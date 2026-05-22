@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{c5e3aafc-1e1e-4a8a-b30c-1d4c0c7c4d11}</UniqueIdentifier>
+      <Extensions>cpp;c</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{0d5f73e4-1a8b-4d0a-8d3f-8e64c9221a32}</UniqueIdentifier>
+      <Extensions>h;hpp;hh</Extensions>
+    </Filter>
+    <Filter Include="Driver Files">
+      <UniqueIdentifier>{34cbcdc9-d2c1-4b85-8e84-ec3da9f1d4d2}</UniqueIdentifier>
+      <Extensions>inf;inx</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="driver.cpp">      <Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="adapter.cpp">     <Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ioctl.cpp">       <Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="newdelete.cpp">   <Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ringbuffer.cpp">  <Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="topology.cpp">    <Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wave.cpp">        <Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavestream.cpp">  <Filter>Source Files</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="debug.h">                  <Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="driver.h">                 <Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ioctl.h">                  <Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="mintopo.h">                <Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="minwave.h">                <Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ringbuffer.h">             <Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="topology.h">               <Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="wave.h">                   <Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="wavestream.h">             <Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="..\include\stream_to_speaker_ioctl.h"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="StreamToSpeaker.inf"><Filter>Driver Files</Filter></Inf>
+  </ItemGroup>
+</Project>

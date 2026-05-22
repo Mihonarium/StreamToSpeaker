@@ -1,0 +1,137 @@
+; StreamToSpeaker.inf
+;
+; Installs the Stream To Speaker virtual audio render endpoint.
+; Adapted from Microsoft's sysvad sample (MIT). Single render
+; endpoint, no capture, no mic array, no keyword detection.
+;
+; Targets: Windows 10 1809 (build 17763) and later, x64 only.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 05/22/2026,1.0.0.1
+CatalogFile = StreamToSpeaker.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir   = 13
+StreamToSpeaker.CopyFiles = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+StreamToSpeaker.sys = 1
+
+[Manufacturer]
+%ProviderName% = StreamToSpeaker,NTamd64.10.0...17763
+
+[StreamToSpeaker.NTamd64.10.0...17763]
+%StreamToSpeaker.DeviceDesc% = StreamToSpeaker_Inst,Root\StreamToSpeaker
+
+; ----------------------------------------------------------------------
+; Install section
+; ----------------------------------------------------------------------
+
+[StreamToSpeaker_Inst.NT]
+CopyFiles  = StreamToSpeaker.CopyFiles
+AddReg     = StreamToSpeaker_AddReg
+
+[StreamToSpeaker.CopyFiles]
+StreamToSpeaker.sys
+
+[StreamToSpeaker_AddReg]
+HKR,,AssociatedFilters,,"wdmaud,redbook"
+HKR,,Driver,,StreamToSpeaker.sys
+
+HKR,Drivers,SubClasses,,"wave,midi,mixer"
+
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%StreamToSpeaker.DeviceDesc%
+
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Description,,%StreamToSpeaker.DeviceDesc%
+
+[StreamToSpeaker_Inst.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,         %KSNAME_Wave%, StreamToSpeaker.I.Wave
+AddInterface = %KSCATEGORY_RENDER%,        %KSNAME_Wave%, StreamToSpeaker.I.Wave
+AddInterface = %KSCATEGORY_REALTIME%,      %KSNAME_Wave%, StreamToSpeaker.I.Wave
+AddInterface = %KSCATEGORY_AUDIO%,         %KSNAME_Topology%, StreamToSpeaker.I.Topo
+AddInterface = %KSCATEGORY_RENDER%,        %KSNAME_Topology%, StreamToSpeaker.I.Topo
+AddInterface = %KSCATEGORY_TOPOLOGY%,      %KSNAME_Topology%, StreamToSpeaker.I.Topo
+
+[StreamToSpeaker.I.Wave]
+AddReg = StreamToSpeaker.I.Wave.AddReg
+
+[StreamToSpeaker.I.Wave.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%StreamToSpeaker.WaveDesc%
+
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_LINE_CONNECTOR%
+HKR,EP\0,%PKEY_AudioEndpoint_Default%,0x00010001,1
+HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,7
+HKR,EP\0,%PKEY_AudioEngine_OEMFormat%,%REG_BINARY%, \
+    01,00,02,00,44,AC,00,00,10,B1,02,00,04,00,10,00
+
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,1
+
+; PacketSize_Constraints2 — advertise a minimum 2 ms period
+; (88 frames at 44.1 kHz). Default packet 128 frames as required.
+HKR,EP\0,%PKEY_AudioEngine_DeviceFormat%,%REG_BINARY%, \
+    01,00,02,00,44,AC,00,00,10,B1,02,00,04,00,10,00
+
+[StreamToSpeaker.I.Topo]
+AddReg = StreamToSpeaker.I.Topo.AddReg
+
+[StreamToSpeaker.I.Topo.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%StreamToSpeaker.TopoDesc%
+
+; ----------------------------------------------------------------------
+; Services
+; ----------------------------------------------------------------------
+
+[StreamToSpeaker_Inst.NT.Services]
+AddService = StreamToSpeaker,0x00000002,StreamToSpeaker_Service
+
+[StreamToSpeaker_Service]
+DisplayName    = %StreamToSpeaker.SvcDesc%
+ServiceType    = 1 ; SERVICE_KERNEL_DRIVER
+StartType      = 3 ; SERVICE_DEMAND_START
+ErrorControl   = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\StreamToSpeaker.sys
+
+; ----------------------------------------------------------------------
+; Strings
+; ----------------------------------------------------------------------
+
+[Strings]
+ProviderName                  = "Stream To Speaker"
+DiskName                      = "Stream To Speaker Installation Disk"
+StreamToSpeaker.DeviceDesc    = "Stream To Speaker"
+StreamToSpeaker.WaveDesc      = "Stream To Speaker Wave"
+StreamToSpeaker.TopoDesc      = "Stream To Speaker Topology"
+StreamToSpeaker.SvcDesc       = "Stream To Speaker Virtual Audio Driver"
+
+REG_BINARY              = 0x00000001
+
+Proxy.CLSID             = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+
+KSCATEGORY_AUDIO        = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER       = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_TOPOLOGY     = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+KSCATEGORY_REALTIME     = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+
+KSNAME_Wave             = "Wave"
+KSNAME_Topology         = "Topology"
+
+KSNODETYPE_LINE_CONNECTOR = "{DFF21CE1-F70F-11D0-B917-00A0C9223196}"
+
+PKEY_AudioEndpoint_Association              = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_Default                  = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
+PKEY_AudioEndpoint_FormFactor               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode= "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
+PKEY_AudioEngine_DeviceFormat               = "{F19F064D-082C-4E27-BC73-6882A1BB8E4C},0"
+PKEY_AudioEngine_OEMFormat                  = "{E4870E26-3CC5-4CD2-BA46-CA0A9A70ED04},3"
