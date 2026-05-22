@@ -1,0 +1,62 @@
+[package]
+name = "stream-to-speaker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Stream To Speaker — user-mode bridge between a Windows virtual audio driver (or WASAPI loopback) and any UPnP/OpenHome network speaker (Sonos, IKEA StreamToSpeaker, etc)."
+license = "MIT"
+
+[lib]
+# Internal Rust crate name retained for code stability — the user-facing
+# product name lives in PRODUCT_NAME in src/lib.rs.
+name = "stream_to_speaker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stream-to-speaker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+crossbeam-channel = "0.5"
+tiny_http = "0.12"
+quick-xml = "0.36"
+roxmltree = "0.20"
+socket2 = { version = "0.5", features = ["all"] }
+byteorder = "1"
+url = "2"
+percent-encoding = "2"
+
+[target.'cfg(windows)'.dependencies]
+# WASAPI loopback fallback. cpal supports WASAPI loopback on Windows.
+cpal = "0.15"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Media_Audio",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Com",
+    "Win32_System_SystemServices",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1

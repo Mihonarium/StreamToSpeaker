@@ -1,0 +1,672 @@
+//! Stream To Speaker — main binary entry point.
+//!
+//! Wires the audio source, silence detector, HTTP server, SSDP discovery,
+//! UPnP control plane, GENA event subscription, interactive speaker
+//! picker, and bidirectional volume sync into one running service. Audio
+//! path runs on a dedicated MMCSS thread; HTTP and control planes each
+//! get their own thread pools.
+//!
+//! When no `--player` is given and stdin is a terminal, the user gets a
+//! numbered prompt listing every discovered speaker (swyh-rs-style, but
+//! text-mode). In non-interactive mode (e.g. running as a Windows
+//! service) we fall back to "first discovered". Speakers can also be
+//! switched at runtime via `POST /api/select`.
+
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, ValueEnum};
+use crossbeam_channel::{select, tick};
+use log::{debug, error, info, warn};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use stream_to_speaker::audio_source::{AudioSource, PACKET_FLAG_STREAM_RESTART};
+use stream_to_speaker::gena::{parse_rendering_notify, GenaManager};
+use stream_to_speaker::http_server::{
+    samples_to_l16_be_bytes, start_http_server, HttpServerConfig, PcmFrame, SpeakerInfo,
+    SpeakerListCallback, SpeakerSelectCallback, StreamHub,
+};
+use stream_to_speaker::picker;
+use stream_to_speaker::silence::{SilenceDetector, DEFAULT_QUIESCENT_AFTER_PACKETS};
+use stream_to_speaker::sine_source::SineSource;
+use stream_to_speaker::ssdp::{spawn_discovery, DiscoveryState, Renderer};
+use stream_to_speaker::upnp;
+use stream_to_speaker::volume_sync::VolumeSync;
+use stream_to_speaker::PRODUCT_NAME;
+#[cfg(windows)]
+use stream_to_speaker::wasapi_source::WasapiLoopbackSource;
+
+// -----------------------------------------------------------------------------
+// CLI
+// -----------------------------------------------------------------------------
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum SourceKind {
+    /// Try the kernel driver, falling back to WASAPI loopback if absent.
+    Auto,
+    /// Force the kernel driver; exit with an error if unavailable.
+    Driver,
+    /// WASAPI loopback (no driver required).
+    WasapiLoopback,
+    /// 440 Hz sine test source.
+    Sine,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "stream-to-speaker",
+    version,
+    about = "Stream To Speaker — streams Windows audio to UPnP/OpenHome network speakers."
+)]
+struct Cli {
+    /// Audio source.
+    #[arg(long, value_enum, default_value_t = SourceKind::Auto)]
+    source: SourceKind,
+
+    /// TCP port to serve `/stream.raw` on.
+    #[arg(long, default_value_t = 5901)]
+    port: u16,
+
+    /// Specific WASAPI device name (substring match). Only used for the
+    /// wasapi-loopback source.
+    #[arg(long)]
+    device: Option<String>,
+
+    /// Speaker to send to: friendly name substring, IP, or omit to be
+    /// prompted (in a terminal) / pick the first one (non-interactive).
+    #[arg(long)]
+    player: Option<String>,
+
+    /// Print discovered speakers and exit.
+    #[arg(long, default_value_t = false)]
+    list_speakers: bool,
+
+    /// Skip the interactive picker even when stdin is a TTY — useful for
+    /// running as a Windows service.
+    #[arg(long, default_value_t = false)]
+    no_interactive: bool,
+
+    /// Interval between SSDP re-discoveries (minutes).
+    #[arg(long, default_value_t = 5)]
+    ssdp_interval: u64,
+
+    /// Initial buffer hint sent to the speaker in DIDL metadata (ms).
+    #[arg(long, default_value_t = 50)]
+    initial_buffer_ms: u32,
+
+    /// Skip SSDP discovery; serve HTTP only.
+    #[arg(long, default_value_t = false)]
+    no_discovery: bool,
+
+    /// Disable silence injection (will send literal zeros during silence).
+    #[arg(long, default_value_t = false)]
+    no_silence_injection: bool,
+
+    /// Number of consecutive silent packets before entering quiescence.
+    #[arg(long, default_value_t = DEFAULT_QUIESCENT_AFTER_PACKETS)]
+    silence_packets_threshold: u32,
+
+    /// Bind address for our HTTP server. The speaker must be able to
+    /// reach us here. Default 0.0.0.0; consider setting to the LAN IP.
+    #[arg(long, default_value = "0.0.0.0")]
+    bind: String,
+
+    /// Public IP to advertise to the speaker in the stream URI. Required
+    /// when bind is 0.0.0.0. Defaults to the first non-loopback IPv4.
+    #[arg(long)]
+    advertise_ip: Option<String>,
+
+    /// Log level: error, warn, info, debug, trace.
+    #[arg(long, default_value = "info")]
+    log_level: String,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let mut builder = env_logger::Builder::from_default_env();
+    builder
+        .filter_level(cli.log_level.parse().unwrap_or(log::LevelFilter::Info))
+        .format_timestamp_millis()
+        .init();
+
+    if let Err(e) = run(cli) {
+        error!("fatal: {:#}", e);
+        std::process::exit(1);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Renderer session — the active speaker + its GENA subscription.
+// -----------------------------------------------------------------------------
+
+/// What we keep track of for a single active speaker.
+struct RendererSession {
+    renderer: Renderer,
+    gena: Arc<GenaManager>,
+    /// The stream URI we're advertising to this speaker — same for every
+    /// speaker on a given run, but cached here for `start`/`stop` symmetry.
+    #[allow(dead_code)]
+    stream_uri: String,
+}
+
+type SharedSession = Arc<Mutex<Option<RendererSession>>>;
+
+fn start_session(
+    renderer: Renderer,
+    stream_uri: &str,
+    didl: &str,
+    callback_url: &str,
+) -> Result<RendererSession> {
+    info!(
+        "targeting speaker: {} ({})",
+        renderer.friendly_name, renderer.ip
+    );
+    // Stop first to clear any "Transport Locked" (Sonos error 705) state
+    // left over from a previous session — swyh-rs does this. Best-effort:
+    // a "not playing" Stop on Sonos returns 701, which we ignore.
+    let _ = upnp::stop(&renderer.av_transport_control_url);
+    // Tiny pause before SetAVTransportURI — swyh-rs uses 100 ms; Sonos's
+    // AVTransport state machine sometimes rejects back-to-back commands.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    upnp::set_av_transport_uri(&renderer.av_transport_control_url, stream_uri, didl)
+        .context("SetAVTransportURI")?;
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    upnp::play(&renderer.av_transport_control_url).context("Play")?;
+
+    let gena = GenaManager::new(callback_url.to_string());
+    match gena.subscribe(&renderer.rendering_control_event_url) {
+        Ok(_) => {
+            gena.clone().spawn_renewer();
+        }
+        Err(e) => {
+            warn!(
+                "GENA subscribe failed (continuing without volume sync from speaker): {}",
+                e
+            );
+        }
+    }
+
+    Ok(RendererSession {
+        renderer,
+        gena,
+        stream_uri: stream_uri.to_string(),
+    })
+}
+
+fn stop_session(session: &RendererSession) {
+    // Best-effort tear-down; we don't fail switching if the old speaker
+    // is already unreachable.
+    session.gena.unsubscribe();
+    if let Err(e) = upnp::stop(&session.renderer.av_transport_control_url) {
+        debug!("UPnP Stop on {} failed: {}", session.renderer.friendly_name, e);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// run()
+// -----------------------------------------------------------------------------
+
+fn run(cli: Cli) -> Result<()> {
+    info!("{} v{}", PRODUCT_NAME, env!("CARGO_PKG_VERSION"));
+
+    // 1. Special-case: --list-speakers prints and exits, no service needed.
+    if cli.list_speakers {
+        return cmd_list_speakers(&cli);
+    }
+
+    // 2. Audio source.
+    let mut source: Box<dyn AudioSource> = build_source(&cli)?;
+    info!("audio source: {}", source.name());
+
+    // 3. HTTP server + stream hub.
+    let hub = StreamHub::new();
+    let bind_addr: IpAddr = cli
+        .bind
+        .parse()
+        .with_context(|| format!("parsing --bind {}", cli.bind))?;
+    let bind_socket = SocketAddr::new(bind_addr, cli.port);
+
+    // 4. SSDP discovery.
+    let discovery = if cli.no_discovery {
+        None
+    } else {
+        let state = DiscoveryState::new();
+        // Reuse advertise_ip / bind for the multicast egress interface.
+        // Falls back to OS-pick when neither is a specific IPv4.
+        let ssdp_iface = pick_ssdp_iface(&cli);
+        spawn_discovery(state.clone(), Duration::from_secs(cli.ssdp_interval * 60), ssdp_iface);
+        Some(state)
+    };
+
+    // 5. Volume sync (shared between driver-event handler and GENA notify).
+    let vsync = Arc::new(VolumeSync::new());
+
+    // 6. Shared "current speaker" state used by /api/select and by the
+    //    driver-event consumer (which needs to know where to send volume
+    //    changes to).
+    let session: SharedSession = Arc::new(Mutex::new(None));
+
+    // 7. Stream URI & DIDL.
+    let advertise_ip = match cli.advertise_ip.as_deref() {
+        Some(ip) => ip.to_string(),
+        None => default_advertise_ip()?,
+    };
+
+    // 8. GENA notify callback.
+    let vsync_for_cb = vsync.clone();
+    let driver_volume_pusher = build_driver_volume_pusher(&cli)?;
+    let gena_callback: stream_to_speaker::http_server::GenaNotifyCallback =
+        Arc::new(move |path: &str, body: &str| {
+            debug!("GENA NOTIFY on {}: {} bytes", path, body.len());
+            if let Some(change) = parse_rendering_notify(body) {
+                if let Some(v) = change.volume {
+                    if let Some(mb) = vsync_for_cb.sonos_changed(v) {
+                        info!("speaker -> driver: volume {} (mb={})", v, mb);
+                        if let Some(p) = driver_volume_pusher.as_ref() {
+                            if let Err(e) = p.push(mb, false) {
+                                warn!("failed to push volume to driver: {}", e);
+                            }
+                        }
+                    }
+                }
+                if let Some(m) = change.mute {
+                    info!("speaker -> driver: mute={}", m);
+                    if let Some(p) = driver_volume_pusher.as_ref() {
+                        if let Err(e) = p.push(0, m) {
+                            warn!("failed to push mute to driver: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+
+    // 9. Speaker list & select callbacks (only useful when discovery is on).
+    let speaker_list: Option<SpeakerListCallback> = discovery.as_ref().map(|d| {
+        let d = d.clone();
+        let session_for_list = session.clone();
+        Arc::new(move || {
+            let active_id = session_for_list
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|s| s.renderer.stable_id());
+            d.renderers()
+                .into_iter()
+                .map(|r| {
+                    let id = r.stable_id();
+                    let active = active_id.as_deref() == Some(id.as_str());
+                    SpeakerInfo {
+                        id,
+                        friendly_name: r.friendly_name,
+                        ip: r.ip.to_string(),
+                        active,
+                    }
+                })
+                .collect()
+        }) as Arc<dyn Fn() -> Vec<SpeakerInfo> + Send + Sync>
+    });
+
+    // Need a couple of values inside the select callback. Build them up
+    // front and clone into the closure.
+    let stream_uri_template = (advertise_ip.clone(), cli.port);
+    let didl_template = (cli.initial_buffer_ms,);
+
+    let speaker_select: Option<SpeakerSelectCallback> =
+        discovery.as_ref().map(|d| {
+            let discovery = d.clone();
+            let session = session.clone();
+            let (adv_ip, port) = stream_uri_template.clone();
+            let (buffer_ms,) = didl_template;
+            Arc::new(move |id: &str| -> Result<(), String> {
+                let Some(new_r) = discovery.find_by_id(id) else {
+                    return Err(format!("no speaker with id {:?}", id));
+                };
+                let stream_uri = format!("http://{}:{}/stream.raw", adv_ip, port);
+                let didl =
+                    upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, buffer_ms);
+                let callback_url = format!("http://{}:{}/gena", adv_ip, port);
+                let new_session = start_session(new_r, &stream_uri, &didl, &callback_url)
+                    .map_err(|e| format!("{:#}", e))?;
+                let mut guard = session.lock().unwrap();
+                if let Some(old) = guard.take() {
+                    drop(guard); // release before potentially-slow Stop
+                    stop_session(&old);
+                    guard = session.lock().unwrap();
+                }
+                *guard = Some(new_session);
+                Ok(())
+            }) as Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>
+        });
+
+    let actual_port = start_http_server(HttpServerConfig {
+        bind: bind_socket,
+        hub: hub.clone(),
+        gena_callback: Some(gena_callback),
+        speaker_list: speaker_list.clone(),
+        speaker_select: speaker_select.clone(),
+    })?;
+
+    let stream_uri = format!("http://{}:{}/stream.raw", advertise_ip, actual_port);
+    info!("stream URI: {}", stream_uri);
+    info!("web UI: http://{}:{}/", advertise_ip, actual_port);
+
+    // 10. Resolve initial speaker.
+    if let Some(state) = discovery.as_ref() {
+        let r = picker::resolve(state, cli.player.as_deref(), !cli.no_interactive)?;
+        if let Some(renderer) = r {
+            let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, cli.initial_buffer_ms);
+            let callback_url = format!("http://{}:{}/gena", advertise_ip, actual_port);
+            match start_session(renderer, &stream_uri, &didl, &callback_url) {
+                Ok(s) => {
+                    *session.lock().unwrap() = Some(s);
+                }
+                Err(e) => {
+                    warn!("starting initial session failed: {:#}", e);
+                }
+            }
+        } else if !cli.no_discovery {
+            warn!(
+                "no speaker selected; serving stream at {}/stream.raw — use the web UI at http://{}:{}/ or POST /api/select to pick one",
+                stream_uri, advertise_ip, actual_port
+            );
+        }
+    }
+
+    // 11. Driver-event consumer.
+    #[cfg(windows)]
+    spawn_driver_event_consumer(&cli, vsync.clone(), session.clone());
+
+    // 12. Audio loop.
+    let mut silence = SilenceDetector::new(cli.silence_packets_threshold, !cli.no_silence_injection);
+    let mut last_packet_log = std::time::Instant::now();
+    let mut packet_count: u64 = 0;
+
+    loop {
+        let mut pkt = match source.recv_packet() {
+            Ok(p) => p,
+            Err(e) => {
+                error!("audio source error: {} — exiting", e);
+                return Err(e);
+            }
+        };
+
+        if pkt.flags & PACKET_FLAG_STREAM_RESTART != 0 {
+            info!("stream restart from source (new session)");
+        }
+
+        if pkt.sample_rate != stream_to_speaker::WIRE_SAMPLE_RATE
+            || pkt.channels != stream_to_speaker::WIRE_CHANNELS
+        {
+            warn!(
+                "unexpected source format: rate={} ch={}; expected {}/{}",
+                pkt.sample_rate,
+                pkt.channels,
+                stream_to_speaker::WIRE_SAMPLE_RATE,
+                stream_to_speaker::WIRE_CHANNELS
+            );
+            continue;
+        }
+
+        silence.process(&mut pkt);
+        let bytes = samples_to_l16_be_bytes(&pkt.samples);
+        hub.publish(PcmFrame(Arc::new(bytes)));
+
+        packet_count += 1;
+        if last_packet_log.elapsed() >= Duration::from_secs(10) {
+            debug!(
+                "{} packets streamed, {} subscriber(s)",
+                packet_count,
+                hub.subscriber_count()
+            );
+            last_packet_log = std::time::Instant::now();
+        }
+
+        // Defensive: keep references alive for cfg(not(windows)) build.
+        let _ = (vsync.clone(), &cli);
+        std::hint::spin_loop();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// --list-speakers
+// -----------------------------------------------------------------------------
+
+fn cmd_list_speakers(cli: &Cli) -> Result<()> {
+    if cli.no_discovery {
+        return Err(anyhow!("--list-speakers and --no-discovery are mutually exclusive"));
+    }
+    let state = DiscoveryState::new();
+    let ssdp_iface = pick_ssdp_iface(cli);
+    spawn_discovery(state.clone(), Duration::from_secs(cli.ssdp_interval * 60), ssdp_iface);
+    // Wait up to 5s for the first sweep.
+    let renderers = picker::wait_for_first_discovery(&state, Duration::from_secs(5));
+    let n = picker::print_speaker_list(&renderers);
+    if n == 0 {
+        eprintln!("(no speakers found within 5s — check that SSDP isn't blocked)");
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Source selection
+// -----------------------------------------------------------------------------
+
+fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
+    match cli.source {
+        SourceKind::Sine => Ok(Box::new(SineSource::new())),
+        SourceKind::WasapiLoopback => {
+            #[cfg(windows)]
+            {
+                Ok(Box::new(WasapiLoopbackSource::new(cli.device.as_deref())?))
+            }
+            #[cfg(not(windows))]
+            {
+                anyhow::bail!("--source wasapi-loopback only works on Windows")
+            }
+        }
+        SourceKind::Driver => {
+            #[cfg(windows)]
+            {
+                use stream_to_speaker::ioctl_source::IoctlAudioSource;
+                let src = IoctlAudioSource::open()
+                    .context("opening Stream-To-Speaker kernel driver (--source driver was specified)")?;
+                Ok(Box::new(src))
+            }
+            #[cfg(not(windows))]
+            {
+                anyhow::bail!("--source driver only works on Windows")
+            }
+        }
+        SourceKind::Auto => {
+            #[cfg(windows)]
+            {
+                use stream_to_speaker::ioctl_source::IoctlAudioSource;
+                match IoctlAudioSource::open() {
+                    Ok(s) => Ok(Box::new(s)),
+                    Err(e) => {
+                        info!(
+                            "driver not present, falling back to WASAPI loopback: {}",
+                            e
+                        );
+                        Ok(Box::new(WasapiLoopbackSource::new(cli.device.as_deref())?))
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                warn!("non-Windows host; using sine source for --source auto");
+                Ok(Box::new(SineSource::new()))
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Driver event consumer (volume change from Windows mixer -> speaker)
+// -----------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn spawn_driver_event_consumer(
+    cli: &Cli,
+    vsync: Arc<VolumeSync>,
+    session: SharedSession,
+) {
+    if cli.source == SourceKind::WasapiLoopback || cli.source == SourceKind::Sine {
+        return;
+    }
+    use stream_to_speaker::ioctl_source::{DriverEvent, IoctlAudioSource};
+    thread::Builder::new()
+        .name("stream-to-speaker-driver-events".to_string())
+        .spawn(move || {
+            let src = match IoctlAudioSource::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("driver-event consumer: second handle failed: {}", e);
+                    return;
+                }
+            };
+            let rx = src.events();
+            while let Ok(ev) = rx.recv() {
+                match ev {
+                    DriverEvent::VolumeChanged { level_millibels } => {
+                        if let Some(level) = vsync.driver_changed(level_millibels) {
+                            info!("driver -> speaker: volume {} (mb={})", level, level_millibels);
+                            if let Some(r) = current_renderer(&session) {
+                                if let Err(e) = upnp::set_volume(&r.rendering_control_control_url, level) {
+                                    warn!("upnp set_volume failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    DriverEvent::MuteChanged { muted } => {
+                        info!("driver -> speaker: mute={}", muted);
+                        if let Some(r) = current_renderer(&session) {
+                            if let Err(e) = upnp::set_mute(&r.rendering_control_control_url, muted) {
+                                warn!("upnp set_mute failed: {}", e);
+                            }
+                        }
+                    }
+                    DriverEvent::StreamStart => info!("driver: stream start"),
+                    DriverEvent::StreamStop => info!("driver: stream stop"),
+                    DriverEvent::FormatChange { sample_rate, bits_per_sample, channels } => {
+                        info!("driver: format change to {}/{}-bit/{}ch", sample_rate, bits_per_sample, channels);
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn spawn_driver_event_consumer(_cli: &Cli, _vsync: Arc<VolumeSync>, _session: SharedSession) {}
+
+fn current_renderer(session: &SharedSession) -> Option<Renderer> {
+    session
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.renderer.clone())
+}
+
+// -----------------------------------------------------------------------------
+// Driver volume pusher
+// -----------------------------------------------------------------------------
+
+trait DriverVolumePush: Send + Sync {
+    fn push(&self, mb: i32, muted: bool) -> Result<()>;
+}
+
+#[cfg(windows)]
+struct IoctlPusher {
+    src: std::sync::Mutex<stream_to_speaker::ioctl_source::IoctlAudioSource>,
+}
+
+#[cfg(windows)]
+impl DriverVolumePush for IoctlPusher {
+    fn push(&self, mb: i32, muted: bool) -> Result<()> {
+        let s = self.src.lock().unwrap();
+        s.push_volume(mb, muted)
+    }
+}
+
+fn build_driver_volume_pusher(cli: &Cli) -> Result<Option<Arc<dyn DriverVolumePush>>> {
+    if cli.source == SourceKind::WasapiLoopback || cli.source == SourceKind::Sine {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    {
+        use stream_to_speaker::ioctl_source::IoctlAudioSource;
+        match IoctlAudioSource::open() {
+            Ok(s) => Ok(Some(Arc::new(IoctlPusher {
+                src: std::sync::Mutex::new(s),
+            }))),
+            Err(e) => {
+                if cli.source == SourceKind::Driver {
+                    return Err(e);
+                }
+                debug!("no driver for volume pusher: {}", e);
+                Ok(None)
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(None)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Resolve the IPv4 interface to use for SSDP multicast egress. Prefers
+/// `--advertise-ip`, then `--bind` if it's a specific IPv4 (not 0.0.0.0),
+/// otherwise falls back to the route-derived default via the UDP-connect
+/// trick. Returns None to let the OS pick if even that fails.
+
+/// Resolve the IPv4 interface to use for SSDP multicast egress. Prefers
+/// `--advertise-ip`, then `--bind` if it's a specific IPv4 (not 0.0.0.0),
+/// otherwise falls back to the route-derived default via the UDP-connect
+/// trick. Returns None to let the OS pick if even that fails.
+fn pick_ssdp_iface(cli: &Cli) -> Option<Ipv4Addr> {
+    if let Some(s) = cli.advertise_ip.as_deref() {
+        if let Ok(IpAddr::V4(v4)) = s.parse() {
+            return Some(v4);
+        }
+    }
+    if let Ok(IpAddr::V4(v4)) = cli.bind.parse::<IpAddr>() {
+        if !v4.is_unspecified() {
+            return Some(v4);
+        }
+    }
+    if let Ok(s) = default_advertise_ip() {
+        if let Ok(IpAddr::V4(v4)) = s.parse() {
+            return Some(v4);
+        }
+    }
+    None
+}
+
+fn default_advertise_ip() -> Result<String> {
+    use std::net::UdpSocket;
+    let s = UdpSocket::bind("0.0.0.0:0").context("binding udp for ip discovery")?;
+    if s.connect("8.8.8.8:53").is_ok() {
+        if let Ok(addr) = s.local_addr() {
+            return Ok(addr.ip().to_string());
+        }
+    }
+    Err(anyhow!("could not determine local IP; pass --advertise-ip"))
+}
+
+#[allow(dead_code)]
+fn _selector_warmup() {
+    let (_t, r) = crossbeam_channel::bounded::<()>(0);
+    let ticker = tick(Duration::from_secs(1));
+    let _ = select! {
+        recv(r) -> _ => 0,
+        recv(ticker) -> _ => 0,
+    };
+}
