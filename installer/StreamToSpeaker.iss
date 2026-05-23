@@ -96,6 +96,15 @@ Source: "{#SourcePath}\staging\StreamToSpeaker.cat"; DestDir: "{app}\driver"; Fl
 Source: "{#SourcePath}\..\scripts\Rename-Endpoint.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\Uninstall-Driver.ps1";           DestDir: "{app}\scripts"; Flags: ignoreversion
 
+; --- devcon.exe (WDK redistributable, MIT) ---
+; Used to add the root-enumerated StreamToSpeaker device after the
+; driver package is staged. pnputil /add-driver /install stages
+; drivers and matches them against EXISTING devices; root-enumerated
+; devices have to be inserted explicitly with devcon (or the
+; SetupDi API). Without this step the driver sits in the store but
+; no audio endpoint ever appears in Sound Settings.
+Source: "{#SourcePath}\staging\devcon.exe"; DestDir: "{app}\driver"; Flags: ignoreversion
+
 ; --- Docs ---
 Source: "{#SourcePath}\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\..\LICENSE";   DestDir: "{app}"; Flags: ignoreversion
@@ -116,15 +125,22 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
-; 1) Install the driver package. pnputil stages it into DriverStore and,
-;    when the INF describes a Root-enumerated device on Win10 1809+,
-;    creates the device automatically. Output captured via /subst-args.
+; 1) Stage the driver package in the DriverStore.
 Filename: "{sys}\pnputil.exe"; \
     Parameters: "/add-driver ""{app}\driver\StreamToSpeaker.inf"" /install"; \
-    StatusMsg: "Installing audio driver..."; \
+    StatusMsg: "Staging audio driver..."; \
     Flags: runhidden waituntilterminated
 
-; 2) Overwrite the cached endpoint friendly name (the Windows registry
+; 2) Insert the root-enumerated device. This is what makes "Stream To
+;    Speaker" appear in Windows Sound Settings — pnputil only stages
+;    the driver, the device still has to be created. devcon install
+;    is idempotent: if the device already exists it just no-ops.
+Filename: "{app}\driver\devcon.exe"; \
+    Parameters: "install ""{app}\driver\StreamToSpeaker.inf"" Root\StreamToSpeaker"; \
+    StatusMsg: "Creating audio device..."; \
+    Flags: runhidden waituntilterminated
+
+; 3) Overwrite the cached endpoint friendly name (the Windows registry
 ;    keeps the auto-generated "Internal AUX Jack ..." string across
 ;    reinstalls; this script writes the same slot Sound Settings'
 ;    Rename button writes to).
@@ -133,7 +149,7 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
     StatusMsg: "Naming the audio endpoint..."; \
     Flags: runhidden waituntilterminated
 
-; 3) Offer to launch the app at the end of install.
+; 4) Offer to launch the app at the end of install.
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; \
     Flags: nowait postinstall skipifsilent
 
@@ -141,6 +157,10 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; \
 ; Kill any running instance before yanking the driver out from under it.
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; \
     Flags: runhidden; RunOnceId: "KillService"
+
+; Remove the device(s) so the driver isn't pinned by an active node.
+Filename: "{app}\driver\devcon.exe"; Parameters: "remove Root\StreamToSpeaker"; \
+    Flags: runhidden waituntilterminated; RunOnceId: "RemoveDevice"
 
 ; Remove the driver package. pnputil /delete-driver expects the OEM-
 ; assigned name (oemNN.inf) which we don't know up front, so we shell
