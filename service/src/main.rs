@@ -21,8 +21,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use log::{debug, error, info, warn};
 use std::net::{IpAddr, SocketAddr};
+#[cfg(windows)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+#[cfg(windows)]
 use std::thread;
 use std::time::Duration;
 

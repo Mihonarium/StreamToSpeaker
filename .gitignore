@@ -1,0 +1,19 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Windows driver build artifacts
+driver/x64/
+driver/Debug/
+driver/Release/
+driver/*.opensdf
+driver/*.suo
+driver/*.user
+driver/.vs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
