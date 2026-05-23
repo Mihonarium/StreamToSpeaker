@@ -90,6 +90,8 @@ private:
 
     KSPIN_LOCK             m_StateLock;
     BOOLEAN                m_TimerStarted;
+    BOOLEAN                m_TimerResolutionRaised;
+    ULONG                  m_DpcLogCounter;
 
     /* Convenience accessor for the device extension. */
     PSTREAM_TO_SPEAKER_DEVICE_EXTENSION DeviceExtension();

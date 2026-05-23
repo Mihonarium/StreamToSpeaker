@@ -235,6 +235,14 @@ Ioctl_HandleGetAudio(_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp)
         return status;
     }
 
+    /* Self-reference the IRP's list entry up front. The cancel routine
+     * decides "is this entry in a list?" via `Flink != &self`, so an
+     * unspecified initial Flink (e.g. left over from pool recycling)
+     * could spuriously satisfy that check and lead to a BSOD on cancel
+     * if the IRP never makes it onto the AudioIrpList (cancellation
+     * race below). InitializeListHead makes the check reliable. */
+    InitializeListHead(&Irp->Tail.Overlay.ListEntry);
+
     /* Mark pending, hook cancel routine, queue. */
     IoMarkIrpPending(Irp);
 
@@ -273,13 +281,18 @@ DequeueAudioIrp(_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ KIRQL HoldingAtIrql)
     while (!IsListEmpty(&Ctx->AudioIrpList)) {
         PLIST_ENTRY entry = RemoveHeadList(&Ctx->AudioIrpList);
         PIRP irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+        /* RemoveHeadList does NOT reset Flink/Blink on the removed
+         * entry; they still point into the live list. Self-reference
+         * the entry NOW (while we hold the lock) so the cancel routine
+         * — which waits on the same lock — sees Flink == &self and
+         * skips its RemoveEntryList. Otherwise it would re-remove on
+         * stale pointers and corrupt the live list (eventual BSOD). */
+        InitializeListHead(&irp->Tail.Overlay.ListEntry);
         if (IoSetCancelRoutine(irp, nullptr) != nullptr) {
             return irp;
         }
-        /* Cancel routine fired between our peek and the clear. Put
-         * the entry back in a defensive zero state and let the cancel
-         * routine complete it. */
-        InitializeListHead(&irp->Tail.Overlay.ListEntry);
+        /* Cancel routine won the IoSetCancelRoutine race; it'll
+         * complete the IRP. The self-reference above keeps it safe. */
     }
     return nullptr;
 }
@@ -421,6 +434,10 @@ Ioctl_HandleGetEvent(_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp)
     }
     KeReleaseSpinLock(&Ctx->EventQueueLock, old);
 
+    /* Self-reference the list entry before any cancel-routine wiring.
+     * See the matching comment in Ioctl_HandleGetAudio. */
+    InitializeListHead(&Irp->Tail.Overlay.ListEntry);
+
     /* Otherwise queue the IRP. */
     IoMarkIrpPending(Irp);
     KeAcquireSpinLock(&Ctx->EventIrpLock, &old);
@@ -447,10 +464,12 @@ DequeueEventIrp(_Inout_ StreamToSpeakerIoctlCtx* Ctx)
     while (!IsListEmpty(&Ctx->EventIrpList)) {
         PLIST_ENTRY entry = RemoveHeadList(&Ctx->EventIrpList);
         PIRP irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+        /* See DequeueAudioIrp: self-reference now so the cancel routine
+         * doesn't re-RemoveEntryList on stale Flink/Blink. */
+        InitializeListHead(&irp->Tail.Overlay.ListEntry);
         if (IoSetCancelRoutine(irp, nullptr) != nullptr) {
             return irp;
         }
-        InitializeListHead(&irp->Tail.Overlay.ListEntry);
     }
     return nullptr;
 }

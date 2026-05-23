@@ -124,6 +124,8 @@ CMiniportWaveRTStream::Init(
     m_StreamFramesProduced   = 0;
     m_StreamFramesConsumed   = 0;
     m_TimerStarted           = FALSE;
+    m_TimerResolutionRaised  = FALSE;
+    m_DpcLogCounter          = 0;
     KeInitializeTimer(&m_Timer);
     KeInitializeDpc(&m_TimerDpc, ConsumerDpcRoutine, this);
     KeInitializeSpinLock(&m_StateLock);
@@ -245,11 +247,27 @@ CMiniportWaveRTStream::GetPosition(_Out_ KSAUDIO_POSITION* OutPosition)
     if (OutPosition == nullptr) {
         return STATUS_INVALID_PARAMETER;
     }
-    /* Bytes consumed-by-driver since stream start. The audio engine
-     * uses this to know when it can refill. */
-    ULONGLONG frames = m_StreamFramesProduced;
-    OutPosition->PlayOffset  = frames * STREAM_TO_SPEAKER_FRAME_BYTES;
-    OutPosition->WriteOffset = frames * STREAM_TO_SPEAKER_FRAME_BYTES;
+    if (m_BufferBytes == 0) {
+        OutPosition->PlayOffset  = 0;
+        OutPosition->WriteOffset = 0;
+        return STATUS_SUCCESS;
+    }
+    /* PlayOffset and WriteOffset are byte offsets *within* the cyclic
+     * buffer (mod m_BufferBytes), not cumulative byte counts. Returning
+     * unbounded counts breaks the engine's modular arithmetic after
+     * one buffer's worth of "consumed" bytes (~23 ms on a 4 KB buffer).
+     *
+     * WriteOffset must lead PlayOffset so the engine has a non-zero
+     * safe window to write into. With WriteOffset == PlayOffset the
+     * engine sees no write headroom and effectively stops feeding the
+     * buffer — which is the lead suspect for our "rare 8-packet burst"
+     * symptom. Pattern follows sysvad. */
+    ULONGLONG playBytes = m_StreamFramesProduced * STREAM_TO_SPEAKER_FRAME_BYTES;
+    ULONG notificationFrames = (STREAM_TO_SPEAKER_NOTIFICATION_INTERVAL_MS *
+                                STREAM_TO_SPEAKER_SAMPLE_RATE) / 1000u;
+    ULONG notificationBytes = notificationFrames * STREAM_TO_SPEAKER_FRAME_BYTES;
+    OutPosition->PlayOffset  = playBytes % m_BufferBytes;
+    OutPosition->WriteOffset = (playBytes + notificationBytes) % m_BufferBytes;
     return STATUS_SUCCESS;
 }
 
@@ -334,6 +352,17 @@ CMiniportWaveRTStream::StartTimer()
     if (m_TimerStarted) {
         return;
     }
+    /* Raise the system timer resolution to 1 ms so our 2 ms periodic
+     * DPC actually fires at the requested cadence. At Windows' default
+     * 15.625 ms system tick, KeSetTimerEx(period=2) coalesces up to
+     * ~16 ms — that drops the DPC rate from ~500/s to ~64/s and is
+     * one of the suspects for the very-low packet rate. The Windows
+     * audio engine usually bumps the resolution while a session is
+     * active, but we shouldn't depend on it. */
+    if (!m_TimerResolutionRaised) {
+        (void)ExSetTimerResolution(10000u, TRUE);
+        m_TimerResolutionRaised = TRUE;
+    }
     m_TimerStarted = TRUE;
     KeSetTimerEx(&m_Timer,
                  m_TimerInterval,
@@ -350,11 +379,27 @@ CMiniportWaveRTStream::StopTimer()
     KeCancelTimer(&m_Timer);
     KeFlushQueuedDpcs();
     m_TimerStarted = FALSE;
+    if (m_TimerResolutionRaised) {
+        (void)ExSetTimerResolution(0u, FALSE);
+        m_TimerResolutionRaised = FALSE;
+    }
 }
 
 VOID
 CMiniportWaveRTStream::DoCopyToRing()
 {
+    /* Throttled diagnostic so we can confirm in DebugView that the DPC
+     * is actually firing and how the produced/consumed counters are
+     * advancing. Logs roughly once per second at the 2 ms cadence. */
+    ++m_DpcLogCounter;
+    if ((m_DpcLogCounter % 500u) == 1u) {
+        DBG_INFO("DPC #%lu: produced=%llu consumed=%llu bufBytes=%lu",
+                 m_DpcLogCounter,
+                 m_StreamFramesProduced,
+                 m_StreamFramesConsumed,
+                 m_BufferBytes);
+    }
+
     if (m_BufferVa == nullptr || m_BufferBytes == 0) {
         return;
     }
