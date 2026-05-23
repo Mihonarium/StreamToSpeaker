@@ -4,6 +4,8 @@ A Windows virtual audio device that streams whatever you're playing on your PC t
 
 The virtual device shows up as **"Stream To Speaker"** in Windows Sound Settings — pick it as the default output (or route a single app to it via Volume Mixer), and the audio flows through a small kernel driver into a user-mode Rust service that pushes raw PCM via HTTP to the speaker. Windows volume stays in sync with the speaker's hardware buttons in both directions.
 
+Ships with a native GUI window plus a system-tray icon for quick controls — speaker picker, drain/pad latency buttons, enable/disable toggle, hard-resync. The headless CLI service is still there behind `--headless` for Windows-service installs.
+
 ## Architecture
 
 ```
@@ -56,13 +58,13 @@ pnputil /add-driver StreamToSpeaker.inf /install
 # Driver is now installed. Confirm in Device Manager → Sound, video and game controllers.
 # You should also see "Stream To Speaker" in Sound Settings.
 
-# Build + run the service
+# Build + run
 cd ..\service
 cargo build --release
 .\target\release\stream-to-speaker.exe
 ```
 
-Then open `http://localhost:5901/` for the speaker picker and live latency controls.
+Default behaviour: opens the GUI window and adds a system-tray icon. Pick a speaker in the list — audio starts flowing immediately. Closing the window minimises to tray; only the tray menu's **Quit** actually exits.
 
 If you upgrade the driver later, `pnputil /add-driver` only stages the new binary. Either reboot, or in Device Manager → Stream To Speaker → right-click → Disable, then Enable. Confirm the new build is live by looking at the service log: `StreamToSpeaker driver opened (proto=1 build=N ...)` — the `build` number bumps on every shipped binary.
 
@@ -81,26 +83,34 @@ A one-line PowerShell fix is in `scripts/Rename-Endpoint.ps1`:
 
 The same logic should be a post-install step in any installer that ships this project.
 
+## Modes
+
+By default the binary launches as a GUI app with a system-tray icon. Other modes via flags:
+
+| Flag         | Behaviour                                                              |
+|--------------|------------------------------------------------------------------------|
+| *(none)*     | Native GUI window + system tray. Closing the window minimises to tray. |
+| `--no-tray`  | GUI window only, no tray icon. Closing the window exits the process.   |
+| `--headless` | No GUI. Pick a speaker via `--player` or the interactive terminal picker. Used for Windows-service installs and SSH sessions. |
+| `--web`      | Enables the HTTP/JSON API and the web UI at `http://<host>:<port>/`. Off by default — the management endpoints are not exposed on the LAN unless you pass this. Can be combined with any mode. |
+
+The audio stream itself (`/stream.raw`) is always served — the speaker pulls from it — but `/`, `/api/speakers`, `/api/select`, `/api/latency/adjust`, `/api/resync` only exist when `--web` is on.
+
 ## Speaker selection
 
-Three ways to pick a target, in increasing order of automation:
+Four ways to pick a target:
 
-1. **Interactive prompt** (default in a terminal): run with no `--player` flag and you get a numbered list of discovered speakers.
+1. **GUI**: radio-button list in the main window, updates automatically as SSDP sees new devices.
 
-   ```text
-   Discovered speakers:
-     [1]  Living Room (192.168.1.50)
-     [2]  Kitchen     (192.168.1.51)
-     [3]  Bedroom     (192.168.1.52)
+2. **Tray**: left-click the tray icon to open the window, then pick from the list.
 
-   Pick a speaker [1-3] (Enter=first, r=refresh, q=skip):
-   ```
+3. **CLI flag**: `--player "Living Room"` (substring match) or `--player 192.168.1.50` (IP literal). Works in any mode.
 
-2. **CLI flag**: `--player "Living Room"` (substring match) or `--player 192.168.1.50` (IP literal). Useful for shortcuts and scripts.
+4. **Web API** (when `--web` is on): click in the web UI at `http://<host>:<port>/`, or `POST /api/select` with `{"id": "<udn-or-ip>"}`.
 
-3. **Web UI / API**: navigate to `http://localhost:5901/` for a tiny HTML page that lists speakers and lets you switch with one click. Switching tears down the GENA subscription on the old speaker, sends `Stop` + `SetAVTransportURI` + `Play` on the new one. The HTTP audio stream stays up.
+In `--headless` without `--player`, on a TTY, you get an interactive numbered prompt (useful over SSH). `--list-speakers` prints discovered devices and exits.
 
-The list refreshes via SSDP every `--ssdp-interval` minutes (default 5). `--list-speakers` prints and exits, useful for confirming a name before scripting.
+The list refreshes via SSDP every `--ssdp-interval` minutes (default 5).
 
 ## Latency control
 
@@ -129,17 +139,23 @@ For *ongoing* drift between the Windows clock and the speaker's audio crystal (t
 ## CLI flags
 
 ```
+--headless                Disable the GUI; run as a CLI service.
+--no-tray                 GUI window only, no system-tray icon.
+--web                     Enable the HTTP/JSON API + web UI at the bound port.
+                          Off by default — when off, only /stream.raw is served.
+
 --source <auto|driver|wasapi-loopback|sine>
                           Audio input. Default 'auto' tries the kernel driver,
                           falls back to WASAPI loopback (cpal) if not present.
 
 --player <name-or-ip>     Speaker target. Substring match against friendly
-                          name, or an IPv4 literal. Omit for interactive picker.
---no-interactive          Skip the picker even in a TTY (for Windows-service mode).
+                          name, or an IPv4 literal. Omit to use the GUI picker
+                          (or the interactive terminal picker in --headless).
+--no-interactive          Skip the terminal picker even in a TTY (Windows-service mode).
 --list-speakers           Print discovered speakers and exit.
 --no-discovery            Skip SSDP entirely; only serve HTTP.
 
---port <N>                TCP port for /stream.raw and the web UI. Default 5901.
+--port <N>                TCP port for /stream.raw and (if --web) the API. Default 5901.
 --bind <ip>               HTTP bind address. Default 0.0.0.0.
 --advertise-ip <ip>       What IP to put in the stream URI we send to the
                           speaker. Defaults to the first non-loopback IPv4.
@@ -175,20 +191,20 @@ For *ongoing* drift between the Windows clock and the speaker's audio crystal (t
 --log-level <level>       error / warn / info / debug / trace. Default info.
 ```
 
-## Web UI / HTTP API
+## Web UI / HTTP API (opt-in)
 
-`http://<host>:5901/` serves a tiny status page with the speaker list, select buttons, latency-trim buttons, and a resync button. The same endpoints, for scripting:
+Pass `--web` to enable. Then `http://<host>:5901/` serves a tiny status page with the speaker list, select buttons, latency-trim buttons, and a resync button. The same endpoints, for scripting:
 
-| Endpoint                          | Method | Effect                                                         |
-|-----------------------------------|--------|----------------------------------------------------------------|
-| `/stream.raw`                     | GET    | Raw PCM stream the speaker pulls (audio/wav, no length).       |
-| `/api/speakers`                   | GET    | JSON list of discovered speakers.                              |
-| `/api/select`                     | POST   | `{"id": "<udn-or-ip>"}` to switch the active speaker.          |
-| `/api/resync`                     | POST   | UPnP Stop + Play — drops Sonos's accumulated prebuffer.        |
-| `/api/latency/adjust?ms=N`        | POST   | `N>0` drains N ms (lower latency); `N<0` pads (higher latency).|
-| `/healthz`                        | GET    | Liveness probe — always returns `ok`.                          |
+| Endpoint                          | Method | Effect                                                         | Always on |
+|-----------------------------------|--------|----------------------------------------------------------------|-----------|
+| `/stream.raw`                     | GET    | Raw PCM stream the speaker pulls (audio/wav, no length).       | yes       |
+| `/api/speakers`                   | GET    | JSON list of discovered speakers.                              | `--web`   |
+| `/api/select`                     | POST   | `{"id": "<udn-or-ip>"}` to switch the active speaker.          | `--web`   |
+| `/api/resync`                     | POST   | UPnP Stop + Play — drops Sonos's accumulated prebuffer.        | `--web`   |
+| `/api/latency/adjust?ms=N`        | POST   | `N>0` drains N ms (lower latency); `N<0` pads (higher latency).| `--web`   |
+| `/healthz`                        | GET    | Liveness probe — always returns `ok`.                          | `--web`   |
 
-> ⚠️ The API endpoints have no authentication. On an untrusted LAN, bind to `127.0.0.1` (`--bind 127.0.0.1`) and configure your speaker(s) to reach the host via that IP, or put the service behind a reverse proxy with auth.
+> ⚠️ The API endpoints have no authentication. On an untrusted LAN, either keep them disabled (the default) and use the GUI/tray, or bind to `127.0.0.1` (`--bind 127.0.0.1`), or put it behind a reverse proxy with auth.
 
 ## Build prerequisites
 
@@ -211,9 +227,13 @@ StreamToSpeaker/
     ├── Cargo.toml                 # binary = stream-to-speaker
     ├── README.md
     └── src/
-        ├── main.rs                # wires everything, audio loop, runtime adjust
+        ├── main.rs                # CLI parsing, mode dispatch (GUI / headless / web)
+        ├── app.rs                 # central Arc<App> state + action methods
+        ├── audio_loop.rs          # extracted audio loop, runs on its own thread
+        ├── gui.rs                 # eframe + egui native window
+        ├── tray.rs                # system-tray icon + menu
         ├── ioctl_source.rs        # driver IOCTL consumer (audio + events)
-        ├── http_server.rs         # /stream.raw + /api/* + status page
+        ├── http_server.rs         # /stream.raw (always) + /api/* (opt-in)
         ├── ssdp.rs                # multicast discovery
         ├── upnp.rs                # SOAP control plane + DIDL metadata
         ├── gena.rs                # event subscription (volume from speaker)
@@ -221,7 +241,7 @@ StreamToSpeaker/
         ├── silence.rs             # silence detection + noise floor
         ├── wasapi_source.rs       # fallback loopback source
         ├── sine_source.rs         # test tone
-        └── picker.rs              # interactive TTY picker
+        └── picker.rs              # interactive TTY picker (used in --headless)
 ```
 
 ## Format support (v1)
