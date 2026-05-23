@@ -256,10 +256,18 @@ fn run_headless(app: Arc<App>, source: Box<dyn AudioSource>) -> Result<()> {
 
 #[cfg(windows)]
 fn run_gui_mode(app: Arc<App>, source: Box<dyn AudioSource>, no_tray: bool) -> Result<()> {
+    // Hide the console window the C runtime allocates for us. The
+    // GUI window + tray icon are the user-facing surface; the console
+    // is just noise. We don't FreeConsole because that would close
+    // a parent terminal too if the user launched us from one — we
+    // just hide the window. (In --headless mode this code path isn't
+    // reached, so terminal users keep their console.)
+    hide_console_window();
+
     // Audio loop on a dedicated thread so it can MMCSS itself without
     // interfering with the GUI event loop.
     let audio_app = app.clone();
-    let audio_thread = thread::Builder::new()
+    let _audio_thread = thread::Builder::new()
         .name("stream-to-speaker-audio".to_string())
         .spawn(move || {
             if let Err(e) = audio_loop::run(audio_app.clone(), source) {
@@ -273,11 +281,27 @@ fn run_gui_mode(app: Arc<App>, source: Box<dyn AudioSource>, no_tray: bool) -> R
         warn!("GUI exited with error: {:#}", e);
     }
 
-    // Tell the audio loop to stop and wait for it.
+    // Tell the audio loop to stop. We deliberately do NOT join() it:
+    // it's blocked inside the kernel IOCTL (recv_packet) waiting for
+    // the next audio packet, and joining would hang until the next
+    // packet arrives — which on a paused / idle Sonos can be forever.
+    // Process termination kills the thread cleanly; the kernel handle
+    // is RAII-dropped via the SharedHandle Arc on exit.
     app.request_shutdown();
-    let _ = audio_thread.join();
     shutdown_cleanup(&app);
     Ok(())
+}
+
+#[cfg(windows)]
+fn hide_console_window() {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
 }
 
 #[cfg(not(windows))]

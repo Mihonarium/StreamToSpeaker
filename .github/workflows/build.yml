@@ -196,6 +196,16 @@ jobs:
                   throw "Required driver artifact $name not found"
               }
           }
+          # devcon.exe — needed at install time to add the root-enumerated
+          # StreamToSpeaker device. Bundled with the WDK we just installed.
+          $devcon = Get-ChildItem `
+              -Path "C:\Program Files (x86)\Windows Kits\10\Tools" `
+              -Recurse -Filter "devcon.exe" -ErrorAction SilentlyContinue `
+              | Where-Object { $_.FullName -match "\\x64\\" } `
+              | Select-Object -First 1
+          if (-not $devcon) { throw "devcon.exe not found under WDK Tools" }
+          Copy-Item $devcon.FullName "$staging\devcon.exe" -Force
+          Write-Host "Staged $($devcon.FullName)"
 
       - name: Build installer (Inno Setup)
         shell: pwsh

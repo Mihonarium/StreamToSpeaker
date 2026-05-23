@@ -123,6 +123,22 @@ foreach ($name in $wanted) {
     }
 }
 
+# devcon.exe from the WDK — needed at install time to add the
+# root-enumerated StreamToSpeaker device. Search common WDK locations
+# and copy the x64 build into the staging dir.
+$devconCandidates = Get-ChildItem `
+    -Path "C:\Program Files (x86)\Windows Kits\10\Tools" `
+    -Recurse `
+    -Filter "devcon.exe" `
+    -ErrorAction SilentlyContinue `
+    | Where-Object { $_.FullName -match "\\x64\\" }
+$devcon = $devconCandidates | Select-Object -First 1
+if (-not $devcon) {
+    throw "devcon.exe not found in the WDK install (looked under C:\Program Files (x86)\Windows Kits\10\Tools)."
+}
+Copy-Item $devcon.FullName (Join-Path $staging "devcon.exe") -Force
+Write-Host "  staged $($devcon.FullName)"
+
 # ---------------------------------------------------------------------------
 # 4. Installer
 # ---------------------------------------------------------------------------
