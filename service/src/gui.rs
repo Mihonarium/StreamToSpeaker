@@ -36,7 +36,6 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
-        follow_system_theme: true,
         ..Default::default()
     };
 
@@ -65,7 +64,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
             Ok(Box::new(StreamToSpeakerApp {
                 app: app_for_eframe,
                 last_repaint_request: Instant::now(),
-                _tray: tray,
+                tray,
             }))
         }),
     );
@@ -76,9 +75,10 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
 struct StreamToSpeakerApp {
     app: Arc<App>,
     last_repaint_request: Instant,
-    /// Tray icon is held here so it lives as long as the egui app.
-    /// Dropped when the app exits.
-    _tray: Option<crate::tray::TrayHandle>,
+    /// Tray icon + menu. Owned here so the tray lives as long as the
+    /// egui app. `!Send` (muda uses Rc internally), so it has to live
+    /// on the main thread.
+    tray: Option<crate::tray::TrayHandle>,
 }
 
 impl eframe::App for StreamToSpeakerApp {
@@ -89,12 +89,24 @@ impl eframe::App for StreamToSpeakerApp {
             self.last_repaint_request = Instant::now();
         }
 
-        // Intercept close-button clicks: hide instead of exit. Only the
-        // tray menu's Quit calls app.request_shutdown(), which will
-        // bubble up here as a normal close request honoured.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.app.is_shutting_down() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Drain tray + menu events; update tray status text. Cheap when
+        // nothing happened.
+        if let Some(tray) = self.tray.as_mut() {
+            tray.pump(&self.app, ctx);
+        }
+
+        // Intercept close-button clicks: hide instead of exit IF the
+        // tray is visible (so the user can still get back). Without the
+        // tray, X means quit.
+        let close_pressed = ctx.input(|i| i.viewport().close_requested());
+        if close_pressed && !self.app.is_shutting_down() {
+            if self.tray.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                // No tray to fall back to — treat X as Quit.
+                self.app.request_shutdown();
+            }
         }
         if self.app.is_shutting_down() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
