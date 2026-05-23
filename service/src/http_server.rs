@@ -41,6 +41,12 @@ pub type SpeakerListCallback = Arc<dyn Fn() -> Vec<SpeakerInfo> + Send + Sync>;
 /// Returns Err with a user-presentable message on failure.
 pub type SpeakerSelectCallback = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// Callback to force a UPnP Stop+Play on the active speaker, which
+/// makes Sonos discard its current prebuffer and pick a fresh
+/// (minimal) prebuffer level — useful for trimming accumulated latency.
+/// Returns Err with a user-presentable message on failure.
+pub type ResyncCallback = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
 /// One PCM packet to broadcast to subscribers. Pre-encoded as bytes so the
 /// audio thread does the conversion once.
 #[derive(Clone)]
@@ -98,6 +104,9 @@ pub struct HttpServerConfig {
     pub speaker_list: Option<SpeakerListCallback>,
     /// If set, exposes `POST /api/select` to switch the active speaker.
     pub speaker_select: Option<SpeakerSelectCallback>,
+    /// If set, exposes `POST /api/resync` to force-flush the speaker's
+    /// prebuffer (UPnP Stop + Play).
+    pub resync: Option<ResyncCallback>,
 }
 
 impl HttpServerConfig {
@@ -108,6 +117,7 @@ impl HttpServerConfig {
             gena_callback: None,
             speaker_list: None,
             speaker_select: None,
+            resync: None,
         }
     }
 }
@@ -129,10 +139,11 @@ pub fn start_http_server(cfg: HttpServerConfig) -> Result<u16> {
     let gena_cb = cfg.gena_callback.clone();
     let list_cb = cfg.speaker_list.clone();
     let select_cb = cfg.speaker_select.clone();
+    let resync_cb = cfg.resync.clone();
 
     thread::Builder::new()
         .name("stream-to-speaker-http".to_string())
-        .spawn(move || run_server(server, hub, gena_cb, list_cb, select_cb))
+        .spawn(move || run_server(server, hub, gena_cb, list_cb, select_cb, resync_cb))
         .context("spawning HTTP server thread")?;
 
     Ok(actual)
@@ -144,6 +155,7 @@ fn run_server(
     gena_callback: Option<GenaNotifyCallback>,
     speaker_list: Option<SpeakerListCallback>,
     speaker_select: Option<SpeakerSelectCallback>,
+    resync: Option<ResyncCallback>,
 ) {
     for req in server.incoming_requests() {
         let url = req.url().to_string();
@@ -182,6 +194,9 @@ fn run_server(
             }
             (Method::Post, "/api/select") => {
                 serve_select(req, &speaker_select);
+            }
+            (Method::Post, "/api/resync") => {
+                serve_resync(req, &resync);
             }
             (m, path) => {
                 // Could be a GENA NOTIFY. tiny_http parses standard
@@ -239,6 +254,8 @@ fn serve_status_page(req: tiny_http::Request, speakers: &Option<SpeakerListCallb
   table {{ border-collapse: collapse; width: 100%; margin-top: 1em; }}
   td, th {{ padding: 0.4em 0.6em; border-bottom: 1px solid #ddd; text-align: left; }}
   button {{ padding: 0.3em 0.8em; }}
+  .actions {{ margin-top: 1.5em; }}
+  .actions button {{ margin-right: 0.5em; }}
 </style>
 </head><body>
 <h1>Stream To Speaker</h1>
@@ -247,6 +264,9 @@ fn serve_status_page(req: tiny_http::Request, speakers: &Option<SpeakerListCallb
   <thead><tr><th>Speaker</th><th>IP</th><th></th></tr></thead>
   <tbody>{rows}</tbody>
 </table>
+<div class="actions">
+  <button onclick="resync()" title="Force Sonos to flush its prebuffer (UPnP Stop + Play). Brief audio glitch, but trims accumulated latency.">resync (trim latency)</button>
+</div>
 <script>
 function select(id) {{
   fetch('/api/select', {{
@@ -254,6 +274,11 @@ function select(id) {{
     headers: {{'Content-Type': 'application/json'}},
     body: JSON.stringify({{id: id}})
   }}).then(r => location.reload());
+}}
+function resync() {{
+  fetch('/api/resync', {{method: 'POST'}}).then(r => r.json()).then(j => {{
+    if (j.error) {{ alert('resync failed: ' + j.error); }}
+  }});
 }}
 setTimeout(() => location.reload(), 5000);
 </script>
@@ -311,6 +336,21 @@ fn serve_select(
                 &format!(r#"{{"error":{}}}"#, json_string(&msg)),
             );
         }
+    }
+}
+
+fn serve_resync(req: tiny_http::Request, resync_cb: &Option<ResyncCallback>) {
+    let Some(cb) = resync_cb else {
+        respond_json_owned(req, 503, r#"{"error":"resync unavailable"}"#);
+        return;
+    };
+    match cb() {
+        Ok(()) => respond_json_owned(req, 200, r#"{"ok":true}"#),
+        Err(msg) => respond_json_owned(
+            req,
+            500,
+            &format!(r#"{{"error":{}}}"#, json_string(&msg)),
+        ),
     }
 }
 
