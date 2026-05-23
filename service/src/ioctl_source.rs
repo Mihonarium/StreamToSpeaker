@@ -322,11 +322,34 @@ impl AudioSource for IoctlAudioSource {
             bail!("IOCTL_STREAM_TO_SPEAKER_GET_AUDIO_PACKET failed: WinError {}", e);
         }
         if (returned as usize) < SIZEOF_PACKET_HEADER {
-            bail!(
-                "short audio packet: {} bytes returned (need >= {})",
-                returned,
-                SIZEOF_PACKET_HEADER
-            );
+            // Driver completes the IRP with 0 bytes on StreamStop (see
+            // driver/ioctl.cpp::IoctlOnStreamStop). That happens any
+            // time the audio source pauses — e.g. YouTube pause, app
+            // switching output device. Treat it as "stream paused" and
+            // emit a short silence packet so the loop keeps the HTTP
+            // stream alive instead of killing the whole service (which
+            // would kill the HTTP server, force Sonos to drop the TCP
+            // connection, and require a manual restart).
+            //
+            // The silence detector downstream injects a low noise floor
+            // so Sonos doesn't drop on a long zero run.
+            //
+            // The next recv_packet will block on a fresh IRP until the
+            // next StreamStart fires, so this only emits one silence
+            // packet per stop event — enough to keep the connection
+            // alive across brief pauses. Continuous-silence-during-
+            // pause needs a separate "silence mode" driven by the
+            // event channel; defer until single-packet bridging is
+            // proven insufficient.
+            const SILENCE_FRAMES: usize = 441; // 10 ms at 44.1 kHz
+            return Ok(AudioPacket {
+                samples: vec![0i16; SILENCE_FRAMES * 2],
+                sample_rate: 44_100,
+                channels: 2,
+                timestamp_qpc: 0,
+                stream_position: 0,
+                flags: 0,
+            });
         }
 
         // SAFETY: scratch_in[0..SIZEOF_PACKET_HEADER] is initialised by the
