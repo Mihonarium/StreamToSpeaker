@@ -192,17 +192,26 @@ impl IoctlAudioSource {
     /// link, then run `IOCTL_STREAM_TO_SPEAKER_GET_VERSION` and refuse if the
     /// protocol doesn't match.
     ///
-    /// Opens TWO handles: one for the audio path (recv_packet / push_volume)
-    /// and a separate one for the control-event reader thread. Windows
-    /// serializes synchronous I/O at the file-object level — sharing a handle
-    /// between the audio thread and the control thread means
-    /// `IOCTL_STREAM_TO_SPEAKER_GET_AUDIO_PACKET` blocks at the file-object
-    /// lock behind whichever `IOCTL_STREAM_TO_SPEAKER_GET_CONTROL_EVENT` IRP
-    /// is pending in the driver, and only unsticks when a control event
-    /// arrives. (Symptom: ~1 audio packet per 80 s, matching the rate of
-    /// StreamStart/StreamStop events.) Two handles → two file-object locks →
-    /// no cross-blocking.
+    /// Spawns a dedicated control-event reader thread on a separate
+    /// handle. See `open_audio_only` for the audio-only variant — three
+    /// independent event consumers split the driver's single event
+    /// stream, which scrambles the order of StreamStart/StreamStop
+    /// signals across rapid scrubbing.
     pub fn open() -> Result<Self> {
+        Self::open_inner(true)
+    }
+
+    /// Like `open`, but DOES NOT spawn a control-event reader thread.
+    /// Use this for the audio-data consumer and the volume-push handle —
+    /// neither of them cares about events, and having extra event
+    /// consumers splits the driver's single event stream across racing
+    /// threads (causing out-of-order StreamStart/StreamStop delivery).
+    /// Only the dedicated driver-event consumer should call `open`.
+    pub fn open_audio_only() -> Result<Self> {
+        Self::open_inner(false)
+    }
+
+    fn open_inner(spawn_event_thread: bool) -> Result<Self> {
         let handle = open_device_handle().context("opening StreamToSpeaker device (audio)")?;
 
         // Version handshake.
@@ -215,19 +224,23 @@ impl IoctlAudioSource {
             );
         }
         info!(
-            "StreamToSpeaker driver opened (proto={} build={})",
-            version.protocol_version, version.driver_build
+            "StreamToSpeaker driver opened (proto={} build={}, events={})",
+            version.protocol_version, version.driver_build, spawn_event_thread
         );
 
-        // Dedicated handle for the control-event reader. See the doc-comment
-        // above for the file-object serialization rationale.
-        let event_handle =
-            open_device_handle().context("opening StreamToSpeaker device (control events)")?;
-
-        // Control event channel + reader thread.
+        // Control event channel + (optional) reader thread.
         let (tx, rx) = bounded::<DriverEvent>(64);
         let shutdown = Arc::new(AtomicBool::new(false));
-        spawn_control_event_thread(event_handle, tx, shutdown.clone());
+        if spawn_event_thread {
+            // Dedicated handle for the control-event reader. Windows
+            // serializes synchronous I/O at the file-object level, so
+            // sharing the audio handle would block recv_packet behind
+            // any pending GET_CONTROL_EVENT IRP.
+            let event_handle = open_device_handle()
+                .context("opening StreamToSpeaker device (control events)")?;
+            spawn_control_event_thread(event_handle, tx, shutdown.clone());
+        }
+        // else: rx exists but no producer; events() returns an empty channel.
 
         Ok(Self {
             handle,

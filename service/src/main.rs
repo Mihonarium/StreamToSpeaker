@@ -24,8 +24,8 @@ use std::time::Duration;
 use stream_to_speaker::audio_source::{AudioSource, PACKET_FLAG_STREAM_RESTART};
 use stream_to_speaker::gena::{parse_rendering_notify, GenaManager};
 use stream_to_speaker::http_server::{
-    samples_to_l16_be_bytes, start_http_server, HttpServerConfig, PcmFrame, SpeakerInfo,
-    SpeakerListCallback, SpeakerSelectCallback, StreamHub,
+    samples_to_l16_be_bytes, start_http_server, HttpServerConfig, LatencyAdjustCallback, PcmFrame,
+    ResyncCallback, SpeakerInfo, SpeakerListCallback, SpeakerSelectCallback, StreamHub,
 };
 use stream_to_speaker::picker;
 use stream_to_speaker::silence::{SilenceDetector, DEFAULT_QUIESCENT_AFTER_PACKETS};
@@ -120,6 +120,35 @@ struct Cli {
     /// Log level: error, warn, info, debug, trace.
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    // ---- Latency / clock-drift compensation ------------------------------
+
+    /// Wall-clock ms between silence packets during silence-injection
+    /// mode. Default 10 = real-time (matches 441 frames @ 44.1 kHz).
+    /// Set > 10 to send slower than real-time during silence, draining
+    /// the speaker's prebuffer so post-pause latency is smaller. Values
+    /// too high (e.g., > 30) risk underrun on Sonos.
+    #[arg(long, default_value_t = 10)]
+    silence_pace_ms: u64,
+
+    /// Rate-fudge compensation in parts-per-million for hardware
+    /// clock-skew between the Windows TSC and the speaker's audio
+    /// crystal. Positive = over-produce (insert duplicated frames) to
+    /// match a speaker whose crystal runs faster than the host's, i.e.
+    /// the speaker is draining its buffer faster than we fill it. Try
+    /// +50 to +200 if you see the Sonos buffer slowly running out;
+    /// negative to drop frames if the buffer overflows. 0 disables.
+    #[arg(long, default_value_t = 0)]
+    rate_fudge_ppm: i32,
+
+    /// Maximum frames added or dropped per packet when applying a
+    /// runtime latency-adjust request (POST /api/latency/adjust). At
+    /// 44.1 kHz, 4 frames is 0.09 ms — well below the audibility
+    /// threshold per packet. A 50 ms adjust at step=4 spreads across
+    /// ~550 audio packets (~1.2 s) so it's smooth; raise for a faster
+    /// snap-to-target at the cost of a more audible click.
+    #[arg(long, default_value_t = 4)]
+    latency_adjust_step_frames: u32,
 }
 
 fn main() {
@@ -248,6 +277,14 @@ fn run(cli: Cli) -> Result<()> {
     //    changes to).
     let session: SharedSession = Arc::new(Mutex::new(None));
 
+    // 6b. Latency-adjust counter. Positive value = we owe Sonos N fewer
+    // frames (drop them) → reduces accumulated latency. Negative = we
+    // owe Sonos N more frames (duplicate them) → increases latency
+    // (used to back off if a drain has gone too far). The audio loop
+    // applies up to --latency-adjust-step-frames per packet so the
+    // adjustment is spread out and the artifact is below audibility.
+    let drain_frames = Arc::new(std::sync::atomic::AtomicI64::new(0));
+
     // 7. Stream URI & DIDL.
     let advertise_ip = match cli.advertise_ip.as_deref() {
         Some(ip) => ip.to_string(),
@@ -340,12 +377,57 @@ fn run(cli: Cli) -> Result<()> {
             }) as Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>
         });
 
+    // 9b. Resync callback: stop + play on the active speaker. Forces
+    // Sonos to discard its current prebuffer; on the next Play it picks
+    // a fresh (typically smaller) prebuffer, trimming accumulated latency.
+    let resync: Option<ResyncCallback> = {
+        let session_for_resync = session.clone();
+        Some(Arc::new(move || -> Result<(), String> {
+            let renderer = {
+                let guard = session_for_resync.lock().unwrap();
+                guard.as_ref().map(|s| s.renderer.clone())
+            };
+            let Some(r) = renderer else {
+                return Err("no active speaker".to_string());
+            };
+            info!("resync: UPnP Stop + Play on {}", r.friendly_name);
+            if let Err(e) = upnp::stop(&r.av_transport_control_url) {
+                // Sonos 701 ("not playing") is fine; warn on anything else.
+                debug!("resync stop: {}", e);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            upnp::play(&r.av_transport_control_url)
+                .map_err(|e| format!("play failed: {:#}", e))
+        }) as Arc<dyn Fn() -> Result<(), String> + Send + Sync>)
+    };
+
+    // 9c. Latency-adjust callback. ms > 0 = trim Sonos's latency by N ms
+    // (drop frames over time); ms < 0 = pad by N ms (duplicate frames).
+    let latency_adjust: Option<LatencyAdjustCallback> = {
+        let drain = drain_frames.clone();
+        Some(Arc::new(move |ms: i32| -> i64 {
+            // 44.1 frames per ms at 44.1 kHz. Use i64 math for the cast.
+            let frames = (ms as i64) * (stream_to_speaker::WIRE_SAMPLE_RATE as i64) / 1000;
+            let new_val = drain.fetch_add(frames, std::sync::atomic::Ordering::AcqRel) + frames;
+            info!(
+                "latency adjust: {:+} ms ({:+} frames) → pending {} frames ({} ms)",
+                ms,
+                frames,
+                new_val,
+                new_val / 44, // approx ms
+            );
+            new_val
+        }) as Arc<dyn Fn(i32) -> i64 + Send + Sync>)
+    };
+
     let actual_port = start_http_server(HttpServerConfig {
         bind: bind_socket,
         hub: hub.clone(),
         gena_callback: Some(gena_callback),
         speaker_list: speaker_list.clone(),
         speaker_select: speaker_select.clone(),
+        resync,
+        latency_adjust,
     })?;
 
     let stream_uri = format!("http://{}:{}/stream.raw", advertise_ip, actual_port);
@@ -386,11 +468,38 @@ fn run(cli: Cli) -> Result<()> {
     let mut silence = SilenceDetector::new(cli.silence_packets_threshold, !cli.no_silence_injection);
     let mut last_packet_log = std::time::Instant::now();
     let mut packet_count: u64 = 0;
-    // Silence-injection pacing: 10 ms wall-clock per packet matches the
-    // 10 ms (441-frame) silence packet size = real-time wire rate.
+    // Silence-injection pacing. The packet is always 10 ms (441 frames)
+    // of audio; silence_pace_ms controls the wall-clock interval between
+    // them. Default 10 = real-time. >10 sends slower than real-time, so
+    // Sonos's buffer drains during pauses → smaller post-pause latency.
     const SILENCE_FRAMES: usize = stream_to_speaker::WIRE_SAMPLE_RATE as usize / 100;
-    let silence_period = Duration::from_millis(10);
+    let silence_period = Duration::from_millis(cli.silence_pace_ms.max(1));
+    if cli.silence_pace_ms != 10 {
+        info!(
+            "silence-injection pacing: {} ms wall-clock per 10 ms silence packet ({})",
+            cli.silence_pace_ms,
+            match cli.silence_pace_ms.cmp(&10) {
+                std::cmp::Ordering::Greater => "drains speaker prebuffer between sessions",
+                std::cmp::Ordering::Less => "WARNING: faster than real-time, will overflow",
+                std::cmp::Ordering::Equal => "real-time",
+            }
+        );
+    }
     let mut next_silence_deadline = std::time::Instant::now();
+    // Rate-fudge state: accumulate fractional-frame compensation. Each
+    // real packet adds `pkt_frames * rate_fudge_ppm / 1e6` to the
+    // accumulator; once it crosses 1.0 we duplicate / drop a frame to
+    // emit the correction. Linear interpolation would be cleaner but a
+    // single sample at hundreds-of-ppm is below the audibility threshold.
+    let fudge_ppm = cli.rate_fudge_ppm;
+    let mut fudge_accum: f64 = 0.0;
+    if fudge_ppm != 0 {
+        info!(
+            "rate-fudge compensation: {:+} ppm ({} crystal-skew)",
+            fudge_ppm,
+            if fudge_ppm > 0 { "over-produce (duplicate frames)" } else { "under-produce (drop frames)" }
+        );
+    }
 
     loop {
         let active = stream_active.load(std::sync::atomic::Ordering::Acquire);
@@ -445,6 +554,60 @@ fn run(cli: Cli) -> Result<()> {
         }
 
         silence.process(&mut pkt);
+
+        // Apply rate-fudge: insert / drop a frame when the accumulator
+        // crosses ±1.0. Channels=2, so each frame is a pair of i16s.
+        if fudge_ppm != 0 && !pkt.samples.is_empty() {
+            let frames_in_pkt = pkt.samples.len() / pkt.channels as usize;
+            fudge_accum += (frames_in_pkt as f64) * (fudge_ppm as f64) * 1e-6;
+            if fudge_accum >= 1.0 {
+                fudge_accum -= 1.0;
+                // Duplicate the final frame. One extra frame at 100 ppm
+                // is a click every ~10 s — well below the noise floor.
+                let ch = pkt.channels as usize;
+                let n = pkt.samples.len();
+                if n >= ch {
+                    let mut last = Vec::with_capacity(ch);
+                    last.extend_from_slice(&pkt.samples[n - ch..]);
+                    pkt.samples.extend_from_slice(&last);
+                }
+            } else if fudge_accum <= -1.0 {
+                fudge_accum += 1.0;
+                // Drop the final frame.
+                let ch = pkt.channels as usize;
+                let n = pkt.samples.len();
+                if n >= ch {
+                    pkt.samples.truncate(n - ch);
+                }
+            }
+        }
+
+        // Apply pending latency adjust (drain_frames): at most
+        // latency_adjust_step_frames per packet, signed.
+        if !pkt.samples.is_empty() {
+            let pending = drain_frames.load(std::sync::atomic::Ordering::Acquire);
+            if pending != 0 {
+                let ch = pkt.channels as usize;
+                let max_step = cli.latency_adjust_step_frames.max(1) as i64;
+                let step = pending.signum() * pending.abs().min(max_step);
+                if step > 0 {
+                    // Drop `step` frames from the end of this packet.
+                    let drop_samples = (step as usize) * ch;
+                    let new_len = pkt.samples.len().saturating_sub(drop_samples);
+                    pkt.samples.truncate(new_len);
+                    drain_frames.fetch_sub(step, std::sync::atomic::Ordering::AcqRel);
+                } else if step < 0 && pkt.samples.len() >= ch {
+                    // Insert |step| duplicates of the last frame.
+                    let last_frame_start = pkt.samples.len() - ch;
+                    let last_frame: Vec<i16> = pkt.samples[last_frame_start..].to_vec();
+                    for _ in 0..(-step) {
+                        pkt.samples.extend_from_slice(&last_frame);
+                    }
+                    drain_frames.fetch_sub(step, std::sync::atomic::Ordering::AcqRel);
+                }
+            }
+        }
+
         let bytes = samples_to_l16_be_bytes(&pkt.samples);
         hub.publish(PcmFrame(Arc::new(bytes)));
 
@@ -505,7 +668,7 @@ fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
             #[cfg(windows)]
             {
                 use stream_to_speaker::ioctl_source::IoctlAudioSource;
-                let src = IoctlAudioSource::open()
+                let src = IoctlAudioSource::open_audio_only()
                     .context("opening Stream-To-Speaker kernel driver (--source driver was specified)")?;
                 Ok(Box::new(src))
             }
@@ -518,7 +681,7 @@ fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
             #[cfg(windows)]
             {
                 use stream_to_speaker::ioctl_source::IoctlAudioSource;
-                match IoctlAudioSource::open() {
+                match IoctlAudioSource::open_audio_only() {
                     Ok(s) => Ok(Box::new(s)),
                     Err(e) => {
                         info!(
@@ -646,7 +809,7 @@ fn build_driver_volume_pusher(cli: &Cli) -> Result<Option<Arc<dyn DriverVolumePu
     #[cfg(windows)]
     {
         use stream_to_speaker::ioctl_source::IoctlAudioSource;
-        match IoctlAudioSource::open() {
+        match IoctlAudioSource::open_audio_only() {
             Ok(s) => Ok(Some(Arc::new(IoctlPusher {
                 src: std::sync::Mutex::new(s),
             }))),
