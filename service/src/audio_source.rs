@@ -43,6 +43,23 @@ impl AudioPacket {
         }
     }
 
+    /// Construct a silent packet of `n_frames` stereo frames at the wire
+    /// format. Used by the main loop and by the IOCTL source when the
+    /// driver signals a stream stop (it drains pending IRPs with zero
+    /// bytes — see `IoctlOnStreamStop`). The PACKET_FLAG_HINT_SILENT bit
+    /// lets the silence detector skip its scan.
+    pub fn silence(n_frames: usize) -> Self {
+        let channels = crate::WIRE_CHANNELS;
+        Self {
+            samples: vec![0i16; n_frames * channels as usize],
+            sample_rate: crate::WIRE_SAMPLE_RATE,
+            channels,
+            timestamp_qpc: 0,
+            stream_position: 0,
+            flags: PACKET_FLAG_HINT_SILENT,
+        }
+    }
+
     /// Number of sample frames (L+R pairs) in this packet.
     pub fn frame_count(&self) -> usize {
         if self.channels == 0 {

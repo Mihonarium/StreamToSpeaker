@@ -337,6 +337,17 @@ impl AudioSource for IoctlAudioSource {
             let e = unsafe { GetLastError() };
             bail!("IOCTL_STREAM_TO_SPEAKER_GET_AUDIO_PACKET failed: WinError {}", e);
         }
+        // The driver completes pending audio IRPs with Information=0 when
+        // the underlying KS stream goes to non-RUN (see IoctlOnStreamStop).
+        // Treat that as a "stream stopped" hint and return synthesized
+        // silence; the main loop will switch to its silence-injection
+        // mode (gated on the StreamStop control event) on the next
+        // iteration.
+        if returned == 0 {
+            return Ok(AudioPacket::silence(
+                crate::WIRE_SAMPLE_RATE as usize / 100, // 10 ms of silence
+            ));
+        }
         if (returned as usize) < SIZEOF_PACKET_HEADER {
             bail!(
                 "short audio packet: {} bytes returned (need >= {})",
