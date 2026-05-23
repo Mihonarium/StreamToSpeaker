@@ -24,9 +24,17 @@
 #define MyAppName        "Stream To Speaker"
 #define MyAppShortName   "StreamToSpeaker"
 #define MyAppExeName     "stream-to-speaker.exe"
+; AppVersion: free-form (e.g. "0.1.0", "0.1.0-rc.1", "0.1.0-abcdef0").
 ; Override on the command line: ISCC /DAppVersion=0.1.0
 #ifndef AppVersion
   #define AppVersion     "0.1.0"
+#endif
+; VersionInfoVersion: strict X.Y.Z.W numeric — required by the Win32
+; resource format. The build script / CI derives this from AppVersion's
+; numeric prefix and passes it separately so pre-release suffixes
+; ("-rc.1", "-abc1234") don't break the compile.
+#ifndef VersionInfoVersion
+  #define VersionInfoVersion "0.1.0.0"
 #endif
 #define MyAppPublisher   "Stream To Speaker"
 #define MyAppURL         "https://github.com/Mihonarium/StreamToSpeaker"
@@ -41,7 +49,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#VersionInfoVersion}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
