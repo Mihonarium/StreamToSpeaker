@@ -1,0 +1,174 @@
+name: Build installer
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into the installer filename (default: 0.1.0-<short-sha>)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # for release uploads on tag pushes
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pin to the latest published 24H2 WDK at time of writing. Bump
+  # whenever the build switches to a newer header.
+  WDK_INSTALLER_URL: "https://go.microsoft.com/fwlink/?linkid=2272234"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------
+      # Compute a version string.  Tag push (v1.2.3) → 1.2.3.  Anything
+      # else → 0.1.0-<short-sha> or the workflow_dispatch input.
+      # -----------------------------------------------------------------
+      - name: Compute version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = ""
+          if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.version }}") {
+              $v = "${{ inputs.version }}"
+          } elseif ("${{ github.ref }}" -like "refs/tags/v*") {
+              $v = "${{ github.ref }}" -replace "refs/tags/v", ""
+          } else {
+              $sha = "${{ github.sha }}".Substring(0, 7)
+              $v = "0.1.0-$sha"
+          }
+          Write-Host "Version: $v"
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------
+      # Toolchains
+      # -----------------------------------------------------------------
+      - name: Set up Rust (stable, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            service/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('service/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Install WDK
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "wdksetup.exe"
+          Write-Host "Downloading WDK from $env:WDK_INSTALLER_URL"
+          Invoke-WebRequest -Uri $env:WDK_INSTALLER_URL -OutFile $installer -UseBasicParsing
+          Write-Host "Installing WDK (silent, ~5 min)..."
+          $p = Start-Process -FilePath $installer -ArgumentList "/features", "+", "/q", "/norestart" -Wait -PassThru
+          Write-Host "WDK installer exit code: $($p.ExitCode)"
+          # 0 = success, 3010 = success-with-reboot-required (OK in CI)
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+              throw "WDK installer failed with exit $($p.ExitCode)"
+          }
+
+      # Visual Studio's developer command prompt needs to be activated
+      # to expose msbuild on PATH for the driver toolset.
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      # -----------------------------------------------------------------
+      # Build
+      # -----------------------------------------------------------------
+      - name: Build driver (Release|x64)
+        shell: pwsh
+        run: |
+          msbuild driver\StreamToSpeaker.sln `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:SignMode=Off `
+            /nologo `
+            /verbosity:minimal
+          if (-not (Test-Path "driver\x64\Release\StreamToSpeaker\StreamToSpeaker.sys")) {
+              Get-ChildItem -Recurse driver\x64\Release\ | Select-Object FullName
+              throw "Driver .sys not produced where expected"
+          }
+
+      - name: Build service (cargo --release)
+        shell: pwsh
+        working-directory: service
+        run: cargo build --release
+
+      - name: Stage artifacts for installer
+        shell: pwsh
+        run: |
+          $staging = "installer\staging"
+          if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "service\target\release\stream-to-speaker.exe" "$staging\stream-to-speaker.exe"
+          $wanted = "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat"
+          foreach ($name in $wanted) {
+              $found = Get-ChildItem -Path "driver\x64\Release" -Recurse -Filter $name -ErrorAction SilentlyContinue `
+                       | Select-Object -First 1
+              if ($found) {
+                  Copy-Item $found.FullName "$staging\$name" -Force
+                  Write-Host "Staged $($found.FullName)"
+              } elseif ($name -eq "StreamToSpeaker.cat") {
+                  Write-Host "$name not produced (unsigned build)"
+              } else {
+                  throw "Required driver artifact $name not found"
+              }
+          }
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC not at $iscc" }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "installer\StreamToSpeaker.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
+
+      # -----------------------------------------------------------------
+      # Publish
+      # -----------------------------------------------------------------
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StreamToSpeakerSetup-${{ steps.ver.outputs.version }}
+          path: installer/out/StreamToSpeakerSetup-*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload raw driver + service binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ steps.ver.outputs.version }}
+          path: |
+            driver/x64/Release/StreamToSpeaker/StreamToSpeaker.sys
+            driver/x64/Release/StreamToSpeaker/StreamToSpeaker.inf
+            driver/x64/Release/StreamToSpeaker/StreamToSpeaker.cat
+            service/target/release/stream-to-speaker.exe
+          if-no-files-found: warn
+
+      - name: Attach to GitHub Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/out/StreamToSpeakerSetup-*.exe
+          generate_release_notes: true
