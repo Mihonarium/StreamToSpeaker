@@ -29,9 +29,10 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
         .with_title("Stream To Speaker")
         .with_inner_size([640.0, 720.0])
         .with_min_inner_size([520.0, 560.0])
-        // We never want eframe to actually close the window when the
-        // user clicks X — we just hide it (minimise to tray). Setting
-        // close_when_close_button_clicked = false lets us intercept it.
+        // Belt-and-braces — egui's default *should* be visible on
+        // Windows but a few combinations have shipped where it
+        // isn't, leaving us with only a tray icon.
+        .with_visible(true)
         .with_close_button(true);
 
     let options = eframe::NativeOptions {
@@ -65,6 +66,9 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 app: app_for_eframe,
                 last_repaint_request: Instant::now(),
                 tray,
+                frame_count: 0,
+                confirm_close_open: false,
+                skip_close_confirmation: false,
             }))
         }),
     );
@@ -79,11 +83,24 @@ struct StreamToSpeakerApp {
     /// egui app. `!Send` (muda uses Rc internally), so it has to live
     /// on the main thread.
     tray: Option<crate::tray::TrayHandle>,
+    /// egui occasionally fires `close_requested()` on the very first
+    /// frame on Windows; if we react to it we hide the window before
+    /// it ever paints. Bump on each update; ignore close-requests
+    /// before frame 2.
+    frame_count: u64,
+    /// True while the "are you sure" modal is shown.
+    confirm_close_open: bool,
+    /// If the user ticks "don't ask again", subsequent X presses go
+    /// straight to minimise (when tray is up) or quit (when not).
+    skip_close_confirmation: bool,
 }
 
 impl eframe::App for StreamToSpeakerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Periodic repaint for live stats.
+        self.frame_count = self.frame_count.saturating_add(1);
+
+        // Periodic repaint for live stats and so the tray pump runs
+        // even when nothing else triggers a frame.
         if self.last_repaint_request.elapsed() >= Duration::from_millis(100) {
             ctx.request_repaint_after(Duration::from_millis(100));
             self.last_repaint_request = Instant::now();
@@ -95,34 +112,48 @@ impl eframe::App for StreamToSpeakerApp {
             tray.pump(&self.app, ctx);
         }
 
-        // Intercept close-button clicks: hide instead of exit IF the
-        // tray is visible (so the user can still get back). Without the
-        // tray, X means quit.
+        // Handle close-button presses.
+        //   - On the very first frame egui sometimes synthesises a
+        //     close_requested on Windows; we'd hide the window before
+        //     it paints once. Skip the first frame entirely.
+        //   - With a tray: show the confirm modal unless the user has
+        //     opted out, in which case minimise straight to tray.
+        //   - Without a tray: X = quit (no way to get the window back).
         let close_pressed = ctx.input(|i| i.viewport().close_requested());
-        if close_pressed && !self.app.is_shutting_down() {
-            if self.tray.is_some() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if close_pressed && self.frame_count > 1 && !self.app.is_shutting_down() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.tray.is_none() {
+                self.app.request_shutdown();
+            } else if self.skip_close_confirmation {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             } else {
-                // No tray to fall back to — treat X as Quit.
-                self.app.request_shutdown();
+                self.confirm_close_open = true;
             }
         }
         if self.app.is_shutting_down() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        // Modal — drawn on top of the main UI when set.
+        if self.confirm_close_open {
+            self.show_close_modal(ctx);
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            self.show_status_banner(ui);
-            ui.add_space(12.0);
-            self.show_speakers(ui);
-            ui.add_space(12.0);
-            self.show_latency(ui);
-            ui.add_space(12.0);
-            self.show_advanced(ui);
-            ui.add_space(12.0);
-            self.show_stats(ui);
+            // Dim everything behind the modal so it reads as modal.
+            let enabled = !self.confirm_close_open;
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.add_space(4.0);
+                self.show_status_banner(ui);
+                ui.add_space(12.0);
+                self.show_speakers(ui);
+                ui.add_space(12.0);
+                self.show_latency(ui);
+                ui.add_space(12.0);
+                self.show_advanced(ui);
+                ui.add_space(12.0);
+                self.show_stats(ui);
+            });
         });
     }
 }
@@ -359,6 +390,74 @@ impl StreamToSpeakerApp {
         let up = self.app.uptime_secs().max(1);
         self.app.packets_published() / up
     }
+
+    fn show_close_modal(&mut self, ctx: &egui::Context) {
+        // Centred floating window, can't be moved or resized — feels
+        // like a modal dialog without actually blocking the event loop
+        // (which would also block the audio loop's GUI signals).
+        let mut still_open = self.confirm_close_open;
+        let mut new_skip = self.skip_close_confirmation;
+        let mut action: Option<CloseAction> = None;
+
+        egui::Window::new("Close Stream To Speaker?")
+            .open(&mut still_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Minimise to the system tray to keep streaming in the \
+                     background, or quit the app entirely.",
+                );
+                ui.add_space(8.0);
+                ui.checkbox(&mut new_skip, "Always minimise to tray — don't ask again");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("📥  Minimise to tray").strong())
+                        .clicked()
+                    {
+                        action = Some(CloseAction::MinimiseToTray);
+                    }
+                    if ui.button("Quit Stream To Speaker").clicked() {
+                        action = Some(CloseAction::Quit);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() {
+                            action = Some(CloseAction::Cancel);
+                        }
+                    });
+                });
+            });
+
+        // egui::Window's `open` boolean is set to false when the user
+        // clicks the window's own close button — treat that as Cancel.
+        if !still_open && action.is_none() {
+            action = Some(CloseAction::Cancel);
+        }
+
+        self.skip_close_confirmation = new_skip;
+        if let Some(a) = action {
+            self.confirm_close_open = false;
+            match a {
+                CloseAction::MinimiseToTray => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+                CloseAction::Quit => {
+                    self.app.request_shutdown();
+                }
+                CloseAction::Cancel => {}
+            }
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum CloseAction {
+    MinimiseToTray,
+    Quit,
+    Cancel,
 }
 
 fn format_duration(secs: u64) -> String {
