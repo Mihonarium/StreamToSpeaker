@@ -124,6 +124,7 @@ CMiniportWaveRTStream::Init(
     m_StreamFramesProduced   = 0;
     m_StreamFramesConsumed   = 0;
     m_TimerStarted           = FALSE;
+    m_DpcTickCount           = 0;
     KeInitializeTimer(&m_Timer);
     KeInitializeDpc(&m_TimerDpc, ConsumerDpcRoutine, this);
     KeInitializeSpinLock(&m_StateLock);
@@ -167,6 +168,8 @@ CMiniportWaveRTStream::AllocateAudioBuffer(
     *OutOffset = 0;
     *OutCacheType = MmCached;
 
+    ULONG originalRequest = RequestedSize;
+
     /* Round up to whole frame and align to a page. Cap at 64 KB so we
      * never allocate something silly. */
     if (RequestedSize == 0) {
@@ -179,6 +182,11 @@ CMiniportWaveRTStream::AllocateAudioBuffer(
     if (RequestedSize == 0) {
         return STATUS_INVALID_PARAMETER;
     }
+
+    DBG_INFO("AllocateAudioBuffer: engine asked %lu, granting %lu bytes (~%lu ms)",
+             originalRequest, RequestedSize,
+             RequestedSize / STREAM_TO_SPEAKER_FRAME_BYTES * 1000u /
+                 STREAM_TO_SPEAKER_SAMPLE_RATE);
 
     UCHAR* va = static_cast<UCHAR*>(
         ExAllocatePool2(POOL_FLAG_NON_PAGED, RequestedSize, STREAM_TO_SPEAKER_POOL_TAG));
@@ -245,11 +253,26 @@ CMiniportWaveRTStream::GetPosition(_Out_ KSAUDIO_POSITION* OutPosition)
     if (OutPosition == nullptr) {
         return STATUS_INVALID_PARAMETER;
     }
-    /* Bytes consumed-by-driver since stream start. The audio engine
-     * uses this to know when it can refill. */
-    ULONGLONG frames = m_StreamFramesProduced;
-    OutPosition->PlayOffset  = frames * STREAM_TO_SPEAKER_FRAME_BYTES;
-    OutPosition->WriteOffset = frames * STREAM_TO_SPEAKER_FRAME_BYTES;
+    /* PlayOffset = bytes the "device" has consumed since stream start.
+     * WriteOffset = upper bound on valid data ahead of the play head.
+     * The engine schedules its next write using (WriteOffset - PlayOffset)
+     * as the amount of buffered data currently in flight; if we report
+     * the two equal, the engine sees zero look-ahead and writes only
+     * sporadically (long silences, occasional bursts). Mirror the
+     * sysvad WaveRT pattern: lead WriteOffset by one notification
+     * period's worth of bytes so the engine always sees a small
+     * ahead-buffer it should keep filling.
+     *
+     * Cumulative (unbounded) byte counts are explicitly permitted by
+     * the WaveRT spec ("can be greater than the buffer size to avoid
+     * wrapping"). We keep that form. */
+    ULONGLONG bytesPlayed = m_StreamFramesProduced * STREAM_TO_SPEAKER_FRAME_BYTES;
+    ULONG leadFrames =
+        (STREAM_TO_SPEAKER_SAMPLE_RATE *
+         STREAM_TO_SPEAKER_NOTIFICATION_INTERVAL_MS + 999u) / 1000u;
+    ULONG leadBytes = leadFrames * STREAM_TO_SPEAKER_FRAME_BYTES;
+    OutPosition->PlayOffset  = bytesPlayed;
+    OutPosition->WriteOffset = bytesPlayed + leadBytes;
     return STATUS_SUCCESS;
 }
 
@@ -302,11 +325,15 @@ CMiniportWaveRTStream::SetState(_In_ KSSTATE State)
     m_State = State;
     KeReleaseSpinLock(&m_StateLock, old);
 
+    DBG_INFO("SetState: %d -> %d (bufBytes=%lu)",
+             (int)prev, (int)State, m_BufferBytes);
+
     if (State == KSSTATE_RUN && prev != KSSTATE_RUN) {
         /* Reset frame counters and notify user-mode of stream start. */
         m_StreamFramesProduced = 0;
         m_StreamFramesConsumed = 0;
         m_LastTickQpc = KeQueryPerformanceCounter(&m_PerfFrequency);
+        m_DpcTickCount = 0;
 
         PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
         if (ext != nullptr && ext->IoctlCtx != nullptr) {
@@ -363,6 +390,8 @@ CMiniportWaveRTStream::DoCopyToRing()
     LARGE_INTEGER nowQpc = KeQueryPerformanceCounter(nullptr);
     LONGLONG deltaTicks = nowQpc.QuadPart - m_LastTickQpc.QuadPart;
     if (deltaTicks <= 0 || m_PerfFrequency.QuadPart <= 0) {
+        DBG_VERBOSE("DPC: dropping tick deltaTicks=%lld freq=%lld",
+                    deltaTicks, m_PerfFrequency.QuadPart);
         return;
     }
     /* frames = deltaTicks * sampleRate / freq */
@@ -381,10 +410,17 @@ CMiniportWaveRTStream::DoCopyToRing()
     }
 
     /* Cap at half the cyclic buffer per tick — that's the safe window
-     * to read without colliding with the engine's writer. */
+     * to read without colliding with the engine's writer. If we're
+     * further behind than that (e.g. a long DPC delay or timer
+     * coalescing), the data at our read position has likely been
+     * overwritten by the engine writing past us; skip ahead so we
+     * resync to the engine's recent writes. Dropping stale frames is
+     * preferable to feeding the consumer out-of-sequence audio. */
     ULONG bufferFrames = m_BufferBytes / STREAM_TO_SPEAKER_FRAME_BYTES;
     ULONGLONG maxThisTick = bufferFrames / 2;
     if (outstanding > maxThisTick) {
+        ULONGLONG skip = outstanding - maxThisTick;
+        m_StreamFramesConsumed += skip;
         outstanding = maxThisTick;
     }
     if (outstanding == 0) {
@@ -411,6 +447,15 @@ CMiniportWaveRTStream::DoCopyToRing()
     }
 
     m_StreamFramesConsumed += outstanding;
+
+    /* Periodic heartbeat so DPC cadence + per-tick frame count are
+     * visible in WPP / DebugView. ~once per second at 2 ms DPC. */
+    m_DpcTickCount++;
+    if ((m_DpcTickCount & 0x1FF) == 0) {
+        DBG_INFO("DPC #%llu: framesDelta=%lld outstanding=%llu bufBytes=%lu",
+                 (ULONGLONG)m_DpcTickCount, (LONGLONG)framesDelta,
+                 (ULONGLONG)outstanding, m_BufferBytes);
+    }
 }
 
 VOID

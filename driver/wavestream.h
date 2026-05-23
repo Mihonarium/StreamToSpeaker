@@ -91,6 +91,10 @@ private:
     KSPIN_LOCK             m_StateLock;
     BOOLEAN                m_TimerStarted;
 
+    /* Diagnostic counter incremented in DoCopyToRing(); used to gate
+     * periodic DBG_INFO prints so per-tick logging doesn't flood. */
+    ULONGLONG              m_DpcTickCount;
+
     /* Convenience accessor for the device extension. */
     PSTREAM_TO_SPEAKER_DEVICE_EXTENSION DeviceExtension();
 
