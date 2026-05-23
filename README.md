@@ -66,6 +66,21 @@ Then open `http://localhost:5901/` for the speaker picker and live latency contr
 
 If you upgrade the driver later, `pnputil /add-driver` only stages the new binary. Either reboot, or in Device Manager → Stream To Speaker → right-click → Disable, then Enable. Confirm the new build is live by looking at the service log: `StreamToSpeaker driver opened (proto=1 build=N ...)` — the `build` number bumps on every shipped binary.
 
+### "Internal AUX Jack — Stream To Speaker" instead of just "Stream To Speaker"
+
+Windows caches the user-visible endpoint name in the registry the first time an endpoint is enrolled, and the cache survives reinstalls. Fresh installs of the current driver get "Stream To Speaker" from the INF; upgrades over a pre-existing install keep the old cached name until you overwrite it (same registry slot the Sound Settings "Rename" button uses).
+
+A one-line PowerShell fix is in `scripts/Rename-Endpoint.ps1`:
+
+```powershell
+# Run elevated (modifies HKLM):
+.\scripts\Rename-Endpoint.ps1
+# Or with a custom display name:
+.\scripts\Rename-Endpoint.ps1 -Name "Sonos Picture Frame"
+```
+
+The same logic should be a post-install step in any installer that ships this project.
+
 ## Speaker selection
 
 Three ways to pick a target, in increasing order of automation:
