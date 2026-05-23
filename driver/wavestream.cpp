@@ -521,27 +521,29 @@ CMiniportWaveRTStream::DoCopyToRing()
         return;
     }
 
-    /* Compute frames produced since last tick from elapsed QPC.
-     * Advance m_LastTickQpc only by the *exact* QPC delta we converted
-     * into whole frames; the fractional remainder stays in the
-     * delta-to-next-tick so we don't lose drift over long runs. */
+    /* Compute frames-due from total elapsed time since stream start, NOT
+     * from per-tick deltas. The per-tick approach accumulates integer-
+     * division truncation: at 10 MHz QPC and 44.1 kHz sample rate, each
+     * 2 ms call loses ~46 QPC ticks (4.6 µs) to truncation, which adds
+     * up to ~2.3 ms of under-production per real second. Over a minute
+     * that's ~140 ms — enough to drain a 200 ms Sonos buffer in roughly
+     * a minute and a half, matching the reported "speaker drifts ahead
+     * and runs out of buffer" symptom.
+     *
+     * Cumulative-elapsed form keeps drift bounded to one frame (~22 µs)
+     * at any moment because the truncation never compounds. */
     LARGE_INTEGER nowQpc = KeQueryPerformanceCounter(nullptr);
-    LONGLONG deltaTicks = nowQpc.QuadPart - m_LastTickQpc.QuadPart;
-    if (deltaTicks <= 0 || m_PerfFrequency.QuadPart <= 0) {
+    LONGLONG elapsedTicks = nowQpc.QuadPart - m_LastTickQpc.QuadPart;
+    if (elapsedTicks <= 0 || m_PerfFrequency.QuadPart <= 0) {
         return;
     }
-    /* frames = deltaTicks * sampleRate / freq */
-    LONGLONG framesDelta = (deltaTicks * (LONGLONG)STREAM_TO_SPEAKER_SAMPLE_RATE)
-                            / m_PerfFrequency.QuadPart;
-    if (framesDelta <= 0) {
+    ULONGLONG framesDue =
+        ((ULONGLONG)elapsedTicks * (ULONGLONG)STREAM_TO_SPEAKER_SAMPLE_RATE)
+        / (ULONGLONG)m_PerfFrequency.QuadPart;
+    if (framesDue <= m_StreamFramesProduced) {
         return;
     }
-    /* QPC ticks that correspond to exactly framesDelta frames; the
-     * remainder gets carried over to the next tick. */
-    LONGLONG consumedTicks =
-        (framesDelta * m_PerfFrequency.QuadPart) / (LONGLONG)STREAM_TO_SPEAKER_SAMPLE_RATE;
-    m_LastTickQpc.QuadPart += consumedTicks;
-    m_StreamFramesProduced += (ULONGLONG)framesDelta;
+    m_StreamFramesProduced = framesDue;
 
     /* Number of frames we still owe the consumer. */
     ULONGLONG outstanding = m_StreamFramesProduced - m_StreamFramesConsumed;
