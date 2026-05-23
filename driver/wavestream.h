@@ -85,7 +85,7 @@ private:
     KTIMER                 m_Timer;
     KDPC                   m_TimerDpc;
     LARGE_INTEGER          m_TimerInterval;       /* relative, 100-ns units */
-    LARGE_INTEGER          m_LastTickQpc;
+    LARGE_INTEGER          m_StreamStartQpc;      /* QPC at KSSTATE_RUN entry */
     LARGE_INTEGER          m_PerfFrequency;
 
     KSPIN_LOCK             m_StateLock;

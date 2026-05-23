@@ -243,6 +243,17 @@ Ioctl_HandleGetAudio(_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp)
      * race below). InitializeListHead makes the check reliable. */
     InitializeListHead(&Irp->Tail.Overlay.ListEntry);
 
+    /* Diagnostic: rate-limited audio-IRP queue counter. Combined with
+     * the DoCopyToRing producer log and the completion counter below
+     * this tells us whether the service is feeding IRPs at the rate we
+     * expect (~500/s), and which side of the producer/consumer is
+     * stalled when packets stop flowing. */
+    static volatile LONG s_audioQueueCount = 0;
+    LONG queueN = InterlockedIncrement(&s_audioQueueCount);
+    if ((queueN % 500) == 1) {
+        DBG_INFO("IRP queued #%ld (ctx=%p)", queueN, (void*)Ctx);
+    }
+
     /* Mark pending, hook cancel routine, queue. */
     IoMarkIrpPending(Irp);
 
@@ -330,6 +341,20 @@ IoctlTryCompleteAudio(_Inout_ StreamToSpeakerIoctlCtx* Ctx)
         PIRP irp = DequeueAudioIrp(Ctx, old);
         KeReleaseSpinLock(&Ctx->AudioIrpLock, old);
         if (irp == nullptr) {
+            /* Smoking-gun diagnostic: the ring has audio ready but no
+             * IRP is queued to drain it. If this fires repeatedly while
+             * the user-mode service is supposedly blocked in
+             * DeviceIoControl, then either (a) IRPs are landing on a
+             * different IoctlCtx than this one (multi-FDO / stale
+             * g_IoctlCtxPtr), or (b) the service isn't actually issuing
+             * IRPs to this device. Includes the Ctx pointer so we can
+             * compare against the producer-side Ctx logged elsewhere. */
+            static volatile LONG s_starveCount = 0;
+            LONG starveN = InterlockedIncrement(&s_starveCount);
+            if ((starveN % 100) == 1) {
+                DBG_INFO("ring has %lu bytes but no IRP queued (count=%ld ctx=%p)",
+                         avail, starveN, (void*)Ctx);
+            }
             return;
         }
 
@@ -395,6 +420,15 @@ IoctlTryCompleteAudio(_Inout_ StreamToSpeakerIoctlCtx* Ctx)
         irp->IoStatus.Status      = STATUS_SUCCESS;
         irp->IoStatus.Information = sizeof(*hdr) + copied;
         IoCompleteRequest(irp, IO_SOUND_INCREMENT);
+
+        /* Rate-limited completion counter; pairs with the queue counter
+         * in Ioctl_HandleGetAudio. Equal rates ⇒ healthy. */
+        static volatile LONG s_audioCompleteCount = 0;
+        LONG completeN = InterlockedIncrement(&s_audioCompleteCount);
+        if ((completeN % 500) == 1) {
+            DBG_INFO("IRP completed #%ld bytes=%lu (ctx=%p)",
+                     completeN, copied, (void*)Ctx);
+        }
     }
 }
 

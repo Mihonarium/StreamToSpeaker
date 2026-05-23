@@ -135,8 +135,8 @@ CMiniportWaveRTStream::Init(
         -(LONGLONG)STREAM_TO_SPEAKER_NOTIFICATION_INTERVAL_MS * 10000LL;
 
     LARGE_INTEGER freq;
-    m_LastTickQpc  = KeQueryPerformanceCounter(&freq);
-    m_PerfFrequency = freq;
+    m_StreamStartQpc = KeQueryPerformanceCounter(&freq);
+    m_PerfFrequency  = freq;
 
     return STATUS_SUCCESS;
 }
@@ -320,11 +320,20 @@ CMiniportWaveRTStream::SetState(_In_ KSSTATE State)
     m_State = State;
     KeReleaseSpinLock(&m_StateLock, old);
 
+    /* Log every transition: we want to know if the pin ever reaches RUN
+     * (the only state in which audio actually flows) and how often the
+     * engine cycles it. KSSTATE: 0=STOP, 1=ACQUIRE, 2=PAUSE, 3=RUN. */
+    if (prev != State) {
+        DBG_INFO("SetState: %d -> %d", (int)prev, (int)State);
+    }
+
     if (State == KSSTATE_RUN && prev != KSSTATE_RUN) {
-        /* Reset frame counters and notify user-mode of stream start. */
+        /* Reset frame counters and capture stream-start QPC. Producer
+         * frames are computed *absolutely* from elapsed QPC ticks in
+         * DoCopyToRing so per-tick truncation doesn't accumulate. */
         m_StreamFramesProduced = 0;
         m_StreamFramesConsumed = 0;
-        m_LastTickQpc = KeQueryPerformanceCounter(&m_PerfFrequency);
+        m_StreamStartQpc = KeQueryPerformanceCounter(&m_PerfFrequency);
 
         PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
         if (ext != nullptr && ext->IoctlCtx != nullptr) {
@@ -390,34 +399,49 @@ CMiniportWaveRTStream::DoCopyToRing()
 {
     /* Throttled diagnostic so we can confirm in DebugView that the DPC
      * is actually firing and how the produced/consumed counters are
-     * advancing. Logs roughly once per second at the 2 ms cadence. */
+     * advancing. Logs roughly once per second at the 2 ms cadence.
+     * The Ctx pointer is so we can compare against the consumer-side
+     * "IRP queued / completed" logs in ioctl.cpp — if these pointers
+     * disagree, audio is being produced into a different IoctlCtx than
+     * the one user-mode IRPs are reaching. */
     ++m_DpcLogCounter;
     if ((m_DpcLogCounter % 500u) == 1u) {
-        DBG_INFO("DPC #%lu: produced=%llu consumed=%llu bufBytes=%lu",
+        PSTREAM_TO_SPEAKER_DEVICE_EXTENSION extLog = DeviceExtension();
+        void* ctxLog = (extLog != nullptr) ? (void*)extLog->IoctlCtx : nullptr;
+        DBG_INFO("DPC #%lu: produced=%llu consumed=%llu bufBytes=%lu ctx=%p",
                  m_DpcLogCounter,
                  m_StreamFramesProduced,
                  m_StreamFramesConsumed,
-                 m_BufferBytes);
+                 m_BufferBytes,
+                 ctxLog);
     }
 
     if (m_BufferVa == nullptr || m_BufferBytes == 0) {
         return;
     }
 
-    /* Compute frames produced since last tick from elapsed QPC. */
+    /* Compute total frames produced since stream start absolutely from
+     * elapsed QPC. The previous per-tick `framesDelta = deltaTicks *
+     * SR / freq; m_LastTickQpc = nowQpc;` lost the truncation remainder
+     * on every tick, which accumulated into ~0.5% sample-clock drift
+     * (measured: 43,857 fps vs. expected 44,100). With Sonos playing
+     * back from its own 44.1 kHz clock that drift slowly drains its
+     * input buffer and causes the "pauses of growing length, then
+     * disconnect" symptom. Computing total frames as one division
+     * keeps the rounding error bounded to ±1 frame at any moment
+     * instead of compounding. */
     LARGE_INTEGER nowQpc = KeQueryPerformanceCounter(nullptr);
-    LONGLONG deltaTicks = nowQpc.QuadPart - m_LastTickQpc.QuadPart;
-    if (deltaTicks <= 0 || m_PerfFrequency.QuadPart <= 0) {
+    LONGLONG totalTicks = nowQpc.QuadPart - m_StreamStartQpc.QuadPart;
+    if (totalTicks <= 0 || m_PerfFrequency.QuadPart <= 0) {
         return;
     }
-    /* frames = deltaTicks * sampleRate / freq */
-    LONGLONG framesDelta = (deltaTicks * (LONGLONG)STREAM_TO_SPEAKER_SAMPLE_RATE)
-                            / m_PerfFrequency.QuadPart;
-    if (framesDelta <= 0) {
+    ULONGLONG totalFrames =
+        ((ULONGLONG)totalTicks * (ULONGLONG)STREAM_TO_SPEAKER_SAMPLE_RATE)
+        / (ULONGLONG)m_PerfFrequency.QuadPart;
+    if (totalFrames <= m_StreamFramesProduced) {
         return;
     }
-    m_LastTickQpc = nowQpc;
-    m_StreamFramesProduced += (ULONGLONG)framesDelta;
+    m_StreamFramesProduced = totalFrames;
 
     /* Number of frames we still owe the consumer. */
     ULONGLONG outstanding = m_StreamFramesProduced - m_StreamFramesConsumed;
