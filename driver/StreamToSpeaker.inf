@@ -71,7 +71,15 @@ HKR,,FriendlyName,,%StreamToSpeaker.WaveDesc%
 
 HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_SPEAKER%
 HKR,EP\0,%PKEY_AudioEndpoint_Default%,0x00010001,1
-HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,1
+; FormFactor = 0 (RemoteNetworkDevice). This is what Bluetooth A2DP
+; sinks, Miracast, and other network audio devices use; the value
+; correctly describes what we are (a remote endpoint reached over
+; the LAN) and — crucially — keeps OEM APOs like Dolby Atmos for
+; Speakers, Nahimic, Realtek enhancements, etc. from auto-attaching
+; to our pipeline. Those APOs target FormFactor=1 (Speakers) and
+; add ~5-30 ms of in-engine processing latency plus EQ / dynamics
+; that we don't want on a passthrough-to-Sonos path.
+HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,0
 HKR,EP\0,%PKEY_AudioEngine_OEMFormat%,%REG_BINARY%, \
     01,00,02,00,44,AC,00,00,10,B1,02,00,04,00,10,00
 

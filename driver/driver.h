@@ -49,7 +49,7 @@
  * pnputil /add-driver only stages the driver; you still need to bounce
  * the device (Device Manager → disable / enable, or a reboot) for the
  * new binary to be in-memory. */
-#define STREAM_TO_SPEAKER_DRIVER_BUILD          3u
+#define STREAM_TO_SPEAKER_DRIVER_BUILD          4u
 
 /* Stream format constants. v1 supports one fixed format. */
 #define STREAM_TO_SPEAKER_SAMPLE_RATE           44100u
