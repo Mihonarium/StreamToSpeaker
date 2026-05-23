@@ -653,14 +653,16 @@ fn run(cli: Cli) -> Result<()> {
         std::hint::spin_loop();
     }
 
-    // Graceful shutdown: send UPnP Stop on the active speaker (so Sonos
-    // doesn't keep showing us as the source with a stale source name)
-    // and tear down GENA. Best-effort — network or speaker errors here
-    // are logged but don't fail the exit.
-    info!("shutdown: cleaning up");
+    // Graceful shutdown: unsubscribe GENA so the speaker doesn't keep a
+    // stale subscription accruing against its per-client limit. We do
+    // NOT send a UPnP Stop here — when we close the TCP stream Sonos
+    // detects EOF and stops on its own, and skipping the explicit Stop
+    // means we exit ~100 ms faster and the speaker's transport state
+    // transitions look the same as a normal end-of-stream.
+    info!("shutdown: unsubscribing GENA");
     let final_session = session.lock().unwrap().take();
     if let Some(s) = final_session {
-        stop_session(&s);
+        s.gena.unsubscribe();
     }
     info!("shutdown: complete");
     match loop_error {
