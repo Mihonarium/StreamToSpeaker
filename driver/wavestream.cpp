@@ -468,16 +468,27 @@ CMiniportWaveRTStream::StartTimer()
     if (m_TimerStarted) {
         return;
     }
-    /* Raise the system timer resolution to 1 ms so our 2 ms periodic
-     * DPC actually fires at the requested cadence. At Windows' default
-     * 15.625 ms system tick, KeSetTimerEx(period=2) coalesces up to
-     * ~16 ms — that drops the DPC rate from ~500/s to ~64/s and is
-     * one of the suspects for the very-low packet rate. The Windows
-     * audio engine usually bumps the resolution while a session is
-     * active, but we shouldn't depend on it. */
+    /* Raise the system timer resolution so our 2 ms periodic DPC
+     * actually fires at the requested cadence. KeSetTimerEx's period
+     * is clamped to the current system timer resolution — at Windows'
+     * default ~15.625 ms tick, KeSetTimerEx(period=2) coalesces up to
+     * ~16 ms (DPC rate ~64/s instead of ~500/s).
+     *
+     * Request the lowest the system supports by passing 1 (== 100 ns,
+     * i.e. ask for "as fine as possible"). The OS rounds up to its
+     * minimum and returns the granted value. We log it so a 16 ms tick
+     * shows up clearly in DebugView if the request didn't take. */
     if (!m_TimerResolutionRaised) {
-        (void)ExSetTimerResolution(10000u, TRUE);
+        ULONG granted = ExSetTimerResolution(1u, TRUE);
         m_TimerResolutionRaised = TRUE;
+        if (granted > 20000u /* 2 ms in 100-ns units */) {
+            DBG_WARN("ExSetTimerResolution granted %lu (= %lu us); "
+                     "DPC will fire at that interval, not the requested 2 ms",
+                     granted, granted / 10u);
+        } else {
+            DBG_INFO("ExSetTimerResolution granted %lu (= %lu us)",
+                     granted, granted / 10u);
+        }
     }
     m_TimerStarted = TRUE;
     KeSetTimerEx(&m_Timer,

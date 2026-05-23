@@ -605,7 +605,7 @@ fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
             #[cfg(windows)]
             {
                 use stream_to_speaker::ioctl_source::IoctlAudioSource;
-                let src = IoctlAudioSource::open()
+                let src = IoctlAudioSource::open_audio_only()
                     .context("opening Stream-To-Speaker kernel driver (--source driver was specified)")?;
                 Ok(Box::new(src))
             }
@@ -618,7 +618,7 @@ fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
             #[cfg(windows)]
             {
                 use stream_to_speaker::ioctl_source::IoctlAudioSource;
-                match IoctlAudioSource::open() {
+                match IoctlAudioSource::open_audio_only() {
                     Ok(s) => Ok(Box::new(s)),
                     Err(e) => {
                         info!(
@@ -746,7 +746,7 @@ fn build_driver_volume_pusher(cli: &Cli) -> Result<Option<Arc<dyn DriverVolumePu
     #[cfg(windows)]
     {
         use stream_to_speaker::ioctl_source::IoctlAudioSource;
-        match IoctlAudioSource::open() {
+        match IoctlAudioSource::open_audio_only() {
             Ok(s) => Ok(Some(Arc::new(IoctlPusher {
                 src: std::sync::Mutex::new(s),
             }))),

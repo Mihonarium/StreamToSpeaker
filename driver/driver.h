@@ -43,8 +43,13 @@
  * ------------------------------------------------------------------- */
 
 /* Build number reported via IOCTL_STREAM_TO_SPEAKER_GET_VERSION. Bump when
- * shipping a new driver binary. */
-#define STREAM_TO_SPEAKER_DRIVER_BUILD          1u
+ * shipping a new driver binary. Inspect the service-side log line
+ *   "StreamToSpeaker driver opened (proto=1 build=N ...)"
+ * after install to confirm the kernel actually loaded the new bits —
+ * pnputil /add-driver only stages the driver; you still need to bounce
+ * the device (Device Manager → disable / enable, or a reboot) for the
+ * new binary to be in-memory. */
+#define STREAM_TO_SPEAKER_DRIVER_BUILD          2u
 
 /* Stream format constants. v1 supports one fixed format. */
 #define STREAM_TO_SPEAKER_SAMPLE_RATE           44100u
