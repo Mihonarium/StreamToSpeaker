@@ -28,6 +28,8 @@
 param(
     [string]$Configuration = "Release",
     [string]$Version = "0.1.0",
+    [ValidateSet("Off", "TestSign")]
+    [string]$SignMode = "TestSign",
     [switch]$SkipDriver,
     [switch]$SkipService,
     [switch]$SkipInstaller
@@ -46,7 +48,7 @@ function Write-Step($msg) {
 # 1. Driver
 # ---------------------------------------------------------------------------
 if (-not $SkipDriver) {
-    Write-Step "Building driver ($Configuration|x64)"
+    Write-Step "Building driver ($Configuration|x64, SignMode=$SignMode)"
     $msbuild = Get-Command msbuild.exe -ErrorAction SilentlyContinue
     if (-not $msbuild) {
         $candidates = @(
@@ -63,9 +65,19 @@ if (-not $SkipDriver) {
     } else {
         $msbuildExe = $msbuild.Source
     }
+    if ($SignMode -eq "TestSign") {
+        # vcxproj's TestSign target uses signtool /a — picks the first
+        # code-signing cert it finds in CurrentUser\My. Warn if none.
+        $certs = Get-ChildItem Cert:\CurrentUser\My `
+            | Where-Object { $_.EnhancedKeyUsageList | Where-Object { $_.ObjectId -eq "1.3.6.1.5.5.7.3.3" } }
+        if (-not $certs) {
+            Write-Warning "No code-signing cert in CurrentUser\My; the TestSign step will fail. Create one with New-SelfSignedCertificate, or pass -SignMode Off to skip signing."
+        }
+    }
     & $msbuildExe (Join-Path $repoRoot "driver\StreamToSpeaker.sln") `
         "/p:Configuration=$Configuration" `
         "/p:Platform=x64" `
+        "/p:SignMode=$SignMode" `
         "/nologo" `
         "/verbosity:minimal"
     if ($LASTEXITCODE -ne 0) { throw "Driver build failed (exit $LASTEXITCODE)" }

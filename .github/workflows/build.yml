@@ -157,18 +157,59 @@ jobs:
       # -----------------------------------------------------------------
       # Build
       # -----------------------------------------------------------------
-      - name: Build driver (Release|x64)
+      # Generate a self-signed test code-signing certificate so we can
+      # actually sign the driver — Windows in test-signing mode loads
+      # signed-by-untrusted drivers but refuses *un*signed ones. The
+      # cert lives only in the CurrentUser\My store; signtool /a (used
+      # by the vcxproj's TestSign target) auto-selects it. We also
+      # export the .cer so the installer can import it to the target
+      # machine's TrustedPublisher + Root stores.
+      - name: Generate test-signing certificate
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate `
+              -Type CodeSigningCert `
+              -Subject "CN=Stream To Speaker (test sign)" `
+              -KeyAlgorithm RSA `
+              -KeyLength 2048 `
+              -HashAlgorithm SHA256 `
+              -CertStoreLocation "Cert:\CurrentUser\My" `
+              -NotAfter (Get-Date).AddYears(5) `
+              -KeyExportPolicy Exportable `
+              -KeyUsage DigitalSignature `
+              -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+          Write-Host "Generated cert thumbprint: $($cert.Thumbprint)"
+          $cerPath = Join-Path $env:RUNNER_TEMP "StreamToSpeaker.cer"
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          Write-Host "Exported .cer to $cerPath ($((Get-Item $cerPath).Length) bytes)"
+          # Trust it locally too so signtool & inf2cat are happy on the
+          # build agent and the driver is loadable for any CI smoke
+          # test we add later.
+          Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" | Out-Null
+          Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
+
+      - name: Build driver (Release|x64, test-signed)
         shell: pwsh
         run: |
           msbuild driver\StreamToSpeaker.sln `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:SignMode=Off `
+            /p:SignMode=TestSign `
             /nologo `
             /verbosity:minimal
           if (-not (Test-Path "driver\x64\Release\StreamToSpeaker\StreamToSpeaker.sys")) {
               Get-ChildItem -Recurse driver\x64\Release\ | Select-Object FullName
               throw "Driver .sys not produced where expected"
+          }
+          # Verify the .sys actually got signed.
+          $sys = Get-ChildItem -Recurse driver\x64\Release\ -Filter "StreamToSpeaker.sys" | Select-Object -First 1
+          $sig = Get-AuthenticodeSignature $sys.FullName
+          Write-Host "Driver signature status: $($sig.Status) (signer: $($sig.SignerCertificate.Subject))"
+          if ($sig.Status -ne "Valid" -and $sig.Status -ne "UnknownError") {
+              # UnknownError is common with self-signed certs that aren't
+              # rooted in a public CA; that's expected here. Anything else
+              # is a real problem.
+              throw "Driver signature unexpected status: $($sig.Status)"
           }
 
       - name: Build service (cargo --release)
@@ -206,6 +247,13 @@ jobs:
           if (-not $devcon) { throw "devcon.exe not found under WDK Tools" }
           Copy-Item $devcon.FullName "$staging\devcon.exe" -Force
           Write-Host "Staged $($devcon.FullName)"
+          # Test-signing certificate — the installer imports this on
+          # the target machine before devcon install runs so Windows
+          # accepts the test-signed driver.
+          $cer = Join-Path $env:RUNNER_TEMP "StreamToSpeaker.cer"
+          if (-not (Test-Path $cer)) { throw "Test-signing cert not produced" }
+          Copy-Item $cer "$staging\StreamToSpeaker.cer" -Force
+          Write-Host "Staged $cer"
 
       - name: Build installer (Inno Setup)
         shell: pwsh

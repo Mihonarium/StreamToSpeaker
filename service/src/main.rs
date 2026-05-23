@@ -12,10 +12,15 @@
 //! default — pass `--web` to enable it. Even with `--web`, prefer
 //! `--bind 127.0.0.1` unless you trust everyone on the LAN.
 
-// Note: we intentionally keep the console subsystem on Windows. The GUI
-// process still attaches a console for log output; users running with
-// `--headless` get a normal terminal experience. A future installer can
-// flip this to "windows" for the GUI-only flavour.
+// Windows subsystem = "windows" — no console window ever auto-allocated.
+// GUI mode: the egui window + tray are the entire user-facing surface.
+// --headless: we explicitly AttachConsole(ATTACH_PARENT_PROCESS) at
+// startup so output flows to the terminal that launched us (and if
+// there isn't one, output goes nowhere — that's fine for service-style
+// runs). This is the standard pattern for "GUI app that can also be a
+// CLI"; the previous "console subsystem + hide it after the fact" had
+// a race where conhost would briefly flash on screen.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
@@ -162,6 +167,14 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
+    // Headless mode: try to attach to the parent terminal so the user
+    // sees log output. GUI mode: no console at all (windows_subsystem
+    // = "windows" already takes care of that).
+    #[cfg(windows)]
+    if cli.headless {
+        attach_parent_console();
+    }
+
     let mut builder = env_logger::Builder::from_default_env();
     builder
         .filter_level(cli.log_level.parse().unwrap_or(log::LevelFilter::Info))
@@ -171,6 +184,20 @@ fn main() {
     if let Err(e) = run(cli) {
         error!("fatal: {:#}", e);
         std::process::exit(1);
+    }
+}
+
+/// Attach this process to its parent's console, if launched from a
+/// terminal. If the parent had no console (double-click launch), this
+/// is a no-op and output silently goes nowhere — which is the right
+/// thing for service-style runs.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        // Return value is ignored on purpose: failure (no parent
+        // console) just means we operate without one.
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
 }
 
@@ -256,13 +283,8 @@ fn run_headless(app: Arc<App>, source: Box<dyn AudioSource>) -> Result<()> {
 
 #[cfg(windows)]
 fn run_gui_mode(app: Arc<App>, source: Box<dyn AudioSource>, no_tray: bool) -> Result<()> {
-    // Hide the console window the C runtime allocates for us. The
-    // GUI window + tray icon are the user-facing surface; the console
-    // is just noise. We don't FreeConsole because that would close
-    // a parent terminal too if the user launched us from one — we
-    // just hide the window. (In --headless mode this code path isn't
-    // reached, so terminal users keep their console.)
-    hide_console_window();
+    // No console-hiding needed: windows_subsystem = "windows" means
+    // we were never allocated one in the first place.
 
     // Audio loop on a dedicated thread so it can MMCSS itself without
     // interfering with the GUI event loop.
@@ -290,18 +312,6 @@ fn run_gui_mode(app: Arc<App>, source: Box<dyn AudioSource>, no_tray: bool) -> R
     app.request_shutdown();
     shutdown_cleanup(&app);
     Ok(())
-}
-
-#[cfg(windows)]
-fn hide_console_window() {
-    use windows_sys::Win32::System::Console::GetConsoleWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-    unsafe {
-        let hwnd = GetConsoleWindow();
-        if !hwnd.is_null() {
-            ShowWindow(hwnd, SW_HIDE);
-        }
-    }
 }
 
 #[cfg(not(windows))]

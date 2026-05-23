@@ -105,6 +105,14 @@ Source: "{#SourcePath}\Uninstall-Driver.ps1";           DestDir: "{app}\scripts"
 ; no audio endpoint ever appears in Sound Settings.
 Source: "{#SourcePath}\staging\devcon.exe"; DestDir: "{app}\driver"; Flags: ignoreversion
 
+; --- Test-signing certificate ---
+; The CI build signs the driver with a self-generated test cert and
+; ships the public .cer here. Imported to TrustedPublisher + Root on
+; the target machine at install time so Windows (in test-signing
+; mode) accepts our driver. skipifsourcedoesntexist so a local
+; unsigned build still produces an installer.
+Source: "{#SourcePath}\staging\StreamToSpeaker.cer"; DestDir: "{app}\driver"; Flags: ignoreversion skipifsourcedoesntexist
+
 ; --- Docs ---
 Source: "{#SourcePath}\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\..\LICENSE";   DestDir: "{app}"; Flags: ignoreversion
@@ -125,13 +133,29 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
-; 1) Stage the driver package in the DriverStore.
+; 1) Import the test-signing certificate to TrustedPublisher AND Root
+;    so Windows (in test-signing mode) accepts our test-signed driver.
+;    Only runs if the .cer was bundled (CI build does; manual unsigned
+;    local builds skip this step and just hope the user has their
+;    own signing trust set up).
+Filename: "{sys}\certutil.exe"; \
+    Parameters: "-addstore -f TrustedPublisher ""{app}\driver\StreamToSpeaker.cer"""; \
+    StatusMsg: "Trusting driver signature..."; \
+    Flags: runhidden waituntilterminated skipifdoesntexist; \
+    Check: FileExists(ExpandConstant('{app}\driver\StreamToSpeaker.cer'))
+Filename: "{sys}\certutil.exe"; \
+    Parameters: "-addstore -f Root ""{app}\driver\StreamToSpeaker.cer"""; \
+    StatusMsg: "Trusting driver signature..."; \
+    Flags: runhidden waituntilterminated skipifdoesntexist; \
+    Check: FileExists(ExpandConstant('{app}\driver\StreamToSpeaker.cer'))
+
+; 2) Stage the driver package in the DriverStore.
 Filename: "{sys}\pnputil.exe"; \
     Parameters: "/add-driver ""{app}\driver\StreamToSpeaker.inf"" /install"; \
     StatusMsg: "Staging audio driver..."; \
     Flags: runhidden waituntilterminated
 
-; 2) Insert the root-enumerated device. This is what makes "Stream To
+; 3) Insert the root-enumerated device. This is what makes "Stream To
 ;    Speaker" appear in Windows Sound Settings — pnputil only stages
 ;    the driver, the device still has to be created. devcon install
 ;    is idempotent: if the device already exists it just no-ops.
@@ -140,7 +164,7 @@ Filename: "{app}\driver\devcon.exe"; \
     StatusMsg: "Creating audio device..."; \
     Flags: runhidden waituntilterminated
 
-; 3) Overwrite the cached endpoint friendly name (the Windows registry
+; 4) Overwrite the cached endpoint friendly name (the Windows registry
 ;    keeps the auto-generated "Internal AUX Jack ..." string across
 ;    reinstalls; this script writes the same slot Sound Settings'
 ;    Rename button writes to).
@@ -149,7 +173,7 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
     StatusMsg: "Naming the audio endpoint..."; \
     Flags: runhidden waituntilterminated
 
-; 4) Offer to launch the app at the end of install.
+; 5) Offer to launch the app at the end of install.
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; \
     Flags: nowait postinstall skipifsilent
 
