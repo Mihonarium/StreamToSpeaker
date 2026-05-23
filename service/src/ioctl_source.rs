@@ -212,10 +212,13 @@ impl IoctlAudioSource {
             version.protocol_version, version.driver_build
         );
 
-        // Control event channel + reader thread.
+        // Control event channel + reader thread. The reader opens its OWN
+        // handle to the driver — see the long comment on
+        // spawn_control_event_thread for why sharing this handle with the
+        // audio path is catastrophic.
         let (tx, rx) = bounded::<DriverEvent>(64);
         let shutdown = Arc::new(AtomicBool::new(false));
-        spawn_control_event_thread(handle.clone(), tx, shutdown.clone());
+        spawn_control_event_thread(tx, shutdown.clone());
 
         Ok(Self {
             handle,
@@ -649,14 +652,40 @@ fn ioctl_get_version(handle: HANDLE) -> Result<StreamToSpeakerVersionInfo> {
 // Control-event reader thread
 // -----------------------------------------------------------------------------
 
-fn spawn_control_event_thread(
-    handle: SharedHandle,
-    tx: Sender<DriverEvent>,
-    shutdown: Arc<AtomicBool>,
-) {
+// The control-event reader must NEVER share a handle with any thread that
+// also calls `DeviceIoControl` (especially the audio `recv_packet` loop).
+//
+// Windows file handles opened *without* `FILE_FLAG_OVERLAPPED` serialize
+// synchronous I/O at the file-object level: at most one synchronous I/O
+// can be outstanding per handle, and concurrent callers block on the file
+// object lock *before* the kernel even dispatches the IRP to the driver.
+//
+// Until 2026-05-23 this thread re-used the audio thread's handle (Arc
+// cloned). The control thread issued `IOCTL_GET_CONTROL_EVENT` which
+// pended waiting for any event; the audio thread's `IOCTL_GET_AUDIO_PACKET`
+// then blocked at the file-object lock and never reached our dispatcher.
+// Net effect: the audio path produced exactly one packet per control
+// event (typically StreamStart / StreamStop), so YouTube playback
+// surfaced as ~1 packet per pause/resume cycle.
+//
+// Opening a fresh handle here gives the control reader its own file
+// object — no contention with the audio path.
+fn spawn_control_event_thread(tx: Sender<DriverEvent>, shutdown: Arc<AtomicBool>) {
     thread::Builder::new()
         .name("stream-to-speaker-control".to_string())
-        .spawn(move || control_event_loop(handle, tx, shutdown))
+        .spawn(move || {
+            let handle = match open_device_handle() {
+                Ok(h) => h,
+                Err(e) => {
+                    error!(
+                        "control-event thread: open failed: {} — events disabled",
+                        e
+                    );
+                    return;
+                }
+            };
+            control_event_loop(handle, tx, shutdown);
+        })
         .expect("spawning control-event thread");
 }
 
