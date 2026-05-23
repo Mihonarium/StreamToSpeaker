@@ -185,6 +185,10 @@ pub struct IoctlAudioSource {
     mmcss_initialised: bool,
     mmcss_handle: MmcssHandle,
     mmcss_task_index: u32,
+    /// Counts every `DeviceIoControl` invocation made by `recv_packet`. Used
+    /// to rate-limit the IOCTL diagnostic log (first few + every 500th + any
+    /// short return).
+    ioctl_call_count: u64,
 }
 
 impl IoctlAudioSource {
@@ -222,6 +226,7 @@ impl IoctlAudioSource {
             mmcss_initialised: false,
             mmcss_handle: MmcssHandle(std::ptr::null_mut()),
             mmcss_task_index: 0,
+            ioctl_call_count: 0,
         })
     }
 
@@ -301,6 +306,24 @@ impl AudioSource for IoctlAudioSource {
     fn recv_packet(&mut self) -> Result<AudioPacket> {
         self.ensure_mmcss();
 
+        // Diagnostic: confirm we're actually calling DeviceIoControl and how
+        // it's returning. The first IOCTL fires the log unconditionally so
+        // we know the loop is running. After that, log every 500th plus the
+        // first short/0-byte return, so the log shows IOCTL activity but
+        // doesn't flood at 500/s.
+        let call_n = self.ioctl_call_count.wrapping_add(1);
+        self.ioctl_call_count = call_n;
+        let log_call = call_n <= 3 || call_n % 500 == 0;
+        let t0 = std::time::Instant::now();
+        if log_call {
+            debug!(
+                "ioctl: calling GET_AUDIO_PACKET #{} (handle={:p} buflen={})",
+                call_n,
+                self.handle.0 .0,
+                self.scratch_in.len()
+            );
+        }
+
         let mut returned: u32 = 0;
         // SAFETY: scratch_in is sized to IOCTL_BUFFER_BYTES; the driver will
         // write at most that many bytes. METHOD_OUT_DIRECT works fine with
@@ -317,6 +340,13 @@ impl AudioSource for IoctlAudioSource {
                 null_mut(),
             )
         };
+        let elapsed_us = t0.elapsed().as_micros();
+        if log_call || returned == 0 {
+            debug!(
+                "ioctl: returned #{} ok={} bytes={} elapsed_us={}",
+                call_n, ok, returned, elapsed_us
+            );
+        }
         if ok == 0 {
             let e = unsafe { GetLastError() };
             bail!("IOCTL_STREAM_TO_SPEAKER_GET_AUDIO_PACKET failed: WinError {}", e);
