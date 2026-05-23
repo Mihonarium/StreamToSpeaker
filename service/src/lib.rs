@@ -4,6 +4,8 @@
 //! split exists so unit tests can exercise individual pieces (the silence
 //! detector in particular) without booting the whole service.
 
+pub mod app;
+pub mod audio_loop;
 pub mod audio_source;
 pub mod silence;
 pub mod http_server;
@@ -19,6 +21,11 @@ pub mod wasapi_source;
 
 #[cfg(windows)]
 pub mod ioctl_source;
+
+#[cfg(windows)]
+pub mod gui;
+#[cfg(windows)]
+pub mod tray;
 
 /// User-facing product name (shown in CLI help, web status page, etc).
 /// Internal Rust crate name stays `stream_to_speaker` for code stability.
