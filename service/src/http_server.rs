@@ -47,6 +47,12 @@ pub type SpeakerSelectCallback = Arc<dyn Fn(&str) -> Result<(), String> + Send +
 /// Returns Err with a user-presentable message on failure.
 pub type ResyncCallback = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
+/// Callback to adjust latency by N milliseconds (positive = reduce
+/// latency by dropping that much audio gradually; negative = increase
+/// latency by duplicating frames). Returns the new pending-frames
+/// counter so the caller can see how much remains to be applied.
+pub type LatencyAdjustCallback = Arc<dyn Fn(i32) -> i64 + Send + Sync>;
+
 /// One PCM packet to broadcast to subscribers. Pre-encoded as bytes so the
 /// audio thread does the conversion once.
 #[derive(Clone)]
@@ -107,6 +113,9 @@ pub struct HttpServerConfig {
     /// If set, exposes `POST /api/resync` to force-flush the speaker's
     /// prebuffer (UPnP Stop + Play).
     pub resync: Option<ResyncCallback>,
+    /// If set, exposes `POST /api/latency/adjust?ms=N` for gradual
+    /// runtime latency trim / pad.
+    pub latency_adjust: Option<LatencyAdjustCallback>,
 }
 
 impl HttpServerConfig {
@@ -118,6 +127,7 @@ impl HttpServerConfig {
             speaker_list: None,
             speaker_select: None,
             resync: None,
+            latency_adjust: None,
         }
     }
 }
@@ -140,10 +150,11 @@ pub fn start_http_server(cfg: HttpServerConfig) -> Result<u16> {
     let list_cb = cfg.speaker_list.clone();
     let select_cb = cfg.speaker_select.clone();
     let resync_cb = cfg.resync.clone();
+    let latency_cb = cfg.latency_adjust.clone();
 
     thread::Builder::new()
         .name("stream-to-speaker-http".to_string())
-        .spawn(move || run_server(server, hub, gena_cb, list_cb, select_cb, resync_cb))
+        .spawn(move || run_server(server, hub, gena_cb, list_cb, select_cb, resync_cb, latency_cb))
         .context("spawning HTTP server thread")?;
 
     Ok(actual)
@@ -156,6 +167,7 @@ fn run_server(
     speaker_list: Option<SpeakerListCallback>,
     speaker_select: Option<SpeakerSelectCallback>,
     resync: Option<ResyncCallback>,
+    latency_adjust: Option<LatencyAdjustCallback>,
 ) {
     for req in server.incoming_requests() {
         let url = req.url().to_string();
@@ -197,6 +209,9 @@ fn run_server(
             }
             (Method::Post, "/api/resync") => {
                 serve_resync(req, &resync);
+            }
+            (Method::Post, "/api/latency/adjust") => {
+                serve_latency_adjust(req, &latency_adjust);
             }
             (m, path) => {
                 // Could be a GENA NOTIFY. tiny_http parses standard
@@ -265,7 +280,13 @@ fn serve_status_page(req: tiny_http::Request, speakers: &Option<SpeakerListCallb
   <tbody>{rows}</tbody>
 </table>
 <div class="actions">
-  <button onclick="resync()" title="Force Sonos to flush its prebuffer (UPnP Stop + Play). Brief audio glitch, but trims accumulated latency.">resync (trim latency)</button>
+  <button onclick="adjustLatency(-100)" title="Pad 100 ms — sends a sample-doubled gap into the stream so Sonos buffers more, in case a drain went too far and Sonos is glitching">+100 ms latency</button>
+  <button onclick="adjustLatency(-25)" title="Pad 25 ms">+25 ms</button>
+  <button onclick="adjustLatency(25)" title="Drain 25 ms from Sonos's prebuffer by dropping that much audio, spread over ~0.5 s">&minus;25 ms</button>
+  <button onclick="adjustLatency(100)" title="Drain 100 ms — same as above, larger step">&minus;100 ms latency</button>
+  &nbsp;
+  <button onclick="resync()" title="Hard reset: UPnP Stop + Play, Sonos picks a fresh prebuffer. Brief audio glitch.">resync</button>
+  <span id="pending" style="margin-left:0.6em; color:#666; font-size:0.9em;"></span>
 </div>
 <script>
 function select(id) {{
@@ -279,6 +300,16 @@ function resync() {{
   fetch('/api/resync', {{method: 'POST'}}).then(r => r.json()).then(j => {{
     if (j.error) {{ alert('resync failed: ' + j.error); }}
   }});
+}}
+function adjustLatency(ms) {{
+  fetch('/api/latency/adjust?ms=' + ms, {{method: 'POST'}})
+    .then(r => r.json()).then(j => {{
+      if (j.error) {{ alert('latency adjust failed: ' + j.error); return; }}
+      const f = j.pending_frames || 0;
+      const remaining_ms = (f / 44.1).toFixed(0);
+      document.getElementById('pending').textContent =
+        f === 0 ? '' : 'pending: ' + remaining_ms + ' ms';
+    }});
 }}
 setTimeout(() => location.reload(), 5000);
 </script>
@@ -352,6 +383,37 @@ fn serve_resync(req: tiny_http::Request, resync_cb: &Option<ResyncCallback>) {
             &format!(r#"{{"error":{}}}"#, json_string(&msg)),
         ),
     }
+}
+
+fn serve_latency_adjust(
+    req: tiny_http::Request,
+    latency_cb: &Option<LatencyAdjustCallback>,
+) {
+    let Some(cb) = latency_cb else {
+        respond_json_owned(req, 503, r#"{"error":"latency adjust unavailable"}"#);
+        return;
+    };
+    let url = req.url().to_string();
+    let ms = extract_query_int(&url, "ms").unwrap_or(0);
+    if !(-5000..=5000).contains(&ms) {
+        respond_json_owned(req, 400, r#"{"error":"ms must be in [-5000, 5000]"}"#);
+        return;
+    }
+    let pending = cb(ms as i32);
+    respond_json_owned(req, 200, &format!(r#"{{"ok":true,"pending_frames":{}}}"#, pending));
+}
+
+/// Pull an integer-valued query parameter from a request URL.
+fn extract_query_int(url: &str, key: &str) -> Option<i64> {
+    let q = url.split_once('?')?.1;
+    for pair in q.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return v.parse::<i64>().ok();
+            }
+        }
+    }
+    None
 }
 
 fn respond_json_owned(req: tiny_http::Request, status: u16, body: &str) {

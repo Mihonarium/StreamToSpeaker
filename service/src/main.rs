@@ -24,8 +24,8 @@ use std::time::Duration;
 use stream_to_speaker::audio_source::{AudioSource, PACKET_FLAG_STREAM_RESTART};
 use stream_to_speaker::gena::{parse_rendering_notify, GenaManager};
 use stream_to_speaker::http_server::{
-    samples_to_l16_be_bytes, start_http_server, HttpServerConfig, PcmFrame, ResyncCallback,
-    SpeakerInfo, SpeakerListCallback, SpeakerSelectCallback, StreamHub,
+    samples_to_l16_be_bytes, start_http_server, HttpServerConfig, LatencyAdjustCallback, PcmFrame,
+    ResyncCallback, SpeakerInfo, SpeakerListCallback, SpeakerSelectCallback, StreamHub,
 };
 use stream_to_speaker::picker;
 use stream_to_speaker::silence::{SilenceDetector, DEFAULT_QUIESCENT_AFTER_PACKETS};
@@ -140,6 +140,15 @@ struct Cli {
     /// negative to drop frames if the buffer overflows. 0 disables.
     #[arg(long, default_value_t = 0)]
     rate_fudge_ppm: i32,
+
+    /// Maximum frames added or dropped per packet when applying a
+    /// runtime latency-adjust request (POST /api/latency/adjust). At
+    /// 44.1 kHz, 4 frames is 0.09 ms — well below the audibility
+    /// threshold per packet. A 50 ms adjust at step=4 spreads across
+    /// ~550 audio packets (~1.2 s) so it's smooth; raise for a faster
+    /// snap-to-target at the cost of a more audible click.
+    #[arg(long, default_value_t = 4)]
+    latency_adjust_step_frames: u32,
 }
 
 fn main() {
@@ -268,6 +277,14 @@ fn run(cli: Cli) -> Result<()> {
     //    changes to).
     let session: SharedSession = Arc::new(Mutex::new(None));
 
+    // 6b. Latency-adjust counter. Positive value = we owe Sonos N fewer
+    // frames (drop them) → reduces accumulated latency. Negative = we
+    // owe Sonos N more frames (duplicate them) → increases latency
+    // (used to back off if a drain has gone too far). The audio loop
+    // applies up to --latency-adjust-step-frames per packet so the
+    // adjustment is spread out and the artifact is below audibility.
+    let drain_frames = Arc::new(std::sync::atomic::AtomicI64::new(0));
+
     // 7. Stream URI & DIDL.
     let advertise_ip = match cli.advertise_ip.as_deref() {
         Some(ip) => ip.to_string(),
@@ -384,6 +401,25 @@ fn run(cli: Cli) -> Result<()> {
         }) as Arc<dyn Fn() -> Result<(), String> + Send + Sync>)
     };
 
+    // 9c. Latency-adjust callback. ms > 0 = trim Sonos's latency by N ms
+    // (drop frames over time); ms < 0 = pad by N ms (duplicate frames).
+    let latency_adjust: Option<LatencyAdjustCallback> = {
+        let drain = drain_frames.clone();
+        Some(Arc::new(move |ms: i32| -> i64 {
+            // 44.1 frames per ms at 44.1 kHz. Use i64 math for the cast.
+            let frames = (ms as i64) * (stream_to_speaker::WIRE_SAMPLE_RATE as i64) / 1000;
+            let new_val = drain.fetch_add(frames, std::sync::atomic::Ordering::AcqRel) + frames;
+            info!(
+                "latency adjust: {:+} ms ({:+} frames) → pending {} frames ({} ms)",
+                ms,
+                frames,
+                new_val,
+                new_val / 44, // approx ms
+            );
+            new_val
+        }) as Arc<dyn Fn(i32) -> i64 + Send + Sync>)
+    };
+
     let actual_port = start_http_server(HttpServerConfig {
         bind: bind_socket,
         hub: hub.clone(),
@@ -391,6 +427,7 @@ fn run(cli: Cli) -> Result<()> {
         speaker_list: speaker_list.clone(),
         speaker_select: speaker_select.clone(),
         resync,
+        latency_adjust,
     })?;
 
     let stream_uri = format!("http://{}:{}/stream.raw", advertise_ip, actual_port);
@@ -541,6 +578,32 @@ fn run(cli: Cli) -> Result<()> {
                 let n = pkt.samples.len();
                 if n >= ch {
                     pkt.samples.truncate(n - ch);
+                }
+            }
+        }
+
+        // Apply pending latency adjust (drain_frames): at most
+        // latency_adjust_step_frames per packet, signed.
+        if !pkt.samples.is_empty() {
+            let pending = drain_frames.load(std::sync::atomic::Ordering::Acquire);
+            if pending != 0 {
+                let ch = pkt.channels as usize;
+                let max_step = cli.latency_adjust_step_frames.max(1) as i64;
+                let step = pending.signum() * pending.abs().min(max_step);
+                if step > 0 {
+                    // Drop `step` frames from the end of this packet.
+                    let drop_samples = (step as usize) * ch;
+                    let new_len = pkt.samples.len().saturating_sub(drop_samples);
+                    pkt.samples.truncate(new_len);
+                    drain_frames.fetch_sub(step, std::sync::atomic::Ordering::AcqRel);
+                } else if step < 0 && pkt.samples.len() >= ch {
+                    // Insert |step| duplicates of the last frame.
+                    let last_frame_start = pkt.samples.len() - ch;
+                    let last_frame: Vec<i16> = pkt.samples[last_frame_start..].to_vec();
+                    for _ in 0..(-step) {
+                        pkt.samples.extend_from_slice(&last_frame);
+                    }
+                    drain_frames.fetch_sub(step, std::sync::atomic::Ordering::AcqRel);
                 }
             }
         }
