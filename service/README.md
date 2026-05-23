@@ -2,7 +2,7 @@
 
 User-mode Rust service that takes PCM audio from either:
 
-- the **Stream To Speaker virtual audio driver** (via `DeviceIoControl` over the IOCTL contract in `../include/symfonisk_ioctl.h`), or
+- the **Stream To Speaker virtual audio driver** (via `DeviceIoControl` over the IOCTL contract in `../include/stream_to_speaker_ioctl.h`), or
 - **WASAPI loopback** (mirrors whatever Windows is currently playing, through `cpal`), or
 - a built-in **440 Hz sine** for end-to-end testing
 

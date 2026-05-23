@@ -69,9 +69,9 @@ AddReg = StreamToSpeaker.I.Wave.AddReg
 HKR,,CLSID,,%Proxy.CLSID%
 HKR,,FriendlyName,,%StreamToSpeaker.WaveDesc%
 
-HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_LINE_CONNECTOR%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_SPEAKER%
 HKR,EP\0,%PKEY_AudioEndpoint_Default%,0x00010001,1
-HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,7
+HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,1
 HKR,EP\0,%PKEY_AudioEngine_OEMFormat%,%REG_BINARY%, \
     01,00,02,00,44,AC,00,00,10,B1,02,00,04,00,10,00
 
@@ -127,7 +127,12 @@ KSCATEGORY_REALTIME     = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
 KSNAME_Wave             = "Wave"
 KSNAME_Topology         = "Topology"
 
-KSNODETYPE_LINE_CONNECTOR = "{DFF21CE1-F70F-11D0-B917-00A0C9223196}"
+; KSNODETYPE_SPEAKER — tells Windows to label the endpoint as
+; "Speakers" rather than "Internal AUX Jack" (which is what
+; KSNODETYPE_LINE_CONNECTOR produces). Combined with FormFactor=1
+; (Speakers), Sound Settings shows it as a normal speaker output
+; with the friendly name "Stream To Speaker".
+KSNODETYPE_SPEAKER        = "{DFF21BE2-F70F-11D0-B917-00A0C9223196}"
 
 PKEY_AudioEndpoint_Association              = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
 PKEY_AudioEndpoint_Default                  = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"

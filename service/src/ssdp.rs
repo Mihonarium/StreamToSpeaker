@@ -121,7 +121,7 @@ const SSDP_MULTICAST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 2
 /// `iface` is the local IPv4 to send multicast from; pass None to let the
 /// OS pick (works on single-interface machines, but on multihomed hosts
 /// with VPN / virtualization adapters Windows often picks the wrong one
-/// and the Symfonisk never sees our M-SEARCH).
+/// and the speaker never sees our M-SEARCH).
 pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, iface: Option<Ipv4Addr>) {
     thread::Builder::new()
         .name("stream-to-speaker-ssdp".to_string())

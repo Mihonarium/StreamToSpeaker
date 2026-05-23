@@ -464,6 +464,23 @@ fn run(cli: Cli) -> Result<()> {
     #[cfg(windows)]
     spawn_driver_event_consumer(&cli, vsync.clone(), session.clone(), stream_active.clone());
 
+    // 11b. Ctrl-C / SIGTERM handler. Sets the shutdown flag; the audio
+    // loop polls it once per iteration and breaks. On the way out we
+    // send a UPnP Stop to the active speaker so Sonos doesn't keep
+    // "Stream To Speaker" stuck as the source.
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let shutdown_handler = shutdown.clone();
+        if let Err(e) = ctrlc::set_handler(move || {
+            // Idempotent: a second Ctrl-C just confirms the first.
+            if !shutdown_handler.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("shutdown requested — sending UPnP Stop and cleaning up...");
+            }
+        }) {
+            warn!("could not install Ctrl-C handler: {} (use Task Manager / kill to stop)", e);
+        }
+    }
+
     // 12. Audio loop.
     let mut silence = SilenceDetector::new(cli.silence_packets_threshold, !cli.no_silence_injection);
     let mut last_packet_log = std::time::Instant::now();
@@ -486,6 +503,9 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
     let mut next_silence_deadline = std::time::Instant::now();
+    // Holds the error that caused the audio loop to exit (if any) so we
+    // can still run the UPnP-Stop cleanup before returning it.
+    let mut loop_error: Option<anyhow::Error> = None;
     // Rate-fudge state: accumulate fractional-frame compensation. Each
     // real packet adds `pkt_frames * rate_fudge_ppm / 1e6` to the
     // accumulator; once it crosses 1.0 we duplicate / drop a frame to
@@ -502,13 +522,20 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         let active = stream_active.load(std::sync::atomic::Ordering::Acquire);
         let mut pkt = if active {
             match source.recv_packet() {
                 Ok(p) => p,
                 Err(e) => {
+                    if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
                     error!("audio source error: {} — exiting", e);
-                    return Err(e);
+                    loop_error = Some(e);
+                    break;
                 }
             }
         } else {
@@ -624,6 +651,21 @@ fn run(cli: Cli) -> Result<()> {
         // Defensive: keep references alive for cfg(not(windows)) build.
         let _ = (vsync.clone(), &cli);
         std::hint::spin_loop();
+    }
+
+    // Graceful shutdown: send UPnP Stop on the active speaker (so Sonos
+    // doesn't keep showing us as the source with a stale source name)
+    // and tear down GENA. Best-effort — network or speaker errors here
+    // are logged but don't fail the exit.
+    info!("shutdown: cleaning up");
+    let final_session = session.lock().unwrap().take();
+    if let Some(s) = final_session {
+        stop_session(&s);
+    }
+    info!("shutdown: complete");
+    match loop_error {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
