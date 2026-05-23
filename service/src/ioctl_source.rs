@@ -191,8 +191,19 @@ impl IoctlAudioSource {
     /// Open the device via the interface GUID, falling back to the symbolic
     /// link, then run `IOCTL_STREAM_TO_SPEAKER_GET_VERSION` and refuse if the
     /// protocol doesn't match.
+    ///
+    /// Opens TWO handles: one for the audio path (recv_packet / push_volume)
+    /// and a separate one for the control-event reader thread. Windows
+    /// serializes synchronous I/O at the file-object level — sharing a handle
+    /// between the audio thread and the control thread means
+    /// `IOCTL_STREAM_TO_SPEAKER_GET_AUDIO_PACKET` blocks at the file-object
+    /// lock behind whichever `IOCTL_STREAM_TO_SPEAKER_GET_CONTROL_EVENT` IRP
+    /// is pending in the driver, and only unsticks when a control event
+    /// arrives. (Symptom: ~1 audio packet per 80 s, matching the rate of
+    /// StreamStart/StreamStop events.) Two handles → two file-object locks →
+    /// no cross-blocking.
     pub fn open() -> Result<Self> {
-        let handle = open_device_handle().context("opening StreamToSpeaker device")?;
+        let handle = open_device_handle().context("opening StreamToSpeaker device (audio)")?;
 
         // Version handshake.
         let version = ioctl_get_version(handle.0 .0)?;
@@ -208,10 +219,15 @@ impl IoctlAudioSource {
             version.protocol_version, version.driver_build
         );
 
+        // Dedicated handle for the control-event reader. See the doc-comment
+        // above for the file-object serialization rationale.
+        let event_handle =
+            open_device_handle().context("opening StreamToSpeaker device (control events)")?;
+
         // Control event channel + reader thread.
         let (tx, rx) = bounded::<DriverEvent>(64);
         let shutdown = Arc::new(AtomicBool::new(false));
-        spawn_control_event_thread(handle.clone(), tx, shutdown.clone());
+        spawn_control_event_thread(event_handle, tx, shutdown.clone());
 
         Ok(Self {
             handle,
@@ -320,6 +336,17 @@ impl AudioSource for IoctlAudioSource {
         if ok == 0 {
             let e = unsafe { GetLastError() };
             bail!("IOCTL_STREAM_TO_SPEAKER_GET_AUDIO_PACKET failed: WinError {}", e);
+        }
+        // The driver completes pending audio IRPs with Information=0 when
+        // the underlying KS stream goes to non-RUN (see IoctlOnStreamStop).
+        // Treat that as a "stream stopped" hint and return synthesized
+        // silence; the main loop will switch to its silence-injection
+        // mode (gated on the StreamStop control event) on the next
+        // iteration.
+        if returned == 0 {
+            return Ok(AudioPacket::silence(
+                crate::WIRE_SAMPLE_RATE as usize / 100, // 10 ms of silence
+            ));
         }
         if (returned as usize) < SIZEOF_PACKET_HEADER {
             bail!(

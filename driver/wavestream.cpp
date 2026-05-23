@@ -60,10 +60,15 @@ CMiniportWaveRTStream::NonDelegatingQueryInterface(
     if (Object == nullptr) {
         return STATUS_INVALID_PARAMETER;
     }
+    /* IMiniportWaveRTStreamNotification : IMiniportWaveRTStream :
+     * IUnknown, so a single chain of casts handles all three IIDs. */
     if (IsEqualGUIDAligned(Interface, IID_IUnknown)) {
-        *Object = PVOID(PUNKNOWN(PMINIPORTWAVERTSTREAM(this)));
+        *Object = PVOID(PUNKNOWN(static_cast<IMiniportWaveRTStreamNotification*>(this)));
     } else if (IsEqualGUIDAligned(Interface, IID_IMiniportWaveRTStream)) {
-        *Object = PVOID(PMINIPORTWAVERTSTREAM(this));
+        *Object = PVOID(static_cast<IMiniportWaveRTStream*>(
+                    static_cast<IMiniportWaveRTStreamNotification*>(this)));
+    } else if (IsEqualGUIDAligned(Interface, IID_IMiniportWaveRTStreamNotification)) {
+        *Object = PVOID(static_cast<IMiniportWaveRTStreamNotification*>(this));
     } else {
         *Object = nullptr;
     }
@@ -126,9 +131,17 @@ CMiniportWaveRTStream::Init(
     m_TimerStarted           = FALSE;
     m_TimerResolutionRaised  = FALSE;
     m_DpcLogCounter          = 0;
+    m_NotificationEventCount = 0;
+    m_NotificationsPerBuffer = 0;
+    m_BytesPerNotification   = 0;
+    m_LastNotificationConsumed = 0;
+    for (ULONG i = 0; i < STREAM_TO_SPEAKER_MAX_NOTIFICATION_EVENTS; ++i) {
+        m_NotificationEvents[i] = nullptr;
+    }
     KeInitializeTimer(&m_Timer);
     KeInitializeDpc(&m_TimerDpc, ConsumerDpcRoutine, this);
     KeInitializeSpinLock(&m_StateLock);
+    KeInitializeSpinLock(&m_EventLock);
 
     /* 2 ms in 100-ns units = -20000 (negative means relative). */
     m_TimerInterval.QuadPart =
@@ -200,6 +213,13 @@ CMiniportWaveRTStream::AllocateAudioBuffer(
     m_Allocated   = TRUE;
     m_StreamFramesProduced = 0;
     m_StreamFramesConsumed = 0;
+    /* Default to a single notification per buffer wrap. Overwritten
+     * if the engine uses AllocateBufferWithNotification. */
+    if (m_NotificationsPerBuffer == 0) {
+        m_NotificationsPerBuffer = 1;
+    }
+    m_BytesPerNotification = RequestedSize / m_NotificationsPerBuffer;
+    m_LastNotificationConsumed = 0;
 
     *OutMdl           = mdl;
     *OutAllocatedSize = RequestedSize;
@@ -229,6 +249,102 @@ CMiniportWaveRTStream::FreeAudioBuffer(
     m_Allocated   = FALSE;
 }
 
+/* IMiniportWaveRTStreamNotification ------------------------------------- */
+
+STDMETHODIMP
+CMiniportWaveRTStream::AllocateBufferWithNotification(
+    _In_  ULONG               NotificationCount,
+    _In_  ULONG               RequestedSize,
+    _Out_ PMDL*               OutMdl,
+    _Out_ ULONG*              OutAllocatedSize,
+    _Out_ ULONG*              OutOffsetFromFirstPage,
+    _Out_ MEMORY_CACHING_TYPE* OutCacheType)
+{
+    PAGED_CODE();
+    if (NotificationCount == 0) {
+        NotificationCount = 1;
+    }
+    if (NotificationCount > 64) {
+        NotificationCount = 64;
+    }
+    /* Round RequestedSize to a multiple of (frame * NotificationCount)
+     * so each notification chunk is a whole number of frames. */
+    ULONG chunk = STREAM_TO_SPEAKER_FRAME_BYTES * NotificationCount;
+    if (chunk == 0) {
+        chunk = STREAM_TO_SPEAKER_FRAME_BYTES;
+    }
+    RequestedSize -= (RequestedSize % chunk);
+    if (RequestedSize == 0) {
+        RequestedSize = chunk;
+    }
+    m_NotificationsPerBuffer = NotificationCount;
+    /* Reuse AllocateAudioBuffer for the actual allocation — it picks up
+     * m_NotificationsPerBuffer from the line above to compute
+     * m_BytesPerNotification. */
+    return AllocateAudioBuffer(RequestedSize, OutMdl, OutAllocatedSize,
+                               OutOffsetFromFirstPage, OutCacheType);
+}
+
+STDMETHODIMP_(VOID)
+CMiniportWaveRTStream::FreeBufferWithNotification(
+    _In_opt_ PMDL Mdl,
+    _In_     ULONG Size)
+{
+    PAGED_CODE();
+    FreeAudioBuffer(Mdl, Size);
+    m_NotificationsPerBuffer = 0;
+    m_BytesPerNotification   = 0;
+}
+
+STDMETHODIMP
+CMiniportWaveRTStream::RegisterNotificationEvent(_In_ PKEVENT NotificationEvent)
+{
+    PAGED_CODE();
+    if (NotificationEvent == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    KIRQL old;
+    KeAcquireSpinLock(&m_EventLock, &old);
+    NTSTATUS status = STATUS_INSUFFICIENT_RESOURCES;
+    for (ULONG i = 0; i < STREAM_TO_SPEAKER_MAX_NOTIFICATION_EVENTS; ++i) {
+        if (m_NotificationEvents[i] == nullptr) {
+            m_NotificationEvents[i] = NotificationEvent;
+            if (i + 1 > m_NotificationEventCount) {
+                m_NotificationEventCount = i + 1;
+            }
+            status = STATUS_SUCCESS;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&m_EventLock, old);
+    return status;
+}
+
+STDMETHODIMP
+CMiniportWaveRTStream::UnregisterNotificationEvent(_In_ PKEVENT NotificationEvent)
+{
+    PAGED_CODE();
+    if (NotificationEvent == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    KIRQL old;
+    KeAcquireSpinLock(&m_EventLock, &old);
+    NTSTATUS status = STATUS_NOT_FOUND;
+    ULONG highWater = 0;
+    for (ULONG i = 0; i < STREAM_TO_SPEAKER_MAX_NOTIFICATION_EVENTS; ++i) {
+        if (m_NotificationEvents[i] == NotificationEvent) {
+            m_NotificationEvents[i] = nullptr;
+            status = STATUS_SUCCESS;
+        }
+        if (m_NotificationEvents[i] != nullptr) {
+            highWater = i + 1;
+        }
+    }
+    m_NotificationEventCount = highWater;
+    KeReleaseSpinLock(&m_EventLock, old);
+    return status;
+}
+
 STDMETHODIMP_(VOID)
 CMiniportWaveRTStream::GetHWLatency(_Out_ PKSRTAUDIO_HWLATENCY OutLatency)
 {
@@ -253,21 +369,20 @@ CMiniportWaveRTStream::GetPosition(_Out_ KSAUDIO_POSITION* OutPosition)
         return STATUS_SUCCESS;
     }
     /* PlayOffset and WriteOffset are byte offsets *within* the cyclic
-     * buffer (mod m_BufferBytes), not cumulative byte counts. Returning
-     * unbounded counts breaks the engine's modular arithmetic after
-     * one buffer's worth of "consumed" bytes (~23 ms on a 4 KB buffer).
+     * buffer (mod m_BufferBytes), not cumulative byte counts.
      *
-     * WriteOffset must lead PlayOffset so the engine has a non-zero
-     * safe window to write into. With WriteOffset == PlayOffset the
-     * engine sees no write headroom and effectively stops feeding the
-     * buffer — which is the lead suspect for our "rare 8-packet burst"
-     * symptom. Pattern follows sysvad. */
-    ULONGLONG playBytes = m_StreamFramesProduced * STREAM_TO_SPEAKER_FRAME_BYTES;
-    ULONG notificationFrames = (STREAM_TO_SPEAKER_NOTIFICATION_INTERVAL_MS *
-                                STREAM_TO_SPEAKER_SAMPLE_RATE) / 1000u;
-    ULONG notificationBytes = notificationFrames * STREAM_TO_SPEAKER_FRAME_BYTES;
-    OutPosition->PlayOffset  = playBytes % m_BufferBytes;
-    OutPosition->WriteOffset = (playBytes + notificationBytes) % m_BufferBytes;
+     * For a software-emulated render endpoint without a real DMA head
+     * we follow sysvad-VirtualAudio: both offsets equal the wall-clock
+     * play head. The engine then knows the entire region between the
+     * advancing PlayOffset and the engine's own internal write head is
+     * available, and refills accordingly. An earlier attempt put
+     * WriteOffset one notification-interval AHEAD of PlayOffset; that
+     * made the engine treat the queued depth as 2 ms and apparently
+     * throttle, manifesting as ~1 packet per 80 s. */
+    ULONGLONG playBytes = (ULONGLONG)m_StreamFramesProduced * STREAM_TO_SPEAKER_FRAME_BYTES;
+    ULONG offset = (ULONG)(playBytes % (ULONGLONG)m_BufferBytes);
+    OutPosition->PlayOffset  = offset;
+    OutPosition->WriteOffset = offset;
     return STATUS_SUCCESS;
 }
 
@@ -324,6 +439,7 @@ CMiniportWaveRTStream::SetState(_In_ KSSTATE State)
         /* Reset frame counters and notify user-mode of stream start. */
         m_StreamFramesProduced = 0;
         m_StreamFramesConsumed = 0;
+        m_LastNotificationConsumed = 0;
         m_LastTickQpc = KeQueryPerformanceCounter(&m_PerfFrequency);
 
         PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
@@ -393,31 +509,41 @@ CMiniportWaveRTStream::DoCopyToRing()
      * advancing. Logs roughly once per second at the 2 ms cadence. */
     ++m_DpcLogCounter;
     if ((m_DpcLogCounter % 500u) == 1u) {
-        DBG_INFO("DPC #%lu: produced=%llu consumed=%llu bufBytes=%lu",
+        DBG_INFO("DPC #%lu: produced=%llu consumed=%llu bufBytes=%lu notif/buf=%lu",
                  m_DpcLogCounter,
                  m_StreamFramesProduced,
                  m_StreamFramesConsumed,
-                 m_BufferBytes);
+                 m_BufferBytes,
+                 m_NotificationsPerBuffer);
     }
 
     if (m_BufferVa == nullptr || m_BufferBytes == 0) {
         return;
     }
 
-    /* Compute frames produced since last tick from elapsed QPC. */
+    /* Compute frames-due from total elapsed time since stream start, NOT
+     * from per-tick deltas. The per-tick approach accumulates integer-
+     * division truncation: at 10 MHz QPC and 44.1 kHz sample rate, each
+     * 2 ms call loses ~46 QPC ticks (4.6 µs) to truncation, which adds
+     * up to ~2.3 ms of under-production per real second. Over a minute
+     * that's ~140 ms — enough to drain a 200 ms Sonos buffer in roughly
+     * a minute and a half, matching the reported "speaker drifts ahead
+     * and runs out of buffer" symptom.
+     *
+     * Cumulative-elapsed form keeps drift bounded to one frame (~22 µs)
+     * at any moment because the truncation never compounds. */
     LARGE_INTEGER nowQpc = KeQueryPerformanceCounter(nullptr);
-    LONGLONG deltaTicks = nowQpc.QuadPart - m_LastTickQpc.QuadPart;
-    if (deltaTicks <= 0 || m_PerfFrequency.QuadPart <= 0) {
+    LONGLONG elapsedTicks = nowQpc.QuadPart - m_LastTickQpc.QuadPart;
+    if (elapsedTicks <= 0 || m_PerfFrequency.QuadPart <= 0) {
         return;
     }
-    /* frames = deltaTicks * sampleRate / freq */
-    LONGLONG framesDelta = (deltaTicks * (LONGLONG)STREAM_TO_SPEAKER_SAMPLE_RATE)
-                            / m_PerfFrequency.QuadPart;
-    if (framesDelta <= 0) {
+    ULONGLONG framesDue =
+        ((ULONGLONG)elapsedTicks * (ULONGLONG)STREAM_TO_SPEAKER_SAMPLE_RATE)
+        / (ULONGLONG)m_PerfFrequency.QuadPart;
+    if (framesDue <= m_StreamFramesProduced) {
         return;
     }
-    m_LastTickQpc = nowQpc;
-    m_StreamFramesProduced += (ULONGLONG)framesDelta;
+    m_StreamFramesProduced = framesDue;
 
     /* Number of frames we still owe the consumer. */
     ULONGLONG outstanding = m_StreamFramesProduced - m_StreamFramesConsumed;
@@ -425,10 +551,18 @@ CMiniportWaveRTStream::DoCopyToRing()
         return;
     }
 
-    /* Cap at half the cyclic buffer per tick — that's the safe window
-     * to read without colliding with the engine's writer. */
+    /* Cap at (bufferFrames - 1) — i.e., almost the full cyclic buffer.
+     * A previous version capped at bufferFrames/2 which threw away
+     * frames if the DPC was even slightly late, manifesting as a slow
+     * loss until the consumer stalled. We can read up to the full
+     * buffer minus one frame in a single pass because the engine's
+     * write head is by construction ahead of where we read (PlayOffset
+     * gates the engine's write window — see GetPosition). */
     ULONG bufferFrames = m_BufferBytes / STREAM_TO_SPEAKER_FRAME_BYTES;
-    ULONGLONG maxThisTick = bufferFrames / 2;
+    if (bufferFrames == 0) {
+        return;
+    }
+    ULONGLONG maxThisTick = (bufferFrames > 1) ? (ULONGLONG)(bufferFrames - 1) : 1ull;
     if (outstanding > maxThisTick) {
         outstanding = maxThisTick;
     }
@@ -456,6 +590,41 @@ CMiniportWaveRTStream::DoCopyToRing()
     }
 
     m_StreamFramesConsumed += outstanding;
+
+    /* Signal any registered notification events when we've crossed a
+     * notification boundary. The audio engine uses these to schedule
+     * its next buffer fill; without them it falls back to polling
+     * GetPosition at 10-20 ms cadence, which starves a 4 ms buffer. */
+    SignalNotificationEvents();
+}
+
+VOID
+CMiniportWaveRTStream::SignalNotificationEvents()
+{
+    if (m_BytesPerNotification == 0) {
+        return;
+    }
+    ULONGLONG consumedBytes = m_StreamFramesConsumed * STREAM_TO_SPEAKER_FRAME_BYTES;
+    ULONGLONG lastBytes     = m_LastNotificationConsumed * STREAM_TO_SPEAKER_FRAME_BYTES;
+    if (consumedBytes - lastBytes < m_BytesPerNotification) {
+        return;
+    }
+    /* Round down to a notification boundary so we don't drift. */
+    ULONGLONG boundary = (consumedBytes / m_BytesPerNotification)
+                         * (ULONGLONG)m_BytesPerNotification;
+    m_LastNotificationConsumed = boundary / STREAM_TO_SPEAKER_FRAME_BYTES;
+
+    /* DPC-level: already at DISPATCH_LEVEL, no KIRQL save needed. */
+    KeAcquireSpinLockAtDpcLevel(&m_EventLock);
+    for (ULONG i = 0; i < m_NotificationEventCount; ++i) {
+        PKEVENT ev = m_NotificationEvents[i];
+        if (ev != nullptr) {
+            /* KeSetEvent at DISPATCH_LEVEL: Increment IO_NO_INCREMENT,
+             * Wait FALSE so we don't try to wait while at DISPATCH. */
+            KeSetEvent(ev, IO_NO_INCREMENT, FALSE);
+        }
+    }
+    KeReleaseSpinLockFromDpcLevel(&m_EventLock);
 }
 
 VOID

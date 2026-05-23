@@ -375,21 +375,43 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     // 11. Driver-event consumer.
+    // Tracks whether the Windows audio engine is in KSSTATE_RUN. When
+    // not, the audio loop emits paced silence directly instead of
+    // blocking on recv_packet — keeps the Sonos HTTP stream alive.
+    let stream_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
     #[cfg(windows)]
-    spawn_driver_event_consumer(&cli, vsync.clone(), session.clone());
+    spawn_driver_event_consumer(&cli, vsync.clone(), session.clone(), stream_active.clone());
 
     // 12. Audio loop.
     let mut silence = SilenceDetector::new(cli.silence_packets_threshold, !cli.no_silence_injection);
     let mut last_packet_log = std::time::Instant::now();
     let mut packet_count: u64 = 0;
+    // Silence-injection pacing: 10 ms wall-clock per packet matches the
+    // 10 ms (441-frame) silence packet size = real-time wire rate.
+    const SILENCE_FRAMES: usize = stream_to_speaker::WIRE_SAMPLE_RATE as usize / 100;
+    let silence_period = Duration::from_millis(10);
+    let mut next_silence_deadline = std::time::Instant::now();
 
     loop {
-        let mut pkt = match source.recv_packet() {
-            Ok(p) => p,
-            Err(e) => {
-                error!("audio source error: {} — exiting", e);
-                return Err(e);
+        let active = stream_active.load(std::sync::atomic::Ordering::Acquire);
+        let mut pkt = if active {
+            match source.recv_packet() {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("audio source error: {} — exiting", e);
+                    return Err(e);
+                }
             }
+        } else {
+            // Stream is stopped. Emit paced silence so the Sonos HTTP
+            // connection doesn't time out. Use a deadline so we stay
+            // close to real-time even if a previous iteration overran.
+            let now = std::time::Instant::now();
+            if next_silence_deadline > now {
+                std::thread::sleep(next_silence_deadline - now);
+            }
+            next_silence_deadline = next_silence_deadline.max(now) + silence_period;
+            stream_to_speaker::audio_source::AudioPacket::silence(SILENCE_FRAMES)
         };
 
         if pkt.flags & PACKET_FLAG_STREAM_RESTART != 0 {
@@ -407,6 +429,19 @@ fn run(cli: Cli) -> Result<()> {
                 stream_to_speaker::WIRE_CHANNELS
             );
             continue;
+        }
+
+        // The IOCTL source signals "stream stop drain" by returning an
+        // all-zeros 10 ms packet (see ioctl_source.rs). Switch to the
+        // silence-injection branch immediately so we don't re-issue a
+        // blocking IOCTL on the next iteration — saves one round-trip
+        // worth of latency before silence starts flowing to Sonos.
+        if active && pkt.samples.iter().all(|s| *s == 0)
+            && pkt.flags & stream_to_speaker::audio_source::PACKET_FLAG_HINT_SILENT != 0
+        {
+            stream_active.store(false, std::sync::atomic::Ordering::Release);
+            next_silence_deadline = std::time::Instant::now() + silence_period;
+            debug!("audio: stream-stop drain received; emitting silence until StreamStart");
         }
 
         silence.process(&mut pkt);
@@ -512,6 +547,7 @@ fn spawn_driver_event_consumer(
     cli: &Cli,
     vsync: Arc<VolumeSync>,
     session: SharedSession,
+    stream_active: Arc<std::sync::atomic::AtomicBool>,
 ) {
     if cli.source == SourceKind::WasapiLoopback || cli.source == SourceKind::Sine {
         return;
@@ -548,8 +584,14 @@ fn spawn_driver_event_consumer(
                             }
                         }
                     }
-                    DriverEvent::StreamStart => info!("driver: stream start"),
-                    DriverEvent::StreamStop => info!("driver: stream stop"),
+                    DriverEvent::StreamStart => {
+                        info!("driver: stream start");
+                        stream_active.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    DriverEvent::StreamStop => {
+                        info!("driver: stream stop");
+                        stream_active.store(false, std::sync::atomic::Ordering::Release);
+                    }
                     DriverEvent::FormatChange { sample_rate, bits_per_sample, channels } => {
                         info!("driver: format change to {}/{}-bit/{}ch", sample_rate, bits_per_sample, channels);
                     }
@@ -561,7 +603,12 @@ fn spawn_driver_event_consumer(
 
 #[cfg(not(windows))]
 #[allow(dead_code)]
-fn spawn_driver_event_consumer(_cli: &Cli, _vsync: Arc<VolumeSync>, _session: SharedSession) {}
+fn spawn_driver_event_consumer(
+    _cli: &Cli,
+    _vsync: Arc<VolumeSync>,
+    _session: SharedSession,
+    _stream_active: Arc<std::sync::atomic::AtomicBool>,
+) {}
 
 fn current_renderer(session: &SharedSession) -> Option<Renderer> {
     session
