@@ -60,15 +60,14 @@ CMiniportWaveRTStream::NonDelegatingQueryInterface(
     if (Object == nullptr) {
         return STATUS_INVALID_PARAMETER;
     }
+    /* IMiniportWaveRTStreamNotification : IMiniportWaveRTStream :
+     * IUnknown, so a single chain of casts handles all three IIDs. */
     if (IsEqualGUIDAligned(Interface, IID_IUnknown)) {
-        *Object = PVOID(PUNKNOWN(PMINIPORTWAVERTSTREAM(this)));
+        *Object = PVOID(PUNKNOWN(static_cast<IMiniportWaveRTStreamNotification*>(this)));
     } else if (IsEqualGUIDAligned(Interface, IID_IMiniportWaveRTStream)) {
-        *Object = PVOID(PMINIPORTWAVERTSTREAM(this));
+        *Object = PVOID(static_cast<IMiniportWaveRTStream*>(
+                    static_cast<IMiniportWaveRTStreamNotification*>(this)));
     } else if (IsEqualGUIDAligned(Interface, IID_IMiniportWaveRTStreamNotification)) {
-        /* Explicit static_cast disambiguates the multiply-inherited
-         * IUnknown bases — the engine must get the
-         * IMiniportWaveRTStreamNotification vtable, not the
-         * IMiniportWaveRTStream one. */
         *Object = PVOID(static_cast<IMiniportWaveRTStreamNotification*>(this));
     } else {
         *Object = nullptr;

@@ -20,8 +20,11 @@ class CMiniportWaveRT;
  * engine typically registers 1; sysvad supports a small handful. */
 #define STREAM_TO_SPEAKER_MAX_NOTIFICATION_EVENTS  8
 
+/* IMiniportWaveRTStreamNotification : IMiniportWaveRTStream (per
+ * portcls.h), so inheriting just the Notification interface gives us
+ * IMiniportWaveRTStream "for free" — and avoids the C4584 ambiguous-
+ * base warning that fires when both are listed explicitly. */
 class CMiniportWaveRTStream :
-    public IMiniportWaveRTStream,
     public IMiniportWaveRTStreamNotification,
     public CUnknown
 {
