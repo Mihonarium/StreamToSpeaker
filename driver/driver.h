@@ -49,7 +49,7 @@
  * pnputil /add-driver only stages the driver; you still need to bounce
  * the device (Device Manager → disable / enable, or a reboot) for the
  * new binary to be in-memory. */
-#define STREAM_TO_SPEAKER_DRIVER_BUILD          5u
+#define STREAM_TO_SPEAKER_DRIVER_BUILD          6u
 
 /* Stream format constants. v1 supports one fixed format. */
 #define STREAM_TO_SPEAKER_SAMPLE_RATE           44100u
@@ -183,6 +183,14 @@ extern "C" NTSTATUS StreamToSpeakerDispatchCreateClose(
     _In_ PIRP           Irp);
 
 extern "C" NTSTATUS StreamToSpeakerDispatchPassThrough(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP           Irp);
+
+extern "C" NTSTATUS StreamToSpeakerDispatchPower(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP           Irp);
+
+extern "C" NTSTATUS StreamToSpeakerDispatchSystemControl(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_ PIRP           Irp);
 
