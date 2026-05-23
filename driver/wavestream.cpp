@@ -613,7 +613,7 @@ CMiniportWaveRTStream::SignalNotificationEvents()
                          * (ULONGLONG)m_BytesPerNotification;
     m_LastNotificationConsumed = boundary / STREAM_TO_SPEAKER_FRAME_BYTES;
 
-    KIRQL old;
+    /* DPC-level: already at DISPATCH_LEVEL, no KIRQL save needed. */
     KeAcquireSpinLockAtDpcLevel(&m_EventLock);
     for (ULONG i = 0; i < m_NotificationEventCount; ++i) {
         PKEVENT ev = m_NotificationEvents[i];
@@ -624,7 +624,6 @@ CMiniportWaveRTStream::SignalNotificationEvents()
         }
     }
     KeReleaseSpinLockFromDpcLevel(&m_EventLock);
-    UNREFERENCED_PARAMETER(old);
 }
 
 VOID
