@@ -136,8 +136,17 @@ if (-not $SkipInstaller) {
     if (-not $iscc) {
         throw "ISCC.exe (Inno Setup 6) not found. Install from https://jrsoftware.org/isdl.php - or 'choco install innosetup'."
     }
+    # Derive the strict X.Y.Z.W numeric version that the PE resource
+    # format requires — Inno's VersionInfoVersion rejects pre-release
+    # suffixes like "-rc.1" or "-abc1234".
+    $prefix = ($Version -split "[-+]")[0]
+    $parts = $prefix -split "\."
+    while ($parts.Count -lt 4) { $parts += "0" }
+    $parts = $parts | ForEach-Object { if ($_ -match "^\d+$") { $_ } else { "0" } }
+    $viVersion = ($parts[0..3]) -join "."
+
     $iss = Join-Path $repoRoot "installer\StreamToSpeaker.iss"
-    & $iscc "/DAppVersion=$Version" $iss
+    & $iscc "/DAppVersion=$Version" "/DVersionInfoVersion=$viVersion" $iss
     if ($LASTEXITCODE -ne 0) { throw "Installer build failed (exit $LASTEXITCODE)" }
 
     $outDir = Join-Path $repoRoot "installer\out"
