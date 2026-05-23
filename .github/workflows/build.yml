@@ -84,7 +84,39 @@ jobs:
         shell: pwsh
         run: choco install innosetup --no-progress -y
 
-      - name: Install WDK
+      # -----------------------------------------------------------------
+      # WDK install (~5 min cold) + cache.
+      #
+      # Cached paths cover what the WindowsKernelModeDriver10.0 toolset
+      # actually reads at build time:
+      #   - "Windows Kits\10\" — SDK + WDK headers, libs, redist tools
+      #   - "MSBuild\Microsoft\WDK\" under each plausible VS installation
+      #     — the .props/.targets that define the toolset itself
+      #
+      # The KitsRoot10 registry value is re-applied separately because
+      # actions/cache doesn't persist the registry. It's tiny and
+      # idempotent so we always run that step.
+      #
+      # Cache key bumps on every WDK URL change AND on any edit to the
+      # workflow file (so this section can be iterated without poisoning
+      # an old cache).
+      # -----------------------------------------------------------------
+      - name: Restore WDK cache
+        id: cache-wdk
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files (x86)\Windows Kits\10
+            C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\WDK
+            C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Microsoft\WDK
+            C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\WDK
+            C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\WDK
+          key: wdk-${{ env.WDK_INSTALLER_URL }}-v2-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: |
+            wdk-${{ env.WDK_INSTALLER_URL }}-v2-
+
+      - name: Install WDK (cache miss)
+        if: steps.cache-wdk.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $installer = Join-Path $env:RUNNER_TEMP "wdksetup.exe"
@@ -93,10 +125,27 @@ jobs:
           Write-Host "Installing WDK (silent, ~5 min)..."
           $p = Start-Process -FilePath $installer -ArgumentList "/features", "+", "/q", "/norestart" -Wait -PassThru
           Write-Host "WDK installer exit code: $($p.ExitCode)"
-          # 0 = success, 3010 = success-with-reboot-required (OK in CI)
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
               throw "WDK installer failed with exit $($p.ExitCode)"
           }
+
+      # Reapply the KitsRoot10 registry value. The WDK installer sets it;
+      # actions/cache doesn't persist registry, so on a cache HIT we have
+      # to recreate it before MSBuild can find the toolset.
+      - name: Restore WDK registry
+        shell: pwsh
+        run: |
+          $kitsRoot = "C:\Program Files (x86)\Windows Kits\10\"
+          if (-not (Test-Path $kitsRoot)) {
+              throw "Windows Kits\10\ missing after WDK install/restore"
+          }
+          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" `
+                           -Name "KitsRoot10" -Value $kitsRoot -PropertyType String -Force | Out-Null
+          New-Item -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" `
+                           -Name "KitsRoot10" -Value $kitsRoot -PropertyType String -Force | Out-Null
+          Write-Host "KitsRoot10 = $kitsRoot"
 
       # Visual Studio's developer command prompt needs to be activated
       # to expose msbuild on PATH for the driver toolset.
