@@ -12,6 +12,11 @@ driver/*.suo
 driver/*.user
 driver/.vs/
 
+# Installer output
+installer/out/
+installer/staging/
+installer/*.iss.log
+
 # IDE
 .idea/
 .vscode/

@@ -210,7 +210,51 @@ Pass `--web` to enable. Then `http://<host>:5901/` serves a tiny status page wit
 
 - **Driver**: VS 2022 Build Tools (or EWDK) + Windows Driver Kit (WDK) 10.0.22621+. See `driver/README.md`.
 - **Service**: Rust 1.74+ stable. `cargo build --release` from `service/`. Produces `target/release/stream-to-speaker.exe`.
+- **Installer** (optional): [Inno Setup 6](https://jrsoftware.org/isdl.php) — `choco install innosetup` works too.
 - **Test signing** (development): Secure Boot off, `bcdedit /set testsigning on`, reboot. HVCI / Memory Integrity must be off in Windows Security → Device Security → Core Isolation.
+
+## Building the installer
+
+A single-file installer (`StreamToSpeakerSetup-<version>.exe`) ties together the driver, the service binary, the endpoint-rename script, and Start Menu / autostart entries.
+
+```powershell
+# Builds driver + service + installer in one shot. Output:
+# installer\out\StreamToSpeakerSetup-<version>.exe
+.\installer\build-installer.ps1
+
+# Or skip individual steps while iterating:
+.\installer\build-installer.ps1 -SkipDriver        # only re-package
+.\installer\build-installer.ps1 -SkipDriver -SkipService
+.\installer\build-installer.ps1 -Version 0.1.0-rc.1
+```
+
+Per-step source: driver via msbuild, service via cargo, installer via Inno Setup's `ISCC.exe`.
+
+### What the installer does on a target machine
+
+1. Copies `stream-to-speaker.exe` to `Program Files\Stream To Speaker`.
+2. Drops `StreamToSpeaker.sys`/`.inf`/`.cat` into a `driver\` subdirectory.
+3. Runs `pnputil /add-driver /install` — stages the driver and (on Win10 1809+) creates the Root-enumerated device.
+4. Runs `scripts\Rename-Endpoint.ps1` to overwrite the cached "Internal AUX Jack" string in the registry.
+5. Optionally adds a Start Menu shortcut, a desktop shortcut, and an autostart entry (per-user `Run` key).
+6. Offers to launch the app on exit.
+
+Uninstall (via Control Panel → Apps): kills any running `stream-to-speaker.exe`, removes the driver via `Uninstall-Driver.ps1` (looks up the `oemNN.inf` assigned name in the driver store), deletes the install directory.
+
+### Caveat: driver signing
+
+The unsigned driver produced by `cargo`/`msbuild` won't load on a normal Windows machine. For development, the target needs test-signing mode + Secure Boot off + HVCI off (see Build prerequisites above). For a shippable installer that doesn't need test-signing, the `.sys` has to be signed with an EV code-signing certificate and WHQL-attested through the Microsoft Hardware Dev Center portal — out of scope for this repo right now.
+
+## Continuous integration
+
+The `.github/workflows/build.yml` workflow builds driver + service + installer on every push, PR, and tag, on `windows-latest` runners. Artifacts:
+
+- **`StreamToSpeakerSetup-<version>.exe`** — the installer
+- **`binaries-<version>`** — raw `.sys`/`.inf`/`.cat` + `stream-to-speaker.exe`
+
+On a tag push (`v1.2.3`), the installer is also attached to a GitHub Release with auto-generated notes.
+
+The workflow installs the WDK from Microsoft's redistributable URL (~5 min cold cache) and Inno Setup via chocolatey. Cargo is cached by `Cargo.lock` hash. Full cold build takes ~15-20 minutes; warm cache cuts it to ~5.
 
 ## Layout
 
