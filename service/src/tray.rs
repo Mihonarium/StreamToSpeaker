@@ -28,12 +28,14 @@ pub struct TrayHandle {
     // Menu items are !Send, so they live on the GUI thread.
     status_item: MenuItem,
     enable_toggle: CheckMenuItem,
+    open_web_item: MenuItem,
 
     // Ids used to route MenuEvents to actions.
     ids: TrayIds,
 
     last_label: String,
     last_enabled: bool,
+    last_web_enabled: bool,
 }
 
 struct TrayIds {
@@ -82,13 +84,14 @@ pub fn spawn(app: Arc<App>, _egui_ctx: egui::Context) -> Result<TrayHandle> {
     menu.append(&PredefinedMenuItem::separator())?;
 
     let show_window = MenuItem::new("Show window", true, None);
+    let web_on = app.is_web_ui_enabled();
     let open_web = MenuItem::new(
-        if app.config.web_enabled {
+        if web_on {
             "Open web UI"
         } else {
-            "Open web UI (start with --web)"
+            "Open web UI (disabled — enable in window)"
         },
-        app.config.web_enabled,
+        web_on,
         None,
     );
     let quit_item = MenuItem::new("Quit", true, None);
@@ -122,9 +125,11 @@ pub fn spawn(app: Arc<App>, _egui_ctx: egui::Context) -> Result<TrayHandle> {
         _icon: tray,
         status_item,
         enable_toggle,
+        open_web_item: open_web,
         ids,
         last_label: String::new(),
         last_enabled: app.is_streaming_enabled(),
+        last_web_enabled: web_on,
     })
 }
 
@@ -149,6 +154,19 @@ impl TrayHandle {
         if enabled != self.last_enabled {
             self.enable_toggle.set_checked(enabled);
             self.last_enabled = enabled;
+        }
+
+        // Sync the "Open web UI" item label + enabled state based on
+        // whether the runtime web-UI toggle is currently on.
+        let web_on = app.is_web_ui_enabled();
+        if web_on != self.last_web_enabled {
+            self.open_web_item.set_text(if web_on {
+                "Open web UI"
+            } else {
+                "Open web UI (disabled — enable in window)"
+            });
+            self.open_web_item.set_enabled(web_on);
+            self.last_web_enabled = web_on;
         }
 
         // Drain menu events. The receiver is process-global; events
@@ -191,7 +209,7 @@ impl TrayHandle {
         } else if *id == self.ids.switch_speaker || *id == self.ids.show_window {
             show_main_window(ctx);
         } else if *id == self.ids.open_web {
-            if app.config.web_enabled {
+            if app.is_web_ui_enabled() {
                 open_web_ui(&app.config.advertise_ip, app.config.bind.port());
             }
         } else if *id == self.ids.quit {

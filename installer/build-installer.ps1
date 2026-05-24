@@ -51,11 +51,11 @@ function Write-Step($msg) {
 # 1. Driver
 # ---------------------------------------------------------------------------
 if (-not $SkipDriver) {
-    # Stamp the driver build number — git commit count by default. The
+    # Stamp the driver build number - git commit count by default. The
     # SAME number ends up in:
     #   - driver.h's STREAM_TO_SPEAKER_DRIVER_BUILD (returned via IOCTL,
     #     logged by the service: 'driver opened build=N')
-    #   - the INF's DriverVer (1.0.0.N — what Device Manager shows,
+    #   - the INF's DriverVer (1.0.0.N - what Device Manager shows,
     #     what PnP uses to compare versions)
     # Override with -DriverBuild N for reproducible local repro.
     $buildNum = if ($DriverBuild -gt 0) { $DriverBuild } else { [int]((git rev-list --count HEAD).Trim()) }
@@ -81,7 +81,7 @@ if (-not $SkipDriver) {
         $msbuildExe = $msbuild.Source
     }
     if ($SignMode -eq "TestSign") {
-        # vcxproj's TestSign target uses signtool /a — picks the first
+        # vcxproj's TestSign target uses signtool /a - picks the first
         # code-signing cert it finds in CurrentUser\My. Warn if none.
         $certs = Get-ChildItem Cert:\CurrentUser\My `
             | Where-Object { $_.EnhancedKeyUsageList | Where-Object { $_.ObjectId -eq "1.3.6.1.5.5.7.3.3" } }
@@ -131,7 +131,7 @@ $svcExe = Join-Path $repoRoot "service\target\release\stream-to-speaker.exe"
 if (-not (Test-Path $svcExe)) { throw "Service binary not found at $svcExe" }
 Copy-Item $svcExe (Join-Path $staging "stream-to-speaker.exe")
 
-# Driver files — scan the build tree for .sys / .inf / .cat with the
+# Driver files - scan the build tree for .sys / .inf / .cat with the
 # expected basenames so we tolerate WDK output-path variation.
 $driverRoot = Join-Path $repoRoot "driver\x64\$Configuration"
 $wanted = @("StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat")
@@ -151,7 +151,7 @@ foreach ($name in $wanted) {
     }
 }
 
-# devcon.exe from the WDK — needed at install time to add the
+# devcon.exe from the WDK - needed at install time to add the
 # root-enumerated StreamToSpeaker device. Search common WDK locations
 # and copy the x64 build into the staging dir.
 $devconCandidates = Get-ChildItem `
@@ -181,7 +181,7 @@ if (-not $SkipInstaller) {
         throw "ISCC.exe (Inno Setup 6) not found. Install from https://jrsoftware.org/isdl.php - or 'choco install innosetup'."
     }
     # Derive the strict X.Y.Z.W numeric version that the PE resource
-    # format requires — Inno's VersionInfoVersion rejects pre-release
+    # format requires - Inno's VersionInfoVersion rejects pre-release
     # suffixes like "-rc.1" or "-abc1234".
     $prefix = ($Version -split "[-+]")[0]
     $parts = $prefix -split "\."

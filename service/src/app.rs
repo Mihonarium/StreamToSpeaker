@@ -73,6 +73,12 @@ pub struct App {
     pub stream_active: Arc<AtomicBool>,
     /// User toggle. False ⇒ no UPnP session, audio goes into the void.
     pub streaming_enabled: Arc<AtomicBool>,
+    /// Runtime flag for the web UI / JSON API. Initial value comes from
+    /// the `--web` CLI flag, but the user can flip it at runtime from
+    /// the GUI. The `/stream.raw` route is always served (the speaker
+    /// needs it); only the user-facing routes (`/`, `/api/*`) honour
+    /// this flag.
+    pub web_ui_enabled: Arc<AtomicBool>,
     /// Pending latency adjustment, in frames. + drops, − duplicates.
     pub drain_frames: Arc<AtomicI64>,
     pub rate_fudge_ppm: Arc<AtomicI32>,
@@ -89,6 +95,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: AppConfig, discovery: Option<Arc<DiscoveryState>>) -> Arc<Self> {
+        let web_initial = config.web_enabled;
         Arc::new(Self {
             config,
             discovery,
@@ -98,6 +105,7 @@ impl App {
             vsync: Arc::new(VolumeSync::new()),
             stream_active: Arc::new(AtomicBool::new(true)),
             streaming_enabled: Arc::new(AtomicBool::new(true)),
+            web_ui_enabled: Arc::new(AtomicBool::new(web_initial)),
             drain_frames: Arc::new(AtomicI64::new(0)),
             rate_fudge_ppm: Arc::new(AtomicI32::new(0)),
             silence_pace_ms: Arc::new(AtomicU64::new(10)),
@@ -215,6 +223,21 @@ impl App {
 
     pub fn is_streaming_enabled(&self) -> bool {
         self.streaming_enabled.load(Ordering::Acquire)
+    }
+
+    // -------------------------------------------------------------------
+    // Web UI runtime toggle
+    // -------------------------------------------------------------------
+
+    pub fn is_web_ui_enabled(&self) -> bool {
+        self.web_ui_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_web_ui_enabled(&self, enabled: bool) {
+        let was = self.web_ui_enabled.swap(enabled, Ordering::AcqRel);
+        if was != enabled {
+            info!("web UI: {}", if enabled { "enabled" } else { "disabled" });
+        }
     }
 
     // -------------------------------------------------------------------

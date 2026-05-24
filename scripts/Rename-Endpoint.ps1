@@ -2,7 +2,7 @@
 #
 # Direct registry writes to MMDevices entries (DeviceState, the
 # friendly-name PKEY) used to be enough but on Windows 11 24H2+ the
-# audio subsystem ignores them — audiosrv re-derives endpoint state
+# audio subsystem ignores them - audiosrv re-derives endpoint state
 # from the INF + its own cache and overwrites what we set. The
 # documented (well, semi-documented) escape hatch is IPolicyConfig,
 # the COM interface the Sound Settings app uses internally. It
@@ -12,10 +12,10 @@
 #   1. Finds the render endpoint whose DeviceDesc starts with our
 #      product name.
 #   2. Sets its friendly name via IPolicyConfig::SetPropertyValue
-#      (PKEY_Device_FriendlyName) — same path Sound Settings'
+#      (PKEY_Device_FriendlyName) - same path Sound Settings'
 #      Rename button writes to.
 #   3. Makes it visible / enabled via
-#      IPolicyConfig::SetEndpointVisibility(id, true) — same path
+#      IPolicyConfig::SetEndpointVisibility(id, true) - same path
 #      the Sound Settings Allow / Disable toggle uses.
 #
 # All output is captured to %LOCALAPPDATA%\StreamToSpeaker\
@@ -170,7 +170,7 @@ namespace StreamToSpeaker {
         exit 2
     }
 
-    Write-Host "Done — $matched endpoint(s) updated."
+    Write-Host "Done - $matched endpoint(s) updated."
 } catch {
     Write-Warning "Rename-Endpoint failed: $_"
     Write-Warning ($_.ScriptStackTrace)

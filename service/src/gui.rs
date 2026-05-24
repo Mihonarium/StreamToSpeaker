@@ -330,24 +330,30 @@ impl eframe::App for StreamToSpeakerApp {
             .show(ctx, |ui| {
                 let enabled = !self.confirm_close_open;
                 ui.add_enabled_ui(enabled, |ui| {
+                    // Keep the header pinned at the top (theme toggle
+                    // shouldn't scroll away); everything below scrolls
+                    // when the window is shorter than the content.
                     self.show_header(ui, &p);
                     ui.add_space(14.0);
-                    self.show_status_banner(ui, &p);
-                    ui.add_space(14.0);
-                    // Onboarding card: only shown when nothing's set up yet.
-                    // Disappears once a speaker is bound so it doesn't take
-                    // up space on every launch.
-                    if self.app.current_renderer().is_none() {
-                        self.show_onboarding(ui, &p);
-                        ui.add_space(14.0);
-                    }
-                    self.show_speakers(ui, &p);
-                    ui.add_space(14.0);
-                    self.show_latency(ui, &p);
-                    ui.add_space(14.0);
-                    self.show_advanced(ui, &p);
-                    ui.add_space(14.0);
-                    self.show_stats(ui, &p);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.show_status_banner(ui, &p);
+                            ui.add_space(14.0);
+                            if self.app.current_renderer().is_none() {
+                                self.show_onboarding(ui, &p);
+                                ui.add_space(14.0);
+                            }
+                            self.show_speakers(ui, &p);
+                            ui.add_space(14.0);
+                            self.show_latency(ui, &p);
+                            ui.add_space(14.0);
+                            self.show_advanced(ui, &p);
+                            ui.add_space(14.0);
+                            self.show_web_ui(ui, &p);
+                            ui.add_space(14.0);
+                            self.show_stats(ui, &p);
+                        });
                 });
             });
     }
@@ -750,9 +756,9 @@ impl StreamToSpeakerApp {
     fn show_advanced(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
             let toggle_label = if self.advanced_open {
-                "Advanced  ▾"
+                "Advanced  v"
             } else {
-                "Advanced  ▸"
+                "Advanced  >"
             };
             if ui
                 .add(
@@ -833,6 +839,66 @@ impl StreamToSpeakerApp {
                 },
             );
             self.app.set_latency_adjust_step_frames(step.max(1) as u32);
+        });
+    }
+
+    fn show_web_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(ui, p, |ui| {
+            section_label(ui, p, "Web UI");
+            ui.add_space(4.0);
+
+            let on = self.app.is_web_ui_enabled();
+            let url = format!(
+                "http://{}:{}/",
+                self.app.config.advertise_ip,
+                self.app.config.bind.port()
+            );
+
+            ui.label(
+                egui::RichText::new(
+                    "Browser-based control panel + JSON API. Lets you switch \
+                     speakers, adjust latency, and read stats from another device \
+                     on your LAN (e.g. your phone).",
+                )
+                .size(12.0)
+                .color(p.text_secondary),
+            );
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                if on {
+                    if primary_button(ui, p, "Open in browser", 150.0)
+                        .on_hover_text(&url)
+                        .clicked()
+                    {
+                        let _ = open_url(&url);
+                    }
+                    if secondary_button(ui, p, "Disable", 96.0)
+                        .on_hover_text("Stop serving the control panel + JSON API")
+                        .clicked()
+                    {
+                        self.app.set_web_ui_enabled(false);
+                    }
+                } else if primary_button(ui, p, "Enable web UI", 150.0)
+                    .on_hover_text(
+                        "Serve the control panel + JSON API on the local HTTP \
+                         port. The audio stream itself is always served.",
+                    )
+                    .clicked()
+                {
+                    self.app.set_web_ui_enabled(true);
+                }
+            });
+
+            if on {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(&url)
+                        .size(11.0)
+                        .color(p.text_tertiary)
+                        .monospace(),
+                );
+            }
         });
     }
 
@@ -1036,20 +1102,23 @@ fn advanced_row(
     hint: &str,
     add_control: impl FnOnce(&mut egui::Ui),
 ) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new(label)
-                    .strong()
-                    .color(p.text_primary),
-            );
-            ui.label(
-                egui::RichText::new(hint)
-                    .size(11.0)
-                    .color(p.text_secondary),
-            );
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    // Stacked layout (label/hint on top, controls underneath). Horizontal
+    // side-by-side layouts overlap badly when the window is narrow —
+    // vertical is robust at any width and reads cleanly.
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .strong()
+                .color(p.text_primary),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(hint)
+                .size(11.0)
+                .color(p.text_secondary),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
             add_control(ui);
         });
     });
@@ -1077,6 +1146,16 @@ fn stat_pill(ui: &mut egui::Ui, p: &Palette, value: &str, label: &str) {
                 );
             });
         });
+}
+
+fn open_url(url: &str) -> std::io::Result<()> {
+    // Windows: `cmd /C start "" <url>` is the canonical "open default
+    // browser" invocation. The empty quoted string is required because
+    // start treats the first quoted arg as the new window title.
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn()
+        .map(|_| ())
 }
 
 fn format_duration(secs: u64) -> String {

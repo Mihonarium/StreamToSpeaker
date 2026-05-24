@@ -65,6 +65,16 @@ MinVersion=10.0.17763
 WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppExeName}
 SetupLogging=yes
+; pnputil + devcon sometimes set the system-wide "reboot needed" flag
+; after staging / installing drivers, which Inno Setup detects and
+; surfaces as a "Setup needs to restart your computer" prompt. For our
+; install path we don't actually need a reboot — devcon creates the
+; device live, Pre-Install.ps1 wipes the cached MMDevices entries,
+; Rename-Endpoint.ps1 uses IPolicyConfig to apply state authoritatively
+; through audiosrv. Suppress the prompt.
+RestartIfNeededByRun=no
+AlwaysRestart=no
+CloseApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
