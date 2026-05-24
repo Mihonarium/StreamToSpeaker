@@ -96,6 +96,19 @@ HKR,EP\0,%PKEY_AudioEndpoint_Default%,0x00010001,1
 ; as a Speakers form factor.
 HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,1
 HKR,EP\0,%PKEY_AudioEndpoint_Disable_SysFx%,0x00010001,1
+
+; Force the endpoint to be enabled (and visible) by default. Without
+; this, the Windows audio endpoint builder creates endpoints with
+; certain category / form-factor combinations as
+; "disabled + hidden", and the user has to flip the Sound Settings
+; "Allow apps and Windows to use this device" toggle manually. Per
+; the WDK docs:
+;   FLAG_ENABLE       = 0x00000001
+;   FLOW_MASK_RENDER  = 0x00000100
+;   FLOW_MASK_CAPTURE = 0x00000200
+; ORed for "enabled render endpoint" = 0x00000101.
+; Ref: https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/pkey-audiodevice-enableendpointbydefault
+HKR,EP\0,%PKEY_AudioDevice_EnableEndpointByDefault%,0x00010001,0x00000101
 HKR,EP\0,%PKEY_AudioEngine_OEMFormat%,%REG_BINARY%, \
     01,00,02,00,44,AC,00,00,10,B1,02,00,04,00,10,00
 
@@ -172,5 +185,6 @@ PKEY_AudioEndpoint_Default                  = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE
 PKEY_AudioEndpoint_FormFactor               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
 PKEY_AudioEndpoint_Disable_SysFx            = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},5"
 PKEY_AudioEndpoint_Supports_EventDriven_Mode= "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
+PKEY_AudioDevice_EnableEndpointByDefault    = "{F3E80BEF-1723-4FF2-BCC4-7F83DC5E46D4},4"
 PKEY_AudioEngine_DeviceFormat               = "{F19F064D-082C-4E27-BC73-6882A1BB8E4C},0"
 PKEY_AudioEngine_OEMFormat                  = "{E4870E26-3CC5-4CD2-BA46-CA0A9A70ED04},3"
