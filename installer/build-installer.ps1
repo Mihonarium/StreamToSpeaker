@@ -28,6 +28,11 @@
 param(
     [string]$Configuration = "Release",
     [string]$Version = "0.1.0",
+    [ValidateSet("Off", "TestSign")]
+    [string]$SignMode = "TestSign",
+    # Override the auto-bumped driver build number. Useful for local
+    # experiments where you want a stable build= line in the service log.
+    [int]$DriverBuild = 0,
     [switch]$SkipDriver,
     [switch]$SkipService,
     [switch]$SkipInstaller
@@ -46,7 +51,19 @@ function Write-Step($msg) {
 # 1. Driver
 # ---------------------------------------------------------------------------
 if (-not $SkipDriver) {
-    Write-Step "Building driver ($Configuration|x64)"
+    # Stamp the driver build number — git commit count by default. The
+    # SAME number ends up in:
+    #   - driver.h's STREAM_TO_SPEAKER_DRIVER_BUILD (returned via IOCTL,
+    #     logged by the service: 'driver opened build=N')
+    #   - the INF's DriverVer (1.0.0.N — what Device Manager shows,
+    #     what PnP uses to compare versions)
+    # Override with -DriverBuild N for reproducible local repro.
+    $buildNum = if ($DriverBuild -gt 0) { $DriverBuild } else { [int]((git rev-list --count HEAD).Trim()) }
+    $driverHeader = Join-Path $repoRoot "driver\driver.h"
+    $content = Get-Content $driverHeader -Raw
+    $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${buildNum}u"
+    Set-Content -Path $driverHeader -Value $new -NoNewline
+    Write-Step "Building driver ($Configuration|x64, SignMode=$SignMode, build=$buildNum, DriverVer=1.0.0.$buildNum)"
     $msbuild = Get-Command msbuild.exe -ErrorAction SilentlyContinue
     if (-not $msbuild) {
         $candidates = @(
@@ -63,9 +80,20 @@ if (-not $SkipDriver) {
     } else {
         $msbuildExe = $msbuild.Source
     }
+    if ($SignMode -eq "TestSign") {
+        # vcxproj's TestSign target uses signtool /a — picks the first
+        # code-signing cert it finds in CurrentUser\My. Warn if none.
+        $certs = Get-ChildItem Cert:\CurrentUser\My `
+            | Where-Object { $_.EnhancedKeyUsageList | Where-Object { $_.ObjectId -eq "1.3.6.1.5.5.7.3.3" } }
+        if (-not $certs) {
+            Write-Warning "No code-signing cert in CurrentUser\My; the TestSign step will fail. Create one with New-SelfSignedCertificate, or pass -SignMode Off to skip signing."
+        }
+    }
     & $msbuildExe (Join-Path $repoRoot "driver\StreamToSpeaker.sln") `
         "/p:Configuration=$Configuration" `
         "/p:Platform=x64" `
+        "/p:SignMode=$SignMode" `
+        "/p:DriverBuildNumber=$buildNum" `
         "/nologo" `
         "/verbosity:minimal"
     if ($LASTEXITCODE -ne 0) { throw "Driver build failed (exit $LASTEXITCODE)" }

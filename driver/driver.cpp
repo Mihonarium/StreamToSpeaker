@@ -103,6 +103,57 @@ StreamToSpeakerDispatchPassThrough(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP I
     return STATUS_NOT_SUPPORTED;
 }
 
+/* IRP_MJ_POWER dispatcher.
+ *
+ * Power IRPs go to every device object the driver owns — that
+ * includes our control device (created via IoCreateDevice with
+ * DeviceExtensionSize=0), not just the PortCls-created audio FDO.
+ * PortCls's Power handler only knows about the audio FDO; when it
+ * sees a Power IRP for our control device it dereferences a
+ * non-existent device extension into garbage and either stalls or
+ * skips PoStartNextPowerIrp / completion, after which the system
+ * hits BugCheck 0x9F (DRIVER_POWER_STATE_FAILURE) sub-code 3
+ * ("a device object has been blocking an IRP for too long").
+ *
+ * Route by device:
+ *   - Control device: complete with success. There's no power
+ *     state to manage; we just need to acknowledge so the power
+ *     manager moves on.
+ *   - Audio FDO: forward to PortCls.
+ */
+extern "C" NTSTATUS
+StreamToSpeakerDispatchPower(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+    if (DeviceObject == g_ControlDevice) {
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = 0;
+        /* PoStartNextPowerIrp is deprecated post-Vista but harmless
+         * on modern Windows. Calling it costs nothing and keeps
+         * older WHQL test runners quiet. */
+        PoStartNextPowerIrp(Irp);
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_SUCCESS;
+    }
+    /* Audio FDO — let PortCls do its thing. */
+    return StreamToSpeakerDispatchPassThrough(DeviceObject, Irp);
+}
+
+/* IRP_MJ_SYSTEM_CONTROL (WMI) is the other major that PortCls
+ * doesn't know to handle on our non-audio control device. Same
+ * routing pattern. */
+extern "C" NTSTATUS
+StreamToSpeakerDispatchSystemControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+    if (DeviceObject == g_ControlDevice) {
+        NTSTATUS status = STATUS_NOT_SUPPORTED;
+        Irp->IoStatus.Status = status;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return status;
+    }
+    return StreamToSpeakerDispatchPassThrough(DeviceObject, Irp);
+}
+
 extern "C" NTSTATUS
 StreamToSpeakerDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 {
@@ -381,6 +432,9 @@ DriverEntry(
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = StreamToSpeakerDispatchDeviceControl;
     DriverObject->MajorFunction[IRP_MJ_CREATE]         = StreamToSpeakerDispatchCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE]          = StreamToSpeakerDispatchCreateClose;
+    /* See StreamToSpeakerDispatchPower for the BugCheck 0x9F rationale. */
+    DriverObject->MajorFunction[IRP_MJ_POWER]          = StreamToSpeakerDispatchPower;
+    DriverObject->MajorFunction[IRP_MJ_SYSTEM_CONTROL] = StreamToSpeakerDispatchSystemControl;
 
     DriverObject->DriverUnload = StreamToSpeakerDriverUnload;
     g_PortClsAddDevice = DriverObject->DriverExtension->AddDevice;
