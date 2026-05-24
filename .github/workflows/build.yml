@@ -188,6 +188,21 @@ jobs:
           Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" | Out-Null
           Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
 
+      # Stamp the driver build number with the git commit count so
+      # every build is uniquely identifiable from the service log line
+      # 'StreamToSpeaker driver opened (build=N ...)'. Lets users
+      # confirm at a glance whether the kernel actually loaded the new
+      # .sys (vs a cached one from a prior install).
+      - name: Bump driver build number
+        shell: pwsh
+        run: |
+          $count = (git rev-list --count HEAD).Trim()
+          $path = "driver/driver.h"
+          $content = Get-Content $path -Raw
+          $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${count}u"
+          Set-Content -Path $path -Value $new -NoNewline
+          Write-Host "Driver build stamped: $count"
+
       - name: Build driver (Release|x64, test-signed)
         shell: pwsh
         run: |

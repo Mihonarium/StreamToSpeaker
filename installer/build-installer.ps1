@@ -30,6 +30,9 @@ param(
     [string]$Version = "0.1.0",
     [ValidateSet("Off", "TestSign")]
     [string]$SignMode = "TestSign",
+    # Override the auto-bumped driver build number. Useful for local
+    # experiments where you want a stable build= line in the service log.
+    [int]$DriverBuild = 0,
     [switch]$SkipDriver,
     [switch]$SkipService,
     [switch]$SkipInstaller
@@ -48,7 +51,16 @@ function Write-Step($msg) {
 # 1. Driver
 # ---------------------------------------------------------------------------
 if (-not $SkipDriver) {
-    Write-Step "Building driver ($Configuration|x64, SignMode=$SignMode)"
+    # Stamp the driver build number — git commit count by default so
+    # every build is uniquely identifiable from the service log
+    # ('StreamToSpeaker driver opened build=N ...'). Pass -DriverBuild
+    # to pin a specific value, e.g. for reproducible local repro.
+    $buildNum = if ($DriverBuild -gt 0) { $DriverBuild } else { [int]((git rev-list --count HEAD).Trim()) }
+    $driverHeader = Join-Path $repoRoot "driver\driver.h"
+    $content = Get-Content $driverHeader -Raw
+    $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${buildNum}u"
+    Set-Content -Path $driverHeader -Value $new -NoNewline
+    Write-Step "Building driver ($Configuration|x64, SignMode=$SignMode, build=$buildNum)"
     $msbuild = Get-Command msbuild.exe -ErrorAction SilentlyContinue
     if (-not $msbuild) {
         $candidates = @(

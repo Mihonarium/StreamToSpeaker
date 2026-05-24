@@ -93,6 +93,7 @@ Source: "{#SourcePath}\staging\StreamToSpeaker.inf"; DestDir: "{app}\driver"; Fl
 Source: "{#SourcePath}\staging\StreamToSpeaker.cat"; DestDir: "{app}\driver"; Flags: ignoreversion skipifsourcedoesntexist
 
 ; --- Scripts ---
+Source: "{#SourcePath}\..\scripts\Pre-Install.ps1";     DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\..\scripts\Rename-Endpoint.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\..\scripts\Reset-Install.ps1";   DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\Uninstall-Driver.ps1";           DestDir: "{app}\scripts"; Flags: ignoreversion
@@ -134,6 +135,17 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
+; 0) Clean up any prior install BEFORE we touch the driver store /
+;    create a new device. Idempotent: if nothing prior is installed,
+;    silently no-ops. This is what unblocks the "upgrade keeps the
+;    old INF properties (Internal AUX Jack label, disabled-by-default
+;    flag, ...)" problem — the cached MMDevices entry has to be wiped
+;    so the new INF takes effect.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\Pre-Install.ps1"""; \
+    StatusMsg: "Cleaning up previous install..."; \
+    Flags: runhidden waituntilterminated
+
 ; 1) Import the test-signing certificate to TrustedPublisher AND Root
 ;    so Windows (in test-signing mode) accepts our test-signed driver.
 ;    Only runs if the .cer was bundled (CI build does; manual unsigned

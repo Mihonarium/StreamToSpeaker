@@ -1,0 +1,101 @@
+# CLAUDE.md — instructions for future Claude Code sessions
+
+## Operating principles
+
+1. **Research, don't speculate.** When the user reports a problem you don't fully understand (especially Windows / driver / OS-level), reach for `WebSearch` and `WebFetch` *before* proposing fixes. The user has explicitly called out cases where speculation wasted iteration cycles — examples: the "Internal AUX Jack" label, the "Allow apps and Windows to use this device" toggle (which turned out to be the documented `PKEY_AudioDevice_EnableEndpointByDefault` behaviour, not anything I'd guessed). If the user says "are you sure?", that's a signal to actually look it up.
+
+2. **Verify with cargo check before pushing.** This is a Linux container; build the service with `cd service && cargo check && cargo check --target x86_64-pc-windows-gnu` after any service edit. The Windows cross-check catches GUI / tray / IOCTL issues that the Linux check skips via `cfg(windows)`. Driver edits can't be syntax-checked here (need WDK) — read carefully and trust the user / CI.
+
+3. **PR-per-merge workflow.** This session pushes to a single fixed branch (`claude/stream-speaker-audio-delivery-Utgpx`), and the user merges each PR as a unit. After every push, check `mcp__github__list_pull_requests` for an open PR matching the branch; if none (previous one merged), open a new one via `mcp__github__create_pull_request` with a focused title describing the new commits. Don't let the branch accumulate too many merged-then-orphaned commits without a fresh PR.
+
+4. **Don't claim "fixed" without verifying.** When a fix lands and the user reports it still doesn't work, the first move is `WebSearch` for what *actually* triggers the symptom — not another guess.
+
+## Project: Stream To Speaker
+
+Windows virtual audio device that streams system audio to UPnP/OpenHome speakers (Sonos primarily). Two parts:
+
+- **`driver/`** — C++ kernel-mode WaveRT/PortCls driver. Single render endpoint, fixed L16 44.1 kHz stereo. Inverted-call IOCTL pattern delivers audio frames to user mode. Includes a separate non-PnP control device for the IOCTLs.
+- **`service/`** — Rust user-mode bridge. Default mode is GUI (egui window + tray icon); `--headless` is the CLI mode; `--web` enables the HTTP/JSON API. Talks to the driver via IOCTLs, discovers speakers via SSDP, controls them via UPnP SOAP, streams PCM via HTTP `audio/wav`.
+
+Shared ABI lives in `include/stream_to_speaker_ioctl.h`. Any change to the on-the-wire layout has to be mirrored in `service/src/ioctl_source.rs`.
+
+## Driver build number
+
+`STREAM_TO_SPEAKER_DRIVER_BUILD` in `driver/driver.h` is the build identifier — the service logs it on every connect (`StreamToSpeaker driver opened (proto=1 build=N ...)`). It exists so a user can confirm the kernel actually loaded the new `.sys` (pnputil only stages drivers; the running kernel may keep the old one until a device-manager bounce or reboot).
+
+**CI auto-bumps it on every workflow run** by replacing the `#define` value with the current git commit count just before `msbuild`. Locally, `installer\build-installer.ps1` does the same. So you don't usually need to hand-edit driver.h — but you can override in the script with `-DriverBuild N`. After making driver-side changes, just push and trust the bump.
+
+## Install / upgrade flow
+
+End users install via `StreamToSpeakerSetup-<version>.exe` (produced by CI). The installer:
+
+1. Imports our test-signing cert to TrustedPublisher + Root
+2. **Cleans up any prior install** — `Pre-Install.ps1` removes the live device (`devcon remove`), unstages the old driver (`pnputil /delete-driver`), wipes cached `HKLM\…\MMDevices\Audio\Render\<id>` entries that would otherwise keep the old INF properties live
+3. `pnputil /add-driver` stages the new driver
+4. `devcon install` creates the root-enumerated device — `pnputil /install` alone does not for root-enumerated devices
+5. `Rename-Endpoint.ps1` overwrites the cached friendly name + flips `DeviceState = ACTIVE` and restarts `AudioEndpointBuilder` so changes take effect without sign-out
+
+User-machine prerequisites that aren't automatable:
+- Test-signing mode (`bcdedit /set testsigning on` + reboot) — we ship a test-signed driver, not WHQL
+- Secure Boot off, HVCI / Memory Integrity off — required for test-signed drivers to load
+- Windows 10 1809+ (the INF targets `NTamd64.10.0...17763`)
+- Click "Allow" once in Sound Settings for the per-device privacy gate (Windows 11 22H2+ only) — addressed by `PKEY_AudioDevice_EnableEndpointByDefault` in the INF, but pre-existing endpoints created without that property still need the manual click
+
+## Key knowledge — Windows-audio specifics learned the hard way
+
+| Symptom | Real cause | Fix |
+|---|---|---|
+| Device label is "Internal AUX Jack" | Windows derives the prefix from `KSNODETYPE_LINE_CONNECTOR` association | Use `KSNODETYPE_SPEAKER` in INF + `PKEY_Device_FriendlyName` to override cached name |
+| New install shows old endpoint name / state | `HKLM\…\MMDevices\Audio\Render\<id>` is cached per endpoint ID and survives reinstalls | `Reset-Install.ps1` wipes the cached entries; the installer now runs the cleanup automatically |
+| Device installed but no Sound Settings endpoint | `pnputil /add-driver /install` doesn't create root-enumerated devices | Use `devcon install <inf> Root\<HardwareId>` after pnputil |
+| "Allow apps and Windows to use this device" toggle | Endpoint builder creates certain KSNODETYPE / form-factor combinations as disabled+hidden by default | `PKEY_AudioDevice_EnableEndpointByDefault = 0x101` (FLAG_ENABLE \| FLOW_MASK_RENDER) in INF |
+| OEM APO (Dolby Atmos etc.) attaches and adds latency | FormFactor=1 (Speakers) is the default match for OEM APOs | `PKEY_AudioEndpoint_Disable_SysFx = 1` in INF |
+| BSOD 0x9F sub-code 3 | A device our driver owns failed to complete an `IRP_MJ_POWER` in time | Don't just override `MJ_DEVICE_CONTROL` / `CREATE` / `CLOSE`; also own `MJ_POWER` and route by device — our control device needs to complete with `STATUS_SUCCESS` + `PoStartNextPowerIrp`, audio FDO forwards to PortCls |
+| Driver loaded but `build=N` shows old N in service log | `pnputil /add-driver` only stages; running kernel keeps old `.sys` | Device Manager → device → Disable/Enable, or reboot |
+
+## Debugging recipes
+
+- **BSOD**: minidumps at `C:\Windows\Minidump\*.dmp`. Parse the header in Python:
+  ```python
+  with open(dump, 'rb') as f: h = f.read(0x400)
+  bugcheck = struct.unpack_from('<I', h, 0x38)[0]
+  params = [struct.unpack_from('<Q', h, 0x40+i*8)[0] for i in range(4)]
+  ```
+- **What's in the driver store**: `pnputil /enum-drivers | Select-String "StreamToSpeaker" -Context 1,8`
+- **Is the device alive**: `devcon status Root\StreamToSpeaker`
+- **Why did PnP refuse**: `Get-Content C:\Windows\INF\setupapi.dev.log -Tail 200 | Select-String StreamToSpeaker -Context 2,5`
+- **Audio engine state**: `mmsys.cpl` shows all endpoints incl. disabled / hidden ones
+- **Driver DPC running?**: kernel `DBG_INFO` in `wavestream.cpp:DoCopyToRing` logs every ~1 s; capture with DebugView (run as admin, enable Kernel capture)
+
+## CI workflow
+
+`.github/workflows/build.yml` runs on `windows-latest` for every push, PR, and tag:
+
+1. Install Inno Setup (chocolatey)
+2. Restore / install WDK (cached — see workflow for keys)
+3. Generate self-signed code-signing cert, import to local trust stores
+4. **Bump driver build to git commit count**
+5. Build driver with `SignMode=TestSign`
+6. Build service (`cargo build --release`)
+7. Stage artifacts into `installer/staging/` (sys, inf, cat, devcon.exe, cert)
+8. Run `ISCC.exe` to produce `installer/out/StreamToSpeakerSetup-<version>.exe`
+9. Upload `.exe` + raw binaries as artifacts
+10. On `v*` tag push: attach `.exe` to GitHub Release
+
+WDK install (~5 min cold) is cached; warm cache restores in ~30 s.
+
+## Future work — explicitly deferred
+
+The user mentioned these but asked NOT to start them now. Pick up when they say:
+
+- **AirPlay support**. We do UPnP AVTransport + OpenHome via SOAP/HTTP. AirPlay is a different protocol (RTP-over-RTSP with FairPlay-encrypted keys for AirPlay 2). Most Sonos devices speak AirPlay 2 as well as UPnP, but some speakers are AirPlay-only (HomePod, AirPort Express, lots of receivers). Rust crates worth checking: `aircast`-style, `rust-airplay`, `airplay2-receiver` (reverse the direction). Likely a substantial new module since AirPlay 2's auth handshake is non-trivial.
+
+- **Lower-latency formats / alternative encodings**. Currently L16 PCM 44.1 kHz stereo. Options to add: 24-bit / 96 kHz for hi-fi; FLAC (compressed, lossless, lower bandwidth — most UPnP speakers support `audio/flac`); Opus (lossy, ultra-low-latency, used in WebRTC; less broadly supported by consumer speakers); AAC (broad compatibility, less optimal for low latency). Architecture-wise: the driver only knows L16 44.1; alternative encodings would be in the service's HTTP output path (encode at packet boundary, ship in the speaker's preferred MIME). Negotiation could be via DIDL `protocolInfo` listing multiple `<res>` lines.
+
+## What I should NOT do
+
+- Don't `process::exit` from anywhere except `main`. Use `app.request_shutdown()` and let the loop unwind.
+- Don't add Power IRP completions without `PoStartNextPowerIrp` even though it's deprecated — older WHQL testers complain.
+- Don't commit `service/target/` (covered by `.gitignore` now; broke the repo once).
+- Don't push `windows_subsystem = "console"` for the GUI build — the brief console flash is a real UX bug. `"windows"` + `AttachConsole(ATTACH_PARENT_PROCESS)` for `--headless` is the right pattern.
+- Don't ignore the user when they push back. They know what they observe; if my diagnosis doesn't match their experience, my diagnosis is probably wrong.
