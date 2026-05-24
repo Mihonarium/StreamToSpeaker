@@ -82,15 +82,20 @@ HKR,EP\0,%PKEY_Device_FriendlyName%,,%StreamToSpeaker.EndpointName%
 
 HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_SPEAKER%
 HKR,EP\0,%PKEY_AudioEndpoint_Default%,0x00010001,1
-; FormFactor = 0 (RemoteNetworkDevice). This is what Bluetooth A2DP
-; sinks, Miracast, and other network audio devices use; the value
-; correctly describes what we are (a remote endpoint reached over
-; the LAN) and — crucially — keeps OEM APOs like Dolby Atmos for
-; Speakers, Nahimic, Realtek enhancements, etc. from auto-attaching
-; to our pipeline. Those APOs target FormFactor=1 (Speakers) and
-; add ~5-30 ms of in-engine processing latency plus EQ / dynamics
-; that we don't want on a passthrough-to-Sonos path.
-HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,0
+; FormFactor = 1 (Speakers). Avoids the FormFactor=0
+; (RemoteNetworkDevice) privacy gate Windows 11 22H2+ applies to
+; "remote" audio devices (the "Allow apps and Windows to use this
+; device for audio" toggle in Sound Settings).
+;
+; The downside of plain Speakers is that OEM APOs (Dolby Atmos for
+; Speakers, Nahimic, Realtek effects) auto-attach to that form factor
+; and add ~5-30 ms of in-engine processing plus uncontrollable EQ —
+; the exact thing we want to avoid on a passthrough-to-Sonos path.
+; PKEY_AudioEndpoint_Disable_SysFx=1 disables system effects on our
+; endpoint specifically, so APOs are skipped even though we register
+; as a Speakers form factor.
+HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,1
+HKR,EP\0,%PKEY_AudioEndpoint_Disable_SysFx%,0x00010001,1
 HKR,EP\0,%PKEY_AudioEngine_OEMFormat%,%REG_BINARY%, \
     01,00,02,00,44,AC,00,00,10,B1,02,00,04,00,10,00
 
@@ -165,6 +170,7 @@ PKEY_Device_FriendlyName    = "{a45c254e-df1c-4efd-8020-67d146a850e0},14"
 PKEY_AudioEndpoint_Association              = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
 PKEY_AudioEndpoint_Default                  = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
 PKEY_AudioEndpoint_FormFactor               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
+PKEY_AudioEndpoint_Disable_SysFx            = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},5"
 PKEY_AudioEndpoint_Supports_EventDriven_Mode= "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
 PKEY_AudioEngine_DeviceFormat               = "{F19F064D-082C-4E27-BC73-6882A1BB8E4C},0"
 PKEY_AudioEngine_OEMFormat                  = "{E4870E26-3CC5-4CD2-BA46-CA0A9A70ED04},3"
