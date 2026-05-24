@@ -82,11 +82,25 @@
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
     <Inf>
-      <!-- Just the w.x.y.z version. The date stamp comes from
-           stampinf's default of "*" (today). -->
-      <TimeStamp>1.0.0.1</TimeStamp>
+      <!-- DriverVer stamped into the INF by stampinf and reported in
+           Device Manager → Properties → Driver. Composed of:
+             DriverVersionPrefix . DriverBuildNumber
+                ^                       ^
+                |                       └─ auto: git commit count
+                |                          (CI + build-installer.ps1
+                |                          inject /p:DriverBuildNumber=N)
+                └─ manual: bump for significant changes. Semver-ish:
+                   - 1.0.x  initial work / 0-to-1 features
+                   - 1.1.x  new feature shipped
+                   - 2.0.x  breaking IOCTL ABI / driver model change
+                   See CLAUDE.md for the discipline. -->
+      <TimeStamp>$(DriverVersionPrefix).$(DriverBuildNumber)</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
+  <PropertyGroup>
+    <DriverVersionPrefix Condition="'$(DriverVersionPrefix)' == ''">1.0.0</DriverVersionPrefix>
+    <DriverBuildNumber Condition="'$(DriverBuildNumber)' == ''">1</DriverBuildNumber>
+  </PropertyGroup>
   <ItemGroup>
     <ClCompile Include="adapter.cpp" />
     <ClCompile Include="driver.cpp" />

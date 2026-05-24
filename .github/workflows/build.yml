@@ -189,19 +189,25 @@ jobs:
           Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
 
       # Stamp the driver build number with the git commit count so
-      # every build is uniquely identifiable from the service log line
-      # 'StreamToSpeaker driver opened (build=N ...)'. Lets users
-      # confirm at a glance whether the kernel actually loaded the new
-      # .sys (vs a cached one from a prior install).
-      - name: Bump driver build number
+      # every build is uniquely identifiable from:
+      #   - The INF's DriverVer (1.0.0.N — what Device Manager and
+      #     PnP version-comparison use)
+      #   - The service log ('StreamToSpeaker driver opened build=N')
+      # Both come from the same git rev-list count, so they stay in
+      # sync and a user can confirm at a glance whether the kernel
+      # actually loaded the new .sys.
+      - name: Compute driver build number
+        id: drvbuild
         shell: pwsh
         run: |
           $count = (git rev-list --count HEAD).Trim()
+          # Update driver.h for the runtime build identifier.
           $path = "driver/driver.h"
           $content = Get-Content $path -Raw
           $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${count}u"
           Set-Content -Path $path -Value $new -NoNewline
-          Write-Host "Driver build stamped: $count"
+          Write-Host "Driver build stamped: $count (driver.h + INF DriverVer 1.0.0.$count)"
+          "build=$count" >> $env:GITHUB_OUTPUT
 
       - name: Build driver (Release|x64, test-signed)
         shell: pwsh
@@ -210,6 +216,7 @@ jobs:
             /p:Configuration=Release `
             /p:Platform=x64 `
             /p:SignMode=TestSign `
+            /p:DriverBuildNumber=${{ steps.drvbuild.outputs.build }} `
             /nologo `
             /verbosity:minimal
           if (-not (Test-Path "driver\x64\Release\StreamToSpeaker\StreamToSpeaker.sys")) {

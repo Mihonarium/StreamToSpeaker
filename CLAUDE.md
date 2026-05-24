@@ -19,11 +19,30 @@ Windows virtual audio device that streams system audio to UPnP/OpenHome speakers
 
 Shared ABI lives in `include/stream_to_speaker_ioctl.h`. Any change to the on-the-wire layout has to be mirrored in `service/src/ioctl_source.rs`.
 
-## Driver build number
+## Driver versioning
 
-`STREAM_TO_SPEAKER_DRIVER_BUILD` in `driver/driver.h` is the build identifier — the service logs it on every connect (`StreamToSpeaker driver opened (proto=1 build=N ...)`). It exists so a user can confirm the kernel actually loaded the new `.sys` (pnputil only stages drivers; the running kernel may keep the old one until a device-manager bounce or reboot).
+INF DriverVer format: `MAJOR.MINOR.BUILD.REVISION`. Two pieces, two sources:
 
-**CI auto-bumps it on every workflow run** by replacing the `#define` value with the current git commit count just before `msbuild`. Locally, `installer\build-installer.ps1` does the same. So you don't usually need to hand-edit driver.h — but you can override in the script with `-DriverBuild N`. After making driver-side changes, just push and trust the bump.
+### Auto: revision (`REVISION` = git commit count)
+
+Bumped on every CI run and every `build-installer.ps1` run, no manual step. Drives:
+
+1. **INF `DriverVer`** (e.g. `1.0.0.42`) — what Windows uses for PnP version comparison and what Device Manager → Properties → Driver shows. From `StreamToSpeaker.vcxproj`: `<TimeStamp>$(DriverVersionPrefix).$(DriverBuildNumber)</TimeStamp>`, with `DriverBuildNumber` injected via `/p:DriverBuildNumber=N`.
+2. **`STREAM_TO_SPEAKER_DRIVER_BUILD` in `driver/driver.h`** — runtime identifier, returned via `IOCTL_STREAM_TO_SPEAKER_GET_VERSION`, logged by the service (`StreamToSpeaker driver opened (proto=1 build=N ...)`).
+
+Both get the same N every build, so `1.0.0.42` in Device Manager == `build=42` in the service log == same `.sys` binary. Override with `-DriverBuild N` on the local script for a reproducible value.
+
+### Manual: prefix (`MAJOR.MINOR.BUILD`)
+
+`DriverVersionPrefix` in `driver/StreamToSpeaker.vcxproj` — defaults to `1.0.0`. **Bump it by hand when the change is significant.** Semver-ish discipline:
+
+- **MAJOR (`1.0.0 → 2.0.0`)** — breaking changes that aren't safe to roll back without uninstalling first. IOCTL ABI changes (modifying `stream_to_speaker_ioctl.h`), changing the device hardware-ID, changing PortCls→WaveRT to a different audio class, etc.
+- **MINOR (`1.0.0 → 1.1.0`)** — new shipped features. Adding AirPlay support, adding alternative codecs, adding a new control device interface, adding a new PKEY in the INF.
+- **BUILD (`1.0.0 → 1.0.1`)** — meaningful bug fixes worth flagging in the version string. The kind of thing a user grepping `1.0.X` would care about. (Note: this is the *third* INF field — not the auto-bumped revision.)
+
+**Also bump `service/Cargo.toml`'s `version =` to match the prefix** when bumping MAJOR or MINOR — the service version shows up in `--version`, in `User-Agent` headers we send to speakers, and is what GitHub Releases use as the tag. (Patch-level disagreements between service and driver are fine; what matters is that the *prefix* tells the same story.)
+
+Don't bump the prefix for routine fixes — the auto-bumped revision is the right granularity for "the bits changed, no semantic difference." Save prefix bumps for "the user should know something changed."
 
 ## Install / upgrade flow
 

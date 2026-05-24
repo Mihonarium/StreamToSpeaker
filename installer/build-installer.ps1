@@ -51,16 +51,19 @@ function Write-Step($msg) {
 # 1. Driver
 # ---------------------------------------------------------------------------
 if (-not $SkipDriver) {
-    # Stamp the driver build number — git commit count by default so
-    # every build is uniquely identifiable from the service log
-    # ('StreamToSpeaker driver opened build=N ...'). Pass -DriverBuild
-    # to pin a specific value, e.g. for reproducible local repro.
+    # Stamp the driver build number — git commit count by default. The
+    # SAME number ends up in:
+    #   - driver.h's STREAM_TO_SPEAKER_DRIVER_BUILD (returned via IOCTL,
+    #     logged by the service: 'driver opened build=N')
+    #   - the INF's DriverVer (1.0.0.N — what Device Manager shows,
+    #     what PnP uses to compare versions)
+    # Override with -DriverBuild N for reproducible local repro.
     $buildNum = if ($DriverBuild -gt 0) { $DriverBuild } else { [int]((git rev-list --count HEAD).Trim()) }
     $driverHeader = Join-Path $repoRoot "driver\driver.h"
     $content = Get-Content $driverHeader -Raw
     $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${buildNum}u"
     Set-Content -Path $driverHeader -Value $new -NoNewline
-    Write-Step "Building driver ($Configuration|x64, SignMode=$SignMode, build=$buildNum)"
+    Write-Step "Building driver ($Configuration|x64, SignMode=$SignMode, build=$buildNum, DriverVer=1.0.0.$buildNum)"
     $msbuild = Get-Command msbuild.exe -ErrorAction SilentlyContinue
     if (-not $msbuild) {
         $candidates = @(
@@ -90,6 +93,7 @@ if (-not $SkipDriver) {
         "/p:Configuration=$Configuration" `
         "/p:Platform=x64" `
         "/p:SignMode=$SignMode" `
+        "/p:DriverBuildNumber=$buildNum" `
         "/nologo" `
         "/verbosity:minimal"
     if ($LASTEXITCODE -ne 0) { throw "Driver build failed (exit $LASTEXITCODE)" }
