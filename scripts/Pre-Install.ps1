@@ -15,6 +15,14 @@
 $ErrorActionPreference = "Continue"  # never abort the installer
 $VerbosePreference = "SilentlyContinue"
 
+# Capture all output to %LOCALAPPDATA%\StreamToSpeaker\install.log so
+# failures are diagnosable after the installer's silent run.
+$logDir = Join-Path $env:LOCALAPPDATA "StreamToSpeaker"
+$null = New-Item -ItemType Directory -Force -Path $logDir -ErrorAction SilentlyContinue
+$logFile = Join-Path $logDir "install.log"
+$null = Start-Transcript -Path $logFile -Append -ErrorAction SilentlyContinue
+"==== Pre-Install started at $(Get-Date -Format 'u') ====" | Write-Host
+
 function Log($msg) {
     Write-Host "[pre-install] $msg"
 }
@@ -75,4 +83,6 @@ if (Test-Path $base) {
 Log "$wiped cached MMDevices entries wiped"
 
 Log "pre-install cleanup complete"
+"==== Pre-Install finished at $(Get-Date -Format 'u') ====" | Write-Host
+$null = Stop-Transcript -ErrorAction SilentlyContinue
 exit 0
