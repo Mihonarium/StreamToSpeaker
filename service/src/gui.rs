@@ -1026,6 +1026,16 @@ impl StreamToSpeakerApp {
                     );
                     ui.memory_mut(|m| m.close_popup());
                 }
+                // "Show getting started" — undo onboarding dismissal
+                // so it appears on the next paint (m20). Useful for
+                // users who hid it and then want the refresher.
+                if self.app.is_onboarding_dismissed() {
+                    if ui.button("Show getting-started again").clicked() {
+                        self.app.reset_onboarding();
+                        self.onboarding_dismissed = false;
+                        ui.memory_mut(|m| m.close_popup());
+                    }
+                }
             },
         );
     }

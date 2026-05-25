@@ -73,6 +73,7 @@ struct TrayIds {
     enable: MenuId,
     show_window: MenuId,
     open_web: MenuId,
+    open_log: MenuId,
     quit: MenuId,
 }
 
@@ -123,9 +124,20 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
         web_on,
         None,
     );
+    // Help-ish items (M32): "Open log folder" + "About" with version.
+    // Disabled "About" acts as a static label that displays version.
+    let open_log = MenuItem::new("Open log folder", true, None);
+    let about_item = MenuItem::new(
+        &format!("Stream To Speaker v{}", env!("CARGO_PKG_VERSION")),
+        false,
+        None,
+    );
     let quit_item = MenuItem::new("Quit", true, None);
     menu.append(&show_window)?;
     menu.append(&open_web)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&open_log)?;
+    menu.append(&about_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
@@ -139,6 +151,7 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
         enable: enable_toggle.id().clone(),
         show_window: show_window.id().clone(),
         open_web: open_web.id().clone(),
+        open_log: open_log.id().clone(),
         quit: quit_item.id().clone(),
     };
 
@@ -317,6 +330,10 @@ fn handle_menu(
     } else if *id == ids.open_web {
         if app.is_web_ui_enabled() {
             open_web_ui(&app.config.advertise_ip, app.config.bind.port());
+        }
+    } else if *id == ids.open_log {
+        if let Some(dir) = crate::log_dir() {
+            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
         }
     } else if *id == ids.quit {
         info!("tray: quit requested");

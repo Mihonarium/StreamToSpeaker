@@ -196,6 +196,16 @@ impl App {
         }
     }
 
+    /// Undo the onboarding dismissal (Help menu → "Show getting-
+    /// started again"). Persists immediately.
+    pub fn reset_onboarding(&self) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.onboarding_dismissed {
+            uc.onboarding_dismissed = false;
+            uc.save();
+        }
+    }
+
     /// Returns the persisted "always minimise to tray on window close"
     /// preference (the close-confirm modal's checkbox).
     pub fn is_always_minimise_to_tray(&self) -> bool {
