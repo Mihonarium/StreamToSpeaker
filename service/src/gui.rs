@@ -61,6 +61,24 @@ mod sp {
     pub const S: f32 = 12.0;
     pub const M: f32 = 16.0;
     pub const L: f32 = 24.0;
+
+    // M14 — three "container padding" tiers, named so we never reach
+    // for raw 18 / 16 / 24 / 12 / 8 again.
+    //
+    //   CARD_*  — sectional cards + status banner. 18 horizontal is
+    //             slightly wider than sp::M to give section_label a
+    //             touch more breathing room from the card border.
+    //   MODAL   — confirm / settings modals. sp::L on all sides; the
+    //             extra padding signals "this is a heavier surface
+    //             demanding attention" (Refactoring UI: heavier
+    //             surfaces get heavier padding).
+    //   PILL_*  — inline pills, segmented controls, status chips.
+    //             Tight by design (small surfaces need small padding).
+    pub const CARD_H: f32 = 18.0;
+    pub const CARD_V: f32 = M;
+    pub const MODAL: f32 = L;
+    pub const PILL_H: f32 = S;
+    pub const PILL_V: f32 = XS;
 }
 const RADIUS_CONTROL: f32 = 4.0;
 const RADIUS_SURFACE: f32 = 8.0;
@@ -899,7 +917,7 @@ fn card<R>(ui: &mut egui::Ui, p: &Palette, content: impl FnOnce(&mut egui::Ui) -
         .fill(p.card)
         .stroke(egui::Stroke::new(1.0, p.divider))
         .rounding(RADIUS_SURFACE)
-        .inner_margin(egui::Margin::symmetric(18.0, 16.0))
+        .inner_margin(egui::Margin::symmetric(sp::CARD_H, sp::CARD_V))
         .show(ui, content)
         .inner
 }
@@ -991,26 +1009,38 @@ fn danger_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) ->
 
 impl StreamToSpeakerApp {
     fn show_header(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("Stream To Speaker")
-                        .size(20.0)
-                        .strong()
-                        .color(p.text_primary),
-                );
-                ui.label(
-                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .size(11.0)
-                        .color(p.text_tertiary),
-                );
+        // M13: indent the header by the card's horizontal padding so
+        // the page title left-aligns with section_label headings
+        // inside cards. Without this the title sat 18 px to the left
+        // of every card heading, breaking the vertical alignment line
+        // the eye anchors to when scanning the page.
+        egui::Frame::none()
+            .inner_margin(egui::Margin::symmetric(sp::CARD_H, 0.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Stream To Speaker")
+                                .size(20.0)
+                                .strong()
+                                .color(p.text_primary),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .size(11.0)
+                                .color(p.text_tertiary),
+                        );
+                    });
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            self.show_help_menu(ui, p);
+                            ui.add_space(sp::XS);
+                            self.show_theme_toggle(ui, p);
+                        },
+                    );
+                });
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.show_help_menu(ui, p);
-                ui.add_space(sp::XS);
-                self.show_theme_toggle(ui, p);
-            });
-        });
     }
 
     fn show_help_menu(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1239,23 +1269,18 @@ impl StreamToSpeakerApp {
             ),
         };
 
-        egui::Frame::none()
+        let frame_resp = egui::Frame::none()
             .fill(p.card)
             .stroke(egui::Stroke::new(1.0, p.divider))
             .rounding(RADIUS_SURFACE)
-            .inner_margin(egui::Margin {
-                left: 0.0,
-                right: 18.0,
-                top: 16.0,
-                bottom: 16.0,
-            })
+            // M8: symmetric padding matches every other card — the
+            // banner used to ship (left:0, right:18, top:16, bottom:16)
+            // so the accent stripe could live INSIDE the layout. Now
+            // the stripe is painted over the frame after the fact, so
+            // padding can be regular.
+            .inner_margin(egui::Margin::symmetric(sp::CARD_H, sp::CARD_V))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // Accent stripe on the left edge — instant state read-out.
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(4.0, 56.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 0.0, accent);
-                    ui.add_space(14.0);
-
                     ui.label(egui::RichText::new(icon).color(accent).size(34.0).strong());
                     ui.add_space(12.0);
 
@@ -1296,6 +1321,26 @@ impl StreamToSpeakerApp {
                     }
                 });
             });
+
+        // M9: paint the accent stripe over the card's rounded left
+        // edge after the frame is drawn. Full card height, left
+        // corners rounded to RADIUS_SURFACE so it visually merges
+        // with the card outline; right edge sharp (rounding 0) so it
+        // butts cleanly into the card interior. The previous stripe
+        // was a hard-edged 4×56 rect placed mid-card — looked like a
+        // floating marker rather than the card's own edge.
+        let card_rect = frame_resp.response.rect;
+        let stripe_rect = egui::Rect::from_min_size(
+            card_rect.min,
+            egui::vec2(4.0, card_rect.height()),
+        );
+        let stripe_rounding = egui::Rounding {
+            nw: RADIUS_SURFACE,
+            sw: RADIUS_SURFACE,
+            ne: 0.0,
+            se: 0.0,
+        };
+        ui.painter().rect_filled(stripe_rect, stripe_rounding, accent);
     }
 
     /// Compact pinned status row (m44). Sits above the scroll area
@@ -1992,7 +2037,7 @@ impl StreamToSpeakerApp {
                     .fill(p.card)
                     .stroke(egui::Stroke::new(1.0, p.divider))
                     .rounding(RADIUS_SURFACE)
-                    .inner_margin(sp::L),
+                    .inner_margin(sp::MODAL),
             )
             .show(ctx, |ui| {
                 ui.label(
@@ -2177,8 +2222,12 @@ fn speaker_row(
         egui::FontId::new(14.0, egui::FontFamily::Proportional),
         p.text_primary,
     );
+    // M12: 18 px right inset — symmetric with the radio indicator at
+    // left + 18, so the row's visual content sits balanced inside
+    // the card. (Was 12, which made the IP huddle against the card
+    // border while the radio breathed comfortably on the other side.)
     ui.painter().text(
-        egui::pos2(rect.right() - 12.0, rect.center().y),
+        egui::pos2(rect.right() - 18.0, rect.center().y),
         egui::Align2::RIGHT_CENTER,
         &sp.ip,
         egui::FontId::new(12.0, egui::FontFamily::Monospace),
@@ -2257,7 +2306,7 @@ fn stat_pill(
     egui::Frame::none()
         .fill(p.card_hover)
         .rounding(RADIUS_CONTROL)
-        .inner_margin(egui::Margin::symmetric(sp::S, sp::XS))
+        .inner_margin(egui::Margin::symmetric(sp::PILL_H, sp::PILL_V))
         .show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.label(
