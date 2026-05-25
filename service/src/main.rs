@@ -29,7 +29,6 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(windows)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-#[cfg(windows)]
 use std::thread;
 use std::time::Duration;
 
@@ -259,25 +258,6 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
 
-    // Resolve initial speaker.
-    if !cli.no_discovery {
-        let initial = picker::resolve(
-            app.discovery.as_ref().unwrap(),
-            cli.player.as_deref(),
-            !cli.no_interactive && cli.headless,
-        )?;
-        if let Some(r) = initial {
-            let id = r.stable_id();
-            if let Err(e) = app.select_speaker(&id) {
-                warn!("starting initial session failed: {}", e);
-            }
-        } else if cli.headless {
-            warn!(
-                "no speaker selected; pick one with the GUI / web UI / POST /api/select"
-            );
-        }
-    }
-
     // Driver-event consumer.
     #[cfg(windows)]
     spawn_driver_event_consumer(app.clone(), &cli);
@@ -290,34 +270,14 @@ fn run(cli: Cli) -> Result<()> {
     app.set_rate_fudge_ppm(cli.rate_fudge_ppm);
     app.set_latency_adjust_step_frames(cli.latency_adjust_step_frames);
 
-    if cli.headless {
-        run_headless(app, source)
-    } else {
-        run_gui_mode(app, source, cli.no_tray)
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Headless run — audio loop on main thread
-// -----------------------------------------------------------------------------
-
-fn run_headless(app: Arc<App>, source: Box<dyn AudioSource>) -> Result<()> {
-    audio_loop::run(app.clone(), source)?;
-    shutdown_cleanup(&app);
-    Ok(())
-}
-
-// -----------------------------------------------------------------------------
-// GUI run — audio loop on background thread, eframe on main thread
-// -----------------------------------------------------------------------------
-
-#[cfg(windows)]
-fn run_gui_mode(app: Arc<App>, source: Box<dyn AudioSource>, no_tray: bool) -> Result<()> {
-    // No console-hiding needed: windows_subsystem = "windows" means
-    // we were never allocated one in the first place.
-
-    // Audio loop on a dedicated thread so it can MMCSS itself without
-    // interfering with the GUI event loop.
+    // Start the audio loop BEFORE we issue any UPnP Play. With the
+    // old order (Play → spawn audio thread) the speaker connected to
+    // /stream.raw before the audio loop was producing data — Sonos
+    // would receive an empty HTTP body, time out, and stay in a
+    // "I'm connected but not playing" state until the user hit
+    // Resync. Spawning audio first means silence injection is already
+    // running by the time we send Play, so the speaker gets a
+    // populated stream from byte zero.
     let audio_app = app.clone();
     let _audio_thread = thread::Builder::new()
         .name("stream-to-speaker-audio".to_string())
@@ -328,6 +288,75 @@ fn run_gui_mode(app: Arc<App>, source: Box<dyn AudioSource>, no_tray: bool) -> R
         })
         .context("spawning audio thread")?;
 
+    // Resolve initial speaker.
+    //
+    // Priority chain:
+    //   1. `--player <hint>`  — explicit override, fuzzy match
+    //   2. interactive headless TTY — prompt the user
+    //   3. saved speaker id from user_config — auto-reconnect to the
+    //      one the user last explicitly picked
+    //   4. otherwise — DON'T auto-select. The GUI's onboarding card
+    //      kicks in so the user picks manually one time; their
+    //      choice gets persisted and step 3 takes over from then on.
+    //
+    // The old fallback ("first discovered") was the reason GUI users
+    // never got to see the onboarding card and ended up with a random
+    // speaker bound at launch.
+    if !cli.no_discovery {
+        let discovery = app.discovery.as_ref().unwrap();
+        let initial = if cli.player.is_some() {
+            picker::resolve(discovery, cli.player.as_deref(), false)?
+        } else if !cli.no_interactive && cli.headless {
+            picker::resolve(discovery, None, true)?
+        } else if let Some(saved_id) = app.saved_speaker_id() {
+            info!("auto-reconnect: trying saved speaker {:?}", saved_id);
+            // Wait briefly for the first SSDP sweep to populate
+            // discovery before we look the saved id up.
+            picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
+            discovery.find_by_id(&saved_id)
+        } else {
+            info!("first launch (no saved speaker) — waiting for manual pick");
+            None
+        };
+        if let Some(r) = initial {
+            let id = r.stable_id();
+            if let Err(e) = app.select_speaker(&id) {
+                warn!("starting initial session failed: {}", e);
+            }
+        } else if cli.headless {
+            warn!(
+                "no speaker selected; pick one with the GUI / web UI / POST /api/select"
+            );
+        }
+    }
+
+    if cli.headless {
+        run_headless(app)
+    } else {
+        run_gui_mode(app, cli.no_tray)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Headless run — block on shutdown signal; audio is on the bg thread
+// spawned in run() above.
+// -----------------------------------------------------------------------------
+
+fn run_headless(app: Arc<App>) -> Result<()> {
+    while !app.is_shutting_down() {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    shutdown_cleanup(&app);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// GUI run — eframe on main thread; audio is on the bg thread spawned
+// in run() above.
+// -----------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn run_gui_mode(app: Arc<App>, no_tray: bool) -> Result<()> {
     // Run the GUI (blocks until window/tray exits).
     if let Err(e) = stream_to_speaker::gui::run(app.clone(), !no_tray) {
         warn!("GUI exited with error: {:#}", e);
@@ -345,7 +374,7 @@ fn run_gui_mode(app: Arc<App>, source: Box<dyn AudioSource>, no_tray: bool) -> R
 }
 
 #[cfg(not(windows))]
-fn run_gui_mode(_app: Arc<App>, _source: Box<dyn AudioSource>, _no_tray: bool) -> Result<()> {
+fn run_gui_mode(_app: Arc<App>, _no_tray: bool) -> Result<()> {
     anyhow::bail!("GUI mode is Windows-only — pass --headless on this platform")
 }
 
@@ -374,12 +403,16 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         None => stream_to_speaker::app::default_advertise_ip()?,
     };
 
+    let ssdp_iface = if cli.no_discovery {
+        None
+    } else {
+        stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind)
+    };
+
     let discovery = if cli.no_discovery {
         None
     } else {
         let state = DiscoveryState::new();
-        let ssdp_iface =
-            stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind);
         spawn_discovery(
             state.clone(),
             Duration::from_secs(cli.ssdp_interval * 60),
@@ -401,6 +434,7 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         no_silence_injection: cli.no_silence_injection,
         no_discovery: cli.no_discovery,
         web_enabled: cli.web,
+        ssdp_iface,
     };
 
     Ok(App::new(config, discovery))

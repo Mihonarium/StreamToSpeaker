@@ -1,16 +1,25 @@
 //! System tray icon + context menu.
 //!
 //! `muda`'s `MenuItem` is `!Send` (it holds an `Rc` internally), so the
-//! menu items live on the GUI's main thread. Tray + menu events are
-//! drained from the egui `update()` loop via `TrayHandle::pump`. The
-//! same loop also keeps the status label and check-state synced with
-//! the shared `App`.
+//! menu items themselves live on the GUI's main thread. `pump()` runs
+//! from the egui update loop and keeps the status label / check states
+//! synced.
+//!
+//! Tray + menu *events* are drained by a dedicated background thread,
+//! not by `pump()`. This is the fix for the "Show window from tray
+//! does nothing after minimize-to-tray" bug: egui's `update()` only
+//! runs in response to `WM_PAINT`, and a hidden window doesn't
+//! generate `WM_PAINT` — so if event draining lives in `pump()`, the
+//! Show-window menu click sits in the channel forever. The bg thread
+//! is unaffected by paint state and just calls `ShowWindow` directly
+//! when the click arrives.
 
 #![cfg(windows)]
 
 use anyhow::{anyhow, Result};
 use eframe::egui;
 use log::{info, warn};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 
 use tray_icon::{
@@ -30,21 +39,20 @@ pub struct TrayHandle {
     enable_toggle: CheckMenuItem,
     open_web_item: MenuItem,
 
-    // Ids used to route MenuEvents to actions.
-    ids: TrayIds,
-
     last_label: String,
     last_enabled: bool,
     last_web_enabled: bool,
 
-    // HWND of the GUI window, populated by gui::update on the first
-    // frame. We use raw Win32 ShowWindow to flip visibility because
-    // egui ViewportCommands don't drain on hidden viewports. Until
-    // set, Show window is a no-op (window is already visible on the
-    // very first frame anyway).
-    hwnd: Option<isize>,
+    /// HWND of the GUI window. Shared with the bg event thread; that
+    /// thread calls raw Win32 `ShowWindow` on it when the user clicks
+    /// the tray icon. Populated by `gui::run` once eframe has actually
+    /// created the OS window (zero means "not set yet" — the very
+    /// first frame is always visible, so the bg thread has nothing to
+    /// do until the window is hidden, which happens later).
+    hwnd: Arc<AtomicIsize>,
 }
 
+#[derive(Clone)]
 struct TrayIds {
     switch_speaker: MenuId,
     trim_25: MenuId,
@@ -128,36 +136,48 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
         .build()
         .map_err(|e| anyhow!("tray-icon build: {}", e))?;
 
-    // `egui_ctx` is held by the periodic-repaint tick already; we just
-    // touch it here so the parameter isn't formally unused.
-    let _ = egui_ctx;
+    let hwnd = Arc::new(AtomicIsize::new(0));
+
+    // Spawn the bg event handler thread. It owns clones of the App
+    // Arc, the egui Context, the TrayIds (MenuId is Clone), and the
+    // shared HWND atomic. Runs until process exit.
+    {
+        let app = app.clone();
+        let ctx = egui_ctx.clone();
+        let ids = ids.clone();
+        let hwnd = hwnd.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-tray-events".to_string())
+            .spawn(move || event_loop(app, ctx, ids, hwnd))
+            .ok();
+    }
 
     Ok(TrayHandle {
         _icon: tray,
         status_item,
         enable_toggle,
         open_web_item: open_web,
-        ids,
         last_label: String::new(),
         last_enabled: app.is_streaming_enabled(),
         last_web_enabled: web_on,
-        hwnd: None,
+        hwnd,
     })
 }
 
 impl TrayHandle {
-    /// Set the HWND the tray uses to show / hide the window. Called by
-    /// gui::update on the first frame, once eframe has actually created
-    /// the OS window.
+    /// Set the HWND the bg event thread uses to show the window when
+    /// the user clicks the tray icon. Called by `gui::run` once eframe
+    /// has actually created the OS window (HWND is stable for the
+    /// lifetime of the window).
     pub fn set_hwnd(&mut self, hwnd: isize) {
-        self.hwnd = Some(hwnd);
+        self.hwnd.store(hwnd, Ordering::Relaxed);
     }
 
-    /// Drain pending tray and menu events, update the visible bits of
-    /// the menu (status label, check state) to reflect the App. Called
-    /// from `gui::update()` once per frame; cheap when there's nothing
-    /// to do.
-    pub fn pump(&mut self, app: &Arc<App>, ctx: &egui::Context) {
+    /// Update the visible bits of the menu (status label, check
+    /// states) to reflect the App. Called from `gui::update()` once
+    /// per frame; cheap when there's nothing to do. Event draining
+    /// happens on the bg event thread now (see module-level docs).
+    pub fn pump(&mut self, app: &Arc<App>, _ctx: &egui::Context) {
         // Sync the status label.
         let label = match app.current_renderer() {
             Some(r) => format!("▶ {}", r.friendly_name),
@@ -175,8 +195,7 @@ impl TrayHandle {
             self.last_enabled = enabled;
         }
 
-        // Sync the "Open web UI" item label + enabled state based on
-        // whether the runtime web-UI toggle is currently on.
+        // Sync the "Open web UI" item label + enabled state.
         let web_on = app.is_web_ui_enabled();
         if web_on != self.last_web_enabled {
             self.open_web_item.set_text(if web_on {
@@ -187,83 +206,112 @@ impl TrayHandle {
             self.open_web_item.set_enabled(web_on);
             self.last_web_enabled = web_on;
         }
-
-        // Drain menu events. The receiver is process-global; events
-        // from any tray icon in this process flow through it.
-        while let Ok(MenuEvent { id }) = MenuEvent::receiver().try_recv() {
-            self.handle_menu_event(&id, app, ctx);
-        }
-
-        // Drain tray-icon events: left-click → show window.
-        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = ev
-            {
-                self.show_main_window(ctx);
-            }
-        }
     }
+}
 
-    fn handle_menu_event(&self, id: &MenuId, app: &Arc<App>, ctx: &egui::Context) {
-        if *id == self.ids.trim_25 {
-            app.adjust_latency(25);
-        } else if *id == self.ids.trim_100 {
-            app.adjust_latency(100);
-        } else if *id == self.ids.pad_25 {
-            app.adjust_latency(-25);
-        } else if *id == self.ids.pad_100 {
-            app.adjust_latency(-100);
-        } else if *id == self.ids.resync {
-            if let Err(e) = app.resync() {
-                warn!("resync failed: {}", e);
-            }
-        } else if *id == self.ids.enable {
-            let new_state = !app.is_streaming_enabled();
-            if let Err(e) = app.set_streaming_enabled(new_state) {
-                warn!("toggle failed: {}", e);
-            }
-        } else if *id == self.ids.switch_speaker || *id == self.ids.show_window {
-            self.show_main_window(ctx);
-        } else if *id == self.ids.open_web {
-            if app.is_web_ui_enabled() {
-                open_web_ui(&app.config.advertise_ip, app.config.bind.port());
-            }
-        } else if *id == self.ids.quit {
-            info!("tray: quit requested");
-            app.request_shutdown();
-            ctx.request_repaint();
-        }
-        ctx.request_repaint();
-    }
-
-    /// Bring the GUI window to the front. SetWindowPos with
-    /// SWP_SHOWWINDOW flips visibility AND lifts Z-order in one
-    /// synchronous call, sidestepping the eframe ViewportCommand
-    /// queue (which doesn't drain on hidden windows — emilk/egui#5229,
-    /// #3655). SW_RESTORE handles the minimised case. ShowWindowAsync
-    /// is used for SW_RESTORE so a tray-pump invocation from outside
-    /// the owning thread is still safe.
-    fn show_main_window(&self, ctx: &egui::Context) {
-        if let Some(hwnd) = self.hwnd {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{
-                SetWindowPos, ShowWindowAsync, SetForegroundWindow, IsIconic,
-                HWND_TOP, SW_RESTORE,
-                SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-            };
-            unsafe {
-                let h = hwnd as _;
-                SetWindowPos(h, HWND_TOP, 0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-                if IsIconic(h) != 0 {
-                    ShowWindowAsync(h, SW_RESTORE);
+/// Background event loop. Drains MenuEvent + TrayIconEvent and acts
+/// on them directly via the App Arc / raw Win32 calls. Runs from
+/// `spawn()` until process exit; the process exit kills the thread
+/// (we never explicitly join, mirroring the audio-thread pattern).
+fn event_loop(
+    app: Arc<App>,
+    ctx: egui::Context,
+    ids: TrayIds,
+    hwnd: Arc<AtomicIsize>,
+) {
+    use crossbeam_channel::select;
+    let menu_rx = MenuEvent::receiver();
+    let tray_rx = TrayIconEvent::receiver();
+    loop {
+        select! {
+            recv(menu_rx) -> ev => {
+                match ev {
+                    Ok(MenuEvent { id }) => handle_menu(&id, &app, &ids, &hwnd, &ctx),
+                    Err(_) => return, // channel closed (shouldn't happen)
                 }
-                SetForegroundWindow(h);
+            }
+            recv(tray_rx) -> ev => {
+                match ev {
+                    Ok(TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    }) => {
+                        show_window_win32(hwnd.load(Ordering::Relaxed));
+                        ctx.request_repaint();
+                    }
+                    Ok(_) => {} // right/middle clicks, double-click, etc.
+                    Err(_) => return,
+                }
             }
         }
-        ctx.request_repaint();
+    }
+}
+
+fn handle_menu(
+    id: &MenuId,
+    app: &Arc<App>,
+    ids: &TrayIds,
+    hwnd: &AtomicIsize,
+    ctx: &egui::Context,
+) {
+    if *id == ids.trim_25 {
+        app.adjust_latency(25);
+    } else if *id == ids.trim_100 {
+        app.adjust_latency(100);
+    } else if *id == ids.pad_25 {
+        app.adjust_latency(-25);
+    } else if *id == ids.pad_100 {
+        app.adjust_latency(-100);
+    } else if *id == ids.resync {
+        if let Err(e) = app.resync() {
+            warn!("tray resync failed: {}", e);
+        }
+    } else if *id == ids.enable {
+        let new_state = !app.is_streaming_enabled();
+        if let Err(e) = app.set_streaming_enabled(new_state) {
+            warn!("tray toggle failed: {}", e);
+        }
+    } else if *id == ids.switch_speaker || *id == ids.show_window {
+        show_window_win32(hwnd.load(Ordering::Relaxed));
+    } else if *id == ids.open_web {
+        if app.is_web_ui_enabled() {
+            open_web_ui(&app.config.advertise_ip, app.config.bind.port());
+        }
+    } else if *id == ids.quit {
+        info!("tray: quit requested");
+        app.request_shutdown();
+        // Force the window visible so gui.rs::update() runs and
+        // executes its shutdown sequence (drop tray, ViewportCommand
+        // Close). Without this, a hidden window stays hidden and
+        // update() never sees the shutdown flag.
+        show_window_win32(hwnd.load(Ordering::Relaxed));
+    }
+    ctx.request_repaint();
+}
+
+/// Raw Win32 "bring this window to the foreground" sequence.
+/// `SetWindowPos` with `SWP_SHOWWINDOW` flips visibility AND lifts
+/// Z-order in one synchronous call, sidestepping the eframe
+/// ViewportCommand queue (which doesn't drain on hidden windows —
+/// emilk/egui#5229, #3655). `SW_RESTORE` handles the minimised case.
+/// `ShowWindowAsync` is used for `SW_RESTORE` so the call is safe
+/// from a non-owning thread (this fn runs on the tray bg thread).
+fn show_window_win32(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, SetForegroundWindow, SetWindowPos, ShowWindowAsync,
+        HWND_TOP, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    };
+    unsafe {
+        let h = hwnd as _;
+        SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        if IsIconic(h) != 0 {
+            ShowWindowAsync(h, SW_RESTORE);
+        }
+        SetForegroundWindow(h);
     }
 }
 
@@ -282,27 +330,42 @@ fn open_web_ui(advertise_ip: &str, port: u16) {
 // -----------------------------------------------------------------------------
 
 fn build_icon() -> Result<Icon> {
+    // 32×32 — Windows downsamples to 16×16 / 24×24 / 20×20 depending
+    // on DPI. Shapes need to be bold enough that downsampling doesn't
+    // collapse them into a featureless blob (which is what the
+    // previous design did, hence "it's a square").
     const W: u32 = 32;
     const H: u32 = 32;
     let mut pixels = vec![0u8; (W * H * 4) as usize];
-
-    let fg = [60u8, 180, 100, 255];
-    let bg = [16u8, 16, 16, 0]; // transparent
+    // Transparent background — all zeros (RGBA 0,0,0,0).
+    let fg = [60u8, 180, 100, 255]; // accent green, opaque
 
     for y in 0..H {
         for x in 0..W {
             let i = ((y * W + x) * 4) as usize;
-            let xc = x as i32 - 16;
-            let yc = y as i32 - 16;
-            let r2 = xc * xc + yc * yc;
-            let speaker_body = (xc.abs() <= 5 && yc.abs() <= 10)
-                || (r2 < 14 * 14 && xc > 5)
-                || (r2 < 6 * 6);
-            let color = if speaker_body { fg } else { bg };
-            pixels[i] = color[0];
-            pixels[i + 1] = color[1];
-            pixels[i + 2] = color[2];
-            pixels[i + 3] = color[3];
+            let xi = x as i32;
+            let yi = y as i32;
+
+            // 1. Speaker body — solid vertical rectangle on the left.
+            //    Width 7, height 11, centered vertically at y=16.
+            let body = xi >= 5 && xi <= 11 && yi >= 11 && yi <= 21;
+
+            // 2. Cone — trapezoid opening to the right, attaches to
+            //    the body's right edge. At x=11 the cone matches the
+            //    body's height; at x=22 it widens to fill 24 px
+            //    vertically.
+            //    half_height(dx) = 5 + dx * 7 / 11   (5 → 12, linear)
+            let cone_dx = xi - 11;
+            let half_h = 5 + (cone_dx * 7 + 5) / 11;
+            let cone =
+                cone_dx >= 0 && cone_dx <= 11 && (yi - 16).abs() <= half_h;
+
+            if body || cone {
+                pixels[i] = fg[0];
+                pixels[i + 1] = fg[1];
+                pixels[i + 2] = fg[2];
+                pixels[i + 3] = fg[3];
+            }
         }
     }
 

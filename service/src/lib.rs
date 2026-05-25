@@ -16,6 +16,7 @@ pub mod volume_sync;
 pub mod sine_source;
 pub mod qpc;
 pub mod picker;
+pub mod user_config;
 #[cfg(windows)]
 pub mod wasapi_source;
 

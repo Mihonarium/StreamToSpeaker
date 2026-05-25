@@ -438,8 +438,15 @@ impl eframe::App for StreamToSpeakerApp {
                         .show(ui, |ui| {
                             self.show_status_banner(ui, &p);
                             ui.add_space(14.0);
-                            if self.app.current_renderer().is_none()
-                                && !self.onboarding_dismissed
+                            // Show onboarding regardless of whether a
+                            // speaker is currently bound, until the
+                            // user explicitly dismisses with "Got it".
+                            // Dismissal is persisted via user_config
+                            // (see app.rs::dismiss_onboarding), so
+                            // returning users don't see it on every
+                            // launch.
+                            if !self.onboarding_dismissed
+                                && !self.app.is_onboarding_dismissed()
                             {
                                 self.show_onboarding(ui, &p);
                                 ui.add_space(14.0);
@@ -612,10 +619,11 @@ impl StreamToSpeakerApp {
                 section_label(ui, p, "Getting started");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if secondary_button(ui, p, "Got it", 72.0)
-                        .on_hover_text("Hide this card for the rest of the session")
+                        .on_hover_text("Hide this card — won't show again on future launches")
                         .clicked()
                     {
                         self.onboarding_dismissed = true;
+                        self.app.dismiss_onboarding();
                     }
                 });
             });
@@ -780,8 +788,12 @@ impl StreamToSpeakerApp {
             ui.horizontal(|ui| {
                 section_label(ui, p, "Speakers");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    secondary_button(ui, p, "↻  Rescan", 92.0)
-                        .on_hover_text("Re-trigger SSDP discovery now (otherwise runs every few minutes)");
+                    if secondary_button(ui, p, "↻  Rescan", 92.0)
+                        .on_hover_text("Re-trigger SSDP discovery now (otherwise runs every few minutes)")
+                        .clicked()
+                    {
+                        self.app.trigger_rescan();
+                    }
                 });
             });
             ui.add_space(6.0);
