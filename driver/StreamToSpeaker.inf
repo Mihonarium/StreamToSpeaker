@@ -36,6 +36,23 @@ StreamToSpeaker.sys = 1
 ; ----------------------------------------------------------------------
 
 [StreamToSpeaker_Inst.NT]
+; Inherit the core KS + WDMAudio registrations from the inbox INFs.
+; Per Microsoft's "Installing Core System Components for an Audio
+; Adapter" docs ([1]):
+;   "Each adapter driver should specify the inclusion of the
+;    KS.Registration section in Ks.inf and the WDMAUDIO.Registration
+;    section in Wdmaudio.inf."
+; Without this, the inbox MediaCategories friendly-name table isn't
+; seeded under our device's software key — and KSNODETYPE_SPEAKER
+; (the bridge pin's Category GUID) fails to resolve to "Speakers"
+; during AudioEndpointBuilder classification. The endpoint then
+; stays at the "Internal AUX Jack" placeholder and is created
+; disabled by default. This was the missing piece that left every
+; one of our previous INF / driver / post-install fixes ineffective.
+;
+; [1] https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/installing-core-system-components-for-an-audio-adapter
+Include    = ks.inf, wdmaudio.inf
+Needs      = KS.Registration, WDMAUDIO.Registration
 CopyFiles  = StreamToSpeaker.CopyFiles
 AddReg     = StreamToSpeaker_AddReg
 
