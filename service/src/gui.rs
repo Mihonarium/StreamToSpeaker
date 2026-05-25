@@ -420,7 +420,21 @@ fn apply_theme(ctx: &egui::Context, dark: bool, system_accent: Option<(u8, u8, u
     visuals.window_rounding = RADIUS_SURFACE.into();
     visuals.menu_rounding = RADIUS_SURFACE.into();
 
-    // Focus ring — visible 2px accent outline for keyboard accessibility.
+    // Focus ring. egui paints a 2-px stroke at `selection.stroke`
+    // around any focused widget, OUTSET by `widgets.active.expansion`
+    // (so 0 expansion ≈ stroke painted on the widget border itself —
+    // invisible if the widget already has its own border). Bump
+    // expansion to 2 epx and use a heavier accent stroke. WCAG
+    // 2.4.7 / 2.4.13 require ≥ 2 px with ≥ 3:1 contrast against
+    // adjacent colours.
+    visuals.selection.stroke = egui::Stroke::new(2.0, p.accent);
+    visuals.widgets.active.expansion = 2.0;
+    // Also explicitly de-conflict hover vs focus visuals: previous
+    // version of this code accidentally double-assigned
+    // `widgets.hovered.bg_stroke` here, overwriting the 1.5-px
+    // active stroke set earlier in the function. Keep hover as a
+    // 1-px subtle accent and rely on `selection.stroke` for the
+    // focused widget on top.
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, p.accent);
     ctx.set_visuals(visuals);
 
