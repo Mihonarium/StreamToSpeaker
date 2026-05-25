@@ -1654,6 +1654,62 @@ impl StreamToSpeakerApp {
                         });
                     }
                 });
+
+            // m24: speaker-side volume slider. Hidden until a speaker is
+            // bound (without one there's nothing to control). Drag pushes
+            // upnp::set_volume on a detached thread; GENA NOTIFYs from the
+            // speaker side stream back through volume_sync so the slider
+            // stays in sync with the Sonos app / physical buttons.
+            if self.app.current_renderer().is_some() {
+                ui.add_space(sp::S);
+                ui.separator();
+                ui.add_space(sp::S);
+                self.show_volume_row(ui, p);
+            }
+        });
+    }
+
+    fn show_volume_row(&self, ui: &mut egui::Ui, p: &Palette) {
+        let current = self.app.current_volume();
+        let mut level: i64 = current.unwrap_or(50) as i64;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Volume")
+                    .strong()
+                    .color(p.text_primary),
+            );
+            ui.add_space(sp::S);
+
+            let trailing_w = 56.0;
+            let avail = ui.available_width();
+            let slider_w = (avail - trailing_w - sp::S).max(80.0);
+            let prev_slider_w = ui.spacing().slider_width;
+            ui.spacing_mut().slider_width = slider_w;
+            let resp = ui.add(
+                egui::Slider::new(&mut level, 0..=100)
+                    .show_value(false)
+                    .clamping(egui::SliderClamping::Always),
+            );
+            ui.spacing_mut().slider_width = prev_slider_w;
+            ui.add_space(sp::S);
+
+            let display = match current {
+                Some(_) => format!("{:>3}", level),
+                None => "  ?".to_string(),
+            };
+            ui.label(
+                egui::RichText::new(display)
+                    .monospace()
+                    .color(p.text_secondary),
+            );
+
+            // Only push on drag-release (drag_stopped) and explicit
+            // click, not on every intermediate value while the user
+            // is still dragging — saves ~30 UPnP SOAP requests per
+            // slide and keeps the speaker side responsive.
+            if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                self.app.set_speaker_volume(level.clamp(0, 100) as u32);
+            }
         });
     }
 

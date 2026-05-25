@@ -328,7 +328,50 @@ impl App {
                 .map(|r| r.friendly_name.clone());
             crate::endpoint_name::update_endpoint_name(speaker_name.as_deref());
         }
+        // m24: prime the volume cache so the GUI slider shows the
+        // speaker's actual level on the next paint, instead of
+        // waiting for the first GENA NOTIFY (which can take a few
+        // seconds and is silent if the user never adjusts the
+        // volume on the speaker side). Detached — the upnp call
+        // can block ~100 ms.
+        if let Some(r) = self.current_renderer() {
+            let vsync = self.vsync.clone();
+            let url = r.rendering_control_control_url.clone();
+            std::thread::spawn(move || {
+                if let Ok(level) = upnp::get_volume(&url) {
+                    vsync.prime_initial_volume(level);
+                }
+            });
+        }
         Ok(())
+    }
+
+    /// Current Sonos-side volume (0-100) if known. None on a fresh
+    /// session before the first prime_initial_volume / GENA NOTIFY.
+    pub fn current_volume(&self) -> Option<u32> {
+        self.vsync.current_level()
+    }
+
+    /// Push a user-set volume to the bound speaker. No-op if no
+    /// speaker is bound. Runs the UPnP SOAP call on a detached
+    /// thread — caller (GUI slider) doesn't block on the network.
+    pub fn set_speaker_volume(&self, level: u32) {
+        let level = level.min(100);
+        let url = {
+            let guard = self.session.lock().unwrap();
+            match guard.as_ref() {
+                Some(s) => s.renderer.rendering_control_control_url.clone(),
+                None => return,
+            }
+        };
+        // Update the cache immediately so the slider doesn't snap
+        // back to the old value while the network call is in flight.
+        self.vsync.prime_initial_volume(level);
+        std::thread::spawn(move || {
+            if let Err(e) = upnp::set_volume(&url, level) {
+                log::warn!("set_volume({}) failed: {:#}", level, e);
+            }
+        });
     }
 
     /// Disconnect from the current speaker (if any), clear the
