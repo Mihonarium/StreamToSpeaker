@@ -282,27 +282,42 @@ fn open_web_ui(advertise_ip: &str, port: u16) {
 // -----------------------------------------------------------------------------
 
 fn build_icon() -> Result<Icon> {
+    // 32×32 — Windows downsamples to 16×16 / 24×24 / 20×20 depending
+    // on DPI. Shapes need to be bold enough that downsampling doesn't
+    // collapse them into a featureless blob (which is what the
+    // previous design did, hence "it's a square").
     const W: u32 = 32;
     const H: u32 = 32;
     let mut pixels = vec![0u8; (W * H * 4) as usize];
-
-    let fg = [60u8, 180, 100, 255];
-    let bg = [16u8, 16, 16, 0]; // transparent
+    // Transparent background — all zeros (RGBA 0,0,0,0).
+    let fg = [60u8, 180, 100, 255]; // accent green, opaque
 
     for y in 0..H {
         for x in 0..W {
             let i = ((y * W + x) * 4) as usize;
-            let xc = x as i32 - 16;
-            let yc = y as i32 - 16;
-            let r2 = xc * xc + yc * yc;
-            let speaker_body = (xc.abs() <= 5 && yc.abs() <= 10)
-                || (r2 < 14 * 14 && xc > 5)
-                || (r2 < 6 * 6);
-            let color = if speaker_body { fg } else { bg };
-            pixels[i] = color[0];
-            pixels[i + 1] = color[1];
-            pixels[i + 2] = color[2];
-            pixels[i + 3] = color[3];
+            let xi = x as i32;
+            let yi = y as i32;
+
+            // 1. Speaker body — solid vertical rectangle on the left.
+            //    Width 7, height 11, centered vertically at y=16.
+            let body = xi >= 5 && xi <= 11 && yi >= 11 && yi <= 21;
+
+            // 2. Cone — trapezoid opening to the right, attaches to
+            //    the body's right edge. At x=11 the cone matches the
+            //    body's height; at x=22 it widens to fill 24 px
+            //    vertically.
+            //    half_height(dx) = 5 + dx * 7 / 11   (5 → 12, linear)
+            let cone_dx = xi - 11;
+            let half_h = 5 + (cone_dx * 7 + 5) / 11;
+            let cone =
+                cone_dx >= 0 && cone_dx <= 11 && (yi - 16).abs() <= half_h;
+
+            if body || cone {
+                pixels[i] = fg[0];
+                pixels[i + 1] = fg[1];
+                pixels[i + 2] = fg[2];
+                pixels[i + 3] = fg[3];
+            }
         }
     }
 
