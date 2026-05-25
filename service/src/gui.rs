@@ -181,6 +181,41 @@ fn is_high_contrast_on() -> bool {
     false
 }
 
+/// Enable Win11's Mica window backdrop. The window's titlebar +
+/// background tint follow the desktop, giving the app a native
+/// Win11 look instead of a flat opaque rectangle.
+///
+/// Returns true if the OS accepted the call (Win11 build 22000+);
+/// false on Win10 / older Win11 (DwmSetWindowAttribute rejects the
+/// DWMWA_SYSTEMBACKDROP_TYPE attribute).
+///
+/// NOTE: Mica is only visible if the window background is at least
+/// partially transparent. Right now we paint the canvas opaque, so
+/// Mica is enabled but covered. A follow-up commit needs to add
+/// `ViewportBuilder::with_transparent(true)` + an `App::clear_color`
+/// override returning `[0,0,0,0]` to actually expose the tint.
+#[cfg(windows)]
+fn try_enable_mica(hwnd: isize) -> bool {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+    };
+    let value: i32 = DWMSBT_MAINWINDOW as i32;
+    let hr = unsafe {
+        DwmSetWindowAttribute(
+            hwnd as _,
+            DWMWA_SYSTEMBACKDROP_TYPE as u32,
+            &value as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        )
+    };
+    hr == 0 // S_OK
+}
+
+#[cfg(not(windows))]
+fn try_enable_mica(_hwnd: isize) -> bool {
+    false
+}
+
 #[derive(Copy, Clone)]
 struct Palette {
     // Surfaces
@@ -516,6 +551,9 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 if let Some(t) = tray.as_mut() {
                     t.set_hwnd(h);
                 }
+                // Opt into Win11 Mica. Silently no-ops on Win10.
+                // See try_enable_mica for the transparency follow-up.
+                let _ = try_enable_mica(h);
             }
 
             let skip_close_confirmation = app_for_eframe.is_always_minimise_to_tray();
