@@ -196,6 +196,21 @@ impl App {
         }
     }
 
+    /// Returns the persisted "always minimise to tray on window close"
+    /// preference (the close-confirm modal's checkbox).
+    pub fn is_always_minimise_to_tray(&self) -> bool {
+        self.user_config.lock().unwrap().always_minimise_to_tray
+    }
+
+    /// Persist the "always minimise to tray" preference.
+    pub fn set_always_minimise_to_tray(&self, on: bool) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.always_minimise_to_tray != on {
+            uc.always_minimise_to_tray = on;
+            uc.save();
+        }
+    }
+
     /// The user's last explicitly-selected speaker, as persisted in
     /// `user_config`. Returns `None` on a fresh install (which is what
     /// makes `main.rs` skip auto-reconnect on the first launch — the

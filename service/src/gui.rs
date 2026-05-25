@@ -401,7 +401,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 tray,
                 frame_count: 0,
                 confirm_close_open: false,
-                skip_close_confirmation: false,
+                skip_close_confirmation: app_for_eframe.is_always_minimise_to_tray(),
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
                 onboarding_dismissed: false,
@@ -1431,7 +1431,7 @@ impl StreamToSpeakerApp {
                 ui.add_space(sp::S);
                 ui.checkbox(
                     &mut new_skip,
-                    "Always minimise to tray (until I quit)",
+                    "Always minimise to tray. Don't ask again.",
                 );
                 ui.add_space(sp::M);
                 ui.horizontal(|ui| {
@@ -1469,7 +1469,13 @@ impl StreamToSpeakerApp {
             action = Some(CloseAction::Cancel);
         }
 
-        self.skip_close_confirmation = new_skip;
+        if new_skip != self.skip_close_confirmation {
+            self.skip_close_confirmation = new_skip;
+            // Persist across launches — was session-local before
+            // (audit Content #63 / Accessibility D-03). Onboarding
+            // dismissal is persisted; this should match.
+            self.app.set_always_minimise_to_tray(new_skip);
+        }
         if let Some(a) = action {
             self.confirm_close_open = false;
             match a {

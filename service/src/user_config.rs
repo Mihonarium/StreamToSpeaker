@@ -19,6 +19,13 @@ pub struct UserConfig {
     pub last_speaker_id: Option<String>,
     #[serde(default)]
     pub onboarding_dismissed: bool,
+    /// User ticked "Always minimise to tray" in the close-confirm
+    /// modal. When true, future window-close events skip the modal
+    /// and silently minimise. Inconsistency with onboarding_dismissed
+    /// — which IS persisted — was confusing; this brings the close
+    /// preference into the same store.
+    #[serde(default)]
+    pub always_minimise_to_tray: bool,
 }
 
 fn config_dir() -> Option<PathBuf> {
