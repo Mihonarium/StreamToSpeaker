@@ -240,6 +240,25 @@ impl App {
         Ok(())
     }
 
+    /// Disconnect from the current speaker (if any), clear the
+    /// persisted `last_speaker_id`, and reset the onboarding-dismissed
+    /// flag so the next launch is a true "first launch" again. Used
+    /// by the GUI's Forget-speaker button (audit Heuristics F-07 —
+    /// without this the only way to clear the saved speaker was to
+    /// edit `%APPDATA%\StreamToSpeaker\config.json` by hand).
+    pub fn forget_saved_speaker(&self) {
+        let s = self.session.lock().unwrap().take();
+        if let Some(s) = s {
+            stop_session(&s);
+        }
+        self.streaming_enabled.store(false, Ordering::Release);
+        *self.last_speaker_id.lock().unwrap() = None;
+        let mut uc = self.user_config.lock().unwrap();
+        uc.last_speaker_id = None;
+        uc.onboarding_dismissed = false;
+        uc.save();
+    }
+
     /// Fire a one-shot SSDP M-SEARCH on the same interface the periodic
     /// loop uses. Runs on a detached thread because `discover_once`
     /// blocks for ~3 s waiting for responses; the GUI button doesn't

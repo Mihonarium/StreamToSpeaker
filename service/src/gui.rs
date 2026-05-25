@@ -909,14 +909,32 @@ impl StreamToSpeakerApp {
                 section_label(ui, p, "Speakers");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if secondary_button(ui, p, "↻  Rescan", 92.0)
-                        .on_hover_text("Re-trigger SSDP discovery now (otherwise runs every few minutes)")
+                        .on_hover_text(
+                            "Search the network for speakers now. Otherwise this runs every few minutes.",
+                        )
                         .clicked()
                     {
                         self.app.trigger_rescan();
                     }
+                    // "Forget saved speaker" — only relevant when the
+                    // user has a persisted last_speaker_id. Clears it
+                    // and resets onboarding so the next launch feels
+                    // like a fresh install. Lives here (alongside
+                    // Rescan) because both are speaker-list-level
+                    // management actions.
+                    if self.app.saved_speaker_id().is_some() {
+                        if link_button(ui, p, "Forget saved", 110.0)
+                            .on_hover_text(
+                                "Disconnect from the speaker and clear the saved choice. The next launch will ask you to pick again.",
+                            )
+                            .clicked()
+                        {
+                            self.app.forget_saved_speaker();
+                        }
+                    }
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(sp::XS);
 
             let view = self.app.speaker_view();
             if view.speakers.is_empty() {
