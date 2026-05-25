@@ -76,15 +76,22 @@ impl AirPlayRenderer {
     }
 
     /// True if this receiver supports a path we know how to talk to.
-    /// We require ALAC (cn=1) — every AirPlay receiver supports it —
-    /// and RSA encryption (et=1), again universal. PCM (cn=0) +
-    /// no-encryption (et=0) would be simpler but isn't actually the
-    /// common configuration in the wild despite being in the spec.
+    ///
+    /// We require:
+    ///   * Not password-protected (we don't speak HTTP-Digest yet).
+    ///   * ALAC (`cn=1`) advertised — universal across AirPlay
+    ///     receivers, but a handful of weird devices only do PCM.
+    ///   * Either no-encryption (`et=0`) OR Apple RSA (`et=1`)
+    ///     advertised. FairPlay-only receivers (`et=3/4/5` exclusive,
+    ///     no `et=0`) require HomeKit pairing and are out of scope.
     pub fn is_supported(&self) -> bool {
         if self.password_protected {
             return false;
         }
-        self.codecs.contains(&1) && self.encryption_types.contains(&1)
+        if !self.codecs.contains(&1) {
+            return false;
+        }
+        self.encryption_types.contains(&0) || self.encryption_types.contains(&1)
     }
 }
 

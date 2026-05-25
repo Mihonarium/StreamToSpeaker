@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::airplay::crypto::SessionKey;
+use crate::airplay::crypto::Cipher;
 use crate::airplay::discovery::AirPlayRenderer;
 use crate::airplay::rtp::{
     bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, spawn_audio_sender,
@@ -105,8 +105,20 @@ impl AirPlaySession {
         .context("opening RTSP connection")?;
         rtsp.options().context("RTSP OPTIONS")?;
 
-        let session_key = SessionKey::random();
-        rtsp.announce(&session_key).context("RTSP ANNOUNCE")?;
+        let cipher = Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no compatible encryption mode for {} (advertised et={:?})",
+                cfg.renderer.friendly_name,
+                cfg.renderer.encryption_types,
+            )
+        })?;
+        info!(
+            "AirPlay: cipher={} (receiver et={:?})",
+            cipher.label(),
+            cfg.renderer.encryption_types,
+        );
+        let cipher = Arc::new(cipher);
+        rtsp.announce(&cipher).context("RTSP ANNOUNCE")?;
 
         let server_ports = rtsp
             .setup(control_port, timing_port)
@@ -145,7 +157,7 @@ impl AirPlaySession {
         let sender_cfg = RtpSenderConfig {
             audio_socket: audio_socket_for_thread,
             receiver_addr: SocketAddr::new(cfg.renderer.ip, server_ports.audio),
-            session_key,
+            cipher,
             initial_seq,
             initial_rtptime,
             ssrc,

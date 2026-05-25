@@ -50,6 +50,67 @@ pub struct SessionKey {
     pub iv: [u8; 16],
 }
 
+/// Audio-stream encryption mode for one session.
+///
+/// Picked at session start based on the receiver's advertised `et=`
+/// TXT-record list:
+///
+///   * `et=1` (and friends) → [`Cipher::AesRsa`] — the classic AirPlay
+///     1 path: AES-128-CBC payload encryption with a session key
+///     wrapped under Apple's public RSA key. Works with AirPort
+///     Express and shairport-sync.
+///   * `et=0` available     → [`Cipher::None`] — the "no encryption"
+///     path. Receivers advertising this accept ANNOUNCE without
+///     `rsaaeskey`/`aesiv` and audio RTP packets without AES. This
+///     is the path AirPlay 2 receivers (Sonos in AP2 mode, modern
+///     speakers) expose to senders that can't do FairPlay pairing.
+///
+/// We prefer `et=0` when available — it skips a round of RSA per
+/// session and works with the broadest set of modern receivers. If
+/// only `et=1` is on offer we fall back to the encrypted path.
+/// FairPlay-only receivers (`et=3/4/5` only) are unsupported here;
+/// they require HomeKit pairing.
+pub enum Cipher {
+    None,
+    AesRsa(SessionKey),
+}
+
+impl Cipher {
+    /// Choose the best cipher we can speak from a receiver's
+    /// advertised `et=` list. Returns `None` if nothing matches
+    /// (FairPlay-only receivers, etc).
+    pub fn pick_for(encryption_types: &[u8]) -> Option<Self> {
+        // Prefer no-encryption first: simpler, works with the AP2
+        // generation, and matches what every "AirConnect"-style
+        // bridge does. RSA is the legacy fallback for AP1-only
+        // receivers that don't advertise et=0.
+        if encryption_types.contains(&0) {
+            Some(Cipher::None)
+        } else if encryption_types.contains(&1) {
+            Some(Cipher::AesRsa(SessionKey::random()))
+        } else {
+            None
+        }
+    }
+
+    /// Short label for logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Cipher::None => "none",
+            Cipher::AesRsa(_) => "aes-rsa",
+        }
+    }
+
+    /// Encrypt one audio packet's payload in place. No-op for
+    /// [`Cipher::None`].
+    pub fn encrypt_payload_in_place(&self, buf: &mut [u8]) {
+        match self {
+            Cipher::None => {}
+            Cipher::AesRsa(key) => encrypt_audio_packet_in_place(buf, key),
+        }
+    }
+}
+
 impl SessionKey {
     /// Roll a fresh random AES key + IV.
     pub fn random() -> Self {

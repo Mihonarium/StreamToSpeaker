@@ -258,13 +258,18 @@ impl App {
             for r in d.renderers() {
                 let id = r.stable_id();
                 let active = active_id.as_deref() == Some(id.as_str());
-                // Mark unsupported speakers (e.g. password-protected)
-                // with a parenthetical so the user can tell why
-                // selection might fail.
+                // Annotate the row so the user can tell why a click
+                // might fail. Otherwise we just tag the row "(AirPlay)"
+                // so the user knows they're picking the AirPlay path
+                // rather than UPnP for receivers that advertise both
+                // (Sonos does).
                 let name = if r.is_supported() {
                     format!("{} (AirPlay)", r.friendly_name)
                 } else if r.password_protected {
                     format!("{} (AirPlay, password-protected)", r.friendly_name)
+                } else if r.encryption_types.iter().any(|&e| e >= 3) {
+                    // FairPlay-only — HomePod / paired-HomeKit territory.
+                    format!("{} (AirPlay, requires HomeKit pairing)", r.friendly_name)
                 } else {
                     format!("{} (AirPlay, unsupported)", r.friendly_name)
                 };

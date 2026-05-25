@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::airplay::alac::build_uncompressed_alac_frame;
-use crate::airplay::crypto::{encrypt_audio_packet_in_place, SessionKey};
+use crate::airplay::crypto::Cipher;
 use crate::http_server::PcmFrame;
 use crate::WIRE_SAMPLE_RATE;
 
@@ -86,8 +86,11 @@ pub struct RtpSenderConfig {
     /// Receiver IP + port — destination for the audio stream (from
     /// the SETUP response's `server_port=`).
     pub receiver_addr: SocketAddr,
-    /// Session AES key + IV.
-    pub session_key: SessionKey,
+    /// Per-session cipher — either AES-RSA or no-op for receivers
+    /// that advertise `et=0`. Shared with the packet builder by Arc
+    /// so we don't clone the (potentially large) SessionKey buffer
+    /// every packet.
+    pub cipher: Arc<Cipher>,
     /// Initial RTP sequence number (echoed in the RECORD `RTP-Info`
     /// header, so must match what the session declared).
     pub initial_seq: u16,
@@ -185,7 +188,7 @@ fn run_sender(cfg: RtpSenderConfig) {
                 cfg.ssrc,
                 packet_count == 0,
                 &alac_frame,
-                &cfg.session_key,
+                &cfg.cipher,
             );
 
             // Pace to wall-clock so we don't outrun the receiver's
@@ -238,14 +241,14 @@ fn append_samples_from_frame(ring: &mut Vec<i16>, frame: &PcmFrame) {
     }
 }
 
-/// Build a complete RTP packet: 12-byte header + AES-encrypted payload.
+/// Build a complete RTP packet: 12-byte header + (optionally encrypted) payload.
 fn build_rtp_packet(
     seq: u16,
     timestamp: u32,
     ssrc: u32,
     is_first_packet: bool,
     alac_frame: &[u8],
-    session_key: &SessionKey,
+    cipher: &Cipher,
 ) -> Vec<u8> {
     let mut pkt = vec![0u8; 12 + alac_frame.len()];
 
@@ -257,7 +260,7 @@ fn build_rtp_packet(
     BigEndian::write_u32(&mut pkt[8..12], ssrc);
 
     pkt[12..].copy_from_slice(alac_frame);
-    encrypt_audio_packet_in_place(&mut pkt[12..], session_key);
+    cipher.encrypt_payload_in_place(&mut pkt[12..]);
     pkt
 }
 
@@ -277,12 +280,9 @@ mod tests {
 
     #[test]
     fn rtp_header_layout() {
-        let sk = SessionKey {
-            key: [0; 16],
-            iv: [0; 16],
-        };
+        let cipher = Cipher::None;
         // Empty ALAC frame so we can inspect the header byte-by-byte.
-        let pkt = build_rtp_packet(0x1234, 0xABCD_0123, 0xDEAD_BEEF, true, &[], &sk);
+        let pkt = build_rtp_packet(0x1234, 0xABCD_0123, 0xDEAD_BEEF, true, &[], &cipher);
         assert_eq!(pkt.len(), 12);
         assert_eq!(pkt[0], 0x80); // V=2 P=0 X=0 CC=0
         assert_eq!(pkt[1], 0x80 | 0x60); // marker + PT=96
@@ -293,11 +293,16 @@ mod tests {
 
     #[test]
     fn rtp_subsequent_packets_have_no_marker() {
-        let sk = SessionKey {
-            key: [0; 16],
-            iv: [0; 16],
-        };
-        let pkt = build_rtp_packet(0, 0, 0, false, &[], &sk);
+        let cipher = Cipher::None;
+        let pkt = build_rtp_packet(0, 0, 0, false, &[], &cipher);
         assert_eq!(pkt[1], 0x60); // PT=96, no marker
+    }
+
+    #[test]
+    fn rtp_unencrypted_payload_is_passed_through() {
+        let cipher = Cipher::None;
+        let payload = [0xAA, 0xBB, 0xCC, 0xDD];
+        let pkt = build_rtp_packet(0, 0, 0, false, &payload, &cipher);
+        assert_eq!(&pkt[12..], &payload);
     }
 }

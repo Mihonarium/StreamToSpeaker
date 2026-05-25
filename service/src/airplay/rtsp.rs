@@ -26,7 +26,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::airplay::crypto::{base64_nopad, random_apple_challenge, SessionKey};
+use crate::airplay::crypto::{base64_nopad, random_apple_challenge, Cipher};
 
 /// User-Agent string the RTSP requests carry.
 ///
@@ -138,44 +138,54 @@ impl RtspClient {
         Ok(())
     }
 
-    /// ANNOUNCE — send the SDP that declares our codec and ships the
-    /// RSA-wrapped AES key + IV.
+    /// ANNOUNCE — send the SDP that declares our codec and (for the
+    /// encrypted path) ships the RSA-wrapped AES key + IV.
     ///
-    /// SDP format:
+    /// SDP format (`o=` and `s=` say "iTunes" because some receivers,
+    /// notably some Sonos AP2 firmwares, gate on the iTunes brand;
+    /// our real identity goes in `Client-Instance`/`DACP-ID`):
     ///
     /// ```text
     /// v=0
-    /// o=stream-to-speaker <session_id> 0 IN IP4 <local_ip>
-    /// s=stream-to-speaker
+    /// o=iTunes <session_id> 0 IN IP4 <local_ip>
+    /// s=iTunes
     /// c=IN IP4 <receiver_ip>
     /// t=0 0
     /// m=audio 0 RTP/AVP 96
     /// a=rtpmap:96 AppleLossless
     /// a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100
-    /// a=rsaaeskey:<base64-nopad of 128-byte RSA-OAEP ciphertext>
-    /// a=aesiv:<base64-nopad of 16-byte IV>
+    /// [a=rsaaeskey:<base64-nopad of 256-byte RSA-OAEP ciphertext>]
+    /// [a=aesiv:<base64-nopad of 16-byte IV>]
     /// ```
-    pub fn announce(&mut self, session_key: &SessionKey) -> Result<()> {
-        let rsa_wrapped = session_key.rsa_wrapped_key()?;
-        let key_b64 = base64_nopad(&rsa_wrapped);
-        let iv_b64 = base64_nopad(&session_key.iv);
+    ///
+    /// The last two lines are only emitted for [`Cipher::AesRsa`].
+    /// For [`Cipher::None`] the receiver expects raw (unencrypted)
+    /// audio RTP packets and we skip the SDP key material entirely.
+    pub fn announce(&mut self, cipher: &Cipher) -> Result<()> {
+        let crypto_lines = match cipher {
+            Cipher::None => String::new(),
+            Cipher::AesRsa(key) => {
+                let rsa_wrapped = key.rsa_wrapped_key()?;
+                let key_b64 = base64_nopad(&rsa_wrapped);
+                let iv_b64 = base64_nopad(&key.iv);
+                format!("a=rsaaeskey:{}\r\na=aesiv:{}\r\n", key_b64, iv_b64)
+            }
+        };
 
         let sdp = format!(
             "v=0\r\n\
-             o=stream-to-speaker {sid} 0 IN IP4 {local}\r\n\
-             s=stream-to-speaker\r\n\
+             o=iTunes {sid} 0 IN IP4 {local}\r\n\
+             s=iTunes\r\n\
              c=IN IP4 {receiver}\r\n\
              t=0 0\r\n\
              m=audio 0 RTP/AVP 96\r\n\
              a=rtpmap:96 AppleLossless\r\n\
              a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n\
-             a=rsaaeskey:{key}\r\n\
-             a=aesiv:{iv}\r\n",
+             {crypto}",
             sid = self.session_id,
             local = self.local_ip,
             receiver = self.receiver_ip,
-            key = key_b64,
-            iv = iv_b64,
+            crypto = crypto_lines,
         );
 
         let uri = self.session_uri();
