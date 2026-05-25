@@ -1150,10 +1150,27 @@ impl StreamToSpeakerApp {
                             .fill(if selected { p.accent } else { egui::Color32::TRANSPARENT })
                             .stroke(egui::Stroke::NONE)
                             .rounding(RADIUS_CONTROL);
-                        if clickable(ui.add_sized([60.0, CONTROL_HEIGHT], btn))
-                            .on_hover_text(tip)
-                            .clicked()
-                        {
+                        // m4: kill the default Button hover stroke
+                        // inside the segmented control. apply_theme
+                        // sets widgets.hovered.bg_stroke to 1 px accent
+                        // for normal buttons — desirable there, but on
+                        // a segment it paints a halo around the hovered
+                        // tile that fights the "these belong together"
+                        // tab affordance. The fill change alone (handled
+                        // by widgets.hovered.bg_fill) is enough hover
+                        // signal here.
+                        let clicked = ui
+                            .scope(|ui| {
+                                ui.visuals_mut().widgets.hovered.bg_stroke =
+                                    egui::Stroke::NONE;
+                                ui.visuals_mut().widgets.active.bg_stroke =
+                                    egui::Stroke::NONE;
+                                clickable(ui.add_sized([60.0, CONTROL_HEIGHT], btn))
+                                    .on_hover_text(tip)
+                                    .clicked()
+                            })
+                            .inner;
+                        if clicked {
                             self.theme_mode = mode;
                         }
                     }
@@ -1770,8 +1787,11 @@ impl StreamToSpeakerApp {
             let chevron = if self.advanced_open { "▾" } else { "▸" };
             let avail_w = ui.available_width();
             let id = ui.id().with("advanced_toggle");
+            // m5: was 28 px tall — undershot CONTROL_HEIGHT and the
+            // 32 px buttons everywhere else in the app. Normalised so
+            // the disclosure strip's click target matches the rest.
             let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(avail_w, 28.0),
+                egui::vec2(avail_w, CONTROL_HEIGHT),
                 egui::Sense::hover(),
             );
             let resp = ui
@@ -2199,12 +2219,35 @@ fn speaker_row(
     }
 
     // Friendly name + IP.
+    // m23: truncate the friendly name with an ellipsis if it would
+    // overflow into the IP column. Painter::text doesn't clip by
+    // default — at narrow window widths a long speaker name would
+    // happily march straight through the IP and off the row's right
+    // edge. LayoutJob with max_rows=1 + break_anywhere does the
+    // elision (default character is `…`).
     let text_left = rect.left() + 34.0;
-    ui.painter().text(
-        egui::pos2(text_left, rect.center().y - 2.0),
-        egui::Align2::LEFT_CENTER,
-        &sp.friendly_name,
-        egui::FontId::new(14.0, egui::FontFamily::Proportional),
+    // Reserve enough room for a 15-char IPv4 in 12 px Monospace plus
+    // some breathing space.
+    const IP_RESERVED_W: f32 = 120.0;
+    let name_max_w = (rect.right() - 18.0 - text_left - IP_RESERVED_W).max(40.0);
+    let name_job = {
+        let mut job = egui::epaint::text::LayoutJob::single_section(
+            sp.friendly_name.clone(),
+            egui::TextFormat {
+                font_id: egui::FontId::new(14.0, egui::FontFamily::Proportional),
+                color: p.text_primary,
+                ..Default::default()
+            },
+        );
+        job.wrap.max_width = name_max_w;
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job
+    };
+    let name_galley = ui.fonts(|f| f.layout_job(name_job));
+    ui.painter().galley(
+        egui::pos2(text_left, rect.center().y - name_galley.size().y / 2.0),
+        name_galley,
         p.text_primary,
     );
     // M12: 18 px right inset — symmetric with the radio indicator at
