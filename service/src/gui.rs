@@ -1297,6 +1297,12 @@ impl StreamToSpeakerApp {
         let mut new_skip = self.skip_close_confirmation;
         let mut action: Option<CloseAction> = None;
 
+        // Esc cancels the modal — ARIA dialog pattern, Windows
+        // convention. egui's Window doesn't auto-handle Escape.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            action = Some(CloseAction::Cancel);
+        }
+
         egui::Window::new(
             egui::RichText::new("Close Stream To Speaker?")
                 .size(15.0)
@@ -1307,43 +1313,52 @@ impl StreamToSpeakerApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(460.0)
+            .default_width(448.0)
             .frame(
                 egui::Frame::window(&ctx.style())
                     .fill(p.card)
                     .stroke(egui::Stroke::new(1.0, p.divider))
                     .rounding(RADIUS_SURFACE)
-                    .inner_margin(22.0),
+                    .inner_margin(sp::L),
             )
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "Minimise to the system tray to keep streaming in the background, \
-                         or quit the app entirely.",
+                        "Keep streaming in the tray, or quit the app entirely.",
                     )
                     .color(p.text_secondary),
                 );
-                ui.add_space(10.0);
+                ui.add_space(sp::S);
                 ui.checkbox(
                     &mut new_skip,
-                    "Always minimise to tray — don't ask again this session",
+                    "Always minimise to tray (until I quit)",
                 );
-                ui.add_space(16.0);
+                ui.add_space(sp::M);
                 ui.horizontal(|ui| {
                     if primary_button(ui, p, "Minimise to tray", 170.0)
-                        .on_hover_text("Hide the window. The tray icon stays, streaming continues.")
+                        .on_hover_text("Hide the window. The tray icon stays and streaming continues.")
                         .clicked()
                     {
                         action = Some(CloseAction::MinimiseToTray);
                     }
-                    if danger_button(ui, p, "Quit", 90.0)
+                    if danger_button(ui, p, "Quit", 96.0)
                         .on_hover_text("Stop streaming and close the app entirely.")
                         .clicked()
                     {
                         action = Some(CloseAction::Quit);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if secondary_button(ui, p, "Cancel", 86.0).clicked() {
+                        // Initial focus on Cancel (the safe choice) per
+                        // ARIA dialog pattern — Enter on a confirmation
+                        // modal should NEVER default to a destructive
+                        // action.
+                        let cancel_id = ui.id().with("close_modal_cancel");
+                        let resp = secondary_button(ui, p, "Cancel", 96.0);
+                        if !resp.has_focus() && !ctx.memory(|m| m.focused().is_some()) {
+                            ui.memory_mut(|m| m.request_focus(cancel_id));
+                        }
+                        let resp = ui.interact(resp.rect, cancel_id, egui::Sense::click());
+                        if resp.clicked() {
                             action = Some(CloseAction::Cancel);
                         }
                     });
