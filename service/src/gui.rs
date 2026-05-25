@@ -226,18 +226,19 @@ fn palette_for(dark: bool) -> Palette {
 // -----------------------------------------------------------------------------
 
 pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
-    // with_taskbar(false) removes the taskbar entry permanently —
-    // typical pattern for tray apps. When we "hide to tray" we just
-    // call Win32 ShowWindow(SW_HIDE) directly, which also stops the
-    // window appearing in Alt-Tab. Reasoning + canonical pattern:
-    // emilk/egui Discussion #737, #1978; egui#3654 (Visible(false) is
-    // unreliable at startup) — taskbar gating is the working knob.
+    // Note: we DON'T use ViewportBuilder::with_taskbar(false). winit
+    // implements that by calling ITaskbarList::DeleteTab on the HWND,
+    // which puts the window in a half-managed taskbar state where
+    // subsequent SW_HIDE/SW_SHOW cycles don't reliably bring the
+    // window back to the foreground. Keep the taskbar entry — when
+    // the window is hidden via ShowWindow(SW_HIDE) the taskbar entry
+    // disappears naturally, and on show it reappears. (Slack / Discord
+    // / OBS tray apps follow this same pattern.)
     let viewport = egui::ViewportBuilder::default()
         .with_title("Stream To Speaker")
         .with_inner_size([720.0, 800.0])
         .with_min_inner_size([580.0, 620.0])
         .with_visible(true)
-        .with_taskbar(false)
         .with_close_button(true);
 
     let options = eframe::NativeOptions {
@@ -255,7 +256,22 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
             apply_theme(&cc.egui_ctx, ThemeMode::System.resolve(&cc.egui_ctx));
             cc.egui_ctx.request_repaint_after(Duration::from_millis(100));
 
-            let tray = if show_tray {
+            // Capture the HWND now, in CreationContext, before any
+            // update() runs. CreationContext::window_handle() is
+            // populated by eframe at construction (epi_integration.rs
+            // initializes Frame's raw_window_handle from the same
+            // root viewport winit Window we'll later show/hide); doing
+            // it here avoids the "first-frame might return Err" edge
+            // case of the previous in-update() capture.
+            let hwnd: Option<isize> = {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                cc.window_handle().ok().and_then(|h| match h.as_raw() {
+                    RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+                    _ => None,
+                })
+            };
+
+            let mut tray = if show_tray {
                 match crate::tray::spawn(app_for_eframe.clone(), cc.egui_ctx.clone()) {
                     Ok(t) => Some(t),
                     Err(e) => {
@@ -266,6 +282,11 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
             } else {
                 None
             };
+            if let Some(h) = hwnd {
+                if let Some(t) = tray.as_mut() {
+                    t.set_hwnd(h);
+                }
+            }
 
             Ok(Box::new(StreamToSpeakerApp {
                 app: app_for_eframe,
@@ -278,7 +299,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 advanced_open: false,
                 onboarding_dismissed: false,
                 last_applied_dark: None,
-                hwnd: None,
+                hwnd,
             }))
         }),
     );
@@ -310,56 +331,44 @@ struct StreamToSpeakerApp {
     hwnd: Option<isize>,
 }
 
-/// Win32 helpers for hide/show. We do not use `ViewportCommand::Visible`
-/// or `Minimized` because eframe processes those commands only inside
-/// `update()`, which only runs on Windows WM_PAINT — and hidden /
-/// minimised windows don't generate WM_PAINT, so the queued
-/// "show window again" command from the tray sits undelivered.
-/// `ShowWindow` is a synchronous Win32 call that flips visibility at
-/// the OS level, no event loop required. See emilk/egui#5229, #3655.
+/// Win32 helpers for hide/show. eframe's `ViewportCommand::Visible` /
+/// `Minimized` are queue-processed inside `update()`, which only runs
+/// on WM_PAINT — and hidden windows don't get WM_PAINT, so the queue
+/// can deadlock. Raw `ShowWindow` is a synchronous OS call that
+/// bypasses the queue (emilk/egui#5229, #3655).
 #[cfg(windows)]
 fn win_hide(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
     unsafe { ShowWindow(hwnd as _, SW_HIDE); }
 }
 
+/// Restore from any state (hidden, minimised) and bring to foreground.
+/// SetWindowPos + SWP_SHOWWINDOW is the most reliable way to make a
+/// hidden window visible AND lift it in Z-order in one call —
+/// SW_HIDE/SW_SHOW alone can desync winit's WindowFlags::VISIBLE bit
+/// and leave the window Z-ordered behind the taskbar. SW_RESTORE
+/// additionally handles the "user minimised via the titlebar" path.
 #[cfg(windows)]
 fn win_show_and_focus(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        ShowWindow, SetForegroundWindow, SW_SHOW, SW_RESTORE,
+        SetWindowPos, ShowWindowAsync, SetForegroundWindow, IsIconic,
+        HWND_TOP, SW_RESTORE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
     };
     unsafe {
-        // SW_RESTORE first to un-minimise if the user minimised via the
-        // titlebar; then SW_SHOW guarantees the window is visible.
-        ShowWindow(hwnd as _, SW_RESTORE);
-        ShowWindow(hwnd as _, SW_SHOW);
-        // Foreground may fail per Windows foreground-stealing rules,
-        // but since the user just clicked the tray icon, we have the
-        // foreground-permission grant and SFW should succeed.
-        SetForegroundWindow(hwnd as _);
+        let h = hwnd as _;
+        SetWindowPos(h, HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        if IsIconic(h) != 0 {
+            ShowWindowAsync(h, SW_RESTORE);
+        }
+        SetForegroundWindow(h);
     }
 }
 
 impl eframe::App for StreamToSpeakerApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count = self.frame_count.saturating_add(1);
-
-        // Capture the HWND on the first frame and hand it to the tray
-        // so the tray's "Show window" click can call ShowWindow
-        // directly (the only thing that works once the window is
-        // hidden — see win_hide / win_show_and_focus above).
-        if self.hwnd.is_none() {
-            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if let Ok(handle) = frame.window_handle() {
-                if let RawWindowHandle::Win32(h) = handle.as_raw() {
-                    let hwnd = h.hwnd.get();
-                    self.hwnd = Some(hwnd);
-                    if let Some(tray) = self.tray.as_mut() {
-                        tray.set_hwnd(hwnd);
-                    }
-                }
-            }
-        }
 
         if self.last_repaint_request.elapsed() >= Duration::from_millis(100) {
             ctx.request_repaint_after(Duration::from_millis(100));

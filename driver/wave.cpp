@@ -83,14 +83,45 @@ static PKSDATARANGE PinDataRangePointersBridge[] =
 };
 
 /* ------------------------------------------------------------------ */
+/* Filter-level property handler — KSPROPSETID_Pin queries that        */
+/* AudioEndpointBuilder calls before creating the endpoint:           */
+/*   KSPROPERTY_PIN_PROPOSEDATAFORMAT  (SET): validate a proposed fmt  */
+/*   KSPROPERTY_PIN_PROPOSEDATAFORMAT2 (GET): list signal-processing  */
+/*                                            modes we support        */
+/* PortCls does NOT auto-handle these; if the filter's AutomationTable */
+/* is NULL, AEB sees STATUS_NOT_SUPPORTED and won't fully classify the */
+/* endpoint (one of the symptoms that leaves us at "Internal AUX Jack" */
+/* placeholder). simpleaudiosample's speakerwavtable.h pattern.        */
+/* ------------------------------------------------------------------ */
+NTSTATUS PropertyHandler_WaveFilter(_In_ PPCPROPERTY_REQUEST Request);
+
+static PCPROPERTY_ITEM PropertiesWaveFilter[] =
+{
+    {
+        &KSPROPSETID_Pin,
+        KSPROPERTY_PIN_PROPOSEDATAFORMAT,
+        KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
+        PropertyHandler_WaveFilter
+    },
+    {
+        &KSPROPSETID_Pin,
+        KSPROPERTY_PIN_PROPOSEDATAFORMAT2,
+        KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT,
+        PropertyHandler_WaveFilter
+    }
+};
+DEFINE_PCAUTOMATION_TABLE_PROP(AutomationWaveFilter, PropertiesWaveFilter);
+
+/* ------------------------------------------------------------------ */
 /* PCPIN_DESCRIPTOR table                                              */
 /* ------------------------------------------------------------------ */
 
 static PCPIN_DESCRIPTOR WaveMiniportPins[] =
 {
-    /* PIN 0: render sink (data IN from engine).
-     * Instance counts are pin INSTANCES, not channels — one
-     * instance is plenty for a render endpoint. */
+    /* PIN 0: render sink (data IN from the audio engine). This is a
+     * HOST pin (KSPIN_COMMUNICATION_SINK), instantiated by the engine
+     * when an app opens the device. Instance counts 1,1,0 are correct
+     * here — exactly one engine connection at a time. */
     {
         1, 1, 0,    /* MaxGlobal, MaxFilter, MinFilter instances */
         NULL,       /* AutomationTable                            */
@@ -105,13 +136,15 @@ static PCPIN_DESCRIPTOR WaveMiniportPins[] =
             0
         }
     },
-    /* PIN 1: bridge (logical out to topology).
-     * Bridge pins still need MaxFilter>=1, otherwise PortCls
-     * can't materialise a connection target.
-     * Category is KSCATEGORY_AUDIO (sysvad pattern) — Category
-     * expects a KSCATEGORY_* GUID, not a KSNODETYPE_*. */
+    /* PIN 1: bridge (logical out to topology, KSPIN_COMMUNICATION_NONE).
+     * Bridge pin: instance counts MUST be 0,0,0 — per Audio Filter
+     * Graphs docs, bridge pins exist implicitly and cannot be
+     * instantiated. PcRegisterPhysicalConnection still works with
+     * 0,0,0 (that's the sysvad / simpleaudiosample pattern); 1,1,0
+     * made AEB skip the bridge-pin scan and never properly classify
+     * the endpoint. */
     {
-        1, 1, 0,
+        0, 0, 0,
         NULL,
         {
             0, NULL, 0, NULL,
@@ -131,17 +164,18 @@ static PCCONNECTION_DESCRIPTOR WaveMiniportConnections[] =
     { PCFILTER_NODE, KSPIN_WAVE_RENDER_SINK,   PCFILTER_NODE, KSPIN_WAVE_RENDER_SOURCE }
 };
 
-static const GUID WaveMiniportCategories[] =
-{
-    STATICGUIDOF(KSCATEGORY_AUDIO),
-    STATICGUIDOF(KSCATEGORY_RENDER),
-    STATICGUIDOF(KSCATEGORY_REALTIME)
-};
-
+/* PCFILTER_DESCRIPTOR.Categories: NULL / 0. The INF's
+ * [StreamToSpeaker_Inst.NT.Interfaces] AddInterface lines already
+ * register KSCATEGORY_AUDIO / RENDER / REALTIME for the wave filter
+ * at PnP level. Double-registering here can confuse AEB's category-
+ * matching pass. Both reference samples leave this NULL. */
 static PCFILTER_DESCRIPTOR WaveMiniportFilterDescriptor =
 {
     0,                                              /* Version          */
-    NULL,                                           /* AutomationTable  */
+    &AutomationWaveFilter,                          /* AutomationTable
+                                                      — KSPROPSETID_Pin
+                                                      proposed-format
+                                                      lives here       */
     sizeof(PCPIN_DESCRIPTOR),                       /* PinSize          */
     SIZEOF_ARRAY(WaveMiniportPins),                 /* PinCount         */
     WaveMiniportPins,                               /* Pins             */
@@ -150,9 +184,115 @@ static PCFILTER_DESCRIPTOR WaveMiniportFilterDescriptor =
     NULL,                                           /* Nodes            */
     SIZEOF_ARRAY(WaveMiniportConnections),          /* ConnectionCount  */
     WaveMiniportConnections,                        /* Connections      */
-    SIZEOF_ARRAY(WaveMiniportCategories),           /* CategoryCount    */
-    WaveMiniportCategories                          /* Categories       */
+    0,                                              /* CategoryCount    */
+    NULL                                            /* Categories       */
 };
+
+/* ------------------------------------------------------------------ */
+/* PropertyHandler_WaveFilter implementation                           */
+/* ------------------------------------------------------------------ */
+
+static NTSTATUS PropertyHandlerProposedFormat(_In_ PPCPROPERTY_REQUEST Request)
+{
+    PAGED_CODE();
+    if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
+        if (Request->ValueSize < sizeof(KSPROPERTY_DESCRIPTION)) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        PKSPROPERTY_DESCRIPTION d =
+            static_cast<PKSPROPERTY_DESCRIPTION>(Request->Value);
+        d->AccessFlags     = KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT;
+        d->DescriptionSize = sizeof(KSPROPERTY_DESCRIPTION);
+        d->PropTypeSet.Set = KSPROPTYPESETID_General;
+        d->PropTypeSet.Id  = 0;
+        d->PropTypeSet.Flags = 0;
+        d->MembersListCount = 0;
+        d->Reserved        = 0;
+        Request->ValueSize = sizeof(KSPROPERTY_DESCRIPTION);
+        return STATUS_SUCCESS;
+    }
+    if (!(Request->Verb & KSPROPERTY_TYPE_SET)) {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    if (Request->ValueSize < sizeof(KSDATAFORMAT_WAVEFORMATEX)) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    PKSDATAFORMAT_WAVEFORMATEX pFmt =
+        static_cast<PKSDATAFORMAT_WAVEFORMATEX>(Request->Value);
+    if (!IsEqualGUIDAligned(pFmt->DataFormat.MajorFormat, KSDATAFORMAT_TYPE_AUDIO) ||
+        !IsEqualGUIDAligned(pFmt->DataFormat.SubFormat,   KSDATAFORMAT_SUBTYPE_PCM)) {
+        return STATUS_NO_MATCH;
+    }
+    if (pFmt->WaveFormatEx.nChannels      != STREAM_TO_SPEAKER_CHANNELS ||
+        pFmt->WaveFormatEx.nSamplesPerSec != STREAM_TO_SPEAKER_SAMPLE_RATE ||
+        pFmt->WaveFormatEx.wBitsPerSample != STREAM_TO_SPEAKER_BITS_PER_SAMPLE) {
+        return STATUS_NO_MATCH;
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS PropertyHandlerProposedFormat2(_In_ PPCPROPERTY_REQUEST Request)
+{
+    PAGED_CODE();
+    if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
+        if (Request->ValueSize < sizeof(KSPROPERTY_DESCRIPTION)) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        PKSPROPERTY_DESCRIPTION d =
+            static_cast<PKSPROPERTY_DESCRIPTION>(Request->Value);
+        d->AccessFlags     = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
+        d->DescriptionSize = sizeof(KSPROPERTY_DESCRIPTION);
+        d->PropTypeSet.Set = KSPROPTYPESETID_General;
+        d->PropTypeSet.Id  = 0;
+        d->PropTypeSet.Flags = 0;
+        d->MembersListCount = 0;
+        d->Reserved        = 0;
+        Request->ValueSize = sizeof(KSPROPERTY_DESCRIPTION);
+        return STATUS_SUCCESS;
+    }
+    if (!(Request->Verb & KSPROPERTY_TYPE_GET)) {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    /* Return a single signal-processing mode: DEFAULT. AEB needs at
+     * least one entry here to consider the pin offload-capable; for
+     * a passthrough virtual driver, DEFAULT is the right answer. */
+    ULONG cModes  = 1;
+    ULONG cbBody  = cModes * sizeof(GUID);
+    ULONG cbTotal = sizeof(KSMULTIPLE_ITEM) + cbBody;
+    if (Request->ValueSize == 0) {
+        Request->ValueSize = cbTotal;
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    if (Request->ValueSize < cbTotal) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    PKSMULTIPLE_ITEM mi = static_cast<PKSMULTIPLE_ITEM>(Request->Value);
+    mi->Size  = cbTotal;
+    mi->Count = cModes;
+    GUID* modes = reinterpret_cast<GUID*>(mi + 1);
+    modes[0] = AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
+    Request->ValueSize = cbTotal;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS PropertyHandler_WaveFilter(_In_ PPCPROPERTY_REQUEST Request)
+{
+    PAGED_CODE();
+    if (Request == nullptr || Request->PropertyItem == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (IsEqualGUIDAligned(*Request->PropertyItem->Set, KSPROPSETID_Pin)) {
+        switch (Request->PropertyItem->Id) {
+        case KSPROPERTY_PIN_PROPOSEDATAFORMAT:
+            return PropertyHandlerProposedFormat(Request);
+        case KSPROPERTY_PIN_PROPOSEDATAFORMAT2:
+            return PropertyHandlerProposedFormat2(Request);
+        default:
+            break;
+        }
+    }
+    return STATUS_NOT_FOUND;
+}
 
 const PCFILTER_DESCRIPTOR*
 StreamToSpeakerWaveFilterDescriptor()

@@ -239,22 +239,28 @@ impl TrayHandle {
         ctx.request_repaint();
     }
 
-    /// Bring the GUI window to the front. We use raw Win32 ShowWindow
-    /// directly because egui's ViewportCommand queue is processed only
-    /// inside update(), which only runs on WM_PAINT — and a hidden
-    /// window doesn't generate WM_PAINT. The queue freeze is a known
-    /// eframe regression (emilk/egui#5229, #3655). ShowWindow flips
-    /// visibility at the OS level, generating the paint events that
-    /// then bring update() back to life.
+    /// Bring the GUI window to the front. SetWindowPos with
+    /// SWP_SHOWWINDOW flips visibility AND lifts Z-order in one
+    /// synchronous call, sidestepping the eframe ViewportCommand
+    /// queue (which doesn't drain on hidden windows — emilk/egui#5229,
+    /// #3655). SW_RESTORE handles the minimised case. ShowWindowAsync
+    /// is used for SW_RESTORE so a tray-pump invocation from outside
+    /// the owning thread is still safe.
     fn show_main_window(&self, ctx: &egui::Context) {
         if let Some(hwnd) = self.hwnd {
             use windows_sys::Win32::UI::WindowsAndMessaging::{
-                ShowWindow, SetForegroundWindow, SW_SHOW, SW_RESTORE,
+                SetWindowPos, ShowWindowAsync, SetForegroundWindow, IsIconic,
+                HWND_TOP, SW_RESTORE,
+                SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
             };
             unsafe {
-                ShowWindow(hwnd as _, SW_RESTORE);
-                ShowWindow(hwnd as _, SW_SHOW);
-                SetForegroundWindow(hwnd as _);
+                let h = hwnd as _;
+                SetWindowPos(h, HWND_TOP, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                if IsIconic(h) != 0 {
+                    ShowWindowAsync(h, SW_RESTORE);
+                }
+                SetForegroundWindow(h);
             }
         }
         ctx.request_repaint();

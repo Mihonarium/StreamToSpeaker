@@ -51,32 +51,27 @@ DEFINE_PCAUTOMATION_TABLE_PROP(AutomationMute, PropertiesMute);
 /* Jack descriptions — handed to AudioEndpointBuilder via             */
 /* KSPROPSETID_Jack on the topology filter.                            */
 /*                                                                     */
-/* Even though we have no physical jack, the audio engine needs to    */
-/* see a description for the bridge pin to correctly classify the     */
-/* endpoint as "Speakers" rather than falling back to defaults that   */
-/* produce names like "Internal AUX Jack". sysvad and                  */
-/* simpleaudiosample both implement this; not implementing it leaves  */
-/* the JackSubType property unset and the engine guesses from the     */
-/* bridge pin's Category alone (insufficient on Win11 22H2+).         */
+/* The tuple (ConnectionType, GeoLocation, GenLocation, PortConnection)*/
+/* feeds AEB's name-composition path. Picking the "virtual / network" */
+/* combo (eConnTypeOtherDigital + eGeoLocNotApplicable + eGenLocOther) */
+/* lands AEB squarely on the "Internal AUX Jack" code path — that      */
+/* literal string is what Windows emits for "internal digital sink at  */
+/* unspecified location."                                              */
 /*                                                                     */
-/* For a virtual/network endpoint:                                     */
-/*   - ConnectionType  = eConnTypeOtherDigital — we're network audio,  */
-/*                       not an analog or HDMI sink                    */
-/*   - GeoLocation     = eGeoLocNotApplicable — there's no physical    */
-/*                       location of "this jack"                       */
-/*   - PortConnection  = ePortConnIntegratedDevice — we're integrated  */
-/*                       into the system, not a removable jack         */
-/*   - IsConnected     = TRUE — always; no jack-detect to honour       */
+/* Use simpleaudiosample's Speakers descriptor verbatim so the         */
+/* speaker code path resolves KSNODETYPE_SPEAKER → "Speakers"          */
+/* (and our PKEY_Device_FriendlyName then overrides to                 */
+/* "Stream To Speaker").                                               */
 /* ------------------------------------------------------------------ */
 static KSJACK_DESCRIPTION BridgeJackDesc =
 {
-    KSAUDIO_SPEAKER_STEREO,         /* ChannelMapping     */
-    0,                               /* Color (none)       */
-    eConnTypeOtherDigital,           /* ConnectionType    */
-    eGeoLocNotApplicable,            /* GeoLocation       */
-    eGenLocOther,                    /* GenLocation       */
-    ePortConnIntegratedDevice,       /* PortConnection    */
-    TRUE                              /* IsConnected       */
+    KSAUDIO_SPEAKER_STEREO,             /* ChannelMapping    */
+    JACKDESC_RGB(0xB3, 0xC9, 0x8C),     /* Color (green — matches sample) */
+    eConnTypeUnknown,                    /* ConnectionType — what speakers use */
+    eGeoLocFront,                        /* GeoLocation       */
+    eGenLocPrimaryBox,                   /* GenLocation       */
+    ePortConnIntegratedDevice,           /* PortConnection    */
+    TRUE                                  /* IsConnected       */
 };
 
 static PKSJACK_DESCRIPTION JackDescriptions[] =
@@ -140,10 +135,19 @@ static PKSDATARANGE TopoPinDataRangePointersBridge[] =
 
 static PCPIN_DESCRIPTOR TopologyMiniportPins[] =
 {
-    /* PIN 0 - input from wave miniport. Bridge pins still need
-     * MaxFilter>=1 so PortCls can materialise the connection. */
+    /* PIN 0 - input from wave miniport (the wave→topology bridge).
+     * Bridge pin instance counts MUST be 0,0,0 — per the Audio Filter
+     * Graphs docs, "a bridge pin or a pin with a physical connection
+     * is permanently connected, the pin exists implicitly and cannot
+     * be instantiated or deleted." AudioEndpointBuilder scans for
+     * bridge pins with count=0; with 1,1,0 our pin looks instantiable
+     * and AEB skips it during classification — which puts the endpoint
+     * on the "Internal AUX Jack" placeholder code path and never
+     * graduates it to a properly-named/enabled state.
+     * sysvad / simpleaudiosample both use 0,0,0; PcRegisterPhysical-
+     * Connection works fine with 0,0,0. */
     {
-        1, 1, 0,
+        0, 0, 0,
         NULL,
         {
             0, NULL, 0, NULL,
@@ -158,24 +162,15 @@ static PCPIN_DESCRIPTOR TopologyMiniportPins[] =
     },
     /* PIN 1 - output to the speakers (logically: the Sonos).
      *
+     * Bridge pin, same instance-count rule (0,0,0) as PIN 0.
+     *
      * Category on a bridge pin IS where you put the KSNODETYPE_*
      * GUID. The AudioEndpointBuilder reads this to derive the
      * endpoint's form-factor for its enabled/visible defaults:
-     *   - KSCATEGORY_AUDIO   → "UnknownFormFactor", which the
-     *     docs ("Audio Endpoint Builder Algorithm") list as
-     *     created-as-disabled-and-hidden by default. That's the
-     *     state that forces the user to flip the Sound Settings
-     *     "Allow apps and Windows to use this device" toggle.
-     *   - KSNODETYPE_SPEAKER → "Speakers", created enabled+visible.
-     *
-     * The INF's PKEY_AudioEndpoint_FormFactor=Speakers and
-     * PKEY_AudioDevice_EnableEndpointByDefault overrides only take
-     * effect after the endpoint builder has already classified the
-     * pin; they don't reach back through a cached
-     * DEVICE_STATE_DISABLED from a prior enrollment. Set the right
-     * Category here so we're on the happy path from first contact. */
+     *   - KSCATEGORY_AUDIO   → "UnknownFormFactor", disabled+hidden.
+     *   - KSNODETYPE_SPEAKER → "Speakers", enabled+visible. */
     {
-        1, 1, 0,
+        0, 0, 0,
         NULL,
         {
             0, NULL, 0, NULL,
@@ -227,12 +222,12 @@ static PCCONNECTION_DESCRIPTOR TopologyMiniportConnections[] =
       KSPIN_TOPOLOGY_LINEOUT_DEST }
 };
 
-static const GUID TopologyMiniportCategories[] =
-{
-    STATICGUIDOF(KSCATEGORY_AUDIO),
-    STATICGUIDOF(KSCATEGORY_RENDER)
-};
-
+/* PCFILTER_DESCRIPTOR.Categories: NULL / 0 here. The INF's
+ * [StreamToSpeaker_Inst.NT.Interfaces] AddInterface lines already
+ * register KSCATEGORY_AUDIO / RENDER for the topology — re-registering
+ * via the filter descriptor double-counts and can confuse AEB's
+ * category-matching pass. sysvad and simpleaudiosample both leave it
+ * NULL here. */
 static PCFILTER_DESCRIPTOR TopologyMiniportFilterDescriptor =
 {
     0,                                              /* Version          */
@@ -248,8 +243,8 @@ static PCFILTER_DESCRIPTOR TopologyMiniportFilterDescriptor =
     TopologyMiniportNodes,                          /* Nodes            */
     SIZEOF_ARRAY(TopologyMiniportConnections),      /* ConnectionCount  */
     TopologyMiniportConnections,                    /* Connections      */
-    SIZEOF_ARRAY(TopologyMiniportCategories),       /* CategoryCount    */
-    TopologyMiniportCategories                      /* Categories       */
+    0,                                              /* CategoryCount    */
+    NULL                                            /* Categories       */
 };
 
 const KSFILTER_DESCRIPTOR*
