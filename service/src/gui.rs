@@ -1017,34 +1017,68 @@ impl StreamToSpeakerApp {
 
     fn show_advanced(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
-            // Full-width clickable strip — clicking anywhere in the card
-            // header row toggles, not just the tiny label. Fitts's law.
+            // Disclosure header: keyboard-focusable strip with the
+            // chevron placed immediately after the label (proximity)
+            // rather than at the right edge of the card. The previous
+            // design had label at left edge / chevron at right edge,
+            // ~600 px apart, so they read as unrelated elements —
+            // exactly the issue the audit flagged. Wiring via
+            // `ui.interact` with a stable id gives Tab focus, and
+            // we accept Enter/Space when focused (ARIA disclosure
+            // pattern). Height bumped 22 → 28 to meet the WCAG 2.5.8
+            // minimum click-target size.
             let chevron = if self.advanced_open { "▾" } else { "▸" };
             let avail_w = ui.available_width();
-            let (rect, resp) =
-                ui.allocate_exact_size(egui::vec2(avail_w, 22.0), egui::Sense::click());
-            let resp = resp.on_hover_text("Tuning knobs for power users");
-            if resp.hovered() {
+            let id = ui.id().with("advanced_toggle");
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(avail_w, 28.0),
+                egui::Sense::hover(),
+            );
+            let resp = ui
+                .interact(rect, id, egui::Sense::click())
+                .on_hover_text("Tuning knobs for power users");
+            if resp.hovered() && resp.enabled() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            // Paint label + chevron into the allocated strip.
-            ui.painter().text(
-                rect.left_center(),
-                egui::Align2::LEFT_CENTER,
-                "ADVANCED",
-                egui::FontId::new(11.0, egui::FontFamily::Proportional),
-                p.text_tertiary,
-            );
-            ui.painter().text(
-                rect.right_center() - egui::vec2(2.0, 0.0),
-                egui::Align2::RIGHT_CENTER,
-                chevron,
-                egui::FontId::new(14.0, egui::FontFamily::Proportional),
-                p.text_tertiary,
-            );
-            if resp.clicked() {
+            let kbd_toggle = resp.has_focus()
+                && ui.input(|i| {
+                    i.key_pressed(egui::Key::Enter)
+                        || i.key_pressed(egui::Key::Space)
+                });
+            if resp.clicked() || kbd_toggle {
                 self.advanced_open = !self.advanced_open;
             }
+            // Explicit focus ring — egui doesn't paint one on a bare
+            // ui.interact rect, and the audit flagged this as a P0
+            // keyboard-accessibility failure.
+            if resp.has_focus() {
+                ui.painter().rect_stroke(
+                    rect.expand(2.0),
+                    RADIUS_CONTROL,
+                    egui::Stroke::new(2.0, p.accent),
+                );
+            }
+            // Paint label + chevron. Measure the label's rect so the
+            // chevron lands immediately to its right (Gestalt
+            // proximity), with a one-token gap between them.
+            let label_font =
+                egui::FontId::new(11.0, egui::FontFamily::Proportional);
+            let chevron_font =
+                egui::FontId::new(14.0, egui::FontFamily::Proportional);
+            let label_rect = ui.painter().text(
+                egui::pos2(rect.left() + sp::XS, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                "ADVANCED",
+                label_font,
+                p.text_tertiary,
+            );
+            ui.painter().text(
+                egui::pos2(label_rect.right() + sp::XS, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                chevron,
+                chevron_font,
+                p.text_tertiary,
+            );
 
             if !self.advanced_open {
                 return;
