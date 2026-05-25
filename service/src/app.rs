@@ -8,7 +8,7 @@
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -97,6 +97,18 @@ pub struct App {
     // ---- Lifecycle ----
     pub shutdown: Arc<AtomicBool>,
 
+    // ---- Rescan feedback ----
+    /// True while a manual SSDP rescan thread is in flight. Cleared
+    /// by the rescan thread on exit. Read by the GUI to show a
+    /// spinner / "Scanning…" caption.
+    pub rescan_in_flight: Arc<AtomicBool>,
+    /// Unix-seconds timestamp of the last completed rescan; 0 if
+    /// none has run yet. GUI uses this to flash a "Found N speakers"
+    /// caption for a few seconds after completion.
+    pub last_rescan_finished_unix: Arc<AtomicI64>,
+    /// Speaker count at the moment the last rescan completed.
+    pub last_rescan_count: Arc<AtomicUsize>,
+
     /// Persisted user preferences (last picked speaker, onboarding
     /// dismissal). Loaded from disk in `App::new` and saved back via
     /// `App::save_user_config` whenever it changes. Behind a Mutex
@@ -130,6 +142,9 @@ impl App {
             packets_published_total: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            rescan_in_flight: Arc::new(AtomicBool::new(false)),
+            last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
+            last_rescan_count: Arc::new(AtomicUsize::new(0)),
             user_config: Mutex::new(user_config),
         })
     }
@@ -269,17 +284,37 @@ impl App {
             warn!("trigger_rescan: discovery disabled");
             return;
         };
+        // Skip if a scan is already running — the user can hammer the
+        // button but we don't need two scans racing.
+        if self.rescan_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let iface = self.config.ssdp_iface;
+        let in_flight = self.rescan_in_flight.clone();
+        let last_finished = self.last_rescan_finished_unix.clone();
+        let last_count = self.last_rescan_count.clone();
         std::thread::Builder::new()
             .name("stream-to-speaker-rescan".to_string())
             .spawn(move || {
-                match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
+                let count = match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
                     Ok(found) => {
-                        info!("manual rescan: {} renderer(s) found", found.len());
+                        let n = found.len();
+                        info!("manual rescan: {} renderer(s) found", n);
                         discovery.replace(found);
+                        n
                     }
-                    Err(e) => warn!("manual rescan failed: {}", e),
-                }
+                    Err(e) => {
+                        warn!("manual rescan failed: {}", e);
+                        0
+                    }
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                last_count.store(count, Ordering::Release);
+                last_finished.store(now, Ordering::Release);
+                in_flight.store(false, Ordering::Release);
             })
             .ok();
     }

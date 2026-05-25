@@ -934,6 +934,41 @@ impl StreamToSpeakerApp {
                     }
                 });
             });
+
+            // Rescan feedback: spinner while a manual scan is in
+            // flight, then "Found N speaker(s) just now" for ~5 s
+            // after completion so the user knows the button did
+            // something (Heuristics F-04 — previously the rescan
+            // gave no feedback at all).
+            let scanning = self.app.rescan_in_flight.load(Ordering::Acquire);
+            let last_finished = self.app.last_rescan_finished_unix.load(Ordering::Acquire);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let recently_finished = last_finished > 0 && (now - last_finished) < 5;
+            if scanning {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.label(
+                        egui::RichText::new("Scanning…")
+                            .size(12.0)
+                            .color(p.text_secondary),
+                    );
+                });
+            } else if recently_finished {
+                let n = self.app.last_rescan_count.load(Ordering::Acquire);
+                let text = match n {
+                    0 => "Scan complete — no speakers found.".to_string(),
+                    1 => "Scan complete — 1 speaker found.".to_string(),
+                    n => format!("Scan complete — {} speakers found.", n),
+                };
+                ui.label(
+                    egui::RichText::new(text)
+                        .size(12.0)
+                        .color(p.text_secondary),
+                );
+            }
             ui.add_space(sp::XS);
 
             let view = self.app.speaker_view();
