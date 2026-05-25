@@ -260,12 +260,35 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     // Resolve initial speaker.
+    //
+    // Priority chain:
+    //   1. `--player <hint>`  — explicit override, fuzzy match
+    //   2. interactive headless TTY — prompt the user
+    //   3. saved speaker id from user_config — auto-reconnect to the
+    //      one the user last explicitly picked
+    //   4. otherwise — DON'T auto-select. The GUI's onboarding card
+    //      kicks in so the user picks manually one time; their
+    //      choice gets persisted and step 3 takes over from then on.
+    //
+    // The old fallback ("first discovered") was the reason GUI users
+    // never got to see the onboarding card and ended up with a random
+    // speaker bound at launch.
     if !cli.no_discovery {
-        let initial = picker::resolve(
-            app.discovery.as_ref().unwrap(),
-            cli.player.as_deref(),
-            !cli.no_interactive && cli.headless,
-        )?;
+        let discovery = app.discovery.as_ref().unwrap();
+        let initial = if cli.player.is_some() {
+            picker::resolve(discovery, cli.player.as_deref(), false)?
+        } else if !cli.no_interactive && cli.headless {
+            picker::resolve(discovery, None, true)?
+        } else if let Some(saved_id) = app.saved_speaker_id() {
+            info!("auto-reconnect: trying saved speaker {:?}", saved_id);
+            // Wait briefly for the first SSDP sweep to populate
+            // discovery before we look the saved id up.
+            picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
+            discovery.find_by_id(&saved_id)
+        } else {
+            info!("first launch (no saved speaker) — waiting for manual pick");
+            None
+        };
         if let Some(r) = initial {
             let id = r.stable_id();
             if let Err(e) = app.select_speaker(&id) {

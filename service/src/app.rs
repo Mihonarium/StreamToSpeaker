@@ -16,6 +16,7 @@ use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use crate::ssdp::{DiscoveryState, Renderer};
+use crate::user_config::UserConfig;
 use crate::volume_sync::VolumeSync;
 use crate::{upnp, PRODUCT_NAME, WIRE_SAMPLE_RATE};
 
@@ -95,16 +96,28 @@ pub struct App {
 
     // ---- Lifecycle ----
     pub shutdown: Arc<AtomicBool>,
+
+    /// Persisted user preferences (last picked speaker, onboarding
+    /// dismissal). Loaded from disk in `App::new` and saved back via
+    /// `App::save_user_config` whenever it changes. Behind a Mutex
+    /// because saves happen lazily from any thread (GUI click,
+    /// auto-reconnect bg thread, ...).
+    pub user_config: Mutex<UserConfig>,
 }
 
 impl App {
     pub fn new(config: AppConfig, discovery: Option<Arc<DiscoveryState>>) -> Arc<Self> {
         let web_initial = config.web_enabled;
+        let user_config = UserConfig::load();
+        // Seed last_speaker_id from disk so that, even before any user
+        // action, code that asks "what was the last speaker?" gets the
+        // persisted answer.
+        let last_speaker_id = Mutex::new(user_config.last_speaker_id.clone());
         Arc::new(Self {
             config,
             discovery,
             session: Arc::new(Mutex::new(None)),
-            last_speaker_id: Mutex::new(None),
+            last_speaker_id,
             hub: StreamHub::new(),
             vsync: Arc::new(VolumeSync::new()),
             stream_active: Arc::new(AtomicBool::new(true)),
@@ -117,7 +130,31 @@ impl App {
             packets_published_total: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            user_config: Mutex::new(user_config),
         })
+    }
+
+    /// Returns true if the user has dismissed the onboarding card.
+    /// Persisted across launches via `user_config`.
+    pub fn is_onboarding_dismissed(&self) -> bool {
+        self.user_config.lock().unwrap().onboarding_dismissed
+    }
+
+    /// Mark the onboarding card as dismissed and persist immediately.
+    pub fn dismiss_onboarding(&self) {
+        let mut uc = self.user_config.lock().unwrap();
+        if !uc.onboarding_dismissed {
+            uc.onboarding_dismissed = true;
+            uc.save();
+        }
+    }
+
+    /// The user's last explicitly-selected speaker, as persisted in
+    /// `user_config`. Returns `None` on a fresh install (which is what
+    /// makes `main.rs` skip auto-reconnect on the first launch — the
+    /// user picks manually that one time).
+    pub fn saved_speaker_id(&self) -> Option<String> {
+        self.user_config.lock().unwrap().last_speaker_id.clone()
     }
 
     // -------------------------------------------------------------------
@@ -180,6 +217,16 @@ impl App {
         *guard = Some(new_session);
         *self.last_speaker_id.lock().unwrap() = Some(id.to_string());
         self.streaming_enabled.store(true, Ordering::Release);
+        // Persist so the next launch can auto-reconnect to this speaker.
+        // Saved as a side-effect of an explicit pick — see
+        // user_config.rs for the file location.
+        {
+            let mut uc = self.user_config.lock().unwrap();
+            if uc.last_speaker_id.as_deref() != Some(id) {
+                uc.last_speaker_id = Some(id.to_string());
+                uc.save();
+            }
+        }
         Ok(())
     }
 
