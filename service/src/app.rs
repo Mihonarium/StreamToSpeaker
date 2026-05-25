@@ -115,6 +115,12 @@ pub struct App {
     /// because saves happen lazily from any thread (GUI click,
     /// auto-reconnect bg thread, ...).
     pub user_config: Mutex<UserConfig>,
+
+    /// Most recent user-facing error message and when it was recorded.
+    /// Surfaced by the GUI as a transient inline banner for ~8 s
+    /// (Heuristics F-03 — previously every action that could fail
+    /// just `warn!`'d to the log file and the user saw nothing).
+    pub last_error: Mutex<Option<(String, Instant)>>,
 }
 
 impl App {
@@ -146,7 +152,33 @@ impl App {
             last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
             last_rescan_count: Arc::new(AtomicUsize::new(0)),
             user_config: Mutex::new(user_config),
+            last_error: Mutex::new(None),
         })
+    }
+
+    /// Record a user-facing error. Logs it AND stashes it for the GUI
+    /// to surface as a transient inline banner. Callers should use
+    /// short, plain-language messages — the GUI shows them verbatim.
+    pub fn record_error(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        warn!("{}", msg);
+        *self.last_error.lock().unwrap() = Some((msg, Instant::now()));
+    }
+
+    /// Returns the current error message if one was recorded within
+    /// the last 8 s, else None. The 8-s window is the standard toast
+    /// duration; longer would feel sticky.
+    pub fn current_error(&self) -> Option<String> {
+        let le = self.last_error.lock().unwrap();
+        match le.as_ref() {
+            Some((msg, when)) if when.elapsed() < Duration::from_secs(8) => Some(msg.clone()),
+            _ => None,
+        }
+    }
+
+    /// Clear the current error (user dismissed the banner).
+    pub fn dismiss_error(&self) {
+        *self.last_error.lock().unwrap() = None;
     }
 
     /// Returns true if the user has dismissed the onboarding card.

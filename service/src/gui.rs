@@ -553,6 +553,7 @@ impl eframe::App for StreamToSpeakerApp {
                         .show(ui, |ui| {
                             ui.set_max_width(ui.available_width() - sp::M);
                             self.show_status_banner(ui, &p);
+                            self.show_error_banner(ui, &p);
                             ui.add_space(14.0);
                             // Show onboarding regardless of whether a
                             // speaker is currently bound, until the
@@ -893,12 +894,56 @@ impl StreamToSpeakerApp {
                                 .on_hover_text(tip);
                                 if r.clicked() {
                                     if let Err(e) = self.app.set_streaming_enabled(!enabled) {
-                                        warn!("toggle streaming failed: {}", e);
+                                        self.app.record_error(
+                                            format!("Couldn't change streaming state: {}", e),
+                                        );
                                     }
                                 }
                             },
                         );
                     }
+                });
+            });
+    }
+
+    /// InfoBar-style banner that surfaces the most recent
+    /// `App::record_error` for ~8 s. Previously every failure path
+    /// (select speaker, toggle streaming, resync) silently `warn!`'d
+    /// to the log file; the user clicked something, nothing
+    /// happened, and they assumed the app was broken (Heuristics
+    /// F-03). Auto-fades — no UI clutter when there's nothing wrong.
+    fn show_error_banner(&self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(msg) = self.app.current_error() else { return; };
+        ui.add_space(sp::XS);
+        egui::Frame::none()
+            .fill(p.card)
+            .stroke(egui::Stroke::new(1.0, p.danger.gamma_multiply(0.6)))
+            .rounding(RADIUS_SURFACE)
+            .inner_margin(egui::Margin::symmetric(sp::M, sp::S))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("⚠")
+                            .color(p.danger)
+                            .size(18.0)
+                            .strong(),
+                    );
+                    ui.add_space(sp::XS);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(&msg)
+                                .size(13.0)
+                                .color(p.text_primary),
+                        );
+                    });
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if link_button(ui, p, "Dismiss", 80.0).clicked() {
+                                self.app.dismiss_error();
+                            }
+                        },
+                    );
                 });
             });
     }
@@ -996,7 +1041,9 @@ impl StreamToSpeakerApp {
                     for sp in view.speakers {
                         speaker_row(ui, p, &sp, |id| {
                             if let Err(e) = self.app.select_speaker(id) {
-                                warn!("select speaker failed: {}", e);
+                                self.app.record_error(
+                                    format!("Couldn't connect to speaker: {}", e),
+                                );
                             }
                         });
                     }
@@ -1112,7 +1159,7 @@ impl StreamToSpeakerApp {
                 };
                 if resp.clicked() {
                     if let Err(e) = self.app.resync() {
-                        warn!("resync failed: {}", e);
+                        self.app.record_error(format!("Resync failed: {}", e));
                     }
                 }
             });
