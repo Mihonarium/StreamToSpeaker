@@ -144,6 +144,59 @@ impl Palette {
     }
 }
 
+/// Append Segoe UI Symbol as a fallback for the Proportional and
+/// Monospace font families. egui resolves glyphs by walking each
+/// family's font list in order; the default fonts (Ubuntu Light /
+/// Hack) cover ASCII + Latin but not the geometric-shape, arrow,
+/// chevron, and box-drawing characters used in the UI. Without
+/// this fallback those glyphs render as `□`.
+///
+/// Loads from `%WINDIR%\Fonts\seguisym.ttf` at runtime — present
+/// on every Win7+ install, so no binary-size hit. If the file is
+/// missing (Windows N edition with language packs stripped) we
+/// log and continue; the glyphs keep showing as squares, but
+/// nothing crashes.
+fn install_symbol_font(ctx: &egui::Context) {
+    let path = {
+        let mut p = std::path::PathBuf::from(
+            std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string()),
+        );
+        p.push("Fonts");
+        p.push("seguisym.ttf");
+        p
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                "symbol font {} not loaded ({}); some glyphs will render as squares",
+                path.display(),
+                e
+            );
+            return;
+        }
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "segoe_ui_symbol".to_owned(),
+        egui::FontData::from_owned(bytes),
+    );
+    // Append (don't prepend) — the default fonts handle Latin text
+    // better than Segoe UI Symbol does. We only want symbol glyphs
+    // falling through.
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .push("segoe_ui_symbol".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("segoe_ui_symbol".to_owned());
+    ctx.set_fonts(fonts);
+}
+
 fn apply_theme(ctx: &egui::Context, dark: bool) {
     let p = if dark { Palette::dark() } else { Palette::light() };
     let mut visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
@@ -251,6 +304,16 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
         "Stream To Speaker",
         options,
         Box::new(move |cc| {
+            // Register Segoe UI Symbol as a fallback font for both
+            // Proportional and Monospace families. egui's bundled
+            // Ubuntu Light / Hack don't have the geometric-shape,
+            // arrow and chevron glyphs we use (▶ ⊘ ‖ ↻ ▾ ▸ ⟳ →),
+            // so without this they render as `□`. Loading the
+            // system Segoe UI Symbol costs zero binary bytes
+            // (it's on every Win7+ install) and only kicks in for
+            // glyphs the default fonts can't draw.
+            install_symbol_font(&cc.egui_ctx);
+
             // Initial theme — System (which falls back to Light if the OS
             // doesn't expose a preference).
             apply_theme(&cc.egui_ctx, ThemeMode::System.resolve(&cc.egui_ctx));
