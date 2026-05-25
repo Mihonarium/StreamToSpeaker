@@ -32,7 +32,8 @@ use crate::app::App;
 /// Owns the tray icon and the menu items. Dropping it removes the
 /// icon; the menu items go with it.
 pub struct TrayHandle {
-    _icon: tray_icon::TrayIcon,
+    icon: tray_icon::TrayIcon,
+    last_icon_state: IconState,
 
     // Menu items are !Send, so they live on the GUI thread.
     status_item: MenuItem,
@@ -155,7 +156,8 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
         quit: quit_item.id().clone(),
     };
 
-    let icon = build_icon()?;
+    let initial_state = IconState::Inactive;
+    let icon = build_icon(initial_state)?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(crate::PRODUCT_NAME)
@@ -180,7 +182,8 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
     }
 
     Ok(TrayHandle {
-        _icon: tray,
+        icon: tray,
+        last_icon_state: initial_state,
         status_item,
         enable_toggle,
         open_web_item: open_web,
@@ -258,6 +261,22 @@ impl TrayHandle {
             });
             self.open_web_item.set_enabled(web_on);
             self.last_web_enabled = web_on;
+        }
+
+        // Sync the tray icon to reflect Active vs Inactive (M31).
+        // Active = a speaker is bound, streaming is enabled, and the
+        // driver is actually delivering audio (stream_active). Any
+        // other state — no speaker, disabled, paused — reads as
+        // Inactive (muted grey).
+        let active = speaker_bound
+            && enabled
+            && app.stream_active.load(std::sync::atomic::Ordering::Acquire);
+        let new_state = if active { IconState::Active } else { IconState::Inactive };
+        if new_state != self.last_icon_state {
+            if let Ok(new_icon) = build_icon(new_state) {
+                let _ = self.icon.set_icon(Some(new_icon));
+            }
+            self.last_icon_state = new_state;
         }
     }
 }
@@ -386,16 +405,30 @@ fn open_web_ui(advertise_ip: &str, port: u16) {
 // Icon (procedurally drawn — no PNG/ICO to ship)
 // -----------------------------------------------------------------------------
 
-fn build_icon() -> Result<Icon> {
+/// Two tray icon states (M31): Active (full green speaker — actually
+/// streaming audio) vs Inactive (grey speaker — idle / disabled / no
+/// speaker bound). Two-state is the minimum that lets a user glance
+/// at the system tray and answer "is my audio going somewhere?"
+/// without opening the window. CLAUDE.md documents that a future
+/// proper-artwork iteration should ship at LEAST these two states.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum IconState {
+    Active,
+    Inactive,
+}
+
+fn build_icon(state: IconState) -> Result<Icon> {
     // 32×32 — Windows downsamples to 16×16 / 24×24 / 20×20 depending
     // on DPI. Shapes need to be bold enough that downsampling doesn't
-    // collapse them into a featureless blob (which is what the
-    // previous design did, hence "it's a square").
+    // collapse them into a featureless blob.
     const W: u32 = 32;
     const H: u32 = 32;
     let mut pixels = vec![0u8; (W * H * 4) as usize];
     // Transparent background — all zeros (RGBA 0,0,0,0).
-    let fg = [60u8, 180, 100, 255]; // accent green, opaque
+    let fg: [u8; 4] = match state {
+        IconState::Active => [60, 180, 100, 255], // accent green, opaque
+        IconState::Inactive => [140, 145, 155, 255], // muted grey
+    };
 
     for y in 0..H {
         for x in 0..W {
@@ -404,14 +437,9 @@ fn build_icon() -> Result<Icon> {
             let yi = y as i32;
 
             // 1. Speaker body — solid vertical rectangle on the left.
-            //    Width 7, height 11, centered vertically at y=16.
             let body = xi >= 5 && xi <= 11 && yi >= 11 && yi <= 21;
 
-            // 2. Cone — trapezoid opening to the right, attaches to
-            //    the body's right edge. At x=11 the cone matches the
-            //    body's height; at x=22 it widens to fill 24 px
-            //    vertically.
-            //    half_height(dx) = 5 + dx * 7 / 11   (5 → 12, linear)
+            // 2. Cone — trapezoid opening to the right.
             let cone_dx = xi - 11;
             let half_h = 5 + (cone_dx * 7 + 5) / 11;
             let cone =
