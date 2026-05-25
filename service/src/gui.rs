@@ -242,9 +242,13 @@ fn try_enable_mica(_hwnd: isize) -> bool {
 /// monitor's bounds. The window still exists, the kernel still
 /// scheduled paints into it — but the user sees nothing.
 ///
-/// We use `MonitorFromRect(..., MONITOR_DEFAULTTONULL)`: if the
-/// returned monitor handle is null, no monitor intersects the
-/// window's rect, and we centre it on the primary monitor.
+/// Uses two checks: the rect-intersect check (catches "completely
+/// off all monitors"), AND a center-point check (catches "almost-
+/// entirely off; only one pixel intersects a monitor", which is
+/// equally invisible from the user's standpoint). If either fails,
+/// we re-centre on the primary monitor's work area AND force
+/// ShowWindow(SW_SHOWNORMAL) in case the persisted state included a
+/// minimised / hidden flag.
 #[cfg(windows)]
 fn rescue_offscreen_window(hwnd: isize) {
     use windows_sys::Win32::Foundation::{POINT, RECT};
@@ -253,21 +257,34 @@ fn rescue_offscreen_window(hwnd: isize) {
         MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, SetWindowPos, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER,
+        GetWindowRect, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOZORDER,
+        SW_SHOWNORMAL,
     };
     unsafe {
         let h = hwnd as _;
         let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         if GetWindowRect(h, &mut rect) == 0 {
+            log::warn!("rescue_offscreen_window: GetWindowRect failed");
             return;
         }
-        let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONULL);
-        if !monitor.is_null() {
-            return; // intersects a monitor, all good
+        log::info!(
+            "rescue: window rect l={} t={} r={} b={} ({}×{})",
+            rect.left, rect.top, rect.right, rect.bottom,
+            rect.right - rect.left, rect.bottom - rect.top
+        );
+        let intersect = MonitorFromRect(&rect, MONITOR_DEFAULTTONULL);
+        let center = POINT {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        };
+        let center_monitor = MonitorFromPoint(center, MONITOR_DEFAULTTONULL);
+        if !intersect.is_null() && !center_monitor.is_null() {
+            return; // window AND its centre are on a monitor — fine
         }
         log::warn!(
-            "window position l={} t={} r={} b={} is off every connected monitor — re-centring on primary",
-            rect.left, rect.top, rect.right, rect.bottom
+            "window appears off-screen (intersect={} center={}); re-centring on primary",
+            if intersect.is_null() { "miss" } else { "hit" },
+            if center_monitor.is_null() { "miss" } else { "hit" },
         );
         let primary = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
         if primary.is_null() {
@@ -278,13 +295,23 @@ fn rescue_offscreen_window(hwnd: isize) {
         if GetMonitorInfoW(primary, &mut mi) == 0 {
             return;
         }
-        let w = rect.right - rect.left;
-        let h_dim = rect.bottom - rect.top;
+        // Use a sensible size if the restored rect is degenerate
+        // (< 100 px in either dim). Otherwise keep the user's size.
+        let mut w = rect.right - rect.left;
+        let mut h_dim = rect.bottom - rect.top;
+        if w < 100 {
+            w = 720;
+        }
+        if h_dim < 100 {
+            h_dim = 800;
+        }
         let mon_w = mi.rcWork.right - mi.rcWork.left;
         let mon_h = mi.rcWork.bottom - mi.rcWork.top;
         let new_x = mi.rcWork.left + (mon_w - w) / 2;
         let new_y = mi.rcWork.top + (mon_h - h_dim) / 2;
-        SetWindowPos(h, HWND_TOP, new_x, new_y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        SetWindowPos(h, HWND_TOP, new_x, new_y, w, h_dim, SWP_NOZORDER);
+        ShowWindow(h, SW_SHOWNORMAL);
+        log::info!("window re-centred to ({}, {}) size {}×{}", new_x, new_y, w, h_dim);
     }
 }
 
@@ -654,6 +681,7 @@ fn palette_for(dark: bool, system_accent: Option<(u8, u8, u8)>) -> Palette {
 // -----------------------------------------------------------------------------
 
 pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
+    log::info!("gui::run starting (tray={})", show_tray);
     // Note: we DON'T use ViewportBuilder::with_taskbar(false). winit
     // implements that by calling ITaskbarList::DeleteTab on the HWND,
     // which puts the window in a half-managed taskbar state where
@@ -683,6 +711,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
         "Stream To Speaker",
         options,
         Box::new(move |cc| {
+            log::info!("eframe CreationContext callback firing");
             // Register Segoe UI Symbol as a fallback font for both
             // Proportional and Monospace families. egui's bundled
             // Ubuntu Light / Hack don't have the media-control,
@@ -767,6 +796,10 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
         }),
     );
 
+    match &res {
+        Ok(()) => log::info!("eframe::run_native returned cleanly"),
+        Err(e) => log::error!("eframe::run_native returned error: {}", e),
+    }
     res.map_err(|e| anyhow::anyhow!("eframe: {}", e))
 }
 
@@ -846,6 +879,9 @@ fn win_show_and_focus(hwnd: isize) {
 impl eframe::App for StreamToSpeakerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count = self.frame_count.saturating_add(1);
+        if self.frame_count == 1 {
+            log::info!("first GUI frame painting");
+        }
 
         if self.last_repaint_request.elapsed() >= Duration::from_millis(100) {
             ctx.request_repaint_after(Duration::from_millis(100));

@@ -218,6 +218,21 @@ fn main() {
     #[cfg(windows)]
     let _mutex_handle = create_singleton_mutex();
 
+    // Single-instance gate. If another instance is already running,
+    // raise its window and exit — same pattern as Slack / Discord /
+    // OBS. Without this, the duplicate launch races to bind port 5901,
+    // tiny_http fails with WSAEADDRINUSE, run() returns Err, the
+    // process exits silently — and the user sees the FIRST instance
+    // in task manager and assumes the new install "doesn't open".
+    // (Skipped in --headless: headless is for service / CLI runs
+    // where multiple invocations against the same port are the
+    // caller's problem.)
+    #[cfg(windows)]
+    if !cli.headless && another_instance_already_running() {
+        raise_existing_window();
+        return;
+    }
+
     let mut builder = env_logger::Builder::from_default_env();
     builder
         .filter_level(cli.log_level.parse().unwrap_or(log::LevelFilter::Info))
@@ -310,6 +325,72 @@ fn create_singleton_mutex() -> Option<isize> {
         } else {
             Some(h as isize)
         }
+    }
+}
+
+/// True if another instance of the app already holds our singleton
+/// mutex. `CreateMutexA` returns the existing handle in that case AND
+/// sets `GetLastError() == ERROR_ALREADY_EXISTS`. Used to short-circuit
+/// the duplicate-launch path: instead of failing later on the port
+/// bind (which silently kills the process and leaves the user staring
+/// at task manager wondering why "the app didn't open"), we look up
+/// the existing window and bring it to the foreground, exiting
+/// silently like every other Windows tray app.
+#[cfg(windows)]
+fn another_instance_already_running() -> bool {
+    use std::ffi::CString;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexA;
+    let Some(name) = CString::new("Global\\StreamToSpeaker.Singleton").ok() else {
+        return false;
+    };
+    unsafe {
+        let h = CreateMutexA(std::ptr::null(), 0, name.as_ptr() as *const u8);
+        if h.is_null() {
+            return false;
+        }
+        let err = GetLastError();
+        // The handle we got either way; we don't close it because the
+        // mutex is keyed by name and we want to keep observing it.
+        err == ERROR_ALREADY_EXISTS
+    }
+}
+
+/// Find the existing instance's main window by title and bring it to
+/// the foreground (un-minimize + raise Z order). Used by the
+/// single-instance path. Best-effort; if FindWindowW returns null
+/// (e.g. the other instance is mid-startup and hasn't created its
+/// window yet) we just return — the user will see nothing happen but
+/// the other instance is still running.
+#[cfg(windows)]
+fn raise_existing_window() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindowAsync,
+        HWND_TOP, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    };
+    let title: Vec<u16> = "Stream To Speaker"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            log::info!("another instance is running but its window isn't findable yet");
+            return;
+        }
+        SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        if IsIconic(hwnd) != 0 {
+            ShowWindowAsync(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd);
     }
 }
 
