@@ -149,6 +149,13 @@ namespace StreamToSpeaker {
     # Without this loop the script would silently exit-2 and the user
     # would still see the "Allow" toggle off the next time they opened
     # Sound Settings.
+    #
+    # Match anywhere in DeviceDesc (not just prefix). On some Windows
+    # versions the cached DeviceDesc starts with a placeholder prefix
+    # ("Internal AUX Jack — Stream To Speaker") rather than our INF
+    # value — using "$Match*" would miss those entries and leave the
+    # endpoint disabled forever. "*$Match*" catches both clean and
+    # prefixed names.
     function Find-OurEndpoints {
         $matches = @()
         Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
@@ -156,7 +163,7 @@ namespace StreamToSpeaker {
             $propsPath = Join-Path $_.PSPath "Properties"
             if (-not (Test-Path $propsPath)) { return }
             $desc = (Get-ItemProperty -Path $propsPath -Name $pkeyDeviceDescStr -ErrorAction SilentlyContinue).$pkeyDeviceDescStr
-            if ($desc -and $desc -like "$Match*") {
+            if ($desc -and $desc -like "*$Match*") {
                 $matches += [pscustomobject]@{ Guid = $endpointGuid; Desc = $desc }
             }
         }
