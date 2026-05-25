@@ -887,7 +887,7 @@ impl eframe::App for StreamToSpeakerApp {
                             ui.set_max_width(ui.available_width() - sp::M);
                             self.show_status_banner(ui, &p);
                             self.show_error_banner(ui, &p);
-                            ui.add_space(14.0);
+                            ui.add_space(sp::M);
                             // Show onboarding regardless of whether a
                             // speaker is currently bound, until the
                             // user explicitly dismisses with "Got it".
@@ -899,16 +899,16 @@ impl eframe::App for StreamToSpeakerApp {
                                 && !self.app.is_onboarding_dismissed()
                             {
                                 self.show_onboarding(ui, &p);
-                                ui.add_space(14.0);
+                                ui.add_space(sp::M);
                             }
                             self.show_speakers(ui, &p);
-                            ui.add_space(14.0);
+                            ui.add_space(sp::M);
                             self.show_latency(ui, &p);
-                            ui.add_space(14.0);
+                            ui.add_space(sp::M);
                             self.show_advanced(ui, &p);
-                            ui.add_space(14.0);
+                            ui.add_space(sp::M);
                             self.show_web_ui(ui, &p);
-                            ui.add_space(14.0);
+                            ui.add_space(sp::M);
                             self.show_stats(ui, &p);
                         });
                     self.last_scroll_y = out.state.offset.y;
@@ -1180,7 +1180,7 @@ impl StreamToSpeakerApp {
                     }
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(sp::XS);
 
             let steps: &[(&str, &str, &str)] = &[
                 (
@@ -1208,18 +1208,22 @@ impl StreamToSpeakerApp {
 
             for (n, title, body) in steps {
                 ui.horizontal(|ui| {
-                    // Numbered indicator
+                    // m2: numbered indicator. Was 28×28 — too big for
+                    // a 14 px title, made the circle's vertical
+                    // centre sit BELOW the title baseline. Shrunk to
+                    // 22 px so the painted circle naturally aligns
+                    // with the title's vertical centre.
                     let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 14.0, p.accent_subtle);
+                        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 11.0, p.accent_subtle);
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         n,
-                        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                        egui::FontId::new(12.0, egui::FontFamily::Proportional),
                         p.accent,
                     );
-                    ui.add_space(6.0);
+                    ui.add_space(sp::S);
                     ui.vertical(|ui| {
                         ui.label(
                             egui::RichText::new(*title)
@@ -1233,7 +1237,7 @@ impl StreamToSpeakerApp {
                         );
                     });
                 });
-                ui.add_space(10.0);
+                ui.add_space(sp::S);
             }
         });
     }
@@ -1300,7 +1304,7 @@ impl StreamToSpeakerApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(icon).color(accent).size(34.0).strong());
-                    ui.add_space(12.0);
+                    ui.add_space(sp::S);
 
                     ui.vertical(|ui| {
                         ui.add_space(2.0);
@@ -1833,7 +1837,7 @@ impl StreamToSpeakerApp {
                 return;
             }
 
-            ui.add_space(8.0);
+            ui.add_space(sp::XS);
 
             let mut ppm = self.app.rate_fudge_ppm.load(Ordering::Relaxed) as i64;
             advanced_row(
@@ -1846,7 +1850,7 @@ impl StreamToSpeakerApp {
             );
             self.app.set_rate_fudge_ppm(ppm.clamp(-1000, 1000) as i32);
 
-            ui.add_space(12.0);
+            ui.add_space(sp::S);
 
             let mut pace = self.app.silence_pace_ms.load(Ordering::Relaxed) as i64;
             advanced_row(
@@ -1859,7 +1863,7 @@ impl StreamToSpeakerApp {
             );
             self.app.set_silence_pace_ms(pace.max(1) as u64);
 
-            ui.add_space(12.0);
+            ui.add_space(sp::S);
 
             let mut step = self.app.latency_adjust_step_frames.load(Ordering::Relaxed) as i64;
             advanced_row(
@@ -1877,7 +1881,6 @@ impl StreamToSpeakerApp {
     fn show_web_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
             section_label(ui, p, "Web UI");
-            ui.add_space(4.0);
 
             let on = self.app.is_web_ui_enabled();
             let url = format!(
@@ -1895,7 +1898,7 @@ impl StreamToSpeakerApp {
                 .size(12.0)
                 .color(p.text_secondary),
             );
-            ui.add_space(10.0);
+            ui.add_space(sp::S);
 
             ui.horizontal(|ui| {
                 if on {
@@ -1932,7 +1935,7 @@ impl StreamToSpeakerApp {
             });
 
             if on {
-                ui.add_space(8.0);
+                ui.add_space(sp::XS);
                 ui.label(
                     egui::RichText::new(&url)
                         .size(12.0)
@@ -1951,7 +1954,6 @@ impl StreamToSpeakerApp {
 
         card(ui, p, |ui| {
             section_label(ui, p, "Stats");
-            ui.add_space(6.0);
             // horizontal_wrapped (not horizontal) so the pills reflow
             // onto a second row at narrow widths instead of clipping
             // off the right edge.
