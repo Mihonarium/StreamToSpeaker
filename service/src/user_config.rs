@@ -26,6 +26,17 @@ pub struct UserConfig {
     /// preference into the same store.
     #[serde(default)]
     pub always_minimise_to_tray: bool,
+    /// Whether to auto-reconnect to `last_speaker_id` on launch.
+    /// `true` (default) preserves the prior behaviour. `false` lets
+    /// a user keep their saved speaker remembered (so the GUI knows
+    /// what to highlight, the Forget button has something to clear)
+    /// without auto-binding at startup.
+    #[serde(default = "default_auto_reconnect")]
+    pub auto_reconnect_on_launch: bool,
+}
+
+fn default_auto_reconnect() -> bool {
+    true
 }
 
 fn config_dir() -> Option<PathBuf> {

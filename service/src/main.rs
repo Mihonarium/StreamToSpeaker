@@ -330,11 +330,16 @@ fn run(cli: Cli) -> Result<()> {
         } else if !cli.no_interactive && cli.headless {
             picker::resolve(discovery, None, true)?
         } else if let Some(saved_id) = app.saved_speaker_id() {
-            info!("auto-reconnect: trying saved speaker {:?}", saved_id);
-            // Wait briefly for the first SSDP sweep to populate
-            // discovery before we look the saved id up.
-            picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
-            discovery.find_by_id(&saved_id)
+            if !app.is_auto_reconnect_on_launch() {
+                info!("auto-reconnect disabled by user preference; saved={:?}", saved_id);
+                None
+            } else {
+                info!("auto-reconnect: trying saved speaker {:?}", saved_id);
+                // Wait briefly for the first SSDP sweep to populate
+                // discovery before we look the saved id up.
+                picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
+                discovery.find_by_id(&saved_id)
+            }
         } else {
             info!("first launch (no saved speaker) — waiting for manual pick");
             None

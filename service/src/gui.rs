@@ -1339,6 +1339,19 @@ impl StreamToSpeakerApp {
                 });
             });
 
+            // Auto-reconnect preference (next to the saved-speaker
+            // controls so it's discoverable when a speaker is saved).
+            if self.app.saved_speaker_id().is_some() {
+                let mut auto = self.app.is_auto_reconnect_on_launch();
+                let resp = ui.checkbox(
+                    &mut auto,
+                    "Auto-connect to this speaker when the app launches",
+                );
+                if resp.changed() {
+                    self.app.set_auto_reconnect_on_launch(auto);
+                }
+            }
+
             // Rescan feedback: spinner while a manual scan is in
             // flight, then "Found N speaker(s) just now" for ~5 s
             // after completion so the user knows the button did

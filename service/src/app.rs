@@ -221,6 +221,20 @@ impl App {
         }
     }
 
+    /// Whether to auto-reconnect to the saved speaker on launch.
+    pub fn is_auto_reconnect_on_launch(&self) -> bool {
+        self.user_config.lock().unwrap().auto_reconnect_on_launch
+    }
+
+    /// Persist the auto-reconnect preference.
+    pub fn set_auto_reconnect_on_launch(&self, on: bool) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.auto_reconnect_on_launch != on {
+            uc.auto_reconnect_on_launch = on;
+            uc.save();
+        }
+    }
+
     /// The user's last explicitly-selected speaker, as persisted in
     /// `user_config`. Returns `None` on a fresh install (which is what
     /// makes `main.rs` skip auto-reconnect on the first launch — the
