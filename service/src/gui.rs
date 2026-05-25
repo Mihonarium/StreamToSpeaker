@@ -318,6 +318,29 @@ fn rescue_offscreen_window(hwnd: isize) {
 #[cfg(not(windows))]
 fn rescue_offscreen_window(_hwnd: isize) {}
 
+/// Always-fire belt-and-braces: ensure the window is in the
+/// normal-visible show state after eframe creates it. Covers the
+/// rare-but-real case where the persisted state, a stale SW_HIDE,
+/// or DWM hand-off leaves the HWND created but never SW_SHOWN.
+#[cfg(windows)]
+fn force_show_normal(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsWindowVisible, ShowWindow, SW_SHOWNORMAL,
+    };
+    unsafe {
+        let h = hwnd as _;
+        let visible_before = IsWindowVisible(h) != 0;
+        ShowWindow(h, SW_SHOWNORMAL);
+        log::info!(
+            "force_show_normal: was_visible={} → SW_SHOWNORMAL issued",
+            visible_before
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn force_show_normal(_hwnd: isize) {}
+
 #[derive(Copy, Clone)]
 struct Palette {
     // Surfaces
@@ -774,6 +797,14 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 // manager shows the process and the user sees
                 // nothing on screen.
                 rescue_offscreen_window(h);
+                // Belt-and-braces: also force the window into the
+                // normal-visible state. eframe / winit set
+                // with_visible(true), but a persisted minimised
+                // state, a stuck SW_HIDE from a previous run, or a
+                // DWM weirdness can leave the window in the
+                // wrong show-state regardless. Cheap to call and
+                // idempotent if the window is already visible.
+                force_show_normal(h);
             }
 
             let skip_close_confirmation = app_for_eframe.is_always_minimise_to_tray();
