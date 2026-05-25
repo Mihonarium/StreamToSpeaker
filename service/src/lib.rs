@@ -27,6 +27,8 @@ pub mod ioctl_source;
 pub mod gui;
 #[cfg(windows)]
 pub mod tray;
+#[cfg(windows)]
+pub mod endpoint_name;
 
 /// User-facing product name (shown in CLI help, web status page, etc).
 /// Internal Rust crate name stays `stream_to_speaker` for code stability.

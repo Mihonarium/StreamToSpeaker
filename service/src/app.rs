@@ -317,6 +317,17 @@ impl App {
                 uc.save();
             }
         }
+        // Update the Windows endpoint name to "Stream To Speaker → {name}"
+        // so the user can see in Sound Settings / volume mixer which
+        // speaker is the current destination. Best-effort; the call
+        // is detached on a thread and failures are debug-logged.
+        #[cfg(windows)]
+        {
+            let speaker_name = self
+                .current_renderer()
+                .map(|r| r.friendly_name.clone());
+            crate::endpoint_name::update_endpoint_name(speaker_name.as_deref());
+        }
         Ok(())
     }
 
@@ -337,6 +348,10 @@ impl App {
         uc.last_speaker_id = None;
         uc.onboarding_dismissed = false;
         uc.save();
+        // Revert the Windows endpoint name back to "Stream To Speaker"
+        // since we're no longer streaming to anything specific.
+        #[cfg(windows)]
+        crate::endpoint_name::update_endpoint_name(None);
     }
 
     /// Fire a one-shot SSDP M-SEARCH on the same interface the periodic
