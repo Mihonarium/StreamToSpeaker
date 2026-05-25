@@ -894,8 +894,14 @@ fn section_label(ui: &mut egui::Ui, p: &Palette, text: &str) {
 /// expectation makes the desktop app feel native instead of toy-like.
 /// Cite: egui Discussion #1430 and the egui::Response docs.
 fn clickable(r: egui::Response) -> egui::Response {
-    if r.hovered() && r.enabled() {
-        r.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    if r.hovered() {
+        if r.enabled() {
+            r.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        } else {
+            // m17: signal "this is disabled, don't bother clicking"
+            // rather than the default arrow which gives no hint.
+            r.ctx.set_cursor_icon(egui::CursorIcon::NotAllowed);
+        }
     }
     r
 }
@@ -1650,7 +1656,11 @@ impl StreamToSpeakerApp {
                     ui.add(
                         egui::DragValue::new(&mut ppm)
                             .range(-1000..=1000)
-                            .suffix(" ppm"),
+                            .suffix(" ppm")
+                            // m21: don't apply on every keystroke —
+                            // typing "100" was briefly applying 1
+                            // then 10 then 100 each frame.
+                            .update_while_editing(false),
                     );
                     if secondary_button(ui, p, "Reset to 0 ppm", 130.0).clicked() {
                         ppm = 0;
@@ -1669,7 +1679,12 @@ impl StreamToSpeakerApp {
                 "Higher than 10 ms shrinks latency after a pause. Stay below ~30 to avoid dropouts.",
                 "When nothing is playing on Windows, the service still sends frames of silence to the speaker (otherwise the speaker drops the connection). The speaker buffers a bit ahead — when real audio comes back, that buffer adds latency before you hear it. Setting this higher than 10 ms makes the silence frames go slower than real-time, draining the buffer during the quiet passages, so post-pause latency is smaller. Too high (>30) and the buffer runs dry and you hear dropouts.",
                 |ui| {
-                    ui.add(egui::DragValue::new(&mut pace).range(1..=100).suffix(" ms"));
+                    ui.add(
+                        egui::DragValue::new(&mut pace)
+                            .range(1..=100)
+                            .suffix(" ms")
+                            .update_while_editing(false),
+                    );
                     if secondary_button(ui, p, "Reset to 10 ms", 130.0).clicked() {
                         pace = 10;
                     }
@@ -1690,7 +1705,8 @@ impl StreamToSpeakerApp {
                     ui.add(
                         egui::DragValue::new(&mut step)
                             .range(1..=256)
-                            .suffix(" frames"),
+                            .suffix(" frames")
+                            .update_while_editing(false),
                     );
                     if secondary_button(ui, p, "Reset to 4 frames", 150.0).clicked() {
                         step = 4;
@@ -1734,7 +1750,12 @@ impl StreamToSpeakerApp {
                         .on_hover_text(format!("Open {} in your default browser", url))
                         .clicked()
                     {
-                        let _ = open_url(&url);
+                        if let Err(e) = open_url(&url) {
+                            // m25: previously the failure was silent.
+                            self.app.record_error(
+                                format!("Couldn't open the browser: {}. URL: {}", e, url),
+                            );
+                        }
                     }
                     if secondary_button(ui, p, "Disable web UI", 140.0)
                         .on_hover_text("Stop serving the web UI")
@@ -1799,11 +1820,12 @@ impl StreamToSpeakerApp {
                     "uptime",
                     "How long the Stream To Speaker service has been running since launch.",
                 );
+                let packets_label = if pkts_total == 1 { "packet" } else { "packets" };
                 stat_pill(
                     ui,
                     p,
                     &humanize_count(pkts_total),
-                    "packets",
+                    packets_label,
                     "Total audio packets sent since launch.",
                 );
             });
