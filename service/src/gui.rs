@@ -507,8 +507,17 @@ fn apply_theme(ctx: &egui::Context, dark: bool, system_accent: Option<(u8, u8, u
 
     let mut style = (*ctx.style()).clone();
     use egui::{FontFamily, FontId, TextStyle};
+    // M6 + M7: Fluent-aligned type ramp. The codebase used to scatter
+    // 9 distinct .size() values (11/12/13/14/15/16/18/20/34) across
+    // widgets — Refactoring UI ch.7 says any text size off the ramp
+    // either reads as a typo or splinters the visual hierarchy. This
+    // collapses to four ramp slots (12 Caption / 14 Body / 16 Body2 /
+    // 20 Heading) plus the deliberate 34 status-icon hero. M7: Heading
+    // was 18 (off-ramp) and unused; now 20 (Subtitle1) and the page
+    // title calls into it via RichText::heading() instead of hard-
+    // coding a size.
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(18.0, FontFamily::Proportional)),
+        (TextStyle::Heading, FontId::new(20.0, FontFamily::Proportional)),
         (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
         (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
         (TextStyle::Button, FontId::new(14.0, FontFamily::Proportional)),
@@ -1021,13 +1030,13 @@ impl StreamToSpeakerApp {
                     ui.vertical(|ui| {
                         ui.label(
                             egui::RichText::new("Stream To Speaker")
-                                .size(20.0)
+                                .heading()
                                 .strong()
                                 .color(p.text_primary),
                         );
                         ui.label(
                             egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .size(11.0)
+                                .size(12.0)
                                 .color(p.text_tertiary),
                         );
                     });
@@ -1378,18 +1387,18 @@ impl StreamToSpeakerApp {
 
                     ui.label(
                         egui::RichText::new(&current.friendly_name)
-                            .size(13.0)
+                            .size(12.0)
                             .strong()
                             .color(p.text_primary),
                     );
                     ui.label(
                         egui::RichText::new("·")
-                            .size(13.0)
+                            .size(12.0)
                             .color(p.text_tertiary),
                     );
                     ui.label(
                         egui::RichText::new(status_text)
-                            .size(13.0)
+                            .size(12.0)
                             .color(p.text_secondary),
                     );
 
@@ -1444,14 +1453,13 @@ impl StreamToSpeakerApp {
                     ui.label(
                         egui::RichText::new("⚠")
                             .color(p.danger)
-                            .size(18.0)
+                            .size(16.0)
                             .strong(),
                     );
                     ui.add_space(sp::XS);
                     ui.vertical(|ui| {
                         ui.label(
                             egui::RichText::new(&msg)
-                                .size(13.0)
                                 .color(p.text_primary),
                         );
                     });
@@ -1951,7 +1959,7 @@ impl StreamToSpeakerApp {
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(&url)
-                        .size(11.0)
+                        .size(12.0)
                         .color(p.text_tertiary)
                         .monospace(),
                 );
@@ -2023,7 +2031,6 @@ impl StreamToSpeakerApp {
 
         egui::Window::new(
             egui::RichText::new("Close Stream To Speaker?")
-                .size(15.0)
                 .strong()
                 .color(p.text_primary),
         )
@@ -2271,7 +2278,6 @@ fn advanced_row(
             );
             let help = ui.label(
                 egui::RichText::new("ⓘ")
-                    .size(13.0)
                     .color(p.accent),
             )
             .on_hover_text(plain_explain);
@@ -2312,7 +2318,6 @@ fn stat_pill(
                 ui.label(
                     egui::RichText::new(value)
                         .strong()
-                        .size(15.0)
                         .color(p.text_primary),
                 );
                 ui.label(
