@@ -637,6 +637,8 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 last_applied_dark: None,
                 last_applied_accent: None,
                 hwnd,
+                last_scroll_y: 0.0,
+                pinned_status_visible: false,
             }))
         }),
     );
@@ -671,6 +673,15 @@ struct StreamToSpeakerApp {
     /// tray-menu round-trip (emilk/egui#5229, #3655). Bypassing the
     /// queue with raw Win32 sidesteps the bug entirely.
     hwnd: Option<isize>,
+    /// Last-observed scroll offset of the main content area. Drives the
+    /// pinned compact status bar (m44): when the user has scrolled past
+    /// the full status banner, a thin pinned bar appears above the
+    /// scroll area so speaker + state stay visible.
+    last_scroll_y: f32,
+    /// Hysteresis flag for the pinned bar. Shows at scroll > 100,
+    /// hides at scroll < 60 — single threshold would flicker on every
+    /// frame the user parked their scroll exactly on the boundary.
+    pinned_status_visible: bool,
 }
 
 /// Win32 helpers for hide/show. eframe's `ViewportCommand::Visible` /
@@ -814,6 +825,27 @@ impl eframe::App for StreamToSpeakerApp {
                     // when the window is shorter than the content.
                     self.show_header(ui, &p);
                     ui.add_space(sp::S);
+
+                    // m44: pinned compact status bar — appears above
+                    // the scroll area once the full status banner has
+                    // scrolled out of view, so the user can still see
+                    // the speaker + state (and hit Enable/Disable)
+                    // without scrolling back to the top. Hysteresis
+                    // (show > 100, hide < 60) prevents flicker on
+                    // the boundary.
+                    let want_pinned = if self.last_scroll_y > 100.0 {
+                        true
+                    } else if self.last_scroll_y < 60.0 {
+                        false
+                    } else {
+                        self.pinned_status_visible
+                    };
+                    self.pinned_status_visible = want_pinned;
+                    if want_pinned && self.app.current_renderer().is_some() {
+                        self.show_pinned_status(ui, &p);
+                        ui.add_space(sp::S);
+                    }
+
                     // Reserve a right-edge inset for the auto-expanding
                     // scrollbar. egui's modern scrollbar starts as a
                     // 2 px panning indicator and morphs to 6 px on
@@ -822,7 +854,7 @@ impl eframe::App for StreamToSpeakerApp {
                     // border of every card — exactly the "scrollbar
                     // touching the card borders" the audit / user
                     // reported.
-                    egui::ScrollArea::vertical()
+                    let out = egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_max_width(ui.available_width() - sp::M);
@@ -852,6 +884,7 @@ impl eframe::App for StreamToSpeakerApp {
                             ui.add_space(14.0);
                             self.show_stats(ui, &p);
                         });
+                    self.last_scroll_y = out.state.offset.y;
                 });
             });
     }
@@ -1261,6 +1294,88 @@ impl StreamToSpeakerApp {
                             },
                         );
                     }
+                });
+            });
+    }
+
+    /// Compact pinned status row (m44). Sits above the scroll area
+    /// once the full status banner scrolls out of view, so the user
+    /// keeps a live read-out of "what's streaming, in what state"
+    /// even when they're 200 px down the page browsing speakers or
+    /// tuning latency. Mirrors the banner's traffic-light scheme but
+    /// trades the 56 px accent stripe + 34 px icon for a 10 px dot,
+    /// keeping the row at ~CONTROL_HEIGHT + padding.
+    fn show_pinned_status(&self, ui: &mut egui::Ui, p: &Palette) {
+        let enabled = self.app.is_streaming_enabled();
+        let active = self.app.stream_active.load(Ordering::Acquire);
+        let Some(current) = self.app.current_renderer() else { return; };
+
+        let (accent, status_text) = match (enabled, active) {
+            (false, _) => (p.danger, "Disabled"),
+            (true, true) => (p.success, "Streaming"),
+            (true, false) => (p.warn, "Idle"),
+        };
+
+        egui::Frame::none()
+            .fill(p.card)
+            .stroke(egui::Stroke::new(1.0, p.divider))
+            .rounding(RADIUS_CONTROL)
+            .inner_margin(egui::Margin::symmetric(sp::M, sp::XS))
+            .show(ui, |ui| {
+                ui.set_max_width(ui.available_width() - sp::M);
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(10.0, 10.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().circle_filled(rect.center(), 5.0, accent);
+                    ui.add_space(sp::S);
+
+                    ui.label(
+                        egui::RichText::new(&current.friendly_name)
+                            .size(13.0)
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    ui.label(
+                        egui::RichText::new("·")
+                            .size(13.0)
+                            .color(p.text_tertiary),
+                    );
+                    ui.label(
+                        egui::RichText::new(status_text)
+                            .size(13.0)
+                            .color(p.text_secondary),
+                    );
+
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let (label, tip) = if enabled {
+                                (
+                                    "Disable",
+                                    "Stop streaming and release the speaker (Ctrl+E)",
+                                )
+                            } else {
+                                (
+                                    "Enable",
+                                    "Reconnect and resume streaming (Ctrl+E)",
+                                )
+                            };
+                            let r = secondary_button(ui, p, label, 88.0)
+                                .on_hover_text(tip);
+                            if r.clicked() {
+                                if let Err(e) =
+                                    self.app.set_streaming_enabled(!enabled)
+                                {
+                                    self.app.record_error(format!(
+                                        "Couldn't change streaming state: {}",
+                                        e
+                                    ));
+                                }
+                            }
+                        },
+                    );
                 });
             });
     }
