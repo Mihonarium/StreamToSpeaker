@@ -551,6 +551,10 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
+        // Persist window size + position across launches (M28).
+        // eframe writes to its own storage (default: roaming config),
+        // independent of our user_config.json.
+        persist_window: true,
         ..Default::default()
     };
 
