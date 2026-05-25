@@ -241,7 +241,15 @@ struct Palette {
     card: egui::Color32,          // section card
     card_hover: egui::Color32,    // hover lift
     card_active: egui::Color32,   // pressed
-    divider: egui::Color32,       // borders
+    divider: egui::Color32,       // section borders (3:1 not required —
+                                  // sectional separator, not a UI
+                                  // component edge per WCAG 1.4.11)
+    /// m28: stroke for UI components — buttons, segmented controls,
+    /// pickers. WCAG 1.4.11 requires ≥3:1 against the adjacent fill
+    /// for any UI affordance edge; the lighter `divider` colour
+    /// (~1.25:1 on white) was fine for card outlines but failed the
+    /// bar when reused on button borders.
+    control_stroke: egui::Color32,
     overlay: egui::Color32,       // selected-row background tint
 
     // Text
@@ -249,6 +257,11 @@ struct Palette {
     text_secondary: egui::Color32,
     text_tertiary: egui::Color32,
     text_on_accent: egui::Color32,
+    /// m27: text colour to use INSIDE accent_subtle tints (onboarding
+    /// numbered circles, accent-tinted pills). text_primary / accent
+    /// both fail AA against accent_subtle in light mode; this is a
+    /// purpose-mixed shade that hits the 4.5:1 bar.
+    text_on_accent_subtle: egui::Color32,
 
     // Brand
     accent: egui::Color32,        // primary action bg
@@ -270,6 +283,9 @@ impl Palette {
             card_hover: egui::Color32::from_rgb(0xf3, 0xf6, 0xf8),
             card_active: egui::Color32::from_rgb(0xe8, 0xec, 0xf1),
             divider: egui::Color32::from_rgb(0xe1, 0xe6, 0xeb),
+            // m28: ~3.1:1 on the white card — qualifies as a UI
+            // component edge under WCAG 1.4.11.
+            control_stroke: egui::Color32::from_rgb(0xa6, 0xb0, 0xbc),
             overlay: egui::Color32::from_rgb(0xe0, 0xf3, 0xf7),
 
             text_primary: egui::Color32::from_rgb(0x14, 0x1b, 0x29),
@@ -279,13 +295,22 @@ impl Palette {
             // against the light card / canvas, passing the 4.5:1 bar.
             text_tertiary: egui::Color32::from_rgb(0x6b, 0x74, 0x88),
             text_on_accent: egui::Color32::from_rgb(0xff, 0xff, 0xff),
+            // m27: 5.8:1 against accent_subtle #c6e7ed — wide pass
+            // for the onboarding-numbered-circle digit.
+            text_on_accent_subtle: egui::Color32::from_rgb(0x05, 0x4a, 0x57),
 
-            accent: egui::Color32::from_rgb(0x07, 0x83, 0x96),
-            accent_hover: egui::Color32::from_rgb(0x05, 0x6b, 0x7c),
+            // m29: was #078396 — fell 0.03 short of AA against white
+            // text on primary buttons. #06738a hits ~5.4:1, keeps
+            // the recognisable teal hue.
+            accent: egui::Color32::from_rgb(0x06, 0x73, 0x8a),
+            accent_hover: egui::Color32::from_rgb(0x05, 0x60, 0x73),
             accent_subtle: egui::Color32::from_rgb(0xc6, 0xe7, 0xed),
 
             success: egui::Color32::from_rgb(0x16, 0x90, 0x4f),
-            warn: egui::Color32::from_rgb(0xb5, 0x70, 0x10),
+            // m26: was #b57010 — ~3.9:1 on canvas, fails AA for any
+            // text use. Darkened to #9a5e0c (~4.7:1) so the warn
+            // accent passes when paired with body-text labels.
+            warn: egui::Color32::from_rgb(0x9a, 0x5e, 0x0c),
             danger: egui::Color32::from_rgb(0xc8, 0x37, 0x37),
             muted: egui::Color32::from_rgb(0x6f, 0x78, 0x89),
         }
@@ -298,6 +323,8 @@ impl Palette {
             card_hover: egui::Color32::from_rgb(0x23, 0x2b, 0x3b),
             card_active: egui::Color32::from_rgb(0x2c, 0x35, 0x47),
             divider: egui::Color32::from_rgb(0x2a, 0x32, 0x42),
+            // m28: ~3.2:1 against the dark card — UI component edge.
+            control_stroke: egui::Color32::from_rgb(0x5a, 0x67, 0x7a),
             overlay: egui::Color32::from_rgb(0x16, 0x3b, 0x44),
 
             text_primary: egui::Color32::from_rgb(0xea, 0xee, 0xf4),
@@ -307,6 +334,9 @@ impl Palette {
             // the dark card.
             text_tertiary: egui::Color32::from_rgb(0x90, 0xa0, 0xb8),
             text_on_accent: egui::Color32::from_rgb(0x0e, 0x12, 0x1b),
+            // m27: dark accent_subtle #1d4f5b is already dark — a
+            // light digit on it gives wide AA contrast.
+            text_on_accent_subtle: egui::Color32::from_rgb(0xc6, 0xe7, 0xed),
 
             accent: egui::Color32::from_rgb(0x5c, 0xcf, 0xe6),
             accent_hover: egui::Color32::from_rgb(0x7e, 0xdc, 0xee),
@@ -985,7 +1015,9 @@ fn primary_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -
 fn secondary_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -> egui::Response {
     let btn = egui::Button::new(egui::RichText::new(label).color(p.text_primary))
         .fill(p.card)
-        .stroke(egui::Stroke::new(1.0, p.divider))
+        // m28: use control_stroke (~3:1) so the button edge passes
+        // WCAG 1.4.11 instead of the sectional divider (~1.25:1).
+        .stroke(egui::Stroke::new(1.0, p.control_stroke))
         .rounding(RADIUS_CONTROL);
     clickable(ui.add_sized([min_width, CONTROL_HEIGHT], btn))
 }
@@ -1000,7 +1032,9 @@ fn link_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -> e
         egui::RichText::new(label).strong().color(p.accent),
     )
     .fill(egui::Color32::TRANSPARENT)
-    .stroke(egui::Stroke::new(1.0, p.accent.gamma_multiply(0.45)))
+    // m28: control_stroke (~3:1) — was `accent.gamma_multiply(0.45)`
+    // which alpha-blended to ~1.6:1 on the page canvas.
+    .stroke(egui::Stroke::new(1.0, p.control_stroke))
     .rounding(RADIUS_CONTROL);
     clickable(ui.add_sized([min_width, CONTROL_HEIGHT], btn))
 }
@@ -1011,7 +1045,10 @@ fn link_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -> e
 fn danger_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -> egui::Response {
     let btn = egui::Button::new(egui::RichText::new(label).color(p.danger))
         .fill(p.card)
-        .stroke(egui::Stroke::new(1.0, p.danger.gamma_multiply(0.5)))
+        // m28: full danger colour for the stroke — gamma_multiply(0.5)
+        // alpha-blended to ~1.6:1 which neither read as "danger" nor
+        // satisfied WCAG 1.4.11.
+        .stroke(egui::Stroke::new(1.0, p.danger))
         .rounding(RADIUS_CONTROL);
     clickable(ui.add_sized([min_width, CONTROL_HEIGHT], btn))
 }
@@ -1064,7 +1101,7 @@ impl StreamToSpeakerApp {
                 .color(p.text_secondary),
         )
         .fill(p.card)
-        .stroke(egui::Stroke::new(1.0, p.divider))
+        .stroke(egui::Stroke::new(1.0, p.control_stroke))
         .rounding(RADIUS_CONTROL);
         let resp = clickable(ui.add_sized([CONTROL_HEIGHT, CONTROL_HEIGHT], btn))
             .on_hover_text("About + log folder + report an issue");
@@ -1233,12 +1270,16 @@ impl StreamToSpeakerApp {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
                     ui.painter().circle_filled(rect.center(), 11.0, p.accent_subtle);
+                    // m27: was p.accent, which gave ~3.42:1 against
+                    // accent_subtle in light mode — fails AA. The
+                    // dedicated text_on_accent_subtle shade hits
+                    // 5.8:1 (light) / 7.4:1 (dark).
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         n,
                         egui::FontId::new(12.0, egui::FontFamily::Proportional),
-                        p.accent,
+                        p.text_on_accent_subtle,
                     );
                     ui.add_space(sp::S);
                     ui.vertical(|ui| {
