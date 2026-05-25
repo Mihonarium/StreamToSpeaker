@@ -696,10 +696,14 @@ impl StreamToSpeakerApp {
         // Three-way segmented control: System / Light / Dark. Compact, lives
         // in the top-right of the header. Each segment shows the current
         // mode by filling with the accent colour.
+        // System → Light → Dark in source order, left-to-right paint
+        // (the inner ui.horizontal is LTR regardless of the parent's
+        // right_to_left layout). Tab follows source order, so Tab
+        // and paint agree.
         let modes = [
-            (ThemeMode::System, "Auto", "Follow Windows theme setting"),
-            (ThemeMode::Light, "Light", "Force light theme"),
-            (ThemeMode::Dark, "Dark", "Force dark theme"),
+            (ThemeMode::System, "System", "Match your Windows light/dark mode"),
+            (ThemeMode::Light, "Light", "Use the light theme regardless of Windows"),
+            (ThemeMode::Dark, "Dark", "Use the dark theme regardless of Windows"),
         ];
         egui::Frame::none()
             .fill(p.card)
