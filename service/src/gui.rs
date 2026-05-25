@@ -269,6 +269,8 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 skip_close_confirmation: false,
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
+                onboarding_dismissed: false,
+                last_applied_dark: None,
             }))
         }),
     );
@@ -285,6 +287,12 @@ struct StreamToSpeakerApp {
     skip_close_confirmation: bool,
     theme_mode: ThemeMode,
     advanced_open: bool,
+    onboarding_dismissed: bool,
+    /// Whether the theme is currently applied as dark. None until first
+    /// apply. We re-apply only when this disagrees with the resolved
+    /// mode — apply_theme rebuilds the full Style+Visuals every call
+    /// and was being run on every frame.
+    last_applied_dark: Option<bool>,
 }
 
 impl eframe::App for StreamToSpeakerApp {
@@ -296,28 +304,48 @@ impl eframe::App for StreamToSpeakerApp {
             self.last_repaint_request = Instant::now();
         }
 
-        // Reapply theme each frame so System-mode follows live OS changes.
+        // Reapply theme only when the resolved mode actually changes.
+        // apply_theme rebuilds the full Style+Visuals (allocates the
+        // text-style map, all the widget visuals); doing that every
+        // frame at 10 fps was wasteful and could cause focus loss on
+        // some egui widgets.
         let dark = self.theme_mode.resolve(ctx);
-        apply_theme(ctx, dark);
+        if self.last_applied_dark != Some(dark) {
+            apply_theme(ctx, dark);
+            self.last_applied_dark = Some(dark);
+        }
         let p = palette_for(dark);
 
         if let Some(tray) = self.tray.as_mut() {
             tray.pump(&self.app, ctx);
         }
 
-        // Close-button handling (same logic as before).
+        // Close-button handling. We hide-to-tray with Minimized(true)
+        // rather than Visible(false) — eframe stops calling update()
+        // on a hidden viewport, so queued ViewportCommands (including
+        // a later Visible(true) from the tray's "Show window") would
+        // never be processed. Minimised windows still tick, so the
+        // tray menu remains responsive. See emilk/egui#5229.
         let close_pressed = ctx.input(|i| i.viewport().close_requested());
         if close_pressed && self.frame_count > 1 && !self.app.is_shutting_down() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.tray.is_none() {
                 self.app.request_shutdown();
             } else if self.skip_close_confirmation {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             } else {
                 self.confirm_close_open = true;
             }
         }
         if self.app.is_shutting_down() {
+            // Drop the tray icon synchronously so it disappears now,
+            // not whenever eframe gets around to dropping the App.
+            // Then force the viewport visible+unminimised so eframe
+            // actually honours the Close — Close on a hidden/minimised
+            // viewport doesn't reliably return from run_native.
+            self.tray.take();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -340,7 +368,9 @@ impl eframe::App for StreamToSpeakerApp {
                         .show(ui, |ui| {
                             self.show_status_banner(ui, &p);
                             ui.add_space(14.0);
-                            if self.app.current_renderer().is_none() {
+                            if self.app.current_renderer().is_none()
+                                && !self.onboarding_dismissed
+                            {
                                 self.show_onboarding(ui, &p);
                                 ui.add_space(14.0);
                             }
@@ -384,6 +414,19 @@ fn section_label(ui: &mut egui::Ui, p: &Palette, text: &str) {
     ui.add_space(2.0);
 }
 
+/// Tag any clickable Response with the pointing-hand cursor on hover.
+/// egui does NOT auto-apply this for Buttons / sense-click Labels — the
+/// default is the arrow cursor, which reads as "this is text, not a
+/// control". Web users expect the hand on every clickable; matching that
+/// expectation makes the desktop app feel native instead of toy-like.
+/// Cite: egui Discussion #1430 and the egui::Response docs.
+fn clickable(r: egui::Response) -> egui::Response {
+    if r.hovered() && r.enabled() {
+        r.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    r
+}
+
 /// Primary button — solid accent fill, white-on-accent text. Use for the
 /// main action of each area (Enable, Minimise to tray, Apply, etc.).
 fn primary_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -> egui::Response {
@@ -395,7 +438,7 @@ fn primary_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -
     .fill(p.accent)
     .stroke(egui::Stroke::new(1.0, p.accent_hover))
     .rounding(8.0);
-    ui.add_sized([min_width, 32.0], btn)
+    clickable(ui.add_sized([min_width, 32.0], btn))
 }
 
 /// Secondary button — outlined, neutral background. For tertiary actions
@@ -405,7 +448,22 @@ fn secondary_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32)
         .fill(p.card)
         .stroke(egui::Stroke::new(1.0, p.divider))
         .rounding(8.0);
-    ui.add_sized([min_width, 32.0], btn)
+    clickable(ui.add_sized([min_width, 32.0], btn))
+}
+
+/// Tertiary / link-style button — accent-coloured text on transparent
+/// background, no border. For actions that ARE the primary action of a
+/// screen but live alongside genuine primary buttons (e.g. "Open in
+/// browser" sitting next to "Enable streaming"). Avoids competing-loud-
+/// fills-on-the-same-screen.
+fn link_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -> egui::Response {
+    let btn = egui::Button::new(
+        egui::RichText::new(label).strong().color(p.accent),
+    )
+    .fill(egui::Color32::TRANSPARENT)
+    .stroke(egui::Stroke::new(1.0, p.accent.gamma_multiply(0.45)))
+    .rounding(8.0);
+    clickable(ui.add_sized([min_width, 32.0], btn))
 }
 
 /// Danger button — red text + thin red border. For "this glitches the audio"
@@ -416,7 +474,7 @@ fn danger_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) ->
         .fill(p.card)
         .stroke(egui::Stroke::new(1.0, p.danger.gamma_multiply(0.5)))
         .rounding(8.0);
-    ui.add_sized([min_width, 32.0], btn)
+    clickable(ui.add_sized([min_width, 32.0], btn))
 }
 
 impl StreamToSpeakerApp {
@@ -462,8 +520,7 @@ impl StreamToSpeakerApp {
                             .fill(if selected { p.accent } else { egui::Color32::TRANSPARENT })
                             .stroke(egui::Stroke::NONE)
                             .rounding(6.0);
-                        if ui
-                            .add_sized([54.0, 24.0], btn)
+                        if clickable(ui.add_sized([60.0, 28.0], btn))
                             .on_hover_text(tip)
                             .clicked()
                         {
@@ -474,11 +531,24 @@ impl StreamToSpeakerApp {
             });
     }
 
-    fn show_onboarding(&self, ui: &mut egui::Ui, p: &Palette) {
+    fn show_onboarding(&mut self, ui: &mut egui::Ui, p: &Palette) {
         // Three-step quick-start. Numbered circles on the left, instructions
-        // on the right. Disappears once a speaker is bound.
+        // on the right. Disappears once a speaker is bound — or when the
+        // user explicitly dismisses with the "Got it" button (some users
+        // unbind a speaker after using the app for a while; the card
+        // shouldn't resurface as if they were a new user).
         card(ui, p, |ui| {
-            section_label(ui, p, "Getting started");
+            ui.horizontal(|ui| {
+                section_label(ui, p, "Getting started");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if secondary_button(ui, p, "Got it", 72.0)
+                        .on_hover_text("Hide this card for the rest of the session")
+                        .clicked()
+                    {
+                        self.onboarding_dismissed = true;
+                    }
+                });
+            });
             ui.add_space(8.0);
 
             let steps: &[(&str, &str, &str)] = &[
@@ -755,25 +825,32 @@ impl StreamToSpeakerApp {
 
     fn show_advanced(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
-            let toggle_label = if self.advanced_open {
-                "Advanced  v"
-            } else {
-                "Advanced  >"
-            };
-            if ui
-                .add(
-                    egui::Label::new(
-                        egui::RichText::new(toggle_label.to_uppercase())
-                            .size(11.0)
-                            .strong()
-                            .color(p.text_tertiary)
-                            .extra_letter_spacing(1.6),
-                    )
-                    .sense(egui::Sense::click()),
-                )
-                .on_hover_text("Tuning knobs for power users")
-                .clicked()
-            {
+            // Full-width clickable strip — clicking anywhere in the card
+            // header row toggles, not just the tiny label. Fitts's law.
+            let chevron = if self.advanced_open { "▾" } else { "▸" };
+            let avail_w = ui.available_width();
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(avail_w, 22.0), egui::Sense::click());
+            let resp = resp.on_hover_text("Tuning knobs for power users");
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            // Paint label + chevron into the allocated strip.
+            ui.painter().text(
+                rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                "ADVANCED",
+                egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                p.text_tertiary,
+            );
+            ui.painter().text(
+                rect.right_center() - egui::vec2(2.0, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                chevron,
+                egui::FontId::new(14.0, egui::FontFamily::Proportional),
+                p.text_tertiary,
+            );
+            if resp.clicked() {
                 self.advanced_open = !self.advanced_open;
             }
 
@@ -867,8 +944,11 @@ impl StreamToSpeakerApp {
 
             ui.horizontal(|ui| {
                 if on {
-                    if primary_button(ui, p, "Open in browser", 150.0)
-                        .on_hover_text(&url)
+                    // Web UI is a side feature, not the screen's primary
+                    // action. Use the lighter link-style button instead
+                    // of competing with Enable in the status banner.
+                    if link_button(ui, p, "Open in browser", 150.0)
+                        .on_hover_text(format!("Open {} in your default browser", url))
                         .clicked()
                     {
                         let _ = open_url(&url);
@@ -879,7 +959,7 @@ impl StreamToSpeakerApp {
                     {
                         self.app.set_web_ui_enabled(false);
                     }
-                } else if primary_button(ui, p, "Enable web UI", 150.0)
+                } else if secondary_button(ui, p, "Enable web UI", 150.0)
                     .on_hover_text(
                         "Serve the control panel + JSON API on the local HTTP \
                          port. The audio stream itself is always served.",
@@ -911,7 +991,10 @@ impl StreamToSpeakerApp {
         card(ui, p, |ui| {
             section_label(ui, p, "Stats");
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            // horizontal_wrapped (not horizontal) so the pills reflow
+            // onto a second row at narrow widths instead of clipping
+            // off the right edge.
+            ui.horizontal_wrapped(|ui| {
                 stat_pill(ui, p, &format!("{}", pkts_sec), "pkt / s");
                 stat_pill(
                     ui,
@@ -997,10 +1080,18 @@ impl StreamToSpeakerApp {
             self.confirm_close_open = false;
             match a {
                 CloseAction::MinimiseToTray => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    // Minimize (not Visible(false)) so the update loop
+                    // keeps running and tray menu commands like
+                    // "Show window" remain deliverable. See the comment
+                    // on the close-button path above.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 }
                 CloseAction::Quit => {
+                    // request_shutdown flips the atomic; the next
+                    // update() tick sees it and runs the Close
+                    // sequence (drop tray, show+unminimise, Close).
                     self.app.request_shutdown();
+                    ctx.request_repaint();
                 }
                 CloseAction::Cancel => {}
             }

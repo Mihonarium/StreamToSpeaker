@@ -53,7 +53,7 @@ struct TrayIds {
 
 /// Build and install the tray icon. The handle must live as long as
 /// the GUI process (drop it to remove the icon).
-pub fn spawn(app: Arc<App>, _egui_ctx: egui::Context) -> Result<TrayHandle> {
+pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
     let menu = Menu::new();
 
     let status_item = MenuItem::new("(no speaker)", false, None);
@@ -120,6 +120,10 @@ pub fn spawn(app: Arc<App>, _egui_ctx: egui::Context) -> Result<TrayHandle> {
         .with_icon(icon)
         .build()
         .map_err(|e| anyhow!("tray-icon build: {}", e))?;
+
+    // `egui_ctx` is held by the periodic-repaint tick already; we just
+    // touch it here so the parameter isn't formally unused.
+    let _ = egui_ctx;
 
     Ok(TrayHandle {
         _icon: tray,
@@ -222,6 +226,14 @@ impl TrayHandle {
 }
 
 fn show_main_window(ctx: &egui::Context) {
+    // Order matters: un-minimise first, then ensure visible, then
+    // focus. We hide-to-tray via Minimized(true) (not Visible(false))
+    // because eframe stops calling update() on hidden viewports and
+    // viewport commands then sit undelivered in the queue forever —
+    // a well-known eframe regression (emilk/egui#5229, #3655). With
+    // Minimized, the update loop keeps ticking and these commands
+    // are processed on the next frame.
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     ctx.request_repaint();

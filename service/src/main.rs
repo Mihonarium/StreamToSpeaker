@@ -175,6 +175,15 @@ fn main() {
         attach_parent_console();
     }
 
+    // Create a named mutex so the Inno Setup installer can detect a
+    // running instance (matched by AppMutex in StreamToSpeaker.iss).
+    // The handle is intentionally leaked — it lives for the process
+    // lifetime and is released when Windows tears down handles on
+    // exit. Two instances racing here is harmless (CreateMutex
+    // returns the same kernel object).
+    #[cfg(windows)]
+    let _mutex_handle = create_singleton_mutex();
+
     let mut builder = env_logger::Builder::from_default_env();
     builder
         .filter_level(cli.log_level.parse().unwrap_or(log::LevelFilter::Info))
@@ -198,6 +207,26 @@ fn attach_parent_console() {
         // Return value is ignored on purpose: failure (no parent
         // console) just means we operate without one.
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+/// Open (or create) the named mutex the Inno Setup installer watches
+/// via AppMutex. Held until process exit. Global\ prefix so the
+/// elevated installer process can see a mutex held by the user-session
+/// service. Returns the HANDLE so the caller can keep it alive — the
+/// kernel object is released when the last handle goes away.
+#[cfg(windows)]
+fn create_singleton_mutex() -> Option<isize> {
+    use std::ffi::CString;
+    use windows_sys::Win32::System::Threading::CreateMutexA;
+    let name = CString::new("Global\\StreamToSpeaker.Singleton").ok()?;
+    unsafe {
+        let h = CreateMutexA(std::ptr::null(), 0, name.as_ptr() as *const u8);
+        if h.is_null() {
+            None
+        } else {
+            Some(h as isize)
+        }
     }
 }
 

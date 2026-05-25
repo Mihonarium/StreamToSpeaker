@@ -20,7 +20,7 @@
          DriverBuildNumber (the revision field) is the git commit
          count, injected by CI / build-installer.ps1 via
          /p:DriverBuildNumber=N. -->
-    <DriverVersionPrefix Condition="'$(DriverVersionPrefix)' == ''">1.0.0</DriverVersionPrefix>
+    <DriverVersionPrefix Condition="'$(DriverVersionPrefix)' == ''">1.0.1</DriverVersionPrefix>
     <DriverBuildNumber Condition="'$(DriverBuildNumber)' == ''">1</DriverBuildNumber>
     <ProjectName>StreamToSpeaker</ProjectName>
     <TargetVersion>Windows10</TargetVersion>
@@ -102,7 +102,13 @@
                    - 1.0.x  initial work / 0-to-1 features
                    - 1.1.x  new feature shipped
                    - 2.0.x  breaking IOCTL ABI / driver model change
-                   See CLAUDE.md for the discipline. -->
+                   See CLAUDE.md for the discipline.
+           Without SpecifyDriverDirectiveVersion=true, the stampinf
+           MSBuild task does NOT pass -v to stampinf.exe and the
+           TimeStamp metadata is silently ignored — leaving the
+           literal DriverVer in the .inf untouched (the bug that
+           kept the installed INF stuck at "1.0.0.1" for ages). -->
+      <SpecifyDriverDirectiveVersion>true</SpecifyDriverDirectiveVersion>
       <TimeStamp>$(DriverVersionPrefix).$(DriverBuildNumber)</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>

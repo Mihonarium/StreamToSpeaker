@@ -55,15 +55,16 @@ if (-not $SkipDriver) {
     # SAME number ends up in:
     #   - driver.h's STREAM_TO_SPEAKER_DRIVER_BUILD (returned via IOCTL,
     #     logged by the service: 'driver opened build=N')
-    #   - the INF's DriverVer (1.0.0.N - what Device Manager shows,
-    #     what PnP uses to compare versions)
+    #   - the INF's DriverVer (<prefix>.N — what Device Manager shows,
+    #     what PnP uses to compare versions; prefix is set in the
+    #     vcxproj's DriverVersionPrefix)
     # Override with -DriverBuild N for reproducible local repro.
     $buildNum = if ($DriverBuild -gt 0) { $DriverBuild } else { [int]((git rev-list --count HEAD).Trim()) }
     $driverHeader = Join-Path $repoRoot "driver\driver.h"
     $content = Get-Content $driverHeader -Raw
     $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${buildNum}u"
     Set-Content -Path $driverHeader -Value $new -NoNewline
-    Write-Step "Building driver ($Configuration|x64, SignMode=$SignMode, build=$buildNum, DriverVer=1.0.0.$buildNum)"
+    Write-Step "Building driver ($Configuration|x64, SignMode=$SignMode, build=$buildNum, DriverVer=<prefix>.$buildNum)"
     $msbuild = Get-Command msbuild.exe -ErrorAction SilentlyContinue
     if (-not $msbuild) {
         $candidates = @(

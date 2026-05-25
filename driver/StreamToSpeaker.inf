@@ -81,7 +81,6 @@ HKR,,FriendlyName,,%StreamToSpeaker.WaveDesc%
 HKR,EP\0,%PKEY_Device_FriendlyName%,,%StreamToSpeaker.EndpointName%
 
 HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_SPEAKER%
-HKR,EP\0,%PKEY_AudioEndpoint_Default%,0x00010001,1
 ; FormFactor = 1 (Speakers). Avoids the FormFactor=0
 ; (RemoteNetworkDevice) privacy gate Windows 11 22H2+ applies to
 ; "remote" audio devices (the "Allow apps and Windows to use this
@@ -181,7 +180,6 @@ KSNODETYPE_SPEAKER        = "{DFF21BE2-F70F-11D0-B917-00A0C9223196}"
 PKEY_Device_FriendlyName    = "{a45c254e-df1c-4efd-8020-67d146a850e0},14"
 
 PKEY_AudioEndpoint_Association              = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
-PKEY_AudioEndpoint_Default                  = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
 PKEY_AudioEndpoint_FormFactor               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
 PKEY_AudioEndpoint_Disable_SysFx            = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},5"
 PKEY_AudioEndpoint_Supports_EventDriven_Mode= "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"

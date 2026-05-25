@@ -86,9 +86,24 @@ static PCPIN_DESCRIPTOR TopologyMiniportPins[] =
             0
         }
     },
-    /* PIN 1 - output to "line out" (logically: the Sonos).
-     * Category is KSCATEGORY_AUDIO; KSNODETYPE_* is for the
-     * topology nodes, not for the pin's category slot. */
+    /* PIN 1 - output to the speakers (logically: the Sonos).
+     *
+     * Category on a bridge pin IS where you put the KSNODETYPE_*
+     * GUID. The AudioEndpointBuilder reads this to derive the
+     * endpoint's form-factor for its enabled/visible defaults:
+     *   - KSCATEGORY_AUDIO   → "UnknownFormFactor", which the
+     *     docs ("Audio Endpoint Builder Algorithm") list as
+     *     created-as-disabled-and-hidden by default. That's the
+     *     state that forces the user to flip the Sound Settings
+     *     "Allow apps and Windows to use this device" toggle.
+     *   - KSNODETYPE_SPEAKER → "Speakers", created enabled+visible.
+     *
+     * The INF's PKEY_AudioEndpoint_FormFactor=Speakers and
+     * PKEY_AudioDevice_EnableEndpointByDefault overrides only take
+     * effect after the endpoint builder has already classified the
+     * pin; they don't reach back through a cached
+     * DEVICE_STATE_DISABLED from a prior enrollment. Set the right
+     * Category here so we're on the happy path from first contact. */
     {
         1, 1, 0,
         NULL,
@@ -98,7 +113,7 @@ static PCPIN_DESCRIPTOR TopologyMiniportPins[] =
             TopoPinDataRangePointersBridge,
             KSPIN_DATAFLOW_OUT,
             KSPIN_COMMUNICATION_NONE,
-            &KSCATEGORY_AUDIO,
+            &KSNODETYPE_SPEAKER,
             NULL,
             0
         }

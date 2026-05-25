@@ -130,19 +130,55 @@ namespace StreamToSpeaker {
     $pkeyFriendlyName_pid   = 14
     $pkeyDeviceDescStr      = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"
 
-    $matched = 0
-    Get-ChildItem $base | ForEach-Object {
-        $endpointGuid = $_.PSChildName
-        $propsPath = Join-Path $_.PSPath "Properties"
-        if (-not (Test-Path $propsPath)) { return }
-        $desc = (Get-ItemProperty -Path $propsPath -Name $pkeyDeviceDescStr -ErrorAction SilentlyContinue).$pkeyDeviceDescStr
-        if (-not $desc -or $desc -notlike "$Match*") { return }
+    # Find-our-endpoint with a retry loop. devcon install returns the
+    # moment the PnP layer has accepted the device; AudioEndpointBuilder
+    # then has to notice the new audio interface and enrol it in
+    # MMDevices\Audio\Render. On a slow machine that can take a few
+    # seconds, and our [Run] entries fire back-to-back with no pause.
+    # Without this loop the script would silently exit-2 and the user
+    # would still see the "Allow" toggle off the next time they opened
+    # Sound Settings.
+    function Find-OurEndpoints {
+        $matches = @()
+        Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
+            $endpointGuid = $_.PSChildName
+            $propsPath = Join-Path $_.PSPath "Properties"
+            if (-not (Test-Path $propsPath)) { return }
+            $desc = (Get-ItemProperty -Path $propsPath -Name $pkeyDeviceDescStr -ErrorAction SilentlyContinue).$pkeyDeviceDescStr
+            if ($desc -and $desc -like "$Match*") {
+                $matches += [pscustomobject]@{ Guid = $endpointGuid; Desc = $desc }
+            }
+        }
+        $matches
+    }
 
+    $endpoints = @()
+    $maxAttempts = 30  # ~30s total
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $endpoints = @(Find-OurEndpoints)
+        if ($endpoints.Count -gt 0) {
+            if ($attempt -gt 1) {
+                Write-Host "Endpoint appeared after $attempt second(s)."
+            }
+            break
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    if ($endpoints.Count -eq 0) {
+        Write-Warning "No render endpoint matched DeviceDesc starting with '$Match' after ${maxAttempts}s."
+        Write-Warning "Either the driver isn't installed, or AudioEndpointBuilder hasn't enrolled the endpoint."
+        Write-Warning "Try signing out and back in if you just installed."
+        exit 2
+    }
+
+    $matched = 0
+    foreach ($ep in $endpoints) {
         $matched++
         # Endpoint IDs are of the form "{0.0.0.00000000}.{<guid>}" for
         # render; .1.00000000 for capture. We're only doing render.
-        $endpointId = "{0.0.0.00000000}.$endpointGuid"
-        Write-Host "Matched $endpointGuid  (desc='$desc')"
+        $endpointId = "{0.0.0.00000000}.$($ep.Guid)"
+        Write-Host "Matched $($ep.Guid)  (desc='$($ep.Desc)')"
 
         # --- Friendly name ---
         $hr = [StreamToSpeaker.PolicyConfigBridge]::SetStringProperty(
@@ -161,13 +197,24 @@ namespace StreamToSpeaker {
         } else {
             Write-Warning "  SetEndpointVisibility failed: HRESULT 0x$('{0:X8}' -f $hr)"
         }
-    }
 
-    if ($matched -eq 0) {
-        Write-Warning "No render endpoint matched DeviceDesc starting with '$Match'."
-        Write-Warning "Either the driver isn't installed yet, or the audio service hasn't enrolled the endpoint."
-        Write-Warning "Try signing out and back in if you just installed."
-        exit 2
+        # --- Verify DeviceState landed on ACTIVE (==1). If it stays at
+        #     DISABLED (==2) or NOTPRESENT (==4) something fought us. ---
+        $statePath = "$base\$($ep.Guid)"
+        $state = (Get-ItemProperty -Path $statePath -Name "DeviceState" -ErrorAction SilentlyContinue).DeviceState
+        if ($state -ne $null) {
+            $stateName = switch ($state) {
+                1 { "ACTIVE" }
+                2 { "DISABLED" }
+                4 { "NOTPRESENT" }
+                8 { "UNPLUGGED" }
+                default { "0x{0:X}" -f $state }
+            }
+            Write-Host "  DeviceState = $stateName ($state)"
+            if ($state -ne 1) {
+                Write-Warning "  Endpoint is not ACTIVE — user may still need to click Allow in Sound Settings."
+            }
+        }
     }
 
     Write-Host "Done - $matched endpoint(s) updated."
