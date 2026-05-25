@@ -36,6 +36,40 @@ use std::time::{Duration, Instant};
 use crate::app::App;
 
 // -----------------------------------------------------------------------------
+// Design tokens
+// -----------------------------------------------------------------------------
+//
+// Centralized spacing + corner-radius scales. Replaces the scatter of
+// hard-coded `5.0`, `7.0`, `13.0`, `14.0`, `18.0`, `22.0` literals that
+// accumulated as the GUI grew — those produced no consistent rhythm,
+// failed Fluent's 4 epx grid, and were the most-flagged issue in the
+// recent UX audit. Every layout call in this file SHOULD read from
+// these constants.
+//
+// Spacing scale follows Fluent 2's tokens (4-epx grid):
+//   XS=8  S=12  M=16  L=24  XL=32
+// (4 itself is reserved for micro-adjustments and isn't surfaced as a
+// named constant — if you reach for 4, ask whether you actually want
+// 8 first.)
+//
+// Corner radii are the two Fluent values:
+//   RADIUS_CONTROL=4  for in-page controls (buttons, list rows, pills)
+//   RADIUS_SURFACE=8  for overlays (cards, modal, app window, menus)
+#[allow(dead_code)] // sp::L is not used today; kept for upcoming spacing sweep.
+mod sp {
+    pub const XS: f32 = 8.0;
+    pub const S: f32 = 12.0;
+    pub const M: f32 = 16.0;
+    pub const L: f32 = 24.0;
+}
+const RADIUS_CONTROL: f32 = 4.0;
+const RADIUS_SURFACE: f32 = 8.0;
+/// Standard interactive control height. One value across primary /
+/// secondary / link / danger / segmented buttons so the rhythm doesn't
+/// drift between adjacent rows.
+const CONTROL_HEIGHT: f32 = 32.0;
+
+// -----------------------------------------------------------------------------
 // Theme + palette
 // -----------------------------------------------------------------------------
 
@@ -217,14 +251,14 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     visuals.widgets.noninteractive.weak_bg_fill = p.card;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, p.divider);
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, p.text_secondary);
-    visuals.widgets.noninteractive.rounding = 6.0.into();
+    visuals.widgets.noninteractive.rounding = RADIUS_CONTROL.into();
 
     // Inactive (button at rest)
     visuals.widgets.inactive.bg_fill = p.card;
     visuals.widgets.inactive.weak_bg_fill = p.card;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, p.divider);
     visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.text_primary);
-    visuals.widgets.inactive.rounding = 6.0.into();
+    visuals.widgets.inactive.rounding = RADIUS_CONTROL.into();
     visuals.widgets.inactive.expansion = 0.0;
 
     // Hovered — subtle bg lift, accent border. Communicates "click me".
@@ -232,7 +266,7 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     visuals.widgets.hovered.weak_bg_fill = p.card_hover;
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, p.accent);
     visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, p.text_primary);
-    visuals.widgets.hovered.rounding = 6.0.into();
+    visuals.widgets.hovered.rounding = RADIUS_CONTROL.into();
     visuals.widgets.hovered.expansion = 1.0;
 
     // Active — pressed, darker fill
@@ -240,14 +274,14 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     visuals.widgets.active.weak_bg_fill = p.card_active;
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5, p.accent);
     visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, p.text_primary);
-    visuals.widgets.active.rounding = 6.0.into();
+    visuals.widgets.active.rounding = RADIUS_CONTROL.into();
     visuals.widgets.active.expansion = 0.0;
 
     visuals.widgets.open.bg_fill = p.card_hover;
     visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, p.accent);
 
-    visuals.window_rounding = 12.0.into();
-    visuals.menu_rounding = 8.0.into();
+    visuals.window_rounding = RADIUS_SURFACE.into();
+    visuals.menu_rounding = RADIUS_SURFACE.into();
 
     // Focus ring — visible 2px accent outline for keyboard accessibility.
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, p.accent);
@@ -263,10 +297,14 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
         (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
     ]
     .into();
-    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(14.0, 7.0);
-    style.spacing.window_margin = egui::Margin::same(16.0);
-    style.spacing.interact_size.y = 30.0;
+    // 8×8 sibling spacing matches Fluent's L3 default (8 epx between
+    // peer controls). The previous 10×8 was off the 4-epx grid.
+    style.spacing.item_spacing = egui::vec2(sp::XS, sp::XS);
+    // 12-horizontal / 6-vertical padding gives ~32-epx-tall buttons
+    // with 14-px Body text and matches the WinUI button proportions.
+    style.spacing.button_padding = egui::vec2(sp::S, 6.0);
+    style.spacing.window_margin = egui::Margin::same(sp::M);
+    style.spacing.interact_size.y = CONTROL_HEIGHT;
     ctx.set_style(style);
 }
 
