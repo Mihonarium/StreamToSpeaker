@@ -824,24 +824,24 @@ impl StreamToSpeakerApp {
                 "⊘",
                 p.danger,
                 "Streaming disabled".to_string(),
-                "The speaker is free for other use. Click Enable to resume.".to_string(),
-                Some("Enable"),
-                Some("Re-bind to the last speaker and resume streaming"),
+                "The speaker is free for other apps. Press Enable to resume.".to_string(),
+                Some("Enable streaming"),
+                Some("Reconnect to the last speaker and resume streaming"),
             ),
             (Some(r), true, true) => (
                 "▶",
                 p.success,
                 format!("Streaming to {}", r.friendly_name),
-                format!("{}  ·  {} pkt/s", r.ip, self.packets_per_sec()),
-                Some("Disable"),
+                format!("{}  ·  {} packets/sec", r.ip, self.packets_per_sec()),
+                Some("Disable streaming"),
                 Some("Stop streaming and release the speaker for other apps"),
             ),
             (Some(r), true, false) => (
                 "‖",
                 p.warn,
-                format!("Idle on {}", r.friendly_name),
-                format!("{}  ·  no audio playing right now", r.ip),
-                Some("Disable"),
+                format!("Standing by on {}", r.friendly_name),
+                format!("{}  ·  waiting for audio", r.ip),
+                Some("Disable streaming"),
                 Some("Stop streaming and release the speaker for other apps"),
             ),
         };
@@ -885,10 +885,10 @@ impl StreamToSpeakerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                let r = if label == "Enable" {
-                                    primary_button(ui, p, label, 96.0)
+                                let r = if label == "Enable streaming" {
+                                    primary_button(ui, p, label, 140.0)
                                 } else {
-                                    secondary_button(ui, p, label, 96.0)
+                                    secondary_button(ui, p, label, 140.0)
                                 }
                                 .on_hover_text(tip);
                                 if r.clicked() {
@@ -1224,23 +1224,24 @@ impl StreamToSpeakerApp {
                 if on {
                     // Web UI is a side feature, not the screen's primary
                     // action. Use the lighter link-style button instead
-                    // of competing with Enable in the status banner.
+                    // of competing with Enable streaming in the status
+                    // banner.
                     if link_button(ui, p, "Open in browser", 150.0)
                         .on_hover_text(format!("Open {} in your default browser", url))
                         .clicked()
                     {
                         let _ = open_url(&url);
                     }
-                    if secondary_button(ui, p, "Disable", 96.0)
-                        .on_hover_text("Stop serving the control panel + JSON API")
+                    if secondary_button(ui, p, "Disable web UI", 140.0)
+                        .on_hover_text("Stop serving the web UI")
                         .clicked()
                     {
                         self.app.set_web_ui_enabled(false);
                     }
-                } else if secondary_button(ui, p, "Enable web UI", 150.0)
+                } else if secondary_button(ui, p, "Enable web UI", 140.0)
                     .on_hover_text(
-                        "Serve the control panel + JSON API on the local HTTP \
-                         port. The audio stream itself is always served.",
+                        "Turn on the web control panel. \
+                         The audio stream stays available either way.",
                     )
                     .clicked()
                 {
