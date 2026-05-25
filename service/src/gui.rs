@@ -1126,11 +1126,11 @@ impl StreamToSpeakerApp {
                 None,
                 None,
             ),
-            (Some(_), false, _) => (
+            (Some(r), false, _) => (
                 "⊘",
                 p.danger,
-                "Streaming disabled".to_string(),
-                "The speaker is free for other apps. Press Enable to resume.".to_string(),
+                format!("Streaming to {} disabled", r.friendly_name),
+                format!("{} is free for other apps. Press Enable to resume streaming.", r.friendly_name),
                 Some("Enable streaming"),
                 Some("Reconnect to the last speaker and resume streaming"),
             ),
@@ -1810,12 +1810,18 @@ impl StreamToSpeakerApp {
                 );
                 ui.add_space(sp::M);
                 ui.horizontal(|ui| {
+                    // Order: primary (Minimise) on the left, then a
+                    // sp::L (24 epx) physical gap before the danger
+                    // (Quit) — Fitts says identical-size adjacent
+                    // buttons of opposite consequence cause mis-
+                    // clicks. Cancel sits flush right.
                     if primary_button(ui, p, "Minimise to tray", 170.0)
                         .on_hover_text("Hide the window. The tray icon stays and streaming continues.")
                         .clicked()
                     {
                         action = Some(CloseAction::MinimiseToTray);
                     }
+                    ui.add_space(sp::L);
                     if danger_button(ui, p, "Quit", 96.0)
                         .on_hover_text("Stop streaming and close the app entirely.")
                         .clicked()
