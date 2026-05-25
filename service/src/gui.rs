@@ -598,8 +598,8 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
         Box::new(move |cc| {
             // Register Segoe UI Symbol as a fallback font for both
             // Proportional and Monospace families. egui's bundled
-            // Ubuntu Light / Hack don't have the geometric-shape,
-            // arrow and chevron glyphs we use (▶ ⊘ ‖ ↻ ▾ ▸ ⟳ →),
+            // Ubuntu Light / Hack don't have the media-control,
+            // chevron, and circled-info glyphs we use (⏵ ⏸ ⏹ ↻ ▾ ▸ ⟳ ⓘ),
             // so without this they render as `□`. Loading the
             // system Segoe UI Symbol costs zero binary bytes
             // (it's on every Win7+ install) and only kicks in for
@@ -1243,6 +1243,15 @@ impl StreamToSpeakerApp {
         let active = self.app.stream_active.load(Ordering::Acquire);
         let current = self.app.current_renderer();
 
+        // M20: status icons were grab-bag — ⊘ from Math Operators
+        // (thin stroke), ▶ from Geometric Shapes (heavy filled),
+        // ‖ from General Punctuation (thin lines) — wildly mismatched
+        // weights. Switched to the Media Control Symbols block
+        // (U+23F5–23F9), designed as a coherent set in Segoe UI
+        // Symbol so all three speaker-bound states render at the
+        // same weight. "?" stays for "no speaker" because it reads
+        // as a text prompt ("what should I pick?"), not as a state
+        // indicator competing with the media icons.
         let (icon, accent, headline, detail, btn_label, btn_tip) = match (&current, enabled, active) {
             (None, _, _) => (
                 "?",
@@ -1253,7 +1262,7 @@ impl StreamToSpeakerApp {
                 None,
             ),
             (Some(r), false, _) => (
-                "⊘",
+                "\u{23F9}", // ⏹ Black Square For Stop
                 p.danger,
                 format!("Streaming to {} disabled", r.friendly_name),
                 format!("{} is free for other apps. Press Enable to resume streaming.", r.friendly_name),
@@ -1261,7 +1270,7 @@ impl StreamToSpeakerApp {
                 Some("Reconnect to the last speaker and resume streaming (Ctrl+E)"),
             ),
             (Some(r), true, true) => (
-                "▶",
+                "\u{23F5}", // ⏵ Black Medium Right-Pointing Triangle (Play)
                 p.success,
                 format!("Streaming to {}", r.friendly_name),
                 format!("{}  ·  {} packets/sec", r.ip, self.packets_per_sec()),
@@ -1269,7 +1278,7 @@ impl StreamToSpeakerApp {
                 Some("Stop streaming and release the speaker for other apps (Ctrl+E)"),
             ),
             (Some(r), true, false) => (
-                "‖",
+                "\u{23F8}", // ⏸ Double Vertical Bar (Pause)
                 p.warn,
                 format!("Standing by on {}", r.friendly_name),
                 format!("{}  ·  waiting for audio", r.ip),
