@@ -2943,7 +2943,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stream-to-speaker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2957,6 +2957,7 @@ dependencies = [
  "log",
  "percent-encoding",
  "quick-xml 0.36.2",
+ "raw-window-handle",
  "roxmltree",
  "socket2",
  "thiserror 1.0.69",

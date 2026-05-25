@@ -44,6 +44,12 @@ public:
     NTSTATUS PropertyHandlerVolumeLevel(_In_ PPCPROPERTY_REQUEST Request);
     NTSTATUS PropertyHandlerMute       (_In_ PPCPROPERTY_REQUEST Request);
     NTSTATUS PropertyHandlerCpuResources(_In_ PPCPROPERTY_REQUEST Request);
+    /* KSPROPSETID_Jack handlers — filter-level. AudioEndpointBuilder
+     * queries these on the topology filter to derive the endpoint's
+     * jack subtype + name. Without them, AEB falls back to defaults
+     * that produce labels like "Internal AUX Jack". */
+    NTSTATUS PropertyHandlerJackDescription (_In_ PPCPROPERTY_REQUEST Request);
+    NTSTATUS PropertyHandlerJackDescription2(_In_ PPCPROPERTY_REQUEST Request);
 
     /* Called from IOCTL_STREAM_TO_SPEAKER_PUSH_VOLUME so the topology mirrors
      * an externally-driven change (e.g. user touched the physical

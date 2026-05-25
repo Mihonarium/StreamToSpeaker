@@ -74,7 +74,26 @@ SetupLogging=yes
 ; through audiosrv. Suppress the prompt.
 RestartIfNeededByRun=no
 AlwaysRestart=no
-CloseApplications=no
+; If an instance of stream-to-speaker.exe is running when the user
+; reinstalls / upgrades, Setup needs to close it before it can replace
+; the binary. force = show the "the following applications should be
+; closed" page with Close-and-retry / Ignore controls AND actually run
+; the close. The filter limits the Restart Manager scan to our binaries
+; under {app}; without the filter Inno would scan the whole system.
+; RestartApplications=no — we don't want Setup re-launching the GUI in
+; the SYSTEM elevated context after install (that creates a permissions
+; mess for the per-user "Run on sign-in" autostart entry).
+CloseApplications=force
+CloseApplicationsFilter=*.exe
+RestartApplications=no
+; Belt and braces — if the GUI somehow holds no files (e.g. it's running
+; from a different path, or it has no handles open to {app}), Restart
+; Manager won't find it. AppMutex matches the exact named mutex the
+; service creates at startup (see service/src/main.rs); when it's held,
+; Setup shows a "Stream To Speaker is running — close it and click OK"
+; dialog with Cancel / Retry buttons. Global\ so the elevated installer
+; can see a mutex created in the user session.
+AppMutex=Global\StreamToSpeaker.Singleton
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -106,6 +125,7 @@ Source: "{#SourcePath}\staging\StreamToSpeaker.cat"; DestDir: "{app}\driver"; Fl
 Source: "{#SourcePath}\..\scripts\Pre-Install.ps1";     DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\..\scripts\Rename-Endpoint.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\..\scripts\Reset-Install.ps1";   DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "{#SourcePath}\..\scripts\Diagnose.ps1";        DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\Uninstall-Driver.ps1";           DestDir: "{app}\scripts"; Flags: ignoreversion
 
 ; --- devcon.exe (WDK redistributable, MIT) ---

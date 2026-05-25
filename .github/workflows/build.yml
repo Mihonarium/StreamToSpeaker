@@ -35,7 +35,7 @@ jobs:
       #   viversion — strict X.Y.Z.W numeric, required for the Win32
       #               VersionInfo resource Inno Setup bakes into setup.exe
       # Tag push  v1.2.3   → version 1.2.3,        viversion 1.2.3.0
-      # Otherwise          → version 0.1.0-<sha>,  viversion 0.1.0.0
+      # Otherwise          → version 0.2.0-<sha>,  viversion 0.2.0.0
       # -----------------------------------------------------------------
       - name: Compute version
         id: ver
@@ -48,7 +48,7 @@ jobs:
               $v = "${{ github.ref }}" -replace "refs/tags/v", ""
           } else {
               $sha = "${{ github.sha }}".Substring(0, 7)
-              $v = "0.1.0-$sha"
+              $v = "0.2.0-$sha"
           }
           # Numeric prefix of $v, padded to 4 parts.
           $prefix = ($v -split "[-+]")[0]
@@ -190,7 +190,7 @@ jobs:
 
       # Stamp the driver build number with the git commit count so
       # every build is uniquely identifiable from:
-      #   - The INF's DriverVer (1.0.0.N — what Device Manager and
+      #   - The INF's DriverVer (<prefix>.N — what Device Manager and
       #     PnP version-comparison use)
       #   - The service log ('StreamToSpeaker driver opened build=N')
       # Both come from the same git rev-list count, so they stay in
@@ -206,7 +206,7 @@ jobs:
           $content = Get-Content $path -Raw
           $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${count}u"
           Set-Content -Path $path -Value $new -NoNewline
-          Write-Host "Driver build stamped: $count (driver.h + INF DriverVer 1.0.0.$count)"
+          Write-Host "Driver build stamped: $count (driver.h + INF DriverVer prefix.$count)"
           "build=$count" >> $env:GITHUB_OUTPUT
 
       - name: Build driver (Release|x64, test-signed)

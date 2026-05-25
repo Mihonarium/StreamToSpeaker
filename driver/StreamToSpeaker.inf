@@ -36,6 +36,23 @@ StreamToSpeaker.sys = 1
 ; ----------------------------------------------------------------------
 
 [StreamToSpeaker_Inst.NT]
+; Inherit the core KS + WDMAudio registrations from the inbox INFs.
+; Per Microsoft's "Installing Core System Components for an Audio
+; Adapter" docs ([1]):
+;   "Each adapter driver should specify the inclusion of the
+;    KS.Registration section in Ks.inf and the WDMAUDIO.Registration
+;    section in Wdmaudio.inf."
+; Without this, the inbox MediaCategories friendly-name table isn't
+; seeded under our device's software key — and KSNODETYPE_SPEAKER
+; (the bridge pin's Category GUID) fails to resolve to "Speakers"
+; during AudioEndpointBuilder classification. The endpoint then
+; stays at the "Internal AUX Jack" placeholder and is created
+; disabled by default. This was the missing piece that left every
+; one of our previous INF / driver / post-install fixes ineffective.
+;
+; [1] https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/installing-core-system-components-for-an-audio-adapter
+Include    = ks.inf, wdmaudio.inf
+Needs      = KS.Registration, WDMAUDIO.Registration
 CopyFiles  = StreamToSpeaker.CopyFiles
 AddReg     = StreamToSpeaker_AddReg
 
@@ -81,7 +98,6 @@ HKR,,FriendlyName,,%StreamToSpeaker.WaveDesc%
 HKR,EP\0,%PKEY_Device_FriendlyName%,,%StreamToSpeaker.EndpointName%
 
 HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_SPEAKER%
-HKR,EP\0,%PKEY_AudioEndpoint_Default%,0x00010001,1
 ; FormFactor = 1 (Speakers). Avoids the FormFactor=0
 ; (RemoteNetworkDevice) privacy gate Windows 11 22H2+ applies to
 ; "remote" audio devices (the "Allow apps and Windows to use this
@@ -165,10 +181,19 @@ KSCATEGORY_REALTIME     = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
 KSNAME_Wave             = "Wave"
 KSNAME_Topology         = "Topology"
 
-; KSNODETYPE_SPEAKER — node type GUID for a speaker association,
-; used so the endpoint's jack-type is "Speaker" rather than the
-; "Line Jack" / "AUX Jack" derived from KSNODETYPE_LINE_CONNECTOR.
-KSNODETYPE_SPEAKER        = "{DFF21BE2-F70F-11D0-B917-00A0C9223196}"
+; KSNODETYPE_SPEAKER — node-type GUID from ksmedia.h. Used as
+; PKEY_AudioEndpoint_Association so the Audio Endpoint Builder
+; classifies this endpoint as a speaker (not a line jack), and so
+; PKEY_AudioDevice_EnableEndpointByDefault's render-flow mask
+; actually matches.
+;
+; IMPORTANT: this GUID is from DEFINE_USB_TERMINAL_GUID(0x0301).
+; The value 0xDFF21BE2 (one hex digit off, USB terminal 0x0202)
+; is KSNODETYPE_DESKTOP_MICROPHONE — using the microphone GUID on
+; a render endpoint makes Windows treat the endpoint as a confused
+; capture-flow device, defeating every default-enable / form-factor
+; override and producing the "Internal AUX Jack" display name.
+KSNODETYPE_SPEAKER        = "{DFF21CE1-F70F-11D0-B917-00A0C9223196}"
 
 ; PKEY_Device_FriendlyName — the user-visible endpoint name that
 ; Sound Settings shows. Setting this on EP\0 at install time
@@ -181,7 +206,6 @@ KSNODETYPE_SPEAKER        = "{DFF21BE2-F70F-11D0-B917-00A0C9223196}"
 PKEY_Device_FriendlyName    = "{a45c254e-df1c-4efd-8020-67d146a850e0},14"
 
 PKEY_AudioEndpoint_Association              = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
-PKEY_AudioEndpoint_Default                  = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
 PKEY_AudioEndpoint_FormFactor               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
 PKEY_AudioEndpoint_Disable_SysFx            = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},5"
 PKEY_AudioEndpoint_Supports_EventDriven_Mode= "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"

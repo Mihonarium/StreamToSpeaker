@@ -7,12 +7,15 @@
  *
  * KS PINs:
  *   PIN 0  KSPIN_TOPOLOGY_WAVEOUT_SOURCE
- *          category KSNODETYPE_ANY, communication NONE, direction OUT-of-filter
- *          (data flows IN to this pin from the wave filter).
+ *          category KSCATEGORY_AUDIO, communication NONE; data flows IN
+ *          to this pin from the wave filter.
  *   PIN 1  KSPIN_TOPOLOGY_LINEOUT_DEST
- *          category KSNODETYPE_LINE_CONNECTOR (we present as line-out;
- *          StreamToSpeaker is a network endpoint, but no node type matches
- *          "wireless speaker" cleanly; line-out is what sysvad uses).
+ *          category KSNODETYPE_SPEAKER. The AudioEndpointBuilder reads
+ *          this GUID to derive the form factor; KSNODETYPE_SPEAKER →
+ *          "Speakers", which is enabled+visible by default.
+ *          KSCATEGORY_AUDIO would yield UnknownFormFactor, which Windows
+ *          creates as disabled+hidden (forcing the user to flip the
+ *          "Allow apps and Windows to use this device" toggle).
  *
  * KS NODEs:
  *   NODE 0 KSNODETYPE_VOLUME

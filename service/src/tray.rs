@@ -36,6 +36,13 @@ pub struct TrayHandle {
     last_label: String,
     last_enabled: bool,
     last_web_enabled: bool,
+
+    // HWND of the GUI window, populated by gui::update on the first
+    // frame. We use raw Win32 ShowWindow to flip visibility because
+    // egui ViewportCommands don't drain on hidden viewports. Until
+    // set, Show window is a no-op (window is already visible on the
+    // very first frame anyway).
+    hwnd: Option<isize>,
 }
 
 struct TrayIds {
@@ -53,7 +60,7 @@ struct TrayIds {
 
 /// Build and install the tray icon. The handle must live as long as
 /// the GUI process (drop it to remove the icon).
-pub fn spawn(app: Arc<App>, _egui_ctx: egui::Context) -> Result<TrayHandle> {
+pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
     let menu = Menu::new();
 
     let status_item = MenuItem::new("(no speaker)", false, None);
@@ -121,6 +128,10 @@ pub fn spawn(app: Arc<App>, _egui_ctx: egui::Context) -> Result<TrayHandle> {
         .build()
         .map_err(|e| anyhow!("tray-icon build: {}", e))?;
 
+    // `egui_ctx` is held by the periodic-repaint tick already; we just
+    // touch it here so the parameter isn't formally unused.
+    let _ = egui_ctx;
+
     Ok(TrayHandle {
         _icon: tray,
         status_item,
@@ -130,10 +141,18 @@ pub fn spawn(app: Arc<App>, _egui_ctx: egui::Context) -> Result<TrayHandle> {
         last_label: String::new(),
         last_enabled: app.is_streaming_enabled(),
         last_web_enabled: web_on,
+        hwnd: None,
     })
 }
 
 impl TrayHandle {
+    /// Set the HWND the tray uses to show / hide the window. Called by
+    /// gui::update on the first frame, once eframe has actually created
+    /// the OS window.
+    pub fn set_hwnd(&mut self, hwnd: isize) {
+        self.hwnd = Some(hwnd);
+    }
+
     /// Drain pending tray and menu events, update the visible bits of
     /// the menu (status label, check state) to reflect the App. Called
     /// from `gui::update()` once per frame; cheap when there's nothing
@@ -183,7 +202,7 @@ impl TrayHandle {
                 ..
             } = ev
             {
-                show_main_window(ctx);
+                self.show_main_window(ctx);
             }
         }
     }
@@ -207,7 +226,7 @@ impl TrayHandle {
                 warn!("toggle failed: {}", e);
             }
         } else if *id == self.ids.switch_speaker || *id == self.ids.show_window {
-            show_main_window(ctx);
+            self.show_main_window(ctx);
         } else if *id == self.ids.open_web {
             if app.is_web_ui_enabled() {
                 open_web_ui(&app.config.advertise_ip, app.config.bind.port());
@@ -219,12 +238,33 @@ impl TrayHandle {
         }
         ctx.request_repaint();
     }
-}
 
-fn show_main_window(ctx: &egui::Context) {
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-    ctx.request_repaint();
+    /// Bring the GUI window to the front. SetWindowPos with
+    /// SWP_SHOWWINDOW flips visibility AND lifts Z-order in one
+    /// synchronous call, sidestepping the eframe ViewportCommand
+    /// queue (which doesn't drain on hidden windows — emilk/egui#5229,
+    /// #3655). SW_RESTORE handles the minimised case. ShowWindowAsync
+    /// is used for SW_RESTORE so a tray-pump invocation from outside
+    /// the owning thread is still safe.
+    fn show_main_window(&self, ctx: &egui::Context) {
+        if let Some(hwnd) = self.hwnd {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, ShowWindowAsync, SetForegroundWindow, IsIconic,
+                HWND_TOP, SW_RESTORE,
+                SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+            };
+            unsafe {
+                let h = hwnd as _;
+                SetWindowPos(h, HWND_TOP, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                if IsIconic(h) != 0 {
+                    ShowWindowAsync(h, SW_RESTORE);
+                }
+                SetForegroundWindow(h);
+            }
+        }
+        ctx.request_repaint();
+    }
 }
 
 fn open_web_ui(advertise_ip: &str, port: u16) {
