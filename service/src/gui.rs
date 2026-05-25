@@ -138,7 +138,10 @@ impl Palette {
 
             text_primary: egui::Color32::from_rgb(0x14, 0x1b, 0x29),
             text_secondary: egui::Color32::from_rgb(0x53, 0x5d, 0x6e),
-            text_tertiary: egui::Color32::from_rgb(0x8a, 0x93, 0xa3),
+            // Bumped from #8a93a3 (which gave ~3:1 on white — fails
+            // WCAG 1.4.3 AA for body text). #6b7488 measures ~4.7:1
+            // against the light card / canvas, passing the 4.5:1 bar.
+            text_tertiary: egui::Color32::from_rgb(0x6b, 0x74, 0x88),
             text_on_accent: egui::Color32::from_rgb(0xff, 0xff, 0xff),
 
             accent: egui::Color32::from_rgb(0x07, 0x83, 0x96),
@@ -163,7 +166,10 @@ impl Palette {
 
             text_primary: egui::Color32::from_rgb(0xea, 0xee, 0xf4),
             text_secondary: egui::Color32::from_rgb(0xa0, 0xa8, 0xb8),
-            text_tertiary: egui::Color32::from_rgb(0x6e, 0x77, 0x88),
+            // Bumped from #6e7788 (which gave ~3.7:1 on the dark card
+            // — fails WCAG 1.4.3 AA). #90a0b8 measures ~5.2:1 against
+            // the dark card.
+            text_tertiary: egui::Color32::from_rgb(0x90, 0xa0, 0xb8),
             text_on_accent: egui::Color32::from_rgb(0x0e, 0x12, 0x1b),
 
             accent: egui::Color32::from_rgb(0x5c, 0xcf, 0xe6),
