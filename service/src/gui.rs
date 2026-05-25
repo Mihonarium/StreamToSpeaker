@@ -98,6 +98,57 @@ impl ThemeMode {
     }
 }
 
+/// Read the Windows accent colour from
+/// `HKCU\\SOFTWARE\\Microsoft\\Windows\\DWM\\AccentColor` (DWORD,
+/// stored 0xAABBGGRR — the alpha+endian convention DWM uses).
+/// Returns the accent as `(R, G, B)` so the caller can derive the
+/// hover / subtle variants. None if the key is missing.
+#[cfg(windows)]
+fn read_system_accent() -> Option<(u8, u8, u8)> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegOpenKeyExW,
+        RegQueryValueExW, REG_DWORD,
+    };
+    let path: Vec<u16> = "SOFTWARE\\Microsoft\\Windows\\DWM\0"
+        .encode_utf16()
+        .collect();
+    let mut hkey: HKEY = std::ptr::null_mut();
+    let r = unsafe {
+        RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_READ, &mut hkey)
+    };
+    if r != 0 {
+        return None;
+    }
+    let val_name: Vec<u16> = "AccentColor\0".encode_utf16().collect();
+    let mut data: u32 = 0;
+    let mut size: u32 = 4;
+    let mut ty: u32 = 0;
+    let r = unsafe {
+        RegQueryValueExW(
+            hkey,
+            val_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            &mut data as *mut u32 as *mut u8,
+            &mut size,
+        )
+    };
+    unsafe { RegCloseKey(hkey) };
+    if r != 0 || ty != REG_DWORD {
+        return None;
+    }
+    // 0xAABBGGRR — extract R, G, B.
+    let r = (data & 0xFF) as u8;
+    let g = ((data >> 8) & 0xFF) as u8;
+    let b = ((data >> 16) & 0xFF) as u8;
+    Some((r, g, b))
+}
+
+#[cfg(not(windows))]
+fn read_system_accent() -> Option<(u8, u8, u8)> {
+    None
+}
+
 #[derive(Copy, Clone)]
 struct Palette {
     // Surfaces
@@ -237,8 +288,8 @@ fn install_symbol_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn apply_theme(ctx: &egui::Context, dark: bool) {
-    let p = if dark { Palette::dark() } else { Palette::light() };
+fn apply_theme(ctx: &egui::Context, dark: bool, system_accent: Option<(u8, u8, u8)>) {
+    let p = palette_for(dark, system_accent);
     let mut visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
 
     visuals.panel_fill = p.canvas;
@@ -314,8 +365,31 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     ctx.set_style(style);
 }
 
-fn palette_for(dark: bool) -> Palette {
-    if dark { Palette::dark() } else { Palette::light() }
+fn palette_for(dark: bool, system_accent: Option<(u8, u8, u8)>) -> Palette {
+    let mut p = if dark { Palette::dark() } else { Palette::light() };
+    if let Some((r, g, b)) = system_accent {
+        let accent = egui::Color32::from_rgb(r, g, b);
+        p.accent = accent;
+        // Hover: nudge towards higher contrast against the card.
+        // Dark theme = brighten the accent; light theme = darken it.
+        p.accent_hover = if dark {
+            egui::Color32::from_rgb(
+                r.saturating_add(30),
+                g.saturating_add(30),
+                b.saturating_add(30),
+            )
+        } else {
+            egui::Color32::from_rgb(
+                r.saturating_sub(30),
+                g.saturating_sub(30),
+                b.saturating_sub(30),
+            )
+        };
+        // Subtle: heavy desaturation toward the card colour for use
+        // as selection / highlight backgrounds.
+        p.accent_subtle = accent.linear_multiply(0.20);
+    }
+    p
 }
 
 // -----------------------------------------------------------------------------
@@ -360,7 +434,11 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
 
             // Initial theme — System (which falls back to Light if the OS
             // doesn't expose a preference).
-            apply_theme(&cc.egui_ctx, ThemeMode::System.resolve(&cc.egui_ctx));
+            apply_theme(
+                &cc.egui_ctx,
+                ThemeMode::System.resolve(&cc.egui_ctx),
+                read_system_accent(),
+            );
             cc.egui_ctx.request_repaint_after(Duration::from_millis(100));
 
             // Capture the HWND now, in CreationContext, before any
@@ -407,6 +485,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 advanced_open: false,
                 onboarding_dismissed: false,
                 last_applied_dark: None,
+                last_applied_accent: None,
                 hwnd,
             }))
         }),
@@ -430,6 +509,11 @@ struct StreamToSpeakerApp {
     /// mode — apply_theme rebuilds the full Style+Visuals every call
     /// and was being run on every frame.
     last_applied_dark: Option<bool>,
+    /// Last-applied system accent (read from registry when ThemeMode
+    /// is System). Compared each frame so a change to Windows'
+    /// Settings → Personalization → Accent color triggers a single
+    /// re-apply, no more.
+    last_applied_accent: Option<(u8, u8, u8)>,
     /// Raw Win32 HWND, captured on the first `update()` from
     /// `eframe::Frame::window_handle()`. Used to drive hide/show via
     /// `ShowWindow` directly — `ViewportCommand::Visible(false)` and
@@ -483,17 +567,24 @@ impl eframe::App for StreamToSpeakerApp {
             self.last_repaint_request = Instant::now();
         }
 
-        // Reapply theme only when the resolved mode actually changes.
-        // apply_theme rebuilds the full Style+Visuals (allocates the
-        // text-style map, all the widget visuals); doing that every
-        // frame at 10 fps was wasteful and could cause focus loss on
-        // some egui widgets.
+        // Reapply theme only when the resolved mode actually changes
+        // or the OS accent shifts (System mode follows the Windows
+        // accent colour live). apply_theme rebuilds the full
+        // Style+Visuals (allocates text-style map, all the widget
+        // visuals); doing that every frame at 10 fps was wasteful
+        // and could cause focus loss on some egui widgets.
         let dark = self.theme_mode.resolve(ctx);
-        if self.last_applied_dark != Some(dark) {
-            apply_theme(ctx, dark);
+        let accent = if matches!(self.theme_mode, ThemeMode::System) {
+            read_system_accent()
+        } else {
+            None
+        };
+        if self.last_applied_dark != Some(dark) || self.last_applied_accent != accent {
+            apply_theme(ctx, dark, accent);
             self.last_applied_dark = Some(dark);
+            self.last_applied_accent = accent;
         }
-        let p = palette_for(dark);
+        let p = palette_for(dark, accent);
 
         if let Some(tray) = self.tray.as_mut() {
             tray.pump(&self.app, ctx);
