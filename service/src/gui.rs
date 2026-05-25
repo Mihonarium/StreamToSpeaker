@@ -395,13 +395,14 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 }
             }
 
+            let skip_close_confirmation = app_for_eframe.is_always_minimise_to_tray();
             Ok(Box::new(StreamToSpeakerApp {
                 app: app_for_eframe,
                 last_repaint_request: Instant::now(),
                 tray,
                 frame_count: 0,
                 confirm_close_open: false,
-                skip_close_confirmation: app_for_eframe.is_always_minimise_to_tray(),
+                skip_close_confirmation,
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
                 onboarding_dismissed: false,
