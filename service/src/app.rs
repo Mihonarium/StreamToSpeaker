@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,6 +44,10 @@ pub struct AppConfig {
     pub no_silence_injection: bool,
     pub no_discovery: bool,
     pub web_enabled: bool,
+    /// Local IPv4 interface the SSDP scanner binds to (same iface the
+    /// periodic discovery loop uses). Stored so the GUI's Rescan button
+    /// can fire a one-shot scan on the same network.
+    pub ssdp_iface: Option<Ipv4Addr>,
 }
 
 /// Snapshot of the speaker list + currently-active id. Cheap to compute
@@ -177,6 +181,31 @@ impl App {
         *self.last_speaker_id.lock().unwrap() = Some(id.to_string());
         self.streaming_enabled.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Fire a one-shot SSDP M-SEARCH on the same interface the periodic
+    /// loop uses. Runs on a detached thread because `discover_once`
+    /// blocks for ~3 s waiting for responses; the GUI button doesn't
+    /// want to freeze. Results land in `DiscoveryState::replace` and
+    /// are picked up by the next `speaker_view()` call.
+    pub fn trigger_rescan(&self) {
+        let Some(discovery) = self.discovery.clone() else {
+            warn!("trigger_rescan: discovery disabled");
+            return;
+        };
+        let iface = self.config.ssdp_iface;
+        std::thread::Builder::new()
+            .name("stream-to-speaker-rescan".to_string())
+            .spawn(move || {
+                match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
+                    Ok(found) => {
+                        info!("manual rescan: {} renderer(s) found", found.len());
+                        discovery.replace(found);
+                    }
+                    Err(e) => warn!("manual rescan failed: {}", e),
+                }
+            })
+            .ok();
     }
 
     /// Resync — UPnP Stop+Play on the current speaker. Drops Sonos's

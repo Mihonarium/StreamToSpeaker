@@ -780,8 +780,12 @@ impl StreamToSpeakerApp {
             ui.horizontal(|ui| {
                 section_label(ui, p, "Speakers");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    secondary_button(ui, p, "↻  Rescan", 92.0)
-                        .on_hover_text("Re-trigger SSDP discovery now (otherwise runs every few minutes)");
+                    if secondary_button(ui, p, "↻  Rescan", 92.0)
+                        .on_hover_text("Re-trigger SSDP discovery now (otherwise runs every few minutes)")
+                        .clicked()
+                    {
+                        self.app.trigger_rescan();
+                    }
                 });
             });
             ui.add_space(6.0);

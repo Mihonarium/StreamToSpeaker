@@ -374,12 +374,16 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         None => stream_to_speaker::app::default_advertise_ip()?,
     };
 
+    let ssdp_iface = if cli.no_discovery {
+        None
+    } else {
+        stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind)
+    };
+
     let discovery = if cli.no_discovery {
         None
     } else {
         let state = DiscoveryState::new();
-        let ssdp_iface =
-            stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind);
         spawn_discovery(
             state.clone(),
             Duration::from_secs(cli.ssdp_interval * 60),
@@ -401,6 +405,7 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         no_silence_injection: cli.no_silence_injection,
         no_discovery: cli.no_discovery,
         web_enabled: cli.web,
+        ssdp_iface,
     };
 
     Ok(App::new(config, discovery))
