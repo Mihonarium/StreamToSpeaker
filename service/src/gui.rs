@@ -739,8 +739,8 @@ impl StreamToSpeakerApp {
             ui.horizontal(|ui| {
                 section_label(ui, p, "Getting started");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if secondary_button(ui, p, "Got it", 72.0)
-                        .on_hover_text("Hide this card — won't show again on future launches")
+                    if secondary_button(ui, p, "Hide this guide", 120.0)
+                        .on_hover_text("Hide this guide. It won't reappear on future launches.")
                         .clicked()
                     {
                         self.onboarding_dismissed = true;
@@ -753,25 +753,24 @@ impl StreamToSpeakerApp {
             let steps: &[(&str, &str, &str)] = &[
                 (
                     "1",
-                    "Pick the audio output in Windows",
-                    "Open Windows Sound Settings (right-click the speaker icon \
-                     in the taskbar → Sound settings) and choose 'Stream To \
-                     Speaker' as the output device, or use Volume Mixer to \
-                     route just one app to it.",
+                    "Set Stream To Speaker as your Windows audio output",
+                    "Right-click the speaker icon in your taskbar and choose \
+                     Open sound settings. Under Output, pick Stream To Speaker. \
+                     (To route only one app, open Volume mixer instead and set \
+                     that app's output to Stream To Speaker.)",
                 ),
                 (
                     "2",
-                    "Choose a speaker below",
-                    "Speakers on the same network appear in the list. Click \
-                     one to start streaming — playback starts within a \
-                     second or two.",
+                    "Choose a speaker",
+                    "Speakers on your network appear in the list below. Click \
+                     one to start streaming.",
                 ),
                 (
                     "3",
-                    "Tune the latency if needed",
-                    "If the speaker lags too far behind the picture, use the \
-                     Latency buttons to trim. Resync is the 'fix it now' \
-                     option (brief glitch but resets everything).",
+                    "Adjust the latency if audio drifts",
+                    "If audio lags the picture, use the Trim buttons. If it \
+                     glitches, use the Pad buttons. Resync gives an instant \
+                     fix at the cost of a brief audio click.",
                 ),
             ];
 

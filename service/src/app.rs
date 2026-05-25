@@ -217,13 +217,23 @@ impl App {
         *guard = Some(new_session);
         *self.last_speaker_id.lock().unwrap() = Some(id.to_string());
         self.streaming_enabled.store(true, Ordering::Release);
-        // Persist so the next launch can auto-reconnect to this speaker.
-        // Saved as a side-effect of an explicit pick — see
-        // user_config.rs for the file location.
+        // Persist so the next launch can auto-reconnect, and dismiss
+        // the onboarding card — once the user has successfully bound
+        // a speaker (whether manually or via auto-reconnect), step 2
+        // of the getting-started guide is done and the card is just
+        // noise on every subsequent launch.
         {
             let mut uc = self.user_config.lock().unwrap();
+            let mut changed = false;
             if uc.last_speaker_id.as_deref() != Some(id) {
                 uc.last_speaker_id = Some(id.to_string());
+                changed = true;
+            }
+            if !uc.onboarding_dismissed {
+                uc.onboarding_dismissed = true;
+                changed = true;
+            }
+            if changed {
                 uc.save();
             }
         }
