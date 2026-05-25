@@ -590,15 +590,20 @@ fn card<R>(ui: &mut egui::Ui, p: &Palette, content: impl FnOnce(&mut egui::Ui) -
         .inner
 }
 
+/// Card-level section heading. Fluent T2 Body Strong (14 px Semibold)
+/// in `text_primary`, sentence case. The previous treatment was an
+/// 11-px uppercase letter-spaced "eyebrow" — but used standalone
+/// (i.e. with no real heading underneath) the eyebrow IS the heading,
+/// which violates Fluent T3 (nothing below 12 px Regular) and makes
+/// section titles disappear from quick-scan reads.
 fn section_label(ui: &mut egui::Ui, p: &Palette, text: &str) {
     ui.label(
-        egui::RichText::new(text.to_uppercase())
-            .size(11.0)
+        egui::RichText::new(text)
+            .size(14.0)
             .strong()
-            .color(p.text_tertiary)
-            .extra_letter_spacing(1.6),
+            .color(p.text_primary),
     );
-    ui.add_space(2.0);
+    ui.add_space(sp::XS);
 }
 
 /// Tag any clickable Response with the pointing-hand cursor on hover.
@@ -1099,26 +1104,27 @@ impl StreamToSpeakerApp {
                     egui::Stroke::new(2.0, p.accent),
                 );
             }
-            // Paint label + chevron. Measure the label's rect so the
-            // chevron lands immediately to its right (Gestalt
-            // proximity), with a one-token gap between them.
+            // Paint label + chevron. Matches the new section_label
+            // (14 px Body Strong, sentence case, primary text). The
+            // chevron lands immediately to the right of the label
+            // text (Gestalt proximity).
             let label_font =
-                egui::FontId::new(11.0, egui::FontFamily::Proportional);
+                egui::FontId::new(14.0, egui::FontFamily::Proportional);
             let chevron_font =
                 egui::FontId::new(14.0, egui::FontFamily::Proportional);
             let label_rect = ui.painter().text(
-                egui::pos2(rect.left() + sp::XS, rect.center().y),
+                egui::pos2(rect.left(), rect.center().y),
                 egui::Align2::LEFT_CENTER,
-                "ADVANCED",
+                "Advanced",
                 label_font,
-                p.text_tertiary,
+                p.text_primary,
             );
             ui.painter().text(
                 egui::pos2(label_rect.right() + sp::XS, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 chevron,
                 chevron_font,
-                p.text_tertiary,
+                p.text_secondary,
             );
 
             if !self.advanced_open {
