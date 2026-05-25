@@ -680,16 +680,81 @@ fn danger_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) ->
 impl StreamToSpeakerApp {
     fn show_header(&mut self, ui: &mut egui::Ui, p: &Palette) {
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Stream To Speaker")
-                    .size(20.0)
-                    .strong()
-                    .color(p.text_primary),
-            );
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("Stream To Speaker")
+                        .size(20.0)
+                        .strong()
+                        .color(p.text_primary),
+                );
+                ui.label(
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .size(11.0)
+                        .color(p.text_tertiary),
+                );
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.show_help_menu(ui, p);
+                ui.add_space(sp::XS);
                 self.show_theme_toggle(ui, p);
             });
         });
+    }
+
+    fn show_help_menu(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // "?" button → popup with About / Open log folder / Report an
+        // issue. Addresses the audit's "no version label, no help link,
+        // no logs link" finding (Heuristics F-22).
+        let popup_id = ui.id().with("help_popup");
+        let btn = egui::Button::new(
+            egui::RichText::new("?")
+                .size(14.0)
+                .strong()
+                .color(p.text_secondary),
+        )
+        .fill(p.card)
+        .stroke(egui::Stroke::new(1.0, p.divider))
+        .rounding(RADIUS_CONTROL);
+        let resp = clickable(ui.add_sized([CONTROL_HEIGHT, CONTROL_HEIGHT], btn))
+            .on_hover_text("About + log folder + report an issue");
+        if resp.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(popup_id));
+        }
+        egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            &resp,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(240.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Stream To Speaker v{}",
+                        env!("CARGO_PKG_VERSION")
+                    ))
+                    .strong()
+                    .color(p.text_primary),
+                );
+                ui.add_space(sp::XS);
+                ui.separator();
+                if ui.button("Open log folder").clicked() {
+                    if let Some(dir) = crate::log_dir() {
+                        // explorer.exe accepts a path arg and opens
+                        // Windows Explorer at that location.
+                        let _ = std::process::Command::new("explorer")
+                            .arg(&dir)
+                            .spawn();
+                    }
+                    ui.memory_mut(|m| m.close_popup());
+                }
+                if ui.button("Report an issue on GitHub").clicked() {
+                    let _ = open_url(
+                        "https://github.com/Mihonarium/StreamToSpeaker/issues/new",
+                    );
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            },
+        );
     }
 
     fn show_theme_toggle(&mut self, ui: &mut egui::Ui, p: &Palette) {

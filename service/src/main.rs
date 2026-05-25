@@ -186,13 +186,34 @@ fn main() {
     let mut builder = env_logger::Builder::from_default_env();
     builder
         .filter_level(cli.log_level.parse().unwrap_or(log::LevelFilter::Info))
-        .format_timestamp_millis()
-        .init();
+        .format_timestamp_millis();
+    // GUI mode has no console (windows_subsystem = "windows"), so
+    // env_logger's default stderr target writes to a dead handle.
+    // Pipe to %LOCALAPPDATA%\StreamToSpeaker\stream-to-speaker.log so
+    // the user (and the GUI's Help menu) can find the log later.
+    // Headless mode keeps stderr so logs still appear in the attached
+    // parent console.
+    if !cli.headless {
+        if let Some(file) = open_log_file() {
+            builder.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+    }
+    builder.init();
 
     if let Err(e) = run(cli) {
         error!("fatal: {:#}", e);
         std::process::exit(1);
     }
+}
+
+fn open_log_file() -> Option<std::fs::File> {
+    let mut path = stream_to_speaker::log_dir()?;
+    path.push("stream-to-speaker.log");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .ok()
 }
 
 /// Attach this process to its parent's console, if launched from a
