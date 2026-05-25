@@ -35,7 +35,7 @@ jobs:
       #   viversion — strict X.Y.Z.W numeric, required for the Win32
       #               VersionInfo resource Inno Setup bakes into setup.exe
       # Tag push  v1.2.3   → version 1.2.3,        viversion 1.2.3.0
-      # Otherwise          → version 0.2.0-<sha>,  viversion 0.2.0.0
+      # Otherwise          → version 0.1.0-<sha>,  viversion 0.1.0.0
       # -----------------------------------------------------------------
       - name: Compute version
         id: ver
@@ -48,7 +48,7 @@ jobs:
               $v = "${{ github.ref }}" -replace "refs/tags/v", ""
           } else {
               $sha = "${{ github.sha }}".Substring(0, 7)
-              $v = "0.2.0-$sha"
+              $v = "0.1.0-$sha"
           }
           # Numeric prefix of $v, padded to 4 parts.
           $prefix = ($v -split "[-+]")[0]
@@ -190,7 +190,7 @@ jobs:
 
       # Stamp the driver build number with the git commit count so
       # every build is uniquely identifiable from:
-      #   - The INF's DriverVer (<prefix>.N — what Device Manager and
+      #   - The INF's DriverVer (1.0.0.N — what Device Manager and
       #     PnP version-comparison use)
       #   - The service log ('StreamToSpeaker driver opened build=N')
       # Both come from the same git rev-list count, so they stay in
@@ -206,7 +206,7 @@ jobs:
           $content = Get-Content $path -Raw
           $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${count}u"
           Set-Content -Path $path -Value $new -NoNewline
-          Write-Host "Driver build stamped: $count (driver.h + INF DriverVer prefix.$count)"
+          Write-Host "Driver build stamped: $count (driver.h + INF DriverVer 1.0.0.$count)"
           "build=$count" >> $env:GITHUB_OUTPUT
 
       - name: Build driver (Release|x64, test-signed)
@@ -288,6 +288,38 @@ jobs:
             "installer\StreamToSpeaker.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
 
+      # Compute SHA256 of every shipped artifact so users can verify
+      # downloads. Hashes go three places:
+      #   - Job log (visible in raw CI output)
+      #   - GitHub step summary (rendered at the top of the workflow run
+      #     page — users can read it without expanding any step)
+      #   - .sha256 sidecar files alongside the .exe (attached to the
+      #     GitHub Release on tag pushes and uploaded as artifacts)
+      - name: Compute artifact SHA256 hashes
+        shell: pwsh
+        run: |
+          $items = @(
+              Get-ChildItem -Path "installer\out" -Filter "StreamToSpeakerSetup-*.exe" -ErrorAction SilentlyContinue
+              Get-Item "service\target\release\stream-to-speaker.exe" -ErrorAction SilentlyContinue
+              Get-ChildItem -Path "driver\x64\Release" -Recurse -Filter "StreamToSpeaker.sys" -ErrorAction SilentlyContinue | Select-Object -First 1
+          ) | Where-Object { $_ }
+          if (-not $items) { throw "No artifacts found to hash" }
+
+          $summary = @()
+          $summary += "## SHA256 hashes"
+          $summary += ""
+          $summary += "| File | SHA256 |"
+          $summary += "| --- | --- |"
+          foreach ($item in $items) {
+              $hash = (Get-FileHash -Algorithm SHA256 -Path $item.FullName).Hash.ToLower()
+              Write-Host "$hash  $($item.Name)"
+              # Sidecar file in the standard `<hash>  <filename>` shasum format.
+              $sidecar = "$($item.FullName).sha256"
+              "$hash  $($item.Name)" | Set-Content -Path $sidecar -Encoding ascii -NoNewline
+              $summary += "| ``$($item.Name)`` | ``$hash`` |"
+          }
+          $summary -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
       # -----------------------------------------------------------------
       # Publish
       # -----------------------------------------------------------------
@@ -295,7 +327,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: StreamToSpeakerSetup-${{ steps.ver.outputs.version }}
-          path: installer/out/StreamToSpeakerSetup-*.exe
+          path: |
+            installer/out/StreamToSpeakerSetup-*.exe
+            installer/out/StreamToSpeakerSetup-*.exe.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -308,11 +342,14 @@ jobs:
             driver/x64/Release/StreamToSpeaker/StreamToSpeaker.inf
             driver/x64/Release/StreamToSpeaker/StreamToSpeaker.cat
             service/target/release/stream-to-speaker.exe
+            service/target/release/stream-to-speaker.exe.sha256
           if-no-files-found: warn
 
       - name: Attach to GitHub Release (tag push only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: installer/out/StreamToSpeakerSetup-*.exe
+          files: |
+            installer/out/StreamToSpeakerSetup-*.exe
+            installer/out/StreamToSpeakerSetup-*.exe.sha256
           generate_release_notes: true
