@@ -1,6 +1,6 @@
 [package]
 name = "stream-to-speaker"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Stream To Speaker — user-mode bridge between a Windows virtual audio driver (or WASAPI loopback) and any UPnP/OpenHome network speaker (Sonos, IKEA StreamToSpeaker, etc)."
@@ -36,6 +36,30 @@ percent-encoding = "2"
 # the obvious fit.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# AirPlay support.
+#
+# mDNS-sd: pure-Rust mDNS browser for `_raop._tcp` / `_airplay._tcp`
+# discovery. Avoids the system Bonjour dep (mDNSResponder is not present
+# on stock Windows, and we don't want to ship the Apple installer).
+mdns-sd = { version = "0.13", default-features = false, features = ["async"] }
+# mdns-sd's receiver is a `flume::Receiver<ServiceEvent>` — pull flume
+# in directly so we can name the error type without leaking the transit
+# crate through mdns-sd's API surface.
+flume = { version = "0.11", default-features = false }
+# RSA-OAEP encryption of the per-session AES key, sent in the SDP
+# `rsaaeskey` attribute. We use the public "Apple AirTunes" RSA key
+# whose private half lives on every RAOP receiver (AirPort Express
+# firmware leak, ~2004). Pure-Rust — no OpenSSL on the Windows build.
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+# AES-128-CBC for the audio payload encryption layer.
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
+# Hash for RSA-OAEP MGF1 — RAOP locks this to SHA-1 (legacy).
+sha1 = { version = "0.10", default-features = false }
+# Base64 for SDP attributes + Apple-Challenge response.
+base64 = "0.22"
+# RNG for AES key + IV + RTP SSRC + Apple-Challenge nonces.
+rand = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 # WASAPI loopback fallback. cpal supports WASAPI loopback on Windows.

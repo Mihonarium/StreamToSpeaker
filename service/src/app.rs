@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::airplay::{
+    AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession, AirPlaySessionConfig,
+};
 use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
@@ -31,7 +34,71 @@ pub struct RendererSession {
     pub stream_uri: String,
 }
 
-pub type SharedSession = Arc<Mutex<Option<RendererSession>>>;
+/// Active session — either UPnP (pull-style, speaker fetches our HTTP
+/// stream) or AirPlay (push-style, we send RTP/UDP to the speaker).
+/// At most one of these is live at a time; switching tears down the
+/// old and brings up the new.
+pub enum ActiveSession {
+    Upnp(RendererSession),
+    AirPlay(AirPlaySession),
+}
+
+impl ActiveSession {
+    pub fn stable_id(&self) -> String {
+        match self {
+            ActiveSession::Upnp(s) => s.renderer.stable_id(),
+            ActiveSession::AirPlay(s) => s.renderer.stable_id(),
+        }
+    }
+
+    pub fn friendly_name(&self) -> String {
+        match self {
+            ActiveSession::Upnp(s) => s.renderer.friendly_name.clone(),
+            ActiveSession::AirPlay(s) => s.renderer.friendly_name.clone(),
+        }
+    }
+
+    pub fn ip(&self) -> IpAddr {
+        match self {
+            ActiveSession::Upnp(s) => s.renderer.ip,
+            ActiveSession::AirPlay(s) => s.renderer.ip,
+        }
+    }
+
+    /// Tear down — drops GENA subscription / RTSP connection /
+    /// background threads. Best-effort; receivers eventually time out
+    /// anyway, so failures here aren't fatal.
+    pub fn stop(self) {
+        match self {
+            ActiveSession::Upnp(s) => stop_session(&s),
+            ActiveSession::AirPlay(s) => s.stop(),
+        }
+    }
+
+    /// Push a volume change to the speaker. UPnP path goes via
+    /// SetVolume SOAP; AirPlay path goes via SET_PARAMETER over the
+    /// existing RTSP socket.
+    pub fn set_volume_pct(&self, pct: u32) -> Result<()> {
+        match self {
+            ActiveSession::Upnp(s) => {
+                upnp::set_volume(&s.renderer.rendering_control_control_url, pct)
+            }
+            ActiveSession::AirPlay(s) => s.set_volume_pct(pct),
+        }
+    }
+
+    /// Push a mute state to the speaker.
+    pub fn set_mute(&self, muted: bool) -> Result<()> {
+        match self {
+            ActiveSession::Upnp(s) => {
+                upnp::set_mute(&s.renderer.rendering_control_control_url, muted)
+            }
+            ActiveSession::AirPlay(s) => s.set_mute(muted),
+        }
+    }
+}
+
+pub type SharedSession = Arc<Mutex<Option<ActiveSession>>>;
 
 /// Stable summary of the runtime config that the GUI / tray can render.
 #[derive(Clone, Debug)]
@@ -65,6 +132,7 @@ pub struct App {
 
     // ---- Discovery + active session ----
     pub discovery: Option<Arc<DiscoveryState>>,
+    pub airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     pub session: SharedSession,
     /// Remembered speaker id so Disable→Enable can rebind to the same one.
     pub last_speaker_id: Mutex<Option<String>>,
@@ -106,7 +174,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: AppConfig, discovery: Option<Arc<DiscoveryState>>) -> Arc<Self> {
+    pub fn new(
+        config: AppConfig,
+        discovery: Option<Arc<DiscoveryState>>,
+        airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
+    ) -> Arc<Self> {
         let web_initial = config.web_enabled;
         let user_config = UserConfig::load();
         // Seed last_speaker_id from disk so that, even before any user
@@ -116,6 +188,7 @@ impl App {
         Arc::new(Self {
             config,
             discovery,
+            airplay_discovery,
             session: Arc::new(Mutex::new(None)),
             last_speaker_id,
             hub: StreamHub::new(),
@@ -162,26 +235,68 @@ impl App {
     // -------------------------------------------------------------------
 
     /// Snapshot of discovered speakers and which one (if any) is active.
+    /// Merges the UPnP and AirPlay discovery lists; the GUI sees a
+    /// single sorted list with one row per speaker regardless of which
+    /// protocol it speaks.
     pub fn speaker_view(&self) -> SpeakerView {
-        let active_id = self.session.lock().unwrap().as_ref().map(|s| s.renderer.stable_id());
-        let speakers = match self.discovery.as_ref() {
-            None => Vec::new(),
-            Some(d) => d.renderers().into_iter().map(|r| {
+        let active_id = self.session.lock().unwrap().as_ref().map(|s| s.stable_id());
+        let mut speakers: Vec<SpeakerInfo> = Vec::new();
+
+        if let Some(d) = self.discovery.as_ref() {
+            for r in d.renderers() {
                 let id = r.stable_id();
                 let active = active_id.as_deref() == Some(id.as_str());
-                SpeakerInfo {
+                speakers.push(SpeakerInfo {
                     id,
                     friendly_name: r.friendly_name,
                     ip: r.ip.to_string(),
                     active,
-                }
-            }).collect(),
-        };
+                });
+            }
+        }
+        if let Some(d) = self.airplay_discovery.as_ref() {
+            for r in d.renderers() {
+                let id = r.stable_id();
+                let active = active_id.as_deref() == Some(id.as_str());
+                // Mark unsupported speakers (e.g. password-protected)
+                // with a parenthetical so the user can tell why
+                // selection might fail.
+                let name = if r.is_supported() {
+                    format!("{} (AirPlay)", r.friendly_name)
+                } else if r.password_protected {
+                    format!("{} (AirPlay, password-protected)", r.friendly_name)
+                } else {
+                    format!("{} (AirPlay, unsupported)", r.friendly_name)
+                };
+                speakers.push(SpeakerInfo {
+                    id,
+                    friendly_name: name,
+                    ip: r.ip.to_string(),
+                    active,
+                });
+            }
+        }
+        speakers.sort_by(|a, b| a.friendly_name.cmp(&b.friendly_name));
         SpeakerView { speakers, active_id }
     }
 
+    /// Returns the active UPnP renderer if the session is UPnP-flavoured.
+    /// Returns `None` for AirPlay sessions or no session — callers that
+    /// need the SOAP URL only work with UPnP anyway.
     pub fn current_renderer(&self) -> Option<Renderer> {
-        self.session.lock().unwrap().as_ref().map(|s| s.renderer.clone())
+        match self.session.lock().unwrap().as_ref() {
+            Some(ActiveSession::Upnp(s)) => Some(s.renderer.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns the active AirPlay renderer if the session is AirPlay-
+    /// flavoured. Mirror of `current_renderer` for the AirPlay path.
+    pub fn current_airplay_renderer(&self) -> Option<AirPlayRenderer> {
+        match self.session.lock().unwrap().as_ref() {
+            Some(ActiveSession::AirPlay(s)) => Some(s.renderer.clone()),
+            _ => None,
+        }
     }
 
     // -------------------------------------------------------------------
@@ -191,30 +306,25 @@ impl App {
     /// Switch to the speaker with the given stable id. Tears down any
     /// existing session, starts a new one. Remembers the id so Disable→
     /// Enable rebinds to the same speaker.
+    ///
+    /// Dispatches based on the id prefix:
+    ///   * `"airplay:<mac>"` → AirPlay RAOP session
+    ///   * anything else     → UPnP / OpenHome session
     pub fn select_speaker(&self, id: &str) -> Result<(), String> {
-        let discovery = self.discovery.as_ref()
-            .ok_or_else(|| "discovery disabled".to_string())?;
-        let Some(new_r) = discovery.find_by_id(id) else {
-            return Err(format!("no speaker with id {:?}", id));
+        let new_session = if id.starts_with("airplay:") {
+            self.start_airplay(id)?
+        } else {
+            self.start_upnp(id)?
         };
-        let didl = upnp::didl_lite_metadata(
-            &self.config.stream_uri,
-            PRODUCT_NAME,
-            self.config.initial_buffer_ms,
-        );
-        let new_session = start_session(
-            new_r,
-            &self.config.stream_uri,
-            &didl,
-            &self.config.callback_url,
-        ).map_err(|e| format!("{:#}", e))?;
+
         let mut guard = self.session.lock().unwrap();
         if let Some(old) = guard.take() {
             drop(guard);
-            stop_session(&old);
+            old.stop();
             guard = self.session.lock().unwrap();
         }
         *guard = Some(new_session);
+        drop(guard);
         *self.last_speaker_id.lock().unwrap() = Some(id.to_string());
         self.streaming_enabled.store(true, Ordering::Release);
         // Persist so the next launch can auto-reconnect to this speaker.
@@ -228,6 +338,59 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn start_upnp(&self, id: &str) -> Result<ActiveSession, String> {
+        let discovery = self
+            .discovery
+            .as_ref()
+            .ok_or_else(|| "UPnP discovery disabled".to_string())?;
+        let Some(new_r) = discovery.find_by_id(id) else {
+            return Err(format!("no UPnP speaker with id {:?}", id));
+        };
+        let didl = upnp::didl_lite_metadata(
+            &self.config.stream_uri,
+            PRODUCT_NAME,
+            self.config.initial_buffer_ms,
+        );
+        let session = start_session(
+            new_r,
+            &self.config.stream_uri,
+            &didl,
+            &self.config.callback_url,
+        )
+        .map_err(|e| format!("{:#}", e))?;
+        Ok(ActiveSession::Upnp(session))
+    }
+
+    fn start_airplay(&self, id: &str) -> Result<ActiveSession, String> {
+        let discovery = self
+            .airplay_discovery
+            .as_ref()
+            .ok_or_else(|| "AirPlay discovery disabled".to_string())?;
+        let Some(renderer) = discovery.find_by_id(id) else {
+            return Err(format!("no AirPlay speaker with id {:?}", id));
+        };
+
+        // Resolve a local IPv4 to bind UDP sockets to + advertise in
+        // SDP. Prefer the explicit `advertise_ip` (which the user can
+        // override). It must be reachable by the receiver, so falling
+        // back to a 0.0.0.0 here would be wrong.
+        let local_ip: IpAddr = self
+            .config
+            .advertise_ip
+            .parse()
+            .map_err(|e| format!("parsing advertise_ip {:?}: {}", self.config.advertise_ip, e))?;
+
+        let samples_rx = self.hub.subscribe();
+        let session = AirPlaySession::start(AirPlaySessionConfig {
+            renderer,
+            local_ip,
+            samples_rx,
+            initial_volume: Some(80),
+        })
+        .map_err(|e| format!("{:#}", e))?;
+        Ok(ActiveSession::AirPlay(session))
     }
 
     /// Fire a one-shot SSDP M-SEARCH on the same interface the periodic
@@ -255,16 +418,45 @@ impl App {
             .ok();
     }
 
-    /// Resync — UPnP Stop+Play on the current speaker. Drops Sonos's
-    /// accumulated prebuffer; next Play starts fresh with a minimal one.
+    /// Resync — drop the speaker's accumulated prebuffer.
+    ///
+    /// UPnP: Stop + Play, Sonos picks a fresh prebuffer level.
+    /// AirPlay: tear down and rebuild the session, which is the only
+    /// reliable way to flush RAOP's own jitter buffer (FLUSH is more
+    /// surgical but receivers differ on what it actually clears).
     pub fn resync(&self) -> Result<(), String> {
-        let r = self.current_renderer().ok_or_else(|| "no active speaker".to_string())?;
-        info!("resync: UPnP Stop + Play on {}", r.friendly_name);
-        if let Err(e) = upnp::stop(&r.av_transport_control_url) {
-            debug!("resync stop ignored: {}", e);
+        // Look at the active session under the lock briefly to figure
+        // out the dispatch, but don't hold the lock during the slow
+        // network calls.
+        enum Kind {
+            Upnp(Renderer),
+            AirPlay(String),
         }
-        std::thread::sleep(Duration::from_millis(100));
-        upnp::play(&r.av_transport_control_url).map_err(|e| format!("play failed: {:#}", e))
+        let kind = {
+            let guard = self.session.lock().unwrap();
+            match guard.as_ref() {
+                Some(ActiveSession::Upnp(s)) => Kind::Upnp(s.renderer.clone()),
+                Some(ActiveSession::AirPlay(s)) => {
+                    Kind::AirPlay(s.renderer.stable_id())
+                }
+                None => return Err("no active speaker".to_string()),
+            }
+        };
+        match kind {
+            Kind::Upnp(r) => {
+                info!("resync: UPnP Stop + Play on {}", r.friendly_name);
+                if let Err(e) = upnp::stop(&r.av_transport_control_url) {
+                    debug!("resync stop ignored: {}", e);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                upnp::play(&r.av_transport_control_url)
+                    .map_err(|e| format!("play failed: {:#}", e))
+            }
+            Kind::AirPlay(id) => {
+                info!("resync: AirPlay tear-down + reconnect for {}", id);
+                self.select_speaker(&id)
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -282,7 +474,7 @@ impl App {
         if !enabled {
             let s = self.session.lock().unwrap().take();
             if let Some(s) = s {
-                stop_session(&s);
+                s.stop();
             }
             info!("streaming disabled");
         } else {

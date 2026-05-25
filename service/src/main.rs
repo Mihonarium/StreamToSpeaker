@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use stream_to_speaker::airplay::{spawn_airplay_discovery, AirPlayDiscoveryState};
 use stream_to_speaker::app::{App, AppConfig};
 use stream_to_speaker::audio_source::AudioSource;
 use stream_to_speaker::gena::parse_rendering_notify;
@@ -126,6 +127,13 @@ struct Cli {
     /// Skip SSDP discovery; serve HTTP only.
     #[arg(long, default_value_t = false)]
     no_discovery: bool,
+
+    /// Skip AirPlay (mDNS) discovery. SSDP/UPnP is unaffected. Use
+    /// this if mDNS is noisy / blocked on the local network or if you
+    /// only ever stream to Sonos via UPnP and want to skip the
+    /// background browse traffic.
+    #[arg(long, default_value_t = false)]
+    no_airplay: bool,
 
     /// Disable silence injection (will send literal zeros during silence).
     #[arg(long, default_value_t = false)]
@@ -379,10 +387,10 @@ fn run_gui_mode(_app: Arc<App>, _no_tray: bool) -> Result<()> {
 }
 
 fn shutdown_cleanup(app: &Arc<App>) {
-    info!("shutdown: unsubscribing GENA");
+    info!("shutdown: tearing down active session");
     let final_session = app.session.lock().unwrap().take();
     if let Some(s) = final_session {
-        s.gena.unsubscribe();
+        s.stop();
     }
     info!("shutdown: complete");
 }
@@ -421,6 +429,18 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         Some(state)
     };
 
+    let airplay_discovery = if cli.no_airplay {
+        None
+    } else {
+        let state = AirPlayDiscoveryState::new();
+        if let Err(e) = spawn_airplay_discovery(state.clone(), ssdp_iface) {
+            warn!("AirPlay discovery failed to start: {} (continuing without it)", e);
+            None
+        } else {
+            Some(state)
+        }
+    };
+
     let stream_uri = format!("http://{}:{}/stream.raw", advertise_ip, cli.port);
     let callback_url = format!("http://{}:{}/gena", advertise_ip, cli.port);
 
@@ -437,7 +457,7 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         ssdp_iface,
     };
 
-    Ok(App::new(config, discovery))
+    Ok(App::new(config, discovery, airplay_discovery))
 }
 
 // -----------------------------------------------------------------------------
@@ -610,23 +630,23 @@ fn spawn_driver_event_consumer(app: Arc<App>, cli: &Cli) {
                     DriverEvent::VolumeChanged { level_millibels } => {
                         if let Some(level) = app.vsync.driver_changed(level_millibels) {
                             info!("driver -> speaker: volume {} (mb={})", level, level_millibels);
-                            if let Some(r) = app.current_renderer() {
-                                if let Err(e) = stream_to_speaker::upnp::set_volume(
-                                    &r.rendering_control_control_url,
-                                    level,
-                                ) {
-                                    warn!("upnp set_volume failed: {}", e);
+                            // Dispatch to whichever session kind is
+                            // active. The ActiveSession enum hides the
+                            // SOAP-vs-RTSP difference.
+                            let guard = app.session.lock().unwrap();
+                            if let Some(s) = guard.as_ref() {
+                                if let Err(e) = s.set_volume_pct(level) {
+                                    warn!("set_volume failed: {}", e);
                                 }
                             }
                         }
                     }
                     DriverEvent::MuteChanged { muted } => {
                         info!("driver -> speaker: mute={}", muted);
-                        if let Some(r) = app.current_renderer() {
-                            if let Err(e) =
-                                stream_to_speaker::upnp::set_mute(&r.rendering_control_control_url, muted)
-                            {
-                                warn!("upnp set_mute failed: {}", e);
+                        let guard = app.session.lock().unwrap();
+                        if let Some(s) = guard.as_ref() {
+                            if let Err(e) = s.set_mute(muted) {
+                                warn!("set_mute failed: {}", e);
                             }
                         }
                     }
