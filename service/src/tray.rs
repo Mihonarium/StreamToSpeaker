@@ -71,16 +71,20 @@ struct TrayIds {
 pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
     let menu = Menu::new();
 
-    let status_item = MenuItem::new("(no speaker)", false, None);
+    let status_item = MenuItem::new("No speaker selected", false, None);
     menu.append(&status_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
 
+    // Tray latency labels match the GUI's "Trim X / Pad X" wording
+    // (previously the GUI used −/+ symbols and the tray used the
+    // verbs, so the same action had two different labels across
+    // surfaces — Content L2 from the audit).
     let switch_speaker = MenuItem::new("Switch speaker…", true, None);
-    let trim_25 = MenuItem::new("Trim 25 ms", true, None);
-    let trim_100 = MenuItem::new("Trim 100 ms", true, None);
-    let pad_25 = MenuItem::new("Pad 25 ms", true, None);
-    let pad_100 = MenuItem::new("Pad 100 ms", true, None);
-    let resync = MenuItem::new("Resync (hard reset)", true, None);
+    let trim_25 = MenuItem::new("Trim 25 ms (sync faster)", true, None);
+    let trim_100 = MenuItem::new("Trim 100 ms (sync faster)", true, None);
+    let pad_25 = MenuItem::new("Pad 25 ms (more buffer)", true, None);
+    let pad_100 = MenuItem::new("Pad 100 ms (more buffer)", true, None);
+    let resync = MenuItem::new("Resync speaker", true, None);
     menu.append(&switch_speaker)?;
     menu.append(&trim_25)?;
     menu.append(&trim_100)?;
@@ -102,9 +106,9 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
     let web_on = app.is_web_ui_enabled();
     let open_web = MenuItem::new(
         if web_on {
-            "Open web UI"
+            "Open web UI in browser"
         } else {
-            "Open web UI (disabled — enable in window)"
+            "Open web UI (turn it on in the main window first)"
         },
         web_on,
         None,
@@ -181,7 +185,7 @@ impl TrayHandle {
         // Sync the status label.
         let label = match app.current_renderer() {
             Some(r) => format!("▶ {}", r.friendly_name),
-            None => "(no speaker)".to_string(),
+            None => "No speaker selected".to_string(),
         };
         if label != self.last_label {
             self.status_item.set_text(&label);
@@ -199,9 +203,9 @@ impl TrayHandle {
         let web_on = app.is_web_ui_enabled();
         if web_on != self.last_web_enabled {
             self.open_web_item.set_text(if web_on {
-                "Open web UI"
+                "Open web UI in browser"
             } else {
-                "Open web UI (disabled — enable in window)"
+                "Open web UI (turn it on in the main window first)"
             });
             self.open_web_item.set_enabled(web_on);
             self.last_web_enabled = web_on;
