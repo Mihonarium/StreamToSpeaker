@@ -421,7 +421,13 @@ fn apply_theme(ctx: &egui::Context, dark: bool, system_accent: Option<(u8, u8, u
     visuals.faint_bg_color = p.card;
     visuals.extreme_bg_color = p.canvas;
     visuals.code_bg_color = p.card_hover;
-    visuals.override_text_color = Some(p.text_primary);
+    // Don't set override_text_color — it forces every label to paint
+    // at primary regardless of `ui.is_enabled()`, defeating egui's
+    // built-in disabled-state fade. Individual labels that want the
+    // primary color set it via RichText::color(p.text_primary)
+    // explicitly. (Audit M21.)
+    visuals.widgets.noninteractive.fg_stroke =
+        egui::Stroke::new(1.0, p.text_primary);
     visuals.hyperlink_color = p.accent;
     visuals.selection.bg_fill = p.accent_subtle;
     visuals.selection.stroke = egui::Stroke::new(1.0, p.accent);
