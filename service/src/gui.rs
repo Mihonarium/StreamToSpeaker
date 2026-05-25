@@ -525,7 +525,7 @@ impl eframe::App for StreamToSpeakerApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(p.canvas).inner_margin(20.0))
+            .frame(egui::Frame::default().fill(p.canvas).inner_margin(sp::M))
             .show(ctx, |ui| {
                 let enabled = !self.confirm_close_open;
                 ui.add_enabled_ui(enabled, |ui| {
@@ -533,10 +533,19 @@ impl eframe::App for StreamToSpeakerApp {
                     // shouldn't scroll away); everything below scrolls
                     // when the window is shorter than the content.
                     self.show_header(ui, &p);
-                    ui.add_space(14.0);
+                    ui.add_space(sp::S);
+                    // Reserve a right-edge inset for the auto-expanding
+                    // scrollbar. egui's modern scrollbar starts as a
+                    // 2 px panning indicator and morphs to 6 px on
+                    // hover, drawn OVER the content (Fluent S2). Without
+                    // a right inset the morphed bar overlays the right
+                    // border of every card — exactly the "scrollbar
+                    // touching the card borders" the audit / user
+                    // reported.
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            ui.set_max_width(ui.available_width() - sp::M);
                             self.show_status_banner(ui, &p);
                             ui.add_space(14.0);
                             // Show onboarding regardless of whether a
