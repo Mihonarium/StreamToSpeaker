@@ -149,6 +149,38 @@ fn read_system_accent() -> Option<(u8, u8, u8)> {
     None
 }
 
+/// True if Windows' High Contrast mode is on (Accessibility → Contrast
+/// themes, or the WIN+ALT+PRINTSCREEN toggle). When this is on, an
+/// app that overrides Visuals defeats the user's accessibility setup
+/// — better to drop our custom palette and let egui's defaults
+/// through, which at least track the dark/light flip.
+#[cfg(windows)]
+fn is_high_contrast_on() -> bool {
+    use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETHIGHCONTRAST,
+    };
+    let mut hc: HIGHCONTRASTW = unsafe { std::mem::zeroed() };
+    hc.cbSize = std::mem::size_of::<HIGHCONTRASTW>() as u32;
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            std::mem::size_of::<HIGHCONTRASTW>() as u32,
+            &mut hc as *mut HIGHCONTRASTW as *mut std::ffi::c_void,
+            0,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+    (hc.dwFlags & HCF_HIGHCONTRASTON) != 0
+}
+
+#[cfg(not(windows))]
+fn is_high_contrast_on() -> bool {
+    false
+}
+
 #[derive(Copy, Clone)]
 struct Palette {
     // Surfaces
@@ -289,6 +321,19 @@ fn install_symbol_font(ctx: &egui::Context) {
 }
 
 fn apply_theme(ctx: &egui::Context, dark: bool, system_accent: Option<(u8, u8, u8)>) {
+    // High-contrast OS mode: don't override visuals at all. The user
+    // has explicitly opted into a system colour scheme designed for
+    // their accessibility needs; clobbering it with our hand-picked
+    // palette defeats the point. Drop back to egui's stock light/dark
+    // visuals and the system text colours. Proper HC integration
+    // (reading GetSysColor for window/button/highlight) is a deeper
+    // follow-up; this fallback at least stops us from making things
+    // WORSE.
+    if is_high_contrast_on() {
+        let visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+        ctx.set_visuals(visuals);
+        return;
+    }
     let p = palette_for(dark, system_accent);
     let mut visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
 
