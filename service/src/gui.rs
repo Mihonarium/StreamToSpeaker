@@ -1418,15 +1418,34 @@ impl StreamToSpeakerApp {
             // onto a second row at narrow widths instead of clipping
             // off the right edge.
             ui.horizontal_wrapped(|ui| {
-                stat_pill(ui, p, &format!("{}", pkts_sec), "pkt / s");
                 stat_pill(
                     ui,
                     p,
-                    &format!("{}", subs),
-                    if subs == 1 { "listener" } else { "listeners" },
+                    &format!("{}", pkts_sec),
+                    "packets/sec",
+                    "10 ms audio packets sent per second from this PC.",
                 );
-                stat_pill(ui, p, &format_duration(uptime), "uptime");
-                stat_pill(ui, p, &humanize_count(pkts_total), "packets");
+                let listener_label = if subs == 1 { "listener" } else { "listeners" };
+                let listener_tip = if subs == 1 {
+                    "1 device is currently pulling the audio stream."
+                } else {
+                    "Devices currently pulling the audio stream from this PC."
+                };
+                stat_pill(ui, p, &format!("{}", subs), listener_label, listener_tip);
+                stat_pill(
+                    ui,
+                    p,
+                    &format_duration(uptime),
+                    "uptime",
+                    "How long the Stream To Speaker service has been running since launch.",
+                );
+                stat_pill(
+                    ui,
+                    p,
+                    &humanize_count(pkts_total),
+                    "packets",
+                    "Total audio packets sent since launch.",
+                );
             });
         });
     }
@@ -1697,12 +1716,21 @@ fn advanced_row(
     });
 }
 
-fn stat_pill(ui: &mut egui::Ui, p: &Palette, value: &str, label: &str) {
+fn stat_pill(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    value: &str,
+    label: &str,
+    tooltip: &str,
+) {
+    // Bumped label 10 → 12 (Fluent T3 — no text below 12 px Regular),
+    // dropped the extra_letter_spacing, and added a tooltip per
+    // Content #20 so "pkt / s" / "listeners" / "uptime" / "packets"
+    // don't read as decoration.
     egui::Frame::none()
         .fill(p.card_hover)
-        .stroke(egui::Stroke::new(1.0, p.divider))
         .rounding(RADIUS_CONTROL)
-        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+        .inner_margin(egui::Margin::symmetric(sp::S, sp::XS))
         .show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.label(
@@ -1713,12 +1741,13 @@ fn stat_pill(ui: &mut egui::Ui, p: &Palette, value: &str, label: &str) {
                 );
                 ui.label(
                     egui::RichText::new(label)
-                        .size(10.0)
-                        .color(p.text_tertiary)
-                        .extra_letter_spacing(0.6),
+                        .size(12.0)
+                        .color(p.text_secondary),
                 );
             });
-        });
+        })
+        .response
+        .on_hover_text(tooltip);
 }
 
 fn open_url(url: &str) -> std::io::Result<()> {
