@@ -26,7 +26,7 @@ if (Test-Path $devcon) {
     & $devcon remove "Root\StreamToSpeaker" | Out-Null
     Write-Host "  device removed."
 } else {
-    Write-Warning "  devcon.exe not found at $devcon — install may have already removed it."
+    Write-Warning "  devcon.exe not found at $devcon - install may have already removed it."
 }
 
 Write-Host "2/3  Removing the driver-store entry..." -ForegroundColor Cyan
@@ -68,10 +68,10 @@ Write-Host ""
 Write-Host "Clean done." -ForegroundColor Green
 Write-Host ""
 Write-Host "Next steps:"
-Write-Host "  1. Reboot (required — MMDevAPI caches in-memory state that"
+Write-Host "  1. Reboot (required - MMDevAPI caches in-memory state that"
 Write-Host "     won't fully release until next session)."
 Write-Host "  2. Re-run StreamToSpeakerSetup-<version>.exe."
 Write-Host "  3. After install, the device should appear as 'Stream To Speaker'"
 Write-Host "     (without the 'Internal AUX Jack' prefix). You'll still need"
-Write-Host "     to click 'Allow' once in Sound Settings — that's a Windows 11"
+Write-Host "     to click 'Allow' once in Sound Settings - that's a Windows 11"
 Write-Host "     per-device privacy gate that requires a manual click."

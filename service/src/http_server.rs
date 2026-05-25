@@ -13,6 +13,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{debug, info, warn};
 use std::io::Read;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -116,6 +117,10 @@ pub struct HttpServerConfig {
     /// If set, exposes `POST /api/latency/adjust?ms=N` for gradual
     /// runtime latency trim / pad.
     pub latency_adjust: Option<LatencyAdjustCallback>,
+    /// Runtime gate on the user-facing routes (`/`, `/api/*`). The
+    /// `/stream.raw` route is always served regardless — the speaker
+    /// can't function without it. `None` ⇒ web UI always on (legacy).
+    pub web_ui_enabled: Option<Arc<AtomicBool>>,
 }
 
 impl HttpServerConfig {
@@ -128,6 +133,7 @@ impl HttpServerConfig {
             speaker_select: None,
             resync: None,
             latency_adjust: None,
+            web_ui_enabled: None,
         }
     }
 }
@@ -151,13 +157,34 @@ pub fn start_http_server(cfg: HttpServerConfig) -> Result<u16> {
     let select_cb = cfg.speaker_select.clone();
     let resync_cb = cfg.resync.clone();
     let latency_cb = cfg.latency_adjust.clone();
+    let web_gate = cfg.web_ui_enabled.clone();
 
     thread::Builder::new()
         .name("stream-to-speaker-http".to_string())
-        .spawn(move || run_server(server, hub, gena_cb, list_cb, select_cb, resync_cb, latency_cb))
+        .spawn(move || {
+            run_server(
+                server, hub, gena_cb, list_cb, select_cb, resync_cb, latency_cb, web_gate,
+            )
+        })
         .context("spawning HTTP server thread")?;
 
     Ok(actual)
+}
+
+fn web_ui_on(gate: &Option<Arc<AtomicBool>>) -> bool {
+    gate.as_ref().map(|g| g.load(Ordering::Acquire)).unwrap_or(true)
+}
+
+fn respond_web_disabled(req: tiny_http::Request) {
+    let mut resp = Response::from_string(
+        r#"{"error":"web UI is disabled — enable it in the GUI"}"#,
+    )
+    .with_status_code(StatusCode(404));
+    resp.add_header(
+        Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..])
+            .unwrap(),
+    );
+    let _ = req.respond(resp);
 }
 
 fn run_server(
@@ -168,6 +195,7 @@ fn run_server(
     speaker_select: Option<SpeakerSelectCallback>,
     resync: Option<ResyncCallback>,
     latency_adjust: Option<LatencyAdjustCallback>,
+    web_ui_enabled: Option<Arc<AtomicBool>>,
 ) {
     for req in server.incoming_requests() {
         let url = req.url().to_string();
@@ -199,19 +227,39 @@ fn run_server(
                 );
             }
             (Method::Get, "/") => {
-                serve_status_page(req, &speaker_list);
+                if web_ui_on(&web_ui_enabled) {
+                    serve_status_page(req, &speaker_list);
+                } else {
+                    respond_web_disabled(req);
+                }
             }
             (Method::Get, "/api/speakers") => {
-                serve_speakers_json(req, &speaker_list);
+                if web_ui_on(&web_ui_enabled) {
+                    serve_speakers_json(req, &speaker_list);
+                } else {
+                    respond_web_disabled(req);
+                }
             }
             (Method::Post, "/api/select") => {
-                serve_select(req, &speaker_select);
+                if web_ui_on(&web_ui_enabled) {
+                    serve_select(req, &speaker_select);
+                } else {
+                    respond_web_disabled(req);
+                }
             }
             (Method::Post, "/api/resync") => {
-                serve_resync(req, &resync);
+                if web_ui_on(&web_ui_enabled) {
+                    serve_resync(req, &resync);
+                } else {
+                    respond_web_disabled(req);
+                }
             }
             (Method::Post, "/api/latency/adjust") => {
-                serve_latency_adjust(req, &latency_adjust);
+                if web_ui_on(&web_ui_enabled) {
+                    serve_latency_adjust(req, &latency_adjust);
+                } else {
+                    respond_web_disabled(req);
+                }
             }
             (m, path) => {
                 // Could be a GENA NOTIFY. tiny_http parses standard

@@ -1,6 +1,6 @@
 # Runs as the first step of the installer's [Run] section, every time.
 # Cleans up any previous Stream To Speaker install so the new INF lands
-# fresh — Windows otherwise caches per-endpoint state across reinstalls
+# fresh - Windows otherwise caches per-endpoint state across reinstalls
 # (jack association, FormFactor, friendly name, enable-by-default flag)
 # and serves the stale version even after pnputil /add-driver and
 # devcon install of a new INF.
@@ -8,7 +8,7 @@
 # Idempotent: if nothing prior is installed, all the removes / wipes
 # silently no-op.
 #
-# No reboot required — the new install creates a fresh endpoint ID
+# No reboot required - the new install creates a fresh endpoint ID
 # (we wipe the MMDevices cache below) so MMDevAPI sees it as brand new
 # rather than refreshing stale in-memory state.
 
@@ -30,7 +30,7 @@ function Log($msg) {
 # ----- 1. Remove the live device (if any) ------------------------------------
 # devcon is staged alongside the driver by the installer; it has to
 # exist by the time this script runs (Inno Setup copies [Files] before
-# [Run]). If it's missing for some reason, skip — no live device to
+# [Run]). If it's missing for some reason, skip - no live device to
 # remove means there's no live device to remove.
 $devcon = Join-Path $PSScriptRoot "..\driver\devcon.exe"
 if (Test-Path $devcon) {
@@ -42,7 +42,7 @@ if (Test-Path $devcon) {
 
 # ----- 2. Unstage the old driver package from the driver store --------------
 # pnputil /delete-driver takes the OEM-assigned name (oemNN.inf), which
-# we don't know up front — enumerate, match on Original Name, delete.
+# we don't know up front - enumerate, match on Original Name, delete.
 Log "scanning driver store for StreamToSpeaker.inf entries..."
 $enum = & pnputil /enum-drivers 2>&1 | Out-String
 $stanzas = $enum -split "(?ms)(?=Published Name:)"

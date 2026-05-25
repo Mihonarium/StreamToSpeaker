@@ -13,6 +13,15 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{B1F7C90E-3CFD-4B0E-A5C4-7E25A2B71F11}</ProjectGuid>
     <RootNamespace>StreamToSpeaker</RootNamespace>
+    <!-- Driver version components. Must be defined BEFORE the
+         ItemDefinitionGroup that references them (MSBuild evaluates
+         the file top-to-bottom for property expansion in metadata).
+         DriverVersionPrefix is edited by hand for significant changes;
+         DriverBuildNumber (the revision field) is the git commit
+         count, injected by CI / build-installer.ps1 via
+         /p:DriverBuildNumber=N. -->
+    <DriverVersionPrefix Condition="'$(DriverVersionPrefix)' == ''">1.0.0</DriverVersionPrefix>
+    <DriverBuildNumber Condition="'$(DriverBuildNumber)' == ''">1</DriverBuildNumber>
     <ProjectName>StreamToSpeaker</ProjectName>
     <TargetVersion>Windows10</TargetVersion>
     <DriverTargetPlatform>Desktop</DriverTargetPlatform>
@@ -97,10 +106,6 @@
       <TimeStamp>$(DriverVersionPrefix).$(DriverBuildNumber)</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
-  <PropertyGroup>
-    <DriverVersionPrefix Condition="'$(DriverVersionPrefix)' == ''">1.0.0</DriverVersionPrefix>
-    <DriverBuildNumber Condition="'$(DriverBuildNumber)' == ''">1</DriverBuildNumber>
-  </PropertyGroup>
   <ItemGroup>
     <ClCompile Include="adapter.cpp" />
     <ClCompile Include="driver.cpp" />

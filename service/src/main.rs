@@ -216,17 +216,18 @@ fn run(cli: Cli) -> Result<()> {
 
     let app = setup_app(&cli)?;
 
-    // Wire optional HTTP server.
-    if cli.web {
-        let port_chosen = start_http(&app)?;
+    // Always start the full HTTP server (audio + API + UI). The /, /api/*
+    // routes honour app.is_web_ui_enabled() at request time, so the GUI
+    // can flip the web UI on and off without re-binding the socket. The
+    // initial state mirrors --web.
+    let port_chosen = start_http(&app)?;
+    if app.is_web_ui_enabled() {
         info!("web UI: http://{}:{}/", app.config.advertise_ip, port_chosen);
     } else {
-        // Even with --web off we still need to serve /stream.raw so the
-        // speaker can pull audio. Use a minimal-config HTTP server (no
-        // /api/* routes, no status page).
-        let port_chosen = start_http_minimal(&app)?;
-        info!("stream URL: http://{}:{}/stream.raw", app.config.advertise_ip, port_chosen);
-        info!("web UI / API: disabled (pass --web to enable)");
+        info!(
+            "stream URL: http://{}:{}/stream.raw (web UI off — toggle in the GUI)",
+            app.config.advertise_ip, port_chosen
+        );
     }
 
     // Resolve initial speaker.
@@ -439,48 +440,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         speaker_select: Some(speaker_select),
         resync: Some(resync),
         latency_adjust: Some(latency_adjust),
-    })
-}
-
-/// Minimal HTTP server — only `/stream.raw` is reachable, no `/api/*`, no
-/// status page, no GENA callback (so volume sync from speaker → Windows
-/// won't work without `--web`; volume sync the other direction still
-/// flows via UPnP SetVolume).
-fn start_http_minimal(app: &Arc<App>) -> Result<u16> {
-    // We still need the GENA callback URL to exist (Sonos POSTs there),
-    // so register it. But registering the GENA callback doesn't expose
-    // anything else; the wired routes inside http_server.rs are gated
-    // on the relevant callbacks being Some.
-    let gena_callback = {
-        let vsync = app.vsync.clone();
-        let pusher = build_driver_volume_pusher();
-        let pusher = pusher.map(Arc::new);
-        Arc::new(move |path: &str, body: &str| {
-            debug!("GENA NOTIFY on {}: {} bytes", path, body.len());
-            if let Some(change) = parse_rendering_notify(body) {
-                if let Some(v) = change.volume {
-                    if let Some(mb) = vsync.sonos_changed(v) {
-                        if let Some(p) = pusher.as_ref() {
-                            let _ = p.push(mb, false);
-                        }
-                    }
-                }
-                if let Some(m) = change.mute {
-                    if let Some(p) = pusher.as_ref() {
-                        let _ = p.push(0, m);
-                    }
-                }
-            }
-        }) as Arc<dyn Fn(&str, &str) + Send + Sync>
-    };
-    start_http_server(HttpServerConfig {
-        bind: app.config.bind,
-        hub: app.hub.clone(),
-        gena_callback: Some(gena_callback),
-        speaker_list: None,
-        speaker_select: None,
-        resync: None,
-        latency_adjust: None,
+        web_ui_enabled: Some(app.web_ui_enabled.clone()),
     })
 }
 
