@@ -1024,18 +1024,54 @@ impl StreamToSpeakerApp {
             let view = self.app.speaker_view();
             if view.speakers.is_empty() {
                 ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("Searching the network for speakers…")
-                        .color(p.text_secondary)
-                        .italics(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Make sure your PC and the speaker are on the same Wi-Fi/Ethernet network.",
-                    )
-                    .size(11.0)
-                    .color(p.text_tertiary),
-                );
+                // After ~10 s with no results, the user has waited
+                // long enough that "still searching" stops being
+                // useful — switch to actionable troubleshooting copy
+                // (Heuristics F-05). Note: italics removed (Fluent
+                // T4 — no italic in the type ramp).
+                let uptime = self.app.uptime_secs();
+                if uptime < 10 {
+                    ui.label(
+                        egui::RichText::new("Searching the network for speakers…")
+                            .color(p.text_secondary),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Make sure your PC and the speaker are on the same Wi-Fi or Ethernet network.",
+                        )
+                        .size(12.0)
+                        .color(p.text_tertiary),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("Still no speakers found.")
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    ui.add_space(sp::XS / 2.0);
+                    ui.label(
+                        egui::RichText::new("Common causes:")
+                            .size(12.0)
+                            .color(p.text_secondary),
+                    );
+                    for cause in [
+                        "Your PC and the speaker are on different Wi-Fi networks (e.g. guest Wi-Fi, VPN).",
+                        "Windows Firewall is blocking SSDP / UPnP traffic for this app.",
+                        "The speaker is powered off, or hasn't finished booting yet.",
+                    ] {
+                        ui.label(
+                            egui::RichText::new(format!("  •  {cause}"))
+                                .size(12.0)
+                                .color(p.text_secondary),
+                        );
+                    }
+                    ui.add_space(sp::XS);
+                    ui.label(
+                        egui::RichText::new("Click Rescan above to try again.")
+                            .size(12.0)
+                            .color(p.text_tertiary),
+                    );
+                }
                 return;
             }
 
