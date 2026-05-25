@@ -143,6 +143,23 @@ impl App {
         self.session.lock().unwrap().as_ref().map(|s| s.renderer.clone())
     }
 
+    /// Trigger an immediate SSDP re-scan. The discovery background
+    /// thread wakes up right away, runs one `discover_once`, then
+    /// resumes its regular periodic schedule. No-op (returns false) if
+    /// discovery is disabled (`--no-discovery`).
+    pub fn request_rescan(&self) -> bool {
+        match self.discovery.as_ref() {
+            Some(d) => { d.request_rescan(); true }
+            None => false,
+        }
+    }
+
+    /// True while the SSDP thread is mid-scan. The GUI uses this to
+    /// render a "Scanning…" hint after the user clicks Rescan.
+    pub fn is_scanning(&self) -> bool {
+        self.discovery.as_ref().map(|d| d.is_scanning()).unwrap_or(false)
+    }
+
     // -------------------------------------------------------------------
     // Speaker actions
     // -------------------------------------------------------------------

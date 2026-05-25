@@ -637,11 +637,17 @@ impl StreamToSpeakerApp {
 
     fn show_speakers(&self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
+            let scanning = self.app.is_scanning();
             ui.horizontal(|ui| {
                 section_label(ui, p, "Speakers");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    secondary_button(ui, p, "↻  Rescan", 92.0)
-                        .on_hover_text("Re-trigger SSDP discovery now (otherwise runs every few minutes)");
+                    let label = if scanning { "↻  Scanning…" } else { "↻  Rescan" };
+                    let resp = ui.add_enabled_ui(!scanning, |ui| {
+                        secondary_button(ui, p, label, 100.0)
+                    }).inner;
+                    resp.on_hover_text("Re-trigger SSDP discovery now (otherwise runs every few minutes)")
+                        .clicked()
+                        .then(|| { self.app.request_rescan(); });
                 });
             });
             ui.add_space(6.0);
@@ -649,8 +655,13 @@ impl StreamToSpeakerApp {
             let view = self.app.speaker_view();
             if view.speakers.is_empty() {
                 ui.add_space(4.0);
+                let msg = if scanning {
+                    "Scanning the network for speakers…"
+                } else {
+                    "Searching the network for speakers…"
+                };
                 ui.label(
-                    egui::RichText::new("Searching the network for speakers…")
+                    egui::RichText::new(msg)
                         .color(p.text_secondary)
                         .italics(),
                 );

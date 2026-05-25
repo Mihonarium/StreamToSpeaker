@@ -11,7 +11,8 @@ use log::{debug, info, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,10 +38,17 @@ pub struct Renderer {
 }
 
 /// Shared discovery state.  The main loop owns one; the SSDP thread
-/// updates it.
+/// updates it. The condvar/`kick_pending` pair lets external callers
+/// (the GUI's Rescan button, the `/api/rescan` endpoint) wake the
+/// discovery thread immediately instead of waiting out the periodic
+/// interval. `scanning` is set while a discover_once call is in flight
+/// so the GUI can render a "Scanning…" hint.
 #[derive(Default)]
 pub struct DiscoveryState {
     inner: Mutex<Vec<Renderer>>,
+    kick_pending: Mutex<bool>,
+    kick_cv: Condvar,
+    scanning: AtomicBool,
 }
 
 impl DiscoveryState {
@@ -50,6 +58,34 @@ impl DiscoveryState {
 
     pub fn renderers(&self) -> Vec<Renderer> {
         self.inner.lock().unwrap().clone()
+    }
+
+    /// True while a discover_once call is running. GUI polls this to
+    /// show feedback after a Rescan click.
+    pub fn is_scanning(&self) -> bool {
+        self.scanning.load(Ordering::Acquire)
+    }
+
+    /// Wake the discovery thread so it runs `discover_once` immediately
+    /// instead of waiting for the periodic timer. Cheap and idempotent —
+    /// rapid double-clicks just collapse into a single re-scan.
+    pub fn request_rescan(&self) {
+        *self.kick_pending.lock().unwrap() = true;
+        self.kick_cv.notify_all();
+    }
+
+    /// Block up to `timeout` for a kick. Returns true if kicked
+    /// (consumes the pending flag), false on timeout. Used by the
+    /// discovery thread between scans.
+    pub fn wait_for_kick(&self, timeout: Duration) -> bool {
+        let mut pending = self.kick_pending.lock().unwrap();
+        if !*pending {
+            let (p, _) = self.kick_cv.wait_timeout(pending, timeout).unwrap();
+            pending = p;
+        }
+        let kicked = *pending;
+        *pending = false;
+        kicked
     }
 
     /// Set the renderer list, deduping by control URL.
@@ -126,6 +162,7 @@ pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, iface: Op
     thread::Builder::new()
         .name("stream-to-speaker-ssdp".to_string())
         .spawn(move || loop {
+            state.scanning.store(true, Ordering::Release);
             match discover_once(Duration::from_secs(3), iface) {
                 Ok(found) => {
                     info!("SSDP discovery: {} renderer(s) found", found.len());
@@ -133,7 +170,11 @@ pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, iface: Op
                 }
                 Err(e) => warn!("SSDP discovery failed: {}", e),
             }
-            thread::sleep(interval);
+            state.scanning.store(false, Ordering::Release);
+            // Wait the regular interval, but wake early on rescan.
+            if state.wait_for_kick(interval) {
+                debug!("SSDP discovery kicked early by Rescan");
+            }
         })
         .expect("spawning SSDP thread");
 }
