@@ -36,6 +36,13 @@ pub struct TrayHandle {
     last_label: String,
     last_enabled: bool,
     last_web_enabled: bool,
+
+    // HWND of the GUI window, populated by gui::update on the first
+    // frame. We use raw Win32 ShowWindow to flip visibility because
+    // egui ViewportCommands don't drain on hidden viewports. Until
+    // set, Show window is a no-op (window is already visible on the
+    // very first frame anyway).
+    hwnd: Option<isize>,
 }
 
 struct TrayIds {
@@ -134,10 +141,18 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
         last_label: String::new(),
         last_enabled: app.is_streaming_enabled(),
         last_web_enabled: web_on,
+        hwnd: None,
     })
 }
 
 impl TrayHandle {
+    /// Set the HWND the tray uses to show / hide the window. Called by
+    /// gui::update on the first frame, once eframe has actually created
+    /// the OS window.
+    pub fn set_hwnd(&mut self, hwnd: isize) {
+        self.hwnd = Some(hwnd);
+    }
+
     /// Drain pending tray and menu events, update the visible bits of
     /// the menu (status label, check state) to reflect the App. Called
     /// from `gui::update()` once per frame; cheap when there's nothing
@@ -187,7 +202,7 @@ impl TrayHandle {
                 ..
             } = ev
             {
-                show_main_window(ctx);
+                self.show_main_window(ctx);
             }
         }
     }
@@ -211,7 +226,7 @@ impl TrayHandle {
                 warn!("toggle failed: {}", e);
             }
         } else if *id == self.ids.switch_speaker || *id == self.ids.show_window {
-            show_main_window(ctx);
+            self.show_main_window(ctx);
         } else if *id == self.ids.open_web {
             if app.is_web_ui_enabled() {
                 open_web_ui(&app.config.advertise_ip, app.config.bind.port());
@@ -223,20 +238,27 @@ impl TrayHandle {
         }
         ctx.request_repaint();
     }
-}
 
-fn show_main_window(ctx: &egui::Context) {
-    // Order matters: un-minimise first, then ensure visible, then
-    // focus. We hide-to-tray via Minimized(true) (not Visible(false))
-    // because eframe stops calling update() on hidden viewports and
-    // viewport commands then sit undelivered in the queue forever —
-    // a well-known eframe regression (emilk/egui#5229, #3655). With
-    // Minimized, the update loop keeps ticking and these commands
-    // are processed on the next frame.
-    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-    ctx.request_repaint();
+    /// Bring the GUI window to the front. We use raw Win32 ShowWindow
+    /// directly because egui's ViewportCommand queue is processed only
+    /// inside update(), which only runs on WM_PAINT — and a hidden
+    /// window doesn't generate WM_PAINT. The queue freeze is a known
+    /// eframe regression (emilk/egui#5229, #3655). ShowWindow flips
+    /// visibility at the OS level, generating the paint events that
+    /// then bring update() back to life.
+    fn show_main_window(&self, ctx: &egui::Context) {
+        if let Some(hwnd) = self.hwnd {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                ShowWindow, SetForegroundWindow, SW_SHOW, SW_RESTORE,
+            };
+            unsafe {
+                ShowWindow(hwnd as _, SW_RESTORE);
+                ShowWindow(hwnd as _, SW_SHOW);
+                SetForegroundWindow(hwnd as _);
+            }
+        }
+        ctx.request_repaint();
+    }
 }
 
 fn open_web_ui(advertise_ip: &str, port: u16) {

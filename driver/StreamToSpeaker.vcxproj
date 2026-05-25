@@ -20,7 +20,7 @@
          DriverBuildNumber (the revision field) is the git commit
          count, injected by CI / build-installer.ps1 via
          /p:DriverBuildNumber=N. -->
-    <DriverVersionPrefix Condition="'$(DriverVersionPrefix)' == ''">1.0.1</DriverVersionPrefix>
+    <DriverVersionPrefix Condition="'$(DriverVersionPrefix)' == ''">1.1.0</DriverVersionPrefix>
     <DriverBuildNumber Condition="'$(DriverBuildNumber)' == ''">1</DriverBuildNumber>
     <ProjectName>StreamToSpeaker</ProjectName>
     <TargetVersion>Windows10</TargetVersion>

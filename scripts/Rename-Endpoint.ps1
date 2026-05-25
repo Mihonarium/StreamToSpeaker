@@ -86,7 +86,8 @@ namespace StreamToSpeaker {
     public class PolicyConfigClient { }
 
     public static class PolicyConfigBridge {
-        // VT_LPWSTR = 31  (PROPVARIANT type tag for wide-string)
+        // PROPVARIANT type tags
+        private const ushort VT_UI4    = 19;
         private const ushort VT_LPWSTR = 31;
 
         public static IPolicyConfig CreateClient() {
@@ -110,6 +111,16 @@ namespace StreamToSpeaker {
                     Marshal.FreeCoTaskMem(pv.p);
                 }
             }
+        }
+
+        // Sets a DWORD-valued PKEY (PROPVARIANT.vt = VT_UI4). The
+        // 32-bit value goes in the IntPtr slot directly — no heap
+        // allocation needed.
+        public static int SetUInt32Property(string endpointId, Guid fmtid, uint pid, uint value) {
+            var key = new PROPERTYKEY { fmtid = fmtid, pid = pid };
+            var pv = new PROPVARIANT { vt = VT_UI4 };
+            pv.p = (IntPtr)(int)value;
+            return CreateClient().SetPropertyValue(endpointId, false, ref key, ref pv);
         }
     }
 }
@@ -172,6 +183,20 @@ namespace StreamToSpeaker {
         exit 2
     }
 
+    # PKEY definitions reused below. The {1DA5D803-...} family is the
+    # AudioEndpoint property GUID; F3E80BEF is the AudioDevice family.
+    $pkeyAudioEndpoint_fmtid = [guid] "1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E"
+    $PKEY_FormFactor_pid                = 0       # VT_UI4 — endpoint form factor
+    $PKEY_Association_pid               = 2       # VT_LPWSTR — KSNODETYPE GUID
+    $PKEY_DisableSysFx_pid              = 5       # VT_UI4
+    $PKEY_SupportsEventDriven_pid       = 7       # VT_UI4
+    $pkeyAudioDevice_fmtid              = [guid] "F3E80BEF-1723-4FF2-BCC4-7F83DC5E46D4"
+    $PKEY_EnableEndpointByDefault_pid   = 4       # VT_UI4 — flag mask
+
+    $FORMFACTOR_SPEAKERS = 1
+    $ENABLE_RENDER_MASK  = 0x101   # FLAG_ENABLE | FLOW_MASK_RENDER
+    $KSNODETYPE_SPEAKER_STR = "{DFF21CE1-F70F-11D0-B917-00A0C9223196}"
+
     $matched = 0
     foreach ($ep in $endpoints) {
         $matched++
@@ -180,7 +205,41 @@ namespace StreamToSpeaker {
         $endpointId = "{0.0.0.00000000}.$($ep.Guid)"
         Write-Host "Matched $($ep.Guid)  (desc='$($ep.Desc)')"
 
-        # --- Friendly name ---
+        # --- Visibility FIRST (== "Allow apps to use this device") ---
+        # On Win11 24H2, SetPropertyValue can race AudioEndpointBuilder
+        # if the visibility transition is still pending — friendly-name
+        # writes get recomposed by AEB seconds later. Promote the
+        # endpoint to ACTIVE first, then write properties.
+        $hr = [StreamToSpeaker.PolicyConfigBridge]::SetVisible($endpointId, $true)
+        if ($hr -eq 0) {
+            Write-Host "  SetEndpointVisibility(true) OK"
+        } else {
+            Write-Warning "  SetEndpointVisibility failed: HRESULT 0x$('{0:X8}' -f $hr)"
+        }
+
+        # --- Force-set the form-factor + association + enable-by-default
+        # via IPolicyConfig. The INF wrote these too, but on the upgrade
+        # path AudioEndpointBuilder may have inherited stale values from
+        # the cached MMDevices entry (especially if a previous install
+        # wrote a different KSNODETYPE_SPEAKER GUID — the BE2/CE1 typo
+        # we fixed in DriverVer 1.1.x). Forcing them via the audiosrv
+        # RPC lands them authoritatively, regardless of cache state.
+        $hr = [StreamToSpeaker.PolicyConfigBridge]::SetUInt32Property(
+            $endpointId, $pkeyAudioEndpoint_fmtid, $PKEY_FormFactor_pid, $FORMFACTOR_SPEAKERS
+        )
+        Write-Host ("  SetFormFactor(Speakers) HRESULT=0x{0:X8}" -f $hr)
+        $hr = [StreamToSpeaker.PolicyConfigBridge]::SetStringProperty(
+            $endpointId, $pkeyAudioEndpoint_fmtid, $PKEY_Association_pid, $KSNODETYPE_SPEAKER_STR
+        )
+        Write-Host ("  SetAssociation(KSNODETYPE_SPEAKER) HRESULT=0x{0:X8}" -f $hr)
+        $hr = [StreamToSpeaker.PolicyConfigBridge]::SetUInt32Property(
+            $endpointId, $pkeyAudioDevice_fmtid, $PKEY_EnableEndpointByDefault_pid, $ENABLE_RENDER_MASK
+        )
+        Write-Host ("  SetEnableEndpointByDefault(0x101) HRESULT=0x{0:X8}" -f $hr)
+
+        # --- Friendly name LAST. After the visibility transition lands
+        # and the property store is authoritative, friendly-name writes
+        # are durable.
         $hr = [StreamToSpeaker.PolicyConfigBridge]::SetStringProperty(
             $endpointId, $pkeyFriendlyName_fmtid, $pkeyFriendlyName_pid, $Name
         )
@@ -188,14 +247,6 @@ namespace StreamToSpeaker {
             Write-Host "  SetStringProperty(FriendlyName='$Name') OK"
         } else {
             Write-Warning "  SetStringProperty failed: HRESULT 0x$('{0:X8}' -f $hr)"
-        }
-
-        # --- Visibility (== "Allow apps to use this device") ---
-        $hr = [StreamToSpeaker.PolicyConfigBridge]::SetVisible($endpointId, $true)
-        if ($hr -eq 0) {
-            Write-Host "  SetEndpointVisibility(true) OK"
-        } else {
-            Write-Warning "  SetEndpointVisibility failed: HRESULT 0x$('{0:X8}' -f $hr)"
         }
 
         # --- Verify DeviceState landed on ACTIVE (==1). If it stays at

@@ -18,8 +18,9 @@
 /* KSPROPERTY automation tables                                        */
 /* ------------------------------------------------------------------ */
 
-/* Forward declaration of the dispatch thunk. */
+/* Forward declarations of the dispatch thunks. */
 NTSTATUS PropertyHandler_Topology(_In_ PPCPROPERTY_REQUEST Request);
+NTSTATUS PropertyHandler_TopoFilter(_In_ PPCPROPERTY_REQUEST Request);
 
 /* DEFINE_PCAUTOMATION_TABLE_PROP wants an array of PCPROPERTY_ITEM;
  * we define one array per node. Fields are: { Set, Id, Flags, Handler }. */
@@ -45,6 +46,75 @@ static PCPROPERTY_ITEM PropertiesMute[] =
     }
 };
 DEFINE_PCAUTOMATION_TABLE_PROP(AutomationMute, PropertiesMute);
+
+/* ------------------------------------------------------------------ */
+/* Jack descriptions — handed to AudioEndpointBuilder via             */
+/* KSPROPSETID_Jack on the topology filter.                            */
+/*                                                                     */
+/* Even though we have no physical jack, the audio engine needs to    */
+/* see a description for the bridge pin to correctly classify the     */
+/* endpoint as "Speakers" rather than falling back to defaults that   */
+/* produce names like "Internal AUX Jack". sysvad and                  */
+/* simpleaudiosample both implement this; not implementing it leaves  */
+/* the JackSubType property unset and the engine guesses from the     */
+/* bridge pin's Category alone (insufficient on Win11 22H2+).         */
+/*                                                                     */
+/* For a virtual/network endpoint:                                     */
+/*   - ConnectionType  = eConnTypeOtherDigital — we're network audio,  */
+/*                       not an analog or HDMI sink                    */
+/*   - GeoLocation     = eGeoLocNotApplicable — there's no physical    */
+/*                       location of "this jack"                       */
+/*   - PortConnection  = ePortConnIntegratedDevice — we're integrated  */
+/*                       into the system, not a removable jack         */
+/*   - IsConnected     = TRUE — always; no jack-detect to honour       */
+/* ------------------------------------------------------------------ */
+static KSJACK_DESCRIPTION BridgeJackDesc =
+{
+    KSAUDIO_SPEAKER_STEREO,         /* ChannelMapping     */
+    0,                               /* Color (none)       */
+    eConnTypeOtherDigital,           /* ConnectionType    */
+    eGeoLocNotApplicable,            /* GeoLocation       */
+    eGenLocOther,                    /* GenLocation       */
+    ePortConnIntegratedDevice,       /* PortConnection    */
+    TRUE                              /* IsConnected       */
+};
+
+static PKSJACK_DESCRIPTION JackDescriptions[] =
+{
+    NULL,            /* PIN 0 — host pin from wave (no jack)             */
+    &BridgeJackDesc, /* PIN 1 — bridge pin (the virtual speaker)         */
+};
+
+/* KSJACK_DESCRIPTION2 — Win7+ addition. JackCapabilities = 0 is fine
+ * for a fixed/integrated endpoint with no presence-detection signal. */
+static KSJACK_DESCRIPTION2 BridgeJackDesc2 =
+{
+    0,    /* DeviceStateInfoMask  */
+    0,    /* JackCapabilities      */
+};
+
+static PKSJACK_DESCRIPTION2 JackDescriptions2[] =
+{
+    NULL,
+    &BridgeJackDesc2,
+};
+
+static PCPROPERTY_ITEM PropertiesTopologyFilter[] =
+{
+    {
+        &KSPROPSETID_Jack,
+        KSPROPERTY_JACK_DESCRIPTION,
+        KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT,
+        PropertyHandler_TopoFilter
+    },
+    {
+        &KSPROPSETID_Jack,
+        KSPROPERTY_JACK_DESCRIPTION2,
+        KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT,
+        PropertyHandler_TopoFilter
+    },
+};
+DEFINE_PCAUTOMATION_TABLE_PROP(AutomationTopoFilter, PropertiesTopologyFilter);
 
 /* ------------------------------------------------------------------ */
 /* Topology descriptor tables                                          */
@@ -166,7 +236,10 @@ static const GUID TopologyMiniportCategories[] =
 static PCFILTER_DESCRIPTOR TopologyMiniportFilterDescriptor =
 {
     0,                                              /* Version          */
-    NULL,                                           /* AutomationTable  */
+    &AutomationTopoFilter,                          /* AutomationTable
+                                                      — KSPROPSETID_Jack
+                                                      lives here, not on
+                                                      the pins / nodes  */
     sizeof(PCPIN_DESCRIPTOR),                       /* PinSize          */
     SIZEOF_ARRAY(TopologyMiniportPins),             /* PinCount         */
     TopologyMiniportPins,                           /* Pins             */
@@ -224,6 +297,35 @@ PropertyHandler_Topology(_In_ PPCPROPERTY_REQUEST Request)
             /* Generic component ID is handled by PortCls; we leave it
              * for the default. */
             return STATUS_NOT_FOUND;
+        }
+    }
+    return STATUS_NOT_FOUND;
+}
+
+/* Filter-level property dispatcher. Hit by KSPROPSETID_Jack queries
+ * from the audio endpoint builder. MajorTarget here is the filter,
+ * not the miniport — we dispatch back to the miniport for the
+ * actual descriptor lookup. */
+NTSTATUS
+PropertyHandler_TopoFilter(_In_ PPCPROPERTY_REQUEST Request)
+{
+    PAGED_CODE();
+    if (Request == nullptr || Request->PropertyItem == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    CMiniportTopology* topo = static_cast<CMiniportTopology*>(
+        static_cast<PMINIPORTTOPOLOGY>(Request->MajorTarget));
+    if (topo == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (IsEqualGUIDAligned(*Request->PropertyItem->Set, KSPROPSETID_Jack)) {
+        switch (Request->PropertyItem->Id) {
+        case KSPROPERTY_JACK_DESCRIPTION:
+            return topo->PropertyHandlerJackDescription(Request);
+        case KSPROPERTY_JACK_DESCRIPTION2:
+            return topo->PropertyHandlerJackDescription2(Request);
+        default:
+            break;
         }
     }
     return STATUS_NOT_FOUND;
@@ -546,6 +648,115 @@ CMiniportTopology::PropertyHandlerCpuResources(_In_ PPCPROPERTY_REQUEST Request)
         return STATUS_SUCCESS;
     }
     return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS
+CMiniportTopology::PropertyHandlerJackDescription(_In_ PPCPROPERTY_REQUEST Request)
+{
+    PAGED_CODE();
+    /* PinId is in the Instance buffer (audio endpoint builder passes
+     * a ULONG pin id with each KSPROPSETID_Jack query). */
+    if (Request->InstanceSize < sizeof(ULONG)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ULONG pinId = *static_cast<PULONG>(Request->Instance);
+    if (pinId >= SIZEOF_ARRAY(JackDescriptions)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    PKSJACK_DESCRIPTION desc = JackDescriptions[pinId];
+    if (desc == nullptr) {
+        /* No jack on this pin (host pin) — explicitly say so. */
+        return STATUS_NOT_FOUND;
+    }
+
+    if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
+        if (Request->ValueSize < sizeof(KSPROPERTY_DESCRIPTION)) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        PKSPROPERTY_DESCRIPTION d =
+            static_cast<PKSPROPERTY_DESCRIPTION>(Request->Value);
+        d->AccessFlags     = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
+        d->DescriptionSize = sizeof(KSPROPERTY_DESCRIPTION);
+        d->PropTypeSet.Set = KSPROPTYPESETID_General;
+        d->PropTypeSet.Id  = 0;
+        d->PropTypeSet.Flags = 0;
+        d->MembersListCount = 0;
+        d->Reserved        = 0;
+        Request->ValueSize = sizeof(KSPROPERTY_DESCRIPTION);
+        return STATUS_SUCCESS;
+    }
+
+    if (Request->Verb & KSPROPERTY_TYPE_GET) {
+        ULONG cbNeeded = sizeof(KSMULTIPLE_ITEM) + sizeof(KSJACK_DESCRIPTION);
+        if (Request->ValueSize == 0) {
+            Request->ValueSize = cbNeeded;
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        if (Request->ValueSize < cbNeeded) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        PKSMULTIPLE_ITEM mi = static_cast<PKSMULTIPLE_ITEM>(Request->Value);
+        mi->Size  = cbNeeded;
+        mi->Count = 1;
+        RtlCopyMemory(mi + 1, desc, sizeof(KSJACK_DESCRIPTION));
+        Request->ValueSize = cbNeeded;
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+
+NTSTATUS
+CMiniportTopology::PropertyHandlerJackDescription2(_In_ PPCPROPERTY_REQUEST Request)
+{
+    PAGED_CODE();
+    if (Request->InstanceSize < sizeof(ULONG)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ULONG pinId = *static_cast<PULONG>(Request->Instance);
+    if (pinId >= SIZEOF_ARRAY(JackDescriptions2)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    PKSJACK_DESCRIPTION2 desc = JackDescriptions2[pinId];
+    if (desc == nullptr) {
+        return STATUS_NOT_FOUND;
+    }
+
+    if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
+        if (Request->ValueSize < sizeof(KSPROPERTY_DESCRIPTION)) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        PKSPROPERTY_DESCRIPTION d =
+            static_cast<PKSPROPERTY_DESCRIPTION>(Request->Value);
+        d->AccessFlags     = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
+        d->DescriptionSize = sizeof(KSPROPERTY_DESCRIPTION);
+        d->PropTypeSet.Set = KSPROPTYPESETID_General;
+        d->PropTypeSet.Id  = 0;
+        d->PropTypeSet.Flags = 0;
+        d->MembersListCount = 0;
+        d->Reserved        = 0;
+        Request->ValueSize = sizeof(KSPROPERTY_DESCRIPTION);
+        return STATUS_SUCCESS;
+    }
+
+    if (Request->Verb & KSPROPERTY_TYPE_GET) {
+        ULONG cbNeeded = sizeof(KSMULTIPLE_ITEM) + sizeof(KSJACK_DESCRIPTION2);
+        if (Request->ValueSize == 0) {
+            Request->ValueSize = cbNeeded;
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        if (Request->ValueSize < cbNeeded) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        PKSMULTIPLE_ITEM mi = static_cast<PKSMULTIPLE_ITEM>(Request->Value);
+        mi->Size  = cbNeeded;
+        mi->Count = 1;
+        RtlCopyMemory(mi + 1, desc, sizeof(KSJACK_DESCRIPTION2));
+        Request->ValueSize = cbNeeded;
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_INVALID_DEVICE_REQUEST;
 }
 
 /* ------------------------------------------------------------------ */

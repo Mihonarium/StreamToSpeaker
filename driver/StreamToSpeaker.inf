@@ -164,10 +164,19 @@ KSCATEGORY_REALTIME     = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
 KSNAME_Wave             = "Wave"
 KSNAME_Topology         = "Topology"
 
-; KSNODETYPE_SPEAKER — node type GUID for a speaker association,
-; used so the endpoint's jack-type is "Speaker" rather than the
-; "Line Jack" / "AUX Jack" derived from KSNODETYPE_LINE_CONNECTOR.
-KSNODETYPE_SPEAKER        = "{DFF21BE2-F70F-11D0-B917-00A0C9223196}"
+; KSNODETYPE_SPEAKER — node-type GUID from ksmedia.h. Used as
+; PKEY_AudioEndpoint_Association so the Audio Endpoint Builder
+; classifies this endpoint as a speaker (not a line jack), and so
+; PKEY_AudioDevice_EnableEndpointByDefault's render-flow mask
+; actually matches.
+;
+; IMPORTANT: this GUID is from DEFINE_USB_TERMINAL_GUID(0x0301).
+; The value 0xDFF21BE2 (one hex digit off, USB terminal 0x0202)
+; is KSNODETYPE_DESKTOP_MICROPHONE — using the microphone GUID on
+; a render endpoint makes Windows treat the endpoint as a confused
+; capture-flow device, defeating every default-enable / form-factor
+; override and producing the "Internal AUX Jack" display name.
+KSNODETYPE_SPEAKER        = "{DFF21CE1-F70F-11D0-B917-00A0C9223196}"
 
 ; PKEY_Device_FriendlyName — the user-visible endpoint name that
 ; Sound Settings shows. Setting this on EP\0 at install time

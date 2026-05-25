@@ -226,11 +226,18 @@ fn palette_for(dark: bool) -> Palette {
 // -----------------------------------------------------------------------------
 
 pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
+    // with_taskbar(false) removes the taskbar entry permanently —
+    // typical pattern for tray apps. When we "hide to tray" we just
+    // call Win32 ShowWindow(SW_HIDE) directly, which also stops the
+    // window appearing in Alt-Tab. Reasoning + canonical pattern:
+    // emilk/egui Discussion #737, #1978; egui#3654 (Visible(false) is
+    // unreliable at startup) — taskbar gating is the working knob.
     let viewport = egui::ViewportBuilder::default()
         .with_title("Stream To Speaker")
         .with_inner_size([720.0, 800.0])
         .with_min_inner_size([580.0, 620.0])
         .with_visible(true)
+        .with_taskbar(false)
         .with_close_button(true);
 
     let options = eframe::NativeOptions {
@@ -271,6 +278,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 advanced_open: false,
                 onboarding_dismissed: false,
                 last_applied_dark: None,
+                hwnd: None,
             }))
         }),
     );
@@ -293,11 +301,65 @@ struct StreamToSpeakerApp {
     /// mode — apply_theme rebuilds the full Style+Visuals every call
     /// and was being run on every frame.
     last_applied_dark: Option<bool>,
+    /// Raw Win32 HWND, captured on the first `update()` from
+    /// `eframe::Frame::window_handle()`. Used to drive hide/show via
+    /// `ShowWindow` directly — `ViewportCommand::Visible(false)` and
+    /// `Minimized` both have eframe queue-drain bugs that break the
+    /// tray-menu round-trip (emilk/egui#5229, #3655). Bypassing the
+    /// queue with raw Win32 sidesteps the bug entirely.
+    hwnd: Option<isize>,
+}
+
+/// Win32 helpers for hide/show. We do not use `ViewportCommand::Visible`
+/// or `Minimized` because eframe processes those commands only inside
+/// `update()`, which only runs on Windows WM_PAINT — and hidden /
+/// minimised windows don't generate WM_PAINT, so the queued
+/// "show window again" command from the tray sits undelivered.
+/// `ShowWindow` is a synchronous Win32 call that flips visibility at
+/// the OS level, no event loop required. See emilk/egui#5229, #3655.
+#[cfg(windows)]
+fn win_hide(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    unsafe { ShowWindow(hwnd as _, SW_HIDE); }
+}
+
+#[cfg(windows)]
+fn win_show_and_focus(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        ShowWindow, SetForegroundWindow, SW_SHOW, SW_RESTORE,
+    };
+    unsafe {
+        // SW_RESTORE first to un-minimise if the user minimised via the
+        // titlebar; then SW_SHOW guarantees the window is visible.
+        ShowWindow(hwnd as _, SW_RESTORE);
+        ShowWindow(hwnd as _, SW_SHOW);
+        // Foreground may fail per Windows foreground-stealing rules,
+        // but since the user just clicked the tray icon, we have the
+        // foreground-permission grant and SFW should succeed.
+        SetForegroundWindow(hwnd as _);
+    }
 }
 
 impl eframe::App for StreamToSpeakerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.frame_count = self.frame_count.saturating_add(1);
+
+        // Capture the HWND on the first frame and hand it to the tray
+        // so the tray's "Show window" click can call ShowWindow
+        // directly (the only thing that works once the window is
+        // hidden — see win_hide / win_show_and_focus above).
+        if self.hwnd.is_none() {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = frame.window_handle() {
+                if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                    let hwnd = h.hwnd.get();
+                    self.hwnd = Some(hwnd);
+                    if let Some(tray) = self.tray.as_mut() {
+                        tray.set_hwnd(hwnd);
+                    }
+                }
+            }
+        }
 
         if self.last_repaint_request.elapsed() >= Duration::from_millis(100) {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -320,32 +382,31 @@ impl eframe::App for StreamToSpeakerApp {
             tray.pump(&self.app, ctx);
         }
 
-        // Close-button handling. We hide-to-tray with Minimized(true)
-        // rather than Visible(false) — eframe stops calling update()
-        // on a hidden viewport, so queued ViewportCommands (including
-        // a later Visible(true) from the tray's "Show window") would
-        // never be processed. Minimised windows still tick, so the
-        // tray menu remains responsive. See emilk/egui#5229.
+        // Close-button handling. Hide-to-tray uses raw Win32 ShowWindow
+        // (see win_hide above) — eframe ViewportCommands sit
+        // undelivered on hidden viewports.
         let close_pressed = ctx.input(|i| i.viewport().close_requested());
         if close_pressed && self.frame_count > 1 && !self.app.is_shutting_down() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.tray.is_none() {
                 self.app.request_shutdown();
             } else if self.skip_close_confirmation {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                if let Some(hwnd) = self.hwnd {
+                    win_hide(hwnd);
+                }
             } else {
                 self.confirm_close_open = true;
             }
         }
         if self.app.is_shutting_down() {
-            // Drop the tray icon synchronously so it disappears now,
-            // not whenever eframe gets around to dropping the App.
-            // Then force the viewport visible+unminimised so eframe
-            // actually honours the Close — Close on a hidden/minimised
-            // viewport doesn't reliably return from run_native.
+            // Drop the tray icon synchronously so it disappears now.
             self.tray.take();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            // Make sure the window is visible before Close — eframe's
+            // Close on a hidden viewport doesn't reliably return from
+            // run_native. (Cheap: SW_SHOW is a no-op if already shown.)
+            if let Some(hwnd) = self.hwnd {
+                win_show_and_focus(hwnd);
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -1080,16 +1141,14 @@ impl StreamToSpeakerApp {
             self.confirm_close_open = false;
             match a {
                 CloseAction::MinimiseToTray => {
-                    // Minimize (not Visible(false)) so the update loop
-                    // keeps running and tray menu commands like
-                    // "Show window" remain deliverable. See the comment
-                    // on the close-button path above.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    if let Some(hwnd) = self.hwnd {
+                        win_hide(hwnd);
+                    }
                 }
                 CloseAction::Quit => {
                     // request_shutdown flips the atomic; the next
                     // update() tick sees it and runs the Close
-                    // sequence (drop tray, show+unminimise, Close).
+                    // sequence (drop tray, ensure-shown, Close).
                     self.app.request_shutdown();
                     ctx.request_repaint();
                 }

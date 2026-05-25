@@ -82,6 +82,37 @@ if (Test-Path $base) {
 }
 Log "$wiped cached MMDevices entries wiped"
 
+# ----- 4. Restart AudioEndpointBuilder + AudioSrv ----------------------------
+# audiosrv keeps an in-memory copy of every endpoint's metadata
+# (form-factor, jack association, DeviceState). Wiping the registry
+# alone isn't enough on Win11 24H2 — when devcon installs the new
+# INF, the service can re-derive the endpoint from the stale in-mem
+# state and ignore our INF properties. Bouncing the services forces
+# a cold re-read. Causes ~2 s of audio dropout on any currently
+# playing endpoints, but that's unavoidable for a clean re-enrolment.
+Log "restarting AudioEndpointBuilder + AudioSrv to drop stale in-memory state..."
+try {
+    Stop-Service AudioEndpointBuilder -Force -ErrorAction Stop
+    Log "  AudioEndpointBuilder stopped"
+} catch {
+    Log "  Stop-Service AudioEndpointBuilder: $_"
+}
+try {
+    Start-Service AudioEndpointBuilder -ErrorAction Stop
+    Log "  AudioEndpointBuilder restarted"
+} catch {
+    Log "  Start-Service AudioEndpointBuilder: $_"
+}
+# AudioSrv depends on AudioEndpointBuilder; stopping AEB above
+# stopped AudioSrv too. Bring it back if it didn't auto-start.
+try {
+    Start-Service AudioSrv -ErrorAction SilentlyContinue
+    Log "  AudioSrv restarted"
+} catch {
+    # Ignore — already running or will be lazily started when the
+    # first audio client connects.
+}
+
 Log "pre-install cleanup complete"
 "==== Pre-Install finished at $(Get-Date -Format 'u') ====" | Write-Host
 $null = Stop-Transcript -ErrorAction SilentlyContinue
