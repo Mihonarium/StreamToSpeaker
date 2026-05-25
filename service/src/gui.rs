@@ -948,70 +948,111 @@ impl StreamToSpeakerApp {
                 section_label(ui, p, "Latency");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (color, text) = if pending == 0 {
-                        (p.text_tertiary, "in sync".to_string())
+                        (p.text_tertiary, "In sync".to_string())
                     } else if pending > 0 {
-                        (p.warn, format!("trimming {} ms…", pending))
+                        (p.warn, format!("Trimming {} ms…", pending))
                     } else {
-                        (p.warn, format!("padding {} ms…", -pending))
+                        (p.warn, format!("Padding {} ms…", -pending))
                     };
                     ui.label(egui::RichText::new(text).size(12.0).color(color));
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(sp::XS);
 
-            ui.label(
-                egui::RichText::new(
-                    "Speaker too far behind the picture? Trim latency. Audio glitching? Add a touch back.",
-                )
-                .size(12.0)
-                .color(p.text_secondary),
-            );
-            ui.add_space(10.0);
+            // Two-column layout. Each column owns ONE direction of
+            // change, with a single-verb symptom-led explainer above
+            // its two buttons. The previous design was a single row
+            // of four near-identical −/+ buttons under a combined
+            // "trim / pad" sentence, which forced the user to
+            // remember which sign maps to which audio problem (the
+            // explicit user complaint). Splitting visually makes the
+            // direction self-documenting.
+            ui.columns(2, |cols| {
+                // Left column: trim latency (negative pending) for
+                // when audio lags the picture.
+                cols[0].label(
+                    egui::RichText::new("Audio lags the picture?")
+                        .size(12.0)
+                        .strong()
+                        .color(p.text_primary),
+                );
+                cols[0].label(
+                    egui::RichText::new("Trim the buffer so the speaker catches up.")
+                        .size(12.0)
+                        .color(p.text_secondary),
+                );
+                cols[0].add_space(sp::XS);
+                cols[0].horizontal(|ui| {
+                    if secondary_button(ui, p, "−25 ms", 78.0)
+                        .on_hover_text("Reduce latency by 25 ms (smaller step)")
+                        .clicked()
+                    {
+                        self.app.adjust_latency(25);
+                    }
+                    if secondary_button(ui, p, "−100 ms", 86.0)
+                        .on_hover_text(
+                            "Reduce latency by 100 ms. Removes audio gradually over ~2 s so the trim isn't audible.",
+                        )
+                        .clicked()
+                    {
+                        self.app.adjust_latency(100);
+                    }
+                });
 
-            ui.horizontal(|ui| {
-                if secondary_button(ui, p, "−100 ms", 86.0)
-                    .on_hover_text(
-                        "Reduce latency by 100 ms. Drops 100 ms of audio gradually over ~2 s.",
-                    )
-                    .clicked()
-                {
-                    self.app.adjust_latency(100);
-                }
-                if secondary_button(ui, p, "−25 ms", 78.0)
-                    .on_hover_text("Reduce latency by 25 ms (a gentler nudge)")
-                    .clicked()
-                {
-                    self.app.adjust_latency(25);
-                }
-                ui.add_space(24.0);
-                if secondary_button(ui, p, "+25 ms", 78.0)
-                    .on_hover_text("Add 25 ms of latency back (use if drained too far)")
-                    .clicked()
-                {
-                    self.app.adjust_latency(-25);
-                }
-                if secondary_button(ui, p, "+100 ms", 86.0)
-                    .on_hover_text("Add 100 ms of latency back")
-                    .clicked()
-                {
-                    self.app.adjust_latency(-100);
-                }
+                // Right column: pad latency (positive buffer) for
+                // when the speaker glitches / drops out.
+                cols[1].label(
+                    egui::RichText::new("Audio glitching or dropping?")
+                        .size(12.0)
+                        .strong()
+                        .color(p.text_primary),
+                );
+                cols[1].label(
+                    egui::RichText::new("Add headroom so the buffer doesn't run dry.")
+                        .size(12.0)
+                        .color(p.text_secondary),
+                );
+                cols[1].add_space(sp::XS);
+                cols[1].horizontal(|ui| {
+                    if secondary_button(ui, p, "+25 ms", 78.0)
+                        .on_hover_text("Add 25 ms of headroom (smaller step)")
+                        .clicked()
+                    {
+                        self.app.adjust_latency(-25);
+                    }
+                    if secondary_button(ui, p, "+100 ms", 86.0)
+                        .on_hover_text("Add 100 ms of headroom (larger step)")
+                        .clicked()
+                    {
+                        self.app.adjust_latency(-100);
+                    }
+                });
             });
 
-            ui.add_space(12.0);
+            ui.add_space(sp::S);
             ui.separator();
-            ui.add_space(8.0);
+            ui.add_space(sp::XS);
 
-            if danger_button(ui, p, "⟳  Resync speaker", 180.0)
-                .on_hover_text(
-                    "Hard reset (UPnP Stop + Play). Speaker discards its prebuffer — brief audio glitch but trims accumulated latency in one shot.",
-                )
-                .clicked()
-            {
-                if let Err(e) = self.app.resync() {
-                    warn!("resync failed: {}", e);
+            // Resync stays disabled when no speaker is bound — the
+            // call would just warn-and-no-op (audit F-14). Tooltip
+            // explains in plain language; the previous version
+            // mentioned UPnP / prebuffer, both engineer terms.
+            let has_speaker = self.app.current_renderer().is_some();
+            ui.add_enabled_ui(has_speaker, |ui| {
+                let resp = danger_button(ui, p, "⟳  Resync speaker", 180.0);
+                let resp = if has_speaker {
+                    resp.on_hover_text(
+                        "Stops and restarts the speaker. Causes a brief audio click but clears any accumulated latency.",
+                    )
+                } else {
+                    resp.on_hover_text("Connect to a speaker first.")
+                };
+                if resp.clicked() {
+                    if let Err(e) = self.app.resync() {
+                        warn!("resync failed: {}", e);
+                    }
                 }
-            }
+            });
         });
     }
 
