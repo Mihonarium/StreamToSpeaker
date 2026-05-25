@@ -1284,14 +1284,15 @@ impl StreamToSpeakerApp {
                 ui,
                 p,
                 "Clock-drift compensation",
-                "Compensates for the small mismatch between your PC's clock and the speaker's audio crystal. Positive over-produces frames; negative drops them. Try +50 to +100 if the buffer slowly empties out, negative if it slowly overflows.",
+                "Try +50 to +100 ppm if audio gradually falls behind; negative if it gradually gets ahead.",
+                "Your PC and the speaker each have a tiny crystal oscillator that tracks time, and they drift apart by a few parts per million. Over many minutes that drift is enough to push audio out of sync. Positive values make the service produce frames slightly faster than real-time (catches up if the speaker is gaining); negative drops frames (catches up if the speaker is losing). Most setups need 0; if you notice audio creeping out of sync after 10–20 minutes of continuous play, nudge in steps of ±25 ppm until it stays put.",
                 |ui| {
                     ui.add(
                         egui::DragValue::new(&mut ppm)
                             .range(-1000..=1000)
                             .suffix(" ppm"),
                     );
-                    if secondary_button(ui, p, "reset", 60.0).clicked() {
+                    if secondary_button(ui, p, "Reset to 0 ppm", 130.0).clicked() {
                         ppm = 0;
                     }
                 },
@@ -1305,10 +1306,11 @@ impl StreamToSpeakerApp {
                 ui,
                 p,
                 "Silence pacing",
-                "10 ms = real-time. Higher values send slower than real-time during pauses, draining the speaker's prebuffer so post-pause latency is smaller. Don't exceed ~30 — risks underrun.",
+                "Higher than 10 ms shrinks latency after a pause. Stay below ~30 to avoid dropouts.",
+                "When nothing is playing on Windows, the service still sends frames of silence to the speaker (otherwise the speaker drops the connection). The speaker buffers a bit ahead — when real audio comes back, that buffer adds latency before you hear it. Setting this higher than 10 ms makes the silence frames go slower than real-time, draining the buffer during the quiet passages, so post-pause latency is smaller. Too high (>30) and the buffer runs dry and you hear dropouts.",
                 |ui| {
                     ui.add(egui::DragValue::new(&mut pace).range(1..=100).suffix(" ms"));
-                    if secondary_button(ui, p, "reset", 60.0).clicked() {
+                    if secondary_button(ui, p, "Reset to 10 ms", 130.0).clicked() {
                         pace = 10;
                     }
                 },
@@ -1322,14 +1324,15 @@ impl StreamToSpeakerApp {
                 ui,
                 p,
                 "Latency-adjust step",
-                "Max frames added or dropped per audio packet when applying a trim/pad request. Larger = snappier response but more audible click.",
+                "Larger = the −/+ buttons act faster but produce a louder click.",
+                "When you press one of the −/+ buttons in the Latency card, the service adds or drops a few audio frames each packet until it's caught up the requested amount. This setting controls how many frames per packet. Larger values reach the target faster but make a louder click; smaller values are smoother but slower. The default of 4 frames is ~0.09 ms per packet, which most listeners can't hear.",
                 |ui| {
                     ui.add(
                         egui::DragValue::new(&mut step)
                             .range(1..=256)
                             .suffix(" frames"),
                     );
-                    if secondary_button(ui, p, "reset", 60.0).clicked() {
+                    if secondary_button(ui, p, "Reset to 4 frames", 150.0).clicked() {
                         step = 4;
                     }
                 },
@@ -1652,21 +1655,39 @@ fn advanced_row(
     p: &Palette,
     label: &str,
     hint: &str,
+    plain_explain: &str,
     add_control: impl FnOnce(&mut egui::Ui),
 ) {
     // Stacked layout (label/hint on top, controls underneath). Horizontal
     // side-by-side layouts overlap badly when the window is narrow —
     // vertical is robust at any width and reads cleanly.
+    //
+    // Each row carries two depths of explanation:
+    //   - `hint` (always visible, concise, may use terms-of-art)
+    //   - `plain_explain` (revealed on hover of the ⓘ glyph next to
+    //      the label, longer, no jargon — for users who want the
+    //      what-and-why before they touch the control).
     ui.vertical(|ui| {
-        ui.label(
-            egui::RichText::new(label)
-                .strong()
-                .color(p.text_primary),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(label)
+                    .strong()
+                    .color(p.text_primary),
+            );
+            let help = ui.label(
+                egui::RichText::new("ⓘ")
+                    .size(13.0)
+                    .color(p.accent),
+            )
+            .on_hover_text(plain_explain);
+            if help.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Help);
+            }
+        });
         ui.add_space(2.0);
         ui.label(
             egui::RichText::new(hint)
-                .size(11.0)
+                .size(12.0)
                 .color(p.text_secondary),
         );
         ui.add_space(6.0);
