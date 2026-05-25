@@ -66,7 +66,10 @@ DEFINE_PCAUTOMATION_TABLE_PROP(AutomationMute, PropertiesMute);
 static KSJACK_DESCRIPTION BridgeJackDesc =
 {
     KSAUDIO_SPEAKER_STEREO,             /* ChannelMapping    */
-    JACKDESC_RGB(0xB3, 0xC9, 0x8C),     /* Color (green — matches sample) */
+    /* Color: 0x00B3C98C = JACKDESC_RGB(0xB3, 0xC9, 0x8C) (green,
+     * matches simpleaudiosample). The JACKDESC_RGB macro isn't
+     * exposed in the WDK 10.0.26100 ksmedia.h, so inline the value. */
+    0x00B3C98Cu,
     eConnTypeUnknown,                    /* ConnectionType — what speakers use */
     eGeoLocFront,                        /* GeoLocation       */
     eGenLocPrimaryBox,                   /* GenLocation       */
