@@ -717,6 +717,38 @@ impl eframe::App for StreamToSpeakerApp {
             self.last_repaint_request = Instant::now();
         }
 
+        // App-wide keyboard shortcuts (M27). consume_shortcut takes the
+        // event off the input queue so individual widgets don't also
+        // fire on the same press.
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        let sc_rescan = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
+        let sc_resync = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::R);
+        let sc_toggle = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
+        let sc_quit = KeyboardShortcut::new(Modifiers::COMMAND, Key::Q);
+        ctx.input_mut(|i| {
+            if i.consume_shortcut(&sc_rescan) {
+                self.app.trigger_rescan();
+            }
+            if i.consume_shortcut(&sc_resync) {
+                if let Err(e) = self.app.resync() {
+                    self.app.record_error(format!("Resync failed: {}", e));
+                }
+            }
+            if i.consume_shortcut(&sc_toggle) {
+                if self.app.current_renderer().is_some() {
+                    let new_state = !self.app.is_streaming_enabled();
+                    if let Err(e) = self.app.set_streaming_enabled(new_state) {
+                        self.app.record_error(
+                            format!("Couldn't change streaming state: {}", e),
+                        );
+                    }
+                }
+            }
+            if i.consume_shortcut(&sc_quit) {
+                self.app.request_shutdown();
+            }
+        });
+
         // Reapply theme only when the resolved mode actually changes
         // or the OS accent shifts (System mode follows the Windows
         // accent colour live). apply_theme rebuilds the full
@@ -1138,7 +1170,7 @@ impl StreamToSpeakerApp {
                 format!("Streaming to {} disabled", r.friendly_name),
                 format!("{} is free for other apps. Press Enable to resume streaming.", r.friendly_name),
                 Some("Enable streaming"),
-                Some("Reconnect to the last speaker and resume streaming"),
+                Some("Reconnect to the last speaker and resume streaming (Ctrl+E)"),
             ),
             (Some(r), true, true) => (
                 "▶",
@@ -1146,7 +1178,7 @@ impl StreamToSpeakerApp {
                 format!("Streaming to {}", r.friendly_name),
                 format!("{}  ·  {} packets/sec", r.ip, self.packets_per_sec()),
                 Some("Disable streaming"),
-                Some("Stop streaming and release the speaker for other apps"),
+                Some("Stop streaming and release the speaker for other apps (Ctrl+E)"),
             ),
             (Some(r), true, false) => (
                 "‖",
@@ -1154,7 +1186,7 @@ impl StreamToSpeakerApp {
                 format!("Standing by on {}", r.friendly_name),
                 format!("{}  ·  waiting for audio", r.ip),
                 Some("Disable streaming"),
-                Some("Stop streaming and release the speaker for other apps"),
+                Some("Stop streaming and release the speaker for other apps (Ctrl+E)"),
             ),
         };
 
@@ -1266,7 +1298,7 @@ impl StreamToSpeakerApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if secondary_button(ui, p, "↻  Rescan", 92.0)
                         .on_hover_text(
-                            "Search the network for speakers now. Otherwise this runs every few minutes.",
+                            "Search the network for speakers now. Otherwise this runs every few minutes. (Ctrl+R)",
                         )
                         .clicked()
                     {
@@ -1499,7 +1531,7 @@ impl StreamToSpeakerApp {
                 let resp = danger_button(ui, p, "⟳  Resync speaker", 180.0);
                 let resp = if has_speaker {
                     resp.on_hover_text(
-                        "Stops and restarts the speaker. Causes a brief audio click but clears any accumulated latency.",
+                        "Stops and restarts the speaker. Causes a brief audio click but clears any accumulated latency. (Ctrl+Shift+R)",
                     )
                 } else {
                     resp.on_hover_text("Connect to a speaker first.")
