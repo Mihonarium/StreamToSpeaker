@@ -174,6 +174,41 @@ fn main() {
         attach_parent_console();
     }
 
+    // Crash visibility. With windows_subsystem="windows" the default
+    // panic handler writes to stderr — which is a dead handle in GUI
+    // mode, so a panic just kills the process with no on-screen
+    // indication. Install a hook that:
+    //   1. logs the panic + a backtrace into the log file (so the
+    //      Help menu's "Open log folder" gives the user something to
+    //      report);
+    //   2. on Windows GUI mode, shows a MessageBox so they at least
+    //      see WHY the window disappeared, instead of "task manager
+    //      shows it but nothing's painted."
+    #[allow(unused_variables)]
+    let headless = cli.headless;
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg: String = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<Any>".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let full = format!("panic at {}: {}\n{}", location, msg, bt);
+        log::error!("{}", full);
+        #[cfg(windows)]
+        if !headless {
+            show_crash_dialog(&format!("Stream To Speaker hit a fatal error:\n\n{}\n\n{}\n\nFull backtrace is in the log file (Help → Open log folder).",
+                location, msg));
+        }
+    }));
+
     // Create a named mutex so the Inno Setup installer can detect a
     // running instance (matched by AppMutex in StreamToSpeaker.iss).
     // The handle is intentionally leaked — it lives for the process
@@ -202,7 +237,35 @@ fn main() {
 
     if let Err(e) = run(cli) {
         error!("fatal: {:#}", e);
+        #[cfg(windows)]
+        if !headless {
+            show_crash_dialog(&format!(
+                "Stream To Speaker couldn't start:\n\n{:#}\n\nSee the log file for details (Help → Open log folder in a working instance, or %LOCALAPPDATA%\\StreamToSpeaker\\stream-to-speaker.log).",
+                e
+            ));
+        }
         std::process::exit(1);
+    }
+}
+
+/// Windows MessageBox for fatal-error visibility. No-op on non-Windows.
+#[cfg(windows)]
+fn show_crash_dialog(body: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_TOPMOST, MB_SETFOREGROUND,
+    };
+    let body_w: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
+    let title_w: Vec<u16> = "Stream To Speaker"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body_w.as_ptr(),
+            title_w.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND,
+        );
     }
 }
 
@@ -386,6 +449,13 @@ fn run_gui_mode(app: Arc<App>, no_tray: bool) -> Result<()> {
     // Run the GUI (blocks until window/tray exits).
     if let Err(e) = stream_to_speaker::gui::run(app.clone(), !no_tray) {
         warn!("GUI exited with error: {:#}", e);
+        // Surface to the user — without this the process just
+        // disappears from the screen (window never created) but
+        // remains in the tray, looking like "no window opened at all".
+        show_crash_dialog(&format!(
+            "Stream To Speaker couldn't open its window:\n\n{:#}\n\nLog file: %LOCALAPPDATA%\\StreamToSpeaker\\stream-to-speaker.log",
+            e
+        ));
     }
 
     // Tell the audio loop to stop. We deliberately do NOT join() it:

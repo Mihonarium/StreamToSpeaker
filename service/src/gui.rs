@@ -234,6 +234,63 @@ fn try_enable_mica(_hwnd: isize) -> bool {
     false
 }
 
+/// Detect and recover from "window persisted off every connected
+/// monitor". eframe's `persist_window: true` stores the previous
+/// window rect; if the user disconnected a monitor, switched a
+/// laptop dock, or upgraded from a binary that wrote out a different
+/// coordinate system, the restored position can land outside any
+/// monitor's bounds. The window still exists, the kernel still
+/// scheduled paints into it — but the user sees nothing.
+///
+/// We use `MonitorFromRect(..., MONITOR_DEFAULTTONULL)`: if the
+/// returned monitor handle is null, no monitor intersects the
+/// window's rect, and we centre it on the primary monitor.
+#[cfg(windows)]
+fn rescue_offscreen_window(hwnd: isize) {
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, MONITORINFO,
+        MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SetWindowPos, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER,
+    };
+    unsafe {
+        let h = hwnd as _;
+        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        if GetWindowRect(h, &mut rect) == 0 {
+            return;
+        }
+        let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONULL);
+        if !monitor.is_null() {
+            return; // intersects a monitor, all good
+        }
+        log::warn!(
+            "window position l={} t={} r={} b={} is off every connected monitor — re-centring on primary",
+            rect.left, rect.top, rect.right, rect.bottom
+        );
+        let primary = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        if primary.is_null() {
+            return;
+        }
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(primary, &mut mi) == 0 {
+            return;
+        }
+        let w = rect.right - rect.left;
+        let h_dim = rect.bottom - rect.top;
+        let mon_w = mi.rcWork.right - mi.rcWork.left;
+        let mon_h = mi.rcWork.bottom - mi.rcWork.top;
+        let new_x = mi.rcWork.left + (mon_w - w) / 2;
+        let new_y = mi.rcWork.top + (mon_h - h_dim) / 2;
+        SetWindowPos(h, HWND_TOP, new_x, new_y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    }
+}
+
+#[cfg(not(windows))]
+fn rescue_offscreen_window(_hwnd: isize) {}
+
 #[derive(Copy, Clone)]
 struct Palette {
     // Surfaces
@@ -678,6 +735,16 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 // Opt into Win11 Mica. Silently no-ops on Win10.
                 // See try_enable_mica for the transparency follow-up.
                 let _ = try_enable_mica(h);
+                // Recovery: if the window position eframe restored
+                // from disk lands outside every connected monitor
+                // (user disconnected a monitor since last launch, or
+                // their previous binary saved a position the new
+                // version doesn't), nudge it back to the primary
+                // monitor centre. Without this the window IS there —
+                // just painted at e.g. (-32000, -32000) — so task
+                // manager shows the process and the user sees
+                // nothing on screen.
+                rescue_offscreen_window(h);
             }
 
             let skip_close_confirmation = app_for_eframe.is_always_minimise_to_tray();
