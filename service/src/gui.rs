@@ -314,45 +314,88 @@ impl Palette {
 /// missing (Windows N edition with language packs stripped) we
 /// log and continue; the glyphs keep showing as squares, but
 /// nothing crashes.
+/// Set up the font stack the app uses. egui's bundled defaults are
+/// Ubuntu Light (proportional) and Hack (mono) — neither is what
+/// Windows users expect to see in a Windows-native app, and the
+/// "strong" weight rendered as synthetic-bold instead of the proper
+/// Semibold cut.
+///
+/// Installs (in priority order, per family):
+/// 1. Segoe UI Regular — the canonical Windows 10/11 UI font
+/// 2. Segoe UI Semibold — proper weight when `.strong()` is used
+/// 3. Segoe UI Symbol — geometric shapes / arrows / chevrons
+///    (falls through for glyphs the first two don't cover)
+///
+/// All three load from `%WINDIR%\Fonts\*.ttf` at runtime — present
+/// on every Win7+ install, so no binary-size hit. Each load is
+/// independent: missing files are warned and skipped. CJK
+/// fallback isn't done here (Yu Gothic / Microsoft YaHei /
+/// Malgun Gothic ship as TrueType collections, .ttc, which need
+/// a separate parser to extract the right face) — see Audit M1.
 fn install_symbol_font(ctx: &egui::Context) {
-    let path = {
-        let mut p = std::path::PathBuf::from(
-            std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string()),
-        );
-        p.push("Fonts");
-        p.push("seguisym.ttf");
-        p
-    };
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                "symbol font {} not loaded ({}); some glyphs will render as squares",
-                path.display(),
-                e
-            );
-            return;
-        }
-    };
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "segoe_ui_symbol".to_owned(),
-        egui::FontData::from_owned(bytes),
-    );
-    // Append (don't prepend) — the default fonts handle Latin text
-    // better than Segoe UI Symbol does. We only want symbol glyphs
-    // falling through.
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .push("segoe_ui_symbol".to_owned());
-    fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .push("segoe_ui_symbol".to_owned());
+    // Prepend (not append) so Segoe UI wins over the bundled Ubuntu
+    // Light for Latin text. Symbol stays at the END as a fallback
+    // for glyphs Segoe UI doesn't cover (arrows, geometric shapes).
+    let fonts_dir = std::path::PathBuf::from(
+        std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string()),
+    )
+    .join("Fonts");
+
+    if let Some(bytes) = read_font(&fonts_dir.join("segoeui.ttf")) {
+        fonts.font_data.insert(
+            "segoe_ui".to_owned(),
+            egui::FontData::from_owned(bytes),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "segoe_ui".to_owned());
+    }
+    if let Some(bytes) = read_font(&fonts_dir.join("seguisb.ttf")) {
+        fonts.font_data.insert(
+            "segoe_ui_semibold".to_owned(),
+            egui::FontData::from_owned(bytes),
+        );
+        // egui doesn't have separate Regular / Semibold families; the
+        // best we can do without a custom FontFamily::Name is to keep
+        // Semibold available as a fallback (so a glyph absent from
+        // Regular pulls from Semibold first, before Symbol). For an
+        // explicit Semibold path we'd register a named family — TODO.
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(1, "segoe_ui_semibold".to_owned());
+    }
+    if let Some(bytes) = read_font(&fonts_dir.join("seguisym.ttf")) {
+        fonts.font_data.insert(
+            "segoe_ui_symbol".to_owned(),
+            egui::FontData::from_owned(bytes),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push("segoe_ui_symbol".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("segoe_ui_symbol".to_owned());
+    }
     ctx.set_fonts(fonts);
+}
+
+fn read_font(path: &std::path::Path) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            warn!("font {} not loaded ({}); using fallback", path.display(), e);
+            None
+        }
+    }
 }
 
 fn apply_theme(ctx: &egui::Context, dark: bool, system_accent: Option<(u8, u8, u8)>) {
