@@ -1510,13 +1510,25 @@ fn speaker_row(
 ) {
     let active = sp.active;
 
-    // The row uses two-pass painting: first we allocate space, then we
-    // paint into it with hover/active-aware colours. This is what egui
-    // recommends for custom interactive widgets so the click target +
-    // hover detection are tied to the actual painted area.
+    // Two-pass painting: allocate, then paint with hover/active/focus-
+    // aware colours. The Response goes through `ui.interact` with a
+    // stable id derived from the speaker — that's what makes the row
+    // a Tab stop (Accessibility B-02; previously a bare allocate +
+    // Sense::click() rect was pointer-only, blocking the app's
+    // primary task for keyboard-only users).
     let height = 44.0;
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    let id = ui.id().with(&sp.id);
+    let response = ui.interact(rect, id, egui::Sense::click());
+
+    // Keyboard activation: Enter or Space when this row is focused.
+    let kbd_activate = response.has_focus()
+        && ui.input(|i| {
+            i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)
+        });
 
     let row_fill = if active {
         p.overlay
@@ -1535,6 +1547,16 @@ fn speaker_row(
 
     ui.painter()
         .rect(rect, RADIUS_CONTROL, row_fill, egui::Stroke::new(1.0, row_stroke));
+
+    // Explicit focus ring for keyboard users — egui doesn't paint
+    // one on a bare ui.interact rect.
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            RADIUS_CONTROL,
+            egui::Stroke::new(2.0, p.accent),
+        );
+    }
 
     // Radio indicator on the left.
     let indicator_center = egui::pos2(rect.left() + 18.0, rect.center().y);
@@ -1567,11 +1589,11 @@ fn speaker_row(
         p.text_tertiary,
     );
 
-    if response.hovered() {
+    if response.hovered() && response.enabled() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
-    if response.clicked() && !active {
+    if (response.clicked() || kbd_activate) && !active {
         on_click(&sp.id);
     }
 
