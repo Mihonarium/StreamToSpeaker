@@ -590,7 +590,7 @@ fn card<R>(ui: &mut egui::Ui, p: &Palette, content: impl FnOnce(&mut egui::Ui) -
     egui::Frame::none()
         .fill(p.card)
         .stroke(egui::Stroke::new(1.0, p.divider))
-        .rounding(12.0)
+        .rounding(RADIUS_SURFACE)
         .inner_margin(egui::Margin::symmetric(18.0, 16.0))
         .show(ui, content)
         .inner
@@ -635,8 +635,8 @@ fn primary_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -
     )
     .fill(p.accent)
     .stroke(egui::Stroke::new(1.0, p.accent_hover))
-    .rounding(8.0);
-    clickable(ui.add_sized([min_width, 32.0], btn))
+    .rounding(RADIUS_CONTROL);
+    clickable(ui.add_sized([min_width, CONTROL_HEIGHT], btn))
 }
 
 /// Secondary button — outlined, neutral background. For tertiary actions
@@ -645,8 +645,8 @@ fn secondary_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32)
     let btn = egui::Button::new(egui::RichText::new(label).color(p.text_primary))
         .fill(p.card)
         .stroke(egui::Stroke::new(1.0, p.divider))
-        .rounding(8.0);
-    clickable(ui.add_sized([min_width, 32.0], btn))
+        .rounding(RADIUS_CONTROL);
+    clickable(ui.add_sized([min_width, CONTROL_HEIGHT], btn))
 }
 
 /// Tertiary / link-style button — accent-coloured text on transparent
@@ -660,8 +660,8 @@ fn link_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -> e
     )
     .fill(egui::Color32::TRANSPARENT)
     .stroke(egui::Stroke::new(1.0, p.accent.gamma_multiply(0.45)))
-    .rounding(8.0);
-    clickable(ui.add_sized([min_width, 32.0], btn))
+    .rounding(RADIUS_CONTROL);
+    clickable(ui.add_sized([min_width, CONTROL_HEIGHT], btn))
 }
 
 /// Danger button — red text + thin red border. For "this glitches the audio"
@@ -671,8 +671,8 @@ fn danger_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) ->
     let btn = egui::Button::new(egui::RichText::new(label).color(p.danger))
         .fill(p.card)
         .stroke(egui::Stroke::new(1.0, p.danger.gamma_multiply(0.5)))
-        .rounding(8.0);
-    clickable(ui.add_sized([min_width, 32.0], btn))
+        .rounding(RADIUS_CONTROL);
+    clickable(ui.add_sized([min_width, CONTROL_HEIGHT], btn))
 }
 
 impl StreamToSpeakerApp {
@@ -702,7 +702,7 @@ impl StreamToSpeakerApp {
         egui::Frame::none()
             .fill(p.card)
             .stroke(egui::Stroke::new(1.0, p.divider))
-            .rounding(8.0)
+            .rounding(RADIUS_CONTROL)
             .inner_margin(egui::Margin::same(2.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -717,8 +717,8 @@ impl StreamToSpeakerApp {
                         let btn = egui::Button::new(btn_text)
                             .fill(if selected { p.accent } else { egui::Color32::TRANSPARENT })
                             .stroke(egui::Stroke::NONE)
-                            .rounding(6.0);
-                        if clickable(ui.add_sized([60.0, 28.0], btn))
+                            .rounding(RADIUS_CONTROL);
+                        if clickable(ui.add_sized([60.0, CONTROL_HEIGHT], btn))
                             .on_hover_text(tip)
                             .clicked()
                         {
@@ -850,7 +850,7 @@ impl StreamToSpeakerApp {
         egui::Frame::none()
             .fill(p.card)
             .stroke(egui::Stroke::new(1.0, p.divider))
-            .rounding(12.0)
+            .rounding(RADIUS_SURFACE)
             .inner_margin(egui::Margin {
                 left: 0.0,
                 right: 18.0,
@@ -1312,7 +1312,7 @@ impl StreamToSpeakerApp {
                 egui::Frame::window(&ctx.style())
                     .fill(p.card)
                     .stroke(egui::Stroke::new(1.0, p.divider))
-                    .rounding(12.0)
+                    .rounding(RADIUS_SURFACE)
                     .inner_margin(22.0),
             )
             .show(ctx, |ui| {
@@ -1419,7 +1419,7 @@ fn speaker_row(
     };
 
     ui.painter()
-        .rect(rect, 8.0, row_fill, egui::Stroke::new(1.0, row_stroke));
+        .rect(rect, RADIUS_CONTROL, row_fill, egui::Stroke::new(1.0, row_stroke));
 
     // Radio indicator on the left.
     let indicator_center = egui::pos2(rect.left() + 18.0, rect.center().y);
@@ -1496,7 +1496,7 @@ fn stat_pill(ui: &mut egui::Ui, p: &Palette, value: &str, label: &str) {
     egui::Frame::none()
         .fill(p.card_hover)
         .stroke(egui::Stroke::new(1.0, p.divider))
-        .rounding(8.0)
+        .rounding(RADIUS_CONTROL)
         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
         .show(ui, |ui| {
             ui.vertical(|ui| {
