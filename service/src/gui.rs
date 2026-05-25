@@ -1229,6 +1229,18 @@ impl StreamToSpeakerApp {
             let resp = ui
                 .interact(rect, id, egui::Sense::click())
                 .on_hover_text("Tuning knobs for power users");
+            // Expose to AccessKit / screen readers.
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    resp.enabled(),
+                    if self.advanced_open {
+                        "Advanced (expanded)"
+                    } else {
+                        "Advanced (collapsed)"
+                    },
+                )
+            });
             if resp.hovered() && resp.enabled() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -1592,6 +1604,17 @@ fn speaker_row(
     );
     let id = ui.id().with(&sp.id);
     let response = ui.interact(rect, id, egui::Sense::click());
+    // Tell AccessKit / UI Automation what this rect is. Without
+    // WidgetInfo, painter-based widgets are invisible to screen
+    // readers (Accessibility G-01).
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::RadioButton,
+            response.enabled(),
+            active,
+            &sp.friendly_name,
+        )
+    });
 
     // Keyboard activation: Enter or Space when this row is focused.
     let kbd_activate = response.has_focus()
