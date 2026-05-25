@@ -29,7 +29,6 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(windows)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-#[cfg(windows)]
 use std::thread;
 use std::time::Duration;
 
@@ -259,6 +258,36 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
 
+    // Driver-event consumer.
+    #[cfg(windows)]
+    spawn_driver_event_consumer(app.clone(), &cli);
+
+    // Ctrl-C handler — set the shutdown flag.
+    install_signal_handler(app.clone());
+
+    // Apply initial values from CLI to the runtime atomics.
+    app.set_silence_pace_ms(cli.silence_pace_ms);
+    app.set_rate_fudge_ppm(cli.rate_fudge_ppm);
+    app.set_latency_adjust_step_frames(cli.latency_adjust_step_frames);
+
+    // Start the audio loop BEFORE we issue any UPnP Play. With the
+    // old order (Play → spawn audio thread) the speaker connected to
+    // /stream.raw before the audio loop was producing data — Sonos
+    // would receive an empty HTTP body, time out, and stay in a
+    // "I'm connected but not playing" state until the user hit
+    // Resync. Spawning audio first means silence injection is already
+    // running by the time we send Play, so the speaker gets a
+    // populated stream from byte zero.
+    let audio_app = app.clone();
+    let _audio_thread = thread::Builder::new()
+        .name("stream-to-speaker-audio".to_string())
+        .spawn(move || {
+            if let Err(e) = audio_loop::run(audio_app.clone(), source) {
+                error!("audio loop exited with error: {:#}", e);
+            }
+        })
+        .context("spawning audio thread")?;
+
     // Resolve initial speaker.
     //
     // Priority chain:
@@ -301,56 +330,33 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    // Driver-event consumer.
-    #[cfg(windows)]
-    spawn_driver_event_consumer(app.clone(), &cli);
-
-    // Ctrl-C handler — set the shutdown flag.
-    install_signal_handler(app.clone());
-
-    // Apply initial values from CLI to the runtime atomics.
-    app.set_silence_pace_ms(cli.silence_pace_ms);
-    app.set_rate_fudge_ppm(cli.rate_fudge_ppm);
-    app.set_latency_adjust_step_frames(cli.latency_adjust_step_frames);
-
     if cli.headless {
-        run_headless(app, source)
+        run_headless(app)
     } else {
-        run_gui_mode(app, source, cli.no_tray)
+        run_gui_mode(app, cli.no_tray)
     }
 }
 
 // -----------------------------------------------------------------------------
-// Headless run — audio loop on main thread
+// Headless run — block on shutdown signal; audio is on the bg thread
+// spawned in run() above.
 // -----------------------------------------------------------------------------
 
-fn run_headless(app: Arc<App>, source: Box<dyn AudioSource>) -> Result<()> {
-    audio_loop::run(app.clone(), source)?;
+fn run_headless(app: Arc<App>) -> Result<()> {
+    while !app.is_shutting_down() {
+        std::thread::sleep(Duration::from_millis(200));
+    }
     shutdown_cleanup(&app);
     Ok(())
 }
 
 // -----------------------------------------------------------------------------
-// GUI run — audio loop on background thread, eframe on main thread
+// GUI run — eframe on main thread; audio is on the bg thread spawned
+// in run() above.
 // -----------------------------------------------------------------------------
 
 #[cfg(windows)]
-fn run_gui_mode(app: Arc<App>, source: Box<dyn AudioSource>, no_tray: bool) -> Result<()> {
-    // No console-hiding needed: windows_subsystem = "windows" means
-    // we were never allocated one in the first place.
-
-    // Audio loop on a dedicated thread so it can MMCSS itself without
-    // interfering with the GUI event loop.
-    let audio_app = app.clone();
-    let _audio_thread = thread::Builder::new()
-        .name("stream-to-speaker-audio".to_string())
-        .spawn(move || {
-            if let Err(e) = audio_loop::run(audio_app.clone(), source) {
-                error!("audio loop exited with error: {:#}", e);
-            }
-        })
-        .context("spawning audio thread")?;
-
+fn run_gui_mode(app: Arc<App>, no_tray: bool) -> Result<()> {
     // Run the GUI (blocks until window/tray exits).
     if let Err(e) = stream_to_speaker::gui::run(app.clone(), !no_tray) {
         warn!("GUI exited with error: {:#}", e);
@@ -368,7 +374,7 @@ fn run_gui_mode(app: Arc<App>, source: Box<dyn AudioSource>, no_tray: bool) -> R
 }
 
 #[cfg(not(windows))]
-fn run_gui_mode(_app: Arc<App>, _source: Box<dyn AudioSource>, _no_tray: bool) -> Result<()> {
+fn run_gui_mode(_app: Arc<App>, _no_tray: bool) -> Result<()> {
     anyhow::bail!("GUI mode is Windows-only — pass --headless on this platform")
 }
 
