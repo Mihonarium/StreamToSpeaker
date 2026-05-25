@@ -264,23 +264,17 @@ impl App {
         *guard = Some(new_session);
         *self.last_speaker_id.lock().unwrap() = Some(id.to_string());
         self.streaming_enabled.store(true, Ordering::Release);
-        // Persist so the next launch can auto-reconnect, and dismiss
-        // the onboarding card — once the user has successfully bound
-        // a speaker (whether manually or via auto-reconnect), step 2
-        // of the getting-started guide is done and the card is just
-        // noise on every subsequent launch.
+        // Persist so the next launch can auto-reconnect. We do NOT
+        // auto-dismiss the onboarding here — picking a speaker only
+        // proves step 2 is done; step 1 (routing Windows audio to
+        // Stream To Speaker) is the actual prerequisite for audio
+        // to flow, and a user can complete step 2 without realising
+        // they still need step 1. The card stays visible until they
+        // click "Hide this guide" themselves.
         {
             let mut uc = self.user_config.lock().unwrap();
-            let mut changed = false;
             if uc.last_speaker_id.as_deref() != Some(id) {
                 uc.last_speaker_id = Some(id.to_string());
-                changed = true;
-            }
-            if !uc.onboarding_dismissed {
-                uc.onboarding_dismissed = true;
-                changed = true;
-            }
-            if changed {
                 uc.save();
             }
         }
