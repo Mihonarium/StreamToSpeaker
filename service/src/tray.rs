@@ -38,10 +38,20 @@ pub struct TrayHandle {
     status_item: MenuItem,
     enable_toggle: CheckMenuItem,
     open_web_item: MenuItem,
+    // Speaker-dependent items disabled in pump() whenever
+    // current_renderer() is None — clicking them would just
+    // warn-and-no-op (audit Heuristics F-16).
+    switch_speaker_item: MenuItem,
+    trim_25_item: MenuItem,
+    trim_100_item: MenuItem,
+    pad_25_item: MenuItem,
+    pad_100_item: MenuItem,
+    resync_item: MenuItem,
 
     last_label: String,
     last_enabled: bool,
     last_web_enabled: bool,
+    last_speaker_bound: bool,
 
     /// HWND of the GUI window. Shared with the bg event thread; that
     /// thread calls raw Win32 `ShowWindow` on it when the user clicks
@@ -161,9 +171,16 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
         status_item,
         enable_toggle,
         open_web_item: open_web,
+        switch_speaker_item: switch_speaker,
+        trim_25_item: trim_25,
+        trim_100_item: trim_100,
+        pad_25_item: pad_25,
+        pad_100_item: pad_100,
+        resync_item: resync,
         last_label: String::new(),
         last_enabled: app.is_streaming_enabled(),
         last_web_enabled: web_on,
+        last_speaker_bound: false,
         hwnd,
     })
 }
@@ -197,6 +214,25 @@ impl TrayHandle {
         if enabled != self.last_enabled {
             self.enable_toggle.set_checked(enabled);
             self.last_enabled = enabled;
+        }
+
+        // Disable speaker-dependent menu items when no speaker is
+        // bound — Trim/Pad/Resync would just warn-and-no-op
+        // (Heuristics F-16). Switch speaker stays enabled so users
+        // can still open the picker from the tray.
+        let speaker_bound = app.current_renderer().is_some();
+        if speaker_bound != self.last_speaker_bound {
+            self.trim_25_item.set_enabled(speaker_bound);
+            self.trim_100_item.set_enabled(speaker_bound);
+            self.pad_25_item.set_enabled(speaker_bound);
+            self.pad_100_item.set_enabled(speaker_bound);
+            self.resync_item.set_enabled(speaker_bound);
+            // Enable-toggle is meaningful only when a speaker exists
+            // to enable/disable streaming TO. Switch speaker always
+            // works.
+            self.enable_toggle.set_enabled(speaker_bound);
+            let _ = &self.switch_speaker_item; // (always enabled)
+            self.last_speaker_bound = speaker_bound;
         }
 
         // Sync the "Open web UI" item label + enabled state.
