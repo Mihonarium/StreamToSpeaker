@@ -1835,29 +1835,16 @@ impl StreamToSpeakerApp {
 
             ui.add_space(8.0);
 
-            let mut ppm = self.app.rate_fudge_ppm.load(Ordering::Relaxed);
+            let mut ppm = self.app.rate_fudge_ppm.load(Ordering::Relaxed) as i64;
             advanced_row(
                 ui,
                 p,
                 "Clock-drift compensation",
                 "Try +50 to +100 ppm if audio gradually falls behind; negative if it gradually gets ahead.",
                 "Your PC and the speaker each have a tiny crystal oscillator that tracks time, and they drift apart by a few parts per million. Over many minutes that drift is enough to push audio out of sync. Positive values make the service produce frames slightly faster than real-time (catches up if the speaker is gaining); negative drops frames (catches up if the speaker is losing). Most setups need 0; if you notice audio creeping out of sync after 10–20 minutes of continuous play, nudge in steps of ±25 ppm until it stays put.",
-                |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut ppm)
-                            .range(-1000..=1000)
-                            .suffix(" ppm")
-                            // m21: don't apply on every keystroke —
-                            // typing "100" was briefly applying 1
-                            // then 10 then 100 each frame.
-                            .update_while_editing(false),
-                    );
-                    if secondary_button(ui, p, "Reset to 0 ppm", 130.0).clicked() {
-                        ppm = 0;
-                    }
-                },
+                |ui| advanced_slider_row(ui, p, &mut ppm, -1000..=1000, " ppm", 0, "0 ppm"),
             );
-            self.app.set_rate_fudge_ppm(ppm);
+            self.app.set_rate_fudge_ppm(ppm.clamp(-1000, 1000) as i32);
 
             ui.add_space(12.0);
 
@@ -1868,17 +1855,7 @@ impl StreamToSpeakerApp {
                 "Silence pacing",
                 "Higher than 10 ms shrinks latency after a pause. Stay below ~30 to avoid dropouts.",
                 "When nothing is playing on Windows, the service still sends frames of silence to the speaker (otherwise the speaker drops the connection). The speaker buffers a bit ahead — when real audio comes back, that buffer adds latency before you hear it. Setting this higher than 10 ms makes the silence frames go slower than real-time, draining the buffer during the quiet passages, so post-pause latency is smaller. Too high (>30) and the buffer runs dry and you hear dropouts.",
-                |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut pace)
-                            .range(1..=100)
-                            .suffix(" ms")
-                            .update_while_editing(false),
-                    );
-                    if secondary_button(ui, p, "Reset to 10 ms", 130.0).clicked() {
-                        pace = 10;
-                    }
-                },
+                |ui| advanced_slider_row(ui, p, &mut pace, 1..=100, " ms", 10, "10 ms"),
             );
             self.app.set_silence_pace_ms(pace.max(1) as u64);
 
@@ -1891,17 +1868,7 @@ impl StreamToSpeakerApp {
                 "Latency-adjust step",
                 "Larger = the −/+ buttons act faster but produce a louder click.",
                 "When you press one of the −/+ buttons in the Latency card, the service adds or drops a few audio frames each packet until it's caught up the requested amount. This setting controls how many frames per packet. Larger values reach the target faster but make a louder click; smaller values are smoother but slower. The default of 4 frames is ~0.09 ms per packet, which most listeners can't hear.",
-                |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut step)
-                            .range(1..=256)
-                            .suffix(" frames")
-                            .update_while_editing(false),
-                    );
-                    if secondary_button(ui, p, "Reset to 4 frames", 150.0).clicked() {
-                        step = 4;
-                    }
-                },
+                |ui| advanced_slider_row(ui, p, &mut step, 1..=256, " frames", 4, "4 frames"),
             );
             self.app.set_latency_adjust_step_frames(step.max(1) as u32);
         });
@@ -2305,6 +2272,55 @@ fn advanced_row(
             add_control(ui);
         });
     });
+}
+
+/// M15: pairing for an Advanced numeric setting — Slider for gross
+/// dragging across the full range, DragValue for fine / precise typing,
+/// Reset to default. DragValue alone (the previous layout) made it
+/// hard to feel out where the "useful" zone of a range was; Slider
+/// alone made it hard to type an exact value. Together they cover both.
+///
+/// The slider gets whatever width remains after the DragValue and Reset
+/// button — so at narrow window widths the slider compresses gracefully
+/// instead of pushing the other controls off the right edge.
+fn advanced_slider_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    value: &mut i64,
+    range: std::ops::RangeInclusive<i64>,
+    suffix: &str,
+    default: i64,
+    default_label: &str,
+) {
+    let dragvalue_w = 96.0;
+    let reset_w = 80.0;
+    let gap = sp::S;
+    let avail = ui.available_width();
+    let slider_w = (avail - dragvalue_w - reset_w - 2.0 * gap).max(80.0);
+    let prev_slider_w = ui.spacing().slider_width;
+    ui.spacing_mut().slider_width = slider_w;
+    ui.add(
+        egui::Slider::new(value, range.clone())
+            .show_value(false)
+            .clamping(egui::SliderClamping::Always),
+    );
+    ui.spacing_mut().slider_width = prev_slider_w;
+    ui.add_space(gap);
+    ui.add(
+        egui::DragValue::new(value)
+            .range(range)
+            .suffix(suffix)
+            // m21: don't apply on every keystroke — typing "100" was
+            // briefly applying 1 then 10 then 100 each frame.
+            .update_while_editing(false),
+    );
+    ui.add_space(gap);
+    if secondary_button(ui, p, "Reset", reset_w)
+        .on_hover_text(format!("Reset to {}", default_label))
+        .clicked()
+    {
+        *value = default;
+    }
 }
 
 fn stat_pill(
