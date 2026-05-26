@@ -595,7 +595,24 @@ fn apply_theme(ctx: &egui::Context, dark: bool, system_accent: Option<(u8, u8, u
     visuals.widgets.noninteractive.rounding = RADIUS_CONTROL.into();
 
     // Inactive (button at rest)
-    visuals.widgets.inactive.bg_fill = p.card;
+    //
+    // `inactive.bg_fill` is ALSO the colour egui::Slider hard-codes
+    // for its rail (slider.rs:766 — `widget_visuals.inactive.bg_fill`,
+    // regardless of interact state). With bg_fill = p.card, the rail
+    // was painted card-on-card — completely invisible, leaving only
+    // the small outlined handle floating with no track to anchor
+    // against ("not displayed on an obvious axis"). Promoted to
+    // p.divider — already the colour used for card borders, so the
+    // rail reads as a structural line in the same vocabulary, and at
+    // ~3-ish-to-1 against the card it's plainly visible.
+    //
+    // Side-effect: DragValue's input background also picks this up
+    // (DragValue uses the inactive state's bg_fill for its at-rest
+    // surface). That actually reads better than card-on-card — looks
+    // like a real input field instead of an unbordered slot. Buttons
+    // are unaffected because our button helpers set `.fill(p.card)`
+    // explicitly on the egui::Button.
+    visuals.widgets.inactive.bg_fill = p.divider;
     visuals.widgets.inactive.weak_bg_fill = p.card;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, p.divider);
     visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.text_primary);
@@ -640,6 +657,14 @@ fn apply_theme(ctx: &egui::Context, dark: bool, system_accent: Option<(u8, u8, u
     // 1-px subtle accent and rely on `selection.stroke` for the
     // focused widget on top.
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, p.accent);
+
+    // Slider visuals: fill the trailing portion of the rail (from
+    // min up to current value) with selection.bg_fill (= accent_subtle
+    // in our palette). Combined with the now-visible rail colour
+    // above, gives sliders a clear "track + progress + handle"
+    // structure — like Fluent / macOS sliders — instead of a
+    // disembodied circle floating with no axis.
+    visuals.slider_trailing_fill = true;
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
