@@ -209,14 +209,17 @@ fn main() {
         }
     }));
 
-    // Create a named mutex so the Inno Setup installer can detect a
-    // running instance (matched by AppMutex in StreamToSpeaker.iss).
-    // The handle is intentionally leaked — it lives for the process
-    // lifetime and is released when Windows tears down handles on
-    // exit. Two instances racing here is harmless (CreateMutex
-    // returns the same kernel object).
+    // Create the singleton mutex (one call, one process) AND get the
+    // "was another instance already holding it?" signal in the same
+    // round-trip — CreateMutexA reports both atomically via the
+    // returned handle + GetLastError(). The handle is intentionally
+    // leaked: it lives for the process lifetime so the Inno Setup
+    // installer's AppMutex check (and our own duplicate-launch gate
+    // below, for FUTURE launches) keep seeing the kernel object.
     #[cfg(windows)]
-    let _mutex_handle = create_singleton_mutex();
+    let (_mutex_handle, another_running) = create_singleton_mutex();
+    #[cfg(not(windows))]
+    let another_running = false;
 
     // Single-instance gate. If another instance is already running,
     // raise its window and exit — same pattern as Slack / Discord /
@@ -224,11 +227,11 @@ fn main() {
     // tiny_http fails with WSAEADDRINUSE, run() returns Err, the
     // process exits silently — and the user sees the FIRST instance
     // in task manager and assumes the new install "doesn't open".
-    // (Skipped in --headless: headless is for service / CLI runs
-    // where multiple invocations against the same port are the
-    // caller's problem.)
-    #[cfg(windows)]
-    if !cli.headless && another_instance_already_running() {
+    // Skipped in --headless: headless is for service / CLI runs where
+    // multiple invocations against the same port are the caller's
+    // problem.
+    if !cli.headless && another_running {
+        #[cfg(windows)]
         raise_existing_window();
         return;
     }
@@ -311,48 +314,30 @@ fn attach_parent_console() {
 /// Open (or create) the named mutex the Inno Setup installer watches
 /// via AppMutex. Held until process exit. Global\ prefix so the
 /// elevated installer process can see a mutex held by the user-session
-/// service. Returns the HANDLE so the caller can keep it alive — the
-/// kernel object is released when the last handle goes away.
+/// service.
+///
+/// Returns (handle, was_already_existing): if `was_already_existing`
+/// is true, another instance of the app already owns the kernel
+/// object and we are the duplicate launch — the caller should defer
+/// to that instance (raise its window) and exit.
+///
+/// IMPORTANT: there is exactly ONE call to CreateMutexA per process.
+/// Calling it twice within the same process would trip
+/// ERROR_ALREADY_EXISTS on the second call (the first call IS the
+/// existing owner) and make every launch look like a duplicate.
 #[cfg(windows)]
-fn create_singleton_mutex() -> Option<isize> {
-    use std::ffi::CString;
-    use windows_sys::Win32::System::Threading::CreateMutexA;
-    let name = CString::new("Global\\StreamToSpeaker.Singleton").ok()?;
-    unsafe {
-        let h = CreateMutexA(std::ptr::null(), 0, name.as_ptr() as *const u8);
-        if h.is_null() {
-            None
-        } else {
-            Some(h as isize)
-        }
-    }
-}
-
-/// True if another instance of the app already holds our singleton
-/// mutex. `CreateMutexA` returns the existing handle in that case AND
-/// sets `GetLastError() == ERROR_ALREADY_EXISTS`. Used to short-circuit
-/// the duplicate-launch path: instead of failing later on the port
-/// bind (which silently kills the process and leaves the user staring
-/// at task manager wondering why "the app didn't open"), we look up
-/// the existing window and bring it to the foreground, exiting
-/// silently like every other Windows tray app.
-#[cfg(windows)]
-fn another_instance_already_running() -> bool {
+fn create_singleton_mutex() -> (Option<isize>, bool) {
     use std::ffi::CString;
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexA;
     let Some(name) = CString::new("Global\\StreamToSpeaker.Singleton").ok() else {
-        return false;
+        return (None, false);
     };
     unsafe {
         let h = CreateMutexA(std::ptr::null(), 0, name.as_ptr() as *const u8);
-        if h.is_null() {
-            return false;
-        }
-        let err = GetLastError();
-        // The handle we got either way; we don't close it because the
-        // mutex is keyed by name and we want to keep observing it.
-        err == ERROR_ALREADY_EXISTS
+        let was_existing = GetLastError() == ERROR_ALREADY_EXISTS;
+        let handle = if h.is_null() { None } else { Some(h as isize) };
+        (handle, was_existing)
     }
 }
 
