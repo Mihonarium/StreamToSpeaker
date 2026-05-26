@@ -32,16 +32,27 @@ use crate::app::App;
 /// Owns the tray icon and the menu items. Dropping it removes the
 /// icon; the menu items go with it.
 pub struct TrayHandle {
-    _icon: tray_icon::TrayIcon,
+    icon: tray_icon::TrayIcon,
+    last_icon_state: IconState,
 
     // Menu items are !Send, so they live on the GUI thread.
     status_item: MenuItem,
     enable_toggle: CheckMenuItem,
     open_web_item: MenuItem,
+    // Speaker-dependent items disabled in pump() whenever
+    // current_renderer() is None — clicking them would just
+    // warn-and-no-op (audit Heuristics F-16).
+    switch_speaker_item: MenuItem,
+    trim_25_item: MenuItem,
+    trim_100_item: MenuItem,
+    pad_25_item: MenuItem,
+    pad_100_item: MenuItem,
+    resync_item: MenuItem,
 
     last_label: String,
     last_enabled: bool,
     last_web_enabled: bool,
+    last_speaker_bound: bool,
 
     /// HWND of the GUI window. Shared with the bg event thread; that
     /// thread calls raw Win32 `ShowWindow` on it when the user clicks
@@ -63,6 +74,7 @@ struct TrayIds {
     enable: MenuId,
     show_window: MenuId,
     open_web: MenuId,
+    open_log: MenuId,
     quit: MenuId,
 }
 
@@ -71,16 +83,20 @@ struct TrayIds {
 pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
     let menu = Menu::new();
 
-    let status_item = MenuItem::new("(no speaker)", false, None);
+    let status_item = MenuItem::new("No speaker selected", false, None);
     menu.append(&status_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
 
+    // Tray latency labels match the GUI's "Trim X / Pad X" wording
+    // (previously the GUI used −/+ symbols and the tray used the
+    // verbs, so the same action had two different labels across
+    // surfaces — Content L2 from the audit).
     let switch_speaker = MenuItem::new("Switch speaker…", true, None);
-    let trim_25 = MenuItem::new("Trim 25 ms", true, None);
-    let trim_100 = MenuItem::new("Trim 100 ms", true, None);
-    let pad_25 = MenuItem::new("Pad 25 ms", true, None);
-    let pad_100 = MenuItem::new("Pad 100 ms", true, None);
-    let resync = MenuItem::new("Resync (hard reset)", true, None);
+    let trim_25 = MenuItem::new("Trim 25 ms (sync faster)", true, None);
+    let trim_100 = MenuItem::new("Trim 100 ms (sync faster)", true, None);
+    let pad_25 = MenuItem::new("Pad 25 ms (more buffer)", true, None);
+    let pad_100 = MenuItem::new("Pad 100 ms (more buffer)", true, None);
+    let resync = MenuItem::new("Resync speaker", true, None);
     menu.append(&switch_speaker)?;
     menu.append(&trim_25)?;
     menu.append(&trim_100)?;
@@ -102,16 +118,27 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
     let web_on = app.is_web_ui_enabled();
     let open_web = MenuItem::new(
         if web_on {
-            "Open web UI"
+            "Open web UI in browser"
         } else {
-            "Open web UI (disabled — enable in window)"
+            "Open web UI (turn it on in the main window first)"
         },
         web_on,
+        None,
+    );
+    // Help-ish items (M32): "Open log folder" + "About" with version.
+    // Disabled "About" acts as a static label that displays version.
+    let open_log = MenuItem::new("Open log folder", true, None);
+    let about_item = MenuItem::new(
+        &format!("Stream To Speaker v{}", env!("CARGO_PKG_VERSION")),
+        false,
         None,
     );
     let quit_item = MenuItem::new("Quit", true, None);
     menu.append(&show_window)?;
     menu.append(&open_web)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&open_log)?;
+    menu.append(&about_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
@@ -125,10 +152,12 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
         enable: enable_toggle.id().clone(),
         show_window: show_window.id().clone(),
         open_web: open_web.id().clone(),
+        open_log: open_log.id().clone(),
         quit: quit_item.id().clone(),
     };
 
-    let icon = build_icon()?;
+    let initial_state = IconState::Inactive;
+    let icon = build_icon(initial_state)?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(crate::PRODUCT_NAME)
@@ -153,13 +182,21 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
     }
 
     Ok(TrayHandle {
-        _icon: tray,
+        icon: tray,
+        last_icon_state: initial_state,
         status_item,
         enable_toggle,
         open_web_item: open_web,
+        switch_speaker_item: switch_speaker,
+        trim_25_item: trim_25,
+        trim_100_item: trim_100,
+        pad_25_item: pad_25,
+        pad_100_item: pad_100,
+        resync_item: resync,
         last_label: String::new(),
         last_enabled: app.is_streaming_enabled(),
         last_web_enabled: web_on,
+        last_speaker_bound: false,
         hwnd,
     })
 }
@@ -181,7 +218,7 @@ impl TrayHandle {
         // Sync the status label.
         let label = match app.current_renderer() {
             Some(r) => format!("▶ {}", r.friendly_name),
-            None => "(no speaker)".to_string(),
+            None => "No speaker selected".to_string(),
         };
         if label != self.last_label {
             self.status_item.set_text(&label);
@@ -195,16 +232,51 @@ impl TrayHandle {
             self.last_enabled = enabled;
         }
 
+        // Disable speaker-dependent menu items when no speaker is
+        // bound — Trim/Pad/Resync would just warn-and-no-op
+        // (Heuristics F-16). Switch speaker stays enabled so users
+        // can still open the picker from the tray.
+        let speaker_bound = app.current_renderer().is_some();
+        if speaker_bound != self.last_speaker_bound {
+            self.trim_25_item.set_enabled(speaker_bound);
+            self.trim_100_item.set_enabled(speaker_bound);
+            self.pad_25_item.set_enabled(speaker_bound);
+            self.pad_100_item.set_enabled(speaker_bound);
+            self.resync_item.set_enabled(speaker_bound);
+            // Enable-toggle is meaningful only when a speaker exists
+            // to enable/disable streaming TO. Switch speaker always
+            // works.
+            self.enable_toggle.set_enabled(speaker_bound);
+            let _ = &self.switch_speaker_item; // (always enabled)
+            self.last_speaker_bound = speaker_bound;
+        }
+
         // Sync the "Open web UI" item label + enabled state.
         let web_on = app.is_web_ui_enabled();
         if web_on != self.last_web_enabled {
             self.open_web_item.set_text(if web_on {
-                "Open web UI"
+                "Open web UI in browser"
             } else {
-                "Open web UI (disabled — enable in window)"
+                "Open web UI (turn it on in the main window first)"
             });
             self.open_web_item.set_enabled(web_on);
             self.last_web_enabled = web_on;
+        }
+
+        // Sync the tray icon to reflect Active vs Inactive (M31).
+        // Active = a speaker is bound, streaming is enabled, and the
+        // driver is actually delivering audio (stream_active). Any
+        // other state — no speaker, disabled, paused — reads as
+        // Inactive (muted grey).
+        let active = speaker_bound
+            && enabled
+            && app.stream_active.load(std::sync::atomic::Ordering::Acquire);
+        let new_state = if active { IconState::Active } else { IconState::Inactive };
+        if new_state != self.last_icon_state {
+            if let Ok(new_icon) = build_icon(new_state) {
+                let _ = self.icon.set_icon(Some(new_icon));
+            }
+            self.last_icon_state = new_state;
         }
     }
 }
@@ -278,6 +350,10 @@ fn handle_menu(
         if app.is_web_ui_enabled() {
             open_web_ui(&app.config.advertise_ip, app.config.bind.port());
         }
+    } else if *id == ids.open_log {
+        if let Some(dir) = crate::log_dir() {
+            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+        }
     } else if *id == ids.quit {
         info!("tray: quit requested");
         app.request_shutdown();
@@ -329,16 +405,30 @@ fn open_web_ui(advertise_ip: &str, port: u16) {
 // Icon (procedurally drawn — no PNG/ICO to ship)
 // -----------------------------------------------------------------------------
 
-fn build_icon() -> Result<Icon> {
+/// Two tray icon states (M31): Active (full green speaker — actually
+/// streaming audio) vs Inactive (grey speaker — idle / disabled / no
+/// speaker bound). Two-state is the minimum that lets a user glance
+/// at the system tray and answer "is my audio going somewhere?"
+/// without opening the window. CLAUDE.md documents that a future
+/// proper-artwork iteration should ship at LEAST these two states.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum IconState {
+    Active,
+    Inactive,
+}
+
+fn build_icon(state: IconState) -> Result<Icon> {
     // 32×32 — Windows downsamples to 16×16 / 24×24 / 20×20 depending
     // on DPI. Shapes need to be bold enough that downsampling doesn't
-    // collapse them into a featureless blob (which is what the
-    // previous design did, hence "it's a square").
+    // collapse them into a featureless blob.
     const W: u32 = 32;
     const H: u32 = 32;
     let mut pixels = vec![0u8; (W * H * 4) as usize];
     // Transparent background — all zeros (RGBA 0,0,0,0).
-    let fg = [60u8, 180, 100, 255]; // accent green, opaque
+    let fg: [u8; 4] = match state {
+        IconState::Active => [60, 180, 100, 255], // accent green, opaque
+        IconState::Inactive => [140, 145, 155, 255], // muted grey
+    };
 
     for y in 0..H {
         for x in 0..W {
@@ -347,14 +437,9 @@ fn build_icon() -> Result<Icon> {
             let yi = y as i32;
 
             // 1. Speaker body — solid vertical rectangle on the left.
-            //    Width 7, height 11, centered vertically at y=16.
             let body = xi >= 5 && xi <= 11 && yi >= 11 && yi <= 21;
 
-            // 2. Cone — trapezoid opening to the right, attaches to
-            //    the body's right edge. At x=11 the cone matches the
-            //    body's height; at x=22 it widens to fill 24 px
-            //    vertically.
-            //    half_height(dx) = 5 + dx * 7 / 11   (5 → 12, linear)
+            // 2. Cone — trapezoid opening to the right.
             let cone_dx = xi - 11;
             let half_h = 5 + (cone_dx * 7 + 5) / 11;
             let cone =

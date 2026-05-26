@@ -120,3 +120,7 @@ The user mentioned these but asked NOT to start them now. Pick up when they say:
 - Don't commit `service/target/` (covered by `.gitignore` now; broke the repo once).
 - Don't push `windows_subsystem = "console"` for the GUI build — the brief console flash is a real UX bug. `"windows"` + `AttachConsole(ATTACH_PARENT_PROCESS)` for `--headless` is the right pattern.
 - Don't ignore the user when they push back. They know what they observe; if my diagnosis doesn't match their experience, my diagnosis is probably wrong.
+
+## Conventions for future work
+
+- **App / tray icons must have an active and a non-active variant.** When we eventually replace the procedurally-drawn tray icon with proper artwork (or add an app icon), ship at minimum two states: one for "streaming active" (full color / accent fill / animated sound waves) and one for "idle / no speaker / disabled" (desaturated or outlined). The tray icon is the only persistent UI signal when the window is hidden; a single static icon hides whether the app is actually doing its job. Same applies if we ever ship a taskbar icon. Sizes: 16×16, 24×24, 32×32, 48×48, 256×256 (Windows tray scales down a single 32×32 fine, but the 16×16 master should be hand-tuned — auto-downscale loses detail).
