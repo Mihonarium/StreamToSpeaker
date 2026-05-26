@@ -301,6 +301,16 @@ impl App {
             guard = self.session.lock().unwrap();
         }
         *guard = Some(new_session);
+        // CRITICAL: drop the session-mutex guard before calling any
+        // method that re-locks it. std::sync::Mutex is NOT re-entrant
+        // — `self.current_renderer()` further down also calls
+        // `self.session.lock()`, and on the same thread that's a
+        // deadlock. Pulling the renderer out HERE (we just stored
+        // it) and dropping the guard immediately keeps the rest of
+        // this function lock-free.
+        let new_renderer = guard.as_ref().map(|s| s.renderer.clone());
+        drop(guard);
+
         *self.last_speaker_id.lock().unwrap() = Some(id.to_string());
         self.streaming_enabled.store(true, Ordering::Release);
         // Persist so the next launch can auto-reconnect. We do NOT
@@ -323,9 +333,7 @@ impl App {
         // is detached on a thread and failures are debug-logged.
         #[cfg(windows)]
         {
-            let speaker_name = self
-                .current_renderer()
-                .map(|r| r.friendly_name.clone());
+            let speaker_name = new_renderer.as_ref().map(|r| r.friendly_name.clone());
             crate::endpoint_name::update_endpoint_name(speaker_name.as_deref());
         }
         // m24: prime the volume cache so the GUI slider shows the
@@ -334,7 +342,7 @@ impl App {
         // seconds and is silent if the user never adjusts the
         // volume on the speaker side). Detached — the upnp call
         // can block ~100 ms.
-        if let Some(r) = self.current_renderer() {
+        if let Some(r) = new_renderer {
             let vsync = self.vsync.clone();
             let url = r.rendering_control_control_url.clone();
             std::thread::spawn(move || {
