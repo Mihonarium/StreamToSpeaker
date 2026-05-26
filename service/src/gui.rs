@@ -722,10 +722,28 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
-        // Persist window size + position across launches (M28).
-        // eframe writes to its own storage (default: roaming config),
-        // independent of our user_config.json.
-        persist_window: true,
+        // M28 disabled: do NOT persist window position.
+        //
+        // The reason: this app uses raw Win32 ShowWindow(SW_HIDE) for
+        // the tray "minimise to tray" feature (eframe's
+        // ViewportCommand::Visible has known queue-drain bugs that
+        // break the tray round-trip — emilk/egui #5229, #3655). When
+        // the user closes-to-tray, the window stays hidden until the
+        // process exits. If eframe runs `WindowSettings::from_window`
+        // during shutdown while the window is hidden,
+        // `window.inner_position()` returns Windows' sentinel
+        // (-32000, -32000) for hidden / minimised windows.
+        // persist_window then saves THAT, and the next launch
+        // restores the window off-screen — invisible, but services
+        // run fine, exactly the "task manager shows it, no window"
+        // symptom users reported.
+        //
+        // The rescue_offscreen_window + force_show_normal paths in
+        // the CreationContext below also handle this case, but
+        // making persistence the default-on root cause was wrong:
+        // a feature that breaks the window for every tray user is a
+        // worse trade than losing "remember last size/position."
+        persist_window: false,
         ..Default::default()
     };
 

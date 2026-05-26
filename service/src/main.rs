@@ -164,6 +164,16 @@ struct Cli {
 }
 
 fn main() {
+    // Startup tombstone. Written as the FIRST thing in main, before
+    // any state initialization, CLI parsing, panic-hook install, or
+    // singleton check could turn around and exit silently. If this
+    // file exists but no log line follows it, we know the process
+    // got at least this far and then died between the tombstone and
+    // env_logger.init(). If the file DOESN'T exist after a launch
+    // attempt, the binary isn't starting at all (SmartScreen,
+    // antivirus quarantine, missing dependency DLL, broken install).
+    write_startup_tombstone();
+
     let cli = Cli::parse();
 
     // Headless mode: try to attach to the parent terminal so the user
@@ -173,6 +183,13 @@ fn main() {
     if cli.headless {
         attach_parent_console();
     }
+
+    // Initialize logging EARLY — before the panic hook and the
+    // singleton-mutex gate. Previously these ran first and any
+    // failure between them was invisible because log::error! was a
+    // no-op until builder.init() landed.
+    init_logging(&cli);
+    info!("{} v{} entering main()", PRODUCT_NAME, env!("CARGO_PKG_VERSION"));
 
     // Crash visibility. With windows_subsystem="windows" the default
     // panic handler writes to stderr — which is a dead handle in GUI
@@ -220,6 +237,7 @@ fn main() {
     let (_mutex_handle, another_running) = create_singleton_mutex();
     #[cfg(not(windows))]
     let another_running = false;
+    info!("singleton: another_instance_running={}", another_running);
 
     // Single-instance gate. If another instance is already running,
     // raise its window and exit — same pattern as Slack / Discord /
@@ -231,11 +249,56 @@ fn main() {
     // multiple invocations against the same port are the caller's
     // problem.
     if !cli.headless && another_running {
+        info!("another instance is running; raising its window and exiting");
         #[cfg(windows)]
         raise_existing_window();
         return;
     }
 
+    if let Err(e) = run(cli) {
+        error!("fatal: {:#}", e);
+        #[cfg(windows)]
+        if !headless {
+            show_crash_dialog(&format!(
+                "Stream To Speaker couldn't start:\n\n{:#}\n\nSee the log file for details (Help → Open log folder in a working instance, or %LOCALAPPDATA%\\StreamToSpeaker\\stream-to-speaker.log).",
+                e
+            ));
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Write a one-line marker file to %LOCALAPPDATA%\StreamToSpeaker\
+/// startup.txt so we can tell — even when env_logger hasn't been
+/// initialized yet — whether the binary actually started executing.
+/// If the file is absent after a launch attempt, the binary itself
+/// didn't run (SmartScreen / antivirus / missing runtime DLL); if it's
+/// present but the log file has no matching entry, main() got at least
+/// to this point and died before init_logging.
+fn write_startup_tombstone() {
+    if let Some(mut path) = stream_to_speaker::log_dir() {
+        path.push("startup.txt");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(
+                f,
+                "{}\tv{}\tmain() entered",
+                now,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
+}
+
+fn init_logging(cli: &Cli) {
     let mut builder = env_logger::Builder::from_default_env();
     builder
         .filter_level(cli.log_level.parse().unwrap_or(log::LevelFilter::Info))
@@ -252,18 +315,6 @@ fn main() {
         }
     }
     builder.init();
-
-    if let Err(e) = run(cli) {
-        error!("fatal: {:#}", e);
-        #[cfg(windows)]
-        if !headless {
-            show_crash_dialog(&format!(
-                "Stream To Speaker couldn't start:\n\n{:#}\n\nSee the log file for details (Help → Open log folder in a working instance, or %LOCALAPPDATA%\\StreamToSpeaker\\stream-to-speaker.log).",
-                e
-            ));
-        }
-        std::process::exit(1);
-    }
 }
 
 /// Windows MessageBox for fatal-error visibility. No-op on non-Windows.
