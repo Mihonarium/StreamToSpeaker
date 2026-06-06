@@ -193,10 +193,43 @@ impl RtspClient {
             "Content-Type".to_string(),
             "application/sdp".to_string(),
         )];
-        let resp = self.request("ANNOUNCE", &uri, &extra, &sdp)?;
+        let mut resp = self.request("ANNOUNCE", &uri, &extra, &sdp)?;
+        if resp.status_code == 403 {
+            // Some receivers (AirPort Express fw 7.8+, certain Sonos) gate
+            // ANNOUNCE behind the MFi `/auth-setup` key exchange. Do it
+            // and retry once. Only fires on 403, so receivers that work
+            // without it are untouched.
+            warn!("ANNOUNCE returned 403; attempting /auth-setup then retrying");
+            self.auth_setup().context("auth-setup after ANNOUNCE 403")?;
+            resp = self.request("ANNOUNCE", &uri, &extra, &sdp)?;
+        }
         if resp.status_code != 200 {
             bail!("ANNOUNCE failed: {} {}", resp.status_code, resp.status_text);
         }
+        Ok(())
+    }
+
+    /// MFi `/auth-setup` handshake. We send a curve25519 (X25519) public
+    /// key prefixed with the `0x01` "unencrypted" selector; the receiver
+    /// replies with its own key plus a signed MFi certificate. For the
+    /// unencrypted audio path we don't need the response contents — just
+    /// completing the exchange unlocks receivers that demand it.
+    pub fn auth_setup(&mut self) -> Result<()> {
+        use x25519_dalek::{EphemeralSecret, PublicKey};
+        let secret = EphemeralSecret::random_from_rng(rand::thread_rng());
+        let public = PublicKey::from(&secret);
+
+        let mut body = Vec::with_capacity(33);
+        body.push(0x01); // 0x01 = no encryption; 0x02 would request MFi-SAP
+        body.extend_from_slice(public.as_bytes());
+
+        let resp = self
+            .request_bytes("POST", "/auth-setup", "application/octet-stream", &body)
+            .context("sending /auth-setup")?;
+        if resp.status_code != 200 {
+            bail!("auth-setup → {} {}", resp.status_code, resp.status_text);
+        }
+        debug!("auth-setup OK ({}B response)", resp.body.len());
         Ok(())
     }
 
@@ -351,6 +384,43 @@ impl RtspClient {
             body.len()
         );
         self.stream.write_all(req.as_bytes())?;
+        self.stream.flush()?;
+        read_response(&mut self.stream)
+    }
+
+    /// Like [`request`](Self::request) but with a binary body — used for
+    /// `/auth-setup`, whose payload is raw key bytes rather than text.
+    fn request_bytes(
+        &mut self,
+        method: &str,
+        uri: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<RtspResponse> {
+        self.cseq += 1;
+        let mut head = String::new();
+        head.push_str(&format!("{} {} RTSP/1.0\r\n", method, uri));
+        head.push_str(&format!("CSeq: {}\r\n", self.cseq));
+        head.push_str(&format!("User-Agent: {}\r\n", RTSP_USER_AGENT));
+        head.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
+        head.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
+        head.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
+        if let Some(token) = &self.session_token {
+            head.push_str(&format!("Session: {}\r\n", token));
+        }
+        head.push_str(&format!("Content-Type: {}\r\n", content_type));
+        head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+
+        debug!(
+            "RTSP > {} {} (CSeq={}, body={}B)",
+            method,
+            uri,
+            self.cseq,
+            body.len()
+        );
+        let mut raw = head.into_bytes();
+        raw.extend_from_slice(body);
+        self.stream.write_all(&raw)?;
         self.stream.flush()?;
         read_response(&mut self.stream)
     }
