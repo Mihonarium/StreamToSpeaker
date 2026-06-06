@@ -666,11 +666,21 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
             debug!("GENA NOTIFY on {}: {} bytes", path, body.len());
             if let Some(change) = parse_rendering_notify(body) {
                 if let Some(v) = change.volume {
-                    if let Some(mb) = vsync.sonos_changed(v) {
-                        info!("speaker -> driver: volume {} (mb={})", v, mb);
-                        if let Some(p) = pusher.as_ref() {
-                            if let Err(e) = p.push(mb, false) {
-                                warn!("failed to push volume to driver: {}", e);
+                    if let Some(level) = vsync.sonos_changed(v) {
+                        info!("speaker -> windows: volume {}", level);
+                        // Drive the Windows slider to the same %, by
+                        // setting the endpoint scalar (Windows then derives
+                        // the matching dB for our node). Fall back to the
+                        // IOCTL millibel push if Core Audio is unavailable.
+                        if let Err(e) =
+                            stream_to_speaker::endpoint_volume::set_master_scalar_percent(level)
+                        {
+                            debug!("set endpoint scalar failed ({:#}); using IOCTL fallback", e);
+                            if let Some(p) = pusher.as_ref() {
+                                let mb = stream_to_speaker::volume_sync::sonos_to_millibels(level);
+                                if let Err(e) = p.push(mb, false) {
+                                    warn!("failed to push volume to driver: {}", e);
+                                }
                             }
                         }
                     }
@@ -821,8 +831,18 @@ fn spawn_driver_event_consumer(app: Arc<App>, cli: &Cli) {
                 }
                 match ev {
                     DriverEvent::VolumeChanged { level_millibels } => {
-                        if let Some(level) = app.vsync.driver_changed(level_millibels) {
-                            info!("driver -> speaker: volume {} (mb={})", level, level_millibels);
+                        // The slider position is the IAudioEndpointVolume
+                        // scalar; the dB we get here is that scalar run
+                        // through Windows' proprietary, undocumented taper
+                        // curve. Read the scalar back directly so slider-%
+                        // maps 1:1 to speaker-%. Fall back to the dB->%
+                        // approximation only if the endpoint can't be read.
+                        let level = stream_to_speaker::endpoint_volume::master_scalar_percent()
+                            .unwrap_or_else(|| {
+                                stream_to_speaker::volume_sync::millibels_to_sonos(level_millibels)
+                            });
+                        if let Some(level) = app.vsync.driver_changed(level) {
+                            info!("windows -> speaker: volume {} (mb={})", level, level_millibels);
                             if let Some(r) = app.current_renderer() {
                                 if let Err(e) = stream_to_speaker::upnp::set_volume(
                                     &r.rendering_control_control_url,

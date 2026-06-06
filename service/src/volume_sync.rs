@@ -1,15 +1,23 @@
-//! Bidirectional volume sync, with a debounce so changes don't bounce.
+//! Bidirectional volume sync between the Windows endpoint slider and the
+//! speaker, with echo suppression so a change made on one side doesn't
+//! bounce back from the other.
 //!
-//! Conversions between Windows millibels (range -10000..=0; UPnP-friendly
-//! log mapping) and the Sonos 0..100 linear volume scale:
+//! Both sides now speak the **same** linear `0..=100` scale:
 //!
-//!  * Windows: log scale, 0 mB = 100%, -2000 mB = -20 dB ≈ 10% perceived.
-//!  * Sonos: linear-ish UI scale but the speaker maps it internally.
+//!  * Windows: we read/write the `IAudioEndpointVolume` *scalar* (the
+//!    actual slider position) via [`crate::endpoint_volume`], scaled to
+//!    `0..=100`. The slider percentage maps 1:1 to the speaker.
+//!  * Speaker (Sonos/UPnP): the `RenderingControl` `Volume` is already a
+//!    `0..=100` value matching the speaker's own UI slider.
 //!
-//! We use the common heuristic: `level = 100 * 10^(mb / 5000)`, clamped.
-//! Inverse: `mb = 5000 * log10(level/100)`. This roughly matches what
-//! Sonos and Windows agree on subjectively. Not strictly correct, but
-//! consistent.
+//! So there is no scale conversion here — `VolumeSync` is purely a
+//! debounce / echo-suppression / last-known-value cache.
+//!
+//! The millibel `<->` percent helpers below are a *fallback* for the
+//! cold path where Core Audio can't reach our endpoint and we have to
+//! work straight off the driver's dB IOCTL. They are an approximation of
+//! Windows' proprietary, undocumented volume taper, so they are
+//! deliberately only used when the exact scalar is unavailable.
 
 use log::debug;
 use std::sync::Mutex;
@@ -25,14 +33,14 @@ pub struct VolumeSync {
 
 #[derive(Debug, Default)]
 struct Inner {
-    /// Last time we pushed a volume to Sonos (so we can ignore the echo
-    /// notify that follows).
-    last_pushed_to_sonos: Option<(u32, Instant)>,
-    /// Last time we pushed a volume to the driver.
-    last_pushed_to_driver: Option<(i32, Instant)>,
-    /// Most recent committed values, for comparison.
-    last_sonos_volume: Option<u32>,
-    last_driver_mb: Option<i32>,
+    /// Last value (0..=100) we pushed to the speaker (so we can drop the
+    /// GENA echo that follows).
+    last_pushed_to_speaker: Option<(u32, Instant)>,
+    /// Last value (0..=100) we pushed to the Windows slider (so we can
+    /// drop the driver-event echo that follows).
+    last_pushed_to_windows: Option<(u32, Instant)>,
+    /// Most recent committed level, for dedup and for the GUI slider.
+    last_level: Option<u32>,
 }
 
 impl VolumeSync {
@@ -42,67 +50,63 @@ impl VolumeSync {
         }
     }
 
-    /// Decision wrapper: should we forward a driver volume change to
-    /// Sonos? Returns the Sonos-scale level if yes.
-    pub fn driver_changed(&self, level_millibels: i32) -> Option<u32> {
-        let sonos_level = millibels_to_sonos(level_millibels);
+    /// The Windows slider moved (reported via the driver event, then read
+    /// back as a scalar). `level` is `0..=100`. Returns the level to push
+    /// to the speaker, or `None` if it's an echo / no change.
+    pub fn driver_changed(&self, level: u32) -> Option<u32> {
+        let level = level.min(100);
         let mut inner = self.inner.lock().unwrap();
-        // If we *just* pushed this value to the driver (from a Sonos
-        // change), drop this echo.
-        if let Some((mb, t)) = inner.last_pushed_to_driver {
-            if t.elapsed() < ECHO_IGNORE_WINDOW && (mb - level_millibels).abs() < 50 {
-                debug!("ignoring driver echo: mb={} (we pushed {} {:?} ago)",
-                    level_millibels, mb, t.elapsed());
+        // If we *just* set this on the Windows slider (from a speaker
+        // change), this is the echo — drop it.
+        if let Some((lvl, t)) = inner.last_pushed_to_windows {
+            if t.elapsed() < ECHO_IGNORE_WINDOW && lvl == level {
+                debug!("ignoring windows echo: level={} (we set it {:?} ago)", level, t.elapsed());
                 return None;
             }
         }
-        // No-op if value didn't actually change.
-        if Some(sonos_level) == inner.last_sonos_volume {
+        if Some(level) == inner.last_level {
             return None;
         }
-        inner.last_pushed_to_sonos = Some((sonos_level, Instant::now()));
-        inner.last_sonos_volume = Some(sonos_level);
-        inner.last_driver_mb = Some(level_millibels);
-        Some(sonos_level)
+        inner.last_pushed_to_speaker = Some((level, Instant::now()));
+        inner.last_level = Some(level);
+        Some(level)
     }
 
-    /// Decision wrapper: should we forward a Sonos volume change to the
-    /// driver? Returns the millibels value if yes.
-    pub fn sonos_changed(&self, sonos_level: u32) -> Option<i32> {
-        let mb = sonos_to_millibels(sonos_level);
+    /// The speaker reported a new volume (`0..=100`, via GENA NOTIFY).
+    /// Returns the level to set on the Windows slider, or `None` if it's
+    /// an echo / no change.
+    pub fn sonos_changed(&self, level: u32) -> Option<u32> {
+        let level = level.min(100);
         let mut inner = self.inner.lock().unwrap();
-        if let Some((lvl, t)) = inner.last_pushed_to_sonos {
-            if t.elapsed() < ECHO_IGNORE_WINDOW && lvl == sonos_level {
-                debug!("ignoring sonos echo: level={} (we pushed {} {:?} ago)",
-                    sonos_level, lvl, t.elapsed());
+        if let Some((lvl, t)) = inner.last_pushed_to_speaker {
+            if t.elapsed() < ECHO_IGNORE_WINDOW && lvl == level {
+                debug!("ignoring speaker echo: level={} (we set it {:?} ago)", level, t.elapsed());
                 return None;
             }
         }
-        if Some(mb) == inner.last_driver_mb {
+        if Some(level) == inner.last_level {
             return None;
         }
-        inner.last_pushed_to_driver = Some((mb, Instant::now()));
-        inner.last_driver_mb = Some(mb);
-        inner.last_sonos_volume = Some(sonos_level);
-        Some(mb)
+        inner.last_pushed_to_windows = Some((level, Instant::now()));
+        inner.last_level = Some(level);
+        Some(level)
     }
 }
 
 impl VolumeSync {
-    /// Last-known Sonos-side volume, set by either of the *_changed
-    /// paths above or by `prime_initial_volume`. The GUI reads this
-    /// to render the volume slider (m24).
+    /// Last-known volume level (`0..=100`), set by either `*_changed`
+    /// path or by `prime_initial_volume`. The GUI reads this to render
+    /// the volume slider (m24).
     pub fn current_level(&self) -> Option<u32> {
-        self.inner.lock().unwrap().last_sonos_volume
+        self.inner.lock().unwrap().last_level
     }
 
-    /// Seed the cache from an initial `upnp::get_volume` call. Doesn't
-    /// touch the `last_pushed_*` echo timestamps — the caller hasn't
-    /// pushed anything, just observed.
+    /// Seed the cache from an initial observation (e.g. `upnp::get_volume`
+    /// on connect, or the GUI slider). Doesn't touch the `last_pushed_*`
+    /// echo timestamps — the caller observed/initiated this directly.
     pub fn prime_initial_volume(&self, level: u32) {
         let mut inner = self.inner.lock().unwrap();
-        inner.last_sonos_volume = Some(level);
-        inner.last_driver_mb = Some(sonos_to_millibels(level));
+        inner.last_level = Some(level.min(100));
     }
 }
 
@@ -112,7 +116,11 @@ impl Default for VolumeSync {
     }
 }
 
-/// Convert Windows millibels (-10000..=0) to a Sonos 0..100 scale.
+/// Convert Windows millibels (`-10000..=0`) to a `0..=100` level.
+///
+/// **Fallback only** — used when the exact slider scalar can't be read
+/// from Core Audio. This is an approximation of Windows' (undocumented,
+/// version-dependent) volume taper, not an exact inverse of it.
 pub fn millibels_to_sonos(mb: i32) -> u32 {
     if mb >= 0 {
         return 100;
@@ -120,15 +128,15 @@ pub fn millibels_to_sonos(mb: i32) -> u32 {
     if mb <= -10000 {
         return 0;
     }
-    // mb is in millibels; convert to dB then to linear scale ratio.
-    // Formula: ratio = 10^(mb / 5000); level = round(100 * ratio).
+    // mb is in millibels; convert to dB then to a linear ratio.
+    // ratio = 10^(mb / 5000); level = round(100 * ratio).
     let exp = (mb as f64) / 5000.0;
     let ratio = (10f64).powf(exp);
     let level = (100.0 * ratio).round().clamp(0.0, 100.0);
     level as u32
 }
 
-/// Inverse of `millibels_to_sonos`.
+/// Inverse of `millibels_to_sonos`. **Fallback only** (see above).
 pub fn sonos_to_millibels(level: u32) -> i32 {
     let level = level.min(100);
     if level == 0 {
@@ -151,20 +159,49 @@ mod tests {
         for level in [0, 1, 10, 25, 50, 75, 100] {
             let mb = sonos_to_millibels(level);
             let back = millibels_to_sonos(mb);
-            assert!((back as i32 - level as i32).abs() <= 1,
-                "level {} -> {} -> {}", level, mb, back);
+            assert!(
+                (back as i32 - level as i32).abs() <= 1,
+                "level {} -> {} -> {}",
+                level,
+                mb,
+                back
+            );
         }
         assert_eq!(millibels_to_sonos(0), 100);
         assert_eq!(millibels_to_sonos(-10000), 0);
     }
 
     #[test]
-    fn echo_is_ignored() {
+    fn speaker_echo_is_ignored() {
         let s = VolumeSync::new();
-        // Sonos tells us volume=50.
-        assert_eq!(s.sonos_changed(50), Some(sonos_to_millibels(50)));
-        // Driver immediately echoes the new mb back.  Ignored.
-        let mb = sonos_to_millibels(50);
-        assert_eq!(s.driver_changed(mb), None);
+        // Speaker tells us volume=50; we forward it to the Windows slider.
+        assert_eq!(s.sonos_changed(50), Some(50));
+        // The driver immediately echoes the new level back. Dropped.
+        assert_eq!(s.driver_changed(50), None);
+    }
+
+    #[test]
+    fn windows_echo_is_ignored() {
+        let s = VolumeSync::new();
+        // Windows slider moves to 30; we forward it to the speaker.
+        assert_eq!(s.driver_changed(30), Some(30));
+        // The speaker's GENA NOTIFY echoes 30 back. Dropped.
+        assert_eq!(s.sonos_changed(30), None);
+    }
+
+    #[test]
+    fn distinct_changes_pass_through() {
+        let s = VolumeSync::new();
+        assert_eq!(s.driver_changed(40), Some(40));
+        // A genuine, different speaker-side change is forwarded.
+        assert_eq!(s.sonos_changed(70), Some(70));
+        // Re-sending the same level is a no-op.
+        assert_eq!(s.sonos_changed(70), None);
+    }
+
+    #[test]
+    fn level_is_clamped() {
+        let s = VolumeSync::new();
+        assert_eq!(s.driver_changed(150), Some(100));
     }
 }
