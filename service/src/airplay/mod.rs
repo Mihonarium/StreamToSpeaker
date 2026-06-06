@@ -35,6 +35,7 @@ pub mod alac;
 pub mod ap2_crypto;
 pub mod crypto;
 pub mod discovery;
+pub mod pairing;
 pub mod rtp;
 pub mod rtsp;
 pub mod session;
