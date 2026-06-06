@@ -343,7 +343,7 @@ fn local_now_ns() -> i64 {
 
 /// Derive an 8-byte PTP clockIdentity from the local IPv4 (EUI-64-ish:
 /// not a real MAC, but stable per host and unique enough for one peer).
-fn clock_identity_from_ip(ip: IpAddr) -> [u8; 8] {
+pub fn clock_identity_from_ip(ip: IpAddr) -> [u8; 8] {
     let mut id = [0u8; 8];
     match ip {
         IpAddr::V4(v4) => {
@@ -356,6 +356,13 @@ fn clock_identity_from_ip(ip: IpAddr) -> [u8; 8] {
         }
     }
     id
+}
+
+/// Decimal-string form of a clockIdentity for the RTSP `timingPeerInfo`
+/// `ID` field. AirPlay encodes the 8-byte clock identity as its
+/// big-endian u64 in base 10 (matches OwnTone's `pair_ap` peer info).
+pub fn clock_id_string(id: &[u8; 8]) -> String {
+    u64::from_be_bytes(*id).to_string()
 }
 
 #[cfg(test)]

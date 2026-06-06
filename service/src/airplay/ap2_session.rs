@@ -5,13 +5,21 @@
 //! handles legacy RAOP). It targets the `_airplay._tcp` endpoint and is
 //! the path used for HomePod and other AP2-only receivers.
 //!
-//! ## Timing note
+//! ## Timing
 //!
-//! We negotiate **NTP** timing (`timingProtocol: NTP`) and reuse the
-//! classic RAOP timing/sync packets, which OwnTone confirms AirPlay 2
-//! receivers still speak in NTP mode (`0x80 0xD2/0xD3` timing, `0xD4`
-//! sync). Receivers that *mandate* PTP (some HomePod firmwares advertise
-//! `SupportsPTP`) may reject NTP; PTP timing is the documented follow-up.
+//! Two timing backends, chosen by the receiver's advertised capability:
+//!
+//! - **NTP** (`timingProtocol: NTP`) — the classic RAOP timing/sync
+//!   packets (`0x80 0xD2/0xD3` timing, `0xD4` sync), which OwnTone
+//!   confirms AirPlay 2 receivers still speak. Used for receivers that
+//!   don't mandate PTP.
+//! - **PTP** (`timingProtocol: PTP`) — IEEE-1588 for receivers that
+//!   advertise `SupportsPTP` (HomePods). We run a PTP follower
+//!   ([`crate::airplay::ap2_ptp`]) on UDP 319/320, send `SETPEERS`, and
+//!   anchor the `0xD4` sync packet to the shared PTP clock instead of
+//!   local NTP. (The live PTP handshake is unverified against real
+//!   hardware; if a HomePod rejects realtime+PTP it likely wants the
+//!   buffered/AAC stream, a separate follow-up.)
 
 use anyhow::{Context, Result};
 use byteorder::{BigEndian, ByteOrder};
@@ -25,11 +33,12 @@ use std::time::{Duration, Instant};
 
 use crate::airplay::alac::build_uncompressed_alac_frame;
 use crate::airplay::ap2_crypto::seal_audio;
+use crate::airplay::ap2_ptp::{self, spawn_ptp, PtpSession};
 use crate::airplay::ap2_rtsp::Ap2Rtsp;
 use crate::airplay::discovery::AirPlayRenderer;
 use crate::airplay::rtp::{bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, FRAMES_PER_PACKET};
 use crate::airplay::session::volume_pct_to_raop_db;
-use crate::airplay::timing::{spawn_sync_sender, spawn_timing_responder};
+use crate::airplay::timing::{spawn_sync_sender, spawn_sync_sender_ptp, spawn_timing_responder};
 use crate::http_server::PcmFrame;
 use crate::WIRE_SAMPLE_RATE;
 
@@ -53,6 +62,7 @@ pub struct AirPlay2Session {
     sender_handle: Option<JoinHandle<()>>,
     timing_handle: Option<JoinHandle<()>>,
     sync_handle: Option<JoinHandle<()>>,
+    ptp_session: Option<PtpSession>,
     _audio_socket: UdpSocket,
 }
 
@@ -79,11 +89,29 @@ impl AirPlay2Session {
             .context("AirPlay 2 HomeKit transient pairing")?;
         info!("AirPlay 2: paired with {}", cfg.renderer.friendly_name);
 
-        rtsp.setup_timing_ntp(timing_port).context("AP2 SETUP(timing)")?;
+        // HomePods (feature bit 41) mandate IEEE-1588 PTP; everything else
+        // gets the classic NTP timing packets.
+        let use_ptp = cfg.renderer.expects_ptp();
+        if use_ptp {
+            info!("AirPlay 2: {} requires PTP timing", cfg.renderer.friendly_name);
+            let clock_id = ap2_ptp::clock_id_string(&ap2_ptp::clock_identity_from_ip(cfg.local_ip));
+            rtsp.setup_timing_ptp(&clock_id).context("AP2 SETUP(timing/PTP)")?;
+        } else {
+            rtsp.setup_timing_ntp(timing_port).context("AP2 SETUP(timing/NTP)")?;
+        }
+
         let ports = rtsp
             .setup_stream(&audio_key, control_port)
             .context("AP2 SETUP(stream)")?;
         debug!("AirPlay 2: receiver data port {}, control port {}", ports.data, ports.control);
+
+        if use_ptp {
+            // Hand the receiver the PTP peer list (ours + its own). Some
+            // firmwares need it before they'll lock; tolerate refusal.
+            if let Err(e) = rtsp.set_peers(&[cfg.local_ip, cfg.renderer.ip]) {
+                warn!("AirPlay 2 SETPEERS failed (PTP may not lock): {}", e);
+            }
+        }
 
         rtsp.record().context("AP2 RECORD")?;
 
@@ -113,22 +141,41 @@ impl AirPlay2Session {
             current_rtptime: current_rtptime.clone(),
         })?;
 
-        let timing_handle = spawn_timing_responder(
-            timing_socket,
-            stop_flag.clone(),
-            cfg.renderer.friendly_name.clone(),
-        )
-        .context("spawning AP2 timing responder")?;
-
-        let sync_handle = spawn_sync_sender(
-            control_socket,
-            SocketAddr::new(cfg.renderer.ip, ports.control),
-            current_rtptime,
-            DEFAULT_LATENCY_SAMPLES,
-            stop_flag.clone(),
-            cfg.renderer.friendly_name.clone(),
-        )
-        .context("spawning AP2 sync sender")?;
+        let sync_addr = SocketAddr::new(cfg.renderer.ip, ports.control);
+        let (timing_handle, sync_handle, ptp_session) = if use_ptp {
+            let ptp = spawn_ptp(cfg.renderer.ip, cfg.local_ip, cfg.renderer.friendly_name.clone())
+                .context("starting AP2 PTP follower")?;
+            let sync = spawn_sync_sender_ptp(
+                control_socket,
+                sync_addr,
+                current_rtptime,
+                DEFAULT_LATENCY_SAMPLES,
+                ptp.clock.clone(),
+                stop_flag.clone(),
+                cfg.renderer.friendly_name.clone(),
+            )
+            .context("spawning AP2 PTP sync sender")?;
+            // The NTP timing responder is unused under PTP; release its socket.
+            drop(timing_socket);
+            (None, Some(sync), Some(ptp))
+        } else {
+            let timing = spawn_timing_responder(
+                timing_socket,
+                stop_flag.clone(),
+                cfg.renderer.friendly_name.clone(),
+            )
+            .context("spawning AP2 timing responder")?;
+            let sync = spawn_sync_sender(
+                control_socket,
+                sync_addr,
+                current_rtptime,
+                DEFAULT_LATENCY_SAMPLES,
+                stop_flag.clone(),
+                cfg.renderer.friendly_name.clone(),
+            )
+            .context("spawning AP2 sync sender")?;
+            (Some(timing), Some(sync), None)
+        };
 
         info!(
             "AirPlay 2: session up — {} → {}:{} (audio), timing :{}, control :{}",
@@ -140,8 +187,9 @@ impl AirPlay2Session {
             rtsp: Arc::new(Mutex::new(rtsp)),
             stop_flag,
             sender_handle: Some(sender_handle),
-            timing_handle: Some(timing_handle),
-            sync_handle: Some(sync_handle),
+            timing_handle,
+            sync_handle,
+            ptp_session,
             _audio_socket: audio_socket,
         })
     }
@@ -167,6 +215,9 @@ impl AirPlay2Session {
         .flatten()
         {
             let _ = h.join();
+        }
+        if let Some(ptp) = self.ptp_session.take() {
+            ptp.stop();
         }
         self.rtsp.lock().unwrap().teardown();
     }

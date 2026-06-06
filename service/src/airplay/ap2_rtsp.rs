@@ -157,6 +157,46 @@ impl Ap2Rtsp {
         Ok(())
     }
 
+    /// First SETUP, PTP variant — declare IEEE-1588 timing and advertise
+    /// ourselves as a PTP peer (the receiver becomes grandmaster and we
+    /// follow on UDP 319/320). `clock_id` is our decimal clockIdentity.
+    pub fn setup_timing_ptp(&mut self, clock_id: &str) -> Result<()> {
+        let mut peer = plist::Dictionary::new();
+        peer.insert(
+            "Addresses".into(),
+            Value::Array(vec![Value::String(self.local_ip.to_string())]),
+        );
+        peer.insert("ID".into(), clock_id.to_string().into());
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert("deviceID".into(), self.device_id_mac.clone().into());
+        dict.insert("sessionUUID".into(), self.session_uuid.clone().into());
+        dict.insert("timingProtocol".into(), "PTP".into());
+        dict.insert("timingPeerInfo".into(), Value::Dictionary(peer));
+        let body = to_binary_plist(&Value::Dictionary(dict))?;
+
+        let uri = self.session_uri();
+        let resp = self.request("SETUP", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
+        if resp.status != 200 {
+            bail!("SETUP(timing/PTP) → {} {}", resp.status, resp.status_text);
+        }
+        Ok(())
+    }
+
+    /// SETPEERS — hand the receiver the full PTP peer address list (ours
+    /// + its own) so it knows who to clock against. Required by some
+    /// HomePod firmwares before they'll honour PTP timing.
+    pub fn set_peers(&mut self, peers: &[IpAddr]) -> Result<()> {
+        let arr: Vec<Value> = peers.iter().map(|ip| Value::String(ip.to_string())).collect();
+        let body = to_binary_plist(&Value::Array(arr))?;
+        let uri = self.session_uri();
+        let resp = self.request("SETPEERS", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
+        if resp.status != 200 {
+            bail!("SETPEERS → {} {}", resp.status, resp.status_text);
+        }
+        Ok(())
+    }
+
     /// Second SETUP — declare the realtime ALAC audio stream and ship the
     /// 32-byte `shk`. Returns the receiver's data + control ports.
     pub fn setup_stream(&mut self, audio_key: &[u8; 32], control_port: u16) -> Result<StreamPorts> {

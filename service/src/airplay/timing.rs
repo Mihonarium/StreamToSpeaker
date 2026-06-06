@@ -157,6 +157,54 @@ pub fn spawn_sync_sender(
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
 ) -> std::io::Result<thread::JoinHandle<()>> {
+    // NTP timeline: the network-time field carries our local NTP clock.
+    spawn_sync_sender_inner(
+        control_socket,
+        receiver_addr,
+        current_rtptime,
+        latency_samples,
+        stop_flag,
+        receiver_name,
+        ntp_now,
+    )
+}
+
+/// PTP variant: the network-time field of the 0xD4 sync packet carries
+/// the shared PTP clock (the receiver's grandmaster time we follow),
+/// expressed as a 32.32 fixed-point value in the PTP timescale. Used for
+/// HomePods and other receivers that mandate IEEE-1588 timing.
+pub fn spawn_sync_sender_ptp(
+    control_socket: UdpSocket,
+    receiver_addr: SocketAddr,
+    current_rtptime: Arc<AtomicU32>,
+    latency_samples: u32,
+    ptp: Arc<crate::airplay::ap2_ptp::PtpClock>,
+    stop_flag: Arc<AtomicBool>,
+    receiver_name: String,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    spawn_sync_sender_inner(
+        control_socket,
+        receiver_addr,
+        current_rtptime,
+        latency_samples,
+        stop_flag,
+        receiver_name,
+        move || ns_to_fixed_32_32(ptp.master_now_ns()),
+    )
+}
+
+fn spawn_sync_sender_inner<F>(
+    control_socket: UdpSocket,
+    receiver_addr: SocketAddr,
+    current_rtptime: Arc<AtomicU32>,
+    latency_samples: u32,
+    stop_flag: Arc<AtomicBool>,
+    receiver_name: String,
+    network_time: F,
+) -> std::io::Result<thread::JoinHandle<()>>
+where
+    F: Fn() -> u64 + Send + 'static,
+{
     thread::Builder::new()
         .name(format!("stream-to-speaker-airplay-sync:{}", receiver_name))
         .spawn(move || {
@@ -166,7 +214,7 @@ pub fn spawn_sync_sender(
             thread::sleep(Duration::from_millis(500));
             let mut first = true;
             while !stop_flag.load(Ordering::Acquire) {
-                let now_ntp = ntp_now();
+                let net_time = network_time();
                 let cur_rtp = current_rtptime.load(Ordering::Acquire);
                 let anchor_rtp = cur_rtp.wrapping_sub(latency_samples);
 
@@ -175,7 +223,7 @@ pub fn spawn_sync_sender(
                 pkt[1] = 0xD4;
                 BigEndian::write_u16(&mut pkt[2..4], RAOP_FIXED_SEQ);
                 BigEndian::write_u32(&mut pkt[4..8], anchor_rtp);
-                BigEndian::write_u64(&mut pkt[8..16], now_ntp);
+                BigEndian::write_u64(&mut pkt[8..16], net_time);
                 BigEndian::write_u32(&mut pkt[16..20], cur_rtp);
                 first = false;
 
@@ -197,4 +245,31 @@ pub fn spawn_sync_sender(
             }
             debug!("AirPlay sync sender: exiting");
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_32_32_encodes_seconds_and_fraction() {
+        assert_eq!(ns_to_fixed_32_32(0), 0);
+        assert_eq!(ns_to_fixed_32_32(1_000_000_000), 1u64 << 32);
+        // Half a second ≈ 0x8000_0000 in the fractional word.
+        let half = ns_to_fixed_32_32(1_500_000_000);
+        assert_eq!(half >> 32, 1);
+        assert!(((half & 0xFFFF_FFFF) as i64 - 0x8000_0000i64).abs() < 4);
+        // Negative clamps to zero rather than wrapping.
+        assert_eq!(ns_to_fixed_32_32(-5), 0);
+    }
+}
+
+/// Convert a nanosecond count to a 32.32 fixed-point seconds value
+/// (seconds in the high 32 bits, fractional seconds in the low 32). Used
+/// to format the PTP clock for the sync packet's network-time field.
+fn ns_to_fixed_32_32(ns: i64) -> u64 {
+    let ns = ns.max(0) as u64;
+    let secs = ns / 1_000_000_000;
+    let frac = ((ns % 1_000_000_000) << 32) / 1_000_000_000;
+    (secs << 32) | frac
 }
