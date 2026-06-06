@@ -12,10 +12,10 @@
 
 ## Project: Stream To Speaker
 
-Windows virtual audio device that streams system audio to UPnP/OpenHome speakers (Sonos primarily). Two parts:
+Windows virtual audio device that streams system audio to network speakers — UPnP/OpenHome (Sonos primarily) **and** AirPlay (RAOP / AirPlay 1, plus AirPlay 2 / HomeKit for HomePod). Two parts:
 
 - **`driver/`** — C++ kernel-mode WaveRT/PortCls driver. Single render endpoint, fixed L16 44.1 kHz stereo. Inverted-call IOCTL pattern delivers audio frames to user mode. Includes a separate non-PnP control device for the IOCTLs.
-- **`service/`** — Rust user-mode bridge. Default mode is GUI (egui window + tray icon); `--headless` is the CLI mode; `--web` enables the HTTP/JSON API. Talks to the driver via IOCTLs, discovers speakers via SSDP, controls them via UPnP SOAP, streams PCM via HTTP `audio/wav`.
+- **`service/`** — Rust user-mode bridge. Default mode is GUI (egui window + tray icon); `--headless` is the CLI mode; `--web` enables the HTTP/JSON API. Talks to the driver via IOCTLs. Discovers speakers via SSDP (UPnP) and mDNS (`_raop._tcp` / `_airplay._tcp`); controls UPnP via SOAP and AirPlay via RTSP; streams PCM either by serving HTTP `audio/wav` (UPnP pull) or pushing RTP/UDP (AirPlay, ALAC). AirPlay code lives in `service/src/airplay/`.
 
 Shared ABI lives in `include/stream_to_speaker_ioctl.h`. Any change to the on-the-wire layout has to be mirrored in `service/src/ioctl_source.rs`.
 
@@ -107,7 +107,16 @@ WDK install (~5 min cold) is cached; warm cache restores in ~30 s.
 
 The user mentioned these but asked NOT to start them now. Pick up when they say:
 
-- **AirPlay support**. We do UPnP AVTransport + OpenHome via SOAP/HTTP. AirPlay is a different protocol (RTP-over-RTSP with FairPlay-encrypted keys for AirPlay 2). Most Sonos devices speak AirPlay 2 as well as UPnP, but some speakers are AirPlay-only (HomePod, AirPort Express, lots of receivers). Rust crates worth checking: `aircast`-style, `rust-airplay`, `airplay2-receiver` (reverse the direction). Likely a substantial new module since AirPlay 2's auth handshake is non-trivial.
+- **AirPlay — implemented; remaining work + caveats.** The AirPlay sender lives in `service/src/airplay/` and is wired into discovery + the picker (each device is classified `RaopLegacy` vs `AirPlay2` via the `_airplay._tcp` `features`/`ft` bits; HomePods — `model AudioAccessory*` — always route to AirPlay 2). Two paths:
+    - **AirPlay 1 / RAOP** — unencrypted (`et=0`) or Apple-RSA (`et=1`): AirPort Express, shairport-sync, Sonos/Apple-TV in legacy mode. `rtsp.rs` / `rtp.rs` / `alac.rs` / `crypto.rs` / `timing.rs` / `session.rs`. (This was already working before; left intact.)
+    - **AirPlay 2 / HomeKit transient pairing** — HomePod + AP2-only receivers: `tlv8.rs` + `srp.rs` + `pairing.rs` + `ap2_crypto.rs` + `ap2_rtsp.rs` + `ap2_session.rs`. SRP-6a (3072-bit / SHA-512, PIN `3939`, flag `0x10`) → HKDF-SHA512 → ChaCha20-Poly1305 encrypted RTSP + per-packet audio. **No FairPlay/DRM blob needed** — transient pairing alone is sufficient (confirmed against OwnTone). Audio is the same uncompressed-ALAC frame as RAOP, ChaCha-sealed (`shk` = pairing secret[0..32]).
+
+  **Verified vs. not:** the crypto core is unit-tested (SRP against the RFC 5054 vector; TLV8/HKDF/channel-cipher/audio-seal round-trips). The *live* pairing + stream has **not** been validated against a real HomePod — that needs the user's hardware. Likely next steps when it's tested:
+    - **PTP timing.** We currently negotiate `timingProtocol: NTP` and reuse the classic RAOP timing/sync packets (OwnTone confirms AP2 speaks these in NTP mode). HomePod firmwares that advertise `SupportsPTP` (feature bit 41) may *require* IEEE-1588 PTP and reject NTP. Implementing it means: bind UDP 319/320, start as PTP master, yield via BMCA, then follow the HomePod's grandmaster clock. OwnTone delegates PTP to an external daemon; `lmcgartland/airplay2-rs` (Rust, reports working with HomePod mini) does it in-process — best reference.
+    - **Persistent pairing.** Only transient pairing is implemented. Full pair-setup (M1–M6, Ed25519) + pair-verify (X25519) is not — but the devices that would need it (Apple TV with PIN) also expose legacy RAOP, so they work today.
+    - **Retransmit/resend.** Neither path answers control-channel resend requests (PT `0x55`→`0x56`); add a sent-packet ring buffer + control-socket listener if Wi-Fi drops cause glitches.
+
+  **References used (authoritative):** OwnTone `src/outputs/{raop,airplay}.c` + `src/pair_ap/`, the openairplay + emanuelcozzi.net specs, pyatv, RFC 5054 / RFC 3526. **Do not anchor on `imadal1n/airsink`** — zero stars, has compatibility issues; it was only a hypothesis source and every load-bearing constant was re-verified against OwnTone/pair_ap.
 
 - **Lower-latency formats / alternative encodings**. Currently L16 PCM 44.1 kHz stereo. Options to add: 24-bit / 96 kHz for hi-fi; FLAC (compressed, lossless, lower bandwidth — most UPnP speakers support `audio/flac`); Opus (lossy, ultra-low-latency, used in WebRTC; less broadly supported by consumer speakers); AAC (broad compatibility, less optimal for low latency). Architecture-wise: the driver only knows L16 44.1; alternative encodings would be in the service's HTTP output path (encode at packet boundary, ship in the speaker's preferred MIME). Negotiation could be via DIDL `protocolInfo` listing multiple `<res>` lines.
 
