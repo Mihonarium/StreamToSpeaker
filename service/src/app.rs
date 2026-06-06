@@ -523,15 +523,38 @@ impl App {
 
         match renderer.transport() {
             Some(Transport::RaopLegacy) => {
+                // Sonos and other AirPlay-2-only receivers advertise a
+                // `_raop._tcp` service but never answer legacy RTSP, so a
+                // RAOP attempt just times out at OPTIONS. Probe RAOP with a
+                // short timeout and, if it fails on a device that also
+                // speaks AirPlay 2, fall back to that path.
                 let samples_rx = self.hub.subscribe();
-                let session = AirPlaySession::start(AirPlaySessionConfig {
-                    renderer,
+                let raop = AirPlaySession::start(AirPlaySessionConfig {
+                    renderer: renderer.clone(),
                     local_ip,
                     samples_rx,
                     initial_volume: Some(80),
-                })
-                .map_err(|e| format!("{:#}", e))?;
-                Ok(ActiveSession::AirPlay(session))
+                    connect_timeout: Duration::from_secs(3),
+                });
+                match raop {
+                    Ok(session) => Ok(ActiveSession::AirPlay(session)),
+                    Err(e) if renderer.supports_airplay2() => {
+                        warn!(
+                            "AirPlay (RAOP) to {} failed ({:#}); falling back to AirPlay 2",
+                            renderer.friendly_name, e
+                        );
+                        let samples_rx = self.hub.subscribe();
+                        let session = AirPlay2Session::start(AirPlay2SessionConfig {
+                            renderer,
+                            local_ip,
+                            samples_rx,
+                            initial_volume: Some(80),
+                        })
+                        .map_err(|e| format!("{:#}", e))?;
+                        Ok(ActiveSession::AirPlay2(session))
+                    }
+                    Err(e) => Err(format!("{:#}", e)),
+                }
             }
             Some(Transport::AirPlay2) => {
                 let samples_rx = self.hub.subscribe();

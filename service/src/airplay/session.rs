@@ -45,6 +45,11 @@ pub struct AirPlaySessionConfig {
     pub samples_rx: Receiver<PcmFrame>,
     /// Initial volume in [0, 100] — converted to RAOP dB internally.
     pub initial_volume: Option<u32>,
+    /// Timeout for the RTSP connect + each request. Callers that have an
+    /// AirPlay 2 fallback pass a short value so a device that advertises
+    /// `_raop._tcp` but ignores legacy RTSP (e.g. Sonos, which is
+    /// AirPlay-2-only) fails fast instead of stalling the full window.
+    pub connect_timeout: Duration,
 }
 
 /// Live AirPlay session.
@@ -106,7 +111,7 @@ impl AirPlaySession {
             cfg.renderer.ip,
             cfg.renderer.port,
             cfg.local_ip,
-            Duration::from_secs(5),
+            cfg.connect_timeout,
         )
         .context("opening RTSP connection")?;
         rtsp.options().context("RTSP OPTIONS")?;
