@@ -510,6 +510,16 @@ impl App {
         let Some(renderer) = discovery.find_by_id(id) else {
             return Err(format!("no AirPlay speaker with id {:?}", id));
         };
+        debug!(
+            "AirPlay select {}: transport={:?} supports_ap2={} features={:?} airplay_port={:?} raop_port={} et={:?}",
+            renderer.friendly_name,
+            renderer.transport(),
+            renderer.supports_airplay2(),
+            renderer.features,
+            renderer.airplay_port,
+            renderer.port,
+            renderer.encryption_types,
+        );
 
         // Resolve a local IPv4 to bind UDP sockets to + advertise in
         // SDP. Prefer the explicit `advertise_ip` (which the user can
@@ -553,7 +563,18 @@ impl App {
                         .map_err(|e| format!("{:#}", e))?;
                         Ok(ActiveSession::AirPlay2(session))
                     }
-                    Err(e) => Err(format!("{:#}", e)),
+                    Err(e) => {
+                        warn!(
+                            "AirPlay (RAOP) to {} failed and there's no AirPlay 2 fallback — \
+                             its _airplay._tcp record wasn't discovered or isn't usable \
+                             (features={:?}, airplay_port={:?}). Error: {:#}",
+                            renderer.friendly_name,
+                            renderer.features,
+                            renderer.airplay_port,
+                            e
+                        );
+                        Err(format!("{:#}", e))
+                    }
                 }
             }
             Some(Transport::AirPlay2) => {
