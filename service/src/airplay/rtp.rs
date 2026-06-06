@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use crate::airplay::alac::build_uncompressed_alac_frame;
 use crate::airplay::crypto::Cipher;
+use crate::airplay::timing::ResendBuffer;
 use crate::http_server::PcmFrame;
 use crate::WIRE_SAMPLE_RATE;
 
@@ -110,6 +111,9 @@ pub struct RtpSenderConfig {
     /// once per second so it can anchor its `RTP - latency` value to
     /// the same clock we're advancing here.
     pub current_rtptime: Arc<AtomicU32>,
+    /// Recent-packet ring so the resend responder can retransmit packets
+    /// the receiver reports missing.
+    pub resend: Arc<ResendBuffer>,
 }
 
 /// Spawn the audio sender thread. Returns once the thread is running.
@@ -207,6 +211,8 @@ fn run_sender(cfg: RtpSenderConfig) {
                 // will notice via TCP keepalive and tear down.
                 return;
             }
+            // Keep a copy so we can retransmit on a resend request.
+            cfg.resend.record(seq, &pkt_bytes);
 
             seq = seq.wrapping_add(1);
             rtptime = rtptime.wrapping_add(FRAMES_PER_PACKET as u32);

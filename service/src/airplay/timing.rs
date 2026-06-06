@@ -53,9 +53,10 @@
 
 use byteorder::{BigEndian, ByteOrder};
 use log::{debug, warn};
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -262,6 +263,30 @@ mod tests {
         // Negative clamps to zero rather than wrapping.
         assert_eq!(ns_to_fixed_32_32(-5), 0);
     }
+
+    #[test]
+    fn resend_buffer_records_evicts_and_fetches() {
+        let rb = ResendBuffer::new(3);
+        rb.record(10, &[0xAA]);
+        rb.record(11, &[0xBB]);
+        rb.record(12, &[0xCC]);
+        assert_eq!(rb.get(10).as_deref(), Some(&[0xAA][..]));
+        // Fourth push evicts seq 10.
+        rb.record(13, &[0xDD]);
+        assert_eq!(rb.get(10), None);
+        assert_eq!(rb.get(13).as_deref(), Some(&[0xDD][..]));
+        assert_eq!(rb.get(999), None);
+    }
+
+    #[test]
+    fn resend_response_wraps_original_packet() {
+        let original = [0x80, 0x60, 0x12, 0x34, 0xDE, 0xAD];
+        let resp = build_resend_response(0x1234, &original);
+        assert_eq!(resp[0], 0x80);
+        assert_eq!(resp[1], 0xD6);
+        assert_eq!(&resp[2..4], &[0x12, 0x34]); // echoed seq
+        assert_eq!(&resp[4..], &original); // original packet appended verbatim
+    }
 }
 
 /// Convert a nanosecond count to a 32.32 fixed-point seconds value
@@ -272,4 +297,114 @@ fn ns_to_fixed_32_32(ns: i64) -> u64 {
     let secs = ns / 1_000_000_000;
     let frac = ((ns % 1_000_000_000) << 32) / 1_000_000_000;
     (secs << 32) | frac
+}
+
+// ---------------------------------------------------------------------------
+// Retransmit / resend (control channel)
+// ---------------------------------------------------------------------------
+
+/// Largest run of packets we'll re-send for a single request — a sanity
+/// cap so a malformed `count` can't make us flood the receiver.
+const MAX_RESEND_RUN: u16 = 128;
+
+/// Ring of recently-sent audio packets keyed by RTP sequence number, so
+/// we can answer the receiver's retransmit (resend) requests when Wi-Fi
+/// drops a packet. Stores the full on-wire bytes (RTP header + payload),
+/// which works for RAOP (plain/AES) and AirPlay 2 (ChaCha-sealed) alike.
+pub struct ResendBuffer {
+    inner: Mutex<VecDeque<(u16, Vec<u8>)>>,
+    cap: usize,
+}
+
+impl ResendBuffer {
+    pub fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(VecDeque::with_capacity(cap)),
+            cap,
+        })
+    }
+
+    /// Record a just-sent packet. Evicts the oldest once at capacity.
+    pub fn record(&self, seq: u16, packet: &[u8]) {
+        let mut q = self.inner.lock().unwrap();
+        if q.len() >= self.cap {
+            q.pop_front();
+        }
+        q.push_back((seq, packet.to_vec()));
+    }
+
+    /// Fetch a previously-sent packet by sequence number, newest first.
+    pub fn get(&self, seq: u16) -> Option<Vec<u8>> {
+        let q = self.inner.lock().unwrap();
+        q.iter().rev().find(|(s, _)| *s == seq).map(|(_, p)| p.clone())
+    }
+}
+
+/// Wrap an original audio packet in the 4-byte RAOP resend-response
+/// header (`0x80 0xD6 <orig-seq BE>`) the receiver expects on the
+/// control channel.
+fn build_resend_response(seq: u16, original_packet: &[u8]) -> Vec<u8> {
+    let mut resp = Vec::with_capacity(4 + original_packet.len());
+    resp.push(0x80);
+    resp.push(0xD6); // M=1, PT=86 (resend response)
+    resp.extend_from_slice(&seq.to_be_bytes());
+    resp.extend_from_slice(original_packet);
+    resp
+}
+
+/// Spawn the retransmit responder. Listens on the control socket for
+/// resend *requests* (`0x80 0xD5`: first-missing-seq + run length) and
+/// re-sends matching buffered packets to the receiver's control port.
+///
+/// The control socket is shared with the sync sender via `try_clone`
+/// (the sync sender only writes; this thread reads + writes).
+pub fn spawn_resend_responder(
+    control_socket: UdpSocket,
+    receiver_control_addr: SocketAddr,
+    resend: Arc<ResendBuffer>,
+    stop_flag: Arc<AtomicBool>,
+    receiver_name: String,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    control_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    thread::Builder::new()
+        .name(format!("stream-to-speaker-airplay-resend:{}", receiver_name))
+        .spawn(move || {
+            let mut buf = [0u8; 64];
+            while !stop_flag.load(Ordering::Acquire) {
+                match control_socket.recv_from(&mut buf) {
+                    // Resend request: 0x80 0xD5, seq(2), first(2), count(2).
+                    Ok((n, _)) if n >= 8 && buf[1] == 0xD5 => {
+                        let first = BigEndian::read_u16(&buf[4..6]);
+                        let count = BigEndian::read_u16(&buf[6..8]).min(MAX_RESEND_RUN);
+                        let mut sent = 0u16;
+                        for i in 0..count {
+                            let seq = first.wrapping_add(i);
+                            if let Some(pkt) = resend.get(seq) {
+                                let resp = build_resend_response(seq, &pkt);
+                                if control_socket.send_to(&resp, receiver_control_addr).is_ok() {
+                                    sent += 1;
+                                }
+                            }
+                        }
+                        debug!(
+                            "AirPlay resend: req first={} count={} → re-sent {}",
+                            first, count, sent
+                        );
+                    }
+                    // Anything else on the control socket (e.g. the
+                    // receiver echoing sync) we ignore.
+                    Ok(_) => {}
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("AirPlay resend recv error: {}", e);
+                    }
+                }
+            }
+            debug!("AirPlay resend responder: exiting");
+        })
 }

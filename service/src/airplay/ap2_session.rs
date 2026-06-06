@@ -38,7 +38,10 @@ use crate::airplay::ap2_rtsp::Ap2Rtsp;
 use crate::airplay::discovery::AirPlayRenderer;
 use crate::airplay::rtp::{bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, FRAMES_PER_PACKET};
 use crate::airplay::session::volume_pct_to_raop_db;
-use crate::airplay::timing::{spawn_sync_sender, spawn_sync_sender_ptp, spawn_timing_responder};
+use crate::airplay::timing::{
+    spawn_resend_responder, spawn_sync_sender, spawn_sync_sender_ptp, spawn_timing_responder,
+    ResendBuffer,
+};
 use crate::http_server::PcmFrame;
 use crate::WIRE_SAMPLE_RATE;
 
@@ -46,6 +49,8 @@ use crate::WIRE_SAMPLE_RATE;
 const DEFAULT_AIRPLAY_PORT: u16 = 7000;
 /// Receiver playback latency in samples for the sync anchor (= latencyMin).
 const DEFAULT_LATENCY_SAMPLES: u32 = 11025;
+/// Recently-sent packets retained for retransmit (~4 s at 44.1 kHz).
+const RESEND_BUFFER_PACKETS: usize = 512;
 
 pub struct AirPlay2SessionConfig {
     pub renderer: AirPlayRenderer,
@@ -62,6 +67,7 @@ pub struct AirPlay2Session {
     sender_handle: Option<JoinHandle<()>>,
     timing_handle: Option<JoinHandle<()>>,
     sync_handle: Option<JoinHandle<()>>,
+    resend_handle: Option<JoinHandle<()>>,
     ptp_session: Option<PtpSession>,
     _audio_socket: UdpSocket,
 }
@@ -127,6 +133,13 @@ impl AirPlay2Session {
         let ssrc = random_ssrc();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let current_rtptime = Arc::new(AtomicU32::new(initial_rtptime));
+        let resend = ResendBuffer::new(RESEND_BUFFER_PACKETS);
+
+        // The control socket carries outbound sync packets and inbound
+        // resend requests — clone it so both threads can use it.
+        let control_for_resend = control_socket
+            .try_clone()
+            .context("clone AP2 control socket")?;
 
         let sender_handle = spawn_ap2_sender(Ap2SenderConfig {
             audio_socket: audio_socket.try_clone().context("clone AP2 audio socket")?,
@@ -139,6 +152,7 @@ impl AirPlay2Session {
             stop_flag: stop_flag.clone(),
             receiver_name: cfg.renderer.friendly_name.clone(),
             current_rtptime: current_rtptime.clone(),
+            resend: resend.clone(),
         })?;
 
         let sync_addr = SocketAddr::new(cfg.renderer.ip, ports.control);
@@ -177,6 +191,15 @@ impl AirPlay2Session {
             (Some(timing), Some(sync), None)
         };
 
+        let resend_handle = spawn_resend_responder(
+            control_for_resend,
+            sync_addr,
+            resend,
+            stop_flag.clone(),
+            cfg.renderer.friendly_name.clone(),
+        )
+        .context("spawning AP2 resend responder")?;
+
         info!(
             "AirPlay 2: session up — {} → {}:{} (audio), timing :{}, control :{}",
             cfg.renderer.friendly_name, cfg.renderer.ip, ports.data, timing_port, control_port,
@@ -189,6 +212,7 @@ impl AirPlay2Session {
             sender_handle: Some(sender_handle),
             timing_handle,
             sync_handle,
+            resend_handle: Some(resend_handle),
             ptp_session,
             _audio_socket: audio_socket,
         })
@@ -210,6 +234,7 @@ impl AirPlay2Session {
             self.sender_handle.take(),
             self.timing_handle.take(),
             self.sync_handle.take(),
+            self.resend_handle.take(),
         ]
         .into_iter()
         .flatten()
@@ -244,6 +269,7 @@ struct Ap2SenderConfig {
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
     current_rtptime: Arc<AtomicU32>,
+    resend: Arc<ResendBuffer>,
 }
 
 fn spawn_ap2_sender(cfg: Ap2SenderConfig) -> Result<JoinHandle<()>> {
@@ -305,6 +331,8 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
                 warn!("AirPlay 2 RTP send failed: {}", e);
                 return;
             }
+            // Retain for retransmit on a resend request.
+            cfg.resend.record(seq, &packet);
 
             seq = seq.wrapping_add(1);
             rtptime = rtptime.wrapping_add(FRAMES_PER_PACKET as u32);

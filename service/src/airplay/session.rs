@@ -21,8 +21,13 @@ use crate::airplay::rtp::{
     RtpSenderConfig,
 };
 use crate::airplay::rtsp::RtspClient;
-use crate::airplay::timing::{spawn_sync_sender, spawn_timing_responder};
+use crate::airplay::timing::{
+    spawn_resend_responder, spawn_sync_sender, spawn_timing_responder, ResendBuffer,
+};
 use crate::http_server::PcmFrame;
+
+/// Recently-sent packets retained for retransmit (~4 s at 44.1 kHz).
+const RESEND_BUFFER_PACKETS: usize = 512;
 
 /// Default receiver-advertised playback latency in samples, used for
 /// sync-packet anchor calculation when the receiver doesn't return an
@@ -56,6 +61,7 @@ pub struct AirPlaySession {
     sender_handle: Option<JoinHandle<()>>,
     timing_handle: Option<JoinHandle<()>>,
     sync_handle: Option<JoinHandle<()>>,
+    resend_handle: Option<JoinHandle<()>>,
     /// Hold the audio socket so it isn't closed prematurely; the
     /// sender thread holds a `try_clone` for sending. Once `stop`
     /// runs we drop these in the right order to wake any blocked
@@ -153,6 +159,14 @@ impl AirPlaySession {
             .context("try_clone audio socket")?;
         let stop_flag = Arc::new(AtomicBool::new(false));
         let current_rtptime = Arc::new(AtomicU32::new(initial_rtptime));
+        let resend = ResendBuffer::new(RESEND_BUFFER_PACKETS);
+
+        // The control socket carries both our outbound sync packets and
+        // the receiver's inbound resend requests — clone it so the sync
+        // sender and the resend responder can use it concurrently.
+        let control_for_resend = control_socket
+            .try_clone()
+            .context("try_clone control socket")?;
 
         let sender_cfg = RtpSenderConfig {
             audio_socket: audio_socket_for_thread,
@@ -165,6 +179,7 @@ impl AirPlaySession {
             stop_flag: stop_flag.clone(),
             receiver_name: cfg.renderer.friendly_name.clone(),
             current_rtptime: current_rtptime.clone(),
+            resend: resend.clone(),
         };
         let sender_handle = spawn_audio_sender(sender_cfg)?;
 
@@ -185,6 +200,15 @@ impl AirPlaySession {
         )
         .context("spawning AirPlay sync sender")?;
 
+        let resend_handle = spawn_resend_responder(
+            control_for_resend,
+            SocketAddr::new(cfg.renderer.ip, server_ports.control),
+            resend,
+            stop_flag.clone(),
+            cfg.renderer.friendly_name.clone(),
+        )
+        .context("spawning AirPlay resend responder")?;
+
         info!(
             "AirPlay: session up — {} ↔ {}:{} (RTSP), audio → {}:{}, control → :{}, timing → :{}",
             cfg.local_ip,
@@ -203,6 +227,7 @@ impl AirPlaySession {
             sender_handle: Some(sender_handle),
             timing_handle: Some(timing_handle),
             sync_handle: Some(sync_handle),
+            resend_handle: Some(resend_handle),
             _audio_socket: audio_socket,
         })
     }
@@ -234,6 +259,7 @@ impl AirPlaySession {
             self.sender_handle.take(),
             self.timing_handle.take(),
             self.sync_handle.take(),
+            self.resend_handle.take(),
         ]
         .into_iter()
         .flatten()
