@@ -152,10 +152,7 @@ fn do_update(new_name: &str) -> Result<()> {
 /// (`{0.0.0.00000000}.{<guid>}`) of the first endpoint whose
 /// DeviceDesc contains "Stream To Speaker". Returns None if no such
 /// endpoint exists.
-///
-/// `pub(crate)` so `endpoint_volume` can reuse it to locate the same
-/// endpoint for `IAudioEndpointVolume`.
-pub(crate) fn find_our_endpoint_id() -> Result<Option<String>> {
+fn find_our_endpoint_id() -> Result<Option<String>> {
     let base = to_wide_null(r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render");
     let mut render_key: HKEY = ptr::null_mut();
     let r = unsafe {

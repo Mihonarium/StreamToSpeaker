@@ -2,22 +2,24 @@
 //! speaker, with echo suppression so a change made on one side doesn't
 //! bounce back from the other.
 //!
-//! Both sides now speak the **same** linear `0..=100` scale:
+//! Both sides speak the same linear `0..=100` scale:
 //!
-//!  * Windows: we read/write the `IAudioEndpointVolume` *scalar* (the
-//!    actual slider position) via [`crate::endpoint_volume`], scaled to
-//!    `0..=100`. The slider percentage maps 1:1 to the speaker.
+//!  * Windows: our driver exposes a hardware volume node advertising a
+//!    −96..0 dB range (`KSPROPERTY_AUDIO_VOLUMELEVEL`). For a hardware
+//!    volume node Windows maps the slider **linearly across that dB
+//!    range** — slider 50 % lands on −48 dB, the midpoint, *not* on the
+//!    perceptual ("audio-tapered") curve that `IAudioEndpointVolume`'s
+//!    scalar methods use. So we receive the dB over the IOCTL and convert
+//!    it back to a percent **linearly**; that recovers the slider
+//!    position 1:1.
 //!  * Speaker (Sonos/UPnP): the `RenderingControl` `Volume` is already a
 //!    `0..=100` value matching the speaker's own UI slider.
 //!
-//! So there is no scale conversion here — `VolumeSync` is purely a
-//! debounce / echo-suppression / last-known-value cache.
-//!
-//! The millibel `<->` percent helpers below are a *fallback* for the
-//! cold path where Core Audio can't reach our endpoint and we have to
-//! work straight off the driver's dB IOCTL. They are an approximation of
-//! Windows' proprietary, undocumented volume taper, so they are
-//! deliberately only used when the exact scalar is unavailable.
+//! Earlier this used a logarithmic `100 * 10^(mb/5000)` conversion, on
+//! the assumption that Windows applied a perceptual taper to the dB. It
+//! doesn't (for a hardware node), so that double-counted the curve and
+//! made e.g. a 50 % slider show as ~11 % on the speaker. The mapping is
+//! plain linear.
 
 use log::debug;
 use std::sync::Mutex;
@@ -25,6 +27,12 @@ use std::time::{Duration, Instant};
 
 /// Window inside which we ignore "echoes" of changes we just made.
 const ECHO_IGNORE_WINDOW: Duration = Duration::from_millis(250);
+
+/// Bottom of the dB range our driver's volume node advertises, in
+/// millibels. MUST match `STREAM_TO_SPEAKER_VOLUME_MIN_MILLIBELS` in
+/// `driver/driver.h` (−9600 = −96 dB) — Windows maps the slider linearly
+/// across `[VOLUME_MIN_MILLIBELS, 0]`, so this is the 0 % anchor.
+const VOLUME_MIN_MILLIBELS: i32 = -9600;
 
 #[derive(Debug)]
 pub struct VolumeSync {
@@ -50,9 +58,9 @@ impl VolumeSync {
         }
     }
 
-    /// The Windows slider moved (reported via the driver event, then read
-    /// back as a scalar). `level` is `0..=100`. Returns the level to push
-    /// to the speaker, or `None` if it's an echo / no change.
+    /// The Windows slider moved (reported via the driver event). `level`
+    /// is `0..=100`. Returns the level to push to the speaker, or `None`
+    /// if it's an echo / no change.
     pub fn driver_changed(&self, level: u32) -> Option<u32> {
         let level = level.min(100);
         let mut inner = self.inner.lock().unwrap();
@@ -116,38 +124,32 @@ impl Default for VolumeSync {
     }
 }
 
-/// Convert Windows millibels (`-10000..=0`) to a `0..=100` level.
-///
-/// **Fallback only** — used when the exact slider scalar can't be read
-/// from Core Audio. This is an approximation of Windows' (undocumented,
-/// version-dependent) volume taper, not an exact inverse of it.
+/// Convert a Windows millibel value from our volume node to a `0..=100`
+/// level. Linear across `[VOLUME_MIN_MILLIBELS, 0]` — see the module
+/// docs for why this isn't logarithmic.
 pub fn millibels_to_sonos(mb: i32) -> u32 {
     if mb >= 0 {
         return 100;
     }
-    if mb <= -10000 {
+    if mb <= VOLUME_MIN_MILLIBELS {
         return 0;
     }
-    // mb is in millibels; convert to dB then to a linear ratio.
-    // ratio = 10^(mb / 5000); level = round(100 * ratio).
-    let exp = (mb as f64) / 5000.0;
-    let ratio = (10f64).powf(exp);
-    let level = (100.0 * ratio).round().clamp(0.0, 100.0);
-    level as u32
+    let frac = (mb - VOLUME_MIN_MILLIBELS) as f64 / (-VOLUME_MIN_MILLIBELS) as f64;
+    (frac * 100.0).round().clamp(0.0, 100.0) as u32
 }
 
-/// Inverse of `millibels_to_sonos`. **Fallback only** (see above).
+/// Inverse of `millibels_to_sonos`: a `0..=100` level to the millibel
+/// value to set on our node so the Windows slider shows that percent.
 pub fn sonos_to_millibels(level: u32) -> i32 {
     let level = level.min(100);
     if level == 0 {
-        return -10000;
+        return VOLUME_MIN_MILLIBELS;
     }
     if level >= 100 {
         return 0;
     }
-    let ratio = (level as f64) / 100.0;
-    let mb = (5000.0 * ratio.log10()).round() as i32;
-    mb.clamp(-10000, 0)
+    let mb = VOLUME_MIN_MILLIBELS as f64 * (1.0 - level as f64 / 100.0);
+    mb.round() as i32
 }
 
 #[cfg(test)]
@@ -168,7 +170,19 @@ mod tests {
             );
         }
         assert_eq!(millibels_to_sonos(0), 100);
-        assert_eq!(millibels_to_sonos(-10000), 0);
+        assert_eq!(millibels_to_sonos(VOLUME_MIN_MILLIBELS), 0);
+        assert_eq!(millibels_to_sonos(-10000), 0); // clamps below the range
+    }
+
+    #[test]
+    fn conversion_is_linear() {
+        // The whole point of the fix: slider % maps 1:1 through the dB.
+        // These are the midpoints Windows produces for our −9600..0 node.
+        assert_eq!(millibels_to_sonos(-4800), 50);
+        assert_eq!(millibels_to_sonos(-2400), 75);
+        assert_eq!(millibels_to_sonos(-7680), 20);
+        assert_eq!(sonos_to_millibels(50), -4800);
+        assert_eq!(sonos_to_millibels(25), -7200);
     }
 
     #[test]

@@ -13,7 +13,6 @@ pub mod ssdp;
 pub mod upnp;
 pub mod gena;
 pub mod volume_sync;
-pub mod endpoint_volume;
 pub mod sine_source;
 pub mod qpc;
 pub mod picker;
