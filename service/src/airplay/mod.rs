@@ -33,6 +33,8 @@
 
 pub mod alac;
 pub mod ap2_crypto;
+pub mod ap2_rtsp;
+pub mod ap2_session;
 pub mod crypto;
 pub mod discovery;
 pub mod pairing;
@@ -43,5 +45,6 @@ pub mod srp;
 pub mod timing;
 pub mod tlv8;
 
+pub use ap2_session::{AirPlay2Session, AirPlay2SessionConfig};
 pub use discovery::{spawn_airplay_discovery, AirPlayDiscoveryState, AirPlayRenderer, Transport};
 pub use session::{AirPlaySession, AirPlaySessionConfig};

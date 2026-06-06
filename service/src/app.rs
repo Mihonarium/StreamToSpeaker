@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::airplay::{
-    AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession, AirPlaySessionConfig, Transport,
+    AirPlay2Session, AirPlay2SessionConfig, AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession,
+    AirPlaySessionConfig, Transport,
 };
 use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
@@ -41,6 +42,7 @@ pub struct RendererSession {
 pub enum ActiveSession {
     Upnp(RendererSession),
     AirPlay(AirPlaySession),
+    AirPlay2(AirPlay2Session),
 }
 
 impl ActiveSession {
@@ -48,6 +50,7 @@ impl ActiveSession {
         match self {
             ActiveSession::Upnp(s) => s.renderer.stable_id(),
             ActiveSession::AirPlay(s) => s.renderer.stable_id(),
+            ActiveSession::AirPlay2(s) => s.renderer.stable_id(),
         }
     }
 
@@ -55,6 +58,7 @@ impl ActiveSession {
         match self {
             ActiveSession::Upnp(s) => s.renderer.friendly_name.clone(),
             ActiveSession::AirPlay(s) => s.renderer.friendly_name.clone(),
+            ActiveSession::AirPlay2(s) => s.renderer.friendly_name.clone(),
         }
     }
 
@@ -62,6 +66,7 @@ impl ActiveSession {
         match self {
             ActiveSession::Upnp(s) => s.renderer.ip,
             ActiveSession::AirPlay(s) => s.renderer.ip,
+            ActiveSession::AirPlay2(s) => s.renderer.ip,
         }
     }
 
@@ -72,6 +77,7 @@ impl ActiveSession {
         match self {
             ActiveSession::Upnp(s) => stop_session(&s),
             ActiveSession::AirPlay(s) => s.stop(),
+            ActiveSession::AirPlay2(s) => s.stop(),
         }
     }
 
@@ -84,6 +90,7 @@ impl ActiveSession {
                 upnp::set_volume(&s.renderer.rendering_control_control_url, pct)
             }
             ActiveSession::AirPlay(s) => s.set_volume_pct(pct),
+            ActiveSession::AirPlay2(s) => s.set_volume_pct(pct),
         }
     }
 
@@ -94,6 +101,7 @@ impl ActiveSession {
                 upnp::set_mute(&s.renderer.rendering_control_control_url, muted)
             }
             ActiveSession::AirPlay(s) => s.set_mute(muted),
+            ActiveSession::AirPlay2(s) => s.set_mute(muted),
         }
     }
 }
@@ -525,10 +533,17 @@ impl App {
                 .map_err(|e| format!("{:#}", e))?;
                 Ok(ActiveSession::AirPlay(session))
             }
-            Some(Transport::AirPlay2) => Err(format!(
-                "{} needs AirPlay 2 (HomeKit pairing) — that path isn't wired up yet",
-                renderer.friendly_name
-            )),
+            Some(Transport::AirPlay2) => {
+                let samples_rx = self.hub.subscribe();
+                let session = AirPlay2Session::start(AirPlay2SessionConfig {
+                    renderer,
+                    local_ip,
+                    samples_rx,
+                    initial_volume: Some(80),
+                })
+                .map_err(|e| format!("{:#}", e))?;
+                Ok(ActiveSession::AirPlay2(session))
+            }
             None => Err(format!(
                 "{} doesn't advertise an AirPlay path we support \
                  (codecs={:?}, et={:?}, password={})",
@@ -654,6 +669,10 @@ impl App {
             match guard.as_ref() {
                 Some(ActiveSession::Upnp(s)) => Kind::Upnp(s.renderer.clone()),
                 Some(ActiveSession::AirPlay(s)) => {
+                    Kind::AirPlay(s.renderer.stable_id())
+                }
+                Some(ActiveSession::AirPlay2(s)) => {
+                    // Same recovery as AirPlay 1: tear down + reconnect.
                     Kind::AirPlay(s.renderer.stable_id())
                 }
                 None => return Err("no active speaker".to_string()),
