@@ -33,6 +33,7 @@
 
 pub mod alac;
 pub mod ap2_crypto;
+pub mod ap2_ptp;
 pub mod ap2_rtsp;
 pub mod ap2_session;
 pub mod crypto;
