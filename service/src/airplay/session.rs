@@ -73,7 +73,7 @@ impl AirPlaySession {
             cfg.renderer.friendly_name, cfg.renderer.ip, cfg.renderer.port,
         );
 
-        if !cfg.renderer.is_supported() {
+        if !cfg.renderer.supports_legacy_raop() {
             return Err(anyhow::anyhow!(
                 "speaker {} doesn't advertise a codec/encryption pair we support \
                  (codecs={:?}, et={:?}, password={})",

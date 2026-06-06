@@ -39,5 +39,5 @@ pub mod rtsp;
 pub mod session;
 pub mod timing;
 
-pub use discovery::{spawn_airplay_discovery, AirPlayDiscoveryState, AirPlayRenderer};
+pub use discovery::{spawn_airplay_discovery, AirPlayDiscoveryState, AirPlayRenderer, Transport};
 pub use session::{AirPlaySession, AirPlaySessionConfig};

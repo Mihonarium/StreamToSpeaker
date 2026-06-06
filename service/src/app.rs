@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::airplay::{
-    AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession, AirPlaySessionConfig,
+    AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession, AirPlaySessionConfig, Transport,
 };
 use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
@@ -344,20 +344,16 @@ impl App {
             for r in d.renderers() {
                 let id = r.stable_id();
                 let active = active_id.as_deref() == Some(id.as_str());
-                // Annotate the row so the user can tell why a click
-                // might fail. Otherwise we just tag the row "(AirPlay)"
-                // so the user knows they're picking the AirPlay path
-                // rather than UPnP for receivers that advertise both
-                // (Sonos does).
-                let name = if r.is_supported() {
-                    format!("{} (AirPlay)", r.friendly_name)
-                } else if r.password_protected {
-                    format!("{} (AirPlay, password-protected)", r.friendly_name)
-                } else if r.encryption_types.iter().any(|&e| e >= 3) {
-                    // FairPlay-only — HomePod / paired-HomeKit territory.
-                    format!("{} (AirPlay, requires HomeKit pairing)", r.friendly_name)
-                } else {
-                    format!("{} (AirPlay, unsupported)", r.friendly_name)
+                // Annotate the row so the user can tell which protocol a
+                // click will use (Sonos advertises both UPnP and AirPlay)
+                // and why an unsupported one might fail.
+                let name = match r.transport() {
+                    Some(Transport::RaopLegacy) => format!("{} (AirPlay)", r.friendly_name),
+                    Some(Transport::AirPlay2) => format!("{} (AirPlay 2)", r.friendly_name),
+                    None if r.password_protected => {
+                        format!("{} (AirPlay, password-protected)", r.friendly_name)
+                    }
+                    None => format!("{} (AirPlay, unsupported)", r.friendly_name),
                 };
                 speakers.push(SpeakerInfo {
                     id,
@@ -517,15 +513,31 @@ impl App {
             .parse()
             .map_err(|e| format!("parsing advertise_ip {:?}: {}", self.config.advertise_ip, e))?;
 
-        let samples_rx = self.hub.subscribe();
-        let session = AirPlaySession::start(AirPlaySessionConfig {
-            renderer,
-            local_ip,
-            samples_rx,
-            initial_volume: Some(80),
-        })
-        .map_err(|e| format!("{:#}", e))?;
-        Ok(ActiveSession::AirPlay(session))
+        match renderer.transport() {
+            Some(Transport::RaopLegacy) => {
+                let samples_rx = self.hub.subscribe();
+                let session = AirPlaySession::start(AirPlaySessionConfig {
+                    renderer,
+                    local_ip,
+                    samples_rx,
+                    initial_volume: Some(80),
+                })
+                .map_err(|e| format!("{:#}", e))?;
+                Ok(ActiveSession::AirPlay(session))
+            }
+            Some(Transport::AirPlay2) => Err(format!(
+                "{} needs AirPlay 2 (HomeKit pairing) — that path isn't wired up yet",
+                renderer.friendly_name
+            )),
+            None => Err(format!(
+                "{} doesn't advertise an AirPlay path we support \
+                 (codecs={:?}, et={:?}, password={})",
+                renderer.friendly_name,
+                renderer.codecs,
+                renderer.encryption_types,
+                renderer.password_protected,
+            )),
+        }
     }
 
     /// Current speaker-side volume (0-100) if known. None on a fresh
