@@ -88,6 +88,24 @@ impl VolumeSync {
     }
 }
 
+impl VolumeSync {
+    /// Last-known Sonos-side volume, set by either of the *_changed
+    /// paths above or by `prime_initial_volume`. The GUI reads this
+    /// to render the volume slider (m24).
+    pub fn current_level(&self) -> Option<u32> {
+        self.inner.lock().unwrap().last_sonos_volume
+    }
+
+    /// Seed the cache from an initial `upnp::get_volume` call. Doesn't
+    /// touch the `last_pushed_*` echo timestamps — the caller hasn't
+    /// pushed anything, just observed.
+    pub fn prime_initial_volume(&self, level: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.last_sonos_volume = Some(level);
+        inner.last_driver_mb = Some(sonos_to_millibels(level));
+    }
+}
+
 impl Default for VolumeSync {
     fn default() -> Self {
         Self::new()

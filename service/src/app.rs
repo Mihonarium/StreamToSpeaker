@@ -8,7 +8,7 @@
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -165,12 +165,30 @@ pub struct App {
     // ---- Lifecycle ----
     pub shutdown: Arc<AtomicBool>,
 
+    // ---- Rescan feedback ----
+    /// True while a manual SSDP rescan thread is in flight. Cleared
+    /// by the rescan thread on exit. Read by the GUI to show a
+    /// spinner / "Scanning…" caption.
+    pub rescan_in_flight: Arc<AtomicBool>,
+    /// Unix-seconds timestamp of the last completed rescan; 0 if
+    /// none has run yet. GUI uses this to flash a "Found N speakers"
+    /// caption for a few seconds after completion.
+    pub last_rescan_finished_unix: Arc<AtomicI64>,
+    /// Speaker count at the moment the last rescan completed.
+    pub last_rescan_count: Arc<AtomicUsize>,
+
     /// Persisted user preferences (last picked speaker, onboarding
     /// dismissal). Loaded from disk in `App::new` and saved back via
     /// `App::save_user_config` whenever it changes. Behind a Mutex
     /// because saves happen lazily from any thread (GUI click,
     /// auto-reconnect bg thread, ...).
     pub user_config: Mutex<UserConfig>,
+
+    /// Most recent user-facing error message and when it was recorded.
+    /// Surfaced by the GUI as a transient inline banner for ~8 s
+    /// (Heuristics F-03 — previously every action that could fail
+    /// just `warn!`'d to the log file and the user saw nothing).
+    pub last_error: Mutex<Option<(String, Instant)>>,
 }
 
 impl App {
@@ -203,8 +221,37 @@ impl App {
             packets_published_total: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            rescan_in_flight: Arc::new(AtomicBool::new(false)),
+            last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
+            last_rescan_count: Arc::new(AtomicUsize::new(0)),
             user_config: Mutex::new(user_config),
+            last_error: Mutex::new(None),
         })
+    }
+
+    /// Record a user-facing error. Logs it AND stashes it for the GUI
+    /// to surface as a transient inline banner. Callers should use
+    /// short, plain-language messages — the GUI shows them verbatim.
+    pub fn record_error(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        warn!("{}", msg);
+        *self.last_error.lock().unwrap() = Some((msg, Instant::now()));
+    }
+
+    /// Returns the current error message if one was recorded within
+    /// the last 8 s, else None. The 8-s window is the standard toast
+    /// duration; longer would feel sticky.
+    pub fn current_error(&self) -> Option<String> {
+        let le = self.last_error.lock().unwrap();
+        match le.as_ref() {
+            Some((msg, when)) if when.elapsed() < Duration::from_secs(8) => Some(msg.clone()),
+            _ => None,
+        }
+    }
+
+    /// Clear the current error (user dismissed the banner).
+    pub fn dismiss_error(&self) {
+        *self.last_error.lock().unwrap() = None;
     }
 
     /// Returns true if the user has dismissed the onboarding card.
@@ -218,6 +265,45 @@ impl App {
         let mut uc = self.user_config.lock().unwrap();
         if !uc.onboarding_dismissed {
             uc.onboarding_dismissed = true;
+            uc.save();
+        }
+    }
+
+    /// Undo the onboarding dismissal (Help menu → "Show getting-
+    /// started again"). Persists immediately.
+    pub fn reset_onboarding(&self) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.onboarding_dismissed {
+            uc.onboarding_dismissed = false;
+            uc.save();
+        }
+    }
+
+    /// Returns the persisted "always minimise to tray on window close"
+    /// preference (the close-confirm modal's checkbox).
+    pub fn is_always_minimise_to_tray(&self) -> bool {
+        self.user_config.lock().unwrap().always_minimise_to_tray
+    }
+
+    /// Persist the "always minimise to tray" preference.
+    pub fn set_always_minimise_to_tray(&self, on: bool) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.always_minimise_to_tray != on {
+            uc.always_minimise_to_tray = on;
+            uc.save();
+        }
+    }
+
+    /// Whether to auto-reconnect to the saved speaker on launch.
+    pub fn is_auto_reconnect_on_launch(&self) -> bool {
+        self.user_config.lock().unwrap().auto_reconnect_on_launch
+    }
+
+    /// Persist the auto-reconnect preference.
+    pub fn set_auto_reconnect_on_launch(&self, on: bool) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.auto_reconnect_on_launch != on {
+            uc.auto_reconnect_on_launch = on;
             uc.save();
         }
     }
@@ -329,18 +415,62 @@ impl App {
             guard = self.session.lock().unwrap();
         }
         *guard = Some(new_session);
+        // CRITICAL: drop the session-mutex guard before calling any
+        // method that re-locks it. std::sync::Mutex is NOT re-entrant
+        // — methods further down also call `self.session.lock()`, and
+        // on the same thread that's a deadlock. Pull out what we need
+        // (we just stored it) and drop the guard immediately so the
+        // rest of this function stays lock-free. We grab two things:
+        // the UPnP renderer (Some only for a UPnP session — used to
+        // prime the volume cache, a SOAP-only path) and the friendly
+        // name (works for either protocol — used for the Windows
+        // endpoint label).
+        let new_upnp_renderer = match guard.as_ref() {
+            Some(ActiveSession::Upnp(s)) => Some(s.renderer.clone()),
+            _ => None,
+        };
+        #[cfg(windows)]
+        let new_friendly_name = guard.as_ref().map(|s| s.friendly_name());
         drop(guard);
+
         *self.last_speaker_id.lock().unwrap() = Some(id.to_string());
         self.streaming_enabled.store(true, Ordering::Release);
-        // Persist so the next launch can auto-reconnect to this speaker.
-        // Saved as a side-effect of an explicit pick — see
-        // user_config.rs for the file location.
+        // Persist so the next launch can auto-reconnect. We do NOT
+        // auto-dismiss the onboarding here — picking a speaker only
+        // proves step 2 is done; step 1 (routing Windows audio to
+        // Stream To Speaker) is the actual prerequisite for audio
+        // to flow, and a user can complete step 2 without realising
+        // they still need step 1. The card stays visible until they
+        // click "Hide this guide" themselves.
         {
             let mut uc = self.user_config.lock().unwrap();
             if uc.last_speaker_id.as_deref() != Some(id) {
                 uc.last_speaker_id = Some(id.to_string());
                 uc.save();
             }
+        }
+        // Update the Windows endpoint name to "Stream To Speaker → {name}"
+        // so the user can see in Sound Settings / volume mixer which
+        // speaker is the current destination. Best-effort; the call
+        // is detached on a thread and failures are debug-logged.
+        #[cfg(windows)]
+        {
+            crate::endpoint_name::update_endpoint_name(new_friendly_name.as_deref());
+        }
+        // m24: prime the volume cache so the GUI slider shows the
+        // speaker's actual level on the next paint, instead of
+        // waiting for the first GENA NOTIFY (which can take a few
+        // seconds and is silent if the user never adjusts the
+        // volume on the speaker side). Detached — the upnp call
+        // can block ~100 ms.
+        if let Some(r) = new_upnp_renderer {
+            let vsync = self.vsync.clone();
+            let url = r.rendering_control_control_url.clone();
+            std::thread::spawn(move || {
+                if let Ok(level) = upnp::get_volume(&url) {
+                    vsync.prime_initial_volume(level);
+                }
+            });
         }
         Ok(())
     }
@@ -398,6 +528,56 @@ impl App {
         Ok(ActiveSession::AirPlay(session))
     }
 
+    /// Current speaker-side volume (0-100) if known. None on a fresh
+    /// session before the first prime_initial_volume / GENA NOTIFY.
+    pub fn current_volume(&self) -> Option<u32> {
+        self.vsync.current_level()
+    }
+
+    /// Push a user-set volume to the bound speaker. No-op if no
+    /// speaker is bound. Runs the network call on a detached thread so
+    /// the caller (GUI slider) doesn't block. Routes through the
+    /// session enum's `set_volume_pct`, so it works for both the UPnP
+    /// (SetVolume SOAP) and AirPlay (SET_PARAMETER) paths.
+    pub fn set_speaker_volume(&self, level: u32) {
+        let level = level.min(100);
+        // Update the cache immediately so the slider doesn't snap
+        // back to the old value while the network call is in flight.
+        self.vsync.prime_initial_volume(level);
+        let session = self.session.clone();
+        std::thread::spawn(move || {
+            let guard = session.lock().unwrap();
+            if let Some(s) = guard.as_ref() {
+                if let Err(e) = s.set_volume_pct(level) {
+                    log::warn!("set speaker volume to {} failed: {:#}", level, e);
+                }
+            }
+        });
+    }
+
+    /// Disconnect from the current speaker (if any), clear the
+    /// persisted `last_speaker_id`, and reset the onboarding-dismissed
+    /// flag so the next launch is a true "first launch" again. Used
+    /// by the GUI's Forget-speaker button (audit Heuristics F-07 —
+    /// without this the only way to clear the saved speaker was to
+    /// edit `%APPDATA%\StreamToSpeaker\config.json` by hand).
+    pub fn forget_saved_speaker(&self) {
+        let s = self.session.lock().unwrap().take();
+        if let Some(s) = s {
+            s.stop();
+        }
+        self.streaming_enabled.store(false, Ordering::Release);
+        *self.last_speaker_id.lock().unwrap() = None;
+        let mut uc = self.user_config.lock().unwrap();
+        uc.last_speaker_id = None;
+        uc.onboarding_dismissed = false;
+        uc.save();
+        // Revert the Windows endpoint name back to "Stream To Speaker"
+        // since we're no longer streaming to anything specific.
+        #[cfg(windows)]
+        crate::endpoint_name::update_endpoint_name(None);
+    }
+
     /// Fire a one-shot SSDP M-SEARCH on the same interface the periodic
     /// loop uses. Runs on a detached thread because `discover_once`
     /// blocks for ~3 s waiting for responses; the GUI button doesn't
@@ -408,17 +588,37 @@ impl App {
             warn!("trigger_rescan: discovery disabled");
             return;
         };
+        // Skip if a scan is already running — the user can hammer the
+        // button but we don't need two scans racing.
+        if self.rescan_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let iface = self.config.ssdp_iface;
+        let in_flight = self.rescan_in_flight.clone();
+        let last_finished = self.last_rescan_finished_unix.clone();
+        let last_count = self.last_rescan_count.clone();
         std::thread::Builder::new()
             .name("stream-to-speaker-rescan".to_string())
             .spawn(move || {
-                match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
+                let count = match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
                     Ok(found) => {
-                        info!("manual rescan: {} renderer(s) found", found.len());
+                        let n = found.len();
+                        info!("manual rescan: {} renderer(s) found", n);
                         discovery.replace(found);
+                        n
                     }
-                    Err(e) => warn!("manual rescan failed: {}", e),
-                }
+                    Err(e) => {
+                        warn!("manual rescan failed: {}", e);
+                        0
+                    }
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                last_count.store(count, Ordering::Release);
+                last_finished.store(now, Ordering::Release);
+                in_flight.store(false, Ordering::Release);
             })
             .ok();
     }

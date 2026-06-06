@@ -172,6 +172,16 @@ struct Cli {
 }
 
 fn main() {
+    // Startup tombstone. Written as the FIRST thing in main, before
+    // any state initialization, CLI parsing, panic-hook install, or
+    // singleton check could turn around and exit silently. If this
+    // file exists but no log line follows it, we know the process
+    // got at least this far and then died between the tombstone and
+    // env_logger.init(). If the file DOESN'T exist after a launch
+    // attempt, the binary isn't starting at all (SmartScreen,
+    // antivirus quarantine, missing dependency DLL, broken install).
+    write_startup_tombstone();
+
     let cli = Cli::parse();
 
     // Headless mode: try to attach to the parent terminal so the user
@@ -182,25 +192,168 @@ fn main() {
         attach_parent_console();
     }
 
-    // Create a named mutex so the Inno Setup installer can detect a
-    // running instance (matched by AppMutex in StreamToSpeaker.iss).
-    // The handle is intentionally leaked — it lives for the process
-    // lifetime and is released when Windows tears down handles on
-    // exit. Two instances racing here is harmless (CreateMutex
-    // returns the same kernel object).
-    #[cfg(windows)]
-    let _mutex_handle = create_singleton_mutex();
+    // Initialize logging EARLY — before the panic hook and the
+    // singleton-mutex gate. Previously these ran first and any
+    // failure between them was invisible because log::error! was a
+    // no-op until builder.init() landed.
+    init_logging(&cli);
+    info!("{} v{} entering main()", PRODUCT_NAME, env!("CARGO_PKG_VERSION"));
 
-    let mut builder = env_logger::Builder::from_default_env();
-    builder
-        .filter_level(cli.log_level.parse().unwrap_or(log::LevelFilter::Info))
-        .format_timestamp_millis()
-        .init();
+    // Crash visibility. With windows_subsystem="windows" the default
+    // panic handler writes to stderr — which is a dead handle in GUI
+    // mode, so a panic just kills the process with no on-screen
+    // indication. Install a hook that:
+    //   1. logs the panic + a backtrace into the log file (so the
+    //      Help menu's "Open log folder" gives the user something to
+    //      report);
+    //   2. on Windows GUI mode, shows a MessageBox so they at least
+    //      see WHY the window disappeared, instead of "task manager
+    //      shows it but nothing's painted."
+    #[allow(unused_variables)]
+    let headless = cli.headless;
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg: String = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<Any>".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let full = format!("panic at {}: {}\n{}", location, msg, bt);
+        log::error!("{}", full);
+        #[cfg(windows)]
+        if !headless {
+            show_crash_dialog(&format!("Stream To Speaker hit a fatal error:\n\n{}\n\n{}\n\nFull backtrace is in the log file (Help → Open log folder).",
+                location, msg));
+        }
+    }));
+
+    // Create the singleton mutex (one call, one process) AND get the
+    // "was another instance already holding it?" signal in the same
+    // round-trip — CreateMutexA reports both atomically via the
+    // returned handle + GetLastError(). The handle is intentionally
+    // leaked: it lives for the process lifetime so the Inno Setup
+    // installer's AppMutex check (and our own duplicate-launch gate
+    // below, for FUTURE launches) keep seeing the kernel object.
+    #[cfg(windows)]
+    let (_mutex_handle, another_running) = create_singleton_mutex();
+    #[cfg(not(windows))]
+    let another_running = false;
+    info!("singleton: another_instance_running={}", another_running);
+
+    // Single-instance gate. If another instance is already running,
+    // raise its window and exit — same pattern as Slack / Discord /
+    // OBS. Without this, the duplicate launch races to bind port 5901,
+    // tiny_http fails with WSAEADDRINUSE, run() returns Err, the
+    // process exits silently — and the user sees the FIRST instance
+    // in task manager and assumes the new install "doesn't open".
+    // Skipped in --headless: headless is for service / CLI runs where
+    // multiple invocations against the same port are the caller's
+    // problem.
+    if !cli.headless && another_running {
+        info!("another instance is running; raising its window and exiting");
+        #[cfg(windows)]
+        raise_existing_window();
+        return;
+    }
 
     if let Err(e) = run(cli) {
         error!("fatal: {:#}", e);
+        #[cfg(windows)]
+        if !headless {
+            show_crash_dialog(&format!(
+                "Stream To Speaker couldn't start:\n\n{:#}\n\nSee the log file for details (Help → Open log folder in a working instance, or %LOCALAPPDATA%\\StreamToSpeaker\\stream-to-speaker.log).",
+                e
+            ));
+        }
         std::process::exit(1);
     }
+}
+
+/// Write a one-line marker file to %LOCALAPPDATA%\StreamToSpeaker\
+/// startup.txt so we can tell — even when env_logger hasn't been
+/// initialized yet — whether the binary actually started executing.
+/// If the file is absent after a launch attempt, the binary itself
+/// didn't run (SmartScreen / antivirus / missing runtime DLL); if it's
+/// present but the log file has no matching entry, main() got at least
+/// to this point and died before init_logging.
+fn write_startup_tombstone() {
+    if let Some(mut path) = stream_to_speaker::log_dir() {
+        path.push("startup.txt");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(
+                f,
+                "{}\tv{}\tmain() entered",
+                now,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
+}
+
+fn init_logging(cli: &Cli) {
+    let mut builder = env_logger::Builder::from_default_env();
+    builder
+        .filter_level(cli.log_level.parse().unwrap_or(log::LevelFilter::Info))
+        .format_timestamp_millis();
+    // GUI mode has no console (windows_subsystem = "windows"), so
+    // env_logger's default stderr target writes to a dead handle.
+    // Pipe to %LOCALAPPDATA%\StreamToSpeaker\stream-to-speaker.log so
+    // the user (and the GUI's Help menu) can find the log later.
+    // Headless mode keeps stderr so logs still appear in the attached
+    // parent console.
+    if !cli.headless {
+        if let Some(file) = open_log_file() {
+            builder.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+    }
+    builder.init();
+}
+
+/// Windows MessageBox for fatal-error visibility. No-op on non-Windows.
+#[cfg(windows)]
+fn show_crash_dialog(body: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_TOPMOST, MB_SETFOREGROUND,
+    };
+    let body_w: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
+    let title_w: Vec<u16> = "Stream To Speaker"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body_w.as_ptr(),
+            title_w.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+    }
+}
+
+fn open_log_file() -> Option<std::fs::File> {
+    let mut path = stream_to_speaker::log_dir()?;
+    path.push("stream-to-speaker.log");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .ok()
 }
 
 /// Attach this process to its parent's console, if launched from a
@@ -220,20 +373,68 @@ fn attach_parent_console() {
 /// Open (or create) the named mutex the Inno Setup installer watches
 /// via AppMutex. Held until process exit. Global\ prefix so the
 /// elevated installer process can see a mutex held by the user-session
-/// service. Returns the HANDLE so the caller can keep it alive — the
-/// kernel object is released when the last handle goes away.
+/// service.
+///
+/// Returns (handle, was_already_existing): if `was_already_existing`
+/// is true, another instance of the app already owns the kernel
+/// object and we are the duplicate launch — the caller should defer
+/// to that instance (raise its window) and exit.
+///
+/// IMPORTANT: there is exactly ONE call to CreateMutexA per process.
+/// Calling it twice within the same process would trip
+/// ERROR_ALREADY_EXISTS on the second call (the first call IS the
+/// existing owner) and make every launch look like a duplicate.
 #[cfg(windows)]
-fn create_singleton_mutex() -> Option<isize> {
+fn create_singleton_mutex() -> (Option<isize>, bool) {
     use std::ffi::CString;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexA;
-    let name = CString::new("Global\\StreamToSpeaker.Singleton").ok()?;
+    let Some(name) = CString::new("Global\\StreamToSpeaker.Singleton").ok() else {
+        return (None, false);
+    };
     unsafe {
         let h = CreateMutexA(std::ptr::null(), 0, name.as_ptr() as *const u8);
-        if h.is_null() {
-            None
-        } else {
-            Some(h as isize)
+        let was_existing = GetLastError() == ERROR_ALREADY_EXISTS;
+        let handle = if h.is_null() { None } else { Some(h as isize) };
+        (handle, was_existing)
+    }
+}
+
+/// Find the existing instance's main window by title and bring it to
+/// the foreground (un-minimize + raise Z order). Used by the
+/// single-instance path. Best-effort; if FindWindowW returns null
+/// (e.g. the other instance is mid-startup and hasn't created its
+/// window yet) we just return — the user will see nothing happen but
+/// the other instance is still running.
+#[cfg(windows)]
+fn raise_existing_window() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindowAsync,
+        HWND_TOP, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    };
+    let title: Vec<u16> = "Stream To Speaker"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            log::info!("another instance is running but its window isn't findable yet");
+            return;
         }
+        SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        if IsIconic(hwnd) != 0 {
+            ShowWindowAsync(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd);
     }
 }
 
@@ -317,11 +518,16 @@ fn run(cli: Cli) -> Result<()> {
         } else if !cli.no_interactive && cli.headless {
             picker::resolve(discovery, None, true)?
         } else if let Some(saved_id) = app.saved_speaker_id() {
-            info!("auto-reconnect: trying saved speaker {:?}", saved_id);
-            // Wait briefly for the first SSDP sweep to populate
-            // discovery before we look the saved id up.
-            picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
-            discovery.find_by_id(&saved_id)
+            if !app.is_auto_reconnect_on_launch() {
+                info!("auto-reconnect disabled by user preference; saved={:?}", saved_id);
+                None
+            } else {
+                info!("auto-reconnect: trying saved speaker {:?}", saved_id);
+                // Wait briefly for the first SSDP sweep to populate
+                // discovery before we look the saved id up.
+                picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
+                discovery.find_by_id(&saved_id)
+            }
         } else {
             info!("first launch (no saved speaker) — waiting for manual pick");
             None
@@ -368,6 +574,13 @@ fn run_gui_mode(app: Arc<App>, no_tray: bool) -> Result<()> {
     // Run the GUI (blocks until window/tray exits).
     if let Err(e) = stream_to_speaker::gui::run(app.clone(), !no_tray) {
         warn!("GUI exited with error: {:#}", e);
+        // Surface to the user — without this the process just
+        // disappears from the screen (window never created) but
+        // remains in the tray, looking like "no window opened at all".
+        show_crash_dialog(&format!(
+            "Stream To Speaker couldn't open its window:\n\n{:#}\n\nLog file: %LOCALAPPDATA%\\StreamToSpeaker\\stream-to-speaker.log",
+            e
+        ));
     }
 
     // Tell the audio loop to stop. We deliberately do NOT join() it:

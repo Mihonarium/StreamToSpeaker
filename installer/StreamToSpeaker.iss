@@ -86,14 +86,10 @@ AlwaysRestart=no
 CloseApplications=force
 CloseApplicationsFilter=*.exe
 RestartApplications=no
-; Belt and braces — if the GUI somehow holds no files (e.g. it's running
-; from a different path, or it has no handles open to {app}), Restart
-; Manager won't find it. AppMutex matches the exact named mutex the
-; service creates at startup (see service/src/main.rs); when it's held,
-; Setup shows a "Stream To Speaker is running — close it and click OK"
-; dialog with Cancel / Retry buttons. Global\ so the elevated installer
-; can see a mutex created in the user session.
-AppMutex=Global\StreamToSpeaker.Singleton
+; (AppMutex removed — replaced by the ClosePriorInstance Pascal
+; function in [Code] below, which offers an explicit "Close it for me"
+; button instead of Inno Setup's default "please close it manually"
+; dialog. The mutex itself is still created by the service.)
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -238,6 +234,50 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
     Flags: runhidden waituntilterminated; RunOnceId: "RemoveDriver"
 
 [Code]
+
+// Detects a running Stream To Speaker process via its named
+// singleton mutex. Offers the user an explicit "Close it for me"
+// choice instead of the default Inno-Setup "please close it
+// manually" dialog. Returns False if the user cancels.
+function ClosePriorInstance(): Boolean;
+var
+  ResultCode: Integer;
+  Attempts: Integer;
+begin
+  Result := True;
+  if not CheckForMutexes('Global\StreamToSpeaker.Singleton') then
+    Exit; // Not running, nothing to do.
+  case MsgBox('Stream To Speaker is currently running.' + #13#10 + #13#10 +
+              'It must close before the installer can update the driver and binaries.' + #13#10 + #13#10 +
+              'Close it now?',
+              mbConfirmation, MB_YESNO) of
+    IDYES:
+    begin
+      // Force-close via taskkill /F. We skip the graceful
+      // (WM_CLOSE) path because the GUI handles WM_CLOSE by
+      // popping its "Quit or minimise to tray?" modal — which
+      // never gets dismissed while the user is over here in the
+      // installer. /F is rude but reliable, and the app's only
+      // persisted state (user_config, last_speaker_id) is saved
+      // on every change rather than at exit, so nothing is lost.
+      Exec(ExpandConstant('{sys}\taskkill.exe'),
+           '/F /IM stream-to-speaker.exe',
+           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      // Mutex release isn't synchronous; wait up to ~5 s.
+      Attempts := 0;
+      while CheckForMutexes('Global\StreamToSpeaker.Singleton') and (Attempts < 10) do begin
+        Sleep(500);
+        Attempts := Attempts + 1;
+      end;
+      Result := True;
+    end;
+    IDNO:
+    begin
+      Result := False;
+    end;
+  end;
+end;
+
 function InitializeSetup(): Boolean;
 var
   Major, Minor, Build: Cardinal;
@@ -252,6 +292,10 @@ begin
     MsgBox('Stream To Speaker requires Windows 10 build 17763 (1809) or later. ' + #13#10 +
            'Detected: ' + IntToStr(Major) + '.' + IntToStr(Minor) + '.' + IntToStr(Build),
            mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+  if not ClosePriorInstance() then begin
     Result := False;
   end;
 end;

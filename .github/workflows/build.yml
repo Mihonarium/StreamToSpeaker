@@ -329,7 +329,6 @@ jobs:
           name: StreamToSpeakerSetup-${{ steps.ver.outputs.version }}
           path: |
             installer/out/StreamToSpeakerSetup-*.exe
-            installer/out/StreamToSpeakerSetup-*.exe.sha256
           if-no-files-found: error
           retention-days: 30
 
