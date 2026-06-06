@@ -60,6 +60,23 @@ sha1 = { version = "0.10", default-features = false }
 base64 = "0.22"
 # RNG for AES key + IV + RTP SSRC + Apple-Challenge nonces.
 rand = "0.8"
+# --- AirPlay 2 (HomeKit transient pairing + ChaCha20-Poly1305 audio) ---
+# AEAD for the encrypted RTSP control channel and the per-packet audio
+# encryption used by AirPlay 2 receivers (HomePod et al).
+chacha20poly1305 = "0.10"
+# HKDF-SHA512 derives the control/audio keys from the pairing secret.
+hkdf = "0.12"
+sha2 = "0.10"
+# SRP-6a (3072-bit group, SHA-512) for HomeKit transient pair-setup. The
+# HomeKit variant has padding/ordering quirks the generic `srp` crate
+# doesn't expose, so we implement it on top of num-bigint (matches what
+# pair_ap / owntone do in C).
+num-bigint = "0.4"
+num-traits = "0.2"
+# Binary property lists for the AirPlay 2 RTSP SETUP request/response.
+plist = "1"
+# Wipe SRP/session key material on drop.
+zeroize = "1"
 
 [target.'cfg(windows)'.dependencies]
 # WASAPI loopback fallback. cpal supports WASAPI loopback on Windows.

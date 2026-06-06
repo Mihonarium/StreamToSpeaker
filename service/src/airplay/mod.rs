@@ -32,12 +32,15 @@
 //!   `app::start_session` / `app::stop_session` for the UPnP path.
 
 pub mod alac;
+pub mod ap2_crypto;
 pub mod crypto;
 pub mod discovery;
 pub mod rtp;
 pub mod rtsp;
 pub mod session;
+pub mod srp;
 pub mod timing;
+pub mod tlv8;
 
 pub use discovery::{spawn_airplay_discovery, AirPlayDiscoveryState, AirPlayRenderer, Transport};
 pub use session::{AirPlaySession, AirPlaySessionConfig};
