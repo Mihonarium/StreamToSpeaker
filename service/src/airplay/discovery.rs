@@ -619,6 +619,21 @@ mod tests {
     }
 
     #[test]
+    fn real_sonos_features_classify_as_ap2_with_ptp() {
+        // The exact `features` word a Sonos advertises on _airplay._tcp.
+        // It must decode to AirPlay 2 + PTP so routing prefers AP2 — its
+        // _raop._tcp service is vestigial and times out at OPTIONS.
+        let ft = parse_features_str("0x445F8A00,0x1C340");
+        assert!(ft.is_some(), "split-hex features should parse");
+        let r = renderer(Some("One"), vec![0, 1], ft, 5000, Some(7000));
+        assert!(r.supports_airplay2(), "Sonos must support AirPlay 2");
+        assert!(r.expects_ptp(), "Sonos advertises PTP (feature bit 41)");
+        // It also advertises a legacy RAOP service we'd otherwise prefer,
+        // which is why blind RAOP routing stalled at OPTIONS.
+        assert!(r.supports_legacy_raop());
+    }
+
+    #[test]
     fn appletv_with_legacy_et_prefers_legacy() {
         // Apple TV supports HK pairing but also legacy RAOP — keep it on
         // the proven path.

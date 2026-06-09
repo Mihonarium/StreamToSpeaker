@@ -531,53 +531,129 @@ impl App {
             .parse()
             .map_err(|e| format!("parsing advertise_ip {:?}: {}", self.config.advertise_ip, e))?;
 
-        match renderer.transport() {
-            Some(Transport::RaopLegacy) => {
-                // Sonos and other AirPlay-2-only receivers advertise a
-                // `_raop._tcp` service but never answer legacy RTSP, so a
-                // RAOP attempt just times out at OPTIONS. Probe RAOP with a
-                // short timeout and, if it fails on a device that also
-                // speaks AirPlay 2, fall back to that path.
+        // Build the ordered list of paths to try, best first. A device may
+        // expose more than one (Sonos advertises a vestigial _raop._tcp it
+        // no longer answers, plus a working _airplay._tcp); we try them in
+        // order and fall back, so legacy RAOP, AirPlay 2, and HomePod
+        // devices all just work.
+        let attempts = self.airplay_attempts(&renderer, discovery);
+        if attempts.is_empty() {
+            return Err(format!(
+                "{} doesn't advertise an AirPlay path we support \
+                 (codecs={:?}, et={:?}, features={:?}, password={})",
+                renderer.friendly_name,
+                renderer.codecs,
+                renderer.encryption_types,
+                renderer.features,
+                renderer.password_protected,
+            ));
+        }
+
+        let total = attempts.len();
+        let mut last_err = String::new();
+        for (i, (transport, r)) in attempts.into_iter().enumerate() {
+            info!(
+                "AirPlay: attempting {:?} to {} ({}/{})",
+                transport,
+                r.friendly_name,
+                i + 1,
+                total
+            );
+            let name = r.friendly_name.clone();
+            match self.start_airplay_one(transport, r, local_ip) {
+                Ok(session) => return Ok(session),
+                Err(e) => {
+                    if i + 1 < total {
+                        warn!(
+                            "AirPlay {:?} to {} failed ({}); trying next path",
+                            transport, name, e
+                        );
+                    }
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Ordered list of AirPlay paths to try for a selected device, best
+    /// first. Receivers that advertise PTP / transient pairing (HomePod,
+    /// Sonos) are tried over AirPlay 2 first; legacy receivers over RAOP
+    /// first. The other path is always appended as a fallback, and an
+    /// AirPlay 2 sibling at the same IP is used when the `_raop` and
+    /// `_airplay` records didn't merge into one entry.
+    fn airplay_attempts(
+        &self,
+        renderer: &AirPlayRenderer,
+        discovery: &AirPlayDiscoveryState,
+    ) -> Vec<(Transport, AirPlayRenderer)> {
+        // An AirPlay 2-capable view of this device: the record itself, or a
+        // sibling _airplay._tcp entry at the same IP (covers a _raop vs
+        // _airplay `deviceid` mismatch that split it into two entries).
+        let ap2 = if renderer.supports_airplay2() {
+            Some(renderer.clone())
+        } else {
+            discovery
+                .renderers()
+                .into_iter()
+                .find(|r| r.ip == renderer.ip && r.supports_airplay2())
+        };
+        let raop = renderer.supports_legacy_raop();
+
+        // Prefer AirPlay 2 for receivers that look AP2-centric — they
+        // require it, advertise PTP, or only expose an AP2 path.
+        let ap2_centric = renderer.requires_airplay2()
+            || renderer.expects_ptp()
+            || ap2
+                .as_ref()
+                .map(|r| r.requires_airplay2() || r.expects_ptp())
+                .unwrap_or(false)
+            || (ap2.is_some() && !raop);
+
+        let mut out: Vec<(Transport, AirPlayRenderer)> = Vec::new();
+        let push_ap2 = |out: &mut Vec<(Transport, AirPlayRenderer)>| {
+            if let Some(r) = &ap2 {
+                out.push((Transport::AirPlay2, r.clone()));
+            }
+        };
+        if ap2_centric {
+            push_ap2(&mut out);
+            if raop {
+                out.push((Transport::RaopLegacy, renderer.clone()));
+            }
+        } else {
+            if raop {
+                out.push((Transport::RaopLegacy, renderer.clone()));
+            }
+            push_ap2(&mut out);
+        }
+        out
+    }
+
+    /// Start a single AirPlay path (one entry from [`airplay_attempts`]).
+    fn start_airplay_one(
+        &self,
+        transport: Transport,
+        renderer: AirPlayRenderer,
+        local_ip: IpAddr,
+    ) -> Result<ActiveSession, String> {
+        match transport {
+            Transport::RaopLegacy => {
                 let samples_rx = self.hub.subscribe();
-                let raop = AirPlaySession::start(AirPlaySessionConfig {
-                    renderer: renderer.clone(),
+                let session = AirPlaySession::start(AirPlaySessionConfig {
+                    renderer,
                     local_ip,
                     samples_rx,
                     initial_volume: Some(80),
+                    // Short — RAOP OPTIONS is a sub-100 ms LAN round-trip, so
+                    // a dead/vestigial RAOP service (Sonos) fails fast and we
+                    // move on to AirPlay 2.
                     connect_timeout: Duration::from_secs(3),
-                });
-                match raop {
-                    Ok(session) => Ok(ActiveSession::AirPlay(session)),
-                    Err(e) if renderer.supports_airplay2() => {
-                        warn!(
-                            "AirPlay (RAOP) to {} failed ({:#}); falling back to AirPlay 2",
-                            renderer.friendly_name, e
-                        );
-                        let samples_rx = self.hub.subscribe();
-                        let session = AirPlay2Session::start(AirPlay2SessionConfig {
-                            renderer,
-                            local_ip,
-                            samples_rx,
-                            initial_volume: Some(80),
-                        })
-                        .map_err(|e| format!("{:#}", e))?;
-                        Ok(ActiveSession::AirPlay2(session))
-                    }
-                    Err(e) => {
-                        warn!(
-                            "AirPlay (RAOP) to {} failed and there's no AirPlay 2 fallback — \
-                             its _airplay._tcp record wasn't discovered or isn't usable \
-                             (features={:?}, airplay_port={:?}). Error: {:#}",
-                            renderer.friendly_name,
-                            renderer.features,
-                            renderer.airplay_port,
-                            e
-                        );
-                        Err(format!("{:#}", e))
-                    }
-                }
+                })
+                .map_err(|e| format!("{:#}", e))?;
+                Ok(ActiveSession::AirPlay(session))
             }
-            Some(Transport::AirPlay2) => {
+            Transport::AirPlay2 => {
                 let samples_rx = self.hub.subscribe();
                 let session = AirPlay2Session::start(AirPlay2SessionConfig {
                     renderer,
@@ -588,14 +664,6 @@ impl App {
                 .map_err(|e| format!("{:#}", e))?;
                 Ok(ActiveSession::AirPlay2(session))
             }
-            None => Err(format!(
-                "{} doesn't advertise an AirPlay path we support \
-                 (codecs={:?}, et={:?}, password={})",
-                renderer.friendly_name,
-                renderer.codecs,
-                renderer.encryption_types,
-                renderer.password_protected,
-            )),
         }
     }
 
