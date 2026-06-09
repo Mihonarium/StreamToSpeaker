@@ -549,31 +549,25 @@ impl App {
             ));
         }
 
-        let total = attempts.len();
-        let mut last_err = String::new();
-        for (i, (transport, r)) in attempts.into_iter().enumerate() {
-            info!(
-                "AirPlay: attempting {:?} to {} ({}/{})",
-                transport,
-                r.friendly_name,
-                i + 1,
-                total
-            );
+        let mut errors: Vec<String> = Vec::new();
+        for (transport, r) in attempts {
+            let label = match transport {
+                Transport::AirPlay2 => "AirPlay 2",
+                Transport::RaopLegacy => "AirPlay/RAOP",
+            };
+            info!("AirPlay: attempting {} to {}", label, r.friendly_name);
             let name = r.friendly_name.clone();
             match self.start_airplay_one(transport, r, local_ip) {
                 Ok(session) => return Ok(session),
                 Err(e) => {
-                    if i + 1 < total {
-                        warn!(
-                            "AirPlay {:?} to {} failed ({}); trying next path",
-                            transport, name, e
-                        );
-                    }
-                    last_err = e;
+                    warn!("AirPlay {} to {} failed: {}", label, name, e);
+                    errors.push(format!("{}: {}", label, e));
                 }
             }
         }
-        Err(last_err)
+        // Surface every path's failure — otherwise the real problem (usually
+        // the AirPlay 2 attempt) hides behind a fallback RAOP OPTIONS timeout.
+        Err(errors.join("  |  "))
     }
 
     /// Ordered list of AirPlay paths to try for a selected device, best
