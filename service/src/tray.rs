@@ -216,7 +216,7 @@ impl TrayHandle {
     /// happens on the bg event thread now (see module-level docs).
     pub fn pump(&mut self, app: &Arc<App>, _ctx: &egui::Context) {
         // Sync the status label.
-        let label = match app.current_renderer() {
+        let label = match app.selected_speaker() {
             Some(r) => format!("▶ {}", r.friendly_name),
             None => "No speaker selected".to_string(),
         };
@@ -236,7 +236,7 @@ impl TrayHandle {
         // bound — Trim/Pad/Resync would just warn-and-no-op
         // (Heuristics F-16). Switch speaker stays enabled so users
         // can still open the picker from the tray.
-        let speaker_bound = app.current_renderer().is_some();
+        let speaker_bound = app.is_speaker_bound();
         if speaker_bound != self.last_speaker_bound {
             self.trim_25_item.set_enabled(speaker_bound);
             self.trim_100_item.set_enabled(speaker_bound);

@@ -980,7 +980,7 @@ impl eframe::App for StreamToSpeakerApp {
                 }
             }
             if i.consume_shortcut(&sc_toggle) {
-                if self.app.current_renderer().is_some() {
+                if self.app.is_speaker_bound() {
                     let new_state = !self.app.is_streaming_enabled();
                     if let Err(e) = self.app.set_streaming_enabled(new_state) {
                         self.app.record_error(
@@ -1075,7 +1075,7 @@ impl eframe::App for StreamToSpeakerApp {
                         self.pinned_status_visible
                     };
                     self.pinned_status_visible = want_pinned;
-                    if want_pinned && self.app.current_renderer().is_some() {
+                    if want_pinned && self.app.is_speaker_bound() {
                         self.show_pinned_status(ui, &p);
                         ui.add_space(sp::S);
                     }
@@ -1480,7 +1480,7 @@ impl StreamToSpeakerApp {
     fn show_status_banner(&self, ui: &mut egui::Ui, p: &Palette) {
         let enabled = self.app.is_streaming_enabled();
         let active = self.app.stream_active.load(Ordering::Acquire);
-        let current = self.app.current_renderer();
+        let current = self.app.selected_speaker();
 
         // M20: status icons were grab-bag — ⊘ from Math Operators
         // (thin stroke), ▶ from Geometric Shapes (heavy filled),
@@ -1610,7 +1610,7 @@ impl StreamToSpeakerApp {
     fn show_pinned_status(&self, ui: &mut egui::Ui, p: &Palette) {
         let enabled = self.app.is_streaming_enabled();
         let active = self.app.stream_active.load(Ordering::Acquire);
-        let Some(current) = self.app.current_renderer() else { return; };
+        let Some(current) = self.app.selected_speaker() else { return; };
 
         let (accent, status_text) = match (enabled, active) {
             (false, _) => (p.danger, "Disabled"),
@@ -1878,7 +1878,7 @@ impl StreamToSpeakerApp {
             // upnp::set_volume on a detached thread; GENA NOTIFYs from the
             // speaker side stream back through volume_sync so the slider
             // stays in sync with the Sonos app / physical buttons.
-            if self.app.current_renderer().is_some() {
+            if self.app.is_speaker_bound() {
                 ui.add_space(sp::S);
                 ui.separator();
                 ui.add_space(sp::S);
@@ -2027,7 +2027,7 @@ impl StreamToSpeakerApp {
             // call would just warn-and-no-op (audit F-14). Tooltip
             // explains in plain language; the previous version
             // mentioned UPnP / prebuffer, both engineer terms.
-            let has_speaker = self.app.current_renderer().is_some();
+            let has_speaker = self.app.is_speaker_bound();
             ui.add_enabled_ui(has_speaker, |ui| {
                 let resp = danger_button(ui, p, "⟳  Resync speaker", 180.0);
                 let resp = if has_speaker {

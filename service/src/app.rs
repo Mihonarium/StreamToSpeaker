@@ -108,6 +108,13 @@ impl ActiveSession {
 
 pub type SharedSession = Arc<Mutex<Option<ActiveSession>>>;
 
+/// Transport-agnostic display info for the bound speaker (UPnP, AirPlay 1
+/// or AirPlay 2), used by the GUI status banner and the tray label.
+pub struct SelectedSpeaker {
+    pub friendly_name: String,
+    pub ip: IpAddr,
+}
+
 /// Stable summary of the runtime config that the GUI / tray can render.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -392,6 +399,20 @@ impl App {
             Some(ActiveSession::AirPlay(s)) => Some(s.renderer.clone()),
             _ => None,
         }
+    }
+
+    /// Transport-agnostic view of the bound speaker for the UI status
+    /// banner and tray — works for UPnP, AirPlay 1 and AirPlay 2 alike.
+    pub fn selected_speaker(&self) -> Option<SelectedSpeaker> {
+        self.session.lock().unwrap().as_ref().map(|s| SelectedSpeaker {
+            friendly_name: s.friendly_name(),
+            ip: s.ip(),
+        })
+    }
+
+    /// True if any speaker (any transport) is currently bound.
+    pub fn is_speaker_bound(&self) -> bool {
+        self.session.lock().unwrap().is_some()
     }
 
     // -------------------------------------------------------------------
