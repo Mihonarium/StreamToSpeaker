@@ -66,6 +66,9 @@ pub struct Ap2Rtsp {
     reader: Option<ChannelCipher>,
     /// Decrypted (or plaintext) response bytes not yet consumed.
     rx_buf: Vec<u8>,
+    /// True once a TEARDOWN has been sent — makes `teardown` idempotent
+    /// and lets Drop skip the duplicate.
+    torn_down: bool,
 }
 
 impl Ap2Rtsp {
@@ -107,6 +110,7 @@ impl Ap2Rtsp {
             writer: None,
             reader: None,
             rx_buf: Vec::with_capacity(4096),
+            torn_down: false,
         })
     }
 
@@ -269,8 +273,12 @@ impl Ap2Rtsp {
         Ok(())
     }
 
-    /// TEARDOWN — best-effort close.
+    /// TEARDOWN — best-effort close. Idempotent.
     pub fn teardown(&mut self) {
+        if self.torn_down {
+            return;
+        }
+        self.torn_down = true;
         let uri = self.session_uri();
         let _ = self.request("TEARDOWN", &uri, &[], None, &[]);
     }
@@ -385,6 +393,20 @@ impl Ap2Rtsp {
 
         debug!("AP2 RTSP < {} {} ({}B body)", status, status_text, body.len());
         Ok(Resp { status, status_text, body })
+    }
+}
+
+impl Drop for Ap2Rtsp {
+    /// A session abandoned mid-bring-up (e.g. a SETUP timed out and `?`
+    /// unwound) must still TEARDOWN: AirPlay receivers hold the half-open
+    /// session for tens of seconds otherwise, and every retry in that
+    /// window times out at pairing. Only fires after pairing established
+    /// the encrypted channel — before that there's no session to tear
+    /// down — and is a no-op when teardown was already sent.
+    fn drop(&mut self) {
+        if self.writer.is_some() {
+            self.teardown();
+        }
     }
 }
 

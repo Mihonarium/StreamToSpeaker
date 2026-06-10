@@ -99,21 +99,19 @@ impl AirPlay2Session {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        // Timing-protocol choice. Only HomePods get PTP: they showed the
-        // silent-playback symptom in OwnTone until its libairptp PTP master
-        // landed, whereas Sonos & co streamed fine for years over NTP — and
-        // our own field test showed this Sonos never engages a PTP master
-        // (zero inbound on 319/320) while it accepts the NTP SETUP. For PTP
-        // **we are the grandmaster** — start the master first so its clock
-        // identity goes into the SETUP payload and the clock is already
-        // being served when the receiver processes it.
-        let use_ptp = cfg.renderer.is_homepod();
+        // Timing-protocol choice: receivers advertising SupportsPTP (bit 41)
+        // get the full PTP path — field-tested on a SYMFONISK whose current
+        // firmware stalls the stream SETUP under timingProtocol=NTP (NTP
+        // appears as vestigial as its RAOP). For PTP **we are the
+        // grandmaster** — start the master first so its clock identity goes
+        // into the SETUP payload and the clock (plus Announce/Signaling) is
+        // already being served when the receiver processes it.
+        let use_ptp = cfg.renderer.expects_ptp();
         info!(
-            "AirPlay 2: timing for {} = {} (model {:?}, advertises PTP: {})",
+            "AirPlay 2: timing for {} = {} (model {:?})",
             cfg.renderer.friendly_name,
             if use_ptp { "PTP (we serve as grandmaster)" } else { "NTP" },
             cfg.renderer.model.as_deref().unwrap_or("?"),
-            cfg.renderer.expects_ptp(),
         );
         let (ptp_session, timing_setup) = if use_ptp {
             let ptp = spawn_ptp_master(cfg.renderer.ip, cfg.local_ip, cfg.renderer.friendly_name.clone())
@@ -126,15 +124,6 @@ impl AirPlay2Session {
             let ts = rtsp
                 .setup_timing_ntp(timing_port)
                 .context("AP2 SETUP(timing/NTP)")?;
-            // The receiver sends NTP timing requests TO our timing port —
-            // unsolicited inbound UDP that Windows Firewall may drop. Send
-            // one priming datagram from our timing socket to the receiver's
-            // timing port so the stateful flow exists in both directions.
-            if ts.timing_port != 0 {
-                let dst = SocketAddr::new(cfg.renderer.ip, ts.timing_port);
-                let _ = timing_socket.send_to(&[0u8; 32], dst);
-                debug!("AirPlay 2: primed timing pinhole → {}", dst);
-            }
             (None, ts)
         };
         let event_port = timing_setup.event_port;

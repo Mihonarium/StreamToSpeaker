@@ -58,6 +58,7 @@ const MSG_DELAY_REQ: u8 = 0x1;
 const MSG_FOLLOW_UP: u8 = 0x8;
 const MSG_DELAY_RESP: u8 = 0x9;
 const MSG_ANNOUNCE: u8 = 0xB;
+const MSG_SIGNALING: u8 = 0xC;
 
 // Header flags (big-endian u16 at bytes 6..8).
 const FLAG_TWO_STEP: u16 = 1 << 9;
@@ -66,17 +67,29 @@ const FLAG_TIMESCALE: u16 = 1 << 3;
 const FLAGS_GENERAL: u16 = FLAG_UNICAST | FLAG_TIMESCALE; // 0x0408
 const FLAGS_SYNC: u16 = FLAGS_GENERAL | FLAG_TWO_STEP; // 0x0608
 
-// logMessageInterval per message kind.
+// logMessageInterval per message kind — libairptp's AIRPTP_LOGMESSAGEINT_*.
 const LOG_INTERVAL_ANNOUNCE: i8 = 0; // 1 s
 const LOG_INTERVAL_SYNC: i8 = -3; // 125 ms
-const LOG_INTERVAL_DELAY_RESP: i8 = 0x7f;
+const LOG_INTERVAL_DELAY_RESP: i8 = -3;
+const LOG_INTERVAL_SIGNALING: i8 = -128;
 
 // sourcePortIdentity port number — Apple stacks use 0x8005 (libairptp
 // hardcodes it); receivers key on it being stable, not on the value.
 const PORT_NUMBER: [u8; 2] = [0x80, 0x05];
 
+// TLV machinery (IEEE-1588 §14): tlvType(2 BE) + lengthField(2 BE) + value.
+const TLV_ORG_EXTENSION: u16 = 0x0003;
+const TLV_PATH_TRACE: u16 = 0x0008;
+/// Apple's organizationId for the proprietary AirPlay PTP signaling TLVs.
+const ORG_APPLE: [u8; 3] = [0x00, 0x0d, 0x93];
+/// Fixed leading bytes of both Apple signaling TLV payloads (libairptp's
+/// `apple_unknown` — meaning unknown, value captured from iOS senders).
+const APPLE_UNKNOWN: [u8; 4] = [0x00, 0x00, 0x03, 0x01];
+
+// libairptp's AIRPTP_INTERVAL_MS_*.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(1);
 const SYNC_INTERVAL: Duration = Duration::from_millis(125);
+const SIGNALING_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The monotonic timeline we serve as PTP grandmaster. Receivers follow
 /// this clock; the `0xD4` audio sync packets must be stamped from the
@@ -181,8 +194,10 @@ fn run_master(
 
     let mut announce_seq: u16 = 0;
     let mut sync_seq: u16 = 0;
+    let mut signaling_seq: u16 = 0;
     let mut last_announce: Option<Instant> = None;
     let mut last_sync: Option<Instant> = None;
+    let mut last_signaling: Option<Instant> = None;
     let mut delay_resps: u64 = 0;
     let mut rx_total: u64 = 0;
     let mut seen_types: u16 = 0;
@@ -197,6 +212,16 @@ fn run_master(
             let _ = general.send_to(&pkt, general_dst);
             announce_seq = announce_seq.wrapping_add(1);
             last_announce = Some(now);
+        }
+
+        // Apple-proprietary signaling TLVs — libairptp sends these to every
+        // peer from the moment it's added (1 s cadence). Observed from iOS
+        // senders; receivers appear to expect them before engaging a master.
+        if last_signaling.map_or(true, |t| now.duration_since(t) >= SIGNALING_INTERVAL) {
+            let pkt = build_signaling(clock_id, signaling_seq);
+            let _ = general.send_to(&pkt, general_dst);
+            signaling_seq = signaling_seq.wrapping_add(1);
+            last_signaling = Some(now);
         }
 
         if last_sync.map_or(true, |t| now.duration_since(t) >= SYNC_INTERVAL) {
@@ -347,13 +372,22 @@ fn build_header(
     out.push(log_interval as u8); // logMessageInterval
 }
 
+/// Append one TLV: tlvType(2 BE) + lengthField(2 BE) + value bytes.
+fn push_tlv(out: &mut Vec<u8>, tlv_type: u16, value: &[u8]) {
+    out.extend_from_slice(&tlv_type.to_be_bytes());
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value);
+}
+
 fn build_announce(clock_id: u64, seq: u16) -> Vec<u8> {
     // Body: originTimestamp(10) currentUtcOffset(2) reserved(1)
     // grandmasterPriority1(1) grandmasterClockQuality(4)
     // grandmasterPriority2(1) grandmasterIdentity(8) stepsRemoved(2)
-    // timeSource(1) = 30 bytes.
-    let mut out = Vec::with_capacity(HEADER_LEN + 30);
-    build_header(&mut out, MSG_ANNOUNCE, FLAGS_GENERAL, clock_id, seq, 30, 0x05, LOG_INTERVAL_ANNOUNCE);
+    // timeSource(1) = 30 bytes, then a PATH_TRACE TLV (4+8) carrying our
+    // clock identity — libairptp appends it and Apple gear expects it.
+    let body_len = 30 + 4 + 8;
+    let mut out = Vec::with_capacity(HEADER_LEN + body_len);
+    build_header(&mut out, MSG_ANNOUNCE, FLAGS_GENERAL, clock_id, seq, body_len, 0x05, LOG_INTERVAL_ANNOUNCE);
     out.extend_from_slice(&[0u8; 10]); // originTimestamp
     out.extend_from_slice(&0i16.to_be_bytes()); // currentUtcOffset
     out.push(0); // reserved
@@ -368,6 +402,31 @@ fn build_announce(clock_id: u64, seq: u16) -> Vec<u8> {
     out.extend_from_slice(&clock_id.to_be_bytes()); // grandmasterIdentity
     out.extend_from_slice(&0u16.to_be_bytes()); // stepsRemoved
     out.push(0x20); // timeSource = GPS
+    push_tlv(&mut out, TLV_PATH_TRACE, &clock_id.to_be_bytes());
+    out
+}
+
+/// Apple-proprietary PTP Signaling message, byte-for-byte per libairptp's
+/// `msg_signaling_make`: targetPortIdentity all-zero, then two Apple
+/// org-extension TLVs (subtypes 1 and 5) whose payloads start with the
+/// fixed `00 00 03 01` and are zero-padded to 22/32 value bytes.
+fn build_signaling(clock_id: u64, seq: u16) -> Vec<u8> {
+    let tlv_value = |subtype: u8, value_len: usize| -> Vec<u8> {
+        let mut v = Vec::with_capacity(value_len);
+        v.extend_from_slice(&ORG_APPLE);
+        v.extend_from_slice(&[0x00, 0x00, subtype]);
+        v.extend_from_slice(&APPLE_UNKNOWN);
+        v.resize(value_len, 0);
+        v
+    };
+    let tlv1 = tlv_value(0x01, 22);
+    let tlv2 = tlv_value(0x05, 32);
+    let body_len = 10 + (4 + tlv1.len()) + (4 + tlv2.len());
+    let mut out = Vec::with_capacity(HEADER_LEN + body_len);
+    build_header(&mut out, MSG_SIGNALING, FLAGS_GENERAL, clock_id, seq, body_len, 0x05, LOG_INTERVAL_SIGNALING);
+    out.extend_from_slice(&[0u8; 10]); // targetPortIdentity (zeros; iOS fills it, libairptp doesn't)
+    push_tlv(&mut out, TLV_ORG_EXTENSION, &tlv1);
+    push_tlv(&mut out, TLV_ORG_EXTENSION, &tlv2);
     out
 }
 
@@ -475,7 +534,39 @@ mod tests {
         assert_eq!(&ann[53..61], &id.to_be_bytes()); // grandmasterIdentity
         assert_eq!(u16::from_be_bytes([ann[61], ann[62]]), 0); // stepsRemoved
         assert_eq!(ann[63], 0x20); // timeSource = GPS
-        assert_eq!(ann.len(), HEADER_LEN + 30);
+        // PATH_TRACE TLV: type 0x0008, length 8, value = clock identity.
+        assert_eq!(u16::from_be_bytes([ann[64], ann[65]]), 0x0008);
+        assert_eq!(u16::from_be_bytes([ann[66], ann[67]]), 8);
+        assert_eq!(&ann[68..76], &id.to_be_bytes());
+        assert_eq!(ann.len(), HEADER_LEN + 30 + 12);
+        // messageLength reflects the TLV too.
+        assert_eq!(u16::from_be_bytes([ann[2], ann[3]]), ann.len() as u16);
+    }
+
+    #[test]
+    fn signaling_matches_libairptp_layout() {
+        let sig = build_signaling(0x1122334455667788, 9);
+        let h = parse_header(&sig).unwrap();
+        assert_eq!(h.msg_type, MSG_SIGNALING);
+        assert_eq!(sig.len(), HEADER_LEN + 10 + 26 + 36); // 106
+        assert_eq!(u16::from_be_bytes([sig[2], sig[3]]), 106);
+        assert_eq!(u16::from_be_bytes([sig[6], sig[7]]), 0x0408); // UNICAST|TIMESCALE
+        assert_eq!(sig[33], 0x80); // logMessageInterval = -128
+        assert_eq!(&sig[34..44], &[0u8; 10]); // targetPortIdentity zeros
+        // TLV1: org-extension, len 22, Apple OUI, subtype 1, fixed prefix.
+        assert_eq!(u16::from_be_bytes([sig[44], sig[45]]), 0x0003);
+        assert_eq!(u16::from_be_bytes([sig[46], sig[47]]), 22);
+        assert_eq!(&sig[48..51], &[0x00, 0x0d, 0x93]);
+        assert_eq!(&sig[51..54], &[0x00, 0x00, 0x01]);
+        assert_eq!(&sig[54..58], &[0x00, 0x00, 0x03, 0x01]);
+        assert!(sig[58..70].iter().all(|&b| b == 0)); // zero padding
+        // TLV2: len 32, subtype 5, same fixed prefix.
+        assert_eq!(u16::from_be_bytes([sig[70], sig[71]]), 0x0003);
+        assert_eq!(u16::from_be_bytes([sig[72], sig[73]]), 32);
+        assert_eq!(&sig[74..77], &[0x00, 0x0d, 0x93]);
+        assert_eq!(&sig[77..80], &[0x00, 0x00, 0x05]);
+        assert_eq!(&sig[80..84], &[0x00, 0x00, 0x03, 0x01]);
+        assert!(sig[84..106].iter().all(|&b| b == 0));
     }
 
     #[test]
