@@ -41,6 +41,15 @@ pub struct StreamPorts {
     pub control: u16,
 }
 
+/// Ports the receiver returned from the first (timing) SETUP.
+#[derive(Debug, Clone, Copy)]
+pub struct TimingSetup {
+    /// TCP event-channel port — must be connected before RECORD.
+    pub event_port: u16,
+    /// The receiver's NTP timing port (0 if absent / PTP mode).
+    pub timing_port: u16,
+}
+
 /// A live AirPlay 2 RTSP control connection.
 pub struct Ap2Rtsp {
     stream: TcpStream,
@@ -138,10 +147,10 @@ impl Ap2Rtsp {
     }
 
     /// First SETUP — declare the timing protocol and our timing port,
-    /// learn the receiver's event port. We use NTP timing (the classic
-    /// RAOP timing packets), which works for AP2 receivers that don't
-    /// mandate PTP. Returns the receiver's `eventPort`.
-    pub fn setup_timing_ntp(&mut self, timing_port: u16) -> Result<u16> {
+    /// learn the receiver's event + timing ports. NTP timing (the classic
+    /// RAOP timing packets) is what OwnTone shipped for AirPlay 2 for
+    /// years — it's the known-working combination with Sonos.
+    pub fn setup_timing_ntp(&mut self, timing_port: u16) -> Result<TimingSetup> {
         let mut dict = plist::Dictionary::new();
         dict.insert("deviceID".into(), self.device_id_mac.clone().into());
         dict.insert("sessionUUID".into(), self.session_uuid.clone().into());
@@ -154,7 +163,7 @@ impl Ap2Rtsp {
         if resp.status != 200 {
             bail!("SETUP(timing) → {} {}", resp.status, resp.status_text);
         }
-        Ok(parse_event_port(&resp.body).unwrap_or(0))
+        Ok(parse_timing_setup(&resp.body))
     }
 
     /// First SETUP, PTP variant — declare IEEE-1588 timing and advertise
@@ -165,8 +174,7 @@ impl Ap2Rtsp {
     /// dict shape mirrors OwnTone's `payload_make_setup_session` PTP
     /// variant: ID (UUID), ClockID (int64), DeviceType, Addresses,
     /// SupportsClockPortMatchingOverride — plus a `timingPeerList` copy.
-    /// Returns the receiver's `eventPort`.
-    pub fn setup_timing_ptp(&mut self, clock_id: u64, clock_uuid: &str) -> Result<u16> {
+    pub fn setup_timing_ptp(&mut self, clock_id: u64, clock_uuid: &str) -> Result<TimingSetup> {
         let mut peer = plist::Dictionary::new();
         peer.insert(
             "Addresses".into(),
@@ -193,7 +201,7 @@ impl Ap2Rtsp {
         if resp.status != 200 {
             bail!("SETUP(timing/PTP) → {} {}", resp.status, resp.status_text);
         }
-        Ok(parse_event_port(&resp.body).unwrap_or(0))
+        Ok(parse_timing_setup(&resp.body))
     }
 
     /// SETPEERS — hand the receiver the full PTP peer address list (ours
@@ -396,15 +404,27 @@ fn to_binary_plist(value: &Value) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Pull the receiver's `eventPort` out of the first SETUP response. The
-/// receiver withholds its RECORD response until the sender opens a TCP
-/// event channel to this port, so it's mandatory for AirPlay 2.
-fn parse_event_port(body: &[u8]) -> Option<u16> {
-    let val: Value = plist::from_bytes(body).ok()?;
-    val.as_dictionary()?
-        .get("eventPort")
-        .and_then(|v| v.as_unsigned_integer())
-        .map(|p| p as u16)
+/// Pull the receiver's `eventPort` (+ optional `timingPort`) out of the
+/// first SETUP response. The receiver withholds its RECORD response until
+/// the sender opens a TCP event channel to the event port, so that one is
+/// mandatory for AirPlay 2; the timing port is where the receiver expects
+/// our NTP-mode timing traffic to originate.
+fn parse_timing_setup(body: &[u8]) -> TimingSetup {
+    let port = |key: &str| -> u16 {
+        plist::from_bytes::<Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.as_dictionary()?
+                    .get(key)
+                    .and_then(|p| p.as_unsigned_integer())
+            })
+            .map(|p| p as u16)
+            .unwrap_or(0)
+    };
+    TimingSetup {
+        event_port: port("eventPort"),
+        timing_port: port("timingPort"),
+    }
 }
 
 /// Pull `streams[0].dataPort` and `.controlPort` out of a SETUP response.

@@ -92,6 +92,7 @@ pub fn spawn_timing_responder(
         .name(format!("stream-to-speaker-airplay-timing:{}", receiver_name))
         .spawn(move || {
             let mut buf = [0u8; 64];
+            let mut served: u64 = 0;
             while !stop_flag.load(Ordering::Acquire) {
                 match timing_socket.recv_from(&mut buf) {
                     Ok((n, peer)) if n >= 32 => {
@@ -102,6 +103,13 @@ pub fn spawn_timing_responder(
                             received_ntp,
                             &timing_socket,
                         );
+                        served += 1;
+                        if served == 1 {
+                            info!(
+                                "AirPlay NTP timing: receiver engaged (first timing request from {})",
+                                peer
+                            );
+                        }
                     }
                     Ok((n, _)) => {
                         debug!("AirPlay timing: short packet ({} bytes), ignoring", n);
@@ -408,10 +416,20 @@ pub fn spawn_resend_responder(
         .name(format!("stream-to-speaker-airplay-resend:{}", receiver_name))
         .spawn(move || {
             let mut buf = [0u8; 64];
+            let mut requests: u64 = 0;
             while !stop_flag.load(Ordering::Acquire) {
                 match control_socket.recv_from(&mut buf) {
                     // Resend request: 0x80 0xD5, seq(2), first(2), count(2).
-                    Ok((n, _)) if n >= 8 && buf[1] == 0xD5 => {
+                    Ok((n, peer)) if n >= 8 && buf[1] == 0xD5 => {
+                        requests += 1;
+                        if requests == 1 {
+                            // A resend request proves the receiver is
+                            // consuming our RTP stream (it tracks seq gaps).
+                            info!(
+                                "AirPlay resend: receiver {} is consuming the RTP stream (first resend request)",
+                                peer
+                            );
+                        }
                         let first = BigEndian::read_u16(&buf[4..6]);
                         let count = BigEndian::read_u16(&buf[6..8]).min(MAX_RESEND_RUN);
                         let mut sent = 0u16;

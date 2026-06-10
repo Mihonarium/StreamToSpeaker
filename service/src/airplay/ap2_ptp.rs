@@ -184,6 +184,9 @@ fn run_master(
     let mut last_announce: Option<Instant> = None;
     let mut last_sync: Option<Instant> = None;
     let mut delay_resps: u64 = 0;
+    let mut rx_total: u64 = 0;
+    let mut seen_types: u16 = 0;
+    let mut last_status = Instant::now();
     let mut buf = [0u8; 256];
 
     while !stop.load(Ordering::Acquire) {
@@ -210,11 +213,14 @@ fn run_master(
         }
 
         // Event port: the receiver's Delay_Req arrives here. The 25 ms read
-        // timeout doubles as the loop tick.
+        // timeout doubles as the loop tick. We log every inbound PTP packet
+        // so the log shows whether the receiver engages our clock at all.
         match event.recv_from(&mut buf) {
             Ok((n, src)) => {
                 let t_recv = clock.now_ns();
+                rx_total += 1;
                 if let Some(h) = parse_header(&buf[..n]) {
+                    note_inbound(&mut seen_types, h.msg_type, PTP_EVENT_PORT, src);
                     if h.msg_type == 0x1 {
                         let resp = build_delay_resp(
                             clock_id,
@@ -238,11 +244,57 @@ fn run_master(
             }
         }
 
-        // General port: drain (the receiver may announce its own clock at
-        // lower precedence; with clockClass 6 we win BMCA — ignore).
-        while let Ok((_n, _src)) = general.recv_from(&mut buf) {}
+        // General port: Announce / Follow_Up / Signaling / Delay_Resp from
+        // the receiver. Logged so we can see e.g. a Signaling handshake.
+        while let Ok((n, src)) = general.recv_from(&mut buf) {
+            rx_total += 1;
+            if let Some(h) = parse_header(&buf[..n]) {
+                note_inbound(&mut seen_types, h.msg_type, PTP_GENERAL_PORT, src);
+            }
+        }
+
+        // Heartbeat: if the receiver never talks back, the PTP clock can't
+        // lock and playback is silent — say so loudly, with the likely cause.
+        if last_status.elapsed() >= Duration::from_secs(5) {
+            if rx_total == 0 {
+                warn!(
+                    "AirPlay 2 PTP: receiver {} has sent us NOTHING on 319/320 after 5s — it isn't \
+                     engaging our clock. Likely inbound UDP 319/320 is firewall-blocked, or it \
+                     expects unicast-PTP signaling we don't send yet. No clock lock = silent audio.",
+                    receiver_ip
+                );
+            } else {
+                info!(
+                    "AirPlay 2 PTP status: received {} packet(s) from receiver, served {} Delay_Resp",
+                    rx_total, delay_resps
+                );
+            }
+            last_status = Instant::now();
+        }
     }
     debug!("AirPlay 2 PTP master exiting ({} delay-resps served)", delay_resps);
+}
+
+/// Log inbound PTP traffic: the first packet of each message type at INFO
+/// (so a default log shows exactly how the receiver engages), repeats at
+/// debug. `seen` is a bitmask indexed by message type.
+fn note_inbound(seen: &mut u16, msg_type: u8, port: u16, src: SocketAddr) {
+    let name = match msg_type {
+        0x0 => "Sync",
+        0x1 => "Delay_Req",
+        0x8 => "Follow_Up",
+        0x9 => "Delay_Resp",
+        0xB => "Announce",
+        0xC => "Signaling",
+        _ => "other",
+    };
+    let bit = 1u16 << (msg_type & 0x0f);
+    if *seen & bit == 0 {
+        *seen |= bit;
+        info!("AirPlay 2 PTP: first {} (type {:#x}) from {} on :{}", name, msg_type, src, port);
+    } else {
+        debug!("AP2 PTP: {} from {} on :{}", name, src, port);
+    }
 }
 
 // ---------------------------------------------------------------------------
