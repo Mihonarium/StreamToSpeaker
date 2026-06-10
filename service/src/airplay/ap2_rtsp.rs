@@ -140,8 +140,8 @@ impl Ap2Rtsp {
     /// First SETUP — declare the timing protocol and our timing port,
     /// learn the receiver's event port. We use NTP timing (the classic
     /// RAOP timing packets), which works for AP2 receivers that don't
-    /// mandate PTP.
-    pub fn setup_timing_ntp(&mut self, timing_port: u16) -> Result<()> {
+    /// mandate PTP. Returns the receiver's `eventPort`.
+    pub fn setup_timing_ntp(&mut self, timing_port: u16) -> Result<u16> {
         let mut dict = plist::Dictionary::new();
         dict.insert("deviceID".into(), self.device_id_mac.clone().into());
         dict.insert("sessionUUID".into(), self.session_uuid.clone().into());
@@ -154,13 +154,14 @@ impl Ap2Rtsp {
         if resp.status != 200 {
             bail!("SETUP(timing) → {} {}", resp.status, resp.status_text);
         }
-        Ok(())
+        Ok(parse_event_port(&resp.body).unwrap_or(0))
     }
 
     /// First SETUP, PTP variant — declare IEEE-1588 timing and advertise
     /// ourselves as a PTP peer (the receiver becomes grandmaster and we
     /// follow on UDP 319/320). `clock_id` is our decimal clockIdentity.
-    pub fn setup_timing_ptp(&mut self, clock_id: &str) -> Result<()> {
+    /// Returns the receiver's `eventPort`.
+    pub fn setup_timing_ptp(&mut self, clock_id: &str) -> Result<u16> {
         let mut peer = plist::Dictionary::new();
         peer.insert(
             "Addresses".into(),
@@ -180,7 +181,7 @@ impl Ap2Rtsp {
         if resp.status != 200 {
             bail!("SETUP(timing/PTP) → {} {}", resp.status, resp.status_text);
         }
-        Ok(())
+        Ok(parse_event_port(&resp.body).unwrap_or(0))
     }
 
     /// SETPEERS — hand the receiver the full PTP peer address list (ours
@@ -381,6 +382,17 @@ fn to_binary_plist(value: &Value) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     plist::to_writer_binary(&mut buf, value).context("serialising binary plist")?;
     Ok(buf)
+}
+
+/// Pull the receiver's `eventPort` out of the first SETUP response. The
+/// receiver withholds its RECORD response until the sender opens a TCP
+/// event channel to this port, so it's mandatory for AirPlay 2.
+fn parse_event_port(body: &[u8]) -> Option<u16> {
+    let val: Value = plist::from_bytes(body).ok()?;
+    val.as_dictionary()?
+        .get("eventPort")
+        .and_then(|v| v.as_unsigned_integer())
+        .map(|p| p as u16)
 }
 
 /// Pull `streams[0].dataPort` and `.controlPort` out of a SETUP response.

@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use byteorder::{BigEndian, ByteOrder};
 use crossbeam_channel::{Receiver, TryRecvError};
 use log::{debug, info, warn};
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -68,6 +68,7 @@ pub struct AirPlay2Session {
     timing_handle: Option<JoinHandle<()>>,
     sync_handle: Option<JoinHandle<()>>,
     resend_handle: Option<JoinHandle<()>>,
+    event_handle: Option<JoinHandle<()>>,
     ptp_session: Option<PtpSession>,
     _audio_socket: UdpSocket,
 }
@@ -95,16 +96,41 @@ impl AirPlay2Session {
             .context("AirPlay 2 HomeKit transient pairing")?;
         info!("AirPlay 2: paired with {}", cfg.renderer.friendly_name);
 
-        // HomePods (feature bit 41) mandate IEEE-1588 PTP; everything else
-        // gets the classic NTP timing packets.
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        // HomePods / Sonos (feature bit 41) mandate IEEE-1588 PTP; everything
+        // else gets the classic NTP timing packets. The first SETUP also
+        // returns the receiver's eventPort.
         let use_ptp = cfg.renderer.expects_ptp();
-        if use_ptp {
+        let event_port = if use_ptp {
             info!("AirPlay 2: {} requires PTP timing", cfg.renderer.friendly_name);
             let clock_id = ap2_ptp::clock_id_string(&ap2_ptp::clock_identity_from_ip(cfg.local_ip));
-            rtsp.setup_timing_ptp(&clock_id).context("AP2 SETUP(timing/PTP)")?;
+            rtsp.setup_timing_ptp(&clock_id).context("AP2 SETUP(timing/PTP)")?
         } else {
-            rtsp.setup_timing_ntp(timing_port).context("AP2 SETUP(timing/NTP)")?;
-        }
+            rtsp.setup_timing_ntp(timing_port).context("AP2 SETUP(timing/NTP)")?
+        };
+
+        // Open the event channel: the receiver withholds its RECORD response
+        // until the sender has a TCP connection to its eventPort. We don't
+        // process events — just keep it open.
+        let event_handle = spawn_event_channel(
+            cfg.renderer.ip,
+            event_port,
+            stop_flag.clone(),
+            cfg.renderer.friendly_name.clone(),
+        );
+
+        // Start PTP *before* RECORD so we're already exchanging on UDP
+        // 319/320 when the receiver brings up timing — it won't answer
+        // RECORD until the PTP clock is live.
+        let ptp_session = if use_ptp {
+            Some(
+                spawn_ptp(cfg.renderer.ip, cfg.local_ip, cfg.renderer.friendly_name.clone())
+                    .context("starting AP2 PTP follower")?,
+            )
+        } else {
+            None
+        };
 
         let ports = rtsp
             .setup_stream(&audio_key, control_port)
@@ -131,7 +157,6 @@ impl AirPlay2Session {
         let initial_seq = random_initial_seq();
         let initial_rtptime = random_initial_rtptime();
         let ssrc = random_ssrc();
-        let stop_flag = Arc::new(AtomicBool::new(false));
         let current_rtptime = Arc::new(AtomicU32::new(initial_rtptime));
         let resend = ResendBuffer::new(RESEND_BUFFER_PACKETS);
 
@@ -156,22 +181,21 @@ impl AirPlay2Session {
         })?;
 
         let sync_addr = SocketAddr::new(cfg.renderer.ip, ports.control);
-        let (timing_handle, sync_handle, ptp_session) = if use_ptp {
-            let ptp = spawn_ptp(cfg.renderer.ip, cfg.local_ip, cfg.renderer.friendly_name.clone())
-                .context("starting AP2 PTP follower")?;
+        let (timing_handle, sync_handle) = if use_ptp {
+            let clock = ptp_session.as_ref().unwrap().clock.clone();
             let sync = spawn_sync_sender_ptp(
                 control_socket,
                 sync_addr,
                 current_rtptime,
                 DEFAULT_LATENCY_SAMPLES,
-                ptp.clock.clone(),
+                clock,
                 stop_flag.clone(),
                 cfg.renderer.friendly_name.clone(),
             )
             .context("spawning AP2 PTP sync sender")?;
             // The NTP timing responder is unused under PTP; release its socket.
             drop(timing_socket);
-            (None, Some(sync), Some(ptp))
+            (None, Some(sync))
         } else {
             let timing = spawn_timing_responder(
                 timing_socket,
@@ -188,7 +212,7 @@ impl AirPlay2Session {
                 cfg.renderer.friendly_name.clone(),
             )
             .context("spawning AP2 sync sender")?;
-            (Some(timing), Some(sync), None)
+            (Some(timing), Some(sync))
         };
 
         let resend_handle = spawn_resend_responder(
@@ -213,6 +237,7 @@ impl AirPlay2Session {
             timing_handle,
             sync_handle,
             resend_handle: Some(resend_handle),
+            event_handle,
             ptp_session,
             _audio_socket: audio_socket,
         })
@@ -235,6 +260,7 @@ impl AirPlay2Session {
             self.timing_handle.take(),
             self.sync_handle.take(),
             self.resend_handle.take(),
+            self.event_handle.take(),
         ]
         .into_iter()
         .flatten()
@@ -252,6 +278,54 @@ impl Drop for AirPlay2Session {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Release);
     }
+}
+
+/// Open the AirPlay 2 event channel — a TCP connection to the receiver's
+/// `eventPort` (from the first SETUP response). The receiver withholds its
+/// RECORD response until this connection exists. We don't act on the events
+/// it may send; a drain thread just keeps the socket open and discards
+/// anything received until shutdown. Best-effort: a missing/unreachable
+/// port logs and returns None rather than failing the session.
+fn spawn_event_channel(
+    receiver_ip: IpAddr,
+    event_port: u16,
+    stop_flag: Arc<AtomicBool>,
+    receiver_name: String,
+) -> Option<JoinHandle<()>> {
+    if event_port == 0 {
+        debug!("AirPlay 2: no eventPort advertised; skipping event channel");
+        return None;
+    }
+    let addr = SocketAddr::new(receiver_ip, event_port);
+    let stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("AirPlay 2: event channel connect to {} failed: {}", addr, e);
+            return None;
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    debug!("AirPlay 2: event channel open to {}", addr);
+
+    std::thread::Builder::new()
+        .name(format!("stream-to-speaker-ap2-event:{}", receiver_name))
+        .spawn(move || {
+            use std::io::Read;
+            let mut stream = stream;
+            let mut buf = [0u8; 1024];
+            while !stop_flag.load(Ordering::Acquire) {
+                match stream.read(&mut buf) {
+                    Ok(0) => break, // receiver closed the channel
+                    Ok(_) => {}     // discard events
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => break,
+                }
+            }
+            debug!("AirPlay 2 event channel closed");
+        })
+        .ok()
 }
 
 // ---------------------------------------------------------------------------
