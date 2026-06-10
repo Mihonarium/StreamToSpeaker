@@ -427,6 +427,25 @@ impl App {
     ///   * `"airplay:<mac>"` → AirPlay RAOP session
     ///   * anything else     → UPnP / OpenHome session
     pub fn select_speaker(&self, id: &str) -> Result<(), String> {
+        // Re-selecting the receiver that's already bound — e.g. retrying a
+        // silent AirPlay session — must tear the old session down FIRST.
+        // While we're still streaming to it the receiver is occupied and
+        // refuses a fresh pairing/connection (it just times out → 10060).
+        // For a *different* receiver we keep the old session until the new
+        // one is up, so a failed switch doesn't drop a working stream.
+        let replacing_same = self
+            .session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.stable_id() == id)
+            .unwrap_or(false);
+        if replacing_same {
+            if let Some(old) = self.session.lock().unwrap().take() {
+                old.stop();
+            }
+        }
+
         let new_session = if id.starts_with("airplay:") {
             self.start_airplay(id)?
         } else {
