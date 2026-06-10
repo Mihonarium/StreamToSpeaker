@@ -14,12 +14,13 @@
 //!   confirms AirPlay 2 receivers still speak. Used for receivers that
 //!   don't mandate PTP.
 //! - **PTP** (`timingProtocol: PTP`) — IEEE-1588 for receivers that
-//!   advertise `SupportsPTP` (HomePods). We run a PTP follower
-//!   ([`crate::airplay::ap2_ptp`]) on UDP 319/320, send `SETPEERS`, and
-//!   anchor the `0xD4` sync packet to the shared PTP clock instead of
-//!   local NTP. (The live PTP handshake is unverified against real
-//!   hardware; if a HomePod rejects realtime+PTP it likely wants the
-//!   buffered/AAC stream, a separate follow-up.)
+//!   advertise `SupportsPTP` (HomePods, Sonos). **We serve as the PTP
+//!   grandmaster** ([`crate::airplay::ap2_ptp`]): the SETUP advertises our
+//!   clock (`timingPeerInfo`/`timingPeerList` + `SETPEERS`), the master
+//!   sends Announce/Sync/Follow_Up on UDP 319/320 and answers Delay_Req,
+//!   and the `0xD4` sync packet is stamped from the same master clock
+//!   (+ NTP epoch delta) so the receiver can map it onto the PTP timeline
+//!   it follows. Mirrors OwnTone's `libairptp` sender design.
 
 use anyhow::{Context, Result};
 use byteorder::{BigEndian, ByteOrder};
@@ -33,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use crate::airplay::alac::build_uncompressed_alac_frame;
 use crate::airplay::ap2_crypto::seal_audio;
-use crate::airplay::ap2_ptp::{self, spawn_ptp, PtpSession};
+use crate::airplay::ap2_ptp::{spawn_ptp_master, PtpMaster};
 use crate::airplay::ap2_rtsp::Ap2Rtsp;
 use crate::airplay::discovery::AirPlayRenderer;
 use crate::airplay::rtp::{bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, FRAMES_PER_PACKET};
@@ -69,7 +70,7 @@ pub struct AirPlay2Session {
     sync_handle: Option<JoinHandle<()>>,
     resend_handle: Option<JoinHandle<()>>,
     event_handle: Option<JoinHandle<()>>,
-    ptp_session: Option<PtpSession>,
+    ptp_session: Option<PtpMaster>,
     _audio_socket: UdpSocket,
 }
 
@@ -99,15 +100,24 @@ impl AirPlay2Session {
         let stop_flag = Arc::new(AtomicBool::new(false));
 
         // HomePods / Sonos (feature bit 41) mandate IEEE-1588 PTP; everything
-        // else gets the classic NTP timing packets. The first SETUP also
-        // returns the receiver's eventPort.
+        // else gets the classic NTP timing packets. For PTP **we are the
+        // grandmaster** — start the master first so its clock identity goes
+        // into the SETUP payload and the clock is already being served when
+        // the receiver processes it. The first SETUP returns the eventPort.
         let use_ptp = cfg.renderer.expects_ptp();
-        let event_port = if use_ptp {
-            info!("AirPlay 2: {} requires PTP timing", cfg.renderer.friendly_name);
-            let clock_id = ap2_ptp::clock_id_string(&ap2_ptp::clock_identity_from_ip(cfg.local_ip));
-            rtsp.setup_timing_ptp(&clock_id).context("AP2 SETUP(timing/PTP)")?
+        let (ptp_session, event_port) = if use_ptp {
+            info!("AirPlay 2: {} uses PTP timing (we serve as grandmaster)", cfg.renderer.friendly_name);
+            let ptp = spawn_ptp_master(cfg.renderer.ip, cfg.local_ip, cfg.renderer.friendly_name.clone())
+                .context("starting AP2 PTP master")?;
+            let event_port = rtsp
+                .setup_timing_ptp(ptp.clock_id, &ptp.clock_uuid)
+                .context("AP2 SETUP(timing/PTP)")?;
+            (Some(ptp), event_port)
         } else {
-            rtsp.setup_timing_ntp(timing_port).context("AP2 SETUP(timing/NTP)")?
+            let event_port = rtsp
+                .setup_timing_ntp(timing_port)
+                .context("AP2 SETUP(timing/NTP)")?;
+            (None, event_port)
         };
 
         // Open the event channel: the receiver withholds its RECORD response
@@ -120,27 +130,15 @@ impl AirPlay2Session {
             cfg.renderer.friendly_name.clone(),
         );
 
-        // Start PTP *before* RECORD so we're already exchanging on UDP
-        // 319/320 when the receiver brings up timing — it won't answer
-        // RECORD until the PTP clock is live.
-        let ptp_session = if use_ptp {
-            Some(
-                spawn_ptp(cfg.renderer.ip, cfg.local_ip, cfg.renderer.friendly_name.clone())
-                    .context("starting AP2 PTP follower")?,
-            )
-        } else {
-            None
-        };
-
         let ports = rtsp
             .setup_stream(&audio_key, control_port)
             .context("AP2 SETUP(stream)")?;
         debug!("AirPlay 2: receiver data port {}, control port {}", ports.data, ports.control);
 
         if use_ptp {
-            // Hand the receiver the PTP peer list (ours + its own). Some
-            // firmwares need it before they'll lock; tolerate refusal.
-            if let Err(e) = rtsp.set_peers(&[cfg.local_ip, cfg.renderer.ip]) {
+            // Hand the receiver the PTP peer address list. OwnTone's order:
+            // receiver's address first, then the sender's.
+            if let Err(e) = rtsp.set_peers(&[cfg.renderer.ip, cfg.local_ip]) {
                 warn!("AirPlay 2 SETPEERS failed (PTP may not lock): {}", e);
             }
         }

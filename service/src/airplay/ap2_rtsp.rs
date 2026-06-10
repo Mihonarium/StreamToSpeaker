@@ -158,22 +158,34 @@ impl Ap2Rtsp {
     }
 
     /// First SETUP, PTP variant — declare IEEE-1588 timing and advertise
-    /// ourselves as a PTP peer (the receiver becomes grandmaster and we
-    /// follow on UDP 319/320). `clock_id` is our decimal clockIdentity.
+    /// **our own clock** as the timing peer: in AirPlay 2 the sender is the
+    /// PTP grandmaster and the receiver follows it (see
+    /// [`crate::airplay::ap2_ptp`]). `clock_id` is the u64 clock identity
+    /// our PTP master serves; `clock_uuid` is its UUID string. The peer
+    /// dict shape mirrors OwnTone's `payload_make_setup_session` PTP
+    /// variant: ID (UUID), ClockID (int64), DeviceType, Addresses,
+    /// SupportsClockPortMatchingOverride — plus a `timingPeerList` copy.
     /// Returns the receiver's `eventPort`.
-    pub fn setup_timing_ptp(&mut self, clock_id: &str) -> Result<u16> {
+    pub fn setup_timing_ptp(&mut self, clock_id: u64, clock_uuid: &str) -> Result<u16> {
         let mut peer = plist::Dictionary::new();
         peer.insert(
             "Addresses".into(),
             Value::Array(vec![Value::String(self.local_ip.to_string())]),
         );
-        peer.insert("ID".into(), clock_id.to_string().into());
+        peer.insert("ClockID".into(), Value::Integer((clock_id as i64).into()));
+        peer.insert("DeviceType".into(), Value::Integer(0u64.into()));
+        peer.insert("ID".into(), clock_uuid.to_string().into());
+        peer.insert("SupportsClockPortMatchingOverride".into(), Value::Boolean(false));
 
         let mut dict = plist::Dictionary::new();
         dict.insert("deviceID".into(), self.device_id_mac.clone().into());
         dict.insert("sessionUUID".into(), self.session_uuid.clone().into());
         dict.insert("timingProtocol".into(), "PTP".into());
-        dict.insert("timingPeerInfo".into(), Value::Dictionary(peer));
+        dict.insert("timingPeerInfo".into(), Value::Dictionary(peer.clone()));
+        dict.insert(
+            "timingPeerList".into(),
+            Value::Array(vec![Value::Dictionary(peer)]),
+        );
         let body = to_binary_plist(&Value::Dictionary(dict))?;
 
         let uri = self.session_uri();

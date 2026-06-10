@@ -171,15 +171,18 @@ pub fn spawn_sync_sender(
 }
 
 /// PTP variant: the network-time field of the 0xD4 sync packet carries
-/// the shared PTP clock (the receiver's grandmaster time we follow),
-/// expressed as a 32.32 fixed-point value in the PTP timescale. Used for
-/// HomePods and other receivers that mandate IEEE-1588 timing.
+/// the **PTP grandmaster clock we ourselves serve** (the receiver follows
+/// our clock — see [`crate::airplay::ap2_ptp`]), with the NTP 1900-epoch
+/// delta added to the seconds. That matches OwnTone exactly: its sync
+/// packets are `CLOCK_MONOTONIC + NTP_EPOCH_DELTA` while its PTP daemon
+/// serves raw `CLOCK_MONOTONIC`, so the receiver can equate
+/// "sync time − epoch delta" with the PTP timeline it is locked to.
 pub fn spawn_sync_sender_ptp(
     control_socket: UdpSocket,
     receiver_addr: SocketAddr,
     current_rtptime: Arc<AtomicU32>,
     latency_samples: u32,
-    ptp: Arc<crate::airplay::ap2_ptp::PtpClock>,
+    ptp_clock: Arc<crate::airplay::ap2_ptp::PtpMasterClock>,
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
 ) -> std::io::Result<thread::JoinHandle<()>> {
@@ -190,7 +193,7 @@ pub fn spawn_sync_sender_ptp(
         latency_samples,
         stop_flag,
         receiver_name,
-        move || ns_to_fixed_32_32(ptp.master_now_ns()),
+        move || ptp_ns_to_ntp_fixed(ptp_clock.now_ns()),
     )
 }
 
@@ -253,15 +256,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_32_32_encodes_seconds_and_fraction() {
-        assert_eq!(ns_to_fixed_32_32(0), 0);
-        assert_eq!(ns_to_fixed_32_32(1_000_000_000), 1u64 << 32);
+    fn ptp_ntp_fixed_applies_epoch_and_fraction() {
+        // Zero on the PTP timeline = exactly the NTP epoch delta seconds.
+        assert_eq!(ptp_ns_to_ntp_fixed(0), NTP_EPOCH_OFFSET << 32);
+        assert_eq!(ptp_ns_to_ntp_fixed(1_000_000_000), (NTP_EPOCH_OFFSET + 1) << 32);
         // Half a second ≈ 0x8000_0000 in the fractional word.
-        let half = ns_to_fixed_32_32(1_500_000_000);
-        assert_eq!(half >> 32, 1);
+        let half = ptp_ns_to_ntp_fixed(1_500_000_000);
+        assert_eq!(half >> 32, NTP_EPOCH_OFFSET + 1);
         assert!(((half & 0xFFFF_FFFF) as i64 - 0x8000_0000i64).abs() < 4);
-        // Negative clamps to zero rather than wrapping.
-        assert_eq!(ns_to_fixed_32_32(-5), 0);
     }
 
     #[test]
@@ -289,12 +291,12 @@ mod tests {
     }
 }
 
-/// Convert a nanosecond count to a 32.32 fixed-point seconds value
-/// (seconds in the high 32 bits, fractional seconds in the low 32). Used
-/// to format the PTP clock for the sync packet's network-time field.
-fn ns_to_fixed_32_32(ns: i64) -> u64 {
-    let ns = ns.max(0) as u64;
-    let secs = ns / 1_000_000_000;
+/// Convert a PTP-timeline nanosecond count to the sync packet's NTP-style
+/// 32.32 field: seconds (plus the 1900 epoch delta) in the high 32 bits,
+/// fractional seconds in the low 32. Mirrors OwnTone's `timespec_to_ntp`
+/// applied to its monotonic PTP clock.
+fn ptp_ns_to_ntp_fixed(ns: u64) -> u64 {
+    let secs = ns / 1_000_000_000 + NTP_EPOCH_OFFSET;
     let frac = ((ns % 1_000_000_000) << 32) / 1_000_000_000;
     (secs << 32) | frac
 }
