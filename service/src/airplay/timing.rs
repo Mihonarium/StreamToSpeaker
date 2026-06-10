@@ -52,7 +52,7 @@
 //! ```
 
 use byteorder::{BigEndian, ByteOrder};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -158,31 +158,30 @@ pub fn spawn_sync_sender(
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
 ) -> std::io::Result<thread::JoinHandle<()>> {
-    // NTP timeline: the network-time field carries our local NTP clock.
+    // NTP path: classic 20-byte 0xD4 sync, time field = our NTP clock.
     spawn_sync_sender_inner(
         control_socket,
         receiver_addr,
         current_rtptime,
-        latency_samples,
         stop_flag,
         receiver_name,
-        ntp_now,
+        "NTP",
+        move |first, cur_rtp| build_ntp_sync(first, cur_rtp, latency_samples, ntp_now()).to_vec(),
     )
 }
 
-/// PTP variant: the network-time field of the 0xD4 sync packet carries
-/// the **PTP grandmaster clock we ourselves serve** (the receiver follows
-/// our clock — see [`crate::airplay::ap2_ptp`]), with the NTP 1900-epoch
-/// delta added to the seconds. That matches OwnTone exactly: its sync
-/// packets are `CLOCK_MONOTONIC + NTP_EPOCH_DELTA` while its PTP daemon
-/// serves raw `CLOCK_MONOTONIC`, so the receiver can equate
-/// "sync time − epoch delta" with the PTP timeline it is locked to.
+/// PTP path: the receiver follows the PTP grandmaster clock we serve, so
+/// the sync packet is OwnTone's **28-byte 0xD7** form (`sync_packet_ptp_make`)
+/// carrying the **raw monotonic clock value** (ns — not NTP 32.32) plus our
+/// 8-byte clock identity. The 20-byte 0xD4 NTP packet is silently ignored
+/// under PTP, which is why audio decrypted but never scheduled → silence.
 pub fn spawn_sync_sender_ptp(
     control_socket: UdpSocket,
     receiver_addr: SocketAddr,
     current_rtptime: Arc<AtomicU32>,
     latency_samples: u32,
     ptp_clock: Arc<crate::airplay::ap2_ptp::PtpMasterClock>,
+    clock_id: u64,
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
 ) -> std::io::Result<thread::JoinHandle<()>> {
@@ -190,56 +189,55 @@ pub fn spawn_sync_sender_ptp(
         control_socket,
         receiver_addr,
         current_rtptime,
-        latency_samples,
         stop_flag,
         receiver_name,
-        move || ptp_ns_to_ntp_fixed(ptp_clock.now_ns()),
+        "PTP",
+        move |first, cur_rtp| {
+            build_ptp_sync(first, cur_rtp, latency_samples, ptp_clock.now_ns(), clock_id).to_vec()
+        },
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_sync_sender_inner<F>(
     control_socket: UdpSocket,
     receiver_addr: SocketAddr,
     current_rtptime: Arc<AtomicU32>,
-    latency_samples: u32,
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
-    network_time: F,
+    kind: &'static str,
+    build_packet: F,
 ) -> std::io::Result<thread::JoinHandle<()>>
 where
-    F: Fn() -> u64 + Send + 'static,
+    F: Fn(bool, u32) -> Vec<u8> + Send + 'static,
 {
     thread::Builder::new()
         .name(format!("stream-to-speaker-airplay-sync:{}", receiver_name))
         .spawn(move || {
-            // Brief delay before first sync packet so the RTP stream is
-            // already flowing — sending a sync ahead of any audio
-            // confuses some receivers.
+            // Brief delay before the first sync packet so the RTP stream is
+            // already flowing — a sync ahead of any audio confuses some
+            // receivers.
             thread::sleep(Duration::from_millis(500));
             let mut first = true;
+            let mut count: u64 = 0;
             while !stop_flag.load(Ordering::Acquire) {
-                let net_time = network_time();
                 let cur_rtp = current_rtptime.load(Ordering::Acquire);
-                let anchor_rtp = cur_rtp.wrapping_sub(latency_samples);
-
-                let mut pkt = [0u8; 20];
-                pkt[0] = if first { 0x90 } else { 0x80 };
-                pkt[1] = 0xD4;
-                BigEndian::write_u16(&mut pkt[2..4], RAOP_FIXED_SEQ);
-                BigEndian::write_u32(&mut pkt[4..8], anchor_rtp);
-                BigEndian::write_u64(&mut pkt[8..16], net_time);
-                BigEndian::write_u32(&mut pkt[16..20], cur_rtp);
-                first = false;
-
+                let pkt = build_packet(first, cur_rtp);
                 if let Err(e) = control_socket.send_to(&pkt, receiver_addr) {
-                    warn!(
-                        "AirPlay sync send to {} failed: {}",
-                        receiver_addr, e
+                    warn!("AirPlay {} sync send to {} failed: {}", kind, receiver_addr, e);
+                }
+                if first {
+                    info!(
+                        "AirPlay {} sync: sending sync packets to {} ({} bytes each)",
+                        kind,
+                        receiver_addr,
+                        pkt.len()
                     );
                 }
+                first = false;
+                count += 1;
 
-                // Sleep ~1 s, but in 100 ms slices so stop_flag is
-                // observed quickly during shutdown.
+                // ~1 s cadence, in 100 ms slices for prompt shutdown.
                 for _ in 0..10 {
                     if stop_flag.load(Ordering::Acquire) {
                         break;
@@ -247,7 +245,7 @@ where
                     thread::sleep(Duration::from_millis(100));
                 }
             }
-            debug!("AirPlay sync sender: exiting");
+            debug!("AirPlay {} sync sender exiting after {} packets", kind, count);
         })
 }
 
@@ -256,14 +254,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ptp_ntp_fixed_applies_epoch_and_fraction() {
-        // Zero on the PTP timeline = exactly the NTP epoch delta seconds.
-        assert_eq!(ptp_ns_to_ntp_fixed(0), NTP_EPOCH_OFFSET << 32);
-        assert_eq!(ptp_ns_to_ntp_fixed(1_000_000_000), (NTP_EPOCH_OFFSET + 1) << 32);
-        // Half a second ≈ 0x8000_0000 in the fractional word.
-        let half = ptp_ns_to_ntp_fixed(1_500_000_000);
-        assert_eq!(half >> 32, NTP_EPOCH_OFFSET + 1);
-        assert!(((half & 0xFFFF_FFFF) as i64 - 0x8000_0000i64).abs() < 4);
+    fn ntp_sync_packet_layout() {
+        let p = build_ntp_sync(true, 100_000, 11025, 0xAABBCCDD11223344);
+        assert_eq!(p.len(), 20);
+        assert_eq!(p[0], 0x90); // first → marker
+        assert_eq!(p[1], 0xD4);
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), 0x0007);
+        assert_eq!(u32::from_be_bytes([p[4], p[5], p[6], p[7]]), 100_000 - 11025);
+        assert_eq!(u64::from_be_bytes(p[8..16].try_into().unwrap()), 0xAABBCCDD11223344);
+        assert_eq!(u32::from_be_bytes([p[16], p[17], p[18], p[19]]), 100_000);
+        assert_eq!(build_ntp_sync(false, 1, 0, 0)[0], 0x80); // subsequent → no marker
+    }
+
+    #[test]
+    fn ptp_sync_packet_is_owntone_0xd7_form() {
+        let p = build_ptp_sync(true, 100_000, 11025, 0x0123456789, 0xDEADBEEFCAFEF00D);
+        assert_eq!(p.len(), 28); // RTCP_SYNC_PACKET_PTP_LEN
+        assert_eq!(p[0], 0x90);
+        assert_eq!(p[1], 0xD7); // PT 215, NOT 0xD4
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), 0x0006);
+        assert_eq!(u32::from_be_bytes([p[4], p[5], p[6], p[7]]), 100_000 - 11025);
+        // Raw nanoseconds — no NTP epoch, no 32.32.
+        assert_eq!(u64::from_be_bytes(p[8..16].try_into().unwrap()), 0x0123456789);
+        assert_eq!(u32::from_be_bytes([p[16], p[17], p[18], p[19]]), 100_000);
+        // Trailing clock identity.
+        assert_eq!(u64::from_be_bytes(p[20..28].try_into().unwrap()), 0xDEADBEEFCAFEF00D);
     }
 
     #[test]
@@ -291,14 +306,35 @@ mod tests {
     }
 }
 
-/// Convert a PTP-timeline nanosecond count to the sync packet's NTP-style
-/// 32.32 field: seconds (plus the 1900 epoch delta) in the high 32 bits,
-/// fractional seconds in the low 32. Mirrors OwnTone's `timespec_to_ntp`
-/// applied to its monotonic PTP clock.
-fn ptp_ns_to_ntp_fixed(ns: u64) -> u64 {
-    let secs = ns / 1_000_000_000 + NTP_EPOCH_OFFSET;
-    let frac = ((ns % 1_000_000_000) << 32) / 1_000_000_000;
-    (secs << 32) | frac
+/// 20-byte NTP audio sync packet (PT 0xD4). Anchor: the RTP timestamp that
+/// should be audible (current − latency) at the carried NTP time, then the
+/// current write head. Matches the classic RAOP/OwnTone NTP sync.
+fn build_ntp_sync(first: bool, cur_rtp: u32, latency: u32, ntp_time: u64) -> [u8; 20] {
+    let mut pkt = [0u8; 20];
+    pkt[0] = if first { 0x90 } else { 0x80 };
+    pkt[1] = 0xD4;
+    BigEndian::write_u16(&mut pkt[2..4], 0x0007);
+    BigEndian::write_u32(&mut pkt[4..8], cur_rtp.wrapping_sub(latency));
+    BigEndian::write_u64(&mut pkt[8..16], ntp_time);
+    BigEndian::write_u32(&mut pkt[16..20], cur_rtp);
+    pkt
+}
+
+/// 28-byte PTP audio sync packet (PT 0xD7) — OwnTone's `sync_packet_ptp_make`.
+/// Differs from the NTP packet in three load-bearing ways: type 0xD7 (not
+/// 0xD4), the time field is the **raw monotonic clock value (ns)** we serve
+/// as PTP grandmaster (no NTP epoch, no 32.32 fixed-point), and the trailing
+/// 8 bytes carry our clock identity so the receiver can map RTP → our clock.
+fn build_ptp_sync(first: bool, cur_rtp: u32, latency: u32, ptp_ns: u64, clock_id: u64) -> [u8; 28] {
+    let mut pkt = [0u8; 28];
+    pkt[0] = if first { 0x90 } else { 0x80 };
+    pkt[1] = 0xD7;
+    BigEndian::write_u16(&mut pkt[2..4], 0x0006);
+    BigEndian::write_u32(&mut pkt[4..8], cur_rtp.wrapping_sub(latency));
+    BigEndian::write_u64(&mut pkt[8..16], ptp_ns);
+    BigEndian::write_u32(&mut pkt[16..20], cur_rtp);
+    BigEndian::write_u64(&mut pkt[20..28], clock_id);
+    pkt
 }
 
 // ---------------------------------------------------------------------------

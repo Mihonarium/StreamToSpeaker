@@ -180,13 +180,14 @@ impl AirPlay2Session {
 
         let sync_addr = SocketAddr::new(cfg.renderer.ip, ports.control);
         let (timing_handle, sync_handle) = if use_ptp {
-            let clock = ptp_session.as_ref().unwrap().clock.clone();
+            let ptp = ptp_session.as_ref().unwrap();
             let sync = spawn_sync_sender_ptp(
                 control_socket,
                 sync_addr,
                 current_rtptime,
                 DEFAULT_LATENCY_SAMPLES,
-                clock,
+                ptp.clock.clone(),
+                ptp.clock_id,
                 stop_flag.clone(),
                 cfg.renderer.friendly_name.clone(),
             )
@@ -362,6 +363,7 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
     let start = Instant::now();
     let packet_duration =
         Duration::from_nanos((FRAMES_PER_PACKET as u64 * 1_000_000_000) / WIRE_SAMPLE_RATE as u64);
+    let mut idle_warned = false;
 
     loop {
         if cfg.stop_flag.load(Ordering::Acquire) {
@@ -378,7 +380,19 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
                     }
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // No audio from the source. If nothing has ever arrived,
+                // the problem is upstream (nothing playing / wrong default
+                // device), not the AirPlay stream — say so once.
+                if packet_count == 0 && !idle_warned && start.elapsed() > Duration::from_secs(3) {
+                    warn!(
+                        "AirPlay 2: no audio from the source after 3s — is something playing with \
+                         Stream To Speaker selected as the Windows output device?"
+                    );
+                    idle_warned = true;
+                }
+                continue;
+            }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
         }
 
@@ -405,11 +419,25 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
             }
             // Retain for retransmit on a resend request.
             cfg.resend.record(seq, &packet);
+            if packet_count == 0 {
+                info!(
+                    "AirPlay 2: audio flowing — first packet ({} bytes) sent to {}",
+                    packet.len(),
+                    cfg.receiver_addr
+                );
+            }
 
             seq = seq.wrapping_add(1);
             rtptime = rtptime.wrapping_add(FRAMES_PER_PACKET as u32);
             cfg.current_rtptime.store(rtptime, Ordering::Release);
             packet_count += 1;
+            if packet_count % 500 == 0 {
+                debug!(
+                    "AirPlay 2: {} audio packets sent ({} s)",
+                    packet_count,
+                    packet_count * FRAMES_PER_PACKET as u64 / WIRE_SAMPLE_RATE as u64
+                );
+            }
             packets_this_round += 1;
             if packets_this_round > 32 {
                 break;
