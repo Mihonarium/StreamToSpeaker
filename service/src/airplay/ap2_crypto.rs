@@ -29,8 +29,11 @@
 //! Each RTP audio payload is sealed with ChaCha20-Poly1305 under the audio
 //! key: nonce = 4 zero bytes + the RTP sequence number (little-endian) in
 //! bytes 4..8 + 4 zero bytes; AAD = RTP header bytes 4..12 (timestamp +
-//! SSRC); the 16-byte tag is appended after the ciphertext. (Verified
-//! against OwnTone `airplay.c`.)
+//! SSRC). On the wire the 16-byte tag follows the ciphertext, then the
+//! **8-byte nonce (nonce[4..12]) is appended after the tag** — the
+//! receiver reads it back to decrypt, and omitting it makes every packet
+//! fail auth (silent playback). Layout: header | ciphertext | tag | nonce.
+//! (Verified against OwnTone `airplay.c`.)
 
 use anyhow::{bail, Result};
 use chacha20poly1305::aead::{Aead, Payload};
@@ -176,9 +179,16 @@ pub fn seal_audio(audio_key: &[u8; 32], rtp_header: &[u8; 12], seq: u16, plainte
     // seqnum at bytes 4..8 (little-endian); a u16 fits in the low two.
     nonce[4..8].copy_from_slice(&(seq as u32).to_le_bytes());
     let aad = &rtp_header[4..12]; // timestamp + SSRC
-    cipher
+    let mut out = cipher
         .encrypt((&nonce).into(), Payload { msg: plaintext, aad })
-        .expect("chacha20poly1305 encrypt never fails")
+        .expect("chacha20poly1305 encrypt never fails");
+    // AirPlay 2 appends the 8-byte nonce (nonce[4..12]) after the tag so the
+    // receiver can decrypt. Without it the receiver fails the Poly1305 auth
+    // tag on every packet and silently drops the audio — the session still
+    // shows "playing" but no sound. Matches OwnTone's on-wire layout:
+    // [RTP header][ciphertext][16-byte tag][8-byte nonce].
+    out.extend_from_slice(&nonce[4..12]);
+    out
 }
 
 #[cfg(test)]
@@ -243,10 +253,12 @@ mod tests {
         let plain = vec![0xABu8; 1416];
         let s0 = seal_audio(&key, &header, 1, &plain);
         let s1 = seal_audio(&key, &header, 2, &plain);
-        // ciphertext + 16-byte tag
-        assert_eq!(s0.len(), plain.len() + TAG_LEN);
+        // ciphertext + 16-byte tag + 8-byte appended nonce
+        assert_eq!(s0.len(), plain.len() + TAG_LEN + 8);
         // Different sequence → different nonce → different ciphertext.
         assert_ne!(s0, s1);
+        // The appended suffix is exactly the nonce bytes (seq=1 LE).
+        assert_eq!(&s0[s0.len() - 8..], &[1, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -256,13 +268,16 @@ mod tests {
         let plain = b"hello airplay 2 audio".to_vec();
         let sealed = seal_audio(&key, &header, 0x1234, &plain);
 
-        // Reconstruct the nonce + AAD a receiver would and decrypt.
-        let cipher = ChaCha20Poly1305::new((&key).into());
+        // A receiver reads the nonce from the appended 8-byte suffix, then
+        // decrypts the ciphertext+tag that precedes it.
+        let suffix = &sealed[sealed.len() - 8..];
         let mut nonce = [0u8; 12];
-        nonce[4..8].copy_from_slice(&(0x1234u32).to_le_bytes());
+        nonce[4..12].copy_from_slice(suffix);
+        let ct_and_tag = &sealed[..sealed.len() - 8];
         let aad = &header[4..12];
+        let cipher = ChaCha20Poly1305::new((&key).into());
         let opened = cipher
-            .decrypt((&nonce).into(), Payload { msg: &sealed, aad })
+            .decrypt((&nonce).into(), Payload { msg: ct_and_tag, aad })
             .unwrap();
         assert_eq!(opened, plain);
     }
