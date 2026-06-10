@@ -85,6 +85,34 @@ jobs:
         run: choco install innosetup --no-progress -y
 
       # -----------------------------------------------------------------
+      # Prebuilt-driver cache.
+      #
+      # The kernel-mode driver only needs rebuilding when its *source*
+      # changes, so key a cache on a hash of driver/ + the shared ABI
+      # header. On a hit we skip the WDK, the signing-cert generation, and
+      # the MSBuild entirely, and reuse the prebuilt test-signed binaries
+      # — crucially INCLUDING the .cer that signed them, so the cert the
+      # installer ships always matches the cached .sys/.cat.
+      #
+      # Versioning consequence: the driver build number (INF DriverVer
+      # revision + STREAM_TO_SPEAKER_DRIVER_BUILD) is now stamped only when
+      # the driver is actually rebuilt — i.e. it tracks the commit count at
+      # the last driver change rather than HEAD. Still monotonic across
+      # driver changes, so PnP upgrade comparison is unaffected.
+      #
+      # restore/save split (not plain actions/cache) so a build that fails
+      # before the cache is populated can't poison the key. Bump the `v1`
+      # tag to force a rebuild after changing build flags without touching
+      # driver source.
+      # -----------------------------------------------------------------
+      - name: Restore prebuilt driver cache
+        id: cache-driver
+        uses: actions/cache/restore@v4
+        with:
+          path: driver-cache
+          key: driver-${{ runner.os }}-v1-${{ env.WDK_INSTALLER_URL }}-${{ hashFiles('driver/**', 'include/**') }}
+
+      # -----------------------------------------------------------------
       # WDK install (~5 min cold) + cache.
       #
       # Cached paths cover what the WindowsKernelModeDriver10.0 toolset
@@ -103,6 +131,7 @@ jobs:
       # -----------------------------------------------------------------
       - name: Restore WDK cache
         id: cache-wdk
+        if: steps.cache-driver.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -116,7 +145,7 @@ jobs:
             wdk-${{ env.WDK_INSTALLER_URL }}-v2-
 
       - name: Install WDK (cache miss)
-        if: steps.cache-wdk.outputs.cache-hit != 'true'
+        if: steps.cache-driver.outputs.cache-hit != 'true' && steps.cache-wdk.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $installer = Join-Path $env:RUNNER_TEMP "wdksetup.exe"
@@ -133,6 +162,7 @@ jobs:
       # actions/cache doesn't persist registry, so on a cache HIT we have
       # to recreate it before MSBuild can find the toolset.
       - name: Restore WDK registry
+        if: steps.cache-driver.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $kitsRoot = "C:\Program Files (x86)\Windows Kits\10\"
@@ -150,6 +180,7 @@ jobs:
       # Visual Studio's developer command prompt needs to be activated
       # to expose msbuild on PATH for the driver toolset.
       - name: Add MSBuild to PATH
+        if: steps.cache-driver.outputs.cache-hit != 'true'
         uses: microsoft/setup-msbuild@v2
         with:
           msbuild-architecture: x64
@@ -165,6 +196,7 @@ jobs:
       # export the .cer so the installer can import it to the target
       # machine's TrustedPublisher + Root stores.
       - name: Generate test-signing certificate
+        if: steps.cache-driver.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $cert = New-SelfSignedCertificate `
@@ -198,6 +230,7 @@ jobs:
       # actually loaded the new .sys.
       - name: Compute driver build number
         id: drvbuild
+        if: steps.cache-driver.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $count = (git rev-list --count HEAD).Trim()
@@ -210,6 +243,7 @@ jobs:
           "build=$count" >> $env:GITHUB_OUTPUT
 
       - name: Build driver (Release|x64, test-signed)
+        if: steps.cache-driver.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           msbuild driver\StreamToSpeaker.sln `
@@ -233,6 +267,29 @@ jobs:
               # is a real problem.
               throw "Driver signature unexpected status: $($sig.Status)"
           }
+          # Collect the signed driver + the .cer that signed it + devcon
+          # into driver-cache/ so the cache save and staging read uniformly,
+          # and the shipped cert always matches the cached binaries.
+          $dc = "driver-cache"
+          New-Item -ItemType Directory -Force -Path $dc | Out-Null
+          foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat") {
+              $f = Get-ChildItem -Path "driver\x64\Release" -Recurse -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $f) { throw "driver output $name not found for cache" }
+              Copy-Item $f.FullName (Join-Path $dc $name) -Force
+          }
+          Copy-Item (Join-Path $env:RUNNER_TEMP "StreamToSpeaker.cer") (Join-Path $dc "StreamToSpeaker.cer") -Force
+          $devcon = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Tools" -Recurse -Filter "devcon.exe" -ErrorAction SilentlyContinue `
+                    | Where-Object { $_.FullName -match "\\x64\\" } | Select-Object -First 1
+          if (-not $devcon) { throw "devcon.exe not found under WDK Tools" }
+          Copy-Item $devcon.FullName (Join-Path $dc "devcon.exe") -Force
+          Write-Host "Populated $dc/ (driver + cert + devcon) for cache + staging"
+
+      - name: Save prebuilt driver cache
+        if: steps.cache-driver.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: driver-cache
+          key: ${{ steps.cache-driver.outputs.cache-primary-key }}
 
       - name: Build service (cargo --release)
         shell: pwsh
@@ -246,36 +303,17 @@ jobs:
           if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "service\target\release\stream-to-speaker.exe" "$staging\stream-to-speaker.exe"
-          $wanted = "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat"
-          foreach ($name in $wanted) {
-              $found = Get-ChildItem -Path "driver\x64\Release" -Recurse -Filter $name -ErrorAction SilentlyContinue `
-                       | Select-Object -First 1
-              if ($found) {
-                  Copy-Item $found.FullName "$staging\$name" -Force
-                  Write-Host "Staged $($found.FullName)"
-              } elseif ($name -eq "StreamToSpeaker.cat") {
-                  Write-Host "$name not produced (unsigned build)"
-              } else {
-                  throw "Required driver artifact $name not found"
-              }
+          # The driver binaries, the test-signing cert that signed them, and
+          # devcon all come from driver-cache/ — populated by the build above
+          # or restored from cache — so the shipped .cer always matches the
+          # shipped .sys/.cat regardless of which path produced them.
+          $dc = "driver-cache"
+          foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "devcon.exe", "StreamToSpeaker.cer") {
+              $src = Join-Path $dc $name
+              if (-not (Test-Path $src)) { throw "driver-cache missing $name" }
+              Copy-Item $src "$staging\$name" -Force
+              Write-Host "Staged $name"
           }
-          # devcon.exe — needed at install time to add the root-enumerated
-          # StreamToSpeaker device. Bundled with the WDK we just installed.
-          $devcon = Get-ChildItem `
-              -Path "C:\Program Files (x86)\Windows Kits\10\Tools" `
-              -Recurse -Filter "devcon.exe" -ErrorAction SilentlyContinue `
-              | Where-Object { $_.FullName -match "\\x64\\" } `
-              | Select-Object -First 1
-          if (-not $devcon) { throw "devcon.exe not found under WDK Tools" }
-          Copy-Item $devcon.FullName "$staging\devcon.exe" -Force
-          Write-Host "Staged $($devcon.FullName)"
-          # Test-signing certificate — the installer imports this on
-          # the target machine before devcon install runs so Windows
-          # accepts the test-signed driver.
-          $cer = Join-Path $env:RUNNER_TEMP "StreamToSpeaker.cer"
-          if (-not (Test-Path $cer)) { throw "Test-signing cert not produced" }
-          Copy-Item $cer "$staging\StreamToSpeaker.cer" -Force
-          Write-Host "Staged $cer"
 
       - name: Build installer (Inno Setup)
         shell: pwsh
@@ -301,7 +339,7 @@ jobs:
           $items = @(
               Get-ChildItem -Path "installer\out" -Filter "StreamToSpeakerSetup-*.exe" -ErrorAction SilentlyContinue
               Get-Item "service\target\release\stream-to-speaker.exe" -ErrorAction SilentlyContinue
-              Get-ChildItem -Path "driver\x64\Release" -Recurse -Filter "StreamToSpeaker.sys" -ErrorAction SilentlyContinue | Select-Object -First 1
+              Get-Item "driver-cache\StreamToSpeaker.sys" -ErrorAction SilentlyContinue
           ) | Where-Object { $_ }
           if (-not $items) { throw "No artifacts found to hash" }
 
@@ -337,9 +375,9 @@ jobs:
         with:
           name: binaries-${{ steps.ver.outputs.version }}
           path: |
-            driver/x64/Release/StreamToSpeaker/StreamToSpeaker.sys
-            driver/x64/Release/StreamToSpeaker/StreamToSpeaker.inf
-            driver/x64/Release/StreamToSpeaker/StreamToSpeaker.cat
+            driver-cache/StreamToSpeaker.sys
+            driver-cache/StreamToSpeaker.inf
+            driver-cache/StreamToSpeaker.cat
             service/target/release/stream-to-speaker.exe
             service/target/release/stream-to-speaker.exe.sha256
           if-no-files-found: warn

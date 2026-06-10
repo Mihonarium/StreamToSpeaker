@@ -32,6 +32,8 @@ Bumped on every CI run and every `build-installer.ps1` run, no manual step. Driv
 
 Both get the same N every build, so `1.0.0.42` in Device Manager == `build=42` in the service log == same `.sys` binary. Override with `-DriverBuild N` on the local script for a reproducible value.
 
+**CI driver cache (build.yml):** the kernel-mode driver is cached and only rebuilt when its *source* changes (cache keyed on `hashFiles('driver/**','include/**')`); a hit skips the WDK, the signing-cert generation, and the MSBuild. So `N` is no longer bumped on *every* CI run — it's the commit count at the **last commit that changed the driver**, stamped into the `.sys`/`.inf` when they were built. Still strictly monotonic across driver changes (PnP upgrades unaffected), and `build=N` still uniquely identifies the `.sys` bits — it just stops advancing on service-only commits. The cache stores the `.cer` *alongside* the `.sys`/`.cat`, so the cert the installer ships always matches the cached binaries (a freshly-generated cert per run would not). `build-installer.ps1` (local) is unchanged — still bumps every run. Bump the `v1` tag in the cache key to force a rebuild after changing build flags without touching driver source.
+
 ### Manual: prefix (`MAJOR.MINOR.BUILD`)
 
 `DriverVersionPrefix` in `driver/StreamToSpeaker.vcxproj` — defaults to `1.0.0`. **Bump it by hand when the change is significant.** Semver-ish discipline:

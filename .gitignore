@@ -17,6 +17,9 @@ installer/out/
 installer/staging/
 installer/*.iss.log
 
+# CI prebuilt-driver cache (populated/restored by the build workflow)
+driver-cache/
+
 # IDE
 .idea/
 .vscode/
