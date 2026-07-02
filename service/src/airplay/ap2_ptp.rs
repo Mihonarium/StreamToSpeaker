@@ -408,10 +408,17 @@ fn run_master(
                     receiver_ip
                 );
             } else {
-                info!(
-                    "AirPlay 2 PTP status: received {} packet(s) from receiver, served {} Delay_Resp",
-                    rx_total, delay_resps
-                );
+                // Delay_Resp count is only interesting when nonzero:
+                // receivers that master their own clock (Sonos) never send
+                // Delay_Req, so 0 is the normal state, not a failure.
+                if delay_resps > 0 {
+                    info!(
+                        "AirPlay 2 PTP status: {} packet(s) from receiver, {} Delay_Resp served",
+                        rx_total, delay_resps
+                    );
+                } else {
+                    info!("AirPlay 2 PTP status: {} packet(s) from receiver", rx_total);
+                }
             }
             last_status = Instant::now();
         }

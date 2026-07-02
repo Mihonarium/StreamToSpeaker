@@ -2185,6 +2185,27 @@ impl StreamToSpeakerApp {
                 |ui| advanced_slider_row(ui, p, &mut step, 1..=256, " frames", 4, "4 frames"),
             );
             self.app.set_latency_adjust_step_frames(step.max(1) as u32);
+
+            ui.add_space(sp::S);
+
+            let mut prefer_rt = self.app.user_config.lock().unwrap().prefer_realtime_airplay;
+            advanced_row(
+                ui,
+                p,
+                "AirPlay 2 stream mode",
+                "Realtime ≈ 0.25 s latency; buffered ≈ 1–2 s but is what iPhones use.",
+                "AirPlay 2 has two stream kinds. Buffered (the default when the speaker supports it) is what iPhones use: the speaker holds a second or two of audio, riding out Wi-Fi hiccups at the cost of that much latency. Realtime is the low-latency kind (~250 ms). Some speakers accept the realtime handshake but never actually play it — if one mode is silent, try the other. Takes effect the next time you connect to the speaker.",
+                |ui| {
+                    ui.checkbox(&mut prefer_rt, "Prefer low-latency realtime");
+                },
+            );
+            {
+                let mut uc = self.app.user_config.lock().unwrap();
+                if uc.prefer_realtime_airplay != prefer_rt {
+                    uc.prefer_realtime_airplay = prefer_rt;
+                    uc.save();
+                }
+            }
         });
     }
 
