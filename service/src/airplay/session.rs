@@ -29,10 +29,11 @@ use crate::http_server::PcmFrame;
 /// Recently-sent packets retained for retransmit (~4 s at 44.1 kHz).
 const RESEND_BUFFER_PACKETS: usize = 512;
 
-/// Default receiver-advertised playback latency in samples, used for
-/// sync-packet anchor calculation when the receiver doesn't return an
-/// `Audio-Latency` header. 11025 samples = 250 ms at 44.1 kHz.
-const DEFAULT_LATENCY_SAMPLES: u32 = 11025;
+/// Playback latency in samples for the sync-packet anchor. 88200 = 2 s at
+/// 44.1 kHz — packet-capture verified: iTunes→Sonos sync packets carry
+/// exactly `next_rtptime − 88200` (and node_airtunes2 hardcodes
+/// `2 * sampling_rate`).
+const DEFAULT_LATENCY_SAMPLES: u32 = 88200;
 
 /// Configuration to spin up one AirPlay session.
 pub struct AirPlaySessionConfig {
@@ -114,7 +115,21 @@ impl AirPlaySession {
             cfg.connect_timeout,
         )
         .context("opening RTSP connection")?;
-        rtsp.options().context("RTSP OPTIONS")?;
+
+        // Opening handshake — packet-capture verified against iTunes for
+        // Windows → Sonos (AirTunes/366 fw): iTunes' FIRST request is
+        // POST /auth-setup (0x01 + X25519), then ANNOUNCE — it never sends
+        // the classic OPTIONS + Apple-Challenge opener, and this Sonos
+        // firmware stalls on it. Receivers advertising MFi (et=4) or an
+        // AirPlay-2 side get the iTunes flow; plain legacy receivers keep
+        // the traditional OPTIONS + Apple-Challenge opener.
+        let mfi_style = cfg.renderer.encryption_types.contains(&4)
+            || cfg.renderer.supports_airplay2();
+        if mfi_style {
+            rtsp.auth_setup().context("RTSP auth-setup (MFi opener)")?;
+        } else {
+            rtsp.options().context("RTSP OPTIONS")?;
+        }
 
         let cipher = Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
             anyhow::anyhow!(

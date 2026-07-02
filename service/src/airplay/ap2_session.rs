@@ -48,8 +48,9 @@ use crate::WIRE_SAMPLE_RATE;
 
 /// Default AirPlay 2 RTSP port if the device didn't advertise one.
 const DEFAULT_AIRPLAY_PORT: u16 = 7000;
-/// Receiver playback latency in samples for the sync anchor (= latencyMin).
-const DEFAULT_LATENCY_SAMPLES: u32 = 11025;
+/// Receiver playback latency in samples for the sync anchor. 88200 = 2 s —
+/// what iTunes actually uses with Sonos (packet-capture verified).
+const DEFAULT_LATENCY_SAMPLES: u32 = 88200;
 /// Recently-sent packets retained for retransmit (~4 s at 44.1 kHz).
 const RESEND_BUFFER_PACKETS: usize = 512;
 /// How far in the future the buffered stream's SETRATEANCHORTIME anchor is

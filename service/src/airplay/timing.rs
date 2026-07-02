@@ -227,10 +227,10 @@ where
     thread::Builder::new()
         .name(format!("stream-to-speaker-airplay-sync:{}", receiver_name))
         .spawn(move || {
-            // Brief delay before the first sync packet so the RTP stream is
-            // already flowing — a sync ahead of any audio confuses some
-            // receivers.
-            thread::sleep(Duration::from_millis(500));
+            // Packet-capture verified: iTunes sends the first (0x90) sync
+            // packet SIMULTANEOUSLY with the first audio packet — not
+            // delayed. A tiny grace keeps it behind socket setup only.
+            thread::sleep(Duration::from_millis(10));
             let mut first = true;
             let mut count: u64 = 0;
             while !stop_flag.load(Ordering::Acquire) {

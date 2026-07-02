@@ -686,13 +686,15 @@ impl App {
         };
         let raop = renderer.supports_legacy_raop();
 
-        // Prefer AirPlay 2 for receivers that look AP2-centric — they
-        // require it, advertise PTP, or only expose an AP2 path.
+        // Prefer AirPlay 2 only for receivers that genuinely REQUIRE it
+        // (HomePods, AP2-only devices). Packet-capture verified: iTunes
+        // streams to a current-firmware Sonos via classic RAOP (auth-setup
+        // opener, realtime UDP, NTP timing) — advertising PTP/buffered
+        // does NOT mean the receiver wants them from third-party senders.
         let ap2_centric = renderer.requires_airplay2()
-            || renderer.expects_ptp()
             || ap2
                 .as_ref()
-                .map(|r| r.requires_airplay2() || r.expects_ptp())
+                .map(|r| r.requires_airplay2())
                 .unwrap_or(false)
             || (ap2.is_some() && !raop);
 

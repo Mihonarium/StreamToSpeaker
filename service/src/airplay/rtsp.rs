@@ -295,6 +295,8 @@ impl RtspClient {
                 "RTP-Info".to_string(),
                 format!("seq={};rtptime={}", initial_seq, initial_rtptime),
             ),
+            // iTunes/node_airtunes2 parity.
+            ("X-Apple-ProtocolVersion".to_string(), "1".to_string()),
         ];
         let resp = self.request("RECORD", &uri, &extra, "")?;
         if resp.status_code != 200 {
