@@ -64,6 +64,11 @@ pub struct AirPlay2SessionConfig {
     pub local_ip: IpAddr,
     pub samples_rx: Receiver<PcmFrame>,
     pub initial_volume: Option<u32>,
+    /// Skip buffered mode and use the low-latency realtime stream even on
+    /// receivers that advertise buffered support (user_config experiment
+    /// switch — realtime is ~250 ms vs buffered's 1-2 s, but some
+    /// receivers only truly play buffered).
+    pub prefer_realtime: bool,
 }
 
 /// A live AirPlay 2 session.
@@ -166,7 +171,10 @@ impl AirPlay2Session {
         // Media Foundation encoder — iOS's buffered codec, the only one
         // field-proven on Sonos — with ALAC as fallback (no encoder needed)
         // and realtime as the last resort. Every rejection is visible.
-        let want_buffered = use_ptp && cfg.renderer.supports_buffered_audio();
+        let want_buffered = use_ptp && cfg.renderer.supports_buffered_audio() && !cfg.prefer_realtime;
+        if cfg.prefer_realtime {
+            info!("AirPlay 2: prefer_realtime_airplay set — using the realtime stream");
+        }
         let mut codec = BufferedCodecKind::Alac;
         #[cfg(windows)]
         if want_buffered {
@@ -338,8 +346,7 @@ impl AirPlay2Session {
                     sync_addr,
                     current_rtptime,
                     DEFAULT_LATENCY_SAMPLES,
-                    ptp.timeline.clock.clone(),
-                    ptp.timeline.clock_id,
+                    ptp.timeline.clone(),
                     stop_flag.clone(),
                     cfg.renderer.friendly_name.clone(),
                 )

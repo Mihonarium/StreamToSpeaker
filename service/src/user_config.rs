@@ -33,6 +33,14 @@ pub struct UserConfig {
     /// without auto-binding at startup.
     #[serde(default = "default_auto_reconnect")]
     pub auto_reconnect_on_launch: bool,
+    /// AirPlay 2 stream-mode experiment switch: `true` skips buffered
+    /// (type 103) and uses the low-latency realtime stream (type 96)
+    /// even on receivers that advertise buffered support. Realtime is
+    /// architecturally ~250 ms vs buffered's 1-2 s, but some receivers
+    /// (current Sonos fw) appear to only actually *play* buffered.
+    /// Edit config.json by hand to flip; no GUI yet.
+    #[serde(default)]
+    pub prefer_realtime_airplay: bool,
 }
 
 fn default_auto_reconnect() -> bool {

@@ -178,18 +178,19 @@ pub fn spawn_sync_sender(
     )
 }
 
-/// PTP path: the receiver follows the PTP grandmaster clock we serve, so
-/// the sync packet is OwnTone's **28-byte 0xD7** form (`sync_packet_ptp_make`)
-/// carrying the **raw monotonic clock value** (ns — not NTP 32.32) plus our
-/// 8-byte clock identity. The 20-byte 0xD4 NTP packet is silently ignored
-/// under PTP, which is why audio decrypted but never scheduled → silence.
+/// PTP path: the sync packet is OwnTone's **28-byte 0xD7** form
+/// (`sync_packet_ptp_make`) carrying a raw nanosecond clock value plus the
+/// 8-byte identity of the clock it's expressed on. Field-tested nuance:
+/// some receivers (current Sonos fw) only respect times on **their own**
+/// timeline — so once the PTP layer has locked onto the receiver's
+/// Sync/Follow_Up stream, the sync packet uses the receiver's clock
+/// (id + time); until then it falls back to our grandmaster clock.
 pub fn spawn_sync_sender_ptp(
     control_socket: UdpSocket,
     receiver_addr: SocketAddr,
     current_rtptime: Arc<AtomicU32>,
     latency_samples: u32,
-    ptp_clock: Arc<crate::airplay::ap2_ptp::PtpMasterClock>,
-    clock_id: u64,
+    timeline: crate::airplay::ap2_ptp::PtpTimeline,
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
 ) -> std::io::Result<thread::JoinHandle<()>> {
@@ -201,7 +202,11 @@ pub fn spawn_sync_sender_ptp(
         receiver_name,
         "PTP",
         move |first, cur_rtp| {
-            build_ptp_sync(first, cur_rtp, latency_samples, ptp_clock.now_ns(), clock_id).to_vec()
+            let (clock_id, now_ns) = match timeline.receiver_now_ns() {
+                Some((id, now)) => (id, now),
+                None => (timeline.clock_id, timeline.our_now_ns()),
+            };
+            build_ptp_sync(first, cur_rtp, latency_samples, now_ns, clock_id).to_vec()
         },
     )
 }

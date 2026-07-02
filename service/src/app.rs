@@ -741,11 +741,13 @@ impl App {
             }
             Transport::AirPlay2 => {
                 let samples_rx = self.hub.subscribe();
+                let prefer_realtime = self.user_config.lock().unwrap().prefer_realtime_airplay;
                 let session = AirPlay2Session::start(AirPlay2SessionConfig {
                     renderer,
                     local_ip,
                     samples_rx,
                     initial_volume: Some(80),
+                    prefer_realtime,
                 })
                 .map_err(|e| format!("{:#}", e))?;
                 Ok(ActiveSession::AirPlay2(session))
