@@ -52,6 +52,12 @@ const DEFAULT_AIRPLAY_PORT: u16 = 7000;
 const DEFAULT_LATENCY_SAMPLES: u32 = 11025;
 /// Recently-sent packets retained for retransmit (~4 s at 44.1 kHz).
 const RESEND_BUFFER_PACKETS: usize = 512;
+/// How far in the future the buffered stream's SETRATEANCHORTIME anchor is
+/// placed — the receiver buffers packets until this point, absorbing
+/// startup jitter.
+const ANCHOR_LEAD_NS: u64 = 500_000_000;
+/// Cadence of the /feedback keepalive iOS senders emit.
+const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct AirPlay2SessionConfig {
     pub renderer: AirPlayRenderer,
@@ -70,6 +76,7 @@ pub struct AirPlay2Session {
     sync_handle: Option<JoinHandle<()>>,
     resend_handle: Option<JoinHandle<()>>,
     event_handle: Option<JoinHandle<()>>,
+    feedback_handle: Option<JoinHandle<()>>,
     ptp_session: Option<PtpMaster>,
     _audio_socket: UdpSocket,
 }
@@ -138,9 +145,32 @@ impl AirPlay2Session {
             cfg.renderer.friendly_name.clone(),
         );
 
-        let ports = rtsp
-            .setup_stream(&audio_key, control_port)
-            .context("AP2 SETUP(stream)")?;
+        // Stream kind: buffered (type 103, TCP — what iOS actually uses,
+        // and seemingly the only kind current Sonos firmware truly plays)
+        // when the receiver advertises bit 40 and we're on PTP; realtime
+        // (type 96, UDP) otherwise. A rejected buffered SETUP falls back
+        // to realtime *visibly* — unlike the silent failure modes.
+        let want_buffered = use_ptp && cfg.renderer.supports_buffered_audio();
+        let (ports, buffered) = if want_buffered {
+            match rtsp.setup_stream_buffered(&audio_key, control_port) {
+                Ok(p) => {
+                    info!("AirPlay 2: buffered stream accepted (type 103/ALAC, TCP data port {})", p.data);
+                    (p, true)
+                }
+                Err(e) => {
+                    warn!("AirPlay 2: buffered SETUP rejected ({e:#}); falling back to realtime");
+                    let p = rtsp
+                        .setup_stream(&audio_key, control_port)
+                        .context("AP2 SETUP(stream, realtime fallback)")?;
+                    (p, false)
+                }
+            }
+        } else {
+            let p = rtsp
+                .setup_stream(&audio_key, control_port)
+                .context("AP2 SETUP(stream)")?;
+            (p, false)
+        };
         debug!("AirPlay 2: receiver data port {}, control port {}", ports.data, ports.control);
 
         if use_ptp {
@@ -172,79 +202,136 @@ impl AirPlay2Session {
             .try_clone()
             .context("clone AP2 control socket")?;
 
-        let sender_handle = spawn_ap2_sender(Ap2SenderConfig {
-            audio_socket: audio_socket.try_clone().context("clone AP2 audio socket")?,
-            receiver_addr: SocketAddr::new(cfg.renderer.ip, ports.data),
-            audio_key,
-            initial_seq,
-            initial_rtptime,
-            ssrc,
-            samples_rx: cfg.samples_rx,
-            stop_flag: stop_flag.clone(),
-            receiver_name: cfg.renderer.friendly_name.clone(),
-            current_rtptime: current_rtptime.clone(),
-            resend: resend.clone(),
-        })?;
+        let (sender_handle, timing_handle, sync_handle, resend_handle) = if buffered {
+            // Buffered: audio goes over ONE TCP connection to the data
+            // port; playback is anchored by SETRATEANCHORTIME on our PTP
+            // timeline. No sync packets, no resend (TCP is reliable), no
+            // NTP timing responder.
+            let data_addr = SocketAddr::new(cfg.renderer.ip, ports.data);
+            let stream = TcpStream::connect_timeout(&data_addr, Duration::from_secs(3))
+                .with_context(|| format!("connecting AP2 buffered data TCP to {}", data_addr))?;
+            stream.set_nodelay(true).ok();
+            let sender = spawn_ap2_buffered_sender(BufferedSenderConfig {
+                stream,
+                audio_key,
+                initial_seq,
+                initial_rtptime,
+                ssrc,
+                samples_rx: cfg.samples_rx,
+                stop_flag: stop_flag.clone(),
+                receiver_name: cfg.renderer.friendly_name.clone(),
+                current_rtptime: current_rtptime.clone(),
+            })?;
 
-        let sync_addr = SocketAddr::new(cfg.renderer.ip, ports.control);
-        let (timing_handle, sync_handle) = if use_ptp {
+            // Anchor: initial_rtptime plays ANCHOR_LEAD from now on our
+            // grandmaster timeline. Sent after the sender is running so the
+            // receiver's buffer is filling during the lead.
             let ptp = ptp_session.as_ref().unwrap();
-            let sync = spawn_sync_sender_ptp(
-                control_socket,
-                sync_addr,
-                current_rtptime,
-                DEFAULT_LATENCY_SAMPLES,
-                ptp.clock.clone(),
-                ptp.clock_id,
-                stop_flag.clone(),
-                cfg.renderer.friendly_name.clone(),
-            )
-            .context("spawning AP2 PTP sync sender")?;
-            // The NTP timing responder is unused under PTP; release its socket.
+            let anchor_ns = ptp.clock.now_ns() + ANCHOR_LEAD_NS;
+            rtsp.set_rate_anchor_time(1, initial_rtptime, anchor_ns, ptp.clock_id)
+                .context("AP2 SETRATEANCHORTIME")?;
+            info!(
+                "AirPlay 2: anchored — rtpTime {} plays at +{} ms on timeline {:#018x}",
+                initial_rtptime,
+                ANCHOR_LEAD_NS / 1_000_000,
+                ptp.clock_id
+            );
             drop(timing_socket);
-            (None, Some(sync))
+            drop(control_socket);
+            drop(control_for_resend);
+            drop(resend);
+            (sender, None, None, None)
         } else {
-            let timing = spawn_timing_responder(
-                timing_socket,
-                stop_flag.clone(),
-                cfg.renderer.friendly_name.clone(),
-            )
-            .context("spawning AP2 timing responder")?;
-            let sync = spawn_sync_sender(
-                control_socket,
+            let sender = spawn_ap2_sender(Ap2SenderConfig {
+                audio_socket: audio_socket.try_clone().context("clone AP2 audio socket")?,
+                receiver_addr: SocketAddr::new(cfg.renderer.ip, ports.data),
+                audio_key,
+                initial_seq,
+                initial_rtptime,
+                ssrc,
+                samples_rx: cfg.samples_rx,
+                stop_flag: stop_flag.clone(),
+                receiver_name: cfg.renderer.friendly_name.clone(),
+                current_rtptime: current_rtptime.clone(),
+                resend: resend.clone(),
+            })?;
+
+            let sync_addr = SocketAddr::new(cfg.renderer.ip, ports.control);
+            let (timing_handle, sync_handle) = if use_ptp {
+                let ptp = ptp_session.as_ref().unwrap();
+                let sync = spawn_sync_sender_ptp(
+                    control_socket,
+                    sync_addr,
+                    current_rtptime,
+                    DEFAULT_LATENCY_SAMPLES,
+                    ptp.clock.clone(),
+                    ptp.clock_id,
+                    stop_flag.clone(),
+                    cfg.renderer.friendly_name.clone(),
+                )
+                .context("spawning AP2 PTP sync sender")?;
+                // The NTP timing responder is unused under PTP; release its socket.
+                drop(timing_socket);
+                (None, Some(sync))
+            } else {
+                let timing = spawn_timing_responder(
+                    timing_socket,
+                    stop_flag.clone(),
+                    cfg.renderer.friendly_name.clone(),
+                )
+                .context("spawning AP2 timing responder")?;
+                let sync = spawn_sync_sender(
+                    control_socket,
+                    sync_addr,
+                    current_rtptime,
+                    DEFAULT_LATENCY_SAMPLES,
+                    stop_flag.clone(),
+                    cfg.renderer.friendly_name.clone(),
+                )
+                .context("spawning AP2 sync sender")?;
+                (Some(timing), Some(sync))
+            };
+
+            let resend_handle = spawn_resend_responder(
+                control_for_resend,
                 sync_addr,
-                current_rtptime,
-                DEFAULT_LATENCY_SAMPLES,
+                resend,
                 stop_flag.clone(),
                 cfg.renderer.friendly_name.clone(),
             )
-            .context("spawning AP2 sync sender")?;
-            (Some(timing), Some(sync))
+            .context("spawning AP2 resend responder")?;
+            (sender, timing_handle, sync_handle, Some(resend_handle))
         };
 
-        let resend_handle = spawn_resend_responder(
-            control_for_resend,
-            sync_addr,
-            resend,
+        info!(
+            "AirPlay 2: session up — {} → {}:{} ({} audio), control :{}",
+            cfg.renderer.friendly_name,
+            cfg.renderer.ip,
+            ports.data,
+            if buffered { "buffered/TCP" } else { "realtime/UDP" },
+            control_port,
+        );
+
+        // /feedback keepalive — iOS senders POST this every ~2 s; some
+        // receivers eventually drop (or never fully start) sessions
+        // without it. Shares the RTSP connection via the session mutex.
+        let rtsp = Arc::new(Mutex::new(rtsp));
+        let feedback_handle = spawn_feedback_keepalive(
+            rtsp.clone(),
             stop_flag.clone(),
             cfg.renderer.friendly_name.clone(),
-        )
-        .context("spawning AP2 resend responder")?;
-
-        info!(
-            "AirPlay 2: session up — {} → {}:{} (audio), timing :{}, control :{}",
-            cfg.renderer.friendly_name, cfg.renderer.ip, ports.data, timing_port, control_port,
         );
 
         Ok(Self {
             renderer: cfg.renderer,
-            rtsp: Arc::new(Mutex::new(rtsp)),
+            rtsp,
             stop_flag,
             sender_handle: Some(sender_handle),
             timing_handle,
             sync_handle,
-            resend_handle: Some(resend_handle),
+            resend_handle,
             event_handle,
+            feedback_handle,
             ptp_session,
             _audio_socket: audio_socket,
         })
@@ -268,6 +355,7 @@ impl AirPlay2Session {
             self.sync_handle.take(),
             self.resend_handle.take(),
             self.event_handle.take(),
+            self.feedback_handle.take(),
         ]
         .into_iter()
         .flatten()
@@ -333,6 +421,170 @@ fn spawn_event_channel(
             debug!("AirPlay 2 event channel closed");
         })
         .ok()
+}
+
+/// POST /feedback every ~2 s until the session stops. Failures downgrade
+/// to debug after the first warn — a dropped keepalive shouldn't spam.
+fn spawn_feedback_keepalive(
+    rtsp: Arc<Mutex<Ap2Rtsp>>,
+    stop_flag: Arc<AtomicBool>,
+    receiver_name: String,
+) -> Option<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("stream-to-speaker-ap2-feedback:{}", receiver_name))
+        .spawn(move || {
+            let mut warned = false;
+            'outer: loop {
+                // Sleep in slices so shutdown isn't delayed.
+                let slices = (FEEDBACK_INTERVAL.as_millis() / 100) as u32;
+                for _ in 0..slices {
+                    if stop_flag.load(Ordering::Acquire) {
+                        break 'outer;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if let Err(e) = rtsp.lock().unwrap().feedback() {
+                    if !warned {
+                        warn!("AirPlay 2 /feedback failed (continuing): {:#}", e);
+                        warned = true;
+                    } else {
+                        debug!("AirPlay 2 /feedback failed: {:#}", e);
+                    }
+                }
+            }
+            debug!("AirPlay 2 feedback keepalive exiting");
+        })
+        .ok()
+}
+
+// ---------------------------------------------------------------------------
+// Buffered audio sender (type 103 — length-prefixed sealed packets on TCP)
+// ---------------------------------------------------------------------------
+
+struct BufferedSenderConfig {
+    stream: TcpStream,
+    audio_key: [u8; 32],
+    initial_seq: u16,
+    initial_rtptime: u32,
+    ssrc: u32,
+    samples_rx: Receiver<PcmFrame>,
+    stop_flag: Arc<AtomicBool>,
+    receiver_name: String,
+    current_rtptime: Arc<AtomicU32>,
+}
+
+/// Frame one sealed RTP packet for the buffered TCP stream: a 2-byte
+/// big-endian length prefix that **includes itself** (the reference
+/// receiver reads 2 bytes, then `len - 2` more).
+fn frame_buffered_packet(pkt: &[u8]) -> Vec<u8> {
+    let total = (pkt.len() + 2) as u16;
+    let mut out = Vec::with_capacity(pkt.len() + 2);
+    out.extend_from_slice(&total.to_be_bytes());
+    out.extend_from_slice(pkt);
+    out
+}
+
+fn spawn_ap2_buffered_sender(cfg: BufferedSenderConfig) -> Result<JoinHandle<()>> {
+    let name = format!("stream-to-speaker-ap2-buffered:{}", cfg.receiver_name);
+    Ok(std::thread::Builder::new().name(name).spawn(move || run_ap2_buffered_sender(cfg))?)
+}
+
+fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
+    use std::io::Write;
+    info!(
+        "AirPlay 2 buffered sender → {:?} (seq={}, rtptime={})",
+        cfg.stream.peer_addr().ok(),
+        cfg.initial_seq,
+        cfg.initial_rtptime
+    );
+    let mut seq = cfg.initial_seq;
+    let mut rtptime = cfg.initial_rtptime;
+    let mut packet_count: u64 = 0;
+    let mut ring: Vec<i16> = Vec::with_capacity(FRAMES_PER_PACKET * 2);
+
+    let start = Instant::now();
+    let packet_duration =
+        Duration::from_nanos((FRAMES_PER_PACKET as u64 * 1_000_000_000) / WIRE_SAMPLE_RATE as u64);
+    let mut idle_warned = false;
+
+    loop {
+        if cfg.stop_flag.load(Ordering::Acquire) {
+            break;
+        }
+        match cfg.samples_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(frame) => {
+                append_samples(&mut ring, &frame);
+                loop {
+                    match cfg.samples_rx.try_recv() {
+                        Ok(f) => append_samples(&mut ring, &f),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if packet_count == 0 && !idle_warned && start.elapsed() > Duration::from_secs(3) {
+                    warn!(
+                        "AirPlay 2: no audio from the source after 3s — is something playing with \
+                         Stream To Speaker selected as the Windows output device?"
+                    );
+                    idle_warned = true;
+                }
+                continue;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+        }
+
+        let mut packets_this_round = 0u32;
+        while ring.len() >= FRAMES_PER_PACKET * 2 {
+            let pkt_samples: Vec<i16> = ring.drain(..FRAMES_PER_PACKET * 2).collect();
+            let alac = build_uncompressed_alac_frame(&pkt_samples);
+
+            let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
+            let sealed = seal_audio(&cfg.audio_key, &header, seq, &alac);
+            let mut packet = Vec::with_capacity(12 + sealed.len());
+            packet.extend_from_slice(&header);
+            packet.extend_from_slice(&sealed);
+            let framed = frame_buffered_packet(&packet);
+
+            // Same wall-clock pacing as realtime — the receiver buffers,
+            // so exact pacing isn't critical, but matching the sample rate
+            // keeps our send queue and its buffer bounded.
+            let deadline = start + packet_duration.saturating_mul((packet_count + 1) as u32);
+            let now = Instant::now();
+            if deadline > now {
+                std::thread::sleep(deadline - now);
+            }
+
+            if let Err(e) = cfg.stream.write_all(&framed) {
+                warn!("AirPlay 2 buffered send failed: {}", e);
+                return;
+            }
+            if packet_count == 0 {
+                info!(
+                    "AirPlay 2: buffered audio flowing — first packet ({} bytes framed)",
+                    framed.len()
+                );
+            }
+
+            seq = seq.wrapping_add(1);
+            rtptime = rtptime.wrapping_add(FRAMES_PER_PACKET as u32);
+            cfg.current_rtptime.store(rtptime, Ordering::Release);
+            packet_count += 1;
+            if packet_count % 500 == 0 {
+                debug!(
+                    "AirPlay 2: {} buffered packets sent ({} s)",
+                    packet_count,
+                    packet_count * FRAMES_PER_PACKET as u64 / WIRE_SAMPLE_RATE as u64
+                );
+            }
+            packets_this_round += 1;
+            if packets_this_round > 32 {
+                break;
+            }
+        }
+    }
+    info!("AirPlay 2 buffered sender stopped after {} packets", packet_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +732,16 @@ fn append_samples(ring: &mut Vec<i16>, frame: &PcmFrame) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_framing_length_includes_itself() {
+        let pkt = [0xAAu8; 10];
+        let framed = frame_buffered_packet(&pkt);
+        assert_eq!(framed.len(), 12);
+        // Receiver reads 2-byte BE length, then len-2 more bytes.
+        assert_eq!(u16::from_be_bytes([framed[0], framed[1]]), 12);
+        assert_eq!(&framed[2..], &pkt);
+    }
 
     #[test]
     fn ap2_header_layout() {

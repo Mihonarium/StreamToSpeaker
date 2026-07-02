@@ -186,6 +186,13 @@ impl AirPlayRenderer {
         self.features.map(|f| f & FEAT_PTP != 0).unwrap_or(false)
     }
 
+    /// True if the device supports buffered audio (feature bit 40) — the
+    /// TCP type-103 stream modern iOS senders use. Current Sonos firmware
+    /// appears to *only* actually play this stream kind.
+    pub fn supports_buffered_audio(&self) -> bool {
+        self.features.map(|f| f & FEAT_BUFFERED_AUDIO != 0).unwrap_or(false)
+    }
+
     /// The transport we'll use for this device, if any. Prefers the
     /// proven legacy RAOP path for devices that support it and don't
     /// *require* AP2 — that keeps Apple TV / Sonos / AirPort Express on
@@ -628,6 +635,7 @@ mod tests {
         let r = renderer(Some("One"), vec![0, 1], ft, 5000, Some(7000));
         assert!(r.supports_airplay2(), "Sonos must support AirPlay 2");
         assert!(r.expects_ptp(), "Sonos advertises PTP (feature bit 41)");
+        assert!(r.supports_buffered_audio(), "Sonos advertises buffered audio (bit 40)");
         // It also advertises a legacy RAOP service we'd otherwise prefer,
         // which is why blind RAOP routing stalled at OPTIONS.
         assert!(r.supports_legacy_raop());

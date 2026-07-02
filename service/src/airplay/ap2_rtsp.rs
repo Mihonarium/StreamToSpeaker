@@ -222,9 +222,22 @@ impl Ap2Rtsp {
         Ok(())
     }
 
-    /// Second SETUP — declare the realtime ALAC audio stream and ship the
-    /// 32-byte `shk`. Returns the receiver's data + control ports.
+    /// Second SETUP — declare the realtime (type 96, UDP) ALAC audio
+    /// stream and ship the 32-byte `shk`. Returns data + control ports.
     pub fn setup_stream(&mut self, audio_key: &[u8; 32], control_port: u16) -> Result<StreamPorts> {
+        self.setup_stream_typed(audio_key, control_port, 0x60)
+    }
+
+    /// Second SETUP, buffered variant — type 103 over TCP, the stream kind
+    /// modern iOS senders use (feature bit 40). Same ALAC payload and seal
+    /// as realtime; playback is anchored via SETRATEANCHORTIME instead of
+    /// control-port sync packets. Returns the receiver's ports — `data` is
+    /// a **TCP** port for this stream kind.
+    pub fn setup_stream_buffered(&mut self, audio_key: &[u8; 32], control_port: u16) -> Result<StreamPorts> {
+        self.setup_stream_typed(audio_key, control_port, 0x67)
+    }
+
+    fn setup_stream_typed(&mut self, audio_key: &[u8; 32], control_port: u16, stream_type: u64) -> Result<StreamPorts> {
         let mut stream = plist::Dictionary::new();
         stream.insert("audioFormat".into(), Value::Integer(0x40000u64.into())); // ALAC 44100/16/2
         stream.insert("audioMode".into(), "default".into());
@@ -236,7 +249,7 @@ impl Ap2Rtsp {
         stream.insert("shk".into(), Value::Data(audio_key.to_vec()));
         stream.insert("spf".into(), Value::Integer(352u64.into())); // samples/packet
         stream.insert("sr".into(), Value::Integer(44100u64.into()));
-        stream.insert("type".into(), Value::Integer(0x60u64.into())); // 96 realtime
+        stream.insert("type".into(), Value::Integer(stream_type.into()));
         stream.insert("supportsDynamicStreamID".into(), Value::Boolean(false));
         stream.insert("streamConnectionID".into(), Value::Integer((self.session_id as u64).into()));
 
@@ -247,9 +260,41 @@ impl Ap2Rtsp {
         let uri = self.session_uri();
         let resp = self.request("SETUP", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
         if resp.status != 200 {
-            bail!("SETUP(stream) → {} {}", resp.status, resp.status_text);
+            bail!("SETUP(stream type {}) → {} {}", stream_type, resp.status, resp.status_text);
         }
         parse_stream_ports(&resp.body)
+    }
+
+    /// SETRATEANCHORTIME — anchor the buffered stream: "RTP timestamp
+    /// `rtp_time` plays at `network_ns` on the timeline `timeline_id`"
+    /// (our PTP grandmaster clock). `rate` 1 = play, 0 = pause. Field
+    /// semantics verified against shairport-sync's handler: `networkTimeFrac`
+    /// is a 64-bit binary fraction of a second.
+    pub fn set_rate_anchor_time(&mut self, rate: u64, rtp_time: u32, network_ns: u64, timeline_id: u64) -> Result<()> {
+        let (secs, frac) = network_time_parts(network_ns);
+        let mut dict = plist::Dictionary::new();
+        dict.insert("rate".into(), Value::Integer(rate.into()));
+        dict.insert("rtpTime".into(), Value::Integer((rtp_time as u64).into()));
+        dict.insert("networkTimeSecs".into(), Value::Integer(secs.into()));
+        dict.insert("networkTimeFrac".into(), Value::Integer(frac.into()));
+        dict.insert("networkTimeTimelineID".into(), Value::Integer(timeline_id.into()));
+        let body = to_binary_plist(&Value::Dictionary(dict))?;
+        let uri = self.session_uri();
+        let resp = self.request("SETRATEANCHORTIME", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
+        if resp.status != 200 {
+            bail!("SETRATEANCHORTIME → {} {}", resp.status, resp.status_text);
+        }
+        Ok(())
+    }
+
+    /// POST /feedback — the ~2 s keepalive iOS senders emit. Some receivers
+    /// drop or never start sessions without it.
+    pub fn feedback(&mut self) -> Result<()> {
+        let resp = self.request("POST", "/feedback", &[], None, &[])?;
+        if resp.status != 200 {
+            bail!("/feedback → {} {}", resp.status, resp.status_text);
+        }
+        Ok(())
     }
 
     /// RECORD — flip the receiver to playback. Empty body (matches iOS).
@@ -474,6 +519,16 @@ fn parse_stream_ports(body: &[u8]) -> Result<StreamPorts> {
     Ok(StreamPorts { data, control })
 }
 
+/// Split a nanosecond timeline value into SETRATEANCHORTIME's
+/// (`networkTimeSecs`, `networkTimeFrac`) pair — frac is a 64-bit binary
+/// fraction of a second (shairport-sync consumes it as such).
+fn network_time_parts(ns: u64) -> (u64, u64) {
+    let secs = ns / 1_000_000_000;
+    let rem = ns % 1_000_000_000;
+    let frac = (((rem as u128) << 64) / 1_000_000_000) as u64;
+    (secs, frac)
+}
+
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
@@ -530,5 +585,16 @@ mod tests {
     fn uuid_format_is_canonical() {
         let u = format_uuid([0x01; 16]);
         assert_eq!(u, "01010101-0101-0101-0101-010101010101");
+    }
+
+    #[test]
+    fn network_time_parts_is_binary_fraction_of_second() {
+        assert_eq!(network_time_parts(0), (0, 0));
+        let (s, f) = network_time_parts(1_500_000_000);
+        assert_eq!(s, 1);
+        // 0.5 s → 0x8000_0000_0000_0000 (allow rounding slack in low bits).
+        assert!((f as i128 - 0x8000_0000_0000_0000u64 as i128).abs() < 1_000_000_000);
+        let (s2, f2) = network_time_parts(2_000_000_000);
+        assert_eq!((s2, f2), (2, 0));
     }
 }
