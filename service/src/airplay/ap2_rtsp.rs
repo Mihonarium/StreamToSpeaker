@@ -18,7 +18,7 @@
 //! format implemented in [`crate::airplay::ap2_crypto::ChannelCipher`].
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::debug;
+use log::{debug, info};
 use plist::Value;
 use rand::Rng;
 use std::collections::HashMap;
@@ -139,6 +139,13 @@ impl Ap2Rtsp {
                     d.get("sourceVersion").and_then(|v| v.as_string()),
                     d.len(),
                 );
+                // Load-bearing diagnostic: the receiver's own codec table.
+                // audioFormats[].audioOutputFormats for type-103 entries is
+                // the authoritative answer to "does this device play ALAC
+                // or only AAC in buffered mode".
+                if let Some(formats) = d.get("audioFormats") {
+                    info!("AP2 /info audioFormats: {:?}", formats);
+                }
             }
         }
         Ok(())

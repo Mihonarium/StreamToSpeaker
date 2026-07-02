@@ -82,6 +82,9 @@ pub struct AirPlay2Session {
     /// stop() to send the spec's FLUSHBUFFERED before TEARDOWN. None for
     /// realtime sessions.
     buffered_flush: Option<(Arc<AtomicU32>, Arc<AtomicU32>)>,
+    /// Clone of the buffered data TCP stream — stop() shuts it down to
+    /// unblock a sender wedged in a full-buffer write before joining it.
+    data_stream: Option<TcpStream>,
     _audio_socket: UdpSocket,
 }
 
@@ -219,6 +222,7 @@ impl AirPlay2Session {
             .context("clone AP2 control socket")?;
 
         let mut buffered_flush = None;
+        let mut data_stream: Option<TcpStream> = None;
         let (sender_handle, timing_handle, sync_handle, resend_handle) = if buffered {
             // Buffered: audio goes over ONE TCP connection to the data
             // port; playback is anchored by SETRATEANCHORTIME on our PTP
@@ -228,6 +232,12 @@ impl AirPlay2Session {
             let stream = TcpStream::connect_timeout(&data_addr, Duration::from_secs(3))
                 .with_context(|| format!("connecting AP2 buffered data TCP to {}", data_addr))?;
             stream.set_nodelay(true).ok();
+            // Without a write timeout, a receiver that stops consuming
+            // fills the socket buffer and write_all blocks forever —
+            // which wedges stop() on the sender join and leaves the
+            // whole app stuck "Connecting…" with TEARDOWN never sent.
+            stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+            data_stream = stream.try_clone().ok();
             let last_seq = Arc::new(AtomicU32::new(initial_seq as u32));
             buffered_flush = Some((last_seq.clone(), current_rtptime.clone()));
             // The anchor (SETRATEANCHORTIME) is sent by the sender thread
@@ -349,6 +359,7 @@ impl AirPlay2Session {
             feedback_handle,
             ptp_session,
             buffered_flush,
+            data_stream,
             _audio_socket: audio_socket,
         })
     }
@@ -365,6 +376,12 @@ impl AirPlay2Session {
     pub fn stop(mut self) {
         info!("AirPlay 2: stopping session to {}", self.renderer.friendly_name);
         self.stop_flag.store(true, Ordering::Release);
+        // Unblock a buffered sender wedged in a full-buffer TCP write —
+        // without this the join below can hang forever on a receiver
+        // that stopped consuming, freezing the whole switch-speaker flow.
+        if let Some(s) = &self.data_stream {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
         for h in [
             self.sender_handle.take(),
             self.timing_handle.take(),
