@@ -120,7 +120,14 @@ features = [
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 1
+# 16 (cargo's release default) instead of 1: release builds drop from
+# minutes to tens of seconds. The runtime cost is negligible for this
+# workload (network audio pacing, not tight CPU loops); thin LTO still
+# runs cross-CGU optimization.
+codegen-units = 16
+# Reuse compilation across local release rebuilds; CI caches prune our
+# own crate anyway, so this only helps dev machines.
+incremental = true
 panic = "abort"
 strip = "symbols"
 

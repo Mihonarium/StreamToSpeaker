@@ -40,7 +40,7 @@ use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use rand::Rng;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -109,19 +109,80 @@ impl PtpMasterClock {
     }
 }
 
-/// Handle to a running PTP master.
-pub struct PtpMaster {
+/// Cloneable view of both timelines in play: **ours** (we serve it as a
+/// PTP master) and **the receiver's** (it serves its own clock to us —
+/// field-tested Sonos accepts SETRATEANCHORTIME *only* on its own
+/// timeline, so the sender must follow the receiver's Sync/Follow_Up
+/// stream to express "now" on it).
+#[derive(Clone)]
+pub struct PtpTimeline {
     pub clock: Arc<PtpMasterClock>,
     /// Our 8-byte clock identity as a u64 — goes BE into every PTP header
     /// and (as int64) into the RTSP `timingPeerInfo.ClockID`.
     pub clock_id: u64,
+    /// The grandmaster identity the receiver announces (0 until seen).
+    peer_clock_id: Arc<AtomicU64>,
+    /// Smoothed (receiver_clock − our_clock) in ns, from its Sync/Follow_Up.
+    peer_offset_ns: Arc<AtomicI64>,
+    peer_locked: Arc<AtomicBool>,
+}
+
+impl PtpTimeline {
+    fn new(clock: Arc<PtpMasterClock>, clock_id: u64) -> Self {
+        Self {
+            clock,
+            clock_id,
+            peer_clock_id: Arc::new(AtomicU64::new(0)),
+            peer_offset_ns: Arc::new(AtomicI64::new(0)),
+            peer_locked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn our_now_ns(&self) -> u64 {
+        self.clock.now_ns()
+    }
+
+    /// `(receiver clock id, receiver "now" in ns)` once we've locked onto
+    /// the receiver's Sync/Follow_Up stream; None before that.
+    pub fn receiver_now_ns(&self) -> Option<(u64, u64)> {
+        if !self.peer_locked.load(Ordering::Acquire) {
+            return None;
+        }
+        let id = self.peer_clock_id.load(Ordering::Acquire);
+        if id == 0 {
+            return None;
+        }
+        let now = self.clock.now_ns() as i64 + self.peer_offset_ns.load(Ordering::Acquire);
+        u64::try_from(now).ok().map(|n| (id, n))
+    }
+
+    /// Ingest one Sync/Follow_Up pair from the receiver: `t1` = its
+    /// precise origin timestamp, `t2` = our receive time. One-way path
+    /// delay (sub-ms on a LAN) is absorbed into the offset — irrelevant
+    /// at audio-anchor precision.
+    fn note_peer_sync(&self, t1_ns: u64, t2_ns: u64) -> i64 {
+        let sample = t1_ns as i64 - t2_ns as i64;
+        let next = if self.peer_locked.load(Ordering::Acquire) {
+            let prev = self.peer_offset_ns.load(Ordering::Acquire);
+            (prev / 8) * 7 + sample / 8
+        } else {
+            sample
+        };
+        self.peer_offset_ns.store(next, Ordering::Release);
+        self.peer_locked.store(true, Ordering::Release);
+        next
+    }
+
+    fn set_peer_clock_id(&self, id: u64) -> u64 {
+        self.peer_clock_id.swap(id, Ordering::AcqRel)
+    }
+}
+
+/// Handle to a running PTP master.
+pub struct PtpMaster {
+    pub timeline: PtpTimeline,
     /// UUID string for the RTSP `timingPeerInfo.ID` field.
     pub clock_uuid: String,
-    /// The grandmaster identity the *receiver* announces (0 until its
-    /// first Announce arrives). Receivers act as masters of their own
-    /// timeline in Apple's PTP model; exposing theirs lets the session
-    /// try anchoring against it if anchors on our clock are refused.
-    pub peer_clock_id: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -160,24 +221,22 @@ pub fn spawn_ptp_master(receiver_ip: IpAddr, local_ip: IpAddr, receiver_name: St
     let clock_id: u64 = rng.gen::<u64>() & 0x7FFF_FFFF_FFFF_FFFF;
     let clock_uuid = format_uuid(rng.gen());
 
-    let clock = PtpMasterClock::new();
+    let timeline = PtpTimeline::new(PtpMasterClock::new(), clock_id);
     let stop = Arc::new(AtomicBool::new(false));
-    let peer_clock_id = Arc::new(AtomicU64::new(0));
 
-    let clock_t = clock.clone();
+    let timeline_t = timeline.clone();
     let stop_t = stop.clone();
-    let peer_t = peer_clock_id.clone();
     let handle = thread::Builder::new()
         .name(format!("stream-to-speaker-ap2-ptp:{}", receiver_name))
         .spawn(move || {
-            run_master(event, general, receiver_ip, clock_id, clock_t, peer_t, stop_t);
+            run_master(event, general, receiver_ip, timeline_t, stop_t);
         })?;
 
     info!(
         "AirPlay 2 PTP: serving as grandmaster for {} (clock_id={:#018x})",
         receiver_ip, clock_id
     );
-    Ok(PtpMaster { clock, clock_id, clock_uuid, peer_clock_id, stop, handle: Some(handle) })
+    Ok(PtpMaster { timeline, clock_uuid, stop, handle: Some(handle) })
 }
 
 fn bind_ptp(local_ip: IpAddr, port: u16) -> Result<UdpSocket> {
@@ -197,13 +256,17 @@ fn run_master(
     event: UdpSocket,
     general: UdpSocket,
     receiver_ip: IpAddr,
-    clock_id: u64,
-    clock: Arc<PtpMasterClock>,
-    peer_clock_id: Arc<AtomicU64>,
+    timeline: PtpTimeline,
     stop: Arc<AtomicBool>,
 ) {
+    let clock_id = timeline.clock_id;
+    let clock = timeline.clock.clone();
     let event_dst = SocketAddr::new(receiver_ip, PTP_EVENT_PORT);
     let general_dst = SocketAddr::new(receiver_ip, PTP_GENERAL_PORT);
+    // The receiver's most recent Sync (seq, our receive time) awaiting its
+    // Follow_Up — pairing them yields the receiver-clock offset.
+    let mut pending_peer_sync: Option<(u16, u64)> = None;
+    let mut peer_lock_logged = false;
 
     let mut announce_seq: u16 = 0;
     let mut sync_seq: u16 = 0;
@@ -259,18 +322,27 @@ fn run_master(
                 rx_total += 1;
                 if let Some(h) = parse_header(&buf[..n]) {
                     note_inbound(&mut seen_types, h.msg_type, PTP_EVENT_PORT, src);
-                    if h.msg_type == 0x1 {
-                        let resp = build_delay_resp(
-                            clock_id,
-                            h.sequence_id,
-                            t_recv,
-                            &h.source_port_identity,
-                        );
-                        let _ = general.send_to(&resp, SocketAddr::new(src.ip(), PTP_GENERAL_PORT));
-                        delay_resps += 1;
-                        if delay_resps == 1 {
-                            info!("AirPlay 2 PTP: receiver {} is exchanging Delay_Req — clock lock in progress", src.ip());
+                    match h.msg_type {
+                        0x1 => {
+                            let resp = build_delay_resp(
+                                clock_id,
+                                h.sequence_id,
+                                t_recv,
+                                &h.source_port_identity,
+                            );
+                            let _ = general.send_to(&resp, SocketAddr::new(src.ip(), PTP_GENERAL_PORT));
+                            delay_resps += 1;
+                            if delay_resps == 1 {
+                                info!("AirPlay 2 PTP: receiver {} is exchanging Delay_Req — clock lock in progress", src.ip());
+                            }
                         }
+                        // The receiver's own Sync (it masters its clock at
+                        // us): remember (seq, our recv time) and pair it
+                        // with the Follow_Up's precise origin timestamp.
+                        0x0 => {
+                            pending_peer_sync = Some((h.sequence_id, t_recv));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -288,16 +360,39 @@ fn run_master(
             rx_total += 1;
             if let Some(h) = parse_header(&buf[..n]) {
                 note_inbound(&mut seen_types, h.msg_type, PTP_GENERAL_PORT, src);
-                if h.msg_type == 0xB {
-                    if let Some((gm, class)) = parse_announce_grandmaster(&buf[..n]) {
-                        let prev = peer_clock_id.swap(gm, Ordering::AcqRel);
-                        if prev != gm {
-                            info!(
-                                "AirPlay 2 PTP: receiver announces its own clock {:#018x} (clockClass {})",
-                                gm, class
-                            );
+                match h.msg_type {
+                    0xB => {
+                        if let Some((gm, class)) = parse_announce_grandmaster(&buf[..n]) {
+                            let prev = timeline.set_peer_clock_id(gm);
+                            if prev != gm {
+                                info!(
+                                    "AirPlay 2 PTP: receiver announces its own clock {:#018x} (clockClass {})",
+                                    gm, class
+                                );
+                            }
                         }
                     }
+                    // Follow_Up completing the receiver's two-step Sync:
+                    // its precise origin timestamp + our Sync receive time
+                    // give the receiver-clock offset we anchor with.
+                    0x8 => {
+                        if let Some((seq, t2)) = pending_peer_sync {
+                            if seq == h.sequence_id {
+                                if let Some(t1) = read_timestamp(&buf[..n], HEADER_LEN) {
+                                    let off = timeline.note_peer_sync(t1, t2);
+                                    if !peer_lock_logged {
+                                        peer_lock_logged = true;
+                                        info!(
+                                            "AirPlay 2 PTP: locked to the receiver's clock (offset {:.3} s) — can anchor on its timeline",
+                                            off as f64 / 1e9
+                                        );
+                                    }
+                                }
+                                pending_peer_sync = None;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -512,7 +607,6 @@ fn parse_announce_grandmaster(buf: &[u8]) -> Option<(u64, u8)> {
 }
 
 /// Read a 10-byte PTP timestamp at `off`, returning ns.
-#[cfg(test)]
 fn read_timestamp(buf: &[u8], off: usize) -> Option<u64> {
     if buf.len() < off + 10 {
         return None;
@@ -635,6 +729,24 @@ mod tests {
         let ns = 123_456_789_012_345u64;
         write_timestamp(&mut buf, ns);
         assert_eq!(read_timestamp(&buf, HEADER_LEN).unwrap(), ns);
+    }
+
+    #[test]
+    fn timeline_follows_receiver_clock() {
+        let tl = PtpTimeline::new(PtpMasterClock::new(), 0x42);
+        assert!(tl.receiver_now_ns().is_none()); // no peer yet
+        tl.set_peer_clock_id(0xABCDEF);
+        assert!(tl.receiver_now_ns().is_none()); // announced but not locked
+        // Receiver clock ~1000 s ahead of ours.
+        let t2 = tl.our_now_ns();
+        let t1 = t2 + 1_000_000_000_000;
+        let off = tl.note_peer_sync(t1, t2);
+        assert_eq!(off, 1_000_000_000_000);
+        let (id, now) = tl.receiver_now_ns().unwrap();
+        assert_eq!(id, 0xABCDEF);
+        // receiver_now ≈ our_now + offset (allow scheduling slack).
+        let expect = tl.our_now_ns() + 1_000_000_000_000;
+        assert!((now as i64 - expect as i64).abs() < 50_000_000);
     }
 
     #[test]

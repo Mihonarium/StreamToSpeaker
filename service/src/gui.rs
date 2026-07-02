@@ -1491,7 +1491,23 @@ impl StreamToSpeakerApp {
         // same weight. "?" stays for "no speaker" because it reads
         // as a text prompt ("what should I pick?"), not as a state
         // indicator competing with the media icons.
-        let (icon, accent, headline, detail, btn_label, btn_tip) = match (&current, enabled, active) {
+        // A background connect owns the banner while in flight — keep
+        // repainting so its progress shows without user input.
+        let connecting = self.app.connecting_to();
+        if connecting.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        let (icon, accent, headline, detail, btn_label, btn_tip) = if let Some(name) = connecting {
+            (
+                "⟳",
+                p.warn,
+                format!("Connecting to {}…", name),
+                "Setting up the session — the speaker list stays usable meanwhile.".to_string(),
+                None,
+                None,
+            )
+        } else {
+            match (&current, enabled, active) {
             (None, _, _) => (
                 "?",
                 p.muted,
@@ -1524,6 +1540,7 @@ impl StreamToSpeakerApp {
                 Some("Disable streaming"),
                 Some("Stop streaming and release the speaker for other apps (Ctrl+E)"),
             ),
+            }
         };
 
         let frame_resp = egui::Frame::none()
@@ -1864,11 +1881,10 @@ impl StreamToSpeakerApp {
                 .show(ui, |ui| {
                     for sp in view.speakers {
                         speaker_row(ui, p, &sp, |id| {
-                            if let Err(e) = self.app.select_speaker(id) {
-                                self.app.record_error(
-                                    format!("Couldn't connect to speaker: {}", e),
-                                );
-                            }
+                            // Bring-up does seconds of network I/O —
+                            // run it off-thread; the status banner shows
+                            // "Connecting…" and errors arrive as toasts.
+                            self.app.select_speaker_async(id);
                         });
                     }
                 });

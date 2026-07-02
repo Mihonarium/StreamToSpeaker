@@ -204,6 +204,12 @@ pub struct App {
     /// (Heuristics F-03 — previously every action that could fail
     /// just `warn!`'d to the log file and the user saw nothing).
     pub last_error: Mutex<Option<(String, Instant)>>,
+
+    /// Friendly name of the speaker a background connect is currently
+    /// running for (None when idle). Session bring-up does seconds of
+    /// blocking network I/O — pairing, SETUPs, fallbacks — so the GUI
+    /// runs it on a worker thread and shows "Connecting…" off this.
+    pub connecting: Mutex<Option<String>>,
 }
 
 impl App {
@@ -241,6 +247,7 @@ impl App {
             last_rescan_count: Arc::new(AtomicUsize::new(0)),
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
+            connecting: Mutex::new(None),
         })
     }
 
@@ -418,6 +425,51 @@ impl App {
     // -------------------------------------------------------------------
     // Speaker actions
     // -------------------------------------------------------------------
+
+    /// Friendly name of an in-flight background connect, if any.
+    pub fn connecting_to(&self) -> Option<String> {
+        self.connecting.lock().unwrap().clone()
+    }
+
+    /// Non-blocking [`select_speaker`]: runs the (seconds-long) session
+    /// bring-up on a worker thread so the GUI stays responsive, exposing
+    /// progress via [`connecting_to`] and failures via `record_error`.
+    /// A second call while one is in flight is refused with a toast.
+    pub fn select_speaker_async(self: &Arc<Self>, id: &str) {
+        {
+            let mut guard = self.connecting.lock().unwrap();
+            if let Some(name) = guard.as_ref() {
+                self.record_error(format!("Still connecting to {} — give it a moment.", name));
+                return;
+            }
+            // Resolve a display name best-effort for the banner.
+            let name = self
+                .discovery
+                .as_ref()
+                .and_then(|d| d.find_by_id(id))
+                .map(|r| r.friendly_name)
+                .or_else(|| {
+                    self.airplay_discovery
+                        .as_ref()
+                        .and_then(|d| d.find_by_id(id))
+                        .map(|r| r.friendly_name)
+                })
+                .unwrap_or_else(|| id.to_string());
+            *guard = Some(name);
+        }
+        let app = self.clone();
+        let id = id.to_string();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-connect".into())
+            .spawn(move || {
+                let result = app.select_speaker(&id);
+                *app.connecting.lock().unwrap() = None;
+                if let Err(e) = result {
+                    app.record_error(format!("Couldn't connect to speaker: {}", e));
+                }
+            })
+            .ok();
+    }
 
     /// Switch to the speaker with the given stable id. Tears down any
     /// existing session, starts a new one. Remembers the id so Disable→

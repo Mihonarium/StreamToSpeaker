@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use crate::airplay::alac::build_uncompressed_alac_frame;
 use crate::airplay::ap2_crypto::seal_audio;
-use crate::airplay::ap2_ptp::{spawn_ptp_master, PtpMaster};
+use crate::airplay::ap2_ptp::{spawn_ptp_master, PtpMaster, PtpTimeline};
 use crate::airplay::ap2_rtsp::Ap2Rtsp;
 use crate::airplay::discovery::AirPlayRenderer;
 use crate::airplay::rtp::{bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, FRAMES_PER_PACKET};
@@ -135,7 +135,7 @@ impl AirPlay2Session {
             let ptp = spawn_ptp_master(cfg.renderer.ip, cfg.local_ip, cfg.renderer.friendly_name.clone())
                 .context("starting AP2 PTP master")?;
             let ts = rtsp
-                .setup_timing_ptp(ptp.clock_id, &ptp.clock_uuid)
+                .setup_timing_ptp(ptp.timeline.clock_id, &ptp.clock_uuid)
                 .context("AP2 SETUP(timing/PTP)")?;
             (Some(ptp), ts)
         } else {
@@ -200,6 +200,11 @@ impl AirPlay2Session {
             }
         }
 
+        // From here the RTSP connection is shared: the buffered sender
+        // anchors on it at first audio, the feedback keepalive posts to it,
+        // and volume changes arrive from arbitrary threads.
+        let rtsp = Arc::new(Mutex::new(rtsp));
+
         // Background threads.
         let initial_seq = random_initial_seq();
         let initial_rtptime = random_initial_rtptime();
@@ -225,6 +230,13 @@ impl AirPlay2Session {
             stream.set_nodelay(true).ok();
             let last_seq = Arc::new(AtomicU32::new(initial_seq as u32));
             buffered_flush = Some((last_seq.clone(), current_rtptime.clone()));
+            // The anchor (SETRATEANCHORTIME) is sent by the sender thread
+            // itself, right before the first real audio packet — anchoring
+            // earlier maps an rtpTime to a wall instant that has passed by
+            // the time audio exists, and the receiver drops everything as
+            // late. Field-tested: this receiver accepts anchors only on
+            // ITS OWN timeline, which the PTP layer follows via the
+            // receiver's Sync/Follow_Up stream.
             let sender = spawn_ap2_buffered_sender(BufferedSenderConfig {
                 stream,
                 audio_key,
@@ -236,56 +248,10 @@ impl AirPlay2Session {
                 receiver_name: cfg.renderer.friendly_name.clone(),
                 current_rtptime: current_rtptime.clone(),
                 last_seq,
+                rtsp: rtsp.clone(),
+                timeline: ptp_session.as_ref().unwrap().timeline.clone(),
             })?;
-
-            // Anchor: initial_rtptime plays ANCHOR_LEAD from now on our
-            // grandmaster timeline. Sent after the sender is running so the
-            // receiver's buffer is filling during the lead. Retried: a
-            // receiver that hasn't finished locking to our PTP clock yet
-            // may 400 an anchor referencing that timeline — while we retry,
-            // the PTP master + Signaling keep running and audio keeps
-            // buffering, so a late lock still converges.
-            let ptp = ptp_session.as_ref().unwrap();
-            let mut anchored = Ok(());
-            for attempt in 1..=5u32 {
-                // Round the anchor up to the next whole second: the frac
-                // field becomes 0, sidestepping any receiver-side parser
-                // quirks with huge unsigned fractions, and the effective
-                // lead stays in [0.5 s, 1.5 s].
-                let raw = ptp.clock.now_ns() + ANCHOR_LEAD_NS;
-                let anchor_ns = raw.div_ceil(1_000_000_000) * 1_000_000_000;
-                // Attempts 1-3 anchor on OUR grandmaster clock (the model
-                // shairport-sync implements). If those are refused, 4-5
-                // are an experiment: anchor on the clock the RECEIVER
-                // announces — some receivers may treat themselves as the
-                // session grandmaster. Whichever succeeds reveals the
-                // timeline model; both are logged.
-                let peer = ptp.peer_clock_id.load(Ordering::Acquire);
-                let timeline = if attempt <= 3 || peer == 0 { ptp.clock_id } else { peer };
-                if timeline == peer && peer != 0 {
-                    warn!(
-                        "AirPlay 2: experiment — anchoring on the RECEIVER's clock {:#018x}",
-                        peer
-                    );
-                }
-                anchored = rtsp.set_rate_anchor_time(1, initial_rtptime, anchor_ns, timeline);
-                match &anchored {
-                    Ok(()) => {
-                        info!(
-                            "AirPlay 2: anchored (attempt {}) — rtpTime {} on timeline {:#018x}",
-                            attempt, initial_rtptime, timeline
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("AirPlay 2 SETRATEANCHORTIME attempt {}/5 failed: {:#}", attempt, e);
-                        if attempt < 5 {
-                            std::thread::sleep(Duration::from_secs(1));
-                        }
-                    }
-                }
-            }
-            anchored.context("AP2 SETRATEANCHORTIME")?;
+            info!("AirPlay 2: buffered stream armed — will anchor at first audio");
             drop(timing_socket);
             drop(control_socket);
             drop(control_for_resend);
@@ -314,8 +280,8 @@ impl AirPlay2Session {
                     sync_addr,
                     current_rtptime,
                     DEFAULT_LATENCY_SAMPLES,
-                    ptp.clock.clone(),
-                    ptp.clock_id,
+                    ptp.timeline.clock.clone(),
+                    ptp.timeline.clock_id,
                     stop_flag.clone(),
                     cfg.renderer.friendly_name.clone(),
                 )
@@ -365,7 +331,6 @@ impl AirPlay2Session {
         // /feedback keepalive — iOS senders POST this every ~2 s; some
         // receivers eventually drop (or never fully start) sessions
         // without it. Shares the RTSP connection via the session mutex.
-        let rtsp = Arc::new(Mutex::new(rtsp));
         let feedback_handle = spawn_feedback_keepalive(
             rtsp.clone(),
             stop_flag.clone(),
@@ -534,6 +499,28 @@ struct BufferedSenderConfig {
     current_rtptime: Arc<AtomicU32>,
     /// Last RTP sequence number sent — read at stop() for FLUSHBUFFERED.
     last_seq: Arc<AtomicU32>,
+    /// Shared RTSP connection — the sender anchors on it at first audio.
+    rtsp: Arc<Mutex<Ap2Rtsp>>,
+    /// Both PTP timelines (ours + the receiver's, once locked).
+    timeline: PtpTimeline,
+}
+
+/// Send SETRATEANCHORTIME for the buffered stream: "rtpTime plays at
+/// (timeline now + lead)". Prefers the RECEIVER's timeline once the PTP
+/// layer has locked onto its Sync/Follow_Up stream (field-tested: Sonos
+/// refuses anchors on any other clock); falls back to our own timeline
+/// for receivers that follow the sender instead. Anchors are rounded up
+/// to a whole second so networkTimeFrac is 0.
+fn try_anchor_buffered(rtsp: &Arc<Mutex<Ap2Rtsp>>, timeline: &PtpTimeline, rtp_time: u32) -> Result<u64> {
+    let (timeline_id, base_ns) = match timeline.receiver_now_ns() {
+        Some((id, now)) => (id, now),
+        None => (timeline.clock_id, timeline.our_now_ns()),
+    };
+    let anchor_ns = (base_ns + ANCHOR_LEAD_NS).div_ceil(1_000_000_000) * 1_000_000_000;
+    rtsp.lock()
+        .unwrap()
+        .set_rate_anchor_time(1, rtp_time, anchor_ns, timeline_id)?;
+    Ok(timeline_id)
 }
 
 /// Frame one sealed RTP packet for the buffered TCP stream: a 2-byte
@@ -565,10 +552,15 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
     let mut packet_count: u64 = 0;
     let mut ring: Vec<i16> = Vec::with_capacity(FRAMES_PER_PACKET * 2);
 
-    let start = Instant::now();
+    let started = Instant::now();
     let packet_duration =
         Duration::from_nanos((FRAMES_PER_PACKET as u64 * 1_000_000_000) / WIRE_SAMPLE_RATE as u64);
     let mut idle_warned = false;
+    let mut anchored = false;
+    // Pacing baseline — reset at the anchor so packet deadlines line up
+    // with the promised playback timeline.
+    let mut pace_start = Instant::now();
+    let mut last_anchor_try: Option<Instant> = None;
 
     loop {
         if cfg.stop_flag.load(Ordering::Acquire) {
@@ -586,16 +578,63 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if packet_count == 0 && !idle_warned && start.elapsed() > Duration::from_secs(3) {
+                if !anchored && !idle_warned && started.elapsed() > Duration::from_secs(3) {
                     warn!(
                         "AirPlay 2: no audio from the source after 3s — is something playing with \
                          Stream To Speaker selected as the Windows output device?"
                     );
                     idle_warned = true;
                 }
-                continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+        }
+
+        // Anchor at first audio: "this rtptime plays at (timeline now +
+        // lead)" is only true if the packet carrying that rtptime is about
+        // to be sent. Until anchored, don't send — the receiver has no
+        // timeline for the bytes.
+        if !anchored {
+            if ring.len() >= FRAMES_PER_PACKET * 2
+                && last_anchor_try.map_or(true, |t| t.elapsed() >= Duration::from_secs(1))
+            {
+                last_anchor_try = Some(Instant::now());
+                match try_anchor_buffered(&cfg.rtsp, &cfg.timeline, rtptime) {
+                    Ok(tid) => {
+                        anchored = true;
+                        pace_start = Instant::now();
+                        packet_count = 0;
+                        info!(
+                            "AirPlay 2: anchored at first audio — rtpTime {} on timeline {:#018x}{}",
+                            rtptime,
+                            tid,
+                            if tid == cfg.timeline.clock_id { " (our clock)" } else { " (receiver's clock)" }
+                        );
+                    }
+                    Err(e) => {
+                        warn!("AirPlay 2 anchor failed (will retry): {:#}", e);
+                    }
+                }
+            }
+            if !anchored {
+                // Bound the pre-anchor buffer to ~2 s of the freshest audio.
+                let max = WIRE_SAMPLE_RATE as usize * 2 * 2;
+                if ring.len() > max {
+                    let cut = ring.len() - max;
+                    ring.drain(..cut);
+                }
+                continue;
+            }
+        }
+
+        // Silence-fill: the anchored timeline equates rtptime with wall
+        // time, so a starved source (nothing playing on Windows) must not
+        // stall rtptime — synthesize silence to keep the receiver's buffer
+        // primed and the mapping intact.
+        if ring.len() < FRAMES_PER_PACKET * 2 {
+            let deadline = pace_start + packet_duration.saturating_mul((packet_count + 1) as u32);
+            if Instant::now() >= deadline {
+                ring.resize(ring.len() + FRAMES_PER_PACKET * 2, 0);
+            }
         }
 
         let mut packets_this_round = 0u32;
@@ -610,10 +649,10 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
             packet.extend_from_slice(&sealed);
             let framed = frame_buffered_packet(&packet);
 
-            // Same wall-clock pacing as realtime — the receiver buffers,
-            // so exact pacing isn't critical, but matching the sample rate
-            // keeps our send queue and its buffer bounded.
-            let deadline = start + packet_duration.saturating_mul((packet_count + 1) as u32);
+            // Pace to wall-clock from the anchor: the receiver plays
+            // rtptime-at-anchor 0.5-1.5 s from now, so staying at the
+            // sample rate keeps its buffer bounded on both sides.
+            let deadline = pace_start + packet_duration.saturating_mul((packet_count + 1) as u32);
             let now = Instant::now();
             if deadline > now {
                 std::thread::sleep(deadline - now);
