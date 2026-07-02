@@ -505,18 +505,39 @@ fn spawn_event_channel(
         .spawn(move || {
             use std::io::Read;
             let mut stream = stream;
-            let mut buf = [0u8; 1024];
+            let mut buf = [0u8; 2048];
+            let mut chunks: u64 = 0;
             while !stop_flag.load(Ordering::Acquire) {
                 match stream.read(&mut buf) {
                     Ok(0) => break, // receiver closed the channel
-                    Ok(_) => {}     // discard events
+                    Ok(n) => {
+                        // Diagnostic: receivers can send requests on this
+                        // channel; if one gates playback, discarding it
+                        // silently would look exactly like our silence bug.
+                        chunks += 1;
+                        let preview_len = n.min(64);
+                        let hex: String =
+                            buf[..preview_len].iter().map(|b| format!("{:02x}", b)).collect();
+                        let text: String = buf[..preview_len]
+                            .iter()
+                            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                            .collect();
+                        if chunks <= 3 {
+                            info!(
+                                "AirPlay 2 event channel: received {} bytes (hex {} | text {:?})",
+                                n, hex, text
+                            );
+                        } else {
+                            debug!("AirPlay 2 event channel: {} bytes", n);
+                        }
+                    }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut => {}
                     Err(_) => break,
                 }
             }
-            debug!("AirPlay 2 event channel closed");
+            debug!("AirPlay 2 event channel closed ({} chunks received)", chunks);
         })
         .ok()
 }
