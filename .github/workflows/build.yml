@@ -76,16 +76,20 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cache cargo registry + target
-        uses: actions/cache@v4
+      # Rust dependency cache. Swatinem/rust-cache instead of a plain
+      # actions/cache on target/: it keys on the *rustc version* as well as
+      # Cargo.lock (a plain lock-keyed cache goes permanently stale every
+      # 6-week toolchain bump, because actions/cache never re-saves on a
+      # key hit — deps then recompile on every run), it prunes our own
+      # crate's artifacts from target/ before saving (only dependencies are
+      # worth caching; smaller entries also relieve the repo's 10 GB cache
+      # budget that the WDK/driver caches share), and it saves even when a
+      # later step fails.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            service/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('service/Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
+          workspaces: service
+          cache-on-failure: true
 
       - name: Install Inno Setup
         shell: pwsh

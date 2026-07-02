@@ -103,7 +103,7 @@ User-machine prerequisites that aren't automatable:
 9. Upload `.exe` + raw binaries as artifacts
 10. On `v*` tag push: attach `.exe` to GitHub Release
 
-WDK install (~5 min cold) is cached; warm cache restores in ~30 s.
+WDK install (~5 min cold) is cached; warm cache restores in ~30 s. Rust deps are cached via `Swatinem/rust-cache@v2` (NOT a plain `actions/cache` on `target/` — that goes permanently stale on every 6-week toolchain bump because `actions/cache` never re-saves on a key hit; rust-cache keys on rustc version + lockfile and prunes our own crate from the saved target dir).
 
 ## Future work — explicitly deferred
 
