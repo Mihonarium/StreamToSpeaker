@@ -271,29 +271,45 @@ impl Ap2Rtsp {
     /// Second SETUP — declare the realtime (type 96, UDP) ALAC audio
     /// stream and ship the 32-byte `shk`. Returns data + control ports.
     pub fn setup_stream(&mut self, audio_key: &[u8; 32], control_port: u16) -> Result<StreamPorts> {
-        self.setup_stream_typed(audio_key, control_port, 0x60)
+        self.setup_stream_typed(audio_key, control_port, 0x60, 2, 352, 0x40000)
     }
 
     /// Second SETUP, buffered variant — type 103 over TCP, the stream kind
-    /// modern iOS senders use (feature bit 40). Same ALAC payload and seal
-    /// as realtime; playback is anchored via SETRATEANCHORTIME instead of
-    /// control-port sync packets. Returns the receiver's ports — `data` is
-    /// a **TCP** port for this stream kind.
-    pub fn setup_stream_buffered(&mut self, audio_key: &[u8; 32], control_port: u16) -> Result<StreamPorts> {
-        self.setup_stream_typed(audio_key, control_port, 0x67)
+    /// modern iOS senders use (feature bit 40). Codec-parameterized:
+    /// AAC-LC = (ct 4, spf 1024, audioFormat 0x400000) — what iOS sends;
+    /// ALAC   = (ct 2, spf 352,  audioFormat 0x40000).
+    /// Playback is anchored via SETRATEANCHORTIME instead of control-port
+    /// sync packets. The returned `data` port is **TCP**.
+    pub fn setup_stream_buffered(
+        &mut self,
+        audio_key: &[u8; 32],
+        control_port: u16,
+        ct: u64,
+        spf: u64,
+        audio_format: u64,
+    ) -> Result<StreamPorts> {
+        self.setup_stream_typed(audio_key, control_port, 0x67, ct, spf, audio_format)
     }
 
-    fn setup_stream_typed(&mut self, audio_key: &[u8; 32], control_port: u16, stream_type: u64) -> Result<StreamPorts> {
+    fn setup_stream_typed(
+        &mut self,
+        audio_key: &[u8; 32],
+        control_port: u16,
+        stream_type: u64,
+        ct: u64,
+        spf: u64,
+        audio_format: u64,
+    ) -> Result<StreamPorts> {
         let mut stream = plist::Dictionary::new();
-        stream.insert("audioFormat".into(), Value::Integer(0x40000u64.into())); // ALAC 44100/16/2
+        stream.insert("audioFormat".into(), Value::Integer(audio_format.into()));
         stream.insert("audioMode".into(), "default".into());
         stream.insert("controlPort".into(), Value::Integer((control_port as u64).into()));
-        stream.insert("ct".into(), Value::Integer(2u64.into())); // ALAC
+        stream.insert("ct".into(), Value::Integer(ct.into()));
         stream.insert("isMedia".into(), Value::Boolean(true));
         stream.insert("latencyMax".into(), Value::Integer(88200u64.into()));
         stream.insert("latencyMin".into(), Value::Integer(11025u64.into()));
         stream.insert("shk".into(), Value::Data(audio_key.to_vec()));
-        stream.insert("spf".into(), Value::Integer(352u64.into())); // samples/packet
+        stream.insert("spf".into(), Value::Integer(spf.into()));
         stream.insert("sr".into(), Value::Integer(44100u64.into()));
         stream.insert("type".into(), Value::Integer(stream_type.into()));
         stream.insert("supportsDynamicStreamID".into(), Value::Boolean(false));

@@ -32,6 +32,8 @@
 //!   `app::start_session` / `app::stop_session` for the UPnP path.
 
 pub mod alac;
+#[cfg(windows)]
+pub mod aac_mf;
 pub mod ap2_crypto;
 pub mod ap2_ptp;
 pub mod ap2_rtsp;

@@ -162,14 +162,58 @@ impl AirPlay2Session {
         // Stream kind: buffered (type 103, TCP — what iOS actually uses,
         // and seemingly the only kind current Sonos firmware truly plays)
         // when the receiver advertises bit 40 and we're on PTP; realtime
-        // (type 96, UDP) otherwise. A rejected buffered SETUP falls back
-        // to realtime *visibly* — unlike the silent failure modes.
+        // (type 96, UDP) otherwise. Codec: AAC-LC via the Windows-provided
+        // Media Foundation encoder — iOS's buffered codec, the only one
+        // field-proven on Sonos — with ALAC as fallback (no encoder needed)
+        // and realtime as the last resort. Every rejection is visible.
         let want_buffered = use_ptp && cfg.renderer.supports_buffered_audio();
+        let mut codec = BufferedCodecKind::Alac;
+        #[cfg(windows)]
+        if want_buffered {
+            match crate::airplay::aac_mf::AacEncoder::new() {
+                Ok(_) => codec = BufferedCodecKind::Aac,
+                Err(e) => {
+                    warn!("AirPlay 2: Windows AAC encoder unavailable ({e:#}); buffered will use ALAC")
+                }
+            }
+        }
         let (ports, buffered) = if want_buffered {
-            match rtsp.setup_stream_buffered(&audio_key, control_port) {
+            let attempt = |rtsp: &mut Ap2Rtsp, k: BufferedCodecKind| match k {
+                BufferedCodecKind::Aac => {
+                    rtsp.setup_stream_buffered(&audio_key, control_port, 4, 1024, 0x400000)
+                }
+                BufferedCodecKind::Alac => {
+                    rtsp.setup_stream_buffered(&audio_key, control_port, 2, 352, 0x40000)
+                }
+            };
+            match attempt(&mut rtsp, codec) {
                 Ok(p) => {
-                    info!("AirPlay 2: buffered stream accepted (type 103/ALAC, TCP data port {})", p.data);
+                    info!(
+                        "AirPlay 2: buffered stream accepted (type 103/{}, TCP data port {})",
+                        codec.label(),
+                        p.data
+                    );
                     (p, true)
+                }
+                Err(e) if codec == BufferedCodecKind::Aac => {
+                    warn!("AirPlay 2: buffered AAC SETUP rejected ({e:#}); trying buffered ALAC");
+                    codec = BufferedCodecKind::Alac;
+                    match attempt(&mut rtsp, codec) {
+                        Ok(p) => {
+                            info!(
+                                "AirPlay 2: buffered stream accepted (type 103/ALAC, TCP data port {})",
+                                p.data
+                            );
+                            (p, true)
+                        }
+                        Err(e) => {
+                            warn!("AirPlay 2: buffered ALAC SETUP rejected ({e:#}); falling back to realtime");
+                            let p = rtsp
+                                .setup_stream(&audio_key, control_port)
+                                .context("AP2 SETUP(stream, realtime fallback)")?;
+                            (p, false)
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("AirPlay 2: buffered SETUP rejected ({e:#}); falling back to realtime");
@@ -260,8 +304,12 @@ impl AirPlay2Session {
                 last_seq,
                 rtsp: rtsp.clone(),
                 timeline: ptp_session.as_ref().unwrap().timeline.clone(),
+                codec,
             })?;
-            info!("AirPlay 2: buffered stream armed — will anchor at first audio");
+            info!(
+                "AirPlay 2: buffered {} stream armed — will anchor at first audio",
+                codec.label()
+            );
             drop(timing_socket);
             drop(control_socket);
             drop(control_for_resend);
@@ -504,6 +552,33 @@ fn spawn_feedback_keepalive(
 // Buffered audio sender (type 103 — length-prefixed sealed packets on TCP)
 // ---------------------------------------------------------------------------
 
+/// Payload codec for the buffered stream. AAC-LC is what iOS sends (and
+/// the only codec field-proven on Sonos); ALAC needs no encoder and is
+/// the fallback + the non-Windows dev default.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BufferedCodecKind {
+    Alac,
+    Aac,
+}
+
+impl BufferedCodecKind {
+    fn label(self) -> &'static str {
+        match self {
+            BufferedCodecKind::Alac => "ALAC",
+            BufferedCodecKind::Aac => "AAC-LC",
+        }
+    }
+
+    /// Samples per packet: fixed at 1024 by AAC-LC; 352 for ALAC (RAOP
+    /// convention, matches the SETUP `spf`).
+    fn spf(self) -> usize {
+        match self {
+            BufferedCodecKind::Alac => FRAMES_PER_PACKET,
+            BufferedCodecKind::Aac => 1024,
+        }
+    }
+}
+
 struct BufferedSenderConfig {
     stream: TcpStream,
     audio_key: [u8; 32],
@@ -520,6 +595,8 @@ struct BufferedSenderConfig {
     rtsp: Arc<Mutex<Ap2Rtsp>>,
     /// Both PTP timelines (ours + the receiver's, once locked).
     timeline: PtpTimeline,
+    /// Negotiated payload codec (must match the SETUP's ct/spf).
+    codec: BufferedCodecKind,
 }
 
 /// Send SETRATEANCHORTIME for the buffered stream: "rtpTime plays at
@@ -564,14 +641,30 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
         cfg.initial_seq,
         cfg.initial_rtptime
     );
+    let spf = cfg.codec.spf();
     let mut seq = cfg.initial_seq;
     let mut rtptime = cfg.initial_rtptime;
     let mut packet_count: u64 = 0;
-    let mut ring: Vec<i16> = Vec::with_capacity(FRAMES_PER_PACKET * 2);
+    let mut ring: Vec<i16> = Vec::with_capacity(spf * 2);
+
+    // The AAC encoder must live on this thread (COM); the session already
+    // probed availability before negotiating ct=4 in SETUP.
+    #[cfg(windows)]
+    let mut aac_encoder = if cfg.codec == BufferedCodecKind::Aac {
+        match crate::airplay::aac_mf::AacEncoder::new() {
+            Ok(enc) => Some(enc),
+            Err(e) => {
+                warn!("AirPlay 2: AAC encoder init failed on sender thread: {e:#}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     let started = Instant::now();
     let packet_duration =
-        Duration::from_nanos((FRAMES_PER_PACKET as u64 * 1_000_000_000) / WIRE_SAMPLE_RATE as u64);
+        Duration::from_nanos((spf as u64 * 1_000_000_000) / WIRE_SAMPLE_RATE as u64);
     let mut idle_warned = false;
     let mut anchored = false;
     // Pacing baseline — reset at the anchor so packet deadlines line up
@@ -611,7 +704,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
         // to be sent. Until anchored, don't send — the receiver has no
         // timeline for the bytes.
         if !anchored {
-            if ring.len() >= FRAMES_PER_PACKET * 2
+            if ring.len() >= spf * 2
                 && last_anchor_try.map_or(true, |t| t.elapsed() >= Duration::from_secs(1))
             {
                 last_anchor_try = Some(Instant::now());
@@ -647,56 +740,74 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
         // time, so a starved source (nothing playing on Windows) must not
         // stall rtptime — synthesize silence to keep the receiver's buffer
         // primed and the mapping intact.
-        if ring.len() < FRAMES_PER_PACKET * 2 {
+        if ring.len() < spf * 2 {
             let deadline = pace_start + packet_duration.saturating_mul((packet_count + 1) as u32);
             if Instant::now() >= deadline {
-                ring.resize(ring.len() + FRAMES_PER_PACKET * 2, 0);
+                ring.resize(ring.len() + spf * 2, 0);
             }
         }
 
         let mut packets_this_round = 0u32;
-        while ring.len() >= FRAMES_PER_PACKET * 2 {
-            let pkt_samples: Vec<i16> = ring.drain(..FRAMES_PER_PACKET * 2).collect();
-            let alac = build_uncompressed_alac_frame(&pkt_samples);
+        while ring.len() >= spf * 2 {
+            let pkt_samples: Vec<i16> = ring.drain(..spf * 2).collect();
+            // One spf-sized PCM chunk → zero or more payload frames (the
+            // AAC MFT buffers a frame or two before its first output; ALAC
+            // is always 1:1).
+            let payloads: Vec<Vec<u8>> = match cfg.codec {
+                BufferedCodecKind::Alac => vec![build_uncompressed_alac_frame(&pkt_samples)],
+                #[cfg(windows)]
+                BufferedCodecKind::Aac => match aac_encoder.as_mut().unwrap().encode(&pkt_samples) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        warn!("AirPlay 2: AAC encode failed: {e:#}");
+                        return;
+                    }
+                },
+                #[cfg(not(windows))]
+                BufferedCodecKind::Aac => unreachable!("AAC is only negotiated on Windows"),
+            };
 
-            let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
-            let sealed = seal_audio(&cfg.audio_key, &header, seq, &alac);
-            let mut packet = Vec::with_capacity(12 + sealed.len());
-            packet.extend_from_slice(&header);
-            packet.extend_from_slice(&sealed);
-            let framed = frame_buffered_packet(&packet);
+            for payload in payloads {
+                let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
+                let sealed = seal_audio(&cfg.audio_key, &header, seq, &payload);
+                let mut packet = Vec::with_capacity(12 + sealed.len());
+                packet.extend_from_slice(&header);
+                packet.extend_from_slice(&sealed);
+                let framed = frame_buffered_packet(&packet);
 
-            // Pace to wall-clock from the anchor: the receiver plays
-            // rtptime-at-anchor 0.5-1.5 s from now, so staying at the
-            // sample rate keeps its buffer bounded on both sides.
-            let deadline = pace_start + packet_duration.saturating_mul((packet_count + 1) as u32);
-            let now = Instant::now();
-            if deadline > now {
-                std::thread::sleep(deadline - now);
-            }
+                // Pace to wall-clock from the anchor: the receiver plays
+                // rtptime-at-anchor 0.5-1.5 s from now, so staying at the
+                // sample rate keeps its buffer bounded on both sides.
+                let deadline = pace_start + packet_duration.saturating_mul((packet_count + 1) as u32);
+                let now = Instant::now();
+                if deadline > now {
+                    std::thread::sleep(deadline - now);
+                }
 
-            if let Err(e) = cfg.stream.write_all(&framed) {
-                warn!("AirPlay 2 buffered send failed: {}", e);
-                return;
-            }
-            if packet_count == 0 {
-                info!(
-                    "AirPlay 2: buffered audio flowing — first packet ({} bytes framed)",
-                    framed.len()
-                );
-            }
+                if let Err(e) = cfg.stream.write_all(&framed) {
+                    warn!("AirPlay 2 buffered send failed (receiver stopped reading?): {}", e);
+                    return;
+                }
+                if packet_count == 0 {
+                    info!(
+                        "AirPlay 2: buffered {} audio flowing — first packet ({} bytes framed)",
+                        cfg.codec.label(),
+                        framed.len()
+                    );
+                }
 
-            seq = seq.wrapping_add(1);
-            rtptime = rtptime.wrapping_add(FRAMES_PER_PACKET as u32);
-            cfg.current_rtptime.store(rtptime, Ordering::Release);
-            cfg.last_seq.store(seq as u32, Ordering::Release);
-            packet_count += 1;
-            if packet_count % 500 == 0 {
-                debug!(
-                    "AirPlay 2: {} buffered packets sent ({} s)",
-                    packet_count,
-                    packet_count * FRAMES_PER_PACKET as u64 / WIRE_SAMPLE_RATE as u64
-                );
+                seq = seq.wrapping_add(1);
+                rtptime = rtptime.wrapping_add(spf as u32);
+                cfg.current_rtptime.store(rtptime, Ordering::Release);
+                cfg.last_seq.store(seq as u32, Ordering::Release);
+                packet_count += 1;
+                if packet_count % 500 == 0 {
+                    debug!(
+                        "AirPlay 2: {} buffered packets sent ({} s)",
+                        packet_count,
+                        packet_count * spf as u64 / WIRE_SAMPLE_RATE as u64
+                    );
+                }
             }
             packets_this_round += 1;
             if packets_this_round > 32 {
