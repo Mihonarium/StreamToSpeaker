@@ -121,6 +121,45 @@ impl Ap2Rtsp {
         }
     }
 
+    /// GET /info — the canonical first request of an AirPlay 2 session
+    /// (iOS sends it before pairing; spec 7.1.1). The response is a
+    /// receiver-capabilities plist; we log a couple of fields. Plaintext,
+    /// pre-pairing.
+    pub fn get_info(&mut self) -> Result<()> {
+        let extra = vec![("X-Apple-ProtocolVersion".to_string(), "1".to_string())];
+        let resp = self.request("GET", "/info", &extra, None, &[])?;
+        if resp.status != 200 {
+            bail!("GET /info → {} {}", resp.status, resp.status_text);
+        }
+        if let Ok(v) = plist::from_bytes::<Value>(&resp.body) {
+            if let Some(d) = v.as_dictionary() {
+                debug!(
+                    "AP2 /info: model={:?} srcvers={:?} ({} keys)",
+                    d.get("model").and_then(|v| v.as_string()),
+                    d.get("sourceVersion").and_then(|v| v.as_string()),
+                    d.len(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// FLUSHBUFFERED — flush the buffered stream up to (seq, ts); sent
+    /// before TEARDOWN when stopping a buffered session (spec 7.1.15;
+    /// `flushUntilSeq`/`flushUntilTS` are the required keys).
+    pub fn flush_buffered(&mut self, until_seq: u32, until_ts: u32) -> Result<()> {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("flushUntilSeq".into(), Value::Integer((until_seq as u64).into()));
+        dict.insert("flushUntilTS".into(), Value::Integer((until_ts as u64).into()));
+        let body = to_binary_plist(&Value::Dictionary(dict))?;
+        let uri = self.session_uri();
+        let resp = self.request("FLUSHBUFFERED", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
+        if resp.status != 200 {
+            bail!("FLUSHBUFFERED → {} {}", resp.status, resp.status_text);
+        }
+        Ok(())
+    }
+
     /// Run HomeKit transient pair-setup. On success the channel becomes
     /// encrypted and the 32-byte audio key is returned for the stream
     /// SETUP `shk`.

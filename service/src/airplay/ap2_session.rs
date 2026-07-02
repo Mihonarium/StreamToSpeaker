@@ -78,6 +78,10 @@ pub struct AirPlay2Session {
     event_handle: Option<JoinHandle<()>>,
     feedback_handle: Option<JoinHandle<()>>,
     ptp_session: Option<PtpMaster>,
+    /// (last sent seq, current rtptime) for the buffered stream — read at
+    /// stop() to send the spec's FLUSHBUFFERED before TEARDOWN. None for
+    /// realtime sessions.
+    buffered_flush: Option<(Arc<AtomicU32>, Arc<AtomicU32>)>,
     _audio_socket: UdpSocket,
 }
 
@@ -98,6 +102,13 @@ impl AirPlay2Session {
 
         let mut rtsp = Ap2Rtsp::connect(cfg.renderer.ip, port, cfg.local_ip, Duration::from_secs(5))
             .context("AirPlay 2 RTSP connect")?;
+
+        // Canonical opener — iOS sends GET /info before pairing. Some
+        // receivers initialise per-connection state on it; harmless
+        // everywhere else, so failure is non-fatal.
+        if let Err(e) = rtsp.get_info() {
+            warn!("AirPlay 2 GET /info failed (continuing): {:#}", e);
+        }
 
         let audio_key = rtsp
             .pair_setup_transient()
@@ -202,6 +213,7 @@ impl AirPlay2Session {
             .try_clone()
             .context("clone AP2 control socket")?;
 
+        let mut buffered_flush = None;
         let (sender_handle, timing_handle, sync_handle, resend_handle) = if buffered {
             // Buffered: audio goes over ONE TCP connection to the data
             // port; playback is anchored by SETRATEANCHORTIME on our PTP
@@ -211,6 +223,8 @@ impl AirPlay2Session {
             let stream = TcpStream::connect_timeout(&data_addr, Duration::from_secs(3))
                 .with_context(|| format!("connecting AP2 buffered data TCP to {}", data_addr))?;
             stream.set_nodelay(true).ok();
+            let last_seq = Arc::new(AtomicU32::new(initial_seq as u32));
+            buffered_flush = Some((last_seq.clone(), current_rtptime.clone()));
             let sender = spawn_ap2_buffered_sender(BufferedSenderConfig {
                 stream,
                 audio_key,
@@ -221,6 +235,7 @@ impl AirPlay2Session {
                 stop_flag: stop_flag.clone(),
                 receiver_name: cfg.renderer.friendly_name.clone(),
                 current_rtptime: current_rtptime.clone(),
+                last_seq,
             })?;
 
             // Anchor: initial_rtptime plays ANCHOR_LEAD from now on our
@@ -368,6 +383,7 @@ impl AirPlay2Session {
             event_handle,
             feedback_handle,
             ptp_session,
+            buffered_flush,
             _audio_socket: audio_socket,
         })
     }
@@ -399,6 +415,16 @@ impl AirPlay2Session {
         }
         if let Some(ptp) = self.ptp_session.take() {
             ptp.stop();
+        }
+        // Buffered sessions get the spec's FLUSHBUFFERED before TEARDOWN
+        // so the receiver drops its buffered tail instead of playing it out.
+        if let Some((seq, ts)) = self.buffered_flush.take() {
+            let mut guard = self.rtsp.lock().unwrap();
+            if let Err(e) = guard.flush_buffered(seq.load(Ordering::Acquire), ts.load(Ordering::Acquire)) {
+                debug!("AirPlay 2 FLUSHBUFFERED failed (continuing to TEARDOWN): {:#}", e);
+            }
+            guard.teardown();
+            return;
         }
         self.rtsp.lock().unwrap().teardown();
     }
@@ -506,6 +532,8 @@ struct BufferedSenderConfig {
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
     current_rtptime: Arc<AtomicU32>,
+    /// Last RTP sequence number sent — read at stop() for FLUSHBUFFERED.
+    last_seq: Arc<AtomicU32>,
 }
 
 /// Frame one sealed RTP packet for the buffered TCP stream: a 2-byte
@@ -605,6 +633,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
             seq = seq.wrapping_add(1);
             rtptime = rtptime.wrapping_add(FRAMES_PER_PACKET as u32);
             cfg.current_rtptime.store(rtptime, Ordering::Release);
+            cfg.last_seq.store(seq as u32, Ordering::Release);
             packet_count += 1;
             if packet_count % 500 == 0 {
                 debug!(
