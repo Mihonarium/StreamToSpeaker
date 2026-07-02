@@ -225,17 +225,36 @@ impl AirPlay2Session {
 
             // Anchor: initial_rtptime plays ANCHOR_LEAD from now on our
             // grandmaster timeline. Sent after the sender is running so the
-            // receiver's buffer is filling during the lead.
+            // receiver's buffer is filling during the lead. Retried: a
+            // receiver that hasn't finished locking to our PTP clock yet
+            // may 400 an anchor referencing that timeline — while we retry,
+            // the PTP master + Signaling keep running and audio keeps
+            // buffering, so a late lock still converges.
             let ptp = ptp_session.as_ref().unwrap();
-            let anchor_ns = ptp.clock.now_ns() + ANCHOR_LEAD_NS;
-            rtsp.set_rate_anchor_time(1, initial_rtptime, anchor_ns, ptp.clock_id)
-                .context("AP2 SETRATEANCHORTIME")?;
-            info!(
-                "AirPlay 2: anchored — rtpTime {} plays at +{} ms on timeline {:#018x}",
-                initial_rtptime,
-                ANCHOR_LEAD_NS / 1_000_000,
-                ptp.clock_id
-            );
+            let mut anchored = Ok(());
+            for attempt in 1..=5 {
+                let anchor_ns = ptp.clock.now_ns() + ANCHOR_LEAD_NS;
+                anchored = rtsp.set_rate_anchor_time(1, initial_rtptime, anchor_ns, ptp.clock_id);
+                match &anchored {
+                    Ok(()) => {
+                        info!(
+                            "AirPlay 2: anchored (attempt {}) — rtpTime {} plays at +{} ms on timeline {:#018x}",
+                            attempt,
+                            initial_rtptime,
+                            ANCHOR_LEAD_NS / 1_000_000,
+                            ptp.clock_id
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("AirPlay 2 SETRATEANCHORTIME attempt {}/5 failed: {:#}", attempt, e);
+                        if attempt < 5 {
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                }
+            }
+            anchored.context("AP2 SETRATEANCHORTIME")?;
             drop(timing_socket);
             drop(control_socket);
             drop(control_for_resend);

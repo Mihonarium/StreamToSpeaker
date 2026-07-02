@@ -260,7 +260,13 @@ impl Ap2Rtsp {
         let uri = self.session_uri();
         let resp = self.request("SETUP", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
         if resp.status != 200 {
-            bail!("SETUP(stream type {}) → {} {}", stream_type, resp.status, resp.status_text);
+            bail!(
+                "SETUP(stream type {}) → {} {}{}",
+                stream_type,
+                resp.status,
+                resp.status_text,
+                describe_error_body(&resp.body)
+            );
         }
         parse_stream_ports(&resp.body)
     }
@@ -272,17 +278,29 @@ impl Ap2Rtsp {
     /// is a 64-bit binary fraction of a second.
     pub fn set_rate_anchor_time(&mut self, rate: u64, rtp_time: u32, network_ns: u64, timeline_id: u64) -> Result<()> {
         let (secs, frac) = network_time_parts(network_ns);
+        debug!(
+            "AP2 SETRATEANCHORTIME: rate={} rtpTime={} secs={} frac={:#018x} timeline={:#018x}",
+            rate, rtp_time, secs, frac, timeline_id
+        );
         let mut dict = plist::Dictionary::new();
         dict.insert("rate".into(), Value::Integer(rate.into()));
         dict.insert("rtpTime".into(), Value::Integer((rtp_time as u64).into()));
         dict.insert("networkTimeSecs".into(), Value::Integer(secs.into()));
         dict.insert("networkTimeFrac".into(), Value::Integer(frac.into()));
-        dict.insert("networkTimeTimelineID".into(), Value::Integer(timeline_id.into()));
+        // Same signed cast as the SETUP `ClockID`, so both references to
+        // our timeline are byte-identical on the wire (the id has bit 63
+        // cleared, so the cast is lossless).
+        dict.insert("networkTimeTimelineID".into(), Value::Integer((timeline_id as i64).into()));
         let body = to_binary_plist(&Value::Dictionary(dict))?;
         let uri = self.session_uri();
         let resp = self.request("SETRATEANCHORTIME", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
         if resp.status != 200 {
-            bail!("SETRATEANCHORTIME → {} {}", resp.status, resp.status_text);
+            bail!(
+                "SETRATEANCHORTIME → {} {}{}",
+                resp.status,
+                resp.status_text,
+                describe_error_body(&resp.body)
+            );
         }
         Ok(())
     }
@@ -517,6 +535,20 @@ fn parse_stream_ports(body: &[u8]) -> Result<StreamPorts> {
         .map(|p| p as u16)
         .unwrap_or(data);
     Ok(StreamPorts { data, control })
+}
+
+/// Render a non-200 response body for error messages: receivers often
+/// return a plist explaining the refusal. Falls back to a short hex dump.
+fn describe_error_body(body: &[u8]) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    if let Ok(v) = plist::from_bytes::<Value>(body) {
+        return format!(" (body: {:?})", v);
+    }
+    let n = body.len().min(64);
+    let hex: String = body[..n].iter().map(|b| format!("{:02x}", b)).collect();
+    format!(" (body {}B: {}{})", body.len(), hex, if body.len() > n { "…" } else { "" })
 }
 
 /// Split a nanosecond timeline value into SETRATEANCHORTIME's

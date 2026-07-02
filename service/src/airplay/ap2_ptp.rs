@@ -147,7 +147,12 @@ pub fn spawn_ptp_master(receiver_ip: IpAddr, local_ip: IpAddr, receiver_name: St
     general.set_nonblocking(true)?;
 
     let mut rng = rand::thread_rng();
-    let clock_id: u64 = rng.gen();
+    // Keep the top bit clear: this id crosses three encodings — raw BE
+    // bytes in PTP headers, a plist Integer in the SETUP `ClockID`, and
+    // `networkTimeTimelineID` in SETRATEANCHORTIME. With bit 63 set, the
+    // signed and unsigned plist encodings diverge (i64 cast vs u64) and a
+    // strict receiver would see two different timeline ids.
+    let clock_id: u64 = rng.gen::<u64>() & 0x7FFF_FFFF_FFFF_FFFF;
     let clock_uuid = format_uuid(rng.gen());
 
     let clock = PtpMasterClock::new();
