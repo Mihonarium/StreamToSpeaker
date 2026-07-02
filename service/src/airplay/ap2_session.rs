@@ -239,6 +239,27 @@ impl AirPlay2Session {
         };
         debug!("AirPlay 2: receiver data port {}, control port {}", ports.data, ports.control);
 
+        // Open the buffered data connection straight after the stream SETUP
+        // — before SETPEERS/RECORD. Receivers hold connection state per
+        // phase (the event channel must exist before RECORD, the anchor
+        // only works at first audio), and real senders connect the data
+        // socket early too.
+        let mut data_stream: Option<TcpStream> = None;
+        let mut early_data: Option<TcpStream> = None;
+        if buffered {
+            let data_addr = SocketAddr::new(cfg.renderer.ip, ports.data);
+            let stream = TcpStream::connect_timeout(&data_addr, Duration::from_secs(3))
+                .with_context(|| format!("connecting AP2 buffered data TCP to {}", data_addr))?;
+            stream.set_nodelay(true).ok();
+            // Without a write timeout, a receiver that stops consuming
+            // fills the socket buffer and write_all blocks forever —
+            // which wedges stop() on the sender join and leaves the
+            // whole app stuck "Connecting…" with TEARDOWN never sent.
+            stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+            data_stream = stream.try_clone().ok();
+            early_data = Some(stream);
+        }
+
         if use_ptp {
             // Hand the receiver the PTP peer address list. OwnTone's order:
             // receiver's address first, then the sender's.
@@ -274,22 +295,12 @@ impl AirPlay2Session {
             .context("clone AP2 control socket")?;
 
         let mut buffered_flush = None;
-        let mut data_stream: Option<TcpStream> = None;
         let (sender_handle, timing_handle, sync_handle, resend_handle) = if buffered {
-            // Buffered: audio goes over ONE TCP connection to the data
-            // port; playback is anchored by SETRATEANCHORTIME on our PTP
-            // timeline. No sync packets, no resend (TCP is reliable), no
-            // NTP timing responder.
-            let data_addr = SocketAddr::new(cfg.renderer.ip, ports.data);
-            let stream = TcpStream::connect_timeout(&data_addr, Duration::from_secs(3))
-                .with_context(|| format!("connecting AP2 buffered data TCP to {}", data_addr))?;
-            stream.set_nodelay(true).ok();
-            // Without a write timeout, a receiver that stops consuming
-            // fills the socket buffer and write_all blocks forever —
-            // which wedges stop() on the sender join and leaves the
-            // whole app stuck "Connecting…" with TEARDOWN never sent.
-            stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
-            data_stream = stream.try_clone().ok();
+            // Buffered: audio goes over the (already-connected) TCP data
+            // connection; playback is anchored by SETRATEANCHORTIME. No
+            // sync packets, no resend (TCP is reliable), no NTP timing
+            // responder.
+            let stream = early_data.take().expect("buffered implies early data connection");
             let last_seq = Arc::new(AtomicU32::new(initial_seq as u32));
             buffered_flush = Some((last_seq.clone(), current_rtptime.clone()));
             // The anchor (SETRATEANCHORTIME) is sent by the sender thread
