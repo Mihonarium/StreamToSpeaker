@@ -1,1 +1,0 @@
-C:\Users\ceo\Downloads\tmp\symfonisk-bridge\current\driver\x64\Release\StreamToSpeaker.sys

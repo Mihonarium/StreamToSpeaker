@@ -90,7 +90,7 @@ User-machine prerequisites that aren't automatable:
 
 ## CI workflow
 
-`.github/workflows/build.yml` runs on `windows-latest` for every push, PR, and tag:
+`.github/workflows/build.yml` runs on **`windows-2022` (pinned)** for every push, PR, and tag. Do NOT move it back to `windows-latest`: that label migrated to Windows Server 2025 + VS 2026 (MSBuild 18) in June 2026, which can't load WDK 26100's MSBuild-17 task DLLs (`MSB4062: ValidateNTTargetVersion … Microsoft.DriverKit.Build.Tasks.18.0.dll not found`). Revisit only with an EWDK or a VS2026-matched WDK. Related war story: stale driver build outputs from a dev machine were once *tracked in git* (`driver/x64/**`, committed before `.gitignore` covered it) — after an msbuild failure, CI's artifact scan happily picked up the stale `.sys` (signed by the dev's personal `WDKTestCert`, mismatching the CI-generated `.cer`). They're untracked now and the build step fails fast on msbuild's exit code; if a `.sys` ever shows a `WDKTestCert <username>` signer in CI logs, something is leaking dev-machine bits again. Steps:
 
 1. Install Inno Setup (chocolatey)
 2. Restore / install WDK (cached — see workflow for keys)

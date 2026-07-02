@@ -23,7 +23,14 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Pinned: windows-latest moved to Windows Server 2025 + Visual Studio
+    # 2026 (MSBuild 18) in June 2026, whose driver-kit integration can't
+    # load our WDK's MSBuild 17 task DLLs (MSB4062 on ValidateNTTargetVersion
+    # — Microsoft.DriverKit.Build.Tasks.18.0.dll doesn't exist in WDK 26100).
+    # windows-2022 keeps VS2022/MSBuild 17 and is supported for years; see
+    # actions/runner-images#14017. Revisit with an EWDK or a VS2026-matched
+    # WDK when one ships.
+    runs-on: windows-2022
     timeout-minutes: 60
 
     steps:
@@ -253,6 +260,12 @@ jobs:
             /p:DriverBuildNumber=${{ steps.drvbuild.outputs.build }} `
             /nologo `
             /verbosity:minimal
+          # Fail fast on msbuild errors. Without this, the artifact scan
+          # below could pick up stale bits and the step only failed at the
+          # very end via the shell's trailing $LASTEXITCODE check.
+          if ($LASTEXITCODE -ne 0) {
+              throw "msbuild failed with exit code $LASTEXITCODE"
+          }
           if (-not (Test-Path "driver\x64\Release\StreamToSpeaker\StreamToSpeaker.sys")) {
               Get-ChildItem -Recurse driver\x64\Release\ | Select-Object FullName
               throw "Driver .sys not produced where expected"
