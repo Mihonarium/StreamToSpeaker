@@ -40,7 +40,7 @@ use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use rand::Rng;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -117,6 +117,11 @@ pub struct PtpMaster {
     pub clock_id: u64,
     /// UUID string for the RTSP `timingPeerInfo.ID` field.
     pub clock_uuid: String,
+    /// The grandmaster identity the *receiver* announces (0 until its
+    /// first Announce arrives). Receivers act as masters of their own
+    /// timeline in Apple's PTP model; exposing theirs lets the session
+    /// try anchoring against it if anchors on our clock are refused.
+    pub peer_clock_id: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -157,20 +162,22 @@ pub fn spawn_ptp_master(receiver_ip: IpAddr, local_ip: IpAddr, receiver_name: St
 
     let clock = PtpMasterClock::new();
     let stop = Arc::new(AtomicBool::new(false));
+    let peer_clock_id = Arc::new(AtomicU64::new(0));
 
     let clock_t = clock.clone();
     let stop_t = stop.clone();
+    let peer_t = peer_clock_id.clone();
     let handle = thread::Builder::new()
         .name(format!("stream-to-speaker-ap2-ptp:{}", receiver_name))
         .spawn(move || {
-            run_master(event, general, receiver_ip, clock_id, clock_t, stop_t);
+            run_master(event, general, receiver_ip, clock_id, clock_t, peer_t, stop_t);
         })?;
 
     info!(
         "AirPlay 2 PTP: serving as grandmaster for {} (clock_id={:#018x})",
         receiver_ip, clock_id
     );
-    Ok(PtpMaster { clock, clock_id, clock_uuid, stop, handle: Some(handle) })
+    Ok(PtpMaster { clock, clock_id, clock_uuid, peer_clock_id, stop, handle: Some(handle) })
 }
 
 fn bind_ptp(local_ip: IpAddr, port: u16) -> Result<UdpSocket> {
@@ -192,6 +199,7 @@ fn run_master(
     receiver_ip: IpAddr,
     clock_id: u64,
     clock: Arc<PtpMasterClock>,
+    peer_clock_id: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let event_dst = SocketAddr::new(receiver_ip, PTP_EVENT_PORT);
@@ -280,6 +288,17 @@ fn run_master(
             rx_total += 1;
             if let Some(h) = parse_header(&buf[..n]) {
                 note_inbound(&mut seen_types, h.msg_type, PTP_GENERAL_PORT, src);
+                if h.msg_type == 0xB {
+                    if let Some((gm, class)) = parse_announce_grandmaster(&buf[..n]) {
+                        let prev = peer_clock_id.swap(gm, Ordering::AcqRel);
+                        if prev != gm {
+                            info!(
+                                "AirPlay 2 PTP: receiver announces its own clock {:#018x} (clockClass {})",
+                                gm, class
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -478,6 +497,20 @@ fn write_timestamp(out: &mut Vec<u8>, ns: u64) {
     out.extend_from_slice(&nanos.to_be_bytes());
 }
 
+/// Pull (grandmasterIdentity, clockClass) out of an inbound Announce.
+/// Body offsets after the 34-byte header: originTimestamp(10),
+/// currentUtcOffset(2), reserved(1), priority1(1), clockQuality(4),
+/// priority2(1), grandmasterIdentity(8).
+fn parse_announce_grandmaster(buf: &[u8]) -> Option<(u64, u8)> {
+    if buf.len() < HEADER_LEN + 30 {
+        return None;
+    }
+    let class = buf[HEADER_LEN + 14];
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&buf[HEADER_LEN + 19..HEADER_LEN + 27]);
+    Some((u64::from_be_bytes(id), class))
+}
+
 /// Read a 10-byte PTP timestamp at `off`, returning ns.
 #[cfg(test)]
 fn read_timestamp(buf: &[u8], off: usize) -> Option<u64> {
@@ -572,6 +605,15 @@ mod tests {
         assert_eq!(&sig[77..80], &[0x00, 0x00, 0x05]);
         assert_eq!(&sig[80..84], &[0x00, 0x00, 0x03, 0x01]);
         assert!(sig[84..106].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn announce_grandmaster_roundtrips_through_parser() {
+        let id = 0x0123456789ABCDEFu64;
+        let ann = build_announce(id, 3);
+        let (gm, class) = parse_announce_grandmaster(&ann).unwrap();
+        assert_eq!(gm, id);
+        assert_eq!(class, 0x06);
     }
 
     #[test]

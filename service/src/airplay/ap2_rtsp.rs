@@ -289,8 +289,12 @@ impl Ap2Rtsp {
         dict.insert("networkTimeFrac".into(), Value::Integer(frac.into()));
         // Same signed cast as the SETUP `ClockID`, so both references to
         // our timeline are byte-identical on the wire (the id has bit 63
-        // cleared, so the cast is lossless).
+        // cleared, so the cast is lossless). Real-world receivers disagree
+        // on this key's name — shairport-sync reads `networkTimeTimelineID`,
+        // goplay2 reads `networkTimeId` — so send both; plist consumers
+        // ignore keys they don't read.
         dict.insert("networkTimeTimelineID".into(), Value::Integer((timeline_id as i64).into()));
+        dict.insert("networkTimeId".into(), Value::Integer((timeline_id as i64).into()));
         let body = to_binary_plist(&Value::Dictionary(dict))?;
         let uri = self.session_uri();
         let resp = self.request("SETRATEANCHORTIME", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;

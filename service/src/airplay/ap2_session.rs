@@ -232,17 +232,33 @@ impl AirPlay2Session {
             // buffering, so a late lock still converges.
             let ptp = ptp_session.as_ref().unwrap();
             let mut anchored = Ok(());
-            for attempt in 1..=5 {
-                let anchor_ns = ptp.clock.now_ns() + ANCHOR_LEAD_NS;
-                anchored = rtsp.set_rate_anchor_time(1, initial_rtptime, anchor_ns, ptp.clock_id);
+            for attempt in 1..=5u32 {
+                // Round the anchor up to the next whole second: the frac
+                // field becomes 0, sidestepping any receiver-side parser
+                // quirks with huge unsigned fractions, and the effective
+                // lead stays in [0.5 s, 1.5 s].
+                let raw = ptp.clock.now_ns() + ANCHOR_LEAD_NS;
+                let anchor_ns = raw.div_ceil(1_000_000_000) * 1_000_000_000;
+                // Attempts 1-3 anchor on OUR grandmaster clock (the model
+                // shairport-sync implements). If those are refused, 4-5
+                // are an experiment: anchor on the clock the RECEIVER
+                // announces — some receivers may treat themselves as the
+                // session grandmaster. Whichever succeeds reveals the
+                // timeline model; both are logged.
+                let peer = ptp.peer_clock_id.load(Ordering::Acquire);
+                let timeline = if attempt <= 3 || peer == 0 { ptp.clock_id } else { peer };
+                if timeline == peer && peer != 0 {
+                    warn!(
+                        "AirPlay 2: experiment — anchoring on the RECEIVER's clock {:#018x}",
+                        peer
+                    );
+                }
+                anchored = rtsp.set_rate_anchor_time(1, initial_rtptime, anchor_ns, timeline);
                 match &anchored {
                     Ok(()) => {
                         info!(
-                            "AirPlay 2: anchored (attempt {}) — rtpTime {} plays at +{} ms on timeline {:#018x}",
-                            attempt,
-                            initial_rtptime,
-                            ANCHOR_LEAD_NS / 1_000_000,
-                            ptp.clock_id
+                            "AirPlay 2: anchored (attempt {}) — rtpTime {} on timeline {:#018x}",
+                            attempt, initial_rtptime, timeline
                         );
                         break;
                     }
