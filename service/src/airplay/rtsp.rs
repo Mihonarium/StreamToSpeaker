@@ -78,6 +78,11 @@ pub struct RtspClient {
     /// Session token returned by the server in the SETUP response;
     /// echoed in every subsequent request's Session header.
     pub session_token: Option<String>,
+    /// True once ANNOUNCE succeeded — the receiver now holds session
+    /// state that must be TEARDOWNed even if a later step fails.
+    announced: bool,
+    /// True once TEARDOWN has been sent (makes it idempotent).
+    torn_down: bool,
 }
 
 impl RtspClient {
@@ -96,7 +101,9 @@ impl RtspClient {
         stream.set_write_timeout(Some(timeout))?;
 
         let mut rng = rand::thread_rng();
-        let session_id: u64 = rng.gen();
+        // 32-bit id: iTunes uses u32-range session ids (capture:
+        // 3865844950); some receivers plausibly parse it as one.
+        let session_id: u64 = rng.gen::<u32>() as u64;
         let client_instance = format!("{:016X}", rng.gen::<u64>());
         let dacp_id = format!("{:016X}", rng.gen::<u64>());
         let active_remote = format!("{}", rng.gen::<u32>());
@@ -111,6 +118,8 @@ impl RtspClient {
             dacp_id,
             active_remote,
             session_token: None,
+            announced: false,
+            torn_down: false,
         })
     }
 
@@ -172,11 +181,15 @@ impl RtspClient {
             }
         };
 
+        // `c=` carries the SENDER address — node_airtunes2 and the
+        // PulseAudio/PipeWire RAOP sinks all do this (we previously sent
+        // the receiver's, which shairport tolerates but stricter stacks
+        // may not).
         let sdp = format!(
             "v=0\r\n\
              o=iTunes {sid} 0 IN IP4 {local}\r\n\
              s=iTunes\r\n\
-             c=IN IP4 {receiver}\r\n\
+             c=IN IP4 {local}\r\n\
              t=0 0\r\n\
              m=audio 0 RTP/AVP 96\r\n\
              a=rtpmap:96 AppleLossless\r\n\
@@ -184,7 +197,6 @@ impl RtspClient {
              {crypto}",
             sid = self.session_id,
             local = self.local_ip,
-            receiver = self.receiver_ip,
             crypto = crypto_lines,
         );
 
@@ -206,6 +218,7 @@ impl RtspClient {
         if resp.status_code != 200 {
             bail!("ANNOUNCE failed: {} {}", resp.status_code, resp.status_text);
         }
+        self.announced = true;
         Ok(())
     }
 
@@ -341,6 +354,10 @@ impl RtspClient {
     /// time out anyway. We swallow errors so a half-broken receiver
     /// doesn't block shutdown.
     pub fn teardown(&mut self) {
+        if self.torn_down {
+            return;
+        }
+        self.torn_down = true;
         let uri = self.session_uri();
         if let Err(e) = self.request("TEARDOWN", &uri, &[], "") {
             warn!("RTSP TEARDOWN failed (continuing anyway): {}", e);
@@ -425,6 +442,18 @@ impl RtspClient {
         self.stream.write_all(&raw)?;
         self.stream.flush()?;
         read_response(&mut self.stream)
+    }
+}
+
+impl Drop for RtspClient {
+    /// A session abandoned mid-bring-up (e.g. SETUP timed out) must still
+    /// TEARDOWN: the receiver holds the announced session for tens of
+    /// seconds otherwise, and every retry in that window — including the
+    /// AirPlay 2 fallback on the same port — times out.
+    fn drop(&mut self) {
+        if self.announced && !self.torn_down {
+            self.teardown();
+        }
     }
 }
 
