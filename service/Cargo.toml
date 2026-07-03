@@ -60,6 +60,9 @@ aes = { version = "0.8", default-features = false }
 cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
 # Hash for RSA-OAEP MGF1 — RAOP locks this to SHA-1 (legacy).
 sha1 = { version = "0.10", default-features = false }
+# MD5 for RTSP Digest auth (RFC 2617) to password-protected AirPlay
+# receivers — mirrors OwnTone's raop_add_auth exactly.
+md-5 = { version = "0.10", default-features = false }
 # Base64 for SDP attributes + Apple-Challenge response.
 base64 = "0.22"
 # RNG for AES key + IV + RTP SSRC + Apple-Challenge nonces.

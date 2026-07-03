@@ -138,12 +138,15 @@ impl AirPlayRenderer {
     /// port, ALAC, no password, and either no-encryption or Apple-RSA
     /// (i.e. not a FairPlay-only `et`).
     pub fn supports_legacy_raop(&self) -> bool {
-        if self.password_protected || self.port == 0 {
+        if self.port == 0 {
             return false;
         }
         if !self.codecs.contains(&1) {
             return false;
         }
+        // Password-protected (`pw=true`) receivers ARE supported — we
+        // speak RTSP Digest auth (the session uses the stored password,
+        // or the UI prompts for one).
         self.encryption_types.contains(&0) || self.encryption_types.contains(&1)
     }
 

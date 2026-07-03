@@ -857,6 +857,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 tray,
                 frame_count: 0,
                 confirm_close_open: false,
+                password_prompt: None,
                 skip_close_confirmation,
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
@@ -885,6 +886,9 @@ struct StreamToSpeakerApp {
     theme_mode: ThemeMode,
     advanced_open: bool,
     onboarding_dismissed: bool,
+    /// Open when the user is entering a password for a `pw=true` AirPlay
+    /// speaker. `None` when no prompt is showing.
+    password_prompt: Option<PasswordPrompt>,
     /// Whether the theme is currently applied as dark. None until first
     /// apply. We re-apply only when this disagrees with the resolved
     /// mode — apply_theme rebuilds the full Style+Visuals every call
@@ -1053,11 +1057,14 @@ impl eframe::App for StreamToSpeakerApp {
         if self.confirm_close_open {
             self.show_close_modal(ctx, &p);
         }
+        if self.password_prompt.is_some() {
+            self.show_password_modal(ctx, &p);
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(p.canvas).inner_margin(sp::M))
             .show(ctx, |ui| {
-                let enabled = !self.confirm_close_open;
+                let enabled = !self.confirm_close_open && self.password_prompt.is_none();
                 ui.add_enabled_ui(enabled, |ui| {
                     // Keep the header pinned at the top (theme toggle
                     // shouldn't scroll away); everything below scrolls
@@ -1777,7 +1784,7 @@ impl StreamToSpeakerApp {
             });
     }
 
-    fn show_speakers(&self, ui: &mut egui::Ui, p: &Palette) {
+    fn show_speakers(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
             ui.horizontal(|ui| {
                 section_label(ui, p, "Speakers");
@@ -1928,12 +1935,23 @@ impl StreamToSpeakerApp {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for sp in view.speakers {
+                        let mut prompt_for: Option<(String, String)> = None;
                         speaker_row(ui, p, &sp, |id| {
-                            // Bring-up does seconds of network I/O —
-                            // run it off-thread; the status banner shows
-                            // "Connecting…" and errors arrive as toasts.
-                            self.app.select_speaker_async(id);
+                            // Password-protected speaker → collect the
+                            // password first (pre-fill any stored one).
+                            if self.app.is_password_protected(id) {
+                                prompt_for = Some((id.to_string(), sp.friendly_name.clone()));
+                            } else {
+                                // Bring-up does seconds of network I/O —
+                                // run it off-thread; the status banner shows
+                                // "Connecting…" and errors arrive as toasts.
+                                self.app.select_speaker_async(id);
+                            }
                         });
+                        if let Some((id, name)) = prompt_for {
+                            let input = self.app.airplay_password(&id).unwrap_or_default();
+                            self.password_prompt = Some(PasswordPrompt { id, name, input });
+                        }
                     }
                 });
 
@@ -2519,6 +2537,85 @@ impl StreamToSpeakerApp {
             }
         }
     }
+
+    /// Password entry modal for a `pw=true` AirPlay speaker. On confirm it
+    /// stores the password (so it's remembered) and kicks off the
+    /// background connect; a wrong password surfaces as an error toast and
+    /// the user can click the speaker again to re-enter.
+    fn show_password_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(prompt) = self.password_prompt.as_mut() else {
+            return;
+        };
+
+        let mut still_open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+
+        let title = format!("Password for {}", prompt.name);
+        egui::Window::new(egui::RichText::new(title).strong().color(p.text_primary))
+            .open(&mut still_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(420.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(p.card)
+                    .stroke(egui::Stroke::new(1.0, p.divider))
+                    .rounding(RADIUS_SURFACE)
+                    .inner_margin(sp::MODAL),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "This speaker requires an AirPlay password. Enter it to connect — \
+                         it'll be remembered for next time.",
+                    )
+                    .color(p.text_secondary),
+                );
+                ui.add_space(sp::S);
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut prompt.input)
+                        .password(true)
+                        .hint_text("AirPlay password")
+                        .desired_width(f32::INFINITY),
+                );
+                // Focus the field when the modal opens; Enter confirms.
+                if !edit.has_focus() && !ctx.memory(|m| m.focused().is_some()) {
+                    edit.request_focus();
+                }
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    confirm = true;
+                }
+                ui.add_space(sp::M);
+                ui.horizontal(|ui| {
+                    if primary_button(ui, p, "Connect", 120.0).clicked() {
+                        confirm = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if secondary_button(ui, p, "Cancel", 96.0).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+
+        if !still_open {
+            cancel = true;
+        }
+        if confirm {
+            if let Some(prompt) = self.password_prompt.take() {
+                self.app.set_airplay_password(&prompt.id, prompt.input.trim());
+                self.app.select_speaker_async(&prompt.id);
+            }
+        } else if cancel {
+            self.password_prompt = None;
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -2526,6 +2623,16 @@ enum CloseAction {
     MinimiseToTray,
     Quit,
     Cancel,
+}
+
+/// State for the AirPlay password entry modal.
+struct PasswordPrompt {
+    /// Stable id of the speaker being connected to.
+    id: String,
+    /// Friendly name, for the dialog title.
+    name: String,
+    /// The password the user is typing.
+    input: String,
 }
 
 // -----------------------------------------------------------------------------

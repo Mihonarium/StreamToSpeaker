@@ -347,6 +347,33 @@ impl App {
         self.user_config.lock().unwrap().auto_reconnect_on_drop
     }
 
+    /// The stored AirPlay password for a device id, if any.
+    pub fn airplay_password(&self, id: &str) -> Option<String> {
+        self.user_config.lock().unwrap().airplay_passwords.get(id).cloned()
+    }
+
+    /// Store (or clear, when `pw` is empty) the AirPlay password for a
+    /// device id and persist it.
+    pub fn set_airplay_password(&self, id: &str, pw: &str) {
+        let mut uc = self.user_config.lock().unwrap();
+        if pw.is_empty() {
+            uc.airplay_passwords.remove(id);
+        } else {
+            uc.airplay_passwords.insert(id.to_string(), pw.to_string());
+        }
+        uc.save();
+    }
+
+    /// Whether a discovered device is password-protected (needs a
+    /// password entered before it can connect).
+    pub fn is_password_protected(&self, id: &str) -> bool {
+        self.airplay_discovery
+            .as_ref()
+            .and_then(|d| d.find_by_id(id))
+            .map(|r| r.password_protected)
+            .unwrap_or(false)
+    }
+
     /// Whether to forward Windows "now playing" to the speaker.
     pub fn is_forward_now_playing(&self) -> bool {
         self.user_config.lock().unwrap().forward_now_playing
@@ -432,15 +459,18 @@ impl App {
                 // Annotate the row so the user can tell which protocol a
                 // click will use (Sonos advertises both UPnP and AirPlay)
                 // and why an unsupported one might fail.
+                let pw = if r.password_protected { ", password" } else { "" };
                 let name = match transport {
                     Some(Transport::RaopLegacy) if has_upnp_twin => {
-                        format!("{} (AirPlay, higher delay)", r.friendly_name)
+                        format!("{} (AirPlay, higher delay{})", r.friendly_name, pw)
                     }
                     Some(Transport::AirPlay2) if has_upnp_twin => {
-                        format!("{} (AirPlay 2, higher delay)", r.friendly_name)
+                        format!("{} (AirPlay 2, higher delay{})", r.friendly_name, pw)
                     }
-                    Some(Transport::RaopLegacy) => format!("{} (AirPlay)", r.friendly_name),
-                    Some(Transport::AirPlay2) => format!("{} (AirPlay 2)", r.friendly_name),
+                    Some(Transport::RaopLegacy) => {
+                        format!("{} (AirPlay{})", r.friendly_name, pw)
+                    }
+                    Some(Transport::AirPlay2) => format!("{} (AirPlay 2{})", r.friendly_name, pw),
                     None if r.password_protected => {
                         format!("{} (AirPlay, password-protected)", r.friendly_name)
                     }
@@ -880,14 +910,6 @@ impl App {
         // devices all just work.
         let attempts = self.airplay_attempts(&renderer, discovery);
         if attempts.is_empty() {
-            // Give the user the actionable reason rather than a raw field dump.
-            if renderer.password_protected {
-                return Err(format!(
-                    "{} is password-protected. Password (RTSP Digest) auth isn't \
-                     supported yet — remove the speaker's AirPlay password to use it.",
-                    renderer.friendly_name,
-                ));
-            }
             return Err(format!(
                 "{} doesn't advertise an AirPlay path we can use \
                  (codecs={:?}, et={:?}, features={:?}). If it's an Apple TV, it may \
@@ -986,9 +1008,13 @@ impl App {
         match transport {
             Transport::RaopLegacy => {
                 let samples_rx = self.hub.subscribe();
-                let (mfi_encryption, uncompressed_alac) = {
+                let (mfi_encryption, uncompressed_alac, password) = {
                     let uc = self.user_config.lock().unwrap();
-                    (uc.airplay_mfi_encryption, uc.airplay_uncompressed_alac)
+                    (
+                        uc.airplay_mfi_encryption,
+                        uc.airplay_uncompressed_alac,
+                        uc.airplay_passwords.get(&renderer.stable_id()).cloned(),
+                    )
                 };
                 let session = AirPlaySession::start(AirPlaySessionConfig {
                     renderer,
@@ -1001,6 +1027,7 @@ impl App {
                     connect_timeout: Duration::from_secs(3),
                     mfi_encryption,
                     uncompressed_alac,
+                    password,
                 })
                 .map_err(|e| format!("{:#}", e))?;
                 Ok(ActiveSession::AirPlay(session))

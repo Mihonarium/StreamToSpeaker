@@ -74,6 +74,9 @@ pub struct AirPlaySessionConfig {
     /// Debug escape hatch: send uncompressed-ALAC escape frames instead
     /// of real compressed ALAC. See `rtp.rs` module docs.
     pub uncompressed_alac: bool,
+    /// AirPlay password for a `pw=true` receiver (RTSP Digest auth).
+    /// `None` for the common unprotected case.
+    pub password: Option<String>,
 }
 
 /// Live AirPlay session.
@@ -219,11 +222,16 @@ impl AirPlaySession {
         // (0x01 + X25519), not OPTIONS + Apple-Challenge. MFi/AP2 devices
         // get auth-setup; plain legacy receivers keep OPTIONS.
         let attempt = |try_mfi: bool| -> Result<(RtspClient, Cipher, ServerPorts, u32)> {
-            let mut rtsp = RtspClient::connect(
+            // Password-protected receivers get RTSP Digest credentials;
+            // the gen-1 AirPort Express (no `am` model) uses the iTunes
+            // digest quirk (username "iTunes" + uppercase hex).
+            let mut rtsp = RtspClient::connect_auth(
                 cfg.renderer.ip,
                 cfg.renderer.port,
                 cfg.local_ip,
                 cfg.connect_timeout,
+                cfg.password.clone(),
+                cfg.renderer.model.is_none(),
             )
             .context("opening RTSP connection")?;
 

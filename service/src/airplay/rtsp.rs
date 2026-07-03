@@ -90,6 +90,18 @@ pub struct RtspClient {
     /// request fails fast — the periodic keepalive surfaces it and the
     /// session is effectively dead.
     poisoned: bool,
+    /// RTSP Digest auth (RFC 2617) for password-protected receivers.
+    /// `password` comes from config/UI; `realm`/`nonce` are learned from
+    /// the first `401 WWW-Authenticate`. Once we have all three, every
+    /// request carries an `Authorization: Digest …` header (mirrors
+    /// OwnTone, which re-adds it on every request).
+    password: Option<String>,
+    realm: Option<String>,
+    nonce: Option<String>,
+    /// gen-1 AirPort Express digest quirk: username `"iTunes"` +
+    /// uppercase hex. Set when the device advertises no `am` model —
+    /// exactly OwnTone's `RAOP_DEV_APEX1_80211G` detection.
+    auth_quirk_itunes: bool,
 }
 
 impl RtspClient {
@@ -100,6 +112,21 @@ impl RtspClient {
         port: u16,
         local_ip: IpAddr,
         timeout: Duration,
+    ) -> Result<Self> {
+        Self::connect_auth(receiver_ip, port, local_ip, timeout, None, false)
+    }
+
+    /// [`connect`](Self::connect) with RTSP Digest credentials for a
+    /// password-protected receiver. `password` is the AirPlay password;
+    /// `auth_quirk_itunes` selects the gen-1 AirPort Express digest
+    /// convention (username `"iTunes"` + uppercase hex).
+    pub fn connect_auth(
+        receiver_ip: IpAddr,
+        port: u16,
+        local_ip: IpAddr,
+        timeout: Duration,
+        password: Option<String>,
+        auth_quirk_itunes: bool,
     ) -> Result<Self> {
         let addr = SocketAddr::new(receiver_ip, port);
         let stream = TcpStream::connect_timeout(&addr, timeout)
@@ -128,7 +155,58 @@ impl RtspClient {
             announced: false,
             torn_down: false,
             poisoned: false,
+            password,
+            realm: None,
+            nonce: None,
+            auth_quirk_itunes,
         })
+    }
+
+    /// Compute the `Authorization: Digest …` value for one request, if we
+    /// have learned a realm/nonce and hold a password. `None` otherwise.
+    fn auth_header(&self, method: &str, uri: &str) -> Option<String> {
+        let realm = self.realm.as_deref()?;
+        let nonce = self.nonce.as_deref()?;
+        let password = self.password.as_deref()?;
+        let username = if self.auth_quirk_itunes { "iTunes" } else { "" };
+        Some(crate::airplay::crypto::digest_auth_header(
+            username,
+            realm,
+            nonce,
+            password,
+            method,
+            uri,
+            self.auth_quirk_itunes,
+        ))
+    }
+
+    /// Parse `WWW-Authenticate: Digest realm="…", nonce="…"` from a 401
+    /// response into `self.realm`/`self.nonce`. Returns true on success.
+    fn parse_auth_challenge(&mut self, resp: &RtspResponse) -> bool {
+        let Some(hdr) = resp.headers.get("www-authenticate") else {
+            return false;
+        };
+        let Some(rest) = hdr.strip_prefix("Digest ") else {
+            return false;
+        };
+        let mut realm = None;
+        let mut nonce = None;
+        for part in rest.split(',') {
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix("realm=") {
+                realm = Some(v.trim().trim_matches('"').to_string());
+            } else if let Some(v) = part.strip_prefix("nonce=") {
+                nonce = Some(v.trim().trim_matches('"').to_string());
+            }
+        }
+        match (realm, nonce) {
+            (Some(r), Some(n)) if !r.is_empty() && !n.is_empty() => {
+                self.realm = Some(r);
+                self.nonce = Some(n);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Construct the per-session URI used in ANNOUNCE/SETUP/RECORD/TEARDOWN.
@@ -430,6 +508,9 @@ impl RtspClient {
         head.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
         head.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
         head.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
+        if let Some(auth) = self.auth_header("SET_PARAMETER", &uri) {
+            head.push_str(&format!("Authorization: {}\r\n", auth));
+        }
         if let Some(token) = &self.session_token {
             head.push_str(&format!("Session: {}\r\n", token));
         }
@@ -496,6 +577,11 @@ impl RtspClient {
 
     /// Like [`request`](Self::request) but with control over whether the
     /// Session header is attached. iTunes omits it on OPTIONS keepalives.
+    ///
+    /// Handles RTSP Digest auth transparently: once a realm/nonce is
+    /// known each request carries the `Authorization` header, and a
+    /// `401` on the first (un-authed) attempt triggers a challenge parse
+    /// + one retry — mirroring OwnTone's re-run-with-auth flow.
     fn request_opts(
         &mut self,
         method: &str,
@@ -504,36 +590,70 @@ impl RtspClient {
         body: &str,
         include_session: bool,
     ) -> Result<RtspResponse> {
-        self.cseq += 1;
-        let mut req = String::new();
-        req.push_str(&format!("{} {} RTSP/1.0\r\n", method, uri));
-        req.push_str(&format!("CSeq: {}\r\n", self.cseq));
-        req.push_str(&format!("User-Agent: {}\r\n", RTSP_USER_AGENT));
-        req.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
-        req.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
-        req.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
-        if include_session {
-            if let Some(token) = &self.session_token {
-                req.push_str(&format!("Session: {}\r\n", token));
+        for attempt in 0..2 {
+            self.cseq += 1;
+            let mut req = String::new();
+            req.push_str(&format!("{} {} RTSP/1.0\r\n", method, uri));
+            req.push_str(&format!("CSeq: {}\r\n", self.cseq));
+            req.push_str(&format!("User-Agent: {}\r\n", RTSP_USER_AGENT));
+            req.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
+            req.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
+            req.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
+            if let Some(auth) = self.auth_header(method, uri) {
+                req.push_str(&format!("Authorization: {}\r\n", auth));
+            }
+            if include_session {
+                if let Some(token) = &self.session_token {
+                    req.push_str(&format!("Session: {}\r\n", token));
+                }
+            }
+            for (k, v) in extra_headers {
+                req.push_str(&format!("{}: {}\r\n", k, v));
+            }
+            if !body.is_empty() {
+                req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            }
+            req.push_str("\r\n");
+            req.push_str(body);
+
+            debug!(
+                "RTSP > {} {} (CSeq={}, body={}B)",
+                method,
+                uri,
+                self.cseq,
+                body.len()
+            );
+            let resp = self.send_and_read(req.as_bytes())?;
+            if let Some(r) = self.handle_auth(resp, attempt)? {
+                return Ok(r);
             }
         }
-        for (k, v) in extra_headers {
-            req.push_str(&format!("{}: {}\r\n", k, v));
-        }
-        if !body.is_empty() {
-            req.push_str(&format!("Content-Length: {}\r\n", body.len()));
-        }
-        req.push_str("\r\n");
-        req.push_str(body);
+        unreachable!("auth retry loop always returns")
+    }
 
-        debug!(
-            "RTSP > {} {} (CSeq={}, body={}B)",
-            method,
-            uri,
-            self.cseq,
-            body.len()
+    /// Shared 401 handling for the request builders. Returns `Some(resp)`
+    /// to hand back to the caller, or `None` to retry the request (now
+    /// with the just-learned credentials).
+    fn handle_auth(&mut self, resp: RtspResponse, attempt: usize) -> Result<Option<RtspResponse>> {
+        if resp.status_code != 401 {
+            return Ok(Some(resp));
+        }
+        // First 401: parse the challenge and retry with auth.
+        if attempt == 0 && self.parse_auth_challenge(&resp) {
+            if self.password.is_none() {
+                bail!(
+                    "{} is password-protected — a password is required",
+                    self.receiver_ip
+                );
+            }
+            return Ok(None); // retry
+        }
+        // Second 401 (we already sent auth) or an unparseable challenge:
+        // the password is wrong (or the scheme unsupported).
+        bail!(
+            "authentication failed for {} — wrong AirPlay password?",
+            self.receiver_ip
         );
-        self.send_and_read(req.as_bytes())
     }
 
     /// Like [`request`](Self::request) but with a binary body — used for
@@ -545,30 +665,39 @@ impl RtspClient {
         content_type: &str,
         body: &[u8],
     ) -> Result<RtspResponse> {
-        self.cseq += 1;
-        let mut head = String::new();
-        head.push_str(&format!("{} {} RTSP/1.0\r\n", method, uri));
-        head.push_str(&format!("CSeq: {}\r\n", self.cseq));
-        head.push_str(&format!("User-Agent: {}\r\n", RTSP_USER_AGENT));
-        head.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
-        head.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
-        head.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
-        if let Some(token) = &self.session_token {
-            head.push_str(&format!("Session: {}\r\n", token));
-        }
-        head.push_str(&format!("Content-Type: {}\r\n", content_type));
-        head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        for attempt in 0..2 {
+            self.cseq += 1;
+            let mut head = String::new();
+            head.push_str(&format!("{} {} RTSP/1.0\r\n", method, uri));
+            head.push_str(&format!("CSeq: {}\r\n", self.cseq));
+            head.push_str(&format!("User-Agent: {}\r\n", RTSP_USER_AGENT));
+            head.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
+            head.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
+            head.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
+            if let Some(auth) = self.auth_header(method, uri) {
+                head.push_str(&format!("Authorization: {}\r\n", auth));
+            }
+            if let Some(token) = &self.session_token {
+                head.push_str(&format!("Session: {}\r\n", token));
+            }
+            head.push_str(&format!("Content-Type: {}\r\n", content_type));
+            head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
 
-        debug!(
-            "RTSP > {} {} (CSeq={}, body={}B)",
-            method,
-            uri,
-            self.cseq,
-            body.len()
-        );
-        let mut raw = head.into_bytes();
-        raw.extend_from_slice(body);
-        self.send_and_read(&raw)
+            debug!(
+                "RTSP > {} {} (CSeq={}, body={}B)",
+                method,
+                uri,
+                self.cseq,
+                body.len()
+            );
+            let mut raw = head.into_bytes();
+            raw.extend_from_slice(body);
+            let resp = self.send_and_read(&raw)?;
+            if let Some(r) = self.handle_auth(resp, attempt)? {
+                return Ok(r);
+            }
+        }
+        unreachable!("auth retry loop always returns")
     }
 
     /// Write a fully-serialised request and read its response, with two

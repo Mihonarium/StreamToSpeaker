@@ -11,6 +11,7 @@
 //!     subsequent launches.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
@@ -57,6 +58,12 @@ pub struct UserConfig {
     /// tries MFi first and falls back to plaintext/RSA on failure.
     #[serde(default)]
     pub airplay_mfi_encryption: bool,
+    /// Per-device AirPlay passwords for `pw=true` receivers, keyed by the
+    /// device's stable id (`airplay:<mac>`). Stored so the user only
+    /// enters it once. Plain-text in the config file (same trust level as
+    /// the rest of the file); RTSP Digest never sends it in the clear.
+    #[serde(default)]
+    pub airplay_passwords: HashMap<String, String>,
     /// Forward Windows' "now playing" (title/artist/album from the System
     /// Media Transport Controls) to the speaker as track metadata, so it
     /// shows on the speaker's display / app. **Off by default** — it's a
