@@ -27,9 +27,26 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 
 use crate::airplay::ap2_crypto::{ChannelCipher, SessionKeys, TAG_LEN};
+use crate::airplay::hap_pairing::{PairSetupPin, PairVerify, PairingCredentials, X_APPLE_HKP_PERSISTENT};
 use crate::airplay::pairing::{TransientPairing, X_APPLE_HKP_VALUE};
 
 const USER_AGENT: &str = "AirPlay/665.13.1";
+
+/// RTSP status code AirPlay 2 receivers return when they refuse transient
+/// pairing and require PIN (persistent HomeKit) verification — an Apple TV
+/// with access control. OwnTone calls this `RTSP_CONNECTION_AUTH_REQUIRED`
+/// and switches `pair_type` to `PAIR_CLIENT_HOMEKIT_NORMAL`.
+const RTSP_CONNECTION_AUTH_REQUIRED: u16 = 470;
+
+/// Outcome of an attempted transient pair-setup.
+pub enum TransientOutcome {
+    /// Paired — the channel is now encrypted; carries the 32-byte audio key.
+    Paired([u8; 32]),
+    /// The receiver returned 470: it requires one-time PIN pairing. The
+    /// caller runs the pin_start → pair_setup_pin ceremony, then reconnects
+    /// and pair-verifies.
+    NeedsPin,
+}
 
 /// Ports the receiver assigned for the audio stream (from the second
 /// SETUP response).
@@ -169,14 +186,21 @@ impl Ap2Rtsp {
 
     /// Run HomeKit transient pair-setup. On success the channel becomes
     /// encrypted and the 32-byte audio key is returned for the stream
-    /// SETUP `shk`.
-    pub fn pair_setup_transient(&mut self) -> Result<[u8; 32]> {
+    /// SETUP `shk`. A 470 on the first request means the receiver refuses
+    /// transient pairing and wants PIN verification — reported as
+    /// [`TransientOutcome::NeedsPin`] so the caller can run the PIN
+    /// ceremony instead of failing hard.
+    pub fn pair_setup_transient(&mut self) -> Result<TransientOutcome> {
         let mut pairing = TransientPairing::new();
 
         let hkp = vec![("X-Apple-HKP".to_string(), X_APPLE_HKP_VALUE.to_string())];
 
         let m1 = pairing.start();
         let r1 = self.request("POST", "/pair-setup", &hkp, Some("application/octet-stream"), &m1)?;
+        if r1.status == RTSP_CONNECTION_AUTH_REQUIRED {
+            debug!("AirPlay 2: transient pair-setup got 470 — receiver requires PIN pairing");
+            return Ok(TransientOutcome::NeedsPin);
+        }
         if r1.status != 200 {
             bail!("pair-setup M1 → {} {}", r1.status, r1.status_text);
         }
@@ -193,6 +217,78 @@ impl Ap2Rtsp {
         self.writer = Some(keys.control_writer());
         self.reader = Some(keys.control_reader());
         debug!("AirPlay 2: transient pairing complete, channel encrypted");
+        Ok(TransientOutcome::Paired(audio_key))
+    }
+
+    /// POST `/pair-pin-start` (X-Apple-HKP: 3) — ask the receiver to enter
+    /// persistent-pairing mode and display a PIN. Sent once, before the PIN
+    /// pair-setup; mirrors OwnTone's `AIRPLAY_SEQ_PIN_START`. Plaintext
+    /// (pairing hasn't produced keys yet).
+    pub fn pin_start(&mut self) -> Result<()> {
+        let hkp = vec![("X-Apple-HKP".to_string(), X_APPLE_HKP_PERSISTENT.to_string())];
+        let resp = self.request("POST", "/pair-pin-start", &hkp, None, &[])?;
+        if resp.status != 200 {
+            bail!("/pair-pin-start → {} {}", resp.status, resp.status_text);
+        }
+        debug!("AirPlay 2: /pair-pin-start accepted — receiver is displaying its PIN");
+        Ok(())
+    }
+
+    /// Persistent HomeKit pair-setup M1–M6 (X-Apple-HKP: 3) using the
+    /// on-screen `pin`, returning the long-term [`PairingCredentials`] to
+    /// persist. Unlike transient pairing this exchanges Ed25519 long-term
+    /// keys and does **not** encrypt the channel — a later `pair_verify`
+    /// (on a fresh connection) derives the session keys. Call `pin_start`
+    /// first so the receiver is showing the PIN.
+    pub fn pair_setup_pin(&mut self, pin: &str) -> Result<PairingCredentials> {
+        let hkp = vec![("X-Apple-HKP".to_string(), X_APPLE_HKP_PERSISTENT.to_string())];
+        let mut ps = PairSetupPin::new(pin);
+
+        let m1 = ps.start();
+        let r1 = self.request("POST", "/pair-setup", &hkp, Some("application/octet-stream"), &m1)?;
+        if r1.status != 200 {
+            bail!("PIN pair-setup M1 → {} {}{}", r1.status, r1.status_text, describe_error_body(&r1.body));
+        }
+        let m3 = ps.handle_m2(&r1.body).context("PIN pair-setup M2→M3")?;
+        let r2 = self.request("POST", "/pair-setup", &hkp, Some("application/octet-stream"), &m3)?;
+        if r2.status != 200 {
+            bail!("PIN pair-setup M3 → {} {}{}", r2.status, r2.status_text, describe_error_body(&r2.body));
+        }
+        let m5 = ps.handle_m4(&r2.body).context("PIN pair-setup M4→M5 (wrong PIN?)")?;
+        let r3 = self.request("POST", "/pair-setup", &hkp, Some("application/octet-stream"), &m5)?;
+        if r3.status != 200 {
+            bail!("PIN pair-setup M5 → {} {}{}", r3.status, r3.status_text, describe_error_body(&r3.body));
+        }
+        let creds = ps.handle_m6(&r3.body).context("PIN pair-setup M6")?;
+        debug!("AirPlay 2: PIN pair-setup complete — stored long-term credentials");
+        Ok(creds)
+    }
+
+    /// HomeKit pair-verify M1–M4 (X-Apple-HKP: 3) using stored
+    /// [`PairingCredentials`]. On success the channel becomes encrypted
+    /// (like transient pairing) and the 32-byte audio key is returned. The
+    /// session key is the X25519 shared secret run through the same
+    /// derivation as transient (OwnTone's `session_cipher_setup`).
+    pub fn pair_verify(&mut self, creds: &PairingCredentials) -> Result<[u8; 32]> {
+        let hkp = vec![("X-Apple-HKP".to_string(), X_APPLE_HKP_PERSISTENT.to_string())];
+        let mut pv = PairVerify::new(creds.clone());
+
+        let m1 = pv.start();
+        let r1 = self.request("POST", "/pair-verify", &hkp, Some("application/octet-stream"), &m1)?;
+        if r1.status != 200 {
+            bail!("pair-verify M1 → {} {}{}", r1.status, r1.status_text, describe_error_body(&r1.body));
+        }
+        let m3 = pv.handle_m2(&r1.body).context("pair-verify M2→M3")?;
+        let r2 = self.request("POST", "/pair-verify", &hkp, Some("application/octet-stream"), &m3)?;
+        if r2.status != 200 {
+            bail!("pair-verify M3 → {} {}{}", r2.status, r2.status_text, describe_error_body(&r2.body));
+        }
+        let shared = pv.finish(&r2.body).context("pair-verify M4")?;
+        let keys = SessionKeys::from_shared(&shared);
+        let audio_key = keys.audio_key();
+        self.writer = Some(keys.control_writer());
+        self.reader = Some(keys.control_reader());
+        debug!("AirPlay 2: pair-verify complete, channel encrypted");
         Ok(audio_key)
     }
 

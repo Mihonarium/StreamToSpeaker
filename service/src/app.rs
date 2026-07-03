@@ -12,9 +12,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::airplay::ap2_rtsp::Ap2Rtsp;
+use crate::airplay::hap_pairing::PairingCredentials;
 use crate::airplay::{
     AirPlay2Session, AirPlay2SessionConfig, AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession,
-    AirPlaySessionConfig, Transport,
+    AirPlaySessionConfig, NeedsPinPairing, PairVerifyFailed, Transport,
 };
 use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
@@ -231,6 +233,57 @@ pub struct App {
     /// blocking network I/O — pairing, SETUPs, fallbacks — so the GUI
     /// runs it on a worker thread and shows "Connecting…" off this.
     pub connecting: Mutex<Option<String>>,
+
+    /// A one-time HomeKit PIN pairing ceremony awaiting the user's PIN.
+    /// Set by [`App::begin_pin_pairing`] once the receiver is displaying
+    /// its PIN; the GUI polls [`App::pending_pin_pairing`], shows a modal,
+    /// and delivers the PIN (or a cancel) via [`App::submit_pin`]. None
+    /// when no ceremony is in flight.
+    pending_pin: Mutex<Option<PinCeremony>>,
+    /// Guards against launching two PIN ceremonies at once (a second
+    /// select of the same Apple TV while the first is still parked on the
+    /// modal). Cleared by the ceremony thread's RAII guard on exit.
+    pin_pairing_active: Arc<AtomicBool>,
+    /// A PIN-pairing request bubbled up from `start_airplay` (an AP2 470
+    /// with no stored keys, after every path failed). Set there, consumed
+    /// by `select_speaker_async` — which holds the `Arc<Self>` needed to
+    /// spawn the ceremony thread.
+    pin_request: Mutex<Option<(String, String)>>,
+}
+
+/// An in-flight PIN pairing ceremony: the receiver is showing its PIN and
+/// the ceremony thread is parked waiting for the user to type it. The GUI
+/// reads `id`/`name` for the modal and sends the entered PIN (or `None` to
+/// cancel) down `pin_tx`.
+struct PinCeremony {
+    id: String,
+    name: String,
+    pin_tx: crossbeam_channel::Sender<Option<String>>,
+}
+
+/// Result of one AirPlay bring-up attempt (one entry from
+/// `airplay_attempts`). `NeedsPin` is distinguished from a generic failure
+/// so `start_airplay` can launch the PIN ceremony only after every path —
+/// including the fallback legacy RAOP that most Apple TVs also expose —
+/// has failed.
+enum AttemptError {
+    /// The receiver requires one-time PIN pairing (an AP2 470 with no
+    /// stored credentials).
+    NeedsPin,
+    /// Any other failure — the message is already user-facing.
+    Other(String),
+}
+
+/// RAII cleanup for a PIN pairing ceremony thread: on any exit (success,
+/// error, cancel, timeout, panic) it clears the pending-modal state and
+/// releases the single-ceremony guard so the user can try again.
+struct CeremonyGuard(Arc<App>);
+
+impl Drop for CeremonyGuard {
+    fn drop(&mut self) {
+        *self.0.pending_pin.lock().unwrap() = None;
+        self.0.pin_pairing_active.store(false, Ordering::Release);
+    }
 }
 
 impl App {
@@ -269,6 +322,9 @@ impl App {
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
+            pending_pin: Mutex::new(None),
+            pin_pairing_active: Arc::new(AtomicBool::new(false)),
+            pin_request: Mutex::new(None),
         })
     }
 
@@ -566,11 +622,21 @@ impl App {
         }
         let app = self.clone();
         let id = id.to_string();
+        // Clear any stale pairing request from a prior attempt so an old one
+        // can't trigger a surprise ceremony on this connect.
+        *self.pin_request.lock().unwrap() = None;
         std::thread::Builder::new()
             .name("stream-to-speaker-connect".into())
             .spawn(move || {
                 let result = app.select_speaker(&id);
                 *app.connecting.lock().unwrap() = None;
+                // A PIN-pairing request may have bubbled up from the AirPlay
+                // attempt loop — launch the ceremony here (this thread's
+                // `app` is the `Arc` the ceremony needs). The error toast
+                // below already tells the user to enter the PIN.
+                if let Some((pid, pname)) = app.pin_request.lock().unwrap().take() {
+                    app.begin_pin_pairing(pid, pname);
+                }
                 if let Err(e) = result {
                     app.record_error(format!("Couldn't connect to speaker: {}", e));
                 }
@@ -922,6 +988,10 @@ impl App {
         }
 
         let mut errors: Vec<String> = Vec::new();
+        // If an AP2 path wants PIN pairing but every path fails, we launch
+        // the one-time ceremony after the loop — but only then, since most
+        // Apple TVs also expose a legacy RAOP path that just works.
+        let mut pin_target: Option<(String, String)> = None;
         for (transport, r) in attempts {
             let label = match transport {
                 Transport::AirPlay2 => "AirPlay 2",
@@ -929,13 +999,30 @@ impl App {
             };
             info!("AirPlay: attempting {} to {}", label, r.friendly_name);
             let name = r.friendly_name.clone();
+            let id = r.stable_id();
             match self.start_airplay_one(transport, r, local_ip) {
                 Ok(session) => return Ok(session),
-                Err(e) => {
+                Err(AttemptError::NeedsPin) => {
+                    warn!("AirPlay {} to {} needs one-time PIN pairing", label, name);
+                    pin_target = Some((id, name.clone()));
+                    errors.push(format!("{}: needs PIN pairing", label));
+                }
+                Err(AttemptError::Other(e)) => {
                     warn!("AirPlay {} to {} failed: {}", label, name, e);
                     errors.push(format!("{}: {}", label, e));
                 }
             }
+        }
+        // Every path failed. If one asked for PIN verification, stash the
+        // request so the async connect wrapper (which holds the `Arc`) can
+        // launch the ceremony, and tell the user what's happening. The
+        // receiver will display a PIN and the GUI collects it.
+        if let Some((id, name)) = pin_target {
+            *self.pin_request.lock().unwrap() = Some((id, name.clone()));
+            return Err(format!(
+                "{} needs pairing — enter the PIN shown on its screen.",
+                name
+            ));
         }
         // Surface every path's failure — otherwise the real problem (usually
         // the AirPlay 2 attempt) hides behind a fallback RAOP OPTIONS timeout.
@@ -1004,7 +1091,7 @@ impl App {
         transport: Transport,
         renderer: AirPlayRenderer,
         local_ip: IpAddr,
-    ) -> Result<ActiveSession, String> {
+    ) -> Result<ActiveSession, AttemptError> {
         match transport {
             Transport::RaopLegacy => {
                 let samples_rx = self.hub.subscribe();
@@ -1029,22 +1116,174 @@ impl App {
                     uncompressed_alac,
                     password,
                 })
-                .map_err(|e| format!("{:#}", e))?;
+                .map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
                 Ok(ActiveSession::AirPlay(session))
             }
             Transport::AirPlay2 => {
                 let samples_rx = self.hub.subscribe();
-                let prefer_realtime = self.user_config.lock().unwrap().prefer_realtime_airplay;
-                let session = AirPlay2Session::start(AirPlay2SessionConfig {
+                let (prefer_realtime, pairing_creds) = {
+                    let uc = self.user_config.lock().unwrap();
+                    (
+                        uc.prefer_realtime_airplay,
+                        uc.airplay_pairings.get(&renderer.stable_id()).cloned(),
+                    )
+                };
+                let stable_id = renderer.stable_id();
+                match AirPlay2Session::start(AirPlay2SessionConfig {
                     renderer,
                     local_ip,
                     samples_rx,
                     initial_volume: Some(80),
                     prefer_realtime,
-                })
-                .map_err(|e| format!("{:#}", e))?;
-                Ok(ActiveSession::AirPlay2(session))
+                    pairing_creds,
+                }) {
+                    Ok(session) => Ok(ActiveSession::AirPlay2(session)),
+                    // A 470-with-no-stored-keys surfaces as NeedsPinPairing;
+                    // keep it typed so start_airplay can launch the ceremony
+                    // only after the RAOP fallback has also failed.
+                    Err(e) if e.downcast_ref::<NeedsPinPairing>().is_some() => {
+                        Err(AttemptError::NeedsPin)
+                    }
+                    // Stored pairing rejected (accessory forgot us): drop the
+                    // stale keys and re-pair, exactly as OwnTone does on a
+                    // verify failure.
+                    Err(e) if e.downcast_ref::<PairVerifyFailed>().is_some() => {
+                        let mut uc = self.user_config.lock().unwrap();
+                        if uc.airplay_pairings.remove(&stable_id).is_some() {
+                            uc.save();
+                        }
+                        Err(AttemptError::NeedsPin)
+                    }
+                    Err(e) => Err(AttemptError::Other(format!("{:#}", e))),
+                }
             }
+        }
+    }
+
+    /// Launch a one-time HomeKit PIN pairing ceremony for an AP2 receiver
+    /// that refused transient pairing (Apple TV with access control). We
+    /// connect, ask the receiver to display its PIN, then park waiting for
+    /// the user to enter it (delivered by the GUI via [`submit_pin`]). On
+    /// success the credentials are stored and we reconnect — which now
+    /// pair-verifies and streams. Isolated behind the 470 trigger and a
+    /// single-ceremony guard, so it can never touch a working device.
+    ///
+    /// [`submit_pin`]: App::submit_pin
+    fn begin_pin_pairing(self: &Arc<Self>, id: String, name: String) {
+        // One ceremony at a time.
+        if self.pin_pairing_active.swap(true, Ordering::AcqRel) {
+            debug!("PIN pairing already in progress; ignoring second request for {}", name);
+            return;
+        }
+        let Some(renderer) = self
+            .airplay_discovery
+            .as_ref()
+            .and_then(|d| d.find_by_id(&id))
+        else {
+            self.pin_pairing_active.store(false, Ordering::Release);
+            self.record_error(format!("Can't pair {} — it's no longer discovered.", name));
+            return;
+        };
+        let local_ip: IpAddr = match self.config.advertise_ip.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                self.pin_pairing_active.store(false, Ordering::Release);
+                self.record_error(format!("Can't pair {}: bad advertise_ip ({})", name, e));
+                return;
+            }
+        };
+
+        let app = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("stream-to-speaker-ap2-pair".into())
+            .spawn(move || {
+                // Clears pending_pin + the active guard on every exit path.
+                let _guard = CeremonyGuard(app.clone());
+
+                let port = renderer.airplay_port.unwrap_or(7000);
+                let mut rtsp = match Ap2Rtsp::connect(
+                    renderer.ip,
+                    port,
+                    local_ip,
+                    Duration::from_secs(5),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        app.record_error(format!("Pairing connect to {} failed: {:#}", name, e));
+                        return;
+                    }
+                };
+                // Ask the receiver to show its PIN.
+                if let Err(e) = rtsp.pin_start() {
+                    app.record_error(format!("Couldn't start pairing on {}: {:#}", name, e));
+                    return;
+                }
+
+                // Publish the modal request and park until the GUI delivers
+                // the PIN (or cancels / times out). 2 min matches the window
+                // Apple TVs give for on-screen PIN entry.
+                let (tx, rx) = crossbeam_channel::bounded::<Option<String>>(1);
+                *app.pending_pin.lock().unwrap() = Some(PinCeremony {
+                    id: id.clone(),
+                    name: name.clone(),
+                    pin_tx: tx,
+                });
+                let pin = match rx.recv_timeout(Duration::from_secs(120)) {
+                    Ok(Some(pin)) => pin,
+                    Ok(None) => {
+                        info!("PIN pairing for {} cancelled by user", name);
+                        return;
+                    }
+                    Err(_) => {
+                        app.record_error(format!("PIN entry for {} timed out.", name));
+                        return;
+                    }
+                };
+
+                // Run pair-setup M1–M6 with the entered PIN on the same
+                // connection the receiver opened its PIN prompt on.
+                match rtsp.pair_setup_pin(pin.trim()) {
+                    Ok(creds) => {
+                        app.store_airplay_pairing(&id, creds);
+                        drop(rtsp); // close the pairing connection before streaming
+                        info!("AirPlay 2: paired {} — connecting", name);
+                        app.select_speaker_async(&id);
+                    }
+                    Err(e) => {
+                        app.record_error(format!(
+                            "Pairing {} failed: {:#} (check the PIN and try again)",
+                            name, e
+                        ));
+                    }
+                }
+            });
+        if spawned.is_err() {
+            self.pin_pairing_active.store(false, Ordering::Release);
+        }
+    }
+
+    /// Persist HomeKit pairing credentials for a device id.
+    pub fn store_airplay_pairing(&self, id: &str, creds: PairingCredentials) {
+        let mut uc = self.user_config.lock().unwrap();
+        uc.airplay_pairings.insert(id.to_string(), creds);
+        uc.save();
+    }
+
+    /// GUI: the (id, name) of a PIN pairing ceremony awaiting the user's
+    /// PIN, or None. The GUI shows a modal while this is Some.
+    pub fn pending_pin_pairing(&self) -> Option<(String, String)> {
+        self.pending_pin
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| (c.id.clone(), c.name.clone()))
+    }
+
+    /// GUI: deliver the entered PIN (`Some`) or cancel the ceremony
+    /// (`None`). Wakes the parked ceremony thread.
+    pub fn submit_pin(&self, pin: Option<String>) {
+        if let Some(c) = self.pending_pin.lock().unwrap().take() {
+            let _ = c.pin_tx.send(pin);
         }
     }
 

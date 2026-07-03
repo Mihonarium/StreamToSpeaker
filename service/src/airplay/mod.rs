@@ -50,6 +50,6 @@ pub mod srp;
 pub mod timing;
 pub mod tlv8;
 
-pub use ap2_session::{AirPlay2Session, AirPlay2SessionConfig};
+pub use ap2_session::{AirPlay2Session, AirPlay2SessionConfig, NeedsPinPairing, PairVerifyFailed};
 pub use discovery::{spawn_airplay_discovery, AirPlayDiscoveryState, AirPlayRenderer, Transport};
 pub use session::{AirPlaySession, AirPlaySessionConfig};

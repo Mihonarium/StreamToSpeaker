@@ -35,8 +35,9 @@ use std::time::{Duration, Instant};
 use crate::airplay::alac::build_uncompressed_alac_frame;
 use crate::airplay::ap2_crypto::seal_audio;
 use crate::airplay::ap2_ptp::{spawn_ptp_master, PtpMaster, PtpTimeline};
-use crate::airplay::ap2_rtsp::Ap2Rtsp;
+use crate::airplay::ap2_rtsp::{Ap2Rtsp, TransientOutcome};
 use crate::airplay::discovery::AirPlayRenderer;
+use crate::airplay::hap_pairing::PairingCredentials;
 use crate::airplay::rtp::{bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, FRAMES_PER_PACKET};
 use crate::airplay::session::volume_pct_to_raop_db;
 use crate::airplay::timing::{
@@ -70,7 +71,44 @@ pub struct AirPlay2SessionConfig {
     /// switch — realtime is ~250 ms vs buffered's 1-2 s, but some
     /// receivers only truly play buffered).
     pub prefer_realtime: bool,
+    /// Stored HomeKit persistent-pairing credentials for this receiver, if
+    /// it was PIN-paired earlier (Apple TV with access control). When
+    /// present, the session does `pair-verify` with these instead of
+    /// transient pairing.
+    pub pairing_creds: Option<PairingCredentials>,
 }
+
+/// Error returned by [`AirPlay2Session::start`] when the receiver refuses
+/// transient pairing (HTTP 470) and no stored credentials exist: it needs
+/// one-time PIN verification (Apple TV with access control). The caller
+/// downcasts this to launch the PIN pairing ceremony instead of surfacing
+/// a generic failure.
+#[derive(Debug)]
+pub struct NeedsPinPairing;
+
+impl std::fmt::Display for NeedsPinPairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "receiver requires one-time PIN pairing")
+    }
+}
+
+impl std::error::Error for NeedsPinPairing {}
+
+/// Error returned by [`AirPlay2Session::start`] when `pair-verify` with
+/// stored credentials fails — almost always because the accessory forgot
+/// the pairing (the user removed it on the Apple TV). The caller clears the
+/// stale credentials and re-pairs, mirroring OwnTone's "key cleared +
+/// re-prompt on verify failure".
+#[derive(Debug)]
+pub struct PairVerifyFailed;
+
+impl std::fmt::Display for PairVerifyFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stored pairing no longer accepted by the receiver")
+    }
+}
+
+impl std::error::Error for PairVerifyFailed {}
 
 /// A live AirPlay 2 session.
 pub struct AirPlay2Session {
@@ -123,9 +161,43 @@ impl AirPlay2Session {
             warn!("AirPlay 2 GET /info failed (continuing): {:#}", e);
         }
 
-        let audio_key = rtsp
-            .pair_setup_transient()
-            .context("AirPlay 2 HomeKit transient pairing")?;
+        // Pairing: a PIN-paired receiver (Apple TV with access control)
+        // gets pair-verify from the stored long-term keys; everything else
+        // gets transient pairing. A transient 470 means the receiver *needs*
+        // PIN pairing but we have no stored keys — surface NeedsPinPairing
+        // so the app can run the one-time PIN ceremony.
+        let audio_key = if let Some(creds) = cfg.pairing_creds.clone() {
+            info!(
+                "AirPlay 2: verifying stored pairing with {}",
+                cfg.renderer.friendly_name
+            );
+            match rtsp.pair_verify(&creds) {
+                Ok(key) => key,
+                Err(e) => {
+                    warn!(
+                        "AirPlay 2: pair-verify with {} failed ({:#}) — clearing stored \
+                         pairing to re-pair",
+                        cfg.renderer.friendly_name, e
+                    );
+                    return Err(PairVerifyFailed.into());
+                }
+            }
+        } else {
+            match rtsp
+                .pair_setup_transient()
+                .context("AirPlay 2 HomeKit transient pairing")?
+            {
+                TransientOutcome::Paired(key) => key,
+                TransientOutcome::NeedsPin => {
+                    info!(
+                        "AirPlay 2: {} refused transient pairing (470) — needs one-time PIN \
+                         verification",
+                        cfg.renderer.friendly_name
+                    );
+                    return Err(NeedsPinPairing.into());
+                }
+            }
+        };
         info!("AirPlay 2: paired with {}", cfg.renderer.friendly_name);
 
         let stop_flag = Arc::new(AtomicBool::new(false));

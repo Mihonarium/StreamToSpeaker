@@ -858,6 +858,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 frame_count: 0,
                 confirm_close_open: false,
                 password_prompt: None,
+                pin_prompt: None,
                 skip_close_confirmation,
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
@@ -889,6 +890,11 @@ struct StreamToSpeakerApp {
     /// Open when the user is entering a password for a `pw=true` AirPlay
     /// speaker. `None` when no prompt is showing.
     password_prompt: Option<PasswordPrompt>,
+    /// Open when an AP2 receiver (Apple TV with access control) is showing
+    /// a PIN and awaiting one-time HomeKit pairing. Mirrors the app's
+    /// `pending_pin_pairing` state each frame; `None` when no ceremony is
+    /// in flight.
+    pin_prompt: Option<PinPrompt>,
     /// Whether the theme is currently applied as dark. None until first
     /// apply. We re-apply only when this disagrees with the resolved
     /// mode — apply_theme rebuilds the full Style+Visuals every call
@@ -1054,17 +1060,35 @@ impl eframe::App for StreamToSpeakerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        // Mirror the app's PIN-pairing state into our modal. The app sets
+        // it (off-thread) once an Apple TV is displaying its PIN; drop our
+        // modal when the app clears it (ceremony finished / cancelled /
+        // timed out). Keyed on id so a new ceremony replaces a stale prompt.
+        match self.app.pending_pin_pairing() {
+            Some((id, name)) => {
+                if self.pin_prompt.as_ref().map(|p| p.id != id).unwrap_or(true) {
+                    self.pin_prompt = Some(PinPrompt { id, name, input: String::new() });
+                }
+            }
+            None => self.pin_prompt = None,
+        }
+
         if self.confirm_close_open {
             self.show_close_modal(ctx, &p);
         }
         if self.password_prompt.is_some() {
             self.show_password_modal(ctx, &p);
         }
+        if self.pin_prompt.is_some() {
+            self.show_pin_modal(ctx, &p);
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(p.canvas).inner_margin(sp::M))
             .show(ctx, |ui| {
-                let enabled = !self.confirm_close_open && self.password_prompt.is_none();
+                let enabled = !self.confirm_close_open
+                    && self.password_prompt.is_none()
+                    && self.pin_prompt.is_none();
                 ui.add_enabled_ui(enabled, |ui| {
                     // Keep the header pinned at the top (theme toggle
                     // shouldn't scroll away); everything below scrolls
@@ -2616,6 +2640,89 @@ impl StreamToSpeakerApp {
             self.password_prompt = None;
         }
     }
+
+    /// One-time HomeKit PIN pairing modal for an AP2 receiver (Apple TV
+    /// with access control). Shown while the app's `pending_pin_pairing`
+    /// is Some — the receiver is displaying a PIN. Confirm sends the PIN to
+    /// the parked ceremony thread; cancel aborts it. Mirrors
+    /// `show_password_modal`.
+    fn show_pin_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(prompt) = self.pin_prompt.as_mut() else {
+            return;
+        };
+
+        let mut still_open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+
+        let title = format!("Pair with {}", prompt.name);
+        egui::Window::new(egui::RichText::new(title).strong().color(p.text_primary))
+            .open(&mut still_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(420.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(p.card)
+                    .stroke(egui::Stroke::new(1.0, p.divider))
+                    .rounding(RADIUS_SURFACE)
+                    .inner_margin(sp::MODAL),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "This receiver needs one-time pairing. A PIN should now be showing \
+                         on its screen — enter it here to pair. It'll be remembered, so you \
+                         won't need to do this again.",
+                    )
+                    .color(p.text_secondary),
+                );
+                ui.add_space(sp::S);
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut prompt.input)
+                        .hint_text("PIN shown on the device")
+                        .desired_width(f32::INFINITY),
+                );
+                if !edit.has_focus() && !ctx.memory(|m| m.focused().is_some()) {
+                    edit.request_focus();
+                }
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    confirm = true;
+                }
+                ui.add_space(sp::M);
+                ui.horizontal(|ui| {
+                    if primary_button(ui, p, "Pair", 120.0).clicked() {
+                        confirm = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if secondary_button(ui, p, "Cancel", 96.0).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+
+        if !still_open {
+            cancel = true;
+        }
+        // A blank PIN isn't a submit — ignore Enter/Pair until it's non-empty.
+        if confirm && prompt.input.trim().is_empty() {
+            confirm = false;
+        }
+        if confirm {
+            if let Some(prompt) = self.pin_prompt.take() {
+                self.app.submit_pin(Some(prompt.input.trim().to_string()));
+            }
+        } else if cancel {
+            self.pin_prompt = None;
+            self.app.submit_pin(None);
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -2632,6 +2739,18 @@ struct PasswordPrompt {
     /// Friendly name, for the dialog title.
     name: String,
     /// The password the user is typing.
+    input: String,
+}
+
+/// State for the one-time HomeKit PIN pairing modal (Apple TV with access
+/// control). Mirrors the app's `pending_pin_pairing`; `id` keys it so a new
+/// ceremony replaces a stale prompt.
+struct PinPrompt {
+    /// Stable id of the receiver being paired.
+    id: String,
+    /// Friendly name, for the dialog title.
+    name: String,
+    /// The PIN the user is typing (as shown on the receiver's screen).
     input: String,
 }
 

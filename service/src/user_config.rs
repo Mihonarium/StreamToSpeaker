@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::airplay::hap_pairing::PairingCredentials;
+
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct UserConfig {
     #[serde(default)]
@@ -64,6 +66,16 @@ pub struct UserConfig {
     /// the rest of the file); RTSP Digest never sends it in the clear.
     #[serde(default)]
     pub airplay_passwords: HashMap<String, String>,
+    /// Per-device HomeKit **persistent** pairing credentials, keyed by the
+    /// device's stable id (`airplay:<mac>`). Stored after a one-time PIN
+    /// pair-setup with an AP2 receiver that refuses transient pairing (an
+    /// Apple TV with access control / "require device verification"), so
+    /// later connects skip straight to pair-verify. Holds our controller
+    /// Ed25519 seed + the accessory's long-term public key — same trust
+    /// level as the rest of the file; the seed is a per-device identity,
+    /// not a reusable secret elsewhere.
+    #[serde(default)]
+    pub airplay_pairings: HashMap<String, PairingCredentials>,
     /// Forward Windows' "now playing" (title/artist/album from the System
     /// Media Transport Controls) to the speaker as track metadata, so it
     /// shows on the speaker's display / app. **Off by default** — it's a
