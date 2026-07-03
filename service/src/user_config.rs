@@ -57,6 +57,14 @@ pub struct UserConfig {
     /// tries MFi first and falls back to plaintext/RSA on failure.
     #[serde(default)]
     pub airplay_mfi_encryption: bool,
+    /// Forward Windows' "now playing" (title/artist/album from the System
+    /// Media Transport Controls) to the speaker as track metadata, so it
+    /// shows on the speaker's display / app. **Off by default** — it's a
+    /// nicety, it reads whatever app currently has media focus, and the
+    /// RAOP metadata path is best-effort (a receiver that ignores it is
+    /// harmless). RAOP only for now (Sonos-class); no AP2 metadata yet.
+    #[serde(default)]
+    pub forward_now_playing: bool,
     /// Debug escape hatch: send the uncompressed-ALAC escape frames
     /// instead of real compressed ALAC. Every field-proven sender
     /// (iTunes, OwnTone, AirConnect) sends compressed; this exists only

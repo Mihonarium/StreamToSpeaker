@@ -94,6 +94,21 @@ impl ActiveSession {
         }
     }
 
+    /// Push "now playing" track metadata to the speaker. Only the RAOP
+    /// (AirPlay 1) path implements it today; AP2/UPnP are no-ops. Returns
+    /// `Ok` on a no-op so callers don't treat unsupported as an error.
+    pub fn set_now_playing(&self, title: &str, artist: &str, album: &str) -> Result<()> {
+        match self {
+            ActiveSession::AirPlay(s) => s.set_now_playing(title, artist, album),
+            ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) => Ok(()),
+        }
+    }
+
+    /// Whether this session type can display track metadata (RAOP only).
+    pub fn supports_metadata(&self) -> bool {
+        matches!(self, ActiveSession::AirPlay(_))
+    }
+
     /// True if the session has died mid-stream (dropped receiver). UPnP
     /// is HTTP-pull (the speaker reconnects on its own), so only the
     /// AirPlay push paths report death here.
@@ -335,6 +350,20 @@ impl App {
     /// Whether to auto-reconnect when a live session drops mid-stream.
     pub fn is_auto_reconnect_on_drop(&self) -> bool {
         self.user_config.lock().unwrap().auto_reconnect_on_drop
+    }
+
+    /// Whether to forward Windows "now playing" to the speaker.
+    pub fn is_forward_now_playing(&self) -> bool {
+        self.user_config.lock().unwrap().forward_now_playing
+    }
+
+    /// Persist the now-playing-forwarding preference.
+    pub fn set_forward_now_playing(&self, on: bool) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.forward_now_playing != on {
+            uc.forward_now_playing = on;
+            uc.save();
+        }
     }
 
     /// Persist the drop-reconnect preference.
@@ -614,6 +643,87 @@ impl App {
                             return;
                         }
                         std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// Background forwarder: when enabled, pushes the OS "now playing"
+    /// (title/artist/album) to the bound speaker as it changes, so the
+    /// track shows on the speaker's display / app. Off by default; RAOP
+    /// only (AP2/UPnP sessions are skipped). Entirely best-effort —
+    /// metadata is non-fatal on every receiver, so a failure or an
+    /// unsupported OS never touches the audio path.
+    pub fn spawn_now_playing_forwarder(self: &Arc<Self>) {
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-now-playing".into())
+            .spawn(move || {
+                #[cfg(windows)]
+                unsafe {
+                    // Best-effort MTA init so the WinRT SMTC calls work on
+                    // this thread; harmless if COM is already initialised.
+                    use windows::Win32::System::Com::{
+                        CoInitializeEx, COINIT_MULTITHREADED,
+                    };
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                }
+
+                let mut last_sent: Option<crate::now_playing::NowPlaying> = None;
+                loop {
+                    for _ in 0..20 {
+                        if app.is_shutting_down() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+
+                    if !app.user_config.lock().unwrap().forward_now_playing {
+                        // Reset so re-enabling re-sends the current track.
+                        last_sent = None;
+                        continue;
+                    }
+
+                    // Only bother if a metadata-capable session is bound.
+                    let capable = app
+                        .session
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|s| s.supports_metadata())
+                        .unwrap_or(false);
+                    if !capable {
+                        last_sent = None;
+                        continue;
+                    }
+
+                    let np = crate::now_playing::current();
+                    if np == last_sent {
+                        continue; // unchanged (incl. both None)
+                    }
+
+                    if let Some(track) = &np {
+                        let sent = {
+                            let guard = app.session.lock().unwrap();
+                            match guard.as_ref() {
+                                Some(s) => s
+                                    .set_now_playing(&track.title, &track.artist, &track.album)
+                                    .is_ok(),
+                                None => false,
+                            }
+                        };
+                        if sent {
+                            debug!(
+                                "now-playing → speaker: {} — {}",
+                                track.artist, track.title
+                            );
+                            last_sent = np;
+                        }
+                    } else {
+                        // Nothing playing now; remember so we re-send when
+                        // it resumes.
+                        last_sent = None;
                     }
                 }
             })

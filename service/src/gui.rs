@@ -2275,6 +2275,21 @@ impl StreamToSpeakerApp {
                     uc.save();
                 }
             }
+
+            ui.add_space(sp::S);
+
+            let mut now_playing = self.app.is_forward_now_playing();
+            advanced_row(
+                ui,
+                p,
+                "Show now-playing on the speaker",
+                "Send the current track's title/artist/album to the speaker's display.",
+                "When on, Stream To Speaker reads whatever Windows reports as \"now playing\" (the same title/artist the media keys show) and forwards it to the speaker so it appears on the speaker's screen or in its app. It reads whichever app currently has media focus. Off by default; works on AirPlay 1 (RAOP) speakers like Sonos in AirPlay mode.",
+                |ui| {
+                    ui.checkbox(&mut now_playing, "Forward Windows' now-playing info");
+                },
+            );
+            self.app.set_forward_now_playing(now_playing);
         });
     }
 

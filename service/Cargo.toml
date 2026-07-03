@@ -103,6 +103,10 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    # WinRT System Media Transport Controls — reads the OS "now playing"
+    # (title/artist/album) for the opt-in metadata-forwarding feature.
+    "Foundation",
+    "Media_Control",
 ] }
 # GUI: native window + system tray. Windows-only for now since the
 # kernel driver is anyway Windows-only.

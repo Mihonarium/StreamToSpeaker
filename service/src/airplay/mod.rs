@@ -40,6 +40,7 @@ pub mod ap2_rtsp;
 pub mod ap2_session;
 pub mod crypto;
 pub mod discovery;
+pub mod dmap;
 pub mod pairing;
 pub mod rtp;
 pub mod rtsp;

@@ -412,6 +412,45 @@ impl RtspClient {
         Ok(())
     }
 
+    /// SET_PARAMETER track metadata — a DMAP-tagged body (see
+    /// [`crate::airplay::dmap`]) so the receiver shows the current
+    /// title/artist/album on its display or app. Best-effort: metadata is
+    /// non-fatal on every reference receiver, so callers should treat a
+    /// failure as cosmetic.
+    pub fn set_metadata(&mut self, dmap_body: &[u8], rtptime: u32) -> Result<()> {
+        if self.poisoned {
+            bail!("RTSP connection is poisoned");
+        }
+        self.cseq += 1;
+        let uri = self.session_uri();
+        let mut head = String::new();
+        head.push_str(&format!("SET_PARAMETER {} RTSP/1.0\r\n", uri));
+        head.push_str(&format!("CSeq: {}\r\n", self.cseq));
+        head.push_str(&format!("User-Agent: {}\r\n", RTSP_USER_AGENT));
+        head.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
+        head.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
+        head.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
+        if let Some(token) = &self.session_token {
+            head.push_str(&format!("Session: {}\r\n", token));
+        }
+        head.push_str(&format!("RTP-Info: rtptime={}\r\n", rtptime));
+        head.push_str("Content-Type: application/x-dmap-tagged\r\n");
+        head.push_str(&format!("Content-Length: {}\r\n\r\n", dmap_body.len()));
+
+        debug!("RTSP > SET_PARAMETER {} (metadata, {}B)", uri, dmap_body.len());
+        let mut raw = head.into_bytes();
+        raw.extend_from_slice(dmap_body);
+        let resp = self.send_and_read(&raw)?;
+        if resp.status_code != 200 {
+            bail!(
+                "SET_PARAMETER metadata → {} {}",
+                resp.status_code,
+                resp.status_text
+            );
+        }
+        Ok(())
+    }
+
     /// FLUSH — tell the receiver to drop everything it has buffered up
     /// to `seq`. We use this when restarting playback after a pause.
     pub fn flush(&mut self, seq: u16, rtptime: u32) -> Result<()> {

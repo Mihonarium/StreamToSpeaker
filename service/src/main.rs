@@ -475,6 +475,10 @@ fn run(cli: Cli) -> Result<()> {
     // fresh one so the UI never shows a zombie "streaming" state.
     app.spawn_reconnect_watchdog();
 
+    // Now-playing metadata forwarder (off by default; pushes the OS's
+    // current track to the speaker when enabled).
+    app.spawn_now_playing_forwarder();
+
     // Ctrl-C handler — set the shutdown flag.
     install_signal_handler(app.clone());
 

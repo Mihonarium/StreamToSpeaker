@@ -90,6 +90,9 @@ pub struct AirPlaySession {
     /// the RTSP connection). The app-level watchdog polls this to tear
     /// down the zombie and auto-reconnect.
     dead: Arc<AtomicBool>,
+    /// Current RTP write head — read to stamp the `RTP-Info` on metadata
+    /// SET_PARAMETERs.
+    current_rtptime: Arc<AtomicU32>,
     /// The background threads. All of them watch `stop_flag` with
     /// bounded wakeups, so `stop()` just sets the flag and joins.
     threads: Vec<JoinHandle<()>>,
@@ -351,7 +354,7 @@ impl AirPlaySession {
             samples_rx: cfg.samples_rx,
             stop_flag: stop_flag.clone(),
             receiver_name: cfg.renderer.friendly_name.clone(),
-            current_rtptime,
+            current_rtptime: current_rtptime.clone(),
             resend: resend.clone(),
             uncompressed_alac: cfg.uncompressed_alac,
             session_dead: dead.clone(),
@@ -460,9 +463,19 @@ impl AirPlaySession {
             rtsp,
             stop_flag,
             dead,
+            current_rtptime,
             threads: guard.into_threads(),
             _audio_socket: audio_socket,
         })
+    }
+
+    /// Push track metadata (title/artist/album) to the receiver via
+    /// SET_PARAMETER. Best-effort and non-fatal — a receiver that ignores
+    /// or rejects metadata is fine; we never let it affect the audio path.
+    pub fn set_now_playing(&self, title: &str, artist: &str, album: &str) -> Result<()> {
+        let body = crate::airplay::dmap::now_playing_body(title, artist, album);
+        let rtptime = self.current_rtptime.load(Ordering::Acquire);
+        self.rtsp.lock().unwrap().set_metadata(&body, rtptime)
     }
 
     /// True once a background thread has flagged the session as dead
