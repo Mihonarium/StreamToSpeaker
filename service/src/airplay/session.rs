@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::airplay::crypto::Cipher;
+use crate::airplay::crypto::{Cipher, MfiKey};
 use crate::airplay::discovery::AirPlayRenderer;
 use crate::airplay::rtp::{
     bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, spawn_audio_sender,
@@ -123,21 +123,31 @@ impl AirPlaySession {
         // firmware stalls on it. Receivers advertising MFi (et=4) or an
         // AirPlay-2 side get the iTunes flow; plain legacy receivers keep
         // the traditional OPTIONS + Apple-Challenge opener.
-        let mfi_style = cfg.renderer.encryption_types.contains(&4)
-            || cfg.renderer.supports_airplay2();
-        if mfi_style {
-            rtsp.auth_setup().context("RTSP auth-setup (MFi opener)")?;
+        let want_mfi = cfg.renderer.encryption_types.contains(&4);
+        let mfi_style = want_mfi || cfg.renderer.supports_airplay2();
+        let shared_secret = if mfi_style {
+            Some(rtsp.auth_setup().context("RTSP auth-setup (MFi opener)")?)
         } else {
             rtsp.options().context("RTSP OPTIONS")?;
-        }
+            None
+        };
 
-        let cipher = Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no compatible encryption mode for {} (advertised et={:?})",
-                cfg.renderer.friendly_name,
-                cfg.renderer.encryption_types,
-            )
-        })?;
+        // Cipher choice. Packet-capture ground truth (iTunes → this Sonos,
+        // AirTunes/366): iTunes encrypts audio via the et=4 MFi path — a
+        // plaintext ANNOUNCE is accepted (200) but the receiver then stalls
+        // SETUP. So when the device advertises et=4 and we completed
+        // auth-setup, we take the MFi wrapped-key path; everything else
+        // falls back to the best of et=0 (plaintext) / et=1 (RSA).
+        let cipher = match (want_mfi, shared_secret) {
+            (true, Some(shared)) => Cipher::Mfi(MfiKey::derive(&shared)),
+            _ => Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no compatible encryption mode for {} (advertised et={:?})",
+                    cfg.renderer.friendly_name,
+                    cfg.renderer.encryption_types,
+                )
+            })?,
+        };
         info!(
             "AirPlay: cipher={} (receiver et={:?})",
             cipher.label(),

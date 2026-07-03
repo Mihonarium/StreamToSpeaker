@@ -124,8 +124,10 @@ impl RtspClient {
     }
 
     /// Construct the per-session URI used in ANNOUNCE/SETUP/RECORD/TEARDOWN.
+    /// Packet-capture verified: iTunes uses the **sender's** IP here
+    /// (`rtsp://<local>/<session>`), not the receiver's.
     fn session_uri(&self) -> String {
-        format!("rtsp://{}/{}", self.receiver_ip, self.session_id)
+        format!("rtsp://{}/{}", self.local_ip, self.session_id)
     }
 
     /// Send OPTIONS * with an Apple-Challenge nonce. The receiver will
@@ -179,17 +181,26 @@ impl RtspClient {
                 let iv_b64 = base64_nopad(&key.iv);
                 format!("a=rsaaeskey:{}\r\na=aesiv:{}\r\n", key_b64, iv_b64)
             }
+            // et=4 MFi: ship the *wrapped* audio key (`mfiaeskey`) plus the
+            // plaintext audio IV (`aesiv`). Matches iTunes's ANNOUNCE to
+            // AirTunes/366 Sonos firmware.
+            Cipher::Mfi(mfi) => {
+                let key_b64 = base64_nopad(&mfi.mfiaeskey);
+                let iv_b64 = base64_nopad(&mfi.audio.iv);
+                format!("a=mfiaeskey:{}\r\na=aesiv:{}\r\n", key_b64, iv_b64)
+            }
         };
 
-        // `c=` carries the SENDER address — node_airtunes2 and the
-        // PulseAudio/PipeWire RAOP sinks all do this (we previously sent
-        // the receiver's, which shairport tolerates but stricter stacks
-        // may not).
+        // `o=` carries the SENDER address; `c=` the RECEIVER's. Packet-
+        // capture verified against iTunes → Sonos (and matches OwnTone's
+        // `raop.c`, which puts `rs->address` = the receiver in `c=`). A
+        // prior revision put the sender in `c=` following node_airtunes2;
+        // the proven-on-this-device reference uses the receiver.
         let sdp = format!(
             "v=0\r\n\
              o=iTunes {sid} 0 IN IP4 {local}\r\n\
              s=iTunes\r\n\
-             c=IN IP4 {local}\r\n\
+             c=IN IP4 {receiver}\r\n\
              t=0 0\r\n\
              m=audio 0 RTP/AVP 96\r\n\
              a=rtpmap:96 AppleLossless\r\n\
@@ -197,6 +208,7 @@ impl RtspClient {
              {crypto}",
             sid = self.session_id,
             local = self.local_ip,
+            receiver = self.receiver_ip,
             crypto = crypto_lines,
         );
 
@@ -212,7 +224,10 @@ impl RtspClient {
             // and retry once. Only fires on 403, so receivers that work
             // without it are untouched.
             warn!("ANNOUNCE returned 403; attempting /auth-setup then retrying");
-            self.auth_setup().context("auth-setup after ANNOUNCE 403")?;
+            // Throwaway unlock — this fallback fires only for non-MFi ciphers
+            // (the et=4 path already did auth-setup up front and built its
+            // key from that secret), so the derived secret is discarded here.
+            let _ = self.auth_setup().context("auth-setup after ANNOUNCE 403")?;
             resp = self.request("ANNOUNCE", &uri, &extra, &sdp)?;
         }
         if resp.status_code != 200 {
@@ -224,16 +239,21 @@ impl RtspClient {
 
     /// MFi `/auth-setup` handshake. We send a curve25519 (X25519) public
     /// key prefixed with the `0x01` "unencrypted" selector; the receiver
-    /// replies with its own key plus a signed MFi certificate. For the
-    /// unencrypted audio path we don't need the response contents — just
-    /// completing the exchange unlocks receivers that demand it.
-    pub fn auth_setup(&mut self) -> Result<()> {
+    /// replies with its own key (first 32 bytes) plus a signed MFi
+    /// certificate + signature.
+    ///
+    /// Returns the **X25519 shared secret**. For the plain/RSA audio paths
+    /// the caller ignores it (just completing the exchange unlocks
+    /// receivers that gate ANNOUNCE on it); for the et=4 MFi path it's the
+    /// key-encryption-key input that wraps the audio key (see
+    /// [`crate::airplay::crypto::MfiKey::derive`]).
+    pub fn auth_setup(&mut self) -> Result<[u8; 32]> {
         use x25519_dalek::{EphemeralSecret, PublicKey};
         let secret = EphemeralSecret::random_from_rng(rand::thread_rng());
         let public = PublicKey::from(&secret);
 
         let mut body = Vec::with_capacity(33);
-        body.push(0x01); // 0x01 = no encryption; 0x02 would request MFi-SAP
+        body.push(0x01); // 0x01 = no encryption; 0x10 would request MFi-SAP
         body.extend_from_slice(public.as_bytes());
 
         let resp = self
@@ -242,8 +262,23 @@ impl RtspClient {
         if resp.status_code != 200 {
             bail!("auth-setup → {} {}", resp.status_code, resp.status_text);
         }
-        debug!("auth-setup OK ({}B response)", resp.body.len());
-        Ok(())
+        // Response: [32B receiver X25519 pubkey][4B certlen][cert]
+        //           [4B siglen][sig]. We need the first 32 bytes to
+        // complete the ECDH.
+        if resp.body.len() < 32 {
+            bail!(
+                "auth-setup response too short ({}B, need ≥32 for the receiver pubkey)",
+                resp.body.len()
+            );
+        }
+        let mut their_pub = [0u8; 32];
+        their_pub.copy_from_slice(&resp.body[..32]);
+        let shared = secret.diffie_hellman(&PublicKey::from(their_pub));
+        debug!(
+            "auth-setup OK ({}B response, ECDH shared secret derived)",
+            resp.body.len()
+        );
+        Ok(*shared.as_bytes())
     }
 
     /// SETUP — request RTP/UDP transport, telling the server which

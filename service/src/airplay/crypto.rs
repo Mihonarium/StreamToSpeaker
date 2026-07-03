@@ -22,12 +22,12 @@
 //! They're not secret — Apple's IP claim was on the private half,
 //! which was extracted from leaked AirPort Express firmware ~2004.
 
-use aes::cipher::{BlockEncryptMut, KeyIvInit};
+use aes::cipher::{BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit};
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use rand::RngCore;
 use rsa::{BigUint, Oaep, RsaPublicKey};
-use sha1::Sha1;
+use sha1::{Digest, Sha1};
 
 /// Apple AirTunes RSA-2048 public modulus, base64.
 ///
@@ -73,6 +73,65 @@ pub struct SessionKey {
 pub enum Cipher {
     None,
     AesRsa(SessionKey),
+    /// `et=4` MFi: after the `/auth-setup` X25519 exchange, a **random**
+    /// 128-bit audio key + IV encrypt the audio (AES-128-CBC, byte-
+    /// identical to the RSA path). The audio key is not sent in the clear
+    /// — it's *wrapped* with a key-encryption-key derived from the ECDH
+    /// shared secret and shipped in `a=mfiaeskey`; the plaintext audio IV
+    /// goes in `a=aesiv`. See [`MfiKey::derive`].
+    ///
+    /// Packet-capture ground truth (iTunes → Sonos, AirTunes/366): iTunes
+    /// ships a 16-byte `mfiaeskey` that is demonstrably **not** the raw
+    /// audio key (decrypting the captured audio with it yields noise in
+    /// every cipher mode), so the receiver recovers the audio key by
+    /// unwrapping `mfiaeskey` with the shared secret. The exact wrap can't
+    /// be reconstructed from the capture (the ECDH secret needs a private
+    /// key we don't have) and no open receiver implements et=4, so the
+    /// KEK/mode below follow the openairplay MFi-SAP derivation and are
+    /// UNVERIFIED against real hardware.
+    Mfi(MfiKey),
+}
+
+/// Key material for the `et=4` MFi audio path: the random audio key/IV we
+/// actually encrypt with, plus the wrapped form of the key we advertise in
+/// `a=mfiaeskey`.
+#[derive(Debug, Clone)]
+pub struct MfiKey {
+    /// Random AES-128 key + IV that encrypt the audio (AES-128-CBC).
+    pub audio: SessionKey,
+    /// The audio key wrapped under the shared-secret-derived KEK — the
+    /// 16-byte value carried by the SDP `a=mfiaeskey` attribute.
+    pub mfiaeskey: [u8; 16],
+}
+
+impl MfiKey {
+    /// Derive the `et=4` key material from the `/auth-setup` X25519 shared
+    /// secret. We pick a fresh random audio key + IV, then wrap the key:
+    ///
+    /// ```text
+    ///   KEK       = SHA1("AES-KEY" ‖ shared)[0..16]   (openairplay MFi-SAP)
+    ///   KIV       = SHA1("AES-IV"  ‖ shared)[0..16]
+    ///   mfiaeskey = AES-128-CTR(audio_key)  under (KEK, KIV)
+    /// ```
+    ///
+    /// A single 16-byte block of AES-CTR with the counter starting at `KIV`
+    /// is just `audio_key XOR AES-ECB(KEK, KIV)`. The receiver derives the
+    /// same KEK/KIV from its half of the ECDH and unwraps to recover the
+    /// audio key. The `aesiv` we advertise is the plaintext audio IV.
+    pub fn derive(shared: &[u8]) -> Self {
+        let audio = SessionKey::random();
+        let kek = sha1_prefixed_16(b"AES-KEY", shared);
+        let kiv = sha1_prefixed_16(b"AES-IV", shared);
+        // AES-128-CTR keystream for the single counter block == AES-ECB of
+        // the initial counter value (KIV) under the KEK.
+        let mut keystream = kiv;
+        aes128_ecb_encrypt_block(&kek, &mut keystream);
+        let mut mfiaeskey = [0u8; 16];
+        for i in 0..16 {
+            mfiaeskey[i] = audio.key[i] ^ keystream[i];
+        }
+        Self { audio, mfiaeskey }
+    }
 }
 
 impl Cipher {
@@ -98,6 +157,7 @@ impl Cipher {
         match self {
             Cipher::None => "none",
             Cipher::AesRsa(_) => "aes-rsa",
+            Cipher::Mfi(_) => "aes-mfi",
         }
     }
 
@@ -107,6 +167,7 @@ impl Cipher {
         match self {
             Cipher::None => {}
             Cipher::AesRsa(key) => encrypt_audio_packet_in_place(buf, key),
+            Cipher::Mfi(mfi) => encrypt_audio_packet_in_place(buf, &mfi.audio),
         }
     }
 }
@@ -149,6 +210,28 @@ fn apple_rsa_public_key() -> Result<RsaPublicKey> {
     let n = BigUint::from_bytes_be(&mod_bytes);
     let e = BigUint::from_bytes_be(&exp_bytes);
     RsaPublicKey::new(n, e).map_err(|e| anyhow!("constructing Apple RSA public key: {}", e))
+}
+
+/// `SHA1(prefix ‖ shared)` truncated to the first 16 bytes — the
+/// key-derivation primitive for `et=4` MFi (see [`MfiKey::derive`]).
+/// SHA-1 is 20 bytes, so the slice is always in range.
+fn sha1_prefixed_16(prefix: &[u8], shared: &[u8]) -> [u8; 16] {
+    let mut h = Sha1::new();
+    h.update(prefix);
+    h.update(shared);
+    let digest = h.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+/// Encrypt a single 16-byte block in place with AES-128 in ECB mode
+/// (one block, no chaining, no padding). Used to build the single-block
+/// AES-CTR keystream that wraps the MFi audio key (see [`MfiKey::derive`]).
+fn aes128_ecb_encrypt_block(key: &[u8; 16], block: &mut [u8; 16]) {
+    let cipher = aes::Aes128::new(key.into());
+    let ga = aes::cipher::generic_array::GenericArray::from_mut_slice(block);
+    cipher.encrypt_block(ga);
 }
 
 /// Encrypt one audio packet's payload in-place with AES-128-CBC.
@@ -255,5 +338,38 @@ mod tests {
     fn base64_nopad_drops_padding() {
         assert_eq!(base64_nopad(&[1, 2]), "AQI");
         assert_eq!(base64_nopad(&[1, 2, 3]), "AQID");
+    }
+
+    #[test]
+    fn mfi_wrap_unwraps_to_audio_key() {
+        // The receiver derives the same KEK/KIV from its half of the ECDH
+        // and unwraps `mfiaeskey` to recover the audio key. Verify the
+        // construction round-trips: unwrap(mfiaeskey) == audio.key.
+        let shared = [0x42u8; 32];
+        let mfi = MfiKey::derive(&shared);
+
+        // Receiver side: KEK = SHA1("AES-KEY"‖shared), keystream =
+        // AES-ECB(KEK, KIV), audio_key = mfiaeskey XOR keystream.
+        let kek = sha1_prefixed_16(b"AES-KEY", &shared);
+        let kiv = sha1_prefixed_16(b"AES-IV", &shared);
+        let mut keystream = kiv;
+        aes128_ecb_encrypt_block(&kek, &mut keystream);
+        let mut recovered = [0u8; 16];
+        for i in 0..16 {
+            recovered[i] = mfi.mfiaeskey[i] ^ keystream[i];
+        }
+        assert_eq!(recovered, mfi.audio.key, "unwrapped mfiaeskey must equal audio key");
+        // The wrapped value must not be the raw key (else there's no point
+        // wrapping) — the capture proved iTunes ships a non-raw key.
+        assert_ne!(mfi.mfiaeskey, mfi.audio.key, "mfiaeskey should be wrapped, not raw");
+    }
+
+    #[test]
+    fn mfi_audio_key_is_random_per_session() {
+        let shared = [0x11u8; 32];
+        let a = MfiKey::derive(&shared);
+        let b = MfiKey::derive(&shared);
+        // Same shared secret, but a fresh random audio key each session.
+        assert_ne!(a.audio.key, b.audio.key);
     }
 }
