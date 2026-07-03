@@ -951,6 +951,22 @@ impl eframe::App for StreamToSpeakerApp {
             self.last_repaint_request = Instant::now();
         }
 
+        // While egui is still easing a scroll delta, repaint at the full
+        // frame rate so the buffered delta drains evenly. egui buffers
+        // wheel/touchpad deltas and releases them over a ~0.1 s ease, but
+        // it does NOT itself request a repaint to animate that — so in
+        // eframe's reactive mode the ease only advances when the OS sends
+        // the next scroll event (or on the 100 ms heartbeat above). During
+        // a touchpad fling the OS events get sparse as inertia decays, so
+        // the buffered portion releases in coarse lumps — the "unnatural
+        // acceleration/jump" at the tail of the fling. Driving repaints
+        // here makes the ease play out smoothly; it self-terminates the
+        // moment the buffer is empty (smooth_scroll_delta returns to zero),
+        // so it costs nothing when not scrolling.
+        if ctx.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO) {
+            ctx.request_repaint();
+        }
+
         // App-wide keyboard shortcuts (M27). consume_shortcut takes the
         // event off the input queue so individual widgets don't also
         // fire on the same press.
