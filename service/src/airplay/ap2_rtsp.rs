@@ -48,6 +48,28 @@ pub enum TransientOutcome {
     NeedsPin,
 }
 
+/// Why a `pair-verify` failed. The distinction is load-bearing: stored
+/// long-term credentials may only be discarded on [`Rejected`] — a response
+/// was received and the receiver (or its crypto) refused the pairing. A
+/// [`Transport`] failure (socket timeout, reset, half-open hold) proves
+/// nothing about the credentials, and wiping them on it would force the
+/// user through a new PIN ceremony after every Wi-Fi blip. Mirrors
+/// OwnTone, which clears `auth_key` only in the pair-verify response
+/// handlers' error paths, never on connection failures.
+///
+/// [`Rejected`]: PairVerifyError::Rejected
+/// [`Transport`]: PairVerifyError::Transport
+#[derive(Debug, thiserror::Error)]
+pub enum PairVerifyError {
+    /// Socket-level failure — no response received. Credentials unproven.
+    #[error("pair-verify transport failure: {0:#}")]
+    Transport(#[source] anyhow::Error),
+    /// The receiver answered and refused (non-200 status, TLV error, or a
+    /// failed signature check). Credentials are stale — re-pair.
+    #[error("pair-verify rejected by receiver: {0:#}")]
+    Rejected(#[source] anyhow::Error),
+}
+
 /// Ports the receiver assigned for the audio stream (from the second
 /// SETUP response).
 #[derive(Debug, Clone, Copy)]
@@ -240,9 +262,19 @@ impl Ap2Rtsp {
     /// keys and does **not** encrypt the channel — a later `pair_verify`
     /// (on a fresh connection) derives the session keys. Call `pin_start`
     /// first so the receiver is showing the PIN.
-    pub fn pair_setup_pin(&mut self, pin: &str) -> Result<PairingCredentials> {
+    ///
+    /// `controller_id`/`controller_seed_hex` are the install's persistent
+    /// pairing identity — reusing them makes a re-pair replace the
+    /// accessory's stored record instead of consuming another of its
+    /// finite pairing slots.
+    pub fn pair_setup_pin(
+        &mut self,
+        pin: &str,
+        controller_id: &str,
+        controller_seed_hex: &str,
+    ) -> Result<PairingCredentials> {
         let hkp = vec![("X-Apple-HKP".to_string(), X_APPLE_HKP_PERSISTENT.to_string())];
-        let mut ps = PairSetupPin::new(pin);
+        let mut ps = PairSetupPin::with_identity(pin, controller_id.to_string(), controller_seed_hex)?;
 
         let m1 = ps.start();
         let r1 = self.request("POST", "/pair-setup", &hkp, Some("application/octet-stream"), &m1)?;
@@ -269,22 +301,53 @@ impl Ap2Rtsp {
     /// (like transient pairing) and the 32-byte audio key is returned. The
     /// session key is the X25519 shared secret run through the same
     /// derivation as transient (OwnTone's `session_cipher_setup`).
-    pub fn pair_verify(&mut self, creds: &PairingCredentials) -> Result<[u8; 32]> {
+    ///
+    /// The error type distinguishes transport failures from receiver
+    /// rejections so the caller only invalidates stored credentials when
+    /// the receiver actually refused them.
+    pub fn pair_verify(
+        &mut self,
+        creds: &PairingCredentials,
+    ) -> std::result::Result<[u8; 32], PairVerifyError> {
+        use PairVerifyError::{Rejected, Transport};
         let hkp = vec![("X-Apple-HKP".to_string(), X_APPLE_HKP_PERSISTENT.to_string())];
         let mut pv = PairVerify::new(creds.clone());
 
         let m1 = pv.start();
-        let r1 = self.request("POST", "/pair-verify", &hkp, Some("application/octet-stream"), &m1)?;
+        let r1 = self
+            .request("POST", "/pair-verify", &hkp, Some("application/octet-stream"), &m1)
+            .map_err(Transport)?;
         if r1.status != 200 {
-            bail!("pair-verify M1 → {} {}{}", r1.status, r1.status_text, describe_error_body(&r1.body));
+            return Err(Rejected(anyhow!(
+                "pair-verify M1 → {} {}{}",
+                r1.status,
+                r1.status_text,
+                describe_error_body(&r1.body)
+            )));
         }
-        let m3 = pv.handle_m2(&r1.body).context("pair-verify M2→M3")?;
-        let r2 = self.request("POST", "/pair-verify", &hkp, Some("application/octet-stream"), &m3)?;
+        let m3 = pv
+            .handle_m2(&r1.body)
+            .context("pair-verify M2→M3")
+            .map_err(Rejected)?;
+        let r2 = self
+            .request("POST", "/pair-verify", &hkp, Some("application/octet-stream"), &m3)
+            .map_err(Transport)?;
         if r2.status != 200 {
-            bail!("pair-verify M3 → {} {}{}", r2.status, r2.status_text, describe_error_body(&r2.body));
+            return Err(Rejected(anyhow!(
+                "pair-verify M3 → {} {}{}",
+                r2.status,
+                r2.status_text,
+                describe_error_body(&r2.body)
+            )));
         }
-        let shared = pv.finish(&r2.body).context("pair-verify M4")?;
+        let mut shared = pv.finish(&r2.body).context("pair-verify M4").map_err(Rejected)?;
         let keys = SessionKeys::from_shared(&shared);
+        // The shared secret is the IKM for every session key — wipe our
+        // stack copy once the (zeroize-on-Drop) SessionKeys are derived.
+        {
+            use zeroize::Zeroize;
+            shared.zeroize();
+        }
         let audio_key = keys.audio_key();
         self.writer = Some(keys.control_writer());
         self.reader = Some(keys.control_reader());
@@ -779,6 +842,24 @@ mod tests {
     fn uuid_format_is_canonical() {
         let u = format_uuid([0x01; 16]);
         assert_eq!(u, "01010101-0101-0101-0101-010101010101");
+    }
+
+    #[test]
+    fn describe_error_body_shapes() {
+        // Decorates every pairing failure message the user acts on.
+        assert_eq!(describe_error_body(&[]), "");
+        // A plist body renders as a debug dump.
+        let mut dict = plist::Dictionary::new();
+        dict.insert("errorCode".into(), Value::Integer((-42i64).into()));
+        let body = to_binary_plist(&Value::Dictionary(dict)).unwrap();
+        let s = describe_error_body(&body);
+        assert!(s.contains("body:"), "got: {}", s);
+        assert!(s.contains("errorCode"), "got: {}", s);
+        // Garbage falls back to a truncated hex dump.
+        let s = describe_error_body(&[0xAB; 100]);
+        assert!(s.contains("100B"), "got: {}", s);
+        assert!(s.contains(&"ab".repeat(64)), "got: {}", s);
+        assert!(s.ends_with("…)"), "got: {}", s);
     }
 
     #[test]

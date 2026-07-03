@@ -47,8 +47,9 @@ use crate::airplay::timing::{
 use crate::http_server::PcmFrame;
 use crate::WIRE_SAMPLE_RATE;
 
-/// Default AirPlay 2 RTSP port if the device didn't advertise one.
-const DEFAULT_AIRPLAY_PORT: u16 = 7000;
+/// Default AirPlay 2 RTSP port if the device didn't advertise one. Public
+/// so the app's PIN-pairing ceremony dials the same port as the session.
+pub const DEFAULT_AIRPLAY_PORT: u16 = 7000;
 /// Receiver playback latency in samples for the sync anchor. 88200 = 2 s —
 /// what iTunes actually uses with Sonos (packet-capture verified).
 const DEFAULT_LATENCY_SAMPLES: u32 = 88200;
@@ -78,37 +79,30 @@ pub struct AirPlay2SessionConfig {
     pub pairing_creds: Option<PairingCredentials>,
 }
 
-/// Error returned by [`AirPlay2Session::start`] when the receiver refuses
-/// transient pairing (HTTP 470) and no stored credentials exist: it needs
-/// one-time PIN verification (Apple TV with access control). The caller
-/// downcasts this to launch the PIN pairing ceremony instead of surfacing
-/// a generic failure.
-#[derive(Debug)]
-pub struct NeedsPinPairing;
-
-impl std::fmt::Display for NeedsPinPairing {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "receiver requires one-time PIN pairing")
-    }
+/// Typed outcome of [`AirPlay2Session::start`], so the caller's policy
+/// decisions (launch the PIN ceremony? invalidate stored credentials?) are
+/// compiler-checked matches instead of string sniffing or fragile anyhow
+/// downcasts that silently break under a future `.map_err` re-wrap.
+#[derive(Debug, thiserror::Error)]
+pub enum Ap2StartError {
+    /// The receiver refused transient pairing (HTTP 470) and no stored
+    /// credentials exist: it needs a one-time PIN ceremony (Apple TV with
+    /// access control / "Require Device Verification").
+    #[error("receiver requires one-time PIN pairing")]
+    NeedsPin,
+    /// The receiver *answered* pair-verify and rejected the stored
+    /// credentials (it forgot the pairing — e.g. the user removed it on
+    /// the Apple TV). The caller clears them and re-pairs; OwnTone's
+    /// "key cleared + re-prompt on verify failure". Transport failures
+    /// during pair-verify deliberately do NOT take this variant — they
+    /// surface as [`Ap2StartError::Other`] and leave the credentials
+    /// intact.
+    #[error("stored pairing no longer accepted by the receiver: {0:#}")]
+    VerifyRejected(#[source] anyhow::Error),
+    /// Everything else (connect failures, SETUP refusals, timeouts, …).
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
-
-impl std::error::Error for NeedsPinPairing {}
-
-/// Error returned by [`AirPlay2Session::start`] when `pair-verify` with
-/// stored credentials fails — almost always because the accessory forgot
-/// the pairing (the user removed it on the Apple TV). The caller clears the
-/// stale credentials and re-pairs, mirroring OwnTone's "key cleared +
-/// re-prompt on verify failure".
-#[derive(Debug)]
-pub struct PairVerifyFailed;
-
-impl std::fmt::Display for PairVerifyFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "stored pairing no longer accepted by the receiver")
-    }
-}
-
-impl std::error::Error for PairVerifyFailed {}
 
 /// A live AirPlay 2 session.
 pub struct AirPlay2Session {
@@ -137,7 +131,7 @@ pub struct AirPlay2Session {
 }
 
 impl AirPlay2Session {
-    pub fn start(cfg: AirPlay2SessionConfig) -> Result<Self> {
+    pub fn start(cfg: AirPlay2SessionConfig) -> std::result::Result<Self, Ap2StartError> {
         let port = cfg.renderer.airplay_port.unwrap_or(DEFAULT_AIRPLAY_PORT);
         info!(
             "AirPlay 2: starting session to {} ({}:{})",
@@ -148,8 +142,8 @@ impl AirPlay2Session {
         let audio_socket = bind_udp(cfg.local_ip).context("bind AP2 audio UDP")?;
         let control_socket = bind_udp(cfg.local_ip).context("bind AP2 control UDP")?;
         let timing_socket = bind_udp(cfg.local_ip).context("bind AP2 timing UDP")?;
-        let control_port = control_socket.local_addr()?.port();
-        let timing_port = timing_socket.local_addr()?.port();
+        let control_port = control_socket.local_addr().context("AP2 control socket addr")?.port();
+        let timing_port = timing_socket.local_addr().context("AP2 timing socket addr")?.port();
 
         let mut rtsp = Ap2Rtsp::connect(cfg.renderer.ip, port, cfg.local_ip, Duration::from_secs(5))
             .context("AirPlay 2 RTSP connect")?;
@@ -164,8 +158,11 @@ impl AirPlay2Session {
         // Pairing: a PIN-paired receiver (Apple TV with access control)
         // gets pair-verify from the stored long-term keys; everything else
         // gets transient pairing. A transient 470 means the receiver *needs*
-        // PIN pairing but we have no stored keys — surface NeedsPinPairing
-        // so the app can run the one-time PIN ceremony.
+        // PIN pairing but we have no stored keys — surface NeedsPin so the
+        // app can run the one-time PIN ceremony. A pair-verify REJECTION
+        // (response received, credentials refused) surfaces as
+        // VerifyRejected so the app clears the stale keys; a mere transport
+        // failure stays a generic error and the keys survive.
         let audio_key = if let Some(creds) = cfg.pairing_creds.clone() {
             info!(
                 "AirPlay 2: verifying stored pairing with {}",
@@ -173,13 +170,18 @@ impl AirPlay2Session {
             );
             match rtsp.pair_verify(&creds) {
                 Ok(key) => key,
-                Err(e) => {
+                Err(crate::airplay::ap2_rtsp::PairVerifyError::Rejected(e)) => {
                     warn!(
-                        "AirPlay 2: pair-verify with {} failed ({:#}) — clearing stored \
-                         pairing to re-pair",
+                        "AirPlay 2: {} rejected the stored pairing ({:#}) — it will be \
+                         cleared for re-pairing",
                         cfg.renderer.friendly_name, e
                     );
-                    return Err(PairVerifyFailed.into());
+                    return Err(Ap2StartError::VerifyRejected(e));
+                }
+                Err(crate::airplay::ap2_rtsp::PairVerifyError::Transport(e)) => {
+                    return Err(Ap2StartError::Other(
+                        e.context("AirPlay 2 HomeKit pair-verify (transport)"),
+                    ));
                 }
             }
         } else {
@@ -194,7 +196,7 @@ impl AirPlay2Session {
                          verification",
                         cfg.renderer.friendly_name
                     );
-                    return Err(NeedsPinPairing.into());
+                    return Err(Ap2StartError::NeedsPin);
                 }
             }
         };

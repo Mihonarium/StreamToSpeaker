@@ -76,6 +76,24 @@ pub struct UserConfig {
     /// not a reusable secret elsewhere.
     #[serde(default)]
     pub airplay_pairings: HashMap<String, PairingCredentials>,
+    /// Persistent per-install HomeKit controller identity (pairing id +
+    /// Ed25519 seed, hex), minted by the first PIN ceremony and reused
+    /// for every later pair-setup: HAP accessories key stored pairings on
+    /// the controller id, so a stable identity makes re-pairing REPLACE
+    /// the record instead of consuming another of the accessory's finite
+    /// pairing slots.
+    #[serde(default)]
+    pub airplay_controller_id: Option<String>,
+    #[serde(default)]
+    pub airplay_controller_seed_hex: Option<String>,
+    /// Catch-all preserving config keys this binary doesn't know about
+    /// (a newer version's settings) across load→save round-trips. Without
+    /// it, running an older build once silently strips them — which for
+    /// `airplay_pairings`-class data costs the user an on-screen PIN
+    /// ceremony per device to recreate. (Protects downgrades from
+    /// versions AFTER this one; releases before it still strip.)
+    #[serde(flatten)]
+    pub unknown_keys: serde_json::Map<String, serde_json::Value>,
     /// Forward Windows' "now playing" (title/artist/album from the System
     /// Media Transport Controls) to the speaker as track metadata, so it
     /// shows on the speaker's display / app. **Off by default** — it's a

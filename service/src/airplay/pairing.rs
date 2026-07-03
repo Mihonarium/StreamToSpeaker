@@ -100,9 +100,9 @@ impl TransientPairing {
             .ok_or_else(|| anyhow!("pair-setup M4 missing Proof"))?;
         if !self.srp.verify_server(server_proof) {
             bail!(
-                "pair-setup M4 server proof failed — the receiver rejected transient \
-                 pairing (it likely requires a password or on-screen device \
-                 verification, which isn't supported yet)"
+                "pair-setup M4 server proof failed — the receiver rejected PIN-less \
+                 transient pairing (it may require an AirPlay password, or one-time \
+                 PIN device verification)"
             );
         }
         Ok(SessionKeys::from_shared(self.srp.session_key()))
@@ -121,10 +121,18 @@ fn check_error(tlv: &Tlv) -> Result<()> {
     if let Some(code) = tlv.error() {
         // HAP error codes: 2=Authentication, 3=Backoff, 4=MaxPeers,
         // 5=MaxTries, 6=Unavailable, 7=Busy.
+        //
+        // NB: an Apple TV that wants PIN verification signals it with an
+        // HTTP 470 on the first pair-setup POST (which routes to the PIN
+        // ceremony — see ap2_rtsp::pair_setup_transient), not with a TLV
+        // error; OwnTone keys its PIN switch on the 470 alone, so we do
+        // too. These strings are for receivers that answer 200 + error.
         let meaning = match code {
-            2 => "authentication — receiver requires a password / device \
-                  verification (transient pairing rejected; not supported yet)",
+            2 => "authentication — the receiver refused PIN-less pairing (it may \
+                  require an AirPlay password, or one-time PIN device verification)",
             3 => "backoff (too many attempts, wait)",
+            4 => "max peers — the device's pairing list is full; remove old \
+                  pairings on the device and try again",
             5 => "max tries (too many wrong attempts — the receiver locked out)",
             6 => "unavailable",
             7 => "busy (another sender is pairing)",

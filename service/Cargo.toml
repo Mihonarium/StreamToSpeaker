@@ -1,6 +1,6 @@
 [package]
 name = "stream-to-speaker"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Stream To Speaker — user-mode bridge between a Windows virtual audio driver (or WASAPI loopback) and any UPnP/OpenHome network speaker (Sonos, IKEA StreamToSpeaker, etc)."

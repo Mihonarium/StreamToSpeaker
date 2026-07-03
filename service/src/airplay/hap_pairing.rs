@@ -114,17 +114,24 @@ impl PairingCredentials {
     }
 }
 
+/// Parse exactly 32 bytes of hex. Total-function by construction — this
+/// is fed from the hand-editable config.json, and the release profile is
+/// `panic = "abort"`, so a slicing panic on a truncated/multibyte string
+/// here would kill the whole app (and crash-loop it at launch while
+/// auto-reconnect keeps retrying the same device).
 fn hex32(s: &str) -> Result<[u8; 32]> {
-    let bytes = (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
-        .collect::<std::result::Result<Vec<u8>, _>>()
-        .map_err(|e| anyhow!("bad hex: {}", e))?;
-    if bytes.len() != 32 {
-        bail!("expected 32 bytes, got {}", bytes.len());
+    if s.len() != 64 || !s.is_ascii() {
+        bail!("expected 64 hex chars, got {} bytes", s.len());
     }
     let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
+    for (i, pair) in s.as_bytes().chunks_exact(2).enumerate() {
+        let hi = (pair[0] as char).to_digit(16);
+        let lo = (pair[1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(hi), Some(lo)) => out[i] = ((hi << 4) | lo) as u8,
+            _ => bail!("bad hex at offset {}", i * 2),
+        }
+    }
     Ok(out)
 }
 
@@ -146,6 +153,18 @@ fn random_controller_id() -> String {
     )
 }
 
+/// Mint a fresh persistent controller identity: `(controller_id,
+/// ed25519_seed_hex)`. Generated ONCE per install and reused for every
+/// pair-setup — HAP accessories key stored pairings on the controller id,
+/// so re-pairing with the same identity replaces the record instead of
+/// consuming another of the accessory's finite pairing slots (OwnTone
+/// likewise passes one fixed device id for its lifetime).
+pub fn generate_controller_identity() -> (String, String) {
+    let mut seed = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut seed);
+    (random_controller_id(), to_hex(&seed))
+}
+
 // ---------------------------------------------------------------------------
 // pair-setup (persistent, with PIN)
 // ---------------------------------------------------------------------------
@@ -158,6 +177,10 @@ pub struct PairSetupPin {
 }
 
 impl PairSetupPin {
+    /// Throwaway identity — tests only. Real ceremonies use
+    /// [`with_identity`] so the controller id is stable across re-pairs.
+    ///
+    /// [`with_identity`]: PairSetupPin::with_identity
     pub fn new(pin: &str) -> Self {
         let mut seed = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut seed);
@@ -166,6 +189,17 @@ impl PairSetupPin {
             controller_id: random_controller_id(),
             signing: SigningKey::from_bytes(&seed),
         }
+    }
+
+    /// Pair-setup with the install's persistent controller identity (see
+    /// [`generate_controller_identity`]).
+    pub fn with_identity(pin: &str, controller_id: String, controller_seed_hex: &str) -> Result<Self> {
+        let seed = hex32(controller_seed_hex).context("controller identity seed")?;
+        Ok(Self {
+            srp: SrpClient::new_homekit_with_pin(pin),
+            controller_id,
+            signing: SigningKey::from_bytes(&seed),
+        })
     }
 
     /// M1 request body. Persistent pair-setup: `State=1, Method=0` — no
@@ -395,6 +429,20 @@ impl PairVerify {
     }
 }
 
+impl Drop for PairVerify {
+    /// The X25519 shared secret is the input keying material for every
+    /// session key — wipe our copy on drop, matching the crate-wide
+    /// convention (srp.rs zeroizes its secrets; SessionKeys zeroizes on
+    /// Drop). `finish` copies the array out; this clears the copy that
+    /// stays behind in the struct.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(s) = self.shared.as_mut() {
+            s.zeroize();
+        }
+    }
+}
+
 fn ed25519_sig(bytes: &[u8]) -> Result<ed25519_dalek::Signature> {
     let arr: [u8; 64] = bytes
         .try_into()
@@ -424,6 +472,8 @@ fn check_error(tlv: &Tlv) -> Result<()> {
         let meaning = match code {
             2 => "authentication (wrong PIN)",
             3 => "backoff (too many attempts — wait)",
+            4 => "max peers — the device's pairing list is full; remove old \
+                  pairings on the device and try again",
             5 => "max tries (receiver locked out)",
             6 => "unavailable",
             7 => "busy (another sender is pairing)",
@@ -521,6 +571,45 @@ mod tests {
         let (id, ltpk) = parse_setup_m6(&k, &m6).expect("M6 accepted");
         assert_eq!(id, "AA:BB:CC:DD:EE:FF");
         assert_eq!(ltpk, acc_vk.to_bytes());
+    }
+
+    #[test]
+    fn hex32_rejects_malformed_input_without_panicking() {
+        // Fed from the hand-editable config.json — every malformed shape
+        // must be an Err, never a panic (release builds abort on panic).
+        assert!(hex32("").is_err());
+        assert!(hex32("ab").is_err()); // too short
+        assert!(hex32(&"a".repeat(63)).is_err()); // odd length
+        assert!(hex32(&"a".repeat(65)).is_err()); // too long
+        assert!(hex32(&"g".repeat(64)).is_err()); // not hex
+        assert!(hex32(&"é".repeat(32)).is_err()); // multibyte, 64 bytes
+        let good = "a0".repeat(32);
+        assert_eq!(hex32(&good).unwrap()[0], 0xa0);
+    }
+
+    #[test]
+    fn identity_roundtrips_through_hex() {
+        let (id, seed_hex) = generate_controller_identity();
+        assert_eq!(seed_hex.len(), 64);
+        let ps = PairSetupPin::with_identity("123-45-678", id.clone(), &seed_hex).unwrap();
+        assert_eq!(ps.controller_id, id);
+        // Same seed → same signing key → deterministic public key.
+        let ps2 = PairSetupPin::with_identity("123-45-678", id, &seed_hex).unwrap();
+        assert_eq!(
+            ps.signing.verifying_key().to_bytes(),
+            ps2.signing.verifying_key().to_bytes()
+        );
+    }
+
+    #[test]
+    fn max_peers_error_is_actionable() {
+        let m2 = TlvBuilder::new()
+            .add_u8(TYPE_STATE, 2)
+            .add_u8(0x07, 4) // TYPE_ERROR = 0x07, kTLVError_MaxPeers
+            .build();
+        let mut ps = PairSetupPin::new("123-45-678");
+        let err = ps.handle_m2(&m2).unwrap_err().to_string();
+        assert!(err.contains("pairing list is full"), "got: {}", err);
     }
 
     #[test]
