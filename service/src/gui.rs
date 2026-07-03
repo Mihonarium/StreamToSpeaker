@@ -1502,7 +1502,7 @@ impl StreamToSpeakerApp {
                 "⟳",
                 p.warn,
                 format!("Connecting to {}…", name),
-                "Setting up the session — the speaker list stays usable meanwhile.".to_string(),
+                "Setting up the session…".to_string(),
                 None,
                 None,
             )

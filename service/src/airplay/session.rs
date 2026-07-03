@@ -20,7 +20,7 @@ use crate::airplay::rtp::{
     bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, spawn_audio_sender,
     RtpSenderConfig,
 };
-use crate::airplay::rtsp::RtspClient;
+use crate::airplay::rtsp::{RtspClient, ServerPorts};
 use crate::airplay::timing::{
     spawn_resend_responder, spawn_sync_sender, spawn_timing_responder, ResendBuffer,
 };
@@ -108,45 +108,80 @@ impl AirPlaySession {
             audio_port, control_port, timing_port
         );
 
-        let mut rtsp = RtspClient::connect(
-            cfg.renderer.ip,
-            cfg.renderer.port,
-            cfg.local_ip,
-            cfg.connect_timeout,
-        )
-        .context("opening RTSP connection")?;
+        // Random initial RTP state for this session — generated once and
+        // reused across handshake attempts and the audio sender.
+        let initial_seq = random_initial_seq();
+        let initial_rtptime = random_initial_rtptime();
+        let ssrc = random_ssrc();
 
-        // Opening handshake — packet-capture verified against iTunes for
-        // Windows → Sonos (AirTunes/366 fw): iTunes' FIRST request is
-        // POST /auth-setup (0x01 + X25519), then ANNOUNCE — it never sends
-        // the classic OPTIONS + Apple-Challenge opener, and this Sonos
-        // firmware stalls on it. Receivers advertising MFi (et=4) or an
-        // AirPlay-2 side get the iTunes flow; plain legacy receivers keep
-        // the traditional OPTIONS + Apple-Challenge opener.
         let want_mfi = cfg.renderer.encryption_types.contains(&4);
         let mfi_style = want_mfi || cfg.renderer.supports_airplay2();
-        let shared_secret = if mfi_style {
-            Some(rtsp.auth_setup().context("RTSP auth-setup (MFi opener)")?)
-        } else {
-            rtsp.options().context("RTSP OPTIONS")?;
-            None
+
+        // One full RTSP bring-up (connect → opener → ANNOUNCE → SETUP →
+        // RECORD), factored so we can try the et=4 MFi path first and, if the
+        // receiver rejects it, reconnect and retry plaintext/RSA — never
+        // regressing a device that at least connected before.
+        //
+        // Opener: iTunes → Sonos (AirTunes/366) leads with POST /auth-setup
+        // (0x01 + X25519), not OPTIONS + Apple-Challenge (which this fw stalls
+        // on). MFi/AP2 devices get auth-setup; plain legacy receivers keep
+        // OPTIONS.
+        let attempt = |try_mfi: bool| -> Result<(RtspClient, Cipher, ServerPorts)> {
+            let mut rtsp = RtspClient::connect(
+                cfg.renderer.ip,
+                cfg.renderer.port,
+                cfg.local_ip,
+                cfg.connect_timeout,
+            )
+            .context("opening RTSP connection")?;
+
+            let cipher = if try_mfi {
+                // Packet-capture ground truth: iTunes encrypts audio to this
+                // Sonos via et=4 (mfiaeskey wrapped under the auth-setup ECDH
+                // secret); a plaintext ANNOUNCE is accepted but SETUP stalls.
+                let shared = rtsp
+                    .auth_setup()
+                    .context("RTSP auth-setup (MFi opener)")?;
+                Cipher::Mfi(MfiKey::derive(&shared))
+            } else {
+                if mfi_style {
+                    // Throwaway unlock — some AP2/MFi receivers 403 the
+                    // ANNOUNCE without a prior auth-setup.
+                    let _ = rtsp.auth_setup().context("RTSP auth-setup")?;
+                } else {
+                    rtsp.options().context("RTSP OPTIONS")?;
+                }
+                Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no compatible encryption mode for {} (advertised et={:?})",
+                        cfg.renderer.friendly_name,
+                        cfg.renderer.encryption_types,
+                    )
+                })?
+            };
+
+            rtsp.announce(&cipher).context("RTSP ANNOUNCE")?;
+            let ports = rtsp.setup(control_port, timing_port).context("RTSP SETUP")?;
+            rtsp.record(initial_seq, initial_rtptime)
+                .context("RTSP RECORD")?;
+            Ok((rtsp, cipher, ports))
         };
 
-        // Cipher choice. Packet-capture ground truth (iTunes → this Sonos,
-        // AirTunes/366): iTunes encrypts audio via the et=4 MFi path — a
-        // plaintext ANNOUNCE is accepted (200) but the receiver then stalls
-        // SETUP. So when the device advertises et=4 and we completed
-        // auth-setup, we take the MFi wrapped-key path; everything else
-        // falls back to the best of et=0 (plaintext) / et=1 (RSA).
-        let cipher = match (want_mfi, shared_secret) {
-            (true, Some(shared)) => Cipher::Mfi(MfiKey::derive(&shared)),
-            _ => Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no compatible encryption mode for {} (advertised et={:?})",
-                    cfg.renderer.friendly_name,
-                    cfg.renderer.encryption_types,
-                )
-            })?,
+        let (mut rtsp, cipher, server_ports) = if want_mfi {
+            match attempt(true) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "AirPlay: et=4 MFi handshake to {} failed ({:#}); \
+                         retrying with plaintext/RSA",
+                        cfg.renderer.friendly_name, e
+                    );
+                    attempt(false)
+                        .context("plaintext fallback after MFi handshake failed")?
+                }
+            }
+        } else {
+            attempt(false)?
         };
         info!(
             "AirPlay: cipher={} (receiver et={:?})",
@@ -154,22 +189,10 @@ impl AirPlaySession {
             cfg.renderer.encryption_types,
         );
         let cipher = Arc::new(cipher);
-        rtsp.announce(&cipher).context("RTSP ANNOUNCE")?;
-
-        let server_ports = rtsp
-            .setup(control_port, timing_port)
-            .context("RTSP SETUP")?;
         debug!(
             "AirPlay SETUP returned server ports: audio={}, control={}, timing={}",
             server_ports.audio, server_ports.control, server_ports.timing,
         );
-
-        // Random initial RTP state for this session.
-        let initial_seq = random_initial_seq();
-        let initial_rtptime = random_initial_rtptime();
-        let ssrc = random_ssrc();
-        rtsp.record(initial_seq, initial_rtptime)
-            .context("RTSP RECORD")?;
 
         if let Some(vol) = cfg.initial_volume {
             // Best-effort — don't fail the session if the volume set
