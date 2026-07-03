@@ -704,22 +704,33 @@ impl App {
                     }
 
                     if let Some(track) = &np {
-                        let sent = {
+                        let result = {
                             let guard = app.session.lock().unwrap();
                             match guard.as_ref() {
-                                Some(s) => s
-                                    .set_now_playing(&track.title, &track.artist, &track.album)
-                                    .is_ok(),
-                                None => false,
+                                Some(s) => Some(s.set_now_playing(
+                                    &track.title,
+                                    &track.artist,
+                                    &track.album,
+                                )),
+                                None => None,
                             }
                         };
-                        if sent {
-                            debug!(
-                                "now-playing → speaker: {} — {}",
-                                track.artist, track.title
-                            );
-                            last_sent = np;
+                        match result {
+                            Some(Ok(())) => {
+                                debug!("now-playing → speaker: {} — {}", track.artist, track.title);
+                            }
+                            Some(Err(e)) => {
+                                // Non-fatal — the receiver may not support
+                                // metadata. Record it as attempted anyway so
+                                // we don't re-send the SAME track every tick
+                                // (which, on a receiver that hangs on it,
+                                // could otherwise churn reconnects).
+                                debug!("now-playing send failed (non-fatal): {:#}", e);
+                            }
+                            None => continue, // session vanished; retry later
                         }
+                        // Mark this track attempted regardless of outcome.
+                        last_sent = np;
                     } else {
                         // Nothing playing now; remember so we re-send when
                         // it resumes.
