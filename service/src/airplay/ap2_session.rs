@@ -77,6 +77,10 @@ pub struct AirPlay2Session {
     pub renderer: AirPlayRenderer,
     rtsp: Arc<Mutex<Ap2Rtsp>>,
     stop_flag: Arc<AtomicBool>,
+    /// Set by background threads when the session has demonstrably died
+    /// (audio send error, buffered TCP write failure, repeated /feedback
+    /// failures). Polled by the app watchdog for auto-reconnect.
+    dead: Arc<AtomicBool>,
     sender_handle: Option<JoinHandle<()>>,
     timing_handle: Option<JoinHandle<()>>,
     sync_handle: Option<JoinHandle<()>>,
@@ -125,6 +129,7 @@ impl AirPlay2Session {
         info!("AirPlay 2: paired with {}", cfg.renderer.friendly_name);
 
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
 
         // Timing-protocol choice: receivers advertising SupportsPTP (bit 41)
         // get the full PTP path — field-tested on a SYMFONISK whose current
@@ -325,6 +330,7 @@ impl AirPlay2Session {
                 rtsp: rtsp.clone(),
                 timeline: ptp_session.as_ref().unwrap().timeline.clone(),
                 codec,
+                session_dead: dead.clone(),
             })?;
             info!(
                 "AirPlay 2: buffered {} stream armed — will anchor at first audio",
@@ -388,6 +394,7 @@ impl AirPlay2Session {
                 receiver_name: cfg.renderer.friendly_name.clone(),
                 current_rtptime,
                 resend: resend.clone(),
+                session_dead: dead.clone(),
             })?;
 
             let resend_handle = spawn_resend_responder(
@@ -416,6 +423,7 @@ impl AirPlay2Session {
         let feedback_handle = spawn_feedback_keepalive(
             rtsp.clone(),
             stop_flag.clone(),
+            dead.clone(),
             cfg.renderer.friendly_name.clone(),
         );
 
@@ -423,6 +431,7 @@ impl AirPlay2Session {
             renderer: cfg.renderer,
             rtsp,
             stop_flag,
+            dead,
             sender_handle: Some(sender_handle),
             timing_handle,
             sync_handle,
@@ -434,6 +443,12 @@ impl AirPlay2Session {
             data_stream,
             _audio_socket: audio_socket,
         })
+    }
+
+    /// True once a background thread flagged the session dead (dropped
+    /// receiver). Polled by the app watchdog for auto-reconnect.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
     }
 
     pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
@@ -564,12 +579,14 @@ fn spawn_event_channel(
 fn spawn_feedback_keepalive(
     rtsp: Arc<Mutex<Ap2Rtsp>>,
     stop_flag: Arc<AtomicBool>,
+    dead: Arc<AtomicBool>,
     receiver_name: String,
 ) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name(format!("stream-to-speaker-ap2-feedback:{}", receiver_name))
         .spawn(move || {
             let mut warned = false;
+            let mut consecutive_failures = 0u32;
             'outer: loop {
                 // Sleep in slices so shutdown isn't delayed.
                 let slices = (FEEDBACK_INTERVAL.as_millis() / 100) as u32;
@@ -586,6 +603,15 @@ fn spawn_feedback_keepalive(
                     } else {
                         debug!("AirPlay 2 /feedback failed: {:#}", e);
                     }
+                    consecutive_failures += 1;
+                    // Sustained /feedback failure = the encrypted control
+                    // channel is gone; flag the session dead for the app
+                    // watchdog.
+                    if consecutive_failures >= 3 {
+                        dead.store(true, Ordering::Release);
+                    }
+                } else {
+                    consecutive_failures = 0;
                 }
             }
             debug!("AirPlay 2 feedback keepalive exiting");
@@ -642,6 +668,7 @@ struct BufferedSenderConfig {
     timeline: PtpTimeline,
     /// Negotiated payload codec (must match the SETUP's ct/spf).
     codec: BufferedCodecKind,
+    session_dead: Arc<AtomicBool>,
 }
 
 /// Send SETRATEANCHORTIME for the buffered stream: "rtpTime plays at
@@ -831,6 +858,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
 
                 if let Err(e) = cfg.stream.write_all(&framed) {
                     warn!("AirPlay 2 buffered send failed (receiver stopped reading?): {}", e);
+                    cfg.session_dead.store(true, Ordering::Release);
                     return;
                 }
                 if packet_count == 0 {
@@ -879,6 +907,7 @@ struct Ap2SenderConfig {
     receiver_name: String,
     current_rtptime: Arc<AtomicU32>,
     resend: Arc<ResendBuffer>,
+    session_dead: Arc<AtomicBool>,
 }
 
 fn spawn_ap2_sender(cfg: Ap2SenderConfig) -> Result<JoinHandle<()>> {
@@ -1019,6 +1048,7 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
 
         if let Err(e) = cfg.audio_socket.send_to(&packet, cfg.receiver_addr) {
             warn!("AirPlay 2 RTP send failed: {}", e);
+            cfg.session_dead.store(true, Ordering::Release);
             return;
         }
         cfg.resend.record(seq, &packet);

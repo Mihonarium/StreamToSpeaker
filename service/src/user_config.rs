@@ -41,6 +41,14 @@ pub struct UserConfig {
     /// Edit config.json by hand to flip; no GUI yet.
     #[serde(default)]
     pub prefer_realtime_airplay: bool,
+    /// Auto-reconnect when a live session drops mid-stream (speaker
+    /// rebooted, Wi-Fi blip, receiver reaped the session). One retry per
+    /// drop, 5 s after detection — OwnTone's field-proven policy (its 5 s
+    /// spacing also respects the Sonos half-open-session hold). The dead
+    /// session is torn down either way so the UI never shows a zombie
+    /// "streaming" state.
+    #[serde(default = "default_auto_reconnect")]
+    pub auto_reconnect_on_drop: bool,
     /// RAOP `et=4` MFi-encryption experiment switch. iTunes encrypts
     /// audio to et=4 receivers with a key wrapped via the auth-setup
     /// ECDH secret; our wrap is a best-grounded guess (no open-source

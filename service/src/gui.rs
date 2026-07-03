@@ -1809,8 +1809,8 @@ impl StreamToSpeakerApp {
                 });
             });
 
-            // Auto-reconnect preference (next to the saved-speaker
-            // controls so it's discoverable when a speaker is saved).
+            // Auto-reconnect preferences (next to the saved-speaker
+            // controls so they're discoverable when a speaker is saved).
             if self.app.saved_speaker_id().is_some() {
                 let mut auto = self.app.is_auto_reconnect_on_launch();
                 let resp = ui.checkbox(
@@ -1819,6 +1819,17 @@ impl StreamToSpeakerApp {
                 );
                 if resp.changed() {
                     self.app.set_auto_reconnect_on_launch(auto);
+                }
+
+                let mut on_drop = self.app.is_auto_reconnect_on_drop();
+                let resp = ui
+                    .checkbox(&mut on_drop, "Reconnect automatically if the connection drops")
+                    .on_hover_text(
+                        "If the speaker reboots or drops off Wi-Fi mid-stream, reconnect after a \
+                         few seconds instead of leaving a dead connection.",
+                    );
+                if resp.changed() {
+                    self.app.set_auto_reconnect_on_drop(on_drop);
                 }
             }
 

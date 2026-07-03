@@ -85,6 +85,11 @@ pub struct AirPlaySession {
     /// Signals every background thread to stop (audio sender, timing
     /// responder, sync sender, resend responder, keepalive).
     stop_flag: Arc<AtomicBool>,
+    /// Set by the background threads when the session has demonstrably
+    /// died (audio socket send error, or repeated keepalive failures on
+    /// the RTSP connection). The app-level watchdog polls this to tear
+    /// down the zombie and auto-reconnect.
+    dead: Arc<AtomicBool>,
     /// The background threads. All of them watch `stop_flag` with
     /// bounded wakeups, so `stop()` just sets the flag and joins.
     threads: Vec<JoinHandle<()>>,
@@ -183,6 +188,7 @@ impl AirPlaySession {
         // responder-after-RECORD ordering left those probes unanswered in
         // every stalled-SETUP session on record.
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
         let mut guard = SpawnGuard::new(stop_flag.clone());
         guard.adopt(
             spawn_timing_responder(
@@ -348,6 +354,7 @@ impl AirPlaySession {
             current_rtptime,
             resend: resend.clone(),
             uncompressed_alac: cfg.uncompressed_alac,
+            session_dead: dead.clone(),
         };
         guard.adopt(spawn_audio_sender(sender_cfg)?);
 
@@ -374,11 +381,13 @@ impl AirPlaySession {
         let keepalive_handle = {
             let rtsp = rtsp.clone();
             let stop_flag = stop_flag.clone();
+            let dead = dead.clone();
             let name = cfg.renderer.friendly_name.clone();
             std::thread::Builder::new()
                 .name(format!("stream-to-speaker-airplay-keepalive:{}", name))
                 .spawn(move || {
                     let mut healthy = true;
+                    let mut consecutive_failures = 0u32;
                     loop {
                         let interval = if healthy {
                             Duration::from_secs(2)
@@ -407,6 +416,7 @@ impl AirPlaySession {
                                     info!("AirPlay keepalive to {} recovered", name);
                                 }
                                 healthy = true;
+                                consecutive_failures = 0;
                             }
                             Err(e) => {
                                 if healthy {
@@ -417,6 +427,15 @@ impl AirPlaySession {
                                     );
                                 }
                                 healthy = false;
+                                consecutive_failures += 1;
+                                // Two failures ≈ 12–20 s of an unresponsive
+                                // control connection — the session is dead;
+                                // flag it for the app watchdog (which tears
+                                // down and auto-reconnects). Keep probing
+                                // anyway in case teardown is slow to arrive.
+                                if consecutive_failures >= 2 {
+                                    dead.store(true, Ordering::Release);
+                                }
                             }
                         }
                     }
@@ -440,9 +459,17 @@ impl AirPlaySession {
             renderer: cfg.renderer,
             rtsp,
             stop_flag,
+            dead,
             threads: guard.into_threads(),
             _audio_socket: audio_socket,
         })
+    }
+
+    /// True once a background thread has flagged the session as dead
+    /// (unreachable receiver / dropped connection). The app watchdog
+    /// polls this to replace the zombie with a fresh session.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
     }
 
     /// Push a new volume value (0..=100) to the receiver. Idempotent

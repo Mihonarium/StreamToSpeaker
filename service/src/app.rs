@@ -94,6 +94,17 @@ impl ActiveSession {
         }
     }
 
+    /// True if the session has died mid-stream (dropped receiver). UPnP
+    /// is HTTP-pull (the speaker reconnects on its own), so only the
+    /// AirPlay push paths report death here.
+    pub fn is_dead(&self) -> bool {
+        match self {
+            ActiveSession::Upnp(_) => false,
+            ActiveSession::AirPlay(s) => s.is_dead(),
+            ActiveSession::AirPlay2(s) => s.is_dead(),
+        }
+    }
+
     /// Push a mute state to the speaker.
     pub fn set_mute(&self, muted: bool) -> Result<()> {
         match self {
@@ -321,6 +332,20 @@ impl App {
         self.user_config.lock().unwrap().auto_reconnect_on_launch
     }
 
+    /// Whether to auto-reconnect when a live session drops mid-stream.
+    pub fn is_auto_reconnect_on_drop(&self) -> bool {
+        self.user_config.lock().unwrap().auto_reconnect_on_drop
+    }
+
+    /// Persist the drop-reconnect preference.
+    pub fn set_auto_reconnect_on_drop(&self, on: bool) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.auto_reconnect_on_drop != on {
+            uc.auto_reconnect_on_drop = on;
+            uc.save();
+        }
+    }
+
     /// Persist the auto-reconnect preference.
     pub fn set_auto_reconnect_on_launch(&self, on: bool) {
         let mut uc = self.user_config.lock().unwrap();
@@ -494,6 +519,102 @@ impl App {
                 *app.connecting.lock().unwrap() = None;
                 if let Err(e) = result {
                     app.record_error(format!("Couldn't connect to speaker: {}", e));
+                }
+            })
+            .ok();
+    }
+
+    /// Background watchdog: when a live session drops mid-stream (speaker
+    /// rebooted / Wi-Fi blip / receiver reaped the session), tear it down
+    /// and reconnect once — so the UI never sits on a zombie "streaming"
+    /// state. Mirrors OwnTone's policy: a single retry, ~5 s after
+    /// detection (the spacing also respects the Sonos half-open hold).
+    /// Gated on the `auto_reconnect_on_drop` config (default on) and on
+    /// streaming being enabled (never fights a user who hit Disable).
+    pub fn spawn_reconnect_watchdog(self: &Arc<Self>) {
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-reconnect-watchdog".into())
+            .spawn(move || {
+                const RECONNECT_GRACE: Duration = Duration::from_secs(5);
+                loop {
+                    // Poll ~1 s, sliced so shutdown is prompt.
+                    for _ in 0..10 {
+                        if app.is_shutting_down() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+
+                    if !app.user_config.lock().unwrap().auto_reconnect_on_drop {
+                        continue;
+                    }
+                    if !app.streaming_enabled.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if app.connecting.lock().unwrap().is_some() {
+                        continue;
+                    }
+
+                    // Is the bound session dead?
+                    let (id, name) = {
+                        let guard = app.session.lock().unwrap();
+                        match guard.as_ref() {
+                            Some(s) if s.is_dead() => (s.stable_id(), s.friendly_name()),
+                            _ => continue,
+                        }
+                    };
+
+                    warn!(
+                        "AirPlay session to {} dropped; auto-reconnecting in {} s",
+                        name,
+                        RECONNECT_GRACE.as_secs()
+                    );
+                    app.record_error(format!("Lost connection to {} — reconnecting…", name));
+
+                    // Grace before the retry, cancellable by shutdown or a
+                    // user Disable.
+                    let mut cancelled = false;
+                    for _ in 0..(RECONNECT_GRACE.as_millis() / 100) {
+                        if app.is_shutting_down() {
+                            return;
+                        }
+                        if !app.streaming_enabled.load(Ordering::Acquire) {
+                            cancelled = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    if cancelled {
+                        continue;
+                    }
+
+                    // Confirm it's still the same dead session (a manual
+                    // reselect during the grace may have replaced it).
+                    let still_dead = app
+                        .session
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|s| s.is_dead() && s.stable_id() == id)
+                        .unwrap_or(false);
+                    if !still_dead {
+                        continue;
+                    }
+
+                    // Reconnect. `select_speaker` tears the dead session
+                    // down first (replacing_same) then brings up a fresh
+                    // one; async so this thread never blocks on the
+                    // multi-second handshake. One shot per drop: if it
+                    // fails the session ends up None and we stop retrying
+                    // (no hammering a gone speaker / poking the Sonos hold).
+                    app.select_speaker_async(&id);
+                    while app.connecting.lock().unwrap().is_some() {
+                        if app.is_shutting_down() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
                 }
             })
             .ok();
