@@ -94,19 +94,14 @@ impl ActiveSession {
         }
     }
 
-    /// Push "now playing" track metadata to the speaker. Only the RAOP
-    /// (AirPlay 1) path implements it today; AP2/UPnP are no-ops. Returns
-    /// `Ok` on a no-op so callers don't treat unsupported as an error.
-    pub fn set_now_playing(&self, title: &str, artist: &str, album: &str) -> Result<()> {
+    /// A detached metadata sender for the bound speaker, if this session
+    /// type supports track metadata (RAOP only today). Cloning it is
+    /// cheap and lets the caller send without holding the session lock.
+    pub fn metadata_handle(&self) -> Option<crate::airplay::session::MetadataHandle> {
         match self {
-            ActiveSession::AirPlay(s) => s.set_now_playing(title, artist, album),
-            ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) => Ok(()),
+            ActiveSession::AirPlay(s) => Some(s.metadata_handle()),
+            ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) => None,
         }
-    }
-
-    /// Whether this session type can display track metadata (RAOP only).
-    pub fn supports_metadata(&self) -> bool {
-        matches!(self, ActiveSession::AirPlay(_))
     }
 
     /// True if the session has died mid-stream (dropped receiver). UPnP
@@ -685,18 +680,15 @@ impl App {
                         continue;
                     }
 
-                    // Only bother if a metadata-capable session is bound.
-                    let capable = app
-                        .session
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|s| s.supports_metadata())
-                        .unwrap_or(false);
-                    if !capable {
+                    // Grab a detached metadata handle (RAOP only) under a
+                    // brief session lock, then release it — the network send
+                    // below must NOT hold the session mutex (the GUI polls
+                    // it every repaint; a slow send would freeze the UI).
+                    let handle = app.session.lock().unwrap().as_ref().and_then(|s| s.metadata_handle());
+                    let Some(handle) = handle else {
                         last_sent = None;
                         continue;
-                    }
+                    };
 
                     let np = crate::now_playing::current();
                     if np == last_sent {
@@ -704,22 +696,11 @@ impl App {
                     }
 
                     if let Some(track) = &np {
-                        let result = {
-                            let guard = app.session.lock().unwrap();
-                            match guard.as_ref() {
-                                Some(s) => Some(s.set_now_playing(
-                                    &track.title,
-                                    &track.artist,
-                                    &track.album,
-                                )),
-                                None => None,
-                            }
-                        };
-                        match result {
-                            Some(Ok(())) => {
+                        match handle.send(&track.title, &track.artist, &track.album) {
+                            Ok(()) => {
                                 debug!("now-playing → speaker: {} — {}", track.artist, track.title);
                             }
-                            Some(Err(e)) => {
+                            Err(e) => {
                                 // Non-fatal — the receiver may not support
                                 // metadata. Record it as attempted anyway so
                                 // we don't re-send the SAME track every tick
@@ -727,7 +708,6 @@ impl App {
                                 // could otherwise churn reconnects).
                                 debug!("now-playing send failed (non-fatal): {:#}", e);
                             }
-                            None => continue, // session vanished; retry later
                         }
                         // Mark this track attempted regardless of outcome.
                         last_sent = np;

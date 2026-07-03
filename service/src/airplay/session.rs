@@ -469,13 +469,17 @@ impl AirPlaySession {
         })
     }
 
-    /// Push track metadata (title/artist/album) to the receiver via
-    /// SET_PARAMETER. Best-effort and non-fatal — a receiver that ignores
-    /// or rejects metadata is fine; we never let it affect the audio path.
-    pub fn set_now_playing(&self, title: &str, artist: &str, album: &str) -> Result<()> {
-        let body = crate::airplay::dmap::now_playing_body(title, artist, album);
-        let rtptime = self.current_rtptime.load(Ordering::Acquire);
-        self.rtsp.lock().unwrap().set_metadata(&body, rtptime)
+    /// A cheap, detachable handle for pushing track metadata without
+    /// holding the (GUI-hot) session lock during the network send. The
+    /// forwarder clones this under a brief session lock, releases the
+    /// session lock, then calls [`MetadataHandle::send`] — which touches
+    /// only the RTSP mutex (shared with the keepalive/volume, never the
+    /// session mutex the GUI polls every repaint).
+    pub fn metadata_handle(&self) -> MetadataHandle {
+        MetadataHandle {
+            rtsp: self.rtsp.clone(),
+            current_rtptime: self.current_rtptime.clone(),
+        }
     }
 
     /// True once a background thread has flagged the session as dead
@@ -521,6 +525,23 @@ impl Drop for AirPlaySession {
         // Belt-and-braces: ensure the audio thread is told to stop if
         // someone drops a session without calling `stop`.
         self.stop_flag.store(true, Ordering::Release);
+    }
+}
+
+/// Detached metadata sender — see [`AirPlaySession::metadata_handle`].
+/// Holds only the shared RTSP connection + RTP clock, so the background
+/// forwarder can send without contending on the session mutex.
+pub struct MetadataHandle {
+    rtsp: Arc<Mutex<RtspClient>>,
+    current_rtptime: Arc<AtomicU32>,
+}
+
+impl MetadataHandle {
+    /// Push "now playing" to the receiver (best-effort, non-fatal).
+    pub fn send(&self, title: &str, artist: &str, album: &str) -> Result<()> {
+        let body = crate::airplay::dmap::now_playing_body(title, artist, album);
+        let rtptime = self.current_rtptime.load(Ordering::Acquire);
+        self.rtsp.lock().unwrap().set_metadata(&body, rtptime)
     }
 }
 
