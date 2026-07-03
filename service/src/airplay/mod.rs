@@ -41,6 +41,7 @@ pub mod ap2_session;
 pub mod crypto;
 pub mod discovery;
 pub mod dmap;
+pub mod hap_pairing;
 pub mod pairing;
 pub mod rtp;
 pub mod rtsp;
