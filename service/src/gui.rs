@@ -864,9 +864,6 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 last_applied_dark: None,
                 last_applied_accent: None,
                 hwnd,
-                last_scroll_y: 0.0,
-                pinned_status_visible: false,
-                prev_scroll_area_top: 0.0,
             }))
         }),
     );
@@ -905,22 +902,6 @@ struct StreamToSpeakerApp {
     /// tray-menu round-trip (emilk/egui#5229, #3655). Bypassing the
     /// queue with raw Win32 sidesteps the bug entirely.
     hwnd: Option<isize>,
-    /// Last-observed scroll offset of the main content area. Drives the
-    /// pinned compact status bar (m44): when the user has scrolled past
-    /// the full status banner, a thin pinned bar appears above the
-    /// scroll area so speaker + state stay visible.
-    last_scroll_y: f32,
-    /// Hysteresis flag for the pinned bar. Shows at scroll > 100,
-    /// hides at scroll < 60 — single threshold would flicker on every
-    /// frame the user parked their scroll exactly on the boundary.
-    pinned_status_visible: bool,
-    /// Y-position where the scroll area started on the previous frame.
-    /// The pinned bar (and any other content above the scroll area)
-    /// changes this height when it appears/disappears; we compensate the
-    /// scroll offset by the delta so the visible content doesn't jump
-    /// (was: a visible hop every time the bar toggled, very noticeable
-    /// mid-flick on a touchpad).
-    prev_scroll_area_top: f32,
 }
 
 /// Win32 helpers for hide/show. eframe's `ViewportCommand::Visible` /
@@ -1068,26 +1049,6 @@ impl eframe::App for StreamToSpeakerApp {
                     self.show_header(ui, &p);
                     ui.add_space(sp::S);
 
-                    // m44: pinned compact status bar — appears above
-                    // the scroll area once the full status banner has
-                    // scrolled out of view, so the user can still see
-                    // the speaker + state (and hit Enable/Disable)
-                    // without scrolling back to the top. Hysteresis
-                    // (show > 100, hide < 60) prevents flicker on
-                    // the boundary.
-                    let want_pinned = if self.last_scroll_y > 100.0 {
-                        true
-                    } else if self.last_scroll_y < 60.0 {
-                        false
-                    } else {
-                        self.pinned_status_visible
-                    };
-                    self.pinned_status_visible = want_pinned;
-                    if want_pinned && self.app.is_speaker_bound() {
-                        self.show_pinned_status(ui, &p);
-                        ui.add_space(sp::S);
-                    }
-
                     // Reserve a right-edge inset for the auto-expanding
                     // scrollbar. egui's modern scrollbar starts as a
                     // 2 px panning indicator and morphs to 6 px on
@@ -1096,27 +1057,26 @@ impl eframe::App for StreamToSpeakerApp {
                     // border of every card — exactly the "scrollbar
                     // touching the card borders" the audit / user
                     // reported.
-                    // Compensate for the pinned bar (and anything else
-                    // above) changing the scroll area's top position: when
-                    // it appears/disappears it shifts the content by its
-                    // height, which reads as a jump. Measure the shift
-                    // since last frame and fold it into the scroll offset
-                    // so the visible content stays put. Only forced on the
-                    // frame the height actually changed, so it never fights
-                    // the user's own scrolling.
-                    let scroll_area_top = ui.cursor().top();
-                    let top_shift = scroll_area_top - self.prev_scroll_area_top;
-                    self.prev_scroll_area_top = scroll_area_top;
-
-                    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
-                    if top_shift.abs() > 0.5 && self.last_scroll_y > 0.5 {
-                        scroll = scroll
-                            .vertical_scroll_offset((self.last_scroll_y + top_shift).max(0.0));
-                    }
-                    let out = scroll
+                    //
+                    // m44: the compact pinned status bar is drawn AFTER
+                    // the scroll area as a floating overlay (see below).
+                    // It occupies zero layout space, so its appearance
+                    // can never shift the content — earlier in-layout
+                    // versions made the page hop on every toggle (worst
+                    // mid-fling on a touchpad) and fighting that with a
+                    // scroll-offset compensation broke scrollbar drags
+                    // and inertia. We record the full status banner's
+                    // bottom edge so the overlay can appear exactly when
+                    // the banner leaves the viewport — no thresholds, no
+                    // hysteresis, and the two can't both be readable at
+                    // once.
+                    let mut banner_bottom_px = f32::MAX;
+                    let out = egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_max_width(ui.available_width() - sp::M);
                             self.show_status_banner(ui, &p);
+                            banner_bottom_px = ui.cursor().top();
                             self.show_error_banner(ui, &p);
                             ui.add_space(sp::M);
                             // Show onboarding regardless of whether a
@@ -1142,7 +1102,44 @@ impl eframe::App for StreamToSpeakerApp {
                             ui.add_space(sp::M);
                             self.show_stats(ui, &p);
                         });
-                    self.last_scroll_y = out.state.offset.y;
+
+                    // Floating pinned status bar: fades/slides in over the
+                    // scroll content once the full banner has scrolled out
+                    // of view. animate_bool gives the smooth transition;
+                    // because it's an overlay, the scroll offset, scrollbar
+                    // geometry, and kinetic fling are completely untouched.
+                    let viewport = out.inner_rect;
+                    let show_pinned = self.app.is_speaker_bound()
+                        && banner_bottom_px <= viewport.top() + 1.0;
+                    let t = ui.ctx().animate_bool_with_time(
+                        egui::Id::new("pinned-status-overlay"),
+                        show_pinned,
+                        0.18,
+                    );
+                    if t > 0.0 {
+                        // Slide down from behind the header while fading in.
+                        let slide = (1.0 - t) * 28.0;
+                        egui::Area::new(egui::Id::new("pinned-status-area"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(egui::pos2(viewport.left(), viewport.top() - slide))
+                            .show(ui.ctx(), |aui| {
+                                aui.set_opacity(t);
+                                aui.set_width(viewport.width());
+                                // Canvas-coloured backdrop so scroll content
+                                // doesn't bleed through around the card's
+                                // rounded corners — reads as the header
+                                // extending down over the content.
+                                egui::Frame::none()
+                                    .fill(p.canvas)
+                                    .inner_margin(egui::Margin {
+                                        bottom: 6.0,
+                                        ..Default::default()
+                                    })
+                                    .show(aui, |aui| {
+                                        self.show_pinned_status(aui, &p);
+                                    });
+                            });
+                    }
                 });
             });
     }
