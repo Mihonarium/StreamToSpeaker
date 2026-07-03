@@ -350,15 +350,22 @@ impl App {
         let active_id = self.session.lock().unwrap().as_ref().map(|s| s.stable_id());
         let mut speakers: Vec<SpeakerInfo> = Vec::new();
 
+        // Track the IPs that have a non-AirPlay (UPnP) entry, so we can
+        // warn on the AirPlay twin that it'll have higher latency (the
+        // AirPlay path buffers ~1–2 s; the UPnP path is lower-latency).
+        let mut upnp_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         if let Some(d) = self.discovery.as_ref() {
             for r in d.renderers() {
                 let id = r.stable_id();
                 let active = active_id.as_deref() == Some(id.as_str());
+                upnp_ips.insert(r.ip.to_string());
                 speakers.push(SpeakerInfo {
                     id,
                     friendly_name: r.friendly_name,
                     ip: r.ip.to_string(),
                     active,
+                    note: None,
                 });
             }
         }
@@ -366,10 +373,23 @@ impl App {
             for r in d.renderers() {
                 let id = r.stable_id();
                 let active = active_id.as_deref() == Some(id.as_str());
+                let transport = r.transport();
+                let usable = transport.is_some();
+                // Same physical speaker also reachable over UPnP → AirPlay
+                // will add noticeably more delay; flag it (only when the
+                // AirPlay path is actually usable — no point warning about
+                // latency on an entry they can't select).
+                let has_upnp_twin = usable && upnp_ips.contains(&r.ip.to_string());
                 // Annotate the row so the user can tell which protocol a
                 // click will use (Sonos advertises both UPnP and AirPlay)
                 // and why an unsupported one might fail.
-                let name = match r.transport() {
+                let name = match transport {
+                    Some(Transport::RaopLegacy) if has_upnp_twin => {
+                        format!("{} (AirPlay, higher delay)", r.friendly_name)
+                    }
+                    Some(Transport::AirPlay2) if has_upnp_twin => {
+                        format!("{} (AirPlay 2, higher delay)", r.friendly_name)
+                    }
                     Some(Transport::RaopLegacy) => format!("{} (AirPlay)", r.friendly_name),
                     Some(Transport::AirPlay2) => format!("{} (AirPlay 2)", r.friendly_name),
                     None if r.password_protected => {
@@ -377,11 +397,19 @@ impl App {
                     }
                     None => format!("{} (AirPlay, unsupported)", r.friendly_name),
                 };
+                let note = has_upnp_twin.then(|| {
+                    "This speaker also has a non-AirPlay (UPnP) entry in the list, which has \
+                     lower latency. AirPlay buffers about 1–2 seconds of audio, so it will be \
+                     more out of sync with video. Prefer the plain entry unless you specifically \
+                     need AirPlay."
+                        .to_string()
+                });
                 speakers.push(SpeakerInfo {
                     id,
                     friendly_name: name,
                     ip: r.ip.to_string(),
                     active,
+                    note,
                 });
             }
         }

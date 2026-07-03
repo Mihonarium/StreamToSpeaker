@@ -866,6 +866,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 hwnd,
                 last_scroll_y: 0.0,
                 pinned_status_visible: false,
+                prev_scroll_area_top: 0.0,
             }))
         }),
     );
@@ -913,6 +914,13 @@ struct StreamToSpeakerApp {
     /// hides at scroll < 60 — single threshold would flicker on every
     /// frame the user parked their scroll exactly on the boundary.
     pinned_status_visible: bool,
+    /// Y-position where the scroll area started on the previous frame.
+    /// The pinned bar (and any other content above the scroll area)
+    /// changes this height when it appears/disappears; we compensate the
+    /// scroll offset by the delta so the visible content doesn't jump
+    /// (was: a visible hop every time the bar toggled, very noticeable
+    /// mid-flick on a touchpad).
+    prev_scroll_area_top: f32,
 }
 
 /// Win32 helpers for hide/show. eframe's `ViewportCommand::Visible` /
@@ -1088,8 +1096,24 @@ impl eframe::App for StreamToSpeakerApp {
                     // border of every card — exactly the "scrollbar
                     // touching the card borders" the audit / user
                     // reported.
-                    let out = egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
+                    // Compensate for the pinned bar (and anything else
+                    // above) changing the scroll area's top position: when
+                    // it appears/disappears it shifts the content by its
+                    // height, which reads as a jump. Measure the shift
+                    // since last frame and fold it into the scroll offset
+                    // so the visible content stays put. Only forced on the
+                    // frame the height actually changed, so it never fights
+                    // the user's own scrolling.
+                    let scroll_area_top = ui.cursor().top();
+                    let top_shift = scroll_area_top - self.prev_scroll_area_top;
+                    self.prev_scroll_area_top = scroll_area_top;
+
+                    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                    if top_shift.abs() > 0.5 && self.last_scroll_y > 0.5 {
+                        scroll = scroll
+                            .vertical_scroll_offset((self.last_scroll_y + top_shift).max(0.0));
+                    }
+                    let out = scroll
                         .show(ui, |ui| {
                             ui.set_max_width(ui.available_width() - sp::M);
                             self.show_status_banner(ui, &p);
@@ -2597,6 +2621,14 @@ fn speaker_row(
     if response.hovered() && response.enabled() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+
+    // Advisory tooltip (e.g. "higher delay" for an AirPlay entry whose
+    // speaker also has a lower-latency UPnP entry).
+    let response = if let Some(note) = sp.note.as_deref() {
+        response.on_hover_text(note)
+    } else {
+        response
+    };
 
     if (response.clicked() || kbd_activate) && !active {
         on_click(&sp.id);
