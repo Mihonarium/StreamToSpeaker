@@ -163,7 +163,13 @@ impl RtspClient {
     /// and no Session header.
     pub fn options_keepalive(&mut self) -> Result<()> {
         let resp = self.request_opts("OPTIONS", "*", &[], "", false)?;
-        if resp.status_code != 200 {
+        // The keepalive's job is to keep the connection warm so the
+        // receiver doesn't reap the session; any answered response proves
+        // that. Some receivers don't implement `OPTIONS *` and reply 501
+        // (Not Implemented) — libraop tolerates exactly this — so we treat
+        // 200 and 501 alike. Only a read/write failure (which poisons the
+        // connection) counts as session death.
+        if resp.status_code != 200 && resp.status_code != 501 {
             bail!(
                 "OPTIONS keepalive → {} {}",
                 resp.status_code,
@@ -359,7 +365,12 @@ impl RtspClient {
     /// RECORD — flip the receiver to "expect audio". `initial_seq` and
     /// `initial_rtptime` go in the `RTP-Info` header so the receiver
     /// can prime its jitter buffer.
-    pub fn record(&mut self, initial_seq: u16, initial_rtptime: u32) -> Result<()> {
+    ///
+    /// Returns the receiver's advertised `Audio-Latency` (in samples) if
+    /// present. Big-DSP AVRs (Denon/Yamaha) report large values here and
+    /// the sender must anchor that far back or audio arrives late; Sonos
+    /// and most speakers omit it (→ `None`, we keep our default anchor).
+    pub fn record(&mut self, initial_seq: u16, initial_rtptime: u32) -> Result<Option<u32>> {
         let uri = self.session_uri();
         // Header set matches iTunes 12.13.10's RECORD exactly (packet-
         // capture verified): just Range + RTP-Info. An earlier build
@@ -376,7 +387,11 @@ impl RtspClient {
         if resp.status_code != 200 {
             bail!("RECORD failed: {} {}", resp.status_code, resp.status_text);
         }
-        Ok(())
+        let audio_latency = resp
+            .headers
+            .get("audio-latency")
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        Ok(audio_latency)
     }
 
     /// SET_PARAMETER volume — RAOP volume is a float in dB, ranging

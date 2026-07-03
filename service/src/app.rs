@@ -630,14 +630,22 @@ impl App {
         // devices all just work.
         let attempts = self.airplay_attempts(&renderer, discovery);
         if attempts.is_empty() {
+            // Give the user the actionable reason rather than a raw field dump.
+            if renderer.password_protected {
+                return Err(format!(
+                    "{} is password-protected. Password (RTSP Digest) auth isn't \
+                     supported yet — remove the speaker's AirPlay password to use it.",
+                    renderer.friendly_name,
+                ));
+            }
             return Err(format!(
-                "{} doesn't advertise an AirPlay path we support \
-                 (codecs={:?}, et={:?}, features={:?}, password={})",
+                "{} doesn't advertise an AirPlay path we can use \
+                 (codecs={:?}, et={:?}, features={:?}). If it's an Apple TV, it may \
+                 require on-screen device verification, which isn't supported yet.",
                 renderer.friendly_name,
                 renderer.codecs,
                 renderer.encryption_types,
                 renderer.features,
-                renderer.password_protected,
             ));
         }
 

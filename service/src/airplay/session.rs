@@ -36,6 +36,11 @@ const RESEND_BUFFER_PACKETS: usize = 512;
 /// `2 * sampling_rate`).
 const DEFAULT_LATENCY_SAMPLES: u32 = 88200;
 
+/// The fixed sample floor RAOP senders add to a receiver-advertised
+/// `Audio-Latency` (libraop's `RAOP_LATENCY_MIN`). 88200 = the receiver's
+/// 77175 + this 11025.
+const RAOP_LATENCY_FLOOR: u32 = 11025;
+
 /// Configuration to spin up one AirPlay session.
 pub struct AirPlaySessionConfig {
     pub renderer: AirPlayRenderer,
@@ -197,7 +202,7 @@ impl AirPlaySession {
         // Opener: iTunes → Sonos (AirTunes/366) leads with POST /auth-setup
         // (0x01 + X25519), not OPTIONS + Apple-Challenge. MFi/AP2 devices
         // get auth-setup; plain legacy receivers keep OPTIONS.
-        let attempt = |try_mfi: bool| -> Result<(RtspClient, Cipher, ServerPorts)> {
+        let attempt = |try_mfi: bool| -> Result<(RtspClient, Cipher, ServerPorts, u32)> {
             let mut rtsp = RtspClient::connect(
                 cfg.renderer.ip,
                 cfg.renderer.port,
@@ -223,20 +228,35 @@ impl AirPlaySession {
                 } else {
                     rtsp.options().context("RTSP OPTIONS")?;
                 }
-                Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no compatible encryption mode for {} (advertised et={:?})",
-                        cfg.renderer.friendly_name,
-                        cfg.renderer.encryption_types,
-                    )
-                })?
+                if cfg.renderer.prefers_rsa_encryption() {
+                    // Classic AirPort Express (ek=1 / am=AirPort*) wants an
+                    // RSA-wrapped AES key; plaintext is silent there.
+                    Cipher::rsa()
+                } else {
+                    Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no compatible encryption mode for {} (advertised et={:?})",
+                            cfg.renderer.friendly_name,
+                            cfg.renderer.encryption_types,
+                        )
+                    })?
+                }
             };
 
             rtsp.announce(&cipher).context("RTSP ANNOUNCE")?;
             let ports = rtsp.setup(control_port, timing_port).context("RTSP SETUP")?;
-            rtsp.record(initial_seq, initial_rtptime)
+            let advertised_latency = rtsp
+                .record(initial_seq, initial_rtptime)
                 .context("RTSP RECORD")?;
-            Ok((rtsp, cipher, ports))
+            // Honor a receiver that asks for a deeper buffer (big-DSP AVRs
+            // report a large Audio-Latency); the reference senders add the
+            // 11025-sample floor. Default (no header, e.g. Sonos) keeps the
+            // proven 88200 anchor exactly.
+            let latency = advertised_latency
+                .map(|l| l.saturating_add(RAOP_LATENCY_FLOOR))
+                .unwrap_or(0)
+                .max(DEFAULT_LATENCY_SAMPLES);
+            Ok((rtsp, cipher, ports, latency))
         };
 
         // On any error below, `guard`'s Drop stops and joins whatever
@@ -257,7 +277,7 @@ impl AirPlaySession {
         } else {
             attempt(false)
         };
-        let (mut rtsp, cipher, server_ports) = handshake?;
+        let (mut rtsp, cipher, server_ports, latency_samples) = handshake?;
         info!(
             "AirPlay: cipher={} (receiver et={:?}, mfi_experiment={})",
             cipher.label(),
@@ -308,7 +328,7 @@ impl AirPlaySession {
                 control_socket,
                 receiver_control_addr,
                 current_rtptime.clone(),
-                DEFAULT_LATENCY_SAMPLES,
+                latency_samples,
                 stop_flag.clone(),
                 cfg.renderer.friendly_name.clone(),
             )

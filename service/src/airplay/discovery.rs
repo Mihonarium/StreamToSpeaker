@@ -111,6 +111,12 @@ pub struct AirPlayRenderer {
     /// True if the RAOP service set `pw=true` (password protected). We
     /// don't speak RAOP HTTP-digest auth, so these are legacy-unsupported.
     pub password_protected: bool,
+    /// The RAOP `ek=1` flag — "encryption key (expected)". Classic
+    /// AirPort Express advertises it and genuinely wants an RSA-wrapped
+    /// key; shairport advertises it too but also accepts plaintext. We
+    /// use it (with the model) to decide whether to encrypt (see
+    /// [`AirPlayRenderer::prefers_rsa_encryption`]).
+    pub encryption_key_required: bool,
     /// 64-bit AirPlay-2 `features`/`ft` bitfield, if the device advertised
     /// `_airplay._tcp`.
     pub features: Option<u64>,
@@ -135,10 +141,42 @@ impl AirPlayRenderer {
         if self.password_protected || self.port == 0 {
             return false;
         }
-        if !self.codecs.contains(&1) {
+        // ALAC (`cn=1`) is mandatory in RAOP, so a device that omits `cn`
+        // entirely is still ALAC-capable — only reject if it advertised a
+        // codec list that lacks ALAC.
+        if !self.codecs.is_empty() && !self.codecs.contains(&1) {
             return false;
         }
         self.encryption_types.contains(&0) || self.encryption_types.contains(&1)
+    }
+
+    /// Whether to encrypt the audio with the RSA-wrapped-key path rather
+    /// than stream plaintext. Reference behaviour (OwnTone/libraop):
+    /// classic AirPort Express genuinely *requires* AES, while sending
+    /// RSA keys to a device that only does plaintext breaks it — so we
+    /// only turn it on for the receiver classes that want it:
+    ///
+    ///   * the device advertised `ek=1` (AirPort Express, shairport — the
+    ///     latter also accepts plaintext, so RSA is safe there), or
+    ///   * the model is a pre-AirPlay-2 AirPort Express (`am=AirPort*`
+    ///     other than the AP2-era `AirPort10,x`, which takes plaintext).
+    ///
+    /// Both require `et=1` to be on offer. Everything else — Sonos-class
+    /// (`et=0,4`, no `ek`), Apple TV, third-party `et=0,4` — stays on the
+    /// proven plaintext path.
+    pub fn prefers_rsa_encryption(&self) -> bool {
+        if !self.encryption_types.contains(&1) {
+            return false;
+        }
+        if self.encryption_key_required {
+            return true;
+        }
+        let apex_rsa_model = self
+            .model
+            .as_deref()
+            .map(|m| m.starts_with("AirPort") && !m.starts_with("AirPort10"))
+            .unwrap_or(false);
+        apex_rsa_model && !self.encryption_types.contains(&4)
     }
 
     /// True if this device is reachable via the AirPlay-2 HomeKit path:
@@ -231,6 +269,7 @@ struct RaopInfo {
     encryption_types: Vec<u8>,
     codecs: Vec<u8>,
     password_protected: bool,
+    encryption_key_required: bool,
     model: Option<String>,
 }
 
@@ -321,6 +360,7 @@ fn merge(mac: &str, raop: Option<&RaopInfo>, airplay: Option<&AirPlayInfo>) -> O
         encryption_types: raop.map(|r| r.encryption_types.clone()).unwrap_or_default(),
         codecs: raop.map(|r| r.codecs.clone()).unwrap_or_default(),
         password_protected: raop.map(|r| r.password_protected).unwrap_or(false),
+        encryption_key_required: raop.map(|r| r.encryption_key_required).unwrap_or(false),
         features: airplay.and_then(|a| a.features),
         pk: airplay.and_then(|a| a.pk.clone()),
         model: airplay
@@ -405,6 +445,7 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
             encryption_types: read_txt_int_list(txt, "et"),
             codecs: read_txt_int_list(txt, "cn"),
             password_protected: read_txt_bool(txt, "pw"),
+            encryption_key_required: read_txt_bool(txt, "ek"),
             model: read_txt_string(txt, "am"),
         };
         debug!(
@@ -559,6 +600,7 @@ mod tests {
             encryption_types: et,
             codecs: vec![1],
             password_protected: false,
+            encryption_key_required: false,
             features: ft,
             pk: None,
             model: model.map(|s| s.to_string()),
@@ -663,5 +705,46 @@ mod tests {
         assert!(!r.supports_airplay2());
         assert_eq!(r.transport(), None);
         assert!(!r.is_supported());
+    }
+
+    #[test]
+    fn rsa_preference_targets_airport_express_not_sonos() {
+        // Sonos-class (et=0,4, no ek, model is a friendly name) → plaintext.
+        let sonos = renderer(Some("Picture frame"), vec![0, 4], None, 5000, None);
+        assert!(!sonos.prefers_rsa_encryption(), "Sonos must stay on plaintext");
+
+        // Classic AirPort Express gen2 (am=AirPort4,x, et=0,1) → RSA.
+        let apex2 = renderer(Some("AirPort4,107"), vec![0, 1], None, 5000, None);
+        assert!(apex2.prefers_rsa_encryption());
+
+        // AP2-era AirPort Express (am=AirPort10,x, et=0,4) → plaintext.
+        let apex_ap2 = renderer(Some("AirPort10,115"), vec![0, 4], None, 5000, None);
+        assert!(!apex_ap2.prefers_rsa_encryption());
+
+        // ek=1 with et=1 available → RSA (classic AirPort Express gen1).
+        let mut ek = renderer(None, vec![0, 1], None, 5000, None);
+        ek.encryption_key_required = true;
+        assert!(ek.prefers_rsa_encryption());
+
+        // ek=1 but no et=1 on offer → we can't RSA, so no.
+        let mut ek_no_rsa = renderer(Some("Weird"), vec![0], None, 5000, None);
+        ek_no_rsa.encryption_key_required = true;
+        assert!(!ek_no_rsa.prefers_rsa_encryption());
+
+        // Third-party et=0,1 plaintext speaker (no ek, non-AirPort model)
+        // → plaintext (must NOT force RSA, which would break it).
+        let thirdparty = renderer(Some("Denon"), vec![0, 1], None, 5000, None);
+        assert!(!thirdparty.prefers_rsa_encryption());
+    }
+
+    #[test]
+    fn missing_codec_list_still_raop_capable() {
+        // A receiver that omits `cn` entirely is still ALAC-capable.
+        let mut r = renderer(Some("Minimal"), vec![0], None, 5000, None);
+        r.codecs = vec![];
+        assert!(r.supports_legacy_raop());
+        // But an explicit codec list without ALAC is rejected.
+        r.codecs = vec![0]; // PCM only
+        assert!(!r.supports_legacy_raop());
     }
 }

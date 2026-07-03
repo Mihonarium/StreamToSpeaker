@@ -135,6 +135,14 @@ impl MfiKey {
 }
 
 impl Cipher {
+    /// The RSA-wrapped-key path with a fresh random session key. Used for
+    /// receivers that require (or expect) AES — classic AirPort Express —
+    /// which [`crate::airplay::discovery::AirPlayRenderer::prefers_rsa_encryption`]
+    /// identifies.
+    pub fn rsa() -> Self {
+        Cipher::AesRsa(SessionKey::random())
+    }
+
     /// Choose the best cipher we can speak from a receiver's
     /// advertised `et=` list. Returns `None` if nothing matches
     /// (FairPlay-only receivers, etc).

@@ -894,93 +894,132 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
     let mut seq = cfg.initial_seq;
     let mut rtptime = cfg.initial_rtptime;
     let mut packet_count: u64 = 0;
-    let mut ring: Vec<i16> = Vec::with_capacity(FRAMES_PER_PACKET * 2);
+    let mut silence_packets: u64 = 0;
+    let mut got_real_audio = false;
+    let mut idle_warned = false;
+    let mut ring: Vec<i16> = Vec::with_capacity(FRAMES_PER_PACKET * 4);
+    let mut disconnected = false;
+    let stereo = FRAMES_PER_PACKET * 2;
+
+    // Drop frames queued during the multi-second pairing/SETUP handshake —
+    // paced sending never drains a backlog, so it would be permanent latency.
+    while cfg.samples_rx.try_recv().is_ok() {}
 
     let start = Instant::now();
     let packet_duration =
         Duration::from_nanos((FRAMES_PER_PACKET as u64 * 1_000_000_000) / WIRE_SAMPLE_RATE as u64);
-    let mut idle_warned = false;
 
+    // Deadline-driven with silence-fill — identical discipline to the RAOP
+    // sender (rtp.rs `run_sender`): the rtptime must stay glued to
+    // wall-clock or the 1 Hz sync re-stamps a frozen timestamp against
+    // advancing time and the receiver discards everything as late (the
+    // anchor-burn failure proven on this device family).
     loop {
         if cfg.stop_flag.load(Ordering::Acquire) {
             break;
         }
-        match cfg.samples_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(frame) => {
-                append_samples(&mut ring, &frame);
-                loop {
-                    match cfg.samples_rx.try_recv() {
-                        Ok(f) => append_samples(&mut ring, &f),
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => return,
+        let deadline = start + packet_duration.saturating_mul((packet_count + 1) as u32);
+
+        // Re-glue after a long stall (suspend/resume) instead of flooding.
+        let behind = Instant::now().saturating_duration_since(deadline);
+        if behind > Duration::from_secs(1) {
+            let missed = (behind.as_nanos() / packet_duration.as_nanos().max(1)) as u64 + 1;
+            packet_count += missed;
+            rtptime = rtptime.wrapping_add((missed as u32).wrapping_mul(FRAMES_PER_PACKET as u32));
+            cfg.current_rtptime.store(rtptime, Ordering::Release);
+            ring.clear();
+            while cfg.samples_rx.try_recv().is_ok() {}
+            continue;
+        }
+
+        loop {
+            loop {
+                match cfg.samples_rx.try_recv() {
+                    Ok(f) => append_samples(&mut ring, &f),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
                     }
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                // No audio from the source. If nothing has ever arrived,
-                // the problem is upstream (nothing playing / wrong default
-                // device), not the AirPlay stream — say so once.
-                if packet_count == 0 && !idle_warned && start.elapsed() > Duration::from_secs(3) {
-                    warn!(
-                        "AirPlay 2: no audio from the source after 3s — is something playing with \
-                         Stream To Speaker selected as the Windows output device?"
-                    );
-                    idle_warned = true;
-                }
-                continue;
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
-        }
-
-        let mut packets_this_round = 0u32;
-        while ring.len() >= FRAMES_PER_PACKET * 2 {
-            let pkt_samples: Vec<i16> = ring.drain(..FRAMES_PER_PACKET * 2).collect();
-            let alac = build_uncompressed_alac_frame(&pkt_samples);
-
-            let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
-            let sealed = seal_audio(&cfg.audio_key, &header, seq, &alac);
-            let mut packet = Vec::with_capacity(12 + sealed.len());
-            packet.extend_from_slice(&header);
-            packet.extend_from_slice(&sealed);
-
-            let deadline = start + packet_duration.saturating_mul((packet_count + 1) as u32);
-            let now = Instant::now();
-            if deadline > now {
-                std::thread::sleep(deadline - now);
-            }
-
-            if let Err(e) = cfg.audio_socket.send_to(&packet, cfg.receiver_addr) {
-                warn!("AirPlay 2 RTP send failed: {}", e);
-                return;
-            }
-            // Retain for retransmit on a resend request.
-            cfg.resend.record(seq, &packet);
-            if packet_count == 0 {
-                info!(
-                    "AirPlay 2: audio flowing — first packet ({} bytes) sent to {}",
-                    packet.len(),
-                    cfg.receiver_addr
-                );
-            }
-
-            seq = seq.wrapping_add(1);
-            rtptime = rtptime.wrapping_add(FRAMES_PER_PACKET as u32);
-            cfg.current_rtptime.store(rtptime, Ordering::Release);
-            packet_count += 1;
-            if packet_count % 500 == 0 {
-                debug!(
-                    "AirPlay 2: {} audio packets sent ({} s)",
-                    packet_count,
-                    packet_count * FRAMES_PER_PACKET as u64 / WIRE_SAMPLE_RATE as u64
-                );
-            }
-            packets_this_round += 1;
-            if packets_this_round > 32 {
+            if disconnected || ring.len() >= stereo {
                 break;
             }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = (deadline - now).min(Duration::from_millis(50));
+            match cfg.samples_rx.recv_timeout(wait) {
+                Ok(f) => append_samples(&mut ring, &f),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if cfg.stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => disconnected = true,
+            }
         }
+        if cfg.stop_flag.load(Ordering::Acquire) {
+            break;
+        }
+        if disconnected && ring.len() < stereo {
+            break;
+        }
+
+        // Diagnose an upstream that never produces audio (nothing playing /
+        // wrong default device) — the AirPlay stream itself is fine.
+        if !got_real_audio && !idle_warned && start.elapsed() > Duration::from_secs(3) {
+            warn!(
+                "AirPlay 2: no audio from the source after 3s — is something playing with \
+                 Stream To Speaker selected as the Windows output device? (streaming silence \
+                 to keep the timeline anchored)"
+            );
+            idle_warned = true;
+        }
+
+        let pkt_samples: Vec<i16> = if ring.len() >= stereo {
+            got_real_audio = true;
+            ring.drain(..stereo).collect()
+        } else {
+            silence_packets += 1;
+            vec![0i16; stereo]
+        };
+        let alac = build_uncompressed_alac_frame(&pkt_samples);
+        let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
+        let sealed = seal_audio(&cfg.audio_key, &header, seq, &alac);
+        let mut packet = Vec::with_capacity(12 + sealed.len());
+        packet.extend_from_slice(&header);
+        packet.extend_from_slice(&sealed);
+
+        let now = Instant::now();
+        if deadline > now {
+            std::thread::sleep(deadline - now);
+        }
+
+        if let Err(e) = cfg.audio_socket.send_to(&packet, cfg.receiver_addr) {
+            warn!("AirPlay 2 RTP send failed: {}", e);
+            return;
+        }
+        cfg.resend.record(seq, &packet);
+        if packet_count == 0 {
+            info!(
+                "AirPlay 2: stream open — first packet ({} bytes) sent to {}",
+                packet.len(),
+                cfg.receiver_addr
+            );
+        }
+
+        seq = seq.wrapping_add(1);
+        rtptime = rtptime.wrapping_add(FRAMES_PER_PACKET as u32);
+        cfg.current_rtptime.store(rtptime, Ordering::Release);
+        packet_count += 1;
     }
-    info!("AirPlay 2 RTP sender stopped after {} packets", packet_count);
+    info!(
+        "AirPlay 2 RTP sender stopped after {} packets ({} silence-filled)",
+        packet_count, silence_packets
+    );
 }
 
 /// Build the 12-byte RTP header for an AirPlay 2 realtime audio packet

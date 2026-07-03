@@ -99,7 +99,11 @@ impl TransientPairing {
             .get(TYPE_PROOF)
             .ok_or_else(|| anyhow!("pair-setup M4 missing Proof"))?;
         if !self.srp.verify_server(server_proof) {
-            bail!("pair-setup M4 server proof failed — wrong PIN or MITM");
+            bail!(
+                "pair-setup M4 server proof failed — the receiver rejected transient \
+                 pairing (it likely requires a password or on-screen device \
+                 verification, which isn't supported yet)"
+            );
         }
         Ok(SessionKeys::from_shared(self.srp.session_key()))
     }
@@ -118,8 +122,10 @@ fn check_error(tlv: &Tlv) -> Result<()> {
         // HAP error codes: 2=Authentication, 3=Backoff, 4=MaxPeers,
         // 5=MaxTries, 6=Unavailable, 7=Busy.
         let meaning = match code {
-            2 => "authentication (wrong PIN)",
+            2 => "authentication — receiver requires a password / device \
+                  verification (transient pairing rejected; not supported yet)",
             3 => "backoff (too many attempts, wait)",
+            5 => "max tries (too many wrong attempts — the receiver locked out)",
             6 => "unavailable",
             7 => "busy (another sender is pairing)",
             _ => "unknown",
