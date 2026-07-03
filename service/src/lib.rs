@@ -4,6 +4,7 @@
 //! split exists so unit tests can exercise individual pieces (the silence
 //! detector in particular) without booting the whole service.
 
+pub mod airplay;
 pub mod app;
 pub mod audio_loop;
 pub mod audio_source;

@@ -1,6 +1,6 @@
 # Stream To Speaker
 
-A Windows virtual audio device that streams whatever you're playing on your PC to a UPnP / OpenHome network speaker — Sonos, IKEA SYMFONISK, KEF, Denon HEOS, MoOde, Volumio, and anything else that speaks UPnP AVTransport or OpenHome.
+A Windows virtual audio device that streams whatever you're playing on your PC to a network speaker — over **UPnP / OpenHome** (Sonos, IKEA SYMFONISK, KEF, Denon HEOS, MoOde, Volumio, and anything else that speaks UPnP AVTransport or OpenHome) or **AirPlay** (AirPort Express, shairport-sync, and AirPlay 2 devices such as HomePod via HomeKit transient pairing). Discovered speakers from both protocols appear in one list.
 
 The virtual device shows up as **"Stream To Speaker"** in Windows Sound Settings — pick it as the default output (or route a single app to it via Volume Mixer), and the audio flows through a small kernel driver into a user-mode Rust service that pushes raw PCM via HTTP to the speaker. Windows volume stays in sync with the speaker's hardware buttons in both directions.
 

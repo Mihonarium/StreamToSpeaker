@@ -980,7 +980,7 @@ impl eframe::App for StreamToSpeakerApp {
                 }
             }
             if i.consume_shortcut(&sc_toggle) {
-                if self.app.current_renderer().is_some() {
+                if self.app.is_speaker_bound() {
                     let new_state = !self.app.is_streaming_enabled();
                     if let Err(e) = self.app.set_streaming_enabled(new_state) {
                         self.app.record_error(
@@ -1075,7 +1075,7 @@ impl eframe::App for StreamToSpeakerApp {
                         self.pinned_status_visible
                     };
                     self.pinned_status_visible = want_pinned;
-                    if want_pinned && self.app.current_renderer().is_some() {
+                    if want_pinned && self.app.is_speaker_bound() {
                         self.show_pinned_status(ui, &p);
                         ui.add_space(sp::S);
                     }
@@ -1480,7 +1480,7 @@ impl StreamToSpeakerApp {
     fn show_status_banner(&self, ui: &mut egui::Ui, p: &Palette) {
         let enabled = self.app.is_streaming_enabled();
         let active = self.app.stream_active.load(Ordering::Acquire);
-        let current = self.app.current_renderer();
+        let current = self.app.selected_speaker();
 
         // M20: status icons were grab-bag — ⊘ from Math Operators
         // (thin stroke), ▶ from Geometric Shapes (heavy filled),
@@ -1491,7 +1491,23 @@ impl StreamToSpeakerApp {
         // same weight. "?" stays for "no speaker" because it reads
         // as a text prompt ("what should I pick?"), not as a state
         // indicator competing with the media icons.
-        let (icon, accent, headline, detail, btn_label, btn_tip) = match (&current, enabled, active) {
+        // A background connect owns the banner while in flight — keep
+        // repainting so its progress shows without user input.
+        let connecting = self.app.connecting_to();
+        if connecting.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        let (icon, accent, headline, detail, btn_label, btn_tip) = if let Some(name) = connecting {
+            (
+                "⟳",
+                p.warn,
+                format!("Connecting to {}…", name),
+                "Setting up the session…".to_string(),
+                None,
+                None,
+            )
+        } else {
+            match (&current, enabled, active) {
             (None, _, _) => (
                 "?",
                 p.muted,
@@ -1524,6 +1540,7 @@ impl StreamToSpeakerApp {
                 Some("Disable streaming"),
                 Some("Stop streaming and release the speaker for other apps (Ctrl+E)"),
             ),
+            }
         };
 
         let frame_resp = egui::Frame::none()
@@ -1610,7 +1627,7 @@ impl StreamToSpeakerApp {
     fn show_pinned_status(&self, ui: &mut egui::Ui, p: &Palette) {
         let enabled = self.app.is_streaming_enabled();
         let active = self.app.stream_active.load(Ordering::Acquire);
-        let Some(current) = self.app.current_renderer() else { return; };
+        let Some(current) = self.app.selected_speaker() else { return; };
 
         let (accent, status_text) = match (enabled, active) {
             (false, _) => (p.danger, "Disabled"),
@@ -1864,11 +1881,10 @@ impl StreamToSpeakerApp {
                 .show(ui, |ui| {
                     for sp in view.speakers {
                         speaker_row(ui, p, &sp, |id| {
-                            if let Err(e) = self.app.select_speaker(id) {
-                                self.app.record_error(
-                                    format!("Couldn't connect to speaker: {}", e),
-                                );
-                            }
+                            // Bring-up does seconds of network I/O —
+                            // run it off-thread; the status banner shows
+                            // "Connecting…" and errors arrive as toasts.
+                            self.app.select_speaker_async(id);
                         });
                     }
                 });
@@ -1878,7 +1894,7 @@ impl StreamToSpeakerApp {
             // upnp::set_volume on a detached thread; GENA NOTIFYs from the
             // speaker side stream back through volume_sync so the slider
             // stays in sync with the Sonos app / physical buttons.
-            if self.app.current_renderer().is_some() {
+            if self.app.is_speaker_bound() {
                 ui.add_space(sp::S);
                 ui.separator();
                 ui.add_space(sp::S);
@@ -2027,7 +2043,7 @@ impl StreamToSpeakerApp {
             // call would just warn-and-no-op (audit F-14). Tooltip
             // explains in plain language; the previous version
             // mentioned UPnP / prebuffer, both engineer terms.
-            let has_speaker = self.app.current_renderer().is_some();
+            let has_speaker = self.app.is_speaker_bound();
             ui.add_enabled_ui(has_speaker, |ui| {
                 let resp = danger_button(ui, p, "⟳  Resync speaker", 180.0);
                 let resp = if has_speaker {
@@ -2169,6 +2185,48 @@ impl StreamToSpeakerApp {
                 |ui| advanced_slider_row(ui, p, &mut step, 1..=256, " frames", 4, "4 frames"),
             );
             self.app.set_latency_adjust_step_frames(step.max(1) as u32);
+
+            ui.add_space(sp::S);
+
+            let mut prefer_rt = self.app.user_config.lock().unwrap().prefer_realtime_airplay;
+            advanced_row(
+                ui,
+                p,
+                "AirPlay 2 stream mode",
+                "Realtime ≈ 0.25 s latency; buffered ≈ 1–2 s but is what iPhones use.",
+                "AirPlay 2 has two stream kinds. Buffered (the default when the speaker supports it) is what iPhones use: the speaker holds a second or two of audio, riding out Wi-Fi hiccups at the cost of that much latency. Realtime is the low-latency kind (~250 ms). Some speakers accept the realtime handshake but never actually play it — if one mode is silent, try the other. Takes effect the next time you connect to the speaker.",
+                |ui| {
+                    ui.checkbox(&mut prefer_rt, "Prefer low-latency realtime");
+                },
+            );
+            {
+                let mut uc = self.app.user_config.lock().unwrap();
+                if uc.prefer_realtime_airplay != prefer_rt {
+                    uc.prefer_realtime_airplay = prefer_rt;
+                    uc.save();
+                }
+            }
+
+            ui.add_space(sp::S);
+
+            let mut mfi = self.app.user_config.lock().unwrap().airplay_mfi_encryption;
+            advanced_row(
+                ui,
+                p,
+                "AirPlay MFi encryption (experimental)",
+                "Off = plain audio (the proven mode). On = try iTunes-style et=4 encryption first.",
+                "Some speakers (Sonos among them) advertise the MFi encryption mode iTunes uses. Streaming works without it, but if a speaker connects and stays silent this is worth an experiment: when enabled, the app first tries the encrypted handshake and falls back to plain audio if the speaker refuses. A refused attempt can make the speaker unresponsive for up to half a minute, which is why this is off by default. Takes effect the next time you connect.",
+                |ui| {
+                    ui.checkbox(&mut mfi, "Try et=4 MFi encryption first");
+                },
+            );
+            {
+                let mut uc = self.app.user_config.lock().unwrap();
+                if uc.airplay_mfi_encryption != mfi {
+                    uc.airplay_mfi_encryption = mfi;
+                    uc.save();
+                }
+            }
         });
     }
 
