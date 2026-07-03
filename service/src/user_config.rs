@@ -41,6 +41,21 @@ pub struct UserConfig {
     /// Edit config.json by hand to flip; no GUI yet.
     #[serde(default)]
     pub prefer_realtime_airplay: bool,
+    /// RAOP `et=4` MFi-encryption experiment switch. iTunes encrypts
+    /// audio to et=4 receivers with a key wrapped via the auth-setup
+    /// ECDH secret; our wrap is a best-grounded guess (no open-source
+    /// reference exists) whose failure can wedge the receiver for tens
+    /// of seconds, so the attempt is opt-in. When enabled the session
+    /// tries MFi first and falls back to plaintext/RSA on failure.
+    #[serde(default)]
+    pub airplay_mfi_encryption: bool,
+    /// Debug escape hatch: send the uncompressed-ALAC escape frames
+    /// instead of real compressed ALAC. Every field-proven sender
+    /// (iTunes, OwnTone, AirConnect) sends compressed; this exists only
+    /// to A/B against receivers that misbehave with the encoder.
+    /// Edit config.json by hand to flip; no GUI.
+    #[serde(default)]
+    pub airplay_uncompressed_alac: bool,
 }
 
 fn default_auto_reconnect() -> bool {

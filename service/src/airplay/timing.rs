@@ -63,11 +63,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// NTP epoch offset — seconds between 1900-01-01 and 1970-01-01.
 const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 
-/// Sequence value RAOP uses for sync + timing responses. The receiver
-/// only checks this on timing requests it sends; for our responses
-/// the constant 7 is what every reference implementation uses.
-const RAOP_FIXED_SEQ: u16 = 7;
-
 /// Convert `SystemTime::now()` to a 64-bit NTP timestamp (seconds
 /// since 1900-01-01 in the high 32 bits, fractional seconds in the
 /// low 32 bits). Saturates on broken clocks.
@@ -136,7 +131,11 @@ fn handle_timing_request(req: &[u8], peer: SocketAddr, received_ntp: u64, sock: 
     let mut resp = [0u8; 32];
     resp[0] = 0x80;
     resp[1] = 0xD3;
-    BigEndian::write_u16(&mut resp[2..4], RAOP_FIXED_SEQ);
+    // Echo the request's sequence field (libraop copies the whole
+    // header). Sonos always sends the constant 0x0007 so this is
+    // byte-identical there, but receivers that increment the timing
+    // seq need the echo to pair request and reply.
+    resp[2..4].copy_from_slice(&req[2..4]);
     // bytes 4..8 stay zero (padding)
     // reference_time: echo the request's bytes 24..32 (the receiver's
     // "transmit" timestamp).
@@ -152,12 +151,33 @@ fn handle_timing_request(req: &[u8], peer: SocketAddr, received_ntp: u64, sock: 
     }
 }
 
+/// Sleep for `total` in 100 ms slices, returning `false` early the moment
+/// `stop_flag` is set (so shutdown latency stays bounded regardless of the
+/// caller's cadence). Returns `true` when the full duration elapsed.
+pub fn sleep_unless_stopped(stop_flag: &AtomicBool, total: Duration) -> bool {
+    let slices = (total.as_millis() / 100).max(1);
+    for _ in 0..slices {
+        if stop_flag.load(Ordering::Acquire) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    !stop_flag.load(Ordering::Acquire)
+}
+
 /// Spawn the sync packet sender. Sends one 20-byte sync packet per
 /// second to the receiver's `control_port` until `stop_flag` is set.
 ///
 /// Latency is the receiver-advertised buffer depth in samples
 /// (typically 11025 = 250 ms at 44.1 kHz) — we use it to compute the
 /// "now should be playing" anchor timestamp.
+///
+/// The initial (`0x90` extension-bit) sync is sent **synchronously,
+/// before this function returns** — every field-proven sender strictly
+/// orders the first sync before the first audio packet (iTunes: 254 µs
+/// before; libraop sends it under the same lock as the first chunk), so
+/// callers get anchor-before-audio by construction as long as they call
+/// this before spawning their audio sender.
 pub fn spawn_sync_sender(
     control_socket: UdpSocket,
     receiver_addr: SocketAddr,
@@ -211,7 +231,6 @@ pub fn spawn_sync_sender_ptp(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_sync_sender_inner<F>(
     control_socket: UdpSocket,
     receiver_addr: SocketAddr,
@@ -224,39 +243,39 @@ fn spawn_sync_sender_inner<F>(
 where
     F: Fn(bool, u32) -> Vec<u8> + Send + 'static,
 {
+    // Anchor first: the initial (extension-bit) sync goes out on the
+    // caller's thread, before this function returns — so "first sync
+    // precedes first audio" holds by construction when the caller spawns
+    // its audio sender afterwards, with no flag to keep consistent.
+    let first_pkt = build_packet(true, current_rtptime.load(Ordering::Acquire));
+    match control_socket.send_to(&first_pkt, receiver_addr) {
+        Ok(_) => info!(
+            "AirPlay {} sync: anchor sync sent to {} ({} bytes); continuing at 1 Hz",
+            kind,
+            receiver_addr,
+            first_pkt.len()
+        ),
+        Err(e) => warn!(
+            "AirPlay {} sync: initial anchor send to {} failed: {}",
+            kind, receiver_addr, e
+        ),
+    }
+
     thread::Builder::new()
         .name(format!("stream-to-speaker-airplay-sync:{}", receiver_name))
         .spawn(move || {
-            // Packet-capture verified: iTunes sends the first (0x90) sync
-            // packet SIMULTANEOUSLY with the first audio packet — not
-            // delayed. A tiny grace keeps it behind socket setup only.
-            thread::sleep(Duration::from_millis(10));
-            let mut first = true;
-            let mut count: u64 = 0;
-            while !stop_flag.load(Ordering::Acquire) {
+            let mut count: u64 = 1;
+            loop {
+                // ~1 s cadence, stop-aware.
+                if !sleep_unless_stopped(&stop_flag, Duration::from_secs(1)) {
+                    break;
+                }
                 let cur_rtp = current_rtptime.load(Ordering::Acquire);
-                let pkt = build_packet(first, cur_rtp);
+                let pkt = build_packet(false, cur_rtp);
                 if let Err(e) = control_socket.send_to(&pkt, receiver_addr) {
                     warn!("AirPlay {} sync send to {} failed: {}", kind, receiver_addr, e);
                 }
-                if first {
-                    info!(
-                        "AirPlay {} sync: sending sync packets to {} ({} bytes each)",
-                        kind,
-                        receiver_addr,
-                        pkt.len()
-                    );
-                }
-                first = false;
                 count += 1;
-
-                // ~1 s cadence, in 100 ms slices for prompt shutdown.
-                for _ in 0..10 {
-                    if stop_flag.load(Ordering::Acquire) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
             }
             debug!("AirPlay {} sync sender exiting after {} packets", kind, count);
         })

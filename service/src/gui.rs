@@ -2206,6 +2206,27 @@ impl StreamToSpeakerApp {
                     uc.save();
                 }
             }
+
+            ui.add_space(sp::S);
+
+            let mut mfi = self.app.user_config.lock().unwrap().airplay_mfi_encryption;
+            advanced_row(
+                ui,
+                p,
+                "AirPlay MFi encryption (experimental)",
+                "Off = plain audio (the proven mode). On = try iTunes-style et=4 encryption first.",
+                "Some speakers (Sonos among them) advertise the MFi encryption mode iTunes uses. Streaming works without it, but if a speaker connects and stays silent this is worth an experiment: when enabled, the app first tries the encrypted handshake and falls back to plain audio if the speaker refuses. A refused attempt can make the speaker unresponsive for up to half a minute, which is why this is off by default. Takes effect the next time you connect.",
+                |ui| {
+                    ui.checkbox(&mut mfi, "Try et=4 MFi encryption first");
+                },
+            );
+            {
+                let mut uc = self.app.user_config.lock().unwrap();
+                if uc.airplay_mfi_encryption != mfi {
+                    uc.airplay_mfi_encryption = mfi;
+                    uc.save();
+                }
+            }
         });
     }
 

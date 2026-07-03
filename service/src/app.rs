@@ -728,6 +728,10 @@ impl App {
         match transport {
             Transport::RaopLegacy => {
                 let samples_rx = self.hub.subscribe();
+                let (mfi_encryption, uncompressed_alac) = {
+                    let uc = self.user_config.lock().unwrap();
+                    (uc.airplay_mfi_encryption, uc.airplay_uncompressed_alac)
+                };
                 let session = AirPlaySession::start(AirPlaySessionConfig {
                     renderer,
                     local_ip,
@@ -737,6 +741,8 @@ impl App {
                     // a dead/vestigial RAOP service (Sonos) fails fast and we
                     // move on to AirPlay 2.
                     connect_timeout: Duration::from_secs(3),
+                    mfi_encryption,
+                    uncompressed_alac,
                 })
                 .map_err(|e| format!("{:#}", e))?;
                 Ok(ActiveSession::AirPlay(session))

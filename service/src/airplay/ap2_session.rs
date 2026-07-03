@@ -336,27 +336,18 @@ impl AirPlay2Session {
             drop(resend);
             (sender, None, None, None)
         } else {
-            let sender = spawn_ap2_sender(Ap2SenderConfig {
-                audio_socket: audio_socket.try_clone().context("clone AP2 audio socket")?,
-                receiver_addr: SocketAddr::new(cfg.renderer.ip, ports.data),
-                audio_key,
-                initial_seq,
-                initial_rtptime,
-                ssrc,
-                samples_rx: cfg.samples_rx,
-                stop_flag: stop_flag.clone(),
-                receiver_name: cfg.renderer.friendly_name.clone(),
-                current_rtptime: current_rtptime.clone(),
-                resend: resend.clone(),
-            })?;
-
+            // Anchor before audio: both sync spawners send their initial
+            // (extension-bit) sync synchronously before returning, so
+            // spawning them BEFORE the audio sender guarantees the
+            // receiver has a timeline anchor before the first audio
+            // packet arrives — same ordering rule as the RAOP path.
             let sync_addr = SocketAddr::new(cfg.renderer.ip, ports.control);
             let (timing_handle, sync_handle) = if use_ptp {
                 let ptp = ptp_session.as_ref().unwrap();
                 let sync = spawn_sync_sender_ptp(
                     control_socket,
                     sync_addr,
-                    current_rtptime,
+                    current_rtptime.clone(),
                     DEFAULT_LATENCY_SAMPLES,
                     ptp.timeline.clone(),
                     stop_flag.clone(),
@@ -376,7 +367,7 @@ impl AirPlay2Session {
                 let sync = spawn_sync_sender(
                     control_socket,
                     sync_addr,
-                    current_rtptime,
+                    current_rtptime.clone(),
                     DEFAULT_LATENCY_SAMPLES,
                     stop_flag.clone(),
                     cfg.renderer.friendly_name.clone(),
@@ -384,6 +375,20 @@ impl AirPlay2Session {
                 .context("spawning AP2 sync sender")?;
                 (Some(timing), Some(sync))
             };
+
+            let sender = spawn_ap2_sender(Ap2SenderConfig {
+                audio_socket: audio_socket.try_clone().context("clone AP2 audio socket")?,
+                receiver_addr: SocketAddr::new(cfg.renderer.ip, ports.data),
+                audio_key,
+                initial_seq,
+                initial_rtptime,
+                ssrc,
+                samples_rx: cfg.samples_rx,
+                stop_flag: stop_flag.clone(),
+                receiver_name: cfg.renderer.friendly_name.clone(),
+                current_rtptime,
+                resend: resend.clone(),
+            })?;
 
             let resend_handle = spawn_resend_responder(
                 control_for_resend,

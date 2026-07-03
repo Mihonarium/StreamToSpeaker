@@ -31,12 +31,13 @@ use crate::airplay::crypto::{base64_nopad, random_apple_challenge, Cipher};
 /// User-Agent string the RTSP requests carry.
 ///
 /// Several RAOP receivers (notably some Sonos firmware revisions) gate
-/// playback on a recognised iTunes-style identifier. We send the well-
-/// known iTunes 7.6 string used by every open-source sender in the
-/// wild — receivers treat it as known-good. The actual product
+/// playback on a recognised iTunes-style identifier. This is the exact
+/// string iTunes-for-Windows 12.13.10 sends (packet-capture verified
+/// against a Sonos on AirTunes/366 firmware). The actual product
 /// identity is carried in `Client-Instance` / DACP-ID so receivers
 /// that DO want our identity can pick it up.
-const RTSP_USER_AGENT: &str = "iTunes/7.6.2 (Windows; N;)";
+const RTSP_USER_AGENT: &str =
+    "iTunes/12.13.10 (Windows; Microsoft Windows 11 x64 (Build 26200); x64) (dt:2)";
 
 /// SDP "session id" — the random 64-bit number we identify our session
 /// by, both in the ANNOUNCE URL and the SDP `o=` line. Once chosen at
@@ -83,6 +84,12 @@ pub struct RtspClient {
     announced: bool,
     /// True once TEARDOWN has been sent (makes it idempotent).
     torn_down: bool,
+    /// Set when a request failed mid-response (read timeout / short
+    /// read): the TCP stream may be positioned mid-message, so any
+    /// further request would mis-pair responses. Once poisoned, every
+    /// request fails fast — the periodic keepalive surfaces it and the
+    /// session is effectively dead.
+    poisoned: bool,
 }
 
 impl RtspClient {
@@ -120,6 +127,7 @@ impl RtspClient {
             session_token: None,
             announced: false,
             torn_down: false,
+            poisoned: false,
         })
     }
 
@@ -146,6 +154,22 @@ impl RtspClient {
             resp.headers.get("public").map(|s| s.as_str()).unwrap_or(""),
             resp.headers.contains_key("apple-response"),
         );
+        Ok(())
+    }
+
+    /// Bare `OPTIONS *` keepalive — sent every couple of seconds during
+    /// streaming (iTunes cadence is 2.0 s; libraop proves 25 s also
+    /// suffices). Matches iTunes's keepalives exactly: no Apple-Challenge
+    /// and no Session header.
+    pub fn options_keepalive(&mut self) -> Result<()> {
+        let resp = self.request_opts("OPTIONS", "*", &[], "", false)?;
+        if resp.status_code != 200 {
+            bail!(
+                "OPTIONS keepalive → {} {}",
+                resp.status_code,
+                resp.status_text
+            );
+        }
         Ok(())
     }
 
@@ -337,14 +361,16 @@ impl RtspClient {
     /// can prime its jitter buffer.
     pub fn record(&mut self, initial_seq: u16, initial_rtptime: u32) -> Result<()> {
         let uri = self.session_uri();
+        // Header set matches iTunes 12.13.10's RECORD exactly (packet-
+        // capture verified): just Range + RTP-Info. An earlier build
+        // added X-Apple-ProtocolVersion (node_airtunes2 habit); iTunes
+        // doesn't send it, so neither do we.
         let extra = vec![
             ("Range".to_string(), "npt=0-".to_string()),
             (
                 "RTP-Info".to_string(),
                 format!("seq={};rtptime={}", initial_seq, initial_rtptime),
             ),
-            // iTunes/node_airtunes2 parity.
-            ("X-Apple-ProtocolVersion".to_string(), "1".to_string()),
         ];
         let resp = self.request("RECORD", &uri, &extra, "")?;
         if resp.status_code != 200 {
@@ -410,6 +436,19 @@ impl RtspClient {
         extra_headers: &[(String, String)],
         body: &str,
     ) -> Result<RtspResponse> {
+        self.request_opts(method, uri, extra_headers, body, true)
+    }
+
+    /// Like [`request`](Self::request) but with control over whether the
+    /// Session header is attached. iTunes omits it on OPTIONS keepalives.
+    fn request_opts(
+        &mut self,
+        method: &str,
+        uri: &str,
+        extra_headers: &[(String, String)],
+        body: &str,
+        include_session: bool,
+    ) -> Result<RtspResponse> {
         self.cseq += 1;
         let mut req = String::new();
         req.push_str(&format!("{} {} RTSP/1.0\r\n", method, uri));
@@ -418,8 +457,10 @@ impl RtspClient {
         req.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
         req.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
         req.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
-        if let Some(token) = &self.session_token {
-            req.push_str(&format!("Session: {}\r\n", token));
+        if include_session {
+            if let Some(token) = &self.session_token {
+                req.push_str(&format!("Session: {}\r\n", token));
+            }
         }
         for (k, v) in extra_headers {
             req.push_str(&format!("{}: {}\r\n", k, v));
@@ -437,9 +478,7 @@ impl RtspClient {
             self.cseq,
             body.len()
         );
-        self.stream.write_all(req.as_bytes())?;
-        self.stream.flush()?;
-        read_response(&mut self.stream)
+        self.send_and_read(req.as_bytes())
     }
 
     /// Like [`request`](Self::request) but with a binary body — used for
@@ -474,9 +513,57 @@ impl RtspClient {
         );
         let mut raw = head.into_bytes();
         raw.extend_from_slice(body);
-        self.stream.write_all(&raw)?;
-        self.stream.flush()?;
-        read_response(&mut self.stream)
+        self.send_and_read(&raw)
+    }
+
+    /// Write a fully-serialised request and read its response, with two
+    /// protections the keepalive-era connection needs:
+    ///
+    /// * **Poisoning** — a request that fails mid-response (read timeout,
+    ///   short read) may leave the TCP stream positioned inside a message;
+    ///   any later read would mis-pair or mis-parse. The connection is
+    ///   marked poisoned and every subsequent request fails fast.
+    /// * **CSeq pairing** — a response that arrives *after* its request
+    ///   timed out (but cleanly, between messages) carries a stale CSeq;
+    ///   it's discarded and the read retried so responses can't shift
+    ///   off-by-one against requests.
+    fn send_and_read(&mut self, raw: &[u8]) -> Result<RtspResponse> {
+        if self.poisoned {
+            bail!("RTSP connection is poisoned (an earlier request failed mid-response)");
+        }
+        if let Err(e) = self.stream.write_all(raw).and_then(|_| self.stream.flush()) {
+            self.poisoned = true;
+            return Err(e).context("writing RTSP request");
+        }
+        // Up to 3 stale responses discarded before giving up — more than
+        // one means something is deeply wrong with the receiver.
+        for _ in 0..3 {
+            let resp = match read_response(&mut self.stream) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(e).context("reading RTSP response");
+                }
+            };
+            match resp
+                .headers
+                .get("cseq")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                Some(c) if c < self.cseq => {
+                    debug!(
+                        "RTSP: discarding stale response (CSeq {} < current {})",
+                        c, self.cseq
+                    );
+                    continue;
+                }
+                // Matching CSeq, no CSeq header (trust positionally), or
+                // a from-the-future CSeq (nothing sane to do but accept).
+                _ => return Ok(resp),
+            }
+        }
+        self.poisoned = true;
+        bail!("RTSP connection desynced: >3 stale responses in a row");
     }
 }
 

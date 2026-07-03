@@ -22,7 +22,8 @@ use crate::airplay::rtp::{
 };
 use crate::airplay::rtsp::{RtspClient, ServerPorts};
 use crate::airplay::timing::{
-    spawn_resend_responder, spawn_sync_sender, spawn_timing_responder, ResendBuffer,
+    sleep_unless_stopped, spawn_resend_responder, spawn_sync_sender, spawn_timing_responder,
+    ResendBuffer,
 };
 use crate::http_server::PcmFrame;
 
@@ -51,6 +52,16 @@ pub struct AirPlaySessionConfig {
     /// `_raop._tcp` but ignores legacy RTSP (e.g. Sonos, which is
     /// AirPlay-2-only) fails fast instead of stalling the full window.
     pub connect_timeout: Duration,
+    /// Opt-in `et=4` MFi-encryption experiment (config flag). When true
+    /// and the receiver advertises et=4, the session tries the MFi
+    /// wrapped-key handshake first, falling back to plaintext/RSA on
+    /// failure. Off by default: the wrap is a best-grounded guess (no
+    /// open-source reference implements et=4), and a stalled attempt
+    /// wedges this receiver class for tens of seconds.
+    pub mfi_encryption: bool,
+    /// Debug escape hatch: send uncompressed-ALAC escape frames instead
+    /// of real compressed ALAC. See `rtp.rs` module docs.
+    pub uncompressed_alac: bool,
 }
 
 /// Live AirPlay session.
@@ -60,19 +71,55 @@ pub struct AirPlaySession {
     /// can serialise into the single RTSP connection.
     rtsp: Arc<Mutex<RtspClient>>,
     /// Signals every background thread to stop (audio sender, timing
-    /// responder, sync sender).
+    /// responder, sync sender, resend responder, keepalive).
     stop_flag: Arc<AtomicBool>,
-    /// Handles on the three background threads. Stored as Options so
-    /// `stop()` can take them out of the session before joining.
-    sender_handle: Option<JoinHandle<()>>,
-    timing_handle: Option<JoinHandle<()>>,
-    sync_handle: Option<JoinHandle<()>>,
-    resend_handle: Option<JoinHandle<()>>,
+    /// The background threads. All of them watch `stop_flag` with
+    /// bounded wakeups, so `stop()` just sets the flag and joins.
+    threads: Vec<JoinHandle<()>>,
     /// Hold the audio socket so it isn't closed prematurely; the
     /// sender thread holds a `try_clone` for sending. Once `stop`
     /// runs we drop these in the right order to wake any blocked
     /// background thread.
     _audio_socket: UdpSocket,
+}
+
+/// Stops-and-joins the session's background threads if `start()` errors
+/// out partway through spawning them — without this, a failed spawn (or
+/// any later `?`) would leak an already-running audio sender that keeps
+/// streaming to the receiver with no owner. `into_threads()` defuses the
+/// guard on the success path.
+struct SpawnGuard {
+    stop_flag: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl SpawnGuard {
+    fn new(stop_flag: Arc<AtomicBool>) -> Self {
+        Self {
+            stop_flag,
+            threads: Vec::new(),
+        }
+    }
+
+    fn adopt(&mut self, handle: JoinHandle<()>) {
+        self.threads.push(handle);
+    }
+
+    fn into_threads(mut self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut self.threads)
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        if self.threads.is_empty() {
+            return;
+        }
+        self.stop_flag.store(true, Ordering::Release);
+        for h in self.threads.drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
 impl AirPlaySession {
@@ -114,18 +161,42 @@ impl AirPlaySession {
         let initial_rtptime = random_initial_rtptime();
         let ssrc = random_ssrc();
 
+        // The timing responder must be live BEFORE the handshake: this
+        // receiver class probes our SETUP-advertised timing port with NTP
+        // requests while SETUP is still in flight (packet-capture: the
+        // Sonos fires three 0xD2s 24 ms after the SETUP request, before
+        // its SETUP 200; iTunes answers each within 200 µs). libraop
+        // carries the same lesson as a comment: "AppleTV expects now the
+        // timing port to be opened BEFORE the setup message". Our old
+        // responder-after-RECORD ordering left those probes unanswered in
+        // every stalled-SETUP session on record.
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let mut guard = SpawnGuard::new(stop_flag.clone());
+        guard.adopt(
+            spawn_timing_responder(
+                timing_socket,
+                stop_flag.clone(),
+                cfg.renderer.friendly_name.clone(),
+            )
+            .context("spawning AirPlay timing responder")?,
+        );
+
         let want_mfi = cfg.renderer.encryption_types.contains(&4);
         let mfi_style = want_mfi || cfg.renderer.supports_airplay2();
+        // The et=4 attempt is opt-in: the wrap is a best-grounded guess,
+        // and a stalled attempt wedges this receiver class for tens of
+        // seconds (capture-proven: after one SETUP stall the Sonos
+        // answers zero RTSP bytes on ANY connection for the hold window),
+        // so it must never gate default connectivity.
+        let try_mfi_first = cfg.mfi_encryption && want_mfi;
 
         // One full RTSP bring-up (connect → opener → ANNOUNCE → SETUP →
-        // RECORD), factored so we can try the et=4 MFi path first and, if the
-        // receiver rejects it, reconnect and retry plaintext/RSA — never
-        // regressing a device that at least connected before.
+        // RECORD). Factored so the opt-in MFi experiment can fall back to
+        // the proven plaintext/RSA recipe.
         //
         // Opener: iTunes → Sonos (AirTunes/366) leads with POST /auth-setup
-        // (0x01 + X25519), not OPTIONS + Apple-Challenge (which this fw stalls
-        // on). MFi/AP2 devices get auth-setup; plain legacy receivers keep
-        // OPTIONS.
+        // (0x01 + X25519), not OPTIONS + Apple-Challenge. MFi/AP2 devices
+        // get auth-setup; plain legacy receivers keep OPTIONS.
         let attempt = |try_mfi: bool| -> Result<(RtspClient, Cipher, ServerPorts)> {
             let mut rtsp = RtspClient::connect(
                 cfg.renderer.ip,
@@ -136,17 +207,18 @@ impl AirPlaySession {
             .context("opening RTSP connection")?;
 
             let cipher = if try_mfi {
-                // Packet-capture ground truth: iTunes encrypts audio to this
-                // Sonos via et=4 (mfiaeskey wrapped under the auth-setup ECDH
-                // secret); a plaintext ANNOUNCE is accepted but SETUP stalls.
+                // iTunes encrypts audio to et=4 receivers with a key
+                // wrapped under the auth-setup ECDH secret (mfiaeskey).
                 let shared = rtsp
                     .auth_setup()
                     .context("RTSP auth-setup (MFi opener)")?;
                 Cipher::Mfi(MfiKey::derive(&shared))
             } else {
                 if mfi_style {
-                    // Throwaway unlock — some AP2/MFi receivers 403 the
-                    // ANNOUNCE without a prior auth-setup.
+                    // Throwaway unlock — same as OwnTone/libraop: complete
+                    // the auth-setup exchange, ignore the secret, stream
+                    // plaintext. Field-proven recipe for Sonos-class
+                    // receivers.
                     let _ = rtsp.auth_setup().context("RTSP auth-setup")?;
                 } else {
                     rtsp.options().context("RTSP OPTIONS")?;
@@ -167,26 +239,30 @@ impl AirPlaySession {
             Ok((rtsp, cipher, ports))
         };
 
-        let (mut rtsp, cipher, server_ports) = if want_mfi {
+        // On any error below, `guard`'s Drop stops and joins whatever
+        // threads exist — the timing responder now, the sync/audio/resend
+        // threads once adopted.
+        let handshake = if try_mfi_first {
             match attempt(true) {
-                Ok(v) => v,
+                Ok(v) => Ok(v),
                 Err(e) => {
                     warn!(
                         "AirPlay: et=4 MFi handshake to {} failed ({:#}); \
                          retrying with plaintext/RSA",
                         cfg.renderer.friendly_name, e
                     );
-                    attempt(false)
-                        .context("plaintext fallback after MFi handshake failed")?
+                    attempt(false).context("plaintext fallback after MFi handshake failed")
                 }
             }
         } else {
-            attempt(false)?
+            attempt(false)
         };
+        let (mut rtsp, cipher, server_ports) = handshake?;
         info!(
-            "AirPlay: cipher={} (receiver et={:?})",
+            "AirPlay: cipher={} (receiver et={:?}, mfi_experiment={})",
             cipher.label(),
             cfg.renderer.encryption_types,
+            cfg.mfi_encryption,
         );
         let cipher = Arc::new(cipher);
         debug!(
@@ -203,14 +279,14 @@ impl AirPlaySession {
             }
         }
 
-        // Spin up the three background threads. The audio sender owns
-        // a try_clone of the audio socket; timing + sync own their
-        // respective sockets outright (we don't need to keep them in
-        // the session struct because the threads block on them).
+        let receiver_control_addr = SocketAddr::new(cfg.renderer.ip, server_ports.control);
+
+        // Spin up the background threads. The audio sender owns a
+        // try_clone of the audio socket; sync owns the control socket
+        // outright.
         let audio_socket_for_thread = audio_socket
             .try_clone()
             .context("try_clone audio socket")?;
-        let stop_flag = Arc::new(AtomicBool::new(false));
         let current_rtptime = Arc::new(AtomicU32::new(initial_rtptime));
         let resend = ResendBuffer::new(RESEND_BUFFER_PACKETS);
 
@@ -220,6 +296,24 @@ impl AirPlaySession {
         let control_for_resend = control_socket
             .try_clone()
             .context("try_clone control socket")?;
+
+        // Anchor before audio: spawn_sync_sender sends the initial 0x90
+        // sync synchronously before returning, so spawning it before the
+        // audio sender guarantees the receiver has its rtptime→wall-clock
+        // mapping before the first audio packet (iTunes: first sync 254 µs
+        // before first audio; audio arriving before the anchor is
+        // classified late and silently discarded).
+        guard.adopt(
+            spawn_sync_sender(
+                control_socket,
+                receiver_control_addr,
+                current_rtptime.clone(),
+                DEFAULT_LATENCY_SAMPLES,
+                stop_flag.clone(),
+                cfg.renderer.friendly_name.clone(),
+            )
+            .context("spawning AirPlay sync sender")?,
+        );
 
         let sender_cfg = RtpSenderConfig {
             audio_socket: audio_socket_for_thread,
@@ -231,36 +325,85 @@ impl AirPlaySession {
             samples_rx: cfg.samples_rx,
             stop_flag: stop_flag.clone(),
             receiver_name: cfg.renderer.friendly_name.clone(),
-            current_rtptime: current_rtptime.clone(),
-            resend: resend.clone(),
-        };
-        let sender_handle = spawn_audio_sender(sender_cfg)?;
-
-        let timing_handle = spawn_timing_responder(
-            timing_socket,
-            stop_flag.clone(),
-            cfg.renderer.friendly_name.clone(),
-        )
-        .context("spawning AirPlay timing responder")?;
-
-        let sync_handle = spawn_sync_sender(
-            control_socket,
-            SocketAddr::new(cfg.renderer.ip, server_ports.control),
             current_rtptime,
-            DEFAULT_LATENCY_SAMPLES,
-            stop_flag.clone(),
-            cfg.renderer.friendly_name.clone(),
-        )
-        .context("spawning AirPlay sync sender")?;
+            resend: resend.clone(),
+            uncompressed_alac: cfg.uncompressed_alac,
+        };
+        guard.adopt(spawn_audio_sender(sender_cfg)?);
 
-        let resend_handle = spawn_resend_responder(
-            control_for_resend,
-            SocketAddr::new(cfg.renderer.ip, server_ports.control),
-            resend,
-            stop_flag.clone(),
-            cfg.renderer.friendly_name.clone(),
-        )
-        .context("spawning AirPlay resend responder")?;
+        guard.adopt(
+            spawn_resend_responder(
+                control_for_resend,
+                receiver_control_addr,
+                resend,
+                stop_flag.clone(),
+                cfg.renderer.friendly_name.clone(),
+            )
+            .context("spawning AirPlay resend responder")?,
+        );
+
+        let rtsp = Arc::new(Mutex::new(rtsp));
+
+        // RTSP keepalive — iTunes sends OPTIONS * every 2.0 s during
+        // streaming (libraop uses 25 s; OwnTone SET_PARAMETER progress at
+        // 25 s). Without one, nothing ever touches the control connection
+        // after RECORD and the receiver eventually reaps the session
+        // while our UI still says "streaming". Failures don't kill the
+        // thread (a Wi-Fi blip must not silently disable keepalives);
+        // it backs off and keeps probing so recovery is automatic.
+        let keepalive_handle = {
+            let rtsp = rtsp.clone();
+            let stop_flag = stop_flag.clone();
+            let name = cfg.renderer.friendly_name.clone();
+            std::thread::Builder::new()
+                .name(format!("stream-to-speaker-airplay-keepalive:{}", name))
+                .spawn(move || {
+                    let mut healthy = true;
+                    loop {
+                        let interval = if healthy {
+                            Duration::from_secs(2)
+                        } else {
+                            // Back off while the receiver is unresponsive so a
+                            // blocked request (3 s read timeout) doesn't hog the
+                            // RTSP mutex from volume changes and stop().
+                            Duration::from_secs(10)
+                        };
+                        if !sleep_unless_stopped(&stop_flag, interval) {
+                            return;
+                        }
+                        // try_lock: skip the round rather than queue behind an
+                        // in-flight volume change — the next round covers it.
+                        let mut client = match rtsp.try_lock() {
+                            Ok(c) => c,
+                            Err(std::sync::TryLockError::WouldBlock) => continue,
+                            Err(std::sync::TryLockError::Poisoned(_)) => return,
+                        };
+                        if stop_flag.load(Ordering::Acquire) {
+                            return;
+                        }
+                        match client.options_keepalive() {
+                            Ok(()) => {
+                                if !healthy {
+                                    info!("AirPlay keepalive to {} recovered", name);
+                                }
+                                healthy = true;
+                            }
+                            Err(e) => {
+                                if healthy {
+                                    warn!(
+                                        "AirPlay keepalive to {} failed ({}); receiver may \
+                                         have dropped the session — retrying every 10 s",
+                                        name, e
+                                    );
+                                }
+                                healthy = false;
+                            }
+                        }
+                    }
+                })
+                .context("spawning AirPlay keepalive")?
+        };
+        guard.adopt(keepalive_handle);
 
         info!(
             "AirPlay: session up — {} ↔ {}:{} (RTSP), audio → {}:{}, control → :{}, timing → :{}",
@@ -275,12 +418,9 @@ impl AirPlaySession {
 
         Ok(Self {
             renderer: cfg.renderer,
-            rtsp: Arc::new(Mutex::new(rtsp)),
+            rtsp,
             stop_flag,
-            sender_handle: Some(sender_handle),
-            timing_handle: Some(timing_handle),
-            sync_handle: Some(sync_handle),
-            resend_handle: Some(resend_handle),
+            threads: guard.into_threads(),
             _audio_socket: audio_socket,
         })
     }
@@ -308,15 +448,7 @@ impl AirPlaySession {
             self.renderer.friendly_name
         );
         self.stop_flag.store(true, Ordering::Release);
-        for h in [
-            self.sender_handle.take(),
-            self.timing_handle.take(),
-            self.sync_handle.take(),
-            self.resend_handle.take(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for h in self.threads.drain(..) {
             let _ = h.join();
         }
         let mut guard = self.rtsp.lock().unwrap();

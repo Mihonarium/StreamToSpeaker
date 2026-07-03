@@ -1,6 +1,6 @@
 [package]
 name = "stream-to-speaker"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Stream To Speaker — user-mode bridge between a Windows virtual audio driver (or WASAPI loopback) and any UPnP/OpenHome network speaker (Sonos, IKEA StreamToSpeaker, etc)."
@@ -17,6 +17,10 @@ name = "stream-to-speaker"
 path = "src/main.rs"
 
 [dependencies]
+# Rust port of Apple's open-source ALAC encoder (Apache-2.0/MIT). Every
+# field-proven RAOP sender ships real compressed ALAC; the uncompressed
+# escape is unproven on current Sonos firmware.
+alac-encoder = "0.3"
 anyhow = "1"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
@@ -81,6 +85,11 @@ num-traits = "0.2"
 plist = "1"
 # Wipe SRP/session key material on drop.
 zeroize = "1"
+
+[dev-dependencies]
+# Reference ALAC decoder — round-trip verifies that the compressed frames
+# our encoder emits decode losslessly under our announced fmtp parameters.
+alac = "0.5"
 
 [target.'cfg(windows)'.dependencies]
 # WASAPI loopback fallback. cpal supports WASAPI loopback on Windows.

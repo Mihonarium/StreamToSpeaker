@@ -3,9 +3,17 @@
 //! AirPlay 1 frames its audio as ALAC, but the codec supports a
 //! pass-through escape that lets a sender ship raw PCM samples wrapped
 //! in a stub ALAC bitstream without actually running the compressor.
-//! Every shipping receiver supports this path — it's how iTunes and
-//! every open-source sender (PipeWire `module-raop-sink`, shairport,
-//! node_airtunes, AirConnect, ...) actually send audio.
+//!
+//! ⚠️ **Debug/fallback path only.** An earlier version of this comment
+//! claimed iTunes sends this escape — packet capture disproved that:
+//! iTunes 12.13.10 sends *real compressed* ALAC (payloads 311–999 B
+//! variable, vs the escape's constant 1416 B), and so do OwnTone,
+//! AirConnect/libraop and node_airtunes2. The only field sender using
+//! the escape is PipeWire `module-raop-sink`, and it reproduces the
+//! connected-but-silent symptom on Sonos. The default RTP path encodes
+//! with Apple's real encoder (`alac-encoder` crate); this module stays
+//! for the `airplay_uncompressed_alac` config escape hatch and for
+//! shairport-class receivers where the escape is known-good.
 //!
 //! The bit layout below is taken verbatim from PipeWire's
 //! `write_codec_pcm()` (its `module-raop-sink.c`) and cross-checked
