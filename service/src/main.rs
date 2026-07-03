@@ -471,6 +471,14 @@ fn run(cli: Cli) -> Result<()> {
     #[cfg(windows)]
     spawn_driver_event_consumer(app.clone(), &cli);
 
+    // Auto-reconnect watchdog — replaces a dropped AirPlay session with a
+    // fresh one so the UI never shows a zombie "streaming" state.
+    app.spawn_reconnect_watchdog();
+
+    // Now-playing metadata forwarder (off by default; pushes the OS's
+    // current track to the speaker when enabled).
+    app.spawn_now_playing_forwarder();
+
     // Ctrl-C handler — set the shutdown flag.
     install_signal_handler(app.clone());
 

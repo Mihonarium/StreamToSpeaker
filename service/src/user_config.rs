@@ -11,7 +11,10 @@
 //!     subsequent launches.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+use crate::airplay::hap_pairing::PairingCredentials;
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct UserConfig {
@@ -41,6 +44,14 @@ pub struct UserConfig {
     /// Edit config.json by hand to flip; no GUI yet.
     #[serde(default)]
     pub prefer_realtime_airplay: bool,
+    /// Auto-reconnect when a live session drops mid-stream (speaker
+    /// rebooted, Wi-Fi blip, receiver reaped the session). One retry per
+    /// drop, 5 s after detection — OwnTone's field-proven policy (its 5 s
+    /// spacing also respects the Sonos half-open-session hold). The dead
+    /// session is torn down either way so the UI never shows a zombie
+    /// "streaming" state.
+    #[serde(default = "default_auto_reconnect")]
+    pub auto_reconnect_on_drop: bool,
     /// RAOP `et=4` MFi-encryption experiment switch. iTunes encrypts
     /// audio to et=4 receivers with a key wrapped via the auth-setup
     /// ECDH secret; our wrap is a best-grounded guess (no open-source
@@ -49,6 +60,48 @@ pub struct UserConfig {
     /// tries MFi first and falls back to plaintext/RSA on failure.
     #[serde(default)]
     pub airplay_mfi_encryption: bool,
+    /// Per-device AirPlay passwords for `pw=true` receivers, keyed by the
+    /// device's stable id (`airplay:<mac>`). Stored so the user only
+    /// enters it once. Plain-text in the config file (same trust level as
+    /// the rest of the file); RTSP Digest never sends it in the clear.
+    #[serde(default)]
+    pub airplay_passwords: HashMap<String, String>,
+    /// Per-device HomeKit **persistent** pairing credentials, keyed by the
+    /// device's stable id (`airplay:<mac>`). Stored after a one-time PIN
+    /// pair-setup with an AP2 receiver that refuses transient pairing (an
+    /// Apple TV with access control / "require device verification"), so
+    /// later connects skip straight to pair-verify. Holds our controller
+    /// Ed25519 seed + the accessory's long-term public key — same trust
+    /// level as the rest of the file; the seed is a per-device identity,
+    /// not a reusable secret elsewhere.
+    #[serde(default)]
+    pub airplay_pairings: HashMap<String, PairingCredentials>,
+    /// Persistent per-install HomeKit controller identity (pairing id +
+    /// Ed25519 seed, hex), minted by the first PIN ceremony and reused
+    /// for every later pair-setup: HAP accessories key stored pairings on
+    /// the controller id, so a stable identity makes re-pairing REPLACE
+    /// the record instead of consuming another of the accessory's finite
+    /// pairing slots.
+    #[serde(default)]
+    pub airplay_controller_id: Option<String>,
+    #[serde(default)]
+    pub airplay_controller_seed_hex: Option<String>,
+    /// Catch-all preserving config keys this binary doesn't know about
+    /// (a newer version's settings) across load→save round-trips. Without
+    /// it, running an older build once silently strips them — which for
+    /// `airplay_pairings`-class data costs the user an on-screen PIN
+    /// ceremony per device to recreate. (Protects downgrades from
+    /// versions AFTER this one; releases before it still strip.)
+    #[serde(flatten)]
+    pub unknown_keys: serde_json::Map<String, serde_json::Value>,
+    /// Forward Windows' "now playing" (title/artist/album from the System
+    /// Media Transport Controls) to the speaker as track metadata, so it
+    /// shows on the speaker's display / app. **Off by default** — it's a
+    /// nicety, it reads whatever app currently has media focus, and the
+    /// RAOP metadata path is best-effort (a receiver that ignores it is
+    /// harmless). RAOP only for now (Sonos-class); no AP2 metadata yet.
+    #[serde(default)]
+    pub forward_now_playing: bool,
     /// Debug escape hatch: send the uncompressed-ALAC escape frames
     /// instead of real compressed ALAC. Every field-proven sender
     /// (iTunes, OwnTone, AirConnect) sends compressed; this exists only

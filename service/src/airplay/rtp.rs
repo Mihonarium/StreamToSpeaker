@@ -149,6 +149,9 @@ pub struct RtpSenderConfig {
     /// Debug escape hatch: ship the uncompressed-ALAC escape instead of
     /// real compressed ALAC (see module docs). Default false.
     pub uncompressed_alac: bool,
+    /// Set when the sender detects the session is dead (audio socket
+    /// send error) so the app watchdog can tear down + reconnect.
+    pub session_dead: Arc<AtomicBool>,
 }
 
 /// Spawn the audio sender thread. Returns once the thread is running.
@@ -339,8 +342,9 @@ fn run_sender(cfg: RtpSenderConfig) {
 
         if let Err(e) = cfg.audio_socket.send_to(&pkt_bytes, cfg.receiver_addr) {
             warn!("AirPlay RTP send failed: {}", e);
-            // Receiver disappeared — give up; the session manager
-            // will notice and tear down.
+            // Receiver disappeared — flag the session dead so the app
+            // watchdog tears it down and auto-reconnects.
+            cfg.session_dead.store(true, Ordering::Release);
             return;
         }
         // Keep a copy so we can retransmit on a resend request.

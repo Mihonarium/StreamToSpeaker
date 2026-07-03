@@ -1,6 +1,6 @@
 [package]
 name = "stream-to-speaker"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Stream To Speaker — user-mode bridge between a Windows virtual audio driver (or WASAPI loopback) and any UPnP/OpenHome network speaker (Sonos, IKEA StreamToSpeaker, etc)."
@@ -60,6 +60,9 @@ aes = { version = "0.8", default-features = false }
 cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
 # Hash for RSA-OAEP MGF1 — RAOP locks this to SHA-1 (legacy).
 sha1 = { version = "0.10", default-features = false }
+# MD5 for RTSP Digest auth (RFC 2617) to password-protected AirPlay
+# receivers — mirrors OwnTone's raop_add_auth exactly.
+md-5 = { version = "0.10", default-features = false }
 # Base64 for SDP attributes + Apple-Challenge response.
 base64 = "0.22"
 # RNG for AES key + IV + RTP SSRC + Apple-Challenge nonces.
@@ -68,6 +71,10 @@ rand = "0.8"
 # (AirPort Express fw 7.8+, certain Sonos) gate ANNOUNCE behind it and
 # return 403 until we complete a curve25519 key exchange.
 x25519-dalek = "2"
+# Ed25519 long-term keys for HomeKit *persistent* pairing (Apple TV PIN
+# pair-setup M5/M6 + pair-verify): the controller signs its device info
+# and verifies the accessory's.
+ed25519-dalek = "2"
 # --- AirPlay 2 (HomeKit transient pairing + ChaCha20-Poly1305 audio) ---
 # AEAD for the encrypted RTSP control channel and the per-packet audio
 # encryption used by AirPlay 2 receivers (HomePod et al).
@@ -103,6 +110,10 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    # WinRT System Media Transport Controls — reads the OS "now playing"
+    # (title/artist/album) for the opt-in metadata-forwarding feature.
+    "Foundation",
+    "Media_Control",
 ] }
 # GUI: native window + system tray. Windows-only for now since the
 # kernel driver is anyway Windows-only.

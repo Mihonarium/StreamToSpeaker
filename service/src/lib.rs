@@ -18,6 +18,7 @@ pub mod sine_source;
 pub mod qpc;
 pub mod picker;
 pub mod user_config;
+pub mod now_playing;
 #[cfg(windows)]
 pub mod wasapi_source;
 

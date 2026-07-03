@@ -33,6 +33,10 @@ pub struct SpeakerInfo {
     pub ip: String,
     /// `true` when this is the currently-active target.
     pub active: bool,
+    /// Optional advisory shown as a row tooltip — e.g. that an AirPlay
+    /// entry for a speaker that also has a non-AirPlay entry will have
+    /// higher latency. `None` for most rows.
+    pub note: Option<String>,
 }
 
 /// Callback that returns the current list of discovered speakers.

@@ -857,6 +857,9 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 tray,
                 frame_count: 0,
                 confirm_close_open: false,
+                password_prompt: None,
+                pin_prompt: None,
+                last_fractional_scroll: None,
                 skip_close_confirmation,
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
@@ -864,8 +867,6 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 last_applied_dark: None,
                 last_applied_accent: None,
                 hwnd,
-                last_scroll_y: 0.0,
-                pinned_status_visible: false,
             }))
         }),
     );
@@ -887,6 +888,19 @@ struct StreamToSpeakerApp {
     theme_mode: ThemeMode,
     advanced_open: bool,
     onboarding_dismissed: bool,
+    /// Open when the user is entering a password for a `pw=true` AirPlay
+    /// speaker. `None` when no prompt is showing.
+    password_prompt: Option<PasswordPrompt>,
+    /// Open when an AP2 receiver (Apple TV with access control) is showing
+    /// a PIN and awaiting one-time HomeKit pairing. Mirrors the app's
+    /// `pending_pin_pairing` state each frame; `None` when no ceremony is
+    /// in flight.
+    pin_prompt: Option<PinPrompt>,
+    /// When the last fractional (touchpad-shaped) wheel event arrived —
+    /// drives the raw_input_hook's mouse-vs-touchpad classification (a
+    /// fling's decay passes through exact integers, so integer deltas
+    /// shortly after a fractional one are still the touchpad).
+    last_fractional_scroll: Option<Instant>,
     /// Whether the theme is currently applied as dark. None until first
     /// apply. We re-apply only when this disagrees with the resolved
     /// mode — apply_theme rebuilds the full Style+Visuals every call
@@ -904,15 +918,6 @@ struct StreamToSpeakerApp {
     /// tray-menu round-trip (emilk/egui#5229, #3655). Bypassing the
     /// queue with raw Win32 sidesteps the bug entirely.
     hwnd: Option<isize>,
-    /// Last-observed scroll offset of the main content area. Drives the
-    /// pinned compact status bar (m44): when the user has scrolled past
-    /// the full status banner, a thin pinned bar appears above the
-    /// scroll area so speaker + state stay visible.
-    last_scroll_y: f32,
-    /// Hysteresis flag for the pinned bar. Shows at scroll > 100,
-    /// hides at scroll < 60 — single threshold would flicker on every
-    /// frame the user parked their scroll exactly on the boundary.
-    pinned_status_visible: bool,
 }
 
 /// Win32 helpers for hide/show. eframe's `ViewportCommand::Visible` /
@@ -951,6 +956,89 @@ fn win_show_and_focus(hwnd: isize) {
 }
 
 impl eframe::App for StreamToSpeakerApp {
+    /// Windows precision touchpads deliver two-finger panning as a stream
+    /// of small, mostly-fractional Line-unit wheel events whose decay
+    /// curve (the driver's own inertia) is already smooth. egui 0.29
+    /// exponentially smooths EVERY Line-unit event over ~100 ms — only
+    /// sub-8pt Point-unit deltas take its direct path (the "smooth mac
+    /// trackpad, don't add latency" bypass in `input_state`). So on
+    /// Windows the OS inertia curve gets convolved with egui's smoother:
+    /// the list lags the fingers while panning, and the accumulated
+    /// backlog drains on its own exponential at finger-lift — the
+    /// unnatural acceleration/jump at the tail of a fling that the
+    /// repaint pump in `update` alone couldn't fix (it keeps the drain
+    /// alive but can't remove the double-smoothing).
+    ///
+    /// Rewrite touchpad-shaped wheel events into pre-scaled Point events
+    /// split into sub-8pt chunks, so every chunk takes egui's unsmoothed
+    /// path and the driver's curve is reproduced 1:1. Touchpad-shaped =
+    /// a fractional/sub-notch Line delta, or any Line event within 300 ms
+    /// of one (a fling's decay passes through exact integers). Isolated
+    /// integer notches — a real mouse wheel — keep egui's smoothing,
+    /// which is what makes notchy wheels feel nice.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        const TOUCHPAD_STICKY: Duration = Duration::from_millis(300);
+        // Just under egui's `is_smooth` threshold of 8.0 points.
+        const SMOOTH_BYPASS_MAX: f32 = 7.0;
+
+        if !raw_input
+            .events
+            .iter()
+            .any(|e| matches!(e, egui::Event::MouseWheel { .. }))
+        {
+            return;
+        }
+        // The same points-per-line factor egui itself would apply.
+        let line_speed = ctx.options(|o| o.line_scroll_speed);
+
+        let mut rewritten: Vec<egui::Event> = Vec::with_capacity(raw_input.events.len() + 4);
+        for event in raw_input.events.drain(..) {
+            let egui::Event::MouseWheel { unit, delta, modifiers } = event else {
+                rewritten.push(event);
+                continue;
+            };
+            let point_delta = match unit {
+                egui::MouseWheelUnit::Line => {
+                    let fractional = delta.x.fract() != 0.0
+                        || delta.y.fract() != 0.0
+                        || (delta != egui::Vec2::ZERO && delta.length() < 1.0);
+                    let now = Instant::now();
+                    if fractional {
+                        self.last_fractional_scroll = Some(now);
+                    }
+                    let touchpad = fractional
+                        || self
+                            .last_fractional_scroll
+                            .map_or(false, |t| now.duration_since(t) < TOUCHPAD_STICKY);
+                    if !touchpad {
+                        // Real mouse-wheel notch: keep egui's smoothing.
+                        rewritten.push(egui::Event::MouseWheel { unit, delta, modifiers });
+                        continue;
+                    }
+                    delta * line_speed
+                }
+                egui::MouseWheelUnit::Point => delta,
+                egui::MouseWheelUnit::Page => {
+                    rewritten.push(egui::Event::MouseWheel { unit, delta, modifiers });
+                    continue;
+                }
+            };
+            // Split so each chunk stays under egui's bypass threshold.
+            // Same-frame chunks are applied together, so the full delta
+            // still lands this frame — just without the added smoothing.
+            let n = ((point_delta.length() / SMOOTH_BYPASS_MAX).ceil() as usize).max(1);
+            let chunk = point_delta / n as f32;
+            for _ in 0..n {
+                rewritten.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: chunk,
+                    modifiers,
+                });
+            }
+        }
+        raw_input.events = rewritten;
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count = self.frame_count.saturating_add(1);
         if self.frame_count == 1 {
@@ -960,6 +1048,22 @@ impl eframe::App for StreamToSpeakerApp {
         if self.last_repaint_request.elapsed() >= Duration::from_millis(100) {
             ctx.request_repaint_after(Duration::from_millis(100));
             self.last_repaint_request = Instant::now();
+        }
+
+        // While egui is still easing a scroll delta, repaint at the full
+        // frame rate so the buffered delta drains evenly. egui buffers
+        // wheel/touchpad deltas and releases them over a ~0.1 s ease, but
+        // it does NOT itself request a repaint to animate that — so in
+        // eframe's reactive mode the ease only advances when the OS sends
+        // the next scroll event (or on the 100 ms heartbeat above). During
+        // a touchpad fling the OS events get sparse as inertia decays, so
+        // the buffered portion releases in coarse lumps — the "unnatural
+        // acceleration/jump" at the tail of the fling. Driving repaints
+        // here makes the ease play out smoothly; it self-terminates the
+        // moment the buffer is empty (smooth_scroll_delta returns to zero),
+        // so it costs nothing when not scrolling.
+        if ctx.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO) {
+            ctx.request_repaint();
         }
 
         // App-wide keyboard shortcuts (M27). consume_shortcut takes the
@@ -1045,40 +1149,51 @@ impl eframe::App for StreamToSpeakerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        // Mirror the app's PIN-pairing state into our modal. The app sets
+        // it (off-thread) once an Apple TV is displaying its PIN; drop our
+        // modal when the app clears it (ceremony finished / cancelled /
+        // timed out). Keyed on id so a new ceremony replaces a stale
+        // prompt. NEVER opened on top of another modal: two stacked
+        // CENTER_CENTER windows share the global Escape (one press would
+        // abort both flows) and the focused field of the one underneath
+        // silently swallows the keystrokes — a PIN typed "into" the
+        // stacked prompt would land in the password field and Enter would
+        // persist it as that speaker's AirPlay password. The ceremony
+        // keeps waiting (2-minute window), so the prompt simply appears
+        // once the other modal closes.
+        if self.password_prompt.is_none() && !self.confirm_close_open {
+            match self.app.pending_pin_pairing() {
+                Some((id, name)) => {
+                    if self.pin_prompt.as_ref().map(|p| p.id != id).unwrap_or(true) {
+                        self.pin_prompt = Some(PinPrompt { id, name, input: String::new() });
+                    }
+                }
+                None => self.pin_prompt = None,
+            }
+        }
+
         if self.confirm_close_open {
             self.show_close_modal(ctx, &p);
+        }
+        if self.password_prompt.is_some() {
+            self.show_password_modal(ctx, &p);
+        }
+        if self.pin_prompt.is_some() {
+            self.show_pin_modal(ctx, &p);
         }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(p.canvas).inner_margin(sp::M))
             .show(ctx, |ui| {
-                let enabled = !self.confirm_close_open;
+                let enabled = !self.confirm_close_open
+                    && self.password_prompt.is_none()
+                    && self.pin_prompt.is_none();
                 ui.add_enabled_ui(enabled, |ui| {
                     // Keep the header pinned at the top (theme toggle
                     // shouldn't scroll away); everything below scrolls
                     // when the window is shorter than the content.
                     self.show_header(ui, &p);
                     ui.add_space(sp::S);
-
-                    // m44: pinned compact status bar — appears above
-                    // the scroll area once the full status banner has
-                    // scrolled out of view, so the user can still see
-                    // the speaker + state (and hit Enable/Disable)
-                    // without scrolling back to the top. Hysteresis
-                    // (show > 100, hide < 60) prevents flicker on
-                    // the boundary.
-                    let want_pinned = if self.last_scroll_y > 100.0 {
-                        true
-                    } else if self.last_scroll_y < 60.0 {
-                        false
-                    } else {
-                        self.pinned_status_visible
-                    };
-                    self.pinned_status_visible = want_pinned;
-                    if want_pinned && self.app.is_speaker_bound() {
-                        self.show_pinned_status(ui, &p);
-                        ui.add_space(sp::S);
-                    }
 
                     // Reserve a right-edge inset for the auto-expanding
                     // scrollbar. egui's modern scrollbar starts as a
@@ -1088,11 +1203,26 @@ impl eframe::App for StreamToSpeakerApp {
                     // border of every card — exactly the "scrollbar
                     // touching the card borders" the audit / user
                     // reported.
+                    //
+                    // m44: the compact pinned status bar is drawn AFTER
+                    // the scroll area as a floating overlay (see below).
+                    // It occupies zero layout space, so its appearance
+                    // can never shift the content — earlier in-layout
+                    // versions made the page hop on every toggle (worst
+                    // mid-fling on a touchpad) and fighting that with a
+                    // scroll-offset compensation broke scrollbar drags
+                    // and inertia. We record the full status banner's
+                    // bottom edge so the overlay can appear exactly when
+                    // the banner leaves the viewport — no thresholds, no
+                    // hysteresis, and the two can't both be readable at
+                    // once.
+                    let mut banner_bottom_px = f32::MAX;
                     let out = egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_max_width(ui.available_width() - sp::M);
                             self.show_status_banner(ui, &p);
+                            banner_bottom_px = ui.cursor().top();
                             self.show_error_banner(ui, &p);
                             ui.add_space(sp::M);
                             // Show onboarding regardless of whether a
@@ -1118,7 +1248,44 @@ impl eframe::App for StreamToSpeakerApp {
                             ui.add_space(sp::M);
                             self.show_stats(ui, &p);
                         });
-                    self.last_scroll_y = out.state.offset.y;
+
+                    // Floating pinned status bar: fades/slides in over the
+                    // scroll content once the full banner has scrolled out
+                    // of view. animate_bool gives the smooth transition;
+                    // because it's an overlay, the scroll offset, scrollbar
+                    // geometry, and kinetic fling are completely untouched.
+                    let viewport = out.inner_rect;
+                    let show_pinned = self.app.is_speaker_bound()
+                        && banner_bottom_px <= viewport.top() + 1.0;
+                    let t = ui.ctx().animate_bool_with_time(
+                        egui::Id::new("pinned-status-overlay"),
+                        show_pinned,
+                        0.18,
+                    );
+                    if t > 0.0 {
+                        // Slide down from behind the header while fading in.
+                        let slide = (1.0 - t) * 28.0;
+                        egui::Area::new(egui::Id::new("pinned-status-area"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(egui::pos2(viewport.left(), viewport.top() - slide))
+                            .show(ui.ctx(), |aui| {
+                                aui.set_opacity(t);
+                                aui.set_width(viewport.width());
+                                // Canvas-coloured backdrop so scroll content
+                                // doesn't bleed through around the card's
+                                // rounded corners — reads as the header
+                                // extending down over the content.
+                                egui::Frame::none()
+                                    .fill(p.canvas)
+                                    .inner_margin(egui::Margin {
+                                        bottom: 6.0,
+                                        ..Default::default()
+                                    })
+                                    .show(aui, |aui| {
+                                        self.show_pinned_status(aui, &p);
+                                    });
+                            });
+                    }
                 });
             });
     }
@@ -1740,7 +1907,7 @@ impl StreamToSpeakerApp {
             });
     }
 
-    fn show_speakers(&self, ui: &mut egui::Ui, p: &Palette) {
+    fn show_speakers(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
             ui.horizontal(|ui| {
                 section_label(ui, p, "Speakers");
@@ -1772,8 +1939,8 @@ impl StreamToSpeakerApp {
                 });
             });
 
-            // Auto-reconnect preference (next to the saved-speaker
-            // controls so it's discoverable when a speaker is saved).
+            // Auto-reconnect preferences (next to the saved-speaker
+            // controls so they're discoverable when a speaker is saved).
             if self.app.saved_speaker_id().is_some() {
                 let mut auto = self.app.is_auto_reconnect_on_launch();
                 let resp = ui.checkbox(
@@ -1782,6 +1949,17 @@ impl StreamToSpeakerApp {
                 );
                 if resp.changed() {
                     self.app.set_auto_reconnect_on_launch(auto);
+                }
+
+                let mut on_drop = self.app.is_auto_reconnect_on_drop();
+                let resp = ui
+                    .checkbox(&mut on_drop, "Reconnect automatically if the connection drops")
+                    .on_hover_text(
+                        "If the speaker reboots or drops off Wi-Fi mid-stream, reconnect after a \
+                         few seconds instead of leaving a dead connection.",
+                    );
+                if resp.changed() {
+                    self.app.set_auto_reconnect_on_drop(on_drop);
                 }
             }
 
@@ -1880,12 +2058,23 @@ impl StreamToSpeakerApp {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for sp in view.speakers {
+                        let mut prompt_for: Option<(String, String)> = None;
                         speaker_row(ui, p, &sp, |id| {
-                            // Bring-up does seconds of network I/O —
-                            // run it off-thread; the status banner shows
-                            // "Connecting…" and errors arrive as toasts.
-                            self.app.select_speaker_async(id);
+                            // Password-protected speaker → collect the
+                            // password first (pre-fill any stored one).
+                            if self.app.is_password_protected(id) {
+                                prompt_for = Some((id.to_string(), sp.friendly_name.clone()));
+                            } else {
+                                // Bring-up does seconds of network I/O —
+                                // run it off-thread; the status banner shows
+                                // "Connecting…" and errors arrive as toasts.
+                                self.app.select_speaker_async(id);
+                            }
                         });
+                        if let Some((id, name)) = prompt_for {
+                            let input = self.app.airplay_password(&id).unwrap_or_default();
+                            self.password_prompt = Some(PasswordPrompt { id, name, input });
+                        }
                     }
                 });
 
@@ -2227,6 +2416,21 @@ impl StreamToSpeakerApp {
                     uc.save();
                 }
             }
+
+            ui.add_space(sp::S);
+
+            let mut now_playing = self.app.is_forward_now_playing();
+            advanced_row(
+                ui,
+                p,
+                "Show now-playing on the speaker",
+                "Send the current track's title/artist/album to the speaker's display.",
+                "When on, Stream To Speaker reads whatever Windows reports as \"now playing\" (the same title/artist the media keys show) and forwards it to the speaker so it appears on the speaker's screen or in its app. It reads whichever app currently has media focus. Off by default; works on AirPlay 1 (RAOP) speakers like Sonos in AirPlay mode.",
+                |ui| {
+                    ui.checkbox(&mut now_playing, "Forward Windows' now-playing info");
+                },
+            );
+            self.app.set_forward_now_playing(now_playing);
         });
     }
 
@@ -2456,6 +2660,177 @@ impl StreamToSpeakerApp {
             }
         }
     }
+
+    /// Password entry modal for a `pw=true` AirPlay speaker. On confirm it
+    /// stores the password (so it's remembered) and kicks off the
+    /// background connect; a wrong password surfaces as an error toast and
+    /// the user can click the speaker again to re-enter.
+    fn show_password_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(prompt) = self.password_prompt.as_mut() else {
+            return;
+        };
+        let title = format!("Password for {}", prompt.name);
+        match show_text_prompt_modal(
+            ctx,
+            p,
+            &title,
+            "This speaker requires an AirPlay password. Enter it to connect — \
+             it'll be remembered for next time.",
+            "AirPlay password",
+            true,
+            "Connect",
+            false,
+            self.confirm_close_open,
+            &mut prompt.input,
+        ) {
+            PromptAction::Confirm => {
+                if let Some(prompt) = self.password_prompt.take() {
+                    self.app.set_airplay_password(&prompt.id, prompt.input.trim());
+                    self.app.select_speaker_async(&prompt.id);
+                }
+            }
+            PromptAction::Cancel => self.password_prompt = None,
+            PromptAction::Open => {}
+        }
+    }
+
+    /// One-time HomeKit PIN pairing modal for an AP2 receiver (Apple TV
+    /// with access control). Shown while the app's `pending_pin_pairing`
+    /// is Some — the receiver is displaying a PIN. Confirm sends the PIN to
+    /// the parked ceremony thread; cancel aborts it.
+    fn show_pin_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(prompt) = self.pin_prompt.as_mut() else {
+            return;
+        };
+        let title = format!("Pair with {}", prompt.name);
+        match show_text_prompt_modal(
+            ctx,
+            p,
+            &title,
+            "This receiver needs one-time pairing. A PIN should now be showing \
+             on its screen — enter it here to pair. It'll be remembered, so you \
+             won't need to do this again.",
+            "PIN shown on the device",
+            false,
+            "Pair",
+            // A blank PIN isn't a submit — ignore Enter/Pair until typed.
+            true,
+            self.confirm_close_open,
+            &mut prompt.input,
+        ) {
+            PromptAction::Confirm => {
+                if let Some(prompt) = self.pin_prompt.take() {
+                    // False = the ceremony's 2-minute window expired while
+                    // the modal was up; the PIN went nowhere. Say so —
+                    // silently eating it reads as "pairing is broken".
+                    if !self.app.submit_pin(Some(prompt.input.trim().to_string())) {
+                        self.app.record_error(
+                            "The pairing window expired — select the speaker again to retry.",
+                        );
+                    }
+                }
+            }
+            PromptAction::Cancel => {
+                self.pin_prompt = None;
+                self.app.submit_pin(None);
+            }
+            PromptAction::Open => {}
+        }
+    }
+}
+
+/// Outcome of one frame of a text-prompt modal.
+enum PromptAction {
+    /// Still open, nothing decided this frame.
+    Open,
+    Confirm,
+    Cancel,
+}
+
+/// Shared scaffold for the text-entry modals (AirPlay password, PIN
+/// pairing): identical window frame, blurb, focused single-line edit,
+/// Enter-to-confirm, Escape / window-X / Cancel-button to cancel.
+/// `suppress_escape` keeps a stacked close-confirm modal's Escape press
+/// from also cancelling this prompt (egui input is global, not routed to
+/// the topmost window).
+#[allow(clippy::too_many_arguments)]
+fn show_text_prompt_modal(
+    ctx: &egui::Context,
+    p: &Palette,
+    title: &str,
+    blurb: &str,
+    hint: &str,
+    mask_input: bool,
+    confirm_label: &str,
+    reject_blank: bool,
+    suppress_escape: bool,
+    input: &mut String,
+) -> PromptAction {
+    let mut still_open = true;
+    let mut confirm = false;
+    let mut cancel = false;
+
+    if !suppress_escape && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        cancel = true;
+    }
+
+    egui::Window::new(egui::RichText::new(title).strong().color(p.text_primary))
+        .open(&mut still_open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(420.0)
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(p.card)
+                .stroke(egui::Stroke::new(1.0, p.divider))
+                .rounding(RADIUS_SURFACE)
+                .inner_margin(sp::MODAL),
+        )
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new(blurb).color(p.text_secondary));
+            ui.add_space(sp::S);
+            let edit = ui.add(
+                egui::TextEdit::singleline(input)
+                    .password(mask_input)
+                    .hint_text(hint)
+                    .desired_width(f32::INFINITY),
+            );
+            // Focus the field when the modal opens; Enter confirms. The
+            // memory check keeps us from stealing focus away from a field
+            // that already has it (including one in another window).
+            if !edit.has_focus() && !ctx.memory(|m| m.focused().is_some()) {
+                edit.request_focus();
+            }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                confirm = true;
+            }
+            ui.add_space(sp::M);
+            ui.horizontal(|ui| {
+                if primary_button(ui, p, confirm_label, 120.0).clicked() {
+                    confirm = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if secondary_button(ui, p, "Cancel", 96.0).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        });
+
+    if !still_open {
+        cancel = true;
+    }
+    if confirm && reject_blank && input.trim().is_empty() {
+        confirm = false;
+    }
+    if confirm {
+        PromptAction::Confirm
+    } else if cancel {
+        PromptAction::Cancel
+    } else {
+        PromptAction::Open
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -2463,6 +2838,28 @@ enum CloseAction {
     MinimiseToTray,
     Quit,
     Cancel,
+}
+
+/// State for the AirPlay password entry modal.
+struct PasswordPrompt {
+    /// Stable id of the speaker being connected to.
+    id: String,
+    /// Friendly name, for the dialog title.
+    name: String,
+    /// The password the user is typing.
+    input: String,
+}
+
+/// State for the one-time HomeKit PIN pairing modal (Apple TV with access
+/// control). Mirrors the app's `pending_pin_pairing`; `id` keys it so a new
+/// ceremony replaces a stale prompt.
+struct PinPrompt {
+    /// Stable id of the receiver being paired.
+    id: String,
+    /// Friendly name, for the dialog title.
+    name: String,
+    /// The PIN the user is typing (as shown on the receiver's screen).
+    input: String,
 }
 
 // -----------------------------------------------------------------------------
@@ -2597,6 +2994,14 @@ fn speaker_row(
     if response.hovered() && response.enabled() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+
+    // Advisory tooltip (e.g. "higher delay" for an AirPlay entry whose
+    // speaker also has a lower-latency UPnP entry).
+    let response = if let Some(note) = sp.note.as_deref() {
+        response.on_hover_text(note)
+    } else {
+        response
+    };
 
     if (response.clicked() || kbd_activate) && !active {
         on_click(&sp.id);

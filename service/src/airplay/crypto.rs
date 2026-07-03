@@ -135,6 +135,14 @@ impl MfiKey {
 }
 
 impl Cipher {
+    /// The RSA-wrapped-key path with a fresh random session key. Used for
+    /// receivers that require (or expect) AES — classic AirPort Express —
+    /// which [`crate::airplay::discovery::AirPlayRenderer::prefers_rsa_encryption`]
+    /// identifies.
+    pub fn rsa() -> Self {
+        Cipher::AesRsa(SessionKey::random())
+    }
+
     /// Choose the best cipher we can speak from a receiver's
     /// advertised `et=` list. Returns `None` if nothing matches
     /// (FairPlay-only receivers, etc).
@@ -279,6 +287,75 @@ pub fn base64_nopad(input: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(input)
 }
 
+/// RTSP Digest authentication for password-protected RAOP receivers —
+/// a byte-exact port of OwnTone's `raop_add_auth` (RFC 2617 without
+/// qop/cnonce, which is what AirPort Express / shairport speak):
+///
+/// ```text
+///   HA1      = MD5(username : realm : password)
+///   HA2      = MD5(method : uri)
+///   response = MD5(HA1 : nonce : HA2)
+/// ```
+///
+/// The hex encoding case is load-bearing: the intermediate `HA1`/`HA2`
+/// strings are fed into the next MD5 as ASCII, so gen-1 AirPort Express
+/// (which uses username `"iTunes"` + **uppercase** hex) produces a
+/// different digest than everything else (empty username + lowercase).
+/// `uppercase` selects that quirk.
+pub fn digest_auth_response(
+    username: &str,
+    realm: &str,
+    nonce: &str,
+    password: &str,
+    method: &str,
+    uri: &str,
+    uppercase: bool,
+) -> String {
+    let ha1 = md5_hex(
+        format!("{}:{}:{}", username, realm, password).as_bytes(),
+        uppercase,
+    );
+    let ha2 = md5_hex(format!("{}:{}", method, uri).as_bytes(), uppercase);
+    md5_hex(
+        format!("{}:{}:{}", ha1, nonce, ha2).as_bytes(),
+        uppercase,
+    )
+}
+
+/// Build the full `Authorization: Digest …` header value for one request.
+pub fn digest_auth_header(
+    username: &str,
+    realm: &str,
+    nonce: &str,
+    password: &str,
+    method: &str,
+    uri: &str,
+    uppercase: bool,
+) -> String {
+    let response =
+        digest_auth_response(username, realm, nonce, password, method, uri, uppercase);
+    format!(
+        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
+        username, realm, nonce, uri, response
+    )
+}
+
+fn md5_hex(input: &[u8], uppercase: bool) -> String {
+    use md5::{Digest, Md5};
+    let mut h = Md5::new();
+    h.update(input);
+    let digest = h.finalize();
+    let mut out = String::with_capacity(32);
+    for b in digest {
+        if uppercase {
+            out.push_str(&format!("{:02X}", b));
+        } else {
+            out.push_str(&format!("{:02x}", b));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +415,54 @@ mod tests {
     fn base64_nopad_drops_padding() {
         assert_eq!(base64_nopad(&[1, 2]), "AQI");
         assert_eq!(base64_nopad(&[1, 2, 3]), "AQID");
+    }
+
+    #[test]
+    fn digest_matches_rfc2617_style_vector() {
+        // Hand-computed reference (empty username, lowercase):
+        //   HA1 = md5(":raop:pass"), HA2 = md5("OPTIONS:*"),
+        //   response = md5(HA1:nonce:HA2).
+        let resp = digest_auth_response("", "raop", "abc123", "pass", "OPTIONS", "*", false);
+        // Compute the expected value the same way, independently.
+        let ha1 = {
+            use md5::{Digest, Md5};
+            let mut h = Md5::new();
+            h.update(b":raop:pass");
+            format!("{:x}", h.finalize())
+        };
+        let ha2 = {
+            use md5::{Digest, Md5};
+            let mut h = Md5::new();
+            h.update(b"OPTIONS:*");
+            format!("{:x}", h.finalize())
+        };
+        let expected = {
+            use md5::{Digest, Md5};
+            let mut h = Md5::new();
+            h.update(format!("{}:abc123:{}", ha1, ha2).as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        assert_eq!(resp, expected);
+        assert_eq!(resp.len(), 32);
+        assert!(resp.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn digest_uppercase_quirk_differs_from_lowercase() {
+        // The iTunes/APEX1 quirk (uppercase hex + "iTunes" user) must
+        // produce a different response than the default — the hex case
+        // changes the intermediate strings fed into the next MD5.
+        let lower = digest_auth_response("", "raop", "n", "p", "OPTIONS", "*", false);
+        let upper = digest_auth_response("iTunes", "raop", "n", "p", "OPTIONS", "*", true);
+        assert_ne!(lower.to_lowercase(), upper.to_lowercase());
+        assert!(upper.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn digest_header_shape() {
+        let h = digest_auth_header("", "raop", "N", "p", "ANNOUNCE", "rtsp://x/1", false);
+        assert!(h.starts_with("Digest username=\"\", realm=\"raop\", nonce=\"N\", uri=\"rtsp://x/1\", response=\""));
+        assert!(h.ends_with('"'));
     }
 
     #[test]

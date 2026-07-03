@@ -36,6 +36,18 @@ const RESEND_BUFFER_PACKETS: usize = 512;
 /// `2 * sampling_rate`).
 const DEFAULT_LATENCY_SAMPLES: u32 = 88200;
 
+/// The sync-anchor latency (samples) to use given the receiver's
+/// advertised `Audio-Latency` (from the RECORD response, `None` if
+/// absent). Mirrors libraop's on-wire sync value: `max(reported,
+/// configured)` — a receiver asking for a deeper buffer (big-DSP AVRs)
+/// gets it; everyone else (Sonos and most speakers omit the header) keeps
+/// the proven 88200 anchor exactly. NB the `+11025` in libraop is a
+/// sender-side *scheduling* value (`raopcl_latency`) that never reaches
+/// the sync packet, so we don't add it here.
+fn effective_latency_samples(advertised: Option<u32>) -> u32 {
+    advertised.unwrap_or(0).max(DEFAULT_LATENCY_SAMPLES)
+}
+
 /// Configuration to spin up one AirPlay session.
 pub struct AirPlaySessionConfig {
     pub renderer: AirPlayRenderer,
@@ -62,6 +74,9 @@ pub struct AirPlaySessionConfig {
     /// Debug escape hatch: send uncompressed-ALAC escape frames instead
     /// of real compressed ALAC. See `rtp.rs` module docs.
     pub uncompressed_alac: bool,
+    /// AirPlay password for a `pw=true` receiver (RTSP Digest auth).
+    /// `None` for the common unprotected case.
+    pub password: Option<String>,
 }
 
 /// Live AirPlay session.
@@ -73,6 +88,14 @@ pub struct AirPlaySession {
     /// Signals every background thread to stop (audio sender, timing
     /// responder, sync sender, resend responder, keepalive).
     stop_flag: Arc<AtomicBool>,
+    /// Set by the background threads when the session has demonstrably
+    /// died (audio socket send error, or repeated keepalive failures on
+    /// the RTSP connection). The app-level watchdog polls this to tear
+    /// down the zombie and auto-reconnect.
+    dead: Arc<AtomicBool>,
+    /// Current RTP write head — read to stamp the `RTP-Info` on metadata
+    /// SET_PARAMETERs.
+    current_rtptime: Arc<AtomicU32>,
     /// The background threads. All of them watch `stop_flag` with
     /// bounded wakeups, so `stop()` just sets the flag and joins.
     threads: Vec<JoinHandle<()>>,
@@ -171,6 +194,7 @@ impl AirPlaySession {
         // responder-after-RECORD ordering left those probes unanswered in
         // every stalled-SETUP session on record.
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
         let mut guard = SpawnGuard::new(stop_flag.clone());
         guard.adopt(
             spawn_timing_responder(
@@ -197,12 +221,17 @@ impl AirPlaySession {
         // Opener: iTunes → Sonos (AirTunes/366) leads with POST /auth-setup
         // (0x01 + X25519), not OPTIONS + Apple-Challenge. MFi/AP2 devices
         // get auth-setup; plain legacy receivers keep OPTIONS.
-        let attempt = |try_mfi: bool| -> Result<(RtspClient, Cipher, ServerPorts)> {
-            let mut rtsp = RtspClient::connect(
+        let attempt = |try_mfi: bool| -> Result<(RtspClient, Cipher, ServerPorts, u32)> {
+            // Password-protected receivers get RTSP Digest credentials;
+            // the gen-1 AirPort Express (no `am` model) uses the iTunes
+            // digest quirk (username "iTunes" + uppercase hex).
+            let mut rtsp = RtspClient::connect_auth(
                 cfg.renderer.ip,
                 cfg.renderer.port,
                 cfg.local_ip,
                 cfg.connect_timeout,
+                cfg.password.clone(),
+                cfg.renderer.model.is_none(),
             )
             .context("opening RTSP connection")?;
 
@@ -223,20 +252,28 @@ impl AirPlaySession {
                 } else {
                     rtsp.options().context("RTSP OPTIONS")?;
                 }
-                Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no compatible encryption mode for {} (advertised et={:?})",
-                        cfg.renderer.friendly_name,
-                        cfg.renderer.encryption_types,
-                    )
-                })?
+                if cfg.renderer.prefers_rsa_encryption() {
+                    // Classic AirPort Express (ek=1 / am=AirPort*) wants an
+                    // RSA-wrapped AES key; plaintext is silent there.
+                    Cipher::rsa()
+                } else {
+                    Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no compatible encryption mode for {} (advertised et={:?})",
+                            cfg.renderer.friendly_name,
+                            cfg.renderer.encryption_types,
+                        )
+                    })?
+                }
             };
 
             rtsp.announce(&cipher).context("RTSP ANNOUNCE")?;
             let ports = rtsp.setup(control_port, timing_port).context("RTSP SETUP")?;
-            rtsp.record(initial_seq, initial_rtptime)
+            let advertised_latency = rtsp
+                .record(initial_seq, initial_rtptime)
                 .context("RTSP RECORD")?;
-            Ok((rtsp, cipher, ports))
+            let latency = effective_latency_samples(advertised_latency);
+            Ok((rtsp, cipher, ports, latency))
         };
 
         // On any error below, `guard`'s Drop stops and joins whatever
@@ -257,7 +294,7 @@ impl AirPlaySession {
         } else {
             attempt(false)
         };
-        let (mut rtsp, cipher, server_ports) = handshake?;
+        let (mut rtsp, cipher, server_ports, latency_samples) = handshake?;
         info!(
             "AirPlay: cipher={} (receiver et={:?}, mfi_experiment={})",
             cipher.label(),
@@ -308,7 +345,7 @@ impl AirPlaySession {
                 control_socket,
                 receiver_control_addr,
                 current_rtptime.clone(),
-                DEFAULT_LATENCY_SAMPLES,
+                latency_samples,
                 stop_flag.clone(),
                 cfg.renderer.friendly_name.clone(),
             )
@@ -325,9 +362,10 @@ impl AirPlaySession {
             samples_rx: cfg.samples_rx,
             stop_flag: stop_flag.clone(),
             receiver_name: cfg.renderer.friendly_name.clone(),
-            current_rtptime,
+            current_rtptime: current_rtptime.clone(),
             resend: resend.clone(),
             uncompressed_alac: cfg.uncompressed_alac,
+            session_dead: dead.clone(),
         };
         guard.adopt(spawn_audio_sender(sender_cfg)?);
 
@@ -354,11 +392,13 @@ impl AirPlaySession {
         let keepalive_handle = {
             let rtsp = rtsp.clone();
             let stop_flag = stop_flag.clone();
+            let dead = dead.clone();
             let name = cfg.renderer.friendly_name.clone();
             std::thread::Builder::new()
                 .name(format!("stream-to-speaker-airplay-keepalive:{}", name))
                 .spawn(move || {
                     let mut healthy = true;
+                    let mut consecutive_failures = 0u32;
                     loop {
                         let interval = if healthy {
                             Duration::from_secs(2)
@@ -387,6 +427,7 @@ impl AirPlaySession {
                                     info!("AirPlay keepalive to {} recovered", name);
                                 }
                                 healthy = true;
+                                consecutive_failures = 0;
                             }
                             Err(e) => {
                                 if healthy {
@@ -397,6 +438,15 @@ impl AirPlaySession {
                                     );
                                 }
                                 healthy = false;
+                                consecutive_failures += 1;
+                                // Two failures ≈ 12–20 s of an unresponsive
+                                // control connection — the session is dead;
+                                // flag it for the app watchdog (which tears
+                                // down and auto-reconnects). Keep probing
+                                // anyway in case teardown is slow to arrive.
+                                if consecutive_failures >= 2 {
+                                    dead.store(true, Ordering::Release);
+                                }
                             }
                         }
                     }
@@ -420,9 +470,31 @@ impl AirPlaySession {
             renderer: cfg.renderer,
             rtsp,
             stop_flag,
+            dead,
+            current_rtptime,
             threads: guard.into_threads(),
             _audio_socket: audio_socket,
         })
+    }
+
+    /// A cheap, detachable handle for pushing track metadata without
+    /// holding the (GUI-hot) session lock during the network send. The
+    /// forwarder clones this under a brief session lock, releases the
+    /// session lock, then calls [`MetadataHandle::send`] — which touches
+    /// only the RTSP mutex (shared with the keepalive/volume, never the
+    /// session mutex the GUI polls every repaint).
+    pub fn metadata_handle(&self) -> MetadataHandle {
+        MetadataHandle {
+            rtsp: self.rtsp.clone(),
+            current_rtptime: self.current_rtptime.clone(),
+        }
+    }
+
+    /// True once a background thread has flagged the session as dead
+    /// (unreachable receiver / dropped connection). The app watchdog
+    /// polls this to replace the zombie with a fresh session.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
     }
 
     /// Push a new volume value (0..=100) to the receiver. Idempotent
@@ -464,6 +536,23 @@ impl Drop for AirPlaySession {
     }
 }
 
+/// Detached metadata sender — see [`AirPlaySession::metadata_handle`].
+/// Holds only the shared RTSP connection + RTP clock, so the background
+/// forwarder can send without contending on the session mutex.
+pub struct MetadataHandle {
+    rtsp: Arc<Mutex<RtspClient>>,
+    current_rtptime: Arc<AtomicU32>,
+}
+
+impl MetadataHandle {
+    /// Push "now playing" to the receiver (best-effort, non-fatal).
+    pub fn send(&self, title: &str, artist: &str, album: &str) -> Result<()> {
+        let body = crate::airplay::dmap::now_playing_body(title, artist, album);
+        let rtptime = self.current_rtptime.load(Ordering::Acquire);
+        self.rtsp.lock().unwrap().set_metadata(&body, rtptime)
+    }
+}
+
 /// Convert a 0..=100 percent volume to a RAOP-protocol dB value.
 ///
 /// RAOP volume semantics:
@@ -499,5 +588,18 @@ mod tests {
             assert!(v > prev, "non-monotonic at {}: {} → {}", p, prev, v);
             prev = v;
         }
+    }
+
+    #[test]
+    fn latency_anchor_defaults_and_honors_larger() {
+        // No Audio-Latency header (Sonos, most speakers) → the proven
+        // 88200 anchor, byte-identical to the old constant.
+        assert_eq!(effective_latency_samples(None), 88200);
+        // A small advertised value never lowers the floor.
+        assert_eq!(effective_latency_samples(Some(0)), 88200);
+        assert_eq!(effective_latency_samples(Some(11025)), 88200);
+        assert_eq!(effective_latency_samples(Some(88200)), 88200);
+        // A big-DSP AVR asking for a deeper buffer gets it.
+        assert_eq!(effective_latency_samples(Some(132300)), 132300);
     }
 }
