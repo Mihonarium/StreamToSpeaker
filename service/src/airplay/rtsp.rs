@@ -166,9 +166,10 @@ impl RtspClient {
         // The keepalive's job is to keep the connection warm so the
         // receiver doesn't reap the session; any answered response proves
         // that. Some receivers don't implement `OPTIONS *` and reply 501
-        // (Not Implemented) — libraop tolerates exactly this — so we treat
-        // 200 and 501 alike. Only a read/write failure (which poisons the
-        // connection) counts as session death.
+        // (Not Implemented) — libraop suppresses the error there and its
+        // caller ignores the return, i.e. treats it as non-fatal, which is
+        // what we do explicitly by accepting 200 and 501 alike. Only a
+        // read/write failure (which poisons the connection) is session death.
         if resp.status_code != 200 && resp.status_code != 501 {
             bail!(
                 "OPTIONS keepalive → {} {}",

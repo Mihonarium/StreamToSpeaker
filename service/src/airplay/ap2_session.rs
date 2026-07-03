@@ -929,6 +929,12 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
             cfg.current_rtptime.store(rtptime, Ordering::Release);
             ring.clear();
             while cfg.samples_rx.try_recv().is_ok() {}
+            warn!(
+                "AirPlay 2 RTP sender: stalled {:.1}s; skipped {} packet slots to stay glued \
+                 to wall-clock",
+                behind.as_secs_f32(),
+                missed
+            );
             continue;
         }
 
@@ -977,6 +983,19 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
                  to keep the timeline anchored)"
             );
             idle_warned = true;
+        }
+
+        // Cap accumulated backlog (mirrors rtp.rs run_sender): each
+        // transient underrun inserts a silence packet ahead of the late
+        // real samples, so without a cap per-underrun latency creeps
+        // unboundedly over a long session. Drop the oldest samples once
+        // the ring exceeds ~32 ms.
+        let high_water = stereo * 4;
+        let drop_to = stereo * 2;
+        if ring.len() > high_water {
+            let drop = ring.len() - drop_to;
+            ring.drain(..drop);
+            debug!("AirPlay 2 RTP sender: dropped {} samples of backlog to cap latency", drop);
         }
 
         let pkt_samples: Vec<i16> = if ring.len() >= stereo {

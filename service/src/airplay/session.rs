@@ -36,10 +36,17 @@ const RESEND_BUFFER_PACKETS: usize = 512;
 /// `2 * sampling_rate`).
 const DEFAULT_LATENCY_SAMPLES: u32 = 88200;
 
-/// The fixed sample floor RAOP senders add to a receiver-advertised
-/// `Audio-Latency` (libraop's `RAOP_LATENCY_MIN`). 88200 = the receiver's
-/// 77175 + this 11025.
-const RAOP_LATENCY_FLOOR: u32 = 11025;
+/// The sync-anchor latency (samples) to use given the receiver's
+/// advertised `Audio-Latency` (from the RECORD response, `None` if
+/// absent). Mirrors libraop's on-wire sync value: `max(reported,
+/// configured)` — a receiver asking for a deeper buffer (big-DSP AVRs)
+/// gets it; everyone else (Sonos and most speakers omit the header) keeps
+/// the proven 88200 anchor exactly. NB the `+11025` in libraop is a
+/// sender-side *scheduling* value (`raopcl_latency`) that never reaches
+/// the sync packet, so we don't add it here.
+fn effective_latency_samples(advertised: Option<u32>) -> u32 {
+    advertised.unwrap_or(0).max(DEFAULT_LATENCY_SAMPLES)
+}
 
 /// Configuration to spin up one AirPlay session.
 pub struct AirPlaySessionConfig {
@@ -248,14 +255,7 @@ impl AirPlaySession {
             let advertised_latency = rtsp
                 .record(initial_seq, initial_rtptime)
                 .context("RTSP RECORD")?;
-            // Honor a receiver that asks for a deeper buffer (big-DSP AVRs
-            // report a large Audio-Latency); the reference senders add the
-            // 11025-sample floor. Default (no header, e.g. Sonos) keeps the
-            // proven 88200 anchor exactly.
-            let latency = advertised_latency
-                .map(|l| l.saturating_add(RAOP_LATENCY_FLOOR))
-                .unwrap_or(0)
-                .max(DEFAULT_LATENCY_SAMPLES);
+            let latency = effective_latency_samples(advertised_latency);
             Ok((rtsp, cipher, ports, latency))
         };
 
@@ -519,5 +519,18 @@ mod tests {
             assert!(v > prev, "non-monotonic at {}: {} → {}", p, prev, v);
             prev = v;
         }
+    }
+
+    #[test]
+    fn latency_anchor_defaults_and_honors_larger() {
+        // No Audio-Latency header (Sonos, most speakers) → the proven
+        // 88200 anchor, byte-identical to the old constant.
+        assert_eq!(effective_latency_samples(None), 88200);
+        // A small advertised value never lowers the floor.
+        assert_eq!(effective_latency_samples(Some(0)), 88200);
+        assert_eq!(effective_latency_samples(Some(11025)), 88200);
+        assert_eq!(effective_latency_samples(Some(88200)), 88200);
+        // A big-DSP AVR asking for a deeper buffer gets it.
+        assert_eq!(effective_latency_samples(Some(132300)), 132300);
     }
 }

@@ -141,10 +141,7 @@ impl AirPlayRenderer {
         if self.password_protected || self.port == 0 {
             return false;
         }
-        // ALAC (`cn=1`) is mandatory in RAOP, so a device that omits `cn`
-        // entirely is still ALAC-capable — only reject if it advertised a
-        // codec list that lacks ALAC.
-        if !self.codecs.is_empty() && !self.codecs.contains(&1) {
+        if !self.codecs.contains(&1) {
             return false;
         }
         self.encryption_types.contains(&0) || self.encryption_types.contains(&1)
@@ -156,27 +153,29 @@ impl AirPlayRenderer {
     /// RSA keys to a device that only does plaintext breaks it — so we
     /// only turn it on for the receiver classes that want it:
     ///
-    ///   * the device advertised `ek=1` (AirPort Express, shairport — the
-    ///     latter also accepts plaintext, so RSA is safe there), or
-    ///   * the model is a pre-AirPlay-2 AirPort Express (`am=AirPort*`
-    ///     other than the AP2-era `AirPort10,x`, which takes plaintext).
+    ///   * the device advertised `ek=1` (AirPort Express gen1, shairport —
+    ///     the latter also accepts plaintext, so RSA is safe there), or
+    ///   * the model is a gen2 802.11n AirPort Express (`am=AirPort4,x`;
+    ///     OwnTone's `APEX2` class, which it force-encrypts).
     ///
-    /// Both require `et=1` to be on offer. Everything else — Sonos-class
-    /// (`et=0,4`, no `ek`), Apple TV, third-party `et=0,4` — stays on the
-    /// proven plaintext path.
+    /// **A device advertising `et=4` (the AirPlay-2 era, incl. Sonos and
+    /// the AP2 `AirPort10,x`) always takes plaintext** — matching OwnTone,
+    /// which force-disables encryption for those. So `et=1` must be on
+    /// offer AND `et=4` must be absent. Everything else — Apple TV,
+    /// third-party `et=0,4`, and non-AirPort models — stays plaintext.
     pub fn prefers_rsa_encryption(&self) -> bool {
-        if !self.encryption_types.contains(&1) {
+        if !self.encryption_types.contains(&1) || self.encryption_types.contains(&4) {
             return false;
         }
         if self.encryption_key_required {
             return true;
         }
-        let apex_rsa_model = self
-            .model
+        // OwnTone's APEX2 (gen2 802.11n) is exactly `am=AirPort4,x`; other
+        // `AirPort*` models (APEX3, e.g. AirPort10,x) it streams plaintext.
+        self.model
             .as_deref()
-            .map(|m| m.starts_with("AirPort") && !m.starts_with("AirPort10"))
-            .unwrap_or(false);
-        apex_rsa_model && !self.encryption_types.contains(&4)
+            .map(|m| m.starts_with("AirPort4"))
+            .unwrap_or(false)
     }
 
     /// True if this device is reachable via the AirPlay-2 HomeKit path:
@@ -735,16 +734,11 @@ mod tests {
         // → plaintext (must NOT force RSA, which would break it).
         let thirdparty = renderer(Some("Denon"), vec![0, 1], None, 5000, None);
         assert!(!thirdparty.prefers_rsa_encryption());
-    }
 
-    #[test]
-    fn missing_codec_list_still_raop_capable() {
-        // A receiver that omits `cn` entirely is still ALAC-capable.
-        let mut r = renderer(Some("Minimal"), vec![0], None, 5000, None);
-        r.codecs = vec![];
-        assert!(r.supports_legacy_raop());
-        // But an explicit codec list without ALAC is rejected.
-        r.codecs = vec![0]; // PCM only
-        assert!(!r.supports_legacy_raop());
+        // et=0,1,4 with ek=1 → still plaintext (et=4 present ⇒ AP2-era,
+        // takes plaintext regardless of ek — matches OwnTone APEX3).
+        let mut et4_ek = renderer(Some("AirPort4,999"), vec![0, 1, 4], None, 5000, None);
+        et4_ek.encryption_key_required = true;
+        assert!(!et4_ek.prefers_rsa_encryption());
     }
 }
