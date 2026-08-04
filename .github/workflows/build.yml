@@ -121,7 +121,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: driver-cache
-          key: driver-${{ runner.os }}-v1-${{ env.WDK_INSTALLER_URL }}-${{ hashFiles('driver/**', 'include/**') }}
+          key: driver-${{ runner.os }}-v2-${{ env.WDK_INSTALLER_URL }}-${{ hashFiles('driver/**', 'include/**') }}
 
       # -----------------------------------------------------------------
       # WDK install (~5 min cold) + cache.
@@ -289,7 +289,9 @@ jobs:
           # and the shipped cert always matches the cached binaries.
           $dc = "driver-cache"
           New-Item -ItemType Directory -Force -Path $dc | Out-Null
-          foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat") {
+          # The .pdb rides along for Partner Center attestation submissions
+          # (the submission CAB must include the symbol file).
+          foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "StreamToSpeaker.pdb") {
               $f = Get-ChildItem -Path "driver\x64\Release" -Recurse -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
               if (-not $f) { throw "driver output $name not found for cache" }
               Copy-Item $f.FullName (Join-Path $dc $name) -Force
@@ -395,6 +397,7 @@ jobs:
             driver-cache/StreamToSpeaker.sys
             driver-cache/StreamToSpeaker.inf
             driver-cache/StreamToSpeaker.cat
+            driver-cache/StreamToSpeaker.pdb
             service/target/release/stream-to-speaker.exe
             service/target/release/stream-to-speaker.exe.sha256
           if-no-files-found: warn
