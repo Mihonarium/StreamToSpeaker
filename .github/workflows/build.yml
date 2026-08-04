@@ -420,8 +420,16 @@ jobs:
   # Approve on the signing run (check the sha256 shown in its run name).
   #
   # Setup (one-time):
-  #   - Repo secret SIGNING_REPO_TOKEN: fine-grained PAT scoped to ONLY
+  #   - Environment "request-signing" (Settings -> Environments) holding
+  #     the secret SIGNING_REPO_TOKEN: a fine-grained PAT scoped to ONLY
   #     the signing repo, with Actions: Read and write. Nothing else.
+  #     Set the environment's "Deployment branches and tags" policy to
+  #     Selected + tag pattern `v*` (no required reviewers - the human
+  #     gate lives in the signing repo). The env-level secret + ref
+  #     policy means a workflow edited on some branch can neither read
+  #     the PAT nor dispatch signing requests; a plain repo secret would
+  #     be readable by any workflow run in this repo.
+  #   - Optionally add a tag ruleset restricting who can create v* tags.
   #   - The signing workflow fetches artifact_url unauthenticated, so
   #     this only works while our releases are public.
   #
@@ -433,6 +441,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: windows-latest
+    environment: request-signing
     timeout-minutes: 75
     permissions:
       contents: write
