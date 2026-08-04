@@ -410,3 +410,116 @@ jobs:
             installer/out/StreamToSpeakerSetup-*.exe
             installer/out/StreamToSpeakerSetup-*.exe.sha256
           generate_release_notes: true
+
+  # -------------------------------------------------------------------
+  # EV-sign the released installer through the central signing repo
+  # (Mihonarium/signing, sign.yml): dispatch with the release-asset URL
+  # + its hash, wait for the human approval gate there and for the run
+  # to finish, then replace the release asset with the signed exe and
+  # regenerate its .sha256 sidecar. The only manual step is clicking
+  # Approve on the signing run (check the sha256 shown in its run name).
+  #
+  # Setup (one-time):
+  #   - Repo secret SIGNING_REPO_TOKEN: fine-grained PAT scoped to ONLY
+  #     the signing repo, with Actions: Read and write. Nothing else.
+  #   - The signing workflow fetches artifact_url unauthenticated, so
+  #     this only works while our releases are public.
+  #
+  # NB the step-summary hash table printed by the build job still shows
+  # the UNSIGNED exe's hash; the .sha256 sidecar on the release asset is
+  # regenerated here and is the canonical one.
+  # -------------------------------------------------------------------
+  sign-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 75
+    permissions:
+      contents: write
+    env:
+      SIGNING_REPO: Mihonarium/signing
+      SIGNING_WORKFLOW: sign.yml
+      SIGNING_REF: main
+      GH_TOKEN: ${{ github.token }}
+      SIGNING_TOKEN: ${{ secrets.SIGNING_REPO_TOKEN }}
+    steps:
+      - name: Sign installer via central signing workflow
+        shell: pwsh
+        run: |
+          if (-not $env:SIGNING_TOKEN) { throw "SIGNING_REPO_TOKEN secret is not set" }
+          $tag  = "${{ github.ref_name }}"
+          $repo = "${{ github.repository }}"
+          $hdr  = @{ Authorization = "Bearer $env:SIGNING_TOKEN"; Accept = "application/vnd.github+json" }
+
+          # --- locate the one setup exe on the release -----------------
+          $rel = gh api "repos/$repo/releases/tags/$tag" | ConvertFrom-Json
+          $assets = @($rel.assets | Where-Object { $_.name -like "StreamToSpeakerSetup-*.exe" })
+          if ($assets.Count -ne 1) { throw "expected exactly one setup exe asset on $tag, found $($assets.Count)" }
+          $asset = $assets[0]
+          $url = "https://github.com/$repo/releases/download/$tag/$($asset.name)"
+
+          # Hash the actual bytes rather than trusting the sidecar.
+          Invoke-WebRequest -Uri $url -OutFile unsigned.exe
+          $sha = (Get-FileHash unsigned.exe -Algorithm SHA256).Hash.ToLower()
+
+          # --- dispatch the signing workflow ---------------------------
+          $body = @{
+              ref = $env:SIGNING_REF
+              inputs = @{
+                  artifact_url    = $url
+                  sha256          = $sha
+                  output_name     = $asset.name
+                  sig_description = "Stream To Speaker Setup"
+                  sig_url         = "https://github.com/$repo"
+              }
+          } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Headers $hdr -Body $body -Uri `
+              "https://api.github.com/repos/$($env:SIGNING_REPO)/actions/workflows/$($env:SIGNING_WORKFLOW)/dispatches"
+          Write-Host "Dispatched signing of $($asset.name) (sha256 $sha)"
+
+          # --- find our run (run name embeds the sha256) ---------------
+          $run = $null
+          foreach ($i in 1..30) {
+              Start-Sleep -Seconds 10
+              $runs = (Invoke-RestMethod -Headers $hdr -Uri `
+                  "https://api.github.com/repos/$($env:SIGNING_REPO)/actions/workflows/$($env:SIGNING_WORKFLOW)/runs?event=workflow_dispatch&per_page=10").workflow_runs
+              $run = $runs | Where-Object { $_.display_title -match $sha } | Select-Object -First 1
+              if ($run) { break }
+          }
+          if (-not $run) { throw "signing run did not appear within 5 minutes" }
+          Write-Host "Signing run: $($run.html_url)"
+          Write-Host "##[notice]Waiting for approval on the signing run - verify its run name shows sha256 $sha, then approve."
+
+          # --- wait for approval + completion --------------------------
+          $deadline = (Get-Date).AddMinutes(60)
+          while ($true) {
+              Start-Sleep -Seconds 20
+              $run = Invoke-RestMethod -Headers $hdr -Uri `
+                  "https://api.github.com/repos/$($env:SIGNING_REPO)/actions/runs/$($run.id)"
+              if ($run.status -eq "completed") { break }
+              if ((Get-Date) -gt $deadline) { throw "timed out after 60 min waiting for the signing run ($($run.status)) - approve it and re-run this job" }
+          }
+          if ($run.conclusion -ne "success") { throw "signing run concluded '$($run.conclusion)' - see $($run.html_url)" }
+
+          # --- fetch the signed artifact -------------------------------
+          $arts = (Invoke-RestMethod -Headers $hdr -Uri `
+              "https://api.github.com/repos/$($env:SIGNING_REPO)/actions/runs/$($run.id)/artifacts").artifacts
+          $signedArt = $arts | Where-Object { $_.name -eq "signed" } | Select-Object -First 1
+          if (-not $signedArt) { throw "run has no 'signed' artifact" }
+          Invoke-WebRequest -Uri $signedArt.archive_download_url -Headers $hdr -OutFile signed.zip
+          Expand-Archive signed.zip -DestinationPath signed
+          $signed = Get-ChildItem signed -Filter $asset.name | Select-Object -First 1
+          if (-not $signed) { throw "signed artifact does not contain $($asset.name)" }
+
+          # --- verify locally, then swap into the release --------------
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match '\\x64\\' } |
+              Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          & $signtool verify /pa $signed.FullName
+          if ($LASTEXITCODE -ne 0) { throw "signtool verification of the signed exe failed" }
+          $signedSha = (Get-FileHash $signed.FullName -Algorithm SHA256).Hash.ToLower()
+          if ($signedSha -eq $sha) { throw "signed file is byte-identical to the unsigned input" }
+
+          "$signedSha  $($asset.name)" | Set-Content -Path "$($signed.FullName).sha256" -Encoding ascii -NoNewline
+          gh release upload $tag $signed.FullName "$($signed.FullName).sha256" --clobber -R $repo
+          Write-Host "Release asset replaced with the signed build (sha256 $signedSha)"
