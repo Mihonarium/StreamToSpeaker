@@ -142,3 +142,152 @@ class HardwareApi:
         # SAS download URL — plain GET, no auth header.
         with urllib.request.urlopen(url, timeout=600) as r:
             return r.read()
+
+
+class Release:
+    """Asset I/O for one driver-v* release via the gh CLI."""
+
+    def __init__(self, repo, tag):
+        self.repo = repo
+        self.tag = tag
+
+    @staticmethod
+    def resolve(repo, tag):
+        """Return (tag, Release, manifest) for `tag`, or the newest driver-v*."""
+        import re
+        out = subprocess.run(
+            ["gh", "api", f"repos/{repo}/releases?per_page=100"],
+            check=True, capture_output=True, text=True).stdout
+        rels = [r for r in json.loads(out) if r["tag_name"].startswith("driver-v")]
+        if tag:
+            rels = [r for r in rels if r["tag_name"] == tag]
+            if not rels:
+                sys.exit(f"::error::release {tag} not found")
+        else:
+            def build(r):
+                mt = re.match(r"^driver-v\d+\.\d+\.\d+\.(\d+)$", r["tag_name"])
+                return int(mt.group(1)) if mt else -1
+            rels = sorted((r for r in rels if build(r) >= 0), key=build, reverse=True)
+            if not rels:
+                sys.exit("::error::no driver-v* releases found")
+        rel = Release(repo, rels[0]["tag_name"])
+        man = json.loads(rel.download_asset("manifest.json"))
+        return rel.tag, rel, man
+
+    def download_asset(self, name):
+        dest = f"_dl_{name}"
+        subprocess.run(["gh", "release", "download", self.tag, "--repo", self.repo,
+                        "--pattern", name, "--output", dest, "--clobber"], check=True)
+        with open(dest, "rb") as f:
+            return f.read()
+
+    def save_manifest(self, manifest):
+        with open("manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+        self.upload_asset("manifest.json")
+
+    def upload_asset(self, path):
+        subprocess.run(["gh", "release", "upload", self.tag, path,
+                        "--repo", self.repo, "--clobber"], check=True)
+
+
+def reconcile(api, rel, m, tag, now=time.time, sleep=time.sleep, deadline_s=2700):
+    import hashlib
+    version = m.get("driver_version") or tag.removeprefix("driver-v")
+    start = now()
+    cached_sub = None  # create-time submission JSON, holds a fresh SAS URL
+    while True:
+        act = next_action(m)
+        if act in ("done", "wait-signing", "failed", "finalize"):
+            return act
+        if act == "create":
+            product = api.create_product(build_product_payload(version))
+            sub = api.create_submission(product["id"], f"attestation {version}")
+            cached_sub = sub
+            apply_created(m, str(product["id"]), str(sub["id"]))
+            rel.save_manifest(m)  # persist IDs BEFORE any upload
+        elif act == "upload":
+            cab = rel.download_asset(m["submission_cab"])
+            got = hashlib.sha256(cab).hexdigest()
+            want = m["submission_cab_signed_sha256"].lower()
+            if got != want:
+                sys.exit(f"::error::EV-signed CAB sha256 {got} != manifest {want} - refusing to upload")
+            sub = cached_sub or api.get_submission(m["ms_product_id"], m["ms_submission_id"])
+            cached_sub = None
+            url = find_download(sub, "initialPackage")
+            if not url:
+                sys.exit("::error::submission has no initialPackage upload URL")
+            api.upload_blob(url, cab)
+            apply_state(m, "uploaded")
+            rel.save_manifest(m)
+        elif act == "commit":
+            api.commit(m["ms_product_id"], m["ms_submission_id"])
+            apply_state(m, "committed")
+            rel.save_manifest(m)
+        elif act == "poll":
+            while True:
+                sub = api.get_submission(m["ms_product_id"], m["ms_submission_id"])
+                wf = sub.get("workflowStatus") or {}
+                state = wf.get("state")
+                if state == "failed" or sub.get("commitStatus") == "commitFailed":
+                    print(f"::error::attestation failed at step "
+                          f"{wf.get('currentStep')}: {wf.get('messages')}")
+                    summary("### Microsoft submission failure\n```json\n"
+                            + json.dumps(sub, indent=2) + "\n```")
+                    apply_state(m, "failed")
+                    rel.save_manifest(m)
+                    break
+                signed_url = find_download(sub, "signedPackage")
+                if state == "completed" and signed_url:
+                    zip_name = f"StreamToSpeaker-Driver-{version}-Microsoft.zip"
+                    with open(zip_name, "wb") as f:
+                        f.write(api.download(signed_url))
+                    rel.upload_asset(zip_name)
+                    apply_done(m, zip_name)
+                    rel.save_manifest(m)
+                    break
+                if now() - start > deadline_s:
+                    print(f"::error::poll deadline exceeded at step "
+                          f"{wf.get('currentStep')} - state stays committed; re-run to resume")
+                    return "poll-timeout"
+                sleep(30)
+        else:
+            raise AssertionError(act)
+
+
+def summary(text):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a") as f:
+            f.write(text + "\n")
+
+
+def main():
+    repo = os.environ["GITHUB_REPOSITORY"]
+    tag_in = os.environ.get("INPUT_TAG") or None
+    tag, rel, m = Release.resolve(repo, tag_in)
+    print(f"reconciling {tag}: ms_state={m.get('ms_state')} attested={m.get('attested')}")
+    if next_action(m) in ("done", "wait-signing"):
+        outcome = next_action(m)  # no API credentials needed
+    else:
+        token = get_token(os.environ["AZURE_TENANT_ID"],
+                          os.environ["AZURE_CLIENT_ID"],
+                          os.environ["AZURE_CLIENT_SECRET"])
+        outcome = reconcile(HardwareApi(token), rel, m, tag)
+    verify = outcome == "finalize"
+    out_path = os.environ.get("GITHUB_OUTPUT")
+    if out_path:
+        with open(out_path, "a") as f:
+            f.write(f"verify_tag={tag if verify else ''}\n")
+            f.write(f"outcome={outcome}\n")
+    summary(f"## Driver attest\n- release: `{tag}`\n- outcome: `{outcome}`\n"
+            f"- product: `{m.get('ms_product_id')}` submission: `{m.get('ms_submission_id')}`")
+    if outcome in ("failed", "poll-timeout"):
+        return 1
+    if outcome == "wait-signing":
+        print("EV-signed CAB not on the release yet - nothing submitted.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
