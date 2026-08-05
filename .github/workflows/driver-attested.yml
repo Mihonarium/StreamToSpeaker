@@ -26,6 +26,13 @@ on:
         description: "driver-v* release tag carrying the Microsoft-signed zip (default: newest unattested one with a zip attached)"
         required: false
         default: ""
+  # Called by driver-attest.yml right after it attaches the zip Microsoft
+  # returned; identical checks run on both the automatic and manual paths.
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -40,10 +47,13 @@ jobs:
       - name: Resolve release + download assets
         id: rel
         shell: pwsh
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           $ErrorActionPreference = "Stop"
           $repo = "${{ github.repository }}"
-          $tag = "${{ inputs.tag }}"
+          $tag = $env:INPUT_TAG
+          if ($tag -and $tag -notmatch '^driver-v[\d.]+$') { throw "unexpected tag input format: $tag" }
           $rels = gh api "repos/$repo/releases?per_page=100" | ConvertFrom-Json
 
           if ($tag) {
