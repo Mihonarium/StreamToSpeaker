@@ -43,10 +43,14 @@ driver/​** or include/​** change on main
   build unsigned driver → submission CAB → driver-v<ver> prerelease
   → EV-sign CAB via Mihonarium/signing   ← human: 1 approval click
         │
-        ▼  human: submit CAB at Partner Center, wait (~1h),
-        │         attach returned zip to the driver-v release
         ▼
-[driver-attested.yml]  manual trigger
+[driver-attest.yml]  auto (fires when Driver submission completes)
+  create Partner Center product+submission via the Hardware API
+  → upload EV-signed CAB → commit → poll (~10 min typical)
+  → attach returned StreamToSpeaker-Driver-<ver>-Microsoft.zip
+        │
+        ▼
+[driver-attested.yml]  auto (called by driver-attest; manual = fallback)
   verify Microsoft signatures + INF identity → canonical
   StreamToSpeaker-Driver-<ver>-Signed.zip → manifest attested=true
         │
@@ -83,8 +87,21 @@ release: `-testsigned` suffix + warning) until you run the loop again.
    `main` to its "Deployment branches and tags" policy** (previously tags
    `v*` only) — `driver-submission.yml`'s `sign-cab` job runs from main.
    No required reviewers here; the human gate lives in the signing repo.
+4. **This repo — Hardware API secrets** (plain repository secrets; no
+   approval gate by design — the EV-signing approval already vouches for
+   the exact CAB bytes, and the Entra app can only submit to our own
+   Partner Center account):
+   - `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` — a
+     Microsoft Entra app registration associated with the Partner Center
+     account (Partner Center → Account settings → User management →
+     Microsoft Entra applications, **Manager** role). The reply URL is
+     never used (client-credentials flow) — `https://localhost` is fine.
+   - Client secrets **expire** (max 24 months). The failure mode is
+     `invalid_client` from the token endpoint in `Driver attest` — create
+     a new secret in Entra (Certificates & secrets), update
+     `AZURE_CLIENT_SECRET`, delete the old one.
 
-## Flow A — driver changed (per driver change, ~2 manual steps + a wait)
+## Flow A — driver changed (1 manual step)
 
 1. Push/merge the driver change to main. `Driver submission` runs: builds
    the driver **unsigned** (`SignMode=Off`, build number = commit count),
@@ -94,14 +111,16 @@ release: `-testsigned` suffix + warning) until you run the loop again.
    show the sha256 from the workflow summary / release notes). CI then
    swaps the release CAB for the EV-signed one. If you don't approve within
    2 h the `sign-cab` job times out — approve and re-run just that job.
-3. **Submit** the signed CAB at the Partner Center hardware dashboard:
-   *Submit new hardware* → upload CAB → leave both test-signing options
-   unchecked → select the Windows 10 1809+ / Windows 11 **x64** targets →
-   Submit. Attestation usually completes in well under an hour.
-4. **Attach** the signed zip Microsoft returns to the same `driver-v<ver>`
-   release (any file name; don't rename anything inside).
-5. Run the **Driver attested** workflow (Actions tab; it auto-picks the
-   newest pending release, or pass the tag). It verifies:
+3. Everything after that is automatic. `Driver attest` fires when `Driver
+   submission` completes and reconciles the release's `manifest.json`
+   forward: create a Partner Center product (`StreamToSpeaker-Driver-<ver>`)
+   + initial submission via the Hardware API, record `ms_product_id` /
+   `ms_submission_id` on the manifest **before** uploading (so duplicate
+   submissions are impossible), upload the EV-signed CAB (re-hashed against
+   the manifest first), commit, poll (attestation typically completes in
+   ~10 minutes), attach the returned
+   `StreamToSpeaker-Driver-<ver>-Microsoft.zip`, then call `Driver
+   attested`, which verifies:
    - `signtool verify /kp` against the catalog AND the embedded `.sys`
      signature; signer must be the *Microsoft Windows Hardware
      Compatibility Publisher*;
@@ -110,11 +129,27 @@ release: `-testsigned` suffix + warning) until you run the loop again.
    then publishes `StreamToSpeaker-Driver-<ver>-Signed.zip` and flips the
    manifest to `attested: true`.
 
+**If `Driver attest` goes red, re-run it** (Actions tab → Run workflow;
+optional `tag` input, defaults to the newest driver release). It is a
+reconciler: every step re-reads `ms_state` from the manifest and resumes
+exactly where it stopped — a timeout mid-poll, a transient API error, or a
+runner death never needs cleanup. Outcomes it can report:
+
+| Outcome | Meaning | What to do |
+| --- | --- | --- |
+| `wait-signing` | EV-signed CAB not on the release yet | Approve the signing run, then this re-fires with `Driver submission` (or re-run manually) |
+| `poll-timeout` | Microsoft still processing after ~45 min | Re-run later; state stays `committed` and polling resumes |
+| `failed` | Microsoft rejected the submission | Read Microsoft's error payload in the run summary; fix, push a new driver build |
+
 Notes: rapid successive driver pushes cancel in-flight submission runs and
-the newest run deletes older *unattested* driver-v prereleases (attested
-ones are kept forever as the record of shipped kernel bits). A cancelled
-`sign-cab` can leave a signing-repo run Waiting — reject it there; its
-digest no longer matches anything CI will publish.
+the newest run deletes older *unattested* driver-v prereleases — except
+ones with an in-flight Partner Center submission (`ms_*` fields present),
+which are kept so the reconciler is never stranded; attested ones are kept
+forever as the record of shipped kernel bits. A cancelled `sign-cab` can
+leave a signing-repo run Waiting — reject it there; its digest no longer
+matches anything CI will publish. A failed first `Driver attest` run can
+leave an empty product in Partner Center; that's harmless (products can't
+be deleted via the API) and capped at one per driver version.
 
 ## Flow B — every main push (no manual steps)
 
@@ -188,12 +223,32 @@ finished overwrites the signed setup exe with an unsigned rebuild — re-run
 - **Signing run never appeared / wrong digest** — the composite action
   polls 5 min for a run whose title contains the digest, then waits for
   approval; see `.github/actions/request-signing/action.yml`.
+- **`Driver attest` fails at the token step (`invalid_client`)** — the
+  Entra client secret expired or was rotated without updating
+  `AZURE_CLIENT_SECRET` (see one-time setup, step 4).
+- **`Driver attest` fails creating the product/submission** — the Entra
+  app lost its Partner Center association or Manager role (Account
+  settings → User management → Microsoft Entra applications).
+
+## Manual fallback (Partner Center in the browser)
+
+If the Hardware API path is ever unavailable, the pre-automation flow still
+works end to end:
+
+1. Download the EV-signed `StreamToSpeaker-Driver-<ver>-Submission.cab`
+   from the `driver-v<ver>` release.
+2. Submit it at the [Partner Center hardware dashboard]
+   (https://partner.microsoft.com/dashboard/hardware): *Submit new
+   hardware* → upload CAB → leave both test-signing options unchecked →
+   select the Windows 10 1809+ / Windows 11 **x64** targets → Submit.
+3. Download the signed zip Microsoft returns and attach it to the same
+   `driver-v<ver>` release (any file name; don't rename anything inside).
+4. Run the **Driver attested** workflow (Actions tab; it auto-picks the
+   newest pending release with a zip attached, or pass the tag). Same
+   verification as the automatic path.
 
 ## Future work
 
-- **Partner Center automation**: the manual submit/download steps can be
-  automated with the Microsoft Hardware API (Azure AD app + hardware
-  submission endpoints), turning Flow A into a single approval click.
 - **WHQL/HLK** for Windows Server support + "Windows Certified" status.
 - **Uninstaller signing** via an ISCC SignTool shim that blocks on the
   signing repo (adds one more approval per release).

@@ -15,11 +15,12 @@ name: Driver submission
 #      there authorizes exactly this CAB's SHA-256) and swaps the release
 #      asset for the signed CAB.
 #
-# A human then submits the signed CAB at the Partner Center hardware
-# dashboard, attaches the signed zip Microsoft returns to the same release,
-# and runs the "Driver attested" workflow to verify + finalize it. From that
-# point build.yml bundles the attested driver into installers whenever the
-# driver source hash still matches.
+# When this workflow completes, driver-attest.yml takes over automatically:
+# it submits the EV-signed CAB to Microsoft via the Partner Center Hardware
+# API, polls, attaches the returned signed zip to the release, and runs the
+# verification in driver-attested.yml. From that point build.yml bundles the
+# attested driver into installers whenever the driver source hash still
+# matches. (Manual fallback: docs/driver-signing.md.)
 
 on:
   push:
@@ -290,10 +291,7 @@ jobs:
               "**Status: awaiting Microsoft attestation.** Runbook (details in ``docs/driver-signing.md``):"
               ""
               "1. Approve the EV-signing run for the submission CAB in the signing repo (its run name must show sha256 ``${{ steps.cab.outputs.sha256 }}``). CI then replaces the CAB asset here with the EV-signed one."
-              "2. Download ``${{ steps.cab.outputs.name }}`` from this release."
-              "3. Submit it at the [Partner Center hardware dashboard](https://partner.microsoft.com/dashboard/hardware) — *Submit new hardware*, leave both test-signing options unchecked, select the Windows 10 1809+ / Windows 11 **x64** targets."
-              "4. Download the signed zip Microsoft returns and attach it to **this** release (any file name)."
-              "5. Run the **Driver attested** workflow (Actions tab) — it verifies Microsoft's signatures and marks this driver as the production driver for installer builds."
+              "2. That's it — the **Driver attest** workflow submits the signed CAB to Microsoft via the Hardware API, polls, attaches the returned zip here, verifies the signatures, and marks this driver attested. If it goes red, re-run it from the Actions tab: it resumes exactly where it left off. Manual fallback: ``docs/driver-signing.md``."
           ) -join "`n"
           Set-Content -Path release-notes.md -Value $notes -Encoding utf8
 
@@ -399,6 +397,6 @@ jobs:
             ""
             "``${{ needs.build-cab.outputs.cab_name }}`` on release ``$tag`` is now the EV-signed CAB (sha256 ``$signedSha``)."
             ""
-            "**Next (manual):** download it, submit at the [Partner Center hardware dashboard](https://partner.microsoft.com/dashboard/hardware),"
-            "attach Microsoft's signed zip back onto the release, then run the **Driver attested** workflow."
+            "**Next (automatic):** the **Driver attest** workflow submits it to Microsoft via the Hardware API,"
+            "attaches the signed zip back onto the release, and runs verification. Watch its run in the Actions tab."
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
