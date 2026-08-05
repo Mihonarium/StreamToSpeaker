@@ -131,12 +131,12 @@ class HardwareApi:
                             f"/products/{product_id}/submissions/{submission_id}/commit")
 
     def upload_blob(self, sas_url, data):
+        # urlopen raises HTTPError on any non-2xx, so success needs no check.
         req = urllib.request.Request(sas_url, data=data, method="PUT", headers={
             "x-ms-blob-type": "BlockBlob",
             "Content-Type": "application/octet-stream"})
-        with urllib.request.urlopen(req, timeout=600) as r:
-            if r.status not in (200, 201):
-                raise RuntimeError(f"blob upload HTTP {r.status}")
+        with urllib.request.urlopen(req, timeout=600):
+            pass
 
     def download(self, url):
         # SAS download URL — plain GET, no auth header.
@@ -216,12 +216,30 @@ def reconcile(api, rel, m, tag, now=time.time, sleep=time.sleep, deadline_s=2700
             cached_sub = None
             url = find_download(sub, "initialPackage")
             if not url:
+                # The create response can omit download links; a fresh GET
+                # always carries them (verified live 2026-08-05).
+                sub = api.get_submission(m["ms_product_id"], m["ms_submission_id"])
+                url = find_download(sub, "initialPackage")
+            if not url:
                 sys.exit("::error::submission has no initialPackage upload URL")
             api.upload_blob(url, cab)
             apply_state(m, "uploaded")
             rel.save_manifest(m)
         elif act == "commit":
-            api.commit(m["ms_product_id"], m["ms_submission_id"])
+            # If a previous run committed but died before save_manifest, a
+            # re-POST of commit is rejected by the API. Treat "already past
+            # commit" as success so the universal-retry invariant holds.
+            try:
+                api.commit(m["ms_product_id"], m["ms_submission_id"])
+            except RuntimeError as e:
+                sub = api.get_submission(m["ms_product_id"], m["ms_submission_id"])
+                wf_state = (sub.get("workflowStatus") or {}).get("state")
+                if (sub.get("commitStatus") in ("commitPending", "commitComplete")
+                        or wf_state in ("started", "completed")):
+                    print(f"commit POST rejected but submission is already "
+                          f"committed ({e}); continuing")
+                else:
+                    raise
             apply_state(m, "committed")
             rel.save_manifest(m)
         elif act == "poll":
@@ -232,8 +250,12 @@ def reconcile(api, rel, m, tag, now=time.time, sleep=time.sleep, deadline_s=2700
                 if state == "failed" or sub.get("commitStatus") == "commitFailed":
                     print(f"::error::attestation failed at step "
                           f"{wf.get('currentStep')}: {wf.get('messages')}")
+                    # downloads.items carries live SAS URLs (the
+                    # initialPackage one is write-capable) — never put those
+                    # in the summary; diagnostics live in workflowStatus.
+                    redacted = {k: v for k, v in sub.items() if k != "downloads"}
                     summary("### Microsoft submission failure\n```json\n"
-                            + json.dumps(sub, indent=2) + "\n```")
+                            + json.dumps(redacted, indent=2) + "\n```")
                     apply_state(m, "failed")
                     rel.save_manifest(m)
                     break
@@ -267,8 +289,8 @@ def main():
     tag_in = os.environ.get("INPUT_TAG") or None
     tag, rel, m = Release.resolve(repo, tag_in)
     print(f"reconciling {tag}: ms_state={m.get('ms_state')} attested={m.get('attested')}")
-    if next_action(m) in ("done", "wait-signing"):
-        outcome = next_action(m)  # no API credentials needed
+    if next_action(m) in ("done", "wait-signing", "finalize", "failed"):
+        outcome = next_action(m)  # terminal states need no API credentials
     else:
         token = get_token(os.environ["AZURE_TENANT_ID"],
                           os.environ["AZURE_CLIENT_ID"],

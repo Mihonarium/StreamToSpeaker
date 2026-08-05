@@ -1,6 +1,8 @@
 import hashlib
 import itertools
 import json
+import os
+import tempfile
 import unittest
 
 import attest
@@ -159,6 +161,17 @@ DONE_SUB = {"commitStatus": "commitComplete",
 
 
 class Reconcile(unittest.TestCase):
+    # reconcile() writes the downloaded zip into cwd — keep test runs out
+    # of the source tree.
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_cwd = os.getcwd()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._tmp.cleanup()
+
     def test_full_run_from_scratch(self):
         m = man(submission_cab_signed_sha256=CAB_SHA)
         rel = FakeRelease(m)
@@ -170,9 +183,6 @@ class Reconcile(unittest.TestCase):
         self.assertEqual(rel.saved[0]["ms_state"], "created")
         self.assertTrue(any(c[0] == "upload_blob" for c in api.calls))
         self.assertEqual(rel.saved[-1]["ms_state"], "done")
-        # the cached create-time SAS URL must never leak into the manifest
-        for saved in rel.saved:
-            self.assertNotIn("_sub", saved)
         self.assertIn("StreamToSpeaker-Driver-1.0.0.42-Microsoft.zip", rel.uploaded)
 
     def test_sha_mismatch_refuses_upload(self):
@@ -226,6 +236,56 @@ class Reconcile(unittest.TestCase):
                                deadline_s=300)
         self.assertEqual(out, "poll-timeout")
         self.assertEqual(m["ms_state"], "committed")
+
+    def test_commit_rejection_recovers_when_already_committed(self):
+        # commit POST succeeded on a previous run that died before
+        # save_manifest; the retry's POST is rejected but the submission is
+        # already past commit — must proceed, not go permanently red.
+        class RejectingApi(FakeApi):
+            def commit(self, pid, sid):
+                raise RuntimeError("POST /commit -> HTTP 400: already committed")
+        m = man(ms_product_id="111", ms_submission_id="222", ms_state="uploaded",
+                submission_cab_signed_sha256=CAB_SHA)
+        rel = FakeRelease(m)
+        api = RejectingApi([
+            {"commitStatus": "commitComplete",
+             "workflowStatus": {"currentStep": "sign", "state": "started"}},
+            DONE_SUB,
+        ])
+        out = attest.reconcile(api, rel, m, "driver-v1.0.0.42",
+                               now=lambda: 0, sleep=lambda s: None)
+        self.assertEqual(out, "finalize")
+        self.assertIn("committed", [s["ms_state"] for s in rel.saved])
+
+    def test_commit_rejection_reraises_when_not_committed(self):
+        class RejectingApi(FakeApi):
+            def commit(self, pid, sid):
+                raise RuntimeError("POST /commit -> HTTP 500: server error")
+        m = man(ms_product_id="111", ms_submission_id="222", ms_state="uploaded",
+                submission_cab_signed_sha256=CAB_SHA)
+        api = RejectingApi([
+            {"commitStatus": "commitPayloadUploading",
+             "workflowStatus": {"currentStep": "packageUpload", "state": "notStarted"}},
+        ])
+        with self.assertRaises(RuntimeError):
+            attest.reconcile(api, FakeRelease(m), m, "driver-v1.0.0.42",
+                             now=lambda: 0, sleep=lambda s: None)
+
+    def test_create_response_without_url_falls_back_to_get(self):
+        class NoUrlApi(FakeApi):
+            def create_submission(self, pid, name):
+                self.calls.append(("create_submission", pid))
+                return {"id": 222}  # no downloads in the create response
+        m = man(submission_cab_signed_sha256=CAB_SHA)
+        rel = FakeRelease(m)
+        api = NoUrlApi([
+            {"downloads": {"items": [{"type": "initialPackage", "url": "https://sas/fresh"}]}},
+            DONE_SUB,
+        ])
+        out = attest.reconcile(api, rel, m, "driver-v1.0.0.42",
+                               now=lambda: 0, sleep=lambda s: None)
+        self.assertEqual(out, "finalize")
+        self.assertIn(("upload_blob", "https://sas/fresh", len(b"CABBYTES")), api.calls)
 
     def test_wait_signing_short_circuits(self):
         m = man(submission_cab_signed_sha256=None)

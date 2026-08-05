@@ -25,3 +25,8 @@ driver-cache/
 .vscode/
 *.swp
 *~
+
+# Python (CI scripts)
+__pycache__/
+.github/scripts/_dl_*
+.github/scripts/*-Microsoft.zip

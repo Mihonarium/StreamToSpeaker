@@ -334,7 +334,11 @@ jobs:
                       # (ms_* fields, written by driver-attest.yml) — deleting
                       # one of those would strand the reconciler mid-run and
                       # lose the record of the submission. A 'failed'
-                      # submission is safe to clean up.
+                      # submission is safe to clean up. (There remains a
+                      # milliseconds-wide race against driver-attest's
+                      # create→persist step; losing it just orphans one
+                      # Partner Center product — the accepted junk-product
+                      # risk — and fails that run cleanly.)
                       $inflight = ($man.PSObject.Properties.Name -contains "ms_submission_id") -and
                                   $man.ms_submission_id -and ($man.ms_state -ne "failed")
                       $keep = [bool]$man.attested -or $inflight
