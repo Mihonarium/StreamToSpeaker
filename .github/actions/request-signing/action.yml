@@ -163,6 +163,71 @@ runs:
             Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
         & $signtool verify /pa $signed.FullName
         if ($LASTEXITCODE -ne 0) { throw "signtool verification of the signed file failed" }
+
+        # --- provenance: signed output must be OUR input + a signature -----
+        # signtool verify only proves the file carries *a* valid signature;
+        # a compromised signer could return any validly-signed file. This
+        # block proves the content is the approved input.
+        #   PE: strip the signature and byte-compare against the submitted
+        #   input, masking only what signing legitimately rewrites — the
+        #   4-byte PE checksum and the 8-byte security data-directory entry
+        #   (PE32 at peHdr+152, PE32+ at peHdr+168; offsets validated
+        #   against a real signed x64 binary) — and tolerating up to 7
+        #   trailing zero bytes of pre-certificate 8-byte alignment padding.
+        #   CAB: the signature is appended to the container, so extract both
+        #   CABs and require identical file sets with identical hashes.
+        $ext = [IO.Path]::GetExtension($env:REQSIGN_OUTPUT_NAME).ToLower()
+        if ($ext -in ".exe", ".dll", ".sys", ".ocx", ".cpl") {
+            $stripped = Join-Path $work "stripped.bin"
+            Copy-Item $signed.FullName $stripped
+            & $signtool remove /s $stripped
+            if ($LASTEXITCODE -ne 0) { throw "signtool remove failed - cannot verify signed-output provenance" }
+            [byte[]]$u = [IO.File]::ReadAllBytes($unsigned)
+            [byte[]]$s = [IO.File]::ReadAllBytes($stripped)
+            if ($s.Length -lt $u.Length -or $s.Length -gt $u.Length + 7) {
+                throw "stripped signed file length $($s.Length) vs submitted $($u.Length) - content mismatch"
+            }
+            for ($i = $u.Length; $i -lt $s.Length; $i++) {
+                if ($s[$i] -ne 0) { throw "non-zero trailing bytes after signature strip - content mismatch" }
+            }
+            $peOff = [BitConverter]::ToInt32($u, 0x3C)
+            $magic = [BitConverter]::ToUInt16($u, $peOff + 24)
+            $ckOff = $peOff + 88
+            $secOff = $peOff + 24 + $(if ($magic -eq 0x20B) { 112 } else { 96 }) + 32
+            foreach ($arr in @(,$u; ,$s)) {
+                for ($i = 0; $i -lt 4; $i++) { $arr[$ckOff + $i] = 0 }
+                for ($i = 0; $i -lt 8; $i++) { $arr[$secOff + $i] = 0 }
+            }
+            $alg = [Security.Cryptography.SHA256]::Create()
+            $hu = [BitConverter]::ToString($alg.ComputeHash($u, 0, $u.Length))
+            $hs = [BitConverter]::ToString($alg.ComputeHash($s, 0, $u.Length))
+            if ($hu -ne $hs) { throw "signed output content differs from the submitted input beyond the signature - refusing" }
+            Write-Host "Provenance verified: signed PE = submitted input + signature"
+        }
+        elseif ($ext -eq ".cab") {
+            $du = Join-Path $work "prov-unsigned"; $ds = Join-Path $work "prov-signed"
+            New-Item -ItemType Directory -Path $du, $ds | Out-Null
+            expand.exe -F:* $unsigned $du | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "expand failed on the submitted CAB" }
+            expand.exe -F:* $signed.FullName $ds | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "expand failed on the signed CAB" }
+            $inv = { param($root)
+                Get-ChildItem $root -Recurse -File | ForEach-Object {
+                    "{0}|{1}" -f $_.FullName.Substring($root.Length).ToLower(),
+                                 (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+                } | Sort-Object
+            }
+            $lu = @(& $inv $du); $ls = @(& $inv $ds)
+            if ($lu.Count -eq 0) { throw "submitted CAB extracted to zero files" }
+            if (($lu -join "`n") -ne ($ls -join "`n")) {
+                throw "signed CAB contents differ from the submitted CAB - refusing"
+            }
+            Write-Host "Provenance verified: signed CAB contains exactly the submitted files ($($lu.Count))"
+        }
+        else {
+            Write-Host "##[warning]no provenance check implemented for '$ext' - signature validity verified only"
+        }
+
         $signedSha = (Get-FileHash $signed.FullName -Algorithm SHA256).Hash.ToLower()
         if ($signedSha -eq $sha) { throw "signed file is byte-identical to the unsigned input" }
 
