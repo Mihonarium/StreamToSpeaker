@@ -141,13 +141,16 @@ jobs:
       - name: Compute driver version
         id: drvver
         shell: pwsh
+        env:
+          INPUT_DRIVER_BUILD: ${{ inputs.driver_build }}
         run: |
           $vcxproj = Get-Content "driver/StreamToSpeaker.vcxproj" -Raw
           if ($vcxproj -notmatch '<DriverVersionPrefix[^>]*>([\d.]+)</DriverVersionPrefix>') {
               throw "DriverVersionPrefix not found in vcxproj"
           }
           $prefix = $Matches[1]
-          $count = "${{ inputs.driver_build }}"
+          $count = $env:INPUT_DRIVER_BUILD
+          if ($count -and $count -notmatch '^\d+$') { throw "driver_build must be numeric, got '$count'" }
           if (-not $count) { $count = (git rev-list --count HEAD).Trim() }
           $version = "$prefix.$count"
           Write-Host "Driver version: $version (prefix $prefix, build $count)"
@@ -321,16 +324,25 @@ jobs:
               if ($r.tag_name -notmatch '^driver-v\d+\.\d+\.\d+\.(\d+)$') { continue }
               $build = [int]$Matches[1]
               if ($build -ge $current) { continue }
-              $attested = $false
+              $keep = $false
               $manAsset = $r.assets | Where-Object { $_.name -eq "manifest.json" } | Select-Object -First 1
               if ($manAsset) {
                   try {
                       # Assets can be served as octet-stream; download + parse.
                       Invoke-WebRequest -Uri $manAsset.browser_download_url -OutFile stale-manifest.json
-                      $attested = [bool]((Get-Content stale-manifest.json -Raw | ConvertFrom-Json).attested)
+                      $man = Get-Content stale-manifest.json -Raw | ConvertFrom-Json
+                      # Keep attested releases (shipped driver history) AND
+                      # releases with an in-flight Partner Center submission
+                      # (ms_* fields, written by driver-attest.yml) — deleting
+                      # one of those would strand the reconciler mid-run and
+                      # lose the record of the submission. A 'failed'
+                      # submission is safe to clean up.
+                      $inflight = ($man.PSObject.Properties.Name -contains "ms_submission_id") -and
+                                  $man.ms_submission_id -and ($man.ms_state -ne "failed")
+                      $keep = [bool]$man.attested -or $inflight
                   } catch { }
               }
-              if ($attested) { continue }
+              if ($keep) { continue }
               Write-Host "Deleting stale unattested prerelease $($r.tag_name)"
               gh release delete $r.tag_name --cleanup-tag --yes
           }
