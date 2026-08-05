@@ -84,5 +84,23 @@ class Mutations(unittest.TestCase):
         self.assertEqual(m["ms_zip_asset"], "X-Microsoft.zip")
 
 
+class FindDownload(unittest.TestCase):
+    SUB = {"downloads": {"items": [
+        {"type": "initialPackage", "url": "https://sas/init"},
+        {"type": "signedPackage", "url": "https://sas/signed"}]}}
+
+    def test_finds_signed(self):
+        self.assertEqual(attest.find_download(self.SUB, "signedPackage"), "https://sas/signed")
+
+    def test_missing_returns_none(self):
+        self.assertIsNone(attest.find_download({"downloads": {"items": []}}, "signedPackage"))
+
+    def test_no_downloads_key(self):
+        self.assertIsNone(attest.find_download({}, "signedPackage"))
+
+    def test_null_downloads(self):
+        self.assertIsNone(attest.find_download({"downloads": None}, "signedPackage"))
+
+
 if __name__ == "__main__":
     unittest.main()

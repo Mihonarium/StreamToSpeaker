@@ -77,3 +77,68 @@ def apply_done(m, zip_asset):
     m["ms_state"] = "done"
     m["ms_zip_asset"] = zip_asset
     return m
+
+
+def find_download(sub, dtype):
+    for item in ((sub.get("downloads") or {}).get("items") or []):
+        if item.get("type") == dtype:
+            return item.get("url")
+    return None
+
+
+def get_token(tenant, client_id, secret):
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials", "client_id": client_id,
+        "client_secret": secret,
+        "resource": "https://manage.devcenter.microsoft.com"}).encode()
+    req = urllib.request.Request(
+        f"https://login.microsoftonline.com/{tenant}/oauth2/token", data=body)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)["access_token"]
+
+
+class HardwareApi:
+    def __init__(self, token):
+        self.token = token
+
+    def request(self, method, path_or_url, body=None):
+        url = path_or_url if path_or_url.startswith("http") else API + path_or_url
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+            **({"Content-Type": "application/json"} if data else {})})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:2000]
+            raise RuntimeError(f"{method} {url} -> HTTP {e.code}: {detail}") from e
+        return json.loads(raw) if raw else {}
+
+    def create_product(self, payload):
+        return self.request("POST", "/products", payload)
+
+    def create_submission(self, product_id, name):
+        return self.request("POST", f"/products/{product_id}/submissions",
+                            {"name": name, "type": "initial"})
+
+    def get_submission(self, product_id, submission_id):
+        return self.request("GET", f"/products/{product_id}/submissions/{submission_id}")
+
+    def commit(self, product_id, submission_id):
+        return self.request("POST",
+                            f"/products/{product_id}/submissions/{submission_id}/commit")
+
+    def upload_blob(self, sas_url, data):
+        req = urllib.request.Request(sas_url, data=data, method="PUT", headers={
+            "x-ms-blob-type": "BlockBlob",
+            "Content-Type": "application/octet-stream"})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            if r.status not in (200, 201):
+                raise RuntimeError(f"blob upload HTTP {r.status}")
+
+    def download(self, url):
+        # SAS download URL — plain GET, no auth header.
+        with urllib.request.urlopen(url, timeout=600) as r:
+            return r.read()
