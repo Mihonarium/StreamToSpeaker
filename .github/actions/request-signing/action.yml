@@ -1,0 +1,171 @@
+name: Request EV code signature
+description: >
+  Dispatch the central signing workflow (Mihonarium/signing, sign.yml) for a
+  publicly downloadable file, wait for the human approval gate there and for
+  the run to finish, download the "signed" artifact, verify it locally with
+  signtool, and expose the signed file's path + hash. The approval in the
+  signing repo authorizes exactly the SHA-256 this action computes from the
+  bytes at artifact-url, so nothing can be swapped between dispatch and
+  signature. Windows runners only (pwsh + signtool from the preinstalled
+  Windows SDK). The calling job must run in the `request-signing`
+  environment so it can read the SIGNING_REPO_TOKEN secret.
+
+inputs:
+  artifact-url:
+    description: >
+      Public (unauthenticated) URL of the exact bytes to sign — e.g. a
+      release-asset download URL. The signing workflow fetches this itself,
+      so it must stay reachable until the human approves.
+    required: true
+  output-name:
+    description: >
+      File name for the signed output (must satisfy the signing workflow's
+      strict name pattern; the extension selects the signing format there —
+      .exe/.sys via ssign, .cab/.cat/.msi via osslsigncode + PKCS#11).
+    required: true
+  sig-description:
+    description: Authenticode description embedded in the signature.
+    required: true
+  sig-url:
+    description: Authenticode URL embedded in the signature.
+    required: false
+    default: https://github.com/Mihonarium/StreamToSpeaker
+  expected-sha256:
+    description: >
+      Optional cross-check — fail before dispatching if the bytes at
+      artifact-url don't hash to this (catches a release asset modified
+      between upload and dispatch). Case-insensitive hex.
+    required: false
+    default: ""
+  signing-repo:
+    description: owner/repo of the central signing repository.
+    required: false
+    default: Mihonarium/signing
+  signing-workflow:
+    description: Workflow file name in the signing repository.
+    required: false
+    default: sign.yml
+  signing-ref:
+    description: Ref of the signing repository to dispatch on.
+    required: false
+    default: main
+  token:
+    description: >
+      Fine-grained PAT with Actions Read+Write scoped to the signing repo
+      only (the SIGNING_REPO_TOKEN secret in the request-signing
+      environment).
+    required: true
+  wait-minutes:
+    description: >
+      How long to wait for the human approval + run completion before
+      giving up. On timeout, approve the signing run and re-run the job.
+    required: false
+    default: "60"
+
+outputs:
+  signed-path:
+    description: Absolute path of the verified signed file on the runner.
+    value: ${{ steps.sign.outputs.signed-path }}
+  signed-sha256:
+    description: Lowercase SHA-256 of the signed file.
+    value: ${{ steps.sign.outputs.signed-sha256 }}
+  unsigned-sha256:
+    description: Lowercase SHA-256 of the input bytes (what the approval authorized).
+    value: ${{ steps.sign.outputs.unsigned-sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - id: sign
+      shell: pwsh
+      env:
+        REQSIGN_URL: ${{ inputs.artifact-url }}
+        REQSIGN_OUTPUT_NAME: ${{ inputs.output-name }}
+        REQSIGN_SIG_DESCRIPTION: ${{ inputs.sig-description }}
+        REQSIGN_SIG_URL: ${{ inputs.sig-url }}
+        REQSIGN_EXPECTED_SHA256: ${{ inputs.expected-sha256 }}
+        REQSIGN_REPO: ${{ inputs.signing-repo }}
+        REQSIGN_WORKFLOW: ${{ inputs.signing-workflow }}
+        REQSIGN_REF: ${{ inputs.signing-ref }}
+        REQSIGN_TOKEN: ${{ inputs.token }}
+        REQSIGN_WAIT_MINUTES: ${{ inputs.wait-minutes }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        if (-not $env:REQSIGN_TOKEN) {
+            throw "signing token is empty - is the SIGNING_REPO_TOKEN secret set, and does the job run in the request-signing environment?"
+        }
+        $hdr = @{ Authorization = "Bearer $env:REQSIGN_TOKEN"; Accept = "application/vnd.github+json" }
+        $work = Join-Path $env:RUNNER_TEMP ("reqsign-" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $work | Out-Null
+
+        # Hash the actual bytes the signing workflow will fetch, not a local
+        # copy — the approval over there binds to this digest.
+        $unsigned = Join-Path $work "unsigned.bin"
+        Invoke-WebRequest -Uri $env:REQSIGN_URL -OutFile $unsigned
+        $sha = (Get-FileHash $unsigned -Algorithm SHA256).Hash.ToLower()
+        if ($env:REQSIGN_EXPECTED_SHA256 -and $env:REQSIGN_EXPECTED_SHA256.ToLower() -ne $sha) {
+            throw "bytes at $env:REQSIGN_URL hash to $sha, expected $($env:REQSIGN_EXPECTED_SHA256.ToLower()) - refusing to request a signature for unexpected content"
+        }
+        "unsigned-sha256=$sha" >> $env:GITHUB_OUTPUT
+
+        # --- dispatch the signing workflow ---------------------------------
+        $body = @{
+            ref = $env:REQSIGN_REF
+            inputs = @{
+                artifact_url    = $env:REQSIGN_URL
+                sha256          = $sha
+                output_name     = $env:REQSIGN_OUTPUT_NAME
+                sig_description = $env:REQSIGN_SIG_DESCRIPTION
+                sig_url         = $env:REQSIGN_SIG_URL
+            }
+        } | ConvertTo-Json
+        Invoke-RestMethod -Method Post -Headers $hdr -Body $body -Uri `
+            "https://api.github.com/repos/$($env:REQSIGN_REPO)/actions/workflows/$($env:REQSIGN_WORKFLOW)/dispatches"
+        Write-Host "Dispatched signing of $($env:REQSIGN_OUTPUT_NAME) (sha256 $sha)"
+
+        # --- find our run (the run name embeds the sha256) -----------------
+        $run = $null
+        foreach ($i in 1..30) {
+            Start-Sleep -Seconds 10
+            $runs = (Invoke-RestMethod -Headers $hdr -Uri `
+                "https://api.github.com/repos/$($env:REQSIGN_REPO)/actions/workflows/$($env:REQSIGN_WORKFLOW)/runs?event=workflow_dispatch&per_page=10").workflow_runs
+            $run = $runs | Where-Object { $_.display_title -match $sha } | Select-Object -First 1
+            if ($run) { break }
+        }
+        if (-not $run) { throw "signing run did not appear within 5 minutes" }
+        Write-Host "Signing run: $($run.html_url)"
+        Write-Host "##[notice]Waiting for approval on the signing run - verify its run name shows sha256 $sha, then approve."
+
+        # --- wait for approval + completion --------------------------------
+        $deadline = (Get-Date).AddMinutes([int]$env:REQSIGN_WAIT_MINUTES)
+        while ($true) {
+            Start-Sleep -Seconds 20
+            $run = Invoke-RestMethod -Headers $hdr -Uri `
+                "https://api.github.com/repos/$($env:REQSIGN_REPO)/actions/runs/$($run.id)"
+            if ($run.status -eq "completed") { break }
+            if ((Get-Date) -gt $deadline) { throw "timed out after $($env:REQSIGN_WAIT_MINUTES) min waiting for the signing run ($($run.status)) - approve it and re-run this job" }
+        }
+        if ($run.conclusion -ne "success") { throw "signing run concluded '$($run.conclusion)' - see $($run.html_url)" }
+
+        # --- fetch the signed artifact -------------------------------------
+        $arts = (Invoke-RestMethod -Headers $hdr -Uri `
+            "https://api.github.com/repos/$($env:REQSIGN_REPO)/actions/runs/$($run.id)/artifacts").artifacts
+        $signedArt = $arts | Where-Object { $_.name -eq "signed" } | Select-Object -First 1
+        if (-not $signedArt) { throw "run has no 'signed' artifact" }
+        Invoke-WebRequest -Uri $signedArt.archive_download_url -Headers $hdr -OutFile (Join-Path $work "signed.zip")
+        Expand-Archive (Join-Path $work "signed.zip") -DestinationPath (Join-Path $work "signed")
+        $signed = Get-ChildItem (Join-Path $work "signed") -Filter $env:REQSIGN_OUTPUT_NAME | Select-Object -First 1
+        if (-not $signed) { throw "signed artifact does not contain $($env:REQSIGN_OUTPUT_NAME)" }
+
+        # --- independent local verification --------------------------------
+        $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+        & $signtool verify /pa $signed.FullName
+        if ($LASTEXITCODE -ne 0) { throw "signtool verification of the signed file failed" }
+        $signedSha = (Get-FileHash $signed.FullName -Algorithm SHA256).Hash.ToLower()
+        if ($signedSha -eq $sha) { throw "signed file is byte-identical to the unsigned input" }
+
+        "signed-path=$($signed.FullName)" >> $env:GITHUB_OUTPUT
+        "signed-sha256=$signedSha" >> $env:GITHUB_OUTPUT
+        Write-Host "Signed $($env:REQSIGN_OUTPUT_NAME): sha256 $signedSha"

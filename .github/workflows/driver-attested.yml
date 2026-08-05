@@ -1,0 +1,193 @@
+name: Driver attested
+
+# Second half of the driver production-signing pipeline (first half:
+# driver-submission.yml; runbook: docs/driver-signing.md).
+#
+# Run this manually after Microsoft returns the attestation-signed driver:
+# download the signed zip from the Partner Center hardware dashboard, attach
+# it (any file name) to the matching driver-v* prerelease, then trigger this
+# workflow. It:
+#   1. verifies Microsoft's signatures (signtool /kp against the catalog AND
+#      the embedded .sys signature; the signer chain must be the
+#      "Microsoft Windows Hardware Compatibility Publisher");
+#   2. checks the INF is byte-identical to the one in our submission CAB
+#      (attestation leaves the INF untouched — any difference means the zip
+#      doesn't belong to this submission);
+#   3. checks the INF DriverVer matches the release version;
+#   4. repackages inf/sys/cat (+pdb from the CAB) into the canonical
+#      StreamToSpeaker-Driver-<ver>-Signed.zip and flips the manifest to
+#      attested=true — from then on build.yml bundles this driver into
+#      installers whenever the driver source hash still matches.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "driver-v* release tag carrying the Microsoft-signed zip (default: newest unattested one with a zip attached)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve release + download assets
+        id: rel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo = "${{ github.repository }}"
+          $tag = "${{ inputs.tag }}"
+          $rels = gh api "repos/$repo/releases?per_page=100" | ConvertFrom-Json
+
+          if ($tag) {
+              $rel = $rels | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
+              if (-not $rel) { throw "release $tag not found" }
+          } else {
+              $cand = @()
+              foreach ($r in @($rels | Where-Object { $_.tag_name -match '^driver-v\d+\.\d+\.\d+\.\d+$' })) {
+                  $manAsset = $r.assets | Where-Object { $_.name -eq "manifest.json" } | Select-Object -First 1
+                  if (-not $manAsset) { continue }
+                  try {
+                      # Assets can be served as octet-stream; download + parse.
+                      Invoke-WebRequest -Uri $manAsset.browser_download_url -OutFile candidate-manifest.json
+                      $m = Get-Content candidate-manifest.json -Raw | ConvertFrom-Json
+                  } catch { continue }
+                  if ($m.attested) { continue }
+                  $msZip = @($r.assets | Where-Object { $_.name -like "*.zip" -and $_.name -notlike "StreamToSpeaker-Driver-*-Signed.zip" })
+                  if ($msZip.Count -eq 0) { continue }
+                  $cand += ,@{ Release = $r; Build = [int]$m.driver_build }
+              }
+              if ($cand.Count -eq 0) {
+                  throw "no unattested driver-v* release with an attached Microsoft zip found - attach the signed zip from Partner Center to its driver-v release first"
+              }
+              $rel = ($cand | Sort-Object { $_.Build } -Descending | Select-Object -First 1).Release
+              $tag = $rel.tag_name
+          }
+          if ($tag -notmatch '^driver-v(\d+\.\d+\.\d+\.\d+)$') { throw "unexpected tag format: $tag" }
+          $version = $Matches[1]
+
+          New-Item -ItemType Directory -Force -Path assets | Out-Null
+          gh release download $tag --dir assets
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+          Get-ChildItem assets | ForEach-Object { Write-Host "  asset: $($_.Name)" }
+
+          $msZips = @(Get-ChildItem assets -Filter "*.zip" | Where-Object { $_.Name -notlike "StreamToSpeaker-Driver-*-Signed.zip" })
+          if ($msZips.Count -ne 1) { throw "expected exactly one Microsoft-signed zip on $tag, found $($msZips.Count) - attach exactly the zip Partner Center returned" }
+          $cab = Get-Item "assets\StreamToSpeaker-Driver-$version-Submission.cab" -ErrorAction Stop
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "ms_zip=$($msZips[0].FullName)" >> $env:GITHUB_OUTPUT
+          "ms_zip_name=$($msZips[0].Name)" >> $env:GITHUB_OUTPUT
+          "cab=$($cab.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Verify Microsoft signatures + INF integrity
+        id: verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.rel.outputs.version }}"
+
+          # --- extract Microsoft's zip --------------------------------
+          Expand-Archive "${{ steps.rel.outputs.ms_zip }}" -DestinationPath ms-signed -Force
+          $sysFiles = @(Get-ChildItem ms-signed -Recurse -Filter "StreamToSpeaker.sys")
+          if ($sysFiles.Count -eq 0) { throw "zip contains no StreamToSpeaker.sys" }
+          if (($sysFiles | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash } | Select-Object -Unique).Count -gt 1) {
+              throw "zip contains multiple DIFFERENT StreamToSpeaker.sys files - inspect it manually"
+          }
+          $sys = $sysFiles[0]
+          $dir = $sys.DirectoryName
+          $inf = Join-Path $dir "StreamToSpeaker.inf"
+          $cat = Join-Path $dir "StreamToSpeaker.cat"
+          foreach ($f in $inf, $cat) { if (-not (Test-Path $f)) { throw "expected $f next to the signed .sys" } }
+
+          # --- extract our submission CAB for comparison --------------
+          # (The EV signature on the CAB container doesn't change the
+          # files inside, so extraction works on the signed CAB.)
+          New-Item -ItemType Directory -Force -Path cab-contents | Out-Null
+          expand.exe -F:* "${{ steps.rel.outputs.cab }}" cab-contents | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "expand.exe failed on the submission CAB" }
+          $subInf = Get-ChildItem cab-contents -Recurse -Filter "StreamToSpeaker.inf" | Select-Object -First 1
+          if (-not $subInf) { throw "submission CAB contains no INF?" }
+
+          # --- signature checks ----------------------------------------
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match '\\x64\\' } |
+              Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+
+          Write-Host "== catalog verification (kernel policy) =="
+          $catOut = & $signtool verify /kp /v /c $cat $sys.FullName 2>&1 | Out-String
+          Write-Host $catOut
+          if ($LASTEXITCODE -ne 0) { throw "signtool catalog verification failed" }
+
+          Write-Host "== embedded verification (kernel policy) =="
+          $embOut = & $signtool verify /kp /v $sys.FullName 2>&1 | Out-String
+          Write-Host $embOut
+          if ($LASTEXITCODE -ne 0) { throw "signtool embedded verification failed" }
+
+          if (($catOut + $embOut) -notmatch "Hardware Compatibility Publisher") {
+              throw "signer is not the Microsoft Windows Hardware Compatibility Publisher - this doesn't look like an attestation-signed package"
+          }
+
+          # --- INF identity checks -------------------------------------
+          $a = (Get-FileHash $inf -Algorithm SHA256).Hash
+          $b = (Get-FileHash $subInf.FullName -Algorithm SHA256).Hash
+          if ($a -ne $b) {
+              throw "returned INF differs from the submitted INF - this zip doesn't match this submission (or the INF was modified)"
+          }
+          $infText = Get-Content $inf -Raw
+          if ($infText -notmatch [regex]::Escape(",$version")) {
+              throw "returned INF does not carry DriverVer $version"
+          }
+
+          # --- canonical repackage -------------------------------------
+          New-Item -ItemType Directory -Force -Path signed-driver | Out-Null
+          Copy-Item $inf, $cat, $sys.FullName signed-driver\
+          $pdb = Get-ChildItem cab-contents -Recurse -Filter "StreamToSpeaker.pdb" | Select-Object -First 1
+          if ($pdb) { Copy-Item $pdb.FullName signed-driver\ }
+          $zipName = "StreamToSpeaker-Driver-$version-Signed.zip"
+          Compress-Archive -Path signed-driver\* -DestinationPath $zipName -Force
+          $zipSha = (Get-FileHash $zipName -Algorithm SHA256).Hash.ToLower()
+          "$zipSha  $zipName" | Set-Content -Path "$zipName.sha256" -Encoding ascii -NoNewline
+
+          "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+          "zip_sha256=$zipSha" >> $env:GITHUB_OUTPUT
+
+      - name: Finalize release (manifest attested=true)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ steps.rel.outputs.tag }}"
+          $version = "${{ steps.rel.outputs.version }}"
+
+          $man = Get-Content assets\manifest.json -Raw | ConvertFrom-Json
+          $man.attested = $true
+          $man.signed_zip = "${{ steps.verify.outputs.zip_name }}"
+          $man.signed_zip_sha256 = "${{ steps.verify.outputs.zip_sha256 }}"
+          $man | Add-Member -NotePropertyName ms_zip_asset -NotePropertyValue "${{ steps.rel.outputs.ms_zip_name }}" -Force
+          $man | ConvertTo-Json | Set-Content -Path manifest.json -Encoding ascii
+
+          gh release upload $tag "${{ steps.verify.outputs.zip_name }}" "${{ steps.verify.outputs.zip_name }}.sha256" manifest.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          gh release edit $tag --title "Driver $version — Microsoft-attested"
+          if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
+
+          @(
+            "## Driver $version attested ✅"
+            ""
+            "| | |"
+            "| --- | --- |"
+            "| Release | ``$tag`` |"
+            "| Canonical package | ``${{ steps.verify.outputs.zip_name }}`` |"
+            "| SHA256 | ``${{ steps.verify.outputs.zip_sha256 }}`` |"
+            ""
+            "Installer builds on main (and tag releases) now bundle this driver automatically"
+            "as long as ``driver/**`` + ``include/**`` still hash to the manifest's source_hash."
+          ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
