@@ -17,8 +17,14 @@
 ;
 ; Requirements before running the installer on a target machine:
 ;   - Windows 10 1809+ (the driver INF targets that)
-;   - Test signing on, Secure Boot off, HVCI off — unless the driver
-;     binary is WHQL-signed (not yet)
+;   - For TEST-SIGNED builds (staging contains StreamToSpeaker.cer):
+;     test signing on, Secure Boot off, HVCI off
+;   - For Microsoft-ATTESTED builds (release CI stages the attestation-
+;     signed driver package and NO .cer): none of the above — the driver
+;     loads on stock Windows 10/11 with Secure Boot on. The cert-import
+;     steps below are gated on the .cer existing, so the same script
+;     serves both variants. (Windows Server won't load attestation-signed
+;     drivers; that was never a target.)
 ; -----------------------------------------------------------------------------
 
 #define MyAppName        "Stream To Speaker"
