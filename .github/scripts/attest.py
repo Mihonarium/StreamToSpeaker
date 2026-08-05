@@ -34,3 +34,46 @@ def next_action(m):
         return {"created": "upload", "uploaded": "commit",
                 "committed": "poll", "done": "finalize", "failed": "failed"}[state]
     raise ValueError(f"unknown ms_state {state!r}")
+
+
+# Mirrors live product 14636198218617861 exactly (GET verified 2026-08-05);
+# driverType is read-only/derived and not part of the create schema.
+REQUESTED_SIGNATURES = [
+    "WINDOWS_v100_X64_RS5_FULL", "WINDOWS_v100_X64_19H1_FULL",
+    "WINDOWS_v100_X64_VB_FULL", "WINDOWS_v100_X64_CO_FULL",
+    "WINDOWS_v100_X64_NI_FULL", "WINDOWS_v100_X64_GE_FULL",
+    "WINDOWS_v100_X64_25H2_FULL", "WINDOWS_v100_X64_26H1_FULL",
+]
+
+
+def build_product_payload(version):
+    return {
+        "productName": f"StreamToSpeaker-Driver-{version}",
+        "testHarness": "attestation",
+        "deviceType": "internalExternal",
+        "isTestSign": False,
+        "isFlightSign": False,
+        "deviceMetadataIds": [],
+        "marketingNames": [],
+        "selectedProductTypes": {},
+        "additionalAttributes": {},
+        "requestedSignatures": REQUESTED_SIGNATURES,
+    }
+
+
+def apply_created(m, product_id, submission_id):
+    m["ms_product_id"] = product_id
+    m["ms_submission_id"] = submission_id
+    m["ms_state"] = "created"
+    return m
+
+
+def apply_state(m, state):
+    m["ms_state"] = state
+    return m
+
+
+def apply_done(m, zip_asset):
+    m["ms_state"] = "done"
+    m["ms_zip_asset"] = zip_asset
+    return m

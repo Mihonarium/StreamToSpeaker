@@ -55,5 +55,34 @@ class NextAction(unittest.TestCase):
         self.assertEqual(attest.next_action(m), "create")
 
 
+class Payload(unittest.TestCase):
+    def test_product_payload(self):
+        p = attest.build_product_payload("1.0.0.42")
+        self.assertEqual(p["productName"], "StreamToSpeaker-Driver-1.0.0.42")
+        self.assertEqual(p["testHarness"], "attestation")
+        self.assertEqual(p["deviceType"], "internalExternal")
+        self.assertFalse(p["isTestSign"])
+        self.assertFalse(p["isFlightSign"])
+        self.assertIn("WINDOWS_v100_X64_RS5_FULL", p["requestedSignatures"])
+        self.assertIn("WINDOWS_v100_X64_26H1_FULL", p["requestedSignatures"])
+        self.assertEqual(len(p["requestedSignatures"]), 8)
+
+
+class Mutations(unittest.TestCase):
+    def test_apply_created_sets_ids_and_state(self):
+        m = attest.apply_created(man(), "111", "222")
+        self.assertEqual((m["ms_product_id"], m["ms_submission_id"], m["ms_state"]),
+                         ("111", "222", "created"))
+
+    def test_apply_state(self):
+        m = attest.apply_state(man(ms_state="created"), "uploaded")
+        self.assertEqual(m["ms_state"], "uploaded")
+
+    def test_apply_done_records_zip(self):
+        m = attest.apply_done(man(ms_state="committed"), "X-Microsoft.zip")
+        self.assertEqual(m["ms_state"], "done")
+        self.assertEqual(m["ms_zip_asset"], "X-Microsoft.zip")
+
+
 if __name__ == "__main__":
     unittest.main()
