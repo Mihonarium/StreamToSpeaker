@@ -17,8 +17,11 @@
 ;
 ; Requirements before running the installer on a target machine:
 ;   - Windows 10 1809+ (the driver INF targets that)
-;   - Test signing on, Secure Boot off, HVCI off — unless the driver
-;     binary is WHQL-signed (not yet)
+;   - Release builds ship the Microsoft-attested driver (from
+;     installer\attested\, staged by CI): no test signing, no Secure
+;     Boot / HVCI changes, no cert imports. Dev builds fall back to the
+;     CI test-signed driver + bundled .cer, which needs test-signing
+;     mode on the target machine.
 ; -----------------------------------------------------------------------------
 
 #define MyAppName        "Stream To Speaker"

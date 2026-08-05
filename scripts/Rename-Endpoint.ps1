@@ -1,4 +1,4 @@
-# Post-install: name + enable the Stream To Speaker audio endpoint.
+﻿# Post-install: name + enable the Stream To Speaker audio endpoint.
 #
 # Direct registry writes to MMDevices entries (DeviceState, the
 # friendly-name PKEY) used to be enough but on Windows 11 24H2+ the

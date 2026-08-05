@@ -56,10 +56,14 @@ End users install via `StreamToSpeakerSetup-<version>.exe` (produced by CI). The
 4. `devcon install` creates the root-enumerated device — `pnputil /install` alone does not for root-enumerated devices
 5. `Rename-Endpoint.ps1` overwrites the cached friendly name + flips `DeviceState = ACTIVE` and restarts `AudioEndpointBuilder` so changes take effect without sign-out
 
-User-machine prerequisites that aren't automatable:
-- Test-signing mode (`bcdedit /set testsigning on` + reboot) — we ship a test-signed driver, not WHQL
+**Release installers ship the Microsoft-attested driver** (since 2026-08-05): `installer/attested/` holds the Partner-Center-signed sys/inf/cat (provenance in its README). CI's staging step prefers it when its INF is byte-identical to the built driver's INF (DriverVer restamps on every driver rebuild, so equality proves same bits); tag builds FAIL on mismatch — submit a new CAB via `installer/Make-SubmissionCab.ps1` and update `installer/attested/`. When attested is staged, no `.cer` is staged → the installer's cert-import steps self-skip (FileExists checks) → users need NO testsigning/Secure-Boot/HVCI changes. `Pre-Install.ps1` also removes stale "Stream To Speaker (test sign)" certs from Root/TrustedPublisher on every install.
+
+⚠️ **PowerShell 5.1 + BOM-less UTF-8 .ps1 = broken scripts.** powershell.exe reads BOM-less files as ANSI; an em-dash inside a double-quoted string becomes a smart-quote and kills the whole parse (this silently broke the installer's Rename-Endpoint step for months). All repo .ps1 files with non-ASCII now carry a UTF-8 BOM — keep it that way when editing, or stay ASCII.
+
+User-machine prerequisites for TEST-SIGNED DEV BUILDS only (release installers need none of these):
+- Test-signing mode (`bcdedit /set testsigning on` + reboot)
 - Secure Boot off, HVCI / Memory Integrity off — required for test-signed drivers to load
-- Windows 10 1809+ (the INF targets `NTamd64.10.0...17763`)
+- Windows 10 1809+ (the INF targets `NTamd64.10.0...17763`) — this one applies to all builds
 - Click "Allow" once in Sound Settings for the per-device privacy gate (Windows 11 22H2+ only) — addressed by `PKEY_AudioDevice_EnableEndpointByDefault` in the INF, but pre-existing endpoints created without that property still need the manual click
 
 ## Key knowledge — Windows-audio specifics learned the hard way

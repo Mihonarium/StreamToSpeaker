@@ -1,4 +1,4 @@
-# StreamToSpeaker — post-install diagnostic.
+﻿# StreamToSpeaker — post-install diagnostic.
 #
 # Run this in an elevated PowerShell session AFTER installing. It
 # prints six critical values that pinpoint where the audio endpoint

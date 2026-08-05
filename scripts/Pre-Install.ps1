@@ -1,4 +1,4 @@
-# Runs as the first step of the installer's [Run] section, every time.
+﻿# Runs as the first step of the installer's [Run] section, every time.
 # Cleans up any previous Stream To Speaker install so the new INF lands
 # fresh - Windows otherwise caches per-endpoint state across reinstalls
 # (jack association, FormFactor, friendly name, enable-by-default flag)
@@ -81,6 +81,25 @@ if (Test-Path $base) {
     }
 }
 Log "$wiped cached MMDevices entries wiped"
+
+# ----- 3b. Remove stale test-signing certificates ---------------------------
+# Older installers imported a per-build self-signed cert into the
+# machine's Root + TrustedPublisher stores so the test-signed driver
+# would install cleanly. Attested (Microsoft-signed) builds don't need
+# any cert trust, so clean these up on every install. Harmless for
+# test-signed dev builds: the installer re-imports its own .cer right
+# after this script runs.
+$certsRemoved = 0
+foreach ($store in "Root", "TrustedPublisher") {
+    Get-ChildItem "Cert:\LocalMachine\$store" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Subject -match "Stream To Speaker \(test sign\)" } |
+        ForEach-Object {
+            Log "  removing stale test cert $($_.Thumbprint) from $store"
+            Remove-Item -Path "Cert:\LocalMachine\$store\$($_.Thumbprint)" -Force -ErrorAction SilentlyContinue
+            $certsRemoved++
+        }
+}
+Log "$certsRemoved stale test-signing certs removed"
 
 # ----- 4. Restart AudioEndpointBuilder + AudioSrv ----------------------------
 # audiosrv keeps an in-memory copy of every endpoint's metadata

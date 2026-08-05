@@ -34,7 +34,12 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      # Full history: the driver build number is the git commit count
+      # (git rev-list --count HEAD), which a shallow checkout reports
+      # as 1 (this is why the first attested driver shipped as 1.1.0.1).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # -----------------------------------------------------------------
       # Compute two version strings:
@@ -322,16 +327,54 @@ jobs:
           if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "service\target\release\stream-to-speaker.exe" "$staging\stream-to-speaker.exe"
-          # The driver binaries, the test-signing cert that signed them, and
-          # devcon all come from driver-cache/ — populated by the build above
-          # or restored from cache — so the shipped .cer always matches the
-          # shipped .sys/.cat regardless of which path produced them.
           $dc = "driver-cache"
-          foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "devcon.exe", "StreamToSpeaker.cer") {
-              $src = Join-Path $dc $name
-              if (-not (Test-Path $src)) { throw "driver-cache missing $name" }
-              Copy-Item $src "$staging\$name" -Force
-              Write-Host "Staged $name"
+
+          # Prefer the Microsoft-attested driver (installer/attested/) when
+          # it matches the driver we just built. The INF embeds DriverVer,
+          # which is restamped on every driver rebuild (and driver rebuilds
+          # happen exactly when driver/include source changes, per the
+          # cache key) — so INF byte-equality proves the attested bits ARE
+          # the current driver. On mismatch:
+          #   - tag builds fail (a release must never silently ship either
+          #     a stale attested driver or a test-signed one) → fix by
+          #     submitting a new CAB (installer/Make-SubmissionCab.ps1) and
+          #     committing the returned package to installer/attested/.
+          #     (A cache-key bump alone also restamps DriverVer — same fix.)
+          #   - dev builds warn and fall back to the test-signed driver.
+          # When attested is staged, the .cer is deliberately NOT staged:
+          # the installer then skips its cert-import steps (FileExists
+          # checks in the .iss) and users need no testsigning/cert trust.
+          $attested = "installer\attested"
+          $useAttested = $false
+          if (Test-Path "$attested\StreamToSpeaker.sys") {
+              $a = (Get-FileHash "$attested\StreamToSpeaker.inf" -Algorithm SHA256).Hash
+              $b = (Get-FileHash "$dc\StreamToSpeaker.inf" -Algorithm SHA256).Hash
+              if ($a -eq $b) {
+                  $useAttested = $true
+              } elseif ("${{ github.ref }}" -like "refs/tags/v*") {
+                  throw "installer/attested/ is stale (INF differs from the built driver) - submit a new attestation CAB and update installer/attested/ before releasing"
+              } else {
+                  Write-Warning "installer/attested/ is stale (driver changed since attestation); dev build ships the test-signed driver"
+              }
+          }
+
+          if ($useAttested) {
+              foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat") {
+                  Copy-Item "$attested\$name" "$staging\$name" -Force
+                  Write-Host "Staged $name (Microsoft-attested)"
+              }
+              Copy-Item "$dc\devcon.exe" "$staging\devcon.exe" -Force
+              Write-Host "Staged devcon.exe"
+          } else {
+              # Test-signed dev path: driver binaries, the test cert that
+              # signed them, and devcon all come from driver-cache/ so the
+              # shipped .cer always matches the shipped .sys/.cat.
+              foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "devcon.exe", "StreamToSpeaker.cer") {
+                  $src = Join-Path $dc $name
+                  if (-not (Test-Path $src)) { throw "driver-cache missing $name" }
+                  Copy-Item $src "$staging\$name" -Force
+                  Write-Host "Staged $name (test-signed dev build)"
+              }
           }
 
       - name: Build installer (Inno Setup)
@@ -468,7 +511,10 @@ jobs:
           $url = "https://github.com/$repo/releases/download/$tag/$($asset.name)"
 
           # Hash the actual bytes rather than trusting the sidecar.
-          Invoke-WebRequest -Uri $url -OutFile unsigned.exe
+          # (gh authenticates, so this works on a private repo too; the
+          # plain browser_download_url does not.)
+          gh release download $tag -R $repo --pattern $asset.name -O unsigned.exe
+          if ($LASTEXITCODE -ne 0) { throw "failed to download $($asset.name) from release $tag" }
           $sha = (Get-FileHash unsigned.exe -Algorithm SHA256).Hash.ToLower()
 
           # --- dispatch the signing workflow ---------------------------

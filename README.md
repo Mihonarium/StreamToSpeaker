@@ -43,8 +43,16 @@ End-to-end latency target on wired ethernet: ~150-300 ms, tuneable at runtime (s
 
 ## Quick start
 
+**Installing a release build?** Just run `StreamToSpeakerSetup-<version>.exe` from
+[Releases](https://github.com/Mihonarium/StreamToSpeaker/releases) — the driver it
+ships is Microsoft-attested (signed via the Windows Hardware Program), so it installs
+on a stock machine: no test-signing mode, Secure Boot and Memory Integrity can stay on.
+
+The steps below are for **building from source** (development), where your locally
+built driver is unsigned/test-signed:
+
 ```powershell
-# One-time: enable test-signed drivers (driver isn't WHQL-signed yet)
+# One-time (DEVELOPMENT BUILDS ONLY): enable test-signed drivers
 bcdedit /set testsigning on
 shutdown /r /t 0
 
@@ -211,7 +219,7 @@ Pass `--web` to enable. Then `http://<host>:5901/` serves a tiny status page wit
 - **Driver**: VS 2022 Build Tools (or EWDK) + Windows Driver Kit (WDK) 10.0.22621+. See `driver/README.md`.
 - **Service**: Rust 1.74+ stable. `cargo build --release` from `service/`. Produces `target/release/stream-to-speaker.exe`.
 - **Installer** (optional): [Inno Setup 6](https://jrsoftware.org/isdl.php) — `choco install innosetup` works too.
-- **Test signing** (development): Secure Boot off, `bcdedit /set testsigning on`, reboot. HVCI / Memory Integrity must be off in Windows Security → Device Security → Core Isolation.
+- **Test signing** (development builds only — release installers ship the Microsoft-attested driver and need none of this): Secure Boot off, `bcdedit /set testsigning on`, reboot. HVCI / Memory Integrity must be off in Windows Security → Device Security → Core Isolation.
 
 ## Building the installer
 
@@ -241,9 +249,11 @@ Per-step source: driver via msbuild, service via cargo, installer via Inno Setup
 
 Uninstall (via Control Panel → Apps): kills any running `stream-to-speaker.exe`, removes the driver via `Uninstall-Driver.ps1` (looks up the `oemNN.inf` assigned name in the driver store), deletes the install directory.
 
-### Caveat: driver signing
+### Driver signing
 
-The unsigned driver produced by `cargo`/`msbuild` won't load on a normal Windows machine. For development, the target needs test-signing mode + Secure Boot off + HVCI off (see Build prerequisites above). For a shippable installer that doesn't need test-signing, the `.sys` has to be signed with an EV code-signing certificate and WHQL-attested through the Microsoft Hardware Dev Center portal — out of scope for this repo right now.
+Release installers ship the **Microsoft-attested** driver from `installer/attested/` — signed through the Windows Hardware Program (Partner Center attestation), so it loads on stock Windows with Secure Boot on and no test-signing. CI stages it automatically whenever it matches the current driver source, and refuses to cut a release when the driver has changed since the last attestation (submit a new CAB with `installer/Make-SubmissionCab.ps1` and update `installer/attested/`).
+
+Locally built drivers (`msbuild` output, CI dev builds) are test-signed and need test-signing mode + Secure Boot off + HVCI off on the target machine (see Build prerequisites above).
 
 ## Continuous integration
 
