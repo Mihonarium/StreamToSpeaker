@@ -85,6 +85,24 @@ jobs:
       # WDK. Restore-only: build.yml owns saving this cache; a miss here
       # just costs the ~5 min install.
       # ----------------------------------------------------------------
+      # The WDK tree is ~50k small files; per-file Defender scanning is the
+      # dominant cost of the cache restore (measured: 293 s restore vs 67 s
+      # driver build). Excluding the target paths before extraction is a
+      # no-op if the image has real-time protection off — the step timing
+      # of "Restore WDK cache" is the measurement either way.
+      - name: Exclude WDK paths from Defender real-time scanning
+        shell: pwsh
+        run: |
+          try {
+              Add-MpPreference -ExclusionPath `
+                  "C:\Program Files (x86)\Windows Kits", `
+                  "C:\Program Files\Microsoft Visual Studio", `
+                  "C:\Program Files (x86)\Microsoft Visual Studio" -ErrorAction Stop
+              Write-Host "Defender exclusions added"
+          } catch {
+              Write-Host "Could not add Defender exclusions ($_) - continuing"
+          }
+
       - name: Restore WDK cache
         id: cache-wdk
         uses: actions/cache/restore@v4
