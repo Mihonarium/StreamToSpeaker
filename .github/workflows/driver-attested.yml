@@ -188,7 +188,28 @@ jobs:
 
           gh release upload $tag --repo "${{ github.repository }}" "${{ steps.verify.outputs.zip_name }}" "${{ steps.verify.outputs.zip_name }}.sha256" manifest.json --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
-          gh release edit $tag --repo "${{ github.repository }}" --title "Driver $version — Microsoft-attested"
+          # Replace the "awaiting attestation" runbook with what this
+          # release actually is now — the notes are what a human reads
+          # first, so a stale pending checklist on a finished release is
+          # actively misleading.
+          $notes = @(
+              "Microsoft-attested driver **$version** (commit $($man.commit))."
+              ""
+              "Install ``StreamToSpeaker-Driver-$version-Signed.zip`` on stock Windows 10 1809+ / Windows 11 — Secure Boot on, no test-signing mode. (Attestation-signed drivers do not load on Windows Server 2016+.)"
+              ""
+              "| | |"
+              "| --- | --- |"
+              "| Driver package | ``$($man.signed_zip)`` |"
+              "| SHA256 | ``$($man.signed_zip_sha256)`` |"
+              "| Driver source hash | ``$($man.source_hash)`` |"
+              "| Partner Center product / submission | ``$($man.ms_product_id)`` / ``$($man.ms_submission_id)`` |"
+              ""
+              "Verified in CI: ``signtool verify /kp`` against the catalog and the embedded ``.sys`` signature, signer chain *Microsoft Windows Hardware Compatibility Publisher*, INF byte-identical to the submitted one and carrying DriverVer $version."
+              ""
+              "Installer builds bundle this driver automatically while ``driver/**`` + ``include/**`` still hash to the source hash above. The other assets here are the submission trail: the EV-signed CAB sent to Microsoft, and the zip Microsoft returned."
+          ) -join "`n"
+          Set-Content -Path attested-notes.md -Value $notes -Encoding utf8
+          gh release edit $tag --repo "${{ github.repository }}" --title "Driver $version — Microsoft-attested" --notes-file attested-notes.md
           if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
 
           @(
