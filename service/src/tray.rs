@@ -91,12 +91,17 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
     // (previously the GUI used −/+ symbols and the tray used the
     // verbs, so the same action had two different labels across
     // surfaces — Content L2 from the audit).
+    // Speaker-dependent items start out matching the actual bound
+    // state, so a fresh launch with no speaker doesn't leave them
+    // enabled-but-no-op (pump() only syncs on *changes* to
+    // `last_speaker_bound`).
+    let speaker_bound = app.is_speaker_bound();
     let switch_speaker = MenuItem::new("Switch speaker…", true, None);
-    let trim_25 = MenuItem::new("Trim 25 ms (sync faster)", true, None);
-    let trim_100 = MenuItem::new("Trim 100 ms (sync faster)", true, None);
-    let pad_25 = MenuItem::new("Pad 25 ms (more buffer)", true, None);
-    let pad_100 = MenuItem::new("Pad 100 ms (more buffer)", true, None);
-    let resync = MenuItem::new("Resync speaker", true, None);
+    let trim_25 = MenuItem::new("Trim 25 ms (sync faster)", speaker_bound, None);
+    let trim_100 = MenuItem::new("Trim 100 ms (sync faster)", speaker_bound, None);
+    let pad_25 = MenuItem::new("Pad 25 ms (more buffer)", speaker_bound, None);
+    let pad_100 = MenuItem::new("Pad 100 ms (more buffer)", speaker_bound, None);
+    let resync = MenuItem::new("Resync speaker", speaker_bound, None);
     menu.append(&switch_speaker)?;
     menu.append(&trim_25)?;
     menu.append(&trim_100)?;
@@ -107,7 +112,7 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
 
     let enable_toggle = CheckMenuItem::new(
         "Streaming enabled",
-        true,
+        speaker_bound,
         app.is_streaming_enabled(),
         None,
     );
@@ -196,7 +201,7 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
         last_label: String::new(),
         last_enabled: app.is_streaming_enabled(),
         last_web_enabled: web_on,
-        last_speaker_bound: false,
+        last_speaker_bound: speaker_bound,
         hwnd,
     })
 }
