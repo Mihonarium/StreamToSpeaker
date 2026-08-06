@@ -7,11 +7,8 @@ name: Debug osslsigncode CAB signing
 # broken". Also tries current osslsigncode master to see if newer fixes it.
 
 on:
-  workflow_dispatch:
-    inputs:
-      run_id:
-        description: Run ID holding the submission-cab artifact
-        required: true
+  push:
+    branches: [debug/osslsigncode-cab]
 
 permissions:
   actions: read
@@ -25,7 +22,7 @@ jobs:
       - name: Fetch the real submission CAB
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.run_id }}
+          RUN_ID: "31060399034"
         run: |
           set -euo pipefail
           [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be numeric"; exit 1; }
