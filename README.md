@@ -17,12 +17,9 @@ directions.
 ## Install
 
 1. **[⬇ Download Stream To Speaker](https://github.com/Mihonarium/StreamToSpeaker/releases/latest/download/StreamToSpeakerSetup.exe)**
-   and run it. (That link always points at the newest signed installer; the
-   [releases page](https://github.com/Mihonarium/StreamToSpeaker/releases/latest)
-   has the versioned file, checksums and provenance bundles.)
-2. That's it — the installer sets up the audio driver and the app. No
-   test-signing mode, no Secure Boot changes: the driver is signed by
-   Microsoft (attestation signing), so it loads on stock Windows.
+   and run it.
+2. That's it. No test-signing mode, no Secure Boot changes — the driver is
+   Microsoft-signed.
 
 **Requirements:** Windows 10 1809+ or Windows 11, 64-bit, and a speaker on
 your network that speaks UPnP/OpenHome or AirPlay. (Windows Server is not
@@ -46,9 +43,6 @@ and **Quit**. Keyboard shortcuts: `Ctrl+E` enable/disable, `Ctrl+R` rescan,
   in the status panel (or `Ctrl+Shift+R`).
 - **No speakers in the list** → press **↻ Rescan**; check the speaker is on
   the same network/VLAN as the PC.
-- **The output device is named "Internal AUX Jack — …"** → an old cached name
-  from a previous install; run `scripts/Rename-Endpoint.ps1` elevated (the
-  installer normally does this for you).
 
 ## Verifying your download
 
@@ -61,15 +55,10 @@ published a file; the attestation says *what it was built from*.
 gh attestation verify StreamToSpeakerSetup.exe -R Mihonarium/StreamToSpeaker
 ```
 
-(The attestation binds to the file's *contents*, so it verifies whether you
-downloaded the stable-named or the versioned copy.)
-
-Verifying the installer covers everything inside it — service and driver
-alike are part of the attested bytes. Each release also ships a Sigstore
-bundle (`<file>.sigstore.json`) for offline verification with `--bundle`.
-The kernel driver additionally carries Microsoft's attestation signature
-(*Microsoft Windows Hardware Compatibility Publisher*), which is what lets
-it load with Secure Boot on.
+Verifying the installer covers everything inside it. Each release also ships
+a Sigstore bundle (`<file>.sigstore.json`) for offline verification with
+`--bundle`. The driver additionally carries Microsoft's attestation
+signature, which is what lets it load with Secure Boot on.
 
 ## For developers
 
