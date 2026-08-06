@@ -59,7 +59,14 @@ VersionInfoVersion={#VersionInfoVersion}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-LicenseFile={#SourcePath}\..\LICENSE
+; The wizard's license page shows the terms for what this installer
+; actually delivers: the signed binaries (all rights reserved — see
+; LICENSE-BINARIES.md) plus the MPL-2.0 source-availability notice
+; that MPL §3.2 requires for executable-form distribution. Showing
+; the raw MPL here would misstate the user's rights over the signed
+; binaries; showing the binary terms alone would omit the source
+; notice. LICENSE-INSTALLER.txt covers both, plus third-party credits.
+LicenseFile={#SourcePath}\LICENSE-INSTALLER.txt
 OutputDir={#SourcePath}\out
 OutputBaseFilename={#MyAppShortName}Setup-{#AppVersion}
 Compression=lzma2
@@ -148,8 +155,14 @@ Source: "{#SourcePath}\staging\devcon.exe"; DestDir: "{app}\driver"; Flags: igno
 Source: "{#SourcePath}\staging\StreamToSpeaker.cer"; DestDir: "{app}\driver"; Flags: ignoreversion skipifsourcedoesntexist
 
 ; --- Docs ---
-Source: "{#SourcePath}\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}\..\LICENSE";   DestDir: "{app}"; Flags: ignoreversion
+; LICENSE (MPL-2.0) covers the source; LICENSE-BINARIES.md covers the
+; signed artifacts; LICENSE-INSTALLER.txt is the combined summary the
+; user accepted on the wizard's license page. Install all three so the
+; accepted terms stay on disk.
+Source: "{#SourcePath}\..\README.md";           DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}\..\LICENSE";             DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}\..\LICENSE-BINARIES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}\LICENSE-INSTALLER.txt";  DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; Tasks: startmenuicon
