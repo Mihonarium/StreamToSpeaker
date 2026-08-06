@@ -386,6 +386,30 @@ impl App {
         }
     }
 
+    /// Whether to show the donation prompt: hidden until the stored
+    /// deadline passes. Shown on first launch (no stored value).
+    pub fn should_show_donation_prompt(&self) -> bool {
+        let uc = self.user_config.lock().unwrap();
+        // Never ask someone who hasn't got it working yet: no saved
+        // speaker means they are still setting up (or it failed for
+        // them), and a donation strip above the onboarding card would
+        // be asking for money before delivering anything.
+        if uc.last_speaker_id.is_none() {
+            return false;
+        }
+        match uc.donation_prompt_hidden_until {
+            None => true,
+            Some(t) => now_unix() >= t,
+        }
+    }
+
+    /// Hide the donation prompt for `days`, persisted immediately.
+    pub fn snooze_donation_prompt(&self, days: u64) {
+        let mut uc = self.user_config.lock().unwrap();
+        uc.donation_prompt_hidden_until = Some(now_unix() + days * 24 * 60 * 60);
+        uc.save();
+    }
+
     /// Undo the onboarding dismissal (Help menu → "Show getting-
     /// started again"). Persists immediately.
     pub fn reset_onboarding(&self) {
@@ -1832,3 +1856,12 @@ pub fn pick_ssdp_iface(advertise_ip: Option<&str>, bind: &str) -> Option<std::ne
 
 #[allow(dead_code)]
 const _: u32 = DEFAULT_QUIESCENT_AFTER_PACKETS;
+
+/// Seconds since the Unix epoch, saturating to 0 if the system clock is
+/// before 1970 (which would only happen on a badly misconfigured box).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
