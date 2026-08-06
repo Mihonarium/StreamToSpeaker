@@ -1,22 +1,49 @@
 name: Request EV code signature
 description: >
-  Dispatch the central signing workflow (Mihonarium/signing, sign.yml) for a
-  publicly downloadable file, wait for the human approval gate there and for
-  the run to finish, download the "signed" artifact, verify it locally with
-  signtool, and expose the signed file's path + hash. The approval in the
-  signing repo authorizes exactly the SHA-256 this action computes from the
-  bytes at artifact-url, so nothing can be swapped between dispatch and
-  signature. Windows runners only (pwsh + signtool from the preinstalled
-  Windows SDK). The calling job must run in the `request-signing`
-  environment so it can read the SIGNING_REPO_TOKEN secret.
+  Dispatch the central signing workflow (Mihonarium/signing, sign.yml), wait
+  for the human approval gate there and for the run to finish, download the
+  "signed" artifact, verify it locally with signtool, and expose the signed
+  file's path + hash. The approval in the signing repo authorizes exactly
+  the SHA-256 this action computes from the source bytes, so nothing can be
+  swapped between dispatch and signature. Two source modes:
+    - artifact-url: a URL fetchable WITHOUT authentication (public repos /
+      presigned URLs only — a private repo's release URLs serve a 404 page).
+    - source-run-id + source-artifact: an Actions artifact of a run in THIS
+      repository; the signing workflow fetches it post-approval with its
+      FETCH_TOKEN environment secret (fine-grained PAT, Actions: Read-only
+      on this repo). This is the mode that works from a private repo.
+  Windows runners only (pwsh + signtool from the preinstalled Windows SDK).
+  The calling job must run in the `request-signing` environment so it can
+  read the SIGNING_REPO_TOKEN secret.
 
 inputs:
   artifact-url:
     description: >
-      Public (unauthenticated) URL of the exact bytes to sign — e.g. a
-      release-asset download URL. The signing workflow fetches this itself,
-      so it must stay reachable until the human approves.
-    required: true
+      Source mode A: public (unauthenticated) URL of the exact bytes to
+      sign. The signing workflow fetches this itself, so it must stay
+      reachable until the human approves. Mutually exclusive with
+      source-run-id/source-artifact.
+    required: false
+    default: ""
+  source-run-id:
+    description: >
+      Source mode B (private repos): numeric Actions run ID in this
+      repository whose artifact holds the unsigned file (use github.run_id
+      to sign an artifact uploaded earlier in the same run). Requires
+      source-artifact; mutually exclusive with artifact-url.
+    required: false
+    default: ""
+  source-artifact:
+    description: "Source mode B: name of the Actions artifact (must contain exactly one file)"
+    required: false
+    default: ""
+  repo-token:
+    description: >
+      Token used to download the source artifact from this repository for
+      pre-dispatch hashing (mode B only). The default workflow token is
+      sufficient.
+    required: false
+    default: ${{ github.token }}
   output-name:
     description: >
       File name for the signed output (must satisfy the signing workflow's
@@ -80,6 +107,9 @@ runs:
       shell: pwsh
       env:
         REQSIGN_URL: ${{ inputs.artifact-url }}
+        REQSIGN_SRC_RUN: ${{ inputs.source-run-id }}
+        REQSIGN_SRC_ART: ${{ inputs.source-artifact }}
+        REQSIGN_REPO_TOKEN: ${{ inputs.repo-token }}
         REQSIGN_OUTPUT_NAME: ${{ inputs.output-name }}
         REQSIGN_SIG_DESCRIPTION: ${{ inputs.sig-description }}
         REQSIGN_SIG_URL: ${{ inputs.sig-url }}
@@ -101,7 +131,22 @@ runs:
         # Hash the actual bytes the signing workflow will fetch, not a local
         # copy — the approval over there binds to this digest.
         $unsigned = Join-Path $work "unsigned.bin"
-        Invoke-WebRequest -Uri $env:REQSIGN_URL -OutFile $unsigned
+        if ($env:REQSIGN_SRC_RUN) {
+            if ($env:REQSIGN_URL) { throw "give either artifact-url or source-run-id/source-artifact, not both" }
+            if (-not $env:REQSIGN_SRC_ART) { throw "source-artifact is required with source-run-id" }
+            if ($env:REQSIGN_SRC_RUN -notmatch '^\d+$') { throw "source-run-id must be numeric" }
+            $fetchDir = Join-Path $work "src-artifact"
+            $env:GH_TOKEN = $env:REQSIGN_REPO_TOKEN
+            gh run download $env:REQSIGN_SRC_RUN --repo $env:GITHUB_REPOSITORY `
+                --name $env:REQSIGN_SRC_ART --dir $fetchDir
+            if ($LASTEXITCODE -ne 0) { throw "gh run download failed for artifact '$($env:REQSIGN_SRC_ART)' of run $($env:REQSIGN_SRC_RUN)" }
+            $files = @(Get-ChildItem $fetchDir -Recurse -File)
+            if ($files.Count -ne 1) { throw "artifact '$($env:REQSIGN_SRC_ART)' must contain exactly one file, found $($files.Count)" }
+            Copy-Item $files[0].FullName $unsigned
+        } else {
+            if (-not $env:REQSIGN_URL) { throw "no source: set artifact-url, or source-run-id + source-artifact" }
+            Invoke-WebRequest -Uri $env:REQSIGN_URL -OutFile $unsigned
+        }
         $sha = (Get-FileHash $unsigned -Algorithm SHA256).Hash.ToLower()
         if ($env:REQSIGN_EXPECTED_SHA256 -and $env:REQSIGN_EXPECTED_SHA256.ToLower() -ne $sha) {
             throw "bytes at $env:REQSIGN_URL hash to $sha, expected $($env:REQSIGN_EXPECTED_SHA256.ToLower()) - refusing to request a signature for unexpected content"
@@ -109,15 +154,24 @@ runs:
         "unsigned-sha256=$sha" >> $env:GITHUB_OUTPUT
 
         # --- dispatch the signing workflow ---------------------------------
+        $dispatchInputs = @{
+            sha256          = $sha
+            output_name     = $env:REQSIGN_OUTPUT_NAME
+            sig_description = $env:REQSIGN_SIG_DESCRIPTION
+            sig_url         = $env:REQSIGN_SIG_URL
+        }
+        if ($env:REQSIGN_SRC_RUN) {
+            # Private-source mode: the signing workflow fetches the artifact
+            # post-approval with its FETCH_TOKEN environment secret.
+            $dispatchInputs.source_repo     = $env:GITHUB_REPOSITORY
+            $dispatchInputs.source_run_id   = $env:REQSIGN_SRC_RUN
+            $dispatchInputs.source_artifact = $env:REQSIGN_SRC_ART
+        } else {
+            $dispatchInputs.artifact_url = $env:REQSIGN_URL
+        }
         $body = @{
             ref = $env:REQSIGN_REF
-            inputs = @{
-                artifact_url    = $env:REQSIGN_URL
-                sha256          = $sha
-                output_name     = $env:REQSIGN_OUTPUT_NAME
-                sig_description = $env:REQSIGN_SIG_DESCRIPTION
-                sig_url         = $env:REQSIGN_SIG_URL
-            }
+            inputs = $dispatchInputs
         } | ConvertTo-Json
         Invoke-RestMethod -Method Post -Headers $hdr -Body $body -Uri `
             "https://api.github.com/repos/$($env:REQSIGN_REPO)/actions/workflows/$($env:REQSIGN_WORKFLOW)/dispatches"

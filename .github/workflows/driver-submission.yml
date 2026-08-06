@@ -260,6 +260,18 @@ jobs:
             "| Source hash | ``${{ steps.srchash.outputs.hash }}`` |"
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
+      # The signing hand-off uses this artifact (private-source mode — the
+      # repo is private, so release-asset URLs are not fetchable without
+      # auth); the release asset below is the durable record + what
+      # driver-attest.yml submits after it's EV-signed.
+      - name: Upload submission CAB as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: submission-cab
+          path: ${{ steps.cab.outputs.path }}
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Create driver prerelease + upload submission CAB
         shell: pwsh
         env:
@@ -322,12 +334,16 @@ jobs:
               if ($r.tag_name -notmatch '^driver-v\d+\.\d+\.\d+\.(\d+)$') { continue }
               $build = [int]$Matches[1]
               if ($build -ge $current) { continue }
-              $keep = $false
+              # Default to KEEPING a release whose manifest we cannot read —
+              # a fetch failure must never look like "safe to delete" (on a
+              # private repo an unauthenticated fetch fails for every
+              # release, attested ones included).
+              $keep = $true
               $manAsset = $r.assets | Where-Object { $_.name -eq "manifest.json" } | Select-Object -First 1
               if ($manAsset) {
                   try {
-                      # Assets can be served as octet-stream; download + parse.
-                      Invoke-WebRequest -Uri $manAsset.browser_download_url -OutFile stale-manifest.json
+                      gh release download $r.tag_name --pattern manifest.json --output stale-manifest.json --clobber
+                      if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
                       $man = Get-Content stale-manifest.json -Raw | ConvertFrom-Json
                       # Keep attested releases (shipped driver history) AND
                       # releases with an in-flight Partner Center submission
@@ -370,7 +386,8 @@ jobs:
         id: sign
         uses: ./.github/actions/request-signing
         with:
-          artifact-url: https://github.com/${{ github.repository }}/releases/download/${{ needs.build-cab.outputs.tag }}/${{ needs.build-cab.outputs.cab_name }}
+          source-run-id: ${{ github.run_id }}
+          source-artifact: submission-cab
           expected-sha256: ${{ needs.build-cab.outputs.cab_sha256 }}
           output-name: ${{ needs.build-cab.outputs.cab_name }}
           sig-description: "Stream To Speaker driver attestation submission"
@@ -386,9 +403,10 @@ jobs:
           "$signedSha  $(Split-Path $signed -Leaf)" | Set-Content -Path "$signed.sha256" -Encoding ascii -NoNewline
 
           # Record the signed CAB's hash in the manifest so the exact bytes
-          # submitted to Microsoft stay identifiable.
-          $manUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/manifest.json"
-          Invoke-WebRequest -Uri $manUrl -OutFile manifest.json
+          # submitted to Microsoft stay identifiable. (Authenticated fetch —
+          # unauthenticated release URLs 404 on this private repo.)
+          gh release download $tag --pattern manifest.json --output manifest.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release download of manifest.json failed" }
           $man = Get-Content manifest.json -Raw | ConvertFrom-Json
           $man.submission_cab_signed_sha256 = $signedSha
           $man | ConvertTo-Json | Set-Content -Path manifest.json -Encoding ascii
