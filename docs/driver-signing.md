@@ -175,8 +175,11 @@ Tag `vX.Y.Z` → `build.yml` runs the release chain:
    asset).
 3. `package` — fetches the attested driver matching this tag's driver
    source; stages it with the *signed* service exe (no test cert) and
-   builds `StreamToSpeakerSetup-<ver>.exe`; attaches it plus the attested
-   driver zip to the release. If no attested driver matches, it falls back
+   builds `StreamToSpeakerSetup-<ver>.exe` and attaches it to the release.
+   The attested driver ships *inside* the installer and is deliberately not
+   published as a standalone asset (see `LICENSE-BINARIES.md`); the
+   `driver-v*` prerelease keeps the canonical copy. If no attested driver
+   matches, it falls back
    to the test-signed driver + cert and names the asset
    `StreamToSpeakerSetup-<ver>-testsigned.exe` with a warning — run Flow A,
    then re-tag, if you wanted a production release.
@@ -184,8 +187,8 @@ Tag `vX.Y.Z` → `build.yml` runs the release chain:
    it into the release. Its regenerated `.sha256` sidecar is canonical.
 
 Final release assets: signed `StreamToSpeakerSetup-<ver>.exe`, signed
-`stream-to-speaker-<ver>.exe`, `StreamToSpeaker-Driver-<dver>-Signed.zip`
-(Microsoft-signed driver package), and `.sha256` sidecars for each.
+`stream-to-speaker-<ver>.exe`, and `.sha256` sidecars for each (plus
+`.sigstore.json` provenance bundles once the repo is public).
 
 The release exists from step 2 onward with in-progress assets; unsigned
 bytes travel to the signing repo as Actions artifacts fetched with its
