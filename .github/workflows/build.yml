@@ -795,6 +795,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
           Write-Host "Release asset replaced with the signed build (sha256 ${{ steps.sign.outputs.signed-sha256 }})"
 
+          # Stable download link. GitHub's /releases/latest/download/<name>
+          # redirect needs a FIXED file name, so publish an unversioned copy
+          # of the same bytes as well — that is the URL the README hands to
+          # users. Skipped for -testsigned fallback builds: a permanent link
+          # must never resolve to an installer that needs testsigning mode.
+          $name = Split-Path $signed -Leaf
+          if ($name -like "*-testsigned*") {
+              Write-Host "##[warning]test-signed build - not updating the stable StreamToSpeakerSetup.exe link"
+          } else {
+              Copy-Item $signed "StreamToSpeakerSetup.exe" -Force
+              "${{ steps.sign.outputs.signed-sha256 }}  StreamToSpeakerSetup.exe" |
+                  Set-Content -Path "StreamToSpeakerSetup.exe.sha256" -Encoding ascii -NoNewline
+              gh release upload "${{ github.ref_name }}" StreamToSpeakerSetup.exe StreamToSpeakerSetup.exe.sha256 --clobber
+              if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+              Write-Host "Stable link updated: releases/latest/download/StreamToSpeakerSetup.exe"
+          }
+
       - name: Attest build provenance (public repo only)
         id: attest
         if: ${{ !github.event.repository.private }}
