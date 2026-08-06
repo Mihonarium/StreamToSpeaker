@@ -65,8 +65,10 @@ jobs:
                   $manAsset = $r.assets | Where-Object { $_.name -eq "manifest.json" } | Select-Object -First 1
                   if (-not $manAsset) { continue }
                   try {
-                      # Assets can be served as octet-stream; download + parse.
-                      Invoke-WebRequest -Uri $manAsset.browser_download_url -OutFile candidate-manifest.json
+                      # Authenticated fetch (private repo); assets can be
+                      # octet-stream, so download + parse.
+                      gh release download $r.tag_name --pattern manifest.json --output candidate-manifest.json --clobber
+                      if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
                       $m = Get-Content candidate-manifest.json -Raw | ConvertFrom-Json
                   } catch { continue }
                   if ($m.attested) { continue }

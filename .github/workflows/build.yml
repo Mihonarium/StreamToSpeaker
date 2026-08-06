@@ -500,8 +500,10 @@ jobs:
   #     read the PAT nor dispatch signing requests; a plain repo secret
   #     would be readable by any workflow run in this repo.
   #   - Optionally add a tag ruleset restricting who can create v* tags.
-  #   - The signing workflow fetches artifact_url unauthenticated, so
-  #     this only works while our releases are public.
+  #   - Unsigned bytes travel to the signing repo as Actions artifacts
+  #     (private-source mode): the signing workflow fetches them
+  #     post-approval with its FETCH_TOKEN environment secret (fine-grained
+  #     PAT, Actions: Read-only on this repo). Works with this repo private.
   #
   # NB the step-summary hash table printed by the build job shows the DEV
   # (test-signed, unsigned-exe) artifacts; the .sha256 sidecars on the
@@ -510,8 +512,8 @@ jobs:
 
   # EV-sign the service exe first, so the released installer CONTAINS a
   # signed binary (better AV/firewall-prompt story than only signing the
-  # setup wrapper). The unsigned exe is briefly a public release asset —
-  # that's inherent to the signing repo's pull-by-URL model.
+  # setup wrapper). The unsigned exe travels as a workflow artifact; only
+  # the signed exe ever lands on the release.
   sign-service:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
@@ -530,7 +532,7 @@ jobs:
           name: release-inputs
           path: release-inputs
 
-      - name: Create release + upload unsigned service exe
+      - name: Create release + stage unsigned service exe
         id: upload
         shell: pwsh
         run: |
@@ -543,16 +545,26 @@ jobs:
               gh release create $tag --title $tag --generate-notes --verify-tag
               if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
           }
-          gh release upload $tag $name --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
           "name=$name" >> $env:GITHUB_OUTPUT
           "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      # The unsigned exe travels to the signing repo as a workflow artifact
+      # (private-source mode) — it is never a release asset; only the signed
+      # exe lands on the release.
+      - name: Upload unsigned service exe as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-service-exe
+          path: ${{ steps.upload.outputs.name }}
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Sign service exe via central signing workflow
         id: sign
         uses: ./.github/actions/request-signing
         with:
-          artifact-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.upload.outputs.name }}
+          source-run-id: ${{ github.run_id }}
+          source-artifact: unsigned-service-exe
           expected-sha256: ${{ steps.upload.outputs.sha }}
           output-name: ${{ steps.upload.outputs.name }}
           sig-description: "Stream To Speaker"
@@ -696,20 +708,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Locate the setup exe release asset
+      - name: Fetch setup exe from the release + stage for signing
         id: asset
         shell: pwsh
         run: |
-          $rel = gh api "repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}" | ConvertFrom-Json
-          $assets = @($rel.assets | Where-Object { $_.name -like "StreamToSpeakerSetup-*.exe" })
-          if ($assets.Count -ne 1) { throw "expected exactly one setup exe asset on ${{ github.ref_name }}, found $($assets.Count)" }
-          "name=$($assets[0].name)" >> $env:GITHUB_OUTPUT
+          # Authenticated download — the repo is private, so the release
+          # asset URL is not fetchable by the signing workflow; the exe is
+          # re-exposed to it as a workflow artifact instead.
+          New-Item -ItemType Directory -Force -Path setup-unsigned | Out-Null
+          gh release download "${{ github.ref_name }}" --pattern "StreamToSpeakerSetup-*.exe" --dir setup-unsigned
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+          $exe = @(Get-ChildItem setup-unsigned -Filter "StreamToSpeakerSetup-*.exe")
+          if ($exe.Count -ne 1) { throw "expected exactly one setup exe asset on ${{ github.ref_name }}, found $($exe.Count)" }
+          "name=$($exe[0].Name)" >> $env:GITHUB_OUTPUT
+          "path=$($exe[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload unsigned setup exe as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-setup-exe
+          path: ${{ steps.asset.outputs.path }}
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Sign installer via central signing workflow
         id: sign
         uses: ./.github/actions/request-signing
         with:
-          artifact-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.asset.outputs.name }}
+          source-run-id: ${{ github.run_id }}
+          source-artifact: unsigned-setup-exe
           output-name: ${{ steps.asset.outputs.name }}
           sig-description: "Stream To Speaker Setup"
           token: ${{ secrets.SIGNING_REPO_TOKEN }}

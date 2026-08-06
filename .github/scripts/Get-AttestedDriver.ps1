@@ -36,12 +36,14 @@ function Out-StepOutput([string]$line) {
     if ($env:GITHUB_OUTPUT) { $line >> $env:GITHUB_OUTPUT }
 }
 
-# Release assets can be served as application/octet-stream, in which case
-# Invoke-RestMethod would not parse the JSON — download then parse.
-function Get-JsonAsset([string]$url) {
+# Authenticated fetch via gh — unauthenticated release-asset URLs 404 on a
+# private repo (and assets can be served as octet-stream anyway, so we
+# download then parse rather than Invoke-RestMethod).
+function Get-JsonAsset([string]$tag, [string]$name) {
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString("N") + ".json")
     try {
-        Invoke-WebRequest -Uri $url -OutFile $tmp
+        gh release download $tag --repo $Repo --pattern $name --output $tmp --clobber
+        if ($LASTEXITCODE -ne 0) { throw "gh release download of $name from $tag failed" }
         Get-Content $tmp -Raw | ConvertFrom-Json
     } finally {
         Remove-Item $tmp -ErrorAction SilentlyContinue
@@ -56,7 +58,7 @@ foreach ($r in @($rels | Where-Object { $_.tag_name -like "driver-v*" -and -not 
     $manAsset = $r.assets | Where-Object { $_.name -eq "manifest.json" } | Select-Object -First 1
     if (-not $manAsset) { continue }
     try {
-        $m = Get-JsonAsset $manAsset.browser_download_url
+        $m = Get-JsonAsset $r.tag_name "manifest.json"
     } catch {
         Write-Host "  ($($r.tag_name): manifest fetch failed, skipping)"
         continue
@@ -82,7 +84,8 @@ if (-not $zipAsset) { throw "$($r.tag_name): manifest says attested=true but ass
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $zipPath = Join-Path (Resolve-Path $OutDir).Path $m.signed_zip
-Invoke-WebRequest -Uri $zipAsset.browser_download_url -OutFile $zipPath
+gh release download $r.tag_name --repo $Repo --pattern $m.signed_zip --output $zipPath --clobber
+if ($LASTEXITCODE -ne 0) { throw "gh release download of $($m.signed_zip) failed" }
 $zipSha = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
 if ($zipSha -ne $m.signed_zip_sha256.ToLower()) {
     throw "$($m.signed_zip) hashes to $zipSha but the manifest records $($m.signed_zip_sha256) - refusing to use it"

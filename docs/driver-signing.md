@@ -78,9 +78,11 @@ release: `-testsigned` suffix + warning) until you run the loop again.
    (https://partner.microsoft.com/dashboard/hardware) and associate the
    Certum EV certificate with the account (the EV cert is both the
    registration credential and what must sign submission CABs).
-2. **Signing repo**: already set up per its README; no new secrets there —
-   this repo submits by public `artifact_url`, so `FETCH_TOKEN` is not
-   needed. Works only while this repo's releases are public.
+2. **Signing repo**: set up per its README, including the `FETCH_TOKEN`
+   environment secret (fine-grained PAT scoped to this repo, Actions:
+   Read-only). This repo is private, so unsigned bytes travel to the
+   signing workflow as Actions artifacts (its private-source mode) —
+   `FETCH_TOKEN` is how it fetches them, after your approval.
 3. **This repo — environment `request-signing`** (already exists for the
    installer signing): holds secret `SIGNING_REPO_TOKEN` (fine-grained PAT,
    scoped to only the signing repo, Actions Read+Write). **Add branch
@@ -166,9 +168,11 @@ Tag `vX.Y.Z` → `build.yml` runs the release chain:
 
 1. `build` — normal CI build; exports the service exe + driver-cache
    (test-signed fallback + devcon) to the release jobs.
-2. `sign-service` — creates the GitHub release (generated notes), uploads
-   `stream-to-speaker-<ver>.exe`, EV-signs it via the signing repo
-   (**approval click 1**), swaps in the signed exe + `.sha256`.
+2. `sign-service` — creates the GitHub release (generated notes), stages
+   `stream-to-speaker-<ver>.exe` as a workflow artifact, EV-signs it via
+   the signing repo (**approval click 1**), uploads the signed exe +
+   `.sha256` to the release (the unsigned exe never becomes a release
+   asset).
 3. `package` — fetches the attested driver matching this tag's driver
    source; stages it with the *signed* service exe (no test cert) and
    builds `StreamToSpeakerSetup-<ver>.exe`; attaches it plus the attested
@@ -183,9 +187,10 @@ Final release assets: signed `StreamToSpeakerSetup-<ver>.exe`, signed
 `stream-to-speaker-<ver>.exe`, `StreamToSpeaker-Driver-<dver>-Signed.zip`
 (Microsoft-signed driver package), and `.sha256` sidecars for each.
 
-The release is public from step 2 onward with in-progress assets (the
-pull-by-URL signing model requires it — same as the pre-existing installer
-signing). Don't announce until `sign-release` is green. If a job dies
+The release exists from step 2 onward with in-progress assets; unsigned
+bytes travel to the signing repo as Actions artifacts fetched with its
+`FETCH_TOKEN` (works with this repo private — nothing depends on public
+release URLs). Don't announce until `sign-release` is green. If a job dies
 mid-chain, re-run it: every step is idempotent (`--clobber` uploads,
 create-if-missing release). Re-running `package` after `sign-release` has
 finished overwrites the signed setup exe with an unsigned rebuild — re-run
