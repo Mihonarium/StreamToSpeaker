@@ -1,0 +1,95 @@
+name: Debug osslsigncode CAB signing
+
+# Temporary diagnostic (branch-only, never merged): reproduce the CAB-signing
+# segfault WITHOUT the Certum cloud or the ssign PKCS#11 module, using a
+# throwaway self-signed key on the real submission CAB. Distinguishes
+# "osslsigncode 2.8's CAB writer is broken" from "the pkcs11 module is
+# broken". Also tries current osslsigncode master to see if newer fixes it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Run ID holding the submission-cab artifact
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch the real submission CAB
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be numeric"; exit 1; }
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name submission-cab --dir cabdir
+          f="$(find cabdir -type f | head -1)"
+          cp -- "$f" test.cab
+          ls -la test.cab
+          sha256sum test.cab
+
+      - name: Throwaway self-signed key (debug only, discarded with the runner)
+        run: |
+          set -euo pipefail
+          openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+            -days 2 -nodes -subj "/CN=throwaway-cab-debug" 2> /dev/null
+          # capture cores as files (default core_pattern pipes to apport)
+          sudo bash -c "echo '$PWD/core.%p' > /proc/sys/kernel/core_pattern" || true
+
+      - name: "Test A: distro osslsigncode (noble, 2.8)"
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq osslsigncode gdb > /dev/null
+          osslsigncode --version || true
+          ulimit -c unlimited
+          set +e
+          osslsigncode sign -certs cert.pem -key key.pem -h sha256 \
+            -in test.cab -out signed-a.cab < /dev/null
+          rc=$?
+          set -e
+          echo "=== Test A exit code: $rc ==="
+          ls -la signed-a.cab 2> /dev/null || echo "(no output file)"
+          for c in core.*; do
+            if [ -f "$c" ]; then
+              echo "--- backtrace ($c) ---"
+              gdb -batch -ex bt "$(command -v osslsigncode)" "$c" 2> /dev/null | tail -30 || true
+              rm -f "$c"
+            fi
+          done
+          if [ "$rc" -eq 0 ]; then
+            osslsigncode verify -in signed-a.cab -CAfile cert.pem || true
+          fi
+
+      - name: "Test B: current osslsigncode master (built from source)"
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq cmake libssl-dev zlib1g-dev > /dev/null
+          git clone -q --depth 1 https://github.com/mtrojnar/osslsigncode osslsrc
+          cmake -S osslsrc -B osslbuild -DCMAKE_BUILD_TYPE=Release > /dev/null
+          cmake --build osslbuild -j > /dev/null
+          ./osslbuild/osslsigncode --version || true
+          ulimit -c unlimited
+          set +e
+          ./osslbuild/osslsigncode sign -certs cert.pem -key key.pem -h sha256 \
+            -in test.cab -out signed-b.cab < /dev/null
+          rc=$?
+          set -e
+          echo "=== Test B exit code: $rc ==="
+          ls -la signed-b.cab 2> /dev/null || echo "(no output file)"
+          for c in core.*; do
+            if [ -f "$c" ]; then
+              echo "--- backtrace ($c) ---"
+              gdb -batch -ex bt ./osslbuild/osslsigncode "$c" 2> /dev/null | tail -30 || true
+              rm -f "$c"
+            fi
+          done
+          if [ "$rc" -eq 0 ]; then
+            ./osslbuild/osslsigncode verify -in signed-b.cab -CAfile cert.pem || true
+          fi
