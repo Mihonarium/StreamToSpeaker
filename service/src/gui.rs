@@ -1952,10 +1952,12 @@ impl StreamToSpeakerApp {
                             {
                                 let _ = open_url("https://buymeacoffee.com/ms00");
                                 // We can't tell whether a donation actually
-                                // happened, so anyone who clicks through is
-                                // left alone for a year rather than asked
-                                // again next week.
-                                self.app.snooze_donation_prompt(365);
+                                // happened, so following the link buys a
+                                // month of quiet — long enough not to pester
+                                // someone who just gave, short enough that a
+                                // browser tab opened and forgotten doesn't
+                                // silence the ask for good.
+                                self.app.snooze_donation_prompt(30);
                             }
                         },
                     );
