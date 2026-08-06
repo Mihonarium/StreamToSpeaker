@@ -23,10 +23,9 @@ and run it. Needs Windows 10 1809+ / Windows 11, 64-bit (not Windows Server).
    app to it in the Volume Mixer.
 2. Pick a speaker in the app.
 
-If sound lags behind video, the **−25 / −100 ms** buttons drain the delay;
-**Resync** (`Ctrl+Shift+R`) restarts the stream fresh. No sound at all →
-**Audio not working? Resync**. Speaker missing from the list → **↻ Rescan**,
-and check it's on the same network as the PC.
+Sound lagging behind video → **−25 / −100 ms**. No sound → **Resync**
+(`Ctrl+Shift+R`). Speaker missing → **↻ Rescan**; check it's on the same
+network as the PC.
 
 Closing the window minimises to the tray; quit from the tray menu.
 
@@ -92,7 +91,7 @@ gh attestation verify StreamToSpeakerSetup.exe -R Mihonarium/StreamToSpeaker
 ```
 
 proves the file was built by this repository's CI from a specific commit.
-Offline: `--bundle <file>.sigstore.json`, shipped with every release.
+Offline: `--bundle <file>.sigstore.json`, shipped with each release.
 
 ## Developers
 
