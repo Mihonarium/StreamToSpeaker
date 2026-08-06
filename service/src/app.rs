@@ -1546,7 +1546,7 @@ impl App {
     /// blocks for ~3 s waiting for responses; the GUI button doesn't
     /// want to freeze. Results land in `DiscoveryState::replace` and
     /// are picked up by the next `speaker_view()` call.
-    pub fn trigger_rescan(&self) {
+    pub fn trigger_rescan(self: &Arc<Self>) {
         let Some(discovery) = self.discovery.clone() else {
             warn!("trigger_rescan: discovery disabled");
             return;
@@ -1557,31 +1557,30 @@ impl App {
             return;
         }
         let iface = self.config.ssdp_iface;
-        let in_flight = self.rescan_in_flight.clone();
-        let last_finished = self.last_rescan_finished_unix.clone();
-        let last_count = self.last_rescan_count.clone();
+        let app = self.clone();
         std::thread::Builder::new()
             .name("stream-to-speaker-rescan".to_string())
             .spawn(move || {
-                let count = match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
+                match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
                     Ok(found) => {
                         let n = found.len();
                         info!("manual rescan: {} renderer(s) found", n);
                         discovery.replace(found);
-                        n
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        app.last_rescan_count.store(n, Ordering::Release);
+                        app.last_rescan_finished_unix.store(now, Ordering::Release);
                     }
                     Err(e) => {
-                        warn!("manual rescan failed: {}", e);
-                        0
+                        // A failed scan is not "no speakers found" —
+                        // surface it as an error banner instead of the
+                        // scan-complete label.
+                        app.record_error(format!("Couldn't scan for speakers: {}", e));
                     }
-                };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                last_count.store(count, Ordering::Release);
-                last_finished.store(now, Ordering::Release);
-                in_flight.store(false, Ordering::Release);
+                }
+                app.rescan_in_flight.store(false, Ordering::Release);
             })
             .ok();
     }
