@@ -1,0 +1,214 @@
+; StreamToSpeaker.inf
+;
+; Installs the Stream To Speaker virtual audio render endpoint.
+; Adapted from Microsoft's sysvad sample (MIT). Single render
+; endpoint, no capture, no mic array, no keyword detection.
+;
+; Targets: Windows 10 1809 (build 17763) and later, x64 only.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 05/22/2026,1.0.0.1
+CatalogFile = StreamToSpeaker.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir   = 13
+StreamToSpeaker.CopyFiles = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+StreamToSpeaker.sys = 1
+
+[Manufacturer]
+%ProviderName% = StreamToSpeaker,NTamd64.10.0...17763
+
+[StreamToSpeaker.NTamd64.10.0...17763]
+%StreamToSpeaker.DeviceDesc% = StreamToSpeaker_Inst,Root\StreamToSpeaker
+
+; ----------------------------------------------------------------------
+; Install section
+; ----------------------------------------------------------------------
+
+[StreamToSpeaker_Inst.NT]
+; Inherit the core KS + WDMAudio registrations from the inbox INFs.
+; Per Microsoft's "Installing Core System Components for an Audio
+; Adapter" docs ([1]):
+;   "Each adapter driver should specify the inclusion of the
+;    KS.Registration section in Ks.inf and the WDMAUDIO.Registration
+;    section in Wdmaudio.inf."
+; Without this, the inbox MediaCategories friendly-name table isn't
+; seeded under our device's software key — and KSNODETYPE_SPEAKER
+; (the bridge pin's Category GUID) fails to resolve to "Speakers"
+; during AudioEndpointBuilder classification. The endpoint then
+; stays at the "Internal AUX Jack" placeholder and is created
+; disabled by default. This was the missing piece that left every
+; one of our previous INF / driver / post-install fixes ineffective.
+;
+; [1] https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/installing-core-system-components-for-an-audio-adapter
+Include    = ks.inf, wdmaudio.inf
+Needs      = KS.Registration, WDMAUDIO.Registration
+CopyFiles  = StreamToSpeaker.CopyFiles
+AddReg     = StreamToSpeaker_AddReg
+
+[StreamToSpeaker.CopyFiles]
+StreamToSpeaker.sys
+
+[StreamToSpeaker_AddReg]
+HKR,,AssociatedFilters,,"wdmaud,redbook"
+HKR,,Driver,,StreamToSpeaker.sys
+
+HKR,Drivers,SubClasses,,"wave,midi,mixer"
+
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%StreamToSpeaker.DeviceDesc%
+
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Description,,%StreamToSpeaker.DeviceDesc%
+
+[StreamToSpeaker_Inst.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,         %KSNAME_Wave%, StreamToSpeaker.I.Wave
+AddInterface = %KSCATEGORY_RENDER%,        %KSNAME_Wave%, StreamToSpeaker.I.Wave
+AddInterface = %KSCATEGORY_REALTIME%,      %KSNAME_Wave%, StreamToSpeaker.I.Wave
+AddInterface = %KSCATEGORY_AUDIO%,         %KSNAME_Topology%, StreamToSpeaker.I.Topo
+AddInterface = %KSCATEGORY_RENDER%,        %KSNAME_Topology%, StreamToSpeaker.I.Topo
+AddInterface = %KSCATEGORY_TOPOLOGY%,      %KSNAME_Topology%, StreamToSpeaker.I.Topo
+
+[StreamToSpeaker.I.Wave]
+AddReg = StreamToSpeaker.I.Wave.AddReg
+
+[StreamToSpeaker.I.Wave.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%StreamToSpeaker.WaveDesc%
+
+; Explicitly set the endpoint's user-visible friendly name. Without
+; this, Windows auto-generates a label from the jack / form-factor
+; metadata ("Internal AUX Jack — Stream To Speaker") and caches it
+; in HKLM\...\MMDevices\Audio\Render\<id>\Properties\... — even
+; reinstalls don't clear the cache. Setting PKEY_Device_FriendlyName
+; on EP\0 at install time lands the right string in the registry
+; the first time a fresh endpoint is enrolled. For upgrades over a
+; pre-existing install, run the rename PowerShell snippet from
+; README.md (or the installer's post-install step).
+HKR,EP\0,%PKEY_Device_FriendlyName%,,%StreamToSpeaker.EndpointName%
+
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_SPEAKER%
+; FormFactor = 1 (Speakers). Avoids the FormFactor=0
+; (RemoteNetworkDevice) privacy gate Windows 11 22H2+ applies to
+; "remote" audio devices (the "Allow apps and Windows to use this
+; device for audio" toggle in Sound Settings).
+;
+; The downside of plain Speakers is that OEM APOs (Dolby Atmos for
+; Speakers, Nahimic, Realtek effects) auto-attach to that form factor
+; and add ~5-30 ms of in-engine processing plus uncontrollable EQ —
+; the exact thing we want to avoid on a passthrough-to-Sonos path.
+; PKEY_AudioEndpoint_Disable_SysFx=1 disables system effects on our
+; endpoint specifically, so APOs are skipped even though we register
+; as a Speakers form factor.
+HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,1
+HKR,EP\0,%PKEY_AudioEndpoint_Disable_SysFx%,0x00010001,1
+
+; Force the endpoint to be enabled (and visible) by default. Without
+; this, the Windows audio endpoint builder creates endpoints with
+; certain category / form-factor combinations as
+; "disabled + hidden", and the user has to flip the Sound Settings
+; "Allow apps and Windows to use this device" toggle manually. Per
+; the WDK docs:
+;   FLAG_ENABLE       = 0x00000001
+;   FLOW_MASK_RENDER  = 0x00000100
+;   FLOW_MASK_CAPTURE = 0x00000200
+; ORed for "enabled render endpoint" = 0x00000101.
+; Ref: https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/pkey-audiodevice-enableendpointbydefault
+HKR,EP\0,%PKEY_AudioDevice_EnableEndpointByDefault%,0x00010001,0x00000101
+HKR,EP\0,%PKEY_AudioEngine_OEMFormat%,%REG_BINARY%, \
+    01,00,02,00,44,AC,00,00,10,B1,02,00,04,00,10,00
+
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,1
+
+; PacketSize_Constraints2 — advertise a minimum 2 ms period
+; (88 frames at 44.1 kHz). Default packet 128 frames as required.
+HKR,EP\0,%PKEY_AudioEngine_DeviceFormat%,%REG_BINARY%, \
+    01,00,02,00,44,AC,00,00,10,B1,02,00,04,00,10,00
+
+[StreamToSpeaker.I.Topo]
+AddReg = StreamToSpeaker.I.Topo.AddReg
+
+[StreamToSpeaker.I.Topo.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%StreamToSpeaker.TopoDesc%
+
+; ----------------------------------------------------------------------
+; Services
+; ----------------------------------------------------------------------
+
+[StreamToSpeaker_Inst.NT.Services]
+AddService = StreamToSpeaker,0x00000002,StreamToSpeaker_Service
+
+[StreamToSpeaker_Service]
+DisplayName    = %StreamToSpeaker.SvcDesc%
+ServiceType    = 1 ; SERVICE_KERNEL_DRIVER
+StartType      = 3 ; SERVICE_DEMAND_START
+ErrorControl   = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\StreamToSpeaker.sys
+
+; ----------------------------------------------------------------------
+; Strings
+; ----------------------------------------------------------------------
+
+[Strings]
+ProviderName                  = "Stream To Speaker"
+DiskName                      = "Stream To Speaker Installation Disk"
+StreamToSpeaker.DeviceDesc    = "Stream To Speaker"
+StreamToSpeaker.WaveDesc      = "Stream To Speaker Wave"
+StreamToSpeaker.TopoDesc      = "Stream To Speaker Topology"
+StreamToSpeaker.SvcDesc       = "Stream To Speaker Virtual Audio Driver"
+StreamToSpeaker.EndpointName  = "Stream To Speaker"
+
+REG_BINARY              = 0x00000001
+
+Proxy.CLSID             = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+
+KSCATEGORY_AUDIO        = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER       = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_TOPOLOGY     = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+KSCATEGORY_REALTIME     = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+
+KSNAME_Wave             = "Wave"
+KSNAME_Topology         = "Topology"
+
+; KSNODETYPE_SPEAKER — node-type GUID from ksmedia.h. Used as
+; PKEY_AudioEndpoint_Association so the Audio Endpoint Builder
+; classifies this endpoint as a speaker (not a line jack), and so
+; PKEY_AudioDevice_EnableEndpointByDefault's render-flow mask
+; actually matches.
+;
+; IMPORTANT: this GUID is from DEFINE_USB_TERMINAL_GUID(0x0301).
+; The value 0xDFF21BE2 (one hex digit off, USB terminal 0x0202)
+; is KSNODETYPE_DESKTOP_MICROPHONE — using the microphone GUID on
+; a render endpoint makes Windows treat the endpoint as a confused
+; capture-flow device, defeating every default-enable / form-factor
+; override and producing the "Internal AUX Jack" display name.
+KSNODETYPE_SPEAKER        = "{DFF21CE1-F70F-11D0-B917-00A0C9223196}"
+
+; PKEY_Device_FriendlyName — the user-visible endpoint name that
+; Sound Settings shows. Setting this on EP\0 at install time
+; preempts Windows's auto-generated "<jack-label> — <DeviceDesc>"
+; string and goes straight to the user-renameable slot in the
+; registry (same slot the Sound Settings "Rename" button writes
+; to). For an endpoint that ALREADY exists with the old cached
+; name, the INF write is ignored — see the rename snippet in the
+; project README for the upgrade path.
+PKEY_Device_FriendlyName    = "{a45c254e-df1c-4efd-8020-67d146a850e0},14"
+
+PKEY_AudioEndpoint_Association              = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_FormFactor               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
+PKEY_AudioEndpoint_Disable_SysFx            = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},5"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode= "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
+PKEY_AudioDevice_EnableEndpointByDefault    = "{F3E80BEF-1723-4FF2-BCC4-7F83DC5E46D4},4"
+PKEY_AudioEngine_DeviceFormat               = "{F19F064D-082C-4E27-BC73-6882A1BB8E4C},0"
+PKEY_AudioEngine_OEMFormat                  = "{E4870E26-3CC5-4CD2-BA46-CA0A9A70ED04},3"

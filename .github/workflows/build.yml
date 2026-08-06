@@ -1,0 +1,831 @@
+name: Build installer
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into the installer filename (default: 0.1.0-<short-sha>)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # for release uploads on tag pushes
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pin to the latest published 24H2 WDK at time of writing. Bump
+  # whenever the build switches to a newer header.
+  WDK_INSTALLER_URL: "https://go.microsoft.com/fwlink/?linkid=2272234"
+
+jobs:
+  build:
+    # Pinned: windows-latest moved to Windows Server 2025 + Visual Studio
+    # 2026 (MSBuild 18) in June 2026, whose driver-kit integration can't
+    # load our WDK's MSBuild 17 task DLLs (MSB4062 on ValidateNTTargetVersion
+    # — Microsoft.DriverKit.Build.Tasks.18.0.dll doesn't exist in WDK 26100).
+    # windows-2022 keeps VS2022/MSBuild 17 and is supported for years; see
+    # actions/runner-images#14017. Revisit with an EWDK or a VS2026-matched
+    # WDK when one ships.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      viversion: ${{ steps.ver.outputs.viversion }}
+      source_hash: ${{ steps.srchash.outputs.hash }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history — the driver build number is `git rev-list --count
+          # HEAD`, which silently evaluates to 1 on the default depth-1
+          # shallow clone (so CI-built drivers were all stamped 1.0.0.1).
+          fetch-depth: 0
+
+      # Identity hash of the driver source. Computed BEFORE the build stamps
+      # driver.h with the build number so it matches what a clean checkout
+      # hashes to — driver-v* release manifests record the same expression
+      # (driver-submission.yml), which is how installer builds find the
+      # Microsoft-attested driver that corresponds to this exact source.
+      - name: Compute driver source hash
+        id: srchash
+        shell: pwsh
+        run: |
+          "hash=${{ hashFiles('driver/**', 'include/**') }}" >> $env:GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------
+      # Compute two version strings:
+      #   version   — free-form, used in filename + display ("0.1.0-abc1234")
+      #   viversion — strict X.Y.Z.W numeric, required for the Win32
+      #               VersionInfo resource Inno Setup bakes into setup.exe
+      # Tag push  v1.2.3   → version 1.2.3,        viversion 1.2.3.0
+      # Otherwise          → version 0.1.0-<sha>,  viversion 0.1.0.0
+      # -----------------------------------------------------------------
+      - name: Compute version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = ""
+          if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.version }}") {
+              $v = "${{ inputs.version }}"
+          } elseif ("${{ github.ref }}" -like "refs/tags/v*") {
+              $v = "${{ github.ref }}" -replace "refs/tags/v", ""
+          } else {
+              $sha = "${{ github.sha }}".Substring(0, 7)
+              $v = "0.1.0-$sha"
+          }
+          # Numeric prefix of $v, padded to 4 parts.
+          $prefix = ($v -split "[-+]")[0]
+          $parts = $prefix -split "\."
+          while ($parts.Count -lt 4) { $parts += "0" }
+          # Strip any non-numeric parts (paranoia — Inno rejects them).
+          $parts = $parts | ForEach-Object { if ($_ -match "^\d+$") { $_ } else { "0" } }
+          $vi = $parts[0..3] -join "."
+          Write-Host "version=$v  viversion=$vi"
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "viversion=$vi" >> $env:GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------
+      # Toolchains
+      # -----------------------------------------------------------------
+      - name: Set up Rust (stable, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # Rust dependency cache. Swatinem/rust-cache instead of a plain
+      # actions/cache on target/: it keys on the *rustc version* as well as
+      # Cargo.lock (a plain lock-keyed cache goes permanently stale every
+      # 6-week toolchain bump, because actions/cache never re-saves on a
+      # key hit — deps then recompile on every run), it prunes our own
+      # crate's artifacts from target/ before saving (only dependencies are
+      # worth caching; smaller entries also relieve the repo's 10 GB cache
+      # budget that the WDK/driver caches share), and it saves even when a
+      # later step fails.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: service
+          cache-on-failure: true
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      # -----------------------------------------------------------------
+      # Prebuilt-driver cache.
+      #
+      # The kernel-mode driver only needs rebuilding when its *source*
+      # changes, so key a cache on a hash of driver/ + the shared ABI
+      # header. On a hit we skip the WDK, the signing-cert generation, and
+      # the MSBuild entirely, and reuse the prebuilt test-signed binaries
+      # — crucially INCLUDING the .cer that signed them, so the cert the
+      # installer ships always matches the cached .sys/.cat.
+      #
+      # Versioning consequence: the driver build number (INF DriverVer
+      # revision + STREAM_TO_SPEAKER_DRIVER_BUILD) is now stamped only when
+      # the driver is actually rebuilt — i.e. it tracks the commit count at
+      # the last driver change rather than HEAD. Still monotonic across
+      # driver changes, so PnP upgrade comparison is unaffected.
+      #
+      # restore/save split (not plain actions/cache) so a build that fails
+      # before the cache is populated can't poison the key. Bump the `v1`
+      # tag to force a rebuild after changing build flags without touching
+      # driver source.
+      # -----------------------------------------------------------------
+      - name: Restore prebuilt driver cache
+        id: cache-driver
+        uses: actions/cache/restore@v4
+        with:
+          path: driver-cache
+          key: driver-${{ runner.os }}-v2-${{ env.WDK_INSTALLER_URL }}-${{ hashFiles('driver/**', 'include/**') }}
+
+      # -----------------------------------------------------------------
+      # WDK install (~5 min cold) + cache.
+      #
+      # Cached paths cover what the WindowsKernelModeDriver10.0 toolset
+      # actually reads at build time:
+      #   - "Windows Kits\10\" — SDK + WDK headers, libs, redist tools
+      #   - "MSBuild\Microsoft\WDK\" under each plausible VS installation
+      #     — the .props/.targets that define the toolset itself
+      #
+      # The KitsRoot10 registry value is re-applied separately because
+      # actions/cache doesn't persist the registry. It's tiny and
+      # idempotent so we always run that step.
+      #
+      # Cache key bumps on every WDK URL change AND on any edit to the
+      # workflow file (so this section can be iterated without poisoning
+      # an old cache).
+      # -----------------------------------------------------------------
+      # The WDK tree is ~50k small files; per-file Defender scanning is the
+      # dominant cost of the cache restore (measured: 293 s restore vs 67 s
+      # driver build). Excluding the target paths before extraction is a
+      # no-op if the image has real-time protection off — the step timing
+      # of "Restore WDK cache" is the measurement either way.
+      - name: Exclude WDK paths from Defender real-time scanning
+        shell: pwsh
+        run: |
+          try {
+              Add-MpPreference -ExclusionPath `
+                  "C:\Program Files (x86)\Windows Kits", `
+                  "C:\Program Files\Microsoft Visual Studio", `
+                  "C:\Program Files (x86)\Microsoft Visual Studio" -ErrorAction Stop
+              Write-Host "Defender exclusions added"
+          } catch {
+              Write-Host "Could not add Defender exclusions ($_) - continuing"
+          }
+
+      - name: Restore WDK cache
+        id: cache-wdk
+        if: steps.cache-driver.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files (x86)\Windows Kits\10
+            C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\WDK
+            C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Microsoft\WDK
+            C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\WDK
+            C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\WDK
+          key: wdk-${{ env.WDK_INSTALLER_URL }}-v2-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: |
+            wdk-${{ env.WDK_INSTALLER_URL }}-v2-
+
+      - name: Install WDK (cache miss)
+        if: steps.cache-driver.outputs.cache-hit != 'true' && steps.cache-wdk.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "wdksetup.exe"
+          Write-Host "Downloading WDK from $env:WDK_INSTALLER_URL"
+          Invoke-WebRequest -Uri $env:WDK_INSTALLER_URL -OutFile $installer -UseBasicParsing
+          Write-Host "Installing WDK (silent, ~5 min)..."
+          $p = Start-Process -FilePath $installer -ArgumentList "/features", "+", "/q", "/norestart" -Wait -PassThru
+          Write-Host "WDK installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+              throw "WDK installer failed with exit $($p.ExitCode)"
+          }
+
+      # Reapply the KitsRoot10 registry value. The WDK installer sets it;
+      # actions/cache doesn't persist registry, so on a cache HIT we have
+      # to recreate it before MSBuild can find the toolset.
+      - name: Restore WDK registry
+        if: steps.cache-driver.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $kitsRoot = "C:\Program Files (x86)\Windows Kits\10\"
+          if (-not (Test-Path $kitsRoot)) {
+              throw "Windows Kits\10\ missing after WDK install/restore"
+          }
+          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" `
+                           -Name "KitsRoot10" -Value $kitsRoot -PropertyType String -Force | Out-Null
+          New-Item -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" `
+                           -Name "KitsRoot10" -Value $kitsRoot -PropertyType String -Force | Out-Null
+          Write-Host "KitsRoot10 = $kitsRoot"
+
+      # Visual Studio's developer command prompt needs to be activated
+      # to expose msbuild on PATH for the driver toolset.
+      - name: Add MSBuild to PATH
+        if: steps.cache-driver.outputs.cache-hit != 'true'
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      # -----------------------------------------------------------------
+      # Build
+      # -----------------------------------------------------------------
+      # Generate a self-signed test code-signing certificate so we can
+      # actually sign the driver — Windows in test-signing mode loads
+      # signed-by-untrusted drivers but refuses *un*signed ones. The
+      # cert lives only in the CurrentUser\My store; signtool /a (used
+      # by the vcxproj's TestSign target) auto-selects it. We also
+      # export the .cer so the installer can import it to the target
+      # machine's TrustedPublisher + Root stores.
+      - name: Generate test-signing certificate
+        if: steps.cache-driver.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate `
+              -Type CodeSigningCert `
+              -Subject "CN=Stream To Speaker (test sign)" `
+              -KeyAlgorithm RSA `
+              -KeyLength 2048 `
+              -HashAlgorithm SHA256 `
+              -CertStoreLocation "Cert:\CurrentUser\My" `
+              -NotAfter (Get-Date).AddYears(5) `
+              -KeyExportPolicy Exportable `
+              -KeyUsage DigitalSignature `
+              -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+          Write-Host "Generated cert thumbprint: $($cert.Thumbprint)"
+          $cerPath = Join-Path $env:RUNNER_TEMP "StreamToSpeaker.cer"
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          Write-Host "Exported .cer to $cerPath ($((Get-Item $cerPath).Length) bytes)"
+          # Trust it locally too so signtool & inf2cat are happy on the
+          # build agent and the driver is loadable for any CI smoke
+          # test we add later.
+          Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" | Out-Null
+          Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
+
+      # Stamp the driver build number with the git commit count so
+      # every build is uniquely identifiable from:
+      #   - The INF's DriverVer (1.0.0.N — what Device Manager and
+      #     PnP version-comparison use)
+      #   - The service log ('StreamToSpeaker driver opened build=N')
+      # Both come from the same git rev-list count, so they stay in
+      # sync and a user can confirm at a glance whether the kernel
+      # actually loaded the new .sys.
+      - name: Compute driver build number
+        id: drvbuild
+        if: steps.cache-driver.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $count = (git rev-list --count HEAD).Trim()
+          # Update driver.h for the runtime build identifier.
+          $path = "driver/driver.h"
+          $content = Get-Content $path -Raw
+          $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${count}u"
+          Set-Content -Path $path -Value $new -NoNewline
+          Write-Host "Driver build stamped: $count (driver.h + INF DriverVer 1.0.0.$count)"
+          "build=$count" >> $env:GITHUB_OUTPUT
+
+      - name: Build driver (Release|x64, test-signed)
+        if: steps.cache-driver.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          msbuild driver\StreamToSpeaker.sln `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:SignMode=TestSign `
+            /p:DriverBuildNumber=${{ steps.drvbuild.outputs.build }} `
+            /nologo `
+            /verbosity:minimal
+          # Fail fast on msbuild errors. Without this, the artifact scan
+          # below could pick up stale bits and the step only failed at the
+          # very end via the shell's trailing $LASTEXITCODE check.
+          if ($LASTEXITCODE -ne 0) {
+              throw "msbuild failed with exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path "driver\x64\Release\StreamToSpeaker\StreamToSpeaker.sys")) {
+              Get-ChildItem -Recurse driver\x64\Release\ | Select-Object FullName
+              throw "Driver .sys not produced where expected"
+          }
+          # Verify the .sys actually got signed.
+          $sys = Get-ChildItem -Recurse driver\x64\Release\ -Filter "StreamToSpeaker.sys" | Select-Object -First 1
+          $sig = Get-AuthenticodeSignature $sys.FullName
+          Write-Host "Driver signature status: $($sig.Status) (signer: $($sig.SignerCertificate.Subject))"
+          if ($sig.Status -ne "Valid" -and $sig.Status -ne "UnknownError") {
+              # UnknownError is common with self-signed certs that aren't
+              # rooted in a public CA; that's expected here. Anything else
+              # is a real problem.
+              throw "Driver signature unexpected status: $($sig.Status)"
+          }
+          # Collect the signed driver + the .cer that signed it + devcon
+          # into driver-cache/ so the cache save and staging read uniformly,
+          # and the shipped cert always matches the cached binaries.
+          $dc = "driver-cache"
+          New-Item -ItemType Directory -Force -Path $dc | Out-Null
+          # The .pdb rides along for Partner Center attestation submissions
+          # (the submission CAB must include the symbol file).
+          foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "StreamToSpeaker.pdb") {
+              $f = Get-ChildItem -Path "driver\x64\Release" -Recurse -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $f) { throw "driver output $name not found for cache" }
+              Copy-Item $f.FullName (Join-Path $dc $name) -Force
+          }
+          Copy-Item (Join-Path $env:RUNNER_TEMP "StreamToSpeaker.cer") (Join-Path $dc "StreamToSpeaker.cer") -Force
+          $devcon = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Tools" -Recurse -Filter "devcon.exe" -ErrorAction SilentlyContinue `
+                    | Where-Object { $_.FullName -match "\\x64\\" } | Select-Object -First 1
+          if (-not $devcon) { throw "devcon.exe not found under WDK Tools" }
+          Copy-Item $devcon.FullName (Join-Path $dc "devcon.exe") -Force
+          Write-Host "Populated $dc/ (driver + cert + devcon) for cache + staging"
+
+      - name: Save prebuilt driver cache
+        if: steps.cache-driver.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: driver-cache
+          key: ${{ steps.cache-driver.outputs.cache-primary-key }}
+
+      - name: Build service (cargo --release)
+        shell: pwsh
+        working-directory: service
+        run: cargo build --release
+
+      - name: Stage artifacts for installer
+        shell: pwsh
+        run: |
+          $staging = "installer\staging"
+          if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "service\target\release\stream-to-speaker.exe" "$staging\stream-to-speaker.exe"
+          # The driver binaries, the test-signing cert that signed them, and
+          # devcon all come from driver-cache/ — populated by the build above
+          # or restored from cache — so the shipped .cer always matches the
+          # shipped .sys/.cat regardless of which path produced them.
+          $dc = "driver-cache"
+          foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "devcon.exe", "StreamToSpeaker.cer") {
+              $src = Join-Path $dc $name
+              if (-not (Test-Path $src)) { throw "driver-cache missing $name" }
+              Copy-Item $src "$staging\$name" -Force
+              Write-Host "Staged $name"
+          }
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC not at $iscc" }
+          & $iscc `
+            "/DAppVersion=${{ steps.ver.outputs.version }}" `
+            "/DVersionInfoVersion=${{ steps.ver.outputs.viversion }}" `
+            "installer\StreamToSpeaker.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
+
+      # -----------------------------------------------------------------
+      # Production-driver installer preview (main pushes / dispatch).
+      #
+      # If a driver-v* release carries a Microsoft-attested driver whose
+      # manifest source_hash matches the CURRENT driver source, build a
+      # second installer that bundles the attested driver package instead of
+      # the test-signed one — and ships NO test certificate, which makes the
+      # .iss skip the cert-import steps entirely (they're gated on the .cer
+      # existing). This runs on service-only commits too; that's the point:
+      # the driver source is unchanged, so the attested binaries stay valid.
+      # Tag pushes skip this — the `package` job builds the release
+      # installer (with the EV-signed service exe) instead.
+      # -----------------------------------------------------------------
+      - name: Fetch attested driver (if one matches the driver source)
+        id: attested
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ steps.srchash.outputs.hash }}" -OutDir attested-driver
+
+      - name: Build production-driver installer preview
+        if: steps.attested.outputs.found == 'true'
+        shell: pwsh
+        run: |
+          $staging = "installer\staging"
+          foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat") {
+              Copy-Item "attested-driver\$name" "$staging\$name" -Force
+          }
+          Remove-Item "$staging\StreamToSpeaker.cer" -ErrorAction SilentlyContinue
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc `
+            "/DAppVersion=${{ steps.ver.outputs.version }}" `
+            "/DVersionInfoVersion=${{ steps.ver.outputs.viversion }}" `
+            "/FStreamToSpeakerSetup-${{ steps.ver.outputs.version }}-attested" `
+            "installer\StreamToSpeaker.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
+          Write-Host "Attested-driver installer built (driver ${{ steps.attested.outputs.version }} from ${{ steps.attested.outputs.tag }})"
+
+      # Compute SHA256 of every shipped artifact so users can verify
+      # downloads. Hashes go three places:
+      #   - Job log (visible in raw CI output)
+      #   - GitHub step summary (rendered at the top of the workflow run
+      #     page — users can read it without expanding any step)
+      #   - .sha256 sidecar files alongside the .exe (attached to the
+      #     GitHub Release on tag pushes and uploaded as artifacts)
+      - name: Compute artifact SHA256 hashes
+        shell: pwsh
+        run: |
+          $items = @(
+              Get-ChildItem -Path "installer\out" -Filter "StreamToSpeakerSetup-*.exe" -ErrorAction SilentlyContinue
+              Get-Item "service\target\release\stream-to-speaker.exe" -ErrorAction SilentlyContinue
+              Get-Item "driver-cache\StreamToSpeaker.sys" -ErrorAction SilentlyContinue
+          ) | Where-Object { $_ }
+          if (-not $items) { throw "No artifacts found to hash" }
+
+          $summary = @()
+          $summary += "## SHA256 hashes"
+          $summary += ""
+          $summary += "| File | SHA256 |"
+          $summary += "| --- | --- |"
+          foreach ($item in $items) {
+              $hash = (Get-FileHash -Algorithm SHA256 -Path $item.FullName).Hash.ToLower()
+              Write-Host "$hash  $($item.Name)"
+              # Sidecar file in the standard `<hash>  <filename>` shasum format.
+              $sidecar = "$($item.FullName).sha256"
+              "$hash  $($item.Name)" | Set-Content -Path $sidecar -Encoding ascii -NoNewline
+              $summary += "| ``$($item.Name)`` | ``$hash`` |"
+          }
+          $summary -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      # -----------------------------------------------------------------
+      # Publish
+      # -----------------------------------------------------------------
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StreamToSpeakerSetup-${{ steps.ver.outputs.version }}
+          path: |
+            installer/out/StreamToSpeakerSetup-*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload raw driver + service binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ steps.ver.outputs.version }}
+          path: |
+            driver-cache/StreamToSpeaker.sys
+            driver-cache/StreamToSpeaker.inf
+            driver-cache/StreamToSpeaker.cat
+            driver-cache/StreamToSpeaker.pdb
+            service/target/release/stream-to-speaker.exe
+            service/target/release/stream-to-speaker.exe.sha256
+          if-no-files-found: warn
+
+      # Tag pushes: hand the build outputs to the release jobs below. The
+      # release installer is NOT the one built above — the `package` job
+      # rebuilds it around the EV-signed service exe (and the attested
+      # driver, when one matches); this artifact carries the inputs it
+      # needs that only exist in this job (test-signed driver + cert as
+      # the fallback, devcon, the service exe to be signed).
+      - name: Upload release inputs (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-inputs
+          path: |
+            driver-cache/
+            service/target/release/stream-to-speaker.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------------
+  # Tag-push release pipeline: build → sign-service → package →
+  # sign-release. Every EV signature goes through the central signing repo
+  # (Mihonarium/signing, sign.yml) via .github/actions/request-signing:
+  # dispatch with a release-asset URL + its hash, wait for the human
+  # approval gate there, then verify + publish the signed bytes. Two
+  # approval clicks per release: the service exe, then the setup exe (the
+  # sha256 to check is shown in each signing run's name).
+  #
+  # Setup (one-time):
+  #   - Environment "request-signing" (Settings -> Environments) holding
+  #     the secret SIGNING_REPO_TOKEN: a fine-grained PAT scoped to ONLY
+  #     the signing repo, with Actions: Read and write. Nothing else.
+  #     Set the environment's "Deployment branches and tags" policy to
+  #     Selected + tag pattern `v*` + branch `main` (main is needed by
+  #     driver-submission.yml's sign-cab job; no required reviewers —
+  #     the human gate lives in the signing repo). The env-level secret
+  #     + ref policy means a workflow edited on some branch can neither
+  #     read the PAT nor dispatch signing requests; a plain repo secret
+  #     would be readable by any workflow run in this repo.
+  #   - Optionally add a tag ruleset restricting who can create v* tags.
+  #   - Unsigned bytes travel to the signing repo as Actions artifacts
+  #     (private-source mode): the signing workflow fetches them
+  #     post-approval with its FETCH_TOKEN environment secret (fine-grained
+  #     PAT, Actions: Read-only on this repo). Works with this repo private.
+  #
+  # NB the step-summary hash table printed by the build job shows the DEV
+  # (test-signed, unsigned-exe) artifacts; the .sha256 sidecars on the
+  # release assets are regenerated by these jobs and are canonical.
+  # -------------------------------------------------------------------
+
+  # EV-sign the service exe first, so the released installer CONTAINS a
+  # signed binary (better AV/firewall-prompt story than only signing the
+  # setup wrapper). The unsigned exe travels as a workflow artifact; only
+  # the signed exe ever lands on the release.
+  sign-service:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    environment: request-signing
+    timeout-minutes: 75
+    permissions:
+      contents: write
+      actions: read              # gh run download of the unsigned-exe artifact
+      id-token: write            # build-provenance attestation (public repo only)
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-inputs
+          path: release-inputs
+
+      - name: Create release + stage unsigned service exe
+        id: upload
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $name = "stream-to-speaker-${{ needs.build.outputs.version }}.exe"
+          Copy-Item "release-inputs\service\target\release\stream-to-speaker.exe" $name
+          $sha = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+          gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+              gh release create $tag --title $tag --generate-notes --verify-tag
+              if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      # The unsigned exe travels to the signing repo as a workflow artifact
+      # (private-source mode) — it is never a release asset; only the signed
+      # exe lands on the release.
+      - name: Upload unsigned service exe as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-service-exe
+          path: ${{ steps.upload.outputs.name }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Sign service exe via central signing workflow
+        id: sign
+        uses: ./.github/actions/request-signing
+        with:
+          source-run-id: ${{ github.run_id }}
+          source-artifact: unsigned-service-exe
+          expected-sha256: ${{ steps.upload.outputs.sha }}
+          output-name: ${{ steps.upload.outputs.name }}
+          sig-description: "Stream To Speaker"
+          token: ${{ secrets.SIGNING_REPO_TOKEN }}
+
+      - name: Replace release asset with the signed exe
+        shell: pwsh
+        run: |
+          $signed = "${{ steps.sign.outputs.signed-path }}"
+          "${{ steps.sign.outputs.signed-sha256 }}  $(Split-Path $signed -Leaf)" |
+              Set-Content -Path "$signed.sha256" -Encoding ascii -NoNewline
+          gh release upload "${{ github.ref_name }}" $signed "$signed.sha256" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+
+      # Provenance for the exact bytes users download (post-signing, so the
+      # digest matches the release asset). No-op while the repo is private:
+      # attestations for private repos need GitHub Enterprise Cloud, so the
+      # step is gated on visibility and lights up the day the repo goes
+      # public. Verify with:
+      #   gh attestation verify stream-to-speaker-<ver>.exe -R ${{ github.repository }}
+      - name: Attest build provenance (public repo only)
+        id: attest
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ steps.sign.outputs.signed-path }}
+
+      # Ship the Sigstore bundle beside the binary so anyone can verify
+      # offline (gh attestation verify --bundle) without querying GitHub.
+      - name: Publish the attestation bundle
+        if: ${{ !github.event.repository.private }}
+        shell: pwsh
+        run: |
+          $bundle = "$(Split-Path "${{ steps.sign.outputs.signed-path }}" -Leaf).sigstore.json"
+          Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
+          gh release upload "${{ github.ref_name }}" $bundle --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+
+  # Build the RELEASE installer: EV-signed service exe + the
+  # Microsoft-attested driver package when one matches this tag's driver
+  # source (then no test cert is shipped and the .iss skips cert import).
+  # Falls back to the test-signed driver + cert — clearly labelled
+  # `-testsigned` — when no attested driver matches, so releases still work
+  # before the first attestation round-trip.
+  package:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, sign-service]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-inputs
+          path: release-inputs
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Fetch attested driver (if one matches the driver source)
+        id: attested
+        shell: pwsh
+        run: |
+          .github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ needs.build.outputs.source_hash }}" -OutDir attested-driver
+
+      - name: Download EV-signed service exe from the release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path svc | Out-Null
+          gh release download "${{ github.ref_name }}" --pattern "stream-to-speaker-*.exe" --dir svc
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+          $exe = @(Get-ChildItem svc -Filter "stream-to-speaker-*.exe")
+          if ($exe.Count -ne 1) { throw "expected exactly one service exe asset, found $($exe.Count)" }
+          $svcExe = $exe[0].FullName
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match '\\x64\\' } |
+              Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          & $signtool verify /pa $svcExe
+          if ($LASTEXITCODE -ne 0) { throw "release service exe is not validly signed - did sign-service complete?" }
+
+      - name: Stage + build release installer
+        id: iscc
+        shell: pwsh
+        run: |
+          $staging = "installer\staging"
+          if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Get-ChildItem svc -Filter "stream-to-speaker-*.exe" |
+              Copy-Item -Destination "$staging\stream-to-speaker.exe"
+
+          $dc = "release-inputs\driver-cache"
+          $suffix = ""
+          if ("${{ steps.attested.outputs.found }}" -eq "true") {
+              foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat") {
+                  Copy-Item "attested-driver\$name" "$staging\$name" -Force
+              }
+              Copy-Item "$dc\devcon.exe" "$staging\devcon.exe" -Force
+              Write-Host "Bundling Microsoft-attested driver ${{ steps.attested.outputs.version }} (${{ steps.attested.outputs.tag }}); no test certificate shipped."
+          } else {
+              foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "StreamToSpeaker.cer", "devcon.exe") {
+                  Copy-Item "$dc\$name" "$staging\$name" -Force
+              }
+              $suffix = "-testsigned"
+              Write-Host "##[warning]No Microsoft-attested driver matches this tag's driver source - shipping the TEST-SIGNED driver (users need testsigning mode). Run the driver submission + attestation flow (docs/driver-signing.md), then tag again."
+          }
+
+          $base = "StreamToSpeakerSetup-${{ needs.build.outputs.version }}$suffix"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC not at $iscc" }
+          & $iscc `
+            "/DAppVersion=${{ needs.build.outputs.version }}" `
+            "/DVersionInfoVersion=${{ needs.build.outputs.viversion }}" `
+            "/F$base" `
+            "installer\StreamToSpeaker.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
+          "exe=installer\out\$base.exe" >> $env:GITHUB_OUTPUT
+          "name=$base.exe" >> $env:GITHUB_OUTPUT
+
+      - name: Attach installer + driver package to the release
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $exe = "${{ steps.iscc.outputs.exe }}"
+          $sha = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$sha  ${{ steps.iscc.outputs.name }}" | Set-Content -Path "$exe.sha256" -Encoding ascii -NoNewline
+          gh release upload $tag $exe "$exe.sha256" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          # The attested driver package is deliberately NOT attached here.
+          # It ships inside the installer; publishing the signed .sys as a
+          # standalone asset hands anyone a Microsoft-signed virtual audio
+          # driver to drop into their own product (see LICENSE-BINARIES.md).
+          # The driver-v* prerelease keeps its copy — CI pairs installers to
+          # it by source hash, and that release is the audit trail.
+          @(
+            "## Release packaging"
+            ""
+            "| | |"
+            "| --- | --- |"
+            "| Installer | ``${{ steps.iscc.outputs.name }}`` (pre-signing sha256 ``$sha``) |"
+            "| Driver | $( if ("${{ steps.attested.outputs.found }}" -eq "true") { "Microsoft-attested ``${{ steps.attested.outputs.version }}`` (``${{ steps.attested.outputs.tag }}``)" } else { "**test-signed fallback** - requires testsigning mode" } ) |"
+          ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+  # EV-sign the final setup exe and swap it into the release. Its .sha256
+  # sidecar (regenerated here) is the canonical download hash.
+  sign-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: windows-latest
+    environment: request-signing
+    timeout-minutes: 75
+    permissions:
+      contents: write
+      actions: read              # gh run download of the unsigned-exe artifact
+      id-token: write            # build-provenance attestation (public repo only)
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch setup exe from the release + stage for signing
+        id: asset
+        shell: pwsh
+        run: |
+          # Authenticated download — the repo is private, so the release
+          # asset URL is not fetchable by the signing workflow; the exe is
+          # re-exposed to it as a workflow artifact instead.
+          New-Item -ItemType Directory -Force -Path setup-unsigned | Out-Null
+          gh release download "${{ github.ref_name }}" --pattern "StreamToSpeakerSetup-*.exe" --dir setup-unsigned
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+          $exe = @(Get-ChildItem setup-unsigned -Filter "StreamToSpeakerSetup-*.exe")
+          if ($exe.Count -ne 1) { throw "expected exactly one setup exe asset on ${{ github.ref_name }}, found $($exe.Count)" }
+          "name=$($exe[0].Name)" >> $env:GITHUB_OUTPUT
+          "path=$($exe[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload unsigned setup exe as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-setup-exe
+          path: ${{ steps.asset.outputs.path }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Sign installer via central signing workflow
+        id: sign
+        uses: ./.github/actions/request-signing
+        with:
+          source-run-id: ${{ github.run_id }}
+          source-artifact: unsigned-setup-exe
+          output-name: ${{ steps.asset.outputs.name }}
+          sig-description: "Stream To Speaker Setup"
+          token: ${{ secrets.SIGNING_REPO_TOKEN }}
+
+      - name: Replace release asset with the signed installer
+        shell: pwsh
+        run: |
+          $signed = "${{ steps.sign.outputs.signed-path }}"
+          "${{ steps.sign.outputs.signed-sha256 }}  $(Split-Path $signed -Leaf)" |
+              Set-Content -Path "$signed.sha256" -Encoding ascii -NoNewline
+          gh release upload "${{ github.ref_name }}" $signed "$signed.sha256" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          Write-Host "Release asset replaced with the signed build (sha256 ${{ steps.sign.outputs.signed-sha256 }})"
+
+          # Stable download link. GitHub's /releases/latest/download/<name>
+          # redirect needs a FIXED file name, so publish an unversioned copy
+          # of the same bytes as well — that is the URL the README hands to
+          # users. Skipped for -testsigned fallback builds: a permanent link
+          # must never resolve to an installer that needs testsigning mode.
+          $name = Split-Path $signed -Leaf
+          if ($name -like "*-testsigned*") {
+              Write-Host "##[warning]test-signed build - not updating the stable StreamToSpeakerSetup.exe link"
+          } else {
+              Copy-Item $signed "StreamToSpeakerSetup.exe" -Force
+              "${{ steps.sign.outputs.signed-sha256 }}  StreamToSpeakerSetup.exe" |
+                  Set-Content -Path "StreamToSpeakerSetup.exe.sha256" -Encoding ascii -NoNewline
+              gh release upload "${{ github.ref_name }}" StreamToSpeakerSetup.exe StreamToSpeakerSetup.exe.sha256 --clobber
+              if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+              Write-Host "Stable link updated: releases/latest/download/StreamToSpeakerSetup.exe"
+          }
+
+      - name: Attest build provenance (public repo only)
+        id: attest
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ steps.sign.outputs.signed-path }}
+
+      # Ship the Sigstore bundle beside the binary so anyone can verify
+      # offline (gh attestation verify --bundle) without querying GitHub.
+      - name: Publish the attestation bundle
+        if: ${{ !github.event.repository.private }}
+        shell: pwsh
+        run: |
+          $bundle = "$(Split-Path "${{ steps.sign.outputs.signed-path }}" -Leaf).sigstore.json"
+          Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
+          gh release upload "${{ github.ref_name }}" $bundle --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }

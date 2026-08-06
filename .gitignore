@@ -1,0 +1,32 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Windows driver build artifacts
+driver/x64/
+driver/Debug/
+driver/Release/
+driver/*.opensdf
+driver/*.suo
+driver/*.user
+driver/.vs/
+
+# Installer output
+installer/out/
+installer/staging/
+installer/*.iss.log
+
+# CI prebuilt-driver cache (populated/restored by the build workflow)
+driver-cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Python (CI scripts)
+__pycache__/
+.github/scripts/_dl_*
+.github/scripts/*-Microsoft.zip

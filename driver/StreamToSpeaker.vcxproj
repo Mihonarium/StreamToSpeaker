@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B1F7C90E-3CFD-4B0E-A5C4-7E25A2B71F11}</ProjectGuid>
+    <RootNamespace>StreamToSpeaker</RootNamespace>
+    <!-- Driver version components. Must be defined BEFORE the
+         ItemDefinitionGroup that references them (MSBuild evaluates
+         the file top-to-bottom for property expansion in metadata).
+         DriverVersionPrefix is edited by hand for significant changes;
+         DriverBuildNumber (the revision field) is the git commit
+         count, injected by CI / build-installer.ps1 via
+         /p:DriverBuildNumber=N. -->
+    <DriverVersionPrefix Condition="'$(DriverVersionPrefix)' == ''">1.1.0</DriverVersionPrefix>
+    <DriverBuildNumber Condition="'$(DriverBuildNumber)' == ''">1</DriverBuildNumber>
+    <ProjectName>StreamToSpeaker</ProjectName>
+    <TargetVersion>Windows10</TargetVersion>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <TargetPlatformVersion>10.0.26100.0</TargetPlatformVersion>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+
+    <!-- WDK signing options. SignMode=TestSign uses the auto-generated
+         test cert; modern signtool requires an explicit file-digest
+         algorithm via /fd. -->
+    <SignMode>TestSign</SignMode>
+    <SignToolFileDigestAlgorithm>SHA256</SignToolFileDigestAlgorithm>
+    <SignToolTimestampDigestAlgorithm>SHA256</SignToolTimestampDigestAlgorithm>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <SpectreMitigation>Spectre</SpectreMitigation>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(Platform)\$(Configuration)\</IntDir>
+    <TargetName>StreamToSpeaker</TargetName>
+    <TargetExt>.sys</TargetExt>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <!-- _KERNEL_MODE, _NTDDK_, _WIN64, _AMD64_, AMD64 are provided by
+           the WindowsKernelModeDriver10.0 toolset. Don't redefine. -->
+      <PreprocessorDefinitions>NTDDI_VERSION=NTDDI_WIN10_RS5;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">DBG=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">DBG=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <BufferSecurityCheck>true</BufferSecurityCheck>
+      <!-- 4505 unreferenced local function, 4324 padding due to alignment,
+           4127 conditional expression is constant — fine.
+           5260 stdunk's "operator new will be removed soon" deprecation
+           notice (not actionable; vendor header). -->
+      <DisableSpecificWarnings>4505;4324;4127;5260</DisableSpecificWarnings>
+      <!-- C++17 aligned operator new is incompatible with our (POOL_FLAGS,
+           ULONG) placement-new convention; disable so the compiler doesn't
+           require std::align_val_t overloads. -->
+      <AdditionalOptions>/Zc:alignedNew- %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(DDK_LIB_PATH)\portcls.lib;$(DDK_LIB_PATH)\ksguid.lib;$(DDK_LIB_PATH)\stdunk.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>Native</SubSystem>
+      <Driver>WDM</Driver>
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+    </Link>
+    <Inf>
+      <!-- DriverVer stamped into the INF by stampinf and reported in
+           Device Manager → Properties → Driver. Composed of:
+             DriverVersionPrefix . DriverBuildNumber
+                ^                       ^
+                |                       └─ auto: git commit count
+                |                          (CI + build-installer.ps1
+                |                          inject /p:DriverBuildNumber=N)
+                └─ manual: bump for significant changes. Semver-ish:
+                   - 1.0.x  initial work / 0-to-1 features
+                   - 1.1.x  new feature shipped
+                   - 2.0.x  breaking IOCTL ABI / driver model change
+                   See CLAUDE.md for the discipline.
+           Without SpecifyDriverDirectiveVersion=true, the stampinf
+           MSBuild task does NOT pass -v to stampinf.exe and the
+           TimeStamp metadata is silently ignored — leaving the
+           literal DriverVer in the .inf untouched (the bug that
+           kept the installed INF stuck at "1.0.0.1" for ages). -->
+      <SpecifyDriverDirectiveVersion>true</SpecifyDriverDirectiveVersion>
+      <TimeStamp>$(DriverVersionPrefix).$(DriverBuildNumber)</TimeStamp>
+    </Inf>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="adapter.cpp" />
+    <ClCompile Include="driver.cpp" />
+    <ClCompile Include="ioctl.cpp" />
+    <ClCompile Include="newdelete.cpp" />
+    <ClCompile Include="ringbuffer.cpp" />
+    <ClCompile Include="topology.cpp" />
+    <ClCompile Include="wave.cpp" />
+    <ClCompile Include="wavestream.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="debug.h" />
+    <ClInclude Include="driver.h" />
+    <ClInclude Include="ioctl.h" />
+    <ClInclude Include="mintopo.h" />
+    <ClInclude Include="minwave.h" />
+    <ClInclude Include="ringbuffer.h" />
+    <ClInclude Include="topology.h" />
+    <ClInclude Include="wave.h" />
+    <ClInclude Include="wavestream.h" />
+    <ClInclude Include="..\include\stream_to_speaker_ioctl.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="StreamToSpeaker.inf" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+
+  <!-- =====================================================================
+       Override the WDK's TestSign target.
+
+       In WDK 10.0.26100 the built-in target invokes signtool without the
+       /fd file-digest flag, which modern signtool rejects. We replace it
+       with a direct call that passes /fd SHA256 and /a (auto-pick any
+       suitable cert in the store — the WDK's auto-generated WDKTestCert
+       fits the bill).
+       ===================================================================== -->
+  <!-- Common: resolve signtool.exe path. $(WindowsSdkVerBinPath) is
+       sometimes empty under 10.0.26100; build path explicitly. -->
+  <PropertyGroup>
+    <_SignToolExe>$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\signtool.exe</_SignToolExe>
+    <_SignToolExe Condition="!Exists('$(_SignToolExe)')">$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x86\signtool.exe</_SignToolExe>
+    <_DriverPkgDir>$(OutDir)$(TargetName)\</_DriverPkgDir>
+  </PropertyGroup>
+
+  <!-- Replace WDK's TestSign target. Signs the .sys with /fd SHA256. -->
+  <Target Name="TestSign"
+          AfterTargets="Link"
+          Condition="'$(SignMode)' == 'TestSign' AND Exists('$(OutDir)$(TargetName).sys')">
+    <Message Text="StreamToSpeaker: test-signing $(TargetName).sys via $(_SignToolExe)"
+             Importance="High" />
+    <Exec Command='"$(_SignToolExe)" sign /v /fd SHA256 /ph /a "$(OutDir)$(TargetName).sys"' />
+  </Target>
+
+  <!-- WDK's DriverPackageTarget only copies the .inf into the package
+       directory when our TestSign override is in effect. Inf2Cat fails
+       because $(TargetName).sys is missing from the package. Copy it
+       in ourselves before Inf2Cat runs. -->
+  <Target Name="StagePackageFiles"
+          BeforeTargets="Inf2Cat"
+          Condition="Exists('$(OutDir)$(TargetName).sys')">
+    <MakeDir Directories="$(_DriverPkgDir)" />
+    <Copy SourceFiles="$(OutDir)$(TargetName).sys"
+          DestinationFiles="$(_DriverPkgDir)$(TargetName).sys"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <!-- Replace WDK's catalog-signing step too. After Inf2Cat generates
+       StreamToSpeaker.cat in the package dir, sign it with /fd SHA256. -->
+  <Target Name="CatalogSign"
+          AfterTargets="Inf2Cat"
+          Condition="'$(SignMode)' == 'TestSign' AND Exists('$(_DriverPkgDir)$(TargetName).cat')">
+    <Message Text="StreamToSpeaker: test-signing $(TargetName).cat" Importance="High" />
+    <Exec Command='"$(_SignToolExe)" sign /v /fd SHA256 /a "$(_DriverPkgDir)$(TargetName).cat"' />
+  </Target>
+</Project>

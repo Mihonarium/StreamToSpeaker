@@ -1,0 +1,70 @@
+name: Driver attest
+
+# Reconciles the newest driver-v* release toward Microsoft attestation via
+# the Partner Center Hardware API (spec: docs/superpowers/specs/
+# 2026-08-05-driver-attestation-automation-design.md). Idempotent: all state
+# lives in the release's manifest.json (ms_product_id / ms_submission_id /
+# ms_state), IDs are persisted before any upload, and a re-run always resumes
+# from the recorded state — workflow_dispatch is the universal retry. All
+# logic lives in .github/scripts/attest.py; this file just runs it and then
+# hands the finished release to the verification workflow.
+#
+# Secrets: AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — the
+# Entra app associated with the Partner Center account (docs/
+# driver-signing.md, one-time setup). Client secrets expire (≤24 months);
+# the failure mode is invalid_client from the token endpoint.
+
+run-name: "Driver attest · ${{ inputs.tag || 'newest driver release' }}"
+
+on:
+  workflow_run:
+    workflows: ["Driver submission"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "driver-v* release tag (default: newest by build number)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: driver-attest
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    # On workflow_run, only act when Driver submission succeeded (its
+    # sign-cab job completed → the EV-signed CAB is on the release).
+    # Manual dispatch always runs.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    outputs:
+      verify_tag: ${{ steps.attest.outputs.verify_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests (guard)
+        run: python3 -m unittest discover -s .github/scripts
+
+      - name: Reconcile attestation state
+        id: attest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: python3 .github/scripts/attest.py
+
+  verify:
+    needs: reconcile
+    if: needs.reconcile.outputs.verify_tag != ''
+    uses: ./.github/workflows/driver-attested.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.reconcile.outputs.verify_tag }}

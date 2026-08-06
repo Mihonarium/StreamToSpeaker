@@ -1,0 +1,443 @@
+name: Driver submission
+
+# First half of the driver production-signing pipeline (runbook:
+# docs/driver-signing.md; second half: driver-attested.yml).
+#
+# On every driver-source change on main this workflow:
+#   1. builds a production (UNSIGNED) driver package — Microsoft applies the
+#      signatures that matter during attestation, and per the attestation
+#      docs any publisher embedded signature would be overwritten anyway;
+#   2. wraps inf + sys + pdb (+ cat if produced) into a Partner Center
+#      submission CAB (MakeCab, files under a StreamToSpeaker\ subdir as the
+#      dashboard requires — no files at the CAB root);
+#   3. parks the CAB + a manifest on a driver-v<version> prerelease;
+#   4. EV-signs the CAB through the central signing repo (human approval
+#      there authorizes exactly this CAB's SHA-256) and swaps the release
+#      asset for the signed CAB.
+#
+# When this workflow completes, driver-attest.yml takes over automatically:
+# it submits the EV-signed CAB to Microsoft via the Partner Center Hardware
+# API, polls, attaches the returned signed zip to the release, and runs the
+# verification in driver-attested.yml. From that point build.yml bundles the
+# attested driver into installers whenever the driver source hash still
+# matches. (Manual fallback: docs/driver-signing.md.)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'driver/**'
+      - 'include/**'
+      - '.github/workflows/driver-submission.yml'
+  workflow_dispatch:
+    inputs:
+      driver_build:
+        description: "Override the driver build number (default: git commit count)"
+        required: false
+        default: ""
+
+# A newer driver push obsoletes an in-flight submission build. Completed
+# stale prereleases are handled by the cleanup step instead. NB a cancelled
+# sign-cab job can leave a signing-repo run Waiting — reject it there (the
+# digest in its run name identifies it).
+concurrency:
+  group: driver-submission
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  # Keep in sync with build.yml — the WDK cache restore below reuses
+  # build.yml's cache entries via restore-keys.
+  WDK_INSTALLER_URL: "https://go.microsoft.com/fwlink/?linkid=2272234"
+
+jobs:
+  build-cab:
+    # Pinned for the same reason as build.yml: windows-latest (Server 2025 +
+    # VS2026/MSBuild 18) can't load WDK 26100's MSBuild-17 task DLLs.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.drvver.outputs.version }}
+      build: ${{ steps.drvver.outputs.build }}
+      tag: ${{ steps.drvver.outputs.tag }}
+      cab_name: ${{ steps.cab.outputs.name }}
+      cab_sha256: ${{ steps.cab.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history — the driver build number is `git rev-list --count
+          # HEAD`, which evaluates to 1 on a depth-1 shallow clone.
+          fetch-depth: 0
+
+      # Identity of the driver source going into this submission. Computed
+      # BEFORE driver.h is stamped with the build number, so it matches what
+      # build.yml computes on a clean checkout — that's how installer builds
+      # later pair attested binaries with the driver source they came from.
+      - name: Compute driver source hash
+        id: srchash
+        shell: pwsh
+        run: |
+          "hash=${{ hashFiles('driver/**', 'include/**') }}" >> $env:GITHUB_OUTPUT
+
+      # ----------------------------------------------------------------
+      # WDK. Restore-only: build.yml owns saving this cache; a miss here
+      # just costs the ~5 min install.
+      # ----------------------------------------------------------------
+      # The WDK tree is ~50k small files; per-file Defender scanning is the
+      # dominant cost of the cache restore (measured: 293 s restore vs 67 s
+      # driver build). Excluding the target paths before extraction is a
+      # no-op if the image has real-time protection off — the step timing
+      # of "Restore WDK cache" is the measurement either way.
+      - name: Exclude WDK paths from Defender real-time scanning
+        shell: pwsh
+        run: |
+          try {
+              Add-MpPreference -ExclusionPath `
+                  "C:\Program Files (x86)\Windows Kits", `
+                  "C:\Program Files\Microsoft Visual Studio", `
+                  "C:\Program Files (x86)\Microsoft Visual Studio" -ErrorAction Stop
+              Write-Host "Defender exclusions added"
+          } catch {
+              Write-Host "Could not add Defender exclusions ($_) - continuing"
+          }
+
+      - name: Restore WDK cache
+        id: cache-wdk
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            C:\Program Files (x86)\Windows Kits\10
+            C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\WDK
+            C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Microsoft\WDK
+            C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\WDK
+            C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\WDK
+          key: wdk-${{ env.WDK_INSTALLER_URL }}-v2-driver-submission
+          restore-keys: |
+            wdk-${{ env.WDK_INSTALLER_URL }}-v2-
+
+      - name: Install WDK (cache miss)
+        if: steps.cache-wdk.outputs.cache-hit != 'true' && steps.cache-wdk.outputs.cache-matched-key == ''
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "wdksetup.exe"
+          Write-Host "Downloading WDK from $env:WDK_INSTALLER_URL"
+          Invoke-WebRequest -Uri $env:WDK_INSTALLER_URL -OutFile $installer -UseBasicParsing
+          Write-Host "Installing WDK (silent, ~5 min)..."
+          $p = Start-Process -FilePath $installer -ArgumentList "/features", "+", "/q", "/norestart" -Wait -PassThru
+          Write-Host "WDK installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+              throw "WDK installer failed with exit $($p.ExitCode)"
+          }
+
+      # actions/cache doesn't persist the registry; recreate KitsRoot10 so
+      # MSBuild can find the toolset (same as build.yml).
+      - name: Restore WDK registry
+        shell: pwsh
+        run: |
+          $kitsRoot = "C:\Program Files (x86)\Windows Kits\10\"
+          if (-not (Test-Path $kitsRoot)) {
+              throw "Windows Kits\10\ missing after WDK install/restore"
+          }
+          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" `
+                           -Name "KitsRoot10" -Value $kitsRoot -PropertyType String -Force | Out-Null
+          New-Item -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" `
+                           -Name "KitsRoot10" -Value $kitsRoot -PropertyType String -Force | Out-Null
+          Write-Host "KitsRoot10 = $kitsRoot"
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      # ----------------------------------------------------------------
+      # Version: <DriverVersionPrefix from vcxproj>.<git commit count>,
+      # exactly like build.yml / build-installer.ps1 stamp it.
+      # ----------------------------------------------------------------
+      - name: Compute driver version
+        id: drvver
+        shell: pwsh
+        env:
+          INPUT_DRIVER_BUILD: ${{ inputs.driver_build }}
+        run: |
+          $vcxproj = Get-Content "driver/StreamToSpeaker.vcxproj" -Raw
+          if ($vcxproj -notmatch '<DriverVersionPrefix[^>]*>([\d.]+)</DriverVersionPrefix>') {
+              throw "DriverVersionPrefix not found in vcxproj"
+          }
+          $prefix = $Matches[1]
+          $count = $env:INPUT_DRIVER_BUILD
+          if ($count -and $count -notmatch '^\d+$') { throw "driver_build must be numeric, got '$count'" }
+          if (-not $count) { $count = (git rev-list --count HEAD).Trim() }
+          $version = "$prefix.$count"
+          Write-Host "Driver version: $version (prefix $prefix, build $count)"
+          "prefix=$prefix" >> $env:GITHUB_OUTPUT
+          "build=$count" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=driver-v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Stamp driver build number
+        shell: pwsh
+        run: |
+          $path = "driver/driver.h"
+          $content = Get-Content $path -Raw
+          $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${{ steps.drvver.outputs.build }}u"
+          Set-Content -Path $path -Value $new -NoNewline
+          Write-Host "Driver build stamped: ${{ steps.drvver.outputs.build }}"
+
+      - name: Build driver (Release|x64, unsigned — Microsoft signs it)
+        shell: pwsh
+        run: |
+          msbuild driver\StreamToSpeaker.sln `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:SignMode=Off `
+            /p:DriverBuildNumber=${{ steps.drvver.outputs.build }} `
+            /nologo `
+            /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) {
+              throw "msbuild failed with exit code $LASTEXITCODE"
+          }
+          $sys = Get-ChildItem -Recurse driver\x64\Release\ -Filter "StreamToSpeaker.sys" | Select-Object -First 1
+          if (-not $sys) { throw "Driver .sys not produced" }
+          # The submission must carry OUR unsigned binary; a leftover
+          # signature would mean stale bits leaked in (see the CI war story
+          # about dev-machine .sys files).
+          $sig = Get-AuthenticodeSignature $sys.FullName
+          if ($sig.Status -ne "NotSigned") {
+              throw "expected an unsigned .sys for attestation submission, got signature status $($sig.Status) (signer: $($sig.SignerCertificate.Subject))"
+          }
+
+      - name: Package submission CAB
+        id: cab
+        shell: pwsh
+        run: |
+          # Collect the package files. INF comes from the build tree so it
+          # carries the stampinf'd DriverVer.
+          $src = "submission-src"
+          New-Item -ItemType Directory -Force -Path $src | Out-Null
+          foreach ($name in "StreamToSpeaker.inf", "StreamToSpeaker.sys", "StreamToSpeaker.pdb") {
+              $f = Get-ChildItem -Path "driver\x64\Release" -Recurse -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $f) { throw "driver output $name not found" }
+              Copy-Item $f.FullName (Join-Path $src $name) -Force
+          }
+          # The dashboard regenerates catalogs; include ours when the build
+          # produced one (used for company verification only).
+          $cat = Get-ChildItem -Path "driver\x64\Release" -Recurse -Filter "StreamToSpeaker.cat" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($cat) { Copy-Item $cat.FullName (Join-Path $src "StreamToSpeaker.cat") -Force }
+
+          # The INF must actually carry this build's DriverVer.
+          $version = "${{ steps.drvver.outputs.version }}"
+          $inf = Get-Content (Join-Path $src "StreamToSpeaker.inf") -Raw
+          if ($inf -notmatch [regex]::Escape(",$version")) {
+              throw "built INF does not contain DriverVer $version - stampinf failed?"
+          }
+
+          $name = "StreamToSpeaker-Driver-$version-Submission.cab"
+          $outDir = (Resolve-Path ".").Path
+          $srcAbs = (Resolve-Path $src).Path
+          $ddfLines = @(
+              ".OPTION EXPLICIT"
+              ".Set CabinetFileCountThreshold=0"
+              ".Set FolderFileCountThreshold=0"
+              ".Set FolderSizeThreshold=0"
+              ".Set MaxCabinetSize=0"
+              ".Set MaxDiskFileCount=0"
+              ".Set MaxDiskSize=0"
+              ".Set CompressionType=MSZIP"
+              ".Set Cabinet=on"
+              ".Set Compress=on"
+              ".Set CabinetNameTemplate=$name"
+              ".Set DiskDirectory1=`"$outDir`""
+              # Partner Center requires each driver package in its own
+              # subdirectory, no files at the CAB root.
+              ".Set DestinationDir=StreamToSpeaker"
+          )
+          $ddfLines += Get-ChildItem $srcAbs | ForEach-Object { '"{0}"' -f $_.FullName }
+          $ddf = Join-Path $env:RUNNER_TEMP "submission.ddf"
+          Set-Content -Path $ddf -Value ($ddfLines -join "`r`n") -Encoding ascii
+          makecab /f $ddf
+          if ($LASTEXITCODE -ne 0) { throw "makecab failed with exit $LASTEXITCODE" }
+          $cabPath = Join-Path $outDir $name
+          if (-not (Test-Path $cabPath)) { throw "CAB not produced at $cabPath" }
+
+          $sha = (Get-FileHash $cabPath -Algorithm SHA256).Hash.ToLower()
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "path=$cabPath" >> $env:GITHUB_OUTPUT
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          @(
+            "## Driver submission CAB"
+            ""
+            "| | |"
+            "| --- | --- |"
+            "| Driver version | ``$version`` |"
+            "| CAB (pre-EV-signature) | ``$name`` |"
+            "| SHA256 | ``$sha`` |"
+            "| Source hash | ``${{ steps.srchash.outputs.hash }}`` |"
+          ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      # The signing hand-off uses this artifact (private-source mode — the
+      # repo is private, so release-asset URLs are not fetchable without
+      # auth); the release asset below is the durable record + what
+      # driver-attest.yml submits after it's EV-signed.
+      - name: Upload submission CAB as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: submission-cab
+          path: ${{ steps.cab.outputs.path }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Create driver prerelease + upload submission CAB
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.drvver.outputs.tag }}"
+          $version = "${{ steps.drvver.outputs.version }}"
+
+          @{
+              schema = 1
+              driver_version = $version
+              driver_prefix = "${{ steps.drvver.outputs.prefix }}"
+              driver_build = [int]"${{ steps.drvver.outputs.build }}"
+              commit = "${{ github.sha }}"
+              source_hash = "${{ steps.srchash.outputs.hash }}"
+              submission_cab = "${{ steps.cab.outputs.name }}"
+              submission_cab_sha256 = "${{ steps.cab.outputs.sha256 }}"
+              submission_cab_signed_sha256 = $null
+              attested = $false
+              signed_zip = $null
+              signed_zip_sha256 = $null
+          } | ConvertTo-Json | Set-Content -Path manifest.json -Encoding ascii
+
+          $notes = @(
+              "Microsoft attestation submission for driver **$version** (commit ${{ github.sha }})."
+              ""
+              "Driver source hash: ``${{ steps.srchash.outputs.hash }}``"
+              ""
+              "**Status: awaiting Microsoft attestation.** Runbook (details in ``docs/driver-signing.md``):"
+              ""
+              "1. Approve the EV-signing run for the submission CAB in the signing repo (its run name must show sha256 ``${{ steps.cab.outputs.sha256 }}``). CI then replaces the CAB asset here with the EV-signed one."
+              "2. That's it — the **Driver attest** workflow submits the signed CAB to Microsoft via the Hardware API, polls, attaches the returned zip here, verifies the signatures, and marks this driver attested. If it goes red, re-run it from the Actions tab: it resumes exactly where it left off. Manual fallback: ``docs/driver-signing.md``."
+          ) -join "`n"
+          Set-Content -Path release-notes.md -Value $notes -Encoding utf8
+
+          gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+              gh release create $tag --prerelease --target "${{ github.sha }}" `
+                  --title "Driver $version — awaiting Microsoft attestation" `
+                  --notes-file release-notes.md
+              if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }
+          gh release upload $tag "${{ steps.cab.outputs.path }}" manifest.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          Write-Host "Prerelease $tag ready (CAB not yet EV-signed)"
+
+      # Unattested submissions that a newer driver build supersedes are dead
+      # weight (their CAB was never submitted, or the submission is moot) —
+      # delete them so the release list always shows at most one pending
+      # submission. Attested releases are history of shipped driver bits and
+      # are kept forever.
+      - name: Clean up stale unattested driver prereleases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $current = [int]"${{ steps.drvver.outputs.build }}"
+          $rels = gh api "repos/${{ github.repository }}/releases?per_page=100" | ConvertFrom-Json
+          foreach ($r in @($rels | Where-Object { $_.tag_name -like "driver-v*" -and $_.tag_name -ne "${{ steps.drvver.outputs.tag }}" })) {
+              if ($r.tag_name -notmatch '^driver-v\d+\.\d+\.\d+\.(\d+)$') { continue }
+              $build = [int]$Matches[1]
+              if ($build -ge $current) { continue }
+              # Default to KEEPING a release whose manifest we cannot read —
+              # a fetch failure must never look like "safe to delete" (on a
+              # private repo an unauthenticated fetch fails for every
+              # release, attested ones included).
+              $keep = $true
+              $manAsset = $r.assets | Where-Object { $_.name -eq "manifest.json" } | Select-Object -First 1
+              if ($manAsset) {
+                  try {
+                      gh release download $r.tag_name --pattern manifest.json --output stale-manifest.json --clobber
+                      if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+                      $man = Get-Content stale-manifest.json -Raw | ConvertFrom-Json
+                      # Keep attested releases (shipped driver history) AND
+                      # releases with an in-flight Partner Center submission
+                      # (ms_* fields, written by driver-attest.yml) — deleting
+                      # one of those would strand the reconciler mid-run and
+                      # lose the record of the submission. A 'failed'
+                      # submission is safe to clean up. (There remains a
+                      # milliseconds-wide race against driver-attest's
+                      # create→persist step; losing it just orphans one
+                      # Partner Center product — the accepted junk-product
+                      # risk — and fails that run cleanly.)
+                      $inflight = ($man.PSObject.Properties.Name -contains "ms_submission_id") -and
+                                  $man.ms_submission_id -and ($man.ms_state -ne "failed")
+                      $keep = [bool]$man.attested -or $inflight
+                  } catch { }
+              }
+              if ($keep) { continue }
+              Write-Host "Deleting stale unattested prerelease $($r.tag_name)"
+              gh release delete $r.tag_name --cleanup-tag --yes
+          }
+
+  # EV-sign the submission CAB through the central signing repo. One human
+  # approval there (check the sha256 in the run name), then this job swaps
+  # the release asset for the signed CAB. NB this job runs on branch `main`,
+  # so the request-signing environment must allow main in its deployment
+  # branches policy (see docs/driver-signing.md, one-time setup).
+  sign-cab:
+    needs: build-cab
+    runs-on: windows-latest
+    environment: request-signing
+    timeout-minutes: 150
+    permissions:
+      contents: write
+      actions: read              # gh run download of the submission-cab artifact
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sign submission CAB via central signing workflow
+        id: sign
+        uses: ./.github/actions/request-signing
+        with:
+          source-run-id: ${{ github.run_id }}
+          source-artifact: submission-cab
+          expected-sha256: ${{ needs.build-cab.outputs.cab_sha256 }}
+          output-name: ${{ needs.build-cab.outputs.cab_name }}
+          sig-description: "Stream To Speaker driver attestation submission"
+          token: ${{ secrets.SIGNING_REPO_TOKEN }}
+          wait-minutes: "120"
+
+      - name: Replace release CAB with the EV-signed one
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.build-cab.outputs.tag }}"
+          $signed = "${{ steps.sign.outputs.signed-path }}"
+          $signedSha = "${{ steps.sign.outputs.signed-sha256 }}"
+          "$signedSha  $(Split-Path $signed -Leaf)" | Set-Content -Path "$signed.sha256" -Encoding ascii -NoNewline
+
+          # Record the signed CAB's hash in the manifest so the exact bytes
+          # submitted to Microsoft stay identifiable. (Authenticated fetch —
+          # unauthenticated release URLs 404 on this private repo.)
+          gh release download $tag --pattern manifest.json --output manifest.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release download of manifest.json failed" }
+          $man = Get-Content manifest.json -Raw | ConvertFrom-Json
+          $man.submission_cab_signed_sha256 = $signedSha
+          $man | ConvertTo-Json | Set-Content -Path manifest.json -Encoding ascii
+
+          gh release upload $tag $signed "$signed.sha256" manifest.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+
+          @(
+            "## Submission CAB EV-signed"
+            ""
+            "``${{ needs.build-cab.outputs.cab_name }}`` on release ``$tag`` is now the EV-signed CAB (sha256 ``$signedSha``)."
+            ""
+            "**Next (automatic):** the **Driver attest** workflow submits it to Microsoft via the Hardware API,"
+            "attaches the signed zip back onto the release, and runs verification. Watch its run in the Actions tab."
+          ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
