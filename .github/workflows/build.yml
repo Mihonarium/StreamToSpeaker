@@ -607,10 +607,22 @@ jobs:
       # public. Verify with:
       #   gh attestation verify stream-to-speaker-<ver>.exe -R ${{ github.repository }}
       - name: Attest build provenance (public repo only)
+        id: attest
         if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: ${{ steps.sign.outputs.signed-path }}
+
+      # Ship the Sigstore bundle beside the binary so anyone can verify
+      # offline (gh attestation verify --bundle) without querying GitHub.
+      - name: Publish the attestation bundle
+        if: ${{ !github.event.repository.private }}
+        shell: pwsh
+        run: |
+          $bundle = "$(Split-Path "${{ steps.sign.outputs.signed-path }}" -Leaf).sigstore.json"
+          Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
+          gh release upload "${{ github.ref_name }}" $bundle --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
 
   # Build the RELEASE installer: EV-signed service exe + the
   # Microsoft-attested driver package when one matches this tag's driver
@@ -788,7 +800,19 @@ jobs:
           Write-Host "Release asset replaced with the signed build (sha256 ${{ steps.sign.outputs.signed-sha256 }})"
 
       - name: Attest build provenance (public repo only)
+        id: attest
         if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: ${{ steps.sign.outputs.signed-path }}
+
+      # Ship the Sigstore bundle beside the binary so anyone can verify
+      # offline (gh attestation verify --bundle) without querying GitHub.
+      - name: Publish the attestation bundle
+        if: ${{ !github.event.repository.private }}
+        shell: pwsh
+        run: |
+          $bundle = "$(Split-Path "${{ steps.sign.outputs.signed-path }}" -Leaf).sigstore.json"
+          Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
+          gh release upload "${{ github.ref_name }}" $bundle --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
