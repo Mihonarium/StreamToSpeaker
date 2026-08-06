@@ -36,6 +36,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write            # build-provenance attestation (public repo only)
+  attestations: write
 
 jobs:
   verify:
@@ -203,3 +205,14 @@ jobs:
             "Installer builds on main (and tag releases) now bundle this driver automatically"
             "as long as ``driver/**`` + ``include/**`` still hash to the manifest's source_hash."
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      # Provenance for the canonical driver package (bytes are final here).
+      # No-op while the repo is private — attestations on private repos
+      # need GitHub Enterprise Cloud; this lights up automatically the day
+      # the repo goes public. Verify with:
+      #   gh attestation verify StreamToSpeaker-Driver-<ver>-Signed.zip -R Mihonarium/StreamToSpeaker
+      - name: Attest build provenance (public repo only)
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ steps.verify.outputs.zip_name }}
