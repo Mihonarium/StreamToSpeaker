@@ -1558,7 +1558,7 @@ impl App {
         }
         let iface = self.config.ssdp_iface;
         let app = self.clone();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("stream-to-speaker-rescan".to_string())
             .spawn(move || {
                 match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
@@ -1581,8 +1581,14 @@ impl App {
                     }
                 }
                 app.rescan_in_flight.store(false, Ordering::Release);
-            })
-            .ok();
+            });
+        if let Err(e) = spawned {
+            // If the thread never started, nothing will clear the
+            // in-flight flag — reset it here or every later rescan
+            // would no-op at the swap guard above.
+            self.rescan_in_flight.store(false, Ordering::Release);
+            self.record_error(format!("Couldn't start speaker scan: {}", e));
+        }
     }
 
     /// Resync — drop the speaker's accumulated prebuffer.
