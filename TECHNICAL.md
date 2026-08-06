@@ -140,58 +140,9 @@ For *ongoing* drift between the Windows clock and the speaker's audio crystal (t
 
 ## CLI flags
 
-```
---headless                Disable the GUI; run as a CLI service.
---no-tray                 GUI window only, no system-tray icon.
---web                     Enable the HTTP/JSON API + web UI at the bound port.
-                          Off by default — when off, only /stream.raw is served.
+Listed in the [README](README.md#cli-flags).
 
---source <auto|driver|wasapi-loopback|sine>
-                          Audio input. Default 'auto' tries the kernel driver,
-                          falls back to WASAPI loopback (cpal) if not present.
 
---player <name-or-ip>     Speaker target. Substring match against friendly
-                          name, or an IPv4 literal. Omit to use the GUI picker
-                          (or the interactive terminal picker in --headless).
---no-interactive          Skip the terminal picker even in a TTY (Windows-service mode).
---list-speakers           Print discovered speakers and exit.
---no-discovery            Skip SSDP entirely; only serve HTTP.
-
---port <N>                TCP port for /stream.raw and (if --web) the API. Default 5901.
---bind <ip>               HTTP bind address. Default 0.0.0.0.
---advertise-ip <ip>       What IP to put in the stream URI we send to the
-                          speaker. Defaults to the first non-loopback IPv4.
-
---initial-buffer-ms <N>   DIDL prebuffer hint sent to the speaker (default 50).
-                          Sonos generally ignores this; tune via the runtime
-                          adjust knobs instead.
-
---silence-pace-ms <N>     Wall-clock ms between silence packets while the
-                          Windows audio engine is paused. Default 10
-                          (= real-time). Higher = under-produces during
-                          silence, draining the speaker's prebuffer between
-                          tracks so post-pause latency is smaller.
-                          Useful range 12-25; >30 risks underrun.
-
---rate-fudge-ppm <N>      Steady-state clock-skew compensation. See above.
-                          Default 0 (no compensation).
-
---latency-adjust-step-frames <N>
-                          Maximum frames added/dropped per audio packet when
-                          servicing a /api/latency/adjust request. Default 4
-                          (≈ 0.09 ms per packet). Higher = snappier adjusts
-                          at the cost of more audible clicks.
-
---no-silence-injection    Don't replace silent packets with a low-noise floor.
-                          Default: inject ~|4|-peak white noise after 500 ms
-                          of silence so Sonos doesn't decide the stream died
-                          and disconnect.
---silence-packets-threshold <N>
-                          Consecutive silent packets before quiescence kicks in.
-
---ssdp-interval <N>       Minutes between SSDP re-discoveries. Default 5.
---log-level <level>       error / warn / info / debug / trace. Default info.
-```
 
 ## Web UI / HTTP API (opt-in)
 
