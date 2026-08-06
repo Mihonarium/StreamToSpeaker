@@ -6,43 +6,29 @@
 
 Play your PC's sound on real speakers anywhere in the house.
 
-Stream To Speaker adds a virtual audio device to Windows and streams whatever
-plays through it to a network speaker — **UPnP / OpenHome** (Sonos, IKEA
-SYMFONISK, KEF, Denon HEOS, MoOde, Volumio, and anything else that speaks UPnP
-AVTransport or OpenHome) or **AirPlay** (AirPort Express, shairport-sync, and
-AirPlay 2 devices such as HomePod). Speakers from both protocols appear in one
-list. Windows volume stays in sync with the speaker's own buttons, in both
-directions.
+Stream To Speaker adds a virtual audio output to Windows and streams it to
+network speakers: **UPnP / OpenHome** (Sonos, IKEA SYMFONISK, KEF, Denon
+HEOS, MoOde, Volumio, …) and **AirPlay** (HomePod, AirPort Express,
+shairport-sync, …). Windows volume and the speaker's own buttons stay in
+sync.
 
 ## Install
 
-1. **[⬇ Download Stream To Speaker](https://github.com/Mihonarium/StreamToSpeaker/releases/latest/download/StreamToSpeakerSetup.exe)**
-   and run it.
-2. That's it. No test-signing mode, no Secure Boot changes — the driver is
-   Microsoft-signed.
-
-**Requirements:** Windows 10 1809+ or Windows 11, 64-bit, and a speaker on
-your network that speaks UPnP/OpenHome or AirPlay. (Windows Server is not
-supported — attestation-signed drivers don't load there.)
+**[⬇ Download](https://github.com/Mihonarium/StreamToSpeaker/releases/latest/download/StreamToSpeakerSetup.exe)**
+and run it. Needs Windows 10 1809+ / Windows 11, 64-bit (not Windows Server).
 
 ## Use
 
-1. Set **Stream To Speaker** as your Windows audio output (taskbar speaker
-   icon → output picker) — or route just one app to it via the Volume Mixer.
-2. Pick a speaker from the list in the app window. Audio starts immediately.
-3. If sound and video drift apart, use the latency buttons (**−25 / −100 ms**
-   drain, **+25 / +100 ms** pad) or press **Resync** for a fresh start.
+1. Set **Stream To Speaker** as the Windows audio output — or route a single
+   app to it in the Volume Mixer.
+2. Pick a speaker in the app.
 
-Closing the window minimises to the tray; the tray menu has quick controls
-and **Quit**. Keyboard shortcuts: `Ctrl+E` enable/disable, `Ctrl+R` rescan,
-`Ctrl+Shift+R` resync.
+If sound lags behind video, the **−25 / −100 ms** buttons drain the delay;
+**Resync** (`Ctrl+Shift+R`) restarts the stream fresh. No sound at all →
+**Audio not working? Resync**. Speaker missing from the list → **↻ Rescan**,
+and check it's on the same network as the PC.
 
-### If something misbehaves
-
-- **It says streaming, but there's no sound** → **Audio not working? Resync**
-  in the status panel (or `Ctrl+Shift+R`).
-- **No speakers in the list** → press **↻ Rescan**; check the speaker is on
-  the same network/VLAN as the PC.
+Closing the window minimises to the tray; quit from the tray menu.
 
 ## CLI flags
 
@@ -99,41 +85,24 @@ and **Quit**. Keyboard shortcuts: `Ctrl+E` enable/disable, `Ctrl+R` rescan,
 --log-level <level>       error / warn / info / debug / trace. Default info.
 ```
 
-## Verifying your download
-
-Every released binary carries a GitHub build-provenance attestation: proof
-that these exact bytes came out of this repository's workflow, at a specific
-commit — not from someone's laptop. The code-signing certificate says *who*
-published a file; the attestation says *what it was built from*.
+## Verifying a download
 
 ```
 gh attestation verify StreamToSpeakerSetup.exe -R Mihonarium/StreamToSpeaker
 ```
 
-Verifying the installer covers everything inside it. Each release also ships
-a Sigstore bundle (`<file>.sigstore.json`) for offline verification with
-`--bundle`. The driver additionally carries Microsoft's attestation
-signature, which is what lets it load with Secure Boot on.
+proves the file was built by this repository's CI from a specific commit.
+Offline: `--bundle <file>.sigstore.json`, shipped with every release.
 
-## For developers
+## Developers
 
-Architecture, building from source, CLI flags, the HTTP API, latency
-internals, CI, and the repo layout live in **[TECHNICAL.md](TECHNICAL.md)**.
-The driver signing/attestation pipeline is documented in
-[docs/driver-signing.md](docs/driver-signing.md).
+Architecture, building from source, HTTP API: [TECHNICAL.md](TECHNICAL.md).
+Driver signing pipeline: [docs/driver-signing.md](docs/driver-signing.md).
 
 ## License
 
-**Source: [MPL-2.0](LICENSE)** — use it, fork it, ship it inside proprietary
-software if you like; changes to *these files* come back to the commons.
+Source [MPL-2.0](LICENSE). Released binaries: free to install and use,
+no redistribution or modification — [LICENSE-BINARIES.md](LICENSE-BINARIES.md).
 
-**Released binaries: [all rights reserved](LICENSE-BINARIES.md)** — install
-and use them freely, but don't redistribute or modify them. They carry our
-code-signing certificate and the driver's Microsoft attestation signature,
-which stand for our identity and a paid, audited process; the code behind
-them is open, our signatures are not. Want to ship a build? Build from source
-and sign it yourself, or ask us.
-
-Driver scaffold derives from Microsoft's sysvad sample (MIT); service borrows
-UPnP/SSDP patterns from [swyh-rs](https://github.com/dheijl/swyh-rs) (MIT).
-Thanks to both projects — their notices are retained in the files concerned.
+Driver scaffold derives from Microsoft's sysvad sample (MIT); UPnP/SSDP
+patterns from [swyh-rs](https://github.com/dheijl/swyh-rs) (MIT).
