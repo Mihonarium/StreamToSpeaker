@@ -1745,19 +1745,66 @@ impl StreamToSpeakerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                let r = if label == "Enable streaming" {
-                                    primary_button(ui, p, label, 140.0)
-                                } else {
-                                    secondary_button(ui, p, label, 140.0)
-                                }
-                                .on_hover_text(tip);
-                                if r.clicked() {
-                                    if let Err(e) = self.app.set_streaming_enabled(!enabled) {
-                                        self.app.record_error(
-                                            format!("Couldn't change streaming state: {}", e),
+                                ui.vertical(|ui| {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let r = if label == "Enable streaming" {
+                                                primary_button(ui, p, label, 140.0)
+                                            } else {
+                                                secondary_button(ui, p, label, 140.0)
+                                            }
+                                            .on_hover_text(tip);
+                                            if r.clicked() {
+                                                if let Err(e) =
+                                                    self.app.set_streaming_enabled(!enabled)
+                                                {
+                                                    self.app.record_error(format!(
+                                                        "Couldn't change streaming state: {}",
+                                                        e
+                                                    ));
+                                                }
+                                            }
+                                        },
+                                    );
+                                    // First-aid affordance. Resync is the fix
+                                    // for the most common complaint ("it says
+                                    // streaming but I hear nothing"), and it
+                                    // used to live only in Advanced and the
+                                    // tray menu — the two places a confused
+                                    // user is least likely to look. Only shown
+                                    // while streaming is enabled: with it off,
+                                    // silence is expected and Enable is the
+                                    // answer, not a resync.
+                                    if enabled {
+                                        ui.add_space(sp::XS);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if link_button(ui, p, "Resync", 72.0)
+                                                    .on_hover_text(
+                                                        "Stop and restart the speaker session. \
+                                                         Causes a brief click but clears silence, \
+                                                         stutter or drift. (Ctrl+Shift+R)",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    if let Err(e) = self.app.resync() {
+                                                        self.app.record_error(format!(
+                                                            "Resync failed: {}",
+                                                            e
+                                                        ));
+                                                    }
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new("Audio not working?")
+                                                        .size(11.0)
+                                                        .color(p.text_secondary),
+                                                );
+                                            },
                                         );
                                     }
-                                }
+                                });
                             },
                         );
                     }
