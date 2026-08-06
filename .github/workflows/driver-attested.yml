@@ -36,6 +36,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write            # build-provenance attestation (public repo only)
+  attestations: write
 
 jobs:
   verify:
@@ -224,3 +226,28 @@ jobs:
             "Installer builds on main (and tag releases) now bundle this driver automatically"
             "as long as ``driver/**`` + ``include/**`` still hash to the manifest's source_hash."
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      # Provenance for the canonical driver package (bytes are final here).
+      # No-op while the repo is private — attestations on private repos
+      # need GitHub Enterprise Cloud; this lights up automatically the day
+      # the repo goes public. Verify with:
+      #   gh attestation verify StreamToSpeaker-Driver-<ver>-Signed.zip -R Mihonarium/StreamToSpeaker
+      - name: Attest build provenance (public repo only)
+        id: attest
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ steps.verify.outputs.zip_name }}
+
+      # Ship the Sigstore bundle beside the package so anyone can verify
+      # offline (gh attestation verify --bundle) without querying GitHub.
+      - name: Publish the attestation bundle
+        if: ${{ !github.event.repository.private }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $bundle = "${{ steps.verify.outputs.zip_name }}.sigstore.json"
+          Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
+          gh release upload "${{ steps.rel.outputs.tag }}" --repo "${{ github.repository }}" $bundle --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }

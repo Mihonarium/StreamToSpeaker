@@ -6,6 +6,32 @@ The virtual device shows up as **"Stream To Speaker"** in Windows Sound Settings
 
 Ships with a native GUI window plus a system-tray icon for quick controls — speaker picker, drain/pad latency buttons, enable/disable toggle, hard-resync. The headless CLI service is still there behind `--headless` for Windows-service installs.
 
+## Verifying your download
+
+Every released binary carries a GitHub build-provenance attestation: proof that
+these exact bytes came out of this repository's public workflow, at a specific
+commit — not from someone's laptop. The code-signing certificate says *who*
+published a file; the attestation says *what it was built from*.
+
+```
+gh attestation verify StreamToSpeakerSetup-<version>.exe -R Mihonarium/StreamToSpeaker
+```
+
+Verifying the installer covers everything inside it — service and driver alike
+are part of the attested bytes. Each release also ships the Sigstore bundle
+(`<file>.sigstore.json`) next to the binary, so you can verify offline:
+
+```
+gh attestation verify StreamToSpeakerSetup-<version>.exe \
+  --bundle StreamToSpeakerSetup-<version>.exe.sigstore.json \
+  -R Mihonarium/StreamToSpeaker
+```
+
+The kernel driver additionally carries Microsoft's attestation signature — it
+is submitted to the Partner Center hardware dashboard by CI and signed by the
+*Microsoft Windows Hardware Compatibility Publisher*, which is what lets it
+load on stock Windows with Secure Boot enabled.
+
 ## Architecture
 
 ```
