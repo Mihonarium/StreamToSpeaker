@@ -693,16 +693,12 @@ jobs:
           "$sha  ${{ steps.iscc.outputs.name }}" | Set-Content -Path "$exe.sha256" -Encoding ascii -NoNewline
           gh release upload $tag $exe "$exe.sha256" --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
-          if ("${{ steps.attested.outputs.found }}" -eq "true") {
-              # Ship the attested driver package on the app release too so a
-              # manual/driver-only install doesn't need to hunt for the
-              # driver-v* prerelease.
-              $zip = "${{ steps.attested.outputs.zip }}"
-              $zsha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-              "$zsha  $(Split-Path $zip -Leaf)" | Set-Content -Path "$zip.sha256" -Encoding ascii -NoNewline
-              gh release upload $tag $zip "$zip.sha256" --clobber
-              if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
-          }
+          # The attested driver package is deliberately NOT attached here.
+          # It ships inside the installer; publishing the signed .sys as a
+          # standalone asset hands anyone a Microsoft-signed virtual audio
+          # driver to drop into their own product (see LICENSE-BINARIES.md).
+          # The driver-v* prerelease keeps its copy — CI pairs installers to
+          # it by source hash, and that release is the audit trail.
           @(
             "## Release packaging"
             ""

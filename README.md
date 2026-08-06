@@ -294,4 +294,16 @@ L16 PCM, 44.1 kHz, stereo only. Wire MIME `audio/L16;rate=44100;channels=2` (we 
 
 ## License
 
-MIT. Driver scaffold derives from Microsoft's sysvad sample (MIT); service borrows UPnP/SSDP patterns from [swyh-rs](https://github.com/dheijl/swyh-rs) (MIT). Thanks to both projects.
+**Source: [MPL-2.0](LICENSE)** — use it, fork it, ship it inside proprietary
+software if you like; changes to *these files* come back to the commons.
+
+**Released binaries: [all rights reserved](LICENSE-BINARIES.md)** — install and
+use them freely, but don't redistribute or modify them. They carry our
+code-signing certificate and the driver's Microsoft attestation signature,
+which stand for our identity and a paid, audited process; the code behind them
+is open, our signatures are not. Want to ship a build? Build from source and
+sign it yourself, or ask us.
+
+Driver scaffold derives from Microsoft's sysvad sample (MIT); service borrows
+UPnP/SSDP patterns from [swyh-rs](https://github.com/dheijl/swyh-rs) (MIT).
+Thanks to both projects — their notices are retained in the files concerned.
