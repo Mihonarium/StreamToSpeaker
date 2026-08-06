@@ -1,0 +1,50 @@
+Stream To Speaker - License
+===========================
+
+Two sets of terms apply: one to the signed program files this installer
+puts on your machine, and one to the source code they were built from.
+
+
+THE INSTALLED PROGRAM FILES
+
+Copyright (c) 2026 Stream To Speaker contributors. All rights reserved.
+
+You may install and use Stream To Speaker freely - for any purpose,
+personal or commercial, on any number of machines.
+
+You may not redistribute the installer or the installed files (mirror,
+re-host, or bundle them into another installer, package, or product),
+and you may not modify them or reuse their signatures or catalog files.
+That is because they carry our code-signing certificate and a Microsoft
+attestation signature for the kernel driver; those signatures identify
+us, so they only belong on builds we made. Full terms:
+https://github.com/Mihonarium/StreamToSpeaker/blob/main/LICENSE-BINARIES.md
+
+The name "Stream To Speaker" and our logos are reserved; do not use
+them to identify your own builds or products.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. TO THE
+MAXIMUM EXTENT PERMITTED BY LAW, THE AUTHORS ACCEPT NO LIABILITY FOR
+ANY DAMAGES ARISING FROM ITS USE.
+
+
+THE SOURCE CODE
+
+Stream To Speaker is open source. The complete source code these
+binaries were built from is available, at no charge, under the Mozilla
+Public License 2.0 at:
+
+    https://github.com/Mihonarium/StreamToSpeaker
+
+Under the MPL you may read, modify, and build the source and distribute
+your own builds. License text: https://mozilla.org/MPL/2.0/
+
+
+THIRD-PARTY CODE
+
+  - The virtual audio driver derives from Microsoft's "sysvad" sample
+    driver, used under the MIT License.
+  - UPnP/SSDP discovery and streaming patterns derive from swyh-rs
+    (https://github.com/dheijl/swyh-rs), used under the MIT License.
+  - The installer bundles devcon.exe, a Windows Driver Kit
+    redistributable, under the MIT License.
