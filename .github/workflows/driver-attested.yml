@@ -67,7 +67,7 @@ jobs:
                   try {
                       # Authenticated fetch (private repo); assets can be
                       # octet-stream, so download + parse.
-                      gh release download $r.tag_name --pattern manifest.json --output candidate-manifest.json --clobber
+                      gh release download $r.tag_name --repo $repo --pattern manifest.json --output candidate-manifest.json --clobber
                       if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
                       $m = Get-Content candidate-manifest.json -Raw | ConvertFrom-Json
                   } catch { continue }
@@ -86,7 +86,7 @@ jobs:
           $version = $Matches[1]
 
           New-Item -ItemType Directory -Force -Path assets | Out-Null
-          gh release download $tag --dir assets
+          gh release download $tag --repo $repo --dir assets
           if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
           Get-ChildItem assets | ForEach-Object { Write-Host "  asset: $($_.Name)" }
 
@@ -186,9 +186,9 @@ jobs:
           $man | Add-Member -NotePropertyName ms_zip_asset -NotePropertyValue "${{ steps.rel.outputs.ms_zip_name }}" -Force
           $man | ConvertTo-Json | Set-Content -Path manifest.json -Encoding ascii
 
-          gh release upload $tag "${{ steps.verify.outputs.zip_name }}" "${{ steps.verify.outputs.zip_name }}.sha256" manifest.json --clobber
+          gh release upload $tag --repo "${{ github.repository }}" "${{ steps.verify.outputs.zip_name }}" "${{ steps.verify.outputs.zip_name }}.sha256" manifest.json --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
-          gh release edit $tag --title "Driver $version — Microsoft-attested"
+          gh release edit $tag --repo "${{ github.repository }}" --title "Driver $version — Microsoft-attested"
           if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
 
           @(
