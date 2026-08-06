@@ -43,6 +43,7 @@ jobs:
       - name: "Test A: distro osslsigncode (noble, 2.8)"
         run: |
           set -euo pipefail
+          sudo apt-get update -qq > /dev/null 2>&1 || true
           sudo apt-get install -y -qq osslsigncode gdb > /dev/null
           osslsigncode --version || true
           ulimit -c unlimited
@@ -67,7 +68,7 @@ jobs:
       - name: "Test B: current osslsigncode master (built from source)"
         run: |
           set -euo pipefail
-          sudo apt-get install -y -qq cmake libssl-dev zlib1g-dev > /dev/null
+          sudo apt-get install -y -qq cmake libssl-dev zlib1g-dev > /dev/null 2>&1 || { sudo apt-get update -qq > /dev/null; sudo apt-get install -y -qq cmake libssl-dev zlib1g-dev > /dev/null; }
           git clone -q --depth 1 https://github.com/mtrojnar/osslsigncode osslsrc
           cmake -S osslsrc -B osslbuild -DCMAKE_BUILD_TYPE=Release > /dev/null
           cmake --build osslbuild -j > /dev/null
