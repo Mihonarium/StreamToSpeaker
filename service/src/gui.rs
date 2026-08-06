@@ -1224,6 +1224,7 @@ impl eframe::App for StreamToSpeakerApp {
                             self.show_status_banner(ui, &p);
                             banner_bottom_px = ui.cursor().top();
                             self.show_error_banner(ui, &p);
+                            self.show_donation_banner(ui, &p);
                             ui.add_space(sp::M);
                             // Show onboarding regardless of whether a
                             // speaker is currently bound, until the
@@ -1900,6 +1901,61 @@ impl StreamToSpeakerApp {
                         |ui| {
                             if link_button(ui, p, "Dismiss", 80.0).clicked() {
                                 self.app.dismiss_error();
+                            }
+                        },
+                    );
+                });
+            });
+    }
+
+    /// Donation ask. Shown on launch until the user either follows the
+    /// link or asks to be reminded later; both choices persist, so it is
+    /// never the same nag twice in one week. Deliberately a quiet strip
+    /// rather than a modal — it must never stand between the user and
+    /// the speaker list.
+    fn show_donation_banner(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        if !self.app.should_show_donation_prompt() {
+            return;
+        }
+        ui.add_space(sp::XS);
+        egui::Frame::none()
+            .fill(p.accent_subtle)
+            .rounding(RADIUS_SURFACE)
+            .inner_margin(egui::Margin::symmetric(sp::M, sp::S))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("☕").size(15.0),
+                    );
+                    ui.add_space(sp::XS);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Stream To Speaker is free and open source. \
+                                 Donate to support its development.",
+                            )
+                            .color(p.text_on_accent_subtle),
+                        );
+                    });
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if secondary_button(ui, p, "Not now", 84.0)
+                                .on_hover_text("Hide this for a week.")
+                                .clicked()
+                            {
+                                self.app.snooze_donation_prompt(7);
+                            }
+                            if primary_button(ui, p, "Donate", 96.0)
+                                .on_hover_text("Opens buymeacoffee.com/ms00 in your browser. Any amount, one-off or monthly.")
+                                .clicked()
+                            {
+                                let _ = open_url("https://buymeacoffee.com/ms00");
+                                // We can't tell whether a donation actually
+                                // happened, so anyone who clicks through is
+                                // left alone for a year rather than asked
+                                // again next week.
+                                self.app.snooze_donation_prompt(365);
                             }
                         },
                     );

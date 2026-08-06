@@ -29,6 +29,14 @@ pub struct UserConfig {
     /// preference into the same store.
     #[serde(default)]
     pub always_minimise_to_tray: bool,
+    /// Unix seconds until which the donation prompt stays hidden.
+    /// `None` = never shown yet (show it). Set 7 days out by "Remind me
+    /// later", and far out once the user has followed the donate link —
+    /// we can't know whether they actually donated, so the honest
+    /// assumption is that anyone who clicked through shouldn't be asked
+    /// again for a long while.
+    #[serde(default)]
+    pub donation_prompt_hidden_until: Option<u64>,
     /// Whether to auto-reconnect to `last_speaker_id` on launch.
     /// `true` (default) preserves the prior behaviour. `false` lets
     /// a user keep their saved speaker remembered (so the GUI knows
