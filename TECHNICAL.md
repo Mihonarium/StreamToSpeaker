@@ -1,8 +1,8 @@
 # Stream To Speaker — technical documentation
 
-How it works, how to build it, and every knob it exposes. For download and
-day-to-day use, see the [README](README.md). For the driver signing and
-Microsoft-attestation pipeline, see [docs/driver-signing.md](docs/driver-signing.md).
+How it works and how to build it. Install and use: [README](README.md).
+Flags: [README](README.md#cli-flags). Driver signing pipeline:
+[docs/driver-signing.md](docs/driver-signing.md).
 
 ## Architecture
 
@@ -28,235 +28,197 @@ Microsoft-attestation pipeline, see [docs/driver-signing.md](docs/driver-signing
 ┌────────────────────────────┐
 │ stream-to-speaker.exe      │   silence detect, noise floor,
 │  (Rust, MMCSS Pro Audio)   │   rate-fudge, runtime latency adjust,
-│                            │   SSDP discovery + UPnP control plane
+│                            │   discovery + control plane
 └──────────────┬─────────────┘
-               │ HTTP GET /stream.raw  (audio/wav, fake content-length)
+               │ UPnP: HTTP GET /stream.raw   AirPlay: RTSP + RTP
                ▼
 ┌────────────────────────────┐
-│ UPnP/OpenHome speaker      │   ~100-300 ms prebuffer (speaker side)
+│ Speaker                    │   ~100-300 ms prebuffer (speaker side)
 └────────────────────────────┘
 ```
 
-End-to-end latency target on wired ethernet: ~150-300 ms, tuneable at runtime (see below).
+End-to-end latency on wired ethernet: ~150-300 ms, tuneable at runtime.
 
-## Building and running from source
+## Build prerequisites
 
-> The steps below build an **unsigned** driver, which needs test-signing
-> mode. Released builds are Microsoft-attestation-signed and need none of
-> this — see the [README](README.md) to just install one.
+- **Driver**: VS 2022 Build Tools (or EWDK) + WDK 10.0.22621+. See
+  `driver/README.md`.
+- **Service**: Rust 1.74+ stable.
+- **Installer** (optional): [Inno Setup 6](https://jrsoftware.org/isdl.php).
+
+## Building from source
+
+A locally built driver is unsigned, so the machine needs test-signing mode
+with Secure Boot and HVCI off. Released drivers are Microsoft-signed and
+need none of this — [docs/driver-signing.md](docs/driver-signing.md) covers
+the pipeline that produces them.
 
 ```powershell
-# One-time: enable test-signed drivers (driver isn't WHQL-signed yet)
 bcdedit /set testsigning on
 shutdown /r /t 0
+# Secure Boot and Core isolation → Memory integrity must both be off.
 
-# After reboot, verify Secure Boot is OFF and HVCI / Memory Integrity is OFF
-# (Windows Security → Device Security → Core isolation → off)
-
-# Build + install the driver
 cd driver
 msbuild StreamToSpeaker.sln /p:Configuration=Release /p:Platform=x64
 pnputil /add-driver StreamToSpeaker.inf /install
-# Driver is now installed. Confirm in Device Manager → Sound, video and game controllers.
-# You should also see "Stream To Speaker" in Sound Settings.
 
-# Build + run
 cd ..\service
 cargo build --release
 .\target\release\stream-to-speaker.exe
 ```
 
-Default behaviour: opens the GUI window and adds a system-tray icon. Pick a speaker in the list — audio starts flowing immediately. Closing the window minimises to tray; only the tray menu's **Quit** actually exits.
+`pnputil /add-driver` only stages an upgrade: reboot, or disable and re-enable
+the device in Device Manager. The service log line
+`StreamToSpeaker driver opened (proto=1 build=N ...)` confirms which build is
+live — `N` bumps on every shipped binary.
 
-If you upgrade the driver later, `pnputil /add-driver` only stages the new binary. Either reboot, or in Device Manager → Stream To Speaker → right-click → Disable, then Enable. Confirm the new build is live by looking at the service log: `StreamToSpeaker driver opened (proto=1 build=N ...)` — the `build` number bumps on every shipped binary.
-
-### "Internal AUX Jack — Stream To Speaker" instead of just "Stream To Speaker"
-
-Windows caches the user-visible endpoint name in the registry the first time an endpoint is enrolled, and the cache survives reinstalls. Fresh installs of the current driver get "Stream To Speaker" from the INF; upgrades over a pre-existing install keep the old cached name until you overwrite it (same registry slot the Sound Settings "Rename" button uses).
-
-A one-line PowerShell fix is in `scripts/Rename-Endpoint.ps1`:
+### Building the installer
 
 ```powershell
-# Run elevated (modifies HKLM):
-.\scripts\Rename-Endpoint.ps1
-# Or with a custom display name:
-.\scripts\Rename-Endpoint.ps1 -Name "Sonos Picture Frame"
+.\installer\build-installer.ps1                          # driver + service + installer
+.\installer\build-installer.ps1 -SkipDriver              # re-package only
+.\installer\build-installer.ps1 -Version 0.1.0-rc.1
 ```
 
-The same logic should be a post-install step in any installer that ships this project.
+Output: `installer\out\StreamToSpeakerSetup-<version>.exe`. It installs the
+service to `Program Files`, stages the driver with `pnputil /add-driver
+/install`, runs `scripts\Rename-Endpoint.ps1`, and optionally adds Start Menu,
+desktop and autostart entries. Uninstall removes the driver via
+`Uninstall-Driver.ps1` and deletes the install directory.
+
+### Endpoint named "Internal AUX Jack — Stream To Speaker"
+
+Windows caches an endpoint's display name in the registry on first enrolment
+and keeps it across reinstalls, so upgrades over an older install show the
+stale name. `scripts\Rename-Endpoint.ps1`, run elevated, overwrites it
+(`-Name` sets a custom one). The installer does this automatically.
 
 ## Modes
 
-By default the binary launches as a GUI app with a system-tray icon. Other modes via flags:
+| Flag | Behaviour |
+|---|---|
+| *(none)* | GUI window + tray. Closing the window minimises to tray. |
+| `--no-tray` | GUI only. Closing the window exits. |
+| `--headless` | No GUI; speaker via `--player` or the terminal picker. For service installs and SSH. |
+| `--web` | Adds the HTTP/JSON API and web UI. Combines with any mode. |
 
-| Flag         | Behaviour                                                              |
-|--------------|------------------------------------------------------------------------|
-| *(none)*     | Native GUI window + system tray. Closing the window minimises to tray. |
-| `--no-tray`  | GUI window only, no tray icon. Closing the window exits the process.   |
-| `--headless` | No GUI. Pick a speaker via `--player` or the interactive terminal picker. Used for Windows-service installs and SSH sessions. |
-| `--web`      | Enables the HTTP/JSON API and the web UI at `http://<host>:<port>/`. Off by default — the management endpoints are not exposed on the LAN unless you pass this. Can be combined with any mode. |
-
-The audio stream itself (`/stream.raw`) is always served — the speaker pulls from it — but `/`, `/api/speakers`, `/api/select`, `/api/latency/adjust`, `/api/resync` only exist when `--web` is on.
+`/stream.raw` is always served — the speaker pulls from it. The management
+endpoints exist only under `--web`.
 
 ## Speaker selection
 
-Four ways to pick a target:
-
-1. **GUI**: radio-button list in the main window, updates automatically as SSDP sees new devices.
-
-2. **Tray**: left-click the tray icon to open the window, then pick from the list.
-
-3. **CLI flag**: `--player "Living Room"` (substring match) or `--player 192.168.1.50` (IP literal). Works in any mode.
-
-4. **Web API** (when `--web` is on): click in the web UI at `http://<host>:<port>/`, or `POST /api/select` with `{"id": "<udn-or-ip>"}`.
-
-In `--headless` without `--player`, on a TTY, you get an interactive numbered prompt (useful over SSH). `--list-speakers` prints discovered devices and exits.
-
-The list refreshes via SSDP every `--ssdp-interval` minutes (default 5).
+The GUI and tray lists update as discovery runs. `--player` takes a name
+substring or an IPv4 literal; `--list-speakers` prints and exits. Without
+`--player`, `--headless` on a TTY offers a numbered prompt. Under `--web`,
+`POST /api/select` with `{"id": "<udn-or-ip>"}`. Discovery re-runs every
+`--ssdp-interval` minutes.
 
 ## Latency control
 
-End-to-end latency = `Windows engine pipeline + driver buffer + your network + speaker prebuffer`. The first three are O(1) ms; the speaker's prebuffer is the bulk of it. Sonos, for instance, prebuffers ~150-200 ms by default and the buffer drifts with the speaker's own crystal vs. the host's TSC.
+End-to-end latency is `Windows engine + driver buffer + network + speaker
+prebuffer`. The first three are O(1) ms; the speaker's prebuffer dominates.
+Sonos prebuffers ~150-200 ms and drifts against the host clock.
 
-The web UI at `http://localhost:5901/` has buttons to nudge it:
+The GUI and web UI expose:
 
-- `−25 ms` / `−100 ms`: drain that much audio over ~0.5-2 s (drops samples gradually — sub-millisecond per packet, below the audibility floor). Reduces latency.
-- `+25 ms` / `+100 ms`: pad with duplicated frames. Increases latency (use if you went too far and Sonos is glitching).
-- `resync`: hard UPnP Stop + Play. Brief audio glitch but Sonos starts fresh with a minimal prebuffer.
-
-Same controls via API for scripting:
+- **−25 / −100 ms** — drain over ~0.5-2 s, dropping sub-millisecond amounts
+  per packet, below the audibility floor.
+- **+25 / +100 ms** — pad with duplicated frames, if you overshot.
+- **Resync** — stop and restart the session: one brief glitch, minimal
+  prebuffer afterwards.
 
 ```bash
 curl -X POST "http://localhost:5901/api/latency/adjust?ms=100"   # trim 100 ms
 curl -X POST "http://localhost:5901/api/latency/adjust?ms=-25"   # pad 25 ms
-curl -X POST "http://localhost:5901/api/resync"                  # hard reset
+curl -X POST "http://localhost:5901/api/resync"
 ```
 
-For *ongoing* drift between the Windows clock and the speaker's audio crystal (typically ±10-100 ppm), set `--rate-fudge-ppm <N>` once at startup:
-
-- Positive (e.g. `+50` to `+200`) duplicates a frame every `1 000 000 / N` frames produced — compensates for a speaker whose crystal runs faster than the host.
-- Negative drops a frame at the same rate — for the opposite case (rare).
-- Start with `0`, watch the buffer for a few minutes, and tune. The right value is whatever keeps Sonos's buffer level stable instead of slowly draining or growing.
+For *ongoing* drift (typically ±10-100 ppm), set `--rate-fudge-ppm` once at
+startup: positive duplicates a frame every `1 000 000 / N` frames (speaker
+crystal faster than the host), negative drops one. Start at 0 and tune until
+the speaker's buffer level holds steady.
 
 ### Tuning notes
 
-- `--initial-buffer-ms` is a DIDL prebuffer hint; Sonos generally ignores it,
-  so prefer the runtime adjust knobs above.
+- `--initial-buffer-ms` is a prebuffer hint in the DIDL metadata; Sonos
+  generally ignores it, so prefer the runtime knobs.
 - `--silence-pace-ms` is wall-clock ms between silence packets while the
-  Windows audio engine is paused. Default 10 = real-time; higher values
-  under-produce during silence, draining the speaker's prebuffer between
-  tracks so post-pause latency is smaller. Useful range 12-25; above 30 risks
-  underrun.
-- `--latency-adjust-step-frames` caps frames added or dropped per audio packet
-  when servicing `/api/latency/adjust`. Default 4 (≈0.09 ms per packet);
-  higher is snappier at the cost of audible clicks.
-- Silence injection (on by default, disable with `--no-silence-injection`)
-  replaces silent packets with ~|4|-peak white noise after 500 ms of silence,
-  so the speaker doesn't decide the stream died and disconnect.
+  audio engine is paused. Default 10 = real-time; higher under-produces,
+  draining the speaker's prebuffer between tracks so post-pause latency is
+  smaller. Useful range 12-25; above 30 risks underrun.
+- `--latency-adjust-step-frames` caps frames added or dropped per packet
+  while adjusting. Default 4 (≈0.09 ms per packet); higher is snappier at the
+  cost of audible clicks.
+- Silence injection (default on) replaces silent packets with ~|4|-peak white
+  noise after 500 ms so the speaker doesn't treat the stream as dead.
 
-## CLI flags
+## HTTP API
 
-Listed in the [README](README.md#cli-flags).
+`--web` serves a status page at `http://<host>:5901/` plus:
 
+| Endpoint | Method | Effect | Always on |
+|---|---|---|---|
+| `/stream.raw` | GET | Raw PCM the speaker pulls. | yes |
+| `/api/speakers` | GET | Discovered speakers. | `--web` |
+| `/api/select` | POST | `{"id": "<udn-or-ip>"}` — switch speaker. | `--web` |
+| `/api/resync` | POST | Restart the session. | `--web` |
+| `/api/latency/adjust?ms=N` | POST | `N>0` drains, `N<0` pads. | `--web` |
+| `/healthz` | GET | Returns `ok`. | `--web` |
 
-
-## Web UI / HTTP API (opt-in)
-
-Pass `--web` to enable. Then `http://<host>:5901/` serves a tiny status page with the speaker list, select buttons, latency-trim buttons, and a resync button. The same endpoints, for scripting:
-
-| Endpoint                          | Method | Effect                                                         | Always on |
-|-----------------------------------|--------|----------------------------------------------------------------|-----------|
-| `/stream.raw`                     | GET    | Raw PCM stream the speaker pulls (audio/wav, no length).       | yes       |
-| `/api/speakers`                   | GET    | JSON list of discovered speakers.                              | `--web`   |
-| `/api/select`                     | POST   | `{"id": "<udn-or-ip>"}` to switch the active speaker.          | `--web`   |
-| `/api/resync`                     | POST   | UPnP Stop + Play — drops Sonos's accumulated prebuffer.        | `--web`   |
-| `/api/latency/adjust?ms=N`        | POST   | `N>0` drains N ms (lower latency); `N<0` pads (higher latency).| `--web`   |
-| `/healthz`                        | GET    | Liveness probe — always returns `ok`.                          | `--web`   |
-
-> ⚠️ The API endpoints have no authentication. On an untrusted LAN, either keep them disabled (the default) and use the GUI/tray, or bind to `127.0.0.1` (`--bind 127.0.0.1`), or put it behind a reverse proxy with auth.
-
-## Build prerequisites
-
-- **Driver**: VS 2022 Build Tools (or EWDK) + Windows Driver Kit (WDK) 10.0.22621+. See `driver/README.md`.
-- **Service**: Rust 1.74+ stable. `cargo build --release` from `service/`. Produces `target/release/stream-to-speaker.exe`.
-- **Installer** (optional): [Inno Setup 6](https://jrsoftware.org/isdl.php) — `choco install innosetup` works too.
-- **Test signing** (development): Secure Boot off, `bcdedit /set testsigning on`, reboot. HVCI / Memory Integrity must be off in Windows Security → Device Security → Core Isolation.
-
-## Building the installer
-
-A single-file installer (`StreamToSpeakerSetup-<version>.exe`) ties together the driver, the service binary, the endpoint-rename script, and Start Menu / autostart entries.
-
-```powershell
-# Builds driver + service + installer in one shot. Output:
-# installer\out\StreamToSpeakerSetup-<version>.exe
-.\installer\build-installer.ps1
-
-# Or skip individual steps while iterating:
-.\installer\build-installer.ps1 -SkipDriver        # only re-package
-.\installer\build-installer.ps1 -SkipDriver -SkipService
-.\installer\build-installer.ps1 -Version 0.1.0-rc.1
-```
-
-Per-step source: driver via msbuild, service via cargo, installer via Inno Setup's `ISCC.exe`.
-
-### What the installer does on a target machine
-
-1. Copies `stream-to-speaker.exe` to `Program Files\Stream To Speaker`.
-2. Drops `StreamToSpeaker.sys`/`.inf`/`.cat` into a `driver\` subdirectory.
-3. Runs `pnputil /add-driver /install` — stages the driver and (on Win10 1809+) creates the Root-enumerated device.
-4. Runs `scripts\Rename-Endpoint.ps1` to overwrite the cached "Internal AUX Jack" string in the registry.
-5. Optionally adds a Start Menu shortcut, a desktop shortcut, and an autostart entry (per-user `Run` key).
-6. Offers to launch the app on exit.
-
-Uninstall (via Control Panel → Apps): kills any running `stream-to-speaker.exe`, removes the driver via `Uninstall-Driver.ps1` (looks up the `oemNN.inf` assigned name in the driver store), deletes the install directory.
-
-### Caveat: driver signing
-
-The unsigned driver produced by `cargo`/`msbuild` won't load on a normal Windows machine. For development, the target needs test-signing mode + Secure Boot off + HVCI off (see Build prerequisites above). For a shippable installer that doesn't need test-signing, the `.sys` has to be signed with an EV code-signing certificate and WHQL-attested through the Microsoft Hardware Dev Center portal — out of scope for this repo right now.
+> ⚠️ The API has no authentication. Leave it off (the default), bind to
+> `127.0.0.1`, or front it with a reverse proxy that authenticates.
 
 ## Continuous integration
 
-The `.github/workflows/build.yml` workflow builds driver + service + installer on every push, PR, and tag, on `windows-latest` runners. Artifacts:
+`build.yml` builds driver + service + installer on every push, PR and tag.
+Pushes to `main` also produce an installer bundling the Microsoft-signed
+driver whenever one matches the current driver source.
 
-- **`StreamToSpeakerSetup-<version>.exe`** — the installer
-- **`binaries-<version>`** — raw `.sys`/`.inf`/`.cat` + `stream-to-speaker.exe`
+A `v*` tag runs the release chain — build → sign the service binary → package
+→ sign the installer — publishing signed binaries with checksums and, on
+public repos, build-provenance attestations. Two approval clicks, both in the
+signing repository.
 
-On a tag push (`v1.2.3`), the installer is also attached to a GitHub Release with auto-generated notes.
+`driver-submission.yml`, `driver-attest.yml` and `driver-attested.yml` handle
+the driver's Microsoft attestation round-trip:
+[docs/driver-signing.md](docs/driver-signing.md).
 
-The workflow installs the WDK from Microsoft's redistributable URL (~5 min cold cache) and Inno Setup via chocolatey. Cargo is cached by `Cargo.lock` hash. Full cold build takes ~15-20 minutes; warm cache cuts it to ~5.
+The WDK install and Rust dependencies are cached; a cold build is ~15-20 min,
+warm ~5.
 
 ## Layout
 
 ```
 StreamToSpeaker/
-├── include/
-│   └── stream_to_speaker_ioctl.h  # shared driver<->service ABI (single source of truth)
-├── driver/                        # C++ kernel-mode driver (PortCls / WaveRT)
-│   ├── README.md
-│   ├── StreamToSpeaker.inf        # device install — names it "Stream To Speaker"
-│   ├── *.cpp, *.h
-│   └── ...
-└── service/                       # Rust user-mode bridge
-    ├── Cargo.toml                 # binary = stream-to-speaker
-    ├── README.md
-    └── src/
-        ├── main.rs                # CLI parsing, mode dispatch (GUI / headless / web)
-        ├── app.rs                 # central Arc<App> state + action methods
-        ├── audio_loop.rs          # extracted audio loop, runs on its own thread
-        ├── gui.rs                 # eframe + egui native window
-        ├── tray.rs                # system-tray icon + menu
-        ├── ioctl_source.rs        # driver IOCTL consumer (audio + events)
-        ├── http_server.rs         # /stream.raw (always) + /api/* (opt-in)
-        ├── ssdp.rs                # multicast discovery
-        ├── upnp.rs                # SOAP control plane + DIDL metadata
-        ├── gena.rs                # event subscription (volume from speaker)
-        ├── volume_sync.rs         # bidirectional volume bridge
-        ├── silence.rs             # silence detection + noise floor
-        ├── wasapi_source.rs       # fallback loopback source
-        ├── sine_source.rs         # test tone
-        └── picker.rs              # interactive TTY picker (used in --headless)
+├── include/stream_to_speaker_ioctl.h   shared driver↔service ABI
+├── driver/                             C++ kernel driver (PortCls / WaveRT)
+├── installer/                          Inno Setup script + build-installer.ps1
+├── scripts/                            endpoint rename, driver uninstall
+├── docs/                               signing pipeline, specs, plans
+└── service/src/
+    ├── main.rs          CLI parsing, mode dispatch
+    ├── app.rs           central Arc<App> state + actions
+    ├── audio_loop.rs    audio loop, own thread
+    ├── audio_source.rs  source abstraction
+    ├── ioctl_source.rs  driver IOCTL consumer (audio + events)
+    ├── wasapi_source.rs loopback fallback · sine_source.rs  test tone
+    ├── gui.rs           eframe/egui window · tray.rs  tray icon + menu
+    ├── picker.rs        terminal picker (--headless)
+    ├── http_server.rs   /stream.raw + /api/*
+    ├── ssdp.rs          discovery · upnp.rs  SOAP + DIDL · gena.rs  events
+    ├── airplay/         RAOP + AirPlay 2: pairing, crypto, RTSP, PTP, AAC
+    ├── volume_sync.rs   bidirectional volume bridge
+    ├── silence.rs       silence detection + noise floor
+    ├── now_playing.rs   track metadata · endpoint_name.rs  endpoint rename
+    ├── user_config.rs   persisted preferences · qpc.rs  high-res clock
+    └── lib.rs           library surface for tests
 ```
 
-## Format support (v1)
+## Formats
 
-L16 PCM, 44.1 kHz, stereo only. Wire MIME `audio/L16;rate=44100;channels=2` (we wrap a 44-byte RIFF/WAVE header in front of the PCM for the actual HTTP body so Sonos accepts it as `audio/wav`). Lowest-latency option with the broadest speaker compatibility. Other formats (24-bit, 48 kHz, FLAC) are deferred until someone wants them — the service architecture is set up to add them as alternative output encoders without touching the driver.
+UPnP/OpenHome: L16 PCM, 44.1 kHz, stereo — wire MIME
+`audio/L16;rate=44100;channels=2`, wrapped in a 44-byte RIFF/WAVE header so
+Sonos accepts it as `audio/wav`. Lowest latency, broadest compatibility.
+
+AirPlay: ALAC for RAOP, and AAC-LC via Windows Media Foundation for AirPlay 2
+buffered audio.
