@@ -1970,45 +1970,66 @@ impl StreamToSpeakerApp {
             .rounding(RADIUS_SURFACE)
             .inner_margin(egui::Margin::symmetric(sp::M, sp::S))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("☕").size(15.0),
-                    );
-                    ui.add_space(sp::XS);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Stream To Speaker is free and open source. \
-                                 Donate to support its development.",
-                            )
-                            .color(p.text_on_accent_subtle),
-                        );
-                    });
+                // Buttons need ~200 px. On a narrow window the message used
+                // to share their row and slide underneath them (labels don't
+                // wrap inside a horizontal layout), so below the threshold
+                // the strip stacks: message on its own line — where it wraps
+                // — and the buttons right-aligned beneath it.
+                let stacked = ui.available_width() < 540.0;
+                let msg = egui::RichText::new(
+                    "☕  Stream To Speaker is free and open source. \
+                     Donate to support its development.",
+                )
+                .color(p.text_on_accent_subtle);
+
+                let buttons = |ui: &mut egui::Ui| -> (bool, bool) {
+                    let mut donate = false;
+                    let mut later = false;
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            if secondary_button(ui, p, "Not now", 84.0)
+                            later = secondary_button(ui, p, "Not now", 84.0)
                                 .on_hover_text("Hide this for a week.")
-                                .clicked()
-                            {
-                                self.app.snooze_donation_prompt(7);
-                            }
-                            if primary_button(ui, p, "Donate", 96.0)
-                                .on_hover_text("Opens buymeacoffee.com/ms00 in your browser. Any amount, one-off or monthly.")
-                                .clicked()
-                            {
-                                let _ = open_url("https://buymeacoffee.com/ms00");
-                                // We can't tell whether a donation actually
-                                // happened, so following the link buys a
-                                // month of quiet — long enough not to pester
-                                // someone who just gave, short enough that a
-                                // browser tab opened and forgotten doesn't
-                                // silence the ask for good.
-                                self.app.snooze_donation_prompt(30);
-                            }
+                                .clicked();
+                            donate = primary_button(ui, p, "Donate", 96.0)
+                                .on_hover_text(
+                                    "Opens buymeacoffee.com/ms00 in your browser. \
+                                     Any amount, one-off or monthly.",
+                                )
+                                .clicked();
                         },
                     );
-                });
+                    (donate, later)
+                };
+
+                let (donate, later) = if stacked {
+                    let mut clicks = (false, false);
+                    ui.vertical(|ui| {
+                        ui.label(msg);
+                        ui.add_space(sp::S);
+                        clicks = buttons(ui);
+                    });
+                    clicks
+                } else {
+                    let mut clicks = (false, false);
+                    ui.horizontal(|ui| {
+                        ui.label(msg);
+                        clicks = buttons(ui);
+                    });
+                    clicks
+                };
+
+                if later {
+                    self.app.snooze_donation_prompt(7);
+                }
+                if donate {
+                    let _ = open_url("https://buymeacoffee.com/ms00");
+                    // We can't tell whether a donation actually happened, so
+                    // following the link buys a month of quiet — long enough
+                    // not to pester someone who just gave, short enough that
+                    // a tab opened and forgotten doesn't silence the ask.
+                    self.app.snooze_donation_prompt(30);
+                }
             });
     }
 
