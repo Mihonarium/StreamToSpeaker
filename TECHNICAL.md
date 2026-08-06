@@ -138,6 +138,22 @@ For *ongoing* drift between the Windows clock and the speaker's audio crystal (t
 - Negative drops a frame at the same rate — for the opposite case (rare).
 - Start with `0`, watch the buffer for a few minutes, and tune. The right value is whatever keeps Sonos's buffer level stable instead of slowly draining or growing.
 
+### Tuning notes
+
+- `--initial-buffer-ms` is a DIDL prebuffer hint; Sonos generally ignores it,
+  so prefer the runtime adjust knobs above.
+- `--silence-pace-ms` is wall-clock ms between silence packets while the
+  Windows audio engine is paused. Default 10 = real-time; higher values
+  under-produce during silence, draining the speaker's prebuffer between
+  tracks so post-pause latency is smaller. Useful range 12-25; above 30 risks
+  underrun.
+- `--latency-adjust-step-frames` caps frames added or dropped per audio packet
+  when servicing `/api/latency/adjust`. Default 4 (≈0.09 ms per packet);
+  higher is snappier at the cost of audible clicks.
+- Silence injection (on by default, disable with `--no-silence-injection`)
+  replaces silent packets with ~|4|-peak white noise after 500 ms of silence,
+  so the speaker doesn't decide the stream died and disconnect.
+
 ## CLI flags
 
 Listed in the [README](README.md#cli-flags).
