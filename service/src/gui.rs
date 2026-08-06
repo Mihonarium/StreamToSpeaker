@@ -1932,7 +1932,7 @@ impl StreamToSpeakerApp {
                         ui.label(
                             egui::RichText::new(
                                 "Stream To Speaker is free and open source. \
-                                 If it's useful, you can support its development.",
+                                 Donate to support its development.",
                             )
                             .color(p.text_on_accent_subtle),
                         );
@@ -1946,8 +1946,8 @@ impl StreamToSpeakerApp {
                             {
                                 self.app.snooze_donation_prompt(7);
                             }
-                            if primary_button(ui, p, "Buy me a coffee", 132.0)
-                                .on_hover_text("Opens buymeacoffee.com/ms00 in your browser.")
+                            if primary_button(ui, p, "Donate", 96.0)
+                                .on_hover_text("Opens buymeacoffee.com/ms00 in your browser. Any amount, one-off or monthly.")
                                 .clicked()
                             {
                                 let _ = open_url("https://buymeacoffee.com/ms00");
