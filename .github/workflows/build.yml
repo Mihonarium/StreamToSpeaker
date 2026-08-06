@@ -522,6 +522,7 @@ jobs:
     timeout-minutes: 75
     permissions:
       contents: write
+      actions: read              # gh run download of the unsigned-exe artifact
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -703,6 +704,7 @@ jobs:
     timeout-minutes: 75
     permissions:
       contents: write
+      actions: read              # gh run download of the unsigned-exe artifact
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

@@ -377,6 +377,7 @@ jobs:
     timeout-minutes: 150
     permissions:
       contents: write
+      actions: read              # gh run download of the submission-cab artifact
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
