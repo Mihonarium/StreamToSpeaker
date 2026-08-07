@@ -83,6 +83,11 @@ Offline: `--bundle <file>.sigstore.json`, shipped with each release.
 Architecture, building from source, HTTP API: [TECHNICAL.md](TECHNICAL.md).
 Driver signing pipeline: [docs/driver-signing.md](docs/driver-signing.md).
 
+## Privacy
+
+Nothing is collected: no servers, no accounts, no telemetry.
+[PRIVACY.md](PRIVACY.md).
+
 ## License
 
 Source [MPL-2.0](LICENSE). Released binaries: free to install and use,
