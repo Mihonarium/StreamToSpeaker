@@ -161,7 +161,7 @@ pub fn spawn(app: Arc<App>, egui_ctx: egui::Context) -> Result<TrayHandle> {
         quit: quit_item.id().clone(),
     };
 
-    let initial_state = IconState::Inactive;
+    let initial_state = IconState::Idle;
     let icon = build_icon(initial_state)?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -268,15 +268,23 @@ impl TrayHandle {
             self.last_web_enabled = web_on;
         }
 
-        // Sync the tray icon to reflect Active vs Inactive (M31).
+        // Sync the tray icon to the current state (M31).
         // Active = a speaker is bound, streaming is enabled, and the
         // driver is actually delivering audio (stream_active). Any
         // other state — no speaker, disabled, paused — reads as
         // Inactive (muted grey).
-        let active = speaker_bound
+        let streaming = speaker_bound
             && enabled
             && app.stream_active.load(std::sync::atomic::Ordering::Acquire);
-        let new_state = if active { IconState::Active } else { IconState::Inactive };
+        let new_state = if streaming {
+            IconState::Live
+        } else if speaker_bound && enabled {
+            // Bound and armed, just nothing playing right now — distinct
+            // from "no speaker", which is the state the user has to act on.
+            IconState::Standby
+        } else {
+            IconState::Idle
+        };
         if new_state != self.last_icon_state {
             if let Ok(new_icon) = build_icon(new_state) {
                 let _ = self.icon.set_icon(Some(new_icon));
@@ -412,52 +420,41 @@ fn open_web_ui(advertise_ip: &str, port: u16) {
 
 /// Two tray icon states (M31): Active (full green speaker — actually
 /// streaming audio) vs Inactive (grey speaker — idle / disabled / no
-/// speaker bound). Two-state is the minimum that lets a user glance
-/// at the system tray and answer "is my audio going somewhere?"
-/// without opening the window. CLAUDE.md documents that a future
-/// proper-artwork iteration should ship at LEAST these two states.
+/// speaker bound). Three states let a user answer "is my audio going
+/// somewhere?" at a glance without opening the window.
+///
+/// The mark itself never changes between states — same laptop, same three
+/// arcs — only the arc colour moves. Shape is what makes an icon
+/// recognisable at 16 px; colour is what still reads at that size.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum IconState {
-    Active,
-    Inactive,
+    /// No speaker chosen: arcs neutral grey.
+    Idle,
+    /// Speaker held, nothing playing: arcs brand blue.
+    Standby,
+    /// Audio streaming: arcs coral.
+    Live,
 }
 
+/// The tray artwork, one buffer per state.
+///
+/// These are raw RGBA — the exact bytes `Icon::from_rgba` wants — rendered
+/// from `assets/brand/tray-*.svg` by the asset build. Shipping raw pixels
+/// rather than PNGs keeps an image decoder out of the dependency tree for
+/// what amounts to three tiny bitmaps.
+const TRAY_IDLE: &[u8] = include_bytes!("../../assets/tray-idle-32.rgba");
+const TRAY_STANDBY: &[u8] = include_bytes!("../../assets/tray-standby-32.rgba");
+const TRAY_LIVE: &[u8] = include_bytes!("../../assets/tray-live-32.rgba");
+
 fn build_icon(state: IconState) -> Result<Icon> {
-    // 32×32 — Windows downsamples to 16×16 / 24×24 / 20×20 depending
-    // on DPI. Shapes need to be bold enough that downsampling doesn't
-    // collapse them into a featureless blob.
+    // 32x32 — Windows downsamples to 16/20/24 depending on DPI.
     const W: u32 = 32;
     const H: u32 = 32;
-    let mut pixels = vec![0u8; (W * H * 4) as usize];
-    // Transparent background — all zeros (RGBA 0,0,0,0).
-    let fg: [u8; 4] = match state {
-        IconState::Active => [60, 180, 100, 255], // accent green, opaque
-        IconState::Inactive => [140, 145, 155, 255], // muted grey
+    let pixels = match state {
+        IconState::Idle => TRAY_IDLE,
+        IconState::Standby => TRAY_STANDBY,
+        IconState::Live => TRAY_LIVE,
     };
-
-    for y in 0..H {
-        for x in 0..W {
-            let i = ((y * W + x) * 4) as usize;
-            let xi = x as i32;
-            let yi = y as i32;
-
-            // 1. Speaker body — solid vertical rectangle on the left.
-            let body = xi >= 5 && xi <= 11 && yi >= 11 && yi <= 21;
-
-            // 2. Cone — trapezoid opening to the right.
-            let cone_dx = xi - 11;
-            let half_h = 5 + (cone_dx * 7 + 5) / 11;
-            let cone =
-                cone_dx >= 0 && cone_dx <= 11 && (yi - 16).abs() <= half_h;
-
-            if body || cone {
-                pixels[i] = fg[0];
-                pixels[i + 1] = fg[1];
-                pixels[i + 2] = fg[2];
-                pixels[i + 3] = fg[3];
-            }
-        }
-    }
-
-    Icon::from_rgba(pixels, W, H).map_err(|e| anyhow!("icon: {}", e))
+    debug_assert_eq!(pixels.len(), (W * H * 4) as usize, "tray asset is not 32x32 RGBA");
+    Icon::from_rgba(pixels.to_vec(), W, H).map_err(|e| anyhow!("icon: {}", e))
 }

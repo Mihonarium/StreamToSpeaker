@@ -93,6 +93,11 @@ plist = "1"
 # Wipe SRP/session key material on drop.
 zeroize = "1"
 
+# Embeds assets/StreamToSpeaker.ico into the exe (see build.rs). Windows-only
+# and build-time only, so it adds nothing to the shipped binary's runtime.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [dev-dependencies]
 # Reference ALAC decoder — round-trip verifies that the compressed frames
 # our encoder emits decode losslessly under our announced fmtp parameters.

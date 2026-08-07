@@ -76,6 +76,10 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
 WizardStyle=modern
+; The setup executable's own icon, and the icon shown in Add/Remove
+; Programs. The installed shortcuts pick theirs up from the exe's embedded
+; resource (service/build.rs), so all four surfaces show the same mark.
+SetupIconFile={#SourcePath}\..\assets\StreamToSpeaker.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 SetupLogging=yes
 ; pnputil + devcon sometimes set the system-wide "reboot needed" flag
