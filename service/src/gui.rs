@@ -740,6 +740,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
     // / OBS tray apps follow this same pattern.)
     let viewport = egui::ViewportBuilder::default()
         .with_title("Stream To Speaker")
+        .with_icon(window_icon(IconState::Idle))
         .with_inner_size([720.0, 800.0])
         .with_min_inner_size([580.0, 620.0])
         .with_visible(true)
@@ -854,6 +855,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
             Ok(Box::new(StreamToSpeakerApp {
                 app: app_for_eframe,
                 last_repaint_request: Instant::now(),
+                last_icon_state: IconState::Idle,
                 tray,
                 frame_count: 0,
                 confirm_close_open: false,
@@ -881,6 +883,9 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
 struct StreamToSpeakerApp {
     app: Arc<App>,
     last_repaint_request: Instant,
+    /// What the window/taskbar icon is currently showing, so it is only
+    /// pushed to the OS when it actually changes.
+    last_icon_state: IconState,
     tray: Option<crate::tray::TrayHandle>,
     frame_count: u64,
     confirm_close_open: bool,
@@ -1041,6 +1046,7 @@ impl eframe::App for StreamToSpeakerApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count = self.frame_count.saturating_add(1);
+        self.sync_window_icon(ctx);
         if self.frame_count == 1 {
             log::info!("first GUI frame painting");
         }
@@ -1953,6 +1959,28 @@ impl StreamToSpeakerApp {
                     );
                 });
             });
+    }
+
+    /// Keep the taskbar icon in step with what the app is doing, using the
+    /// same three states as the tray. Only pushed on change — sending a
+    /// viewport command every frame would be wasteful and makes the icon
+    /// flicker on some drivers.
+    fn sync_window_icon(&mut self, ctx: &egui::Context) {
+        let bound = self.app.selected_speaker().is_some();
+        let enabled = self.app.is_streaming_enabled();
+        let state = if bound && enabled && self.app.stream_active.load(Ordering::Acquire) {
+            IconState::Live
+        } else if bound && enabled {
+            IconState::Standby
+        } else {
+            IconState::Idle
+        };
+        if state != self.last_icon_state {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
+                window_icon(state),
+            ))));
+            self.last_icon_state = state;
+        }
     }
 
     /// Donation ask. Shown on launch until the user either follows the
@@ -3262,6 +3290,30 @@ fn stat_pill(
         })
         .response
         .on_hover_text(tooltip);
+}
+
+/// Window/taskbar icon state. Mirrors the tray: the mark is identical in
+/// every state and only the arc colour changes.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum IconState {
+    Idle,
+    Standby,
+    Live,
+}
+
+/// Raw RGBA rendered from `assets/brand/app-*.svg` by the asset build —
+/// the format `egui::IconData` takes, so no image decoder is needed.
+const WINDOW_IDLE: &[u8] = include_bytes!("../../assets/window-idle-128.rgba");
+const WINDOW_STANDBY: &[u8] = include_bytes!("../../assets/window-standby-128.rgba");
+const WINDOW_LIVE: &[u8] = include_bytes!("../../assets/window-live-128.rgba");
+
+fn window_icon(state: IconState) -> egui::IconData {
+    let rgba = match state {
+        IconState::Idle => WINDOW_IDLE,
+        IconState::Standby => WINDOW_STANDBY,
+        IconState::Live => WINDOW_LIVE,
+    };
+    egui::IconData { rgba: rgba.to_vec(), width: 128, height: 128 }
 }
 
 fn open_url(url: &str) -> std::io::Result<()> {
