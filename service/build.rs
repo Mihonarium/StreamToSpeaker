@@ -7,14 +7,23 @@
 fn main() {
     #[cfg(windows)]
     {
-        println!("cargo:rerun-if-changed=../assets/StreamToSpeaker.ico");
+        const ICON: &str = "../assets/StreamToSpeaker.ico";
+        println!("cargo:rerun-if-changed={ICON}");
+
+        // Fail loudly. A resource compiler comes with the Windows SDK,
+        // which is already required to build this project, so if it is
+        // missing the build environment is broken — and the failure mode
+        // if we merely warned is a release binary that silently ships
+        // with no icon.
         let mut res = winresource::WindowsResource::new();
-        res.set_icon("../assets/StreamToSpeaker.ico");
-        if let Err(e) = res.compile() {
-            // Never fail the build over decoration: a resource compiler is
-            // not present on every dev machine, and an icon-less binary
-            // still runs correctly.
-            println!("cargo:warning=icon resource not embedded: {e}");
-        }
+        res.set_icon(ICON);
+        res.compile().unwrap_or_else(|e| {
+            panic!(
+                "failed to embed {ICON} into the executable: {e}\n\
+                 A resource compiler (rc.exe from the Windows SDK, or windres) \
+                 must be on PATH. Building without it would produce a binary \
+                 with no icon in Explorer, the Start Menu or shortcuts."
+            )
+        });
     }
 }
