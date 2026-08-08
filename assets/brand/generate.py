@@ -19,8 +19,11 @@ Three states in each. The shape never changes, only the arc COLOUR, so the
 icon stays recognisable while still reporting what the app is doing:
   idle      no speaker chosen     arcs in the ink — one quiet monochrome mark
   standby   connected, silent     arcs green
-  live      audio playing         arcs coral
+  live      audio playing         arcs a brighter green
 Colour is what survives 16px; an arc-count difference does not.
+
+The static brand mark (`app-brand`) keeps the coral arcs and is what the
+exe, installer and shortcut icon use; only the running app swaps colour.
 """
 import math
 import os
@@ -30,8 +33,15 @@ OUT = os.path.dirname(os.path.abspath(__file__))
 # nothing to report, which keeps idle a single coherent monochrome mark
 # instead of grey arcs that wash out against a mid-tone background.
 INK = "#545cc4"
-# State colours: green for connected and ready, coral for playing.
-GREEN, CORAL = "#22c55e", "#fe6045"
+# Green means a speaker is connected. Both connected states use it — the
+# icon's job is to answer "is this working?", and it cannot answer that if
+# the green only appears in the half-second before audio starts flowing.
+# Playing is the brighter of the two.
+GREEN, GREEN_WAITING = "#22c55e", "#15a349"
+# Coral is the brand, not a state: it is what the exe, installer and
+# shortcut icon wear, so the mark stays coral wherever it is not reporting
+# anything live.
+CORAL = "#fe6045"
 
 
 def arc(cx, cy, r, a0, a1):
@@ -90,10 +100,12 @@ def write(path, body):
     open(path, "w").write(head + body + "</svg>")
 
 
-STATES = [("idle", INK), ("standby", GREEN), ("live", CORAL)]
+STATES = [("idle", INK), ("standby", GREEN_WAITING), ("live", GREEN)]
 
 for family, sw, arc_sw in [("app", 11, 15), ("tray", 13, 17)]:
     for name, colour in STATES:
         write(f"{OUT}/{family}-{name}.svg", laptop(sw) + arcs(colour, arc_sw))
 
-print("wrote 6 svgs to", OUT)
+write(f"{OUT}/app-brand.svg", laptop(11) + arcs(CORAL, 15))
+
+print("wrote 7 svgs to", OUT)

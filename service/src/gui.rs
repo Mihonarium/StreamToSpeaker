@@ -1351,6 +1351,40 @@ fn clickable(r: egui::Response) -> egui::Response {
     r
 }
 
+/// Give a window's ✕ the pointer cursor.
+///
+/// egui paints the close button itself and offers no hook to style or sense
+/// it, so it was the one control in the app that gave no "this is clickable"
+/// hint. There is nothing to wrap in `clickable`, so re-derive its rect the
+/// way `egui::containers::window` lays it out: the title bar is inset by the
+/// frame's margin, and the button is one `icon_width` square at its right
+/// end, centred vertically. Padded slightly — this is only a cursor hint, so
+/// erring generous costs nothing, and if egui's layout ever shifts the worst
+/// case is the hint being a couple of pixels off rather than a broken button.
+fn window_close_cursor(ctx: &egui::Context, window_rect: egui::Rect, inner_margin: f32) {
+    let Some(pos) = ctx.pointer_hover_pos() else { return };
+    let (icon_w, min_h, heading) = {
+        let style = ctx.style();
+        (
+            style.spacing.icon_width,
+            style.spacing.interact_size.y,
+            style.text_styles[&egui::TextStyle::Heading].clone(),
+        )
+    };
+    let title_h = ctx.fonts(|f| f.row_height(&heading)).max(min_h);
+    let pad = (title_h - icon_w) / 2.0;
+    let btn = egui::Rect::from_min_size(
+        egui::pos2(
+            window_rect.right() - inner_margin - pad - icon_w,
+            window_rect.top() + inner_margin + 0.5 * title_h - 0.5 * icon_w,
+        ),
+        egui::Vec2::splat(icon_w),
+    );
+    if btn.expand(3.0).contains(pos) {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+}
+
 /// Primary button — solid accent fill, white-on-accent text. Use for the
 /// main action of each area (Enable, Minimise to tray, Apply, etc.).
 fn primary_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -> egui::Response {
@@ -1952,18 +1986,27 @@ impl StreamToSpeakerApp {
                             .strong(),
                     );
                     ui.add_space(sp::XS);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(&msg)
-                                .color(p.text_primary),
-                        );
-                    });
+                    // Lay Dismiss out FIRST, then the message into what is
+                    // left. Adding the message first let it claim the whole
+                    // row, so the button — which has a transparent fill —
+                    // was drawn on top of the words. A long error message
+                    // now wraps instead of colliding.
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             if link_button(ui, p, "Dismiss", 80.0).clicked() {
                                 self.app.dismiss_error();
                             }
+                            ui.add_space(sp::S);
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(&msg)
+                                            .color(p.text_primary),
+                                    );
+                                },
+                            );
                         },
                     );
                 });
@@ -2754,7 +2797,7 @@ impl StreamToSpeakerApp {
             action = Some(CloseAction::Cancel);
         }
 
-        egui::Window::new(
+        let win = egui::Window::new(
             egui::RichText::new("Close Stream To Speaker?")
                 .strong()
                 .color(p.text_primary),
@@ -2820,6 +2863,9 @@ impl StreamToSpeakerApp {
                     });
                 });
             });
+        if let Some(win) = win {
+            window_close_cursor(ctx, win.response.rect, sp::MODAL);
+        }
 
         if !still_open && action.is_none() {
             action = Some(CloseAction::Cancel);
@@ -2965,7 +3011,7 @@ fn show_text_prompt_modal(
         cancel = true;
     }
 
-    egui::Window::new(egui::RichText::new(title).strong().color(p.text_primary))
+    let win = egui::Window::new(egui::RichText::new(title).strong().color(p.text_primary))
         .open(&mut still_open)
         .collapsible(false)
         .resizable(false)
@@ -3008,6 +3054,9 @@ fn show_text_prompt_modal(
                 });
             });
         });
+    if let Some(win) = win {
+        window_close_cursor(ctx, win.response.rect, sp::MODAL);
+    }
 
     if !still_open {
         cancel = true;

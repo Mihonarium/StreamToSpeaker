@@ -135,7 +135,11 @@ pub fn update_endpoint_name(active_speaker: Option<&str>) {
         .name("stream-to-speaker-rename-endpoint".to_string())
         .spawn(move || {
             if let Err(e) = do_update(&new_name) {
-                log::debug!("update_endpoint_name failed (cosmetic): {:#}", e);
+                // Warn, not debug. This is cosmetic enough to ignore at
+                // runtime but not so cosmetic that it should be invisible:
+                // it went unnoticed for a long time precisely because the
+                // one failure that mattered never showed up in the log.
+                log::warn!("could not rename the Windows endpoint (cosmetic): {:#}", e);
             }
         })
         .ok();
@@ -211,32 +215,52 @@ fn find_our_endpoint_id() -> Result<Option<String>> {
         }
         let _guard2 = CloseKeyOnDrop(props_key);
 
-        let desc_pkey =
-            to_wide_null("{a45c254e-df1c-4efd-8020-67d146a850e0},2");
-        let mut data_type: u32 = 0;
-        let mut buf = [0u8; 1024];
-        let mut len = buf.len() as u32;
-        let r = unsafe {
-            RegQueryValueExW(
-                props_key,
-                desc_pkey.as_ptr(),
-                ptr::null_mut(),
-                &mut data_type,
-                buf.as_mut_ptr(),
-                &mut len,
-            )
-        };
-        if r != 0 || data_type != REG_SZ {
-            continue;
-        }
-        let u16_slice = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u16, (len / 2) as usize)
-        };
-        // Trim trailing nulls.
-        let stop = u16_slice.iter().position(|&c| c == 0).unwrap_or(u16_slice.len());
-        let desc = String::from_utf16_lossy(&u16_slice[..stop]);
+        // Match on any of the three names Windows keeps for an endpoint,
+        // because the one that carries our string is not the obvious one.
+        //
+        //   ,2  DeviceDesc              "Speakers"
+        //   ,14 FriendlyName            "Speakers (Stream To Speaker)"
+        //   ,6  interface friendly name "Stream To Speaker"
+        //
+        // DeviceDesc is generated from the endpoint's form factor, so on our
+        // device it reads "Speakers" and contains nothing identifying at
+        // all. Matching only on it — as this did — meant the scan never
+        // found the endpoint and every rename silently bailed.
+        //
+        // ,14 keeps matching after we have renamed, since the name we write
+        // still begins "Stream To Speaker".
+        const NAME_KEYS: [&str; 3] = [
+            "{a45c254e-df1c-4efd-8020-67d146a850e0},14",
+            "{b3f8fa53-0004-438e-9003-51a46e139bfc},6",
+            "{a45c254e-df1c-4efd-8020-67d146a850e0},2",
+        ];
+        let matched = NAME_KEYS.iter().any(|pkey| {
+            let key = to_wide_null(pkey);
+            let mut data_type: u32 = 0;
+            let mut buf = [0u8; 1024];
+            let mut len = buf.len() as u32;
+            let r = unsafe {
+                RegQueryValueExW(
+                    props_key,
+                    key.as_ptr(),
+                    ptr::null_mut(),
+                    &mut data_type,
+                    buf.as_mut_ptr(),
+                    &mut len,
+                )
+            };
+            if r != 0 || data_type != REG_SZ {
+                return false;
+            }
+            let u16_slice = unsafe {
+                std::slice::from_raw_parts(buf.as_ptr() as *const u16, (len / 2) as usize)
+            };
+            // Trim trailing nulls.
+            let stop = u16_slice.iter().position(|&c| c == 0).unwrap_or(u16_slice.len());
+            String::from_utf16_lossy(&u16_slice[..stop]).contains("Stream To Speaker")
+        });
 
-        if desc.contains("Stream To Speaker") {
+        if matched {
             return Ok(Some(format!(r"{{0.0.0.00000000}}.{}", &guid_str)));
         }
     }
