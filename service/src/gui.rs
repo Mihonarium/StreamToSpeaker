@@ -856,6 +856,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 app: app_for_eframe,
                 last_repaint_request: Instant::now(),
                 last_icon_state: IconState::Idle,
+                mark_textures: None,
                 tray,
                 frame_count: 0,
                 confirm_close_open: false,
@@ -886,6 +887,9 @@ struct StreamToSpeakerApp {
     /// What the window/taskbar icon is currently showing, so it is only
     /// pushed to the OS when it actually changes.
     last_icon_state: IconState,
+    /// Header mark, one texture per state. Uploaded on the first frame
+    /// that draws the header, since building one needs a Context.
+    mark_textures: Option<[egui::TextureHandle; 3]>,
     tray: Option<crate::tray::TrayHandle>,
     frame_count: u64,
     confirm_close_open: bool,
@@ -1415,6 +1419,11 @@ impl StreamToSpeakerApp {
             .inner_margin(egui::Margin::symmetric(sp::CARD_H, 0.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    // The mark, showing the same state as the tray and
+                    // taskbar. Sized to the title block beside it.
+                    let tex = self.mark_texture(ui.ctx(), self.icon_state());
+                    ui.image((tex, egui::vec2(38.0, 38.0)));
+                    ui.add_space(sp::S);
                     ui.vertical(|ui| {
                         ui.label(
                             egui::RichText::new("Stream To Speaker")
@@ -1961,20 +1970,48 @@ impl StreamToSpeakerApp {
             });
     }
 
-    /// Keep the taskbar icon in step with what the app is doing, using the
-    /// same three states as the tray. Only pushed on change — sending a
-    /// viewport command every frame would be wasteful and makes the icon
-    /// flicker on some drivers.
-    fn sync_window_icon(&mut self, ctx: &egui::Context) {
+    /// What the mark should be reporting right now. The taskbar icon and
+    /// the header mark both read this, so they cannot drift apart.
+    fn icon_state(&self) -> IconState {
         let bound = self.app.selected_speaker().is_some();
         let enabled = self.app.is_streaming_enabled();
-        let state = if bound && enabled && self.app.stream_active.load(Ordering::Acquire) {
+        if bound && enabled && self.app.stream_active.load(Ordering::Acquire) {
             IconState::Live
         } else if bound && enabled {
             IconState::Standby
         } else {
             IconState::Idle
-        };
+        }
+    }
+
+    /// The header mark, uploaded once and kept. Re-uploading artwork that
+    /// never changes would churn GPU memory every frame; three 64px
+    /// textures cost about 48 KB in total.
+    fn mark_texture(&mut self, ctx: &egui::Context, state: IconState) -> egui::TextureId {
+        let textures = self.mark_textures.get_or_insert_with(|| {
+            let load = |name: &str, rgba: &[u8]| {
+                let image = egui::ColorImage::from_rgba_unmultiplied([64, 64], rgba);
+                ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
+            };
+            [
+                load("mark-idle", MARK_IDLE),
+                load("mark-standby", MARK_STANDBY),
+                load("mark-live", MARK_LIVE),
+            ]
+        });
+        match state {
+            IconState::Idle => textures[0].id(),
+            IconState::Standby => textures[1].id(),
+            IconState::Live => textures[2].id(),
+        }
+    }
+
+    /// Keep the taskbar icon in step with what the app is doing, using the
+    /// same three states as the tray. Only pushed on change — sending a
+    /// viewport command every frame would be wasteful and makes the icon
+    /// flicker on some drivers.
+    fn sync_window_icon(&mut self, ctx: &egui::Context) {
+        let state = self.icon_state();
         if state != self.last_icon_state {
             ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
                 window_icon(state),
@@ -3306,6 +3343,11 @@ enum IconState {
 const WINDOW_IDLE: &[u8] = include_bytes!("../../assets/window-idle-128.rgba");
 const WINDOW_STANDBY: &[u8] = include_bytes!("../../assets/window-standby-128.rgba");
 const WINDOW_LIVE: &[u8] = include_bytes!("../../assets/window-live-128.rgba");
+
+/// The same mark at the size the in-app header draws it.
+const MARK_IDLE: &[u8] = include_bytes!("../../assets/mark-idle-64.rgba");
+const MARK_STANDBY: &[u8] = include_bytes!("../../assets/mark-standby-64.rgba");
+const MARK_LIVE: &[u8] = include_bytes!("../../assets/mark-live-64.rgba");
 
 fn window_icon(state: IconState) -> egui::IconData {
     let rgba = match state {

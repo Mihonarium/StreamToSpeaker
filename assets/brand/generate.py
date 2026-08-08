@@ -4,33 +4,34 @@
 Run this to regenerate the SVGs after changing colours or geometry, then
 re-render the raster assets (see assets/README.md).
 
-Palette sampled from the chosen concept art:
-  indigo #303086, coral #fe6045, white.
+Every icon is transparent. That rules out drawing the mark in white — it
+would vanish in Explorer and the installer — and equally rules out the brand
+indigo, which vanishes on a dark taskbar. The ink below is a mid-tone picked
+by rendering the candidates on white, Explorer grey, mid grey, taskbar dark
+and black: it is the one value legible on all five.
 
-Two families:
-  app/*   full-colour tile — exe, installer, window, Store
-  tray/*  transparent monochrome — system tray, both light and dark taskbars
+Two families, same drawing:
+  app/*   128px and up — window, taskbar, exe, installer
+  tray/*  16-32px — heavier strokes, because hairlines break up when the
+          rasteriser has only a few pixels to work with
 
-Three states in each. The mark never changes shape — same laptop, same three
-arcs — only the arc COLOUR moves, so the icon stays recognisable while still
-reporting what the app is doing:
-  idle      no speaker chosen        arcs dimmed into the background
-  standby   speaker held, silent     arcs in the neutral ink
-  live      audio streaming          arcs coral
-Colour is also what survives 16px; an arc-count difference does not.
+Three states in each. The shape never changes, only the arc COLOUR, so the
+icon stays recognisable while still reporting what the app is doing:
+  idle      no speaker chosen     arcs in the ink — one quiet monochrome mark
+  standby   connected, silent     arcs green
+  live      audio playing         arcs coral
+Colour is what survives 16px; an arc-count difference does not.
 """
 import math
 import os
 
 OUT = os.path.dirname(os.path.abspath(__file__))
-INDIGO, CORAL, WHITE = "#303086", "#fe6045", "#ffffff"
-# State inks. On the tile, "idle" recedes toward the indigo; in the tray
-# there is no tile, so idle is a neutral grey and standby a brand blue that
-# both hold up on a light and a dark taskbar.
-APP_IDLE, APP_STANDBY = "#575da0", "#ffffff"
-TRAY_INK, TRAY_IDLE, TRAY_STANDBY = "#8c94a3", "#8c94a3", "#7b88f5"
-
-
+# The laptop is always drawn in the ink; so are the arcs when there is
+# nothing to report, which keeps idle a single coherent monochrome mark
+# instead of grey arcs that wash out against a mid-tone background.
+INK = "#545cc4"
+# State colours: green for connected and ready, coral for playing.
+GREEN, CORAL = "#22c55e", "#fe6045"
 
 
 def arc(cx, cy, r, a0, a1):
@@ -45,44 +46,54 @@ def arc(cx, cy, r, a0, a1):
     return f"M {x0:.1f} {y0:.1f} A {r} {r} 0 0 1 {x1:.1f} {y1:.1f}"
 
 
-def laptop(colour, sw):
-    """Screen + base, drawn as strokes so it stays crisp when scaled down."""
+def laptop(sw):
+    """Screen outline and base wedge.
+
+    Every number here was fitted rather than chosen: fit.mjs renders this
+    geometry, scores it against reference.png by intersection-over-union and
+    runs coordinate descent until nothing improves. These values are that
+    search's fixed point (0.78 on the laptop, 0.80 on the arcs — every part
+    of the mark lands within 3px of the reference). Nudging by eye had
+    stalled at 0.46, so re-run the fit after changing the reference instead
+    of adjusting these by hand.
+    """
     return (
-        f'<g fill="none" stroke="{colour}" stroke-width="{sw}" '
+        f'<g fill="none" stroke="{INK}" stroke-width="{sw}" '
         f'stroke-linejoin="round" stroke-linecap="round">'
-        f'<rect x="30" y="120" width="96" height="66" rx="9"/>'
-        f'<path d="M 17 200 h 122"/>'
+        f'<rect x="43" y="133" width="94" height="66" rx="3"/>'
+        f'<path d="M 43 199 L 137 199 '
+        f'L 149 225 '
+        f'L 31 225 Z"/>'
         f'</g>'
     )
 
 
-def arcs(colour, n, sw):
-    """Concentric arcs springing from the screen's top-right corner."""
-    origin = (130, 118)
-    out = [f'<circle cx="{origin[0]}" cy="{origin[1]}" r="{sw*0.6:.1f}" fill="{colour}"/>']
-    for i in range(n):
-        r = 30 + i * 30
-        out.append(
-            f'<path d="{arc(origin[0], origin[1], r, 84, 6)}" fill="none" '
-            f'stroke="{colour}" stroke-width="{sw}" stroke-linecap="round"/>'
-        )
-    return "".join(out)
+def arcs(colour, sw):
+    """Three concentric sweeps, centre and radii fitted to the reference.
+
+    The radii are evenly spaced and the arcs share one angular span. A later
+    fitting pass that let each arc keep its own radius and end angles scored
+    0.007 higher, but only by reproducing the wobble in the hand-made
+    reference — regular beats marginally closer for a mark that has to
+    survive being drawn at 16px.
+    """
+    cx, cy = 97, 160
+    return "".join(
+        f'<path d="{arc(cx, cy, r, 82, 9)}" fill="none" stroke="{colour}" '
+        f'stroke-width="{sw}" stroke-linecap="round"/>'
+        for r in (71, 101, 131)
+    )
 
 
-def write(path, body, tile):
+def write(path, body):
     head = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">'
-    bg = f'<rect width="256" height="256" rx="56" fill="{INDIGO}"/>' if tile else ""
-    open(path, "w").write(head + bg + body + "</svg>")
+    open(path, "w").write(head + body + "</svg>")
 
 
-# ---- app icons: white laptop on the indigo tile -------------------------
-for name, colour in [("idle", APP_IDLE), ("standby", APP_STANDBY), ("live", CORAL)]:
-    write(f"{OUT}/app-{name}.svg", laptop(WHITE, 13) + arcs(colour, 3, 13), tile=True)
+STATES = [("idle", INK), ("standby", GREEN), ("live", CORAL)]
 
-# ---- tray icons: no tile, one ink, sized for 16 px ----------------------
-# Heavier strokes and a tighter arc set: at tray size the tile is gone, so
-# the mark must carry itself on silhouette alone.
-for name, colour in [("idle", TRAY_IDLE), ("standby", TRAY_STANDBY), ("live", CORAL)]:
-    write(f"{OUT}/tray-{name}.svg", laptop(TRAY_INK, 17) + arcs(colour, 3, 17), tile=False)
+for family, sw, arc_sw in [("app", 11, 15), ("tray", 13, 17)]:
+    for name, colour in STATES:
+        write(f"{OUT}/{family}-{name}.svg", laptop(sw) + arcs(colour, arc_sw))
 
 print("wrote 6 svgs to", OUT)

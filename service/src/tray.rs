@@ -428,9 +428,10 @@ fn open_web_ui(advertise_ip: &str, port: u16) {
 /// recognisable at 16 px; colour is what still reads at that size.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum IconState {
-    /// No speaker chosen: arcs neutral grey.
+    /// No speaker chosen: arcs in the ink, so the mark reads as one
+    /// monochrome shape with nothing to report.
     Idle,
-    /// Speaker held, nothing playing: arcs brand blue.
+    /// Speaker held, nothing playing: arcs green.
     Standby,
     /// Audio streaming: arcs coral.
     Live,
