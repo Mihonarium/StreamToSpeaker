@@ -27,6 +27,8 @@ grey, taskbar dark and black alike.
 | `StreamToSpeaker.ico` | the exe resource (`service/build.rs`), `SetupIconFile`, and every shortcut |
 | `window-*-128.rgba` | window and taskbar icon, swapped at runtime as state changes |
 | `tray-*-32.rgba` | system-tray icon, swapped the same way |
+| `mark-*-64.rgba` | the mark in the app's own header, swapped the same way |
+| `banner.gif` | the README header |
 | `brand/*.svg` | the source of all of the above |
 | `brand/reference.png` | the concept art the geometry is fitted to |
 

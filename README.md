@@ -1,10 +1,8 @@
-# Stream To Speaker
+![Stream To Speaker — play your PC's sound on AirPlay, Sonos, and UPnP speakers](assets/banner.gif)
 
 [![Build installer](https://github.com/Mihonarium/StreamToSpeaker/actions/workflows/build.yml/badge.svg)](https://github.com/Mihonarium/StreamToSpeaker/actions/workflows/build.yml)
 [![Source: MPL-2.0](https://img.shields.io/badge/source-MPL--2.0-blue)](LICENSE)
 [![Binaries: all rights reserved](https://img.shields.io/badge/binaries-all%20rights%20reserved-orange)](LICENSE-BINARIES.md)
-
-Play your PC's sound on AirPlay, Sonos and UPnP speakers.
 
 Stream To Speaker adds a virtual audio output to Windows and streams it over
 the network — to Sonos, IKEA SYMFONISK, KEF, Denon HEOS, MoOde and Volumio
