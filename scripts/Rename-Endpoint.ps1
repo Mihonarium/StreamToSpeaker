@@ -9,8 +9,9 @@
 # RPCs into audiosrv (SYSTEM) which then applies state authoritatively.
 #
 # This script:
-#   1. Finds the render endpoint whose DeviceDesc starts with our
-#      product name.
+#   1. Finds the render endpoint carrying our product name in any of its
+#      three name properties (see the note by $nameKeys — DeviceDesc, the
+#      obvious one, never contains it).
 #   2. Sets its friendly name via IPolicyConfig::SetPropertyValue
 #      (PKEY_Device_FriendlyName) - same path Sound Settings'
 #      Rename button writes to.
@@ -140,6 +141,7 @@ namespace StreamToSpeaker {
     $pkeyFriendlyName_fmtid = [guid] "a45c254e-df1c-4efd-8020-67d146a850e0"
     $pkeyFriendlyName_pid   = 14
     $pkeyDeviceDescStr      = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"
+    $pkeyFriendlyNameStr    = "{a45c254e-df1c-4efd-8020-67d146a850e0},14"
 
     # Find-our-endpoint with a retry loop. devcon install returns the
     # moment the PnP layer has accepted the device; AudioEndpointBuilder
@@ -150,24 +152,40 @@ namespace StreamToSpeaker {
     # would still see the "Allow" toggle off the next time they opened
     # Sound Settings.
     #
-    # Match anywhere in DeviceDesc (not just prefix). On some Windows
-    # versions the cached DeviceDesc starts with a placeholder prefix
-    # ("Internal AUX Jack — Stream To Speaker") rather than our INF
-    # value — using "$Match*" would miss those entries and leave the
-    # endpoint disabled forever. "*$Match*" catches both clean and
-    # prefixed names.
+    # Match on any of the three names Windows keeps for an endpoint. The
+    # obvious one is the wrong one: DeviceDesc is copied from the friendly
+    # name registered for the bridge pin's KSNODETYPE_SPEAKER category, so
+    # on a healthy install it reads "Speakers" and contains nothing of ours
+    # at all. Our product name lives in the other two — "Speakers (Stream
+    # To Speaker)" in FriendlyName and "Stream To Speaker" in the device
+    # interface name. Matching DeviceDesc alone found nothing and this
+    # script exited 2 every time.
+    #
+    #   ,2  DeviceDesc               "Speakers"
+    #   ,14 FriendlyName             "Speakers (Stream To Speaker)"
+    #   ,6  DeviceInterface name     "Stream To Speaker"
+    $nameKeys = @(
+        "{a45c254e-df1c-4efd-8020-67d146a850e0},14",
+        "{b3f8fa53-0004-438e-9003-51a46e139bfc},6",
+        $pkeyDeviceDescStr
+    )
     function Find-OurEndpoints {
-        $matches = @()
+        $found = @()
         Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
             $endpointGuid = $_.PSChildName
             $propsPath = Join-Path $_.PSPath "Properties"
             if (-not (Test-Path $propsPath)) { return }
-            $desc = (Get-ItemProperty -Path $propsPath -Name $pkeyDeviceDescStr -ErrorAction SilentlyContinue).$pkeyDeviceDescStr
-            if ($desc -and $desc -like "*$Match*") {
-                $matches += [pscustomobject]@{ Guid = $endpointGuid; Desc = $desc }
+            $props = Get-ItemProperty -Path $propsPath -ErrorAction SilentlyContinue
+            $hit = $null
+            foreach ($k in $nameKeys) {
+                $v = $props.$k
+                if ($v -and $v -like "*$Match*") { $hit = $v; break }
+            }
+            if ($hit) {
+                $found += [pscustomobject]@{ Guid = $endpointGuid; Desc = $hit }
             }
         }
-        $matches
+        $found
     }
 
     $endpoints = @()
@@ -184,7 +202,7 @@ namespace StreamToSpeaker {
     }
 
     if ($endpoints.Count -eq 0) {
-        Write-Warning "No render endpoint matched DeviceDesc starting with '$Match' after ${maxAttempts}s."
+        Write-Warning "No render endpoint matched '$Match' in DeviceDesc, FriendlyName or the interface name after ${maxAttempts}s."
         Write-Warning "Either the driver isn't installed, or AudioEndpointBuilder hasn't enrolled the endpoint."
         Write-Warning "Try signing out and back in if you just installed."
         exit 2
@@ -254,6 +272,17 @@ namespace StreamToSpeaker {
             Write-Host "  SetStringProperty(FriendlyName='$Name') OK"
         } else {
             Write-Warning "  SetStringProperty failed: HRESULT 0x$('{0:X8}' -f $hr)"
+        }
+
+        # S_OK only means audiosrv accepted the RPC. AudioEndpointBuilder
+        # can still recompose the name from the pin category afterwards,
+        # which looks identical to success unless we read it back.
+        $applied = (Get-ItemProperty -Path "$base\$($ep.Guid)\Properties" `
+            -Name $pkeyFriendlyNameStr -ErrorAction SilentlyContinue).$pkeyFriendlyNameStr
+        if ($applied -eq $Name) {
+            Write-Host "  verified: endpoint is now '$applied'"
+        } else {
+            Write-Warning "  rename did not stick: wanted '$Name', Windows kept '$applied'"
         }
 
         # --- Verify DeviceState landed on ACTIVE (==1). If it stays at

@@ -147,9 +147,77 @@ pub fn update_endpoint_name(active_speaker: Option<&str>) {
 
 fn do_update(new_name: &str) -> Result<()> {
     let Some(endpoint_id) = find_our_endpoint_id()? else {
-        bail!("no Stream To Speaker endpoint found in MMDevices");
+        bail!(
+            "no Stream To Speaker endpoint found in MMDevices\\Audio\\Render \
+             (is the driver installed and the endpoint enrolled?)"
+        );
     };
-    set_endpoint_friendly_name(&endpoint_id, new_name)
+    set_endpoint_friendly_name(&endpoint_id, new_name)?;
+
+    // Read the name back. IPolicyConfig returning S_OK is not proof the
+    // name stuck: it is an RPC into audiosrv, which can accept the call
+    // and then have AudioEndpointBuilder recompose the name from the pin
+    // category afterwards. Without this check a silent recompose looks
+    // exactly like success, which is how the original bug hid for so
+    // long — the failing step reported nothing at all.
+    let Some((_, guid)) = endpoint_id.rsplit_once('.') else {
+        return Ok(());
+    };
+    match read_friendly_name(guid) {
+        Some(actual) if actual == new_name => {
+            log::info!("Windows endpoint renamed to {:?}", actual);
+        }
+        Some(actual) => {
+            log::warn!(
+                "endpoint rename did not stick: asked for {:?}, Windows kept {:?}",
+                new_name,
+                actual
+            );
+        }
+        None => log::warn!("endpoint renamed but the name could not be read back"),
+    }
+    Ok(())
+}
+
+/// Current `PKEY_Device_FriendlyName` of the endpoint whose MMDevices key
+/// is `guid`, straight from the registry — used to confirm a rename landed.
+fn read_friendly_name(guid: &str) -> Option<String> {
+    let path = format!(
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\{}\Properties",
+        guid
+    );
+    let path_w = to_wide_null(&path);
+    let mut key: HKEY = ptr::null_mut();
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path_w.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
+        return None;
+    }
+    let _guard = CloseKeyOnDrop(key);
+    read_string_value(key, "{a45c254e-df1c-4efd-8020-67d146a850e0},14")
+}
+
+/// Read one REG_SZ property value out of an endpoint's Properties key.
+fn read_string_value(key: HKEY, pkey: &str) -> Option<String> {
+    let name = to_wide_null(pkey);
+    let mut data_type: u32 = 0;
+    let mut buf = [0u8; 1024];
+    let mut len = buf.len() as u32;
+    let r = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            ptr::null_mut(),
+            &mut data_type,
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    if r != 0 || data_type != REG_SZ {
+        return None;
+    }
+    let u16_slice =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u16, (len / 2) as usize) };
+    let stop = u16_slice.iter().position(|&c| c == 0).unwrap_or(u16_slice.len());
+    Some(String::from_utf16_lossy(&u16_slice[..stop]))
 }
 
 /// Scan `HKLM\...\MMDevices\Audio\Render\*` and return the device id
@@ -235,32 +303,17 @@ fn find_our_endpoint_id() -> Result<Option<String>> {
             "{a45c254e-df1c-4efd-8020-67d146a850e0},2",
         ];
         let matched = NAME_KEYS.iter().any(|pkey| {
-            let key = to_wide_null(pkey);
-            let mut data_type: u32 = 0;
-            let mut buf = [0u8; 1024];
-            let mut len = buf.len() as u32;
-            let r = unsafe {
-                RegQueryValueExW(
-                    props_key,
-                    key.as_ptr(),
-                    ptr::null_mut(),
-                    &mut data_type,
-                    buf.as_mut_ptr(),
-                    &mut len,
-                )
-            };
-            if r != 0 || data_type != REG_SZ {
-                return false;
-            }
-            let u16_slice = unsafe {
-                std::slice::from_raw_parts(buf.as_ptr() as *const u16, (len / 2) as usize)
-            };
-            // Trim trailing nulls.
-            let stop = u16_slice.iter().position(|&c| c == 0).unwrap_or(u16_slice.len());
-            String::from_utf16_lossy(&u16_slice[..stop]).contains("Stream To Speaker")
+            read_string_value(props_key, pkey)
+                .is_some_and(|v| v.contains("Stream To Speaker"))
         });
 
         if matched {
+            log::debug!(
+                "matched endpoint {} (desc={:?}, friendly={:?})",
+                guid_str,
+                read_string_value(props_key, NAME_KEYS[2]),
+                read_string_value(props_key, NAME_KEYS[0]),
+            );
             return Ok(Some(format!(r"{{0.0.0.00000000}}.{}", &guid_str)));
         }
     }
