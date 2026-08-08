@@ -13,7 +13,13 @@ recognisable, colour is what still reads at 16 px.
 | --- | --- | --- |
 | `idle` | no speaker chosen | ink — the whole mark goes monochrome |
 | `standby` | speaker held, nothing playing | green |
-| `live` | audio streaming | coral |
+| `live` | audio streaming | brighter green |
+
+Both connected states are green: the icon exists to answer "is this
+working?", and it cannot if the green only shows in the moment before audio
+starts. Coral is reserved for `app-brand.svg` — the static mark the exe,
+installer and shortcut wear, which should not look like it is reporting a
+state.
 
 Every icon is transparent, which fixes the ink. White would disappear in
 Explorer and the installer; the brand indigo would disappear on a dark
@@ -24,7 +30,7 @@ grey, taskbar dark and black alike.
 
 | file | used by |
 | --- | --- |
-| `StreamToSpeaker.ico` | the exe resource (`service/build.rs`), `SetupIconFile`, and every shortcut |
+| `StreamToSpeaker.ico` | the exe resource (`service/build.rs`), `SetupIconFile`, and every shortcut — rendered from `brand/app-brand.svg` |
 | `window-*-128.rgba` | window and taskbar icon, swapped at runtime as state changes |
 | `tray-*-32.rgba` | system-tray icon, swapped the same way |
 | `mark-*-64.rgba` | the mark in the app's own header, swapped the same way |
