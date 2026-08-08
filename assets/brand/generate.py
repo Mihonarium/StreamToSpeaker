@@ -4,31 +4,34 @@
 Run this to regenerate the SVGs after changing colours or geometry, then
 re-render the raster assets (see assets/README.md).
 
-Palette sampled from the chosen concept art:
-  indigo #303086, coral #fe6045, white.
+Every icon is transparent. That rules out drawing the mark in white — it
+would vanish in Explorer and the installer — and equally rules out the brand
+indigo, which vanishes on a dark taskbar. The ink below is a mid-tone picked
+by rendering the candidates on white, Explorer grey, mid grey, taskbar dark
+and black: it is the one value legible on all five.
 
-Two families:
-  app/*   full-colour tile — exe, installer, window, Store
-  tray/*  transparent monochrome — system tray, both light and dark taskbars
+Two families, same drawing:
+  app/*   128px and up — window, taskbar, exe, installer
+  tray/*  16-32px — heavier strokes, because hairlines break up when the
+          rasteriser has only a few pixels to work with
 
-Three states in each. The mark never changes shape — same laptop, same three
-arcs — only the arc COLOUR moves, so the icon stays recognisable while still
-reporting what the app is doing:
-  idle      no speaker chosen        arcs dimmed into the background
-  standby   speaker held, silent     arcs in the neutral ink
-  live      audio streaming          arcs coral
-Colour is also what survives 16px; an arc-count difference does not.
+Three states in each. The shape never changes, only the arc COLOUR, so the
+icon stays recognisable while still reporting what the app is doing:
+  idle      no speaker chosen     arcs in the ink — one quiet monochrome mark
+  standby   connected, silent     arcs green
+  live      audio playing         arcs coral
+Colour is what survives 16px; an arc-count difference does not.
 """
 import math
 import os
 
 OUT = os.path.dirname(os.path.abspath(__file__))
-INDIGO, CORAL, WHITE = "#303086", "#fe6045", "#ffffff"
-# State inks. On the tile, "idle" recedes toward the indigo; in the tray
-# there is no tile, so idle is a neutral grey and standby a brand blue that
-# both hold up on a light and a dark taskbar.
-APP_IDLE, APP_STANDBY = "#575da0", "#ffffff"
-TRAY_INK, TRAY_IDLE, TRAY_STANDBY = "#8c94a3", "#8c94a3", "#7b88f5"
+# The laptop is always drawn in the ink; so are the arcs when there is
+# nothing to report, which keeps idle a single coherent monochrome mark
+# instead of grey arcs that wash out against a mid-tone background.
+INK = "#545cc4"
+# State colours: green for connected and ready, coral for playing.
+GREEN, CORAL = "#22c55e", "#fe6045"
 
 
 def arc(cx, cy, r, a0, a1):
@@ -43,7 +46,7 @@ def arc(cx, cy, r, a0, a1):
     return f"M {x0:.1f} {y0:.1f} A {r} {r} 0 0 1 {x1:.1f} {y1:.1f}"
 
 
-def laptop(colour, sw):
+def laptop(sw):
     """Screen outline and base wedge.
 
     Every number here was fitted rather than chosen: fit.mjs renders this
@@ -55,7 +58,7 @@ def laptop(colour, sw):
     of adjusting these by hand.
     """
     return (
-        f'<g fill="none" stroke="{colour}" stroke-width="{sw}" '
+        f'<g fill="none" stroke="{INK}" stroke-width="{sw}" '
         f'stroke-linejoin="round" stroke-linecap="round">'
         f'<rect x="43" y="133" width="94" height="66" rx="3"/>'
         f'<path d="M 43 199 L 137 199 '
@@ -65,7 +68,7 @@ def laptop(colour, sw):
     )
 
 
-def arcs(colour, n, sw):
+def arcs(colour, sw):
     """Three concentric sweeps, centre and radii fitted to the reference.
 
     The radii are evenly spaced and the arcs share one angular span. A later
@@ -78,26 +81,19 @@ def arcs(colour, n, sw):
     return "".join(
         f'<path d="{arc(cx, cy, r, 82, 9)}" fill="none" stroke="{colour}" '
         f'stroke-width="{sw}" stroke-linecap="round"/>'
-        for r in (71, 101, 131)[:n]
+        for r in (71, 101, 131)
     )
 
 
-def write(path, body, tile):
+def write(path, body):
     head = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">'
-    # Square, not rounded: Windows draws app icons unrounded, so a radius
-    # here would just be indigo missing from the corners.
-    bg = f'<rect width="256" height="256" fill="{INDIGO}"/>' if tile else ""
-    open(path, "w").write(head + bg + body + "</svg>")
+    open(path, "w").write(head + body + "</svg>")
 
 
-# ---- app icons: white laptop on the indigo tile -------------------------
-for name, colour in [("idle", APP_IDLE), ("standby", APP_STANDBY), ("live", CORAL)]:
-    write(f"{OUT}/app-{name}.svg", laptop(WHITE, 11) + arcs(colour, 3, 15), tile=True)
+STATES = [("idle", INK), ("standby", GREEN), ("live", CORAL)]
 
-# ---- tray icons: no tile, one ink, sized for 16 px ----------------------
-# Same geometry, heavier strokes: at tray size the tile is gone, so the
-# mark has only its silhouette to carry it.
-for name, colour in [("idle", TRAY_IDLE), ("standby", TRAY_STANDBY), ("live", CORAL)]:
-    write(f"{OUT}/tray-{name}.svg", laptop(TRAY_INK, 13) + arcs(colour, 3, 17), tile=False)
+for family, sw, arc_sw in [("app", 11, 15), ("tray", 13, 17)]:
+    for name, colour in STATES:
+        write(f"{OUT}/{family}-{name}.svg", laptop(sw) + arcs(colour, arc_sw))
 
 print("wrote 6 svgs to", OUT)

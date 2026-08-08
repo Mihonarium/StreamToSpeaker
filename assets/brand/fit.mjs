@@ -60,7 +60,10 @@ const out = await pg.evaluate(async ({refB64, START, SCORE_ONLY}) => {
         const [x0, y0] = p(a0), [x1, y1] = p(a1);
         return `M ${x0.toFixed(1)} ${y0.toFixed(1)} A ${r} ${r} 0 0 1 ${x1.toFixed(1)} ${y1.toFixed(1)}`;
     };
-    // Must stay in step with generate.py — same shapes, same order.
+    // Must stay in step with generate.py — same shapes, same order. The
+    // colours here are the REFERENCE's (white on an indigo tile), not the
+    // ones the icons ship in: this fits geometry, and the masks only need to
+    // separate laptop from arcs in both images.
     const svgOf = p => `<svg xmlns="http://www.w3.org/2000/svg" width="${S}" height="${S}"
         viewBox="0 0 ${S} ${S}"><rect width="${S}" height="${S}" fill="#303086"/>
         <g fill="none" stroke="#ffffff" stroke-width="${p.stroke}"

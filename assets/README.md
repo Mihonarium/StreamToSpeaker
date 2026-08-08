@@ -11,9 +11,14 @@ recognisable, colour is what still reads at 16 px.
 
 | state | meaning | arcs |
 | --- | --- | --- |
-| `idle` | no speaker chosen | receded (tile) / grey (tray) |
-| `standby` | speaker held, nothing playing | white (tile) / blue (tray) |
+| `idle` | no speaker chosen | ink — the whole mark goes monochrome |
+| `standby` | speaker held, nothing playing | green |
 | `live` | audio streaming | coral |
+
+Every icon is transparent, which fixes the ink. White would disappear in
+Explorer and the installer; the brand indigo would disappear on a dark
+taskbar. `#545cc4` is the mid-tone that survives white, Explorer grey, mid
+grey, taskbar dark and black alike.
 
 ## Files
 
