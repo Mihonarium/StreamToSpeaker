@@ -433,7 +433,8 @@ pub enum IconState {
     Idle,
     /// Speaker held, nothing playing: arcs green.
     Standby,
-    /// Audio streaming: arcs coral.
+    /// Audio streaming: arcs a brighter green. Both connected states are
+    /// green because the question the icon answers is "is this working?".
     Live,
 }
 
