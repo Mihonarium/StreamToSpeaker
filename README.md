@@ -4,13 +4,12 @@
 [![Source: MPL-2.0](https://img.shields.io/badge/source-MPL--2.0-blue)](LICENSE)
 [![Binaries: all rights reserved](https://img.shields.io/badge/binaries-all%20rights%20reserved-orange)](LICENSE-BINARIES.md)
 
-Play your PC's sound on real speakers anywhere in the house.
+Play your PC's sound on AirPlay, Sonos and UPnP speakers.
 
-Stream To Speaker adds a virtual audio output to Windows and streams it to
-network speakers: **UPnP / OpenHome** (Sonos, IKEA SYMFONISK, KEF, Denon
-HEOS, MoOde, Volumio, …) and **AirPlay** (HomePod, AirPort Express,
-shairport-sync, …). Windows volume and the speaker's own buttons stay in
-sync.
+Stream To Speaker adds a virtual audio output to Windows and streams it over
+the network — to Sonos, IKEA SYMFONISK, KEF, Denon HEOS, MoOde and Volumio
+over **UPnP / OpenHome**, and to HomePod, AirPort Express and shairport-sync
+over **AirPlay**. Windows volume and the speaker's own buttons stay in sync.
 
 ## Install
 
