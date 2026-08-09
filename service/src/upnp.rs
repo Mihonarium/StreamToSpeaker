@@ -347,15 +347,27 @@ fn soap_post(control_url: &str, soap_action: &str, body: &str) -> Result<String>
 
     let mut buf = Vec::with_capacity(4096);
     stream.read_to_end(&mut buf)?;
-    let text = String::from_utf8_lossy(&buf).to_string();
 
-    let (head, body_part) = text.split_once("\r\n\r\n").unwrap_or((&text[..], ""));
+    // Split head/body on bytes, then peel chunked transfer-encoding if
+    // present. Sonos chunks HTTP/1.1 responses (same behavior ssdp.rs's
+    // http_get dodges by speaking HTTP/1.0); small SOAP replies fit one
+    // chunk and parsed fine by accident, but GetZoneGroupState bodies
+    // run tens of KB and interior chunk-size lines would corrupt the
+    // escaped XML. decode_maybe_chunked is a no-op for plain bodies.
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(buf.len());
+    let head = String::from_utf8_lossy(&buf[..split]);
+    let body_part = crate::ssdp::decode_maybe_chunked(&buf[split..]);
+
     let status_line = head.lines().next().unwrap_or("");
     debug!("SOAP {} -> {}", soap_action, status_line);
     if !status_line.contains(" 200 ") {
         return Err(anyhow!("SOAP {} failed: {}", soap_action, status_line));
     }
-    Ok(body_part.to_string())
+    Ok(String::from_utf8_lossy(&body_part).into_owned())
 }
 
 /// Minimal XML attribute / text escape.

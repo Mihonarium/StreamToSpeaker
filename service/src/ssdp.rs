@@ -514,7 +514,10 @@ fn find_header_body_split(buf: &[u8]) -> Option<usize> {
 
 /// If the body starts with a hex chunk-size line (Transfer-Encoding:
 /// chunked), decode the chunks. Otherwise returns the body unchanged.
-fn decode_maybe_chunked(body: &[u8]) -> Vec<u8> {
+/// Shared with upnp.rs's SOAP client — Sonos chunks its HTTP/1.1
+/// responses, and a large GetZoneGroupState body straddles multiple
+/// chunks whose size lines would otherwise corrupt the XML mid-payload.
+pub(crate) fn decode_maybe_chunked(body: &[u8]) -> Vec<u8> {
     // Heuristic: a hex chunk-size line is short, ends with \r\n, and is
     // followed by binary data. If the first \r\n we see is preceded by
     // pure hex digits, treat as chunked.
@@ -562,5 +565,25 @@ impl ToSocketAddrFirst for (&str, u16) {
         addrs
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no addrs"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dechunks_multi_chunk_body() {
+        // Two chunks whose boundary lands mid-payload — the case a big
+        // GetZoneGroupState response hits: interior chunk-size lines
+        // must not leak into the reassembled XML.
+        let body = b"c\r\n<ZoneGroupSt\r\n4\r\nate>\r\n0\r\n\r\n";
+        assert_eq!(decode_maybe_chunked(body), b"<ZoneGroupState>");
+    }
+
+    #[test]
+    fn plain_body_passes_through() {
+        let body = b"<?xml version=\"1.0\"?><Envelope/>";
+        assert_eq!(decode_maybe_chunked(body), body);
     }
 }

@@ -117,8 +117,12 @@ pub fn parse_zone_group_state(xml: &str) -> Vec<ZoneGroup> {
             let Some(uuid) = m.attribute("UUID") else {
                 continue;
             };
+            // IsZoneBridge covers BRIDGE/BOOST units — no audio output,
+            // never a valid target (SoCo excludes them from visible
+            // zones the same way, independently of Invisible).
             let invisible = m.tag_name().name() == "Satellite"
-                || m.attribute("Invisible").map(|v| v == "1").unwrap_or(false);
+                || m.attribute("Invisible").map(|v| v == "1").unwrap_or(false)
+                || m.attribute("IsZoneBridge").map(|v| v == "1").unwrap_or(false);
             members.push(ZoneMember {
                 uuid: uuid.to_string(),
                 zone_name: m.attribute("ZoneName").unwrap_or("").to_string(),
@@ -397,6 +401,36 @@ mod tests {
         let solo = &renderers[1];
         assert!(solo.group_members.is_empty());
         assert!(!solo.is_group());
+    }
+
+    #[test]
+    fn bridge_units_are_invisible() {
+        // BOOST/BRIDGE: its own single-member group, flagged
+        // IsZoneBridge="1" (SoCo excludes these from visible zones too).
+        let xml = r#"<ZoneGroupState><ZoneGroups>
+<ZoneGroup Coordinator="RINCON_BRIDGE" ID="RINCON_BRIDGE:1">
+  <ZoneGroupMember UUID="RINCON_BRIDGE" Location="http://192.168.1.20:1400/xml/device_description.xml" ZoneName="BOOST" IsZoneBridge="1"/>
+</ZoneGroup>
+</ZoneGroups></ZoneGroupState>"#;
+        let groups = parse_zone_group_state(xml);
+        assert!(groups[0].members[0].invisible);
+        let mut renderers = vec![renderer("uuid:RINCON_BRIDGE", "BOOST")];
+        apply_topology(&mut renderers, &groups, &|_| None);
+        assert!(renderers.is_empty());
+    }
+
+    #[test]
+    fn parses_pre_10_1_shape_without_zonegroups_wrapper() {
+        // Pre-10.1 S1 firmware: ZoneGroup elements sit directly under
+        // ZoneGroupState, no <ZoneGroups> (SoCo's compatibility case).
+        let xml = r#"<ZoneGroupState>
+<ZoneGroup Coordinator="RINCON_AAA" ID="RINCON_AAA:1">
+  <ZoneGroupMember UUID="RINCON_AAA" Location="http://192.168.1.10:1400/xml/device_description.xml" ZoneName="Den"/>
+</ZoneGroup>
+</ZoneGroupState>"#;
+        let groups = parse_zone_group_state(xml);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members[0].zone_name, "Den");
     }
 
     #[test]

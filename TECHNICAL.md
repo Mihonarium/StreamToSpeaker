@@ -115,19 +115,29 @@ substring or an IPv4 literal; `--list-speakers` prints and exits. Without
 
 ### Sonos groups
 
-Discovery queries the Sonos `ZoneGroupTopology` service (`GetZoneGroupState`)
-and folds the zone-group state into the list (`sonos.rs`): bonded invisible
-units (stereo-pair slaves, Subs, surrounds) and grouped non-coordinator
-members are hidden — sending `SetAVTransportURI` to a member would silently
-rip it out of its group — and each group appears as its coordinator, named
-"Living Room + Kitchen" (or "+ N" beyond two). `--player` also matches group
-member names. Selecting a speaker re-checks topology from the device itself
-and redirects to its current coordinator, so a list stale by up to one
-discovery interval can't break a group. Group sessions route volume through
-`GroupRenderingControl` on the coordinator (`SetGroupVolume` scales every
-member, like the Sonos app's group slider) and subscribe GENA to its flat
-`GroupVolume`/`GroupMute` events instead of `RenderingControl`'s
-`LastChange`.
+Discovery queries the Sonos `ZoneGroupTopology` service (`GetZoneGroupState`,
+answered by any player) and folds the zone-group state into the list
+(`sonos.rs`): bonded invisible units (stereo-pair slaves, Subs, surrounds —
+`Invisible="1"` members and `Satellite` children), BRIDGE/BOOST units
+(`IsZoneBridge="1"`), and grouped non-coordinator members are hidden, and
+each group appears as its coordinator, named "Living Room + Kitchen" (or
+"+ N" beyond two). Members are hidden because `SetAVTransportURI` *is*
+Sonos's group-membership mechanism — `x-rincon:<coordinator-UUID>` joins a
+zone to a group, so pointing a member at a normal stream URI changes its
+membership instead of coexisting with it (SoCo hard-errors client-side on
+any transport call to a non-coordinator for the same reason). `--player`
+also matches group member names. Selecting a speaker re-checks topology from
+the device itself and redirects to its current coordinator, so a list stale
+by up to one discovery interval can't break a group. Group sessions route
+volume through `GroupRenderingControl` on the coordinator —
+`SetGroupVolume`/`SetGroupMute` scale every member proportionally like the
+Sonos app's group slider, and error 701 anywhere else — and subscribe GENA
+to its flat `GroupVolume`/`GroupMute` events instead of `RenderingControl`'s
+`LastChange`. Both ZoneGroupState shapes are handled (S2 wraps
+`<ZoneGroups>` in `<ZoneGroupState>`; pre-10.1 S1 doesn't), and the SOAP
+client de-chunks response bodies — Sonos chunks HTTP/1.1 responses, which
+small replies survive by accident but a multi-KB `GetZoneGroupState` does
+not.
 
 ## Latency control
 
