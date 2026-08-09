@@ -59,7 +59,9 @@ impl ActiveSession {
 
     pub fn friendly_name(&self) -> String {
         match self {
-            ActiveSession::Upnp(s) => s.renderer.friendly_name.clone(),
+            // display_name shows "Living Room + Kitchen" when streaming
+            // to a Sonos group (identical to friendly_name otherwise).
+            ActiveSession::Upnp(s) => s.renderer.display_name(),
             ActiveSession::AirPlay(s) => s.renderer.friendly_name.clone(),
             ActiveSession::AirPlay2(s) => s.renderer.friendly_name.clone(),
         }
@@ -85,13 +87,15 @@ impl ActiveSession {
     }
 
     /// Push a volume change to the speaker. UPnP path goes via
-    /// SetVolume SOAP; AirPlay path goes via SET_PARAMETER over the
-    /// existing RTSP socket.
+    /// SetVolume SOAP (SetGroupVolume when streaming to a Sonos group,
+    /// so the whole group scales like its Sonos-app slider); AirPlay
+    /// path goes via SET_PARAMETER over the existing RTSP socket.
     pub fn set_volume_pct(&self, pct: u32) -> Result<()> {
         match self {
-            ActiveSession::Upnp(s) => {
-                upnp::set_volume(&s.renderer.rendering_control_control_url, pct)
-            }
+            ActiveSession::Upnp(s) => match s.renderer.group_volume_control_url() {
+                Some(url) => upnp::set_group_volume(url, pct),
+                None => upnp::set_volume(&s.renderer.rendering_control_control_url, pct),
+            },
             ActiveSession::AirPlay(s) => s.set_volume_pct(pct),
             ActiveSession::AirPlay2(s) => s.set_volume_pct(pct),
         }
@@ -121,9 +125,10 @@ impl ActiveSession {
     /// Push a mute state to the speaker.
     pub fn set_mute(&self, muted: bool) -> Result<()> {
         match self {
-            ActiveSession::Upnp(s) => {
-                upnp::set_mute(&s.renderer.rendering_control_control_url, muted)
-            }
+            ActiveSession::Upnp(s) => match s.renderer.group_volume_control_url() {
+                Some(url) => upnp::set_group_mute(url, muted),
+                None => upnp::set_mute(&s.renderer.rendering_control_control_url, muted),
+            },
             ActiveSession::AirPlay(s) => s.set_mute(muted),
             ActiveSession::AirPlay2(s) => s.set_mute(muted),
         }
@@ -534,12 +539,29 @@ impl App {
                 let id = r.stable_id();
                 let active = active_id.as_deref() == Some(id.as_str());
                 upnp_ips.insert(r.ip.to_string());
+                // Sonos group coordinators present as one row for the
+                // whole group ("Living Room + Kitchen"); the grouped
+                // members themselves are filtered out at discovery time
+                // because streaming to one would silently ungroup it.
+                let note = r.is_group().then(|| {
+                    let mut all = vec![r
+                        .zone_name
+                        .clone()
+                        .unwrap_or_else(|| r.friendly_name.clone())];
+                    all.extend(r.group_members.iter().cloned());
+                    format!(
+                        "Sonos group: {}. Audio plays on every speaker in the group and the \
+                         volume slider moves the whole group. To stream to a single speaker, \
+                         ungroup it in the Sonos app first.",
+                        all.join(" + ")
+                    )
+                });
                 speakers.push(SpeakerInfo {
                     id,
-                    friendly_name: r.friendly_name,
+                    friendly_name: r.display_name(),
                     ip: r.ip.to_string(),
                     active,
-                    note: None,
+                    note,
                 });
             }
         }
@@ -669,7 +691,7 @@ impl App {
                 .discovery
                 .as_ref()
                 .and_then(|d| d.find_by_id(id))
-                .map(|r| r.friendly_name)
+                .map(|r| r.display_name())
                 .or_else(|| {
                     self.airplay_discovery
                         .as_ref()
@@ -917,6 +939,11 @@ impl App {
             }
         }
 
+        // The session's stable id can legitimately differ from the
+        // requested one: selecting a Sonos that joined a group since the
+        // last scan streams to its group coordinator instead (see
+        // start_upnp). Remember the id we actually bound so reconnect /
+        // active-row highlighting track reality.
         let new_session = if id.starts_with("airplay:") {
             match self.start_airplay(id) {
                 Ok(s) => s,
@@ -953,6 +980,7 @@ impl App {
         } else {
             self.start_upnp(id)?
         };
+        let actual_id = new_session.stable_id();
 
         let mut guard = self.session.lock().unwrap();
         if let Some(old) = guard.take() {
@@ -979,7 +1007,7 @@ impl App {
         let new_friendly_name = guard.as_ref().map(|s| s.friendly_name());
         drop(guard);
 
-        *self.last_speaker_id.lock().unwrap() = Some(id.to_string());
+        *self.last_speaker_id.lock().unwrap() = Some(actual_id.clone());
         self.streaming_enabled.store(true, Ordering::Release);
         // Persist so the next launch can auto-reconnect. We do NOT
         // auto-dismiss the onboarding here — picking a speaker only
@@ -990,8 +1018,8 @@ impl App {
         // click "Hide this guide" themselves.
         {
             let mut uc = self.user_config.lock().unwrap();
-            if uc.last_speaker_id.as_deref() != Some(id) {
-                uc.last_speaker_id = Some(id.to_string());
+            if uc.last_speaker_id.as_deref() != Some(actual_id.as_str()) {
+                uc.last_speaker_id = Some(actual_id.clone());
                 uc.save();
             }
         }
@@ -1011,9 +1039,14 @@ impl App {
         // can block ~100 ms.
         if let Some(r) = new_upnp_renderer {
             let vsync = self.vsync.clone();
-            let url = r.rendering_control_control_url.clone();
             std::thread::spawn(move || {
-                if let Ok(level) = upnp::get_volume(&url) {
+                // Group sessions prime from the group volume — that's
+                // what the slider will be driving.
+                let level = match r.group_volume_control_url() {
+                    Some(url) => upnp::get_group_volume(url),
+                    None => upnp::get_volume(&r.rendering_control_control_url),
+                };
+                if let Ok(level) = level {
                     vsync.prime_initial_volume(level);
                 }
             });
@@ -1028,6 +1061,15 @@ impl App {
             .ok_or_else(|| "UPnP discovery disabled".to_string())?;
         let Some(new_r) = discovery.find_by_id(id) else {
             return Err(format!("no UPnP speaker with id {:?}", id));
+        };
+        // Sonos: the discovery list can be minutes stale, and streaming
+        // to a zone that has since been grouped would silently rip it
+        // out of its group. Re-check topology from the device itself and
+        // stream to the group coordinator (= the whole group) instead.
+        // No-op for non-Sonos renderers; fails open on network errors.
+        let new_r = {
+            let d = discovery.clone();
+            crate::sonos::resolve_group_coordinator(new_r, &move |cid| d.find_by_id(cid))
         };
         let didl = upnp::didl_lite_metadata(
             &self.config.stream_uri,
@@ -1787,7 +1829,7 @@ pub fn start_session(
     didl: &str,
     callback_url: &str,
 ) -> Result<RendererSession> {
-    info!("targeting speaker: {} ({})", renderer.friendly_name, renderer.ip);
+    info!("targeting speaker: {} ({})", renderer.display_name(), renderer.ip);
     // Stop first to clear any "Transport Locked" (Sonos 705) carry-over.
     let _ = upnp::stop(&renderer.av_transport_control_url);
     std::thread::sleep(Duration::from_millis(100));
@@ -1797,7 +1839,9 @@ pub fn start_session(
     upnp::play(&renderer.av_transport_control_url).context("Play")?;
 
     let gena = GenaManager::new(callback_url.to_string());
-    match gena.subscribe(&renderer.rendering_control_event_url) {
+    // Groups subscribe to GroupRenderingControl (GroupVolume events —
+    // the group slider), standalone speakers to RenderingControl.
+    match gena.subscribe(renderer.volume_event_url()) {
         Ok(_) => {
             gena.clone().spawn_renewer();
         }

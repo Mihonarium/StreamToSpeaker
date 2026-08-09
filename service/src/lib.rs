@@ -10,6 +10,7 @@ pub mod audio_loop;
 pub mod audio_source;
 pub mod silence;
 pub mod http_server;
+pub mod sonos;
 pub mod ssdp;
 pub mod upnp;
 pub mod gena;
