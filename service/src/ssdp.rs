@@ -34,6 +34,21 @@ pub struct Renderer {
     pub av_transport_event_url: Option<String>,
     /// Cached UDN if available.
     pub udn: Option<String>,
+    /// Sonos only: ZoneGroupTopology control URL (GetZoneGroupState).
+    /// Present ⇒ the device participates in Sonos zone grouping.
+    pub zone_group_topology_control_url: Option<String>,
+    /// Sonos only: GroupRenderingControl control URL — group-wide volume
+    /// on the coordinator (SetGroupVolume scales every member).
+    pub group_rendering_control_control_url: Option<String>,
+    /// Sonos only: GroupRenderingControl event URL (GroupVolume NOTIFYs).
+    pub group_rendering_control_event_url: Option<String>,
+    /// Room name from zone topology ("Living Room") — cleaner than the
+    /// device-description friendlyName for group display. Sonos only.
+    pub zone_name: Option<String>,
+    /// Zone names of the OTHER visible members of the group this
+    /// renderer coordinates. Empty ⇒ standalone (or non-Sonos). Filled
+    /// by `sonos::apply_topology`.
+    pub group_members: Vec<String>,
 }
 
 /// Shared discovery state.  The main loop owns one; the SSDP thread
@@ -75,6 +90,23 @@ impl DiscoveryState {
                 return Some(r.clone());
             }
         }
+        // Group-aware match: "--player Kitchen" should find the group
+        // entry that contains Kitchen even though the row is named after
+        // its coordinator.
+        for r in inner.iter() {
+            let zone_hit = r
+                .zone_name
+                .as_deref()
+                .map(|z| z.to_ascii_lowercase().contains(&q))
+                .unwrap_or(false);
+            let member_hit = r
+                .group_members
+                .iter()
+                .any(|m| m.to_ascii_lowercase().contains(&q));
+            if zone_hit || member_hit {
+                return Some(r.clone());
+            }
+        }
         None
     }
 
@@ -105,6 +137,51 @@ impl Renderer {
     /// advertises one, IP literal as fallback.
     pub fn stable_id(&self) -> String {
         self.udn.clone().unwrap_or_else(|| self.ip.to_string())
+    }
+
+    /// True when this renderer coordinates a Sonos group with at least
+    /// one other audible speaker.
+    pub fn is_group(&self) -> bool {
+        !self.group_members.is_empty()
+    }
+
+    /// Name to show the user. Standalone speakers keep their device
+    /// friendlyName; group coordinators use the Sonos convention —
+    /// "Living Room + Kitchen" for a pair, "Living Room + 2" beyond.
+    pub fn display_name(&self) -> String {
+        if !self.is_group() {
+            return self.friendly_name.clone();
+        }
+        let base = self.zone_name.as_deref().unwrap_or(&self.friendly_name);
+        if self.group_members.len() == 1 {
+            format!("{} + {}", base, self.group_members[0])
+        } else {
+            format!("{} + {}", base, self.group_members.len())
+        }
+    }
+
+    /// GroupRenderingControl control URL, but only when volume should
+    /// actually be group-routed (a real multi-speaker group). Standalone
+    /// Sonos zones use plain RenderingControl — identical behavior to
+    /// pre-group builds.
+    pub fn group_volume_control_url(&self) -> Option<&str> {
+        if self.is_group() {
+            self.group_rendering_control_control_url.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// The event URL our GENA volume-sync subscription should use:
+    /// GroupRenderingControl for a group (GroupVolume events reflect the
+    /// group slider), plain RenderingControl otherwise.
+    pub fn volume_event_url(&self) -> &str {
+        if self.is_group() {
+            if let Some(u) = self.group_rendering_control_event_url.as_deref() {
+                return u;
+            }
+        }
+        &self.rendering_control_event_url
     }
 }
 
@@ -212,6 +289,10 @@ pub fn discover_once(timeout: Duration, iface: Option<Ipv4Addr>) -> Result<Vec<R
         }
     }
 
+    // Sonos: fold zone-group topology in — hides bonded/grouped members,
+    // annotates group coordinators. No-op without Sonos devices.
+    crate::sonos::annotate_with_topology(&mut renderers);
+
     Ok(renderers)
 }
 
@@ -231,7 +312,7 @@ fn extract_header(response: &str, header: &str) -> Option<String> {
     None
 }
 
-fn fetch_and_parse_device(location: &str, timeout: Duration) -> Result<Renderer> {
+pub(crate) fn fetch_and_parse_device(location: &str, timeout: Duration) -> Result<Renderer> {
     let xml = http_get(location, timeout).with_context(|| format!("GET {}", location))?;
     let url = url::Url::parse(location).with_context(|| format!("parse location {}", location))?;
     let base = format!(
@@ -300,6 +381,9 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr) -> Result<Ren
     let mut av_event: Option<String> = None;
     let mut rc_ctrl: Option<String> = None;
     let mut rc_event: Option<String> = None;
+    let mut zgt_ctrl: Option<String> = None;
+    let mut grc_ctrl: Option<String> = None;
+    let mut grc_event: Option<String> = None;
 
     for svc in device.descendants().filter(|n| n.tag_name().name() == "service") {
         let st = svc
@@ -321,6 +405,13 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr) -> Result<Ren
         } else if st.contains(":RenderingControl:") {
             rc_ctrl = control.map(|s| s.to_string());
             rc_event = event.map(|s| s.to_string());
+        } else if st.contains(":ZoneGroupTopology:") {
+            // Sonos zone grouping (root device on Sonos hardware).
+            zgt_ctrl = control.map(|s| s.to_string());
+        } else if st.contains(":GroupRenderingControl:") {
+            // Sonos group-wide volume (MediaRenderer sub-device).
+            grc_ctrl = control.map(|s| s.to_string());
+            grc_event = event.map(|s| s.to_string());
         }
     }
 
@@ -337,6 +428,11 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr) -> Result<Ren
         rendering_control_event_url: absolute_url(base_url, &rc_event),
         av_transport_event_url: av_event.map(|e| absolute_url(base_url, &e)),
         udn,
+        zone_group_topology_control_url: zgt_ctrl.map(|u| absolute_url(base_url, &u)),
+        group_rendering_control_control_url: grc_ctrl.map(|u| absolute_url(base_url, &u)),
+        group_rendering_control_event_url: grc_event.map(|u| absolute_url(base_url, &u)),
+        zone_name: None,
+        group_members: Vec::new(),
     })
 }
 

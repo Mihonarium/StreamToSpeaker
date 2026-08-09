@@ -113,6 +113,22 @@ substring or an IPv4 literal; `--list-speakers` prints and exits. Without
 `POST /api/select` with `{"id": "<udn-or-ip>"}`. Discovery re-runs every
 `--ssdp-interval` minutes.
 
+### Sonos groups
+
+Discovery queries the Sonos `ZoneGroupTopology` service (`GetZoneGroupState`)
+and folds the zone-group state into the list (`sonos.rs`): bonded invisible
+units (stereo-pair slaves, Subs, surrounds) and grouped non-coordinator
+members are hidden — sending `SetAVTransportURI` to a member would silently
+rip it out of its group — and each group appears as its coordinator, named
+"Living Room + Kitchen" (or "+ N" beyond two). `--player` also matches group
+member names. Selecting a speaker re-checks topology from the device itself
+and redirects to its current coordinator, so a list stale by up to one
+discovery interval can't break a group. Group sessions route volume through
+`GroupRenderingControl` on the coordinator (`SetGroupVolume` scales every
+member, like the Sonos app's group slider) and subscribe GENA to its flat
+`GroupVolume`/`GroupMute` events instead of `RenderingControl`'s
+`LastChange`.
+
 ## Latency control
 
 End-to-end latency is `Windows engine + driver buffer + network + speaker

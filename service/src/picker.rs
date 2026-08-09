@@ -32,7 +32,8 @@ pub fn print_speaker_list(renderers: &[Renderer]) -> usize {
     println!();
     println!("Discovered speakers:");
     for (i, r) in renderers.iter().enumerate() {
-        println!("  [{}]  {}  ({})", i + 1, r.friendly_name, r.ip);
+        // display_name shows Sonos groups as "Living Room + Kitchen".
+        println!("  [{}]  {}  ({})", i + 1, r.display_name(), r.ip);
     }
     println!();
     renderers.len()
@@ -134,7 +135,7 @@ pub fn resolve(
                     q,
                     renderers
                         .iter()
-                        .map(|r| r.friendly_name.clone())
+                        .map(|r| r.display_name())
                         .collect::<Vec<_>>()
                 ));
             }
@@ -148,7 +149,7 @@ pub fn resolve(
     if renderers.len() > 1 {
         log::warn!(
             "multiple speakers discovered; defaulting to first ({}). Use --player <name> to pick.",
-            renderers[0].friendly_name
+            renderers[0].display_name()
         );
     }
     Ok(renderers.into_iter().next())
