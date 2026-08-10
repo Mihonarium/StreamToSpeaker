@@ -27,6 +27,11 @@ use crate::user_config::UserConfig;
 use crate::volume_sync::VolumeSync;
 use crate::{upnp, PRODUCT_NAME, WIRE_SAMPLE_RATE};
 
+/// How long a privacy-mode bring-up window (`App::pending_stream_ip`)
+/// stays valid without being explicitly cleared. Generous vs. the
+/// seconds-scale SOAP handshake; exists only as a backstop.
+const PENDING_STREAM_IP_WINDOW: Duration = Duration::from_secs(60);
+
 /// One running renderer session: the speaker we've handed our stream URL
 /// to and its GENA subscription on RenderingControl.
 pub struct RendererSession {
@@ -235,6 +240,15 @@ pub struct App {
     /// runs it on a worker thread and shows "Connecting…" off this.
     pub connecting: Mutex<Option<String>>,
 
+    /// Privacy-mode bring-up window: the IP of a UPnP speaker we're
+    /// currently handing the stream URL to, set *before* the SOAP Play
+    /// call. Sonos probes `/stream.raw` the moment Play returns —
+    /// before `session` holds the new speaker — so the privacy gate
+    /// needs this to admit the speaker's very first fetch. Cleared once
+    /// the session is stored (or bring-up fails); the timestamp expires
+    /// it as a backstop against any path that forgets to clear.
+    pending_stream_ip: Mutex<Option<(IpAddr, Instant)>>,
+
     /// The one in-flight HomeKit PIN pairing ceremony, if any. Single
     /// source of truth for the whole ceremony lifecycle: reserving the
     /// slot IS the "only one ceremony at a time" lock, the `AwaitingPin`
@@ -342,6 +356,7 @@ impl App {
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
+            pending_stream_ip: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
         })
     }
@@ -502,6 +517,87 @@ impl App {
             uc.auto_reconnect_on_launch = on;
             uc.save();
         }
+    }
+
+    /// Whether privacy mode is on: `/stream.raw` served only to the
+    /// bound speaker (and this machine itself).
+    pub fn is_privacy_mode(&self) -> bool {
+        self.user_config.lock().unwrap().privacy_mode
+    }
+
+    /// Persist the privacy-mode preference. Turning it ON also cuts off
+    /// any `/stream.raw` listener that connected while the stream was
+    /// open to everyone — otherwise an established connection would
+    /// keep receiving audio indefinitely (the gate is per-request).
+    pub fn set_privacy_mode(&self, on: bool) {
+        {
+            // Scoped: `stream_client_allowed` below re-locks user_config.
+            let mut uc = self.user_config.lock().unwrap();
+            if uc.privacy_mode == on {
+                return;
+            }
+            uc.privacy_mode = on;
+            uc.save();
+        }
+        info!("privacy mode {}", if on { "enabled" } else { "disabled" });
+        if on {
+            let cut = self.hub.disconnect_clients(|ip| !self.stream_client_allowed(ip));
+            if cut > 0 {
+                info!("privacy mode: disconnected {} existing stream listener(s)", cut);
+            }
+        }
+    }
+
+    /// Privacy gate for `/stream.raw`: may `peer` pull the audio stream?
+    /// Always yes with privacy mode off. With it on, we admit:
+    ///   - loopback and this machine's own advertised IP (a request from
+    ///     the PC itself is the same user — and useful for debugging);
+    ///   - the bound session's speaker;
+    ///   - the speaker a UPnP bring-up is mid-handshake with (see
+    ///     `pending_stream_ip` — Play precedes the session store, and
+    ///     Sonos fetches the stream in that gap).
+    /// Called per request from the HTTP threads; both locks taken here
+    /// are only ever held briefly.
+    pub fn stream_client_allowed(&self, peer: IpAddr) -> bool {
+        if !self.is_privacy_mode() {
+            return true;
+        }
+        let peer = canonical_ip(peer);
+        if peer.is_loopback() {
+            return true;
+        }
+        if let Ok(own) = self.config.advertise_ip.parse::<IpAddr>() {
+            // A connection to our own LAN IP from this machine arrives
+            // with that IP as its source, not 127.0.0.1.
+            if peer == canonical_ip(own) {
+                return true;
+            }
+        }
+        {
+            let pending = self.pending_stream_ip.lock().unwrap();
+            if let Some((ip, when)) = pending.as_ref() {
+                if peer == canonical_ip(*ip) && when.elapsed() < PENDING_STREAM_IP_WINDOW {
+                    return true;
+                }
+            }
+        }
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| canonical_ip(s.ip()) == peer)
+            .unwrap_or(false)
+    }
+
+    /// Open the privacy-mode bring-up window for `ip` (see
+    /// `pending_stream_ip`).
+    fn set_pending_stream_ip(&self, ip: IpAddr) {
+        *self.pending_stream_ip.lock().unwrap() = Some((ip, Instant::now()));
+    }
+
+    /// Close the privacy-mode bring-up window.
+    fn clear_pending_stream_ip(&self) {
+        *self.pending_stream_ip.lock().unwrap() = None;
     }
 
     /// The user's last explicitly-selected speaker, as persisted in
@@ -951,7 +1047,13 @@ impl App {
                 }
             }
         } else {
-            self.start_upnp(id)?
+            match self.start_upnp(id) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.clear_pending_stream_ip();
+                    return Err(e);
+                }
+            }
         };
 
         let mut guard = self.session.lock().unwrap();
@@ -978,6 +1080,9 @@ impl App {
         #[cfg(windows)]
         let new_friendly_name = guard.as_ref().map(|s| s.friendly_name());
         drop(guard);
+        // The stored session now vouches for the speaker's IP; the
+        // bring-up window has done its job.
+        self.clear_pending_stream_ip();
 
         *self.last_speaker_id.lock().unwrap() = Some(id.to_string());
         self.streaming_enabled.store(true, Ordering::Release);
@@ -1029,6 +1134,10 @@ impl App {
         let Some(new_r) = discovery.find_by_id(id) else {
             return Err(format!("no UPnP speaker with id {:?}", id));
         };
+        // Admit the speaker through the privacy gate BEFORE the SOAP
+        // handshake — it HEAD/GETs `/stream.raw` as soon as Play
+        // returns, while `self.session` still holds the old state.
+        self.set_pending_stream_ip(new_r.ip);
         let didl = upnp::didl_lite_metadata(
             &self.config.stream_uri,
             PRODUCT_NAME,
@@ -1854,6 +1963,20 @@ pub fn pick_ssdp_iface(advertise_ip: Option<&str>, bind: &str) -> Option<std::ne
     None
 }
 
+/// Fold an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) back to plain
+/// IPv4 so privacy-gate comparisons work regardless of what family the
+/// listening socket handed us the peer in. Discovery always records
+/// speakers as IPv4, but a dual-stack bind can report v4 peers mapped.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => ip,
+        },
+        IpAddr::V4(_) => ip,
+    }
+}
+
 #[allow(dead_code)]
 const _: u32 = DEFAULT_QUIESCENT_AFTER_PACKETS;
 
@@ -1864,4 +1987,72 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> Arc<App> {
+        let app = App::new(
+            AppConfig {
+                stream_uri: "http://192.168.1.10:8080/stream.raw".into(),
+                callback_url: "http://192.168.1.10:8080/gena".into(),
+                advertise_ip: "192.168.1.10".into(),
+                bind: "0.0.0.0:8080".parse().unwrap(),
+                initial_buffer_ms: 0,
+                silence_packets_threshold: 0,
+                no_silence_injection: false,
+                no_discovery: true,
+                web_enabled: false,
+                ssdp_iface: None,
+            },
+            None,
+            None,
+        );
+        // Directly mutate the field — set_privacy_mode would write the
+        // developer's real config file to disk.
+        app.user_config.lock().unwrap().privacy_mode = true;
+        app
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn privacy_off_allows_everyone() {
+        let app = test_app();
+        app.user_config.lock().unwrap().privacy_mode = false;
+        assert!(app.stream_client_allowed(ip("192.168.1.99")));
+    }
+
+    #[test]
+    fn privacy_on_denies_strangers_allows_self() {
+        let app = test_app();
+        // No session, no pending bring-up: only this machine gets in.
+        assert!(!app.stream_client_allowed(ip("192.168.1.99")));
+        assert!(app.stream_client_allowed(ip("127.0.0.1")));
+        assert!(app.stream_client_allowed(ip("::1")));
+        assert!(app.stream_client_allowed(ip("192.168.1.10")));
+    }
+
+    #[test]
+    fn privacy_on_admits_pending_bringup_ip() {
+        let app = test_app();
+        app.set_pending_stream_ip(ip("192.168.1.50"));
+        assert!(app.stream_client_allowed(ip("192.168.1.50")));
+        // Dual-stack sockets report v4 peers as IPv4-mapped IPv6.
+        assert!(app.stream_client_allowed(ip("::ffff:192.168.1.50")));
+        assert!(!app.stream_client_allowed(ip("192.168.1.51")));
+        app.clear_pending_stream_ip();
+        assert!(!app.stream_client_allowed(ip("192.168.1.50")));
+    }
+
+    #[test]
+    fn canonical_ip_folds_mapped_v6_only() {
+        assert_eq!(ip("192.168.1.2"), canonical_ip(ip("::ffff:192.168.1.2")));
+        assert_eq!(ip("192.168.1.2"), canonical_ip(ip("192.168.1.2")));
+        assert_eq!(ip("fe80::1"), canonical_ip(ip("fe80::1")));
+    }
 }

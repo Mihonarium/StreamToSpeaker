@@ -117,6 +117,15 @@ pub struct UserConfig {
     /// Edit config.json by hand to flip; no GUI.
     #[serde(default)]
     pub airplay_uncompressed_alac: bool,
+    /// Privacy mode: only serve `/stream.raw` (the system-audio stream)
+    /// to the speaker we're currently streaming to. Without it, anyone
+    /// on the LAN who knows the URL can listen to everything the PC
+    /// plays. **Off by default** — it can break grouped Sonos playback
+    /// (the group's coordinator, which may be a *different* unit than
+    /// the selected one, is what fetches the stream) and any other
+    /// setup where the fetching IP differs from the selected speaker's.
+    #[serde(default)]
+    pub privacy_mode: bool,
 }
 
 fn default_auto_reconnect() -> bool {

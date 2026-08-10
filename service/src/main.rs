@@ -38,7 +38,7 @@ use stream_to_speaker::audio_source::AudioSource;
 use stream_to_speaker::gena::parse_rendering_notify;
 use stream_to_speaker::http_server::{
     start_http_server, HttpServerConfig, LatencyAdjustCallback, ResyncCallback, SpeakerInfo,
-    SpeakerListCallback, SpeakerSelectCallback,
+    SpeakerListCallback, SpeakerSelectCallback, StreamClientAllowedCallback,
 };
 use stream_to_speaker::picker;
 use stream_to_speaker::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
@@ -739,6 +739,11 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         Arc::new(move |ms| app2.adjust_latency(ms))
             as Arc<dyn Fn(i32) -> i64 + Send + Sync>
     };
+    let stream_client_allowed: StreamClientAllowedCallback = {
+        let app2 = app.clone();
+        Arc::new(move |ip| app2.stream_client_allowed(ip))
+            as Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>
+    };
 
     start_http_server(HttpServerConfig {
         bind: app.config.bind,
@@ -749,6 +754,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         resync: Some(resync),
         latency_adjust: Some(latency_adjust),
         web_ui_enabled: Some(app.web_ui_enabled.clone()),
+        stream_client_allowed: Some(stream_client_allowed),
     })
 }
 

@@ -2665,6 +2665,21 @@ impl StreamToSpeakerApp {
                 },
             );
             self.app.set_forward_now_playing(now_playing);
+
+            ui.add_space(sp::S);
+
+            let mut privacy = self.app.is_privacy_mode();
+            advanced_row(
+                ui,
+                p,
+                "Privacy mode",
+                "Serve the audio stream only to the speaker you're streaming to.",
+                "The speaker fetches your PC's audio from a plain HTTP URL, so by default anyone on your network who knows that URL can listen to whatever your PC plays. Privacy mode refuses stream requests from every address except the selected speaker's (and this PC's own). Turn it off if playback breaks on grouped speakers — in a Sonos group, the unit that actually fetches the stream can be a different one than the speaker you selected. AirPlay speakers are unaffected either way (audio is pushed to them directly, not fetched from the URL).",
+                |ui| {
+                    ui.checkbox(&mut privacy, "Only the active speaker may fetch the stream");
+                },
+            );
+            self.app.set_privacy_mode(privacy);
         });
     }
 
