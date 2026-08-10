@@ -58,6 +58,11 @@ pub type ResyncCallback = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 /// counter so the caller can see how much remains to be applied.
 pub type LatencyAdjustCallback = Arc<dyn Fn(i32) -> i64 + Send + Sync>;
 
+/// Callback deciding whether a client IP may fetch `/stream.raw`
+/// (privacy mode). Consulted per request, so the user can flip the
+/// setting or switch speakers without re-binding the socket.
+pub type StreamClientAllowedCallback = Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>;
+
 /// One PCM packet to broadcast to subscribers. Pre-encoded as bytes so the
 /// audio thread does the conversion once.
 #[derive(Clone)]
@@ -65,7 +70,14 @@ pub struct PcmFrame(pub Arc<Vec<u8>>);
 
 /// Hub used by the audio thread to push PCM and by HTTP workers to pull.
 pub struct StreamHub {
-    subscribers: Mutex<Vec<Sender<PcmFrame>>>,
+    subscribers: Mutex<Vec<HubSubscriber>>,
+}
+
+struct HubSubscriber {
+    tx: Sender<PcmFrame>,
+    /// Peer IP for HTTP `/stream.raw` clients; `None` for internal
+    /// consumers (the AirPlay senders), which privacy mode never prunes.
+    peer: Option<std::net::IpAddr>,
 }
 
 impl StreamHub {
@@ -75,11 +87,22 @@ impl StreamHub {
         })
     }
 
+    /// Subscribe an internal (in-process) consumer.
     pub fn subscribe(&self) -> Receiver<PcmFrame> {
+        self.subscribe_inner(None)
+    }
+
+    /// Subscribe an HTTP stream client, remembering its peer IP so
+    /// [`StreamHub::disconnect_clients`] can cut it off later.
+    pub fn subscribe_from(&self, peer: std::net::IpAddr) -> Receiver<PcmFrame> {
+        self.subscribe_inner(Some(peer))
+    }
+
+    fn subscribe_inner(&self, peer: Option<std::net::IpAddr>) -> Receiver<PcmFrame> {
         // Bounded; if a subscriber stalls we drop frames rather than
         // back-pressure the audio path.
         let (tx, rx) = bounded::<PcmFrame>(128);
-        self.subscribers.lock().unwrap().push(tx);
+        self.subscribers.lock().unwrap().push(HubSubscriber { tx, peer });
         rx
     }
 
@@ -87,8 +110,8 @@ impl StreamHub {
     /// is closed or full.
     pub fn publish(&self, frame: PcmFrame) {
         let mut subs = self.subscribers.lock().unwrap();
-        subs.retain(|tx| {
-            match tx.try_send(frame.clone()) {
+        subs.retain(|sub| {
+            match sub.tx.try_send(frame.clone()) {
                 Ok(()) => true,
                 Err(crossbeam_channel::TrySendError::Full(_)) => {
                     // Drop the frame for this slow subscriber; they'll
@@ -98,6 +121,18 @@ impl StreamHub {
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
             }
         });
+    }
+
+    /// Disconnect the HTTP stream clients whose peer IP matches `pred`.
+    /// Dropping a subscriber's Sender makes its `StreamReader` return
+    /// EOF, which closes the connection. Used when privacy mode turns
+    /// on, so a listener connected *before* the flip doesn't keep
+    /// receiving audio forever. Returns how many were cut.
+    pub fn disconnect_clients(&self, pred: impl Fn(std::net::IpAddr) -> bool) -> usize {
+        let mut subs = self.subscribers.lock().unwrap();
+        let before = subs.len();
+        subs.retain(|sub| !sub.peer.map(&pred).unwrap_or(false));
+        before - subs.len()
     }
 
     /// Current subscriber count.
@@ -125,6 +160,10 @@ pub struct HttpServerConfig {
     /// `/stream.raw` route is always served regardless — the speaker
     /// can't function without it. `None` ⇒ web UI always on (legacy).
     pub web_ui_enabled: Option<Arc<AtomicBool>>,
+    /// If set, GET/HEAD `/stream.raw` is only served when this returns
+    /// `true` for the client's IP — the privacy-mode gate. `None` ⇒
+    /// the stream is served to anyone who connects (legacy).
+    pub stream_client_allowed: Option<StreamClientAllowedCallback>,
 }
 
 impl HttpServerConfig {
@@ -138,6 +177,7 @@ impl HttpServerConfig {
             resync: None,
             latency_adjust: None,
             web_ui_enabled: None,
+            stream_client_allowed: None,
         }
     }
 }
@@ -162,12 +202,14 @@ pub fn start_http_server(cfg: HttpServerConfig) -> Result<u16> {
     let resync_cb = cfg.resync.clone();
     let latency_cb = cfg.latency_adjust.clone();
     let web_gate = cfg.web_ui_enabled.clone();
+    let stream_gate = cfg.stream_client_allowed.clone();
 
     thread::Builder::new()
         .name("stream-to-speaker-http".to_string())
         .spawn(move || {
             run_server(
                 server, hub, gena_cb, list_cb, select_cb, resync_cb, latency_cb, web_gate,
+                stream_gate,
             )
         })
         .context("spawning HTTP server thread")?;
@@ -200,6 +242,7 @@ fn run_server(
     resync: Option<ResyncCallback>,
     latency_adjust: Option<LatencyAdjustCallback>,
     web_ui_enabled: Option<Arc<AtomicBool>>,
+    stream_client_allowed: Option<StreamClientAllowedCallback>,
 ) {
     for req in server.incoming_requests() {
         let url = req.url().to_string();
@@ -208,6 +251,9 @@ fn run_server(
 
         match (method.clone(), url.as_str()) {
             (Method::Get, "/stream.raw") => {
+                let Some(req) = check_stream_client(req, &stream_client_allowed) else {
+                    continue;
+                };
                 let hub = hub.clone();
                 thread::Builder::new()
                     .name("stream-to-speaker-http-stream".to_string())
@@ -223,6 +269,9 @@ fn run_server(
                  * committing to GET. Reply with the same DLNA headers we
                  * would on GET, but no body. Without this Sonos gives up
                  * with "Couldn't connect" before ever trying the GET. */
+                let Some(req) = check_stream_client(req, &stream_client_allowed) else {
+                    continue;
+                };
                 serve_stream_head(req);
             }
             (Method::Get, "/healthz") => {
@@ -281,6 +330,31 @@ fn run_server(
         }
     }
     warn!("HTTP server loop exited");
+}
+
+/// Privacy-mode gate for `/stream.raw`. Returns the request back when
+/// the client may proceed; answers it with a 403 and returns `None`
+/// when it may not. A peer address tiny_http can't report (never the
+/// case for TCP) fails closed while the gate is active.
+fn check_stream_client(
+    req: tiny_http::Request,
+    gate: &Option<StreamClientAllowedCallback>,
+) -> Option<tiny_http::Request> {
+    let Some(cb) = gate else { return Some(req) };
+    let peer = req.remote_addr().map(|a| a.ip());
+    if peer.map(|ip| cb(ip)).unwrap_or(false) {
+        return Some(req);
+    }
+    info!(
+        "privacy mode: refused {} /stream.raw from {}",
+        req.method(),
+        peer.map(|ip| ip.to_string()).unwrap_or_else(|| "<unknown>".into())
+    );
+    let _ = req.respond(
+        Response::from_string("forbidden: privacy mode is on — the audio stream is only served to the active speaker")
+            .with_status_code(StatusCode(403)),
+    );
+    None
 }
 
 // -----------------------------------------------------------------------------
@@ -593,7 +667,12 @@ fn handle_notify(
 /// hand so we have precise control over flush timing.
 fn serve_stream(req: tiny_http::Request, hub: Arc<StreamHub>) -> Result<()> {
     // Subscribe BEFORE we send headers so we don't miss the first frame.
-    let rx = hub.subscribe();
+    // Tagged with the peer IP so privacy mode can cut the connection
+    // off later if this client stops being allowed.
+    let rx = match req.remote_addr().map(|a| a.ip()) {
+        Some(peer) => hub.subscribe_from(peer),
+        None => hub.subscribe(),
+    };
 
     // We need the raw TCP stream for hand-rolled chunked transfer.
     // tiny_http exposes the request via `respond` but using a Response
@@ -771,3 +850,32 @@ pub fn wire_bytes_per_second() -> usize {
 /// Just a const stash so users can confirm channel count without importing
 /// from lib.rs directly.
 pub const WIRE_CHANNELS_PUBLIC: u16 = WIRE_CHANNELS;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    fn disconnect_clients_cuts_matching_http_peers_only() {
+        let hub = StreamHub::new();
+        let internal = hub.subscribe(); // e.g. an AirPlay sender
+        let stranger = hub.subscribe_from("192.168.1.99".parse::<IpAddr>().unwrap());
+        let speaker = hub.subscribe_from("192.168.1.50".parse::<IpAddr>().unwrap());
+        assert_eq!(hub.subscriber_count(), 3);
+
+        let cut = hub.disconnect_clients(|ip| ip != "192.168.1.50".parse::<IpAddr>().unwrap());
+        assert_eq!(cut, 1);
+        assert_eq!(hub.subscriber_count(), 2);
+
+        hub.publish(PcmFrame(Arc::new(vec![0u8; 4])));
+        // The stranger's channel is dead — its reader sees EOF.
+        assert!(matches!(
+            stranger.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        // The speaker and the internal consumer still get audio.
+        assert!(speaker.try_recv().is_ok());
+        assert!(internal.try_recv().is_ok());
+    }
+}

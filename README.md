@@ -26,6 +26,13 @@ network as the PC.
 
 Closing the window minimises to the tray; quit from the tray menu.
 
+Speakers that stream over UPnP fetch the PC's audio from a plain HTTP URL, so
+by default anyone on the same network who knows the URL can listen in.
+**Advanced → Privacy mode** restricts that URL to the selected speaker's IP
+(turn it off if playback breaks on grouped Sonos speakers — the group's
+coordinator, which fetches the stream, can be a different unit than the one
+you selected).
+
 ## CLI flags
 
 ```
