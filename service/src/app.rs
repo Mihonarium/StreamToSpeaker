@@ -1191,12 +1191,13 @@ impl App {
         match transport {
             Transport::RaopLegacy => {
                 let samples_rx = self.hub.subscribe();
-                let (mfi_encryption, uncompressed_alac, password) = {
+                let (mfi_encryption, uncompressed_alac, password, latency_ms) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.airplay_mfi_encryption,
                         uc.airplay_uncompressed_alac,
                         uc.airplay_passwords.get(&renderer.stable_id()).cloned(),
+                        uc.effective_airplay_latency_ms(),
                     )
                 };
                 let session = AirPlaySession::start(AirPlaySessionConfig {
@@ -1211,6 +1212,7 @@ impl App {
                     mfi_encryption,
                     uncompressed_alac,
                     password,
+                    latency_ms,
                 })
                 .map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
                 Ok(ActiveSession::AirPlay(session))
@@ -1218,11 +1220,12 @@ impl App {
             Transport::AirPlay2 => {
                 let samples_rx = self.hub.subscribe();
                 let stable_id = renderer.stable_id();
-                let (prefer_realtime, pairing_creds) = {
+                let (prefer_realtime, pairing_creds, latency_ms) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.prefer_realtime_airplay,
                         uc.airplay_pairings.get(&stable_id).cloned(),
+                        uc.effective_airplay_latency_ms(),
                     )
                 };
                 match AirPlay2Session::start(AirPlay2SessionConfig {
@@ -1231,6 +1234,7 @@ impl App {
                     samples_rx,
                     initial_volume: Some(80),
                     prefer_realtime,
+                    latency_ms,
                     pairing_creds,
                 }) {
                     Ok(session) => Ok(ActiveSession::AirPlay2(session)),

@@ -138,6 +138,27 @@ startup: positive duplicates a frame every `1 000 000 / N` frames (speaker
 crystal faster than the host), negative drops one. Start at 0 and tune until
 the speaker's buffer level holds steady.
 
+### AirPlay buffer
+
+AirPlay delay is dominated by a buffer the *sender* asks for: each sync
+packet tells the speaker "the frame written N samples ago is playing now",
+so N is the receiver's buffer depth and most of the audible delay. iTunes
+uses 2 s (88200 samples). **Advanced → AirPlay buffer (latency)** sets N in
+milliseconds (`airplay_latency_ms` in config.json; default 2000, range
+20–3000):
+
+- The receiver's own `Audio-Latency` (stated on SETUP and/or RECORD) is a
+  floor: the anchor is `max(configured, advertised)`, so a speaker that
+  reports its minimum is never driven below it, and a big-DSP AVR asking
+  for more than 2 s still gets it.
+- AirPlay 2: the value drives the realtime stream's declared
+  `latencyMin/Max` and its sync anchor. Below 1000 ms the buffered stream
+  (which holds 1–2 s regardless) is skipped in favour of realtime.
+- Realistic floors: a recent Apple TV accepts very small values on a good
+  network; AirPort Express and most AirPlay speakers need ~100–350 ms. Any
+  Wi-Fi hiccup longer than the buffer is a dropout, so lower it until
+  playback stutters, then back off. Applies on the next connect.
+
 ### Tuning notes
 
 - `--initial-buffer-ms` is a prebuffer hint in the DIDL metadata; Sonos
