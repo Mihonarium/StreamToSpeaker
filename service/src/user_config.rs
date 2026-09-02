@@ -133,6 +133,29 @@ pub struct UserConfig {
     /// to [`AIRPLAY_LATENCY_MS_MIN`]..=[`AIRPLAY_LATENCY_MS_MAX`] on read.
     #[serde(default = "default_airplay_latency_ms")]
     pub airplay_latency_ms: u32,
+    /// Once-a-day check for a newer release on GitHub (Advanced toggle).
+    /// One unauthenticated GET of the releases API; nothing is downloaded
+    /// or installed. On by default. See `update_check`.
+    #[serde(default = "default_true")]
+    pub check_for_updates: bool,
+    /// Unix seconds of the last completed update check, any outcome —
+    /// paces the automatic check across launches.
+    #[serde(default)]
+    pub update_last_check_unix: Option<u64>,
+    /// Newest release seen by the last successful check: tag + release
+    /// page. Cached so the banner is right from the first frame after
+    /// launch (the check itself runs 20 s in) and on an offline launch.
+    #[serde(default)]
+    pub update_latest_tag: Option<String>,
+    #[serde(default)]
+    pub update_latest_url: Option<String>,
+    /// Tag the user chose "Skip this version" on — the banner stays
+    /// hidden until a *different* newer release appears.
+    #[serde(default)]
+    pub update_skipped_tag: Option<String>,
+    /// "Later" on the update banner: hidden until this unix time.
+    #[serde(default)]
+    pub update_banner_hidden_until: Option<u64>,
 }
 
 /// Default AirPlay buffer — iTunes' 2 s (88200 samples at 44.1 kHz).
@@ -143,6 +166,10 @@ pub const AIRPLAY_LATENCY_MS_DEFAULT: u32 = 2000;
 pub const AIRPLAY_LATENCY_MS_MIN: u32 = 20;
 /// Ceiling for `airplay_latency_ms` (3 s — "buffered" territory).
 pub const AIRPLAY_LATENCY_MS_MAX: u32 = 3000;
+
+fn default_true() -> bool {
+    true
+}
 
 fn default_airplay_latency_ms() -> u32 {
     AIRPLAY_LATENCY_MS_DEFAULT
@@ -231,6 +258,8 @@ mod tests {
         assert_eq!(c.airplay_latency_ms, AIRPLAY_LATENCY_MS_DEFAULT);
         assert!(c.auto_reconnect_on_launch);
         assert!(c.auto_reconnect_on_drop);
+        assert!(c.check_for_updates);
+        assert_eq!(c.update_last_check_unix, None);
         assert!(!c.prefer_realtime_airplay);
     }
 

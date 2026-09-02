@@ -189,3 +189,16 @@ The user mentioned these but asked NOT to start them now. Pick up when they say:
 - **egui + Windows touchpad scrolling (don't re-learn this).** egui 0.29 exponentially smooths every *Line-unit* wheel event (~90%/100 ms) and only lets sub-8pt *Point-unit* deltas through unsmoothed (its "mac trackpad" bypass in `input_state/mod.rs`). Windows precision touchpads pan via fractional Line-delta `WM_MOUSEWHEEL` events whose decay curve is already smooth, so egui's smoother stacks on the driver's inertia → lag while panning + a rubber-band acceleration/jump at finger-lift. Fix lives in `gui.rs raw_input_hook`: touchpad-shaped events (fractional line deltas, or any within 300 ms of one — flings pass through exact integers) are rewritten to pre-scaled Point events split into sub-8pt chunks so every chunk takes the unsmoothed path; isolated integer notches (real mouse wheels) keep egui's smoothing. The `update()` repaint pump (repaint while `smooth_scroll_delta != 0`) is still needed for the mouse-wheel case in reactive mode. If egui is ever upgraded, re-check `is_smooth` in `input_state` before touching this.
 
 - **App / tray icons must have an active and a non-active variant.** When we eventually replace the procedurally-drawn tray icon with proper artwork (or add an app icon), ship at minimum two states: one for "streaming active" (full color / accent fill / animated sound waves) and one for "idle / no speaker / disabled" (desaturated or outlined). The tray icon is the only persistent UI signal when the window is hidden; a single static icon hides whether the app is actually doing its job. Same applies if we ever ship a taskbar icon. Sizes: 16×16, 24×24, 32×32, 48×48, 256×256 (Windows tray scales down a single 32×32 fine, but the 16×16 master should be hand-tuned — auto-downscale loses detail).
+
+
+## Release version vs crate version (update check)
+
+The service crate version (`service/Cargo.toml`, e.g. 0.6.0) and the GitHub
+release tag (e.g. `v0.1.4`) are **independent**. Anything user-facing or
+compared against GitHub must use `stream_to_speaker::display_version()` /
+`release_version()` (lib.rs), which read `STS_RELEASE_VERSION` — set by
+build.yml's "Build service" step on `v*` tag pushes only (build.rs declares
+`rerun-if-env-changed` so a cached target/ can't ship a stale value). Local
+and non-tag CI builds have no release version: they display the crate
+version and `update_check` never runs. Never compare `CARGO_PKG_VERSION`
+against release tags.

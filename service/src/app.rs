@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::update_check::{self, ReleaseInfo};
+
 use crate::airplay::ap2_rtsp::Ap2Rtsp;
 use crate::airplay::ap2_session::DEFAULT_AIRPLAY_PORT;
 use crate::airplay::hap_pairing::PairingCredentials;
@@ -165,6 +167,25 @@ pub struct SpeakerView {
     pub active_id: Option<String>,
 }
 
+/// Result of one update check, for the Help menu's status line.
+#[derive(Clone, Debug)]
+pub enum UpdateOutcome {
+    UpToDate,
+    Available(ReleaseInfo),
+    /// No release tag baked into this exe → nothing to compare against.
+    DevBuild,
+    Failed(String),
+}
+
+/// In-memory update-check state (the persistent part lives in `UserConfig`).
+#[derive(Clone, Debug, Default)]
+pub struct UpdateState {
+    /// A check is in flight (Help menu shows "Checking…").
+    pub checking: bool,
+    /// Outcome + unix time of the most recent check this run.
+    pub last: Option<(UpdateOutcome, u64)>,
+}
+
 pub struct App {
     /// Resolved-at-startup configuration. Immutable after `new`.
     pub config: AppConfig,
@@ -203,6 +224,8 @@ pub struct App {
 
     // ---- Lifecycle ----
     pub shutdown: Arc<AtomicBool>,
+    /// Update-check state; see `update_check` and [`App::spawn_update_checker`].
+    pub update: Mutex<UpdateState>,
 
     // ---- Rescan feedback ----
     /// True while a manual SSDP rescan thread is in flight. Cleared
@@ -336,6 +359,7 @@ impl App {
             packets_published_total: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            update: Mutex::new(UpdateState::default()),
             rescan_in_flight: Arc::new(AtomicBool::new(false)),
             last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
             last_rescan_count: Arc::new(AtomicUsize::new(0)),
@@ -408,6 +432,181 @@ impl App {
         let mut uc = self.user_config.lock().unwrap();
         uc.donation_prompt_hidden_until = Some(now_unix() + days * 24 * 60 * 60);
         uc.save();
+    }
+
+    // ---- Update check ----------------------------------------------------
+
+    pub fn is_check_for_updates(&self) -> bool {
+        self.user_config.lock().unwrap().check_for_updates
+    }
+
+    pub fn set_check_for_updates(&self, on: bool) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.check_for_updates != on {
+            uc.check_for_updates = on;
+            uc.save();
+        }
+    }
+
+    pub fn update_state(&self) -> UpdateState {
+        self.update.lock().unwrap().clone()
+    }
+
+    /// The newer release the banner should offer right now, if any. Works
+    /// off the cached last result so it is correct from the first frame.
+    pub fn update_banner(&self) -> Option<ReleaseInfo> {
+        let current = update_check::current_version()?;
+        let uc = self.user_config.lock().unwrap();
+        let tag = uc.update_latest_tag.as_deref()?;
+        let version = update_check::banner_candidate(
+            &current,
+            tag,
+            uc.update_skipped_tag.as_deref(),
+            uc.update_banner_hidden_until,
+            now_unix(),
+        )?;
+        Some(ReleaseInfo {
+            tag: tag.to_string(),
+            version,
+            url: uc
+                .update_latest_url
+                .clone()
+                .unwrap_or_else(|| update_check::RELEASES_PAGE.to_string()),
+            installer_url: None,
+        })
+    }
+
+    /// "Skip this version": never offer `tag` again (a later one still shows).
+    pub fn skip_update(&self, tag: &str) {
+        let mut uc = self.user_config.lock().unwrap();
+        uc.update_skipped_tag = Some(tag.to_string());
+        uc.save();
+    }
+
+    /// "Later": hide the banner for `days`.
+    pub fn snooze_update_banner(&self, days: u64) {
+        let mut uc = self.user_config.lock().unwrap();
+        uc.update_banner_hidden_until = Some(now_unix() + days * 24 * 60 * 60);
+        uc.save();
+    }
+
+    fn update_check_due(&self) -> bool {
+        let uc = self.user_config.lock().unwrap();
+        if !uc.check_for_updates {
+            return false;
+        }
+        match uc.update_last_check_unix {
+            None => true,
+            Some(t) => now_unix().saturating_sub(t) >= update_check::CHECK_INTERVAL.as_secs(),
+        }
+    }
+
+    /// One blocking check (call off the UI thread). `manual` bypasses the
+    /// enable switch and the daily cadence; a dev build never checks.
+    pub fn run_update_check(&self, manual: bool) {
+        let finish = |outcome: UpdateOutcome| {
+            let mut st = self.update.lock().unwrap();
+            st.checking = false;
+            st.last = Some((outcome, now_unix()));
+        };
+        let Some(current) = update_check::current_version() else {
+            finish(UpdateOutcome::DevBuild);
+            return;
+        };
+        if !manual && !self.is_check_for_updates() {
+            self.update.lock().unwrap().checking = false;
+            return;
+        }
+        self.update.lock().unwrap().checking = true;
+        let result = update_check::fetch_latest_release();
+        let now = now_unix();
+        let outcome = match result {
+            Ok(rel) => {
+                {
+                    let mut uc = self.user_config.lock().unwrap();
+                    uc.update_last_check_unix = Some(now);
+                    uc.update_latest_tag = Some(rel.tag.clone());
+                    uc.update_latest_url = Some(rel.url.clone());
+                    uc.save();
+                }
+                if update_check::is_newer(&rel.version, &current) {
+                    log::info!(
+                        "update available: {} (this is v{}) — {}",
+                        rel.tag,
+                        crate::display_version(),
+                        rel.url
+                    );
+                    UpdateOutcome::Available(rel)
+                } else {
+                    log::info!("update check: v{} is the latest release", crate::display_version());
+                    UpdateOutcome::UpToDate
+                }
+            }
+            Err(e) => {
+                // Stamp the attempt so an offline machine retries once a
+                // day, not every hour; the cached latest (if any) still
+                // drives the banner.
+                let mut uc = self.user_config.lock().unwrap();
+                uc.update_last_check_unix = Some(now);
+                uc.save();
+                log::warn!("update check failed: {:#}", e);
+                UpdateOutcome::Failed(format!("{e:#}"))
+            }
+        };
+        finish(outcome);
+    }
+
+    /// Sleep `d` in slices, returning false early if shutdown began.
+    fn sleep_unless_shutdown(&self, d: Duration) -> bool {
+        let end = Instant::now() + d;
+        while Instant::now() < end {
+            if self.is_shutting_down() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        true
+    }
+
+    /// Background once-a-day update check: first attempt ~20 s after
+    /// launch (never on the startup path), then whenever 24 h have passed
+    /// since the last attempt, re-evaluated hourly. Everything it does is
+    /// gated by `check_for_updates`; a dev build is a no-op.
+    pub fn spawn_update_checker(self: &Arc<Self>) {
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-update-check".into())
+            .spawn(move || {
+                if !app.sleep_unless_shutdown(update_check::STARTUP_DELAY) {
+                    return;
+                }
+                loop {
+                    if app.update_check_due() {
+                        app.run_update_check(false);
+                    }
+                    if !app.sleep_unless_shutdown(Duration::from_secs(60 * 60)) {
+                        return;
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// Help menu "Check for updates now": one manual check on a worker
+    /// thread. `checking` is set here so the menu reflects it immediately.
+    pub fn check_for_updates_now(self: &Arc<Self>) {
+        {
+            let mut st = self.update.lock().unwrap();
+            if st.checking {
+                return;
+            }
+            st.checking = true;
+        }
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-update-check-manual".into())
+            .spawn(move || app.run_update_check(true))
+            .ok();
     }
 
     /// Undo the onboarding dismissal (Help menu → "Show getting-

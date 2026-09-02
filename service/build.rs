@@ -5,6 +5,11 @@
 //! tray icons are set at runtime and are a separate concern — this one is
 //! what the file itself looks like on disk.
 fn main() {
+    // CI bakes the release tag in via STS_RELEASE_VERSION on tag builds
+    // (option_env! in lib.rs). Declare it so a cached target/ from a
+    // non-tag build is never reused with the old (empty) value.
+    println!("cargo:rerun-if-env-changed=STS_RELEASE_VERSION");
+
     #[cfg(windows)]
     {
         const ICON: &str = "../assets/StreamToSpeaker.ico";

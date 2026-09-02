@@ -26,6 +26,10 @@ network as the PC.
 
 Closing the window minimises to the tray; quit from the tray menu.
 
+Once a day the app asks GitHub whether a newer release exists and, if so,
+shows a link to it. Nothing is downloaded or installed by itself. Turn the
+check off under **Advanced** if you'd rather not.
+
 ## CLI flags
 
 ```
