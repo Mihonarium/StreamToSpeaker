@@ -1234,7 +1234,11 @@ impl eframe::App for StreamToSpeakerApp {
                             self.show_status_banner(ui, &p);
                             banner_bottom_px = ui.cursor().top();
                             self.show_error_banner(ui, &p);
-                            self.show_donation_banner(ui, &p);
+                            // One ask at a time: an available update
+                            // outranks the donation strip.
+                            if !self.show_update_banner(ui, &p) {
+                                self.show_donation_banner(ui, &p);
+                            }
                             ui.add_space(sp::M);
                             // Show onboarding regardless of whether a
                             // speaker is currently bound, until the
@@ -1387,6 +1391,56 @@ fn window_close_cursor(ctx: &egui::Context, window_rect: egui::Rect, inner_margi
 
 /// Primary button — solid accent fill, white-on-accent text. Use for the
 /// main action of each area (Enable, Minimise to tray, Apply, etc.).
+/// A notice strip's content row: a message with right-aligned actions,
+/// laid out so the message can never run under the buttons. The buttons
+/// are placed first (right-to-left), then the message wraps in whatever
+/// width is left; if that would be too narrow to read, the row stacks —
+/// message on top, buttons right-aligned beneath. `buttons_w` is the
+/// buttons' total width including gaps (the caller knows it from the min
+/// widths it passes to the button helpers).
+///
+/// Why: a label added *before* a right-to-left button group claims the
+/// row at its full single-line width — labels don't wrap inside
+/// horizontal layouts — so past a certain window width the buttons were
+/// painted straight over the text. A fixed "stack below N px" threshold
+/// only moved that collision to a different window width (the donation
+/// strip overlapped at the default 720 px window).
+///
+/// Every right-to-left row here is wrapped in `ui.horizontal`, which
+/// bounds the row's height. A vertically-centred horizontal layout dropped
+/// straight into an unbounded ui (the scroll area's content) centres its
+/// widgets within an infinite height — i.e. at y = ∞ — and the enclosing
+/// frame then paints the whole page. `main`'s stacked branch did this at
+/// the 580 px minimum width; the first cut of this helper did it at every
+/// width. Verified with a headless egui layout harness.
+fn notice_row(
+    ui: &mut egui::Ui,
+    msg: egui::RichText,
+    buttons_w: f32,
+    buttons: impl FnOnce(&mut egui::Ui),
+) {
+    const MIN_TEXT_W: f32 = 240.0;
+    if ui.available_width() - buttons_w - sp::S < MIN_TEXT_W {
+        ui.vertical(|ui| {
+            ui.add(egui::Label::new(msg).wrap());
+            ui.add_space(sp::S);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), buttons);
+            });
+        });
+    } else {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                buttons(ui);
+                ui.add_space(sp::S);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(msg).wrap());
+                });
+            });
+        });
+    }
+}
+
 fn primary_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -> egui::Response {
     let btn = egui::Button::new(
         egui::RichText::new(label)
@@ -1466,7 +1520,7 @@ impl StreamToSpeakerApp {
                                 .color(p.text_primary),
                         );
                         ui.label(
-                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            egui::RichText::new(format!("v{}", crate::display_version()))
                                 .size(12.0)
                                 .color(p.text_tertiary),
                         );
@@ -1509,10 +1563,13 @@ impl StreamToSpeakerApp {
             egui::PopupCloseBehavior::CloseOnClickOutside,
             |ui| {
                 ui.set_min_width(240.0);
+                // Bounded so a long status line wraps instead of
+                // widening the popup off-screen.
+                ui.set_max_width(360.0);
                 ui.label(
                     egui::RichText::new(format!(
                         "Stream To Speaker v{}",
-                        env!("CARGO_PKG_VERSION")
+                        crate::display_version()
                     ))
                     .strong()
                     .color(p.text_primary),
@@ -1534,6 +1591,16 @@ impl StreamToSpeakerApp {
                         "https://github.com/Mihonarium/StreamToSpeaker/issues/new",
                     );
                     ui.memory_mut(|m| m.close_popup());
+                }
+                ui.separator();
+                let (status, busy) = self.update_status_line();
+                ui.label(
+                    egui::RichText::new(status)
+                        .size(12.0)
+                        .color(p.text_secondary),
+                );
+                if !busy && ui.button("Check for updates now").clicked() {
+                    self.app.check_for_updates_now();
                 }
                 // "Show getting started" — undo onboarding dismissal
                 // so it appears on the next paint (m20). Useful for
@@ -1648,9 +1715,10 @@ impl StreamToSpeakerApp {
                 (
                     "3",
                     "Adjust the latency if audio drifts",
-                    "If audio lags the picture, use the Trim buttons. If it \
-                     glitches, use the Pad buttons. Resync gives an instant \
-                     fix at the cost of a brief audio click.",
+                    "If audio lags the picture, use −25 / −100 ms in the \
+                     Latency card. If it glitches or drops out, use \
+                     +25 / +100 ms. Resync speaker restarts the connection — \
+                     an instant fix at the cost of a brief click.",
                 ),
             ];
 
@@ -1775,26 +1843,25 @@ impl StreamToSpeakerApp {
                     ui.label(egui::RichText::new(icon).color(accent).size(34.0).strong());
                     ui.add_space(sp::S);
 
-                    ui.vertical(|ui| {
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new(headline)
-                                .size(16.0)
-                                .strong()
-                                .color(p.text_primary),
-                        );
-                        ui.label(
-                            egui::RichText::new(detail)
-                                .size(12.0)
-                                .color(p.text_secondary),
-                        );
-                    });
-
-                    if let (Some(label), Some(tip)) = (btn_label, btn_tip) {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.vertical(|ui| {
+                    // Buttons first (right-aligned), the text column in
+                    // whatever is left, wrapping — so a long speaker name
+                    // folds onto a second line instead of running under
+                    // the buttons (the notice_row rule).
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if let (Some(label), Some(tip)) = (btn_label, btn_tip) {
+                                // Explicit-width, right-aligned column. A plain
+                                // `ui.vertical` here claims the full remaining
+                                // width — its bounding box reaches the left edge
+                                // — so the text column laid out after it got
+                                // ~0 px and the headline came out one word per
+                                // line. Verified with the headless harness.
+                                let col_h = ui.available_height();
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(140.0, col_h),
+                                    egui::Layout::top_down(egui::Align::Max),
+                                    |ui| {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
@@ -1853,10 +1920,33 @@ impl StreamToSpeakerApp {
                                             },
                                         );
                                     }
-                                });
-                            },
-                        );
-                    }
+                                    },
+                                );
+                                ui.add_space(sp::S);
+                            }
+
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.add_space(2.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(headline)
+                                            .size(16.0)
+                                            .strong()
+                                            .color(p.text_primary),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(detail)
+                                            .size(12.0)
+                                            .color(p.text_secondary),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        },
+                    );
                 });
             });
 
@@ -1914,23 +2004,10 @@ impl StreamToSpeakerApp {
                     ui.painter().circle_filled(rect.center(), 5.0, accent);
                     ui.add_space(sp::S);
 
-                    ui.label(
-                        egui::RichText::new(&current.friendly_name)
-                            .size(12.0)
-                            .strong()
-                            .color(p.text_primary),
-                    );
-                    ui.label(
-                        egui::RichText::new("·")
-                            .size(12.0)
-                            .color(p.text_tertiary),
-                    );
-                    ui.label(
-                        egui::RichText::new(status_text)
-                            .size(12.0)
-                            .color(p.text_secondary),
-                    );
-
+                    // Button first, then the text in what is left, with the
+                    // speaker name truncated (an ellipsis, not a wrap — this
+                    // bar is one line by design) so a long name can't run
+                    // under the button.
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
@@ -1957,6 +2034,36 @@ impl StreamToSpeakerApp {
                                     ));
                                 }
                             }
+                            ui.add_space(sp::S);
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    // Leave room for " · Streaming" after the name.
+                                    let name_w = (ui.available_width() - 96.0).max(60.0);
+                                    ui.scope(|ui| {
+                                        ui.set_max_width(name_w);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&current.friendly_name)
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(p.text_primary),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                    ui.label(
+                                        egui::RichText::new("·")
+                                            .size(12.0)
+                                            .color(p.text_tertiary),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(status_text)
+                                            .size(12.0)
+                                            .color(p.text_secondary),
+                                    );
+                                },
+                            );
                         },
                     );
                 });
@@ -1986,29 +2093,21 @@ impl StreamToSpeakerApp {
                             .strong(),
                     );
                     ui.add_space(sp::XS);
-                    // Lay Dismiss out FIRST, then the message into what is
-                    // left. Adding the message first let it claim the whole
-                    // row, so the button — which has a transparent fill —
-                    // was drawn on top of the words. A long error message
-                    // now wraps instead of colliding.
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
+                    // Dismiss is laid out first and the message wraps into
+                    // what is left (notice_row), so a long error can't run
+                    // under the button.
+                    let mut dismiss = false;
+                    notice_row(
+                        ui,
+                        egui::RichText::new(&msg).color(p.text_primary),
+                        80.0,
                         |ui| {
-                            if link_button(ui, p, "Dismiss", 80.0).clicked() {
-                                self.app.dismiss_error();
-                            }
-                            ui.add_space(sp::S);
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(&msg)
-                                            .color(p.text_primary),
-                                    );
-                                },
-                            );
+                            dismiss = link_button(ui, p, "Dismiss", 80.0).clicked();
                         },
                     );
+                    if dismiss {
+                        self.app.dismiss_error();
+                    }
                 });
             });
     }
@@ -2063,6 +2162,88 @@ impl StreamToSpeakerApp {
         }
     }
 
+    /// "A newer version is available" strip. Driven by the cached
+    /// update-check result so it's present from the first frame after
+    /// launch. Never installs anything — the primary action opens the
+    /// release page in the browser. Returns whether it was shown, so the
+    /// caller can hold the donation strip back: one ask at a time.
+    fn show_update_banner(&mut self, ui: &mut egui::Ui, p: &Palette) -> bool {
+        let Some(rel) = self.app.update_banner() else {
+            return false;
+        };
+        ui.add_space(sp::XS);
+        egui::Frame::none()
+            .fill(p.accent_subtle)
+            .rounding(RADIUS_SURFACE)
+            .inner_margin(egui::Margin::symmetric(sp::M, sp::S))
+            .show(ui, |ui| {
+                let msg = egui::RichText::new(format!(
+                    "⬆  Stream To Speaker {} is available — you have v{}.",
+                    rel.tag,
+                    crate::display_version()
+                ))
+                .color(p.text_on_accent_subtle);
+                let (mut download, mut skip, mut later) = (false, false, false);
+                notice_row(ui, msg, 100.0 + 130.0 + 72.0 + 2.0 * sp::XS, |ui| {
+                    later = secondary_button(ui, p, "Later", 72.0)
+                        .on_hover_text("Hide this for three days.")
+                        .clicked();
+                    skip = secondary_button(ui, p, "Skip this version", 130.0)
+                        .on_hover_text(
+                            "Don't mention this version again. A later one will still show.",
+                        )
+                        .clicked();
+                    download = primary_button(ui, p, "Download", 100.0)
+                        .on_hover_text(
+                            "Opens the release page on GitHub in your browser. \
+                             Run the installer from there — nothing is installed \
+                             automatically.",
+                        )
+                        .clicked();
+                });
+                if download {
+                    let _ = open_url(&rel.url);
+                }
+                if skip {
+                    self.app.skip_update(&rel.tag);
+                }
+                if later {
+                    self.app.snooze_update_banner(3);
+                }
+            });
+        true
+    }
+
+    /// One-line update status for the Help menu, plus whether the
+    /// "Check now" button should be hidden (dev build / check in flight).
+    fn update_status_line(&self) -> (String, bool) {
+        use crate::app::UpdateOutcome;
+        if crate::release_version().is_none() {
+            return ("Development build — update checks are off.".into(), true);
+        }
+        let st = self.app.update_state();
+        if st.checking {
+            return ("Checking for updates…".into(), true);
+        }
+        let line = match st.last {
+            None if self.app.is_check_for_updates() => {
+                "Updates: not checked yet since launch.".to_string()
+            }
+            None => "Automatic update checks are off (Advanced).".to_string(),
+            Some((UpdateOutcome::UpToDate, _)) => "You have the latest version.".to_string(),
+            Some((UpdateOutcome::Available(r), _)) => format!("{} is available.", r.tag),
+            Some((UpdateOutcome::DevBuild, _)) => {
+                "Development build — update checks are off.".to_string()
+            }
+            Some((UpdateOutcome::Failed(e), _)) => {
+                // One line of reason is plenty in a popup; the log has it all.
+                let e: String = e.chars().take(90).collect();
+                format!("Couldn't check for updates: {e}")
+            }
+        };
+        (line, false)
+    }
+
     /// Donation ask. Shown on launch until the user either follows the
     /// link or asks to be reminded later; both choices persist, so it is
     /// never the same nag twice in one week. Deliberately a quiet strip
@@ -2078,55 +2259,23 @@ impl StreamToSpeakerApp {
             .rounding(RADIUS_SURFACE)
             .inner_margin(egui::Margin::symmetric(sp::M, sp::S))
             .show(ui, |ui| {
-                // Buttons need ~200 px. On a narrow window the message used
-                // to share their row and slide underneath them (labels don't
-                // wrap inside a horizontal layout), so below the threshold
-                // the strip stacks: message on its own line — where it wraps
-                // — and the buttons right-aligned beneath it.
-                let stacked = ui.available_width() < 540.0;
                 let msg = egui::RichText::new(
                     "☕  Stream To Speaker is free and open source. \
                      Donate to support its development.",
                 )
                 .color(p.text_on_accent_subtle);
-
-                let buttons = |ui: &mut egui::Ui| -> (bool, bool) {
-                    let mut donate = false;
-                    let mut later = false;
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            later = secondary_button(ui, p, "Not now", 84.0)
-                                .on_hover_text("Hide this for a week.")
-                                .clicked();
-                            donate = primary_button(ui, p, "Donate", 96.0)
-                                .on_hover_text(
-                                    "Opens buymeacoffee.com/ms00 in your browser. \
-                                     Any amount, one-off or monthly.",
-                                )
-                                .clicked();
-                        },
-                    );
-                    (donate, later)
-                };
-
-                let (donate, later) = if stacked {
-                    let mut clicks = (false, false);
-                    ui.vertical(|ui| {
-                        ui.label(msg);
-                        ui.add_space(sp::S);
-                        clicks = buttons(ui);
-                    });
-                    clicks
-                } else {
-                    let mut clicks = (false, false);
-                    ui.horizontal(|ui| {
-                        ui.label(msg);
-                        clicks = buttons(ui);
-                    });
-                    clicks
-                };
-
+                let (mut donate, mut later) = (false, false);
+                notice_row(ui, msg, 96.0 + 84.0 + sp::XS, |ui| {
+                    later = secondary_button(ui, p, "Not now", 84.0)
+                        .on_hover_text("Hide this for a week.")
+                        .clicked();
+                    donate = primary_button(ui, p, "Donate", 96.0)
+                        .on_hover_text(
+                            "Opens buymeacoffee.com/ms00 in your browser. \
+                             Any amount, one-off or monthly.",
+                        )
+                        .clicked();
+                });
                 if later {
                     self.app.snooze_donation_prompt(7);
                 }
@@ -2611,6 +2760,39 @@ impl StreamToSpeakerApp {
 
             ui.add_space(sp::S);
 
+            {
+                use crate::user_config::{
+                    AIRPLAY_LATENCY_MS_DEFAULT, AIRPLAY_LATENCY_MS_MAX, AIRPLAY_LATENCY_MS_MIN,
+                };
+                let mut lat_ms =
+                    self.app.user_config.lock().unwrap().effective_airplay_latency_ms() as i64;
+                advanced_row(
+                    ui,
+                    p,
+                    "AirPlay buffer (latency)",
+                    "Lower = less delay, less margin for Wi-Fi hiccups. 2000 ms is what iTunes uses.",
+                    "How much audio an AirPlay speaker holds before playing it. This is most of the delay you hear on AirPlay, so lowering it lowers the delay in step — but any Wi-Fi hiccup longer than the buffer becomes a dropout. A recent Apple TV copes with very small values on a good network; AirPort Express and most AirPlay speakers need roughly 100–350 ms, and a speaker that reports its own minimum is never driven below it. Applies to AirPlay 1 speakers and the AirPlay 2 realtime stream; below 1000 ms an AirPlay 2 speaker is switched to the realtime stream automatically. Takes effect the next time you connect.",
+                    |ui| {
+                        advanced_slider_row(
+                            ui,
+                            p,
+                            &mut lat_ms,
+                            (AIRPLAY_LATENCY_MS_MIN as i64)..=(AIRPLAY_LATENCY_MS_MAX as i64),
+                            " ms",
+                            AIRPLAY_LATENCY_MS_DEFAULT as i64,
+                            "2000 ms",
+                        )
+                    },
+                );
+                let mut uc = self.app.user_config.lock().unwrap();
+                if uc.airplay_latency_ms != lat_ms as u32 {
+                    uc.airplay_latency_ms = lat_ms as u32;
+                    uc.save();
+                }
+            }
+
+            ui.add_space(sp::S);
+
             let mut prefer_rt = self.app.user_config.lock().unwrap().prefer_realtime_airplay;
             advanced_row(
                 ui,
@@ -2650,6 +2832,21 @@ impl StreamToSpeakerApp {
                     uc.save();
                 }
             }
+
+            ui.add_space(sp::S);
+
+            let mut check_updates = self.app.is_check_for_updates();
+            advanced_row(
+                ui,
+                p,
+                "Check for updates",
+                "Asks GitHub once a day whether a newer version exists. Nothing installs by itself.",
+                "Once a day the app fetches the latest release entry from github.com — a plain web request carrying only the app version, so GitHub sees your IP address as any website would. If a newer version exists, a strip at the top offers a link to the download page; nothing is downloaded or installed automatically. You can also check on demand from the ? menu. Development builds never check.",
+                |ui| {
+                    ui.checkbox(&mut check_updates, "Check for updates once a day");
+                },
+            );
+            self.app.set_check_for_updates(check_updates);
 
             ui.add_space(sp::S);
 

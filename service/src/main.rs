@@ -197,7 +197,7 @@ fn main() {
     // failure between them was invisible because log::error! was a
     // no-op until builder.init() landed.
     init_logging(&cli);
-    info!("{} v{} entering main()", PRODUCT_NAME, env!("CARGO_PKG_VERSION"));
+    info!("{} v{} entering main()", PRODUCT_NAME, stream_to_speaker::display_version());
 
     // Crash visibility. With windows_subsystem="windows" the default
     // panic handler writes to stderr — which is a dead handle in GUI
@@ -300,7 +300,7 @@ fn write_startup_tombstone() {
                 f,
                 "{}\tv{}\tmain() entered",
                 now,
-                env!("CARGO_PKG_VERSION")
+                stream_to_speaker::display_version()
             );
         }
     }
@@ -439,7 +439,7 @@ fn raise_existing_window() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    info!("{} v{}", PRODUCT_NAME, env!("CARGO_PKG_VERSION"));
+    info!("{} v{}", PRODUCT_NAME, stream_to_speaker::display_version());
 
     // --list-speakers short-circuit
     if cli.list_speakers {
@@ -474,6 +474,10 @@ fn run(cli: Cli) -> Result<()> {
     // Auto-reconnect watchdog — replaces a dropped AirPlay session with a
     // fresh one so the UI never shows a zombie "streaming" state.
     app.spawn_reconnect_watchdog();
+
+    // Once-a-day "newer release on GitHub?" check (Advanced toggle; a
+    // dev build without a baked release tag never checks).
+    app.spawn_update_checker();
 
     // Now-playing metadata forwarder (off by default; pushes the OS's
     // current track to the speaker when enabled).

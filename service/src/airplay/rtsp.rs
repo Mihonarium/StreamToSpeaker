@@ -51,6 +51,18 @@ pub struct ServerPorts {
     pub audio: u16,
     pub control: u16,
     pub timing: u16,
+    /// The receiver's `Audio-Latency` (samples) if it states one already
+    /// at SETUP — Apple TV and AirPort Express do; RECORD may repeat or
+    /// revise it. Sonos and most speakers never send it.
+    pub audio_latency: Option<u32>,
+}
+
+/// The receiver's advertised `Audio-Latency` header (samples), if any.
+/// Sent on SETUP and/or RECORD responses depending on the receiver.
+fn audio_latency_of(resp: &RtspResponse) -> Option<u32> {
+    resp.headers
+        .get("audio-latency")
+        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 /// A live RTSP control connection.
@@ -438,7 +450,8 @@ impl RtspClient {
         let audio = server_port.ok_or_else(|| anyhow!("SETUP: no server_port in transport"))?;
         let control = control_port.unwrap_or(audio);
         let timing = timing_port.unwrap_or(audio);
-        Ok(ServerPorts { audio, control, timing })
+        let audio_latency = audio_latency_of(&resp);
+        Ok(ServerPorts { audio, control, timing, audio_latency })
     }
 
     /// RECORD — flip the receiver to "expect audio". `initial_seq` and
@@ -466,11 +479,7 @@ impl RtspClient {
         if resp.status_code != 200 {
             bail!("RECORD failed: {} {}", resp.status_code, resp.status_text);
         }
-        let audio_latency = resp
-            .headers
-            .get("audio-latency")
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        Ok(audio_latency)
+        Ok(audio_latency_of(&resp))
     }
 
     /// SET_PARAMETER volume — RAOP volume is a float in dB, ranging

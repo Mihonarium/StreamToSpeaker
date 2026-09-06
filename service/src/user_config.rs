@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use crate::airplay::hap_pairing::PairingCredentials;
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserConfig {
     #[serde(default)]
     pub last_speaker_id: Option<String>,
@@ -126,6 +126,75 @@ pub struct UserConfig {
     /// setup where the fetching IP differs from the selected speaker's.
     #[serde(default)]
     pub privacy_mode: bool,
+    /// AirPlay sender-side buffer, in milliseconds: how far behind the RTP
+    /// write head our sync packets place "now", i.e. how much audio the
+    /// receiver holds before playing it. This is the bulk of the delay
+    /// heard on AirPlay, so lowering it lowers the delay in step, at the
+    /// cost of dropout margin (any hiccup longer than the buffer is a
+    /// dropout). 2000 = what iTunes sends, proven on every receiver
+    /// class. A modern Apple TV accepts almost anything; AirPort Express
+    /// and most AirPlay speakers need ~100-350 ms. The receiver's own
+    /// advertised `Audio-Latency` is always honoured as a floor, so a
+    /// speaker that reports its minimum is never driven below it.
+    /// Applies to RAOP and the AirPlay 2 realtime stream; below 1000 ms
+    /// an AirPlay 2 receiver is driven realtime automatically, since the
+    /// buffered stream holds seconds regardless of what we ask. Clamped
+    /// to [`AIRPLAY_LATENCY_MS_MIN`]..=[`AIRPLAY_LATENCY_MS_MAX`] on read.
+    #[serde(default = "default_airplay_latency_ms")]
+    pub airplay_latency_ms: u32,
+    /// Once-a-day check for a newer release on GitHub (Advanced toggle).
+    /// One unauthenticated GET of the releases API; nothing is downloaded
+    /// or installed. On by default. See `update_check`.
+    #[serde(default = "default_true")]
+    pub check_for_updates: bool,
+    /// Unix seconds of the last completed update check, any outcome —
+    /// paces the automatic check across launches.
+    #[serde(default)]
+    pub update_last_check_unix: Option<u64>,
+    /// Newest release seen by the last successful check: tag + release
+    /// page. Cached so the banner is right from the first frame after
+    /// launch (the check itself runs 20 s in) and on an offline launch.
+    #[serde(default)]
+    pub update_latest_tag: Option<String>,
+    #[serde(default)]
+    pub update_latest_url: Option<String>,
+    /// Tag the user chose "Skip this version" on — the banner stays
+    /// hidden until a *different* newer release appears.
+    #[serde(default)]
+    pub update_skipped_tag: Option<String>,
+    /// "Later" on the update banner: hidden until this unix time.
+    #[serde(default)]
+    pub update_banner_hidden_until: Option<u64>,
+}
+
+/// Default AirPlay buffer — iTunes' 2 s (88200 samples at 44.1 kHz).
+pub const AIRPLAY_LATENCY_MS_DEFAULT: u32 = 2000;
+/// Floor for `airplay_latency_ms`. Below ~20 ms the sender's own pacing
+/// jitter (8 ms RTP packets fed by 10 ms driver frames) exceeds the
+/// receiver's margin, so smaller values only add dropouts.
+pub const AIRPLAY_LATENCY_MS_MIN: u32 = 20;
+/// Ceiling for `airplay_latency_ms` (3 s — "buffered" territory).
+pub const AIRPLAY_LATENCY_MS_MAX: u32 = 3000;
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_airplay_latency_ms() -> u32 {
+    AIRPLAY_LATENCY_MS_DEFAULT
+}
+
+/// Fresh-install defaults come from the same serde defaults a parsed
+/// config uses, so a field's `#[serde(default = ...)]` is its single
+/// source of truth. (The previous `#[derive(Default)]` zeroed every
+/// field on a first launch — `auto_reconnect_on_drop` documented as
+/// default-true came up false, and was then persisted false by the first
+/// save. A non-zero default like `airplay_latency_ms` makes that
+/// divergence unaffordable.)
+impl Default for UserConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("every UserConfig field has a serde default")
+    }
 }
 
 fn default_auto_reconnect() -> bool {
@@ -153,6 +222,13 @@ fn config_path() -> Option<PathBuf> {
 }
 
 impl UserConfig {
+    /// `airplay_latency_ms` clamped to its supported range, so a hand-
+    /// edited config (or an older file with the field absent → default)
+    /// can't produce a zero or absurd anchor.
+    pub fn effective_airplay_latency_ms(&self) -> u32 {
+        self.airplay_latency_ms.clamp(AIRPLAY_LATENCY_MS_MIN, AIRPLAY_LATENCY_MS_MAX)
+    }
+
     pub fn load() -> Self {
         let Some(path) = config_path() else { return Self::default(); };
         let Ok(content) = std::fs::read_to_string(&path) else { return Self::default(); };
@@ -176,5 +252,38 @@ impl UserConfig {
         if let Err(e) = std::fs::write(&path, content) {
             log::warn!("user_config: write {}: {}", path.display(), e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_defaults_match_serde_defaults() {
+        // A first launch (no config file) must see the documented
+        // defaults, not zeroed fields.
+        let c = UserConfig::default();
+        assert_eq!(c.airplay_latency_ms, AIRPLAY_LATENCY_MS_DEFAULT);
+        assert!(c.auto_reconnect_on_launch);
+        assert!(c.auto_reconnect_on_drop);
+        assert!(c.check_for_updates);
+        assert_eq!(c.update_last_check_unix, None);
+        assert!(!c.prefer_realtime_airplay);
+    }
+
+    #[test]
+    fn latency_ms_absent_or_absurd_is_clamped() {
+        // Older config file without the field → default.
+        let c: UserConfig = serde_json::from_str(r#"{"onboarding_dismissed":true}"#).unwrap();
+        assert_eq!(c.effective_airplay_latency_ms(), AIRPLAY_LATENCY_MS_DEFAULT);
+        // Hand-edited nonsense is clamped, never zero.
+        let c: UserConfig = serde_json::from_str(r#"{"airplay_latency_ms":0}"#).unwrap();
+        assert_eq!(c.effective_airplay_latency_ms(), AIRPLAY_LATENCY_MS_MIN);
+        let c: UserConfig = serde_json::from_str(r#"{"airplay_latency_ms":999999}"#).unwrap();
+        assert_eq!(c.effective_airplay_latency_ms(), AIRPLAY_LATENCY_MS_MAX);
+        // In-range values pass through.
+        let c: UserConfig = serde_json::from_str(r#"{"airplay_latency_ms":100}"#).unwrap();
+        assert_eq!(c.effective_airplay_latency_ms(), 100);
     }
 }

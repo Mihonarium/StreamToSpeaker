@@ -138,6 +138,27 @@ startup: positive duplicates a frame every `1 000 000 / N` frames (speaker
 crystal faster than the host), negative drops one. Start at 0 and tune until
 the speaker's buffer level holds steady.
 
+### AirPlay buffer
+
+AirPlay delay is dominated by a buffer the *sender* asks for: each sync
+packet tells the speaker "the frame written N samples ago is playing now",
+so N is the receiver's buffer depth and most of the audible delay. iTunes
+uses 2 s (88200 samples). **Advanced → AirPlay buffer (latency)** sets N in
+milliseconds (`airplay_latency_ms` in config.json; default 2000, range
+20–3000):
+
+- The receiver's own `Audio-Latency` (stated on SETUP and/or RECORD) is a
+  floor: the anchor is `max(configured, advertised)`, so a speaker that
+  reports its minimum is never driven below it, and a big-DSP AVR asking
+  for more than 2 s still gets it.
+- AirPlay 2: the value drives the realtime stream's declared
+  `latencyMin/Max` and its sync anchor. Below 1000 ms the buffered stream
+  (which holds 1–2 s regardless) is skipped in favour of realtime.
+- Realistic floors: a recent Apple TV accepts very small values on a good
+  network; AirPort Express and most AirPlay speakers need ~100–350 ms. Any
+  Wi-Fi hiccup longer than the buffer is a dropout, so lower it until
+  playback stutters, then back off. Applies on the next connect.
+
 ### Tuning notes
 
 - `--initial-buffer-ms` is a prebuffer hint in the DIDL metadata; Sonos
@@ -151,6 +172,24 @@ the speaker's buffer level holds steady.
   cost of audible clicks.
 - Silence injection (default on) replaces silent packets with ~|4|-peak white
   noise after 500 ms so the speaker doesn't treat the stream as dead.
+
+## Update check
+
+`src/update_check.rs`. Once a day (first ~20 s after launch, never on the
+startup path) the app GETs
+`https://api.github.com/repos/Mihonarium/StreamToSpeaker/releases/latest` over
+WinHTTP — the OS HTTPS stack, so the system certificate store and proxy
+apply and no TLS library is bundled. The request carries only a
+`User-Agent` with the app version. If the release tag is newer (strict
+semver) a banner offers the release page; nothing is downloaded or installed
+automatically. "Skip this version" / "Later" and the on/off switch
+(`check_for_updates`, Advanced) persist in `config.json`.
+
+The version compared is the **release tag**, baked in by CI as
+`STS_RELEASE_VERSION` on `v*` tag builds (`release_version()` /
+`display_version()` in `lib.rs`) — not `CARGO_PKG_VERSION`, which is
+versioned independently. A build without it is a dev build: the label shows
+the crate version and update checks are off.
 
 ## HTTP API
 

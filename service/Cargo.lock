@@ -3652,6 +3652,7 @@ dependencies = [
  "raw-window-handle",
  "roxmltree",
  "rsa",
+ "semver",
  "serde",
  "serde_json",
  "sha1",
