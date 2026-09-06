@@ -25,14 +25,10 @@ use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use crate::ssdp::{DiscoveryState, Renderer};
+use crate::stream_gate::{canonical_ip, is_local_address, Grant, StreamGate};
 use crate::user_config::UserConfig;
 use crate::volume_sync::VolumeSync;
 use crate::{upnp, PRODUCT_NAME, WIRE_SAMPLE_RATE};
-
-/// How long a privacy-mode bring-up window (`App::pending_stream_ip`)
-/// stays valid without being explicitly cleared. Generous vs. the
-/// seconds-scale SOAP handshake; exists only as a backstop.
-const PENDING_STREAM_IP_WINDOW: Duration = Duration::from_secs(60);
 
 /// One running renderer session: the speaker we've handed our stream URL
 /// to and its GENA subscription on RenderingControl.
@@ -43,6 +39,9 @@ pub struct RendererSession {
     /// every speaker on a given run.
     #[allow(dead_code)]
     pub stream_uri: String,
+    /// Privacy-gate grant for this speaker's addresses. Lives exactly as
+    /// long as the session: dropping the session revokes them.
+    pub stream_grant: Option<Grant>,
 }
 
 /// Active session — either UPnP (pull-style, speaker fetches our HTTP
@@ -263,14 +262,9 @@ pub struct App {
     /// runs it on a worker thread and shows "Connecting…" off this.
     pub connecting: Mutex<Option<String>>,
 
-    /// Privacy-mode bring-up window: the IP of a UPnP speaker we're
-    /// currently handing the stream URL to, set *before* the SOAP Play
-    /// call. Sonos probes `/stream.raw` the moment Play returns —
-    /// before `session` holds the new speaker — so the privacy gate
-    /// needs this to admit the speaker's very first fetch. Cleared once
-    /// the session is stored (or bring-up fails); the timestamp expires
-    /// it as a backstop against any path that forgets to clear.
-    pending_stream_ip: Mutex<Option<(IpAddr, Instant)>>,
+    /// Privacy gate for `/stream.raw` (see `stream_gate.rs`). Sessions
+    /// hold grants in it; the HTTP threads consult it per request.
+    pub stream_gate: Arc<StreamGate>,
 
     /// The one in-flight HomeKit PIN pairing ceremony, if any. Single
     /// source of truth for the whole ceremony lifecycle: reserving the
@@ -350,6 +344,15 @@ impl App {
         airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     ) -> Arc<Self> {
         let web_initial = config.web_enabled;
+        // "This machine" for the privacy gate: the advertised IP, but
+        // only if this host actually owns it — a user-supplied
+        // --advertise-ip pointing at a proxy must not admit everything
+        // behind that proxy.
+        let own_ip = config
+            .advertise_ip
+            .parse::<IpAddr>()
+            .ok()
+            .filter(|ip| is_local_address(*ip));
         let user_config = UserConfig::load();
         // Seed last_speaker_id from disk so that, even before any user
         // action, code that asks "what was the last speaker?" gets the
@@ -377,10 +380,10 @@ impl App {
             rescan_in_flight: Arc::new(AtomicBool::new(false)),
             last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
             last_rescan_count: Arc::new(AtomicUsize::new(0)),
+            stream_gate: StreamGate::new(user_config.privacy_mode, own_ip),
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
-            pending_stream_ip: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
         })
     }
@@ -718,19 +721,20 @@ impl App {
         }
     }
 
-    /// Whether privacy mode is on: `/stream.raw` served only to the
-    /// bound speaker (and this machine itself).
+    // ---- Privacy mode ---------------------------------------------------
+
+    /// Whether privacy mode is on: `/stream.raw` served only to speakers
+    /// with a live session, plus this machine itself.
     pub fn is_privacy_mode(&self) -> bool {
-        self.user_config.lock().unwrap().privacy_mode
+        self.stream_gate.privacy()
     }
 
-    /// Persist the privacy-mode preference. Turning it ON also cuts off
-    /// any `/stream.raw` listener that connected while the stream was
-    /// open to everyone — otherwise an established connection would
-    /// keep receiving audio indefinitely (the gate is per-request).
+    /// Persist the privacy-mode preference and apply it. Turning it ON
+    /// also cuts off any `/stream.raw` listener the gate wouldn't admit
+    /// now — otherwise an established connection would keep receiving
+    /// audio indefinitely.
     pub fn set_privacy_mode(&self, on: bool) {
         {
-            // Scoped: `stream_client_allowed` below re-locks user_config.
             let mut uc = self.user_config.lock().unwrap();
             if uc.privacy_mode == on {
                 return;
@@ -738,65 +742,74 @@ impl App {
             uc.privacy_mode = on;
             uc.save();
         }
+        self.stream_gate.set_privacy(on);
         info!("privacy mode {}", if on { "enabled" } else { "disabled" });
         if on {
-            let cut = self.hub.disconnect_clients(|ip| !self.stream_client_allowed(ip));
-            if cut > 0 {
-                info!("privacy mode: disconnected {} existing stream listener(s)", cut);
-            }
+            self.prune_stream_clients();
         }
     }
 
-    /// Privacy gate for `/stream.raw`: may `peer` pull the audio stream?
-    /// Always yes with privacy mode off. With it on, we admit:
-    ///   - loopback and this machine's own advertised IP (a request from
-    ///     the PC itself is the same user — and useful for debugging);
-    ///   - the bound session's speaker;
-    ///   - the speaker a UPnP bring-up is mid-handshake with (see
-    ///     `pending_stream_ip` — Play precedes the session store, and
-    ///     Sonos fetches the stream in that gap).
-    /// Called per request from the HTTP threads; both locks taken here
-    /// are only ever held briefly.
+    /// Privacy gate for `/stream.raw`, called per request (and once a
+    /// second per open stream) from the HTTP threads. Touches only the
+    /// gate's own brief lock — never `session`, which other threads hold
+    /// across multi-second SOAP calls — so a stalled speaker can't park
+    /// the HTTP accept loop. A refusal is surfaced to the user, rate-
+    /// limited per address, naming the device when discovery knows it.
     pub fn stream_client_allowed(&self, peer: IpAddr) -> bool {
-        if !self.is_privacy_mode() {
+        if self.stream_gate.allows(peer) {
             return true;
         }
+        if self.stream_gate.note_refusal(peer) {
+            self.record_error(format!(
+                "Privacy mode refused a connection to the audio stream from {}. \
+                 Turn privacy mode off (Advanced) to let that device listen.",
+                self.describe_peer(peer)
+            ));
+        }
+        false
+    }
+
+    /// "Kitchen (192.168.1.50)" when discovery knows the address, else
+    /// the bare address. Brief locks only.
+    fn describe_peer(&self, peer: IpAddr) -> String {
         let peer = canonical_ip(peer);
-        if peer.is_loopback() {
-            return true;
+        let upnp = self.discovery.as_ref().and_then(|d| {
+            d.renderers()
+                .into_iter()
+                .find(|r| r.stream_peers().iter().any(|ip| canonical_ip(*ip) == peer))
+                .map(|r| r.friendly_name)
+        });
+        let name = upnp.or_else(|| {
+            self.airplay_discovery.as_ref().and_then(|d| {
+                d.renderers()
+                    .into_iter()
+                    .find(|r| canonical_ip(r.ip) == peer)
+                    .map(|r| r.friendly_name)
+            })
+        });
+        match name {
+            Some(n) => format!("{} ({})", n, peer),
+            None => peer.to_string(),
         }
-        if let Ok(own) = self.config.advertise_ip.parse::<IpAddr>() {
-            // A connection to our own LAN IP from this machine arrives
-            // with that IP as its source, not 127.0.0.1.
-            if peer == canonical_ip(own) {
-                return true;
-            }
-        }
-        {
-            let pending = self.pending_stream_ip.lock().unwrap();
-            if let Some((ip, when)) = pending.as_ref() {
-                if peer == canonical_ip(*ip) && when.elapsed() < PENDING_STREAM_IP_WINDOW {
-                    return true;
-                }
-            }
-        }
-        self.session
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| canonical_ip(s.ip()) == peer)
-            .unwrap_or(false)
     }
 
-    /// Open the privacy-mode bring-up window for `ip` (see
-    /// `pending_stream_ip`).
-    fn set_pending_stream_ip(&self, ip: IpAddr) {
-        *self.pending_stream_ip.lock().unwrap() = Some((ip, Instant::now()));
-    }
-
-    /// Close the privacy-mode bring-up window.
-    fn clear_pending_stream_ip(&self) {
-        *self.pending_stream_ip.lock().unwrap() = None;
+    /// Cut off every `/stream.raw` listener the gate no longer admits —
+    /// after a speaker switch, Disable, Forget, or privacy turning on.
+    /// The allow-set is snapshotted first, so the hub's subscriber lock
+    /// (taken by the audio thread per packet) is held only for a pure
+    /// predicate, never while waiting on anything.
+    pub fn prune_stream_clients(&self) {
+        let snapshot = self.stream_gate.snapshot();
+        if !snapshot.privacy() {
+            return;
+        }
+        let cut = self.hub.disconnect_clients(|ip| !snapshot.allows(ip));
+        if cut > 0 {
+            info!(
+                "privacy mode: disconnected {} stream listener(s) no longer allowed",
+                cut
+            );
+        }
     }
 
     /// The user's last explicitly-selected speaker, as persisted in
@@ -1246,13 +1259,7 @@ impl App {
                 }
             }
         } else {
-            match self.start_upnp(id) {
-                Ok(s) => s,
-                Err(e) => {
-                    self.clear_pending_stream_ip();
-                    return Err(e);
-                }
-            }
+            self.start_upnp(id)?
         };
 
         let mut guard = self.session.lock().unwrap();
@@ -1279,9 +1286,9 @@ impl App {
         #[cfg(windows)]
         let new_friendly_name = guard.as_ref().map(|s| s.friendly_name());
         drop(guard);
-        // The stored session now vouches for the speaker's IP; the
-        // bring-up window has done its job.
-        self.clear_pending_stream_ip();
+        // The old session — and with it its privacy grant — is gone:
+        // cut off any listener the allow-set no longer covers.
+        self.prune_stream_clients();
 
         *self.last_speaker_id.lock().unwrap() = Some(id.to_string());
         self.streaming_enabled.store(true, Ordering::Release);
@@ -1333,10 +1340,12 @@ impl App {
         let Some(new_r) = discovery.find_by_id(id) else {
             return Err(format!("no UPnP speaker with id {:?}", id));
         };
-        // Admit the speaker through the privacy gate BEFORE the SOAP
-        // handshake — it HEAD/GETs `/stream.raw` as soon as Play
-        // returns, while `self.session` still holds the old state.
-        self.set_pending_stream_ip(new_r.ip);
+        // Grant the speaker's addresses through the privacy gate BEFORE
+        // the SOAP handshake — it HEAD/GETs `/stream.raw` as soon as
+        // Play returns, while `self.session` still holds the old state.
+        // The grant moves into the session it produces; if bring-up
+        // fails it drops on the error path and the gate forgets it.
+        let grant = self.stream_gate.grant(new_r.stream_peers());
         let didl = upnp::didl_lite_metadata(
             &self.config.stream_uri,
             PRODUCT_NAME,
@@ -1347,6 +1356,7 @@ impl App {
             &self.config.stream_uri,
             &didl,
             &self.config.callback_url,
+            Some(grant),
         )
         .map_err(|e| format!("{:#}", e))?;
         Ok(ActiveSession::Upnp(session))
@@ -1865,6 +1875,7 @@ impl App {
         if let Some(s) = s {
             s.stop();
         }
+        self.prune_stream_clients();
         self.streaming_enabled.store(false, Ordering::Release);
         *self.last_speaker_id.lock().unwrap() = None;
         let mut uc = self.user_config.lock().unwrap();
@@ -1989,6 +2000,7 @@ impl App {
             if let Some(s) = s {
                 s.stop();
             }
+            self.prune_stream_clients();
             info!("streaming disabled");
         } else {
             let last = self.last_speaker_id.lock().unwrap().clone();
@@ -2098,6 +2110,7 @@ pub fn start_session(
     stream_uri: &str,
     didl: &str,
     callback_url: &str,
+    stream_grant: Option<Grant>,
 ) -> Result<RendererSession> {
     info!("targeting speaker: {} ({})", renderer.friendly_name, renderer.ip);
     // Stop first to clear any "Transport Locked" (Sonos 705) carry-over.
@@ -2122,6 +2135,7 @@ pub fn start_session(
         renderer,
         gena,
         stream_uri: stream_uri.to_string(),
+        stream_grant,
     })
 }
 
@@ -2166,20 +2180,6 @@ pub fn pick_ssdp_iface(advertise_ip: Option<&str>, bind: &str) -> Option<std::ne
     None
 }
 
-/// Fold an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) back to plain
-/// IPv4 so privacy-gate comparisons work regardless of what family the
-/// listening socket handed us the peer in. Discovery always records
-/// speakers as IPv4, but a dual-stack bind can report v4 peers mapped.
-fn canonical_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => ip,
-        },
-        IpAddr::V4(_) => ip,
-    }
-}
-
 #[allow(dead_code)]
 const _: u32 = DEFAULT_QUIESCENT_AFTER_PACKETS;
 
@@ -2213,9 +2213,9 @@ mod tests {
             None,
             None,
         );
-        // Directly mutate the field — set_privacy_mode would write the
+        // Flip the gate directly — set_privacy_mode would write the
         // developer's real config file to disk.
-        app.user_config.lock().unwrap().privacy_mode = true;
+        app.stream_gate.set_privacy(true);
         app
     }
 
@@ -2226,36 +2226,43 @@ mod tests {
     #[test]
     fn privacy_off_allows_everyone() {
         let app = test_app();
-        app.user_config.lock().unwrap().privacy_mode = false;
+        app.stream_gate.set_privacy(false);
         assert!(app.stream_client_allowed(ip("192.168.1.99")));
+        assert!(app.current_error().is_none());
     }
 
     #[test]
-    fn privacy_on_denies_strangers_allows_self() {
+    fn privacy_on_refuses_strangers_admits_loopback() {
         let app = test_app();
-        // No session, no pending bring-up: only this machine gets in.
         assert!(!app.stream_client_allowed(ip("192.168.1.99")));
         assert!(app.stream_client_allowed(ip("127.0.0.1")));
         assert!(app.stream_client_allowed(ip("::1")));
-        assert!(app.stream_client_allowed(ip("192.168.1.10")));
+        // The advertised IP is NOT this test host's address, so it is
+        // not admitted as "this machine" (the proxy/NAT case).
+        assert!(!app.stream_client_allowed(ip("192.168.1.10")));
     }
 
     #[test]
-    fn privacy_on_admits_pending_bringup_ip() {
+    fn grant_lives_and_dies_with_its_holder() {
         let app = test_app();
-        app.set_pending_stream_ip(ip("192.168.1.50"));
+        let grant = app.stream_gate.grant([ip("192.168.1.50")]);
         assert!(app.stream_client_allowed(ip("192.168.1.50")));
-        // Dual-stack sockets report v4 peers as IPv4-mapped IPv6.
         assert!(app.stream_client_allowed(ip("::ffff:192.168.1.50")));
         assert!(!app.stream_client_allowed(ip("192.168.1.51")));
-        app.clear_pending_stream_ip();
+        drop(grant);
         assert!(!app.stream_client_allowed(ip("192.168.1.50")));
     }
 
     #[test]
-    fn canonical_ip_folds_mapped_v6_only() {
-        assert_eq!(ip("192.168.1.2"), canonical_ip(ip("::ffff:192.168.1.2")));
-        assert_eq!(ip("192.168.1.2"), canonical_ip(ip("192.168.1.2")));
-        assert_eq!(ip("fe80::1"), canonical_ip(ip("fe80::1")));
+    fn refusal_is_surfaced_once_per_peer() {
+        let app = test_app();
+        assert!(!app.stream_client_allowed(ip("192.168.1.99")));
+        let msg = app.current_error().expect("refusal recorded as a user-visible error");
+        assert!(msg.contains("192.168.1.99"), "{msg}");
+        assert!(msg.contains("privacy mode off"), "{msg}");
+        // A repeat within the report interval is refused silently.
+        app.dismiss_error();
+        assert!(!app.stream_client_allowed(ip("192.168.1.99")));
+        assert!(app.current_error().is_none());
     }
 }

@@ -2871,12 +2871,33 @@ impl StreamToSpeakerApp {
                 p,
                 "Privacy mode",
                 "Serve the audio stream only to the speaker you're streaming to.",
-                "The speaker fetches your PC's audio from a plain HTTP URL, so by default anyone on your network who knows that URL can listen to whatever your PC plays. Privacy mode refuses stream requests from every address except the selected speaker's (and this PC's own). Turn it off if playback breaks on grouped speakers — in a Sonos group, the unit that actually fetches the stream can be a different one than the speaker you selected. AirPlay speakers are unaffected either way (audio is pushed to them directly, not fetched from the URL).",
+                "The speaker fetches your PC's audio from a plain HTTP URL, so by default anyone on your network who knows that URL can listen to whatever your PC plays. Privacy mode serves the stream only to the speaker you're streaming to (and this PC itself): its addresses are allowed for as long as its session lasts, and switching to a different speaker cuts off anything still listening from the previous one. A refused device is named in a message, so you can tell a phone from a speaker. In a Sonos group the unit that fetches the stream is the group's coordinator — pick that one, or turn privacy mode off, if playback breaks. AirPlay speakers are unaffected either way (audio is pushed to them directly, not fetched from the URL).",
                 |ui| {
                     ui.checkbox(&mut privacy, "Only the active speaker may fetch the stream");
                 },
             );
             self.app.set_privacy_mode(privacy);
+            if privacy {
+                ui.label(
+                    egui::RichText::new(
+                        "Switching speakers cuts off any device still receiving the \
+                         stream from the previous one.",
+                    )
+                    .size(12.0)
+                    .color(p.text_secondary),
+                );
+                if self.app.is_web_ui_enabled() {
+                    ui.label(
+                        egui::RichText::new(
+                            "⚠  The web UI is on: anyone on your network who can open it \
+                             can point the stream at another device, which defeats \
+                             privacy mode. Turn one of the two off.",
+                        )
+                        .size(12.0)
+                        .color(p.warn),
+                    );
+                }
+            }
         });
     }
 
@@ -2935,6 +2956,19 @@ impl StreamToSpeakerApp {
                     self.app.set_web_ui_enabled(true);
                 }
             });
+
+            if on && self.app.is_privacy_mode() {
+                ui.add_space(sp::XS);
+                ui.label(
+                    egui::RichText::new(
+                        "⚠  Privacy mode is on, but anyone on your network who can open \
+                         this web UI can switch the stream to another device — which \
+                         defeats it. Turn one of the two off.",
+                    )
+                    .size(12.0)
+                    .color(p.warn),
+                );
+            }
 
             if on {
                 ui.add_space(sp::XS);

@@ -255,10 +255,11 @@ fn run_server(
                     continue;
                 };
                 let hub = hub.clone();
+                let gate = stream_client_allowed.clone();
                 thread::Builder::new()
                     .name("stream-to-speaker-http-stream".to_string())
                     .spawn(move || {
-                        if let Err(e) = serve_stream(req, hub) {
+                        if let Err(e) = serve_stream(req, hub, gate) {
                             debug!("stream client ended: {}", e);
                         }
                     })
@@ -665,14 +666,23 @@ fn handle_notify(
 
 /// Serve a single `/stream.raw` connection.  We write chunked HTTP/1.1 by
 /// hand so we have precise control over flush timing.
-fn serve_stream(req: tiny_http::Request, hub: Arc<StreamHub>) -> Result<()> {
+fn serve_stream(
+    req: tiny_http::Request,
+    hub: Arc<StreamHub>,
+    gate: Option<StreamClientAllowedCallback>,
+) -> Result<()> {
     // Subscribe BEFORE we send headers so we don't miss the first frame.
     // Tagged with the peer IP so privacy mode can cut the connection
     // off later if this client stops being allowed.
-    let rx = match req.remote_addr().map(|a| a.ip()) {
+    let peer = req.remote_addr().map(|a| a.ip());
+    let rx = match peer {
         Some(peer) => hub.subscribe_from(peer),
         None => hub.subscribe(),
     };
+    // The reader also re-asks the gate once a second while streaming, so
+    // a listener that stops being allowed (speaker switched, privacy
+    // turned on) is cut within a second even if no explicit prune ran.
+    let recheck = gate.and_then(|cb| peer.map(|p| (cb, p)));
 
     // We need the raw TCP stream for hand-rolled chunked transfer.
     // tiny_http exposes the request via `respond` but using a Response
@@ -683,7 +693,7 @@ fn serve_stream(req: tiny_http::Request, hub: Arc<StreamHub>) -> Result<()> {
     // crossbeam channel.  tiny_http will Transfer-Encoding: chunked it
     // for us.
 
-    let reader = StreamReader::new(rx);
+    let reader = StreamReader::new(rx, recheck);
 
     // swyh-rs's StreamSize::U32maxNotChunked pattern — emit a fixed
     // (fake) Content-Length of u32::MAX-1 and set chunked_threshold to
@@ -747,18 +757,31 @@ fn dlna_stream_headers() -> Vec<Header> {
 /// up to a few seconds for a frame; if nothing arrives it returns EOF
 /// (closing the stream), which is the cleanest way to signal the client we
 /// have nothing to send.
+/// How often an open stream re-asks the privacy gate about its peer.
+const GATE_RECHECK: Duration = Duration::from_secs(1);
+
 struct StreamReader {
     rx: Receiver<PcmFrame>,
     /// Bytes not yet returned from the last received frame.
     leftover: Vec<u8>,
     /// Offset into `leftover` that has been served.
     leftover_pos: usize,
+    /// Privacy gate + this client's address; re-checked every
+    /// [`GATE_RECHECK`]. `None` when the gate is off or the peer is
+    /// unknown.
+    gate: Option<(StreamClientAllowedCallback, std::net::IpAddr)>,
+    last_gate_check: std::time::Instant,
 }
 
 impl StreamReader {
-    fn new(rx: Receiver<PcmFrame>) -> Self {
+    fn new(
+        rx: Receiver<PcmFrame>,
+        gate: Option<(StreamClientAllowedCallback, std::net::IpAddr)>,
+    ) -> Self {
         Self {
             rx,
+            gate,
+            last_gate_check: std::time::Instant::now(),
             // Pre-load a 44-byte RIFF/WAVE header so the consumer (Sonos)
             // sees a valid streaming WAV from byte 0. swyh-rs does the
             // same thing in audio/rwstream.rs.
@@ -803,6 +826,15 @@ fn wav_header_streaming() -> [u8; 44] {
 impl Read for StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.leftover_pos >= self.leftover.len() {
+            // Still allowed? EOF closes the connection if not.
+            if let Some((cb, peer)) = &self.gate {
+                if self.last_gate_check.elapsed() >= GATE_RECHECK {
+                    self.last_gate_check = std::time::Instant::now();
+                    if !cb(*peer) {
+                        return Ok(0);
+                    }
+                }
+            }
             // Need a new frame.  Wait up to 30 s; if nothing, signal EOF.
             match self.rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(frame) => {
