@@ -384,7 +384,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
 
       # -----------------------------------------------------------------
-      # Production-driver installer preview (main pushes / dispatch).
+      # Production-driver installer preview (PRs / main pushes / dispatch).
       #
       # If a driver-v* release carries a Microsoft-attested driver whose
       # manifest source_hash matches the CURRENT driver source, build a
@@ -398,7 +398,10 @@ jobs:
       # -----------------------------------------------------------------
       - name: Fetch attested driver (if one matches the driver source)
         id: attested
-        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        # Every non-tag build: PRs included, so a service-only PR yields an
+        # installer with the production driver that reviewers can run
+        # without testsigning mode. Tag pushes are handled by `package`.
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
