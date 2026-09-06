@@ -173,6 +173,24 @@ milliseconds (`airplay_latency_ms` in config.json; default 2000, range
 - Silence injection (default on) replaces silent packets with ~|4|-peak white
   noise after 500 ms so the speaker doesn't treat the stream as dead.
 
+## Update check
+
+`src/update_check.rs`. Once a day (first ~20 s after launch, never on the
+startup path) the app GETs
+`https://api.github.com/repos/Mihonarium/StreamToSpeaker/releases/latest` over
+WinHTTP — the OS HTTPS stack, so the system certificate store and proxy
+apply and no TLS library is bundled. The request carries only a
+`User-Agent` with the app version. If the release tag is newer (strict
+semver) a banner offers the release page; nothing is downloaded or installed
+automatically. "Skip this version" / "Later" and the on/off switch
+(`check_for_updates`, Advanced) persist in `config.json`.
+
+The version compared is the **release tag**, baked in by CI as
+`STS_RELEASE_VERSION` on `v*` tag builds (`release_version()` /
+`display_version()` in `lib.rs`) — not `CARGO_PKG_VERSION`, which is
+versioned independently. A build without it is a dev build: the label shows
+the crate version and update checks are off.
+
 ## HTTP API
 
 `--web` serves a status page at `http://<host>:5901/` plus:

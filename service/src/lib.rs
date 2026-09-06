@@ -18,6 +18,7 @@ pub mod sine_source;
 pub mod qpc;
 pub mod picker;
 pub mod user_config;
+pub mod update_check;
 pub mod now_playing;
 #[cfg(windows)]
 pub mod wasapi_source;
@@ -37,6 +38,24 @@ pub mod endpoint_name;
 pub const PRODUCT_NAME: &str = "Stream To Speaker";
 /// Short slug used in user agents.
 pub const PRODUCT_UA: &str = "stream-to-speaker/0.1";
+
+/// Release version CI bakes in on tag builds (`STS_RELEASE_VERSION` = the
+/// git tag minus its `v`, see build.yml). Unset for local/dev builds.
+const RELEASE_VERSION_ENV: Option<&str> = option_env!("STS_RELEASE_VERSION");
+
+/// The release this exe was built for, or `None` for a dev build. NB the
+/// crate version (`CARGO_PKG_VERSION`) is *not* the release version — the
+/// two are versioned independently — so anything user-facing or
+/// comparable against GitHub must use this.
+pub fn release_version() -> Option<&'static str> {
+    RELEASE_VERSION_ENV.filter(|s| !s.trim().is_empty())
+}
+
+/// Version to show people: the release tag on release builds, else the
+/// crate version (dev builds).
+pub fn display_version() -> &'static str {
+    release_version().unwrap_or(env!("CARGO_PKG_VERSION"))
+}
 
 /// Wire format: only L16 PCM, 44.1 kHz, stereo in v1.
 pub const WIRE_SAMPLE_RATE: u32 = 44_100;
