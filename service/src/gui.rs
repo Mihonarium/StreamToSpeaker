@@ -1405,6 +1405,14 @@ fn window_close_cursor(ctx: &egui::Context, window_rect: egui::Rect, inner_margi
 /// painted straight over the text. A fixed "stack below N px" threshold
 /// only moved that collision to a different window width (the donation
 /// strip overlapped at the default 720 px window).
+///
+/// Every right-to-left row here is wrapped in `ui.horizontal`, which
+/// bounds the row's height. A vertically-centred horizontal layout dropped
+/// straight into an unbounded ui (the scroll area's content) centres its
+/// widgets within an infinite height — i.e. at y = ∞ — and the enclosing
+/// frame then paints the whole page. `main`'s stacked branch did this at
+/// the 580 px minimum width; the first cut of this helper did it at every
+/// width. Verified with a headless egui layout harness.
 fn notice_row(
     ui: &mut egui::Ui,
     msg: egui::RichText,
@@ -1416,14 +1424,18 @@ fn notice_row(
         ui.vertical(|ui| {
             ui.add(egui::Label::new(msg).wrap());
             ui.add_space(sp::S);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), buttons);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), buttons);
+            });
         });
     } else {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            buttons(ui);
-            ui.add_space(sp::S);
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add(egui::Label::new(msg).wrap());
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                buttons(ui);
+                ui.add_space(sp::S);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(msg).wrap());
+                });
             });
         });
     }
@@ -1839,7 +1851,17 @@ impl StreamToSpeakerApp {
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             if let (Some(label), Some(tip)) = (btn_label, btn_tip) {
-                                ui.vertical(|ui| {
+                                // Explicit-width, right-aligned column. A plain
+                                // `ui.vertical` here claims the full remaining
+                                // width — its bounding box reaches the left edge
+                                // — so the text column laid out after it got
+                                // ~0 px and the headline came out one word per
+                                // line. Verified with the headless harness.
+                                let col_h = ui.available_height();
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(140.0, col_h),
+                                    egui::Layout::top_down(egui::Align::Max),
+                                    |ui| {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
@@ -1898,7 +1920,8 @@ impl StreamToSpeakerApp {
                                             },
                                         );
                                     }
-                                });
+                                    },
+                                );
                                 ui.add_space(sp::S);
                             }
 
