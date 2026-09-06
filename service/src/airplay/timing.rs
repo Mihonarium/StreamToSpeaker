@@ -60,6 +60,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Convert a latency in milliseconds to sample frames at the wire rate —
+/// the unit the sync-packet anchor and `Audio-Latency` speak. 2000 ms →
+/// 88200, the iTunes constant.
+pub fn latency_ms_to_samples(ms: u32) -> u32 {
+    (ms as u64 * crate::WIRE_SAMPLE_RATE as u64 / 1000) as u32
+}
+
 /// NTP epoch offset — seconds between 1900-01-01 and 1970-01-01.
 const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 

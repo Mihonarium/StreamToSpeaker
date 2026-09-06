@@ -2611,6 +2611,39 @@ impl StreamToSpeakerApp {
 
             ui.add_space(sp::S);
 
+            {
+                use crate::user_config::{
+                    AIRPLAY_LATENCY_MS_DEFAULT, AIRPLAY_LATENCY_MS_MAX, AIRPLAY_LATENCY_MS_MIN,
+                };
+                let mut lat_ms =
+                    self.app.user_config.lock().unwrap().effective_airplay_latency_ms() as i64;
+                advanced_row(
+                    ui,
+                    p,
+                    "AirPlay buffer (latency)",
+                    "Lower = less delay, less margin for Wi-Fi hiccups. 2000 ms is what iTunes uses.",
+                    "How much audio an AirPlay speaker holds before playing it. This is most of the delay you hear on AirPlay, so lowering it lowers the delay in step — but any Wi-Fi hiccup longer than the buffer becomes a dropout. A recent Apple TV copes with very small values on a good network; AirPort Express and most AirPlay speakers need roughly 100–350 ms, and a speaker that reports its own minimum is never driven below it. Applies to AirPlay 1 speakers and the AirPlay 2 realtime stream; below 1000 ms an AirPlay 2 speaker is switched to the realtime stream automatically. Takes effect the next time you connect.",
+                    |ui| {
+                        advanced_slider_row(
+                            ui,
+                            p,
+                            &mut lat_ms,
+                            (AIRPLAY_LATENCY_MS_MIN as i64)..=(AIRPLAY_LATENCY_MS_MAX as i64),
+                            " ms",
+                            AIRPLAY_LATENCY_MS_DEFAULT as i64,
+                            "2000 ms",
+                        )
+                    },
+                );
+                let mut uc = self.app.user_config.lock().unwrap();
+                if uc.airplay_latency_ms != lat_ms as u32 {
+                    uc.airplay_latency_ms = lat_ms as u32;
+                    uc.save();
+                }
+            }
+
+            ui.add_space(sp::S);
+
             let mut prefer_rt = self.app.user_config.lock().unwrap().prefer_realtime_airplay;
             advanced_row(
                 ui,
