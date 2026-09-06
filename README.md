@@ -26,6 +26,17 @@ network as the PC.
 
 Closing the window minimises to the tray; quit from the tray menu.
 
+Speakers that stream over UPnP fetch the PC's audio from a plain HTTP URL, so
+by default anyone on the same network who knows the URL can listen in.
+**Advanced → Privacy mode** serves that URL only to the speaker you're
+streaming to: its addresses are allowed for as long as its session lasts, and
+switching speakers cuts off anything still listening from the old one. A
+refused device is named in a message, so you can tell a phone from a Sonos
+group member (in a group, the coordinator is the unit that fetches the
+stream — pick that one, or turn privacy mode off). Note that the web UI, if
+enabled, lets anyone on your network pick a different speaker, which defeats
+privacy mode; the app warns when both are on.
+
 Once a day the app asks GitHub whether a newer release exists and, if so,
 shows a link to it. Nothing is downloaded or installed by itself. Turn the
 check off under **Advanced** if you'd rather not.
