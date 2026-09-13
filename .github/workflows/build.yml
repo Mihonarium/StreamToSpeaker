@@ -348,6 +348,25 @@ jobs:
           path: driver-cache
           key: ${{ steps.cache-driver.outputs.cache-primary-key }}
 
+      # On tag builds, make the crate version match the release tag so
+      # `--version`, CARGO_PKG_VERSION and the exe's metadata agree with the
+      # installer filename and the in-app update check. The repo's
+      # Cargo.toml keeps its own number between releases; only the built
+      # artifact is stamped. First `^version` line only — the file also has
+      # a bare `version = "…"` under a dependency table further down.
+      - name: Stamp crate version from the tag (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        working-directory: service
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $toml = Get-Content Cargo.toml -Raw
+          $re = [regex]::new('(?m)^version = "[^"]*"')
+          if (-not $re.IsMatch($toml)) { throw "no package version line in Cargo.toml" }
+          $stamped = $re.Replace($toml, "version = `"$v`"", 1)
+          Set-Content Cargo.toml $stamped -NoNewline
+          Write-Host "Cargo.toml package version stamped to $v"
+
       - name: Build service (cargo --release)
         shell: pwsh
         working-directory: service
@@ -358,6 +377,22 @@ jobs:
           # Empty on non-tag builds → dev build → update checks disabled.
           STS_RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && steps.ver.outputs.version || '' }}
         run: cargo build --release
+
+      # The unit tests never ran in CI before this step existed. --release
+      # shares the artifacts just built. The second command runs the one
+      # `#[ignore]`d test: a live WinHTTP round-trip to the GitHub releases
+      # API — the update check's transport, which can only be exercised on
+      # a Windows host with network.
+      - name: Test service (unit tests + live update-check fetch)
+        shell: pwsh
+        working-directory: service
+        env:
+          STS_RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && steps.ver.outputs.version || '' }}
+        run: |
+          cargo test --release
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
+          cargo test --release -- --ignored live_github_fetch
+          if ($LASTEXITCODE -ne 0) { throw "live update-check fetch failed" }
 
       - name: Stage artifacts for installer
         shell: pwsh
@@ -838,3 +873,38 @@ jobs:
           Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
           gh release upload "${{ github.ref_name }}" $bundle --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+
+  # Minimum-supported-Rust check. `rust-version` in service/Cargo.toml is
+  # only a true statement while this job passes: it checks both targets on
+  # exactly that toolchain with the lockfile as-is (--locked), so a
+  # dependency bump that raises the floor fails here instead of on a user's
+  # machine. Ubuntu is enough — the Windows-only code is covered by the
+  # cross-check target, the same way the local workflow does it.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          v=$(grep -m1 '^rust-version' service/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          test -n "$v" || { echo "no rust-version in service/Cargo.toml" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+          targets: x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: service
+
+      - name: cargo check on the MSRV (Linux + Windows cross-check)
+        working-directory: service
+        run: |
+          cargo check --locked
+          cargo check --locked --target x86_64-pc-windows-gnu
