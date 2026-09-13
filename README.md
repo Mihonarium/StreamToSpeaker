@@ -20,6 +20,10 @@ and run it. Needs Windows 10 1809+ / Windows 11, 64-bit (not Windows Server).
    app to it in the Volume Mixer.
 2. Pick a speaker in the app.
 
+Sonos speakers grouped in the Sonos app show up as one entry ("Living Room +
+Kitchen"); audio plays on the whole group and the volume slider moves the
+group volume. To stream to a single speaker, ungroup it in the Sonos app.
+
 Sound lagging behind video → **−25 / −100 ms**. No sound → **Resync**
 (`Ctrl+Shift+R`). Speaker missing → **↻ Rescan**; check it's on the same
 network as the PC.

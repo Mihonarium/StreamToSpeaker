@@ -119,13 +119,27 @@ impl GenaManager {
     }
 }
 
-/// Parse a NOTIFY body for RenderingControl LastChange events. Returns
-/// None if we can't extract anything useful (which is fine — we'll just
-/// ignore the notify).
+/// Parse a NOTIFY body for volume/mute changes. Handles both shapes we
+/// subscribe to:
+///
+///  * RenderingControl — a `LastChange` property whose text is an
+///    entity-encoded XML document with `<Volume>` / `<Mute>` elements;
+///  * GroupRenderingControl (Sonos group volume) — flat `<GroupVolume>`
+///    / `<GroupMute>` properties, no LastChange wrapper.
+///
+/// Returns None if we can't extract anything useful (which is fine —
+/// we'll just ignore the notify).
 pub fn parse_rendering_notify(body: &str) -> Option<RenderingChange> {
-    // The body is propertyset -> property -> LastChange (text node,
-    // entity-encoded).  Extract LastChange.
-    let lc = find_tag_text(body, "LastChange")?;
+    let Some(lc) = find_tag_text(body, "LastChange") else {
+        // GroupRenderingControl notifies carry flat properties.
+        let volume = find_tag_text(body, "GroupVolume").and_then(|v| v.trim().parse::<u32>().ok());
+        let mute = find_tag_text(body, "GroupMute")
+            .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"));
+        if volume.is_none() && mute.is_none() {
+            return None;
+        }
+        return Some(RenderingChange { volume, mute });
+    };
     // LastChange is XML-encoded inside the text node.
     let decoded = xml_unescape(&lc);
 
@@ -280,8 +294,9 @@ fn extract_header(response: &str, header: &str) -> Option<String> {
     None
 }
 
-/// Pull the text between the first `<tag>...</tag>` pair.
-fn find_tag_text(xml: &str, tag: &str) -> Option<String> {
+/// Pull the text between the first `<tag>...</tag>` pair. Also used by
+/// upnp.rs / sonos.rs for the ZoneGroupState payload.
+pub(crate) fn find_tag_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
     let i = xml.find(&open)?;
@@ -290,7 +305,7 @@ fn find_tag_text(xml: &str, tag: &str) -> Option<String> {
     Some(after[..j].to_string())
 }
 
-fn xml_unescape(s: &str) -> String {
+pub(crate) fn xml_unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     let bytes = s.as_bytes();
@@ -344,5 +359,27 @@ mod tests {
     #[test]
     fn xml_unescape_basic() {
         assert_eq!(xml_unescape("a &amp; b &lt;c&gt; &quot;d&quot;"), "a & b <c> \"d\"");
+    }
+
+    #[test]
+    fn parses_group_volume_change() {
+        // GroupRenderingControl NOTIFY — flat properties, no LastChange.
+        let body = r#"<?xml version="1.0"?>
+<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+<e:property><GroupVolume>32</GroupVolume></e:property>
+<e:property><GroupMute>1</GroupMute></e:property>
+<e:property><GroupVolumeChangeable>1</GroupVolumeChangeable></e:property>
+</e:propertyset>"#;
+        let rc = parse_rendering_notify(body).expect("decode");
+        assert_eq!(rc.volume, Some(32));
+        assert_eq!(rc.mute, Some(true));
+    }
+
+    #[test]
+    fn ignores_empty_group_notify() {
+        let body = r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+<e:property><GroupVolumeChangeable>1</GroupVolumeChangeable></e:property>
+</e:propertyset>"#;
+        assert!(parse_rendering_notify(body).is_none());
     }
 }

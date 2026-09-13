@@ -62,6 +62,15 @@ User-machine prerequisites that aren't automatable:
 - Windows 10 1809+ (the INF targets `NTamd64.10.0...17763`)
 - Click "Allow" once in Sound Settings for the per-device privacy gate (Windows 11 22H2+ only) — addressed by `PKEY_AudioDevice_EnableEndpointByDefault` in the INF, but pre-existing endpoints created without that property still need the manual click
 
+## Key knowledge — Sonos zone groups (research-verified 2026-08-09 vs SoCo, svrooij/sonos-api-docs, node-sonos-ts)
+
+Implemented in `service/src/sonos.rs` (+ ssdp/upnp/gena/app wiring). Facts below were verified against SoCo's `zonegroupstate.py`/`core.py` and svrooij's service docs — NOT against real grouped hardware yet:
+
+- **Topology**: `GetZoneGroupState` (no args) on `urn:schemas-upnp-org:service:ZoneGroupTopology:1`, control URL `/ZoneGroupTopology/Control`, answered by **any** player. Output `ZoneGroupState` = entity-escaped XML. S2 firmware wraps `<ZoneGroups>` inside `<ZoneGroupState>`; pre-10.1 S1 has `<ZoneGroup>` directly under the root (SoCo's compatibility fallback — we walk descendants so both parse). `ZoneGroup` has `Coordinator` + `ID`; `ZoneGroupMember` has `UUID` (no `uuid:` prefix, unlike UDN), `Location` (that member's device-description URL), `ZoneName`, `Invisible="1"` (stereo-pair slave / Sub), `IsZoneBridge="1"` (BRIDGE/BOOST — filter these too, SoCo does), and `Satellite` child elements (surrounds) which we fold in as invisible members. The service also EVENTS ZoneGroupState via GENA — unused today; would give live group-change updates instead of per-scan.
+- **Group membership mechanism**: `SetAVTransportURI` with `x-rincon:<coordinator-UUID>` = join a group; `BecomeCoordinatorOfStandaloneGroup` = leave. A normal stream URI to a grouped member changes its membership (this is why we hide members; SoCo raises client-side on ANY transport call to a non-coordinator).
+- **Group volume**: `urn:schemas-upnp-org:service:GroupRenderingControl:1` at `/MediaRenderer/GroupRenderingControl/Control|Event` — `SetGroupVolume(InstanceID=0, DesiredVolume)` / `GetGroupVolume` / `SetGroupMute(DesiredMute)` / `SetRelativeGroupVolume(Adjustment) → NewVolume` / `SnapshotGroupVolume`. Coordinator-only: **error 701 "Player isn't the coordinator"** elsewhere. Scales members proportionally (the Sonos-app group slider). GENA events are **flat** properties (`<GroupVolume>`, `<GroupMute>`, `<GroupVolumeChangeable>` — booleans as 1/0), NOT LastChange-wrapped like RenderingControl; `parse_rendering_notify` handles both shapes.
+- **Transport gotcha**: Sonos chunks HTTP/1.1 responses. `ssdp.rs http_get` dodges via HTTP/1.0; `upnp.rs soap_post` speaks 1.1 and now de-chunks the body (`decode_maybe_chunked`) — small SOAP replies fit one chunk and parsed "fine" by accident for years, a multi-KB `GetZoneGroupState` would have had interior chunk-size lines corrupting the escaped XML.
+
 ## Key knowledge — Windows-audio specifics learned the hard way
 
 | Symptom | Real cause | Fix |

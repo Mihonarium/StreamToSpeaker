@@ -3,6 +3,9 @@
 //! Actions:
 //!   * AVTransport: SetAVTransportURI, Play, Stop
 //!   * RenderingControl: SetVolume, SetMute, GetVolume, GetMute
+//!   * GroupRenderingControl (Sonos): SetGroupVolume, GetGroupVolume,
+//!     SetGroupMute — group-wide volume, addressed to the coordinator
+//!   * ZoneGroupTopology (Sonos): GetZoneGroupState
 //!
 //! SOAP is just HTTP POST with a specific Content-Type + SOAPAction header
 //! and an envelope-shaped XML body. We hand-roll it over TCP so we don't
@@ -176,6 +179,91 @@ pub fn get_mute(control_url: &str) -> Result<bool> {
     Ok(n != 0)
 }
 
+/// Set the Sonos group volume (0..=100) via GroupRenderingControl on the
+/// group coordinator. Scales every member proportionally — the same
+/// semantics as the group slider in the Sonos app. Returns 701 when
+/// addressed to a non-coordinator, so callers must route to the
+/// coordinator (ssdp::Renderer::group_volume_control_url does).
+pub fn set_group_volume(control_url: &str, level: u32) -> Result<()> {
+    let level = level.min(100);
+    let body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:SetGroupVolume xmlns:u="urn:schemas-upnp-org:service:GroupRenderingControl:1">
+<InstanceID>0</InstanceID>
+<DesiredVolume>{level}</DesiredVolume>
+</u:SetGroupVolume>
+</s:Body>
+</s:Envelope>"#
+    );
+    soap_post(
+        control_url,
+        "urn:schemas-upnp-org:service:GroupRenderingControl:1#SetGroupVolume",
+        &body,
+    )
+    .map(|_| ())
+}
+
+pub fn get_group_volume(control_url: &str) -> Result<u32> {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:GetGroupVolume xmlns:u="urn:schemas-upnp-org:service:GroupRenderingControl:1">
+<InstanceID>0</InstanceID>
+</u:GetGroupVolume>
+</s:Body>
+</s:Envelope>"#;
+    let resp = soap_post(
+        control_url,
+        "urn:schemas-upnp-org:service:GroupRenderingControl:1#GetGroupVolume",
+        body,
+    )?;
+    extract_int_tag(&resp, "CurrentVolume")
+        .ok_or_else(|| anyhow!("CurrentVolume missing in GetGroupVolume response"))
+}
+
+pub fn set_group_mute(control_url: &str, muted: bool) -> Result<()> {
+    let body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:SetGroupMute xmlns:u="urn:schemas-upnp-org:service:GroupRenderingControl:1">
+<InstanceID>0</InstanceID>
+<DesiredMute>{m}</DesiredMute>
+</u:SetGroupMute>
+</s:Body>
+</s:Envelope>"#,
+        m = if muted { 1 } else { 0 }
+    );
+    soap_post(
+        control_url,
+        "urn:schemas-upnp-org:service:GroupRenderingControl:1#SetGroupMute",
+        &body,
+    )
+    .map(|_| ())
+}
+
+/// Fetch the entity-decoded ZoneGroupState XML from a Sonos device's
+/// ZoneGroupTopology service. Parsing lives in `sonos.rs`.
+pub fn get_zone_group_state(control_url: &str) -> Result<String> {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:GetZoneGroupState xmlns:u="urn:schemas-upnp-org:service:ZoneGroupTopology:1">
+</u:GetZoneGroupState>
+</s:Body>
+</s:Envelope>"#;
+    let resp = soap_post(
+        control_url,
+        "urn:schemas-upnp-org:service:ZoneGroupTopology:1#GetZoneGroupState",
+        body,
+    )?;
+    let inner = crate::gena::find_tag_text(&resp, "ZoneGroupState")
+        .ok_or_else(|| anyhow!("ZoneGroupState missing in response"))?;
+    Ok(crate::gena::xml_unescape(&inner))
+}
+
 /// Build the DIDL-Lite metadata blob for SetAVTransportURI.
 ///
 /// WAV variant — Sonos's preferred input. `audio/wav` MIME type and
@@ -259,15 +347,27 @@ fn soap_post(control_url: &str, soap_action: &str, body: &str) -> Result<String>
 
     let mut buf = Vec::with_capacity(4096);
     stream.read_to_end(&mut buf)?;
-    let text = String::from_utf8_lossy(&buf).to_string();
 
-    let (head, body_part) = text.split_once("\r\n\r\n").unwrap_or((&text[..], ""));
+    // Split head/body on bytes, then peel chunked transfer-encoding if
+    // present. Sonos chunks HTTP/1.1 responses (same behavior ssdp.rs's
+    // http_get dodges by speaking HTTP/1.0); small SOAP replies fit one
+    // chunk and parsed fine by accident, but GetZoneGroupState bodies
+    // run tens of KB and interior chunk-size lines would corrupt the
+    // escaped XML. decode_maybe_chunked is a no-op for plain bodies.
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(buf.len());
+    let head = String::from_utf8_lossy(&buf[..split]);
+    let body_part = crate::ssdp::decode_maybe_chunked(&buf[split..]);
+
     let status_line = head.lines().next().unwrap_or("");
     debug!("SOAP {} -> {}", soap_action, status_line);
     if !status_line.contains(" 200 ") {
         return Err(anyhow!("SOAP {} failed: {}", soap_action, status_line));
     }
-    Ok(body_part.to_string())
+    Ok(String::from_utf8_lossy(&body_part).into_owned())
 }
 
 /// Minimal XML attribute / text escape.
