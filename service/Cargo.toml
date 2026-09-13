@@ -1,6 +1,6 @@
 [package]
 name = "stream-to-speaker"
-version = "0.7.0"
+version = "0.1.5"
 edition = "2021"
 # Honest floor: the locked dependency tree (time-macros 0.2.27, edition
 # 2024) needs 1.88, and CI's `msrv` job checks both targets on exactly this
