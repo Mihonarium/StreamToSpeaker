@@ -21,6 +21,7 @@ pub mod picker;
 pub mod user_config;
 pub mod update_check;
 pub mod stream_gate;
+pub mod gui_layout;
 pub mod now_playing;
 #[cfg(windows)]
 pub mod wasapi_source;

@@ -45,6 +45,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Release-tag comparison for the once-a-day update check (src/update_check.rs).
 semver = "1"
+# egui is cross-platform here (unlike eframe, which stays Windows-gated) so
+# the layout skeletons in gui_layout.rs — and their headless tests in
+# tests/gui_layout.rs — build and run on Linux.
+egui = "0.29"
 # AirPlay support.
 #
 # mDNS-sd: pure-Rust mDNS browser for `_raop._tcp` / `_airplay._tcp`
@@ -131,7 +135,6 @@ windows = { version = "0.58", features = [
 # GUI: native window + system tray. Windows-only for now since the
 # kernel driver is anyway Windows-only.
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "persistence"] }
-egui = "0.29"
 tray-icon = "0.19"
 # Transitively pulled in by eframe but exposed via the HasWindowHandle
 # trait we use to grab the HWND for Win32 ShowWindow hide/show in

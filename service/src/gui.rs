@@ -56,30 +56,7 @@ use crate::app::App;
 //   RADIUS_CONTROL=4  for in-page controls (buttons, list rows, pills)
 //   RADIUS_SURFACE=8  for overlays (cards, modal, app window, menus)
 #[allow(dead_code)] // sp::L is not used today; kept for upcoming spacing sweep.
-mod sp {
-    pub const XS: f32 = 8.0;
-    pub const S: f32 = 12.0;
-    pub const M: f32 = 16.0;
-    pub const L: f32 = 24.0;
-
-    // M14 — three "container padding" tiers, named so we never reach
-    // for raw 18 / 16 / 24 / 12 / 8 again.
-    //
-    //   CARD_*  — sectional cards + status banner. 18 horizontal is
-    //             slightly wider than sp::M to give section_label a
-    //             touch more breathing room from the card border.
-    //   MODAL   — confirm / settings modals. sp::L on all sides; the
-    //             extra padding signals "this is a heavier surface
-    //             demanding attention" (Refactoring UI: heavier
-    //             surfaces get heavier padding).
-    //   PILL_*  — inline pills, segmented controls, status chips.
-    //             Tight by design (small surfaces need small padding).
-    pub const CARD_H: f32 = 18.0;
-    pub const CARD_V: f32 = M;
-    pub const MODAL: f32 = L;
-    pub const PILL_H: f32 = S;
-    pub const PILL_V: f32 = XS;
-}
+use crate::gui_layout::{banner_row, notice_row, sp};
 const RADIUS_CONTROL: f32 = 4.0;
 const RADIUS_SURFACE: f32 = 8.0;
 /// Standard interactive control height. One value across primary /
@@ -1391,56 +1368,6 @@ fn window_close_cursor(ctx: &egui::Context, window_rect: egui::Rect, inner_margi
 
 /// Primary button — solid accent fill, white-on-accent text. Use for the
 /// main action of each area (Enable, Minimise to tray, Apply, etc.).
-/// A notice strip's content row: a message with right-aligned actions,
-/// laid out so the message can never run under the buttons. The buttons
-/// are placed first (right-to-left), then the message wraps in whatever
-/// width is left; if that would be too narrow to read, the row stacks —
-/// message on top, buttons right-aligned beneath. `buttons_w` is the
-/// buttons' total width including gaps (the caller knows it from the min
-/// widths it passes to the button helpers).
-///
-/// Why: a label added *before* a right-to-left button group claims the
-/// row at its full single-line width — labels don't wrap inside
-/// horizontal layouts — so past a certain window width the buttons were
-/// painted straight over the text. A fixed "stack below N px" threshold
-/// only moved that collision to a different window width (the donation
-/// strip overlapped at the default 720 px window).
-///
-/// Every right-to-left row here is wrapped in `ui.horizontal`, which
-/// bounds the row's height. A vertically-centred horizontal layout dropped
-/// straight into an unbounded ui (the scroll area's content) centres its
-/// widgets within an infinite height — i.e. at y = ∞ — and the enclosing
-/// frame then paints the whole page. `main`'s stacked branch did this at
-/// the 580 px minimum width; the first cut of this helper did it at every
-/// width. Verified with a headless egui layout harness.
-fn notice_row(
-    ui: &mut egui::Ui,
-    msg: egui::RichText,
-    buttons_w: f32,
-    buttons: impl FnOnce(&mut egui::Ui),
-) {
-    const MIN_TEXT_W: f32 = 240.0;
-    if ui.available_width() - buttons_w - sp::S < MIN_TEXT_W {
-        ui.vertical(|ui| {
-            ui.add(egui::Label::new(msg).wrap());
-            ui.add_space(sp::S);
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), buttons);
-            });
-        });
-    } else {
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                buttons(ui);
-                ui.add_space(sp::S);
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add(egui::Label::new(msg).wrap());
-                });
-            });
-        });
-    }
-}
-
 fn primary_button(ui: &mut egui::Ui, p: &Palette, label: &str, min_width: f32) -> egui::Response {
     let btn = egui::Button::new(
         egui::RichText::new(label)
@@ -1843,110 +1770,89 @@ impl StreamToSpeakerApp {
                     ui.label(egui::RichText::new(icon).color(accent).size(34.0).strong());
                     ui.add_space(sp::S);
 
-                    // Buttons first (right-aligned), the text column in
-                    // whatever is left, wrapping — so a long speaker name
-                    // folds onto a second line instead of running under
-                    // the buttons (the notice_row rule).
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if let (Some(label), Some(tip)) = (btn_label, btn_tip) {
-                                // Explicit-width, right-aligned column. A plain
-                                // `ui.vertical` here claims the full remaining
-                                // width — its bounding box reaches the left edge
-                                // — so the text column laid out after it got
-                                // ~0 px and the headline came out one word per
-                                // line. Verified with the headless harness.
-                                let col_h = ui.available_height();
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(140.0, col_h),
-                                    egui::Layout::top_down(egui::Align::Max),
-                                    |ui| {
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            let r = if label == "Enable streaming" {
-                                                primary_button(ui, p, label, 140.0)
-                                            } else {
-                                                secondary_button(ui, p, label, 140.0)
-                                            }
-                                            .on_hover_text(tip);
-                                            if r.clicked() {
-                                                if let Err(e) =
-                                                    self.app.set_streaming_enabled(!enabled)
-                                                {
-                                                    self.app.record_error(format!(
-                                                        "Couldn't change streaming state: {}",
-                                                        e
-                                                    ));
-                                                }
-                                            }
-                                        },
-                                    );
-                                    // First-aid affordance. Resync is the fix
-                                    // for the most common complaint ("it says
-                                    // streaming but I hear nothing"), and it
-                                    // used to live only in Advanced and the
-                                    // tray menu — the two places a confused
-                                    // user is least likely to look. Only shown
-                                    // while streaming is enabled: with it off,
-                                    // silence is expected and Enable is the
-                                    // answer, not a resync.
-                                    if enabled {
-                                        ui.add_space(sp::XS);
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if link_button(ui, p, "Resync", 72.0)
-                                                    .on_hover_text(
-                                                        "Stop and restart the speaker session. \
-                                                         Causes a brief click but clears silence, \
-                                                         stutter or drift. (Ctrl+Shift+R)",
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    if let Err(e) = self.app.resync() {
-                                                        self.app.record_error(format!(
-                                                            "Resync failed: {}",
-                                                            e
-                                                        ));
-                                                    }
-                                                }
-                                                ui.label(
-                                                    egui::RichText::new("Audio not working?")
-                                                        .size(11.0)
-                                                        .color(p.text_secondary),
-                                                );
-                                            },
-                                        );
+                    // Buttons first (right-aligned, fixed width), the text
+                    // column in whatever is left, wrapping — see
+                    // gui_layout::banner_row for why the order matters.
+                    let button_col = match (btn_label, btn_tip) {
+                        (Some(label), Some(tip)) => Some((140.0, move |ui: &mut egui::Ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let r = if label == "Enable streaming" {
+                                        primary_button(ui, p, label, 140.0)
+                                    } else {
+                                        secondary_button(ui, p, label, 140.0)
                                     }
+                                    .on_hover_text(tip);
+                                    if r.clicked() {
+                                        if let Err(e) = self.app.set_streaming_enabled(!enabled) {
+                                            self.app.record_error(format!(
+                                                "Couldn't change streaming state: {}",
+                                                e
+                                            ));
+                                        }
+                                    }
+                                },
+                            );
+                            // First-aid affordance. Resync is the fix for the
+                            // most common complaint ("it says streaming but I
+                            // hear nothing"), and it used to live only in
+                            // Advanced and the tray menu — the two places a
+                            // confused user is least likely to look. Only
+                            // shown while streaming is enabled: with it off,
+                            // silence is expected and Enable is the answer,
+                            // not a resync.
+                            if enabled {
+                                ui.add_space(sp::XS);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if link_button(ui, p, "Resync", 72.0)
+                                            .on_hover_text(
+                                                "Stop and restart the speaker session. \
+                                                 Causes a brief click but clears silence, \
+                                                 stutter or drift. (Ctrl+Shift+R)",
+                                            )
+                                            .clicked()
+                                        {
+                                            if let Err(e) = self.app.resync() {
+                                                self.app.record_error(format!(
+                                                    "Resync failed: {}",
+                                                    e
+                                                ));
+                                            }
+                                        }
+                                        ui.label(
+                                            egui::RichText::new("Audio not working?")
+                                                .size(11.0)
+                                                .color(p.text_secondary),
+                                        );
                                     },
                                 );
-                                ui.add_space(sp::S);
                             }
-
-                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                                ui.add_space(2.0);
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(headline)
-                                            .size(16.0)
-                                            .strong()
-                                            .color(p.text_primary),
-                                    )
-                                    .wrap(),
-                                );
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(detail)
-                                            .size(12.0)
-                                            .color(p.text_secondary),
-                                    )
-                                    .wrap(),
-                                );
-                            });
-                        },
-                    );
+                        })),
+                        _ => None,
+                    };
+                    banner_row(ui, button_col, |ui| {
+                        ui.add_space(2.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(headline)
+                                    .size(16.0)
+                                    .strong()
+                                    .color(p.text_primary),
+                            )
+                            .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(detail)
+                                    .size(12.0)
+                                    .color(p.text_secondary),
+                            )
+                            .wrap(),
+                        );
+                    });
                 });
             });
 
