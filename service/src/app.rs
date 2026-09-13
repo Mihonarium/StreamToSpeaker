@@ -124,6 +124,17 @@ impl ActiveSession {
         }
     }
 
+    /// `(resend requests, packets re-sent)` for the AirPlay push paths;
+    /// `None` for UPnP, where the speaker pulls over TCP and nothing is
+    /// retransmitted at our level.
+    pub fn resend_stats(&self) -> Option<(u64, u64)> {
+        match self {
+            ActiveSession::Upnp(_) => None,
+            ActiveSession::AirPlay(s) => Some(s.resend_stats()),
+            ActiveSession::AirPlay2(s) => Some(s.resend_stats()),
+        }
+    }
+
     /// Push a mute state to the speaker.
     pub fn set_mute(&self, muted: bool) -> Result<()> {
         match self {
@@ -2078,6 +2089,13 @@ impl App {
 
     pub fn subscriber_count(&self) -> usize {
         self.hub.subscriber_count()
+    }
+
+    /// Retransmission counters of the live AirPlay session, if any — the
+    /// Stats card shows them so a user running a low AirPlay buffer can
+    /// see whether the network is keeping up.
+    pub fn resend_stats(&self) -> Option<(u64, u64)> {
+        self.session.lock().unwrap().as_ref().and_then(|s| s.resend_stats())
     }
 
     pub fn packets_published(&self) -> u64 {

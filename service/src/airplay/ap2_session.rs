@@ -122,6 +122,9 @@ pub struct AirPlay2Session {
     /// (audio send error, buffered TCP write failure, repeated /feedback
     /// failures). Polled by the app watchdog for auto-reconnect.
     dead: Arc<AtomicBool>,
+    /// Retransmission counters (realtime stream only; buffered has no
+    /// resend path and leaves them at zero).
+    resend_stats: Arc<crate::airplay::timing::ResendStats>,
     sender_handle: Option<JoinHandle<()>>,
     timing_handle: Option<JoinHandle<()>>,
     sync_handle: Option<JoinHandle<()>>,
@@ -213,6 +216,7 @@ impl AirPlay2Session {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
+        let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
 
         // Timing-protocol choice: receivers advertising SupportsPTP (bit 41)
         // get the full PTP path — field-tested on a SYMFONISK whose current
@@ -495,6 +499,7 @@ impl AirPlay2Session {
                 control_for_resend,
                 sync_addr,
                 resend,
+                resend_stats.clone(),
                 stop_flag.clone(),
                 cfg.renderer.friendly_name.clone(),
             )
@@ -526,6 +531,7 @@ impl AirPlay2Session {
             rtsp,
             stop_flag,
             dead,
+            resend_stats,
             sender_handle: Some(sender_handle),
             timing_handle,
             sync_handle,
@@ -543,6 +549,11 @@ impl AirPlay2Session {
     /// receiver). Polled by the app watchdog for auto-reconnect.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+
+    /// `(resend requests, packets re-sent)` so far this session.
+    pub fn resend_stats(&self) -> (u64, u64) {
+        self.resend_stats.snapshot()
     }
 
     pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
