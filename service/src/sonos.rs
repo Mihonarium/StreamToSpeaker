@@ -240,7 +240,7 @@ pub fn annotate_with_topology(renderers: &mut Vec<Renderer>) {
     match fetch_zone_groups(&zgt_url) {
         Ok(groups) => {
             apply_topology(renderers, &groups, &|location| {
-                crate::ssdp::fetch_and_parse_device(location, std::time::Duration::from_secs(3))
+                crate::ssdp::fetch_and_parse_device(location, std::time::Duration::from_secs(3), None)
                     .ok()
             });
         }
@@ -289,7 +289,7 @@ pub fn resolve_group_coordinator(
         let coord_member = group.members.iter().find(|m| m.uuid == group.coordinator_uuid);
         let coord = lookup(&coord_id).or_else(|| {
             coord_member.and_then(|m| {
-                crate::ssdp::fetch_and_parse_device(&m.location, std::time::Duration::from_secs(3))
+                crate::ssdp::fetch_and_parse_device(&m.location, std::time::Duration::from_secs(3), None)
                     .ok()
             })
         });
@@ -322,12 +322,47 @@ pub fn resolve_group_coordinator(
         .filter(|m| m.uuid != group.coordinator_uuid && !m.invisible)
         .map(|m| m.zone_name.clone())
         .collect();
+    // Every other member's address (invisible ones too — a stereo-pair
+    // slave or Sub is still a device on the LAN that may fetch), so a
+    // privacy-mode grant for this session covers the whole group.
+    target.group_member_addrs = group
+        .members
+        .iter()
+        .filter(|m| m.uuid != group.coordinator_uuid)
+        .filter_map(|m| location_host_addr(&m.location))
+        .collect();
     target
+}
+
+/// The address behind a topology `Location` URL: a literal IP, or the
+/// first address a hostname resolves to. `None` if unparseable.
+pub(crate) fn location_host_addr(location: &str) -> Option<std::net::IpAddr> {
+    let url = url::Url::parse(location).ok()?;
+    let host = url.host_str()?;
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+    use std::net::ToSocketAddrs;
+    (host, url.port().unwrap_or(1400))
+        .to_socket_addrs()
+        .ok()?
+        .next()
+        .map(|sa| sa.ip())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn location_host_addr_parses_literal_ips_and_rejects_garbage() {
+        assert_eq!(
+            location_host_addr("http://192.168.1.51:1400/xml/device_description.xml"),
+            Some("192.168.1.51".parse().unwrap())
+        );
+        assert_eq!(location_host_addr("not a url"), None);
+        assert_eq!(location_host_addr("http:///nohost"), None);
+    }
     use std::net::{IpAddr, Ipv4Addr};
 
     fn renderer(udn: &str, name: &str) -> Renderer {
@@ -354,6 +389,9 @@ mod tests {
             ),
             zone_name: None,
             group_members: Vec::new(),
+            source_ip: None,
+            host_addrs: Vec::new(),
+            group_member_addrs: Vec::new(),
         }
     }
 

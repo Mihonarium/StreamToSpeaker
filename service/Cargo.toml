@@ -40,6 +40,8 @@ percent-encoding = "2"
 # the obvious fit.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Release-tag comparison for the once-a-day update check (src/update_check.rs).
+semver = "1"
 # AirPlay support.
 #
 # mDNS-sd: pure-Rust mDNS browser for `_raop._tcp` / `_airplay._tcp`
@@ -113,6 +115,9 @@ cpal = "0.15"
 # plumbing sane; scoped to just the Media Foundation surface.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    # WinHTTP: the OS HTTPS stack for the update check — system cert store
+    # + proxy, no bundled TLS library.
+    "Win32_Networking_WinHttp",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
     # WinRT System Media Transport Controls — reads the OS "now playing"

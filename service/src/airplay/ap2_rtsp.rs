@@ -429,8 +429,13 @@ impl Ap2Rtsp {
 
     /// Second SETUP — declare the realtime (type 96, UDP) ALAC audio
     /// stream and ship the 32-byte `shk`. Returns data + control ports.
-    pub fn setup_stream(&mut self, audio_key: &[u8; 32], control_port: u16) -> Result<StreamPorts> {
-        self.setup_stream_typed(audio_key, control_port, 0x60, 2, 352, 0x40000)
+    pub fn setup_stream(
+        &mut self,
+        audio_key: &[u8; 32],
+        control_port: u16,
+        anchor_latency: u32,
+    ) -> Result<StreamPorts> {
+        self.setup_stream_typed(audio_key, control_port, 0x60, 2, 352, 0x40000, anchor_latency)
     }
 
     /// Second SETUP, buffered variant — type 103 over TCP, the stream kind
@@ -446,8 +451,9 @@ impl Ap2Rtsp {
         ct: u64,
         spf: u64,
         audio_format: u64,
+        anchor_latency: u32,
     ) -> Result<StreamPorts> {
-        self.setup_stream_typed(audio_key, control_port, 0x67, ct, spf, audio_format)
+        self.setup_stream_typed(audio_key, control_port, 0x67, ct, spf, audio_format, anchor_latency)
     }
 
     fn setup_stream_typed(
@@ -458,6 +464,7 @@ impl Ap2Rtsp {
         ct: u64,
         spf: u64,
         audio_format: u64,
+        anchor_latency: u32,
     ) -> Result<StreamPorts> {
         let mut stream = plist::Dictionary::new();
         stream.insert("audioFormat".into(), Value::Integer(audio_format.into()));
@@ -465,8 +472,14 @@ impl Ap2Rtsp {
         stream.insert("controlPort".into(), Value::Integer((control_port as u64).into()));
         stream.insert("ct".into(), Value::Integer(ct.into()));
         stream.insert("isMedia".into(), Value::Boolean(true));
-        stream.insert("latencyMax".into(), Value::Integer(88200u64.into()));
-        stream.insert("latencyMin".into(), Value::Integer(11025u64.into()));
+        // iOS advertises 11025..88200 (0.25-2 s). Widen the window to
+        // include the anchor we will actually send in sync packets, so a
+        // receiver that clamps to the declared range can't quietly pin a
+        // low-latency anchor back to 250 ms (or a deep one to 2 s).
+        let latency_min = anchor_latency.min(11025) as u64;
+        let latency_max = anchor_latency.max(88200) as u64;
+        stream.insert("latencyMax".into(), Value::Integer(latency_max.into()));
+        stream.insert("latencyMin".into(), Value::Integer(latency_min.into()));
         stream.insert("shk".into(), Value::Data(audio_key.to_vec()));
         stream.insert("spf".into(), Value::Integer(spf.into()));
         stream.insert("sr".into(), Value::Integer(44100u64.into()));

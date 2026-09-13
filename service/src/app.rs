@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::update_check::{self, ReleaseInfo};
+
 use crate::airplay::ap2_rtsp::Ap2Rtsp;
 use crate::airplay::ap2_session::DEFAULT_AIRPLAY_PORT;
 use crate::airplay::hap_pairing::PairingCredentials;
@@ -23,6 +25,7 @@ use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use crate::ssdp::{DiscoveryState, Renderer};
+use crate::stream_gate::{canonical_ip, is_local_address, Grant, StreamGate};
 use crate::user_config::UserConfig;
 use crate::volume_sync::VolumeSync;
 use crate::{upnp, PRODUCT_NAME, WIRE_SAMPLE_RATE};
@@ -36,6 +39,9 @@ pub struct RendererSession {
     /// every speaker on a given run.
     #[allow(dead_code)]
     pub stream_uri: String,
+    /// Privacy-gate grant for this speaker's addresses. Lives exactly as
+    /// long as the session: dropping the session revokes them.
+    pub stream_grant: Option<Grant>,
 }
 
 /// Active session — either UPnP (pull-style, speaker fetches our HTTP
@@ -170,6 +176,25 @@ pub struct SpeakerView {
     pub active_id: Option<String>,
 }
 
+/// Result of one update check, for the Help menu's status line.
+#[derive(Clone, Debug)]
+pub enum UpdateOutcome {
+    UpToDate,
+    Available(ReleaseInfo),
+    /// No release tag baked into this exe → nothing to compare against.
+    DevBuild,
+    Failed(String),
+}
+
+/// In-memory update-check state (the persistent part lives in `UserConfig`).
+#[derive(Clone, Debug, Default)]
+pub struct UpdateState {
+    /// A check is in flight (Help menu shows "Checking…").
+    pub checking: bool,
+    /// Outcome + unix time of the most recent check this run.
+    pub last: Option<(UpdateOutcome, u64)>,
+}
+
 pub struct App {
     /// Resolved-at-startup configuration. Immutable after `new`.
     pub config: AppConfig,
@@ -208,6 +233,8 @@ pub struct App {
 
     // ---- Lifecycle ----
     pub shutdown: Arc<AtomicBool>,
+    /// Update-check state; see `update_check` and [`App::spawn_update_checker`].
+    pub update: Mutex<UpdateState>,
 
     // ---- Rescan feedback ----
     /// True while a manual SSDP rescan thread is in flight. Cleared
@@ -239,6 +266,10 @@ pub struct App {
     /// blocking network I/O — pairing, SETUPs, fallbacks — so the GUI
     /// runs it on a worker thread and shows "Connecting…" off this.
     pub connecting: Mutex<Option<String>>,
+
+    /// Privacy gate for `/stream.raw` (see `stream_gate.rs`). Sessions
+    /// hold grants in it; the HTTP threads consult it per request.
+    pub stream_gate: Arc<StreamGate>,
 
     /// The one in-flight HomeKit PIN pairing ceremony, if any. Single
     /// source of truth for the whole ceremony lifecycle: reserving the
@@ -318,6 +349,15 @@ impl App {
         airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     ) -> Arc<Self> {
         let web_initial = config.web_enabled;
+        // "This machine" for the privacy gate: the advertised IP, but
+        // only if this host actually owns it — a user-supplied
+        // --advertise-ip pointing at a proxy must not admit everything
+        // behind that proxy.
+        let own_ip = config
+            .advertise_ip
+            .parse::<IpAddr>()
+            .ok()
+            .filter(|ip| is_local_address(*ip));
         let user_config = UserConfig::load();
         // Seed last_speaker_id from disk so that, even before any user
         // action, code that asks "what was the last speaker?" gets the
@@ -341,9 +381,11 @@ impl App {
             packets_published_total: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            update: Mutex::new(UpdateState::default()),
             rescan_in_flight: Arc::new(AtomicBool::new(false)),
             last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
             last_rescan_count: Arc::new(AtomicUsize::new(0)),
+            stream_gate: StreamGate::new(user_config.privacy_mode, own_ip),
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
@@ -413,6 +455,181 @@ impl App {
         let mut uc = self.user_config.lock().unwrap();
         uc.donation_prompt_hidden_until = Some(now_unix() + days * 24 * 60 * 60);
         uc.save();
+    }
+
+    // ---- Update check ----------------------------------------------------
+
+    pub fn is_check_for_updates(&self) -> bool {
+        self.user_config.lock().unwrap().check_for_updates
+    }
+
+    pub fn set_check_for_updates(&self, on: bool) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.check_for_updates != on {
+            uc.check_for_updates = on;
+            uc.save();
+        }
+    }
+
+    pub fn update_state(&self) -> UpdateState {
+        self.update.lock().unwrap().clone()
+    }
+
+    /// The newer release the banner should offer right now, if any. Works
+    /// off the cached last result so it is correct from the first frame.
+    pub fn update_banner(&self) -> Option<ReleaseInfo> {
+        let current = update_check::current_version()?;
+        let uc = self.user_config.lock().unwrap();
+        let tag = uc.update_latest_tag.as_deref()?;
+        let version = update_check::banner_candidate(
+            &current,
+            tag,
+            uc.update_skipped_tag.as_deref(),
+            uc.update_banner_hidden_until,
+            now_unix(),
+        )?;
+        Some(ReleaseInfo {
+            tag: tag.to_string(),
+            version,
+            url: uc
+                .update_latest_url
+                .clone()
+                .unwrap_or_else(|| update_check::RELEASES_PAGE.to_string()),
+            installer_url: None,
+        })
+    }
+
+    /// "Skip this version": never offer `tag` again (a later one still shows).
+    pub fn skip_update(&self, tag: &str) {
+        let mut uc = self.user_config.lock().unwrap();
+        uc.update_skipped_tag = Some(tag.to_string());
+        uc.save();
+    }
+
+    /// "Later": hide the banner for `days`.
+    pub fn snooze_update_banner(&self, days: u64) {
+        let mut uc = self.user_config.lock().unwrap();
+        uc.update_banner_hidden_until = Some(now_unix() + days * 24 * 60 * 60);
+        uc.save();
+    }
+
+    fn update_check_due(&self) -> bool {
+        let uc = self.user_config.lock().unwrap();
+        if !uc.check_for_updates {
+            return false;
+        }
+        match uc.update_last_check_unix {
+            None => true,
+            Some(t) => now_unix().saturating_sub(t) >= update_check::CHECK_INTERVAL.as_secs(),
+        }
+    }
+
+    /// One blocking check (call off the UI thread). `manual` bypasses the
+    /// enable switch and the daily cadence; a dev build never checks.
+    pub fn run_update_check(&self, manual: bool) {
+        let finish = |outcome: UpdateOutcome| {
+            let mut st = self.update.lock().unwrap();
+            st.checking = false;
+            st.last = Some((outcome, now_unix()));
+        };
+        let Some(current) = update_check::current_version() else {
+            finish(UpdateOutcome::DevBuild);
+            return;
+        };
+        if !manual && !self.is_check_for_updates() {
+            self.update.lock().unwrap().checking = false;
+            return;
+        }
+        self.update.lock().unwrap().checking = true;
+        let result = update_check::fetch_latest_release();
+        let now = now_unix();
+        let outcome = match result {
+            Ok(rel) => {
+                {
+                    let mut uc = self.user_config.lock().unwrap();
+                    uc.update_last_check_unix = Some(now);
+                    uc.update_latest_tag = Some(rel.tag.clone());
+                    uc.update_latest_url = Some(rel.url.clone());
+                    uc.save();
+                }
+                if update_check::is_newer(&rel.version, &current) {
+                    log::info!(
+                        "update available: {} (this is v{}) — {}",
+                        rel.tag,
+                        crate::display_version(),
+                        rel.url
+                    );
+                    UpdateOutcome::Available(rel)
+                } else {
+                    log::info!("update check: v{} is the latest release", crate::display_version());
+                    UpdateOutcome::UpToDate
+                }
+            }
+            Err(e) => {
+                // Stamp the attempt so an offline machine retries once a
+                // day, not every hour; the cached latest (if any) still
+                // drives the banner.
+                let mut uc = self.user_config.lock().unwrap();
+                uc.update_last_check_unix = Some(now);
+                uc.save();
+                log::warn!("update check failed: {:#}", e);
+                UpdateOutcome::Failed(format!("{e:#}"))
+            }
+        };
+        finish(outcome);
+    }
+
+    /// Sleep `d` in slices, returning false early if shutdown began.
+    fn sleep_unless_shutdown(&self, d: Duration) -> bool {
+        let end = Instant::now() + d;
+        while Instant::now() < end {
+            if self.is_shutting_down() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        true
+    }
+
+    /// Background once-a-day update check: first attempt ~20 s after
+    /// launch (never on the startup path), then whenever 24 h have passed
+    /// since the last attempt, re-evaluated hourly. Everything it does is
+    /// gated by `check_for_updates`; a dev build is a no-op.
+    pub fn spawn_update_checker(self: &Arc<Self>) {
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-update-check".into())
+            .spawn(move || {
+                if !app.sleep_unless_shutdown(update_check::STARTUP_DELAY) {
+                    return;
+                }
+                loop {
+                    if app.update_check_due() {
+                        app.run_update_check(false);
+                    }
+                    if !app.sleep_unless_shutdown(Duration::from_secs(60 * 60)) {
+                        return;
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// Help menu "Check for updates now": one manual check on a worker
+    /// thread. `checking` is set here so the menu reflects it immediately.
+    pub fn check_for_updates_now(self: &Arc<Self>) {
+        {
+            let mut st = self.update.lock().unwrap();
+            if st.checking {
+                return;
+            }
+            st.checking = true;
+        }
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-update-check-manual".into())
+            .spawn(move || app.run_update_check(true))
+            .ok();
     }
 
     /// Undo the onboarding dismissal (Help menu → "Show getting-
@@ -506,6 +723,97 @@ impl App {
         if uc.auto_reconnect_on_launch != on {
             uc.auto_reconnect_on_launch = on;
             uc.save();
+        }
+    }
+
+    // ---- Privacy mode ---------------------------------------------------
+
+    /// Whether privacy mode is on: `/stream.raw` served only to speakers
+    /// with a live session, plus this machine itself.
+    pub fn is_privacy_mode(&self) -> bool {
+        self.stream_gate.privacy()
+    }
+
+    /// Persist the privacy-mode preference and apply it. Turning it ON
+    /// also cuts off any `/stream.raw` listener the gate wouldn't admit
+    /// now — otherwise an established connection would keep receiving
+    /// audio indefinitely.
+    pub fn set_privacy_mode(&self, on: bool) {
+        {
+            let mut uc = self.user_config.lock().unwrap();
+            if uc.privacy_mode == on {
+                return;
+            }
+            uc.privacy_mode = on;
+            uc.save();
+        }
+        self.stream_gate.set_privacy(on);
+        info!("privacy mode {}", if on { "enabled" } else { "disabled" });
+        if on {
+            self.prune_stream_clients();
+        }
+    }
+
+    /// Privacy gate for `/stream.raw`, called per request (and once a
+    /// second per open stream) from the HTTP threads. Touches only the
+    /// gate's own brief lock — never `session`, which other threads hold
+    /// across multi-second SOAP calls — so a stalled speaker can't park
+    /// the HTTP accept loop. A refusal is surfaced to the user, rate-
+    /// limited per address, naming the device when discovery knows it.
+    pub fn stream_client_allowed(&self, peer: IpAddr) -> bool {
+        if self.stream_gate.allows(peer) {
+            return true;
+        }
+        if self.stream_gate.note_refusal(peer) {
+            self.record_error(format!(
+                "Privacy mode refused a connection to the audio stream from {}. \
+                 Turn privacy mode off (Advanced) to let that device listen.",
+                self.describe_peer(peer)
+            ));
+        }
+        false
+    }
+
+    /// "Kitchen (192.168.1.50)" when discovery knows the address, else
+    /// the bare address. Brief locks only.
+    fn describe_peer(&self, peer: IpAddr) -> String {
+        let peer = canonical_ip(peer);
+        let upnp = self.discovery.as_ref().and_then(|d| {
+            d.renderers()
+                .into_iter()
+                .find(|r| r.stream_peers().iter().any(|ip| canonical_ip(*ip) == peer))
+                .map(|r| r.friendly_name)
+        });
+        let name = upnp.or_else(|| {
+            self.airplay_discovery.as_ref().and_then(|d| {
+                d.renderers()
+                    .into_iter()
+                    .find(|r| canonical_ip(r.ip) == peer)
+                    .map(|r| r.friendly_name)
+            })
+        });
+        match name {
+            Some(n) => format!("{} ({})", n, peer),
+            None => peer.to_string(),
+        }
+    }
+
+    /// Cut off every `/stream.raw` listener the gate no longer admits —
+    /// after a speaker switch, Disable, Forget, or privacy turning on.
+    /// The allow-set is snapshotted first, so the hub's subscriber lock
+    /// (taken by the audio thread per packet) is held only for a pure
+    /// predicate, never while waiting on anything.
+    pub fn prune_stream_clients(&self) {
+        let snapshot = self.stream_gate.snapshot();
+        if !snapshot.privacy() {
+            return;
+        }
+        let cut = self.hub.disconnect_clients(|ip| !snapshot.allows(ip));
+        if cut > 0 {
+            info!(
+                "privacy mode: disconnected {} stream listener(s) no longer allowed",
+                cut
+            );
         }
     }
 
@@ -1006,6 +1314,9 @@ impl App {
         #[cfg(windows)]
         let new_friendly_name = guard.as_ref().map(|s| s.friendly_name());
         drop(guard);
+        // The old session — and with it its privacy grant — is gone:
+        // cut off any listener the allow-set no longer covers.
+        self.prune_stream_clients();
 
         *self.last_speaker_id.lock().unwrap() = Some(actual_id.clone());
         self.streaming_enabled.store(true, Ordering::Release);
@@ -1071,6 +1382,15 @@ impl App {
             let d = discovery.clone();
             crate::sonos::resolve_group_coordinator(new_r, &move |cid| d.find_by_id(cid))
         };
+        // Grant the speaker's addresses through the privacy gate BEFORE
+        // the SOAP handshake — it HEAD/GETs `/stream.raw` as soon as
+        // Play returns, while `self.session` still holds the old state.
+        // The grant moves into the session it produces; if bring-up
+        // fails it drops on the error path and the gate forgets it.
+        // (`stream_peers` includes the other Sonos group members' addresses
+        // resolved above, so the whole group is admitted, whichever unit
+        // ends up fetching.)
+        let grant = self.stream_gate.grant(new_r.stream_peers());
         let didl = upnp::didl_lite_metadata(
             &self.config.stream_uri,
             PRODUCT_NAME,
@@ -1081,6 +1401,7 @@ impl App {
             &self.config.stream_uri,
             &didl,
             &self.config.callback_url,
+            Some(grant),
         )
         .map_err(|e| format!("{:#}", e))?;
         Ok(ActiveSession::Upnp(session))
@@ -1233,12 +1554,13 @@ impl App {
         match transport {
             Transport::RaopLegacy => {
                 let samples_rx = self.hub.subscribe();
-                let (mfi_encryption, uncompressed_alac, password) = {
+                let (mfi_encryption, uncompressed_alac, password, latency_ms) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.airplay_mfi_encryption,
                         uc.airplay_uncompressed_alac,
                         uc.airplay_passwords.get(&renderer.stable_id()).cloned(),
+                        uc.effective_airplay_latency_ms(),
                     )
                 };
                 let session = AirPlaySession::start(AirPlaySessionConfig {
@@ -1253,6 +1575,7 @@ impl App {
                     mfi_encryption,
                     uncompressed_alac,
                     password,
+                    latency_ms,
                 })
                 .map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
                 Ok(ActiveSession::AirPlay(session))
@@ -1260,11 +1583,12 @@ impl App {
             Transport::AirPlay2 => {
                 let samples_rx = self.hub.subscribe();
                 let stable_id = renderer.stable_id();
-                let (prefer_realtime, pairing_creds) = {
+                let (prefer_realtime, pairing_creds, latency_ms) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.prefer_realtime_airplay,
                         uc.airplay_pairings.get(&stable_id).cloned(),
+                        uc.effective_airplay_latency_ms(),
                     )
                 };
                 match AirPlay2Session::start(AirPlay2SessionConfig {
@@ -1273,6 +1597,7 @@ impl App {
                     samples_rx,
                     initial_volume: Some(80),
                     prefer_realtime,
+                    latency_ms,
                     pairing_creds,
                 }) {
                     Ok(session) => Ok(ActiveSession::AirPlay2(session)),
@@ -1595,6 +1920,7 @@ impl App {
         if let Some(s) = s {
             s.stop();
         }
+        self.prune_stream_clients();
         self.streaming_enabled.store(false, Ordering::Release);
         *self.last_speaker_id.lock().unwrap() = None;
         let mut uc = self.user_config.lock().unwrap();
@@ -1719,6 +2045,7 @@ impl App {
             if let Some(s) = s {
                 s.stop();
             }
+            self.prune_stream_clients();
             info!("streaming disabled");
         } else {
             let last = self.last_speaker_id.lock().unwrap().clone();
@@ -1828,6 +2155,7 @@ pub fn start_session(
     stream_uri: &str,
     didl: &str,
     callback_url: &str,
+    stream_grant: Option<Grant>,
 ) -> Result<RendererSession> {
     info!("targeting speaker: {} ({})", renderer.display_name(), renderer.ip);
     // Stop first to clear any "Transport Locked" (Sonos 705) carry-over.
@@ -1854,6 +2182,7 @@ pub fn start_session(
         renderer,
         gena,
         stream_uri: stream_uri.to_string(),
+        stream_grant,
     })
 }
 
@@ -1908,4 +2237,79 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> Arc<App> {
+        let app = App::new(
+            AppConfig {
+                stream_uri: "http://192.168.1.10:8080/stream.raw".into(),
+                callback_url: "http://192.168.1.10:8080/gena".into(),
+                advertise_ip: "192.168.1.10".into(),
+                bind: "0.0.0.0:8080".parse().unwrap(),
+                initial_buffer_ms: 0,
+                silence_packets_threshold: 0,
+                no_silence_injection: false,
+                no_discovery: true,
+                web_enabled: false,
+                ssdp_iface: None,
+            },
+            None,
+            None,
+        );
+        // Flip the gate directly — set_privacy_mode would write the
+        // developer's real config file to disk.
+        app.stream_gate.set_privacy(true);
+        app
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn privacy_off_allows_everyone() {
+        let app = test_app();
+        app.stream_gate.set_privacy(false);
+        assert!(app.stream_client_allowed(ip("192.168.1.99")));
+        assert!(app.current_error().is_none());
+    }
+
+    #[test]
+    fn privacy_on_refuses_strangers_admits_loopback() {
+        let app = test_app();
+        assert!(!app.stream_client_allowed(ip("192.168.1.99")));
+        assert!(app.stream_client_allowed(ip("127.0.0.1")));
+        assert!(app.stream_client_allowed(ip("::1")));
+        // The advertised IP is NOT this test host's address, so it is
+        // not admitted as "this machine" (the proxy/NAT case).
+        assert!(!app.stream_client_allowed(ip("192.168.1.10")));
+    }
+
+    #[test]
+    fn grant_lives_and_dies_with_its_holder() {
+        let app = test_app();
+        let grant = app.stream_gate.grant([ip("192.168.1.50")]);
+        assert!(app.stream_client_allowed(ip("192.168.1.50")));
+        assert!(app.stream_client_allowed(ip("::ffff:192.168.1.50")));
+        assert!(!app.stream_client_allowed(ip("192.168.1.51")));
+        drop(grant);
+        assert!(!app.stream_client_allowed(ip("192.168.1.50")));
+    }
+
+    #[test]
+    fn refusal_is_surfaced_once_per_peer() {
+        let app = test_app();
+        assert!(!app.stream_client_allowed(ip("192.168.1.99")));
+        let msg = app.current_error().expect("refusal recorded as a user-visible error");
+        assert!(msg.contains("192.168.1.99"), "{msg}");
+        assert!(msg.contains("privacy mode off"), "{msg}");
+        // A repeat within the report interval is refused silently.
+        app.dismiss_error();
+        assert!(!app.stream_client_allowed(ip("192.168.1.99")));
+        assert!(app.current_error().is_none());
+    }
 }
