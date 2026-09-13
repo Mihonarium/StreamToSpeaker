@@ -231,8 +231,53 @@ impl UserConfig {
 
     pub fn load() -> Self {
         let Some(path) = config_path() else { return Self::default(); };
-        let Ok(content) = std::fs::read_to_string(&path) else { return Self::default(); };
-        serde_json::from_str(&content).unwrap_or_default()
+        Self::load_from(&path)
+    }
+
+    /// Load from `path`. A missing file is a fresh install. A file that
+    /// exists but isn't valid JSON is **quarantined** — renamed to
+    /// `config.json.corrupt-<unix time>` beside the original — and the
+    /// defaults are used. The old behaviour was `unwrap_or_default()`,
+    /// which silently reset everything and then let the next save
+    /// overwrite the broken file; `airplay_pairings` alone costs a PIN
+    /// ceremony per Apple TV to recreate, so the data is worth keeping
+    /// for manual recovery.
+    pub fn load_from(path: &std::path::Path) -> Self {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                log::warn!(
+                    "user_config: can't read {}: {} — using defaults (file left as is)",
+                    path.display(),
+                    e
+                );
+                return Self::default();
+            }
+        };
+        match serde_json::from_str(&content) {
+            Ok(c) => c,
+            Err(e) => {
+                let aside = quarantine_path(path);
+                match std::fs::rename(path, &aside) {
+                    Ok(()) => log::error!(
+                        "user_config: {} is not valid JSON ({}); moved it to {} and starting \
+                         with defaults",
+                        path.display(),
+                        e,
+                        aside.display()
+                    ),
+                    Err(re) => log::error!(
+                        "user_config: {} is not valid JSON ({}) and could not be moved aside \
+                         ({}); starting with defaults — the next save will overwrite it",
+                        path.display(),
+                        e,
+                        re
+                    ),
+                }
+                Self::default()
+            }
+        }
     }
 
     /// Best-effort save. Logged-on-failure rather than propagated — a
@@ -240,6 +285,15 @@ impl UserConfig {
     /// selection.
     pub fn save(&self) {
         let Some(path) = config_path() else { return; };
+        self.save_to(&path);
+    }
+
+    /// Atomic replace: serialise to a sibling temp file, then rename it
+    /// over the real one. A crash or power cut mid-write can then never
+    /// leave a truncated `config.json` (which `load_from` would have to
+    /// quarantine). `rename` replaces an existing file on both Windows
+    /// and Unix.
+    pub fn save_to(&self, path: &std::path::Path) {
         let Some(dir) = path.parent() else { return; };
         if let Err(e) = std::fs::create_dir_all(dir) {
             log::warn!("user_config: mkdir {}: {}", dir.display(), e);
@@ -249,10 +303,29 @@ impl UserConfig {
             Ok(s) => s,
             Err(e) => { log::warn!("user_config: serialize: {}", e); return; }
         };
-        if let Err(e) = std::fs::write(&path, content) {
-            log::warn!("user_config: write {}: {}", path.display(), e);
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, content) {
+            log::warn!("user_config: write {}: {}", tmp.display(), e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            log::warn!("user_config: replace {}: {}", path.display(), e);
+            let _ = std::fs::remove_file(&tmp);
         }
     }
+}
+
+/// `config.json` → `config.json.corrupt-<unix seconds>` in the same dir.
+fn quarantine_path(path: &std::path::Path) -> PathBuf {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.json".into());
+    path.with_file_name(format!("{name}.corrupt-{secs}"))
 }
 
 #[cfg(test)]
@@ -270,6 +343,60 @@ mod tests {
         assert!(c.check_for_updates);
         assert_eq!(c.update_last_check_unix, None);
         assert!(!c.prefer_realtime_airplay);
+    }
+
+    fn temp_config_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sts-user-config-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn save_then_load_round_trips_and_leaves_no_temp_file() {
+        let dir = temp_config_dir("roundtrip");
+        let path = dir.join("config.json");
+        let mut c = UserConfig::default();
+        c.last_speaker_id = Some("uuid:RINCON_TEST".into());
+        c.airplay_latency_ms = 250;
+        c.save_to(&path);
+        assert!(path.exists(), "config written");
+        assert!(!dir.join("config.json.tmp").exists(), "temp file renamed away");
+        let back = UserConfig::load_from(&path);
+        assert_eq!(back.last_speaker_id.as_deref(), Some("uuid:RINCON_TEST"));
+        assert_eq!(back.airplay_latency_ms, 250);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_file_is_quarantined_not_overwritten() {
+        let dir = temp_config_dir("corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{ \"airplay_pairings\": { truncated").unwrap();
+        let c = UserConfig::load_from(&path);
+        // Defaults, and the broken file is preserved under a new name.
+        assert_eq!(c.airplay_latency_ms, AIRPLAY_LATENCY_MS_DEFAULT);
+        assert!(!path.exists(), "corrupt file moved aside");
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("config.json.corrupt-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "exactly one quarantined copy");
+        let body = std::fs::read_to_string(kept[0].path()).unwrap();
+        assert!(body.contains("airplay_pairings"), "original bytes preserved");
+        // A save afterwards writes a fresh valid file next to it.
+        c.save_to(&path);
+        assert!(UserConfig::load_from(&path).airplay_latency_ms == AIRPLAY_LATENCY_MS_DEFAULT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_file_is_a_fresh_install() {
+        let dir = temp_config_dir("missing");
+        let c = UserConfig::load_from(&dir.join("config.json"));
+        assert!(c.auto_reconnect_on_drop);
+        assert!(!dir.exists(), "loading must not create anything");
     }
 
     #[test]
