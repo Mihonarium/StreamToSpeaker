@@ -1270,8 +1270,9 @@ impl eframe::App for StreamToSpeakerApp {
                     // because it's an overlay, the scroll offset, scrollbar
                     // geometry, and kinetic fling are completely untouched.
                     let viewport = out.inner_rect;
-                    let show_pinned = self.app.is_speaker_bound()
-                        && banner_bottom_px <= viewport.top() + 1.0;
+                    // Armed purely by scroll position: the bar mirrors every
+                    // banner state, "no speaker selected" included.
+                    let show_pinned = banner_bottom_px <= viewport.top() + 1.0;
                     let t = ui.ctx().animate_bool_with_time(
                         egui::Id::new("pinned-status-overlay"),
                         show_pinned,
@@ -1981,12 +1982,33 @@ impl StreamToSpeakerApp {
     fn show_pinned_status(&self, ui: &mut egui::Ui, p: &Palette) {
         let enabled = self.app.is_streaming_enabled();
         let active = self.app.stream_active.load(Ordering::Acquire);
-        let Some(current) = self.app.selected_speaker() else { return; };
-
-        let (accent, status_text) = match (enabled, active) {
-            (false, _) => (p.danger, "Disabled"),
-            (true, true) => (p.success, "Streaming"),
-            (true, false) => (p.warn, "Idle"),
+        // Mirror every state the full banner has — "no speaker" and
+        // "connecting" included — so scrolling never hides what the app
+        // is doing. Only the bound states carry an Enable/Disable button.
+        let (accent, name, status_text, button): (
+            egui::Color32,
+            Option<String>,
+            String,
+            Option<(&str, &str)>,
+        ) = if let Some(target) = self.app.connecting_to() {
+            (p.warn, None, format!("Connecting to {}…", target), None)
+        } else {
+            match self.app.selected_speaker() {
+                None => (p.muted, None, "No speaker selected".to_string(), None),
+                Some(current) => {
+                    let (accent, status) = match (enabled, active) {
+                        (false, _) => (p.danger, "Disabled"),
+                        (true, true) => (p.success, "Streaming"),
+                        (true, false) => (p.warn, "Idle"),
+                    };
+                    let button = if enabled {
+                        ("Disable", "Stop streaming and release the speaker (Ctrl+E)")
+                    } else {
+                        ("Enable", "Reconnect and resume streaming (Ctrl+E)")
+                    };
+                    (accent, Some(current.friendly_name), status.to_string(), Some(button))
+                }
+            }
         };
 
         egui::Frame::none()
@@ -2011,56 +2033,53 @@ impl StreamToSpeakerApp {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            let (label, tip) = if enabled {
-                                (
-                                    "Disable",
-                                    "Stop streaming and release the speaker (Ctrl+E)",
-                                )
-                            } else {
-                                (
-                                    "Enable",
-                                    "Reconnect and resume streaming (Ctrl+E)",
-                                )
-                            };
-                            let r = secondary_button(ui, p, label, 88.0)
-                                .on_hover_text(tip);
-                            if r.clicked() {
-                                if let Err(e) =
-                                    self.app.set_streaming_enabled(!enabled)
-                                {
-                                    self.app.record_error(format!(
-                                        "Couldn't change streaming state: {}",
-                                        e
-                                    ));
+                            if let Some((label, tip)) = button {
+                                let r = secondary_button(ui, p, label, 88.0)
+                                    .on_hover_text(tip);
+                                if r.clicked() {
+                                    if let Err(e) =
+                                        self.app.set_streaming_enabled(!enabled)
+                                    {
+                                        self.app.record_error(format!(
+                                            "Couldn't change streaming state: {}",
+                                            e
+                                        ));
+                                    }
                                 }
+                                ui.add_space(sp::S);
                             }
-                            ui.add_space(sp::S);
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    // Leave room for " · Streaming" after the name.
-                                    let name_w = (ui.available_width() - 96.0).max(60.0);
-                                    ui.scope(|ui| {
-                                        ui.set_max_width(name_w);
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&current.friendly_name)
-                                                    .size(12.0)
-                                                    .strong()
-                                                    .color(p.text_primary),
-                                            )
-                                            .truncate(),
+                                    if let Some(name) = &name {
+                                        // Leave room for " · Streaming" after the name.
+                                        let name_w = (ui.available_width() - 96.0).max(60.0);
+                                        ui.scope(|ui| {
+                                            ui.set_max_width(name_w);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(name)
+                                                        .size(12.0)
+                                                        .strong()
+                                                        .color(p.text_primary),
+                                                )
+                                                .truncate(),
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new("·")
+                                                .size(12.0)
+                                                .color(p.text_tertiary),
                                         );
-                                    });
+                                    }
                                     ui.label(
-                                        egui::RichText::new("·")
+                                        egui::RichText::new(&status_text)
                                             .size(12.0)
-                                            .color(p.text_tertiary),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(status_text)
-                                            .size(12.0)
-                                            .color(p.text_secondary),
+                                            .color(if name.is_some() {
+                                                p.text_secondary
+                                            } else {
+                                                p.text_primary
+                                            }),
                                     );
                                 },
                             );
