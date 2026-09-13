@@ -30,22 +30,34 @@ use crate::http_server::PcmFrame;
 /// Recently-sent packets retained for retransmit (~4 s at 44.1 kHz).
 const RESEND_BUFFER_PACKETS: usize = 512;
 
-/// Playback latency in samples for the sync-packet anchor. 88200 = 2 s at
-/// 44.1 kHz — packet-capture verified: iTunes→Sonos sync packets carry
-/// exactly `next_rtptime − 88200` (and node_airtunes2 hardcodes
-/// `2 * sampling_rate`).
+/// Default playback latency in samples for the sync-packet anchor. 88200
+/// = 2 s at 44.1 kHz — packet-capture verified: iTunes→Sonos sync packets
+/// carry exactly `next_rtptime − 88200` (and node_airtunes2 hardcodes
+/// `2 * sampling_rate`). The user's `airplay_latency_ms` overrides it.
+#[cfg(test)]
 const DEFAULT_LATENCY_SAMPLES: u32 = 88200;
 
 /// The sync-anchor latency (samples) to use given the receiver's
-/// advertised `Audio-Latency` (from the RECORD response, `None` if
-/// absent). Mirrors libraop's on-wire sync value: `max(reported,
-/// configured)` — a receiver asking for a deeper buffer (big-DSP AVRs)
-/// gets it; everyone else (Sonos and most speakers omit the header) keeps
-/// the proven 88200 anchor exactly. NB the `+11025` in libraop is a
-/// sender-side *scheduling* value (`raopcl_latency`) that never reaches
-/// the sync packet, so we don't add it here.
-fn effective_latency_samples(advertised: Option<u32>) -> u32 {
-    advertised.unwrap_or(0).max(DEFAULT_LATENCY_SAMPLES)
+/// advertised `Audio-Latency` (`None` if it never sent one) and the
+/// configured target. Mirrors libraop's on-wire sync value:
+/// `max(reported, configured)` — a receiver asking for a deeper buffer
+/// (big-DSP AVRs) gets it, and a low-latency target can never drive a
+/// receiver below its own stated floor; everyone else (Sonos and most
+/// speakers omit the header) gets exactly the target. NB the `+11025` in
+/// libraop is a sender-side *scheduling* value (`raopcl_latency`) that
+/// never reaches the sync packet, so we don't add it here.
+fn effective_latency_samples(advertised: Option<u32>, target: u32) -> u32 {
+    advertised.unwrap_or(0).max(target)
+}
+
+/// A receiver may state `Audio-Latency` at SETUP, at RECORD, or both
+/// (Apple TV / AirPort Express do; a big-DSP AVR only at RECORD). Keep the
+/// larger — the floor we must not anchor below.
+fn merge_advertised_latency(setup: Option<u32>, record: Option<u32>) -> Option<u32> {
+    match (setup, record) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Configuration to spin up one AirPlay session.
@@ -77,6 +89,11 @@ pub struct AirPlaySessionConfig {
     /// AirPlay password for a `pw=true` receiver (RTSP Digest auth).
     /// `None` for the common unprotected case.
     pub password: Option<String>,
+    /// Sync-anchor latency target in ms (user_config `airplay_latency_ms`,
+    /// already clamped). 2000 = the iTunes-proven anchor; lower cuts the
+    /// receiver's buffer, and thus the audible delay, in step. The
+    /// receiver's advertised `Audio-Latency` is honoured as a floor.
+    pub latency_ms: u32,
 }
 
 /// Live AirPlay session.
@@ -221,6 +238,7 @@ impl AirPlaySession {
         // Opener: iTunes → Sonos (AirTunes/366) leads with POST /auth-setup
         // (0x01 + X25519), not OPTIONS + Apple-Challenge. MFi/AP2 devices
         // get auth-setup; plain legacy receivers keep OPTIONS.
+        let target_latency_samples = crate::airplay::timing::latency_ms_to_samples(cfg.latency_ms);
         let attempt = |try_mfi: bool| -> Result<(RtspClient, Cipher, ServerPorts, u32)> {
             // Password-protected receivers get RTSP Digest credentials;
             // the gen-1 AirPort Express (no `am` model) uses the iTunes
@@ -269,10 +287,19 @@ impl AirPlaySession {
 
             rtsp.announce(&cipher).context("RTSP ANNOUNCE")?;
             let ports = rtsp.setup(control_port, timing_port).context("RTSP SETUP")?;
-            let advertised_latency = rtsp
+            let record_latency = rtsp
                 .record(initial_seq, initial_rtptime)
                 .context("RTSP RECORD")?;
-            let latency = effective_latency_samples(advertised_latency);
+            let advertised_latency = merge_advertised_latency(ports.audio_latency, record_latency);
+            let latency = effective_latency_samples(advertised_latency, target_latency_samples);
+            info!(
+                "AirPlay: sync anchor {} samples (~{} ms) — configured {} ms, receiver Audio-Latency: SETUP {:?} / RECORD {:?}",
+                latency,
+                latency as u64 * 1000 / crate::WIRE_SAMPLE_RATE as u64,
+                cfg.latency_ms,
+                ports.audio_latency,
+                record_latency,
+            );
             Ok((rtsp, cipher, ports, latency))
         };
 
@@ -592,14 +619,39 @@ mod tests {
 
     #[test]
     fn latency_anchor_defaults_and_honors_larger() {
+        let d = DEFAULT_LATENCY_SAMPLES;
         // No Audio-Latency header (Sonos, most speakers) → the proven
         // 88200 anchor, byte-identical to the old constant.
-        assert_eq!(effective_latency_samples(None), 88200);
+        assert_eq!(effective_latency_samples(None, d), 88200);
         // A small advertised value never lowers the floor.
-        assert_eq!(effective_latency_samples(Some(0)), 88200);
-        assert_eq!(effective_latency_samples(Some(11025)), 88200);
-        assert_eq!(effective_latency_samples(Some(88200)), 88200);
+        assert_eq!(effective_latency_samples(Some(0), d), 88200);
+        assert_eq!(effective_latency_samples(Some(11025), d), 88200);
+        assert_eq!(effective_latency_samples(Some(88200), d), 88200);
         // A big-DSP AVR asking for a deeper buffer gets it.
-        assert_eq!(effective_latency_samples(Some(132300)), 132300);
+        assert_eq!(effective_latency_samples(Some(132300), d), 132300);
+    }
+
+    #[test]
+    fn latency_anchor_low_target_honors_receiver_floor() {
+        // Low-latency mode: a 100 ms target is 4410 samples.
+        let target = crate::airplay::timing::latency_ms_to_samples(100);
+        assert_eq!(target, 4410);
+        // Silent receiver, or one content with less → the target wins.
+        assert_eq!(effective_latency_samples(None, target), 4410);
+        assert_eq!(effective_latency_samples(Some(220), target), 4410);
+        // ...but never below what the receiver says it needs.
+        assert_eq!(effective_latency_samples(Some(11025), target), 11025);
+        // And the default target still maps to the iTunes constant.
+        assert_eq!(crate::airplay::timing::latency_ms_to_samples(2000), 88200);
+    }
+
+    #[test]
+    fn advertised_latency_merges_setup_and_record() {
+        assert_eq!(merge_advertised_latency(None, None), None);
+        assert_eq!(merge_advertised_latency(Some(220), None), Some(220));
+        assert_eq!(merge_advertised_latency(None, Some(11025)), Some(11025));
+        // Both stated: the deeper floor wins whichever leg carried it.
+        assert_eq!(merge_advertised_latency(Some(220), Some(11025)), Some(11025));
+        assert_eq!(merge_advertised_latency(Some(132300), Some(11025)), Some(132300));
     }
 }

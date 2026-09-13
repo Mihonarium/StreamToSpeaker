@@ -53,6 +53,10 @@ pub const DEFAULT_AIRPLAY_PORT: u16 = 7000;
 /// Receiver playback latency in samples for the sync anchor. 88200 = 2 s —
 /// what iTunes actually uses with Sonos (packet-capture verified).
 const DEFAULT_LATENCY_SAMPLES: u32 = 88200;
+/// Below this configured anchor the buffered stream — which holds 1-2 s
+/// regardless of what we ask — is skipped in favour of realtime, the
+/// only AirPlay 2 stream kind that can actually deliver low latency.
+const LOW_LATENCY_REALTIME_MS: u32 = 1000;
 /// Recently-sent packets retained for retransmit (~4 s at 44.1 kHz).
 const RESEND_BUFFER_PACKETS: usize = 512;
 /// How far in the future the buffered stream's SETRATEANCHORTIME anchor is
@@ -72,6 +76,11 @@ pub struct AirPlay2SessionConfig {
     /// switch — realtime is ~250 ms vs buffered's 1-2 s, but some
     /// receivers only truly play buffered).
     pub prefer_realtime: bool,
+    /// Sync-anchor latency target in ms (user_config `airplay_latency_ms`,
+    /// already clamped). Drives the realtime stream's declared
+    /// `latencyMin/Max` and its sync-packet anchor; below
+    /// [`LOW_LATENCY_REALTIME_MS`] buffered mode is skipped outright.
+    pub latency_ms: u32,
     /// Stored HomeKit persistent-pairing credentials for this receiver, if
     /// it was PIN-paired earlier (Apple TV with access control). When
     /// present, the session does `pair-verify` with these instead of
@@ -251,9 +260,20 @@ impl AirPlay2Session {
         // Media Foundation encoder — iOS's buffered codec, the only one
         // field-proven on Sonos — with ALAC as fallback (no encoder needed)
         // and realtime as the last resort. Every rejection is visible.
-        let want_buffered = use_ptp && cfg.renderer.supports_buffered_audio() && !cfg.prefer_realtime;
+        let latency_samples = crate::airplay::timing::latency_ms_to_samples(cfg.latency_ms);
+        let low_latency = cfg.latency_ms < LOW_LATENCY_REALTIME_MS;
+        let want_buffered = use_ptp
+            && cfg.renderer.supports_buffered_audio()
+            && !cfg.prefer_realtime
+            && !low_latency;
         if cfg.prefer_realtime {
             info!("AirPlay 2: prefer_realtime_airplay set — using the realtime stream");
+        } else if low_latency && use_ptp && cfg.renderer.supports_buffered_audio() {
+            info!(
+                "AirPlay 2: airplay_latency_ms={} is below {} ms — using the realtime stream \
+                 (buffered holds seconds regardless)",
+                cfg.latency_ms, LOW_LATENCY_REALTIME_MS
+            );
         }
         let mut codec = BufferedCodecKind::Alac;
         #[cfg(windows)]
@@ -268,10 +288,10 @@ impl AirPlay2Session {
         let (ports, buffered) = if want_buffered {
             let attempt = |rtsp: &mut Ap2Rtsp, k: BufferedCodecKind| match k {
                 BufferedCodecKind::Aac => {
-                    rtsp.setup_stream_buffered(&audio_key, control_port, 4, 1024, 0x400000)
+                    rtsp.setup_stream_buffered(&audio_key, control_port, 4, 1024, 0x400000, DEFAULT_LATENCY_SAMPLES)
                 }
                 BufferedCodecKind::Alac => {
-                    rtsp.setup_stream_buffered(&audio_key, control_port, 2, 352, 0x40000)
+                    rtsp.setup_stream_buffered(&audio_key, control_port, 2, 352, 0x40000, DEFAULT_LATENCY_SAMPLES)
                 }
             };
             match attempt(&mut rtsp, codec) {
@@ -297,7 +317,7 @@ impl AirPlay2Session {
                         Err(e) => {
                             warn!("AirPlay 2: buffered ALAC SETUP rejected ({e:#}); falling back to realtime");
                             let p = rtsp
-                                .setup_stream(&audio_key, control_port)
+                                .setup_stream(&audio_key, control_port, latency_samples)
                                 .context("AP2 SETUP(stream, realtime fallback)")?;
                             (p, false)
                         }
@@ -306,14 +326,14 @@ impl AirPlay2Session {
                 Err(e) => {
                     warn!("AirPlay 2: buffered SETUP rejected ({e:#}); falling back to realtime");
                     let p = rtsp
-                        .setup_stream(&audio_key, control_port)
+                        .setup_stream(&audio_key, control_port, latency_samples)
                         .context("AP2 SETUP(stream, realtime fallback)")?;
                     (p, false)
                 }
             }
         } else {
             let p = rtsp
-                .setup_stream(&audio_key, control_port)
+                .setup_stream(&audio_key, control_port, latency_samples)
                 .context("AP2 SETUP(stream)")?;
             (p, false)
         };
@@ -428,7 +448,7 @@ impl AirPlay2Session {
                     control_socket,
                     sync_addr,
                     current_rtptime.clone(),
-                    DEFAULT_LATENCY_SAMPLES,
+                    latency_samples,
                     ptp.timeline.clone(),
                     stop_flag.clone(),
                     cfg.renderer.friendly_name.clone(),
@@ -448,7 +468,7 @@ impl AirPlay2Session {
                     control_socket,
                     sync_addr,
                     current_rtptime.clone(),
-                    DEFAULT_LATENCY_SAMPLES,
+                    latency_samples,
                     stop_flag.clone(),
                     cfg.renderer.friendly_name.clone(),
                 )

@@ -38,7 +38,7 @@ use stream_to_speaker::audio_source::AudioSource;
 use stream_to_speaker::gena::parse_rendering_notify;
 use stream_to_speaker::http_server::{
     start_http_server, HttpServerConfig, LatencyAdjustCallback, ResyncCallback, SpeakerInfo,
-    SpeakerListCallback, SpeakerSelectCallback,
+    SpeakerListCallback, SpeakerSelectCallback, StreamClientAllowedCallback,
 };
 use stream_to_speaker::picker;
 use stream_to_speaker::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
@@ -197,7 +197,7 @@ fn main() {
     // failure between them was invisible because log::error! was a
     // no-op until builder.init() landed.
     init_logging(&cli);
-    info!("{} v{} entering main()", PRODUCT_NAME, env!("CARGO_PKG_VERSION"));
+    info!("{} v{} entering main()", PRODUCT_NAME, stream_to_speaker::display_version());
 
     // Crash visibility. With windows_subsystem="windows" the default
     // panic handler writes to stderr — which is a dead handle in GUI
@@ -300,7 +300,7 @@ fn write_startup_tombstone() {
                 f,
                 "{}\tv{}\tmain() entered",
                 now,
-                env!("CARGO_PKG_VERSION")
+                stream_to_speaker::display_version()
             );
         }
     }
@@ -439,7 +439,7 @@ fn raise_existing_window() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    info!("{} v{}", PRODUCT_NAME, env!("CARGO_PKG_VERSION"));
+    info!("{} v{}", PRODUCT_NAME, stream_to_speaker::display_version());
 
     // --list-speakers short-circuit
     if cli.list_speakers {
@@ -474,6 +474,10 @@ fn run(cli: Cli) -> Result<()> {
     // Auto-reconnect watchdog — replaces a dropped AirPlay session with a
     // fresh one so the UI never shows a zombie "streaming" state.
     app.spawn_reconnect_watchdog();
+
+    // Once-a-day "newer release on GitHub?" check (Advanced toggle; a
+    // dev build without a baked release tag never checks).
+    app.spawn_update_checker();
 
     // Now-playing metadata forwarder (off by default; pushes the OS's
     // current track to the speaker when enabled).
@@ -739,6 +743,11 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         Arc::new(move |ms| app2.adjust_latency(ms))
             as Arc<dyn Fn(i32) -> i64 + Send + Sync>
     };
+    let stream_client_allowed: StreamClientAllowedCallback = {
+        let app2 = app.clone();
+        Arc::new(move |ip| app2.stream_client_allowed(ip))
+            as Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>
+    };
 
     start_http_server(HttpServerConfig {
         bind: app.config.bind,
@@ -749,6 +758,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         resync: Some(resync),
         latency_adjust: Some(latency_adjust),
         web_ui_enabled: Some(app.web_ui_enabled.clone()),
+        stream_client_allowed: Some(stream_client_allowed),
     })
 }
 
