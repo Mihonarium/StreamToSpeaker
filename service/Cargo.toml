@@ -2,7 +2,10 @@
 name = "stream-to-speaker"
 version = "0.6.0"
 edition = "2021"
-rust-version = "1.74"
+# Honest floor: the locked dependency tree (time-macros 0.2.27, edition
+# 2024) needs 1.88, and CI's `msrv` job checks both targets on exactly this
+# toolchain so the number can't silently drift again.
+rust-version = "1.88"
 description = "Stream To Speaker — user-mode bridge between a Windows virtual audio driver (or WASAPI loopback) and any UPnP/OpenHome network speaker (Sonos, IKEA StreamToSpeaker, etc)."
 license = "MIT"
 
