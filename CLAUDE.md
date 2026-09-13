@@ -202,12 +202,21 @@ The user mentioned these but asked NOT to start them now. Pick up when they say:
 
 ## Release version vs crate version (update check)
 
-The service crate version (`service/Cargo.toml`, e.g. 0.6.0) and the GitHub
-release tag (e.g. `v0.1.4`) are **independent**. Anything user-facing or
-compared against GitHub must use `stream_to_speaker::display_version()` /
-`release_version()` (lib.rs), which read `STS_RELEASE_VERSION` — set by
-build.yml's "Build service" step on `v*` tag pushes only (build.rs declares
-`rerun-if-env-changed` so a cached target/ can't ship a stale value). Local
-and non-tag CI builds have no release version: they display the crate
-version and `update_check` never runs. Never compare `CARGO_PKG_VERSION`
-against release tags.
+From v0.1.5 the service crate version (`service/Cargo.toml`) **tracks the
+release tag**: a release PR bumps it to the tag's number, and build.yml's
+"Stamp crate version" step overwrites it with the tag on `v*` builds anyway,
+so `--version`, `CARGO_PKG_VERSION`, the exe metadata, the installer name and
+the update check all agree. (Before that the two were independent — crate
+0.6.0/0.7.0 against tag v0.1.4 — which is why the update check compares
+`STS_RELEASE_VERSION`, not `CARGO_PKG_VERSION`.) Anything user-facing or
+compared against GitHub must still use `stream_to_speaker::display_version()`
+/ `release_version()` (lib.rs): they read `STS_RELEASE_VERSION`, set only on
+tag builds (build.rs declares `rerun-if-env-changed` so a cached target/
+can't ship a stale value). Local and non-tag CI builds have no release
+version: they display the crate version and `update_check` never runs.
+
+**Releasing:** merge a PR that bumps the crate version, then push a
+lightweight tag `vX.Y.Z` on `main` (`git tag vX.Y.Z <merge-commit> && git
+push origin vX.Y.Z`). The tag push runs build → sign-service → package →
+sign-release and creates the GitHub Release with generated notes; the
+`request-signing` environment may hold the signing jobs for approval.
