@@ -3023,6 +3023,25 @@ impl StreamToSpeakerApp {
                     packets_label,
                     "Total audio packets sent since launch.",
                 );
+                // AirPlay only: what the speaker asked to have sent again.
+                // The one number that says whether a low AirPlay buffer is
+                // actually sustainable on this network.
+                if let Some((requests, resent)) = self.app.resend_stats() {
+                    stat_pill(
+                        ui,
+                        p,
+                        &humanize_count(resent),
+                        "resent",
+                        &format!(
+                            "Packets the speaker asked to have sent again this session ({} \
+                             request{}). A number that keeps climbing means the network \
+                             isn't keeping up with the AirPlay buffer set in Advanced — \
+                             raise the buffer if you hear dropouts.",
+                            requests,
+                            if requests == 1 { "" } else { "s" }
+                        ),
+                    );
+                }
             });
         });
     }

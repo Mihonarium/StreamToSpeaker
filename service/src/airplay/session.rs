@@ -110,6 +110,8 @@ pub struct AirPlaySession {
     /// the RTSP connection). The app-level watchdog polls this to tear
     /// down the zombie and auto-reconnect.
     dead: Arc<AtomicBool>,
+    /// Retransmission counters, fed by the resend responder.
+    resend_stats: Arc<crate::airplay::timing::ResendStats>,
     /// Current RTP write head — read to stamp the `RTP-Info` on metadata
     /// SET_PARAMETERs.
     current_rtptime: Arc<AtomicU32>,
@@ -212,6 +214,7 @@ impl AirPlaySession {
         // every stalled-SETUP session on record.
         let stop_flag = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
+        let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
         let mut guard = SpawnGuard::new(stop_flag.clone());
         guard.adopt(
             spawn_timing_responder(
@@ -401,6 +404,7 @@ impl AirPlaySession {
                 control_for_resend,
                 receiver_control_addr,
                 resend,
+                resend_stats.clone(),
                 stop_flag.clone(),
                 cfg.renderer.friendly_name.clone(),
             )
@@ -498,6 +502,7 @@ impl AirPlaySession {
             rtsp,
             stop_flag,
             dead,
+            resend_stats,
             current_rtptime,
             threads: guard.into_threads(),
             _audio_socket: audio_socket,
@@ -522,6 +527,11 @@ impl AirPlaySession {
     /// polls this to replace the zombie with a fresh session.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+
+    /// `(resend requests, packets re-sent)` so far this session.
+    pub fn resend_stats(&self) -> (u64, u64) {
+        self.resend_stats.snapshot()
     }
 
     /// Push a new volume value (0..=100) to the receiver. Idempotent

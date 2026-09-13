@@ -55,7 +55,7 @@ use byteorder::{BigEndian, ByteOrder};
 use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -435,10 +435,32 @@ fn build_resend_response(seq: u16, original_packet: &[u8]) -> Vec<u8> {
 ///
 /// The control socket is shared with the sync sender via `try_clone`
 /// (the sync sender only writes; this thread reads + writes).
+/// Retransmission counters for one session, shared between the resend
+/// responder (writer) and whoever reports them (the Stats card, the log
+/// line at exit). Resend requests are the receiver telling us packets
+/// went missing: a rising rate at a low AirPlay buffer means the network
+/// can't sustain that buffer — the one signal a user needs to decide to
+/// raise it.
+#[derive(Default, Debug)]
+pub struct ResendStats {
+    /// Resend requests received (each names a run of sequence numbers).
+    pub requests: AtomicU64,
+    /// Packets actually re-sent in response.
+    pub packets: AtomicU64,
+}
+
+impl ResendStats {
+    /// `(requests, packets re-sent)`.
+    pub fn snapshot(&self) -> (u64, u64) {
+        (self.requests.load(Ordering::Relaxed), self.packets.load(Ordering::Relaxed))
+    }
+}
+
 pub fn spawn_resend_responder(
     control_socket: UdpSocket,
     receiver_control_addr: SocketAddr,
     resend: Arc<ResendBuffer>,
+    stats: Arc<ResendStats>,
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
 ) -> std::io::Result<thread::JoinHandle<()>> {
@@ -453,6 +475,7 @@ pub fn spawn_resend_responder(
                     // Resend request: 0x80 0xD5, seq(2), first(2), count(2).
                     Ok((n, peer)) if n >= 8 && buf[1] == 0xD5 => {
                         requests += 1;
+                        stats.requests.fetch_add(1, Ordering::Relaxed);
                         if requests == 1 {
                             // A resend request proves the receiver is
                             // consuming our RTP stream (it tracks seq gaps).
@@ -473,6 +496,7 @@ pub fn spawn_resend_responder(
                                 }
                             }
                         }
+                        stats.packets.fetch_add(sent as u64, Ordering::Relaxed);
                         debug!(
                             "AirPlay resend: req first={} count={} → re-sent {}",
                             first, count, sent
@@ -492,6 +516,10 @@ pub fn spawn_resend_responder(
                     }
                 }
             }
-            debug!("AirPlay resend responder: exiting");
+            let (req, pk) = stats.snapshot();
+            info!(
+                "AirPlay resend responder: exiting after {} resend request(s), {} packet(s) re-sent",
+                req, pk
+            );
         })
 }
