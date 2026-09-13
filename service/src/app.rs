@@ -1387,6 +1387,9 @@ impl App {
         // Play returns, while `self.session` still holds the old state.
         // The grant moves into the session it produces; if bring-up
         // fails it drops on the error path and the gate forgets it.
+        // (`stream_peers` includes the other Sonos group members' addresses
+        // resolved above, so the whole group is admitted, whichever unit
+        // ends up fetching.)
         let grant = self.stream_gate.grant(new_r.stream_peers());
         let didl = upnp::didl_lite_metadata(
             &self.config.stream_uri,

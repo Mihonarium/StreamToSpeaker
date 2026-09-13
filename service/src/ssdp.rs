@@ -49,6 +49,11 @@ pub struct Renderer {
     /// renderer coordinates. Empty ⇒ standalone (or non-Sonos). Filled
     /// by `sonos::apply_topology`.
     pub group_members: Vec<String>,
+    /// Sonos only: addresses of the OTHER members of the group this
+    /// renderer coordinates (from their topology `Location` hosts), so
+    /// privacy mode admits the whole group — any member may end up
+    /// fetching the stream. Filled by `sonos::resolve_group_coordinator`.
+    pub group_member_addrs: Vec<IpAddr>,
     /// Source address of the SSDP reply that announced this device, if
     /// known. Can differ from `ip` (multi-homed renderers, hostname
     /// LOCATIONs); privacy mode admits both.
@@ -151,6 +156,7 @@ impl Renderer {
         let mut v = vec![self.ip];
         v.extend(self.host_addrs.iter().copied());
         v.extend(self.source_ip);
+        v.extend(self.group_member_addrs.iter().copied());
         v.sort();
         v.dedup();
         v
@@ -468,6 +474,7 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr) -> Result<Ren
         group_rendering_control_event_url: grc_event.map(|u| absolute_url(base_url, &u)),
         zone_name: None,
         group_members: Vec::new(),
+        group_member_addrs: Vec::new(),
         source_ip: None,
         host_addrs: vec![ip],
     })
