@@ -35,6 +35,11 @@ on:
         description: "driver-v* release tag (default: newest by build number)"
         required: false
         default: ""
+      dry_run:
+        description: "Validate the wiring only: no Partner Center call, no release change; hands `tag` to Driver attested in dry-run mode (exercises the reusable-workflow call + its permission grants)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -62,15 +67,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 55
     outputs:
-      verify_tag: ${{ steps.attest.outputs.verify_tag }}
+      verify_tag: ${{ steps.attest.outputs.verify_tag || steps.dry.outputs.verify_tag }}
+      dry_run: ${{ steps.dry.outputs.dry_run || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Unit tests (guard)
         run: python3 -m unittest discover -s .github/scripts
 
+      - name: Dry run (no Partner Center call)
+        id: dry
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-driver-v1.1.0.204}"
+          echo "::notice::dry run - skipping the Hardware API; handing $tag to Driver attested in dry-run mode"
+          echo "verify_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "dry_run=true" >> "$GITHUB_OUTPUT"
+
       - name: Reconcile attestation state
         id: attest
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -92,3 +110,4 @@ jobs:
       attestations: write
     with:
       tag: ${{ needs.reconcile.outputs.verify_tag }}
+      dry_run: ${{ needs.reconcile.outputs.dry_run == 'true' }}

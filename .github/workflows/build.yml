@@ -383,8 +383,7 @@ jobs:
       # `#[ignore]`d test: a live WinHTTP round-trip to the GitHub releases
       # API — the update check's transport, which can only be exercised on
       # a Windows host with network. It authenticates with the job token
-      # (shared runner IPs exhaust the anonymous 60/h quota; this once
-      # failed a main build with "API rate limit exceeded") and treats a
+      # (shared runner IPs exhaust the anonymous 60/h quota) and treats a
       # rate-limit answer as a skip, so it can't block a release build.
       - name: Test service (unit tests + live update-check fetch)
         shell: pwsh
