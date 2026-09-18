@@ -37,13 +37,14 @@ StreamToSpeakerWaveFormat()
 }
 
 /* Signal-processing modes the render pin supports. DEFAULT is what
- * the shared-mode engine uses; RAW lets exclusive-mode clients bypass
- * APO processing — for a passthrough virtual device both are simply
- * "the bits you give us". */
+ * the shared-mode engine uses and is the only required mode. RAW is
+ * deliberately not advertised: a pin that offers RAW must provide
+ * hardware volume/mute/peak-meter (no APOs run in RAW) and the HLK
+ * Hardware Offload test then opens a second, RAW-mode stream, which a
+ * single-instance render pin backed by one ring buffer cannot serve. */
 static const GUID g_SignalProcessingModes[] =
 {
-    STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
-    STATIC_AUDIO_SIGNALPROCESSINGMODE_RAW
+    STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT
 };
 
 /* Fill a KSDATAFORMAT_WAVEFORMATEXTENSIBLE for `channels` (1 or 2)
