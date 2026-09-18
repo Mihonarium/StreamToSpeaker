@@ -124,7 +124,7 @@ static KSDATARANGE_AUDIO PinDataRangesPCM[] =
     {
         {
             sizeof(KSDATARANGE_AUDIO),
-            0,
+            KSDATARANGE_ATTRIBUTES,     /* an attribute list follows in the pointer array */
             0,
             0,
             STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
@@ -139,9 +139,34 @@ static KSDATARANGE_AUDIO PinDataRangesPCM[] =
     }
 };
 
+/* Signal-processing-mode attribute for the render pin's data range.
+ * KS only lets a client connect with a KSDATAFORMAT_ATTRIBUTES format
+ * (the audio engine always attaches the processing mode) if the
+ * matching data range declares the attribute, so the range above is
+ * flagged KSDATARANGE_ATTRIBUTES and this list follows it in the
+ * pointer array — the sysvad pattern. */
+static KSATTRIBUTE PinDataRangeSignalProcessingModeAttribute =
+{
+    sizeof(KSATTRIBUTE),
+    0,
+    STATICGUIDOF(KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE)
+};
+
+static PKSATTRIBUTE PinDataRangeAttributes[] =
+{
+    &PinDataRangeSignalProcessingModeAttribute
+};
+
+static KSATTRIBUTE_LIST PinDataRangeAttributeList =
+{
+    SIZEOF_ARRAY(PinDataRangeAttributes),
+    PinDataRangeAttributes
+};
+
 static PKSDATARANGE PinDataRangePointersPCM[] =
 {
-    reinterpret_cast<PKSDATARANGE>(&PinDataRangesPCM[0])
+    reinterpret_cast<PKSDATARANGE>(&PinDataRangesPCM[0]),
+    reinterpret_cast<PKSDATARANGE>(&PinDataRangeAttributeList)
 };
 
 /* Bridge pin (output) advertises a generic analog data range. */
@@ -302,9 +327,29 @@ static NTSTATUS BasicSupportNoMembers(
     return STATUS_BUFFER_TOO_SMALL;
 }
 
+/* KSP_PIN::PinId from a pin-scoped filter property request, or
+ * (ULONG)-1 if the instance data is too short. */
+static ULONG RequestPinId(_In_ PPCPROPERTY_REQUEST Request)
+{
+    if (Request->Instance == nullptr ||
+        Request->InstanceSize < sizeof(KSP_PIN) - RTL_SIZEOF_THROUGH_FIELD(KSP_PIN, Property)) {
+        return (ULONG)-1;
+    }
+    return CONTAINING_RECORD(Request->Instance, KSP_PIN, PinId)->PinId;
+}
+
 static NTSTATUS PropertyHandlerProposedFormat(_In_ PPCPROPERTY_REQUEST Request)
 {
     PAGED_CODE();
+    /* Only the render sink pin has a proposable format; the bridge pin
+     * must not report support (HLK KS Topology Test). */
+    ULONG pin = RequestPinId(Request);
+    if (pin >= SIZEOF_ARRAY(WaveMiniportPins)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (pin != KSPIN_WAVE_RENDER_SINK) {
+        return STATUS_NOT_SUPPORTED;
+    }
     if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
         return BasicSupportNoMembers(Request,
                                      KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
@@ -380,6 +425,15 @@ static BOOLEAN IsSupportedSignalProcessingMode(_In_ const GUID& Mode)
 static NTSTATUS PropertyHandlerProposedFormat2(_In_ PPCPROPERTY_REQUEST Request)
 {
     PAGED_CODE();
+    /* Request->Instance points at KSP_PIN::PinId (everything after the
+     * KSPROPERTY header). Only the render sink pin is mode-aware. */
+    ULONG pin = RequestPinId(Request);
+    if (pin >= SIZEOF_ARRAY(WaveMiniportPins)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (pin != KSPIN_WAVE_RENDER_SINK) {
+        return STATUS_NOT_SUPPORTED;
+    }
     if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
         return BasicSupportNoMembers(Request,
                                      KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT,
@@ -388,16 +442,7 @@ static NTSTATUS PropertyHandlerProposedFormat2(_In_ PPCPROPERTY_REQUEST Request)
     if (!(Request->Verb & KSPROPERTY_TYPE_GET)) {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
-    /* Request->Instance points at KSP_PIN::PinId (everything after the
-     * KSPROPERTY header). */
-    if (Request->Instance == nullptr ||
-        Request->InstanceSize < sizeof(KSP_PIN) - RTL_SIZEOF_THROUGH_FIELD(KSP_PIN, Property)) {
-        return STATUS_INVALID_PARAMETER;
-    }
     const KSP_PIN* kspPin = CONTAINING_RECORD(Request->Instance, KSP_PIN, PinId);
-    if (kspPin->PinId != KSPIN_WAVE_RENDER_SINK) {
-        return STATUS_NOT_SUPPORTED;
-    }
     const UCHAR* attrs   = reinterpret_cast<const UCHAR*>(kspPin + 1);
     const UCHAR* instEnd = static_cast<const UCHAR*>(Request->Instance) + Request->InstanceSize;
     size_t cbAttrs = (attrs < instEnd) ? static_cast<size_t>(instEnd - attrs) : 0;
@@ -677,6 +722,21 @@ CMiniportWaveRT::NewStream(
     }
     if (StreamToSpeakerSupportedChannels(DataFormat, DataFormat->FormatSize) == 0) {
         return STATUS_NO_MATCH;
+    }
+    if (DataFormat->Flags & KSDATAFORMAT_ATTRIBUTES) {
+        /* The audio engine attaches the signal-processing mode; only
+         * modes we advertised through GetModes may be used. */
+        const UCHAR* attrs = reinterpret_cast<const UCHAR*>(DataFormat) +
+            ((DataFormat->FormatSize + FILE_QUAD_ALIGNMENT) & ~static_cast<ULONG>(FILE_QUAD_ALIGNMENT));
+        const KSMULTIPLE_ITEM* items = reinterpret_cast<const KSMULTIPLE_ITEM*>(attrs);
+        GUID mode = AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
+        NTSTATUS st = SignalProcessingModeFromAttributes(items, items->Size, &mode);
+        if (st != STATUS_NOT_FOUND && !NT_SUCCESS(st)) {
+            return st;
+        }
+        if (!IsSupportedSignalProcessingMode(mode)) {
+            return STATUS_NOT_SUPPORTED;
+        }
     }
     *OutStream = nullptr;
 

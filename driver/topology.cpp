@@ -549,6 +549,9 @@ CMiniportTopology::PropertyHandlerVolumeLevel(_In_ PPCPROPERTY_REQUEST Request)
         return STATUS_INVALID_PARAMETER;
     }
     LONG channel = *static_cast<LONG*>(Request->Instance);
+    if (channel != -1 && (channel < 0 || (ULONG)channel >= STREAM_TO_SPEAKER_CHANNELS)) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     if (Request->Verb & KSPROPERTY_TYPE_GET) {
         if (Request->ValueSize < sizeof(LONG)) {
@@ -598,6 +601,15 @@ CMiniportTopology::PropertyHandlerMute(_In_ PPCPROPERTY_REQUEST Request)
     if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
         /* BOOL range: 0 (unmuted) .. 1 (muted), one step. */
         return BasicSupportSteppedPerChannel(Request, VT_BOOL, 0, 1, 1);
+    }
+
+    /* Channel selector: -1 == "all". Mute is one switch for both
+     * channels, but the index must still be a valid channel. */
+    if (Request->InstanceSize >= sizeof(LONG)) {
+        LONG channel = *static_cast<LONG*>(Request->Instance);
+        if (channel != -1 && (channel < 0 || (ULONG)channel >= STREAM_TO_SPEAKER_CHANNELS)) {
+            return STATUS_INVALID_PARAMETER;
+        }
     }
 
     if (Request->Verb & KSPROPERTY_TYPE_GET) {
