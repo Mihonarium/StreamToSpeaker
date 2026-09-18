@@ -281,7 +281,10 @@ def release_notes(m):
 
 
 def gh(*args, **kw):
-    return subprocess.run(["gh", *args], check=True, capture_output=True, text=True, **kw).stdout
+    r = subprocess.run(["gh", *args], capture_output=True, text=True, **kw)
+    if r.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:3])} failed ({r.returncode}): {r.stderr.strip()[:2000]}")
+    return r.stdout
 
 
 def ensure_release(repo, tag, version, commit):
