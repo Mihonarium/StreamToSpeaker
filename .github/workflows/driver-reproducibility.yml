@@ -1,0 +1,402 @@
+# Driver reproducibility check
+#
+# Rebuilds the kernel driver from the checked-out source with the same
+# msbuild invocation the release pipeline uses, pinned to a given build
+# number, and compares the result against the package that was tested and
+# certified (the `-lab-testsigned.zip` asset on a driver-v* release):
+#
+#   * guard: hashFiles('driver/**','include/**') of the checkout must equal
+#     the release manifest's `source_hash`, i.e. this IS the certified tree;
+#   * StreamToSpeaker.sys: Authenticode signature removed from the released
+#     copy, then raw SHA-256, then a normalised comparison that masks the PE
+#     fields known to vary between builds (COFF TimeDateStamp, PE CheckSum,
+#     debug-directory timestamps and the PDB GUID/age/path). Anything else
+#     that differs is listed by offset/size/section;
+#   * StreamToSpeaker.inf: compared with the DriverVer date masked (stampinf
+#     writes the build date);
+#   * the .cat is signed and re-issued by Microsoft — not compared.
+#
+# The job fails only when the normalised comparison differs. `raw_identical`
+# and `normalised_identical` are exposed as job outputs. Comparison logic:
+# .github/scripts/repro_compare.py.
+name: Driver reproducibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "driver-v* release whose lab package to compare against"
+        required: true
+        default: "driver-v1.1.0.209"
+      build_number:
+        description: "DriverBuildNumber to pin (the release's driver_build)"
+        required: true
+        default: "209"
+      commit:
+        description: "Commit to build (empty = HEAD of the branch this is run from)"
+        required: false
+        default: ""
+      build_root:
+        description: "Directory the source is copied to before building. The PDB path the linker embeds depends on it, and its length changes the debug-directory layout."
+        required: false
+        default: 'C:\build\src'
+      stamp_driver_h:
+        description: "Rewrite STREAM_TO_SPEAKER_DRIVER_BUILD in driver/driver.h to build_number before building (what build.yml and driver-submission.yml do). Off: build the tree exactly as checked out."
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # Same installer as build.yml so the WDK cache is shared with it.
+  WDK_INSTALLER_URL: "https://go.microsoft.com/fwlink/?linkid=2272234"
+
+jobs:
+  reproduce:
+    # windows-2022 for the same reason as build.yml (VS2022/MSBuild 17 +
+    # WDK 26100's MSBuild-17 task DLLs).
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      raw_identical: ${{ steps.cmp_sys.outputs.raw_identical }}
+      normalised_identical: ${{ steps.verdict.outputs.normalised_identical }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+
+      # The identity hash must be taken from the pristine checkout, before
+      # anything (the optional driver.h stamp) touches the tree.
+      - name: Compute driver source hash
+        id: srchash
+        shell: pwsh
+        run: |
+          "hash=${{ hashFiles('driver/**', 'include/**') }}" >> $env:GITHUB_OUTPUT
+
+      - name: Fetch release manifest and lab package
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:BUILD_NUMBER -notmatch '^\d+$') { throw "build_number must be numeric, got '$env:BUILD_NUMBER'" }
+          New-Item -ItemType Directory -Force -Path released | Out-Null
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern manifest.json --output released/manifest.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not download manifest.json from release $env:TAG" }
+          $m = Get-Content released/manifest.json -Raw | ConvertFrom-Json
+          Write-Host "Release $env:TAG: driver $($m.driver_version) (build $($m.driver_build)), commit $($m.commit)"
+          Write-Host "  manifest source_hash : $($m.source_hash)"
+          Write-Host "  checkout source_hash : $env:SOURCE_HASH"
+          if (-not $m.source_hash) { throw "manifest has no source_hash" }
+          if ($m.source_hash -ne $env:SOURCE_HASH) {
+              throw "driver source hash of this checkout does not match the release manifest - this is not the tree that was certified"
+          }
+          if ("$($m.driver_build)" -ne $env:BUILD_NUMBER) {
+              throw "build_number input ($env:BUILD_NUMBER) differs from the manifest's driver_build ($($m.driver_build))"
+          }
+          $labZip = $m.lab_zip
+          if (-not $labZip) { $labZip = "StreamToSpeaker-Driver-$($m.driver_version)-lab-testsigned.zip" }
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern $labZip --output "released/$labZip" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not download $labZip from release $env:TAG" }
+          $sha = (Get-FileHash "released/$labZip" -Algorithm SHA256).Hash.ToLower()
+          Write-Host "  $labZip sha256 $sha"
+          if ($m.lab_zip_sha256 -and $sha -ne $m.lab_zip_sha256.ToLower()) {
+              throw "$labZip sha256 $sha does not match the manifest's lab_zip_sha256 $($m.lab_zip_sha256)"
+          }
+          Expand-Archive "released/$labZip" -DestinationPath released/lab -Force
+          Get-ChildItem released/lab | ForEach-Object { Write-Host "  lab: $($_.Name) ($($_.Length) bytes)" }
+          foreach ($n in "StreamToSpeaker.sys", "StreamToSpeaker.inf") {
+              if (-not (Test-Path "released/lab/$n")) { throw "$n missing from $labZip" }
+          }
+          "version=$($m.driver_version)" >> $env:GITHUB_OUTPUT
+          "lab_zip=$labZip" >> $env:GITHUB_OUTPUT
+
+      # ---- WDK: copied from build.yml (same paths, same cache key) ----
+      - name: Exclude WDK paths from Defender real-time scanning
+        shell: pwsh
+        run: |
+          try {
+              Add-MpPreference -ExclusionPath `
+                  "C:\Program Files (x86)\Windows Kits", `
+                  "C:\Program Files\Microsoft Visual Studio", `
+                  "C:\Program Files (x86)\Microsoft Visual Studio" -ErrorAction Stop
+              Write-Host "Defender exclusions added"
+          } catch {
+              Write-Host "Could not add Defender exclusions ($_) - continuing"
+          }
+
+      - name: Restore WDK cache
+        id: cache-wdk
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files (x86)\Windows Kits\10
+            C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\WDK
+            C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Microsoft\WDK
+            C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\WDK
+            C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\WDK
+          # Keyed on build.yml (not this file) on purpose: it is build.yml's
+          # cache entry, so this job reuses the exact WDK tree the release
+          # builds use.
+          key: wdk-${{ env.WDK_INSTALLER_URL }}-v2-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: |
+            wdk-${{ env.WDK_INSTALLER_URL }}-v2-
+
+      - name: Install WDK (cache miss)
+        if: steps.cache-wdk.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "wdksetup.exe"
+          Write-Host "Downloading WDK from $env:WDK_INSTALLER_URL"
+          Invoke-WebRequest -Uri $env:WDK_INSTALLER_URL -OutFile $installer -UseBasicParsing
+          Write-Host "Installing WDK (silent, ~5 min)..."
+          $p = Start-Process -FilePath $installer -ArgumentList "/features", "+", "/q", "/norestart" -Wait -PassThru
+          Write-Host "WDK installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+              throw "WDK installer failed with exit $($p.ExitCode)"
+          }
+
+      - name: Restore WDK registry
+        shell: pwsh
+        run: |
+          $kitsRoot = "C:\Program Files (x86)\Windows Kits\10\"
+          if (-not (Test-Path $kitsRoot)) {
+              throw "Windows Kits\10\ missing after WDK install/restore"
+          }
+          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" `
+                           -Name "KitsRoot10" -Value $kitsRoot -PropertyType String -Force | Out-Null
+          New-Item -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" `
+                           -Name "KitsRoot10" -Value $kitsRoot -PropertyType String -Force | Out-Null
+          Write-Host "KitsRoot10 = $kitsRoot"
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # ---- Build ----
+      - name: Stamp driver build number into driver.h
+        if: inputs.stamp_driver_h
+        shell: pwsh
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          $path = "driver/driver.h"
+          $content = Get-Content $path -Raw
+          $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}$($env:BUILD_NUMBER)u"
+          Set-Content -Path $path -Value $new -NoNewline
+          Write-Host "driver.h stamped: STREAM_TO_SPEAKER_DRIVER_BUILD $env:BUILD_NUMBER"
+
+      - name: Build driver (Release|x64, unsigned, pinned build number)
+        id: build
+        shell: pwsh
+        env:
+          BUILD_ROOT: ${{ inputs.build_root }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:BUILD_ROOT
+          if (Test-Path $root) { Remove-Item -Recurse -Force $root }
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item -Recurse driver (Join-Path $root "driver")
+          Copy-Item -Recurse include (Join-Path $root "include")
+          Write-Host "Source copied to $root"
+          Write-Host "driver.h: $((Select-String -Path (Join-Path $root 'driver\driver.h') -Pattern 'STREAM_TO_SPEAKER_DRIVER_BUILD').Line.Trim())"
+
+          $log = Join-Path $env:GITHUB_WORKSPACE "msbuild-detailed.log"
+          msbuild (Join-Path $root "driver\StreamToSpeaker.sln") `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:SignMode=Off `
+            /p:DriverBuildNumber=$env:BUILD_NUMBER `
+            /nologo `
+            /verbosity:minimal `
+            /fileLogger "/fileLoggerParameters:LogFile=$log;Verbosity=detailed"
+          if ($LASTEXITCODE -ne 0) { throw "msbuild failed with exit code $LASTEXITCODE" }
+
+          $out = Join-Path $root "driver\x64\Release"
+          $sys = Get-ChildItem -Path $out -Recurse -Filter "StreamToSpeaker.sys" | Select-Object -First 1
+          $inf = Get-ChildItem -Path $out -Recurse -Filter "StreamToSpeaker.inf" | Select-Object -First 1
+          $pdb = Get-ChildItem -Path $out -Recurse -Filter "StreamToSpeaker.pdb" | Select-Object -First 1
+          if (-not $sys -or -not $inf) { Get-ChildItem -Recurse $out | Select-Object FullName; throw "driver outputs not produced" }
+          $sig = Get-AuthenticodeSignature $sys.FullName
+          if ($sig.Status -ne "NotSigned") { throw "expected an unsigned .sys, got signature status $($sig.Status)" }
+          $infText = Get-Content $inf.FullName -Raw
+          if ($infText -notmatch [regex]::Escape(",$env:VERSION")) { throw "built INF does not carry DriverVer $env:VERSION - stampinf failed?" }
+          New-Item -ItemType Directory -Force -Path fresh | Out-Null
+          Copy-Item $sys.FullName fresh/StreamToSpeaker.sys
+          Copy-Item $inf.FullName fresh/StreamToSpeaker.inf
+          if ($pdb) { Copy-Item $pdb.FullName fresh/StreamToSpeaker.pdb }
+          Write-Host "fresh .sys sha256 $((Get-FileHash fresh/StreamToSpeaker.sys -Algorithm SHA256).Hash.ToLower())"
+          Write-Host "fresh INF: $((Select-String -Path fresh/StreamToSpeaker.inf -Pattern 'DriverVer').Line.Trim())"
+
+      - name: Record toolset versions
+        id: toolset
+        shell: pwsh
+        run: |
+          $kits = "C:\Program Files (x86)\Windows Kits\10"
+          $lines = @()
+          $lines += "runner image: $env:ImageOS $env:ImageVersion"
+          $lines += "msbuild: $((msbuild -version -nologo | Select-Object -Last 1))"
+          $log = Get-Content msbuild-detailed.log -Raw
+          $tools = [regex]::Matches($log, '(?i)[A-Z]:\\[^"\r\n]*?\\(?:CL|link|stampinf|inf2cat)\.exe') |
+                   ForEach-Object { $_.Value } | Sort-Object -Unique
+          foreach ($t in $tools) {
+              $fv = (Get-Item $t -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+              $lines += "$t : $fv"
+          }
+          $lines += "SDK/WDK versions under $kits\Include: $((Get-ChildItem "$kits\Include" -Directory | ForEach-Object Name) -join ', ')"
+          foreach ($exe in "signtool.exe", "stampinf.exe", "inf2cat.exe") {
+              $f = Get-ChildItem "$kits\bin" -Recurse -Filter $exe -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+              if ($f) { $lines += "$($f.FullName) : $($f.VersionInfo.FileVersion)" }
+          }
+          $kits_installed = Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -match 'Windows Driver Kit|Windows Software Development Kit' } |
+              ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion)" } | Sort-Object -Unique
+          if ($kits_installed) { $lines += "installed kits: $($kits_installed -join '; ')" }
+          $lines | ForEach-Object { Write-Host $_ }
+          $lines | Set-Content toolset.txt
+          # Command lines as msbuild ran them (cl / link / stampinf), for the artifact.
+          [regex]::Matches($log, '(?im)^\s*[A-Z]:\\[^\r\n]*?\\(?:CL|link|stampinf|inf2cat)\.exe .*$') |
+              ForEach-Object { $_.Value.Trim() } | Sort-Object -Unique | Set-Content tool-commands.txt
+
+      # ---- Compare ----
+      - name: Strip the lab package's Authenticode signature (signtool remove /s)
+        shell: pwsh
+        run: |
+          $kits = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $signtool = Get-ChildItem $kits -Recurse -Filter signtool.exe | Where-Object { $_.FullName -match '\\x64\\' } |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path released/stripped | Out-Null
+          Copy-Item released/lab/StreamToSpeaker.sys released/stripped/StreamToSpeaker.sys
+          Write-Host "lab .sys (signed)   sha256 $((Get-FileHash released/lab/StreamToSpeaker.sys -Algorithm SHA256).Hash.ToLower())"
+          if ($signtool) {
+              & $signtool.FullName remove /s released/stripped/StreamToSpeaker.sys
+              if ($LASTEXITCODE -ne 0) { throw "signtool remove /s failed with $LASTEXITCODE" }
+              Write-Host "signature removed with $($signtool.FullName)"
+          } else {
+              Write-Host "::warning::signtool.exe not found; the comparison script strips the certificate table itself"
+          }
+          Write-Host "lab .sys (stripped) sha256 $((Get-FileHash released/stripped/StreamToSpeaker.sys -Algorithm SHA256).Hash.ToLower())"
+
+      - name: Compare StreamToSpeaker.sys
+        id: cmp_sys
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          python .github/scripts/repro_compare.py sys released/stripped/StreamToSpeaker.sys fresh/StreamToSpeaker.sys --json compare-sys.json
+          exit $LASTEXITCODE
+
+      - name: Compare StreamToSpeaker.inf
+        id: cmp_inf
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          python .github/scripts/repro_compare.py inf released/lab/StreamToSpeaker.inf fresh/StreamToSpeaker.inf --json compare-inf.json
+          exit $LASTEXITCODE
+
+      - name: Summary
+        id: verdict
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+          SYS_RAW: ${{ steps.cmp_sys.outputs.raw_identical }}
+          SYS_NORM: ${{ steps.cmp_sys.outputs.normalised_identical }}
+          INF_RAW: ${{ steps.cmp_inf.outputs.raw_identical }}
+          INF_NORM: ${{ steps.cmp_inf.outputs.normalised_identical }}
+          SYS_OUTCOME: ${{ steps.cmp_sys.outcome }}
+          INF_OUTCOME: ${{ steps.cmp_inf.outcome }}
+        run: |
+          $ok = ($env:SYS_NORM -eq 'true') -and ($env:INF_NORM -eq 'true')
+          "normalised_identical=$($ok.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          $s = @()
+          $s += "## Driver reproducibility: $env:TAG"
+          $s += ""
+          $s += "| File | raw identical | normalised identical |"
+          $s += "|---|---|---|"
+          $s += "| StreamToSpeaker.sys (signature stripped) | $env:SYS_RAW | $env:SYS_NORM |"
+          $s += "| StreamToSpeaker.inf (DriverVer date masked) | $env:INF_RAW | $env:INF_NORM |"
+          $s += "| streamtospeaker.cat | not compared (signed, re-issued by Microsoft) | |"
+          $s += ""
+          if (Test-Path compare-sys.json) {
+              $r = Get-Content compare-sys.json -Raw | ConvertFrom-Json
+              $s += "### StreamToSpeaker.sys"
+              $s += ""
+              $s += "| | released | fresh |"
+              $s += "|---|---|---|"
+              $s += "| stripped sha256 | ``$($r.released.stripped_sha256)`` | ``$($r.fresh.stripped_sha256)`` |"
+              $s += "| size | $($r.released.size) | $($r.fresh.size) |"
+              $s += "| linker | $($r.released.linker_version) | $($r.fresh.linker_version) |"
+              $s += "| COFF timestamp | $($r.released.coff_timestamp) | $($r.fresh.coff_timestamp) |"
+              $pr = ($r.released.debug | Where-Object pdb_path | Select-Object -First 1)
+              $pf = ($r.fresh.debug | Where-Object pdb_path | Select-Object -First 1)
+              $s += "| PDB | ``$($pr.pdb_path)`` guid $($pr.pdb_guid) age $($pr.pdb_age) | ``$($pf.pdb_path)`` guid $($pf.pdb_guid) age $($pf.pdb_age) |"
+              $rich = { param($x) if ($x) { ($x.entries | ForEach-Object { "$($_.product_id):$($_.build)x$($_.count)" }) -join ', ' } else { 'none' } }
+              $s += "| Rich header (product:build x count) | $(& $rich $r.released.rich) | $(& $rich $r.fresh.rich) |"
+              $s += ""
+              if ($r.differing_regions.Count -gt 0) {
+                  $s += "Differing byte ranges after masking:"
+                  $s += ""
+                  $s += "| offset | size | region |"
+                  $s += "|---|---|---|"
+                  foreach ($d in $r.differing_regions) { $s += "| 0x{0:x8} | {1} | {2} |" -f $d.offset, $d.size, $d.region }
+                  $s += ""
+              }
+          }
+          if (Test-Path compare-inf.json) {
+              $r = Get-Content compare-inf.json -Raw | ConvertFrom-Json
+              $s += "### StreamToSpeaker.inf"
+              $s += ""
+              $s += "released: ``$($r.released.driverver)``, fresh: ``$($r.fresh.driverver)``"
+              foreach ($d in $r.differing_lines) { $s += "- line $($d.line): released ``$($d.released)`` / fresh ``$($d.fresh)``" }
+              $s += ""
+          }
+          if (Test-Path toolset.txt) {
+              $s += "### Toolset"
+              $s += ""
+              $s += '```'
+              $s += Get-Content toolset.txt
+              $s += '```'
+          }
+          $s | Add-Content $env:GITHUB_STEP_SUMMARY
+          $s | ForEach-Object { Write-Host $_ }
+
+      - name: Upload comparison artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-reproducibility-${{ inputs.tag }}
+          path: |
+            fresh/
+            released/stripped/
+            compare-sys.json
+            compare-inf.json
+            toolset.txt
+            tool-commands.txt
+            msbuild-detailed.log
+          if-no-files-found: warn
+
+      - name: Verdict
+        shell: pwsh
+        env:
+          OK: ${{ steps.verdict.outputs.normalised_identical }}
+          SYS_RAW: ${{ steps.cmp_sys.outputs.raw_identical }}
+        run: |
+          if ($env:OK -ne 'true') { throw "the rebuilt driver differs from the released package beyond the masked fields (see summary)" }
+          if ($env:SYS_RAW -eq 'true') { Write-Host "Byte-for-byte reproducible." }
+          else { Write-Host "Reproducible up to timestamps / checksum / PDB identity." }
