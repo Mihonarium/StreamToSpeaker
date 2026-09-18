@@ -352,6 +352,39 @@ works end to end:
    newest pending release with a zip attached, or pass the tag). Same
    verification as the automatic path.
 
+## CI change checklist
+
+Lessons from 2026-09-18, when a workflow that linted clean failed at
+trigger time on `main` (a caller of the reusable `driver-attested.yml`
+did not grant the `id-token`/`attestations` permissions it declares) and
+a release build failed on GitHub's anonymous API quota. Before reporting
+any workflow change as done:
+
+1. `actionlint .github/workflows/*.yml` — necessary, not sufficient.
+2. **Execute every touched workflow from the branch** with
+   `gh workflow run <file> --ref <branch>` (all of them have
+   `workflow_dispatch`; `driver-attest.yml` and `driver-attested.yml`
+   take `dry_run=true`, which exercises the reusable-workflow call and
+   the signtool checks against an already-attested tag such as
+   `driver-v1.1.0.204` without touching Partner Center or the release;
+   `driver-submission.yml` is safe to run only when a certified driver
+   matches, i.e. its guard stops it; `driver-certified.yml` needs a real
+   version + `ms_zip_asset` and rewrites that release's manifest). GitHub
+   validates permission grants for reusable-workflow calls, input types
+   and `needs` wiring only at trigger time — a run that never starts
+   (`startup_failure`) is the failure mode to look for.
+3. **Reusable-workflow calls:** the calling job's `permissions:` must
+   include every permission the called workflow declares at its top
+   level (currently `contents: write`, `id-token: write`,
+   `attestations: write` for `driver-attested.yml`).
+4. **No release-gating step may depend on an unauthenticated external
+   API.** Anything that talks to GitHub from a runner uses the job token
+   (`GH_TOKEN`/`GITHUB_TOKEN: ${{ github.token }}`); the live update-check
+   test additionally treats a rate-limit answer as a skip. Partner Center
+   calls use the Entra app secrets.
+5. Mind the API quota: `gh api rate_limit` before bursts of `gh` calls
+   from this box; the account's 5,000/h is shared with CI-side polling.
+
 ## Future work
 
 - **Automate the HLK lab run** (controller + client VMs exist — see the
