@@ -115,6 +115,9 @@ pub struct AirPlaySession {
     /// Current RTP write head — read to stamp the `RTP-Info` on metadata
     /// SET_PARAMETERs.
     current_rtptime: Arc<AtomicU32>,
+    /// Last volume (0..=100) pushed to the receiver; what an unmute
+    /// restores. RAOP has no separate mute, only the -144 dB sentinel.
+    volume_pct: AtomicU32,
     /// The background threads. All of them watch `stop_flag` with
     /// bounded wakeups, so `stop()` just sets the flag and joins.
     threads: Vec<JoinHandle<()>>,
@@ -504,6 +507,7 @@ impl AirPlaySession {
             dead,
             resend_stats,
             current_rtptime,
+            volume_pct: AtomicU32::new(cfg.initial_volume.unwrap_or(100)),
             threads: guard.into_threads(),
             _audio_socket: audio_socket,
         })
@@ -537,14 +541,16 @@ impl AirPlaySession {
     /// Push a new volume value (0..=100) to the receiver. Idempotent
     /// across repeats; receivers throttle their own UI updates.
     pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
+        self.volume_pct.store(vol.min(100), Ordering::Relaxed);
         let db = volume_pct_to_raop_db(vol);
         self.rtsp.lock().unwrap().set_volume(db)
     }
 
     /// Push a mute state. RAOP doesn't have a separate mute parameter,
-    /// just the sentinel -144 dB "off" volume.
+    /// just the sentinel -144 dB "off" volume; an unmute restores the
+    /// last level rather than jumping to full volume.
     pub fn set_mute(&self, muted: bool) -> Result<()> {
-        let db = if muted { -144.0 } else { 0.0 };
+        let db = mute_db(muted, self.volume_pct.load(Ordering::Relaxed));
         self.rtsp.lock().unwrap().set_volume(db)
     }
 
@@ -599,6 +605,19 @@ impl MetadataHandle {
 ///
 /// Interpolation between 1 and 100 is linear in dB. This matches
 /// PulseAudio's RAOP sink and the iTunes reference.
+/// dB to send for a mute transition: the -144 sentinel when muting, the
+/// last known level when unmuting. Windows mutes on its own when the
+/// volume keys reach zero and unmutes on the next key up, so an unmute
+/// that sent 0 dB (100 %) put the speaker at full volume while the
+/// Windows slider still showed the old level.
+pub fn mute_db(muted: bool, last_level_pct: u32) -> f32 {
+    if muted {
+        -144.0
+    } else {
+        volume_pct_to_raop_db(last_level_pct)
+    }
+}
+
 pub fn volume_pct_to_raop_db(pct: u32) -> f32 {
     let pct = pct.min(100);
     if pct == 0 {
@@ -616,6 +635,13 @@ mod tests {
     #[test]
     fn volume_mapping_anchor_points() {
         assert_eq!(volume_pct_to_raop_db(0), -144.0);
+        // Unmute restores the level; it never jumps to 0 dB unless the
+        // level really is 100.
+        assert_eq!(mute_db(true, 30), -144.0);
+        assert_eq!(mute_db(false, 30), volume_pct_to_raop_db(30));
+        assert!(mute_db(false, 30) < -20.0);
+        assert_eq!(mute_db(false, 100), 0.0);
+        assert_eq!(mute_db(false, 0), -144.0);
         assert!((volume_pct_to_raop_db(1) - -30.0).abs() < 1e-4);
         assert!((volume_pct_to_raop_db(100) - 0.0).abs() < 1e-4);
         // Monotonic

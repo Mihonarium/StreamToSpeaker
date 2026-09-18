@@ -39,7 +39,7 @@ use crate::airplay::ap2_rtsp::{Ap2Rtsp, TransientOutcome};
 use crate::airplay::discovery::AirPlayRenderer;
 use crate::airplay::hap_pairing::PairingCredentials;
 use crate::airplay::rtp::{bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, FRAMES_PER_PACKET};
-use crate::airplay::session::volume_pct_to_raop_db;
+use crate::airplay::session::{mute_db, volume_pct_to_raop_db};
 use crate::airplay::timing::{
     spawn_resend_responder, spawn_sync_sender, spawn_sync_sender_ptp, spawn_timing_responder,
     ResendBuffer,
@@ -117,6 +117,8 @@ pub enum Ap2StartError {
 pub struct AirPlay2Session {
     pub renderer: AirPlayRenderer,
     rtsp: Arc<Mutex<Ap2Rtsp>>,
+    /// Last volume (0..=100) pushed to the receiver; restored on unmute.
+    volume_pct: AtomicU32,
     stop_flag: Arc<AtomicBool>,
     /// Set by background threads when the session has demonstrably died
     /// (audio send error, buffered TCP write failure, repeated /feedback
@@ -529,6 +531,7 @@ impl AirPlay2Session {
         Ok(Self {
             renderer: cfg.renderer,
             rtsp,
+            volume_pct: AtomicU32::new(cfg.initial_volume.unwrap_or(100)),
             stop_flag,
             dead,
             resend_stats,
@@ -557,11 +560,12 @@ impl AirPlay2Session {
     }
 
     pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
+        self.volume_pct.store(vol.min(100), Ordering::Relaxed);
         self.rtsp.lock().unwrap().set_volume(volume_pct_to_raop_db(vol))
     }
 
     pub fn set_mute(&self, muted: bool) -> Result<()> {
-        let db = if muted { -144.0 } else { 0.0 };
+        let db = mute_db(muted, self.volume_pct.load(Ordering::Relaxed));
         self.rtsp.lock().unwrap().set_volume(db)
     }
 
