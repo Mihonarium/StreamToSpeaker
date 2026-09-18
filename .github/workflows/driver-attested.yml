@@ -3,6 +3,10 @@ name: Driver attested
 # Second half of the driver production-signing pipeline (first half:
 # driver-submission.yml; runbook: docs/driver-signing.md).
 #
+# Attestation only — a WHQL/HLK return goes through driver-certified.yml
+# (its .sys keeps the lab test signature as the primary signer, which the
+# checks below reject by design).
+#
 # Run this manually after Microsoft returns the attestation-signed driver:
 # download the signed zip from the Partner Center hardware dashboard, attach
 # it (any file name) to the matching driver-v* prerelease, then trigger this
@@ -73,7 +77,7 @@ jobs:
                       if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
                       $m = Get-Content candidate-manifest.json -Raw | ConvertFrom-Json
                   } catch { continue }
-                  if ($m.attested) { continue }
+                  if ($m.attested -or $m.certified) { continue }
                   $msZip = @($r.assets | Where-Object { $_.name -like "*.zip" -and $_.name -notlike "StreamToSpeaker-Driver-*-Signed.zip" })
                   if ($msZip.Count -eq 0) { continue }
                   $cand += ,@{ Release = $r; Build = [int]$m.driver_build }

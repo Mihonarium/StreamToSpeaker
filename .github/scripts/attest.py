@@ -23,7 +23,9 @@ API = "https://manage.devcenter.microsoft.com/v2.0/my/hardware"
 
 
 def next_action(m):
-    if m.get("attested"):
+    # A certified manifest (driver-certified.yml / certified.py) has no
+    # attestation submission at all; it is done by construction.
+    if m.get("attested") or m.get("certified"):
         return "done"
     if not m.get("submission_cab_signed_sha256"):
         return "wait-signing"

@@ -13,6 +13,15 @@ name: Driver attest
 # Entra app associated with the Partner Center account (docs/
 # driver-signing.md, one-time setup). Client secrets expire (≤24 months);
 # the failure mode is invalid_client from the token endpoint.
+#
+# The automatic hand-off from Driver submission is OPT-IN: set the
+# repository variable AUTO_ATTEST=true (Settings → Secrets and variables →
+# Actions → Variables). Without it the workflow_run trigger logs why it did
+# nothing and exits green; workflow_dispatch always runs. Rationale: the
+# shipped driver is now the WHQL-certified package, and an attestation
+# submission for the same source would be a lower-trust duplicate (the
+# certified-guard job in Driver submission already prevents the build;
+# this is the second lock in case that guard is bypassed with force=true).
 
 run-name: "Driver attest · ${{ inputs.tag || 'newest driver release' }}"
 
@@ -35,11 +44,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  auto-attest-gate:
+    # workflow_run only: explain (visibly, in a green run) why nothing
+    # happened unless auto-attest is switched on.
+    if: github.event_name == 'workflow_run' && vars.AUTO_ATTEST != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "::notice::Automatic attestation is OFF (repository variable AUTO_ATTEST != 'true'). Nothing was submitted to Microsoft. To attest the newest driver-v* release, run this workflow manually (Actions → Driver attest → Run workflow), or set AUTO_ATTEST=true to re-enable the hand-off from Driver submission."
+
   reconcile:
     # On workflow_run, only act when Driver submission succeeded (its
-    # sign-cab job completed → the EV-signed CAB is on the release).
-    # Manual dispatch always runs.
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # sign-cab job completed → the EV-signed CAB is on the release) AND
+    # auto-attest is opted in. Manual dispatch always runs.
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && vars.AUTO_ATTEST == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 55
     outputs:

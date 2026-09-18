@@ -15,12 +15,20 @@ name: Driver submission
 #      there authorizes exactly this CAB's SHA-256) and swaps the release
 #      asset for the signed CAB.
 #
-# When this workflow completes, driver-attest.yml takes over automatically:
-# it submits the EV-signed CAB to Microsoft via the Partner Center Hardware
-# API, polls, attaches the returned signed zip to the release, and runs the
-# verification in driver-attested.yml. From that point build.yml bundles the
-# attested driver into installers whenever the driver source hash still
-# matches. (Manual fallback: docs/driver-signing.md.)
+# When this workflow completes, driver-attest.yml can take over (opt-in via
+# the AUTO_ATTEST repository variable): it submits the EV-signed CAB to
+# Microsoft via the Partner Center Hardware API, polls, attaches the
+# returned signed zip to the release, and runs the verification in
+# driver-attested.yml. From that point build.yml bundles the attested driver
+# into installers whenever the driver source hash still matches. (Manual
+# fallback: docs/driver-signing.md.)
+#
+# Guard: nothing is built or submitted while a WHQL-CERTIFIED driver-v*
+# release (driver-certified.yml, manifest certified=true) already matches
+# the current driver source hash — installers bundle that package, and a
+# fresh attestation build would only be a lower-trust duplicate of the same
+# source. Merging a certified driver branch therefore triggers this
+# workflow but it exits at the first job. Pass force=true to build anyway.
 
 on:
   push:
@@ -35,6 +43,11 @@ on:
         description: "Override the driver build number (default: git commit count)"
         required: false
         default: ""
+      force:
+        description: "Build + submit even if a certified driver already matches this driver source"
+        type: boolean
+        required: false
+        default: false
 
 # A newer driver push obsoletes an in-flight submission build. Completed
 # stale prereleases are handled by the cleanup step instead. NB a cancelled
@@ -53,7 +66,53 @@ env:
   WDK_INSTALLER_URL: "https://go.microsoft.com/fwlink/?linkid=2272234"
 
 jobs:
+  # Is there already a WHQL-certified package for exactly this driver
+  # source? Then an attestation build is redundant (and would be a
+  # lower-trust duplicate that Get-AttestedDriver.ps1 ignores anyway).
+  # Computed on windows-2022 because hashFiles() is checkout-dependent
+  # (CRLF + NTFS order) and must equal what build.yml records.
+  certified-guard:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Look for a certified driver matching this driver source
+        id: check
+        shell: pwsh
+        env:
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          $hash = "${{ hashFiles('driver/**', 'include/**') }}"
+          Write-Host "Driver source hash: $hash"
+          $rels = gh api "repos/${{ github.repository }}/releases?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "gh api releases failed" }
+          $hit = $null
+          foreach ($r in @($rels | Where-Object { $_.tag_name -like "driver-v*" })) {
+              if (-not ($r.assets | Where-Object { $_.name -eq "manifest.json" })) { continue }
+              try {
+                  gh release download $r.tag_name --pattern manifest.json --output guard-manifest.json --clobber
+                  if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+                  $m = Get-Content guard-manifest.json -Raw | ConvertFrom-Json
+              } catch { continue }
+              if ($m.certified -and $m.source_hash -eq $hash) { $hit = $r.tag_name; break }
+          }
+          if ($hit -and $env:INPUT_FORCE -ne "true") {
+              Write-Host "##[notice]Certified driver $hit already matches driver source hash $hash - skipping the attestation build + submission. Installers bundle the certified package. (Dispatch with force=true to build anyway.)"
+              "proceed=false" >> $env:GITHUB_OUTPUT
+          } else {
+              if ($hit) { Write-Host "force=true: building although certified driver $hit matches this source." }
+              else { Write-Host "No certified driver matches this driver source - proceeding with the attestation build." }
+              "proceed=true" >> $env:GITHUB_OUTPUT
+          }
+
   build-cab:
+    needs: certified-guard
+    if: needs.certified-guard.outputs.proceed == 'true'
     # Pinned for the same reason as build.yml: windows-latest (Server 2025 +
     # VS2026/MSBuild 18) can't load WDK 26100's MSBuild-17 task DLLs.
     runs-on: windows-2022
@@ -363,7 +422,9 @@ jobs:
                       gh release download $r.tag_name --pattern manifest.json --output stale-manifest.json --clobber
                       if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
                       $man = Get-Content stale-manifest.json -Raw | ConvertFrom-Json
-                      # Keep attested releases (shipped driver history) AND
+                      # Keep attested AND certified releases (shipped driver
+                      # history; a certified build is older than any later
+                      # attestation build by construction) AND
                       # releases with an in-flight Partner Center submission
                       # (ms_* fields, written by driver-attest.yml) — deleting
                       # one of those would strand the reconciler mid-run and
@@ -375,7 +436,7 @@ jobs:
                       # risk — and fails that run cleanly.)
                       $inflight = ($man.PSObject.Properties.Name -contains "ms_submission_id") -and
                                   $man.ms_submission_id -and ($man.ms_state -ne "failed")
-                      $keep = [bool]$man.attested -or $inflight
+                      $keep = [bool]$man.attested -or [bool]$man.certified -or $inflight
                   } catch { }
               }
               if ($keep) { continue }
@@ -389,7 +450,8 @@ jobs:
   # so the request-signing environment must allow main in its deployment
   # branches policy (see docs/driver-signing.md, one-time setup).
   sign-cab:
-    needs: build-cab
+    needs: [certified-guard, build-cab]
+    if: needs.certified-guard.outputs.proceed == 'true'
     runs-on: windows-latest
     environment: request-signing
     timeout-minutes: 150

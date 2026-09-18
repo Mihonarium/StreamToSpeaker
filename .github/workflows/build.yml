@@ -427,17 +427,19 @@ jobs:
       # -----------------------------------------------------------------
       # Production-driver installer preview (PRs / main pushes / dispatch).
       #
-      # If a driver-v* release carries a Microsoft-attested driver whose
-      # manifest source_hash matches the CURRENT driver source, build a
-      # second installer that bundles the attested driver package instead of
-      # the test-signed one — and ships NO test certificate, which makes the
+      # If a driver-v* release carries a Microsoft-signed driver (WHQL-
+      # certified preferred, else attestation-signed) whose manifest
+      # source_hash matches the CURRENT driver source, build a second
+      # installer that bundles that driver package instead of the
+      # test-signed one — and ships NO test certificate, which makes the
       # .iss skip the cert-import steps entirely (they're gated on the .cer
       # existing). This runs on service-only commits too; that's the point:
-      # the driver source is unchanged, so the attested binaries stay valid.
-      # Tag pushes skip this — the `package` job builds the release
-      # installer (with the EV-signed service exe) instead.
+      # the driver source is unchanged, so the signed binaries stay valid.
+      # The artifact suffix names the kind (-certified / -attested). Tag
+      # pushes skip this — the `package` job builds the release installer
+      # (with the EV-signed service exe) instead.
       # -----------------------------------------------------------------
-      - name: Fetch attested driver (if one matches the driver source)
+      - name: Fetch Microsoft-signed driver (if one matches the driver source)
         id: attested
         # Every non-tag build: PRs included, so a service-only PR yields an
         # installer with the production driver that reviewers can run
@@ -458,14 +460,15 @@ jobs:
               Copy-Item "attested-driver\$name" "$staging\$name" -Force
           }
           Remove-Item "$staging\StreamToSpeaker.cer" -ErrorAction SilentlyContinue
+          $kind = "${{ steps.attested.outputs.kind }}"
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           & $iscc `
             "/DAppVersion=${{ steps.ver.outputs.version }}" `
             "/DVersionInfoVersion=${{ steps.ver.outputs.viversion }}" `
-            "/FStreamToSpeakerSetup-${{ steps.ver.outputs.version }}-attested" `
+            "/FStreamToSpeakerSetup-${{ steps.ver.outputs.version }}-$kind" `
             "installer\StreamToSpeaker.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
-          Write-Host "Attested-driver installer built (driver ${{ steps.attested.outputs.version }} from ${{ steps.attested.outputs.tag }})"
+          Write-Host "Production-driver installer built: Microsoft-signed ($kind) driver ${{ steps.attested.outputs.version }} from ${{ steps.attested.outputs.tag }}"
 
       # Compute SHA256 of every shipped artifact so users can verify
       # downloads. Hashes go three places:
@@ -669,8 +672,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
 
   # Build the RELEASE installer: EV-signed service exe + the
-  # Microsoft-attested driver package when one matches this tag's driver
-  # source (then no test cert is shipped and the .iss skips cert import).
+  # Microsoft-signed driver package (WHQL-certified preferred over
+  # attestation-signed) when one matches this tag's driver source (then no
+  # test cert is shipped and the .iss skips cert import).
   # Falls back to the test-signed driver + cert — clearly labelled
   # `-testsigned` — when no attested driver matches, so releases still work
   # before the first attestation round-trip.
@@ -695,7 +699,7 @@ jobs:
         shell: pwsh
         run: choco install innosetup --no-progress -y
 
-      - name: Fetch attested driver (if one matches the driver source)
+      - name: Fetch Microsoft-signed driver (if one matches the driver source)
         id: attested
         shell: pwsh
         run: |
@@ -733,13 +737,13 @@ jobs:
                   Copy-Item "attested-driver\$name" "$staging\$name" -Force
               }
               Copy-Item "$dc\devcon.exe" "$staging\devcon.exe" -Force
-              Write-Host "Bundling Microsoft-attested driver ${{ steps.attested.outputs.version }} (${{ steps.attested.outputs.tag }}); no test certificate shipped."
+              Write-Host "Bundling Microsoft-signed (${{ steps.attested.outputs.kind }}) driver ${{ steps.attested.outputs.version }} (${{ steps.attested.outputs.tag }}); no test certificate shipped."
           } else {
               foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "StreamToSpeaker.cer", "devcon.exe") {
                   Copy-Item "$dc\$name" "$staging\$name" -Force
               }
               $suffix = "-testsigned"
-              Write-Host "##[warning]No Microsoft-attested driver matches this tag's driver source - shipping the TEST-SIGNED driver (users need testsigning mode). Run the driver submission + attestation flow (docs/driver-signing.md), then tag again."
+              Write-Host "##[warning]No Microsoft-signed driver matches this tag's driver source - shipping the TEST-SIGNED driver (users need testsigning mode). Run an HLK round (Driver certified) or the driver submission + attestation flow (docs/driver-signing.md), then tag again."
           }
 
           $base = "StreamToSpeakerSetup-${{ needs.build.outputs.version }}$suffix"
@@ -775,7 +779,7 @@ jobs:
             "| | |"
             "| --- | --- |"
             "| Installer | ``${{ steps.iscc.outputs.name }}`` (pre-signing sha256 ``$sha``) |"
-            "| Driver | $( if ("${{ steps.attested.outputs.found }}" -eq "true") { "Microsoft-attested ``${{ steps.attested.outputs.version }}`` (``${{ steps.attested.outputs.tag }}``)" } else { "**test-signed fallback** - requires testsigning mode" } ) |"
+            "| Driver | $( if ("${{ steps.attested.outputs.found }}" -eq "true") { "Microsoft-signed (${{ steps.attested.outputs.kind }}) ``${{ steps.attested.outputs.version }}`` (``${{ steps.attested.outputs.tag }}``)" } else { "**test-signed fallback** - requires testsigning mode" } ) |"
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
   # EV-sign the final setup exe and swap it into the release. Its .sha256

@@ -18,10 +18,16 @@ Partner Center routes:
   that's fine), it does **not** load on Windows Server ≥ 2016, and Microsoft
   frames it as "not Windows Certified" (no compatibility assurances). This
   is what our pipeline automates.
-- **WHQL / HLK** — full hardware-lab testing, works everywhere including
-  Server, and is Microsoft's blessed retail path. Big effort; a possible
-  future upgrade, orthogonal to everything below (only the "what we submit"
-  step changes).
+- **WHQL / HLK** — full hardware-lab testing (the HLK playlist on a lab
+  client, an `.hlkx` package signed with the EV cert, submitted by hand),
+  Microsoft's blessed retail path and the one the Microsoft Store expects
+  (policy 10.2.4). **This is what ships since driver 1.1.0.209** — see
+  Flow D. The lab run itself is not automated; everything after
+  Microsoft returns the signed package is (`driver-certified.yml`).
+  Certification is **per binary**: any change under `driver/` or
+  `include/` needs a new HLK run before installers can bundle a
+  certified driver again (they fall back to attestation, then to
+  test-signed).
 
 Facts the pipeline design leans on (from the attestation docs, verified
 2026-08): the submission is a **CAB** containing the driver package in a
@@ -67,10 +73,33 @@ driver/​** or include/​** change on main
 
 The pairing rule everywhere: a driver-v release records
 `source_hash = hashFiles('driver/**', 'include/**')` at submission time,
-and installer builds only bundle an attested driver whose `source_hash`
-equals the driver-source hash of the commit being built. Driver changed
-since the last attestation → installers fall back (preview: skipped;
-release: `-testsigned` suffix + warning) until you run the loop again.
+and installer builds only bundle a Microsoft-signed driver whose
+`source_hash` equals the driver-source hash of the commit being built.
+Driver changed since the last signing round → installers fall back
+(preview: skipped; release: `-testsigned` suffix + warning) until you run
+the loop again.
+
+**Selection order** (`.github/scripts/Get-AttestedDriver.ps1`, used by
+`build.yml` previews and the tagged `package` job): among matching
+releases, a manifest with `certified: true` (WHQL, Flow D) always beats
+`attested: true` — even with a lower `driver_build` — and within one kind
+the highest build wins. The artifact/summary names the kind
+(`-certified` / `-attested`). Two guards keep the attestation machinery
+from overriding a certified driver: `Driver submission` starts with a
+`certified-guard` job that exits (green, with a notice) when a certified
+release already matches the current source hash (dispatch with
+`force=true` to override), and `Driver attest`'s automatic hand-off is
+**opt-in** via the repository variable `AUTO_ATTEST=true` (otherwise the
+`workflow_run` trigger only logs why it did nothing; manual dispatch
+always runs).
+
+`hashFiles()` is checkout-dependent: on the windows-2022 runners it sees
+CRLF-converted text files (`core.autocrlf=true`) in NTFS directory order.
+`python3 .github/scripts/certified.py hash` reproduces that value from a
+Linux checkout (validated against the `driver-v1.1.0.204` manifest), so
+you can predict whether a branch will pair with a release before pushing.
+Anything that computes the hash for a manifest must run on windows-2022,
+like `build.yml` does.
 
 ## One-time setup
 
@@ -199,11 +228,63 @@ create-if-missing release). Re-running `package` after `sign-release` has
 finished overwrites the signed setup exe with an unsigned rebuild — re-run
 `sign-release` afterwards.
 
+## Flow D — WHQL certification (HLK run by hand, the rest automated)
+
+Used for driver **1.1.0.209** (product `14599256519720956`, submission
+`1152921505701928485`, report `95342530`, `WINDOWS_v100_X64_25H2_FULL`),
+release `driver-v1.1.0.209`.
+
+1. **Lab.** Build the driver (`SignMode=TestSign` is fine — Microsoft
+   replaces nothing but adds its own signatures), run the WHCP playlist
+   on an HLK client, package the results in HLK Studio and sign the
+   `.hlkx` with the EV cert. Keep the exact INF/SYS/CAT the client ran
+   (`sts-driver-209.zip` for 209): it is the reference the workflow
+   compares Microsoft's return against.
+2. **Submit by hand** at Partner Center (Hardware → Submit new hardware →
+   upload the `.hlkx`, tick the offered OS, no test-signing options). Note
+   the product id and submission id from the URL.
+3. **Prepare the release**: create `driver-v<ver>` (prerelease) targeting
+   the commit whose `driver/**` + `include/**` tree is what the lab
+   tested, and attach the lab package as
+   `StreamToSpeaker-Driver-<ver>-lab-testsigned.zip`.
+4. **Run `Driver certified`** (Actions → Run workflow) **from that
+   commit's branch** with `version`, `product_id`, `submission_id`,
+   `report_id`. It polls the Hardware API until the submission is
+   `completed` with a `signedPackage`, downloads it, and verifies:
+   - INF byte-identical to the lab package and carrying DriverVer `<ver>`;
+   - `.sys` code identical to the lab `.sys` after stripping the
+     Authenticode certificate table (what `signtool remove /s` does) —
+     Microsoft *adds* a nested signature, the lab test signature stays
+     primary, so `driver-attested.yml`'s "primary signer must be
+     Microsoft" check would reject a correct HLK return;
+   - `signtool verify /kp /v /c` against the re-issued catalog (this is
+     what the kernel relies on), and a *Microsoft Windows Hardware
+     Compatibility Publisher* signature on the `.sys` at any index of
+     `signtool verify /all`.
+   Then it publishes `StreamToSpeaker-Driver-<ver>-Microsoft.zip` (as
+   returned), the canonical flat `…-Signed.zip`, and `manifest.json` with
+   `certified: true`, `certification: {product_id, submission_id, os,
+   report_id}`, `source_hash` computed on the windows-2022 runner, and
+   the same field set the attestation manifests have (`attested: false`,
+   `ms_state: done`, no submission CAB).
+   Already have the zip from the dashboard? Attach it to the release and
+   pass its name as `ms_zip_asset` — the API step is skipped and no Azure
+   secrets are needed.
+5. Merge the driver branch. `Driver submission` fires on the `driver/**`
+   push and its `certified-guard` stops it; `build.yml` bundles the
+   certified package into every installer whose driver tree still hashes
+   to the manifest's `source_hash`.
+
+The script behind it is `.github/scripts/certified.py` (`hash`, `fetch`,
+`verify`, `release`; unit tests in `test_certified.py`, run in the
+workflow's guard step). `release` is idempotent and can be run locally
+with `gh` to (re)publish a release from hand-downloaded files.
+
 ## What is and isn't signed
 
 | Artifact | Signature | Why |
 | --- | --- | --- |
-| `StreamToSpeaker.sys` / `.cat` (release) | Microsoft (attestation) | Only signature Windows accepts for kernel code |
+| `StreamToSpeaker.sys` / `.cat` (release) | Microsoft (WHQL certification; attestation as fallback) | Only signature Windows accepts for kernel code |
 | Submission CAB | Certum EV | Partner Center requirement |
 | `stream-to-speaker.exe` | Certum EV | AV/firewall-prompt trust for the binary that actually runs |
 | `StreamToSpeakerSetup-<ver>.exe` | Certum EV | SmartScreen reputation on the download |
@@ -224,10 +305,26 @@ finished overwrites the signed setup exe with an unsigned rebuild — re-run
   that submission (version mixup) or was repacked; re-download from Partner
   Center and attach as-is.
 - **Release says `-testsigned` unexpectedly** — the driver source changed
-  after the last attestation (any edit under `driver/` or `include/`
-  changes the hash). Compare the manifest's `source_hash` on the newest
-  attested `driver-v*` release with the `Compute driver source hash` output
-  in the failing run.
+  after the last signing round (any edit under `driver/` or `include/`
+  changes the hash — a comment counts). Compare the manifest's
+  `source_hash` on the newest certified/attested `driver-v*` release with
+  the `Compute driver source hash` output in the failing run, or run
+  `python3 .github/scripts/certified.py hash` locally.
+- **Installer bundles an attested build although a certified one exists** —
+  their `source_hash` differs: the certified manifest pairs only with the
+  exact tree the lab tested. Either restore that tree or run a new HLK
+  round.
+- **`Driver certified` fails the signtool step on index 0** — expected
+  noise: the primary signature is the lab test cert (untrusted on the
+  runner); the step only requires the Microsoft signature at some index
+  plus a passing catalog verification. If the catalog check fails, the
+  zip is not the return for that lab package.
+- **`Driver submission` skipped everything** — its `certified-guard` found
+  a certified release for the current source hash (by design); dispatch
+  with `force=true` if you really want an attestation build too.
+- **`Driver attest` did nothing after `Driver submission`** — automatic
+  attestation is opt-in (`AUTO_ATTEST` repository variable); run it
+  manually.
 - **Signing run never appeared / wrong digest** — the composite action
   polls 5 min for a run whose title contains the digest, then waits for
   approval; see `.github/actions/request-signing/action.yml`.
@@ -257,6 +354,7 @@ works end to end:
 
 ## Future work
 
-- **WHQL/HLK** for Windows Server support + "Windows Certified" status.
+- **Automate the HLK lab run** (controller + client VMs exist — see the
+  Hetzner lab notes) so Flow D's steps 1-3 stop being manual.
 - **Uninstaller signing** via an ISCC SignTool shim that blocks on the
   signing repo (adds one more approval per release).
