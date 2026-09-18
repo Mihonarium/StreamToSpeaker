@@ -8,12 +8,25 @@ import repro_compare as rc
 import test_certified
 
 
+def rich_block(entries, key=0x1234ABCD):
+    """A Rich header: DanS ^ key, 3 x key, (comp.id ^ key, count ^ key)..., Rich, key."""
+    out = struct.pack("<IIII", 0x536E6144 ^ key, key, key, key)
+    for product, build, count in entries:
+        out += struct.pack("<II", ((product << 16) | build) ^ key, count ^ key)
+    return out + b"Rich" + struct.pack("<I", key)
+
+
 def make_pe(code=b"CODE" * 64, pdb_path=b"C:\\src\\driver.pdb", timestamp=0x1000, checksum=0x2000,
-            guid=b"\x11" * 16, age=1):
+            guid=b"\x11" * 16, age=1, rich=None, stub_pad=0):
     """PE32+ with one section holding a CodeView debug entry, so the
-    normalisation has something to mask."""
-    e_lfanew = 0x40
-    dos = bytearray(b"MZ" + b"\0" * (e_lfanew - 2))
+    normalisation has something to mask. `rich` = [(product, build, count)]
+    entries placed at 0x40; `stub_pad` shifts e_lfanew (different linkers
+    pad the DOS stub differently)."""
+    dos = bytearray(b"MZ" + b"\0" * 0x3E)
+    if rich:
+        dos += rich_block(rich)
+    dos += b"\0" * stub_pad
+    e_lfanew = len(dos)
     struct.pack_into("<I", dos, 0x3C, e_lfanew)
     sec_va, sec_raw = 0x1000, 0x400
     cv = b"RSDS" + guid + struct.pack("<I", age) + pdb_path + b"\0"
@@ -68,6 +81,20 @@ class SysCompare(unittest.TestCase):
         self.assertEqual(r["region"], ".rdata")
         cv_len = 4 + 16 + 4 + len(b"C:\\src\\driver.pdb") + 1
         self.assertEqual(r["offset"], 0x400 + 28 + cv_len + 10)
+
+    def test_header_shift_and_rich_header_are_structural(self):
+        a = make_pe(rich=[(261, 35229, 8), (258, 35229, 1)])
+        b = make_pe(rich=[(261, 35228, 8), (258, 35228, 1)], stub_pad=8)
+        rep = rc.compare_sys(self.path("a", a), self.path("b", b))
+        self.assertFalse(rep["raw_identical"])
+        self.assertTrue(rep["normalised_identical"])
+        self.assertFalse(rep["toolset_identical"])
+        self.assertEqual(rep["e_lfanew"], {"released": 0x40 + 16 + 16 + 8, "fresh": 0x40 + 16 + 16 + 8 + 8})
+        self.assertEqual(rep["released"]["rich"]["entries"][0], {"product_id": 261, "build": 35229, "count": 8})
+        same = make_pe(rich=[(261, 35229, 8), (258, 35229, 1)])
+        rep = rc.compare_sys(self.path("c", a), self.path("d", same))
+        self.assertTrue(rep["toolset_identical"])
+        self.assertTrue(rep["raw_identical"])
 
     def test_signature_is_stripped_before_comparing(self):
         plain = make_pe()

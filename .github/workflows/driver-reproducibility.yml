@@ -10,14 +10,17 @@
 #   * StreamToSpeaker.sys: Authenticode signature removed from the released
 #     copy, then raw SHA-256, then a normalised comparison that masks the PE
 #     fields known to vary between builds (COFF TimeDateStamp, PE CheckSum,
-#     debug-directory timestamps and the PDB GUID/age/path). Anything else
-#     that differs is listed by offset/size/section;
+#     debug-directory timestamps and the PDB GUID/age/path) and compares the
+#     header block and every section from their own offsets. Anything else
+#     that differs is listed by offset/size/section. The Rich header's
+#     compiler/linker/library build ids are compared separately
+#     (`toolset_identical`) and only warn;
 #   * StreamToSpeaker.inf: compared with the DriverVer date masked (stampinf
 #     writes the build date);
 #   * the .cat is signed and re-issued by Microsoft — not compared.
 #
-# The job fails only when the normalised comparison differs. `raw_identical`
-# and `normalised_identical` are exposed as job outputs. Comparison logic:
+# The job fails only when the normalised comparison differs. `raw_identical`,
+# `normalised_identical` and `toolset_identical` are exposed as job outputs. Comparison logic:
 # .github/scripts/repro_compare.py.
 name: Driver reproducibility
 
@@ -68,6 +71,7 @@ jobs:
     outputs:
       raw_identical: ${{ steps.cmp_sys.outputs.raw_identical }}
       normalised_identical: ${{ steps.verdict.outputs.normalised_identical }}
+      toolset_identical: ${{ steps.cmp_sys.outputs.toolset_identical }}
 
     steps:
       - name: Resolve parameters
@@ -339,6 +343,7 @@ jobs:
           TAG: ${{ steps.params.outputs.tag }}
           SYS_RAW: ${{ steps.cmp_sys.outputs.raw_identical }}
           SYS_NORM: ${{ steps.cmp_sys.outputs.normalised_identical }}
+          SYS_TOOLSET: ${{ steps.cmp_sys.outputs.toolset_identical }}
           INF_RAW: ${{ steps.cmp_inf.outputs.raw_identical }}
           INF_NORM: ${{ steps.cmp_inf.outputs.normalised_identical }}
           SYS_OUTCOME: ${{ steps.cmp_sys.outcome }}
@@ -355,6 +360,11 @@ jobs:
           $s += "| StreamToSpeaker.inf (DriverVer date masked) | $env:INF_RAW | $env:INF_NORM |"
           $s += "| streamtospeaker.cat | not compared (signed, re-issued by Microsoft) | |"
           $s += ""
+          $s += "Same toolset (Rich header compiler/linker/library build ids): $env:SYS_TOOLSET"
+          $s += ""
+          if ($env:SYS_TOOLSET -ne 'true') {
+              Write-Host "::warning::the released .sys was linked by a different compiler/linker/WDK build than this runner has (see the Rich header rows in the summary); code compared regardless"
+          }
           if (Test-Path compare-sys.json) {
               $r = Get-Content compare-sys.json -Raw | ConvertFrom-Json
               $s += "### StreamToSpeaker.sys"
@@ -418,7 +428,9 @@ jobs:
         env:
           OK: ${{ steps.verdict.outputs.normalised_identical }}
           SYS_RAW: ${{ steps.cmp_sys.outputs.raw_identical }}
+          SYS_TOOLSET: ${{ steps.cmp_sys.outputs.toolset_identical }}
         run: |
           if ($env:OK -ne 'true') { throw "the rebuilt driver differs from the released package beyond the masked fields (see summary)" }
           if ($env:SYS_RAW -eq 'true') { Write-Host "Byte-for-byte reproducible." }
-          else { Write-Host "Reproducible up to timestamps / checksum / PDB identity." }
+          elseif ($env:SYS_TOOLSET -eq 'true') { Write-Host "Reproducible up to timestamps / checksum / PDB identity." }
+          else { Write-Host "Code and data reproducible; headers differ only in timestamps / checksum / PDB identity / toolset build ids." }
