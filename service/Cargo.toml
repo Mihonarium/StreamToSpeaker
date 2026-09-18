@@ -6,8 +6,11 @@ edition = "2021"
 # 2024) needs 1.88, and CI's `msrv` job checks both targets on exactly this
 # toolchain so the number can't silently drift again.
 rust-version = "1.88"
-description = "Stream To Speaker — user-mode bridge between a Windows virtual audio driver (or WASAPI loopback) and any UPnP/OpenHome network speaker (Sonos, IKEA StreamToSpeaker, etc)."
-license = "MIT"
+description = "Stream To Speaker — streams Windows audio from a virtual audio device (or WASAPI loopback) to UPnP/OpenHome speakers (Sonos, IKEA SYMFONISK, KEF, Denon HEOS…) and AirPlay receivers (HomePod, Apple TV, AirPort Express)."
+# Source is MPL-2.0 (see ../LICENSE). Released, signed binaries are under
+# separate terms (../LICENSE-BINARIES.md) — this field describes the source.
+license = "MPL-2.0"
+repository = "https://github.com/Mihonarium/StreamToSpeaker"
 
 [lib]
 # Internal Rust crate name retained for code stability — the user-facing
