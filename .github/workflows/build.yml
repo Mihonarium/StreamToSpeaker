@@ -382,12 +382,16 @@ jobs:
       # shares the artifacts just built. The second command runs the one
       # `#[ignore]`d test: a live WinHTTP round-trip to the GitHub releases
       # API — the update check's transport, which can only be exercised on
-      # a Windows host with network.
+      # a Windows host with network. It authenticates with the job token
+      # (shared runner IPs exhaust the anonymous 60/h quota; this once
+      # failed a main build with "API rate limit exceeded") and treats a
+      # rate-limit answer as a skip, so it can't block a release build.
       - name: Test service (unit tests + live update-check fetch)
         shell: pwsh
         working-directory: service
         env:
           STS_RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && steps.ver.outputs.version || '' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           cargo test --release
           if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
