@@ -16,18 +16,23 @@ known to vary between otherwise identical builds masked out:
   * every IMAGE_DEBUG_DIRECTORY entry's TimeDateStamp, and the payload of
     the CodeView (RSDS: PDB GUID, age, path) and REPRO entries
 
-Everything else — code, data, relocations, imports, the Rich header (which
-records the compiler/linker build numbers) — must match. The report lists
-every differing byte range with the section it falls in, and decodes both
-files' headers (linker version, timestamps, PDB, Rich header) so a toolset
-mismatch is visible at a glance.
+The comparison is structural rather than positional: the PE header block
+(COFF + optional header + section table) is compared from each file's own
+e_lfanew (linkers pad the DOS stub differently), then every section's raw
+bytes. Everything else — code, data, relocations, imports — must match.
+The Rich header (the linker's record of which compiler/linker/library
+build numbers produced each object) is decoded and compared separately as
+`toolset_identical`; it is metadata, not image content, so it does not
+affect `normalised_identical` but a mismatch is reported loudly. The report
+lists every differing byte range with the section it falls in, and decodes
+both files' headers (linker version, timestamps, PDB, Rich header).
 
 `inf` compares the two INFs with the DriverVer *date* masked (stampinf
 writes the build date); the version part must still match.
 
 Exit status is 0 when the normalised comparison matches, 1 otherwise.
-When GITHUB_OUTPUT is set, `raw_identical` and `normalised_identical`
-(true/false) are appended to it.
+When GITHUB_OUTPUT is set, `raw_identical`, `normalised_identical` and
+`toolset_identical` (true/false) are appended to it.
 """
 import argparse
 import hashlib
@@ -172,6 +177,7 @@ class PE:
 def masked_ranges(pe):
     """(offset, size, label) ranges that legitimately vary between builds."""
     ranges = [
+        (0x3C, 4, "DOS e_lfanew"),  # header block is compared from each file's own offset
         (pe.e_lfanew + 8, 4, "COFF TimeDateStamp"),
         (pe.checksum_off, 4, "OptionalHeader CheckSum"),
     ]
@@ -188,6 +194,23 @@ def normalise(data):
     for off, size, _ in masked_ranges(pe):
         out[off:off + size] = b"\0" * size
     return bytes(out)
+
+
+def structure(pe, total_len):
+    """Split an image into the pieces compared structurally: DOS stub up to
+    the Rich header, PE header block, each section's raw bytes, and whatever
+    follows the last section. Absolute (offset_start, offset_end) ranges,
+    taken from the unmasked parse so masking can't disturb them."""
+    rich = pe.rich_header()
+    stub_end = rich["offset"] if rich else pe.e_lfanew
+    parts = [("DOS stub", 0, stub_end),
+             ("PE header block", pe.e_lfanew, pe.sec_tab_end)]
+    last = pe.sec_tab_end
+    for sec in pe.sections:
+        parts.append((sec["name"], sec["raw"], sec["raw"] + sec["rawsize"]))
+        last = max(last, sec["raw"] + sec["rawsize"])
+    parts.append(("overlay", last, total_len))
+    return parts
 
 
 def diff_regions(a, b, limit=200):
@@ -242,13 +265,29 @@ def compare_sys(released_path, fresh_path):
 
     norm_r, norm_f = normalise(released), normalise(fresh)
     report["masked"] = [{"offset": o, "size": s, "what": w} for o, s, w in masked_ranges(pe_r)]
-    normalised_identical = norm_r == norm_f
-    report["normalised_identical"] = normalised_identical
 
+    rich_r, rich_f = pe_r.rich_header(), pe_f.rich_header()
+    report["toolset_identical"] = (rich_r["entries"] if rich_r else None) == (rich_f["entries"] if rich_f else None)
+
+    # Structural comparison: piece by piece, each from its own offset, so an
+    # e_lfanew shift (different DOS-stub padding) doesn't smear the whole
+    # header as "different" and the Rich header is left out.
+    parts_r = structure(pe_r, len(norm_r))
+    parts_f = structure(pe_f, len(norm_f))
     regions = []
-    if not normalised_identical:
+    same_layout = [p[0] for p in parts_r] == [p[0] for p in parts_f]
+    if same_layout:
+        for (name, r0, r1), (_, f0, f1) in zip(parts_r, parts_f):
+            for off, size in diff_regions(norm_r[r0:r1], norm_f[f0:f1]):
+                regions.append({"offset": r0 + off, "size": size,
+                                "region": name if name != "PE header block" else pe_r.region_of(r0 + off)})
+    else:
+        # Different section list: fall back to a plain byte diff.
         for off, size in diff_regions(norm_r, norm_f):
             regions.append({"offset": off, "size": size, "region": pe_r.region_of(off)})
+    report["same_layout"] = same_layout
+    report["e_lfanew"] = {"released": pe_r.e_lfanew, "fresh": pe_f.e_lfanew}
+    report["normalised_identical"] = same_layout and not regions
     report["differing_regions"] = regions
     return report
 
@@ -280,7 +319,12 @@ def print_sys_report(rep):
     side("fresh   ", rep["fresh"])
     print(f"  raw identical        : {rep['raw_identical']}")
     print(f"  normalised identical : {rep['normalised_identical']}  "
-          f"(masked: {'; '.join(m['what'] for m in rep['masked'])})")
+          f"(masked: {'; '.join(m['what'] for m in rep['masked'])}; "
+          f"e_lfanew {rep['e_lfanew']['released']:#x} vs {rep['e_lfanew']['fresh']:#x})")
+    print(f"  toolset identical    : {rep['toolset_identical']}  (Rich header build ids)")
+    if not rep["toolset_identical"]:
+        print("    the two images were produced by different compiler/linker/library builds; "
+              "code is compared regardless")
     if rep["differing_regions"]:
         print("  differing regions after masking (offset, size, region):")
         for r in rep["differing_regions"]:
@@ -354,7 +398,8 @@ def main(argv=None):
     if a.json:
         with open(a.json, "w", encoding="utf-8") as fh:
             json.dump(rep, fh, indent=2)
-    gh_output(raw_identical=rep["raw_identical"], normalised_identical=rep["normalised_identical"])
+    gh_output(raw_identical=rep["raw_identical"], normalised_identical=rep["normalised_identical"],
+              toolset_identical=rep.get("toolset_identical", True))
     return 0 if rep["normalised_identical"] else 1
 
 
