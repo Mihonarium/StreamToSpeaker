@@ -22,6 +22,12 @@
 name: Driver reproducibility
 
 on:
+  # Pushes that touch the check itself re-run it with the defaults below.
+  push:
+    paths:
+      - ".github/workflows/driver-reproducibility.yml"
+      - ".github/scripts/repro_compare.py"
+      - ".github/scripts/certified.py"
   workflow_dispatch:
     inputs:
       tag:
@@ -64,6 +70,22 @@ jobs:
       normalised_identical: ${{ steps.verdict.outputs.normalised_identical }}
 
     steps:
+      - name: Resolve parameters
+        id: params
+        shell: pwsh
+        env:
+          IN_TAG: ${{ inputs.tag }}
+          IN_BUILD: ${{ inputs.build_number }}
+          IN_ROOT: ${{ inputs.build_root }}
+        run: |
+          $tag = if ($env:IN_TAG) { $env:IN_TAG } else { "driver-v1.1.0.209" }
+          $build = if ($env:IN_BUILD) { $env:IN_BUILD } else { "209" }
+          $root = if ($env:IN_ROOT) { $env:IN_ROOT } else { 'C:\build\src' }
+          Write-Host "tag=$tag build_number=$build build_root=$root"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "build_number=$build" >> $env:GITHUB_OUTPUT
+          "build_root=$root" >> $env:GITHUB_OUTPUT
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.commit || github.sha }}
@@ -81,8 +103,8 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-          BUILD_NUMBER: ${{ inputs.build_number }}
+          TAG: ${{ steps.params.outputs.tag }}
+          BUILD_NUMBER: ${{ steps.params.outputs.build_number }}
           SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -192,7 +214,7 @@ jobs:
         if: inputs.stamp_driver_h
         shell: pwsh
         env:
-          BUILD_NUMBER: ${{ inputs.build_number }}
+          BUILD_NUMBER: ${{ steps.params.outputs.build_number }}
         run: |
           $path = "driver/driver.h"
           $content = Get-Content $path -Raw
@@ -204,8 +226,8 @@ jobs:
         id: build
         shell: pwsh
         env:
-          BUILD_ROOT: ${{ inputs.build_root }}
-          BUILD_NUMBER: ${{ inputs.build_number }}
+          BUILD_ROOT: ${{ steps.params.outputs.build_root }}
+          BUILD_NUMBER: ${{ steps.params.outputs.build_number }}
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -314,7 +336,7 @@ jobs:
         id: verdict
         shell: pwsh
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ steps.params.outputs.tag }}
           SYS_RAW: ${{ steps.cmp_sys.outputs.raw_identical }}
           SYS_NORM: ${{ steps.cmp_sys.outputs.normalised_identical }}
           INF_RAW: ${{ steps.cmp_inf.outputs.raw_identical }}
@@ -380,7 +402,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: driver-reproducibility-${{ inputs.tag }}
+          name: driver-reproducibility-${{ steps.params.outputs.tag }}
           path: |
             fresh/
             released/stripped/
