@@ -136,7 +136,16 @@ pub fn user_agent() -> String {
 /// One synchronous round-trip to GitHub. Blocks for up to the WinHTTP
 /// timeouts (~10-15 s); call it off the UI thread.
 pub fn fetch_latest_release() -> Result<ReleaseInfo> {
-    let (status, body) = http_get(API_HOST, API_PATH, &user_agent())?;
+    fetch_latest_release_with(None)
+}
+
+/// `fetch_latest_release` with an optional GitHub token (`Authorization:
+/// Bearer`). The app never passes one — the privacy story above depends
+/// on the request carrying nothing but a User-Agent — but CI's live test
+/// runs from shared runner IPs whose anonymous quota (60/h per IP) is
+/// routinely exhausted, so it authenticates with the job's GITHUB_TOKEN.
+pub fn fetch_latest_release_with(token: Option<&str>) -> Result<ReleaseInfo> {
+    let (status, body) = http_get(API_HOST, API_PATH, &user_agent(), token)?;
     match status {
         200 => parse_latest_release(&body),
         404 => bail!("no release has been published yet"),
@@ -155,7 +164,7 @@ fn api_message(body: &str) -> String {
 
 /// HTTPS GET → (status, body). Windows-only by design (see module docs).
 #[cfg(windows)]
-fn http_get(host: &str, path: &str, user_agent: &str) -> Result<(u16, String)> {
+fn http_get(host: &str, path: &str, user_agent: &str, token: Option<&str>) -> Result<(u16, String)> {
     use std::ffi::c_void;
     use windows::core::PCWSTR;
     use windows::Win32::Networking::WinHttp::*;
@@ -218,7 +227,11 @@ fn http_get(host: &str, path: &str, user_agent: &str) -> Result<(u16, String)> {
             return Err(last_error("WinHttpOpenRequest"));
         }
 
-        let headers = wide("Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n");
+        let mut header_text = String::from("Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n");
+        if let Some(t) = token.filter(|t| !t.is_empty()) {
+            header_text.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        let headers = wide(&header_text);
         // Length excludes the terminator (the binding passes the slice length).
         WinHttpAddRequestHeaders(req.0, &headers[..headers.len() - 1], WINHTTP_ADDREQ_FLAG_ADD)
             .context("WinHttpAddRequestHeaders")?;
@@ -262,7 +275,7 @@ fn http_get(host: &str, path: &str, user_agent: &str) -> Result<(u16, String)> {
 }
 
 #[cfg(not(windows))]
-fn http_get(_host: &str, _path: &str, _user_agent: &str) -> Result<(u16, String)> {
+fn http_get(_host: &str, _path: &str, _user_agent: &str, _token: Option<&str>) -> Result<(u16, String)> {
     bail!("update checks are only implemented on Windows (WinHTTP)")
 }
 
@@ -361,10 +374,23 @@ mod tests {
 
     /// Live round-trip through WinHTTP to GitHub. Ignored by default (needs
     /// Windows + network): `cargo test -- --ignored live_github_fetch`.
+    /// Authenticates with `GITHUB_TOKEN` when set (CI passes the job token:
+    /// the anonymous per-IP quota on shared runners is often exhausted),
+    /// and a rate-limit answer is reported as a skip rather than a failure
+    /// — it says nothing about our code and must never block a release
+    /// build. Every other error still fails the test.
     #[test]
     #[ignore]
     fn live_github_fetch() {
-        let r = fetch_latest_release().expect("fetch latest release");
+        let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+        let r = match fetch_latest_release_with(token.as_deref()) {
+            Ok(r) => r,
+            Err(e) if e.to_string().contains("rate limit") => {
+                eprintln!("::notice::live_github_fetch skipped: {e} (token present: {})", token.is_some());
+                return;
+            }
+            Err(e) => panic!("fetch latest release: {e:#}"),
+        };
         assert!(r.tag.starts_with('v'));
         assert!(r.url.starts_with("https://github.com/"));
     }
