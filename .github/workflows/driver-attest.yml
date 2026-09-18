@@ -83,7 +83,12 @@ jobs:
     needs: reconcile
     if: needs.reconcile.outputs.verify_tag != ''
     uses: ./.github/workflows/driver-attested.yml
+    # A caller must grant every permission the reusable workflow declares
+    # (driver-attested.yml requests id-token + attestations for the
+    # build-provenance step), or GitHub rejects the workflow at push time.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     with:
       tag: ${{ needs.reconcile.outputs.verify_tag }}
