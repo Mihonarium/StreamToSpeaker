@@ -49,12 +49,16 @@ if ($matched -eq 0) {
 Write-Host "3/3  Wiping cached MMDevices endpoint entries..." -ForegroundColor Cyan
 $base = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
 $pkeyDeviceDesc = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"
+# The endpoint's DeviceDesc is just "Speakers" until Rename-Endpoint.ps1 has run;
+# the device-interface name carries "Stream To Speaker" from the INF from the start.
+$pkeyInterfaceName = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6"
 $wiped = 0
 Get-ChildItem $base | ForEach-Object {
     $propsPath = Join-Path $_.PSPath "Properties"
     if (-not (Test-Path $propsPath)) { return }
     $desc = (Get-ItemProperty -Path $propsPath -Name $pkeyDeviceDesc -ErrorAction SilentlyContinue).$pkeyDeviceDesc
-    if ($desc -like "*Stream To Speaker*") {
+    $iface = (Get-ItemProperty -Path $propsPath -Name $pkeyInterfaceName -ErrorAction SilentlyContinue).$pkeyInterfaceName
+    if ($desc -like "*Stream To Speaker*" -or $iface -like "*Stream To Speaker*") {
         Write-Host "  wiping $($_.PSChildName) ($desc)"
         Remove-Item -Path $_.PSPath -Recurse -Force
         $wiped++
