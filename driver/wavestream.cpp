@@ -6,21 +6,23 @@
  * periodic DPC while in KSSTATE_RUN that:
  *
  *   1. Computes how many frames the engine has produced since the
- *      previous tick using elapsed QPC time. (We don't have a real
+ *      stream entered RUN using elapsed QPC time. (We don't have a real
  *      hardware position register, so we synthesize one from the
  *      sample clock.)
  *   2. Copies those frames out of the cyclic buffer into the IOCTL
- *      ring buffer.
+ *      ring buffer (up-mixing mono streams to the stereo ring format).
  *   3. Calls IoctlTryCompleteAudio() to wake up any pending IRPs.
  *
  * The DPC fires every STREAM_TO_SPEAKER_NOTIFICATION_INTERVAL_MS (2 ms by
  * default), matching the WaveRT minimum buffer of 2 ms.
  *
- * Position registers: WaveRT supports HW position registers, but a
- * virtual device doesn't need a polled register — we return the
+ * Position semantics follow KS: the play position resets to zero on
+ * the transition to KSSTATE_STOP, freezes in PAUSE and advances only
+ * in RUN. Position registers: WaveRT supports HW position registers,
+ * but a virtual device doesn't need a polled register — we return the
  * software-tracked counter via GetPosition. GetPositionRegister
  * returns no register (Register==NULL), forcing the audio engine to
- * call GetPosition periodically.
+ * call GetPosition periodically (or, in packet mode, GetPacketCount).
  */
 
 #include "wavestream.h"
@@ -61,7 +63,8 @@ CMiniportWaveRTStream::NonDelegatingQueryInterface(
         return STATUS_INVALID_PARAMETER;
     }
     /* IMiniportWaveRTStreamNotification : IMiniportWaveRTStream :
-     * IUnknown, so a single chain of casts handles all three IIDs. */
+     * IUnknown, so a single chain of casts handles those three IIDs;
+     * IMiniportWaveRTOutputStream is a separate IUnknown-derived base. */
     if (IsEqualGUIDAligned(Interface, IID_IUnknown)) {
         *Object = PVOID(PUNKNOWN(static_cast<IMiniportWaveRTStreamNotification*>(this)));
     } else if (IsEqualGUIDAligned(Interface, IID_IMiniportWaveRTStream)) {
@@ -69,6 +72,8 @@ CMiniportWaveRTStream::NonDelegatingQueryInterface(
                     static_cast<IMiniportWaveRTStreamNotification*>(this)));
     } else if (IsEqualGUIDAligned(Interface, IID_IMiniportWaveRTStreamNotification)) {
         *Object = PVOID(static_cast<IMiniportWaveRTStreamNotification*>(this));
+    } else if (IsEqualGUIDAligned(Interface, IID_IMiniportWaveRTOutputStream)) {
+        *Object = PVOID(static_cast<IMiniportWaveRTOutputStream*>(this));
     } else {
         *Object = nullptr;
     }
@@ -93,6 +98,10 @@ CMiniportWaveRTStream::~CMiniportWaveRTStream()
         ExFreePoolWithTag(m_BufferVa, STREAM_TO_SPEAKER_POOL_TAG);
         m_BufferVa = nullptr;
     }
+    if (m_UpmixVa != nullptr) {
+        ExFreePoolWithTag(m_UpmixVa, STREAM_TO_SPEAKER_POOL_TAG);
+        m_UpmixVa = nullptr;
+    }
     if (m_PortStream != nullptr) {
         m_PortStream->Release();
         m_PortStream = nullptr;
@@ -111,9 +120,12 @@ CMiniportWaveRTStream::Init(
     _In_ PKSDATAFORMAT     DataFormat)
 {
     PAGED_CODE();
-    UNREFERENCED_PARAMETER(DataFormat);
-    if (Miniport == nullptr) {
+    if (Miniport == nullptr || DataFormat == nullptr) {
         return STATUS_INVALID_PARAMETER;
+    }
+    ULONG channels = StreamToSpeakerSupportedChannels(DataFormat, DataFormat->FormatSize);
+    if (channels == 0) {
+        return STATUS_NO_MATCH;
     }
     m_Miniport               = Miniport;
     m_PortStream             = PortStream;
@@ -123,11 +135,21 @@ CMiniportWaveRTStream::Init(
     m_PinId                  = Pin;
     m_Allocated              = FALSE;
     m_State                  = KSSTATE_STOP;
+    m_Channels               = channels;
+    m_FrameBytes             = channels * (STREAM_TO_SPEAKER_BITS_PER_SAMPLE / 8u);
     m_BufferMdl              = nullptr;
     m_BufferVa               = nullptr;
     m_BufferBytes            = 0;
+    m_UpmixVa                = nullptr;
+    m_UpmixBytes             = 0;
     m_StreamFramesProduced   = 0;
+    m_FramesAtRunStart       = 0;
+    m_RunStartQpc.QuadPart   = 0;
     m_StreamFramesConsumed   = 0;
+    m_LastOsWritePacket      = 0;
+    m_EosReceived            = FALSE;
+    m_EosPacketNumber        = 0;
+    m_EosPacketLength        = 0;
     m_TimerStarted           = FALSE;
     m_TimerResolutionRaised  = FALSE;
     m_DpcLogCounter          = 0;
@@ -148,9 +170,10 @@ CMiniportWaveRTStream::Init(
         -(LONGLONG)STREAM_TO_SPEAKER_NOTIFICATION_INTERVAL_MS * 10000LL;
 
     LARGE_INTEGER freq;
-    m_LastTickQpc  = KeQueryPerformanceCounter(&freq);
+    m_RunStartQpc   = KeQueryPerformanceCounter(&freq);
     m_PerfFrequency = freq;
 
+    DBG_INFO("stream init: %lu channel(s), %lu bytes/frame", m_Channels, m_FrameBytes);
     return STATUS_SUCCESS;
 }
 
@@ -158,6 +181,42 @@ PSTREAM_TO_SPEAKER_DEVICE_EXTENSION
 CMiniportWaveRTStream::DeviceExtension()
 {
     return (m_Miniport != nullptr) ? m_Miniport->DeviceExtension() : nullptr;
+}
+
+/* Forget everything about the play position: KSSTATE_STOP semantics. */
+VOID
+CMiniportWaveRTStream::ResetPosition()
+{
+    m_StreamFramesProduced     = 0;
+    m_FramesAtRunStart         = 0;
+    m_StreamFramesConsumed     = 0;
+    m_LastNotificationConsumed = 0;
+    m_LastOsWritePacket        = 0;
+    m_EosReceived              = FALSE;
+    m_EosPacketNumber          = 0;
+    m_EosPacketLength          = 0;
+    m_RunStartQpc              = KeQueryPerformanceCounter(nullptr);
+}
+
+/* One packet == one notification interval of the cyclic buffer. */
+ULONG
+CMiniportWaveRTStream::PacketBytes() const
+{
+    if (m_NotificationsPerBuffer == 0 || m_BufferBytes == 0) {
+        return 0;
+    }
+    return m_BufferBytes / m_NotificationsPerBuffer;
+}
+
+ULONG
+CMiniportWaveRTStream::PacketsCompleted() const
+{
+    ULONG packet = PacketBytes();
+    if (packet == 0) {
+        return 0;
+    }
+    ULONGLONG playedBytes = m_StreamFramesProduced * (ULONGLONG)m_FrameBytes;
+    return (ULONG)(playedBytes / packet);
 }
 
 /* ------------------------------------------------------------------ */
@@ -182,6 +241,10 @@ CMiniportWaveRTStream::AllocateAudioBuffer(
     *OutOffset = 0;
     *OutCacheType = MmCached;
 
+    if (m_Allocated) {
+        return STATUS_DEVICE_BUSY;
+    }
+
     /* Round up to whole frame and align to a page. Cap at 64 KB so we
      * never allocate something silly. */
     if (RequestedSize == 0) {
@@ -190,7 +253,7 @@ CMiniportWaveRTStream::AllocateAudioBuffer(
     if (RequestedSize > 0x10000) {
         RequestedSize = 0x10000;
     }
-    RequestedSize -= (RequestedSize % STREAM_TO_SPEAKER_FRAME_BYTES);
+    RequestedSize -= (RequestedSize % m_FrameBytes);
     if (RequestedSize == 0) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -207,19 +270,35 @@ CMiniportWaveRTStream::AllocateAudioBuffer(
     }
     MmBuildMdlForNonPagedPool(mdl);
 
+    /* Mono streams are up-mixed into stereo before they reach the
+     * ring buffer; the DPC may hand over almost a whole cyclic buffer
+     * per tick, so the scratch area is twice the buffer. */
+    UCHAR* upmix = nullptr;
+    ULONG  upmixBytes = 0;
+    if (m_Channels == 1) {
+        upmixBytes = RequestedSize * 2u;
+        upmix = static_cast<UCHAR*>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, upmixBytes, STREAM_TO_SPEAKER_POOL_TAG));
+        if (upmix == nullptr) {
+            IoFreeMdl(mdl);
+            ExFreePoolWithTag(va, STREAM_TO_SPEAKER_POOL_TAG);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
     m_BufferMdl   = mdl;
     m_BufferVa    = va;
     m_BufferBytes = RequestedSize;
+    m_UpmixVa     = upmix;
+    m_UpmixBytes  = upmixBytes;
     m_Allocated   = TRUE;
-    m_StreamFramesProduced = 0;
-    m_StreamFramesConsumed = 0;
+    ResetPosition();
     /* Default to a single notification per buffer wrap. Overwritten
      * if the engine uses AllocateBufferWithNotification. */
     if (m_NotificationsPerBuffer == 0) {
         m_NotificationsPerBuffer = 1;
     }
     m_BytesPerNotification = RequestedSize / m_NotificationsPerBuffer;
-    m_LastNotificationConsumed = 0;
 
     *OutMdl           = mdl;
     *OutAllocatedSize = RequestedSize;
@@ -245,6 +324,11 @@ CMiniportWaveRTStream::FreeAudioBuffer(
         ExFreePoolWithTag(m_BufferVa, STREAM_TO_SPEAKER_POOL_TAG);
         m_BufferVa = nullptr;
     }
+    if (m_UpmixVa != nullptr) {
+        ExFreePoolWithTag(m_UpmixVa, STREAM_TO_SPEAKER_POOL_TAG);
+        m_UpmixVa = nullptr;
+    }
+    m_UpmixBytes  = 0;
     m_BufferBytes = 0;
     m_Allocated   = FALSE;
 }
@@ -269,9 +353,9 @@ CMiniportWaveRTStream::AllocateBufferWithNotification(
     }
     /* Round RequestedSize to a multiple of (frame * NotificationCount)
      * so each notification chunk is a whole number of frames. */
-    ULONG chunk = STREAM_TO_SPEAKER_FRAME_BYTES * NotificationCount;
+    ULONG chunk = m_FrameBytes * NotificationCount;
     if (chunk == 0) {
-        chunk = STREAM_TO_SPEAKER_FRAME_BYTES;
+        chunk = m_FrameBytes;
     }
     RequestedSize -= (RequestedSize % chunk);
     if (RequestedSize == 0) {
@@ -345,6 +429,81 @@ CMiniportWaveRTStream::UnregisterNotificationEvent(_In_ PKEVENT NotificationEven
     return status;
 }
 
+/* IMiniportWaveRTOutputStream ------------------------------------------- */
+
+STDMETHODIMP_(NTSTATUS)
+CMiniportWaveRTStream::SetWritePacket(
+    _In_ ULONG PacketNumber,
+    _In_ DWORD Flags,
+    _In_ ULONG EosPacketLength)
+{
+    PAGED_CODE();
+    ULONG packet = PacketBytes();
+    if (packet == 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (m_EosReceived) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    /* The engine must hand us the packet right after the one being
+     * played (while running) or the one at the play head (otherwise).
+     * Modulo arithmetic: the packet counter wraps. */
+    ULONG expected = PacketsCompleted();
+    if (m_State == KSSTATE_RUN) {
+        ++expected;
+    }
+    LONG delta = (LONG)(PacketNumber - expected);
+    if (delta < 0) {
+        return STATUS_DATA_LATE_ERROR;
+    }
+    if (delta > 0) {
+        return STATUS_DATA_OVERRUN;
+    }
+    if (Flags & KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) {
+        if (EosPacketLength > packet) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        m_EosReceived     = TRUE;
+        m_EosPacketNumber = PacketNumber;
+        m_EosPacketLength = EosPacketLength;
+    }
+    m_LastOsWritePacket = PacketNumber;
+    return STATUS_SUCCESS;
+}
+
+STDMETHODIMP_(NTSTATUS)
+CMiniportWaveRTStream::GetOutputStreamPresentationPosition(
+    _Out_ KSAUDIO_PRESENTATION_POSITION* pPresentationPosition)
+{
+    PAGED_CODE();
+    if (pPresentationPosition == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (PacketBytes() == 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    /* Position in blocks (frames) since STOP, stamped with the QPC at
+     * which it was read. A frame we have consumed is "presented". */
+    pPresentationPosition->u64PositionInBlocks = m_StreamFramesProduced;
+    pPresentationPosition->u64QPCPosition      =
+        (ULONGLONG)KeQueryPerformanceCounter(nullptr).QuadPart;
+    return STATUS_SUCCESS;
+}
+
+STDMETHODIMP_(NTSTATUS)
+CMiniportWaveRTStream::GetPacketCount(_Out_ ULONG* pPacketCount)
+{
+    PAGED_CODE();
+    if (pPacketCount == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (PacketBytes() == 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    *pPacketCount = PacketsCompleted();
+    return STATUS_SUCCESS;
+}
+
 STDMETHODIMP_(VOID)
 CMiniportWaveRTStream::GetHWLatency(_Out_ PKSRTAUDIO_HWLATENCY OutLatency)
 {
@@ -352,7 +511,7 @@ CMiniportWaveRTStream::GetHWLatency(_Out_ PKSRTAUDIO_HWLATENCY OutLatency)
     if (OutLatency == nullptr) {
         return;
     }
-    OutLatency->FifoSize     = STREAM_TO_SPEAKER_FRAME_BYTES * 32;
+    OutLatency->FifoSize     = m_FrameBytes * 32;
     OutLatency->ChipsetDelay = 0;
     OutLatency->CodecDelay   = 0;
 }
@@ -379,7 +538,7 @@ CMiniportWaveRTStream::GetPosition(_Out_ KSAUDIO_POSITION* OutPosition)
      * WriteOffset one notification-interval AHEAD of PlayOffset; that
      * made the engine treat the queued depth as 2 ms and apparently
      * throttle, manifesting as ~1 packet per 80 s. */
-    ULONGLONG playBytes = (ULONGLONG)m_StreamFramesProduced * STREAM_TO_SPEAKER_FRAME_BYTES;
+    ULONGLONG playBytes = (ULONGLONG)m_StreamFramesProduced * m_FrameBytes;
     ULONG offset = (ULONG)(playBytes % (ULONGLONG)m_BufferBytes);
     OutPosition->PlayOffset  = offset;
     OutPosition->WriteOffset = offset;
@@ -399,7 +558,7 @@ CMiniportWaveRTStream::GetPositionRegister(_Out_ KSRTAUDIO_HWREGISTER* OutRegist
     OutRegister->Width        = 32;
     OutRegister->Numerator    = 1;
     OutRegister->Denominator  = 1;
-    OutRegister->Accuracy     = STREAM_TO_SPEAKER_FRAME_BYTES;
+    OutRegister->Accuracy     = m_FrameBytes;
     return STATUS_NOT_IMPLEMENTED;
 }
 
@@ -418,9 +577,20 @@ STDMETHODIMP
 CMiniportWaveRTStream::SetFormat(_In_ PKSDATAFORMAT DataFormat)
 {
     PAGED_CODE();
-    UNREFERENCED_PARAMETER(DataFormat);
-    /* We only advertise one format; PortCls validates it before we
-     * see it. */
+    /* Only a format identical in channel count to the one the stream
+     * was created with can be swapped in without reallocating. */
+    if (DataFormat == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ULONG channels = StreamToSpeakerSupportedChannels(DataFormat, DataFormat->FormatSize);
+    if (channels == 0) {
+        return STATUS_NO_MATCH;
+    }
+    if (channels != m_Channels && m_Allocated) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    m_Channels   = channels;
+    m_FrameBytes = channels * (STREAM_TO_SPEAKER_BITS_PER_SAMPLE / 8u);
     return STATUS_SUCCESS;
 }
 
@@ -435,24 +605,50 @@ CMiniportWaveRTStream::SetState(_In_ KSSTATE State)
     m_State = State;
     KeReleaseSpinLock(&m_StateLock, old);
 
-    if (State == KSSTATE_RUN && prev != KSSTATE_RUN) {
-        /* Reset frame counters and notify user-mode of stream start. */
-        m_StreamFramesProduced = 0;
-        m_StreamFramesConsumed = 0;
-        m_LastNotificationConsumed = 0;
-        m_LastTickQpc = KeQueryPerformanceCounter(&m_PerfFrequency);
+    if (State == prev) {
+        return STATUS_SUCCESS;
+    }
+
+    if (prev == KSSTATE_RUN) {
+        /* Leaving RUN: freeze the play position and stop the consumer. */
+        StopTimer();
+        PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
+        if (ext != nullptr && ext->IoctlCtx != nullptr) {
+            IoctlOnStreamStop(ext->IoctlCtx);
+        }
+    }
+
+    switch (State) {
+    case KSSTATE_STOP:
+        /* KS semantics: STOP rewinds the stream to position zero. */
+        ResetPosition();
+        break;
+
+    case KSSTATE_ACQUIRE:
+        if (prev == KSSTATE_STOP) {
+            ResetPosition();
+        }
+        break;
+
+    case KSSTATE_PAUSE:
+        break;
+
+    case KSSTATE_RUN: {
+        /* Resume the sample clock from the frozen position and notify
+         * user-mode of stream start. */
+        m_FramesAtRunStart = m_StreamFramesProduced;
+        m_RunStartQpc      = KeQueryPerformanceCounter(&m_PerfFrequency);
 
         PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
         if (ext != nullptr && ext->IoctlCtx != nullptr) {
             IoctlOnStreamStart(ext->IoctlCtx);
         }
         StartTimer();
-    } else if (State != KSSTATE_RUN && prev == KSSTATE_RUN) {
-        StopTimer();
-        PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
-        if (ext != nullptr && ext->IoctlCtx != nullptr) {
-            IoctlOnStreamStop(ext->IoctlCtx);
-        }
+        break;
+    }
+
+    default:
+        break;
     }
 
     return STATUS_SUCCESS;
@@ -512,6 +708,36 @@ CMiniportWaveRTStream::StopTimer()
     }
 }
 
+/* Hand `Bytes` bytes of engine-format PCM starting at `Src` to the
+ * ring buffer, up-mixing mono to the ring's stereo frames. Runs at
+ * DISPATCH_LEVEL. */
+VOID
+CMiniportWaveRTStream::ProduceToRing(
+    _In_reads_bytes_(Bytes) const UCHAR* Src,
+    _In_ ULONG Bytes)
+{
+    PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
+    if (ext == nullptr || ext->IoctlCtx == nullptr || Bytes == 0) {
+        return;
+    }
+    if (m_Channels == STREAM_TO_SPEAKER_CHANNELS) {
+        IoctlAudioProduce(ext->IoctlCtx, Src, Bytes);
+        return;
+    }
+    /* Mono: duplicate each 16-bit sample into L and R. */
+    if (m_UpmixVa == nullptr || Bytes * 2u > m_UpmixBytes) {
+        return;
+    }
+    const USHORT* in  = reinterpret_cast<const USHORT*>(Src);
+    USHORT*       out = reinterpret_cast<USHORT*>(m_UpmixVa);
+    ULONG samples = Bytes / sizeof(USHORT);
+    for (ULONG i = 0; i < samples; ++i) {
+        out[2 * i]     = in[i];
+        out[2 * i + 1] = in[i];
+    }
+    IoctlAudioProduce(ext->IoctlCtx, m_UpmixVa, samples * 2u * sizeof(USHORT));
+}
+
 VOID
 CMiniportWaveRTStream::DoCopyToRing()
 {
@@ -532,23 +758,23 @@ CMiniportWaveRTStream::DoCopyToRing()
         return;
     }
 
-    /* Compute frames-due from total elapsed time since stream start, NOT
-     * from per-tick deltas. The per-tick approach accumulates integer-
-     * division truncation: at 10 MHz QPC and 44.1 kHz sample rate, each
-     * 2 ms call loses ~46 QPC ticks (4.6 µs) to truncation, which adds
-     * up to ~2.3 ms of under-production per real second. Over a minute
-     * that's ~140 ms — enough to drain a 200 ms Sonos buffer in roughly
-     * a minute and a half, matching the reported "speaker drifts ahead
-     * and runs out of buffer" symptom.
+    /* Compute frames-due from total elapsed time since the stream last
+     * entered RUN, NOT from per-tick deltas. The per-tick approach
+     * accumulates integer-division truncation: at 10 MHz QPC and
+     * 44.1 kHz sample rate, each 2 ms call loses ~46 QPC ticks (4.6 µs)
+     * to truncation, which adds up to ~2.3 ms of under-production per
+     * real second. Over a minute that's ~140 ms — enough to drain a
+     * 200 ms Sonos buffer in roughly a minute and a half, matching the
+     * reported "speaker drifts ahead and runs out of buffer" symptom.
      *
      * Cumulative-elapsed form keeps drift bounded to one frame (~22 µs)
      * at any moment because the truncation never compounds. */
     LARGE_INTEGER nowQpc = KeQueryPerformanceCounter(nullptr);
-    LONGLONG elapsedTicks = nowQpc.QuadPart - m_LastTickQpc.QuadPart;
+    LONGLONG elapsedTicks = nowQpc.QuadPart - m_RunStartQpc.QuadPart;
     if (elapsedTicks <= 0 || m_PerfFrequency.QuadPart <= 0) {
         return;
     }
-    ULONGLONG framesDue =
+    ULONGLONG framesDue = m_FramesAtRunStart +
         ((ULONGLONG)elapsedTicks * (ULONGLONG)STREAM_TO_SPEAKER_SAMPLE_RATE)
         / (ULONGLONG)m_PerfFrequency.QuadPart;
     if (framesDue <= m_StreamFramesProduced) {
@@ -569,7 +795,7 @@ CMiniportWaveRTStream::DoCopyToRing()
      * buffer minus one frame in a single pass because the engine's
      * write head is by construction ahead of where we read (PlayOffset
      * gates the engine's write window — see GetPosition). */
-    ULONG bufferFrames = m_BufferBytes / STREAM_TO_SPEAKER_FRAME_BYTES;
+    ULONG bufferFrames = m_BufferBytes / m_FrameBytes;
     if (bufferFrames == 0) {
         return;
     }
@@ -583,21 +809,16 @@ CMiniportWaveRTStream::DoCopyToRing()
 
     /* Read position in the cyclic buffer = consumed frames mod bufferFrames. */
     ULONG readFrame = (ULONG)(m_StreamFramesConsumed % bufferFrames);
-    ULONG bytesToRead = (ULONG)outstanding * STREAM_TO_SPEAKER_FRAME_BYTES;
-    ULONG firstChunk = (bufferFrames - readFrame) * STREAM_TO_SPEAKER_FRAME_BYTES;
+    ULONG bytesToRead = (ULONG)outstanding * m_FrameBytes;
+    ULONG firstChunk = (bufferFrames - readFrame) * m_FrameBytes;
     if (firstChunk > bytesToRead) {
         firstChunk = bytesToRead;
     }
 
-    PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
-    if (ext != nullptr && ext->IoctlCtx != nullptr) {
-        IoctlAudioProduce(ext->IoctlCtx,
-                          m_BufferVa + (readFrame * STREAM_TO_SPEAKER_FRAME_BYTES),
-                          firstChunk);
-        ULONG remaining = bytesToRead - firstChunk;
-        if (remaining > 0) {
-            IoctlAudioProduce(ext->IoctlCtx, m_BufferVa, remaining);
-        }
+    ProduceToRing(m_BufferVa + (readFrame * m_FrameBytes), firstChunk);
+    ULONG remaining = bytesToRead - firstChunk;
+    if (remaining > 0) {
+        ProduceToRing(m_BufferVa, remaining);
     }
 
     m_StreamFramesConsumed += outstanding;
@@ -615,15 +836,15 @@ CMiniportWaveRTStream::SignalNotificationEvents()
     if (m_BytesPerNotification == 0) {
         return;
     }
-    ULONGLONG consumedBytes = m_StreamFramesConsumed * STREAM_TO_SPEAKER_FRAME_BYTES;
-    ULONGLONG lastBytes     = m_LastNotificationConsumed * STREAM_TO_SPEAKER_FRAME_BYTES;
+    ULONGLONG consumedBytes = m_StreamFramesConsumed * m_FrameBytes;
+    ULONGLONG lastBytes     = m_LastNotificationConsumed * m_FrameBytes;
     if (consumedBytes - lastBytes < m_BytesPerNotification) {
         return;
     }
     /* Round down to a notification boundary so we don't drift. */
     ULONGLONG boundary = (consumedBytes / m_BytesPerNotification)
                          * (ULONGLONG)m_BytesPerNotification;
-    m_LastNotificationConsumed = boundary / STREAM_TO_SPEAKER_FRAME_BYTES;
+    m_LastNotificationConsumed = boundary / m_FrameBytes;
 
     /* DPC-level: already at DISPATCH_LEVEL, no KIRQL save needed. */
     KeAcquireSpinLockAtDpcLevel(&m_EventLock);
@@ -642,11 +863,9 @@ VOID
 CMiniportWaveRTStream::OnConsumerDpc()
 {
     /* Runs at DISPATCH_LEVEL. */
-    KIRQL old;
     KeAcquireSpinLockAtDpcLevel(&m_StateLock);
     KSSTATE st = m_State;
     KeReleaseSpinLockFromDpcLevel(&m_StateLock);
-    UNREFERENCED_PARAMETER(old);
 
     if (st != KSSTATE_RUN) {
         return;

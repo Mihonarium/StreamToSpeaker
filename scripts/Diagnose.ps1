@@ -19,7 +19,26 @@ Write-Header "0. System"
 $wv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
 "Build      : $($wv.CurrentBuildNumber).$($wv.UBR)  ($($wv.DisplayVersion))"
 $bcd = & bcdedit /enum '{current}' 2>&1 | Out-String
-if ($bcd -match 'testsigning\s+Yes') { "TestSigning: ON" } else { "TestSigning: OFF (driver will NOT load!)" }
+$testSigning = $bcd -match 'testsigning\s+Yes'
+# Test-signing mode only matters for a TEST-SIGNED build, which is the one
+# that ships a self-signed StreamToSpeaker.cer next to the driver (the
+# installer imports it). Microsoft-signed builds (WHQL-certified or
+# attestation-signed) ship no .cer and load with test signing OFF.
+$cer = Join-Path $PSScriptRoot '..\driver\StreamToSpeaker.cer'
+$testSignedBuild = $false
+if (Test-Path $cer) {
+    try {
+        $c = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $cer
+        $testSignedBuild = ($c.Subject -eq $c.Issuer)   # self-signed = test cert
+    } catch { $testSignedBuild = $true }
+}
+if ($testSignedBuild) {
+    "Build      : test-signed (self-signed StreamToSpeaker.cer shipped)"
+    if ($testSigning) { "TestSigning: ON" } else { "TestSigning: OFF (driver will NOT load! bcdedit /set testsigning on + reboot)" }
+} else {
+    "Build      : Microsoft-signed (no test certificate shipped)"
+    "TestSigning: $(if ($testSigning) { 'ON (not needed for this build)' } else { 'OFF (fine for this build)' })"
+}
 
 Write-Header "1. Driver staged + loaded"
 $sys32 = "$env:windir\System32\drivers\StreamToSpeaker.sys"
@@ -95,7 +114,8 @@ if (Test-Path $setup) {
 Write-Header "5. Decision tree — read top to bottom, stop at first match"
 @'
 - DeviceState=NOTPRESENT (4) or no entry at all:
-    -> driver not loading (check section 1: TestSigning, signature, store entry)
+    -> driver not loading (check section 1: signature, store entry; and
+       TestSigning only if section 0 says the build is test-signed)
 
 - DeviceState=DISABLED (2) AND FormFactor=10 (UnknownFormFactor):
     -> bridge pin Category not respected; check JackSubType (should be a

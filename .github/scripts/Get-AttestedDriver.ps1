@@ -5,21 +5,27 @@
     matches a driver-source hash.
 
 .DESCRIPTION
-    Scans this repo's driver-v* releases (created by driver-submission.yml,
-    finalized by driver-attested.yml). A release qualifies when its
-    manifest.json says attested=true AND its source_hash equals -SourceHash
-    (the hashFiles('driver/**','include/**') of the checkout being built) —
-    i.e. the attested binaries were built from exactly the driver source
-    that's being packaged now. Service-only commits keep the same driver
-    source hash, so they keep matching the last attested driver.
+    Scans this repo's driver-v* releases (created by driver-submission.yml
+    + driver-attested.yml for attestation, or driver-certified.yml for
+    WHQL). A release qualifies when its manifest.json says attested=true
+    or certified=true AND its source_hash equals -SourceHash (the
+    hashFiles('driver/**','include/**') of the checkout being built) —
+    i.e. the Microsoft-signed binaries were built from exactly the driver
+    source that's being packaged now. Service-only commits keep the same
+    driver source hash, so they keep matching the last signed driver.
 
-    The newest qualifying build's StreamToSpeaker-Driver-<ver>-Signed.zip is
+    Preference among matches: a WHQL-certified package always beats an
+    attestation-signed one, even with a lower driver_build (certification
+    is per binary, and the certified build is the one the lab tested);
+    within the same kind the highest driver_build wins.
+
+    The chosen build's StreamToSpeaker-Driver-<ver>-Signed.zip is
     downloaded, verified against the manifest's recorded hash, and the
     driver files (inf/sys/cat) are extracted flat into -OutDir.
 
-    Emits step outputs (GITHUB_OUTPUT): found, tag, version, build, zip.
-    Exits 0 with found=false when nothing matches — callers decide whether
-    that is fatal.
+    Emits step outputs (GITHUB_OUTPUT): found, tag, version, build, zip,
+    kind (certified|attested). Exits 0 with found=false when nothing
+    matches — callers decide whether that is fatal.
 
 .NOTES
     Requires the gh CLI with GH_TOKEN set (standard on Actions runners).
@@ -63,16 +69,20 @@ foreach ($r in @($rels | Where-Object { $_.tag_name -like "driver-v*" -and -not 
         Write-Host "  ($($r.tag_name): manifest fetch failed, skipping)"
         continue
     }
-    if (-not $m.attested) { continue }
+    $certified = [bool]$m.certified
+    if (-not ($m.attested -or $certified)) { continue }
     if ($m.source_hash -ne $SourceHash) { continue }
-    if (-not $best -or [int]$m.driver_build -gt [int]$best.Manifest.driver_build) {
-        $best = @{ Release = $r; Manifest = $m }
+    # Rank: certified first, then the highest driver_build.
+    $rank = @([int]$certified, [int]$m.driver_build)
+    if (-not $best -or $rank[0] -gt $best.Rank[0] -or
+        ($rank[0] -eq $best.Rank[0] -and $rank[1] -gt $best.Rank[1])) {
+        $best = @{ Release = $r; Manifest = $m; Rank = $rank }
     }
 }
 
 if (-not $best) {
-    Write-Host "No Microsoft-attested driver release matches driver source hash $SourceHash."
-    Write-Host "(Driver source changed since the last attestation? Run the 'Driver submission' workflow and the Partner Center flow - see docs/driver-signing.md.)"
+    Write-Host "No Microsoft-signed (certified or attested) driver release matches driver source hash $SourceHash."
+    Write-Host "(Driver source changed since the last signing round? A new HLK run + 'Driver certified', or the 'Driver submission' attestation flow - see docs/driver-signing.md.)"
     Out-StepOutput "found=false"
     exit 0
 }
@@ -80,7 +90,8 @@ if (-not $best) {
 $m = $best.Manifest
 $r = $best.Release
 $zipAsset = $r.assets | Where-Object { $_.name -eq $m.signed_zip } | Select-Object -First 1
-if (-not $zipAsset) { throw "$($r.tag_name): manifest says attested=true but asset $($m.signed_zip) is missing" }
+$kind = if ($m.certified) { "certified" } else { "attested" }
+if (-not $zipAsset) { throw "$($r.tag_name): manifest says $kind but asset $($m.signed_zip) is missing" }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $zipPath = Join-Path (Resolve-Path $OutDir).Path $m.signed_zip
@@ -99,8 +110,9 @@ foreach ($name in "StreamToSpeaker.inf", "StreamToSpeaker.sys", "StreamToSpeaker
     Copy-Item $f.FullName (Join-Path $OutDir $name) -Force
 }
 
-Write-Host "Attested driver: $($r.tag_name) (DriverVer $($m.driver_version), driver source hash matches)"
+Write-Host "Microsoft-signed driver ($kind): $($r.tag_name) (DriverVer $($m.driver_version), driver source hash matches)"
 Out-StepOutput "found=true"
+Out-StepOutput "kind=$kind"
 Out-StepOutput "tag=$($r.tag_name)"
 Out-StepOutput "version=$($m.driver_version)"
 Out-StepOutput "build=$($m.driver_build)"

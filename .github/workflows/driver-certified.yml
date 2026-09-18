@@ -1,0 +1,279 @@
+name: Driver certified
+
+# WHQL/HLK counterpart of driver-attest.yml + driver-attested.yml (runbook:
+# docs/driver-signing.md, "Flow D"). Input is a Partner Center HLK
+# submission that was created by hand from an .hlkx (the lab run is not
+# automated); this workflow turns Microsoft's return into a driver-v<ver>
+# release that build.yml bundles into installers:
+#
+#   fetch  (ubuntu)   poll the submission via the Hardware API until it is
+#                     completed with a signedPackage and download it — or
+#                     take a hand-downloaded zip already attached to the
+#                     release (ms_zip_asset). Cross-check it against the lab
+#                     package (INF byte-identical, .sys identical after
+#                     stripping signatures, Microsoft publisher present).
+#   verify (windows)  signtool: catalog verification with the kernel policy,
+#                     and a Microsoft Windows Hardware Compatibility
+#                     Publisher signature on the .sys at ANY index — for HLK
+#                     returns Microsoft nests its signature behind the lab's
+#                     test signature, which is why driver-attested.yml
+#                     (primary signer must be Microsoft) can't be reused.
+#                     Then publish the canonical -Signed.zip + manifest.json
+#                     (certified: true, certification ids) on the release.
+#
+# Dispatch it from the commit whose driver/** + include/** tree was
+# certified: the manifest records that commit and its hashFiles() source
+# hash, and installers only bundle the package while their driver tree
+# still hashes to the same value. The release must already carry the lab
+# package (INF/SYS/CAT exactly as tested, test-signed) as
+# StreamToSpeaker-Driver-<version>-lab-testsigned.zip — attach it by hand,
+# it is the reference everything is compared against.
+#
+# Secrets: AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET (same
+# Entra app as Driver attest); not needed when ms_zip_asset is given.
+
+run-name: "Driver certified · ${{ inputs.version }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Certified driver version (INF DriverVer), e.g. 1.1.0.209"
+        required: true
+      product_id:
+        description: "Partner Center product id of the HLK submission (leave empty with ms_zip_asset)"
+        required: false
+        default: ""
+      submission_id:
+        description: "Partner Center submission id (leave empty with ms_zip_asset)"
+        required: false
+        default: ""
+      ms_zip_asset:
+        description: "Name of a hand-downloaded Microsoft-signed zip already attached to the release (skips the Hardware API)"
+        required: false
+        default: ""
+      lab_zip_asset:
+        description: "Name of the lab package asset on the release (default: StreamToSpeaker-Driver-<version>-lab-testsigned.zip)"
+        required: false
+        default: ""
+      report_id:
+        description: "Certification report id (from the dashboard / certificationReport download URL)"
+        required: false
+        default: ""
+      os:
+        description: "Comma-separated requestedSignatures the certification covers"
+        required: false
+        default: "WINDOWS_v100_X64_25H2_FULL"
+      tag:
+        description: "Release tag (default: driver-v<version>)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  id-token: write            # build-provenance attestation (public repo only)
+  attestations: write
+
+concurrency:
+  group: driver-certified-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.rel.outputs.tag }}
+      ms_zip: ${{ steps.rel.outputs.ms_zip }}
+      lab_zip: ${{ steps.rel.outputs.lab_zip }}
+      product_id: ${{ steps.rel.outputs.product_id }}
+      submission_id: ${{ steps.rel.outputs.submission_id }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests (guard)
+        run: python3 -m unittest discover -s .github/scripts
+
+      - name: Resolve release + inputs
+        id: rel
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_MS_ZIP: ${{ inputs.ms_zip_asset }}
+          INPUT_LAB_ZIP: ${{ inputs.lab_zip_asset }}
+          INPUT_PRODUCT: ${{ inputs.product_id }}
+          INPUT_SUBMISSION: ${{ inputs.submission_id }}
+        run: |
+          set -euo pipefail
+          [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be MAJOR.MINOR.BUILD.REVISION, got '$INPUT_VERSION'"; exit 1; }
+          tag="${INPUT_TAG:-driver-v$INPUT_VERSION}"
+          lab="${INPUT_LAB_ZIP:-StreamToSpeaker-Driver-$INPUT_VERSION-lab-testsigned.zip}"
+          if [[ -z "$INPUT_MS_ZIP" && ( -z "$INPUT_PRODUCT" || -z "$INPUT_SUBMISSION" ) ]]; then
+            echo "::error::give product_id + submission_id (Hardware API) or ms_zip_asset (hand-downloaded zip on the release)"; exit 1
+          fi
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Creating prerelease $tag at $GITHUB_SHA"
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+              --title "Driver $INPUT_VERSION — WHQL certification in progress" \
+              --notes "Certified driver $INPUT_VERSION: assets being published by the Driver certified workflow."
+          fi
+          if ! gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$lab" --output "$lab" --clobber; then
+            echo "::error::release $tag has no '$lab' - attach the lab package (INF/SYS/CAT exactly as tested, test-signed) under that name and re-run"; exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "lab_zip=$lab"
+            echo "ms_zip=${INPUT_MS_ZIP:-StreamToSpeaker-Driver-$INPUT_VERSION-Microsoft.zip}"
+            echo "product_id=$INPUT_PRODUCT"
+            echo "submission_id=$INPUT_SUBMISSION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Take the hand-downloaded Microsoft zip from the release
+        if: inputs.ms_zip_asset != ''
+        run: |
+          set -euo pipefail
+          gh release download "${{ steps.rel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" \
+            --pattern "${{ steps.rel.outputs.ms_zip }}" --output "${{ steps.rel.outputs.ms_zip }}" --clobber
+
+      - name: Fetch the signed package from Partner Center
+        if: inputs.ms_zip_asset == ''
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/certified.py fetch \
+            --product-id "${{ steps.rel.outputs.product_id }}" \
+            --submission-id "${{ steps.rel.outputs.submission_id }}" \
+            --out "${{ steps.rel.outputs.ms_zip }}"
+          # Park Microsoft's zip on the release as-is (the audit trail);
+          # the canonical package is published by the verify job.
+          gh release upload "${{ steps.rel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" "${{ steps.rel.outputs.ms_zip }}" --clobber
+
+      - name: Cross-check Microsoft's zip against the lab package
+        run: |
+          python3 .github/scripts/certified.py verify \
+            --ms-zip "${{ steps.rel.outputs.ms_zip }}" --lab-zip "${{ steps.rel.outputs.lab_zip }}" \
+            --version "${{ inputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: certified-packages
+          path: |
+            ${{ steps.rel.outputs.ms_zip }}
+            ${{ steps.rel.outputs.lab_zip }}
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    needs: fetch
+    # windows-2022, not windows-latest: hashFiles() depends on the checkout
+    # (CRLF conversion + NTFS directory order) and must equal what
+    # build.yml records on its windows-2022 runner, or installers never
+    # pair with this package.
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute driver source hash
+        id: srchash
+        shell: pwsh
+        run: |
+          "hash=${{ hashFiles('driver/**', 'include/**') }}" >> $env:GITHUB_OUTPUT
+          Write-Host "Driver source hash of ${{ github.sha }}: ${{ hashFiles('driver/**', 'include/**') }}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: certified-packages
+          path: packages
+
+      - name: Verify Microsoft signatures (signtool)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Expand-Archive "packages\${{ needs.fetch.outputs.ms_zip }}" -DestinationPath ms-signed -Force
+          $sysFiles = @(Get-ChildItem ms-signed -Recurse -Filter "StreamToSpeaker.sys")
+          if ($sysFiles.Count -ne 1) { throw "expected exactly one StreamToSpeaker.sys in Microsoft's zip, found $($sysFiles.Count)" }
+          $sys = $sysFiles[0]
+          $cat = Get-ChildItem $sys.DirectoryName -Filter "StreamToSpeaker.cat" | Select-Object -First 1
+          if (-not $cat) { throw "no catalog next to the signed .sys" }
+
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match '\\x64\\' } |
+              Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+
+          Write-Host "== catalog verification (kernel policy) =="
+          $catOut = & $signtool verify /kp /v /c $cat.FullName $sys.FullName 2>&1 | Out-String
+          Write-Host $catOut
+          if ($LASTEXITCODE -ne 0) { throw "signtool catalog verification failed" }
+          if ($catOut -notmatch "Hardware Compatibility Publisher") { throw "catalog is not signed by the Microsoft Windows Hardware Compatibility Publisher" }
+
+          Write-Host "== embedded signatures, all indexes (kernel policy) =="
+          # The primary signature is the lab's self-signed test certificate
+          # (HLK submissions keep it; Microsoft nests its signature at index
+          # 1), so signtool reports an untrusted root for index 0 and exits
+          # non-zero. The requirement is a Microsoft Windows Hardware
+          # Compatibility Publisher signature at ANY index; the catalog check
+          # above is what the kernel actually relies on.
+          $embOut = & $signtool verify /all /v /kp $sys.FullName 2>&1 | Out-String
+          Write-Host $embOut
+          if ($embOut -notmatch "Hardware Compatibility Publisher") {
+              throw "no Microsoft Windows Hardware Compatibility Publisher signature on the .sys at any index"
+          }
+          if ($embOut -notmatch "Nested Signature") {
+              Write-Host "##[warning]no nested signature reported - Microsoft signed as primary? (fine, but unexpected for an HLK return)"
+          }
+
+      - name: Cross-check against the lab package (INF + stripped .sys)
+        shell: pwsh
+        run: |
+          python .github/scripts/certified.py verify `
+            --ms-zip "packages\${{ needs.fetch.outputs.ms_zip }}" --lab-zip "packages\${{ needs.fetch.outputs.lab_zip }}" `
+            --version "${{ inputs.version }}"
+          if ($LASTEXITCODE -ne 0) { throw "package cross-check failed" }
+
+      - name: Publish canonical package + manifest (certified=true)
+        id: publish
+        shell: pwsh
+        run: |
+          $args = @(
+            "release",
+            "--repo", "${{ github.repository }}",
+            "--tag", "${{ needs.fetch.outputs.tag }}",
+            "--version", "${{ inputs.version }}",
+            "--commit", "${{ github.sha }}",
+            "--source-hash", "${{ steps.srchash.outputs.hash }}",
+            "--product-id", "${{ needs.fetch.outputs.product_id || inputs.product_id }}",
+            "--submission-id", "${{ needs.fetch.outputs.submission_id || inputs.submission_id }}",
+            "--os", "${{ inputs.os }}",
+            "--ms-zip", "packages\${{ needs.fetch.outputs.ms_zip }}",
+            "--lab-zip", "packages\${{ needs.fetch.outputs.lab_zip }}"
+          )
+          if ("${{ inputs.report_id }}") { $args += @("--report-id", "${{ inputs.report_id }}") }
+          python .github/scripts/certified.py @args
+          if ($LASTEXITCODE -ne 0) { throw "publishing the certified release failed" }
+
+      # Provenance for the canonical driver package (bytes are final here).
+      # Verify with:
+      #   gh attestation verify StreamToSpeaker-Driver-<ver>-Signed.zip -R ${{ github.repository }}
+      - name: Attest build provenance (public repo only)
+        id: attest
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ steps.publish.outputs.signed_zip }}
+
+      - name: Publish the attestation bundle
+        if: ${{ !github.event.repository.private }}
+        shell: pwsh
+        run: |
+          $bundle = "${{ steps.publish.outputs.signed_zip }}.sigstore.json"
+          Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
+          gh release upload "${{ needs.fetch.outputs.tag }}" --repo "${{ github.repository }}" $bundle --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }

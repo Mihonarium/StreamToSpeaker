@@ -16,15 +16,14 @@
 ; Output:     installer\out\StreamToSpeakerSetup-<ver>.exe
 ;
 ; Requirements before running the installer on a target machine:
-;   - Windows 10 1809+ (the driver INF targets that)
+;   - Windows 10 1809+ x64 (the driver INF targets that)
 ;   - For TEST-SIGNED builds (staging contains StreamToSpeaker.cer):
 ;     test signing on, Secure Boot off, HVCI off
-;   - For Microsoft-ATTESTED builds (release CI stages the attestation-
-;     signed driver package and NO .cer): none of the above — the driver
-;     loads on stock Windows 10/11 with Secure Boot on. The cert-import
-;     steps below are gated on the .cer existing, so the same script
-;     serves both variants. (Windows Server won't load attestation-signed
-;     drivers; that was never a target.)
+;   - For Microsoft-SIGNED builds (release CI stages the WHQL-certified —
+;     or, failing that, attestation-signed — driver package and NO .cer):
+;     none of the above — the driver loads on stock Windows 10/11 with
+;     Secure Boot on. The cert-import steps below are gated on the .cer
+;     existing, so the same script serves both variants.
 ; -----------------------------------------------------------------------------
 
 #define MyAppName        "Stream To Speaker"
@@ -72,8 +71,11 @@ OutputBaseFilename={#MyAppShortName}Setup-{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=admin
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
+; x64os, not x64compatible: the kernel driver is x64-only, and
+; x64compatible would also admit ARM64 hosts (where x64 apps run under
+; emulation but an x64 .sys cannot load). Requires Inno Setup 6.3+.
+ArchitecturesAllowed=x64os
+ArchitecturesInstallIn64BitMode=x64os
 MinVersion=10.0.17763
 WizardStyle=modern
 ; The setup executable's own icon, and the icon shown in Add/Remove

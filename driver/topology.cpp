@@ -469,30 +469,67 @@ CMiniportTopology::Init(
 /* Property handlers                                                   */
 /* ------------------------------------------------------------------ */
 
-static VOID FillVolumeBasicSupport(
-    _Out_ PKSPROPERTY_DESCRIPTION desc,
-    _Out_ PKSPROPERTY_MEMBERSHEADER hdr,
-    _Out_ PKSPROPERTY_STEPPING_LONG step)
+/* KSPROPERTY_TYPE_BASICSUPPORT for a per-channel stepped property
+ * (volume, mute). KS clients may ask for just the access flags (a
+ * ULONG), the KSPROPERTY_DESCRIPTION header, or the header plus the
+ * members list; all three are honoured. The description carries one
+ * KSPROPERTY_STEPPING_LONG per channel and is flagged MULTICHANNEL,
+ * as HLK's KS Topology Test requires for a multi-channel node.
+ * Mirrors sysvad's PropertyHandler_BasicSupportVolume/Mute. */
+static NTSTATUS BasicSupportSteppedPerChannel(
+    _In_ PPCPROPERTY_REQUEST Request,
+    _In_ ULONG PropTypeId,
+    _In_ LONG  Minimum,
+    _In_ LONG  Maximum,
+    _In_ ULONG Step)
 {
-    desc->AccessFlags       = KSPROPERTY_TYPE_BASICSUPPORT |
-                              KSPROPERTY_TYPE_GET |
-                              KSPROPERTY_TYPE_SET;
-    desc->DescriptionSize   = sizeof(*desc) + sizeof(*hdr) + sizeof(*step);
-    desc->PropTypeSet.Set   = KSPROPTYPESETID_General;
-    desc->PropTypeSet.Id    = VT_I4;
-    desc->PropTypeSet.Flags = 0;
-    desc->MembersListCount  = 1;
-    desc->Reserved          = 0;
+    const ULONG access = KSPROPERTY_TYPE_BASICSUPPORT |
+                         KSPROPERTY_TYPE_GET |
+                         KSPROPERTY_TYPE_SET;
+    const ULONG cbFull = sizeof(KSPROPERTY_DESCRIPTION) +
+                         sizeof(KSPROPERTY_MEMBERSHEADER) +
+                         sizeof(KSPROPERTY_STEPPING_LONG) * STREAM_TO_SPEAKER_CHANNELS;
 
-    hdr->MembersFlags       = KSPROPERTY_MEMBER_STEPPEDRANGES;
-    hdr->MembersSize        = sizeof(*step);
-    hdr->MembersCount       = 1;
-    hdr->Flags              = KSPROPERTY_MEMBER_FLAG_BASICSUPPORT_UNIFORM;
+    if (Request->ValueSize >= sizeof(KSPROPERTY_DESCRIPTION)) {
+        PKSPROPERTY_DESCRIPTION desc =
+            static_cast<PKSPROPERTY_DESCRIPTION>(Request->Value);
+        desc->AccessFlags       = access;
+        desc->DescriptionSize   = cbFull;
+        desc->PropTypeSet.Set   = KSPROPTYPESETID_General;
+        desc->PropTypeSet.Id    = PropTypeId;
+        desc->PropTypeSet.Flags = 0;
+        desc->MembersListCount  = 1;
+        desc->Reserved          = 0;
 
-    step->SteppingDelta     = STREAM_TO_SPEAKER_VOLUME_STEP_MILLIBELS;
-    step->Reserved          = 0;
-    step->Bounds.SignedMinimum = STREAM_TO_SPEAKER_VOLUME_MIN_MILLIBELS;
-    step->Bounds.SignedMaximum = STREAM_TO_SPEAKER_VOLUME_MAX_MILLIBELS;
+        if (Request->ValueSize >= cbFull) {
+            PKSPROPERTY_MEMBERSHEADER hdr =
+                reinterpret_cast<PKSPROPERTY_MEMBERSHEADER>(desc + 1);
+            hdr->MembersFlags = KSPROPERTY_MEMBER_STEPPEDRANGES;
+            hdr->MembersSize  = sizeof(KSPROPERTY_STEPPING_LONG);
+            hdr->MembersCount = STREAM_TO_SPEAKER_CHANNELS;
+            hdr->Flags        = KSPROPERTY_MEMBER_FLAG_BASICSUPPORT_MULTICHANNEL;
+
+            PKSPROPERTY_STEPPING_LONG step =
+                reinterpret_cast<PKSPROPERTY_STEPPING_LONG>(hdr + 1);
+            for (ULONG i = 0; i < STREAM_TO_SPEAKER_CHANNELS; ++i) {
+                step[i].SteppingDelta        = Step;
+                step[i].Reserved             = 0;
+                step[i].Bounds.SignedMinimum = Minimum;
+                step[i].Bounds.SignedMaximum = Maximum;
+            }
+            Request->ValueSize = cbFull;
+        } else {
+            Request->ValueSize = sizeof(KSPROPERTY_DESCRIPTION);
+        }
+        return STATUS_SUCCESS;
+    }
+    if (Request->ValueSize >= sizeof(ULONG)) {
+        *static_cast<PULONG>(Request->Value) = access;
+        Request->ValueSize = sizeof(ULONG);
+        return STATUS_SUCCESS;
+    }
+    Request->ValueSize = 0;
+    return STATUS_BUFFER_TOO_SMALL;
 }
 
 NTSTATUS
@@ -501,36 +538,10 @@ CMiniportTopology::PropertyHandlerVolumeLevel(_In_ PPCPROPERTY_REQUEST Request)
     PAGED_CODE();
 
     if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
-        if (Request->ValueSize < sizeof(KSPROPERTY_DESCRIPTION)) {
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-        PKSPROPERTY_DESCRIPTION desc =
-            static_cast<PKSPROPERTY_DESCRIPTION>(Request->Value);
-        if (Request->ValueSize < sizeof(*desc) +
-                                 sizeof(KSPROPERTY_MEMBERSHEADER) +
-                                 sizeof(KSPROPERTY_STEPPING_LONG)) {
-            /* Return just the size. */
-            desc->AccessFlags     = KSPROPERTY_TYPE_BASICSUPPORT |
-                                    KSPROPERTY_TYPE_GET |
-                                    KSPROPERTY_TYPE_SET;
-            desc->DescriptionSize = sizeof(*desc) +
-                                    sizeof(KSPROPERTY_MEMBERSHEADER) +
-                                    sizeof(KSPROPERTY_STEPPING_LONG);
-            desc->PropTypeSet.Set   = KSPROPTYPESETID_General;
-            desc->PropTypeSet.Id    = VT_I4;
-            desc->PropTypeSet.Flags = 0;
-            desc->MembersListCount  = 1;
-            desc->Reserved          = 0;
-            Request->ValueSize      = sizeof(*desc);
-            return STATUS_SUCCESS;
-        }
-        PKSPROPERTY_MEMBERSHEADER hdr =
-            reinterpret_cast<PKSPROPERTY_MEMBERSHEADER>(desc + 1);
-        PKSPROPERTY_STEPPING_LONG step =
-            reinterpret_cast<PKSPROPERTY_STEPPING_LONG>(hdr + 1);
-        FillVolumeBasicSupport(desc, hdr, step);
-        Request->ValueSize = desc->DescriptionSize;
-        return STATUS_SUCCESS;
+        return BasicSupportSteppedPerChannel(Request, VT_I4,
+                                             STREAM_TO_SPEAKER_VOLUME_MIN_MILLIBELS,
+                                             STREAM_TO_SPEAKER_VOLUME_MAX_MILLIBELS,
+                                             STREAM_TO_SPEAKER_VOLUME_STEP_MILLIBELS);
     }
 
     /* Channel selector: -1 == "all". */
@@ -538,6 +549,9 @@ CMiniportTopology::PropertyHandlerVolumeLevel(_In_ PPCPROPERTY_REQUEST Request)
         return STATUS_INVALID_PARAMETER;
     }
     LONG channel = *static_cast<LONG*>(Request->Instance);
+    if (channel != -1 && (channel < 0 || (ULONG)channel >= STREAM_TO_SPEAKER_CHANNELS)) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     if (Request->Verb & KSPROPERTY_TYPE_GET) {
         if (Request->ValueSize < sizeof(LONG)) {
@@ -585,22 +599,17 @@ CMiniportTopology::PropertyHandlerMute(_In_ PPCPROPERTY_REQUEST Request)
     PAGED_CODE();
 
     if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
-        if (Request->ValueSize < sizeof(KSPROPERTY_DESCRIPTION)) {
-            return STATUS_BUFFER_TOO_SMALL;
+        /* BOOL range: 0 (unmuted) .. 1 (muted), one step. */
+        return BasicSupportSteppedPerChannel(Request, VT_BOOL, 0, 1, 1);
+    }
+
+    /* Channel selector: -1 == "all". Mute is one switch for both
+     * channels, but the index must still be a valid channel. */
+    if (Request->InstanceSize >= sizeof(LONG)) {
+        LONG channel = *static_cast<LONG*>(Request->Instance);
+        if (channel != -1 && (channel < 0 || (ULONG)channel >= STREAM_TO_SPEAKER_CHANNELS)) {
+            return STATUS_INVALID_PARAMETER;
         }
-        PKSPROPERTY_DESCRIPTION desc =
-            static_cast<PKSPROPERTY_DESCRIPTION>(Request->Value);
-        desc->AccessFlags     = KSPROPERTY_TYPE_BASICSUPPORT |
-                                KSPROPERTY_TYPE_GET |
-                                KSPROPERTY_TYPE_SET;
-        desc->DescriptionSize = sizeof(*desc);
-        desc->PropTypeSet.Set   = KSPROPTYPESETID_General;
-        desc->PropTypeSet.Id    = VT_BOOL;
-        desc->PropTypeSet.Flags = 0;
-        desc->MembersListCount  = 0;
-        desc->Reserved          = 0;
-        Request->ValueSize = sizeof(*desc);
-        return STATUS_SUCCESS;
     }
 
     if (Request->Verb & KSPROPERTY_TYPE_GET) {

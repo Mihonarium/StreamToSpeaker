@@ -36,16 +36,96 @@ StreamToSpeakerWaveFormat()
     return &g_WaveFormat;
 }
 
+/* Signal-processing modes the render pin supports. DEFAULT is what
+ * the shared-mode engine uses and is the only required mode. RAW is
+ * deliberately not advertised: a pin that offers RAW must provide
+ * hardware volume/mute/peak-meter (no APOs run in RAW) and the HLK
+ * Hardware Offload test then opens a second, RAW-mode stream, which a
+ * single-instance render pin backed by one ring buffer cannot serve. */
+static const GUID g_SignalProcessingModes[] =
+{
+    STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT
+};
+
+/* Fill a KSDATAFORMAT_WAVEFORMATEXTENSIBLE for `channels` (1 or 2)
+ * channels of L16 @ 44.1 kHz. `needed` bytes are written. */
+static const ULONG g_FormatBytes =
+    sizeof(KSDATAFORMAT) + sizeof(WAVEFORMATEXTENSIBLE);
+
+static VOID FillFormat(_Out_writes_bytes_(g_FormatBytes) PVOID Out, _In_ ULONG Channels)
+{
+    PKSDATAFORMAT_WAVEFORMATEXTENSIBLE fmt =
+        static_cast<PKSDATAFORMAT_WAVEFORMATEXTENSIBLE>(Out);
+    RtlZeroMemory(fmt, g_FormatBytes);
+    RtlCopyMemory(&fmt->WaveFormatExt, &g_WaveFormat, sizeof(WAVEFORMATEXTENSIBLE));
+    if (Channels == 1) {
+        fmt->WaveFormatExt.Format.nChannels       = 1;
+        fmt->WaveFormatExt.Format.nBlockAlign     = (WORD)(STREAM_TO_SPEAKER_BITS_PER_SAMPLE / 8u);
+        fmt->WaveFormatExt.Format.nAvgBytesPerSec = STREAM_TO_SPEAKER_SAMPLE_RATE *
+                                                    (STREAM_TO_SPEAKER_BITS_PER_SAMPLE / 8u);
+        fmt->WaveFormatExt.dwChannelMask          = KSAUDIO_SPEAKER_MONO;
+    }
+    fmt->DataFormat.FormatSize  = g_FormatBytes;
+    fmt->DataFormat.Flags       = 0;
+    fmt->DataFormat.SampleSize  = fmt->WaveFormatExt.Format.nBlockAlign;
+    fmt->DataFormat.Reserved    = 0;
+    fmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
+    fmt->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
+    fmt->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
+}
+
+ULONG
+StreamToSpeakerSupportedChannels(_In_reads_bytes_(Size) const KSDATAFORMAT* Format, _In_ ULONG Size)
+{
+    if (Format == nullptr || Size < sizeof(KSDATAFORMAT_WAVEFORMATEX) ||
+        Format->FormatSize < sizeof(KSDATAFORMAT_WAVEFORMATEX)) {
+        return 0;
+    }
+    if (!IsEqualGUIDAligned(Format->MajorFormat, KSDATAFORMAT_TYPE_AUDIO) ||
+        !IsEqualGUIDAligned(Format->Specifier,   KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)) {
+        return 0;
+    }
+    const WAVEFORMATEX* wfx =
+        &reinterpret_cast<const KSDATAFORMAT_WAVEFORMATEX*>(Format)->WaveFormatEx;
+    BOOLEAN pcm = IsEqualGUIDAligned(Format->SubFormat, KSDATAFORMAT_SUBTYPE_PCM) ? TRUE : FALSE;
+    if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        if (Size < g_FormatBytes || Format->FormatSize < g_FormatBytes ||
+            wfx->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+            return 0;
+        }
+        const WAVEFORMATEXTENSIBLE* ext =
+            reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(wfx);
+        pcm = (pcm && IsEqualGUIDAligned(ext->SubFormat, KSDATAFORMAT_SUBTYPE_PCM)) ? TRUE : FALSE;
+        if (ext->Samples.wValidBitsPerSample != 0 &&
+            ext->Samples.wValidBitsPerSample != STREAM_TO_SPEAKER_BITS_PER_SAMPLE) {
+            return 0;
+        }
+    } else if (wfx->wFormatTag != WAVE_FORMAT_PCM) {
+        return 0;
+    }
+    if (!pcm ||
+        wfx->nSamplesPerSec != STREAM_TO_SPEAKER_SAMPLE_RATE ||
+        wfx->wBitsPerSample != STREAM_TO_SPEAKER_BITS_PER_SAMPLE ||
+        (wfx->nChannels != 1 && wfx->nChannels != STREAM_TO_SPEAKER_CHANNELS) ||
+        wfx->nBlockAlign != wfx->nChannels * (STREAM_TO_SPEAKER_BITS_PER_SAMPLE / 8u)) {
+        return 0;
+    }
+    return wfx->nChannels;
+}
+
 /* ------------------------------------------------------------------ */
 /* Data ranges for the wave pin                                        */
 /* ------------------------------------------------------------------ */
 
+/* KSDATARANGE_AUDIO has no minimum channel count: MaximumChannels == 2
+ * means "1 or 2 channels" (HLK's General Audio Test probes both), so
+ * every format path in this file accepts mono as well as stereo. */
 static KSDATARANGE_AUDIO PinDataRangesPCM[] =
 {
     {
         {
             sizeof(KSDATARANGE_AUDIO),
-            0,
+            KSDATARANGE_ATTRIBUTES,     /* an attribute list follows in the pointer array */
             0,
             0,
             STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
@@ -60,9 +140,34 @@ static KSDATARANGE_AUDIO PinDataRangesPCM[] =
     }
 };
 
+/* Signal-processing-mode attribute for the render pin's data range.
+ * KS only lets a client connect with a KSDATAFORMAT_ATTRIBUTES format
+ * (the audio engine always attaches the processing mode) if the
+ * matching data range declares the attribute, so the range above is
+ * flagged KSDATARANGE_ATTRIBUTES and this list follows it in the
+ * pointer array — the sysvad pattern. */
+static KSATTRIBUTE PinDataRangeSignalProcessingModeAttribute =
+{
+    sizeof(KSATTRIBUTE),
+    0,
+    STATICGUIDOF(KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE)
+};
+
+static PKSATTRIBUTE PinDataRangeAttributes[] =
+{
+    &PinDataRangeSignalProcessingModeAttribute
+};
+
+static KSATTRIBUTE_LIST PinDataRangeAttributeList =
+{
+    SIZEOF_ARRAY(PinDataRangeAttributes),
+    PinDataRangeAttributes
+};
+
 static PKSDATARANGE PinDataRangePointersPCM[] =
 {
-    reinterpret_cast<PKSDATARANGE>(&PinDataRangesPCM[0])
+    reinterpret_cast<PKSDATARANGE>(&PinDataRangesPCM[0]),
+    reinterpret_cast<PKSDATARANGE>(&PinDataRangeAttributeList)
 };
 
 /* Bridge pin (output) advertises a generic analog data range. */
@@ -86,12 +191,12 @@ static PKSDATARANGE PinDataRangePointersBridge[] =
 /* Filter-level property handler — KSPROPSETID_Pin queries that        */
 /* AudioEndpointBuilder calls before creating the endpoint:           */
 /*   KSPROPERTY_PIN_PROPOSEDATAFORMAT  (SET): validate a proposed fmt  */
-/*   KSPROPERTY_PIN_PROPOSEDATAFORMAT2 (GET): list signal-processing  */
-/*                                            modes we support        */
+/*   KSPROPERTY_PIN_PROPOSEDATAFORMAT2 (GET): default format for a     */
+/*                                            signal-processing mode   */
 /* PortCls does NOT auto-handle these; if the filter's AutomationTable */
 /* is NULL, AEB sees STATUS_NOT_SUPPORTED and won't fully classify the */
 /* endpoint (one of the symptoms that leaves us at "Internal AUX Jack" */
-/* placeholder). simpleaudiosample's speakerwavtable.h pattern.        */
+/* placeholder). sysvad's speakerwavtable.h pattern.                   */
 /* ------------------------------------------------------------------ */
 NTSTATUS PropertyHandler_WaveFilter(_In_ PPCPROPERTY_REQUEST Request);
 
@@ -192,24 +297,64 @@ static PCFILTER_DESCRIPTOR WaveMiniportFilterDescriptor =
 /* PropertyHandler_WaveFilter implementation                           */
 /* ------------------------------------------------------------------ */
 
+/* KSPROPERTY_TYPE_BASICSUPPORT for a property with no value ranges.
+ * KS clients may pass either a ULONG (access flags only) or a
+ * KSPROPERTY_DESCRIPTION; both must be honoured (HLK KS Topology
+ * Test, TC_CheckPropertyDescriptorSize). */
+static NTSTATUS BasicSupportNoMembers(
+    _In_ PPCPROPERTY_REQUEST Request,
+    _In_ ULONG               AccessFlags,
+    _In_ ULONG               PropTypeId)
+{
+    if (Request->ValueSize >= sizeof(KSPROPERTY_DESCRIPTION)) {
+        PKSPROPERTY_DESCRIPTION d =
+            static_cast<PKSPROPERTY_DESCRIPTION>(Request->Value);
+        d->AccessFlags       = AccessFlags;
+        d->DescriptionSize   = sizeof(KSPROPERTY_DESCRIPTION);
+        d->PropTypeSet.Set   = KSPROPTYPESETID_General;
+        d->PropTypeSet.Id    = PropTypeId;
+        d->PropTypeSet.Flags = 0;
+        d->MembersListCount  = 0;
+        d->Reserved          = 0;
+        Request->ValueSize   = sizeof(KSPROPERTY_DESCRIPTION);
+        return STATUS_SUCCESS;
+    }
+    if (Request->ValueSize >= sizeof(ULONG)) {
+        *static_cast<PULONG>(Request->Value) = AccessFlags;
+        Request->ValueSize = sizeof(ULONG);
+        return STATUS_SUCCESS;
+    }
+    Request->ValueSize = 0;
+    return STATUS_BUFFER_TOO_SMALL;
+}
+
+/* KSP_PIN::PinId from a pin-scoped filter property request, or
+ * (ULONG)-1 if the instance data is too short. */
+static ULONG RequestPinId(_In_ PPCPROPERTY_REQUEST Request)
+{
+    if (Request->Instance == nullptr ||
+        Request->InstanceSize < sizeof(KSP_PIN) - RTL_SIZEOF_THROUGH_FIELD(KSP_PIN, Property)) {
+        return (ULONG)-1;
+    }
+    return CONTAINING_RECORD(Request->Instance, KSP_PIN, PinId)->PinId;
+}
+
 static NTSTATUS PropertyHandlerProposedFormat(_In_ PPCPROPERTY_REQUEST Request)
 {
     PAGED_CODE();
+    /* Only the render sink pin has a proposable format; the bridge pin
+     * must not report support (HLK KS Topology Test). */
+    ULONG pin = RequestPinId(Request);
+    if (pin >= SIZEOF_ARRAY(WaveMiniportPins)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (pin != KSPIN_WAVE_RENDER_SINK) {
+        return STATUS_NOT_SUPPORTED;
+    }
     if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
-        if (Request->ValueSize < sizeof(KSPROPERTY_DESCRIPTION)) {
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-        PKSPROPERTY_DESCRIPTION d =
-            static_cast<PKSPROPERTY_DESCRIPTION>(Request->Value);
-        d->AccessFlags     = KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT;
-        d->DescriptionSize = sizeof(KSPROPERTY_DESCRIPTION);
-        d->PropTypeSet.Set = KSPROPTYPESETID_General;
-        d->PropTypeSet.Id  = 0;
-        d->PropTypeSet.Flags = 0;
-        d->MembersListCount = 0;
-        d->Reserved        = 0;
-        Request->ValueSize = sizeof(KSPROPERTY_DESCRIPTION);
-        return STATUS_SUCCESS;
+        return BasicSupportNoMembers(Request,
+                                     KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
+                                     VT_ILLEGAL);
     }
     if (!(Request->Verb & KSPROPERTY_TYPE_SET)) {
         return STATUS_INVALID_DEVICE_REQUEST;
@@ -217,61 +362,123 @@ static NTSTATUS PropertyHandlerProposedFormat(_In_ PPCPROPERTY_REQUEST Request)
     if (Request->ValueSize < sizeof(KSDATAFORMAT_WAVEFORMATEX)) {
         return STATUS_BUFFER_TOO_SMALL;
     }
-    PKSDATAFORMAT_WAVEFORMATEX pFmt =
-        static_cast<PKSDATAFORMAT_WAVEFORMATEX>(Request->Value);
-    if (!IsEqualGUIDAligned(pFmt->DataFormat.MajorFormat, KSDATAFORMAT_TYPE_AUDIO) ||
-        !IsEqualGUIDAligned(pFmt->DataFormat.SubFormat,   KSDATAFORMAT_SUBTYPE_PCM)) {
-        return STATUS_NO_MATCH;
-    }
-    if (pFmt->WaveFormatEx.nChannels      != STREAM_TO_SPEAKER_CHANNELS ||
-        pFmt->WaveFormatEx.nSamplesPerSec != STREAM_TO_SPEAKER_SAMPLE_RATE ||
-        pFmt->WaveFormatEx.wBitsPerSample != STREAM_TO_SPEAKER_BITS_PER_SAMPLE) {
+    const KSDATAFORMAT* fmt = static_cast<const KSDATAFORMAT*>(Request->Value);
+    if (StreamToSpeakerSupportedChannels(fmt, Request->ValueSize) == 0) {
         return STATUS_NO_MATCH;
     }
     return STATUS_SUCCESS;
 }
 
+/* Locate the signal-processing-mode attribute in a KSMULTIPLE_ITEM
+ * attribute list (as attached to KSP_PIN by PROPOSEDATAFORMAT2).
+ * Returns STATUS_NOT_FOUND when the list carries no mode attribute. */
+static NTSTATUS SignalProcessingModeFromAttributes(
+    _In_reads_bytes_(Bytes) const VOID* List,
+    _In_  size_t Bytes,
+    _Out_ GUID*  Mode)
+{
+    if (Bytes < sizeof(KSMULTIPLE_ITEM)) {
+        return STATUS_NOT_FOUND;
+    }
+    const KSMULTIPLE_ITEM* items = static_cast<const KSMULTIPLE_ITEM*>(List);
+    if (items->Size < sizeof(KSMULTIPLE_ITEM) || items->Size > Bytes) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    const UCHAR* p   = reinterpret_cast<const UCHAR*>(items + 1);
+    const UCHAR* end = reinterpret_cast<const UCHAR*>(items) + items->Size;
+    for (ULONG i = 0; i < items->Count; ++i) {
+        if (p + sizeof(KSATTRIBUTE) > end) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        const KSATTRIBUTE* attr = reinterpret_cast<const KSATTRIBUTE*>(p);
+        if (attr->Size < sizeof(KSATTRIBUTE) || p + attr->Size > end) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (IsEqualGUIDAligned(attr->Attribute, KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE)) {
+            if (attr->Size < sizeof(KSATTRIBUTE_AUDIOSIGNALPROCESSING_MODE)) {
+                return STATUS_INVALID_PARAMETER;
+            }
+            *Mode = reinterpret_cast<const KSATTRIBUTE_AUDIOSIGNALPROCESSING_MODE*>(attr)
+                        ->SignalProcessingMode;
+            return STATUS_SUCCESS;
+        }
+        /* Attributes are 8-byte aligned within the list. */
+        p += (attr->Size + FILE_QUAD_ALIGNMENT) & ~static_cast<size_t>(FILE_QUAD_ALIGNMENT);
+    }
+    return STATUS_NOT_FOUND;
+}
+
+static BOOLEAN IsSupportedSignalProcessingMode(_In_ const GUID& Mode)
+{
+    for (ULONG i = 0; i < SIZEOF_ARRAY(g_SignalProcessingModes); ++i) {
+        if (IsEqualGUIDAligned(Mode, g_SignalProcessingModes[i])) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* KSPROPERTY_PIN_PROPOSEDATAFORMAT2 (GET): the instance data is a
+ * KSP_PIN followed by an attribute list naming a signal-processing
+ * mode; the reply is the pin's default format for that mode with the
+ * same attribute list appended (KSDATAFORMAT_ATTRIBUTES). Mirrors
+ * sysvad's PropertyHandlerProposedFormat2. */
 static NTSTATUS PropertyHandlerProposedFormat2(_In_ PPCPROPERTY_REQUEST Request)
 {
     PAGED_CODE();
+    /* Request->Instance points at KSP_PIN::PinId (everything after the
+     * KSPROPERTY header). Only the render sink pin is mode-aware. */
+    ULONG pin = RequestPinId(Request);
+    if (pin >= SIZEOF_ARRAY(WaveMiniportPins)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (pin != KSPIN_WAVE_RENDER_SINK) {
+        return STATUS_NOT_SUPPORTED;
+    }
     if (Request->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
-        if (Request->ValueSize < sizeof(KSPROPERTY_DESCRIPTION)) {
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-        PKSPROPERTY_DESCRIPTION d =
-            static_cast<PKSPROPERTY_DESCRIPTION>(Request->Value);
-        d->AccessFlags     = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
-        d->DescriptionSize = sizeof(KSPROPERTY_DESCRIPTION);
-        d->PropTypeSet.Set = KSPROPTYPESETID_General;
-        d->PropTypeSet.Id  = 0;
-        d->PropTypeSet.Flags = 0;
-        d->MembersListCount = 0;
-        d->Reserved        = 0;
-        Request->ValueSize = sizeof(KSPROPERTY_DESCRIPTION);
-        return STATUS_SUCCESS;
+        return BasicSupportNoMembers(Request,
+                                     KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT,
+                                     VT_ILLEGAL);
     }
     if (!(Request->Verb & KSPROPERTY_TYPE_GET)) {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
-    /* Return a single signal-processing mode: DEFAULT. AEB needs at
-     * least one entry here to consider the pin offload-capable; for
-     * a passthrough virtual driver, DEFAULT is the right answer. */
-    ULONG cModes  = 1;
-    ULONG cbBody  = cModes * sizeof(GUID);
-    ULONG cbTotal = sizeof(KSMULTIPLE_ITEM) + cbBody;
+    const KSP_PIN* kspPin = CONTAINING_RECORD(Request->Instance, KSP_PIN, PinId);
+    const UCHAR* attrs   = reinterpret_cast<const UCHAR*>(kspPin + 1);
+    const UCHAR* instEnd = static_cast<const UCHAR*>(Request->Instance) + Request->InstanceSize;
+    size_t cbAttrs = (attrs < instEnd) ? static_cast<size_t>(instEnd - attrs) : 0;
+
+    GUID mode = AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
+    NTSTATUS status = SignalProcessingModeFromAttributes(attrs, cbAttrs, &mode);
+    if (status == STATUS_NOT_FOUND) {
+        cbAttrs = 0;
+    } else if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    if (!IsSupportedSignalProcessingMode(mode)) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    ULONG cbFormat = (g_FormatBytes + FILE_QUAD_ALIGNMENT) & ~static_cast<ULONG>(FILE_QUAD_ALIGNMENT);
+    if (cbAttrs > MAXULONG - cbFormat) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ULONG cbNeeded = cbFormat + static_cast<ULONG>(cbAttrs);
     if (Request->ValueSize == 0) {
-        Request->ValueSize = cbTotal;
+        Request->ValueSize = cbNeeded;
         return STATUS_BUFFER_OVERFLOW;
     }
-    if (Request->ValueSize < cbTotal) {
+    if (Request->ValueSize < cbNeeded) {
         return STATUS_BUFFER_TOO_SMALL;
     }
-    PKSMULTIPLE_ITEM mi = static_cast<PKSMULTIPLE_ITEM>(Request->Value);
-    mi->Size  = cbTotal;
-    mi->Count = cModes;
-    GUID* modes = reinterpret_cast<GUID*>(mi + 1);
-    modes[0] = AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
-    Request->ValueSize = cbTotal;
+    UCHAR* out = static_cast<UCHAR*>(Request->Value);
+    RtlZeroMemory(out, cbNeeded);
+    FillFormat(out, STREAM_TO_SPEAKER_CHANNELS);
+    if (cbAttrs > 0) {
+        reinterpret_cast<PKSDATAFORMAT>(out)->Flags = KSDATAFORMAT_ATTRIBUTES;
+        RtlCopyMemory(out + cbFormat, attrs, cbAttrs);
+    }
+    Request->ValueSize = cbNeeded;
     return STATUS_SUCCESS;
 }
 
@@ -348,6 +555,8 @@ CMiniportWaveRT::NonDelegatingQueryInterface(
     } else if (IsEqualGUIDAligned(Interface, IID_IMiniport) ||
                IsEqualGUIDAligned(Interface, IID_IMiniportWaveRT)) {
         *Object = PVOID(PMINIPORTWAVERT(this));
+    } else if (IsEqualGUIDAligned(Interface, IID_IMiniportAudioSignalProcessing)) {
+        *Object = PVOID(PMINIPORTAudioSignalProcessing(this));
     } else {
         *Object = nullptr;
     }
@@ -369,6 +578,42 @@ CMiniportWaveRT::GetDescription(_Out_ PPCFILTER_DESCRIPTOR* OutFilterDescriptor)
     return STATUS_SUCCESS;
 }
 
+/* IMiniportAudioSignalProcessing::GetModes — PortCls serves
+ * KSPROPERTY_AUDIOSIGNALPROCESSING_MODES from this. Only the render
+ * sink pin is mode-aware; the bridge pin reports "no modes". */
+STDMETHODIMP_(NTSTATUS)
+CMiniportWaveRT::GetModes(
+    _In_                                        ULONG  Pin,
+    _Out_writes_opt_(*NumSignalProcessingModes) GUID*  SignalProcessingModes,
+    _Inout_                                     ULONG* NumSignalProcessingModes)
+{
+    PAGED_CODE();
+    if (NumSignalProcessingModes == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Pin >= SIZEOF_ARRAY(WaveMiniportPins)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Pin != KSPIN_WAVE_RENDER_SINK) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    const ULONG count = SIZEOF_ARRAY(g_SignalProcessingModes);
+    if (SignalProcessingModes != nullptr) {
+        if (*NumSignalProcessingModes < count) {
+            *NumSignalProcessingModes = count;
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        for (ULONG i = 0; i < count; ++i) {
+            SignalProcessingModes[i] = g_SignalProcessingModes[i];
+        }
+    }
+    *NumSignalProcessingModes = count;
+    return STATUS_SUCCESS;
+}
+
+/* Intersect the client's KSDATARANGE_AUDIO with ours. Sample rate and
+ * bit depth are fixed; the channel count follows the client (1 or 2),
+ * because a data range with MaximumChannels == 2 promises both. */
 STDMETHODIMP
 CMiniportWaveRT::DataRangeIntersection(
     _In_ ULONG               PinId,
@@ -385,46 +630,57 @@ CMiniportWaveRT::DataRangeIntersection(
         return STATUS_INVALID_PARAMETER;
     }
     *ResultantFormatLength = 0;
+    if (ClientDataRange == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     if (PinId != KSPIN_WAVE_RENDER_SINK) {
         return STATUS_NOT_SUPPORTED;
     }
 
-    /* Only KSDATAFORMAT_TYPE_AUDIO + PCM. */
-    if (!IsEqualGUIDAligned(ClientDataRange->MajorFormat, KSDATAFORMAT_TYPE_AUDIO) ||
-        !IsEqualGUIDAligned(ClientDataRange->SubFormat,   KSDATAFORMAT_SUBTYPE_PCM)) {
+    /* Only KSDATAFORMAT_TYPE_AUDIO + PCM (wildcards allowed). */
+    if (!IsEqualGUIDAligned(ClientDataRange->MajorFormat, KSDATAFORMAT_TYPE_AUDIO) &&
+        !IsEqualGUIDAligned(ClientDataRange->MajorFormat, KSDATAFORMAT_TYPE_WILDCARD)) {
+        return STATUS_NO_MATCH;
+    }
+    if (!IsEqualGUIDAligned(ClientDataRange->SubFormat, KSDATAFORMAT_SUBTYPE_PCM) &&
+        !IsEqualGUIDAligned(ClientDataRange->SubFormat, KSDATAFORMAT_SUBTYPE_WILDCARD)) {
+        return STATUS_NO_MATCH;
+    }
+    if (!IsEqualGUIDAligned(ClientDataRange->Specifier, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX) &&
+        !IsEqualGUIDAligned(ClientDataRange->Specifier, KSDATAFORMAT_SPECIFIER_WILDCARD)) {
         return STATUS_NO_MATCH;
     }
 
-    ULONG needed = sizeof(KSDATAFORMAT_WAVEFORMATEX) + sizeof(WAVEFORMATEXTENSIBLE) -
-                   sizeof(WAVEFORMATEX);
+    ULONG channels = STREAM_TO_SPEAKER_CHANNELS;
+    if (ClientDataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO)) {
+        const KSDATARANGE_AUDIO* client =
+            reinterpret_cast<const KSDATARANGE_AUDIO*>(ClientDataRange);
+        if (client->MinimumSampleFrequency > STREAM_TO_SPEAKER_SAMPLE_RATE ||
+            client->MaximumSampleFrequency < STREAM_TO_SPEAKER_SAMPLE_RATE ||
+            client->MinimumBitsPerSample   > STREAM_TO_SPEAKER_BITS_PER_SAMPLE ||
+            client->MaximumBitsPerSample   < STREAM_TO_SPEAKER_BITS_PER_SAMPLE ||
+            client->MaximumChannels        == 0) {
+            return STATUS_NO_MATCH;
+        }
+        if (client->MaximumChannels < STREAM_TO_SPEAKER_CHANNELS) {
+            channels = client->MaximumChannels;
+        }
+    }
+
     if (OutputBufferLength == 0) {
-        *ResultantFormatLength = needed;
+        *ResultantFormatLength = g_FormatBytes;
         return STATUS_BUFFER_OVERFLOW;
     }
-    if (OutputBufferLength < needed) {
+    if (OutputBufferLength < g_FormatBytes) {
         return STATUS_BUFFER_TOO_SMALL;
     }
     if (ResultantFormat == nullptr) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    PKSDATAFORMAT_WAVEFORMATEX out =
-        static_cast<PKSDATAFORMAT_WAVEFORMATEX>(ResultantFormat);
-    RtlZeroMemory(out, needed);
-    out->DataFormat.FormatSize  = needed;
-    out->DataFormat.Flags       = 0;
-    out->DataFormat.SampleSize  = STREAM_TO_SPEAKER_FRAME_BYTES;
-    out->DataFormat.Reserved    = 0;
-    out->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
-    out->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
-    out->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
-
-    PWAVEFORMATEXTENSIBLE wfx =
-        reinterpret_cast<PWAVEFORMATEXTENSIBLE>(&out->WaveFormatEx);
-    RtlCopyMemory(wfx, &g_WaveFormat, sizeof(WAVEFORMATEXTENSIBLE));
-
-    *ResultantFormatLength = needed;
+    FillFormat(ResultantFormat, channels);
+    *ResultantFormatLength = g_FormatBytes;
     return STATUS_SUCCESS;
 }
 
@@ -464,6 +720,24 @@ CMiniportWaveRT::NewStream(
     }
     if (Pin != KSPIN_WAVE_RENDER_SINK) {
         return STATUS_INVALID_PARAMETER;
+    }
+    if (StreamToSpeakerSupportedChannels(DataFormat, DataFormat->FormatSize) == 0) {
+        return STATUS_NO_MATCH;
+    }
+    if (DataFormat->Flags & KSDATAFORMAT_ATTRIBUTES) {
+        /* The audio engine attaches the signal-processing mode; only
+         * modes we advertised through GetModes may be used. */
+        const UCHAR* attrs = reinterpret_cast<const UCHAR*>(DataFormat) +
+            ((DataFormat->FormatSize + FILE_QUAD_ALIGNMENT) & ~static_cast<ULONG>(FILE_QUAD_ALIGNMENT));
+        const KSMULTIPLE_ITEM* items = reinterpret_cast<const KSMULTIPLE_ITEM*>(attrs);
+        GUID mode = AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
+        NTSTATUS st = SignalProcessingModeFromAttributes(items, items->Size, &mode);
+        if (st != STATUS_NOT_FOUND && !NT_SUCCESS(st)) {
+            return st;
+        }
+        if (!IsSupportedSignalProcessingMode(mode)) {
+            return STATUS_NOT_SUPPORTED;
+        }
     }
     *OutStream = nullptr;
 

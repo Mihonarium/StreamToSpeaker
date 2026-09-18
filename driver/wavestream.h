@@ -7,6 +7,12 @@
  *    DPC has copied into the IOCTL ring buffer.
  *  - A periodic kernel timer (KTIMER + KDPC) that fires every
  *    STREAM_TO_SPEAKER_NOTIFICATION_INTERVAL_MS while in KSSTATE_RUN.
+ *
+ * Besides the classic position/notification model it implements
+ * IMiniportWaveRTOutputStream (packet-based streaming: SetWritePacket,
+ * GetPacketCount, presentation position). The audio engine only treats
+ * a WaveRT render pin as event-driven capable when those are present,
+ * and HLK's WaveRT conformance test requires it.
  */
 
 #pragma once
@@ -26,6 +32,7 @@ class CMiniportWaveRT;
  * base warning that fires when both are listed explicitly. */
 class CMiniportWaveRTStream :
     public IMiniportWaveRTStreamNotification,
+    public IMiniportWaveRTOutputStream,
     public CUnknown
 {
 public:
@@ -84,6 +91,16 @@ public:
     STDMETHODIMP RegisterNotificationEvent(_In_ PKEVENT NotificationEvent) override;
     STDMETHODIMP UnregisterNotificationEvent(_In_ PKEVENT NotificationEvent) override;
 
+    /* IMiniportWaveRTOutputStream — packet-based streaming. A "packet"
+     * is one notification interval of the cyclic buffer. */
+    STDMETHODIMP_(NTSTATUS) SetWritePacket(
+        _In_ ULONG PacketNumber,
+        _In_ DWORD Flags,
+        _In_ ULONG EosPacketLength) override;
+    STDMETHODIMP_(NTSTATUS) GetOutputStreamPresentationPosition(
+        _Out_ KSAUDIO_PRESENTATION_POSITION* pPresentationPosition) override;
+    STDMETHODIMP_(NTSTATUS) GetPacketCount(_Out_ ULONG* pPacketCount) override;
+
     /* The DPC handler that copies fresh frames out of the WaveRT
      * cyclic buffer and into the IOCTL ring buffer. Public so the
      * static C-style KDEFERRED_ROUTINE thunk can call into it. */
@@ -96,24 +113,43 @@ private:
     BOOLEAN                m_Allocated;
     KSSTATE                m_State;
 
+    /* Stream format: 1 or 2 channels of L16 @ 44.1 kHz. m_FrameBytes is
+     * the engine-side frame size (2 or 4 bytes); the ring buffer the
+     * service reads is always stereo (STREAM_TO_SPEAKER_FRAME_BYTES). */
+    ULONG                  m_Channels;
+    ULONG                  m_FrameBytes;
+
     /* WaveRT cyclic buffer. */
     PMDL                   m_BufferMdl;
     UCHAR*                 m_BufferVa;
     ULONG                  m_BufferBytes;     /* round to whole frame */
 
-    /* Frames written by the engine so far (== Windows' Play position
-     * in samples). We track this with a sample-counter that we
-     * increment in the DPC by the elapsed time delta. */
+    /* Mono → stereo up-mix scratch space (m_BufferBytes * 2), only
+     * allocated for mono streams. */
+    UCHAR*                 m_UpmixVa;
+    ULONG                  m_UpmixBytes;
+
+    /* Frames "played" so far since the last KSSTATE_STOP (== Windows'
+     * Play position in frames). Synthesised from the sample clock:
+     * frames at the most recent RUN transition plus elapsed QPC time
+     * since then. */
     ULONGLONG              m_StreamFramesProduced;
+    ULONGLONG              m_FramesAtRunStart;
+    LARGE_INTEGER          m_RunStartQpc;
 
     /* Frames our consumer has copied into the IOCTL ring already. */
     ULONGLONG              m_StreamFramesConsumed;
+
+    /* Packet bookkeeping for IMiniportWaveRTOutputStream. */
+    ULONG                  m_LastOsWritePacket;
+    BOOLEAN                m_EosReceived;
+    ULONG                  m_EosPacketNumber;
+    ULONG                  m_EosPacketLength;
 
     /* Bookkeeping for the periodic DPC. */
     KTIMER                 m_Timer;
     KDPC                   m_TimerDpc;
     LARGE_INTEGER          m_TimerInterval;       /* relative, 100-ns units */
-    LARGE_INTEGER          m_LastTickQpc;
     LARGE_INTEGER          m_PerfFrequency;
 
     KSPIN_LOCK             m_StateLock;
@@ -134,8 +170,12 @@ private:
     /* Convenience accessor for the device extension. */
     PSTREAM_TO_SPEAKER_DEVICE_EXTENSION DeviceExtension();
 
-    VOID StartTimer();
-    VOID StopTimer();
-    VOID DoCopyToRing();
-    VOID SignalNotificationEvents();
+    VOID  ResetPosition();
+    ULONG PacketBytes() const;
+    ULONG PacketsCompleted() const;
+    VOID  ProduceToRing(_In_reads_bytes_(Bytes) const UCHAR* Src, _In_ ULONG Bytes);
+    VOID  StartTimer();
+    VOID  StopTimer();
+    VOID  DoCopyToRing();
+    VOID  SignalNotificationEvents();
 };
