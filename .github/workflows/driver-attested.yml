@@ -30,13 +30,24 @@ on:
         description: "driver-v* release tag carrying the Microsoft-signed zip (default: newest unattested one with a zip attached)"
         required: false
         default: ""
+      dry_run:
+        description: "Verify only (signatures + INF checks against the given tag, which may already be attested); never touch the release"
+        type: boolean
+        required: false
+        default: false
   # Called by driver-attest.yml right after it attaches the zip Microsoft
   # returned; identical checks run on both the automatic and manual paths.
+  # NB a caller must grant contents: write + id-token: write +
+  # attestations: write, or GitHub refuses the call at trigger time.
   workflow_call:
     inputs:
       tag:
         required: true
         type: string
+      dry_run:
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -178,7 +189,15 @@ jobs:
           "zip_name=$zipName" >> $env:GITHUB_OUTPUT
           "zip_sha256=$zipSha" >> $env:GITHUB_OUTPUT
 
+      - name: Dry run - verification passed, release untouched
+        if: inputs.dry_run
+        shell: pwsh
+        run: |
+          Write-Host "::notice::dry run - ${{ steps.rel.outputs.tag }} verified (signtool + INF identity); manifest and release notes left as they are"
+          "## Driver attested - dry run of ``${{ steps.rel.outputs.tag }}`` passed (release untouched)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
       - name: Finalize release (manifest attested=true)
+        if: ${{ !inputs.dry_run }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -238,7 +257,7 @@ jobs:
       #   gh attestation verify StreamToSpeaker-Driver-<ver>-Signed.zip -R Mihonarium/StreamToSpeaker
       - name: Attest build provenance (public repo only)
         id: attest
-        if: ${{ !github.event.repository.private }}
+        if: ${{ !github.event.repository.private && !inputs.dry_run }}
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: ${{ steps.verify.outputs.zip_name }}
@@ -246,7 +265,7 @@ jobs:
       # Ship the Sigstore bundle beside the package so anyone can verify
       # offline (gh attestation verify --bundle) without querying GitHub.
       - name: Publish the attestation bundle
-        if: ${{ !github.event.repository.private }}
+        if: ${{ !github.event.repository.private && !inputs.dry_run }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

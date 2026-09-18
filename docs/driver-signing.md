@@ -237,9 +237,8 @@ release `driver-v1.1.0.209`.
 1. **Lab.** Build the driver (`SignMode=TestSign` is fine — Microsoft
    replaces nothing but adds its own signatures), run the WHCP playlist
    on an HLK client, package the results in HLK Studio and sign the
-   `.hlkx` with the EV cert. Keep the exact INF/SYS/CAT the client ran
-   (`sts-driver-209.zip` for 209): it is the reference the workflow
-   compares Microsoft's return against.
+   `.hlkx` with the EV cert. Keep the exact INF/SYS/CAT the client ran:
+   it is the reference the workflow compares Microsoft's return against.
 2. **Submit by hand** at Partner Center (Hardware → Submit new hardware →
    upload the `.hlkx`, tick the offered OS, no test-signing options). Note
    the product id and submission id from the URL.
@@ -352,9 +351,25 @@ works end to end:
    newest pending release with a zip attached, or pass the tag). Same
    verification as the automatic path.
 
+## Dry runs
+
+`Driver attest` and `Driver attested` take a `dry_run` input on manual
+dispatch. `Driver attested` with `dry_run=true` runs the signtool and INF
+checks against the given `tag` (which may already be attested, e.g.
+`driver-v1.1.0.204`) and stops before the release is modified. `Driver
+attest` with `dry_run=true` skips the Hardware API entirely and calls
+`Driver attested` in dry-run mode for `tag` (default
+`driver-v1.1.0.204`), which exercises the reusable-workflow call — the
+calling job must grant `contents: write`, `id-token: write` and
+`attestations: write`, the permissions `driver-attested.yml` declares.
+`Driver submission` needs no dry-run input: while a certified driver
+matches the current source hash its `certified-guard` job ends the run
+before anything is built. `Driver certified` has no dry-run mode; passing
+`ms_zip_asset` avoids the Hardware API but still rewrites the release's
+manifest.
+
 ## Future work
 
-- **Automate the HLK lab run** (controller + client VMs exist — see the
-  Hetzner lab notes) so Flow D's steps 1-3 stop being manual.
+- **Automate the HLK lab run** so Flow D's steps 1-3 stop being manual.
 - **Uninstaller signing** via an ISCC SignTool shim that blocks on the
   signing repo (adds one more approval per release).
