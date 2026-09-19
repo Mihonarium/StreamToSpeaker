@@ -69,7 +69,8 @@ impl ActiveSession {
             // to a Sonos group (identical to friendly_name otherwise).
             ActiveSession::Upnp(s) => s.renderer.display_name(),
             ActiveSession::AirPlay(s) => s.renderer.friendly_name.clone(),
-            ActiveSession::AirPlay2(s) => s.renderer.friendly_name.clone(),
+            // A stereo pair shows its group name ("Büro 2"), else "L + R".
+            ActiveSession::AirPlay2(s) => s.display_name(),
         }
     }
 
@@ -909,7 +910,13 @@ impl App {
                 // and why an unsupported one might fail.
                 let pw = if r.password_protected { ", password" } else { "" };
                 let base = e.display_name();
-                let group = if e.is_group() { " group" } else { "" };
+                let group = if e.is_group() {
+                    " group"
+                } else if e.is_pair() {
+                    " stereo pair"
+                } else {
+                    ""
+                };
                 let name = match transport {
                     Some(Transport::RaopLegacy) if has_upnp_twin => {
                         format!("{} (AirPlay{}, higher delay{})", base, group, pw)
@@ -932,17 +939,37 @@ impl App {
                         "AirPlay group: {}. Audio is sent over AirPlay 2 to {}, the group's \
                          leader, the same way an iPhone streams to this group.",
                         e.member_names().join(" + "),
-                        r.friendly_name,
+                        if e.is_pair() { e.display_name() } else { r.friendly_name.clone() },
+                    ));
+                } else if e.is_pair() {
+                    notes.push(format!(
+                        "HomePod stereo pair: {}. Both speakers get the same stream over \
+                         AirPlay 2, timed by one shared clock, and each plays its own \
+                         channel.",
+                        e.member_names().join(" + "),
                     ));
                 } else if let Some(leader) = e.folded_under.as_deref() {
-                    let leader_name = d
-                        .find_by_id(leader)
-                        .map(|l| l.friendly_name)
+                    let leader_entry = d.entry_by_id(leader);
+                    let leader_name = leader_entry
+                        .as_ref()
+                        .map(|l| l.display_name())
                         .unwrap_or_else(|| leader.to_string());
-                    notes.push(format!(
-                        "Member of the AirPlay group led by {}. Streams to this speaker alone.",
-                        leader_name
-                    ));
+                    let in_pair = leader_entry
+                        .as_ref()
+                        .map(|l| l.pair_members.iter().any(|m| m.stable_id() == id))
+                        .unwrap_or(false);
+                    if in_pair {
+                        notes.push(format!(
+                            "One half of the stereo pair {}. Streams to this speaker alone \
+                             (it still plays only its own channel).",
+                            leader_name
+                        ));
+                    } else {
+                        notes.push(format!(
+                            "Member of the AirPlay group led by {}. Streams to this speaker alone.",
+                            leader_name
+                        ));
+                    }
                 } else if !e.ungrouped_peers.is_empty() {
                     notes.push(format!(
                         "Shares an AirPlay group (stereo pair or multi-room set) with {}. \
@@ -1487,6 +1514,12 @@ impl App {
         // no longer answers, plus a working _airplay._tcp); we try them in
         // order and fall back, so legacy RAOP, AirPlay 2, and HomePod
         // devices all just work.
+        // A stereo pair row streams to BOTH halves in one session; the
+        // other half rides along as a partner of the row's device.
+        let partners: Vec<AirPlayRenderer> = discovery
+            .entry_by_id(id)
+            .map(|e| e.pair_members)
+            .unwrap_or_default();
         let attempts = self.airplay_attempts(&renderer, discovery);
         if attempts.is_empty() {
             return Err(SelectFailure::Msg(format!(
@@ -1514,7 +1547,7 @@ impl App {
             info!("AirPlay: attempting {} to {}", label, r.friendly_name);
             let name = r.friendly_name.clone();
             let id = r.stable_id();
-            match self.start_airplay_one(transport, r, local_ip) {
+            match self.start_airplay_one(transport, r, partners.clone(), local_ip) {
                 Ok(session) => return Ok(session),
                 Err(AttemptError::NeedsPin) => {
                     warn!("AirPlay {} to {} needs one-time PIN pairing", label, name);
@@ -1568,15 +1601,25 @@ impl App {
         // group's speakers (the "connects, no sound" report), so falling
         // back to RAOP would just turn a visible failure — or a PIN
         // prompt — into silence. See `transport_as_group_leader`.
-        let leads_group = discovery
-            .entry_by_id(&renderer.stable_id())
-            .map(|e| e.is_group())
-            .unwrap_or(false);
+        let entry = discovery.entry_by_id(&renderer.stable_id());
+        let leads_group = entry.as_ref().map(|e| e.is_group()).unwrap_or(false);
+        let is_pair = entry.as_ref().map(|e| e.is_pair()).unwrap_or(false);
         if leads_group {
             if let Some(r) = &ap2 {
                 info!(
                     "AirPlay: {} leads a group; using AirPlay 2 only (legacy RAOP to a group \
                      leader plays nothing on the group's speakers)",
+                    renderer.friendly_name
+                );
+                return vec![(Transport::AirPlay2, r.clone())];
+            }
+        }
+        // A stereo pair is AirPlay 2 only: its halves are driven by two
+        // lock-step AP2 sessions on one PTP clock; RAOP has no equivalent.
+        if is_pair {
+            if let Some(r) = &ap2 {
+                info!(
+                    "AirPlay: {} is half of a stereo pair; using AirPlay 2 to both halves",
                     renderer.friendly_name
                 );
                 return vec![(Transport::AirPlay2, r.clone())];
@@ -1620,6 +1663,7 @@ impl App {
         &self,
         transport: Transport,
         renderer: AirPlayRenderer,
+        partners: Vec<AirPlayRenderer>,
         local_ip: IpAddr,
     ) -> Result<ActiveSession, AttemptError> {
         match transport {
@@ -1653,17 +1697,26 @@ impl App {
             }
             Transport::AirPlay2 => {
                 let samples_rx = self.hub.subscribe();
-                let stable_id = renderer.stable_id();
                 let (prefer_realtime, pairing_creds, latency_ms) = {
                     let uc = self.user_config.lock().unwrap();
+                    // Stored PIN pairings for every receiver in the session
+                    // (the pair's halves are looked up individually).
+                    let creds = std::iter::once(&renderer)
+                        .chain(&partners)
+                        .filter_map(|r| {
+                            let id = r.stable_id();
+                            uc.airplay_pairings.get(&id).cloned().map(|c| (id, c))
+                        })
+                        .collect();
                     (
                         uc.prefer_realtime_airplay,
-                        uc.airplay_pairings.get(&stable_id).cloned(),
+                        creds,
                         uc.effective_airplay_latency_ms(),
                     )
                 };
                 match AirPlay2Session::start(AirPlay2SessionConfig {
                     renderer,
+                    partners,
                     local_ip,
                     samples_rx,
                     initial_volume: Some(80),
@@ -1682,12 +1735,12 @@ impl App {
                     // failure". Transport failures never take this branch,
                     // so a Wi-Fi blip / receiver reboot can't wipe a valid
                     // pairing.
-                    Err(Ap2StartError::VerifyRejected(e)) => {
+                    Err(Ap2StartError::VerifyRejected { id, source }) => {
                         warn!(
                             "stored pairing rejected by the receiver ({:#}) — clearing it",
-                            e
+                            source
                         );
-                        self.remove_airplay_pairing(&stable_id);
+                        self.remove_airplay_pairing(&id);
                         Err(AttemptError::NeedsPin)
                     }
                     Err(Ap2StartError::Other(e)) => Err(AttemptError::Other(format!("{:#}", e))),

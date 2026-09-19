@@ -69,9 +69,10 @@ pub struct UserConfig {
     #[serde(default)]
     pub airplay_mfi_encryption: bool,
     /// Show the members of an AirPlay group (HomePods set as an Apple
-    /// TV's default audio output) as their own rows, next to the group
-    /// row. Off by default: the group is listed once, like the iPhone's
-    /// AirPlay picker, and a click targets the group leader.
+    /// TV's default audio output) or of a HomePod stereo pair as their
+    /// own rows, next to the group / pair row. Off by default: the group
+    /// is listed once, like the iPhone's AirPlay picker, and a click
+    /// targets the group leader (or, for a pair, both halves).
     #[serde(default)]
     pub show_airplay_group_members: bool,
     /// Per-device AirPlay passwords for `pw=true` receivers, keyed by the
