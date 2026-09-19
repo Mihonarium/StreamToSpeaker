@@ -605,6 +605,16 @@ impl MetadataHandle {
 ///
 /// Interpolation between 1 and 100 is linear in dB. This matches
 /// PulseAudio's RAOP sink and the iTunes reference.
+pub fn volume_pct_to_raop_db(pct: u32) -> f32 {
+    let pct = pct.min(100);
+    if pct == 0 {
+        return -144.0;
+    }
+    // Linear in dB from -30 (1%) to 0 (100%) over 99 steps.
+    let pct_f = pct as f32;
+    -30.0 + (pct_f - 1.0) * (30.0 / 99.0)
+}
+
 /// dB to send for a mute transition: the -144 sentinel when muting, the
 /// last known level when unmuting. Windows mutes on its own when the
 /// volume keys reach zero and unmutes on the next key up, so an unmute
@@ -616,16 +626,6 @@ pub fn mute_db(muted: bool, last_level_pct: u32) -> f32 {
     } else {
         volume_pct_to_raop_db(last_level_pct)
     }
-}
-
-pub fn volume_pct_to_raop_db(pct: u32) -> f32 {
-    let pct = pct.min(100);
-    if pct == 0 {
-        return -144.0;
-    }
-    // Linear in dB from -30 (1%) to 0 (100%) over 99 steps.
-    let pct_f = pct as f32;
-    -30.0 + (pct_f - 1.0) * (30.0 / 99.0)
 }
 
 #[cfg(test)]
