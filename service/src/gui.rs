@@ -2765,8 +2765,8 @@ impl StreamToSpeakerApp {
                 ui,
                 p,
                 "AirPlay group members",
-                "Off = one row per group, like the iPhone's AirPlay menu. On = also list each member.",
-                "When HomePods are set as an Apple TV's default audio output they form an AirPlay group, and the Apple TV is its leader. The speaker list shows the group once, named after the group, and a click sends audio to the Apple TV over AirPlay 2, which plays it on the HomePods. Turn this on to also list the HomePods individually — a click on one streams to that speaker alone.",
+                "Off = one row per group or stereo pair, like the iPhone's AirPlay menu. On = also list each member.",
+                "When HomePods are set as an Apple TV's default audio output they form an AirPlay group, and the Apple TV is its leader. The speaker list shows the group once, named after the group, and a click sends audio to the Apple TV over AirPlay 2, which plays it on the HomePods. A HomePod stereo pair is likewise one row, named after the pair; a click streams to both HomePods at once, in sync. Turn this on to also list the members individually — a click on one streams to that speaker alone.",
                 |ui| {
                     ui.checkbox(&mut show_members, "Show group members individually");
                 },
