@@ -885,10 +885,19 @@ impl App {
             }
         }
         if let Some(d) = self.airplay_discovery.as_ref() {
-            for r in d.renderers() {
+            let show_members = self.user_config.lock().unwrap().show_airplay_group_members;
+            for e in d.entries() {
+                // AirPlay groups (an Apple TV with HomePods as its default
+                // audio output) present as ONE row, like the iPhone's
+                // AirPlay picker; the members are hidden unless the user
+                // opted to see them (Advanced).
+                if e.folded_under.is_some() && !show_members {
+                    continue;
+                }
+                let r = &e.renderer;
                 let id = r.stable_id();
                 let active = active_id.as_deref() == Some(id.as_str());
-                let transport = r.transport();
+                let transport = e.transport();
                 let usable = transport.is_some();
                 // Same physical speaker also reachable over UPnP → AirPlay
                 // will add noticeably more delay; flag it (only when the
@@ -899,29 +908,58 @@ impl App {
                 // click will use (Sonos advertises both UPnP and AirPlay)
                 // and why an unsupported one might fail.
                 let pw = if r.password_protected { ", password" } else { "" };
+                let base = e.display_name();
+                let group = if e.is_group() { " group" } else { "" };
                 let name = match transport {
                     Some(Transport::RaopLegacy) if has_upnp_twin => {
-                        format!("{} (AirPlay, higher delay{})", r.friendly_name, pw)
+                        format!("{} (AirPlay{}, higher delay{})", base, group, pw)
                     }
                     Some(Transport::AirPlay2) if has_upnp_twin => {
-                        format!("{} (AirPlay 2, higher delay{})", r.friendly_name, pw)
+                        format!("{} (AirPlay 2{}, higher delay{})", base, group, pw)
                     }
                     Some(Transport::RaopLegacy) => {
-                        format!("{} (AirPlay{})", r.friendly_name, pw)
+                        format!("{} (AirPlay{}{})", base, group, pw)
                     }
-                    Some(Transport::AirPlay2) => format!("{} (AirPlay 2{})", r.friendly_name, pw),
+                    Some(Transport::AirPlay2) => format!("{} (AirPlay 2{}{})", base, group, pw),
                     None if r.password_protected => {
-                        format!("{} (AirPlay, password-protected)", r.friendly_name)
+                        format!("{} (AirPlay, password-protected)", base)
                     }
-                    None => format!("{} (AirPlay, unsupported)", r.friendly_name),
+                    None => format!("{} (AirPlay, unsupported)", base),
                 };
-                let note = has_upnp_twin.then(|| {
-                    "This speaker also has a non-AirPlay (UPnP) entry in the list, which has \
-                     lower latency. AirPlay buffers about 1–2 seconds of audio, so it will be \
-                     more out of sync with video. Prefer the plain entry unless you specifically \
-                     need AirPlay."
-                        .to_string()
-                });
+                let mut notes: Vec<String> = Vec::new();
+                if e.is_group() {
+                    notes.push(format!(
+                        "AirPlay group: {}. Audio is sent over AirPlay 2 to {}, the group's \
+                         leader, the same way an iPhone streams to this group.",
+                        e.member_names().join(" + "),
+                        r.friendly_name,
+                    ));
+                } else if let Some(leader) = e.folded_under.as_deref() {
+                    let leader_name = d
+                        .find_by_id(leader)
+                        .map(|l| l.friendly_name)
+                        .unwrap_or_else(|| leader.to_string());
+                    notes.push(format!(
+                        "Member of the AirPlay group led by {}. Streams to this speaker alone.",
+                        leader_name
+                    ));
+                } else if !e.ungrouped_peers.is_empty() {
+                    notes.push(format!(
+                        "Shares an AirPlay group (stereo pair or multi-room set) with {}. \
+                         Streams to this speaker alone.",
+                        e.ungrouped_peers.join(" + ")
+                    ));
+                }
+                if has_upnp_twin {
+                    notes.push(
+                        "This speaker also has a non-AirPlay (UPnP) entry in the list, which has \
+                         lower latency. AirPlay buffers about 1–2 seconds of audio, so it will be \
+                         more out of sync with video. Prefer the plain entry unless you specifically \
+                         need AirPlay."
+                            .to_string(),
+                    );
+                }
+                let note = (!notes.is_empty()).then(|| notes.join(" "));
                 speakers.push(SpeakerInfo {
                     id,
                     friendly_name: name,
@@ -1427,7 +1465,7 @@ impl App {
             return Err(SelectFailure::Msg(format!("no AirPlay speaker with id {:?}", id)));
         };
         debug!(
-            "AirPlay select {}: transport={:?} supports_ap2={} features={:?} airplay_port={:?} raop_port={} et={:?}",
+            "AirPlay select {}: transport={:?} supports_ap2={} features={:?} airplay_port={:?} raop_port={} et={:?} group={:?}",
             renderer.friendly_name,
             renderer.transport(),
             renderer.supports_airplay2(),
@@ -1435,6 +1473,7 @@ impl App {
             renderer.airplay_port,
             renderer.port,
             renderer.encryption_types,
+            renderer.group,
         );
 
         // Resolve a local IPv4 to bind UDP sockets to + advertise in
@@ -1522,6 +1561,27 @@ impl App {
                 .find(|r| r.ip == renderer.ip && r.supports_airplay2())
         };
         let raop = renderer.supports_legacy_raop();
+
+        // A group leader (an Apple TV whose default audio output is a set
+        // of HomePods) is driven over AirPlay 2 ONLY: its legacy RAOP
+        // service accepts the session but the audio never reaches the
+        // group's speakers (the "connects, no sound" report), so falling
+        // back to RAOP would just turn a visible failure — or a PIN
+        // prompt — into silence. See `transport_as_group_leader`.
+        let leads_group = discovery
+            .entry_by_id(&renderer.stable_id())
+            .map(|e| e.is_group())
+            .unwrap_or(false);
+        if leads_group {
+            if let Some(r) = &ap2 {
+                info!(
+                    "AirPlay: {} leads a group; using AirPlay 2 only (legacy RAOP to a group \
+                     leader plays nothing on the group's speakers)",
+                    renderer.friendly_name
+                );
+                return vec![(Transport::AirPlay2, r.clone())];
+            }
+        }
 
         // Prefer AirPlay 2 only for receivers that genuinely REQUIRE it
         // (HomePods, AP2-only devices). Packet-capture verified: iTunes
