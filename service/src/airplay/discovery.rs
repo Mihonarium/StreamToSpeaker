@@ -175,6 +175,9 @@ pub struct GroupHints {
     pub group_name: Option<String>,
     /// `tsid`.
     pub tight_sync_id: Option<String>,
+    /// The half index a stereo pair encodes in its `gid`
+    /// (`<tsid>+<index>+<uuid>` → 0 or 1); `None` for anything else.
+    pub tight_sync_index: Option<u8>,
 }
 
 impl GroupHints {
@@ -207,6 +210,11 @@ pub struct AirPlayEntry {
     /// The other members of the group this renderer leads, sorted by
     /// name. Empty for a plain device.
     pub led_members: Vec<AirPlayRenderer>,
+    /// The other half (halves) of the stereo pair this renderer belongs
+    /// to. Unlike `led_members`, which the leader relays to, these are
+    /// streamed to **directly, alongside `renderer`**, in one multi-
+    /// receiver AirPlay 2 session. Empty unless this row is a pair.
+    pub pair_members: Vec<AirPlayRenderer>,
     /// `Some(leader stable id)` when this renderer is a member that was
     /// folded under a group row — hidden from the list by default.
     pub folded_under: Option<String>,
@@ -221,6 +229,7 @@ impl AirPlayEntry {
         Self {
             renderer,
             led_members: Vec::new(),
+            pair_members: Vec::new(),
             folded_under: None,
             ungrouped_peers: Vec::new(),
         }
@@ -231,10 +240,25 @@ impl AirPlayEntry {
         !self.led_members.is_empty()
     }
 
-    /// Row label: the group's public name (`gpn`) for a group, else the
-    /// device's friendly name.
+    /// True if this row stands for a stereo pair (two halves driven
+    /// together, no relaying leader).
+    pub fn is_pair(&self) -> bool {
+        !self.pair_members.is_empty()
+    }
+
+    /// Every receiver a click on this row streams to directly: the
+    /// row's device plus its pair partner(s). A single device for plain
+    /// rows and for group rows (the leader relays to its members).
+    pub fn targets(&self) -> Vec<AirPlayRenderer> {
+        let mut v = vec![self.renderer.clone()];
+        v.extend(self.pair_members.iter().cloned());
+        v
+    }
+
+    /// Row label: the group's public name (`gpn`) for a group or a
+    /// stereo pair, else the device's friendly name.
     pub fn display_name(&self) -> String {
-        if self.is_group() {
+        if self.is_group() || self.is_pair() {
             if let Some(n) = self.renderer.group.group_name.as_deref() {
                 let n = n.trim();
                 if !n.is_empty() {
@@ -245,20 +269,29 @@ impl AirPlayEntry {
         self.renderer.friendly_name.clone()
     }
 
-    /// Names of every device in the group, leader first.
+    /// Names of every device in the group or pair, leader / first half
+    /// first.
     pub fn member_names(&self) -> Vec<String> {
         let mut v = vec![self.renderer.friendly_name.clone()];
+        v.extend(self.pair_members.iter().map(|m| m.friendly_name.clone()));
         v.extend(self.led_members.iter().map(|m| m.friendly_name.clone()));
         v
     }
 
     /// The transport a click on this row uses. A group leader is driven
     /// over AirPlay 2 whenever it can be (see
-    /// [`AirPlayRenderer::transport_as_group_leader`]); everything else
-    /// is exactly [`AirPlayRenderer::transport`].
+    /// [`AirPlayRenderer::transport_as_group_leader`]); a stereo pair is
+    /// AirPlay 2 only (both halves get their own session, synchronised
+    /// by one shared PTP clock — there is no legacy equivalent);
+    /// everything else is exactly [`AirPlayRenderer::transport`].
     pub fn transport(&self) -> Option<Transport> {
         if self.is_group() {
             self.renderer.transport_as_group_leader()
+        } else if self.is_pair() {
+            self.targets()
+                .iter()
+                .all(|r| r.supports_airplay2())
+                .then_some(Transport::AirPlay2)
         } else {
             self.renderer.transport()
         }
@@ -557,14 +590,18 @@ fn merge(mac: &str, raop: Option<&RaopInfo>, airplay: Option<&AirPlayInfo>) -> O
 
 /// Fold discovered receivers into list rows by their advertised group.
 ///
-/// Devices sharing a [`GroupHints::grouping_key`] form a group. A group
-/// collapses into ONE row — named after `gpn`, targeting the leader —
-/// only when [`pick_group_leader`] finds an unambiguous leader among the
-/// members in range; the other members become hidden rows
-/// (`folded_under`). Groups without such a leader (a lone HomePod
-/// stereo pair, whose halves both claim `igl=1`; or hints missing) stay
-/// as individual rows, each noting its peers, i.e. exactly today's
-/// behaviour. Devices with no group key, or whose key nobody else
+/// Devices sharing a [`GroupHints::grouping_key`] form a group. Within a
+/// group, members sharing a `tsid` are first collapsed into ONE unit — a
+/// HomePod stereo pair — represented by its lower-indexed half (the
+/// `+0` in `gid`, else the lower MAC) with the other half in
+/// `pair_members`. A group then collapses into ONE row — named after
+/// `gpn`, targeting the leader — only when [`pick_group_leader`] finds an
+/// unambiguous leader among the units in range; the other members
+/// (pair halves included) become hidden rows (`folded_under`). A group
+/// that is nothing but a stereo pair is one pair row plus a hidden row
+/// for the partner half. Groups with several leader claimants and no
+/// Apple TV stay as individual rows (pair rows stay pairs), each noting
+/// its peers. Devices with no group key, or whose key nobody else
 /// shares (every standalone AP2 receiver advertises a private `gid`),
 /// are plain rows. Output is sorted by row label.
 pub fn group_renderers(renderers: Vec<AirPlayRenderer>) -> Vec<AirPlayEntry> {
@@ -578,43 +615,74 @@ pub fn group_renderers(renderers: Vec<AirPlayRenderer>) -> Vec<AirPlayEntry> {
     }
 
     let mut out: Vec<AirPlayEntry> = plain.into_iter().map(AirPlayEntry::plain).collect();
-    for (_, mut members) in by_key {
+    for (_, members) in by_key {
         if members.len() < 2 {
             out.extend(members.into_iter().map(AirPlayEntry::plain));
             continue;
         }
-        members.sort_by(|a, b| a.friendly_name.cmp(&b.friendly_name));
-        match pick_group_leader(&members) {
-            Some(idx) => {
-                let leader = members.remove(idx);
-                let leader_id = leader.stable_id();
-                for m in &members {
+        let mut units = pair_units(members);
+        units.sort_by(|a, b| a.primary.friendly_name.cmp(&b.primary.friendly_name));
+        match pick_group_leader(&units.iter().map(|u| u.primary.clone()).collect::<Vec<_>>()) {
+            Some(idx) if units.len() > 1 => {
+                let leader = units.remove(idx);
+                let leader_id = leader.primary.stable_id();
+                // The leader relays to everyone else, pair halves
+                // included: a pair under an Apple TV is two members.
+                let mut led: Vec<AirPlayRenderer> = Vec::new();
+                for u in units {
+                    led.push(u.primary);
+                    led.extend(u.partners);
+                }
+                led.sort_by(|a, b| a.friendly_name.cmp(&b.friendly_name));
+                for m in &led {
                     out.push(AirPlayEntry {
                         renderer: m.clone(),
                         led_members: Vec::new(),
+                        pair_members: Vec::new(),
                         folded_under: Some(leader_id.clone()),
                         ungrouped_peers: Vec::new(),
                     });
                 }
+                // A leading stereo pair (no Apple TV; the pair's igl=1
+                // won over igl=0 members) keeps its halves.
+                out.extend(leader.partners.iter().map(|p| AirPlayEntry {
+                    renderer: p.clone(),
+                    led_members: Vec::new(),
+                    pair_members: Vec::new(),
+                    folded_under: Some(leader_id.clone()),
+                    ungrouped_peers: Vec::new(),
+                }));
                 out.push(AirPlayEntry {
-                    renderer: leader,
-                    led_members: members,
+                    renderer: leader.primary,
+                    led_members: led,
+                    pair_members: leader.partners,
                     folded_under: None,
                     ungrouped_peers: Vec::new(),
                 });
             }
-            None => {
-                let names: Vec<String> = members.iter().map(|m| m.friendly_name.clone()).collect();
-                for (i, m) in members.into_iter().enumerate() {
+            _ => {
+                // No relaying leader: each unit is its own row (a pair
+                // row for a pair), noting the other units as peers.
+                let names: Vec<String> = units.iter().map(|u| u.label()).collect();
+                for (i, u) in units.into_iter().enumerate() {
                     let peers = names
                         .iter()
                         .enumerate()
                         .filter(|(j, _)| *j != i)
                         .map(|(_, n)| n.clone())
                         .collect();
-                    out.push(AirPlayEntry {
-                        renderer: m,
+                    let primary_id = u.primary.stable_id();
+                    out.extend(u.partners.iter().map(|p| AirPlayEntry {
+                        renderer: p.clone(),
                         led_members: Vec::new(),
+                        pair_members: Vec::new(),
+                        folded_under: Some(primary_id.clone()),
+                        ungrouped_peers: Vec::new(),
+                    }));
+                    out.push(AirPlayEntry {
+                        renderer: u.primary,
+                        led_members: Vec::new(),
+                        pair_members: u.partners,
                         folded_under: None,
                         ungrouped_peers: peers,
                     });
@@ -630,6 +698,67 @@ pub fn group_renderers(renderers: Vec<AirPlayRenderer>) -> Vec<AirPlayEntry> {
     out
 }
 
+/// One unit of a group: a single device, or a stereo pair collapsed to
+/// its primary half plus partner(s).
+struct PairUnit {
+    primary: AirPlayRenderer,
+    partners: Vec<AirPlayRenderer>,
+}
+
+impl PairUnit {
+    /// What peers call this unit: the pair's `gpn`, else the device name.
+    fn label(&self) -> String {
+        if !self.partners.is_empty() {
+            if let Some(n) = self.primary.group.group_name.as_deref() {
+                if !n.trim().is_empty() {
+                    return n.trim().to_string();
+                }
+            }
+        }
+        self.primary.friendly_name.clone()
+    }
+}
+
+/// Collapse the members of one group into units: devices sharing a
+/// `tsid` (a HomePod stereo pair — both halves advertise `igl=1 gcgl=1`,
+/// the same `gpn`, and `gid = <tsid>+<0|1>+<uuid>`) become one unit whose
+/// primary is the `+0` half (else the lowest MAC — deterministic, so the
+/// row id is stable across scans). Everything else is a unit of one.
+fn pair_units(members: Vec<AirPlayRenderer>) -> Vec<PairUnit> {
+    let mut by_tsid: HashMap<String, Vec<AirPlayRenderer>> = HashMap::new();
+    let mut singles: Vec<AirPlayRenderer> = Vec::new();
+    for m in members {
+        match m.group.tight_sync_id.clone() {
+            Some(t) => by_tsid.entry(t).or_default().push(m),
+            None => singles.push(m),
+        }
+    }
+    let mut units: Vec<PairUnit> = singles
+        .into_iter()
+        .map(|primary| PairUnit { primary, partners: Vec::new() })
+        .collect();
+    for (_, mut halves) in by_tsid {
+        if halves.len() < 2 {
+            units.extend(halves.into_iter().map(|primary| PairUnit { primary, partners: Vec::new() }));
+            continue;
+        }
+        halves.sort_by(|a, b| {
+            pair_half_order(a)
+                .cmp(&pair_half_order(b))
+                .then_with(|| a.mac_id.cmp(&b.mac_id))
+        });
+        let primary = halves.remove(0);
+        units.push(PairUnit { primary, partners: halves });
+    }
+    units
+}
+
+/// Sort key for the halves of a pair: the `gid` index (`+0` before
+/// `+1`), unknown last.
+fn pair_half_order(r: &AirPlayRenderer) -> u8 {
+    r.group.tight_sync_index.unwrap_or(u8::MAX)
+}
+
 /// Index of the member to target for a group, or `None` when there is
 /// no unambiguous leader:
 ///
@@ -639,9 +768,9 @@ pub fn group_renderers(renderers: Vec<AirPlayRenderer>) -> Vec<AirPlayEntry> {
 ///    leader whichever way its `igl` currently reads (it drops to
 ///    `igl=0` while receiving AirPlay from someone else);
 /// 2. else the one member advertising `igl=1`;
-/// 3. else none — several claimants (a stereo pair advertises `igl=1`
-///    on BOTH halves and needs a sender that drives both, which we
-///    don't) or no hint at all.
+/// 3. else none — several claimants or no hint at all. (A stereo pair
+///    counts as ONE claimant here: [`group_renderers`] collapses its
+///    halves before calling this.)
 pub fn pick_group_leader(members: &[AirPlayRenderer]) -> Option<usize> {
     let unique = |pred: &dyn Fn(&AirPlayRenderer) -> bool| -> Option<usize> {
         let mut it = members.iter().enumerate().filter(|(_, m)| pred(m));
@@ -803,7 +932,16 @@ fn parse_group_hints(txt: &TxtMap) -> GroupHints {
         tight_sync_id: read_txt_string(txt, "tsid")
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty()),
+        tight_sync_index: read_txt_string(txt, "gid").and_then(|s| pair_index_from_gid(&s)),
     }
+}
+
+/// The half index of a stereo pair's `gid` (`<tsid>+<index>+<uuid>`);
+/// `None` when the `gid` has no such suffix.
+fn pair_index_from_gid(raw: &str) -> Option<u8> {
+    let mut parts = raw.trim().split('+');
+    parts.next()?;
+    parts.next()?.trim().parse().ok()
 }
 
 /// Normalise a `gid`/`pgid` so records from different devices compare:
@@ -1187,43 +1325,148 @@ mod tests {
         assert_eq!(group.display_name(), "Living Room");
     }
 
+    /// Verbatim shape from owntone#1413: both halves advertise igl=1
+    /// gcgl=1, gid = "<tsid>+<0|1>+<uuid>", the same gpn and tsid.
+    fn stereo_half(name: &str, mac: &str, ip: &str, gid: &str) -> AirPlayRenderer {
+        from_txt(
+            name,
+            mac,
+            ip,
+            Some(&[
+                ("deviceid", mac), ("features", HOMEPOD_FEATURES), ("flags", "0x9a404"),
+                ("gid", gid), ("igl", "1"), ("gcgl", "1"), ("gpn", "Büro 2"), ("tsm", "0"),
+                ("tsid", "EAFA36AA-9785-54B2-A537-D9EE2A55CF1C"), ("model", "AudioAccessory1,1"),
+                ("pk", "cc"), ("srcvers", "530.6"), ("acl", "0"),
+            ]),
+            Some(&[("cn", "0,1,2,3"), ("et", "0,3,5"), ("am", "AudioAccessory1,1"), ("tp", "UDP")]),
+        )
+    }
+
+    const LINKS_GID: &str = "EAFA36AA-9785-54B2-A537-D9EE2A55CF1C+0+6276FFFA-04E1-439E-8139-2C906B34E587";
+    const RECHTS_GID: &str = "EAFA36AA-9785-54B2-A537-D9EE2A55CF1C+1+4671EEC3-7E13-4DC7-BEC3-C9805D3AB964";
+
+    fn links() -> AirPlayRenderer {
+        stereo_half("Links", "D4:A3:3D:7A:28:D8", "192.168.178.46", LINKS_GID)
+    }
+
+    fn rechts() -> AirPlayRenderer {
+        stereo_half("Rechts", "50:BC:96:07:E8:6D", "192.168.178.47", RECHTS_GID)
+    }
+
     #[test]
-    fn lone_homepod_stereo_pair_stays_two_rows_with_peer_notes() {
-        // Verbatim shape from owntone#1413: both halves advertise igl=1
-        // gcgl=1, gid = "<tsid>+<0|1>+<uuid>", the same gpn and tsid.
-        let half = |name: &str, mac: &str, ip: &str, gid: &str| {
-            from_txt(
-                name,
-                mac,
-                ip,
-                Some(&[
-                    ("deviceid", mac), ("features", HOMEPOD_FEATURES), ("flags", "0x9a404"),
-                    ("gid", gid), ("igl", "1"), ("gcgl", "1"), ("gpn", "Büro 2"), ("tsm", "0"),
-                    ("tsid", "EAFA36AA-9785-54B2-A537-D9EE2A55CF1C"), ("model", "AudioAccessory1,1"),
-                    ("pk", "cc"), ("srcvers", "530.6"), ("acl", "0"),
-                ]),
-                Some(&[("cn", "0,1,2,3"), ("et", "0,3,5"), ("am", "AudioAccessory1,1"), ("tp", "UDP")]),
-            )
-        };
-        let links = half(
-            "Links", "D4:A3:3D:7A:28:D8", "192.168.178.46",
-            "EAFA36AA-9785-54B2-A537-D9EE2A55CF1C+0+6276FFFA-04E1-439E-8139-2C906B34E587",
-        );
-        let rechts = half(
-            "Rechts", "50:BC:96:07:E8:6D", "192.168.178.47",
-            "EAFA36AA-9785-54B2-A537-D9EE2A55CF1C+1+4671EEC3-7E13-4DC7-BEC3-C9805D3AB964",
-        );
+    fn stereo_pair_gid_index_parses() {
+        assert_eq!(links().group.tight_sync_index, Some(0));
+        assert_eq!(rechts().group.tight_sync_index, Some(1));
+        assert_eq!(pair_index_from_gid(TV_GID), None);
+        assert_eq!(pair_index_from_gid("abc+x+def"), None);
+        assert_eq!(apple_tv_leader().group.tight_sync_index, None);
+    }
+
+    #[test]
+    fn lone_homepod_stereo_pair_folds_into_one_pair_row() {
+        let (links, rechts) = (links(), rechts());
         assert_eq!(links.group.grouping_key(), rechts.group.grouping_key());
-        let entries = group_renderers(vec![links, rechts]);
-        assert_eq!(entries.len(), 2);
-        for (me, other) in [("Links", "Rechts"), ("Rechts", "Links")] {
-            let e = find(&entries, me);
-            assert!(!e.is_group());
-            assert!(e.folded_under.is_none(), "no unambiguous leader → not folded");
-            assert_eq!(e.ungrouped_peers, vec![other.to_string()]);
-            assert_eq!(e.display_name(), me);
-            assert_eq!(e.transport(), Some(Transport::AirPlay2));
+        // Input order must not matter: the +0 half is the row.
+        for order in [vec![links.clone(), rechts.clone()], vec![rechts.clone(), links.clone()]] {
+            let entries = group_renderers(order);
+            assert_eq!(entries.len(), 2);
+            let pair = find(&entries, "Links");
+            assert!(pair.is_pair());
+            assert!(!pair.is_group());
+            assert!(pair.folded_under.is_none());
+            assert!(pair.ungrouped_peers.is_empty());
+            assert_eq!(pair.display_name(), "Büro 2");
+            assert_eq!(pair.member_names(), vec!["Links", "Rechts"]);
+            assert_eq!(pair.renderer.stable_id(), links.stable_id());
+            assert_eq!(pair.pair_members.len(), 1);
+            assert_eq!(pair.pair_members[0].stable_id(), rechts.stable_id());
+            assert_eq!(pair.transport(), Some(Transport::AirPlay2));
+            let targets: Vec<String> = pair.targets().iter().map(|r| r.friendly_name.clone()).collect();
+            assert_eq!(targets, vec!["Links", "Rechts"]);
+            // The partner half is a hidden row under the pair.
+            let other = find(&entries, "Rechts");
+            assert_eq!(other.folded_under.as_deref(), Some(links.stable_id().as_str()));
+            assert!(!other.is_pair());
+            assert_eq!(other.display_name(), "Rechts");
+            let visible: Vec<_> = entries.iter().filter(|e| e.folded_under.is_none()).collect();
+            assert_eq!(visible.len(), 1);
         }
+    }
+
+    #[test]
+    fn stereo_pair_without_gid_index_still_pairs_by_lowest_mac() {
+        let mut a = links();
+        let mut b = rechts();
+        a.group.tight_sync_index = None;
+        b.group.tight_sync_index = None;
+        // MACs: 50:BC… (Rechts) < D4:A3… (Links).
+        let entries = group_renderers(vec![a, b]);
+        let pair = entries.iter().find(|e| e.is_pair()).expect("a pair row");
+        assert_eq!(pair.renderer.friendly_name, "Rechts");
+        assert_eq!(pair.pair_members[0].friendly_name, "Links");
+    }
+
+    #[test]
+    fn stereo_pair_under_an_apple_tv_folds_under_the_tv_as_before() {
+        // The pair is the TV's default output: both halves carry the TV's
+        // gid as pgid (nested), keep their own tsid pair gid.
+        let nest = |mut r: AirPlayRenderer| {
+            r.group.parent_group_id = Some(TV_GID.to_ascii_lowercase());
+            r.group.parent_group_contains_leader = Some(true);
+            r
+        };
+        let tv = apple_tv_leader();
+        let entries = group_renderers(vec![nest(links()), tv.clone(), nest(rechts())]);
+        assert_eq!(entries.len(), 3);
+        let group = find(&entries, "Living Room");
+        assert!(group.is_group());
+        assert!(!group.is_pair(), "the TV relays; it is not itself a pair");
+        assert_eq!(group.member_names(), vec!["Living Room", "Links", "Rechts"]);
+        assert_eq!(group.transport(), Some(Transport::AirPlay2));
+        assert_eq!(group.targets().len(), 1, "one session, to the TV");
+        for name in ["Links", "Rechts"] {
+            let m = find(&entries, name);
+            assert_eq!(m.folded_under.as_deref(), Some(tv.stable_id().as_str()));
+            assert!(!m.is_pair());
+        }
+    }
+
+    #[test]
+    fn stereo_pair_beside_another_leader_claimant_stays_a_pair_row() {
+        // A user-built multi-room group: the pair plus a lone HomePod that
+        // also says igl=1 → two claimants, no fold; the pair stays ONE row.
+        let mut solo = homepod_member("Küche", "E0:2B:96:96:FB:77", "192.168.178.50");
+        solo.group.group_id = links().group.group_id.clone();
+        solo.group.is_group_leader = Some(true);
+        let entries = group_renderers(vec![links(), solo.clone(), rechts()]);
+        assert_eq!(entries.len(), 3);
+        let pair = find(&entries, "Links");
+        assert!(pair.is_pair());
+        assert_eq!(pair.ungrouped_peers, vec!["Küche".to_string()]);
+        let k = find(&entries, "Küche");
+        assert!(!k.is_pair() && !k.is_group());
+        assert!(k.folded_under.is_none());
+        assert_eq!(k.ungrouped_peers, vec!["Büro 2".to_string()], "peers name the pair by gpn");
+        assert_eq!(find(&entries, "Rechts").folded_under.as_deref(), Some(links().stable_id().as_str()));
+    }
+
+    #[test]
+    fn stereo_pair_leading_igl0_members_keeps_its_halves() {
+        // The pair (igl=1) with a Sonos (isGroupLeader=0) joined to it: the
+        // pair is the unique leader claimant; it relays to the Sonos and
+        // still drives both of its halves.
+        let mut sonos = homepod_member("Basement", "34:7E:5C:31:D9:96", "192.0.2.41");
+        sonos.model = Some("Bookshelf".into());
+        sonos.group.group_id = links().group.group_id.clone();
+        sonos.group.is_group_leader = Some(false);
+        let entries = group_renderers(vec![sonos, links(), rechts()]);
+        let lead = find(&entries, "Links");
+        assert!(lead.is_group() && lead.is_pair());
+        assert_eq!(lead.display_name(), "Büro 2");
+        assert_eq!(lead.member_names(), vec!["Links", "Rechts", "Basement"]);
+        assert_eq!(lead.targets().len(), 2);
+        assert_eq!(find(&entries, "Rechts").folded_under.as_deref(), Some(links().stable_id().as_str()));
+        assert_eq!(find(&entries, "Basement").folded_under.as_deref(), Some(links().stable_id().as_str()));
     }
 
     #[test]
