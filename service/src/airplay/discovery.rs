@@ -711,8 +711,9 @@ pub fn spawn_airplay_discovery(
 // Resolution ingestion
 // -----------------------------------------------------------------------------
 
-/// TXT record as plain key → value pairs (keys as advertised; lookups
-/// are case-sensitive except where a known alias is checked).
+/// TXT record as plain key → value pairs (keys as advertised). Lookups
+/// are case-insensitive, as mdns-sd's own accessors are: receivers spell
+/// keys inconsistently (`deviceid`/`deviceID`, `features`/`Features`).
 type TxtMap = HashMap<String, String>;
 
 fn txt_map(txt: &TxtProperties) -> TxtMap {
@@ -876,7 +877,9 @@ fn mac_from_event(service: &str, fullname: &str) -> Option<String> {
 }
 
 fn read_txt_string(txt: &TxtMap, key: &str) -> Option<String> {
-    txt.get(key).cloned()
+    txt.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.clone())
 }
 
 /// `Some(true)` for `true`/`1`/`yes`, `Some(false)` for any other value,
@@ -994,6 +997,20 @@ mod tests {
 
     fn txt(pairs: &[(&str, &str)]) -> TxtMap {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn txt_lookups_ignore_key_case() {
+        // mdns-sd matched keys case-insensitively; a receiver that
+        // advertises mixed-case keys must still be resolved and grouped.
+        let t = txt(&[("deviceID", "AA:BB:CC:DD:EE:FF"), ("Features", "0x445F8A00,0x1C340"),
+                      ("gid", "ABCDEF01-2222-3333-4444-555555555555"), ("isGroupLeader", "1"),
+                      ("GPN", "Kitchen")]);
+        assert_eq!(read_txt_string(&t, "deviceid").as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+        assert!(read_features(&t).is_some());
+        let g = parse_group_hints(&t);
+        assert_eq!(g.is_group_leader, Some(true));
+        assert_eq!(g.group_name.as_deref(), Some("Kitchen"));
     }
 
     /// Build a merged renderer from an `_airplay._tcp` TXT set (plus an
