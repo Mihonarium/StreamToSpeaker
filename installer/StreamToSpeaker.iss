@@ -10,7 +10,7 @@
 ;      "Internal AUX Jack — Stream To Speaker" name in the registry
 ;   5. Creates a Start Menu shortcut and (opt-in) an auto-start entry
 ;   6. On uninstall: kills any running stream-to-speaker.exe, removes
-;      the driver via pnputil (looked up by Original Name), deletes files
+;      the driver via pnputil (found by its hardware ID), deletes files
 ;
 ; Build with: ISCC.exe installer\StreamToSpeaker.iss
 ; Output:     installer\out\StreamToSpeakerSetup-<ver>.exe
@@ -252,8 +252,8 @@ Filename: "{app}\driver\devcon.exe"; Parameters: "remove Root\StreamToSpeaker"; 
 
 ; Remove the driver package. pnputil /delete-driver expects the OEM-
 ; assigned name (oemNN.inf) which we don't know up front, so we shell
-; into a PowerShell that enumerates the driver store, finds the entry
-; whose OriginalName matches StreamToSpeaker.inf, and uninstalls it.
+; into a PowerShell that finds the published INF (%windir%\INF\oemNN.inf)
+; declaring Root\StreamToSpeaker and uninstalls that package.
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\Uninstall-Driver.ps1"""; \
     Flags: runhidden waituntilterminated; RunOnceId: "RemoveDriver"

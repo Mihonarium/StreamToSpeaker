@@ -3,31 +3,31 @@
 #
 # pnputil /delete-driver expects the OEM-assigned name (oemNN.inf) that
 # the driver store handed out on /add-driver. We don't know that name
-# up front, so this script enumerates the driver store, finds the entry
-# whose "Original Name" matches StreamToSpeaker.inf, and uninstalls it.
+# up front, so this script finds every published package that declares
+# our hardware ID (Root\StreamToSpeaker) and uninstalls it.
 
 $ErrorActionPreference = "SilentlyContinue"
 
-$enumOutput = & pnputil /enum-drivers 2>&1 | Out-String
-if (-not $enumOutput) {
-    Write-Output "pnputil enum-drivers returned no output; driver may already be gone."
-    exit 0
+# Published names (oemNN.inf) of every Stream To Speaker package in the
+# driver store. pnputil /enum-drivers is not parsed: its labels
+# ("Original Name:", "Published Name:") are translated on non-English
+# Windows. Instead: every published package has its INF copied to
+# %windir%\INF\oemNN.inf, and ours is the one declaring our hardware ID.
+# The same function is in installer/Uninstall-Driver.ps1,
+# scripts/Pre-Install.ps1 and scripts/Reset-Install.ps1; keep them equal.
+function Get-StreamToSpeakerDriverPackages {
+    $infDir = Join-Path $env:windir 'INF'
+    @(Get-ChildItem -Path $infDir -Filter 'oem*.inf' -ErrorAction SilentlyContinue |
+        Where-Object { Select-String -Path $_.FullName -Pattern 'Root\StreamToSpeaker' -SimpleMatch -Quiet -ErrorAction SilentlyContinue } |
+        ForEach-Object { $_.Name } |
+        Sort-Object)
 }
 
-# pnputil output groups each driver in a stanza with blank-line
-# separators. We split on blank lines and look for ones containing
-# our INF.
-$stanzas = $enumOutput -split "`r?`n`r?`n"
 $removed = 0
-foreach ($stanza in $stanzas) {
-    if ($stanza -match "Original Name:\s*StreamToSpeaker\.inf") {
-        if ($stanza -match "Published Name:\s*(oem\d+\.inf)") {
-            $oemName = $matches[1]
-            Write-Output "Removing driver package $oemName ..."
-            & pnputil /delete-driver $oemName /uninstall /force | Out-Null
-            $removed++
-        }
-    }
+foreach ($oemName in (Get-StreamToSpeakerDriverPackages)) {
+    Write-Output "Removing driver package $oemName ..."
+    & pnputil /delete-driver $oemName /uninstall /force | Out-Null
+    $removed++
 }
 
 if ($removed -eq 0) {

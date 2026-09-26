@@ -16,6 +16,21 @@
 
 $ErrorActionPreference = "Continue"
 
+# Published names (oemNN.inf) of every Stream To Speaker package in the
+# driver store. pnputil /enum-drivers is not parsed: its labels
+# ("Original Name:", "Published Name:") are translated on non-English
+# Windows. Instead: every published package has its INF copied to
+# %windir%\INF\oemNN.inf, and ours is the one declaring our hardware ID.
+# The same function is in installer/Uninstall-Driver.ps1,
+# scripts/Pre-Install.ps1 and scripts/Reset-Install.ps1; keep them equal.
+function Get-StreamToSpeakerDriverPackages {
+    $infDir = Join-Path $env:windir 'INF'
+    @(Get-ChildItem -Path $infDir -Filter 'oem*.inf' -ErrorAction SilentlyContinue |
+        Where-Object { Select-String -Path $_.FullName -Pattern 'Root\StreamToSpeaker' -SimpleMatch -Quiet -ErrorAction SilentlyContinue } |
+        ForEach-Object { $_.Name } |
+        Sort-Object)
+}
+
 Write-Host "1/3  Removing the live device node..." -ForegroundColor Cyan
 $devcon = Join-Path $PSScriptRoot "..\driver\devcon.exe"
 if (-not (Test-Path $devcon)) {
@@ -30,17 +45,11 @@ if (Test-Path $devcon) {
 }
 
 Write-Host "2/3  Removing the driver-store entry..." -ForegroundColor Cyan
-$enum = & pnputil /enum-drivers 2>&1 | Out-String
-$stanzas = $enum -split "(?ms)(?=Published Name:)"
 $matched = 0
-foreach ($s in $stanzas) {
-    if ($s -match "Original Name:\s*StreamToSpeaker\.inf" -and
-        $s -match "Published Name:\s*(oem\d+\.inf)") {
-        $oem = $matches[1]
-        Write-Host "  removing $oem ..."
-        & pnputil /delete-driver $oem /uninstall /force | Out-Null
-        $matched++
-    }
+foreach ($oem in (Get-StreamToSpeakerDriverPackages)) {
+    Write-Host "  removing $oem ..."
+    & pnputil /delete-driver $oem /uninstall /force | Out-Null
+    $matched++
 }
 if ($matched -eq 0) {
     Write-Host "  (no StreamToSpeaker driver in the store)"
