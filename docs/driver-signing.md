@@ -231,8 +231,10 @@ finished overwrites the signed setup exe with an unsigned rebuild — re-run
 ## Flow D — WHQL certification (HLK run by hand, the rest automated)
 
 Used for driver **1.1.0.209** (product `14599256519720956`, submission
-`1152921505701928485`, report `95342530`, `WINDOWS_v100_X64_25H2_FULL`),
-release `driver-v1.1.0.209`.
+`1152921505701928485`, `WINDOWS_v100_X64_25H2_FULL`), release
+`driver-v1.1.0.209`. Its
+[certification report](https://partner.microsoft.com/en-us/dashboard/hardware/Driver/DownloadCertificationReport/95342530/14599256519720956/1152921505701928485)
+(`95342530` in that URL is the seller ID, not a report ID).
 
 1. **Lab.** Build the driver (`SignMode=TestSign` is fine — Microsoft
    replaces nothing but adds its own signatures), run the WHCP playlist
@@ -248,7 +250,8 @@ release `driver-v1.1.0.209`.
    `StreamToSpeaker-Driver-<ver>-lab-testsigned.zip`.
 4. **Run `Driver certified`** (Actions → Run workflow) **from that
    commit's branch** with `version`, `product_id`, `submission_id`,
-   `report_id`. It polls the Hardware API until the submission is
+   `report_id` (the seller ID: the first number in the dashboard's
+   certificationReport URL). It polls the Hardware API until the submission is
    `completed` with a `signedPackage`, downloads it, and verifies:
    - INF byte-identical to the lab package and carrying DriverVer `<ver>`;
    - `.sys` code identical to the lab `.sys` after stripping the
