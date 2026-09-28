@@ -238,6 +238,9 @@ def build_manifest(version, commit, source_hash, product_id, submission_id,
             "product_id": str(product_id),
             "submission_id": str(submission_id),
             "os": list(os_list),
+            # The seller ID in the dashboard's certificationReport URL
+            # (DownloadCertificationReport/<seller>/<product>/<submission>);
+            # the field name is kept for existing manifests.
             "report_id": int(report_id) if report_id else None,
         },
         "signed_zip": signed_name,
@@ -252,13 +255,34 @@ def build_manifest(version, commit, source_hash, product_id, submission_id,
     }
 
 
+# Plain names for the dashboard's OS codes in release notes ("v100" is
+# Windows version 10.0, shared by Windows 10 and 11).
+OS_NAMES = {
+    "WINDOWS_v100_X64_25H2_FULL": "Windows 11, version 25H2 (x64)",
+}
+
+
+def os_label(code):
+    name = OS_NAMES.get(code)
+    return f"{name} (`{code}`)" if name else f"`{code}`"
+
+
+def report_url(c):
+    """The dashboard's public certification report link, or None."""
+    if not (c.get("report_id") and c.get("product_id") and c.get("submission_id")):
+        return None
+    return ("https://partner.microsoft.com/en-us/dashboard/hardware/Driver/DownloadCertificationReport/"
+            f"{c['report_id']}/{c['product_id']}/{c['submission_id']}")
+
+
 def release_notes(m):
     c = m["certification"]
+    url = report_url(c)
     return "\n".join([
         f"WHQL-certified driver **{m['driver_version']}** (commit {m['commit']}).",
         "",
-        f"Install `{m['signed_zip']}` on stock Windows 10 1809+ / Windows 11 — Secure Boot on, no test-signing mode. "
-        "WHQL-certified (HLK) for " + ", ".join(c["os"]) + ".",
+        f"`{m['signed_zip']}` is signed by Microsoft: it installs without test-signing mode, with Secure Boot on. "
+        "WHQL-certified (HLK) for " + ", ".join(os_label(o) for o in c["os"]) + ".",
         "",
         "| | |",
         "| --- | --- |",
@@ -266,16 +290,16 @@ def release_notes(m):
         f"| SHA256 | `{m['signed_zip_sha256']}` |",
         f"| Driver source hash | `{m['source_hash']}` |",
         f"| Partner Center product / submission | `{c['product_id']}` / `{c['submission_id']}` |",
-        f"| Certification report | `{c['report_id']}` |",
+        f"| Certification report | {f'[report]({url})' if url else 'n/a'} |",
         "",
         "Verified in CI: `signtool verify /kp` against the re-issued catalog, a *Microsoft Windows Hardware "
-        "Compatibility Publisher* signature on the `.sys` (nested behind the lab's test signature — expected for "
-        "HLK submissions), `.sys` code byte-identical to the lab-tested binary after stripping signatures, "
+        "Compatibility Publisher* signature on the `.sys` (nested behind the test signature it carried during HLK testing — expected for "
+        "HLK submissions), `.sys` code byte-identical to the HLK-tested binary after stripping signatures, "
         "INF byte-identical to the tested one and carrying DriverVer " + m["driver_version"] + ".",
         "",
         "Installer builds bundle this driver automatically while `driver/**` + `include/**` still hash to the "
         f"source hash above, in preference to any attestation-signed build. `{m['lab_zip']}` is the package "
-        f"exactly as tested in the lab (test-signed); `{m['ms_zip_asset']}` is the zip Microsoft returned. "
+        f"exactly as HLK-tested (test-signed); `{m['ms_zip_asset']}` is the zip Microsoft returned. "
         "Certification is per binary: any driver change needs a new HLK run.",
     ])
 

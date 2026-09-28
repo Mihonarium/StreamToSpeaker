@@ -282,8 +282,16 @@ class Manifest(unittest.TestCase):
                                      95342530, b"", b"", b"")
         notes = certified.release_notes(m)
         self.assertIn("WHQL-certified", notes)
-        self.assertIn("95342530", notes)
+        self.assertIn("DownloadCertificationReport/95342530/1/2", notes)
         self.assertIn("new HLK run", notes)
+        self.assertNotIn("Windows 10", notes)
+        self.assertIn("Windows 11, version 25H2 (x64) (`WINDOWS_v100_X64_25H2_FULL`)", notes)
+
+    def test_notes_without_report_id(self):
+        m = certified.build_manifest("1.1.0.209", "abc", "5b" * 32, 1, 2, [], None, b"", b"", b"")
+        self.assertIn("| Certification report | n/a |", certified.release_notes(m))
+        m = certified.build_manifest("1.1.0.209", "abc", "5b" * 32, "", "", [], 95342530, b"", b"", b"")
+        self.assertIn("| Certification report | n/a |", certified.release_notes(m))
 
 
 if __name__ == "__main__":
