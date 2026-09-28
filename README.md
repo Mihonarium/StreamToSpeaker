@@ -94,7 +94,7 @@ gh attestation verify StreamToSpeakerSetup.exe -R Mihonarium/StreamToSpeaker
 proves the file was built by this repository's CI from a specific commit.
 Offline: `--bundle <file>.sigstore.json`, shipped with each release.
 
-The driver is [certified by Microsoft](https://partner.microsoft.com/en-us/dashboard/hardware/Driver/DownloadCertificationReport/95342530/13546379290870261/1152921505701928801).
+The driver is [certified by Microsoft](https://partner.microsoft.com/en-us/dashboard/hardware/Driver/DownloadCertificationReport/95342530/14599256519720956/1152921505701928485).
 
 ## Developers
 
