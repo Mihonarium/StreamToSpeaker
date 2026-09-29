@@ -58,7 +58,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Convert a latency in milliseconds to sample frames at the wire rate —
 /// the unit the sync-packet anchor and `Audio-Latency` speak. 2000 ms →
@@ -80,6 +80,140 @@ pub fn ntp_now() -> u64 {
     let secs = now.as_secs() + NTP_EPOCH_OFFSET;
     let frac = ((now.subsec_nanos() as u64) << 32) / 1_000_000_000;
     (secs << 32) | frac
+}
+
+/// A duration as a 32.32 NTP interval.
+fn duration_to_ntp(d: Duration) -> u64 {
+    (d.as_secs() << 32) | (((d.subsec_nanos() as u64) << 32) / 1_000_000_000)
+}
+
+/// Our NTP clock at instant `t` (past or future): [`ntp_now`] moved by
+/// the monotonic distance to `t`.
+pub fn ntp_at(t: Instant) -> u64 {
+    ntp_at_from(t, Instant::now(), ntp_now())
+}
+
+/// [`ntp_at`] given a simultaneous reading of both clocks: `ntp` is our
+/// NTP clock at `now`.
+fn ntp_at_from(t: Instant, now: Instant, ntp: u64) -> u64 {
+    if t >= now {
+        ntp.wrapping_add(duration_to_ntp(t - now))
+    } else {
+        ntp.wrapping_sub(duration_to_ntp(now - t))
+    }
+}
+
+/// Wall-clock length of one realtime packet (352 frames at the wire rate)
+/// — the realtime sender's pacing step.
+pub fn realtime_packet_duration() -> Duration {
+    Duration::from_nanos((crate::airplay::rtp::FRAMES_PER_PACKET as u64 * 1_000_000_000) / crate::WIRE_SAMPLE_RATE as u64)
+}
+
+/// The realtime sender's schedule, shared with the session's sync sender:
+/// the packet `n` after the start (rtptime `initial + 352·n`) is due at
+/// `start + (n+1)·`[`realtime_packet_duration`]. The sender paces to it,
+/// keeps it through re-glues, and publishes the next packet's (rtptime,
+/// due instant) after every send; a sync packet built from that point
+/// states the exact send time of the rtptime it names, whenever the sync
+/// thread happens to wake — no 0-8 ms sampling error, and one value for
+/// every member.
+pub struct SendSchedule {
+    start: Instant,
+    next: Mutex<(u32, Instant)>,
+}
+
+impl SendSchedule {
+    /// A schedule starting now, first packet `initial_rtptime`.
+    pub fn new(initial_rtptime: u32) -> Arc<Self> {
+        let start = Instant::now();
+        Arc::new(Self { start, next: Mutex::new((initial_rtptime, start + realtime_packet_duration())) })
+    }
+
+    /// When the sender's packet clock started.
+    pub fn start(&self) -> Instant {
+        self.start
+    }
+
+    /// Due instant of the packet `packet_count` packets after the start.
+    pub fn due(&self, packet_count: u64) -> Instant {
+        self.start + realtime_packet_duration().saturating_mul((packet_count + 1) as u32)
+    }
+
+    /// The next packet to send: its rtptime and packet index.
+    pub fn set_next(&self, rtptime: u32, packet_count: u64) {
+        *self.next.lock().unwrap() = (rtptime, self.due(packet_count));
+    }
+
+    /// `(rtptime, due instant)` of the next packet to send.
+    pub fn next(&self) -> (u32, Instant) {
+        *self.next.lock().unwrap()
+    }
+}
+
+/// The clock an AirPlay 2 session's sync packets are expressed on.
+#[derive(Clone)]
+pub enum SyncClock {
+    /// 28-byte 0xD7 packets on the PTP timeline (the followed receiver's
+    /// clock once locked, else ours).
+    Ptp(crate::airplay::ap2_ptp::PtpTimeline),
+    /// 20-byte 0xD4 packets on our NTP clock.
+    Ntp,
+}
+
+/// Where a session's sync packets take their (rtptime, time) pair from.
+#[derive(Clone)]
+pub enum SyncTime {
+    /// The rtptime the sender published last and the clock read when the
+    /// sync thread wakes — what single receivers (and one-member
+    /// pair/group sessions) use.
+    Sampled(Arc<AtomicU32>),
+    /// The sender's schedule: the next packet's rtptime and its exact due
+    /// instant (pair/group sessions of two or more members).
+    Scheduled(Arc<SendSchedule>),
+}
+
+/// One sync packet for a session: the same bytes for every member.
+pub fn session_sync_packet(first: bool, latency: u32, clock: &SyncClock, time: &SyncTime) -> Vec<u8> {
+    let (cur_rtp, due) = match time {
+        SyncTime::Sampled(rtp) => (rtp.load(Ordering::Acquire), None),
+        SyncTime::Scheduled(s) => {
+            let (rtp, at) = s.next();
+            (rtp, Some(at))
+        }
+    };
+    match clock {
+        SyncClock::Ptp(timeline) => {
+            let (clock_id, ns) = timeline.time_at(due.unwrap_or_else(Instant::now));
+            build_ptp_sync(first, cur_rtp, latency, ns, clock_id).to_vec()
+        }
+        SyncClock::Ntp => {
+            let ntp = due.map(ntp_at).unwrap_or_else(ntp_now);
+            build_ntp_sync(first, cur_rtp, latency, ntp).to_vec()
+        }
+    }
+}
+
+/// One sync sender for a whole AirPlay 2 session: every tick builds ONE
+/// packet ([`session_sync_packet`]) and sends it to every member's control
+/// address from that member's control socket. Per-member threads sampled
+/// the rtptime→time mapping independently, so the halves of a pair were
+/// told mappings up to a packet (8 ms) apart. The initial (0x90) packet is
+/// sent to every member before this returns (anchor before audio).
+pub fn spawn_session_sync_sender(
+    dests: Vec<(UdpSocket, SocketAddr)>,
+    latency_samples: u32,
+    clock: SyncClock,
+    time: SyncTime,
+    stop_flag: Arc<AtomicBool>,
+    receiver_name: String,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    let kind = match clock {
+        SyncClock::Ptp(_) => "PTP",
+        SyncClock::Ntp => "NTP",
+    };
+    spawn_sync_sender_inner(dests, stop_flag, receiver_name, kind, move |first| {
+        session_sync_packet(first, latency_samples, &clock, &time)
+    })
 }
 
 /// Spawn the timing responder. Owns the timing socket. Exits when
@@ -195,77 +329,41 @@ pub fn spawn_sync_sender(
 ) -> std::io::Result<thread::JoinHandle<()>> {
     // NTP path: classic 20-byte 0xD4 sync, time field = our NTP clock.
     spawn_sync_sender_inner(
-        control_socket,
-        receiver_addr,
-        current_rtptime,
+        vec![(control_socket, receiver_addr)],
         stop_flag,
         receiver_name,
         "NTP",
-        move |first, cur_rtp| build_ntp_sync(first, cur_rtp, latency_samples, ntp_now()).to_vec(),
-    )
-}
-
-/// PTP path: the sync packet is OwnTone's **28-byte 0xD7** form
-/// (`sync_packet_ptp_make`) carrying a raw nanosecond clock value plus the
-/// 8-byte identity of the clock it's expressed on. Field-tested nuance:
-/// some receivers (current Sonos fw) only respect times on **their own**
-/// timeline — so once the PTP layer has locked onto the receiver's
-/// Sync/Follow_Up stream, the sync packet uses the receiver's clock
-/// (id + time); until then it falls back to our grandmaster clock.
-pub fn spawn_sync_sender_ptp(
-    control_socket: UdpSocket,
-    receiver_addr: SocketAddr,
-    current_rtptime: Arc<AtomicU32>,
-    latency_samples: u32,
-    timeline: crate::airplay::ap2_ptp::PtpTimeline,
-    stop_flag: Arc<AtomicBool>,
-    receiver_name: String,
-) -> std::io::Result<thread::JoinHandle<()>> {
-    spawn_sync_sender_inner(
-        control_socket,
-        receiver_addr,
-        current_rtptime,
-        stop_flag,
-        receiver_name,
-        "PTP",
-        move |first, cur_rtp| {
-            let (clock_id, now_ns) = match timeline.receiver_now_ns() {
-                Some((id, now)) => (id, now),
-                None => (timeline.clock_id, timeline.our_now_ns()),
-            };
-            build_ptp_sync(first, cur_rtp, latency_samples, now_ns, clock_id).to_vec()
+        move |first| {
+            build_ntp_sync(first, current_rtptime.load(Ordering::Acquire), latency_samples, ntp_now()).to_vec()
         },
     )
 }
 
 fn spawn_sync_sender_inner<F>(
-    control_socket: UdpSocket,
-    receiver_addr: SocketAddr,
-    current_rtptime: Arc<AtomicU32>,
+    dests: Vec<(UdpSocket, SocketAddr)>,
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
     kind: &'static str,
     build_packet: F,
 ) -> std::io::Result<thread::JoinHandle<()>>
 where
-    F: Fn(bool, u32) -> Vec<u8> + Send + 'static,
+    F: Fn(bool) -> Vec<u8> + Send + 'static,
 {
     // Anchor first: the initial (extension-bit) sync goes out on the
     // caller's thread, before this function returns — so "first sync
     // precedes first audio" holds by construction when the caller spawns
     // its audio sender afterwards, with no flag to keep consistent.
-    let first_pkt = build_packet(true, current_rtptime.load(Ordering::Acquire));
-    match control_socket.send_to(&first_pkt, receiver_addr) {
-        Ok(_) => info!(
-            "AirPlay {} sync: anchor sync sent to {} ({} bytes); continuing at 1 Hz",
-            kind,
-            receiver_addr,
-            first_pkt.len()
-        ),
-        Err(e) => warn!(
-            "AirPlay {} sync: initial anchor send to {} failed: {}",
-            kind, receiver_addr, e
-        ),
+    let first_pkt = build_packet(true);
+    for (socket, addr) in &dests {
+        match socket.send_to(&first_pkt, addr) {
+            Ok(_) => info!(
+                "AirPlay {} sync: anchor sync sent to {} ({} bytes); continuing at 1 Hz",
+                kind,
+                addr,
+                first_pkt.len()
+            ),
+            Err(e) => warn!("AirPlay {} sync: initial anchor send to {} failed: {}", kind, addr, e),
+        }
     }
 
     thread::Builder::new()
@@ -277,10 +375,12 @@ where
                 if !sleep_unless_stopped(&stop_flag, Duration::from_secs(1)) {
                     break;
                 }
-                let cur_rtp = current_rtptime.load(Ordering::Acquire);
-                let pkt = build_packet(false, cur_rtp);
-                if let Err(e) = control_socket.send_to(&pkt, receiver_addr) {
-                    warn!("AirPlay {} sync send to {} failed: {}", kind, receiver_addr, e);
+                // One packet per tick, the same bytes to every destination.
+                let pkt = build_packet(false);
+                for (socket, addr) in &dests {
+                    if let Err(e) = socket.send_to(&pkt, addr) {
+                        warn!("AirPlay {} sync send to {} failed: {}", kind, addr, e);
+                    }
                 }
                 count += 1;
             }
@@ -318,6 +418,79 @@ mod tests {
         assert_eq!(u32::from_be_bytes([p[16], p[17], p[18], p[19]]), 100_000);
         // Trailing clock identity.
         assert_eq!(u64::from_be_bytes(p[20..28].try_into().unwrap()), 0xDEADBEEFCAFEF00D);
+    }
+
+    #[test]
+    fn scheduled_sync_time_is_the_due_time_of_the_rtptime_it_names() {
+        let schedule = SendSchedule::new(1000);
+        let dur = realtime_packet_duration();
+        assert_eq!(schedule.next(), (1000, schedule.start() + dur));
+        // After 10 packets (and after a re-glue, which only moves the
+        // count), the next rtptime is due exactly on the schedule.
+        schedule.set_next(1000 + 352 * 10, 10);
+        assert_eq!(schedule.next(), (1000 + 3520, schedule.start() + dur * 11));
+        assert_eq!(schedule.due(0), schedule.start() + dur);
+
+        // NTP: the time field is the due instant, whenever the packet is
+        // built — two builds 100 ms apart carry the same mapping (within
+        // the wall clock's own read jitter; a sampled time would be 100 ms
+        // later).
+        let time = SyncTime::Scheduled(schedule.clone());
+        let a = session_sync_packet(false, 11025, &SyncClock::Ntp, &time);
+        std::thread::sleep(Duration::from_millis(100));
+        let b = session_sync_packet(false, 11025, &SyncClock::Ntp, &time);
+        assert_eq!(&a[..8], &b[..8], "same rtptimes");
+        assert_eq!(&a[16..20], &b[16..20]);
+        let ta = u64::from_be_bytes(a[8..16].try_into().unwrap());
+        let tb = u64::from_be_bytes(b[8..16].try_into().unwrap());
+        let ms_apart = (ta.abs_diff(tb) as u128 * 1000) >> 32;
+        assert!(ms_apart < 50, "{ms_apart} ms apart");
+    }
+
+    #[test]
+    fn ntp_at_moves_ntp_now_by_the_monotonic_distance() {
+        let now = Instant::now();
+        let ntp = 1000u64 << 32;
+        assert_eq!(ntp_at_from(now, now, ntp), ntp);
+        assert_eq!(ntp_at_from(now + Duration::from_millis(1500), now, ntp), ntp + ((1 << 32) | (1 << 31)));
+        assert_eq!(ntp_at_from(now, now + Duration::from_secs(3), ntp), ntp - (3 << 32));
+        assert_eq!(duration_to_ntp(Duration::from_millis(1500)), (1 << 32) | (1 << 31));
+        // The live version reads both clocks: 3 s ahead is ≈ 3 s later.
+        let secs = ntp_at(now + Duration::from_secs(3)).wrapping_sub(ntp_at(now)) as f64 / 4_294_967_296.0;
+        assert!((secs - 3.0).abs() < 0.1, "{secs}");
+    }
+
+    #[test]
+    fn one_session_sync_sender_sends_every_member_the_same_packet() {
+        let rx_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for rx in [&rx_a, &rx_b] {
+            rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        }
+        let dests = vec![
+            (UdpSocket::bind("127.0.0.1:0").unwrap(), rx_a.local_addr().unwrap()),
+            (UdpSocket::bind("127.0.0.1:0").unwrap(), rx_b.local_addr().unwrap()),
+        ];
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_session_sync_sender(
+            dests,
+            11025,
+            SyncClock::Ntp,
+            SyncTime::Scheduled(SendSchedule::new(5000)),
+            stop.clone(),
+            "test".into(),
+        )
+        .unwrap();
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        let na = rx_a.recv(&mut a).unwrap();
+        let nb = rx_b.recv(&mut b).unwrap();
+        stop.store(true, Ordering::Release);
+        handle.join().unwrap();
+        assert_eq!(na, 20);
+        assert_eq!(a[..na], b[..nb], "byte-identical anchor sync to both members");
+        assert_eq!(a[0], 0x90, "the first packet is the anchor sync");
+        assert_eq!(u32::from_be_bytes([a[16], a[17], a[18], a[19]]), 5000);
     }
 
     #[test]

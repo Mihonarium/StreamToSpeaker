@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use crate::airplay::ap2_crypto::{ChannelCipher, SessionKeys, TAG_LEN};
 use crate::airplay::hap_pairing::{PairSetupPin, PairVerify, PairingCredentials, X_APPLE_HKP_PERSISTENT};
+use crate::airplay::pair_experiments::{PairRecipe, SenderIdentity, SETPEERS_CT_PLIST};
 use crate::airplay::pairing::{TransientPairing, X_APPLE_HKP_VALUE};
 
 const USER_AGENT: &str = "AirPlay/665.13.1";
@@ -80,18 +81,55 @@ pub struct StreamPorts {
     pub control: u16,
 }
 
-/// Ports the receiver returned from the first (timing) SETUP.
-#[derive(Debug, Clone, Copy)]
+/// What the first (session/timing) SETUP negotiated.
+#[derive(Debug, Clone)]
 pub struct TimingSetup {
     /// TCP event-channel port — must be connected before RECORD.
     pub event_port: u16,
     /// The receiver's NTP timing port (0 if absent / PTP mode).
     pub timing_port: u16,
+    /// The top-level keys we sent, in order (for the log).
+    pub sent_keys: Vec<String>,
+    /// The receiver's full reply plist, if it parsed (for the log: look
+    /// for timingPeerInfo / TightSyncUUID / ClockID).
+    pub reply: Option<Value>,
+}
+
+/// Timing part of a pair/group SETUP(session).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionTiming {
+    /// PTP, advertising our clock as the timing peer.
+    Ptp { clock_id: u64, clock_uuid: String },
+    /// NTP, with our timing-responder port.
+    Ntp { timing_port: u16 },
+}
+
+/// Everything a pair/group SETUP(session) carries beyond the connection's
+/// own deviceID / sessionUUID / local address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSessionSetup {
+    pub recipe: PairRecipe,
+    pub timing: SessionTiming,
+    /// The `name` key: what the receiver shows as the sender.
+    pub name: String,
+    /// `groupUUID`: random per connection in the `ma` recipe, one per
+    /// session (shared by the members) in `apple`. Not sent under NTP.
+    pub group_uuid: String,
+    /// `sessionCorrelationUUID` (apple recipe only): one per session. The
+    /// apple recipe also sends it as the timing peer's `ID`, as
+    /// phranck/AirplayKit's Protocol-Session.md reports a macOS sender
+    /// doing.
+    pub correlation_uuid: String,
+    /// `senderSupportsRelay` value in the apple recipe.
+    pub sender_relay: bool,
 }
 
 /// A live AirPlay 2 RTSP control connection.
 pub struct Ap2Rtsp {
     stream: TcpStream,
+    /// Event-channel ciphers (receiver→us reader, us→receiver writer),
+    /// derived at pairing; taken by the event-channel thread.
+    event_ciphers: Option<(ChannelCipher, ChannelCipher)>,
     cseq: u32,
     local_ip: IpAddr,
     receiver_ip: IpAddr,
@@ -111,11 +149,29 @@ pub struct Ap2Rtsp {
 }
 
 impl Ap2Rtsp {
+    /// Connect with a random per-connection sender identity (deviceID,
+    /// DACP-ID/Client-Instance) — what single receivers and the PIN
+    /// ceremony use.
     pub fn connect(
         receiver_ip: IpAddr,
         port: u16,
         local_ip: IpAddr,
         timeout: Duration,
+    ) -> Result<Self> {
+        Self::connect_as(receiver_ip, port, local_ip, timeout, None)
+    }
+
+    /// Connect presenting `identity` (deviceID/macAddress and
+    /// DACP-ID/Client-Instance) when given — pair/group sessions use the
+    /// install's persistent identity on every connection, like OwnTone and
+    /// Music Assistant. `Active-Remote`, `sessionUUID` and the session id
+    /// stay random per connection either way.
+    pub fn connect_as(
+        receiver_ip: IpAddr,
+        port: u16,
+        local_ip: IpAddr,
+        timeout: Duration,
+        identity: Option<&SenderIdentity>,
     ) -> Result<Self> {
         let addr = SocketAddr::new(receiver_ip, port);
         let stream = TcpStream::connect_timeout(&addr, timeout)
@@ -127,17 +183,22 @@ impl Ap2Rtsp {
         let mut rng = rand::thread_rng();
         let session_id: u32 = rng.gen();
         let mac: [u8; 6] = rng.gen();
-        let device_id_mac = mac
+        let mut device_id_mac = mac
             .iter()
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<_>>()
             .join(":");
-        let client_instance = format!("{:016X}", rng.gen::<u64>());
+        let mut client_instance = format!("{:016X}", rng.gen::<u64>());
         let active_remote = format!("{}", rng.gen::<u32>());
         let session_uuid = format_uuid(rng.gen());
+        if let Some(id) = identity.filter(|i| i.is_valid()) {
+            device_id_mac = id.device_mac.clone();
+            client_instance = id.dacp_id.clone();
+        }
 
         Ok(Self {
             stream,
+            event_ciphers: None,
             cseq: 0,
             local_ip,
             receiver_ip,
@@ -238,6 +299,7 @@ impl Ap2Rtsp {
         // From here on, everything is encrypted.
         self.writer = Some(keys.control_writer());
         self.reader = Some(keys.control_reader());
+        self.event_ciphers = Some((keys.event_reader(), keys.event_writer()));
         debug!("AirPlay 2: transient pairing complete, channel encrypted");
         Ok(TransientOutcome::Paired(audio_key))
     }
@@ -351,6 +413,7 @@ impl Ap2Rtsp {
         let audio_key = keys.audio_key();
         self.writer = Some(keys.control_writer());
         self.reader = Some(keys.control_reader());
+        self.event_ciphers = Some((keys.event_reader(), keys.event_writer()));
         debug!("AirPlay 2: pair-verify complete, channel encrypted");
         Ok(audio_key)
     }
@@ -360,11 +423,8 @@ impl Ap2Rtsp {
     /// RAOP timing packets) is what OwnTone shipped for AirPlay 2 for
     /// years — it's the known-working combination with Sonos.
     pub fn setup_timing_ntp(&mut self, timing_port: u16) -> Result<TimingSetup> {
-        let mut dict = plist::Dictionary::new();
-        dict.insert("deviceID".into(), self.device_id_mac.clone().into());
-        dict.insert("sessionUUID".into(), self.session_uuid.clone().into());
-        dict.insert("timingProtocol".into(), "NTP".into());
-        dict.insert("timingPort".into(), Value::Integer((timing_port as u64).into()));
+        let dict = single_ntp_session_dict(&self.device_id_mac, &self.session_uuid, timing_port);
+        let sent_keys = dict.keys().cloned().collect();
         let body = to_binary_plist(&Value::Dictionary(dict))?;
 
         let uri = self.session_uri();
@@ -372,7 +432,7 @@ impl Ap2Rtsp {
         if resp.status != 200 {
             bail!("SETUP(timing) → {} {}", resp.status, resp.status_text);
         }
-        Ok(parse_timing_setup(&resp.body))
+        Ok(parse_timing_setup(&resp.body, sent_keys))
     }
 
     /// First SETUP, PTP variant — declare IEEE-1588 timing and advertise
@@ -384,25 +444,14 @@ impl Ap2Rtsp {
     /// variant: ID (UUID), ClockID (int64), DeviceType, Addresses,
     /// SupportsClockPortMatchingOverride — plus a `timingPeerList` copy.
     pub fn setup_timing_ptp(&mut self, clock_id: u64, clock_uuid: &str) -> Result<TimingSetup> {
-        let mut peer = plist::Dictionary::new();
-        peer.insert(
-            "Addresses".into(),
-            Value::Array(vec![Value::String(self.local_ip.to_string())]),
+        let dict = single_ptp_session_dict(
+            &self.device_id_mac,
+            &self.session_uuid,
+            self.local_ip,
+            clock_id,
+            clock_uuid,
         );
-        peer.insert("ClockID".into(), Value::Integer((clock_id as i64).into()));
-        peer.insert("DeviceType".into(), Value::Integer(0u64.into()));
-        peer.insert("ID".into(), clock_uuid.to_string().into());
-        peer.insert("SupportsClockPortMatchingOverride".into(), Value::Boolean(false));
-
-        let mut dict = plist::Dictionary::new();
-        dict.insert("deviceID".into(), self.device_id_mac.clone().into());
-        dict.insert("sessionUUID".into(), self.session_uuid.clone().into());
-        dict.insert("timingProtocol".into(), "PTP".into());
-        dict.insert("timingPeerInfo".into(), Value::Dictionary(peer.clone()));
-        dict.insert(
-            "timingPeerList".into(),
-            Value::Array(vec![Value::Dictionary(peer)]),
-        );
+        let sent_keys = dict.keys().cloned().collect();
         let body = to_binary_plist(&Value::Dictionary(dict))?;
 
         let uri = self.session_uri();
@@ -410,19 +459,52 @@ impl Ap2Rtsp {
         if resp.status != 200 {
             bail!("SETUP(timing/PTP) → {} {}", resp.status, resp.status_text);
         }
-        Ok(parse_timing_setup(&resp.body))
+        Ok(parse_timing_setup(&resp.body, sent_keys))
+    }
+
+    /// First SETUP for a pair/group session: the recipe's group keys (see
+    /// [`group_session_dict`]) on top of this connection's deviceID,
+    /// sessionUUID and local address.
+    pub fn setup_session_group(&mut self, setup: &GroupSessionSetup) -> Result<TimingSetup> {
+        let dict = group_session_dict(&self.device_id_mac, &self.session_uuid, self.local_ip, setup);
+        let sent_keys = dict.keys().cloned().collect();
+        let body = to_binary_plist(&Value::Dictionary(dict))?;
+        let uri = self.session_uri();
+        let resp = self.request("SETUP", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
+        if resp.status != 200 {
+            bail!(
+                "SETUP(session, {} recipe) → {} {}{}",
+                setup.recipe,
+                resp.status,
+                resp.status_text,
+                describe_error_body(&resp.body)
+            );
+        }
+        Ok(parse_timing_setup(&resp.body, sent_keys))
+    }
+
+    /// The event-channel ciphers derived at pairing, once (None before
+    /// pairing or after the first call).
+    pub fn take_event_ciphers(&mut self) -> Option<(ChannelCipher, ChannelCipher)> {
+        self.event_ciphers.take()
     }
 
     /// SETPEERS — hand the receiver the full PTP peer address list (ours
     /// + its own) so it knows who to clock against. Required by some
     /// HomePod firmwares before they'll honour PTP timing.
     pub fn set_peers(&mut self, peers: &[IpAddr]) -> Result<()> {
+        self.set_peers_typed(peers, SETPEERS_CT_PLIST)
+    }
+
+    /// SETPEERS with an explicit content type (the apple recipe sends
+    /// OwnTone's `/peer-list-changed`).
+    pub fn set_peers_typed(&mut self, peers: &[IpAddr], content_type: &str) -> Result<()> {
         let arr: Vec<Value> = peers.iter().map(|ip| Value::String(ip.to_string())).collect();
         let body = to_binary_plist(&Value::Array(arr))?;
         let uri = self.session_uri();
-        let resp = self.request("SETPEERS", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
+        let resp = self.request("SETPEERS", &uri, &[], Some(content_type), &body)?;
         if resp.status != 200 {
-            bail!("SETPEERS → {} {}", resp.status, resp.status_text);
+            bail!("SETPEERS → {} {}{}", resp.status, resp.status_text, describe_error_body(&resp.body));
         }
         Ok(())
     }
@@ -728,14 +810,16 @@ fn to_binary_plist(value: &Value) -> Result<Vec<u8>> {
 }
 
 /// Pull the receiver's `eventPort` (+ optional `timingPort`) out of the
-/// first SETUP response. The receiver withholds its RECORD response until
-/// the sender opens a TCP event channel to the event port, so that one is
-/// mandatory for AirPlay 2; the timing port is where the receiver expects
-/// our NTP-mode timing traffic to originate.
-fn parse_timing_setup(body: &[u8]) -> TimingSetup {
+/// first SETUP response, and keep the whole reply for the log. The
+/// receiver withholds its RECORD response until the sender opens a TCP
+/// event channel to the event port, so that one is mandatory for AirPlay
+/// 2; the timing port is where the receiver expects our NTP-mode timing
+/// traffic to originate.
+fn parse_timing_setup(body: &[u8], sent_keys: Vec<String>) -> TimingSetup {
+    let reply = plist::from_bytes::<Value>(body).ok();
     let port = |key: &str| -> u16 {
-        plist::from_bytes::<Value>(body)
-            .ok()
+        reply
+            .as_ref()
             .and_then(|v| {
                 v.as_dictionary()?
                     .get(key)
@@ -747,6 +831,158 @@ fn parse_timing_setup(body: &[u8]) -> TimingSetup {
     TimingSetup {
         event_port: port("eventPort"),
         timing_port: port("timingPort"),
+        sent_keys,
+        reply,
+    }
+}
+
+/// The `timingPeerInfo` dict advertising our clock (also the single entry
+/// of `timingPeerList`).
+fn timing_peer_dict(local_ip: IpAddr, clock_id: u64, clock_uuid: &str, clock_port_override: bool) -> plist::Dictionary {
+    let mut peer = plist::Dictionary::new();
+    peer.insert(
+        "Addresses".into(),
+        Value::Array(vec![Value::String(local_ip.to_string())]),
+    );
+    peer.insert("ClockID".into(), Value::Integer((clock_id as i64).into()));
+    peer.insert("DeviceType".into(), Value::Integer(0u64.into()));
+    peer.insert("ID".into(), clock_uuid.to_string().into());
+    peer.insert("SupportsClockPortMatchingOverride".into(), Value::Boolean(clock_port_override));
+    peer
+}
+
+/// SETUP(session) body for a single receiver on PTP, as it has always been sent:
+/// deviceID, sessionUUID, timingProtocol, timingPeerInfo, timingPeerList.
+pub(crate) fn single_ptp_session_dict(
+    device_id: &str,
+    session_uuid: &str,
+    local_ip: IpAddr,
+    clock_id: u64,
+    clock_uuid: &str,
+) -> plist::Dictionary {
+    let peer = timing_peer_dict(local_ip, clock_id, clock_uuid, false);
+    let mut dict = plist::Dictionary::new();
+    dict.insert("deviceID".into(), device_id.to_string().into());
+    dict.insert("sessionUUID".into(), session_uuid.to_string().into());
+    dict.insert("timingProtocol".into(), "PTP".into());
+    dict.insert("timingPeerInfo".into(), Value::Dictionary(peer.clone()));
+    dict.insert("timingPeerList".into(), Value::Array(vec![Value::Dictionary(peer)]));
+    dict
+}
+
+/// SETUP(session) body for a single receiver on NTP, as it has always been sent:
+/// deviceID, sessionUUID, timingProtocol, timingPort.
+pub(crate) fn single_ntp_session_dict(device_id: &str, session_uuid: &str, timing_port: u16) -> plist::Dictionary {
+    let mut dict = plist::Dictionary::new();
+    dict.insert("deviceID".into(), device_id.to_string().into());
+    dict.insert("sessionUUID".into(), session_uuid.to_string().into());
+    dict.insert("timingProtocol".into(), "NTP".into());
+    dict.insert("timingPort".into(), Value::Integer((timing_port as u64).into()));
+    dict
+}
+
+/// SETUP(session) body for a pair/group session.
+///
+/// * PTP, `ma` (Music Assistant airplay-cli ap2_client.c / OwnTone
+///   airplay.c): name, deviceID, sessionUUID, timingProtocol=PTP,
+///   macAddress, groupUUID, groupContainsGroupLeader=false,
+///   timingPeerInfo/List with SupportsClockPortMatchingOverride=false. No
+///   isMultiSelectAirPlay, no senderSupportsRelay.
+/// * PTP, `apple` (keys modelled on Apple senders as public sources
+///   describe them: pyatv's iPhone-shaped airplayv2.py body and the macOS
+///   sender SETUP in phranck/AirplayKit's Protocol-Session.md): name,
+///   macAddress, deviceID, sessionUUID, sessionCorrelationUUID,
+///   timingProtocol=PTP, isMultiSelectAirPlay=true, groupUUID,
+///   groupContainsGroupLeader=false, senderSupportsRelay,
+///   timingPeerInfo/List with SupportsClockPortMatchingOverride=true and
+///   `ID` = the sessionCorrelationUUID (AirplayKit reports the same UUID
+///   in both places). No supportsGroupCohesion or cluster keys.
+/// * NTP, either recipe (pyatv 0.18 airplayv2.py): deviceID, sessionUUID,
+///   timingPort, timingProtocol=NTP, isMultiSelectAirPlay=true,
+///   groupContainsGroupLeader=false, macAddress, name,
+///   senderSupportsRelay (false unless the apple recipe's switch is on),
+///   no groupUUID.
+pub fn group_session_dict(
+    device_id: &str,
+    session_uuid: &str,
+    local_ip: IpAddr,
+    s: &GroupSessionSetup,
+) -> plist::Dictionary {
+    let relay = s.recipe == PairRecipe::Apple && s.sender_relay;
+    let mut d = plist::Dictionary::new();
+    match (&s.timing, s.recipe) {
+        (SessionTiming::Ntp { timing_port }, _) => {
+            d.insert("deviceID".into(), device_id.to_string().into());
+            d.insert("sessionUUID".into(), session_uuid.to_string().into());
+            d.insert("timingPort".into(), Value::Integer((*timing_port as u64).into()));
+            d.insert("timingProtocol".into(), "NTP".into());
+            d.insert("isMultiSelectAirPlay".into(), Value::Boolean(true));
+            d.insert("groupContainsGroupLeader".into(), Value::Boolean(false));
+            d.insert("macAddress".into(), device_id.to_string().into());
+            d.insert("name".into(), s.name.clone().into());
+            d.insert("senderSupportsRelay".into(), Value::Boolean(relay));
+        }
+        (SessionTiming::Ptp { clock_id, clock_uuid }, PairRecipe::Ma) => {
+            let peer = timing_peer_dict(local_ip, *clock_id, clock_uuid, false);
+            d.insert("name".into(), s.name.clone().into());
+            d.insert("deviceID".into(), device_id.to_string().into());
+            d.insert("sessionUUID".into(), session_uuid.to_string().into());
+            d.insert("timingProtocol".into(), "PTP".into());
+            d.insert("macAddress".into(), device_id.to_string().into());
+            d.insert("groupUUID".into(), s.group_uuid.clone().into());
+            d.insert("groupContainsGroupLeader".into(), Value::Boolean(false));
+            d.insert("timingPeerInfo".into(), Value::Dictionary(peer.clone()));
+            d.insert("timingPeerList".into(), Value::Array(vec![Value::Dictionary(peer)]));
+        }
+        (SessionTiming::Ptp { clock_id, .. }, PairRecipe::Apple) => {
+            let peer = timing_peer_dict(local_ip, *clock_id, &s.correlation_uuid, true);
+            d.insert("name".into(), s.name.clone().into());
+            d.insert("macAddress".into(), device_id.to_string().into());
+            d.insert("deviceID".into(), device_id.to_string().into());
+            d.insert("sessionUUID".into(), session_uuid.to_string().into());
+            d.insert("sessionCorrelationUUID".into(), s.correlation_uuid.clone().into());
+            d.insert("timingProtocol".into(), "PTP".into());
+            d.insert("isMultiSelectAirPlay".into(), Value::Boolean(true));
+            d.insert("groupUUID".into(), s.group_uuid.clone().into());
+            d.insert("groupContainsGroupLeader".into(), Value::Boolean(false));
+            d.insert("senderSupportsRelay".into(), Value::Boolean(relay));
+            d.insert("timingPeerInfo".into(), Value::Dictionary(peer.clone()));
+            d.insert("timingPeerList".into(), Value::Array(vec![Value::Dictionary(peer)]));
+        }
+    }
+    d
+}
+
+/// A fresh random UUID string in the canonical upper-case form.
+pub fn random_uuid() -> String {
+    format_uuid(rand::thread_rng().gen())
+}
+
+/// Compact one-line rendering of a plist for the log: dicts as
+/// `{key: value, …}`, arrays as `[…]`, data as its length plus a short
+/// hex prefix.
+pub fn plist_brief(v: &Value) -> String {
+    match v {
+        Value::Dictionary(d) => format!(
+            "{{{}}}",
+            d.iter()
+                .map(|(k, v)| format!("{}: {}", k, plist_brief(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Array(a) => format!("[{}]", a.iter().map(plist_brief).collect::<Vec<_>>().join(", ")),
+        Value::String(s) => format!("{:?}", s),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(r) => r.to_string(),
+        Value::Data(d) => {
+            let n = d.len().min(8);
+            let hex: String = d[..n].iter().map(|b| format!("{:02x}", b)).collect();
+            format!("<{} bytes {}{}>", d.len(), hex, if d.len() > n { "…" } else { "" })
+        }
+        Value::Date(d) => format!("{:?}", d),
+        Value::Uid(u) => format!("uid({})", u.get()),
+        other => format!("{:?}", other),
     }
 }
 
@@ -873,6 +1109,191 @@ mod tests {
         assert!(s.contains("100B"), "got: {}", s);
         assert!(s.contains(&"ab".repeat(64)), "got: {}", s);
         assert!(s.ends_with("…)"), "got: {}", s);
+    }
+
+    fn keys(d: &plist::Dictionary) -> Vec<&str> {
+        d.keys().map(String::as_str).collect()
+    }
+
+    const DEV: &str = "AA:BB:CC:DD:EE:FF";
+    const SESS: &str = "11111111-2222-3333-4444-555555555555";
+
+    fn local() -> IpAddr {
+        "192.0.2.2".parse().unwrap()
+    }
+
+    fn group(recipe: PairRecipe, timing: SessionTiming, relay: bool) -> GroupSessionSetup {
+        GroupSessionSetup {
+            recipe,
+            timing,
+            name: "Stream To Speaker".into(),
+            group_uuid: "GGGGGGGG-0000-0000-0000-000000000000".into(),
+            correlation_uuid: "CCCCCCCC-0000-0000-0000-000000000000".into(),
+            sender_relay: relay,
+        }
+    }
+
+    fn ptp() -> SessionTiming {
+        SessionTiming::Ptp { clock_id: 0x1234, clock_uuid: "UU".into() }
+    }
+
+    fn peer_override(d: &plist::Dictionary) -> bool {
+        d["timingPeerInfo"].as_dictionary().unwrap()["SupportsClockPortMatchingOverride"]
+            .as_boolean()
+            .unwrap()
+    }
+
+    #[test]
+    fn single_receiver_session_setup_is_unchanged() {
+        // Exactly the keys (and order) single receivers were always sent.
+        let d = single_ptp_session_dict(DEV, SESS, local(), 0x1234, "UU");
+        assert_eq!(keys(&d), ["deviceID", "sessionUUID", "timingProtocol", "timingPeerInfo", "timingPeerList"]);
+        let peer = d["timingPeerInfo"].as_dictionary().unwrap();
+        assert_eq!(keys(peer), ["Addresses", "ClockID", "DeviceType", "ID", "SupportsClockPortMatchingOverride"]);
+        assert!(!peer_override(&d));
+        assert_eq!(peer["ClockID"].as_signed_integer(), Some(0x1234));
+        assert_eq!(d["timingPeerList"].as_array().unwrap().len(), 1);
+        let n = single_ntp_session_dict(DEV, SESS, 6002);
+        assert_eq!(keys(&n), ["deviceID", "sessionUUID", "timingProtocol", "timingPort"]);
+        assert_eq!(n["timingPort"].as_unsigned_integer(), Some(6002));
+    }
+
+    #[test]
+    fn ma_recipe_session_setup_keys() {
+        let d = group_session_dict(DEV, SESS, local(), &group(PairRecipe::Ma, ptp(), true));
+        assert_eq!(
+            keys(&d),
+            [
+                "name", "deviceID", "sessionUUID", "timingProtocol", "macAddress", "groupUUID",
+                "groupContainsGroupLeader", "timingPeerInfo", "timingPeerList"
+            ]
+        );
+        assert_eq!(d["macAddress"].as_string(), Some(DEV));
+        assert_eq!(d["deviceID"].as_string(), Some(DEV));
+        assert_eq!(d["groupContainsGroupLeader"].as_boolean(), Some(false));
+        assert_eq!(d["timingProtocol"].as_string(), Some("PTP"));
+        assert!(!peer_override(&d));
+        // ma keeps the clock's own UUID as the timing peer ID.
+        assert_eq!(d["timingPeerInfo"].as_dictionary().unwrap()["ID"].as_string(), Some("UU"));
+        // No Apple system-session keys, whatever the relay switch says.
+        for k in ["isMultiSelectAirPlay", "senderSupportsRelay", "sessionCorrelationUUID"] {
+            assert!(!d.contains_key(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn apple_recipe_session_setup_keys() {
+        let d = group_session_dict(DEV, SESS, local(), &group(PairRecipe::Apple, ptp(), false));
+        assert_eq!(
+            keys(&d),
+            [
+                "name", "macAddress", "deviceID", "sessionUUID", "sessionCorrelationUUID", "timingProtocol",
+                "isMultiSelectAirPlay", "groupUUID", "groupContainsGroupLeader", "senderSupportsRelay",
+                "timingPeerInfo", "timingPeerList"
+            ]
+        );
+        assert_eq!(d["isMultiSelectAirPlay"].as_boolean(), Some(true));
+        assert_eq!(d["groupContainsGroupLeader"].as_boolean(), Some(false));
+        assert_eq!(d["senderSupportsRelay"].as_boolean(), Some(false));
+        assert_eq!(d["groupUUID"].as_string(), Some("GGGGGGGG-0000-0000-0000-000000000000"));
+        assert_eq!(d["sessionCorrelationUUID"].as_string(), Some("CCCCCCCC-0000-0000-0000-000000000000"));
+        assert!(peer_override(&d), "the apple recipe sends SupportsClockPortMatchingOverride=true");
+        // As AirplayKit's Protocol-Session.md reports for a macOS sender:
+        // timingPeerInfo.ID and every timingPeerList[].ID are the
+        // sessionCorrelationUUID.
+        let correlation = d["sessionCorrelationUUID"].as_string().unwrap();
+        assert_eq!(d["timingPeerInfo"].as_dictionary().unwrap()["ID"].as_string(), Some(correlation));
+        for p in d["timingPeerList"].as_array().unwrap() {
+            assert_eq!(p.as_dictionary().unwrap()["ID"].as_string(), Some(correlation));
+        }
+        let d = group_session_dict(DEV, SESS, local(), &group(PairRecipe::Apple, ptp(), true));
+        assert_eq!(d["senderSupportsRelay"].as_boolean(), Some(true));
+        for k in ["supportsGroupCohesion", "timingPort"] {
+            assert!(!d.contains_key(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn ntp_group_session_setup_is_pyatv_shaped() {
+        for recipe in [PairRecipe::Ma, PairRecipe::Apple] {
+            let d = group_session_dict(
+                DEV,
+                SESS,
+                local(),
+                &group(recipe, SessionTiming::Ntp { timing_port: 6002 }, false),
+            );
+            assert_eq!(
+                keys(&d),
+                [
+                    "deviceID", "sessionUUID", "timingPort", "timingProtocol", "isMultiSelectAirPlay",
+                    "groupContainsGroupLeader", "macAddress", "name", "senderSupportsRelay"
+                ]
+            );
+            assert_eq!(d["timingProtocol"].as_string(), Some("NTP"));
+            assert_eq!(d["isMultiSelectAirPlay"].as_boolean(), Some(true));
+            assert_eq!(d["senderSupportsRelay"].as_boolean(), Some(false));
+            assert!(!d.contains_key("groupUUID"), "pyatv sends no groupUUID");
+        }
+        // The relay switch is an apple-recipe switch only.
+        let ma = group_session_dict(DEV, SESS, local(), &group(PairRecipe::Ma, SessionTiming::Ntp { timing_port: 1 }, true));
+        assert_eq!(ma["senderSupportsRelay"].as_boolean(), Some(false));
+        let apple = group_session_dict(DEV, SESS, local(), &group(PairRecipe::Apple, SessionTiming::Ntp { timing_port: 1 }, true));
+        assert_eq!(apple["senderSupportsRelay"].as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn group_setup_bodies_serialise_as_binary_plists() {
+        for recipe in [PairRecipe::Ma, PairRecipe::Apple] {
+            let d = group_session_dict(DEV, SESS, local(), &group(recipe, ptp(), false));
+            let body = to_binary_plist(&Value::Dictionary(d.clone())).unwrap();
+            let back: Value = plist::from_bytes(&body).unwrap();
+            assert_eq!(back.as_dictionary().unwrap(), &d);
+        }
+    }
+
+    #[test]
+    fn identity_is_persistent_only_when_given() {
+        use crate::airplay::pair_experiments::SenderIdentity;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let id = SenderIdentity::generate();
+        let a = Ap2Rtsp::connect_as(ip, port, ip, Duration::from_secs(2), Some(&id)).unwrap();
+        let b = Ap2Rtsp::connect_as(ip, port, ip, Duration::from_secs(2), Some(&id)).unwrap();
+        assert_eq!(a.device_id_mac, id.device_mac);
+        assert_eq!(a.client_instance, id.dacp_id);
+        assert_eq!(b.device_id_mac, id.device_mac);
+        // Per connection regardless: Active-Remote, sessionUUID, session id.
+        assert_ne!(a.session_uuid, b.session_uuid);
+        assert!(a.active_remote != b.active_remote || a.session_id != b.session_id);
+        // Without an identity (single receivers): random per connection.
+        let c = Ap2Rtsp::connect(ip, port, ip, Duration::from_secs(2)).unwrap();
+        let d = Ap2Rtsp::connect(ip, port, ip, Duration::from_secs(2)).unwrap();
+        assert_ne!(c.client_instance, d.client_instance);
+        assert_ne!(c.device_id_mac, id.device_mac);
+        // A malformed identity is never put into headers.
+        let bad = SenderIdentity { device_mac: "x\r\ny".into(), dacp_id: "zz".into() };
+        let e = Ap2Rtsp::connect_as(ip, port, ip, Duration::from_secs(2), Some(&bad)).unwrap();
+        assert_ne!(e.device_id_mac, bad.device_mac);
+        drop(listener);
+    }
+
+    #[test]
+    fn plist_brief_is_one_line() {
+        let mut d = plist::Dictionary::new();
+        d.insert("eventPort".into(), Value::Integer(51000u64.into()));
+        d.insert("timingPeerInfo".into(), Value::Dictionary({
+            let mut p = plist::Dictionary::new();
+            p.insert("Addresses".into(), Value::Array(vec![Value::String("192.0.2.11".into())]));
+            p.insert("TightSyncUUID".into(), Value::String("T".into()));
+            p
+        }));
+        d.insert("k".into(), Value::Data(vec![1, 2, 3]));
+        let s = plist_brief(&Value::Dictionary(d));
+        assert_eq!(
+            s,
+            r#"{eventPort: 51000, timingPeerInfo: {Addresses: ["192.0.2.11"], TightSyncUUID: "T"}, k: <3 bytes 010203>}"#
+        );
     }
 
     #[test]

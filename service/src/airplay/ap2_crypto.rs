@@ -45,6 +45,14 @@ use zeroize::Zeroize;
 const CONTROL_SALT: &[u8] = b"Control-Salt";
 const CONTROL_WRITE_INFO: &[u8] = b"Control-Write-Encryption-Key";
 const CONTROL_READ_INFO: &[u8] = b"Control-Read-Encryption-Key";
+/// Event channel (the receiver's reverse connection, pair_ap's
+/// `PAIR_CHANNEL_EVENTS`): the receiver writes with the *Write* key and we
+/// reply with the *Read* key — the opposite of the control channel,
+/// "probably because it is a reverse connection" (pair_homekit.c;
+/// pyatv's EventChannel uses the same pairing).
+const EVENTS_SALT: &[u8] = b"Events-Salt";
+const EVENTS_WRITE_INFO: &[u8] = b"Events-Write-Encryption-Key";
+const EVENTS_READ_INFO: &[u8] = b"Events-Read-Encryption-Key";
 
 /// Max plaintext bytes per encrypted control block (HAP `ENCRYPTED_LEN_MAX`).
 const BLOCK_MAX: usize = 0x400;
@@ -64,6 +72,8 @@ pub struct SessionKeys {
     audio: [u8; 32],
     control_write: [u8; 32],
     control_read: [u8; 32],
+    events_write: [u8; 32],
+    events_read: [u8; 32],
 }
 
 impl SessionKeys {
@@ -77,7 +87,26 @@ impl SessionKeys {
             audio,
             control_write: hkdf32(CONTROL_SALT, shared, CONTROL_WRITE_INFO),
             control_read: hkdf32(CONTROL_SALT, shared, CONTROL_READ_INFO),
+            events_write: hkdf32(EVENTS_SALT, shared, EVENTS_WRITE_INFO),
+            events_read: hkdf32(EVENTS_SALT, shared, EVENTS_READ_INFO),
         }
+    }
+
+    /// Cipher for what the receiver sends on the event channel.
+    pub fn event_reader(&self) -> ChannelCipher {
+        ChannelCipher::new(&self.events_write)
+    }
+
+    /// Cipher for our replies on the event channel.
+    pub fn event_writer(&self) -> ChannelCipher {
+        ChannelCipher::new(&self.events_read)
+    }
+
+    /// The receiver's side of the event channel (its writer, its reader)
+    /// — for tests that play the receiver.
+    #[cfg(test)]
+    pub(crate) fn receiver_event_ciphers(&self) -> (ChannelCipher, ChannelCipher) {
+        (ChannelCipher::new(&self.events_write), ChannelCipher::new(&self.events_read))
     }
 
     /// The 32-byte audio key sent as `shk` in the RTSP SETUP and used to
@@ -102,6 +131,8 @@ impl Drop for SessionKeys {
         self.audio.zeroize();
         self.control_write.zeroize();
         self.control_read.zeroize();
+        self.events_write.zeroize();
+        self.events_read.zeroize();
     }
 }
 
@@ -232,6 +263,28 @@ mod tests {
             out.extend_from_slice(&rx.decrypt_block(len, block).unwrap());
         }
         assert_eq!(out, msg);
+    }
+
+    #[test]
+    fn event_channel_keys_are_the_reverse_pairing() {
+        // The receiver encrypts events with Events-Write, we read with it;
+        // our replies use Events-Read. Both differ from the control keys.
+        let shared = [0x33u8; 64];
+        let keys = SessionKeys::from_shared(&shared);
+        let mut receiver_tx = ChannelCipher::new(&hkdf32(EVENTS_SALT, &shared, EVENTS_WRITE_INFO));
+        let mut our_rx = keys.event_reader();
+        let wire = receiver_tx.encrypt(b"POST /command RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+        let len = u16::from_le_bytes([wire[0], wire[1]]);
+        assert_eq!(our_rx.decrypt_block(len, &wire[2..]).unwrap(), b"POST /command RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+        let mut our_tx = keys.event_writer();
+        let mut receiver_rx = ChannelCipher::new(&hkdf32(EVENTS_SALT, &shared, EVENTS_READ_INFO));
+        let wire = our_tx.encrypt(b"RTSP/1.0 200 OK\r\n\r\n");
+        let len = u16::from_le_bytes([wire[0], wire[1]]);
+        assert_eq!(receiver_rx.decrypt_block(len, &wire[2..]).unwrap(), b"RTSP/1.0 200 OK\r\n\r\n");
+        // A control-channel key cannot read events.
+        let mut control_rx = keys.control_reader();
+        let wire = ChannelCipher::new(&hkdf32(EVENTS_SALT, &shared, EVENTS_WRITE_INFO)).encrypt(b"x");
+        assert!(control_rx.decrypt_block(1, &wire[2..]).is_err());
     }
 
     #[test]

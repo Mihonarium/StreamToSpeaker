@@ -2723,8 +2723,8 @@ impl StreamToSpeakerApp {
                 ui,
                 p,
                 "AirPlay 2 stream mode",
-                "Realtime ≈ 0.25 s latency; buffered ≈ 1–2 s but is what iPhones use.",
-                "AirPlay 2 has two stream kinds. Buffered (the default when the speaker supports it) is what iPhones use: the speaker holds a second or two of audio, riding out Wi-Fi hiccups at the cost of that much latency. Realtime is the low-latency kind (~250 ms). Some speakers accept the realtime handshake but never actually play it — if one mode is silent, try the other. Takes effect the next time you connect to the speaker.",
+                "Realtime plays after the AirPlay buffer above; buffered ≈ 1–2 s but is what iPhones use.",
+                "AirPlay 2 has two stream kinds. Buffered (the default when the speaker supports it) is what iPhones use: the speaker holds a second or two of audio, riding out Wi-Fi hiccups at the cost of that much latency. Realtime is the low-latency kind: it plays after the AirPlay buffer set above, which can go well below a second. Some speakers accept the realtime handshake but never actually play it — if one mode is silent, try the other. Takes effect the next time you connect to the speaker.",
                 |ui| {
                     ui.checkbox(&mut prefer_rt, "Prefer low-latency realtime");
                 },
@@ -2757,6 +2757,31 @@ impl StreamToSpeakerApp {
                     uc.save();
                 }
             }
+
+            ui.add_space(sp::S);
+
+            let mut show_members = self.app.user_config.lock().unwrap().show_airplay_group_members;
+            advanced_row(
+                ui,
+                p,
+                "AirPlay group members",
+                "Off = one row per group or stereo pair, like the iPhone's AirPlay menu. On = also list each member.",
+                "When a HomePod stereo pair is set as an Apple TV's default audio output they form an AirPlay group. The speaker list shows the group once, named after the group, and a click sends audio over AirPlay 2 straight to the HomePods; the Apple TV itself is not used (unless one of the speakers lacks AirPlay 2 — then audio goes to the Apple TV to relay, which is untested). An Apple TV with a single HomePod is not combined: each has its own row. A HomePod stereo pair is likewise one row, named after the pair; a click streams to both HomePods in sync. Speakers grouped from an iPhone's AirPlay menu are not combined and each keeps its own row — except while an iPhone plays to an Apple TV together with a HomePod stereo pair: that looks the same as the TV's own pair, so they are combined into the TV's row while that lasts. \"AirPlay pairs and groups\" below changes what these rows stream to. Turn this on to also list every device individually, the Apple TV included — a click on one streams to that device alone.",
+                |ui| {
+                    ui.checkbox(&mut show_members, "Show group members individually");
+                },
+            );
+            {
+                let mut uc = self.app.user_config.lock().unwrap();
+                if uc.show_airplay_group_members != show_members {
+                    uc.show_airplay_group_members = show_members;
+                    uc.save();
+                }
+            }
+
+            ui.add_space(sp::S);
+
+            self.show_airplay_pair_settings(ui, p);
 
             ui.add_space(sp::S);
 
@@ -2823,6 +2848,231 @@ impl StreamToSpeakerApp {
                     );
                 }
             }
+        });
+    }
+
+    /// Advanced → "AirPlay pairs and groups (experimental)": the pair/group
+    /// session settings (see `airplay::pair_experiments`). They apply to
+    /// HomePod stereo pairs and Apple-TV-led rows only, on the next connect.
+    fn show_airplay_pair_settings(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        use crate::airplay::pair_experiments::{
+            PairRecipe, PairSplit, PairStream, PairTargets, PairTiming, PtpRole, TvRow,
+        };
+
+        ui.label(
+            egui::RichText::new("AirPlay pairs and groups (experimental)")
+                .strong()
+                .color(p.text_primary),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Only for HomePod stereo pair rows, Apple TV + HomePod pair rows, and a paired \
+                 HomePod's own row when \"Show group members individually\" is on; every other \
+                 speaker is unaffected. Changes apply the next time you connect (or press Reconnect now), \
+                 except Detailed AirPlay logging, which applies immediately to every speaker. \
+                 Values in parentheses are what the log shows.",
+            )
+            .size(12.0)
+            .color(p.text_secondary),
+        );
+        ui.add_space(sp::XS);
+
+        let mut s = self.app.user_config.lock().unwrap().pair_settings();
+        let before = s.clone();
+
+        advanced_row(
+            ui,
+            p,
+            "Pair recipe",
+            "How each HomePod's session is set up: the way Music Assistant does it (default) or closer to the way Apple devices are reported to do it.",
+            "Music Assistant and OwnTone, whose users report working HomePod pairs, set up each HomePod with a random group id, a sender name and MAC, and start playback before describing the stream. The Apple recipe instead sends some keys iPhones and Macs are reported to send (such as multi-select), gives both HomePods the same group id (this app's choice, not something Apple devices are known to do), and tells each HomePod about its partner. Try the other recipe if one HomePod stays silent or the pair drops.",
+            |ui| {
+                setting_combo(ui, "pair_recipe", &mut s.recipe, PairRecipe::ALL, |v| match v {
+                    PairRecipe::Ma => "Music Assistant (ma)",
+                    PairRecipe::Apple => "Apple (apple)",
+                })
+            },
+        );
+        ui.add_space(sp::S);
+        advanced_row(
+            ui,
+            p,
+            "Pair targets",
+            "Both = send to both HomePods of a pair (default). Leader = the pair's main HomePod only.",
+            "A stereo pair's HomePods are reported not to pass audio to each other from senders other than Apple devices, such as this app, so the default sends the full stream to both, on one shared clock. \"Leader\" sends it only to the HomePod that leads the pair, to test whether that one then plays both channels.",
+            |ui| {
+                setting_combo(ui, "pair_targets", &mut s.targets, PairTargets::ALL, |v| match v {
+                    PairTargets::Both => "Both HomePods (both)",
+                    PairTargets::Leader => "Main HomePod only (leader)",
+                })
+            },
+        );
+        ui.add_space(sp::S);
+        advanced_row(
+            ui,
+            p,
+            "Apple TV row",
+            "HomePods = stream straight to the Apple TV's HomePods (default). TV = send audio to the Apple TV only.",
+            "An Apple TV that uses a HomePod stereo pair as its speakers is reported to play nothing from senders other than Apple devices, such as this app, so the Apple TV row sends audio to its HomePods directly (the pair like a pair row) and the TV is not used. \"TV\" sends one realtime AirPlay 2 stream to the Apple TV instead, to test whether it passes it on to its HomePods.",
+            |ui| {
+                setting_combo(ui, "tv_row", &mut s.tv_row, TvRow::ALL, |v| match v {
+                    TvRow::Homepods => "Its HomePods (homepods)",
+                    TvRow::Tv => "The Apple TV (tv)",
+                })
+            },
+        );
+        ui.add_space(sp::S);
+        advanced_row(
+            ui,
+            p,
+            "Pair stream kind",
+            "Realtime = what Music Assistant and OwnTone use for pairs (default). Buffered = the iPhone-style stream with a bigger buffer.",
+            "Realtime sends audio in small UDP packets, played after the AirPlay buffer set above (2 s by default). Buffered sends it over TCP with a larger buffer, as iPhones do for music; it is used only if every HomePod supports it and the realtime preference and latency setting above allow it.",
+            |ui| {
+                setting_combo(ui, "pair_stream", &mut s.stream, PairStream::ALL, |v| match v {
+                    PairStream::Realtime => "Realtime (realtime)",
+                    PairStream::Buffered => "Buffered (buffered)",
+                })
+            },
+        );
+        ui.add_space(sp::S);
+        advanced_row(
+            ui,
+            p,
+            "Pair clock",
+            "Master = this PC is the clock both HomePods follow (default). Follow = follow a HomePod's own clock.",
+            "AirPlay 2 speakers play in step by following one shared clock. By default this PC serves it; when only one device is played (a HomePod's own row, \"Main HomePod only\", or the Apple TV row set to the TV) this PC also follows that device's own clock, as it does for any single speaker. \"Follow\" stops serving it and follows the first HomePod whose clock reaches this PC. Try it if one HomePod stays silent.",
+            |ui| {
+                setting_combo(ui, "pair_ptp_role", &mut s.ptp_role, PtpRole::ALL, |v| match v {
+                    PtpRole::Master => "This PC (master)",
+                    PtpRole::Follow => "Follow a HomePod (follow)",
+                })
+            },
+        );
+        ui.add_space(sp::S);
+        advanced_row(
+            ui,
+            p,
+            "Pair timing",
+            "PTP (default) or NTP, the older AirPlay timing the open-source pyatv library uses.",
+            "PTP is the clock protocol HomePods advertise. NTP is the older AirPlay timing, which pyatv uses; NTP sessions follow pyatv's request order. Use NTP only if nothing else works.",
+            |ui| {
+                setting_combo(ui, "pair_timing", &mut s.timing, PairTiming::ALL, |v| match v {
+                    PairTiming::Ptp => "PTP (ptp)",
+                    PairTiming::Ntp => "NTP (ntp)",
+                })
+            },
+        );
+        ui.add_space(sp::S);
+        advanced_row(
+            ui,
+            p,
+            "Left/right split",
+            "Off = each HomePod picks its own channel (default). On = the left HomePod gets left only, the other right. Swap = reversed.",
+            "Normally both HomePods get the full stereo stream and each plays its own side. If each HomePod plays both channels, first restart both HomePods by unplugging them for 10 seconds. If each still plays both channels, \"On\" sends the left HomePod only the left channel and the other only the right; use \"Swap\" if the sides come out reversed. Pick which HomePod is left below.",
+            |ui| {
+                setting_combo(ui, "pair_split", &mut s.split, PairSplit::ALL, |v| match v {
+                    PairSplit::Off => "Off (off)",
+                    PairSplit::On => "On (on)",
+                    PairSplit::Swap => "Swap (swap)",
+                })
+            },
+        );
+        for pair in self.app.airplay_pair_choices() {
+            ui.add_space(sp::XS);
+            let name_of = |id: &str| {
+                pair.halves
+                    .iter()
+                    .find(|(h, _)| h == id)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| id.to_string())
+            };
+            let mut choice: Option<String> = s
+                .left_halves
+                .get(&pair.tsid)
+                .filter(|id| pair.halves.iter().any(|(h, _)| h == *id))
+                .cloned();
+            let auto_label = format!("Automatic: {}", name_of(&pair.default_left));
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Left HomePod of {}", pair.label))
+                        .size(12.0)
+                        .color(p.text_secondary),
+                );
+                egui::ComboBox::from_id_salt(("pair_left", pair.tsid.as_str()))
+                    .selected_text(match &choice {
+                        Some(id) => name_of(id),
+                        None => auto_label.clone(),
+                    })
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut choice, None, auto_label.as_str());
+                        for (id, name) in &pair.halves {
+                            ui.selectable_value(&mut choice, Some(id.clone()), name.as_str());
+                        }
+                    });
+            });
+            match choice {
+                Some(id) => {
+                    s.left_halves.insert(pair.tsid.clone(), id);
+                }
+                None => {
+                    s.left_halves.remove(&pair.tsid);
+                }
+            }
+        }
+        ui.add_space(sp::S);
+        advanced_row(
+            ui,
+            p,
+            "Sender relay flag",
+            "Apple recipe only. Leave off unless asked to try it.",
+            "Sets the \"sender supports relay\" flag (senderSupportsRelay) that Macs are reported to send. It is said to concern remote control, not audio. It is sent only with the Apple recipe.",
+            |ui| {
+                ui.checkbox(&mut s.sender_relay, "Send the relay flag Macs are reported to send");
+            },
+        );
+
+        if s != before {
+            let mut uc = self.app.user_config.lock().unwrap();
+            uc.set_pair_settings(&s);
+            uc.save();
+        }
+
+        ui.add_space(sp::S);
+        let mut detailed = self.app.is_airplay_detailed_logging();
+        advanced_row(
+            ui,
+            p,
+            "Detailed AirPlay logging",
+            "Write debug detail to the log file, starting now. Turn off when done; the log grows faster.",
+            "Adds this app's debug lines (every AirPlay request and reply, clock packets) to the log file (? button → Open log folder). Useful when reporting a problem with a pair or group. Takes effect immediately and is remembered.",
+            |ui| {
+                ui.checkbox(&mut detailed, "Detailed AirPlay logging");
+            },
+        );
+        self.app.set_airplay_detailed_logging(detailed);
+
+        ui.add_space(sp::S);
+        let bound = self.app.is_speaker_bound();
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(bound, |ui| {
+                let resp = secondary_button(ui, p, "Reconnect now", 140.0).on_hover_text(
+                    "Reconnect the speaker you're streaming to, so changed settings take effect",
+                );
+                if resp.clicked() {
+                    self.app.reconnect_active();
+                }
+            });
+            ui.label(
+                egui::RichText::new(if bound {
+                    "Applies the settings above to the current speaker."
+                } else {
+                    "Connect to a speaker first."
+                })
+                .size(12.0)
+                .color(p.text_secondary),
+            );
         });
     }
 
@@ -3438,6 +3688,24 @@ fn speaker_row(
     }
 
     ui.add_space(6.0);
+}
+
+/// A dropdown over every value of a setting enum, labelled by `label`.
+fn setting_combo<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut T,
+    all: &[T],
+    label: impl Fn(T) -> &'static str,
+) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(label(*value))
+        .width(240.0)
+        .show_ui(ui, |ui| {
+            for v in all {
+                ui.selectable_value(value, *v, label(*v));
+            }
+        });
 }
 
 fn advanced_row(

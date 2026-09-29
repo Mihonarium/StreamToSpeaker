@@ -17,6 +17,13 @@ use crate::update_check::{self, ReleaseInfo};
 use crate::airplay::ap2_rtsp::Ap2Rtsp;
 use crate::airplay::ap2_session::DEFAULT_AIRPLAY_PORT;
 use crate::airplay::hap_pairing::PairingCredentials;
+use crate::airplay::ap2_session::GroupSessionOptions;
+use crate::airplay::discovery::GROUP_ID_SUFFIX;
+use crate::airplay::discovery::AirPlayEntry;
+use crate::airplay::pair_experiments::{
+    channel_maps, discovered_pairs, is_pair_half, pair_buddy_ips, PairChoice, PairSettings, PairStream,
+    SenderIdentity, TvRow,
+};
 use crate::airplay::{
     AirPlay2Session, AirPlay2SessionConfig, AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession,
     AirPlaySessionConfig, Ap2StartError, Transport,
@@ -59,7 +66,7 @@ impl ActiveSession {
         match self {
             ActiveSession::Upnp(s) => s.renderer.stable_id(),
             ActiveSession::AirPlay(s) => s.renderer.stable_id(),
-            ActiveSession::AirPlay2(s) => s.renderer.stable_id(),
+            ActiveSession::AirPlay2(s) => s.row_id.clone(),
         }
     }
 
@@ -69,7 +76,8 @@ impl ActiveSession {
             // to a Sonos group (identical to friendly_name otherwise).
             ActiveSession::Upnp(s) => s.renderer.display_name(),
             ActiveSession::AirPlay(s) => s.renderer.friendly_name.clone(),
-            ActiveSession::AirPlay2(s) => s.renderer.friendly_name.clone(),
+            // A stereo pair shows its group name ("Büro 2"), else "L + R".
+            ActiveSession::AirPlay2(s) => s.display_name(),
         }
     }
 
@@ -125,6 +133,14 @@ impl ActiveSession {
             ActiveSession::Upnp(_) => false,
             ActiveSession::AirPlay(s) => s.is_dead(),
             ActiveSession::AirPlay2(s) => s.is_dead(),
+        }
+    }
+
+    /// Which member took a dead AirPlay 2 session down, and why.
+    pub fn first_failure(&self) -> Option<String> {
+        match self {
+            ActiveSession::AirPlay2(s) => s.first_failure(),
+            _ => None,
         }
     }
 
@@ -296,6 +312,8 @@ pub struct App {
 struct PinCeremonyState {
     /// Stable id of the receiver being paired.
     id: String,
+    /// The speaker-list row selected once pairing succeeds.
+    row_id: String,
     /// Friendly name, for the modal + toasts.
     name: String,
     stage: PinStage,
@@ -318,11 +336,64 @@ enum PinStage {
 /// path — including the fallback legacy RAOP that most Apple TVs also
 /// expose — has failed.
 enum AttemptError {
-    /// The receiver requires one-time PIN pairing (an AP2 470 with no
-    /// stored credentials, or stored credentials the receiver rejected).
-    NeedsPin,
+    /// A receiver requires one-time PIN pairing (an AP2 470 with no
+    /// stored credentials, or stored credentials the receiver rejected):
+    /// its stable id and name.
+    NeedsPin { id: String, name: String },
     /// Any other failure — the message is already user-facing.
     Other(String),
+}
+
+/// True if a select of this row (or, with no row, of these targets among
+/// every discovered receiver, `all`) is a pair/group session: a pair row,
+/// an Apple-TV-led row, or a pair half (its partner discovered too) on its
+/// own. Everything else is a single receiver, with every pair/group rule
+/// off (see `airplay::pair_experiments`).
+fn is_group_session(entry: Option<&AirPlayEntry>, targets: &[AirPlayRenderer], all: &[AirPlayRenderer]) -> bool {
+    match entry {
+        Some(e) => e.group_session(),
+        None => targets.iter().any(|t| is_pair_half(t, all)),
+    }
+}
+
+/// The pair/group options for a session to `targets` (session order)
+/// started from `entry`: the settings snapshot, the persistent identity,
+/// each target's L/R channel map and pair buddies (from every discovered
+/// receiver, `all`).
+fn group_session_options(
+    entry: Option<&AirPlayEntry>,
+    targets: &[AirPlayRenderer],
+    all: &[AirPlayRenderer],
+    pair_settings: &PairSettings,
+    identity: SenderIdentity,
+) -> GroupSessionOptions {
+    let policy = pair_settings.target_policy();
+    let mut settings = pair_settings.clone();
+    // The Apple TV row set to `tv` is one realtime session to the TV (to
+    // test whether the TV passes the stream on to its HomePods), whatever
+    // the pair stream kind says.
+    if entry.map(|e| e.is_tv_group()).unwrap_or(false) && policy.tv_row == TvRow::Tv {
+        settings.stream = PairStream::Realtime;
+    }
+    GroupSessionOptions {
+        settings,
+        identity,
+        sender_name: PRODUCT_NAME.to_string(),
+        row_kind: entry
+            .map(|e| e.row_kind_label(&policy))
+            .unwrap_or("member row (pair half)")
+            .to_string(),
+        channel_maps: channel_maps(targets, all, pair_settings.split, &pair_settings.left_halves),
+        buddies: targets.iter().map(|t| pair_buddy_ips(t, all)).collect(),
+    }
+}
+
+/// The AirPlay 2 session options a select computes once for every
+/// attempt: the pair/group settings (None = single receiver) and the
+/// single-receiver gPTP-framing override.
+struct Ap2Extras {
+    group: Option<GroupSessionOptions>,
+    force_gptp_framing: bool,
 }
 
 /// Failure of a whole [`App::start_airplay`] select: either "this device
@@ -332,8 +403,12 @@ enum AttemptError {
 /// the synchronous web-API / tray / launch paths, sees the truth.
 enum SelectFailure {
     NeedsPin {
+        /// The receiver to pair.
         id: String,
         name: String,
+        /// The speaker-list row to reconnect to once paired (a group row
+        /// can need one of its speakers paired).
+        row_id: String,
         /// The other attempted paths' failures, pre-joined (may be empty).
         details: String,
     },
@@ -698,6 +773,10 @@ impl App {
     /// Whether a discovered device is password-protected (needs a
     /// password entered before it can connect).
     pub fn is_password_protected(&self, id: &str) -> bool {
+        // A group row streams over AirPlay 2, which has no RAOP password.
+        if id.ends_with(GROUP_ID_SUFFIX) {
+            return false;
+        }
         self.airplay_discovery
             .as_ref()
             .and_then(|d| d.find_by_id(id))
@@ -885,10 +964,22 @@ impl App {
             }
         }
         if let Some(d) = self.airplay_discovery.as_ref() {
-            for r in d.renderers() {
-                let id = r.stable_id();
+            let (show_members, policy) = {
+                let uc = self.user_config.lock().unwrap();
+                (uc.show_airplay_group_members, uc.pair_settings().target_policy())
+            };
+            for e in d.entries() {
+                // AirPlay groups (an Apple TV with a HomePod stereo pair as
+                // its default audio output) present as ONE row, like the
+                // iPhone's AirPlay picker; the members are hidden unless
+                // the user opted to see them (Advanced).
+                if e.folded_under.is_some() && !show_members {
+                    continue;
+                }
+                let r = &e.renderer;
+                let id = e.id();
                 let active = active_id.as_deref() == Some(id.as_str());
-                let transport = r.transport();
+                let transport = e.transport_with(&policy);
                 let usable = transport.is_some();
                 // Same physical speaker also reachable over UPnP → AirPlay
                 // will add noticeably more delay; flag it (only when the
@@ -899,29 +990,122 @@ impl App {
                 // click will use (Sonos advertises both UPnP and AirPlay)
                 // and why an unsupported one might fail.
                 let pw = if r.password_protected { ", password" } else { "" };
+                let base = e.display_name();
+                let group = if e.is_group() {
+                    " group"
+                } else if e.is_pair() {
+                    " stereo pair"
+                } else {
+                    ""
+                };
                 let name = match transport {
                     Some(Transport::RaopLegacy) if has_upnp_twin => {
-                        format!("{} (AirPlay, higher delay{})", r.friendly_name, pw)
+                        format!("{} (AirPlay{}, higher delay{})", base, group, pw)
                     }
                     Some(Transport::AirPlay2) if has_upnp_twin => {
-                        format!("{} (AirPlay 2, higher delay{})", r.friendly_name, pw)
+                        format!("{} (AirPlay 2{}, higher delay{})", base, group, pw)
                     }
                     Some(Transport::RaopLegacy) => {
-                        format!("{} (AirPlay{})", r.friendly_name, pw)
+                        format!("{} (AirPlay{}{})", base, group, pw)
                     }
-                    Some(Transport::AirPlay2) => format!("{} (AirPlay 2{})", r.friendly_name, pw),
+                    Some(Transport::AirPlay2) => format!("{} (AirPlay 2{}{})", base, group, pw),
                     None if r.password_protected => {
-                        format!("{} (AirPlay, password-protected)", r.friendly_name)
+                        format!("{} (AirPlay, password-protected)", base)
                     }
-                    None => format!("{} (AirPlay, unsupported)", r.friendly_name),
+                    None => format!("{} (AirPlay, unsupported)", base),
                 };
-                let note = has_upnp_twin.then(|| {
-                    "This speaker also has a non-AirPlay (UPnP) entry in the list, which has \
-                     lower latency. AirPlay buffers about 1–2 seconds of audio, so it will be \
-                     more out of sync with video. Prefer the plain entry unless you specifically \
-                     need AirPlay."
-                        .to_string()
-                });
+                let mut notes: Vec<String> = Vec::new();
+                let names = |rs: &[AirPlayRenderer]| {
+                    rs.iter().map(|m| m.friendly_name.clone()).collect::<Vec<_>>().join(" + ")
+                };
+                let targets = e.targets_with(&policy);
+                if e.is_group() && e.streams_via_leader() {
+                    notes.push(format!(
+                        "AirPlay group: {}. Audio is sent over AirPlay 2 to {}, the group's \
+                         leader, to relay to the whole group (untested).",
+                        e.member_names().join(" + "),
+                        names(&targets),
+                    ));
+                } else if e.is_tv_group() && targets.len() == 1 && targets[0].mac_id == r.mac_id {
+                    notes.push(format!(
+                        "AirPlay group: {}. Audio is sent over AirPlay 2 to the Apple TV {} only \
+                         (Advanced → AirPlay pairs and groups).",
+                        e.member_names().join(" + "),
+                        r.friendly_name,
+                    ));
+                } else if e.is_group() {
+                    notes.push(format!(
+                        "AirPlay group: {}. Audio is sent over AirPlay 2 straight to {}; {} \
+                         itself is not used.",
+                        e.member_names().join(" + "),
+                        names(&targets),
+                        r.friendly_name,
+                    ));
+                } else if e.is_pair() {
+                    notes.push(format!(
+                        "Stereo pair: {}. Audio is sent over AirPlay 2 to {}{}.",
+                        e.member_names().join(" + "),
+                        names(&targets),
+                        if targets.len() > 1 {
+                            ", in sync"
+                        } else {
+                            " only (Advanced → AirPlay pairs and groups)"
+                        },
+                    ));
+                } else if let Some(row) = e.folded_under.as_deref() {
+                    let row_entry = d.entry_by_id(row);
+                    let row_name = row_entry
+                        .as_ref()
+                        .map(|l| l.display_name())
+                        .unwrap_or_else(|| row.to_string());
+                    let is_leader = row_entry
+                        .as_ref()
+                        .map(|l| l.is_group() && l.renderer.mac_id == r.mac_id)
+                        .unwrap_or(false);
+                    let in_pair = row_entry
+                        .as_ref()
+                        .map(|l| l.pair_members.iter().any(|m| m.mac_id == r.mac_id))
+                        .unwrap_or(false);
+                    if is_leader && r.is_apple_tv() {
+                        notes.push(format!(
+                            "Leads the AirPlay group {}. Streams to this Apple TV alone; while \
+                             its audio output is set to the group's speakers it may play \
+                             nothing — use the group entry instead.",
+                            row_name
+                        ));
+                    } else if is_leader {
+                        notes.push(format!(
+                            "Leads the AirPlay group {}. Streams to this speaker alone.",
+                            row_name
+                        ));
+                    } else if in_pair {
+                        notes.push(format!(
+                            "One half of the stereo pair {}. Streams to this speaker alone.",
+                            row_name
+                        ));
+                    } else {
+                        notes.push(format!(
+                            "Member of the AirPlay group {}. Streams to this speaker alone.",
+                            row_name
+                        ));
+                    }
+                } else if !e.ungrouped_peers.is_empty() {
+                    notes.push(format!(
+                        "Shares an AirPlay group (stereo pair or multi-room set) with {}. \
+                         Streams to this speaker alone.",
+                        e.ungrouped_peers.join(" + ")
+                    ));
+                }
+                if has_upnp_twin {
+                    notes.push(
+                        "This speaker also has a non-AirPlay (UPnP) entry in the list, which has \
+                         lower latency. AirPlay buffers about 1–2 seconds of audio, so it will be \
+                         more out of sync with video. Prefer the plain entry unless you specifically \
+                         need AirPlay."
+                            .to_string(),
+                    );
+                }
+                let note = (!notes.is_empty()).then(|| notes.join(" "));
                 speakers.push(SpeakerInfo {
                     id,
                     friendly_name: name,
@@ -1014,8 +1198,8 @@ impl App {
                 .or_else(|| {
                     self.airplay_discovery
                         .as_ref()
-                        .and_then(|d| d.find_by_id(id))
-                        .map(|r| r.friendly_name)
+                        .and_then(|d| d.entry_by_id(id))
+                        .map(|e| e.display_name())
                 })
                 .unwrap_or_else(|| id.to_string());
             *guard = Some(name);
@@ -1067,17 +1251,18 @@ impl App {
                     }
 
                     // Is the bound session dead?
-                    let (id, name) = {
+                    let (id, name, why) = {
                         let guard = app.session.lock().unwrap();
                         match guard.as_ref() {
-                            Some(s) if s.is_dead() => (s.stable_id(), s.friendly_name()),
+                            Some(s) if s.is_dead() => (s.stable_id(), s.friendly_name(), s.first_failure()),
                             _ => continue,
                         }
                     };
 
                     warn!(
-                        "AirPlay session to {} dropped; auto-reconnecting in {} s",
+                        "AirPlay session to {} dropped{}; auto-reconnecting in {} s",
                         name,
+                        why.map(|w| format!(" (first failure: {})", w)).unwrap_or_default(),
                         RECONNECT_GRACE.as_secs()
                     );
                     app.record_error(format!("Lost connection to {} — reconnecting…", name));
@@ -1231,8 +1416,8 @@ impl App {
         // single in-progress HAP pairing session and make the ceremony
         // fail with "wrong PIN" despite a correct one. (Selecting a
         // *different* speaker meanwhile is fine.)
-        if let Some((cid, cname)) = self.pin_pairing_device() {
-            if cid == id {
+        if let Some((cid, crow, cname)) = self.pin_pairing_device() {
+            if cid == id || crow == id {
                 return Err(format!(
                     "Pairing with {} is in progress — enter the PIN shown on its screen.",
                     cname
@@ -1267,7 +1452,7 @@ impl App {
             match self.start_airplay(id) {
                 Ok(s) => s,
                 Err(SelectFailure::Msg(m)) => return Err(m),
-                Err(SelectFailure::NeedsPin { id: pid, name, details }) => {
+                Err(SelectFailure::NeedsPin { id: pid, name, row_id, details }) => {
                     // Keep the other paths' failures visible — the RAOP
                     // fallback's reason would otherwise vanish behind the
                     // pairing message.
@@ -1280,7 +1465,7 @@ impl App {
                         // GUI speaker click: launch the one-time ceremony.
                         // The receiver will display a PIN and the modal
                         // collects it; the toast narrates what's happening.
-                        self.begin_pin_pairing(pid, name.clone());
+                        self.begin_pin_pairing(pid, name.clone(), row_id);
                         return Err(format!(
                             "{} needs one-time pairing — enter the PIN shown on its screen.{}",
                             name, suffix
@@ -1423,11 +1608,49 @@ impl App {
             .airplay_discovery
             .as_ref()
             .ok_or_else(|| SelectFailure::Msg("AirPlay discovery disabled".to_string()))?;
-        let Some(renderer) = discovery.find_by_id(id) else {
-            return Err(SelectFailure::Msg(format!("no AirPlay speaker with id {:?}", id)));
+        // The row decides who is streamed to (see
+        // `AirPlayEntry::targets_with`): a stereo pair to both halves (or
+        // its leader half), a group led by an Apple TV to its HomePods (or
+        // the TV), any other group to its leader. The pair/group settings
+        // are a snapshot: changes apply on the next connect.
+        let (pair_settings, force_gptp_framing) = {
+            let uc = self.user_config.lock().unwrap();
+            (uc.pair_settings(), uc.airplay_force_gptp_framing)
         };
+        let policy = pair_settings.target_policy();
+        let entry = discovery.entry_by_id(id);
+        let mut targets = match &entry {
+            Some(e) => e.targets_with(&policy),
+            // A group id never falls back to its leader: that is the
+            // device the group row exists to avoid.
+            None if id.ends_with(GROUP_ID_SUFFIX) => {
+                return Err(SelectFailure::Msg(
+                    "that AirPlay group isn't currently discovered (are all of its speakers \
+                     on?)"
+                        .to_string(),
+                ));
+            }
+            None => discovery.find_by_id(id).into_iter().collect(),
+        };
+        if targets.is_empty() {
+            return Err(SelectFailure::Msg(format!("no AirPlay speaker with id {:?}", id)));
+        }
+        // Pair/group session: a pair row, an Apple-TV-led row, or a pair
+        // half on its own. Everything else is a single receiver, with
+        // every pair/group rule off.
+        let all = discovery.renderers();
+        let group_session = is_group_session(entry.as_ref(), &targets, &all);
+        let group = group_session.then(|| {
+            group_session_options(entry.as_ref(), &targets, &all, &pair_settings, self.airplay_sender_identity())
+        });
+        let renderer = targets.remove(0);
+        let partners = targets;
+        let row_label = entry
+            .as_ref()
+            .filter(|e| e.is_group() || e.is_pair())
+            .map(|e| e.display_name());
         debug!(
-            "AirPlay select {}: transport={:?} supports_ap2={} features={:?} airplay_port={:?} raop_port={} et={:?}",
+            "AirPlay select {}: transport={:?} supports_ap2={} features={:?} airplay_port={:?} raop_port={} et={:?} group={:?}",
             renderer.friendly_name,
             renderer.transport(),
             renderer.supports_airplay2(),
@@ -1435,6 +1658,7 @@ impl App {
             renderer.airplay_port,
             renderer.port,
             renderer.encryption_types,
+            renderer.group,
         );
 
         // Resolve a local IPv4 to bind UDP sockets to + advertise in
@@ -1448,7 +1672,25 @@ impl App {
         // no longer answers, plus a working _airplay._tcp); we try them in
         // order and fall back, so legacy RAOP, AirPlay 2, and HomePod
         // devices all just work.
-        let attempts = self.airplay_attempts(&renderer, discovery);
+        // Group rows are AirPlay 2 only: several targets share one
+        // lock-step AirPlay 2 session, and an Apple TV leading HomePods is
+        // reported to accept a session from a third-party sender but leave
+        // the speakers silent (owntone#1675; Rogue Amoeba,
+        // https://rogueamoeba.com/support/knowledgebase/?showArticle=AirfoilSatellite-AppleTVHomePods).
+        // Pair/group sessions are AirPlay 2 only too (the
+        // settings are AirPlay 2 experiments). Anything else gets the
+        // usual fallbacks.
+        let ap2_only = group_session
+            || !partners.is_empty()
+            || entry.as_ref().map(|e| e.is_group()).unwrap_or(false);
+        let attempts = if ap2_only {
+            self.ap2_view(&renderer, discovery)
+                .map(|r| (Transport::AirPlay2, r))
+                .into_iter()
+                .collect()
+        } else {
+            self.airplay_attempts(&renderer, discovery)
+        };
         if attempts.is_empty() {
             return Err(SelectFailure::Msg(format!(
                 "{} doesn't advertise an AirPlay path we can use \
@@ -1461,6 +1703,7 @@ impl App {
             )));
         }
 
+        let row_id = id.to_string();
         let mut errors: Vec<String> = Vec::new();
         // If an AP2 path wants PIN pairing, surface it (typed) only after
         // every path has failed — most Apple TVs also expose a legacy RAOP
@@ -1474,12 +1717,13 @@ impl App {
             };
             info!("AirPlay: attempting {} to {}", label, r.friendly_name);
             let name = r.friendly_name.clone();
-            let id = r.stable_id();
-            match self.start_airplay_one(transport, r, local_ip) {
+            let row = (row_id.clone(), row_label.clone());
+            let ap2 = Ap2Extras { group: group.clone(), force_gptp_framing };
+            match self.start_airplay_one(transport, r, partners.clone(), row, local_ip, ap2) {
                 Ok(session) => return Ok(session),
-                Err(AttemptError::NeedsPin) => {
-                    warn!("AirPlay {} to {} needs one-time PIN pairing", label, name);
-                    pin_target = Some((id, name.clone()));
+                Err(AttemptError::NeedsPin { id, name: who }) => {
+                    warn!("AirPlay {} to {} needs one-time PIN pairing ({})", label, name, who);
+                    pin_target = Some((id, who));
                 }
                 Err(AttemptError::Other(e)) => {
                     warn!("AirPlay {} to {} failed: {}", label, name, e);
@@ -1494,8 +1738,26 @@ impl App {
         // RAOP error.
         let details = errors.join("  |  ");
         match pin_target {
-            Some((id, name)) => Err(SelectFailure::NeedsPin { id, name, details }),
+            Some((id, name)) => Err(SelectFailure::NeedsPin { id, name, row_id, details }),
             None => Err(SelectFailure::Msg(details)),
+        }
+    }
+
+    /// An AirPlay 2-capable view of this device: the record itself, or a
+    /// sibling _airplay._tcp entry at the same IP (covers a _raop vs
+    /// _airplay `deviceid` mismatch that split it into two entries).
+    fn ap2_view(
+        &self,
+        renderer: &AirPlayRenderer,
+        discovery: &AirPlayDiscoveryState,
+    ) -> Option<AirPlayRenderer> {
+        if renderer.supports_airplay2() {
+            Some(renderer.clone())
+        } else {
+            discovery
+                .renderers()
+                .into_iter()
+                .find(|r| r.ip == renderer.ip && r.supports_airplay2())
         }
     }
 
@@ -1510,17 +1772,7 @@ impl App {
         renderer: &AirPlayRenderer,
         discovery: &AirPlayDiscoveryState,
     ) -> Vec<(Transport, AirPlayRenderer)> {
-        // An AirPlay 2-capable view of this device: the record itself, or a
-        // sibling _airplay._tcp entry at the same IP (covers a _raop vs
-        // _airplay `deviceid` mismatch that split it into two entries).
-        let ap2 = if renderer.supports_airplay2() {
-            Some(renderer.clone())
-        } else {
-            discovery
-                .renderers()
-                .into_iter()
-                .find(|r| r.ip == renderer.ip && r.supports_airplay2())
-        };
+        let ap2 = self.ap2_view(renderer, discovery);
         let raop = renderer.supports_legacy_raop();
 
         // Prefer AirPlay 2 only for receivers that genuinely REQUIRE it
@@ -1560,7 +1812,10 @@ impl App {
         &self,
         transport: Transport,
         renderer: AirPlayRenderer,
+        partners: Vec<AirPlayRenderer>,
+        (row_id, row_label): (String, Option<String>),
         local_ip: IpAddr,
+        ap2: Ap2Extras,
     ) -> Result<ActiveSession, AttemptError> {
         match transport {
             Transport::RaopLegacy => {
@@ -1593,42 +1848,61 @@ impl App {
             }
             Transport::AirPlay2 => {
                 let samples_rx = self.hub.subscribe();
-                let stable_id = renderer.stable_id();
                 let (prefer_realtime, pairing_creds, latency_ms) = {
                     let uc = self.user_config.lock().unwrap();
+                    // Stored PIN pairings for every receiver in the session
+                    // (looked up per receiver).
+                    let creds = std::iter::once(&renderer)
+                        .chain(&partners)
+                        .filter_map(|r| {
+                            let id = r.stable_id();
+                            uc.airplay_pairings.get(&id).cloned().map(|c| (id, c))
+                        })
+                        .collect();
                     (
                         uc.prefer_realtime_airplay,
-                        uc.airplay_pairings.get(&stable_id).cloned(),
+                        creds,
                         uc.effective_airplay_latency_ms(),
                     )
                 };
                 match AirPlay2Session::start(AirPlay2SessionConfig {
                     renderer,
+                    partners,
+                    row_id,
+                    row_label,
                     local_ip,
                     samples_rx,
                     initial_volume: Some(80),
                     prefer_realtime,
                     latency_ms,
                     pairing_creds,
+                    group: ap2.group,
+                    force_gptp_framing: ap2.force_gptp_framing,
                 }) {
                     Ok(session) => Ok(ActiveSession::AirPlay2(session)),
                     // 470 with no stored keys: typed, so start_airplay
                     // surfaces the PIN requirement only after the RAOP
                     // fallback has also failed.
-                    Err(Ap2StartError::NeedsPin) => Err(AttemptError::NeedsPin),
+                    Err(Ap2StartError::NeedsPin { id, name }) => Err(AttemptError::NeedsPin { id, name }),
                     // The receiver ANSWERED pair-verify and rejected the
                     // stored credentials (it forgot the pairing): drop them
                     // and re-pair — OwnTone's "key cleared on verify
                     // failure". Transport failures never take this branch,
                     // so a Wi-Fi blip / receiver reboot can't wipe a valid
                     // pairing.
-                    Err(Ap2StartError::VerifyRejected(e)) => {
+                    Err(Ap2StartError::VerifyRejected { id, source }) => {
                         warn!(
                             "stored pairing rejected by the receiver ({:#}) — clearing it",
-                            e
+                            source
                         );
-                        self.remove_airplay_pairing(&stable_id);
-                        Err(AttemptError::NeedsPin)
+                        self.remove_airplay_pairing(&id);
+                        let name = self
+                            .airplay_discovery
+                            .as_ref()
+                            .and_then(|d| d.find_by_id(&id))
+                            .map(|r| r.friendly_name)
+                            .unwrap_or_else(|| id.clone());
+                        Err(AttemptError::NeedsPin { id, name })
                     }
                     Err(Ap2StartError::Other(e)) => Err(AttemptError::Other(format!("{:#}", e))),
                 }
@@ -1654,7 +1928,7 @@ impl App {
     /// automatic retries must not make a TV display a pairing PIN.
     ///
     /// [`submit_pin`]: App::submit_pin
-    fn begin_pin_pairing(self: &Arc<Self>, id: String, name: String) {
+    fn begin_pin_pairing(self: &Arc<Self>, id: String, name: String, row_id: String) {
         // Reserve the single ceremony slot; holding it also blocks
         // re-selects of this device (see select_speaker_opts).
         {
@@ -1668,6 +1942,7 @@ impl App {
             }
             *slot = Some(PinCeremonyState {
                 id: id.clone(),
+                row_id: row_id.clone(),
                 name: name.clone(),
                 stage: PinStage::Starting,
             });
@@ -1792,7 +2067,7 @@ impl App {
                             }
                             std::thread::sleep(Duration::from_millis(100));
                         }
-                        app.select_speaker_async_opts(&id, false);
+                        app.select_speaker_async_opts(&row_id, false);
                     }
                     Err(e) => {
                         app.record_error(format!(
@@ -1825,6 +2100,61 @@ impl App {
         (id, seed)
     }
 
+    /// The persistent per-install AirPlay sender identity (deviceID /
+    /// macAddress, DACP-ID / Client-Instance) that pair/group sessions
+    /// present on every connection, generated once and kept in config.
+    /// A missing or malformed stored value is replaced.
+    fn airplay_sender_identity(&self) -> SenderIdentity {
+        let mut uc = self.user_config.lock().unwrap();
+        if let Some(id) = uc.airplay_sender_identity.clone().filter(|i| i.is_valid()) {
+            return id;
+        }
+        let id = SenderIdentity::generate();
+        info!("AirPlay: generated this install's sender identity for pair/group sessions");
+        uc.airplay_sender_identity = Some(id.clone());
+        uc.save();
+        id
+    }
+
+    /// The discovered HomePod stereo pairs, for the "left HomePod" choice.
+    pub fn airplay_pair_choices(&self) -> Vec<PairChoice> {
+        self.airplay_discovery
+            .as_ref()
+            .map(|d| discovered_pairs(&d.renderers()))
+            .unwrap_or_default()
+    }
+
+    /// Reconnect the active speaker row now (pair/group settings apply on
+    /// the next connect). Returns false when nothing is connected.
+    pub fn reconnect_active(self: &Arc<Self>) -> bool {
+        let id = self.session.lock().unwrap().as_ref().map(|s| s.stable_id());
+        match id {
+            Some(id) => {
+                info!("reconnect requested for {}", id);
+                self.select_speaker_async(&id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn is_airplay_detailed_logging(&self) -> bool {
+        self.user_config.lock().unwrap().airplay_detailed_logging
+    }
+
+    /// Detailed AirPlay logging: persist and raise/lower the log level now.
+    pub fn set_airplay_detailed_logging(&self, on: bool) {
+        {
+            let mut uc = self.user_config.lock().unwrap();
+            if uc.airplay_detailed_logging == on {
+                return;
+            }
+            uc.airplay_detailed_logging = on;
+            uc.save();
+        }
+        crate::logging::set_detailed(on);
+    }
+
     /// Persist HomeKit pairing credentials for a device id.
     pub fn store_airplay_pairing(&self, id: &str, creds: PairingCredentials) {
         let mut uc = self.user_config.lock().unwrap();
@@ -1851,12 +2181,12 @@ impl App {
 
     /// The device a PIN ceremony is currently pairing (any stage), if one
     /// is in flight.
-    fn pin_pairing_device(&self) -> Option<(String, String)> {
+    fn pin_pairing_device(&self) -> Option<(String, String, String)> {
         self.pin_ceremony
             .lock()
             .unwrap()
             .as_ref()
-            .map(|s| (s.id.clone(), s.name.clone()))
+            .map(|s| (s.id.clone(), s.row_id.clone(), s.name.clone()))
     }
 
     /// GUI: the (id, name) of a PIN pairing ceremony awaiting the user's
@@ -2016,8 +2346,10 @@ impl App {
                     Kind::AirPlay(s.renderer.stable_id())
                 }
                 Some(ActiveSession::AirPlay2(s)) => {
-                    // Same recovery as AirPlay 1: tear down + reconnect.
-                    Kind::AirPlay(s.renderer.stable_id())
+                    // Same recovery as AirPlay 1: tear down + reconnect
+                    // the row it was started from (a group row, not just
+                    // its first speaker).
+                    Kind::AirPlay(s.row_id.clone())
                 }
                 None => return Err("no active speaker".to_string()),
             }
@@ -2286,6 +2618,150 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// An AirPlay 2 receiver with the given group keys (HomePod unless
+    /// `model` says otherwise).
+    fn ap2(name: &str, mac: &str, addr: &str, model: &str, gid: &str, tsid: Option<&str>, flags: Option<u64>) -> AirPlayRenderer {
+        use crate::airplay::discovery::{GroupHints, FEAT_AUDIO, FEAT_BUFFERED_AUDIO, FEAT_PTP, FEAT_TRANSIENT_PAIRING};
+        let group = GroupHints {
+            group_id: Some(gid.to_string()),
+            is_group_leader: Some(model.starts_with("AppleTV")),
+            group_name: Some("Living Room".into()),
+            tight_sync_id: tsid.map(str::to_string),
+            status_flags: flags,
+            ..GroupHints::default()
+        };
+        AirPlayRenderer {
+            friendly_name: name.into(),
+            mac_id: mac.into(),
+            ip: ip(addr),
+            port: 7000,
+            airplay_port: Some(7000),
+            encryption_types: vec![0],
+            codecs: vec![1],
+            password_protected: false,
+            encryption_key_required: false,
+            features: Some(FEAT_AUDIO | FEAT_TRANSIENT_PAIRING | FEAT_PTP | FEAT_BUFFERED_AUDIO),
+            pk: None,
+            model: Some(model.into()),
+            group,
+        }
+    }
+
+    fn identity() -> SenderIdentity {
+        SenderIdentity { device_mac: "02:11:22:33:44:55".into(), dacp_id: "0123456789ABCDEF".into() }
+    }
+
+    /// A lone HomePod, a Sonos, an Apple TV alone: no pair/group options,
+    /// one target — a single-receiver session.
+    #[test]
+    fn single_receivers_get_no_group_options() {
+        use crate::airplay::discovery::group_renderers;
+        let all = vec![
+            ap2("Kitchen", "AA0000000001", "192.0.2.21", "AudioAccessory5,1", "g-kitchen", None, Some(0x804)),
+            ap2("Sonos", "AA0000000002", "192.0.2.22", "One", "g-sonos", None, None),
+            ap2("Den TV", "AA0000000003", "192.0.2.23", "AppleTV14,1", "g-den", None, None),
+        ];
+        for e in group_renderers(all.clone()) {
+            let settings = PairSettings::default();
+            let targets = e.targets_with(&settings.target_policy());
+            assert_eq!(targets.len(), 1);
+            assert!(!is_group_session(Some(&e), &targets, &all), "{}", e.renderer.friendly_name);
+        }
+        // No row found (the device vanished meanwhile): a non-pair device
+        // is single too.
+        assert!(!is_group_session(None, &all[..1], &all));
+    }
+
+    /// A HomePod advertising a `tsid` nobody else in range shares — one
+    /// half of a pair whose buddy is unplugged, asleep or not yet resolved
+    /// (owntone#1413 'B__rok__che (2)', flags bit 14), with its gid
+    /// normalised to that tsid — keeps the single-receiver session: one
+    /// target, no pair/group options, the usual fallbacks.
+    #[test]
+    fn a_half_whose_partner_is_not_discovered_is_a_single_receiver() {
+        use crate::airplay::discovery::group_renderers;
+        const TSID: &str = "9270ba34-0000-0000-0000-000000000000";
+        let lone = ap2("B__rok__che (2)", "AA0000000031", "192.0.2.31", "AudioAccessory5,1", TSID, Some(TSID), Some(0x9e404));
+        let kitchen = ap2("Kitchen", "AA0000000001", "192.0.2.21", "AudioAccessory5,1", "g-kitchen", None, None);
+        let all = vec![lone.clone(), kitchen];
+        let entries = group_renderers(all.clone());
+        let e = entries.iter().find(|e| e.renderer.mac_id == lone.mac_id).unwrap();
+        let settings = PairSettings::default();
+        let policy = settings.target_policy();
+        assert!(!e.group_session());
+        assert!(!e.pair_half);
+        assert_eq!(e.row_kind_label(&policy), "single");
+        let targets = e.targets_with(&policy);
+        assert_eq!(targets.iter().map(|t| t.mac_id.as_str()).collect::<Vec<_>>(), [lone.mac_id.as_str()]);
+        assert!(!is_group_session(Some(e), &targets, &all));
+        assert!(!is_group_session(None, &targets, &all));
+        assert_eq!(e.transport_with(&policy), lone.transport());
+
+        // Its partner comes back: a pair row, both halves group sessions.
+        let mut partner = lone.clone();
+        partner.mac_id = "AA0000000032".into();
+        partner.friendly_name = "B__rok__che (1)".into();
+        partner.ip = ip("192.0.2.32");
+        let all = vec![lone.clone(), partner];
+        assert!(is_group_session(None, &[lone.clone()], &all));
+        let entries = group_renderers(all);
+        assert!(entries.iter().any(|e| e.is_pair() && e.group_session()));
+        let half = entries.iter().find(|e| e.folded_under.is_some()).unwrap();
+        assert!(half.pair_half && half.group_session());
+    }
+
+    /// A stereo pair behind an Apple TV: the TV row streams to both halves
+    /// with the recipe, per-half buddies, and (split on) L to the +0 /
+    /// bit-13-less rules; `tv` makes it one realtime session to the TV.
+    #[test]
+    fn tv_row_and_pair_row_group_options() {
+        use crate::airplay::discovery::group_renderers;
+        use crate::airplay::pair_experiments::{ChannelMap, PairSplit, PairStream, TvRow};
+        const TSID: &str = "11111111-2222-3333-4444-555555555555";
+        let tv = ap2("Living Room", "AA00000000FF", "192.0.2.10", "AppleTV14,1", "g-tv", None, None);
+        // HomePods as the TV's output: its gid, igl=0, their own tsid.
+        let a = ap2("Pair A", "AA0000000011", "192.0.2.11", "AudioAccessory5,1", "g-tv", Some(TSID), Some(0x3a0c04));
+        let b = ap2("Pair B", "AA0000000012", "192.0.2.12", "AudioAccessory5,1", "g-tv", Some(TSID), Some(0x1a2c04));
+        let all = vec![tv.clone(), a.clone(), b.clone()];
+        let entries = group_renderers(all.clone());
+        let row = entries.iter().find(|e| e.is_tv_group()).expect("TV row");
+
+        let mut settings = PairSettings { split: PairSplit::On, ..PairSettings::default() };
+        let targets = row.targets_with(&settings.target_policy());
+        // Bit 13 (0x1a2c04) marks B as the tight-sync leader: set up first.
+        assert_eq!(targets.iter().map(|t| t.friendly_name.as_str()).collect::<Vec<_>>(), ["Pair B", "Pair A"]);
+        assert!(is_group_session(Some(row), &targets, &all));
+        let g = group_session_options(Some(row), &targets, &all, &settings, identity());
+        assert_eq!(g.settings.stream, PairStream::Realtime);
+        assert_eq!(g.row_kind, "Apple TV row (HomePods)");
+        assert_eq!(g.buddies, vec![vec![a.ip], vec![b.ip]]);
+        // No gid index behind a TV: the lowest MAC (A) is left by default.
+        assert_eq!(g.channel_maps, vec![ChannelMap::Right, ChannelMap::Left]);
+        assert_eq!(g.identity, identity());
+
+        // tv: one session to the TV, realtime even if buffered is chosen.
+        settings.tv_row = TvRow::Tv;
+        settings.stream = PairStream::Buffered;
+        let targets = row.targets_with(&settings.target_policy());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].friendly_name, "Living Room");
+        let g = group_session_options(Some(row), &targets, &all, &settings, identity());
+        assert_eq!(g.settings.stream, PairStream::Realtime);
+        assert_eq!(g.row_kind, "Apple TV row (TV only)");
+        assert_eq!(g.channel_maps, vec![ChannelMap::Stereo]);
+        assert_eq!(g.buddies, vec![Vec::<IpAddr>::new()]);
+
+        // A pair half's own member row is a pair/group session; alone it
+        // is never split.
+        let half_row = entries.iter().find(|e| e.renderer.friendly_name == "Pair A").unwrap();
+        let settings = PairSettings { split: PairSplit::On, ..PairSettings::default() };
+        let targets = half_row.targets_with(&settings.target_policy());
+        assert!(is_group_session(Some(half_row), &targets, &all));
+        let g = group_session_options(Some(half_row), &targets, &all, &settings, identity());
+        assert_eq!(g.channel_maps, vec![ChannelMap::Stereo]);
+        assert_eq!(g.buddies, vec![vec![b.ip]]);
     }
 
     #[test]

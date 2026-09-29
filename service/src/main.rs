@@ -307,10 +307,17 @@ fn write_startup_tombstone() {
 }
 
 fn init_logging(cli: &Cli) {
+    let base: log::LevelFilter = cli.log_level.parse().unwrap_or(log::LevelFilter::Info);
+    // RUST_LOG (developers) keeps full control of the filter; otherwise
+    // this crate's filter is built at debug and `log::max_level` gates it,
+    // so the "Detailed AirPlay logging" switch can raise the level at
+    // runtime (see `stream_to_speaker::logging`).
+    let custom_filter = std::env::var_os("RUST_LOG").is_some();
     let mut builder = env_logger::Builder::from_default_env();
-    builder
-        .filter_level(cli.log_level.parse().unwrap_or(log::LevelFilter::Info))
-        .format_timestamp_millis();
+    builder.filter_level(base).format_timestamp_millis();
+    if !custom_filter {
+        builder.filter_module("stream_to_speaker", stream_to_speaker::logging::detailed_level(base));
+    }
     // GUI mode has no console (windows_subsystem = "windows"), so
     // env_logger's default stderr target writes to a dead handle.
     // Pipe to %LOCALAPPDATA%\StreamToSpeaker\stream-to-speaker.log so
@@ -323,6 +330,7 @@ fn init_logging(cli: &Cli) {
         }
     }
     builder.init();
+    stream_to_speaker::logging::init_base_level(if custom_filter { log::max_level() } else { base });
 }
 
 /// Windows MessageBox for fatal-error visibility. No-op on non-Windows.
@@ -452,6 +460,9 @@ fn run(cli: Cli) -> Result<()> {
     info!("audio source: {}", source.name());
 
     let app = setup_app(&cli)?;
+    if app.is_airplay_detailed_logging() {
+        stream_to_speaker::logging::set_detailed(true);
+    }
 
     // Always start the full HTTP server (audio + API + UI). The /, /api/*
     // routes honour app.is_web_ui_enabled() at request time, so the GUI

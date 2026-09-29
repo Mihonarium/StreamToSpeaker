@@ -71,6 +71,77 @@ pub const WIRE_BITS_PER_SAMPLE: u16 = 16;
 pub const WIRE_BYTES_PER_FRAME: usize =
     (WIRE_CHANNELS as usize) * (WIRE_BITS_PER_SAMPLE as usize / 8);
 
+/// Runtime log level: the level the process started with (`--log-level`)
+/// and the "Detailed AirPlay logging" switch, which raises it to debug for
+/// this crate without a restart. `main` builds the logger with this
+/// crate's filter already at debug and gates it with `log::max_level`.
+pub mod logging {
+    use log::LevelFilter;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static BASE: AtomicUsize = AtomicUsize::new(LevelFilter::Info as usize);
+
+    fn from_usize(v: usize) -> LevelFilter {
+        [
+            LevelFilter::Off,
+            LevelFilter::Error,
+            LevelFilter::Warn,
+            LevelFilter::Info,
+            LevelFilter::Debug,
+            LevelFilter::Trace,
+        ]
+        .get(v)
+        .copied()
+        .unwrap_or(LevelFilter::Info)
+    }
+
+    /// The level this crate's own filter is built with: at least debug.
+    pub fn detailed_level(base: LevelFilter) -> LevelFilter {
+        base.max(LevelFilter::Debug)
+    }
+
+    /// The effective maximum level for a base level and the switch.
+    pub fn effective_level(base: LevelFilter, detailed: bool) -> LevelFilter {
+        if detailed {
+            detailed_level(base)
+        } else {
+            base
+        }
+    }
+
+    /// Record the start-up level and apply it (called once, after the
+    /// logger is installed).
+    pub fn init_base_level(base: LevelFilter) {
+        BASE.store(base as usize, Ordering::Release);
+        log::set_max_level(base);
+    }
+
+    /// Turn detailed (debug) logging on or off at runtime.
+    pub fn set_detailed(on: bool) {
+        let base = from_usize(BASE.load(Ordering::Acquire));
+        let level = effective_level(base, on);
+        log::set_max_level(level);
+        log::info!("log level: {} (detailed AirPlay logging {})", level, if on { "on" } else { "off" });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn detailed_logging_raises_to_debug_and_never_lowers() {
+            assert_eq!(effective_level(LevelFilter::Info, false), LevelFilter::Info);
+            assert_eq!(effective_level(LevelFilter::Info, true), LevelFilter::Debug);
+            assert_eq!(effective_level(LevelFilter::Warn, true), LevelFilter::Debug);
+            assert_eq!(effective_level(LevelFilter::Trace, true), LevelFilter::Trace);
+            assert_eq!(effective_level(LevelFilter::Trace, false), LevelFilter::Trace);
+            for l in [LevelFilter::Off, LevelFilter::Error, LevelFilter::Info, LevelFilter::Trace] {
+                assert_eq!(from_usize(l as usize), l);
+            }
+        }
+    }
+}
+
 /// Per-user log directory (`%LOCALAPPDATA%\StreamToSpeaker`). Created
 /// if missing. Returns None when `LOCALAPPDATA` isn't set (non-Windows
 /// hosts, lint builds). Used by `main.rs` to seed the file logger and

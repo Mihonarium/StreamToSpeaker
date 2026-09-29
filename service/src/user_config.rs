@@ -15,6 +15,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::airplay::hap_pairing::PairingCredentials;
+use crate::airplay::pair_experiments::{
+    PairRecipe, PairSettings, PairSplit, PairStream, PairTargets, PairTiming, PtpRole, SenderIdentity, TvRow,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserConfig {
@@ -68,6 +71,13 @@ pub struct UserConfig {
     /// tries MFi first and falls back to plaintext/RSA on failure.
     #[serde(default)]
     pub airplay_mfi_encryption: bool,
+    /// Show every device of an AirPlay group (HomePods set as an Apple
+    /// TV's default audio output, the TV included) or of a HomePod stereo
+    /// pair as its own row, next to the group / pair row. Off by default:
+    /// the group is listed once, like the iPhone's AirPlay picker (see
+    /// `AirPlayEntry::targets` for what a click on it streams to).
+    #[serde(default)]
+    pub show_airplay_group_members: bool,
     /// Per-device AirPlay passwords for `pw=true` receivers, keyed by the
     /// device's stable id (`airplay:<mac>`). Stored so the user only
     /// enters it once. Plain-text in the config file (same trust level as
@@ -165,6 +175,69 @@ pub struct UserConfig {
     /// "Later" on the update banner: hidden until this unix time.
     #[serde(default)]
     pub update_banner_hidden_until: Option<u64>,
+
+    // ---- AirPlay pair/group experiments (see `airplay::pair_experiments`).
+    // They apply only to pair/group sessions: stereo pairs (and their
+    // halves) and Apple TV rows that stream to their HomePods or to the
+    // TV; every other receiver keeps the single-receiver behaviour.
+    // Changes apply on the next connect. Values are lenient: an unknown
+    // value falls back to the default instead of failing the file.
+    /// `ma` | `apple`: SETUP keys, request order, SETPEERS shape.
+    #[serde(default)]
+    pub airplay_pair_recipe: PairRecipe,
+    /// `both` | `leader`: stream to both halves of a pair, or the leader.
+    #[serde(default)]
+    pub airplay_pair_targets: PairTargets,
+    /// `homepods` | `tv`: what an Apple-TV-led row streams to.
+    #[serde(default)]
+    pub airplay_tv_row: TvRow,
+    /// `realtime` | `buffered`: stream kind for pair/group sessions.
+    #[serde(default)]
+    pub airplay_pair_stream: PairStream,
+    /// `master` | `follow`: PTP role for pair/group sessions.
+    #[serde(default)]
+    pub airplay_pair_ptp_role: PtpRole,
+    /// `ptp` | `ntp`: timing for pair/group sessions.
+    #[serde(default)]
+    pub airplay_pair_timing: PairTiming,
+    /// `off` | `on` | `swap`: sender-side L/R split per pair half.
+    #[serde(default)]
+    pub airplay_pair_split: PairSplit,
+    /// The left half of each stereo pair for the split: pair `tsid` →
+    /// stable id of the left HomePod. Absent = the pair's `gid` +0 half.
+    #[serde(default, deserialize_with = "lenient")]
+    pub airplay_pair_left: HashMap<String, String>,
+    /// `senderSupportsRelay=true` in the apple recipe.
+    #[serde(default)]
+    pub airplay_sender_relay: bool,
+    /// Detailed AirPlay logging: raises the log level to debug at runtime.
+    #[serde(default)]
+    pub airplay_detailed_logging: bool,
+    /// Persistent AirPlay sender identity for pair/group sessions
+    /// (deviceID/macAddress, DACP-ID/Client-Instance), generated once.
+    #[serde(default, deserialize_with = "lenient")]
+    pub airplay_sender_identity: Option<SenderIdentity>,
+    /// Force gPTP framing (PTP header transportSpecific = 1) on
+    /// single-receiver sessions too. Pair/group sessions always use it;
+    /// single receivers keep the plain-1588 byte unless this is set.
+    /// Hand-edit only.
+    #[serde(default)]
+    pub airplay_force_gptp_framing: bool,
+}
+
+/// Deserialise a field, falling back to its default (with a warning)
+/// when the stored value has the wrong shape — one hand-edited key must
+/// not quarantine the whole file.
+fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v.clone()).unwrap_or_else(|e| {
+        log::warn!("config: ignoring malformed value {} ({})", v, e);
+        T::default()
+    }))
 }
 
 /// Default AirPlay buffer — iTunes' 2 s (88200 samples at 44.1 kHz).
@@ -222,6 +295,34 @@ fn config_path() -> Option<PathBuf> {
 }
 
 impl UserConfig {
+    /// The pair/group experiment settings as one snapshot.
+    pub fn pair_settings(&self) -> PairSettings {
+        PairSettings {
+            recipe: self.airplay_pair_recipe,
+            targets: self.airplay_pair_targets,
+            tv_row: self.airplay_tv_row,
+            stream: self.airplay_pair_stream,
+            ptp_role: self.airplay_pair_ptp_role,
+            timing: self.airplay_pair_timing,
+            split: self.airplay_pair_split,
+            sender_relay: self.airplay_sender_relay,
+            left_halves: self.airplay_pair_left.clone(),
+        }
+    }
+
+    /// Store a pair/group settings snapshot back (the GUI edits a copy).
+    pub fn set_pair_settings(&mut self, s: &PairSettings) {
+        self.airplay_pair_recipe = s.recipe;
+        self.airplay_pair_targets = s.targets;
+        self.airplay_tv_row = s.tv_row;
+        self.airplay_pair_stream = s.stream;
+        self.airplay_pair_ptp_role = s.ptp_role;
+        self.airplay_pair_timing = s.timing;
+        self.airplay_pair_split = s.split;
+        self.airplay_sender_relay = s.sender_relay;
+        self.airplay_pair_left = s.left_halves.clone();
+    }
+
     /// `airplay_latency_ms` clamped to its supported range, so a hand-
     /// edited config (or an older file with the field absent → default)
     /// can't produce a zero or absurd anchor.
@@ -343,6 +444,52 @@ mod tests {
         assert!(c.check_for_updates);
         assert_eq!(c.update_last_check_unix, None);
         assert!(!c.prefer_realtime_airplay);
+        // Pair/group experiments: the documented defaults, nothing forced
+        // on single receivers.
+        assert_eq!(c.pair_settings(), PairSettings::default());
+        assert!(!c.airplay_detailed_logging);
+        assert!(!c.airplay_force_gptp_framing);
+        assert_eq!(c.airplay_sender_identity, None);
+    }
+
+    #[test]
+    fn pair_settings_round_trip_and_tolerate_bad_values() {
+        let dir = temp_config_dir("pair");
+        let path = dir.join("config.json");
+        let mut c = UserConfig::default();
+        c.airplay_pair_recipe = PairRecipe::Apple;
+        c.airplay_pair_targets = PairTargets::Leader;
+        c.airplay_tv_row = TvRow::Tv;
+        c.airplay_pair_stream = PairStream::Buffered;
+        c.airplay_pair_ptp_role = PtpRole::Follow;
+        c.airplay_pair_timing = PairTiming::Ntp;
+        c.airplay_pair_split = PairSplit::Swap;
+        c.airplay_pair_left.insert("tsid".into(), "airplay:AABBCCDDEEFF".into());
+        c.airplay_sender_relay = true;
+        c.airplay_sender_identity = Some(SenderIdentity::generate());
+        c.save_to(&path);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"airplay_pair_recipe\": \"apple\""), "{raw}");
+        let back = UserConfig::load_from(&path);
+        assert_eq!(back.pair_settings(), c.pair_settings());
+        assert_eq!(back.airplay_sender_identity, c.airplay_sender_identity);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // set_pair_settings is the inverse of pair_settings.
+        let mut d = UserConfig::default();
+        d.set_pair_settings(&c.pair_settings());
+        assert_eq!(d.pair_settings(), c.pair_settings());
+
+        // Nonsense values fall back to defaults; the rest of the file
+        // (here the latency) survives — no quarantine.
+        let c: UserConfig = serde_json::from_str(
+            r#"{"airplay_pair_recipe":"roon","airplay_pair_split":7,"airplay_pair_left":"x",
+                "airplay_sender_identity":{"device_mac":1},"airplay_latency_ms":300}"#,
+        )
+        .unwrap();
+        assert_eq!(c.pair_settings(), PairSettings::default());
+        assert_eq!(c.airplay_sender_identity, None);
+        assert_eq!(c.airplay_latency_ms, 300);
     }
 
     fn temp_config_dir(tag: &str) -> std::path::PathBuf {
