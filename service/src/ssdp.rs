@@ -54,10 +54,6 @@ pub struct Renderer {
     /// privacy mode admits the whole group — any member may end up
     /// fetching the stream. Filled by `sonos::resolve_group_coordinator`.
     pub group_member_addrs: Vec<IpAddr>,
-    /// Source address of the SSDP reply that announced this device, if
-    /// known. Can differ from `ip` (multi-homed renderers, hostname
-    /// LOCATIONs); privacy mode admits both.
-    pub source_ip: Option<IpAddr>,
     /// Every address the LOCATION host resolves to (just `ip` when the
     /// LOCATION carries a literal address). Privacy mode admits all of
     /// them, so a hostname resolving AAAA-first can't get the speaker
@@ -150,12 +146,11 @@ impl Renderer {
     /// Stable identifier suitable for `find_by_id`. UDN if the device
     /// advertises one, IP literal as fallback.
     /// Every address this renderer is known to use, for the privacy
-    /// gate: the control-plane IP, all addresses its LOCATION host
-    /// resolves to, and the address its SSDP reply came from.
+    /// gate: the control-plane IP and all addresses its LOCATION host
+    /// resolves to.
     pub fn stream_peers(&self) -> Vec<IpAddr> {
         let mut v = vec![self.ip];
         v.extend(self.host_addrs.iter().copied());
-        v.extend(self.source_ip);
         v.extend(self.group_member_addrs.iter().copied());
         v.sort();
         v.dedup();
@@ -287,18 +282,16 @@ pub fn discover_once(timeout: Duration, iface: Option<Ipv4Addr>) -> Result<Vec<R
 
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 4096];
-    // (LOCATION, SSDP reply source) — the source is kept because the
-    // privacy gate admits it alongside the LOCATION host.
-    let mut locations: Vec<(String, IpAddr)> = Vec::new();
+    let mut locations: Vec<String> = Vec::new();
 
     while Instant::now() < deadline {
         match udp.recv_from(&mut buf) {
             Ok((n, peer)) => {
                 let text = String::from_utf8_lossy(&buf[..n]);
                 if let Some(loc) = extract_header(&text, "LOCATION") {
-                    if !locations.iter().any(|(l, _)| l == &loc) {
+                    if !locations.contains(&loc) {
                         debug!("SSDP response LOCATION={} from {}", loc, peer.ip());
-                        locations.push((loc, peer.ip()));
+                        locations.push(loc);
                     }
                 }
             }
@@ -311,8 +304,8 @@ pub fn discover_once(timeout: Duration, iface: Option<Ipv4Addr>) -> Result<Vec<R
     }
 
     let mut renderers = Vec::new();
-    for (loc, source) in &locations {
-        match fetch_and_parse_device(loc, Duration::from_secs(3), Some(*source)) {
+    for loc in &locations {
+        match fetch_and_parse_device(loc, Duration::from_secs(3)) {
             Ok(r) => renderers.push(r),
             Err(e) => debug!("device fetch {} failed: {}", loc, e),
         }
@@ -341,11 +334,7 @@ fn extract_header(response: &str, header: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn fetch_and_parse_device(
-    location: &str,
-    timeout: Duration,
-    source_ip: Option<IpAddr>,
-) -> Result<Renderer> {
+pub(crate) fn fetch_and_parse_device(location: &str, timeout: Duration) -> Result<Renderer> {
     let xml = http_get(location, timeout).with_context(|| format!("GET {}", location))?;
     let url = url::Url::parse(location).with_context(|| format!("parse location {}", location))?;
     let base = format!(
@@ -384,7 +373,6 @@ pub(crate) fn fetch_and_parse_device(
     };
 
     let mut renderer = parse_device_description(&xml, &base, ip)?;
-    renderer.source_ip = source_ip;
     renderer.host_addrs = host_addrs;
     Ok(renderer)
 }
@@ -475,7 +463,6 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr) -> Result<Ren
         zone_name: None,
         group_members: Vec::new(),
         group_member_addrs: Vec::new(),
-        source_ip: None,
         host_addrs: vec![ip],
     })
 }
