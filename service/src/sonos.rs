@@ -279,7 +279,7 @@ pub fn annotate_with_topology(renderers: &mut Vec<Renderer>) {
     match fetch_zone_groups(&zgt_url) {
         Ok(groups) => {
             apply_topology(renderers, &groups, &|location| {
-                crate::ssdp::fetch_and_parse_device(location, std::time::Duration::from_secs(3), None)
+                crate::ssdp::fetch_and_parse_device(location, std::time::Duration::from_secs(3))
                     .ok()
             });
         }
@@ -328,7 +328,7 @@ pub fn resolve_group_coordinator(
         let coord_member = group.members.iter().find(|m| m.uuid == group.coordinator_uuid);
         let coord = lookup(&coord_id).or_else(|| {
             coord_member.and_then(|m| {
-                crate::ssdp::fetch_and_parse_device(&m.location, std::time::Duration::from_secs(3), None)
+                crate::ssdp::fetch_and_parse_device(&m.location, std::time::Duration::from_secs(3))
                     .ok()
             })
         });
@@ -428,7 +428,6 @@ mod tests {
             ),
             zone_name: None,
             group_members: Vec::new(),
-            source_ip: None,
             host_addrs: Vec::new(),
             group_member_addrs: Vec::new(),
         }
