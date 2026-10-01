@@ -63,8 +63,8 @@ fn merge_advertised_latency(setup: Option<u32>, record: Option<u32>) -> Option<u
 /// Configuration to spin up one AirPlay session.
 pub struct AirPlaySessionConfig {
     pub renderer: AirPlayRenderer,
-    /// Local IPv4 we'll bind UDP sockets to and advertise in SDP. Same
-    /// IP we already use for `advertise_ip` on the HTTP side.
+    /// Local IPv4 we'll bind UDP sockets to and advertise in SDP: this
+    /// PC's address on the receiver's network (or `--advertise-ip`).
     pub local_ip: IpAddr,
     /// Subscription on the StreamHub — produces PcmFrame entries the
     /// audio thread consumes.

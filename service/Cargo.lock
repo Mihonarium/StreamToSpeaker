@@ -3640,6 +3640,7 @@ dependencies = [
  "env_logger",
  "flume",
  "hkdf",
+ "if-addrs",
  "log",
  "md-5",
  "mdns-sd",
