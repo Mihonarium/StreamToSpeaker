@@ -589,11 +589,23 @@ pub(crate) fn decode_maybe_chunked(body: &[u8]) -> Vec<u8> {
         let size_str = size_str.split(';').next().unwrap_or("0");
         let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
         p = crlf + 2;
-        if size == 0 || p + size > body.len() {
+        if size == 0 {
             break;
         }
-        out.extend_from_slice(&body[p..p + size]);
-        p += size + 2; // skip chunk + trailing \r\n
+        let Some(chunk_end) = p.checked_add(size) else {
+            break;
+        };
+        if chunk_end > body.len() {
+            break;
+        }
+        out.extend_from_slice(&body[p..chunk_end]);
+        let Some(next_chunk) = chunk_end.checked_add(2) else {
+            break;
+        };
+        if body.get(chunk_end..next_chunk) != Some(b"\r\n") {
+            break;
+        }
+        p = next_chunk; // skip chunk + trailing \r\n
     }
     out
 }
@@ -629,5 +641,11 @@ mod tests {
     fn plain_body_passes_through() {
         let body = b"<?xml version=\"1.0\"?><Envelope/>";
         assert_eq!(decode_maybe_chunked(body), body);
+    }
+
+    #[test]
+    fn oversized_later_chunk_does_not_panic() {
+        let body = b"1\r\nX\r\nffffffffffffffff\r\n";
+        assert_eq!(decode_maybe_chunked(body), b"X");
     }
 }
