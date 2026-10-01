@@ -634,7 +634,15 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
 
     let advertise_ip = match cli.advertise_ip.as_deref() {
         Some(ip) => ip.to_string(),
-        None => stream_to_speaker::app::default_advertise_ip()?,
+        // Only the default shown in the UI; each speaker gets the address
+        // on its own network. Without a default route (offline LAN), use
+        // any local IPv4.
+        None => stream_to_speaker::app::default_advertise_ip().or_else(|e| {
+            stream_to_speaker::ssdp::local_ipv4_interfaces()
+                .first()
+                .map(|ip| ip.to_string())
+                .ok_or(e)
+        })?,
     };
 
     let ssdp_iface = if cli.no_discovery {
