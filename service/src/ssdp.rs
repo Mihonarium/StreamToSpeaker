@@ -217,10 +217,8 @@ const SSDP_MULTICAST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 2
 
 /// Spawn the SSDP discovery background thread.  Runs an initial discovery
 /// immediately and then every `interval` afterwards.
-/// `iface` is the local IPv4 to send multicast from; pass None to let the
-/// OS pick (works on single-interface machines, but on multihomed hosts
-/// with VPN / virtualization adapters Windows often picks the wrong one
-/// and the speaker never sees our M-SEARCH).
+/// `iface` pins the search to one local IPv4; `None` searches from every
+/// interface (see [`discover_once`]).
 pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, iface: Option<Ipv4Addr>) {
     thread::Builder::new()
         .name("stream-to-speaker-ssdp".to_string())
@@ -238,67 +236,53 @@ pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, iface: Op
 }
 
 /// One-shot discovery. Returns a deduped list of renderers.
-/// `iface` selects the multicast egress interface.
+/// `iface` pins the search to one local IPv4 (from `--advertise-ip` /
+/// `--bind`); `None` searches from every non-loopback IPv4 interface,
+/// so a speaker on a second NIC is found even when a VPN owns the
+/// default route.
 pub fn discover_once(timeout: Duration, iface: Option<Ipv4Addr>) -> Result<Vec<Renderer>> {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
-    sock.set_read_timeout(Some(Duration::from_millis(500)))?;
-
-    // Bind to the chosen interface (or 0.0.0.0 if unspecified). Binding
-    // to a specific IP ensures the kernel uses *that* interface for both
-    // sending the M-SEARCH and receiving the unicast responses Sonos sends
-    // back. On a multihomed host this is essential — otherwise Windows
-    // can pick a VPN adapter or virtualization NIC and the multicast
-    // vanishes into the void.
-    let bind_ip = iface.unwrap_or(Ipv4Addr::UNSPECIFIED);
-    sock.bind(&SocketAddr::new(IpAddr::V4(bind_ip), 0).into())?;
-    sock.set_multicast_ttl_v4(2)?;
+    // A pinned interface stays strict: failing to search from it is an
+    // error, not a silent fallback to whatever the OS picks.
     if let Some(ip) = iface {
-        // Explicitly select multicast egress interface as well; bind alone
-        // isn't always sufficient on Windows.
-        sock.set_multicast_if_v4(&ip)?;
-        debug!("SSDP socket bound to interface {}", ip);
-    } else {
-        debug!("SSDP socket bound to 0.0.0.0 (OS picks interface)");
+        return collect_renderers(vec![search_socket(ip)?], timeout);
     }
-
-    let udp: UdpSocket = sock.into();
-
-    // Send one M-SEARCH per search target.
-    for st in SEARCH_TARGETS {
-        let req = format!(
-            "M-SEARCH * HTTP/1.1\r\n\
-             HOST: 239.255.255.250:1900\r\n\
-             MAN: \"ssdp:discover\"\r\n\
-             MX: 2\r\n\
-             ST: {}\r\n\
-             USER-AGENT: stream-to-speaker/0.1\r\n\
-             \r\n",
-            st
-        );
-        udp.send_to(req.as_bytes(), SSDP_MULTICAST)
-            .context("sending SSDP M-SEARCH")?;
+    let ifaces = local_ipv4_interfaces();
+    let mut sockets: Vec<UdpSocket> = Vec::new();
+    for ip in &ifaces {
+        match search_socket(*ip) {
+            Ok(s) => sockets.push(s),
+            Err(e) => debug!("SSDP search on {} failed: {:#}", ip, e),
+        }
     }
+    if sockets.is_empty() {
+        // No usable interface list (or every bind failed): let the OS pick.
+        sockets.push(search_socket(Ipv4Addr::UNSPECIFIED)?);
+    }
+    collect_renderers(sockets, timeout)
+}
 
+/// Read M-SEARCH replies on `sockets` until `timeout`, then fetch and
+/// parse each advertised device.
+fn collect_renderers(sockets: Vec<UdpSocket>, timeout: Duration) -> Result<Vec<Renderer>> {
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 4096];
     let mut locations: Vec<String> = Vec::new();
 
     while Instant::now() < deadline {
-        match udp.recv_from(&mut buf) {
-            Ok((n, peer)) => {
-                let text = String::from_utf8_lossy(&buf[..n]);
-                if let Some(loc) = extract_header(&text, "LOCATION") {
-                    if !locations.contains(&loc) {
-                        debug!("SSDP response LOCATION={} from {}", loc, peer.ip());
-                        locations.push(loc);
+        for udp in &sockets {
+            match udp.recv_from(&mut buf) {
+                Ok((n, peer)) => {
+                    let text = String::from_utf8_lossy(&buf[..n]);
+                    if let Some(loc) = extract_header(&text, "LOCATION") {
+                        if !locations.contains(&loc) {
+                            debug!("SSDP response LOCATION={} from {}", loc, peer.ip());
+                            locations.push(loc);
+                        }
                     }
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => continue,
-            Err(e) => {
-                debug!("SSDP recv error: {}", e);
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => debug!("SSDP recv error: {}", e),
             }
         }
     }
@@ -316,6 +300,58 @@ pub fn discover_once(timeout: Duration, iface: Option<Ipv4Addr>) -> Result<Vec<R
     crate::sonos::annotate_with_topology(&mut renderers);
 
     Ok(renderers)
+}
+
+/// Non-loopback, non-link-local IPv4 addresses of this machine (from
+/// every adapter; one without a link just fails its send and is skipped).
+pub fn local_ipv4_interfaces() -> Vec<Ipv4Addr> {
+    let mut v: Vec<Ipv4Addr> = if_addrs::get_if_addrs()
+        .map(|list| {
+            list.into_iter()
+                .filter_map(|i| match i.ip() {
+                    IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() => {
+                        Some(ip)
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// A UDP socket bound to `ip` that has sent our M-SEARCHes out of that
+/// interface. Binding to the address (not just choosing the multicast
+/// interface) makes Windows send *and* receive the unicast replies on
+/// that interface.
+fn search_socket(ip: Ipv4Addr) -> Result<UdpSocket> {
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    sock.set_read_timeout(Some(Duration::from_millis(50)))?;
+    sock.bind(&SocketAddr::new(IpAddr::V4(ip), 0).into())?;
+    sock.set_multicast_ttl_v4(2)?;
+    if !ip.is_unspecified() {
+        sock.set_multicast_if_v4(&ip)?;
+    }
+    debug!("SSDP searching from {}", ip);
+    let udp: UdpSocket = sock.into();
+    for st in SEARCH_TARGETS {
+        let req = format!(
+            "M-SEARCH * HTTP/1.1\r\n\
+             HOST: 239.255.255.250:1900\r\n\
+             MAN: \"ssdp:discover\"\r\n\
+             MX: 2\r\n\
+             ST: {}\r\n\
+             USER-AGENT: stream-to-speaker/0.1\r\n\
+             \r\n",
+            st
+        );
+        udp.send_to(req.as_bytes(), SSDP_MULTICAST)
+            .with_context(|| format!("sending SSDP M-SEARCH from {}", ip))?;
+    }
+    Ok(udp)
 }
 
 fn extract_header(response: &str, header: &str) -> Option<String> {

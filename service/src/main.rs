@@ -148,8 +148,9 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
 
-    /// Public IP to advertise to the speaker in the stream URI. Required
-    /// when bind is 0.0.0.0. Defaults to the first non-loopback IPv4.
+    /// Local IP to give every speaker (stream URI, callbacks, AirPlay) and
+    /// to search for speakers from. Default: per speaker, the address this
+    /// PC uses to reach that speaker, and discovery on every interface.
     #[arg(long)]
     advertise_ip: Option<String>,
 
@@ -666,13 +667,9 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         }
     };
 
-    let stream_uri = format!("http://{}:{}/stream.raw", advertise_ip, cli.port);
-    let callback_url = format!("http://{}:{}/gena", advertise_ip, cli.port);
-
     let config = AppConfig {
-        stream_uri,
-        callback_url,
         advertise_ip,
+        advertise_ip_explicit: cli.advertise_ip.is_some(),
         bind: bind_socket,
         initial_buffer_ms: cli.initial_buffer_ms,
         silence_packets_threshold: cli.silence_packets_threshold,

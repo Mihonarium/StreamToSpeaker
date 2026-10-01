@@ -35,8 +35,8 @@ use crate::{upnp, PRODUCT_NAME, WIRE_SAMPLE_RATE};
 pub struct RendererSession {
     pub renderer: Renderer,
     pub gena: Arc<GenaManager>,
-    /// The stream URI we're advertising. Cached for symmetry; same for
-    /// every speaker on a given run.
+    /// The stream URI this speaker was given (it carries this PC's
+    /// address on the speaker's network).
     #[allow(dead_code)]
     pub stream_uri: String,
     /// Privacy-gate grant for this speaker's addresses. Lives exactly as
@@ -164,9 +164,12 @@ pub struct SelectedSpeaker {
 /// Stable summary of the runtime config that the GUI / tray can render.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
-    pub stream_uri: String,
-    pub callback_url: String,
     pub advertise_ip: String,
+    /// True when `advertise_ip` came from `--advertise-ip`: it is then used
+    /// for every speaker. Otherwise each speaker gets the local address
+    /// Windows would use to reach it (see [`App::local_ip_toward`]), and
+    /// `advertise_ip` is only the default-route address shown in the UI.
+    pub advertise_ip_explicit: bool,
     pub bind: SocketAddr,
     pub initial_buffer_ms: u32,
     pub silence_packets_threshold: u32,
@@ -1402,18 +1405,12 @@ impl App {
         // resolved above, so the whole group is admitted, whichever unit
         // ends up fetching.)
         let grant = self.stream_gate.grant(new_r.stream_peers());
-        let didl = upnp::didl_lite_metadata(
-            &self.config.stream_uri,
-            PRODUCT_NAME,
-            self.config.initial_buffer_ms,
-        );
-        let session = start_session(
-            new_r,
-            &self.config.stream_uri,
-            &didl,
-            &self.config.callback_url,
-            Some(grant),
-        )
+        // The URLs the speaker calls back on carry the address this PC
+        // has on the speaker's network, not the default-route one.
+        let local_ip = self.local_ip_toward(new_r.ip).map_err(|e| e.to_string())?;
+        let (stream_uri, callback_url) = local_urls(local_ip, self.config.bind.port());
+        let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms);
+        let session = start_session(new_r, &stream_uri, &didl, &callback_url, Some(grant))
         .map_err(|e| format!("{:#}", e))?;
         Ok(ActiveSession::Upnp(session))
     }
@@ -1437,11 +1434,10 @@ impl App {
             renderer.encryption_types,
         );
 
-        // Resolve a local IPv4 to bind UDP sockets to + advertise in
-        // SDP. Prefer the explicit `advertise_ip` (which the user can
-        // override). It must be reachable by the receiver, so falling
-        // back to a 0.0.0.0 here would be wrong.
-        let local_ip = self.advertised_local_ip().map_err(SelectFailure::Msg)?;
+        // The local address to bind UDP sockets to and advertise in SDP:
+        // the one on the receiver's network (or `--advertise-ip`). It must
+        // be reachable by the receiver, so 0.0.0.0 would be wrong.
+        let local_ip = self.local_ip_toward(renderer.ip).map_err(SelectFailure::Msg)?;
 
         // Build the ordered list of paths to try, best first. A device may
         // expose more than one (Sonos advertises a vestigial _raop._tcp it
@@ -1685,7 +1681,7 @@ impl App {
             self.record_error(format!("Can't pair {} — it's no longer discovered.", name));
             return;
         };
-        let local_ip = match self.advertised_local_ip() {
+        let local_ip = match self.local_ip_toward(renderer.ip) {
             Ok(ip) => ip,
             Err(e) => {
                 self.record_error(format!("Can't pair {}: {}", name, e));
@@ -1847,6 +1843,26 @@ impl App {
             .advertise_ip
             .parse()
             .map_err(|e| format!("bad advertise_ip {:?}: {}", self.config.advertise_ip, e))
+    }
+
+    /// The local address to give a speaker at `peer`: `--advertise-ip` when
+    /// set, else a specific `--bind` address, else the address Windows
+    /// would send from to reach `peer`, so a
+    /// speaker on a second NIC is not handed a VPN or other-subnet address.
+    /// Falls back to the startup default if the route lookup fails.
+    pub fn local_ip_toward(&self, peer: IpAddr) -> Result<IpAddr, String> {
+        // `--bind` to a specific address: the HTTP server only listens
+        // there, so that is the address speakers must be given.
+        let bind_ip = self.config.bind.ip();
+        if !self.config.advertise_ip_explicit && !bind_ip.is_unspecified() {
+            return Ok(bind_ip);
+        }
+        if !self.config.advertise_ip_explicit {
+            if let Some(ip) = route_source_ip(peer) {
+                return Ok(ip);
+            }
+        }
+        self.advertised_local_ip()
     }
 
     /// The device a PIN ceremony is currently pairing (any stage), if one
@@ -2226,6 +2242,37 @@ pub fn default_advertise_ip() -> Result<String> {
     Err(anyhow!("could not determine local IP; pass --advertise-ip"))
 }
 
+/// The source address the OS routing table picks for packets to `peer`
+/// (a connected UDP socket sends nothing). None if there is no route or
+/// the answer is unusable.
+pub fn route_source_ip(peer: IpAddr) -> Option<IpAddr> {
+    use std::net::UdpSocket;
+    let any: SocketAddr = if peer.is_ipv4() {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let s = UdpSocket::bind(any).ok()?;
+    s.connect((peer, 9)).ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
+/// `/stream.raw` and `/gena` URLs on `ip`.
+fn local_urls(ip: IpAddr, port: u16) -> (String, String) {
+    let host = match ip {
+        IpAddr::V6(v6) => format!("[{}]", v6),
+        IpAddr::V4(v4) => v4.to_string(),
+    };
+    (
+        format!("http://{}:{}/stream.raw", host, port),
+        format!("http://{}:{}/gena", host, port),
+    )
+}
+
+/// The one interface SSDP should search from, if the user pinned one
+/// (`--advertise-ip`, or `--bind` to a specific address). None = search
+/// from every interface.
 pub fn pick_ssdp_iface(advertise_ip: Option<&str>, bind: &str) -> Option<std::net::Ipv4Addr> {
     if let Some(s) = advertise_ip {
         if let Ok(IpAddr::V4(v4)) = s.parse() {
@@ -2234,11 +2281,6 @@ pub fn pick_ssdp_iface(advertise_ip: Option<&str>, bind: &str) -> Option<std::ne
     }
     if let Ok(IpAddr::V4(v4)) = bind.parse::<IpAddr>() {
         if !v4.is_unspecified() {
-            return Some(v4);
-        }
-    }
-    if let Ok(s) = default_advertise_ip() {
-        if let Ok(IpAddr::V4(v4)) = s.parse() {
             return Some(v4);
         }
     }
@@ -2261,12 +2303,33 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn local_urls_bracket_ipv6_hosts() {
+        let (s, c) = local_urls("192.168.2.100".parse().unwrap(), 8080);
+        assert_eq!(s, "http://192.168.2.100:8080/stream.raw");
+        assert_eq!(c, "http://192.168.2.100:8080/gena");
+        let (s, _) = local_urls("fe80::1".parse().unwrap(), 8080);
+        assert_eq!(s, "http://[fe80::1]:8080/stream.raw");
+    }
+
+    #[test]
+    fn route_source_ip_uses_the_route_to_the_peer() {
+        assert_eq!(route_source_ip("127.0.0.1".parse().unwrap()), Some("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ssdp_searches_every_interface_unless_pinned() {
+        assert_eq!(pick_ssdp_iface(None, "0.0.0.0"), None);
+        assert_eq!(pick_ssdp_iface(Some("192.168.2.100"), "0.0.0.0"), Some("192.168.2.100".parse().unwrap()));
+        assert_eq!(pick_ssdp_iface(None, "10.0.0.5"), Some("10.0.0.5".parse().unwrap()));
+    }
+
+
     fn test_app() -> Arc<App> {
         let app = App::new(
             AppConfig {
-                stream_uri: "http://192.168.1.10:8080/stream.raw".into(),
-                callback_url: "http://192.168.1.10:8080/gena".into(),
                 advertise_ip: "192.168.1.10".into(),
+                advertise_ip_explicit: false,
                 bind: "0.0.0.0:8080".parse().unwrap(),
                 initial_buffer_ms: 0,
                 silence_packets_threshold: 0,

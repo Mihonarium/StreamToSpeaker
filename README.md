@@ -65,8 +65,9 @@ check off under **Advanced** if you'd rather not.
 
 --port <N>                TCP port. Default 5901.
 --bind <ip>               HTTP bind address. Default 0.0.0.0.
---advertise-ip <ip>       IP to advertise in the stream URI sent to the
-                          speaker. Default: first non-loopback IPv4.
+--advertise-ip <ip>       IP to give every speaker and to search from.
+                          Default: per speaker, this PC's address on that
+                          speaker's network; search on every interface.
 
 --initial-buffer-ms <N>   Prebuffer hint sent to the speaker. Default 50.
 --silence-pace-ms <N>     Pacing of silence packets. Default 10 (real-time);
