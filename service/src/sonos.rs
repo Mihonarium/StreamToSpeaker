@@ -90,6 +90,15 @@ pub fn fetch_zone_groups(control_url: &str) -> anyhow::Result<Vec<ZoneGroup>> {
 /// </ZoneGroups>
 /// ```
 pub fn parse_zone_group_state(xml: &str) -> Vec<ZoneGroup> {
+    const MAX_TOPOLOGY_BYTES: usize = 1024 * 1024;
+    const MAX_GROUPS: usize = 64;
+    const MAX_MEMBERS: usize = 1024;
+    const MAX_COPIED_ATTRIBUTE_BYTES: usize = 1024 * 1024;
+
+    if xml.len() > MAX_TOPOLOGY_BYTES {
+        debug!("ZoneGroupState exceeds {} bytes", MAX_TOPOLOGY_BYTES);
+        return Vec::new();
+    }
     let doc = match roxmltree::Document::parse(xml.trim_start()) {
         Ok(d) => d,
         Err(e) => {
@@ -99,24 +108,54 @@ pub fn parse_zone_group_state(xml: &str) -> Vec<ZoneGroup> {
     };
 
     let mut groups = Vec::new();
+    let mut member_count = 0usize;
+    let mut copied_attribute_bytes = 0usize;
     for g in doc
         .descendants()
         .filter(|n| n.tag_name().name() == "ZoneGroup")
     {
+        // ZoneGroup elements are siblings in the protocol.  Reject nesting so
+        // a member can never be attributed to several ancestor groups.
+        if g.ancestors()
+            .skip(1)
+            .any(|n| n.is_element() && n.tag_name().name() == "ZoneGroup")
+            || groups.len() == MAX_GROUPS
+        {
+            debug!("invalid or oversized ZoneGroupState");
+            return Vec::new();
+        }
         let Some(coordinator) = g.attribute("Coordinator") else {
             continue;
         };
         let mut members = Vec::new();
-        for m in g.descendants().filter(|n| {
-            let name = n.tag_name().name();
-            // Satellites are bonded sub-units nested inside a member;
-            // fold them in as invisible members so their SSDP entries
-            // get filtered like any other invisible zone.
-            name == "ZoneGroupMember" || name == "Satellite"
-        }) {
+        // Only accept members directly owned by this group and satellites
+        // directly owned by those members.  In particular, do not traverse
+        // into a nested group.
+        let members_and_satellites = g
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "ZoneGroupMember")
+            .flat_map(|member| {
+                std::iter::once(member).chain(
+                    member
+                        .children()
+                        .filter(|n| n.is_element() && n.tag_name().name() == "Satellite"),
+                )
+            });
+        for m in members_and_satellites {
             let Some(uuid) = m.attribute("UUID") else {
                 continue;
             };
+            let zone_name = m.attribute("ZoneName").unwrap_or("");
+            let location = m.attribute("Location").unwrap_or("");
+            member_count += 1;
+            copied_attribute_bytes = copied_attribute_bytes
+                .saturating_add(uuid.len())
+                .saturating_add(zone_name.len())
+                .saturating_add(location.len());
+            if member_count > MAX_MEMBERS || copied_attribute_bytes > MAX_COPIED_ATTRIBUTE_BYTES {
+                debug!("ZoneGroupState member allocation budget exceeded");
+                return Vec::new();
+            }
             // IsZoneBridge covers BRIDGE/BOOST units — no audio output,
             // never a valid target (SoCo excludes them from visible
             // zones the same way, independently of Invisible).
@@ -125,8 +164,8 @@ pub fn parse_zone_group_state(xml: &str) -> Vec<ZoneGroup> {
                 || m.attribute("IsZoneBridge").map(|v| v == "1").unwrap_or(false);
             members.push(ZoneMember {
                 uuid: uuid.to_string(),
-                zone_name: m.attribute("ZoneName").unwrap_or("").to_string(),
-                location: m.attribute("Location").unwrap_or("").to_string(),
+                zone_name: zone_name.to_string(),
+                location: location.to_string(),
                 invisible,
             });
         }
@@ -469,6 +508,30 @@ mod tests {
         let groups = parse_zone_group_state(xml);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members[0].zone_name, "Den");
+    }
+
+    #[test]
+    fn rejects_nested_groups_without_copying_descendant_members() {
+        let xml = r#"<ZoneGroupState><ZoneGroups>
+<ZoneGroup Coordinator="OUTER">
+  <ZoneGroup Coordinator="INNER">
+    <ZoneGroupMember UUID="INNER" ZoneName="Kitchen" Location="http://speaker/desc.xml"/>
+  </ZoneGroup>
+</ZoneGroup>
+</ZoneGroups></ZoneGroupState>"#;
+        assert!(parse_zone_group_state(xml).is_empty());
+    }
+
+    #[test]
+    fn rejects_topologies_over_the_member_budget() {
+        let mut xml = String::from(
+            "<ZoneGroupState><ZoneGroups><ZoneGroup Coordinator=\"RINCON_A\">",
+        );
+        for i in 0..=1024 {
+            xml.push_str(&format!("<ZoneGroupMember UUID=\"RINCON_{i}\"/>"));
+        }
+        xml.push_str("</ZoneGroup></ZoneGroups></ZoneGroupState>");
+        assert!(parse_zone_group_state(&xml).is_empty());
     }
 
     #[test]

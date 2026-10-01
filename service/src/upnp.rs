@@ -254,10 +254,13 @@ pub fn get_zone_group_state(control_url: &str) -> Result<String> {
 </u:GetZoneGroupState>
 </s:Body>
 </s:Envelope>"#;
-    let resp = soap_post(
+    // Topology is supplied by an unauthenticated LAN peer.  Keep the wire
+    // response bounded before parsing or entity-decoding it.
+    let resp = soap_post_with_limit(
         control_url,
         "urn:schemas-upnp-org:service:ZoneGroupTopology:1#GetZoneGroupState",
         body,
+        1024 * 1024,
     )?;
     let inner = crate::gena::find_tag_text(&resp, "ZoneGroupState")
         .ok_or_else(|| anyhow!("ZoneGroupState missing in response"))?;
@@ -306,6 +309,15 @@ pub fn encode_stream_uri(stream_uri: &str) -> String {
 // -----------------------------------------------------------------------------
 
 fn soap_post(control_url: &str, soap_action: &str, body: &str) -> Result<String> {
+    soap_post_with_limit(control_url, soap_action, body, usize::MAX)
+}
+
+fn soap_post_with_limit(
+    control_url: &str,
+    soap_action: &str,
+    body: &str,
+    response_limit: usize,
+) -> Result<String> {
     let url = url::Url::parse(control_url).context("parsing control URL")?;
     let host = url.host_str().ok_or_else(|| anyhow!("missing host"))?;
     let port = url.port().unwrap_or(80);
@@ -346,7 +358,16 @@ fn soap_post(control_url: &str, soap_action: &str, body: &str) -> Result<String>
     stream.flush()?;
 
     let mut buf = Vec::with_capacity(4096);
-    stream.read_to_end(&mut buf)?;
+    stream
+        .take(response_limit.saturating_add(1) as u64)
+        .read_to_end(&mut buf)?;
+    if buf.len() > response_limit {
+        return Err(anyhow!(
+            "SOAP {} response exceeds {} bytes",
+            soap_action,
+            response_limit
+        ));
+    }
 
     // Split head/body on bytes, then peel chunked transfer-encoding if
     // present. Sonos chunks HTTP/1.1 responses (same behavior ssdp.rs's
