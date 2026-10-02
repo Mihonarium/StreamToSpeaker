@@ -41,6 +41,11 @@ pub enum Incoming {
 pub struct ChannelWriter {
     ws: Arc<WsWriter>,
     cipher: Mutex<Option<SendCipher>>,
+    /// Set while an in-band re-handshake runs: ordinary sends are dropped
+    /// (the spec forbids new application messages until the next
+    /// activation, and anything encrypted under the old keys after
+    /// message 2 would break the session).
+    rekeying: std::sync::atomic::AtomicBool,
 }
 
 impl ChannelWriter {
@@ -50,6 +55,14 @@ impl ChannelWriter {
     }
 
     pub fn send_json_str(&self, text: &str) -> Result<()> {
+        if self.is_rekeying() {
+            return Ok(());
+        }
+        self.send_json_forced(text)
+    }
+
+    /// Send even while re-keying (the handshake messages themselves).
+    pub fn send_json_forced(&self, text: &str) -> Result<()> {
         let mut guard = self.cipher.lock().map_err(|_| anyhow!("channel poisoned"))?;
         match guard.as_mut() {
             Some(c) => {
@@ -70,6 +83,9 @@ impl ChannelWriter {
 
     /// Send a binary message whose first byte is its message type.
     pub fn send_binary(&self, data: &[u8]) -> Result<()> {
+        if self.is_rekeying() {
+            return Ok(());
+        }
         let mut guard = self.cipher.lock().map_err(|_| anyhow!("channel poisoned"))?;
         match guard.as_mut() {
             Some(c) => {
@@ -81,6 +97,28 @@ impl ChannelWriter {
             }
             None => self.ws.send_binary(data),
         }
+    }
+
+    pub fn set_rekeying(&self, on: bool) {
+        self.rekeying.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_rekeying(&self) -> bool {
+        self.rekeying.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Send a JSON message under the current keys and install `next`
+    /// atomically, so no other sender can slip a message in between.
+    pub fn send_json_then_swap(&self, text: &str, next: SendCipher) -> Result<()> {
+        let mut guard = self.cipher.lock().map_err(|_| anyhow!("channel poisoned"))?;
+        let c = guard.as_mut().ok_or_else(|| anyhow!("re-handshake on an unencrypted channel"))?;
+        let mut pt = Vec::with_capacity(text.len() + 1);
+        pt.push(MSG_JSON);
+        pt.extend_from_slice(text.as_bytes());
+        let ct = c.encrypt(&pt)?;
+        self.ws.send_binary(&ct)?;
+        *guard = Some(next);
+        Ok(())
     }
 
     /// Install new transport keys (after a re-handshake).
@@ -251,6 +289,7 @@ pub fn channel(ws_reader: WsReader, ws_writer: Arc<WsWriter>, cipher: Option<(Se
         Arc::new(ChannelWriter {
             ws: ws_writer,
             cipher: Mutex::new(send),
+            rekeying: std::sync::atomic::AtomicBool::new(false),
         }),
     )
 }

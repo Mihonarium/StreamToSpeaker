@@ -320,9 +320,13 @@ pub fn server_code(ctx: &PairingCtx<'_>, dynamic: bool, ask_code: &dyn Fn() -> O
     let deadline = Instant::now() + SERVER_ATTEMPT_TIMEOUT;
     let d = ctx.dialect;
     let sid = sid(d, &ctx.handshake_hash, ctx.pairing_index);
-    // client/pair-init (possibly after a pair-pending).
+    // client/pair-init (possibly after a pair-pending). A compliant client
+    // answers the activation at once, so don't hold the caller's
+    // "connecting" state for minutes; a pending (gesture-gated) attempt
+    // gets the full window.
+    let mut init_deadline = Instant::now() + Duration::from_secs(20);
     let init = loop {
-        match next(ctx, &["client/pair-init", "client/pair-pending"], deadline)? {
+        match next(ctx, &["client/pair-init", "client/pair-pending"], init_deadline.min(deadline))? {
             Next::Msg(v) if msg_type(&v) == "client/pair-init" => {
                 let idx = payload(&v).get("pairing_index").and_then(Value::as_u64).unwrap_or(0) as u32;
                 if idx < ctx.pairing_index {
@@ -330,7 +334,10 @@ pub fn server_code(ctx: &PairingCtx<'_>, dynamic: bool, ask_code: &dyn Fn() -> O
                 }
                 break v;
             }
-            Next::Msg(_) => continue,
+            Next::Msg(_) => {
+                init_deadline = deadline; // pair-pending: wait for the gesture
+                continue;
+            }
             Next::Abort(r) => return Ok(PairOutcome::Aborted(r)),
             Next::Leave(_) => bail!("client sent server/activate"),
         }

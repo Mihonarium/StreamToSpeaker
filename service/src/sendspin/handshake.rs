@@ -332,10 +332,9 @@ pub fn client_rehandshake(
     }
     hs.set_psk(&psk.psk);
     let msg2 = hs.write_message_2(b"{}")?;
-    writer.send_json_str(&handshake_text(&msg2))?;
     let h = hs.handshake_hash();
     let (send, recv) = hs.into_transport()?.split();
-    writer.swap_cipher(send);
+    writer.send_json_then_swap(&handshake_text(&msg2), send)?;
     reader.swap_cipher(recv);
     Ok((psk, h))
 }
@@ -355,7 +354,7 @@ pub fn server_rehandshake(
     let mut hs = Handshake::initiator(suite, server_private, &client_pub, previous_hash, &psk.psk);
     let p1 = json!({ "psk_id": psk.psk_id, "psk_category": psk.category.wire() }).to_string();
     let msg1 = hs.write_message_1(p1.as_bytes())?;
-    writer.send_json_str(&handshake_text(&msg1))?;
+    writer.send_json_forced(&handshake_text(&msg1))?;
     loop {
         match reader.recv()? {
             Incoming::Json { value, .. } if msg_type(&value) == "noise/handshake" => {

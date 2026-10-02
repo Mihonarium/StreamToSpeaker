@@ -124,6 +124,15 @@ impl ActiveSession {
         }
     }
 
+    /// The speaker ended the session itself in a way that rules out an
+    /// automatic reconnect (Sendspin goodbye such as "another_server").
+    pub fn ended_by_speaker(&self) -> Option<String> {
+        match self {
+            ActiveSession::Sendspin(s) => s.ended_by_speaker(),
+            _ => None,
+        }
+    }
+
     /// True if the session has died mid-stream (dropped receiver). UPnP
     /// is HTTP-pull (the speaker reconnects on its own), so only the
     /// AirPlay push paths report death here.
@@ -1095,6 +1104,23 @@ impl App {
                         continue;
                     }
                     if app.connecting.lock().unwrap().is_some() {
+                        continue;
+                    }
+
+                    // Did the speaker hand itself to something else? Then
+                    // end our session quietly instead of fighting for it.
+                    let ended = {
+                        let mut guard = app.session.lock().unwrap();
+                        let reason = guard.as_ref().and_then(|s| s.ended_by_speaker());
+                        reason.and_then(|r| guard.take().map(|s| (s, r)))
+                    };
+                    if let Some((s, reason)) = ended {
+                        let name = s.friendly_name();
+                        s.stop();
+                        app.record_error(match reason.as_str() {
+                            "another_server" => format!("{} switched to another source.", name),
+                            _ => format!("{} ended the stream ({}).", name, reason.replace('_', " ")),
+                        });
                         continue;
                     }
 

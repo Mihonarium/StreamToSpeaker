@@ -31,7 +31,7 @@ use mdns_sd::{ServiceEvent, ServiceInfo};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -251,6 +251,13 @@ struct Shared {
     volume: AtomicU32,
     /// Format being streamed (for the UI / logs).
     format: Mutex<Option<AudioFormat>>,
+    /// The speaker ended the session with a goodbye that rules out an
+    /// automatic reconnect (another server, shutdown, …).
+    ended: Mutex<Option<String>>,
+    /// Current send-ahead, µs (grows when the player asks for more buffer).
+    lead_us: AtomicI64,
+    extra_latency_ms: u32,
+    buffer_capacity: u64,
 }
 
 /// A live connection streaming to one player.
@@ -294,10 +301,15 @@ impl PlayerSession {
             can_mute: AtomicBool::new(false),
             volume: AtomicU32::new(up.state.volume.unwrap_or(100)),
             format: Mutex::new(None),
+            ended: Mutex::new(None),
+            lead_us: AtomicI64::new(0),
+            extra_latency_ms,
+            buffer_capacity: hello.buffer_capacity,
         });
         update_capabilities(&shared, &hello, &up.state);
 
         let fmt = choose_format(&hello.formats).ok_or_else(|| {
+            up.writer.close();
             StartError::Other(anyhow!(
                 "{} offers no audio format we can produce (formats: {:?})",
                 hello.name,
@@ -316,6 +328,7 @@ impl PlayerSession {
             up.dialect
         );
         *shared.format.lock().unwrap() = Some(fmt.clone());
+        shared.lead_us.store(lead_us, Ordering::SeqCst);
 
         let mut threads = Vec::new();
         let events = up.events.take().expect("events");
@@ -335,7 +348,7 @@ impl PlayerSession {
                 std::thread::Builder::new()
                     .name("sendspin-player-audio".into())
                     .spawn(move || {
-                        if let Err(e) = audio_loop(&sh, samples_rx, fmt2, lead_us) {
+                        if let Err(e) = audio_loop(&sh, samples_rx, fmt2) {
                             if !sh.stop.load(Ordering::SeqCst) {
                                 warn!("Sendspin audio sender stopped: {:#}", e);
                                 sh.dead.store(true, Ordering::SeqCst);
@@ -372,22 +385,32 @@ impl PlayerSession {
         if self.shared.stop.swap(true, Ordering::SeqCst) {
             return;
         }
-        let _ = self.shared.writer.send_json(&proto::stream_end_player(now_us()));
-        self.shared.writer.close();
+        // Let the sender finish its chunk first: nothing may follow
+        // stream/end.
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
+        let _ = self.shared.writer.send_json(&proto::stream_end_player(now_us()));
+        self.shared.writer.close();
     }
 
+    /// The connection dropped and a reconnect may bring it back.
     pub fn is_dead(&self) -> bool {
-        self.shared.dead.load(Ordering::SeqCst)
+        self.shared.dead.load(Ordering::SeqCst) && self.ended_by_speaker().is_none()
+    }
+
+    /// The speaker ended the session itself (it switched to another
+    /// server, is shutting down, …): reason, if so. No auto-reconnect.
+    pub fn ended_by_speaker(&self) -> Option<String> {
+        self.shared.ended.lock().unwrap().clone()
     }
 
     pub fn set_volume_pct(&self, pct: u32) -> Result<()> {
         if !self.shared.can_volume.load(Ordering::SeqCst) {
             bail!("this speaker does not accept volume changes");
         }
-        self.shared.volume.store(pct.min(100), Ordering::SeqCst);
+        let pct = pct.min(100);
+        self.shared.volume.store(pct, Ordering::SeqCst);
         self.shared.writer.send_json(&proto::player_command_volume(pct))
     }
 
@@ -497,9 +520,11 @@ fn bring_up(
             let (reader, writer) = channel::channel(ws_r, ws_w, None);
             writer.send_json(&proto::legacy_server_hello(&server_id, server_name, &roles))?;
             let events = spawn_pump(reader, "player", Box::new(|_, _| None));
+            let guard = CloseGuard(Some(writer.clone()));
             let state_msg = wait_for(&writer, &events, Duration::from_secs(10), "the speaker's state", &|v| msg_type(v) == "client/state")?;
             let state = proto::parse_player_state(payload(&state_msg));
             let _ = writer.send_json(&proto::group_update(true, &group_id(), server_name));
+            guard.disarm();
             Ok(BringUp {
                 writer,
                 events: Some(events),
@@ -556,6 +581,7 @@ fn bring_up(
                 })
             };
             let events = spawn_pump(hs.reader, "player", hook);
+            let guard = CloseGuard(Some(writer.clone()));
 
             writer.send_json(&proto::server_hello(server_name))?;
             let hello_msg = wait_for(&writer, &events, Duration::from_secs(10), "client/hello", &|v| msg_type(v) == "client/hello")?;
@@ -685,6 +711,7 @@ fn bring_up(
                     merge_state(&mut state, &upd);
                 }
             }
+            guard.disarm();
             Ok(BringUp {
                 writer,
                 events: Some(events),
@@ -693,6 +720,24 @@ fn bring_up(
                 hello,
                 state,
             })
+        }
+    }
+}
+
+/// Closes a half-built connection on error paths (the reader thread
+/// would otherwise keep the socket open).
+struct CloseGuard(Option<Arc<ChannelWriter>>);
+
+impl CloseGuard {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        if let Some(w) = self.0.take() {
+            w.close();
         }
     }
 }
@@ -745,7 +790,7 @@ pub fn choose_format(formats: &[AudioFormat]) -> Option<AudioFormat> {
 pub fn compute_lead_us(state: &PlayerState, extra_ms: u32, buffer_capacity: u64, fmt: &AudioFormat) -> i64 {
     let min_buffer = state.min_buffer_ms.unwrap_or(500) as i64;
     let delay = state.output_delay_ms.unwrap_or(0) as i64;
-    let mut lead_ms = (min_buffer + delay + extra_ms as i64).clamp(150, 6_000);
+    let mut lead_ms = (min_buffer + delay + extra_ms as i64).clamp(150, 12_000);
     if buffer_capacity > 0 {
         // Chunks in flight ≈ lead worth of audio (PCM bound; FLAC is smaller).
         let bytes_per_ms = (fmt.sample_rate as u64 * fmt.channels as u64 * (fmt.bit_depth as u64 / 8)) as f64 / 1000.0;
@@ -779,6 +824,10 @@ fn control_loop(sh: Arc<Shared>, events: Receiver<Event>, hello: PlayerHello) {
                     {
                         let mut cur = sh.state.lock().unwrap();
                         merge_state(&mut cur, &st);
+                        if let Some(fmt) = sh.format.lock().unwrap().clone() {
+                            let lead = compute_lead_us(&cur, sh.extra_latency_ms, sh.buffer_capacity, &fmt);
+                            sh.lead_us.store(lead, Ordering::SeqCst);
+                        }
                     }
                     update_capabilities(&sh, &hello, &st);
                     if st.available == Some(false) {
@@ -788,6 +837,10 @@ fn control_loop(sh: Arc<Shared>, events: Receiver<Event>, hello: PlayerHello) {
                 "client/goodbye" => {
                     let reason = payload(&value).get("reason").and_then(Value::as_str).unwrap_or("?");
                     info!("Sendspin: {} said goodbye ({})", hello.name, reason);
+                    if reason != "restart" {
+                        // Spec: no automatic reconnect for these reasons.
+                        *sh.ended.lock().unwrap() = Some(reason.to_string());
+                    }
                     sh.dead.store(true, Ordering::SeqCst);
                     sh.writer.close();
                     return;
@@ -899,7 +952,8 @@ fn encode_pcm(samples: &[i16], bit_depth: u16) -> Vec<u8> {
     out
 }
 
-fn audio_loop(sh: &Shared, rx: Receiver<PcmFrame>, fmt: AudioFormat, lead_us: i64) -> Result<()> {
+fn audio_loop(sh: &Shared, rx: Receiver<PcmFrame>, fmt: AudioFormat) -> Result<()> {
+    let mut lead_us = sh.lead_us.load(Ordering::SeqCst);
     let rate = fmt.sample_rate as i64;
     let ch = fmt.channels as usize;
     let chunk_frames = (fmt.sample_rate / 50) as usize; // 20 ms
@@ -925,6 +979,14 @@ fn audio_loop(sh: &Shared, rx: Receiver<PcmFrame>, fmt: AudioFormat, lead_us: i6
     loop {
         if sh.stop.load(Ordering::SeqCst) {
             return Ok(());
+        }
+        // The player asked for more buffer (min_buffer / output delay):
+        // push the timeline later by the difference. A smaller lead is kept
+        // as is — moving earlier would overlap audio already sent.
+        let wanted = sh.lead_us.load(Ordering::SeqCst);
+        if wanted > lead_us + 20_000 {
+            anchor_us += wanted - lead_us;
+            lead_us = wanted;
         }
         let ts = anchor_us + frames_sent * 1_000_000 / rate;
         let send_at = ts - lead_us;

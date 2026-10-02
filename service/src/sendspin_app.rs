@@ -168,7 +168,8 @@ impl App {
         if on {
             self.start_sendspin_source()
         } else {
-            if let Some(svc) = self.sendspin.source.lock().unwrap().take() {
+            let svc = self.sendspin.source.lock().unwrap().take();
+            if let Some(svc) = svc {
                 svc.stop();
             }
             Ok(())
@@ -214,7 +215,8 @@ impl App {
     }
 
     pub fn stop_sendspin(&self) {
-        if let Some(svc) = self.sendspin.source.lock().unwrap().take() {
+        let svc = self.sendspin.source.lock().unwrap().take();
+        if let Some(svc) = svc {
             svc.stop();
         }
     }
@@ -240,7 +242,7 @@ impl App {
                     note: Some(
                         "Sendspin speaker (for example an ESPHome or Music Assistant speaker). \
                          Selecting it streams to it directly; if Music Assistant is playing on it \
-                         at the time, this computer takes over."
+                         at the time, this computer normally takes over."
                             .to_string(),
                     ),
                 }

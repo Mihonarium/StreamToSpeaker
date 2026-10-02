@@ -88,7 +88,7 @@ impl SendspinConfig {
     }
 
     /// Insert or replace the record for `server_id`, evicting the least
-    /// recently used one beyond [`MAX_CLIENT_RECORDS`] (never `keep`).
+    /// recently used one beyond [`MAX_CLIENT_RECORDS`].
     pub fn store_server_pairing(&mut self, rec: ServerPairing) {
         self.server_pairings.retain(|r| r.server_id != rec.server_id);
         self.server_pairings.push(rec);

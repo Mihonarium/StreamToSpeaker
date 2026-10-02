@@ -87,7 +87,7 @@ struct Shared {
     next_conn: AtomicU64,
     state: Mutex<SourceState>,
     /// Code on display for an in-progress dynamic pairing: (code, server).
-    code: Mutex<Option<(String, String)>>,
+    code: Mutex<Option<(u64, String, String)>>,
     admitted: Mutex<Option<Admitted>>,
     last_event: Mutex<Option<(String, Instant)>>,
 }
@@ -155,7 +155,7 @@ impl SourceService {
 
     /// The 6-digit code to show while a server is pairing with us.
     pub fn pairing_code(&self) -> Option<(String, String)> {
-        self.shared.code.lock().unwrap().clone()
+        self.shared.code.lock().unwrap().as_ref().map(|(_, c, s)| (c.clone(), s.clone()))
     }
 
     /// A short status note (pairing results etc.), with its time.
@@ -240,8 +240,11 @@ fn handle_socket(sh: &Arc<Shared>, stream: TcpStream, peer: SocketAddr) -> Resul
             *sh.state.lock().unwrap() = SourceState::Waiting;
         }
     }
-    if sh.code.lock().unwrap().is_some() {
-        *sh.code.lock().unwrap() = None;
+    {
+        let mut code = sh.code.lock().unwrap();
+        if code.as_ref().map(|(id, _, _)| *id) == Some(conn_id) {
+            *code = None;
+        }
     }
     result
 }
@@ -379,6 +382,8 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
         let resolver = resolver.clone();
         Box::new(move |reader: &mut super::channel::ChannelReader, msg: &Value| {
             let prev = *h_shared.lock().unwrap();
+            // No application messages from now until the next activation.
+            writer.set_rekeying(true);
             let res = handshake::client_rehandshake(reader, &writer, msg, &prev, &server_id, &client_priv, suite, &resolver);
             Some(Event::Rehandshake(match res {
                 Ok((psk, h)) => {
@@ -403,6 +408,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
         signal: Mutex::new(None),
     });
     let _alive_guard = AliveGuard(conn.clone());
+    let _close_guard = CloseGuard(writer.clone());
 
     // server/hello → client/hello.
     let hello = expect(&events, "server/hello", Duration::from_secs(10))?;
@@ -417,6 +423,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
     let mut admitted = false;
     let mut pairing_index: u32 = 0;
     let mut helpers_started = false;
+    let mut start_pending = false;
     loop {
         if sh.stop.load(Ordering::SeqCst) {
             let _ = writer.send_json(&proto::client_goodbye("shutdown"));
@@ -445,6 +452,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
             Event::Binary { .. } => {}
             Event::Json { value, received_at } => match msg_type(&value) {
                 "server/hello" => {
+                    writer.set_rekeying(false);
                     // aiosendspin 9.x re-exchanges hellos after a re-handshake.
                     if let Some(n) = payload(&value).get("name").and_then(Value::as_str) {
                         server_name = n.to_string();
@@ -452,6 +460,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                     send_hello(sh, &conn, category == PskCategory::LongTerm)?;
                 }
                 "server/activate" => {
+                    writer.set_rekeying(false);
                     let mut pending = Some(value);
                     while let Some(v) = pending.take() {
                         let act = proto::parse_activation(payload(&v));
@@ -496,7 +505,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                         if act.pairing {
                             pairing_index += 1;
                             set_state(sh, conn_id, SourceState::NeedsPairing { server: server_name.clone() });
-                            pending = run_pairing(sh, &conn, &events, &act, category, pairing_index, &h_shared, suite, &server_id, &server_name)?;
+                            pending = run_pairing(sh, conn_id, &conn, &events, &act, category, pairing_index, &h_shared, suite, &server_id, &server_name)?;
                             continue;
                         }
                         // Steady state: helpers + availability.
@@ -535,6 +544,11 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                     if became_synced && conn.source_active.load(Ordering::SeqCst) && !conn.state_sent.load(Ordering::SeqCst) {
                         conn.send_state();
                     }
+                    if became_synced && start_pending && conn.source_active.load(Ordering::SeqCst) {
+                        start_pending = false;
+                        conn.start_stream()?;
+                        set_state(sh, conn_id, SourceState::Connected { server: server_name.clone(), streaming: true });
+                    }
                 }
                 "server/command" => {
                     if let Some(cmd) = payload(&value).get("source").and_then(|s| s.get("command")).and_then(Value::as_str) {
@@ -544,11 +558,15 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                                     conn.start_stream()?;
                                     note(sh, format!("{} started playing this PC's audio", server_name));
                                     set_state(sh, conn_id, SourceState::Connected { server: server_name.clone(), streaming: true });
+                                } else if conn.source_active.load(Ordering::SeqCst) {
+                                    // Start as soon as the clock has synced.
+                                    start_pending = true;
                                 } else {
-                                    debug!("ignoring source start: role inactive or clock not synced");
+                                    debug!("ignoring source start: source role not active");
                                 }
                             }
                             "stop" => {
+                                start_pending = false;
                                 conn.stop_stream();
                                 if category == PskCategory::LongTerm {
                                     set_state(sh, conn_id, SourceState::Connected { server: server_name.clone(), streaming: false });
@@ -574,6 +592,16 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                 other => debug!("Sendspin source: ignoring {}", other),
             },
         }
+    }
+}
+
+/// Closes the socket when the handler returns on any path (the reader
+/// thread would otherwise keep it open until the peer sends something).
+struct CloseGuard(Arc<ChannelWriter>);
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -697,6 +725,7 @@ fn set_state(sh: &Shared, conn_id: u64, st: SourceState) {
 #[allow(clippy::too_many_arguments)]
 fn run_pairing(
     sh: &Shared,
+    conn_id: u64,
     conn: &Conn,
     events: &Receiver<Event>,
     act: &Activation,
@@ -736,7 +765,7 @@ fn run_pairing(
                     // a headless install can still be paired.
                     info!("Sendspin source: pairing code for {} is {}", server_name, c);
                 }
-                *sh.code.lock().unwrap() = code.map(|c| (c, server_name.to_string()));
+                *sh.code.lock().unwrap() = code.map(|c| (conn_id, c, server_name.to_string()));
             };
             pairing::client_dynamic_code(&ctx, digits, &show)
         }
@@ -784,9 +813,10 @@ fn spawn_time_sync(conn: Arc<Conn>) {
 }
 
 /// Capture timestamps. Servers expect them to be sample-continuous —
-/// Music Assistant's bridge inserts silence when a timestamp runs more than
-/// 10 ms ahead of the previous chunk's end and drops a chunk that runs
-/// 10 ms behind — so the timeline is the sample count since an anchor.
+/// aiosendspin's source bridge (Music Assistant 2.10) inserts silence when
+/// a timestamp runs more than 10 ms past the previous chunk's end and drops
+/// a chunk that runs 10 ms behind — so the timeline is the sample count
+/// since an anchor.
 /// Frame arrival (jittery by scheduling) only steers it: a low-passed
 /// error slews the anchor in sub-millisecond steps, which absorbs drift
 /// between the audio clock and ours, and only a real stall (half a second)

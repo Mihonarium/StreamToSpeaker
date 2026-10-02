@@ -7,8 +7,8 @@
 //!   descriptors, `trust_level` in `client/hello`, `client_stream/*`,
 //!   `static_delay_ms`, 9-byte binary audio header, hellos re-exchanged
 //!   after a re-handshake, Noise message 1 without `psk_category`.
-//! * [`Dialect::Spec`] — the current specification text (sendspin-cpp,
-//!   newer ESPHome firmware): `dynamic_pairing_code` / `static_pairing_code`
+//! * [`Dialect::Spec`] — the current specification text (current sendspin-cpp
+//!   and aiosendspin development code): `dynamic_pairing_code` / `static_pairing_code`
 //!   keyed in an object, `client-stream/*`, `output_delay_ms`, 13-byte
 //!   audio header carrying `send_ahead`, `psk_category` in message 1.
 //!
