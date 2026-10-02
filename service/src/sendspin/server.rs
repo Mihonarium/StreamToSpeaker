@@ -668,9 +668,22 @@ fn bring_up(
             let state_msg = wait_for(&writer, &events, Duration::from_secs(15), "the speaker's state", &|v| {
                 msg_type(v) == "client/state"
             })?;
-            let state = proto::parse_player_state(payload(&state_msg));
+            let mut state = proto::parse_player_state(payload(&state_msg));
             if state.available == Some(false) {
-                return Err(anyhow!("{} is busy with another source right now", hello.name).into());
+                // Current players report unavailable until their clock has
+                // converged; give the time sync a moment before deciding
+                // the speaker is busy with something else.
+                let deadline = Instant::now() + Duration::from_secs(8);
+                while state.available == Some(false) {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(anyhow!("{} is busy with another source right now", hello.name).into());
+                    }
+                    let next = wait_for(&writer, &events, left, "the speaker to become available", &|v| msg_type(v) == "client/state")
+                        .map_err(|_| anyhow!("{} is busy with another source right now", hello.name))?;
+                    let upd = proto::parse_player_state(payload(&next));
+                    merge_state(&mut state, &upd);
+                }
             }
             Ok(BringUp {
                 writer,

@@ -161,12 +161,21 @@ fn next(ctx: &PairingCtx<'_>, expected: &[&str], deadline: Instant) -> Result<Ne
             Err(RecvTimeoutError::Disconnected) => bail!("connection closed during pairing"),
         };
         match ev {
-            Event::Json { value, .. } => {
+            Event::Json { value, received_at } => {
+                let received_us = super::instant_to_us(received_at);
                 let t = msg_type(&value);
                 if expected.contains(&t) {
                     return Ok(Next::Msg(value));
                 }
                 match t {
+                    // Server side: keep answering the player's clock sync
+                    // while the pairing exchange runs.
+                    "client/time" => {
+                        if let Some(t1) = payload(&value).get("client_transmitted").and_then(Value::as_i64) {
+                            let _ = ctx.writer.send_json(&super::proto::server_time(t1, received_us, super::now_us()));
+                        }
+                        continue;
+                    }
                     "pair/abort" => {
                         let reason = payload(&value).get("reason").and_then(Value::as_str).unwrap_or("unknown");
                         return Ok(Next::Abort(reason.to_string()));
