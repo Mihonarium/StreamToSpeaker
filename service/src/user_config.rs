@@ -165,6 +165,10 @@ pub struct UserConfig {
     /// "Later" on the update banner: hidden until this unix time.
     #[serde(default)]
     pub update_banner_hidden_until: Option<u64>,
+    /// Sendspin (Music Assistant) identities, pairing records and
+    /// settings — see `sendspin::store`.
+    #[serde(default)]
+    pub sendspin: crate::sendspin::store::SendspinConfig,
 }
 
 /// Default AirPlay buffer — iTunes' 2 s (88200 samples at 44.1 kHz).
