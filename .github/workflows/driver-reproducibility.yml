@@ -94,6 +94,16 @@ jobs:
         with:
           ref: ${{ inputs.commit || github.sha }}
 
+      # The comparison scripts come from the commit this workflow runs from,
+      # not from `commit`: an older certified commit predates them.
+      - name: Check out the comparison scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: repro-tools
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
       # Identity of the checkout; the build step then proves the tree it
       # compiles is byte-identical to it.
       - name: Compute driver source hash
@@ -230,7 +240,7 @@ jobs:
           Copy-Item -Recurse driver (Join-Path $root "driver")
           Copy-Item -Recurse include (Join-Path $root "include")
           Write-Host "Source copied to $root"
-          python .github/scripts/repro_compare.py tree . $root
+          python repro-tools/.github/scripts/repro_compare.py tree . $root
           if ($LASTEXITCODE -ne 0) { throw "the build tree differs from the checkout whose source hash was verified" }
           Write-Host "driver.h: $((Select-String -Path (Join-Path $root 'driver\driver.h') -Pattern 'STREAM_TO_SPEAKER_DRIVER_BUILD').Line.Trim())"
 
@@ -316,7 +326,7 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          python .github/scripts/repro_compare.py sys released/stripped/StreamToSpeaker.sys fresh/StreamToSpeaker.sys --json compare-sys.json
+          python repro-tools/.github/scripts/repro_compare.py sys released/stripped/StreamToSpeaker.sys fresh/StreamToSpeaker.sys --json compare-sys.json
           exit $LASTEXITCODE
 
       - name: Compare StreamToSpeaker.inf
@@ -324,7 +334,7 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          python .github/scripts/repro_compare.py inf released/lab/StreamToSpeaker.inf fresh/StreamToSpeaker.inf --json compare-inf.json
+          python repro-tools/.github/scripts/repro_compare.py inf released/lab/StreamToSpeaker.inf fresh/StreamToSpeaker.inf --json compare-inf.json
           exit $LASTEXITCODE
 
       - name: Summary
