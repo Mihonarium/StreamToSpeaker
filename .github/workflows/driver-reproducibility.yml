@@ -34,6 +34,16 @@
 # With `installer_tag` (a v* release), the setup exe of that release is
 # unpacked (innounp, pinned by hash) and its {app}\driver files must be
 # byte-identical to the shipped package, with no test certificate.
+# `installer_name` picks that asset by exact name (default: the release's
+# only StreamToSpeakerSetup-*.exe) and `installer_sha256`, when given, is
+# the hash the downloaded exe must have.
+#
+# Also a reusable workflow (workflow_call, same inputs): build.yml's
+# `verify-driver` job runs it on v* tags against the unsigned installer the
+# `package` job just attached, and `sign-release` waits for it.
+#
+# Only certified driver-v* releases (manifest `lab_zip`) can be checked;
+# any other release fails at the manifest step.
 #
 # The job fails when a normalised comparison differs, when the shipped
 # package does not verify, or when the installer check fails. Job outputs:
@@ -45,7 +55,10 @@ name: Driver reproducibility
 
 on:
   # Pushes that touch the check itself re-run it with the defaults below.
+  # Branches only: path filters are not evaluated for tag pushes, and v*
+  # tags already run it through build.yml's verify-driver job.
   push:
+    branches: ["**"]
     paths:
       - ".github/workflows/driver-reproducibility.yml"
       - ".github/scripts/repro_compare.py"
@@ -70,6 +83,49 @@ on:
         default: 'C:\build\src'
       installer_tag:
         description: "Optional v* release whose setup exe to unpack and check it bundles exactly this release's signed_zip (empty = skip)"
+        required: false
+        default: ""
+      installer_name:
+        description: "Exact setup exe asset name on installer_tag (empty = its only StreamToSpeakerSetup-*.exe)"
+        required: false
+        default: ""
+      installer_sha256:
+        description: "Expected SHA-256 of that setup exe (empty = check against its .sha256 asset if present)"
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      tag:
+        description: "driver-v* release whose lab package to compare against"
+        type: string
+        required: true
+      build_number:
+        description: "DriverBuildNumber to pin (the release's driver_build)"
+        type: string
+        required: true
+      commit:
+        description: "Commit to build (empty = the caller's commit)"
+        type: string
+        required: false
+        default: ""
+      build_root:
+        description: "Directory the source is copied to before building"
+        type: string
+        required: false
+        default: 'C:\build\src'
+      installer_tag:
+        description: "Optional v* release whose setup exe must bundle exactly this release's signed_zip"
+        type: string
+        required: false
+        default: ""
+      installer_name:
+        description: "Exact setup exe asset name on installer_tag"
+        type: string
+        required: false
+        default: ""
+      installer_sha256:
+        description: "Expected SHA-256 of that setup exe"
+        type: string
         required: false
         default: ""
 
@@ -102,14 +158,23 @@ jobs:
           IN_BUILD: ${{ inputs.build_number }}
           IN_ROOT: ${{ inputs.build_root }}
           IN_INSTALLER: ${{ inputs.installer_tag }}
+          IN_INAME: ${{ inputs.installer_name }}
+          IN_ISHA: ${{ inputs.installer_sha256 }}
         run: |
           $tag = if ($env:IN_TAG) { $env:IN_TAG } else { "driver-v1.1.0.209" }
           $build = if ($env:IN_BUILD) { $env:IN_BUILD } else { "209" }
           $root = if ($env:IN_ROOT) { $env:IN_ROOT } else { 'C:\build\src' }
           $installer = "$env:IN_INSTALLER".Trim()
+          $iname = "$env:IN_INAME".Trim()
+          $isha = "$env:IN_ISHA".Trim().ToLower()
           if ($installer -and $installer -notmatch '^v[0-9][0-9A-Za-z.+-]*$') { throw "installer_tag must be a v* release tag, got '$installer'" }
-          Write-Host "tag=$tag build_number=$build build_root=$root installer_tag=$installer"
+          if (($iname -or $isha) -and -not $installer) { throw "installer_name / installer_sha256 need installer_tag" }
+          if ($iname -and $iname -notmatch '^StreamToSpeakerSetup-[0-9A-Za-z.+-]+\.exe$') { throw "installer_name must be a StreamToSpeakerSetup-*.exe asset name, got '$iname'" }
+          if ($isha -and $isha -notmatch '^[0-9a-f]{64}$') { throw "installer_sha256 must be 64 hex digits, got '$isha'" }
+          Write-Host "tag=$tag build_number=$build build_root=$root installer_tag=$installer installer_name=$iname installer_sha256=$isha"
           "installer_tag=$installer" >> $env:GITHUB_OUTPUT
+          "installer_name=$iname" >> $env:GITHUB_OUTPUT
+          "installer_sha256=$isha" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "build_number=$build" >> $env:GITHUB_OUTPUT
           "build_root=$root" >> $env:GITHUB_OUTPUT
@@ -161,8 +226,11 @@ jobs:
           if ("$($m.driver_build)" -ne $env:BUILD_NUMBER) {
               throw "build_number input ($env:BUILD_NUMBER) differs from the manifest's driver_build ($($m.driver_build))"
           }
+          # Only certified releases carry the lab package this rebuild is
+          # pinned to; attestation-signed builds stamp driver.h and build in
+          # the runner workspace, which this check does not reproduce.
           $labZip = $m.lab_zip
-          if (-not $labZip) { $labZip = "StreamToSpeaker-Driver-$($m.driver_version)-lab-testsigned.zip" }
+          if (-not $labZip) { throw "release $env:TAG records no lab_zip (attestation-signed releases have none): this check can only verify certified driver releases" }
           gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern $labZip --output "released/$labZip" --clobber
           if ($LASTEXITCODE -ne 0) { throw "could not download $labZip from release $env:TAG" }
           $sha = (Get-FileHash "released/$labZip" -Algorithm SHA256).Hash.ToLower()
@@ -422,18 +490,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ITAG: ${{ steps.params.outputs.installer_tag }}
+          INAME: ${{ steps.params.outputs.installer_name }}
+          ISHA: ${{ steps.params.outputs.installer_sha256 }}
           INNOUNP_URL: https://github.com/jrathlev/InnoUnpacker-Windows-GUI/releases/download/oi_2_2_11/innounp-2.zip
           INNOUNP_SHA256: 851772538a041229102ad9964542d49dc00c74002e3091a70469c079ae368f52
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path installer | Out-Null
-          gh release download $env:ITAG --repo $env:GITHUB_REPOSITORY --pattern "StreamToSpeakerSetup-*" --dir installer --clobber
-          if ($LASTEXITCODE -ne 0) { throw "could not download the setup exe from release $env:ITAG" }
-          $exes = @(Get-ChildItem installer -Filter "StreamToSpeakerSetup-*.exe")
-          if ($exes.Count -ne 1) { throw "expected exactly one StreamToSpeakerSetup-*.exe on $env:ITAG, found $($exes.Count)" }
+          $pattern = if ($env:INAME) { $env:INAME } else { "StreamToSpeakerSetup-*.exe" }
+          gh release download $env:ITAG --repo $env:GITHUB_REPOSITORY --pattern $pattern --pattern "$pattern.sha256" --dir installer --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not download $pattern from release $env:ITAG" }
+          $exes = @(Get-ChildItem installer -Filter $pattern)
+          if ($exes.Count -ne 1) { throw "expected exactly one $pattern on $env:ITAG, found $($exes.Count)" }
           $exe = $exes[0]
           $sha = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
           Write-Host "$($exe.Name) sha256 $sha"
+          "exe=$($exe.Name)" >> $env:GITHUB_OUTPUT
+          "exe_sha256=$sha" >> $env:GITHUB_OUTPUT
+          if ($env:ISHA) {
+              if ($sha -ne $env:ISHA) { throw "$($exe.Name) on $env:ITAG hashes to $sha, expected $env:ISHA - not the installer this check was asked about" }
+              Write-Host "  matches the expected sha256"
+          }
           $sidecar = "$($exe.FullName).sha256"
           if (Test-Path $sidecar) {
               $want = ((Get-Content $sidecar -Raw).Trim() -split '\s+')[0].ToLower()
@@ -457,8 +534,6 @@ jobs:
           if ($sys.Count -ne 1) { Get-ChildItem -Recurse installer\unpacked | Select-Object FullName; throw "expected one StreamToSpeaker.sys in the installer, found $($sys.Count)" }
           $dir = $sys[0].DirectoryName
           Get-ChildItem $dir | ForEach-Object { Write-Host "  installer: $($_.Name) ($($_.Length) bytes)" }
-          "exe=$($exe.Name)" >> $env:GITHUB_OUTPUT
-          "exe_sha256=$sha" >> $env:GITHUB_OUTPUT
           "signature=$($sig.Status)" >> $env:GITHUB_OUTPUT
           $cer = @(Get-ChildItem $dir -Filter *.cer)
           "test_cert=$([bool]$cer.Count)".ToLower() >> $env:GITHUB_OUTPUT
@@ -580,7 +655,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: driver-reproducibility-${{ steps.params.outputs.tag }}
+          name: driver-reproducibility-${{ steps.params.outputs.tag }}${{ steps.params.outputs.installer_tag && format('-{0}', steps.params.outputs.installer_tag) || '' }}
           path: |
             fresh/
             released/stripped/

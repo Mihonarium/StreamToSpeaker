@@ -564,7 +564,10 @@ jobs:
 
   # -------------------------------------------------------------------
   # Tag-push release pipeline: build → sign-service → package →
-  # sign-release. Every EV signature goes through the central signing repo
+  # verify-driver → sign-release. verify-driver rebuilds the driver from the
+  # tagged source and proves the installer `package` produced bundles
+  # exactly that driver (driver-reproducibility.yml); nothing is signed
+  # unless it passes. Every EV signature goes through the central signing repo
   # (Mihonarium/signing, sign.yml) via .github/actions/request-signing:
   # dispatch with a release-asset URL + its hash, wait for the human
   # approval gate there, then verify + publish the signed bytes. Two
@@ -703,6 +706,12 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+    outputs:
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+      driver_build: ${{ steps.attested.outputs.build }}
+      installer_name: ${{ steps.iscc.outputs.name }}
+      installer_sha256: ${{ steps.attach.outputs.sha256 }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -756,12 +765,16 @@ jobs:
               }
               Copy-Item "$dc\devcon.exe" "$staging\devcon.exe" -Force
               Write-Host "Bundling Microsoft-signed (${{ steps.attested.outputs.kind }}) driver ${{ steps.attested.outputs.version }} (${{ steps.attested.outputs.tag }}); no test certificate shipped."
+              if ("${{ steps.attested.outputs.kind }}" -ne "certified") {
+                  Write-Host "##[warning]${{ steps.attested.outputs.tag }} is not a certified release: the driver reproducibility gate can only verify certified drivers, so verify-driver will fail and this release will not be signed."
+              }
           } else {
               foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "StreamToSpeaker.cer", "devcon.exe") {
                   Copy-Item "$dc\$name" "$staging\$name" -Force
               }
               $suffix = "-testsigned"
               Write-Host "##[warning]No Microsoft-signed driver matches this tag's driver source - shipping the TEST-SIGNED driver (users need testsigning mode). Run an HLK round (Driver certified) or the driver submission + attestation flow (docs/driver-signing.md), then tag again."
+              Write-Host "##[warning]Driver reproducibility gate SKIPPED: the bundled test-signed driver was built from this tag's source by the build job; there is no Microsoft-signed package to compare."
           }
 
           $base = "StreamToSpeakerSetup-${{ needs.build.outputs.version }}$suffix"
@@ -786,11 +799,13 @@ jobs:
           }
 
       - name: Attach installer + driver package to the release
+        id: attach
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
           $exe = "${{ steps.iscc.outputs.exe }}"
           $sha = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
           "$sha  ${{ steps.iscc.outputs.name }}" | Set-Content -Path "$exe.sha256" -Encoding ascii -NoNewline
           gh release upload $tag $exe "$exe.sha256" --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
@@ -807,13 +822,45 @@ jobs:
             "| --- | --- |"
             "| Installer | ``${{ steps.iscc.outputs.name }}`` (pre-signing sha256 ``$sha``) |"
             "| Driver | $( if ("${{ steps.attested.outputs.found }}" -eq "true") { "Microsoft-signed (${{ steps.attested.outputs.kind }}) ``${{ steps.attested.outputs.version }}`` (``${{ steps.attested.outputs.tag }}``)" } else { "**test-signed fallback** - requires testsigning mode" } ) |"
+            "| Reproducibility gate | $( if ("${{ steps.attested.outputs.found }}" -eq "true") { "verify-driver job" } else { "**skipped** (no Microsoft-signed package to compare)" } ) |"
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
-  # EV-sign the final setup exe and swap it into the release. Its .sha256
-  # sidecar (regenerated here) is the canonical download hash.
-  sign-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+  # Release gate: rebuild the driver from the tagged commit and check it
+  # against the driver-v* release `package` picked (certified tree guard,
+  # lab package, shipped Signed.zip), then unpack the unsigned installer
+  # `package` just attached (by exact name and sha256) and check its
+  # driver files are that Signed.zip byte for byte with no test
+  # certificate. Read-only, no secrets. Skipped only for the test-signed
+  # fallback, whose driver the build job compiled from this tag's source
+  # itself; package and sign-release log that loudly. An attestation-signed
+  # driver has no lab package to pin the rebuild to, so the check fails and
+  # the release stays unsigned (package warns).
+  verify-driver:
+    if: startsWith(github.ref, 'refs/tags/v') && needs.package.outputs.driver_found == 'true'
     needs: package
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package.outputs.driver_tag }}
+      build_number: ${{ needs.package.outputs.driver_build }}
+      commit: ${{ github.sha }}
+      installer_tag: ${{ github.ref_name }}
+      installer_name: ${{ needs.package.outputs.installer_name }}
+      installer_sha256: ${{ needs.package.outputs.installer_sha256 }}
+
+  # EV-sign the final setup exe and swap it into the release. Its .sha256
+  # sidecar (regenerated here) is the canonical download hash. Runs only
+  # when verify-driver passed, or when it was skipped because `package`
+  # explicitly fell back to the test-signed driver; it signs only the exact
+  # bytes `package` produced and verify-driver checked.
+  sign-release:
+    if: >-
+      !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
+      needs.package.result == 'success' &&
+      (needs.verify-driver.result == 'success' ||
+       (needs.verify-driver.result == 'skipped' && needs.package.outputs.driver_found == 'false'))
+    needs: [package, verify-driver]
     runs-on: windows-latest
     environment: request-signing
     timeout-minutes: 75
@@ -835,10 +882,17 @@ jobs:
           # asset URL is not fetchable by the signing workflow; the exe is
           # re-exposed to it as a workflow artifact instead.
           New-Item -ItemType Directory -Force -Path setup-unsigned | Out-Null
-          gh release download "${{ github.ref_name }}" --pattern "StreamToSpeakerSetup-*.exe" --dir setup-unsigned
+          $name = "${{ needs.package.outputs.installer_name }}"
+          if ($name -notlike "StreamToSpeakerSetup-*.exe") { throw "package reported no installer name" }
+          if ("${{ needs.package.outputs.driver_found }}" -ne "true") {
+              Write-Host "##[warning]Signing a TEST-SIGNED fallback installer; the driver reproducibility gate was skipped."
+          }
+          gh release download "${{ github.ref_name }}" --pattern $name --dir setup-unsigned
           if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
-          $exe = @(Get-ChildItem setup-unsigned -Filter "StreamToSpeakerSetup-*.exe")
-          if ($exe.Count -ne 1) { throw "expected exactly one setup exe asset on ${{ github.ref_name }}, found $($exe.Count)" }
+          $exe = @(Get-ChildItem setup-unsigned -Filter $name)
+          if ($exe.Count -ne 1) { throw "expected $name on ${{ github.ref_name }}, found $($exe.Count)" }
+          $sha = (Get-FileHash $exe[0].FullName -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne "${{ needs.package.outputs.installer_sha256 }}") { throw "$name on the release hashes to $sha, not the ${{ needs.package.outputs.installer_sha256 }} that package built and verify-driver checked" }
           "name=$($exe[0].Name)" >> $env:GITHUB_OUTPUT
           "path=$($exe[0].FullName)" >> $env:GITHUB_OUTPUT
 
@@ -856,6 +910,7 @@ jobs:
         with:
           source-run-id: ${{ github.run_id }}
           source-artifact: unsigned-setup-exe
+          expected-sha256: ${{ needs.package.outputs.installer_sha256 }}
           output-name: ${{ steps.asset.outputs.name }}
           sig-description: "Stream To Speaker Setup"
           token: ${{ secrets.SIGNING_REPO_TOKEN }}
