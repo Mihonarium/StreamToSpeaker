@@ -697,8 +697,9 @@ fn bring_up(
     }
 }
 
+/// We stream to one player at a time: one fixed solo group.
 fn group_id() -> String {
-    format!("sts-{}", &b64url(&x25519_public(&[7u8; 32]))[..8])
+    "stream-to-speaker".to_string()
 }
 
 /// Roles we activate: the player, plus metadata when offered.

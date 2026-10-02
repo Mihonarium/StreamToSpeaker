@@ -3344,8 +3344,8 @@ impl StreamToSpeakerApp {
                 Some(SourceState::NeedsPairing { server }) => (
                     format!(
                         "{} found this computer. To finish, open \u{201c}{}\u{201d} in Music Assistant's \
-                         settings and pair it — with the code this window shows, or the pairing \
-                         token below.",
+                         player settings and start its setup: a 6-digit code then appears here \
+                         to type in there.",
                         server, name
                     ),
                     p.warn,
@@ -3367,6 +3367,13 @@ impl StreamToSpeakerApp {
             }
             ui.add_space(sp::S);
             ui.label(egui::RichText::new("Pairing token").strong().color(p.text_primary));
+            ui.label(
+                egui::RichText::new(
+                    "Only needed for a Sendspin server that asks for a token instead of a code.",
+                )
+                .size(12.0)
+                .color(p.text_tertiary),
+            );
             let token = self.app.sendspin_pairing_token();
             let shown = if self.show_ma_token {
                 crate::sendspin::keys::format_token_for_display(&token)

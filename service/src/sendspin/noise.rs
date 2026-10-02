@@ -595,9 +595,8 @@ mod tests {
     }
 
     /// Cross-implementation vector generated with the Python `noiseprotocol`
-    /// library (the one aiosendspin uses), fixed static + ephemeral keys:
-    /// see the e2e test notes in `mod.rs`. Message bytes and handshake hash
-    /// must match exactly.
+    /// library (the one aiosendspin uses) from fixed static and ephemeral
+    /// keys. Message bytes and handshake hash must match exactly.
     #[test]
     fn matches_noiseprotocol_reference_vector() {
         let si: [u8; 32] = core::array::from_fn(|i| i as u8);
