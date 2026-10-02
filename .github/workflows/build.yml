@@ -784,7 +784,6 @@ jobs:
               .github/scripts/Write-DriverRecord.ps1 -StagingDir $staging -OutDir installer\out -Installer "$base.exe" `
                 -Kind test-signed -SourceHash "${{ needs.build.outputs.source_hash }}"
           }
-          "record=installer\out\$base.driver.json" >> $env:GITHUB_OUTPUT
 
       - name: Attach installer + driver package to the release
         shell: pwsh
@@ -809,42 +808,6 @@ jobs:
             "| Installer | ``${{ steps.iscc.outputs.name }}`` (pre-signing sha256 ``$sha``) |"
             "| Driver | $( if ("${{ steps.attested.outputs.found }}" -eq "true") { "Microsoft-signed (${{ steps.attested.outputs.kind }}) ``${{ steps.attested.outputs.version }}`` (``${{ steps.attested.outputs.tag }}``)" } else { "**test-signed fallback** - requires testsigning mode" } ) |"
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
-
-      # Separate step so a failure here (record upload, notes edit) can
-      # never block signing the installer.
-      - name: Record the bundled driver on the release
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
-          $tag = "${{ github.ref_name }}"
-          # The record of the bundled driver (hashes only) IS attached, and
-          # summarised in the release notes; see Write-DriverRecord.ps1.
-          $record = "${{ steps.iscc.outputs.record }}"
-          gh release upload $tag $record --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release upload of the driver record failed" }
-          $r = Get-Content $record -Raw | ConvertFrom-Json
-          $begin = "<!-- bundled-driver -->"; $end = "<!-- /bundled-driver -->"
-          $section = @($begin, "## Bundled driver", "")
-          if ($r.driver.package) {
-              $section += "``$($r.installer)`` bundles the Microsoft-signed ($($r.driver.kind)) driver ``$($r.driver.version)`` from [``$($r.driver.release)``](https://github.com/${{ github.repository }}/releases/tag/$($r.driver.release)): ``$($r.driver.package.name)``, sha256 ``$($r.driver.package.sha256)``."
-          } else {
-              $section += "``$($r.installer)`` bundles a **test-signed** driver (requires testsigning mode)."
-          }
-          $section += ""
-          $section += "| File | SHA256 |"
-          $section += "| --- | --- |"
-          foreach ($p in $r.files.PSObject.Properties) { $section += "| ``$($p.Name)`` | ``$($p.Value)`` |" }
-          $section += ""
-          $section += "Record: ``$(Split-Path $record -Leaf)``. The *Driver reproducibility* workflow rebuilds this driver from source and, given this release as ``installer_tag``, checks the installer's driver files against the package."
-          $section += $end
-          $body = gh release view $tag --json body -q .body
-          if ($LASTEXITCODE -ne 0) { throw "gh release view failed" }
-          $body = ($body -join "`n") -replace "(?s)\r?\n*$([regex]::Escape($begin)).*?$([regex]::Escape($end))", ""
-          $notes = Join-Path $env:RUNNER_TEMP "notes.md"
-          (($body.TrimEnd(), "", ($section -join "`n")) -join "`n") | Set-Content -Path $notes -Encoding utf8
-          gh release edit $tag --notes-file $notes
-          if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
 
   # EV-sign the final setup exe and swap it into the release. Its .sha256
   # sidecar (regenerated here) is the canonical download hash.
