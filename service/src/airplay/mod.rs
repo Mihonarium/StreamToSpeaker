@@ -42,6 +42,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod dmap;
 pub mod hap_pairing;
+pub mod metadata;
 pub mod pairing;
 pub mod rtp;
 pub mod rtsp;

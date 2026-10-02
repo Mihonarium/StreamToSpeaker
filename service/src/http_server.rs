@@ -1,7 +1,8 @@
 //! HTTP server.
 //!
 //! Two responsibilities:
-//!   1. `GET /stream.raw` — endless chunked stream of L16 PCM.
+//!   1. `GET /stream.raw` — endless stream of PCM WAV (with in-band ICY
+//!      track titles for renderers that ask for them, see [`IcyMetadata`]).
 //!   2. `NOTIFY ...` (also `POST` / `M-POST` if Sonos uses them) — GENA
 //!      event callbacks from the speaker.
 //!
@@ -13,7 +14,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{debug, info, warn};
 use std::io::Read;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -62,6 +63,174 @@ pub type LatencyAdjustCallback = Arc<dyn Fn(i32) -> i64 + Send + Sync>;
 /// (privacy mode). Consulted per request, so the user can flip the
 /// setting or switch speakers without re-binding the socket.
 pub type StreamClientAllowedCallback = Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>;
+
+/// In-band track titles for UPnP renderers (the Shoutcast/Icecast "ICY"
+/// convention): a client that sends `Icy-MetaData: 1` gets an
+/// `icy-metaint: N` response header and, every N body bytes, a
+/// length-prefixed `StreamTitle='…';` block (a single zero byte when
+/// nothing changed). The client's HTTP layer strips the blocks before the
+/// audio decoder sees them, so the WAV stream is untouched, and the title
+/// can change mid-stream without restarting playback — unlike
+/// SetAVTransportURI, which every renderer treats as a new item.
+///
+/// Off unless the user enabled now-playing forwarding. Never offered to
+/// Sonos (identified by its User-Agent): it isn't known to show stream
+/// titles for a plain WAV URI, and whether its WAV path would strip the
+/// blocks is unverified — a wrong guess would put clicks in the audio.
+pub struct IcyMetadata {
+    enabled: AtomicBool,
+    /// Bumped on every title change, so each stream sends it once.
+    version: AtomicU64,
+    title: Mutex<Option<String>>,
+}
+
+/// Bytes of audio between metadata blocks (the usual Icecast value).
+pub const ICY_METAINT: usize = 16_000;
+
+impl IcyMetadata {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            enabled: AtomicBool::new(false),
+            version: AtomicU64::new(0),
+            title: Mutex::new(None),
+        })
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    /// Turn the feature on/off. Turning it off clears the title, so open
+    /// streams blank it on the renderer.
+    pub fn set_enabled(&self, on: bool) {
+        if self.enabled.swap(on, Ordering::AcqRel) && !on {
+            self.set_title(None);
+        }
+    }
+
+    /// Publish a new title (no-op if unchanged).
+    pub fn set_title(&self, title: Option<String>) {
+        let mut t = self.title.lock().unwrap();
+        if *t != title {
+            *t = title;
+            self.version.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn current(&self) -> (u64, Option<String>) {
+        let t = self.title.lock().unwrap();
+        (self.version.load(Ordering::Acquire), t.clone())
+    }
+}
+
+/// Should this `/stream.raw` request get ICY metadata?
+fn wants_icy(req: &tiny_http::Request, icy: &Option<Arc<IcyMetadata>>) -> bool {
+    let Some(icy) = icy else { return false };
+    if !icy.is_enabled() {
+        return false;
+    }
+    let header = |name: &str| {
+        req.headers()
+            .iter()
+            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str().to_string())
+    };
+    let asked = header("Icy-MetaData").map(|v| v.trim() == "1").unwrap_or(false);
+    let ua = header("User-Agent").unwrap_or_default();
+    let sonos = ua.to_ascii_lowercase().contains("sonos");
+    debug!(
+        "stream GET from {:?}: User-Agent {:?}, Icy-MetaData {}",
+        req.remote_addr(),
+        ua,
+        if asked { "requested" } else { "not requested" }
+    );
+    asked && !sonos
+}
+
+/// One ICY metadata block: a length byte (in 16-byte units) followed by
+/// `StreamTitle='…';` zero-padded to a multiple of 16. Titles are UTF-8,
+/// capped to the 4080-byte maximum on a character boundary; NULs and the
+/// `';` terminator sequence are removed so a title can't end the field.
+pub fn icy_block(title: Option<&str>) -> Vec<u8> {
+    const PREFIX: &str = "StreamTitle='";
+    const SUFFIX: &str = "';";
+    const MAX: usize = 255 * 16;
+    let clean: String = title
+        .unwrap_or("")
+        .replace('\0', "")
+        .replace("';", "'");
+    let mut text = clean.as_str();
+    let room = MAX - PREFIX.len() - SUFFIX.len();
+    if text.len() > room {
+        let mut cut = room;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text = &text[..cut];
+    }
+    let body = format!("{PREFIX}{text}{SUFFIX}");
+    let blocks = body.len().div_ceil(16);
+    let mut out = Vec::with_capacity(1 + blocks * 16);
+    out.push(blocks as u8);
+    out.extend_from_slice(body.as_bytes());
+    out.resize(1 + blocks * 16, 0);
+    out
+}
+
+/// Wraps the stream body, inserting an ICY block every `metaint` bytes.
+struct IcyReader<R> {
+    inner: R,
+    meta: Arc<IcyMetadata>,
+    metaint: usize,
+    until_meta: usize,
+    pending: Vec<u8>,
+    pending_pos: usize,
+    sent_version: Option<u64>,
+}
+
+impl<R: Read> IcyReader<R> {
+    fn new(inner: R, meta: Arc<IcyMetadata>, metaint: usize) -> Self {
+        Self {
+            inner,
+            meta,
+            metaint,
+            until_meta: metaint,
+            pending: Vec::new(),
+            pending_pos: 0,
+            sent_version: None,
+        }
+    }
+}
+
+impl<R: Read> Read for IcyReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pending_pos < self.pending.len() {
+            let n = buf.len().min(self.pending.len() - self.pending_pos);
+            buf[..n].copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + n]);
+            self.pending_pos += n;
+            return Ok(n);
+        }
+        if self.until_meta == 0 {
+            let (version, title) = self.meta.current();
+            self.pending = if self.sent_version == Some(version) {
+                vec![0]
+            } else {
+                self.sent_version = Some(version);
+                icy_block(title.as_deref())
+            };
+            self.pending_pos = 0;
+            self.until_meta = self.metaint;
+            return self.read(buf);
+        }
+        let want = buf.len().min(self.until_meta);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.until_meta -= n;
+        Ok(n)
+    }
+}
 
 /// One PCM packet to broadcast to subscribers. Pre-encoded as bytes so the
 /// audio thread does the conversion once.
@@ -164,6 +333,8 @@ pub struct HttpServerConfig {
     /// `true` for the client's IP — the privacy-mode gate. `None` ⇒
     /// the stream is served to anyone who connects (legacy).
     pub stream_client_allowed: Option<StreamClientAllowedCallback>,
+    /// In-band track titles for renderers that ask (see [`IcyMetadata`]).
+    pub icy: Option<Arc<IcyMetadata>>,
 }
 
 impl HttpServerConfig {
@@ -178,6 +349,7 @@ impl HttpServerConfig {
             latency_adjust: None,
             web_ui_enabled: None,
             stream_client_allowed: None,
+            icy: None,
         }
     }
 }
@@ -203,13 +375,14 @@ pub fn start_http_server(cfg: HttpServerConfig) -> Result<u16> {
     let latency_cb = cfg.latency_adjust.clone();
     let web_gate = cfg.web_ui_enabled.clone();
     let stream_gate = cfg.stream_client_allowed.clone();
+    let icy = cfg.icy.clone();
 
     thread::Builder::new()
         .name("stream-to-speaker-http".to_string())
         .spawn(move || {
             run_server(
                 server, hub, gena_cb, list_cb, select_cb, resync_cb, latency_cb, web_gate,
-                stream_gate,
+                stream_gate, icy,
             )
         })
         .context("spawning HTTP server thread")?;
@@ -243,6 +416,7 @@ fn run_server(
     latency_adjust: Option<LatencyAdjustCallback>,
     web_ui_enabled: Option<Arc<AtomicBool>>,
     stream_client_allowed: Option<StreamClientAllowedCallback>,
+    icy: Option<Arc<IcyMetadata>>,
 ) {
     for req in server.incoming_requests() {
         let url = req.url().to_string();
@@ -256,10 +430,11 @@ fn run_server(
                 };
                 let hub = hub.clone();
                 let gate = stream_client_allowed.clone();
+                let icy = wants_icy(&req, &icy).then(|| icy.clone()).flatten();
                 thread::Builder::new()
                     .name("stream-to-speaker-http-stream".to_string())
                     .spawn(move || {
-                        if let Err(e) = serve_stream(req, hub, gate) {
+                        if let Err(e) = serve_stream(req, hub, gate, icy) {
                             debug!("stream client ended: {}", e);
                         }
                     })
@@ -670,6 +845,7 @@ fn serve_stream(
     req: tiny_http::Request,
     hub: Arc<StreamHub>,
     gate: Option<StreamClientAllowedCallback>,
+    icy: Option<Arc<IcyMetadata>>,
 ) -> Result<()> {
     // Subscribe BEFORE we send headers so we don't miss the first frame.
     // Tagged with the peer IP so privacy mode can cut the connection
@@ -694,6 +870,13 @@ fn serve_stream(
     // for us.
 
     let reader = StreamReader::new(rx, recheck);
+    let reader: Box<dyn Read + Send> = match &icy {
+        Some(meta) => Box::new(IcyReader::new(reader, meta.clone(), ICY_METAINT)),
+        None => Box::new(reader),
+    };
+    if icy.is_some() {
+        debug!("stream client {:?}: in-band (ICY) titles every {} bytes", peer, ICY_METAINT);
+    }
 
     // swyh-rs's StreamSize::U32maxNotChunked pattern — emit a fixed
     // (fake) Content-Length of u32::MAX-1 and set chunked_threshold to
@@ -706,6 +889,11 @@ fn serve_stream(
         .with_chunked_threshold(u32::MAX as usize);
     for h in dlna_stream_headers() {
         response.add_header(h);
+    }
+    if icy.is_some() {
+        if let Ok(h) = Header::from_bytes(&b"icy-metaint"[..], ICY_METAINT.to_string().as_bytes()) {
+            response.add_header(h);
+        }
     }
 
     req.respond(response).map_err(|e| anyhow::anyhow!("stream respond: {}", e))?;
@@ -887,6 +1075,109 @@ pub const WIRE_CHANNELS_PUBLIC: u16 = WIRE_CHANNELS;
 mod tests {
     use super::*;
     use std::net::IpAddr;
+
+    /// Strip ICY blocks the way a client does: returns (audio, titles).
+    fn icy_demux(mut wire: &[u8], metaint: usize) -> (Vec<u8>, Vec<String>) {
+        let mut audio = Vec::new();
+        let mut titles = Vec::new();
+        loop {
+            let n = wire.len().min(metaint);
+            audio.extend_from_slice(&wire[..n]);
+            wire = &wire[n..];
+            if wire.is_empty() {
+                break;
+            }
+            let len = wire[0] as usize * 16;
+            let block = &wire[1..1 + len];
+            wire = &wire[1 + len..];
+            if len > 0 {
+                let text = String::from_utf8(block.to_vec()).unwrap();
+                let text = text.trim_end_matches('\0');
+                let t = text
+                    .strip_prefix("StreamTitle='")
+                    .and_then(|t| t.strip_suffix("';"))
+                    .expect("well-formed block");
+                titles.push(t.to_string());
+            }
+        }
+        (audio, titles)
+    }
+
+    fn read_all(mut r: impl Read) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 777]; // odd size: blocks straddle reads
+        loop {
+            let n = r.read(&mut buf).unwrap();
+            if n == 0 {
+                return out;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    #[test]
+    fn icy_block_layout() {
+        let b = icy_block(Some("Artist - Song"));
+        let body = "StreamTitle='Artist - Song';";
+        assert_eq!(b[0] as usize, body.len().div_ceil(16));
+        assert_eq!(b.len(), 1 + b[0] as usize * 16);
+        assert_eq!(&b[1..1 + body.len()], body.as_bytes());
+        assert!(b[1 + body.len()..].iter().all(|&x| x == 0));
+        // Clearing the title is an explicit empty StreamTitle.
+        let clear = icy_block(None);
+        assert_eq!(&clear[1..16], b"StreamTitle='';");
+    }
+
+    #[test]
+    fn icy_block_sanitises_and_caps() {
+        let b = icy_block(Some("a';b\0c"));
+        let (_, titles) = icy_demux(&[&[0u8; 4][..], &b[..]].concat(), 4);
+        assert_eq!(titles, vec!["a'bc".to_string()]);
+        let long = "é".repeat(5000);
+        let b = icy_block(Some(&long));
+        assert_eq!(b[0], 255);
+        assert_eq!(b.len(), 1 + 255 * 16);
+        let text = std::str::from_utf8(&b[1..]).unwrap().trim_end_matches('\0');
+        assert!(text.ends_with("';"));
+    }
+
+    #[test]
+    fn icy_reader_interleaves_without_touching_audio() {
+        let audio: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let meta = IcyMetadata::new();
+        meta.set_enabled(true);
+        meta.set_title(Some("Artist - Ünïcode".into()));
+        let wire = read_all(IcyReader::new(std::io::Cursor::new(audio.clone()), meta, 1000));
+        let (got, titles) = icy_demux(&wire, 1000);
+        assert_eq!(got, audio, "audio bytes pass through exactly");
+        // Sent once, then empty (one zero byte) blocks.
+        assert_eq!(titles, vec!["Artist - Ünïcode".to_string()]);
+        assert_eq!(wire.len(), audio.len() + icy_block(Some("Artist - Ünïcode")).len() + 99);
+    }
+
+    #[test]
+    fn icy_reader_sends_title_changes_and_clear_on_disable() {
+        let meta = IcyMetadata::new();
+        meta.set_enabled(true);
+        meta.set_title(Some("One".into()));
+        let mut r = IcyReader::new(std::io::repeat(7), meta.clone(), 100);
+        let mut take = |n: usize| {
+            let mut v = vec![0u8; n];
+            let mut got = 0;
+            while got < n {
+                got += r.read(&mut v[got..]).unwrap();
+            }
+            v
+        };
+        let mut wire = take(1000);
+        meta.set_title(Some("Two".into()));
+        meta.set_title(Some("Two".into())); // unchanged: no extra block
+        wire.extend(take(1000));
+        meta.set_enabled(false);
+        wire.extend(take(1000));
+        let (_, titles) = icy_demux(&wire, 100);
+        assert_eq!(titles, vec!["One".to_string(), "Two".to_string(), String::new()]);
+    }
 
     #[test]
     fn disconnect_clients_cuts_matching_http_peers_only() {

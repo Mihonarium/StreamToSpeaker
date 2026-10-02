@@ -102,12 +102,14 @@ pub struct UserConfig {
     /// versions AFTER this one; releases before it still strip.)
     #[serde(flatten)]
     pub unknown_keys: serde_json::Map<String, serde_json::Value>,
-    /// Forward Windows' "now playing" (title/artist/album from the System
-    /// Media Transport Controls) to the speaker as track metadata, so it
-    /// shows on the speaker's display / app. **Off by default** — it's a
-    /// nicety, it reads whatever app currently has media focus, and the
-    /// RAOP metadata path is best-effort (a receiver that ignores it is
-    /// harmless). RAOP only for now (Sonos-class); no AP2 metadata yet.
+    /// Forward Windows' "now playing" (title/artist/album/cover art/position
+    /// from the System Media Transport Controls) to the speaker as track
+    /// metadata, so it shows on the speaker's display / app. **Off by
+    /// default** — it's a nicety and it sends what the PC is playing to the
+    /// speaker. AirPlay 1 and 2 get it over RTSP (parts gated on what the
+    /// receiver advertises); UPnP renderers that request ICY metadata get
+    /// the title in-band on the stream (never Sonos). Best-effort: a
+    /// receiver that rejects it gets none until the setting is toggled.
     #[serde(default)]
     pub forward_now_playing: bool,
     /// Debug escape hatch: send the uncompressed-ALAC escape frames

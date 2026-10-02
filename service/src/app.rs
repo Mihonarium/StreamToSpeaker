@@ -107,13 +107,15 @@ impl ActiveSession {
         }
     }
 
-    /// A detached metadata sender for the bound speaker, if this session
-    /// type supports track metadata (RAOP only today). Cloning it is
-    /// cheap and lets the caller send without holding the session lock.
-    pub fn metadata_handle(&self) -> Option<crate::airplay::session::MetadataHandle> {
+    /// A detached metadata sender for the bound speaker (AirPlay 1 and 2;
+    /// UPnP speakers get metadata in-stream instead, see
+    /// [`crate::http_server::IcyMetadata`]). Cloning it is cheap and lets
+    /// the caller send without holding the session lock.
+    pub fn metadata_handle(&self) -> Option<crate::airplay::metadata::MetadataHandle> {
         match self {
             ActiveSession::AirPlay(s) => Some(s.metadata_handle()),
-            ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) => None,
+            ActiveSession::AirPlay2(s) => Some(s.metadata_handle()),
+            ActiveSession::Upnp(_) => None,
         }
     }
 
@@ -285,6 +287,10 @@ pub struct App {
     /// hold grants in it; the HTTP threads consult it per request.
     pub stream_gate: Arc<StreamGate>,
 
+    /// In-band track titles on `/stream.raw` for UPnP renderers that ask
+    /// for them; fed by the now-playing forwarder.
+    pub icy: Arc<crate::http_server::IcyMetadata>,
+
     /// The one in-flight HomeKit PIN pairing ceremony, if any. Single
     /// source of truth for the whole ceremony lifecycle: reserving the
     /// slot IS the "only one ceremony at a time" lock, the `AwaitingPin`
@@ -400,6 +406,7 @@ impl App {
             last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
             last_rescan_count: Arc::new(AtomicUsize::new(0)),
             stream_gate: StreamGate::new(user_config.privacy_mode, own_ip),
+            icy: crate::http_server::IcyMetadata::new(),
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
@@ -1136,11 +1143,14 @@ impl App {
     }
 
     /// Background forwarder: when enabled, pushes the OS "now playing"
-    /// (title/artist/album) to the bound speaker as it changes, so the
-    /// track shows on the speaker's display / app. Off by default; RAOP
-    /// only (AP2/UPnP sessions are skipped). Entirely best-effort —
-    /// metadata is non-fatal on every receiver, so a failure or an
-    /// unsupported OS never touches the audio path.
+    /// to the bound speaker as it changes, so the track shows on the
+    /// speaker's display / app. AirPlay 1 and 2 get title/artist/album,
+    /// cover art and position over the RTSP connection (each part only
+    /// if the receiver advertises it); UPnP renderers that ask for ICY
+    /// metadata get the title in-band on the stream. Off by default.
+    /// Best-effort: a speaker that rejects or times out on metadata gets
+    /// none until the setting is toggled (on AirPlay 2 a timed-out request
+    /// also ends that session once, see `Ap2Rtsp::set_metadata`).
     pub fn spawn_now_playing_forwarder(self: &Arc<Self>) {
         let app = self.clone();
         std::thread::Builder::new()
@@ -1155,61 +1165,117 @@ impl App {
                     };
                     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
                 }
-
-                let mut last_sent: Option<crate::now_playing::NowPlaying> = None;
-                loop {
-                    for _ in 0..20 {
-                        if app.is_shutting_down() {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-
-                    if !app.user_config.lock().unwrap().forward_now_playing {
-                        // Reset so re-enabling re-sends the current track.
-                        last_sent = None;
-                        continue;
-                    }
-
-                    // Grab a detached metadata handle (RAOP only) under a
-                    // brief session lock, then release it — the network send
-                    // below must NOT hold the session mutex (the GUI polls
-                    // it every repaint; a slow send would freeze the UI).
-                    let handle = app.session.lock().unwrap().as_ref().and_then(|s| s.metadata_handle());
-                    let Some(handle) = handle else {
-                        last_sent = None;
-                        continue;
-                    };
-
-                    let np = crate::now_playing::current();
-                    if np == last_sent {
-                        continue; // unchanged (incl. both None)
-                    }
-
-                    if let Some(track) = &np {
-                        match handle.send(&track.title, &track.artist, &track.album) {
-                            Ok(()) => {
-                                debug!("now-playing → speaker: {} — {}", track.artist, track.title);
-                            }
-                            Err(e) => {
-                                // Non-fatal — the receiver may not support
-                                // metadata. Record it as attempted anyway so
-                                // we don't re-send the SAME track every tick
-                                // (which, on a receiver that hangs on it,
-                                // could otherwise churn reconnects).
-                                debug!("now-playing send failed (non-fatal): {:#}", e);
-                            }
-                        }
-                        // Mark this track attempted regardless of outcome.
-                        last_sent = np;
-                    } else {
-                        // Nothing playing now; remember so we re-send when
-                        // it resumes.
-                        last_sent = None;
-                    }
-                }
+                app.run_now_playing_forwarder();
             })
             .ok();
+    }
+
+    fn run_now_playing_forwarder(&self) {
+        use crate::now_playing::{Sent, Watcher};
+        /// Re-read the OS state this often even without a change event.
+        const RECHECK: Duration = Duration::from_secs(5);
+        /// Wake this often to notice shutdown / a new session.
+        const TICK: Duration = Duration::from_millis(500);
+        /// Retry creating the OS watcher after a failure.
+        const WATCHER_RETRY: Duration = Duration::from_secs(30);
+
+        let mut watcher: Option<Watcher> = None;
+        let mut watcher_failed_at: Option<Instant> = None;
+        let mut last_check: Option<Instant> = None;
+        let mut current: Option<crate::now_playing::NowPlaying> = None;
+        // (session the record is for, what it has been sent, the current
+        // item's RTP-Info id)
+        let mut sent: Option<(u64, Sent, Option<u32>)> = None;
+        // Speakers that failed a metadata send. Not retried until the
+        // setting is turned off and on again: a receiver that hangs on
+        // metadata would otherwise have its session dropped and
+        // reconnected over and over.
+        let mut refused: std::collections::HashSet<String> = Default::default();
+
+        while !self.is_shutting_down() {
+            if !self.user_config.lock().unwrap().forward_now_playing {
+                // Off: drop everything, so turning it back on re-sends.
+                self.icy.set_enabled(false);
+                refused.clear();
+                watcher = None;
+                current = None;
+                sent = None;
+                last_check = None;
+                std::thread::sleep(TICK);
+                continue;
+            }
+            self.icy.set_enabled(true);
+
+            if watcher.is_none()
+                && watcher_failed_at.map_or(true, |t| t.elapsed() >= WATCHER_RETRY)
+            {
+                watcher = Watcher::new();
+                watcher_failed_at = watcher.is_none().then(Instant::now);
+                last_check = None;
+            }
+            let Some(w) = watcher.as_mut() else {
+                std::thread::sleep(TICK);
+                continue;
+            };
+
+            let changed = w.wait(TICK);
+            if changed || last_check.map_or(true, |t| t.elapsed() >= RECHECK) {
+                current = w.snapshot();
+                last_check = Some(Instant::now());
+                self.icy.set_title(
+                    current.as_ref().map(|np| np.display_line()).filter(|t| !t.is_empty()),
+                );
+            }
+
+            // Detached handle under a brief session lock — the network
+            // sends below must NOT hold the session mutex (the GUI polls
+            // it every repaint).
+            let handle = self.session.lock().unwrap().as_ref().and_then(|s| s.metadata_handle());
+            let Some(handle) = handle else {
+                sent = None;
+                continue;
+            };
+            if handle.is_disabled() || !handle.caps().any() || refused.contains(handle.device_id()) {
+                continue;
+            }
+            let key = handle.session_id();
+            if sent.as_ref().map(|(k, _, _)| *k) != Some(key) {
+                // New session: it has been sent nothing yet.
+                sent = Some((key, Sent::default(), None));
+            }
+            let Some(np) = current.as_ref() else { continue };
+            let (_, record, item_rtp) = sent.as_mut().unwrap();
+            let now = Instant::now();
+            let plan = record.plan(np, now);
+            let caps = handle.caps();
+            let to_send = plan.masked(caps.text, caps.artwork, caps.progress);
+            if !to_send.is_empty() {
+                // Re-check right before sending: the user may have just
+                // turned the feature off.
+                if !self.user_config.lock().unwrap().forward_now_playing {
+                    continue;
+                }
+                match handle.send(np, to_send, now, *item_rtp) {
+                    Ok(id) => *item_rtp = Some(id),
+                    Err(e) => {
+                        // Cosmetic, but stop for this speaker (see `refused`).
+                        info!(
+                            "now playing: speaker refused track info, not sending it more: {:#}",
+                            e
+                        );
+                        handle.disable();
+                        refused.insert(handle.device_id().to_string());
+                        continue;
+                    }
+                }
+                debug!(
+                    "now playing → speaker: {:?} — {:?} (text={} art={} progress={})",
+                    np.artist, np.title, to_send.text, to_send.artwork, to_send.progress
+                );
+            }
+            // Parts the receiver doesn't take count as handled.
+            record.record(np, plan, now);
+        }
     }
 
     /// Switch to the speaker with the given stable id. Tears down any

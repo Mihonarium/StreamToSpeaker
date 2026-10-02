@@ -499,12 +499,14 @@ impl RtspClient {
         Ok(())
     }
 
-    /// SET_PARAMETER track metadata — a DMAP-tagged body (see
-    /// [`crate::airplay::dmap`]) so the receiver shows the current
-    /// title/artist/album on its display or app. Best-effort: metadata is
-    /// non-fatal on every reference receiver, so callers should treat a
-    /// failure as cosmetic.
-    pub fn set_metadata(&mut self, dmap_body: &[u8], rtptime: u32) -> Result<()> {
+    /// SET_PARAMETER carrying track metadata: a DMAP-tagged text body
+    /// (`application/x-dmap-tagged`, see [`crate::airplay::dmap`]), cover
+    /// art (`image/jpeg` / `image/png`) or a `text/parameters` progress
+    /// line. `rtptime` goes out as `RTP-Info: rtptime=…`, which receivers
+    /// use to tie the text and art of one item together. Best-effort:
+    /// metadata is non-fatal on every reference receiver, so callers
+    /// should treat a failure as cosmetic.
+    pub fn set_metadata(&mut self, content_type: &str, body: &[u8], rtptime: u32) -> Result<()> {
         if self.poisoned {
             bail!("RTSP connection is poisoned");
         }
@@ -524,16 +526,17 @@ impl RtspClient {
             head.push_str(&format!("Session: {}\r\n", token));
         }
         head.push_str(&format!("RTP-Info: rtptime={}\r\n", rtptime));
-        head.push_str("Content-Type: application/x-dmap-tagged\r\n");
-        head.push_str(&format!("Content-Length: {}\r\n\r\n", dmap_body.len()));
+        head.push_str(&format!("Content-Type: {}\r\n", content_type));
+        head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
 
-        debug!("RTSP > SET_PARAMETER {} (metadata, {}B)", uri, dmap_body.len());
+        debug!("RTSP > SET_PARAMETER {} ({}, {}B)", uri, content_type, body.len());
         let mut raw = head.into_bytes();
-        raw.extend_from_slice(dmap_body);
+        raw.extend_from_slice(body);
         let resp = self.send_and_read(&raw)?;
         if resp.status_code != 200 {
             bail!(
-                "SET_PARAMETER metadata → {} {}",
+                "SET_PARAMETER {} → {} {}",
+                content_type,
                 resp.status_code,
                 resp.status_text
             );

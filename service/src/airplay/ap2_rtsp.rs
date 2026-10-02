@@ -108,6 +108,12 @@ pub struct Ap2Rtsp {
     /// True once a TEARDOWN has been sent — makes `teardown` idempotent
     /// and lets Drop skip the duplicate.
     torn_down: bool,
+    /// Set when a metadata request failed (timeout, short read or write).
+    /// The channel may then be mid-frame or one response behind, so every
+    /// later request fails fast instead of pairing a stale reply with the
+    /// wrong request (the RAOP client poisons for the same reason). Other
+    /// requests keep their existing failure handling.
+    poisoned: bool,
 }
 
 impl Ap2Rtsp {
@@ -150,6 +156,7 @@ impl Ap2Rtsp {
             reader: None,
             rx_buf: Vec::with_capacity(4096),
             torn_down: false,
+            poisoned: false,
         })
     }
 
@@ -574,6 +581,27 @@ impl Ap2Rtsp {
         Ok(())
     }
 
+    /// SET_PARAMETER carrying track metadata (DMAP text, cover art or a
+    /// `progress:` line) over the encrypted control channel — the same
+    /// requests an AirPlay 1 sender makes, which AirPlay 2 receivers
+    /// accept when they advertise the metadata feature bits (OwnTone
+    /// `airplay.c` parity). Best-effort; callers treat failure as cosmetic.
+    pub fn set_metadata(&mut self, content_type: &str, body: &[u8], rtptime: u32) -> Result<()> {
+        let uri = self.session_uri();
+        let extra = [("RTP-Info".to_string(), format!("rtptime={}", rtptime))];
+        let resp = match self.request("SET_PARAMETER", &uri, &extra, Some(content_type), body) {
+            Ok(r) => r,
+            Err(e) => {
+                self.poisoned = true;
+                return Err(e);
+            }
+        };
+        if resp.status != 200 {
+            bail!("SET_PARAMETER({}) → {} {}", content_type, resp.status, resp.status_text);
+        }
+        Ok(())
+    }
+
     /// TEARDOWN — best-effort close. Idempotent.
     pub fn teardown(&mut self) {
         if self.torn_down {
@@ -589,6 +617,20 @@ impl Ap2Rtsp {
     // -------------------------------------------------------------------
 
     fn request(
+        &mut self,
+        method: &str,
+        uri: &str,
+        extra: &[(String, String)],
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<Resp> {
+        if self.poisoned {
+            bail!("AP2 RTSP connection is unusable after an earlier I/O failure");
+        }
+        self.request_inner(method, uri, extra, content_type, body)
+    }
+
+    fn request_inner(
         &mut self,
         method: &str,
         uri: &str,

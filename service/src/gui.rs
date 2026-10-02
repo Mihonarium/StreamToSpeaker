@@ -2780,8 +2780,8 @@ impl StreamToSpeakerApp {
                 ui,
                 p,
                 "Show now-playing on the speaker",
-                "Send the current track's title/artist/album to the speaker's display.",
-                "When on, Stream To Speaker reads whatever Windows reports as \"now playing\" (the same title/artist the media keys show) and forwards it to the speaker so it appears on the speaker's screen or in its app. It reads whichever app currently has media focus. Off by default; works on AirPlay 1 (RAOP) speakers like Sonos in AirPlay mode.",
+                "Send the current track's title, artist, album and cover art to the speaker.",
+                "When on, Stream To Speaker reads what Windows reports as \"now playing\" (the same track info the media keys show) and sends it to the speaker, so it appears on the speaker's screen or in its app. If several apps are playing, it prefers the one playing through Stream To Speaker. AirPlay speakers get the parts they support (title, artist, album, cover art, position). UPnP speakers that read stream titles get \"Artist - Title\". Sonos over UPnP keeps showing \"Stream To Speaker\"; connect to it over AirPlay to see the track. Off by default.",
                 |ui| {
                     ui.checkbox(&mut now_playing, "Forward Windows' now-playing info");
                 },

@@ -125,6 +125,9 @@ pub struct AirPlayRenderer {
     /// Model string (`am=` on RAOP or `model` on AirPlay), e.g.
     /// `AudioAccessory5,1` for a HomePod.
     pub model: Option<String>,
+    /// RAOP `md=` — metadata the receiver wants (0 = text, 1 = artwork,
+    /// 2 = progress). `None` when the key is absent.
+    pub metadata_types: Option<Vec<u8>>,
 }
 
 impl AirPlayRenderer {
@@ -273,6 +276,7 @@ struct RaopInfo {
     password_protected: bool,
     encryption_key_required: bool,
     model: Option<String>,
+    metadata_types: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -368,6 +372,7 @@ fn merge(mac: &str, raop: Option<&RaopInfo>, airplay: Option<&AirPlayInfo>) -> O
         model: airplay
             .and_then(|a| a.model.clone())
             .or_else(|| raop.and_then(|r| r.model.clone())),
+        metadata_types: raop.and_then(|r| r.metadata_types.clone()),
     })
 }
 
@@ -449,10 +454,11 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
             password_protected: read_txt_bool(txt, "pw"),
             encryption_key_required: read_txt_bool(txt, "ek"),
             model: read_txt_string(txt, "am"),
+            metadata_types: read_txt_string(txt, "md").map(|_| read_txt_int_list(txt, "md")),
         };
         debug!(
-            "AirPlay RAOP resolved: {} @ {:?}:{} et={:?} cn={:?}",
-            r.friendly_name, r.ip, r.port, r.encryption_types, r.codecs
+            "AirPlay RAOP resolved: {} @ {:?}:{} et={:?} cn={:?} md={:?}",
+            r.friendly_name, r.ip, r.port, r.encryption_types, r.codecs, r.metadata_types
         );
         state.upsert_raop(mac, r);
     } else {
@@ -606,6 +612,7 @@ mod tests {
             features: ft,
             pk: None,
             model: model.map(|s| s.to_string()),
+            metadata_types: None,
         }
     }
 

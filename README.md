@@ -41,6 +41,13 @@ stream — pick that one, or turn privacy mode off). Note that the web UI, if
 enabled, lets anyone on your network pick a different speaker, which defeats
 privacy mode; the app warns when both are on.
 
+**Advanced → Show now-playing on the speaker** (off by default) sends the
+track Windows reports as playing (title, artist, album, cover art, position)
+to the speaker you're streaming to, so it shows on its screen or in its app.
+Nothing is sent while it's off. AirPlay speakers get the parts they support;
+UPnP speakers that read stream titles get "Artist - Title"; Sonos over UPnP
+keeps showing "Stream To Speaker" (use AirPlay to see the track there).
+
 Once a day the app asks GitHub whether a newer release exists and, if so,
 shows a link to it. Nothing is downloaded or installed by itself. Turn the
 check off under **Advanced** if you'd rather not.

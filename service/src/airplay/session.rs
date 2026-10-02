@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::airplay::crypto::{Cipher, MfiKey};
 use crate::airplay::discovery::AirPlayRenderer;
+use crate::airplay::metadata::{MetadataCaps, MetadataHandle};
 use crate::airplay::rtp::{
     bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, spawn_audio_sender,
     RtpSenderConfig,
@@ -115,6 +116,12 @@ pub struct AirPlaySession {
     /// Current RTP write head — read to stamp the `RTP-Info` on metadata
     /// SET_PARAMETERs.
     current_rtptime: Arc<AtomicU32>,
+    /// Receiver latency in samples (how far the audible point trails
+    /// `current_rtptime`), for metadata progress.
+    latency_samples: u32,
+    /// Set once a metadata send failed — see [`MetadataHandle`].
+    metadata_disabled: Arc<AtomicBool>,
+    metadata_session_id: u64,
     /// Last volume (0..=100) pushed to the receiver; what an unmute
     /// restores. RAOP has no separate mute, only the -144 dB sentinel.
     volume_pct: AtomicU32,
@@ -507,6 +514,9 @@ impl AirPlaySession {
             dead,
             resend_stats,
             current_rtptime,
+            latency_samples,
+            metadata_disabled: Arc::new(AtomicBool::new(false)),
+            metadata_session_id: crate::airplay::metadata::next_session_id(),
             volume_pct: AtomicU32::new(cfg.initial_volume.unwrap_or(100)),
             threads: guard.into_threads(),
             _audio_socket: audio_socket,
@@ -520,10 +530,15 @@ impl AirPlaySession {
     /// only the RTSP mutex (shared with the keepalive/volume, never the
     /// session mutex the GUI polls every repaint).
     pub fn metadata_handle(&self) -> MetadataHandle {
-        MetadataHandle {
-            rtsp: self.rtsp.clone(),
-            current_rtptime: self.current_rtptime.clone(),
-        }
+        MetadataHandle::raop(
+            self.rtsp.clone(),
+            self.current_rtptime.clone(),
+            self.latency_samples,
+            MetadataCaps::from_raop_md(self.renderer.metadata_types.as_deref()),
+            self.metadata_disabled.clone(),
+            self.metadata_session_id,
+            self.renderer.stable_id(),
+        )
     }
 
     /// True once a background thread has flagged the session as dead
@@ -576,23 +591,6 @@ impl Drop for AirPlaySession {
         // Belt-and-braces: ensure the audio thread is told to stop if
         // someone drops a session without calling `stop`.
         self.stop_flag.store(true, Ordering::Release);
-    }
-}
-
-/// Detached metadata sender — see [`AirPlaySession::metadata_handle`].
-/// Holds only the shared RTSP connection + RTP clock, so the background
-/// forwarder can send without contending on the session mutex.
-pub struct MetadataHandle {
-    rtsp: Arc<Mutex<RtspClient>>,
-    current_rtptime: Arc<AtomicU32>,
-}
-
-impl MetadataHandle {
-    /// Push "now playing" to the receiver (best-effort, non-fatal).
-    pub fn send(&self, title: &str, artist: &str, album: &str) -> Result<()> {
-        let body = crate::airplay::dmap::now_playing_body(title, artist, album);
-        let rtptime = self.current_rtptime.load(Ordering::Acquire);
-        self.rtsp.lock().unwrap().set_metadata(&body, rtptime)
     }
 }
 

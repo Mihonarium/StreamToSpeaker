@@ -224,7 +224,7 @@ fn read_string_value(key: HKEY, pkey: &str) -> Option<String> {
 /// (`{0.0.0.00000000}.{<guid>}`) of the first endpoint whose
 /// DeviceDesc contains "Stream To Speaker". Returns None if no such
 /// endpoint exists.
-fn find_our_endpoint_id() -> Result<Option<String>> {
+pub(crate) fn find_our_endpoint_id() -> Result<Option<String>> {
     let base = to_wide_null(r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render");
     let mut render_key: HKEY = ptr::null_mut();
     let r = unsafe {

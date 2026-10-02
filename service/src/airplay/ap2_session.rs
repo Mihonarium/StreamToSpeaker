@@ -36,6 +36,7 @@ use crate::airplay::alac::build_uncompressed_alac_frame;
 use crate::airplay::ap2_crypto::seal_audio;
 use crate::airplay::ap2_ptp::{spawn_ptp_master, PtpMaster, PtpTimeline};
 use crate::airplay::ap2_rtsp::{Ap2Rtsp, TransientOutcome};
+use crate::airplay::metadata::{MetadataCaps, MetadataHandle};
 use crate::airplay::discovery::AirPlayRenderer;
 use crate::airplay::hap_pairing::PairingCredentials;
 use crate::airplay::rtp::{bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, FRAMES_PER_PACKET};
@@ -141,6 +142,13 @@ pub struct AirPlay2Session {
     /// Clone of the buffered data TCP stream — stop() shuts it down to
     /// unblock a sender wedged in a full-buffer write before joining it.
     data_stream: Option<TcpStream>,
+    /// RTP write head + how far the audible point trails it (samples),
+    /// for metadata progress.
+    current_rtptime: Arc<AtomicU32>,
+    playout_lag: u32,
+    /// Set once a metadata send failed — see [`MetadataHandle`].
+    metadata_disabled: Arc<AtomicBool>,
+    metadata_session_id: u64,
     _audio_socket: UdpSocket,
 }
 
@@ -492,7 +500,7 @@ impl AirPlay2Session {
                 samples_rx: cfg.samples_rx,
                 stop_flag: stop_flag.clone(),
                 receiver_name: cfg.renderer.friendly_name.clone(),
-                current_rtptime,
+                current_rtptime: current_rtptime.clone(),
                 resend: resend.clone(),
                 session_dead: dead.clone(),
             })?;
@@ -528,9 +536,22 @@ impl AirPlay2Session {
             cfg.renderer.friendly_name.clone(),
         );
 
+        // Where the audible point sits behind the write head: the buffered
+        // stream is anchored ANCHOR_LEAD ahead of first audio; realtime
+        // streams trail by the sync packets' latency.
+        let playout_lag = if buffered {
+            (ANCHOR_LEAD_NS * crate::WIRE_SAMPLE_RATE as u64 / 1_000_000_000) as u32
+        } else {
+            latency_samples
+        };
+
         Ok(Self {
             renderer: cfg.renderer,
             rtsp,
+            current_rtptime,
+            playout_lag,
+            metadata_disabled: Arc::new(AtomicBool::new(false)),
+            metadata_session_id: crate::airplay::metadata::next_session_id(),
             volume_pct: AtomicU32::new(cfg.initial_volume.unwrap_or(100)),
             stop_flag,
             dead,
@@ -562,6 +583,21 @@ impl AirPlay2Session {
     pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
         self.volume_pct.store(vol.min(100), Ordering::Relaxed);
         self.rtsp.lock().unwrap().set_volume(volume_pct_to_raop_db(vol))
+    }
+
+    /// Detached "now playing" sender for this session; see
+    /// [`MetadataHandle`]. Parts are gated on the receiver's metadata
+    /// feature bits.
+    pub fn metadata_handle(&self) -> MetadataHandle {
+        MetadataHandle::ap2(
+            self.rtsp.clone(),
+            self.current_rtptime.clone(),
+            self.playout_lag,
+            MetadataCaps::from_features(self.renderer.features),
+            self.metadata_disabled.clone(),
+            self.metadata_session_id,
+            self.renderer.stable_id(),
+        )
     }
 
     pub fn set_mute(&self, muted: bool) -> Result<()> {

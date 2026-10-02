@@ -764,6 +764,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         latency_adjust: Some(latency_adjust),
         web_ui_enabled: Some(app.web_ui_enabled.clone()),
         stream_client_allowed: Some(stream_client_allowed),
+        icy: Some(app.icy.clone()),
     })
 }
 

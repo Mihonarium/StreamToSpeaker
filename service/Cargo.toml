@@ -132,9 +132,19 @@ windows = { version = "0.58", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
     # WinRT System Media Transport Controls — reads the OS "now playing"
-    # (title/artist/album) for the opt-in metadata-forwarding feature.
+    # (title/artist/album/artwork/position) for the opt-in
+    # metadata-forwarding feature; Storage_Streams + Graphics_Imaging read
+    # and, if oversized, re-encode the cover art; Win32_Media_Audio +
+    # Threading find which apps are playing on our endpoint.
     "Foundation",
+    "Foundation_Collections",
     "Media_Control",
+    "Storage_Streams",
+    "Graphics_Imaging",
+    "Win32_Media_Audio",
+    "Win32_System_Threading",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
 ] }
 # GUI: native window + system tray. Windows-only for now since the
 # kernel driver is anyway Windows-only.
