@@ -210,6 +210,99 @@ class InfCompare(unittest.TestCase):
         self.assertTrue(rep["normalised_identical"])
 
 
+def make_zip(path, members):
+    with zipfile.ZipFile(path, "w") as z:
+        for name, data in members.items():
+            z.writestr(name, data)
+    with open(path, "rb") as fh:
+        return rc.sha256(fh.read())
+
+
+class PackageCheck(unittest.TestCase):
+    MEMBERS = {"drivers/x/StreamToSpeaker.sys": b"SYS", "drivers/x/StreamToSpeaker.inf": b"INF",
+               "drivers/x/streamtospeaker.cat": b"CAT", "drivers/x/readme.txt": b"-"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.zip = os.path.join(self.tmp, "pkg.zip")
+        self.out = os.path.join(self.tmp, "out")
+
+    def test_good_package_is_extracted_flat_with_canonical_names(self):
+        digest = make_zip(self.zip, self.MEMBERS)
+        rep = rc.check_package(self.zip, digest.upper(), self.out)
+        self.assertTrue(rep["ok"])
+        self.assertEqual(sorted(os.listdir(self.out)),
+                         ["StreamToSpeaker.cat", "StreamToSpeaker.inf", "StreamToSpeaker.sys"])
+        self.assertEqual(rep["files"]["StreamToSpeaker.cat"]["sha256"], rc.sha256(b"CAT"))
+        self.assertEqual(rep["files"]["StreamToSpeaker.cat"]["member"], "drivers/x/streamtospeaker.cat")
+
+    def test_hash_mismatch_fails_and_extracts_nothing(self):
+        make_zip(self.zip, self.MEMBERS)
+        rep = rc.check_package(self.zip, "0" * 64, self.out)
+        self.assertFalse(rep["sha256_ok"])
+        self.assertFalse(rep["ok"])
+        self.assertFalse(os.path.exists(self.out))
+        self.assertEqual(rc.main(["package", self.zip, self.out, "--sha256", "0" * 64]), 1)
+
+    def test_missing_expected_hash_fails(self):
+        make_zip(self.zip, self.MEMBERS)
+        self.assertFalse(rc.check_package(self.zip, "", self.out)["ok"])
+
+    def test_missing_file_fails(self):
+        members = dict(self.MEMBERS)
+        del members["drivers/x/streamtospeaker.cat"]
+        digest = make_zip(self.zip, members)
+        rep = rc.check_package(self.zip, digest, self.out)
+        self.assertEqual(rep["missing"], ["StreamToSpeaker.cat"])
+        self.assertFalse(rep["ok"])
+
+    def test_duplicate_file_fails(self):
+        members = dict(self.MEMBERS, **{"other/StreamToSpeaker.sys": b"EVIL"})
+        digest = make_zip(self.zip, members)
+        rep = rc.check_package(self.zip, digest, self.out)
+        self.assertEqual(rep["duplicates"], ["other/StreamToSpeaker.sys"])
+        self.assertFalse(rep["ok"])
+
+    def test_cli_success(self):
+        digest = make_zip(self.zip, self.MEMBERS)
+        self.assertEqual(rc.main(["package", self.zip, self.out, "--sha256", digest]), 0)
+
+
+class FilesCompare(unittest.TestCase):
+    def setUp(self):
+        self.a, self.b = tempfile.mkdtemp(), tempfile.mkdtemp()
+        for d in (self.a, self.b):
+            for name, data in (("StreamToSpeaker.sys", b"SYS"), ("StreamToSpeaker.inf", b"INF"),
+                               ("StreamToSpeaker.cat", b"CAT")):
+                with open(os.path.join(d, name), "wb") as f:
+                    f.write(data)
+
+    def test_identical(self):
+        rep = rc.compare_files(self.a, self.b)
+        self.assertTrue(rep["identical"])
+        self.assertEqual(rc.main(["files", self.a, self.b]), 0)
+
+    def test_name_case_does_not_matter(self):
+        os.rename(os.path.join(self.b, "StreamToSpeaker.cat"), os.path.join(self.b, "streamtospeaker.cat"))
+        self.assertTrue(rc.compare_files(self.a, self.b)["identical"])
+
+    def test_different_bytes(self):
+        with open(os.path.join(self.b, "StreamToSpeaker.sys"), "wb") as f:
+            f.write(b"SYS2")
+        rep = rc.compare_files(self.a, self.b)
+        self.assertFalse(rep["identical"])
+        self.assertFalse(rep["files"]["StreamToSpeaker.sys"]["identical"])
+        self.assertTrue(rep["files"]["StreamToSpeaker.inf"]["identical"])
+        self.assertEqual(rc.main(["files", self.a, self.b]), 1)
+
+    def test_missing_on_both_sides_is_not_identical(self):
+        for d in (self.a, self.b):
+            os.remove(os.path.join(d, "StreamToSpeaker.cat"))
+        rep = rc.compare_files(self.a, self.b)
+        self.assertFalse(rep["files"]["StreamToSpeaker.cat"]["identical"])
+        self.assertFalse(rep["identical"])
+
+
 @unittest.skipUnless(test_certified.HAVE_REAL, "real 1.1.0.209 packages not on this machine")
 class RealPackages(unittest.TestCase):
     def test_lab_and_microsoft_sys_identical_after_strip(self):
