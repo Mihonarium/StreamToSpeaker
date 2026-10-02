@@ -839,6 +839,8 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 confirm_close_open: false,
                 password_prompt: None,
                 pin_prompt: None,
+                sendspin_prompt: None,
+                show_ma_token: false,
                 last_fractional_scroll: None,
                 skip_close_confirmation,
                 theme_mode: ThemeMode::System,
@@ -882,6 +884,11 @@ struct StreamToSpeakerApp {
     /// `pending_pin_pairing` state each frame; `None` when no ceremony is
     /// in flight.
     pin_prompt: Option<PinPrompt>,
+    /// Open while a Sendspin speaker needs its pairing code or token.
+    /// Mirrors the app's `pending_sendspin_pairing` each frame.
+    sendspin_prompt: Option<SendspinPrompt>,
+    /// The Music Assistant card shows the pairing token in clear text.
+    show_ma_token: bool,
     /// When the last fractional (touchpad-shaped) wheel event arrived —
     /// drives the raw_input_hook's mouse-vs-touchpad classification (a
     /// fling's decay passes through exact integers, so integer deltas
@@ -1159,6 +1166,19 @@ impl eframe::App for StreamToSpeakerApp {
             }
         }
 
+        // Same mirroring for a Sendspin speaker that needs pairing; the
+        // connect thread waits (minutes) while the speaker shows its code.
+        if self.password_prompt.is_none() && self.pin_prompt.is_none() && !self.confirm_close_open {
+            match self.app.pending_sendspin_pairing() {
+                Some(view) => {
+                    if self.sendspin_prompt.as_ref().map(|p| p.view.id != view.id || p.view.kind != view.kind).unwrap_or(true) {
+                        self.sendspin_prompt = Some(SendspinPrompt { view, input: String::new() });
+                    }
+                }
+                None => self.sendspin_prompt = None,
+            }
+        }
+
         if self.confirm_close_open {
             self.show_close_modal(ctx, &p);
         }
@@ -1168,13 +1188,18 @@ impl eframe::App for StreamToSpeakerApp {
         if self.pin_prompt.is_some() {
             self.show_pin_modal(ctx, &p);
         }
+        if self.sendspin_prompt.is_some() {
+            self.show_sendspin_pair_modal(ctx, &p);
+        }
+        self.show_ma_code_window(ctx, &p);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(p.canvas).inner_margin(sp::M))
             .show(ctx, |ui| {
                 let enabled = !self.confirm_close_open
                     && self.password_prompt.is_none()
-                    && self.pin_prompt.is_none();
+                    && self.pin_prompt.is_none()
+                    && self.sendspin_prompt.is_none();
                 ui.add_enabled_ui(enabled, |ui| {
                     // Keep the header pinned at the top (theme toggle
                     // shouldn't scroll away); everything below scrolls
@@ -1234,6 +1259,10 @@ impl eframe::App for StreamToSpeakerApp {
                             ui.add_space(sp::M);
                             self.show_latency(ui, &p);
                             ui.add_space(sp::M);
+                            if self.app.is_sendspin_available() {
+                                self.show_music_assistant(ui, &p);
+                                ui.add_space(sp::M);
+                            }
                             self.show_advanced(ui, &p);
                             ui.add_space(sp::M);
                             self.show_web_ui(ui, &p);
@@ -3166,6 +3195,211 @@ impl StreamToSpeakerApp {
     }
 }
 
+impl StreamToSpeakerApp {
+    /// Pairing prompt for a Sendspin speaker: its live code, its printed
+    /// code, or its pairing token, depending on what it offers.
+    fn show_sendspin_pair_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(prompt) = self.sendspin_prompt.as_mut() else {
+            return;
+        };
+        let v = &prompt.view;
+        let title = format!("Pair with {}", v.name);
+        let lead = if v.lost_credential {
+            format!("{} no longer recognises this computer, so it needs to be paired again. ", v.name)
+        } else {
+            format!("{} needs to be paired with this computer once. ", v.name)
+        };
+        let (blurb, hint, reject_blank) = match v.kind {
+            crate::sendspin_app::PairPromptKind::LiveCode => (
+                format!(
+                    "{}It is now showing or saying a pairing code — enter it here. \
+                     (A pairing token, starting with SP:, works too.)",
+                    lead
+                ),
+                "Pairing code",
+                true,
+            ),
+            crate::sendspin_app::PairPromptKind::StaticCodeOrToken => (
+                format!(
+                    "{}Enter the pairing code printed on the speaker or in its documentation, \
+                     or paste its pairing token (starts with SP:).",
+                    lead
+                ),
+                "Pairing code or token",
+                true,
+            ),
+            crate::sendspin_app::PairPromptKind::TokenOnly => (
+                format!(
+                    "{}Paste its pairing token (starts with SP:) from the speaker's settings \
+                     or documentation.",
+                    lead
+                ),
+                "SP:…",
+                true,
+            ),
+        };
+        match show_text_prompt_modal(
+            ctx,
+            p,
+            &title,
+            &blurb,
+            hint,
+            false,
+            "Pair",
+            reject_blank,
+            self.confirm_close_open,
+            &mut prompt.input,
+        ) {
+            PromptAction::Confirm => {
+                if let Some(prompt) = self.sendspin_prompt.take() {
+                    self.app.submit_sendspin_pairing(Some(prompt.input.trim().to_string()));
+                }
+            }
+            PromptAction::Cancel => {
+                self.sendspin_prompt = None;
+                self.app.submit_sendspin_pairing(None);
+            }
+            PromptAction::Open => {}
+        }
+    }
+
+    /// While Music Assistant pairs with this PC by code, show the code
+    /// prominently (the user types it into Music Assistant).
+    fn show_ma_code_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some((code, server)) = self.app.sendspin_source_code() else {
+            return;
+        };
+        let grouped = if code.len() == 6 {
+            format!("{} {}", &code[..3], &code[3..])
+        } else {
+            code.clone()
+        };
+        egui::Window::new(egui::RichText::new("Pair with Music Assistant").strong().color(p.text_primary))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(380.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(p.card)
+                    .stroke(egui::Stroke::new(1.0, p.divider))
+                    .rounding(RADIUS_SURFACE)
+                    .inner_margin(sp::MODAL),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("Enter this code in {} to pair this computer:", server))
+                        .color(p.text_secondary),
+                );
+                ui.add_space(sp::S);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(grouped).size(36.0).strong().monospace().color(p.text_primary));
+                });
+                ui.add_space(sp::S);
+                ui.label(
+                    egui::RichText::new("This window closes by itself when pairing finishes.")
+                        .size(12.0)
+                        .color(p.text_tertiary),
+                );
+            });
+    }
+
+    /// Music Assistant card: offer this PC as a Sendspin input and show
+    /// how to pair it.
+    fn show_music_assistant(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(ui, p, |ui| {
+            section_label(ui, p, "Music Assistant");
+            ui.label(
+                egui::RichText::new(
+                    "Make this computer's audio available in Music Assistant as a live input \
+                     (through its Sendspin Source plugin), so you can play it on any speaker \
+                     Music Assistant controls.",
+                )
+                .size(12.0)
+                .color(p.text_secondary),
+            );
+            ui.add_space(sp::S);
+            let mut on = self.app.is_sendspin_source_enabled();
+            let resp = ui.checkbox(&mut on, "Offer this computer as a Music Assistant input");
+            if resp.changed() {
+                if let Err(e) = self.app.set_sendspin_source_enabled(on) {
+                    self.app.record_error(format!("Couldn't change the Music Assistant input: {}", e));
+                }
+            }
+            if !on {
+                return;
+            }
+            ui.add_space(sp::XS);
+            use crate::sendspin::source::SourceState;
+            let name = self.app.sendspin_source_name();
+            let (text, color) = match self.app.sendspin_source_state() {
+                Some(SourceState::Waiting) | None => (
+                    format!(
+                        "Waiting for Music Assistant. Enable the Sendspin Source plugin there; \
+                         this computer appears as \u{201c}{}\u{201d}.",
+                        name
+                    ),
+                    p.text_secondary,
+                ),
+                Some(SourceState::NeedsPairing { server }) => (
+                    format!(
+                        "{} found this computer. To finish, open \u{201c}{}\u{201d} in Music Assistant's \
+                         settings and pair it — with the code this window shows, or the pairing \
+                         token below.",
+                        server, name
+                    ),
+                    p.warn,
+                ),
+                Some(SourceState::Connected { server, streaming }) => (
+                    if streaming {
+                        format!("Paired with {} — playing this computer's audio.", server)
+                    } else {
+                        format!("Paired with {} — ready. Pick \u{201c}{}\u{201d} as a source there.", server, name)
+                    },
+                    p.text_primary,
+                ),
+                Some(SourceState::Failed(e)) => (format!("Not available: {}", e), p.warn),
+            };
+            ui.label(egui::RichText::new(text).size(12.0).color(color));
+            if let Some(note) = self.app.sendspin_source_note() {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(note).size(12.0).color(p.text_tertiary));
+            }
+            ui.add_space(sp::S);
+            ui.label(egui::RichText::new("Pairing token").strong().color(p.text_primary));
+            let token = self.app.sendspin_pairing_token();
+            let shown = if self.show_ma_token {
+                crate::sendspin::keys::format_token_for_display(&token)
+            } else {
+                "SP:0 •••• •••• •••• ••••".to_string()
+            };
+            ui.label(egui::RichText::new(shown).size(12.0).monospace().color(p.text_secondary));
+            ui.add_space(sp::XS);
+            ui.horizontal(|ui| {
+                if secondary_button(ui, p, "Copy token", 120.0)
+                    .on_hover_text("Copy the token to paste into Music Assistant's pairing dialog")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(token.clone());
+                }
+                let label = if self.show_ma_token { "Hide" } else { "Show" };
+                if link_button(ui, p, label, 80.0).clicked() {
+                    self.show_ma_token = !self.show_ma_token;
+                }
+            });
+            let paired = self.app.sendspin_paired_servers();
+            if !paired.is_empty() {
+                ui.add_space(sp::XS);
+                ui.label(
+                    egui::RichText::new(format!("Paired with: {}", paired.join(", ")))
+                        .size(12.0)
+                        .color(p.text_tertiary),
+                );
+            }
+        });
+    }
+}
+
 /// Outcome of one frame of a text-prompt modal.
 enum PromptAction {
     /// Still open, nothing decided this frame.
@@ -3268,6 +3502,13 @@ enum CloseAction {
     MinimiseToTray,
     Quit,
     Cancel,
+}
+
+/// State for the Sendspin speaker pairing modal.
+struct SendspinPrompt {
+    view: crate::sendspin_app::PairPromptView,
+    /// What the user is typing (code or token).
+    input: String,
 }
 
 /// State for the AirPlay password entry modal.

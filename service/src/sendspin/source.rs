@@ -67,6 +67,8 @@ pub struct SourceOptions {
     pub name: String,
     pub port: u16,
     pub software_version: String,
+    /// Announce via mDNS (off only for tests that dial the port directly).
+    pub advertise: bool,
 }
 
 struct Admitted {
@@ -126,9 +128,10 @@ impl SourceService {
         std::thread::Builder::new()
             .name("sendspin-source-accept".into())
             .spawn(move || accept_loop(sh, listener))?;
-        let mdns_fullname = match mdns::register_client(&opts.name, &opts.name, port) {
-            Ok(f) => Some(f),
-            Err(e) => {
+        let mdns_fullname = match opts.advertise.then(|| mdns::register_client(&opts.name, &opts.name, port)) {
+            None => None,
+            Some(Ok(f)) => Some(f),
+            Some(Err(e)) => {
                 warn!("Sendspin source: mDNS advertisement failed: {:#}", e);
                 *shared.state.lock().unwrap() = SourceState::Failed(format!("mDNS advertisement failed: {:#}", e));
                 None
@@ -780,38 +783,74 @@ fn spawn_time_sync(conn: Arc<Conn>) {
     });
 }
 
-/// Timestamp smoother: capture times come from frame arrival (jittery by
-/// scheduling); we follow a sample-counted timeline and only slew toward
-/// the measured arrival, re-anchoring on large jumps (stalls).
+/// Capture timestamps. Servers expect them to be sample-continuous —
+/// Music Assistant's bridge inserts silence when a timestamp runs more than
+/// 10 ms ahead of the previous chunk's end and drops a chunk that runs
+/// 10 ms behind — so the timeline is the sample count since an anchor.
+/// Frame arrival (jittery by scheduling) only steers it: a low-passed
+/// error slews the anchor in sub-millisecond steps, which absorbs drift
+/// between the audio clock and ours, and only a real stall (half a second)
+/// re-anchors.
 struct CaptureClock {
     anchor_us: Option<f64>,
     frames: u64,
+    err_ema_us: f64,
 }
+
+const CLOCK_REANCHOR_US: f64 = 500_000.0;
+const CLOCK_SLEW_THRESHOLD_US: f64 = 15_000.0;
+const CLOCK_SLEW_STEP_US: f64 = 200.0;
 
 impl CaptureClock {
     fn new() -> Self {
-        Self { anchor_us: None, frames: 0 }
+        Self {
+            anchor_us: None,
+            frames: 0,
+            err_ema_us: 0.0,
+        }
+    }
+
+    fn position_us(&self) -> f64 {
+        self.anchor_us.unwrap_or(0.0) + self.frames as f64 * 1e6 / WIRE_SAMPLE_RATE as f64
     }
 
     /// `measured_start_us`: local time the first sample of the next chunk
-    /// was (approximately) captured. Returns the smoothed value.
+    /// was (approximately) captured. Returns that chunk's timestamp.
     fn next(&mut self, measured_start_us: i64, chunk_frames: usize) -> i64 {
-        let predicted = self.anchor_us.map(|a| a + self.frames as f64 * 1e6 / WIRE_SAMPLE_RATE as f64);
-        let out = match predicted {
-            Some(p) if (p - measured_start_us as f64).abs() < 30_000.0 => {
-                // Slew 1% of the error per chunk.
-                let corr = (measured_start_us as f64 - p) * 0.01;
-                self.anchor_us = self.anchor_us.map(|a| a + corr);
-                p + corr
+        let measured = measured_start_us as f64;
+        match self.anchor_us {
+            None => self.reanchor(measured),
+            Some(_) => {
+                let err = measured - self.position_us();
+                if err.abs() > CLOCK_REANCHOR_US {
+                    self.reanchor(measured);
+                } else {
+                    self.err_ema_us = self.err_ema_us * 0.98 + err * 0.02;
+                    if self.err_ema_us.abs() > CLOCK_SLEW_THRESHOLD_US {
+                        let step = CLOCK_SLEW_STEP_US.copysign(self.err_ema_us);
+                        self.anchor_us = self.anchor_us.map(|a| a + step);
+                        self.err_ema_us -= step;
+                    }
+                }
             }
-            _ => {
-                self.anchor_us = Some(measured_start_us as f64);
-                self.frames = 0;
-                measured_start_us as f64
-            }
-        };
+        }
+        let out = self.position_us().round() as i64;
         self.frames += chunk_frames as u64;
-        out.round() as i64
+        out
+    }
+
+    /// Frames dropped before sending: the timeline moves on by exactly
+    /// their duration (a true gap the server fills with silence).
+    fn skip(&mut self, frames: usize) {
+        if self.anchor_us.is_some() {
+            self.frames += frames as u64;
+        }
+    }
+
+    fn reanchor(&mut self, measured: f64) {
+        self.anchor_us = Some(measured);
+        self.frames = 0;
+        self.err_ema_us = 0.0;
     }
 }
 
@@ -861,15 +900,16 @@ fn spawn_audio(sh: Arc<Shared>, conn: Arc<Conn>) {
             let pending_frames = pending.len() / BYTES_PER_FRAME;
             pending.extend_from_slice(&bytes[..frame_frames * BYTES_PER_FRAME]);
             let first_sample_us = arrived - ((pending_frames + frame_frames) as i64 * 1_000_000 / WIRE_SAMPLE_RATE as i64);
-            // Bound backlog after a stall: keep at most ~100 ms.
-            let max_bytes = (WIRE_SAMPLE_RATE as usize / 10) * BYTES_PER_FRAME;
+            // Bound backlog after a stall (spec: drop stale audio rather than
+            // bursting it): keep at most ~300 ms.
+            let max_bytes = (WIRE_SAMPLE_RATE as usize * 3 / 10) * BYTES_PER_FRAME;
             let mut start_us = first_sample_us;
             if pending.len() > max_bytes {
                 let drop = pending.len() - max_bytes;
                 let drop = drop - drop % BYTES_PER_FRAME;
                 pending.drain(..drop);
                 start_us += (drop / BYTES_PER_FRAME) as i64 * 1_000_000 / WIRE_SAMPLE_RATE as i64;
-                clock = CaptureClock::new();
+                clock.skip(drop / BYTES_PER_FRAME);
             }
             while pending.len() >= CHUNK_FRAMES * BYTES_PER_FRAME {
                 let chunk: Vec<u8> = pending.drain(..CHUNK_FRAMES * BYTES_PER_FRAME).collect();
@@ -914,15 +954,41 @@ mod tests {
     }
 
     #[test]
-    fn capture_clock_follows_samples_and_reanchors() {
+    fn capture_clock_is_sample_continuous_under_jitter() {
         let mut c = CaptureClock::new();
-        let t0 = c.next(1_000_000, CHUNK_FRAMES);
-        assert_eq!(t0, 1_000_000);
-        // Jittery arrival (+3 ms) barely moves the sample-counted timeline.
-        let t1 = c.next(1_020_000 + 3_000, CHUNK_FRAMES);
-        assert!((t1 - 1_020_000).abs() < 100, "t1={}", t1);
-        // A 200 ms stall re-anchors.
-        let t2 = c.next(1_300_000, CHUNK_FRAMES);
-        assert_eq!(t2, 1_300_000);
+        let dur = (CHUNK_FRAMES as f64 * 1e6 / WIRE_SAMPLE_RATE as f64) as i64;
+        let mut prev = c.next(1_000_000, CHUNK_FRAMES);
+        assert_eq!(prev, 1_000_000);
+        // ±35 ms of arrival jitter: every step stays within 1 ms of the
+        // chunk duration (servers reject >10 ms discontinuities).
+        for i in 1..500i64 {
+            let jitter = if i % 7 == 0 { 35_000 } else if i % 5 == 0 { -25_000 } else { 0 };
+            let ts = c.next(1_000_000 + i * dur + jitter, CHUNK_FRAMES);
+            assert!((ts - prev - dur).abs() <= 1_000, "step {} at {}", ts - prev, i);
+            prev = ts;
+        }
+    }
+
+    #[test]
+    fn capture_clock_slews_toward_drift_and_reanchors_on_stall() {
+        let mut c = CaptureClock::new();
+        let dur = CHUNK_FRAMES as f64 * 1e6 / WIRE_SAMPLE_RATE as f64;
+        // Audio clock 0.2% slow vs ours: arrival drifts later each chunk.
+        let mut t = 0f64;
+        let mut ts = 0;
+        for _ in 0..3_000 {
+            ts = c.next(t as i64, CHUNK_FRAMES);
+            t += dur * 1.002;
+        }
+        assert!((t - dur * 1.002 - ts as f64).abs() < 40_000.0, "tracking error {}", t - ts as f64);
+        // A 2 s stall re-anchors.
+        let after = c.next(t as i64 + 2_000_000, CHUNK_FRAMES);
+        assert_eq!(after, t as i64 + 2_000_000);
+        // Dropped frames advance the timeline by exactly their duration.
+        let mut d = CaptureClock::new();
+        d.next(0, CHUNK_FRAMES);
+        d.skip(CHUNK_FRAMES);
+        let x = d.next((2.0 * dur) as i64, CHUNK_FRAMES);
+        assert!((x as f64 - 2.0 * dur).abs() < 2.0);
     }
 }

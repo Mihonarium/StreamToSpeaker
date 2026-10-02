@@ -93,6 +93,7 @@ fn main() {
                 name: arg(&args, "--name").unwrap_or_else(|| "Harness Source".into()),
                 port: arg(&args, "--port").and_then(|p| p.parse().ok()).unwrap_or(8928),
                 software_version: env!("CARGO_PKG_VERSION").into(),
+                advertise: !args.iter().any(|a| a == "--no-mdns"),
             };
             let svc = stream_to_speaker::sendspin::source::SourceService::start(opts, hub, store).expect("start");
             println!("PORT {}", svc.port());

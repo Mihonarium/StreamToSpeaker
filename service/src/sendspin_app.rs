@@ -144,6 +144,7 @@ impl App {
             name: self.sendspin_source_name(),
             port: DEFAULT_CLIENT_PORT,
             software_version: crate::display_version().to_string(),
+            advertise: true,
         };
         let svc = SourceService::start(opts, self.hub.clone(), self.sendspin_store()).map_err(|e| format!("{:#}", e))?;
         info!("Music Assistant input enabled (port {})", svc.port());
