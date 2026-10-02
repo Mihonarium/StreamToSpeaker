@@ -97,6 +97,26 @@ Offline: `--bundle <file>.sigstore.json`, shipped with each release.
 
 The driver is [certified by Microsoft](https://partner.microsoft.com/en-us/dashboard/hardware/Driver/DownloadCertificationReport/95342530/14599256519720956/1152921505701928485).
 
+### Which driver is inside
+
+The installer bundles the Microsoft-signed package of a `driver-v*`
+release (currently [`driver-v1.1.0.209`](https://github.com/Mihonarium/StreamToSpeaker/releases/tag/driver-v1.1.0.209)),
+whose `manifest.json` records the source commit, the hash of the driver
+source tree and the SHA-256 of `StreamToSpeaker-Driver-<ver>-Signed.zip`.
+Releases after v0.1.9 also carry `StreamToSpeakerSetup-<ver>.driver.json`,
+naming that package and the SHA-256 of the `.sys`/`.inf`/`.cat` inside the
+installer (also in the release notes).
+
+The [Driver reproducibility](.github/workflows/driver-reproducibility.yml)
+workflow checks the chain end to end: it rebuilds the driver from the
+certified source with the release toolchain and compares it with both the
+package Microsoft tested and the shipped `Signed.zip` (signatures stripped;
+only timestamps, checksum and PDB identity masked), verifies the shipped
+package's hash and Microsoft catalog signature, and, given a release as
+`installer_tag`, unpacks that release's installer and checks that its
+driver files are the shipped package byte for byte. Run it from the
+Actions tab, or `gh workflow run driver-reproducibility.yml -f installer_tag=v0.1.9`.
+
 ## Developers
 
 Architecture, building from source, HTTP API: [TECHNICAL.md](TECHNICAL.md).

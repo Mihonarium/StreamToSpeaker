@@ -6,6 +6,8 @@ Used by driver-reproducibility.yml. Pure Python, no third-party modules.
   repro_compare.py sys  <released.sys> <fresh.sys>   [--json out.json]
   repro_compare.py inf  <released.inf> <fresh.inf>   [--json out.json]
   repro_compare.py tree <checkout>     <build_root>  [--json out.json]
+  repro_compare.py package <package.zip> <out_dir> --sha256 <expected> [--json out.json]
+  repro_compare.py files <dir_a> <dir_b>              [--json out.json]
 
 `sys` strips the Authenticode certificate table from both files (what
 `signtool remove /s` does; a no-op on an unsigned build), compares the raw
@@ -36,6 +38,16 @@ writes the build date); the version part must still match.
 `tree` checks that driver/ and include/ under the build root are
 byte-identical to the checkout the source-hash guard ran on.
 
+`package` checks a driver package zip against the SHA-256 a release
+manifest records for it, then extracts its .sys/.inf/.cat flat into
+out_dir under their canonical names (any directory layout inside the zip,
+names matched case-insensitively, a duplicate is an error) and records
+each file's SHA-256.
+
+`files` checks that the .sys/.inf/.cat in two directories are
+byte-identical (e.g. what an installer put on disk vs the package it is
+supposed to bundle).
+
 Exit status is 0 when the normalised comparison matches, 1 otherwise.
 When GITHUB_OUTPUT is set, `raw_identical`, `normalised_identical` and
 `toolset_identical` (true/false) are appended to it.
@@ -47,9 +59,10 @@ import os
 import re
 import struct
 import sys
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from certified import pe_strip_signature  # noqa: E402
+from certified import PACKAGE_FILES, pe_strip_signature  # noqa: E402
 
 IMAGE_DEBUG_TYPE = {
     0: "UNKNOWN", 1: "COFF", 2: "CODEVIEW", 3: "FPO", 4: "MISC", 5: "EXCEPTION",
@@ -470,13 +483,118 @@ def print_tree_report(rep):
     print(f"  identical: {rep['identical']}")
 
 
+def check_package(zip_path, expected_sha256, out_dir, names=PACKAGE_FILES):
+    """Verify a package zip's SHA-256 and extract its driver files flat."""
+    with open(zip_path, "rb") as fh:
+        digest = sha256(fh.read())
+    rep = {
+        "zip": zip_path,
+        "sha256": digest,
+        "expected_sha256": (expected_sha256 or "").lower(),
+        "sha256_ok": bool(expected_sha256) and digest == expected_sha256.lower(),
+        "files": {},
+        "missing": [],
+        "duplicates": [],
+    }
+    wanted = {n.lower(): n for n in names}
+    found = {}
+    with zipfile.ZipFile(zip_path) as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            canon = wanted.get(os.path.basename(info.filename).lower())
+            if not canon:
+                continue
+            if canon in found:
+                rep["duplicates"].append(info.filename)
+                continue
+            found[canon] = (info.filename, z.read(info))
+    rep["missing"] = [n for n in names if n not in found]
+    if rep["sha256_ok"] and not rep["missing"] and not rep["duplicates"]:
+        os.makedirs(out_dir, exist_ok=True)
+        for canon, (member, data) in found.items():
+            with open(os.path.join(out_dir, canon), "wb") as fh:
+                fh.write(data)
+            rep["files"][canon] = {"member": member, "size": len(data), "sha256": sha256(data)}
+    rep["ok"] = rep["sha256_ok"] and not rep["missing"] and not rep["duplicates"]
+    return rep
+
+
+def print_package_report(rep):
+    print(f"== package {rep['zip']} ==")
+    print(f"  sha256   : {rep['sha256']}")
+    print(f"  expected : {rep['expected_sha256'] or '(none)'}  -> {'match' if rep['sha256_ok'] else 'MISMATCH'}")
+    for name, f in rep["files"].items():
+        print(f"  {name:22} {f['sha256']}  ({f['size']} bytes, {f['member']})")
+    for name in rep["missing"]:
+        print(f"  missing: {name}")
+    for member in rep["duplicates"]:
+        print(f"  duplicate: {member}")
+    print(f"  ok: {rep['ok']}")
+
+
+def find_file(directory, name):
+    """Path of `name` in `directory`, matched case-insensitively, or None."""
+    if not os.path.isdir(directory):
+        return None
+    for entry in sorted(os.listdir(directory)):
+        if entry.lower() == name.lower() and os.path.isfile(os.path.join(directory, entry)):
+            return os.path.join(directory, entry)
+    return None
+
+
+def compare_files(dir_a, dir_b, names=PACKAGE_FILES):
+    """Are the named files byte-identical in both directories?"""
+    files = {}
+    for name in names:
+        row = {}
+        for label, d in (("a", dir_a), ("b", dir_b)):
+            p = find_file(d, name)
+            if p:
+                with open(p, "rb") as fh:
+                    row[label] = sha256(fh.read())
+            else:
+                row[label] = None
+        row["identical"] = row["a"] is not None and row["a"] == row["b"]
+        files[name] = row
+    return {"a": dir_a, "b": dir_b, "files": files,
+            "identical": all(r["identical"] for r in files.values())}
+
+
+def print_files_report(rep):
+    print(f"== {rep['a']} vs {rep['b']} ==")
+    for name, r in rep["files"].items():
+        print(f"  {name:22} {'identical' if r['identical'] else 'DIFFERENT'}  "
+              f"{r['a'] or '(missing)'} / {r['b'] or '(missing)'}")
+    print(f"  identical: {rep['identical']}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("kind", choices=("sys", "inf", "tree"))
+    ap.add_argument("kind", choices=("sys", "inf", "tree", "package", "files"))
     ap.add_argument("released")
     ap.add_argument("fresh")
     ap.add_argument("--json", help="also write the full report here")
+    ap.add_argument("--sha256", help="package: the SHA-256 the release manifest records for the zip")
     a = ap.parse_args(argv)
+
+    def dump(rep):
+        if a.json:
+            with open(a.json, "w", encoding="utf-8") as fh:
+                json.dump(rep, fh, indent=2)
+
+    if a.kind == "package":
+        rep = check_package(a.released, a.sha256, a.fresh)
+        print_package_report(rep)
+        dump(rep)
+        gh_output(package_ok=rep["ok"], package_sha256=rep["sha256"])
+        return 0 if rep["ok"] else 1
+    if a.kind == "files":
+        rep = compare_files(a.released, a.fresh)
+        print_files_report(rep)
+        dump(rep)
+        gh_output(files_identical=rep["identical"])
+        return 0 if rep["identical"] else 1
     if a.kind == "sys":
         rep = compare_sys(a.released, a.fresh)
         print_sys_report(rep)
