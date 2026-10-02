@@ -112,6 +112,75 @@ class SysCompare(unittest.TestCase):
         self.assertEqual(rep["differing_regions"][-1]["size"], 16)
 
 
+    def test_nonzero_header_padding_is_reported(self):
+        # Header slack after the section table is not compared positionally
+        # (its length follows e_lfanew), so it must be checked to be zero.
+        b = bytearray(make_pe())
+        b[0x3F0] = 0x5A
+        rep = rc.compare_sys(self.path("a", make_pe()), self.path("b", bytes(b)))
+        self.assertFalse(rep["normalised_identical"])
+        self.assertEqual([(r["offset"], r["size"]) for r in rep["differing_regions"]], [(0x3F0, 1)])
+        self.assertIn("non-zero padding in fresh", rep["differing_regions"][0]["region"])
+
+    def test_nonzero_stub_slack_is_reported(self):
+        # The bytes between the Rich header and the PE signature.
+        a = make_pe(rich=[(261, 35229, 8)], stub_pad=8)
+        b = bytearray(a)
+        b[0x40 + 16 + 8 + 8 + 2] = 1
+        rep = rc.compare_sys(self.path("a", a), self.path("b", bytes(b)))
+        self.assertFalse(rep["normalised_identical"])
+        self.assertEqual(len(rep["differing_regions"]), 1)
+
+    def test_build_constant_change_is_a_code_difference(self):
+        # A source tree stamped with a different build number compiles to a
+        # different immediate; masking must never hide that.
+        code8 = b"\x41\xb8" + struct.pack("<I", 8) + b"CODE" * 62
+        code209 = b"\x41\xb8" + struct.pack("<I", 209) + b"CODE" * 62
+        rep = rc.compare_sys(self.path("a", make_pe(code=code8)), self.path("b", make_pe(code=code209, timestamp=0x5555)))
+        self.assertFalse(rep["normalised_identical"])
+        self.assertEqual([r["region"] for r in rep["differing_regions"]], [".rdata"])
+
+
+class TreeCompare(unittest.TestCase):
+    def setUp(self):
+        self.src = tempfile.mkdtemp()
+        self.build = tempfile.mkdtemp()
+        for root in (self.src, self.build):
+            os.makedirs(os.path.join(root, "driver"))
+            os.makedirs(os.path.join(root, "include"))
+            self.write(root, "driver/driver.h", b"#define STREAM_TO_SPEAKER_DRIVER_BUILD          8u\r\n")
+            self.write(root, "include/abi.h", b"struct x;\r\n")
+
+    def write(self, root, rel, data):
+        with open(os.path.join(root, rel), "wb") as f:
+            f.write(data)
+
+    def test_identical_copy(self):
+        rep = rc.compare_trees(self.src, self.build)
+        self.assertTrue(rep["identical"])
+        self.assertEqual(rep["files"], 2)
+
+    def test_stamped_driver_h_is_caught(self):
+        # What the old stamp_driver_h option did after the source-hash guard.
+        self.write(self.build, "driver/driver.h", b"#define STREAM_TO_SPEAKER_DRIVER_BUILD          209u\r\n")
+        rep = rc.compare_trees(self.src, self.build)
+        self.assertFalse(rep["identical"])
+        self.assertEqual(rep["changed"], ["driver/driver.h"])
+        self.assertEqual(rc.main(["tree", self.src, self.build]), 1)
+
+    def test_extra_or_missing_files_are_caught(self):
+        self.write(self.build, "driver/extra.cpp", b"")
+        os.remove(os.path.join(self.build, "include", "abi.h"))
+        rep = rc.compare_trees(self.src, self.build)
+        self.assertEqual(rep["only_in_build"], ["driver/extra.cpp"])
+        self.assertEqual(rep["only_in_source"], ["include/abi.h"])
+        self.assertFalse(rep["identical"])
+
+    def test_empty_tree_is_not_identical(self):
+        rep = rc.compare_trees(tempfile.mkdtemp(), tempfile.mkdtemp())
+        self.assertFalse(rep["identical"])
+
+
 class InfCompare(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

@@ -6,13 +6,18 @@
 # certified (the `-lab-testsigned.zip` asset on a driver-v* release):
 #
 #   * guard: hashFiles('driver/**','include/**') of the checkout must equal
-#     the release manifest's `source_hash`, i.e. this IS the certified tree;
+#     the release manifest's `source_hash`, i.e. this IS the certified tree,
+#     and the tree msbuild compiles must be byte-identical to that checkout
+#     (nothing rewrites a source file in between: the lab package was built
+#     from the tree as committed, so driver.h's STREAM_TO_SPEAKER_DRIVER_BUILD
+#     is NOT stamped here; only the INF DriverVer carries the build number);
 #   * StreamToSpeaker.sys: Authenticode signature removed from the released
 #     copy, then raw SHA-256, then a normalised comparison that masks the PE
 #     fields known to vary between builds (COFF TimeDateStamp, PE CheckSum,
 #     debug-directory timestamps and the PDB GUID/age/path) and compares the
-#     header block and every section from their own offsets. Anything else
-#     that differs is listed by offset/size/section. The Rich header's
+#     header block and every section from their own offsets; padding outside
+#     those pieces must be zero. Anything else that differs is listed by
+#     offset/size/section. The Rich header's
 #     compiler/linker/library build ids are compared separately
 #     (`toolset_identical`) and only warn;
 #   * StreamToSpeaker.inf: compared with the DriverVer date masked (stampinf
@@ -49,11 +54,6 @@ on:
         description: "Directory the source is copied to before building. The PDB path the linker embeds depends on it, and its length changes the debug-directory layout."
         required: false
         default: 'C:\build\src'
-      stamp_driver_h:
-        description: "Rewrite STREAM_TO_SPEAKER_DRIVER_BUILD in driver/driver.h to build_number before building (what build.yml and driver-submission.yml do). Off: build the tree exactly as checked out."
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: read
@@ -94,8 +94,8 @@ jobs:
         with:
           ref: ${{ inputs.commit || github.sha }}
 
-      # The identity hash must be taken from the pristine checkout, before
-      # anything (the optional driver.h stamp) touches the tree.
+      # Identity of the checkout; the build step then proves the tree it
+      # compiles is byte-identical to it.
       - name: Compute driver source hash
         id: srchash
         shell: pwsh
@@ -158,9 +158,10 @@ jobs:
               Write-Host "Could not add Defender exclusions ($_) - continuing"
           }
 
+      # Restore only: this job never writes build.yml's cache entry.
       - name: Restore WDK cache
         id: cache-wdk
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             C:\Program Files (x86)\Windows Kits\10
@@ -214,18 +215,6 @@ jobs:
           python-version: "3.x"
 
       # ---- Build ----
-      - name: Stamp driver build number into driver.h
-        if: inputs.stamp_driver_h
-        shell: pwsh
-        env:
-          BUILD_NUMBER: ${{ steps.params.outputs.build_number }}
-        run: |
-          $path = "driver/driver.h"
-          $content = Get-Content $path -Raw
-          $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}$($env:BUILD_NUMBER)u"
-          Set-Content -Path $path -Value $new -NoNewline
-          Write-Host "driver.h stamped: STREAM_TO_SPEAKER_DRIVER_BUILD $env:BUILD_NUMBER"
-
       - name: Build driver (Release|x64, unsigned, pinned build number)
         id: build
         shell: pwsh
@@ -241,6 +230,8 @@ jobs:
           Copy-Item -Recurse driver (Join-Path $root "driver")
           Copy-Item -Recurse include (Join-Path $root "include")
           Write-Host "Source copied to $root"
+          python .github/scripts/repro_compare.py tree . $root
+          if ($LASTEXITCODE -ne 0) { throw "the build tree differs from the checkout whose source hash was verified" }
           Write-Host "driver.h: $((Select-String -Path (Join-Path $root 'driver\driver.h') -Pattern 'STREAM_TO_SPEAKER_DRIVER_BUILD').Line.Trim())"
 
           $log = Join-Path $env:GITHUB_WORKSPACE "msbuild-detailed.log"
@@ -428,8 +419,13 @@ jobs:
         env:
           OK: ${{ steps.verdict.outputs.normalised_identical }}
           SYS_RAW: ${{ steps.cmp_sys.outputs.raw_identical }}
+          SYS_NORM: ${{ steps.cmp_sys.outputs.normalised_identical }}
           SYS_TOOLSET: ${{ steps.cmp_sys.outputs.toolset_identical }}
+          INF_NORM: ${{ steps.cmp_inf.outputs.normalised_identical }}
         run: |
+          # A comparison that crashed sets no output; that is an error of the
+          # check, not evidence that the driver is not reproducible.
+          if (-not $env:SYS_NORM -or -not $env:INF_NORM) { throw "a comparison step did not complete (see its log); no verdict" }
           if ($env:OK -ne 'true') { throw "the rebuilt driver differs from the released package beyond the masked fields (see summary)" }
           if ($env:SYS_RAW -eq 'true') { Write-Host "Byte-for-byte reproducible." }
           elseif ($env:SYS_TOOLSET -eq 'true') { Write-Host "Reproducible up to timestamps / checksum / PDB identity." }

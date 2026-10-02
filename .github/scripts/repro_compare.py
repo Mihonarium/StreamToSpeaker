@@ -5,6 +5,7 @@ Used by driver-reproducibility.yml. Pure Python, no third-party modules.
 
   repro_compare.py sys  <released.sys> <fresh.sys>   [--json out.json]
   repro_compare.py inf  <released.inf> <fresh.inf>   [--json out.json]
+  repro_compare.py tree <checkout>     <build_root>  [--json out.json]
 
 `sys` strips the Authenticode certificate table from both files (what
 `signtool remove /s` does; a no-op on an unsigned build), compares the raw
@@ -19,7 +20,9 @@ known to vary between otherwise identical builds masked out:
 The comparison is structural rather than positional: the PE header block
 (COFF + optional header + section table) is compared from each file's own
 e_lfanew (linkers pad the DOS stub differently), then every section's raw
-bytes. Everything else — code, data, relocations, imports — must match.
+bytes. Everything else — code, data, relocations, imports — must match,
+and the bytes no piece covers (stub slack, header padding, gaps between
+sections) must be zero in both files.
 The Rich header (the linker's record of which compiler/linker/library
 build numbers produced each object) is decoded and compared separately as
 `toolset_identical`; it is metadata, not image content, so it does not
@@ -29,6 +32,9 @@ both files' headers (linker version, timestamps, PDB, Rich header).
 
 `inf` compares the two INFs with the DriverVer *date* masked (stampinf
 writes the build date); the version part must still match.
+
+`tree` checks that driver/ and include/ under the build root are
+byte-identical to the checkout the source-hash guard ran on.
 
 Exit status is 0 when the normalised comparison matches, 1 otherwise.
 When GITHUB_OUTPUT is set, `raw_identical`, `normalised_identical` and
@@ -213,6 +219,42 @@ def structure(pe, total_len):
     return parts
 
 
+def uncompared_ranges(pe, total_len):
+    """Byte ranges `structure()` leaves out (Rich header aside): the slack
+    between the Rich header and the PE signature, the header padding after
+    the section table, and any gaps between sections. Linkers fill them
+    with zeros; they are not compared positionally because their length
+    follows e_lfanew, but anything non-zero in them must not go unseen."""
+    covered = sorted((a, b) for _, a, b in structure(pe, total_len) if b > a)
+    rich = pe.rich_header()
+    if rich:
+        covered = sorted(covered + [(rich["offset"], rich["end"])])
+    gaps, pos = [], 0
+    for a, b in covered:
+        if a > pos:
+            gaps.append((pos, a))
+        pos = max(pos, b)
+    if pos < total_len:
+        gaps.append((pos, total_len))
+    return gaps
+
+
+def nonzero_ranges(data, start, end):
+    """Contiguous runs of non-zero bytes in data[start:end], absolute."""
+    out = []
+    i = start
+    while i < end:
+        if data[i] == 0:
+            i += 1
+            continue
+        j = i
+        while j < end and data[j] != 0:
+            j += 1
+        out.append((i, j - i))
+        i = j
+    return out
+
+
 def diff_regions(a, b, limit=200):
     """Contiguous byte ranges where a and b differ (length mismatch counts
     as one trailing region)."""
@@ -285,6 +327,12 @@ def compare_sys(released_path, fresh_path):
         # Different section list: fall back to a plain byte diff.
         for off, size in diff_regions(norm_r, norm_f):
             regions.append({"offset": off, "size": size, "region": pe_r.region_of(off)})
+    # Bytes outside every compared piece must be zero padding in both files.
+    for label, pe, data in (("released", pe_r, norm_r), ("fresh", pe_f, norm_f)):
+        for g0, g1 in uncompared_ranges(pe, len(data)):
+            for off, size in nonzero_ranges(data, g0, g1):
+                regions.append({"offset": off, "size": size,
+                                "region": f"non-zero padding in {label} ({pe.region_of(off)})"})
     report["same_layout"] = same_layout
     report["e_lfanew"] = {"released": pe_r.e_lfanew, "fresh": pe_f.e_lfanew}
     report["normalised_identical"] = same_layout and not regions
@@ -382,9 +430,49 @@ def print_inf_report(rep):
         print(f"    line {d['line']}: released={d['released']!r} fresh={d['fresh']!r}")
 
 
+def tree_files(root, subdirs):
+    """{relative/posix/path: sha256} of every file under root/<subdir>."""
+    out = {}
+    for sub in subdirs:
+        base = os.path.join(root, sub)
+        for dirpath, _dirs, files in os.walk(base):
+            for name in files:
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, root).replace(os.sep, "/")
+                with open(full, "rb") as fh:
+                    out[rel] = sha256(fh.read())
+    return out
+
+
+def compare_trees(source_root, build_root, subdirs=("driver", "include")):
+    """Is the tree msbuild is about to compile byte-identical to the checkout
+    whose hashFiles() matched the release manifest? Catches any step that
+    rewrites a source file (e.g. stamping driver.h) between the identity
+    guard and the build."""
+    a, b = tree_files(source_root, subdirs), tree_files(build_root, subdirs)
+    changed = sorted(k for k in a.keys() & b.keys() if a[k] != b[k])
+    return {
+        "source_root": source_root,
+        "build_root": build_root,
+        "files": len(a),
+        "only_in_source": sorted(a.keys() - b.keys()),
+        "only_in_build": sorted(b.keys() - a.keys()),
+        "changed": changed,
+        "identical": bool(a) and a == b,
+    }
+
+
+def print_tree_report(rep):
+    print(f"== build tree {rep['build_root']} vs checkout {rep['source_root']} ({rep['files']} files) ==")
+    for key in ("only_in_source", "only_in_build", "changed"):
+        for path in rep[key]:
+            print(f"  {key.replace('_', ' ')}: {path}")
+    print(f"  identical: {rep['identical']}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("kind", choices=("sys", "inf"))
+    ap.add_argument("kind", choices=("sys", "inf", "tree"))
     ap.add_argument("released")
     ap.add_argument("fresh")
     ap.add_argument("--json", help="also write the full report here")
@@ -392,9 +480,16 @@ def main(argv=None):
     if a.kind == "sys":
         rep = compare_sys(a.released, a.fresh)
         print_sys_report(rep)
-    else:
+    elif a.kind == "inf":
         rep = compare_inf(a.released, a.fresh)
         print_inf_report(rep)
+    else:
+        rep = compare_trees(a.released, a.fresh)
+        print_tree_report(rep)
+        if a.json:
+            with open(a.json, "w", encoding="utf-8") as fh:
+                json.dump(rep, fh, indent=2)
+        return 0 if rep["identical"] else 1
     if a.json:
         with open(a.json, "w", encoding="utf-8") as fh:
             json.dump(rep, fh, indent=2)
