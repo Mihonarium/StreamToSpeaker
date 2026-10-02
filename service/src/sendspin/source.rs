@@ -728,6 +728,11 @@ fn run_pairing(
         _ => {
             let digits = act.pin_length.unwrap_or(MIN_CODE_DIGITS).max(MIN_CODE_DIGITS);
             let show = |code: Option<String>| {
+                if let Some(c) = &code {
+                    // Single-use and only valid for this attempt; logged so
+                    // a headless install can still be paired.
+                    info!("Sendspin source: pairing code for {} is {}", server_name, c);
+                }
                 *sh.code.lock().unwrap() = code.map(|c| (c, server_name.to_string()));
             };
             pairing::client_dynamic_code(&ctx, digits, &show)

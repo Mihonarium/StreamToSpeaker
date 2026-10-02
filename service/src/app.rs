@@ -52,6 +52,8 @@ pub enum ActiveSession {
     Upnp(RendererSession),
     AirPlay(AirPlaySession),
     AirPlay2(AirPlay2Session),
+    /// Sendspin player (we push timestamped audio, like AirPlay).
+    Sendspin(crate::sendspin::server::PlayerSession),
 }
 
 impl ActiveSession {
@@ -60,6 +62,7 @@ impl ActiveSession {
             ActiveSession::Upnp(s) => s.renderer.stable_id(),
             ActiveSession::AirPlay(s) => s.renderer.stable_id(),
             ActiveSession::AirPlay2(s) => s.renderer.stable_id(),
+            ActiveSession::Sendspin(s) => s.renderer.stable_id(),
         }
     }
 
@@ -70,6 +73,7 @@ impl ActiveSession {
             ActiveSession::Upnp(s) => s.renderer.display_name(),
             ActiveSession::AirPlay(s) => s.renderer.friendly_name.clone(),
             ActiveSession::AirPlay2(s) => s.renderer.friendly_name.clone(),
+            ActiveSession::Sendspin(s) => s.renderer.friendly_name.clone(),
         }
     }
 
@@ -78,6 +82,7 @@ impl ActiveSession {
             ActiveSession::Upnp(s) => s.renderer.ip,
             ActiveSession::AirPlay(s) => s.renderer.ip,
             ActiveSession::AirPlay2(s) => s.renderer.ip,
+            ActiveSession::Sendspin(s) => s.renderer.ip,
         }
     }
 
@@ -89,6 +94,7 @@ impl ActiveSession {
             ActiveSession::Upnp(s) => stop_session(&s),
             ActiveSession::AirPlay(s) => s.stop(),
             ActiveSession::AirPlay2(s) => s.stop(),
+            ActiveSession::Sendspin(s) => s.stop(),
         }
     }
 
@@ -104,6 +110,7 @@ impl ActiveSession {
             },
             ActiveSession::AirPlay(s) => s.set_volume_pct(pct),
             ActiveSession::AirPlay2(s) => s.set_volume_pct(pct),
+            ActiveSession::Sendspin(s) => s.set_volume_pct(pct),
         }
     }
 
@@ -113,7 +120,7 @@ impl ActiveSession {
     pub fn metadata_handle(&self) -> Option<crate::airplay::session::MetadataHandle> {
         match self {
             ActiveSession::AirPlay(s) => Some(s.metadata_handle()),
-            ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) => None,
+            ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) | ActiveSession::Sendspin(_) => None,
         }
     }
 
@@ -125,6 +132,7 @@ impl ActiveSession {
             ActiveSession::Upnp(_) => false,
             ActiveSession::AirPlay(s) => s.is_dead(),
             ActiveSession::AirPlay2(s) => s.is_dead(),
+            ActiveSession::Sendspin(s) => s.is_dead(),
         }
     }
 
@@ -136,6 +144,7 @@ impl ActiveSession {
             ActiveSession::Upnp(_) => None,
             ActiveSession::AirPlay(s) => Some(s.resend_stats()),
             ActiveSession::AirPlay2(s) => Some(s.resend_stats()),
+            ActiveSession::Sendspin(_) => None,
         }
     }
 
@@ -148,6 +157,7 @@ impl ActiveSession {
             },
             ActiveSession::AirPlay(s) => s.set_mute(muted),
             ActiveSession::AirPlay2(s) => s.set_mute(muted),
+            ActiveSession::Sendspin(s) => s.set_mute(muted),
         }
     }
 }
@@ -293,6 +303,9 @@ pub struct App {
     /// reset the accessory's single HAP pairing session mid-ceremony).
     /// Cleared by the ceremony's RAII guard on every exit path.
     pin_ceremony: Mutex<Option<PinCeremonyState>>,
+
+    /// Sendspin players + the Music Assistant source (`sendspin_app`).
+    pub(crate) sendspin: crate::sendspin_app::SendspinAppState,
 }
 
 /// A PIN pairing ceremony in flight (see [`App::begin_pin_pairing`]).
@@ -404,6 +417,7 @@ impl App {
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
+            sendspin: Default::default(),
         })
     }
 
@@ -934,6 +948,7 @@ impl App {
                 });
             }
         }
+        speakers.extend(self.sendspin_speakers(active_id.as_deref()));
         speakers.sort_by(|a, b| a.friendly_name.cmp(&b.friendly_name));
         SpeakerView { speakers, active_id }
     }
@@ -998,6 +1013,19 @@ impl App {
     }
 
     fn select_speaker_async_opts(self: &Arc<Self>, id: &str, interactive: bool) {
+        self.select_speaker_async_with(id, interactive, None);
+    }
+
+    /// [`select_speaker_async_opts`] carrying a Sendspin pairing input
+    /// (token or code) for a speaker that needs pairing.
+    ///
+    /// [`select_speaker_async_opts`]: App::select_speaker_async_opts
+    pub(crate) fn select_speaker_async_with(
+        self: &Arc<Self>,
+        id: &str,
+        interactive: bool,
+        sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
+    ) {
         {
             let mut guard = self.connecting.lock().unwrap();
             if let Some(name) = guard.as_ref() {
@@ -1020,15 +1048,16 @@ impl App {
                         .and_then(|d| d.find_by_id(id))
                         .map(|r| r.friendly_name)
                 })
+                .or_else(|| self.sendspin_name_for(id))
                 .unwrap_or_else(|| id.to_string());
-            *guard = Some(name);
+            *guard = Some(if sendspin_pairing.is_some() { format!("{} (pairing)", name) } else { name });
         }
         let app = self.clone();
         let id = id.to_string();
         std::thread::Builder::new()
             .name("stream-to-speaker-connect".into())
             .spawn(move || {
-                let result = app.select_speaker_opts(&id, interactive);
+                let result = app.select_speaker_inner(&id, interactive, sendspin_pairing);
                 *app.connecting.lock().unwrap() = None;
                 if let Err(e) = result {
                     app.record_error(format!("Couldn't connect to speaker: {}", e));
@@ -1079,7 +1108,7 @@ impl App {
                     };
 
                     warn!(
-                        "AirPlay session to {} dropped; auto-reconnecting in {} s",
+                        "Session to {} dropped; auto-reconnecting in {} s",
                         name,
                         RECONNECT_GRACE.as_secs()
                     );
@@ -1229,6 +1258,15 @@ impl App {
     }
 
     fn select_speaker_opts(self: &Arc<Self>, id: &str, interactive: bool) -> Result<(), String> {
+        self.select_speaker_inner(id, interactive, None)
+    }
+
+    fn select_speaker_inner(
+        self: &Arc<Self>,
+        id: &str,
+        interactive: bool,
+        sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
+    ) -> Result<(), String> {
         // A PIN ceremony in flight for THIS device owns its pairing state:
         // a concurrent transient pair-setup would reset the accessory's
         // single in-progress HAP pairing session and make the ceremony
@@ -1266,7 +1304,9 @@ impl App {
         // last scan streams to its group coordinator instead (see
         // start_upnp). Remember the id we actually bound so reconnect /
         // active-row highlighting track reality.
-        let new_session = if id.starts_with("airplay:") {
+        let new_session = if crate::sendspin_app::is_sendspin_id(id) {
+            self.start_sendspin_player(id, sendspin_pairing, interactive)?
+        } else if id.starts_with("airplay:") {
             match self.start_airplay(id) {
                 Ok(s) => s,
                 Err(SelectFailure::Msg(m)) => return Err(m),
@@ -2033,6 +2073,10 @@ impl App {
                 }
                 Some(ActiveSession::AirPlay2(s)) => {
                     // Same recovery as AirPlay 1: tear down + reconnect.
+                    Kind::AirPlay(s.renderer.stable_id())
+                }
+                Some(ActiveSession::Sendspin(s)) => {
+                    // A fresh session restarts the stream timeline.
                     Kind::AirPlay(s.renderer.stable_id())
                 }
                 None => return Err("no active speaker".to_string()),

@@ -135,6 +135,16 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_airplay: bool,
 
+    /// Skip Sendspin: no Sendspin speakers in the list and no Music
+    /// Assistant input.
+    #[arg(long, default_value_t = false)]
+    no_sendspin: bool,
+
+    /// Offer this computer's audio to Music Assistant as a Sendspin
+    /// input for this run (the GUI toggle saves the same setting).
+    #[arg(long, default_value_t = false)]
+    sendspin_source: bool,
+
     /// Disable silence injection (will send literal zeros during silence).
     #[arg(long, default_value_t = false)]
     no_silence_injection: bool,
@@ -453,6 +463,14 @@ fn run(cli: Cli) -> Result<()> {
     info!("audio source: {}", source.name());
 
     let app = setup_app(&cli)?;
+    if cli.no_sendspin {
+        app.disable_sendspin();
+    } else {
+        app.init_sendspin(!cli.no_discovery, cli.sendspin_source);
+        if cli.player.is_none() {
+            app.reconnect_saved_sendspin_speaker();
+        }
+    }
 
     // Always start the full HTTP server (audio + API + UI). The /, /api/*
     // routes honour app.is_web_ui_enabled() at request time, so the GUI
@@ -613,6 +631,7 @@ fn run_gui_mode(_app: Arc<App>, _no_tray: bool) -> Result<()> {
 }
 
 fn shutdown_cleanup(app: &Arc<App>) {
+    app.stop_sendspin();
     info!("shutdown: tearing down active session");
     let final_session = app.session.lock().unwrap().take();
     if let Some(s) = final_session {
