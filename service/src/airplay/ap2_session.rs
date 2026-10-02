@@ -826,6 +826,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
     let mut seq = cfg.initial_seq;
     let mut rtptime = cfg.initial_rtptime;
     let mut packet_count: u64 = 0;
+    let mut audio_nonce: u64 = 0;
     let mut ring: Vec<i16> = Vec::with_capacity(spf * 2);
 
     // The AAC encoder must live on this thread (COM); the session already
@@ -950,7 +951,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
 
             for payload in payloads {
                 let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
-                let sealed = seal_audio(&cfg.audio_key, &header, seq, &payload);
+                let sealed = seal_audio(&cfg.audio_key, &header, audio_nonce, &payload);
                 let mut packet = Vec::with_capacity(12 + sealed.len());
                 packet.extend_from_slice(&header);
                 packet.extend_from_slice(&sealed);
@@ -983,6 +984,14 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
                 cfg.current_rtptime.store(rtptime, Ordering::Release);
                 cfg.last_seq.store(seq as u32, Ordering::Release);
                 packet_count += 1;
+                audio_nonce = match audio_nonce.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        warn!("AirPlay 2 audio nonce exhausted; ending session before nonce reuse");
+                        cfg.session_dead.store(true, Ordering::Release);
+                        return;
+                    }
+                };
                 if packet_count % 500 == 0 {
                     debug!(
                         "AirPlay 2: {} buffered packets sent ({} s)",
@@ -1032,6 +1041,7 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
     let mut seq = cfg.initial_seq;
     let mut rtptime = cfg.initial_rtptime;
     let mut packet_count: u64 = 0;
+    let mut audio_nonce: u64 = 0;
     let mut silence_packets: u64 = 0;
     let mut got_real_audio = false;
     let mut idle_warned = false;
@@ -1145,7 +1155,7 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
         };
         let alac = build_uncompressed_alac_frame(&pkt_samples);
         let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
-        let sealed = seal_audio(&cfg.audio_key, &header, seq, &alac);
+        let sealed = seal_audio(&cfg.audio_key, &header, audio_nonce, &alac);
         let mut packet = Vec::with_capacity(12 + sealed.len());
         packet.extend_from_slice(&header);
         packet.extend_from_slice(&sealed);
@@ -1173,6 +1183,14 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
         rtptime = rtptime.wrapping_add(FRAMES_PER_PACKET as u32);
         cfg.current_rtptime.store(rtptime, Ordering::Release);
         packet_count += 1;
+        audio_nonce = match audio_nonce.checked_add(1) {
+            Some(next) => next,
+            None => {
+                warn!("AirPlay 2 audio nonce exhausted; ending session before nonce reuse");
+                cfg.session_dead.store(true, Ordering::Release);
+                return;
+            }
+        };
     }
     info!(
         "AirPlay 2 RTP sender stopped after {} packets ({} silence-filled)",
