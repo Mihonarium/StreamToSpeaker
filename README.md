@@ -8,6 +8,8 @@ Stream To Speaker adds a virtual audio output to Windows and streams it over
 the network — to Sonos, IKEA SYMFONISK, KEF, Denon HEOS, MoOde and Volumio
 over **UPnP / OpenHome**, and to HomePod, AirPort Express and shairport-sync
 over **AirPlay**. Windows volume and the speaker's own buttons stay in sync.
+It also streams to **Sendspin** speakers (Music Assistant's streaming
+protocol) and can offer the PC's sound to Music Assistant as an input.
 
 ## Install
 
@@ -27,6 +29,16 @@ group volume. To stream to a single speaker, ungroup it in the Sonos app.
 Sound lagging behind video → **−25 / −100 ms**. No sound → **Resync**
 (`Ctrl+Shift+R`). Speaker missing → **↻ Rescan**; check it's on the same
 network as the PC.
+
+Sendspin speakers play directly, without Music Assistant. One that asks to be
+paired shows or says a code (or has one printed on it): type it in when the app
+asks; it's remembered.
+
+**Music Assistant input:** tick *Offer this computer as a Music Assistant input*
+and enable the Sendspin Source plugin in Music Assistant. The first time, open
+this computer in Music Assistant's player settings and run its setup; the app
+shows a 6-digit code to type in there. After that the PC appears as a source
+you can play on any Music Assistant speaker.
 
 Closing the window minimises to the tray; quit from the tray menu.
 
