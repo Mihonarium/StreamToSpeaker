@@ -30,6 +30,8 @@ Sound lagging behind video → **−25 / −100 ms**. No sound → **Resync**
 (`Ctrl+Shift+R`). Speaker missing → **↻ Rescan**; check it's on the same
 network as the PC.
 
+Sendspin is off by default: tick *Enable Sendspin* in the *Sendspin and Music
+Assistant* card to list Sendspin speakers and offer the Music Assistant input.
 Sendspin speakers play directly, without Music Assistant. One that asks to be
 paired shows or says a code (or has one printed on it): type it in when the app
 asks; it's remembered.

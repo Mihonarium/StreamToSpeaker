@@ -54,6 +54,8 @@ pub struct SendspinAppState {
     pub(crate) source: Mutex<Option<SourceService>>,
     pub(crate) prompt: Mutex<Option<PairPrompt>>,
     pub(crate) disabled: AtomicBool,
+    /// Speaker discovery may run this session (not `--no-discovery`).
+    pub(crate) discovery_allowed: AtomicBool,
 }
 
 /// Persistence through the app's `config.json` (weak: sessions must not
@@ -92,20 +94,63 @@ impl App {
     /// source. `force_source` enables the source for this run without
     /// changing the saved setting (command-line use).
     pub fn init_sendspin(self: &Arc<Self>, discovery: bool, force_source: bool) {
-        if discovery {
-            let st = SendspinDiscoveryState::new();
-            match server::spawn_discovery(st.clone()) {
-                Ok(()) => {
-                    let _ = self.sendspin.discovery.set(st);
-                }
-                Err(e) => warn!("Sendspin discovery failed to start: {:#} (continuing without it)", e),
-            }
+        self.sendspin.discovery_allowed.store(discovery, Ordering::SeqCst);
+        let (enabled, saved) = {
+            let uc = self.user_config.lock().unwrap();
+            (uc.sendspin.enabled, uc.sendspin.source_enabled)
+        };
+        if !enabled && !force_source {
+            return;
         }
-        let saved = self.user_config.lock().unwrap().sendspin.source_enabled;
+        if enabled {
+            self.start_sendspin_discovery();
+        }
         if saved || force_source {
             if let Err(e) = self.start_sendspin_source() {
                 self.record_error(format!("Couldn't start the Music Assistant input: {}", e));
             }
+        }
+    }
+
+    fn start_sendspin_discovery(self: &Arc<Self>) {
+        if !self.sendspin.discovery_allowed.load(Ordering::SeqCst) || self.sendspin.discovery.get().is_some() {
+            return;
+        }
+        let st = SendspinDiscoveryState::new();
+        match server::spawn_discovery(st.clone()) {
+            Ok(()) => {
+                let _ = self.sendspin.discovery.set(st);
+            }
+            Err(e) => warn!("Sendspin discovery failed to start: {:#} (continuing without it)", e),
+        }
+    }
+
+    /// The saved "Enable Sendspin" setting (off by default).
+    pub fn is_sendspin_enabled(&self) -> bool {
+        self.user_config.lock().unwrap().sendspin.enabled
+    }
+
+    /// GUI toggle: persist; on starts speaker discovery (and the Music
+    /// Assistant input if it was left on), off stops the input and hides
+    /// Sendspin speakers.
+    pub fn set_sendspin_enabled(self: &Arc<Self>, on: bool) {
+        let source_saved = {
+            let mut uc = self.user_config.lock().unwrap();
+            if uc.sendspin.enabled != on {
+                uc.sendspin.enabled = on;
+                uc.save();
+            }
+            uc.sendspin.source_enabled
+        };
+        if on {
+            self.start_sendspin_discovery();
+            if source_saved && !self.is_sendspin_source_enabled() {
+                if let Err(e) = self.start_sendspin_source() {
+                    self.record_error(format!("Couldn't start the Music Assistant input: {}", e));
+                }
+            }
+        } else {
+            self.stop_sendspin();
         }
     }
 
@@ -227,7 +272,7 @@ impl App {
         let Some(d) = self.sendspin.discovery.get() else {
             return Vec::new();
         };
-        if !self.is_sendspin_available() {
+        if !self.is_sendspin_available() || !self.is_sendspin_enabled() {
             return Vec::new();
         }
         d.renderers()
@@ -256,7 +301,7 @@ impl App {
         let Some(id) = self.saved_speaker_id().filter(|id| is_sendspin_id(id)) else {
             return;
         };
-        if !self.is_auto_reconnect_on_launch() || !self.is_sendspin_available() {
+        if !self.is_auto_reconnect_on_launch() || !self.is_sendspin_available() || !self.is_sendspin_enabled() {
             return;
         }
         let app = self.clone();

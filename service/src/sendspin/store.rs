@@ -18,6 +18,10 @@ pub const MAX_CLIENT_RECORDS: usize = 8;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SendspinConfig {
+    /// Sendspin is opt-in: off (the default) means no Sendspin speaker
+    /// discovery and no Music Assistant input.
+    #[serde(default)]
+    pub enabled: bool,
     /// Act as a Sendspin source for Music Assistant (advertise
     /// `_sendspin._tcp` and stream system audio when a server asks).
     #[serde(default)]

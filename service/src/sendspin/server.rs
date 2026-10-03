@@ -158,7 +158,7 @@ pub fn spawn_discovery(state: Arc<SendspinDiscoveryState>) -> Result<()> {
         .spawn(move || loop {
             match rx.recv_timeout(Duration::from_secs(60)) {
                 Ok(ServiceEvent::ServiceResolved(info)) => {
-                    if mdns::is_own_instance(info.get_fullname()) {
+                    if mdns::is_own_instance(info.get_fullname()) || mdns::is_source_advert(&info) {
                         continue;
                     }
                     if let Some(r) = renderer_from_info(&info) {

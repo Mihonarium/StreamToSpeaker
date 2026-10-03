@@ -3308,7 +3308,22 @@ impl StreamToSpeakerApp {
     /// how to pair it.
     fn show_music_assistant(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
-            section_label(ui, p, "Music Assistant");
+            section_label(ui, p, "Sendspin and Music Assistant");
+            let mut enabled = self.app.is_sendspin_enabled();
+            if ui
+                .checkbox(&mut enabled, "Enable Sendspin (experimental)")
+                .on_hover_text(
+                    "Lists Sendspin speakers (for example ESPHome speakers) and lets you offer \
+                     this computer as a Music Assistant input. Off by default.",
+                )
+                .changed()
+            {
+                self.app.set_sendspin_enabled(enabled);
+            }
+            if !enabled {
+                return;
+            }
+            ui.add_space(sp::S);
             ui.label(
                 egui::RichText::new(
                     "Make this computer's audio available in Music Assistant as a live input \

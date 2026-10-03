@@ -9,6 +9,9 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 pub const CLIENT_SERVICE: &str = "_sendspin._tcp.local.";
+/// TXT marker on this app's source advertisement.
+pub const SOURCE_MARKER_KEY: &str = "sts";
+pub const SOURCE_MARKER_VALUE: &str = "source";
 pub const DEFAULT_CLIENT_PORT: u16 = 8928;
 pub const DEFAULT_PATH: &str = "/sendspin";
 
@@ -67,13 +70,22 @@ fn host_label(name: &str) -> String {
     h
 }
 
+/// True for this app's own Music Assistant source advertisement (another
+/// copy of the app), which is not a speaker.
+pub fn is_source_advert(info: &ServiceInfo) -> bool {
+    info.get_property_val_str(SOURCE_MARKER_KEY) == Some(SOURCE_MARKER_VALUE)
+}
+
 /// Advertise a Sendspin client endpoint. Returns the registered fullname
 /// (pass it to [`unregister`]).
 pub fn register_client(instance: &str, friendly_name: &str, port: u16) -> Result<String> {
     let d = daemon()?;
     let instance = instance_label(instance);
     let host = format!("{}-sendspin.local.", host_label(&crate::sendspin::machine_name()));
-    let props = [("path", DEFAULT_PATH), ("name", friendly_name)];
+    // `sts=source` marks this app's own source advertisement, so other
+    // copies of the app don't list it as a speaker (roles are otherwise
+    // only known after connecting).
+    let props = [("path", DEFAULT_PATH), ("name", friendly_name), (SOURCE_MARKER_KEY, SOURCE_MARKER_VALUE)];
     let info = ServiceInfo::new(CLIENT_SERVICE, &instance, &host, "", port, &props[..])
         .map_err(|e| anyhow!("mDNS service info: {}", e))?
         .enable_addr_auto();
@@ -96,6 +108,16 @@ pub fn unregister(fullname: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_marker_is_recognised() {
+        let src = ServiceInfo::new(CLIENT_SERVICE, "pc", "pc.local.", "192.0.2.1", 8928,
+            &[("path", DEFAULT_PATH), (SOURCE_MARKER_KEY, SOURCE_MARKER_VALUE)][..]).unwrap();
+        let spk = ServiceInfo::new(CLIENT_SERVICE, "kitchen", "k.local.", "192.0.2.2", 8928,
+            &[("path", DEFAULT_PATH), ("name", "Kitchen")][..]).unwrap();
+        assert!(is_source_advert(&src));
+        assert!(!is_source_advert(&spk));
+    }
+
     use super::*;
 
     #[test]
