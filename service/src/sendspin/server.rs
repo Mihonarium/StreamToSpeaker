@@ -170,15 +170,23 @@ pub fn spawn_discovery(state: Arc<SendspinDiscoveryState>) -> Result<()> {
                     debug!("Sendspin player removed: {}", fullname);
                     state.remove_fullname(&fullname);
                 }
+                Ok(ServiceEvent::SearchStopped(_)) => return,
                 Ok(_) => {}
                 Err(flume::RecvTimeoutError::Timeout) => {}
                 Err(flume::RecvTimeoutError::Disconnected) => {
-                    warn!("Sendspin mDNS browse ended");
+                    debug!("Sendspin mDNS browse ended");
                     return;
                 }
             }
         })?;
     Ok(())
+}
+
+/// Stop the browse started by [`spawn_discovery`]; its thread exits.
+pub fn stop_discovery() {
+    if let Ok(d) = mdns::daemon() {
+        let _ = d.stop_browse(mdns::CLIENT_SERVICE);
+    }
 }
 
 // ---------------------------------------------------------------------------

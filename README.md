@@ -9,7 +9,8 @@ the network — to Sonos, IKEA SYMFONISK, KEF, Denon HEOS, MoOde and Volumio
 over **UPnP / OpenHome**, and to HomePod, AirPort Express and shairport-sync
 over **AirPlay**. Windows volume and the speaker's own buttons stay in sync.
 It also streams to **Sendspin** speakers (Music Assistant's streaming
-protocol) and can offer the PC's sound to Music Assistant as an input.
+protocol) and can offer the PC's sound to Music Assistant as an input
+(optional, off by default).
 
 ## Install
 

@@ -3320,7 +3320,9 @@ impl StreamToSpeakerApp {
             {
                 self.app.set_sendspin_enabled(enabled);
             }
-            if !enabled {
+            // `--sendspin-source` runs the input with the setting off; keep
+            // its controls visible so it can be seen and turned off.
+            if !enabled && !self.app.is_sendspin_source_enabled() {
                 return;
             }
             ui.add_space(sp::S);

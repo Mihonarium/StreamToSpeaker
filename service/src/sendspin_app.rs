@@ -6,7 +6,7 @@
 use crossbeam_channel::{bounded, Sender};
 use log::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use crate::app::{ActiveSession, App};
@@ -50,7 +50,7 @@ pub(crate) struct PairPrompt {
 
 #[derive(Default)]
 pub struct SendspinAppState {
-    pub(crate) discovery: OnceLock<Arc<SendspinDiscoveryState>>,
+    pub(crate) discovery: Mutex<Option<Arc<SendspinDiscoveryState>>>,
     pub(crate) source: Mutex<Option<SourceService>>,
     pub(crate) prompt: Mutex<Option<PairPrompt>>,
     pub(crate) disabled: AtomicBool,
@@ -113,16 +113,28 @@ impl App {
     }
 
     fn start_sendspin_discovery(self: &Arc<Self>) {
-        if !self.sendspin.discovery_allowed.load(Ordering::SeqCst) || self.sendspin.discovery.get().is_some() {
+        if !self.sendspin.discovery_allowed.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut slot = self.sendspin.discovery.lock().unwrap();
+        if slot.is_some() {
             return;
         }
         let st = SendspinDiscoveryState::new();
         match server::spawn_discovery(st.clone()) {
-            Ok(()) => {
-                let _ = self.sendspin.discovery.set(st);
-            }
+            Ok(()) => *slot = Some(st),
             Err(e) => warn!("Sendspin discovery failed to start: {:#} (continuing without it)", e),
         }
+    }
+
+    fn stop_sendspin_discovery(&self) {
+        if self.sendspin.discovery.lock().unwrap().take().is_some() {
+            server::stop_discovery();
+        }
+    }
+
+    fn sendspin_discovery(&self) -> Option<Arc<SendspinDiscoveryState>> {
+        self.sendspin.discovery.lock().unwrap().clone()
     }
 
     /// The saved "Enable Sendspin" setting (off by default).
@@ -131,8 +143,8 @@ impl App {
     }
 
     /// GUI toggle: persist; on starts speaker discovery (and the Music
-    /// Assistant input if it was left on), off stops the input and hides
-    /// Sendspin speakers.
+    /// Assistant input if it was left on); off stops the input, speaker
+    /// discovery, any pairing prompt and a session to a Sendspin speaker.
     pub fn set_sendspin_enabled(self: &Arc<Self>, on: bool) {
         let source_saved = {
             let mut uc = self.user_config.lock().unwrap();
@@ -151,6 +163,20 @@ impl App {
             }
         } else {
             self.stop_sendspin();
+            self.stop_sendspin_discovery();
+            *self.sendspin.prompt.lock().unwrap() = None;
+            let session = {
+                let mut g = self.session.lock().unwrap();
+                if g.as_ref().is_some_and(|s| is_sendspin_id(&s.stable_id())) {
+                    g.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(s) = session {
+                info!("Sendspin turned off: disconnecting the Sendspin speaker");
+                s.stop();
+            }
         }
     }
 
@@ -269,7 +295,7 @@ impl App {
     // ---- Sendspin speakers (server role) ----
 
     pub(crate) fn sendspin_speakers(&self, active_id: Option<&str>) -> Vec<SpeakerInfo> {
-        let Some(d) = self.sendspin.discovery.get() else {
+        let Some(d) = self.sendspin_discovery() else {
             return Vec::new();
         };
         if !self.is_sendspin_available() || !self.is_sendspin_enabled() {
@@ -309,7 +335,7 @@ impl App {
             .name("stream-to-speaker-sendspin-launch".into())
             .spawn(move || {
                 for _ in 0..100 {
-                    if app.is_shutting_down() {
+                    if app.is_shutting_down() || !app.is_sendspin_enabled() {
                         return;
                     }
                     if app.sendspin_name_for(&id).is_some() {
@@ -325,7 +351,7 @@ impl App {
     }
 
     pub(crate) fn sendspin_name_for(&self, id: &str) -> Option<String> {
-        self.sendspin.discovery.get()?.find_by_id(id).map(|r| r.friendly_name)
+        self.sendspin_discovery()?.find_by_id(id).map(|r| r.friendly_name)
     }
 
     /// Bring up a session to a Sendspin speaker.
@@ -338,10 +364,11 @@ impl App {
         if !self.is_sendspin_available() {
             return Err("Sendspin is disabled for this run".into());
         }
+        if !self.is_sendspin_enabled() {
+            return Err("Sendspin is turned off in settings".into());
+        }
         let disc = self
-            .sendspin
-            .discovery
-            .get()
+            .sendspin_discovery()
             .ok_or_else(|| "Sendspin discovery is not running".to_string())?;
         let renderer = disc
             .find_by_id(id)

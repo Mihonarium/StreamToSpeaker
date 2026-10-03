@@ -141,7 +141,7 @@ struct Cli {
     no_sendspin: bool,
 
     /// Offer this computer's audio to Music Assistant as a Sendspin
-    /// input for this run (the GUI toggle saves the same setting).
+    /// input for this run, even when Sendspin is off in settings.
     #[arg(long, default_value_t = false)]
     sendspin_source: bool,
 
