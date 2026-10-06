@@ -11,8 +11,14 @@ over **AirPlay**. Windows volume and the speaker's own buttons stay in sync.
 
 ## Install
 
+*Directly or from the Microsoft Store.*
+
 **[⬇ Download](https://github.com/Mihonarium/StreamToSpeaker/releases/latest/download/StreamToSpeakerSetup.exe)**
 and run it. Needs Windows 10 1809+ / Windows 11, x64 (not ARM64 or Windows Server).
+
+<a href="https://get.microsoft.com/installer/download/xpfm3gjl2tdg30?referrer=appbadge" target="_self" >
+	<img src="https://get.microsoft.com/images/en-us%20dark.svg" width="150"/>
+</a>
 
 ## Use
 
