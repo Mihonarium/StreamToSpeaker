@@ -27,8 +27,9 @@
 //! ## Audio packets
 //!
 //! Each RTP audio payload is sealed with ChaCha20-Poly1305 under the audio
-//! key: nonce = 4 zero bytes + the RTP sequence number (little-endian) in
-//! bytes 4..8 + 4 zero bytes; AAD = RTP header bytes 4..12 (timestamp +
+//! key: nonce = 4 zero bytes + an independent, monotonically increasing
+//! 64-bit packet counter (little-endian); AAD = RTP header bytes 4..12
+//! (timestamp +
 //! SSRC). On the wire the 16-byte tag follows the ciphertext, then the
 //! **8-byte nonce (nonce[4..12]) is appended after the tag** — the
 //! receiver reads it back to decrypt, and omitting it makes every packet
@@ -171,13 +172,17 @@ impl ChannelCipher {
 
 /// Seal one RTP audio payload with the audio key. Returns ciphertext with
 /// the 16-byte Poly1305 tag appended (to follow the 12-byte RTP header on
-/// the wire). `rtp_header` is the 12-byte header already built; `seq` is
-/// the RTP sequence number used to build the nonce.
-pub fn seal_audio(audio_key: &[u8; 32], rtp_header: &[u8; 12], seq: u16, plaintext: &[u8]) -> Vec<u8> {
+/// the wire). `rtp_header` is the 12-byte header already built;
+/// `nonce_counter` must never repeat for the supplied key.
+pub fn seal_audio(
+    audio_key: &[u8; 32],
+    rtp_header: &[u8; 12],
+    nonce_counter: u64,
+    plaintext: &[u8],
+) -> Vec<u8> {
     let cipher = ChaCha20Poly1305::new(audio_key.into());
     let mut nonce = [0u8; 12];
-    // seqnum at bytes 4..8 (little-endian); a u16 fits in the low two.
-    nonce[4..8].copy_from_slice(&(seq as u32).to_le_bytes());
+    nonce[4..12].copy_from_slice(&nonce_counter.to_le_bytes());
     let aad = &rtp_header[4..12]; // timestamp + SSRC
     let mut out = cipher
         .encrypt((&nonce).into(), Payload { msg: plaintext, aad })
@@ -247,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_seal_appends_tag_and_is_unique_per_seq() {
+    fn audio_seal_appends_tag_and_is_unique_per_counter() {
         let key = [7u8; 32];
         let header = [0x80, 0x60, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78];
         let plain = vec![0xABu8; 1416];
@@ -255,10 +260,26 @@ mod tests {
         let s1 = seal_audio(&key, &header, 2, &plain);
         // ciphertext + 16-byte tag + 8-byte appended nonce
         assert_eq!(s0.len(), plain.len() + TAG_LEN + 8);
-        // Different sequence → different nonce → different ciphertext.
+        // Different counter → different nonce → different ciphertext.
         assert_ne!(s0, s1);
         // The appended suffix is exactly the nonce bytes (seq=1 LE).
         assert_eq!(&s0[s0.len() - 8..], &[1, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn audio_nonce_does_not_repeat_when_rtp_sequence_wraps() {
+        let key = [7u8; 32];
+        let header = [0x80, 0x60, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78];
+        let plain = b"audio";
+        let first = seal_audio(&key, &header, 1, plain);
+        let after_seq_wrap = seal_audio(&key, &header, 65_537, plain);
+
+        assert_ne!(first, after_seq_wrap);
+        assert_eq!(&first[first.len() - 8..], &1u64.to_le_bytes());
+        assert_eq!(
+            &after_seq_wrap[after_seq_wrap.len() - 8..],
+            &65_537u64.to_le_bytes()
+        );
     }
 
     #[test]
