@@ -5,7 +5,8 @@
 
 use crossbeam_channel::{bounded, Sender};
 use log::{info, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use crate::sendspin::proto::PairMethod;
 use crate::sendspin::server::{
     self, NowPlayingFn, PairingInput, PlayerSession, PlayerSessionConfig, SendspinDiscoveryState, StartError,
 };
-use crate::sendspin::source::{SourceOptions, SourceService, SourceState};
+use crate::sendspin::source::{SourceOptions, SourceService, SourceState, PAIRING_FAILURE_LIMIT};
 use crate::sendspin::store::SendspinConfig;
 use crate::sendspin::{machine_name, SendspinStore};
 use crate::PRODUCT_NAME;
@@ -40,6 +41,8 @@ pub struct PairPromptView {
     pub kind: PairPromptKind,
     /// We were paired before but the speaker forgot it.
     pub lost_credential: bool,
+    /// A different identity answered at the name we paired with.
+    pub identity_changed: bool,
 }
 
 pub(crate) struct PairPrompt {
@@ -56,6 +59,38 @@ pub struct SendspinAppState {
     pub(crate) disabled: AtomicBool,
     /// Speaker discovery may run this session (not `--no-discovery`).
     pub(crate) discovery_allowed: AtomicBool,
+    /// Live [`MaOutputSession`]s (Music Assistant is the output while > 0).
+    pub(crate) ma_output: Arc<AtomicUsize>,
+}
+
+/// Speaker-list id of the "Music Assistant" output.
+pub const MA_OUTPUT_ID: &str = "music-assistant:input";
+
+/// Music Assistant selected as the output. While this session exists the
+/// Music Assistant input reports itself available and sends this
+/// computer's audio; dropping it stops both.
+pub struct MaOutputSession {
+    pub name: String,
+    app: Weak<App>,
+    selected: Arc<AtomicUsize>,
+}
+
+impl MaOutputSession {
+    /// The paired Music Assistant server's address, when connected.
+    pub fn ip(&self) -> IpAddr {
+        self.app
+            .upgrade()
+            .and_then(|a| a.sendspin.source.lock().unwrap().as_ref().and_then(|s| s.paired_server_ip()))
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+    }
+
+    pub fn stop(self) {}
+}
+
+impl Drop for MaOutputSession {
+    fn drop(&mut self) {
+        self.selected.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Persistence through the app's `config.json` (weak: sessions must not
@@ -167,7 +202,7 @@ impl App {
             *self.sendspin.prompt.lock().unwrap() = None;
             let session = {
                 let mut g = self.session.lock().unwrap();
-                if g.as_ref().is_some_and(|s| is_sendspin_id(&s.stable_id())) {
+                if g.as_ref().is_some_and(|s| is_sendspin_id(&s.stable_id()) || s.stable_id() == MA_OUTPUT_ID) {
                     g.take()
                 } else {
                     None
@@ -175,7 +210,11 @@ impl App {
             };
             if let Some(s) = session {
                 info!("Sendspin turned off: disconnecting the Sendspin speaker");
-                s.stop();
+                // Stopping joins the sender threads and can wait out a
+                // stalled socket: keep it off the GUI thread.
+                let _ = std::thread::Builder::new()
+                    .name("stream-to-speaker-sendspin-stop".into())
+                    .spawn(move || s.stop());
             }
         }
     }
@@ -216,6 +255,7 @@ impl App {
             port: DEFAULT_CLIENT_PORT,
             software_version: crate::display_version().to_string(),
             advertise: true,
+            output_selected: self.sendspin.ma_output.clone(),
         };
         let svc = SourceService::start(opts, self.hub.clone(), self.sendspin_store()).map_err(|e| format!("{:#}", e))?;
         info!("Music Assistant input enabled (port {})", svc.port());
@@ -243,6 +283,7 @@ impl App {
             if let Some(svc) = svc {
                 svc.stop();
             }
+            self.end_ma_output();
             Ok(())
         }
     }
@@ -268,6 +309,21 @@ impl App {
             .map(|(m, _)| m)
     }
 
+    /// Too many wrong pairing codes: code pairing is refused until the
+    /// user allows it again.
+    pub fn is_sendspin_pairing_paused(&self) -> bool {
+        self.user_config.lock().unwrap().sendspin.pairing_code_failures >= PAIRING_FAILURE_LIMIT
+    }
+
+    /// GUI: reset the wrong-code count so code pairing works again.
+    pub fn allow_sendspin_pairing_again(&self) {
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.sendspin.pairing_code_failures != 0 {
+            uc.sendspin.pairing_code_failures = 0;
+            uc.save();
+        }
+    }
+
     /// Pairing token for Music Assistant's "pair with token" option.
     pub fn sendspin_pairing_token(self: &Arc<Self>) -> String {
         crate::sendspin::source::pairing_token(&*self.sendspin_store())
@@ -290,18 +346,78 @@ impl App {
         if let Some(svc) = svc {
             svc.stop();
         }
+        self.end_ma_output();
+    }
+
+    /// Unselect Music Assistant as the output (its input went away).
+    fn end_ma_output(&self) {
+        let s = {
+            let mut g = self.session.lock().unwrap();
+            if g.as_ref().is_some_and(|s| s.stable_id() == MA_OUTPUT_ID) {
+                g.take()
+            } else {
+                None
+            }
+        };
+        if let Some(s) = s {
+            info!("Music Assistant input stopped: unselecting it as the output");
+            s.stop();
+        }
+    }
+
+    /// Select Music Assistant as the output (speaker-list entry).
+    pub(crate) fn start_ma_output(self: &Arc<Self>) -> Result<ActiveSession, String> {
+        if !self.is_sendspin_available() {
+            return Err("Sendspin is disabled for this run".into());
+        }
+        if !self.is_sendspin_source_enabled() {
+            return Err("turn on \u{201c}Offer this computer as a Music Assistant input\u{201d} first".into());
+        }
+        // Counted, so an overlapping select that drops an older session
+        // cannot unselect the newer one.
+        self.sendspin.ma_output.fetch_add(1, Ordering::SeqCst);
+        Ok(ActiveSession::MusicAssistant(MaOutputSession {
+            name: "Music Assistant".into(),
+            app: Arc::downgrade(self),
+            selected: self.sendspin.ma_output.clone(),
+        }))
+    }
+
+    /// The "Music Assistant" speaker-list entry: shown while the input is
+    /// on and paired with a server (or while it is the output).
+    fn ma_output_entry(&self, active_id: Option<&str>) -> Option<SpeakerInfo> {
+        let active = active_id == Some(MA_OUTPUT_ID);
+        let ip = self.sendspin.source.lock().unwrap().as_ref().map(|s| s.paired_server_ip());
+        let paired = !self.user_config.lock().unwrap().sendspin.server_pairings.is_empty();
+        let shown = active || (ip.is_some() && paired && self.is_sendspin_available());
+        if !shown {
+            return None;
+        }
+        Some(SpeakerInfo {
+            active,
+            id: MA_OUTPUT_ID.to_string(),
+            friendly_name: "Music Assistant".to_string(),
+            ip: ip.flatten().map(|a| a.to_string()).unwrap_or_default(),
+            note: Some(
+                "Sends this computer's audio to Music Assistant's Sendspin input, only while this \
+                 is selected. Music Assistant plays it on the speaker set in this computer's \
+                 \u{201c}Automatically play line-in on\u{201d} setting there, or wherever you start it."
+                    .to_string(),
+            ),
+        })
     }
 
     // ---- Sendspin speakers (server role) ----
 
     pub(crate) fn sendspin_speakers(&self, active_id: Option<&str>) -> Vec<SpeakerInfo> {
+        let ma = self.ma_output_entry(active_id);
         let Some(d) = self.sendspin_discovery() else {
-            return Vec::new();
+            return ma.into_iter().collect();
         };
         if !self.is_sendspin_available() || !self.is_sendspin_enabled() {
-            return Vec::new();
+            return ma.into_iter().collect();
         }
-        d.renderers()
+        ma.into_iter().chain(d.renderers()
             .into_iter()
             .map(|r| {
                 let id = r.stable_id();
@@ -317,16 +433,23 @@ impl App {
                             .to_string(),
                     ),
                 }
-            })
+            }))
             .collect()
     }
 
     /// Launch: reconnect to a saved Sendspin speaker once discovery has
     /// seen it (mDNS needs a moment), when launch reconnect is on.
     pub fn reconnect_saved_sendspin_speaker(self: &Arc<Self>) {
-        let Some(id) = self.saved_speaker_id().filter(|id| is_sendspin_id(id)) else {
+        let Some(id) = self.saved_speaker_id().filter(|id| is_sendspin_id(id) || id == MA_OUTPUT_ID) else {
             return;
         };
+        if id == MA_OUTPUT_ID {
+            if self.is_auto_reconnect_on_launch() && self.is_sendspin_source_enabled() {
+                info!("auto-reconnect: Music Assistant output");
+                self.select_speaker_async_with(&id, false, None);
+            }
+            return;
+        }
         if !self.is_auto_reconnect_on_launch() || !self.is_sendspin_available() || !self.is_sendspin_enabled() {
             return;
         }
@@ -350,7 +473,15 @@ impl App {
             .ok();
     }
 
+    /// Is Music Assistant the selected output?
+    pub fn is_ma_output_selected(&self) -> bool {
+        self.sendspin.ma_output.load(Ordering::SeqCst) > 0
+    }
+
     pub(crate) fn sendspin_name_for(&self, id: &str) -> Option<String> {
+        if id == MA_OUTPUT_ID {
+            return Some("Music Assistant".into());
+        }
         self.sendspin_discovery()?.find_by_id(id).map(|r| r.friendly_name)
     }
 
@@ -397,19 +528,33 @@ impl App {
         };
         match PlayerSession::start(cfg) {
             Ok(s) => {
+                // Sendspin may have been turned off while we connected.
+                if !self.is_sendspin_enabled() {
+                    s.stop();
+                    return Err("Sendspin was turned off in settings".into());
+                }
                 if let Some(v) = s.volume() {
                     self.vsync.prime_initial_volume(v);
                 }
                 Ok(ActiveSession::Sendspin(s))
             }
-            Err(StartError::NeedsPairing { methods, lost_credential }) => {
+            Err(StartError::NeedsPairing {
+                methods,
+                lost_credential,
+                identity_changed,
+            }) => {
+                let what = if identity_changed {
+                    format!("{}'s identity changed since it was paired, so it must be paired again", name)
+                } else {
+                    format!("{} needs to be paired once", name)
+                };
                 if interactive {
-                    self.begin_sendspin_pairing(id, &name, &methods, lost_credential);
-                    Err(format!("{} needs to be paired once — follow the prompt.", name))
+                    self.begin_sendspin_pairing(id, &name, &methods, lost_credential, identity_changed);
+                    Err(format!("{} — follow the prompt.", what))
                 } else {
                     Err(format!(
-                        "{} needs to be paired once — open the {} window and click it in the speaker list.",
-                        name, PRODUCT_NAME
+                        "{} — open the {} window and click it in the speaker list.",
+                        what, PRODUCT_NAME
                     ))
                 }
             }
@@ -417,7 +562,7 @@ impl App {
         }
     }
 
-    fn begin_sendspin_pairing(self: &Arc<Self>, id: &str, name: &str, methods: &[PairMethod], lost: bool) {
+    fn begin_sendspin_pairing(self: &Arc<Self>, id: &str, name: &str, methods: &[PairMethod], lost: bool, identity_changed: bool) {
         let kind = if methods.contains(&PairMethod::DynamicCode) {
             PairPromptKind::LiveCode
         } else if methods.contains(&PairMethod::StaticCode) {
@@ -430,6 +575,7 @@ impl App {
             name: name.to_string(),
             kind,
             lost_credential: lost,
+            identity_changed,
         };
         if kind == PairPromptKind::LiveCode {
             // Connect again in pairing mode: the speaker derives a code

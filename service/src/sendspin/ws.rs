@@ -21,7 +21,7 @@ use sha1::{Digest, Sha1};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// GUID appended to the client key when computing `Sec-WebSocket-Accept`.
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -120,7 +120,9 @@ impl WsReader {
     pub fn recv(&mut self) -> Result<WsMessage> {
         let mut assembling: Option<(u8, Vec<u8>)> = None;
         loop {
-            let frame = match self.read_frame()? {
+            // Continuation frames may only fill what is left of the limit.
+            let budget = MAX_MESSAGE_BYTES - assembling.as_ref().map(|(_, b)| b.len()).unwrap_or(0);
+            let frame = match self.read_frame(budget)? {
                 Some(f) => f,
                 None => return Ok(WsMessage::Close),
             };
@@ -148,9 +150,6 @@ impl WsReader {
                         bail!("websocket: continuation frame without a started message");
                     };
                     buf.extend_from_slice(&frame.payload);
-                    if buf.len() > MAX_MESSAGE_BYTES {
-                        bail!("websocket: message exceeds {} bytes", MAX_MESSAGE_BYTES);
-                    }
                     if frame.fin {
                         return finish_message(op, buf);
                     }
@@ -187,7 +186,9 @@ impl WsReader {
         std::mem::replace(&mut self.pending, rest)
     }
 
-    fn read_frame(&mut self) -> Result<Option<Frame>> {
+    /// Read one frame whose data payload may be at most `budget` bytes
+    /// (checked from the header, before the payload is read).
+    fn read_frame(&mut self, budget: usize) -> Result<Option<Frame>> {
         if !self.fill(2)? {
             return Ok(None);
         }
@@ -221,12 +222,18 @@ impl WsReader {
             }
             n => (n, 2),
         };
-        if len > MAX_MESSAGE_BYTES {
-            bail!("websocket: frame of {} bytes exceeds limit", len);
+        if opcode >= 0x8 {
+            if !fin || len > 125 {
+                bail!("websocket: malformed control frame");
+            }
+        } else if len > budget {
+            bail!("websocket: message exceeds {} bytes", MAX_MESSAGE_BYTES);
         }
         let mask_len = if masked { 4 } else { 0 };
-        if self.role == WsRole::Client && masked {
-            bail!("websocket: server sent a masked frame");
+        match (self.role, masked) {
+            (WsRole::Client, true) => bail!("websocket: server sent a masked frame"),
+            (WsRole::Server, false) => bail!("websocket: client sent an unmasked frame"),
+            _ => {}
         }
         if !self.fill(hdr + mask_len + len)? {
             return Ok(None);
@@ -238,9 +245,6 @@ impl WsReader {
             for (i, b) in payload.iter_mut().enumerate() {
                 *b ^= key[i & 3];
             }
-        }
-        if opcode >= 0x8 && (!fin || len > 125) {
-            bail!("websocket: malformed control frame");
         }
         Ok(Some(Frame { fin, opcode, payload }))
     }
@@ -295,9 +299,10 @@ pub fn accept_key(client_key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(h.finalize())
 }
 
-/// Read an HTTP header block (up to and including the blank line).
-/// Returns `(header_text, leftover_bytes)`.
-fn read_http_head(stream: &mut TcpStream) -> Result<(String, Vec<u8>)> {
+/// Read an HTTP header block (up to and including the blank line), all
+/// of it before `deadline` (a peer trickling bytes cannot hold the socket
+/// longer). Returns `(header_text, leftover_bytes)`.
+fn read_http_head(stream: &mut TcpStream, deadline: Instant) -> Result<(String, Vec<u8>)> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -309,6 +314,11 @@ fn read_http_head(stream: &mut TcpStream) -> Result<(String, Vec<u8>)> {
         if buf.len() > MAX_HANDSHAKE_BYTES {
             bail!("websocket: HTTP header block too large");
         }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("websocket: timed out reading the HTTP upgrade header");
+        }
+        stream.set_read_timeout(Some(left)).ok();
         let n = stream.read(&mut chunk).context("reading HTTP upgrade header")?;
         if n == 0 {
             bail!("websocket: connection closed during HTTP upgrade");
@@ -337,12 +347,20 @@ pub enum Accepted {
     Rejected(String),
 }
 
+/// Is `path` usable as a request target: absolute, printable ASCII, no
+/// spaces (it goes verbatim into the request line)?
+pub fn valid_path(path: &str) -> bool {
+    path.starts_with('/') && path.bytes().all(|b| b.is_ascii_graphic())
+}
+
 /// Server side: complete the HTTP upgrade on an accepted TCP stream.
-/// `path` is the expected request path (e.g. `/sendspin`).
+/// `path` is the expected request path (e.g. `/sendspin`). Requests that
+/// carry an `Origin` header are refused: browsers always send one and
+/// Sendspin servers do not, so a web page cannot drive this socket.
 pub fn accept(mut stream: TcpStream, path: &str, handshake_timeout: Duration) -> Result<Accepted> {
-    stream.set_read_timeout(Some(handshake_timeout)).ok();
+    stream.set_write_timeout(Some(handshake_timeout)).ok();
     stream.set_nodelay(true).ok();
-    let (head, leftover) = read_http_head(&mut stream)?;
+    let (head, leftover) = read_http_head(&mut stream, Instant::now() + handshake_timeout)?;
     let request_line = head.lines().next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
@@ -352,6 +370,11 @@ pub fn accept(mut stream: TcpStream, path: &str, handshake_timeout: Duration) ->
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
     let key = header_value(&head, "Sec-WebSocket-Key");
+    if header_value(&head, "Origin").is_some() {
+        let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(resp.as_bytes());
+        return Ok(Accepted::Rejected(format!("{} {} with an Origin header", method, target)));
+    }
     if method != "GET" || req_path != path || !upgrade || key.is_none() {
         let body = "Not a Sendspin WebSocket endpoint\n";
         let resp = format!(
@@ -383,7 +406,9 @@ pub fn connect(addr: SocketAddr, host_header: &str, path: &str, timeout: Duratio
     let mut key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key_bytes);
     let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
-    let path = if path.starts_with('/') { path.to_string() } else { format!("/{}", path) };
+    if !valid_path(path) {
+        bail!("invalid WebSocket path {:?}", path);
+    }
     let req = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\nUser-Agent: {}\r\n\r\n",
         path,
@@ -392,7 +417,7 @@ pub fn connect(addr: SocketAddr, host_header: &str, path: &str, timeout: Duratio
         crate::PRODUCT_UA
     );
     stream.write_all(req.as_bytes()).context("sending WebSocket upgrade")?;
-    let (head, leftover) = read_http_head(&mut stream)?;
+    let (head, leftover) = read_http_head(&mut stream, Instant::now() + timeout)?;
     let status = head.lines().next().unwrap_or("");
     if !status.split_whitespace().nth(1).map(|c| c == "101").unwrap_or(false) {
         bail!("WebSocket upgrade refused: {}", status);
@@ -517,5 +542,89 @@ mod tests {
         let err = connect(addr, "127.0.0.1", "/other", Duration::from_secs(5)).err().unwrap();
         assert!(format!("{:#}", err).contains("404"));
         assert!(server.join().unwrap());
+    }
+
+    /// A server-role reader fed raw bytes from a plain TCP peer.
+    fn server_reader_with(bytes: Vec<u8>) -> (WsReader, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (s, _) = listener.accept().unwrap();
+        peer.write_all(&bytes).unwrap();
+        let (r, _w) = split(s, Vec::new(), WsRole::Server).unwrap();
+        (r, peer)
+    }
+
+    #[test]
+    fn server_role_rejects_unmasked_and_oversized_frames() {
+        let (mut r, _p) = server_reader_with(encode_frame(OP_TEXT, b"hi", WsRole::Server));
+        assert!(format!("{:#}", r.recv().unwrap_err()).contains("unmasked"));
+        // A ping announcing 126+ bytes is refused from its header alone.
+        let (mut r, _p) = server_reader_with(vec![0x89, 0x80 | 126, 0x01, 0x00]);
+        assert!(format!("{:#}", r.recv().unwrap_err()).contains("control frame"));
+        // A continuation that would push the message past the limit is
+        // refused from its header (the payload is never sent).
+        let mut first = encode_frame(OP_BINARY, &vec![0u8; 70_000], WsRole::Client);
+        first[0] &= 0x7F;
+        let mut cont = vec![0x80, 0x80 | 127];
+        cont.extend_from_slice(&((MAX_MESSAGE_BYTES - 70_000 + 1) as u64).to_be_bytes());
+        first.extend_from_slice(&cont);
+        let (mut r, _p) = server_reader_with(first);
+        assert!(format!("{:#}", r.recv().unwrap_err()).contains("exceeds"));
+    }
+
+    #[test]
+    fn upgrade_with_origin_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            matches!(accept(s, "/sendspin", Duration::from_secs(5)).unwrap(), Accepted::Rejected(_))
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(
+            b"GET /sendspin HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: http://evil.example\r\n\r\n",
+        )
+        .unwrap();
+        let mut resp = String::new();
+        let _ = c.read_to_string(&mut resp);
+        assert!(resp.starts_with("HTTP/1.1 403"), "{}", resp);
+        assert!(server.join().unwrap());
+    }
+
+    #[test]
+    fn slow_upgrade_header_hits_the_overall_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let t = Instant::now();
+            let r = accept(s, "/sendspin", Duration::from_millis(600));
+            (r.is_err(), t.elapsed())
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        // One byte every 200 ms: each read succeeds, the total does not.
+        for b in b"GET /sendspin HTTP/1.1\r\n".iter() {
+            if c.write_all(&[*b]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            if server.is_finished() {
+                break;
+            }
+        }
+        let (failed, took) = server.join().unwrap();
+        assert!(failed);
+        assert!(took < Duration::from_secs(2), "{:?}", took);
+    }
+
+    #[test]
+    fn request_paths_are_validated() {
+        assert!(valid_path("/sendspin"));
+        assert!(valid_path("/a/b?x=1"));
+        assert!(!valid_path("sendspin"));
+        assert!(!valid_path("/a b"));
+        assert!(!valid_path("/a\r\nHost: x"));
+        assert!(!valid_path("/caf\u{e9}"));
     }
 }

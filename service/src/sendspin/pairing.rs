@@ -64,6 +64,9 @@ pub enum PairOutcome {
     Left(Value),
     /// A `pair/abort` was sent or received.
     Aborted(String),
+    /// The other side's code confirmation did not verify (a wrong code was
+    /// entered); we sent the code-mismatch `pair/abort`.
+    CodeMismatch,
 }
 
 fn sid(d: Dialect, h: &[u8; 32], pairing_index: u32) -> Vec<u8> {
@@ -196,6 +199,11 @@ fn send_abort(ctx: &PairingCtx<'_>, reason: &str) -> PairOutcome {
     PairOutcome::Aborted(reason.to_string())
 }
 
+fn send_mismatch(ctx: &PairingCtx<'_>) -> PairOutcome {
+    let _ = ctx.writer.send_json(&envelope("pair/abort", json!({ "reason": code_mismatch_reason(ctx.dialect) })));
+    PairOutcome::CodeMismatch
+}
+
 fn code_mismatch_reason(d: Dialect) -> &'static str {
     match d {
         Dialect::V9 => "pin_mismatch",
@@ -271,7 +279,7 @@ fn client_dynamic_code_inner(ctx: &PairingCtx<'_>, digits: u32, show: &dyn Fn(Op
         Next::Leave(v) => return Ok(PairOutcome::Left(v)),
     };
     if !pake.verify(&field_bytes(&confirm, "server_kc", 64)?) {
-        return Ok(send_abort(ctx, code_mismatch_reason(d)));
+        return Ok(send_mismatch(ctx));
     }
     let isk = pake.isk()?;
     let mut confirm_payload = json!({ "client_kc": b64url(&pake.tag()?) });
@@ -376,7 +384,7 @@ pub fn server_code(ctx: &PairingCtx<'_>, dynamic: bool, ask_code: &dyn Fn() -> O
     };
     let isk = pake.isk()?;
     if !pake.verify(&field_bytes(&confirm, "client_kc", 64)?) {
-        return Ok(send_abort(ctx, code_mismatch_reason(d)));
+        return Ok(send_mismatch(ctx));
     }
     if let (Some(nonce_a), Some(commit_b)) = (nonce_a, commit_b) {
         let nonce_b: [u8; 32] = if let Ok(n) = field32(&confirm, "nonce_B") {

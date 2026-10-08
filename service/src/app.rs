@@ -54,6 +54,8 @@ pub enum ActiveSession {
     AirPlay2(AirPlay2Session),
     /// Sendspin player (we push timestamped audio, like AirPlay).
     Sendspin(crate::sendspin::server::PlayerSession),
+    /// Music Assistant as the output: its Sendspin input gets our audio.
+    MusicAssistant(crate::sendspin_app::MaOutputSession),
 }
 
 impl ActiveSession {
@@ -63,6 +65,7 @@ impl ActiveSession {
             ActiveSession::AirPlay(s) => s.renderer.stable_id(),
             ActiveSession::AirPlay2(s) => s.renderer.stable_id(),
             ActiveSession::Sendspin(s) => s.renderer.stable_id(),
+            ActiveSession::MusicAssistant(_) => crate::sendspin_app::MA_OUTPUT_ID.to_string(),
         }
     }
 
@@ -74,6 +77,7 @@ impl ActiveSession {
             ActiveSession::AirPlay(s) => s.renderer.friendly_name.clone(),
             ActiveSession::AirPlay2(s) => s.renderer.friendly_name.clone(),
             ActiveSession::Sendspin(s) => s.renderer.friendly_name.clone(),
+            ActiveSession::MusicAssistant(s) => s.name.clone(),
         }
     }
 
@@ -83,6 +87,7 @@ impl ActiveSession {
             ActiveSession::AirPlay(s) => s.renderer.ip,
             ActiveSession::AirPlay2(s) => s.renderer.ip,
             ActiveSession::Sendspin(s) => s.renderer.ip,
+            ActiveSession::MusicAssistant(s) => s.ip(),
         }
     }
 
@@ -95,6 +100,7 @@ impl ActiveSession {
             ActiveSession::AirPlay(s) => s.stop(),
             ActiveSession::AirPlay2(s) => s.stop(),
             ActiveSession::Sendspin(s) => s.stop(),
+            ActiveSession::MusicAssistant(s) => s.stop(),
         }
     }
 
@@ -111,6 +117,8 @@ impl ActiveSession {
             ActiveSession::AirPlay(s) => s.set_volume_pct(pct),
             ActiveSession::AirPlay2(s) => s.set_volume_pct(pct),
             ActiveSession::Sendspin(s) => s.set_volume_pct(pct),
+            // Music Assistant keeps its own volume per speaker.
+            ActiveSession::MusicAssistant(_) => Ok(()),
         }
     }
 
@@ -120,7 +128,7 @@ impl ActiveSession {
     pub fn metadata_handle(&self) -> Option<crate::airplay::session::MetadataHandle> {
         match self {
             ActiveSession::AirPlay(s) => Some(s.metadata_handle()),
-            ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) | ActiveSession::Sendspin(_) => None,
+            ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) | ActiveSession::Sendspin(_) | ActiveSession::MusicAssistant(_) => None,
         }
     }
 
@@ -142,6 +150,7 @@ impl ActiveSession {
             ActiveSession::AirPlay(s) => s.is_dead(),
             ActiveSession::AirPlay2(s) => s.is_dead(),
             ActiveSession::Sendspin(s) => s.is_dead(),
+            ActiveSession::MusicAssistant(_) => false,
         }
     }
 
@@ -153,7 +162,7 @@ impl ActiveSession {
             ActiveSession::Upnp(_) => None,
             ActiveSession::AirPlay(s) => Some(s.resend_stats()),
             ActiveSession::AirPlay2(s) => Some(s.resend_stats()),
-            ActiveSession::Sendspin(_) => None,
+            ActiveSession::Sendspin(_) | ActiveSession::MusicAssistant(_) => None,
         }
     }
 
@@ -167,6 +176,7 @@ impl ActiveSession {
             ActiveSession::AirPlay(s) => s.set_mute(muted),
             ActiveSession::AirPlay2(s) => s.set_mute(muted),
             ActiveSession::Sendspin(s) => s.set_mute(muted),
+            ActiveSession::MusicAssistant(_) => Ok(()),
         }
     }
 }
@@ -1080,8 +1090,10 @@ impl App {
     /// and reconnect once — so the UI never sits on a zombie "streaming"
     /// state. Mirrors OwnTone's policy: a single retry, ~5 s after
     /// detection (the spacing also respects the Sonos half-open hold).
-    /// Gated on the `auto_reconnect_on_drop` config (default on) and on
-    /// streaming being enabled (never fights a user who hit Disable).
+    /// The reconnect is gated on the `auto_reconnect_on_drop` config
+    /// (default on) and on streaming being enabled (never fights a user
+    /// who hit Disable); a session the speaker ended itself is always
+    /// cleared.
     pub fn spawn_reconnect_watchdog(self: &Arc<Self>) {
         let app = self.clone();
         std::thread::Builder::new()
@@ -1097,18 +1109,9 @@ impl App {
                         std::thread::sleep(Duration::from_millis(100));
                     }
 
-                    if !app.user_config.lock().unwrap().auto_reconnect_on_drop {
-                        continue;
-                    }
-                    if !app.streaming_enabled.load(Ordering::Acquire) {
-                        continue;
-                    }
-                    if app.connecting.lock().unwrap().is_some() {
-                        continue;
-                    }
-
                     // Did the speaker hand itself to something else? Then
-                    // end our session quietly instead of fighting for it.
+                    // end our session quietly instead of fighting for it
+                    // (whatever the reconnect settings: it no longer plays).
                     let ended = {
                         let mut guard = app.session.lock().unwrap();
                         let reason = guard.as_ref().and_then(|s| s.ended_by_speaker());
@@ -1121,6 +1124,16 @@ impl App {
                             "another_server" => format!("{} switched to another source.", name),
                             _ => format!("{} ended the stream ({}).", name, reason.replace('_', " ")),
                         });
+                        continue;
+                    }
+
+                    if !app.user_config.lock().unwrap().auto_reconnect_on_drop {
+                        continue;
+                    }
+                    if !app.streaming_enabled.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if app.connecting.lock().unwrap().is_some() {
                         continue;
                     }
 
@@ -1330,7 +1343,9 @@ impl App {
         // last scan streams to its group coordinator instead (see
         // start_upnp). Remember the id we actually bound so reconnect /
         // active-row highlighting track reality.
-        let new_session = if crate::sendspin_app::is_sendspin_id(id) {
+        let new_session = if id == crate::sendspin_app::MA_OUTPUT_ID {
+            self.start_ma_output()?
+        } else if crate::sendspin_app::is_sendspin_id(id) {
             self.start_sendspin_player(id, sendspin_pairing, interactive)?
         } else if id.starts_with("airplay:") {
             match self.start_airplay(id) {
@@ -1375,6 +1390,24 @@ impl App {
             drop(guard);
             old.stop();
             guard = self.session.lock().unwrap();
+        }
+        // Checked under the session lock: turning Sendspin off saves the
+        // setting first and then looks for a Sendspin session here, so
+        // either it sees this one or this sees the setting.
+        let still_allowed = match &new_session {
+            ActiveSession::Sendspin(_) => self.is_sendspin_enabled(),
+            // The input stops (and unselects this) when turned off.
+            ActiveSession::MusicAssistant(_) => self.is_sendspin_source_enabled(),
+            _ => true,
+        };
+        if !still_allowed {
+            drop(guard);
+            let msg = match &new_session {
+                ActiveSession::MusicAssistant(_) => "the Music Assistant input was turned off",
+                _ => "Sendspin was turned off in settings",
+            };
+            new_session.stop();
+            return Err(msg.into());
         }
         *guard = Some(new_session);
         // CRITICAL: drop the session-mutex guard before calling any
@@ -2105,6 +2138,8 @@ impl App {
                     // A fresh session restarts the stream timeline.
                     Kind::AirPlay(s.renderer.stable_id())
                 }
+                // Music Assistant buffers on its side; nothing to resync here.
+                Some(ActiveSession::MusicAssistant(_)) => return Ok(()),
                 None => return Err("no active speaker".to_string()),
             }
         };

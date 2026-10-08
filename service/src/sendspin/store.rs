@@ -52,6 +52,10 @@ pub struct SendspinConfig {
     /// own minimum buffer).
     #[serde(default)]
     pub player_extra_latency_ms: u32,
+    /// Wrong pairing codes entered by servers since the last successful
+    /// pairing (or since the user allowed pairing again).
+    #[serde(default)]
+    pub pairing_code_failures: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +73,11 @@ pub struct PlayerPairing {
     pub psk: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// The speaker's mDNS instance name (lowercase) this identity was
+    /// paired at: a peer at that name with another identity is refused
+    /// until it is paired again.
+    #[serde(default)]
+    pub instance: Option<String>,
 }
 
 impl SendspinConfig {
@@ -116,6 +125,36 @@ impl SendspinConfig {
                 .unwrap_or(false)
         });
         before != self.server_pairings.len()
+    }
+
+    /// The `client_id` paired at a speaker's mDNS instance name.
+    pub fn pinned_client_id(&self, instance: &str) -> Option<String> {
+        let inst = instance.to_ascii_lowercase();
+        self.player_pairings
+            .iter()
+            .find(|(_, p)| p.instance.as_deref() == Some(inst.as_str()))
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Pin `client_id`'s record to `instance`; a record pinned there for
+    /// another identity is dropped (it was paired again). Returns whether
+    /// anything changed.
+    pub fn pin_player(&mut self, client_id: &str, instance: &str) -> bool {
+        let inst = instance.to_ascii_lowercase();
+        if !self.player_pairings.contains_key(client_id) {
+            return false;
+        }
+        let before = self.player_pairings.len();
+        self.player_pairings
+            .retain(|id, p| id == client_id || p.instance.as_deref() != Some(inst.as_str()));
+        let mut changed = before != self.player_pairings.len();
+        if let Some(p) = self.player_pairings.get_mut(client_id) {
+            if p.instance.as_deref() != Some(inst.as_str()) {
+                p.instance = Some(inst);
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn touch_server_pairing(&mut self, server_id: &str, now: u64) {
@@ -173,6 +212,30 @@ mod tests {
         assert_eq!(c.server_pairings.iter().filter(|r| r.server_id == "s5").count(), 1);
         assert!(c.remove_server_pairing_by_psk_id(&super::super::keys::psk_id(&[9; 32])));
         assert!(!c.server_pairings.iter().any(|r| r.server_id == "s5"));
+    }
+
+    #[test]
+    fn players_are_pinned_by_instance() {
+        let mut c = SendspinConfig::default();
+        let rec = |psk: u8| PlayerPairing {
+            psk: b64url(&[psk; 32]),
+            name: None,
+            instance: None,
+        };
+        c.player_pairings.insert("old".into(), rec(1));
+        assert_eq!(c.pinned_client_id("Kitchen"), None);
+        assert!(!c.pin_player("missing", "Kitchen"));
+        assert!(c.pin_player("old", "Kitchen"));
+        assert!(!c.pin_player("old", "kitchen"), "already pinned");
+        assert_eq!(c.pinned_client_id("KITCHEN").as_deref(), Some("old"));
+        // Paired again with a new identity: the new one replaces the pin.
+        c.player_pairings.insert("new".into(), rec(2));
+        assert!(c.pin_player("new", "Kitchen"));
+        assert_eq!(c.pinned_client_id("kitchen").as_deref(), Some("new"));
+        assert!(!c.player_pairings.contains_key("old"));
+        // Older records without an instance still load.
+        let r: PlayerPairing = serde_json::from_str(r#"{"psk":"x"}"#).unwrap();
+        assert_eq!(r.instance, None);
     }
 
     #[test]

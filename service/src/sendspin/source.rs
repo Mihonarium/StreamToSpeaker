@@ -22,7 +22,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 use log::{debug, info, warn};
 use serde_json::Value;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,14 @@ const SIGNAL_THRESHOLD: i16 = 32;
 const SIGNAL_ABSENT_AFTER: Duration = Duration::from_secs(8);
 /// Dynamic pairing code length we accept/offer.
 const MIN_CODE_DIGITS: u32 = 6;
+/// Wrong pairing codes (across connections and restarts) after which
+/// code pairing is paused until the user allows it again.
+pub const PAIRING_FAILURE_LIMIT: u32 = 10;
+/// Most simultaneous connections on the listener; further ones are closed
+/// at once (one Music Assistant server needs one, plus reconnect overlap).
+const MAX_CONNECTIONS: usize = 8;
+/// Time a connection gets to finish the handshake and be activated.
+const ADMISSION_DEADLINE: Duration = Duration::from_secs(30);
 
 /// What the GUI shows for the source.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +77,10 @@ pub struct SourceOptions {
     pub software_version: String,
     /// Announce via mDNS (off only for tests that dial the port directly).
     pub advertise: bool,
+    /// Number of live "Music Assistant is the output" selections; only
+    /// while it is non-zero does the input report itself available and
+    /// send audio.
+    pub output_selected: Arc<AtomicUsize>,
 }
 
 struct Admitted {
@@ -76,7 +88,9 @@ struct Admitted {
     rank: u8,
     server_id: String,
     pairing_attempt: bool,
+    category: PskCategory,
     writer: Arc<ChannelWriter>,
+    peer: std::net::IpAddr,
 }
 
 struct Shared {
@@ -85,6 +99,8 @@ struct Shared {
     store: Arc<dyn SendspinStore>,
     stop: AtomicBool,
     next_conn: AtomicU64,
+    /// Open connections on the listener.
+    connections: AtomicUsize,
     state: Mutex<SourceState>,
     /// Code on display for an in-progress dynamic pairing: (code, server).
     code: Mutex<Option<(u64, String, String)>>,
@@ -119,6 +135,7 @@ impl SourceService {
             store,
             stop: AtomicBool::new(false),
             next_conn: AtomicU64::new(1),
+            connections: AtomicUsize::new(0),
             state: Mutex::new(SourceState::Waiting),
             code: Mutex::new(None),
             admitted: Mutex::new(None),
@@ -163,6 +180,17 @@ impl SourceService {
         self.shared.last_event.lock().unwrap().clone()
     }
 
+    /// Address of the paired server currently connected, if any.
+    pub fn paired_server_ip(&self) -> Option<std::net::IpAddr> {
+        self.shared
+            .admitted
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|a| a.category == PskCategory::LongTerm)
+            .map(|a| a.peer)
+    }
+
     /// The pairing token to paste into Music Assistant.
     pub fn pairing_token(&self) -> String {
         pairing_token(&*self.shared.store)
@@ -204,15 +232,25 @@ fn accept_loop(sh: Arc<Shared>, listener: TcpListener) {
     while !sh.stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, peer)) => {
+                if sh.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    sh.connections.fetch_sub(1, Ordering::SeqCst);
+                    debug!("Sendspin source: refusing {} (too many connections)", peer);
+                    drop(stream);
+                    continue;
+                }
                 let _ = stream.set_nonblocking(false);
                 let sh2 = sh.clone();
-                let _ = std::thread::Builder::new()
+                let spawned = std::thread::Builder::new()
                     .name("sendspin-source-conn".into())
                     .spawn(move || {
                         if let Err(e) = handle_socket(&sh2, stream, peer) {
                             debug!("Sendspin source connection from {} ended: {:#}", peer, e);
                         }
+                        sh2.connections.fetch_sub(1, Ordering::SeqCst);
                     });
+                if spawned.is_err() {
+                    sh.connections.fetch_sub(1, Ordering::SeqCst);
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -226,12 +264,17 @@ fn accept_loop(sh: Arc<Shared>, listener: TcpListener) {
 }
 
 fn handle_socket(sh: &Arc<Shared>, stream: TcpStream, peer: SocketAddr) -> Result<()> {
-    let (r, w) = match super::ws::accept(stream, mdns::DEFAULT_PATH, Duration::from_secs(10))? {
-        super::ws::Accepted::WebSocket(r, w) => (r, w),
-        super::ws::Accepted::Rejected(what) => bail!("not a Sendspin request: {}", what),
-    };
     let conn_id = sh.next_conn.fetch_add(1, Ordering::SeqCst);
-    let result = run_connection(sh, conn_id, r, w, peer);
+    let ended = Arc::new(AtomicBool::new(false));
+    if let Ok(s) = stream.try_clone() {
+        spawn_admission_deadline(sh.clone(), conn_id, s, ended.clone());
+    }
+    let result = match super::ws::accept(stream, mdns::DEFAULT_PATH, Duration::from_secs(10)) {
+        Ok(super::ws::Accepted::WebSocket(r, w)) => run_connection(sh, conn_id, r, w, peer),
+        Ok(super::ws::Accepted::Rejected(what)) => Err(anyhow!("not a Sendspin request: {}", what)),
+        Err(e) => Err(e),
+    };
+    ended.store(true, Ordering::SeqCst);
     // Release admission (if we held it) and reset the GUI state.
     {
         let mut adm = sh.admitted.lock().unwrap();
@@ -247,6 +290,26 @@ fn handle_socket(sh: &Arc<Shared>, stream: TcpStream, peer: SocketAddr) -> Resul
         }
     }
     result
+}
+
+/// Close a connection that has not been admitted (handshake plus first
+/// activation) within [`ADMISSION_DEADLINE`], so idle or trickling peers
+/// cannot hold the listener's connection slots.
+fn spawn_admission_deadline(sh: Arc<Shared>, conn_id: u64, stream: TcpStream, ended: Arc<AtomicBool>) {
+    let _ = std::thread::Builder::new().name("sendspin-source-deadline".into()).spawn(move || {
+        let deadline = Instant::now() + ADMISSION_DEADLINE;
+        while Instant::now() < deadline {
+            if ended.load(Ordering::SeqCst) || sh.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let admitted = sh.admitted.lock().unwrap().as_ref().map(|a| a.conn_id) == Some(conn_id);
+        if !admitted && !ended.load(Ordering::SeqCst) {
+            debug!("Sendspin source: closing connection {} (not admitted in time)", conn_id);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    });
 }
 
 fn note(sh: &Shared, msg: impl Into<String>) {
@@ -294,6 +357,8 @@ struct Conn {
     stream: Mutex<StreamCtl>,
     /// Latest signal estimate (None until the first audio frame).
     signal: Mutex<Option<bool>>,
+    /// Shared with [`SourceOptions::output_selected`].
+    selected: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -309,8 +374,9 @@ impl Conn {
     }
 
     fn send_state(&self) {
-        let signal = *self.signal.lock().unwrap();
-        let _ = self.writer.send_json(&proto::client_state_source(true, Some(signal.unwrap_or(false))));
+        let selected = self.selected.load(Ordering::SeqCst) > 0;
+        let signal = selected && self.signal.lock().unwrap().unwrap_or(false);
+        let _ = self.writer.send_json(&proto::client_state_source(selected, Some(signal)));
         self.state_sent.store(true, Ordering::SeqCst);
     }
 
@@ -406,6 +472,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
         state_sent: AtomicBool::new(false),
         stream: Mutex::new(StreamCtl::default()),
         signal: Mutex::new(None),
+        selected: sh.opts.output_selected.clone(),
     });
     let _alive_guard = AliveGuard(conn.clone());
     let _close_guard = CloseGuard(writer.clone());
@@ -471,14 +538,14 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                             return Ok(());
                         }
                         if !admitted {
-                            if !admit(sh, conn_id, &act, &server_id, &writer) {
+                            if !admit(sh, conn_id, &act, category, &server_id, &writer, peer.ip()) {
                                 let _ = writer.send_json(&proto::client_goodbye("concurrent_attempt"));
                                 writer.close();
                                 return Ok(());
                             }
                             admitted = true;
                         } else {
-                            update_rank(sh, conn_id, &act);
+                            update_rank(sh, conn_id, &act, category);
                         }
                         if act.playback && category == PskCategory::LongTerm {
                             let sid = server_id.clone();
@@ -505,7 +572,11 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                         if act.pairing {
                             pairing_index += 1;
                             set_state(sh, conn_id, SourceState::NeedsPairing { server: server_name.clone() });
-                            pending = run_pairing(sh, conn_id, &conn, &events, &act, category, pairing_index, &h_shared, suite, &server_id, &server_name)?;
+                            let res = run_pairing(sh, conn_id, &conn, &events, &act, category, pairing_index, &h_shared, suite, &server_id, &server_name);
+                            // The attempt is over, however it ended: it no
+                            // longer holds off other servers.
+                            end_pairing_attempt(sh, conn_id);
+                            pending = res?;
                             continue;
                         }
                         // Steady state: helpers + availability.
@@ -514,7 +585,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                             spawn_time_sync(conn.clone());
                             spawn_audio(sh.clone(), conn.clone());
                         }
-                        if source_now && !was && conn.synced() {
+                        if source_now && conn.synced() {
                             conn.send_state();
                         }
                         let st = if category == PskCategory::LongTerm && source_now {
@@ -667,27 +738,65 @@ fn rank(act: &Activation) -> u8 {
     }
 }
 
+/// One side of an admission decision.
+struct Contender<'a> {
+    conn_id: u64,
+    rank: u8,
+    category: PskCategory,
+    server_id: &'a str,
+    pairing_attempt: bool,
+}
+
 /// Multi-server admission (server-initiated rules, simplified): an
 /// incoming connection whose first activation ranks at least as high as
-/// the current one displaces it; a running pairing attempt is never
-/// displaced; between two idle connections the last-playback server wins.
-fn admit(sh: &Shared, conn_id: u64, act: &Activation, server_id: &str, writer: &Arc<ChannelWriter>) -> bool {
+/// the current one displaces it; a running pairing attempt is not
+/// displaced, except that a paired server always displaces an unpaired
+/// (Sentinel-keyed) connection and is never displaced by one, so a
+/// stranger cannot lock Music Assistant out or kick it; between two idle connections the last-playback server wins.
+fn may_displace(cur: &Contender<'_>, new: &Contender<'_>, last_playback: Option<&str>) -> bool {
+    if cur.server_id == new.server_id || cur.conn_id == new.conn_id {
+        // Same server reconnecting: replace silently.
+        return true;
+    }
+    if new.category == PskCategory::LongTerm && cur.category == PskCategory::Sentinel {
+        return true;
+    }
+    if cur.category == PskCategory::LongTerm && new.category != PskCategory::LongTerm {
+        return false;
+    }
+    if cur.pairing_attempt || new.rank < cur.rank {
+        return false;
+    }
+    if new.rank == 0 && cur.rank == 0 {
+        let incoming_is_last = last_playback == Some(new.server_id);
+        let current_is_last = last_playback == Some(cur.server_id);
+        return incoming_is_last && !current_is_last;
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit(sh: &Shared, conn_id: u64, act: &Activation, category: PskCategory, server_id: &str, writer: &Arc<ChannelWriter>, peer: std::net::IpAddr) -> bool {
     let mut adm = sh.admitted.lock().unwrap();
     let new_rank = rank(act);
     if let Some(cur) = adm.as_ref() {
-        if cur.server_id == server_id || cur.conn_id == conn_id {
-            // Same server reconnecting: replace silently.
-        } else if cur.pairing_attempt {
+        let current = Contender {
+            conn_id: cur.conn_id,
+            rank: cur.rank,
+            category: cur.category,
+            server_id: &cur.server_id,
+            pairing_attempt: cur.pairing_attempt,
+        };
+        let new = Contender {
+            conn_id,
+            rank: new_rank,
+            category,
+            server_id,
+            pairing_attempt: act.pairing,
+        };
+        let last = sh.store.snapshot().last_playback_server;
+        if !may_displace(&current, &new, last.as_deref()) {
             return false;
-        } else if new_rank < cur.rank {
-            return false;
-        } else if new_rank == 0 && cur.rank == 0 {
-            let last = sh.store.snapshot().last_playback_server;
-            let incoming_is_last = last.as_deref() == Some(server_id);
-            let current_is_last = last.as_deref() == Some(cur.server_id.as_str());
-            if !incoming_is_last || current_is_last {
-                return false;
-            }
         }
         if cur.conn_id != conn_id {
             let _ = cur.writer.send_json(&proto::client_goodbye("another_server"));
@@ -699,16 +808,28 @@ fn admit(sh: &Shared, conn_id: u64, act: &Activation, server_id: &str, writer: &
         rank: new_rank,
         server_id: server_id.to_string(),
         pairing_attempt: act.pairing,
+        category,
         writer: writer.clone(),
+        peer,
     });
     true
 }
 
-fn update_rank(sh: &Shared, conn_id: u64, act: &Activation) {
+fn update_rank(sh: &Shared, conn_id: u64, act: &Activation, category: PskCategory) {
     if let Some(a) = sh.admitted.lock().unwrap().as_mut() {
         if a.conn_id == conn_id {
             a.rank = rank(act);
             a.pairing_attempt = act.pairing;
+            a.category = category;
+        }
+    }
+}
+
+fn end_pairing_attempt(sh: &Shared, conn_id: u64) {
+    if let Some(a) = sh.admitted.lock().unwrap().as_mut() {
+        if a.conn_id == conn_id && a.pairing_attempt {
+            a.pairing_attempt = false;
+            a.rank = 0;
         }
     }
 }
@@ -746,6 +867,13 @@ fn run_pairing(
         let _ = conn.writer.send_json(&super::channel::envelope("pair/abort", serde_json::json!({"reason": "method_not_supported"})));
         return Ok(None);
     }
+    if method == Some(PairMethod::DynamicCode) && sh.store.snapshot().pairing_code_failures >= PAIRING_FAILURE_LIMIT {
+        // Too many wrong codes: no code is derived or shown until the user
+        // allows pairing again (the pairing token still works).
+        let _ = conn.writer.send_json(&super::channel::envelope("pair/abort", serde_json::json!({"reason": "method_not_supported"})));
+        note(sh, format!("Refused a pairing code attempt from {}: code pairing is paused after too many wrong codes", server_name));
+        return Ok(None);
+    }
     conn.quiet.store(true, Ordering::SeqCst);
     let ctx = PairingCtx {
         dialect: conn.dialect,
@@ -781,10 +909,25 @@ fn run_pairing(
             };
             sh.store.update(&mut |c: &mut SendspinConfig| {
                 c.store_server_pairing(rec.clone());
+                c.pairing_code_failures = 0;
                 true
             });
             note(sh, format!("Paired with {}", server_name));
             Ok(None)
+        }
+        PairOutcome::CodeMismatch => {
+            let mut failures = 0;
+            sh.store.update(&mut |c: &mut SendspinConfig| {
+                c.pairing_code_failures = c.pairing_code_failures.saturating_add(1);
+                failures = c.pairing_code_failures;
+                true
+            });
+            note(sh, format!("Pairing with {} failed: the code entered was wrong", server_name));
+            if failures >= PAIRING_FAILURE_LIMIT {
+                warn!("Sendspin source: {} wrong pairing codes; code pairing paused", failures);
+            }
+            // Each guess needs a new connection.
+            bail!("wrong pairing code")
         }
         PairOutcome::Left(v) => Ok(Some(v)),
         PairOutcome::Aborted(reason) => {
@@ -813,10 +956,9 @@ fn spawn_time_sync(conn: Arc<Conn>) {
 }
 
 /// Capture timestamps. Servers expect them to be sample-continuous —
-/// aiosendspin's source bridge (Music Assistant 2.10) inserts silence when
-/// a timestamp runs more than 10 ms past the previous chunk's end and drops
-/// a chunk that runs 10 ms behind — so the timeline is the sample count
-/// since an anchor.
+/// aiosendspin's source bridge inserts silence when a timestamp runs more
+/// than a few milliseconds past the expected position and resets on a
+/// large jump — so the timeline is the sample count since an anchor.
 /// Frame arrival (jittery by scheduling) only steers it: a low-passed
 /// error slews the anchor in sub-millisecond steps, which absorbs drift
 /// between the audio clock and ours, and only a real stall (half a second)
@@ -891,7 +1033,7 @@ fn spawn_audio(sh: Arc<Shared>, conn: Arc<Conn>) {
         let mut clock = CaptureClock::new();
         let mut generation = 0u64;
         let mut last_loud: Option<Instant> = None;
-        let mut reported_signal: Option<bool> = None;
+        let mut reported_signal: Option<(bool, bool)> = None;
         while conn.alive.load(Ordering::SeqCst) {
             let frame = match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(f) => f,
@@ -909,14 +1051,17 @@ fn spawn_audio(sh: Arc<Shared>, conn: Arc<Conn>) {
             }
             let present = last_loud.map(|t| t.elapsed() < SIGNAL_ABSENT_AFTER).unwrap_or(false);
             *conn.signal.lock().unwrap() = Some(present);
-            if reported_signal != Some(present) && conn.source_active.load(Ordering::SeqCst) && conn.synced() && !conn.quiet.load(Ordering::SeqCst) {
-                reported_signal = Some(present);
+            let selected = conn.selected.load(Ordering::SeqCst) > 0;
+            let reported = (selected, selected && present);
+            if reported_signal != Some(reported) && conn.source_active.load(Ordering::SeqCst) && conn.synced() && !conn.quiet.load(Ordering::SeqCst) {
+                reported_signal = Some(reported);
                 conn.send_state();
             }
 
-            // Streaming.
+            // Streaming: audio goes to Music Assistant only while it is the
+            // selected output.
             let st = conn.stream.lock().unwrap();
-            if !st.open {
+            if !st.open || !selected {
                 pending.clear();
                 continue;
             }
@@ -983,6 +1128,41 @@ mod tests {
         assert_eq!(check_activation(LongTerm, &mgmt), Err("unauthorized"));
     }
 
+    fn contender(conn_id: u64, rank: u8, category: PskCategory, server_id: &str, pairing_attempt: bool) -> Contender<'_> {
+        Contender {
+            conn_id,
+            rank,
+            category,
+            server_id,
+            pairing_attempt,
+        }
+    }
+
+    #[test]
+    fn admission_rules() {
+        use PskCategory::*;
+        // An unpaired pairing attempt holds off another unpaired server…
+        let stranger = contender(1, 1, Sentinel, "x", true);
+        assert!(!may_displace(&stranger, &contender(2, 1, Sentinel, "y", true), None));
+        assert!(!may_displace(&stranger, &contender(2, 2, Pairing, "y", false), None));
+        // …but never a server we are paired with.
+        assert!(may_displace(&stranger, &contender(2, 0, LongTerm, "ma", false), None));
+        // A paired server's pairing attempt is not displaced.
+        let paired = contender(1, 1, LongTerm, "ma", true);
+        assert!(!may_displace(&paired, &contender(2, 2, LongTerm, "ma2", false), None));
+        // The same server reconnecting replaces itself.
+        assert!(may_displace(&paired, &contender(3, 0, Sentinel, "ma", false), None));
+        // An unpaired connection never displaces a paired one, even idle.
+        let idle_paired = contender(1, 0, LongTerm, "ma", false);
+        assert!(!may_displace(&idle_paired, &contender(2, 1, Sentinel, "x", true), None));
+        assert!(!may_displace(&idle_paired, &contender(2, 1, Pairing, "x", true), None));
+        // Idle vs idle: only the last playback server takes over.
+        let idle = contender(1, 0, LongTerm, "a", false);
+        assert!(!may_displace(&idle, &contender(2, 0, LongTerm, "b", false), Some("a")));
+        assert!(may_displace(&idle, &contender(2, 0, LongTerm, "b", false), Some("b")));
+        assert!(may_displace(&idle, &contender(2, 2, LongTerm, "b", false), None));
+    }
+
     #[test]
     fn capture_clock_is_sample_continuous_under_jitter() {
         let mut c = CaptureClock::new();
@@ -990,7 +1170,7 @@ mod tests {
         let mut prev = c.next(1_000_000, CHUNK_FRAMES);
         assert_eq!(prev, 1_000_000);
         // ±35 ms of arrival jitter: every step stays within 1 ms of the
-        // chunk duration (servers reject >10 ms discontinuities).
+        // chunk duration (servers treat larger steps as gaps or jumps).
         for i in 1..500i64 {
             let jitter = if i % 7 == 0 { 35_000 } else if i % 5 == 0 { -25_000 } else { 0 };
             let ts = c.next(1_000_000 + i * dur + jitter, CHUNK_FRAMES);

@@ -128,10 +128,11 @@ fn renderer_from_info(info: &ServiceInfo) -> Option<SendspinRenderer> {
         .copied()
         .find(|a| !a.is_loopback() && !a.is_link_local())
         .map(IpAddr::V4)?;
-    let mut path = info.get_property_val_str("path").unwrap_or(mdns::DEFAULT_PATH).to_string();
-    if !path.starts_with('/') {
-        path.insert(0, '/');
-    }
+    let path = info
+        .get_property_val_str("path")
+        .map(|p| if p.starts_with('/') { p.to_string() } else { format!("/{}", p) })
+        .filter(|p| super::ws::valid_path(p))
+        .unwrap_or_else(|| mdns::DEFAULT_PATH.to_string());
     let friendly_name = info
         .get_property_val_str("name")
         .filter(|n| !n.trim().is_empty())
@@ -224,14 +225,24 @@ pub struct PlayerSessionConfig {
 #[derive(Debug)]
 pub enum StartError {
     /// The player only plays for a paired server. `methods` are what it
-    /// offers; `lost_credential` = we had a pairing it no longer knows.
-    NeedsPairing { methods: Vec<PairMethod>, lost_credential: bool },
+    /// offers; `lost_credential` = we had a pairing it no longer knows;
+    /// `identity_changed` = we paired with a different identity at this
+    /// speaker's name (reset, replaced, or an impostor), so it must be
+    /// paired again before we stream to it.
+    NeedsPairing {
+        methods: Vec<PairMethod>,
+        lost_credential: bool,
+        identity_changed: bool,
+    },
     Other(anyhow::Error),
 }
 
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StartError::NeedsPairing { identity_changed: true, .. } => {
+                write!(f, "the speaker's identity changed since it was paired; pair it again to confirm it")
+            }
             StartError::NeedsPairing { lost_credential: true, .. } => {
                 write!(f, "the speaker no longer recognises this computer's pairing; pair it again")
             }
@@ -516,8 +527,19 @@ fn bring_up(
         .with_context(|| format!("connecting to {}", renderer.url()))?;
     let first = handshake::read_first_frame(&mut ws_r, &ws_w, timeout)?;
     let server_id = b64url(&x25519_public(server_priv));
+    // The identity we paired with at this speaker's name, if any.
+    let pinned = store.snapshot().pinned_client_id(&renderer.instance);
     match first {
         FirstFrame::Refused(why) => Err(anyhow!("the speaker's protocol version is not supported ({})", why).into()),
+        FirstFrame::LegacyHello { .. } if pinned.is_some() => {
+            ws_w.close();
+            Err(anyhow!(
+                "{} was paired with this computer but now answers without encryption, so this computer won't stream to it \
+                 (its firmware may have been downgraded, or another device is using its name)",
+                renderer.friendly_name
+            )
+            .into())
+        }
         FirstFrame::LegacyHello { value } => {
             // Pre-encryption wire: plaintext, the hello carries everything.
             let hello = proto::parse_player_hello(payload(&value));
@@ -599,10 +621,25 @@ fn bring_up(
                 return Err(anyhow!("{} is not a Sendspin speaker (roles: {:?})", hello.name, hello.roles).into());
             }
 
+            if pinned.as_deref().is_some_and(|p| p != client_id) && pairing.is_none() {
+                warn!("Sendspin: {} answers with a different identity than the one paired at that name", hello.name);
+                return Err(StartError::NeedsPairing {
+                    methods: hello.pair_methods.clone(),
+                    lost_credential: false,
+                    identity_changed: true,
+                });
+            }
+            if token.is_some() && category != PskCategory::Pairing {
+                // Message 2 verified only under the Sentinel: the speaker
+                // does not hold that token's PSK, so nothing may be paired
+                // over this connection.
+                return Err(anyhow!("{} did not accept that pairing token (it may be out of date); get a current one from the speaker", hello.name).into());
+            }
             if hs.credential_mismatch && pairing.is_none() {
                 return Err(StartError::NeedsPairing {
                     methods: hello.pair_methods.clone(),
                     lost_credential: true,
+                    identity_changed: false,
                 });
             }
             let mut pairing_index = 0u32;
@@ -613,6 +650,7 @@ fn bring_up(
                         return Err(StartError::NeedsPairing {
                             methods: hello.pair_methods.clone(),
                             lost_credential: referenced_lt,
+                            identity_changed: false,
                         });
                     };
                     let (method, ask) = match input {
@@ -645,6 +683,7 @@ fn bring_up(
                         PairOutcome::Aborted(reason) => {
                             return Err(anyhow!("pairing was not completed ({})", reason.replace('_', " ")).into())
                         }
+                        PairOutcome::CodeMismatch => return Err(anyhow!("pairing was not completed (the code did not match)").into()),
                         PairOutcome::Left(_) => return Err(anyhow!("pairing ended unexpectedly").into()),
                     };
                     let name = hello.name.clone();
@@ -655,8 +694,10 @@ fn bring_up(
                             PlayerPairing {
                                 psk: b64url(&lt_psk),
                                 name: Some(name.clone()),
+                                instance: None,
                             },
                         );
+                        c.pin_player(&cid, &renderer.instance);
                         true
                     });
                     pairing::server_send_finalize(&writer)?;
@@ -694,6 +735,11 @@ fn bring_up(
                         hello = proto::parse_player_hello(payload(&h2));
                     }
                 }
+            }
+            if category == PskCategory::LongTerm {
+                // Records made before pinning existed get pinned on first use.
+                let cid = client_id.clone();
+                store.update(&mut |c: &mut SendspinConfig| c.pin_player(&cid, &renderer.instance));
             }
             debug!("Sendspin: {} playing on a {:?} connection", hello.name, category);
             let roles = roles_to_activate(&hello);
@@ -776,6 +822,10 @@ fn update_capabilities(sh: &Shared, hello: &PlayerHello, state: &PlayerState) {
     }
 }
 
+/// Sample rates we resample to (an arbitrary rate could need a huge
+/// filter).
+const STANDARD_RATES: [u32; 11] = [8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+
 /// Pick the stream format: the player's highest-priority PCM/FLAC entry,
 /// but prefer one at our native 44.1 kHz (no resampling) when offered.
 pub fn choose_format(formats: &[AudioFormat]) -> Option<AudioFormat> {
@@ -783,7 +833,7 @@ pub fn choose_format(formats: &[AudioFormat]) -> Option<AudioFormat> {
         matches!(f.codec.as_str(), "pcm" | "flac")
             && (1..=2).contains(&f.channels)
             && matches!(f.bit_depth, 16 | 24 | 32)
-            && (8_000..=192_000).contains(&f.sample_rate)
+            && STANDARD_RATES.contains(&f.sample_rate)
             && !(f.codec == "flac" && f.bit_depth == 32)
     };
     formats
@@ -1108,6 +1158,8 @@ mod tests {
         let fmts = vec![f("opus", 48_000, 16), f("flac", 48_000, 24), f("pcm", 48_000, 16)];
         assert_eq!(choose_format(&fmts).unwrap(), f("flac", 48_000, 24));
         assert!(choose_format(&[f("opus", 48_000, 16)]).is_none());
+        assert!(choose_format(&[f("pcm", 44_101, 16)]).is_none());
+        assert_eq!(choose_format(&[f("pcm", 47_999, 16), f("pcm", 96_000, 24)]).unwrap(), f("pcm", 96_000, 24));
     }
 
     #[test]

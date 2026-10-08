@@ -94,6 +94,7 @@ fn main() {
                 port: arg(&args, "--port").and_then(|p| p.parse().ok()).unwrap_or(8928),
                 software_version: env!("CARGO_PKG_VERSION").into(),
                 advertise: !args.iter().any(|a| a == "--no-mdns"),
+                output_selected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             };
             let svc = stream_to_speaker::sendspin::source::SourceService::start(opts, hub, store).expect("start");
             println!("PORT {}", svc.port());
@@ -174,7 +175,7 @@ fn main() {
                     println!("STOP dead={}", s.is_dead());
                     s.stop();
                 }
-                Err(StartError::NeedsPairing { methods, lost_credential }) => {
+                Err(StartError::NeedsPairing { methods, lost_credential, .. }) => {
                     println!("NEEDS-PAIRING {:?} lost={}", methods, lost_credential);
                     std::process::exit(3);
                 }

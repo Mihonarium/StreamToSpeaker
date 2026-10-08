@@ -3204,7 +3204,14 @@ impl StreamToSpeakerApp {
         };
         let v = &prompt.view;
         let title = format!("Pair with {}", v.name);
-        let lead = if v.lost_credential {
+        let lead = if v.identity_changed {
+            format!(
+                "{} is answering with a different identity than the speaker this computer was paired with \
+                 (it may have been reset or replaced, or another device is using its name). \
+                 Pair it again only if it is your speaker. ",
+                v.name
+            )
+        } else if v.lost_credential {
             format!("{} no longer recognises this computer, so it needs to be paired again. ", v.name)
         } else {
             format!("{} needs to be paired with this computer once. ", v.name)
@@ -3294,6 +3301,10 @@ impl StreamToSpeakerApp {
                 ui.add_space(sp::S);
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new(grouped).size(36.0).strong().monospace().color(p.text_primary));
+                    ui.add_space(sp::XS);
+                    if secondary_button(ui, p, "Copy code", 120.0).clicked() {
+                        ui.ctx().copy_text(code.clone());
+                    }
                 });
                 ui.add_space(sp::S);
                 ui.label(
@@ -3361,17 +3372,23 @@ impl StreamToSpeakerApp {
                 Some(SourceState::NeedsPairing { server }) => (
                     format!(
                         "{} found this computer. To finish, open \u{201c}{}\u{201d} in Music Assistant's \
-                         player settings and start its setup: a 6-digit code then appears here \
-                         to type in there.",
+                         player settings and start its setup: a window with a 6-digit code then \
+                         opens here; type that code in there.",
                         server, name
                     ),
                     p.warn,
                 ),
                 Some(SourceState::Connected { server, streaming }) => (
-                    if streaming {
+                    if streaming && self.app.is_ma_output_selected() {
                         format!("Paired with {} — playing this computer's audio.", server)
                     } else {
-                        format!("Paired with {} — ready. Pick \u{201c}{}\u{201d} as a source there.", server, name)
+                        format!(
+                            "Paired with {}. Select \u{201c}Music Assistant\u{201d} in the speaker list to \
+                             send this computer's audio there (it gets none otherwise). Music Assistant \
+                             picks the speaker: set \u{201c}Automatically play line-in on\u{201d} in \
+                             \u{201c}{}\u{201d}'s player settings there, or start the input from Browse.",
+                            server, name
+                        )
                     },
                     p.text_primary,
                 ),
@@ -3382,34 +3399,57 @@ impl StreamToSpeakerApp {
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new(note).size(12.0).color(p.text_tertiary));
             }
+            if self.app.is_sendspin_pairing_paused() {
+                ui.add_space(sp::XS);
+                ui.label(
+                    egui::RichText::new(
+                        "Pairing with a code is paused: wrong codes were entered too many times. \
+                         If that was you, allow pairing again and retry from Music Assistant; \
+                         otherwise something on your network may be trying to pair with this computer.",
+                    )
+                    .size(12.0)
+                    .color(p.warn),
+                );
+                ui.add_space(sp::XS);
+                if secondary_button(ui, p, "Allow pairing again", 170.0).clicked() {
+                    self.app.allow_sendspin_pairing_again();
+                }
+            }
             ui.add_space(sp::S);
-            ui.label(egui::RichText::new("Pairing token").strong().color(p.text_primary));
-            ui.label(
-                egui::RichText::new(
-                    "Only needed for a Sendspin server that asks for a token instead of a code.",
-                )
-                .size(12.0)
-                .color(p.text_tertiary),
-            );
-            let token = self.app.sendspin_pairing_token();
-            let shown = if self.show_ma_token {
-                crate::sendspin::keys::format_token_for_display(&token)
-            } else {
-                "SP:0 •••• •••• •••• ••••".to_string()
-            };
-            ui.label(egui::RichText::new(shown).size(12.0).monospace().color(p.text_secondary));
-            ui.add_space(sp::XS);
-            ui.horizontal(|ui| {
-                if secondary_button(ui, p, "Copy token", 120.0)
-                    .on_hover_text("Copy the token to paste into Music Assistant's pairing dialog")
-                    .clicked()
-                {
-                    ui.ctx().copy_text(token.clone());
-                }
-                let label = if self.show_ma_token { "Hide" } else { "Show" };
-                if link_button(ui, p, label, 80.0).clicked() {
-                    self.show_ma_token = !self.show_ma_token;
-                }
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Pair with a token instead").size(12.0).color(p.text_tertiary),
+            )
+            .id_salt("sendspin-token")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Music Assistant pairs with the 6-digit code shown during setup, so you \
+                         don't need this. It is only for a Sendspin server that asks for a token.",
+                    )
+                    .size(12.0)
+                    .color(p.text_tertiary),
+                );
+                let token = self.app.sendspin_pairing_token();
+                let shown = if self.show_ma_token {
+                    crate::sendspin::keys::format_token_for_display(&token)
+                } else {
+                    "SP:0 •••• •••• •••• ••••".to_string()
+                };
+                ui.label(egui::RichText::new(shown).size(12.0).monospace().color(p.text_secondary));
+                ui.add_space(sp::XS);
+                ui.horizontal(|ui| {
+                    if secondary_button(ui, p, "Copy token", 120.0)
+                        .on_hover_text("Copy the token for a Sendspin server that asks for one")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(token.clone());
+                    }
+                    let label = if self.show_ma_token { "Hide" } else { "Show" };
+                    if link_button(ui, p, label, 80.0).clicked() {
+                        self.show_ma_token = !self.show_ma_token;
+                    }
+                });
             });
             let paired = self.app.sendspin_paired_servers();
             if !paired.is_empty() {

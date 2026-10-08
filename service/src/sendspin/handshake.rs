@@ -58,7 +58,7 @@ pub struct ClientHandshake {
     pub handshake_hash: [u8; 32],
     pub suite: Suite,
     /// The server sent `psk_category` in message 1 (current spec text);
-    /// absent on aiosendspin 9.x servers (Music Assistant 2.10).
+    /// absent on servers using aiosendspin 9.x.
     pub server_sends_psk_category: bool,
     /// No candidate PSK matched and we completed with the Sentinel.
     pub fell_back_to_sentinel: bool,

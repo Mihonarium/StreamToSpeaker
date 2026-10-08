@@ -8,9 +8,9 @@ Stream To Speaker adds a virtual audio output to Windows and streams it over
 the network — to Sonos, IKEA SYMFONISK, KEF, Denon HEOS, MoOde and Volumio
 over **UPnP / OpenHome**, and to HomePod, AirPort Express and shairport-sync
 over **AirPlay**. Windows volume and the speaker's own buttons stay in sync.
-It also streams to **Sendspin** speakers (Music Assistant's streaming
-protocol) and can offer the PC's sound to Music Assistant as an input
-(optional, off by default).
+It also has experimental support for **Sendspin** (Music Assistant's
+streaming protocol): it can stream to Sendspin speakers and offer the PC's
+sound to Music Assistant as an input (optional, off by default).
 
 ## Install
 
@@ -31,17 +31,19 @@ Sound lagging behind video → **−25 / −100 ms**. No sound → **Resync**
 (`Ctrl+Shift+R`). Speaker missing → **↻ Rescan**; check it's on the same
 network as the PC.
 
-Sendspin is off by default: tick *Enable Sendspin* in the *Sendspin and Music
-Assistant* card to list Sendspin speakers and offer the Music Assistant input.
-Sendspin speakers play directly, without Music Assistant. One that asks to be
-paired shows or says a code (or has one printed on it): type it in when the app
-asks; it's remembered.
+Sendspin support is experimental and off by default: tick *Enable Sendspin*
+in the *Sendspin and Music Assistant* card to list Sendspin speakers and offer
+the Music Assistant input. Sendspin speakers play directly, without Music
+Assistant. One that asks to be paired shows or says a code (or has one printed
+on it): type it in when the app asks; it's remembered.
 
-**Music Assistant input:** tick *Offer this computer as a Music Assistant input*
+**Music Assistant input (experimental):** tick *Offer this computer as a Music Assistant input*
 and enable the Sendspin Source plugin in Music Assistant. The first time, open
 this computer in Music Assistant's player settings and run its setup; the app
-shows a 6-digit code to type in there. After that the PC appears as a source
-you can play on any Music Assistant speaker.
+shows a 6-digit code to type in there. After that, select *Music Assistant* in
+the speaker list to send the PC's audio there; it gets audio only while that is
+selected. Music Assistant chooses the speaker: set *Automatically play line-in
+on* in this computer's player settings there, or play the input from Browse.
 
 Closing the window minimises to the tray; quit from the tray menu.
 

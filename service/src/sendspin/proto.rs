@@ -1,8 +1,8 @@
 //! Sendspin application messages, in the two wire dialects found in the
 //! field.
 //!
-//! * [`Dialect::V9`] — aiosendspin 9.x, i.e. what Music Assistant 2.10
-//!   ships (and the reference Python player): pairing methods
+//! * [`Dialect::V9`] — aiosendspin 9.x (servers built on it, and the
+//!   reference Python player of that line): pairing methods
 //!   `dynamic_pin` / `static_pin` / `pairing_psk` listed as an array of
 //!   descriptors, `trust_level` in `client/hello`, `client_stream/*`,
 //!   `static_delay_ms`, 9-byte binary audio header, hellos re-exchanged
