@@ -373,8 +373,12 @@ impl Conn {
         self.filter.lock().unwrap().is_synchronized()
     }
 
+    fn is_selected(&self) -> bool {
+        self.selected.load(Ordering::SeqCst) > 0
+    }
+
     fn send_state(&self) {
-        let selected = self.selected.load(Ordering::SeqCst) > 0;
+        let selected = self.is_selected();
         let signal = selected && self.signal.lock().unwrap().unwrap_or(false);
         let _ = self.writer.send_json(&proto::client_state_source(selected, Some(signal)));
         self.state_sent.store(true, Ordering::SeqCst);
@@ -615,7 +619,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                     if became_synced && conn.source_active.load(Ordering::SeqCst) && !conn.state_sent.load(Ordering::SeqCst) {
                         conn.send_state();
                     }
-                    if became_synced && start_pending && conn.source_active.load(Ordering::SeqCst) {
+                    if became_synced && start_pending && conn.source_active.load(Ordering::SeqCst) && conn.is_selected() {
                         start_pending = false;
                         conn.start_stream()?;
                         set_state(sh, conn_id, SourceState::Connected { server: server_name.clone(), streaming: true });
@@ -624,6 +628,11 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                 "server/command" => {
                     if let Some(cmd) = payload(&value).get("source").and_then(|s| s.get("command")).and_then(Value::as_str) {
                         match cmd {
+                            "start" if !conn.is_selected() => {
+                                // Audio goes to Music Assistant only while it is the
+                                // selected output; it is told the input is unavailable.
+                                debug!("ignoring source start: Music Assistant is not the selected output");
+                            }
                             "start" => {
                                 if conn.source_active.load(Ordering::SeqCst) && conn.synced() {
                                     conn.start_stream()?;
@@ -1034,6 +1043,7 @@ fn spawn_audio(sh: Arc<Shared>, conn: Arc<Conn>) {
         let mut generation = 0u64;
         let mut last_loud: Option<Instant> = None;
         let mut reported_signal: Option<(bool, bool)> = None;
+        let mut was_selected = false;
         while conn.alive.load(Ordering::SeqCst) {
             let frame = match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(f) => f,
@@ -1051,7 +1061,12 @@ fn spawn_audio(sh: Arc<Shared>, conn: Arc<Conn>) {
             }
             let present = last_loud.map(|t| t.elapsed() < SIGNAL_ABSENT_AFTER).unwrap_or(false);
             *conn.signal.lock().unwrap() = Some(present);
-            let selected = conn.selected.load(Ordering::SeqCst) > 0;
+            let selected = conn.is_selected();
+            if was_selected && !selected {
+                // Unselected: end the stream so Music Assistant stops now.
+                conn.stop_stream();
+            }
+            was_selected = selected;
             let reported = (selected, selected && present);
             if reported_signal != Some(reported) && conn.source_active.load(Ordering::SeqCst) && conn.synced() && !conn.quiet.load(Ordering::SeqCst) {
                 reported_signal = Some(reported);

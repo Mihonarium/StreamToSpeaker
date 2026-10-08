@@ -1766,6 +1766,15 @@ impl StreamToSpeakerApp {
                 Some("Enable streaming"),
                 Some("Reconnect to the last speaker and resume streaming (Ctrl+E)"),
             ),
+            // Music Assistant selected while it is away (no address yet).
+            (Some(r), true, _) if r.ip.is_unspecified() => (
+                "\u{23F8}", // ⏸ Double Vertical Bar (Pause)
+                p.warn,
+                format!("Standing by on {}", r.friendly_name),
+                format!("{} not connected — resumes when it reconnects", r.friendly_name),
+                Some("Disable streaming"),
+                Some("Stop streaming and release the speaker for other apps (Ctrl+E)"),
+            ),
             (Some(r), true, true) => (
                 "\u{23F5}", // ⏵ Black Medium Right-Pointing Triangle (Play)
                 p.success,
