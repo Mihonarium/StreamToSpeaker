@@ -84,7 +84,10 @@ Output: `installer\out\StreamToSpeakerSetup-<version>.exe`. It installs the
 service to `Program Files`, stages the driver with `pnputil /add-driver
 /install`, runs `scripts\Rename-Endpoint.ps1`, and optionally adds Start Menu,
 desktop and autostart entries. Uninstall removes the driver via
-`Uninstall-Driver.ps1` and deletes the install directory.
+`Uninstall-Driver.ps1`, removes the test-signing certificate a test-signed
+build imported into `LocalMachine\Root` and `TrustedPublisher`
+(`Remove-TestCertificate.ps1`; an upgrade removes the replaced build's
+certificate when it differs), and deletes the install directory.
 
 ### Endpoint named "Internal AUX Jack — Stream To Speaker"
 

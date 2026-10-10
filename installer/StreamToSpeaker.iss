@@ -142,6 +142,7 @@ Source: "{#SourcePath}\..\scripts\Rename-Endpoint.ps1"; DestDir: "{app}\scripts"
 Source: "{#SourcePath}\..\scripts\Reset-Install.ps1";   DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\..\scripts\Diagnose.ps1";        DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\Uninstall-Driver.ps1";           DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "{#SourcePath}\Remove-TestCertificate.ps1";     DestDir: "{app}\scripts"; Flags: ignoreversion
 
 ; --- devcon.exe (WDK redistributable, MIT) ---
 ; Used to add the root-enumerated StreamToSpeaker device after the
@@ -201,7 +202,9 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
 ;    so Windows (in test-signing mode) accepts our test-signed driver.
 ;    Only runs if the .cer was bundled (CI build does; manual unsigned
 ;    local builds skip this step and just hope the user has their
-;    own signing trust set up).
+;    own signing trust set up). Uninstall removes this certificate
+;    again (Remove-TestCertificate.ps1), and an upgrade removes the
+;    replaced build's certificate when it differs (see [Code]).
 Filename: "{sys}\certutil.exe"; \
     Parameters: "-addstore -f TrustedPublisher ""{app}\driver\StreamToSpeaker.cer"""; \
     StatusMsg: "Trusting driver signature..."; \
@@ -258,6 +261,13 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\Uninstall-Driver.ps1"""; \
     Flags: runhidden waituntilterminated; RunOnceId: "RemoveDriver"
 
+; Remove the test-signing certificate a test-signed build imported into
+; LocalMachine Root + TrustedPublisher (no-op for Microsoft-signed builds,
+; which ship no .cer). Runs before uninstall deletes {app}.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\Remove-TestCertificate.ps1"" -CerPath ""{app}\driver\StreamToSpeaker.cer"""; \
+    Flags: runhidden waituntilterminated; RunOnceId: "RemoveTestCert"
+
 [Code]
 
 // Detects a running Stream To Speaker process via its named
@@ -300,6 +310,35 @@ begin
     begin
       Result := False;
     end;
+  end;
+end;
+
+// Upgrade: an earlier test-signed build left its certificate in
+// LocalMachine Root + TrustedPublisher and its .cer in {app}\driver.
+// Move that .cer aside before the new files go in (otherwise a build
+// that ships no .cer would leave the old one behind, and the import
+// step in [Run] would trust it again), then remove the old certificate
+// once the new build is installed, unless the new build ships the same
+// one.
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  OldCer, SavedCer: String;
+  ResultCode: Integer;
+begin
+  OldCer := ExpandConstant('{app}\driver\StreamToSpeaker.cer');
+  SavedCer := ExpandConstant('{tmp}\previous-test-cert.cer');
+  if CurStep = ssInstall then begin
+    if FileExists(OldCer) then begin
+      if FileCopy(OldCer, SavedCer, False) then
+        DeleteFile(OldCer);
+    end;
+  end else if CurStep = ssPostInstall then begin
+    if FileExists(SavedCer) then
+      Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+           '-NoProfile -ExecutionPolicy Bypass -File "' +
+           ExpandConstant('{app}\scripts\Remove-TestCertificate.ps1') + '"' +
+           ' -CerPath "' + SavedCer + '" -KeepCerPath "' + OldCer + '"',
+           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
 
