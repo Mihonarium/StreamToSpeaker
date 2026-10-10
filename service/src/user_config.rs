@@ -439,6 +439,6 @@ mod tests {
         let c: UserConfig =
             serde_json::from_str(r#"{"equalizer":{"enabled":true,"preamp_db":40.2}}"#).unwrap();
         assert!(c.equalizer.enabled);
-        assert_eq!(c.equalizer.preamp_db, 12.0);
+        assert_eq!(c.equalizer.preamp_db, 0.0);
     }
 }

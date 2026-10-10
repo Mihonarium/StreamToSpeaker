@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use crate::app::App;
 use crate::equalizer::{
     matching_preset, EqSettings, EQ_BANDS, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_GAIN_STEP_DB,
-    EQ_PRESETS,
+    EQ_PREAMP_MAX_DB, EQ_PRESETS,
 };
 
 // -----------------------------------------------------------------------------
@@ -1133,9 +1133,7 @@ impl eframe::App for StreamToSpeakerApp {
             if self.tray.is_none() {
                 self.app.request_shutdown();
             } else if self.skip_close_confirmation {
-                if let Some(hwnd) = self.hwnd {
-                    win_hide(hwnd);
-                }
+                self.hide_to_tray();
             } else {
                 self.confirm_close_open = true;
             }
@@ -2577,6 +2575,25 @@ impl StreamToSpeakerApp {
         });
     }
 
+    /// Hide the window to the tray. An unapplied equalizer preview is
+    /// dropped first, as Revert would, so an unseen draft never keeps
+    /// playing.
+    fn hide_to_tray(&mut self) {
+        self.discard_eq_preview();
+        if let Some(hwnd) = self.hwnd {
+            win_hide(hwnd);
+        }
+    }
+
+    /// Drop the equalizer draft and, if it differed, put the stream back
+    /// on the saved curve.
+    fn discard_eq_preview(&mut self) {
+        if self.eq_draft.take().is_some_and(|d| d != self.app.eq_saved()) {
+            self.app.eq_revert();
+        }
+        self.eq_previewed = None;
+    }
+
     fn show_equalizer(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
             let was_open = self.eq_open;
@@ -2591,10 +2608,7 @@ impl StreamToSpeakerApp {
             if !self.eq_open {
                 if was_open {
                     // Closed without Apply: back to the saved curve.
-                    if self.eq_draft.take().is_some_and(|d| d != self.app.eq_saved()) {
-                        self.app.eq_revert();
-                    }
-                    self.eq_previewed = None;
+                    self.discard_eq_preview();
                 }
                 return;
             }
@@ -2671,7 +2685,7 @@ impl StreamToSpeakerApp {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Preamp").color(p.text_primary));
                     ui.add(
-                        egui::Slider::new(&mut draft.preamp_db, gain_range.clone())
+                        egui::Slider::new(&mut draft.preamp_db, EQ_GAIN_MIN_DB..=EQ_PREAMP_MAX_DB)
                             .step_by(EQ_GAIN_STEP_DB as f64)
                             .suffix(" dB")
                             .clamping(egui::SliderClamping::Always),
@@ -2708,8 +2722,10 @@ impl StreamToSpeakerApp {
                 .on_hover_text(
                     "Boosting a band can push loud passages past full scale, which \
                      distorts. The equalizer measures the curve's highest point and \
-                     lowers the overall level by that much (plus any positive preamp), \
-                     so a boost never clips.",
+                     lowers the overall level just enough that the peak stays at full \
+                     scale, so a boost never clips. A preamp cut counts toward that \
+                     reduction; the preamp can only cut, since any boost there would be \
+                     taken straight back off.",
                 );
             ui.add_space(sp::S);
 
@@ -3206,11 +3222,7 @@ impl StreamToSpeakerApp {
         if let Some(a) = action {
             self.confirm_close_open = false;
             match a {
-                CloseAction::MinimiseToTray => {
-                    if let Some(hwnd) = self.hwnd {
-                        win_hide(hwnd);
-                    }
-                }
+                CloseAction::MinimiseToTray => self.hide_to_tray(),
                 CloseAction::Quit => {
                     // request_shutdown flips the atomic; the next
                     // update() tick sees it and runs the Close

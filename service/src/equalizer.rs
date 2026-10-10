@@ -5,7 +5,7 @@
 //!
 //! - Ten RBJ-cookbook peaking biquads (Q = 1.4) at octave centres from
 //!   31.25 Hz to 16 kHz, gain −12..+12 dB in 0.5 dB steps, plus a preamp
-//!   in the same range.
+//!   of −12..0 dB.
 //! - **Automatic headroom**: the cascade's magnitude response is
 //!   evaluated at DC, Nyquist, every band centre and 4096 log-spaced
 //!   points from 10 Hz to Nyquist; the peak (floored at 0 dB) plus the
@@ -42,6 +42,10 @@ pub const EQ_Q: f64 = 1.4;
 /// Per-band gain and preamp limits, dB.
 pub const EQ_GAIN_MIN_DB: f32 = -12.0;
 pub const EQ_GAIN_MAX_DB: f32 = 12.0;
+/// Preamp ceiling, dB. Automatic headroom takes any positive preamp
+/// straight back off (it never lets the output exceed 0 dB at the curve's
+/// peak), so a boost there could never be heard; the preamp only cuts.
+pub const EQ_PREAMP_MAX_DB: f32 = 0.0;
 /// Gain resolution, dB.
 pub const EQ_GAIN_STEP_DB: f32 = 0.5;
 /// Crossfade length between two curves, as a fraction of a second
@@ -74,10 +78,14 @@ impl Default for EqSettings {
 /// Clamp to the supported range and snap to the 0.5 dB grid. Non-finite
 /// values (a hand-edited config) become 0.
 fn snap_db(v: f32) -> f32 {
+    snap_db_within(v, EQ_GAIN_MAX_DB)
+}
+
+fn snap_db_within(v: f32, max: f32) -> f32 {
     if !v.is_finite() {
         return 0.0;
     }
-    let v = v.clamp(EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB);
+    let v = v.clamp(EQ_GAIN_MIN_DB, max);
     let snapped = (v / EQ_GAIN_STEP_DB).round() * EQ_GAIN_STEP_DB;
     // Normalise -0.0 so flat comparisons and presets match exactly.
     if snapped == 0.0 { 0.0 } else { snapped }
@@ -87,7 +95,7 @@ impl EqSettings {
     /// Copy with every gain clamped and snapped to the supported grid.
     pub fn sanitized(&self) -> Self {
         let mut s = self.clone();
-        s.preamp_db = snap_db(s.preamp_db);
+        s.preamp_db = snap_db_within(s.preamp_db, EQ_PREAMP_MAX_DB);
         for b in s.bands_db.iter_mut() {
             *b = snap_db(*b);
         }
@@ -542,7 +550,7 @@ mod tests {
         for s in [
             EqSettings { enabled: false, preamp_db: 6.0, bands_db: [12.0; EQ_BANDS] },
             EqSettings { enabled: true, preamp_db: 0.0, bands_db: [0.0; EQ_BANDS] },
-            // Positive preamp on a flat curve is fully taken back by headroom.
+            // A positive preamp is clamped to 0 dB.
             EqSettings { enabled: true, preamp_db: 9.0, bands_db: [0.0; EQ_BANDS] },
         ] {
             let d = EqDesign::new(&s, FS);
@@ -588,11 +596,11 @@ mod tests {
     fn headroom_matches_peak_and_prevents_clipping_full_scale_sine() {
         let mut bands = [0.0f32; EQ_BANDS];
         bands[5] = 12.0; // 1 kHz
-        let s = EqSettings { enabled: true, preamp_db: 3.0, bands_db: bands };
+        let s = EqSettings { enabled: true, preamp_db: -3.0, bands_db: bands };
         let d = EqDesign::new(&s, FS);
         // A lone band's peak is its own gain; preamp + peak comes back off.
         assert!((d.peak_db - 12.0).abs() < 0.01, "peak {}", d.peak_db);
-        assert!((d.auto_attenuation_db + 15.0).abs() < 0.01);
+        assert!((d.auto_attenuation_db + 9.0).abs() < 0.01);
         assert!((d.effective_preamp_db + 12.0).abs() < 0.01);
 
         // Full-scale 1 kHz sine through the chain in float (before the
@@ -699,6 +707,8 @@ mod tests {
         }
         .sanitized();
         assert_eq!(s.preamp_db, 0.0);
+        let boosted = EqSettings { preamp_db: 6.0, ..EqSettings::default() }.sanitized();
+        assert_eq!(boosted.preamp_db, 0.0, "preamp only cuts");
         assert_eq!(&s.bands_db[..5], &[0.5, 0.0, 12.0, -12.0, 1.5]);
         assert_eq!(s.bands_db[9].to_bits(), 0.0f32.to_bits(), "no negative zero");
         for p in EQ_PRESETS {
