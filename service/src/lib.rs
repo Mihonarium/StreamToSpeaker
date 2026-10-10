@@ -5,6 +5,8 @@
 //! detector in particular) without booting the whole service.
 
 pub mod airplay;
+pub mod sendspin;
+pub mod sendspin_app;
 pub mod app;
 pub mod audio_loop;
 pub mod audio_source;
