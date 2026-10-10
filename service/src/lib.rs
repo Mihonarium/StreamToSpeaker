@@ -69,9 +69,23 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
             format!("refusing to open {:?}", url),
         ));
     }
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
     let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
     let verb = wide("open");
     let file = wide(url);
+    // ShellExecute may hand off to shell extensions that need COM; the
+    // documented requirement is an apartment-threaded apartment. S_OK /
+    // S_FALSE (already initialised as STA) both need a matching
+    // CoUninitialize; a thread already in the MTA just proceeds.
+    // SAFETY: plain COM initialisation for this thread.
+    let hr = unsafe {
+        CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    };
     // SAFETY: both strings are NUL-terminated and outlive the call.
     let rc = unsafe {
         ShellExecuteW(
@@ -83,6 +97,10 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
             SW_SHOWNORMAL,
         )
     };
+    if hr >= 0 {
+        // SAFETY: balances the successful CoInitializeEx above.
+        unsafe { CoUninitialize() };
+    }
     // Values above 32 mean success.
     if rc as usize > 32 {
         Ok(())
