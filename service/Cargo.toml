@@ -156,6 +156,8 @@ features = [
     "Win32_Media_Audio",
     "Win32_System_Threading",
     "Win32_Security",
+    # DPAPI (CryptProtectData) for the secrets stored in config.json.
+    "Win32_Security_Cryptography",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",
     "Win32_System_Com",

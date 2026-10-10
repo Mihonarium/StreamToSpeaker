@@ -19,6 +19,7 @@ pub mod sine_source;
 pub mod qpc;
 pub mod picker;
 pub mod user_config;
+pub mod secret_store;
 pub mod update_check;
 pub mod stream_gate;
 pub mod gui_layout;

@@ -9,12 +9,16 @@
 //!   - `onboarding_dismissed`: whether the user clicked "Got it" on
 //!     the onboarding card. Persisted so we don't re-show it on
 //!     subsequent launches.
+//!
+//! Secrets (AirPlay passwords, pairing seeds) are sealed with DPAPI in
+//! the file and plain in memory; see `secret_store`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::airplay::hap_pairing::PairingCredentials;
+use crate::secret_store::{self, LockedNode, PlatformCodec, SecretCodec};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserConfig {
@@ -70,8 +74,8 @@ pub struct UserConfig {
     pub airplay_mfi_encryption: bool,
     /// Per-device AirPlay passwords for `pw=true` receivers, keyed by the
     /// device's stable id (`airplay:<mac>`). Stored so the user only
-    /// enters it once. Plain-text in the config file (same trust level as
-    /// the rest of the file); RTSP Digest never sends it in the clear.
+    /// enters it once. Sealed with DPAPI in the file (plain in memory);
+    /// RTSP Digest never sends it in the clear.
     #[serde(default)]
     pub airplay_passwords: HashMap<String, String>,
     /// Per-device HomeKit **persistent** pairing credentials, keyed by the
@@ -79,9 +83,8 @@ pub struct UserConfig {
     /// pair-setup with an AP2 receiver that refuses transient pairing (an
     /// Apple TV with access control / "require device verification"), so
     /// later connects skip straight to pair-verify. Holds our controller
-    /// Ed25519 seed + the accessory's long-term public key — same trust
-    /// level as the rest of the file; the seed is a per-device identity,
-    /// not a reusable secret elsewhere.
+    /// Ed25519 seed (sealed with DPAPI in the file) + the accessory's
+    /// long-term public key.
     #[serde(default)]
     pub airplay_pairings: HashMap<String, PairingCredentials>,
     /// Persistent per-install HomeKit controller identity (pairing id +
@@ -89,7 +92,7 @@ pub struct UserConfig {
     /// for every later pair-setup: HAP accessories key stored pairings on
     /// the controller id, so a stable identity makes re-pairing REPLACE
     /// the record instead of consuming another of the accessory's finite
-    /// pairing slots.
+    /// pairing slots. The seed is sealed with DPAPI in the file.
     #[serde(default)]
     pub airplay_controller_id: Option<String>,
     #[serde(default)]
@@ -102,6 +105,11 @@ pub struct UserConfig {
     /// versions AFTER this one; releases before it still strip.)
     #[serde(flatten)]
     pub unknown_keys: serde_json::Map<String, serde_json::Value>,
+    /// Stored secrets this account couldn't unseal (file copied from
+    /// another machine or user). Kept out of the live settings, written
+    /// back unchanged on every save so they're never lost.
+    #[serde(skip)]
+    pub locked_secrets: Vec<LockedNode>,
     /// Forward Windows' "now playing" (title/artist/album from the System
     /// Media Transport Controls) to the speaker as track metadata, so it
     /// shows on the speaker's display / app. **Off by default** — it's a
@@ -243,6 +251,14 @@ impl UserConfig {
     /// ceremony per Apple TV to recreate, so the data is worth keeping
     /// for manual recovery.
     pub fn load_from(path: &std::path::Path) -> Self {
+        Self::load_from_with(path, &PlatformCodec)
+    }
+
+    /// [`load_from`](Self::load_from) with an explicit secret protector.
+    /// Unseals protected values; if the file still had plain secrets (one
+    /// written before they were protected) and the protector can seal,
+    /// saves right away so they don't stay readable on disk.
+    pub fn load_from_with(path: &std::path::Path, codec: &dyn SecretCodec) -> Self {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
@@ -255,8 +271,23 @@ impl UserConfig {
                 return Self::default();
             }
         };
-        match serde_json::from_str(&content) {
-            Ok(c) => c,
+        let parsed = serde_json::from_str::<serde_json::Value>(&content).and_then(|mut tree| {
+            let report = secret_store::unseal(&mut tree, codec);
+            serde_json::from_value::<UserConfig>(tree).map(|c| (c, report))
+        });
+        match parsed {
+            Ok((mut c, report)) => {
+                c.locked_secrets = report.locked;
+                if report.plaintext > 0 && codec.can_protect() {
+                    log::info!(
+                        "user_config: protecting {} stored secret(s) written unprotected by an \
+                         earlier version",
+                        report.plaintext
+                    );
+                    c.save_to_with(path, codec);
+                }
+                c
+            }
             Err(e) => {
                 let aside = quarantine_path(path);
                 match std::fs::rename(path, &aside) {
@@ -294,12 +325,20 @@ impl UserConfig {
     /// quarantine). `rename` replaces an existing file on both Windows
     /// and Unix.
     pub fn save_to(&self, path: &std::path::Path) {
+        self.save_to_with(path, &PlatformCodec)
+    }
+
+    /// [`save_to`](Self::save_to) with an explicit secret protector.
+    pub fn save_to_with(&self, path: &std::path::Path, codec: &dyn SecretCodec) {
         let Some(dir) = path.parent() else { return; };
         if let Err(e) = std::fs::create_dir_all(dir) {
             log::warn!("user_config: mkdir {}: {}", dir.display(), e);
             return;
         }
-        let content = match serde_json::to_string_pretty(self) {
+        let content = match serde_json::to_value(self).and_then(|mut tree| {
+            secret_store::seal(&mut tree, &self.locked_secrets, codec);
+            serde_json::to_string_pretty(&tree)
+        }) {
             Ok(s) => s,
             Err(e) => { log::warn!("user_config: serialize: {}", e); return; }
         };
@@ -397,6 +436,58 @@ mod tests {
         let c = UserConfig::load_from(&dir.join("config.json"));
         assert!(c.auto_reconnect_on_drop);
         assert!(!dir.exists(), "loading must not create anything");
+    }
+
+    #[test]
+    fn secrets_are_sealed_on_disk_and_plain_files_migrate() {
+        use crate::secret_store::tests::FakeCodec;
+        use crate::secret_store::PROTECTED_PREFIX;
+        let dir = temp_config_dir("secrets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let seed = "ab".repeat(32);
+        // A file from before protection: plain secrets.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"airplay_passwords":{{"airplay:aa":"hunter2"}},
+                    "airplay_controller_id":"ctl","airplay_controller_seed_hex":"{seed}",
+                    "airplay_pairings":{{"airplay:cc":{{"controller_id":"ctl",
+                    "controller_seed_hex":"{seed}","accessory_id":"acc",
+                    "accessory_ltpk_hex":"{ltpk}"}}}},"future_setting":7}}"#,
+                ltpk = "cd".repeat(32)
+            ),
+        )
+        .unwrap();
+        let codec = FakeCodec(0x42);
+        let c = UserConfig::load_from_with(&path, &codec);
+        assert_eq!(c.airplay_passwords["airplay:aa"], "hunter2");
+        assert_eq!(c.airplay_pairings["airplay:cc"].controller_seed_hex, seed);
+        // Loading rewrote the file sealed; unknown keys survive.
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!disk.contains("hunter2") && !disk.contains(&seed), "{disk}");
+        assert!(disk.contains(PROTECTED_PREFIX) && disk.contains("future_setting"));
+        // And it reads back to the same values.
+        let back = UserConfig::load_from_with(&path, &codec);
+        assert_eq!(back.airplay_passwords, c.airplay_passwords);
+        assert_eq!(back.airplay_pairings, c.airplay_pairings);
+        assert_eq!(back.airplay_controller_seed_hex.as_deref(), Some(seed.as_str()));
+
+        // A different protector (another user / machine) can't open them:
+        // the settings load without them, and saving keeps them on disk.
+        let other = FakeCodec(0x43);
+        let mut locked = UserConfig::load_from_with(&path, &other);
+        assert!(locked.airplay_passwords.is_empty());
+        assert!(locked.airplay_pairings.is_empty());
+        assert_eq!(locked.airplay_controller_seed_hex, None);
+        assert_eq!(locked.airplay_controller_id.as_deref(), Some("ctl"));
+        locked.last_speaker_id = Some("x".into());
+        locked.save_to_with(&path, &other);
+        let again = UserConfig::load_from_with(&path, &codec);
+        assert_eq!(again.airplay_passwords["airplay:aa"], "hunter2");
+        assert_eq!(again.airplay_pairings, c.airplay_pairings);
+        assert_eq!(again.last_speaker_id.as_deref(), Some("x"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
