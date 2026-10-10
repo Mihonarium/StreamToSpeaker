@@ -1384,6 +1384,14 @@ impl App {
             .discovery
             .as_ref()
             .ok_or_else(|| "UPnP discovery disabled".to_string())?;
+        if let Some(addrs) = discovery.identity_conflict(id) {
+            let addrs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+            return Err(format!(
+                "Several devices on the network ({}) claim to be this speaker, so none was picked. \
+                 Check the devices at those addresses, then rescan.",
+                addrs.join(", ")
+            ));
+        }
         let Some(new_r) = discovery.find_by_id(id) else {
             return Err(format!("no UPnP speaker with id {:?}", id));
         };

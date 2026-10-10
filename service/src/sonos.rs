@@ -218,7 +218,9 @@ pub fn apply_topology(
         });
         let coord_member = g.members.iter().find(|m| m.uuid == g.coordinator_uuid);
         if let (true, Some(cm)) = (any_member_discovered, coord_member) {
-            if let Some(r) = fetch(&cm.location) {
+            let fetched = fetch(&cm.location)
+                .filter(|r| r.udn.as_deref().map(bare_uuid) == Some(g.coordinator_uuid.as_str()));
+            if let Some(r) = fetched {
                 info!(
                     "Sonos topology: coordinator {} missed SSDP; recovered from topology",
                     cm.zone_name
@@ -326,11 +328,8 @@ pub fn resolve_group_coordinator(
     } else {
         let coord_id = format!("uuid:{}", group.coordinator_uuid);
         let coord_member = group.members.iter().find(|m| m.uuid == group.coordinator_uuid);
-        let coord = lookup(&coord_id).or_else(|| {
-            coord_member.and_then(|m| {
-                crate::ssdp::fetch_and_parse_device(&m.location, std::time::Duration::from_secs(3))
-                    .ok()
-            })
+        let coord = verified_coordinator(group, &coord_id, lookup, &|location| {
+            crate::ssdp::fetch_and_parse_device(location, std::time::Duration::from_secs(3)).ok()
         });
         match coord {
             Some(c) => {
@@ -371,6 +370,28 @@ pub fn resolve_group_coordinator(
         .filter_map(|m| location_host_addr(&m.location))
         .collect();
     target
+}
+
+/// The group's coordinator as a Renderer. The topology came from the
+/// speaker the user picked, so the coordinator is trusted only at the
+/// address that topology gives for it: a discovery entry claiming the
+/// coordinator's UDN from another address is ignored in favour of a
+/// fetch from the topology `Location`, whose description must carry the
+/// coordinator's UUID.
+fn verified_coordinator(
+    group: &ZoneGroup,
+    coord_id: &str,
+    lookup: &dyn Fn(&str) -> Option<Renderer>,
+    fetch: &dyn Fn(&str) -> Option<Renderer>,
+) -> Option<Renderer> {
+    let m = group.members.iter().find(|m| m.uuid == group.coordinator_uuid)?;
+    let expected = location_host_addr(&m.location)?;
+    lookup(coord_id)
+        .filter(|c| c.ip == expected || c.host_addrs.contains(&expected))
+        .or_else(|| {
+            fetch(&m.location)
+                .filter(|c| c.udn.as_deref().map(bare_uuid) == Some(group.coordinator_uuid.as_str()))
+        })
 }
 
 /// The address behind a topology `Location` URL: a literal IP, or the
@@ -561,6 +582,45 @@ mod tests {
         assert_eq!(renderers.len(), 1);
         assert_eq!(renderers[0].udn.as_deref(), Some("uuid:RINCON_AAA"));
         assert_eq!(renderers[0].group_members, vec!["Kitchen"]);
+    }
+
+    #[test]
+    fn synthesized_coordinator_must_carry_the_coordinator_uuid() {
+        let groups = parse_zone_group_state(SAMPLE);
+        let mut renderers = vec![renderer("uuid:RINCON_BBB", "Kitchen - Sonos One")];
+        apply_topology(&mut renderers, &groups, &|_| Some(renderer("uuid:RINCON_ZZZ", "Impostor")));
+        assert!(renderers.iter().all(|r| r.udn.as_deref() != Some("uuid:RINCON_ZZZ")));
+    }
+
+    #[test]
+    fn coordinator_is_trusted_only_at_the_topology_address() {
+        let groups = parse_zone_group_state(SAMPLE);
+        let g = &groups[0]; // coordinator RINCON_AAA at 192.168.1.10
+        let mut impostor = renderer("uuid:RINCON_AAA", "Impostor");
+        impostor.ip = "192.168.1.66".parse().unwrap();
+        let real = renderer("uuid:RINCON_AAA", "Living Room");
+
+        // Discovery entry at the wrong address: ignored, real one fetched.
+        let imp = impostor.clone();
+        let got = verified_coordinator(g, "uuid:RINCON_AAA", &move |_| Some(imp.clone()), &|_| {
+            Some(real.clone())
+        })
+        .unwrap();
+        assert_eq!(got.friendly_name, "Living Room");
+
+        // Discovery entry at the topology address: used directly.
+        let real2 = renderer("uuid:RINCON_AAA", "Living Room");
+        let got = verified_coordinator(g, "uuid:RINCON_AAA", &move |_| Some(real2.clone()), &|_| None).unwrap();
+        assert_eq!(got.ip, "192.168.1.10".parse::<IpAddr>().unwrap());
+
+        // Fetched description with another UUID: rejected.
+        let imp = impostor.clone();
+        assert!(verified_coordinator(g, "uuid:RINCON_AAA", &|_| None, &move |_| {
+            let mut r = imp.clone();
+            r.udn = Some("uuid:RINCON_ZZZ".into());
+            Some(r)
+        })
+        .is_none());
     }
 
     #[test]
