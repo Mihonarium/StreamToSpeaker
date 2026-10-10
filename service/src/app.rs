@@ -774,6 +774,12 @@ impl App {
     /// across multi-second SOAP calls — so a stalled speaker can't park
     /// the HTTP accept loop. A refusal is surfaced to the user, rate-
     /// limited per address, naming the device when discovery knows it.
+    /// Whether `peer` belongs to the active speaker (or its group). The
+    /// HTTP server never lets other clients crowd these out.
+    pub fn is_speaker_peer(&self, peer: IpAddr) -> bool {
+        self.stream_gate.is_granted(peer)
+    }
+
     pub fn stream_client_allowed(&self, peer: IpAddr) -> bool {
         if self.stream_gate.allows(peer) {
             return true;

@@ -757,6 +757,10 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         web_ui_enabled: Some(app.web_ui_enabled.clone()),
         stream_client_allowed: Some(stream_client_allowed),
         extra_hosts: vec![app.config.advertise_ip.clone()],
+        speaker_peer: Some({
+            let app2 = app.clone();
+            Arc::new(move |ip| app2.is_speaker_peer(ip))
+        }),
     })
 }
 

@@ -183,6 +183,10 @@ pub struct HttpServerConfig {
     /// address assigned to this machine — e.g. an `--advertise-ip` that
     /// points at a NAT or proxy in front of this PC.
     pub extra_hosts: Vec<String>,
+    /// True for the active speaker's addresses. Their connections are
+    /// exempt from the shared connection budget, so other clients can't
+    /// lock the speaker out.
+    pub speaker_peer: Option<StreamClientAllowedCallback>,
 }
 
 impl HttpServerConfig {
@@ -198,6 +202,7 @@ impl HttpServerConfig {
             web_ui_enabled: None,
             stream_client_allowed: None,
             extra_hosts: Vec::new(),
+            speaker_peer: None,
         }
     }
 }
@@ -210,7 +215,7 @@ impl HttpServerConfig {
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
 /// Whole request head of a connection's first request.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Keep-alive: how long a connection may sit idle before its next
 /// request head is complete.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -222,10 +227,15 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_NOTIFY_BODY: usize = 64 * 1024;
 /// `/api/select` bodies: `{"id":"..."}`.
 const MAX_API_BODY: usize = 4 * 1024;
+/// Connections from everyone but the active speaker (see [`ConnLimiter`]).
 const MAX_CONNECTIONS: usize = 128;
-/// Per client address, so one host can't use up the whole budget and
-/// lock the speaker out of `/stream.raw`.
+/// Per client address, so one host can't use up the whole budget.
 const MAX_CONNECTIONS_PER_PEER: usize = 16;
+/// Per speaker address: generous, only a bound on a misbehaving unit.
+const MAX_SPEAKER_CONNECTIONS_PER_PEER: usize = 64;
+/// A stream consumer that accepts nothing for this long is gone (a
+/// renderer pausing its reads for a few seconds is fine).
+const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A speaker's initial event can arrive before we have read the SID
 /// out of its SUBSCRIBE response; wait this long for it to register.
 const NOTIFY_SUBSCRIBE_WAIT: Duration = Duration::from_secs(3);
@@ -259,6 +269,7 @@ pub fn start_http_server(cfg: HttpServerConfig) -> Result<u16> {
         latency_adjust: cfg.latency_adjust,
         web_ui_enabled: cfg.web_ui_enabled,
         stream_client_allowed: cfg.stream_client_allowed,
+        speaker_peer: cfg.speaker_peer,
         notify_lock: Mutex::new(()),
     });
     thread::Builder::new()
@@ -282,6 +293,7 @@ struct Ctx {
     latency_adjust: Option<LatencyAdjustCallback>,
     web_ui_enabled: Option<Arc<AtomicBool>>,
     stream_client_allowed: Option<StreamClientAllowedCallback>,
+    speaker_peer: Option<StreamClientAllowedCallback>,
     hosts: HostPolicy,
     /// Event callbacks run one at a time, in arrival order, as they did
     /// when a single thread served every request.
@@ -294,8 +306,9 @@ fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
     loop {
         match listener.accept() {
             Ok((stream, peer)) => {
-                let Some(permit) = limiter.acquire(peer.ip()) else {
-                    debug!("http: connection limit reached, dropping {}", peer);
+                let priority = ctx.speaker_peer.as_ref().is_some_and(|f| f(peer.ip()));
+                let Some(permit) = limiter.admit(peer.ip(), priority, &stream) else {
+                    debug!("http: could not track connection from {}, dropping", peer);
                     continue;
                 };
                 let ctx = ctx.clone();
@@ -322,46 +335,76 @@ fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
     }
 }
 
-/// Bounds concurrent connections, overall and per client address.
+/// Bounds concurrent connections without ever turning a newcomer away:
+/// when a budget is full, the oldest connection charged to it is shut
+/// down to make room. Connections from the active speaker's addresses
+/// are never evicted on behalf of other clients and don't count
+/// towards the shared budget, so no other host can crowd the speaker
+/// out of `/stream.raw` or its event callbacks.
 #[derive(Default)]
 struct ConnLimiter {
-    inner: Mutex<(usize, HashMap<IpAddr, usize>)>,
+    inner: Mutex<LimiterInner>,
+}
+
+#[derive(Default)]
+struct LimiterInner {
+    next_id: u64,
+    conns: Vec<Tracked>,
+}
+
+struct Tracked {
+    id: u64,
+    peer: IpAddr,
+    priority: bool,
+    /// Second handle on the socket, used to shut it down on eviction.
+    stream: TcpStream,
 }
 
 struct ConnPermit {
     limiter: Arc<ConnLimiter>,
-    peer: IpAddr,
+    id: u64,
+}
+
+impl LimiterInner {
+    /// Shut down and forget the oldest connection matching `pred`.
+    fn evict_oldest(&mut self, pred: impl Fn(&Tracked) -> bool) {
+        if let Some(pos) = self.conns.iter().position(pred) {
+            let t = self.conns.remove(pos);
+            debug!("http: connection budget full, closing oldest from {}", t.peer);
+            let _ = t.stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 impl ConnLimiter {
-    fn acquire(self: &Arc<Self>, peer: IpAddr) -> Option<ConnPermit> {
+    fn admit(self: &Arc<Self>, peer: IpAddr, priority: bool, stream: &TcpStream) -> Option<ConnPermit> {
+        let handle = stream.try_clone().ok()?;
         let peer = canonical_ip(peer);
         let mut g = self.inner.lock().unwrap();
-        let (total, per_peer) = &mut *g;
-        let n = per_peer.entry(peer).or_insert(0);
-        if *total >= MAX_CONNECTIONS || *n >= MAX_CONNECTIONS_PER_PEER {
-            if *n == 0 {
-                per_peer.remove(&peer);
-            }
-            return None;
+        let same_peer = g.conns.iter().filter(|t| t.peer == peer).count();
+        let per_peer_cap = if priority { MAX_SPEAKER_CONNECTIONS_PER_PEER } else { MAX_CONNECTIONS_PER_PEER };
+        if same_peer >= per_peer_cap {
+            // A host past its own budget only displaces itself.
+            g.evict_oldest(|t| t.peer == peer);
+        } else if !priority && g.conns.iter().filter(|t| !t.priority).count() >= MAX_CONNECTIONS {
+            g.evict_oldest(|t| !t.priority);
         }
-        *n += 1;
-        *total += 1;
-        Some(ConnPermit { limiter: self.clone(), peer })
+        g.next_id += 1;
+        let id = g.next_id;
+        g.conns.push(Tracked { id, peer, priority, stream: handle });
+        Some(ConnPermit { limiter: self.clone(), id })
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.inner.lock().unwrap().conns.len()
     }
 }
 
 impl Drop for ConnPermit {
     fn drop(&mut self) {
         let mut g = self.limiter.inner.lock().unwrap();
-        let (total, per_peer) = &mut *g;
-        *total = total.saturating_sub(1);
-        if let Some(n) = per_peer.get_mut(&self.peer) {
-            *n -= 1;
-            if *n == 0 {
-                per_peer.remove(&self.peer);
-            }
-        }
+        g.conns.retain(|t| t.id != self.id);
     }
 }
 
@@ -633,9 +676,10 @@ impl Ctx {
         let recheck = self.stream_client_allowed.clone().map(|cb| (cb, peer));
         let mut reader = StreamReader::new(rx, recheck);
 
-        // A speaker may stop reading for a long while (paused, buffer
-        // full); the stream has always waited for it.
-        let _ = conn.stream.set_write_timeout(None);
+        // A renderer may stop reading for a while when its buffer is
+        // full; only a consumer that stays stalled is dropped, which
+        // frees its connection slot.
+        let _ = conn.stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT));
         let mut out = BufWriter::with_capacity(1024, &conn.stream);
         let result = write_stream_head(&mut out, head.minor, FAKE_CONTENT_LEN)
             .and_then(|_| std::io::copy(&mut reader, &mut out).map(|_| ()))
@@ -667,14 +711,15 @@ struct HostPolicy {
 impl HostPolicy {
     fn new(bind_ip: IpAddr, extra: &[String], is_local: fn(IpAddr) -> bool) -> Self {
         let mut names = vec!["localhost".to_string()];
-        for var in ["COMPUTERNAME", "HOSTNAME"] {
-            if let Ok(n) = std::env::var(var) {
-                let n = n.trim().trim_end_matches('.').to_ascii_lowercase();
-                if !n.is_empty() {
-                    names.push(format!("{}.local", n));
-                    names.push(n);
-                }
+        for n in machine_names() {
+            let n = n.trim().trim_end_matches('.').to_ascii_lowercase();
+            if n.is_empty() || names.contains(&n) {
+                continue;
             }
+            if !n.contains('.') {
+                names.push(format!("{}.local", n));
+            }
+            names.push(n);
         }
         let mut ips = Vec::new();
         for e in extra {
@@ -695,7 +740,13 @@ impl HostPolicy {
         let Some(name) = host_without_port(host) else {
             return false;
         };
-        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let mut name = name.trim_end_matches('.').to_ascii_lowercase();
+        // IPv6 zone id (`fe80::1%25eth0` in a URL): not part of the address.
+        if name.contains(':') {
+            if let Some(pct) = name.find('%') {
+                name.truncate(pct);
+            }
+        }
         if let Ok(ip) = name.parse::<IpAddr>() {
             let ip = canonical_ip(ip);
             if ip.is_unspecified() || ip.is_multicast() {
@@ -708,6 +759,37 @@ impl HostPolicy {
         }
         self.names.iter().any(|n| *n == name)
     }
+}
+
+/// This machine's names: NetBIOS name, DNS host name and fully
+/// qualified DNS name (what a router's DNS hands out for it).
+#[cfg(windows)]
+fn machine_names() -> Vec<String> {
+    use windows_sys::Win32::System::SystemInformation::{
+        ComputerNameDnsFullyQualified, ComputerNameDnsHostname, ComputerNameNetBIOS,
+        GetComputerNameExW,
+    };
+    let mut out: Vec<String> = std::env::var("COMPUTERNAME").into_iter().collect();
+    for kind in [ComputerNameNetBIOS, ComputerNameDnsHostname, ComputerNameDnsFullyQualified] {
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        // SAFETY: `len` is the buffer's capacity in UTF-16 units; on
+        // success it holds the length written, without the NUL.
+        let ok = unsafe { GetComputerNameExW(kind, buf.as_mut_ptr(), &mut len) };
+        if ok != 0 && (len as usize) <= buf.len() {
+            out.push(String::from_utf16_lossy(&buf[..len as usize]));
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn machine_names() -> Vec<String> {
+    let mut out: Vec<String> = std::env::var("HOSTNAME").into_iter().collect();
+    if let Ok(n) = std::fs::read_to_string("/etc/hostname") {
+        out.push(n);
+    }
+    out
 }
 
 /// `host[:port]` / `[v6][:port]` → host. None if malformed.
@@ -1609,6 +1691,7 @@ mod tests {
         for ok in [
             "localhost", "LOCALHOST:5901", "127.0.0.1:5901", "[::1]:5901", "192.168.1.10:5901",
             "192.168.1.10", "10.9.9.9:5901", "[::ffff:192.168.1.10]:5901",
+            "[::1%25eth0]:5901", "[::1%eth0]",
         ] {
             assert!(p.allows(Some(ok)), "{ok}");
         }
@@ -1624,6 +1707,18 @@ mod tests {
     fn head(raw: &str) -> Result<Head, HeadErr> {
         let raw = raw.replace('\n', "\r\n");
         parse_head(raw.trim_end().as_bytes())
+    }
+
+    #[test]
+    fn host_policy_accepts_this_machines_names() {
+        let p = policy();
+        for n in machine_names() {
+            let n = n.trim().trim_end_matches('.');
+            if !n.is_empty() {
+                assert!(p.allows(Some(&format!("{}:5901", n.to_ascii_uppercase()))), "{n}");
+                assert!(!p.allows(Some(&format!("{}.evil.example", n))), "{n}");
+            }
+        }
     }
 
     #[test]
@@ -1675,16 +1770,56 @@ mod tests {
         );
     }
 
+    /// A connected socket pair over loopback.
+    fn socket_pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
+        let c = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (s, _) = listener.accept().unwrap();
+        (c, s)
+    }
+
+    /// Has the far end been shut down? (A live, quiet peer times out.)
+    fn is_shut(c: &mut TcpStream) -> bool {
+        c.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut b = [0u8; 1];
+        match c.read(&mut b) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+        }
+    }
+
     #[test]
-    fn conn_limiter_caps_per_peer() {
+    fn conn_limiter_evicts_within_budget_and_spares_the_speaker() {
         let l = Arc::new(ConnLimiter::default());
+        let lst = TcpListener::bind("127.0.0.1:0").unwrap();
         let a: IpAddr = "192.168.1.99".parse().unwrap();
-        let b: IpAddr = "192.168.1.50".parse().unwrap();
-        let held: Vec<_> = (0..MAX_CONNECTIONS_PER_PEER).map(|_| l.acquire(a).unwrap()).collect();
-        assert!(l.acquire(a).is_none());
-        assert!(l.acquire(b).is_some());
-        drop(held);
-        assert!(l.acquire(a).is_some());
+        let speaker: IpAddr = "192.168.1.50".parse().unwrap();
+
+        let (mut sc, ss) = socket_pair(&lst);
+        let _sp = l.admit(speaker, true, &ss).unwrap();
+        // One host past its own budget displaces only its own oldest.
+        let mut first = None;
+        let mut permits = Vec::new();
+        for i in 0..=MAX_CONNECTIONS_PER_PEER {
+            let (c, s) = socket_pair(&lst);
+            permits.push(l.admit(a, false, &s).unwrap());
+            if i == 0 {
+                first = Some(c);
+            }
+        }
+        assert!(is_shut(first.as_mut().unwrap()));
+        assert_eq!(l.count(), 1 + MAX_CONNECTIONS_PER_PEER);
+        // Many hosts filling the shared budget never touch the speaker.
+        for i in 0..MAX_CONNECTIONS + 8 {
+            let (_c, s) = socket_pair(&lst);
+            let ip = IpAddr::from([10, 0, (i / 200) as u8, (i % 200) as u8 + 1]);
+            permits.push(l.admit(ip, false, &s).unwrap());
+        }
+        assert_eq!(l.count(), 1 + MAX_CONNECTIONS);
+        assert!(!is_shut(&mut sc));
     }
 
     // ---- live server --------------------------------------------------
@@ -1722,6 +1857,57 @@ mod tests {
 
     fn healthz(port: u16) -> String {
         exchange(port, b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", 4096)
+    }
+
+    /// Connect to the server from a chosen loopback source address.
+    fn connect_from(src: [u8; 4], port: u16) -> TcpStream {
+        use socket2::{Domain, Socket, Type};
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        sock.bind(&SocketAddr::from((src, 0)).into()).unwrap();
+        sock.connect(&SocketAddr::from(([127, 0, 0, 1], port)).into()).unwrap();
+        let s: TcpStream = sock.into();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    }
+
+    #[test]
+    fn stalled_stream_listeners_cannot_lock_out_the_speaker() {
+        let hub = StreamHub::new();
+        let mut cfg = HttpServerConfig::minimal("127.0.0.1:0".parse().unwrap(), hub.clone());
+        let speaker: IpAddr = "127.0.0.1".parse().unwrap();
+        cfg.speaker_peer = Some(Arc::new(move |ip| ip == speaker));
+        let port = start(cfg);
+        let h = hub.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                h.publish(PcmFrame(Arc::new(vec![1u8; 4096])));
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        // Many hosts open streams and never read them, more than the
+        // shared budget holds.
+        let mut hogs = Vec::new();
+        for host in 2..=12u8 {
+            for _ in 0..MAX_CONNECTIONS_PER_PEER {
+                let mut s = connect_from([127, 0, 0, host], port);
+                s.write_all(b"GET /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+                hogs.push(s);
+            }
+        }
+        thread::sleep(Duration::from_millis(300));
+        let probe = |src: [u8; 4]| {
+            let mut s = connect_from(src, port);
+            s.write_all(b"HEAD /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+            let mut buf = [0u8; 512];
+            let n = s.read(&mut buf).unwrap_or(0);
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        };
+        // The speaker gets through, and so does a newcomer.
+        assert!(probe([127, 0, 0, 1]).starts_with("HTTP/1.1 200"));
+        assert!(probe([127, 0, 0, 13]).starts_with("HTTP/1.1 200"));
+        stop.store(true, Ordering::Relaxed);
     }
 
     #[test]
