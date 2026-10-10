@@ -21,6 +21,7 @@ use crate::airplay::{
     AirPlay2Session, AirPlay2SessionConfig, AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession,
     AirPlaySessionConfig, Ap2StartError, Transport,
 };
+use crate::equalizer::{EqControl, EqReport, EqSettings};
 use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
@@ -240,6 +241,8 @@ pub struct App {
     pub rate_fudge_ppm: Arc<AtomicI32>,
     pub silence_pace_ms: Arc<AtomicU64>,
     pub latency_adjust_step_frames: Arc<AtomicU32>,
+    /// Equalizer hand-off to the audio loop (designs built off-thread).
+    pub eq: Arc<EqControl>,
 
     // ---- Stats (best-effort, advisory) ----
     pub packets_published_total: Arc<AtomicU64>,
@@ -377,6 +380,10 @@ impl App {
         // action, code that asks "what was the last speaker?" gets the
         // persisted answer.
         let last_speaker_id = Mutex::new(user_config.last_speaker_id.clone());
+        let eq = EqControl::new(WIRE_SAMPLE_RATE);
+        if user_config.equalizer.enabled {
+            eq.request(user_config.equalizer.clone());
+        }
         Arc::new(Self {
             config,
             discovery,
@@ -392,6 +399,7 @@ impl App {
             rate_fudge_ppm: Arc::new(AtomicI32::new(0)),
             silence_pace_ms: Arc::new(AtomicU64::new(10)),
             latency_adjust_step_frames: Arc::new(AtomicU32::new(4)),
+            eq,
             packets_published_total: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -720,6 +728,41 @@ impl App {
             uc.forward_now_playing = on;
             uc.save();
         }
+    }
+
+    // ---- Equalizer -------------------------------------------------------
+
+    /// The saved equalizer curve.
+    pub fn eq_saved(&self) -> EqSettings {
+        self.user_config.lock().unwrap().equalizer.clone()
+    }
+
+    /// Apply `settings` to the running stream without saving (live
+    /// preview while editing). No reconnect: the change is crossfaded in.
+    pub fn eq_preview(&self, settings: &EqSettings) {
+        self.eq.request(settings.clone());
+    }
+
+    /// Apply and persist `settings`.
+    pub fn eq_apply(&self, settings: &EqSettings) {
+        let settings = settings.sanitized();
+        self.eq.request(settings.clone());
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.equalizer != settings {
+            uc.equalizer = settings;
+            uc.save();
+        }
+    }
+
+    /// Drop any previewed curve and return the stream to the saved one.
+    pub fn eq_revert(&self) {
+        let saved = self.eq_saved();
+        self.eq.request(saved);
+    }
+
+    /// Headroom figures of the most recently designed curve.
+    pub fn eq_report(&self) -> Option<EqReport> {
+        self.eq.report()
     }
 
     /// Persist the drop-reconnect preference.

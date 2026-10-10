@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::airplay::hap_pairing::PairingCredentials;
+use crate::equalizer::EqSettings;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserConfig {
@@ -165,6 +166,11 @@ pub struct UserConfig {
     /// "Later" on the update banner: hidden until this unix time.
     #[serde(default)]
     pub update_banner_hidden_until: Option<u64>,
+    /// Ten-band equalizer applied to everything streamed (all output
+    /// types). Off by default; disabling keeps the curve. A malformed
+    /// entry falls back to the default rather than failing the file.
+    #[serde(default, deserialize_with = "crate::equalizer::deserialize_lenient")]
+    pub equalizer: EqSettings,
 }
 
 /// Default AirPlay buffer — iTunes' 2 s (88200 samples at 44.1 kHz).
@@ -412,5 +418,27 @@ mod tests {
         // In-range values pass through.
         let c: UserConfig = serde_json::from_str(r#"{"airplay_latency_ms":100}"#).unwrap();
         assert_eq!(c.effective_airplay_latency_ms(), 100);
+    }
+
+    #[test]
+    fn equalizer_defaults_round_trips_and_tolerates_garbage() {
+        assert!(!UserConfig::default().equalizer.enabled);
+        let mut c = UserConfig::default();
+        c.equalizer.enabled = true;
+        c.equalizer.bands_db[2] = 4.5;
+        let back: UserConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.equalizer, c.equalizer);
+        // A broken equalizer entry must not take the rest of the file with it.
+        let c: UserConfig = serde_json::from_str(
+            r#"{"last_speaker_id":"x","equalizer":{"bands_db":[1,2,3]}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.last_speaker_id.as_deref(), Some("x"));
+        assert_eq!(c.equalizer, EqSettings::default());
+        // Out-of-range values are clamped onto the grid.
+        let c: UserConfig =
+            serde_json::from_str(r#"{"equalizer":{"enabled":true,"preamp_db":40.2}}"#).unwrap();
+        assert!(c.equalizer.enabled);
+        assert_eq!(c.equalizer.preamp_db, 12.0);
     }
 }
