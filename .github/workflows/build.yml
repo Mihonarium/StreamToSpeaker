@@ -92,7 +92,7 @@ jobs:
       # Toolchains
       # -----------------------------------------------------------------
       - name: Set up Rust (stable, x86_64-pc-windows-msvc)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -925,7 +925,7 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust ${{ steps.msrv.outputs.version }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
           targets: x86_64-pc-windows-gnu
