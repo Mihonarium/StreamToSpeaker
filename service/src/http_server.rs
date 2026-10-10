@@ -21,7 +21,6 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{debug, info, warn};
-use std::collections::HashMap;
 use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -231,10 +230,12 @@ const MAX_API_BODY: usize = 4 * 1024;
 const MAX_CONNECTIONS: usize = 128;
 /// Per client address, so one host can't use up the whole budget.
 const MAX_CONNECTIONS_PER_PEER: usize = 16;
-/// Per speaker address: generous, only a bound on a misbehaving unit.
-const MAX_SPEAKER_CONNECTIONS_PER_PEER: usize = 64;
-/// A stream consumer that accepts nothing for this long is gone (a
-/// renderer pausing its reads for a few seconds is fine).
+/// Per protected address (the active speaker, loopback): generous, only
+/// a bound on a misbehaving client.
+const MAX_PROTECTED_CONNECTIONS_PER_PEER: usize = 64;
+/// A non-speaker stream consumer that accepts nothing for this long is
+/// gone. The active speaker gets no such limit: it may stop reading
+/// indefinitely while paused from its own app.
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A speaker's initial event can arrive before we have read the SID
 /// out of its SUBSCRIBE response; wait this long for it to register.
@@ -306,8 +307,11 @@ fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
     loop {
         match listener.accept() {
             Ok((stream, peer)) => {
-                let priority = ctx.speaker_peer.as_ref().is_some_and(|f| f(peer.ip()));
-                let Some(permit) = limiter.admit(peer.ip(), priority, &stream) else {
+                let speaker = ctx.speaker_peer.as_ref().is_some_and(|f| f(peer.ip()));
+                // This PC's own clients (the local web UI, tools) are
+                // protected like the speaker; other LAN hosts are not.
+                let protected = speaker || canonical_ip(peer.ip()).is_loopback();
+                let Some(permit) = limiter.admit(peer.ip(), protected, &stream) else {
                     debug!("http: could not track connection from {}, dropping", peer);
                     continue;
                 };
@@ -316,7 +320,7 @@ fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
                     .name("stream-to-speaker-http-conn".to_string())
                     .spawn(move || {
                         let _permit = permit;
-                        handle_connection(stream, peer, &ctx);
+                        handle_connection(stream, peer, speaker, &ctx);
                     });
                 if let Err(e) = spawned {
                     warn!("http: could not spawn connection thread: {}", e);
@@ -337,10 +341,11 @@ fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
 
 /// Bounds concurrent connections without ever turning a newcomer away:
 /// when a budget is full, the oldest connection charged to it is shut
-/// down to make room. Connections from the active speaker's addresses
-/// are never evicted on behalf of other clients and don't count
-/// towards the shared budget, so no other host can crowd the speaker
-/// out of `/stream.raw` or its event callbacks.
+/// down to make room. Protected connections — from the active speaker's
+/// addresses or from this PC itself (loopback) — are never evicted on
+/// behalf of other clients and don't count towards the shared budget,
+/// so no other host can crowd the speaker out of `/stream.raw` or its
+/// event callbacks, or lock the local web UI out.
 #[derive(Default)]
 struct ConnLimiter {
     inner: Mutex<LimiterInner>,
@@ -382,7 +387,8 @@ impl ConnLimiter {
         let peer = canonical_ip(peer);
         let mut g = self.inner.lock().unwrap();
         let same_peer = g.conns.iter().filter(|t| t.peer == peer).count();
-        let per_peer_cap = if priority { MAX_SPEAKER_CONNECTIONS_PER_PEER } else { MAX_CONNECTIONS_PER_PEER };
+        let per_peer_cap =
+            if priority { MAX_PROTECTED_CONNECTIONS_PER_PEER } else { MAX_CONNECTIONS_PER_PEER };
         if same_peer >= per_peer_cap {
             // A host past its own budget only displaces itself.
             g.evict_oldest(|t| t.peer == peer);
@@ -408,9 +414,9 @@ impl Drop for ConnPermit {
     }
 }
 
-fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: &Ctx) {
+fn handle_connection(stream: TcpStream, peer: SocketAddr, speaker: bool, ctx: &Ctx) {
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-    let mut conn = Conn { stream, peer, buf: Vec::new() };
+    let mut conn = Conn { stream, peer, speaker, buf: Vec::new() };
     let mut timeout = HEAD_TIMEOUT;
     loop {
         let head = match read_head(&mut conn, timeout) {
@@ -676,10 +682,11 @@ impl Ctx {
         let recheck = self.stream_client_allowed.clone().map(|cb| (cb, peer));
         let mut reader = StreamReader::new(rx, recheck);
 
-        // A renderer may stop reading for a while when its buffer is
-        // full; only a consumer that stays stalled is dropped, which
-        // frees its connection slot.
-        let _ = conn.stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT));
+        // The active speaker may stop reading for as long as it is
+        // paused and must find the stream still open afterwards. Any
+        // other consumer that stays stalled is dropped, freeing its slot.
+        let write_timeout = (!conn.speaker).then_some(STREAM_WRITE_TIMEOUT);
+        let _ = conn.stream.set_write_timeout(write_timeout);
         let mut out = BufWriter::with_capacity(1024, &conn.stream);
         let result = write_stream_head(&mut out, head.minor, FAKE_CONTENT_LEN)
             .and_then(|_| std::io::copy(&mut reader, &mut out).map(|_| ()))
@@ -845,6 +852,8 @@ fn is_json_content_type(ct: Option<&str>) -> bool {
 struct Conn {
     stream: TcpStream,
     peer: SocketAddr,
+    /// From the active speaker's addresses when accepted.
+    speaker: bool,
     /// Bytes received but not yet consumed.
     buf: Vec<u8>,
 }
@@ -1886,8 +1895,9 @@ mod tests {
                 thread::sleep(Duration::from_millis(2));
             }
         });
-        // Many hosts open streams and never read them, more than the
-        // shared budget holds.
+        // Many hosts open streams and never read them. (Loopback sources
+        // are protected themselves; eviction of LAN hosts is covered by
+        // the limiter test above.)
         let mut hogs = Vec::new();
         for host in 2..=12u8 {
             for _ in 0..MAX_CONNECTIONS_PER_PEER {
