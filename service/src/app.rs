@@ -128,6 +128,16 @@ impl ActiveSession {
         }
     }
 
+    /// The fault that ended the session when a reconnect can't fix it
+    /// (e.g. the receiver rejected our authentication). Such a session is
+    /// ended without the drop watchdog's retry.
+    pub fn final_fault(&self) -> Option<String> {
+        match self {
+            ActiveSession::AirPlay2(s) => s.fault().filter(|f| !f.retryable).map(|f| f.to_string()),
+            ActiveSession::Upnp(_) | ActiveSession::AirPlay(_) => None,
+        }
+    }
+
     /// `(resend requests, packets re-sent)` for the AirPlay push paths;
     /// `None` for UPnP, where the speaker pulls over TCP and nothing is
     /// retransmitted at our level.
@@ -1057,6 +1067,24 @@ impl App {
                             return;
                         }
                         std::thread::sleep(Duration::from_millis(100));
+                    }
+
+                    // A session that failed for good (not retryable) is
+                    // ended here, whatever the reconnect setting.
+                    let final_fault = {
+                        let mut guard = app.session.lock().unwrap();
+                        match guard.as_ref().and_then(|s| s.is_dead().then(|| s.final_fault()).flatten()) {
+                            Some(fault) => guard.take().map(|s| (s, fault)),
+                            None => None,
+                        }
+                    };
+                    if let Some((s, fault)) = final_fault {
+                        let name = s.friendly_name();
+                        s.stop();
+                        app.prune_stream_clients();
+                        warn!("AirPlay session to {} ended: {}", name, fault);
+                        app.record_error(format!("Connection to {} ended: {}", name, fault));
+                        continue;
                     }
 
                     if !app.user_config.lock().unwrap().auto_reconnect_on_drop {

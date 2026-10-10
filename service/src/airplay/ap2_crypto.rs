@@ -10,6 +10,10 @@
 //!     info=`Control-Write-Encryption-Key`).
 //!   * **control read key**  = HKDF-SHA512(salt=`Control-Salt`, ikm=K,
 //!     info=`Control-Read-Encryption-Key`).
+//!   * **event channel keys** = HKDF-SHA512(salt=`Events-Salt`, ikm=K, …):
+//!     the receiver *writes* events with `Events-Write-Encryption-Key`
+//!     (our read key) and reads our replies with
+//!     `Events-Read-Encryption-Key` (our write key).
 //!
 //! ## Control channel framing (HAP transport)
 //!
@@ -53,6 +57,9 @@ use zeroize::Zeroize;
 const CONTROL_SALT: &[u8] = b"Control-Salt";
 const CONTROL_WRITE_INFO: &[u8] = b"Control-Write-Encryption-Key";
 const CONTROL_READ_INFO: &[u8] = b"Control-Read-Encryption-Key";
+const EVENTS_SALT: &[u8] = b"Events-Salt";
+const EVENTS_WRITE_INFO: &[u8] = b"Events-Write-Encryption-Key";
+const EVENTS_READ_INFO: &[u8] = b"Events-Read-Encryption-Key";
 
 /// Max plaintext bytes per encrypted control block (HAP `ENCRYPTED_LEN_MAX`).
 const BLOCK_MAX: usize = 0x400;
@@ -72,6 +79,8 @@ pub struct SessionKeys {
     audio: [u8; 32],
     control_write: [u8; 32],
     control_read: [u8; 32],
+    events_tx: [u8; 32],
+    events_rx: [u8; 32],
 }
 
 impl SessionKeys {
@@ -85,6 +94,10 @@ impl SessionKeys {
             audio,
             control_write: hkdf32(CONTROL_SALT, shared, CONTROL_WRITE_INFO),
             control_read: hkdf32(CONTROL_SALT, shared, CONTROL_READ_INFO),
+            // The event channel is named from the receiver's side: it
+            // writes with the "Write" key, so that one is our reader.
+            events_tx: hkdf32(EVENTS_SALT, shared, EVENTS_READ_INFO),
+            events_rx: hkdf32(EVENTS_SALT, shared, EVENTS_WRITE_INFO),
         }
     }
 
@@ -103,6 +116,19 @@ impl SessionKeys {
     pub fn control_reader(&self) -> ChannelCipher {
         ChannelCipher::new(&self.control_read)
     }
+
+    /// `(writer, reader)` ciphers for the event channel (the TCP
+    /// connection to the receiver's `eventPort`).
+    pub fn event_ciphers(&self) -> (ChannelCipher, ChannelCipher) {
+        (ChannelCipher::new(&self.events_tx), ChannelCipher::new(&self.events_rx))
+    }
+
+    /// The receiver's `(writer, reader)` for the event channel — the mirror
+    /// of [`SessionKeys::event_ciphers`], for loopback tests.
+    #[cfg(test)]
+    pub fn receiver_event_ciphers(&self) -> (ChannelCipher, ChannelCipher) {
+        (ChannelCipher::new(&self.events_rx), ChannelCipher::new(&self.events_tx))
+    }
 }
 
 impl Drop for SessionKeys {
@@ -110,6 +136,8 @@ impl Drop for SessionKeys {
         self.audio.zeroize();
         self.control_write.zeroize();
         self.control_read.zeroize();
+        self.events_tx.zeroize();
+        self.events_rx.zeroize();
     }
 }
 
@@ -174,6 +202,57 @@ impl ChannelCipher {
                 Payload { msg: ct_and_tag, aad: &len_le },
             )
             .map_err(|_| anyhow::anyhow!("control block auth failed (counter {})", self.counter - 1))
+    }
+}
+
+/// Why [`HapReader::push`] failed. An authentication failure (wrong key,
+/// corrupted or reordered record) is a different fault from the peer
+/// closing the connection, and callers report it as such.
+#[derive(Debug, thiserror::Error)]
+pub enum HapReadError {
+    #[error("encrypted record failed authentication")]
+    Auth,
+}
+
+/// Incremental decoder for an inbound HAP-framed stream. Bytes arrive in
+/// arbitrary pieces (a TCP read can end inside the length prefix, the
+/// ciphertext or the tag); `push` buffers them and returns the plaintext
+/// of every record completed so far. A timed-out read therefore never
+/// loses or desynchronises data.
+pub struct HapReader {
+    cipher: ChannelCipher,
+    pending: Vec<u8>,
+}
+
+impl HapReader {
+    pub fn new(cipher: ChannelCipher) -> Self {
+        Self { cipher, pending: Vec::new() }
+    }
+
+    /// True while a partial record is buffered.
+    pub fn has_partial(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> std::result::Result<Vec<u8>, HapReadError> {
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while self.pending.len() - pos >= 2 {
+            let len = u16::from_le_bytes([self.pending[pos], self.pending[pos + 1]]);
+            let total = 2 + len as usize + TAG_LEN;
+            if self.pending.len() - pos < total {
+                break;
+            }
+            let plain = self
+                .cipher
+                .decrypt_block(len, &self.pending[pos + 2..pos + total])
+                .map_err(|_| HapReadError::Auth)?;
+            out.extend_from_slice(&plain);
+            pos += total;
+        }
+        self.pending.drain(..pos);
+        Ok(out)
     }
 }
 
@@ -278,6 +357,62 @@ mod tests {
         // rx is at counter 0 → nonce mismatch → auth fails.
         let len = u16::from_le_bytes([wire[0], wire[1]]);
         assert!(rx.decrypt_block(len, &wire[2..]).is_err());
+    }
+
+    #[test]
+    fn hap_reader_reassembles_records_split_anywhere() {
+        let keys = SessionKeys::from_shared(&[4u8; 64]);
+        let mut tx = keys.control_writer();
+        let msg_a = b"POST /command RTSP/1.0\r\nCSeq: 3\r\n\r\n".to_vec();
+        let msg_b: Vec<u8> = (0..1500u32).map(|i| (i * 7) as u8).collect();
+        let mut wire = tx.encrypt(&msg_a);
+        wire.extend_from_slice(&tx.encrypt(&msg_b));
+        let mut want = msg_a.clone();
+        want.extend_from_slice(&msg_b);
+        let first_len = 2 + msg_a.len() + TAG_LEN;
+        // Split inside the length prefix, the ciphertext and the tag of
+        // the first record, plus every-byte feeding.
+        for cuts in [
+            vec![1],
+            vec![10],
+            vec![first_len - 3],
+            vec![first_len + 1, first_len + 600],
+            (1..wire.len()).collect::<Vec<_>>(),
+        ] {
+            let mut rx = HapReader::new(keys.control_writer());
+            let mut got = Vec::new();
+            let mut last = 0;
+            for c in cuts.into_iter().chain([wire.len()]) {
+                got.extend(rx.push(&wire[last..c]).unwrap());
+                last = c;
+            }
+            assert_eq!(got, want);
+            assert!(!rx.has_partial());
+        }
+    }
+
+    #[test]
+    fn hap_reader_wrong_key_is_auth_error() {
+        let mut tx = SessionKeys::from_shared(&[4u8; 64]).control_writer();
+        let wire = tx.encrypt(b"hello");
+        let mut rx = HapReader::new(SessionKeys::from_shared(&[5u8; 64]).control_writer());
+        assert!(matches!(rx.push(&wire), Err(HapReadError::Auth)));
+    }
+
+    #[test]
+    fn event_keys_are_mirrored_between_sides() {
+        // What the receiver writes with "Events-Write" we must read, and
+        // vice versa — the two directions use distinct keys.
+        let keys = SessionKeys::from_shared(&[6u8; 64]);
+        let (mut our_tx, _) = keys.event_ciphers();
+        let mut receiver_rx = ChannelCipher::new(&hkdf32(EVENTS_SALT, &[6u8; 64], EVENTS_READ_INFO));
+        let wire = our_tx.encrypt(b"RTSP/1.0 200 OK\r\n\r\n");
+        let len = u16::from_le_bytes([wire[0], wire[1]]);
+        assert!(receiver_rx.decrypt_block(len, &wire[2..]).is_ok());
+        let mut receiver_tx = ChannelCipher::new(&hkdf32(EVENTS_SALT, &[6u8; 64], EVENTS_WRITE_INFO));
+        let (_, our_rx) = keys.event_ciphers();
+        let mut reader = HapReader::new(our_rx);
+        assert_eq!(reader.push(&receiver_tx.encrypt(b"ev")).unwrap(), b"ev");
     }
 
     #[test]

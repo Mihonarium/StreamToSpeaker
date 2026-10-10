@@ -447,6 +447,16 @@ pub struct ResendStats {
     pub requests: AtomicU64,
     /// Packets actually re-sent in response.
     pub packets: AtomicU64,
+    /// Packets named by requests (sum of the requested runs).
+    pub requested: AtomicU64,
+    /// Requested packets no longer (or never) in the history.
+    pub missing: AtomicU64,
+    /// Requested packets past their playout deadline (not resent).
+    pub expired: AtomicU64,
+    /// Requested packets dropped because the pending queue was full.
+    pub queue_drops: AtomicU64,
+    /// Resends that failed on the socket.
+    pub send_errors: AtomicU64,
 }
 
 impl ResendStats {
