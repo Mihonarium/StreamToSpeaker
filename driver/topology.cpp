@@ -365,13 +365,11 @@ CMiniportTopology::~CMiniportTopology()
         m_Port->Release();
         m_Port = nullptr;
     }
-    if (m_Ext != nullptr) {
-        /* Normally already withdrawn (the published pointer holds a
-         * reference); clear it only if it still names this object. */
-        InterlockedCompareExchangePointer(
-            reinterpret_cast<PVOID volatile*>(&m_Ext->Topology), nullptr, this);
-        m_Ext = nullptr;
-    }
+    /* Do not touch m_Ext here: the last reference can be dropped after
+     * the FDO (and the extension in it) is gone. Ext->Topology needs no
+     * clearing — while it names this object it holds a reference, so
+     * TopologyWithdraw has always cleared it before we get here. */
+    m_Ext = nullptr;
 }
 
 STDMETHODIMP

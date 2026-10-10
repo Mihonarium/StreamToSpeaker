@@ -468,10 +468,13 @@ StreamToSpeakerDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP
  *                     drained) and disable the device interface. Audio
  *                     streams may still be open, so nothing is freed.
  *   REMOVE_DEVICE     the same if surprise removal did not happen,
- *                     forward to PortCls, and only then free the
- *                     context: PortCls's teardown of the subdevices is
- *                     the last point where a stream or topology
- *                     callback could still post into it.
+ *                     detach the context from the extension, forward
+ *                     to PortCls, and only then free it: producers read
+ *                     ext->IoctlCtx once, so during PortCls's teardown
+ *                     they see either nullptr or a context that is not
+ *                     yet freed. Nothing (including DriverUnload, should
+ *                     the FDO's deletion be deferred) can find the
+ *                     freed context through the extension.
  */
 extern "C" NTSTATUS
 StreamToSpeakerDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
@@ -501,8 +504,9 @@ StreamToSpeakerDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             TopologyWithdraw(ext);
             WithdrawIoctlCtx(ext);
             DisableDeviceInterface(ext, TRUE);
-            /* ext->IoctlCtx stays set for PortCls's teardown below. */
             StreamToSpeakerIoctlCtx* ctx = ext->IoctlCtx;
+            InterlockedExchangePointer(
+                reinterpret_cast<PVOID volatile*>(&ext->IoctlCtx), nullptr);
             NTSTATUS status = StreamToSpeakerDispatchPassThrough(DeviceObject, Irp);
             /* The FDO and its extension are gone now; ctx is unreachable
              * from everywhere. */
@@ -657,14 +661,29 @@ static NTSTATUS CreateControlDevice(_In_ PDRIVER_OBJECT DriverObject,
         &g_ControlDeviceSddl,
         &GUID_DEVCLASS_STREAM_TO_SPEAKER_CONTROL,
         &g_ControlDevice);
-    if (status == STATUS_INVALID_PARAMETER) {
-        DBG_WARN("control device SDDL rejected; using the interactive-only descriptor");
-        status = IoCreateDeviceSecure(
-            DriverObject, 0, Name,
-            FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
-            &g_ControlDeviceSddlInteractiveOnly,
-            &GUID_DEVCLASS_STREAM_TO_SPEAKER_CONTROL,
-            &g_ControlDevice);
+    if (NT_SUCCESS(status)) {
+        DBG_INFO("control device %wZ created with descriptor %wZ",
+                 Name, &g_ControlDeviceSddl);
+        return status;
+    }
+    /* A name collision is handled by the caller (retry under another
+     * name). Any other failure may come from the descriptor, so retry
+     * with the interactive-only one. */
+    if (status == STATUS_OBJECT_NAME_COLLISION) {
+        return status;
+    }
+    DBG_WARN("control device creation with descriptor %wZ failed 0x%08x; "
+             "retrying with %wZ",
+             &g_ControlDeviceSddl, status, &g_ControlDeviceSddlInteractiveOnly);
+    status = IoCreateDeviceSecure(
+        DriverObject, 0, Name,
+        FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
+        &g_ControlDeviceSddlInteractiveOnly,
+        &GUID_DEVCLASS_STREAM_TO_SPEAKER_CONTROL,
+        &g_ControlDevice);
+    if (NT_SUCCESS(status)) {
+        DBG_INFO("control device %wZ created with descriptor %wZ",
+                 Name, &g_ControlDeviceSddlInteractiveOnly);
     }
     return status;
 }
