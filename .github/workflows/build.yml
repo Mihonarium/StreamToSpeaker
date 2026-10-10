@@ -905,6 +905,42 @@ jobs:
           gh release upload "${{ github.ref_name }}" $bundle --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
 
+  # Installer lifecycle test (installer-lifecycle.yml) for pull requests
+  # that change what the installer does: install / repair / uninstall /
+  # upgrade from the previous release, run against the installer this run
+  # just built. Other PRs skip it; it can also be dispatched on its own.
+  installer-changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The PR merge commit and its first parent (the base it merges
+          # into): their diff is exactly the PR's change.
+          fetch-depth: 2
+      - id: diff
+        run: |
+          files=$(git diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$files"
+          if printf '%s\n' "$files" | grep -qE '^(installer/|scripts/(Pre-Install|Rename-Endpoint|Reset-Install|Diagnose)\.ps1$|\.github/workflows/installer-lifecycle\.yml$|\.github/scripts/Test-InstallerLifecycle\.ps1$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  installer-lifecycle:
+    needs: [build, installer-changes]
+    if: needs.installer-changes.outputs.changed == 'true'
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/installer-lifecycle.yml
+    with:
+      version: ${{ needs.build.outputs.version }}
+
   # Minimum-supported-Rust check. `rust-version` in service/Cargo.toml is
   # only a true statement while this job passes: it checks both targets on
   # exactly that toolchain with the lockfile as-is (--locked), so a

@@ -1,0 +1,281 @@
+name: Installer lifecycle
+
+# Installs, repairs, uninstalls and upgrades the installer on a disposable
+# runner and checks what each step leaves behind (logic and checks in
+# .github/scripts/Test-InstallerLifecycle.ps1):
+#
+#   fresh install → repair → uninstall
+#   → previous public release → upgrade to this build → uninstall
+#   (→ also over the Microsoft-signed-driver variant, when built)
+#
+# A user-data sentinel in %APPDATA%\StreamToSpeaker must survive all of it:
+# uninstall deliberately leaves user data in place.
+#
+# Hosted runners run Windows Server without test-signing, so the driver is
+# never expected to load here: the checks cover what the installer itself
+# does (files, Apps & Features entry, shortcuts, certificate trust, driver
+# store, device node) and only report the device's status.
+#
+# Called by build.yml on pull requests that touch the installer (same run,
+# so it tests exactly the installer that run built), or dispatched by hand
+# against an earlier Build installer run's artifacts.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version the calling build stamped into the installer
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Build installer run whose installer to test (default: latest successful run on this branch)"
+        required: false
+        default: ""
+      previous_tag:
+        description: "Release to upgrade from (default: newest vX.Y.Z release with an installer)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # Releases live in the upstream repository, also for runs on forks.
+  RELEASES_REPO: Mihonarium/StreamToSpeaker
+
+jobs:
+  lifecycle:
+    # Same image as the build, so the installer meets the OS it was built
+    # alongside.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate the build to test
+        id: src
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          RUN_ID: ${{ inputs.build_run_id }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          $run = ""
+          if ($env:EVENT -eq "workflow_dispatch") {
+              $run = $env:RUN_ID
+              if (-not $run) {
+                  $run = gh run list --repo $env:GITHUB_REPOSITORY --workflow build.yml --branch $env:BRANCH `
+                      --status success --limit 1 --json databaseId --jq '.[0].databaseId'
+                  if (-not $run) { throw "No successful 'Build installer' run on $env:BRANCH; pass build_run_id." }
+              }
+              if ($run -notmatch '^\d+$') { throw "build_run_id must be a run number, got '$run'" }
+              Write-Host "Testing artifacts of run $run"
+          } else {
+              Write-Host "Testing artifacts of this run"
+          }
+          "run_id=$run" >> $env:GITHUB_OUTPUT
+
+      - name: Download installers (this run)
+        if: steps.src.outputs.run_id == ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: StreamToSpeakerSetup-*
+          path: dist/installer
+          merge-multiple: true
+
+      - name: Download binaries (this run)
+        if: steps.src.outputs.run_id == ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: dist/binaries
+          merge-multiple: true
+
+      - name: Download installers (build run ${{ steps.src.outputs.run_id }})
+        if: steps.src.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: StreamToSpeakerSetup-*
+          path: dist/installer
+          merge-multiple: true
+          run-id: ${{ steps.src.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download binaries (build run ${{ steps.src.outputs.run_id }})
+        if: steps.src.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: dist/binaries
+          merge-multiple: true
+          run-id: ${{ steps.src.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      # Each installer has a <name>.driver.json build record naming the
+      # driver kind it bundles; the test-signed one is always built.
+      - name: Pick the installers under test
+        id: pick
+        shell: pwsh
+        env:
+          CALLER_VERSION: ${{ inputs.version }}
+        run: |
+          $records = @(Get-ChildItem dist/installer -Filter "StreamToSpeakerSetup-*.driver.json")
+          if (-not $records) { throw "no installer build records in the artifact" }
+          $dev = $null; $prod = $null
+          foreach ($r in $records) {
+              $j = Get-Content $r.FullName -Raw | ConvertFrom-Json
+              $exe = Join-Path $r.DirectoryName $j.installer
+              if (-not (Test-Path $exe)) { throw "record $($r.Name) names missing installer $($j.installer)" }
+              Write-Host "$($j.installer): driver $($j.driver.kind), test certificate $($j.test_cert)"
+              if ($j.driver.kind -eq "test-signed") { $dev = @{ exe = $exe; rec = $r.FullName; name = $j.installer } }
+              elseif (-not $prod) { $prod = @{ exe = $exe; rec = $r.FullName } }
+          }
+          if (-not $dev) { throw "no test-signed installer in the artifact" }
+          $version = $env:CALLER_VERSION
+          if (-not $version) { $version = $dev.name -replace '^StreamToSpeakerSetup-', '' -replace '\.exe$', '' }
+          $exe = Get-ChildItem dist/binaries -Recurse -Filter stream-to-speaker.exe | Select-Object -First 1
+          if (-not $exe) { throw "no stream-to-speaker.exe in the binaries artifact" }
+          Write-Host "Version under test: $version"
+          # Paths and versions reach later steps as environment variables,
+          # never spliced into their scripts.
+          @(
+              "STS_VERSION=$version"
+              "STS_DEV_EXE=$($dev.exe)"
+              "STS_DEV_RECORD=$($dev.rec)"
+              "STS_SERVICE_EXE=$($exe.FullName)"
+              "STS_PROD_EXE=$(if ($prod) { $prod.exe })"
+              "STS_PROD_RECORD=$(if ($prod) { $prod.rec })"
+          ) | Add-Content $env:GITHUB_ENV
+          "has_prod=$(if ($prod) { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
+
+      # Newest non-draft, non-prerelease vX.Y.Z release carrying a setup exe
+      # (driver-v* releases are skipped by the tag shape). Its .sha256
+      # sidecar, when published, must match the download.
+      - name: Download the previous release's installer
+        id: prev
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT_TAG: ${{ inputs.previous_tag }}
+        run: |
+          $rels = gh api --paginate "repos/$env:RELEASES_REPO/releases?per_page=100" --jq '.[]' |
+              ForEach-Object { $_ | ConvertFrom-Json }
+          $setup = { param($r) @($r.assets | Where-Object { $_.name -match '^StreamToSpeakerSetup-.+\.exe$' }) }
+          if ($env:WANT_TAG) {
+              $rel = $rels | Where-Object { $_.tag_name -eq $env:WANT_TAG } | Select-Object -First 1
+              if (-not $rel) { throw "no release $env:WANT_TAG in $env:RELEASES_REPO" }
+          } else {
+              $rel = $rels |
+                  Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -match '^v\d+\.\d+\.\d+$' -and (& $setup $_).Count -gt 0 } |
+                  Sort-Object { [version]$_.tag_name.Substring(1) } -Descending |
+                  Select-Object -First 1
+          }
+          if (-not $rel) {
+              Write-Host "::warning::No previous release with an installer; skipping the upgrade path."
+              "found=false" >> $env:GITHUB_OUTPUT
+              exit 0
+          }
+          $assets = & $setup $rel
+          if (-not $assets) { throw "release $($rel.tag_name) has no setup exe" }
+          # Prefer the Microsoft-signed-driver installer over a -testsigned fallback.
+          $asset = ($assets | Where-Object { $_.name -notmatch '-testsigned\.exe$' } | Select-Object -First 1)
+          if (-not $asset) { $asset = $assets[0] }
+          New-Item -ItemType Directory -Force dist/previous | Out-Null
+          gh release download $rel.tag_name --repo $env:RELEASES_REPO --pattern $asset.name --dir dist/previous
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          $path = Join-Path dist/previous $asset.name
+          $hash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
+          if ($rel.assets | Where-Object { $_.name -eq "$($asset.name).sha256" }) {
+              gh release download $rel.tag_name --repo $env:RELEASES_REPO --pattern "$($asset.name).sha256" --dir dist/previous
+              if ($LASTEXITCODE -ne 0) { throw "sidecar download failed" }
+              $want = ((Get-Content "$path.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
+              if ($want -ne $hash) { throw "$($asset.name): sha256 $hash does not match the published $want" }
+              Write-Host "$($asset.name) matches its published sha256"
+          } else {
+              Write-Host "::warning::$($rel.tag_name) publishes no .sha256 for $($asset.name)"
+          }
+          $sig = Get-AuthenticodeSignature $path
+          Write-Host "Previous release: $($rel.tag_name) / $($asset.name) sha256 $hash, Authenticode $($sig.Status) ($($sig.SignerCertificate.Subject))"
+          $prevVersion = $rel.tag_name -replace '^v', ''
+          "found=true" >> $env:GITHUB_OUTPUT
+          "version=$prevVersion" >> $env:GITHUB_OUTPUT
+          "STS_PREV_EXE=$((Resolve-Path $path).Path)" | Add-Content $env:GITHUB_ENV
+          "STS_PREV_VERSION=$prevVersion" | Add-Content $env:GITHUB_ENV
+
+      - name: Runner state + user-data sentinel
+        shell: pwsh
+        run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase env
+
+      - name: Fresh install
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase install
+          -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+
+      - name: Repair (reinstall over itself)
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase repair
+          -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+
+      - name: Uninstall
+        shell: pwsh
+        run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase uninstall
+
+      - name: Install the previous release (${{ steps.prev.outputs.version }})
+        if: steps.prev.outputs.found == 'true'
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase previous
+          -Installer $env:STS_PREV_EXE -ExpectVersion $env:STS_PREV_VERSION
+
+      - name: Upgrade to this build
+        if: steps.prev.outputs.found == 'true'
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase upgrade
+          -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+
+      # Test-signed install → Microsoft-signed-driver install of the same
+      # build, the path a tester takes from a dev build to a release.
+      - name: Upgrade to the Microsoft-signed-driver installer
+        if: steps.prev.outputs.found == 'true' && steps.pick.outputs.has_prod == 'true'
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase upgrade
+          -Installer $env:STS_PROD_EXE -DriverRecord $env:STS_PROD_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+
+      - name: Final uninstall
+        if: steps.prev.outputs.found == 'true'
+        shell: pwsh
+        run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase uninstall
+
+      - name: Collect logs
+        if: always()
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "lifecycle\logs"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $install = Join-Path $env:LOCALAPPDATA "StreamToSpeaker\install.log"
+          if (Test-Path $install) { Copy-Item $install $out }
+          $setupapi = Join-Path $env:windir "INF\setupapi.dev.log"
+          if (Test-Path $setupapi) {
+              Get-Content $setupapi -Tail 3000 | Set-Content (Join-Path $out "setupapi.dev.tail.log")
+          }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-lifecycle-logs
+          path: ${{ runner.temp }}/lifecycle
+          if-no-files-found: warn
+          retention-days: 14
