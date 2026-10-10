@@ -183,7 +183,7 @@ Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: 
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     ValueType: string; ValueName: "{#MyAppName}"; \
     ValueData: """{app}\{#MyAppExeName}"" --startup"; \
-    Tasks: autostart; Flags: uninsdeletevalue
+    Tasks: autostart; Check: AutostartWanted; Flags: uninsdeletevalue
 ; (Uninstall also removes the value when it was turned on from inside the
 ; app rather than by this task — see CurUninstallStepChanged in [Code].)
 
@@ -325,6 +325,26 @@ begin
   if not ClosePriorInstance() then begin
     Result := False;
   end;
+end;
+
+// Setup re-ticks tasks chosen at the previous install. If that install
+// had the autostart task but the Run value is gone now, the user switched
+// start-at-sign-in off inside the app — don't turn it back on. (A value
+// that exists is rewritten as usual; a fresh install, or an upgrade whose
+// previous install didn't have the task, follows the checkbox.)
+function AutostartWanted(): Boolean;
+var
+  PrevTasks: String;
+begin
+  Result := True;
+  if RegValueExists(HKEY_CURRENT_USER,
+       'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}') then
+    Exit;
+  if RegQueryStringValue(HKLM64,
+       ExpandConstant('Software\Microsoft\Windows\CurrentVersion\Uninstall\{#emit SetupSetting("AppId")}_is1'),
+       'Inno Setup: Selected Tasks', PrevTasks) then
+    if Pos('autostart', Lowercase(PrevTasks)) > 0 then
+      Result := False;
 end;
 
 // The app's "Start at sign-in" switch can create the Run value without

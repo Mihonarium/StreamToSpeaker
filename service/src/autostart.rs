@@ -8,9 +8,11 @@
 //! and the installer can't disagree: the value itself is the setting
 //! (there is no copy in config.json to drift from it).
 //!
-//! On every GUI launch an existing value is rewritten to point at the
-//! running exe, so a moved install (or one the installer wrote before the
-//! flag existed) heals itself. A missing value is left missing.
+//! On every GUI launch an existing value that names an exe in the running
+//! exe's own folder is brought up to date (an entry written before the
+//! flag existed gains it). A value naming any other folder is left alone,
+//! so running a stray copy (an old download, a build artifact) can't
+//! redirect sign-in to it. A missing value is left missing.
 
 /// Command-line flag the Run entry passes: start hidden in the tray.
 pub const STARTUP_FLAG: &str = "--startup";
@@ -38,8 +40,30 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
     }
 }
 
-/// Launch-time self-heal: if the value exists but doesn't match the
-/// running exe (moved install, or written without the flag), rewrite it.
+/// The exe path a Run value starts: quoted, or up to the first space.
+fn exe_of(value: &str) -> &str {
+    let v = value.trim_start();
+    match v.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => v.split(' ').next().unwrap_or(v),
+    }
+}
+
+/// Whether a Run value refers to an exe in the same folder as `exe`
+/// (compared as Windows paths: either slash, any case).
+fn same_install(value: &str, exe: &std::path::Path) -> bool {
+    fn folder(p: &str) -> Option<String> {
+        let cut = p.rfind(['\\', '/'])?;
+        Some(p[..cut].to_lowercase())
+    }
+    match (folder(exe_of(value)), folder(&exe.to_string_lossy())) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Launch-time update: if the value exists, names this install's folder
+/// and differs from what we'd write (e.g. lacks the flag), rewrite it.
 pub fn reapply() {
     let Some(current) = imp::read() else {
         return;
@@ -48,7 +72,7 @@ pub fn reapply() {
         return;
     };
     let wanted = command_line(&exe);
-    if current != wanted {
+    if current != wanted && same_install(&current, &exe) {
         match imp::write(&wanted) {
             Ok(()) => log::info!("autostart: updated sign-in entry to {}", wanted),
             Err(e) => log::warn!("autostart: couldn't update sign-in entry: {}", e),
@@ -169,6 +193,19 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_same_install_is_updated() {
+        let exe = std::path::Path::new(r"C:\Program Files\Stream To Speaker\stream-to-speaker.exe");
+        assert!(same_install(r#""C:\program files\Stream To Speaker\stream-to-speaker.exe""#, exe));
+        assert!(same_install(
+            r#""C:\Program Files\Stream To Speaker\stream-to-speaker.exe" --startup"#,
+            exe
+        ));
+        assert!(!same_install(r#""C:\Users\me\Downloads\stream-to-speaker.exe""#, exe));
+        assert!(!same_install("", exe));
+        assert_eq!(exe_of(r"C:\x\a.exe --startup"), r"C:\x\a.exe");
+    }
 
     #[test]
     fn command_line_quotes_the_path_and_adds_the_flag() {
