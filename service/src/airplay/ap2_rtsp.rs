@@ -45,6 +45,9 @@ const TEARDOWN_WAIT: Duration = Duration::from_millis(300);
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Header block limit otherwise (the long-standing bound).
 const LENIENT_MAX_HEADER_BYTES: usize = 1 << 20;
+/// Absolute bound on one reply when the timeout applies per read: a peer
+/// trickling bytes can't keep a request waiting forever.
+const MAX_REPLY_WAIT: Duration = Duration::from_secs(30);
 /// Sent-but-unanswered requests tracked for reply attribution.
 const PENDING_CAP: usize = 64;
 /// Response body limit (a `GET /info` plist is a few KiB).
@@ -209,6 +212,8 @@ pub struct Ap2Rtsp {
     /// poisons the connection, and TEARDOWN waits only briefly. Off,
     /// framing is read leniently as it always was.
     strict: bool,
+    /// Absolute bound on waiting for one reply ([`MAX_REPLY_WAIT`]).
+    reply_wait_cap: Duration,
     /// True once a TEARDOWN has been sent — makes `teardown` idempotent
     /// and lets Drop skip the duplicate.
     torn_down: bool,
@@ -259,6 +264,7 @@ impl Ap2Rtsp {
             poisoned: false,
             pending: VecDeque::new(),
             strict: false,
+            reply_wait_cap: MAX_REPLY_WAIT,
             torn_down: false,
         })
     }
@@ -926,6 +932,7 @@ impl Ap2Rtsp {
     /// status remembered; a response to a request we never sent poisons
     /// the connection.
     fn await_response(&mut self, cseq: u32, mut deadline: Instant, per_read: bool) -> Result<Option<Resp>> {
+        let hard_deadline = Instant::now() + self.reply_wait_cap;
         loop {
             let parsed = parse_response(&mut self.rx_buf, self.strict);
             match parsed {
@@ -979,7 +986,7 @@ impl Ap2Rtsp {
                 return Ok(None);
             }
             if self.fill(deadline - now)? && per_read {
-                deadline = Instant::now() + self.timeout;
+                deadline = (Instant::now() + self.timeout).min(hard_deadline);
             }
         }
     }
@@ -1057,10 +1064,12 @@ struct Resp {
 }
 
 /// Take one complete RTSP/HTTP response off the front of `buf`, or
-/// `Ok(None)` if it isn't complete yet. In `strict` mode bodies over
-/// 1 MiB, headers over 16 KiB, chunked transfer, duplicate
-/// or unparseable framing headers (`CSeq`, `Content-Length`); otherwise
-/// those are read leniently (last value wins, unparseable = absent).
+/// `Ok(None)` if it isn't complete yet. A Content-Length over 1 MiB is
+/// always rejected, so a hostile peer can't make the buffer grow without
+/// bound. In `strict` mode so are headers over 16 KiB, chunked transfer,
+/// duplicate or unparseable framing headers (`CSeq`, `Content-Length`);
+/// otherwise those are read leniently (last value wins, unparseable =
+/// absent).
 fn parse_response(buf: &mut Vec<u8>, strict: bool) -> Result<Option<Resp>> {
     let header_limit = if strict { MAX_HEADER_BYTES } else { LENIENT_MAX_HEADER_BYTES };
     let Some(header_end) = find_subsequence(buf, b"\r\n\r\n") else {
@@ -1103,7 +1112,7 @@ fn parse_response(buf: &mut Vec<u8>, strict: bool) -> Result<Option<Resp>> {
         }
     }
     let content_length = content_length.unwrap_or(0);
-    if strict && content_length > MAX_BODY_BYTES {
+    if content_length > MAX_BODY_BYTES {
         bail!("AP2 RTSP response body too large ({} bytes)", content_length);
     }
     let body_start = header_end + 4;
@@ -1420,6 +1429,47 @@ mod tests {
         assert!(c.request("OPTIONS", "*", &[], None, &[]).is_err());
         c.teardown();
         assert_eq!(server.join().unwrap().last().map(String::as_str), Some("TEARDOWN"));
+    }
+
+    #[test]
+    fn oversized_or_wrapping_content_length_is_rejected_in_both_modes() {
+        for strict in [false, true] {
+            for cl in [(MAX_BODY_BYTES + 1).to_string(), usize::MAX.to_string()] {
+                let mut buf = format!("RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: {cl}\r\n\r\nxx").into_bytes();
+                assert!(parse_response(&mut buf, strict).is_err(), "strict={strict} cl={cl}");
+            }
+            let mut ok = format!("RTSP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", MAX_BODY_BYTES).into_bytes();
+            assert!(parse_response(&mut ok, strict).unwrap().is_none()); // waits for the body
+        }
+    }
+
+    /// A peer that keeps trickling bytes can't hold a request past the
+    /// absolute bound even though each read resets the per-read timeout.
+    #[test]
+    fn trickling_reply_hits_the_absolute_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let _ = sock.write_all(b"RTSP/1.0 200 OK\r\nContent-Length: 100000\r\n\r\n");
+            while !stop_t.load(std::sync::atomic::Ordering::Acquire) {
+                if sock.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut c = Ap2Rtsp::connect(ip, port, ip, Duration::from_millis(200)).unwrap();
+        c.reply_wait_cap = Duration::from_millis(600);
+        let started = Instant::now();
+        assert!(c.request("OPTIONS", "*", &[], None, &[]).is_err());
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(500) && took < Duration::from_secs(3), "{took:?}");
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        server.join().unwrap();
     }
 
     #[test]
