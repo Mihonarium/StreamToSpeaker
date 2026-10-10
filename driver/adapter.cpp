@@ -153,7 +153,6 @@ StreamToSpeakerStartDevice(
     DBG_INFO("QueryInterface(IMiniportTopology) ok");
 
     static_cast<CMiniportTopology*>(topoMiniport)->SetDeviceExtension(ext);
-    ext->Topology = static_cast<CMiniportTopology*>(topoMiniport);
 
     /* Register subdevices. Capture each port's IUnknown so we can pass
      * them to PcRegisterPhysicalConnection below. */
@@ -196,6 +195,9 @@ StreamToSpeakerStartDevice(
     if (!NT_SUCCESS(status)) {
         DBG_ERROR("PcRegisterPhysicalConnection failed 0x%08x", status);
     } else {
+        /* Only a fully started topology is reachable from
+         * IOCTL_STREAM_TO_SPEAKER_PUSH_VOLUME. Takes its own reference. */
+        TopologyPublish(ext, static_cast<CMiniportTopology*>(topoMiniport));
         DBG_INFO("StartDevice complete");
     }
 

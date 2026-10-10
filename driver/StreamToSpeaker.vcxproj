@@ -85,7 +85,7 @@
       <AdditionalOptions>/Zc:alignedNew- %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(DDK_LIB_PATH)\portcls.lib;$(DDK_LIB_PATH)\ksguid.lib;$(DDK_LIB_PATH)\stdunk.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(DDK_LIB_PATH)\portcls.lib;$(DDK_LIB_PATH)\wdmsec.lib;$(DDK_LIB_PATH)\ksguid.lib;$(DDK_LIB_PATH)\stdunk.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <SubSystem>Native</SubSystem>
       <Driver>WDM</Driver>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>

@@ -366,9 +366,10 @@ CMiniportTopology::~CMiniportTopology()
         m_Port = nullptr;
     }
     if (m_Ext != nullptr) {
-        if (m_Ext->Topology == this) {
-            m_Ext->Topology = nullptr;
-        }
+        /* Normally already withdrawn (the published pointer holds a
+         * reference); clear it only if it still names this object. */
+        InterlockedCompareExchangePointer(
+            reinterpret_cast<PVOID volatile*>(&m_Ext->Topology), nullptr, this);
         m_Ext = nullptr;
     }
 }
@@ -834,14 +835,75 @@ CMiniportTopology::OnExternalVolumeChange(_In_ INT32 Mb, _In_ BOOLEAN Muted)
     FireControlChange(KSNODE_TOPO_MUTE);
 }
 
-/* Free function used by ioctl.cpp through extern declaration. */
+/* ------------------------------------------------------------------ */
+/* Publication to the IOCTL path                                       */
+/* ------------------------------------------------------------------ */
+
+/* Ext->Topology holds its own reference on the miniport while it is
+ * published, so a reader inside the rundown can never see a miniport
+ * whose last reference has gone. Withdraw clears the pointer first,
+ * then waits for every reader that may already hold it, then drops
+ * the reference — after it returns, no IOCTL is inside the miniport
+ * and PortCls can tear the subdevice down. */
 VOID
-TopologyOnExternalVolumeChange(
-    _In_ CMiniportTopology* Topology,
-    _In_ INT32              LevelMillibels,
-    _In_ BOOLEAN            Muted)
+TopologyPublish(
+    _In_ PSTREAM_TO_SPEAKER_DEVICE_EXTENSION Ext,
+    _In_ CMiniportTopology*                  Topology)
 {
-    if (Topology != nullptr) {
-        Topology->OnExternalVolumeChange(LevelMillibels, Muted);
+    PAGED_CODE();
+    if (Ext == nullptr || Topology == nullptr) {
+        return;
     }
+    /* A START without an intervening STOP should not happen, but never
+     * leak or overwrite a published miniport. */
+    TopologyWithdraw(Ext);
+
+    PMINIPORTTOPOLOGY(Topology)->AddRef();
+    InterlockedExchangePointer(
+        reinterpret_cast<PVOID volatile*>(&Ext->Topology), Topology);
+}
+
+VOID
+TopologyWithdraw(_In_ PSTREAM_TO_SPEAKER_DEVICE_EXTENSION Ext)
+{
+    PAGED_CODE();
+    if (Ext == nullptr) {
+        return;
+    }
+    CMiniportTopology* old = static_cast<CMiniportTopology*>(
+        InterlockedExchangePointer(
+            reinterpret_cast<PVOID volatile*>(&Ext->Topology), nullptr));
+
+    /* Wait for IOCTLs that read the pointer before it was cleared, then
+     * re-arm the rundown so a later START can publish again. Readers
+     * arriving after the clear see nullptr. */
+    ExWaitForRundownProtectionRelease(&Ext->TopologyRundown);
+    ExReInitializeRundownProtection(&Ext->TopologyRundown);
+
+    if (old != nullptr) {
+        PMINIPORTTOPOLOGY(old)->Release();
+    }
+}
+
+/* IOCTL_STREAM_TO_SPEAKER_PUSH_VOLUME entry point. */
+VOID
+TopologyForwardExternalVolume(
+    _In_ PSTREAM_TO_SPEAKER_DEVICE_EXTENSION Ext,
+    _In_ INT32                               LevelMillibels,
+    _In_ BOOLEAN                             Muted)
+{
+    PAGED_CODE();
+    if (Ext == nullptr) {
+        return;
+    }
+    if (!ExAcquireRundownProtection(&Ext->TopologyRundown)) {
+        return;   /* being withdrawn */
+    }
+    CMiniportTopology* topo = static_cast<CMiniportTopology*>(
+        InterlockedCompareExchangePointer(
+            reinterpret_cast<PVOID volatile*>(&Ext->Topology), nullptr, nullptr));
+    if (topo != nullptr) {
+        topo->OnExternalVolumeChange(LevelMillibels, Muted);
+    }
+    ExReleaseRundownProtection(&Ext->TopologyRundown);
 }

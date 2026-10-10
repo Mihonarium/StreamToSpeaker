@@ -127,7 +127,19 @@ typedef struct _STREAM_TO_SPEAKER_DEVICE_EXTENSION {
     BOOLEAN                 SymbolicLinkCreated;
 
     StreamToSpeakerIoctlCtx*      IoctlCtx;
+    /* TRUE once IoctlCtx has been withdrawn from the control device
+     * (surprise removal or remove): no IOCTL can reach it any more and
+     * every IRP that was queued on it has been completed. */
+    BOOLEAN                 IoctlCtxWithdrawn;
+
+    /* Topology miniport that IOCTL_STREAM_TO_SPEAKER_PUSH_VOLUME forwards
+     * to. Published with its own reference only after StartDevice has
+     * fully succeeded, and withdrawn (waiting for in-flight users) before
+     * PortCls processes STOP / SURPRISE_REMOVAL / REMOVE. Never read it
+     * directly from the IOCTL path: use TopologyForwardExternalVolume. */
     CMiniportTopology*      Topology;
+    EX_RUNDOWN_REF          TopologyRundown;
+
     CMiniportWaveRTStream*  ActiveStream;
 } STREAM_TO_SPEAKER_DEVICE_EXTENSION, *PSTREAM_TO_SPEAKER_DEVICE_EXTENSION;
 
@@ -182,6 +194,14 @@ extern "C" NTSTATUS StreamToSpeakerDispatchCreateClose(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_ PIRP           Irp);
 
+extern "C" NTSTATUS StreamToSpeakerDispatchCleanup(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP           Irp);
+
+extern "C" NTSTATUS StreamToSpeakerDispatchOther(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP           Irp);
+
 extern "C" NTSTATUS StreamToSpeakerDispatchPassThrough(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_ PIRP           Irp);
@@ -196,6 +216,19 @@ extern "C" NTSTATUS StreamToSpeakerDispatchSystemControl(
 
 extern "C" VOID StreamToSpeakerDriverUnload(
     _In_ PDRIVER_OBJECT DriverObject);
+
+/* Topology publication (topology.cpp). Publish/Withdraw run at
+ * PASSIVE_LEVEL; Withdraw blocks until no IOCTL is using the miniport.
+ * Forward is a no-op when no topology is published. */
+VOID TopologyPublish(
+    _In_ PSTREAM_TO_SPEAKER_DEVICE_EXTENSION Ext,
+    _In_ CMiniportTopology*                  Topology);
+VOID TopologyWithdraw(
+    _In_ PSTREAM_TO_SPEAKER_DEVICE_EXTENSION Ext);
+VOID TopologyForwardExternalVolume(
+    _In_ PSTREAM_TO_SPEAKER_DEVICE_EXTENSION Ext,
+    _In_ INT32                               LevelMillibels,
+    _In_ BOOLEAN                             Muted);
 
 NTSTATUS CreateMiniportWaveRTStreamToSpeaker(
     _Out_  PUNKNOWN*  Unknown,
