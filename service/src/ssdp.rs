@@ -60,6 +60,11 @@ pub struct Renderer {
     /// them, so a hostname resolving AAAA-first can't get the speaker
     /// refused.
     pub host_addrs: Vec<IpAddr>,
+    /// `modelName` from the device description.
+    pub model_name: Option<String>,
+    /// Several different devices claim this renderer's UDN, so it is
+    /// identified by its address instead (see `stable_id`).
+    pub udn_conflict: bool,
 }
 
 /// Shared discovery state.  The main loop owns one; the SSDP thread
@@ -70,73 +75,136 @@ pub struct DiscoveryState {
     identity: Mutex<IdentityState>,
 }
 
-/// Which address each UDN is trusted at. A UDN is self-reported, so two
-/// devices can claim the same one; see [`resolve_udn_conflicts`].
+/// Which addresses each UDN is trusted at. A UDN is self-reported, so
+/// two devices can claim the same one; see [`resolve_udn_conflicts`].
 #[derive(Default)]
 struct IdentityState {
-    /// UDN → the single address it was last accepted from.
-    pins: HashMap<String, IpAddr>,
-    /// UDN → addresses currently claiming it with none pinned. Selecting
-    /// such a UDN is refused until only one claimant remains.
+    /// UDN → the addresses it was last accepted from (more than one for a
+    /// multi-homed device).
+    pins: HashMap<String, Vec<IpAddr>>,
+    /// UDN → addresses of different devices currently claiming it with
+    /// none pinned. The UDN itself selects nothing; each claimant is
+    /// listed under its address instead.
     conflicted: HashMap<String, Vec<IpAddr>>,
+}
+
+/// Path part of a URL, for comparing the same device seen at two hosts.
+fn url_path(u: &str) -> &str {
+    let rest = u.split_once("://").map(|(_, r)| r).unwrap_or(u);
+    rest.find('/').map(|i| &rest[i..]).unwrap_or("/")
+}
+
+/// Do two descriptions with the same UDN describe one device reachable at
+/// several addresses (same name, model and control paths)?
+fn same_device(a: &Renderer, b: &Renderer) -> bool {
+    a.friendly_name == b.friendly_name
+        && a.model_name == b.model_name
+        && url_path(&a.av_transport_control_url) == url_path(&b.av_transport_control_url)
+        && url_path(&a.rendering_control_control_url) == url_path(&b.rendering_control_control_url)
+        && url_path(&a.rendering_control_event_url) == url_path(&b.rendering_control_event_url)
+}
+
+/// One entry for a device seen at several addresses: the lowest address
+/// controls it, and every address is admitted for streaming.
+fn merge_multi_homed(mut entries: Vec<Renderer>) -> Renderer {
+    entries.sort_by_key(|r| r.ip);
+    let mut merged = entries.remove(0);
+    for r in entries {
+        merged.host_addrs.push(r.ip);
+        merged.host_addrs.extend(r.host_addrs);
+    }
+    merged.host_addrs.push(merged.ip);
+    merged.host_addrs.sort();
+    merged.host_addrs.dedup();
+    merged
 }
 
 /// Settle UDN collisions in one discovery pass.
 ///
-/// A UDN seen at a single address is accepted and pinned there, so a
-/// speaker that moves to a new DHCP lease is followed on the next scan.
-/// A UDN claimed from several addresses at once keeps only the claimant
-/// at the pinned address; the others are dropped. With no pin among the
-/// claimants (first scan, or all of them new) every claimant stays
-/// listed but the UDN is reported as conflicted, so nothing is selected
-/// or admitted through the privacy gate by that identity.
+/// * A UDN seen at a single address is accepted and pinned there, so a
+///   speaker that moves to a new DHCP lease is followed on the next scan.
+/// * Claimants at pinned addresses are kept; claimants at other addresses
+///   are dropped while a pinned one is present.
+/// * With no pinned claimant (first scan, or all new): if every claimant
+///   has the same description, it is one multi-homed device (Ethernet and
+///   Wi-Fi, or seen through several adapters) — merged into one entry and
+///   pinned at all its addresses. Otherwise they are different devices:
+///   each stays listed, marked `udn_conflict` so it is selected by its
+///   address, and the UDN is reported as conflicted.
+///
+/// The cost of the pinning: a device that copies a speaker's whole
+/// description and is present when that UDN is first seen is accepted as
+/// part of it; identity is self-reported, so nothing here can prove which
+/// claimant is genuine.
 fn resolve_udn_conflicts(
     list: Vec<Renderer>,
-    pins: &mut HashMap<String, IpAddr>,
+    pins: &mut HashMap<String, Vec<IpAddr>>,
 ) -> (Vec<Renderer>, HashMap<String, Vec<IpAddr>>) {
-    let mut claimants: HashMap<String, Vec<IpAddr>> = HashMap::new();
-    for r in &list {
-        if let Some(udn) = &r.udn {
-            let v = claimants.entry(udn.clone()).or_default();
-            if !v.contains(&r.ip) {
-                v.push(r.ip);
+    let mut out = Vec::with_capacity(list.len());
+    let mut by_udn: HashMap<String, Vec<Renderer>> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for r in list {
+        match r.udn.clone() {
+            Some(udn) => {
+                if !by_udn.contains_key(&udn) {
+                    order.push(udn.clone());
+                }
+                by_udn.entry(udn).or_default().push(r);
             }
+            None => out.push(r),
         }
     }
     let mut conflicted = HashMap::new();
-    let mut keep_only: HashMap<String, IpAddr> = HashMap::new();
-    for (udn, addrs) in claimants {
+    for udn in order {
+        let entries = by_udn.remove(&udn).unwrap_or_default();
+        let mut addrs: Vec<IpAddr> = entries.iter().map(|r| r.ip).collect();
+        addrs.sort();
+        addrs.dedup();
         if addrs.len() == 1 {
-            pins.insert(udn, addrs[0]);
+            pins.insert(udn, addrs);
+            out.extend(entries);
             continue;
         }
-        match pins.get(&udn).copied().filter(|p| addrs.contains(p)) {
-            Some(pinned) => {
+        let pinned: Vec<IpAddr> = pins
+            .get(&udn)
+            .map(|p| addrs.iter().copied().filter(|a| p.contains(a)).collect())
+            .unwrap_or_default();
+        if !pinned.is_empty() {
+            let (keep, drop): (Vec<Renderer>, Vec<Renderer>) =
+                entries.into_iter().partition(|r| pinned.contains(&r.ip));
+            if !drop.is_empty() {
                 warn!(
-                    "devices at {:?} claim the identity {} already seen at {}; ignoring them",
-                    addrs.iter().filter(|a| **a != pinned).collect::<Vec<_>>(),
+                    "devices at {:?} claim the identity {} already seen at {:?}; ignoring them",
+                    drop.iter().map(|r| r.ip).collect::<Vec<_>>(),
                     udn,
                     pinned
                 );
-                keep_only.insert(udn, pinned);
             }
-            None => {
-                warn!(
-                    "devices at {:?} all claim the identity {}; it can't be selected until only one remains",
-                    addrs, udn
-                );
-                conflicted.insert(udn, addrs);
+            if keep.len() > 1 && keep.windows(2).all(|w| same_device(&w[0], &w[1])) {
+                out.push(merge_multi_homed(keep));
+            } else {
+                out.extend(keep);
             }
+            continue;
         }
+        if entries.windows(2).all(|w| same_device(&w[0], &w[1])) {
+            debug!("{} answers at {:?}; treating it as one multi-homed device", udn, addrs);
+            pins.insert(udn, addrs);
+            out.push(merge_multi_homed(entries));
+            continue;
+        }
+        warn!(
+            "different devices at {:?} all claim the identity {}; each is listed under its address",
+            addrs, udn
+        );
+        out.extend(entries.into_iter().map(|mut r| {
+            r.udn_conflict = true;
+            r
+        }));
+        conflicted.insert(udn, addrs);
     }
-    let list = list
-        .into_iter()
-        .filter(|r| match r.udn.as_ref().and_then(|u| keep_only.get(u)) {
-            Some(pinned) => r.ip == *pinned,
-            None => true,
-        })
-        .collect();
-    (list, conflicted)
+    out.sort_by(|a, b| a.friendly_name.cmp(&b.friendly_name));
+    (out, conflicted)
 }
 
 impl DiscoveryState {
@@ -160,8 +228,8 @@ impl DiscoveryState {
         *self.inner.lock().unwrap() = new;
     }
 
-    /// Addresses currently claiming `id` when more than one device does
-    /// and none of them is the one it was previously seen at.
+    /// Addresses of the different devices currently claiming the UDN `id`
+    /// when none of them was seen with it before.
     pub fn identity_conflict(&self, id: &str) -> Option<Vec<IpAddr>> {
         self.identity.lock().unwrap().conflicted.get(id).cloned()
     }
@@ -208,8 +276,9 @@ impl DiscoveryState {
 
     /// Match by stable id (UDN if available, otherwise IP literal).
     /// Used by the `/api/select` HTTP endpoint.
-    /// A UDN claimed by several devices (see `identity_conflict`) matches
-    /// nothing. UDN matches take precedence over IP literals, so a device
+    /// A UDN claimed by several different devices (see
+    /// `identity_conflict`) matches nothing; those devices are selected by
+    /// address. UDN matches take precedence over IP literals, so a device
     /// can't shadow another by advertising its address as a UDN.
     pub fn find_by_id(&self, id: &str) -> Option<Renderer> {
         if let Some(addrs) = self.identity_conflict(id) {
@@ -217,7 +286,7 @@ impl DiscoveryState {
             return None;
         }
         let inner = self.inner.lock().unwrap();
-        if let Some(r) = inner.iter().find(|r| r.udn.as_deref() == Some(id)) {
+        if let Some(r) = inner.iter().find(|r| !r.udn_conflict && r.udn.as_deref() == Some(id)) {
             return Some(r.clone());
         }
         inner.iter().find(|r| r.ip.to_string() == id).cloned()
@@ -240,7 +309,10 @@ impl Renderer {
     }
 
     pub fn stable_id(&self) -> String {
-        self.udn.clone().unwrap_or_else(|| self.ip.to_string())
+        match &self.udn {
+            Some(udn) if !self.udn_conflict => udn.clone(),
+            _ => self.ip.to_string(),
+        }
     }
 
     /// True when this renderer coordinates a Sonos group with at least
@@ -253,6 +325,10 @@ impl Renderer {
     /// friendlyName; group coordinators use the Sonos convention —
     /// "Living Room + Kitchen" for a pair, "Living Room + 2" beyond.
     pub fn display_name(&self) -> String {
+        if self.udn_conflict {
+            // Another device claims the same identity: tell them apart.
+            return format!("{} ({})", self.friendly_name, self.ip);
+        }
         if !self.is_group() {
             return self.friendly_name.clone();
         }
@@ -515,6 +591,12 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr) -> Result<Ren
         .unwrap_or("Unknown")
         .to_string();
 
+    let model_name = device
+        .descendants()
+        .find(|n| n.tag_name().name() == "modelName")
+        .and_then(|n| n.text())
+        .map(|s| s.trim().to_string());
+
     let udn = device
         .descendants()
         .find(|n| n.tag_name().name() == "UDN")
@@ -582,6 +664,8 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr) -> Result<Ren
         group_members: Vec::new(),
         group_member_addrs: Vec::new(),
         host_addrs: vec![ip],
+        model_name,
+        udn_conflict: false,
     })
 }
 
@@ -782,6 +866,8 @@ mod tests {
             group_members: Vec::new(),
             group_member_addrs: Vec::new(),
             host_addrs: vec![ip],
+            model_name: Some("Model".into()),
+            udn_conflict: false,
         }
     }
 
@@ -814,6 +900,49 @@ mod tests {
         // Once only one claimant answers, it is accepted.
         state.replace(vec![r("Living Room", "uuid:A", "192.168.1.10")]);
         assert!(state.find_by_id("uuid:A").is_some());
+    }
+
+    #[test]
+    fn multi_homed_device_is_merged_and_pinned() {
+        let state = DiscoveryState::new();
+        state.replace(vec![
+            r("Living Room", "uuid:A", "192.168.1.10"),
+            r("Living Room", "uuid:A", "10.0.0.10"),
+        ]);
+        let list = state.renderers();
+        assert_eq!(list.len(), 1);
+        assert!(state.identity_conflict("uuid:A").is_none());
+        let got = state.find_by_id("uuid:A").unwrap();
+        assert_eq!(got.ip.to_string(), "10.0.0.10");
+        let peers = got.stream_peers();
+        assert!(peers.contains(&"192.168.1.10".parse().unwrap()));
+        assert!(peers.contains(&"10.0.0.10".parse().unwrap()));
+        // Later, a copy of the description at a new address is ignored.
+        state.replace(vec![
+            r("Living Room", "uuid:A", "192.168.1.10"),
+            r("Living Room", "uuid:A", "10.0.0.10"),
+            r("Living Room", "uuid:A", "192.168.1.66"),
+        ]);
+        let got = state.find_by_id("uuid:A").unwrap();
+        assert!(!got.stream_peers().contains(&"192.168.1.66".parse().unwrap()));
+        assert_eq!(state.renderers().len(), 1);
+    }
+
+    #[test]
+    fn conflicting_devices_are_selectable_by_address() {
+        let state = DiscoveryState::new();
+        let mut other = r("Living Room", "uuid:A", "192.168.1.66");
+        other.model_name = Some("Other".into());
+        state.replace(vec![r("Living Room", "uuid:A", "192.168.1.10"), other]);
+        let list = state.renderers();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|x| x.udn_conflict));
+        let ids: Vec<String> = list.iter().map(|x| x.stable_id()).collect();
+        assert!(ids.contains(&"192.168.1.10".to_string()));
+        assert!(ids.contains(&"192.168.1.66".to_string()));
+        assert!(list.iter().any(|x| x.display_name() == "Living Room (192.168.1.66)"));
+        assert!(state.find_by_id("uuid:A").is_none());
+        assert_eq!(state.find_by_id("192.168.1.66").unwrap().model_name.as_deref(), Some("Other"));
     }
 
     #[test]

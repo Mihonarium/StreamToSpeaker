@@ -451,6 +451,8 @@ mod tests {
             group_members: Vec::new(),
             host_addrs: Vec::new(),
             group_member_addrs: Vec::new(),
+            model_name: None,
+            udn_conflict: false,
         }
     }
 

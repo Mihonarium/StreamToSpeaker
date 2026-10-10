@@ -1387,8 +1387,8 @@ impl App {
         if let Some(addrs) = discovery.identity_conflict(id) {
             let addrs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
             return Err(format!(
-                "Several devices on the network ({}) claim to be this speaker, so none was picked. \
-                 Check the devices at those addresses, then rescan.",
+                "Several different devices on the network ({}) claim to be this speaker, so none was \
+                 picked automatically. Pick the entry with the right address from the speaker list.",
                 addrs.join(", ")
             ));
         }
