@@ -127,6 +127,9 @@ typedef struct _STREAM_TO_SPEAKER_DEVICE_EXTENSION {
     BOOLEAN                 SymbolicLinkCreated;
 
     StreamToSpeakerIoctlCtx*      IoctlCtx;
+    /* Entry in the driver's list of devices whose IoctlCtx can be
+     * published to the control device (guarded by a driver-wide mutex). */
+    LIST_ENTRY              LiveLink;
     /* TRUE once IoctlCtx has been withdrawn from the control device
      * (surprise removal or remove): no IOCTL can reach it any more and
      * every IRP that was queued on it has been completed. */
@@ -168,6 +171,18 @@ StreamToSpeakerGetExt(_In_ PDEVICE_OBJECT DeviceObject)
     return reinterpret_cast<PSTREAM_TO_SPEAKER_DEVICE_EXTENSION>(
         static_cast<PUCHAR>(DeviceObject->DeviceExtension)
         + PORT_CLASS_DEVICE_EXTENSION_SIZE);
+}
+
+/* Single read of the extension's IOCTL context for the audio-side
+ * producers (WaveRT DPC, stream state changes, topology setters), so a
+ * caller never checks one value and uses another. */
+inline StreamToSpeakerIoctlCtx*
+StreamToSpeakerExtIoctlCtx(_In_ PSTREAM_TO_SPEAKER_DEVICE_EXTENSION Ext)
+{
+    if (Ext == nullptr) {
+        return nullptr;
+    }
+    return *reinterpret_cast<StreamToSpeakerIoctlCtx* volatile*>(&Ext->IoctlCtx);
 }
 
 /* Must be extern "C" + NTAPI so the function pointer matches the

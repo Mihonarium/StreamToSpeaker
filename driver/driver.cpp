@@ -40,13 +40,17 @@ static UNICODE_STRING g_ControlDeviceName = RTL_CONSTANT_STRING_W(L"\\Device\\St
 
 /* Control-device security.
  *
- * DACL: SYSTEM and Administrators full control; interactively logged-on
- * users (the service is a per-user GUI app started from the Start menu
- * or the HKCU Run key, not a Windows service) read + write, which is
- * what CreateFileW(GENERIC_READ | GENERIC_WRITE) needs. Network logons,
- * services' own accounts, restricted tokens and AppContainers get no
- * access. FILE_DEVICE_SECURE_OPEN applies the same check to opens of
- * any name below the device.
+ * DACL: SYSTEM and Administrators full control; read + write (what
+ * CreateFileW(GENERIC_READ | GENERIC_WRITE) needs) for interactively
+ * logged-on users — the app normally runs as a per-user GUI started
+ * from the Start menu or the HKCU Run key — and for processes running
+ * as a Windows service (the SERVICE logon SID, S-1-5-6; it is written
+ * out because IoCreateDeviceSecure's SDDL subset has no "SU"
+ * abbreviation), so the headless --no-interactive mode can run under a
+ * service account. LocalSystem is covered by SY. Network logons, batch
+ * logons, restricted tokens and AppContainers get no access.
+ * FILE_DEVICE_SECURE_OPEN applies the same check to opens of any name
+ * below the device.
  *
  * Integrity: IoCreateDeviceSecure accepts a DACL only (no S: mandatory
  * label). An unlabeled device object is treated as Medium integrity
@@ -59,7 +63,16 @@ static UNICODE_STRING g_ControlDeviceName = RTL_CONSTANT_STRING_W(L"\\Device\\St
  * The class GUID names the registry key under which an administrator
  * can override this descriptor (Class\{GUID}\Properties). */
 static const UNICODE_STRING g_ControlDeviceSddl = RTL_CONSTANT_STRING_W(
+    L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)(A;;GRGW;;;S-1-5-6)");
+/* Used only if the descriptor above is rejected: the same without the
+ * service ACE, so the interactive app keeps working. */
+static const UNICODE_STRING g_ControlDeviceSddlInteractiveOnly = RTL_CONSTANT_STRING_W(
     L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
+
+/* Name the control device was actually created with (the fixed name, or
+ * a suffixed one after a collision); the symbolic link targets it. */
+static WCHAR          g_ControlDeviceNameBuffer[64];
+static UNICODE_STRING g_ControlDeviceCreatedName;
 
 /* {C82EC36C-B4B0-4DB5-BB28-80E5EE94D83C} */
 DEFINE_GUID(GUID_DEVCLASS_STREAM_TO_SPEAKER_CONTROL,
@@ -90,6 +103,15 @@ static BOOLEAN                 g_ControlSymlinkCreated = FALSE;
  * be freed. Lives in the driver image, so it outlives every context. */
 static EX_RUNDOWN_REF          g_IoctlCtxRundown;
 
+/* Devices whose IoctlCtx may be published, in arrival order. Only one
+ * context is published at a time; when the published device goes away
+ * the next live one takes over. g_IoctlCtxWithdrawing is TRUE while a
+ * published context is being drained, so nothing is published until the
+ * rundown has been re-armed. Both guarded by g_LiveDevicesLock. */
+static FAST_MUTEX              g_LiveDevicesLock;
+static LIST_ENTRY              g_LiveDevices;
+static BOOLEAN                 g_IoctlCtxWithdrawing = FALSE;
+
 static PDRIVER_ADD_DEVICE      g_PortClsAddDevice = nullptr;
 static PDRIVER_DISPATCH        g_PortClsDispatchTable[IRP_MJ_MAXIMUM_FUNCTION + 1];
 
@@ -103,13 +125,19 @@ extern "C" VOID StreamToSpeakerIoctlRefRelease()
     ExReleaseRundownProtection(&g_IoctlCtxRundown);
 }
 
-/* Publish ctx to the control device. The driver serves one virtual
- * device: if a context is already published, the new one stays private
- * (no IOCTL can reach it) rather than silently replacing the other. */
-static BOOLEAN PublishIoctlCtx(StreamToSpeakerIoctlCtx* ctx)
+/* Add ext to the live list and publish its context if none is
+ * published. A second device's context waits in the list instead of
+ * replacing the first one's under its users. PASSIVE_LEVEL. */
+static VOID RegisterLiveDevice(PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext)
 {
-    return InterlockedCompareExchangePointer(
-        (PVOID volatile *)&g_IoctlCtxPtr, (PVOID)ctx, nullptr) == nullptr;
+    PAGED_CODE();
+    ExAcquireFastMutex(&g_LiveDevicesLock);
+    InsertTailList(&g_LiveDevices, &ext->LiveLink);
+    if (!g_IoctlCtxWithdrawing) {
+        InterlockedCompareExchangePointer(
+            (PVOID volatile *)&g_IoctlCtxPtr, (PVOID)ext->IoctlCtx, nullptr);
+    }
+    ExReleaseFastMutex(&g_LiveDevicesLock);
 }
 
 /* Make ext's IOCTL context unreachable and quiescent: clear the global
@@ -125,21 +153,51 @@ static VOID WithdrawIoctlCtx(PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext)
     }
     ext->IoctlCtxWithdrawn = TRUE;
 
+    ExAcquireFastMutex(&g_LiveDevicesLock);
+    RemoveEntryList(&ext->LiveLink);
+    InitializeListHead(&ext->LiveLink);
     BOOLEAN wasPublished =
         InterlockedCompareExchangePointer(
             (PVOID volatile *)&g_IoctlCtxPtr, nullptr, (PVOID)ext->IoctlCtx)
         == (PVOID)ext->IoctlCtx;
+    if (wasPublished) {
+        g_IoctlCtxWithdrawing = TRUE;
+    }
+    ExReleaseFastMutex(&g_LiveDevicesLock);
 
     IoctlBeginClose(ext->IoctlCtx);
 
     if (wasPublished) {
         ExWaitForRundownProtectionRelease(&g_IoctlCtxRundown);
-        /* Re-arm for a device added later; with the pointer cleared a
-         * new reference can only observe nullptr. */
+        /* Re-arm; with the pointer cleared a new reference can only
+         * observe nullptr until the next context is published below. */
         ExReInitializeRundownProtection(&g_IoctlCtxRundown);
+
+        ExAcquireFastMutex(&g_LiveDevicesLock);
+        g_IoctlCtxWithdrawing = FALSE;
+        if (!IsListEmpty(&g_LiveDevices)) {
+            PSTREAM_TO_SPEAKER_DEVICE_EXTENSION next = CONTAINING_RECORD(
+                g_LiveDevices.Flink, STREAM_TO_SPEAKER_DEVICE_EXTENSION, LiveLink);
+            InterlockedExchangePointer(
+                (PVOID volatile *)&g_IoctlCtxPtr, (PVOID)next->IoctlCtx);
+            DBG_INFO("control device now serves the next device");
+        }
+        ExReleaseFastMutex(&g_LiveDevicesLock);
     }
 }
 
+static VOID FreeIoctlCtx(StreamToSpeakerIoctlCtx* ctx)
+{
+    PAGED_CODE();
+    if (ctx != nullptr) {
+        IoctlCtxDestroy(ctx);
+        ExFreePoolWithTag(ctx, STREAM_TO_SPEAKER_POOL_TAG);
+    }
+}
+
+/* Withdraw and free in one go. Only for paths where no audio-side
+ * producer can still run (driver unload); REMOVE frees after PortCls
+ * has torn the device down instead. */
 static VOID DestroyIoctlCtx(PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext)
 {
     PAGED_CODE();
@@ -149,8 +207,7 @@ static VOID DestroyIoctlCtx(PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext)
     WithdrawIoctlCtx(ext);
     StreamToSpeakerIoctlCtx* ctx = ext->IoctlCtx;
     ext->IoctlCtx = nullptr;
-    IoctlCtxDestroy(ctx);
-    ExFreePoolWithTag(ctx, STREAM_TO_SPEAKER_POOL_TAG);
+    FreeIoctlCtx(ctx);
 }
 
 static VOID DisableDeviceInterface(PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext,
@@ -194,9 +251,15 @@ static NTSTATUS CompleteControlIrp(_In_ PIRP Irp, _In_ NTSTATUS Status)
  * g_ControlDeviceSddl for why: the I/O manager has already checked the
  * requested access against the DACL and the implicit Medium no-write-up
  * label, so requiring write here excludes Low-integrity callers even
- * when they ask for read only. MAXIMUM_ALLOWED on its own is refused
- * for the same reason. OriginalDesiredAccess may hold mapped or
- * unmapped generic rights, so accept either form. */
+ * when they ask for read only.
+ *
+ * Write counts as granted if either
+ *  - PreviouslyGrantedAccess has FILE_WRITE_DATA (the result of the I/O
+ *    manager's check; also covers MAXIMUM_ALLOWED opens), or
+ *  - the caller explicitly requested a write right: the open only
+ *    reaches us if everything requested was granted, so this holds
+ *    even if PreviouslyGrantedAccess were not filled in. The request
+ *    may carry mapped or unmapped generic rights; accept either. */
 static NTSTATUS ControlDeviceCheckOpen(_In_ PIRP Irp)
 {
     PAGED_CODE();
@@ -210,10 +273,11 @@ static NTSTATUS ControlDeviceCheckOpen(_In_ PIRP Irp)
         return STATUS_ACCESS_DENIED;
     }
     const ACCESS_MASK writeRights = FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL;
-    if ((sc->AccessState->OriginalDesiredAccess & writeRights) == 0) {
-        return STATUS_ACCESS_DENIED;
+    if ((sc->AccessState->PreviouslyGrantedAccess & FILE_WRITE_DATA) != 0 ||
+        (sc->AccessState->OriginalDesiredAccess & writeRights) != 0) {
+        return STATUS_SUCCESS;
     }
-    return STATUS_SUCCESS;
+    return STATUS_ACCESS_DENIED;
 }
 
 extern "C" NTSTATUS
@@ -285,7 +349,7 @@ StreamToSpeakerDispatchPassThrough(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP I
 /* IRP_MJ_POWER dispatcher.
  *
  * Power IRPs go to every device object the driver owns — that
- * includes our control device (created via IoCreateDevice with
+ * includes our control device (created via IoCreateDeviceSecure with
  * DeviceExtensionSize=0), not just the PortCls-created audio FDO.
  * PortCls's Power handler only knows about the audio FDO; when it
  * sees a Power IRP for our control device it dereferences a
@@ -403,10 +467,11 @@ StreamToSpeakerDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP
  *                     new IOCTLs, queued IRPs completed, in-flight ones
  *                     drained) and disable the device interface. Audio
  *                     streams may still be open, so nothing is freed.
- *   REMOVE_DEVICE     the same if surprise removal did not happen, then
- *                     free the context. All handles to the FDO are
- *                     closed by now, so no stream or topology callback
- *                     can still reach it.
+ *   REMOVE_DEVICE     the same if surprise removal did not happen,
+ *                     forward to PortCls, and only then free the
+ *                     context: PortCls's teardown of the subdevices is
+ *                     the last point where a stream or topology
+ *                     callback could still post into it.
  */
 extern "C" NTSTATUS
 StreamToSpeakerDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
@@ -432,11 +497,18 @@ StreamToSpeakerDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             DisableDeviceInterface(ext, FALSE);
             break;
 
-        case IRP_MN_REMOVE_DEVICE:
+        case IRP_MN_REMOVE_DEVICE: {
             TopologyWithdraw(ext);
-            DestroyIoctlCtx(ext);
+            WithdrawIoctlCtx(ext);
             DisableDeviceInterface(ext, TRUE);
-            break;
+            /* ext->IoctlCtx stays set for PortCls's teardown below. */
+            StreamToSpeakerIoctlCtx* ctx = ext->IoctlCtx;
+            NTSTATUS status = StreamToSpeakerDispatchPassThrough(DeviceObject, Irp);
+            /* The FDO and its extension are gone now; ctx is unreachable
+             * from everywhere. */
+            FreeIoctlCtx(ctx);
+            return status;
+        }
 
         default:
             break;
@@ -475,6 +547,7 @@ StreamToSpeakerAddDeviceInit(
     ext->SymbolicLinkCreated       = FALSE;
     ext->IoctlCtxWithdrawn         = FALSE;
     ext->Topology                  = nullptr;
+    InitializeListHead(&ext->LiveLink);
     RtlInitUnicodeString(&ext->DeviceInterfaceLink, nullptr);
     ExInitializeRundownProtection(&ext->TopologyRundown);
 
@@ -494,20 +567,17 @@ StreamToSpeakerAddDeviceInit(
         return status;
     }
 
-    /* Publish the IoctlCtx so the separate control device's IOCTL
-     * dispatcher can find it. (See driver.cpp top for rationale.) */
-    if (!PublishIoctlCtx(ext->IoctlCtx)) {
-        DBG_WARN("another device already serves the control device; "
-                 "this one is not reachable through IOCTLs");
-    }
+    /* Publish the IoctlCtx (or queue it behind another device's) so the
+     * separate control device's IOCTL dispatcher can find it. (See
+     * driver.cpp top for rationale.) */
+    RegisterLiveDevice(ext);
 
-    /* Register a device interface with a reference string. The reference
-     * string serves as a discriminator: user-mode CreateFileW on the path
-     * returned by SetupDi puts the reference in FileObject->FileName, and
-     * our CREATE dispatcher routes by matching that string. Without a
-     * reference string ksthunk/PortCls reject the open with
-     * STATUS_OBJECT_NAME_NOT_FOUND (the cause of ERROR_FILE_NOT_FOUND we
-     * see when opening the interface path bare). Pattern is SAR-derived. */
+    /* Register a device interface with a reference string. Opens of
+     * that path reach the audio FDO, whose CREATE goes to PortCls, which
+     * does not know the "control" reference and fails the open; the
+     * service then falls back to \\.\StreamToSpeaker (the control
+     * device). The interface is kept so the device stays discoverable
+     * by GUID. */
     {
         UNICODE_STRING ref;
         RtlInitUnicodeString(&ref, STREAM_TO_SPEAKER_CONTROL_REF_STRING);
@@ -525,11 +595,9 @@ StreamToSpeakerAddDeviceInit(
         }
     }
 
-    /* No symbolic link: PortCls's FDO has an anonymous name
-     * (\Device\NNNNNNNN), so \DosDevices\StreamToSpeaker → \Device\StreamToSpeaker
-     * resolves to a non-existent NT name and CreateFileW would return
-     * ERROR_FILE_NOT_FOUND. User-mode goes through the device interface
-     * exclusively. */
+    /* No symbolic link to the FDO: PortCls's FDO has an anonymous name
+     * (\Device\NNNNNNNN). \DosDevices\StreamToSpeaker points at the
+     * control device instead (created in DriverEntry). */
     ext->SymbolicLinkCreated = FALSE;
 
     /* DO_DIRECT_IO for METHOD_OUT_DIRECT IOCTLs. PortCls already
@@ -571,6 +639,36 @@ StreamToSpeakerDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     }
 }
 
+/* Create the control device under Name with g_ControlDeviceSddl. If
+ * that descriptor is rejected as malformed, fall back to the
+ * interactive-only one rather than leaving the driver without a
+ * control device. */
+static NTSTATUS CreateControlDevice(_In_ PDRIVER_OBJECT DriverObject,
+                                   _In_ PUNICODE_STRING Name)
+{
+    PAGED_CODE();
+    NTSTATUS status = IoCreateDeviceSecure(
+        DriverObject,
+        0,                          /* no device-extension; we keep state globally */
+        Name,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,    /* apply the DACL to opens below the device name too */
+        FALSE,                      /* not exclusive — multiple opens OK */
+        &g_ControlDeviceSddl,
+        &GUID_DEVCLASS_STREAM_TO_SPEAKER_CONTROL,
+        &g_ControlDevice);
+    if (status == STATUS_INVALID_PARAMETER) {
+        DBG_WARN("control device SDDL rejected; using the interactive-only descriptor");
+        status = IoCreateDeviceSecure(
+            DriverObject, 0, Name,
+            FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
+            &g_ControlDeviceSddlInteractiveOnly,
+            &GUID_DEVCLASS_STREAM_TO_SPEAKER_CONTROL,
+            &g_ControlDevice);
+    }
+    return status;
+}
+
 extern "C" NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT  DriverObject,
@@ -578,6 +676,8 @@ DriverEntry(
 {
     PAGED_CODE();
     ExInitializeRundownProtection(&g_IoctlCtxRundown);
+    ExInitializeFastMutex(&g_LiveDevicesLock);
+    InitializeListHead(&g_LiveDevices);
 
     NTSTATUS status = PcInitializeAdapterDriver(
         DriverObject, RegistryPath, StreamToSpeakerAddDevice);
@@ -631,50 +731,33 @@ DriverEntry(
      * load returns STATUS_OBJECT_NAME_COLLISION (Code 37). */
     IoDeleteSymbolicLink(&g_SymbolicLink);  /* errors ignored — link may not exist */
 
-    NTSTATUS cdStatus = IoCreateDeviceSecure(
-        DriverObject,
-        0,                          /* no device-extension; we keep state globally */
-        &g_ControlDeviceName,
-        FILE_DEVICE_UNKNOWN,
-        FILE_DEVICE_SECURE_OPEN,    /* apply the DACL to opens below the device name too */
-        FALSE,                      /* not exclusive — multiple opens OK */
-        &g_ControlDeviceSddl,
-        &GUID_DEVCLASS_STREAM_TO_SPEAKER_CONTROL,
-        &g_ControlDevice);
+    g_ControlDeviceCreatedName = g_ControlDeviceName;
+    NTSTATUS cdStatus = CreateControlDevice(DriverObject, &g_ControlDeviceCreatedName);
     if (cdStatus == STATUS_OBJECT_NAME_COLLISION) {
         /* Device object survived a previous load. Without a handle we
-         * can't delete it directly. Best we can do is reuse the name
-         * by picking a fresh one with an instance counter. */
+         * can't delete it directly. Best we can do is pick a fresh name
+         * with a suffix; the symbolic link below follows it. */
         DBG_WARN("control device name collision; reboot to fully clear, retrying with suffix");
-        UNICODE_STRING altName;
-        altName.MaximumLength = 128;
-        altName.Length = 0;
-        altName.Buffer = static_cast<PWSTR>(ExAllocatePool2(
-            POOL_FLAG_PAGED, altName.MaximumLength, STREAM_TO_SPEAKER_POOL_TAG));
-        if (altName.Buffer != nullptr) {
-            ULONG tick = (ULONG)(KeQueryInterruptTime() & 0xFFFF);
-            UNICODE_STRING base = g_ControlDeviceName;
-            RtlCopyUnicodeString(&altName, &base);
-            WCHAR suffix[8];
-            for (int i = 0; i < 4; i++) {
-                WCHAR nib = (WCHAR)((tick >> (i * 4)) & 0xF);
-                suffix[i] = (nib < 10) ? (WCHAR)(L'0' + nib) : (WCHAR)(L'A' + nib - 10);
-            }
-            suffix[4] = 0;
-            UNICODE_STRING suff;
-            RtlInitUnicodeString(&suff, suffix);
-            RtlAppendUnicodeStringToString(&altName, &suff);
-            cdStatus = IoCreateDeviceSecure(
-                DriverObject, 0, &altName,
-                FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
-                &g_ControlDeviceSddl,
-                &GUID_DEVCLASS_STREAM_TO_SPEAKER_CONTROL,
-                &g_ControlDevice);
-            ExFreePoolWithTag(altName.Buffer, STREAM_TO_SPEAKER_POOL_TAG);
+        g_ControlDeviceCreatedName.Buffer        = g_ControlDeviceNameBuffer;
+        g_ControlDeviceCreatedName.Length        = 0;
+        g_ControlDeviceCreatedName.MaximumLength = sizeof(g_ControlDeviceNameBuffer);
+        RtlCopyUnicodeString(&g_ControlDeviceCreatedName, &g_ControlDeviceName);
+        ULONG tick = (ULONG)(KeQueryInterruptTime() & 0xFFFF);
+        WCHAR suffix[8];
+        for (int i = 0; i < 4; i++) {
+            WCHAR nib = (WCHAR)((tick >> (i * 4)) & 0xF);
+            suffix[i] = (nib < 10) ? (WCHAR)(L'0' + nib) : (WCHAR)(L'A' + nib - 10);
+        }
+        suffix[4] = 0;
+        UNICODE_STRING suff;
+        RtlInitUnicodeString(&suff, suffix);
+        cdStatus = RtlAppendUnicodeStringToString(&g_ControlDeviceCreatedName, &suff);
+        if (NT_SUCCESS(cdStatus)) {
+            cdStatus = CreateControlDevice(DriverObject, &g_ControlDeviceCreatedName);
         }
     }
     if (!NT_SUCCESS(cdStatus)) {
-        DBG_ERROR("IoCreateDevice(control) failed 0x%08x", cdStatus);
+        DBG_ERROR("IoCreateDeviceSecure(control) failed 0x%08x", cdStatus);
         return cdStatus;
     }
     g_ControlDevice->Flags |= DO_DIRECT_IO;       /* METHOD_OUT_DIRECT for audio IOCTL */
@@ -682,15 +765,15 @@ DriverEntry(
 
     /* Symlink: after the IoDeleteSymbolicLink above, this should succeed.
      * If we still hit a collision, force-delete and retry. */
-    NTSTATUS slStatus = IoCreateSymbolicLink(&g_SymbolicLink, &g_ControlDeviceName);
+    NTSTATUS slStatus = IoCreateSymbolicLink(&g_SymbolicLink, &g_ControlDeviceCreatedName);
     if (slStatus == STATUS_OBJECT_NAME_COLLISION) {
         IoDeleteSymbolicLink(&g_SymbolicLink);
-        slStatus = IoCreateSymbolicLink(&g_SymbolicLink, &g_ControlDeviceName);
+        slStatus = IoCreateSymbolicLink(&g_SymbolicLink, &g_ControlDeviceCreatedName);
     }
     if (NT_SUCCESS(slStatus)) {
         g_ControlSymlinkCreated = TRUE;
         DBG_INFO("control device created: %wZ  symlink: %wZ",
-                 &g_ControlDeviceName, &g_SymbolicLink);
+                 &g_ControlDeviceCreatedName, &g_SymbolicLink);
     } else {
         DBG_ERROR("IoCreateSymbolicLink failed 0x%08x — control device unreachable",
                   slStatus);

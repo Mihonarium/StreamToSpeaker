@@ -774,7 +774,8 @@ CMiniportTopology::PropertyHandlerJackDescription2(_In_ PPCPROPERTY_REQUEST Requ
 VOID
 CMiniportTopology::PostVolumeEvent_NoLock()
 {
-    if (m_Ext == nullptr || m_Ext->IoctlCtx == nullptr) {
+    StreamToSpeakerIoctlCtx* ctx = StreamToSpeakerExtIoctlCtx(m_Ext);
+    if (ctx == nullptr) {
         return;
     }
     STREAM_TO_SPEAKER_CONTROL_EVENT ev = { };
@@ -788,19 +789,20 @@ CMiniportTopology::PostVolumeEvent_NoLock()
         }
     }
     ev.Data.Volume.LevelMillibels = mb;
-    IoctlPostEvent(m_Ext->IoctlCtx, &ev);
+    IoctlPostEvent(ctx, &ev);
 }
 
 VOID
 CMiniportTopology::PostMuteEvent_NoLock()
 {
-    if (m_Ext == nullptr || m_Ext->IoctlCtx == nullptr) {
+    StreamToSpeakerIoctlCtx* ctx = StreamToSpeakerExtIoctlCtx(m_Ext);
+    if (ctx == nullptr) {
         return;
     }
     STREAM_TO_SPEAKER_CONTROL_EVENT ev = { };
     ev.EventType = StreamToSpeakerEventMuteChanged;
     ev.Data.Mute.Muted = m_Muted ? 1 : 0;
-    IoctlPostEvent(m_Ext->IoctlCtx, &ev);
+    IoctlPostEvent(ctx, &ev);
 }
 
 VOID
