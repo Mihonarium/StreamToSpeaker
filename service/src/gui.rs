@@ -705,8 +705,11 @@ fn palette_for(dark: bool, system_accent: Option<(u8, u8, u8)>) -> Palette {
 // Run
 // -----------------------------------------------------------------------------
 
-pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
-    log::info!("gui::run starting (tray={})", show_tray);
+/// `start_hidden`: launched at sign-in — once the window exists, hide it
+/// to the tray (only when the tray icon was actually created, or the user
+/// would have no way to reach the app).
+pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
+    log::info!("gui::run starting (tray={} start_hidden={})", show_tray, start_hidden);
     // Note: we DON'T use ViewportBuilder::with_taskbar(false). winit
     // implements that by calling ITaskbarList::DeleteTab on the HWND,
     // which puts the window in a half-managed taskbar state where
@@ -801,6 +804,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
             } else {
                 None
             };
+            let hide_to_tray = start_hidden && tray.is_some() && hwnd.is_some();
             if let Some(h) = hwnd {
                 if let Some(t) = tray.as_mut() {
                     t.set_hwnd(h);
@@ -825,7 +829,9 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 // DWM weirdness can leave the window in the
                 // wrong show-state regardless. Cheap to call and
                 // idempotent if the window is already visible.
-                force_show_normal(h);
+                if !hide_to_tray {
+                    force_show_normal(h);
+                }
             }
 
             let skip_close_confirmation = app_for_eframe.is_always_minimise_to_tray();
@@ -850,6 +856,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 last_applied_dark: None,
                 last_applied_accent: None,
                 hwnd,
+                hide_after_first_frame: hide_to_tray,
             }))
         }),
     );
@@ -914,6 +921,10 @@ struct StreamToSpeakerApp {
     /// tray-menu round-trip (emilk/egui#5229, #3655). Bypassing the
     /// queue with raw Win32 sidesteps the bug entirely.
     hwnd: Option<isize>,
+    /// Started from the sign-in entry: hide to the tray as soon as eframe
+    /// has shown the window (it makes the window visible after painting
+    /// the first frame, so hiding any earlier wouldn't stick).
+    hide_after_first_frame: bool,
 }
 
 /// Win32 helpers for hide/show. eframe's `ViewportCommand::Visible` /
@@ -1040,6 +1051,20 @@ impl eframe::App for StreamToSpeakerApp {
         self.sync_window_icon(ctx);
         if self.frame_count == 1 {
             log::info!("first GUI frame painting");
+        }
+        if self.hide_after_first_frame {
+            if self.frame_count >= 2 {
+                self.hide_after_first_frame = false;
+                if let Some(hwnd) = self.hwnd {
+                    log::info!("started at sign-in: hiding to the tray");
+                    win_hide(hwnd);
+                }
+            } else {
+                // Get the second frame right away rather than on the
+                // 100 ms heartbeat, so the window is up as briefly as
+                // possible.
+                ctx.request_repaint();
+            }
         }
 
         if self.last_repaint_request.elapsed() >= Duration::from_millis(100) {
@@ -2632,6 +2657,27 @@ impl StreamToSpeakerApp {
             }
 
             ui.add_space(sp::XS);
+
+            let mut at_sign_in = crate::autostart::is_enabled();
+            advanced_row(
+                ui,
+                p,
+                "Start at sign-in",
+                "Start Stream To Speaker in the tray when you sign in to Windows.",
+                "Adds Stream To Speaker to your Windows startup apps (the same entry the installer's \"Start when I sign in\" option creates). It starts in the notification area without opening this window, and reconnects to your speaker if that's turned on. You can also switch it off in Windows Settings → Apps → Startup.",
+                |ui| {
+                    if ui.checkbox(&mut at_sign_in, "Start when I sign in").changed() {
+                        if let Err(e) = crate::autostart::set_enabled(at_sign_in) {
+                            self.app.record_error(format!(
+                                "Couldn't change the start-at-sign-in setting: {}",
+                                e
+                            ));
+                        }
+                    }
+                },
+            );
+
+            ui.add_space(sp::S);
 
             let mut ppm = self.app.rate_fudge_ppm.load(Ordering::Relaxed) as i64;
             advanced_row(

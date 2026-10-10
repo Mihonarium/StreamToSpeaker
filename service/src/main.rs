@@ -109,6 +109,11 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_tray: bool,
 
+    /// Launched by the sign-in (Run) entry: start in the tray without
+    /// opening the window. Ignored with --no-tray.
+    #[arg(long, default_value_t = false, hide = true)]
+    startup: bool,
+
     /// Enable the HTTP / JSON API and built-in web UI. The audio stream
     /// itself (`/stream.raw`) is always served — Sonos needs it — but the
     /// rest of the endpoints (`/`, `/api/*`) are only registered when
@@ -567,7 +572,9 @@ fn run(cli: Cli) -> Result<()> {
     if cli.headless {
         run_headless(app)
     } else {
-        run_gui_mode(app, cli.no_tray)
+        // Keep an existing sign-in entry pointing at this exe.
+        stream_to_speaker::autostart::reapply();
+        run_gui_mode(app, cli.no_tray, cli.startup && !cli.no_tray)
     }
 }
 
@@ -590,9 +597,9 @@ fn run_headless(app: Arc<App>) -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[cfg(windows)]
-fn run_gui_mode(app: Arc<App>, no_tray: bool) -> Result<()> {
+fn run_gui_mode(app: Arc<App>, no_tray: bool, start_hidden: bool) -> Result<()> {
     // Run the GUI (blocks until window/tray exits).
-    if let Err(e) = stream_to_speaker::gui::run(app.clone(), !no_tray) {
+    if let Err(e) = stream_to_speaker::gui::run(app.clone(), !no_tray, start_hidden) {
         warn!("GUI exited with error: {:#}", e);
         // Surface to the user — without this the process just
         // disappears from the screen (window never created) but
@@ -615,7 +622,7 @@ fn run_gui_mode(app: Arc<App>, no_tray: bool) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn run_gui_mode(_app: Arc<App>, _no_tray: bool) -> Result<()> {
+fn run_gui_mode(_app: Arc<App>, _no_tray: bool, _start_hidden: bool) -> Result<()> {
     anyhow::bail!("GUI mode is Windows-only — pass --headless on this platform")
 }
 

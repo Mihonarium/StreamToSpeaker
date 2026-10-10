@@ -175,15 +175,17 @@ Name: "{group}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; Tasks: 
 Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Registry]
-; Opt-in autostart — runs the GUI when the user signs in. The default
-; mode (no flags) opens the window + adds the system tray; users who
-; ticked this task probably want minimised-to-tray UX. We add /no-tray
-; OFF (i.e. default tray-on) and rely on the window being closable to
-; the tray. A future iteration could add a --minimized flag.
+; Opt-in autostart — runs the app when the user signs in. --startup
+; starts it in the tray without opening the window. The app's own
+; "Start at sign-in" switch reads and writes this same value (same name,
+; same data), so the two never disagree; the app also rewrites an
+; existing value to its current path on each launch.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     ValueType: string; ValueName: "{#MyAppName}"; \
-    ValueData: """{app}\{#MyAppExeName}"""; \
+    ValueData: """{app}\{#MyAppExeName}"" --startup"; \
     Tasks: autostart; Flags: uninsdeletevalue
+; (Uninstall also removes the value when it was turned on from inside the
+; app rather than by this task — see CurUninstallStepChanged in [Code].)
 
 [Run]
 ; 0) Clean up any prior install BEFORE we touch the driver store /
@@ -323,4 +325,13 @@ begin
   if not ClosePriorInstance() then begin
     Result := False;
   end;
+end;
+
+// The app's "Start at sign-in" switch can create the Run value without
+// the autostart task, so uninstall removes it either way.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+    RegDeleteValue(HKEY_CURRENT_USER,
+      'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}');
 end;

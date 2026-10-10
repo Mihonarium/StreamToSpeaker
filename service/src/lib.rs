@@ -25,6 +25,7 @@ pub mod gui_layout;
 pub mod manual_speakers;
 pub mod discovery_net;
 pub mod diagnostics;
+pub mod autostart;
 pub mod now_playing;
 #[cfg(windows)]
 pub mod wasapi_source;
