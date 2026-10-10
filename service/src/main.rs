@@ -251,7 +251,7 @@ fn main() {
     // Single-instance gate. If another instance is already running,
     // raise its window and exit — same pattern as Slack / Discord /
     // OBS. Without this, the duplicate launch races to bind port 5901,
-    // tiny_http fails with WSAEADDRINUSE, run() returns Err, the
+    // the HTTP bind fails with WSAEADDRINUSE, run() returns Err, the
     // process exits silently — and the user sees the FIRST instance
     // in task manager and assumes the new install "doesn't open".
     // Skipped in --headless: headless is for service / CLI runs where
@@ -764,6 +764,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         latency_adjust: Some(latency_adjust),
         web_ui_enabled: Some(app.web_ui_enabled.clone()),
         stream_client_allowed: Some(stream_client_allowed),
+        extra_hosts: vec![app.config.advertise_ip.clone()],
     })
 }
 
