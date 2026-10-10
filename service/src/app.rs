@@ -21,11 +21,12 @@ use crate::airplay::{
     AirPlay2Session, AirPlay2SessionConfig, AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession,
     AirPlaySessionConfig, Ap2StartError, Transport,
 };
+use crate::discovery_net::{self, MdnsController, NetAdapter, Resolved, SavedAdapter};
 use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
 use crate::manual_speakers::{self, ManualKind, ManualSpeaker};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
-use crate::ssdp::{DiscoveryState, Renderer};
+use crate::ssdp::{DiscoveryState, Renderer, SearchScope};
 use crate::stream_gate::{canonical_ip, is_local_address, Grant, StreamGate};
 use crate::user_config::UserConfig;
 use crate::volume_sync::VolumeSync;
@@ -306,6 +307,31 @@ pub struct App {
     /// last connect (the probe result), keyed by id — so the PIN ceremony
     /// and other lookups by id find them without re-probing.
     manual_resolved: Mutex<std::collections::HashMap<String, AirPlayRenderer>>,
+
+    /// Discovery's adapter state as last applied (see `discovery_net`):
+    /// every adapter, one adapter, or paused because it is down.
+    discovery_scope: Mutex<Resolved>,
+    /// The machine's adapters as of the last network check, for the
+    /// adapter selector (refreshed every couple of seconds off-thread).
+    adapters_cache: Mutex<Vec<NetAdapter>>,
+    /// The mDNS browser, rebuilt when the chosen adapter changes.
+    mdns: Mutex<Option<MdnsController>>,
+    /// Serialises scope changes (the monitor thread vs. a settings edit).
+    scope_apply: Mutex<()>,
+    /// Why AirPlay discovery couldn't start, if it couldn't.
+    discovery_error: Mutex<Option<String>>,
+}
+
+/// Discovery-network state for the settings UI.
+#[derive(Clone, Debug)]
+pub struct DiscoveryNetStatus {
+    pub scope: Resolved,
+    /// The saved choice (`None` = every adapter).
+    pub selected: Option<SavedAdapter>,
+    /// Set when `--advertise-ip` / `--bind` pins SSDP to one address; the
+    /// adapter choice is then ignored.
+    pub pinned: Option<Ipv4Addr>,
+    pub error: Option<String>,
 }
 
 /// A PIN pairing ceremony in flight (see [`App::begin_pin_pairing`]).
@@ -418,6 +444,11 @@ impl App {
             connecting: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
             manual_resolved: Mutex::new(std::collections::HashMap::new()),
+            discovery_scope: Mutex::new(Resolved::All),
+            adapters_cache: Mutex::new(Vec::new()),
+            mdns: Mutex::new(None),
+            scope_apply: Mutex::new(()),
+            discovery_error: Mutex::new(None),
         })
     }
 
@@ -2153,6 +2184,166 @@ impl App {
         crate::endpoint_name::update_endpoint_name(None);
     }
 
+    // -------------------------------------------------------------------
+    // Discovery network (adapter selection)
+    // -------------------------------------------------------------------
+
+    /// Start SSDP (every `ssdp_interval`) and mDNS discovery on the saved
+    /// adapter choice, plus the monitor that pauses / resumes them as that
+    /// adapter goes down and comes back.
+    pub fn start_discovery(self: &Arc<Self>, ssdp_interval: Duration) {
+        let adapters = discovery_net::list_adapters();
+        let resolved = self.resolve_scope(&adapters);
+        info!("discovery: {:?}", resolved);
+        *self.adapters_cache.lock().unwrap() = adapters;
+        *self.discovery_scope.lock().unwrap() = resolved.clone();
+
+        if let Some(d) = self.discovery.clone() {
+            let weak = Arc::downgrade(self);
+            let scope: crate::ssdp::ScopeFn = Arc::new(move || {
+                weak.upgrade().map(|a| a.ssdp_scope()).unwrap_or(SearchScope::Paused)
+            });
+            crate::ssdp::spawn_discovery(d, ssdp_interval, scope);
+        }
+        if let Some(state) = self.airplay_discovery.clone() {
+            let ctl = MdnsController::new(state);
+            let started = match &resolved {
+                Resolved::All => ctl.start(None),
+                Resolved::Active { name, .. } => ctl.start(Some(name)),
+                Resolved::Paused { .. } => Ok(()),
+            };
+            if let Err(e) = started {
+                self.note_discovery_failure(&e);
+            }
+            *self.mdns.lock().unwrap() = Some(ctl);
+        }
+
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-netwatch".into())
+            .spawn(move || {
+                while app.sleep_unless_shutdown(Duration::from_secs(2)) {
+                    app.refresh_discovery_scope();
+                }
+            })
+            .ok();
+    }
+
+    fn note_discovery_failure(&self, e: &anyhow::Error) {
+        let msg = format!(
+            "AirPlay discovery couldn't start ({:#}). You can still add AirPlay speakers \
+             by address with the Add button.",
+            e
+        );
+        self.record_error(msg.clone());
+        *self.discovery_error.lock().unwrap() = Some(msg);
+    }
+
+    /// The saved adapter choice mapped onto `adapters`. A command-line pin
+    /// (`--advertise-ip` / `--bind`) overrides it: SSDP then searches from
+    /// that address and mDNS from every adapter, as before the choice
+    /// existed.
+    fn resolve_scope(&self, adapters: &[NetAdapter]) -> Resolved {
+        if self.config.ssdp_iface.is_some() {
+            return Resolved::All;
+        }
+        let selected = self.user_config.lock().unwrap().discovery_adapter.clone();
+        discovery_net::resolve(selected.as_ref(), adapters)
+    }
+
+    /// Where SSDP searches right now.
+    pub fn ssdp_scope(&self) -> SearchScope {
+        if let Some(ip) = self.config.ssdp_iface {
+            return SearchScope::Iface(ip);
+        }
+        match &*self.discovery_scope.lock().unwrap() {
+            Resolved::All => SearchScope::All,
+            Resolved::Active { ip, .. } => SearchScope::Iface(*ip),
+            Resolved::Paused { .. } => SearchScope::Paused,
+        }
+    }
+
+    /// Re-check the adapters and apply any change of scope: restart mDNS
+    /// on the new interface set (or stop it while paused), forget what
+    /// was found on the old network, and search again.
+    fn refresh_discovery_scope(self: &Arc<Self>) {
+        let _serial = self.scope_apply.lock().unwrap();
+        let adapters = discovery_net::list_adapters();
+        let new = self.resolve_scope(&adapters);
+        *self.adapters_cache.lock().unwrap() = adapters;
+        let old = std::mem::replace(&mut *self.discovery_scope.lock().unwrap(), new.clone());
+        if old == new {
+            return;
+        }
+        match &new {
+            Resolved::All => info!("discovery: searching on every adapter"),
+            Resolved::Active { name, ip } => info!("discovery: searching on {} ({})", name, ip),
+            Resolved::Paused { name } => {
+                warn!("discovery: paused — adapter {} is unavailable", name)
+            }
+        }
+        if let Some(ctl) = self.mdns.lock().unwrap().as_ref() {
+            let same_adapter = matches!(
+                (&old, &new),
+                (Resolved::Active { name: a, .. }, Resolved::Active { name: b, .. }) if a == b
+            );
+            let result = match &new {
+                // The mDNS stack follows address changes on the same
+                // adapter by itself.
+                _ if same_adapter => Ok(()),
+                Resolved::All => ctl.start(None),
+                Resolved::Active { name, .. } => ctl.start(Some(name)),
+                Resolved::Paused { .. } => {
+                    ctl.stop();
+                    Ok(())
+                }
+            };
+            match result {
+                Ok(()) => *self.discovery_error.lock().unwrap() = None,
+                Err(e) => self.note_discovery_failure(&e),
+            }
+        }
+        if let Some(d) = self.discovery.as_ref() {
+            d.clear();
+        }
+        if !matches!(new, Resolved::Paused { .. }) {
+            self.trigger_rescan();
+        }
+    }
+
+    /// Settings: the adapters to offer (as of the last check, at most a
+    /// couple of seconds old).
+    pub fn network_adapters(&self) -> Vec<NetAdapter> {
+        self.adapters_cache.lock().unwrap().clone()
+    }
+
+    pub fn discovery_net_status(&self) -> DiscoveryNetStatus {
+        DiscoveryNetStatus {
+            scope: self.discovery_scope.lock().unwrap().clone(),
+            selected: self.user_config.lock().unwrap().discovery_adapter.clone(),
+            pinned: self.config.ssdp_iface,
+            error: self.discovery_error.lock().unwrap().clone(),
+        }
+    }
+
+    /// Persist a new adapter choice (`None` = every adapter) and apply it
+    /// off the calling thread (restarting mDNS takes a moment).
+    pub fn set_discovery_adapter(self: &Arc<Self>, choice: Option<SavedAdapter>) {
+        {
+            let mut uc = self.user_config.lock().unwrap();
+            if uc.discovery_adapter == choice {
+                return;
+            }
+            uc.discovery_adapter = choice;
+            uc.save();
+        }
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-netapply".into())
+            .spawn(move || app.refresh_discovery_scope())
+            .ok();
+    }
+
     /// Fire a one-shot SSDP M-SEARCH on the same interface the periodic
     /// loop uses. Runs on a detached thread because `discover_once`
     /// blocks for ~3 s waiting for responses; the GUI button doesn't
@@ -2168,12 +2359,26 @@ impl App {
         if self.rescan_in_flight.swap(true, Ordering::AcqRel) {
             return;
         }
-        let iface = self.config.ssdp_iface;
+        let scope = self.ssdp_scope();
+        let Some(iface) = scope.iface() else {
+            self.rescan_in_flight.store(false, Ordering::Release);
+            if let Resolved::Paused { name } = &*self.discovery_scope.lock().unwrap() {
+                self.record_error(format!(
+                    "Speaker search is paused: the network adapter \"{}\" is unavailable. \
+                     It resumes when the adapter is back, or choose another adapter in \
+                     Advanced.",
+                    name
+                ));
+            }
+            return;
+        };
         let app = self.clone();
         let spawned = std::thread::Builder::new()
             .name("stream-to-speaker-rescan".to_string())
             .spawn(move || {
                 match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
+                    // Searched the old network; the scope moved meanwhile.
+                    Ok(_) if app.ssdp_scope() != scope => {}
                     Ok(found) => {
                         let n = found.len();
                         info!("manual rescan: {} renderer(s) found", n);

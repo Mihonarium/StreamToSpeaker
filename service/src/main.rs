@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use stream_to_speaker::airplay::{spawn_airplay_discovery, AirPlayDiscoveryState};
+use stream_to_speaker::airplay::AirPlayDiscoveryState;
 use stream_to_speaker::app::{App, AppConfig};
 use stream_to_speaker::audio_source::AudioSource;
 use stream_to_speaker::gena::parse_rendering_notify;
@@ -43,7 +43,7 @@ use stream_to_speaker::http_server::{
 use stream_to_speaker::picker;
 use stream_to_speaker::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use stream_to_speaker::sine_source::SineSource;
-use stream_to_speaker::ssdp::{spawn_discovery, DiscoveryState};
+use stream_to_speaker::ssdp::{spawn_discovery, DiscoveryState, SearchScope};
 use stream_to_speaker::{audio_loop, PRODUCT_NAME};
 #[cfg(windows)]
 use stream_to_speaker::wasapi_source::WasapiLoopbackSource;
@@ -658,29 +658,10 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind)
     };
 
-    let discovery = if cli.no_discovery {
-        None
-    } else {
-        let state = DiscoveryState::new();
-        spawn_discovery(
-            state.clone(),
-            Duration::from_secs(cli.ssdp_interval * 60),
-            ssdp_iface,
-        );
-        Some(state)
-    };
-
-    let airplay_discovery = if cli.no_airplay {
-        None
-    } else {
-        let state = AirPlayDiscoveryState::new();
-        if let Err(e) = spawn_airplay_discovery(state.clone(), ssdp_iface) {
-            warn!("AirPlay discovery failed to start: {} (continuing without it)", e);
-            None
-        } else {
-            Some(state)
-        }
-    };
+    // The browsers are started by the app once its saved settings (the
+    // chosen network adapter) are loaded.
+    let discovery = (!cli.no_discovery).then(DiscoveryState::new);
+    let airplay_discovery = (!cli.no_airplay).then(AirPlayDiscoveryState::new);
 
     let config = AppConfig {
         advertise_ip,
@@ -694,7 +675,9 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         ssdp_iface,
     };
 
-    Ok(App::new(config, discovery, airplay_discovery))
+    let app = App::new(config, discovery, airplay_discovery);
+    app.start_discovery(Duration::from_secs(cli.ssdp_interval * 60));
+    Ok(app)
 }
 
 // -----------------------------------------------------------------------------
@@ -784,10 +767,14 @@ fn cmd_list_speakers(cli: &Cli) -> Result<()> {
     }
     let state = DiscoveryState::new();
     let ssdp_iface = stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind);
+    let scope = match ssdp_iface {
+        Some(ip) => SearchScope::Iface(ip),
+        None => SearchScope::All,
+    };
     spawn_discovery(
         state.clone(),
         Duration::from_secs(cli.ssdp_interval * 60),
-        ssdp_iface,
+        Arc::new(move || scope),
     );
     let renderers = picker::wait_for_first_discovery(&state, Duration::from_secs(5));
     let n = picker::print_speaker_list(&renderers);

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::airplay::hap_pairing::PairingCredentials;
+use crate::discovery_net::SavedAdapter;
 use crate::manual_speakers::ManualSpeaker;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -170,6 +171,10 @@ pub struct UserConfig {
     /// order they were added.
     #[serde(default)]
     pub manual_speakers: Vec<ManualSpeaker>,
+    /// The one network adapter speaker discovery runs on; `None` = every
+    /// adapter (see `discovery_net`).
+    #[serde(default)]
+    pub discovery_adapter: Option<SavedAdapter>,
 }
 
 /// Default AirPlay buffer — iTunes' 2 s (88200 samples at 44.1 kHz).

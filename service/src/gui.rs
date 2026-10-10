@@ -2325,6 +2325,23 @@ impl StreamToSpeakerApp {
                         .color(p.text_secondary),
                 );
             }
+            {
+                let net = self.app.discovery_net_status();
+                if let crate::discovery_net::Resolved::Paused { name } = &net.scope {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "⚠  Speaker search is paused: the network adapter \"{}\" is \
+                             unavailable (see Advanced).",
+                            name
+                        ))
+                        .size(12.0)
+                        .color(p.warn),
+                    );
+                }
+                if let Some(err) = net.error.as_deref() {
+                    ui.label(egui::RichText::new(err).size(12.0).color(p.danger));
+                }
+            }
             ui.add_space(sp::XS);
 
             let view = self.app.speaker_view();
@@ -2822,6 +2839,10 @@ impl StreamToSpeakerApp {
 
             ui.add_space(sp::S);
 
+            self.show_discovery_adapter(ui, p);
+
+            ui.add_space(sp::S);
+
             let mut privacy = self.app.is_privacy_mode();
             advanced_row(
                 ui,
@@ -2856,6 +2877,102 @@ impl StreamToSpeakerApp {
                 }
             }
         });
+    }
+
+    /// Advanced → which network adapter speaker discovery runs on.
+    fn show_discovery_adapter(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        use crate::discovery_net::{Resolved, SavedAdapter};
+        let status = self.app.discovery_net_status();
+        let adapters = self.app.network_adapters();
+        advanced_row(
+            ui,
+            p,
+            "Discovery network adapter",
+            "Search for speakers on every network adapter, or on one only.",
+            "By default the app looks for speakers on every network this PC is connected to. If a VPN, a virtual-machine adapter or a second network gets in the way, pick the adapter your speakers are on. If that adapter goes away (cable unplugged, Wi-Fi off), searching pauses until it's back — it never quietly switches to the other adapters. Speakers you added by address and the audio stream itself aren't affected.",
+            |ui| {
+                let label_for = |sel: &Option<SavedAdapter>| -> String {
+                    match sel {
+                        None => "All adapters".to_string(),
+                        Some(s) => match adapters.iter().find(|a| a.key == s.key) {
+                            Some(a) if a.usable_ipv4().is_some() => a.name.clone(),
+                            Some(a) => format!("{} (unavailable)", a.name),
+                            None => format!("{} (unavailable)", s.name),
+                        },
+                    }
+                };
+                let mut choice = status.selected.clone();
+                ui.add_enabled_ui(status.pinned.is_none(), |ui| {
+                    egui::ComboBox::from_id_salt("discovery_adapter")
+                        .selected_text(label_for(&choice))
+                        .width(320.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut choice, None, "All adapters");
+                            for a in &adapters {
+                                let addrs = if a.ipv4.is_empty() {
+                                    "no IPv4 address".to_string()
+                                } else {
+                                    a.ipv4
+                                        .iter()
+                                        .map(|ip| ip.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                };
+                                let state = if a.usable_ipv4().is_some() {
+                                    "connected"
+                                } else {
+                                    "unavailable"
+                                };
+                                ui.selectable_value(
+                                    &mut choice,
+                                    Some(SavedAdapter { key: a.key.clone(), name: a.name.clone() }),
+                                    format!("{} — {} ({})", a.name, addrs, state),
+                                );
+                            }
+                            // A saved adapter that's gone stays listed.
+                            if let Some(s) = status.selected.as_ref() {
+                                if !adapters.iter().any(|a| a.key == s.key) {
+                                    ui.selectable_value(
+                                        &mut choice,
+                                        Some(s.clone()),
+                                        format!("{} — not present (unavailable)", s.name),
+                                    );
+                                }
+                            }
+                        });
+                });
+                if choice != status.selected {
+                    self.app.set_discovery_adapter(choice);
+                }
+            },
+        );
+        let (text, color) = match (&status.pinned, &status.scope) {
+            (Some(ip), _) => (
+                format!(
+                    "Searching from {} (set on the command line); this choice is ignored.",
+                    ip
+                ),
+                p.text_secondary,
+            ),
+            (None, Resolved::All) => {
+                ("Searching on every network adapter.".to_string(), p.text_secondary)
+            }
+            (None, Resolved::Active { name, ip }) => {
+                (format!("Searching only on {} ({}).", name, ip), p.text_secondary)
+            }
+            (None, Resolved::Paused { name }) => (
+                format!(
+                    "⚠  Search paused: {} is unavailable. It resumes when the adapter is \
+                     back. Speakers added by address still work.",
+                    name
+                ),
+                p.warn,
+            ),
+        };
+        ui.label(egui::RichText::new(text).size(12.0).color(color));
+        if let Some(err) = status.error.as_deref() {
+            ui.label(egui::RichText::new(err).size(12.0).color(p.danger));
+        }
     }
 
     fn show_web_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {

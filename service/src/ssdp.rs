@@ -120,6 +120,12 @@ impl DiscoveryState {
         None
     }
 
+    /// Forget every renderer (discovery moved to another network, or
+    /// paused because its adapter went away).
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().clear();
+    }
+
     pub fn first(&self) -> Option<Renderer> {
         self.inner.lock().unwrap().first().cloned()
     }
@@ -215,20 +221,52 @@ const SEARCH_TARGETS: &[&str] = &[
 
 const SSDP_MULTICAST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900);
 
+/// Where an SSDP search goes out from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchScope {
+    /// Every non-loopback IPv4 interface.
+    All,
+    /// One local IPv4 only (a pinned address or the chosen adapter's).
+    Iface(Ipv4Addr),
+    /// Don't search: the chosen adapter is unavailable, and searching
+    /// elsewhere instead would defeat the choice.
+    Paused,
+}
+
+impl SearchScope {
+    /// The `iface` argument of [`discover_once`], or None when paused.
+    pub fn iface(self) -> Option<Option<Ipv4Addr>> {
+        match self {
+            SearchScope::All => Some(None),
+            SearchScope::Iface(ip) => Some(Some(ip)),
+            SearchScope::Paused => None,
+        }
+    }
+}
+
+/// Shared "where to search" query, re-read before every sweep.
+pub type ScopeFn = Arc<dyn Fn() -> SearchScope + Send + Sync>;
+
 /// Spawn the SSDP discovery background thread.  Runs an initial discovery
-/// immediately and then every `interval` afterwards.
-/// `iface` pins the search to one local IPv4; `None` searches from every
-/// interface (see [`discover_once`]).
-pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, iface: Option<Ipv4Addr>) {
+/// immediately and then every `interval` afterwards, each sweep from
+/// wherever `scope` says at that moment (see [`discover_once`]). A sweep
+/// whose scope changed while it ran is discarded — its results belong to
+/// the old network.
+pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, scope: ScopeFn) {
     thread::Builder::new()
         .name("stream-to-speaker-ssdp".to_string())
         .spawn(move || loop {
-            match discover_once(Duration::from_secs(3), iface) {
-                Ok(found) => {
-                    info!("SSDP discovery: {} renderer(s) found", found.len());
-                    state.replace(found);
-                }
-                Err(e) => warn!("SSDP discovery failed: {}", e),
+            let used = scope();
+            match used.iface() {
+                None => debug!("SSDP discovery paused (chosen adapter unavailable)"),
+                Some(iface) => match discover_once(Duration::from_secs(3), iface) {
+                    Ok(found) if scope() == used => {
+                        info!("SSDP discovery: {} renderer(s) found", found.len());
+                        state.replace(found);
+                    }
+                    Ok(_) => debug!("SSDP sweep discarded: discovery scope changed meanwhile"),
+                    Err(e) => warn!("SSDP discovery failed: {}", e),
+                },
             }
             thread::sleep(interval);
         })
