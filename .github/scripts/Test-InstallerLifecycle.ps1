@@ -116,6 +116,9 @@ function Invoke-Setup([string]$exe, [string]$label) {
     Write-Host "Running $(Split-Path $exe -Leaf) silently (log: $log)"
     $p = Start-Process -FilePath $exe -PassThru -ArgumentList @(
         "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/LOG=`"$log`"")
+    # Touching the handle keeps it open, so ExitCode is still readable after
+    # the process exits (otherwise it can come back $null).
+    $null = $p.Handle
     if (-not $p.WaitForExit(15 * 60 * 1000)) {
         $p | Stop-Process -Force -ErrorAction SilentlyContinue
         throw "setup did not finish within 15 minutes (a dialog waiting for input?)"
@@ -131,6 +134,7 @@ function Invoke-Uninstall([string]$label) {
     Write-Host "Running $exe silently (log: $log)"
     $p = Start-Process -FilePath $exe -PassThru -ArgumentList @(
         "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$log`"")
+    $null = $p.Handle
     if (-not $p.WaitForExit(15 * 60 * 1000)) {
         $p | Stop-Process -Force -ErrorAction SilentlyContinue
         throw "uninstaller did not finish within 15 minutes"
