@@ -22,6 +22,7 @@ use crate::airplay::{
     AirPlaySessionConfig, Ap2StartError, Transport,
 };
 use crate::discovery_net::{self, MdnsController, NetAdapter, Resolved, SavedAdapter};
+use crate::diagnostics::{Fault, Snapshot};
 use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
 use crate::manual_speakers::{self, ManualKind, ManualSpeaker};
@@ -129,6 +130,15 @@ impl ActiveSession {
     /// True if the session has died mid-stream (dropped receiver). UPnP
     /// is HTTP-pull (the speaker reconnects on its own), so only the
     /// AirPlay push paths report death here.
+    /// Short protocol label for diagnostics.
+    pub fn transport_label(&self) -> &'static str {
+        match self {
+            ActiveSession::Upnp(_) => "UPnP",
+            ActiveSession::AirPlay(_) => "AirPlay (RAOP)",
+            ActiveSession::AirPlay2(_) => "AirPlay 2",
+        }
+    }
+
     pub fn is_dead(&self) -> bool {
         match self {
             ActiveSession::Upnp(_) => false,
@@ -252,7 +262,17 @@ pub struct App {
 
     // ---- Stats (best-effort, advisory) ----
     pub packets_published_total: Arc<AtomicU64>,
+    /// Of `packets_published_total`, the silence generated while Windows
+    /// had no stream running.
+    pub idle_silence_packets: Arc<AtomicU64>,
     pub started_at: Instant,
+    /// Id of the bound session and when it came up (session uptime).
+    session_started: Mutex<Option<(String, Instant)>>,
+    /// Automatic reconnects since the user last picked a speaker.
+    reconnects: AtomicU32,
+    /// The last dropped / failed connection, with the counters as they
+    /// were just before it. Kept until the next fault, across reconnects.
+    last_fault: Mutex<Option<Fault>>,
 
     // ---- Lifecycle ----
     pub shutdown: Arc<AtomicBool>,
@@ -432,7 +452,11 @@ impl App {
             silence_pace_ms: Arc::new(AtomicU64::new(10)),
             latency_adjust_step_frames: Arc::new(AtomicU32::new(4)),
             packets_published_total: Arc::new(AtomicU64::new(0)),
+            idle_silence_packets: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
+            session_started: Mutex::new(None),
+            reconnects: AtomicU32::new(0),
+            last_fault: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             update: Mutex::new(UpdateState::default()),
             rescan_in_flight: Arc::new(AtomicBool::new(false)),
@@ -1167,6 +1191,7 @@ impl App {
     ///
     /// [`select_speaker_async_opts`]: App::select_speaker_async_opts
     pub fn select_speaker_async(self: &Arc<Self>, id: &str) {
+        self.reconnects.store(0, Ordering::Relaxed);
         self.select_speaker_async_opts(id, true);
     }
 
@@ -1193,7 +1218,9 @@ impl App {
                 let result = app.select_speaker_opts(&id, interactive);
                 *app.connecting.lock().unwrap() = None;
                 if let Err(e) = result {
-                    app.record_error(format!("Couldn't connect to speaker: {}", e));
+                    let msg = format!("Couldn't connect to speaker: {}", e);
+                    app.record_fault(&msg);
+                    app.record_error(msg);
                 }
             })
             .ok();
@@ -1245,6 +1272,7 @@ impl App {
                         name,
                         RECONNECT_GRACE.as_secs()
                     );
+                    app.record_fault(&format!("Connection to {} dropped", name));
                     app.record_error(format!("Lost connection to {} — reconnecting…", name));
 
                     // Grace before the retry, cancellable by shutdown or a
@@ -1285,6 +1313,7 @@ impl App {
                     // (no hammering a gone speaker / poking the Sonos hold).
                     // Non-interactive: an unattended retry must never pop
                     // a PIN pairing prompt on the user's TV.
+                    app.reconnects.fetch_add(1, Ordering::Relaxed);
                     app.select_speaker_async_opts(&id, false);
                     while app.connecting.lock().unwrap().is_some() {
                         if app.is_shutting_down() {
@@ -1498,6 +1527,7 @@ impl App {
         self.prune_stream_clients();
 
         *self.last_speaker_id.lock().unwrap() = Some(actual_id.clone());
+        *self.session_started.lock().unwrap() = Some((actual_id.clone(), Instant::now()));
         self.streaming_enabled.store(true, Ordering::Release);
         // Persist so the next launch can auto-reconnect. We do NOT
         // auto-dismiss the onboarding here — picking a speaker only
@@ -2563,6 +2593,103 @@ impl App {
 
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    // -------------------------------------------------------------------
+    // Diagnostics
+    // -------------------------------------------------------------------
+
+    /// Counters and state right now. Brief locks only.
+    pub fn diagnostics_snapshot(&self) -> Snapshot {
+        let (speaker, speaker_id, speaker_addr, transport, resend) = {
+            let guard = self.session.lock().unwrap();
+            match guard.as_ref() {
+                Some(s) => (
+                    Some(s.friendly_name()),
+                    Some(s.stable_id()),
+                    Some(s.ip().to_string()),
+                    Some(s.transport_label()),
+                    s.resend_stats(),
+                ),
+                None => (None, None, None, None, None),
+            }
+        };
+        let session_secs = self
+            .session_started
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(id, _)| speaker_id.as_deref() == Some(id.as_str()))
+            .map(|(_, t)| t.elapsed().as_secs());
+        let airplay_buffer_ms = speaker_id
+            .as_deref()
+            .filter(|id| id.starts_with("airplay:"))
+            .map(|id| self.airplay_latency_ms_for(id));
+        let discovery = match &*self.discovery_scope.lock().unwrap() {
+            _ if self.config.no_discovery && self.airplay_discovery.is_none() => {
+                "off".to_string()
+            }
+            Resolved::All => match self.config.ssdp_iface {
+                Some(ip) => format!("SSDP from {}, mDNS on every adapter", ip),
+                None => "every adapter".to_string(),
+            },
+            Resolved::Active { name, ip } => format!("{} ({}) only", name, ip),
+            Resolved::Paused { name } => format!("paused ({} unavailable)", name),
+        };
+        Snapshot {
+            taken_unix: now_unix(),
+            app_uptime_secs: self.uptime_secs(),
+            speaker,
+            speaker_id,
+            speaker_addr,
+            transport,
+            session_secs,
+            reconnects: self.reconnects.load(Ordering::Relaxed),
+            streaming_enabled: self.is_streaming_enabled(),
+            audio_active: self.stream_active.load(Ordering::Acquire),
+            connecting_to: self.connecting_to(),
+            packets_published: self.packets_published(),
+            idle_silence_packets: self.idle_silence_packets.load(Ordering::Relaxed),
+            dropped_packets: self.hub.dropped_frames(),
+            hub_consumers: self.hub.subscriber_count(),
+            resend,
+            pending_latency_ms: self.pending_latency_ms(),
+            airplay_buffer_ms,
+            stream_format: "L16 PCM, 44.1 kHz, 16-bit, stereo",
+            discovery,
+            speakers_listed: self.speaker_view().speakers.len(),
+        }
+    }
+
+    /// Remember a fault together with the counters just before it.
+    fn record_fault(&self, what: &str) {
+        let before = self.diagnostics_snapshot();
+        *self.last_fault.lock().unwrap() = Some(Fault {
+            when_unix: now_unix(),
+            what: what.to_string(),
+            before,
+        });
+    }
+
+    pub fn last_fault(&self) -> Option<Fault> {
+        self.last_fault.lock().unwrap().clone()
+    }
+
+    /// Plain-text diagnostics for the clipboard.
+    pub fn diagnostics_report(&self) -> String {
+        let last_error = self.last_error.lock().unwrap().as_ref().map(|(m, _)| m.clone());
+        crate::diagnostics::report(
+            PRODUCT_NAME,
+            crate::display_version(),
+            &self.diagnostics_snapshot(),
+            last_error.as_deref(),
+            self.last_fault().as_ref(),
+        )
+    }
+
+    /// The AirPlay buffer used when connecting to `id`.
+    pub fn airplay_latency_ms_for(&self, _id: &str) -> u32 {
+        self.user_config.lock().unwrap().effective_airplay_latency_ms()
     }
 
     // -------------------------------------------------------------------

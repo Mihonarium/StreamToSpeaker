@@ -74,6 +74,9 @@ pub struct PcmFrame(pub Arc<Vec<u8>>);
 /// Hub used by the audio thread to push PCM and by HTTP workers to pull.
 pub struct StreamHub {
     subscribers: Mutex<Vec<HubSubscriber>>,
+    /// Frames a subscriber's full queue had no room for (dropped for that
+    /// subscriber only), since launch.
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 struct HubSubscriber {
@@ -87,6 +90,7 @@ impl StreamHub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             subscribers: Mutex::new(Vec::new()),
+            dropped: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -119,6 +123,8 @@ impl StreamHub {
                 Err(crossbeam_channel::TrySendError::Full(_)) => {
                     // Drop the frame for this slow subscriber; they'll
                     // catch up.  We keep them subscribed.
+                    self.dropped
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     true
                 }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
@@ -136,6 +142,11 @@ impl StreamHub {
         let before = subs.len();
         subs.retain(|sub| !sub.peer.map(&pred).unwrap_or(false));
         before - subs.len()
+    }
+
+    /// Frames dropped for slow subscribers since launch.
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Current subscriber count.

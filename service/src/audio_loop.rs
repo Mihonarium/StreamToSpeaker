@@ -65,6 +65,7 @@ pub fn run(app: Arc<App>, mut source: Box<dyn AudioSource>) -> Result<()> {
                 std::thread::sleep(next_silence_deadline - now);
             }
             next_silence_deadline = next_silence_deadline.max(now) + pace;
+            app.idle_silence_packets.fetch_add(1, Ordering::Relaxed);
             AudioPacket::silence(SILENCE_FRAMES)
         };
 

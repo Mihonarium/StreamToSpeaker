@@ -844,6 +844,8 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 skip_close_confirmation,
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
+                diagnostics_open: false,
+                diagnostics_copied_at: None,
                 onboarding_dismissed: false,
                 last_applied_dark: None,
                 last_applied_accent: None,
@@ -874,6 +876,11 @@ struct StreamToSpeakerApp {
     skip_close_confirmation: bool,
     theme_mode: ThemeMode,
     advanced_open: bool,
+    /// The Diagnostics card is expanded (its counters are only gathered
+    /// while it is).
+    diagnostics_open: bool,
+    /// When "Copy diagnostics" last succeeded, for its confirmation.
+    diagnostics_copied_at: Option<Instant>,
     onboarding_dismissed: bool,
     /// Open when the user is entering a password for a `pw=true` AirPlay
     /// speaker. `None` when no prompt is showing.
@@ -1249,6 +1256,8 @@ impl eframe::App for StreamToSpeakerApp {
                             self.show_web_ui(ui, &p);
                             ui.add_space(sp::M);
                             self.show_stats(ui, &p);
+                            ui.add_space(sp::M);
+                            self.show_diagnostics(ui, &p);
                         });
 
                     // Floating pinned status bar: fades/slides in over the
@@ -2610,83 +2619,12 @@ impl StreamToSpeakerApp {
 
     fn show_advanced(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
-            // Disclosure header: keyboard-focusable strip with the
-            // chevron placed immediately after the label (proximity)
-            // rather than at the right edge of the card. The previous
-            // design had label at left edge / chevron at right edge,
-            // ~600 px apart, so they read as unrelated elements —
-            // exactly the issue the audit flagged. Wiring via
-            // `ui.interact` with a stable id gives Tab focus, and
-            // we accept Enter/Space when focused (ARIA disclosure
-            // pattern). Height bumped 22 → 28 to meet the WCAG 2.5.8
-            // minimum click-target size.
-            let chevron = if self.advanced_open { "▾" } else { "▸" };
-            let avail_w = ui.available_width();
-            let id = ui.id().with("advanced_toggle");
-            // m5: was 28 px tall — undershot CONTROL_HEIGHT and the
-            // 32 px buttons everywhere else in the app. Normalised so
-            // the disclosure strip's click target matches the rest.
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(avail_w, CONTROL_HEIGHT),
-                egui::Sense::hover(),
-            );
-            let resp = ui
-                .interact(rect, id, egui::Sense::click())
-                .on_hover_text("Tuning knobs for power users");
-            // Expose to AccessKit / screen readers.
-            resp.widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::Button,
-                    resp.enabled(),
-                    if self.advanced_open {
-                        "Advanced (expanded)"
-                    } else {
-                        "Advanced (collapsed)"
-                    },
-                )
-            });
-            if resp.hovered() && resp.enabled() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            let kbd_toggle = resp.has_focus()
-                && ui.input(|i| {
-                    i.key_pressed(egui::Key::Enter)
-                        || i.key_pressed(egui::Key::Space)
-                });
-            if resp.clicked() || kbd_toggle {
-                self.advanced_open = !self.advanced_open;
-            }
-            // Explicit focus ring — egui doesn't paint one on a bare
-            // ui.interact rect, and the audit flagged this as a P0
-            // keyboard-accessibility failure.
-            if resp.has_focus() {
-                ui.painter().rect_stroke(
-                    rect.expand(2.0),
-                    RADIUS_CONTROL,
-                    egui::Stroke::new(2.0, p.accent),
-                );
-            }
-            // Paint label + chevron. Matches the new section_label
-            // (14 px Body Strong, sentence case, primary text). The
-            // chevron lands immediately to the right of the label
-            // text (Gestalt proximity).
-            let label_font =
-                egui::FontId::new(14.0, egui::FontFamily::Proportional);
-            let chevron_font =
-                egui::FontId::new(14.0, egui::FontFamily::Proportional);
-            let label_rect = ui.painter().text(
-                egui::pos2(rect.left(), rect.center().y),
-                egui::Align2::LEFT_CENTER,
+            disclosure_header(
+                ui,
+                p,
                 "Advanced",
-                label_font,
-                p.text_primary,
-            );
-            ui.painter().text(
-                egui::pos2(label_rect.right() + sp::XS, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                chevron,
-                chevron_font,
-                p.text_secondary,
+                "Tuning knobs for power users",
+                &mut self.advanced_open,
             );
 
             if !self.advanced_open {
@@ -3117,6 +3055,80 @@ impl StreamToSpeakerApp {
                     );
                 }
             });
+        });
+    }
+
+    /// Diagnostics: the app's counters now and as they were just before
+    /// the last fault, plus copy-to-clipboard and the log folder. Counters
+    /// are gathered only while the card is expanded.
+    fn show_diagnostics(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(ui, p, |ui| {
+            disclosure_header(
+                ui,
+                p,
+                "Diagnostics",
+                "Connection details and counters, for troubleshooting or a bug report",
+                &mut self.diagnostics_open,
+            );
+            if !self.diagnostics_open {
+                return;
+            }
+            ui.add_space(sp::XS);
+            ui.horizontal(|ui| {
+                if secondary_button(ui, p, "Copy diagnostics", 150.0)
+                    .on_hover_text(
+                        "Copy everything below as plain text — paste it into a bug report.",
+                    )
+                    .clicked()
+                {
+                    ui.ctx().copy_text(self.app.diagnostics_report());
+                    self.diagnostics_copied_at = Some(Instant::now());
+                }
+                if secondary_button(ui, p, "Open log folder", 140.0).clicked() {
+                    if let Some(dir) = crate::log_dir() {
+                        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                    }
+                }
+                if self
+                    .diagnostics_copied_at
+                    .map_or(false, |t| t.elapsed() < Duration::from_secs(3))
+                {
+                    ui.label(egui::RichText::new("Copied.").size(12.0).color(p.text_secondary));
+                }
+            });
+            ui.add_space(sp::S);
+            let now = self.app.diagnostics_snapshot();
+            diagnostics_grid(ui, p, "diag_now", &now.rows());
+            ui.add_space(sp::S);
+            match self.app.last_fault() {
+                Some(f) => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Last fault ({} ago): {}",
+                            crate::diagnostics::format_secs(
+                                now.taken_unix.saturating_sub(f.when_unix)
+                            ),
+                            f.what
+                        ))
+                        .strong()
+                        .color(p.text_primary),
+                    );
+                    ui.label(
+                        egui::RichText::new("Statistics just before it:")
+                            .size(12.0)
+                            .color(p.text_secondary),
+                    );
+                    ui.add_space(sp::XS / 2.0);
+                    diagnostics_grid(ui, p, "diag_fault", &f.before.rows());
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("No dropped or failed connections this run.")
+                            .size(12.0)
+                            .color(p.text_secondary),
+                    );
+                }
+            }
         });
     }
 
@@ -3765,6 +3777,85 @@ fn speaker_row(
     action
 }
 
+/// Collapsible-card header: a keyboard-focusable strip with the label and,
+/// right after it, a chevron. Toggles `open` on click or Enter/Space.
+fn disclosure_header(ui: &mut egui::Ui, p: &Palette, label: &str, hover: &str, open: &mut bool) {
+    // Disclosure header: keyboard-focusable strip with the
+    // chevron placed immediately after the label (proximity)
+    // rather than at the right edge of the card. The previous
+    // design had label at left edge / chevron at right edge,
+    // ~600 px apart, so they read as unrelated elements —
+    // exactly the issue the audit flagged. Wiring via
+    // `ui.interact` with a stable id gives Tab focus, and
+    // we accept Enter/Space when focused (ARIA disclosure
+    // pattern). Height bumped 22 → 28 to meet the WCAG 2.5.8
+    // minimum click-target size.
+    let chevron = if *open { "▾" } else { "▸" };
+    let avail_w = ui.available_width();
+    let id = ui.id().with(label).with("disclosure");
+    // m5: was 28 px tall — undershot CONTROL_HEIGHT and the
+    // 32 px buttons everywhere else in the app. Normalised so
+    // the disclosure strip's click target matches the rest.
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(avail_w, CONTROL_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let resp = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_text(hover);
+    // Expose to AccessKit / screen readers.
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            resp.enabled(),
+            format!("{} ({})", label, if *open { "expanded" } else { "collapsed" }),
+        )
+    });
+    if resp.hovered() && resp.enabled() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let kbd_toggle = resp.has_focus()
+        && ui.input(|i| {
+            i.key_pressed(egui::Key::Enter)
+                || i.key_pressed(egui::Key::Space)
+        });
+    if resp.clicked() || kbd_toggle {
+        *open = !*open;
+    }
+    // Explicit focus ring — egui doesn't paint one on a bare
+    // ui.interact rect, and the audit flagged this as a P0
+    // keyboard-accessibility failure.
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            RADIUS_CONTROL,
+            egui::Stroke::new(2.0, p.accent),
+        );
+    }
+    // Paint label + chevron. Matches the new section_label
+    // (14 px Body Strong, sentence case, primary text). The
+    // chevron lands immediately to the right of the label
+    // text (Gestalt proximity).
+    let label_font =
+        egui::FontId::new(14.0, egui::FontFamily::Proportional);
+    let chevron_font =
+        egui::FontId::new(14.0, egui::FontFamily::Proportional);
+    let label_rect = ui.painter().text(
+        egui::pos2(rect.left(), rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        label_font,
+        p.text_primary,
+    );
+    ui.painter().text(
+        egui::pos2(label_rect.right() + sp::XS, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        chevron,
+        chevron_font,
+        p.text_secondary,
+    );
+}
+
 fn advanced_row(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -3858,6 +3949,26 @@ fn advanced_slider_row(
     {
         *value = default;
     }
+}
+
+/// Two-column label/value table for the Diagnostics card.
+fn diagnostics_grid(ui: &mut egui::Ui, p: &Palette, id: &str, rows: &[(&'static str, String)]) {
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([sp::M, 4.0])
+        .striped(false)
+        .show(ui, |ui| {
+            for (k, v) in rows {
+                ui.label(egui::RichText::new(*k).size(12.0).color(p.text_secondary));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(v).size(12.0).monospace().color(p.text_primary),
+                    )
+                    .wrap(),
+                );
+                ui.end_row();
+            }
+        });
 }
 
 fn stat_pill(
