@@ -963,15 +963,24 @@ impl App {
             }
         };
         if let Some(s) = stopped {
+            let cell = Arc::new(Mutex::new(Some(s)));
             let app = self.clone();
-            std::thread::Builder::new()
+            let worker_cell = cell.clone();
+            let spawned = std::thread::Builder::new()
                 .name("stream-to-speaker-stop".into())
                 .spawn(move || {
-                    s.stop();
+                    if let Some(s) = worker_cell.lock().unwrap().take() {
+                        s.stop();
+                    }
                     // Its privacy grant went with it.
                     app.prune_stream_clients();
-                })
-                .ok();
+                });
+            if spawned.is_err() {
+                if let Some(s) = cell.lock().unwrap().take() {
+                    s.stop();
+                }
+                self.prune_stream_clients();
+            }
         }
         {
             let mut last = self.last_speaker_id.lock().unwrap();
@@ -1257,7 +1266,10 @@ impl App {
         if std::thread::Builder::new()
             .name("stream-to-speaker-connect".into())
             .spawn(move || {
-                let result = app.select_speaker_opts(&id, interactive);
+                // A click is the user's choice; other background connects
+                // (reconnects, auto-connect) only bind while streaming is
+                // still enabled.
+                let result = app.select_speaker_opts(&id, interactive, interactive);
                 *app.connecting.lock().unwrap() = None;
                 if let Err(e) = result {
                     let msg = format!("Couldn't connect to speaker: {}", e);
@@ -1478,10 +1490,22 @@ impl App {
             }
         }
         let _release = Release(&self.connecting);
-        self.select_speaker_opts(id, false)
+        self.select_speaker_opts(id, false, true)
     }
 
-    fn select_speaker_opts(self: &Arc<Self>, id: &str, interactive: bool) -> Result<(), String> {
+    /// `user_choice`: the user asked for this speaker now, which (re-)enables
+    /// streaming up front. Either way the new session binds only if
+    /// streaming is still enabled when it is up — a Disable pressed while
+    /// it was connecting wins, and the fresh session is stopped instead.
+    fn select_speaker_opts(
+        self: &Arc<Self>,
+        id: &str,
+        interactive: bool,
+        user_choice: bool,
+    ) -> Result<(), String> {
+        if user_choice {
+            self.streaming_enabled.store(true, Ordering::Release);
+        }
         // A PIN ceremony in flight for THIS device owns its pairing state:
         // a concurrent transient pair-setup would reset the accessory's
         // single in-progress HAP pairing session and make the ceremony
@@ -1566,6 +1590,15 @@ impl App {
             old.stop();
             guard = self.session.lock().unwrap();
         }
+        // Checked under the session lock: Disable flips the flag before it
+        // takes the session, so either it sees ours or we see its flag.
+        if !self.streaming_enabled.load(Ordering::Acquire) {
+            drop(guard);
+            info!("streaming was disabled while connecting to {}; not binding", actual_id);
+            new_session.stop();
+            self.prune_stream_clients();
+            return Ok(());
+        }
         *guard = Some(new_session);
         // CRITICAL: drop the session-mutex guard before calling any
         // method that re-locks it. std::sync::Mutex is NOT re-entrant
@@ -1590,7 +1623,6 @@ impl App {
 
         *self.last_speaker_id.lock().unwrap() = Some(actual_id.clone());
         *self.session_started.lock().unwrap() = Some((actual_id.clone(), Instant::now()));
-        self.streaming_enabled.store(true, Ordering::Release);
         // Persist so the next launch can auto-reconnect. We do NOT
         // auto-dismiss the onboarding here — picking a speaker only
         // proves step 2 is done; step 1 (routing Windows audio to
@@ -2571,6 +2603,10 @@ impl App {
             }
             self.prune_stream_clients();
             info!("streaming disabled");
+        } else if let Some(name) = self.connecting_to() {
+            // A connect is still in flight; with streaming enabled again
+            // it binds when it's up, so starting another would only fight it.
+            info!("streaming enabled; the connect to {} in progress will bind", name);
         } else {
             let last = self.last_speaker_id.lock().unwrap().clone();
             match last {

@@ -231,16 +231,30 @@ pub fn resolve_ipv4(host: &str, port: u16) -> Result<Ipv4Addr, String> {
     if let Ok(v4) = host.parse::<Ipv4Addr>() {
         return Ok(v4);
     }
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("couldn't resolve {}: {}", host, e))?;
-    addrs
-        .filter_map(|a| match a.ip() {
-            IpAddr::V4(v4) => Some(v4),
-            IpAddr::V6(_) => None,
+    // The OS resolver has no timeout of its own; give up after a few
+    // seconds (the lookup thread finishes on its own and is discarded).
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let name = host.to_string();
+    std::thread::Builder::new()
+        .name("stream-to-speaker-resolve".into())
+        .spawn(move || {
+            let result = (name.as_str(), port).to_socket_addrs().map(|addrs| {
+                addrs
+                    .filter_map(|a| match a.ip() {
+                        IpAddr::V4(v4) => Some(v4),
+                        IpAddr::V6(_) => None,
+                    })
+                    .next()
+            });
+            let _ = tx.send(result);
         })
-        .next()
-        .ok_or_else(|| format!("{} has no IPv4 address", host))
+        .map_err(|e| format!("couldn't resolve {}: {}", host, e))?;
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(Some(v4))) => Ok(v4),
+        Ok(Ok(None)) => Err(format!("{} has no IPv4 address", host)),
+        Ok(Err(e)) => Err(format!("couldn't resolve {}: {}", host, e)),
+        Err(_) => Err(format!("couldn't resolve {}: no answer within 5 s", host)),
+    }
 }
 
 /// What a receiver's plaintext `GET /info` revealed.

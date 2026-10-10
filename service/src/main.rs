@@ -508,10 +508,9 @@ fn run(cli: Cli) -> Result<()> {
     // A saved speaker added by address needs no discovery: connect in the
     // background (the window and tray come up meanwhile), with or without
     // --no-discovery.
-    let picking = cli.player.is_some() || (!cli.no_interactive && cli.headless);
     let saved_manual = app
         .saved_speaker_id()
-        .filter(|_| !picking && app.is_auto_reconnect_on_launch())
+        .filter(|_| cli.player.is_none() && app.is_auto_reconnect_on_launch())
         .filter(|id| app.find_manual_speaker(id).is_some())
         .filter(|id| app.auto_connect_allowed_at_launch(id));
     if let Some(id) = saved_manual {
