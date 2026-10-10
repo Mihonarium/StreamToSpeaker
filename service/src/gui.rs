@@ -804,7 +804,15 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
             } else {
                 None
             };
-            let hide_to_tray = start_hidden && tray.is_some() && hwnd.is_some();
+            // A second launch during startup means the user wants the
+            // window, sign-in start or not.
+            let hide_to_tray = start_hidden
+                && tray.is_some()
+                && hwnd.is_some()
+                && !crate::single_instance::activation_pending();
+            if let Some(h) = hwnd {
+                crate::single_instance::set_window(h);
+            }
             if let Some(h) = hwnd {
                 if let Some(t) = tray.as_mut() {
                     t.set_hwnd(h);
@@ -1060,6 +1068,14 @@ impl eframe::App for StreamToSpeakerApp {
         self.sync_window_icon(ctx);
         if self.frame_count == 1 {
             log::info!("first GUI frame painting");
+        }
+        if crate::single_instance::take_activation() {
+            // Raised by a second launch (the hand-off thread already showed
+            // the window if it existed): cancel a pending sign-in hide.
+            self.hide_after_first_frame = false;
+            if let Some(hwnd) = self.hwnd {
+                win_show_and_focus(hwnd);
+            }
         }
         if self.hide_after_first_frame {
             if self.frame_count >= 2 {
