@@ -22,6 +22,7 @@
 //! plain linear.
 
 use log::debug;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,8 @@ const VOLUME_MIN_MILLIBELS: i32 = -9600;
 #[derive(Debug)]
 pub struct VolumeSync {
     inner: Mutex<Inner>,
+    /// Last known mute state of the shared endpoint, from either side.
+    muted: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +58,7 @@ impl VolumeSync {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
+            muted: AtomicBool::new(false),
         }
     }
 
@@ -112,6 +116,35 @@ impl VolumeSync {
     /// Seed the cache from an initial observation (e.g. `upnp::get_volume`
     /// on connect, or the GUI slider). Doesn't touch the `last_pushed_*`
     /// echo timestamps — the caller observed/initiated this directly.
+    /// Record a mute change seen on either side (Windows or speaker).
+    pub fn note_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Release);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Acquire)
+    }
+
+    /// Apply a speaker event (GENA) to our state and work out what to
+    /// hand the driver. The driver's PUSH_VOLUME sets level *and* mute
+    /// together, so every push carries both: a mute event keeps the
+    /// current level and a volume event keeps the current mute state.
+    /// `volume` is the speaker's raw `0..=100`. Returns `(millibels,
+    /// muted)`, or `None` when nothing needs pushing (echo, no change,
+    /// or a mute change while no level is known yet).
+    pub fn speaker_event(&self, volume: Option<u32>, mute: Option<bool>) -> Option<(i32, bool)> {
+        let new_level = volume.and_then(|v| self.sonos_changed(v));
+        let mute_changed = match mute {
+            Some(m) => self.muted.swap(m, Ordering::AcqRel) != m,
+            None => false,
+        };
+        if new_level.is_none() && !mute_changed {
+            return None;
+        }
+        let level = new_level.or_else(|| self.current_level())?;
+        Some((sonos_to_millibels(level), self.is_muted()))
+    }
+
     pub fn prime_initial_volume(&self, level: u32) {
         let mut inner = self.inner.lock().unwrap();
         inner.last_level = Some(level.min(100));
@@ -211,6 +244,27 @@ mod tests {
         assert_eq!(s.sonos_changed(70), Some(70));
         // Re-sending the same level is a no-op.
         assert_eq!(s.sonos_changed(70), None);
+    }
+
+    #[test]
+    fn speaker_mute_keeps_the_level() {
+        let v = VolumeSync::new();
+        v.prime_initial_volume(40);
+        // Mute alone: same level, muted — never 0 dB (= 100 %).
+        assert_eq!(v.speaker_event(None, Some(true)), Some((sonos_to_millibels(40), true)));
+        // Repeated mute state: nothing to push.
+        assert_eq!(v.speaker_event(None, Some(true)), None);
+        // A volume change while muted stays muted.
+        assert_eq!(v.speaker_event(Some(55), None), Some((sonos_to_millibels(55), true)));
+        assert_eq!(v.speaker_event(Some(55), Some(false)), Some((sonos_to_millibels(55), false)));
+    }
+
+    #[test]
+    fn speaker_mute_without_known_level_is_not_pushed() {
+        let v = VolumeSync::new();
+        assert_eq!(v.speaker_event(None, Some(true)), None);
+        assert!(v.is_muted());
+        assert_eq!(v.speaker_event(Some(30), None), Some((sonos_to_millibels(30), true)));
     }
 
     #[test]

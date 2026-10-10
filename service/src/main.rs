@@ -702,25 +702,17 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         Arc::new(move |path: &str, body: &str| {
             debug!("GENA NOTIFY on {}: {} bytes", path, body.len());
             if let Some(change) = parse_rendering_notify(body) {
-                if let Some(v) = change.volume {
-                    if let Some(level) = vsync.sonos_changed(v) {
-                        // Set our node's dB to the linear position for this
-                        // percent; Windows then shows the slider at the
-                        // same %.
-                        let mb = stream_to_speaker::volume_sync::sonos_to_millibels(level);
-                        info!("speaker -> windows: volume {} (mb={})", level, mb);
-                        if let Some(p) = pusher.as_ref() {
-                            if let Err(e) = p.push(mb, false) {
-                                warn!("failed to push volume to driver: {}", e);
-                            }
-                        }
-                    }
-                }
-                if let Some(m) = change.mute {
-                    info!("speaker -> driver: mute={}", m);
+                // Set our node's dB to the linear position for the
+                // speaker's percent (Windows then shows the slider at the
+                // same %), keeping level and mute consistent.
+                if let Some((mb, muted)) = vsync.speaker_event(change.volume, change.mute) {
+                    info!(
+                        "speaker -> windows: volume {:?} mute {:?} (mb={}, muted={})",
+                        change.volume, change.mute, mb, muted
+                    );
                     if let Some(p) = pusher.as_ref() {
-                        if let Err(e) = p.push(0, m) {
-                            warn!("failed to push mute to driver: {}", e);
+                        if let Err(e) = p.push(mb, muted) {
+                            warn!("failed to push volume/mute to driver: {}", e);
                         }
                     }
                 }
@@ -890,6 +882,7 @@ fn spawn_driver_event_consumer(app: Arc<App>, cli: &Cli) {
                     }
                     DriverEvent::MuteChanged { muted } => {
                         info!("driver -> speaker: mute={}", muted);
+                        app.vsync.note_muted(muted);
                         let guard = app.session.lock().unwrap();
                         if let Some(s) = guard.as_ref() {
                             if let Err(e) = s.set_mute(muted) {
