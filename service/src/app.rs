@@ -951,19 +951,27 @@ impl App {
 
     /// Remove a manual speaker: disconnect it if it's the active one and
     /// drop what was stored under its id.
-    pub fn remove_manual_speaker(&self, id: &str) {
-        let active = self
-            .session
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| s.stable_id() == id)
-            .unwrap_or(false);
-        if active {
-            if let Some(s) = self.session.lock().unwrap().take() {
-                s.stop();
+    /// The teardown runs on a worker thread: it is network I/O and this is
+    /// called from the GUI.
+    pub fn remove_manual_speaker(self: &Arc<Self>, id: &str) {
+        let stopped = {
+            let mut guard = self.session.lock().unwrap();
+            if guard.as_ref().map_or(false, |s| s.stable_id() == id) {
+                guard.take()
+            } else {
+                None
             }
-            self.prune_stream_clients();
+        };
+        if let Some(s) = stopped {
+            let app = self.clone();
+            std::thread::Builder::new()
+                .name("stream-to-speaker-stop".into())
+                .spawn(move || {
+                    s.stop();
+                    // Its privacy grant went with it.
+                    app.prune_stream_clients();
+                })
+                .ok();
         }
         {
             let mut last = self.last_speaker_id.lock().unwrap();
@@ -1212,12 +1220,26 @@ impl App {
     /// [`select_speaker_async_opts`]: App::select_speaker_async_opts
     pub fn select_speaker_async(self: &Arc<Self>, id: &str) {
         self.reconnects.store(0, Ordering::Relaxed);
-        self.select_speaker_async_opts(id, true);
+        self.select_speaker_async_opts(id, true, false);
     }
 
-    fn select_speaker_async_opts(self: &Arc<Self>, id: &str, interactive: bool) {
+    /// Non-interactive [`select_speaker_async`] for automatic callers
+    /// (launch reconnect to a speaker added by address).
+    ///
+    /// [`select_speaker_async`]: App::select_speaker_async
+    pub fn connect_in_background(self: &Arc<Self>, id: &str) {
+        self.select_speaker_async_opts(id, false, false);
+    }
+
+    /// `only_if_idle`: give up unless nothing is bound either — decided
+    /// under the same `connecting` lock every select claims, so an
+    /// automatic connect can never replace a speaker the user picked.
+    fn select_speaker_async_opts(self: &Arc<Self>, id: &str, interactive: bool, only_if_idle: bool) {
         {
             let mut guard = self.connecting.lock().unwrap();
+            if only_if_idle && guard.is_none() && self.session.lock().unwrap().is_some() {
+                return;
+            }
             if let Some(name) = guard.as_ref() {
                 if interactive {
                     self.record_error(format!("Still connecting to {} — give it a moment.", name));
@@ -1232,7 +1254,7 @@ impl App {
         }
         let app = self.clone();
         let id = id.to_string();
-        std::thread::Builder::new()
+        if std::thread::Builder::new()
             .name("stream-to-speaker-connect".into())
             .spawn(move || {
                 let result = app.select_speaker_opts(&id, interactive);
@@ -1243,7 +1265,11 @@ impl App {
                     app.record_error(msg);
                 }
             })
-            .ok();
+            .is_err()
+        {
+            *self.connecting.lock().unwrap() = None;
+            self.record_error("Couldn't start connecting (no thread available).");
+        }
     }
 
     /// Background watchdog: when a live session drops mid-stream (speaker
@@ -1334,7 +1360,7 @@ impl App {
                     // Non-interactive: an unattended retry must never pop
                     // a PIN pairing prompt on the user's TV.
                     app.reconnects.fetch_add(1, Ordering::Relaxed);
-                    app.select_speaker_async_opts(&id, false);
+                    app.select_speaker_async_opts(&id, false, false);
                     while app.connecting.lock().unwrap().is_some() {
                         if app.is_shutting_down() {
                             return;
@@ -1436,6 +1462,22 @@ impl App {
     /// entry point of the web API / tray toggle / launch reconnect, where
     /// nobody could answer a PIN prompt).
     pub fn select_speaker(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        // Claim the same `connecting` slot the background connects use, so
+        // the two can't run at once and auto-connect sees this one.
+        {
+            let mut guard = self.connecting.lock().unwrap();
+            if let Some(name) = guard.as_ref() {
+                return Err(format!("Still connecting to {} — try again in a moment.", name));
+            }
+            *guard = Some(self.speaker_name(id).unwrap_or_else(|| id.to_string()));
+        }
+        struct Release<'a>(&'a Mutex<Option<String>>);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = None;
+            }
+        }
+        let _release = Release(&self.connecting);
         self.select_speaker_opts(id, false)
     }
 
@@ -1634,7 +1676,14 @@ impl App {
     /// description is fetched now (exactly as discovery would have) and the
     /// session keeps the manual id.
     fn start_upnp_manual(&self, m: &ManualSpeaker) -> Result<ActiveSession, String> {
-        let r = crate::ssdp::fetch_and_parse_device(&m.host, Duration::from_secs(3))
+        // Fetch from an IPv4 address: the stream and the SOAP control
+        // paths are IPv4-only, and a hostname may resolve IPv6-first.
+        let mut url = url::Url::parse(&m.host).map_err(|e| format!("{}: {}", m.host, e))?;
+        let host = url.host_str().unwrap_or_default().to_string();
+        let ip = manual_speakers::resolve_ipv4(&host, url.port().unwrap_or(80))?;
+        url.set_ip_host(IpAddr::V4(ip))
+            .map_err(|_| format!("{}: can't use address {}", m.host, ip))?;
+        let r = crate::ssdp::fetch_and_parse_device(url.as_str(), Duration::from_secs(3))
             .map_err(|e| format!("couldn't read {}: {:#}", m.host, e))?;
         let own_udn = r.udn.clone();
         // A Sonos that's grouped streams via its coordinator, as for a
@@ -2062,7 +2111,7 @@ impl App {
                             }
                             std::thread::sleep(Duration::from_millis(100));
                         }
-                        app.select_speaker_async_opts(&id, false);
+                        app.select_speaker_async_opts(&id, false, false);
                     }
                     Err(e) => {
                         app.record_error(format!(
@@ -2811,7 +2860,7 @@ impl App {
                     if let Some(id) = pick {
                         info!("auto-connect: connecting to {}", id);
                         tried.insert(id.clone());
-                        app.select_speaker_async_opts(&id, false);
+                        app.select_speaker_async_opts(&id, false, true);
                     }
                 }
             })

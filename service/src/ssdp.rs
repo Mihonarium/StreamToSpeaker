@@ -551,6 +551,10 @@ fn absolute_url(base: &str, maybe_relative: &str) -> String {
     }
 }
 
+/// Largest response [`http_get`] accepts. Device descriptions are a few
+/// KB; anything near this is not one (a stream URL, say).
+const MAX_HTTP_GET_BYTES: usize = 256 * 1024;
+
 /// Tiny blocking HTTP GET. We don't have hyper/reqwest; this is fine for
 /// the few KB of XML SSDP responders return.
 pub fn http_get(url_str: &str, timeout: Duration) -> Result<String> {
@@ -561,7 +565,14 @@ pub fn http_get(url_str: &str, timeout: Duration) -> Result<String> {
     }
     let host = url.host_str().ok_or_else(|| anyhow!("no host"))?;
     let port = url.port().unwrap_or(80);
-    let path = if url.path().is_empty() { "/" } else { url.path() };
+    let mut path = if url.path().is_empty() { "/".to_string() } else { url.path().to_string() };
+    if let Some(q) = url.query() {
+        path.push('?');
+        path.push_str(q);
+    }
+    // Whole-request deadline: per-read timeouts alone let a server that
+    // trickles bytes hold us indefinitely.
+    let deadline = Instant::now() + timeout * 2;
 
     let mut stream = TcpStream::connect_timeout(
         &(host, port).to_socket_addrs_first()?,
@@ -581,7 +592,26 @@ pub fn http_get(url_str: &str, timeout: Duration) -> Result<String> {
     stream.write_all(req.as_bytes())?;
 
     let mut buf = Vec::with_capacity(16384);
-    stream.read_to_end(&mut buf)?;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(anyhow!("GET {} took too long", url_str));
+        }
+        stream.set_read_timeout(Some(left.min(timeout)))?;
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > MAX_HTTP_GET_BYTES {
+            return Err(anyhow!(
+                "GET {}: response larger than {} KB",
+                url_str,
+                MAX_HTTP_GET_BYTES / 1024
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
 
     // Find headers/body split. Robust to header lines being CRLF or LF only.
     let split_pos = find_header_body_split(&buf)

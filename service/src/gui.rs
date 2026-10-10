@@ -2516,6 +2516,7 @@ impl StreamToSpeakerApp {
                                 }
                             }
                             RowAction::Trailing => {
+                                self.commit_settings_password();
                                 self.speaker_settings_open =
                                     if settings_open { None } else { Some(sp.id.clone()) };
                                 self.settings_password =
@@ -2541,6 +2542,26 @@ impl StreamToSpeakerApp {
                 self.show_volume_row(ui, p);
             }
         });
+    }
+
+    /// Save the open settings panel's password field (a manual AirPlay
+    /// speaker's) if it changed — the field normally saves on blur, which
+    /// doesn't happen when the panel is closed or swapped first.
+    fn commit_settings_password(&mut self) {
+        let Some(id) = self.speaker_settings_open.clone() else {
+            return;
+        };
+        let manual_airplay = self
+            .app
+            .find_manual_speaker(&id)
+            .map_or(false, |m| m.kind == crate::manual_speakers::ManualKind::AirPlay);
+        if !manual_airplay {
+            return;
+        }
+        let pw = self.settings_password.trim().to_string();
+        if self.app.airplay_password(&id).unwrap_or_default() != pw {
+            self.app.set_airplay_password(&id, &pw);
+        }
     }
 
     /// Inline settings under a speaker row (opened with its ⚙ button).

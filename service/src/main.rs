@@ -247,9 +247,14 @@ fn main() {
     // leaked: it lives for the process lifetime so the Inno Setup
     // installer's AppMutex check (and our own duplicate-launch gate
     // below, for FUTURE launches) keep seeing the kernel object.
-    // The Global\ mutex is what the installer watches for a running copy.
+    // The Global\ mutex is what the installer watches for a running copy;
+    // its "already existed" answer also covers an instance that never
+    // takes the per-session claim below (--headless, or one running
+    // elevated).
     #[cfg(windows)]
-    let _mutex_handle = create_singleton_mutex();
+    let (_mutex_handle, global_taken) = create_singleton_mutex();
+    #[cfg(not(windows))]
+    let global_taken = false;
 
     // Single-instance gate. If another instance is already running in
     // this session, ask it to show its window and exit — same pattern as
@@ -267,6 +272,13 @@ fn main() {
             stream_to_speaker::single_instance::claim()
         {
             info!("another instance is running; asked it to show its window, exiting");
+            return;
+        }
+        if global_taken {
+            // Running, but not a GUI in this session we could hand over
+            // to (a --headless instance, or an elevated one). Starting
+            // anyway would only fail to bind the stream port.
+            info!("another instance (headless or elevated) is already running; exiting");
             return;
         }
     }
@@ -386,13 +398,26 @@ fn attach_parent_console() {
 /// Which instance gets to run is decided separately, per session, by
 /// `single_instance::claim`; this one only signals "the app is running"
 /// to Setup.
+///
+/// Returns (handle, already running): the mutex already existed, or we
+/// may not open it because an elevated instance owns it.
 #[cfg(windows)]
-fn create_singleton_mutex() -> Option<isize> {
+fn create_singleton_mutex() -> (Option<isize>, bool) {
     use std::ffi::CString;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexA;
-    let name = CString::new("Global\\StreamToSpeaker.Singleton").ok()?;
-    let h = unsafe { CreateMutexA(std::ptr::null(), 0, name.as_ptr() as *const u8) };
-    (!h.is_null()).then_some(h as isize)
+    let Some(name) = CString::new("Global\\StreamToSpeaker.Singleton").ok() else {
+        return (None, false);
+    };
+    unsafe {
+        let h = CreateMutexA(std::ptr::null(), 0, name.as_ptr() as *const u8);
+        let err = GetLastError();
+        if h.is_null() {
+            (None, err == ERROR_ACCESS_DENIED)
+        } else {
+            (Some(h as isize), err == ERROR_ALREADY_EXISTS)
+        }
+    }
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -480,7 +505,19 @@ fn run(cli: Cli) -> Result<()> {
     // The old fallback ("first discovered") was the reason GUI users
     // never got to see the onboarding card and ended up with a random
     // speaker bound at launch.
-    if !cli.no_discovery {
+    // A saved speaker added by address needs no discovery: connect in the
+    // background (the window and tray come up meanwhile), with or without
+    // --no-discovery.
+    let picking = cli.player.is_some() || (!cli.no_interactive && cli.headless);
+    let saved_manual = app
+        .saved_speaker_id()
+        .filter(|_| !picking && app.is_auto_reconnect_on_launch())
+        .filter(|id| app.find_manual_speaker(id).is_some())
+        .filter(|id| app.auto_connect_allowed_at_launch(id));
+    if let Some(id) = saved_manual {
+        info!("auto-reconnect: connecting to saved manual speaker {:?}", id);
+        app.connect_in_background(&id);
+    } else if !cli.no_discovery {
         let discovery = app.discovery.as_ref().unwrap();
         let initial = if cli.player.is_some() {
             picker::resolve(discovery, cli.player.as_deref(), false)?
@@ -492,13 +529,6 @@ fn run(cli: Cli) -> Result<()> {
                 None
             } else if !app.auto_connect_allowed_at_launch(&saved_id) {
                 info!("auto-reconnect: {:?} is set to never auto-connect", saved_id);
-                None
-            } else if app.find_manual_speaker(&saved_id).is_some() {
-                // Added by address: nothing to wait for in discovery.
-                info!("auto-reconnect: trying saved manual speaker {:?}", saved_id);
-                if let Err(e) = app.select_speaker(&saved_id) {
-                    warn!("reconnecting to saved manual speaker failed: {}", e);
-                }
                 None
             } else {
                 info!("auto-reconnect: trying saved speaker {:?}", saved_id);
