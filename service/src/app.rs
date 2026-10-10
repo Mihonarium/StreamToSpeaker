@@ -21,12 +21,16 @@ use crate::airplay::{
     AirPlay2Session, AirPlay2SessionConfig, AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession,
     AirPlaySessionConfig, Ap2StartError, Transport,
 };
+use crate::discovery_net::{self, MdnsController, NetAdapter, Resolved, SavedAdapter};
+use crate::diagnostics::{Fault, Snapshot};
+use crate::equalizer::{EqControl, EqReport, EqSettings};
 use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
+use crate::manual_speakers::{self, ManualKind, ManualSpeaker};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
-use crate::ssdp::{DiscoveryState, Renderer};
+use crate::ssdp::{DiscoveryState, Renderer, SearchScope};
 use crate::stream_gate::{canonical_ip, is_local_address, Grant, StreamGate};
-use crate::user_config::UserConfig;
+use crate::user_config::{AutoConnect, SpeakerSettings, UserConfig};
 use crate::volume_sync::VolumeSync;
 use crate::{upnp, PRODUCT_NAME, WIRE_SAMPLE_RATE};
 
@@ -42,6 +46,10 @@ pub struct RendererSession {
     /// Privacy-gate grant for this speaker's addresses. Lives exactly as
     /// long as the session: dropping the session revokes them.
     pub stream_grant: Option<Grant>,
+    /// Id the session reports instead of the renderer's own (a speaker
+    /// added by address keeps its manual id, so the list highlights the
+    /// row the user clicked and a relaunch reconnects through it).
+    pub id_override: Option<String>,
 }
 
 /// Active session — either UPnP (pull-style, speaker fetches our HTTP
@@ -57,7 +65,10 @@ pub enum ActiveSession {
 impl ActiveSession {
     pub fn stable_id(&self) -> String {
         match self {
-            ActiveSession::Upnp(s) => s.renderer.stable_id(),
+            ActiveSession::Upnp(s) => s
+                .id_override
+                .clone()
+                .unwrap_or_else(|| s.renderer.stable_id()),
             ActiveSession::AirPlay(s) => s.renderer.stable_id(),
             ActiveSession::AirPlay2(s) => s.renderer.stable_id(),
         }
@@ -120,6 +131,15 @@ impl ActiveSession {
     /// True if the session has died mid-stream (dropped receiver). UPnP
     /// is HTTP-pull (the speaker reconnects on its own), so only the
     /// AirPlay push paths report death here.
+    /// Short protocol label for diagnostics.
+    pub fn transport_label(&self) -> &'static str {
+        match self {
+            ActiveSession::Upnp(_) => "UPnP",
+            ActiveSession::AirPlay(_) => "AirPlay (RAOP)",
+            ActiveSession::AirPlay2(_) => "AirPlay 2",
+        }
+    }
+
     pub fn is_dead(&self) -> bool {
         match self {
             ActiveSession::Upnp(_) => false,
@@ -250,10 +270,22 @@ pub struct App {
     pub rate_fudge_ppm: Arc<AtomicI32>,
     pub silence_pace_ms: Arc<AtomicU64>,
     pub latency_adjust_step_frames: Arc<AtomicU32>,
+    /// Equalizer hand-off to the audio loop (designs built off-thread).
+    pub eq: Arc<EqControl>,
 
     // ---- Stats (best-effort, advisory) ----
     pub packets_published_total: Arc<AtomicU64>,
+    /// Of `packets_published_total`, the silence generated while Windows
+    /// had no stream running.
+    pub idle_silence_packets: Arc<AtomicU64>,
     pub started_at: Instant,
+    /// Id of the bound session and when it came up (session uptime).
+    session_started: Mutex<Option<(String, Instant)>>,
+    /// Automatic reconnects since the user last picked a speaker.
+    reconnects: AtomicU32,
+    /// The last dropped / failed connection, with the counters as they
+    /// were just before it. Kept until the next fault, across reconnects.
+    last_fault: Mutex<Option<Fault>>,
 
     // ---- Lifecycle ----
     pub shutdown: Arc<AtomicBool>,
@@ -303,6 +335,36 @@ pub struct App {
     /// reset the accessory's single HAP pairing session mid-ceremony).
     /// Cleared by the ceremony's RAII guard on every exit path.
     pin_ceremony: Mutex<Option<PinCeremonyState>>,
+
+    /// Receiver records built for manually added AirPlay speakers at their
+    /// last connect (the probe result), keyed by id — so the PIN ceremony
+    /// and other lookups by id find them without re-probing.
+    manual_resolved: Mutex<std::collections::HashMap<String, AirPlayRenderer>>,
+
+    /// Discovery's adapter state as last applied (see `discovery_net`):
+    /// every adapter, one adapter, or paused because it is down.
+    discovery_scope: Mutex<Resolved>,
+    /// The machine's adapters as of the last network check, for the
+    /// adapter selector (refreshed every couple of seconds off-thread).
+    adapters_cache: Mutex<Vec<NetAdapter>>,
+    /// The mDNS browser, rebuilt when the chosen adapter changes.
+    mdns: Mutex<Option<MdnsController>>,
+    /// Serialises scope changes (the monitor thread vs. a settings edit).
+    scope_apply: Mutex<()>,
+    /// Why AirPlay discovery couldn't start, if it couldn't.
+    discovery_error: Mutex<Option<String>>,
+}
+
+/// Discovery-network state for the settings UI.
+#[derive(Clone, Debug)]
+pub struct DiscoveryNetStatus {
+    pub scope: Resolved,
+    /// The saved choice (`None` = every adapter).
+    pub selected: Option<SavedAdapter>,
+    /// Set when `--advertise-ip` / `--bind` pins SSDP to one address; the
+    /// adapter choice is then ignored.
+    pub pinned: Option<Ipv4Addr>,
+    pub error: Option<String>,
 }
 
 /// A PIN pairing ceremony in flight (see [`App::begin_pin_pairing`]).
@@ -387,6 +449,10 @@ impl App {
         // action, code that asks "what was the last speaker?" gets the
         // persisted answer.
         let last_speaker_id = Mutex::new(user_config.last_speaker_id.clone());
+        let eq = EqControl::new(WIRE_SAMPLE_RATE);
+        if user_config.equalizer.enabled {
+            eq.request(user_config.equalizer.clone());
+        }
         Arc::new(Self {
             config,
             discovery,
@@ -402,8 +468,13 @@ impl App {
             rate_fudge_ppm: Arc::new(AtomicI32::new(0)),
             silence_pace_ms: Arc::new(AtomicU64::new(10)),
             latency_adjust_step_frames: Arc::new(AtomicU32::new(4)),
+            eq,
             packets_published_total: Arc::new(AtomicU64::new(0)),
+            idle_silence_packets: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
+            session_started: Mutex::new(None),
+            reconnects: AtomicU32::new(0),
+            last_fault: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             update: Mutex::new(UpdateState::default()),
             rescan_in_flight: Arc::new(AtomicBool::new(false)),
@@ -414,6 +485,12 @@ impl App {
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
+            manual_resolved: Mutex::new(std::collections::HashMap::new()),
+            discovery_scope: Mutex::new(Resolved::All),
+            adapters_cache: Mutex::new(Vec::new()),
+            mdns: Mutex::new(None),
+            scope_apply: Mutex::new(()),
+            discovery_error: Mutex::new(None),
         })
     }
 
@@ -701,7 +778,7 @@ impl App {
     pub fn set_airplay_password(&self, id: &str, pw: &str) {
         let mut uc = self.user_config.lock().unwrap();
         if pw.is_empty() {
-            uc.airplay_passwords.remove(id);
+            uc.remove_airplay_password(id);
         } else {
             uc.airplay_passwords.insert(id.to_string(), pw.to_string());
         }
@@ -730,6 +807,41 @@ impl App {
             uc.forward_now_playing = on;
             uc.save();
         }
+    }
+
+    // ---- Equalizer -------------------------------------------------------
+
+    /// The saved equalizer curve.
+    pub fn eq_saved(&self) -> EqSettings {
+        self.user_config.lock().unwrap().equalizer.clone()
+    }
+
+    /// Apply `settings` to the running stream without saving (live
+    /// preview while editing). No reconnect: the change is crossfaded in.
+    pub fn eq_preview(&self, settings: &EqSettings) {
+        self.eq.request(settings.clone());
+    }
+
+    /// Apply and persist `settings`.
+    pub fn eq_apply(&self, settings: &EqSettings) {
+        let settings = settings.sanitized();
+        self.eq.request(settings.clone());
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.equalizer != settings {
+            uc.equalizer = settings;
+            uc.save();
+        }
+    }
+
+    /// Drop any previewed curve and return the stream to the saved one.
+    pub fn eq_revert(&self) {
+        let saved = self.eq_saved();
+        self.eq.request(saved);
+    }
+
+    /// Headroom figures of the most recently designed curve.
+    pub fn eq_report(&self) -> Option<EqReport> {
+        self.eq.report()
     }
 
     /// Persist the drop-reconnect preference.
@@ -850,6 +962,129 @@ impl App {
     }
 
     // -------------------------------------------------------------------
+    // Manually added speakers
+    // -------------------------------------------------------------------
+
+    /// Speakers the user added by address, in the order added.
+    pub fn manual_speakers(&self) -> Vec<ManualSpeaker> {
+        self.user_config.lock().unwrap().manual_speakers.clone()
+    }
+
+    /// The manual entry with this id, if any.
+    pub fn find_manual_speaker(&self, id: &str) -> Option<ManualSpeaker> {
+        if !manual_speakers::is_manual_id(id) {
+            return None;
+        }
+        self.user_config
+            .lock()
+            .unwrap()
+            .manual_speakers
+            .iter()
+            .find(|m| m.id() == id)
+            .cloned()
+    }
+
+    /// Validate and persist a new manual speaker (the add dialog's
+    /// fields). Returns its id, or a user-facing reason it was refused.
+    pub fn add_manual_speaker(
+        &self,
+        kind: ManualKind,
+        name: &str,
+        host: &str,
+        port: &str,
+    ) -> Result<String, String> {
+        let mut uc = self.user_config.lock().unwrap();
+        let entry = manual_speakers::validate(kind, name, host, port, &uc.manual_speakers)?;
+        let id = entry.id();
+        info!("manual speaker added: {} ({})", entry.display_name(), id);
+        uc.manual_speakers.push(entry);
+        uc.save();
+        Ok(id)
+    }
+
+    /// Remove a manual speaker: disconnect it if it's the active one and
+    /// drop what was stored under its id.
+    /// The teardown runs on a worker thread: it is network I/O and this is
+    /// called from the GUI.
+    pub fn remove_manual_speaker(self: &Arc<Self>, id: &str) {
+        let stopped = {
+            let mut guard = self.session.lock().unwrap();
+            if guard.as_ref().map_or(false, |s| s.stable_id() == id) {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        if let Some(s) = stopped {
+            let cell = Arc::new(Mutex::new(Some(s)));
+            let app = self.clone();
+            let worker_cell = cell.clone();
+            let spawned = std::thread::Builder::new()
+                .name("stream-to-speaker-stop".into())
+                .spawn(move || {
+                    if let Some(s) = worker_cell.lock().unwrap().take() {
+                        s.stop();
+                    }
+                    // Its privacy grant went with it.
+                    app.prune_stream_clients();
+                });
+            if spawned.is_err() {
+                if let Some(s) = cell.lock().unwrap().take() {
+                    s.stop();
+                }
+                self.prune_stream_clients();
+            }
+        }
+        {
+            let mut last = self.last_speaker_id.lock().unwrap();
+            if last.as_deref() == Some(id) {
+                *last = None;
+            }
+        }
+        self.manual_resolved.lock().unwrap().remove(id);
+        let mut uc = self.user_config.lock().unwrap();
+        let before = uc.manual_speakers.len();
+        uc.manual_speakers.retain(|m| m.id() != id);
+        if uc.manual_speakers.len() == before {
+            return;
+        }
+        if uc.last_speaker_id.as_deref() == Some(id) {
+            uc.last_speaker_id = None;
+        }
+        uc.airplay_passwords.remove(id);
+        uc.airplay_pairings.remove(id);
+        uc.save();
+        info!("manual speaker removed: {}", id);
+    }
+
+    /// Display name for any speaker id: discovered UPnP, discovered
+    /// AirPlay, or manual.
+    fn speaker_name(&self, id: &str) -> Option<String> {
+        if let Some(m) = self.find_manual_speaker(id) {
+            return Some(m.display_name());
+        }
+        self.discovery
+            .as_ref()
+            .and_then(|d| d.find_by_id(id))
+            .map(|r| r.display_name())
+            .or_else(|| {
+                self.airplay_discovery
+                    .as_ref()
+                    .and_then(|d| d.find_by_id(id))
+                    .map(|r| r.friendly_name)
+            })
+    }
+
+    /// The AirPlay receiver record for an id: discovered, or the last
+    /// probe of a manual entry.
+    fn find_airplay_renderer(&self, id: &str) -> Option<AirPlayRenderer> {
+        if manual_speakers::is_manual_id(id) {
+            return self.manual_resolved.lock().unwrap().get(id).cloned();
+        }
+        self.airplay_discovery.as_ref().and_then(|d| d.find_by_id(id))
+    }
+
+    // -------------------------------------------------------------------
     // Speaker view
     // -------------------------------------------------------------------
 
@@ -858,6 +1093,14 @@ impl App {
     /// single sorted list with one row per speaker regardless of which
     /// protocol it speaks.
     pub fn speaker_view(&self) -> SpeakerView {
+        self.speaker_view_opts(false)
+    }
+
+    /// [`speaker_view`] with the user-hidden speakers included (flagged)
+    /// when `include_hidden`; without it they're left out unless active.
+    ///
+    /// [`speaker_view`]: App::speaker_view
+    pub fn speaker_view_opts(&self, include_hidden: bool) -> SpeakerView {
         let active_id = self.session.lock().unwrap().as_ref().map(|s| s.stable_id());
         let mut speakers: Vec<SpeakerInfo> = Vec::new();
 
@@ -894,6 +1137,8 @@ impl App {
                     ip: r.ip.to_string(),
                     active,
                     note,
+                    manual: false,
+                    hidden: false,
                 });
             }
         }
@@ -936,7 +1181,7 @@ impl App {
                                 .to_string(),
                         )
                     };
-                    speakers.push(SpeakerInfo { id, friendly_name: name, ip: r.ip.to_string(), active, note: Some(note) });
+                    speakers.push(SpeakerInfo { id, friendly_name: name, ip: r.ip.to_string(), active, note: Some(note), manual: false, hidden: false });
                     continue;
                 }
                 let name = match transport {
@@ -968,8 +1213,40 @@ impl App {
                     ip: r.ip.to_string(),
                     active,
                     note,
+                    manual: false,
+                    hidden: false,
                 });
             }
+        }
+        for m in self.manual_speakers() {
+            let id = m.id();
+            let active = active_id.as_deref() == Some(id.as_str());
+            let (proto, how) = match m.kind {
+                ManualKind::AirPlay => ("AirPlay", "AirPlay receiver"),
+                ManualKind::Upnp => ("UPnP", "UPnP device description"),
+            };
+            speakers.push(SpeakerInfo {
+                friendly_name: format!("{} ({}, added manually)", m.display_name(), proto),
+                ip: m.address_label(),
+                active,
+                note: Some(format!(
+                    "Added by address ({} at {}). It's always listed, even when discovery \
+                     doesn't see it; connecting tells you if it can't be reached.",
+                    how, m.host
+                )),
+                manual: true,
+                hidden: false,
+                id,
+            });
+        }
+        {
+            let uc = self.user_config.lock().unwrap();
+            for sp in speakers.iter_mut() {
+                sp.hidden = uc.speaker_settings.get(&sp.id).map_or(false, |s| s.hidden);
+            }
+        }
+        if !include_hidden {
+            speakers.retain(|sp| !sp.hidden || sp.active);
         }
         speakers.sort_by(|a, b| a.friendly_name.cmp(&b.friendly_name));
         SpeakerView { speakers, active_id }
@@ -1031,12 +1308,27 @@ impl App {
     ///
     /// [`select_speaker_async_opts`]: App::select_speaker_async_opts
     pub fn select_speaker_async(self: &Arc<Self>, id: &str) {
-        self.select_speaker_async_opts(id, true);
+        self.reconnects.store(0, Ordering::Relaxed);
+        self.select_speaker_async_opts(id, true, false);
     }
 
-    fn select_speaker_async_opts(self: &Arc<Self>, id: &str, interactive: bool) {
+    /// Non-interactive [`select_speaker_async`] for automatic callers
+    /// (launch reconnect to a speaker added by address).
+    ///
+    /// [`select_speaker_async`]: App::select_speaker_async
+    pub fn connect_in_background(self: &Arc<Self>, id: &str) {
+        self.select_speaker_async_opts(id, false, false);
+    }
+
+    /// `only_if_idle`: give up unless nothing is bound either — decided
+    /// under the same `connecting` lock every select claims, so an
+    /// automatic connect can never replace a speaker the user picked.
+    fn select_speaker_async_opts(self: &Arc<Self>, id: &str, interactive: bool, only_if_idle: bool) {
         {
             let mut guard = self.connecting.lock().unwrap();
+            if only_if_idle && guard.is_none() && self.session.lock().unwrap().is_some() {
+                return;
+            }
             if let Some(name) = guard.as_ref() {
                 if interactive {
                     self.record_error(format!("Still connecting to {} — give it a moment.", name));
@@ -1046,32 +1338,30 @@ impl App {
                 return;
             }
             // Resolve a display name best-effort for the banner.
-            let name = self
-                .discovery
-                .as_ref()
-                .and_then(|d| d.find_by_id(id))
-                .map(|r| r.display_name())
-                .or_else(|| {
-                    self.airplay_discovery
-                        .as_ref()
-                        .and_then(|d| d.find_by_id(id))
-                        .map(|r| r.friendly_name)
-                })
-                .unwrap_or_else(|| id.to_string());
+            let name = self.speaker_name(id).unwrap_or_else(|| id.to_string());
             *guard = Some(name);
         }
         let app = self.clone();
         let id = id.to_string();
-        std::thread::Builder::new()
+        if std::thread::Builder::new()
             .name("stream-to-speaker-connect".into())
             .spawn(move || {
-                let result = app.select_speaker_opts(&id, interactive);
+                // A click is the user's choice; other background connects
+                // (reconnects, auto-connect) only bind while streaming is
+                // still enabled.
+                let result = app.select_speaker_opts(&id, interactive, interactive);
                 *app.connecting.lock().unwrap() = None;
                 if let Err(e) = result {
-                    app.record_error(format!("Couldn't connect to speaker: {}", e));
+                    let msg = format!("Couldn't connect to speaker: {}", e);
+                    app.record_fault(&msg);
+                    app.record_error(msg);
                 }
             })
-            .ok();
+            .is_err()
+        {
+            *self.connecting.lock().unwrap() = None;
+            self.record_error("Couldn't start connecting (no thread available).");
+        }
     }
 
     /// Background watchdog: when a live session drops mid-stream (speaker
@@ -1138,6 +1428,7 @@ impl App {
                         name,
                         RECONNECT_GRACE.as_secs()
                     );
+                    app.record_fault(&format!("Connection to {} dropped", name));
                     app.record_error(format!("Lost connection to {} — reconnecting…", name));
 
                     // Grace before the retry, cancellable by shutdown or a
@@ -1178,7 +1469,8 @@ impl App {
                     // (no hammering a gone speaker / poking the Sonos hold).
                     // Non-interactive: an unattended retry must never pop
                     // a PIN pairing prompt on the user's TV.
-                    app.select_speaker_async_opts(&id, false);
+                    app.reconnects.fetch_add(1, Ordering::Relaxed);
+                    app.select_speaker_async_opts(&id, false, false);
                     while app.connecting.lock().unwrap().is_some() {
                         if app.is_shutting_down() {
                             return;
@@ -1280,10 +1572,38 @@ impl App {
     /// entry point of the web API / tray toggle / launch reconnect, where
     /// nobody could answer a PIN prompt).
     pub fn select_speaker(self: &Arc<Self>, id: &str) -> Result<(), String> {
-        self.select_speaker_opts(id, false)
+        // Claim the same `connecting` slot the background connects use, so
+        // the two can't run at once and auto-connect sees this one.
+        {
+            let mut guard = self.connecting.lock().unwrap();
+            if let Some(name) = guard.as_ref() {
+                return Err(format!("Still connecting to {} — try again in a moment.", name));
+            }
+            *guard = Some(self.speaker_name(id).unwrap_or_else(|| id.to_string()));
+        }
+        struct Release<'a>(&'a Mutex<Option<String>>);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = None;
+            }
+        }
+        let _release = Release(&self.connecting);
+        self.select_speaker_opts(id, false, true)
     }
 
-    fn select_speaker_opts(self: &Arc<Self>, id: &str, interactive: bool) -> Result<(), String> {
+    /// `user_choice`: the user asked for this speaker now, which (re-)enables
+    /// streaming up front. Either way the new session binds only if
+    /// streaming is still enabled when it is up — a Disable pressed while
+    /// it was connecting wins, and the fresh session is stopped instead.
+    fn select_speaker_opts(
+        self: &Arc<Self>,
+        id: &str,
+        interactive: bool,
+        user_choice: bool,
+    ) -> Result<(), String> {
+        if user_choice {
+            self.streaming_enabled.store(true, Ordering::Release);
+        }
         // A PIN ceremony in flight for THIS device owns its pairing state:
         // a concurrent transient pair-setup would reset the accessory's
         // single in-progress HAP pairing session and make the ceremony
@@ -1321,8 +1641,11 @@ impl App {
         // last scan streams to its group coordinator instead (see
         // start_upnp). Remember the id we actually bound so reconnect /
         // active-row highlighting track reality.
-        let new_session = if id.starts_with("airplay:") {
-            match self.start_airplay(id) {
+        let manual = self.find_manual_speaker(id);
+        let new_session = if let Some(m) = manual.as_ref().filter(|m| m.kind == ManualKind::Upnp) {
+            self.start_upnp_manual(m)?
+        } else if id.starts_with("airplay:") {
+            match self.start_airplay(id, manual.as_ref()) {
                 Ok(s) => s,
                 Err(SelectFailure::Msg(m)) => return Err(m),
                 Err(SelectFailure::NeedsPin { id: pid, name, details }) => {
@@ -1365,6 +1688,15 @@ impl App {
             old.stop();
             guard = self.session.lock().unwrap();
         }
+        // Checked under the session lock: Disable flips the flag before it
+        // takes the session, so either it sees ours or we see its flag.
+        if !self.streaming_enabled.load(Ordering::Acquire) {
+            drop(guard);
+            info!("streaming was disabled while connecting to {}; not binding", actual_id);
+            new_session.stop();
+            self.prune_stream_clients();
+            return Ok(());
+        }
         *guard = Some(new_session);
         // CRITICAL: drop the session-mutex guard before calling any
         // method that re-locks it. std::sync::Mutex is NOT re-entrant
@@ -1388,7 +1720,7 @@ impl App {
         self.prune_stream_clients();
 
         *self.last_speaker_id.lock().unwrap() = Some(actual_id.clone());
-        self.streaming_enabled.store(true, Ordering::Release);
+        *self.session_started.lock().unwrap() = Some((actual_id.clone(), Instant::now()));
         // Persist so the next launch can auto-reconnect. We do NOT
         // auto-dismiss the onboarding here — picking a speaker only
         // proves step 2 is done; step 1 (routing Windows audio to
@@ -1470,13 +1802,58 @@ impl App {
         Ok(ActiveSession::Upnp(session))
     }
 
-    fn start_airplay(&self, id: &str) -> Result<ActiveSession, SelectFailure> {
-        let discovery = self
-            .airplay_discovery
-            .as_ref()
-            .ok_or_else(|| SelectFailure::Msg("AirPlay discovery disabled".to_string()))?;
-        let Some(renderer) = discovery.find_by_id(id) else {
-            return Err(SelectFailure::Msg(format!("no AirPlay speaker with id {:?}", id)));
+    /// UPnP session to a speaker added by its device-description URL: the
+    /// description is fetched now (exactly as discovery would have) and the
+    /// session keeps the manual id.
+    fn start_upnp_manual(&self, m: &ManualSpeaker) -> Result<ActiveSession, String> {
+        // Fetch from an IPv4 address: the stream and the SOAP control
+        // paths are IPv4-only, and a hostname may resolve IPv6-first.
+        let mut url = url::Url::parse(&m.host).map_err(|e| format!("{}: {}", m.host, e))?;
+        let host = url.host_str().unwrap_or_default().to_string();
+        let ip = manual_speakers::resolve_ipv4(&host, url.port().unwrap_or(80))?;
+        url.set_ip_host(IpAddr::V4(ip))
+            .map_err(|_| format!("{}: can't use address {}", m.host, ip))?;
+        let r = crate::ssdp::fetch_and_parse_device(url.as_str(), Duration::from_secs(3))
+            .map_err(|e| format!("couldn't read {}: {:#}", m.host, e))?;
+        let own_udn = r.udn.clone();
+        // A Sonos that's grouped streams via its coordinator, as for a
+        // discovered one; the coordinator is looked up in discovery.
+        let r = match self.discovery.clone() {
+            Some(d) => crate::sonos::resolve_group_coordinator(r, &move |cid| d.find_by_id(cid)),
+            None => r,
+        };
+        let redirected = r.udn != own_udn;
+        let grant = self.stream_gate.grant(r.stream_peers());
+        let local_ip = self.local_ip_toward(r.ip).map_err(|e| e.to_string())?;
+        let (stream_uri, callback_url) = local_urls(local_ip, self.config.bind.port());
+        let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms);
+        let mut session = start_session(r, &stream_uri, &didl, &callback_url, Some(grant))
+            .map_err(|e| format!("{:#}", e))?;
+        if !redirected {
+            session.id_override = Some(m.id());
+        }
+        Ok(ActiveSession::Upnp(session))
+    }
+
+    /// AirPlay session to a discovered receiver (`manual` None) or to one
+    /// added by address, which is resolved and probed first.
+    fn start_airplay(
+        &self,
+        id: &str,
+        manual: Option<&ManualSpeaker>,
+    ) -> Result<ActiveSession, SelectFailure> {
+        let (renderer, discovery) = match manual {
+            Some(m) => (self.resolve_manual_airplay(m).map_err(SelectFailure::Msg)?, None),
+            None => {
+                let discovery = self
+                    .airplay_discovery
+                    .as_deref()
+                    .ok_or_else(|| SelectFailure::Msg("AirPlay discovery disabled".to_string()))?;
+                let Some(renderer) = discovery.find_by_id(id) else {
+                    return Err(SelectFailure::Msg(format!("no AirPlay speaker with id {:?}", id)));
+                };
+                (renderer, Some(discovery))
+            }
         };
         debug!(
             "AirPlay select {}: transport={:?} supports_ap2={} features={:?} airplay_port={:?} raop_port={} et={:?}",
@@ -1559,16 +1936,40 @@ impl App {
         }
     }
 
+    /// Build the receiver record for a manual AirPlay entry: resolve the
+    /// host, then ask the receiver what it is (`GET /info`). Cached for
+    /// later lookups by id (PIN pairing).
+    fn resolve_manual_airplay(&self, m: &ManualSpeaker) -> Result<AirPlayRenderer, String> {
+        let ip = manual_speakers::resolve_ipv4(&m.host, m.port)?;
+        let addr = SocketAddr::new(IpAddr::V4(ip), m.port);
+        let info = manual_speakers::probe_info(addr, Duration::from_secs(3))?;
+        match &info {
+            Some(i) => info!(
+                "manual AirPlay {}: /info model={:?} features={:?}",
+                addr, i.model, i.features
+            ),
+            None => info!("manual AirPlay {}: no /info answer — treating it as AirPlay 1", addr),
+        }
+        let r = manual_speakers::airplay_renderer(m, ip, info.as_ref());
+        self.manual_resolved
+            .lock()
+            .unwrap()
+            .insert(r.stable_id(), r.clone());
+        Ok(r)
+    }
+
     /// Ordered list of AirPlay paths to try for a selected device, best
     /// first. Receivers that advertise PTP / transient pairing (HomePod,
     /// Sonos) are tried over AirPlay 2 first; legacy receivers over RAOP
     /// first. The other path is always appended as a fallback, and an
     /// AirPlay 2 sibling at the same IP is used when the `_raop` and
     /// `_airplay` records didn't merge into one entry.
+    /// `discovery` is None for a manually added receiver, which is never
+    /// paired up with a discovered one.
     fn airplay_attempts(
         &self,
         renderer: &AirPlayRenderer,
-        discovery: &AirPlayDiscoveryState,
+        discovery: Option<&AirPlayDiscoveryState>,
     ) -> Vec<(Transport, AirPlayRenderer)> {
         // A stereo pair plays over AirPlay 2 on every member, or not at all.
         if renderer.pair.is_some() {
@@ -1583,10 +1984,11 @@ impl App {
         let ap2 = if renderer.supports_airplay2() {
             Some(renderer.clone())
         } else {
-            discovery
-                .renderers()
-                .into_iter()
-                .find(|r| r.ip == renderer.ip && r.supports_airplay2())
+            discovery.and_then(|d| {
+                d.renderers()
+                    .into_iter()
+                    .find(|r| r.ip == renderer.ip && r.supports_airplay2())
+            })
         };
         let raop = renderer.supports_legacy_raop();
 
@@ -1638,7 +2040,7 @@ impl App {
                         uc.airplay_mfi_encryption,
                         uc.airplay_uncompressed_alac,
                         uc.airplay_passwords.get(&renderer.stable_id()).cloned(),
-                        uc.effective_airplay_latency_ms(),
+                        uc.airplay_latency_ms_for(&renderer.stable_id()),
                     )
                 };
                 let session = AirPlaySession::start(AirPlaySessionConfig {
@@ -1666,9 +2068,9 @@ impl App {
                     (
                         uc.prefer_realtime_airplay,
                         uc.airplay_pairings.get(&stable_id).cloned(),
-                        uc.effective_airplay_latency_ms(),
+                        uc.airplay_latency_ms_for(&stable_id),
                         !uc.airplay_homepod_buffered,
-                        uc.effective_homepod_latency_ms(),
+                        uc.homepod_latency_ms_for(&stable_id),
                     )
                 };
                 match AirPlay2Session::start(AirPlay2SessionConfig {
@@ -1748,11 +2150,7 @@ impl App {
         // it), panic — clears it.
         let guard = CeremonyGuard(self.clone());
 
-        let Some(renderer) = self
-            .airplay_discovery
-            .as_ref()
-            .and_then(|d| d.find_by_id(&id))
-        else {
+        let Some(renderer) = self.find_airplay_renderer(&id) else {
             self.record_error(format!("Can't pair {} — it's no longer discovered.", name));
             return;
         };
@@ -1863,7 +2261,7 @@ impl App {
                             }
                             std::thread::sleep(Duration::from_millis(100));
                         }
-                        app.select_speaker_async_opts(&id, false);
+                        app.select_speaker_async_opts(&id, false, false);
                     }
                     Err(e) => {
                         app.record_error(format!(
@@ -1907,7 +2305,7 @@ impl App {
     /// receiver rejected them — it forgot the pairing).
     fn remove_airplay_pairing(&self, id: &str) {
         let mut uc = self.user_config.lock().unwrap();
-        if uc.airplay_pairings.remove(id).is_some() {
+        if uc.remove_airplay_pairing(id) {
             uc.save();
         }
     }
@@ -2035,6 +2433,166 @@ impl App {
         crate::endpoint_name::update_endpoint_name(None);
     }
 
+    // -------------------------------------------------------------------
+    // Discovery network (adapter selection)
+    // -------------------------------------------------------------------
+
+    /// Start SSDP (every `ssdp_interval`) and mDNS discovery on the saved
+    /// adapter choice, plus the monitor that pauses / resumes them as that
+    /// adapter goes down and comes back.
+    pub fn start_discovery(self: &Arc<Self>, ssdp_interval: Duration) {
+        let adapters = discovery_net::list_adapters();
+        let resolved = self.resolve_scope(&adapters);
+        info!("discovery: {:?}", resolved);
+        *self.adapters_cache.lock().unwrap() = adapters;
+        *self.discovery_scope.lock().unwrap() = resolved.clone();
+
+        if let Some(d) = self.discovery.clone() {
+            let weak = Arc::downgrade(self);
+            let scope: crate::ssdp::ScopeFn = Arc::new(move || {
+                weak.upgrade().map(|a| a.ssdp_scope()).unwrap_or(SearchScope::Paused)
+            });
+            crate::ssdp::spawn_discovery(d, ssdp_interval, scope);
+        }
+        if let Some(state) = self.airplay_discovery.clone() {
+            let ctl = MdnsController::new(state);
+            let started = match &resolved {
+                Resolved::All => ctl.start(None),
+                Resolved::Active { name, .. } => ctl.start(Some(name)),
+                Resolved::Paused { .. } => Ok(()),
+            };
+            if let Err(e) = started {
+                self.note_discovery_failure(&e);
+            }
+            *self.mdns.lock().unwrap() = Some(ctl);
+        }
+
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-netwatch".into())
+            .spawn(move || {
+                while app.sleep_unless_shutdown(Duration::from_secs(2)) {
+                    app.refresh_discovery_scope();
+                }
+            })
+            .ok();
+    }
+
+    fn note_discovery_failure(&self, e: &anyhow::Error) {
+        let msg = format!(
+            "AirPlay discovery couldn't start ({:#}). You can still add AirPlay speakers \
+             by address with the Add button.",
+            e
+        );
+        self.record_error(msg.clone());
+        *self.discovery_error.lock().unwrap() = Some(msg);
+    }
+
+    /// The saved adapter choice mapped onto `adapters`. A command-line pin
+    /// (`--advertise-ip` / `--bind`) overrides it: SSDP then searches from
+    /// that address and mDNS from every adapter, as before the choice
+    /// existed.
+    fn resolve_scope(&self, adapters: &[NetAdapter]) -> Resolved {
+        if self.config.ssdp_iface.is_some() {
+            return Resolved::All;
+        }
+        let selected = self.user_config.lock().unwrap().discovery_adapter.clone();
+        discovery_net::resolve(selected.as_ref(), adapters)
+    }
+
+    /// Where SSDP searches right now.
+    pub fn ssdp_scope(&self) -> SearchScope {
+        if let Some(ip) = self.config.ssdp_iface {
+            return SearchScope::Iface(ip);
+        }
+        match &*self.discovery_scope.lock().unwrap() {
+            Resolved::All => SearchScope::All,
+            Resolved::Active { ip, .. } => SearchScope::Iface(*ip),
+            Resolved::Paused { .. } => SearchScope::Paused,
+        }
+    }
+
+    /// Re-check the adapters and apply any change of scope: restart mDNS
+    /// on the new interface set (or stop it while paused), forget what
+    /// was found on the old network, and search again.
+    fn refresh_discovery_scope(self: &Arc<Self>) {
+        let _serial = self.scope_apply.lock().unwrap();
+        let adapters = discovery_net::list_adapters();
+        let new = self.resolve_scope(&adapters);
+        *self.adapters_cache.lock().unwrap() = adapters;
+        let old = std::mem::replace(&mut *self.discovery_scope.lock().unwrap(), new.clone());
+        if old == new {
+            return;
+        }
+        match &new {
+            Resolved::All => info!("discovery: searching on every adapter"),
+            Resolved::Active { name, ip } => info!("discovery: searching on {} ({})", name, ip),
+            Resolved::Paused { name } => {
+                warn!("discovery: paused — adapter {} is unavailable", name)
+            }
+        }
+        if let Some(ctl) = self.mdns.lock().unwrap().as_ref() {
+            let same_adapter = matches!(
+                (&old, &new),
+                (Resolved::Active { name: a, .. }, Resolved::Active { name: b, .. }) if a == b
+            );
+            let result = match &new {
+                // The mDNS stack follows address changes on the same
+                // adapter by itself.
+                _ if same_adapter => Ok(()),
+                Resolved::All => ctl.start(None),
+                Resolved::Active { name, .. } => ctl.start(Some(name)),
+                Resolved::Paused { .. } => {
+                    ctl.stop();
+                    Ok(())
+                }
+            };
+            match result {
+                Ok(()) => *self.discovery_error.lock().unwrap() = None,
+                Err(e) => self.note_discovery_failure(&e),
+            }
+        }
+        if let Some(d) = self.discovery.as_ref() {
+            d.clear();
+        }
+        if !matches!(new, Resolved::Paused { .. }) {
+            self.trigger_rescan();
+        }
+    }
+
+    /// Settings: the adapters to offer (as of the last check, at most a
+    /// couple of seconds old).
+    pub fn network_adapters(&self) -> Vec<NetAdapter> {
+        self.adapters_cache.lock().unwrap().clone()
+    }
+
+    pub fn discovery_net_status(&self) -> DiscoveryNetStatus {
+        DiscoveryNetStatus {
+            scope: self.discovery_scope.lock().unwrap().clone(),
+            selected: self.user_config.lock().unwrap().discovery_adapter.clone(),
+            pinned: self.config.ssdp_iface,
+            error: self.discovery_error.lock().unwrap().clone(),
+        }
+    }
+
+    /// Persist a new adapter choice (`None` = every adapter) and apply it
+    /// off the calling thread (restarting mDNS takes a moment).
+    pub fn set_discovery_adapter(self: &Arc<Self>, choice: Option<SavedAdapter>) {
+        {
+            let mut uc = self.user_config.lock().unwrap();
+            if uc.discovery_adapter == choice {
+                return;
+            }
+            uc.discovery_adapter = choice;
+            uc.save();
+        }
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-netapply".into())
+            .spawn(move || app.refresh_discovery_scope())
+            .ok();
+    }
+
     /// Fire a one-shot SSDP M-SEARCH on the same interface the periodic
     /// loop uses. Runs on a detached thread because `discover_once`
     /// blocks for ~3 s waiting for responses; the GUI button doesn't
@@ -2050,12 +2608,26 @@ impl App {
         if self.rescan_in_flight.swap(true, Ordering::AcqRel) {
             return;
         }
-        let iface = self.config.ssdp_iface;
+        let scope = self.ssdp_scope();
+        let Some(iface) = scope.iface() else {
+            self.rescan_in_flight.store(false, Ordering::Release);
+            if let Resolved::Paused { name } = &*self.discovery_scope.lock().unwrap() {
+                self.record_error(format!(
+                    "Speaker search is paused: the network adapter \"{}\" is unavailable. \
+                     It resumes when the adapter is back, or choose another adapter in \
+                     Advanced.",
+                    name
+                ));
+            }
+            return;
+        };
         let app = self.clone();
         let spawned = std::thread::Builder::new()
             .name("stream-to-speaker-rescan".to_string())
             .spawn(move || {
                 match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
+                    // Searched the old network; the scope moved meanwhile.
+                    Ok(_) if app.ssdp_scope() != scope => {}
                     Ok(found) => {
                         let n = found.len();
                         info!("manual rescan: {} renderer(s) found", n);
@@ -2149,6 +2721,10 @@ impl App {
             }
             self.prune_stream_clients();
             info!("streaming disabled");
+        } else if let Some(name) = self.connecting_to() {
+            // A connect is still in flight; with streaming enabled again
+            // it binds when it's up, so starting another would only fight it.
+            info!("streaming enabled; the connect to {} in progress will bind", name);
         } else {
             let last = self.last_speaker_id.lock().unwrap().clone();
             match last {
@@ -2243,6 +2819,209 @@ impl App {
     }
 
     // -------------------------------------------------------------------
+    // Diagnostics
+    // -------------------------------------------------------------------
+
+    /// Counters and state right now. Brief locks only.
+    pub fn diagnostics_snapshot(&self) -> Snapshot {
+        let (speaker, speaker_id, speaker_addr, transport, resend) = {
+            let guard = self.session.lock().unwrap();
+            match guard.as_ref() {
+                Some(s) => (
+                    Some(s.friendly_name()),
+                    Some(s.stable_id()),
+                    Some(s.ip().to_string()),
+                    Some(s.transport_label()),
+                    s.resend_stats(),
+                ),
+                None => (None, None, None, None, None),
+            }
+        };
+        let session_secs = self
+            .session_started
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(id, _)| speaker_id.as_deref() == Some(id.as_str()))
+            .map(|(_, t)| t.elapsed().as_secs());
+        let airplay_buffer_ms = speaker_id
+            .as_deref()
+            .filter(|id| id.starts_with("airplay:"))
+            .map(|id| self.airplay_latency_ms_for(id));
+        let discovery = match &*self.discovery_scope.lock().unwrap() {
+            _ if self.config.no_discovery && self.airplay_discovery.is_none() => {
+                "off".to_string()
+            }
+            Resolved::All => match self.config.ssdp_iface {
+                Some(ip) => format!("SSDP from {}, mDNS on every adapter", ip),
+                None => "every adapter".to_string(),
+            },
+            Resolved::Active { name, ip } => format!("{} ({}) only", name, ip),
+            Resolved::Paused { name } => format!("paused ({} unavailable)", name),
+        };
+        Snapshot {
+            taken_unix: now_unix(),
+            app_uptime_secs: self.uptime_secs(),
+            speaker,
+            speaker_id,
+            speaker_addr,
+            transport,
+            session_secs,
+            reconnects: self.reconnects.load(Ordering::Relaxed),
+            streaming_enabled: self.is_streaming_enabled(),
+            audio_active: self.stream_active.load(Ordering::Acquire),
+            connecting_to: self.connecting_to(),
+            packets_published: self.packets_published(),
+            idle_silence_packets: self.idle_silence_packets.load(Ordering::Relaxed),
+            dropped_packets: self.hub.dropped_frames(),
+            hub_consumers: self.hub.subscriber_count(),
+            resend,
+            pending_latency_ms: self.pending_latency_ms(),
+            airplay_buffer_ms,
+            stream_format: "L16 PCM, 44.1 kHz, 16-bit, stereo",
+            discovery,
+            speakers_listed: self.speaker_view().speakers.len(),
+        }
+    }
+
+    /// Remember a fault together with the counters just before it.
+    fn record_fault(&self, what: &str) {
+        let before = self.diagnostics_snapshot();
+        *self.last_fault.lock().unwrap() = Some(Fault {
+            when_unix: now_unix(),
+            what: what.to_string(),
+            before,
+        });
+    }
+
+    pub fn last_fault(&self) -> Option<Fault> {
+        self.last_fault.lock().unwrap().clone()
+    }
+
+    /// Plain-text diagnostics for the clipboard.
+    pub fn diagnostics_report(&self) -> String {
+        let last_error = self.last_error.lock().unwrap().as_ref().map(|(m, _)| m.clone());
+        crate::diagnostics::report(
+            PRODUCT_NAME,
+            crate::display_version(),
+            &self.diagnostics_snapshot(),
+            last_error.as_deref(),
+            self.last_fault().as_ref(),
+        )
+    }
+
+    /// The AirPlay buffer used when connecting to `id`.
+    pub fn airplay_latency_ms_for(&self, id: &str) -> u32 {
+        self.user_config.lock().unwrap().airplay_latency_ms_for(id)
+    }
+
+    // -------------------------------------------------------------------
+    // Per-speaker settings
+    // -------------------------------------------------------------------
+
+    pub fn speaker_settings(&self, id: &str) -> SpeakerSettings {
+        self.user_config
+            .lock()
+            .unwrap()
+            .speaker_settings
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Store one speaker's settings (an all-default value drops its entry).
+    pub fn set_speaker_settings(&self, id: &str, settings: SpeakerSettings) {
+        let mut uc = self.user_config.lock().unwrap();
+        let changed = if settings.is_default() {
+            uc.speaker_settings.remove(id).is_some()
+        } else if uc.speaker_settings.get(id) != Some(&settings) {
+            uc.speaker_settings.insert(id.to_string(), settings);
+            true
+        } else {
+            false
+        };
+        if changed {
+            uc.save();
+        }
+    }
+
+    /// Whether launch-time reconnection may pick `id` (its own setting
+    /// can veto it).
+    pub fn auto_connect_allowed_at_launch(&self, id: &str) -> bool {
+        self.speaker_settings(id).auto_connect != AutoConnect::Never
+    }
+
+    /// Background auto-connect for speakers set to "Always": when one is
+    /// listed (for at least a second), nothing is bound or connecting, and
+    /// the user hasn't switched streaming off, connect to it — the
+    /// last-used one first. Each speaker is tried once per appearance:
+    /// it is re-armed only after it drops out of the list and comes back.
+    /// Never interactive, so it can't start a PIN prompt.
+    pub fn spawn_auto_connect(self: &Arc<Self>) {
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-auto-connect".into())
+            .spawn(move || {
+                let mut first_seen: std::collections::HashMap<String, Instant> =
+                    std::collections::HashMap::new();
+                let mut tried: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                while app.sleep_unless_shutdown(Duration::from_secs(1)) {
+                    let always: Vec<String> = {
+                        let uc = app.user_config.lock().unwrap();
+                        uc.speaker_settings
+                            .iter()
+                            .filter(|(_, s)| s.auto_connect == AutoConnect::Always && !s.hidden)
+                            .map(|(id, _)| id.clone())
+                            .collect()
+                    };
+                    if always.is_empty() {
+                        first_seen.clear();
+                        tried.clear();
+                        continue;
+                    }
+                    let listed: std::collections::HashSet<String> =
+                        app.speaker_view().speakers.into_iter().map(|s| s.id).collect();
+                    first_seen.retain(|id, _| listed.contains(id));
+                    tried.retain(|id| listed.contains(id));
+                    let now = Instant::now();
+                    for id in always.iter().filter(|id| listed.contains(*id)) {
+                        first_seen.entry(id.clone()).or_insert(now);
+                    }
+                    if app.is_speaker_bound()
+                        || app.connecting_to().is_some()
+                        || !app.is_streaming_enabled()
+                        || app.pin_pairing_device().is_some()
+                    {
+                        continue;
+                    }
+                    let mut eligible: Vec<&String> = always
+                        .iter()
+                        .filter(|id| !tried.contains(*id))
+                        .filter(|id| {
+                            first_seen
+                                .get(*id)
+                                .map_or(false, |t| now.duration_since(*t) >= Duration::from_secs(1))
+                        })
+                        .collect();
+                    eligible.sort();
+                    let last = app.last_speaker_id.lock().unwrap().clone();
+                    let pick = eligible
+                        .iter()
+                        .find(|id| Some(id.as_str()) == last.as_deref())
+                        .or_else(|| eligible.first())
+                        .map(|id| (*id).clone());
+                    if let Some(id) = pick {
+                        info!("auto-connect: connecting to {}", id);
+                        tried.insert(id.clone());
+                        app.select_speaker_async_opts(&id, false, true);
+                    }
+                }
+            })
+            .ok();
+    }
+
+    // -------------------------------------------------------------------
     // Shutdown
     // -------------------------------------------------------------------
 
@@ -2292,6 +3071,7 @@ pub fn start_session(
         gena,
         stream_uri: stream_uri.to_string(),
         stream_grant,
+        id_override: None,
     })
 }
 

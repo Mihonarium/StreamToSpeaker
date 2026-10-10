@@ -37,6 +37,12 @@ pub struct SpeakerInfo {
     /// entry for a speaker that also has a non-AirPlay entry will have
     /// higher latency. `None` for most rows.
     pub note: Option<String>,
+    /// `true` for a speaker the user added by address rather than one
+    /// found by discovery.
+    pub manual: bool,
+    /// The user hid this speaker (only listed when hidden ones are asked
+    /// for, or while it is the one playing).
+    pub hidden: bool,
 }
 
 /// Callback that returns the current list of discovered speakers.
@@ -71,6 +77,9 @@ pub struct PcmFrame(pub Arc<Vec<u8>>);
 /// Hub used by the audio thread to push PCM and by HTTP workers to pull.
 pub struct StreamHub {
     subscribers: Mutex<Vec<HubSubscriber>>,
+    /// Frames a subscriber's full queue had no room for (dropped for that
+    /// subscriber only), since launch.
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 struct HubSubscriber {
@@ -84,6 +93,7 @@ impl StreamHub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             subscribers: Mutex::new(Vec::new()),
+            dropped: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -116,6 +126,8 @@ impl StreamHub {
                 Err(crossbeam_channel::TrySendError::Full(_)) => {
                     // Drop the frame for this slow subscriber; they'll
                     // catch up.  We keep them subscribed.
+                    self.dropped
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     true
                 }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
@@ -133,6 +145,11 @@ impl StreamHub {
         let before = subs.len();
         subs.retain(|sub| !sub.peer.map(&pred).unwrap_or(false));
         before - subs.len()
+    }
+
+    /// Frames dropped for slow subscribers since launch.
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Current subscriber count.
@@ -560,11 +577,12 @@ fn speakers_to_json(list: &[SpeakerInfo]) -> String {
             s.push(',');
         }
         s.push_str(&format!(
-            r#"{{"id":{},"name":{},"ip":{},"active":{}}}"#,
+            r#"{{"id":{},"name":{},"ip":{},"active":{},"manual":{}}}"#,
             json_string(&sp.id),
             json_string(&sp.friendly_name),
             json_string(&sp.ip),
-            sp.active
+            sp.active,
+            sp.manual
         ));
     }
     s.push_str("]}");

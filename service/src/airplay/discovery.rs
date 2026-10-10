@@ -453,6 +453,13 @@ impl AirPlayDiscoveryState {
         self.airplay.lock().unwrap().insert(mac, info);
     }
 
+    /// Forget every receiver (the browse is being restarted on a
+    /// different set of interfaces).
+    pub fn clear(&self) {
+        self.raop.lock().unwrap().clear();
+        self.airplay.lock().unwrap().clear();
+    }
+
     fn remove(&self, mac: &str, service: &str) {
         if service == RAOP_SERVICE {
             self.raop.lock().unwrap().remove(mac);
@@ -590,11 +597,18 @@ pub fn spawn_airplay_discovery(
     iface_hint: Option<Ipv4Addr>,
 ) -> Result<()> {
     let daemon = ServiceDaemon::new().map_err(|e| anyhow::anyhow!("mdns daemon init: {}", e))?;
+    info!("AirPlay discovery: iface hint {:?}", iface_hint);
+    spawn_airplay_discovery_on(state, daemon)
+}
 
-    info!(
-        "AirPlay discovery: browsing {} + {} (iface hint {:?})",
-        RAOP_SERVICE, AIRPLAY_SERVICE, iface_hint,
-    );
+/// Browse both service types on a caller-built daemon (one whose
+/// interface selection the caller controls). Consumers exit when the
+/// daemon shuts down.
+pub fn spawn_airplay_discovery_on(
+    state: Arc<AirPlayDiscoveryState>,
+    daemon: ServiceDaemon,
+) -> Result<()> {
+    info!("AirPlay discovery: browsing {} + {}", RAOP_SERVICE, AIRPLAY_SERVICE);
 
     for service in [RAOP_SERVICE, AIRPLAY_SERVICE] {
         let receiver = daemon

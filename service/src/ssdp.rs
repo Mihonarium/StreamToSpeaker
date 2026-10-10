@@ -120,6 +120,12 @@ impl DiscoveryState {
         None
     }
 
+    /// Forget every renderer (discovery moved to another network, or
+    /// paused because its adapter went away).
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().clear();
+    }
+
     pub fn first(&self) -> Option<Renderer> {
         self.inner.lock().unwrap().first().cloned()
     }
@@ -215,20 +221,52 @@ const SEARCH_TARGETS: &[&str] = &[
 
 const SSDP_MULTICAST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900);
 
+/// Where an SSDP search goes out from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchScope {
+    /// Every non-loopback IPv4 interface.
+    All,
+    /// One local IPv4 only (a pinned address or the chosen adapter's).
+    Iface(Ipv4Addr),
+    /// Don't search: the chosen adapter is unavailable, and searching
+    /// elsewhere instead would defeat the choice.
+    Paused,
+}
+
+impl SearchScope {
+    /// The `iface` argument of [`discover_once`], or None when paused.
+    pub fn iface(self) -> Option<Option<Ipv4Addr>> {
+        match self {
+            SearchScope::All => Some(None),
+            SearchScope::Iface(ip) => Some(Some(ip)),
+            SearchScope::Paused => None,
+        }
+    }
+}
+
+/// Shared "where to search" query, re-read before every sweep.
+pub type ScopeFn = Arc<dyn Fn() -> SearchScope + Send + Sync>;
+
 /// Spawn the SSDP discovery background thread.  Runs an initial discovery
-/// immediately and then every `interval` afterwards.
-/// `iface` pins the search to one local IPv4; `None` searches from every
-/// interface (see [`discover_once`]).
-pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, iface: Option<Ipv4Addr>) {
+/// immediately and then every `interval` afterwards, each sweep from
+/// wherever `scope` says at that moment (see [`discover_once`]). A sweep
+/// whose scope changed while it ran is discarded — its results belong to
+/// the old network.
+pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, scope: ScopeFn) {
     thread::Builder::new()
         .name("stream-to-speaker-ssdp".to_string())
         .spawn(move || loop {
-            match discover_once(Duration::from_secs(3), iface) {
-                Ok(found) => {
-                    info!("SSDP discovery: {} renderer(s) found", found.len());
-                    state.replace(found);
-                }
-                Err(e) => warn!("SSDP discovery failed: {}", e),
+            let used = scope();
+            match used.iface() {
+                None => debug!("SSDP discovery paused (chosen adapter unavailable)"),
+                Some(iface) => match discover_once(Duration::from_secs(3), iface) {
+                    Ok(found) if scope() == used => {
+                        info!("SSDP discovery: {} renderer(s) found", found.len());
+                        state.replace(found);
+                    }
+                    Ok(_) => debug!("SSDP sweep discarded: discovery scope changed meanwhile"),
+                    Err(e) => warn!("SSDP discovery failed: {}", e),
+                },
             }
             thread::sleep(interval);
         })
@@ -513,6 +551,10 @@ fn absolute_url(base: &str, maybe_relative: &str) -> String {
     }
 }
 
+/// Largest response [`http_get`] accepts. Device descriptions are a few
+/// KB; anything near this is not one (a stream URL, say).
+const MAX_HTTP_GET_BYTES: usize = 256 * 1024;
+
 /// Tiny blocking HTTP GET. We don't have hyper/reqwest; this is fine for
 /// the few KB of XML SSDP responders return.
 pub fn http_get(url_str: &str, timeout: Duration) -> Result<String> {
@@ -523,7 +565,14 @@ pub fn http_get(url_str: &str, timeout: Duration) -> Result<String> {
     }
     let host = url.host_str().ok_or_else(|| anyhow!("no host"))?;
     let port = url.port().unwrap_or(80);
-    let path = if url.path().is_empty() { "/" } else { url.path() };
+    let mut path = if url.path().is_empty() { "/".to_string() } else { url.path().to_string() };
+    if let Some(q) = url.query() {
+        path.push('?');
+        path.push_str(q);
+    }
+    // Whole-request deadline: per-read timeouts alone let a server that
+    // trickles bytes hold us indefinitely.
+    let deadline = Instant::now() + timeout * 2;
 
     let mut stream = TcpStream::connect_timeout(
         &(host, port).to_socket_addrs_first()?,
@@ -543,7 +592,26 @@ pub fn http_get(url_str: &str, timeout: Duration) -> Result<String> {
     stream.write_all(req.as_bytes())?;
 
     let mut buf = Vec::with_capacity(16384);
-    stream.read_to_end(&mut buf)?;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(anyhow!("GET {} took too long", url_str));
+        }
+        stream.set_read_timeout(Some(left.min(timeout)))?;
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > MAX_HTTP_GET_BYTES {
+            return Err(anyhow!(
+                "GET {}: response larger than {} KB",
+                url_str,
+                MAX_HTTP_GET_BYTES / 1024
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
 
     // Find headers/body split. Robust to header lines being CRLF or LF only.
     let split_pos = find_header_body_split(&buf)
