@@ -539,6 +539,9 @@ fn run(cli: Cli) -> Result<()> {
             if !app.is_auto_reconnect_on_launch() {
                 info!("auto-reconnect disabled by user preference; saved={:?}", saved_id);
                 None
+            } else if !app.auto_connect_allowed_at_launch(&saved_id) {
+                info!("auto-reconnect: {:?} is set to never auto-connect", saved_id);
+                None
             } else if app.find_manual_speaker(&saved_id).is_some() {
                 // Added by address: nothing to wait for in discovery.
                 info!("auto-reconnect: trying saved manual speaker {:?}", saved_id);
@@ -568,6 +571,9 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
     }
+
+    // Speakers set to connect automatically whenever they appear.
+    app.spawn_auto_connect();
 
     if cli.headless {
         run_headless(app)

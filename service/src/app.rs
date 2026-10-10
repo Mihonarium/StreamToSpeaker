@@ -29,7 +29,7 @@ use crate::manual_speakers::{self, ManualKind, ManualSpeaker};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use crate::ssdp::{DiscoveryState, Renderer, SearchScope};
 use crate::stream_gate::{canonical_ip, is_local_address, Grant, StreamGate};
-use crate::user_config::UserConfig;
+use crate::user_config::{AutoConnect, SpeakerSettings, UserConfig};
 use crate::volume_sync::VolumeSync;
 use crate::{upnp, PRODUCT_NAME, WIRE_SAMPLE_RATE};
 
@@ -1023,6 +1023,14 @@ impl App {
     /// single sorted list with one row per speaker regardless of which
     /// protocol it speaks.
     pub fn speaker_view(&self) -> SpeakerView {
+        self.speaker_view_opts(false)
+    }
+
+    /// [`speaker_view`] with the user-hidden speakers included (flagged)
+    /// when `include_hidden`; without it they're left out unless active.
+    ///
+    /// [`speaker_view`]: App::speaker_view
+    pub fn speaker_view_opts(&self, include_hidden: bool) -> SpeakerView {
         let active_id = self.session.lock().unwrap().as_ref().map(|s| s.stable_id());
         let mut speakers: Vec<SpeakerInfo> = Vec::new();
 
@@ -1060,6 +1068,7 @@ impl App {
                     active,
                     note,
                     manual: false,
+                    hidden: false,
                 });
             }
         }
@@ -1108,6 +1117,7 @@ impl App {
                     active,
                     note,
                     manual: false,
+                    hidden: false,
                 });
             }
         }
@@ -1128,8 +1138,18 @@ impl App {
                     how, m.host
                 )),
                 manual: true,
+                hidden: false,
                 id,
             });
+        }
+        {
+            let uc = self.user_config.lock().unwrap();
+            for sp in speakers.iter_mut() {
+                sp.hidden = uc.speaker_settings.get(&sp.id).map_or(false, |s| s.hidden);
+            }
+        }
+        if !include_hidden {
+            speakers.retain(|sp| !sp.hidden || sp.active);
         }
         speakers.sort_by(|a, b| a.friendly_name.cmp(&b.friendly_name));
         SpeakerView { speakers, active_id }
@@ -1825,7 +1845,7 @@ impl App {
                         uc.airplay_mfi_encryption,
                         uc.airplay_uncompressed_alac,
                         uc.airplay_passwords.get(&renderer.stable_id()).cloned(),
-                        uc.effective_airplay_latency_ms(),
+                        uc.airplay_latency_ms_for(&renderer.stable_id()),
                     )
                 };
                 let session = AirPlaySession::start(AirPlaySessionConfig {
@@ -1853,7 +1873,7 @@ impl App {
                     (
                         uc.prefer_realtime_airplay,
                         uc.airplay_pairings.get(&stable_id).cloned(),
-                        uc.effective_airplay_latency_ms(),
+                        uc.airplay_latency_ms_for(&stable_id),
                     )
                 };
                 match AirPlay2Session::start(AirPlay2SessionConfig {
@@ -2688,8 +2708,114 @@ impl App {
     }
 
     /// The AirPlay buffer used when connecting to `id`.
-    pub fn airplay_latency_ms_for(&self, _id: &str) -> u32 {
-        self.user_config.lock().unwrap().effective_airplay_latency_ms()
+    pub fn airplay_latency_ms_for(&self, id: &str) -> u32 {
+        self.user_config.lock().unwrap().airplay_latency_ms_for(id)
+    }
+
+    // -------------------------------------------------------------------
+    // Per-speaker settings
+    // -------------------------------------------------------------------
+
+    pub fn speaker_settings(&self, id: &str) -> SpeakerSettings {
+        self.user_config
+            .lock()
+            .unwrap()
+            .speaker_settings
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Store one speaker's settings (an all-default value drops its entry).
+    pub fn set_speaker_settings(&self, id: &str, settings: SpeakerSettings) {
+        let mut uc = self.user_config.lock().unwrap();
+        let changed = if settings.is_default() {
+            uc.speaker_settings.remove(id).is_some()
+        } else if uc.speaker_settings.get(id) != Some(&settings) {
+            uc.speaker_settings.insert(id.to_string(), settings);
+            true
+        } else {
+            false
+        };
+        if changed {
+            uc.save();
+        }
+    }
+
+    /// Whether launch-time reconnection may pick `id` (its own setting
+    /// can veto it).
+    pub fn auto_connect_allowed_at_launch(&self, id: &str) -> bool {
+        self.speaker_settings(id).auto_connect != AutoConnect::Never
+    }
+
+    /// Background auto-connect for speakers set to "Always": when one is
+    /// listed (for at least a second), nothing is bound or connecting, and
+    /// the user hasn't switched streaming off, connect to it — the
+    /// last-used one first. Each speaker is tried once per appearance:
+    /// it is re-armed only after it drops out of the list and comes back.
+    /// Never interactive, so it can't start a PIN prompt.
+    pub fn spawn_auto_connect(self: &Arc<Self>) {
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-auto-connect".into())
+            .spawn(move || {
+                let mut first_seen: std::collections::HashMap<String, Instant> =
+                    std::collections::HashMap::new();
+                let mut tried: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                while app.sleep_unless_shutdown(Duration::from_secs(1)) {
+                    let always: Vec<String> = {
+                        let uc = app.user_config.lock().unwrap();
+                        uc.speaker_settings
+                            .iter()
+                            .filter(|(_, s)| s.auto_connect == AutoConnect::Always && !s.hidden)
+                            .map(|(id, _)| id.clone())
+                            .collect()
+                    };
+                    if always.is_empty() {
+                        first_seen.clear();
+                        tried.clear();
+                        continue;
+                    }
+                    let listed: std::collections::HashSet<String> =
+                        app.speaker_view().speakers.into_iter().map(|s| s.id).collect();
+                    first_seen.retain(|id, _| listed.contains(id));
+                    tried.retain(|id| listed.contains(id));
+                    let now = Instant::now();
+                    for id in always.iter().filter(|id| listed.contains(*id)) {
+                        first_seen.entry(id.clone()).or_insert(now);
+                    }
+                    if app.is_speaker_bound()
+                        || app.connecting_to().is_some()
+                        || !app.is_streaming_enabled()
+                        || app.pin_pairing_device().is_some()
+                    {
+                        continue;
+                    }
+                    let mut eligible: Vec<&String> = always
+                        .iter()
+                        .filter(|id| !tried.contains(*id))
+                        .filter(|id| {
+                            first_seen
+                                .get(*id)
+                                .map_or(false, |t| now.duration_since(*t) >= Duration::from_secs(1))
+                        })
+                        .collect();
+                    eligible.sort();
+                    let last = app.last_speaker_id.lock().unwrap().clone();
+                    let pick = eligible
+                        .iter()
+                        .find(|id| Some(id.as_str()) == last.as_deref())
+                        .or_else(|| eligible.first())
+                        .map(|id| (*id).clone());
+                    if let Some(id) = pick {
+                        info!("auto-connect: connecting to {}", id);
+                        tried.insert(id.clone());
+                        app.select_speaker_async_opts(&id, false);
+                    }
+                }
+            })
+            .ok();
     }
 
     // -------------------------------------------------------------------

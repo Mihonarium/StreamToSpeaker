@@ -40,6 +40,9 @@ pub struct SpeakerInfo {
     /// `true` for a speaker the user added by address rather than one
     /// found by discovery.
     pub manual: bool,
+    /// The user hid this speaker (only listed when hidden ones are asked
+    /// for, or while it is the one playing).
+    pub hidden: bool,
 }
 
 /// Callback that returns the current list of discovered speakers.

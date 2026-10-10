@@ -845,6 +845,9 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
                 confirm_close_open: false,
                 password_prompt: None,
                 add_speaker_prompt: None,
+                speaker_settings_open: None,
+                settings_password: String::new(),
+                show_hidden_speakers: false,
                 pin_prompt: None,
                 last_fractional_scroll: None,
                 skip_close_confirmation,
@@ -894,6 +897,12 @@ struct StreamToSpeakerApp {
     password_prompt: Option<PasswordPrompt>,
     /// Open while the user is adding a speaker by address.
     add_speaker_prompt: Option<AddSpeakerPrompt>,
+    /// Speaker whose inline settings (⚙) are open.
+    speaker_settings_open: Option<String>,
+    /// Edit buffer for the open settings' AirPlay password field.
+    settings_password: String,
+    /// The list includes speakers the user hid.
+    show_hidden_speakers: bool,
     /// Open when an AP2 receiver (Apple TV with access control) is showing
     /// a PIN and awaiting one-time HomeKit pairing. Mirrors the app's
     /// `pending_pin_pairing` state each frame; `None` when no ceremony is
@@ -2378,8 +2387,32 @@ impl StreamToSpeakerApp {
             }
             ui.add_space(sp::XS);
 
-            let view = self.app.speaker_view();
-            if view.speakers.is_empty() {
+            let all = self.app.speaker_view_opts(true);
+            let hidden_n = all.speakers.iter().filter(|s| s.hidden && !s.active).count();
+            if hidden_n == 0 {
+                self.show_hidden_speakers = false;
+            }
+            let show_hidden = self.show_hidden_speakers;
+            let speakers: Vec<_> = all
+                .speakers
+                .into_iter()
+                .filter(|s| show_hidden || !s.hidden || s.active)
+                .collect();
+            if hidden_n > 0 {
+                let text = match (show_hidden, hidden_n) {
+                    (true, _) => "Hide hidden speakers".to_string(),
+                    (false, 1) => "Show 1 hidden speaker".to_string(),
+                    (false, n) => format!("Show {} hidden speakers", n),
+                };
+                if clickable(ui.link(egui::RichText::new(text).size(12.0)))
+                    .on_hover_text("Speakers you hid with ⚙ → Hide this speaker.")
+                    .clicked()
+                {
+                    self.show_hidden_speakers = !show_hidden;
+                }
+                ui.add_space(sp::XS / 2.0);
+            }
+            if speakers.is_empty() && hidden_n == 0 {
                 ui.add_space(4.0);
                 // After ~10 s with no results, the user has waited
                 // long enough that "still searching" stops being
@@ -2439,10 +2472,13 @@ impl StreamToSpeakerApp {
                 .max_height(190.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for sp in view.speakers {
-                        let trailing = sp
-                            .manual
-                            .then_some(("✕", "Remove this manually added speaker"));
+                    for mut sp in speakers {
+                        if sp.hidden {
+                            sp.friendly_name.push_str("  · hidden");
+                        }
+                        let settings_open =
+                            self.speaker_settings_open.as_deref() == Some(sp.id.as_str());
+                        let trailing = Some(("⚙", "Settings for this speaker"));
                         match speaker_row(ui, p, &sp, trailing) {
                             RowAction::Select => {
                                 let id = sp.id.as_str();
@@ -2463,8 +2499,16 @@ impl StreamToSpeakerApp {
                                     self.app.select_speaker_async(id);
                                 }
                             }
-                            RowAction::Trailing => self.app.remove_manual_speaker(&sp.id),
+                            RowAction::Trailing => {
+                                self.speaker_settings_open =
+                                    if settings_open { None } else { Some(sp.id.clone()) };
+                                self.settings_password =
+                                    self.app.airplay_password(&sp.id).unwrap_or_default();
+                            }
                             RowAction::None => {}
+                        }
+                        if self.speaker_settings_open.as_deref() == Some(sp.id.as_str()) {
+                            self.show_speaker_settings(ui, p, &sp);
                         }
                     }
                 });
@@ -2481,6 +2525,141 @@ impl StreamToSpeakerApp {
                 self.show_volume_row(ui, p);
             }
         });
+    }
+
+    /// Inline settings under a speaker row (opened with its ⚙ button).
+    fn show_speaker_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        sp: &crate::http_server::SpeakerInfo,
+    ) {
+        use crate::user_config::{
+            AutoConnect, AIRPLAY_LATENCY_MS_MAX, AIRPLAY_LATENCY_MS_MIN,
+        };
+        let before = self.app.speaker_settings(&sp.id);
+        let mut st = before.clone();
+        let is_airplay = sp.id.starts_with("airplay:");
+        let mut remove = false;
+        egui::Frame::none()
+            .fill(p.card_hover)
+            .rounding(RADIUS_CONTROL)
+            .inner_margin(egui::Margin::symmetric(sp::S, sp::S))
+            .show(ui, |ui| {
+                ui.checkbox(&mut st.hidden, "Hide this speaker from the list")
+                    .on_hover_text(
+                        "It stays connected if it's playing, and \"Show hidden speakers\" \
+                         above the list brings it back.",
+                    );
+                ui.add_space(sp::XS);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Connect automatically").color(p.text_primary));
+                    let label = |a: AutoConnect| match a {
+                        AutoConnect::Default => "Use the app setting",
+                        AutoConnect::Always => "Whenever it's available",
+                        AutoConnect::Never => "Never",
+                    };
+                    egui::ComboBox::from_id_salt(("auto_connect", sp.id.as_str()))
+                        .selected_text(label(st.auto_connect))
+                        .show_ui(ui, |ui| {
+                            for a in [AutoConnect::Default, AutoConnect::Always, AutoConnect::Never]
+                            {
+                                ui.selectable_value(&mut st.auto_connect, a, label(a));
+                            }
+                        });
+                });
+                ui.label(
+                    egui::RichText::new(match st.auto_connect {
+                        AutoConnect::Default => {
+                            "Reconnects at launch if it was the last speaker used and \
+                             auto-connect at launch is on."
+                        }
+                        AutoConnect::Always => {
+                            "Connects when it appears and nothing else is playing. Turning \
+                             streaming off stops this until you pick a speaker again."
+                        }
+                        AutoConnect::Never => "Only connects when you click it.",
+                    })
+                    .size(12.0)
+                    .color(p.text_secondary),
+                );
+                if is_airplay {
+                    ui.add_space(sp::S);
+                    let global = self.app.user_config.lock().unwrap().effective_airplay_latency_ms();
+                    let mut own = st.airplay_latency_ms.is_some();
+                    if ui
+                        .checkbox(&mut own, "Own AirPlay buffer for this speaker")
+                        .on_hover_text(
+                            "Overrides the AirPlay buffer in Advanced for this speaker only. \
+                             Takes effect the next time you connect.",
+                        )
+                        .changed()
+                    {
+                        st.airplay_latency_ms = own.then_some(global);
+                    }
+                    match st.airplay_latency_ms {
+                        Some(ms) => {
+                            let mut v = ms as i64;
+                            ui.horizontal(|ui| {
+                                advanced_slider_row(
+                                    ui,
+                                    p,
+                                    &mut v,
+                                    (AIRPLAY_LATENCY_MS_MIN as i64)..=(AIRPLAY_LATENCY_MS_MAX as i64),
+                                    " ms",
+                                    global as i64,
+                                    &format!("{} ms (the app setting)", global),
+                                );
+                            });
+                            st.airplay_latency_ms = Some(v as u32);
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new(format!("Uses the app setting ({} ms).", global))
+                                    .size(12.0)
+                                    .color(p.text_secondary),
+                            );
+                        }
+                    }
+                }
+                if sp.manual && is_airplay {
+                    ui.add_space(sp::S);
+                    ui.label(
+                        egui::RichText::new("AirPlay password (if the speaker has one)")
+                            .color(p.text_primary),
+                    );
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.settings_password)
+                            .password(true)
+                            .hint_text("No password")
+                            .desired_width(240.0),
+                    );
+                    if edit.lost_focus() {
+                        let pw = self.settings_password.trim().to_string();
+                        if self.app.airplay_password(&sp.id).unwrap_or_default() != pw {
+                            self.app.set_airplay_password(&sp.id, &pw);
+                        }
+                    }
+                }
+                if sp.manual {
+                    ui.add_space(sp::S);
+                    if danger_button(ui, p, "Remove speaker", 140.0)
+                        .on_hover_text("Remove this manually added speaker from the list.")
+                        .clicked()
+                    {
+                        remove = true;
+                    }
+                }
+            });
+        ui.add_space(6.0);
+        if remove {
+            self.speaker_settings_open = None;
+            self.app.remove_manual_speaker(&sp.id);
+            return;
+        }
+        if st != before {
+            self.app.set_speaker_settings(&sp.id, st);
+        }
     }
 
     fn show_volume_row(&self, ui: &mut egui::Ui, p: &Palette) {
