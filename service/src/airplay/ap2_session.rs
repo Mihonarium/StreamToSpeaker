@@ -33,7 +33,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::airplay::alac::build_uncompressed_alac_frame;
-use crate::airplay::ap2_crypto::seal_audio;
+use crate::airplay::ap2_crypto::AudioSealer;
 use crate::airplay::ap2_ptp::{spawn_ptp_master, PtpMaster, PtpTimeline};
 use crate::airplay::ap2_rtsp::{Ap2Rtsp, TransientOutcome};
 use crate::airplay::discovery::AirPlayRenderer;
@@ -823,6 +823,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
         cfg.initial_rtptime
     );
     let spf = cfg.codec.spf();
+    let mut sealer = AudioSealer::new(&cfg.audio_key, cfg.initial_seq);
     let mut seq = cfg.initial_seq;
     let mut rtptime = cfg.initial_rtptime;
     let mut packet_count: u64 = 0;
@@ -950,7 +951,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
 
             for payload in payloads {
                 let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
-                let sealed = seal_audio(&cfg.audio_key, &header, seq, &payload);
+                let sealed = sealer.seal(&header, &payload);
                 let mut packet = Vec::with_capacity(12 + sealed.len());
                 packet.extend_from_slice(&header);
                 packet.extend_from_slice(&sealed);
@@ -1029,6 +1030,9 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
         "AirPlay 2 RTP sender → {} (seq={}, rtptime={})",
         cfg.receiver_addr, cfg.initial_seq, cfg.initial_rtptime
     );
+    // One nonce per packet actually sent, counting on from the first seq;
+    // resends replay the recorded on-wire bytes and never consume one.
+    let mut sealer = AudioSealer::new(&cfg.audio_key, cfg.initial_seq);
     let mut seq = cfg.initial_seq;
     let mut rtptime = cfg.initial_rtptime;
     let mut packet_count: u64 = 0;
@@ -1145,7 +1149,7 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
         };
         let alac = build_uncompressed_alac_frame(&pkt_samples);
         let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
-        let sealed = seal_audio(&cfg.audio_key, &header, seq, &alac);
+        let sealed = sealer.seal(&header, &alac);
         let mut packet = Vec::with_capacity(12 + sealed.len());
         packet.extend_from_slice(&header);
         packet.extend_from_slice(&sealed);
@@ -1214,6 +1218,32 @@ mod tests {
         // Receiver reads 2-byte BE length, then len-2 more bytes.
         assert_eq!(u16::from_be_bytes([framed[0], framed[1]]), 12);
         assert_eq!(&framed[2..], &pkt);
+    }
+
+    #[test]
+    fn resend_across_seq_wrap_replays_original_nonce() {
+        // Packets recorded across a 16-bit seq wrap are fetched back
+        // byte-for-byte: a retransmission carries the nonce the packet was
+        // first sealed with and never consumes a fresh one.
+        let mut sealer = AudioSealer::new(&[5u8; 32], 65_530);
+        let resend = ResendBuffer::new(RESEND_BUFFER_PACKETS);
+        let mut originals = Vec::new();
+        let mut seq: u16 = 65_530;
+        for i in 0..12u32 {
+            let header = ap2_rtp_header(seq, 0xFFFF_F000u32.wrapping_add(i * 352), 0xABCD, i == 0);
+            let mut packet = header.to_vec();
+            packet.extend_from_slice(&sealer.seal(&header, &[i as u8; 16]));
+            resend.record(seq, &packet);
+            originals.push((seq, packet));
+            seq = seq.wrapping_add(1);
+        }
+        let after = sealer.next_counter();
+        for (i, (seq, packet)) in originals.iter().enumerate() {
+            let got = resend.get(*seq).unwrap();
+            assert_eq!(&got, packet);
+            assert_eq!(&got[got.len() - 8..], &(65_530 + i as u64).to_le_bytes());
+        }
+        assert_eq!(sealer.next_counter(), after);
     }
 
     #[test]
