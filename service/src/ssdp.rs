@@ -542,8 +542,8 @@ pub fn http_get(url_str: &str, timeout: Duration) -> Result<String> {
     );
     stream.write_all(req.as_bytes())?;
 
-    let mut buf = Vec::with_capacity(16384);
-    stream.read_to_end(&mut buf)?;
+    let buf = read_to_end_bounded(&mut stream, MAX_DESCRIPTION_BYTES, Instant::now() + RESPONSE_DEADLINE)
+        .with_context(|| format!("reading {}", url_str))?;
 
     // Find headers/body split. Robust to header lines being CRLF or LF only.
     let split_pos = find_header_body_split(&buf)
@@ -564,6 +564,36 @@ pub fn http_get(url_str: &str, timeout: Duration) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Largest device-description response accepted (real ones are tens of KB).
+const MAX_DESCRIPTION_BYTES: usize = 1 << 20;
+
+/// Overall time allowed for reading one HTTP response from a LAN device,
+/// however slowly it trickles in. Each read is also bounded by the
+/// socket's read timeout.
+pub(crate) const RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Read until EOF, failing once more than `limit` bytes have arrived or
+/// `deadline` has passed.
+pub(crate) fn read_to_end_bounded<R: Read>(r: &mut R, limit: usize, deadline: Instant) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(limit.min(16384));
+    let mut tmp = [0u8; 8192];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("response not complete within {:?}", RESPONSE_DEADLINE));
+        }
+        let n = match r.read(&mut tmp) {
+            Ok(0) => return Ok(buf),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if buf.len() + n > limit {
+            return Err(anyhow!("response exceeds {} bytes", limit));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
 }
 
 /// Find the byte offset where the HTTP body starts (after headers' blank line).
@@ -650,6 +680,17 @@ impl ToSocketAddrFirst for (&str, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_to_end_bounded_enforces_limit_and_deadline() {
+        use std::io::Cursor;
+        let far = Instant::now() + Duration::from_secs(60);
+        let data = vec![7u8; 20_000];
+        assert_eq!(read_to_end_bounded(&mut Cursor::new(data.clone()), 20_000, far).unwrap(), data);
+        assert!(read_to_end_bounded(&mut Cursor::new(data), 19_999, far).is_err());
+        let past = Instant::now() - Duration::from_millis(1);
+        assert!(read_to_end_bounded(&mut Cursor::new(vec![1u8; 10]), 100, past).is_err());
+    }
 
     #[test]
     fn dechunks_multi_chunk_body() {

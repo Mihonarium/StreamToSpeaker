@@ -18,7 +18,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -272,8 +272,13 @@ fn do_request(
     stream.write_all(req.as_bytes())?;
     stream.flush()?;
 
-    let mut buf = Vec::with_capacity(2048);
-    stream.read_to_end(&mut buf)?;
+    // SUBSCRIBE/UNSUBSCRIBE replies are headers only.
+    let buf = crate::ssdp::read_to_end_bounded(
+        &mut stream,
+        64 * 1024,
+        std::time::Instant::now() + crate::ssdp::RESPONSE_DEADLINE,
+    )
+    .with_context(|| format!("reading {} response", method))?;
     let text = String::from_utf8_lossy(&buf).to_string();
 
     let status_line = text.lines().next().unwrap_or("");
