@@ -23,6 +23,7 @@ use crate::airplay::{
 };
 use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
+use crate::manual_speakers::{self, ManualKind, ManualSpeaker};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use crate::ssdp::{DiscoveryState, Renderer};
 use crate::stream_gate::{canonical_ip, is_local_address, Grant, StreamGate};
@@ -42,6 +43,10 @@ pub struct RendererSession {
     /// Privacy-gate grant for this speaker's addresses. Lives exactly as
     /// long as the session: dropping the session revokes them.
     pub stream_grant: Option<Grant>,
+    /// Id the session reports instead of the renderer's own (a speaker
+    /// added by address keeps its manual id, so the list highlights the
+    /// row the user clicked and a relaunch reconnects through it).
+    pub id_override: Option<String>,
 }
 
 /// Active session — either UPnP (pull-style, speaker fetches our HTTP
@@ -57,7 +62,10 @@ pub enum ActiveSession {
 impl ActiveSession {
     pub fn stable_id(&self) -> String {
         match self {
-            ActiveSession::Upnp(s) => s.renderer.stable_id(),
+            ActiveSession::Upnp(s) => s
+                .id_override
+                .clone()
+                .unwrap_or_else(|| s.renderer.stable_id()),
             ActiveSession::AirPlay(s) => s.renderer.stable_id(),
             ActiveSession::AirPlay2(s) => s.renderer.stable_id(),
         }
@@ -293,6 +301,11 @@ pub struct App {
     /// reset the accessory's single HAP pairing session mid-ceremony).
     /// Cleared by the ceremony's RAII guard on every exit path.
     pin_ceremony: Mutex<Option<PinCeremonyState>>,
+
+    /// Receiver records built for manually added AirPlay speakers at their
+    /// last connect (the probe result), keyed by id — so the PIN ceremony
+    /// and other lookups by id find them without re-probing.
+    manual_resolved: Mutex<std::collections::HashMap<String, AirPlayRenderer>>,
 }
 
 /// A PIN pairing ceremony in flight (see [`App::begin_pin_pairing`]).
@@ -404,6 +417,7 @@ impl App {
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
+            manual_resolved: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -840,6 +854,112 @@ impl App {
     }
 
     // -------------------------------------------------------------------
+    // Manually added speakers
+    // -------------------------------------------------------------------
+
+    /// Speakers the user added by address, in the order added.
+    pub fn manual_speakers(&self) -> Vec<ManualSpeaker> {
+        self.user_config.lock().unwrap().manual_speakers.clone()
+    }
+
+    /// The manual entry with this id, if any.
+    pub fn find_manual_speaker(&self, id: &str) -> Option<ManualSpeaker> {
+        if !manual_speakers::is_manual_id(id) {
+            return None;
+        }
+        self.user_config
+            .lock()
+            .unwrap()
+            .manual_speakers
+            .iter()
+            .find(|m| m.id() == id)
+            .cloned()
+    }
+
+    /// Validate and persist a new manual speaker (the add dialog's
+    /// fields). Returns its id, or a user-facing reason it was refused.
+    pub fn add_manual_speaker(
+        &self,
+        kind: ManualKind,
+        name: &str,
+        host: &str,
+        port: &str,
+    ) -> Result<String, String> {
+        let mut uc = self.user_config.lock().unwrap();
+        let entry = manual_speakers::validate(kind, name, host, port, &uc.manual_speakers)?;
+        let id = entry.id();
+        info!("manual speaker added: {} ({})", entry.display_name(), id);
+        uc.manual_speakers.push(entry);
+        uc.save();
+        Ok(id)
+    }
+
+    /// Remove a manual speaker: disconnect it if it's the active one and
+    /// drop what was stored under its id.
+    pub fn remove_manual_speaker(&self, id: &str) {
+        let active = self
+            .session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.stable_id() == id)
+            .unwrap_or(false);
+        if active {
+            if let Some(s) = self.session.lock().unwrap().take() {
+                s.stop();
+            }
+            self.prune_stream_clients();
+        }
+        {
+            let mut last = self.last_speaker_id.lock().unwrap();
+            if last.as_deref() == Some(id) {
+                *last = None;
+            }
+        }
+        self.manual_resolved.lock().unwrap().remove(id);
+        let mut uc = self.user_config.lock().unwrap();
+        let before = uc.manual_speakers.len();
+        uc.manual_speakers.retain(|m| m.id() != id);
+        if uc.manual_speakers.len() == before {
+            return;
+        }
+        if uc.last_speaker_id.as_deref() == Some(id) {
+            uc.last_speaker_id = None;
+        }
+        uc.airplay_passwords.remove(id);
+        uc.airplay_pairings.remove(id);
+        uc.save();
+        info!("manual speaker removed: {}", id);
+    }
+
+    /// Display name for any speaker id: discovered UPnP, discovered
+    /// AirPlay, or manual.
+    fn speaker_name(&self, id: &str) -> Option<String> {
+        if let Some(m) = self.find_manual_speaker(id) {
+            return Some(m.display_name());
+        }
+        self.discovery
+            .as_ref()
+            .and_then(|d| d.find_by_id(id))
+            .map(|r| r.display_name())
+            .or_else(|| {
+                self.airplay_discovery
+                    .as_ref()
+                    .and_then(|d| d.find_by_id(id))
+                    .map(|r| r.friendly_name)
+            })
+    }
+
+    /// The AirPlay receiver record for an id: discovered, or the last
+    /// probe of a manual entry.
+    fn find_airplay_renderer(&self, id: &str) -> Option<AirPlayRenderer> {
+        if manual_speakers::is_manual_id(id) {
+            return self.manual_resolved.lock().unwrap().get(id).cloned();
+        }
+        self.airplay_discovery.as_ref().and_then(|d| d.find_by_id(id))
+    }
+
+    // -------------------------------------------------------------------
     // Speaker view
     // -------------------------------------------------------------------
 
@@ -884,6 +1004,7 @@ impl App {
                     ip: r.ip.to_string(),
                     active,
                     note,
+                    manual: false,
                 });
             }
         }
@@ -931,8 +1052,29 @@ impl App {
                     ip: r.ip.to_string(),
                     active,
                     note,
+                    manual: false,
                 });
             }
+        }
+        for m in self.manual_speakers() {
+            let id = m.id();
+            let active = active_id.as_deref() == Some(id.as_str());
+            let (proto, how) = match m.kind {
+                ManualKind::AirPlay => ("AirPlay", "AirPlay receiver"),
+                ManualKind::Upnp => ("UPnP", "UPnP device description"),
+            };
+            speakers.push(SpeakerInfo {
+                friendly_name: format!("{} ({}, added manually)", m.display_name(), proto),
+                ip: m.address_label(),
+                active,
+                note: Some(format!(
+                    "Added by address ({} at {}). It's always listed, even when discovery \
+                     doesn't see it; connecting tells you if it can't be reached.",
+                    how, m.host
+                )),
+                manual: true,
+                id,
+            });
         }
         speakers.sort_by(|a, b| a.friendly_name.cmp(&b.friendly_name));
         SpeakerView { speakers, active_id }
@@ -1009,18 +1151,7 @@ impl App {
                 return;
             }
             // Resolve a display name best-effort for the banner.
-            let name = self
-                .discovery
-                .as_ref()
-                .and_then(|d| d.find_by_id(id))
-                .map(|r| r.display_name())
-                .or_else(|| {
-                    self.airplay_discovery
-                        .as_ref()
-                        .and_then(|d| d.find_by_id(id))
-                        .map(|r| r.friendly_name)
-                })
-                .unwrap_or_else(|| id.to_string());
+            let name = self.speaker_name(id).unwrap_or_else(|| id.to_string());
             *guard = Some(name);
         }
         let app = self.clone();
@@ -1266,8 +1397,11 @@ impl App {
         // last scan streams to its group coordinator instead (see
         // start_upnp). Remember the id we actually bound so reconnect /
         // active-row highlighting track reality.
-        let new_session = if id.starts_with("airplay:") {
-            match self.start_airplay(id) {
+        let manual = self.find_manual_speaker(id);
+        let new_session = if let Some(m) = manual.as_ref().filter(|m| m.kind == ManualKind::Upnp) {
+            self.start_upnp_manual(m)?
+        } else if id.starts_with("airplay:") {
+            match self.start_airplay(id, manual.as_ref()) {
                 Ok(s) => s,
                 Err(SelectFailure::Msg(m)) => return Err(m),
                 Err(SelectFailure::NeedsPin { id: pid, name, details }) => {
@@ -1415,13 +1549,51 @@ impl App {
         Ok(ActiveSession::Upnp(session))
     }
 
-    fn start_airplay(&self, id: &str) -> Result<ActiveSession, SelectFailure> {
-        let discovery = self
-            .airplay_discovery
-            .as_ref()
-            .ok_or_else(|| SelectFailure::Msg("AirPlay discovery disabled".to_string()))?;
-        let Some(renderer) = discovery.find_by_id(id) else {
-            return Err(SelectFailure::Msg(format!("no AirPlay speaker with id {:?}", id)));
+    /// UPnP session to a speaker added by its device-description URL: the
+    /// description is fetched now (exactly as discovery would have) and the
+    /// session keeps the manual id.
+    fn start_upnp_manual(&self, m: &ManualSpeaker) -> Result<ActiveSession, String> {
+        let r = crate::ssdp::fetch_and_parse_device(&m.host, Duration::from_secs(3))
+            .map_err(|e| format!("couldn't read {}: {:#}", m.host, e))?;
+        let own_udn = r.udn.clone();
+        // A Sonos that's grouped streams via its coordinator, as for a
+        // discovered one; the coordinator is looked up in discovery.
+        let r = match self.discovery.clone() {
+            Some(d) => crate::sonos::resolve_group_coordinator(r, &move |cid| d.find_by_id(cid)),
+            None => r,
+        };
+        let redirected = r.udn != own_udn;
+        let grant = self.stream_gate.grant(r.stream_peers());
+        let local_ip = self.local_ip_toward(r.ip).map_err(|e| e.to_string())?;
+        let (stream_uri, callback_url) = local_urls(local_ip, self.config.bind.port());
+        let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms);
+        let mut session = start_session(r, &stream_uri, &didl, &callback_url, Some(grant))
+            .map_err(|e| format!("{:#}", e))?;
+        if !redirected {
+            session.id_override = Some(m.id());
+        }
+        Ok(ActiveSession::Upnp(session))
+    }
+
+    /// AirPlay session to a discovered receiver (`manual` None) or to one
+    /// added by address, which is resolved and probed first.
+    fn start_airplay(
+        &self,
+        id: &str,
+        manual: Option<&ManualSpeaker>,
+    ) -> Result<ActiveSession, SelectFailure> {
+        let (renderer, discovery) = match manual {
+            Some(m) => (self.resolve_manual_airplay(m).map_err(SelectFailure::Msg)?, None),
+            None => {
+                let discovery = self
+                    .airplay_discovery
+                    .as_deref()
+                    .ok_or_else(|| SelectFailure::Msg("AirPlay discovery disabled".to_string()))?;
+                let Some(renderer) = discovery.find_by_id(id) else {
+                    return Err(SelectFailure::Msg(format!("no AirPlay speaker with id {:?}", id)));
+                };
+                (renderer, Some(discovery))
+            }
         };
         debug!(
             "AirPlay select {}: transport={:?} supports_ap2={} features={:?} airplay_port={:?} raop_port={} et={:?}",
@@ -1495,16 +1667,40 @@ impl App {
         }
     }
 
+    /// Build the receiver record for a manual AirPlay entry: resolve the
+    /// host, then ask the receiver what it is (`GET /info`). Cached for
+    /// later lookups by id (PIN pairing).
+    fn resolve_manual_airplay(&self, m: &ManualSpeaker) -> Result<AirPlayRenderer, String> {
+        let ip = manual_speakers::resolve_ipv4(&m.host, m.port)?;
+        let addr = SocketAddr::new(IpAddr::V4(ip), m.port);
+        let info = manual_speakers::probe_info(addr, Duration::from_secs(3))?;
+        match &info {
+            Some(i) => info!(
+                "manual AirPlay {}: /info model={:?} features={:?}",
+                addr, i.model, i.features
+            ),
+            None => info!("manual AirPlay {}: no /info answer — treating it as AirPlay 1", addr),
+        }
+        let r = manual_speakers::airplay_renderer(m, ip, info.as_ref());
+        self.manual_resolved
+            .lock()
+            .unwrap()
+            .insert(r.stable_id(), r.clone());
+        Ok(r)
+    }
+
     /// Ordered list of AirPlay paths to try for a selected device, best
     /// first. Receivers that advertise PTP / transient pairing (HomePod,
     /// Sonos) are tried over AirPlay 2 first; legacy receivers over RAOP
     /// first. The other path is always appended as a fallback, and an
     /// AirPlay 2 sibling at the same IP is used when the `_raop` and
     /// `_airplay` records didn't merge into one entry.
+    /// `discovery` is None for a manually added receiver, which is never
+    /// paired up with a discovered one.
     fn airplay_attempts(
         &self,
         renderer: &AirPlayRenderer,
-        discovery: &AirPlayDiscoveryState,
+        discovery: Option<&AirPlayDiscoveryState>,
     ) -> Vec<(Transport, AirPlayRenderer)> {
         // An AirPlay 2-capable view of this device: the record itself, or a
         // sibling _airplay._tcp entry at the same IP (covers a _raop vs
@@ -1512,10 +1708,11 @@ impl App {
         let ap2 = if renderer.supports_airplay2() {
             Some(renderer.clone())
         } else {
-            discovery
-                .renderers()
-                .into_iter()
-                .find(|r| r.ip == renderer.ip && r.supports_airplay2())
+            discovery.and_then(|d| {
+                d.renderers()
+                    .into_iter()
+                    .find(|r| r.ip == renderer.ip && r.supports_airplay2())
+            })
         };
         let raop = renderer.supports_legacy_raop();
 
@@ -1673,11 +1870,7 @@ impl App {
         // it), panic — clears it.
         let guard = CeremonyGuard(self.clone());
 
-        let Some(renderer) = self
-            .airplay_discovery
-            .as_ref()
-            .and_then(|d| d.find_by_id(&id))
-        else {
+        let Some(renderer) = self.find_airplay_renderer(&id) else {
             self.record_error(format!("Can't pair {} — it's no longer discovered.", name));
             return;
         };
@@ -2217,6 +2410,7 @@ pub fn start_session(
         gena,
         stream_uri: stream_uri.to_string(),
         stream_grant,
+        id_override: None,
     })
 }
 

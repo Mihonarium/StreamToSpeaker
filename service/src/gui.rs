@@ -838,6 +838,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 frame_count: 0,
                 confirm_close_open: false,
                 password_prompt: None,
+                add_speaker_prompt: None,
                 pin_prompt: None,
                 last_fractional_scroll: None,
                 skip_close_confirmation,
@@ -877,6 +878,8 @@ struct StreamToSpeakerApp {
     /// Open when the user is entering a password for a `pw=true` AirPlay
     /// speaker. `None` when no prompt is showing.
     password_prompt: Option<PasswordPrompt>,
+    /// Open while the user is adding a speaker by address.
+    add_speaker_prompt: Option<AddSpeakerPrompt>,
     /// Open when an AP2 receiver (Apple TV with access control) is showing
     /// a PIN and awaiting one-time HomeKit pairing. Mirrors the app's
     /// `pending_pin_pairing` state each frame; `None` when no ceremony is
@@ -1148,7 +1151,10 @@ impl eframe::App for StreamToSpeakerApp {
         // persist it as that speaker's AirPlay password. The ceremony
         // keeps waiting (2-minute window), so the prompt simply appears
         // once the other modal closes.
-        if self.password_prompt.is_none() && !self.confirm_close_open {
+        if self.password_prompt.is_none()
+            && self.add_speaker_prompt.is_none()
+            && !self.confirm_close_open
+        {
             match self.app.pending_pin_pairing() {
                 Some((id, name)) => {
                     if self.pin_prompt.as_ref().map(|p| p.id != id).unwrap_or(true) {
@@ -1168,13 +1174,17 @@ impl eframe::App for StreamToSpeakerApp {
         if self.pin_prompt.is_some() {
             self.show_pin_modal(ctx, &p);
         }
+        if self.add_speaker_prompt.is_some() {
+            self.show_add_speaker_modal(ctx, &p);
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(p.canvas).inner_margin(sp::M))
             .show(ctx, |ui| {
                 let enabled = !self.confirm_close_open
                     && self.password_prompt.is_none()
-                    && self.pin_prompt.is_none();
+                    && self.pin_prompt.is_none()
+                    && self.add_speaker_prompt.is_none();
                 ui.add_enabled_ui(enabled, |ui| {
                     // Keep the header pinned at the top (theme toggle
                     // shouldn't scroll away); everything below scrolls
@@ -2228,6 +2238,16 @@ impl StreamToSpeakerApp {
                     {
                         self.app.trigger_rescan();
                     }
+                    if secondary_button(ui, p, "+  Add", 76.0)
+                        .on_hover_text(
+                            "Add a speaker by its IP address or hostname — for speakers \
+                             discovery can't see (another subnet, VLAN, or a network that \
+                             blocks multicast).",
+                        )
+                        .clicked()
+                    {
+                        self.add_speaker_prompt = Some(AddSpeakerPrompt::default());
+                    }
                     // "Forget saved speaker" — only relevant when the
                     // user has a persisted last_speaker_id. Clears it
                     // and resets onboarding so the next launch feels
@@ -2353,9 +2373,12 @@ impl StreamToSpeakerApp {
                     }
                     ui.add_space(sp::XS);
                     ui.label(
-                        egui::RichText::new("Click Rescan above to try again.")
-                            .size(12.0)
-                            .color(p.text_tertiary),
+                        egui::RichText::new(
+                            "Click Rescan above to try again, or Add to enter the speaker's \
+                             address yourself.",
+                        )
+                        .size(12.0)
+                        .color(p.text_tertiary),
                     );
                 }
                 return;
@@ -2366,22 +2389,31 @@ impl StreamToSpeakerApp {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for sp in view.speakers {
-                        let mut prompt_for: Option<(String, String)> = None;
-                        speaker_row(ui, p, &sp, |id| {
-                            // Password-protected speaker → collect the
-                            // password first (pre-fill any stored one).
-                            if self.app.is_password_protected(id) {
-                                prompt_for = Some((id.to_string(), sp.friendly_name.clone()));
-                            } else {
-                                // Bring-up does seconds of network I/O —
-                                // run it off-thread; the status banner shows
-                                // "Connecting…" and errors arrive as toasts.
-                                self.app.select_speaker_async(id);
+                        let trailing = sp
+                            .manual
+                            .then_some(("✕", "Remove this manually added speaker"));
+                        match speaker_row(ui, p, &sp, trailing) {
+                            RowAction::Select => {
+                                let id = sp.id.as_str();
+                                // Password-protected speaker → collect the
+                                // password first (pre-fill any stored one).
+                                if self.app.is_password_protected(id) {
+                                    let input = self.app.airplay_password(id).unwrap_or_default();
+                                    self.password_prompt = Some(PasswordPrompt {
+                                        id: id.to_string(),
+                                        name: sp.friendly_name.clone(),
+                                        input,
+                                    });
+                                } else {
+                                    // Bring-up does seconds of network I/O —
+                                    // run it off-thread; the status banner
+                                    // shows "Connecting…" and errors arrive
+                                    // as toasts.
+                                    self.app.select_speaker_async(id);
+                                }
                             }
-                        });
-                        if let Some((id, name)) = prompt_for {
-                            let input = self.app.airplay_password(&id).unwrap_or_default();
-                            self.password_prompt = Some(PasswordPrompt { id, name, input });
+                            RowAction::Trailing => self.app.remove_manual_speaker(&sp.id),
+                            RowAction::None => {}
                         }
                     }
                 });
@@ -3164,6 +3196,147 @@ impl StreamToSpeakerApp {
             PromptAction::Open => {}
         }
     }
+
+    /// "Add a speaker by address" dialog. Validation happens in the app
+    /// (`add_manual_speaker`); its refusal is shown inline and the dialog
+    /// stays open so the user can fix the field.
+    fn show_add_speaker_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        use crate::manual_speakers::{ManualKind, DEFAULT_AIRPLAY_PORT};
+        let Some(prompt) = self.add_speaker_prompt.as_mut() else {
+            return;
+        };
+        let mut still_open = true;
+        let mut confirm = false;
+        let mut cancel = !self.confirm_close_open && ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+        let win = egui::Window::new(
+            egui::RichText::new("Add a speaker by address")
+                .strong()
+                .color(p.text_primary),
+        )
+        .open(&mut still_open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(440.0)
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(p.card)
+                .stroke(egui::Stroke::new(1.0_f32, p.divider))
+                .rounding(RADIUS_SURFACE)
+                .inner_margin(sp::MODAL),
+        )
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "For a speaker that doesn't show up by itself. It stays in the list \
+                     until you remove it.",
+                )
+                .color(p.text_secondary),
+            );
+            ui.add_space(sp::S);
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut prompt.kind, ManualKind::AirPlay, "AirPlay");
+                ui.add_space(sp::S);
+                ui.radio_value(&mut prompt.kind, ManualKind::Upnp, "UPnP / Sonos");
+            });
+            ui.add_space(sp::S);
+            let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
+                ui.label(egui::RichText::new(label).size(12.0).color(p.text_secondary));
+                ui.add(
+                    egui::TextEdit::singleline(value)
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY),
+                )
+            };
+            let first = match prompt.kind {
+                ManualKind::AirPlay => {
+                    let r = field(ui, "IP address or hostname", &mut prompt.host, "192.168.1.20");
+                    ui.add_space(sp::XS);
+                    field(
+                        ui,
+                        "Port (7000 for most AirPlay 2 speakers, often 5000 for older ones)",
+                        &mut prompt.port,
+                        &DEFAULT_AIRPLAY_PORT.to_string(),
+                    );
+                    r
+                }
+                ManualKind::Upnp => field(
+                    ui,
+                    "Device-description URL",
+                    &mut prompt.host,
+                    "http://192.168.1.20:1400/xml/device_description.xml",
+                ),
+            };
+            if !prompt.focused {
+                first.request_focus();
+                prompt.focused = true;
+            }
+            ui.add_space(sp::XS);
+            field(ui, "Name (optional)", &mut prompt.name, "Shown in the speaker list");
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                confirm = true;
+            }
+            if let Some(err) = prompt.error.as_deref() {
+                ui.add_space(sp::XS);
+                ui.label(egui::RichText::new(err).size(12.0).color(p.danger));
+            }
+            ui.add_space(sp::M);
+            ui.horizontal(|ui| {
+                if primary_button(ui, p, "Add", 120.0).clicked() {
+                    confirm = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if secondary_button(ui, p, "Cancel", 96.0).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        });
+        if let Some(win) = win {
+            window_close_cursor(ctx, win.response.rect, sp::MODAL);
+        }
+        if !still_open {
+            cancel = true;
+        }
+        if cancel {
+            self.add_speaker_prompt = None;
+        } else if confirm {
+            match self
+                .app
+                .add_manual_speaker(prompt.kind, &prompt.name, &prompt.host, &prompt.port)
+            {
+                Ok(_) => self.add_speaker_prompt = None,
+                Err(e) => prompt.error = Some(e),
+            }
+        }
+    }
+}
+
+/// State for the add-a-speaker dialog.
+struct AddSpeakerPrompt {
+    kind: crate::manual_speakers::ManualKind,
+    name: String,
+    /// AirPlay: address/hostname. UPnP: device-description URL.
+    host: String,
+    port: String,
+    /// Why the last Add was refused.
+    error: Option<String>,
+    /// Initial focus has been placed.
+    focused: bool,
+}
+
+impl Default for AddSpeakerPrompt {
+    fn default() -> Self {
+        Self {
+            kind: crate::manual_speakers::ManualKind::AirPlay,
+            name: String::new(),
+            host: String::new(),
+            port: crate::manual_speakers::DEFAULT_AIRPLAY_PORT.to_string(),
+            error: None,
+            focused: false,
+        }
+    }
 }
 
 /// Outcome of one frame of a text-prompt modal.
@@ -3296,13 +3469,27 @@ struct PinPrompt {
 // Composable pieces
 // -----------------------------------------------------------------------------
 
+/// What the user did to a speaker row this frame.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum RowAction {
+    None,
+    /// Clicked / activated the row: connect to this speaker.
+    Select,
+    /// Clicked the row's trailing button.
+    Trailing,
+}
+
+/// One speaker in the list. `trailing` adds a small icon button at the
+/// right end of the row (`(glyph, tooltip)`), e.g. remove for a manually
+/// added speaker.
 fn speaker_row(
     ui: &mut egui::Ui,
     p: &Palette,
     sp: &crate::http_server::SpeakerInfo,
-    on_click: impl FnOnce(&str),
-) {
+    trailing: Option<(&str, &str)>,
+) -> RowAction {
     let active = sp.active;
+    let mut action = RowAction::None;
 
     // Two-pass painting: allocate, then paint with hover/active/focus-
     // aware colours. The Response goes through `ui.interact` with a
@@ -3388,7 +3575,11 @@ fn speaker_row(
     // Reserve enough room for a 15-char IPv4 in 12 px Monospace plus
     // some breathing space.
     const IP_RESERVED_W: f32 = 120.0;
-    let name_max_w = (rect.right() - 18.0 - text_left - IP_RESERVED_W).max(40.0);
+    // The trailing button sits at the right edge; the address moves left
+    // of it.
+    const TRAILING_W: f32 = 28.0;
+    let right_inset = if trailing.is_some() { 18.0 + TRAILING_W + 6.0 } else { 18.0 };
+    let name_max_w = (rect.right() - right_inset - text_left - IP_RESERVED_W).max(40.0);
     let name_job = {
         let mut job = egui::epaint::text::LayoutJob::single_section(
             sp.friendly_name.clone(),
@@ -3414,12 +3605,28 @@ fn speaker_row(
     // the card. (Was 12, which made the IP huddle against the card
     // border while the radio breathed comfortably on the other side.)
     ui.painter().text(
-        egui::pos2(rect.right() - 18.0, rect.center().y),
+        egui::pos2(rect.right() - right_inset, rect.center().y),
         egui::Align2::RIGHT_CENTER,
         &sp.ip,
         egui::FontId::new(12.0, egui::FontFamily::Monospace),
         p.text_tertiary,
     );
+
+    // Added after the row's own interact, so it is hit-tested on top of
+    // it and a click on it doesn't also select the row.
+    if let Some((glyph, tip)) = trailing {
+        let btn_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 12.0 - TRAILING_W / 2.0, rect.center().y),
+            egui::vec2(TRAILING_W, TRAILING_W),
+        );
+        let btn = egui::Button::new(egui::RichText::new(glyph).color(p.text_secondary))
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .rounding(RADIUS_CONTROL);
+        if clickable(ui.put(btn_rect, btn)).on_hover_text(tip).clicked() {
+            action = RowAction::Trailing;
+        }
+    }
 
     if response.hovered() && response.enabled() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -3433,11 +3640,12 @@ fn speaker_row(
         response
     };
 
-    if (response.clicked() || kbd_activate) && !active {
-        on_click(&sp.id);
+    if (response.clicked() || kbd_activate) && !active && action == RowAction::None {
+        action = RowAction::Select;
     }
 
     ui.add_space(6.0);
+    action
 }
 
 fn advanced_row(

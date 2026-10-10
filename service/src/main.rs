@@ -534,6 +534,13 @@ fn run(cli: Cli) -> Result<()> {
             if !app.is_auto_reconnect_on_launch() {
                 info!("auto-reconnect disabled by user preference; saved={:?}", saved_id);
                 None
+            } else if app.find_manual_speaker(&saved_id).is_some() {
+                // Added by address: nothing to wait for in discovery.
+                info!("auto-reconnect: trying saved manual speaker {:?}", saved_id);
+                if let Err(e) = app.select_speaker(&saved_id) {
+                    warn!("reconnecting to saved manual speaker failed: {}", e);
+                }
+                None
             } else {
                 info!("auto-reconnect: trying saved speaker {:?}", saved_id);
                 // Wait briefly for the first SSDP sweep to populate

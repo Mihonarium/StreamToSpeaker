@@ -37,6 +37,9 @@ pub struct SpeakerInfo {
     /// entry for a speaker that also has a non-AirPlay entry will have
     /// higher latency. `None` for most rows.
     pub note: Option<String>,
+    /// `true` for a speaker the user added by address rather than one
+    /// found by discovery.
+    pub manual: bool,
 }
 
 /// Callback that returns the current list of discovered speakers.
@@ -560,11 +563,12 @@ fn speakers_to_json(list: &[SpeakerInfo]) -> String {
             s.push(',');
         }
         s.push_str(&format!(
-            r#"{{"id":{},"name":{},"ip":{},"active":{}}}"#,
+            r#"{{"id":{},"name":{},"ip":{},"active":{},"manual":{}}}"#,
             json_string(&sp.id),
             json_string(&sp.friendly_name),
             json_string(&sp.ip),
-            sp.active
+            sp.active,
+            sp.manual
         ));
     }
     s.push_str("]}");

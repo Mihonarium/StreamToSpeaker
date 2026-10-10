@@ -22,6 +22,7 @@ pub mod user_config;
 pub mod update_check;
 pub mod stream_gate;
 pub mod gui_layout;
+pub mod manual_speakers;
 pub mod now_playing;
 #[cfg(windows)]
 pub mod wasapi_source;

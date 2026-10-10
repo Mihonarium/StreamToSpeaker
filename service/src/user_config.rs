@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::airplay::hap_pairing::PairingCredentials;
+use crate::manual_speakers::ManualSpeaker;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserConfig {
@@ -165,6 +166,10 @@ pub struct UserConfig {
     /// "Later" on the update banner: hidden until this unix time.
     #[serde(default)]
     pub update_banner_hidden_until: Option<u64>,
+    /// Speakers the user added by address (see `manual_speakers`), in the
+    /// order they were added.
+    #[serde(default)]
+    pub manual_speakers: Vec<ManualSpeaker>,
 }
 
 /// Default AirPlay buffer — iTunes' 2 s (88200 samples at 44.1 kHz).
