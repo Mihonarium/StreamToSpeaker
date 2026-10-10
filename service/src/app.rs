@@ -912,6 +912,33 @@ impl App {
                 // click will use (Sonos advertises both UPnP and AirPlay)
                 // and why an unsupported one might fail.
                 let pw = if r.password_protected { ", password" } else { "" };
+                if let Some(pair) = &r.pair {
+                    let members: Vec<&str> = pair.members.iter().map(|m| m.friendly_name.as_str()).collect();
+                    let (name, note) = if pair.is_complete() {
+                        (
+                            format!("{} (AirPlay 2 stereo pair)", r.friendly_name),
+                            format!(
+                                "HomePod stereo pair: {}. Both HomePods play, each its own channel, and the \
+                                 volume slider moves both.",
+                                members.join(" + ")
+                            ),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "{} (stereo pair, {} of {} present)",
+                                r.friendly_name,
+                                pair.members.len(),
+                                pair.expected
+                            ),
+                            "Waiting for the other HomePod of this stereo pair to come online. The pair \
+                             can only be played with both HomePods present."
+                                .to_string(),
+                        )
+                    };
+                    speakers.push(SpeakerInfo { id, friendly_name: name, ip: r.ip.to_string(), active, note: Some(note) });
+                    continue;
+                }
                 let name = match transport {
                     Some(Transport::RaopLegacy) if has_upnp_twin => {
                         format!("{} (AirPlay, higher delay{})", r.friendly_name, pw)
@@ -1462,6 +1489,15 @@ impl App {
             renderer.encryption_types,
         );
 
+        if let Some(pair) = renderer.pair.as_ref().filter(|p| !p.is_complete()) {
+            return Err(SelectFailure::Msg(format!(
+                "{} is a stereo pair; waiting for the other HomePod to come online ({} of {} present).",
+                renderer.friendly_name,
+                pair.members.len(),
+                pair.expected
+            )));
+        }
+
         // The local address to bind UDP sockets to and advertise in SDP:
         // the one on the receiver's network (or `--advertise-ip`). It must
         // be reachable by the receiver, so 0.0.0.0 would be wrong.
@@ -1534,6 +1570,13 @@ impl App {
         renderer: &AirPlayRenderer,
         discovery: &AirPlayDiscoveryState,
     ) -> Vec<(Transport, AirPlayRenderer)> {
+        // A stereo pair plays over AirPlay 2 on every member, or not at all.
+        if renderer.pair.is_some() {
+            return renderer
+                .transport()
+                .map(|t| vec![(t, renderer.clone())])
+                .unwrap_or_default();
+        }
         // An AirPlay 2-capable view of this device: the record itself, or a
         // sibling _airplay._tcp entry at the same IP (covers a _raop vs
         // _airplay `deviceid` mismatch that split it into two entries).
@@ -1618,12 +1661,14 @@ impl App {
             Transport::AirPlay2 => {
                 let samples_rx = self.hub.subscribe();
                 let stable_id = renderer.stable_id();
-                let (prefer_realtime, pairing_creds, latency_ms) = {
+                let (prefer_realtime, pairing_creds, latency_ms, homepod_realtime, homepod_latency_ms) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.prefer_realtime_airplay,
                         uc.airplay_pairings.get(&stable_id).cloned(),
                         uc.effective_airplay_latency_ms(),
+                        !uc.airplay_homepod_buffered,
+                        uc.effective_homepod_latency_ms(),
                     )
                 };
                 match AirPlay2Session::start(AirPlay2SessionConfig {
@@ -1634,6 +1679,8 @@ impl App {
                     prefer_realtime,
                     latency_ms,
                     pairing_creds,
+                    homepod_realtime,
+                    homepod_latency_ms,
                 }) {
                     Ok(session) => Ok(ActiveSession::AirPlay2(session)),
                     // 470 with no stored keys: typed, so start_airplay

@@ -843,6 +843,7 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 skip_close_confirmation,
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
+                homepod_latency_draft: None,
                 onboarding_dismissed: false,
                 last_applied_dark: None,
                 last_applied_accent: None,
@@ -873,6 +874,8 @@ struct StreamToSpeakerApp {
     skip_close_confirmation: bool,
     theme_mode: ThemeMode,
     advanced_open: bool,
+    /// HomePod delay while its slider is being dragged; saved on release.
+    homepod_latency_draft: Option<i64>,
     onboarding_dismissed: bool,
     /// Open when the user is entering a password for a `pw=true` AirPlay
     /// speaker. `None` when no prompt is showing.
@@ -2696,7 +2699,7 @@ impl StreamToSpeakerApp {
                     p,
                     "AirPlay buffer (latency)",
                     "Lower = less delay, less margin for Wi-Fi hiccups. 2000 ms is what iTunes uses.",
-                    "How much audio an AirPlay speaker holds before playing it. This is most of the delay you hear on AirPlay, so lowering it lowers the delay in step — but any Wi-Fi hiccup longer than the buffer becomes a dropout. A recent Apple TV copes with very small values on a good network; AirPort Express and most AirPlay speakers need roughly 100–350 ms, and a speaker that reports its own minimum is never driven below it. Applies to AirPlay 1 speakers and the AirPlay 2 realtime stream; below 1000 ms an AirPlay 2 speaker is switched to the realtime stream automatically. Takes effect the next time you connect.",
+                    "How much audio an AirPlay speaker holds before playing it. This is most of the delay you hear on AirPlay, so lowering it lowers the delay in step — but any Wi-Fi hiccup longer than the buffer becomes a dropout. A recent Apple TV copes with very small values on a good network; AirPort Express and most AirPlay speakers need roughly 100–350 ms, and a speaker that reports its own minimum is never driven below it. Applies to AirPlay 1 speakers and the AirPlay 2 realtime stream (HomePods use the HomePod delay setting instead); below 1000 ms an AirPlay 2 speaker is switched to the realtime stream automatically. Takes effect the next time you connect.",
                     |ui| {
                         advanced_slider_row(
                             ui,
@@ -2733,6 +2736,50 @@ impl StreamToSpeakerApp {
                 let mut uc = self.app.user_config.lock().unwrap();
                 if uc.prefer_realtime_airplay != prefer_rt {
                     uc.prefer_realtime_airplay = prefer_rt;
+                    uc.save();
+                }
+            }
+
+            ui.add_space(sp::S);
+
+            {
+                use crate::user_config::{
+                    HOMEPOD_LATENCY_MS_DEFAULT, HOMEPOD_LATENCY_MS_MAX, HOMEPOD_LATENCY_MS_MIN,
+                };
+                let (mut hp_buffered, saved_ms) = {
+                    let uc = self.app.user_config.lock().unwrap();
+                    (uc.airplay_homepod_buffered, uc.effective_homepod_latency_ms() as i64)
+                };
+                let mut hp_ms = self.homepod_latency_draft.unwrap_or(saved_ms);
+                let mut commit = false;
+                advanced_row(
+                    ui,
+                    p,
+                    "HomePod delay",
+                    "HomePods and HomePod stereo pairs stream in low-latency realtime mode with this delay.",
+                    "HomePods are streamed with the realtime AirPlay 2 stream and asked to play with exactly this delay (200 ms by default; about 120 ms works on a clean network, 500 ms rides out more Wi-Fi trouble). This is the delay the HomePod adds, not a measured end-to-end figure. Stereo pairs always use realtime mode. If a single HomePod misbehaves, tick the box to go back to the buffered stream used before (seconds of delay, set by the AirPlay buffer above). Takes effect the next time you connect.",
+                    |ui| {
+                        ui.vertical(|ui| {
+                            commit = advanced_slider_row_commit(
+                                ui,
+                                p,
+                                &mut hp_ms,
+                                (HOMEPOD_LATENCY_MS_MIN as i64)..=(HOMEPOD_LATENCY_MS_MAX as i64),
+                                " ms",
+                                HOMEPOD_LATENCY_MS_DEFAULT as i64,
+                                "200 ms",
+                            );
+                            ui.checkbox(&mut hp_buffered, "Use the buffered stream for single HomePods");
+                        });
+                    },
+                );
+                // Save on release; hold the dragged value until then.
+                self.homepod_latency_draft = (!commit && hp_ms != saved_ms).then_some(hp_ms);
+                let mut uc = self.app.user_config.lock().unwrap();
+                let ms = if commit { hp_ms as u32 } else { uc.airplay_homepod_latency_ms };
+                if uc.airplay_homepod_buffered != hp_buffered || uc.airplay_homepod_latency_ms != ms {
+                    uc.airplay_homepod_buffered = hp_buffered;
+                    uc.airplay_homepod_latency_ms = ms;
                     uc.save();
                 }
             }
@@ -3504,6 +3551,21 @@ fn advanced_slider_row(
     default: i64,
     default_label: &str,
 ) {
+    advanced_slider_row_commit(ui, p, value, range, suffix, default, default_label);
+}
+
+/// [`advanced_slider_row`] that also says whether the value was committed
+/// this frame: a finished drag, a click on the track, an edited number or
+/// Reset — not every intermediate value while the slider is dragged.
+fn advanced_slider_row_commit(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    value: &mut i64,
+    range: std::ops::RangeInclusive<i64>,
+    suffix: &str,
+    default: i64,
+    default_label: &str,
+) -> bool {
     let dragvalue_w = 96.0;
     let reset_w = 80.0;
     let gap = sp::S;
@@ -3511,14 +3573,14 @@ fn advanced_slider_row(
     let slider_w = (avail - dragvalue_w - reset_w - 2.0 * gap).max(80.0);
     let prev_slider_w = ui.spacing().slider_width;
     ui.spacing_mut().slider_width = slider_w;
-    ui.add(
+    let slider = ui.add(
         egui::Slider::new(value, range.clone())
             .show_value(false)
             .clamping(egui::SliderClamping::Always),
     );
     ui.spacing_mut().slider_width = prev_slider_w;
     ui.add_space(gap);
-    ui.add(
+    let drag_value = ui.add(
         egui::DragValue::new(value)
             .range(range)
             .suffix(suffix)
@@ -3532,7 +3594,10 @@ fn advanced_slider_row(
         .clicked()
     {
         *value = default;
+        return true;
     }
+    let committed = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
+    committed(&slider) || committed(&drag_value)
 }
 
 fn stat_pill(

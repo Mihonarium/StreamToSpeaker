@@ -10,6 +10,10 @@
 //! the receiver with no clock to bind to: it accepts and decrypts audio but
 //! never schedules it — session shows "playing", output is silence.
 //!
+//! One master serves every receiver of a session — a HomePod stereo pair's
+//! members all follow the same grandmaster, so they share one timeline.
+//! In HomePod sessions packets from hosts that aren't members are ignored.
+//!
 //! Per registered peer we send unicast:
 //!   * **Announce** → port 320, ~1 s cadence
 //!   * **Sync** (two-step) → port 319, 125 ms cadence, followed by
@@ -99,7 +103,7 @@ pub struct PtpMasterClock {
 }
 
 impl PtpMasterClock {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self { start: Instant::now() })
     }
 
@@ -202,11 +206,20 @@ impl Drop for PtpMaster {
     }
 }
 
-/// Start the PTP master serving `receiver_ip`. Binds the event (319) and
-/// general (320) ports — one session at a time owns them — and starts the
-/// announce/sync transmit loop immediately so the clock is live before the
-/// RTSP SETUP that advertises it.
-pub fn spawn_ptp_master(receiver_ip: IpAddr, local_ip: IpAddr, receiver_name: String) -> Result<PtpMaster> {
+/// Start the PTP master serving `members` (every receiver of the session —
+/// one, or each member of a stereo pair). Binds the event (319) and
+/// general (320) ports once — one session at a time owns them — and starts
+/// the announce/sync transmit loop immediately so the clock is live before
+/// the RTSP SETUP that advertises it. `members_only`: ignore PTP traffic
+/// from any other host (otherwise every source is answered, as before).
+pub fn spawn_ptp_master(
+    members: &[IpAddr],
+    local_ip: IpAddr,
+    receiver_name: String,
+    members_only: bool,
+) -> Result<PtpMaster> {
+    anyhow::ensure!(!members.is_empty(), "PTP master needs at least one receiver");
+    let members = members.to_vec();
     let event = bind_ptp(local_ip, PTP_EVENT_PORT).context("bind PTP event :319")?;
     let general = bind_ptp(local_ip, PTP_GENERAL_PORT).context("bind PTP general :320")?;
     event.set_read_timeout(Some(Duration::from_millis(25)))?;
@@ -226,15 +239,16 @@ pub fn spawn_ptp_master(receiver_ip: IpAddr, local_ip: IpAddr, receiver_name: St
 
     let timeline_t = timeline.clone();
     let stop_t = stop.clone();
+    let members_t = members.clone();
     let handle = thread::Builder::new()
         .name(format!("stream-to-speaker-ap2-ptp:{}", receiver_name))
         .spawn(move || {
-            run_master(event, general, receiver_ip, timeline_t, stop_t);
+            run_master(event, general, members_t, members_only, timeline_t, stop_t);
         })?;
 
     info!(
-        "AirPlay 2 PTP: serving as grandmaster for {} (clock_id={:#018x})",
-        receiver_ip, clock_id
+        "AirPlay 2 PTP: serving as grandmaster for {:?} (clock_id={:#018x})",
+        members, clock_id
     );
     Ok(PtpMaster { timeline, clock_uuid, stop, handle: Some(handle) })
 }
@@ -255,14 +269,21 @@ fn bind_ptp(local_ip: IpAddr, port: u16) -> Result<UdpSocket> {
 fn run_master(
     event: UdpSocket,
     general: UdpSocket,
-    receiver_ip: IpAddr,
+    members: Vec<IpAddr>,
+    members_only: bool,
     timeline: PtpTimeline,
     stop: Arc<AtomicBool>,
 ) {
     let clock_id = timeline.clock_id;
     let clock = timeline.clock.clone();
-    let event_dst = SocketAddr::new(receiver_ip, PTP_EVENT_PORT);
-    let general_dst = SocketAddr::new(receiver_ip, PTP_GENERAL_PORT);
+    let event_dsts: Vec<SocketAddr> = members.iter().map(|ip| SocketAddr::new(*ip, PTP_EVENT_PORT)).collect();
+    let general_dsts: Vec<SocketAddr> =
+        members.iter().map(|ip| SocketAddr::new(*ip, PTP_GENERAL_PORT)).collect();
+    // Following a receiver's own clock (the Sonos anchor nuance) only
+    // makes sense with a single receiver; several members follow us.
+    let follow_receiver_clock = members.len() == 1;
+    let is_member = |src: &SocketAddr| !members_only || members.contains(&src.ip());
+    let receiver_ip = members[0];
     // The receiver's most recent Sync (seq, our receive time) awaiting its
     // Follow_Up — pairing them yields the receiver-clock offset.
     let mut pending_peer_sync: Option<(u16, u64)> = None;
@@ -285,7 +306,9 @@ fn run_master(
 
         if last_announce.map_or(true, |t| now.duration_since(t) >= ANNOUNCE_INTERVAL) {
             let pkt = build_announce(clock_id, announce_seq);
-            let _ = general.send_to(&pkt, general_dst);
+            for dst in &general_dsts {
+                let _ = general.send_to(&pkt, dst);
+            }
             announce_seq = announce_seq.wrapping_add(1);
             last_announce = Some(now);
         }
@@ -295,7 +318,9 @@ fn run_master(
         // senders; receivers appear to expect them before engaging a master.
         if last_signaling.map_or(true, |t| now.duration_since(t) >= SIGNALING_INTERVAL) {
             let pkt = build_signaling(clock_id, signaling_seq);
-            let _ = general.send_to(&pkt, general_dst);
+            for dst in &general_dsts {
+                let _ = general.send_to(&pkt, dst);
+            }
             signaling_seq = signaling_seq.wrapping_add(1);
             last_signaling = Some(now);
         }
@@ -303,12 +328,15 @@ fn run_master(
         if last_sync.map_or(true, |t| now.duration_since(t) >= SYNC_INTERVAL) {
             // Two-step: Sync carries a coarse origin, the Follow_Up sent
             // right behind it carries the precise origin timestamp.
-            let coarse = clock.now_ns();
-            let sync = build_sync(clock_id, sync_seq, coarse);
-            let _ = event.send_to(&sync, event_dst);
-            let precise = clock.now_ns();
-            let fup = build_follow_up(clock_id, sync_seq, precise);
-            let _ = general.send_to(&fup, general_dst);
+            // Per member, each with its own precise timestamp.
+            for (edst, gdst) in event_dsts.iter().zip(&general_dsts) {
+                let coarse = clock.now_ns();
+                let sync = build_sync(clock_id, sync_seq, coarse);
+                let _ = event.send_to(&sync, edst);
+                let precise = clock.now_ns();
+                let fup = build_follow_up(clock_id, sync_seq, precise);
+                let _ = general.send_to(&fup, gdst);
+            }
             sync_seq = sync_seq.wrapping_add(1);
             last_sync = Some(now);
         }
@@ -317,6 +345,9 @@ fn run_master(
         // timeout doubles as the loop tick. We log every inbound PTP packet
         // so the log shows whether the receiver engages our clock at all.
         match event.recv_from(&mut buf) {
+            Ok((_, src)) if !is_member(&src) => {
+                debug!("AP2 PTP: ignoring packet from non-member {}", src);
+            }
             Ok((n, src)) => {
                 let t_recv = clock.now_ns();
                 rx_total += 1;
@@ -339,7 +370,7 @@ fn run_master(
                         // The receiver's own Sync (it masters its clock at
                         // us): remember (seq, our recv time) and pair it
                         // with the Follow_Up's precise origin timestamp.
-                        0x0 => {
+                        0x0 if follow_receiver_clock => {
                             pending_peer_sync = Some((h.sequence_id, t_recv));
                         }
                         _ => {}
@@ -357,11 +388,15 @@ fn run_master(
         // General port: Announce / Follow_Up / Signaling / Delay_Resp from
         // the receiver. Logged so we can see e.g. a Signaling handshake.
         while let Ok((n, src)) = general.recv_from(&mut buf) {
+            if !is_member(&src) {
+                debug!("AP2 PTP: ignoring packet from non-member {}", src);
+                continue;
+            }
             rx_total += 1;
             if let Some(h) = parse_header(&buf[..n]) {
                 note_inbound(&mut seen_types, h.msg_type, PTP_GENERAL_PORT, src);
                 match h.msg_type {
-                    0xB => {
+                    0xB if follow_receiver_clock => {
                         if let Some((gm, class)) = parse_announce_grandmaster(&buf[..n]) {
                             let prev = timeline.set_peer_clock_id(gm);
                             if prev != gm {
@@ -375,7 +410,7 @@ fn run_master(
                     // Follow_Up completing the receiver's two-step Sync:
                     // its precise origin timestamp + our Sync receive time
                     // give the receiver-clock offset we anchor with.
-                    0x8 => {
+                    0x8 if follow_receiver_clock => {
                         if let Some((seq, t2)) = pending_peer_sync {
                             if seq == h.sequence_id {
                                 if let Some(t1) = read_timestamp(&buf[..n], HEADER_LEN) {
@@ -405,7 +440,7 @@ fn run_master(
                     "AirPlay 2 PTP: receiver {} has sent us NOTHING on 319/320 after 5s — it isn't \
                      engaging our clock. Likely inbound UDP 319/320 is firewall-blocked, or it \
                      expects unicast-PTP signaling we don't send yet. No clock lock = silent audio.",
-                    receiver_ip
+                    if members.len() == 1 { receiver_ip.to_string() } else { format!("{:?}", members) }
                 );
             } else {
                 // Delay_Resp count is only interesting when nonzero:

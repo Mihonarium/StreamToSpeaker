@@ -277,6 +277,12 @@ impl AudioSealer {
         }
     }
 
+    /// Skip `n` counter values alongside a jump of the RTP sequence number
+    /// by `n`, so the suffix keeps tracking the sequence number.
+    pub fn advance(&mut self, n: u64) {
+        self.counter = self.counter.wrapping_add(n);
+    }
+
     /// Nonce counter the next sealed packet will carry.
     pub fn next_counter(&self) -> u64 {
         self.counter

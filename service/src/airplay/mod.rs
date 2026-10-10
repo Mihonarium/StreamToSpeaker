@@ -38,6 +38,7 @@ pub mod ap2_crypto;
 pub mod ap2_events;
 pub mod ap2_health;
 pub mod ap2_ptp;
+pub mod ap2_realtime;
 pub mod ap2_resend;
 pub mod ap2_rtsp;
 pub mod ap2_session;

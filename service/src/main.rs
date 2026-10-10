@@ -526,6 +526,7 @@ fn run(cli: Cli) -> Result<()> {
     // speaker bound at launch.
     if !cli.no_discovery {
         let discovery = app.discovery.as_ref().unwrap();
+        let mut pair_wait_started = false;
         let initial = if cli.player.is_some() {
             picker::resolve(discovery, cli.player.as_deref(), false)?
         } else if !cli.no_interactive && cli.headless {
@@ -539,7 +540,31 @@ fn run(cli: Cli) -> Result<()> {
                 // Wait briefly for the first SSDP sweep to populate
                 // discovery before we look the saved id up.
                 picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
-                discovery.find_by_id(&saved_id)
+                let found = discovery.find_by_id(&saved_id);
+                // A saved HomePod stereo pair (or one of its members): give
+                // both members time to resolve in the background, then play
+                // the pair — unless the user picked something meanwhile.
+                if found.is_none() && saved_id.starts_with("airplay:") {
+                    if let Some(ad) = app.airplay_discovery.clone() {
+                        let app = app.clone();
+                        pair_wait_started = std::thread::Builder::new()
+                            .name("stream-to-speaker-pair-reconnect".into())
+                            .spawn(move || {
+                                let Some(id) = ad.wait_for_pair(&saved_id, Duration::from_secs(15)) else {
+                                    return;
+                                };
+                                if app.session.lock().unwrap().is_some()
+                                    || app.connecting.lock().unwrap().is_some()
+                                {
+                                    return;
+                                }
+                                info!("auto-reconnect: stereo pair {:?}", id);
+                                app.select_speaker_async(&id);
+                            })
+                            .is_ok();
+                    }
+                }
+                found
             }
         } else {
             info!("first launch (no saved speaker) — waiting for manual pick");
@@ -550,7 +575,7 @@ fn run(cli: Cli) -> Result<()> {
             if let Err(e) = app.select_speaker(&id) {
                 warn!("starting initial session failed: {}", e);
             }
-        } else if cli.headless {
+        } else if cli.headless && !pair_wait_started {
             warn!(
                 "no speaker selected; pick one with the GUI / web UI / POST /api/select"
             );

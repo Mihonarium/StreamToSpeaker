@@ -142,6 +142,18 @@ pub struct UserConfig {
     /// to [`AIRPLAY_LATENCY_MS_MIN`]..=[`AIRPLAY_LATENCY_MS_MAX`] on read.
     #[serde(default = "default_airplay_latency_ms")]
     pub airplay_latency_ms: u32,
+    /// HomePods (single, `model AudioAccessory*`) normally stream with the
+    /// low-latency realtime profile at [`Self::airplay_homepod_latency_ms`].
+    /// `true` returns single HomePods to the earlier buffered AirPlay 2
+    /// stream (seconds of delay, governed by `airplay_latency_ms` and
+    /// `prefer_realtime_airplay`). Stereo pairs always use realtime.
+    #[serde(default)]
+    pub airplay_homepod_buffered: bool,
+    /// Playout delay requested from HomePods on the realtime profile, in
+    /// ms (the stream's pinned `latencyMin`/`latencyMax`). Clamped to
+    /// [`HOMEPOD_LATENCY_MS_MIN`]..=[`HOMEPOD_LATENCY_MS_MAX`] on read.
+    #[serde(default = "default_homepod_latency_ms")]
+    pub airplay_homepod_latency_ms: u32,
     /// Once-a-day check for a newer release on GitHub (Advanced toggle).
     /// One unauthenticated GET of the releases API; nothing is downloaded
     /// or installed. On by default. See `update_check`.
@@ -175,6 +187,18 @@ pub const AIRPLAY_LATENCY_MS_DEFAULT: u32 = 2000;
 pub const AIRPLAY_LATENCY_MS_MIN: u32 = 20;
 /// Ceiling for `airplay_latency_ms` (3 s — "buffered" territory).
 pub const AIRPLAY_LATENCY_MS_MAX: u32 = 3000;
+
+/// Default HomePod realtime delay.
+pub const HOMEPOD_LATENCY_MS_DEFAULT: u32 = 200;
+/// Floor for `airplay_homepod_latency_ms` (same pacing argument as
+/// [`AIRPLAY_LATENCY_MS_MIN`]).
+pub const HOMEPOD_LATENCY_MS_MIN: u32 = 20;
+/// Ceiling for `airplay_homepod_latency_ms`.
+pub const HOMEPOD_LATENCY_MS_MAX: u32 = 2000;
+
+fn default_homepod_latency_ms() -> u32 {
+    HOMEPOD_LATENCY_MS_DEFAULT
+}
 
 fn default_true() -> bool {
     true
@@ -227,6 +251,11 @@ impl UserConfig {
     /// can't produce a zero or absurd anchor.
     pub fn effective_airplay_latency_ms(&self) -> u32 {
         self.airplay_latency_ms.clamp(AIRPLAY_LATENCY_MS_MIN, AIRPLAY_LATENCY_MS_MAX)
+    }
+
+    /// `airplay_homepod_latency_ms` clamped to its supported range.
+    pub fn effective_homepod_latency_ms(&self) -> u32 {
+        self.airplay_homepod_latency_ms.clamp(HOMEPOD_LATENCY_MS_MIN, HOMEPOD_LATENCY_MS_MAX)
     }
 
     pub fn load() -> Self {
@@ -343,6 +372,8 @@ mod tests {
         assert!(c.check_for_updates);
         assert_eq!(c.update_last_check_unix, None);
         assert!(!c.prefer_realtime_airplay);
+        assert!(!c.airplay_homepod_buffered);
+        assert_eq!(c.effective_homepod_latency_ms(), HOMEPOD_LATENCY_MS_DEFAULT);
     }
 
     fn temp_config_dir(tag: &str) -> std::path::PathBuf {

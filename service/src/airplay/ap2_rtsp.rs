@@ -86,6 +86,51 @@ pub enum PairVerifyError {
     Rejected(#[source] anyhow::Error),
 }
 
+/// Payload codec of a realtime stream: raw big-endian PCM (`ct` 1) or
+/// ALAC (`ct` 2), both 44.1 kHz / 16-bit / stereo, 352 frames per packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealtimeCodec {
+    Pcm,
+    Alac,
+}
+
+impl RealtimeCodec {
+    /// Pick from the receiver's advertised `cn` list (0 = PCM, 1 = ALAC):
+    /// PCM when the list is empty or offers it, ALAC only when PCM is
+    /// missing, nothing when it offers neither.
+    pub fn from_cn(cn: &[u8]) -> Option<Self> {
+        if cn.is_empty() || cn.contains(&0) {
+            Some(RealtimeCodec::Pcm)
+        } else if cn.contains(&1) {
+            Some(RealtimeCodec::Alac)
+        } else {
+            None
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RealtimeCodec::Pcm => "PCM",
+            RealtimeCodec::Alac => "ALAC",
+        }
+    }
+
+    fn ct(self) -> u64 {
+        match self {
+            RealtimeCodec::Pcm => 1,
+            RealtimeCodec::Alac => 2,
+        }
+    }
+
+    /// `audioFormat` bit for 44.1 kHz / 16-bit / stereo.
+    fn audio_format(self) -> u64 {
+        match self {
+            RealtimeCodec::Pcm => 0x800,
+            RealtimeCodec::Alac => 0x40000,
+        }
+    }
+}
+
 /// Outcome of a volume read-back via `GET /info`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InfoVolume {
@@ -524,6 +569,80 @@ impl Ap2Rtsp {
             bail!("SETUP(timing/PTP) → {} {}", resp.status, resp.status_text);
         }
         Ok(parse_timing_setup(&resp.body))
+    }
+
+    /// First SETUP for the HomePod realtime profile: the PTP session dict
+    /// plus the multi-select keys iOS sends (`isMultiSelectAirPlay`,
+    /// `groupContainsGroupLeader`, `senderSupportsRelay`) and our name /
+    /// `macAddress`. Used for single HomePods and each stereo-pair member.
+    pub fn setup_timing_ptp_homepod(&mut self, clock_id: u64, clock_uuid: &str, sender_name: &str) -> Result<TimingSetup> {
+        let dict = homepod_session_dict(
+            &self.device_id_mac,
+            &self.session_uuid,
+            sender_name,
+            clock_id,
+            clock_uuid,
+            self.local_ip,
+        );
+        let body = to_binary_plist(&Value::Dictionary(dict))?;
+        let uri = self.session_uri();
+        let resp = self.request("SETUP", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
+        if resp.status != 200 {
+            bail!("SETUP(session/PTP) → {} {}{}", resp.status, resp.status_text, describe_error_body(&resp.body));
+        }
+        Ok(parse_timing_setup(&resp.body))
+    }
+
+    /// Second SETUP for the HomePod realtime profile: type 96 with the
+    /// latency window **pinned** (`latencyMin` = `latencyMax` = the
+    /// requested latency in samples), so the receiver plays at exactly
+    /// that delay. `ct`/`audio_format` pick PCM or ALAC;
+    /// `streamConnectionID` is the stream's SSRC. Returns the ports and
+    /// the receiver's own `latencyMin`, if it reported a plausible one.
+    pub fn setup_stream_pinned(
+        &mut self,
+        audio_key: &[u8; 32],
+        control_port: u16,
+        codec: RealtimeCodec,
+        latency_samples: u32,
+        ssrc: u32,
+    ) -> Result<(StreamPorts, Option<u32>)> {
+        let stream = pinned_stream_dict(audio_key, control_port, codec, latency_samples, ssrc);
+        let mut dict = plist::Dictionary::new();
+        dict.insert("streams".into(), Value::Array(vec![Value::Dictionary(stream)]));
+        let body = to_binary_plist(&Value::Dictionary(dict))?;
+        let uri = self.session_uri();
+        let resp = self.request("SETUP", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
+        if resp.status != 200 {
+            bail!(
+                "SETUP(stream, realtime {}) → {} {}{}",
+                codec.label(),
+                resp.status,
+                resp.status_text,
+                describe_error_body(&resp.body)
+            );
+        }
+        let ports = parse_stream_ports(&resp.body)?;
+        Ok((ports, parse_stream_latency_min(&resp.body)))
+    }
+
+    /// RECORD with `Range: npt=0-` and `RTP-Info` naming the first packet,
+    /// immediately followed by a FLUSH with the same headers.
+    pub fn record_and_flush_at(&mut self, seq: u16, rtptime: u32) -> Result<()> {
+        let uri = self.session_uri();
+        let headers = vec![
+            ("Range".to_string(), "npt=0-".to_string()),
+            ("RTP-Info".to_string(), format!("seq={};rtptime={}", seq, rtptime)),
+        ];
+        let resp = self.request("RECORD", &uri, &headers, None, &[])?;
+        if resp.status != 200 {
+            bail!("RECORD → {} {}", resp.status, resp.status_text);
+        }
+        let resp = self.request("FLUSH", &uri, &headers, None, &[])?;
+        if resp.status != 200 {
+            bail!("FLUSH → {} {}", resp.status, resp.status_text);
+        }
+        Ok(())
     }
 
     /// SETPEERS — hand the receiver the full PTP peer address list (ours
@@ -1040,6 +1159,70 @@ fn parse_timing_setup(body: &[u8]) -> TimingSetup {
     }
 }
 
+/// The HomePod-profile SETUP(session) body.
+fn homepod_session_dict(
+    device_id: &str,
+    session_uuid: &str,
+    sender_name: &str,
+    clock_id: u64,
+    clock_uuid: &str,
+    local_ip: IpAddr,
+) -> plist::Dictionary {
+    let mut peer = plist::Dictionary::new();
+    peer.insert("Addresses".into(), Value::Array(vec![Value::String(local_ip.to_string())]));
+    peer.insert("ClockID".into(), Value::Integer((clock_id as i64).into()));
+    peer.insert("DeviceType".into(), Value::Integer(0u64.into()));
+    peer.insert("ID".into(), clock_uuid.to_string().into());
+    peer.insert("SupportsClockPortMatchingOverride".into(), Value::Boolean(false));
+
+    let mut dict = plist::Dictionary::new();
+    dict.insert("deviceID".into(), device_id.to_string().into());
+    dict.insert("macAddress".into(), device_id.to_string().into());
+    dict.insert("name".into(), sender_name.to_string().into());
+    dict.insert("sessionUUID".into(), session_uuid.to_string().into());
+    dict.insert("timingProtocol".into(), "PTP".into());
+    dict.insert("isMultiSelectAirPlay".into(), Value::Boolean(true));
+    dict.insert("groupContainsGroupLeader".into(), Value::Boolean(false));
+    dict.insert("senderSupportsRelay".into(), Value::Boolean(false));
+    dict.insert("timingPeerInfo".into(), Value::Dictionary(peer.clone()));
+    dict.insert("timingPeerList".into(), Value::Array(vec![Value::Dictionary(peer)]));
+    dict
+}
+
+/// The HomePod-profile realtime stream dict (latency window pinned).
+fn pinned_stream_dict(
+    audio_key: &[u8; 32],
+    control_port: u16,
+    codec: RealtimeCodec,
+    latency_samples: u32,
+    ssrc: u32,
+) -> plist::Dictionary {
+    let mut stream = plist::Dictionary::new();
+    stream.insert("type".into(), Value::Integer(0x60u64.into()));
+    stream.insert("ct".into(), Value::Integer(codec.ct().into()));
+    stream.insert("audioFormat".into(), Value::Integer(codec.audio_format().into()));
+    stream.insert("spf".into(), Value::Integer(352u64.into()));
+    stream.insert("sr".into(), Value::Integer(44100u64.into()));
+    stream.insert("audioMode".into(), "default".into());
+    stream.insert("isMedia".into(), Value::Boolean(true));
+    stream.insert("supportsDynamicStreamID".into(), Value::Boolean(false));
+    stream.insert("streamConnectionID".into(), Value::Integer((ssrc as u64).into()));
+    stream.insert("controlPort".into(), Value::Integer((control_port as u64).into()));
+    stream.insert("shk".into(), Value::Data(audio_key.to_vec()));
+    stream.insert("latencyMin".into(), Value::Integer((latency_samples as u64).into()));
+    stream.insert("latencyMax".into(), Value::Integer((latency_samples as u64).into()));
+    stream
+}
+
+/// `streams[0].latencyMin` from a SETUP(stream) response, when it is a
+/// plausible receiver latency (1 sample .. 10 s).
+fn parse_stream_latency_min(body: &[u8]) -> Option<u32> {
+    let val: Value = plist::from_bytes(body).ok()?;
+    let s0 = val.as_dictionary()?.get("streams")?.as_array()?.first()?.as_dictionary()?;
+    let v = s0.get("latencyMin")?.as_unsigned_integer()?;
+    (1..=10 * 44_100).contains(&v).then_some(v as u32)
+}
+
 /// Pull `streams[0].dataPort` and `.controlPort` out of a SETUP response.
 fn parse_stream_ports(body: &[u8]) -> Result<StreamPorts> {
     let val: Value = plist::from_bytes(body).context("parsing SETUP(stream) plist response")?;
@@ -1264,6 +1447,59 @@ mod tests {
         assert_eq!(parse_initial_volume(&body(None)), None);
         assert_eq!(parse_initial_volume(&body(Some(Value::Real(3.0)))), None);
         assert_eq!(parse_initial_volume(b"garbage"), None);
+    }
+
+    #[test]
+    fn codec_choice_follows_cn() {
+        assert_eq!(RealtimeCodec::from_cn(&[]), Some(RealtimeCodec::Pcm));
+        assert_eq!(RealtimeCodec::from_cn(&[0, 1, 2, 3]), Some(RealtimeCodec::Pcm));
+        assert_eq!(RealtimeCodec::from_cn(&[1, 3]), Some(RealtimeCodec::Alac));
+        assert_eq!(RealtimeCodec::from_cn(&[2, 3]), None);
+    }
+
+    #[test]
+    fn pinned_stream_dict_pins_latency_window() {
+        let d = pinned_stream_dict(&[1u8; 32], 6001, RealtimeCodec::Pcm, 8820, 0xABCD);
+        let int = |k: &str| d.get(k).and_then(|v| v.as_unsigned_integer());
+        assert_eq!(int("type"), Some(0x60));
+        assert_eq!(int("ct"), Some(1));
+        assert_eq!(int("audioFormat"), Some(0x800));
+        assert_eq!(int("spf"), Some(352));
+        assert_eq!(int("latencyMin"), Some(8820));
+        assert_eq!(int("latencyMax"), Some(8820));
+        assert_eq!(int("streamConnectionID"), Some(0xABCD));
+        assert_eq!(int("controlPort"), Some(6001));
+        let a = pinned_stream_dict(&[1u8; 32], 6001, RealtimeCodec::Alac, 8820, 1);
+        assert_eq!(a.get("audioFormat").and_then(|v| v.as_unsigned_integer()), Some(0x40000));
+    }
+
+    #[test]
+    fn homepod_session_dict_has_multiselect_keys() {
+        let d = homepod_session_dict("AA:BB", "UUID", "Sender", 42, "CLOCK", "10.0.0.2".parse().unwrap());
+        assert_eq!(d.get("isMultiSelectAirPlay").and_then(|v| v.as_boolean()), Some(true));
+        assert_eq!(d.get("groupContainsGroupLeader").and_then(|v| v.as_boolean()), Some(false));
+        assert_eq!(d.get("senderSupportsRelay").and_then(|v| v.as_boolean()), Some(false));
+        assert_eq!(d.get("timingProtocol").and_then(|v| v.as_string()), Some("PTP"));
+        let peers = d.get("timingPeerList").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(peers.len(), 1);
+        let p = peers[0].as_dictionary().unwrap();
+        assert_eq!(p.get("ClockID").and_then(|v| v.as_signed_integer()), Some(42));
+        assert!(d.get("groupUUID").is_none());
+    }
+
+    #[test]
+    fn stream_latency_min_is_range_checked() {
+        let body = |v: u64| {
+            let mut s0 = plist::Dictionary::new();
+            s0.insert("dataPort".into(), Value::Integer(1u64.into()));
+            s0.insert("latencyMin".into(), Value::Integer(v.into()));
+            let mut d = plist::Dictionary::new();
+            d.insert("streams".into(), Value::Array(vec![Value::Dictionary(s0)]));
+            to_binary_plist(&Value::Dictionary(d)).unwrap()
+        };
+        assert_eq!(parse_stream_latency_min(&body(11025)), Some(11025));
+        assert_eq!(parse_stream_latency_min(&body(0)), None);
+        assert_eq!(parse_stream_latency_min(&body(10 * 44_100 + 1)), None);
     }
 
     #[test]
