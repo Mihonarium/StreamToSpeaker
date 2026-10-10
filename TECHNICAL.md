@@ -228,7 +228,7 @@ the crate version and update checks are off.
 | `/api/select` | POST | `{"id": "<udn-or-ip>"}` with `Content-Type: application/json` — switch speaker. | `--web` |
 | `/api/resync` | POST | Restart the session. | `--web` |
 | `/api/latency/adjust?ms=N` | POST | `N>0` drains, `N<0` pads. | `--web` |
-| `/healthz` | GET | Returns `ok`. | `--web` |
+| `/healthz` | GET | Returns `ok`. | yes |
 
 Requests must name this machine in `Host` (`localhost`, its computer name,
 one of its IP addresses, or `--advertise-ip`), and the `POST` routes refuse

@@ -113,9 +113,6 @@ impl VolumeSync {
         self.inner.lock().unwrap().last_level
     }
 
-    /// Seed the cache from an initial observation (e.g. `upnp::get_volume`
-    /// on connect, or the GUI slider). Doesn't touch the `last_pushed_*`
-    /// echo timestamps — the caller observed/initiated this directly.
     /// Record a mute change seen on either side (Windows or speaker).
     pub fn note_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Release);
@@ -145,6 +142,9 @@ impl VolumeSync {
         Some((sonos_to_millibels(level), self.is_muted()))
     }
 
+    /// Seed the cache from an initial observation (e.g. `upnp::get_volume`
+    /// on connect, or the GUI slider). Doesn't touch the `last_pushed_*`
+    /// echo timestamps — the caller observed/initiated this directly.
     pub fn prime_initial_volume(&self, level: u32) {
         let mut inner = self.inner.lock().unwrap();
         inner.last_level = Some(level.min(100));
