@@ -691,7 +691,7 @@ impl App {
     pub fn set_airplay_password(&self, id: &str, pw: &str) {
         let mut uc = self.user_config.lock().unwrap();
         if pw.is_empty() {
-            uc.airplay_passwords.remove(id);
+            uc.remove_airplay_password(id);
         } else {
             uc.airplay_passwords.insert(id.to_string(), pw.to_string());
         }
@@ -1832,7 +1832,7 @@ impl App {
     /// receiver rejected them — it forgot the pairing).
     fn remove_airplay_pairing(&self, id: &str) {
         let mut uc = self.user_config.lock().unwrap();
-        if uc.airplay_pairings.remove(id).is_some() {
+        if uc.remove_airplay_pairing(id) {
             uc.save();
         }
     }
