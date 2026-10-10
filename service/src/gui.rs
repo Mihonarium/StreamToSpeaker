@@ -3598,13 +3598,7 @@ fn window_icon(state: IconState) -> egui::IconData {
 }
 
 fn open_url(url: &str) -> std::io::Result<()> {
-    // Windows: `cmd /C start "" <url>` is the canonical "open default
-    // browser" invocation. The empty quoted string is required because
-    // start treats the first quoted arg as the new window title.
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn()
-        .map(|_| ())
+    crate::open_url(url)
 }
 
 fn format_duration(secs: u64) -> String {

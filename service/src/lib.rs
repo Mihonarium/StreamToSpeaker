@@ -36,6 +36,90 @@ pub mod tray;
 #[cfg(windows)]
 pub mod endpoint_name;
 
+/// Whether `url` is something we're willing to hand to the shell: an
+/// absolute http(s) URL made only of letters, digits and `-._~/:%[]@`.
+/// That excludes whitespace, quotes, control characters and shell
+/// metacharacters (`&`, `|`, `^`, `<`, `>`); nothing we open needs a
+/// query string.
+pub fn is_openable_url(url: &str) -> bool {
+    let rest = if let Some(r) = url.strip_prefix("https://") {
+        r
+    } else if let Some(r) = url.strip_prefix("http://") {
+        r
+    } else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.starts_with('/')
+        && rest.len() < 2048
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~/:%[]@".contains(&b))
+}
+
+/// Open `url` in the default browser via `ShellExecuteW` — no command
+/// interpreter involved. Refuses anything [`is_openable_url`] rejects.
+#[cfg(windows)]
+pub fn open_url(url: &str) -> std::io::Result<()> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    if !is_openable_url(url) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to open {:?}", url),
+        ));
+    }
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let verb = wide("open");
+    let file = wide(url);
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // Values above 32 mean success.
+    if rc as usize > 32 {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("ShellExecuteW failed ({})", rc as usize),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::is_openable_url;
+
+    #[test]
+    fn openable_urls() {
+        assert!(is_openable_url("https://github.com/Mihonarium/StreamToSpeaker/releases/tag/v0.1.4"));
+        assert!(is_openable_url("http://192.168.1.10:5901/"));
+        assert!(is_openable_url("http://[fe80::1]:5901/"));
+        for bad in [
+            "https://github.com/x&calc",
+            "https://github.com/x|calc",
+            "https://github.com/x^&calc",
+            "https://github.com/x\"calc",
+            "https://github.com/x calc",
+            "file:///C:/Windows/System32/calc.exe",
+            "calc.exe",
+            "https://",
+            "https:///x",
+            "javascript:alert(1)",
+        ] {
+            assert!(!is_openable_url(bad), "{bad}");
+        }
+    }
+}
+
 /// User-facing product name (shown in CLI help, web status page, etc).
 /// Internal Rust crate name stays `stream_to_speaker` for code stability.
 pub const PRODUCT_NAME: &str = "Stream To Speaker";
