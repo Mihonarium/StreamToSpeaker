@@ -70,6 +70,7 @@ jobs:
         with:
           path: repo-scripts
           sparse-checkout: .github/scripts
+          persist-credentials: false
 
       - name: Resolve release + download assets
         id: rel
