@@ -81,7 +81,7 @@ Implemented in `service/src/sonos.rs` (+ ssdp/upnp/gena/app wiring). Facts below
 | "Allow apps and Windows to use this device" toggle | Endpoint builder creates certain KSNODETYPE / form-factor combinations as disabled+hidden by default | `PKEY_AudioDevice_EnableEndpointByDefault = 0x101` (FLAG_ENABLE \| FLOW_MASK_RENDER) in INF |
 | OEM APO (Dolby Atmos etc.) attaches and adds latency | FormFactor=1 (Speakers) is the default match for OEM APOs | `PKEY_AudioEndpoint_Disable_SysFx = 1` in INF |
 | BSOD 0x9F sub-code 3 | A device our driver owns failed to complete an `IRP_MJ_POWER` in time | Don't just override `MJ_DEVICE_CONTROL` / `CREATE` / `CLOSE`; also own `MJ_POWER` and route by device — our control device needs to complete with `STATUS_SUCCESS` + `PoStartNextPowerIrp`, audio FDO forwards to PortCls |
-| Driver loaded but `build=N` shows old N in service log | `pnputil /add-driver` only stages; running kernel keeps old `.sys` | Device Manager → device → Disable/Enable, or reboot |
+| Driver loaded but `build=N` shows old N in service log | `pnputil /add-driver` only stages, and the control device keeps the loaded `.sys` in memory until Windows restarts | Reboot (disable/enable is not enough); the installer asks for a restart when the driver binary changes |
 
 ## Debugging recipes
 
