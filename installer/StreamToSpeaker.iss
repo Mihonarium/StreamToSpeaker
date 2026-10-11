@@ -267,9 +267,26 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
 var
   PriorDriverHash: String;
 
+// The file the driver's service loads, from its ImagePath. The INF
+// installs with DIRID 13, so this is the package's DriverStore copy
+// (\SystemRoot\System32\DriverStore\FileRepository\...), not
+// System32\drivers. '' when the service isn't installed.
 function DriverImagePath(): String;
+var
+  Path: String;
 begin
-  Result := ExpandConstant('{sys}\drivers\StreamToSpeaker.sys');
+  Result := '';
+  if not RegQueryStringValue(HKLM64, 'SYSTEM\CurrentControlSet\Services\StreamToSpeaker',
+                             'ImagePath', Path) then
+    Exit;
+  Path := Trim(Path);
+  if Copy(Path, 1, 4) = '\??\' then
+    Path := Copy(Path, 5, Length(Path) - 4)
+  else if CompareText(Copy(Path, 1, 12), '\SystemRoot\') = 0 then
+    Path := ExpandConstant('{win}') + Copy(Path, 12, Length(Path) - 11)
+  else if CompareText(Copy(Path, 1, 9), 'System32\') = 0 then
+    Path := ExpandConstant('{win}\') + Path;
+  Result := Path;
 end;
 
 // The driver's control device keeps the loaded image in memory until
@@ -339,6 +356,7 @@ end;
 function InitializeSetup(): Boolean;
 var
   Major, Minor, Build: Cardinal;
+  DriverFile: String;
   Version: TWindowsVersion;
 begin
   Result := True;
@@ -358,11 +376,14 @@ begin
     Exit;
   end;
   PriorDriverHash := '';
-  if FileExists(DriverImagePath()) then begin
+  DriverFile := DriverImagePath();
+  if (DriverFile <> '') and FileExists(DriverFile) then begin
     try
-      PriorDriverHash := GetSHA256OfFile(DriverImagePath());
+      PriorDriverHash := GetSHA256OfFile(DriverFile);
+      Log('Installed driver ' + DriverFile + ' has SHA-256 ' + PriorDriverHash);
     except
       PriorDriverHash := '';
     end;
-  end;
+  end else
+    Log('No installed driver binary found (' + DriverFile + ')');
 end;
