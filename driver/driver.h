@@ -24,6 +24,9 @@
   /* _KERNEL_MODE and _NTDDK_ are defined by the WindowsKernelModeDriver
      toolset automatically; do not redefine here. */
 
+  /* ntifs.h first: it includes ntddk.h itself and must precede it (the
+   * CREATE handler queries the caller's token integrity level). */
+  #include <ntifs.h>
   #include <ntddk.h>
   #include <wdm.h>
   #include <windef.h>

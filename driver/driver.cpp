@@ -53,12 +53,12 @@ static UNICODE_STRING g_ControlDeviceName = RTL_CONSTANT_STRING_W(L"\\Device\\St
  * below the device.
  *
  * Integrity: IoCreateDeviceSecure accepts a DACL only (no S: mandatory
- * label). An unlabeled device object is treated as Medium integrity
- * with no-write-up, so a Low-integrity caller can open it for read but
- * never for write. The CREATE handler therefore requires every
- * user-mode open to ask for write access; together that keeps
- * Low-integrity (sandboxed) processes from opening the device at all,
- * including read-only opens that could otherwise pull audio packets.
+ * label), and the device object ends up with an inherited Low
+ * no-write-up label from the object directory, so the DACL alone lets
+ * Low-integrity processes open it read + write. The CREATE handler is
+ * therefore the integrity control: it refuses user-mode callers whose
+ * token is below Medium integrity, and additionally requires every
+ * user-mode open to ask for write access.
  *
  * The class GUID names the registry key under which an administrator
  * can override this descriptor (Class\{GUID}\Properties). */
@@ -247,11 +247,44 @@ static NTSTATUS CompleteControlIrp(_In_ PIRP Irp, _In_ NTSTATUS Status)
     return Status;
 }
 
-/* User-mode opens of the control device must request write access. See
- * g_ControlDeviceSddl for why: the I/O manager has already checked the
- * requested access against the DACL and the implicit Medium no-write-up
- * label, so requiring write here excludes Low-integrity callers even
- * when they ask for read only.
+/* Integrity level of the effective token (client token if the caller
+ * is impersonating, else the primary token) of the subject opening the
+ * file. PASSIVE_LEVEL (IRP_MJ_CREATE).
+ *
+ * For TokenIntegrityLevel, SeQueryInformationToken stores the level
+ * itself (a DWORD, e.g. SECURITY_MANDATORY_MEDIUM_RID) in the output
+ * pointer variable rather than a pointer to an allocated buffer, so
+ * there is nothing to free. Anything that is not a plausible level is
+ * treated as a failure. */
+static NTSTATUS QuerySubjectIntegrityLevel(
+    _In_  PSECURITY_SUBJECT_CONTEXT Subject,
+    _Out_ PULONG                    Level)
+{
+    PAGED_CODE();
+    *Level = 0;
+    PACCESS_TOKEN token = SeQuerySubjectContextToken(Subject);
+    if (token == nullptr) {
+        return STATUS_ACCESS_DENIED;
+    }
+    PVOID info = nullptr;
+    NTSTATUS status = SeQueryInformationToken(token, TokenIntegrityLevel, &info);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    ULONG_PTR raw = reinterpret_cast<ULONG_PTR>(info);
+    if (raw > SECURITY_MANDATORY_PROTECTED_PROCESS_RID) {
+        return STATUS_ACCESS_DENIED;
+    }
+    *Level = static_cast<ULONG>(raw);
+    return STATUS_SUCCESS;
+}
+
+/* User-mode opens of the control device (and kernel-mode opens that ask
+ * for an access check) must come from a token of at least Medium
+ * integrity and must request write access. The DACL does not stop
+ * Low-integrity processes (see g_ControlDeviceSddl), so the integrity
+ * check is the control; it fails closed if the level cannot be read.
+ * Kernel-mode opens without SL_FORCE_ACCESS_CHECK are not checked.
  *
  * Write counts as granted if either
  *  - PreviouslyGrantedAccess has FILE_WRITE_DATA (the result of the I/O
@@ -272,6 +305,16 @@ static NTSTATUS ControlDeviceCheckOpen(_In_ PIRP Irp)
     if (sc == nullptr || sc->AccessState == nullptr) {
         return STATUS_ACCESS_DENIED;
     }
+
+    ULONG level = 0;
+    NTSTATUS status = QuerySubjectIntegrityLevel(
+        &sc->AccessState->SubjectSecurityContext, &level);
+    if (!NT_SUCCESS(status) || level < SECURITY_MANDATORY_MEDIUM_RID) {
+        DBG_WARN("control device open refused: integrity 0x%x (status 0x%08x)",
+                 level, status);
+        return STATUS_ACCESS_DENIED;
+    }
+
     const ACCESS_MASK writeRights = FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL;
     if ((sc->AccessState->PreviouslyGrantedAccess & FILE_WRITE_DATA) != 0 ||
         (sc->AccessState->OriginalDesiredAccess & writeRights) != 0) {
