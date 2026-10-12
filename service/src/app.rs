@@ -59,6 +59,10 @@ pub enum ActiveSession {
     Upnp(RendererSession),
     AirPlay(AirPlaySession),
     AirPlay2(AirPlay2Session),
+    /// Sendspin player (we push timestamped audio, like AirPlay).
+    Sendspin(crate::sendspin::server::PlayerSession),
+    /// Music Assistant as the output: its Sendspin input gets our audio.
+    MusicAssistant(crate::sendspin_app::MaOutputSession),
 }
 
 impl ActiveSession {
@@ -70,6 +74,20 @@ impl ActiveSession {
                 .unwrap_or_else(|| s.renderer.stable_id()),
             ActiveSession::AirPlay(s) => s.renderer.stable_id(),
             ActiveSession::AirPlay2(s) => s.renderer.stable_id(),
+            ActiveSession::Sendspin(s) => s.renderer.stable_id(),
+            ActiveSession::MusicAssistant(_) => crate::sendspin_app::MA_OUTPUT_ID.to_string(),
+        }
+    }
+
+    /// Does this session drive the speaker selected as `id` (resolved to
+    /// `target` for UPnP ids)?
+    pub fn is_device(&self, id: &str, target: Option<&Renderer>) -> bool {
+        if self.stable_id() == id {
+            return true;
+        }
+        match (self, target) {
+            (ActiveSession::Upnp(s), Some(t)) => s.renderer.same_device_as(t),
+            _ => false,
         }
     }
 
@@ -80,6 +98,8 @@ impl ActiveSession {
             ActiveSession::Upnp(s) => s.renderer.display_name(),
             ActiveSession::AirPlay(s) => s.renderer.friendly_name.clone(),
             ActiveSession::AirPlay2(s) => s.renderer.friendly_name.clone(),
+            ActiveSession::Sendspin(s) => s.renderer.friendly_name.clone(),
+            ActiveSession::MusicAssistant(s) => s.name.clone(),
         }
     }
 
@@ -88,6 +108,8 @@ impl ActiveSession {
             ActiveSession::Upnp(s) => s.renderer.ip,
             ActiveSession::AirPlay(s) => s.renderer.ip,
             ActiveSession::AirPlay2(s) => s.renderer.ip,
+            ActiveSession::Sendspin(s) => s.renderer.ip,
+            ActiveSession::MusicAssistant(s) => s.ip(),
         }
     }
 
@@ -99,6 +121,8 @@ impl ActiveSession {
             ActiveSession::Upnp(s) => stop_session(&s),
             ActiveSession::AirPlay(s) => s.stop(),
             ActiveSession::AirPlay2(s) => s.stop(),
+            ActiveSession::Sendspin(s) => s.stop(),
+            ActiveSession::MusicAssistant(s) => s.stop(),
         }
     }
 
@@ -114,6 +138,9 @@ impl ActiveSession {
             },
             ActiveSession::AirPlay(s) => s.set_volume_pct(pct),
             ActiveSession::AirPlay2(s) => s.set_volume_pct(pct),
+            ActiveSession::Sendspin(s) => s.set_volume_pct(pct),
+            // Music Assistant keeps its own volume per speaker.
+            ActiveSession::MusicAssistant(_) => Ok(()),
         }
     }
 
@@ -123,27 +150,53 @@ impl ActiveSession {
     pub fn metadata_handle(&self) -> Option<crate::airplay::session::MetadataHandle> {
         match self {
             ActiveSession::AirPlay(s) => Some(s.metadata_handle()),
-            ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) => None,
+            ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) | ActiveSession::Sendspin(_) | ActiveSession::MusicAssistant(_) => None,
         }
     }
 
-    /// True if the session has died mid-stream (dropped receiver). UPnP
-    /// is HTTP-pull (the speaker reconnects on its own), so only the
-    /// AirPlay push paths report death here.
+    /// The speaker ended the session itself in a way that rules out an
+    /// automatic reconnect (Sendspin goodbye such as "another_server").
+    pub fn ended_by_speaker(&self) -> Option<String> {
+        match self {
+            ActiveSession::Sendspin(s) => s.ended_by_speaker(),
+            _ => None,
+        }
+    }
+
     /// Short protocol label for diagnostics.
     pub fn transport_label(&self) -> &'static str {
         match self {
             ActiveSession::Upnp(_) => "UPnP",
             ActiveSession::AirPlay(_) => "AirPlay (RAOP)",
             ActiveSession::AirPlay2(_) => "AirPlay 2",
+            ActiveSession::Sendspin(_) => "Sendspin",
+            ActiveSession::MusicAssistant(_) => "Music Assistant (Sendspin)",
         }
     }
 
+    /// True if the session has died mid-stream (dropped receiver). UPnP
+    /// is HTTP-pull (the speaker reconnects on its own), so only the
+    /// AirPlay push paths report death here.
     pub fn is_dead(&self) -> bool {
         match self {
             ActiveSession::Upnp(_) => false,
             ActiveSession::AirPlay(s) => s.is_dead(),
             ActiveSession::AirPlay2(s) => s.is_dead(),
+            ActiveSession::Sendspin(s) => s.is_dead(),
+            ActiveSession::MusicAssistant(_) => false,
+        }
+    }
+
+    /// The fault that ended the session when a reconnect can't fix it
+    /// (e.g. the receiver rejected our authentication). Such a session is
+    /// ended without the drop watchdog's retry.
+    pub fn final_fault(&self) -> Option<String> {
+        match self {
+            ActiveSession::AirPlay2(s) => s.fault().filter(|f| !f.retryable).map(|f| f.to_string()),
+            ActiveSession::Upnp(_)
+            | ActiveSession::AirPlay(_)
+            | ActiveSession::Sendspin(_)
+            | ActiveSession::MusicAssistant(_) => None,
         }
     }
 
@@ -155,6 +208,7 @@ impl ActiveSession {
             ActiveSession::Upnp(_) => None,
             ActiveSession::AirPlay(s) => Some(s.resend_stats()),
             ActiveSession::AirPlay2(s) => Some(s.resend_stats()),
+            ActiveSession::Sendspin(_) | ActiveSession::MusicAssistant(_) => None,
         }
     }
 
@@ -167,6 +221,8 @@ impl ActiveSession {
             },
             ActiveSession::AirPlay(s) => s.set_mute(muted),
             ActiveSession::AirPlay2(s) => s.set_mute(muted),
+            ActiveSession::Sendspin(s) => s.set_mute(muted),
+            ActiveSession::MusicAssistant(_) => Ok(()),
         }
     }
 }
@@ -323,6 +379,8 @@ pub struct App {
     /// Cleared by the ceremony's RAII guard on every exit path.
     pin_ceremony: Mutex<Option<PinCeremonyState>>,
 
+    /// Sendspin players + the Music Assistant source (`sendspin_app`).
+    pub(crate) sendspin: crate::sendspin_app::SendspinAppState,
     /// Receiver records built for manually added AirPlay speakers at their
     /// last connect (the probe result), keyed by id — so the PIN ceremony
     /// and other lookups by id find them without re-probing.
@@ -467,6 +525,7 @@ impl App {
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
+            sendspin: Default::default(),
             manual_resolved: Mutex::new(std::collections::HashMap::new()),
             discovery_scope: Mutex::new(Resolved::All),
             adapters_cache: Mutex::new(Vec::new()),
@@ -760,7 +819,7 @@ impl App {
     pub fn set_airplay_password(&self, id: &str, pw: &str) {
         let mut uc = self.user_config.lock().unwrap();
         if pw.is_empty() {
-            uc.airplay_passwords.remove(id);
+            uc.remove_airplay_password(id);
         } else {
             uc.airplay_passwords.insert(id.to_string(), pw.to_string());
         }
@@ -835,6 +894,12 @@ impl App {
         if on {
             self.prune_stream_clients();
         }
+    }
+
+    /// Whether `peer` belongs to the active speaker (or its group). The
+    /// HTTP server never lets other clients crowd these out.
+    pub fn is_speaker_peer(&self, peer: IpAddr) -> bool {
+        self.stream_gate.is_granted(peer)
     }
 
     /// Privacy gate for `/stream.raw`, called per request (and once a
@@ -1020,6 +1085,7 @@ impl App {
                     .and_then(|d| d.find_by_id(id))
                     .map(|r| r.friendly_name)
             })
+            .or_else(|| self.sendspin_name_for(id))
     }
 
     /// The AirPlay receiver record for an id: discovered, or the last
@@ -1048,7 +1114,15 @@ impl App {
     ///
     /// [`speaker_view`]: App::speaker_view
     pub fn speaker_view_opts(&self, include_hidden: bool) -> SpeakerView {
-        let active_id = self.session.lock().unwrap().as_ref().map(|s| s.stable_id());
+        let (active_id, active_upnp) = {
+            let guard = self.session.lock().unwrap();
+            let id = guard.as_ref().map(|s| s.stable_id());
+            let upnp = match guard.as_ref() {
+                Some(ActiveSession::Upnp(s)) => Some(s.renderer.clone()),
+                _ => None,
+            };
+            (id, upnp)
+        };
         let mut speakers: Vec<SpeakerInfo> = Vec::new();
 
         // Track the IPs that have a non-AirPlay (UPnP) entry, so we can
@@ -1059,7 +1133,8 @@ impl App {
         if let Some(d) = self.discovery.as_ref() {
             for r in d.renderers() {
                 let id = r.stable_id();
-                let active = active_id.as_deref() == Some(id.as_str());
+                let active = active_id.as_deref() == Some(id.as_str())
+                    || active_upnp.as_ref().map(|a| a.same_device_as(&r)).unwrap_or(false);
                 upnp_ips.insert(r.ip.to_string());
                 // Sonos group coordinators present as one row for the
                 // whole group ("Living Room + Kitchen"); the grouped
@@ -1104,6 +1179,41 @@ impl App {
                 // click will use (Sonos advertises both UPnP and AirPlay)
                 // and why an unsupported one might fail.
                 let pw = if r.password_protected { ", password" } else { "" };
+                if let Some(pair) = &r.pair {
+                    let members: Vec<&str> = pair.members.iter().map(|m| m.friendly_name.as_str()).collect();
+                    let (name, note) = if pair.is_complete() {
+                        (
+                            format!("{} (AirPlay 2 stereo pair)", r.friendly_name),
+                            format!(
+                                "HomePod stereo pair: {}. Both HomePods play, each its own channel, and the \
+                                 volume slider moves both.",
+                                members.join(" + ")
+                            ),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "{} (stereo pair, {} of {} present)",
+                                r.friendly_name,
+                                pair.members.len(),
+                                pair.expected
+                            ),
+                            "Waiting for the other HomePod of this stereo pair to come online. The pair \
+                             can only be played with both HomePods present."
+                                .to_string(),
+                        )
+                    };
+                    speakers.push(SpeakerInfo {
+                        id,
+                        friendly_name: name,
+                        ip: r.ip.to_string(),
+                        active,
+                        note: Some(note),
+                        manual: false,
+                        hidden: false,
+                    });
+                    continue;
+                }
                 let name = match transport {
                     Some(Transport::RaopLegacy) if has_upnp_twin => {
                         format!("{} (AirPlay, higher delay{})", r.friendly_name, pw)
@@ -1138,6 +1248,7 @@ impl App {
                 });
             }
         }
+        speakers.extend(self.sendspin_speakers(active_id.as_deref()));
         for m in self.manual_speakers() {
             let id = m.id();
             let active = active_id.as_deref() == Some(id.as_str());
@@ -1244,6 +1355,29 @@ impl App {
     /// under the same `connecting` lock every select claims, so an
     /// automatic connect can never replace a speaker the user picked.
     fn select_speaker_async_opts(self: &Arc<Self>, id: &str, interactive: bool, only_if_idle: bool) {
+        self.select_speaker_async_full(id, interactive, only_if_idle, None);
+    }
+
+    /// [`select_speaker_async_opts`] carrying a Sendspin pairing input
+    /// (token or code) for a speaker that needs pairing.
+    ///
+    /// [`select_speaker_async_opts`]: App::select_speaker_async_opts
+    pub(crate) fn select_speaker_async_with(
+        self: &Arc<Self>,
+        id: &str,
+        interactive: bool,
+        sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
+    ) {
+        self.select_speaker_async_full(id, interactive, false, sendspin_pairing);
+    }
+
+    fn select_speaker_async_full(
+        self: &Arc<Self>,
+        id: &str,
+        interactive: bool,
+        only_if_idle: bool,
+        sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
+    ) {
         {
             let mut guard = self.connecting.lock().unwrap();
             if only_if_idle && guard.is_none() && self.session.lock().unwrap().is_some() {
@@ -1259,7 +1393,7 @@ impl App {
             }
             // Resolve a display name best-effort for the banner.
             let name = self.speaker_name(id).unwrap_or_else(|| id.to_string());
-            *guard = Some(name);
+            *guard = Some(if sendspin_pairing.is_some() { format!("{} (pairing)", name) } else { name });
         }
         let app = self.clone();
         let id = id.to_string();
@@ -1269,7 +1403,7 @@ impl App {
                 // A click is the user's choice; other background connects
                 // (reconnects, auto-connect) only bind while streaming is
                 // still enabled.
-                let result = app.select_speaker_opts(&id, interactive, interactive);
+                let result = app.select_speaker_inner(&id, interactive, interactive, sendspin_pairing);
                 *app.connecting.lock().unwrap() = None;
                 if let Err(e) = result {
                     let msg = format!("Couldn't connect to speaker: {}", e);
@@ -1289,8 +1423,10 @@ impl App {
     /// and reconnect once — so the UI never sits on a zombie "streaming"
     /// state. Mirrors OwnTone's policy: a single retry, ~5 s after
     /// detection (the spacing also respects the Sonos half-open hold).
-    /// Gated on the `auto_reconnect_on_drop` config (default on) and on
-    /// streaming being enabled (never fights a user who hit Disable).
+    /// The reconnect is gated on the `auto_reconnect_on_drop` config
+    /// (default on) and on streaming being enabled (never fights a user
+    /// who hit Disable); a session the speaker ended itself is always
+    /// cleared.
     pub fn spawn_reconnect_watchdog(self: &Arc<Self>) {
         let app = self.clone();
         std::thread::Builder::new()
@@ -1304,6 +1440,42 @@ impl App {
                             return;
                         }
                         std::thread::sleep(Duration::from_millis(100));
+                    }
+
+                    // Did the speaker hand itself to something else? Then
+                    // end our session quietly instead of fighting for it
+                    // (whatever the reconnect settings: it no longer plays).
+                    let ended = {
+                        let mut guard = app.session.lock().unwrap();
+                        let reason = guard.as_ref().and_then(|s| s.ended_by_speaker());
+                        reason.and_then(|r| guard.take().map(|s| (s, r)))
+                    };
+                    if let Some((s, reason)) = ended {
+                        let name = s.friendly_name();
+                        s.stop();
+                        app.record_error(match reason.as_str() {
+                            "another_server" => format!("{} switched to another source.", name),
+                            _ => format!("{} ended the stream ({}).", name, reason.replace('_', " ")),
+                        });
+                        continue;
+                    }
+
+                    // A session that failed for good (not retryable) is
+                    // ended here, whatever the reconnect setting.
+                    let final_fault = {
+                        let mut guard = app.session.lock().unwrap();
+                        match guard.as_ref().and_then(|s| s.is_dead().then(|| s.final_fault()).flatten()) {
+                            Some(fault) => guard.take().map(|s| (s, fault)),
+                            None => None,
+                        }
+                    };
+                    if let Some((s, fault)) = final_fault {
+                        let name = s.friendly_name();
+                        s.stop();
+                        app.prune_stream_clients();
+                        warn!("AirPlay session to {} ended: {}", name, fault);
+                        app.record_error(format!("Connection to {} ended: {}", name, fault));
+                        continue;
                     }
 
                     if !app.user_config.lock().unwrap().auto_reconnect_on_drop {
@@ -1326,7 +1498,7 @@ impl App {
                     };
 
                     warn!(
-                        "AirPlay session to {} dropped; auto-reconnecting in {} s",
+                        "Session to {} dropped; auto-reconnecting in {} s",
                         name,
                         RECONNECT_GRACE.as_secs()
                     );
@@ -1503,6 +1675,16 @@ impl App {
         interactive: bool,
         user_choice: bool,
     ) -> Result<(), String> {
+        self.select_speaker_inner(id, interactive, user_choice, None)
+    }
+
+    fn select_speaker_inner(
+        self: &Arc<Self>,
+        id: &str,
+        interactive: bool,
+        user_choice: bool,
+        sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
+    ) -> Result<(), String> {
         if user_choice {
             self.streaming_enabled.store(true, Ordering::Release);
         }
@@ -1525,12 +1707,21 @@ impl App {
         // refuses a fresh pairing/connection (it just times out → 10060).
         // For a *different* receiver we keep the old session until the new
         // one is up, so a failed switch doesn't drop a working stream.
+        // Compare devices, not id strings: a UPnP speaker's id switches
+        // between its UDN and its address as identity conflicts appear and
+        // clear, and stopping the "old" session after starting the new one
+        // would send Stop to the very speaker we just started.
+        let target = if id.starts_with("airplay:") {
+            None
+        } else {
+            self.discovery.as_ref().and_then(|d| d.find_by_id(id))
+        };
         let replacing_same = self
             .session
             .lock()
             .unwrap()
             .as_ref()
-            .map(|s| s.stable_id() == id)
+            .map(|s| s.is_device(id, target.as_ref()))
             .unwrap_or(false);
         if replacing_same {
             if let Some(old) = self.session.lock().unwrap().take() {
@@ -1544,7 +1735,11 @@ impl App {
         // start_upnp). Remember the id we actually bound so reconnect /
         // active-row highlighting track reality.
         let manual = self.find_manual_speaker(id);
-        let new_session = if let Some(m) = manual.as_ref().filter(|m| m.kind == ManualKind::Upnp) {
+        let new_session = if id == crate::sendspin_app::MA_OUTPUT_ID {
+            self.start_ma_output()?
+        } else if crate::sendspin_app::is_sendspin_id(id) {
+            self.start_sendspin_player(id, sendspin_pairing, interactive)?
+        } else if let Some(m) = manual.as_ref().filter(|m| m.kind == ManualKind::Upnp) {
             self.start_upnp_manual(m)?
         } else if id.starts_with("airplay:") {
             match self.start_airplay(id, manual.as_ref()) {
@@ -1598,6 +1793,24 @@ impl App {
             new_session.stop();
             self.prune_stream_clients();
             return Ok(());
+        }
+        // Checked under the session lock: turning Sendspin off saves the
+        // setting first and then looks for a Sendspin session here, so
+        // either it sees this one or this sees the setting.
+        let still_allowed = match &new_session {
+            ActiveSession::Sendspin(_) => self.is_sendspin_enabled(),
+            // The input stops (and unselects this) when turned off.
+            ActiveSession::MusicAssistant(_) => self.is_sendspin_source_enabled(),
+            _ => true,
+        };
+        if !still_allowed {
+            drop(guard);
+            let msg = match &new_session {
+                ActiveSession::MusicAssistant(_) => "the Music Assistant input was turned off",
+                _ => "Sendspin was turned off in settings",
+            };
+            new_session.stop();
+            return Err(msg.into());
         }
         *guard = Some(new_session);
         // CRITICAL: drop the session-mutex guard before calling any
@@ -1673,6 +1886,14 @@ impl App {
             .discovery
             .as_ref()
             .ok_or_else(|| "UPnP discovery disabled".to_string())?;
+        if let Some(addrs) = discovery.identity_conflict(id) {
+            let addrs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+            return Err(format!(
+                "Several different devices on the network ({}) claim to be this speaker, so none was \
+                 picked automatically. Pick the entry with the right address from the speaker list.",
+                addrs.join(", ")
+            ));
+        }
         let Some(new_r) = discovery.find_by_id(id) else {
             return Err(format!("no UPnP speaker with id {:?}", id));
         };
@@ -1767,6 +1988,15 @@ impl App {
             renderer.port,
             renderer.encryption_types,
         );
+
+        if let Some(pair) = renderer.pair.as_ref().filter(|p| !p.is_complete()) {
+            return Err(SelectFailure::Msg(format!(
+                "{} is a stereo pair; waiting for the other HomePod to come online ({} of {} present).",
+                renderer.friendly_name,
+                pair.members.len(),
+                pair.expected
+            )));
+        }
 
         // The local address to bind UDP sockets to and advertise in SDP:
         // the one on the receiver's network (or `--advertise-ip`). It must
@@ -1864,6 +2094,13 @@ impl App {
         renderer: &AirPlayRenderer,
         discovery: Option<&AirPlayDiscoveryState>,
     ) -> Vec<(Transport, AirPlayRenderer)> {
+        // A stereo pair plays over AirPlay 2 on every member, or not at all.
+        if renderer.pair.is_some() {
+            return renderer
+                .transport()
+                .map(|t| vec![(t, renderer.clone())])
+                .unwrap_or_default();
+        }
         // An AirPlay 2-capable view of this device: the record itself, or a
         // sibling _airplay._tcp entry at the same IP (covers a _raop vs
         // _airplay `deviceid` mismatch that split it into two entries).
@@ -1949,12 +2186,14 @@ impl App {
             Transport::AirPlay2 => {
                 let samples_rx = self.hub.subscribe();
                 let stable_id = renderer.stable_id();
-                let (prefer_realtime, pairing_creds, latency_ms) = {
+                let (prefer_realtime, pairing_creds, latency_ms, homepod_realtime, homepod_latency_ms) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.prefer_realtime_airplay,
                         uc.airplay_pairings.get(&stable_id).cloned(),
                         uc.airplay_latency_ms_for(&stable_id),
+                        !uc.airplay_homepod_buffered,
+                        uc.homepod_latency_ms_for(&stable_id),
                     )
                 };
                 match AirPlay2Session::start(AirPlay2SessionConfig {
@@ -1965,6 +2204,8 @@ impl App {
                     prefer_realtime,
                     latency_ms,
                     pairing_creds,
+                    homepod_realtime,
+                    homepod_latency_ms,
                 }) {
                     Ok(session) => Ok(ActiveSession::AirPlay2(session)),
                     // 470 with no stored keys: typed, so start_airplay
@@ -2187,7 +2428,7 @@ impl App {
     /// receiver rejected them — it forgot the pairing).
     fn remove_airplay_pairing(&self, id: &str) {
         let mut uc = self.user_config.lock().unwrap();
-        if uc.airplay_pairings.remove(id).is_some() {
+        if uc.remove_airplay_pairing(id) {
             uc.save();
         }
     }
@@ -2564,6 +2805,12 @@ impl App {
                     // Same recovery as AirPlay 1: tear down + reconnect.
                     Kind::AirPlay(s.renderer.stable_id())
                 }
+                Some(ActiveSession::Sendspin(s)) => {
+                    // A fresh session restarts the stream timeline.
+                    Kind::AirPlay(s.renderer.stable_id())
+                }
+                // Music Assistant buffers on its side; nothing to resync here.
+                Some(ActiveSession::MusicAssistant(_)) => return Ok(()),
                 None => return Err("no active speaker".to_string()),
             }
         };

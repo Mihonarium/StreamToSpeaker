@@ -21,12 +21,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use log::{debug, info};
 use plist::Value;
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::airplay::ap2_crypto::{ChannelCipher, SessionKeys, TAG_LEN};
+use crate::airplay::ap2_crypto::{ChannelCipher, HapReader, SessionKeys};
 use crate::airplay::hap_pairing::{PairSetupPin, PairVerify, PairingCredentials, X_APPLE_HKP_PERSISTENT};
 use crate::airplay::pairing::{TransientPairing, X_APPLE_HKP_VALUE};
 
@@ -37,6 +37,25 @@ const USER_AGENT: &str = "AirPlay/665.13.1";
 /// with access control. OwnTone calls this `RTSP_CONNECTION_AUTH_REQUIRED`
 /// and switches `pair_type` to `PAIR_CLIENT_HOMEKIT_NORMAL`.
 const RTSP_CONNECTION_AUTH_REQUIRED: u16 = 470;
+
+/// How long TEARDOWN waits for its reply.
+const TEARDOWN_WAIT: Duration = Duration::from_millis(300);
+/// Response header block limit in strict mode; anything larger is a
+/// protocol error.
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+/// Header block limit otherwise (the long-standing bound).
+const LENIENT_MAX_HEADER_BYTES: usize = 1 << 20;
+/// Absolute bound on one reply when the timeout applies per read: a peer
+/// trickling bytes can't keep a request waiting forever.
+const MAX_REPLY_WAIT: Duration = Duration::from_secs(30);
+/// Sent-but-unanswered requests tracked for reply attribution.
+const PENDING_CAP: usize = 64;
+/// Response body limit (a `GET /info` plist is a few KiB).
+const MAX_BODY_BYTES: usize = 1 << 20;
+/// Late (stale-CSeq) response statuses kept for a caller that stopped
+/// waiting, so a `/feedback` reply consumed by a later request still
+/// counts.
+const LATE_STATUS_CAP: usize = 16;
 
 /// Outcome of an attempted transient pair-setup.
 pub enum TransientOutcome {
@@ -70,6 +89,70 @@ pub enum PairVerifyError {
     Rejected(#[source] anyhow::Error),
 }
 
+/// Payload codec of a realtime stream: raw big-endian PCM (`ct` 1) or
+/// ALAC (`ct` 2), both 44.1 kHz / 16-bit / stereo, 352 frames per packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealtimeCodec {
+    Pcm,
+    Alac,
+}
+
+impl RealtimeCodec {
+    /// Pick from the receiver's advertised `cn` list (0 = PCM, 1 = ALAC):
+    /// PCM when the list is empty or offers it, ALAC only when PCM is
+    /// missing, nothing when it offers neither.
+    pub fn from_cn(cn: &[u8]) -> Option<Self> {
+        if cn.is_empty() || cn.contains(&0) {
+            Some(RealtimeCodec::Pcm)
+        } else if cn.contains(&1) {
+            Some(RealtimeCodec::Alac)
+        } else {
+            None
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RealtimeCodec::Pcm => "PCM",
+            RealtimeCodec::Alac => "ALAC",
+        }
+    }
+
+    fn ct(self) -> u64 {
+        match self {
+            RealtimeCodec::Pcm => 1,
+            RealtimeCodec::Alac => 2,
+        }
+    }
+
+    /// `audioFormat` bit for 44.1 kHz / 16-bit / stereo.
+    fn audio_format(self) -> u64 {
+        match self {
+            RealtimeCodec::Pcm => 0x800,
+            RealtimeCodec::Alac => 0x40000,
+        }
+    }
+}
+
+/// Outcome of a volume read-back via `GET /info`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InfoVolume {
+    Db(f64),
+    /// Answered, but without a usable `initialVolume` (never invent one).
+    Missing,
+    /// The receiver refused `GET /info` with this status.
+    Refused(u16),
+}
+
+/// State of a pending `GET /info` volume read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InfoPoll {
+    Pending,
+    Done(InfoVolume),
+    /// The reply was consumed by a later request (or never matched).
+    Lost,
+}
+
 /// Ports the receiver assigned for the audio stream (from the second
 /// SETUP response).
 #[derive(Debug, Clone, Copy)]
@@ -100,11 +183,37 @@ pub struct Ap2Rtsp {
     client_instance: String,
     active_remote: String,
     session_uuid: String,
-    /// Outbound/inbound ciphers — None until pairing completes.
+    /// Default per-request response timeout.
+    timeout: Duration,
+    /// Outbound cipher / inbound record decoder — None until pairing
+    /// completes.
     writer: Option<ChannelCipher>,
-    reader: Option<ChannelCipher>,
+    reader: Option<HapReader>,
+    /// Event-channel `(writer, reader)` ciphers from the same pairing,
+    /// handed to the event-channel thread once.
+    event_ciphers: Option<(ChannelCipher, ChannelCipher)>,
     /// Decrypted (or plaintext) response bytes not yet consumed.
     rx_buf: Vec<u8>,
+    /// `(CSeq, status)` of responses that arrived after their request
+    /// stopped waiting.
+    late: VecDeque<(u32, u16)>,
+    /// Set when the connection can no longer be trusted: a write failed
+    /// partway (an encrypted record can't be retried with a fresh nonce),
+    /// a record failed authentication, the peer closed, or a response
+    /// carried a CSeq we never sent (strict mode). Every later request
+    /// fails fast.
+    poisoned: bool,
+    /// CSeqs sent and not yet answered, oldest first. RTSP answers in
+    /// order, so a reply without a CSeq belongs to the oldest of these —
+    /// never to a newer request after an earlier one timed out.
+    pending: VecDeque<u32>,
+    /// Strict mode (HomePod sessions): duplicate or unparseable framing
+    /// headers and chunked replies are protocol errors, an unknown CSeq
+    /// poisons the connection, and TEARDOWN waits only briefly. Off,
+    /// framing is read leniently as it always was.
+    strict: bool,
+    /// Absolute bound on waiting for one reply ([`MAX_REPLY_WAIT`]).
+    reply_wait_cap: Duration,
     /// True once a TEARDOWN has been sent — makes `teardown` idempotent
     /// and lets Drop skip the duplicate.
     torn_down: bool,
@@ -146,9 +255,16 @@ impl Ap2Rtsp {
             client_instance,
             active_remote,
             session_uuid,
+            timeout,
             writer: None,
             reader: None,
+            event_ciphers: None,
             rx_buf: Vec::with_capacity(4096),
+            late: VecDeque::new(),
+            poisoned: false,
+            pending: VecDeque::new(),
+            strict: false,
+            reply_wait_cap: MAX_REPLY_WAIT,
             torn_down: false,
         })
     }
@@ -188,6 +304,56 @@ impl Ap2Rtsp {
             }
         }
         Ok(())
+    }
+
+    /// Send `GET /info` on the paired (encrypted) connection without
+    /// waiting, to read the receiver's `initialVolume` back; collect the
+    /// answer with [`Ap2Rtsp::poll_info_volume`].
+    pub fn send_info(&mut self) -> Result<u32> {
+        self.send_request("GET", "/info", &[], None, &[])
+    }
+
+    /// Wait up to `wait` for the reply to the `GET /info` sent as `cseq`.
+    /// `Err` only for transport failures.
+    pub fn poll_info_volume(&mut self, cseq: u32, wait: Duration) -> Result<InfoPoll> {
+        // Another request already read past it: the body is gone.
+        if self.take_late(cseq).is_some() || self.cseq != cseq {
+            return Ok(InfoPoll::Lost);
+        }
+        let Some(resp) = self.await_response(cseq, Instant::now() + wait, false)? else {
+            return Ok(InfoPoll::Pending);
+        };
+        if resp.status != 200 {
+            return Ok(InfoPoll::Done(InfoVolume::Refused(resp.status)));
+        }
+        Ok(InfoPoll::Done(match parse_initial_volume(&resp.body) {
+            Some(db) => InfoVolume::Db(db),
+            None => InfoVolume::Missing,
+        }))
+    }
+
+    /// Mark the connection unusable — strict mode only; otherwise the
+    /// connection is used as long as the socket allows, as it always was.
+    fn poison(&mut self) {
+        if self.strict {
+            self.poisoned = true;
+        }
+    }
+
+    /// Turn on strict mode (see the `strict` field).
+    pub fn set_strict(&mut self, strict: bool) {
+        self.strict = strict;
+    }
+
+    /// Take the event-channel ciphers derived during pairing (once).
+    pub fn take_event_ciphers(&mut self) -> Option<(ChannelCipher, ChannelCipher)> {
+        self.event_ciphers.take()
+    }
+
+    fn install_keys(&mut self, keys: &SessionKeys) {
+        self.writer = Some(keys.control_writer());
+        self.reader = Some(HapReader::new(keys.control_reader()));
+        self.event_ciphers = Some(keys.event_ciphers());
     }
 
     /// FLUSHBUFFERED — flush the buffered stream up to (seq, ts); sent
@@ -236,8 +402,7 @@ impl Ap2Rtsp {
         let keys: SessionKeys = pairing.handle_m4(&r2.body).context("pair-setup M4")?;
         let audio_key = keys.audio_key();
         // From here on, everything is encrypted.
-        self.writer = Some(keys.control_writer());
-        self.reader = Some(keys.control_reader());
+        self.install_keys(&keys);
         debug!("AirPlay 2: transient pairing complete, channel encrypted");
         Ok(TransientOutcome::Paired(audio_key))
     }
@@ -349,8 +514,7 @@ impl Ap2Rtsp {
             shared.zeroize();
         }
         let audio_key = keys.audio_key();
-        self.writer = Some(keys.control_writer());
-        self.reader = Some(keys.control_reader());
+        self.install_keys(&keys);
         debug!("AirPlay 2: pair-verify complete, channel encrypted");
         Ok(audio_key)
     }
@@ -411,6 +575,80 @@ impl Ap2Rtsp {
             bail!("SETUP(timing/PTP) → {} {}", resp.status, resp.status_text);
         }
         Ok(parse_timing_setup(&resp.body))
+    }
+
+    /// First SETUP for the HomePod realtime profile: the PTP session dict
+    /// plus the multi-select keys iOS sends (`isMultiSelectAirPlay`,
+    /// `groupContainsGroupLeader`, `senderSupportsRelay`) and our name /
+    /// `macAddress`. Used for single HomePods and each stereo-pair member.
+    pub fn setup_timing_ptp_homepod(&mut self, clock_id: u64, clock_uuid: &str, sender_name: &str) -> Result<TimingSetup> {
+        let dict = homepod_session_dict(
+            &self.device_id_mac,
+            &self.session_uuid,
+            sender_name,
+            clock_id,
+            clock_uuid,
+            self.local_ip,
+        );
+        let body = to_binary_plist(&Value::Dictionary(dict))?;
+        let uri = self.session_uri();
+        let resp = self.request("SETUP", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
+        if resp.status != 200 {
+            bail!("SETUP(session/PTP) → {} {}{}", resp.status, resp.status_text, describe_error_body(&resp.body));
+        }
+        Ok(parse_timing_setup(&resp.body))
+    }
+
+    /// Second SETUP for the HomePod realtime profile: type 96 with the
+    /// latency window **pinned** (`latencyMin` = `latencyMax` = the
+    /// requested latency in samples), so the receiver plays at exactly
+    /// that delay. `ct`/`audio_format` pick PCM or ALAC;
+    /// `streamConnectionID` is the stream's SSRC. Returns the ports and
+    /// the receiver's own `latencyMin`, if it reported a plausible one.
+    pub fn setup_stream_pinned(
+        &mut self,
+        audio_key: &[u8; 32],
+        control_port: u16,
+        codec: RealtimeCodec,
+        latency_samples: u32,
+        ssrc: u32,
+    ) -> Result<(StreamPorts, Option<u32>)> {
+        let stream = pinned_stream_dict(audio_key, control_port, codec, latency_samples, ssrc);
+        let mut dict = plist::Dictionary::new();
+        dict.insert("streams".into(), Value::Array(vec![Value::Dictionary(stream)]));
+        let body = to_binary_plist(&Value::Dictionary(dict))?;
+        let uri = self.session_uri();
+        let resp = self.request("SETUP", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
+        if resp.status != 200 {
+            bail!(
+                "SETUP(stream, realtime {}) → {} {}{}",
+                codec.label(),
+                resp.status,
+                resp.status_text,
+                describe_error_body(&resp.body)
+            );
+        }
+        let ports = parse_stream_ports(&resp.body)?;
+        Ok((ports, parse_stream_latency_min(&resp.body)))
+    }
+
+    /// RECORD with `Range: npt=0-` and `RTP-Info` naming the first packet,
+    /// immediately followed by a FLUSH with the same headers.
+    pub fn record_and_flush_at(&mut self, seq: u16, rtptime: u32) -> Result<()> {
+        let uri = self.session_uri();
+        let headers = vec![
+            ("Range".to_string(), "npt=0-".to_string()),
+            ("RTP-Info".to_string(), format!("seq={};rtptime={}", seq, rtptime)),
+        ];
+        let resp = self.request("RECORD", &uri, &headers, None, &[])?;
+        if resp.status != 200 {
+            bail!("RECORD → {} {}", resp.status, resp.status_text);
+        }
+        let resp = self.request("FLUSH", &uri, &headers, None, &[])?;
+        if resp.status != 200 {
+            bail!("FLUSH → {} {}", resp.status, resp.status_text);
+        }
+        Ok(())
     }
 
     /// SETPEERS — hand the receiver the full PTP peer address list (ours
@@ -543,14 +781,36 @@ impl Ap2Rtsp {
         Ok(())
     }
 
-    /// POST /feedback — the ~2 s keepalive iOS senders emit. Some receivers
-    /// drop or never start sessions without it.
-    pub fn feedback(&mut self) -> Result<()> {
-        let resp = self.request("POST", "/feedback", &[], None, &[])?;
-        if resp.status != 200 {
-            bail!("/feedback → {} {}", resp.status, resp.status_text);
+    /// Send `POST /feedback` — the ~2 s keepalive iOS senders emit — without
+    /// waiting for the reply. Returns its CSeq for [`Ap2Rtsp::poll_status`],
+    /// so a slow receiver never blocks the connection (volume traffic
+    /// shares it) and the request is never re-sent while one is
+    /// outstanding.
+    pub fn send_feedback(&mut self) -> Result<u32> {
+        self.send_request("POST", "/feedback", &[], None, &[])
+    }
+
+    /// `POST /feedback`, waiting for the reply like any other request.
+    pub fn feedback_status(&mut self) -> Result<u16> {
+        Ok(self.request("POST", "/feedback", &[], None, &[])?.status)
+    }
+
+    /// Wait up to `wait` for the status of the request sent with `cseq`.
+    /// `Ok(None)` = not answered yet. A reply that a later request already
+    /// read past (it arrived late) is still reported here.
+    pub fn poll_status(&mut self, cseq: u32, wait: Duration) -> Result<Option<u16>> {
+        if let Some(st) = self.take_late(cseq) {
+            return Ok(Some(st));
         }
-        Ok(())
+        let newest = self.cseq;
+        let got = self.await_response(newest, Instant::now() + wait, false)?;
+        if newest == cseq {
+            return Ok(got.map(|r| r.status));
+        }
+        if let Some(r) = got {
+            self.remember_late(newest, r.status);
+        }
+        Ok(self.take_late(cseq))
     }
 
     /// RECORD — flip the receiver to playback. Empty body (matches iOS).
@@ -574,14 +834,22 @@ impl Ap2Rtsp {
         Ok(())
     }
 
-    /// TEARDOWN — best-effort close. Idempotent.
+    /// TEARDOWN — best-effort close. Idempotent. The request always goes
+    /// out (receivers otherwise hold a half-open session); the reply is
+    /// waited for only briefly so stopping never stalls on a dead peer.
     pub fn teardown(&mut self) {
         if self.torn_down {
             return;
         }
         self.torn_down = true;
         let uri = self.session_uri();
-        let _ = self.request("TEARDOWN", &uri, &[], None, &[]);
+        let wait = if self.strict { TEARDOWN_WAIT } else { self.timeout };
+        // Sent even on a connection marked unusable: a receiver left with a
+        // half-open session refuses new connections for a while.
+        self.poisoned = false;
+        if let Ok(cseq) = self.send_request("TEARDOWN", &uri, &[], None, &[]) {
+            let _ = self.await_response(cseq, Instant::now() + wait, !self.strict);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -596,6 +864,28 @@ impl Ap2Rtsp {
         content_type: Option<&str>,
         body: &[u8],
     ) -> Result<Resp> {
+        let cseq = self.send_request(method, uri, extra, content_type, body)?;
+        // Strict: one deadline for the whole reply. Otherwise the timeout
+        // applies per read, as it always has.
+        match self.await_response(cseq, Instant::now() + self.timeout, !self.strict)? {
+            Some(resp) => Ok(resp),
+            // The connection stays usable: if the reply turns up later, the
+            // next request skips it by CSeq instead of taking it as its own.
+            None => bail!("AP2 RTSP: {} {} timed out after {:?}", method, uri, self.timeout),
+        }
+    }
+
+    fn send_request(
+        &mut self,
+        method: &str,
+        uri: &str,
+        extra: &[(String, String)],
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<u32> {
+        if self.poisoned {
+            bail!("AP2 RTSP: connection unusable after an earlier failure");
+        }
         self.cseq += 1;
         let mut req = String::new();
         req.push_str(&format!("{} {} RTSP/1.0\r\n", method, uri));
@@ -618,82 +908,137 @@ impl Ap2Rtsp {
 
         debug!("AP2 RTSP > {} {} (CSeq={}, body={}B, enc={})", method, uri, self.cseq, body.len(), self.writer.is_some());
 
-        match self.writer.as_mut() {
+        let res = match self.writer.as_mut() {
             Some(w) => {
                 let framed = w.encrypt(&raw);
-                self.stream.write_all(&framed)?;
+                self.stream.write_all(&framed)
             }
-            None => self.stream.write_all(&raw)?,
+            None => self.stream.write_all(&raw),
         }
-        self.stream.flush()?;
-        self.read_response()
+        .and_then(|_| self.stream.flush());
+        if let Err(e) = res {
+            self.poison();
+            return Err(e.into());
+        }
+        if self.pending.len() >= PENDING_CAP {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(self.cseq);
+        Ok(self.cseq)
     }
 
-    /// Pull more bytes into `rx_buf`. On the encrypted channel this reads
-    /// exactly one HAP block (2-byte length + ciphertext + tag) and
-    /// decrypts it; on the plaintext channel it reads whatever's available.
-    fn fill(&mut self) -> Result<()> {
-        if self.reader.is_some() {
-            let mut len_buf = [0u8; 2];
-            self.stream.read_exact(&mut len_buf)?;
-            let block_len = u16::from_le_bytes(len_buf);
-            let mut block = vec![0u8; block_len as usize + TAG_LEN];
-            self.stream.read_exact(&mut block)?;
-            let plain = self
-                .reader
-                .as_mut()
-                .unwrap()
-                .decrypt_block(block_len, &block)?;
-            self.rx_buf.extend_from_slice(&plain);
-        } else {
-            let mut tmp = [0u8; 2048];
-            let n = self.stream.read(&mut tmp)?;
-            if n == 0 {
+    /// Read until the response to `cseq` is complete or `deadline` passes
+    /// (`Ok(None)`). Responses to earlier requests are skipped and their
+    /// status remembered; a response to a request we never sent poisons
+    /// the connection.
+    fn await_response(&mut self, cseq: u32, mut deadline: Instant, per_read: bool) -> Result<Option<Resp>> {
+        let hard_deadline = Instant::now() + self.reply_wait_cap;
+        loop {
+            let parsed = parse_response(&mut self.rx_buf, self.strict);
+            match parsed {
+                Err(e) => {
+                    self.poison();
+                    return Err(e);
+                }
+                Ok(Some(resp)) if !self.strict => {
+                    // Lenient: CSeq values are not trusted (receivers may
+                    // echo a constant). A reply is only skipped when it
+                    // names — or, lacking a CSeq, falls to — an earlier
+                    // request that timed out and is still unanswered.
+                    let earlier = match resp.cseq {
+                        Some(c) => Some(c).filter(|c| *c != cseq && self.pending.contains(c)),
+                        None => self.pending.front().copied().filter(|p| *p != cseq),
+                    };
+                    if let Some(c) = earlier {
+                        self.pending.retain(|p| *p != c);
+                        debug!("AP2 RTSP: skipping late response to CSeq {} ({})", c, resp.status);
+                        self.remember_late(c, resp.status);
+                        continue;
+                    }
+                    self.pending.retain(|p| *p != cseq);
+                    debug!("AP2 RTSP < {} {} ({}B body)", resp.status, resp.status_text, resp.body.len());
+                    return Ok(Some(resp));
+                }
+                Ok(Some(resp)) => {
+                    // No CSeq: replies come in order, so it answers the
+                    // oldest request still waiting.
+                    let c = resp.cseq.or_else(|| self.pending.front().copied()).unwrap_or(cseq);
+                    if let Some(i) = self.pending.iter().position(|p| *p == c) {
+                        self.pending.remove(i);
+                    }
+                    if c < cseq {
+                        debug!("AP2 RTSP: skipping late response CSeq {} ({})", c, resp.status);
+                        self.remember_late(c, resp.status);
+                        continue;
+                    }
+                    if c > cseq && self.strict {
+                        self.poison();
+                        bail!("AP2 RTSP protocol error: response CSeq {} while awaiting {}", c, cseq);
+                    }
+                    self.pending.retain(|p| *p != cseq);
+                    debug!("AP2 RTSP < {} {} ({}B body)", resp.status, resp.status_text, resp.body.len());
+                    return Ok(Some(resp));
+                }
+                Ok(None) => {}
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            if self.fill(deadline - now)? && per_read {
+                deadline = (Instant::now() + self.timeout).min(hard_deadline);
+            }
+        }
+    }
+
+    /// Read whatever arrives within `wait` into `rx_buf` (decrypting
+    /// complete records on the encrypted channel). A timeout is not an
+    /// error; partial records stay buffered in the decoder. Returns whether
+    /// any bytes arrived.
+    fn fill(&mut self, wait: Duration) -> Result<bool> {
+        self.stream
+            .set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
+        let mut tmp = [0u8; 4096];
+        let n = match self.stream.read(&mut tmp) {
+            Ok(0) => {
+                self.poison();
                 bail!("AP2 RTSP: connection closed");
             }
-            self.rx_buf.extend_from_slice(&tmp[..n]);
+            Ok(n) => n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Ok(false);
+            }
+            Err(e) => {
+                self.poison();
+                return Err(e.into());
+            }
+        };
+        match self.reader.as_mut() {
+            Some(r) => match r.push(&tmp[..n]) {
+                Ok(plain) => self.rx_buf.extend_from_slice(&plain),
+                Err(e) => {
+                    self.poison();
+                    bail!("AP2 RTSP: {}", e);
+                }
+            },
+            None => self.rx_buf.extend_from_slice(&tmp[..n]),
         }
-        Ok(())
+        Ok(true)
     }
 
-    fn read_response(&mut self) -> Result<Resp> {
-        // Read until we have the full header block.
-        let header_end = loop {
-            if let Some(pos) = find_subsequence(&self.rx_buf, b"\r\n\r\n") {
-                break pos;
-            }
-            if self.rx_buf.len() > 1 << 20 {
-                bail!("AP2 RTSP response headers too large");
-            }
-            self.fill()?;
-        };
-
-        let head = String::from_utf8_lossy(&self.rx_buf[..header_end]).to_string();
-        let mut lines = head.lines();
-        let status_line = lines.next().ok_or_else(|| anyhow!("empty RTSP status line"))?;
-        let (status, status_text) = parse_status_line(status_line)?;
-        let mut headers: HashMap<String, String> = HashMap::new();
-        for line in lines {
-            if let Some((k, v)) = line.split_once(':') {
-                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-            }
+    fn remember_late(&mut self, cseq: u32, status: u16) {
+        if self.late.len() >= LATE_STATUS_CAP {
+            self.late.pop_front();
         }
-        let content_length = headers
-            .get("content-length")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
+        self.late.push_back((cseq, status));
+    }
 
-        let body_start = header_end + 4;
-        while self.rx_buf.len() < body_start + content_length {
-            self.fill()?;
-        }
-        let body = self.rx_buf[body_start..body_start + content_length].to_vec();
-        // Drop the consumed bytes (responses shouldn't be pipelined, but
-        // keep any surplus just in case).
-        self.rx_buf.drain(..body_start + content_length);
-
-        debug!("AP2 RTSP < {} {} ({}B body)", status, status_text, body.len());
-        Ok(Resp { status, status_text, body })
+    fn take_late(&mut self, cseq: u32) -> Option<u16> {
+        let i = self.late.iter().position(|(c, _)| *c == cseq)?;
+        self.late.remove(i).map(|(_, st)| st)
     }
 }
 
@@ -714,7 +1059,77 @@ impl Drop for Ap2Rtsp {
 struct Resp {
     status: u16,
     status_text: String,
+    cseq: Option<u32>,
     body: Vec<u8>,
+}
+
+/// Take one complete RTSP/HTTP response off the front of `buf`, or
+/// `Ok(None)` if it isn't complete yet. A Content-Length over 1 MiB is
+/// always rejected, so a hostile peer can't make the buffer grow without
+/// bound. In `strict` mode so are headers over 16 KiB, chunked transfer,
+/// duplicate or unparseable framing headers (`CSeq`, `Content-Length`);
+/// otherwise those are read leniently (last value wins, unparseable =
+/// absent).
+fn parse_response(buf: &mut Vec<u8>, strict: bool) -> Result<Option<Resp>> {
+    let header_limit = if strict { MAX_HEADER_BYTES } else { LENIENT_MAX_HEADER_BYTES };
+    let Some(header_end) = find_subsequence(buf, b"\r\n\r\n") else {
+        if buf.len() > header_limit {
+            bail!("AP2 RTSP response headers too large");
+        }
+        return Ok(None);
+    };
+    if header_end > header_limit {
+        bail!("AP2 RTSP response headers too large");
+    }
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let mut lines = head.lines();
+    let status_line = lines.next().ok_or_else(|| anyhow!("empty RTSP status line"))?;
+    let (status, status_text) = parse_status_line(status_line)?;
+    let mut content_length: Option<usize> = None;
+    let mut cseq: Option<u32> = None;
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
+        match k.as_str() {
+            "content-length" if strict => {
+                if content_length.is_some() {
+                    bail!("AP2 RTSP response has duplicate Content-Length");
+                }
+                content_length = Some(v.parse().context("parsing Content-Length")?);
+            }
+            "content-length" => content_length = v.parse().ok(),
+            "cseq" if strict => {
+                if cseq.is_some() {
+                    bail!("AP2 RTSP response has duplicate CSeq");
+                }
+                cseq = Some(v.parse().context("parsing CSeq")?);
+            }
+            "cseq" => cseq = v.parse().ok(),
+            "transfer-encoding" if strict && v.eq_ignore_ascii_case("chunked") => {
+                bail!("AP2 RTSP chunked responses are not supported");
+            }
+            _ => {}
+        }
+    }
+    let body_start = header_end + 4;
+    let body_end = body_end(body_start, content_length.unwrap_or(0))?;
+    if buf.len() < body_end {
+        return Ok(None);
+    }
+    let body = buf[body_start..body_end].to_vec();
+    buf.drain(..body_end);
+    Ok(Some(Resp { status, status_text, cseq, body }))
+}
+
+/// `initialVolume` (dB) from a `GET /info` plist — a real or an integer.
+/// Values that aren't finite or lie above 0 dB are rejected as `None`.
+fn parse_initial_volume(body: &[u8]) -> Option<f64> {
+    let v: Value = plist::from_bytes(body).ok()?;
+    let raw = v.as_dictionary()?.get("initialVolume")?;
+    let db = raw
+        .as_real()
+        .or_else(|| raw.as_signed_integer().map(|i| i as f64))?;
+    (db.is_finite() && db <= 0.0).then_some(db)
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +1163,70 @@ fn parse_timing_setup(body: &[u8]) -> TimingSetup {
         event_port: port("eventPort"),
         timing_port: port("timingPort"),
     }
+}
+
+/// The HomePod-profile SETUP(session) body.
+fn homepod_session_dict(
+    device_id: &str,
+    session_uuid: &str,
+    sender_name: &str,
+    clock_id: u64,
+    clock_uuid: &str,
+    local_ip: IpAddr,
+) -> plist::Dictionary {
+    let mut peer = plist::Dictionary::new();
+    peer.insert("Addresses".into(), Value::Array(vec![Value::String(local_ip.to_string())]));
+    peer.insert("ClockID".into(), Value::Integer((clock_id as i64).into()));
+    peer.insert("DeviceType".into(), Value::Integer(0u64.into()));
+    peer.insert("ID".into(), clock_uuid.to_string().into());
+    peer.insert("SupportsClockPortMatchingOverride".into(), Value::Boolean(false));
+
+    let mut dict = plist::Dictionary::new();
+    dict.insert("deviceID".into(), device_id.to_string().into());
+    dict.insert("macAddress".into(), device_id.to_string().into());
+    dict.insert("name".into(), sender_name.to_string().into());
+    dict.insert("sessionUUID".into(), session_uuid.to_string().into());
+    dict.insert("timingProtocol".into(), "PTP".into());
+    dict.insert("isMultiSelectAirPlay".into(), Value::Boolean(true));
+    dict.insert("groupContainsGroupLeader".into(), Value::Boolean(false));
+    dict.insert("senderSupportsRelay".into(), Value::Boolean(false));
+    dict.insert("timingPeerInfo".into(), Value::Dictionary(peer.clone()));
+    dict.insert("timingPeerList".into(), Value::Array(vec![Value::Dictionary(peer)]));
+    dict
+}
+
+/// The HomePod-profile realtime stream dict (latency window pinned).
+fn pinned_stream_dict(
+    audio_key: &[u8; 32],
+    control_port: u16,
+    codec: RealtimeCodec,
+    latency_samples: u32,
+    ssrc: u32,
+) -> plist::Dictionary {
+    let mut stream = plist::Dictionary::new();
+    stream.insert("type".into(), Value::Integer(0x60u64.into()));
+    stream.insert("ct".into(), Value::Integer(codec.ct().into()));
+    stream.insert("audioFormat".into(), Value::Integer(codec.audio_format().into()));
+    stream.insert("spf".into(), Value::Integer(352u64.into()));
+    stream.insert("sr".into(), Value::Integer(44100u64.into()));
+    stream.insert("audioMode".into(), "default".into());
+    stream.insert("isMedia".into(), Value::Boolean(true));
+    stream.insert("supportsDynamicStreamID".into(), Value::Boolean(false));
+    stream.insert("streamConnectionID".into(), Value::Integer((ssrc as u64).into()));
+    stream.insert("controlPort".into(), Value::Integer((control_port as u64).into()));
+    stream.insert("shk".into(), Value::Data(audio_key.to_vec()));
+    stream.insert("latencyMin".into(), Value::Integer((latency_samples as u64).into()));
+    stream.insert("latencyMax".into(), Value::Integer((latency_samples as u64).into()));
+    stream
+}
+
+/// `streams[0].latencyMin` from a SETUP(stream) response, when it is a
+/// plausible receiver latency (1 sample .. 10 s).
+fn parse_stream_latency_min(body: &[u8]) -> Option<u32> {
+    let val: Value = plist::from_bytes(body).ok()?;
+    let s0 = val.as_dictionary()?.get("streams")?.as_array()?.first()?.as_dictionary()?;
+    let v = s0.get("latencyMin")?.as_unsigned_integer()?;
+    (1..=10 * 44_100).contains(&v).then_some(v as u32)
 }
 
 /// Pull `streams[0].dataPort` and `.controlPort` out of a SETUP response.
@@ -799,6 +1278,17 @@ fn network_time_parts(ns: u64) -> (u64, u64) {
     (secs, frac)
 }
 
+/// End offset of a response body that starts at `body_start`, refusing
+/// bodies over `MAX_BODY_BYTES`.
+fn body_end(body_start: usize, content_length: usize) -> Result<usize> {
+    if content_length > MAX_BODY_BYTES {
+        bail!("AP2 RTSP response body too large ({} bytes)", content_length);
+    }
+    body_start
+        .checked_add(content_length)
+        .ok_or_else(|| anyhow!("AP2 RTSP response body length overflows"))
+}
+
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
@@ -843,6 +1333,241 @@ mod tests {
         let ports = parse_stream_ports(&body).unwrap();
         assert_eq!(ports.data, 6010);
         assert_eq!(ports.control, 6011);
+    }
+
+    #[test]
+    fn body_end_caps_and_never_overflows() {
+        assert_eq!(body_end(40, 0).unwrap(), 40);
+        assert_eq!(body_end(40, 300).unwrap(), 340);
+        assert_eq!(body_end(40, MAX_BODY_BYTES).unwrap(), 40 + MAX_BODY_BYTES);
+        assert!(body_end(40, MAX_BODY_BYTES + 1).is_err());
+        assert!(body_end(40, usize::MAX).is_err());
+        assert!(body_end(usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn parse_response_waits_for_body_and_keeps_surplus() {
+        let mut buf = b"RTSP/1.0 200 OK\r\nCSeq: 4\r\nContent-Length: 3\r\n\r\nab".to_vec();
+        assert!(parse_response(&mut buf, true).unwrap().is_none());
+        buf.extend_from_slice(b"cRTSP/1.0 503 Busy\r\nCSeq: 5\r\n\r\n");
+        let r = parse_response(&mut buf, true).unwrap().unwrap();
+        assert_eq!((r.status, r.cseq, r.body.as_slice()), (200, Some(4), &b"abc"[..]));
+        let r = parse_response(&mut buf, true).unwrap().unwrap();
+        assert_eq!((r.status, r.cseq), (503, Some(5)));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn parse_response_rejects_ambiguous_framing() {
+        for bad in [
+            &b"RTSP/1.0 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n"[..],
+            b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nCSeq: 2\r\n\r\n",
+            b"RTSP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"RTSP/1.0 200 OK\r\nContent-Length: 99999999\r\n\r\n",
+        ] {
+            assert!(parse_response(&mut bad.to_vec(), true).is_err());
+        }
+        let mut huge = vec![b'x'; MAX_HEADER_BYTES + 1];
+        assert!(parse_response(&mut huge, true).is_err());
+    }
+
+    /// A reply without CSeq that arrives after its request timed out is
+    /// attributed to that request, not to the next one.
+    #[test]
+    fn late_reply_without_cseq_is_not_paired_with_next_request() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+            let mut out = sock;
+            let read_request = |r: &mut std::io::BufReader<TcpStream>| loop {
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            };
+            read_request(&mut reader);
+            std::thread::sleep(Duration::from_millis(400));
+            out.write_all(b"RTSP/1.0 201 Late\r\n\r\n").unwrap();
+            read_request(&mut reader);
+            out.write_all(b"RTSP/1.0 202 Second\r\n\r\n").unwrap();
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut c = Ap2Rtsp::connect(ip, port, ip, Duration::from_millis(200)).unwrap();
+        assert!(c.request("OPTIONS", "*", &[], None, &[]).is_err());
+        std::thread::sleep(Duration::from_millis(400));
+        c.timeout = Duration::from_secs(2);
+        let r = c.request("OPTIONS", "*", &[], None, &[]).unwrap();
+        assert_eq!(r.status, 202);
+        assert_eq!(c.take_late(1), Some(201));
+        server.join().unwrap();
+    }
+
+    /// Outside strict mode a receiver echoing a constant CSeq keeps
+    /// working, and a parse failure doesn't block TEARDOWN.
+    #[test]
+    fn lenient_mode_ignores_cseq_values() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+            let mut out = sock;
+            let mut methods = Vec::new();
+            for reply in [
+                &b"RTSP/1.0 200 OK\r\nCSeq: 0\r\n\r\n"[..],
+                b"RTSP/1.0 204 OK\r\nCSeq: 0\r\n\r\n",
+                b"garbage\r\n\r\n",
+            ] {
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                methods.push(first.split(' ').next().unwrap().to_string());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                out.write_all(reply).unwrap();
+            }
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            methods.push(first.split(' ').next().unwrap().to_string());
+            methods
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut c = Ap2Rtsp::connect(ip, port, ip, Duration::from_secs(2)).unwrap();
+        assert_eq!(c.request("OPTIONS", "*", &[], None, &[]).unwrap().status, 200);
+        assert_eq!(c.request("OPTIONS", "*", &[], None, &[]).unwrap().status, 204);
+        assert!(c.request("OPTIONS", "*", &[], None, &[]).is_err());
+        c.teardown();
+        assert_eq!(server.join().unwrap().last().map(String::as_str), Some("TEARDOWN"));
+    }
+
+    #[test]
+    fn oversized_or_wrapping_content_length_is_rejected_in_both_modes() {
+        for strict in [false, true] {
+            for cl in [(MAX_BODY_BYTES + 1).to_string(), usize::MAX.to_string()] {
+                let mut buf = format!("RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: {cl}\r\n\r\nxx").into_bytes();
+                assert!(parse_response(&mut buf, strict).is_err(), "strict={strict} cl={cl}");
+            }
+            let mut ok = format!("RTSP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", MAX_BODY_BYTES).into_bytes();
+            assert!(parse_response(&mut ok, strict).unwrap().is_none()); // waits for the body
+        }
+    }
+
+    /// A peer that keeps trickling bytes can't hold a request past the
+    /// absolute bound even though each read resets the per-read timeout.
+    #[test]
+    fn trickling_reply_hits_the_absolute_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let _ = sock.write_all(b"RTSP/1.0 200 OK\r\nContent-Length: 100000\r\n\r\n");
+            while !stop_t.load(std::sync::atomic::Ordering::Acquire) {
+                if sock.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut c = Ap2Rtsp::connect(ip, port, ip, Duration::from_millis(200)).unwrap();
+        c.reply_wait_cap = Duration::from_millis(600);
+        let started = Instant::now();
+        assert!(c.request("OPTIONS", "*", &[], None, &[]).is_err());
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(500) && took < Duration::from_secs(3), "{took:?}");
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn lenient_parsing_tolerates_odd_framing() {
+        let mut buf = b"RTSP/1.0 200 OK\r\nCSeq: x\r\nContent-Length: ?\r\n\r\n".to_vec();
+        let r = parse_response(&mut buf, false).unwrap().unwrap();
+        assert_eq!((r.status, r.cseq, r.body.len()), (200, None, 0));
+        let mut buf = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nCSeq: 2\r\nContent-Length: 1\r\n\r\nz".to_vec();
+        let r = parse_response(&mut buf, false).unwrap().unwrap();
+        assert_eq!((r.cseq, r.body.as_slice()), (Some(2), &b"z"[..]));
+        assert!(parse_response(&mut vec![b'x'; MAX_HEADER_BYTES + 1], false).unwrap().is_none());
+    }
+
+    #[test]
+    fn initial_volume_real_integer_missing() {
+        let body = |v: Option<Value>| {
+            let mut d = plist::Dictionary::new();
+            if let Some(v) = v {
+                d.insert("initialVolume".into(), v);
+            }
+            to_binary_plist(&Value::Dictionary(d)).unwrap()
+        };
+        assert_eq!(parse_initial_volume(&body(Some(Value::Real(-12.5)))), Some(-12.5));
+        assert_eq!(parse_initial_volume(&body(Some(Value::Integer((-30i64).into())))), Some(-30.0));
+        assert_eq!(parse_initial_volume(&body(None)), None);
+        assert_eq!(parse_initial_volume(&body(Some(Value::Real(3.0)))), None);
+        assert_eq!(parse_initial_volume(b"garbage"), None);
+    }
+
+    #[test]
+    fn codec_choice_follows_cn() {
+        assert_eq!(RealtimeCodec::from_cn(&[]), Some(RealtimeCodec::Pcm));
+        assert_eq!(RealtimeCodec::from_cn(&[0, 1, 2, 3]), Some(RealtimeCodec::Pcm));
+        assert_eq!(RealtimeCodec::from_cn(&[1, 3]), Some(RealtimeCodec::Alac));
+        assert_eq!(RealtimeCodec::from_cn(&[2, 3]), None);
+    }
+
+    #[test]
+    fn pinned_stream_dict_pins_latency_window() {
+        let d = pinned_stream_dict(&[1u8; 32], 6001, RealtimeCodec::Pcm, 8820, 0xABCD);
+        let int = |k: &str| d.get(k).and_then(|v| v.as_unsigned_integer());
+        assert_eq!(int("type"), Some(0x60));
+        assert_eq!(int("ct"), Some(1));
+        assert_eq!(int("audioFormat"), Some(0x800));
+        assert_eq!(int("spf"), Some(352));
+        assert_eq!(int("latencyMin"), Some(8820));
+        assert_eq!(int("latencyMax"), Some(8820));
+        assert_eq!(int("streamConnectionID"), Some(0xABCD));
+        assert_eq!(int("controlPort"), Some(6001));
+        let a = pinned_stream_dict(&[1u8; 32], 6001, RealtimeCodec::Alac, 8820, 1);
+        assert_eq!(a.get("audioFormat").and_then(|v| v.as_unsigned_integer()), Some(0x40000));
+    }
+
+    #[test]
+    fn homepod_session_dict_has_multiselect_keys() {
+        let d = homepod_session_dict("AA:BB", "UUID", "Sender", 42, "CLOCK", "10.0.0.2".parse().unwrap());
+        assert_eq!(d.get("isMultiSelectAirPlay").and_then(|v| v.as_boolean()), Some(true));
+        assert_eq!(d.get("groupContainsGroupLeader").and_then(|v| v.as_boolean()), Some(false));
+        assert_eq!(d.get("senderSupportsRelay").and_then(|v| v.as_boolean()), Some(false));
+        assert_eq!(d.get("timingProtocol").and_then(|v| v.as_string()), Some("PTP"));
+        let peers = d.get("timingPeerList").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(peers.len(), 1);
+        let p = peers[0].as_dictionary().unwrap();
+        assert_eq!(p.get("ClockID").and_then(|v| v.as_signed_integer()), Some(42));
+        assert!(d.get("groupUUID").is_none());
+    }
+
+    #[test]
+    fn stream_latency_min_is_range_checked() {
+        let body = |v: u64| {
+            let mut s0 = plist::Dictionary::new();
+            s0.insert("dataPort".into(), Value::Integer(1u64.into()));
+            s0.insert("latencyMin".into(), Value::Integer(v.into()));
+            let mut d = plist::Dictionary::new();
+            d.insert("streams".into(), Value::Array(vec![Value::Dictionary(s0)]));
+            to_binary_plist(&Value::Dictionary(d)).unwrap()
+        };
+        assert_eq!(parse_stream_latency_min(&body(11025)), Some(11025));
+        assert_eq!(parse_stream_latency_min(&body(0)), None);
+        assert_eq!(parse_stream_latency_min(&body(10 * 44_100 + 1)), None);
     }
 
     #[test]

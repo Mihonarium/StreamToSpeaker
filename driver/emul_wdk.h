@@ -74,6 +74,9 @@ typedef size_t            ULONG_PTR;
 #define STDMETHODIMP NTSTATUS
 #define STDMETHODIMP_(t) t
 
+#define TRUE  1
+#define FALSE 0
+
 /* ---- statuses ---- */
 #define STATUS_SUCCESS                 ((NTSTATUS)0)
 #define STATUS_UNSUCCESSFUL            ((NTSTATUS)0xC0000001L)
@@ -97,6 +100,10 @@ typedef struct _LIST_ENTRY { struct _LIST_ENTRY *Flink, *Blink; } LIST_ENTRY, *P
 typedef struct _DEVICE_OBJECT  DEVICE_OBJECT, *PDEVICE_OBJECT;
 typedef struct _IRP            IRP, *PIRP;
 typedef struct _MDL            MDL, *PMDL;
+typedef struct _FILE_OBJECT    FILE_OBJECT, *PFILE_OBJECT;
+typedef char                   CCHAR;
+typedef struct _EX_RUNDOWN_REF { ULONG_PTR Count; } EX_RUNDOWN_REF, *PEX_RUNDOWN_REF;
+#define PORT_CLASS_DEVICE_EXTENSION_SIZE (64 * sizeof(ULONG_PTR))
 typedef struct _DRIVER_OBJECT  DRIVER_OBJECT, *PDRIVER_OBJECT;
 typedef struct _UNICODE_STRING { USHORT Length, MaximumLength; PWSTR Buffer; } UNICODE_STRING, *PUNICODE_STRING;
 typedef struct _GUID { unsigned long Data1; unsigned short Data2,Data3; unsigned char Data4[8]; } GUID;
@@ -159,7 +166,7 @@ struct _IRP {
     BOOLEAN Cancel;
     struct { PVOID SystemBuffer; } AssociatedIrp;
     struct {
-        struct { LIST_ENTRY ListEntry; } Overlay;
+        struct { PVOID DriverContext[4]; LIST_ENTRY ListEntry; } Overlay;
     } Tail;
 };
 
@@ -187,6 +194,7 @@ typedef struct _IO_STACK_LOCATION {
             ULONG IoControlCode;
         } DeviceIoControl;
     } Parameters;
+    PFILE_OBJECT FileObject;
 } IO_STACK_LOCATION, *PIO_STACK_LOCATION;
 
 static inline PIO_STACK_LOCATION IoGetCurrentIrpStackLocation(PIRP) { static IO_STACK_LOCATION s; return &s; }
@@ -230,6 +238,13 @@ static inline LARGE_INTEGER KeQueryPerformanceCounter(LARGE_INTEGER* freq) {
 
 static inline LONG InterlockedExchange(volatile LONG* t, LONG v) { LONG old = *t; *t = v; return old; }
 static inline LONG64 ReadAcquire64(volatile LONG64* p) { return *p; }
+static inline PVOID InterlockedExchangePointer(PVOID volatile* t, PVOID v) { PVOID o = *t; *t = v; return o; }
+static inline PVOID InterlockedCompareExchangePointer(PVOID volatile* t, PVOID x, PVOID c) { PVOID o = *t; if (o == c) { *t = x; } return o; }
+static inline VOID    ExInitializeRundownProtection(PEX_RUNDOWN_REF r) { r->Count = 0; }
+static inline VOID    ExReInitializeRundownProtection(PEX_RUNDOWN_REF r) { r->Count = 0; }
+static inline BOOLEAN ExAcquireRundownProtection(PEX_RUNDOWN_REF r) { r->Count += 2; return 1; }
+static inline VOID    ExReleaseRundownProtection(PEX_RUNDOWN_REF r) { r->Count -= 2; }
+static inline VOID    ExWaitForRundownProtectionRelease(PEX_RUNDOWN_REF r) { r->Count = 1; }
 
 static inline PVOID ExAllocatePool2(POOL_FLAGS, SIZE_T n, ULONG) { return ::malloc(n); }
 static inline VOID  ExFreePoolWithTag(PVOID p, ULONG) { ::free(p); }

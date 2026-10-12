@@ -18,6 +18,13 @@
  * any other path we call IoSetCancelRoutine(Irp, NULL) and check the
  * old routine — if it was already nulled by the I/O manager the IRP
  * is being cancelled and we must leave it alone.
+ *
+ * Lifetime: every queued IRP owns one rundown reference on the
+ * published context (StreamToSpeakerIoctlRefAcquire) and records the
+ * context in Tail.Overlay.DriverContext[0], so its cancel routine never
+ * depends on the global pointer, which removal withdraws first. Queued
+ * IRPs are always completed through CompleteQueuedIrp, which drops that
+ * reference after IoCompleteRequest.
  */
 
 #include "ioctl.h"
@@ -30,6 +37,39 @@ static NTSTATUS Ioctl_HandleGetVersion (_In_ PIRP Irp);
 static NTSTATUS Ioctl_HandleGetAudio   (_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp);
 static NTSTATUS Ioctl_HandleGetEvent   (_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp);
 static NTSTATUS Ioctl_HandlePushVolume (_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp);
+
+#define IRP_QUEUED_CTX(irp) ((irp)->Tail.Overlay.DriverContext[0])
+
+/* Complete an IRP that IoctlDispatch returned STATUS_PENDING for and
+ * release the context reference it owns. Must be the caller's last
+ * touch of the IRP. */
+static VOID
+CompleteQueuedIrp(_In_ PIRP Irp, _In_ NTSTATUS Status,
+                  _In_ ULONG_PTR Information, _In_ CCHAR PriorityBoost)
+{
+    Irp->IoStatus.Status      = Status;
+    Irp->IoStatus.Information = Information;
+    IoCompleteRequest(Irp, PriorityBoost);
+    StreamToSpeakerIoctlRefRelease();
+}
+
+/* Take the reference a queued IRP will own and remember its context.
+ * Fails once removal has started. */
+static BOOLEAN
+PrepareIrpForQueue(_In_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp)
+{
+    if (!StreamToSpeakerIoctlRefAcquire()) {
+        return FALSE;
+    }
+    IRP_QUEUED_CTX(Irp) = Ctx;
+    /* Self-reference the IRP's list entry up front. The cancel routine
+     * decides "is this entry in a list?" via `Flink != &self`, so an
+     * unspecified initial Flink (e.g. left over from pool recycling)
+     * could spuriously satisfy that check and lead to a BSOD on cancel
+     * if the IRP never makes it onto a list (cancellation race). */
+    InitializeListHead(&Irp->Tail.Overlay.ListEntry);
+    return TRUE;
+}
 
 /* ------------------------------------------------------------------ */
 /* Lifecycle                                                           */
@@ -148,7 +188,6 @@ static NTSTATUS
 Ioctl_HandlePushVolume(_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp)
 {
     PAGED_CODE();
-    UNREFERENCED_PARAMETER(Ctx);
 
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
     if (sp->Parameters.DeviceIoControl.InputBufferLength
@@ -172,17 +211,14 @@ Ioctl_HandlePushVolume(_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp)
     }
 
     /* Hand off to topology so it can fire a KS property change event
-     * back to the Windows audio engine. The topology pointer is held
-     * in the device extension. */
+     * back to the Windows audio engine. The caller holds the context
+     * rundown reference, so the FDO (Ctx->DeviceObject) cannot be
+     * removed underneath us; the topology miniport has its own
+     * rundown because it can go away on STOP while the FDO stays. */
     PDEVICE_OBJECT devObj = Ctx->DeviceObject;
     if (devObj != nullptr) {
-        PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext =
-            StreamToSpeakerGetExt(devObj);
-        if (ext != nullptr && ext->Topology != nullptr) {
-            extern VOID TopologyOnExternalVolumeChange(
-                CMiniportTopology*, INT32, BOOLEAN);
-            TopologyOnExternalVolumeChange(ext->Topology, mb, in->Muted != 0);
-        }
+        TopologyForwardExternalVolume(
+            StreamToSpeakerGetExt(devObj), mb, in->Muted != 0);
     }
 
     Irp->IoStatus.Information = 0;
@@ -235,28 +271,29 @@ Ioctl_HandleGetAudio(_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp)
         return status;
     }
 
-    /* Self-reference the IRP's list entry up front. The cancel routine
-     * decides "is this entry in a list?" via `Flink != &self`, so an
-     * unspecified initial Flink (e.g. left over from pool recycling)
-     * could spuriously satisfy that check and lead to a BSOD on cancel
-     * if the IRP never makes it onto the AudioIrpList (cancellation
-     * race below). InitializeListHead makes the check reliable. */
-    InitializeListHead(&Irp->Tail.Overlay.ListEntry);
+    if (!PrepareIrpForQueue(Ctx, Irp)) {
+        Irp->IoStatus.Information = 0;
+        return STATUS_DEVICE_NOT_READY;
+    }
 
-    /* Mark pending, hook cancel routine, queue. */
+    /* Mark pending, hook cancel routine, queue. From here on the IRP is
+     * completed only through CompleteQueuedIrp. */
     IoMarkIrpPending(Irp);
 
     KIRQL old;
     KeAcquireSpinLock(&Ctx->AudioIrpLock, &old);
+    if (Ctx->Closing) {
+        KeReleaseSpinLock(&Ctx->AudioIrpLock, old);
+        CompleteQueuedIrp(Irp, STATUS_DEVICE_NOT_READY, 0, IO_NO_INCREMENT);
+        return STATUS_PENDING;
+    }
     IoSetCancelRoutine(Irp, StreamToSpeakerIoctlCancelAudio);
     if (Irp->Cancel) {
         /* Already cancelled before we wired the cancel routine. Undo
          * and complete here. */
         if (IoSetCancelRoutine(Irp, nullptr) != nullptr) {
             KeReleaseSpinLock(&Ctx->AudioIrpLock, old);
-            Irp->IoStatus.Status = STATUS_CANCELLED;
-            Irp->IoStatus.Information = 0;
-            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            CompleteQueuedIrp(Irp, STATUS_CANCELLED, 0, IO_NO_INCREMENT);
             return STATUS_PENDING; /* IRP already completed by us. */
         }
         /* Cancel routine already ran; it will complete the IRP. */
@@ -341,9 +378,7 @@ IoctlTryCompleteAudio(_Inout_ StreamToSpeakerIoctlCtx* Ctx)
             ? MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority | MdlMappingNoExecute)
             : nullptr;
         if (sysAddr == nullptr) {
-            irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
-            irp->IoStatus.Information = 0;
-            IoCompleteRequest(irp, IO_NO_INCREMENT);
+            CompleteQueuedIrp(irp, STATUS_INSUFFICIENT_RESOURCES, 0, IO_NO_INCREMENT);
             continue;
         }
 
@@ -363,12 +398,15 @@ IoctlTryCompleteAudio(_Inout_ StreamToSpeakerIoctlCtx* Ctx)
             /* Race: someone else drained the ring. Requeue at head. */
             IoMarkIrpPending(irp);
             KeAcquireSpinLock(&Ctx->AudioIrpLock, &old);
+            if (Ctx->Closing) {
+                KeReleaseSpinLock(&Ctx->AudioIrpLock, old);
+                CompleteQueuedIrp(irp, STATUS_CANCELLED, 0, IO_NO_INCREMENT);
+                continue;
+            }
             IoSetCancelRoutine(irp, StreamToSpeakerIoctlCancelAudio);
             if (irp->Cancel && IoSetCancelRoutine(irp, nullptr) != nullptr) {
                 KeReleaseSpinLock(&Ctx->AudioIrpLock, old);
-                irp->IoStatus.Status = STATUS_CANCELLED;
-                irp->IoStatus.Information = 0;
-                IoCompleteRequest(irp, IO_NO_INCREMENT);
+                CompleteQueuedIrp(irp, STATUS_CANCELLED, 0, IO_NO_INCREMENT);
                 continue;
             }
             InsertHeadList(&Ctx->AudioIrpList, &irp->Tail.Overlay.ListEntry);
@@ -392,9 +430,8 @@ IoctlTryCompleteAudio(_Inout_ StreamToSpeakerIoctlCtx* Ctx)
         hdr->TimestampQpc     = (UINT64)qpc.QuadPart;
         hdr->StreamPosition   = Ctx->StreamPositionFrames;
 
-        irp->IoStatus.Status      = STATUS_SUCCESS;
-        irp->IoStatus.Information = sizeof(*hdr) + copied;
-        IoCompleteRequest(irp, IO_SOUND_INCREMENT);
+        CompleteQueuedIrp(irp, STATUS_SUCCESS, sizeof(*hdr) + copied,
+                          IO_SOUND_INCREMENT);
     }
 }
 
@@ -434,20 +471,23 @@ Ioctl_HandleGetEvent(_Inout_ StreamToSpeakerIoctlCtx* Ctx, _In_ PIRP Irp)
     }
     KeReleaseSpinLock(&Ctx->EventQueueLock, old);
 
-    /* Self-reference the list entry before any cancel-routine wiring.
-     * See the matching comment in Ioctl_HandleGetAudio. */
-    InitializeListHead(&Irp->Tail.Overlay.ListEntry);
-
     /* Otherwise queue the IRP. */
+    if (!PrepareIrpForQueue(Ctx, Irp)) {
+        Irp->IoStatus.Information = 0;
+        return STATUS_DEVICE_NOT_READY;
+    }
     IoMarkIrpPending(Irp);
     KeAcquireSpinLock(&Ctx->EventIrpLock, &old);
+    if (Ctx->Closing) {
+        KeReleaseSpinLock(&Ctx->EventIrpLock, old);
+        CompleteQueuedIrp(Irp, STATUS_DEVICE_NOT_READY, 0, IO_NO_INCREMENT);
+        return STATUS_PENDING;
+    }
     IoSetCancelRoutine(Irp, StreamToSpeakerIoctlCancelEvent);
     if (Irp->Cancel) {
         if (IoSetCancelRoutine(Irp, nullptr) != nullptr) {
             KeReleaseSpinLock(&Ctx->EventIrpLock, old);
-            Irp->IoStatus.Status = STATUS_CANCELLED;
-            Irp->IoStatus.Information = 0;
-            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            CompleteQueuedIrp(Irp, STATUS_CANCELLED, 0, IO_NO_INCREMENT);
             return STATUS_PENDING;
         }
         KeReleaseSpinLock(&Ctx->EventIrpLock, old);
@@ -494,13 +534,10 @@ IoctlPostEvent(_Inout_ StreamToSpeakerIoctlCtx* Ctx,
         if (out != nullptr &&
             sp->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(*Event)) {
             *out = *Event;
-            irp->IoStatus.Status = STATUS_SUCCESS;
-            irp->IoStatus.Information = sizeof(*Event);
+            CompleteQueuedIrp(irp, STATUS_SUCCESS, sizeof(*Event), IO_NO_INCREMENT);
         } else {
-            irp->IoStatus.Status = STATUS_BUFFER_TOO_SMALL;
-            irp->IoStatus.Information = 0;
+            CompleteQueuedIrp(irp, STATUS_BUFFER_TOO_SMALL, 0, IO_NO_INCREMENT);
         }
-        IoCompleteRequest(irp, IO_NO_INCREMENT);
         return;
     }
 
@@ -552,9 +589,7 @@ IoctlOnStreamStop(_Inout_ StreamToSpeakerIoctlCtx* Ctx)
         if (irp == nullptr) {
             break;
         }
-        irp->IoStatus.Status = STATUS_SUCCESS;
-        irp->IoStatus.Information = 0;
-        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        CompleteQueuedIrp(irp, STATUS_SUCCESS, 0, IO_NO_INCREMENT);
     }
 
     STREAM_TO_SPEAKER_CONTROL_EVENT ev = { };
@@ -576,9 +611,7 @@ IoctlCancelAll(_Inout_ StreamToSpeakerIoctlCtx* Ctx)
         if (irp == nullptr) {
             break;
         }
-        irp->IoStatus.Status = STATUS_CANCELLED;
-        irp->IoStatus.Information = 0;
-        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        CompleteQueuedIrp(irp, STATUS_CANCELLED, 0, IO_NO_INCREMENT);
     }
     for (;;) {
         KIRQL old;
@@ -588,9 +621,70 @@ IoctlCancelAll(_Inout_ StreamToSpeakerIoctlCtx* Ctx)
         if (irp == nullptr) {
             break;
         }
-        irp->IoStatus.Status = STATUS_CANCELLED;
-        irp->IoStatus.Information = 0;
-        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        CompleteQueuedIrp(irp, STATUS_CANCELLED, 0, IO_NO_INCREMENT);
+    }
+}
+
+VOID
+IoctlBeginClose(_Inout_ StreamToSpeakerIoctlCtx* Ctx)
+{
+    if (Ctx == nullptr) {
+        return;
+    }
+    /* Any queueing path that takes its list lock after this store sees
+     * Closing; one that already holds the lock finishes inserting before
+     * IoctlCancelAll can take the lock, so its IRP is cancelled below. */
+    InterlockedExchange(&Ctx->Closing, 1);
+    IoctlCancelAll(Ctx);
+}
+
+/* Move every claimable IRP queued through FileObject from List to Out.
+ * Caller holds the list's lock. IRPs whose cancel routine has already
+ * been claimed by the I/O manager are left for that routine (their
+ * entry is self-referenced so it skips RemoveEntryList). */
+static VOID
+CollectFileIrps(_Inout_ PLIST_ENTRY List, _In_ PFILE_OBJECT FileObject,
+                _Inout_ PLIST_ENTRY Out)
+{
+    PLIST_ENTRY entry = List->Flink;
+    while (entry != List) {
+        PLIST_ENTRY next = entry->Flink;
+        PIRP irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+        if (IoGetCurrentIrpStackLocation(irp)->FileObject == FileObject) {
+            RemoveEntryList(entry);
+            InitializeListHead(entry);
+            if (IoSetCancelRoutine(irp, nullptr) != nullptr) {
+                InsertTailList(Out, entry);
+            }
+        }
+        entry = next;
+    }
+}
+
+VOID
+IoctlCancelFileIrps(_Inout_ StreamToSpeakerIoctlCtx* Ctx,
+                    _In_ PFILE_OBJECT FileObject)
+{
+    if (Ctx == nullptr || FileObject == nullptr) {
+        return;
+    }
+    LIST_ENTRY claimed;
+    InitializeListHead(&claimed);
+
+    KIRQL old;
+    KeAcquireSpinLock(&Ctx->AudioIrpLock, &old);
+    CollectFileIrps(&Ctx->AudioIrpList, FileObject, &claimed);
+    KeReleaseSpinLock(&Ctx->AudioIrpLock, old);
+
+    KeAcquireSpinLock(&Ctx->EventIrpLock, &old);
+    CollectFileIrps(&Ctx->EventIrpList, FileObject, &claimed);
+    KeReleaseSpinLock(&Ctx->EventIrpLock, old);
+
+    while (!IsListEmpty(&claimed)) {
+        PLIST_ENTRY entry = RemoveHeadList(&claimed);
+        InitializeListHead(entry);
+        PIRP irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+        CompleteQueuedIrp(irp, STATUS_CANCELLED, 0, IO_NO_INCREMENT);
     }
 }
 
@@ -609,8 +703,10 @@ StreamToSpeakerIoctlCancelAudio(_Inout_ PDEVICE_OBJECT DeviceObject,
 
     /* DeviceObject here is the control device (DeviceExtensionSize=0,
      * StreamToSpeakerGetExt on it returns a garbage pointer → BSOD).
-     * Get IoctlCtx from the global publisher instead. */
-    StreamToSpeakerIoctlCtx* ctx = StreamToSpeakerCurrentIoctlCtx();
+     * The context was recorded in the IRP when it was queued; the
+     * reference the IRP owns keeps it alive until we complete it. */
+    StreamToSpeakerIoctlCtx* ctx =
+        static_cast<StreamToSpeakerIoctlCtx*>(IRP_QUEUED_CTX(Irp));
     if (ctx != nullptr) {
         KIRQL old;
         KeAcquireSpinLock(&ctx->AudioIrpLock, &old);
@@ -623,9 +719,7 @@ StreamToSpeakerIoctlCancelAudio(_Inout_ PDEVICE_OBJECT DeviceObject,
         KeReleaseSpinLock(&ctx->AudioIrpLock, old);
     }
 
-    Irp->IoStatus.Status = STATUS_CANCELLED;
-    Irp->IoStatus.Information = 0;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    CompleteQueuedIrp(Irp, STATUS_CANCELLED, 0, IO_NO_INCREMENT);
 }
 
 static VOID
@@ -637,7 +731,8 @@ StreamToSpeakerIoctlCancelEvent(_Inout_ PDEVICE_OBJECT DeviceObject,
 
     /* See cancel-audio above: never dereference DeviceObject's extension
      * here; the control device has none. */
-    StreamToSpeakerIoctlCtx* ctx = StreamToSpeakerCurrentIoctlCtx();
+    StreamToSpeakerIoctlCtx* ctx =
+        static_cast<StreamToSpeakerIoctlCtx*>(IRP_QUEUED_CTX(Irp));
     if (ctx != nullptr) {
         KIRQL old;
         KeAcquireSpinLock(&ctx->EventIrpLock, &old);
@@ -649,7 +744,5 @@ StreamToSpeakerIoctlCancelEvent(_Inout_ PDEVICE_OBJECT DeviceObject,
         KeReleaseSpinLock(&ctx->EventIrpLock, old);
     }
 
-    Irp->IoStatus.Status = STATUS_CANCELLED;
-    Irp->IoStatus.Information = 0;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    CompleteQueuedIrp(Irp, STATUS_CANCELLED, 0, IO_NO_INCREMENT);
 }

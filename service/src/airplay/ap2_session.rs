@@ -33,16 +33,23 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::airplay::alac::build_uncompressed_alac_frame;
-use crate::airplay::ap2_crypto::seal_audio;
+use crate::airplay::ap2_crypto::AudioSealer;
+use crate::airplay::ap2_events::spawn_event_channel;
+use crate::airplay::ap2_health::{
+    log_notice, raop_db_to_volume_pct, Ap2Fault, DeviceVolume, FaultChannel, FaultSlot, FeedbackAction,
+    FeedbackMonitor, SendAction, SendHealth, VolumeTracker, FEEDBACK_INTERVAL,
+};
 use crate::airplay::ap2_ptp::{spawn_ptp_master, PtpMaster, PtpTimeline};
-use crate::airplay::ap2_rtsp::{Ap2Rtsp, TransientOutcome};
+use crate::airplay::ap2_resend::Retransmitter;
+use crate::airplay::ap2_crypto::ChannelCipher;
+use crate::airplay::ap2_realtime::{MemberLink, RealtimeGroup, RealtimeRun};
+use crate::airplay::ap2_rtsp::{Ap2Rtsp, InfoPoll, InfoVolume, RealtimeCodec, TransientOutcome};
 use crate::airplay::discovery::AirPlayRenderer;
 use crate::airplay::hap_pairing::PairingCredentials;
 use crate::airplay::rtp::{bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, FRAMES_PER_PACKET};
 use crate::airplay::session::{mute_db, volume_pct_to_raop_db};
 use crate::airplay::timing::{
-    spawn_resend_responder, spawn_sync_sender, spawn_sync_sender_ptp, spawn_timing_responder,
-    ResendBuffer,
+    spawn_resend_responder, spawn_sync_sender, spawn_sync_sender_ptp, spawn_timing_responder, ResendBuffer,
 };
 use crate::http_server::PcmFrame;
 use crate::WIRE_SAMPLE_RATE;
@@ -57,14 +64,17 @@ const DEFAULT_LATENCY_SAMPLES: u32 = 88200;
 /// regardless of what we ask — is skipped in favour of realtime, the
 /// only AirPlay 2 stream kind that can actually deliver low latency.
 const LOW_LATENCY_REALTIME_MS: u32 = 1000;
-/// Recently-sent packets retained for retransmit (~4 s at 44.1 kHz).
-const RESEND_BUFFER_PACKETS: usize = 512;
 /// How far in the future the buffered stream's SETRATEANCHORTIME anchor is
 /// placed — the receiver buffers packets until this point, absorbing
 /// startup jitter.
 const ANCHOR_LEAD_NS: u64 = 500_000_000;
-/// Cadence of the /feedback keepalive iOS senders emit.
-const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
+/// Recently-sent packets retained for retransmit (~4 s at 44.1 kHz).
+const RESEND_BUFFER_PACKETS: usize = 512;
+/// Device-volume read-back cadence (`GET /info`).
+const VOLUME_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Response budget for one read-back request — short, so a slow receiver
+/// never holds the shared control connection for long.
+const VOLUME_POLL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 pub struct AirPlay2SessionConfig {
     pub renderer: AirPlayRenderer,
@@ -86,6 +96,12 @@ pub struct AirPlay2SessionConfig {
     /// present, the session does `pair-verify` with these instead of
     /// transient pairing.
     pub pairing_creds: Option<PairingCredentials>,
+    /// Stream HomePods with the low-latency realtime profile (see
+    /// [`AirPlay2Session::start`]); `false` keeps single HomePods on the
+    /// general path (buffered when supported). Stereo pairs always use it.
+    pub homepod_realtime: bool,
+    /// Playout delay for the HomePod realtime profile, in ms.
+    pub homepod_latency_ms: u32,
 }
 
 /// Typed outcome of [`AirPlay2Session::start`], so the caller's policy
@@ -121,9 +137,14 @@ pub struct AirPlay2Session {
     volume_pct: AtomicU32,
     stop_flag: Arc<AtomicBool>,
     /// Set by background threads when the session has demonstrably died
-    /// (audio send error, buffered TCP write failure, repeated /feedback
-    /// failures). Polled by the app watchdog for auto-reconnect.
+    /// (see [`FaultSlot`]: audio sends failing for the grace period, a
+    /// buffered TCP write failure, a /feedback fault, the event channel
+    /// closing). Polled by the app watchdog for auto-reconnect.
     dead: Arc<AtomicBool>,
+    /// Why the session died, once a thread has raised a fault.
+    faults: FaultSlot,
+    /// Device-volume read-back state.
+    volume: Arc<Mutex<VolumeTracker>>,
     /// Retransmission counters (realtime stream only; buffered has no
     /// resend path and leaves them at zero).
     resend_stats: Arc<crate::airplay::timing::ResendStats>,
@@ -133,6 +154,7 @@ pub struct AirPlay2Session {
     resend_handle: Option<JoinHandle<()>>,
     event_handle: Option<JoinHandle<()>>,
     feedback_handle: Option<JoinHandle<()>>,
+    volume_handle: Option<JoinHandle<()>>,
     ptp_session: Option<PtpMaster>,
     /// (last sent seq, current rtptime) for the buffered stream — read at
     /// stop() to send the spec's FLUSHBUFFERED before TEARDOWN. None for
@@ -141,11 +163,25 @@ pub struct AirPlay2Session {
     /// Clone of the buffered data TCP stream — stop() shuts it down to
     /// unblock a sender wedged in a full-buffer write before joining it.
     data_stream: Option<TcpStream>,
-    _audio_socket: UdpSocket,
+    _audio_socket: Option<UdpSocket>,
+    /// Control connections of the other stereo-pair members (the leader's
+    /// is `rtsp`). Volume goes to the leader first, then these.
+    followers: Vec<Arc<Mutex<Ap2Rtsp>>>,
+    /// Per-member threads beyond the fixed handles above.
+    extra_handles: Vec<JoinHandle<()>>,
 }
 
 impl AirPlay2Session {
+    /// Bring up a session. HomePods with PTP (and every stereo pair) take
+    /// the realtime HomePod profile ([`AirPlay2Session::start_homepod_realtime`])
+    /// unless `homepod_realtime` is off; every other receiver takes the
+    /// general path below.
     pub fn start(cfg: AirPlay2SessionConfig) -> std::result::Result<Self, Ap2StartError> {
+        if cfg.renderer.pair.is_some()
+            || (cfg.homepod_realtime && cfg.renderer.is_homepod() && cfg.renderer.expects_ptp())
+        {
+            return Self::start_homepod_realtime(cfg);
+        }
         let port = cfg.renderer.airplay_port.unwrap_or(DEFAULT_AIRPLAY_PORT);
         info!(
             "AirPlay 2: starting session to {} ({}:{})",
@@ -161,6 +197,10 @@ impl AirPlay2Session {
 
         let mut rtsp = Ap2Rtsp::connect(cfg.renderer.ip, port, cfg.local_ip, Duration::from_secs(5))
             .context("AirPlay 2 RTSP connect")?;
+        // HomePods get the stricter connection handling (framing checks,
+        // short TEARDOWN wait); other receivers keep the lenient one.
+        let homepod = cfg.renderer.is_homepod();
+        rtsp.set_strict(homepod);
 
         // Canonical opener — iOS sends GET /info before pairing. Some
         // receivers initialise per-connection state on it; harmless
@@ -169,55 +209,13 @@ impl AirPlay2Session {
             warn!("AirPlay 2 GET /info failed (continuing): {:#}", e);
         }
 
-        // Pairing: a PIN-paired receiver (Apple TV with access control)
-        // gets pair-verify from the stored long-term keys; everything else
-        // gets transient pairing. A transient 470 means the receiver *needs*
-        // PIN pairing but we have no stored keys — surface NeedsPin so the
-        // app can run the one-time PIN ceremony. A pair-verify REJECTION
-        // (response received, credentials refused) surfaces as
-        // VerifyRejected so the app clears the stale keys; a mere transport
-        // failure stays a generic error and the keys survive.
-        let audio_key = if let Some(creds) = cfg.pairing_creds.clone() {
-            info!(
-                "AirPlay 2: verifying stored pairing with {}",
-                cfg.renderer.friendly_name
-            );
-            match rtsp.pair_verify(&creds) {
-                Ok(key) => key,
-                Err(crate::airplay::ap2_rtsp::PairVerifyError::Rejected(e)) => {
-                    warn!(
-                        "AirPlay 2: {} rejected the stored pairing ({:#}) — it will be \
-                         cleared for re-pairing",
-                        cfg.renderer.friendly_name, e
-                    );
-                    return Err(Ap2StartError::VerifyRejected(e));
-                }
-                Err(crate::airplay::ap2_rtsp::PairVerifyError::Transport(e)) => {
-                    return Err(Ap2StartError::Other(
-                        e.context("AirPlay 2 HomeKit pair-verify (transport)"),
-                    ));
-                }
-            }
-        } else {
-            match rtsp
-                .pair_setup_transient()
-                .context("AirPlay 2 HomeKit transient pairing")?
-            {
-                TransientOutcome::Paired(key) => key,
-                TransientOutcome::NeedsPin => {
-                    info!(
-                        "AirPlay 2: {} refused transient pairing (470) — needs one-time PIN \
-                         verification",
-                        cfg.renderer.friendly_name
-                    );
-                    return Err(Ap2StartError::NeedsPin);
-                }
-            }
-        };
+        let audio_key = pair_member(&mut rtsp, cfg.pairing_creds.clone(), &cfg.renderer.friendly_name)?;
         info!("AirPlay 2: paired with {}", cfg.renderer.friendly_name);
 
+        let event_ciphers = rtsp.take_event_ciphers();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
+        let faults = FaultSlot::new(dead.clone(), cfg.renderer.friendly_name.clone());
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
 
         // Timing-protocol choice: receivers advertising SupportsPTP (bit 41)
@@ -235,7 +233,7 @@ impl AirPlay2Session {
             cfg.renderer.model.as_deref().unwrap_or("?"),
         );
         let (ptp_session, timing_setup) = if use_ptp {
-            let ptp = spawn_ptp_master(cfg.renderer.ip, cfg.local_ip, cfg.renderer.friendly_name.clone())
+            let ptp = spawn_ptp_master(&[cfg.renderer.ip], cfg.local_ip, cfg.renderer.friendly_name.clone(), homepod)
                 .context("starting AP2 PTP master")?;
             let ts = rtsp
                 .setup_timing_ptp(ptp.timeline.clock_id, &ptp.clock_uuid)
@@ -250,12 +248,17 @@ impl AirPlay2Session {
         let event_port = timing_setup.event_port;
 
         // Open the event channel: the receiver withholds its RECORD response
-        // until the sender has a TCP connection to its eventPort. We don't
-        // process events — just keep it open.
+        // until the sender has a TCP connection to its eventPort. On a
+        // HomePod its requests are decrypted and answered 200, and the
+        // receiver closing it ends the session; other receivers keep the
+        // channel open and drained, as before.
         let event_handle = spawn_event_channel(
             cfg.renderer.ip,
             event_port,
+            event_ciphers.filter(|_| homepod),
             stop_flag.clone(),
+            faults.clone(),
+            homepod,
             cfg.renderer.friendly_name.clone(),
         );
 
@@ -376,9 +379,12 @@ impl AirPlay2Session {
 
         rtsp.record().context("AP2 RECORD")?;
 
+        let volume = Arc::new(Mutex::new(VolumeTracker::default()));
         if let Some(vol) = cfg.initial_volume {
+            let seq = volume.lock().unwrap().on_write(vol, Instant::now());
             if let Err(e) = rtsp.set_volume(volume_pct_to_raop_db(vol)) {
                 warn!("AirPlay 2 initial volume failed: {}", e);
+                volume.lock().unwrap().on_write_failed(seq);
             }
         }
 
@@ -392,7 +398,6 @@ impl AirPlay2Session {
         let initial_rtptime = random_initial_rtptime();
         let ssrc = random_ssrc();
         let current_rtptime = Arc::new(AtomicU32::new(initial_rtptime));
-        let resend = ResendBuffer::new(RESEND_BUFFER_PACKETS);
 
         // The control socket carries outbound sync packets and inbound
         // resend requests — clone it so both threads can use it.
@@ -430,7 +435,7 @@ impl AirPlay2Session {
                 rtsp: rtsp.clone(),
                 timeline: ptp_session.as_ref().unwrap().timeline.clone(),
                 codec,
-                session_dead: dead.clone(),
+                faults: faults.clone(),
             })?;
             info!(
                 "AirPlay 2: buffered {} stream armed — will anchor at first audio",
@@ -439,7 +444,6 @@ impl AirPlay2Session {
             drop(timing_socket);
             drop(control_socket);
             drop(control_for_resend);
-            drop(resend);
             (sender, None, None, None)
         } else {
             // Anchor before audio: both sync spawners send their initial
@@ -482,6 +486,39 @@ impl AirPlay2Session {
                 (Some(timing), Some(sync))
             };
 
+            // HomePods: resends from the media loop with per-slot budgets
+            // and playout deadlines, and a grace period for send errors.
+            // The resend socket gets a 1 ms *read* timeout rather than
+            // non-blocking mode, which would also apply to the sync
+            // thread's sends on the shared socket. Other receivers keep
+            // the resend thread and stop on the first send error.
+            let (recovery, resend_handle) = if homepod {
+                control_for_resend
+                    .set_read_timeout(Some(Duration::from_millis(1)))
+                    .context("AP2 control socket read timeout")?;
+                let recovery = RealtimeRecovery::Deadline {
+                    control_socket: control_for_resend,
+                    retransmit: Retransmitter::new(
+                        cfg.renderer.ip,
+                        resend_stats.clone(),
+                        cfg.renderer.friendly_name.clone(),
+                    ),
+                    latency: Duration::from_millis(cfg.latency_ms as u64),
+                };
+                (recovery, None)
+            } else {
+                let resend = ResendBuffer::new(RESEND_BUFFER_PACKETS);
+                let handle = spawn_resend_responder(
+                    control_for_resend,
+                    sync_addr,
+                    resend.clone(),
+                    resend_stats.clone(),
+                    stop_flag.clone(),
+                    cfg.renderer.friendly_name.clone(),
+                )
+                .context("spawning AP2 resend responder")?;
+                (RealtimeRecovery::Classic { resend }, Some(handle))
+            };
             let sender = spawn_ap2_sender(Ap2SenderConfig {
                 audio_socket: audio_socket.try_clone().context("clone AP2 audio socket")?,
                 receiver_addr: SocketAddr::new(cfg.renderer.ip, ports.data),
@@ -493,20 +530,10 @@ impl AirPlay2Session {
                 stop_flag: stop_flag.clone(),
                 receiver_name: cfg.renderer.friendly_name.clone(),
                 current_rtptime,
-                resend: resend.clone(),
-                session_dead: dead.clone(),
+                recovery,
+                faults: faults.clone(),
             })?;
-
-            let resend_handle = spawn_resend_responder(
-                control_for_resend,
-                sync_addr,
-                resend,
-                resend_stats.clone(),
-                stop_flag.clone(),
-                cfg.renderer.friendly_name.clone(),
-            )
-            .context("spawning AP2 resend responder")?;
-            (sender, timing_handle, sync_handle, Some(resend_handle))
+            (sender, timing_handle, sync_handle, resend_handle)
         };
 
         info!(
@@ -524,9 +551,16 @@ impl AirPlay2Session {
         let feedback_handle = spawn_feedback_keepalive(
             rtsp.clone(),
             stop_flag.clone(),
-            dead.clone(),
+            faults.clone(),
+            homepod,
             cfg.renderer.friendly_name.clone(),
         );
+        // Volume read-back is limited to HomePods.
+        let volume_handle = if homepod {
+            spawn_volume_reader(rtsp.clone(), volume.clone(), stop_flag.clone(), cfg.renderer.friendly_name.clone())
+        } else {
+            None
+        };
 
         Ok(Self {
             renderer: cfg.renderer,
@@ -534,6 +568,8 @@ impl AirPlay2Session {
             volume_pct: AtomicU32::new(cfg.initial_volume.unwrap_or(100)),
             stop_flag,
             dead,
+            faults,
+            volume,
             resend_stats,
             sender_handle: Some(sender_handle),
             timing_handle,
@@ -541,10 +577,272 @@ impl AirPlay2Session {
             resend_handle,
             event_handle,
             feedback_handle,
+            volume_handle,
             ptp_session,
             buffered_flush,
             data_stream,
-            _audio_socket: audio_socket,
+            _audio_socket: Some(audio_socket),
+            followers: Vec::new(),
+            extra_handles: Vec::new(),
+        })
+    }
+
+    /// The realtime HomePod profile, for a single HomePod or every member
+    /// of a stereo pair (one session per member, leader first):
+    ///
+    /// 1. per member: connect, `GET /info`, pair;
+    /// 2. one PTP grandmaster shared by all members;
+    /// 3. per member: SETUP(session) with the multi-select keys, then the
+    ///    encrypted event channel;
+    /// 4. per member: SETPEERS listing every member plus us;
+    /// 5. per member: SETUP(stream) type 96, PCM when every member's `cn`
+    ///    allows it (else ALAC), `latencyMin` = `latencyMax` = the
+    ///    configured delay, `streamConnectionID` = its SSRC; a reported
+    ///    `latencyMin` becomes that member's effective latency;
+    /// 6. per member: RECORD + FLUSH naming its first packet, all on one
+    ///    shared initial RTP timestamp;
+    /// 7. one realtime scheduler for all members, `/feedback` and the event
+    ///    channel per member, volume read-back from the leader.
+    ///
+    /// Any member's fault ends the whole session. A failure partway tears
+    /// down what was set up (TEARDOWN on drop, threads stopped).
+    fn start_homepod_realtime(cfg: AirPlay2SessionConfig) -> std::result::Result<Self, Ap2StartError> {
+        let label = cfg.renderer.friendly_name.clone();
+        let members: Vec<AirPlayRenderer> = match &cfg.renderer.pair {
+            Some(p) if !p.is_complete() => {
+                return Err(anyhow::anyhow!(
+                    "{}: waiting for every member of the stereo pair ({} of {} present)",
+                    label,
+                    p.members.len(),
+                    p.expected
+                )
+                .into())
+            }
+            Some(p) => p.members.clone(),
+            None => vec![cfg.renderer.clone()],
+        };
+        let codec = common_codec(&members).ok_or_else(|| {
+            anyhow::anyhow!("{}: receiver offers neither PCM nor ALAC (cn={:?})", label, members[0].codecs)
+        })?;
+        let latency_samples = crate::airplay::timing::latency_ms_to_samples(cfg.homepod_latency_ms);
+        info!(
+            "AirPlay 2: starting HomePod realtime session to {} ({} member(s), {} ms, {})",
+            label,
+            members.len(),
+            cfg.homepod_latency_ms,
+            codec.label()
+        );
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let mut stop_guard = StopOnDrop(Some(stop_flag.clone()));
+        let dead = Arc::new(AtomicBool::new(false));
+        let faults = FaultSlot::new(dead.clone(), label.clone());
+        let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
+
+        struct Pending {
+            renderer: AirPlayRenderer,
+            rtsp: Ap2Rtsp,
+            audio_key: [u8; 32],
+            event_ciphers: Option<(ChannelCipher, ChannelCipher)>,
+            audio_socket: Option<UdpSocket>,
+            control_socket: Option<UdpSocket>,
+        }
+
+        // 1. Connect + pair, leader first.
+        let mut pending: Vec<Pending> = Vec::with_capacity(members.len());
+        for r in &members {
+            let audio_socket = bind_udp(cfg.local_ip).context("bind AP2 audio UDP")?;
+            let control_socket = bind_udp(cfg.local_ip).context("bind AP2 control UDP")?;
+            let port = r.airplay_port.unwrap_or(DEFAULT_AIRPLAY_PORT);
+            let mut rtsp = Ap2Rtsp::connect(r.ip, port, cfg.local_ip, Duration::from_secs(3))
+                .with_context(|| format!("AirPlay 2 RTSP connect to {}", r.friendly_name))?;
+            rtsp.set_strict(true);
+            if let Err(e) = rtsp.get_info() {
+                warn!("AirPlay 2 GET /info to {} failed (continuing): {:#}", r.friendly_name, e);
+            }
+            // Stored PIN credentials are keyed by the selected entry, so
+            // they only apply to a single receiver.
+            let audio_key = if members.len() == 1 {
+                pair_member(&mut rtsp, cfg.pairing_creds.clone(), &r.friendly_name)?
+            } else {
+                // A PIN ceremony pairs one receiver under the selected
+                // entry's id, so it can't serve a pair: report it plainly
+                // instead of prompting for a PIN that would never be used.
+                match pair_member(&mut rtsp, None, &r.friendly_name) {
+                    Ok(k) => k,
+                    Err(Ap2StartError::NeedsPin | Ap2StartError::VerifyRejected(_)) => {
+                        return Err(anyhow::anyhow!(
+                            "{}: this stereo-pair member requires PIN pairing, which pairs don't support",
+                            r.friendly_name
+                        )
+                        .into())
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            info!("AirPlay 2: paired with {}", r.friendly_name);
+            let event_ciphers = rtsp.take_event_ciphers();
+            pending.push(Pending {
+                renderer: r.clone(),
+                rtsp,
+                audio_key,
+                event_ciphers,
+                audio_socket: Some(audio_socket),
+                control_socket: Some(control_socket),
+            });
+        }
+
+        // 2. One grandmaster for every member.
+        let member_ips: Vec<IpAddr> = members.iter().map(|r| r.ip).collect();
+        let mut ptp_guard = PtpGuard(Some(
+            spawn_ptp_master(&member_ips, cfg.local_ip, label.clone(), true).context("starting AP2 PTP master")?,
+        ));
+        let ptp = ptp_guard.0.as_ref().expect("just set");
+
+        // 3. Session SETUP + event channel.
+        let mut extra_handles = Vec::new();
+        for p in &mut pending {
+            let ts = p
+                .rtsp
+                .setup_timing_ptp_homepod(ptp.timeline.clock_id, &ptp.clock_uuid, crate::PRODUCT_NAME)
+                .with_context(|| format!("AP2 SETUP(session) to {}", p.renderer.friendly_name))?;
+            if ts.event_port == 0 {
+                return Err(anyhow::anyhow!("{}: SETUP response has no eventPort", p.renderer.friendly_name).into());
+            }
+            if let Some(h) = spawn_event_channel(
+                p.renderer.ip,
+                ts.event_port,
+                p.event_ciphers.take(),
+                stop_flag.clone(),
+                faults.clone(),
+                true,
+                p.renderer.friendly_name.clone(),
+            ) {
+                extra_handles.push(h);
+            }
+        }
+
+        // 4. Every member gets the same peer list: all members, then us.
+        let mut peers = member_ips.clone();
+        peers.push(cfg.local_ip);
+        for p in &mut pending {
+            if let Err(e) = p.rtsp.set_peers(&peers) {
+                warn!("AirPlay 2 SETPEERS to {} failed (PTP may not lock): {:#}", p.renderer.friendly_name, e);
+            }
+        }
+
+        // 5. Stream SETUP: shared initial timestamp, per-member seq/SSRC.
+        let initial_rtptime = random_initial_rtptime();
+        let mut links: Vec<MemberLink> = Vec::with_capacity(pending.len());
+        for p in &mut pending {
+            let control_socket = p.control_socket.take().expect("bound above");
+            let audio_socket = p.audio_socket.take().expect("bound above");
+            let control_port = control_socket.local_addr().context("AP2 control socket addr")?.port();
+            let ssrc = random_ssrc();
+            let first_seq = random_initial_seq();
+            let (ports, reported) = p
+                .rtsp
+                .setup_stream_pinned(&p.audio_key, control_port, codec, latency_samples, ssrc)
+                .with_context(|| format!("AP2 SETUP(stream) to {}", p.renderer.friendly_name))?;
+            let effective = match reported {
+                Some(v) => {
+                    info!("AirPlay 2 {}: receiver latency {} samples (reported)", p.renderer.friendly_name, v);
+                    v
+                }
+                None => {
+                    info!(
+                        "AirPlay 2 {}: receiver latency {} samples (estimated — not reported)",
+                        p.renderer.friendly_name, latency_samples
+                    );
+                    latency_samples
+                }
+            };
+            control_socket
+                .set_nonblocking(true)
+                .context("AP2 control socket non-blocking")?;
+            links.push(MemberLink {
+                name: p.renderer.friendly_name.clone(),
+                audio_socket,
+                data_addr: SocketAddr::new(p.renderer.ip, ports.data),
+                control_socket,
+                control_addr: SocketAddr::new(p.renderer.ip, ports.control),
+                sealer: AudioSealer::new(&p.audio_key, first_seq),
+                seq: first_seq,
+                ssrc,
+                latency_samples: effective,
+                retransmit: Retransmitter::new(p.renderer.ip, resend_stats.clone(), p.renderer.friendly_name.clone()),
+                health: SendHealth::new(Instant::now()),
+                packets: 0,
+            });
+        }
+
+        // 6. RECORD + FLUSH naming each member's first packet.
+        for (p, l) in pending.iter_mut().zip(&links) {
+            p.rtsp
+                .record_and_flush_at(l.seq, initial_rtptime)
+                .with_context(|| format!("AP2 RECORD to {}", p.renderer.friendly_name))?;
+        }
+
+        // Initial volume to every member, leader first.
+        let volume = Arc::new(Mutex::new(VolumeTracker::default()));
+        if let Some(vol) = cfg.initial_volume {
+            let seq = volume.lock().unwrap().on_write(vol, Instant::now());
+            for p in &mut pending {
+                if let Err(e) = p.rtsp.set_volume(volume_pct_to_raop_db(vol)) {
+                    warn!("AirPlay 2 initial volume to {} failed: {}", p.renderer.friendly_name, e);
+                    volume.lock().unwrap().on_write_failed(seq);
+                }
+            }
+        }
+
+        // 7. Media, keepalives, read-back.
+        let group = RealtimeGroup::new(links, initial_rtptime, ptp.timeline.clock.clone(), ptp.timeline.clock_id);
+        let sender = crate::airplay::ap2_realtime::spawn(RealtimeRun {
+            group,
+            codec,
+            samples_rx: cfg.samples_rx,
+            stop_flag: stop_flag.clone(),
+            faults: faults.clone(),
+            name: label.clone(),
+        })
+        .context("spawning AP2 realtime sender")?;
+
+        let mut conns = pending
+            .into_iter()
+            .map(|p| (p.renderer.friendly_name, Arc::new(Mutex::new(p.rtsp))));
+        let (leader_name, rtsp) = conns.next().expect("at least one member");
+        let followers: Vec<(String, Arc<Mutex<Ap2Rtsp>>)> = conns.collect();
+        let feedback_handle = spawn_feedback_keepalive(rtsp.clone(), stop_flag.clone(), faults.clone(), true, leader_name.clone());
+        for (name, conn) in &followers {
+            extra_handles.extend(spawn_feedback_keepalive(conn.clone(), stop_flag.clone(), faults.clone(), true, name.clone()));
+        }
+        let volume_handle = spawn_volume_reader(rtsp.clone(), volume.clone(), stop_flag.clone(), leader_name);
+
+        info!("AirPlay 2: HomePod realtime session up — {}", label);
+        stop_guard.0 = None;
+        let ptp = ptp_guard.0.take().expect("set at bring-up");
+        Ok(Self {
+            renderer: cfg.renderer,
+            rtsp,
+            volume_pct: AtomicU32::new(cfg.initial_volume.unwrap_or(100)),
+            stop_flag,
+            dead,
+            faults,
+            volume,
+            resend_stats,
+            sender_handle: Some(sender),
+            timing_handle: None,
+            sync_handle: None,
+            resend_handle: None,
+            event_handle: None,
+            feedback_handle,
+            volume_handle,
+            ptp_session: Some(ptp),
+            buffered_flush: None,
+            data_stream: None,
+            _audio_socket: None,
+            followers: followers.into_iter().map(|(_, c)| c).collect(),
+            extra_handles,
         })
     }
 
@@ -554,19 +852,48 @@ impl AirPlay2Session {
         self.dead.load(Ordering::Acquire)
     }
 
+    /// The fault that ended the session, if one was raised. A
+    /// non-retryable fault means reconnecting won't help.
+    pub fn fault(&self) -> Option<Ap2Fault> {
+        self.faults.get()
+    }
+
     /// `(resend requests, packets re-sent)` so far this session.
     pub fn resend_stats(&self) -> (u64, u64) {
         self.resend_stats.snapshot()
     }
 
+    /// The receiver's own volume as last read back, with its sync state.
+    pub fn device_volume(&self) -> DeviceVolume {
+        self.volume.lock().unwrap().state(Instant::now())
+    }
+
     pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
         self.volume_pct.store(vol.min(100), Ordering::Relaxed);
-        self.rtsp.lock().unwrap().set_volume(volume_pct_to_raop_db(vol))
+        let seq = self.volume.lock().unwrap().on_write(vol, Instant::now());
+        let res = self.set_volume_db_all(volume_pct_to_raop_db(vol));
+        if res.is_err() {
+            self.volume.lock().unwrap().on_write_failed(seq);
+        }
+        res
     }
 
     pub fn set_mute(&self, muted: bool) -> Result<()> {
         let db = mute_db(muted, self.volume_pct.load(Ordering::Relaxed));
-        self.rtsp.lock().unwrap().set_volume(db)
+        self.set_volume_db_all(db)
+    }
+
+    /// Write the volume to every member, leader first. Every member is
+    /// tried; the first failure is returned.
+    fn set_volume_db_all(&self, db: f32) -> Result<()> {
+        let mut result = self.rtsp.lock().unwrap().set_volume(db);
+        for f in &self.followers {
+            let r = f.lock().unwrap().set_volume(db);
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        result
     }
 
     pub fn stop(mut self) {
@@ -585,11 +912,16 @@ impl AirPlay2Session {
             self.resend_handle.take(),
             self.event_handle.take(),
             self.feedback_handle.take(),
+            self.volume_handle.take(),
         ]
         .into_iter()
         .flatten()
+        .chain(self.extra_handles.drain(..))
         {
             let _ = h.join();
+        }
+        for f in &self.followers {
+            f.lock().unwrap().teardown();
         }
         if let Some(ptp) = self.ptp_session.take() {
             ptp.stop();
@@ -614,118 +946,257 @@ impl Drop for AirPlay2Session {
     }
 }
 
-/// Open the AirPlay 2 event channel — a TCP connection to the receiver's
-/// `eventPort` (from the first SETUP response). The receiver withholds its
-/// RECORD response until this connection exists. We don't act on the events
-/// it may send; a drain thread just keeps the socket open and discards
-/// anything received until shutdown. Best-effort: a missing/unreachable
-/// port logs and returns None rather than failing the session.
-fn spawn_event_channel(
-    receiver_ip: IpAddr,
-    event_port: u16,
-    stop_flag: Arc<AtomicBool>,
-    receiver_name: String,
-) -> Option<JoinHandle<()>> {
-    if event_port == 0 {
-        debug!("AirPlay 2: no eventPort advertised; skipping event channel");
-        return None;
-    }
-    let addr = SocketAddr::new(receiver_ip, event_port);
-    let stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("AirPlay 2: event channel connect to {} failed: {}", addr, e);
-            return None;
-        }
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    debug!("AirPlay 2: event channel open to {}", addr);
+/// Sets the stop flag when dropped (unless cleared), so the threads of a
+/// bring-up that fails partway exit instead of lingering.
+struct StopOnDrop(Option<Arc<AtomicBool>>);
 
-    std::thread::Builder::new()
-        .name(format!("stream-to-speaker-ap2-event:{}", receiver_name))
-        .spawn(move || {
-            use std::io::Read;
-            let mut stream = stream;
-            let mut buf = [0u8; 2048];
-            let mut chunks: u64 = 0;
-            while !stop_flag.load(Ordering::Acquire) {
-                match stream.read(&mut buf) {
-                    Ok(0) => break, // receiver closed the channel
-                    Ok(n) => {
-                        // Diagnostic: receivers can send requests on this
-                        // channel; if one gates playback, discarding it
-                        // silently would look exactly like our silence bug.
-                        chunks += 1;
-                        let preview_len = n.min(64);
-                        let hex: String =
-                            buf[..preview_len].iter().map(|b| format!("{:02x}", b)).collect();
-                        let text: String = buf[..preview_len]
-                            .iter()
-                            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
-                            .collect();
-                        if chunks <= 3 {
-                            info!(
-                                "AirPlay 2 event channel: received {} bytes (hex {} | text {:?})",
-                                n, hex, text
-                            );
-                        } else {
-                            debug!("AirPlay 2 event channel: {} bytes", n);
-                        }
-                    }
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(_) => break,
-                }
-            }
-            debug!("AirPlay 2 event channel closed ({} chunks received)", chunks);
-        })
-        .ok()
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(f) = &self.0 {
+            f.store(true, Ordering::Release);
+        }
+    }
 }
 
-/// POST /feedback every ~2 s until the session stops. Failures downgrade
-/// to debug after the first warn — a dropped keepalive shouldn't spam.
+/// Stops and joins the PTP master when dropped (unless taken), so a
+/// failed bring-up releases ports 319/320 before a retry binds them.
+struct PtpGuard(Option<PtpMaster>);
+
+impl Drop for PtpGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            p.stop();
+        }
+    }
+}
+
+/// The realtime codec every member accepts: PCM when all allow it, else
+/// ALAC when all allow that.
+fn common_codec(members: &[AirPlayRenderer]) -> Option<RealtimeCodec> {
+    let picks: Vec<Option<RealtimeCodec>> = members.iter().map(|m| RealtimeCodec::from_cn(&m.codecs)).collect();
+    if picks.iter().all(|p| *p == Some(RealtimeCodec::Pcm)) {
+        Some(RealtimeCodec::Pcm)
+    } else if members.iter().all(|m| m.codecs.is_empty() || m.codecs.contains(&1)) {
+        Some(RealtimeCodec::Alac)
+    } else {
+        None
+    }
+}
+
+/// Pair one receiver on its RTSP connection: `pair-verify` with stored
+/// credentials when there are some, transient pairing otherwise. Returns
+/// the 32-byte audio key.
+fn pair_member(
+    rtsp: &mut Ap2Rtsp,
+    creds: Option<PairingCredentials>,
+    name: &str,
+) -> std::result::Result<[u8; 32], Ap2StartError> {
+    // Pairing: a PIN-paired receiver (Apple TV with access control)
+    // gets pair-verify from the stored long-term keys; everything else
+    // gets transient pairing. A transient 470 means the receiver *needs*
+    // PIN pairing but we have no stored keys — surface NeedsPin so the
+    // app can run the one-time PIN ceremony. A pair-verify REJECTION
+    // (response received, credentials refused) surfaces as
+    // VerifyRejected so the app clears the stale keys; a mere transport
+    // failure stays a generic error and the keys survive.
+    let key = if let Some(creds) = creds {
+        info!("AirPlay 2: verifying stored pairing with {}", name);
+        match rtsp.pair_verify(&creds) {
+            Ok(key) => key,
+            Err(crate::airplay::ap2_rtsp::PairVerifyError::Rejected(e)) => {
+                warn!(
+                    "AirPlay 2: {} rejected the stored pairing ({:#}) — it will be \
+                     cleared for re-pairing",
+                    name, e
+                );
+                return Err(Ap2StartError::VerifyRejected(e));
+            }
+            Err(crate::airplay::ap2_rtsp::PairVerifyError::Transport(e)) => {
+                return Err(Ap2StartError::Other(
+                    e.context("AirPlay 2 HomeKit pair-verify (transport)"),
+                ));
+            }
+        }
+    } else {
+        match rtsp
+            .pair_setup_transient()
+            .context("AirPlay 2 HomeKit transient pairing")?
+        {
+            TransientOutcome::Paired(key) => key,
+            TransientOutcome::NeedsPin => {
+                info!(
+                    "AirPlay 2: {} refused transient pairing (470) — needs one-time PIN \
+                     verification",
+                    name
+                );
+                return Err(Ap2StartError::NeedsPin);
+            }
+        }
+    };
+    Ok(key)
+}
+
+/// `/feedback` keepalive every [`FEEDBACK_INTERVAL`]; policy lives in
+/// [`FeedbackMonitor`].
+///
+/// HomePods (`strict`): one request in flight at a time, polled without
+/// holding the shared connection while the receiver is slow — only ever
+/// taken with `try_lock` for a few ms, so a volume change (whose caller
+/// may hold the app's session lock) never waits behind it. Other
+/// receivers: a plain synchronous request per interval.
 fn spawn_feedback_keepalive(
     rtsp: Arc<Mutex<Ap2Rtsp>>,
     stop_flag: Arc<AtomicBool>,
-    dead: Arc<AtomicBool>,
+    faults: FaultSlot,
+    strict: bool,
     receiver_name: String,
 ) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name(format!("stream-to-speaker-ap2-feedback:{}", receiver_name))
         .spawn(move || {
-            let mut warned = false;
-            let mut consecutive_failures = 0u32;
-            'outer: loop {
-                // Sleep in slices so shutdown isn't delayed.
-                let slices = (FEEDBACK_INTERVAL.as_millis() / 100) as u32;
-                for _ in 0..slices {
-                    if stop_flag.load(Ordering::Acquire) {
-                        break 'outer;
+            let mut monitor = FeedbackMonitor::new(strict);
+            if !strict {
+                // Other receivers: one synchronous request every interval,
+                // as always; three failures in a row drop the session.
+                while crate::airplay::timing::sleep_unless_stopped(&stop_flag, FEEDBACK_INTERVAL) {
+                    let result = rtsp.lock().unwrap().feedback_status();
+                    let action = match result {
+                        Ok(status) => monitor.on_status(status, Instant::now()),
+                        Err(e) => monitor.on_error(format!("{e:#}")),
+                    };
+                    if monitor.failures == 1 && action == FeedbackAction::None {
+                        warn!("AirPlay 2 /feedback failed (continuing)");
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    if let FeedbackAction::Fault(f) = action {
+                        if !stop_flag.load(Ordering::Acquire) {
+                            faults.raise(f);
+                        }
+                        break;
+                    }
                 }
-                if let Err(e) = rtsp.lock().unwrap().feedback() {
-                    if !warned {
-                        warn!("AirPlay 2 /feedback failed (continuing): {:#}", e);
-                        warned = true;
-                    } else {
-                        debug!("AirPlay 2 /feedback failed: {:#}", e);
-                    }
-                    consecutive_failures += 1;
-                    // Sustained /feedback failure = the encrypted control
-                    // channel is gone; flag the session dead for the app
-                    // watchdog.
-                    if consecutive_failures >= 3 {
-                        dead.store(true, Ordering::Release);
-                    }
+                debug!("AirPlay 2 feedback keepalive exiting ({} failures)", monitor.failures);
+                return;
+            }
+            let mut cseq = 0u32;
+            let mut next_due = Instant::now() + FEEDBACK_INTERVAL;
+            while !stop_flag.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(100));
+                let now = Instant::now();
+                if !monitor.outstanding() && now < next_due {
+                    continue;
+                }
+                let Ok(mut guard) = rtsp.try_lock() else { continue };
+                let polled = if monitor.outstanding() {
+                    guard.poll_status(cseq, Duration::from_millis(20))
                 } else {
-                    consecutive_failures = 0;
+                    next_due = now + FEEDBACK_INTERVAL;
+                    match guard.send_feedback() {
+                        Ok(c) => {
+                            cseq = c;
+                            monitor.on_sent(now);
+                            // Most replies take a few ms; catch them now.
+                            guard.poll_status(cseq, Duration::from_millis(50))
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+                drop(guard);
+                let action = match polled {
+                    Ok(Some(status)) => monitor.on_status(status, Instant::now()),
+                    Ok(None) => monitor.on_tick(Instant::now()),
+                    Err(e) => monitor.on_error(format!("control connection: {e:#}")),
+                };
+                match action {
+                    FeedbackAction::None => {}
+                    FeedbackAction::Delayed => log_notice(&receiver_name, "feedback delayed", false),
+                    FeedbackAction::Recovered => log_notice(&receiver_name, "feedback", true),
+                    FeedbackAction::Fault(f) => {
+                        if !stop_flag.load(Ordering::Acquire) {
+                            faults.raise(f);
+                        }
+                        break;
+                    }
                 }
             }
-            debug!("AirPlay 2 feedback keepalive exiting");
+            debug!(
+                "AirPlay 2 feedback keepalive exiting ({} failures, last rtt {:?})",
+                monitor.failures, monitor.last_rtt
+            );
         })
         .ok()
+}
+
+/// Read the receiver's volume back (`GET /info` → `initialVolume`) every
+/// second. The request is sent and its reply polled in short `try_lock`
+/// slices, so the connection is never held for long and a busy one just
+/// skips a round. Stops for good if the receiver doesn't report a volume.
+fn spawn_volume_reader(
+    rtsp: Arc<Mutex<Ap2Rtsp>>,
+    volume: Arc<Mutex<VolumeTracker>>,
+    stop_flag: Arc<AtomicBool>,
+    receiver_name: String,
+) -> Option<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("stream-to-speaker-ap2-volume:{}", receiver_name))
+        .spawn(move || {
+            let mut last_logged: Option<DeviceVolume> = None;
+            while crate::airplay::timing::sleep_unless_stopped(&stop_flag, VOLUME_POLL_INTERVAL) {
+                let Some(read) = read_volume_once(&rtsp, &stop_flag) else { continue };
+                let mut tracker = volume.lock().unwrap();
+                let keep_polling = match read {
+                    Ok(InfoVolume::Db(db)) => {
+                        tracker.on_read(Some(raop_db_to_volume_pct(db)));
+                        true
+                    }
+                    Ok(InfoVolume::Missing | InfoVolume::Refused(_)) => {
+                        tracker.on_read(None);
+                        false
+                    }
+                    // Transport trouble is the keepalive's call; keep trying.
+                    Err(e) => {
+                        debug!("AirPlay 2 {}: volume read-back failed: {:#}", receiver_name, e);
+                        tracker.on_read(None);
+                        true
+                    }
+                };
+                let state = tracker.state(Instant::now());
+                drop(tracker);
+                if last_logged != Some(state) {
+                    debug!("AirPlay 2 {}: device volume {:?}", receiver_name, state);
+                    last_logged = Some(state);
+                }
+                if !keep_polling {
+                    info!(
+                        "AirPlay 2 {}: receiver does not report its volume; read-back stopped",
+                        receiver_name
+                    );
+                    break;
+                }
+            }
+        })
+        .ok()
+}
+
+/// One read-back round. `None` = skipped (connection busy, reply lost or
+/// slower than [`VOLUME_POLL_TIMEOUT`], or stopping).
+fn read_volume_once(rtsp: &Arc<Mutex<Ap2Rtsp>>, stop_flag: &AtomicBool) -> Option<Result<InfoVolume>> {
+    let cseq = match rtsp.try_lock().ok()?.send_info() {
+        Ok(c) => c,
+        Err(e) => return Some(Err(e)),
+    };
+    let deadline = Instant::now() + VOLUME_POLL_TIMEOUT;
+    while Instant::now() < deadline && !stop_flag.load(Ordering::Acquire) {
+        if let Ok(mut guard) = rtsp.try_lock() {
+            match guard.poll_info_volume(cseq, Duration::from_millis(20)) {
+                Ok(InfoPoll::Done(v)) => return Some(Ok(v)),
+                Ok(InfoPoll::Lost) => return None,
+                Ok(InfoPoll::Pending) => {}
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -777,7 +1248,7 @@ struct BufferedSenderConfig {
     timeline: PtpTimeline,
     /// Negotiated payload codec (must match the SETUP's ct/spf).
     codec: BufferedCodecKind,
-    session_dead: Arc<AtomicBool>,
+    faults: FaultSlot,
 }
 
 /// Send SETRATEANCHORTIME for the buffered stream: "rtpTime plays at
@@ -787,14 +1258,16 @@ struct BufferedSenderConfig {
 /// for receivers that follow the sender instead. Anchors are rounded up
 /// to a whole second so networkTimeFrac is 0.
 fn try_anchor_buffered(rtsp: &Arc<Mutex<Ap2Rtsp>>, timeline: &PtpTimeline, rtp_time: u32) -> Result<u64> {
+    // Take the connection first: another request (volume, read-back) may
+    // hold it for a while, and an anchor computed before that wait could
+    // already be in the past when it is sent.
+    let mut conn = rtsp.lock().unwrap();
     let (timeline_id, base_ns) = match timeline.receiver_now_ns() {
         Some((id, now)) => (id, now),
         None => (timeline.clock_id, timeline.our_now_ns()),
     };
     let anchor_ns = (base_ns + ANCHOR_LEAD_NS).div_ceil(1_000_000_000) * 1_000_000_000;
-    rtsp.lock()
-        .unwrap()
-        .set_rate_anchor_time(1, rtp_time, anchor_ns, timeline_id)?;
+    conn.set_rate_anchor_time(1, rtp_time, anchor_ns, timeline_id)?;
     Ok(timeline_id)
 }
 
@@ -823,6 +1296,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
         cfg.initial_rtptime
     );
     let spf = cfg.codec.spf();
+    let mut sealer = AudioSealer::new(&cfg.audio_key, cfg.initial_seq);
     let mut seq = cfg.initial_seq;
     let mut rtptime = cfg.initial_rtptime;
     let mut packet_count: u64 = 0;
@@ -950,7 +1424,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
 
             for payload in payloads {
                 let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
-                let sealed = seal_audio(&cfg.audio_key, &header, seq, &payload);
+                let sealed = sealer.seal(&header, &payload);
                 let mut packet = Vec::with_capacity(12 + sealed.len());
                 packet.extend_from_slice(&header);
                 packet.extend_from_slice(&sealed);
@@ -966,8 +1440,14 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
                 }
 
                 if let Err(e) = cfg.stream.write_all(&framed) {
-                    warn!("AirPlay 2 buffered send failed (receiver stopped reading?): {}", e);
-                    cfg.session_dead.store(true, Ordering::Release);
+                    if !cfg.stop_flag.load(Ordering::Acquire) {
+                        cfg.faults.raise(Ap2Fault::new(
+                            "media_write_failed",
+                            FaultChannel::Media,
+                            true,
+                            format!("buffered send failed (receiver stopped reading?): {e}"),
+                        ));
+                    }
                     return;
                 }
                 if packet_count == 0 {
@@ -1015,8 +1495,20 @@ struct Ap2SenderConfig {
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
     current_rtptime: Arc<AtomicU32>,
-    resend: Arc<ResendBuffer>,
-    session_dead: Arc<AtomicBool>,
+    recovery: RealtimeRecovery,
+    faults: FaultSlot,
+}
+
+/// How the realtime sender handles retransmission and send errors.
+enum RealtimeRecovery {
+    /// Packets go into the ring a separate responder thread serves, and a
+    /// failed send ends the session.
+    Classic { resend: Arc<ResendBuffer> },
+    /// HomePods: resend requests are read (1 ms read timeout) and answered
+    /// from the media loop after each slot's new audio, only until the
+    /// packet's playout deadline (slot + `latency`); send errors are
+    /// tolerated for the grace period.
+    Deadline { control_socket: UdpSocket, retransmit: Retransmitter, latency: Duration },
 }
 
 fn spawn_ap2_sender(cfg: Ap2SenderConfig) -> Result<JoinHandle<()>> {
@@ -1024,11 +1516,15 @@ fn spawn_ap2_sender(cfg: Ap2SenderConfig) -> Result<JoinHandle<()>> {
     Ok(std::thread::Builder::new().name(name).spawn(move || run_ap2_sender(cfg))?)
 }
 
-fn run_ap2_sender(cfg: Ap2SenderConfig) {
+fn run_ap2_sender(mut cfg: Ap2SenderConfig) {
     info!(
         "AirPlay 2 RTP sender → {} (seq={}, rtptime={})",
         cfg.receiver_addr, cfg.initial_seq, cfg.initial_rtptime
     );
+    // One nonce per packet actually sent, counting on from the first seq;
+    // resends replay the recorded on-wire bytes and never consume one.
+    let mut sealer = AudioSealer::new(&cfg.audio_key, cfg.initial_seq);
+    let mut send_health = SendHealth::new(Instant::now());
     let mut seq = cfg.initial_seq;
     let mut rtptime = cfg.initial_rtptime;
     let mut packet_count: u64 = 0;
@@ -1145,7 +1641,7 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
         };
         let alac = build_uncompressed_alac_frame(&pkt_samples);
         let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
-        let sealed = seal_audio(&cfg.audio_key, &header, seq, &alac);
+        let sealed = sealer.seal(&header, &alac);
         let mut packet = Vec::with_capacity(12 + sealed.len());
         packet.extend_from_slice(&header);
         packet.extend_from_slice(&sealed);
@@ -1155,12 +1651,46 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
             std::thread::sleep(deadline - now);
         }
 
-        if let Err(e) = cfg.audio_socket.send_to(&packet, cfg.receiver_addr) {
-            warn!("AirPlay 2 RTP send failed: {}", e);
-            cfg.session_dead.store(true, Ordering::Release);
-            return;
+        if let RealtimeRecovery::Classic { resend } = &cfg.recovery {
+            if let Err(e) = cfg.audio_socket.send_to(&packet, cfg.receiver_addr) {
+                cfg.faults.raise(Ap2Fault::new(
+                    "media_send_failed",
+                    FaultChannel::Media,
+                    true,
+                    format!("AirPlay 2 RTP send failed: {e}"),
+                ));
+                return;
+            }
+            resend.record(seq, &packet);
         }
-        cfg.resend.record(seq, &packet);
+        // HomePods: a failed send is media loss, not a dead session — Wi-Fi
+        // roams and adapter resets fail a few sends and recover. Only a
+        // sustained run without one successful send ends the session.
+        let action = match &cfg.recovery {
+            RealtimeRecovery::Classic { .. } => SendAction::None,
+            RealtimeRecovery::Deadline { .. } => match cfg.audio_socket.send_to(&packet, cfg.receiver_addr) {
+                Ok(_) => send_health.on_ok(Instant::now()),
+                Err(e) => {
+                    debug!("AirPlay 2 RTP send failed: {}", e);
+                    send_health.on_err(Instant::now())
+                }
+            },
+        };
+        match action {
+            SendAction::None => {}
+            SendAction::Delayed => log_notice(&cfg.receiver_name, "audio send failing", false),
+            SendAction::Recovered => log_notice(&cfg.receiver_name, "audio send", true),
+            SendAction::Fault(f) => {
+                cfg.faults.raise(f);
+                return;
+            }
+        }
+        if let RealtimeRecovery::Deadline { control_socket, retransmit, latency } = &mut cfg.recovery {
+            // Recorded either way: the receiver may ask for it once the
+            // path is back, and the retransmission must carry these bytes.
+            retransmit.history.record(seq, packet.clone().into(), deadline, *latency);
+            retransmit.service(control_socket, Instant::now());
+        }
         if packet_count == 0 {
             info!(
                 "AirPlay 2: stream open — first packet ({} bytes) sent to {}",
@@ -1175,8 +1705,8 @@ fn run_ap2_sender(cfg: Ap2SenderConfig) {
         packet_count += 1;
     }
     info!(
-        "AirPlay 2 RTP sender stopped after {} packets ({} silence-filled)",
-        packet_count, silence_packets
+        "AirPlay 2 RTP sender stopped after {} packets ({} silence-filled, {} send errors)",
+        packet_count, silence_packets, send_health.errors
     );
 }
 
@@ -1214,6 +1744,57 @@ mod tests {
         // Receiver reads 2-byte BE length, then len-2 more bytes.
         assert_eq!(u16::from_be_bytes([framed[0], framed[1]]), 12);
         assert_eq!(&framed[2..], &pkt);
+    }
+
+    #[test]
+    fn resend_across_seq_wrap_replays_original_nonce() {
+        // Packets recorded across a 16-bit seq wrap are fetched back
+        // byte-for-byte: a retransmission carries the nonce the packet was
+        // first sealed with and never consumes a fresh one.
+        use crate::airplay::ap2_resend::{History, Lookup};
+        let mut sealer = AudioSealer::new(&[5u8; 32], 65_530);
+        let mut history = History::new(512);
+        let slot = Instant::now();
+        let mut originals = Vec::new();
+        let mut seq: u16 = 65_530;
+        for i in 0..12u32 {
+            let header = ap2_rtp_header(seq, 0xFFFF_F000u32.wrapping_add(i * 352), 0xABCD, i == 0);
+            let mut packet = header.to_vec();
+            packet.extend_from_slice(&sealer.seal(&header, &[i as u8; 16]));
+            history.record(seq, packet.clone().into(), slot, Duration::from_secs(2));
+            originals.push((seq, packet));
+            seq = seq.wrapping_add(1);
+        }
+        let after = sealer.next_counter();
+        for (i, (seq, packet)) in originals.iter().enumerate() {
+            let Lookup::Hit(got) = history.lookup(*seq, slot) else { panic!("seq {seq} not resendable") };
+            assert_eq!(&got[..], &packet[..]);
+            assert_eq!(&got[got.len() - 8..], &(65_530 + i as u64).to_le_bytes());
+        }
+        assert_eq!(sealer.next_counter(), after);
+    }
+
+    #[test]
+    fn common_codec_needs_every_member() {
+        let with_cn = |cn: Vec<u8>| AirPlayRenderer {
+            friendly_name: "x".into(),
+            mac_id: "AA".into(),
+            ip: "10.0.0.2".parse().unwrap(),
+            port: 7000,
+            airplay_port: Some(7000),
+            encryption_types: vec![0],
+            codecs: cn,
+            password_protected: false,
+            encryption_key_required: false,
+            features: None,
+            pk: None,
+            model: Some("AudioAccessory5,1".into()),
+            group: None,
+            pair: None,
+        };
+        assert_eq!(common_codec(&[with_cn(vec![0, 1, 2, 3]), with_cn(vec![])]), Some(RealtimeCodec::Pcm));
+        assert_eq!(common_codec(&[with_cn(vec![0, 1]), with_cn(vec![1])]), Some(RealtimeCodec::Alac));
+        assert_eq!(common_codec(&[with_cn(vec![0]), with_cn(vec![1])]), None);
     }
 
     #[test]

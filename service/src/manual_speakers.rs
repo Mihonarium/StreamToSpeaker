@@ -385,6 +385,8 @@ pub fn airplay_renderer(
         features: info.and_then(|i| i.features),
         pk: info.and_then(|i| i.pk.clone()),
         model: info.and_then(|i| i.model.clone()),
+        group: None,
+        pair: None,
     }
 }
 

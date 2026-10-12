@@ -104,6 +104,22 @@ pub fn banner_candidate(
     Some(latest)
 }
 
+/// Release pages and downloads of this repository; any other URL the
+/// API hands back is ignored.
+const RELEASE_PAGE_PREFIX: &str = "https://github.com/Mihonarium/StreamToSpeaker/releases/";
+const RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/Mihonarium/StreamToSpeaker/releases/download/";
+
+/// `url` lies under `prefix`, has no `..` segment, and is safe to hand to
+/// the shell (see [`crate::is_openable_url`]).
+fn is_release_url(url: &str, prefix: &str) -> bool {
+    url.strip_prefix(prefix).is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.split('/').all(|seg| seg != "..")
+            && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~/%".contains(&b))
+    }) && crate::is_openable_url(url)
+}
+
 /// Parse the `releases/latest` JSON body.
 pub fn parse_latest_release(json: &str) -> Result<ReleaseInfo> {
     let v: serde_json::Value = serde_json::from_str(json).context("release JSON")?;
@@ -114,7 +130,7 @@ pub fn parse_latest_release(json: &str) -> Result<ReleaseInfo> {
     let version = parse_tag_version(tag)?;
     let url = v["html_url"]
         .as_str()
-        .filter(|u| u.starts_with("https://github.com/"))
+        .filter(|u| is_release_url(u, RELEASE_PAGE_PREFIX))
         .unwrap_or(RELEASES_PAGE)
         .to_string();
     let installer_url = v["assets"].as_array().and_then(|assets| {
@@ -122,6 +138,7 @@ pub fn parse_latest_release(json: &str) -> Result<ReleaseInfo> {
             .iter()
             .find(|a| a["name"].as_str() == Some(INSTALLER_ASSET))
             .and_then(|a| a["browser_download_url"].as_str())
+            .filter(|u| is_release_url(u, RELEASE_DOWNLOAD_PREFIX))
             .map(str::to_string)
     });
     Ok(ReleaseInfo { tag: tag.to_string(), version, url, installer_url })
@@ -328,6 +345,24 @@ mod tests {
             r.installer_url.as_deref(),
             Some("https://github.com/Mihonarium/StreamToSpeaker/releases/download/v0.1.4/StreamToSpeakerSetup.exe")
         );
+    }
+
+    #[test]
+    fn foreign_or_unsafe_urls_are_ignored() {
+        for (html, dl) in [
+            ("https://github.com/x&calc", "https://github.com/Mihonarium/StreamToSpeaker/releases/download/v1/a&calc"),
+            ("https://github.com/Mihonarium/StreamToSpeaker/releases/tag/v1\"&calc", "https://evil.example/StreamToSpeakerSetup.exe"),
+            ("https://github.com/other/repo/releases/tag/v1", "https://github.com/Mihonarium/StreamToSpeaker/releases/download/../../x"),
+        ] {
+            let json = format!(
+                r#"{{"tag_name":"v0.2.0","html_url":{},"assets":[{{"name":"StreamToSpeakerSetup.exe","browser_download_url":{}}}]}}"#,
+                serde_json::to_string(html).unwrap(),
+                serde_json::to_string(dl).unwrap()
+            );
+            let r = parse_latest_release(&json).unwrap();
+            assert_eq!(r.url, RELEASES_PAGE, "{html}");
+            assert_eq!(r.installer_url, None, "{dl}");
+        }
     }
 
     #[test]
