@@ -64,10 +64,11 @@ driver/​** or include/​** change on main
         ▼                                              ▼
 [build.yml, every main push]                 [build.yml, tag v* push]
   extra artifact: installer bundling           sign-service → package →
-  the attested driver (when its                sign-release: release
-  source_hash matches HEAD's driver            installer with attested
-  source — service-only commits keep           driver + EV-signed service
-  matching)                                    exe + EV-signed setup exe
+  the attested driver (when its                verify-driver → sign-release:
+  source_hash matches HEAD's driver            release installer with
+  source — service-only commits keep           attested driver + EV-signed
+  matching)                                    service exe + EV-signed
+                                               setup exe
                                                ← human: 2 approval clicks
 ```
 
@@ -212,8 +213,24 @@ Tag `vX.Y.Z` → `build.yml` runs the release chain:
    to the test-signed driver + cert and names the asset
    `StreamToSpeakerSetup-<ver>-testsigned.exe` with a warning — run Flow A,
    then re-tag, if you wanted a production release.
-4. `sign-release` — EV-signs the setup exe (**approval click 2**) and swaps
-   it into the release. Its regenerated `.sha256` sidecar is canonical.
+4. `verify-driver` — the release gate. Runs `driver-reproducibility.yml`
+   for the `driver-v*` release `package` picked: rebuilds the driver from
+   the tagged commit (its driver source hash must equal the manifest's),
+   compares it with the lab package and the shipped `Signed.zip`, then
+   unpacks the unsigned installer `package` just attached (by exact name
+   and SHA-256) and requires its driver files to be that `Signed.zip`
+   byte for byte, with no test certificate. Read-only token, no secrets.
+   If it fails, nothing is signed. For a `-testsigned` fallback it is
+   skipped (the driver was compiled from the tag in `build`; there is no
+   Microsoft-signed package to compare) and `package` / `sign-release`
+   say so in a warning. Only **certified** driver releases can be
+   verified: an attestation-signed driver (Flow A) has no lab package to
+   pin the rebuild to, so the gate fails and the release is not signed.
+5. `sign-release` — runs only after `verify-driver` passed (or was skipped
+   for the fallback); fetches the setup exe by the name and SHA-256
+   `package` recorded, EV-signs exactly those bytes (**approval click 2**)
+   and swaps it into the release. Its regenerated `.sha256` sidecar is
+   canonical.
 
 Final release assets: signed `StreamToSpeakerSetup-<ver>.exe`, signed
 `stream-to-speaker-<ver>.exe`, and `.sha256` sidecars for each (plus
@@ -224,9 +241,13 @@ bytes travel to the signing repo as Actions artifacts fetched with its
 `FETCH_TOKEN` (works with this repo private — nothing depends on public
 release URLs). Don't announce until `sign-release` is green. If a job dies
 mid-chain, re-run it: every step is idempotent (`--clobber` uploads,
-create-if-missing release). Re-running `package` after `sign-release` has
-finished overwrites the signed setup exe with an unsigned rebuild — re-run
-`sign-release` afterwards.
+create-if-missing release). Re-running `package` re-runs `verify-driver`
+and `sign-release` with it (they depend on it); after `sign-release` has
+finished it overwrites the signed setup exe with an unsigned rebuild, so
+let that chain complete. Once `sign-release` has swapped the signed exe
+into the release, re-running `sign-release` alone fails its SHA-256 check
+(the release no longer holds the bytes `package` built): re-run from
+`package` instead.
 
 ## Flow D — WHQL certification (HLK run by hand, the rest automated)
 
