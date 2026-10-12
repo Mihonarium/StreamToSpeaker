@@ -6,6 +6,7 @@ import struct
 import tempfile
 import unittest
 import zipfile
+import zlib
 
 import repro_compare as rc
 import test_certified
@@ -280,6 +281,19 @@ class BuildPlan(unittest.TestCase):
         # The CAB kept on the release is the EV-signed one.
         self.assertEqual(plan["reference_sha256"], "c9" * 32)
 
+    def test_plan_carries_source_hash_and_a_printable_commit(self):
+        plan = rc.build_plan(dict(ATTESTED_MANIFEST, source_hash="AB" * 32, signed_zip_sha256="C2" * 32), "t")
+        self.assertEqual(plan["source_hash"], "ab" * 32)
+        self.assertEqual(plan["signed_zip"], "StreamToSpeaker-Driver-1.1.0.204-Signed.zip")
+        self.assertEqual(plan["signed_zip_sha256"], "c2" * 32)
+        self.assertEqual(plan["commit"], "cde07512d466b2e09fa278505487be98981ef723")
+        # The commit is only displayed: anything that is not a commit id is
+        # dropped rather than printed.
+        for bad in ("abc\n::error::x", "##[error]x", 5, None, "not-a-commit"):
+            plan = rc.build_plan(dict(ATTESTED_MANIFEST, commit=bad), "t")
+            self.assertTrue(plan["ok"])
+            self.assertEqual(plan["commit"], "")
+
     def test_both_flags_set_fails(self):
         plan = rc.build_plan(dict(CERTIFIED_MANIFEST, attested=True), "t")
         self.assertFalse(plan["ok"])
@@ -473,6 +487,9 @@ class PlanCli(unittest.TestCase):
         out = self.outputs()
         self.assertEqual(out["kind"], "attested")
         self.assertEqual(out["stamp_driver_h"], "true")
+        self.assertEqual(out["source_hash"], "80" * 32)
+        self.assertEqual(out["signed_zip"], "StreamToSpeaker-Driver-1.1.0.204-Signed.zip")
+        self.assertEqual(out["signed_zip_sha256"], "c2" * 32)
         self.assertEqual(out["build_number"], "204")
         self.assertEqual(out["version"], "1.1.0.204")
         self.assertEqual(out["reference_asset"], "StreamToSpeaker-Driver-1.1.0.204-Submission.cab")
@@ -681,6 +698,413 @@ class FilesCompare(unittest.TestCase):
         rep = rc.compare_files(self.a, self.b)
         self.assertFalse(rep["files"]["StreamToSpeaker.cat"]["identical"])
         self.assertFalse(rep["identical"])
+
+
+def make_cab(files, compression=1, reserve=(0, 0, 0), flags_extra=0, block=32768, folder_index=0):
+    """A one-folder cabinet as makecab lays it out. files = [(name, data)];
+    compression 0 = stored, 1 = MSZIP (each block one deflate stream with
+    the previous block as dictionary); reserve = (header, folder, data)
+    reserved-area sizes, as a signed cabinet has."""
+    blob = b"".join(d for _, d in files)
+    blocks, prev = [], b""
+    for off in range(0, len(blob), block):
+        chunk = blob[off:off + block]
+        if compression == 1:
+            c = (zlib.compressobj(9, zlib.DEFLATED, -15, zdict=prev) if prev
+                 else zlib.compressobj(9, zlib.DEFLATED, -15))
+            payload = b"CK" + c.compress(chunk) + c.flush()
+        else:
+            payload = chunk
+        blocks.append((payload, len(chunk)))
+        prev = chunk
+    res_hdr, res_folder, res_data = reserve
+    has_res = any(reserve)
+    flags = (0x0004 if has_res else 0) | flags_extra
+    header_size = 36 + (4 + res_hdr if has_res else 0)
+    cffiles, uoff = b"", 0
+    for name, d in files:
+        cffiles += struct.pack("<IIHHHH", len(d), uoff, folder_index, 0, 0, 0x20) + name.encode("latin-1") + b"\0"
+        uoff += len(d)
+    coff_files = header_size + 8 + res_folder
+    coff_data = coff_files + len(cffiles)
+    cfdata = b"".join(struct.pack("<IHH", 0, len(payload), n) + b"\xAA" * res_data + payload
+                      for payload, n in blocks)
+    header = struct.pack("<4sIIIIIBBHHHHH", b"MSCF", 0, coff_data + len(cfdata), 0, coff_files, 0, 3, 1,
+                         1, len(files), flags, 0x1234, 0)
+    if has_res:
+        header += struct.pack("<HBB", res_hdr, res_folder, res_data) + b"\xBB" * res_hdr
+    folder = struct.pack("<IHH", coff_data, len(blocks), compression) + b"\xCC" * res_folder
+    return header + folder + cffiles + cfdata
+
+
+def varied(n, seed=1):
+    """n bytes that compress, but not to nothing, and differ block to block."""
+    out, x = bytearray(), seed
+    while len(out) < n:
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        out += b"line %d of the driver %d\r\n" % (x % 977, x % 13)
+    return bytes(out[:n])
+
+
+class CleanText(unittest.TestCase):
+    def test_plain_text_is_unchanged(self):
+        for t in ("C:\\src\\driver.pdb", "DriverVer = 08/05/2026,1.1.0.204", "a: b #1 [x] ~`'\"%"):
+            self.assertEqual(rc.clean_text(t), t)
+
+    def test_control_and_separator_characters_are_escaped(self):
+        self.assertEqual(rc.clean_text("a\nb\r\tc\x00\x7f"), "a\\x0ab\\x0d\\x09c\\x00\\x7f")
+        self.assertEqual(rc.clean_text("a\u2028b\u2029c\u202ed\u200be"), "a\\u2028b\\u2029c\\u202ed\\u200be")
+        # Nothing but printable ASCII comes out, whatever the console's
+        # encoding is.
+        self.assertEqual(rc.clean_text("na\u00efve \ufffd \U0001f600"), "na\\xefve \\ufffd \\U0001f600")
+        self.assertTrue(rc.clean_text("".join(map(chr, range(0x250)))).isascii())
+        self.assertNotIn("\n", rc.clean_text("x\n::set-output name=a::b"))
+
+    def test_workflow_command_markers_are_broken_up(self):
+        for t in ("::error::x", " ::set-output name=a::b", ":::", "::::", "a::b",
+                  "##[error]x", "x ##[set-output name=a]b", "###[", "####[x]"):
+            c = rc.clean_text(t)
+            self.assertNotIn("::", c, t)
+            self.assertNotIn("##[", c, t)
+        self.assertEqual(rc.clean_text("::error::x"), ":\\:error:\\:x")
+        self.assertEqual(rc.clean_text("##[error]x"), "#\\#[error]x")
+
+    def test_long_text_is_cut_and_other_types_are_shown(self):
+        self.assertEqual(rc.clean_text("x" * 500), "x" * 400 + "...")
+        self.assertEqual(rc.clean_text(5), "5")
+        self.assertEqual(rc.clean_text(None), "None")
+
+    def test_command_text_escapes_percent(self):
+        self.assertEqual(rc.command_text("50%0A::x"), "50%250A:\\:x")
+
+
+class WorkflowCommandHygiene(unittest.TestCase):
+    """What the scripts print about release files must not be readable by
+    the Actions runner as workflow commands."""
+    EVIL = "C:\\b\\x.pdb\n::set-output name=normalised_identical::true\r\n##[error]boom"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._env = {k: os.environ.get(k) for k in ("GITHUB_ACTIONS", "GITHUB_OUTPUT")}
+        os.environ["GITHUB_ACTIONS"] = "true"
+        os.environ["GITHUB_OUTPUT"] = os.path.join(self.tmp, "gh_output")
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def path(self, name, data):
+        p = os.path.join(self.tmp, name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def run_main(self, argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = rc.main(argv)
+        return code, buf.getvalue().splitlines()
+
+    def assert_quarantined(self, lines):
+        """The report sits between ::stop-commands::<token> and ::<token>::,
+        and nothing in between (or anywhere) could be read as a command."""
+        self.assertRegex(lines[0], r"^::stop-commands::[0-9a-f]{32}$")
+        token = lines[0].split("::")[2]
+        self.assertEqual(lines[-1], f"::{token}::")
+        for line in lines[1:-1]:
+            self.assertFalse(line.lstrip().startswith("::"), line)
+            self.assertNotIn("##[", line)
+            self.assertNotIn(token, line)
+
+    def test_sys_report_with_a_hostile_pdb_path_and_section_name(self):
+        hostile = bytearray(make_pe(pdb_path=self.EVIL.encode("utf-8")))
+        e_lfanew = struct.unpack_from("<I", hostile, 0x3C)[0]
+        hostile[e_lfanew + 24 + 240:e_lfanew + 24 + 248] = b"::er\nror"     # the section's name
+        a = self.path("a.sys", bytes(hostile))
+        rep = rc.compare_sys(a, a)
+        shown = rep["released"]["debug"][0]["pdb_path"]
+        self.assertNotIn("\n", shown)
+        self.assertNotIn("::", shown)
+        self.assertNotIn("##[", shown)
+        self.assertEqual(rep["released"]["sections"][0]["name"], ":\\:er\\x0aror")
+        # ... while the build-root derivation still sees the real bytes.
+        self.assertEqual(rc.reference_pdb_path(a), self.EVIL)
+        code, lines = self.run_main(["sys", a, a, "--json", os.path.join(self.tmp, "r.json")])
+        self.assertEqual(code, 0)
+        self.assert_quarantined(lines)
+        with open(os.path.join(self.tmp, "r.json"), encoding="utf-8") as f:
+            self.assertNotIn("\\n::", f.read())
+
+    def test_inf_report_with_hostile_lines(self):
+        a = self.path("a.inf", b"[Version]\r\nDriverVer = 08/05/2026,1.0.0.1 ##[error]x\r\n::error::y\r\n")
+        b = self.path("b.inf", b"[Version]\r\nDriverVer = 08/06/2026,1.0.0.1\r\nplain\r\n")
+        rep = rc.compare_inf(a, b)
+        self.assertFalse(rep["normalised_identical"])
+        self.assertNotIn("##[", rep["released"]["driverver"])
+        for d in rep["differing_lines"]:
+            self.assertNotIn("::", d["released"])
+            self.assertNotIn("##[", d["released"])
+        code, lines = self.run_main(["inf", a, b])
+        self.assertEqual(code, 1)
+        self.assert_quarantined(lines)
+
+    def test_package_report_with_hostile_member_names(self):
+        z = os.path.join(self.tmp, "p.zip")
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("a\n::error::x/StreamToSpeaker.sys", b"S")
+            zf.writestr("##[error]y/StreamToSpeaker.inf", b"I")
+            zf.writestr("StreamToSpeaker.cat", b"C")
+            zf.writestr("dup\n::warning::z/streamtospeaker.CAT", b"C2")
+        with open(z, "rb") as f:
+            sha = rc.sha256(f.read())
+        code, lines = self.run_main(["package", z, os.path.join(self.tmp, "out"), "--sha256", sha])
+        self.assertEqual(code, 1)                      # the duplicate .cat
+        self.assert_quarantined(lines)
+        self.assertTrue(any("duplicate" in line for line in lines))
+
+    def test_plan_errors_are_single_cleaned_command_lines(self):
+        m = os.path.join(self.tmp, "manifest.json")
+        with open(m, "w", encoding="utf-8") as f:
+            json.dump(dict(ATTESTED_MANIFEST, signed_zip="x.zip\n::set-output name=kind::certified",
+                           submission_cab="##[set-output name=kind]certified"), f)
+        code, lines = self.run_main(["plan", m, "driver-v1.1.0.204"])
+        self.assertEqual(code, 1)
+        for line in lines:
+            if line.startswith("::"):
+                self.assertTrue(line.startswith("::error::the manifest of "), line)
+                self.assertNotIn("::", line[len("::error::"):])
+            self.assertNotIn("##[", line)
+        self.assertEqual(sum(line.startswith("::error::") for line in lines), 2)
+
+    def test_buildroot_shows_a_hostile_pdb_path_cleaned(self):
+        m = os.path.join(self.tmp, "manifest.json")
+        with open(m, "w", encoding="utf-8") as f:
+            json.dump(ATTESTED_MANIFEST, f)
+        plan_json = os.path.join(self.tmp, "plan.json")
+        self.run_main(["plan", m, "driver-v1.1.0.204", "--json", plan_json])
+        ref = self.path("ref.sys", make_pe(pdb_path=self.EVIL.encode("utf-8")))
+        code, lines = self.run_main(["buildroot", plan_json, ref])
+        self.assertEqual(code, 1)
+        commands = [line for line in lines if line.lstrip().startswith("::")]
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(commands[0].startswith("::error::the submitted .sys records the PDB path"))
+        self.assertNotIn("::", commands[0][len("::error::"):])
+        for line in lines:
+            self.assertNotIn("##[", line)
+
+    def test_unparsable_sys_gives_no_verdict(self):
+        good = self.path("good.sys", make_pe())
+        bad = self.path("bad.sys", b"MZ\n::error::not really a PE")
+        code, lines = self.run_main(["sys", bad, good])
+        self.assertEqual(code, 2)
+        self.assert_quarantined(lines)
+        self.assertFalse(os.path.exists(os.environ["GITHUB_OUTPUT"]))
+
+    def test_no_markers_outside_actions(self):
+        os.environ.pop("GITHUB_ACTIONS")
+        a = self.path("a.sys", make_pe())
+        _code, lines = self.run_main(["sys", a, a])
+        self.assertFalse(any("stop-commands" in line for line in lines))
+
+
+class ArchiveExtraction(unittest.TestCase):
+    SYS = make_pe()
+    INF = b"[Version]\r\nDriverVer = 08/05/2026,1.1.0.204\r\n"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.out = os.path.join(self.tmp, "work", "out")      # two levels down: room to escape upwards
+        os.makedirs(os.path.dirname(self.out))
+
+    def write(self, name, data):
+        p = os.path.join(self.tmp, name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def tree(self):
+        return sorted(os.path.relpath(os.path.join(d, f), self.tmp).replace(os.sep, "/")
+                      for d, _dirs, files in os.walk(self.tmp) for f in files)
+
+    def read(self, name):
+        with open(os.path.join(self.out, name), "rb") as f:
+            return f.read()
+
+    # ---- cabinet reader ----
+    def test_cab_stored_and_mszip_round_trip(self):
+        big = varied(100_000)                                  # four MSZIP blocks
+        files = [("StreamToSpeaker\\StreamToSpeaker.cat", b"CAT"), ("StreamToSpeaker\\StreamToSpeaker.inf", self.INF),
+                 ("StreamToSpeaker\\StreamToSpeaker.pdb", big), ("StreamToSpeaker\\StreamToSpeaker.sys", self.SYS)]
+        for compression in (0, 1):
+            for reserve in ((0, 0, 0), (20, 0, 0), (20, 3, 5)):
+                cab = make_cab(files, compression=compression, reserve=reserve)
+                got = {name: read() for name, _size, read in rc.cab_entries(cab)}
+                self.assertEqual(got, dict(files), (compression, reserve))
+        self.assertLess(len(make_cab(files, compression=1)), len(make_cab(files, compression=0)))
+
+    def test_cab_block_needs_the_previous_block_as_dictionary(self):
+        # Two blocks with the same content: the second one compresses to
+        # almost nothing because it refers back into the first.
+        data = varied(32768, seed=7) * 2
+        cab = make_cab([("f.bin", data)], compression=1)
+        (name, size, read), = rc.cab_entries(cab)
+        self.assertEqual((name, size, read()), ("f.bin", len(data), data))
+
+    def test_cab_errors(self):
+        good = make_cab([("StreamToSpeaker.sys", self.SYS)], compression=1)
+        with self.assertRaises(rc.ArchiveError):
+            rc.cab_entries(b"PK\x03\x04 not a cabinet")
+        with self.assertRaises(rc.ArchiveError):
+            rc.cab_entries(good[:30])                          # header cut short
+        with self.assertRaises(rc.ArchiveError):
+            rc.cab_entries(make_cab([("a", b"x")], flags_extra=0x0002))    # continues in another volume
+        for broken in (good[:-10],                                          # data block cut short
+                       make_cab([("a", b"x" * 10)], compression=3),         # LZX
+                       make_cab([("a", b"x" * 10)], folder_index=4),        # no such folder
+                       good.replace(b"CK", b"XX", 1)):
+            entries = rc.cab_entries(broken)
+            with self.assertRaises(rc.ArchiveError):
+                entries[0][2]()
+        # A file whose declared size runs past the folder's data.
+        cab = bytearray(make_cab([("a", b"x" * 10)], compression=0))
+        coff_files = struct.unpack_from("<I", cab, 16)[0]
+        struct.pack_into("<I", cab, coff_files, 5000)
+        with self.assertRaises(rc.ArchiveError):
+            rc.cab_entries(bytes(cab))[0][2]()
+
+    # ---- reference package ----
+    def test_reference_from_a_submission_cab(self):
+        cab = self.write("sub.cab", make_cab([("StreamToSpeaker\\StreamToSpeaker.inf", self.INF),
+                                              ("StreamToSpeaker\\StreamToSpeaker.pdb", varied(70_000)),
+                                              ("StreamToSpeaker\\StreamToSpeaker.sys", self.SYS)], reserve=(20, 0, 0)))
+        with open(cab, "rb") as f:
+            sha = rc.sha256(f.read())
+        rep = rc.extract_reference(cab, "submission_cab", self.out, sha.upper())
+        self.assertTrue(rep["ok"], rep)
+        self.assertEqual(sorted(os.listdir(self.out)), ["StreamToSpeaker.inf", "StreamToSpeaker.sys"])
+        self.assertEqual(self.read("StreamToSpeaker.sys"), self.SYS)
+        self.assertEqual(self.read("StreamToSpeaker.inf"), self.INF)
+        self.assertEqual(rep["files"]["StreamToSpeaker.sys"]["sha256"], rc.sha256(self.SYS))
+
+    def test_reference_cab_needs_the_recorded_hash(self):
+        cab = self.write("sub.cab", make_cab([("StreamToSpeaker.inf", self.INF), ("StreamToSpeaker.sys", self.SYS)]))
+        for expected in (None, "", "00" * 32):
+            rep = rc.extract_reference(cab, "submission_cab", self.out, expected)
+            self.assertFalse(rep["ok"], expected)
+            self.assertTrue(rep["error"])
+            self.assertFalse(os.path.exists(self.out))
+
+    def test_reference_from_a_lab_zip(self):
+        z = self.write("lab.zip", b"")
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("x64/Release/StreamToSpeaker.sys", self.SYS)
+            zf.writestr("x64/Release/streamtospeaker.INF", self.INF)
+            zf.writestr("x64/Release/streamtospeaker.cat", b"CAT")
+        with open(z, "rb") as f:
+            sha = rc.sha256(f.read())
+        self.assertTrue(rc.extract_reference(z, "lab_zip", self.out, sha)["ok"])
+        self.assertEqual(sorted(os.listdir(self.out)), ["StreamToSpeaker.inf", "StreamToSpeaker.sys"])
+        # An older certified manifest records no hash for the lab zip.
+        rep = rc.extract_reference(z, "lab_zip", os.path.join(self.tmp, "work", "out2"), None)
+        self.assertTrue(rep["ok"])
+        self.assertFalse(rep["sha256_ok"])
+        self.assertFalse(rc.extract_reference(z, "lab_zip", os.path.join(self.tmp, "work", "out3"), "11" * 32)["ok"])
+
+    def test_reference_missing_duplicate_and_unreadable(self):
+        cab = self.write("a.cab", make_cab([("StreamToSpeaker.sys", self.SYS)]))
+        with open(cab, "rb") as f:
+            sha = rc.sha256(f.read())
+        rep = rc.extract_reference(cab, "submission_cab", self.out, sha)
+        self.assertEqual((rep["ok"], rep["missing"]), (False, ["StreamToSpeaker.inf"]))
+        cab = self.write("b.cab", make_cab([("StreamToSpeaker.sys", self.SYS), ("StreamToSpeaker.inf", self.INF),
+                                            ("other\\STREAMTOSPEAKER.SYS", b"second")]))
+        with open(cab, "rb") as f:
+            sha = rc.sha256(f.read())
+        rep = rc.extract_reference(cab, "submission_cab", self.out, sha)
+        self.assertEqual((rep["ok"], rep["duplicates"]), (False, ["other\\STREAMTOSPEAKER.SYS"]))
+        junk = self.write("c.cab", b"MSCF" + b"\xff" * 40)
+        with open(junk, "rb") as f:
+            sha = rc.sha256(f.read())
+        rep = rc.extract_reference(junk, "submission_cab", self.out, sha)
+        self.assertFalse(rep["ok"])
+        self.assertIn("could not read the archive", rep["error"])
+        notzip = self.write("d.zip", b"not a zip at all")
+        self.assertFalse(rc.extract_reference(notzip, "lab_zip", self.out, None)["ok"])
+        self.assertFalse(rc.extract_reference(os.path.join(self.tmp, "nope.zip"), "lab_zip", self.out, None)["ok"])
+        self.assertFalse(rc.extract_reference(cab, "something_else", self.out, sha)["ok"])
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_entries_cannot_escape_the_output_directory(self):
+        before = None
+        for label, names in (
+                ("dotdot", ("..\\..\\StreamToSpeaker.sys", "../../StreamToSpeaker.inf")),
+                ("absolute", ("C:\\Windows\\System32\\drivers\\StreamToSpeaker.sys", "/etc/StreamToSpeaker.inf")),
+                ("mixed", ("a/..\\..\\../StreamToSpeaker.sys", "\\\\server\\share\\StreamToSpeaker.inf"))):
+            out = os.path.join(self.tmp, "work", "out-" + label)
+            cab = self.write(label + ".cab", make_cab([(names[0], self.SYS), (names[1], self.INF)]))
+            with open(cab, "rb") as f:
+                sha = rc.sha256(f.read())
+            self.assertTrue(rc.extract_reference(cab, "submission_cab", out, sha)["ok"], label)
+            self.assertEqual(sorted(os.listdir(out)), ["StreamToSpeaker.inf", "StreamToSpeaker.sys"])
+            z = self.write(label + ".zip", b"")
+            with zipfile.ZipFile(z, "w") as zf:
+                zf.writestr(names[0], self.SYS)
+                zf.writestr(names[1], self.INF)
+                zf.writestr("../../StreamToSpeaker.cat", b"CAT")
+            with open(z, "rb") as f:
+                zsha = rc.sha256(f.read())
+            zout = os.path.join(self.tmp, "work", "zout-" + label)
+            self.assertTrue(rc.check_package(z, zsha, zout)["ok"], label)
+            self.assertEqual(sorted(os.listdir(zout)),
+                             ["StreamToSpeaker.cat", "StreamToSpeaker.inf", "StreamToSpeaker.sys"])
+            self.assertTrue(rc.extract_reference(z, "lab_zip", os.path.join(self.tmp, "work", "rout-" + label), zsha)["ok"])
+        # Nothing was written anywhere but the archives themselves and the
+        # output directories under work/.
+        outside = [p for p in self.tree() if not p.startswith("work/") and not p.endswith((".cab", ".zip"))]
+        self.assertEqual(outside, [])
+        self.assertEqual(sorted(os.listdir(os.path.join(self.tmp, "work"))),
+                         sorted(["out-dotdot", "out-absolute", "out-mixed", "zout-dotdot", "zout-absolute",
+                                 "zout-mixed", "rout-dotdot", "rout-absolute", "rout-mixed"]))
+
+    def test_oversized_members_are_refused(self):
+        old = rc.MAX_MEMBER_BYTES
+        rc.MAX_MEMBER_BYTES = 1000
+        try:
+            cab = self.write("big.cab", make_cab([("StreamToSpeaker.sys", varied(5000)),
+                                                  ("StreamToSpeaker.inf", self.INF)]))
+            with open(cab, "rb") as f:
+                sha = rc.sha256(f.read())
+            rep = rc.extract_reference(cab, "submission_cab", self.out, sha)
+            self.assertFalse(rep["ok"])
+            self.assertIn("larger than", rep["error"])
+            z = self.write("big.zip", b"")
+            with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("StreamToSpeaker.sys", b"\0" * 50_000)
+                zf.writestr("StreamToSpeaker.inf", self.INF)
+                zf.writestr("StreamToSpeaker.cat", b"C")
+            with open(z, "rb") as f:
+                zsha = rc.sha256(f.read())
+            rep = rc.check_package(z, zsha, self.out)
+            self.assertFalse(rep["ok"])
+            self.assertIn("larger than", rep["error"])
+        finally:
+            rc.MAX_MEMBER_BYTES = old
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_reference_cli(self):
+        cab = self.write("sub.cab", make_cab([("d\\StreamToSpeaker.inf", self.INF), ("d\\StreamToSpeaker.sys", self.SYS)]))
+        with open(cab, "rb") as f:
+            sha = rc.sha256(f.read())
+        report = os.path.join(self.tmp, "reference.json")
+        self.assertEqual(rc.main(["reference", cab, self.out, "--type", "submission_cab", "--sha256", sha,
+                                  "--json", report]), 0)
+        with open(report, encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["ok"])
+        self.assertEqual(rc.main(["reference", cab, os.path.join(self.tmp, "work", "o2"), "--type", "submission_cab"]), 1)
+        self.assertEqual(rc.main(["reference", cab, os.path.join(self.tmp, "work", "o3"), "--type", "lab_zip"]), 1)
 
 
 @unittest.skipUnless(test_certified.HAVE_REAL, "real 1.1.0.209 packages not on this machine")

@@ -9,6 +9,7 @@ Used by driver-reproducibility.yml. Pure Python, no third-party modules.
   repro_compare.py plan <manifest.json> <tag>        [--build-number N] [--json out.json]
   repro_compare.py buildroot <plan.json> <reference.sys> [--build-root DIR]
   repro_compare.py package <package.zip> <out_dir> --sha256 <expected> [--json out.json]
+  repro_compare.py reference <archive> <out_dir> --type lab_zip|submission_cab [--sha256 <expected>]
   repro_compare.py files <dir_a> <dir_b>              [--json out.json]
 
 `sys` strips the Authenticode certificate table from both files (what
@@ -46,9 +47,20 @@ out_dir under their canonical names (any directory layout inside the zip,
 names matched case-insensitively, a duplicate is an error) and records
 each file's SHA-256.
 
+`reference` does the same for the package a release was signed from: the
+lab zip of a certified release or the submission CAB of an attested one
+(read with the cabinet reader below, stored and MSZIP folders), extracting
+its .sys/.inf. The SHA-256 is required for a submission CAB. Neither
+command writes to a path taken from the archive.
+
 `files` checks that the .sys/.inf/.cat in two directories are
 byte-identical (e.g. what an installer put on disk vs the package it is
 supposed to bundle).
+
+Text that comes from a release (manifest values, archive member names, PDB
+paths, section names, INF lines) is passed through clean_text before it is
+printed or stored in a report, and the reports are printed with the
+runner's workflow commands switched off (see "Untrusted text").
 
 `plan` reads a driver-v* release manifest and says how that driver was
 built, so the rebuild can repeat it without being told per release:
@@ -84,13 +96,16 @@ When GITHUB_OUTPUT is set, `raw_identical`, `normalised_identical` and
 `toolset_identical` (true/false) are appended to it.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import re
+import secrets
 import struct
 import sys
 import zipfile
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from certified import PACKAGE_FILES, pe_strip_signature  # noqa: E402
@@ -101,6 +116,59 @@ IMAGE_DEBUG_TYPE = {
     11: "CLSID", 12: "VC_FEATURE", 13: "POGO", 14: "ILTCG", 15: "MPX", 16: "REPRO",
     17: "SPGO", 20: "EX_DLLCHARACTERISTICS",
 }
+
+
+# ---------------------------------------------------------------------------
+# Untrusted text
+# ---------------------------------------------------------------------------
+# Release assets and the files inside them (manifest values, archive member
+# names, PDB paths, section names, INF lines) are not trusted. The Actions
+# runner reads workflow commands from the log: a line that starts with "::"
+# and, in the legacy form, "##[" anywhere in a line. So such text is never
+# printed or put in a report as-is.
+COMMAND_COLON_RE = re.compile(r":(?=:)")
+COMMAND_HASH_RE = re.compile(r"#(?=#\[)")
+
+
+def clean_text(value, limit=400):
+    """`value` as one line of printable ASCII that the runner cannot read
+    as a workflow command: every character outside 0x20-0x7e becomes a
+    \\xNN / \\uNNNN escape (so no line breaks, no look-alike or
+    direction-changing characters, and nothing the console encoding could
+    choke on), "::" becomes ":\\:" and "##[" becomes "#\\#[". Text longer
+    than `limit` characters is cut."""
+    text = value if isinstance(value, str) else str(value)
+    out = []
+    for ch in text[:limit]:
+        cp = ord(ch)
+        if 0x20 <= cp <= 0x7E:
+            out.append(ch)
+        else:
+            out.append(f"\\x{cp:02x}" if cp < 0x100 else f"\\u{cp:04x}" if cp < 0x10000 else f"\\U{cp:08x}")
+    cleaned = COMMAND_HASH_RE.sub(r"#\\", COMMAND_COLON_RE.sub(r":\\", "".join(out)))
+    return cleaned + ("..." if len(text) > limit else "")
+
+
+def command_text(value):
+    """clean_text for the message of a workflow command this script prints
+    itself (::error::, ::warning::), where "%" starts an escape."""
+    return clean_text(value).replace("%", "%25")
+
+
+@contextlib.contextmanager
+def quarantined_output():
+    """Print a report as plain log text: on an Actions runner, workflow
+    commands are switched off until a token nobody could have put into a
+    release asset beforehand is printed back."""
+    if not os.environ.get("GITHUB_ACTIONS"):
+        yield
+        return
+    token = secrets.token_hex(16)
+    print(f"::stop-commands::{token}", flush=True)
+    try:
+        yield
+    finally:
+        print(f"::{token}::", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +197,9 @@ class PE:
         self.sections = []
         for i in range(self.nsections):
             off = sec_tab + 40 * i
-            name = data[off:off + 8].rstrip(b"\0").decode("ascii", "replace")
+            # A label only: the section table's raw bytes are compared as
+            # part of the header block.
+            name = clean_text(data[off:off + 8].rstrip(b"\0").decode("ascii", "replace"))
             vsize, va, rawsize, rawptr = struct.unpack_from("<IIII", data, off + 8)
             self.sections.append({"name": name, "va": va, "vsize": vsize,
                                   "raw": rawptr, "rawsize": rawsize, "hdr": off})
@@ -202,7 +272,8 @@ class PE:
             "coff_timestamp": f"{self.timestamp:#010x}",
             "checksum": f"{self.checksum:#010x}",
             "sections": [{"name": s["name"], "raw": s["raw"], "rawsize": s["rawsize"]} for s in self.sections],
-            "debug": [{k: v for k, v in e.items() if k not in ("entry_off", "raw_off")} for e in self.debug_entries()],
+            "debug": [{k: (clean_text(v) if k == "pdb_path" else v) for k, v in e.items()
+                       if k not in ("entry_off", "raw_off")} for e in self.debug_entries()],
             "rich": self.rich_header(),
         }
 
@@ -325,7 +396,7 @@ def sha256(b):
 
 def gh_output(**kv):
     path = os.environ.get("GITHUB_OUTPUT")
-    if not path:
+    if not path or not kv:
         return
     with open(path, "a", encoding="utf-8") as fh:
         for k, v in kv.items():
@@ -458,12 +529,15 @@ def compare_inf(released_path, fresh_path):
                       f"<{len(lines_r)} lines>", f"<{len(lines_f)} lines>"))
     driverver_r = text_r[ver_r.start():text_r.find("\n", ver_r.start())].strip() if ver_r else None
     driverver_f = text_f[ver_f.start():text_f.find("\n", ver_f.start())].strip() if ver_f else None
+    def shown(text):
+        return None if text is None else clean_text(text)
+
     return {
-        "released": {"path": released_path, "encoding": enc_r, "driverver": driverver_r},
-        "fresh": {"path": fresh_path, "encoding": enc_f, "driverver": driverver_f},
+        "released": {"path": released_path, "encoding": enc_r, "driverver": shown(driverver_r)},
+        "fresh": {"path": fresh_path, "encoding": enc_f, "driverver": shown(driverver_f)},
         "raw_identical": text_r == text_f and enc_r == enc_f,
         "normalised_identical": masked_r == masked_f and enc_r == enc_f,
-        "differing_lines": [{"line": n, "released": a, "fresh": b} for n, a, b in diffs[:50]],
+        "differing_lines": [{"line": n, "released": shown(a), "fresh": shown(b)} for n, a, b in diffs[:50]],
     }
 
 
@@ -475,7 +549,7 @@ def print_inf_report(rep):
     print(f"  raw identical        : {rep['raw_identical']}")
     print(f"  normalised identical : {rep['normalised_identical']}")
     for d in rep["differing_lines"]:
-        print(f"    line {d['line']}: released={d['released']!r} fresh={d['fresh']!r}")
+        print(f"    line {d['line']}: released=[{d['released']}] fresh=[{d['fresh']}]")
 
 
 def tree_files(root, subdirs):
@@ -553,7 +627,7 @@ def print_tree_report(rep):
     print(f"== build tree {rep['build_root']} vs checkout {rep['source_root']} ({rep['files']} files) ==")
     for key in ("only_in_source", "only_in_build", "changed"):
         for path in rep[key]:
-            print(f"  {key.replace('_', ' ')}: {path}")
+            print(f"  {key.replace('_', ' ')}: {clean_text(path)}")
     if "stamped_build" in rep:
         print(f"  {STAMP_FILE} stamped to build {rep['stamped_build']}, otherwise as the checkout: {rep['stamp_ok']}")
         if rep["stamp_problem"]:
@@ -615,9 +689,9 @@ def build_plan(manifest, tag, build_number=None):
     version = need("driver_version", "the DriverVer the rebuilt INF must carry",
                    re.compile(r"\d+\.\d+\.\d+\.\d+"))
     build = need("driver_build", "the DriverBuildNumber the driver was built with", re.compile(r"\d+"))
-    need("source_hash", "the driver source the release was built from", HEX64_RE)
-    need("signed_zip", "the package installers bundle", ASSET_RE)
-    need("signed_zip_sha256", "the hash of the package installers bundle", HEX64_RE)
+    source_hash = need("source_hash", "the driver source the release was built from", HEX64_RE)
+    signed_zip = need("signed_zip", "the package installers bundle", ASSET_RE)
+    signed_zip_sha256 = need("signed_zip_sha256", "the hash of the package installers bundle", HEX64_RE)
     if build is not None and version and not version.endswith(f".{build}"):
         errors.append(f"driver_version {version} does not end in driver_build {build}")
     if build_number not in (None, "") and build is not None and str(build_number) != str(build):
@@ -635,7 +709,13 @@ def build_plan(manifest, tag, build_number=None):
             return ""
         return v
 
-    plan = {"tag": tag, "version": version, "build_number": str(build) if build is not None else None}
+    commit = m.get("commit")
+    plan = {"tag": tag, "version": version, "build_number": str(build) if build is not None else None,
+            "source_hash": (source_hash or "").lower(),
+            "signed_zip": signed_zip or "",
+            "signed_zip_sha256": (signed_zip_sha256 or "").lower(),
+            # Shown only; the checkout is identified by its source hash.
+            "commit": commit if isinstance(commit, str) and re.fullmatch(r"[0-9a-fA-F]{7,64}", commit) else ""}
     if certified and attested:
         errors.append(f"the manifest of {tag} claims to be both certified and attested")
         plan.update(kind="")
@@ -669,13 +749,16 @@ def build_plan(manifest, tag, build_number=None):
 
 
 def print_plan(plan):
-    print(f"== build plan for {plan['tag']} ==")
+    print(f"== build plan for {clean_text(plan['tag'])} ==")
     for e in plan["errors"]:
-        print(f"::error::{e}")
+        print(f"::error::{command_text(e)}")
     if not plan["ok"]:
         return
     print(f"  kind              : {plan['kind']}")
     print(f"  driver            : {plan['version']} (DriverBuildNumber {plan['build_number']})")
+    print(f"  manifest commit   : {plan['commit'] or '(none or not a commit id)'}")
+    print(f"  source hash       : {plan['source_hash']}")
+    print(f"  shipped package   : {plan['signed_zip']} (sha256 {plan['signed_zip_sha256']})")
     print(f"  driver.h stamped  : {plan['stamp_driver_h']}")
     print(f"  reference package : {plan['reference_asset']} ({plan['reference_type']}"
           f"{', sha256 ' + plan['reference_sha256'] if plan['reference_sha256'] else ''})")
@@ -739,6 +822,160 @@ def reference_pdb_path(sys_path):
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Archives from a release
+# ---------------------------------------------------------------------------
+# Nothing here writes to a path taken from an archive: the wanted files are
+# picked by base name and written under their canonical names, flat, into
+# the output directory. An entry cannot escape it, whatever its path says.
+MAX_MEMBER_BYTES = 64 << 20      # driver files are tens of kilobytes
+MAX_FOLDER_BYTES = 256 << 20     # a cabinet folder (.sys + .inf + .pdb + .cat)
+REFERENCE_FILES = ("StreamToSpeaker.sys", "StreamToSpeaker.inf")
+REFERENCE_TYPES = ("lab_zip", "submission_cab")
+
+
+class ArchiveError(ValueError):
+    pass
+
+
+def member_basename(name):
+    return re.split(r"[\\/]", name)[-1]
+
+
+def pick_zip_members(zip_path, names):
+    """pick_members() over the files of a zip."""
+    with zipfile.ZipFile(zip_path) as z:
+        def reader(info):
+            def read():
+                with z.open(info) as fh:
+                    blob = fh.read(MAX_MEMBER_BYTES + 1)
+                if len(blob) > MAX_MEMBER_BYTES:
+                    raise ArchiveError(f"{clean_text(info.filename)} is larger than {MAX_MEMBER_BYTES} bytes")
+                return blob
+            return read
+
+        return pick_members([(info.filename, info.file_size, reader(info))
+                             for info in z.infolist() if not info.is_dir()], names)
+
+
+def cab_entries(data):
+    """[(member name, size, read())] for the files of a single-volume
+    Microsoft cabinet (stored or MSZIP folders, which is what makecab
+    writes for the submission CAB; an Authenticode-signed cabinet keeps its
+    signature in the header's reserved area, which is skipped)."""
+    if data[:4] != b"MSCF":
+        raise ArchiveError("not a cabinet (no MSCF signature)")
+    try:
+        (_sig, _r1, _cb_cabinet, _r2, coff_files, _r3, _vminor, _vmajor, n_folders, n_files,
+         flags, _set_id, _i_cabinet) = struct.unpack_from("<4sIIIIIBBHHHHH", data, 0)
+        pos = 36
+        res_folder = res_data = 0
+        if flags & 0x0004:                       # cfhdrRESERVE_PRESENT
+            res_header, res_folder, res_data = struct.unpack_from("<HBB", data, pos)
+            pos += 4 + res_header
+        if flags & 0x0003:                       # previous / next cabinet
+            raise ArchiveError("multi-volume cabinets are not supported")
+        folders = []
+        for _ in range(n_folders):
+            coff_start, n_data, compression = struct.unpack_from("<IHH", data, pos)
+            pos += 8 + res_folder
+            folders.append((coff_start, n_data, compression & 0x000F))
+        files = []
+        pos = coff_files
+        for _ in range(n_files):
+            cb_file, uoff, i_folder, _date, _time, attribs = struct.unpack_from("<IIHHHH", data, pos)
+            pos += 16
+            end = data.index(b"\0", pos)
+            name = data[pos:end].decode("utf-8" if attribs & 0x80 else "latin-1", "replace")
+            pos = end + 1
+            files.append((name, cb_file, uoff, i_folder))
+    except (struct.error, ValueError) as e:
+        if isinstance(e, ArchiveError):
+            raise
+        raise ArchiveError(f"malformed cabinet: {e}")
+
+    cache = {}
+
+    def folder_bytes(index):
+        if index in cache:
+            return cache[index]
+        if index >= len(folders):
+            raise ArchiveError("a file refers to a folder this cabinet does not hold")
+        coff_start, n_data, compression = folders[index]
+        if compression not in (0, 1):
+            raise ArchiveError(f"unsupported cabinet compression type {compression}")
+        out, previous, pos = bytearray(), b"", coff_start
+        try:
+            for _ in range(n_data):
+                _checksum, cb_data, cb_uncompressed = struct.unpack_from("<IHH", data, pos)
+                pos += 8 + res_data
+                block = bytes(data[pos:pos + cb_data])
+                if len(block) != cb_data:
+                    raise ArchiveError("truncated cabinet data block")
+                pos += cb_data
+                if compression == 0:
+                    chunk = block
+                else:
+                    # MSZIP: "CK" + one raw deflate stream of at most 32 KiB,
+                    # with the previous block's output as its dictionary.
+                    if block[:2] != b"CK":
+                        raise ArchiveError("bad MSZIP block signature")
+                    inflater = zlib.decompressobj(-15, zdict=previous) if previous else zlib.decompressobj(-15)
+                    chunk = inflater.decompress(block[2:], 32769)
+                    if len(chunk) > 32768 or inflater.unconsumed_tail:
+                        raise ArchiveError("MSZIP block larger than 32 KiB")
+                if len(chunk) != cb_uncompressed:
+                    raise ArchiveError("cabinet data block size mismatch")
+                out += chunk
+                previous = chunk
+                if len(out) > MAX_FOLDER_BYTES:
+                    raise ArchiveError(f"cabinet folder larger than {MAX_FOLDER_BYTES} bytes")
+        except (struct.error, zlib.error) as e:
+            raise ArchiveError(f"malformed cabinet data: {e}")
+        cache[index] = bytes(out)
+        return cache[index]
+
+    def reader(cb_file, uoff, i_folder):
+        def read():
+            blob = folder_bytes(i_folder)[uoff:uoff + cb_file]
+            if len(blob) != cb_file:
+                raise ArchiveError("a file extends past its folder's data")
+            return blob
+        return read
+
+    return [(name, cb_file, reader(cb_file, uoff, i_folder)) for name, cb_file, uoff, i_folder in files]
+
+
+def pick_members(entries, names):
+    """From archive entries pick the wanted files by base name (matched
+    case-insensitively, any directory): ({canonical name: (member, bytes)},
+    missing names, duplicate members)."""
+    wanted = {n.lower(): n for n in names}
+    found, duplicates = {}, []
+    for member, size, read in entries:
+        canon = wanted.get(member_basename(member).lower())
+        if not canon:
+            continue
+        if canon in found:
+            duplicates.append(clean_text(member))
+            continue
+        if size > MAX_MEMBER_BYTES:
+            raise ArchiveError(f"{clean_text(member)} is larger than {MAX_MEMBER_BYTES} bytes")
+        found[canon] = (member, read())
+    return found, [n for n in names if n not in found], duplicates
+
+
+def write_members(found, out_dir):
+    """Write picked members flat under their canonical names; the report rows."""
+    os.makedirs(out_dir, exist_ok=True)
+    rows = {}
+    for canon, (member, data) in found.items():
+        with open(os.path.join(out_dir, canon), "wb") as fh:
+            fh.write(data)
+        rows[canon] = {"member": clean_text(member), "size": len(data), "sha256": sha256(data)}
+    return rows
+
+
 def check_package(zip_path, expected_sha256, out_dir, names=PACKAGE_FILES):
     """Verify a package zip's SHA-256 and extract its driver files flat."""
     with open(zip_path, "rb") as fh:
@@ -751,41 +988,92 @@ def check_package(zip_path, expected_sha256, out_dir, names=PACKAGE_FILES):
         "files": {},
         "missing": [],
         "duplicates": [],
+        "error": None,
     }
-    wanted = {n.lower(): n for n in names}
     found = {}
-    with zipfile.ZipFile(zip_path) as z:
-        for info in z.infolist():
-            if info.is_dir():
-                continue
-            canon = wanted.get(os.path.basename(info.filename).lower())
-            if not canon:
-                continue
-            if canon in found:
-                rep["duplicates"].append(info.filename)
-                continue
-            found[canon] = (info.filename, z.read(info))
-    rep["missing"] = [n for n in names if n not in found]
-    if rep["sha256_ok"] and not rep["missing"] and not rep["duplicates"]:
-        os.makedirs(out_dir, exist_ok=True)
-        for canon, (member, data) in found.items():
-            with open(os.path.join(out_dir, canon), "wb") as fh:
-                fh.write(data)
-            rep["files"][canon] = {"member": member, "size": len(data), "sha256": sha256(data)}
-    rep["ok"] = rep["sha256_ok"] and not rep["missing"] and not rep["duplicates"]
+    try:
+        found, rep["missing"], rep["duplicates"] = pick_zip_members(zip_path, names)
+    except (ArchiveError, zipfile.BadZipFile, OSError, zlib.error, RuntimeError, NotImplementedError) as e:
+        rep["error"] = clean_text(f"could not read the zip: {e}")
+    rep["ok"] = rep["sha256_ok"] and not rep["error"] and not rep["missing"] and not rep["duplicates"]
+    if rep["ok"]:
+        rep["files"] = write_members(found, out_dir)
     return rep
 
 
 def print_package_report(rep):
     print(f"== package {rep['zip']} ==")
     print(f"  sha256   : {rep['sha256']}")
-    print(f"  expected : {rep['expected_sha256'] or '(none)'}  -> {'match' if rep['sha256_ok'] else 'MISMATCH'}")
+    print(f"  expected : {clean_text(rep['expected_sha256']) or '(none)'}  -> {'match' if rep['sha256_ok'] else 'MISMATCH'}")
     for name, f in rep["files"].items():
         print(f"  {name:22} {f['sha256']}  ({f['size']} bytes, {f['member']})")
     for name in rep["missing"]:
         print(f"  missing: {name}")
     for member in rep["duplicates"]:
         print(f"  duplicate: {member}")
+    if rep["error"]:
+        print(f"  {rep['error']}")
+    print(f"  ok: {rep['ok']}")
+
+
+def extract_reference(archive_path, kind, out_dir, expected_sha256=None, names=REFERENCE_FILES):
+    """The reference .sys/.inf of a release, flat in out_dir: from the lab
+    zip of a certified release or the submission CAB of an attested one.
+
+    The archive's SHA-256 must equal `expected_sha256` when one is given; a
+    submission CAB must always come with one (the manifest's
+    `submission_cab_signed_sha256`), an older certified manifest may not
+    record its lab zip's hash."""
+    rep = {"archive": archive_path, "type": kind, "sha256": None,
+           "expected_sha256": (expected_sha256 or "").lower(), "sha256_ok": False,
+           "files": {}, "missing": [], "duplicates": [], "error": None, "ok": False}
+    if kind not in REFERENCE_TYPES:
+        rep["error"] = clean_text(f"unknown reference type {kind!r}")
+        return rep
+    try:
+        with open(archive_path, "rb") as fh:
+            data = fh.read()
+    except OSError as e:
+        rep["error"] = clean_text(f"could not read the archive: {e}")
+        return rep
+    rep["sha256"] = sha256(data)
+    if expected_sha256:
+        rep["sha256_ok"] = rep["sha256"] == expected_sha256.lower()
+        if not rep["sha256_ok"]:
+            rep["error"] = "the archive is not the one the manifest records (SHA-256 differs)"
+            return rep
+    elif kind == "submission_cab":
+        rep["error"] = "no expected SHA-256 given for the submission CAB"
+        return rep
+    try:
+        if kind == "submission_cab":
+            found, rep["missing"], rep["duplicates"] = pick_members(cab_entries(data), names)
+        else:
+            found, rep["missing"], rep["duplicates"] = pick_zip_members(archive_path, names)
+    except (ArchiveError, zipfile.BadZipFile, OSError, zlib.error, RuntimeError, NotImplementedError) as e:
+        rep["error"] = clean_text(f"could not read the archive: {e}")
+        return rep
+    rep["ok"] = not rep["missing"] and not rep["duplicates"]
+    if rep["ok"]:
+        rep["files"] = write_members(found, out_dir)
+    return rep
+
+
+def print_reference_report(rep):
+    print(f"== reference package {rep['archive']} ({clean_text(rep['type'])}) ==")
+    print(f"  sha256   : {rep['sha256']}")
+    if rep["expected_sha256"]:
+        print(f"  expected : {clean_text(rep['expected_sha256'])}  -> {'match' if rep['sha256_ok'] else 'MISMATCH'}")
+    else:
+        print("  expected : (the manifest records none)")
+    for name, f in rep["files"].items():
+        print(f"  {name:22} {f['sha256']}  ({f['size']} bytes, {f['member']})")
+    for name in rep["missing"]:
+        print(f"  missing: {name}")
+    for member in rep["duplicates"]:
+        print(f"  duplicate: {member}")
+    if rep["error"]:
+        print(f"  {rep['error']}")
     print(f"  ok: {rep['ok']}")
 
 
@@ -827,85 +1115,109 @@ def print_files_report(rep):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("kind", choices=("sys", "inf", "tree", "package", "files", "plan", "buildroot"))
+    ap.add_argument("kind", choices=("sys", "inf", "tree", "package", "reference", "files", "plan", "buildroot"))
     ap.add_argument("released")
     ap.add_argument("fresh")
     ap.add_argument("--json", help="also write the full report here")
-    ap.add_argument("--sha256", help="package: the SHA-256 the release manifest records for the zip")
+    ap.add_argument("--sha256", help="package / reference: the SHA-256 the release manifest records for the archive")
+    ap.add_argument("--type", choices=REFERENCE_TYPES, help="reference: lab zip or submission CAB")
     ap.add_argument("--stamped-build", help="tree: driver.h in the build tree is stamped with this build number")
     ap.add_argument("--build-number", help="plan: optional build number that must equal the manifest's driver_build")
     ap.add_argument("--build-root", help="buildroot: build here instead of the derived directory")
     a = ap.parse_args(argv)
+    # Whatever ends up in a message, printing it must not fail on the
+    # console's encoding.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
 
     def dump(rep):
         if a.json:
             with open(a.json, "w", encoding="utf-8") as fh:
                 json.dump(rep, fh, indent=2)
 
-    if a.kind == "package":
-        rep = check_package(a.released, a.sha256, a.fresh)
-        print_package_report(rep)
-        dump(rep)
-        gh_output(package_ok=rep["ok"], package_sha256=rep["sha256"])
-        return 0 if rep["ok"] else 1
+    # plan / buildroot print workflow commands of their own (::error::,
+    # ::warning::); what they show of the release goes through clean_text.
     if a.kind == "plan":
         try:
             with open(a.released, "r", encoding="utf-8-sig") as fh:
                 manifest = json.load(fh)
         except (OSError, ValueError) as e:
-            print(f"::error::could not read {a.released}: {e}")
+            print(f"::error::{command_text(f'could not read {a.released}: {e}')}")
             return 1
         rep = build_plan(manifest, a.fresh, a.build_number)
         print_plan(rep)
         dump(rep)
         if rep["ok"]:
             gh_output(kind=rep["kind"], version=rep["version"], build_number=rep["build_number"],
-                      stamp_driver_h=rep["stamp_driver_h"], reference_type=rep["reference_type"],
-                      reference_asset=rep["reference_asset"], reference_sha256=rep["reference_sha256"])
+                      source_hash=rep["source_hash"], stamp_driver_h=rep["stamp_driver_h"],
+                      reference_type=rep["reference_type"], reference_asset=rep["reference_asset"],
+                      reference_sha256=rep["reference_sha256"], signed_zip=rep["signed_zip"],
+                      signed_zip_sha256=rep["signed_zip_sha256"])
         return 0 if rep["ok"] else 1
     if a.kind == "buildroot":
-        with open(a.released, "r", encoding="utf-8") as fh:
-            plan = json.load(fh)
         try:
+            with open(a.released, "r", encoding="utf-8") as fh:
+                plan = json.load(fh)
             pdb = reference_pdb_path(a.fresh)
-        except (OSError, ValueError, struct.error) as e:
-            print(f"::error::could not read the PDB path of {a.fresh}: {e}")
+        except (OSError, ValueError, struct.error, IndexError) as e:
+            print(f"::error::{command_text(f'could not read the plan or the PDB path of {a.fresh}: {e}')}")
             return 1
         res = resolve_build_root(plan, pdb, a.build_root)
-        print(f"reference .sys PDB path: {pdb!r}")
+        print(f"reference .sys PDB path: [{clean_text(pdb)}]")
         if res["error"]:
-            print(f"::error::{res['error']}")
+            print(f"::error::{command_text(res['error'])}")
             return 1
         if res["warning"]:
-            print(f"::warning::{res['warning']}")
+            print(f"::warning::{command_text(res['warning'])}")
         print(f"build root: {res['root']} ({res['source']})")
         gh_output(build_root=res["root"])
         return 0
-    if a.kind == "files":
-        rep = compare_files(a.released, a.fresh)
-        print_files_report(rep)
+
+    # The other reports are built from release files and print no workflow
+    # commands: the runner reads none from their output.
+    def report():
+        if a.kind == "package":
+            rep = check_package(a.released, a.sha256, a.fresh)
+            print_package_report(rep)
+            dump(rep)
+            return (0 if rep["ok"] else 1), {"package_ok": rep["ok"], "package_sha256": rep["sha256"]}
+        if a.kind == "reference":
+            rep = extract_reference(a.released, a.type, a.fresh, a.sha256)
+            print_reference_report(rep)
+            dump(rep)
+            return (0 if rep["ok"] else 1), {"reference_ok": rep["ok"]}
+        if a.kind == "files":
+            rep = compare_files(a.released, a.fresh)
+            print_files_report(rep)
+            dump(rep)
+            return (0 if rep["identical"] else 1), {"files_identical": rep["identical"]}
+        if a.kind == "tree":
+            rep = compare_trees(a.released, a.fresh, stamped_build=a.stamped_build)
+            print_tree_report(rep)
+            dump(rep)
+            return (0 if rep["identical"] else 1), {}
+        try:
+            if a.kind == "sys":
+                rep = compare_sys(a.released, a.fresh)
+                print_sys_report(rep)
+            else:
+                rep = compare_inf(a.released, a.fresh)
+                print_inf_report(rep)
+        except (OSError, ValueError, struct.error, IndexError) as e:
+            # No verdict (and no outputs): a file that cannot be read or
+            # parsed is not evidence either way.
+            print(f"error: {clean_text(f'could not compare {a.released} with {a.fresh}: {e}')}")
+            return 2, {}
         dump(rep)
-        gh_output(files_identical=rep["identical"])
-        return 0 if rep["identical"] else 1
-    if a.kind == "sys":
-        rep = compare_sys(a.released, a.fresh)
-        print_sys_report(rep)
-    elif a.kind == "inf":
-        rep = compare_inf(a.released, a.fresh)
-        print_inf_report(rep)
-    else:
-        rep = compare_trees(a.released, a.fresh, stamped_build=a.stamped_build)
-        print_tree_report(rep)
-        if a.json:
-            with open(a.json, "w", encoding="utf-8") as fh:
-                json.dump(rep, fh, indent=2)
-        return 0 if rep["identical"] else 1
-    if a.json:
-        with open(a.json, "w", encoding="utf-8") as fh:
-            json.dump(rep, fh, indent=2)
-    gh_output(raw_identical=rep["raw_identical"], normalised_identical=rep["normalised_identical"],
-              toolset_identical=rep.get("toolset_identical", True))
-    return 0 if rep["normalised_identical"] else 1
+        return (0 if rep["normalised_identical"] else 1), {
+            "raw_identical": rep["raw_identical"], "normalised_identical": rep["normalised_identical"],
+            "toolset_identical": rep.get("toolset_identical", True)}
+
+    with quarantined_output():
+        code, outputs = report()
+    gh_output(**outputs)
+    return code
 
 
 if __name__ == "__main__":
