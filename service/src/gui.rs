@@ -34,6 +34,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::app::App;
+use crate::equalizer::{
+    matching_preset, EqSettings, EQ_BANDS, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_GAIN_STEP_DB,
+    EQ_PREAMP_MAX_DB, EQ_PRESETS,
+};
 
 // -----------------------------------------------------------------------------
 // Design tokens
@@ -866,6 +870,9 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
                 homepod_latency_draft: None,
                 diagnostics_open: false,
                 diagnostics_copied_at: None,
+                eq_open: false,
+                eq_draft: None,
+                eq_previewed: None,
                 onboarding_dismissed: false,
                 last_applied_dark: None,
                 last_applied_accent: None,
@@ -904,6 +911,15 @@ struct StreamToSpeakerApp {
     diagnostics_open: bool,
     /// When "Copy diagnostics" last succeeded, for its confirmation.
     diagnostics_copied_at: Option<Instant>,
+    /// Equalizer card expanded. Collapsing it discards an unapplied
+    /// draft (the stream returns to the saved curve).
+    eq_open: bool,
+    /// Curve being edited; `Some` while the card is open. Previewed live
+    /// on the stream, saved only by Apply.
+    eq_draft: Option<EqSettings>,
+    /// Last draft handed to the stream, so an unchanged draft isn't
+    /// re-sent every frame.
+    eq_previewed: Option<EqSettings>,
     onboarding_dismissed: bool,
     /// Open when the user is entering a password for a `pw=true` AirPlay
     /// speaker. `None` when no prompt is showing.
@@ -1187,9 +1203,7 @@ impl eframe::App for StreamToSpeakerApp {
             if self.tray.is_none() {
                 self.app.request_shutdown();
             } else if self.skip_close_confirmation {
-                if let Some(hwnd) = self.hwnd {
-                    win_hide(hwnd);
-                }
+                self.hide_to_tray();
             } else {
                 self.confirm_close_open = true;
             }
@@ -1328,6 +1342,8 @@ impl eframe::App for StreamToSpeakerApp {
                             self.show_speakers(ui, &p);
                             ui.add_space(sp::M);
                             self.show_latency(ui, &p);
+                            ui.add_space(sp::M);
+                            self.show_equalizer(ui, &p);
                             ui.add_space(sp::M);
                             if self.app.is_sendspin_available() {
                                 self.show_music_assistant(ui, &p);
@@ -2899,11 +2915,217 @@ impl StreamToSpeakerApp {
         });
     }
 
-    fn show_advanced(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    /// Hide the window to the tray. An unapplied equalizer preview is
+    /// dropped first, as Revert would, so an unseen draft never keeps
+    /// playing.
+    fn hide_to_tray(&mut self) {
+        self.discard_eq_preview();
+        if let Some(hwnd) = self.hwnd {
+            win_hide(hwnd);
+        }
+    }
+
+    /// Drop the equalizer draft and, if it differed, put the stream back
+    /// on the saved curve.
+    fn discard_eq_preview(&mut self) {
+        if self.eq_draft.take().is_some_and(|d| d != self.app.eq_saved()) {
+            self.app.eq_revert();
+        }
+        self.eq_previewed = None;
+    }
+
+    fn show_equalizer(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
+            let was_open = self.eq_open;
             disclosure_header(
                 ui,
                 p,
+                "equalizer_toggle",
+                "Equalizer",
+                "Ten-band equalizer for everything you stream",
+                &mut self.eq_open,
+            );
+            if !self.eq_open {
+                if was_open {
+                    // Closed without Apply: back to the saved curve.
+                    self.discard_eq_preview();
+                }
+                return;
+            }
+            let saved = self.app.eq_saved();
+            let mut draft = self.eq_draft.take().unwrap_or_else(|| saved.clone());
+
+            ui.add_space(sp::XS);
+            ui.label(
+                egui::RichText::new(
+                    "Shapes the sound sent to every speaker. Changes play live while \
+                     you edit; Apply keeps them, Revert or closing this card drops them.",
+                )
+                .size(12.0)
+                .color(p.text_secondary),
+            );
+            ui.add_space(sp::XS);
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut draft.enabled, "Enable equalizer");
+                ui.add_space(sp::M);
+                let current = matching_preset(&draft.bands_db).unwrap_or("Custom");
+                egui::ComboBox::from_id_salt("eq_preset")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for preset in EQ_PRESETS {
+                            if ui
+                                .selectable_label(current == preset.name, preset.name)
+                                .clicked()
+                            {
+                                draft.bands_db = preset.bands_db;
+                                draft.preamp_db = 0.0;
+                            }
+                        }
+                    });
+            });
+            ui.add_space(sp::S);
+
+            // Ten vertical sliders, one column each, labelled with the
+            // band's value above and its frequency below.
+            const BAND_LABELS: [&str; EQ_BANDS] =
+                ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
+            let gain_range = EQ_GAIN_MIN_DB..=EQ_GAIN_MAX_DB;
+            let enabled = draft.enabled;
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.columns(EQ_BANDS, |cols| {
+                    for (i, col) in cols.iter_mut().enumerate() {
+                        col.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{:+.1}", draft.bands_db[i]))
+                                    .size(11.0)
+                                    .color(p.text_secondary),
+                            );
+                            ui.spacing_mut().slider_width = 120.0;
+                            ui.add(
+                                egui::Slider::new(&mut draft.bands_db[i], gain_range.clone())
+                                    .vertical()
+                                    .show_value(false)
+                                    .step_by(EQ_GAIN_STEP_DB as f64)
+                                    .clamping(egui::SliderClamping::Always),
+                            )
+                            .on_hover_text(format!(
+                                "{} Hz: {:+.1} dB",
+                                BAND_LABELS[i], draft.bands_db[i]
+                            ));
+                            ui.label(
+                                egui::RichText::new(BAND_LABELS[i])
+                                    .size(11.0)
+                                    .color(p.text_primary),
+                            );
+                        });
+                    }
+                });
+                ui.add_space(sp::S);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Preamp").color(p.text_primary));
+                    ui.add(
+                        egui::Slider::new(&mut draft.preamp_db, EQ_GAIN_MIN_DB..=EQ_PREAMP_MAX_DB)
+                            .step_by(EQ_GAIN_STEP_DB as f64)
+                            .suffix(" dB")
+                            .clamping(egui::SliderClamping::Always),
+                    );
+                });
+            });
+            draft = draft.sanitized();
+
+            // Live preview: hand every change to the stream (the designer
+            // throttles to ~50 ms and crossfades, so dragging is smooth).
+            if self.eq_previewed.as_ref() != Some(&draft) {
+                self.app.eq_preview(&draft);
+                self.eq_previewed = Some(draft.clone());
+            }
+
+            ui.add_space(sp::XS);
+            let headroom = match self.app.eq_report() {
+                Some(r) if r.settings == draft => {
+                    if !draft.enabled {
+                        "Off — audio passes through unchanged.".to_string()
+                    } else {
+                        format!(
+                            "Automatic headroom {:+.1} dB · effective preamp {:+.1} dB",
+                            r.auto_attenuation_db, r.effective_preamp_db
+                        )
+                    }
+                }
+                _ => {
+                    ui.ctx().request_repaint_after(Duration::from_millis(60));
+                    "Calculating headroom…".to_string()
+                }
+            };
+            ui.label(egui::RichText::new(headroom).size(12.0).color(p.text_secondary))
+                .on_hover_text(
+                    "Boosting a band can push loud passages past full scale, which \
+                     distorts. The equalizer measures the curve's highest point and \
+                     lowers the overall level just enough that the peak stays at full \
+                     scale, so a boost never clips. A preamp cut counts toward that \
+                     reduction; the preamp can only cut, since any boost there would be \
+                     taken straight back off.",
+                );
+            ui.add_space(sp::S);
+
+            let dirty = draft != saved;
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled_ui(dirty, |ui| primary_button(ui, p, "Apply", 96.0))
+                    .inner
+                    .on_hover_text("Save this curve")
+                    .clicked()
+                {
+                    self.app.eq_apply(&draft);
+                }
+                ui.add_space(sp::XS);
+                if ui
+                    .add_enabled_ui(dirty, |ui| secondary_button(ui, p, "Revert", 96.0))
+                    .inner
+                    .on_hover_text("Go back to the saved curve")
+                    .clicked()
+                {
+                    draft = saved.clone();
+                    self.app.eq_revert();
+                    self.eq_previewed = Some(draft.clone());
+                }
+                ui.add_space(sp::XS);
+                if secondary_button(ui, p, "Reset to flat", 120.0)
+                    .on_hover_text("All bands and the preamp to 0 dB (keeps the on/off switch)")
+                    .clicked()
+                {
+                    draft = EqSettings { enabled: draft.enabled, ..EqSettings::default() };
+                }
+                if dirty {
+                    ui.add_space(sp::XS);
+                    ui.label(
+                        egui::RichText::new("Not saved")
+                            .size(12.0)
+                            .color(p.text_secondary),
+                    );
+                }
+            });
+            self.eq_draft = Some(draft);
+        });
+    }
+
+    fn show_advanced(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(ui, p, |ui| {
+            // Disclosure header: keyboard-focusable strip with the
+            // chevron placed immediately after the label (proximity)
+            // rather than at the right edge of the card. The previous
+            // design had label at left edge / chevron at right edge,
+            // ~600 px apart, so they read as unrelated elements —
+            // exactly the issue the audit flagged. Wiring via
+            // `ui.interact` with a stable id gives Tab focus, and
+            // we accept Enter/Space when focused (ARIA disclosure
+            // pattern). Height bumped 22 → 28 to meet the WCAG 2.5.8
+            // minimum click-target size.
+            disclosure_header(
+                ui,
+                p,
+                "advanced_toggle",
                 "Advanced",
                 "Tuning knobs for power users",
                 &mut self.advanced_open,
@@ -3413,6 +3635,7 @@ impl StreamToSpeakerApp {
             disclosure_header(
                 ui,
                 p,
+                "diagnostics_toggle",
                 "Diagnostics",
                 "Connection details and counters, for troubleshooting or a bug report",
                 &mut self.diagnostics_open,
@@ -3579,11 +3802,7 @@ impl StreamToSpeakerApp {
         if let Some(a) = action {
             self.confirm_close_open = false;
             match a {
-                CloseAction::MinimiseToTray => {
-                    if let Some(hwnd) = self.hwnd {
-                        win_hide(hwnd);
-                    }
-                }
+                CloseAction::MinimiseToTray => self.hide_to_tray(),
                 CloseAction::Quit => {
                     // request_shutdown flips the atomic; the next
                     // update() tick sees it and runs the Close
@@ -4400,22 +4619,19 @@ fn speaker_row(
     action
 }
 
-/// Collapsible-card header: a keyboard-focusable strip with the label and,
-/// right after it, a chevron. Toggles `open` on click or Enter/Space.
-fn disclosure_header(ui: &mut egui::Ui, p: &Palette, label: &str, hover: &str, open: &mut bool) {
-    // Disclosure header: keyboard-focusable strip with the
-    // chevron placed immediately after the label (proximity)
-    // rather than at the right edge of the card. The previous
-    // design had label at left edge / chevron at right edge,
-    // ~600 px apart, so they read as unrelated elements —
-    // exactly the issue the audit flagged. Wiring via
-    // `ui.interact` with a stable id gives Tab focus, and
-    // we accept Enter/Space when focused (ARIA disclosure
-    // pattern). Height bumped 22 → 28 to meet the WCAG 2.5.8
-    // minimum click-target size.
+/// Card disclosure strip: keyboard-focusable label with the chevron
+/// right after it, toggling `open` on click / Enter / Space.
+fn disclosure_header(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    id_salt: &str,
+    label: &str,
+    hover: &str,
+    open: &mut bool,
+) {
     let chevron = if *open { "▾" } else { "▸" };
     let avail_w = ui.available_width();
-    let id = ui.id().with(label).with("disclosure");
+    let id = ui.id().with(id_salt);
     // m5: was 28 px tall — undershot CONTROL_HEIGHT and the
     // 32 px buttons everywhere else in the app. Normalised so
     // the disclosure strip's click target matches the rest.

@@ -10,6 +10,7 @@ pub mod sendspin_app;
 pub mod app;
 pub mod audio_loop;
 pub mod audio_source;
+pub mod equalizer;
 pub mod silence;
 pub mod http_server;
 pub mod sonos;
