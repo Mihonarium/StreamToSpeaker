@@ -230,6 +230,11 @@ impl ActiveSession {
 
 pub type SharedSession = Arc<Mutex<Option<ActiveSession>>>;
 
+/// How long an error stays in the GUI's banner (the usual toast time).
+const ERROR_BANNER_TTL: Duration = Duration::from_secs(8);
+/// Start of the notice shown when a speaker is picked mid-connect.
+const STILL_CONNECTING_PREFIX: &str = "Still connecting to ";
+
 /// Transport-agnostic display info for the bound speaker (UPnP, AirPlay 1
 /// or AirPlay 2), used by the GUI status banner and the tray label.
 pub struct SelectedSpeaker {
@@ -558,14 +563,29 @@ impl App {
     pub fn current_error(&self) -> Option<String> {
         let le = self.last_error.lock().unwrap();
         match le.as_ref() {
-            Some((msg, when)) if when.elapsed() < Duration::from_secs(8) => Some(msg.clone()),
+            Some((msg, when)) if when.elapsed() < ERROR_BANNER_TTL => Some(msg.clone()),
             _ => None,
         }
+    }
+
+    /// How long the current error stays on screen, if one is showing.
+    pub fn error_expires_in(&self) -> Option<Duration> {
+        let le = self.last_error.lock().unwrap();
+        le.as_ref().and_then(|(_, when)| ERROR_BANNER_TTL.checked_sub(when.elapsed()))
     }
 
     /// Clear the current error (user dismissed the banner).
     pub fn dismiss_error(&self) {
         *self.last_error.lock().unwrap() = None;
+    }
+
+    /// Drop a "Still connecting to …" notice once that connect has ended:
+    /// it no longer says anything true.
+    fn clear_connecting_notice(&self) {
+        let mut le = self.last_error.lock().unwrap();
+        if le.as_ref().is_some_and(|(m, _)| m.starts_with(STILL_CONNECTING_PREFIX)) {
+            *le = None;
+        }
     }
 
     /// Returns true if the user has dismissed the onboarding card.
@@ -1428,7 +1448,7 @@ impl App {
             }
             if let Some(name) = guard.as_ref() {
                 if interactive {
-                    self.record_error(format!("Still connecting to {} — give it a moment.", name));
+                    self.record_error(format!("{}{} — give it a moment.", STILL_CONNECTING_PREFIX, name));
                 } else {
                     debug!("select of {} skipped — still connecting to {}", id, name);
                 }
@@ -1448,6 +1468,7 @@ impl App {
                 // still enabled.
                 let result = app.select_speaker_inner(&id, interactive, interactive, sendspin_pairing);
                 *app.connecting.lock().unwrap() = None;
+                app.clear_connecting_notice();
                 if let Err(e) = result {
                     let msg = format!("Couldn't connect to speaker: {}", e);
                     app.record_fault(&msg);
