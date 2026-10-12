@@ -138,7 +138,10 @@ like `build.yml` does.
 1. Push/merge the driver change to main. `Driver submission` runs: builds
    the driver **unsigned** (`SignMode=Off`, build number = commit count),
    packs `StreamToSpeaker-Driver-<ver>-Submission.cab`, creates prerelease
-   `driver-v<ver>`, and dispatches the CAB to the signing repo.
+   `driver-v<ver>`, and dispatches the CAB to the signing repo. The
+   release's `manifest.json` records how the binary was built
+   (`driver_build`, `build_root` = the runner checkout it was linked in,
+   `driver_h_stamped`), which is what the reproducibility check repeats.
 2. **Approve** the signing run in `Mihonarium/signing` (its run name must
    show the sha256 from the workflow summary / release notes). CI then
    swaps the release CAB for the EV-signed one. If you don't approve within
@@ -215,17 +218,22 @@ Tag `vX.Y.Z` → `build.yml` runs the release chain:
    then re-tag, if you wanted a production release.
 4. `verify-driver` — the release gate. Runs `driver-reproducibility.yml`
    for the `driver-v*` release `package` picked: rebuilds the driver from
-   the tagged commit (its driver source hash must equal the manifest's),
-   compares it with the lab package and the shipped `Signed.zip`, then
+   the tagged commit (its driver source hash must equal the manifest's)
+   the way that release's manifest says it was built, compares it with
+   the release's reference package (certified: the lab package; attested:
+   the unsigned driver in the submission CAB) and the shipped
+   `Signed.zip`, then
    unpacks the unsigned installer `package` just attached (by exact name
    and SHA-256) and requires its driver files to be that `Signed.zip`
    byte for byte, with no test certificate. Read-only token, no secrets.
-   If it fails, nothing is signed. For a `-testsigned` fallback it is
-   skipped (the driver was compiled from the tag in `build`; there is no
-   Microsoft-signed package to compare) and `package` / `sign-release`
-   say so in a warning. Only **certified** driver releases can be
-   verified: an attestation-signed driver (Flow A) has no lab package to
-   pin the rebuild to, so the gate fails and the release is not signed.
+   If it fails, the installer is not signed (the service exe was signed
+   in step 2, and the unsigned installer from step 3 stays attached to
+   the release). For a `-testsigned` fallback it is skipped (that driver
+   is CI's own build of the tag's driver source, from `build` or its
+   driver cache; there is no Microsoft-signed package to compare) and
+   `package` / `sign-release` say so in a warning. Certified and
+   attestation-signed drivers are both verified; see "Reproducibility
+   check" below for what each rebuild repeats.
 5. `sign-release` — runs only after `verify-driver` passed (or was skipped
    for the fallback); fetches the setup exe by the name and SHA-256
    `package` recorded, EV-signs exactly those bytes (**approval click 2**)
@@ -262,6 +270,12 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
    on an HLK client, package the results in HLK Studio and sign the
    `.hlkx` with the EV cert. Keep the exact INF/SYS/CAT the client ran:
    it is the reference the workflow compares Microsoft's return against.
+   The reproducibility check (below) rebuilds a certified release from
+   the committed tree (`driver.h` not stamped) in `C:\build\src` with
+   `/p:DriverBuildNumber=<build>`; a lab build made differently (stamped
+   `driver.h`, another build number, a build directory whose path has
+   another length) does not verify, and the release gate then stops the
+   installer signature.
 2. **Submit by hand** at Partner Center (Hardware → Submit new hardware →
    upload the `.hlkx`, tick the offered OS, no test-signing options). Note
    the product id and submission id from the URL.
@@ -288,8 +302,9 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
    returned), the canonical flat `…-Signed.zip`, and `manifest.json` with
    `certified: true`, `certification: {product_id, submission_id, os,
    report_id}`, `source_hash` computed on the windows-2022 runner, and
-   the same field set the attestation manifests have (`attested: false`,
-   `ms_state: done`, no submission CAB).
+   the fields the attestation manifests share with it (`attested: false`,
+   `ms_state: done`, no submission CAB; the attestation-only `build_root`
+   and `driver_h_stamped` are not written).
    Already have the zip from the dashboard? Attach it to the release and
    pass its name as `ms_zip_asset` — the API step is skipped and no Azure
    secrets are needed.
@@ -302,6 +317,38 @@ The script behind it is `.github/scripts/certified.py` (`hash`, `fetch`,
 `verify`, `release`; unit tests in `test_certified.py`, run in the
 workflow's guard step). `release` is idempotent and can be run locally
 with `gh` to (re)publish a release from hand-downloaded files.
+
+## Reproducibility check (`driver-reproducibility.yml`)
+
+Run from the Actions tab with a `driver-v*` `tag` (optionally `commit` =
+the commit to build when the branch head is not that driver's source, and
+`installer_tag` = a `v*` release whose installer to unpack). It is also
+the `verify-driver` release gate. How the release was built follows from
+its `manifest.json` (its kind, build number and reference package, see
+the table); a manifest that is neither `certified` nor `attested`, or
+lacks a field the rebuild needs, fails the run with the field named.
+
+| | Certified (`certified: true`) | Attested (`attested: true`) |
+| --- | --- | --- |
+| Reference binary | `.sys`/`.inf` in `lab_zip` (test-signed lab package) | unsigned `.sys`/`.inf` in `submission_cab` (the EV-signed CAB on the release, SHA-256 = `submission_cab_signed_sha256`) |
+| `driver.h` build constant | as committed | stamped with `driver_build`, as `Driver submission` does |
+| Build directory | `C:\build\src` | where the submitted `.sys` was linked: from its PDB path, or the manifest's `build_root` when that path has an unexpected form (a `build_root` that disagrees with the binary only warns) - normally the runner checkout, then built in place |
+| Build tree vs checkout | byte-identical | identical except the stamped constant |
+| Shipped `Signed.zip` | catalog verifies (Microsoft); `.sys`/`.inf` match the rebuild | the same, plus: embedded `.sys` signature verifies (Microsoft is the primary signer), `.sys` equals the submitted one with signatures stripped, INF byte-identical to the submitted one |
+
+Both use msbuild `Release|x64`, `SignMode=Off`,
+`DriverBuildNumber=<driver_build>`, require the checkout's driver source
+hash to equal `source_hash`, and compare `.sys` files with signatures
+stripped and only build-varying header fields masked: the COFF
+timestamp, the PE checksum, the debug-directory timestamps and the
+CodeView (PDB GUID, age, path) and REPRO debug payloads; the header block
+is compared from each file's own offset. The INF is compared with the
+DriverVer date masked. The linker embeds the PDB path and its length
+shifts the image layout, so the rebuild has to happen at the same path;
+the path text itself is among the masked fields.
+Compiler/linker build ids (Rich header) are reported and only warn. With `installer_tag`, the
+installer's driver files must be the `Signed.zip` contents byte for byte
+and carry no test certificate.
 
 ## What is and isn't signed
 
