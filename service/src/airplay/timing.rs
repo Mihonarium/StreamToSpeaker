@@ -54,7 +54,7 @@
 use byteorder::{BigEndian, ByteOrder};
 use log::{debug, info, warn};
 use std::collections::VecDeque;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -293,6 +293,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn control_traffic_only_from_the_receiver() {
+        let rx: IpAddr = "192.168.1.20".parse().unwrap();
+        assert!(from_receiver("192.168.1.20".parse().unwrap(), rx));
+        assert!(from_receiver("::ffff:192.168.1.20".parse().unwrap(), rx));
+        assert!(!from_receiver("192.168.1.21".parse().unwrap(), rx));
+    }
+
+    #[test]
     fn ntp_sync_packet_layout() {
         let p = build_ntp_sync(true, 100_000, 11025, 0xAABBCCDD11223344);
         assert_eq!(p.len(), 20);
@@ -456,6 +464,15 @@ impl ResendStats {
     }
 }
 
+/// True when a datagram from `peer` came from the receiver's address
+/// (IPv4-mapped IPv6 folded). Resend requests from anyone else on the LAN
+/// are ignored, so a third party can't make us re-send audio at the
+/// receiver. PTP is deliberately not filtered this way: a grouped
+/// receiver's clock messages can come from another unit's address.
+pub(crate) fn from_receiver(peer: IpAddr, receiver: IpAddr) -> bool {
+    crate::stream_gate::canonical_ip(peer) == crate::stream_gate::canonical_ip(receiver)
+}
+
 pub fn spawn_resend_responder(
     control_socket: UdpSocket,
     receiver_control_addr: SocketAddr,
@@ -473,7 +490,11 @@ pub fn spawn_resend_responder(
             while !stop_flag.load(Ordering::Acquire) {
                 match control_socket.recv_from(&mut buf) {
                     // Resend request: 0x80 0xD5, seq(2), first(2), count(2).
-                    Ok((n, peer)) if n >= 8 && buf[1] == 0xD5 => {
+                    Ok((n, peer))
+                        if n >= 8
+                            && buf[1] == 0xD5
+                            && from_receiver(peer.ip(), receiver_control_addr.ip()) =>
+                    {
                         requests += 1;
                         stats.requests.fetch_add(1, Ordering::Relaxed);
                         if requests == 1 {

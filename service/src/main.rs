@@ -557,7 +557,21 @@ fn run(cli: Cli) -> Result<()> {
                 // Wait briefly for the first SSDP sweep to populate
                 // discovery before we look the saved id up.
                 picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
-                discovery.find_by_id(&saved_id)
+                let found = discovery.find_by_id(&saved_id);
+                if found.is_none() {
+                    match discovery.identity_conflict(&saved_id) {
+                        Some(addrs) => warn!(
+                            "auto-reconnect skipped: different devices at {:?} all claim to be the saved \
+                             speaker {:?}; pick the right one by address",
+                            addrs, saved_id
+                        ),
+                        None if !saved_id.starts_with("airplay:") => {
+                            info!("auto-reconnect: saved speaker {:?} not found on the network", saved_id)
+                        }
+                        None => {}
+                    }
+                }
+                found
             }
         } else {
             info!("first launch (no saved speaker) — waiting for manual pick");

@@ -69,6 +69,18 @@ impl ActiveSession {
         }
     }
 
+    /// Does this session drive the speaker selected as `id` (resolved to
+    /// `target` for UPnP ids)?
+    pub fn is_device(&self, id: &str, target: Option<&Renderer>) -> bool {
+        if self.stable_id() == id {
+            return true;
+        }
+        match (self, target) {
+            (ActiveSession::Upnp(s), Some(t)) => s.renderer.same_device_as(t),
+            _ => false,
+        }
+    }
+
     pub fn friendly_name(&self) -> String {
         match self {
             // display_name shows "Living Room + Kitchen" when streaming
@@ -887,7 +899,15 @@ impl App {
     /// single sorted list with one row per speaker regardless of which
     /// protocol it speaks.
     pub fn speaker_view(&self) -> SpeakerView {
-        let active_id = self.session.lock().unwrap().as_ref().map(|s| s.stable_id());
+        let (active_id, active_upnp) = {
+            let guard = self.session.lock().unwrap();
+            let id = guard.as_ref().map(|s| s.stable_id());
+            let upnp = match guard.as_ref() {
+                Some(ActiveSession::Upnp(s)) => Some(s.renderer.clone()),
+                _ => None,
+            };
+            (id, upnp)
+        };
         let mut speakers: Vec<SpeakerInfo> = Vec::new();
 
         // Track the IPs that have a non-AirPlay (UPnP) entry, so we can
@@ -898,7 +918,8 @@ impl App {
         if let Some(d) = self.discovery.as_ref() {
             for r in d.renderers() {
                 let id = r.stable_id();
-                let active = active_id.as_deref() == Some(id.as_str());
+                let active = active_id.as_deref() == Some(id.as_str())
+                    || active_upnp.as_ref().map(|a| a.same_device_as(&r)).unwrap_or(false);
                 upnp_ips.insert(r.ip.to_string());
                 // Sonos group coordinators present as one row for the
                 // whole group ("Living Room + Kitchen"); the grouped
@@ -1331,12 +1352,21 @@ impl App {
         // refuses a fresh pairing/connection (it just times out → 10060).
         // For a *different* receiver we keep the old session until the new
         // one is up, so a failed switch doesn't drop a working stream.
+        // Compare devices, not id strings: a UPnP speaker's id switches
+        // between its UDN and its address as identity conflicts appear and
+        // clear, and stopping the "old" session after starting the new one
+        // would send Stop to the very speaker we just started.
+        let target = if id.starts_with("airplay:") {
+            None
+        } else {
+            self.discovery.as_ref().and_then(|d| d.find_by_id(id))
+        };
         let replacing_same = self
             .session
             .lock()
             .unwrap()
             .as_ref()
-            .map(|s| s.stable_id() == id)
+            .map(|s| s.is_device(id, target.as_ref()))
             .unwrap_or(false);
         if replacing_same {
             if let Some(old) = self.session.lock().unwrap().take() {
@@ -1489,6 +1519,14 @@ impl App {
             .discovery
             .as_ref()
             .ok_or_else(|| "UPnP discovery disabled".to_string())?;
+        if let Some(addrs) = discovery.identity_conflict(id) {
+            let addrs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+            return Err(format!(
+                "Several different devices on the network ({}) claim to be this speaker, so none was \
+                 picked automatically. Pick the entry with the right address from the speaker list.",
+                addrs.join(", ")
+            ));
+        }
         let Some(new_r) = discovery.find_by_id(id) else {
             return Err(format!("no UPnP speaker with id {:?}", id));
         };

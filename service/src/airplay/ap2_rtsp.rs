@@ -24,13 +24,21 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::airplay::ap2_crypto::{ChannelCipher, SessionKeys, TAG_LEN};
 use crate::airplay::hap_pairing::{PairSetupPin, PairVerify, PairingCredentials, X_APPLE_HKP_PERSISTENT};
 use crate::airplay::pairing::{TransientPairing, X_APPLE_HKP_VALUE};
 
 const USER_AGENT: &str = "AirPlay/665.13.1";
+
+/// Largest response body accepted. Real receivers answer with a few KB at
+/// most (GET /info is the biggest); anything larger is refused rather than
+/// buffered.
+const MAX_BODY_BYTES: usize = 1 << 20;
+
+/// Overall time allowed for one response, however slowly it trickles in.
+const RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// RTSP status code AirPlay 2 receivers return when they refuse transient
 /// pairing and require PIN (persistent HomeKit) verification — an Apple TV
@@ -657,6 +665,7 @@ impl Ap2Rtsp {
     }
 
     fn read_response(&mut self) -> Result<Resp> {
+        let deadline = Instant::now() + RESPONSE_DEADLINE;
         // Read until we have the full header block.
         let header_end = loop {
             if let Some(pos) = find_subsequence(&self.rx_buf, b"\r\n\r\n") {
@@ -664,6 +673,9 @@ impl Ap2Rtsp {
             }
             if self.rx_buf.len() > 1 << 20 {
                 bail!("AP2 RTSP response headers too large");
+            }
+            if Instant::now() >= deadline {
+                bail!("AP2 RTSP response timed out");
             }
             self.fill()?;
         };
@@ -684,13 +696,17 @@ impl Ap2Rtsp {
             .unwrap_or(0);
 
         let body_start = header_end + 4;
-        while self.rx_buf.len() < body_start + content_length {
+        let body_end = body_end(body_start, content_length)?;
+        while self.rx_buf.len() < body_end {
+            if Instant::now() >= deadline {
+                bail!("AP2 RTSP response body timed out");
+            }
             self.fill()?;
         }
-        let body = self.rx_buf[body_start..body_start + content_length].to_vec();
+        let body = self.rx_buf[body_start..body_end].to_vec();
         // Drop the consumed bytes (responses shouldn't be pipelined, but
         // keep any surplus just in case).
-        self.rx_buf.drain(..body_start + content_length);
+        self.rx_buf.drain(..body_end);
 
         debug!("AP2 RTSP < {} {} ({}B body)", status, status_text, body.len());
         Ok(Resp { status, status_text, body })
@@ -799,6 +815,17 @@ fn network_time_parts(ns: u64) -> (u64, u64) {
     (secs, frac)
 }
 
+/// End offset of a response body that starts at `body_start`, refusing
+/// bodies over `MAX_BODY_BYTES`.
+fn body_end(body_start: usize, content_length: usize) -> Result<usize> {
+    if content_length > MAX_BODY_BYTES {
+        bail!("AP2 RTSP response body too large ({} bytes)", content_length);
+    }
+    body_start
+        .checked_add(content_length)
+        .ok_or_else(|| anyhow!("AP2 RTSP response body length overflows"))
+}
+
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
@@ -843,6 +870,16 @@ mod tests {
         let ports = parse_stream_ports(&body).unwrap();
         assert_eq!(ports.data, 6010);
         assert_eq!(ports.control, 6011);
+    }
+
+    #[test]
+    fn body_end_caps_and_never_overflows() {
+        assert_eq!(body_end(40, 0).unwrap(), 40);
+        assert_eq!(body_end(40, 300).unwrap(), 340);
+        assert_eq!(body_end(40, MAX_BODY_BYTES).unwrap(), 40 + MAX_BODY_BYTES);
+        assert!(body_end(40, MAX_BODY_BYTES + 1).is_err());
+        assert!(body_end(40, usize::MAX).is_err());
+        assert!(body_end(usize::MAX, 1).is_err());
     }
 
     #[test]
