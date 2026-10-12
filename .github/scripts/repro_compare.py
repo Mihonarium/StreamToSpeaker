@@ -51,7 +51,7 @@ byte-identical (e.g. what an installer put on disk vs the package it is
 supposed to bundle).
 
 `plan` reads a driver-v* release manifest and says how that driver was
-built, so the rebuild can repeat it without per-release inputs:
+built, so the rebuild can repeat it without being told per release:
 
   * certified (`certified: true`, HLK lab build): reference package =
     `lab_zip`, driver.h compiled as committed, built at C:\\build\\src;
@@ -66,10 +66,14 @@ error (exit 1 with the list of problems), never a pass.
 
 `buildroot` resolves the directory to build in. The linker embeds the PDB
 path, so the rebuild has to happen at the path the reference binary was
-linked at: for an attested release that path is read from the reference
-.sys (and must agree with the manifest's `build_root` when it records
-one); a certified release keeps C:\\build\\src unless the manifest records
-another. `--build-root` overrides either.
+linked at. For an attested release that path is read from the reference
+.sys (<root>\\driver\\x64\\Release\\StreamToSpeaker.pdb); the manifest's
+`build_root` is used when the PDB path does not have that form, and a
+`build_root` that disagrees with the binary is reported as a warning (the
+binary decides). A certified release is built at C:\\build\\src.
+`--build-root` overrides either. The result has to be a plain directory
+path at least two levels below a drive root (see valid_build_root), or it
+is an error.
 
 `tree --stamped-build N` allows exactly one difference between the two
 trees: driver/driver.h, which must be the checkout's file with
@@ -563,10 +567,29 @@ def print_tree_report(rep):
 CERTIFIED_BUILD_ROOT = "C:\\build\\src"
 PDB_TAIL_RE = re.compile(r"(?P<root>[A-Za-z]:(?:\\[^\\/:*?\"<>|\x00-\x1f\x7f]+)+)"
                          r"\\driver\\x64\\Release\\StreamToSpeaker\.pdb", re.IGNORECASE)
-# At least <drive>:\\a\\b: the build step empties this directory first.
-BUILD_ROOT_RE = re.compile(r"[A-Za-z]:(?:\\[^\\/:*?\"<>|\x00-\x1f\x7f]+){2,}\\?")
 HEX64_RE = re.compile(r"[0-9a-fA-F]{64}")
 ASSET_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+BAD_COMPONENT_CHARS_RE = re.compile(r'[\\/:*?"<>|\[\]\x00-\x1f\x7f]')
+
+
+def valid_build_root(path):
+    """Is `path` a plain absolute Windows directory at least two levels
+    below a drive root (<drive>:\\a\\b, one trailing backslash tolerated)?
+
+    The build step empties this directory before it copies the source in,
+    so nothing shallower is accepted, and no component that Windows or
+    PowerShell would read as something else: `.` / `..`, a leading space,
+    a trailing dot or space, wildcard brackets, control characters."""
+    if not isinstance(path, str):
+        return False
+    parts = (path[:-1] if path.endswith("\\") else path).split("\\")
+    if len(parts) < 3 or not re.fullmatch(r"[A-Za-z]:", parts[0]):
+        return False
+    for comp in parts[1:]:
+        if (not comp or comp in (".", "..") or comp[0] == " " or comp[-1] in ". "
+                or BAD_COMPONENT_CHARS_RE.search(comp)):
+            return False
+    return True
 
 
 def build_plan(manifest, tag, build_number=None):
@@ -600,29 +623,32 @@ def build_plan(manifest, tag, build_number=None):
     if build_number not in (None, "") and build is not None and str(build_number) != str(build):
         errors.append(f"build_number input ({build_number}) differs from the manifest's driver_build ({build})")
 
-    def optional(field, pattern):
+    def optional(field, check):
+        """A field that may be absent; when present it must pass `check`
+        (a compiled pattern to match in full, or a predicate)."""
         v = m.get(field)
         if v in (None, ""):
             return ""
-        if not isinstance(v, str) or not pattern.fullmatch(v):
+        ok = isinstance(v, str) and (check(v) if callable(check) else bool(check.fullmatch(v)))
+        if not ok:
             errors.append(f"the manifest of {tag} has a malformed {field}: {v!r}")
             return ""
         return v
 
-    recorded_root = optional("build_root", re.compile(r"[A-Za-z]:(?:\\[^\\/:*?\"<>|\x00-\x1f\x7f]+)+\\?"))
     plan = {"tag": tag, "version": version, "build_number": str(build) if build is not None else None}
     if certified and attested:
         errors.append(f"the manifest of {tag} claims to be both certified and attested")
         plan.update(kind="")
     elif certified:
-        # Lab build: tree as committed, fixed build directory. An older
-        # certified manifest without lab_zip falls back to the conventional
-        # asset name; the download then decides.
+        # Lab build: tree as committed, fixed build directory (a manifest
+        # `build_root` is an attestation field and plays no part here). An
+        # older certified manifest without lab_zip falls back to the
+        # conventional asset name; the download then decides.
         plan.update(kind="certified", stamp_driver_h=False, reference_type="lab_zip",
                     reference_asset=optional("lab_zip", ASSET_RE) or (
                         f"StreamToSpeaker-Driver-{version}-lab-testsigned.zip" if version else None),
                     reference_sha256=optional("lab_zip_sha256", HEX64_RE).lower(),
-                    manifest_build_root=recorded_root or CERTIFIED_BUILD_ROOT)
+                    manifest_build_root="")
     elif attested:
         cab = need("submission_cab", "the submission CAB holding the unsigned driver that was built", ASSET_RE)
         cab_sha = need("submission_cab_signed_sha256",
@@ -632,7 +658,7 @@ def build_plan(manifest, tag, build_number=None):
                           "attested builds are expected to stamp driver.h")
         plan.update(kind="attested", stamp_driver_h=True, reference_type="submission_cab",
                     reference_asset=cab, reference_sha256=(cab_sha or "").lower(),
-                    manifest_build_root=recorded_root)
+                    manifest_build_root=optional("build_root", valid_build_root))
     else:
         errors.append(f"the manifest of {tag} is neither certified nor attested: "
                       "there is no Microsoft-signed driver to verify")
@@ -653,7 +679,11 @@ def print_plan(plan):
     print(f"  driver.h stamped  : {plan['stamp_driver_h']}")
     print(f"  reference package : {plan['reference_asset']} ({plan['reference_type']}"
           f"{', sha256 ' + plan['reference_sha256'] if plan['reference_sha256'] else ''})")
-    print(f"  build root        : {plan['manifest_build_root'] or '(from the reference .sys PDB path)'}")
+    if plan["kind"] == "certified":
+        print(f"  build directory   : {CERTIFIED_BUILD_ROOT}")
+    else:
+        print("  build directory   : where the submitted .sys was linked "
+              f"(manifest build_root: {plan['manifest_build_root'] or 'not recorded'})")
 
 
 def pdb_build_root(pdb_path):
@@ -666,22 +696,38 @@ def same_path(a, b):
     return a.rstrip("\\/").replace("/", "\\").lower() == b.rstrip("\\/").replace("/", "\\").lower()
 
 
-def resolve_build_root(plan, reference_pdb_path, override=None):
-    """(build_root, source, error). See the module docstring (`buildroot`)."""
-    if override:
-        return override, "build_root input", None
+def resolve_build_root(plan, pdb_path, override=None):
+    """Where to rebuild: {"root", "source", "warning", "error"} (`root` is
+    None exactly when `error` is set). See the module docstring
+    (`buildroot`)."""
+    res = {"root": None, "source": None, "warning": None, "error": None}
     recorded = plan.get("manifest_build_root") or ""
-    if plan.get("kind") == "certified":
-        return recorded or CERTIFIED_BUILD_ROOT, "certified lab build directory", None
-    derived = pdb_build_root(reference_pdb_path)
-    if not derived:
-        return None, None, ("the submitted .sys records the PDB path "
-                            f"{reference_pdb_path!r}, which is not <root>\\driver\\x64\\Release\\StreamToSpeaker.pdb: "
-                            "cannot tell where the driver was built")
-    if recorded and not same_path(recorded, derived):
-        return None, None, (f"the manifest records build_root {recorded} but the submitted .sys was linked "
-                            f"at {derived}")
-    return derived, "PDB path of the submitted .sys" + (" (= manifest build_root)" if recorded else ""), None
+    if override:
+        res.update(root=override, source="build_root input")
+    elif plan.get("kind") == "certified":
+        res.update(root=CERTIFIED_BUILD_ROOT, source="certified lab build directory")
+    elif plan.get("kind") == "attested":
+        derived = pdb_build_root(pdb_path)
+        if derived:
+            res.update(root=derived, source="PDB path of the submitted .sys")
+            if recorded and not same_path(recorded, derived):
+                res["warning"] = (f"the manifest records build_root {recorded} but the submitted .sys was "
+                                  f"linked at {derived}; building where the binary was linked")
+        elif recorded:
+            res.update(root=recorded, source="manifest build_root; the PDB path of the submitted .sys "
+                                             "does not have the expected form")
+        else:
+            res["error"] = ("the submitted .sys records the PDB path "
+                            f"{pdb_path!r}, which is not <root>\\driver\\x64\\Release\\StreamToSpeaker.pdb, "
+                            "and the manifest records no build_root: cannot tell where the driver was built")
+    else:
+        res["error"] = f"no build plan for release kind {plan.get('kind')!r}"
+    if res["root"] is not None and not valid_build_root(res["root"]):
+        res.update(root=None, error=f"build root {res['root']!r} is not a plain directory path at least two "
+                                    "levels below a drive root; refusing to build there")
+    elif res["root"] is not None and res["root"].endswith("\\"):
+        res["root"] = res["root"][:-1]
+    return res
 
 
 def reference_pdb_path(sys_path):
@@ -825,16 +871,15 @@ def main(argv=None):
         except (OSError, ValueError, struct.error) as e:
             print(f"::error::could not read the PDB path of {a.fresh}: {e}")
             return 1
-        root, source, err = resolve_build_root(plan, pdb, a.build_root)
+        res = resolve_build_root(plan, pdb, a.build_root)
         print(f"reference .sys PDB path: {pdb!r}")
-        if not err and not BUILD_ROOT_RE.fullmatch(root):
-            err = (f"build root {root!r} is not a directory at least two levels below a drive root; "
-                   "refusing to build there")
-        if err:
-            print(f"::error::{err}")
+        if res["error"]:
+            print(f"::error::{res['error']}")
             return 1
-        print(f"build root: {root} ({source})")
-        gh_output(build_root=root, reference_pdb_path=pdb)
+        if res["warning"]:
+            print(f"::warning::{res['warning']}")
+        print(f"build root: {res['root']} ({res['source']})")
+        gh_output(build_root=res["root"])
         return 0
     if a.kind == "files":
         rep = compare_files(a.released, a.fresh)

@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import struct
@@ -258,7 +260,7 @@ class BuildPlan(unittest.TestCase):
         self.assertEqual(plan["reference_type"], "lab_zip")
         self.assertEqual(plan["reference_asset"], "StreamToSpeaker-Driver-1.1.1.211-lab-testsigned.zip")
         self.assertEqual(plan["reference_sha256"], "aa" * 32)
-        self.assertEqual(rc.resolve_build_root(plan, "whatever")[0], "C:\\build\\src")
+        self.assertEqual(rc.resolve_build_root(plan, "whatever")["root"], "C:\\build\\src")
 
     def test_certified_without_lab_zip_uses_the_conventional_name(self):
         m = dict(CERTIFIED_MANIFEST, lab_zip=None, lab_zip_sha256=None)
@@ -349,37 +351,95 @@ class BuildRoot(unittest.TestCase):
 
     def test_attested_root_comes_from_the_submitted_binary(self):
         plan = rc.build_plan(ATTESTED_MANIFEST, "t")
-        root, source, err = rc.resolve_build_root(plan, RUNNER_PDB)
-        self.assertEqual((root, err), (RUNNER_ROOT, None))
-        self.assertIn("PDB path", source)
+        res = rc.resolve_build_root(plan, RUNNER_PDB)
+        self.assertEqual((res["root"], res["error"], res["warning"]), (RUNNER_ROOT, None, None))
+        self.assertIn("PDB path", res["source"])
 
-    def test_attested_root_must_agree_with_a_recorded_one(self):
-        ok = rc.build_plan(dict(ATTESTED_MANIFEST, build_root="d:\\a\\streamtospeaker\\StreamToSpeaker\\"), "t")
-        self.assertEqual(rc.resolve_build_root(ok, RUNNER_PDB)[0], RUNNER_ROOT)
-        bad = rc.build_plan(dict(ATTESTED_MANIFEST, build_root="C:\\elsewhere"), "t")
-        root, _source, err = rc.resolve_build_root(bad, RUNNER_PDB)
-        self.assertIsNone(root)
-        self.assertIn("C:\\elsewhere", err)
+    def test_attested_recorded_root_agreeing_with_the_binary(self):
+        plan = rc.build_plan(dict(ATTESTED_MANIFEST, build_root="d:\\a\\streamtospeaker\\StreamToSpeaker\\"), "t")
+        res = rc.resolve_build_root(plan, RUNNER_PDB)
+        self.assertEqual((res["root"], res["error"], res["warning"]), (RUNNER_ROOT, None, None))
 
-    def test_attested_without_usable_pdb_path_fails(self):
-        plan = rc.build_plan(ATTESTED_MANIFEST, "t")
-        for pdb in ("", "StreamToSpeaker.pdb"):
-            root, _source, err = rc.resolve_build_root(plan, pdb)
-            self.assertIsNone(root)
-            self.assertIn("cannot tell where the driver was built", err)
-        # ... even when the manifest records a root: the binary decides.
+    def test_attested_recorded_root_disagreeing_warns_and_the_binary_decides(self):
+        plan = rc.build_plan(dict(ATTESTED_MANIFEST, build_root="C:\\else\\where"), "t")
+        self.assertTrue(plan["ok"], plan["errors"])
+        res = rc.resolve_build_root(plan, RUNNER_PDB)
+        self.assertEqual((res["root"], res["error"]), (RUNNER_ROOT, None))
+        self.assertIn("C:\\else\\where", res["warning"])
+        self.assertIn(RUNNER_ROOT, res["warning"])
+
+    def test_attested_without_usable_pdb_path_uses_the_recorded_root(self):
         plan = rc.build_plan(dict(ATTESTED_MANIFEST, build_root=RUNNER_ROOT), "t")
-        self.assertIsNone(rc.resolve_build_root(plan, "")[0])
+        for pdb in ("", "StreamToSpeaker.pdb", "D:\\x\\y\\StreamToSpeaker.pdb"):
+            res = rc.resolve_build_root(plan, pdb)
+            self.assertEqual((res["root"], res["error"]), (RUNNER_ROOT, None), pdb)
+            self.assertIn("manifest build_root", res["source"])
+
+    def test_attested_without_usable_pdb_path_or_recorded_root_fails(self):
+        plan = rc.build_plan(ATTESTED_MANIFEST, "t")
+        for pdb in ("", "StreamToSpeaker.pdb", "D:\\x\\y\\StreamToSpeaker.pdb"):
+            res = rc.resolve_build_root(plan, pdb)
+            self.assertIsNone(res["root"])
+            self.assertIn("cannot tell where the driver was built", res["error"])
 
     def test_override_wins(self):
         plan = rc.build_plan(ATTESTED_MANIFEST, "t")
-        self.assertEqual(rc.resolve_build_root(plan, RUNNER_PDB, "E:\\x")[0], "E:\\x")
+        self.assertEqual(rc.resolve_build_root(plan, RUNNER_PDB, "E:\\x\\y")["root"], "E:\\x\\y")
+        self.assertEqual(rc.resolve_build_root(plan, "", "E:\\x\\y")["root"], "E:\\x\\y")
         plan = rc.build_plan(CERTIFIED_MANIFEST, "t")
-        self.assertEqual(rc.resolve_build_root(plan, "", "E:\\x")[0], "E:\\x")
+        self.assertEqual(rc.resolve_build_root(plan, "", "E:\\x\\y")["root"], "E:\\x\\y")
 
-    def test_certified_recorded_root(self):
-        plan = rc.build_plan(dict(CERTIFIED_MANIFEST, build_root="C:\\lab\\src"), "t")
-        self.assertEqual(rc.resolve_build_root(plan, RUNNER_PDB)[0], "C:\\lab\\src")
+    def test_certified_root_is_fixed(self):
+        # build_root is an attestation field; a lab build is always
+        # rebuilt at the fixed directory, whatever else is in the manifest
+        # or the lab binary.
+        for m in (CERTIFIED_MANIFEST, dict(CERTIFIED_MANIFEST, build_root="C:\\lab\\src"),
+                  dict(CERTIFIED_MANIFEST, build_root="not a path")):
+            plan = rc.build_plan(m, "t")
+            self.assertTrue(plan["ok"], plan["errors"])
+            res = rc.resolve_build_root(plan, RUNNER_PDB)
+            self.assertEqual((res["root"], res["warning"]), ("C:\\build\\src", None))
+
+    def test_valid_build_root(self):
+        for good in ("C:\\build\\src", RUNNER_ROOT, RUNNER_ROOT + "\\", "D:\\a b\\c d", "c:\\x\\y.z\\w"):
+            self.assertTrue(rc.valid_build_root(good), good)
+        for bad in ("C:\\", "C:", "C:\\Windows", "D:\\a", "D:\\a\\", "relative\\dir", "\\\\server\\share\\a\\b",
+                    "D:/a/b", "D:\\a\\\\b", "C:\\a\\..", "D:\\a\\x\\..\\y", "D:\\a\\.\\b", "D:\\a\\b.", "D:\\a\\b ",
+                    "D:\\a\\ b", "D:\\a\\b[c]", "D:\\a\\b*", "D:\\a\\b?", "D:\\a\\b\nx", "D:\\a\\b\x7f", "D:\\a\\b:c",
+                    "", None, 5, ["D:\\a\\b"]):
+            self.assertFalse(rc.valid_build_root(bad), repr(bad))
+
+    def test_recorded_root_trailing_backslash_is_dropped(self):
+        plan = rc.build_plan(dict(ATTESTED_MANIFEST, build_root=RUNNER_ROOT + "\\"), "t")
+        self.assertEqual(rc.resolve_build_root(plan, "")["root"], RUNNER_ROOT)
+
+    def test_shallow_or_relative_roots_are_refused(self):
+        # The build step empties the directory: never a drive root or a
+        # top-level directory, wherever the path came from.
+        attested = rc.build_plan(ATTESTED_MANIFEST, "t")
+        for shallow in ("C:\\", "C:\\Windows", "D:\\a", "relative\\dir", "\\\\server\\share\\a\\b", "D:\\a\\b\nx",
+                        "D:\\a\\x\\..", "D:\\a\\StreamToSpeake[r]"):
+            res = rc.resolve_build_root(attested, RUNNER_PDB, shallow)
+            self.assertIsNone(res["root"], shallow)
+            self.assertIn("refusing to build there", res["error"])
+        # ... also when the path comes out of the submitted binary:
+        for pdb in ("D:\\a\\driver\\x64\\Release\\StreamToSpeaker.pdb",
+                    "D:\\a\\x\\..\\driver\\x64\\Release\\StreamToSpeaker.pdb",
+                    "D:\\a\\x\\y.\\driver\\x64\\Release\\StreamToSpeaker.pdb"):
+            res = rc.resolve_build_root(attested, pdb)
+            self.assertIsNone(res["root"], pdb)
+            self.assertIn("refusing to build there", res["error"])
+
+    def test_attested_manifest_with_an_unusable_build_root_fails(self):
+        for bad in ("D:\\a", "D:\\a\\x\\..", "relative\\dir", "D:\\a\\b[c]"):
+            plan = rc.build_plan(dict(ATTESTED_MANIFEST, build_root=bad), "t")
+            self.assertFalse(plan["ok"], bad)
+            self.assertTrue(any("build_root" in e for e in plan["errors"]))
+
+    def test_unknown_kind_has_no_root(self):
+        res = rc.resolve_build_root({"kind": ""}, RUNNER_PDB)
+        self.assertIsNone(res["root"])
+        self.assertIn("no build plan", res["error"])
 
 
 class PlanCli(unittest.TestCase):
@@ -421,7 +481,6 @@ class PlanCli(unittest.TestCase):
             f.write(make_pe(pdb_path=RUNNER_PDB.encode("ascii")))
         self.assertEqual(rc.main(["buildroot", plan_json, sys_path]), 0)
         self.assertEqual(self.outputs()["build_root"], RUNNER_ROOT)
-        self.assertEqual(self.outputs()["reference_pdb_path"], RUNNER_PDB)
 
     def test_buildroot_fails_when_the_submitted_binary_has_no_usable_pdb_path(self):
         plan_json = os.path.join(self.tmp, "plan.json")
@@ -434,6 +493,30 @@ class PlanCli(unittest.TestCase):
         with open(sys_path, "wb") as f:
             f.write(b"not a PE")
         self.assertEqual(rc.main(["buildroot", plan_json, sys_path]), 1)
+
+    def test_buildroot_with_a_recorded_root(self):
+        plan_json = os.path.join(self.tmp, "plan.json")
+        sys_path = os.path.join(self.tmp, "ref.sys")
+        # PDB path of an unexpected form: the manifest's build_root is used.
+        self.assertEqual(rc.main(["plan", self.manifest(dict(ATTESTED_MANIFEST, build_root=RUNNER_ROOT,
+                                                             driver_h_stamped=True)),
+                                  "driver-v1.1.0.204", "--json", plan_json]), 0)
+        with open(sys_path, "wb") as f:
+            f.write(make_pe())  # C:\src\driver.pdb
+        self.assertEqual(rc.main(["buildroot", plan_json, sys_path]), 0)
+        self.assertEqual(self.outputs()["build_root"], RUNNER_ROOT)
+        # A recorded root that disagrees with the binary: warned about, the
+        # binary decides.
+        os.remove(self.out)
+        self.assertEqual(rc.main(["plan", self.manifest(dict(ATTESTED_MANIFEST, build_root="C:\\else\\where")),
+                                  "driver-v1.1.0.204", "--json", plan_json]), 0)
+        with open(sys_path, "wb") as f:
+            f.write(make_pe(pdb_path=RUNNER_PDB.encode("ascii")))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(rc.main(["buildroot", plan_json, sys_path]), 0)
+        self.assertIn("::warning::the manifest records build_root C:\\else\\where", buf.getvalue())
+        self.assertEqual(self.outputs()["build_root"], RUNNER_ROOT)
 
     def test_gh_output_refuses_multi_line_values(self):
         with self.assertRaises(ValueError):

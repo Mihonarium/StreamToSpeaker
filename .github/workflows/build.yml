@@ -582,10 +582,15 @@ jobs:
 
   # -------------------------------------------------------------------
   # Tag-push release pipeline: build → sign-service → package →
-  # verify-driver → sign-release. verify-driver rebuilds the driver from the
-  # tagged source and proves the installer `package` produced bundles
-  # exactly that driver (driver-reproducibility.yml); nothing is signed
-  # unless it passes. Every EV signature goes through the central signing repo
+  # verify-driver → sign-release. verify-driver (driver-reproducibility.yml)
+  # rebuilds the driver from the tagged source, requires it to match the
+  # Microsoft-signed driver release `package` picked (identical apart from
+  # the masked build-varying header fields) and requires the installer
+  # `package` produced to bundle that release's signed package byte for
+  # byte. An installer with a Microsoft-signed driver is not signed unless
+  # it passes; the test-signed fallback skips it with a warning. The
+  # service exe is signed before it runs.
+  # Every EV signature goes through the central signing repo
   # (Mihonarium/signing, sign.yml) via .github/actions/request-signing:
   # dispatch with a release-asset URL + its hash, wait for the human
   # approval gate there, then verify + publish the signed bytes. Two
@@ -788,7 +793,7 @@ jobs:
               }
               $suffix = "-testsigned"
               Write-Host "##[warning]No Microsoft-signed driver matches this tag's driver source - shipping the TEST-SIGNED driver (users need testsigning mode). Run an HLK round (Driver certified) or the driver submission + attestation flow (docs/driver-signing.md), then tag again."
-              Write-Host "##[warning]Driver reproducibility gate SKIPPED: the bundled test-signed driver was built from this tag's source by the build job; there is no Microsoft-signed package to compare."
+              Write-Host "##[warning]Driver reproducibility gate SKIPPED: the bundled test-signed driver is CI's own build of this tag's driver source (the build job or its driver cache); there is no Microsoft-signed package to compare."
           }
 
           $base = "StreamToSpeakerSetup-${{ needs.build.outputs.version }}$suffix"
@@ -812,7 +817,7 @@ jobs:
                 -Kind test-signed -SourceHash "${{ needs.build.outputs.source_hash }}"
           }
 
-      - name: Attach installer + driver package to the release
+      - name: Attach installer to the release
         id: attach
         shell: pwsh
         run: |
@@ -847,8 +852,9 @@ jobs:
   # installer `package` just attached (by exact name and sha256) and check
   # its driver files are that Signed.zip byte for byte with no test
   # certificate. Read-only, no secrets. Skipped only for the test-signed
-  # fallback, whose driver the build job compiled from this tag's source
-  # itself; package and sign-release log that loudly.
+  # fallback, whose driver is CI's own build of this tag's driver source
+  # (the build job, or its cache keyed on the driver source hash); package
+  # and sign-release log that loudly.
   verify-driver:
     if: startsWith(github.ref, 'refs/tags/v') && needs.package.outputs.driver_found == 'true'
     needs: package

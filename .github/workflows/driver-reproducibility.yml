@@ -3,9 +3,10 @@
 # Rebuilds the kernel driver from the checked-out source the way the given
 # driver-v* release was built, and compares the result with that release:
 # the unsigned/lab-signed reference binary it was signed from, and the
-# Microsoft-signed package installers bundle. How the release was built is
-# read from its manifest.json (`repro_compare.py plan`), so only `tag` is
-# needed:
+# Microsoft-signed package installers bundle. How the release was built
+# follows from its manifest.json (`repro_compare.py plan`): its kind, build
+# number and reference package. Only `tag` has to be given (and `commit`
+# when the ref this runs from does not hold that driver's source):
 #
 #   * certified (WHQL, manifest `certified: true`): reference package =
 #     `lab_zip` (the test-signed package the HLK lab tested). Built from the
@@ -17,10 +18,11 @@
 #     Microsoft signed from (its SHA-256 must equal
 #     `submission_cab_signed_sha256`). driver.h is stamped with
 #     `driver_build` exactly as that workflow does, and the build happens in
-#     the directory the submitted .sys was linked in (read from its PDB
-#     path, normally the runner checkout D:\a\<repo>\<repo>; it must agree
-#     with the manifest's `build_root` when recorded). When that directory
-#     is this job's own checkout the build runs in place.
+#     the directory the submitted .sys was linked in: read from its PDB
+#     path (normally the runner checkout D:\a\<repo>\<repo>), or the
+#     manifest's `build_root` when the PDB path does not have the expected
+#     form; a `build_root` that disagrees with the binary only warns. When
+#     that directory is this job's own checkout the build runs in place.
 #
 # A manifest that is neither, or lacks a field the rebuild needs, fails the
 # job at the manifest step. Both kinds use msbuild Release|x64, SignMode=Off
@@ -234,12 +236,14 @@ jobs:
         shell: pwsh
         working-directory: repro-tools/.github/scripts
         run: |
-          python -m unittest test_repro_compare
+          # -b: the tests exercise failure paths that print workflow
+          # commands (::error::); only show output of a failing test.
+          python -m unittest -b test_repro_compare
           if ($LASTEXITCODE -ne 0) { throw "repro_compare.py unit tests failed" }
 
-      # How the release was built comes from its manifest (kind, build
-      # number, reference package, whether driver.h was stamped); nothing
-      # here is a per-release input. An unusable manifest stops the job.
+      # How the release was built follows from its manifest (kind, build
+      # number, reference package, whether driver.h was stamped), not from
+      # inputs. An unusable manifest stops the job.
       - name: Fetch release manifest and reference package
         id: release
         shell: pwsh
@@ -302,7 +306,7 @@ jobs:
           $rootArgs = @("buildroot", "plan.json", "released/reference/StreamToSpeaker.sys")
           if ($env:ROOT_OVERRIDE) { $rootArgs += @("--build-root", $env:ROOT_OVERRIDE) }
           python repro-tools/.github/scripts/repro_compare.py @rootArgs
-          if ($LASTEXITCODE -ne 0) { throw "could not tell where $env:TAG was built (see the error above); future attested releases record build_root in the manifest" }
+          if ($LASTEXITCODE -ne 0) { throw "no usable build directory for $env:TAG (see the error above)" }
           "reference_label=$(if ($plan.kind -eq 'certified') { 'lab package' } else { 'submission CAB' })" >> $env:GITHUB_OUTPUT
 
       # ---- WDK: copied from build.yml (same paths, same cache key) ----
@@ -433,6 +437,9 @@ jobs:
           $ErrorActionPreference = "Stop"
           $root = $env:BUILD_ROOT
           if (-not $root -or $env:BUILD_NUMBER -notmatch '^\d+$') { throw "no build root / build number resolved from the release manifest" }
+          # repro_compare.py only hands out plain absolute paths; make sure
+          # Windows reads this one the same way before anything is deleted.
+          if ([IO.Path]::GetFullPath($root).TrimEnd('\') -ine $root.TrimEnd('\')) { throw "build root $root is not a canonical absolute path" }
           $ws = (Resolve-Path $env:GITHUB_WORKSPACE).Path.TrimEnd('\')
           $inPlace = $root.TrimEnd('\') -ieq $ws
           if ($inPlace) {
@@ -448,10 +455,12 @@ jobs:
           } else {
               $pristine = "."
               # The directory is emptied first: never one that contains
-              # this checkout.
-              if ("$ws\".StartsWith($root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw "build root $root contains the job's workspace $ws; refusing to build there" }
+              # this checkout or lies inside it.
+              $rootDir = $root.TrimEnd('\') + '\'
+              if ("$ws\".StartsWith($rootDir, [StringComparison]::OrdinalIgnoreCase)) { throw "build root $root contains the job's workspace $ws; refusing to build there" }
+              if ($rootDir.StartsWith("$ws\", [StringComparison]::OrdinalIgnoreCase)) { throw "build root $root is inside the job's workspace $ws; refusing to build there" }
               try {
-                  if (Test-Path $root) { Remove-Item -Recurse -Force $root }
+                  if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
                   New-Item -ItemType Directory -Force -Path $root | Out-Null
               } catch {
                   throw "cannot create the build directory $root on this runner ($_); the release was linked at that path and the PDB path is part of the image layout"
