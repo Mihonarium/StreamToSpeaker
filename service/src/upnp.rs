@@ -14,7 +14,7 @@
 use anyhow::{anyhow, Context, Result};
 use log::debug;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
@@ -308,8 +308,12 @@ pub fn encode_stream_uri(stream_uri: &str) -> String {
 // Low-level SOAP POST + helpers
 // -----------------------------------------------------------------------------
 
+/// Largest SOAP response accepted. The biggest real reply is a Sonos
+/// GetZoneGroupState for a large household (escaped XML, well under 1 MiB).
+const MAX_SOAP_RESPONSE_BYTES: usize = 4 << 20;
+
 fn soap_post(control_url: &str, soap_action: &str, body: &str) -> Result<String> {
-    soap_post_with_limit(control_url, soap_action, body, usize::MAX)
+    soap_post_with_limit(control_url, soap_action, body, MAX_SOAP_RESPONSE_BYTES)
 }
 
 fn soap_post_with_limit(
@@ -357,17 +361,12 @@ fn soap_post_with_limit(
     stream.write_all(body_bytes)?;
     stream.flush()?;
 
-    let mut buf = Vec::with_capacity(4096);
-    stream
-        .take(response_limit.saturating_add(1) as u64)
-        .read_to_end(&mut buf)?;
-    if buf.len() > response_limit {
-        return Err(anyhow!(
-            "SOAP {} response exceeds {} bytes",
-            soap_action,
-            response_limit
-        ));
-    }
+    let buf = crate::ssdp::read_to_end_bounded(
+        &mut stream,
+        response_limit,
+        std::time::Instant::now() + crate::ssdp::RESPONSE_DEADLINE,
+    )
+    .with_context(|| format!("reading SOAP {} response", soap_action))?;
 
     // Split head/body on bytes, then peel chunked transfer-encoding if
     // present. Sonos chunks HTTP/1.1 responses (same behavior ssdp.rs's

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::app::App;
 use crate::audio_source::{AudioPacket, AudioSource, PACKET_FLAG_HINT_SILENT, PACKET_FLAG_STREAM_RESTART};
+use crate::equalizer::Equalizer;
 use crate::http_server::{samples_to_l16_be_bytes, PcmFrame};
 use crate::silence::SilenceDetector;
 use crate::{WIRE_CHANNELS, WIRE_SAMPLE_RATE};
@@ -29,6 +30,10 @@ pub fn run(app: Arc<App>, mut source: Box<dyn AudioSource>) -> Result<()> {
     // KSSTATE_RUN). Pacing controlled by silence_pace_ms atomic.
     const SILENCE_FRAMES: usize = WIRE_SAMPLE_RATE as usize / 100;
     let mut next_silence_deadline = Instant::now();
+
+    // Equalizer: a no-op until a curve is enabled; new curves arrive
+    // from `app.eq` and are crossfaded in.
+    let mut eq = Equalizer::new(WIRE_SAMPLE_RATE, WIRE_CHANNELS);
 
     // Rate-fudge accumulator for clock-skew compensation.
     let mut fudge_accum: f64 = 0.0;
@@ -65,6 +70,7 @@ pub fn run(app: Arc<App>, mut source: Box<dyn AudioSource>) -> Result<()> {
                 std::thread::sleep(next_silence_deadline - now);
             }
             next_silence_deadline = next_silence_deadline.max(now) + pace;
+            app.idle_silence_packets.fetch_add(1, Ordering::Relaxed);
             AudioPacket::silence(SILENCE_FRAMES)
         };
 
@@ -93,6 +99,13 @@ pub fn run(app: Arc<App>, mut source: Box<dyn AudioSource>) -> Result<()> {
                 + Duration::from_millis(app.silence_pace_ms.load(Ordering::Relaxed).max(1));
             debug!("audio: stream-stop drain received; emitting silence until StreamStart");
         }
+
+        // EQ before the silence detector, so the keep-alive noise floor
+        // it injects is never boosted.
+        if let Some(design) = app.eq.take_ready() {
+            eq.set_design(design);
+        }
+        eq.process(&mut pkt.samples);
 
         silence.process(&mut pkt);
 

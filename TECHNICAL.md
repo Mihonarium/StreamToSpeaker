@@ -67,8 +67,11 @@ cargo build --release
 .\target\release\stream-to-speaker.exe
 ```
 
-`pnputil /add-driver` only stages an upgrade: reboot, or disable and re-enable
-the device in Device Manager. The service log line
+`pnputil /add-driver` only stages an upgrade, and the driver's control device
+keeps the loaded image in memory until Windows restarts, so a new driver binary
+only runs after a reboot (disabling and re-enabling the device is not enough).
+The installer asks for a restart when an upgrade replaces the driver binary
+that was installed before. The service log line
 `StreamToSpeaker driver opened (proto=1 build=N ...)` confirms which build is
 live — `N` bumps on every shipped binary.
 
@@ -84,7 +87,10 @@ Output: `installer\out\StreamToSpeakerSetup-<version>.exe`. It installs the
 service to `Program Files`, stages the driver with `pnputil /add-driver
 /install`, runs `scripts\Rename-Endpoint.ps1`, and optionally adds Start Menu,
 desktop and autostart entries. Uninstall removes the driver via
-`Uninstall-Driver.ps1` and deletes the install directory.
+`Uninstall-Driver.ps1`, removes the test-signing certificate a test-signed
+build imported into `LocalMachine\Root` and `TrustedPublisher`
+(`Remove-TestCertificate.ps1`; an upgrade removes the replaced build's
+certificate when it differs), and deletes the install directory.
 
 ### Endpoint named "Internal AUX Jack — Stream To Speaker"
 
@@ -225,13 +231,24 @@ the crate version and update checks are off.
 |---|---|---|---|
 | `/stream.raw` | GET | Raw PCM the speaker pulls. | yes |
 | `/api/speakers` | GET | Discovered speakers. | `--web` |
-| `/api/select` | POST | `{"id": "<udn-or-ip>"}` — switch speaker. | `--web` |
+| `/api/select` | POST | `{"id": "<udn-or-ip>"}` with `Content-Type: application/json` — switch speaker. | `--web` |
 | `/api/resync` | POST | Restart the session. | `--web` |
 | `/api/latency/adjust?ms=N` | POST | `N>0` drains, `N<0` pads. | `--web` |
-| `/healthz` | GET | Returns `ok`. | `--web` |
+| `/healthz` | GET | Returns `ok`. | yes |
 
-> ⚠️ The API has no authentication. Leave it off (the default), bind to
-> `127.0.0.1`, or front it with a reverse proxy that authenticates.
+Requests must name this machine in `Host` (`localhost`, its computer name,
+one of its IP addresses, or `--advertise-ip`), and the `POST` routes refuse
+requests a browser marks as coming from another site (`Origin` /
+`Sec-Fetch-Site`), so a web page can't drive the API or read the stream
+through DNS rebinding. Scripts that send neither header are unaffected:
+
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{"id":"uuid:RINCON_..."}' http://localhost:5901/api/select
+```
+
+> ⚠️ The API has no authentication: anyone on the LAN can call it while it
+> is on. Leave it off (the default), bind to `127.0.0.1`, or front it with a
+> reverse proxy that authenticates.
 
 ## Continuous integration
 

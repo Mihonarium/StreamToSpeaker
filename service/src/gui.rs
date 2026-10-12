@@ -34,6 +34,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::app::App;
+use crate::equalizer::{
+    matching_preset, EqSettings, EQ_BANDS, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_GAIN_STEP_DB,
+    EQ_PREAMP_MAX_DB, EQ_PRESETS,
+};
 
 // -----------------------------------------------------------------------------
 // Design tokens
@@ -705,8 +709,11 @@ fn palette_for(dark: bool, system_accent: Option<(u8, u8, u8)>) -> Palette {
 // Run
 // -----------------------------------------------------------------------------
 
-pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
-    log::info!("gui::run starting (tray={})", show_tray);
+/// `start_hidden`: launched at sign-in — once the window exists, hide it
+/// to the tray (only when the tray icon was actually created, or the user
+/// would have no way to reach the app).
+pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
+    log::info!("gui::run starting (tray={} start_hidden={})", show_tray, start_hidden);
     // Note: we DON'T use ViewportBuilder::with_taskbar(false). winit
     // implements that by calling ITaskbarList::DeleteTab on the HWND,
     // which puts the window in a half-managed taskbar state where
@@ -801,6 +808,15 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
             } else {
                 None
             };
+            // A second launch during startup means the user wants the
+            // window, sign-in start or not.
+            let hide_to_tray = start_hidden
+                && tray.is_some()
+                && hwnd.is_some()
+                && !crate::single_instance::activation_pending();
+            if let Some(h) = hwnd {
+                crate::single_instance::set_window(h);
+            }
             if let Some(h) = hwnd {
                 if let Some(t) = tray.as_mut() {
                     t.set_hwnd(h);
@@ -825,7 +841,9 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 // DWM weirdness can leave the window in the
                 // wrong show-state regardless. Cheap to call and
                 // idempotent if the window is already visible.
-                force_show_normal(h);
+                if !hide_to_tray {
+                    force_show_normal(h);
+                }
             }
 
             let skip_close_confirmation = app_for_eframe.is_always_minimise_to_tray();
@@ -838,15 +856,28 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 frame_count: 0,
                 confirm_close_open: false,
                 password_prompt: None,
+                add_speaker_prompt: None,
+                speaker_settings_open: None,
+                settings_password: String::new(),
+                show_hidden_speakers: false,
                 pin_prompt: None,
+                sendspin_prompt: None,
+                show_ma_token: false,
                 last_fractional_scroll: None,
                 skip_close_confirmation,
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
+                homepod_latency_draft: None,
+                diagnostics_open: false,
+                diagnostics_copied_at: None,
+                eq_open: false,
+                eq_draft: None,
+                eq_previewed: None,
                 onboarding_dismissed: false,
                 last_applied_dark: None,
                 last_applied_accent: None,
                 hwnd,
+                hide_after_first_frame: hide_to_tray,
             }))
         }),
     );
@@ -873,15 +904,44 @@ struct StreamToSpeakerApp {
     skip_close_confirmation: bool,
     theme_mode: ThemeMode,
     advanced_open: bool,
+    /// HomePod delay while its slider is being dragged; saved on release.
+    homepod_latency_draft: Option<i64>,
+    /// The Diagnostics card is expanded (its counters are only gathered
+    /// while it is).
+    diagnostics_open: bool,
+    /// When "Copy diagnostics" last succeeded, for its confirmation.
+    diagnostics_copied_at: Option<Instant>,
+    /// Equalizer card expanded. Collapsing it discards an unapplied
+    /// draft (the stream returns to the saved curve).
+    eq_open: bool,
+    /// Curve being edited; `Some` while the card is open. Previewed live
+    /// on the stream, saved only by Apply.
+    eq_draft: Option<EqSettings>,
+    /// Last draft handed to the stream, so an unchanged draft isn't
+    /// re-sent every frame.
+    eq_previewed: Option<EqSettings>,
     onboarding_dismissed: bool,
     /// Open when the user is entering a password for a `pw=true` AirPlay
     /// speaker. `None` when no prompt is showing.
     password_prompt: Option<PasswordPrompt>,
+    /// Open while the user is adding a speaker by address.
+    add_speaker_prompt: Option<AddSpeakerPrompt>,
+    /// Speaker whose inline settings (⚙) are open.
+    speaker_settings_open: Option<String>,
+    /// Edit buffer for the open settings' AirPlay password field.
+    settings_password: String,
+    /// The list includes speakers the user hid.
+    show_hidden_speakers: bool,
     /// Open when an AP2 receiver (Apple TV with access control) is showing
     /// a PIN and awaiting one-time HomeKit pairing. Mirrors the app's
     /// `pending_pin_pairing` state each frame; `None` when no ceremony is
     /// in flight.
     pin_prompt: Option<PinPrompt>,
+    /// Open while a Sendspin speaker needs its pairing code or token.
+    /// Mirrors the app's `pending_sendspin_pairing` each frame.
+    sendspin_prompt: Option<SendspinPrompt>,
+    /// The Music Assistant card shows the pairing token in clear text.
+    show_ma_token: bool,
     /// When the last fractional (touchpad-shaped) wheel event arrived —
     /// drives the raw_input_hook's mouse-vs-touchpad classification (a
     /// fling's decay passes through exact integers, so integer deltas
@@ -904,6 +964,10 @@ struct StreamToSpeakerApp {
     /// tray-menu round-trip (emilk/egui#5229, #3655). Bypassing the
     /// queue with raw Win32 sidesteps the bug entirely.
     hwnd: Option<isize>,
+    /// Started from the sign-in entry: hide to the tray as soon as eframe
+    /// has shown the window (it makes the window visible after painting
+    /// the first frame, so hiding any earlier wouldn't stick).
+    hide_after_first_frame: bool,
 }
 
 /// Win32 helpers for hide/show. eframe's `ViewportCommand::Visible` /
@@ -1031,6 +1095,28 @@ impl eframe::App for StreamToSpeakerApp {
         if self.frame_count == 1 {
             log::info!("first GUI frame painting");
         }
+        if crate::single_instance::take_activation() {
+            // Raised by a second launch (the hand-off thread already showed
+            // the window if it existed): cancel a pending sign-in hide.
+            self.hide_after_first_frame = false;
+            if let Some(hwnd) = self.hwnd {
+                win_show_and_focus(hwnd);
+            }
+        }
+        if self.hide_after_first_frame {
+            if self.frame_count >= 2 {
+                self.hide_after_first_frame = false;
+                if let Some(hwnd) = self.hwnd {
+                    log::info!("started at sign-in: hiding to the tray");
+                    win_hide(hwnd);
+                }
+            } else {
+                // Get the second frame right away rather than on the
+                // 100 ms heartbeat, so the window is up as briefly as
+                // possible.
+                ctx.request_repaint();
+            }
+        }
 
         if self.last_repaint_request.elapsed() >= Duration::from_millis(100) {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -1117,9 +1203,7 @@ impl eframe::App for StreamToSpeakerApp {
             if self.tray.is_none() {
                 self.app.request_shutdown();
             } else if self.skip_close_confirmation {
-                if let Some(hwnd) = self.hwnd {
-                    win_hide(hwnd);
-                }
+                self.hide_to_tray();
             } else {
                 self.confirm_close_open = true;
             }
@@ -1148,7 +1232,10 @@ impl eframe::App for StreamToSpeakerApp {
         // persist it as that speaker's AirPlay password. The ceremony
         // keeps waiting (2-minute window), so the prompt simply appears
         // once the other modal closes.
-        if self.password_prompt.is_none() && !self.confirm_close_open {
+        if self.password_prompt.is_none()
+            && self.add_speaker_prompt.is_none()
+            && !self.confirm_close_open
+        {
             match self.app.pending_pin_pairing() {
                 Some((id, name)) => {
                     if self.pin_prompt.as_ref().map(|p| p.id != id).unwrap_or(true) {
@@ -1156,6 +1243,19 @@ impl eframe::App for StreamToSpeakerApp {
                     }
                 }
                 None => self.pin_prompt = None,
+            }
+        }
+
+        // Same mirroring for a Sendspin speaker that needs pairing; the
+        // connect thread waits (minutes) while the speaker shows its code.
+        if self.password_prompt.is_none() && self.pin_prompt.is_none() && !self.confirm_close_open {
+            match self.app.pending_sendspin_pairing() {
+                Some(view) => {
+                    if self.sendspin_prompt.as_ref().map(|p| p.view.id != view.id || p.view.kind != view.kind).unwrap_or(true) {
+                        self.sendspin_prompt = Some(SendspinPrompt { view, input: String::new() });
+                    }
+                }
+                None => self.sendspin_prompt = None,
             }
         }
 
@@ -1168,13 +1268,22 @@ impl eframe::App for StreamToSpeakerApp {
         if self.pin_prompt.is_some() {
             self.show_pin_modal(ctx, &p);
         }
+        if self.sendspin_prompt.is_some() {
+            self.show_sendspin_pair_modal(ctx, &p);
+        }
+        self.show_ma_code_window(ctx, &p);
+        if self.add_speaker_prompt.is_some() {
+            self.show_add_speaker_modal(ctx, &p);
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(p.canvas).inner_margin(sp::M))
             .show(ctx, |ui| {
                 let enabled = !self.confirm_close_open
                     && self.password_prompt.is_none()
-                    && self.pin_prompt.is_none();
+                    && self.pin_prompt.is_none()
+                    && self.sendspin_prompt.is_none()
+                    && self.add_speaker_prompt.is_none();
                 ui.add_enabled_ui(enabled, |ui| {
                     // Keep the header pinned at the top (theme toggle
                     // shouldn't scroll away); everything below scrolls
@@ -1234,11 +1343,19 @@ impl eframe::App for StreamToSpeakerApp {
                             ui.add_space(sp::M);
                             self.show_latency(ui, &p);
                             ui.add_space(sp::M);
+                            self.show_equalizer(ui, &p);
+                            ui.add_space(sp::M);
+                            if self.app.is_sendspin_available() {
+                                self.show_music_assistant(ui, &p);
+                                ui.add_space(sp::M);
+                            }
                             self.show_advanced(ui, &p);
                             ui.add_space(sp::M);
                             self.show_web_ui(ui, &p);
                             ui.add_space(sp::M);
                             self.show_stats(ui, &p);
+                            ui.add_space(sp::M);
+                            self.show_diagnostics(ui, &p);
                         });
 
                     // Floating pinned status bar: fades/slides in over the
@@ -1737,6 +1854,15 @@ impl StreamToSpeakerApp {
                 Some("Enable streaming"),
                 Some("Reconnect to the last speaker and resume streaming (Ctrl+E)"),
             ),
+            // Music Assistant selected while it is away (no address yet).
+            (Some(r), true, _) if r.ip.is_unspecified() => (
+                "\u{23F8}", // ⏸ Double Vertical Bar (Pause)
+                p.warn,
+                format!("Standing by on {}", r.friendly_name),
+                format!("{} not connected — resumes when it reconnects", r.friendly_name),
+                Some("Disable streaming"),
+                Some("Stop streaming and release the speaker for other apps (Ctrl+E)"),
+            ),
             (Some(r), true, true) => (
                 "\u{23F5}", // ⏵ Black Medium Right-Pointing Triangle (Play)
                 p.success,
@@ -2228,6 +2354,16 @@ impl StreamToSpeakerApp {
                     {
                         self.app.trigger_rescan();
                     }
+                    if secondary_button(ui, p, "+  Add", 76.0)
+                        .on_hover_text(
+                            "Add a speaker by its IP address or hostname — for speakers \
+                             discovery can't see (another subnet, VLAN, or a network that \
+                             blocks multicast).",
+                        )
+                        .clicked()
+                    {
+                        self.add_speaker_prompt = Some(AddSpeakerPrompt::default());
+                    }
                     // "Forget saved speaker" — only relevant when the
                     // user has a persisted last_speaker_id. Clears it
                     // and resets onboarding so the next launch feels
@@ -2305,10 +2441,51 @@ impl StreamToSpeakerApp {
                         .color(p.text_secondary),
                 );
             }
+            {
+                let net = self.app.discovery_net_status();
+                if let crate::discovery_net::Resolved::Paused { name } = &net.scope {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "⚠  Speaker search is paused: the network adapter \"{}\" is \
+                             unavailable (see Advanced).",
+                            name
+                        ))
+                        .size(12.0)
+                        .color(p.warn),
+                    );
+                }
+                if let Some(err) = net.error.as_deref() {
+                    ui.label(egui::RichText::new(err).size(12.0).color(p.danger));
+                }
+            }
             ui.add_space(sp::XS);
 
-            let view = self.app.speaker_view();
-            if view.speakers.is_empty() {
+            let all = self.app.speaker_view_opts(true);
+            let hidden_n = all.speakers.iter().filter(|s| s.hidden && !s.active).count();
+            if hidden_n == 0 {
+                self.show_hidden_speakers = false;
+            }
+            let show_hidden = self.show_hidden_speakers;
+            let speakers: Vec<_> = all
+                .speakers
+                .into_iter()
+                .filter(|s| show_hidden || !s.hidden || s.active)
+                .collect();
+            if hidden_n > 0 {
+                let text = match (show_hidden, hidden_n) {
+                    (true, _) => "Hide hidden speakers".to_string(),
+                    (false, 1) => "Show 1 hidden speaker".to_string(),
+                    (false, n) => format!("Show {} hidden speakers", n),
+                };
+                if clickable(ui.link(egui::RichText::new(text).size(12.0)))
+                    .on_hover_text("Speakers you hid with ⚙ → Hide this speaker.")
+                    .clicked()
+                {
+                    self.show_hidden_speakers = !show_hidden;
+                }
+                ui.add_space(sp::XS / 2.0);
+            }
+            if speakers.is_empty() && hidden_n == 0 {
                 ui.add_space(4.0);
                 // After ~10 s with no results, the user has waited
                 // long enough that "still searching" stops being
@@ -2353,9 +2530,12 @@ impl StreamToSpeakerApp {
                     }
                     ui.add_space(sp::XS);
                     ui.label(
-                        egui::RichText::new("Click Rescan above to try again.")
-                            .size(12.0)
-                            .color(p.text_tertiary),
+                        egui::RichText::new(
+                            "Click Rescan above to try again, or Add to enter the speaker's \
+                             address yourself.",
+                        )
+                        .size(12.0)
+                        .color(p.text_tertiary),
                     );
                 }
                 return;
@@ -2365,23 +2545,44 @@ impl StreamToSpeakerApp {
                 .max_height(190.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for sp in view.speakers {
-                        let mut prompt_for: Option<(String, String)> = None;
-                        speaker_row(ui, p, &sp, |id| {
-                            // Password-protected speaker → collect the
-                            // password first (pre-fill any stored one).
-                            if self.app.is_password_protected(id) {
-                                prompt_for = Some((id.to_string(), sp.friendly_name.clone()));
-                            } else {
-                                // Bring-up does seconds of network I/O —
-                                // run it off-thread; the status banner shows
-                                // "Connecting…" and errors arrive as toasts.
-                                self.app.select_speaker_async(id);
+                    for mut sp in speakers {
+                        if sp.hidden {
+                            sp.friendly_name.push_str("  · hidden");
+                        }
+                        let settings_open =
+                            self.speaker_settings_open.as_deref() == Some(sp.id.as_str());
+                        let trailing = Some(("⚙", "Settings for this speaker"));
+                        match speaker_row(ui, p, &sp, trailing) {
+                            RowAction::Select => {
+                                let id = sp.id.as_str();
+                                // Password-protected speaker → collect the
+                                // password first (pre-fill any stored one).
+                                if self.app.is_password_protected(id) {
+                                    let input = self.app.airplay_password(id).unwrap_or_default();
+                                    self.password_prompt = Some(PasswordPrompt {
+                                        id: id.to_string(),
+                                        name: sp.friendly_name.clone(),
+                                        input,
+                                    });
+                                } else {
+                                    // Bring-up does seconds of network I/O —
+                                    // run it off-thread; the status banner
+                                    // shows "Connecting…" and errors arrive
+                                    // as toasts.
+                                    self.app.select_speaker_async(id);
+                                }
                             }
-                        });
-                        if let Some((id, name)) = prompt_for {
-                            let input = self.app.airplay_password(&id).unwrap_or_default();
-                            self.password_prompt = Some(PasswordPrompt { id, name, input });
+                            RowAction::Trailing => {
+                                self.commit_settings_password();
+                                self.speaker_settings_open =
+                                    if settings_open { None } else { Some(sp.id.clone()) };
+                                self.settings_password =
+                                    self.app.airplay_password(&sp.id).unwrap_or_default();
+                            }
+                            RowAction::None => {}
+                        }
+                        if self.speaker_settings_open.as_deref() == Some(sp.id.as_str()) {
+                            self.show_speaker_settings(ui, p, &sp);
                         }
                     }
                 });
@@ -2398,6 +2599,161 @@ impl StreamToSpeakerApp {
                 self.show_volume_row(ui, p);
             }
         });
+    }
+
+    /// Save the open settings panel's password field (a manual AirPlay
+    /// speaker's) if it changed — the field normally saves on blur, which
+    /// doesn't happen when the panel is closed or swapped first.
+    fn commit_settings_password(&mut self) {
+        let Some(id) = self.speaker_settings_open.clone() else {
+            return;
+        };
+        let manual_airplay = self
+            .app
+            .find_manual_speaker(&id)
+            .map_or(false, |m| m.kind == crate::manual_speakers::ManualKind::AirPlay);
+        if !manual_airplay {
+            return;
+        }
+        let pw = self.settings_password.trim().to_string();
+        if self.app.airplay_password(&id).unwrap_or_default() != pw {
+            self.app.set_airplay_password(&id, &pw);
+        }
+    }
+
+    /// Inline settings under a speaker row (opened with its ⚙ button).
+    fn show_speaker_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        sp: &crate::http_server::SpeakerInfo,
+    ) {
+        use crate::user_config::{
+            AutoConnect, AIRPLAY_LATENCY_MS_MAX, AIRPLAY_LATENCY_MS_MIN,
+        };
+        let before = self.app.speaker_settings(&sp.id);
+        let mut st = before.clone();
+        let is_airplay = sp.id.starts_with("airplay:");
+        let mut remove = false;
+        egui::Frame::none()
+            .fill(p.card_hover)
+            .rounding(RADIUS_CONTROL)
+            .inner_margin(egui::Margin::symmetric(sp::S, sp::S))
+            .show(ui, |ui| {
+                ui.checkbox(&mut st.hidden, "Hide this speaker from the list")
+                    .on_hover_text(
+                        "It stays connected if it's playing, and \"Show hidden speakers\" \
+                         above the list brings it back.",
+                    );
+                ui.add_space(sp::XS);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Connect automatically").color(p.text_primary));
+                    let label = |a: AutoConnect| match a {
+                        AutoConnect::Default => "Use the app setting",
+                        AutoConnect::Always => "Whenever it's available",
+                        AutoConnect::Never => "Never",
+                    };
+                    egui::ComboBox::from_id_salt(("auto_connect", sp.id.as_str()))
+                        .selected_text(label(st.auto_connect))
+                        .show_ui(ui, |ui| {
+                            for a in [AutoConnect::Default, AutoConnect::Always, AutoConnect::Never]
+                            {
+                                ui.selectable_value(&mut st.auto_connect, a, label(a));
+                            }
+                        });
+                });
+                ui.label(
+                    egui::RichText::new(match st.auto_connect {
+                        AutoConnect::Default => {
+                            "Reconnects at launch if it was the last speaker used and \
+                             auto-connect at launch is on."
+                        }
+                        AutoConnect::Always => {
+                            "Connects when it appears and nothing else is playing. Turning \
+                             streaming off stops this until you pick a speaker again."
+                        }
+                        AutoConnect::Never => "Only connects when you click it.",
+                    })
+                    .size(12.0)
+                    .color(p.text_secondary),
+                );
+                if is_airplay {
+                    ui.add_space(sp::S);
+                    let global = self.app.user_config.lock().unwrap().effective_airplay_latency_ms();
+                    let mut own = st.airplay_latency_ms.is_some();
+                    if ui
+                        .checkbox(&mut own, "Own AirPlay buffer for this speaker")
+                        .on_hover_text(
+                            "Overrides the AirPlay buffer in Advanced for this speaker only. \
+                             Takes effect the next time you connect.",
+                        )
+                        .changed()
+                    {
+                        st.airplay_latency_ms = own.then_some(global);
+                    }
+                    match st.airplay_latency_ms {
+                        Some(ms) => {
+                            let mut v = ms as i64;
+                            ui.horizontal(|ui| {
+                                advanced_slider_row(
+                                    ui,
+                                    p,
+                                    &mut v,
+                                    (AIRPLAY_LATENCY_MS_MIN as i64)..=(AIRPLAY_LATENCY_MS_MAX as i64),
+                                    " ms",
+                                    global as i64,
+                                    &format!("{} ms (the app setting)", global),
+                                );
+                            });
+                            st.airplay_latency_ms = Some(v as u32);
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new(format!("Uses the app setting ({} ms).", global))
+                                    .size(12.0)
+                                    .color(p.text_secondary),
+                            );
+                        }
+                    }
+                }
+                if sp.manual && is_airplay {
+                    ui.add_space(sp::S);
+                    ui.label(
+                        egui::RichText::new("AirPlay password (if the speaker has one)")
+                            .color(p.text_primary),
+                    );
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.settings_password)
+                            .password(true)
+                            .hint_text("No password")
+                            .desired_width(240.0),
+                    );
+                    if edit.lost_focus() {
+                        let pw = self.settings_password.trim().to_string();
+                        if self.app.airplay_password(&sp.id).unwrap_or_default() != pw {
+                            self.app.set_airplay_password(&sp.id, &pw);
+                        }
+                    }
+                }
+                if sp.manual {
+                    ui.add_space(sp::S);
+                    if danger_button(ui, p, "Remove speaker", 140.0)
+                        .on_hover_text("Remove this manually added speaker from the list.")
+                        .clicked()
+                    {
+                        remove = true;
+                    }
+                }
+            });
+        ui.add_space(6.0);
+        if remove {
+            self.speaker_settings_open = None;
+            self.app.remove_manual_speaker(&sp.id);
+            return;
+        }
+        if st != before {
+            self.app.set_speaker_settings(&sp.id, st);
+        }
     }
 
     fn show_volume_row(&self, ui: &mut egui::Ui, p: &Palette) {
@@ -2559,6 +2915,201 @@ impl StreamToSpeakerApp {
         });
     }
 
+    /// Hide the window to the tray. An unapplied equalizer preview is
+    /// dropped first, as Revert would, so an unseen draft never keeps
+    /// playing.
+    fn hide_to_tray(&mut self) {
+        self.discard_eq_preview();
+        if let Some(hwnd) = self.hwnd {
+            win_hide(hwnd);
+        }
+    }
+
+    /// Drop the equalizer draft and, if it differed, put the stream back
+    /// on the saved curve.
+    fn discard_eq_preview(&mut self) {
+        if self.eq_draft.take().is_some_and(|d| d != self.app.eq_saved()) {
+            self.app.eq_revert();
+        }
+        self.eq_previewed = None;
+    }
+
+    fn show_equalizer(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(ui, p, |ui| {
+            let was_open = self.eq_open;
+            disclosure_header(
+                ui,
+                p,
+                "equalizer_toggle",
+                "Equalizer",
+                "Ten-band equalizer for everything you stream",
+                &mut self.eq_open,
+            );
+            if !self.eq_open {
+                if was_open {
+                    // Closed without Apply: back to the saved curve.
+                    self.discard_eq_preview();
+                }
+                return;
+            }
+            let saved = self.app.eq_saved();
+            let mut draft = self.eq_draft.take().unwrap_or_else(|| saved.clone());
+
+            ui.add_space(sp::XS);
+            ui.label(
+                egui::RichText::new(
+                    "Shapes the sound sent to every speaker. Changes play live while \
+                     you edit; Apply keeps them, Revert or closing this card drops them.",
+                )
+                .size(12.0)
+                .color(p.text_secondary),
+            );
+            ui.add_space(sp::XS);
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut draft.enabled, "Enable equalizer");
+                ui.add_space(sp::M);
+                let current = matching_preset(&draft.bands_db).unwrap_or("Custom");
+                egui::ComboBox::from_id_salt("eq_preset")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for preset in EQ_PRESETS {
+                            if ui
+                                .selectable_label(current == preset.name, preset.name)
+                                .clicked()
+                            {
+                                draft.bands_db = preset.bands_db;
+                                draft.preamp_db = 0.0;
+                            }
+                        }
+                    });
+            });
+            ui.add_space(sp::S);
+
+            // Ten vertical sliders, one column each, labelled with the
+            // band's value above and its frequency below.
+            const BAND_LABELS: [&str; EQ_BANDS] =
+                ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
+            let gain_range = EQ_GAIN_MIN_DB..=EQ_GAIN_MAX_DB;
+            let enabled = draft.enabled;
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.columns(EQ_BANDS, |cols| {
+                    for (i, col) in cols.iter_mut().enumerate() {
+                        col.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{:+.1}", draft.bands_db[i]))
+                                    .size(11.0)
+                                    .color(p.text_secondary),
+                            );
+                            ui.spacing_mut().slider_width = 120.0;
+                            ui.add(
+                                egui::Slider::new(&mut draft.bands_db[i], gain_range.clone())
+                                    .vertical()
+                                    .show_value(false)
+                                    .step_by(EQ_GAIN_STEP_DB as f64)
+                                    .clamping(egui::SliderClamping::Always),
+                            )
+                            .on_hover_text(format!(
+                                "{} Hz: {:+.1} dB",
+                                BAND_LABELS[i], draft.bands_db[i]
+                            ));
+                            ui.label(
+                                egui::RichText::new(BAND_LABELS[i])
+                                    .size(11.0)
+                                    .color(p.text_primary),
+                            );
+                        });
+                    }
+                });
+                ui.add_space(sp::S);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Preamp").color(p.text_primary));
+                    ui.add(
+                        egui::Slider::new(&mut draft.preamp_db, EQ_GAIN_MIN_DB..=EQ_PREAMP_MAX_DB)
+                            .step_by(EQ_GAIN_STEP_DB as f64)
+                            .suffix(" dB")
+                            .clamping(egui::SliderClamping::Always),
+                    );
+                });
+            });
+            draft = draft.sanitized();
+
+            // Live preview: hand every change to the stream (the designer
+            // throttles to ~50 ms and crossfades, so dragging is smooth).
+            if self.eq_previewed.as_ref() != Some(&draft) {
+                self.app.eq_preview(&draft);
+                self.eq_previewed = Some(draft.clone());
+            }
+
+            ui.add_space(sp::XS);
+            let headroom = match self.app.eq_report() {
+                Some(r) if r.settings == draft => {
+                    if !draft.enabled {
+                        "Off — audio passes through unchanged.".to_string()
+                    } else {
+                        format!(
+                            "Automatic headroom {:+.1} dB · effective preamp {:+.1} dB",
+                            r.auto_attenuation_db, r.effective_preamp_db
+                        )
+                    }
+                }
+                _ => {
+                    ui.ctx().request_repaint_after(Duration::from_millis(60));
+                    "Calculating headroom…".to_string()
+                }
+            };
+            ui.label(egui::RichText::new(headroom).size(12.0).color(p.text_secondary))
+                .on_hover_text(
+                    "Boosting a band can push loud passages past full scale, which \
+                     distorts. The equalizer measures the curve's highest point and \
+                     lowers the overall level just enough that the peak stays at full \
+                     scale, so a boost never clips. A preamp cut counts toward that \
+                     reduction; the preamp can only cut, since any boost there would be \
+                     taken straight back off.",
+                );
+            ui.add_space(sp::S);
+
+            let dirty = draft != saved;
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled_ui(dirty, |ui| primary_button(ui, p, "Apply", 96.0))
+                    .inner
+                    .on_hover_text("Save this curve")
+                    .clicked()
+                {
+                    self.app.eq_apply(&draft);
+                }
+                ui.add_space(sp::XS);
+                if ui
+                    .add_enabled_ui(dirty, |ui| secondary_button(ui, p, "Revert", 96.0))
+                    .inner
+                    .on_hover_text("Go back to the saved curve")
+                    .clicked()
+                {
+                    draft = saved.clone();
+                    self.app.eq_revert();
+                    self.eq_previewed = Some(draft.clone());
+                }
+                ui.add_space(sp::XS);
+                if secondary_button(ui, p, "Reset to flat", 120.0)
+                    .on_hover_text("All bands and the preamp to 0 dB (keeps the on/off switch)")
+                    .clicked()
+                {
+                    draft = EqSettings { enabled: draft.enabled, ..EqSettings::default() };
+                }
+                if dirty {
+                    ui.add_space(sp::XS);
+                    ui.label(
+                        egui::RichText::new("Not saved")
+                            .size(12.0)
+                            .color(p.text_secondary),
+                    );
+                }
+            });
+            self.eq_draft = Some(draft);
+        });
+    }
+
     fn show_advanced(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(ui, p, |ui| {
             // Disclosure header: keyboard-focusable strip with the
@@ -2571,73 +3122,13 @@ impl StreamToSpeakerApp {
             // we accept Enter/Space when focused (ARIA disclosure
             // pattern). Height bumped 22 → 28 to meet the WCAG 2.5.8
             // minimum click-target size.
-            let chevron = if self.advanced_open { "▾" } else { "▸" };
-            let avail_w = ui.available_width();
-            let id = ui.id().with("advanced_toggle");
-            // m5: was 28 px tall — undershot CONTROL_HEIGHT and the
-            // 32 px buttons everywhere else in the app. Normalised so
-            // the disclosure strip's click target matches the rest.
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(avail_w, CONTROL_HEIGHT),
-                egui::Sense::hover(),
-            );
-            let resp = ui
-                .interact(rect, id, egui::Sense::click())
-                .on_hover_text("Tuning knobs for power users");
-            // Expose to AccessKit / screen readers.
-            resp.widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::Button,
-                    resp.enabled(),
-                    if self.advanced_open {
-                        "Advanced (expanded)"
-                    } else {
-                        "Advanced (collapsed)"
-                    },
-                )
-            });
-            if resp.hovered() && resp.enabled() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            let kbd_toggle = resp.has_focus()
-                && ui.input(|i| {
-                    i.key_pressed(egui::Key::Enter)
-                        || i.key_pressed(egui::Key::Space)
-                });
-            if resp.clicked() || kbd_toggle {
-                self.advanced_open = !self.advanced_open;
-            }
-            // Explicit focus ring — egui doesn't paint one on a bare
-            // ui.interact rect, and the audit flagged this as a P0
-            // keyboard-accessibility failure.
-            if resp.has_focus() {
-                ui.painter().rect_stroke(
-                    rect.expand(2.0),
-                    RADIUS_CONTROL,
-                    egui::Stroke::new(2.0, p.accent),
-                );
-            }
-            // Paint label + chevron. Matches the new section_label
-            // (14 px Body Strong, sentence case, primary text). The
-            // chevron lands immediately to the right of the label
-            // text (Gestalt proximity).
-            let label_font =
-                egui::FontId::new(14.0, egui::FontFamily::Proportional);
-            let chevron_font =
-                egui::FontId::new(14.0, egui::FontFamily::Proportional);
-            let label_rect = ui.painter().text(
-                egui::pos2(rect.left(), rect.center().y),
-                egui::Align2::LEFT_CENTER,
+            disclosure_header(
+                ui,
+                p,
+                "advanced_toggle",
                 "Advanced",
-                label_font,
-                p.text_primary,
-            );
-            ui.painter().text(
-                egui::pos2(label_rect.right() + sp::XS, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                chevron,
-                chevron_font,
-                p.text_secondary,
+                "Tuning knobs for power users",
+                &mut self.advanced_open,
             );
 
             if !self.advanced_open {
@@ -2645,6 +3136,27 @@ impl StreamToSpeakerApp {
             }
 
             ui.add_space(sp::XS);
+
+            let mut at_sign_in = crate::autostart::is_enabled();
+            advanced_row(
+                ui,
+                p,
+                "Start at sign-in",
+                "Start Stream To Speaker in the tray when you sign in to Windows.",
+                "Adds Stream To Speaker to your Windows startup apps (the same entry the installer's \"Start when I sign in\" option creates). It starts in the notification area without opening this window, and reconnects to your speaker if that's turned on. You can also switch it off in Windows Settings → Apps → Startup.",
+                |ui| {
+                    if ui.checkbox(&mut at_sign_in, "Start when I sign in").changed() {
+                        if let Err(e) = crate::autostart::set_enabled(at_sign_in) {
+                            self.app.record_error(format!(
+                                "Couldn't change the start-at-sign-in setting: {}",
+                                e
+                            ));
+                        }
+                    }
+                },
+            );
+
+            ui.add_space(sp::S);
 
             let mut ppm = self.app.rate_fudge_ppm.load(Ordering::Relaxed) as i64;
             advanced_row(
@@ -2696,7 +3208,7 @@ impl StreamToSpeakerApp {
                     p,
                     "AirPlay buffer (latency)",
                     "Lower = less delay, less margin for Wi-Fi hiccups. 2000 ms is what iTunes uses.",
-                    "How much audio an AirPlay speaker holds before playing it. This is most of the delay you hear on AirPlay, so lowering it lowers the delay in step — but any Wi-Fi hiccup longer than the buffer becomes a dropout. A recent Apple TV copes with very small values on a good network; AirPort Express and most AirPlay speakers need roughly 100–350 ms, and a speaker that reports its own minimum is never driven below it. Applies to AirPlay 1 speakers and the AirPlay 2 realtime stream; below 1000 ms an AirPlay 2 speaker is switched to the realtime stream automatically. Takes effect the next time you connect.",
+                    "How much audio an AirPlay speaker holds before playing it. This is most of the delay you hear on AirPlay, so lowering it lowers the delay in step — but any Wi-Fi hiccup longer than the buffer becomes a dropout. A recent Apple TV copes with very small values on a good network; AirPort Express and most AirPlay speakers need roughly 100–350 ms, and a speaker that reports its own minimum is never driven below it. Applies to AirPlay 1 speakers and the AirPlay 2 realtime stream (HomePods use the HomePod delay setting instead); below 1000 ms an AirPlay 2 speaker is switched to the realtime stream automatically. Takes effect the next time you connect.",
                     |ui| {
                         advanced_slider_row(
                             ui,
@@ -2733,6 +3245,50 @@ impl StreamToSpeakerApp {
                 let mut uc = self.app.user_config.lock().unwrap();
                 if uc.prefer_realtime_airplay != prefer_rt {
                     uc.prefer_realtime_airplay = prefer_rt;
+                    uc.save();
+                }
+            }
+
+            ui.add_space(sp::S);
+
+            {
+                use crate::user_config::{
+                    HOMEPOD_LATENCY_MS_DEFAULT, HOMEPOD_LATENCY_MS_MAX, HOMEPOD_LATENCY_MS_MIN,
+                };
+                let (mut hp_buffered, saved_ms) = {
+                    let uc = self.app.user_config.lock().unwrap();
+                    (uc.airplay_homepod_buffered, uc.effective_homepod_latency_ms() as i64)
+                };
+                let mut hp_ms = self.homepod_latency_draft.unwrap_or(saved_ms);
+                let mut commit = false;
+                advanced_row(
+                    ui,
+                    p,
+                    "HomePod delay",
+                    "HomePods and HomePod stereo pairs stream in low-latency realtime mode with this delay.",
+                    "HomePods are streamed with the realtime AirPlay 2 stream and asked to play with exactly this delay (200 ms by default; about 120 ms works on a clean network, 500 ms rides out more Wi-Fi trouble). This is the delay the HomePod adds, not a measured end-to-end figure. Stereo pairs always use realtime mode. If a single HomePod misbehaves, tick the box to go back to the buffered stream used before (seconds of delay, set by the AirPlay buffer above). Takes effect the next time you connect.",
+                    |ui| {
+                        ui.vertical(|ui| {
+                            commit = advanced_slider_row_commit(
+                                ui,
+                                p,
+                                &mut hp_ms,
+                                (HOMEPOD_LATENCY_MS_MIN as i64)..=(HOMEPOD_LATENCY_MS_MAX as i64),
+                                " ms",
+                                HOMEPOD_LATENCY_MS_DEFAULT as i64,
+                                "200 ms",
+                            );
+                            ui.checkbox(&mut hp_buffered, "Use the buffered stream for single HomePods");
+                        });
+                    },
+                );
+                // Save on release; hold the dragged value until then.
+                self.homepod_latency_draft = (!commit && hp_ms != saved_ms).then_some(hp_ms);
+                let mut uc = self.app.user_config.lock().unwrap();
+                let ms = if commit { hp_ms as u32 } else { uc.airplay_homepod_latency_ms };
+                if uc.airplay_homepod_buffered != hp_buffered || uc.airplay_homepod_latency_ms != ms {
+                    uc.airplay_homepod_buffered = hp_buffered;
+                    uc.airplay_homepod_latency_ms = ms;
                     uc.save();
                 }
             }
@@ -2790,6 +3346,10 @@ impl StreamToSpeakerApp {
 
             ui.add_space(sp::S);
 
+            self.show_discovery_adapter(ui, p);
+
+            ui.add_space(sp::S);
+
             let mut privacy = self.app.is_privacy_mode();
             advanced_row(
                 ui,
@@ -2824,6 +3384,102 @@ impl StreamToSpeakerApp {
                 }
             }
         });
+    }
+
+    /// Advanced → which network adapter speaker discovery runs on.
+    fn show_discovery_adapter(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        use crate::discovery_net::{Resolved, SavedAdapter};
+        let status = self.app.discovery_net_status();
+        let adapters = self.app.network_adapters();
+        advanced_row(
+            ui,
+            p,
+            "Discovery network adapter",
+            "Search for speakers on every network adapter, or on one only.",
+            "By default the app looks for speakers on every network this PC is connected to. If a VPN, a virtual-machine adapter or a second network gets in the way, pick the adapter your speakers are on. If that adapter goes away (cable unplugged, Wi-Fi off), searching pauses until it's back — it never quietly switches to the other adapters. Speakers you added by address and the audio stream itself aren't affected.",
+            |ui| {
+                let label_for = |sel: &Option<SavedAdapter>| -> String {
+                    match sel {
+                        None => "All adapters".to_string(),
+                        Some(s) => match adapters.iter().find(|a| a.key == s.key) {
+                            Some(a) if a.usable_ipv4().is_some() => a.name.clone(),
+                            Some(a) => format!("{} (unavailable)", a.name),
+                            None => format!("{} (unavailable)", s.name),
+                        },
+                    }
+                };
+                let mut choice = status.selected.clone();
+                ui.add_enabled_ui(status.pinned.is_none(), |ui| {
+                    egui::ComboBox::from_id_salt("discovery_adapter")
+                        .selected_text(label_for(&choice))
+                        .width(320.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut choice, None, "All adapters");
+                            for a in &adapters {
+                                let addrs = if a.ipv4.is_empty() {
+                                    "no IPv4 address".to_string()
+                                } else {
+                                    a.ipv4
+                                        .iter()
+                                        .map(|ip| ip.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                };
+                                let state = if a.usable_ipv4().is_some() {
+                                    "connected"
+                                } else {
+                                    "unavailable"
+                                };
+                                ui.selectable_value(
+                                    &mut choice,
+                                    Some(SavedAdapter { key: a.key.clone(), name: a.name.clone() }),
+                                    format!("{} — {} ({})", a.name, addrs, state),
+                                );
+                            }
+                            // A saved adapter that's gone stays listed.
+                            if let Some(s) = status.selected.as_ref() {
+                                if !adapters.iter().any(|a| a.key == s.key) {
+                                    ui.selectable_value(
+                                        &mut choice,
+                                        Some(s.clone()),
+                                        format!("{} — not present (unavailable)", s.name),
+                                    );
+                                }
+                            }
+                        });
+                });
+                if choice != status.selected {
+                    self.app.set_discovery_adapter(choice);
+                }
+            },
+        );
+        let (text, color) = match (&status.pinned, &status.scope) {
+            (Some(ip), _) => (
+                format!(
+                    "Searching from {} (set on the command line); this choice is ignored.",
+                    ip
+                ),
+                p.text_secondary,
+            ),
+            (None, Resolved::All) => {
+                ("Searching on every network adapter.".to_string(), p.text_secondary)
+            }
+            (None, Resolved::Active { name, ip }) => {
+                (format!("Searching only on {} ({}).", name, ip), p.text_secondary)
+            }
+            (None, Resolved::Paused { name }) => (
+                format!(
+                    "⚠  Search paused: {} is unavailable. It resumes when the adapter is \
+                     back. Speakers added by address still work.",
+                    name
+                ),
+                p.warn,
+            ),
+        };
+        ui.label(egui::RichText::new(text).size(12.0).color(color));
+        if let Some(err) = status.error.as_deref() {
+            ui.label(egui::RichText::new(err).size(12.0).color(p.danger));
+        }
     }
 
     fn show_web_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -2971,6 +3627,81 @@ impl StreamToSpeakerApp {
         });
     }
 
+    /// Diagnostics: the app's counters now and as they were just before
+    /// the last fault, plus copy-to-clipboard and the log folder. Counters
+    /// are gathered only while the card is expanded.
+    fn show_diagnostics(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(ui, p, |ui| {
+            disclosure_header(
+                ui,
+                p,
+                "diagnostics_toggle",
+                "Diagnostics",
+                "Connection details and counters, for troubleshooting or a bug report",
+                &mut self.diagnostics_open,
+            );
+            if !self.diagnostics_open {
+                return;
+            }
+            ui.add_space(sp::XS);
+            ui.horizontal(|ui| {
+                if secondary_button(ui, p, "Copy diagnostics", 150.0)
+                    .on_hover_text(
+                        "Copy everything below as plain text — paste it into a bug report.",
+                    )
+                    .clicked()
+                {
+                    ui.ctx().copy_text(self.app.diagnostics_report());
+                    self.diagnostics_copied_at = Some(Instant::now());
+                }
+                if secondary_button(ui, p, "Open log folder", 140.0).clicked() {
+                    if let Some(dir) = crate::log_dir() {
+                        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                    }
+                }
+                if self
+                    .diagnostics_copied_at
+                    .map_or(false, |t| t.elapsed() < Duration::from_secs(3))
+                {
+                    ui.label(egui::RichText::new("Copied.").size(12.0).color(p.text_secondary));
+                }
+            });
+            ui.add_space(sp::S);
+            let now = self.app.diagnostics_snapshot();
+            diagnostics_grid(ui, p, "diag_now", &now.rows());
+            ui.add_space(sp::S);
+            match self.app.last_fault() {
+                Some(f) => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Last fault ({} ago): {}",
+                            crate::diagnostics::format_secs(
+                                now.taken_unix.saturating_sub(f.when_unix)
+                            ),
+                            f.what
+                        ))
+                        .strong()
+                        .color(p.text_primary),
+                    );
+                    ui.label(
+                        egui::RichText::new("Statistics just before it:")
+                            .size(12.0)
+                            .color(p.text_secondary),
+                    );
+                    ui.add_space(sp::XS / 2.0);
+                    diagnostics_grid(ui, p, "diag_fault", &f.before.rows());
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("No dropped or failed connections this run.")
+                            .size(12.0)
+                            .color(p.text_secondary),
+                    );
+                }
+            }
+        });
+    }
+
     fn packets_per_sec(&self) -> u64 {
         let up = self.app.uptime_secs().max(1);
         self.app.packets_published() / up
@@ -3071,11 +3802,7 @@ impl StreamToSpeakerApp {
         if let Some(a) = action {
             self.confirm_close_open = false;
             match a {
-                CloseAction::MinimiseToTray => {
-                    if let Some(hwnd) = self.hwnd {
-                        win_hide(hwnd);
-                    }
-                }
+                CloseAction::MinimiseToTray => self.hide_to_tray(),
                 CloseAction::Quit => {
                     // request_shutdown flips the atomic; the next
                     // update() tick sees it and runs the Close
@@ -3163,6 +3890,416 @@ impl StreamToSpeakerApp {
             }
             PromptAction::Open => {}
         }
+    }
+
+    /// "Add a speaker by address" dialog. Validation happens in the app
+    /// (`add_manual_speaker`); its refusal is shown inline and the dialog
+    /// stays open so the user can fix the field.
+    fn show_add_speaker_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        use crate::manual_speakers::{ManualKind, DEFAULT_AIRPLAY_PORT};
+        let Some(prompt) = self.add_speaker_prompt.as_mut() else {
+            return;
+        };
+        let mut still_open = true;
+        let mut confirm = false;
+        let mut cancel = !self.confirm_close_open && ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+        let win = egui::Window::new(
+            egui::RichText::new("Add a speaker by address")
+                .strong()
+                .color(p.text_primary),
+        )
+        .open(&mut still_open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(440.0)
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(p.card)
+                .stroke(egui::Stroke::new(1.0_f32, p.divider))
+                .rounding(RADIUS_SURFACE)
+                .inner_margin(sp::MODAL),
+        )
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "For a speaker that doesn't show up by itself. It stays in the list \
+                     until you remove it.",
+                )
+                .color(p.text_secondary),
+            );
+            ui.add_space(sp::S);
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut prompt.kind, ManualKind::AirPlay, "AirPlay");
+                ui.add_space(sp::S);
+                ui.radio_value(&mut prompt.kind, ManualKind::Upnp, "UPnP / Sonos");
+            });
+            ui.add_space(sp::S);
+            let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
+                ui.label(egui::RichText::new(label).size(12.0).color(p.text_secondary));
+                ui.add(
+                    egui::TextEdit::singleline(value)
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY),
+                )
+            };
+            let first = match prompt.kind {
+                ManualKind::AirPlay => {
+                    let r = field(ui, "IP address or hostname", &mut prompt.host, "192.168.1.20");
+                    ui.add_space(sp::XS);
+                    field(
+                        ui,
+                        "Port (7000 for most AirPlay 2 speakers, often 5000 for older ones)",
+                        &mut prompt.port,
+                        &DEFAULT_AIRPLAY_PORT.to_string(),
+                    );
+                    r
+                }
+                ManualKind::Upnp => field(
+                    ui,
+                    "Device-description URL",
+                    &mut prompt.host,
+                    "http://192.168.1.20:1400/xml/device_description.xml",
+                ),
+            };
+            if !prompt.focused {
+                first.request_focus();
+                prompt.focused = true;
+            }
+            ui.add_space(sp::XS);
+            field(ui, "Name (optional)", &mut prompt.name, "Shown in the speaker list");
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                confirm = true;
+            }
+            if let Some(err) = prompt.error.as_deref() {
+                ui.add_space(sp::XS);
+                ui.label(egui::RichText::new(err).size(12.0).color(p.danger));
+            }
+            ui.add_space(sp::M);
+            ui.horizontal(|ui| {
+                if primary_button(ui, p, "Add", 120.0).clicked() {
+                    confirm = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if secondary_button(ui, p, "Cancel", 96.0).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        });
+        if let Some(win) = win {
+            window_close_cursor(ctx, win.response.rect, sp::MODAL);
+        }
+        if !still_open {
+            cancel = true;
+        }
+        if cancel {
+            self.add_speaker_prompt = None;
+        } else if confirm {
+            match self
+                .app
+                .add_manual_speaker(prompt.kind, &prompt.name, &prompt.host, &prompt.port)
+            {
+                Ok(_) => self.add_speaker_prompt = None,
+                Err(e) => prompt.error = Some(e),
+            }
+        }
+    }
+}
+
+/// State for the add-a-speaker dialog.
+struct AddSpeakerPrompt {
+    kind: crate::manual_speakers::ManualKind,
+    name: String,
+    /// AirPlay: address/hostname. UPnP: device-description URL.
+    host: String,
+    port: String,
+    /// Why the last Add was refused.
+    error: Option<String>,
+    /// Initial focus has been placed.
+    focused: bool,
+}
+
+impl Default for AddSpeakerPrompt {
+    fn default() -> Self {
+        Self {
+            kind: crate::manual_speakers::ManualKind::AirPlay,
+            name: String::new(),
+            host: String::new(),
+            port: crate::manual_speakers::DEFAULT_AIRPLAY_PORT.to_string(),
+            error: None,
+            focused: false,
+        }
+    }
+}
+
+impl StreamToSpeakerApp {
+    /// Pairing prompt for a Sendspin speaker: its live code, its printed
+    /// code, or its pairing token, depending on what it offers.
+    fn show_sendspin_pair_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(prompt) = self.sendspin_prompt.as_mut() else {
+            return;
+        };
+        let v = &prompt.view;
+        let title = format!("Pair with {}", v.name);
+        let lead = if v.identity_changed {
+            format!(
+                "{} is answering with a different identity than the speaker this computer was paired with \
+                 (it may have been reset or replaced, or another device is using its name). \
+                 Pair it again only if it is your speaker. ",
+                v.name
+            )
+        } else if v.lost_credential {
+            format!("{} no longer recognises this computer, so it needs to be paired again. ", v.name)
+        } else {
+            format!("{} needs to be paired with this computer once. ", v.name)
+        };
+        let (blurb, hint, reject_blank) = match v.kind {
+            crate::sendspin_app::PairPromptKind::LiveCode => (
+                format!(
+                    "{}It is now showing or saying a pairing code — enter it here. \
+                     (A pairing token, starting with SP:, works too.)",
+                    lead
+                ),
+                "Pairing code",
+                true,
+            ),
+            crate::sendspin_app::PairPromptKind::StaticCodeOrToken => (
+                format!(
+                    "{}Enter the pairing code printed on the speaker or in its documentation, \
+                     or paste its pairing token (starts with SP:).",
+                    lead
+                ),
+                "Pairing code or token",
+                true,
+            ),
+            crate::sendspin_app::PairPromptKind::TokenOnly => (
+                format!(
+                    "{}Paste its pairing token (starts with SP:) from the speaker's settings \
+                     or documentation.",
+                    lead
+                ),
+                "SP:…",
+                true,
+            ),
+        };
+        match show_text_prompt_modal(
+            ctx,
+            p,
+            &title,
+            &blurb,
+            hint,
+            false,
+            "Pair",
+            reject_blank,
+            self.confirm_close_open,
+            &mut prompt.input,
+        ) {
+            PromptAction::Confirm => {
+                if let Some(prompt) = self.sendspin_prompt.take() {
+                    self.app.submit_sendspin_pairing(Some(prompt.input.trim().to_string()));
+                }
+            }
+            PromptAction::Cancel => {
+                self.sendspin_prompt = None;
+                self.app.submit_sendspin_pairing(None);
+            }
+            PromptAction::Open => {}
+        }
+    }
+
+    /// While Music Assistant pairs with this PC by code, show the code
+    /// prominently (the user types it into Music Assistant).
+    fn show_ma_code_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some((code, server)) = self.app.sendspin_source_code() else {
+            return;
+        };
+        let grouped = if code.len() == 6 {
+            format!("{} {}", &code[..3], &code[3..])
+        } else {
+            code.clone()
+        };
+        egui::Window::new(egui::RichText::new("Pair with Music Assistant").strong().color(p.text_primary))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(380.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(p.card)
+                    .stroke(egui::Stroke::new(1.0, p.divider))
+                    .rounding(RADIUS_SURFACE)
+                    .inner_margin(sp::MODAL),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("Enter this code in {} to pair this computer:", server))
+                        .color(p.text_secondary),
+                );
+                ui.add_space(sp::S);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(grouped).size(36.0).strong().monospace().color(p.text_primary));
+                    ui.add_space(sp::XS);
+                    if secondary_button(ui, p, "Copy code", 120.0).clicked() {
+                        ui.ctx().copy_text(code.clone());
+                    }
+                });
+                ui.add_space(sp::S);
+                ui.label(
+                    egui::RichText::new("This window closes by itself when pairing finishes.")
+                        .size(12.0)
+                        .color(p.text_tertiary),
+                );
+            });
+    }
+
+    /// Music Assistant card: offer this PC as a Sendspin input and show
+    /// how to pair it.
+    fn show_music_assistant(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(ui, p, |ui| {
+            section_label(ui, p, "Sendspin and Music Assistant");
+            let mut enabled = self.app.is_sendspin_enabled();
+            if ui
+                .checkbox(&mut enabled, "Enable Sendspin (experimental)")
+                .on_hover_text(
+                    "Lists Sendspin speakers (for example ESPHome speakers) and lets you offer \
+                     this computer as a Music Assistant input. Off by default.",
+                )
+                .changed()
+            {
+                self.app.set_sendspin_enabled(enabled);
+            }
+            // `--sendspin-source` runs the input with the setting off; keep
+            // its controls visible so it can be seen and turned off.
+            if !enabled && !self.app.is_sendspin_source_enabled() {
+                return;
+            }
+            ui.add_space(sp::S);
+            ui.label(
+                egui::RichText::new(
+                    "Make this computer's audio available in Music Assistant as a live input \
+                     (through its Sendspin Source plugin), so you can play it on any speaker \
+                     Music Assistant controls.",
+                )
+                .size(12.0)
+                .color(p.text_secondary),
+            );
+            ui.add_space(sp::S);
+            let mut on = self.app.is_sendspin_source_enabled();
+            let resp = ui.checkbox(&mut on, "Offer this computer as a Music Assistant input");
+            if resp.changed() {
+                if let Err(e) = self.app.set_sendspin_source_enabled(on) {
+                    self.app.record_error(format!("Couldn't change the Music Assistant input: {}", e));
+                }
+            }
+            if !on {
+                return;
+            }
+            ui.add_space(sp::XS);
+            use crate::sendspin::source::SourceState;
+            let name = self.app.sendspin_source_name();
+            let (text, color) = match self.app.sendspin_source_state() {
+                Some(SourceState::Waiting) | None => (
+                    format!(
+                        "Waiting for Music Assistant. Enable the Sendspin Source plugin there; \
+                         this computer appears as \u{201c}{}\u{201d}.",
+                        name
+                    ),
+                    p.text_secondary,
+                ),
+                Some(SourceState::NeedsPairing { server }) => (
+                    format!(
+                        "{} found this computer. To finish, open \u{201c}{}\u{201d} in Music Assistant's \
+                         player settings and start its setup: a window with a 6-digit code then \
+                         opens here; type that code in there.",
+                        server, name
+                    ),
+                    p.warn,
+                ),
+                Some(SourceState::Connected { server, streaming }) => (
+                    if streaming && self.app.is_ma_output_selected() {
+                        format!("Paired with {} — playing this computer's audio.", server)
+                    } else {
+                        format!(
+                            "Paired with {}. Select \u{201c}Music Assistant\u{201d} in the speaker list to \
+                             send this computer's audio there (it gets none otherwise). Music Assistant \
+                             picks the speaker: set \u{201c}Automatically play line-in on\u{201d} in \
+                             \u{201c}{}\u{201d}'s player settings there, or start the input from Browse.",
+                            server, name
+                        )
+                    },
+                    p.text_primary,
+                ),
+                Some(SourceState::Failed(e)) => (format!("Not available: {}", e), p.warn),
+            };
+            ui.label(egui::RichText::new(text).size(12.0).color(color));
+            if let Some(note) = self.app.sendspin_source_note() {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(note).size(12.0).color(p.text_tertiary));
+            }
+            if self.app.is_sendspin_pairing_paused() {
+                ui.add_space(sp::XS);
+                ui.label(
+                    egui::RichText::new(
+                        "Pairing with a code is paused: wrong codes were entered too many times. \
+                         If that was you, allow pairing again and retry from Music Assistant; \
+                         otherwise something on your network may be trying to pair with this computer.",
+                    )
+                    .size(12.0)
+                    .color(p.warn),
+                );
+                ui.add_space(sp::XS);
+                if secondary_button(ui, p, "Allow pairing again", 170.0).clicked() {
+                    self.app.allow_sendspin_pairing_again();
+                }
+            }
+            ui.add_space(sp::S);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Pair with a token instead").size(12.0).color(p.text_tertiary),
+            )
+            .id_salt("sendspin-token")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Music Assistant pairs with the 6-digit code shown during setup, so you \
+                         don't need this. It is only for a Sendspin server that asks for a token.",
+                    )
+                    .size(12.0)
+                    .color(p.text_tertiary),
+                );
+                let token = self.app.sendspin_pairing_token();
+                let shown = if self.show_ma_token {
+                    crate::sendspin::keys::format_token_for_display(&token)
+                } else {
+                    "SP:0 •••• •••• •••• ••••".to_string()
+                };
+                ui.label(egui::RichText::new(shown).size(12.0).monospace().color(p.text_secondary));
+                ui.add_space(sp::XS);
+                ui.horizontal(|ui| {
+                    if secondary_button(ui, p, "Copy token", 120.0)
+                        .on_hover_text("Copy the token for a Sendspin server that asks for one")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(token.clone());
+                    }
+                    let label = if self.show_ma_token { "Hide" } else { "Show" };
+                    if link_button(ui, p, label, 80.0).clicked() {
+                        self.show_ma_token = !self.show_ma_token;
+                    }
+                });
+            });
+            let paired = self.app.sendspin_paired_servers();
+            if !paired.is_empty() {
+                ui.add_space(sp::XS);
+                ui.label(
+                    egui::RichText::new(format!("Paired with: {}", paired.join(", ")))
+                        .size(12.0)
+                        .color(p.text_tertiary),
+                );
+            }
+        });
     }
 }
 
@@ -3270,6 +4407,13 @@ enum CloseAction {
     Cancel,
 }
 
+/// State for the Sendspin speaker pairing modal.
+struct SendspinPrompt {
+    view: crate::sendspin_app::PairPromptView,
+    /// What the user is typing (code or token).
+    input: String,
+}
+
 /// State for the AirPlay password entry modal.
 struct PasswordPrompt {
     /// Stable id of the speaker being connected to.
@@ -3296,13 +4440,27 @@ struct PinPrompt {
 // Composable pieces
 // -----------------------------------------------------------------------------
 
+/// What the user did to a speaker row this frame.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum RowAction {
+    None,
+    /// Clicked / activated the row: connect to this speaker.
+    Select,
+    /// Clicked the row's trailing button.
+    Trailing,
+}
+
+/// One speaker in the list. `trailing` adds a small icon button at the
+/// right end of the row (`(glyph, tooltip)`), e.g. remove for a manually
+/// added speaker.
 fn speaker_row(
     ui: &mut egui::Ui,
     p: &Palette,
     sp: &crate::http_server::SpeakerInfo,
-    on_click: impl FnOnce(&str),
-) {
+    trailing: Option<(&str, &str)>,
+) -> RowAction {
     let active = sp.active;
+    let mut action = RowAction::None;
 
     // Two-pass painting: allocate, then paint with hover/active/focus-
     // aware colours. The Response goes through `ui.interact` with a
@@ -3388,7 +4546,11 @@ fn speaker_row(
     // Reserve enough room for a 15-char IPv4 in 12 px Monospace plus
     // some breathing space.
     const IP_RESERVED_W: f32 = 120.0;
-    let name_max_w = (rect.right() - 18.0 - text_left - IP_RESERVED_W).max(40.0);
+    // The trailing button sits at the right edge; the address moves left
+    // of it.
+    const TRAILING_W: f32 = 28.0;
+    let right_inset = if trailing.is_some() { 18.0 + TRAILING_W + 6.0 } else { 18.0 };
+    let name_max_w = (rect.right() - right_inset - text_left - IP_RESERVED_W).max(40.0);
     let name_job = {
         let mut job = egui::epaint::text::LayoutJob::single_section(
             sp.friendly_name.clone(),
@@ -3414,12 +4576,28 @@ fn speaker_row(
     // the card. (Was 12, which made the IP huddle against the card
     // border while the radio breathed comfortably on the other side.)
     ui.painter().text(
-        egui::pos2(rect.right() - 18.0, rect.center().y),
+        egui::pos2(rect.right() - right_inset, rect.center().y),
         egui::Align2::RIGHT_CENTER,
         &sp.ip,
         egui::FontId::new(12.0, egui::FontFamily::Monospace),
         p.text_tertiary,
     );
+
+    // Added after the row's own interact, so it is hit-tested on top of
+    // it and a click on it doesn't also select the row.
+    if let Some((glyph, tip)) = trailing {
+        let btn_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 12.0 - TRAILING_W / 2.0, rect.center().y),
+            egui::vec2(TRAILING_W, TRAILING_W),
+        );
+        let btn = egui::Button::new(egui::RichText::new(glyph).color(p.text_secondary))
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .rounding(RADIUS_CONTROL);
+        if clickable(ui.put(btn_rect, btn)).on_hover_text(tip).clicked() {
+            action = RowAction::Trailing;
+        }
+    }
 
     if response.hovered() && response.enabled() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -3433,11 +4611,88 @@ fn speaker_row(
         response
     };
 
-    if (response.clicked() || kbd_activate) && !active {
-        on_click(&sp.id);
+    if (response.clicked() || kbd_activate) && !active && action == RowAction::None {
+        action = RowAction::Select;
     }
 
     ui.add_space(6.0);
+    action
+}
+
+/// Card disclosure strip: keyboard-focusable label with the chevron
+/// right after it, toggling `open` on click / Enter / Space.
+fn disclosure_header(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    id_salt: &str,
+    label: &str,
+    hover: &str,
+    open: &mut bool,
+) {
+    let chevron = if *open { "▾" } else { "▸" };
+    let avail_w = ui.available_width();
+    let id = ui.id().with(id_salt);
+    // m5: was 28 px tall — undershot CONTROL_HEIGHT and the
+    // 32 px buttons everywhere else in the app. Normalised so
+    // the disclosure strip's click target matches the rest.
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(avail_w, CONTROL_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let resp = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_text(hover);
+    // Expose to AccessKit / screen readers.
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            resp.enabled(),
+            format!("{} ({})", label, if *open { "expanded" } else { "collapsed" }),
+        )
+    });
+    if resp.hovered() && resp.enabled() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let kbd_toggle = resp.has_focus()
+        && ui.input(|i| {
+            i.key_pressed(egui::Key::Enter)
+                || i.key_pressed(egui::Key::Space)
+        });
+    if resp.clicked() || kbd_toggle {
+        *open = !*open;
+    }
+    // Explicit focus ring — egui doesn't paint one on a bare
+    // ui.interact rect, and the audit flagged this as a P0
+    // keyboard-accessibility failure.
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            RADIUS_CONTROL,
+            egui::Stroke::new(2.0, p.accent),
+        );
+    }
+    // Paint label + chevron. Matches the new section_label
+    // (14 px Body Strong, sentence case, primary text). The
+    // chevron lands immediately to the right of the label
+    // text (Gestalt proximity).
+    let label_font =
+        egui::FontId::new(14.0, egui::FontFamily::Proportional);
+    let chevron_font =
+        egui::FontId::new(14.0, egui::FontFamily::Proportional);
+    let label_rect = ui.painter().text(
+        egui::pos2(rect.left(), rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        label_font,
+        p.text_primary,
+    );
+    ui.painter().text(
+        egui::pos2(label_rect.right() + sp::XS, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        chevron,
+        chevron_font,
+        p.text_secondary,
+    );
 }
 
 fn advanced_row(
@@ -3504,6 +4759,21 @@ fn advanced_slider_row(
     default: i64,
     default_label: &str,
 ) {
+    advanced_slider_row_commit(ui, p, value, range, suffix, default, default_label);
+}
+
+/// [`advanced_slider_row`] that also says whether the value was committed
+/// this frame: a finished drag, a click on the track, an edited number or
+/// Reset — not every intermediate value while the slider is dragged.
+fn advanced_slider_row_commit(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    value: &mut i64,
+    range: std::ops::RangeInclusive<i64>,
+    suffix: &str,
+    default: i64,
+    default_label: &str,
+) -> bool {
     let dragvalue_w = 96.0;
     let reset_w = 80.0;
     let gap = sp::S;
@@ -3511,14 +4781,14 @@ fn advanced_slider_row(
     let slider_w = (avail - dragvalue_w - reset_w - 2.0 * gap).max(80.0);
     let prev_slider_w = ui.spacing().slider_width;
     ui.spacing_mut().slider_width = slider_w;
-    ui.add(
+    let slider = ui.add(
         egui::Slider::new(value, range.clone())
             .show_value(false)
             .clamping(egui::SliderClamping::Always),
     );
     ui.spacing_mut().slider_width = prev_slider_w;
     ui.add_space(gap);
-    ui.add(
+    let drag_value = ui.add(
         egui::DragValue::new(value)
             .range(range)
             .suffix(suffix)
@@ -3532,7 +4802,30 @@ fn advanced_slider_row(
         .clicked()
     {
         *value = default;
+        return true;
     }
+    let committed = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
+    committed(&slider) || committed(&drag_value)
+}
+
+/// Two-column label/value table for the Diagnostics card.
+fn diagnostics_grid(ui: &mut egui::Ui, p: &Palette, id: &str, rows: &[(&'static str, String)]) {
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([sp::M, 4.0])
+        .striped(false)
+        .show(ui, |ui| {
+            for (k, v) in rows {
+                ui.label(egui::RichText::new(*k).size(12.0).color(p.text_secondary));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(v).size(12.0).monospace().color(p.text_primary),
+                    )
+                    .wrap(),
+                );
+                ui.end_row();
+            }
+        });
 }
 
 fn stat_pill(
@@ -3598,13 +4891,7 @@ fn window_icon(state: IconState) -> egui::IconData {
 }
 
 fn open_url(url: &str) -> std::io::Result<()> {
-    // Windows: `cmd /C start "" <url>` is the canonical "open default
-    // browser" invocation. The empty quoted string is required because
-    // start treats the first quoted arg as the new window title.
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn()
-        .map(|_| ())
+    crate::open_url(url)
 }
 
 fn format_duration(secs: u64) -> String {
