@@ -612,9 +612,9 @@ CMiniportWaveRTStream::SetState(_In_ KSSTATE State)
     if (prev == KSSTATE_RUN) {
         /* Leaving RUN: freeze the play position and stop the consumer. */
         StopTimer();
-        PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
-        if (ext != nullptr && ext->IoctlCtx != nullptr) {
-            IoctlOnStreamStop(ext->IoctlCtx);
+        StreamToSpeakerIoctlCtx* ctx = StreamToSpeakerExtIoctlCtx(DeviceExtension());
+        if (ctx != nullptr) {
+            IoctlOnStreamStop(ctx);
         }
     }
 
@@ -639,9 +639,9 @@ CMiniportWaveRTStream::SetState(_In_ KSSTATE State)
         m_FramesAtRunStart = m_StreamFramesProduced;
         m_RunStartQpc      = KeQueryPerformanceCounter(&m_PerfFrequency);
 
-        PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
-        if (ext != nullptr && ext->IoctlCtx != nullptr) {
-            IoctlOnStreamStart(ext->IoctlCtx);
+        StreamToSpeakerIoctlCtx* ctx = StreamToSpeakerExtIoctlCtx(DeviceExtension());
+        if (ctx != nullptr) {
+            IoctlOnStreamStart(ctx);
         }
         StartTimer();
         break;
@@ -716,12 +716,12 @@ CMiniportWaveRTStream::ProduceToRing(
     _In_reads_bytes_(Bytes) const UCHAR* Src,
     _In_ ULONG Bytes)
 {
-    PSTREAM_TO_SPEAKER_DEVICE_EXTENSION ext = DeviceExtension();
-    if (ext == nullptr || ext->IoctlCtx == nullptr || Bytes == 0) {
+    StreamToSpeakerIoctlCtx* ctx = StreamToSpeakerExtIoctlCtx(DeviceExtension());
+    if (ctx == nullptr || Bytes == 0) {
         return;
     }
     if (m_Channels == STREAM_TO_SPEAKER_CHANNELS) {
-        IoctlAudioProduce(ext->IoctlCtx, Src, Bytes);
+        IoctlAudioProduce(ctx, Src, Bytes);
         return;
     }
     /* Mono: duplicate each 16-bit sample into L and R. */
@@ -735,7 +735,7 @@ CMiniportWaveRTStream::ProduceToRing(
         out[2 * i]     = in[i];
         out[2 * i + 1] = in[i];
     }
-    IoctlAudioProduce(ext->IoctlCtx, m_UpmixVa, samples * 2u * sizeof(USHORT));
+    IoctlAudioProduce(ctx, m_UpmixVa, samples * 2u * sizeof(USHORT));
 }
 
 VOID

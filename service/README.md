@@ -54,11 +54,11 @@ stream-to-speaker --no-discovery --port 5901
 | Method | Path                 | Purpose                                                      |
 | ------ | -------------------- | ------------------------------------------------------------ |
 | GET    | `/`                  | Tiny built-in HTML page: speaker list + one-click switching. |
-| GET    | `/stream.raw`        | Endless chunked L16 PCM stream consumed by the speaker.      |
+| GET    | `/stream.raw`        | Endless WAV (L16 PCM) stream consumed by the speaker.        |
 | GET    | `/healthz`           | Returns "ok" — for monitoring.                               |
 | GET    | `/api/speakers`      | JSON list of discovered speakers (with active marker).       |
-| POST   | `/api/select`        | Body `{"id": "<udn-or-ip>"}` — switch the active speaker.    |
-| NOTIFY | `/gena`              | GENA event callback target for UPnP RenderingControl.        |
+| POST   | `/api/select`        | JSON body `{"id": "<udn-or-ip>"}` — switch the active speaker. |
+| NOTIFY | `/gena`              | GENA events; accepted only from the subscribed speaker (SID + address). |
 
 The `/api/*` endpoints are the integration surface for any future tray icon or richer UI.
 

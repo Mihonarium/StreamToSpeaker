@@ -19,10 +19,13 @@
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
 use std::io::Write;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::stream_gate::canonical_ip;
 
 /// A simple Volume / Mute change decoded from a LastChange notification.
 #[derive(Debug, Clone)]
@@ -42,12 +45,149 @@ pub struct SubscriptionState {
     pub last_renew: Instant,
 }
 
+// -----------------------------------------------------------------------------
+// Live-subscription registry
+// -----------------------------------------------------------------------------
+
+/// How an incoming NOTIFY relates to the subscriptions we hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyAdmission {
+    /// SID and source address match a live subscription.
+    Live,
+    /// Unknown SID, but a SUBSCRIBE to this address is in flight — the
+    /// publisher's initial event can race our reading of the SID from
+    /// the SUBSCRIBE response. Worth waiting briefly for.
+    Pending,
+    /// Neither: not one of ours.
+    Unknown,
+}
+
+#[derive(Default)]
+struct RegistryInner {
+    /// (SID, publisher addresses) of every live subscription.
+    live: Vec<(String, Vec<IpAddr>)>,
+    /// (token, publisher addresses) of SUBSCRIBEs still in flight.
+    pending: Vec<(u64, Vec<IpAddr>)>,
+    next_token: u64,
+}
+
+/// Every GENA subscription this process holds, keyed by SID together
+/// with the publisher's address. The HTTP server accepts a NOTIFY only
+/// when both match, so a LAN host can't inject volume/mute events by
+/// guessing the callback path.
+#[derive(Default)]
+pub struct SubscriptionRegistry {
+    inner: Mutex<RegistryInner>,
+    changed: Condvar,
+}
+
+impl SubscriptionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Note a SUBSCRIBE about to be sent to `publisher`. Pass the token
+    /// to [`Self::finish_subscribe`] once the response is in.
+    pub(crate) fn begin_subscribe(&self, publisher: Vec<IpAddr>) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        g.next_token += 1;
+        let token = g.next_token;
+        let publisher = publisher.into_iter().map(canonical_ip).collect();
+        g.pending.push((token, publisher));
+        token
+    }
+
+    /// Resolve an in-flight SUBSCRIBE: registers `sid` (if it succeeded)
+    /// for the addresses given to [`Self::begin_subscribe`].
+    pub(crate) fn finish_subscribe(&self, token: u64, sid: Option<&str>) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(pos) = g.pending.iter().position(|(t, _)| *t == token) {
+            let (_, ips) = g.pending.remove(pos);
+            if let Some(sid) = sid {
+                g.live.retain(|(s, _)| s != sid);
+                g.live.push((sid.to_string(), ips));
+            }
+        }
+        drop(g);
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn remove(&self, sid: &str) {
+        self.inner.lock().unwrap().live.retain(|(s, _)| s != sid);
+        self.changed.notify_all();
+    }
+
+    pub fn check(&self, sid: &str, peer: IpAddr) -> NotifyAdmission {
+        let g = self.inner.lock().unwrap();
+        Self::check_locked(&g, sid, canonical_ip(peer))
+    }
+
+    fn check_locked(g: &RegistryInner, sid: &str, peer: IpAddr) -> NotifyAdmission {
+        if g.live.iter().any(|(s, ips)| s == sid && ips.contains(&peer)) {
+            NotifyAdmission::Live
+        } else if g.pending.iter().any(|(_, ips)| ips.contains(&peer)) {
+            NotifyAdmission::Pending
+        } else {
+            NotifyAdmission::Unknown
+        }
+    }
+
+    /// Like [`Self::check`], but while the answer is `Pending` wait (up to
+    /// `timeout`) for the in-flight SUBSCRIBE to resolve. True only for a
+    /// live match.
+    pub fn wait_live(&self, sid: &str, peer: IpAddr, timeout: Duration) -> bool {
+        let peer = canonical_ip(peer);
+        let deadline = Instant::now() + timeout;
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            match Self::check_locked(&g, sid, peer) {
+                NotifyAdmission::Live => return true,
+                NotifyAdmission::Unknown => return false,
+                NotifyAdmission::Pending => {}
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            g = self.changed.wait_timeout(g, deadline - now).unwrap().0;
+        }
+    }
+}
+
+/// The process-wide registry used by [`GenaManager`] and the HTTP
+/// server's NOTIFY route.
+pub fn registry() -> &'static SubscriptionRegistry {
+    static REGISTRY: OnceLock<SubscriptionRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(SubscriptionRegistry::new)
+}
+
+/// Addresses the publisher behind `event_url` can send NOTIFYs from:
+/// the event URL's host (an IP literal for every renderer we know of;
+/// a name is resolved).
+fn publisher_addresses(event_url: &str) -> Vec<IpAddr> {
+    let Ok(url) = url::Url::parse(event_url) else {
+        return Vec::new();
+    };
+    match url.host() {
+        Some(url::Host::Ipv4(v4)) => vec![IpAddr::V4(v4)],
+        Some(url::Host::Ipv6(v6)) => vec![IpAddr::V6(v6)],
+        Some(url::Host::Domain(name)) => (name, url.port().unwrap_or(80))
+            .to_socket_addrs()
+            .map(|it| it.map(|a| a.ip()).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
 /// Manager that keeps a subscription alive in the background and parses
 /// incoming notifies.
 pub struct GenaManager {
     state: Mutex<Option<SubscriptionState>>,
     /// Public callback URL the renderer should call back on.
     callback_url: String,
+    /// Set by [`GenaManager::unsubscribe`]; stops the renewer and keeps
+    /// it from re-subscribing a speaker we've moved away from.
+    closed: AtomicBool,
 }
 
 impl GenaManager {
@@ -55,24 +195,44 @@ impl GenaManager {
         Arc::new(Self {
             state: Mutex::new(None),
             callback_url,
+            closed: AtomicBool::new(false),
         })
     }
 
     /// SUBSCRIBE to `event_url`. Returns the SID assigned by the renderer.
     pub fn subscribe(&self, event_url: &str) -> Result<String> {
-        let (sid, timeout) = http_subscribe(event_url, &self.callback_url, 1800)?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(anyhow!("subscription closed"));
+        }
+        let reg = registry();
+        let token = reg.begin_subscribe(publisher_addresses(event_url));
+        let result = http_subscribe(event_url, &self.callback_url, 1800);
+        reg.finish_subscribe(token, result.as_ref().ok().map(|(sid, _)| sid.as_str()));
+        let (sid, timeout) = result?;
         let st = SubscriptionState {
             sid: sid.clone(),
             timeout_secs: timeout,
             event_url: event_url.to_string(),
             last_renew: Instant::now(),
         };
-        *self.state.lock().unwrap() = Some(st);
+        let old = self.state.lock().unwrap().replace(st);
+        if let Some(old) = old.filter(|o| o.sid != sid) {
+            reg.remove(&old.sid);
+        }
+        // Lost a race with unsubscribe(): withdraw what we just added.
+        if self.closed.load(Ordering::Acquire) {
+            if let Some(s) = self.state.lock().unwrap().take() {
+                reg.remove(&s.sid);
+                let _ = http_unsubscribe(&s.event_url, &s.sid);
+            }
+            return Err(anyhow!("subscription closed"));
+        }
         info!("GENA subscribed: sid={} timeout={}s", sid, timeout);
         Ok(sid)
     }
 
     /// Background renewer loop. Renews well before the timeout expires.
+    /// Exits once [`GenaManager::unsubscribe`] has run.
     pub fn spawn_renewer(self: Arc<Self>) {
         thread::Builder::new()
             .name("stream-to-speaker-gena-renew".to_string())
@@ -88,6 +248,9 @@ impl GenaManager {
                     }
                 };
                 thread::sleep(to_sleep);
+                if self.closed.load(Ordering::Acquire) {
+                    return;
+                }
 
                 let snapshot = self.state.lock().unwrap().clone();
                 if let Some(s) = snapshot {
@@ -101,6 +264,9 @@ impl GenaManager {
                             debug!("GENA renewed sid={} timeout={}s", s.sid, timeout);
                         }
                         Err(e) => {
+                            if self.closed.load(Ordering::Acquire) {
+                                return;
+                            }
                             warn!("GENA renew failed: {}; re-subscribing", e);
                             let _ = self.subscribe(&s.event_url);
                         }
@@ -110,10 +276,13 @@ impl GenaManager {
             .expect("spawning GENA renewer");
     }
 
-    /// UNSUBSCRIBE on shutdown.  Best-effort.
+    /// UNSUBSCRIBE on shutdown / speaker switch.  Best-effort. NOTIFYs
+    /// carrying the old SID are refused from here on.
     pub fn unsubscribe(&self) {
-        let st = self.state.lock().unwrap().clone();
+        self.closed.store(true, Ordering::Release);
+        let st = self.state.lock().unwrap().take();
         if let Some(s) = st {
+            registry().remove(&s.sid);
             let _ = http_unsubscribe(&s.event_url, &s.sid);
         }
     }
@@ -359,6 +528,64 @@ mod tests {
         let rc = parse_rendering_notify(body).expect("decode");
         assert_eq!(rc.volume, Some(33));
         assert_eq!(rc.mute, Some(false));
+    }
+
+    #[test]
+    fn registry_matches_sid_and_publisher() {
+        let reg = SubscriptionRegistry::new();
+        let speaker: IpAddr = "192.168.1.50".parse().unwrap();
+        let other: IpAddr = "192.168.1.99".parse().unwrap();
+        assert_eq!(reg.check("uuid:a", speaker), NotifyAdmission::Unknown);
+
+        let t = reg.begin_subscribe(vec![speaker]);
+        assert_eq!(reg.check("uuid:a", speaker), NotifyAdmission::Pending);
+        assert_eq!(reg.check("uuid:a", other), NotifyAdmission::Unknown);
+        reg.finish_subscribe(t, Some("uuid:a"));
+        assert_eq!(reg.check("uuid:a", speaker), NotifyAdmission::Live);
+        // IPv4-mapped form of the same address.
+        assert_eq!(reg.check("uuid:a", "::ffff:192.168.1.50".parse().unwrap()), NotifyAdmission::Live);
+        assert_eq!(reg.check("uuid:a", other), NotifyAdmission::Unknown);
+        assert_eq!(reg.check("uuid:b", speaker), NotifyAdmission::Unknown);
+
+        reg.remove("uuid:a");
+        assert_eq!(reg.check("uuid:a", speaker), NotifyAdmission::Unknown);
+
+        // A failed SUBSCRIBE leaves nothing behind.
+        let t = reg.begin_subscribe(vec![speaker]);
+        reg.finish_subscribe(t, None);
+        assert_eq!(reg.check("uuid:a", speaker), NotifyAdmission::Unknown);
+    }
+
+    #[test]
+    fn wait_live_sees_a_subscribe_that_completes_meanwhile() {
+        let reg = Arc::new(SubscriptionRegistry::new());
+        let speaker: IpAddr = "192.168.1.50".parse().unwrap();
+        let t = reg.begin_subscribe(vec![speaker]);
+        let r2 = reg.clone();
+        let h = thread::spawn(move || r2.wait_live("uuid:late", speaker, Duration::from_secs(5)));
+        thread::sleep(Duration::from_millis(50));
+        reg.finish_subscribe(t, Some("uuid:late"));
+        assert!(h.join().unwrap());
+        // Unknown publisher: no wait at all.
+        let start = Instant::now();
+        assert!(!reg.wait_live("uuid:late", "10.0.0.1".parse().unwrap(), Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn publisher_addresses_from_event_url() {
+        assert_eq!(
+            publisher_addresses("http://192.168.1.50:1400/MediaRenderer/RenderingControl/Event"),
+            vec!["192.168.1.50".parse::<IpAddr>().unwrap()]
+        );
+        assert!(publisher_addresses("not a url").is_empty());
+    }
+
+    #[test]
+    fn unsubscribed_manager_does_not_resubscribe() {
+        let m = GenaManager::new("http://127.0.0.1:1/gena".into());
+        m.unsubscribe();
+        assert!(m.subscribe("http://127.0.0.1:1/Event").is_err());
     }
 
     #[test]
