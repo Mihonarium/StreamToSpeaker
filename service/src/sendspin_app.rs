@@ -404,6 +404,8 @@ impl App {
                  \u{201c}Automatically play line-in on\u{201d} setting there, or wherever you start it."
                     .to_string(),
             ),
+            manual: false,
+            hidden: false,
         })
     }
 
@@ -432,6 +434,8 @@ impl App {
                          at the time, this computer normally takes over."
                             .to_string(),
                     ),
+                    manual: false,
+                    hidden: false,
                 }
             }))
             .collect()

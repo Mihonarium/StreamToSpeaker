@@ -25,6 +25,11 @@ pub mod secret_store;
 pub mod update_check;
 pub mod stream_gate;
 pub mod gui_layout;
+pub mod manual_speakers;
+pub mod discovery_net;
+pub mod diagnostics;
+pub mod autostart;
+pub mod single_instance;
 pub mod now_playing;
 #[cfg(windows)]
 pub mod wasapi_source;

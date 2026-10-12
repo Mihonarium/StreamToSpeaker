@@ -20,6 +20,8 @@ use std::path::PathBuf;
 
 use crate::airplay::hap_pairing::PairingCredentials;
 use crate::secret_store::{self, LockedNode, PlatformCodec, SecretCodec};
+use crate::discovery_net::SavedAdapter;
+use crate::manual_speakers::ManualSpeaker;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserConfig {
@@ -191,6 +193,52 @@ pub struct UserConfig {
     /// settings — see `sendspin::store`.
     #[serde(default)]
     pub sendspin: crate::sendspin::store::SendspinConfig,
+    /// Speakers the user added by address (see `manual_speakers`), in the
+    /// order they were added.
+    #[serde(default)]
+    pub manual_speakers: Vec<ManualSpeaker>,
+    /// The one network adapter speaker discovery runs on; `None` = every
+    /// adapter (see `discovery_net`).
+    #[serde(default)]
+    pub discovery_adapter: Option<SavedAdapter>,
+    /// Per-speaker overrides keyed by speaker id. Only speakers with a
+    /// non-default setting have an entry.
+    #[serde(default)]
+    pub speaker_settings: HashMap<String, SpeakerSettings>,
+}
+
+/// Whether the app connects to a speaker by itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoConnect {
+    /// Follow the app-wide setting (reconnect to the last-used speaker at
+    /// launch when that is on).
+    #[default]
+    Default,
+    /// Connect when it shows up and nothing else is playing.
+    Always,
+    /// Never connect without a click, not even at launch.
+    Never,
+}
+
+/// Settings that apply to one speaker.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeakerSettings {
+    /// Left out of the speaker list (and the web API's), unless it's the
+    /// one playing. Shown again with "Show hidden".
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub auto_connect: AutoConnect,
+    /// AirPlay buffer for this speaker, overriding `airplay_latency_ms`.
+    #[serde(default)]
+    pub airplay_latency_ms: Option<u32>,
+}
+
+impl SpeakerSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Default AirPlay buffer — iTunes' 2 s (88200 samples at 44.1 kHz).
@@ -290,6 +338,24 @@ impl UserConfig {
     /// `airplay_homepod_latency_ms` clamped to its supported range.
     pub fn effective_homepod_latency_ms(&self) -> u32 {
         self.airplay_homepod_latency_ms.clamp(HOMEPOD_LATENCY_MS_MIN, HOMEPOD_LATENCY_MS_MAX)
+    }
+
+    /// The AirPlay buffer for speaker `id`: its own override if set, else
+    /// the app-wide value; clamped either way.
+    pub fn airplay_latency_ms_for(&self, id: &str) -> u32 {
+        match self.speaker_settings.get(id).and_then(|s| s.airplay_latency_ms) {
+            Some(ms) => ms.clamp(AIRPLAY_LATENCY_MS_MIN, AIRPLAY_LATENCY_MS_MAX),
+            None => self.effective_airplay_latency_ms(),
+        }
+    }
+
+    /// The HomePod delay for speaker `id`: its own AirPlay buffer override
+    /// if set, else the app-wide HomePod delay; clamped either way.
+    pub fn homepod_latency_ms_for(&self, id: &str) -> u32 {
+        match self.speaker_settings.get(id).and_then(|s| s.airplay_latency_ms) {
+            Some(ms) => ms.clamp(HOMEPOD_LATENCY_MS_MIN, HOMEPOD_LATENCY_MS_MAX),
+            None => self.effective_homepod_latency_ms(),
+        }
     }
 
     pub fn load() -> Self {
@@ -604,6 +670,26 @@ mod tests {
         assert!(!again.airplay_passwords.contains_key("airplay:bb"));
         assert_eq!(again.last_speaker_id.as_deref(), Some("x"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_speaker_latency_overrides_and_clamps() {
+        let mut c = UserConfig::default();
+        c.airplay_latency_ms = 500;
+        assert_eq!(c.airplay_latency_ms_for("airplay:AA"), 500);
+        c.speaker_settings.insert(
+            "airplay:AA".into(),
+            SpeakerSettings { airplay_latency_ms: Some(150), ..Default::default() },
+        );
+        assert_eq!(c.airplay_latency_ms_for("airplay:AA"), 150);
+        assert_eq!(c.airplay_latency_ms_for("airplay:BB"), 500);
+        c.speaker_settings.get_mut("airplay:AA").unwrap().airplay_latency_ms = Some(1);
+        assert_eq!(c.airplay_latency_ms_for("airplay:AA"), AIRPLAY_LATENCY_MS_MIN);
+        // Round-trips through JSON; an old config without the map loads.
+        let back: UserConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.speaker_settings, c.speaker_settings);
+        let old: UserConfig = serde_json::from_str("{}").unwrap();
+        assert!(old.speaker_settings.is_empty());
     }
 
     #[test]
