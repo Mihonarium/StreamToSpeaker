@@ -67,8 +67,11 @@ cargo build --release
 .\target\release\stream-to-speaker.exe
 ```
 
-`pnputil /add-driver` only stages an upgrade: reboot, or disable and re-enable
-the device in Device Manager. The service log line
+`pnputil /add-driver` only stages an upgrade, and the driver's control device
+keeps the loaded image in memory until Windows restarts, so a new driver binary
+only runs after a reboot (disabling and re-enabling the device is not enough).
+The installer asks for a restart when an upgrade replaces the driver binary
+that was installed before. The service log line
 `StreamToSpeaker driver opened (proto=1 build=N ...)` confirms which build is
 live — `N` bumps on every shipped binary.
 

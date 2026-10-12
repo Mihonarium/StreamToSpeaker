@@ -14,8 +14,14 @@ sound to Music Assistant as an input (optional, off by default).
 
 ## Install
 
+*Directly or from the Microsoft Store.*
+
 **[⬇ Download](https://github.com/Mihonarium/StreamToSpeaker/releases/latest/download/StreamToSpeakerSetup.exe)**
 and run it. Needs Windows 10 1809+ / Windows 11, x64 (not ARM64 or Windows Server).
+
+<a href="https://apps.microsoft.com/detail/xpfm3gjl2tdg30?referrer=appbadge&mode=full" target="_blank"  rel="noopener noreferrer">
+	<img src="https://get.microsoft.com/images/en-us%20dark.svg" width="150"/>
+</a>
 
 ## Use
 
