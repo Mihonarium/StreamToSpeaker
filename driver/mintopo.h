@@ -39,11 +39,6 @@
 /* Filter descriptor accessor (exported by topology.cpp). */
 extern const KSFILTER_DESCRIPTOR* StreamToSpeakerTopologyFilterDescriptor();
 
-/* Forward decl of the topology miniport class. */
+/* Forward decl of the topology miniport class. The IOCTL path reaches it
+ * through TopologyForwardExternalVolume (driver.h). */
 class CMiniportTopology;
-
-/* Hooks used by ioctl.cpp / wavestream.cpp. */
-VOID TopologyOnExternalVolumeChange(
-    _In_ CMiniportTopology* Topology,
-    _In_ INT32              LevelMillibels,
-    _In_ BOOLEAN            Muted);

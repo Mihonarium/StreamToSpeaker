@@ -34,6 +34,15 @@ extern "C" StreamToSpeakerIoctlCtx* StreamToSpeakerCurrentIoctlCtx();
 #include "driver.h"
 #include "ringbuffer.h"
 
+/* Rundown reference on the published IoctlCtx (driver.cpp). Acquire
+ * BEFORE reading StreamToSpeakerCurrentIoctlCtx and keep it while the
+ * context is in use. Every IRP that IoctlDispatch pends owns one extra
+ * reference, released by whichever path completes it. Removal waits for
+ * all references before the context and the FDO it points at go away.
+ * Callable at IRQL <= DISPATCH_LEVEL. */
+extern "C" BOOLEAN StreamToSpeakerIoctlRefAcquire();
+extern "C" VOID    StreamToSpeakerIoctlRefRelease();
+
 #define STREAM_TO_SPEAKER_EVENT_QUEUE_DEPTH    16
 
 struct StreamToSpeakerIoctlCtx {
@@ -64,6 +73,10 @@ struct StreamToSpeakerIoctlCtx {
     /* Latch the "next packet has STREAM_RESTART" flag. Set on stream
      * start, cleared after first packet emitted. */
     volatile LONG           PendingStreamRestart;
+
+    /* Set by IoctlBeginClose. Read under AudioIrpLock / EventIrpLock by
+     * every path that queues an IRP; once set, nothing new is queued. */
+    volatile LONG           Closing;
 };
 
 /* Lifecycle. */
@@ -101,5 +114,14 @@ VOID IoctlPostEvent(_Inout_ StreamToSpeakerIoctlCtx* Ctx,
 VOID IoctlOnStreamStart(_Inout_ StreamToSpeakerIoctlCtx* Ctx);
 VOID IoctlOnStreamStop (_Inout_ StreamToSpeakerIoctlCtx* Ctx);
 
-/* Cancel all pended IRPs. Called on device remove. */
+/* Cancel all pended IRPs. */
 VOID IoctlCancelAll(_Inout_ StreamToSpeakerIoctlCtx* Ctx);
+
+/* Device removal: refuse further queueing, then cancel everything that
+ * is queued. The caller then waits for the rundown to drain. */
+VOID IoctlBeginClose(_Inout_ StreamToSpeakerIoctlCtx* Ctx);
+
+/* IRP_MJ_CLEANUP on the control device: cancel the IRPs queued through
+ * FileObject (the handle's last user is gone). */
+VOID IoctlCancelFileIrps(_Inout_ StreamToSpeakerIoctlCtx* Ctx,
+                         _In_ PFILE_OBJECT FileObject);
