@@ -2129,6 +2129,11 @@ impl StreamToSpeakerApp {
     /// F-03). Auto-fades — no UI clutter when there's nothing wrong.
     fn show_error_banner(&self, ui: &mut egui::Ui, p: &Palette) {
         let Some(msg) = self.app.current_error() else { return; };
+        // The window only repaints on input: wake it when the banner is
+        // due to go away, or it would stay up until the next mouse move.
+        if let Some(left) = self.app.error_expires_in() {
+            ui.ctx().request_repaint_after(left + std::time::Duration::from_millis(50));
+        }
         ui.add_space(sp::XS);
         egui::Frame::none()
             .fill(p.card)
