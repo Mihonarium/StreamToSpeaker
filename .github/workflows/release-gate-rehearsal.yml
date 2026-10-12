@@ -15,6 +15,7 @@ on:
   push:
     branches: [ci/release-driver-gate-v2]
     paths: [".github/workflows/release-gate-rehearsal.yml"]
+  workflow_dispatch:
 
 permissions:
   contents: read
