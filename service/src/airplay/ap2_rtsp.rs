@@ -1111,16 +1111,13 @@ fn parse_response(buf: &mut Vec<u8>, strict: bool) -> Result<Option<Resp>> {
             _ => {}
         }
     }
-    let content_length = content_length.unwrap_or(0);
-    if content_length > MAX_BODY_BYTES {
-        bail!("AP2 RTSP response body too large ({} bytes)", content_length);
-    }
     let body_start = header_end + 4;
-    if buf.len() < body_start.saturating_add(content_length) {
+    let body_end = body_end(body_start, content_length.unwrap_or(0))?;
+    if buf.len() < body_end {
         return Ok(None);
     }
-    let body = buf[body_start..body_start + content_length].to_vec();
-    buf.drain(..body_start + content_length);
+    let body = buf[body_start..body_end].to_vec();
+    buf.drain(..body_end);
     Ok(Some(Resp { status, status_text, cseq, body }))
 }
 
@@ -1281,6 +1278,17 @@ fn network_time_parts(ns: u64) -> (u64, u64) {
     (secs, frac)
 }
 
+/// End offset of a response body that starts at `body_start`, refusing
+/// bodies over `MAX_BODY_BYTES`.
+fn body_end(body_start: usize, content_length: usize) -> Result<usize> {
+    if content_length > MAX_BODY_BYTES {
+        bail!("AP2 RTSP response body too large ({} bytes)", content_length);
+    }
+    body_start
+        .checked_add(content_length)
+        .ok_or_else(|| anyhow!("AP2 RTSP response body length overflows"))
+}
+
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
@@ -1325,6 +1333,16 @@ mod tests {
         let ports = parse_stream_ports(&body).unwrap();
         assert_eq!(ports.data, 6010);
         assert_eq!(ports.control, 6011);
+    }
+
+    #[test]
+    fn body_end_caps_and_never_overflows() {
+        assert_eq!(body_end(40, 0).unwrap(), 40);
+        assert_eq!(body_end(40, 300).unwrap(), 340);
+        assert_eq!(body_end(40, MAX_BODY_BYTES).unwrap(), 40 + MAX_BODY_BYTES);
+        assert!(body_end(40, MAX_BODY_BYTES + 1).is_err());
+        assert!(body_end(40, usize::MAX).is_err());
+        assert!(body_end(usize::MAX, 1).is_err());
     }
 
     #[test]

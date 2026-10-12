@@ -17,7 +17,9 @@ name: Driver attested
 #   2. checks the INF is byte-identical to the one in our submission CAB
 #      (attestation leaves the INF untouched — any difference means the zip
 #      doesn't belong to this submission);
-#   3. checks the INF DriverVer matches the release version;
+#   3. checks the INF DriverVer matches the release version, and that the
+#      returned .sys is the submitted one (identical after stripping
+#      signatures, certified.py sys-match);
 #   4. repackages inf/sys/cat (+pdb from the CAB) into the canonical
 #      StreamToSpeaker-Driver-<ver>-Signed.zip and flips the manifest to
 #      attested=true — from then on build.yml bundles this driver into
@@ -61,6 +63,15 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      # Only the comparison scripts, in their own directory: the steps
+      # below work in the workspace root (assets/, ms-signed/, ...), and a
+      # full checkout would mix the repository's own assets/ into them.
+      - uses: actions/checkout@v4
+        with:
+          path: repo-scripts
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
       - name: Resolve release + download assets
         id: rel
         shell: pwsh
@@ -176,6 +187,15 @@ jobs:
               throw "returned INF does not carry DriverVer $version"
           }
 
+          # --- .sys identity check -------------------------------------
+          # Attestation only adds Microsoft's signature; the code must be
+          # exactly the unsigned binary we submitted.
+          $subSys = @(Get-ChildItem cab-contents -Recurse -Filter "StreamToSpeaker.sys")
+          if ($subSys.Count -ne 1) { throw "expected exactly one StreamToSpeaker.sys in the submission CAB, found $($subSys.Count)" }
+          $subSysPath = $subSys[0].FullName
+          python repo-scripts\.github\scripts\certified.py sys-match --signed $sys.FullName --submitted $subSysPath
+          if ($LASTEXITCODE -ne 0) { throw "returned .sys differs from the submitted .sys" }
+
           # --- canonical repackage -------------------------------------
           New-Item -ItemType Directory -Force -Path signed-driver | Out-Null
           Copy-Item $inf, $cat, $sys.FullName signed-driver\
@@ -193,7 +213,7 @@ jobs:
         if: inputs.dry_run
         shell: pwsh
         run: |
-          Write-Host "::notice::dry run - ${{ steps.rel.outputs.tag }} verified (signtool + INF identity); manifest and release notes left as they are"
+          Write-Host "::notice::dry run - ${{ steps.rel.outputs.tag }} verified (signtool + INF and .sys identity); manifest and release notes left as they are"
           "## Driver attested - dry run of ``${{ steps.rel.outputs.tag }}`` passed (release untouched)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       - name: Finalize release (manifest attested=true)
@@ -229,7 +249,7 @@ jobs:
               "| Driver source hash | ``$($man.source_hash)`` |"
               "| Partner Center product / submission | ``$($man.ms_product_id)`` / ``$($man.ms_submission_id)`` |"
               ""
-              "Verified in CI: ``signtool verify /kp`` against the catalog and the embedded ``.sys`` signature, signer chain *Microsoft Windows Hardware Compatibility Publisher*, INF byte-identical to the submitted one and carrying DriverVer $version."
+              "Verified in CI: ``signtool verify /kp`` against the catalog and the embedded ``.sys`` signature, signer chain *Microsoft Windows Hardware Compatibility Publisher*, INF byte-identical to the submitted one and carrying DriverVer $version, ``.sys`` identical to the submitted one after stripping signatures."
               ""
               "Installer builds bundle this driver automatically while ``driver/**`` + ``include/**`` still hash to the source hash above. The other assets here are the submission trail: the EV-signed CAB sent to Microsoft, and the zip Microsoft returned."
           ) -join "`n"

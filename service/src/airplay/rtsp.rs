@@ -24,7 +24,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::airplay::crypto::{base64_nopad, random_apple_challenge, Cipher};
 
@@ -781,14 +781,26 @@ pub struct RtspResponse {
     pub body: Vec<u8>,
 }
 
+/// Largest response body accepted. RAOP replies are a few hundred bytes;
+/// anything larger is refused rather than buffered.
+const MAX_BODY_BYTES: usize = 1 << 20;
+
+/// Overall time allowed for one response, however slowly it trickles in.
+/// The socket's read timeout bounds each individual read.
+const RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Read one RTSP/1.0 response off the stream. RTSP/1.0 framing matches
 /// HTTP/1.0 closely: status line + headers + optional body delimited
 /// by Content-Length.
-fn read_response(stream: &mut TcpStream) -> Result<RtspResponse> {
+fn read_response<R: Read>(stream: &mut R) -> Result<RtspResponse> {
+    let deadline = Instant::now() + RESPONSE_DEADLINE;
     let mut buf = Vec::with_capacity(2048);
     let mut tmp = [0u8; 1024];
     let header_end;
     loop {
+        if Instant::now() >= deadline {
+            bail!("RTSP response timed out");
+        }
         let n = stream.read(&mut tmp)?;
         if n == 0 {
             bail!("RTSP connection closed while waiting for response");
@@ -819,9 +831,15 @@ fn read_response(stream: &mut TcpStream) -> Result<RtspResponse> {
         .get("content-length")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        bail!("RTSP response body too large ({} bytes)", content_length);
+    }
     let body_start = header_end + 4; // "\r\n\r\n"
     let mut body = buf[body_start..].to_vec();
     while body.len() < content_length {
+        if Instant::now() >= deadline {
+            bail!("RTSP response body timed out");
+        }
         let need = content_length - body.len();
         let read_cap = tmp.len().min(need);
         let n = stream.read(&mut tmp[..read_cap])?;
@@ -868,4 +886,27 @@ fn parse_status_line(line: &str) -> Result<(u16, String)> {
         .parse()
         .with_context(|| format!("parsing status code {:?}", code_str))?;
     Ok((code, text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_response_reads_body_by_content_length() {
+        let mut c = Cursor::new(b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: 3\r\n\r\nabcEXTRA".to_vec());
+        let r = read_response(&mut c).unwrap();
+        assert_eq!(r.status_code, 200);
+        assert_eq!(r.body, b"abc");
+    }
+
+    #[test]
+    fn read_response_refuses_oversized_body() {
+        let mut c = Cursor::new(b"RTSP/1.0 200 OK\r\nContent-Length: 99999999999\r\n\r\n".to_vec());
+        assert!(read_response(&mut c).is_err());
+        let huge = format!("RTSP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", usize::MAX);
+        let mut c = Cursor::new(huge.into_bytes());
+        assert!(read_response(&mut c).is_err());
+    }
 }

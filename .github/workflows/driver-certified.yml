@@ -229,6 +229,9 @@ jobs:
           if ($embOut -notmatch "Nested Signature") {
               Write-Host "##[warning]no nested signature reported - Microsoft signed as primary? (fine, but unexpected for an HLK return)"
           }
+          # signtool's non-zero exit for the test-signed index 0 is expected
+          # (see above); don't let it become the step's exit code.
+          exit 0
 
       - name: Cross-check against the lab package (INF + stripped .sys)
         shell: pwsh

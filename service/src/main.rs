@@ -135,6 +135,16 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_airplay: bool,
 
+    /// Skip Sendspin: no Sendspin speakers in the list and no Music
+    /// Assistant input.
+    #[arg(long, default_value_t = false)]
+    no_sendspin: bool,
+
+    /// Offer this computer's audio to Music Assistant as a Sendspin
+    /// input for this run, even when Sendspin is off in settings.
+    #[arg(long, default_value_t = false)]
+    sendspin_source: bool,
+
     /// Disable silence injection (will send literal zeros during silence).
     #[arg(long, default_value_t = false)]
     no_silence_injection: bool,
@@ -251,7 +261,7 @@ fn main() {
     // Single-instance gate. If another instance is already running,
     // raise its window and exit — same pattern as Slack / Discord /
     // OBS. Without this, the duplicate launch races to bind port 5901,
-    // tiny_http fails with WSAEADDRINUSE, run() returns Err, the
+    // the HTTP bind fails with WSAEADDRINUSE, run() returns Err, the
     // process exits silently — and the user sees the FIRST instance
     // in task manager and assumes the new install "doesn't open".
     // Skipped in --headless: headless is for service / CLI runs where
@@ -453,6 +463,14 @@ fn run(cli: Cli) -> Result<()> {
     info!("audio source: {}", source.name());
 
     let app = setup_app(&cli)?;
+    if cli.no_sendspin {
+        app.disable_sendspin();
+    } else {
+        app.init_sendspin(!cli.no_discovery, cli.sendspin_source);
+        if cli.player.is_none() {
+            app.reconnect_saved_sendspin_speaker();
+        }
+    }
 
     // Always start the full HTTP server (audio + API + UI). The /, /api/*
     // routes honour app.is_web_ui_enabled() at request time, so the GUI
@@ -541,6 +559,19 @@ fn run(cli: Cli) -> Result<()> {
                 // discovery before we look the saved id up.
                 picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
                 let found = discovery.find_by_id(&saved_id);
+                if found.is_none() {
+                    match discovery.identity_conflict(&saved_id) {
+                        Some(addrs) => warn!(
+                            "auto-reconnect skipped: different devices at {:?} all claim to be the saved \
+                             speaker {:?}; pick the right one by address",
+                            addrs, saved_id
+                        ),
+                        None if !saved_id.starts_with("airplay:") => {
+                            info!("auto-reconnect: saved speaker {:?} not found on the network", saved_id)
+                        }
+                        None => {}
+                    }
+                }
                 // A saved HomePod stereo pair (or one of its members): give
                 // both members time to resolve in the background, then play
                 // the pair — unless the user picked something meanwhile.
@@ -638,6 +669,7 @@ fn run_gui_mode(_app: Arc<App>, _no_tray: bool) -> Result<()> {
 }
 
 fn shutdown_cleanup(app: &Arc<App>) {
+    app.stop_sendspin();
     info!("shutdown: tearing down active session");
     let final_session = app.session.lock().unwrap().take();
     if let Some(s) = final_session {
@@ -727,25 +759,17 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         Arc::new(move |path: &str, body: &str| {
             debug!("GENA NOTIFY on {}: {} bytes", path, body.len());
             if let Some(change) = parse_rendering_notify(body) {
-                if let Some(v) = change.volume {
-                    if let Some(level) = vsync.sonos_changed(v) {
-                        // Set our node's dB to the linear position for this
-                        // percent; Windows then shows the slider at the
-                        // same %.
-                        let mb = stream_to_speaker::volume_sync::sonos_to_millibels(level);
-                        info!("speaker -> windows: volume {} (mb={})", level, mb);
-                        if let Some(p) = pusher.as_ref() {
-                            if let Err(e) = p.push(mb, false) {
-                                warn!("failed to push volume to driver: {}", e);
-                            }
-                        }
-                    }
-                }
-                if let Some(m) = change.mute {
-                    info!("speaker -> driver: mute={}", m);
+                // Set our node's dB to the linear position for the
+                // speaker's percent (Windows then shows the slider at the
+                // same %), keeping level and mute consistent.
+                if let Some((mb, muted)) = vsync.speaker_event(change.volume, change.mute) {
+                    info!(
+                        "speaker -> windows: volume {:?} mute {:?} (mb={}, muted={})",
+                        change.volume, change.mute, mb, muted
+                    );
                     if let Some(p) = pusher.as_ref() {
-                        if let Err(e) = p.push(0, m) {
-                            warn!("failed to push mute to driver: {}", e);
+                        if let Err(e) = p.push(mb, muted) {
+                            warn!("failed to push volume/mute to driver: {}", e);
                         }
                     }
                 }
@@ -789,6 +813,11 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         latency_adjust: Some(latency_adjust),
         web_ui_enabled: Some(app.web_ui_enabled.clone()),
         stream_client_allowed: Some(stream_client_allowed),
+        extra_hosts: vec![app.config.advertise_ip.clone()],
+        speaker_peer: Some({
+            let app2 = app.clone();
+            Arc::new(move |ip| app2.is_speaker_peer(ip))
+        }),
     })
 }
 
@@ -914,6 +943,7 @@ fn spawn_driver_event_consumer(app: Arc<App>, cli: &Cli) {
                     }
                     DriverEvent::MuteChanged { muted } => {
                         info!("driver -> speaker: mute={}", muted);
+                        app.vsync.note_muted(muted);
                         let guard = app.session.lock().unwrap();
                         if let Some(s) = guard.as_ref() {
                             if let Err(e) = s.set_mute(muted) {
