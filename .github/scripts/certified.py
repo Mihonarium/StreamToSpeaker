@@ -329,14 +329,14 @@ def publish_release(repo, tag, manifest, files, notes):
             f.write(data)
         names.append(name)
         sha_name = f"{name}.sha256"
-        with open(sha_name, "w") as f:
+        with open(sha_name, "w", encoding="utf-8") as f:
             f.write(f"{hashlib.sha256(data).hexdigest()}  {name}")
         names.append(sha_name)
-    with open("manifest.json", "w") as f:
+    with open("manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     names.append("manifest.json")
     gh("release", "upload", tag, "--repo", repo, "--clobber", *names)
-    with open("release-notes.md", "w") as f:
+    with open("release-notes.md", "w", encoding="utf-8") as f:
         f.write(notes)
     gh("release", "edit", tag, "--repo", repo, "--prerelease",
        "--title", f"Driver {manifest['driver_version']} — WHQL-certified", "--notes-file", "release-notes.md")
@@ -399,7 +399,7 @@ def cmd_release(a):
     print(f"{'created' if created else 'updated'} {tag}: {m['signed_zip']} sha256 {m['signed_zip_sha256']}")
     out_path = os.environ.get("GITHUB_OUTPUT")
     if out_path:
-        with open(out_path, "a") as f:
+        with open(out_path, "a", encoding="utf-8") as f:
             f.write(f"tag={tag}\nsigned_zip={m['signed_zip']}\nsigned_zip_sha256={m['signed_zip_sha256']}\n")
     attest.summary("\n".join([
         f"## Driver {a.version} certified ✅", "", "| | |", "| --- | --- |", f"| Release | `{tag}` |",

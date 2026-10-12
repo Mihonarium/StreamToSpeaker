@@ -184,7 +184,7 @@ class Release:
             return f.read()
 
     def save_manifest(self, manifest):
-        with open("manifest.json", "w") as f:
+        with open("manifest.json", "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
         self.upload_asset("manifest.json")
 
@@ -282,7 +282,7 @@ def reconcile(api, rel, m, tag, now=time.time, sleep=time.sleep, deadline_s=2700
 def summary(text):
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:
-        with open(path, "a") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(text + "\n")
 
 
@@ -301,7 +301,7 @@ def main():
     verify = outcome == "finalize"
     out_path = os.environ.get("GITHUB_OUTPUT")
     if out_path:
-        with open(out_path, "a") as f:
+        with open(out_path, "a", encoding="utf-8") as f:
             f.write(f"verify_tag={tag if verify else ''}\n")
             f.write(f"outcome={outcome}\n")
     summary(f"## Driver attest\n- release: `{tag}`\n- outcome: `{outcome}`\n"
