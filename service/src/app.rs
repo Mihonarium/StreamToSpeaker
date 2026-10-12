@@ -801,6 +801,12 @@ impl App {
         }
     }
 
+    /// Whether `peer` belongs to the active speaker (or its group). The
+    /// HTTP server never lets other clients crowd these out.
+    pub fn is_speaker_peer(&self, peer: IpAddr) -> bool {
+        self.stream_gate.is_granted(peer)
+    }
+
     /// Privacy gate for `/stream.raw`, called per request (and once a
     /// second per open stream) from the HTTP threads. Touches only the
     /// gate's own brief lock — never `session`, which other threads hold

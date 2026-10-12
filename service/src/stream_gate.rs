@@ -146,6 +146,13 @@ impl StreamGate {
             .any(|ips| ips.contains(&peer))
     }
 
+    /// Is `peer` one of the addresses a live session granted, whatever
+    /// the privacy setting? (The selected speaker and its group.)
+    pub fn is_granted(&self, peer: IpAddr) -> bool {
+        let peer = canonical_ip(peer);
+        self.grants.lock().unwrap().values().any(|ips| ips.contains(&peer))
+    }
+
     pub fn snapshot(&self) -> AllowSnapshot {
         let granted = self
             .grants
@@ -210,6 +217,16 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn is_granted_ignores_privacy_setting() {
+        let g = StreamGate::new(false, None);
+        assert!(!g.is_granted(ip("192.168.1.50")));
+        let grant = g.grant([ip("192.168.1.50")]);
+        assert!(g.is_granted(ip("::ffff:192.168.1.50")));
+        drop(grant);
+        assert!(!g.is_granted(ip("192.168.1.50")));
     }
 
     #[test]

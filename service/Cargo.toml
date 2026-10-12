@@ -34,7 +34,6 @@ log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
 ctrlc = { version = "3", features = ["termination"] }
-tiny_http = "0.12"
 quick-xml = "0.36"
 roxmltree = "0.20"
 socket2 = { version = "0.5", features = ["all"] }
@@ -167,7 +166,9 @@ features = [
     "Win32_System_SystemServices",
     "Win32_System_Console",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
     "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
 ]

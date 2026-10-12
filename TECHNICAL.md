@@ -228,13 +228,24 @@ the crate version and update checks are off.
 |---|---|---|---|
 | `/stream.raw` | GET | Raw PCM the speaker pulls. | yes |
 | `/api/speakers` | GET | Discovered speakers. | `--web` |
-| `/api/select` | POST | `{"id": "<udn-or-ip>"}` — switch speaker. | `--web` |
+| `/api/select` | POST | `{"id": "<udn-or-ip>"}` with `Content-Type: application/json` — switch speaker. | `--web` |
 | `/api/resync` | POST | Restart the session. | `--web` |
 | `/api/latency/adjust?ms=N` | POST | `N>0` drains, `N<0` pads. | `--web` |
-| `/healthz` | GET | Returns `ok`. | `--web` |
+| `/healthz` | GET | Returns `ok`. | yes |
 
-> ⚠️ The API has no authentication. Leave it off (the default), bind to
-> `127.0.0.1`, or front it with a reverse proxy that authenticates.
+Requests must name this machine in `Host` (`localhost`, its computer name,
+one of its IP addresses, or `--advertise-ip`), and the `POST` routes refuse
+requests a browser marks as coming from another site (`Origin` /
+`Sec-Fetch-Site`), so a web page can't drive the API or read the stream
+through DNS rebinding. Scripts that send neither header are unaffected:
+
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{"id":"uuid:RINCON_..."}' http://localhost:5901/api/select
+```
+
+> ⚠️ The API has no authentication: anyone on the LAN can call it while it
+> is on. Leave it off (the default), bind to `127.0.0.1`, or front it with a
+> reverse proxy that authenticates.
 
 ## Continuous integration
 
