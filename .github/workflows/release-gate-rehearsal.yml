@@ -1,0 +1,258 @@
+# Temporary: exercises build.yml's verify-driver / sign-release wiring from
+# a branch against existing releases. Each chain mirrors the tag pipeline:
+# a stand-in `package` job producing the same outputs (driver chosen by the
+# real Get-AttestedDriver.ps1 from the tagged source), the verify-driver job
+# as in build.yml, and a stand-in sign-release with build.yml's condition
+# (minus the tag clause) that fetches and hash-checks the installer but
+# signs nothing.
+#   certified - v0.1.9 installer + the driver its tagged source selects
+#   attested  - v0.1.6 installer + the driver its tagged source selects
+#   mismatch  - v0.1.6 installer checked against v0.1.9's driver (must fail)
+#   fallback  - no Microsoft-signed match: the gate is skipped, signing runs
+name: Release gate rehearsal
+
+on:
+  push:
+    branches: [ci/release-driver-gate-v2]
+    paths: [".github/workflows/release-gate-rehearsal.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Windows like the real package/build jobs: hashFiles() of the driver
+  # source depends on the checkout's line endings.
+  package-certified:
+    runs-on: windows-latest
+    outputs:
+      commit: ${{ steps.src.outputs.commit }}
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+      driver_kind: ${{ steps.attested.outputs.kind }}
+      installer_name: ${{ steps.inst.outputs.name }}
+      installer_sha256: ${{ steps.inst.outputs.sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: v0.1.9, path: tagged }
+      - uses: actions/checkout@v4
+        with: { path: tools, sparse-checkout: .github/scripts }
+      - id: src
+        working-directory: tagged
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: attested
+        shell: pwsh
+        run: tools/.github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ hashFiles('tagged/driver/**', 'tagged/include/**') }}" -OutDir attested-driver
+      - id: inst
+        shell: pwsh
+        run: |
+          $name = "StreamToSpeakerSetup-0.1.9.exe"
+          gh release download v0.1.9 --repo $env:GITHUB_REPOSITORY --pattern $name --dir inst
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$((Get-FileHash "inst/$name" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+
+  verify-driver-certified:
+    if: needs.package-certified.outputs.driver_found == 'true'
+    needs: package-certified
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package-certified.outputs.driver_tag }}
+      commit: ${{ needs.package-certified.outputs.commit }}
+      installer_tag: v0.1.9
+      installer_name: ${{ needs.package-certified.outputs.installer_name }}
+      installer_sha256: ${{ needs.package-certified.outputs.installer_sha256 }}
+
+  sign-release-certified:
+    if: >-
+      !cancelled() &&
+      needs.package-certified.result == 'success' &&
+      (needs.verify-driver-certified.result == 'success' ||
+       (needs.verify-driver-certified.result == 'skipped' && needs.package-certified.outputs.driver_found == 'false'))
+    needs: [package-certified, verify-driver-certified]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - shell: pwsh
+        run: |
+          $name = "${{ needs.package-certified.outputs.installer_name }}"
+          gh release download v0.1.9 --repo $env:GITHUB_REPOSITORY --pattern $name --dir setup-unsigned
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          $sha = (Get-FileHash "setup-unsigned/$name" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne "${{ needs.package-certified.outputs.installer_sha256 }}") { throw "hash differs" }
+          Write-Host "sign-release would run: $name sha256 $sha (driver ${{ needs.package-certified.outputs.driver_tag }}, ${{ needs.package-certified.outputs.driver_kind }}; gate: ${{ needs.verify-driver-certified.result }})"
+
+  # Windows like the real package/build jobs: hashFiles() of the driver
+  # source depends on the checkout's line endings.
+  package-attested:
+    runs-on: windows-latest
+    outputs:
+      commit: ${{ steps.src.outputs.commit }}
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+      driver_kind: ${{ steps.attested.outputs.kind }}
+      installer_name: ${{ steps.inst.outputs.name }}
+      installer_sha256: ${{ steps.inst.outputs.sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: v0.1.6, path: tagged }
+      - uses: actions/checkout@v4
+        with: { path: tools, sparse-checkout: .github/scripts }
+      - id: src
+        working-directory: tagged
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: attested
+        shell: pwsh
+        run: tools/.github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ hashFiles('tagged/driver/**', 'tagged/include/**') }}" -OutDir attested-driver
+      - id: inst
+        shell: pwsh
+        run: |
+          $name = "StreamToSpeakerSetup-0.1.6.exe"
+          gh release download v0.1.6 --repo $env:GITHUB_REPOSITORY --pattern $name --dir inst
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$((Get-FileHash "inst/$name" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+
+  verify-driver-attested:
+    if: needs.package-attested.outputs.driver_found == 'true'
+    needs: package-attested
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package-attested.outputs.driver_tag }}
+      commit: ${{ needs.package-attested.outputs.commit }}
+      installer_tag: v0.1.6
+      installer_name: ${{ needs.package-attested.outputs.installer_name }}
+      installer_sha256: ${{ needs.package-attested.outputs.installer_sha256 }}
+
+  sign-release-attested:
+    if: >-
+      !cancelled() &&
+      needs.package-attested.result == 'success' &&
+      (needs.verify-driver-attested.result == 'success' ||
+       (needs.verify-driver-attested.result == 'skipped' && needs.package-attested.outputs.driver_found == 'false'))
+    needs: [package-attested, verify-driver-attested]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - shell: pwsh
+        run: |
+          $name = "${{ needs.package-attested.outputs.installer_name }}"
+          gh release download v0.1.6 --repo $env:GITHUB_REPOSITORY --pattern $name --dir setup-unsigned
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          $sha = (Get-FileHash "setup-unsigned/$name" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne "${{ needs.package-attested.outputs.installer_sha256 }}") { throw "hash differs" }
+          Write-Host "sign-release would run: $name sha256 $sha (driver ${{ needs.package-attested.outputs.driver_tag }}, ${{ needs.package-attested.outputs.driver_kind }}; gate: ${{ needs.verify-driver-attested.result }})"
+
+  # Windows like the real package/build jobs: hashFiles() of the driver
+  # source depends on the checkout's line endings.
+  package-mismatch:
+    runs-on: windows-latest
+    outputs:
+      commit: ${{ steps.src.outputs.commit }}
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+      driver_kind: ${{ steps.attested.outputs.kind }}
+      installer_name: ${{ steps.inst.outputs.name }}
+      installer_sha256: ${{ steps.inst.outputs.sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: v0.1.9, path: tagged }
+      - uses: actions/checkout@v4
+        with: { path: tools, sparse-checkout: .github/scripts }
+      - id: src
+        working-directory: tagged
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: attested
+        shell: pwsh
+        run: tools/.github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ hashFiles('tagged/driver/**', 'tagged/include/**') }}" -OutDir attested-driver
+      - id: inst
+        shell: pwsh
+        run: |
+          $name = "StreamToSpeakerSetup-0.1.6.exe"
+          gh release download v0.1.6 --repo $env:GITHUB_REPOSITORY --pattern $name --dir inst
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$((Get-FileHash "inst/$name" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+
+  verify-driver-mismatch:
+    if: needs.package-mismatch.outputs.driver_found == 'true'
+    needs: package-mismatch
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package-mismatch.outputs.driver_tag }}
+      commit: ${{ needs.package-mismatch.outputs.commit }}
+      installer_tag: v0.1.6
+      installer_name: ${{ needs.package-mismatch.outputs.installer_name }}
+      installer_sha256: ${{ needs.package-mismatch.outputs.installer_sha256 }}
+
+  sign-release-mismatch:
+    if: >-
+      !cancelled() &&
+      needs.package-mismatch.result == 'success' &&
+      (needs.verify-driver-mismatch.result == 'success' ||
+       (needs.verify-driver-mismatch.result == 'skipped' && needs.package-mismatch.outputs.driver_found == 'false'))
+    needs: [package-mismatch, verify-driver-mismatch]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - shell: pwsh
+        run: |
+          $name = "${{ needs.package-mismatch.outputs.installer_name }}"
+          gh release download v0.1.6 --repo $env:GITHUB_REPOSITORY --pattern $name --dir setup-unsigned
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          $sha = (Get-FileHash "setup-unsigned/$name" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne "${{ needs.package-mismatch.outputs.installer_sha256 }}") { throw "hash differs" }
+          Write-Host "sign-release would run: $name sha256 $sha (driver ${{ needs.package-mismatch.outputs.driver_tag }}, ${{ needs.package-mismatch.outputs.driver_kind }}; gate: ${{ needs.verify-driver-mismatch.result }})"
+
+  package-fallback:
+    runs-on: ubuntu-latest
+    outputs:
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: .github/scripts }
+      # A driver source no driver-v* release matches.
+      - id: attested
+        shell: pwsh
+        run: .github/scripts/Get-AttestedDriver.ps1 -SourceHash "0000000000000000000000000000000000000000000000000000000000000000" -OutDir attested-driver
+
+  verify-driver-fallback:
+    if: needs.package-fallback.outputs.driver_found == 'true'
+    needs: package-fallback
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package-fallback.outputs.driver_tag }}
+      installer_tag: v0.1.9
+
+  sign-release-fallback:
+    if: >-
+      !cancelled() &&
+      needs.package-fallback.result == 'success' &&
+      (needs.verify-driver-fallback.result == 'success' ||
+       (needs.verify-driver-fallback.result == 'skipped' && needs.package-fallback.outputs.driver_found == 'false'))
+    needs: [package-fallback, verify-driver-fallback]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "sign-release would run (gate ${{ needs.verify-driver-fallback.result }}, driver_found ${{ needs.package-fallback.outputs.driver_found }})"
