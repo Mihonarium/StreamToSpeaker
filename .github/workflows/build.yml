@@ -92,7 +92,7 @@ jobs:
       # Toolchains
       # -----------------------------------------------------------------
       - name: Set up Rust (stable, x86_64-pc-windows-msvc)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -377,6 +377,24 @@ jobs:
           # Empty on non-tag builds → dev build → update checks disabled.
           STS_RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && steps.ver.outputs.version || '' }}
         run: cargo build --release
+
+      # The exe must run on a clean Windows install, which has the UCRT but
+      # not the Visual C++ runtime DLLs (service/.cargo/config.toml links
+      # the C runtime statically). Fail if it imports any of them.
+      - name: Check the service exe needs no Visual C++ runtime DLL
+        shell: pwsh
+        working-directory: service
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe |
+              Where-Object { $_.FullName -match '\\Hostx64\\x64\\' } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          $deps = & $dumpbin /nologo /dependents target\release\stream-to-speaker.exe | Out-String
+          Write-Host $deps
+          if ($deps -match '(?im)^\s*(vcruntime\d+(_\d+)?|msvcp\d+(_\w+)?|concrt\d+)\.dll') {
+              throw "stream-to-speaker.exe imports a Visual C++ runtime DLL ($($Matches[0].Trim())), which a clean Windows install doesn't have"
+          }
 
       # The unit tests never ran in CI before this step existed. --release
       # shares the artifacts just built. The second command runs the one
@@ -925,7 +943,7 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust ${{ steps.msrv.outputs.version }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
           targets: x86_64-pc-windows-gnu

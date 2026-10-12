@@ -54,7 +54,7 @@
 use byteorder::{BigEndian, ByteOrder};
 use log::{debug, info, warn};
 use std::collections::VecDeque;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -293,6 +293,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn control_traffic_only_from_the_receiver() {
+        let rx: IpAddr = "192.168.1.20".parse().unwrap();
+        assert!(from_receiver("192.168.1.20".parse().unwrap(), rx));
+        assert!(from_receiver("::ffff:192.168.1.20".parse().unwrap(), rx));
+        assert!(!from_receiver("192.168.1.21".parse().unwrap(), rx));
+    }
+
+    #[test]
     fn ntp_sync_packet_layout() {
         let p = build_ntp_sync(true, 100_000, 11025, 0xAABBCCDD11223344);
         assert_eq!(p.len(), 20);
@@ -318,6 +326,22 @@ mod tests {
         assert_eq!(u32::from_be_bytes([p[16], p[17], p[18], p[19]]), 100_000);
         // Trailing clock identity.
         assert_eq!(u64::from_be_bytes(p[20..28].try_into().unwrap()), 0xDEADBEEFCAFEF00D);
+    }
+
+    #[test]
+    fn homepod_sync_maps_current_rtp_unshifted() {
+        let p = build_ptp_sync_homepod(true, 100_000, 8820, 0x0123456789, 0x7EADBEEFCAFEF00D);
+        assert_eq!(p.len(), 28);
+        assert_eq!((p[0], p[1]), (0x90, 0xD7));
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), 0x0006);
+        assert_eq!(u32::from_be_bytes(p[4..8].try_into().unwrap()), 100_000);
+        assert_eq!(u64::from_be_bytes(p[8..16].try_into().unwrap()), 0x0123456789);
+        assert_eq!(u32::from_be_bytes(p[16..20].try_into().unwrap()), 100_000 - 8820);
+        assert_eq!(u64::from_be_bytes(p[20..28].try_into().unwrap()), 0x7EADBEEFCAFEF00D);
+        assert_eq!(build_ptp_sync_homepod(false, 5, 10, 0, 0)[0], 0x80);
+        // Wraps rather than underflowing near zero.
+        let w = build_ptp_sync_homepod(false, 5, 10, 0, 0);
+        assert_eq!(u32::from_be_bytes(w[16..20].try_into().unwrap()), 5u32.wrapping_sub(10));
     }
 
     #[test]
@@ -372,6 +396,25 @@ fn build_ptp_sync(first: bool, cur_rtp: u32, latency: u32, ptp_ns: u64, clock_id
     BigEndian::write_u32(&mut pkt[4..8], cur_rtp.wrapping_sub(latency));
     BigEndian::write_u64(&mut pkt[8..16], ptp_ns);
     BigEndian::write_u32(&mut pkt[16..20], cur_rtp);
+    BigEndian::write_u64(&mut pkt[20..28], clock_id);
+    pkt
+}
+
+/// 28-byte PTP sync packet (PT 0xD7) for the HomePod realtime profile.
+/// Same layout as [`build_ptp_sync`] but with the RTP fields the other way
+/// round: bytes 4..8 carry the **current** RTP timestamp (the next packet
+/// to be sent) unshifted, bytes 16..20 the current timestamp minus the
+/// latency. The receiver applies the SETUP `latencyMin` itself, so
+/// subtracting the latency in the 4..8 mapping as well would double the
+/// audible delay. The time and clock id are always our grandmaster's.
+pub fn build_ptp_sync_homepod(first: bool, cur_rtp: u32, latency: u32, ptp_ns: u64, clock_id: u64) -> [u8; 28] {
+    let mut pkt = [0u8; 28];
+    pkt[0] = if first { 0x90 } else { 0x80 };
+    pkt[1] = 0xD7;
+    BigEndian::write_u16(&mut pkt[2..4], 0x0006);
+    BigEndian::write_u32(&mut pkt[4..8], cur_rtp);
+    BigEndian::write_u64(&mut pkt[8..16], ptp_ns);
+    BigEndian::write_u32(&mut pkt[16..20], cur_rtp.wrapping_sub(latency));
     BigEndian::write_u64(&mut pkt[20..28], clock_id);
     pkt
 }
@@ -447,6 +490,16 @@ pub struct ResendStats {
     pub requests: AtomicU64,
     /// Packets actually re-sent in response.
     pub packets: AtomicU64,
+    /// Packets named by requests (sum of the requested runs).
+    pub requested: AtomicU64,
+    /// Requested packets no longer (or never) in the history.
+    pub missing: AtomicU64,
+    /// Requested packets past their playout deadline (not resent).
+    pub expired: AtomicU64,
+    /// Requested packets dropped because the pending queue was full.
+    pub queue_drops: AtomicU64,
+    /// Resends that failed on the socket.
+    pub send_errors: AtomicU64,
 }
 
 impl ResendStats {
@@ -454,6 +507,15 @@ impl ResendStats {
     pub fn snapshot(&self) -> (u64, u64) {
         (self.requests.load(Ordering::Relaxed), self.packets.load(Ordering::Relaxed))
     }
+}
+
+/// True when a datagram from `peer` came from the receiver's address
+/// (IPv4-mapped IPv6 folded). Resend requests from anyone else on the LAN
+/// are ignored, so a third party can't make us re-send audio at the
+/// receiver. PTP is deliberately not filtered this way: a grouped
+/// receiver's clock messages can come from another unit's address.
+pub(crate) fn from_receiver(peer: IpAddr, receiver: IpAddr) -> bool {
+    crate::stream_gate::canonical_ip(peer) == crate::stream_gate::canonical_ip(receiver)
 }
 
 pub fn spawn_resend_responder(
@@ -473,7 +535,11 @@ pub fn spawn_resend_responder(
             while !stop_flag.load(Ordering::Acquire) {
                 match control_socket.recv_from(&mut buf) {
                     // Resend request: 0x80 0xD5, seq(2), first(2), count(2).
-                    Ok((n, peer)) if n >= 8 && buf[1] == 0xD5 => {
+                    Ok((n, peer))
+                        if n >= 8
+                            && buf[1] == 0xD5
+                            && from_receiver(peer.ip(), receiver_control_addr.ip()) =>
+                    {
                         requests += 1;
                         stats.requests.fetch_add(1, Ordering::Relaxed);
                         if requests == 1 {

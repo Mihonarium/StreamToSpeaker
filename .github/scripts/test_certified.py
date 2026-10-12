@@ -102,6 +102,31 @@ class PeStrip(unittest.TestCase):
         b = certified.pe_strip_signature(make_pe(code=b"B" * 64, cert=b"sig1"))
         self.assertNotEqual(a, b)
 
+    def test_same_code_matches_signed_against_unsigned(self):
+        unsigned = make_pe()
+        self.assertTrue(certified.pe_same_code(make_pe(cert=b"sig" * 10), unsigned))
+        self.assertFalse(certified.pe_same_code(make_pe(code=b"X" * 256, cert=b"sig"), unsigned))
+
+    def test_same_code_tolerates_alignment_padding_only(self):
+        unsigned = make_pe(code=b"C" * 61)
+        padded = make_pe(code=b"C" * 61 + b"\0" * 3, cert=b"sig")
+        self.assertTrue(certified.pe_same_code(padded, unsigned))
+        self.assertTrue(certified.pe_same_code(unsigned, padded))
+        self.assertFalse(certified.pe_same_code(make_pe(code=b"C" * 61 + b"\0" * 8, cert=b"sig"), unsigned))
+        self.assertFalse(certified.pe_same_code(make_pe(code=b"C" * 61 + b"\0\1", cert=b"sig"), unsigned))
+
+    def test_sys_match_command(self):
+        d = tempfile.mkdtemp()
+        try:
+            signed, sub, other = (os.path.join(d, n) for n in ("s.sys", "u.sys", "o.sys"))
+            for path, data in ((signed, make_pe(cert=b"sig")), (sub, make_pe()), (other, make_pe(code=b"Z" * 256))):
+                with open(path, "wb") as f:
+                    f.write(data)
+            self.assertEqual(certified.main(["sys-match", "--signed", signed, "--submitted", sub]), 0)
+            self.assertEqual(certified.main(["sys-match", "--signed", signed, "--submitted", other]), 1)
+        finally:
+            shutil.rmtree(d)
+
     def test_rejects_non_pe(self):
         with self.assertRaises(ValueError):
             certified.pe_strip_signature(b"not a pe file")

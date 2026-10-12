@@ -839,10 +839,13 @@ pub fn run(app: Arc<App>, show_tray: bool) -> Result<()> {
                 confirm_close_open: false,
                 password_prompt: None,
                 pin_prompt: None,
+                sendspin_prompt: None,
+                show_ma_token: false,
                 last_fractional_scroll: None,
                 skip_close_confirmation,
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
+                homepod_latency_draft: None,
                 onboarding_dismissed: false,
                 last_applied_dark: None,
                 last_applied_accent: None,
@@ -873,6 +876,8 @@ struct StreamToSpeakerApp {
     skip_close_confirmation: bool,
     theme_mode: ThemeMode,
     advanced_open: bool,
+    /// HomePod delay while its slider is being dragged; saved on release.
+    homepod_latency_draft: Option<i64>,
     onboarding_dismissed: bool,
     /// Open when the user is entering a password for a `pw=true` AirPlay
     /// speaker. `None` when no prompt is showing.
@@ -882,6 +887,11 @@ struct StreamToSpeakerApp {
     /// `pending_pin_pairing` state each frame; `None` when no ceremony is
     /// in flight.
     pin_prompt: Option<PinPrompt>,
+    /// Open while a Sendspin speaker needs its pairing code or token.
+    /// Mirrors the app's `pending_sendspin_pairing` each frame.
+    sendspin_prompt: Option<SendspinPrompt>,
+    /// The Music Assistant card shows the pairing token in clear text.
+    show_ma_token: bool,
     /// When the last fractional (touchpad-shaped) wheel event arrived —
     /// drives the raw_input_hook's mouse-vs-touchpad classification (a
     /// fling's decay passes through exact integers, so integer deltas
@@ -1159,6 +1169,19 @@ impl eframe::App for StreamToSpeakerApp {
             }
         }
 
+        // Same mirroring for a Sendspin speaker that needs pairing; the
+        // connect thread waits (minutes) while the speaker shows its code.
+        if self.password_prompt.is_none() && self.pin_prompt.is_none() && !self.confirm_close_open {
+            match self.app.pending_sendspin_pairing() {
+                Some(view) => {
+                    if self.sendspin_prompt.as_ref().map(|p| p.view.id != view.id || p.view.kind != view.kind).unwrap_or(true) {
+                        self.sendspin_prompt = Some(SendspinPrompt { view, input: String::new() });
+                    }
+                }
+                None => self.sendspin_prompt = None,
+            }
+        }
+
         if self.confirm_close_open {
             self.show_close_modal(ctx, &p);
         }
@@ -1168,13 +1191,18 @@ impl eframe::App for StreamToSpeakerApp {
         if self.pin_prompt.is_some() {
             self.show_pin_modal(ctx, &p);
         }
+        if self.sendspin_prompt.is_some() {
+            self.show_sendspin_pair_modal(ctx, &p);
+        }
+        self.show_ma_code_window(ctx, &p);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(p.canvas).inner_margin(sp::M))
             .show(ctx, |ui| {
                 let enabled = !self.confirm_close_open
                     && self.password_prompt.is_none()
-                    && self.pin_prompt.is_none();
+                    && self.pin_prompt.is_none()
+                    && self.sendspin_prompt.is_none();
                 ui.add_enabled_ui(enabled, |ui| {
                     // Keep the header pinned at the top (theme toggle
                     // shouldn't scroll away); everything below scrolls
@@ -1234,6 +1262,10 @@ impl eframe::App for StreamToSpeakerApp {
                             ui.add_space(sp::M);
                             self.show_latency(ui, &p);
                             ui.add_space(sp::M);
+                            if self.app.is_sendspin_available() {
+                                self.show_music_assistant(ui, &p);
+                                ui.add_space(sp::M);
+                            }
                             self.show_advanced(ui, &p);
                             ui.add_space(sp::M);
                             self.show_web_ui(ui, &p);
@@ -1736,6 +1768,15 @@ impl StreamToSpeakerApp {
                 format!("{} is free for other apps. Press Enable to resume streaming.", r.friendly_name),
                 Some("Enable streaming"),
                 Some("Reconnect to the last speaker and resume streaming (Ctrl+E)"),
+            ),
+            // Music Assistant selected while it is away (no address yet).
+            (Some(r), true, _) if r.ip.is_unspecified() => (
+                "\u{23F8}", // ⏸ Double Vertical Bar (Pause)
+                p.warn,
+                format!("Standing by on {}", r.friendly_name),
+                format!("{} not connected — resumes when it reconnects", r.friendly_name),
+                Some("Disable streaming"),
+                Some("Stop streaming and release the speaker for other apps (Ctrl+E)"),
             ),
             (Some(r), true, true) => (
                 "\u{23F5}", // ⏵ Black Medium Right-Pointing Triangle (Play)
@@ -2696,7 +2737,7 @@ impl StreamToSpeakerApp {
                     p,
                     "AirPlay buffer (latency)",
                     "Lower = less delay, less margin for Wi-Fi hiccups. 2000 ms is what iTunes uses.",
-                    "How much audio an AirPlay speaker holds before playing it. This is most of the delay you hear on AirPlay, so lowering it lowers the delay in step — but any Wi-Fi hiccup longer than the buffer becomes a dropout. A recent Apple TV copes with very small values on a good network; AirPort Express and most AirPlay speakers need roughly 100–350 ms, and a speaker that reports its own minimum is never driven below it. Applies to AirPlay 1 speakers and the AirPlay 2 realtime stream; below 1000 ms an AirPlay 2 speaker is switched to the realtime stream automatically. Takes effect the next time you connect.",
+                    "How much audio an AirPlay speaker holds before playing it. This is most of the delay you hear on AirPlay, so lowering it lowers the delay in step — but any Wi-Fi hiccup longer than the buffer becomes a dropout. A recent Apple TV copes with very small values on a good network; AirPort Express and most AirPlay speakers need roughly 100–350 ms, and a speaker that reports its own minimum is never driven below it. Applies to AirPlay 1 speakers and the AirPlay 2 realtime stream (HomePods use the HomePod delay setting instead); below 1000 ms an AirPlay 2 speaker is switched to the realtime stream automatically. Takes effect the next time you connect.",
                     |ui| {
                         advanced_slider_row(
                             ui,
@@ -2733,6 +2774,50 @@ impl StreamToSpeakerApp {
                 let mut uc = self.app.user_config.lock().unwrap();
                 if uc.prefer_realtime_airplay != prefer_rt {
                     uc.prefer_realtime_airplay = prefer_rt;
+                    uc.save();
+                }
+            }
+
+            ui.add_space(sp::S);
+
+            {
+                use crate::user_config::{
+                    HOMEPOD_LATENCY_MS_DEFAULT, HOMEPOD_LATENCY_MS_MAX, HOMEPOD_LATENCY_MS_MIN,
+                };
+                let (mut hp_buffered, saved_ms) = {
+                    let uc = self.app.user_config.lock().unwrap();
+                    (uc.airplay_homepod_buffered, uc.effective_homepod_latency_ms() as i64)
+                };
+                let mut hp_ms = self.homepod_latency_draft.unwrap_or(saved_ms);
+                let mut commit = false;
+                advanced_row(
+                    ui,
+                    p,
+                    "HomePod delay",
+                    "HomePods and HomePod stereo pairs stream in low-latency realtime mode with this delay.",
+                    "HomePods are streamed with the realtime AirPlay 2 stream and asked to play with exactly this delay (200 ms by default; about 120 ms works on a clean network, 500 ms rides out more Wi-Fi trouble). This is the delay the HomePod adds, not a measured end-to-end figure. Stereo pairs always use realtime mode. If a single HomePod misbehaves, tick the box to go back to the buffered stream used before (seconds of delay, set by the AirPlay buffer above). Takes effect the next time you connect.",
+                    |ui| {
+                        ui.vertical(|ui| {
+                            commit = advanced_slider_row_commit(
+                                ui,
+                                p,
+                                &mut hp_ms,
+                                (HOMEPOD_LATENCY_MS_MIN as i64)..=(HOMEPOD_LATENCY_MS_MAX as i64),
+                                " ms",
+                                HOMEPOD_LATENCY_MS_DEFAULT as i64,
+                                "200 ms",
+                            );
+                            ui.checkbox(&mut hp_buffered, "Use the buffered stream for single HomePods");
+                        });
+                    },
+                );
+                // Save on release; hold the dragged value until then.
+                self.homepod_latency_draft = (!commit && hp_ms != saved_ms).then_some(hp_ms);
+                let mut uc = self.app.user_config.lock().unwrap();
+                let ms = if commit { hp_ms as u32 } else { uc.airplay_homepod_latency_ms };
+                if uc.airplay_homepod_buffered != hp_buffered || uc.airplay_homepod_latency_ms != ms {
+                    uc.airplay_homepod_buffered = hp_buffered;
+                    uc.airplay_homepod_latency_ms = ms;
                     uc.save();
                 }
             }
@@ -3166,6 +3251,275 @@ impl StreamToSpeakerApp {
     }
 }
 
+impl StreamToSpeakerApp {
+    /// Pairing prompt for a Sendspin speaker: its live code, its printed
+    /// code, or its pairing token, depending on what it offers.
+    fn show_sendspin_pair_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(prompt) = self.sendspin_prompt.as_mut() else {
+            return;
+        };
+        let v = &prompt.view;
+        let title = format!("Pair with {}", v.name);
+        let lead = if v.identity_changed {
+            format!(
+                "{} is answering with a different identity than the speaker this computer was paired with \
+                 (it may have been reset or replaced, or another device is using its name). \
+                 Pair it again only if it is your speaker. ",
+                v.name
+            )
+        } else if v.lost_credential {
+            format!("{} no longer recognises this computer, so it needs to be paired again. ", v.name)
+        } else {
+            format!("{} needs to be paired with this computer once. ", v.name)
+        };
+        let (blurb, hint, reject_blank) = match v.kind {
+            crate::sendspin_app::PairPromptKind::LiveCode => (
+                format!(
+                    "{}It is now showing or saying a pairing code — enter it here. \
+                     (A pairing token, starting with SP:, works too.)",
+                    lead
+                ),
+                "Pairing code",
+                true,
+            ),
+            crate::sendspin_app::PairPromptKind::StaticCodeOrToken => (
+                format!(
+                    "{}Enter the pairing code printed on the speaker or in its documentation, \
+                     or paste its pairing token (starts with SP:).",
+                    lead
+                ),
+                "Pairing code or token",
+                true,
+            ),
+            crate::sendspin_app::PairPromptKind::TokenOnly => (
+                format!(
+                    "{}Paste its pairing token (starts with SP:) from the speaker's settings \
+                     or documentation.",
+                    lead
+                ),
+                "SP:…",
+                true,
+            ),
+        };
+        match show_text_prompt_modal(
+            ctx,
+            p,
+            &title,
+            &blurb,
+            hint,
+            false,
+            "Pair",
+            reject_blank,
+            self.confirm_close_open,
+            &mut prompt.input,
+        ) {
+            PromptAction::Confirm => {
+                if let Some(prompt) = self.sendspin_prompt.take() {
+                    self.app.submit_sendspin_pairing(Some(prompt.input.trim().to_string()));
+                }
+            }
+            PromptAction::Cancel => {
+                self.sendspin_prompt = None;
+                self.app.submit_sendspin_pairing(None);
+            }
+            PromptAction::Open => {}
+        }
+    }
+
+    /// While Music Assistant pairs with this PC by code, show the code
+    /// prominently (the user types it into Music Assistant).
+    fn show_ma_code_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some((code, server)) = self.app.sendspin_source_code() else {
+            return;
+        };
+        let grouped = if code.len() == 6 {
+            format!("{} {}", &code[..3], &code[3..])
+        } else {
+            code.clone()
+        };
+        egui::Window::new(egui::RichText::new("Pair with Music Assistant").strong().color(p.text_primary))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(380.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(p.card)
+                    .stroke(egui::Stroke::new(1.0, p.divider))
+                    .rounding(RADIUS_SURFACE)
+                    .inner_margin(sp::MODAL),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("Enter this code in {} to pair this computer:", server))
+                        .color(p.text_secondary),
+                );
+                ui.add_space(sp::S);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(grouped).size(36.0).strong().monospace().color(p.text_primary));
+                    ui.add_space(sp::XS);
+                    if secondary_button(ui, p, "Copy code", 120.0).clicked() {
+                        ui.ctx().copy_text(code.clone());
+                    }
+                });
+                ui.add_space(sp::S);
+                ui.label(
+                    egui::RichText::new("This window closes by itself when pairing finishes.")
+                        .size(12.0)
+                        .color(p.text_tertiary),
+                );
+            });
+    }
+
+    /// Music Assistant card: offer this PC as a Sendspin input and show
+    /// how to pair it.
+    fn show_music_assistant(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(ui, p, |ui| {
+            section_label(ui, p, "Sendspin and Music Assistant");
+            let mut enabled = self.app.is_sendspin_enabled();
+            if ui
+                .checkbox(&mut enabled, "Enable Sendspin (experimental)")
+                .on_hover_text(
+                    "Lists Sendspin speakers (for example ESPHome speakers) and lets you offer \
+                     this computer as a Music Assistant input. Off by default.",
+                )
+                .changed()
+            {
+                self.app.set_sendspin_enabled(enabled);
+            }
+            // `--sendspin-source` runs the input with the setting off; keep
+            // its controls visible so it can be seen and turned off.
+            if !enabled && !self.app.is_sendspin_source_enabled() {
+                return;
+            }
+            ui.add_space(sp::S);
+            ui.label(
+                egui::RichText::new(
+                    "Make this computer's audio available in Music Assistant as a live input \
+                     (through its Sendspin Source plugin), so you can play it on any speaker \
+                     Music Assistant controls.",
+                )
+                .size(12.0)
+                .color(p.text_secondary),
+            );
+            ui.add_space(sp::S);
+            let mut on = self.app.is_sendspin_source_enabled();
+            let resp = ui.checkbox(&mut on, "Offer this computer as a Music Assistant input");
+            if resp.changed() {
+                if let Err(e) = self.app.set_sendspin_source_enabled(on) {
+                    self.app.record_error(format!("Couldn't change the Music Assistant input: {}", e));
+                }
+            }
+            if !on {
+                return;
+            }
+            ui.add_space(sp::XS);
+            use crate::sendspin::source::SourceState;
+            let name = self.app.sendspin_source_name();
+            let (text, color) = match self.app.sendspin_source_state() {
+                Some(SourceState::Waiting) | None => (
+                    format!(
+                        "Waiting for Music Assistant. Enable the Sendspin Source plugin there; \
+                         this computer appears as \u{201c}{}\u{201d}.",
+                        name
+                    ),
+                    p.text_secondary,
+                ),
+                Some(SourceState::NeedsPairing { server }) => (
+                    format!(
+                        "{} found this computer. To finish, open \u{201c}{}\u{201d} in Music Assistant's \
+                         player settings and start its setup: a window with a 6-digit code then \
+                         opens here; type that code in there.",
+                        server, name
+                    ),
+                    p.warn,
+                ),
+                Some(SourceState::Connected { server, streaming }) => (
+                    if streaming && self.app.is_ma_output_selected() {
+                        format!("Paired with {} — playing this computer's audio.", server)
+                    } else {
+                        format!(
+                            "Paired with {}. Select \u{201c}Music Assistant\u{201d} in the speaker list to \
+                             send this computer's audio there (it gets none otherwise). Music Assistant \
+                             picks the speaker: set \u{201c}Automatically play line-in on\u{201d} in \
+                             \u{201c}{}\u{201d}'s player settings there, or start the input from Browse.",
+                            server, name
+                        )
+                    },
+                    p.text_primary,
+                ),
+                Some(SourceState::Failed(e)) => (format!("Not available: {}", e), p.warn),
+            };
+            ui.label(egui::RichText::new(text).size(12.0).color(color));
+            if let Some(note) = self.app.sendspin_source_note() {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(note).size(12.0).color(p.text_tertiary));
+            }
+            if self.app.is_sendspin_pairing_paused() {
+                ui.add_space(sp::XS);
+                ui.label(
+                    egui::RichText::new(
+                        "Pairing with a code is paused: wrong codes were entered too many times. \
+                         If that was you, allow pairing again and retry from Music Assistant; \
+                         otherwise something on your network may be trying to pair with this computer.",
+                    )
+                    .size(12.0)
+                    .color(p.warn),
+                );
+                ui.add_space(sp::XS);
+                if secondary_button(ui, p, "Allow pairing again", 170.0).clicked() {
+                    self.app.allow_sendspin_pairing_again();
+                }
+            }
+            ui.add_space(sp::S);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Pair with a token instead").size(12.0).color(p.text_tertiary),
+            )
+            .id_salt("sendspin-token")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Music Assistant pairs with the 6-digit code shown during setup, so you \
+                         don't need this. It is only for a Sendspin server that asks for a token.",
+                    )
+                    .size(12.0)
+                    .color(p.text_tertiary),
+                );
+                let token = self.app.sendspin_pairing_token();
+                let shown = if self.show_ma_token {
+                    crate::sendspin::keys::format_token_for_display(&token)
+                } else {
+                    "SP:0 •••• •••• •••• ••••".to_string()
+                };
+                ui.label(egui::RichText::new(shown).size(12.0).monospace().color(p.text_secondary));
+                ui.add_space(sp::XS);
+                ui.horizontal(|ui| {
+                    if secondary_button(ui, p, "Copy token", 120.0)
+                        .on_hover_text("Copy the token for a Sendspin server that asks for one")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(token.clone());
+                    }
+                    let label = if self.show_ma_token { "Hide" } else { "Show" };
+                    if link_button(ui, p, label, 80.0).clicked() {
+                        self.show_ma_token = !self.show_ma_token;
+                    }
+                });
+            });
+            let paired = self.app.sendspin_paired_servers();
+            if !paired.is_empty() {
+                ui.add_space(sp::XS);
+                ui.label(
+                    egui::RichText::new(format!("Paired with: {}", paired.join(", ")))
+                        .size(12.0)
+                        .color(p.text_tertiary),
+                );
+            }
+        });
+    }
+}
+
 /// Outcome of one frame of a text-prompt modal.
 enum PromptAction {
     /// Still open, nothing decided this frame.
@@ -3268,6 +3622,13 @@ enum CloseAction {
     MinimiseToTray,
     Quit,
     Cancel,
+}
+
+/// State for the Sendspin speaker pairing modal.
+struct SendspinPrompt {
+    view: crate::sendspin_app::PairPromptView,
+    /// What the user is typing (code or token).
+    input: String,
 }
 
 /// State for the AirPlay password entry modal.
@@ -3504,6 +3865,21 @@ fn advanced_slider_row(
     default: i64,
     default_label: &str,
 ) {
+    advanced_slider_row_commit(ui, p, value, range, suffix, default, default_label);
+}
+
+/// [`advanced_slider_row`] that also says whether the value was committed
+/// this frame: a finished drag, a click on the track, an edited number or
+/// Reset — not every intermediate value while the slider is dragged.
+fn advanced_slider_row_commit(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    value: &mut i64,
+    range: std::ops::RangeInclusive<i64>,
+    suffix: &str,
+    default: i64,
+    default_label: &str,
+) -> bool {
     let dragvalue_w = 96.0;
     let reset_w = 80.0;
     let gap = sp::S;
@@ -3511,14 +3887,14 @@ fn advanced_slider_row(
     let slider_w = (avail - dragvalue_w - reset_w - 2.0 * gap).max(80.0);
     let prev_slider_w = ui.spacing().slider_width;
     ui.spacing_mut().slider_width = slider_w;
-    ui.add(
+    let slider = ui.add(
         egui::Slider::new(value, range.clone())
             .show_value(false)
             .clamping(egui::SliderClamping::Always),
     );
     ui.spacing_mut().slider_width = prev_slider_w;
     ui.add_space(gap);
-    ui.add(
+    let drag_value = ui.add(
         egui::DragValue::new(value)
             .range(range)
             .suffix(suffix)
@@ -3532,7 +3908,10 @@ fn advanced_slider_row(
         .clicked()
     {
         *value = default;
+        return true;
     }
+    let committed = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
+    committed(&slider) || committed(&drag_value)
 }
 
 fn stat_pill(
@@ -3598,13 +3977,7 @@ fn window_icon(state: IconState) -> egui::IconData {
 }
 
 fn open_url(url: &str) -> std::io::Result<()> {
-    // Windows: `cmd /C start "" <url>` is the canonical "open default
-    // browser" invocation. The empty quoted string is required because
-    // start treats the first quoted arg as the new window title.
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn()
-        .map(|_| ())
+    crate::open_url(url)
 }
 
 fn format_duration(secs: u64) -> String {

@@ -406,10 +406,7 @@ fn show_window_win32(hwnd: isize) {
 
 fn open_web_ui(advertise_ip: &str, port: u16) {
     let url = format!("http://{}:{}/", advertise_ip, port);
-    if let Err(e) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", &url])
-        .spawn()
-    {
+    if let Err(e) = crate::open_url(&url) {
         warn!("failed to open browser to {}: {}", url, e);
     }
 }

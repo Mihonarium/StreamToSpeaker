@@ -34,8 +34,6 @@ log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
 ctrlc = { version = "3", features = ["termination"] }
-tiny_http = "0.12"
-quick-xml = "0.36"
 roxmltree = "0.20"
 socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"
@@ -105,6 +103,11 @@ num-traits = "0.2"
 plist = "1"
 # Wipe SRP/session key material on drop.
 zeroize = "1"
+# --- Sendspin (Music Assistant) ---
+# AES-256-GCM for the `25519_AESGCM_SHA256` Noise suite (the ChaChaPoly
+# suite reuses chacha20poly1305 above), HMAC-SHA256 for the Noise HKDF.
+aes-gcm = "0.10"
+hmac = "0.12"
 
 # Embeds assets/StreamToSpeaker.ico into the exe (see build.rs). Windows-only
 # and build-time only, so it adds nothing to the shipped binary's runtime.
@@ -164,7 +167,9 @@ features = [
     "Win32_System_SystemServices",
     "Win32_System_Console",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
     "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
 ]

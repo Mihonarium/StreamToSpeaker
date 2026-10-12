@@ -55,11 +55,11 @@ on:
       tag:
         description: "driver-v* release whose lab package to compare against"
         required: true
-        default: "driver-v1.1.0.209"
+        default: "driver-v1.1.1.211"
       build_number:
         description: "DriverBuildNumber to pin (the release's driver_build)"
         required: true
-        default: "209"
+        default: "211"
       commit:
         description: "Commit to build (empty = HEAD of the branch this is run from)"
         required: false
@@ -103,8 +103,8 @@ jobs:
           IN_ROOT: ${{ inputs.build_root }}
           IN_INSTALLER: ${{ inputs.installer_tag }}
         run: |
-          $tag = if ($env:IN_TAG) { $env:IN_TAG } else { "driver-v1.1.0.209" }
-          $build = if ($env:IN_BUILD) { $env:IN_BUILD } else { "209" }
+          $tag = if ($env:IN_TAG) { $env:IN_TAG } else { "driver-v1.1.1.211" }
+          $build = if ($env:IN_BUILD) { $env:IN_BUILD } else { "211" }
           $root = if ($env:IN_ROOT) { $env:IN_ROOT } else { 'C:\build\src' }
           $installer = "$env:IN_INSTALLER".Trim()
           if ($installer -and $installer -notmatch '^v[0-9][0-9A-Za-z.+-]*$') { throw "installer_tag must be a v* release tag, got '$installer'" }

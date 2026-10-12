@@ -41,11 +41,23 @@
 //! | `pk`        | device HomeKit Ed25519 public key (hex)              |
 //! | `model`     | e.g. `AudioAccessory5,1` (HomePod), `AppleTV6,2`     |
 //! | `srcvers`   | AirPlay source version, e.g. `366.0`                 |
+//! | `tsid`      | group id shared by the members of a stereo pair      |
+//! | `gpn`       | group (pair) name                                    |
+//! | `igl`       | `1` on the group leader                              |
+//!
+//! ## Stereo pairs
+//!
+//! Two HomePods configured as a stereo pair advertise separately but share
+//! a `tsid` (only HomePods are grouped this way). Once two records with the same `tsid` have been seen they are
+//! listed as **one** entry (`airplay:pair:<tsid>`, see [`StereoPair`]) and
+//! the members are hidden; selecting a member selects the pair. The entry
+//! stays listed while a member is offline, but can only be played with
+//! every member present.
 
 use anyhow::Result;
 use log::{debug, info, warn};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo, TxtProperties};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -125,13 +137,49 @@ pub struct AirPlayRenderer {
     /// Model string (`am=` on RAOP or `model` on AirPlay), e.g.
     /// `AudioAccessory5,1` for a HomePod.
     pub model: Option<String>,
+    /// Group TXT keys from `_airplay._tcp`, when the device advertises a
+    /// group id.
+    pub group: Option<GroupTxt>,
+    /// Set on the synthetic entry that stands for a whole stereo pair.
+    pub pair: Option<StereoPair>,
+}
+
+/// Group-related TXT keys of one receiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupTxt {
+    /// `tsid`, normalised (trimmed, lower-case).
+    pub tsid: String,
+    /// `gpn` — the group's display name.
+    pub name: Option<String>,
+    /// `igl=1` — this member leads the group.
+    pub leader: bool,
+}
+
+/// A stereo pair: members seen sharing one `tsid`.
+#[derive(Debug, Clone)]
+pub struct StereoPair {
+    pub tsid: String,
+    /// Members currently discovered, leader first.
+    pub members: Vec<AirPlayRenderer>,
+    /// Members known to belong to the pair (seen this run).
+    pub expected: usize,
+}
+
+impl StereoPair {
+    /// Every known member is present.
+    pub fn is_complete(&self) -> bool {
+        self.members.len() >= self.expected && self.expected >= 2
+    }
 }
 
 impl AirPlayRenderer {
     /// Stable identifier used by the UI / persistence layer. Prefixed so
     /// it can't collide with the UPnP `Renderer::stable_id()`.
     pub fn stable_id(&self) -> String {
-        format!("airplay:{}", self.mac_id)
+        match &self.pair {
+            Some(p) => format!("{}{}", PAIR_ID_PREFIX, p.tsid),
+            None => format!("airplay:{}", self.mac_id),
+        }
     }
 
     /// True if this device exposes a usable **legacy RAOP** path: a RAOP
@@ -205,7 +253,7 @@ impl AirPlayRenderer {
     /// audio on HomeKit pairing even though they still advertise a RAOP
     /// service, so we route them to AP2 regardless of their `et` list.
     pub fn requires_airplay2(&self) -> bool {
-        if self.is_homepod() {
+        if self.is_homepod() || self.pair.is_some() {
             return true;
         }
         // No usable legacy path but a usable AP2 path ⇒ AP2 is required.
@@ -239,6 +287,12 @@ impl AirPlayRenderer {
     /// the well-tested code path and reserves the AP2 path for HomePods
     /// and AP2-only receivers.
     pub fn transport(&self) -> Option<Transport> {
+        // A pair is played over AirPlay 2 by every member, so all of them
+        // must be present and reachable that way.
+        if let Some(p) = &self.pair {
+            let ok = p.is_complete() && p.members.iter().all(|m| m.supports_airplay2());
+            return ok.then_some(Transport::AirPlay2);
+        }
         if self.requires_airplay2() {
             return self.supports_airplay2().then_some(Transport::AirPlay2);
         }
@@ -283,13 +337,23 @@ struct AirPlayInfo {
     features: Option<u64>,
     pk: Option<String>,
     model: Option<String>,
+    group: Option<GroupTxt>,
 }
+
+/// Stable-id prefix of a stereo-pair entry.
+pub const PAIR_ID_PREFIX: &str = "airplay:pair:";
 
 /// Shared discovery state. Mirrors `ssdp::DiscoveryState` semantics.
 #[derive(Default)]
 pub struct AirPlayDiscoveryState {
     raop: Mutex<HashMap<String, RaopInfo>>,
     airplay: Mutex<HashMap<String, AirPlayInfo>>,
+    /// `_airplay._tcp` instance fullname → MAC, so a removal (which only
+    /// names the instance) can evict the right record.
+    airplay_names: Mutex<HashMap<String, String>>,
+    /// tsid → MACs seen advertising it this run. Two or more make a pair;
+    /// remembering them keeps the pair listed while a member is offline.
+    pair_members: Mutex<HashMap<String, BTreeSet<String>>>,
 }
 
 impl AirPlayDiscoveryState {
@@ -298,34 +362,94 @@ impl AirPlayDiscoveryState {
     }
 
     /// Snapshot of currently-known receivers, sorted by friendly name.
+    /// Stereo-pair members are folded into one entry per pair.
     pub fn renderers(&self) -> Vec<AirPlayRenderer> {
-        let raop = self.raop.lock().unwrap();
-        let airplay = self.airplay.lock().unwrap();
-        let mut macs: HashSet<String> = HashSet::new();
-        macs.extend(raop.keys().cloned());
-        macs.extend(airplay.keys().cloned());
-
-        let mut v: Vec<AirPlayRenderer> = macs
-            .into_iter()
-            .filter_map(|mac| merge(&mac, raop.get(&mac), airplay.get(&mac)))
-            .collect();
+        let singles = {
+            let raop = self.raop.lock().unwrap();
+            let airplay = self.airplay.lock().unwrap();
+            let mut macs: HashSet<String> = HashSet::new();
+            macs.extend(raop.keys().cloned());
+            macs.extend(airplay.keys().cloned());
+            macs.into_iter()
+                .filter_map(|mac| merge(&mac, raop.get(&mac), airplay.get(&mac)))
+                .collect::<Vec<_>>()
+        };
+        let memory = self.pair_members.lock().unwrap().clone();
+        let mut v = fold_pairs(singles, &memory);
         v.sort_by(|a, b| a.friendly_name.cmp(&b.friendly_name));
         v
     }
 
     /// Find by our public `stable_id()` (i.e. with the `airplay:` prefix).
+    /// A stereo-pair member's id resolves to its pair: playing one member
+    /// alone would break the pair.
     pub fn find_by_id(&self, id: &str) -> Option<AirPlayRenderer> {
+        if id.starts_with(PAIR_ID_PREFIX) {
+            return self.renderers().into_iter().find(|r| r.stable_id() == id);
+        }
         let mac = id.strip_prefix("airplay:")?.to_string();
+        let tsid = self
+            .pair_members
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, macs)| macs.len() >= 2 && macs.contains(&mac))
+            .map(|(tsid, _)| tsid.clone());
+        if let Some(tsid) = tsid {
+            let pair_id = format!("{}{}", PAIR_ID_PREFIX, tsid);
+            return self.renderers().into_iter().find(|r| r.stable_id() == pair_id);
+        }
         let raop = self.raop.lock().unwrap();
         let airplay = self.airplay.lock().unwrap();
         merge(&mac, raop.get(&mac), airplay.get(&mac))
+    }
+
+    /// Launch reconnect for a saved stereo pair (or a saved id of one of
+    /// its members): wait up to `max` for every member to resolve and
+    /// return the pair's id. `None` when the id isn't a HomePod pair (or
+    /// a possible member of one) or the pair didn't complete in time.
+    pub fn wait_for_pair(&self, id: &str, max: Duration) -> Option<String> {
+        let deadline = std::time::Instant::now() + max;
+        loop {
+            match pair_launch_step(id, self.find_by_id(id).as_ref()) {
+                PairLaunch::Ready(pair_id) => return Some(pair_id),
+                PairLaunch::NotAPair => return None,
+                PairLaunch::Wait if std::time::Instant::now() >= deadline => return None,
+                PairLaunch::Wait => thread::sleep(Duration::from_millis(250)),
+            }
+        }
     }
 
     fn upsert_raop(&self, mac: String, info: RaopInfo) {
         self.raop.lock().unwrap().insert(mac, info);
     }
 
-    fn upsert_airplay(&self, mac: String, info: AirPlayInfo) {
+    fn upsert_airplay(&self, mac: String, fullname: &str, info: AirPlayInfo) {
+        {
+            let mut memory = self.pair_members.lock().unwrap();
+            // A device that left a pair (or changed groups) is forgotten
+            // under its old tsid.
+            for (tsid, macs) in memory.iter_mut() {
+                if info.group.as_ref().map(|g| &g.tsid) != Some(tsid) {
+                    macs.remove(&mac);
+                }
+            }
+            memory.retain(|_, macs| !macs.is_empty());
+            // Only HomePods are folded into pairs; other receivers keep
+            // their own entries whatever group keys they advertise.
+            let homepod = info.model.as_deref().is_some_and(|m| m.starts_with("AudioAccessory"));
+            if let Some(g) = info.group.as_ref().filter(|_| homepod) {
+                memory.entry(g.tsid.clone()).or_default().insert(mac.clone());
+            }
+        }
+        {
+            // One instance name per device: a device that re-advertises
+            // under a new name forgets the old one, so a late removal of
+            // the old name can't evict the current record.
+            let mut names = self.airplay_names.lock().unwrap();
+            names.retain(|n, m| *m != mac || n == fullname);
+            names.insert(fullname.to_string(), mac.clone());
+        }
         self.airplay.lock().unwrap().insert(mac, info);
     }
 
@@ -336,6 +460,88 @@ impl AirPlayDiscoveryState {
             self.airplay.lock().unwrap().remove(mac);
         }
     }
+
+    /// Evict the `_airplay._tcp` record named `fullname` — HomePods only,
+    /// where it tells which stereo-pair member is offline. Other receivers
+    /// keep their record (and so their routing) until re-resolved.
+    fn remove_airplay_instance(&self, fullname: &str) {
+        let mut names = self.airplay_names.lock().unwrap();
+        let Some(mac) = names.get(fullname).cloned() else { return };
+        let mut airplay = self.airplay.lock().unwrap();
+        let homepod = airplay
+            .get(&mac)
+            .and_then(|a| a.model.as_deref())
+            .is_some_and(|m| m.starts_with("AudioAccessory"));
+        if homepod {
+            names.remove(fullname);
+            airplay.remove(&mac);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PairLaunch {
+    Ready(String),
+    Wait,
+    NotAPair,
+}
+
+/// One step of [`AirPlayDiscoveryState::wait_for_pair`]: a complete pair
+/// is ready; an incomplete pair, a pair id not resolved yet, or a HomePod
+/// advertising a group id (its partner may not have resolved) is worth
+/// waiting for; anything else isn't a pair.
+fn pair_launch_step(id: &str, found: Option<&AirPlayRenderer>) -> PairLaunch {
+    match found {
+        Some(r) => match &r.pair {
+            Some(p) if p.is_complete() => PairLaunch::Ready(r.stable_id()),
+            Some(_) => PairLaunch::Wait,
+            None if r.is_homepod() && r.group.is_some() => PairLaunch::Wait,
+            None => PairLaunch::NotAPair,
+        },
+        None if id.starts_with(PAIR_ID_PREFIX) => PairLaunch::Wait,
+        None => PairLaunch::NotAPair,
+    }
+}
+
+/// Replace the members of every known pair (`memory`: tsid → MACs seen)
+/// with one pair entry. The entry copies its leader's record (`igl=1`,
+/// else the lowest MAC present) and is named by `gpn`, else the leader's
+/// name. Pairs with no member present are omitted.
+fn fold_pairs(singles: Vec<AirPlayRenderer>, memory: &HashMap<String, BTreeSet<String>>) -> Vec<AirPlayRenderer> {
+    let pairs: HashMap<&String, &BTreeSet<String>> =
+        memory.iter().filter(|(_, macs)| macs.len() >= 2).collect();
+    let pair_of = |r: &AirPlayRenderer| -> Option<String> {
+        pairs
+            .iter()
+            .find(|(_, macs)| macs.contains(&r.mac_id))
+            .map(|(tsid, _)| (*tsid).clone())
+    };
+    let mut out = Vec::new();
+    let mut grouped: HashMap<String, Vec<AirPlayRenderer>> = HashMap::new();
+    for r in singles {
+        match pair_of(&r) {
+            Some(tsid) => grouped.entry(tsid).or_default().push(r),
+            None => out.push(r),
+        }
+    }
+    for (tsid, mut members) in grouped {
+        members.sort_by(|a, b| {
+            let lead = |r: &AirPlayRenderer| !r.group.as_ref().map(|g| g.leader).unwrap_or(false);
+            lead(a).cmp(&lead(b)).then_with(|| a.mac_id.cmp(&b.mac_id))
+        });
+        let leader = members[0].clone();
+        let name = members
+            .iter()
+            .find_map(|m| m.group.as_ref().and_then(|g| g.name.clone()))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| leader.friendly_name.clone());
+        let expected = pairs.get(&tsid).map(|m| m.len()).unwrap_or(2);
+        let mut entry = leader;
+        entry.friendly_name = name;
+        entry.pair = Some(StereoPair { tsid, members, expected });
+        out.push(entry);
+    }
+    out
 }
 
 /// Build a public [`AirPlayRenderer`] from whichever partial records we
@@ -368,6 +574,8 @@ fn merge(mac: &str, raop: Option<&RaopInfo>, airplay: Option<&AirPlayInfo>) -> O
         model: airplay
             .and_then(|a| a.model.clone())
             .or_else(|| raop.and_then(|r| r.model.clone())),
+        group: airplay.and_then(|a| a.group.clone()),
+        pair: None,
     })
 }
 
@@ -407,9 +615,11 @@ pub fn spawn_airplay_discovery(
                             ingest_resolution(&state, service, &info);
                         }
                         Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
+                            debug!("AirPlay removed ({}): {}", service, fullname);
                             if let Some(mac) = mac_from_event(service, &fullname) {
-                                debug!("AirPlay removed ({}): {}", service, fullname);
                                 state.remove(&mac, service);
+                            } else if service == AIRPLAY_SERVICE {
+                                state.remove_airplay_instance(&fullname);
                             }
                         }
                         Ok(_) => { /* SearchStarted / ServiceFound / etc. */ }
@@ -469,12 +679,17 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
             features: read_features(txt),
             pk: read_txt_string(txt, "pk"),
             model: read_txt_string(txt, "model"),
+            group: group_txt(
+                read_txt_string(txt, "tsid").as_deref(),
+                read_txt_string(txt, "gpn"),
+                read_txt_bool(txt, "igl"),
+            ),
         };
         debug!(
-            "AirPlay v2 resolved: {} @ {:?}:{} ft={:?} model={:?}",
-            a.friendly_name, a.ip, a.port, a.features, a.model
+            "AirPlay v2 resolved: {} @ {:?}:{} ft={:?} model={:?} group={:?}",
+            a.friendly_name, a.ip, a.port, a.features, a.model, a.group
         );
-        state.upsert_airplay(mac, a);
+        state.upsert_airplay(mac, info.get_fullname(), a);
     }
 }
 
@@ -522,6 +737,15 @@ fn airplay_instance_name(fullname: &str) -> String {
         .unwrap_or(fullname)
         .trim_end_matches('.')
         .to_string()
+}
+
+/// Group keys from TXT. An empty or all-zero `tsid` means "no group".
+fn group_txt(tsid: Option<&str>, name: Option<String>, leader: bool) -> Option<GroupTxt> {
+    let tsid = tsid?.trim().to_ascii_lowercase();
+    if tsid.is_empty() || tsid.chars().all(|c| c == '0' || c == '-') {
+        return None;
+    }
+    Some(GroupTxt { tsid, name: name.map(|n| n.trim().to_string()), leader })
 }
 
 /// On removal we only get the fullname; recover the MAC so we can evict
@@ -606,7 +830,120 @@ mod tests {
             features: ft,
             pk: None,
             model: model.map(|s| s.to_string()),
+            group: None,
+            pair: None,
         }
+    }
+
+    const HOMEPOD_FT: u64 = FEAT_AUDIO | FEAT_PTP | FEAT_TRANSIENT_PAIRING | FEAT_HK_PAIRING;
+
+    fn pod(mac: &str, tsid: Option<&str>, leader: bool, gpn: Option<&str>) -> AirPlayRenderer {
+        let mut r = renderer(Some("AudioAccessory5,1"), vec![0], Some(HOMEPOD_FT), 7000, Some(7000));
+        r.mac_id = mac.into();
+        r.friendly_name = format!("Pod {mac}");
+        r.group = tsid.and_then(|t| group_txt(Some(t), gpn.map(String::from), leader));
+        r
+    }
+
+    fn memory(entries: &[(&str, &[&str])]) -> HashMap<String, BTreeSet<String>> {
+        entries
+            .iter()
+            .map(|(t, macs)| (t.to_ascii_lowercase(), macs.iter().map(|m| m.to_string()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn pair_launch_waits_for_members() {
+        let mem = memory(&[("t1", &["AA", "BB"])]);
+        let both = fold_pairs(vec![pod("AA", Some("t1"), true, None), pod("BB", Some("t1"), false, None)], &mem);
+        let one = fold_pairs(vec![pod("AA", Some("t1"), true, None)], &mem);
+        assert_eq!(pair_launch_step("airplay:AA", Some(&both[0])), PairLaunch::Ready("airplay:pair:t1".into()));
+        assert_eq!(pair_launch_step("airplay:pair:t1", Some(&one[0])), PairLaunch::Wait);
+        assert_eq!(pair_launch_step("airplay:pair:t1", None), PairLaunch::Wait);
+        // A HomePod with a group id, partner not yet seen.
+        assert_eq!(pair_launch_step("airplay:AA", Some(&pod("AA", Some("t1"), true, None))), PairLaunch::Wait);
+        assert_eq!(pair_launch_step("airplay:CC", Some(&pod("CC", None, false, None))), PairLaunch::NotAPair);
+        assert_eq!(pair_launch_step("airplay:ZZ", None), PairLaunch::NotAPair);
+    }
+
+    #[test]
+    fn group_txt_normalises_and_ignores_empty() {
+        assert_eq!(group_txt(Some(" ABC-1 "), None, true).unwrap().tsid, "abc-1");
+        assert!(group_txt(Some(""), None, false).is_none());
+        assert!(group_txt(Some("00000000-0000"), None, false).is_none());
+        assert!(group_txt(None, None, false).is_none());
+    }
+
+    #[test]
+    fn pair_folds_into_one_entry_with_leader_first() {
+        let singles = vec![
+            pod("AA", Some("T1"), false, Some("Living Room")),
+            pod("BB", Some("T1"), true, Some("Living Room")),
+            pod("CC", Some("T9"), false, None), // single device with its own tsid
+        ];
+        let v = fold_pairs(singles, &memory(&[("T1", &["AA", "BB"]), ("T9", &["CC"])]));
+        assert_eq!(v.len(), 2);
+        let pair = v.iter().find(|r| r.pair.is_some()).unwrap();
+        assert_eq!(pair.stable_id(), "airplay:pair:t1");
+        assert_eq!(pair.friendly_name, "Living Room");
+        let p = pair.pair.as_ref().unwrap();
+        assert_eq!(p.members[0].mac_id, "BB"); // igl=1 leads
+        assert!(p.is_complete());
+        assert_eq!(pair.transport(), Some(Transport::AirPlay2));
+        assert!(v.iter().any(|r| r.stable_id() == "airplay:CC"));
+    }
+
+    #[test]
+    fn incomplete_pair_stays_listed_but_unplayable() {
+        let v = fold_pairs(vec![pod("AA", Some("t1"), false, None)], &memory(&[("t1", &["AA", "BB"])]));
+        assert_eq!(v.len(), 1);
+        let p = v[0].pair.as_ref().unwrap();
+        assert_eq!((p.members.len(), p.expected), (1, 2));
+        assert!(!p.is_complete());
+        assert_eq!(v[0].transport(), None);
+        // No gpn: named after the member present.
+        assert_eq!(v[0].friendly_name, "Pod AA");
+    }
+
+    #[test]
+    fn member_id_resolves_to_pair_and_membership_follows_tsid() {
+        let state = AirPlayDiscoveryState::default();
+        let info = |tsid: &str, leader: bool| AirPlayInfo {
+            friendly_name: "x".into(),
+            ip: Some("10.0.0.2".parse().unwrap()),
+            port: 7000,
+            features: Some(HOMEPOD_FT),
+            pk: None,
+            model: Some("AudioAccessory5,1".into()),
+            group: group_txt(Some(tsid), Some("Pair".into()), leader),
+        };
+        state.upsert_airplay("AA".into(), "a._airplay._tcp.local.", info("t1", true));
+        state.upsert_airplay("BB".into(), "b._airplay._tcp.local.", info("t1", false));
+        assert_eq!(state.renderers().len(), 1);
+        assert_eq!(state.find_by_id("airplay:BB").unwrap().stable_id(), "airplay:pair:t1");
+        // Member goes offline: still one entry, 1 of 2.
+        state.remove_airplay_instance("b._airplay._tcp.local.");
+        let v = state.renderers();
+        assert_eq!(v.len(), 1);
+        assert!(!v[0].pair.as_ref().unwrap().is_complete());
+        // A late removal of a device's previous instance name doesn't
+        // evict its current record.
+        state.upsert_airplay("BB".into(), "b2._airplay._tcp.local.", info("t1", false));
+        state.upsert_airplay("BB".into(), "b3._airplay._tcp.local.", info("t1", false));
+        state.remove_airplay_instance("b2._airplay._tcp.local.");
+        assert!(state.renderers()[0].pair.as_ref().unwrap().is_complete());
+        // Other receivers sharing a tsid are never folded, and a removal
+        // never evicts their record.
+        let mut other = info("t3", false);
+        other.model = Some("Speaker1,1".into());
+        state.upsert_airplay("CC".into(), "c._airplay._tcp.local.", other.clone());
+        state.upsert_airplay("DD".into(), "d._airplay._tcp.local.", other);
+        assert!(state.find_by_id("airplay:CC").unwrap().pair.is_none());
+        state.remove_airplay_instance("c._airplay._tcp.local.");
+        assert!(state.find_by_id("airplay:CC").unwrap().features.is_some());
+        // Unpaired (new tsid): back to two single devices.
+        state.upsert_airplay("BB".into(), "b._airplay._tcp.local.", info("t2", true));
+        assert_eq!(state.renderers().iter().filter(|r| r.pair.is_none()).count(), 4);
     }
 
     #[test]
