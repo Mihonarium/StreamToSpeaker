@@ -5,7 +5,9 @@ Used by driver-reproducibility.yml. Pure Python, no third-party modules.
 
   repro_compare.py sys  <released.sys> <fresh.sys>   [--json out.json]
   repro_compare.py inf  <released.inf> <fresh.inf>   [--json out.json]
-  repro_compare.py tree <checkout>     <build_root>  [--json out.json]
+  repro_compare.py tree <checkout>     <build_root>  [--stamped-build N] [--json out.json]
+  repro_compare.py plan <manifest.json> <tag>        [--build-number N] [--json out.json]
+  repro_compare.py buildroot <plan.json> <reference.sys> [--build-root DIR]
   repro_compare.py package <package.zip> <out_dir> --sha256 <expected> [--json out.json]
   repro_compare.py files <dir_a> <dir_b>              [--json out.json]
 
@@ -47,6 +49,31 @@ each file's SHA-256.
 `files` checks that the .sys/.inf/.cat in two directories are
 byte-identical (e.g. what an installer put on disk vs the package it is
 supposed to bundle).
+
+`plan` reads a driver-v* release manifest and says how that driver was
+built, so the rebuild can repeat it without per-release inputs:
+
+  * certified (`certified: true`, HLK lab build): reference package =
+    `lab_zip`, driver.h compiled as committed, built at C:\\build\\src;
+  * attested (`attested: true`, driver-submission.yml build): reference
+    package = `submission_cab` (the EV-signed CAB on the release, whose
+    SHA-256 is `submission_cab_signed_sha256`), driver.h stamped with
+    `driver_build` exactly as driver-submission.yml does, built where that
+    workflow's checkout was.
+
+A manifest that is neither, or that lacks a field the rebuild needs, is an
+error (exit 1 with the list of problems), never a pass.
+
+`buildroot` resolves the directory to build in. The linker embeds the PDB
+path, so the rebuild has to happen at the path the reference binary was
+linked at: for an attested release that path is read from the reference
+.sys (and must agree with the manifest's `build_root` when it records
+one); a certified release keeps C:\\build\\src unless the manifest records
+another. `--build-root` overrides either.
+
+`tree --stamped-build N` allows exactly one difference between the two
+trees: driver/driver.h, which must be the checkout's file with
+STREAM_TO_SPEAKER_DRIVER_BUILD set to N.
 
 Exit status is 0 when the normalised comparison matches, 1 otherwise.
 When GITHUB_OUTPUT is set, `raw_identical`, `normalised_identical` and
@@ -298,6 +325,10 @@ def gh_output(**kv):
         return
     with open(path, "a", encoding="utf-8") as fh:
         for k, v in kv.items():
+            # One line per value: anything else would let a value define
+            # further outputs.
+            if any(ord(c) < 0x20 or ord(c) == 0x7F for c in str(v)):
+                raise ValueError(f"refusing to write a control character to step output {k}")
             fh.write(f"{k}={str(v).lower() if isinstance(v, bool) else v}\n")
 
 
@@ -457,14 +488,32 @@ def tree_files(root, subdirs):
     return out
 
 
-def compare_trees(source_root, build_root, subdirs=("driver", "include")):
+STAMP_FILE = "driver/driver.h"
+STAMP_RE = re.compile(rb"(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u")
+
+
+def stamp_driver_h(data, build):
+    """driver.h as driver-submission.yml's "Stamp driver build number" step
+    leaves it: every STREAM_TO_SPEAKER_DRIVER_BUILD value replaced by
+    `build`, nothing else touched. Raises when there is nothing to stamp."""
+    out, n = STAMP_RE.subn(lambda m: m.group(1) + str(int(build)).encode("ascii") + b"u", data)
+    if n == 0:
+        raise ValueError("no STREAM_TO_SPEAKER_DRIVER_BUILD definition to stamp")
+    return out
+
+
+def compare_trees(source_root, build_root, subdirs=("driver", "include"), stamped_build=None):
     """Is the tree msbuild is about to compile byte-identical to the checkout
     whose hashFiles() matched the release manifest? Catches any step that
-    rewrites a source file (e.g. stamping driver.h) between the identity
-    guard and the build."""
+    rewrites a source file between the identity guard and the build.
+
+    With `stamped_build` (attested releases, whose driver.h was stamped
+    before compiling) exactly one difference is required: driver/driver.h
+    must be the checkout's file with the build constant set to that number.
+    """
     a, b = tree_files(source_root, subdirs), tree_files(build_root, subdirs)
     changed = sorted(k for k in a.keys() & b.keys() if a[k] != b[k])
-    return {
+    rep = {
         "source_root": source_root,
         "build_root": build_root,
         "files": len(a),
@@ -473,6 +522,27 @@ def compare_trees(source_root, build_root, subdirs=("driver", "include")):
         "changed": changed,
         "identical": bool(a) and a == b,
     }
+    if stamped_build is None:
+        return rep
+    rep["stamped_build"] = int(stamped_build)
+    rep["stamp_ok"] = False
+    rep["stamp_problem"] = None
+    try:
+        with open(os.path.join(source_root, *STAMP_FILE.split("/")), "rb") as fh:
+            want = stamp_driver_h(fh.read(), stamped_build)
+        with open(os.path.join(build_root, *STAMP_FILE.split("/")), "rb") as fh:
+            got = fh.read()
+    except (OSError, ValueError) as e:
+        rep["stamp_problem"] = str(e)
+    else:
+        rep["stamp_ok"] = got == want
+        if not rep["stamp_ok"]:
+            rep["stamp_problem"] = (f"{STAMP_FILE} in the build tree is not the checkout's file with "
+                                    f"STREAM_TO_SPEAKER_DRIVER_BUILD set to {int(stamped_build)}")
+    others = [k for k in changed if k != STAMP_FILE]
+    rep["identical"] = (bool(a) and rep["stamp_ok"] and not others
+                        and not rep["only_in_source"] and not rep["only_in_build"])
+    return rep
 
 
 def print_tree_report(rep):
@@ -480,7 +550,147 @@ def print_tree_report(rep):
     for key in ("only_in_source", "only_in_build", "changed"):
         for path in rep[key]:
             print(f"  {key.replace('_', ' ')}: {path}")
+    if "stamped_build" in rep:
+        print(f"  {STAMP_FILE} stamped to build {rep['stamped_build']}, otherwise as the checkout: {rep['stamp_ok']}")
+        if rep["stamp_problem"]:
+            print(f"  {rep['stamp_problem']}")
     print(f"  identical: {rep['identical']}")
+
+
+# ---------------------------------------------------------------------------
+# How a release was built
+# ---------------------------------------------------------------------------
+CERTIFIED_BUILD_ROOT = "C:\\build\\src"
+PDB_TAIL_RE = re.compile(r"(?P<root>[A-Za-z]:(?:\\[^\\/:*?\"<>|\x00-\x1f\x7f]+)+)"
+                         r"\\driver\\x64\\Release\\StreamToSpeaker\.pdb", re.IGNORECASE)
+# At least <drive>:\\a\\b: the build step empties this directory first.
+BUILD_ROOT_RE = re.compile(r"[A-Za-z]:(?:\\[^\\/:*?\"<>|\x00-\x1f\x7f]+){2,}\\?")
+HEX64_RE = re.compile(r"[0-9a-fA-F]{64}")
+ASSET_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+
+
+def build_plan(manifest, tag, build_number=None):
+    """What the rebuild has to repeat for the driver-v* release `tag`,
+    derived from its manifest alone. Returns a dict with `ok`, `errors`
+    and, when ok, the plan fields."""
+    errors = []
+    m = manifest if isinstance(manifest, dict) else {}
+    if not isinstance(manifest, dict):
+        errors.append("manifest.json is not a JSON object")
+    certified, attested = m.get("certified") is True, m.get("attested") is True
+
+    def need(field, what, pattern=None):
+        v = m.get(field)
+        if v is None or v == "" or isinstance(v, bool):
+            errors.append(f"the manifest of {tag} records no {field} ({what})")
+            return None
+        if not isinstance(v, (str, int)) or (pattern and not pattern.fullmatch(str(v))):
+            errors.append(f"the manifest of {tag} has a malformed {field}: {v!r}")
+            return None
+        return v
+
+    version = need("driver_version", "the DriverVer the rebuilt INF must carry",
+                   re.compile(r"\d+\.\d+\.\d+\.\d+"))
+    build = need("driver_build", "the DriverBuildNumber the driver was built with", re.compile(r"\d+"))
+    need("source_hash", "the driver source the release was built from", HEX64_RE)
+    need("signed_zip", "the package installers bundle", ASSET_RE)
+    need("signed_zip_sha256", "the hash of the package installers bundle", HEX64_RE)
+    if build is not None and version and not version.endswith(f".{build}"):
+        errors.append(f"driver_version {version} does not end in driver_build {build}")
+    if build_number not in (None, "") and build is not None and str(build_number) != str(build):
+        errors.append(f"build_number input ({build_number}) differs from the manifest's driver_build ({build})")
+
+    def optional(field, pattern):
+        v = m.get(field)
+        if v in (None, ""):
+            return ""
+        if not isinstance(v, str) or not pattern.fullmatch(v):
+            errors.append(f"the manifest of {tag} has a malformed {field}: {v!r}")
+            return ""
+        return v
+
+    recorded_root = optional("build_root", re.compile(r"[A-Za-z]:(?:\\[^\\/:*?\"<>|\x00-\x1f\x7f]+)+\\?"))
+    plan = {"tag": tag, "version": version, "build_number": str(build) if build is not None else None}
+    if certified and attested:
+        errors.append(f"the manifest of {tag} claims to be both certified and attested")
+        plan.update(kind="")
+    elif certified:
+        # Lab build: tree as committed, fixed build directory. An older
+        # certified manifest without lab_zip falls back to the conventional
+        # asset name; the download then decides.
+        plan.update(kind="certified", stamp_driver_h=False, reference_type="lab_zip",
+                    reference_asset=optional("lab_zip", ASSET_RE) or (
+                        f"StreamToSpeaker-Driver-{version}-lab-testsigned.zip" if version else None),
+                    reference_sha256=optional("lab_zip_sha256", HEX64_RE).lower(),
+                    manifest_build_root=recorded_root or CERTIFIED_BUILD_ROOT)
+    elif attested:
+        cab = need("submission_cab", "the submission CAB holding the unsigned driver that was built", ASSET_RE)
+        cab_sha = need("submission_cab_signed_sha256",
+                       "the hash of the EV-signed submission CAB kept on the release", HEX64_RE)
+        if "driver_h_stamped" in m and m["driver_h_stamped"] is not True:
+            errors.append(f"the manifest of {tag} says driver_h_stamped={m['driver_h_stamped']!r}; "
+                          "attested builds are expected to stamp driver.h")
+        plan.update(kind="attested", stamp_driver_h=True, reference_type="submission_cab",
+                    reference_asset=cab, reference_sha256=(cab_sha or "").lower(),
+                    manifest_build_root=recorded_root)
+    else:
+        errors.append(f"the manifest of {tag} is neither certified nor attested: "
+                      "there is no Microsoft-signed driver to verify")
+        plan.update(kind="")
+    plan["errors"] = errors
+    plan["ok"] = not errors
+    return plan
+
+
+def print_plan(plan):
+    print(f"== build plan for {plan['tag']} ==")
+    for e in plan["errors"]:
+        print(f"::error::{e}")
+    if not plan["ok"]:
+        return
+    print(f"  kind              : {plan['kind']}")
+    print(f"  driver            : {plan['version']} (DriverBuildNumber {plan['build_number']})")
+    print(f"  driver.h stamped  : {plan['stamp_driver_h']}")
+    print(f"  reference package : {plan['reference_asset']} ({plan['reference_type']}"
+          f"{', sha256 ' + plan['reference_sha256'] if plan['reference_sha256'] else ''})")
+    print(f"  build root        : {plan['manifest_build_root'] or '(from the reference .sys PDB path)'}")
+
+
+def pdb_build_root(pdb_path):
+    """D:\\a\\x\\x\\driver\\x64\\Release\\StreamToSpeaker.pdb -> D:\\a\\x\\x, or None."""
+    m = PDB_TAIL_RE.fullmatch(pdb_path or "")
+    return m.group("root") if m else None
+
+
+def same_path(a, b):
+    return a.rstrip("\\/").replace("/", "\\").lower() == b.rstrip("\\/").replace("/", "\\").lower()
+
+
+def resolve_build_root(plan, reference_pdb_path, override=None):
+    """(build_root, source, error). See the module docstring (`buildroot`)."""
+    if override:
+        return override, "build_root input", None
+    recorded = plan.get("manifest_build_root") or ""
+    if plan.get("kind") == "certified":
+        return recorded or CERTIFIED_BUILD_ROOT, "certified lab build directory", None
+    derived = pdb_build_root(reference_pdb_path)
+    if not derived:
+        return None, None, ("the submitted .sys records the PDB path "
+                            f"{reference_pdb_path!r}, which is not <root>\\driver\\x64\\Release\\StreamToSpeaker.pdb: "
+                            "cannot tell where the driver was built")
+    if recorded and not same_path(recorded, derived):
+        return None, None, (f"the manifest records build_root {recorded} but the submitted .sys was linked "
+                            f"at {derived}")
+    return derived, "PDB path of the submitted .sys" + (" (= manifest build_root)" if recorded else ""), None
+
+
+def reference_pdb_path(sys_path):
+    with open(sys_path, "rb") as fh:
+        pe = PE(pe_strip_signature(fh.read()))
+    for e in pe.debug_entries():
+        if e.get("pdb_path"):
+            return e["pdb_path"]
+    return ""
 
 
 def check_package(zip_path, expected_sha256, out_dir, names=PACKAGE_FILES):
@@ -571,11 +781,14 @@ def print_files_report(rep):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("kind", choices=("sys", "inf", "tree", "package", "files"))
+    ap.add_argument("kind", choices=("sys", "inf", "tree", "package", "files", "plan", "buildroot"))
     ap.add_argument("released")
     ap.add_argument("fresh")
     ap.add_argument("--json", help="also write the full report here")
     ap.add_argument("--sha256", help="package: the SHA-256 the release manifest records for the zip")
+    ap.add_argument("--stamped-build", help="tree: driver.h in the build tree is stamped with this build number")
+    ap.add_argument("--build-number", help="plan: optional build number that must equal the manifest's driver_build")
+    ap.add_argument("--build-root", help="buildroot: build here instead of the derived directory")
     a = ap.parse_args(argv)
 
     def dump(rep):
@@ -589,6 +802,40 @@ def main(argv=None):
         dump(rep)
         gh_output(package_ok=rep["ok"], package_sha256=rep["sha256"])
         return 0 if rep["ok"] else 1
+    if a.kind == "plan":
+        try:
+            with open(a.released, "r", encoding="utf-8-sig") as fh:
+                manifest = json.load(fh)
+        except (OSError, ValueError) as e:
+            print(f"::error::could not read {a.released}: {e}")
+            return 1
+        rep = build_plan(manifest, a.fresh, a.build_number)
+        print_plan(rep)
+        dump(rep)
+        if rep["ok"]:
+            gh_output(kind=rep["kind"], version=rep["version"], build_number=rep["build_number"],
+                      stamp_driver_h=rep["stamp_driver_h"], reference_type=rep["reference_type"],
+                      reference_asset=rep["reference_asset"], reference_sha256=rep["reference_sha256"])
+        return 0 if rep["ok"] else 1
+    if a.kind == "buildroot":
+        with open(a.released, "r", encoding="utf-8") as fh:
+            plan = json.load(fh)
+        try:
+            pdb = reference_pdb_path(a.fresh)
+        except (OSError, ValueError, struct.error) as e:
+            print(f"::error::could not read the PDB path of {a.fresh}: {e}")
+            return 1
+        root, source, err = resolve_build_root(plan, pdb, a.build_root)
+        print(f"reference .sys PDB path: {pdb!r}")
+        if not err and not BUILD_ROOT_RE.fullmatch(root):
+            err = (f"build root {root!r} is not a directory at least two levels below a drive root; "
+                   "refusing to build there")
+        if err:
+            print(f"::error::{err}")
+            return 1
+        print(f"build root: {root} ({source})")
+        gh_output(build_root=root, reference_pdb_path=pdb)
+        return 0
     if a.kind == "files":
         rep = compare_files(a.released, a.fresh)
         print_files_report(rep)
@@ -602,7 +849,7 @@ def main(argv=None):
         rep = compare_inf(a.released, a.fresh)
         print_inf_report(rep)
     else:
-        rep = compare_trees(a.released, a.fresh)
+        rep = compare_trees(a.released, a.fresh, stamped_build=a.stamped_build)
         print_tree_report(rep)
         if a.json:
             with open(a.json, "w", encoding="utf-8") as fh:

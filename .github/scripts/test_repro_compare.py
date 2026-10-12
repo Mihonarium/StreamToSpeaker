@@ -1,3 +1,4 @@
+import json
 import os
 import struct
 import tempfile
@@ -179,6 +180,302 @@ class TreeCompare(unittest.TestCase):
     def test_empty_tree_is_not_identical(self):
         rep = rc.compare_trees(tempfile.mkdtemp(), tempfile.mkdtemp())
         self.assertFalse(rep["identical"])
+
+    # ---- attested releases: driver.h stamped before the build ----
+    def test_stamp_replaces_only_the_build_number(self):
+        src = b"// \xe2\x80\x94 note\r\n#define STREAM_TO_SPEAKER_DRIVER_BUILD          8u\r\n#define OTHER 8u\r\n"
+        self.assertEqual(rc.stamp_driver_h(src, 204),
+                         b"// \xe2\x80\x94 note\r\n#define STREAM_TO_SPEAKER_DRIVER_BUILD          204u\r\n#define OTHER 8u\r\n")
+        with self.assertRaises(ValueError):
+            rc.stamp_driver_h(b"#define NOTHING 1\r\n", 204)
+
+    def test_stamped_tree_accepted_with_stamped_build(self):
+        self.write(self.build, "driver/driver.h", b"#define STREAM_TO_SPEAKER_DRIVER_BUILD          204u\r\n")
+        rep = rc.compare_trees(self.src, self.build, stamped_build=204)
+        self.assertTrue(rep["identical"])
+        self.assertTrue(rep["stamp_ok"])
+        self.assertEqual(rep["changed"], ["driver/driver.h"])
+        self.assertEqual(rc.main(["tree", self.src, self.build, "--stamped-build", "204"]), 0)
+
+    def test_stamped_tree_wrong_number_or_unstamped_is_rejected(self):
+        self.write(self.build, "driver/driver.h", b"#define STREAM_TO_SPEAKER_DRIVER_BUILD          205u\r\n")
+        self.assertFalse(rc.compare_trees(self.src, self.build, stamped_build=204)["identical"])
+        # Not stamped at all: the build would not be the one being verified.
+        self.write(self.build, "driver/driver.h", b"#define STREAM_TO_SPEAKER_DRIVER_BUILD          8u\r\n")
+        rep = rc.compare_trees(self.src, self.build, stamped_build=204)
+        self.assertFalse(rep["identical"])
+        self.assertIn("204", rep["stamp_problem"])
+        self.assertEqual(rc.main(["tree", self.src, self.build, "--stamped-build", "204"]), 1)
+
+    def test_stamped_tree_extra_edit_in_driver_h_is_rejected(self):
+        self.write(self.build, "driver/driver.h",
+                   b"#define STREAM_TO_SPEAKER_DRIVER_BUILD          204u\r\n#define BACKDOOR 1\r\n")
+        self.assertFalse(rc.compare_trees(self.src, self.build, stamped_build=204)["identical"])
+
+    def test_stamped_tree_other_changes_are_rejected(self):
+        self.write(self.build, "driver/driver.h", b"#define STREAM_TO_SPEAKER_DRIVER_BUILD          204u\r\n")
+        self.write(self.build, "include/abi.h", b"struct y;\r\n")
+        rep = rc.compare_trees(self.src, self.build, stamped_build=204)
+        self.assertFalse(rep["identical"])
+        self.write(self.build, "include/abi.h", b"struct x;\r\n")
+        self.write(self.build, "driver/extra.cpp", b"")
+        self.assertFalse(rc.compare_trees(self.src, self.build, stamped_build=204)["identical"])
+
+    def test_stamped_tree_line_ending_change_is_rejected(self):
+        self.write(self.build, "driver/driver.h", b"#define STREAM_TO_SPEAKER_DRIVER_BUILD          204u\n")
+        self.assertFalse(rc.compare_trees(self.src, self.build, stamped_build=204)["identical"])
+
+
+CERTIFIED_MANIFEST = {
+    "schema": 1, "driver_version": "1.1.1.211", "driver_prefix": "1.1.1", "driver_build": 211,
+    "commit": "9ad59bfda059ec9e5ed2de9bb0db866e7a1d2152", "source_hash": "f4" * 32,
+    "submission_cab": None, "submission_cab_sha256": None, "submission_cab_signed_sha256": None,
+    "attested": False, "certified": True,
+    "signed_zip": "StreamToSpeaker-Driver-1.1.1.211-Signed.zip", "signed_zip_sha256": "e7" * 32,
+    "lab_zip": "StreamToSpeaker-Driver-1.1.1.211-lab-testsigned.zip", "lab_zip_sha256": "AA" * 32,
+}
+# Shape of the 1.1.0.204 manifest (attested before build_root was recorded).
+ATTESTED_MANIFEST = {
+    "schema": 1, "driver_version": "1.1.0.204", "driver_prefix": "1.1.0", "driver_build": 204,
+    "commit": "cde07512d466b2e09fa278505487be98981ef723", "source_hash": "80" * 32,
+    "submission_cab": "StreamToSpeaker-Driver-1.1.0.204-Submission.cab",
+    "submission_cab_sha256": "36" * 32, "submission_cab_signed_sha256": "C9" * 32,
+    "attested": True,
+    "signed_zip": "StreamToSpeaker-Driver-1.1.0.204-Signed.zip", "signed_zip_sha256": "c2" * 32,
+    "ms_zip_asset": "StreamToSpeaker-Driver-1.1.0.204-Microsoft.zip",
+}
+RUNNER_ROOT = "D:\\a\\StreamToSpeaker\\StreamToSpeaker"
+RUNNER_PDB = RUNNER_ROOT + "\\driver\\x64\\Release\\StreamToSpeaker.pdb"
+
+
+class BuildPlan(unittest.TestCase):
+    def test_certified(self):
+        plan = rc.build_plan(CERTIFIED_MANIFEST, "driver-v1.1.1.211")
+        self.assertTrue(plan["ok"], plan["errors"])
+        self.assertEqual(plan["kind"], "certified")
+        self.assertFalse(plan["stamp_driver_h"])
+        self.assertEqual(plan["build_number"], "211")
+        self.assertEqual(plan["reference_type"], "lab_zip")
+        self.assertEqual(plan["reference_asset"], "StreamToSpeaker-Driver-1.1.1.211-lab-testsigned.zip")
+        self.assertEqual(plan["reference_sha256"], "aa" * 32)
+        self.assertEqual(rc.resolve_build_root(plan, "whatever")[0], "C:\\build\\src")
+
+    def test_certified_without_lab_zip_uses_the_conventional_name(self):
+        m = dict(CERTIFIED_MANIFEST, lab_zip=None, lab_zip_sha256=None)
+        plan = rc.build_plan(m, "driver-v1.1.1.211")
+        self.assertTrue(plan["ok"])
+        self.assertEqual(plan["reference_asset"], "StreamToSpeaker-Driver-1.1.1.211-lab-testsigned.zip")
+        self.assertEqual(plan["reference_sha256"], "")
+
+    def test_attested(self):
+        plan = rc.build_plan(ATTESTED_MANIFEST, "driver-v1.1.0.204")
+        self.assertTrue(plan["ok"], plan["errors"])
+        self.assertEqual(plan["kind"], "attested")
+        self.assertTrue(plan["stamp_driver_h"])
+        self.assertEqual(plan["build_number"], "204")
+        self.assertEqual(plan["reference_type"], "submission_cab")
+        self.assertEqual(plan["reference_asset"], "StreamToSpeaker-Driver-1.1.0.204-Submission.cab")
+        # The CAB kept on the release is the EV-signed one.
+        self.assertEqual(plan["reference_sha256"], "c9" * 32)
+
+    def test_both_flags_set_fails(self):
+        plan = rc.build_plan(dict(CERTIFIED_MANIFEST, attested=True), "t")
+        self.assertFalse(plan["ok"])
+
+    def test_values_that_could_forge_step_outputs_fail(self):
+        for field, bad in (("driver_version", "1.1.0.204\n"), ("signed_zip_sha256", "c2" * 32 + "\n"),
+                           ("submission_cab", "a.cab\nkind=certified"), ("signed_zip", "x.zip\nkind=certified"),
+                           ("submission_cab", "..\\x.cab"), ("build_root", "D:\\a\nkind=certified\\b"),
+                           ("build_root", 5), ("submission_cab", ["a.cab"])):
+            plan = rc.build_plan(dict(ATTESTED_MANIFEST, **{field: bad}), "t")
+            self.assertFalse(plan["ok"], (field, bad))
+        self.assertFalse(rc.build_plan(dict(CERTIFIED_MANIFEST, lab_zip="a.zip\nkind=attested"), "t")["ok"])
+        self.assertFalse(rc.build_plan(dict(CERTIFIED_MANIFEST, lab_zip_sha256=7), "t")["ok"])
+
+    def test_neither_certified_nor_attested_fails(self):
+        for m in (dict(ATTESTED_MANIFEST, attested=False), dict(ATTESTED_MANIFEST, attested="true"), {}):
+            plan = rc.build_plan(m, "driver-v1.1.0.204")
+            self.assertFalse(plan["ok"])
+            self.assertTrue(any("neither certified nor attested" in e for e in plan["errors"]), plan["errors"])
+
+    def test_missing_fields_fail_with_the_field_named(self):
+        for field in ("driver_build", "driver_version", "source_hash", "signed_zip", "signed_zip_sha256",
+                      "submission_cab", "submission_cab_signed_sha256"):
+            for bad in (None, ""):
+                plan = rc.build_plan(dict(ATTESTED_MANIFEST, **{field: bad}), "driver-v1.1.0.204")
+                self.assertFalse(plan["ok"], field)
+                self.assertTrue(any(field in e for e in plan["errors"]), (field, plan["errors"]))
+            m = dict(ATTESTED_MANIFEST)
+            del m[field]
+            self.assertFalse(rc.build_plan(m, "driver-v1.1.0.204")["ok"], field)
+
+    def test_malformed_fields_fail(self):
+        self.assertFalse(rc.build_plan(dict(ATTESTED_MANIFEST, submission_cab_signed_sha256="abc"), "t")["ok"])
+        self.assertFalse(rc.build_plan(dict(ATTESTED_MANIFEST, driver_build="204; rm"), "t")["ok"])
+        self.assertFalse(rc.build_plan(dict(ATTESTED_MANIFEST, driver_build=205), "t")["ok"])  # version says .204
+        self.assertFalse(rc.build_plan(["not", "an", "object"], "t")["ok"])
+
+    def test_build_number_cross_check(self):
+        self.assertTrue(rc.build_plan(ATTESTED_MANIFEST, "t", "204")["ok"])
+        self.assertTrue(rc.build_plan(ATTESTED_MANIFEST, "t", "")["ok"])
+        plan = rc.build_plan(ATTESTED_MANIFEST, "t", "209")
+        self.assertFalse(plan["ok"])
+        self.assertTrue(any("differs from the manifest" in e for e in plan["errors"]))
+
+    def test_attested_manifest_saying_not_stamped_fails(self):
+        self.assertFalse(rc.build_plan(dict(ATTESTED_MANIFEST, driver_h_stamped=False), "t")["ok"])
+        self.assertTrue(rc.build_plan(dict(ATTESTED_MANIFEST, driver_h_stamped=True), "t")["ok"])
+
+
+class BuildRoot(unittest.TestCase):
+    def test_pdb_build_root(self):
+        self.assertEqual(rc.pdb_build_root(RUNNER_PDB), RUNNER_ROOT)
+        self.assertEqual(rc.pdb_build_root("C:\\build\\src\\driver\\x64\\Release\\StreamToSpeaker.pdb"), "C:\\build\\src")
+        self.assertEqual(rc.pdb_build_root("D:\\driver\\x64\\release\\streamtospeaker.pdb"), None)  # no directory
+        for bad in ("", None, "StreamToSpeaker.pdb", "D:\\a\\x\\driver\\x64\\Debug\\StreamToSpeaker.pdb",
+                    "\\\\server\\share\\driver\\x64\\Release\\StreamToSpeaker.pdb",
+                    "/home/x/driver/x64/Release/StreamToSpeaker.pdb",
+                    "D:\\a\\x y\\..\\driver\\x64\\Release\\Other.pdb"):
+            self.assertIsNone(rc.pdb_build_root(bad), bad)
+
+    def test_pdb_path_with_control_characters_is_rejected(self):
+        evil = "D:\\a\nkind=certified\nstamp_driver_h=false\nz=q\\driver\\x64\\Release\\StreamToSpeaker.pdb"
+        self.assertIsNone(rc.pdb_build_root(evil))
+        self.assertIsNone(rc.pdb_build_root(RUNNER_PDB + "\n"))
+
+    def test_same_path(self):
+        self.assertTrue(rc.same_path("D:/a/X/", "d:\\A\\x"))
+        self.assertFalse(rc.same_path("D:\\a\\x", "D:\\a\\xy"))
+
+    def test_attested_root_comes_from_the_submitted_binary(self):
+        plan = rc.build_plan(ATTESTED_MANIFEST, "t")
+        root, source, err = rc.resolve_build_root(plan, RUNNER_PDB)
+        self.assertEqual((root, err), (RUNNER_ROOT, None))
+        self.assertIn("PDB path", source)
+
+    def test_attested_root_must_agree_with_a_recorded_one(self):
+        ok = rc.build_plan(dict(ATTESTED_MANIFEST, build_root="d:\\a\\streamtospeaker\\StreamToSpeaker\\"), "t")
+        self.assertEqual(rc.resolve_build_root(ok, RUNNER_PDB)[0], RUNNER_ROOT)
+        bad = rc.build_plan(dict(ATTESTED_MANIFEST, build_root="C:\\elsewhere"), "t")
+        root, _source, err = rc.resolve_build_root(bad, RUNNER_PDB)
+        self.assertIsNone(root)
+        self.assertIn("C:\\elsewhere", err)
+
+    def test_attested_without_usable_pdb_path_fails(self):
+        plan = rc.build_plan(ATTESTED_MANIFEST, "t")
+        for pdb in ("", "StreamToSpeaker.pdb"):
+            root, _source, err = rc.resolve_build_root(plan, pdb)
+            self.assertIsNone(root)
+            self.assertIn("cannot tell where the driver was built", err)
+        # ... even when the manifest records a root: the binary decides.
+        plan = rc.build_plan(dict(ATTESTED_MANIFEST, build_root=RUNNER_ROOT), "t")
+        self.assertIsNone(rc.resolve_build_root(plan, "")[0])
+
+    def test_override_wins(self):
+        plan = rc.build_plan(ATTESTED_MANIFEST, "t")
+        self.assertEqual(rc.resolve_build_root(plan, RUNNER_PDB, "E:\\x")[0], "E:\\x")
+        plan = rc.build_plan(CERTIFIED_MANIFEST, "t")
+        self.assertEqual(rc.resolve_build_root(plan, "", "E:\\x")[0], "E:\\x")
+
+    def test_certified_recorded_root(self):
+        plan = rc.build_plan(dict(CERTIFIED_MANIFEST, build_root="C:\\lab\\src"), "t")
+        self.assertEqual(rc.resolve_build_root(plan, RUNNER_PDB)[0], "C:\\lab\\src")
+
+
+class PlanCli(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.out = os.path.join(self.tmp, "gh_output")
+        self._old = os.environ.get("GITHUB_OUTPUT")
+        os.environ["GITHUB_OUTPUT"] = self.out
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("GITHUB_OUTPUT", None)
+        else:
+            os.environ["GITHUB_OUTPUT"] = self._old
+
+    def manifest(self, m):
+        p = os.path.join(self.tmp, "manifest.json")
+        with open(p, "w", encoding="ascii") as f:
+            json.dump(m, f)
+        return p
+
+    def outputs(self):
+        if not os.path.exists(self.out):
+            return {}
+        with open(self.out, encoding="utf-8") as f:
+            return dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+
+    def test_plan_and_buildroot_for_an_attested_release(self):
+        plan_json = os.path.join(self.tmp, "plan.json")
+        self.assertEqual(rc.main(["plan", self.manifest(ATTESTED_MANIFEST), "driver-v1.1.0.204", "--json", plan_json]), 0)
+        out = self.outputs()
+        self.assertEqual(out["kind"], "attested")
+        self.assertEqual(out["stamp_driver_h"], "true")
+        self.assertEqual(out["build_number"], "204")
+        self.assertEqual(out["version"], "1.1.0.204")
+        self.assertEqual(out["reference_asset"], "StreamToSpeaker-Driver-1.1.0.204-Submission.cab")
+        sys_path = os.path.join(self.tmp, "ref.sys")
+        with open(sys_path, "wb") as f:
+            f.write(make_pe(pdb_path=RUNNER_PDB.encode("ascii")))
+        self.assertEqual(rc.main(["buildroot", plan_json, sys_path]), 0)
+        self.assertEqual(self.outputs()["build_root"], RUNNER_ROOT)
+        self.assertEqual(self.outputs()["reference_pdb_path"], RUNNER_PDB)
+
+    def test_buildroot_fails_when_the_submitted_binary_has_no_usable_pdb_path(self):
+        plan_json = os.path.join(self.tmp, "plan.json")
+        self.assertEqual(rc.main(["plan", self.manifest(ATTESTED_MANIFEST), "driver-v1.1.0.204", "--json", plan_json]), 0)
+        sys_path = os.path.join(self.tmp, "ref.sys")
+        with open(sys_path, "wb") as f:
+            f.write(make_pe())  # C:\src\driver.pdb
+        self.assertEqual(rc.main(["buildroot", plan_json, sys_path]), 1)
+        self.assertNotIn("build_root", self.outputs())
+        with open(sys_path, "wb") as f:
+            f.write(b"not a PE")
+        self.assertEqual(rc.main(["buildroot", plan_json, sys_path]), 1)
+
+    def test_gh_output_refuses_multi_line_values(self):
+        with self.assertRaises(ValueError):
+            rc.gh_output(build_root="D:\\a\nkind=certified")
+        self.assertEqual(self.outputs(), {})
+
+    def test_buildroot_override_and_shallow_roots(self):
+        plan_json = os.path.join(self.tmp, "plan.json")
+        self.assertEqual(rc.main(["plan", self.manifest(ATTESTED_MANIFEST), "driver-v1.1.0.204", "--json", plan_json]), 0)
+        sys_path = os.path.join(self.tmp, "ref.sys")
+        with open(sys_path, "wb") as f:
+            f.write(make_pe(pdb_path=RUNNER_PDB.encode("ascii")))
+        self.assertEqual(rc.main(["buildroot", plan_json, sys_path, "--build-root", "E:\\x\\y"]), 0)
+        self.assertEqual(self.outputs()["build_root"], "E:\\x\\y")
+        # The build step empties the directory: never a drive root or a
+        # top-level directory, whoever asks.
+        for shallow in ("C:\\", "C:\\Windows", "D:\\a", "relative\\dir"):
+            self.assertEqual(rc.main(["buildroot", plan_json, sys_path, "--build-root", shallow]), 1, shallow)
+        with open(sys_path, "wb") as f:
+            f.write(make_pe(pdb_path=b"D:\\a\\driver\\x64\\Release\\StreamToSpeaker.pdb"))
+        self.assertEqual(rc.main(["buildroot", plan_json, sys_path]), 1)
+
+    def test_plan_failure_sets_no_outputs(self):
+        self.assertEqual(rc.main(["plan", self.manifest(dict(ATTESTED_MANIFEST, attested=False)), "driver-v1.1.0.204"]), 1)
+        self.assertEqual(self.outputs(), {})
+        self.assertEqual(rc.main(["plan", os.path.join(self.tmp, "missing.json"), "t"]), 1)
+        bad = os.path.join(self.tmp, "bad.json")
+        with open(bad, "w") as f:
+            f.write("{nope")
+        self.assertEqual(rc.main(["plan", bad, "t"]), 1)
+
+    def test_certified_plan_cli(self):
+        plan_json = os.path.join(self.tmp, "plan.json")
+        self.assertEqual(rc.main(["plan", self.manifest(CERTIFIED_MANIFEST), "driver-v1.1.1.211",
+                                  "--build-number", "211", "--json", plan_json]), 0)
+        out = self.outputs()
+        self.assertEqual((out["kind"], out["stamp_driver_h"]), ("certified", "false"))
+        sys_path = os.path.join(self.tmp, "ref.sys")
+        with open(sys_path, "wb") as f:
+            f.write(make_pe())
+        self.assertEqual(rc.main(["buildroot", plan_json, sys_path]), 0)
+        self.assertEqual(self.outputs()["build_root"], "C:\\build\\src")
 
 
 class InfCompare(unittest.TestCase):

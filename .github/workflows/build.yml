@@ -727,7 +727,6 @@ jobs:
     outputs:
       driver_found: ${{ steps.attested.outputs.found }}
       driver_tag: ${{ steps.attested.outputs.tag }}
-      driver_build: ${{ steps.attested.outputs.build }}
       installer_name: ${{ steps.iscc.outputs.name }}
       installer_sha256: ${{ steps.attach.outputs.sha256 }}
     env:
@@ -783,9 +782,6 @@ jobs:
               }
               Copy-Item "$dc\devcon.exe" "$staging\devcon.exe" -Force
               Write-Host "Bundling Microsoft-signed (${{ steps.attested.outputs.kind }}) driver ${{ steps.attested.outputs.version }} (${{ steps.attested.outputs.tag }}); no test certificate shipped."
-              if ("${{ steps.attested.outputs.kind }}" -ne "certified") {
-                  Write-Host "##[warning]${{ steps.attested.outputs.tag }} is not a certified release: the driver reproducibility gate can only verify certified drivers, so verify-driver will fail and this release will not be signed."
-              }
           } else {
               foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "StreamToSpeaker.cer", "devcon.exe") {
                   Copy-Item "$dc\$name" "$staging\$name" -Force
@@ -843,16 +839,16 @@ jobs:
             "| Reproducibility gate | $( if ("${{ steps.attested.outputs.found }}" -eq "true") { "verify-driver job" } else { "**skipped** (no Microsoft-signed package to compare)" } ) |"
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
-  # Release gate: rebuild the driver from the tagged commit and check it
-  # against the driver-v* release `package` picked (certified tree guard,
-  # lab package, shipped Signed.zip), then unpack the unsigned installer
-  # `package` just attached (by exact name and sha256) and check its
-  # driver files are that Signed.zip byte for byte with no test
+  # Release gate: rebuild the driver from the tagged commit the way the
+  # driver-v* release `package` picked was built (read from that release's
+  # manifest: WHQL-certified lab build or attestation submission build)
+  # and check it against that release (source-hash guard, the lab package
+  # or submission CAB, the shipped Signed.zip), then unpack the unsigned
+  # installer `package` just attached (by exact name and sha256) and check
+  # its driver files are that Signed.zip byte for byte with no test
   # certificate. Read-only, no secrets. Skipped only for the test-signed
   # fallback, whose driver the build job compiled from this tag's source
-  # itself; package and sign-release log that loudly. An attestation-signed
-  # driver has no lab package to pin the rebuild to, so the check fails and
-  # the release stays unsigned (package warns).
+  # itself; package and sign-release log that loudly.
   verify-driver:
     if: startsWith(github.ref, 'refs/tags/v') && needs.package.outputs.driver_found == 'true'
     needs: package
@@ -861,7 +857,6 @@ jobs:
     uses: ./.github/workflows/driver-reproducibility.yml
     with:
       tag: ${{ needs.package.outputs.driver_tag }}
-      build_number: ${{ needs.package.outputs.driver_build }}
       commit: ${{ github.sha }}
       installer_tag: ${{ github.ref_name }}
       installer_name: ${{ needs.package.outputs.installer_name }}

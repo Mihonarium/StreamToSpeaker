@@ -364,6 +364,11 @@ jobs:
               driver_build = [int]"${{ steps.drvver.outputs.build }}"
               commit = "${{ github.sha }}"
               source_hash = "${{ steps.srchash.outputs.hash }}"
+              # How this binary was built, for driver-reproducibility.yml:
+              # the linker embeds the PDB path, so a rebuild has to happen
+              # in the same directory, with driver.h stamped as above.
+              build_root = "${{ github.workspace }}"
+              driver_h_stamped = $true
               submission_cab = "${{ steps.cab.outputs.name }}"
               submission_cab_sha256 = "${{ steps.cab.outputs.sha256 }}"
               submission_cab_signed_sha256 = $null
