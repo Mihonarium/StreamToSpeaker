@@ -90,7 +90,9 @@ SetupLogging=yes
 ; install path we don't actually need a reboot — devcon creates the
 ; device live, Pre-Install.ps1 wipes the cached MMDevices entries,
 ; Rename-Endpoint.ps1 uses IPolicyConfig to apply state authoritatively
-; through audiosrv. Suppress the prompt.
+; through audiosrv. Suppress the prompt. The one case that does need
+; a restart is decided in NeedRestart() in [Code]: replacing a driver
+; binary that is already loaded.
 RestartIfNeededByRun=no
 AlwaysRestart=no
 ; If an instance of stream-to-speaker.exe is running when the user
@@ -260,6 +262,54 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
 
 [Code]
 
+// SHA-256 of the driver binary Windows was using before this install
+// ('' when there was none), captured before anything is replaced.
+var
+  PriorDriverHash: String;
+
+// The file the driver's service loads, from its ImagePath. The INF
+// installs with DIRID 13, so this is the package's DriverStore copy
+// (\SystemRoot\System32\DriverStore\FileRepository\...), not
+// System32\drivers. '' when the service isn't installed.
+function DriverImagePath(): String;
+var
+  Path: String;
+begin
+  Result := '';
+  if not RegQueryStringValue(HKLM64, 'SYSTEM\CurrentControlSet\Services\StreamToSpeaker',
+                             'ImagePath', Path) then
+    Exit;
+  Path := Trim(Path);
+  if Copy(Path, 1, 4) = '\??\' then
+    Path := Copy(Path, 5, Length(Path) - 4)
+  else if CompareText(Copy(Path, 1, 12), '\SystemRoot\') = 0 then
+    Path := ExpandConstant('{win}') + Copy(Path, 12, Length(Path) - 11)
+  else if CompareText(Copy(Path, 1, 9), 'System32\') = 0 then
+    Path := ExpandConstant('{win}\') + Path;
+  Result := Path;
+end;
+
+// The driver's control device keeps the loaded image in memory until
+// Windows restarts, so an upgrade that ships a different driver binary
+// only takes effect after a restart. Ask for one in exactly that case
+// (a silent install with /NORESTART still never restarts).
+function NeedRestart(): Boolean;
+var
+  NewHash: String;
+begin
+  Result := False;
+  if PriorDriverHash = '' then
+    Exit;
+  try
+    NewHash := GetSHA256OfFile(ExpandConstant('{app}\driver\StreamToSpeaker.sys'));
+  except
+    Exit;
+  end;
+  Result := CompareText(NewHash, PriorDriverHash) <> 0;
+  if Result then
+    Log('Driver binary changed (' + PriorDriverHash + ' -> ' + NewHash + '); a restart is needed to load it.');
+end;
+
 // Detects a running Stream To Speaker process via its named
 // singleton mutex. Offers the user an explicit "Close it for me"
 // choice instead of the default Inno-Setup "please close it
@@ -306,6 +356,7 @@ end;
 function InitializeSetup(): Boolean;
 var
   Major, Minor, Build: Cardinal;
+  DriverFile: String;
   Version: TWindowsVersion;
 begin
   Result := True;
@@ -322,5 +373,17 @@ begin
   end;
   if not ClosePriorInstance() then begin
     Result := False;
+    Exit;
   end;
+  PriorDriverHash := '';
+  DriverFile := DriverImagePath();
+  if (DriverFile <> '') and FileExists(DriverFile) then begin
+    try
+      PriorDriverHash := GetSHA256OfFile(DriverFile);
+      Log('Installed driver ' + DriverFile + ' has SHA-256 ' + PriorDriverHash);
+    except
+      PriorDriverHash := '';
+    end;
+  end else
+    Log('No installed driver binary found (' + DriverFile + ')');
 end;
