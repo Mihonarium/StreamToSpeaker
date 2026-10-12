@@ -479,7 +479,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          .github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ steps.srchash.outputs.hash }}" -OutDir attested-driver
+          # -WarnOnError: here the package only adds a preview installer,
+          # so a lookup error costs that preview (with a warning) instead of
+          # failing the build. The tag pipeline's `package` job fails.
+          .github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ steps.srchash.outputs.hash }}" -OutDir attested-driver -WarnOnError
 
       - name: Build production-driver installer preview
         if: steps.attested.outputs.found == 'true'
