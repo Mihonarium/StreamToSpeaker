@@ -90,7 +90,9 @@ SetupLogging=yes
 ; install path we don't actually need a reboot — devcon creates the
 ; device live, Pre-Install.ps1 wipes the cached MMDevices entries,
 ; Rename-Endpoint.ps1 uses IPolicyConfig to apply state authoritatively
-; through audiosrv. Suppress the prompt.
+; through audiosrv. Suppress the prompt. The one case that does need
+; a restart is decided in NeedRestart() in [Code]: replacing a driver
+; binary that is already loaded.
 RestartIfNeededByRun=no
 AlwaysRestart=no
 ; If an instance of stream-to-speaker.exe is running when the user
@@ -142,6 +144,7 @@ Source: "{#SourcePath}\..\scripts\Rename-Endpoint.ps1"; DestDir: "{app}\scripts"
 Source: "{#SourcePath}\..\scripts\Reset-Install.ps1";   DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\..\scripts\Diagnose.ps1";        DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourcePath}\Uninstall-Driver.ps1";           DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "{#SourcePath}\Remove-TestCertificate.ps1";     DestDir: "{app}\scripts"; Flags: ignoreversion
 
 ; --- devcon.exe (WDK redistributable, MIT) ---
 ; Used to add the root-enumerated StreamToSpeaker device after the
@@ -175,15 +178,17 @@ Name: "{group}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; Tasks: 
 Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Registry]
-; Opt-in autostart — runs the GUI when the user signs in. The default
-; mode (no flags) opens the window + adds the system tray; users who
-; ticked this task probably want minimised-to-tray UX. We add /no-tray
-; OFF (i.e. default tray-on) and rely on the window being closable to
-; the tray. A future iteration could add a --minimized flag.
+; Opt-in autostart — runs the app when the user signs in. --startup
+; starts it in the tray without opening the window. The app's own
+; "Start at sign-in" switch reads and writes this same value (same name,
+; same data), so the two never disagree; the app also rewrites an
+; existing value to its current path on each launch.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     ValueType: string; ValueName: "{#MyAppName}"; \
-    ValueData: """{app}\{#MyAppExeName}"""; \
-    Tasks: autostart; Flags: uninsdeletevalue
+    ValueData: """{app}\{#MyAppExeName}"" --startup"; \
+    Tasks: autostart; Check: AutostartWanted; Flags: uninsdeletevalue
+; (Uninstall also removes the value when it was turned on from inside the
+; app rather than by this task — see CurUninstallStepChanged in [Code].)
 
 [Run]
 ; 0) Clean up any prior install BEFORE we touch the driver store /
@@ -201,7 +206,9 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
 ;    so Windows (in test-signing mode) accepts our test-signed driver.
 ;    Only runs if the .cer was bundled (CI build does; manual unsigned
 ;    local builds skip this step and just hope the user has their
-;    own signing trust set up).
+;    own signing trust set up). Uninstall removes this certificate
+;    again (Remove-TestCertificate.ps1), and an upgrade removes the
+;    replaced build's certificate when it differs (see [Code]).
 Filename: "{sys}\certutil.exe"; \
     Parameters: "-addstore -f TrustedPublisher ""{app}\driver\StreamToSpeaker.cer"""; \
     StatusMsg: "Trusting driver signature..."; \
@@ -258,7 +265,62 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\Uninstall-Driver.ps1"""; \
     Flags: runhidden waituntilterminated; RunOnceId: "RemoveDriver"
 
+; Remove the test-signing certificate a test-signed build imported into
+; LocalMachine Root + TrustedPublisher (no-op for Microsoft-signed builds,
+; which ship no .cer). Runs before uninstall deletes {app}.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\Remove-TestCertificate.ps1"" -CerPath ""{app}\driver\StreamToSpeaker.cer"""; \
+    Flags: runhidden waituntilterminated; RunOnceId: "RemoveTestCert"
+
 [Code]
+
+// SHA-256 of the driver binary Windows was using before this install
+// ('' when there was none), captured before anything is replaced.
+var
+  PriorDriverHash: String;
+
+// The file the driver's service loads, from its ImagePath. The INF
+// installs with DIRID 13, so this is the package's DriverStore copy
+// (\SystemRoot\System32\DriverStore\FileRepository\...), not
+// System32\drivers. '' when the service isn't installed.
+function DriverImagePath(): String;
+var
+  Path: String;
+begin
+  Result := '';
+  if not RegQueryStringValue(HKLM64, 'SYSTEM\CurrentControlSet\Services\StreamToSpeaker',
+                             'ImagePath', Path) then
+    Exit;
+  Path := Trim(Path);
+  if Copy(Path, 1, 4) = '\??\' then
+    Path := Copy(Path, 5, Length(Path) - 4)
+  else if CompareText(Copy(Path, 1, 12), '\SystemRoot\') = 0 then
+    Path := ExpandConstant('{win}') + Copy(Path, 12, Length(Path) - 11)
+  else if CompareText(Copy(Path, 1, 9), 'System32\') = 0 then
+    Path := ExpandConstant('{win}\') + Path;
+  Result := Path;
+end;
+
+// The driver's control device keeps the loaded image in memory until
+// Windows restarts, so an upgrade that ships a different driver binary
+// only takes effect after a restart. Ask for one in exactly that case
+// (a silent install with /NORESTART still never restarts).
+function NeedRestart(): Boolean;
+var
+  NewHash: String;
+begin
+  Result := False;
+  if PriorDriverHash = '' then
+    Exit;
+  try
+    NewHash := GetSHA256OfFile(ExpandConstant('{app}\driver\StreamToSpeaker.sys'));
+  except
+    Exit;
+  end;
+  Result := CompareText(NewHash, PriorDriverHash) <> 0;
+  if Result then
+    Log('Driver binary changed (' + PriorDriverHash + ' -> ' + NewHash + '); a restart is needed to load it.');
+end;
 
 // Detects a running Stream To Speaker process via its named
 // singleton mutex. Offers the user an explicit "Close it for me"
@@ -303,9 +365,39 @@ begin
   end;
 end;
 
+// Upgrade: an earlier test-signed build left its certificate in
+// LocalMachine Root + TrustedPublisher and its .cer in {app}\driver.
+// Move that .cer aside before the new files go in (otherwise a build
+// that ships no .cer would leave the old one behind, and the import
+// step in [Run] would trust it again), then remove the old certificate
+// once the new build is installed, unless the new build ships the same
+// one.
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  OldCer, SavedCer: String;
+  ResultCode: Integer;
+begin
+  OldCer := ExpandConstant('{app}\driver\StreamToSpeaker.cer');
+  SavedCer := ExpandConstant('{tmp}\previous-test-cert.cer');
+  if CurStep = ssInstall then begin
+    if FileExists(OldCer) then begin
+      if FileCopy(OldCer, SavedCer, False) then
+        DeleteFile(OldCer);
+    end;
+  end else if CurStep = ssPostInstall then begin
+    if FileExists(SavedCer) then
+      Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+           '-NoProfile -ExecutionPolicy Bypass -File "' +
+           ExpandConstant('{app}\scripts\Remove-TestCertificate.ps1') + '"' +
+           ' -CerPath "' + SavedCer + '" -KeepCerPath "' + OldCer + '"',
+           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+end;
+
 function InitializeSetup(): Boolean;
 var
   Major, Minor, Build: Cardinal;
+  DriverFile: String;
   Version: TWindowsVersion;
 begin
   Result := True;
@@ -322,5 +414,46 @@ begin
   end;
   if not ClosePriorInstance() then begin
     Result := False;
+    Exit;
   end;
+  PriorDriverHash := '';
+  DriverFile := DriverImagePath();
+  if (DriverFile <> '') and FileExists(DriverFile) then begin
+    try
+      PriorDriverHash := GetSHA256OfFile(DriverFile);
+      Log('Installed driver ' + DriverFile + ' has SHA-256 ' + PriorDriverHash);
+    except
+      PriorDriverHash := '';
+    end;
+  end else
+    Log('No installed driver binary found (' + DriverFile + ')');
+end;
+
+// Setup re-ticks tasks chosen at the previous install. If that install
+// had the autostart task but the Run value is gone now, the user switched
+// start-at-sign-in off inside the app — don't turn it back on. (A value
+// that exists is rewritten as usual; a fresh install, or an upgrade whose
+// previous install didn't have the task, follows the checkbox.)
+function AutostartWanted(): Boolean;
+var
+  PrevTasks: String;
+begin
+  Result := True;
+  if RegValueExists(HKEY_CURRENT_USER,
+       'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}') then
+    Exit;
+  if RegQueryStringValue(HKLM64,
+       ExpandConstant('Software\Microsoft\Windows\CurrentVersion\Uninstall\{#emit SetupSetting("AppId")}_is1'),
+       'Inno Setup: Selected Tasks', PrevTasks) then
+    if Pos('autostart', Lowercase(PrevTasks)) > 0 then
+      Result := False;
+end;
+
+// The app's "Start at sign-in" switch can create the Run value without
+// the autostart task, so uninstall removes it either way.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+    RegDeleteValue(HKEY_CURRENT_USER,
+      'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}');
 end;

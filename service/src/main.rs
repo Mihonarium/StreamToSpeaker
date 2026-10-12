@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use stream_to_speaker::airplay::{spawn_airplay_discovery, AirPlayDiscoveryState};
+use stream_to_speaker::airplay::AirPlayDiscoveryState;
 use stream_to_speaker::app::{App, AppConfig};
 use stream_to_speaker::audio_source::AudioSource;
 use stream_to_speaker::gena::parse_rendering_notify;
@@ -43,7 +43,7 @@ use stream_to_speaker::http_server::{
 use stream_to_speaker::picker;
 use stream_to_speaker::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use stream_to_speaker::sine_source::SineSource;
-use stream_to_speaker::ssdp::{spawn_discovery, DiscoveryState};
+use stream_to_speaker::ssdp::{spawn_discovery, DiscoveryState, SearchScope};
 use stream_to_speaker::{audio_loop, PRODUCT_NAME};
 #[cfg(windows)]
 use stream_to_speaker::wasapi_source::WasapiLoopbackSource;
@@ -109,6 +109,11 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_tray: bool,
 
+    /// Launched by the sign-in (Run) entry: start in the tray without
+    /// opening the window. Ignored with --no-tray.
+    #[arg(long, default_value_t = false, hide = true)]
+    startup: bool,
+
     /// Enable the HTTP / JSON API and built-in web UI. The audio stream
     /// itself (`/stream.raw`) is always served — Sonos needs it — but the
     /// rest of the endpoints (`/`, `/api/*`) are only registered when
@@ -134,6 +139,16 @@ struct Cli {
     /// background browse traffic.
     #[arg(long, default_value_t = false)]
     no_airplay: bool,
+
+    /// Skip Sendspin: no Sendspin speakers in the list and no Music
+    /// Assistant input.
+    #[arg(long, default_value_t = false)]
+    no_sendspin: bool,
+
+    /// Offer this computer's audio to Music Assistant as a Sendspin
+    /// input for this run, even when Sendspin is off in settings.
+    #[arg(long, default_value_t = false)]
+    sendspin_source: bool,
 
     /// Disable silence injection (will send literal zeros during silence).
     #[arg(long, default_value_t = false)]
@@ -242,26 +257,40 @@ fn main() {
     // leaked: it lives for the process lifetime so the Inno Setup
     // installer's AppMutex check (and our own duplicate-launch gate
     // below, for FUTURE launches) keep seeing the kernel object.
+    // The Global\ mutex is what the installer watches for a running copy;
+    // its "already existed" answer also covers an instance that never
+    // takes the per-session claim below (--headless, or one running
+    // elevated).
     #[cfg(windows)]
-    let (_mutex_handle, another_running) = create_singleton_mutex();
+    let (_mutex_handle, global_taken) = create_singleton_mutex();
     #[cfg(not(windows))]
-    let another_running = false;
-    info!("singleton: another_instance_running={}", another_running);
+    let global_taken = false;
 
-    // Single-instance gate. If another instance is already running,
-    // raise its window and exit — same pattern as Slack / Discord /
-    // OBS. Without this, the duplicate launch races to bind port 5901,
-    // tiny_http fails with WSAEADDRINUSE, run() returns Err, the
-    // process exits silently — and the user sees the FIRST instance
-    // in task manager and assumes the new install "doesn't open".
-    // Skipped in --headless: headless is for service / CLI runs where
-    // multiple invocations against the same port are the caller's
-    // problem.
-    if !cli.headless && another_running {
-        info!("another instance is running; raising its window and exiting");
-        #[cfg(windows)]
-        raise_existing_window();
-        return;
+    // Single-instance gate. If another instance is already running in
+    // this session, ask it to show its window and exit — same pattern as
+    // Slack / Discord / OBS. Without this, the duplicate launch races to
+    // bind port 5901, the HTTP bind fails with WSAEADDRINUSE, run()
+    // returns Err, the process exits silently — and the user sees the FIRST
+    // instance in task manager and assumes the new install "doesn't
+    // open". The hand-off goes through a named event the first instance
+    // listens on from here on, so it works before that instance has a
+    // window too. Skipped in --headless: headless is for service / CLI
+    // runs where multiple invocations against the same port are the
+    // caller's problem.
+    if !cli.headless {
+        if let stream_to_speaker::single_instance::Claim::Another =
+            stream_to_speaker::single_instance::claim()
+        {
+            info!("another instance is running; asked it to show its window, exiting");
+            return;
+        }
+        if global_taken {
+            // Running, but not a GUI in this session we could hand over
+            // to (a --headless instance, or an elevated one). Starting
+            // anyway would only fail to bind the stream port.
+            info!("another instance (headless or elevated) is already running; exiting");
+            return;
+        }
     }
 
     if let Err(e) = run(cli) {
@@ -376,66 +405,28 @@ fn attach_parent_console() {
 /// elevated installer process can see a mutex held by the user-session
 /// service.
 ///
-/// Returns (handle, was_already_existing): if `was_already_existing`
-/// is true, another instance of the app already owns the kernel
-/// object and we are the duplicate launch — the caller should defer
-/// to that instance (raise its window) and exit.
+/// Which instance gets to run is decided separately, per session, by
+/// `single_instance::claim`; this one only signals "the app is running"
+/// to Setup.
 ///
-/// IMPORTANT: there is exactly ONE call to CreateMutexA per process.
-/// Calling it twice within the same process would trip
-/// ERROR_ALREADY_EXISTS on the second call (the first call IS the
-/// existing owner) and make every launch look like a duplicate.
+/// Returns (handle, already running): the mutex already existed, or we
+/// may not open it because an elevated instance owns it.
 #[cfg(windows)]
 fn create_singleton_mutex() -> (Option<isize>, bool) {
     use std::ffi::CString;
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexA;
     let Some(name) = CString::new("Global\\StreamToSpeaker.Singleton").ok() else {
         return (None, false);
     };
     unsafe {
         let h = CreateMutexA(std::ptr::null(), 0, name.as_ptr() as *const u8);
-        let was_existing = GetLastError() == ERROR_ALREADY_EXISTS;
-        let handle = if h.is_null() { None } else { Some(h as isize) };
-        (handle, was_existing)
-    }
-}
-
-/// Find the existing instance's main window by title and bring it to
-/// the foreground (un-minimize + raise Z order). Used by the
-/// single-instance path. Best-effort; if FindWindowW returns null
-/// (e.g. the other instance is mid-startup and hasn't created its
-/// window yet) we just return — the user will see nothing happen but
-/// the other instance is still running.
-#[cfg(windows)]
-fn raise_existing_window() {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindowAsync,
-        HWND_TOP, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    };
-    let title: Vec<u16> = "Stream To Speaker"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if hwnd.is_null() {
-            log::info!("another instance is running but its window isn't findable yet");
-            return;
+        let err = GetLastError();
+        if h.is_null() {
+            (None, err == ERROR_ACCESS_DENIED)
+        } else {
+            (Some(h as isize), err == ERROR_ALREADY_EXISTS)
         }
-        SetWindowPos(
-            hwnd,
-            HWND_TOP,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-        );
-        if IsIconic(hwnd) != 0 {
-            ShowWindowAsync(hwnd, SW_RESTORE);
-        }
-        SetForegroundWindow(hwnd);
     }
 }
 
@@ -453,6 +444,14 @@ fn run(cli: Cli) -> Result<()> {
     info!("audio source: {}", source.name());
 
     let app = setup_app(&cli)?;
+    if cli.no_sendspin {
+        app.disable_sendspin();
+    } else {
+        app.init_sendspin(!cli.no_discovery, cli.sendspin_source);
+        if cli.player.is_none() {
+            app.reconnect_saved_sendspin_speaker();
+        }
+    }
 
     // Always start the full HTTP server (audio + API + UI). The /, /api/*
     // routes honour app.is_web_ui_enabled() at request time, so the GUI
@@ -524,8 +523,20 @@ fn run(cli: Cli) -> Result<()> {
     // The old fallback ("first discovered") was the reason GUI users
     // never got to see the onboarding card and ended up with a random
     // speaker bound at launch.
-    if !cli.no_discovery {
+    // A saved speaker added by address needs no discovery: connect in the
+    // background (the window and tray come up meanwhile), with or without
+    // --no-discovery.
+    let saved_manual = app
+        .saved_speaker_id()
+        .filter(|_| cli.player.is_none() && app.is_auto_reconnect_on_launch())
+        .filter(|id| app.find_manual_speaker(id).is_some())
+        .filter(|id| app.auto_connect_allowed_at_launch(id));
+    if let Some(id) = saved_manual {
+        info!("auto-reconnect: connecting to saved manual speaker {:?}", id);
+        app.connect_in_background(&id);
+    } else if !cli.no_discovery {
         let discovery = app.discovery.as_ref().unwrap();
+        let mut pair_wait_started = false;
         let initial = if cli.player.is_some() {
             picker::resolve(discovery, cli.player.as_deref(), false)?
         } else if !cli.no_interactive && cli.headless {
@@ -534,12 +545,52 @@ fn run(cli: Cli) -> Result<()> {
             if !app.is_auto_reconnect_on_launch() {
                 info!("auto-reconnect disabled by user preference; saved={:?}", saved_id);
                 None
+            } else if !app.auto_connect_allowed_at_launch(&saved_id) {
+                info!("auto-reconnect: {:?} is set to never auto-connect", saved_id);
+                None
             } else {
                 info!("auto-reconnect: trying saved speaker {:?}", saved_id);
                 // Wait briefly for the first SSDP sweep to populate
                 // discovery before we look the saved id up.
                 picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
-                discovery.find_by_id(&saved_id)
+                let found = discovery.find_by_id(&saved_id);
+                if found.is_none() {
+                    match discovery.identity_conflict(&saved_id) {
+                        Some(addrs) => warn!(
+                            "auto-reconnect skipped: different devices at {:?} all claim to be the saved \
+                             speaker {:?}; pick the right one by address",
+                            addrs, saved_id
+                        ),
+                        None if !saved_id.starts_with("airplay:") => {
+                            info!("auto-reconnect: saved speaker {:?} not found on the network", saved_id)
+                        }
+                        None => {}
+                    }
+                }
+                // A saved HomePod stereo pair (or one of its members): give
+                // both members time to resolve in the background, then play
+                // the pair — unless the user picked something meanwhile.
+                if found.is_none() && saved_id.starts_with("airplay:") {
+                    if let Some(ad) = app.airplay_discovery.clone() {
+                        let app = app.clone();
+                        pair_wait_started = std::thread::Builder::new()
+                            .name("stream-to-speaker-pair-reconnect".into())
+                            .spawn(move || {
+                                let Some(id) = ad.wait_for_pair(&saved_id, Duration::from_secs(15)) else {
+                                    return;
+                                };
+                                if app.session.lock().unwrap().is_some()
+                                    || app.connecting.lock().unwrap().is_some()
+                                {
+                                    return;
+                                }
+                                info!("auto-reconnect: stereo pair {:?}", id);
+                                app.select_speaker_async(&id);
+                            })
+                            .is_ok();
+                    }
+                }
+                found
             }
         } else {
             info!("first launch (no saved speaker) — waiting for manual pick");
@@ -550,17 +601,22 @@ fn run(cli: Cli) -> Result<()> {
             if let Err(e) = app.select_speaker(&id) {
                 warn!("starting initial session failed: {}", e);
             }
-        } else if cli.headless {
+        } else if cli.headless && !pair_wait_started {
             warn!(
                 "no speaker selected; pick one with the GUI / web UI / POST /api/select"
             );
         }
     }
 
+    // Speakers set to connect automatically whenever they appear.
+    app.spawn_auto_connect();
+
     if cli.headless {
         run_headless(app)
     } else {
-        run_gui_mode(app, cli.no_tray)
+        // Keep an existing sign-in entry pointing at this exe.
+        stream_to_speaker::autostart::reapply();
+        run_gui_mode(app, cli.no_tray, cli.startup && !cli.no_tray)
     }
 }
 
@@ -583,9 +639,9 @@ fn run_headless(app: Arc<App>) -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[cfg(windows)]
-fn run_gui_mode(app: Arc<App>, no_tray: bool) -> Result<()> {
+fn run_gui_mode(app: Arc<App>, no_tray: bool, start_hidden: bool) -> Result<()> {
     // Run the GUI (blocks until window/tray exits).
-    if let Err(e) = stream_to_speaker::gui::run(app.clone(), !no_tray) {
+    if let Err(e) = stream_to_speaker::gui::run(app.clone(), !no_tray, start_hidden) {
         warn!("GUI exited with error: {:#}", e);
         // Surface to the user — without this the process just
         // disappears from the screen (window never created) but
@@ -608,11 +664,12 @@ fn run_gui_mode(app: Arc<App>, no_tray: bool) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn run_gui_mode(_app: Arc<App>, _no_tray: bool) -> Result<()> {
+fn run_gui_mode(_app: Arc<App>, _no_tray: bool, _start_hidden: bool) -> Result<()> {
     anyhow::bail!("GUI mode is Windows-only — pass --headless on this platform")
 }
 
 fn shutdown_cleanup(app: &Arc<App>) {
+    app.stop_sendspin();
     info!("shutdown: tearing down active session");
     let final_session = app.session.lock().unwrap().take();
     if let Some(s) = final_session {
@@ -651,29 +708,10 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind)
     };
 
-    let discovery = if cli.no_discovery {
-        None
-    } else {
-        let state = DiscoveryState::new();
-        spawn_discovery(
-            state.clone(),
-            Duration::from_secs(cli.ssdp_interval * 60),
-            ssdp_iface,
-        );
-        Some(state)
-    };
-
-    let airplay_discovery = if cli.no_airplay {
-        None
-    } else {
-        let state = AirPlayDiscoveryState::new();
-        if let Err(e) = spawn_airplay_discovery(state.clone(), ssdp_iface) {
-            warn!("AirPlay discovery failed to start: {} (continuing without it)", e);
-            None
-        } else {
-            Some(state)
-        }
-    };
+    // The browsers are started by the app once its saved settings (the
+    // chosen network adapter) are loaded.
+    let discovery = (!cli.no_discovery).then(DiscoveryState::new);
+    let airplay_discovery = (!cli.no_airplay).then(AirPlayDiscoveryState::new);
 
     let config = AppConfig {
         advertise_ip,
@@ -687,7 +725,9 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         ssdp_iface,
     };
 
-    Ok(App::new(config, discovery, airplay_discovery))
+    let app = App::new(config, discovery, airplay_discovery);
+    app.start_discovery(Duration::from_secs(cli.ssdp_interval * 60));
+    Ok(app)
 }
 
 // -----------------------------------------------------------------------------
@@ -702,25 +742,17 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         Arc::new(move |path: &str, body: &str| {
             debug!("GENA NOTIFY on {}: {} bytes", path, body.len());
             if let Some(change) = parse_rendering_notify(body) {
-                if let Some(v) = change.volume {
-                    if let Some(level) = vsync.sonos_changed(v) {
-                        // Set our node's dB to the linear position for this
-                        // percent; Windows then shows the slider at the
-                        // same %.
-                        let mb = stream_to_speaker::volume_sync::sonos_to_millibels(level);
-                        info!("speaker -> windows: volume {} (mb={})", level, mb);
-                        if let Some(p) = pusher.as_ref() {
-                            if let Err(e) = p.push(mb, false) {
-                                warn!("failed to push volume to driver: {}", e);
-                            }
-                        }
-                    }
-                }
-                if let Some(m) = change.mute {
-                    info!("speaker -> driver: mute={}", m);
+                // Set our node's dB to the linear position for the
+                // speaker's percent (Windows then shows the slider at the
+                // same %), keeping level and mute consistent.
+                if let Some((mb, muted)) = vsync.speaker_event(change.volume, change.mute) {
+                    info!(
+                        "speaker -> windows: volume {:?} mute {:?} (mb={}, muted={})",
+                        change.volume, change.mute, mb, muted
+                    );
                     if let Some(p) = pusher.as_ref() {
-                        if let Err(e) = p.push(0, m) {
-                            warn!("failed to push mute to driver: {}", e);
+                        if let Err(e) = p.push(mb, muted) {
+                            warn!("failed to push volume/mute to driver: {}", e);
                         }
                     }
                 }
@@ -764,6 +796,11 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         latency_adjust: Some(latency_adjust),
         web_ui_enabled: Some(app.web_ui_enabled.clone()),
         stream_client_allowed: Some(stream_client_allowed),
+        extra_hosts: vec![app.config.advertise_ip.clone()],
+        speaker_peer: Some({
+            let app2 = app.clone();
+            Arc::new(move |ip| app2.is_speaker_peer(ip))
+        }),
     })
 }
 
@@ -777,10 +814,14 @@ fn cmd_list_speakers(cli: &Cli) -> Result<()> {
     }
     let state = DiscoveryState::new();
     let ssdp_iface = stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind);
+    let scope = match ssdp_iface {
+        Some(ip) => SearchScope::Iface(ip),
+        None => SearchScope::All,
+    };
     spawn_discovery(
         state.clone(),
         Duration::from_secs(cli.ssdp_interval * 60),
-        ssdp_iface,
+        Arc::new(move || scope),
     );
     let renderers = picker::wait_for_first_discovery(&state, Duration::from_secs(5));
     let n = picker::print_speaker_list(&renderers);
@@ -889,6 +930,7 @@ fn spawn_driver_event_consumer(app: Arc<App>, cli: &Cli) {
                     }
                     DriverEvent::MuteChanged { muted } => {
                         info!("driver -> speaker: mute={}", muted);
+                        app.vsync.note_muted(muted);
                         let guard = app.session.lock().unwrap();
                         if let Some(s) = guard.as_ref() {
                             if let Err(e) = s.set_mute(muted) {

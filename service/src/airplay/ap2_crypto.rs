@@ -10,6 +10,10 @@
 //!     info=`Control-Write-Encryption-Key`).
 //!   * **control read key**  = HKDF-SHA512(salt=`Control-Salt`, ikm=K,
 //!     info=`Control-Read-Encryption-Key`).
+//!   * **event channel keys** = HKDF-SHA512(salt=`Events-Salt`, ikm=K, …):
+//!     the receiver *writes* events with `Events-Write-Encryption-Key`
+//!     (our read key) and reads our replies with
+//!     `Events-Read-Encryption-Key` (our write key).
 //!
 //! ## Control channel framing (HAP transport)
 //!
@@ -27,13 +31,21 @@
 //! ## Audio packets
 //!
 //! Each RTP audio payload is sealed with ChaCha20-Poly1305 under the audio
-//! key: nonce = 4 zero bytes + the RTP sequence number (little-endian) in
-//! bytes 4..8 + 4 zero bytes; AAD = RTP header bytes 4..12 (timestamp +
-//! SSRC). On the wire the 16-byte tag follows the ciphertext, then the
-//! **8-byte nonce (nonce[4..12]) is appended after the tag** — the
-//! receiver reads it back to decrypt, and omitting it makes every packet
-//! fail auth (silent playback). Layout: header | ciphertext | tag | nonce.
-//! (Verified against OwnTone `airplay.c`.)
+//! key: nonce = 4 zero bytes + a **64-bit little-endian extended sequence
+//! number** — it starts at the stream's first RTP sequence number and
+//! rises by one per sealed packet; AAD = RTP header bytes
+//! 4..12 (timestamp + SSRC). On the wire the 16-byte tag follows the
+//! ciphertext, then the **8-byte nonce (nonce[4..12]) is appended after
+//! the tag** — the receiver reads it back from the packet to decrypt (it
+//! never derives it), and omitting it makes every packet fail auth (silent
+//! playback). Layout: header | ciphertext | tag | nonce.
+//!
+//! Until the 16-bit RTP sequence number first wraps, the suffix is
+//! byte-identical to the sequence number itself (as it always was); after
+//! the wrap it keeps counting (65536, 65537, …) where the 16-bit value
+//! would restart and reuse a ChaCha20-Poly1305 nonce under the same key
+//! (~8.7 min at 352 frames / 44.1 kHz), leaking the keystream. A retransmission re-sends the original on-wire bytes, so it
+//! carries the original nonce and never consumes a new one.
 
 use anyhow::{bail, Result};
 use chacha20poly1305::aead::{Aead, Payload};
@@ -45,6 +57,9 @@ use zeroize::Zeroize;
 const CONTROL_SALT: &[u8] = b"Control-Salt";
 const CONTROL_WRITE_INFO: &[u8] = b"Control-Write-Encryption-Key";
 const CONTROL_READ_INFO: &[u8] = b"Control-Read-Encryption-Key";
+const EVENTS_SALT: &[u8] = b"Events-Salt";
+const EVENTS_WRITE_INFO: &[u8] = b"Events-Write-Encryption-Key";
+const EVENTS_READ_INFO: &[u8] = b"Events-Read-Encryption-Key";
 
 /// Max plaintext bytes per encrypted control block (HAP `ENCRYPTED_LEN_MAX`).
 const BLOCK_MAX: usize = 0x400;
@@ -64,6 +79,8 @@ pub struct SessionKeys {
     audio: [u8; 32],
     control_write: [u8; 32],
     control_read: [u8; 32],
+    events_tx: [u8; 32],
+    events_rx: [u8; 32],
 }
 
 impl SessionKeys {
@@ -77,6 +94,10 @@ impl SessionKeys {
             audio,
             control_write: hkdf32(CONTROL_SALT, shared, CONTROL_WRITE_INFO),
             control_read: hkdf32(CONTROL_SALT, shared, CONTROL_READ_INFO),
+            // The event channel is named from the receiver's side: it
+            // writes with the "Write" key, so that one is our reader.
+            events_tx: hkdf32(EVENTS_SALT, shared, EVENTS_READ_INFO),
+            events_rx: hkdf32(EVENTS_SALT, shared, EVENTS_WRITE_INFO),
         }
     }
 
@@ -95,6 +116,19 @@ impl SessionKeys {
     pub fn control_reader(&self) -> ChannelCipher {
         ChannelCipher::new(&self.control_read)
     }
+
+    /// `(writer, reader)` ciphers for the event channel (the TCP
+    /// connection to the receiver's `eventPort`).
+    pub fn event_ciphers(&self) -> (ChannelCipher, ChannelCipher) {
+        (ChannelCipher::new(&self.events_tx), ChannelCipher::new(&self.events_rx))
+    }
+
+    /// The receiver's `(writer, reader)` for the event channel — the mirror
+    /// of [`SessionKeys::event_ciphers`], for loopback tests.
+    #[cfg(test)]
+    pub fn receiver_event_ciphers(&self) -> (ChannelCipher, ChannelCipher) {
+        (ChannelCipher::new(&self.events_rx), ChannelCipher::new(&self.events_tx))
+    }
 }
 
 impl Drop for SessionKeys {
@@ -102,6 +136,8 @@ impl Drop for SessionKeys {
         self.audio.zeroize();
         self.control_write.zeroize();
         self.control_read.zeroize();
+        self.events_tx.zeroize();
+        self.events_rx.zeroize();
     }
 }
 
@@ -169,26 +205,109 @@ impl ChannelCipher {
     }
 }
 
-/// Seal one RTP audio payload with the audio key. Returns ciphertext with
-/// the 16-byte Poly1305 tag appended (to follow the 12-byte RTP header on
-/// the wire). `rtp_header` is the 12-byte header already built; `seq` is
-/// the RTP sequence number used to build the nonce.
-pub fn seal_audio(audio_key: &[u8; 32], rtp_header: &[u8; 12], seq: u16, plaintext: &[u8]) -> Vec<u8> {
-    let cipher = ChaCha20Poly1305::new(audio_key.into());
-    let mut nonce = [0u8; 12];
-    // seqnum at bytes 4..8 (little-endian); a u16 fits in the low two.
-    nonce[4..8].copy_from_slice(&(seq as u32).to_le_bytes());
-    let aad = &rtp_header[4..12]; // timestamp + SSRC
-    let mut out = cipher
-        .encrypt((&nonce).into(), Payload { msg: plaintext, aad })
-        .expect("chacha20poly1305 encrypt never fails");
-    // AirPlay 2 appends the 8-byte nonce (nonce[4..12]) after the tag so the
-    // receiver can decrypt. Without it the receiver fails the Poly1305 auth
-    // tag on every packet and silently drops the audio — the session still
-    // shows "playing" but no sound. Matches OwnTone's on-wire layout:
-    // [RTP header][ciphertext][16-byte tag][8-byte nonce].
-    out.extend_from_slice(&nonce[4..12]);
-    out
+/// Why [`HapReader::push`] failed. An authentication failure (wrong key,
+/// corrupted or reordered record) is a different fault from the peer
+/// closing the connection, and callers report it as such.
+#[derive(Debug, thiserror::Error)]
+pub enum HapReadError {
+    #[error("encrypted record failed authentication")]
+    Auth,
+}
+
+/// Incremental decoder for an inbound HAP-framed stream. Bytes arrive in
+/// arbitrary pieces (a TCP read can end inside the length prefix, the
+/// ciphertext or the tag); `push` buffers them and returns the plaintext
+/// of every record completed so far. A timed-out read therefore never
+/// loses or desynchronises data.
+pub struct HapReader {
+    cipher: ChannelCipher,
+    pending: Vec<u8>,
+}
+
+impl HapReader {
+    pub fn new(cipher: ChannelCipher) -> Self {
+        Self { cipher, pending: Vec::new() }
+    }
+
+    /// True while a partial record is buffered.
+    pub fn has_partial(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> std::result::Result<Vec<u8>, HapReadError> {
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while self.pending.len() - pos >= 2 {
+            let len = u16::from_le_bytes([self.pending[pos], self.pending[pos + 1]]);
+            let total = 2 + len as usize + TAG_LEN;
+            if self.pending.len() - pos < total {
+                break;
+            }
+            let plain = self
+                .cipher
+                .decrypt_block(len, &self.pending[pos + 2..pos + total])
+                .map_err(|_| HapReadError::Auth)?;
+            out.extend_from_slice(&plain);
+            pos += total;
+        }
+        self.pending.drain(..pos);
+        Ok(out)
+    }
+}
+
+/// Per-stream audio packet sealer: the ChaCha20-Poly1305 cipher under the
+/// audio key plus the 64-bit nonce counter (an extended RTP sequence
+/// number). One instance per audio stream;
+/// every [`AudioSealer::seal`] consumes exactly one nonce, so no two
+/// packets of the stream ever share one (the counter cannot realistically
+/// wrap — 2^64 packets).
+pub struct AudioSealer {
+    cipher: ChaCha20Poly1305,
+    counter: u64,
+}
+
+impl AudioSealer {
+    /// `first_seq` is the RTP sequence number of the stream's first
+    /// packet; the counter starts there.
+    pub fn new(audio_key: &[u8; 32], first_seq: u16) -> Self {
+        Self {
+            cipher: ChaCha20Poly1305::new(audio_key.into()),
+            counter: first_seq as u64,
+        }
+    }
+
+    /// Skip `n` counter values alongside a jump of the RTP sequence number
+    /// by `n`, so the suffix keeps tracking the sequence number.
+    pub fn advance(&mut self, n: u64) {
+        self.counter = self.counter.wrapping_add(n);
+    }
+
+    /// Nonce counter the next sealed packet will carry.
+    pub fn next_counter(&self) -> u64 {
+        self.counter
+    }
+
+    /// Seal one RTP audio payload. Returns ciphertext + 16-byte tag + the
+    /// 8-byte nonce suffix, to follow the 12-byte RTP header on the wire.
+    /// `rtp_header` is the header already built (bytes 4..12 are the AAD).
+    pub fn seal(&mut self, rtp_header: &[u8; 12], plaintext: &[u8]) -> Vec<u8> {
+        let mut nonce = [0u8; 12];
+        nonce[4..12].copy_from_slice(&self.counter.to_le_bytes());
+        self.counter = self.counter.wrapping_add(1);
+        let aad = &rtp_header[4..12]; // timestamp + SSRC
+        let mut out = self
+            .cipher
+            .encrypt((&nonce).into(), Payload { msg: plaintext, aad })
+            .expect("chacha20poly1305 encrypt never fails");
+        // AirPlay 2 appends the 8-byte nonce (nonce[4..12]) after the tag so
+        // the receiver can decrypt. Without it the receiver fails the
+        // Poly1305 auth tag on every packet and silently drops the audio —
+        // the session still shows "playing" but no sound. Layout:
+        // [RTP header][ciphertext][16-byte tag][8-byte nonce].
+        out.extend_from_slice(&nonce[4..12]);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -247,18 +366,89 @@ mod tests {
     }
 
     #[test]
-    fn audio_seal_appends_tag_and_is_unique_per_seq() {
-        let key = [7u8; 32];
+    fn hap_reader_reassembles_records_split_anywhere() {
+        let keys = SessionKeys::from_shared(&[4u8; 64]);
+        let mut tx = keys.control_writer();
+        let msg_a = b"POST /command RTSP/1.0\r\nCSeq: 3\r\n\r\n".to_vec();
+        let msg_b: Vec<u8> = (0..1500u32).map(|i| (i * 7) as u8).collect();
+        let mut wire = tx.encrypt(&msg_a);
+        wire.extend_from_slice(&tx.encrypt(&msg_b));
+        let mut want = msg_a.clone();
+        want.extend_from_slice(&msg_b);
+        let first_len = 2 + msg_a.len() + TAG_LEN;
+        // Split inside the length prefix, the ciphertext and the tag of
+        // the first record, plus every-byte feeding.
+        for cuts in [
+            vec![1],
+            vec![10],
+            vec![first_len - 3],
+            vec![first_len + 1, first_len + 600],
+            (1..wire.len()).collect::<Vec<_>>(),
+        ] {
+            let mut rx = HapReader::new(keys.control_writer());
+            let mut got = Vec::new();
+            let mut last = 0;
+            for c in cuts.into_iter().chain([wire.len()]) {
+                got.extend(rx.push(&wire[last..c]).unwrap());
+                last = c;
+            }
+            assert_eq!(got, want);
+            assert!(!rx.has_partial());
+        }
+    }
+
+    #[test]
+    fn hap_reader_wrong_key_is_auth_error() {
+        let mut tx = SessionKeys::from_shared(&[4u8; 64]).control_writer();
+        let wire = tx.encrypt(b"hello");
+        let mut rx = HapReader::new(SessionKeys::from_shared(&[5u8; 64]).control_writer());
+        assert!(matches!(rx.push(&wire), Err(HapReadError::Auth)));
+    }
+
+    #[test]
+    fn event_keys_are_mirrored_between_sides() {
+        // What the receiver writes with "Events-Write" we must read, and
+        // vice versa — the two directions use distinct keys.
+        let keys = SessionKeys::from_shared(&[6u8; 64]);
+        let (mut our_tx, _) = keys.event_ciphers();
+        let mut receiver_rx = ChannelCipher::new(&hkdf32(EVENTS_SALT, &[6u8; 64], EVENTS_READ_INFO));
+        let wire = our_tx.encrypt(b"RTSP/1.0 200 OK\r\n\r\n");
+        let len = u16::from_le_bytes([wire[0], wire[1]]);
+        assert!(receiver_rx.decrypt_block(len, &wire[2..]).is_ok());
+        let mut receiver_tx = ChannelCipher::new(&hkdf32(EVENTS_SALT, &[6u8; 64], EVENTS_WRITE_INFO));
+        let (_, our_rx) = keys.event_ciphers();
+        let mut reader = HapReader::new(our_rx);
+        assert_eq!(reader.push(&receiver_tx.encrypt(b"ev")).unwrap(), b"ev");
+    }
+
+    #[test]
+    fn audio_seal_appends_tag_and_counter_suffix() {
+        let mut sealer = AudioSealer::new(&[7u8; 32], 0);
         let header = [0x80, 0x60, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78];
         let plain = vec![0xABu8; 1416];
-        let s0 = seal_audio(&key, &header, 1, &plain);
-        let s1 = seal_audio(&key, &header, 2, &plain);
+        let s0 = sealer.seal(&header, &plain);
+        let s1 = sealer.seal(&header, &plain);
         // ciphertext + 16-byte tag + 8-byte appended nonce
         assert_eq!(s0.len(), plain.len() + TAG_LEN + 8);
-        // Different sequence → different nonce → different ciphertext.
+        // Same header and payload, next counter → different ciphertext.
         assert_ne!(s0, s1);
-        // The appended suffix is exactly the nonce bytes (seq=1 LE).
-        assert_eq!(&s0[s0.len() - 8..], &[1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&s0[s0.len() - 8..], &0u64.to_le_bytes());
+        assert_eq!(&s1[s1.len() - 8..], &1u64.to_le_bytes());
+        assert_eq!(sealer.next_counter(), 2);
+    }
+
+    /// Open a sealed packet the way a receiver does: nonce from the 8-byte
+    /// suffix, AAD from the header.
+    fn open(key: &[u8; 32], header: &[u8; 12], sealed: &[u8]) -> Vec<u8> {
+        let mut nonce = [0u8; 12];
+        nonce[4..12].copy_from_slice(&sealed[sealed.len() - 8..]);
+        let cipher = ChaCha20Poly1305::new(key.into());
+        cipher
+            .decrypt(
+                (&nonce).into(),
+                Payload { msg: &sealed[..sealed.len() - 8], aad: &header[4..12] },
+            )
+            .unwrap()
     }
 
     #[test]
@@ -266,19 +456,58 @@ mod tests {
         let key = [9u8; 32];
         let header = [0x80, 0x60, 0x11, 0x22, 0x01, 0x02, 0x03, 0x04, 0x0A, 0x0B, 0x0C, 0x0D];
         let plain = b"hello airplay 2 audio".to_vec();
-        let sealed = seal_audio(&key, &header, 0x1234, &plain);
+        let mut sealer = AudioSealer::new(&key, 0x1234);
+        for _ in 0..3 {
+            let sealed = sealer.seal(&header, &plain);
+            assert_eq!(open(&key, &header, &sealed), plain);
+        }
+    }
 
-        // A receiver reads the nonce from the appended 8-byte suffix, then
-        // decrypts the ciphertext+tag that precedes it.
-        let suffix = &sealed[sealed.len() - 8..];
-        let mut nonce = [0u8; 12];
-        nonce[4..12].copy_from_slice(suffix);
-        let ct_and_tag = &sealed[..sealed.len() - 8];
-        let aad = &header[4..12];
-        let cipher = ChaCha20Poly1305::new((&key).into());
-        let opened = cipher
-            .decrypt((&nonce).into(), Payload { msg: ct_and_tag, aad })
-            .unwrap();
-        assert_eq!(opened, plain);
+    #[test]
+    fn audio_nonces_never_repeat_across_seq_wrap() {
+        // Drive a stream through two full 16-bit sequence wraps: the RTP
+        // seq repeats, the nonce suffix must not.
+        let key = [3u8; 32];
+        let mut sealer = AudioSealer::new(&key, 65_000);
+        let mut seen = std::collections::HashSet::new();
+        let mut seq: u16 = 65_000;
+        let total = 2 * 65_536 + 1_000;
+        for i in 0..total {
+            let mut header = [0u8; 12];
+            header[0] = 0x80;
+            header[1] = 0x60;
+            header[2..4].copy_from_slice(&seq.to_be_bytes());
+            header[4..8].copy_from_slice(&(i as u32).wrapping_mul(352).to_be_bytes());
+            let sealed = sealer.seal(&header, &[0u8; 4]);
+            let suffix: [u8; 8] = sealed[sealed.len() - 8..].try_into().unwrap();
+            assert!(seen.insert(suffix), "nonce reused at packet {i} (seq {seq})");
+            if i < 536 {
+                // Before the first wrap: exactly the old seq-derived suffix.
+                assert_eq!(suffix, old_seq_suffix(seq));
+            }
+            seq = seq.wrapping_add(1);
+        }
+        assert_eq!(sealer.next_counter(), 65_000 + total as u64);
+    }
+
+    /// The suffix the seq-derived nonce used to carry: seq (LE) in the
+    /// low two bytes, zeros elsewhere.
+    fn old_seq_suffix(seq: u16) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[..4].copy_from_slice(&(seq as u32).to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn audio_nonce_matches_seq_until_first_wrap() {
+        let mut sealer = AudioSealer::new(&[2u8; 32], 0);
+        let header = [0x80, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        for seq in 0..=u16::MAX {
+            let sealed = sealer.seal(&header, &[]);
+            assert_eq!(sealed[sealed.len() - 8..], old_seq_suffix(seq));
+        }
+        // The next one would have reused seq 0's nonce; it doesn't.
+        let sealed = sealer.seal(&header, &[]);
+        assert_eq!(&sealed[sealed.len() - 8..], &65_536u64.to_le_bytes());
     }
 }

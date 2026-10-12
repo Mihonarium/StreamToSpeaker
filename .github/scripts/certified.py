@@ -24,6 +24,8 @@ Subcommands:
   fetch     poll a Partner Center submission until a signedPackage exists,
             download it (needs AZURE_* env like attest.py)
   verify    run checks 1-3 on a Microsoft zip + lab zip
+  sys-match check 2 alone on two .sys files (used by driver-attested.yml
+            to tie an attestation return to the submitted binary)
   release   build the canonical -Signed.zip + manifest.json and put them
             on the driver-v<ver> release (creates it when missing)
 Stdlib only; release asset I/O goes through the gh CLI.
@@ -120,6 +122,18 @@ def pe_strip_signature(data):
     out[sec_off:sec_off + 8] = b"\0" * 8
     out[checksum_off:checksum_off + 4] = b"\0" * 4
     return bytes(out)
+
+
+def pe_same_code(a, b):
+    """True when two .sys files are the same code once signatures are
+    stripped. Signing pads the image with up to 7 zero bytes so the
+    certificate table starts 8-byte aligned; that padding survives the
+    strip, so a zero tail shorter than 8 bytes is ignored."""
+    sa, sb = pe_strip_signature(a), pe_strip_signature(b)
+    if len(sa) < len(sb):
+        sa, sb = sb, sa
+    tail = sa[len(sb):]
+    return sa[:len(sb)] == sb and len(tail) < 8 and not any(tail)
 
 
 def pe_certificate_table(data):
@@ -329,14 +343,14 @@ def publish_release(repo, tag, manifest, files, notes):
             f.write(data)
         names.append(name)
         sha_name = f"{name}.sha256"
-        with open(sha_name, "w") as f:
+        with open(sha_name, "w", encoding="utf-8") as f:
             f.write(f"{hashlib.sha256(data).hexdigest()}  {name}")
         names.append(sha_name)
-    with open("manifest.json", "w") as f:
+    with open("manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     names.append("manifest.json")
     gh("release", "upload", tag, "--repo", repo, "--clobber", *names)
-    with open("release-notes.md", "w") as f:
+    with open("release-notes.md", "w", encoding="utf-8") as f:
         f.write(notes)
     gh("release", "edit", tag, "--repo", repo, "--prerelease",
        "--title", f"Driver {manifest['driver_version']} — WHQL-certified", "--notes-file", "release-notes.md")
@@ -379,6 +393,23 @@ def cmd_verify(a):
     return 0
 
 
+def cmd_sys_match(a):
+    with open(a.signed, "rb") as f:
+        signed = f.read()
+    with open(a.submitted, "rb") as f:
+        submitted = f.read()
+    try:
+        same = pe_same_code(signed, submitted)
+    except ValueError as e:
+        print(f"::error::.sys could not be parsed: {e}")
+        return 1
+    if not same:
+        print("::error::the returned .sys is not the submitted .sys (code differs after stripping signatures)")
+        return 1
+    print("returned .sys is the submitted .sys (identical after stripping signatures)")
+    return 0
+
+
 def cmd_release(a):
     with open(a.ms_zip, "rb") as f:
         ms = f.read()
@@ -399,7 +430,7 @@ def cmd_release(a):
     print(f"{'created' if created else 'updated'} {tag}: {m['signed_zip']} sha256 {m['signed_zip_sha256']}")
     out_path = os.environ.get("GITHUB_OUTPUT")
     if out_path:
-        with open(out_path, "a") as f:
+        with open(out_path, "a", encoding="utf-8") as f:
             f.write(f"tag={tag}\nsigned_zip={m['signed_zip']}\nsigned_zip_sha256={m['signed_zip_sha256']}\n")
     attest.summary("\n".join([
         f"## Driver {a.version} certified ✅", "", "| | |", "| --- | --- |", f"| Release | `{tag}` |",
@@ -420,6 +451,9 @@ def main(argv=None):
     s = sub.add_parser("verify")
     s.add_argument("--ms-zip", required=True); s.add_argument("--lab-zip", required=True)
     s.add_argument("--version"); s.set_defaults(fn=cmd_verify)
+    s = sub.add_parser("sys-match", help="a signed .sys is the given unsigned/other-signed .sys")
+    s.add_argument("--signed", required=True); s.add_argument("--submitted", required=True)
+    s.set_defaults(fn=cmd_sys_match)
     s = sub.add_parser("release")
     s.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     s.add_argument("--tag"); s.add_argument("--version", required=True)
