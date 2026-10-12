@@ -105,6 +105,11 @@ num-traits = "0.2"
 plist = "1"
 # Wipe SRP/session key material on drop.
 zeroize = "1"
+# --- Sendspin (Music Assistant) ---
+# AES-256-GCM for the `25519_AESGCM_SHA256` Noise suite (the ChaChaPoly
+# suite reuses chacha20poly1305 above), HMAC-SHA256 for the Noise HKDF.
+aes-gcm = "0.10"
+hmac = "0.12"
 
 # Embeds assets/StreamToSpeaker.ico into the exe (see build.rs). Windows-only
 # and build-time only, so it adds nothing to the shipped binary's runtime.
