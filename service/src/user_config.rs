@@ -10,9 +10,10 @@
 //!     the onboarding card. Persisted so we don't re-show it on
 //!     subsequent launches.
 //!
-//! Secrets (AirPlay passwords, pairing credentials, the controller seed)
-//! are sealed with DPAPI into a separate `protected` section of the file
-//! and plain in memory; see `secret_store`.
+//! Secrets (AirPlay passwords, pairing credentials, the controller seed;
+//! Sendspin identity keys and pairing PSKs) are sealed with DPAPI into a
+//! separate `protected` section of the file and plain in memory; see
+//! `secret_store`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -115,6 +116,11 @@ pub struct UserConfig {
     /// back unchanged on every save so they're never lost.
     #[serde(skip)]
     pub locked_secrets: Vec<LockedNode>,
+    /// `config.json` exists but couldn't be read, or couldn't be moved
+    /// aside when it was unusable: these are defaults, not its contents,
+    /// so saves leave the file alone for the rest of the run.
+    #[serde(skip)]
+    keep_file: bool,
     /// Forward Windows' "now playing" (title/artist/album from the System
     /// Media Transport Controls) to the speaker as track metadata, so it
     /// shows on the speaker's display / app. **Off by default** — it's a
@@ -191,7 +197,8 @@ pub struct UserConfig {
     #[serde(default)]
     pub update_banner_hidden_until: Option<u64>,
     /// Sendspin (Music Assistant) identities, pairing records and
-    /// settings — see `sendspin::store`.
+    /// settings — see `sendspin::store`. The identities and pairing
+    /// records are stored sealed in the file's `protected` section.
     #[serde(default)]
     pub sendspin: crate::sendspin::store::SendspinConfig,
     /// Speakers the user added by address (see `manual_speakers`), in the
@@ -370,13 +377,15 @@ impl UserConfig {
     }
 
     /// Load from `path`. A missing file is a fresh install. A file that
-    /// exists but isn't valid JSON is **quarantined** — renamed to
+    /// exists but isn't valid JSON (or isn't text in an encoding
+    /// `decode_config_text` reads) is **quarantined** — renamed to
     /// `config.json.corrupt-<unix time>` beside the original — and the
     /// defaults are used. The old behaviour was `unwrap_or_default()`,
     /// which silently reset everything and then let the next save
     /// overwrite the broken file; `airplay_pairings` alone costs a PIN
     /// ceremony per Apple TV to recreate, so the data is worth keeping
-    /// for manual recovery.
+    /// for manual recovery. A file that can't be read at all (or moved
+    /// aside) is never overwritten by this run's saves.
     pub fn load_from(path: &std::path::Path) -> Self {
         Self::load_from_with(path, &PlatformCodec)
     }
@@ -385,28 +394,37 @@ impl UserConfig {
     /// Unseals protected values; if the file still had plain secrets
     /// (written before protection existed, or by an older version since)
     /// and the protector can seal, saves right away so they don't stay
-    /// readable on disk.
+    /// readable on disk. A file in another encoding than the UTF-8 saves
+    /// write is rewritten right away too: older versions read only that.
     pub fn load_from_with(path: &std::path::Path, codec: &dyn SecretCodec) -> Self {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
             Err(e) => {
-                log::warn!(
-                    "user_config: can't read {}: {} — using defaults (file left as is)",
+                log::error!(
+                    "user_config: can't read {}: {} — using defaults; the file is left as is \
+                     and settings changed in this run are not saved",
                     path.display(),
                     e
                 );
-                return Self::default();
+                return Self { keep_file: true, ..Self::default() };
             }
         };
-        let parsed = serde_json::from_str::<serde_json::Value>(&content).and_then(|mut tree| {
-            let report = secret_store::unseal(&mut tree, codec);
-            serde_json::from_value::<UserConfig>(tree).map(|c| (c, report))
+        let parsed = decode_config_text(&bytes, decode_ansi).and_then(|(json, encoding)| {
+            serde_json::from_str::<serde_json::Value>(&json)
+                .and_then(|mut tree| {
+                    let report = secret_store::unseal(&mut tree, codec);
+                    serde_json::from_value::<UserConfig>(tree).map(|c| (c, report, encoding))
+                })
+                .map_err(|e| format!("not valid JSON: {e}"))
         });
         match parsed {
-            Ok((mut c, report)) => {
+            Ok((mut c, report, encoding)) => {
                 c.locked_secrets = report.locked;
-                if report.needs_save && codec.can_protect() {
+                if let Some(encoding) = encoding {
+                    log::info!("user_config: rewriting {} ({encoding}) as UTF-8", path.display());
+                    c.save_to_with(path, codec);
+                } else if report.needs_save && codec.can_protect() {
                     log::info!(
                         "user_config: protecting stored secrets written unprotected by an \
                          earlier version"
@@ -419,19 +437,23 @@ impl UserConfig {
                 let aside = quarantine_path(path);
                 match std::fs::rename(path, &aside) {
                     Ok(()) => log::error!(
-                        "user_config: {} is not valid JSON ({}); moved it to {} and starting \
-                         with defaults",
+                        "user_config: can't use {} ({}); moved it to {} and starting with \
+                         defaults",
                         path.display(),
                         e,
                         aside.display()
                     ),
-                    Err(re) => log::error!(
-                        "user_config: {} is not valid JSON ({}) and could not be moved aside \
-                         ({}); starting with defaults — the next save will overwrite it",
-                        path.display(),
-                        e,
-                        re
-                    ),
+                    Err(re) => {
+                        log::error!(
+                            "user_config: can't use {} ({}) and could not move it aside ({}); \
+                             starting with defaults — the file is left as is and settings \
+                             changed in this run are not saved",
+                            path.display(),
+                            e,
+                            re
+                        );
+                        return Self { keep_file: true, ..Self::default() };
+                    }
                 }
                 Self::default()
             }
@@ -457,6 +479,13 @@ impl UserConfig {
 
     /// [`save_to`](Self::save_to) with an explicit secret protector.
     pub fn save_to_with(&self, path: &std::path::Path, codec: &dyn SecretCodec) {
+        if self.keep_file {
+            log::warn!(
+                "user_config: not saving over {}: it couldn't be read at startup",
+                path.display()
+            );
+            return;
+        }
         let Some(dir) = path.parent() else { return; };
         if let Err(e) = std::fs::create_dir_all(dir) {
             log::warn!("user_config: mkdir {}: {}", dir.display(), e);
@@ -479,6 +508,72 @@ impl UserConfig {
             let _ = std::fs::remove_file(&tmp);
         }
     }
+}
+
+/// The text of a config file, and the name of its encoding when it isn't
+/// the UTF-8 without a byte-order mark that saves write. A file edited by
+/// hand may also be UTF-8 with one (Windows PowerShell 5 `Set-Content
+/// -Encoding UTF8`), UTF-16 with one (its `Out-File` and `>`), or in the
+/// system's ANSI code page (its `Set-Content`), which `ansi` decodes.
+fn decode_config_text(
+    bytes: &[u8],
+    ansi: fn(&[u8]) -> Option<String>,
+) -> Result<(String, Option<&'static str>), String> {
+    fn utf16(b: &[u8], unit: fn([u8; 2]) -> u16) -> Result<String, String> {
+        if b.len() % 2 != 0 {
+            return Err("odd length for UTF-16".into());
+        }
+        let units: Vec<u16> = b.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();
+        String::from_utf16(&units).map_err(|e| format!("bad UTF-16: {e}"))
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, u16::from_le_bytes).map(|t| (t, Some("UTF-16LE")));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, u16::from_be_bytes).map(|t| (t, Some("UTF-16BE")));
+    }
+    if let Some(rest) = bytes.strip_prefix(b"\xEF\xBB\xBF") {
+        return String::from_utf8(rest.to_vec())
+            .map(|t| (t, Some("UTF-8 with a byte-order mark")))
+            .map_err(|e| format!("not UTF-8: {e}"));
+    }
+    match String::from_utf8(bytes.to_vec()) {
+        Ok(t) => Ok((t, None)),
+        Err(e) => match ansi(bytes) {
+            Some(t) => Ok((t, Some("ANSI code page"))),
+            None => Err(format!("not UTF-8: {e}")),
+        },
+    }
+}
+
+/// Text in the system's ANSI code page; `None` when the bytes aren't
+/// valid in it (or off Windows).
+#[cfg(windows)]
+fn decode_ansi(bytes: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP, MB_ERR_INVALID_CHARS};
+    let len = i32::try_from(bytes.len()).ok().filter(|n| *n > 0)?;
+    // SAFETY: the input pointer and length describe `bytes`; the second
+    // call writes at most `n` units into a buffer of that size.
+    let n = unsafe {
+        MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, bytes.as_ptr(), len, std::ptr::null_mut(), 0)
+    };
+    if n <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; n as usize];
+    let written = unsafe {
+        MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, bytes.as_ptr(), len, wide.as_mut_ptr(), n)
+    };
+    if written <= 0 {
+        return None;
+    }
+    wide.truncate(written as usize);
+    String::from_utf16(&wide).ok()
+}
+
+#[cfg(not(windows))]
+fn decode_ansi(_: &[u8]) -> Option<String> {
+    None
 }
 
 /// `config.json` → `config.json.corrupt-<unix seconds>` in the same dir.
@@ -556,6 +651,129 @@ mod tests {
         // A save afterwards writes a fresh valid file next to it.
         c.save_to(&path);
         assert!(UserConfig::load_from(&path).airplay_latency_ms == AIRPLAY_LATENCY_MS_DEFAULT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_leading_byte_order_mark_is_accepted_and_not_written() {
+        let dir = temp_config_dir("bom");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        // What Windows PowerShell 5 `Set-Content -Encoding UTF8` writes.
+        std::fs::write(&path, "\u{feff}{\"last_speaker_id\":\"uuid:RINCON_BOM\",\"airplay_latency_ms\":300}")
+            .unwrap();
+        let c = UserConfig::load_from(&path);
+        assert_eq!(c.last_speaker_id.as_deref(), Some("uuid:RINCON_BOM"));
+        assert_eq!(c.airplay_latency_ms, 300);
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        assert_eq!(names, ["config.json"], "nothing quarantined");
+        // Rewritten without the mark at once, as every version reads it.
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"{"), "saved without a BOM");
+        let back: UserConfig = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.last_speaker_id.as_deref(), Some("uuid:RINCON_BOM"));
+        // Only one: a second mark is not a config file this app wrote.
+        std::fs::write(&path, "\u{feff}\u{feff}{}").unwrap();
+        UserConfig::load_from(&path);
+        assert!(!path.exists(), "quarantined");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf16_files_load_and_undecodable_ones_are_quarantined() {
+        let dir = temp_config_dir("utf16");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let json = "{\"last_speaker_id\":\"Küche\",\"airplay_latency_ms\":400}";
+        // What Windows PowerShell 5 `Out-File` and `>` write, and the
+        // big-endian form.
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain(json.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain(json.encode_utf16().flat_map(u16::to_be_bytes)).collect();
+        for bytes in [le, be] {
+            std::fs::write(&path, &bytes).unwrap();
+            let c = UserConfig::load_from(&path);
+            assert_eq!(c.last_speaker_id.as_deref(), Some("Küche"));
+            assert_eq!(c.airplay_latency_ms, 400);
+            // Rewritten as UTF-8 at once, as every version reads it.
+            let back: UserConfig = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(back.last_speaker_id.as_deref(), Some("Küche"));
+            assert_eq!(back.airplay_latency_ms, 400);
+        }
+        // Odd-length UTF-16, unpaired surrogates, and (off Windows, where
+        // there is no ANSI code page to try) Windows-1252: moved aside,
+        // never overwritten.
+        let ansi = b"{\"last_speaker_id\":\"K\xFCche\"}".to_vec();
+        let mut bad = vec![vec![0xFF, 0xFE, b'{'], vec![0xFF, 0xFE, 0x00, 0xD8, b'{', 0]];
+        if !cfg!(windows) {
+            bad.push(ansi);
+        }
+        for bytes in bad {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let c = UserConfig::load_from(&path);
+            assert_eq!(c.last_speaker_id, None);
+            assert!(!path.exists(), "quarantined");
+            let kept: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
+            assert_eq!(kept.len(), 1);
+            assert_eq!(std::fs::read(kept[0].path()).unwrap(), bytes);
+            c.save_to(&path);
+            assert_eq!(std::fs::read(kept[0].path()).unwrap(), bytes, "a save doesn't touch it");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_in_the_ansi_code_page_is_decoded_with_it() {
+        fn latin1(b: &[u8]) -> Option<String> {
+            Some(b.iter().map(|&c| c as char).collect())
+        }
+        fn none(_: &[u8]) -> Option<String> {
+            None
+        }
+        let ansi = b"{\"source_name\":\"K\xFCche PC\"}";
+        let (text, encoding) = decode_config_text(ansi, latin1).unwrap();
+        assert_eq!(text, "{\"source_name\":\"Küche PC\"}");
+        assert_eq!(encoding, Some("ANSI code page"));
+        assert!(decode_config_text(ansi, none).is_err());
+        // UTF-8 is never second-guessed, and a UTF-8 mark rules out ANSI.
+        let utf8 = "{\"source_name\":\"Küche\"}";
+        assert_eq!(decode_config_text(utf8.as_bytes(), latin1).unwrap(), (utf8.to_string(), None));
+        let marked: Vec<u8> = b"\xEF\xBB\xBF".iter().chain(ansi).copied().collect();
+        assert!(decode_config_text(&marked, latin1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_is_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_config_dir("unreadable");
+        let path = dir.join("config.json");
+        let mut c = UserConfig::default();
+        c.last_speaker_id = Some("kept".into());
+        c.airplay_passwords.insert("airplay:aa".into(), "hunter2".into());
+        c.save_to(&path);
+        let before = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // Permissions don't apply (running as root): nothing to test.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut loaded = UserConfig::load_from(&path);
+        assert_eq!(loaded.last_speaker_id, None, "defaults");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Readable again later in the run: saves still leave it alone.
+        loaded.airplay_latency_ms = 777;
+        loaded.save_to(&path);
+        loaded.clone().save_to(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        assert_eq!(names, ["config.json"]);
+        // The next launch reads it as it was.
+        let next = UserConfig::load_from(&path);
+        assert_eq!(next.last_speaker_id.as_deref(), Some("kept"));
+        assert_eq!(next.airplay_passwords["airplay:aa"], "hunter2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -675,6 +893,312 @@ mod tests {
         assert_eq!(again.airplay_passwords.get("airplay:aa").map(String::as_str), Some("hunter2"));
         assert!(!again.airplay_passwords.contains_key("airplay:bb"));
         assert_eq!(again.last_speaker_id.as_deref(), Some("x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use crate::sendspin::keys::{b64url, psk_id};
+    use crate::sendspin::store::{PlayerPairing, SendspinConfig, ServerPairing};
+
+    /// Sendspin with both identities, one server and one player paired.
+    fn paired_sendspin() -> SendspinConfig {
+        let mut s = SendspinConfig { enabled: true, source_enabled: true, ..Default::default() };
+        s.ensure_client_key();
+        s.ensure_pairing_psk();
+        s.ensure_server_key();
+        s.store_server_pairing(server_pairing("srv-a", 0xA1));
+        s.player_pairings.insert(
+            "player-a".into(),
+            PlayerPairing {
+                psk: b64url(&[0xB1; 32]),
+                name: Some("Kitchen".into()),
+                instance: Some("kitchen".into()),
+            },
+        );
+        s
+    }
+
+    fn server_pairing(id: &str, psk: u8) -> ServerPairing {
+        ServerPairing {
+            server_id: id.into(),
+            psk: b64url(&[psk; 32]),
+            server_name: Some("Music Assistant".into()),
+            last_used_unix: 10,
+        }
+    }
+
+    fn sendspin_secrets(s: &SendspinConfig) -> Vec<String> {
+        let mut v: Vec<String> =
+            [&s.client_key, &s.pairing_psk, &s.server_key].iter().filter_map(|k| (*k).clone()).collect();
+        v.extend(s.server_pairings.iter().map(|r| r.psk.clone()));
+        v.extend(s.player_pairings.values().map(|p| p.psk.clone()));
+        v
+    }
+
+    fn assert_same_client(a: &SendspinConfig, b: &SendspinConfig) {
+        assert_eq!(a.client_key, b.client_key);
+        assert_eq!(a.pairing_psk, b.pairing_psk);
+        assert_eq!(a.server_pairings, b.server_pairings);
+    }
+
+    fn assert_same_server(a: &SendspinConfig, b: &SendspinConfig) {
+        assert_eq!(a.server_key, b.server_key);
+        assert_eq!(a.player_pairings, b.player_pairings);
+    }
+
+    /// Load, change and save `path` the way a version without secret
+    /// groups (0.1.10) does: the same secret table, no groups.
+    fn as_older_version(
+        path: &std::path::Path,
+        codec: &dyn SecretCodec,
+        f: impl FnOnce(&mut UserConfig),
+    ) -> UserConfig {
+        let mut tree: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let report = secret_store::unseal_with(&mut tree, codec, &[]);
+        let mut c: UserConfig = serde_json::from_value(tree).unwrap();
+        c.locked_secrets = report.locked;
+        f(&mut c);
+        let mut tree = serde_json::to_value(&c).unwrap();
+        secret_store::seal_with(&mut tree, &c.locked_secrets, codec, &[]);
+        std::fs::write(path, serde_json::to_string_pretty(&tree).unwrap()).unwrap();
+        c
+    }
+
+    fn protected_section(path: &std::path::Path) -> serde_json::Value {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        v[crate::secret_store::PROTECTED_KEY].clone()
+    }
+
+    #[test]
+    fn sendspin_secrets_are_sealed_on_disk_and_plain_files_migrate() {
+        use crate::secret_store::tests::FakeCodec;
+        let dir = temp_config_dir("sendspin-secrets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let mut c = UserConfig::default();
+        c.last_speaker_id = Some("x".into());
+        c.sendspin = paired_sendspin();
+        // A file from before protection covered Sendspin: plain fields.
+        std::fs::write(&path, serde_json::to_string_pretty(&c).unwrap()).unwrap();
+        let codec = FakeCodec(0x42);
+        let loaded = UserConfig::load_from_with(&path, &codec);
+        assert_same_client(&loaded.sendspin, &c.sendspin);
+        assert_same_server(&loaded.sendspin, &c.sendspin);
+        // Loading rewrote the file sealed.
+        let disk = std::fs::read_to_string(&path).unwrap();
+        for s in sendspin_secrets(&c.sendspin) {
+            assert!(!disk.contains(&s), "{s} in {disk}");
+        }
+        let p = protected_section(&path);
+        assert!(p["/sendspin/client_identity"].is_string() && p["/sendspin/server_identity"].is_string());
+        // And it reads back to the same values, settings included.
+        let back = UserConfig::load_from_with(&path, &codec);
+        assert_same_client(&back.sendspin, &c.sendspin);
+        assert_same_server(&back.sendspin, &c.sendspin);
+        assert!(back.sendspin.enabled && back.sendspin.source_enabled);
+        assert_eq!(back.last_speaker_id.as_deref(), Some("x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_identity_minted_by_an_older_version_gives_way_to_the_sealed_one() {
+        use crate::secret_store::tests::FakeCodec;
+        let dir = temp_config_dir("sendspin-downgrade");
+        let path = dir.join("config.json");
+        let codec = FakeCodec(0x42);
+        let mut c = UserConfig::default();
+        c.sendspin = paired_sendspin();
+        c.save_to_with(&path, &codec);
+        let sealed = protected_section(&path);
+
+        // The older version sees no Sendspin identity or pairing, mints
+        // its own when the source starts and a speaker connects, and saves
+        // them in the plain fields.
+        let old = as_older_version(&path, &codec, |old| {
+            assert!(old.sendspin.enabled && old.sendspin.source_enabled);
+            assert!(old.sendspin.client_key.is_none() && old.sendspin.server_key.is_none());
+            assert!(old.sendspin.server_pairings.is_empty() && old.sendspin.player_pairings.is_empty());
+            old.sendspin.ensure_client_key();
+            old.sendspin.ensure_pairing_psk();
+            old.sendspin.ensure_server_key();
+        });
+        // Nothing stored was dropped or changed.
+        assert_eq!(protected_section(&path), sealed);
+
+        // Back on this version: nothing was paired with the minted
+        // identities, so the originals and their pairings return, and the
+        // minted keys leave the file.
+        let back = UserConfig::load_from_with(&path, &codec);
+        assert_same_client(&back.sendspin, &c.sendspin);
+        assert_same_server(&back.sendspin, &c.sendspin);
+        let disk = std::fs::read_to_string(&path).unwrap();
+        for s in sendspin_secrets(&old.sendspin) {
+            assert!(!disk.contains(&s), "{s} in {disk}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sendspin_pairings_made_by_an_older_version_win_on_return() {
+        use crate::secret_store::tests::FakeCodec;
+        let dir = temp_config_dir("sendspin-repaired");
+        let path = dir.join("config.json");
+        let codec = FakeCodec(0x42);
+        let mut c = UserConfig::default();
+        c.sendspin = paired_sendspin();
+        c.save_to_with(&path, &codec);
+        let sealed = protected_section(&path);
+
+        // The older version pairs Music Assistant again with its new client
+        // identity; its server identity stays unpaired.
+        let old = as_older_version(&path, &codec, |old| {
+            old.sendspin.ensure_client_key();
+            old.sendspin.ensure_pairing_psk();
+            old.sendspin.ensure_server_key();
+            old.sendspin.store_server_pairing(server_pairing("srv-b", 0xA2));
+        });
+
+        let back = UserConfig::load_from_with(&path, &codec);
+        assert_same_client(&back.sendspin, &old.sendspin);
+        assert_same_server(&back.sendspin, &c.sendspin);
+        let disk = std::fs::read_to_string(&path).unwrap();
+        for s in sendspin_secrets(&old.sendspin) {
+            assert!(!disk.contains(&s), "resealed at once: {s} in {disk}");
+        }
+        // The replaced client group is gone; the server group stays.
+        let mut again = UserConfig::load_from_with(&path, &codec);
+        assert_same_client(&again.sendspin, &old.sendspin);
+        assert!(again.locked_secrets.is_empty());
+        again.airplay_latency_ms += 1;
+        again.save_to_with(&path, &codec);
+        let p = protected_section(&path);
+        assert_eq!(p.as_object().unwrap().len(), 2);
+        assert_ne!(p["/sendspin/client_identity"], sealed["/sendspin/client_identity"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_sendspin_identities_survive_until_paired_again() {
+        use crate::secret_store::tests::FakeCodec;
+        let dir = temp_config_dir("sendspin-locked");
+        let path = dir.join("config.json");
+        let mut c = UserConfig::default();
+        c.sendspin = paired_sendspin();
+        c.save_to_with(&path, &FakeCodec(1));
+        let sealed = protected_section(&path);
+
+        // Another user / machine can't open them, and starts the source
+        // with an identity of its own.
+        let mut other = UserConfig::load_from_with(&path, &FakeCodec(2));
+        assert_eq!(other.locked_secrets.len(), 2);
+        assert!(other.sendspin.client_key.is_none() && other.sendspin.server_pairings.is_empty());
+        other.sendspin.ensure_client_key();
+        other.sendspin.ensure_pairing_psk();
+        other.save_to_with(&path, &FakeCodec(2));
+        let again = UserConfig::load_from_with(&path, &FakeCodec(1));
+        assert_same_client(&again.sendspin, &c.sendspin);
+        assert_same_server(&again.sendspin, &c.sendspin);
+
+        // A server pairs with the new identity: it replaces the stored
+        // client group; the server group is still kept.
+        other.sendspin.store_server_pairing(server_pairing("srv-c", 0xA3));
+        other.save_to_with(&path, &FakeCodec(2));
+        let there = UserConfig::load_from_with(&path, &FakeCodec(2));
+        assert_same_client(&there.sendspin, &other.sendspin);
+        assert_eq!(there.sendspin.server_key, None);
+        let here = UserConfig::load_from_with(&path, &FakeCodec(1));
+        assert_eq!(here.sendspin.client_key, None);
+        assert_same_server(&here.sendspin, &c.sendspin);
+        // One group per role is stored: the new client group and the
+        // server group kept byte for byte.
+        let p = protected_section(&path);
+        assert_eq!(p.as_object().unwrap().len(), 2);
+        assert_eq!(p["/sendspin/server_identity"], sealed["/sendspin/server_identity"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_identity_minted_while_the_stored_one_is_locked_lasts_across_launches() {
+        use crate::secret_store::tests::FakeCodec;
+        let dir = temp_config_dir("sendspin-pending");
+        let path = dir.join("config.json");
+        let mut c = UserConfig::default();
+        c.sendspin = paired_sendspin();
+        c.save_to_with(&path, &FakeCodec(1));
+        let sealed = protected_section(&path);
+
+        // On another PC, an older version mints an unpaired identity in the
+        // plain fields next to the groups it can't see.
+        let old = as_older_version(&path, &FakeCodec(2), |old| {
+            old.sendspin.ensure_client_key();
+            old.sendspin.ensure_pairing_psk();
+            old.sendspin.ensure_server_key();
+        });
+        // This version can't open the groups either: it keeps that identity,
+        // and every later launch gets the same one, pairing token included.
+        let first = UserConfig::load_from_with(&path, &FakeCodec(2));
+        assert_eq!(first.sendspin.client_key, old.sendspin.client_key);
+        let disk = std::fs::read_to_string(&path).unwrap();
+        for s in sendspin_secrets(&old.sendspin) {
+            assert!(!disk.contains(&s), "{s} in {disk}");
+        }
+        for _ in 0..2 {
+            let next = UserConfig::load_from_with(&path, &FakeCodec(2));
+            assert_eq!(next.sendspin.client_key, old.sendspin.client_key);
+            assert_eq!(next.sendspin.pairing_psk, old.sendspin.pairing_psk);
+            assert_eq!(next.sendspin.server_key, old.sendspin.server_key);
+            next.save_to_with(&path, &FakeCodec(2));
+        }
+        // The same holds for one this version mints itself.
+        let fresh = temp_config_dir("sendspin-pending-fresh").join("config.json");
+        c.save_to_with(&fresh, &FakeCodec(1));
+        let mut there = UserConfig::load_from_with(&fresh, &FakeCodec(2));
+        there.sendspin.ensure_client_key();
+        there.sendspin.ensure_pairing_psk();
+        there.save_to_with(&fresh, &FakeCodec(2));
+        let again = UserConfig::load_from_with(&fresh, &FakeCodec(2));
+        assert_eq!(again.sendspin.client_key, there.sendspin.client_key);
+        assert_eq!(again.sendspin.pairing_psk, there.sendspin.pairing_psk);
+
+        // The stored groups were never touched, and win where they open.
+        let p = protected_section(&path);
+        assert_eq!(p["/sendspin/client_identity"], sealed["/sendspin/client_identity"]);
+        assert_eq!(p["/sendspin/server_identity"], sealed["/sendspin/server_identity"]);
+        let home = UserConfig::load_from_with(&path, &FakeCodec(1));
+        assert_same_client(&home.sendspin, &c.sendspin);
+        assert_same_server(&home.sendspin, &c.sendspin);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(fresh.parent().unwrap());
+    }
+
+    #[test]
+    fn removed_sendspin_pairings_stay_removed() {
+        use crate::secret_store::tests::FakeCodec;
+        let dir = temp_config_dir("sendspin-removed");
+        let path = dir.join("config.json");
+        let codec = FakeCodec(0x42);
+        let mut c = UserConfig::default();
+        c.sendspin = paired_sendspin();
+        c.save_to_with(&path, &codec);
+
+        let mut c = UserConfig::load_from_with(&path, &codec);
+        // Music Assistant revokes its pairing; the kitchen speaker is
+        // paired again with a new identity, which replaces the old record.
+        assert!(c.sendspin.remove_server_pairing_by_psk_id(&psk_id(&[0xA1; 32])));
+        c.sendspin.player_pairings.insert(
+            "player-b".into(),
+            PlayerPairing { psk: b64url(&[0xB2; 32]), name: None, instance: None },
+        );
+        assert!(c.sendspin.pin_player("player-b", "kitchen"));
+        c.save_to_with(&path, &codec);
+
+        let back = UserConfig::load_from_with(&path, &codec);
+        assert!(back.sendspin.server_pairings.is_empty());
+        assert_eq!(back.sendspin.client_key, c.sendspin.client_key, "the identity stays");
+        let ids: Vec<&String> = back.sendspin.player_pairings.keys().collect();
+        assert_eq!(ids, ["player-b"]);
+        assert!(back.locked_secrets.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -372,6 +372,15 @@ pub fn audio_chunk(d: Dialect, timestamp_us: i64, now_us: i64, audio: &[u8]) -> 
     out
 }
 
+/// Longest name we keep from a peer's hello, in characters. Names are
+/// shown, logged and stored with pairings; a longer one is cut.
+pub const MAX_PEER_NAME_CHARS: usize = 256;
+
+/// `name` as sent by a peer, cut to [`MAX_PEER_NAME_CHARS`].
+pub fn peer_name(name: &str) -> String {
+    name.chars().take(MAX_PEER_NAME_CHARS).collect()
+}
+
 /// What a player told us in `client/hello`.
 #[derive(Clone, Debug, Default)]
 pub struct PlayerHello {
@@ -391,7 +400,7 @@ pub struct PlayerHello {
 
 pub fn parse_player_hello(payload: &Value) -> PlayerHello {
     let mut h = PlayerHello {
-        name: payload.get("name").and_then(Value::as_str).unwrap_or("Sendspin player").to_string(),
+        name: peer_name(payload.get("name").and_then(Value::as_str).unwrap_or("Sendspin player")),
         client_id: payload.get("client_id").and_then(Value::as_str).map(str::to_string),
         ..Default::default()
     };
@@ -498,6 +507,14 @@ mod tests {
             offer_dynamic_code: true,
             min_code_length: 6,
         }
+    }
+
+    #[test]
+    fn peer_names_are_cut() {
+        let long = "ü".repeat(MAX_PEER_NAME_CHARS + 10);
+        let h = parse_player_hello(&json!({ "name": long }));
+        assert_eq!(h.name.chars().count(), MAX_PEER_NAME_CHARS);
+        assert_eq!(peer_name("Kitchen"), "Kitchen");
     }
 
     #[test]
