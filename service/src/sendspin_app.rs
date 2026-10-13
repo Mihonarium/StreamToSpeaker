@@ -4,13 +4,14 @@
 //! a Live Input).
 
 use crossbeam_channel::{bounded, Sender};
-use log::{info, warn};
+use log::{debug, info};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use crate::app::{ActiveSession, App};
+use crate::discovery_net::MdnsController;
 use crate::http_server::SpeakerInfo;
 use crate::sendspin::mdns::DEFAULT_CLIENT_PORT;
 use crate::sendspin::proto::PairMethod;
@@ -53,7 +54,16 @@ pub(crate) struct PairPrompt {
 
 #[derive(Default)]
 pub struct SendspinAppState {
+    /// Sendspin speakers found; `Some` while Sendspin discovery is on.
     pub(crate) discovery: Mutex<Option<Arc<SendspinDiscoveryState>>>,
+    /// The mDNS browse feeding `discovery`, on the discovery network
+    /// adapter. Held for the whole of a start, stop or re-scope, which
+    /// can take a second.
+    pub(crate) browse: Mutex<Option<MdnsController>>,
+    /// Why the browse isn't running although Sendspin discovery is on:
+    /// it failed to start (retried on each network check). `None` while
+    /// it runs, is paused with its adapter, or discovery is off.
+    pub(crate) discovery_error: Mutex<Option<String>>,
     pub(crate) source: Mutex<Option<SourceService>>,
     pub(crate) prompt: Mutex<Option<PairPrompt>>,
     pub(crate) disabled: AtomicBool,
@@ -65,6 +75,42 @@ pub struct SendspinAppState {
 
 /// Speaker-list id of the "Music Assistant" output.
 pub const MA_OUTPUT_ID: &str = "music-assistant:input";
+
+/// What the launch reconnect does with a saved Sendspin speaker or the
+/// Music Assistant output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SendspinLaunch {
+    /// Leave it alone.
+    Skip(LaunchSkip),
+    /// Select the Music Assistant output.
+    MaOutput,
+    /// Connect to this speaker once discovery has seen it.
+    Speaker(String),
+}
+
+/// One check of the launch reconnect's wait for a saved Sendspin speaker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchStep {
+    /// Not seen yet: check again shortly.
+    Wait,
+    /// Seen: select it.
+    Select,
+    /// Leave it alone, for this reason.
+    Stop(&'static str),
+}
+
+/// Why the launch reconnect leaves the saved speaker alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchSkip {
+    /// Reconnect at launch is off in the app settings.
+    ReconnectOff,
+    /// The speaker's own auto-connect setting is "Never".
+    Never,
+    /// Sendspin is off, or disabled for this run.
+    SendspinOff,
+    /// The Music Assistant input isn't running.
+    InputOff,
+}
 
 /// Music Assistant selected as the output. While this session exists the
 /// Music Assistant input reports itself available and sends this
@@ -138,7 +184,7 @@ impl App {
             return;
         }
         if enabled {
-            self.start_sendspin_discovery();
+            self.sync_sendspin_discovery();
         }
         if saved || force_source {
             if let Err(e) = self.start_sendspin_source() {
@@ -147,25 +193,80 @@ impl App {
         }
     }
 
-    fn start_sendspin_discovery(self: &Arc<Self>) {
-        if !self.sendspin.discovery_allowed.load(Ordering::SeqCst) {
+    /// Bring Sendspin speaker discovery in line with the settings: on
+    /// while Sendspin is on (and discovery is allowed this run), browsing
+    /// on the discovery network adapter and paused while that adapter is
+    /// down, like AirPlay and UPnP discovery. Safe to call any time; slow
+    /// when it restarts the browse, so not on the GUI thread.
+    pub(crate) fn sync_sendspin_discovery(&self) {
+        let mut browse = self.sendspin.browse.lock().unwrap();
+        let wanted = self.sendspin.discovery_allowed.load(Ordering::SeqCst)
+            && self.is_sendspin_available()
+            && self.is_sendspin_enabled();
+        if !wanted {
+            *self.sendspin.discovery.lock().unwrap() = None;
+            *self.sendspin.discovery_error.lock().unwrap() = None;
+            if let Some(ctl) = browse.take() {
+                ctl.stop();
+            }
             return;
         }
-        let mut slot = self.sendspin.discovery.lock().unwrap();
-        if slot.is_some() {
-            return;
-        }
-        let st = SendspinDiscoveryState::new();
-        match server::spawn_discovery(st.clone()) {
-            Ok(()) => *slot = Some(st),
-            Err(e) => warn!("Sendspin discovery failed to start: {:#} (continuing without it)", e),
+        let ctl = browse.get_or_insert_with(|| {
+            let st = SendspinDiscoveryState::new();
+            *self.sendspin.discovery.lock().unwrap() = Some(st.clone());
+            let found = st.clone();
+            MdnsController::new(
+                "Sendspin",
+                move |d| server::spawn_discovery_on(found.clone(), d),
+                move || st.clear(),
+            )
+        });
+        let result = ctl.apply(&self.current_discovery_scope());
+        let mut error = self.sendspin.discovery_error.lock().unwrap();
+        match result {
+            Ok(()) => {
+                if error.take().is_some() {
+                    if ctl.is_running() {
+                        info!("Sendspin discovery: started");
+                    } else {
+                        info!("Sendspin discovery: paused (discovery adapter unavailable)");
+                    }
+                }
+            }
+            // Shown once per failure; the network check retries quietly.
+            Err(e) if error.is_none() => {
+                let msg = format!(
+                    "Sendspin speaker discovery couldn't start ({:#}). It will keep trying.",
+                    e
+                );
+                self.record_error(msg.clone());
+                *error = Some(msg);
+            }
+            Err(e) => debug!("Sendspin discovery: still failing to start: {:#}", e),
         }
     }
 
-    fn stop_sendspin_discovery(&self) {
-        if self.sendspin.discovery.lock().unwrap().take().is_some() {
-            server::stop_discovery();
+    /// Network check: try again to start a Sendspin browse that failed to
+    /// start (nothing else restarts it while the adapter scope holds).
+    pub(crate) fn retry_failed_sendspin_discovery(&self) {
+        if self.sendspin_discovery_error().is_some() {
+            self.sync_sendspin_discovery();
         }
+    }
+
+    /// Why Sendspin speaker discovery is on but not running, for the window.
+    pub(crate) fn sendspin_discovery_error(&self) -> Option<String> {
+        self.sendspin.discovery_error.lock().unwrap().clone()
+    }
+
+    /// [`sync_sendspin_discovery`](Self::sync_sendspin_discovery) on a
+    /// thread of its own.
+    fn spawn_sendspin_discovery_sync(self: &Arc<Self>) {
+        let app = self.clone();
+        std::thread::Builder::new()
+            .name("stream-to-speaker-sendspin-discovery".into())
+            .spawn(move || app.sync_sendspin_discovery())
+            .ok();
     }
 
     fn sendspin_discovery(&self) -> Option<Arc<SendspinDiscoveryState>> {
@@ -189,8 +290,11 @@ impl App {
             }
             uc.sendspin.source_enabled
         };
+        // Off the GUI thread: stopping the browse can take a second. Each
+        // run applies the setting as saved by then, so quick toggles
+        // settle on the last one.
+        self.spawn_sendspin_discovery_sync();
         if on {
-            self.start_sendspin_discovery();
             if source_saved && !self.is_sendspin_source_enabled() {
                 if let Err(e) = self.start_sendspin_source() {
                     self.record_error(format!("Couldn't start the Music Assistant input: {}", e));
@@ -198,7 +302,6 @@ impl App {
             }
         } else {
             self.stop_sendspin();
-            self.stop_sendspin_discovery();
             *self.sendspin.prompt.lock().unwrap() = None;
             let session = {
                 let mut g = self.session.lock().unwrap();
@@ -441,40 +544,100 @@ impl App {
             .collect()
     }
 
-    /// Launch: reconnect to a saved Sendspin speaker once discovery has
-    /// seen it (mDNS needs a moment), when launch reconnect is on.
-    pub fn reconnect_saved_sendspin_speaker(self: &Arc<Self>) {
-        let Some(id) = self.saved_speaker_id().filter(|id| is_sendspin_id(id) || id == MA_OUTPUT_ID) else {
-            return;
-        };
-        if id == MA_OUTPUT_ID {
-            if self.is_auto_reconnect_on_launch() && self.is_sendspin_source_enabled() {
-                info!("auto-reconnect: Music Assistant output");
-                self.select_speaker_async_with(&id, false, None);
+    /// What the launch reconnect does with the saved speaker when it is a
+    /// Sendspin speaker or the Music Assistant output (`None`: it is
+    /// neither). The same gates as for every other speaker: reconnect at
+    /// launch is on, and the speaker's own auto-connect setting isn't
+    /// "Never".
+    pub(crate) fn sendspin_launch_plan(&self) -> Option<SendspinLaunch> {
+        let id = self.saved_speaker_id().filter(|id| is_sendspin_id(id) || id == MA_OUTPUT_ID)?;
+        Some(if !self.is_auto_reconnect_on_launch() {
+            SendspinLaunch::Skip(LaunchSkip::ReconnectOff)
+        } else if !self.auto_connect_allowed_at_launch(&id) {
+            SendspinLaunch::Skip(LaunchSkip::Never)
+        } else if id == MA_OUTPUT_ID {
+            if self.is_sendspin_source_enabled() {
+                SendspinLaunch::MaOutput
+            } else {
+                SendspinLaunch::Skip(LaunchSkip::InputOff)
             }
-            return;
-        }
-        if !self.is_auto_reconnect_on_launch() || !self.is_sendspin_available() || !self.is_sendspin_enabled() {
-            return;
-        }
+        } else if !self.is_sendspin_available() || !self.is_sendspin_enabled() {
+            SendspinLaunch::Skip(LaunchSkip::SendspinOff)
+        } else {
+            SendspinLaunch::Speaker(id)
+        })
+    }
+
+    /// Launch: reconnect to a saved Sendspin speaker once discovery has
+    /// seen it (mDNS needs a moment), or select the Music Assistant
+    /// output — see [`sendspin_launch_plan`](Self::sendspin_launch_plan).
+    pub fn reconnect_saved_sendspin_speaker(self: &Arc<Self>) {
+        let id = match self.sendspin_launch_plan() {
+            None => return,
+            Some(SendspinLaunch::Skip(why)) => {
+                info!(
+                    "auto-reconnect: saved {:?} left alone ({:?})",
+                    self.saved_speaker_id().unwrap_or_default(),
+                    why
+                );
+                return;
+            }
+            Some(SendspinLaunch::MaOutput) => {
+                info!("auto-reconnect: Music Assistant output");
+                self.select_speaker_async_with(MA_OUTPUT_ID, false, None);
+                return;
+            }
+            Some(SendspinLaunch::Speaker(id)) => id,
+        };
         let app = self.clone();
+        let picks_seen = self.user_pick_count();
         std::thread::Builder::new()
             .name("stream-to-speaker-sendspin-launch".into())
             .spawn(move || {
                 for _ in 0..100 {
-                    if app.is_shutting_down() || !app.is_sendspin_enabled() {
+                    if app.is_shutting_down() {
                         return;
                     }
-                    if app.sendspin_name_for(&id).is_some() {
-                        info!("auto-reconnect: saved Sendspin speaker {:?}", id);
-                        app.select_speaker_async_with(&id, false, None);
-                        return;
+                    match app.sendspin_launch_step(&id, picks_seen) {
+                        LaunchStep::Wait => {}
+                        LaunchStep::Stop(why) => {
+                            info!("auto-reconnect: saved Sendspin speaker {:?}: {}", id, why);
+                            return;
+                        }
+                        LaunchStep::Select => {
+                            info!("auto-reconnect: saved Sendspin speaker {:?}", id);
+                            app.connect_unless_user_picked(&id, picks_seen);
+                            return;
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 info!("auto-reconnect: saved Sendspin speaker {:?} not found", id);
             })
             .ok();
+    }
+
+    /// One check of the launch wait for the saved Sendspin speaker `id`,
+    /// which started when [`user_pick_count`](Self::user_pick_count) was
+    /// `picks_seen`: give up when the user picked a speaker since (even
+    /// one that failed to connect), or the launch plan no longer selects
+    /// `id` (Sendspin turned off, the speaker set to "Never", another
+    /// speaker saved); select it once discovery has seen it. Automatic
+    /// connects ("Always" speakers) don't count as a pick; one that binds
+    /// makes its speaker the saved one, which ends the wait.
+    pub(crate) fn sendspin_launch_step(&self, id: &str, picks_seen: u64) -> LaunchStep {
+        if self.user_pick_count() != picks_seen {
+            return LaunchStep::Stop("a speaker was picked meanwhile");
+        }
+        match self.sendspin_launch_plan() {
+            Some(SendspinLaunch::Speaker(planned)) if planned == id => {}
+            _ => return LaunchStep::Stop("no longer reconnected at launch"),
+        }
+        if self.sendspin_name_for(id).is_some() {
+            LaunchStep::Select
+        } else {
+            LaunchStep::Wait
+        }
     }
 
     /// Is Music Assistant the selected output?
@@ -504,6 +667,7 @@ impl App {
         }
         let disc = self
             .sendspin_discovery()
+            .filter(|_| self.sendspin_discovery_error().is_none())
             .ok_or_else(|| "Sendspin discovery is not running".to_string())?;
         let renderer = disc
             .find_by_id(id)
@@ -616,6 +780,7 @@ impl App {
     }
 
     fn spawn_select_with_pairing(self: &Arc<Self>, id: String, input: PairingInput) {
+        self.note_user_pick();
         let app = self.clone();
         std::thread::Builder::new()
             .name("stream-to-speaker-sendspin-pair".into())

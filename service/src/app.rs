@@ -374,6 +374,18 @@ pub struct App {
     /// runs it on a worker thread and shows "Connecting…" off this.
     pub connecting: Mutex<Option<String>>,
 
+    /// Counts selections through [`select_speaker_async`],
+    /// [`select_speaker`] and a Sendspin pairing answer, the paths the
+    /// window, tray, web API and terminal picker use; the launch and
+    /// stereo-pair reconnects of other speakers go through them too.
+    /// Bumped before the selection claims `connecting`. An automatic
+    /// connect that must not override the user compares it under that
+    /// lock, so even a pick that failed at once is seen.
+    ///
+    /// [`select_speaker_async`]: App::select_speaker_async
+    /// [`select_speaker`]: App::select_speaker
+    user_picks: AtomicU64,
+
     /// Privacy gate for `/stream.raw` (see `stream_gate.rs`). Sessions
     /// hold grants in it; the HTTP threads consult it per request.
     pub stream_gate: Arc<StreamGate>,
@@ -400,7 +412,8 @@ pub struct App {
     /// The machine's adapters as of the last network check, for the
     /// adapter selector (refreshed every couple of seconds off-thread).
     adapters_cache: Mutex<Vec<NetAdapter>>,
-    /// The mDNS browser, rebuilt when the chosen adapter changes.
+    /// The AirPlay mDNS browser, rebuilt when the chosen adapter changes
+    /// (Sendspin's is in `sendspin`).
     mdns: Mutex<Option<MdnsController>>,
     /// Serialises scope changes (the monitor thread vs. a settings edit).
     scope_apply: Mutex<()>,
@@ -417,6 +430,7 @@ pub struct DiscoveryNetStatus {
     /// Set when `--advertise-ip` / `--bind` pins SSDP to one address; the
     /// adapter choice is then ignored.
     pub pinned: Option<Ipv4Addr>,
+    /// AirPlay or Sendspin discovery failed to start (one line each).
     pub error: Option<String>,
 }
 
@@ -537,6 +551,7 @@ impl App {
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
+            user_picks: AtomicU64::new(0),
             pin_ceremony: Mutex::new(None),
             sendspin: Default::default(),
             manual_resolved: Mutex::new(std::collections::HashMap::new()),
@@ -1402,8 +1417,19 @@ impl App {
     ///
     /// [`select_speaker_async_opts`]: App::select_speaker_async_opts
     pub fn select_speaker_async(self: &Arc<Self>, id: &str) {
+        self.note_user_pick();
         self.reconnects.store(0, Ordering::Relaxed);
         self.select_speaker_async_opts(id, true, false);
+    }
+
+    /// Record that the user picked a speaker (see `user_picks`).
+    pub(crate) fn note_user_pick(&self) {
+        self.user_picks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many speakers the user has picked so far (see `user_picks`).
+    pub(crate) fn user_pick_count(&self) -> u64 {
+        self.user_picks.load(Ordering::SeqCst)
     }
 
     /// Non-interactive [`select_speaker_async`] for automatic callers
@@ -1418,7 +1444,16 @@ impl App {
     /// under the same `connecting` lock every select claims, so an
     /// automatic connect can never replace a speaker the user picked.
     fn select_speaker_async_opts(self: &Arc<Self>, id: &str, interactive: bool, only_if_idle: bool) {
-        self.select_speaker_async_full(id, interactive, only_if_idle, None);
+        self.select_speaker_async_full(id, interactive, only_if_idle, None, None);
+    }
+
+    /// Automatic, non-interactive connect that gives way to the user:
+    /// skipped when they picked a speaker since [`user_pick_count`]
+    /// returned `picks_seen`, decided under the `connecting` lock.
+    ///
+    /// [`user_pick_count`]: App::user_pick_count
+    pub(crate) fn connect_unless_user_picked(self: &Arc<Self>, id: &str, picks_seen: u64) {
+        self.select_speaker_async_full(id, false, false, Some(picks_seen), None);
     }
 
     /// [`select_speaker_async_opts`] carrying a Sendspin pairing input
@@ -1431,7 +1466,7 @@ impl App {
         interactive: bool,
         sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
     ) {
-        self.select_speaker_async_full(id, interactive, false, sendspin_pairing);
+        self.select_speaker_async_full(id, interactive, false, None, sendspin_pairing);
     }
 
     fn select_speaker_async_full(
@@ -1439,11 +1474,16 @@ impl App {
         id: &str,
         interactive: bool,
         only_if_idle: bool,
+        unless_picked_since: Option<u64>,
         sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
     ) {
         {
             let mut guard = self.connecting.lock().unwrap();
             if only_if_idle && guard.is_none() && self.session.lock().unwrap().is_some() {
+                return;
+            }
+            if unless_picked_since.is_some_and(|seen| seen != self.user_pick_count()) {
+                debug!("select of {} skipped — the user picked a speaker", id);
                 return;
             }
             if let Some(name) = guard.as_ref() {
@@ -1710,6 +1750,7 @@ impl App {
     /// entry point of the web API / tray toggle / launch reconnect, where
     /// nobody could answer a PIN prompt).
     pub fn select_speaker(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        self.note_user_pick();
         // Claim the same `connecting` slot the background connects use, so
         // the two can't run at once and auto-connect sees this one.
         {
@@ -2642,13 +2683,13 @@ impl App {
             crate::ssdp::spawn_discovery(d, ssdp_interval, scope);
         }
         if let Some(state) = self.airplay_discovery.clone() {
-            let ctl = MdnsController::new(state);
-            let started = match &resolved {
-                Resolved::All => ctl.start(None),
-                Resolved::Active { name, .. } => ctl.start(Some(name)),
-                Resolved::Paused { .. } => Ok(()),
-            };
-            if let Err(e) = started {
+            let found = state.clone();
+            let ctl = MdnsController::new(
+                "AirPlay",
+                move |d| crate::airplay::discovery::spawn_airplay_discovery_on(found.clone(), d),
+                move || state.clear(),
+            );
+            if let Err(e) = ctl.apply(&resolved) {
                 self.note_discovery_failure(&e);
             }
             *self.mdns.lock().unwrap() = Some(ctl);
@@ -2687,6 +2728,11 @@ impl App {
         discovery_net::resolve(selected.as_ref(), adapters)
     }
 
+    /// Discovery's adapter scope as last applied.
+    pub(crate) fn current_discovery_scope(&self) -> Resolved {
+        self.discovery_scope.lock().unwrap().clone()
+    }
+
     /// Where SSDP searches right now.
     pub fn ssdp_scope(&self) -> SearchScope {
         if let Some(ip) = self.config.ssdp_iface {
@@ -2700,8 +2746,9 @@ impl App {
     }
 
     /// Re-check the adapters and apply any change of scope: restart mDNS
-    /// on the new interface set (or stop it while paused), forget what
-    /// was found on the old network, and search again.
+    /// (AirPlay and Sendspin) on the new interface set (or stop it while
+    /// paused), forget what was found on the old network, and search again.
+    /// Otherwise retry a Sendspin browse that failed to start.
     fn refresh_discovery_scope(self: &Arc<Self>) {
         let _serial = self.scope_apply.lock().unwrap();
         let adapters = discovery_net::list_adapters();
@@ -2709,6 +2756,7 @@ impl App {
         *self.adapters_cache.lock().unwrap() = adapters;
         let old = std::mem::replace(&mut *self.discovery_scope.lock().unwrap(), new.clone());
         if old == new {
+            self.retry_failed_sendspin_discovery();
             return;
         }
         match &new {
@@ -2719,26 +2767,12 @@ impl App {
             }
         }
         if let Some(ctl) = self.mdns.lock().unwrap().as_ref() {
-            let same_adapter = matches!(
-                (&old, &new),
-                (Resolved::Active { name: a, .. }, Resolved::Active { name: b, .. }) if a == b
-            );
-            let result = match &new {
-                // The mDNS stack follows address changes on the same
-                // adapter by itself.
-                _ if same_adapter => Ok(()),
-                Resolved::All => ctl.start(None),
-                Resolved::Active { name, .. } => ctl.start(Some(name)),
-                Resolved::Paused { .. } => {
-                    ctl.stop();
-                    Ok(())
-                }
-            };
-            match result {
+            match ctl.apply(&new) {
                 Ok(()) => *self.discovery_error.lock().unwrap() = None,
                 Err(e) => self.note_discovery_failure(&e),
             }
         }
+        self.sync_sendspin_discovery();
         if let Some(d) = self.discovery.as_ref() {
             d.clear();
         }
@@ -2758,7 +2792,13 @@ impl App {
             scope: self.discovery_scope.lock().unwrap().clone(),
             selected: self.user_config.lock().unwrap().discovery_adapter.clone(),
             pinned: self.config.ssdp_iface,
-            error: self.discovery_error.lock().unwrap().clone(),
+            error: {
+                let airplay = self.discovery_error.lock().unwrap().clone();
+                match (airplay, self.sendspin_discovery_error()) {
+                    (Some(a), Some(s)) => Some(format!("{}\n{}", a, s)),
+                    (a, s) => a.or(s),
+                }
+            },
         }
     }
 
@@ -3427,6 +3467,225 @@ mod tests {
         assert!(!app.stream_client_allowed(ip("192.168.1.51")));
         drop(grant);
         assert!(!app.stream_client_allowed(ip("192.168.1.50")));
+    }
+
+    /// [`test_app`] with default settings instead of the developer's
+    /// (in memory only: nothing here saves).
+    fn test_app_defaults() -> Arc<App> {
+        let app = test_app();
+        *app.user_config.lock().unwrap() = UserConfig::default();
+        app
+    }
+
+    #[test]
+    fn sendspin_discovery_pauses_with_the_discovery_adapter() {
+        let app = test_app_defaults();
+        {
+            let mut uc = app.user_config.lock().unwrap();
+            uc.sendspin.enabled = true;
+            uc.discovery_adapter =
+                Some(SavedAdapter { key: "{no-such-adapter}".into(), name: "USB LAN".into() });
+        }
+        app.sendspin.discovery_allowed.store(true, Ordering::SeqCst);
+        // The chosen adapter is missing: discovery pauses, Sendspin's too.
+        app.refresh_discovery_scope();
+        assert_eq!(app.current_discovery_scope(), Resolved::Paused { name: "USB LAN".into() });
+        {
+            let browse = app.sendspin.browse.lock().unwrap();
+            let ctl = browse.as_ref().expect("Sendspin discovery is on");
+            assert_eq!(ctl.applied(), Some(discovery_net::MdnsScope::Paused));
+            assert!(!ctl.is_running());
+        }
+        let found = app.sendspin.discovery.lock().unwrap().clone().expect("Sendspin discovery is on");
+        assert!(found.renderers().is_empty());
+        assert!(app.sendspin_speakers(None).is_empty());
+
+        // Sendspin off: its discovery goes away entirely.
+        app.user_config.lock().unwrap().sendspin.enabled = false;
+        app.sync_sendspin_discovery();
+        assert!(app.sendspin.discovery.lock().unwrap().is_none());
+        assert!(app.sendspin.browse.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn sendspin_launch_reconnect_follows_the_speaker_setting() {
+        use crate::sendspin_app::{LaunchSkip, SendspinLaunch, MA_OUTPUT_ID};
+        let app = test_app_defaults();
+        app.user_config.lock().unwrap().sendspin.enabled = true;
+        let plan = |id: &str, auto_connect: AutoConnect| {
+            {
+                let mut uc = app.user_config.lock().unwrap();
+                uc.last_speaker_id = Some(id.to_string());
+                uc.speaker_settings.insert(
+                    id.to_string(),
+                    SpeakerSettings { auto_connect, ..Default::default() },
+                );
+            }
+            app.sendspin_launch_plan()
+        };
+        let kitchen = || Some(SendspinLaunch::Speaker("sendspin:kitchen".into()));
+        assert_eq!(plan("sendspin:kitchen", AutoConnect::Default), kitchen());
+        assert_eq!(plan("sendspin:kitchen", AutoConnect::Always), kitchen());
+        assert_eq!(
+            plan("sendspin:kitchen", AutoConnect::Never),
+            Some(SendspinLaunch::Skip(LaunchSkip::Never))
+        );
+        assert_eq!(
+            plan(MA_OUTPUT_ID, AutoConnect::Never),
+            Some(SendspinLaunch::Skip(LaunchSkip::Never))
+        );
+        // No Music Assistant input running here, so nothing to select.
+        assert_eq!(
+            plan(MA_OUTPUT_ID, AutoConnect::Default),
+            Some(SendspinLaunch::Skip(LaunchSkip::InputOff))
+        );
+        // Other kinds of speaker are reconnected by `main`.
+        assert_eq!(plan("airplay:AABBCCDDEEFF", AutoConnect::Default), None);
+
+        app.user_config.lock().unwrap().auto_reconnect_on_launch = false;
+        assert_eq!(
+            plan("sendspin:kitchen", AutoConnect::Default),
+            Some(SendspinLaunch::Skip(LaunchSkip::ReconnectOff))
+        );
+        app.user_config.lock().unwrap().auto_reconnect_on_launch = true;
+        app.user_config.lock().unwrap().sendspin.enabled = false;
+        assert_eq!(
+            plan("sendspin:kitchen", AutoConnect::Default),
+            Some(SendspinLaunch::Skip(LaunchSkip::SendspinOff))
+        );
+    }
+
+    #[test]
+    fn always_auto_connect_sees_sendspin_speakers() {
+        use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
+        let app = test_app_defaults();
+        let found = SendspinDiscoveryState::new();
+        found.insert(SendspinRenderer {
+            instance: "Kitchen".into(),
+            friendly_name: "Kitchen".into(),
+            ip: ip("192.168.1.40"),
+            port: 8928,
+            path: "/sendspin".into(),
+        });
+        *app.sendspin.discovery.lock().unwrap() = Some(found);
+        // The auto-connect loop picks from this list.
+        let listed = || app.speaker_view().speakers.iter().any(|s| s.id == "sendspin:kitchen");
+        assert!(!listed(), "listed while Sendspin is off");
+        app.user_config.lock().unwrap().sendspin.enabled = true;
+        assert!(listed());
+    }
+
+    #[test]
+    fn failed_sendspin_discovery_is_shown_and_retried() {
+        use crate::sendspin::server::SendspinDiscoveryState;
+        let app = test_app_defaults();
+        app.user_config.lock().unwrap().sendspin.enabled = true;
+        app.sendspin.discovery_allowed.store(true, Ordering::SeqCst);
+        // A browse that can't start until `fail` is cleared.
+        let fail = Arc::new(AtomicBool::new(true));
+        let f = fail.clone();
+        *app.sendspin.discovery.lock().unwrap() = Some(SendspinDiscoveryState::new());
+        *app.sendspin.browse.lock().unwrap() = Some(MdnsController::stub(
+            "Sendspin",
+            move || {
+                if f.load(Ordering::SeqCst) {
+                    Err(anyhow!("no socket"))
+                } else {
+                    Ok(())
+                }
+            },
+            || {},
+        ));
+        app.sync_sendspin_discovery();
+        let err = app.sendspin_discovery_error().expect("failure noted");
+        assert!(err.contains("no socket"), "{}", err);
+        assert_eq!(app.current_error(), Some(err.clone()));
+        assert_eq!(app.discovery_net_status().error, Some(err.clone()));
+        match app.start_sendspin_player("sendspin:kitchen", None, false) {
+            Err(e) => assert_eq!(e, "Sendspin discovery is not running"),
+            Ok(_) => panic!("connected without discovery"),
+        }
+
+        // The network check retries while the scope stays the same,
+        // without repeating the banner.
+        app.dismiss_error();
+        app.refresh_discovery_scope();
+        assert!(app.sendspin_discovery_error().is_some());
+        assert_eq!(app.current_error(), None);
+        fail.store(false, Ordering::SeqCst);
+        app.refresh_discovery_scope();
+        assert_eq!(app.sendspin_discovery_error(), None);
+        assert_eq!(app.discovery_net_status().error, None);
+        assert!(app.sendspin.browse.lock().unwrap().as_ref().unwrap().is_running());
+        match app.start_sendspin_player("sendspin:kitchen", None, false) {
+            Err(e) => assert!(e.starts_with("no Sendspin speaker with id"), "{}", e),
+            Ok(_) => panic!("connected to a speaker that wasn't found"),
+        }
+
+        app.user_config.lock().unwrap().sendspin.enabled = false;
+        app.sync_sendspin_discovery();
+        assert!(app.sendspin.browse.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn sendspin_launch_wait_yields_to_the_user() {
+        use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
+        use crate::sendspin_app::LaunchStep;
+        let id = "sendspin:kitchen";
+        let app = test_app_defaults();
+        {
+            let mut uc = app.user_config.lock().unwrap();
+            uc.sendspin.enabled = true;
+            uc.last_speaker_id = Some(id.to_string());
+        }
+        let found = SendspinDiscoveryState::new();
+        *app.sendspin.discovery.lock().unwrap() = Some(found.clone());
+        let seen = app.user_pick_count();
+        let step = |app: &App| app.sendspin_launch_step(id, seen);
+        assert_eq!(step(&app), LaunchStep::Wait);
+        found.insert(SendspinRenderer {
+            instance: "Kitchen".into(),
+            friendly_name: "Kitchen".into(),
+            ip: ip("192.168.1.40"),
+            port: 8928,
+            path: "/sendspin".into(),
+        });
+        assert_eq!(step(&app), LaunchStep::Select);
+
+        let stops = |app: &App| matches!(step(app), LaunchStep::Stop(_));
+        // An automatic connect (an "Always" speaker) still connecting
+        // doesn't end the wait: it isn't a pick.
+        *app.connecting.lock().unwrap() = Some("Den".into());
+        assert_eq!(step(&app), LaunchStep::Select);
+        *app.connecting.lock().unwrap() = None;
+        // The saved speaker was set to "Never".
+        app.user_config.lock().unwrap().speaker_settings.insert(
+            id.to_string(),
+            SpeakerSettings { auto_connect: AutoConnect::Never, ..Default::default() },
+        );
+        assert!(stops(&app));
+        app.user_config.lock().unwrap().speaker_settings.remove(id);
+        assert_eq!(step(&app), LaunchStep::Select);
+        // Another speaker was saved.
+        app.user_config.lock().unwrap().last_speaker_id = Some("airplay:AABBCCDDEEFF".into());
+        assert!(stops(&app));
+        app.user_config.lock().unwrap().last_speaker_id = Some(id.to_string());
+        // Sendspin was turned off.
+        app.user_config.lock().unwrap().sendspin.enabled = false;
+        assert!(stops(&app));
+        app.user_config.lock().unwrap().sendspin.enabled = true;
+        assert_eq!(step(&app), LaunchStep::Select);
+
+        // The user picked a speaker whose connect failed at once: nothing
+        // is bound or connecting afterwards, yet the wait gives up.
+        assert!(app.select_speaker("sendspin:nowhere").is_err());
+        assert!(!app.is_speaker_bound() && app.connecting_to().is_none());
+        assert!(stops(&app));
+        // A select decided after that pick is skipped as well.
+        app.dismiss_error();
+        app.connect_unless_user_picked(id, seen);
+        assert_eq!(app.connecting_to(), None);
+        assert_eq!(app.current_error(), None);
     }
 
     #[test]
