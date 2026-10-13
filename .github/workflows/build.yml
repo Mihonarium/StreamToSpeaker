@@ -12,8 +12,10 @@ on:
         required: false
         default: ""
 
+# Read-only by default; the release jobs that write to the draft release
+# declare their own permissions.
 permissions:
-  contents: write  # for release uploads on tag pushes
+  contents: read
 
 # Runs for the same v* tag never overlap: they work on the same draft
 # release. Other runs each get a group of their own.
@@ -50,6 +52,9 @@ jobs:
           # HEAD`, which silently evaluates to 1 on the default depth-1
           # shallow clone (so CI-built drivers were all stamped 1.0.0.1).
           fetch-depth: 0
+          # Nothing in this job pushes; no token is left in .git/config for
+          # the build scripts and third-party actions that run here.
+          persist-credentials: false
 
       # Identity hash of the driver source. Computed BEFORE the build stamps
       # driver.h with the build number so it matches what a clean checkout
@@ -68,20 +73,35 @@ jobs:
       #   viversion — strict X.Y.Z.W numeric, required for the Win32
       #               VersionInfo resource Inno Setup bakes into setup.exe
       # Tag push  v1.2.3   → version 1.2.3,        viversion 1.2.3.0
+      # Dispatch with a version (not on a tag) → that version
       # Otherwise          → version 0.1.0-<sha>,  viversion 0.1.0.0
+      # The version must be <major>.<minor>.<patch> plus an optional suffix
+      # of letters, digits and . + - ; anything else (a tag such as
+      # v1.2.3$(...) included) fails here, before it reaches a file name,
+      # a step output or a later job. On a tag the tag is the version: a
+      # dispatched version that differs from it is refused.
       # -----------------------------------------------------------------
       - name: Compute version
         id: ver
         shell: pwsh
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
+          $ErrorActionPreference = "Stop"
           $v = ""
-          if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.version }}") {
-              $v = "${{ inputs.version }}"
-          } elseif ("${{ github.ref }}" -like "refs/tags/v*") {
-              $v = "${{ github.ref }}" -replace "refs/tags/v", ""
+          if ($env:GITHUB_REF -clike "refs/tags/v*") {
+              $v = $env:GITHUB_REF.Substring("refs/tags/v".Length)
+              if ($env:EVENT -eq "workflow_dispatch" -and $env:INPUT_VERSION -and $env:INPUT_VERSION -cne $v) {
+                  throw "a dispatch on a tag builds the tag's version; leave the version input empty"
+              }
+          } elseif ($env:EVENT -eq "workflow_dispatch" -and $env:INPUT_VERSION) {
+              $v = $env:INPUT_VERSION
           } else {
-              $sha = "${{ github.sha }}".Substring(0, 7)
-              $v = "0.1.0-$sha"
+              $v = "0.1.0-" + $env:GITHUB_SHA.Substring(0, 7)
+          }
+          if ($v -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*\z') {
+              throw "the version must be <major>.<minor>.<patch> optionally followed by letters, digits and . + - (from the tag or the version input)"
           }
           # Numeric prefix of $v, padded to 4 parts.
           $prefix = ($v -split "[-+]")[0]
@@ -364,8 +384,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         working-directory: service
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          $v = "${{ steps.ver.outputs.version }}"
+          $v = $env:VERSION
           $toml = Get-Content Cargo.toml -Raw
           $re = [regex]::new('(?m)^version = "[^"]*"')
           if (-not $re.IsMatch($toml)) { throw "no package version line in Cargo.toml" }
@@ -442,23 +464,30 @@ jobs:
 
       - name: Build installer (Inno Setup)
         shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          VIVERSION: ${{ steps.ver.outputs.viversion }}
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "ISCC not at $iscc" }
           & $iscc `
-            "/DAppVersion=${{ steps.ver.outputs.version }}" `
-            "/DVersionInfoVersion=${{ steps.ver.outputs.viversion }}" `
+            "/DAppVersion=$env:VERSION" `
+            "/DVersionInfoVersion=$env:VIVERSION" `
             "installer\StreamToSpeaker.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
 
       # Which driver package each installer bundles: a <installer>.driver.json
-      # next to the exe (uploaded with it) and a table in the step summary.
+      # next to the exe (uploaded with it, except on tag pushes, which
+      # upload no dev installer) and a table in the step summary.
       - name: Record the bundled driver (test-signed installer)
         shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
         run: |
           .github/scripts/Write-DriverRecord.ps1 -StagingDir installer\staging -OutDir installer\out `
-            -Installer "StreamToSpeakerSetup-${{ steps.ver.outputs.version }}.exe" -Kind test-signed `
-            -SourceHash "${{ steps.srchash.outputs.hash }}"
+            -Installer "StreamToSpeakerSetup-$env:VERSION.exe" -Kind test-signed `
+            -SourceHash $env:SOURCE_HASH
 
       # -----------------------------------------------------------------
       # Production-driver installer preview (PRs / main pushes / dispatch).
@@ -484,35 +513,47 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
         run: |
           # -WarnOnError: here the package only adds a preview installer,
-          # so a lookup error costs that preview (with a warning) instead of
-          # failing the build. The tag pipeline's `package` job fails.
-          .github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ steps.srchash.outputs.hash }}" -OutDir attested-driver -WarnOnError
+          # so a failed lookup costs that preview (with a warning) instead
+          # of failing the build; a driver package that does not match its
+          # manifest still fails it. The tag pipeline's `package` job fails
+          # on either.
+          .github/scripts/Get-AttestedDriver.ps1 -SourceHash $env:SOURCE_HASH -OutDir attested-driver -WarnOnError
 
       - name: Build production-driver installer preview
         if: steps.attested.outputs.found == 'true'
         shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          VIVERSION: ${{ steps.ver.outputs.viversion }}
+          SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
+          KIND: ${{ steps.attested.outputs.kind }}
+          DRIVER_TAG: ${{ steps.attested.outputs.tag }}
+          DRIVER_VERSION: ${{ steps.attested.outputs.version }}
+          DRIVER_BUILD: ${{ steps.attested.outputs.build }}
+          DRIVER_ZIP: ${{ steps.attested.outputs.zip }}
         run: |
           $staging = "installer\staging"
           foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat") {
               Copy-Item "attested-driver\$name" "$staging\$name" -Force
           }
           Remove-Item "$staging\StreamToSpeaker.cer" -ErrorAction SilentlyContinue
-          $kind = "${{ steps.attested.outputs.kind }}"
+          $kind = $env:KIND
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           & $iscc `
-            "/DAppVersion=${{ steps.ver.outputs.version }}" `
-            "/DVersionInfoVersion=${{ steps.ver.outputs.viversion }}" `
-            "/FStreamToSpeakerSetup-${{ steps.ver.outputs.version }}-$kind" `
+            "/DAppVersion=$env:VERSION" `
+            "/DVersionInfoVersion=$env:VIVERSION" `
+            "/FStreamToSpeakerSetup-$env:VERSION-$kind" `
             "installer\StreamToSpeaker.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
-          Write-Host "Production-driver installer built: Microsoft-signed ($kind) driver ${{ steps.attested.outputs.version }} from ${{ steps.attested.outputs.tag }}"
+          Write-Host "Production-driver installer built: Microsoft-signed ($kind) driver $env:DRIVER_VERSION from $env:DRIVER_TAG"
           .github/scripts/Write-DriverRecord.ps1 -StagingDir $staging -OutDir installer\out `
-            -Installer "StreamToSpeakerSetup-${{ steps.ver.outputs.version }}-$kind.exe" -Kind $kind `
-            -SourceHash "${{ steps.srchash.outputs.hash }}" -Tag "${{ steps.attested.outputs.tag }}" `
-            -Version "${{ steps.attested.outputs.version }}" -Build "${{ steps.attested.outputs.build }}" `
-            -Zip "${{ steps.attested.outputs.zip }}"
+            -Installer "StreamToSpeakerSetup-$env:VERSION-$kind.exe" -Kind $kind `
+            -SourceHash $env:SOURCE_HASH -Tag $env:DRIVER_TAG `
+            -Version $env:DRIVER_VERSION -Build $env:DRIVER_BUILD `
+            -Zip $env:DRIVER_ZIP
 
       # Compute SHA256 of every shipped artifact so users can verify
       # downloads. Hashes go three places:
@@ -1297,6 +1338,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Read rust-version from Cargo.toml
         id: msrv
