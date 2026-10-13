@@ -129,12 +129,52 @@ pub enum Ap2StartError {
     Other(#[from] anyhow::Error),
 }
 
+/// Volume and mute for one AirPlay 2 session (every pair member); see
+/// [`AirPlay2Session::volume_control`].
+#[derive(Clone)]
+pub struct VolumeHandle {
+    rtsp: Arc<Mutex<Ap2Rtsp>>,
+    followers: Vec<Arc<Mutex<Ap2Rtsp>>>,
+    volume_pct: Arc<AtomicU32>,
+    volume: Arc<Mutex<VolumeTracker>>,
+}
+
+impl VolumeHandle {
+    pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
+        self.volume_pct.store(vol.min(100), Ordering::Relaxed);
+        let seq = self.volume.lock().unwrap().on_write(vol, Instant::now());
+        let res = self.set_volume_db_all(volume_pct_to_raop_db(vol));
+        if res.is_err() {
+            self.volume.lock().unwrap().on_write_failed(seq);
+        }
+        res
+    }
+
+    pub fn set_mute(&self, muted: bool) -> Result<()> {
+        let db = mute_db(muted, self.volume_pct.load(Ordering::Relaxed));
+        self.set_volume_db_all(db)
+    }
+
+    /// Write the volume to every member, leader first. Every member is
+    /// tried; the first failure is returned.
+    fn set_volume_db_all(&self, db: f32) -> Result<()> {
+        let mut result = self.rtsp.lock().unwrap().set_volume(db);
+        for f in &self.followers {
+            let r = f.lock().unwrap().set_volume(db);
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        result
+    }
+}
+
 /// A live AirPlay 2 session.
 pub struct AirPlay2Session {
     pub renderer: AirPlayRenderer,
     rtsp: Arc<Mutex<Ap2Rtsp>>,
     /// Last volume (0..=100) pushed to the receiver; restored on unmute.
-    volume_pct: AtomicU32,
+    volume_pct: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
     /// Set by background threads when the session has demonstrably died
     /// (see [`FaultSlot`]: audio sends failing for the grace period, a
@@ -565,7 +605,7 @@ impl AirPlay2Session {
         Ok(Self {
             renderer: cfg.renderer,
             rtsp,
-            volume_pct: AtomicU32::new(cfg.initial_volume.unwrap_or(100)),
+            volume_pct: Arc::new(AtomicU32::new(cfg.initial_volume.unwrap_or(100))),
             stop_flag,
             dead,
             faults,
@@ -824,7 +864,7 @@ impl AirPlay2Session {
         Ok(Self {
             renderer: cfg.renderer,
             rtsp,
-            volume_pct: AtomicU32::new(cfg.initial_volume.unwrap_or(100)),
+            volume_pct: Arc::new(AtomicU32::new(cfg.initial_volume.unwrap_or(100))),
             stop_flag,
             dead,
             faults,
@@ -868,32 +908,30 @@ impl AirPlay2Session {
         self.volume.lock().unwrap().state(Instant::now())
     }
 
+    /// The level (0..=100) last set on the receiver, at first the one
+    /// the session started it at.
+    pub fn volume_pct(&self) -> u32 {
+        self.volume_pct.load(Ordering::Relaxed)
+    }
+
     pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
-        self.volume_pct.store(vol.min(100), Ordering::Relaxed);
-        let seq = self.volume.lock().unwrap().on_write(vol, Instant::now());
-        let res = self.set_volume_db_all(volume_pct_to_raop_db(vol));
-        if res.is_err() {
-            self.volume.lock().unwrap().on_write_failed(seq);
-        }
-        res
+        self.volume_control().set_volume_pct(vol)
     }
 
     pub fn set_mute(&self, muted: bool) -> Result<()> {
-        let db = mute_db(muted, self.volume_pct.load(Ordering::Relaxed));
-        self.set_volume_db_all(db)
+        self.volume_control().set_mute(muted)
     }
 
-    /// Write the volume to every member, leader first. Every member is
-    /// tried; the first failure is returned.
-    fn set_volume_db_all(&self, db: f32) -> Result<()> {
-        let mut result = self.rtsp.lock().unwrap().set_volume(db);
-        for f in &self.followers {
-            let r = f.lock().unwrap().set_volume(db);
-            if result.is_ok() {
-                result = r;
-            }
+    /// A detachable handle for volume and mute: the send touches only the
+    /// members' RTSP mutexes and the read-back tracker, so the caller can
+    /// make it after releasing the session lock.
+    pub fn volume_control(&self) -> VolumeHandle {
+        VolumeHandle {
+            rtsp: self.rtsp.clone(),
+            followers: self.followers.clone(),
+            volume_pct: self.volume_pct.clone(),
+            volume: self.volume.clone(),
         }
-        result
     }
 
     pub fn stop(mut self) {

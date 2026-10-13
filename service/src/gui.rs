@@ -846,10 +846,30 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
                 }
             }
 
+            // The volume level changes on other threads (Windows slider,
+            // speaker events): repaint as each change lands so the volume
+            // row follows a drag rather than catching up a beat later. Not
+            // while the window is hidden to the tray: it gets no WM_PAINT
+            // then, and a repaint request it can't serve would keep eframe
+            // polling. Showing the window repaints it.
+            {
+                let ctx = cc.egui_ctx.clone();
+                app_for_eframe.vsync.set_on_change(move || {
+                    if !window_hidden(hwnd) {
+                        ctx.request_repaint();
+                    }
+                });
+            }
+
+            let tray = tray.map(|t| {
+                let t = std::rc::Rc::new(std::cell::RefCell::new(t));
+                crate::tray::sync_on_timer(&t, app_for_eframe.clone());
+                t
+            });
+
             let skip_close_confirmation = app_for_eframe.is_always_minimise_to_tray();
             Ok(Box::new(StreamToSpeakerApp {
                 app: app_for_eframe,
-                last_repaint_request: Instant::now(),
                 last_icon_state: IconState::Idle,
                 mark_textures: None,
                 tray,
@@ -891,14 +911,14 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
 
 struct StreamToSpeakerApp {
     app: Arc<App>,
-    last_repaint_request: Instant,
     /// What the window/taskbar icon is currently showing, so it is only
     /// pushed to the OS when it actually changes.
     last_icon_state: IconState,
     /// Header mark, one texture per state. Uploaded on the first frame
     /// that draws the header, since building one needs a Context.
     mark_textures: Option<[egui::TextureHandle; 3]>,
-    tray: Option<crate::tray::TrayHandle>,
+    /// Shared with the tray's sync timer (see `tray::sync_on_timer`).
+    tray: Option<std::rc::Rc<std::cell::RefCell<crate::tray::TrayHandle>>>,
     frame_count: u64,
     confirm_close_open: bool,
     skip_close_confirmation: bool,
@@ -979,6 +999,20 @@ struct StreamToSpeakerApp {
 fn win_hide(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
     unsafe { ShowWindow(hwnd as _, SW_HIDE); }
+}
+
+/// Whether the window is hidden to the tray (not merely minimised).
+pub(crate) fn window_hidden(hwnd: Option<isize>) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+        hwnd.is_some_and(|h| unsafe { IsWindowVisible(h as _) } == 0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        false
+    }
 }
 
 /// Restore from any state (hidden, minimised) and bring to foreground.
@@ -1118,11 +1152,6 @@ impl eframe::App for StreamToSpeakerApp {
             }
         }
 
-        if self.last_repaint_request.elapsed() >= Duration::from_millis(100) {
-            ctx.request_repaint_after(Duration::from_millis(100));
-            self.last_repaint_request = Instant::now();
-        }
-
         // While egui is still easing a scroll delta, repaint at the full
         // frame rate so the buffered delta drains evenly. egui buffers
         // wheel/touchpad deltas and releases them over a ~0.1 s ease, but
@@ -1190,8 +1219,11 @@ impl eframe::App for StreamToSpeakerApp {
         }
         let p = palette_for(dark, accent);
 
-        if let Some(tray) = self.tray.as_mut() {
-            tray.pump(&self.app, ctx);
+        if let Some(tray) = self.tray.as_ref() {
+            // Busy only if the sync timer fired inside this frame.
+            if let Ok(mut tray) = tray.try_borrow_mut() {
+                tray.pump(&self.app);
+            }
         }
 
         // Close-button handling. Hide-to-tray uses raw Win32 ShowWindow
@@ -1398,6 +1430,13 @@ impl eframe::App for StreamToSpeakerApp {
                     }
                 });
             });
+
+        // Last, once this frame's hide decisions are made: a window hidden
+        // to the tray gets no WM_PAINT, so a heartbeat left pending would
+        // keep eframe polling until it is shown again.
+        if !window_hidden(self.hwnd) {
+            crate::gui_layout::schedule_heartbeat(ctx);
+        }
     }
 }
 
@@ -1809,8 +1848,9 @@ impl StreamToSpeakerApp {
 
     fn show_status_banner(&self, ui: &mut egui::Ui, p: &Palette) {
         let enabled = self.app.is_streaming_enabled();
-        let active = self.app.stream_active.load(Ordering::Acquire);
+        let active = self.app.receiving_windows_audio();
         let current = self.app.selected_speaker();
+        let dropped = current.is_some() && self.app.selected_session_dead();
 
         // M20: status icons were grab-bag — ⊘ from Math Operators
         // (thin stroke), ▶ from Geometric Shapes (heavy filled),
@@ -1863,6 +1903,30 @@ impl StreamToSpeakerApp {
                 Some("Disable streaming"),
                 Some("Stop streaming and release the speaker for other apps (Ctrl+E)"),
             ),
+            // The session dropped; it stays bound until the reconnect.
+            (Some(r), true, _) if dropped => {
+                let (icon, headline, detail) = if self.app.is_auto_reconnect_on_drop() {
+                    (
+                        "⟳",
+                        format!("Reconnecting to {}…", r.friendly_name),
+                        "The connection dropped; trying again in a moment.".to_string(),
+                    )
+                } else {
+                    (
+                        "\u{23F8}", // ⏸ Double Vertical Bar (Pause)
+                        format!("Lost connection to {}", r.friendly_name),
+                        "Press Resync, or pick the speaker again, to reconnect.".to_string(),
+                    )
+                };
+                (
+                    icon,
+                    p.warn,
+                    headline,
+                    detail,
+                    Some("Disable streaming"),
+                    Some("Stop streaming and release the speaker for other apps (Ctrl+E)"),
+                )
+            }
             (Some(r), true, true) => (
                 "\u{23F5}", // ⏵ Black Medium Right-Pointing Triangle (Play)
                 p.success,
@@ -2013,7 +2077,7 @@ impl StreamToSpeakerApp {
     /// keeping the row at ~CONTROL_HEIGHT + padding.
     fn show_pinned_status(&self, ui: &mut egui::Ui, p: &Palette) {
         let enabled = self.app.is_streaming_enabled();
-        let active = self.app.stream_active.load(Ordering::Acquire);
+        let active = self.app.receiving_windows_audio();
         // Mirror every state the full banner has — "no speaker" and
         // "connecting" included — so scrolling never hides what the app
         // is doing. Only the bound states carry an Enable/Disable button.
@@ -2028,10 +2092,15 @@ impl StreamToSpeakerApp {
             match self.app.selected_speaker() {
                 None => (p.muted, None, "No speaker selected".to_string(), None),
                 Some(current) => {
+                    let dropped = enabled && self.app.selected_session_dead();
                     let (accent, status) = match (enabled, active) {
                         (false, _) => (p.danger, "Disabled"),
+                        (true, _) if dropped && self.app.is_auto_reconnect_on_drop() => {
+                            (p.warn, "Reconnecting…")
+                        }
+                        (true, _) if dropped => (p.warn, "Connection lost"),
                         (true, true) => (p.success, "Streaming"),
-                        (true, false) => (p.warn, "Idle"),
+                        (true, false) => (p.warn, "Standing by"),
                     };
                     let button = if enabled {
                         ("Disable", "Stop streaming and release the speaker (Ctrl+E)")
@@ -2129,8 +2198,8 @@ impl StreamToSpeakerApp {
     /// F-03). Auto-fades — no UI clutter when there's nothing wrong.
     fn show_error_banner(&self, ui: &mut egui::Ui, p: &Palette) {
         let Some(msg) = self.app.current_error() else { return; };
-        // The window only repaints on input: wake it when the banner is
-        // due to go away, or it would stay up until the next mouse move.
+        // Wake the window when the banner is due to go away, rather than
+        // on whichever heartbeat or input comes after it.
         if let Some(left) = self.app.error_expires_in() {
             ui.ctx().request_repaint_after(left + std::time::Duration::from_millis(50));
         }
@@ -2173,7 +2242,7 @@ impl StreamToSpeakerApp {
     fn icon_state(&self) -> IconState {
         let bound = self.app.selected_speaker().is_some();
         let enabled = self.app.is_streaming_enabled();
-        if bound && enabled && self.app.stream_active.load(Ordering::Acquire) {
+        if bound && enabled && self.app.receiving_windows_audio() && !self.app.selected_session_dead() {
             IconState::Live
         } else if bound && enabled {
             IconState::Standby
@@ -2593,15 +2662,24 @@ impl StreamToSpeakerApp {
                 });
 
             // m24: speaker-side volume slider. Hidden until a speaker is
-            // bound (without one there's nothing to control). Drag pushes
-            // upnp::set_volume on a detached thread; GENA NOTIFYs from the
-            // speaker side stream back through volume_sync so the slider
-            // stays in sync with the Sonos app / physical buttons.
+            // bound (without one there's nothing to control). Moving it
+            // queues the level for the speaker's volume thread and moves
+            // the Windows slider with it; the speaker's own changes (GENA
+            // NOTIFYs) come back through volume_sync, so the slider stays
+            // in sync with the Sonos app / physical buttons.
             if self.app.is_speaker_bound() {
                 ui.add_space(sp::S);
                 ui.separator();
                 ui.add_space(sp::S);
-                self.show_volume_row(ui, p);
+                if self.app.speaker_volume_controllable() {
+                    self.show_volume_row(ui, p);
+                } else {
+                    ui.label(
+                        egui::RichText::new("Music Assistant sets this speaker's volume.")
+                            .size(12.0)
+                            .color(p.text_secondary),
+                    );
+                }
             }
         });
     }
@@ -2795,11 +2873,10 @@ impl StreamToSpeakerApp {
                     .color(p.text_secondary),
             );
 
-            // Only push on drag-release (drag_stopped) and explicit
-            // click, not on every intermediate value while the user
-            // is still dragging — saves ~30 UPnP SOAP requests per
-            // slide and keeps the speaker side responsive.
-            if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+            // Every step of a drag goes out, as with the Windows slider:
+            // the speaker follows the pointer. A slow speaker gets the
+            // newest level next rather than every one in between.
+            if resp.changed() {
                 self.app.set_speaker_volume(level.clamp(0, 100) as u32);
             }
         });

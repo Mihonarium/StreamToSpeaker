@@ -739,6 +739,11 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         let vsync = app.vsync.clone();
         let pusher = build_driver_volume_pusher();
         let pusher = pusher.map(Arc::new);
+        // The window's volume slider moves the Windows slider through the
+        // same push.
+        if let Some(p) = pusher.clone() {
+            app.set_windows_volume_push(move |mb, muted| p.push(mb, muted));
+        }
         Arc::new(move |path: &str, body: &str| {
             debug!("GENA NOTIFY on {}: {} bytes", path, body.len());
             if let Some(change) = parse_rendering_notify(body) {
@@ -892,6 +897,7 @@ fn spawn_driver_event_consumer(app: Arc<App>, cli: &Cli) {
         return;
     }
     use stream_to_speaker::ioctl_source::{DriverEvent, IoctlAudioSource};
+    use stream_to_speaker::volume_sync::SpeakerCommand;
     thread::Builder::new()
         .name("stream-to-speaker-driver-events".to_string())
         .spawn(move || {
@@ -917,26 +923,18 @@ fn spawn_driver_event_consumer(app: Arc<App>, cli: &Cli) {
                         );
                         if let Some(level) = app.vsync.driver_changed(level) {
                             info!("windows -> speaker: volume {} (mb={})", level, level_millibels);
-                            // Dispatch to whichever session kind is active;
-                            // the ActiveSession enum hides SOAP-vs-RTSP so
-                            // UPnP, AirPlay 1 and AirPlay 2 all get it.
-                            let guard = app.session.lock().unwrap();
-                            if let Some(s) = guard.as_ref() {
-                                if let Err(e) = s.set_volume_pct(level) {
-                                    warn!("set_volume failed: {}", e);
-                                }
-                            }
+                            // Queued for whichever session kind is active
+                            // and sent from the volume thread: a speaker
+                            // round trip here would hold up the events
+                            // behind this one (and, under the session
+                            // lock, the window).
+                            app.send_to_speaker(SpeakerCommand::Volume(level));
                         }
                     }
                     DriverEvent::MuteChanged { muted } => {
                         info!("driver -> speaker: mute={}", muted);
                         app.vsync.note_muted(muted);
-                        let guard = app.session.lock().unwrap();
-                        if let Some(s) = guard.as_ref() {
-                            if let Err(e) = s.set_mute(muted) {
-                                warn!("set_mute failed: {}", e);
-                            }
-                        }
+                        app.send_to_speaker(SpeakerCommand::Mute(muted));
                     }
                     DriverEvent::StreamStart => {
                         info!("driver: stream start");

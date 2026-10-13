@@ -29,6 +29,8 @@ pub struct SilenceDetector {
     quiescent_after: u32,
     inject_noise: bool,
     rng_state: u32,
+    /// Whether the last packet processed carried sound.
+    heard_sound: bool,
 }
 
 impl SilenceDetector {
@@ -40,6 +42,7 @@ impl SilenceDetector {
             inject_noise,
             // Arbitrary non-zero seed.
             rng_state: 0x9E37_79B9,
+            heard_sound: false,
         }
     }
 
@@ -48,13 +51,22 @@ impl SilenceDetector {
         self.state
     }
 
+    /// Whether the last packet processed carried sound, judged on its own
+    /// samples before any noise went in. Unlike [`Self::state`], which
+    /// starts out Active and holds for the quiescence window, this is
+    /// false for every silent packet.
+    pub fn heard_sound(&self) -> bool {
+        self.heard_sound
+    }
+
     /// Inspect a packet and (if we're quiescent) rewrite the samples in
     /// place with low-amplitude noise. Returns the current state after the
     /// update.
     pub fn process(&mut self, pkt: &mut AudioPacket) -> SilenceState {
         let peak = peak_abs_i16(&pkt.samples);
+        self.heard_sound = peak > SILENCE_PEAK_THRESHOLD;
 
-        if peak > SILENCE_PEAK_THRESHOLD {
+        if self.heard_sound {
             // Real audio. Immediately back to Active.
             self.state = SilenceState::Active;
             self.consecutive_silent_packets = 0;
@@ -209,6 +221,20 @@ mod tests {
         assert_eq!(det.process(&mut loud), SilenceState::Active);
         // And loud samples are NOT rewritten.
         assert!(loud.samples.iter().all(|s| *s == 10_000));
+    }
+
+    #[test]
+    fn heard_sound_follows_each_packet() {
+        let mut det = SilenceDetector::new(50, true);
+        assert!(!det.heard_sound());
+        // Still Active from the start, but the packet itself was silent.
+        let mut p = silent_packet(441);
+        assert_eq!(det.process(&mut p), SilenceState::Active);
+        assert!(!det.heard_sound());
+        det.process(&mut loud_packet(441));
+        assert!(det.heard_sound());
+        det.process(&mut silent_packet(441));
+        assert!(!det.heard_sound());
     }
 
     #[test]

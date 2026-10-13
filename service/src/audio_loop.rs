@@ -108,6 +108,9 @@ pub fn run(app: Arc<App>, mut source: Box<dyn AudioSource>) -> Result<()> {
         eq.process(&mut pkt.samples);
 
         silence.process(&mut pkt);
+        if active {
+            app.note_source_packet(silence.heard_sound());
+        }
 
         // Rate-fudge: insert / drop a frame when the accumulator crosses ±1.0.
         let fudge_ppm = app.rate_fudge_ppm.load(Ordering::Relaxed);

@@ -117,7 +117,7 @@ pub struct AirPlaySession {
     current_rtptime: Arc<AtomicU32>,
     /// Last volume (0..=100) pushed to the receiver; what an unmute
     /// restores. RAOP has no separate mute, only the -144 dB sentinel.
-    volume_pct: AtomicU32,
+    volume_pct: Arc<AtomicU32>,
     /// The background threads. All of them watch `stop_flag` with
     /// bounded wakeups, so `stop()` just sets the flag and joins.
     threads: Vec<JoinHandle<()>>,
@@ -507,7 +507,7 @@ impl AirPlaySession {
             dead,
             resend_stats,
             current_rtptime,
-            volume_pct: AtomicU32::new(cfg.initial_volume.unwrap_or(100)),
+            volume_pct: Arc::new(AtomicU32::new(cfg.initial_volume.unwrap_or(100))),
             threads: guard.into_threads(),
             _audio_socket: audio_socket,
         })
@@ -538,20 +538,31 @@ impl AirPlaySession {
         self.resend_stats.snapshot()
     }
 
+    /// The level (0..=100) last set on the receiver, at first the one
+    /// the session started it at.
+    pub fn volume_pct(&self) -> u32 {
+        self.volume_pct.load(Ordering::Relaxed)
+    }
+
     /// Push a new volume value (0..=100) to the receiver. Idempotent
     /// across repeats; receivers throttle their own UI updates.
     pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
-        self.volume_pct.store(vol.min(100), Ordering::Relaxed);
-        let db = volume_pct_to_raop_db(vol);
-        self.rtsp.lock().unwrap().set_volume(db)
+        self.volume_control().set_volume_pct(vol)
     }
 
-    /// Push a mute state. RAOP doesn't have a separate mute parameter,
-    /// just the sentinel -144 dB "off" volume; an unmute restores the
-    /// last level rather than jumping to full volume.
+    /// Push a mute state. See [`VolumeHandle::set_mute`].
     pub fn set_mute(&self, muted: bool) -> Result<()> {
-        let db = mute_db(muted, self.volume_pct.load(Ordering::Relaxed));
-        self.rtsp.lock().unwrap().set_volume(db)
+        self.volume_control().set_mute(muted)
+    }
+
+    /// A detachable handle for volume and mute, like
+    /// [`Self::metadata_handle`]: the send touches only the RTSP mutex, so
+    /// the caller can make it after releasing the session lock.
+    pub fn volume_control(&self) -> VolumeHandle {
+        VolumeHandle {
+            rtsp: self.rtsp.clone(),
+            volume_pct: self.volume_pct.clone(),
+        }
     }
 
     /// Tear down: stop the background threads, TEARDOWN RTSP, close
@@ -593,6 +604,30 @@ impl MetadataHandle {
         let body = crate::airplay::dmap::now_playing_body(title, artist, album);
         let rtptime = self.current_rtptime.load(Ordering::Acquire);
         self.rtsp.lock().unwrap().set_metadata(&body, rtptime)
+    }
+}
+
+/// Volume and mute for one RAOP session; see
+/// [`AirPlaySession::volume_control`].
+#[derive(Clone)]
+pub struct VolumeHandle {
+    rtsp: Arc<Mutex<RtspClient>>,
+    volume_pct: Arc<AtomicU32>,
+}
+
+impl VolumeHandle {
+    pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
+        self.volume_pct.store(vol.min(100), Ordering::Relaxed);
+        let db = volume_pct_to_raop_db(vol);
+        self.rtsp.lock().unwrap().set_volume(db)
+    }
+
+    /// Push a mute state. RAOP doesn't have a separate mute parameter,
+    /// just the sentinel -144 dB "off" volume; an unmute restores the
+    /// last level rather than jumping to full volume.
+    pub fn set_mute(&self, muted: bool) -> Result<()> {
+        let db = mute_db(muted, self.volume_pct.load(Ordering::Relaxed));
+        self.rtsp.lock().unwrap().set_volume(db)
     }
 }
 
