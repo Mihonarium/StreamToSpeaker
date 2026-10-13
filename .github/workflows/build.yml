@@ -558,8 +558,8 @@ jobs:
             installer/out/StreamToSpeakerSetup-*.driver.json
           if-no-files-found: error
           retention-days: 30
-          # Artifacts of earlier attempts stay on the run: a re-run of this
-          # job replaces them instead of failing on the name.
+          # Artifacts of earlier attempts stay on the run; without overwrite a
+          # re-run of this job would add a second artifact of the same name.
           overwrite: true
 
       - name: Upload raw driver + service binaries
