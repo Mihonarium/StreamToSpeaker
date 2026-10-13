@@ -382,8 +382,12 @@ jobs:
           restore-keys: |
             wdk-${{ env.WDK_INSTALLER_URL }}-v2-
 
+      # Only when nothing was restored. A restore-key match is a tree from
+      # the same WDK installer (its URL is part of every key), as
+      # driver-submission.yml relies on too; running the installer over it
+      # again only adds a way to fail.
       - name: Install WDK (cache miss)
-        if: steps.cache-wdk.outputs.cache-hit != 'true'
+        if: steps.cache-wdk.outputs.cache-hit != 'true' && steps.cache-wdk.outputs.cache-matched-key == ''
         shell: pwsh
         run: |
           $installer = Join-Path $env:RUNNER_TEMP "wdksetup.exe"
