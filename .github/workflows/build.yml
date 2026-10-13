@@ -558,11 +558,15 @@ jobs:
             installer/out/StreamToSpeakerSetup-*.driver.json
           if-no-files-found: error
           retention-days: 30
+          # Artifacts of earlier attempts stay on the run: a re-run of this
+          # job replaces them instead of failing on the name.
+          overwrite: true
 
       - name: Upload raw driver + service binaries
         uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ steps.ver.outputs.version }}
+          overwrite: true
           path: |
             driver-cache/StreamToSpeaker.sys
             driver-cache/StreamToSpeaker.inf
