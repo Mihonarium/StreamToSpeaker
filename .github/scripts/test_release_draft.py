@@ -69,6 +69,11 @@ class FakeGh:
             sha = args[1].rsplit("/", 1)[1]
             commit = next(t[2] for t in self.tags.values() if isinstance(t, tuple) and t[1] == sha)
             return json.dumps({"object": {"type": "commit", "sha": commit}})
+        if args[:3] == ("api", "--method", "DELETE"):
+            aid = int(args[3].rsplit("/", 1)[1])
+            for r in self.releases:
+                r["assets"] = [a for a in r["assets"] if a["id"] != aid]
+            return ""
         if args[:3] == ("api", "--method", "PATCH"):
             rid = int(args[3].rsplit("/", 1)[1])
             rel = next(r for r in self.releases if r["id"] == rid)
@@ -88,6 +93,11 @@ def bundle_for(data, name):
                        "verificationMaterial": {},
                        "dsseEnvelope": {"payload": base64.b64encode(json.dumps(statement).encode()).decode(),
                                         "payloadType": "application/vnd.in-toto+json", "signatures": []}}).encode()
+
+
+def signed_hashes(files, installer=INSTALLER):
+    """What sign-service and sign-release report for the exes in `files`."""
+    return hashlib.sha256(files[SERVICE]).hexdigest(), hashlib.sha256(files[installer]).hexdigest()
 
 
 def complete_files(installer=INSTALLER, provenance=True):
@@ -156,6 +166,31 @@ class FindingTheDraft(unittest.TestCase):
             rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
         self.assertFalse(self.creates(gh))
 
+    def test_ensure_refuses_an_existing_draft_when_the_tag_moved(self):
+        # A run whose tag has since been moved to another commit must not
+        # take over the draft of the commit the tag points at now.
+        for tags in ({"v0.1.11": OTHER}, {}):
+            gh = FakeGh([release("v0.1.11", rid=5)], tags=tags)
+            with self.assertRaises(rd.ReleaseError):
+                rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+            self.assertFalse(self.creates(gh))
+        gh = FakeGh([release("v0.1.11", rid=5)])
+        rel, created = rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+        self.assertEqual((rel["id"], created), (5, False))
+        self.assertTrue([c for c in gh.calls if c[0] == "api" and "/git/ref/tags/v0.1.11" in c[1]])
+
+    def test_require_with_a_commit_checks_the_tag(self):
+        gh = FakeGh([release("v0.1.11", rid=5)])
+        self.assertEqual(rd.require_draft(REPO, "v0.1.11", gh, commit=COMMIT)["id"], 5)
+        gh = FakeGh([release("v0.1.11", rid=5)], tags={"v0.1.11": OTHER})
+        with self.assertRaisesRegex(rd.ReleaseError, "points at"):
+            rd.require_draft(REPO, "v0.1.11", gh, commit=COMMIT)
+        gh = FakeGh([release("v0.1.11", rid=5)], tags={})
+        with self.assertRaisesRegex(rd.ReleaseError, "404"):
+            rd.require_draft(REPO, "v0.1.11", gh, commit=COMMIT)
+        with self.assertRaisesRegex(rd.ReleaseError, "full commit sha"):
+            rd.require_draft(REPO, "v0.1.11", FakeGh([release("v0.1.11", rid=5)]), commit="")
+
     def test_ensure_with_a_target_for_a_tag_that_does_not_exist_yet(self):
         gh = FakeGh([], tags={})
         rd.ensure_draft(REPO, "v0.0.0-x", target=COMMIT, run=gh, sleep=lambda s: None)
@@ -215,6 +250,63 @@ class ExpectedAssets(unittest.TestCase):
         self.assertTrue(any(p.startswith("empty:") for p in problems))
 
 
+class Versions(unittest.TestCase):
+    def test_order(self):
+        order = ["v0.1.9", "v0.1.10", "v0.1.11-rc.1", "v0.1.11-rc.2", "v0.1.11-rc.10", "v0.1.11", "v0.2.0", "v1.0.0"]
+        self.assertEqual(sorted(reversed(order), key=rd.version_key), order)
+        self.assertEqual(rd.version_key("v0.1.11+build.5"), rd.version_key("v0.1.11"))
+        for bad in ("driver-v1.1.1.211", "v1.2", "main", None):
+            self.assertIsNone(rd.version_key(bad))
+
+    def test_newer_releases(self):
+        rels = [release("v0.1.12", rid=1, draft=False), release("v0.1.10", rid=2, draft=False),
+                release("v0.2.0", rid=3), release("driver-v1.1.1.211", rid=4, draft=False)]
+        rels.append(dict(release("v0.3.0", rid=5, draft=False), prerelease=True))
+        # Drafts, pre-releases and other tags never count.
+        self.assertEqual(rd.newer_releases(rels, "v0.1.11"), ["v0.1.12"])
+        self.assertEqual(rd.newer_releases(rels, "v0.1.13"), [])
+        self.assertEqual(rd.newer_releases(rels, "v0.1.12"), [])
+        rels.append(release("v0.1.20", rid=6, draft=False))
+        self.assertEqual(rd.newer_releases(rels, "v0.1.11"), ["v0.1.12", "v0.1.20"])
+
+
+class StaleAssets(unittest.TestCase):
+    TESTSIGNED = f"StreamToSpeakerSetup-{V}-testsigned.exe"
+
+    def test_a_testsigned_attempt_left_on_a_draft(self):
+        names = sorted(set(complete_files()) | set(complete_files(self.TESTSIGNED)))
+        stale = rd.stale_setup_assets(release("v0.1.11", names=names), V, INSTALLER, True)
+        self.assertEqual(sorted(a["name"] for a in stale),
+                         sorted(n for n in names if n.startswith(self.TESTSIGNED)))
+
+    def test_alias_of_an_earlier_attempt_goes_for_a_testsigned_release(self):
+        names = sorted(set(complete_files()) | set(complete_files(self.TESTSIGNED)))
+        stale = rd.stale_setup_assets(release("v0.1.11", names=names), V, self.TESTSIGNED, True)
+        self.assertEqual(sorted(a["name"] for a in stale),
+                         sorted([INSTALLER, INSTALLER + ".sha256", INSTALLER + ".sigstore.json",
+                                 rd.ALIAS, rd.ALIAS + ".sha256"]))
+
+    def test_other_assets_are_left_alone(self):
+        names = sorted(complete_files()) + ["notes.txt", "StreamToSpeakerSetup-0.1.10.exe",
+                                             f"stream-to-speaker-{V}-old.exe"]
+        self.assertEqual(rd.stale_setup_assets(release("v0.1.11", names=names), V, INSTALLER, True), [])
+
+    def test_prune_deletes_them_from_the_draft_of_this_commit_only(self):
+        names = sorted(set(complete_files()) | set(complete_files(self.TESTSIGNED)))
+        gh = FakeGh([release("v0.1.11", rid=2, names=names)])
+        rel, removed = rd.prune(REPO, "v0.1.11", COMMIT, V, INSTALLER, True, gh)
+        self.assertEqual(len(removed), 3)
+        self.assertEqual(sorted(a["name"] for a in gh.releases[0]["assets"]), sorted(complete_files()))
+        gh = FakeGh([release("v0.1.11", rid=2, names=names)], tags={"v0.1.11": OTHER})
+        with self.assertRaisesRegex(rd.ReleaseError, "points at"):
+            rd.prune(REPO, "v0.1.11", COMMIT, V, INSTALLER, True, gh)
+        self.assertFalse([c for c in gh.calls if c[:3] == ("api", "--method", "DELETE")])
+        gh = FakeGh([release("v0.1.11", rid=2, draft=False, names=names)])
+        with self.assertRaisesRegex(rd.ReleaseError, "already a published release"):
+            rd.prune(REPO, "v0.1.11", COMMIT, V, INSTALLER, True, gh)
+        self.assertFalse([c for c in gh.calls if c[:3] == ("api", "--method", "DELETE")])
+
+
 class Check(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -227,29 +319,33 @@ class Check(unittest.TestCase):
         return FakeGh([release("v0.1.10", rid=1, draft=False),
                        release("v0.1.11", rid=2, names=sorted(set(files) | set(extra_names)))], files)
 
+    def check(self, files, directory=None, installer=INSTALLER, provenance=True, tag="v0.1.11", gh=None,
+              hashes=None):
+        gh = gh or self.gh_for(files)
+        hashes = hashes or signed_hashes(files, installer)
+        return rd.check(REPO, tag, V, installer, provenance, directory or self.dir, *hashes, run=gh)
+
     def test_complete_draft_passes(self):
-        gh = self.gh_for(complete_files())
-        rel, digests = rd.check(REPO, "v0.1.11", V, INSTALLER, True, self.dir, gh)
+        rel, digests = self.check(complete_files())
         self.assertEqual(rel["id"], 2)
         self.assertEqual(set(digests), {SERVICE, INSTALLER, rd.ALIAS})
 
     def test_testsigned_draft_without_provenance_passes(self):
         installer = f"StreamToSpeakerSetup-{V}-testsigned.exe"
-        gh = self.gh_for(complete_files(installer, provenance=False))
-        rd.check(REPO, "v0.1.11", V, installer, False, self.dir, gh)
+        self.check(complete_files(installer, provenance=False), installer=installer, provenance=False)
 
     def test_incomplete_or_extra_assets_fail_before_downloading(self):
         files = complete_files()
         del files[rd.ALIAS + ".sha256"]
         gh = self.gh_for(files, extra_names=[f"StreamToSpeakerSetup-{V}-unsigned.exe"])
         with self.assertRaisesRegex(rd.ReleaseError, "not complete"):
-            rd.check(REPO, "v0.1.11", V, INSTALLER, True, self.dir, gh)
+            self.check(files, gh=gh, hashes=("0" * 64, "0" * 64))
         self.assertFalse([c for c in gh.calls if c[:2] == ("release", "download")])
 
-    def check_fails(self, files, pattern):
+    def check_fails(self, files, pattern, hashes=None):
         directory = tempfile.mkdtemp(dir=self.tmp)
         with self.assertRaisesRegex(rd.ReleaseError, pattern):
-            rd.check(REPO, "v0.1.11", V, INSTALLER, True, directory, self.gh_for(files))
+            self.check(files, directory, hashes=hashes)
 
     def test_wrong_sidecar_fails(self):
         files = complete_files()
@@ -277,28 +373,47 @@ class Check(unittest.TestCase):
         files[INSTALLER + ".sigstore.json"] = b"not json"
         self.check_fails(files, "cannot be read as a provenance bundle")
 
+    def test_exes_must_be_what_this_run_signed(self):
+        # A complete, consistent set that another run (or anyone with write
+        # access) put on the draft is refused.
+        mine = complete_files()
+        for name, data in ((SERVICE, b"another run's service exe"), (INSTALLER, b"another run's setup exe")):
+            files = complete_files()
+            files[name] = data
+            files[name + ".sha256"] = f"{hashlib.sha256(data).hexdigest()}  {name}".encode()
+            files[name + ".sigstore.json"] = bundle_for(data, name)
+            if name == INSTALLER:
+                files[rd.ALIAS] = data
+                files[rd.ALIAS + ".sha256"] = f"{hashlib.sha256(data).hexdigest()}  {rd.ALIAS}".encode()
+            self.check_fails(files, f"{name} is not the file this run signed", hashes=signed_hashes(mine))
+
+    def test_signed_hashes_are_required(self):
+        for hashes in (("", "0" * 64), ("0" * 64, "abc")):
+            with self.assertRaisesRegex(rd.ReleaseError, "sha256 of the service exe"):
+                self.check(complete_files(), hashes=hashes)
+
     def test_downloaded_set_must_match(self):
         files = complete_files()
         gh = self.gh_for(files)
         gh.files = dict(files, **{"extra.txt": b"x"})
         with self.assertRaisesRegex(rd.ReleaseError, "unexpected file: extra.txt"):
-            rd.check(REPO, "v0.1.11", V, INSTALLER, True, self.dir, gh)
+            self.check(files, gh=gh)
 
     def test_target_directory_must_be_empty(self):
         os.makedirs(self.dir)
         with open(os.path.join(self.dir, "leftover"), "w") as fh:
             fh.write("x")
         with self.assertRaisesRegex(rd.ReleaseError, "not empty"):
-            rd.check(REPO, "v0.1.11", V, INSTALLER, True, self.dir, self.gh_for(complete_files()))
+            self.check(complete_files())
 
     def test_version_must_be_the_tags(self):
         with self.assertRaisesRegex(rd.ReleaseError, "not the version of the tag"):
-            rd.check(REPO, "v0.1.12", V, INSTALLER, True, self.dir, self.gh_for(complete_files()))
+            self.check(complete_files(), tag="v0.1.12")
 
     def test_published_release_is_not_checked(self):
         gh = FakeGh([release("v0.1.11", rid=2, draft=False, names=sorted(complete_files()))], complete_files())
         with self.assertRaisesRegex(rd.ReleaseError, "already a published release"):
-            rd.check(REPO, "v0.1.11", V, INSTALLER, True, self.dir, gh)
+            self.check(complete_files(), gh=gh)
 
 
 class Publish(unittest.TestCase):
@@ -309,7 +424,8 @@ class Publish(unittest.TestCase):
         if ids is None:
             rel = next(r for r in gh.releases if r["id"] == int(release_id))
             ids = rd.asset_ids(rel, rd.expected_assets(V, installer, True))
-        return rd.publish(REPO, "v0.1.11", release_id, ids, commit, version, installer, True, gh)
+        result, newer = rd.publish(REPO, "v0.1.11", release_id, ids, commit, version, installer, True, gh)
+        return result
 
     def patched(self, gh):
         return [c for c in gh.calls if c[:3] == ("api", "--method", "PATCH")]
@@ -322,6 +438,23 @@ class Publish(unittest.TestCase):
         self.assertIn("draft=false", patch)
         self.assertIn("prerelease=false", patch)
         self.assertIn("make_latest=true", patch)
+
+    def test_older_release_published_later_is_not_made_latest(self):
+        # v0.1.12 went out while v0.1.11's chain waited: publishing v0.1.11
+        # must leave releases/latest (and the stable link) on v0.1.12.
+        gh = FakeGh([release("v0.1.12", rid=1, draft=False), release("v0.1.11", rid=2, names=self.names)])
+        self.publish(gh)
+        patch = self.patched(gh)[0]
+        self.assertIn("draft=false", patch)
+        self.assertIn("prerelease=false", patch)
+        self.assertIn("make_latest=false", patch)
+        # An older published release, a newer draft or a newer pre-release
+        # does not stop it from becoming latest.
+        newer_pre = dict(release("v0.2.0", rid=4, draft=False), prerelease=True)
+        gh = FakeGh([release("v0.1.10", rid=1, draft=False), release("v0.1.12", rid=3), newer_pre,
+                     release("v0.1.11", rid=2, names=self.names)])
+        self.publish(gh)
+        self.assertIn("make_latest=true", self.patched(gh)[0])
 
     def test_testsigned_fallback_is_a_prerelease_never_latest(self):
         installer = f"StreamToSpeakerSetup-{V}-testsigned.exe"
@@ -409,6 +542,10 @@ class Cli(unittest.TestCase):
 
     def test_missing_arguments(self):
         self.assertEqual(rd.main(["check", "v0.1.11", "--repo", REPO]), 1)
+        self.assertEqual(rd.main(["check", "v0.1.11", "--repo", REPO, "--version", V, "--installer", INSTALLER,
+                                  "--dir", "d"]), 1)  # no signed hashes
+        self.assertEqual(rd.main(["require", "v0.1.11", "--repo", REPO]), 1)  # no --commit
+        self.assertEqual(rd.main(["prune", "v0.1.11", "--repo", REPO, "--commit", COMMIT]), 1)
         self.assertEqual(rd.main(["publish", "v0.1.11", "--repo", REPO, "--version", V]), 1)
         self.assertEqual(rd.main(["publish", "v0.1.11", "--repo", REPO, "--version", V, "--installer", INSTALLER,
                                   "--release-id", "2", "--asset-ids", "1,2"]), 1)  # no --commit

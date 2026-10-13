@@ -684,10 +684,20 @@ jobs:
       actions: read              # gh run download of the unsigned-exe artifact
       id-token: write            # build-provenance attestation (public repo only)
       attestations: write
+    outputs:
+      # The signed bytes of this run: package and publish accept only
+      # this exe from the draft.
+      signed_sha256: ${{ steps.sign.outputs.signed-sha256 }}
+    # The release jobs' scripts read values from the environment
+    # (GITHUB_REF_NAME, GITHUB_SHA, GITHUB_REPOSITORY and the variables
+    # set here), never from expressions spliced into the script text.
     env:
       GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.build.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:
@@ -699,17 +709,18 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $tag = "${{ github.ref_name }}"
-          if ($tag -cne "v${{ needs.build.outputs.version }}") { throw "version ${{ needs.build.outputs.version }} is not the version of the tag $tag" }
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -cne "v$env:VERSION") { throw "the build job's version is not the version of the tag $tag" }
           python .github/scripts/test_release_draft.py -b
           if ($LASTEXITCODE -ne 0) { throw "release_draft.py unit tests failed" }
-          $name = "stream-to-speaker-${{ needs.build.outputs.version }}.exe"
+          $name = "stream-to-speaker-$env:VERSION.exe"
           Copy-Item "release-inputs\service\target\release\stream-to-speaker.exe" $name
           $sha = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
           # A draft until `publish`; refuses a tag whose release is already
           # published (a published release is never modified) and a tag that
-          # no longer points at this run's commit.
-          python .github/scripts/release_draft.py ensure $tag --repo "${{ github.repository }}" --commit "${{ github.sha }}"
+          # no longer points at this run's commit, also when the draft
+          # already exists.
+          python .github/scripts/release_draft.py ensure $tag --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
           if ($LASTEXITCODE -ne 0) { throw "could not create or find the draft release for $tag (see above)" }
           "name=$name" >> $env:GITHUB_OUTPUT
           "sha=$sha" >> $env:GITHUB_OUTPUT
@@ -725,6 +736,7 @@ jobs:
           if-no-files-found: error
           # Read by the signing repo once the request is approved; one day,
           # the minimum, is enough (a re-run of this job uploads it again).
+          # The cleanup job deletes it once the exe is signed.
           retention-days: 1
           # A re-run of this job replaces the earlier attempt's artifact.
           overwrite: true
@@ -742,14 +754,16 @@ jobs:
 
       - name: Upload the signed exe to the draft release
         shell: pwsh
+        env:
+          SIGNED: ${{ steps.sign.outputs.signed-path }}
+          SIGNED_SHA256: ${{ steps.sign.outputs.signed-sha256 }}
         run: |
           $ErrorActionPreference = "Stop"
-          python .github/scripts/release_draft.py require "${{ github.ref_name }}" --repo "${{ github.repository }}"
-          if ($LASTEXITCODE -ne 0) { throw "no draft release to upload to (see above)" }
-          $signed = "${{ steps.sign.outputs.signed-path }}"
-          "${{ steps.sign.outputs.signed-sha256 }}  $(Split-Path $signed -Leaf)" |
-              Set-Content -Path "$signed.sha256" -Encoding ascii -NoNewline
-          gh release upload "${{ github.ref_name }}" $signed "$signed.sha256" --clobber
+          python .github/scripts/release_draft.py require $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "no draft release of this commit to upload to (see above)" }
+          "$env:SIGNED_SHA256  $(Split-Path $env:SIGNED -Leaf)" |
+              Set-Content -Path "$env:SIGNED.sha256" -Encoding ascii -NoNewline
+          gh release upload $env:GITHUB_REF_NAME $env:SIGNED "$env:SIGNED.sha256" --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
 
       # Provenance for the exact bytes users download (post-signing, so the
@@ -768,13 +782,16 @@ jobs:
       - name: Upload the attestation bundle to the draft release
         if: ${{ !github.event.repository.private }}
         shell: pwsh
+        env:
+          SIGNED: ${{ steps.sign.outputs.signed-path }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
           $ErrorActionPreference = "Stop"
-          python .github/scripts/release_draft.py require "${{ github.ref_name }}" --repo "${{ github.repository }}"
-          if ($LASTEXITCODE -ne 0) { throw "no draft release to upload to (see above)" }
-          $bundle = "$(Split-Path "${{ steps.sign.outputs.signed-path }}" -Leaf).sigstore.json"
-          Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
-          gh release upload "${{ github.ref_name }}" $bundle --clobber
+          python .github/scripts/release_draft.py require $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "no draft release of this commit to upload to (see above)" }
+          $bundle = "$(Split-Path $env:SIGNED -Leaf).sigstore.json"
+          Copy-Item -LiteralPath $env:BUNDLE_PATH $bundle
+          gh release upload $env:GITHUB_REF_NAME $bundle --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
 
   # Build the RELEASE installer: EV-signed service exe + the
@@ -801,8 +818,14 @@ jobs:
       installer_sha256: ${{ steps.iscc.outputs.sha256 }}
     env:
       GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.build.outputs.version }}
+      VIVERSION: ${{ needs.build.outputs.viversion }}
+      SOURCE_HASH: ${{ needs.build.outputs.source_hash }}
+      SERVICE_SHA256: ${{ needs.sign-service.outputs.signed_sha256 }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:
@@ -817,21 +840,26 @@ jobs:
         id: attested
         shell: pwsh
         run: |
-          .github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ needs.build.outputs.source_hash }}" -OutDir attested-driver
+          .github/scripts/Get-AttestedDriver.ps1 -SourceHash $env:SOURCE_HASH -OutDir attested-driver
 
+      # The service exe on the draft must be exactly the one sign-service
+      # signed in this run, not one another run uploaded since.
       - name: Download the EV-signed service exe from the draft release
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python .github/scripts/release_draft.py require "${{ github.ref_name }}" --repo "${{ github.repository }}"
-          if ($LASTEXITCODE -ne 0) { throw "no draft release for ${{ github.ref_name }} (see above)" }
-          $name = "stream-to-speaker-${{ needs.build.outputs.version }}.exe"
+          python .github/scripts/release_draft.py require $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "no draft release of this commit (see above)" }
+          $name = "stream-to-speaker-$env:VERSION.exe"
           New-Item -ItemType Directory -Force -Path svc | Out-Null
-          gh release download "${{ github.ref_name }}" --pattern $name --dir svc
+          gh release download $env:GITHUB_REF_NAME --pattern $name --dir svc
           if ($LASTEXITCODE -ne 0) { throw "gh release download of $name failed" }
           $exe = @(Get-ChildItem svc -Filter $name)
           if ($exe.Count -ne 1) { throw "expected $name on the draft release, found $($exe.Count)" }
           $svcExe = $exe[0].FullName
+          $got = (Get-FileHash -LiteralPath $svcExe -Algorithm SHA256).Hash.ToLower()
+          if ($env:SERVICE_SHA256 -notmatch '^[0-9a-f]{64}$') { throw "sign-service reported no signed sha256" }
+          if ($got -ne $env:SERVICE_SHA256) { throw "$name on the draft release (sha256 $got) is not the exe sign-service signed in this run (sha256 $env:SERVICE_SHA256)" }
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
               Where-Object { $_.FullName -match '\\x64\\' } |
               Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
@@ -841,22 +869,29 @@ jobs:
       - name: Stage + build release installer
         id: iscc
         shell: pwsh
+        env:
+          FOUND: ${{ steps.attested.outputs.found }}
+          KIND: ${{ steps.attested.outputs.kind }}
+          DRIVER_TAG: ${{ steps.attested.outputs.tag }}
+          DRIVER_VERSION: ${{ steps.attested.outputs.version }}
+          DRIVER_BUILD: ${{ steps.attested.outputs.build }}
+          DRIVER_ZIP: ${{ steps.attested.outputs.zip }}
         run: |
           $ErrorActionPreference = "Stop"
           $staging = "installer\staging"
           if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
           New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "svc\stream-to-speaker-${{ needs.build.outputs.version }}.exe" "$staging\stream-to-speaker.exe"
+          Copy-Item "svc\stream-to-speaker-$env:VERSION.exe" "$staging\stream-to-speaker.exe"
 
           $dc = "release-inputs\driver-cache"
           $suffix = ""
-          if ("${{ steps.attested.outputs.found }}" -eq "true") {
+          if ($env:FOUND -eq "true") {
               foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat") {
                   Copy-Item "attested-driver\$name" "$staging\$name" -Force
               }
               Copy-Item "$dc\devcon.exe" "$staging\devcon.exe" -Force
-              Write-Host "Bundling Microsoft-signed (${{ steps.attested.outputs.kind }}) driver ${{ steps.attested.outputs.version }} (${{ steps.attested.outputs.tag }}); no test certificate shipped."
-          } elseif ("${{ steps.attested.outputs.found }}" -eq "false") {
+              Write-Host "Bundling Microsoft-signed ($env:KIND) driver $env:DRIVER_VERSION ($env:DRIVER_TAG); no test certificate shipped."
+          } elseif ($env:FOUND -eq "false") {
               foreach ($name in "StreamToSpeaker.sys", "StreamToSpeaker.inf", "StreamToSpeaker.cat", "StreamToSpeaker.cer", "devcon.exe") {
                   Copy-Item "$dc\$name" "$staging\$name" -Force
               }
@@ -864,15 +899,15 @@ jobs:
               Write-Host "##[warning]No Microsoft-signed driver matches this tag's driver source - shipping the TEST-SIGNED driver (users need testsigning mode); the release will be published as a pre-release, not as the latest release. Run an HLK round (Driver certified) or the driver submission + attestation flow (docs/driver-signing.md), then tag again."
               Write-Host "##[warning]Driver reproducibility gate SKIPPED: the bundled test-signed driver is CI's own build of this tag's driver source (the build job or its driver cache); there is no Microsoft-signed package to compare."
           } else {
-              throw "the driver lookup gave no answer (found='${{ steps.attested.outputs.found }}')"
+              throw "the driver lookup gave no answer (found='$env:FOUND')"
           }
 
-          $base = "StreamToSpeakerSetup-${{ needs.build.outputs.version }}$suffix"
+          $base = "StreamToSpeakerSetup-$env:VERSION$suffix"
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "ISCC not at $iscc" }
           & $iscc `
-            "/DAppVersion=${{ needs.build.outputs.version }}" `
-            "/DVersionInfoVersion=${{ needs.build.outputs.viversion }}" `
+            "/DAppVersion=$env:VERSION" `
+            "/DVersionInfoVersion=$env:VIVERSION" `
             "/F$base" `
             "installer\StreamToSpeaker.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
@@ -881,14 +916,14 @@ jobs:
           "exe=$exe" >> $env:GITHUB_OUTPUT
           "name=$base.exe" >> $env:GITHUB_OUTPUT
           "sha256=$sha" >> $env:GITHUB_OUTPUT
-          if ("${{ steps.attested.outputs.found }}" -eq "true") {
+          if ($env:FOUND -eq "true") {
               .github/scripts/Write-DriverRecord.ps1 -StagingDir $staging -OutDir installer\out -Installer "$base.exe" `
-                -Kind "${{ steps.attested.outputs.kind }}" -SourceHash "${{ needs.build.outputs.source_hash }}" `
-                -Tag "${{ steps.attested.outputs.tag }}" -Version "${{ steps.attested.outputs.version }}" `
-                -Build "${{ steps.attested.outputs.build }}" -Zip "${{ steps.attested.outputs.zip }}"
+                -Kind $env:KIND -SourceHash $env:SOURCE_HASH `
+                -Tag $env:DRIVER_TAG -Version $env:DRIVER_VERSION `
+                -Build $env:DRIVER_BUILD -Zip $env:DRIVER_ZIP
           } else {
               .github/scripts/Write-DriverRecord.ps1 -StagingDir $staging -OutDir installer\out -Installer "$base.exe" `
-                -Kind test-signed -SourceHash "${{ needs.build.outputs.source_hash }}"
+                -Kind test-signed -SourceHash $env:SOURCE_HASH
           }
           # The Microsoft-signed driver package is deliberately not a
           # release asset either. It ships inside the installer; publishing
@@ -903,8 +938,8 @@ jobs:
             "| | |"
             "| --- | --- |"
             "| Installer | ``$base.exe`` (unsigned, workflow artifact ``unsigned-setup-exe``, sha256 ``$sha``) |"
-            "| Driver | $( if ("${{ steps.attested.outputs.found }}" -eq "true") { "Microsoft-signed (${{ steps.attested.outputs.kind }}) ``${{ steps.attested.outputs.version }}`` (``${{ steps.attested.outputs.tag }}``)" } else { "**test-signed fallback** - requires testsigning mode; published as a pre-release, not as the latest release" } ) |"
-            "| Reproducibility gate | $( if ("${{ steps.attested.outputs.found }}" -eq "true") { "verify-driver job" } else { "**skipped** (no Microsoft-signed package to compare)" } ) |"
+            "| Driver | $( if ($env:FOUND -eq "true") { "Microsoft-signed ($env:KIND) ``$env:DRIVER_VERSION`` (``$env:DRIVER_TAG``)" } else { "**test-signed fallback** - requires testsigning mode; published as a pre-release, not as the latest release" } ) |"
+            "| Reproducibility gate | $( if ($env:FOUND -eq "true") { "verify-driver job" } else { "**skipped** (no Microsoft-signed package to compare)" } ) |"
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       # The unsigned installer travels to the release gate and the signing
@@ -916,7 +951,8 @@ jobs:
           path: ${{ steps.iscc.outputs.exe }}
           if-no-files-found: error
           # Read by verify-driver, sign-release and the signing repo once the
-          # request is approved: one day, the minimum.
+          # request is approved: one day, the minimum. The cleanup job
+          # deletes it once the installer is signed.
           retention-days: 1
           # A re-run of this job builds and replaces it (new sha256, which
           # the jobs after it follow).
@@ -930,7 +966,8 @@ jobs:
   # installer artifact `package` uploaded (exact name and sha256) and check
   # its driver files are that Signed.zip byte for byte with no test
   # certificate. Read-only, no secrets. Called this way the check requires
-  # every input below to be non-empty and reports verified / driver_tag /
+  # every input below except `commit` to be non-empty (an empty `commit`
+  # means the caller's commit) and reports verified / driver_tag /
   # installer_sha256, which sign-release binds to. Skipped only for the
   # test-signed fallback, whose driver is CI's own build of this tag's
   # driver source (the build job, or its cache keyed on the driver source
@@ -976,27 +1013,41 @@ jobs:
       actions: read              # gh run download of the unsigned-exe artifact
       id-token: write            # build-provenance attestation (public repo only)
       attestations: write
+    outputs:
+      # The signed bytes of this run: publish accepts only this setup exe
+      # (and alias) from the draft.
+      signed_sha256: ${{ steps.sign.outputs.signed-sha256 }}
     env:
       GH_TOKEN: ${{ github.token }}
+      INSTALLER_NAME: ${{ needs.package.outputs.installer_name }}
+      INSTALLER_SHA256: ${{ needs.package.outputs.installer_sha256 }}
+      DRIVER_FOUND: ${{ needs.package.outputs.driver_found }}
+      PROVENANCE: ${{ !github.event.repository.private }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Check what is about to be signed
         id: asset
         shell: pwsh
+        env:
+          GATE_DRIVER_TAG: ${{ needs.verify-driver.outputs.driver_tag }}
+          GATE_SHA256: ${{ needs.verify-driver.outputs.installer_sha256 }}
         run: |
           $ErrorActionPreference = "Stop"
-          $name = "${{ needs.package.outputs.installer_name }}"
-          if ($name -notmatch '^StreamToSpeakerSetup-[0-9A-Za-z.+-]+\.exe$') { throw "package reported no installer name" }
-          if ("${{ needs.package.outputs.installer_sha256 }}" -notmatch '^[0-9a-f]{64}$') { throw "package reported no installer sha256" }
-          if ("${{ needs.package.outputs.driver_found }}" -ne "true") {
+          $name = $env:INSTALLER_NAME
+          if ($name -cnotmatch '^StreamToSpeakerSetup-[0-9A-Za-z.+-]+\.exe\z') { throw "package reported no installer name" }
+          if ($env:INSTALLER_SHA256 -cnotmatch '^[0-9a-f]{64}\z') { throw "package reported no installer sha256" }
+          if ($env:DRIVER_FOUND -ne "true") {
               Write-Host "##[warning]Signing a TEST-SIGNED fallback installer; the driver reproducibility gate was skipped."
           } else {
-              Write-Host "Release gate: ${{ needs.verify-driver.outputs.driver_tag }} verified against $name (sha256 ${{ needs.verify-driver.outputs.installer_sha256 }})"
+              Write-Host "Release gate: $env:GATE_DRIVER_TAG verified against $name (sha256 $env:GATE_SHA256)"
           }
-          # Before asking for an approval: the draft must still be there.
-          python .github/scripts/release_draft.py require "${{ github.ref_name }}" --repo "${{ github.repository }}"
-          if ($LASTEXITCODE -ne 0) { throw "no draft release for ${{ github.ref_name }} (see above)" }
+          # Before asking for an approval: the draft must still be there,
+          # and the tag must still point at this run's commit.
+          python .github/scripts/release_draft.py require $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "no draft release of this commit (see above)" }
           "name=$name" >> $env:GITHUB_OUTPUT
 
       - name: Sign installer via central signing workflow
@@ -1012,16 +1063,18 @@ jobs:
 
       - name: Upload the signed installer to the draft release
         shell: pwsh
+        env:
+          SIGNED: ${{ steps.sign.outputs.signed-path }}
+          SIGNED_SHA256: ${{ steps.sign.outputs.signed-sha256 }}
         run: |
           $ErrorActionPreference = "Stop"
-          python .github/scripts/release_draft.py require "${{ github.ref_name }}" --repo "${{ github.repository }}"
-          if ($LASTEXITCODE -ne 0) { throw "no draft release to upload to (see above)" }
-          $signed = "${{ steps.sign.outputs.signed-path }}"
-          "${{ steps.sign.outputs.signed-sha256 }}  $(Split-Path $signed -Leaf)" |
-              Set-Content -Path "$signed.sha256" -Encoding ascii -NoNewline
-          gh release upload "${{ github.ref_name }}" $signed "$signed.sha256" --clobber
+          python .github/scripts/release_draft.py require $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "no draft release of this commit to upload to (see above)" }
+          "$env:SIGNED_SHA256  $(Split-Path $env:SIGNED -Leaf)" |
+              Set-Content -Path "$env:SIGNED.sha256" -Encoding ascii -NoNewline
+          gh release upload $env:GITHUB_REF_NAME $env:SIGNED "$env:SIGNED.sha256" --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
-          Write-Host "Signed installer on the draft release (sha256 ${{ steps.sign.outputs.signed-sha256 }})"
+          Write-Host "Signed installer on the draft release (sha256 $env:SIGNED_SHA256)"
 
           # Stable download link. GitHub's /releases/latest/download/<name>
           # redirect needs a FIXED file name, so the release carries an
@@ -1029,14 +1082,14 @@ jobs:
           # README hands to users. Skipped for -testsigned fallback builds: a
           # permanent link must never resolve to an installer that needs
           # testsigning mode.
-          $name = Split-Path $signed -Leaf
+          $name = Split-Path $env:SIGNED -Leaf
           if ($name -like "*-testsigned*") {
               Write-Host "##[warning]test-signed build - no stable StreamToSpeakerSetup.exe link on this release"
           } else {
-              Copy-Item $signed "StreamToSpeakerSetup.exe" -Force
-              "${{ steps.sign.outputs.signed-sha256 }}  StreamToSpeakerSetup.exe" |
+              Copy-Item -LiteralPath $env:SIGNED "StreamToSpeakerSetup.exe" -Force
+              "$env:SIGNED_SHA256  StreamToSpeakerSetup.exe" |
                   Set-Content -Path "StreamToSpeakerSetup.exe.sha256" -Encoding ascii -NoNewline
-              gh release upload "${{ github.ref_name }}" StreamToSpeakerSetup.exe StreamToSpeakerSetup.exe.sha256 --clobber
+              gh release upload $env:GITHUB_REF_NAME StreamToSpeakerSetup.exe StreamToSpeakerSetup.exe.sha256 --clobber
               if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
               Write-Host "Stable link asset on the draft: releases/latest/download/StreamToSpeakerSetup.exe once published"
           }
@@ -1053,21 +1106,80 @@ jobs:
       - name: Upload the attestation bundle to the draft release
         if: ${{ !github.event.repository.private }}
         shell: pwsh
+        env:
+          SIGNED: ${{ steps.sign.outputs.signed-path }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
           $ErrorActionPreference = "Stop"
-          python .github/scripts/release_draft.py require "${{ github.ref_name }}" --repo "${{ github.repository }}"
-          if ($LASTEXITCODE -ne 0) { throw "no draft release to upload to (see above)" }
-          $bundle = "$(Split-Path "${{ steps.sign.outputs.signed-path }}" -Leaf).sigstore.json"
-          Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
-          gh release upload "${{ github.ref_name }}" $bundle --clobber
+          python .github/scripts/release_draft.py require $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "no draft release of this commit to upload to (see above)" }
+          $bundle = "$(Split-Path $env:SIGNED -Leaf).sigstore.json"
+          Copy-Item -LiteralPath $env:BUNDLE_PATH $bundle
+          gh release upload $env:GITHUB_REF_NAME $bundle --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
 
-  # The last job: the draft becomes the published, latest release (a
-  # pre-release that is not latest for a test-signed fallback) only when
-  # it holds exactly the assets of a complete release (release_draft.py
-  # check: every expected name, nothing else, each sidecar and provenance
-  # bundle matching its file, the stable alias identical to the setup exe)
-  # and every exe on it carries a valid Authenticode signature; publishing
+      # An earlier attempt that built the other kind of installer (for
+      # example -testsigned before a driver release for this source
+      # existed) left its setup exe, sidecar and bundle on the draft, and
+      # for a -testsigned installer now the alias of a Microsoft-signed one.
+      # publish refuses unexpected assets, so they go; nothing else does.
+      - name: Remove setup exe assets an earlier attempt left on the draft
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pruneArgs = @("prune", $env:GITHUB_REF_NAME, "--repo", $env:GITHUB_REPOSITORY, "--commit", $env:GITHUB_SHA, "--version", $env:GITHUB_REF_NAME.Substring(1), "--installer", $env:INSTALLER_NAME)
+          if ($env:PROVENANCE -eq "true") { $pruneArgs += "--provenance" }
+          python .github/scripts/release_draft.py @pruneArgs
+          if ($LASTEXITCODE -ne 0) { throw "could not remove the assets of an earlier attempt (see above)" }
+
+  # Nothing in the run reads the artifacts with unsigned binaries in them
+  # once the exes are signed, so they are deleted then rather than left
+  # downloadable for the rest of their day: unsigned-service-exe once
+  # sign-service succeeded; unsigned-setup-exe, release-inputs and
+  # binaries-<ver> once sign-release succeeded. (A failed chain keeps them
+  # for re-running its failed jobs; they expire after a day.)
+  cleanup:
+    if: >-
+      !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
+      needs.sign-service.result == 'success'
+    needs: [build, sign-service, sign-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write             # delete this run's artifacts
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.build.outputs.version }}
+      RELEASE_SIGNED: ${{ needs.sign-release.result == 'success' }}
+    steps:
+      - name: Delete the artifacts with unsigned binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          names=(unsigned-service-exe)
+          if [ "$RELEASE_SIGNED" = "true" ]; then
+            names+=(unsigned-setup-exe release-inputs "binaries-$VERSION")
+          fi
+          artifacts=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | [.id, .name] | @tsv')
+          while IFS=$'\t' read -r id name; do
+            [ -n "$id" ] || continue
+            for n in "${names[@]}"; do
+              if [ "$name" = "$n" ]; then
+                gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" >/dev/null
+                echo "deleted artifact $name ($id)"
+              fi
+            done
+          done <<< "$artifacts"
+
+  # The last job: the draft is published (as the latest release unless a
+  # published release has a version at least as high; a pre-release that
+  # is not latest for a test-signed fallback) only when it holds exactly
+  # the assets of a complete release (release_draft.py check: every
+  # expected name, nothing else, the service exe and the setup exe (and
+  # the alias) exactly the bytes sign-service and sign-release signed in
+  # this run, each sidecar and provenance bundle matching its file) and
+  # every exe on it carries a valid Authenticode signature; publishing
   # then requires the same asset ids that were checked and the tag still
   # pointing at this run's commit. The explicit status checks matter: in
   # the test-signed fallback verify-driver is skipped, and without them
@@ -1076,18 +1188,19 @@ jobs:
   publish:
     if: >-
       !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
-      needs.build.result == 'success' && needs.package.result == 'success' &&
-      needs.sign-release.result == 'success'
-    needs: [build, package, sign-release]
+      needs.build.result == 'success' && needs.sign-service.result == 'success' &&
+      needs.package.result == 'success' && needs.sign-release.result == 'success'
+    needs: [build, sign-service, package, sign-release]
     runs-on: windows-latest
     timeout-minutes: 20
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ github.ref_name }}
       VERSION: ${{ needs.build.outputs.version }}
       INSTALLER: ${{ needs.package.outputs.installer_name }}
+      SERVICE_SHA256: ${{ needs.sign-service.outputs.signed_sha256 }}
+      INSTALLER_SHA256: ${{ needs.sign-release.outputs.signed_sha256 }}
       PROVENANCE: ${{ !github.event.repository.private }}
     steps:
       - uses: actions/checkout@v4
@@ -1103,7 +1216,7 @@ jobs:
           python .github/scripts/test_release_draft.py -b
           if ($LASTEXITCODE -ne 0) { throw "release_draft.py unit tests failed" }
           $dir = Join-Path $env:RUNNER_TEMP "draft-assets"
-          $checkArgs = @("check", $env:TAG, "--repo", $env:GITHUB_REPOSITORY, "--version", $env:VERSION, "--installer", $env:INSTALLER, "--dir", $dir)
+          $checkArgs = @("check", $env:GITHUB_REF_NAME, "--repo", $env:GITHUB_REPOSITORY, "--version", $env:VERSION, "--installer", $env:INSTALLER, "--dir", $dir, "--service-sha256", $env:SERVICE_SHA256, "--installer-sha256", $env:INSTALLER_SHA256)
           if ($env:PROVENANCE -eq "true") { $checkArgs += "--provenance" }
           python .github/scripts/release_draft.py @checkArgs
           if ($LASTEXITCODE -ne 0) { throw "the draft release is not complete (see above); nothing was published" }
@@ -1118,8 +1231,9 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw "$($exe.Name) on the draft does not carry a valid Authenticode signature; nothing was published" }
           }
 
-      # Latest release; a -testsigned fallback installer makes it a
-      # pre-release that is never latest (release_draft.py publish).
+      # Latest release unless a published release has a version at least as
+      # high; a -testsigned fallback installer makes it a pre-release that
+      # is never latest (release_draft.py publish).
       - name: Publish the release
         shell: pwsh
         env:
@@ -1127,10 +1241,10 @@ jobs:
           ASSET_IDS: ${{ steps.check.outputs.asset_ids }}
         run: |
           $ErrorActionPreference = "Stop"
-          $publishArgs = @("publish", $env:TAG, "--repo", $env:GITHUB_REPOSITORY, "--release-id", $env:RELEASE_ID, "--asset-ids", $env:ASSET_IDS, "--commit", $env:GITHUB_SHA, "--version", $env:VERSION, "--installer", $env:INSTALLER)
+          $publishArgs = @("publish", $env:GITHUB_REF_NAME, "--repo", $env:GITHUB_REPOSITORY, "--release-id", $env:RELEASE_ID, "--asset-ids", $env:ASSET_IDS, "--commit", $env:GITHUB_SHA, "--version", $env:VERSION, "--installer", $env:INSTALLER)
           if ($env:PROVENANCE -eq "true") { $publishArgs += "--provenance" }
           python .github/scripts/release_draft.py @publishArgs
-          if ($LASTEXITCODE -ne 0) { throw "publishing $env:TAG failed (see above)" }
+          if ($LASTEXITCODE -ne 0) { throw "publishing $env:GITHUB_REF_NAME failed (see above)" }
 
   # Installer lifecycle test (installer-lifecycle.yml) for pull requests
   # that change what the installer does: install / repair / uninstall /
