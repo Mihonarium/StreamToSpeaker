@@ -648,7 +648,8 @@ jobs:
 
   # -------------------------------------------------------------------
   # Tag-push release pipeline: build → sign-service → package →
-  # verify-driver → sign-release → publish.
+  # verify-driver → sign-release → publish (and cleanup, which deletes
+  # artifacts with unsigned binaries once the exes are signed).
   #
   # The version is assembled in a DRAFT release (release_draft.py) and
   # becomes public only in the last job, `publish`, once the draft holds
@@ -657,7 +658,11 @@ jobs:
   # to the /releases/latest/download/ links, not to the public release
   # list. If any job fails or is cancelled nothing is published; re-running
   # the failed jobs continues on the same draft (uploads replace earlier
-  # ones), and `publish` refuses a draft that is not complete.
+  # ones), and `publish` refuses a draft that is not complete or whose
+  # exes are not the bytes this run signed. Every job that writes to the
+  # draft or asks for a signature first checks that the tag still points
+  # at this run's commit. A published release becomes latest only if no
+  # published release has a version at least as high.
   #
   # A release whose installer falls back to the test-signed driver is
   # published as a pre-release and never made latest: releases/latest, the
@@ -665,10 +670,12 @@ jobs:
   # release with a Microsoft-signed driver.
   #
   # The artifacts that carry unsigned binaries between the jobs
-  # (release-inputs, unsigned-service-exe, unsigned-setup-exe, and the
-  # build job's binaries-<ver>) are kept for one day; a tag run uploads no
-  # test-signed dev installer. Re-running a job after the artifact it reads
-  # has expired fails before anything is signed; re-run all jobs then.
+  # (release-inputs, unsigned-service-exe, unsigned-setup-exe, the build
+  # job's binaries-<ver> and the release gate's comparison artifact) are
+  # kept for one day, and cleanup deletes the first four once nothing
+  # reads them; a tag run uploads no test-signed dev installer. Re-running
+  # a job after the artifact it reads has expired or been deleted fails
+  # before anything is signed; re-run all jobs then.
   #
   # The unsigned setup exe is never a release asset: `package` uploads it
   # as the workflow artifact `unsigned-setup-exe`. verify-driver

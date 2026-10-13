@@ -120,7 +120,7 @@ Offline: `--bundle <file>.sigstore.json`, shipped with each release.
 
 The driver is [certified by Microsoft](https://partner.microsoft.com/en-us/dashboard/hardware/Driver/DownloadCertificationReport/95342530/14599256519720956/1152921505701928485).
 
-The driver inside each installer is checked against a rebuild from this source by the [Driver reproducibility](.github/workflows/driver-reproducibility.yml) workflow, and each installer build logs which driver package it bundled.
+The Microsoft-signed driver inside each release installer is checked against a rebuild from this source by the [Driver reproducibility](.github/workflows/driver-reproducibility.yml) workflow before the installer is signed, and each installer build logs which driver package it bundled. (Pre-releases built with the test-signed driver, which needs testsigning mode, skip that check.)
 
 ## Developers
 
