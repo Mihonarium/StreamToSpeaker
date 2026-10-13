@@ -6,7 +6,10 @@
 //! and text must never be squashed into a one-word-per-line column.
 
 use egui::{Color32, Rect, RichText, Shape, Vec2};
-use stream_to_speaker::gui_layout::{banner_row, notice_row, sp};
+use std::sync::{Arc, Mutex};
+use stream_to_speaker::gui_layout::{
+    banner_row, notice_row, schedule_heartbeat, sp, BACKGROUND_HEARTBEAT, HEARTBEAT,
+};
 
 const FRAME_FILL: Color32 = Color32::from_rgb(1, 2, 3);
 const BTN_FILL: Color32 = Color32::from_rgb(4, 5, 6);
@@ -183,4 +186,69 @@ fn banner_row_without_buttons_gives_text_the_full_width() {
     assert!(o.frame.height() < 120.0);
     assert!((head.height() / 16.0).round() as u32 == 1);
     assert!(o.buttons.is_empty());
+}
+
+#[test]
+fn every_frame_schedules_the_next_heartbeat() {
+    let ctx = egui::Context::default();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    {
+        let requests = requests.clone();
+        ctx.set_request_repaint_callback(move |info| requests.lock().unwrap().push(info.delay));
+    }
+    // egui paints its first frames on its own; get past them.
+    for _ in 0..2 {
+        let _ = ctx.run(egui::RawInput::default(), schedule_heartbeat);
+    }
+    // Back-to-back frames, as when the heartbeat itself fires: egui runs
+    // it a predicted frame early, before a full HEARTBEAT has passed.
+    for frame in 0..5 {
+        requests.lock().unwrap().clear();
+        let _ = ctx.run(egui::RawInput::default(), schedule_heartbeat);
+        let got = requests.lock().unwrap().clone();
+        assert!(
+            got.iter().any(|d| !d.is_zero() && *d <= HEARTBEAT),
+            "frame {frame} scheduled no heartbeat: {got:?}"
+        );
+    }
+}
+
+/// Frames of a window whose viewport is as `set` leaves it; returns the
+/// heartbeat delays they asked for.
+fn heartbeats_with(set: impl Fn(&mut egui::ViewportInfo)) -> Vec<std::time::Duration> {
+    let ctx = egui::Context::default();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    {
+        let requests = requests.clone();
+        ctx.set_request_repaint_callback(move |info| requests.lock().unwrap().push(info.delay));
+    }
+    let input = || {
+        let mut raw = egui::RawInput::default();
+        set(raw.viewports.entry(egui::ViewportId::ROOT).or_default());
+        raw
+    };
+    for _ in 0..2 {
+        let _ = ctx.run(input(), schedule_heartbeat);
+    }
+    requests.lock().unwrap().clear();
+    let _ = ctx.run(input(), schedule_heartbeat);
+    let got = requests.lock().unwrap().clone();
+    got
+}
+
+#[test]
+fn a_window_in_the_background_beats_slowly() {
+    let fast = |got: &[std::time::Duration]| got.iter().any(|d| !d.is_zero() && *d <= HEARTBEAT);
+    let slow = |got: &[std::time::Duration]| {
+        !got.is_empty() && got.iter().all(|d| *d > HEARTBEAT && *d <= BACKGROUND_HEARTBEAT)
+    };
+    let focused = heartbeats_with(|v| v.focused = Some(true));
+    assert!(fast(&focused), "{focused:?}");
+    let minimised = heartbeats_with(|v| {
+        v.focused = Some(false);
+        v.minimized = Some(true);
+    });
+    assert!(slow(&minimised), "{minimised:?}");
+    let behind = heartbeats_with(|v| v.focused = Some(false));
+    assert!(slow(&behind), "{behind:?}");
 }

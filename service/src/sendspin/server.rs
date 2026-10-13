@@ -31,7 +31,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -278,7 +278,10 @@ struct Shared {
     state: Mutex<PlayerState>,
     can_volume: AtomicBool,
     can_mute: AtomicBool,
-    volume: AtomicU32,
+    /// Last level the player reported or we set; None until either
+    /// happened (a player may list the volume command without reporting
+    /// a level).
+    volume: Mutex<Option<u32>>,
     /// Format being streamed (for the UI / logs).
     format: Mutex<Option<AudioFormat>>,
     /// The speaker ended the session with a goodbye that rules out an
@@ -288,6 +291,30 @@ struct Shared {
     lead_us: AtomicI64,
     extra_latency_ms: u32,
     buffer_capacity: u64,
+}
+
+/// Volume and mute for one player; see [`PlayerSession::volume_control`].
+#[derive(Clone)]
+pub struct VolumeHandle {
+    shared: Arc<Shared>,
+}
+
+impl VolumeHandle {
+    pub fn set_volume_pct(&self, pct: u32) -> Result<()> {
+        if !self.shared.can_volume.load(Ordering::SeqCst) {
+            bail!("this speaker does not accept volume changes");
+        }
+        let pct = pct.min(100);
+        *self.shared.volume.lock().unwrap() = Some(pct);
+        self.shared.writer.send_json(&proto::player_command_volume(pct))
+    }
+
+    pub fn set_mute(&self, muted: bool) -> Result<()> {
+        if !self.shared.can_mute.load(Ordering::SeqCst) {
+            bail!("this speaker does not accept mute");
+        }
+        self.shared.writer.send_json(&proto::player_command_mute(muted))
+    }
 }
 
 /// A live connection streaming to one player.
@@ -329,7 +356,7 @@ impl PlayerSession {
             state: Mutex::new(up.state.clone()),
             can_volume: AtomicBool::new(false),
             can_mute: AtomicBool::new(false),
-            volume: AtomicU32::new(up.state.volume.unwrap_or(100)),
+            volume: Mutex::new(None),
             format: Mutex::new(None),
             ended: Mutex::new(None),
             lead_us: AtomicI64::new(0),
@@ -436,27 +463,26 @@ impl PlayerSession {
     }
 
     pub fn set_volume_pct(&self, pct: u32) -> Result<()> {
-        if !self.shared.can_volume.load(Ordering::SeqCst) {
-            bail!("this speaker does not accept volume changes");
-        }
-        let pct = pct.min(100);
-        self.shared.volume.store(pct, Ordering::SeqCst);
-        self.shared.writer.send_json(&proto::player_command_volume(pct))
+        self.volume_control().set_volume_pct(pct)
     }
 
     pub fn set_mute(&self, muted: bool) -> Result<()> {
-        if !self.shared.can_mute.load(Ordering::SeqCst) {
-            bail!("this speaker does not accept mute");
-        }
-        self.shared.writer.send_json(&proto::player_command_mute(muted))
+        self.volume_control().set_mute(muted)
     }
 
-    /// Last volume the player reported (or we set).
+    /// A detachable handle for volume and mute, so the caller can send
+    /// after releasing the session lock.
+    pub fn volume_control(&self) -> VolumeHandle {
+        VolumeHandle { shared: self.shared.clone() }
+    }
+
+    /// Last volume the player reported (or we set). None while the player
+    /// takes no volume commands or has not reported a level yet.
     pub fn volume(&self) -> Option<u32> {
-        self.shared
-            .can_volume
-            .load(Ordering::SeqCst)
-            .then(|| self.shared.volume.load(Ordering::SeqCst))
+        if !self.shared.can_volume.load(Ordering::SeqCst) {
+            return None;
+        }
+        *self.shared.volume.lock().unwrap()
     }
 
     pub fn format(&self) -> Option<AudioFormat> {
@@ -829,7 +855,7 @@ fn update_capabilities(sh: &Shared, hello: &PlayerHello, state: &PlayerState) {
     sh.can_volume.store(cmds.iter().any(|c| c == "volume"), Ordering::SeqCst);
     sh.can_mute.store(cmds.iter().any(|c| c == "mute"), Ordering::SeqCst);
     if let Some(v) = state.volume {
-        sh.volume.store(v.min(100), Ordering::SeqCst);
+        *sh.volume.lock().unwrap() = Some(v.min(100));
     }
 }
 
@@ -1149,6 +1175,98 @@ fn audio_loop(sh: &Shared, rx: Receiver<PcmFrame>, fmt: AudioFormat) -> Result<(
     }
 }
 
+/// A pre-encryption Sendspin player on loopback, for tests that need a
+/// live [`PlayerSession`].
+#[cfg(test)]
+pub(crate) mod test_player {
+    use super::*;
+    use crate::sendspin::ws::{self, Accepted, WsWriter};
+    use crate::sendspin::MemoryStore;
+    use serde_json::json;
+    use std::net::TcpListener;
+
+    /// The player's side of the wire.
+    pub(crate) struct FakePlayer {
+        player: Arc<WsWriter>,
+        /// Kept so the session's audio input stays open.
+        _samples: crossbeam_channel::Sender<PcmFrame>,
+    }
+
+    impl FakePlayer {
+        /// The player sends a `client/state` whose player part is `player`.
+        pub(crate) fn report(&self, player: Value) {
+            let msg = json!({"type": "client/state", "payload": {"player": player}});
+            self.player.send_text(&msg.to_string()).unwrap();
+        }
+    }
+
+    /// Start a session to a player that lists `commands` in its hello and
+    /// whose first state carries `volume` when given.
+    pub(crate) fn connect(commands: &[&str], volume: Option<u32>) -> (PlayerSession, FakePlayer) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let commands: Vec<String> = commands.iter().map(|c| c.to_string()).collect();
+        let (writer_tx, writer_rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let Accepted::WebSocket(mut r, w) = ws::accept(stream, "/sendspin", Duration::from_secs(5)).unwrap() else {
+                panic!("not a WebSocket upgrade")
+            };
+            let hello = json!({"type": "client/hello", "payload": {
+                "client_id": "fake-player",
+                "name": "Fake player",
+                "supported_roles": ["player@v1"],
+                "player_support": {
+                    "supported_formats": [{"codec": "pcm", "sample_rate": 44_100, "channels": 2, "bit_depth": 16}],
+                    "buffer_capacity": 1_000_000,
+                    "supported_commands": commands,
+                },
+            }});
+            w.send_text(&hello.to_string()).unwrap();
+            let mut player = json!({"state": "synchronized"});
+            if let Some(v) = volume {
+                player["volume"] = json!(v);
+            }
+            w.send_text(&json!({"type": "client/state", "payload": {"player": player}}).to_string()).unwrap();
+            writer_tx.send(w).unwrap();
+            // Drain whatever the session sends until it closes.
+            while !matches!(r.recv(), Ok(ws::WsMessage::Close) | Err(_)) {}
+        });
+        let (samples, samples_rx) = crossbeam_channel::unbounded();
+        let session = PlayerSession::start(PlayerSessionConfig {
+            renderer: SendspinRenderer {
+                instance: "Fake player".into(),
+                friendly_name: "Fake player".into(),
+                ip: addr.ip(),
+                port: addr.port(),
+                path: "/sendspin".into(),
+            },
+            server_name: "test".into(),
+            store: Arc::new(MemoryStore::default()),
+            samples_rx,
+            extra_latency_ms: 0,
+            pairing: None,
+            now_playing: None,
+            connect_timeout: Duration::from_secs(5),
+        })
+        .unwrap_or_else(|e| panic!("session to the fake player failed: {:?}", e));
+        let player = writer_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        (session, FakePlayer { player, _samples: samples })
+    }
+
+    /// Wait until `f` holds, up to five seconds.
+    pub(crate) fn eventually(f: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        f()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1213,5 +1331,36 @@ mod tests {
         assert_eq!(r.url(), "ws://192.168.1.5:8928/sendspin");
         st.remove_fullname("Kitchen Speaker._sendspin._tcp.local.");
         assert!(st.renderers().is_empty());
+    }
+
+    #[test]
+    fn a_player_that_never_reports_a_level_has_none() {
+        let (session, player) = test_player::connect(&["volume", "mute"], None);
+        assert_eq!(session.volume(), None);
+        // A later state without a level leaves it unknown.
+        player.report(serde_json::json!({"muted": false}));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(session.volume(), None);
+        // Once it reports one, that level counts.
+        player.report(serde_json::json!({"volume": 40}));
+        assert!(test_player::eventually(|| session.volume() == Some(40)));
+        // As does a level we set.
+        session.set_volume_pct(25).unwrap();
+        assert_eq!(session.volume(), Some(25));
+    }
+
+    #[test]
+    fn a_player_reports_its_level_as_it_connects() {
+        let (session, player) = test_player::connect(&["volume"], Some(130));
+        assert_eq!(session.volume(), Some(100));
+        player.report(serde_json::json!({"volume": 35}));
+        assert!(test_player::eventually(|| session.volume() == Some(35)));
+    }
+
+    #[test]
+    fn a_player_without_the_volume_command_has_no_level() {
+        let (session, _player) = test_player::connect(&["mute"], Some(40));
+        assert_eq!(session.volume(), None);
+        assert!(session.set_volume_pct(30).is_err());
     }
 }

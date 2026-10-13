@@ -1,9 +1,10 @@
 //! System tray icon + context menu.
 //!
 //! `muda`'s `MenuItem` is `!Send` (it holds an `Rc` internally), so the
-//! menu items themselves live on the GUI's main thread. `pump()` runs
-//! from the egui update loop and keeps the status label / check states
-//! synced.
+//! menu items themselves live on the GUI's main thread. `pump()` keeps
+//! the icon, status label and check states synced. It runs from the egui
+//! update loop and from a timer on the same thread ([`sync_on_timer`]),
+//! which keeps the tray current while the window is hidden to it.
 //!
 //! Tray + menu *events* are drained by a dedicated background thread,
 //! not by `pump()`. This is the fix for the "Show window from tray
@@ -19,6 +20,8 @@
 use anyhow::{anyhow, Result};
 use eframe::egui;
 use log::{info, warn};
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 
@@ -215,11 +218,12 @@ impl TrayHandle {
         self.hwnd.store(hwnd, Ordering::Relaxed);
     }
 
-    /// Update the visible bits of the menu (status label, check
-    /// states) to reflect the App. Called from `gui::update()` once
-    /// per frame; cheap when there's nothing to do. Event draining
-    /// happens on the bg event thread now (see module-level docs).
-    pub fn pump(&mut self, app: &Arc<App>, _ctx: &egui::Context) {
+    /// Update the visible bits of the tray (icon, status label, check
+    /// states) to reflect the App. Called from `gui::update()` once per
+    /// frame and from the sync timer; cheap when there's nothing to do.
+    /// Event draining happens on the bg event thread now (see
+    /// module-level docs).
+    pub fn pump(&mut self, app: &Arc<App>) {
         // Sync the status label.
         let label = match app.selected_speaker() {
             Some(r) => format!("▶ {}", r.friendly_name),
@@ -269,13 +273,13 @@ impl TrayHandle {
         }
 
         // Sync the tray icon to the current state (M31).
-        // Active = a speaker is bound, streaming is enabled, and the
-        // driver is actually delivering audio (stream_active). Any
-        // other state — no speaker, disabled, paused — reads as
-        // Inactive (muted grey).
-        let streaming = speaker_bound
-            && enabled
-            && app.stream_active.load(std::sync::atomic::Ordering::Acquire);
+        // Live = a speaker is bound and its session up, streaming is
+        // enabled, and Windows is actually delivering audio. Bound and
+        // enabled otherwise (nothing playing, or reconnecting after a
+        // drop) is Standby; anything else — no speaker, disabled — reads
+        // as Idle (muted grey).
+        let streaming =
+            speaker_bound && enabled && app.receiving_windows_audio() && !app.selected_session_dead();
         let new_state = if streaming {
             IconState::Live
         } else if speaker_bound && enabled {
@@ -291,6 +295,59 @@ impl TrayHandle {
             }
             self.last_icon_state = new_state;
         }
+    }
+}
+
+/// How often the timer re-syncs the tray. Whether audio is arriving is
+/// judged by how long ago the last packet came, so the state changes with
+/// time alone and has to be looked at again.
+const SYNC_INTERVAL_MS: u32 = 500;
+
+thread_local! {
+    /// The tray the sync timer keeps current, and the app it reflects.
+    /// Set and read on the GUI thread only, where the timer runs.
+    static TIMER_SYNC: RefCell<Option<(Weak<RefCell<TrayHandle>>, Arc<App>)>> = const { RefCell::new(None) };
+}
+
+/// Keep `tray` in sync on a Win32 thread timer as well as from the
+/// window's `update()`, which only runs on WM_PAINT and so not while the
+/// window is hidden to the tray — exactly when the tray icon is the only
+/// sign of what the app is doing. Call on the GUI thread: the timer
+/// belongs to it, and winit's message loop dispatches it whether or not
+/// the window is shown. The timer stops itself once the tray is dropped.
+pub fn sync_on_timer(tray: &Rc<RefCell<TrayHandle>>, app: Arc<App>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetTimer;
+    TIMER_SYNC.with(|slot| *slot.borrow_mut() = Some((Rc::downgrade(tray), app)));
+    // SAFETY: a thread timer (no window) with a callback that only
+    // touches this thread's state.
+    let id = unsafe { SetTimer(std::ptr::null_mut(), 0, SYNC_INTERVAL_MS, Some(on_sync_timer)) };
+    if id == 0 {
+        warn!("tray: no sync timer; the icon follows the app only while the window is shown");
+    }
+}
+
+unsafe extern "system" fn on_sync_timer(
+    _hwnd: windows_sys::Win32::Foundation::HWND,
+    _msg: u32,
+    id: usize,
+    _time: u32,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::KillTimer;
+    let keep = TIMER_SYNC
+        .try_with(|slot| {
+            // Busy means a sync is already running further up this stack.
+            let Ok(slot) = slot.try_borrow() else { return true };
+            let Some((tray, app)) = slot.as_ref() else { return false };
+            let Some(tray) = tray.upgrade() else { return false };
+            // Likewise for the window's own pump.
+            if let Ok(mut tray) = tray.try_borrow_mut() {
+                tray.pump(app);
+            }
+            true
+        })
+        .unwrap_or(false);
+    if !keep {
+        KillTimer(std::ptr::null_mut(), id);
     }
 }
 
@@ -376,7 +433,12 @@ fn handle_menu(
         // update() never sees the shutdown flag.
         show_window_win32(hwnd.load(Ordering::Relaxed));
     }
-    ctx.request_repaint();
+    // A hidden window can't repaint (no WM_PAINT), and the sync timer
+    // keeps the tray itself current; showing the window repaints it.
+    let h = hwnd.load(Ordering::Relaxed);
+    if h == 0 || !crate::gui::window_hidden(Some(h)) {
+        ctx.request_repaint();
+    }
 }
 
 /// Raw Win32 "bring this window to the foreground" sequence.

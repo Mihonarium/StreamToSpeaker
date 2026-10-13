@@ -701,9 +701,6 @@ impl App {
                     s.stop();
                     return Err("Sendspin was turned off in settings".into());
                 }
-                if let Some(v) = s.volume() {
-                    self.vsync.prime_initial_volume(v);
-                }
                 Ok(ActiveSession::Sendspin(s))
             }
             Err(StartError::NeedsPairing {

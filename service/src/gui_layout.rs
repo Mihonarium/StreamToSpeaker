@@ -16,8 +16,46 @@
 //!    infinite height — at y = ∞ — and the enclosing frame paints the whole
 //!    page. Every such row must live inside `ui.horizontal`, which bounds
 //!    the row height.
+//!
+//! The window's repaint heartbeat lives here too, for the same reason:
+//! it is plain egui and can be checked headlessly.
 
 use egui;
+use std::time::Duration;
+
+/// How often an idle window repaints to pick up state that changes on
+/// other threads (stream state, counters, the speaker list) while it has
+/// the focus.
+pub const HEARTBEAT: Duration = Duration::from_millis(100);
+
+/// The same while the window is minimised or behind another window's
+/// focus. What changes on its own then (Streaming or Standing by, the
+/// packet rate) changes about once a second, and a volume change repaints
+/// at once anyway; ten full frames a second would only keep the CPU out
+/// of its idle states.
+pub const BACKGROUND_HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// The heartbeat for the window as `ctx` last saw it.
+pub fn heartbeat(ctx: &egui::Context) -> Duration {
+    let background = ctx.input(|i| {
+        let v = i.viewport();
+        v.minimized == Some(true) || v.focused == Some(false)
+    });
+    if background {
+        BACKGROUND_HEARTBEAT
+    } else {
+        HEARTBEAT
+    }
+}
+
+/// Schedule the next heartbeat repaint. Call on every frame the window
+/// stays visible: egui forgets a pending request when a frame starts, and
+/// fires a delayed repaint one predicted frame early (about 83 ms for
+/// 100 ms), so a request skipped because "the last one was under 100 ms
+/// ago" is never renewed and the window then repaints only on input.
+pub fn schedule_heartbeat(ctx: &egui::Context) {
+    ctx.request_repaint_after(heartbeat(ctx));
+}
 
 /// Spacing scale shared with `gui.rs`.
 pub mod sp {

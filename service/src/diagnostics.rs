@@ -4,6 +4,67 @@
 //! reconnect that follows it. Rendered as plain text for the clipboard.
 
 use std::fmt::Write as _;
+use std::time::Duration;
+
+/// How long without a packet from Windows before the audio is reported
+/// as no longer arriving.
+const SOURCE_STALE_AFTER: Duration = Duration::from_secs(1);
+
+/// How long after the last packet that carried sound the audio still
+/// counts as playing, so a short pause in the sound doesn't flip it.
+const SOUND_HOLD: Duration = Duration::from_millis(500);
+
+/// What the audio loop is getting from Windows. The driver's start/stop
+/// events only say whether a stream is running on our device (and the
+/// app starts out assuming one is), not whether anything is audible, so
+/// this also looks at the packets themselves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowsAudio {
+    /// Windows reported its stream stopped.
+    Stopped,
+    /// Waiting on Windows, and no packet has come since launch.
+    #[default]
+    NothingYet,
+    /// Waiting on Windows, and the last packet is over a second old.
+    NothingRecently,
+    /// Packets are arriving, but none carried sound in the last half
+    /// second.
+    Silent,
+    /// Packets are arriving and carried sound in the last half second.
+    Playing,
+}
+
+impl WindowsAudio {
+    /// `reading_source`: the audio loop takes packets from Windows rather
+    /// than generating silence. `since_last_packet` / `since_last_sound`:
+    /// age of the newest packet from Windows / of the newest one that
+    /// carried sound, `None` if none came yet.
+    pub fn classify(
+        reading_source: bool,
+        since_last_packet: Option<Duration>,
+        since_last_sound: Option<Duration>,
+    ) -> Self {
+        if !reading_source {
+            return WindowsAudio::Stopped;
+        }
+        match since_last_packet {
+            None => WindowsAudio::NothingYet,
+            Some(age) if age > SOURCE_STALE_AFTER => WindowsAudio::NothingRecently,
+            Some(_) if since_last_sound.is_some_and(|age| age <= SOUND_HOLD) => WindowsAudio::Playing,
+            Some(_) => WindowsAudio::Silent,
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            WindowsAudio::Stopped => "stream stopped by Windows",
+            WindowsAudio::NothingYet => "nothing received yet",
+            WindowsAudio::NothingRecently => "nothing received for over a second",
+            WindowsAudio::Silent => "receiving silence",
+            WindowsAudio::Playing => "playing",
+        }
+    }
+}
 
 /// Counters and state at one moment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -21,8 +82,7 @@ pub struct Snapshot {
     /// Automatic reconnects since the user last picked a speaker.
     pub reconnects: u32,
     pub streaming_enabled: bool,
-    /// Windows is delivering audio (as opposed to idle silence).
-    pub audio_active: bool,
+    pub windows_audio: WindowsAudio,
     pub connecting_to: Option<String>,
     /// 10 ms packets published to the senders / stream clients.
     pub packets_published: u64,
@@ -67,10 +127,7 @@ impl Snapshot {
             ),
             ("Reconnects (this playback)", self.reconnects.to_string()),
             ("Streaming enabled", yes_no(self.streaming_enabled)),
-            (
-                "Windows audio",
-                if self.audio_active { "playing" } else { "idle (sending silence)" }.to_string(),
-            ),
+            ("Windows audio", self.windows_audio.describe().to_string()),
             ("Connecting to", opt(&self.connecting_to)),
             ("Packets sent", self.packets_published.to_string()),
             ("  of which idle silence", self.idle_silence_packets.to_string()),
@@ -191,6 +248,44 @@ mod tests {
         let text = report("App", "1", &Snapshot::default(), None, None);
         assert!(text.contains("[last fault] none this run"));
         assert!(text.contains("Speaker: —"));
+    }
+
+    #[test]
+    fn windows_audio_says_only_what_is_known() {
+        let fresh = Some(Duration::from_millis(30));
+        let long_ago = Some(Duration::from_secs(3));
+        // A stop from Windows wins over anything the packets said.
+        assert_eq!(WindowsAudio::classify(false, fresh, fresh), WindowsAudio::Stopped);
+        // Reading from Windows but nothing came: the state the app starts in.
+        assert_eq!(WindowsAudio::classify(true, None, None), WindowsAudio::NothingYet);
+        assert_eq!(WindowsAudio::classify(true, long_ago, long_ago), WindowsAudio::NothingRecently);
+        // Packets, but none ever carried sound (a silent stream at launch).
+        assert_eq!(WindowsAudio::classify(true, fresh, None), WindowsAudio::Silent);
+        assert_eq!(WindowsAudio::classify(true, fresh, long_ago), WindowsAudio::Silent);
+        assert_eq!(WindowsAudio::classify(true, fresh, fresh), WindowsAudio::Playing);
+        // A short pause in the sound is still playing.
+        assert_eq!(
+            WindowsAudio::classify(true, fresh, Some(Duration::from_millis(400))),
+            WindowsAudio::Playing
+        );
+    }
+
+    #[test]
+    fn only_audible_packets_read_as_playing() {
+        let row = |w: WindowsAudio| {
+            let snap = Snapshot { windows_audio: w, ..Default::default() };
+            snap.rows().into_iter().find(|(k, _)| *k == "Windows audio").unwrap().1
+        };
+        assert_eq!(row(WindowsAudio::default()), "nothing received yet");
+        for w in [
+            WindowsAudio::Stopped,
+            WindowsAudio::NothingYet,
+            WindowsAudio::NothingRecently,
+            WindowsAudio::Silent,
+        ] {
+            assert_ne!(row(w), "playing", "{:?}", w);
+        }
+        assert_eq!(row(WindowsAudio::Playing), "playing");
     }
 
     #[test]

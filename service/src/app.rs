@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::update_check::{self, ReleaseInfo};
@@ -22,7 +22,7 @@ use crate::airplay::{
     AirPlaySessionConfig, Ap2StartError, Transport,
 };
 use crate::discovery_net::{self, MdnsController, NetAdapter, Resolved, SavedAdapter};
-use crate::diagnostics::{Fault, Snapshot};
+use crate::diagnostics::{Fault, Snapshot, WindowsAudio};
 use crate::equalizer::{EqControl, EqReport, EqSettings};
 use crate::gena::GenaManager;
 use crate::http_server::{SpeakerInfo, StreamHub};
@@ -31,7 +31,7 @@ use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use crate::ssdp::{DiscoveryState, Renderer, SearchScope};
 use crate::stream_gate::{canonical_ip, is_local_address, Grant, StreamGate};
 use crate::user_config::{AutoConnect, SpeakerSettings, UserConfig};
-use crate::volume_sync::VolumeSync;
+use crate::volume_sync::{sonos_to_millibels, PendingCommands, SpeakerCommand, VolumeSync};
 use crate::{upnp, PRODUCT_NAME, WIRE_SAMPLE_RATE};
 
 /// One running renderer session: the speaker we've handed our stream URL
@@ -127,21 +127,42 @@ impl ActiveSession {
         }
     }
 
-    /// Push a volume change to the speaker. UPnP path goes via
-    /// SetVolume SOAP (SetGroupVolume when streaming to a Sonos group,
-    /// so the whole group scales like its Sonos-app slider); AirPlay
-    /// path goes via SET_PARAMETER over the existing RTSP socket.
-    pub fn set_volume_pct(&self, pct: u32) -> Result<()> {
+    /// Whether [`Self::volume_control`] has one: false for Music
+    /// Assistant, which keeps its own volume per speaker.
+    pub fn has_volume_control(&self) -> bool {
+        !matches!(self, ActiveSession::MusicAssistant(_))
+    }
+
+    /// The speaker's volume and mute control, detached from the session
+    /// (see [`VolumeControl`]). UPnP goes via SetVolume SOAP
+    /// (SetGroupVolume when streaming to a Sonos group, so the whole
+    /// group scales like its Sonos-app slider); AirPlay via SET_PARAMETER
+    /// over the existing RTSP socket. `None` for Music Assistant, which
+    /// keeps its own volume per speaker.
+    pub fn volume_control(&self) -> Option<VolumeControl> {
         match self {
-            ActiveSession::Upnp(s) => match s.renderer.group_volume_control_url() {
-                Some(url) => upnp::set_group_volume(url, pct),
-                None => upnp::set_volume(&s.renderer.rendering_control_control_url, pct),
-            },
-            ActiveSession::AirPlay(s) => s.set_volume_pct(pct),
-            ActiveSession::AirPlay2(s) => s.set_volume_pct(pct),
-            ActiveSession::Sendspin(s) => s.set_volume_pct(pct),
-            // Music Assistant keeps its own volume per speaker.
-            ActiveSession::MusicAssistant(_) => Ok(()),
+            ActiveSession::Upnp(s) => Some(match s.renderer.group_volume_control_url() {
+                Some(url) => VolumeControl::UpnpGroup(url.to_string()),
+                None => VolumeControl::Upnp(s.renderer.rendering_control_control_url.clone()),
+            }),
+            ActiveSession::AirPlay(s) => Some(VolumeControl::AirPlay(s.volume_control())),
+            ActiveSession::AirPlay2(s) => Some(VolumeControl::AirPlay2(s.volume_control())),
+            ActiveSession::Sendspin(s) => Some(VolumeControl::Sendspin(s.volume_control())),
+            ActiveSession::MusicAssistant(_) => None,
+        }
+    }
+
+    /// The speaker's level as its session starts, when known without
+    /// asking it: AirPlay sessions set it as they start, and a Sendspin
+    /// player counts only if it reported one as it connected (one that
+    /// takes the volume command but sends no level gives None). None for
+    /// UPnP, whose speaker has to be asked, and Music Assistant.
+    pub fn level_on_connect(&self) -> Option<u32> {
+        match self {
+            ActiveSession::AirPlay(s) => Some(s.volume_pct()),
+            ActiveSession::AirPlay2(s) => Some(s.volume_pct()),
+            ActiveSession::Sendspin(s) => s.volume(),
+            ActiveSession::Upnp(_) | ActiveSession::MusicAssistant(_) => None,
         }
     }
 
@@ -212,23 +233,207 @@ impl ActiveSession {
             ActiveSession::Sendspin(_) | ActiveSession::MusicAssistant(_) => None,
         }
     }
+}
 
-    /// Push a mute state to the speaker.
+pub type SharedSession = Arc<Mutex<Option<ActiveSession>>>;
+
+/// Sets level (millibels) and mute on our endpoint, moving the Windows
+/// volume slider.
+pub type WindowsVolumePush = Box<dyn Fn(i32, bool) -> Result<()> + Send + Sync>;
+
+/// What a volume or mute change needs to reach the bound speaker, cloned
+/// out of the session so the network round trip runs without the session
+/// lock — the window takes that lock several times on every repaint.
+#[derive(Clone)]
+pub enum VolumeControl {
+    /// RenderingControl on the speaker itself.
+    Upnp(String),
+    /// GroupRenderingControl on a Sonos group's coordinator.
+    UpnpGroup(String),
+    AirPlay(crate::airplay::session::VolumeHandle),
+    AirPlay2(crate::airplay::ap2_session::VolumeHandle),
+    Sendspin(crate::sendspin::server::VolumeHandle),
+}
+
+impl VolumeControl {
+    pub fn set_volume_pct(&self, pct: u32) -> Result<()> {
+        match self {
+            VolumeControl::Upnp(url) => upnp::set_volume(url, pct),
+            VolumeControl::UpnpGroup(url) => upnp::set_group_volume(url, pct),
+            VolumeControl::AirPlay(h) => h.set_volume_pct(pct),
+            VolumeControl::AirPlay2(h) => h.set_volume_pct(pct),
+            VolumeControl::Sendspin(h) => h.set_volume_pct(pct),
+        }
+    }
+
     pub fn set_mute(&self, muted: bool) -> Result<()> {
         match self {
-            ActiveSession::Upnp(s) => match s.renderer.group_volume_control_url() {
-                Some(url) => upnp::set_group_mute(url, muted),
-                None => upnp::set_mute(&s.renderer.rendering_control_control_url, muted),
-            },
-            ActiveSession::AirPlay(s) => s.set_mute(muted),
-            ActiveSession::AirPlay2(s) => s.set_mute(muted),
-            ActiveSession::Sendspin(s) => s.set_mute(muted),
-            ActiveSession::MusicAssistant(_) => Ok(()),
+            VolumeControl::Upnp(url) => upnp::set_mute(url, muted),
+            VolumeControl::UpnpGroup(url) => upnp::set_group_mute(url, muted),
+            VolumeControl::AirPlay(h) => h.set_mute(muted),
+            VolumeControl::AirPlay2(h) => h.set_mute(muted),
+            VolumeControl::Sendspin(h) => h.set_mute(muted),
         }
     }
 }
 
-pub type SharedSession = Arc<Mutex<Option<ActiveSession>>>;
+/// Sends volume and mute changes to the bound speaker from a thread of its
+/// own. Each send runs on a [`VolumeControl`] cloned under a brief session
+/// lock, so a slow or unreachable speaker (a SOAP call can wait seconds)
+/// holds up neither the window, which takes the session lock on every
+/// repaint, nor the driver events queued behind a volume change. Changes
+/// that arrive during a send wait in [`PendingCommands`], where a slider
+/// drag collapses into its newest level. Each change is for the session
+/// bound when it was queued; one left over when another speaker has been
+/// bound since is dropped, never sent to the new speaker.
+///
+/// When a run of level changes is over, the thread also settles where the
+/// speaker ended up (see [`VolumeSync::speaker_settle`]) and moves the
+/// Windows slider there if that is not where we left it. Apart from the
+/// level read as a session starts, only UPnP speakers' level reports
+/// (GENA events) reach [`VolumeSync`]; for AirPlay and Sendspin the settle
+/// finds nothing to do.
+pub struct SpeakerControl {
+    shared: Arc<SpeakerControlShared>,
+}
+
+struct SpeakerControlShared {
+    pending: Mutex<PendingCommands>,
+    wake: Condvar,
+    closed: AtomicBool,
+    /// Number of the bound session; changed whenever one is bound, under
+    /// the session lock.
+    session: AtomicU64,
+}
+
+impl SpeakerControl {
+    fn new(session: SharedSession, vsync: Arc<VolumeSync>, windows: Arc<OnceLock<WindowsVolumePush>>) -> Self {
+        let shared = Arc::new(SpeakerControlShared {
+            pending: Mutex::new(PendingCommands::default()),
+            wake: Condvar::new(),
+            closed: AtomicBool::new(false),
+            session: AtomicU64::new(0),
+        });
+        let worker = shared.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("stream-to-speaker-volume".to_string())
+            .spawn(move || run_speaker_control(&worker, &session, &vsync, &windows))
+        {
+            warn!("speaker volume thread failed to start: {}", e);
+        }
+        Self { shared }
+    }
+
+    /// Queue a change for the bound speaker; returns at once.
+    pub fn send(&self, cmd: SpeakerCommand) {
+        let session = self.shared.session.load(Ordering::Acquire);
+        self.shared.pending.lock().unwrap().push(session, cmd);
+        self.shared.wake.notify_one();
+    }
+
+    /// A new session is being bound (call under the session lock). Returns
+    /// its number.
+    fn session_bound(&self) -> u64 {
+        self.shared.session.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Number of the session bound last.
+    fn session_number(&self) -> u64 {
+        self.shared.session.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for SpeakerControl {
+    fn drop(&mut self) {
+        let _pending = self.shared.pending.lock().unwrap();
+        self.shared.closed.store(true, Ordering::Release);
+        self.shared.wake.notify_all();
+    }
+}
+
+/// Set the Windows slider to `level`, if the driver is there to do it.
+fn push_windows_level(windows: &OnceLock<WindowsVolumePush>, level: u32, muted: bool) {
+    if let Some(push) = windows.get() {
+        if let Err(e) = push(sonos_to_millibels(level), muted) {
+            warn!("failed to push volume to Windows: {:#}", e);
+        }
+    }
+}
+
+fn run_speaker_control(
+    shared: &SpeakerControlShared,
+    session: &SharedSession,
+    vsync: &VolumeSync,
+    windows: &OnceLock<WindowsVolumePush>,
+) {
+    // A level went to the speaker since the last settle.
+    let mut settle_due = false;
+    loop {
+        let next = {
+            let mut pending = shared.pending.lock().unwrap();
+            loop {
+                if shared.closed.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(next) = pending.pop() {
+                    break Some(next);
+                }
+                if !settle_due {
+                    pending = shared.wake.wait(pending).unwrap();
+                    continue;
+                }
+                match vsync.speaker_run_ends_in() {
+                    Some(left) => pending = shared.wake.wait_timeout(pending, left).unwrap().0,
+                    None => break None,
+                }
+            }
+        };
+        let Some((number, cmd)) = next else {
+            settle_due = false;
+            if let Some(level) = vsync.speaker_settle() {
+                info!("speaker -> windows: volume {} (where the speaker settled)", level);
+                push_windows_level(windows, level, vsync.is_muted());
+            }
+            continue;
+        };
+        let control = {
+            let guard = session.lock().unwrap();
+            if shared.session.load(Ordering::Acquire) != number {
+                debug!("dropping {:?} queued for a speaker no longer bound", cmd);
+                None
+            } else {
+                let control = guard.as_ref().and_then(|s| s.volume_control());
+                // Under the session lock, so a speaker bound meanwhile
+                // starts from a clean run.
+                if let (Some(_), SpeakerCommand::Volume(level)) = (&control, cmd) {
+                    vsync.speaker_send_start(level);
+                }
+                control
+            }
+        };
+        let Some(control) = control else { continue };
+        let result = match cmd {
+            SpeakerCommand::Volume(level) => {
+                let result = control.set_volume_pct(level);
+                vsync.speaker_send_done();
+                settle_due = true;
+                result
+            }
+            SpeakerCommand::Mute(muted) => control.set_mute(muted),
+        };
+        if let Err(e) = result {
+            match cmd {
+                SpeakerCommand::Volume(level) => warn!("set speaker volume to {} failed: {:#}", level, e),
+                SpeakerCommand::Mute(muted) => warn!("set speaker mute to {} failed: {:#}", muted, e),
+            }
+        }
+    }
+}
+
+/// Volume an AirPlay session starts the speaker at when no level is known
+/// yet (nothing has come from the Windows slider, the window's slider or a
+/// speaker this run).
+const AIRPLAY_DEFAULT_VOLUME: u32 = 80;
 
 /// How long an error stays in the GUI's banner (the usual toast time).
 const ERROR_BANNER_TTL: Duration = Duration::from_secs(8);
@@ -304,6 +509,10 @@ pub struct App {
     // ---- Audio data plumbing ----
     pub hub: Arc<StreamHub>,
     pub vsync: Arc<VolumeSync>,
+    speaker_control: SpeakerControl,
+    /// Sets the Windows slider: (millibels, muted). Registered at startup
+    /// when the driver is there.
+    windows_volume: Arc<OnceLock<WindowsVolumePush>>,
 
     // ---- Runtime atomics (audio hot path reads these every packet) ----
     /// Driver's KSSTATE_RUN flag mirror — set by the driver-event consumer.
@@ -329,6 +538,11 @@ pub struct App {
     /// Of `packets_published_total`, the silence generated while Windows
     /// had no stream running.
     pub idle_silence_packets: Arc<AtomicU64>,
+    /// When the audio loop last got a packet from Windows, and the last
+    /// one that carried sound, in ms since `started_at` plus one
+    /// (0 = never).
+    source_packet_at_ms: AtomicU64,
+    source_sound_at_ms: AtomicU64,
     pub started_at: Instant,
     /// Id of the bound session and when it came up (session uptime).
     session_started: Mutex<Option<(String, Instant)>>,
@@ -520,14 +734,20 @@ impl App {
         if user_config.equalizer.enabled {
             eq.request(user_config.equalizer.clone());
         }
+        let session: SharedSession = Arc::new(Mutex::new(None));
+        let vsync = Arc::new(VolumeSync::new());
+        let windows_volume = Arc::new(OnceLock::new());
+        let speaker_control = SpeakerControl::new(session.clone(), vsync.clone(), Arc::clone(&windows_volume));
         Arc::new(Self {
             config,
             discovery,
             airplay_discovery,
-            session: Arc::new(Mutex::new(None)),
+            session,
             last_speaker_id,
             hub: StreamHub::new(),
-            vsync: Arc::new(VolumeSync::new()),
+            vsync,
+            speaker_control,
+            windows_volume,
             stream_active: Arc::new(AtomicBool::new(true)),
             streaming_enabled: Arc::new(AtomicBool::new(true)),
             web_ui_enabled: Arc::new(AtomicBool::new(web_initial)),
@@ -538,6 +758,8 @@ impl App {
             eq,
             packets_published_total: Arc::new(AtomicU64::new(0)),
             idle_silence_packets: Arc::new(AtomicU64::new(0)),
+            source_packet_at_ms: AtomicU64::new(0),
+            source_sound_at_ms: AtomicU64::new(0),
             started_at: Instant::now(),
             session_started: Mutex::new(None),
             reconnects: AtomicU32::new(0),
@@ -1389,6 +1611,13 @@ impl App {
         })
     }
 
+    /// The bound session has dropped: it stays bound until the drop
+    /// watchdog reconnects (see [`Self::is_auto_reconnect_on_drop`]) or,
+    /// with that off, until the user acts.
+    pub fn selected_session_dead(&self) -> bool {
+        self.session.lock().unwrap().as_ref().is_some_and(|s| s.is_dead())
+    }
+
     /// True if any speaker (any transport) is currently bound.
     pub fn is_speaker_bound(&self) -> bool {
         self.session.lock().unwrap().is_some()
@@ -1917,7 +2146,11 @@ impl App {
             new_session.stop();
             return Err(msg.into());
         }
-        *guard = Some(new_session);
+        // The level of the speaker being bound, when known now (a UPnP
+        // speaker is asked below).
+        let new_level = new_session.level_on_connect();
+        let new_airplay = matches!(&new_session, ActiveSession::AirPlay(_) | ActiveSession::AirPlay2(_));
+        let session_number = self.bind_session(&mut guard, new_session);
         // CRITICAL: drop the session-mutex guard before calling any
         // method that re-locks it. std::sync::Mutex is NOT re-entrant
         // — methods further down also call `self.session.lock()`, and
@@ -1925,7 +2158,7 @@ impl App {
         // (we just stored it) and drop the guard immediately so the
         // rest of this function stays lock-free. We grab two things:
         // the UPnP renderer (Some only for a UPnP session — used to
-        // prime the volume cache, a SOAP-only path) and the friendly
+        // read the speaker's level, a SOAP-only path) and the friendly
         // name (works for either protocol — used for the Windows
         // endpoint label).
         let new_upnp_renderer = match guard.as_ref() {
@@ -1963,27 +2196,49 @@ impl App {
         {
             crate::endpoint_name::update_endpoint_name(new_friendly_name.as_deref());
         }
-        // m24: prime the volume cache so the GUI slider shows the
-        // speaker's actual level on the next paint, instead of
-        // waiting for the first GENA NOTIFY (which can take a few
-        // seconds and is silent if the user never adjusts the
-        // volume on the speaker side). Detached — the upnp call
-        // can block ~100 ms.
+        // m24: start the window, the Windows slider and the speaker out
+        // agreeing, on the speaker's level. Without this the window would
+        // wait for the first GENA NOTIFY (which can take a few seconds and
+        // is silent if the user never adjusts the volume on the speaker
+        // side), and the first Windows key press would step from whatever
+        // the Windows slider showed before. A UPnP speaker is asked on a
+        // detached thread — the call can block ~100 ms.
+        if let Some(level) = new_level {
+            self.speaker_level_on_connect(session_number, level);
+        }
         if let Some(r) = new_upnp_renderer {
-            let vsync = self.vsync.clone();
+            let app = Arc::clone(self);
             std::thread::spawn(move || {
-                // Group sessions prime from the group volume — that's
-                // what the slider will be driving.
+                // Group sessions read the group volume — that's what the
+                // slider will be driving.
                 let level = match r.group_volume_control_url() {
                     Some(url) => upnp::get_group_volume(url),
                     None => upnp::get_volume(&r.rendering_control_control_url),
                 };
                 if let Ok(level) = level {
-                    vsync.prime_initial_volume(level);
+                    app.speaker_level_on_connect(session_number, level);
                 }
             });
         }
+        // An AirPlay session starts at a level, never muted: carry over a
+        // mute set in Windows. (Mute on a UPnP speaker is its own state,
+        // which its events report.)
+        if new_airplay && self.vsync.is_muted() {
+            self.speaker_control.send(SpeakerCommand::Mute(true));
+        }
         Ok(())
+    }
+
+    /// Make `session` the bound one, under the session lock held in
+    /// `guard`. Volume changes still queued for the old speaker are
+    /// dropped rather than sent to this one, and nothing sent to the old
+    /// one is taken for an echo from this one. Returns the new session's
+    /// number (see [`SpeakerControl`]).
+    fn bind_session(&self, guard: &mut std::sync::MutexGuard<'_, Option<ActiveSession>>, session: ActiveSession) -> u64 {
+        **guard = Some(session);
+        let number = self.speaker_control.session_bound();
+        self.vsync.speaker_bound();
+        number
     }
 
     fn start_upnp(&self, id: &str) -> Result<ActiveSession, String> {
@@ -2275,7 +2530,7 @@ impl App {
                     renderer,
                     local_ip,
                     samples_rx,
-                    initial_volume: Some(80),
+                    initial_volume: Some(self.airplay_start_volume()),
                     // Short — RAOP OPTIONS is a sub-100 ms LAN round-trip, so
                     // a dead/vestigial RAOP service (Sonos) fails fast and we
                     // move on to AirPlay 2.
@@ -2305,7 +2560,7 @@ impl App {
                     renderer,
                     local_ip,
                     samples_rx,
-                    initial_volume: Some(80),
+                    initial_volume: Some(self.airplay_start_volume()),
                     prefer_realtime,
                     latency_ms,
                     pairing_creds,
@@ -2610,31 +2865,79 @@ impl App {
         tx.send(pin).is_ok()
     }
 
-    /// Current speaker-side volume (0-100) if known. None on a fresh
-    /// session before the first prime_initial_volume / GENA NOTIFY.
+    /// Current speaker-side volume (0-100) if known: None until a level
+    /// came from the Windows slider, the window's slider or a speaker.
     pub fn current_volume(&self) -> Option<u32> {
         self.vsync.current_level()
     }
 
-    /// Push a user-set volume to the bound speaker. No-op if no
-    /// speaker is bound. Runs the network call on a detached thread so
-    /// the caller (GUI slider) doesn't block. Routes through the
-    /// session enum's `set_volume_pct`, so it works for both the UPnP
-    /// (SetVolume SOAP) and AirPlay (SET_PARAMETER) paths.
+    /// The window's volume slider set `level`. Sets the window's level and
+    /// the Windows slider, and queues the level for the bound speaker's
+    /// volume thread (see [`SpeakerControl`]), so the caller doesn't
+    /// block. Moving the slider unmutes, as the Windows volume slider
+    /// does. No-op unless the bound speaker takes volume changes.
     pub fn set_speaker_volume(&self, level: u32) {
+        if !self.speaker_volume_controllable() {
+            return;
+        }
         let level = level.min(100);
-        // Update the cache immediately so the slider doesn't snap
-        // back to the old value while the network call is in flight.
-        self.vsync.prime_initial_volume(level);
-        let session = self.session.clone();
-        std::thread::spawn(move || {
-            let guard = session.lock().unwrap();
-            if let Some(s) = guard.as_ref() {
-                if let Err(e) = s.set_volume_pct(level) {
-                    log::warn!("set speaker volume to {} failed: {:#}", level, e);
-                }
-            }
-        });
+        let unmute = self.vsync.is_muted();
+        if unmute {
+            self.vsync.note_muted(false);
+        }
+        // Update the level at once so the slider doesn't snap back while
+        // the network call is in flight, and move the Windows slider with
+        // it: the speaker's report of this level is an echo, so it won't,
+        // and the next Windows key press would otherwise step from the old
+        // Windows level.
+        if self.vsync.window_changed(level) || unmute {
+            push_windows_level(&self.windows_volume, level, false);
+        }
+        // Level first: on AirPlay an unmute restores the session's level,
+        // which is then already the new one.
+        self.speaker_control.send(SpeakerCommand::Volume(level));
+        if unmute {
+            self.speaker_control.send(SpeakerCommand::Mute(false));
+        }
+    }
+
+    /// The bound speaker takes volume changes from us (every transport but
+    /// Music Assistant, which keeps its own volume per speaker).
+    pub fn speaker_volume_controllable(&self) -> bool {
+        self.session.lock().unwrap().as_ref().is_some_and(|s| s.has_volume_control())
+    }
+
+    /// The level an AirPlay session starts the speaker at: the current
+    /// one, so a reconnect or a switch keeps what the window and Windows
+    /// show, else a default.
+    fn airplay_start_volume(&self) -> u32 {
+        self.vsync.current_level().unwrap_or(AIRPLAY_DEFAULT_VOLUME)
+    }
+
+    /// The speaker bound as session `session_number` is at `level` as
+    /// its session starts: show it in the window and on the Windows
+    /// slider, unless another speaker has been bound since or a level was
+    /// set for this one meanwhile.
+    fn speaker_level_on_connect(&self, session_number: u64, level: u32) {
+        if self.speaker_control.session_number() != session_number {
+            return;
+        }
+        if let Some(level) = self.vsync.speaker_connected(level) {
+            info!("speaker -> windows: volume {} (as the session started)", level);
+            push_windows_level(&self.windows_volume, level, self.vsync.is_muted());
+        }
+    }
+
+    /// Register how to set the Windows slider (the driver's volume push).
+    /// The first registration wins.
+    pub fn set_windows_volume_push(&self, push: impl Fn(i32, bool) -> Result<()> + Send + Sync + 'static) {
+        let _ = self.windows_volume.set(Box::new(push));
+    }
+
+    /// Queue a volume or mute change from Windows for the bound speaker.
+    /// Returns at once; the send happens on the volume thread.
+    pub fn send_to_speaker(&self, cmd: SpeakerCommand) {
+        self.speaker_control.send(cmd);
     }
 
     /// Disconnect from the current speaker (if any), clear the
@@ -3051,6 +3354,38 @@ impl App {
         self.started_at.elapsed().as_secs()
     }
 
+    /// Audio loop: a packet came from Windows (not generated here);
+    /// `audible` is whether it carried sound.
+    pub fn note_source_packet(&self, audible: bool) {
+        let ms = self.started_at.elapsed().as_millis() as u64 + 1;
+        self.source_packet_at_ms.store(ms, Ordering::Relaxed);
+        if audible {
+            self.source_sound_at_ms.store(ms, Ordering::Relaxed);
+        }
+    }
+
+    /// Windows is giving the audio loop a stream, with sound or silent:
+    /// what the window's status and the tray call streaming. The driver's
+    /// stream flag alone is set from launch until Windows first stops a
+    /// stream, whether anything came or not.
+    pub fn receiving_windows_audio(&self) -> bool {
+        matches!(self.windows_audio(), WindowsAudio::Playing | WindowsAudio::Silent)
+    }
+
+    /// What Windows is giving the audio loop right now.
+    pub fn windows_audio(&self) -> WindowsAudio {
+        let now = self.started_at.elapsed().as_millis() as u64 + 1;
+        let since = |at: &AtomicU64| {
+            let at = at.load(Ordering::Relaxed);
+            (at != 0).then(|| Duration::from_millis(now.saturating_sub(at)))
+        };
+        WindowsAudio::classify(
+            self.stream_active.load(Ordering::Acquire),
+            since(&self.source_packet_at_ms),
+            since(&self.source_sound_at_ms),
+        )
+    }
+
     // -------------------------------------------------------------------
     // Diagnostics
     // -------------------------------------------------------------------
@@ -3102,7 +3437,7 @@ impl App {
             session_secs,
             reconnects: self.reconnects.load(Ordering::Relaxed),
             streaming_enabled: self.is_streaming_enabled(),
-            audio_active: self.stream_active.load(Ordering::Acquire),
+            windows_audio: self.windows_audio(),
             connecting_to: self.connecting_to(),
             packets_published: self.packets_published(),
             idle_silence_packets: self.idle_silence_packets.load(Ordering::Relaxed),
@@ -3437,6 +3772,314 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn windows_audio_starts_unknown_and_follows_the_packets() {
+        let app = test_app();
+        // The app starts out reading from Windows before anything came.
+        assert_eq!(app.diagnostics_snapshot().windows_audio, WindowsAudio::NothingYet);
+        app.note_source_packet(false);
+        assert_eq!(app.windows_audio(), WindowsAudio::Silent);
+        app.note_source_packet(true);
+        assert_eq!(app.windows_audio(), WindowsAudio::Playing);
+        // A silent packet right after sound is a pause, not silence yet.
+        app.note_source_packet(false);
+        assert_eq!(app.windows_audio(), WindowsAudio::Playing);
+        app.stream_active.store(false, Ordering::Release);
+        assert_eq!(app.windows_audio(), WindowsAudio::Stopped);
+    }
+
+    #[test]
+    fn streaming_status_needs_packets_from_windows() {
+        let app = test_app();
+        // At launch the stream flag is set but nothing has come.
+        assert!(app.stream_active.load(Ordering::Acquire));
+        assert!(!app.receiving_windows_audio());
+        // A silent stream still counts, as before.
+        app.note_source_packet(false);
+        assert!(app.receiving_windows_audio());
+        app.note_source_packet(true);
+        assert!(app.receiving_windows_audio());
+        app.stream_active.store(false, Ordering::Release);
+        assert!(!app.receiving_windows_audio());
+    }
+
+    /// What the fake UPnP speaker was asked to do.
+    #[derive(Debug, PartialEq)]
+    enum Soap {
+        Volume(u32),
+        Mute(bool),
+    }
+
+    /// A UPnP speaker on loopback that reports each SetVolume and SetMute
+    /// and answers only when the test releases it, like a slow speaker.
+    fn slow_soap_speaker() -> (
+        String,
+        crossbeam_channel::Receiver<Soap>,
+        crossbeam_channel::Sender<()>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/RenderingControl/Control", listener.local_addr().unwrap());
+        let (got_tx, got_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded::<()>();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !String::from_utf8_lossy(&req).contains("</s:Envelope>") {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&req).into_owned();
+                let field = |name: &str| {
+                    req.split(&format!("<{}>", name))
+                        .nth(1)
+                        .and_then(|r| r.split('<').next())
+                        .and_then(|v| v.parse::<u32>().ok())
+                };
+                let what = match (field("DesiredVolume"), field("DesiredMute")) {
+                    (Some(level), _) => Soap::Volume(level),
+                    (None, Some(m)) => Soap::Mute(m != 0),
+                    (None, None) => return,
+                };
+                if got_tx.send(what).is_err() || release_rx.recv().is_err() {
+                    return;
+                }
+                let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        (url, got_rx, release_tx)
+    }
+
+    /// Bind `session` the way selecting a speaker does.
+    fn bind(app: &App, session: ActiveSession) {
+        let mut guard = app.session.lock().unwrap();
+        app.bind_session(&mut guard, session);
+    }
+
+    fn upnp_session(control_url: &str) -> ActiveSession {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        ActiveSession::Upnp(RendererSession {
+            renderer: Renderer {
+                friendly_name: "Kitchen".into(),
+                ip,
+                base_url: String::new(),
+                av_transport_control_url: String::new(),
+                rendering_control_control_url: control_url.into(),
+                rendering_control_event_url: String::new(),
+                av_transport_event_url: None,
+                udn: Some("uuid:kitchen".into()),
+                zone_group_topology_control_url: None,
+                group_rendering_control_control_url: None,
+                group_rendering_control_event_url: None,
+                zone_name: None,
+                group_members: Vec::new(),
+                group_member_addrs: Vec::new(),
+                host_addrs: vec![ip],
+                model_name: None,
+                udn_conflict: false,
+            },
+            gena: GenaManager::new("http://127.0.0.1:1/gena".into()),
+            stream_uri: String::new(),
+            stream_grant: None,
+            id_override: None,
+        })
+    }
+
+    #[test]
+    fn a_slow_speaker_holds_up_neither_the_window_nor_the_newest_level() {
+        let app = test_app();
+        let (url, got, release) = slow_soap_speaker();
+        bind(&app, upnp_session(&url));
+        let wait = Duration::from_secs(5);
+
+        app.send_to_speaker(SpeakerCommand::Volume(31));
+        assert_eq!(got.recv_timeout(wait), Ok(Soap::Volume(31)));
+        // The speaker is sitting on that request. The window's per-repaint
+        // session reads must not wait for it, and the drag goes on.
+        assert!(app.session.try_lock().is_ok(), "session lock held across the speaker round trip");
+        assert!(app.selected_speaker().is_some());
+        for level in 32..=50 {
+            app.send_to_speaker(SpeakerCommand::Volume(level));
+        }
+        release.send(()).unwrap();
+        // Next comes the newest level, not 32, 33, …
+        assert_eq!(got.recv_timeout(wait), Ok(Soap::Volume(50)));
+        release.send(()).unwrap();
+        assert!(got.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn the_window_slider_sets_the_speaker_and_the_windows_slider() {
+        let app = test_app();
+        let pushed = record_windows_pushes(&app);
+        let (url, got, release) = slow_soap_speaker();
+        bind(&app, upnp_session(&url));
+        app.set_speaker_volume(64);
+        assert_eq!(app.current_volume(), Some(64));
+        assert_eq!(*pushed.lock().unwrap(), vec![(sonos_to_millibels(64), false)]);
+        // Windows reports the level straight back: not a new change.
+        assert_eq!(app.vsync.driver_changed(64), None);
+        assert_eq!(got.recv_timeout(Duration::from_secs(5)), Ok(Soap::Volume(64)));
+        release.send(()).unwrap();
+        // The same level again still goes to the speaker, not to Windows.
+        app.set_speaker_volume(64);
+        assert_eq!(got.recv_timeout(Duration::from_secs(5)), Ok(Soap::Volume(64)));
+        release.send(()).unwrap();
+        assert_eq!(pushed.lock().unwrap().len(), 1);
+    }
+
+    /// Records what is pushed to the Windows slider.
+    fn record_windows_pushes(app: &App) -> Arc<Mutex<Vec<(i32, bool)>>> {
+        let pushed = Arc::new(Mutex::new(Vec::new()));
+        let p = pushed.clone();
+        app.set_windows_volume_push(move |mb, muted| {
+            p.lock().unwrap().push((mb, muted));
+            Ok(())
+        });
+        pushed
+    }
+
+    #[test]
+    fn levels_queued_for_one_speaker_never_reach_the_next() {
+        let app = test_app();
+        let (url_a, got_a, release_a) = slow_soap_speaker();
+        let (url_b, got_b, release_b) = slow_soap_speaker();
+        let wait = Duration::from_secs(5);
+        bind(&app, upnp_session(&url_a));
+        app.send_to_speaker(SpeakerCommand::Volume(22));
+        assert_eq!(got_a.recv_timeout(wait), Ok(Soap::Volume(22)));
+        // A is slow; the user turns it up, hears nothing, and switches.
+        app.send_to_speaker(SpeakerCommand::Volume(70));
+        app.send_to_speaker(SpeakerCommand::Mute(true));
+        bind(&app, upnp_session(&url_b));
+        release_a.send(()).unwrap();
+        assert!(got_a.recv_timeout(Duration::from_millis(300)).is_err());
+        assert!(got_b.recv_timeout(Duration::from_millis(300)).is_err());
+        // Changes made after the switch go to B.
+        app.send_to_speaker(SpeakerCommand::Volume(40));
+        assert_eq!(got_b.recv_timeout(wait), Ok(Soap::Volume(40)));
+        release_b.send(()).unwrap();
+    }
+
+    #[test]
+    fn moving_the_window_slider_unmutes() {
+        let app = test_app();
+        let pushed = record_windows_pushes(&app);
+        let (url, got, release) = slow_soap_speaker();
+        bind(&app, upnp_session(&url));
+        app.vsync.note_muted(true);
+        app.set_speaker_volume(30);
+        assert!(!app.vsync.is_muted());
+        assert_eq!(*pushed.lock().unwrap(), vec![(sonos_to_millibels(30), false)]);
+        let wait = Duration::from_secs(5);
+        assert_eq!(got.recv_timeout(wait), Ok(Soap::Volume(30)));
+        release.send(()).unwrap();
+        assert_eq!(got.recv_timeout(wait), Ok(Soap::Mute(false)));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn the_window_slider_does_nothing_without_a_speaker() {
+        let app = test_app();
+        let pushed = record_windows_pushes(&app);
+        app.set_speaker_volume(30);
+        assert_eq!(app.current_volume(), None);
+        assert!(pushed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_new_speakers_level_moves_the_windows_slider() {
+        let app = test_app();
+        let pushed = record_windows_pushes(&app);
+        let (url, _got, _release) = slow_soap_speaker();
+        app.vsync.driver_changed(50);
+        let number = {
+            let mut guard = app.session.lock().unwrap();
+            app.bind_session(&mut guard, upnp_session(&url))
+        };
+        app.speaker_level_on_connect(number, 20);
+        assert_eq!(app.current_volume(), Some(20));
+        assert_eq!(*pushed.lock().unwrap(), vec![(sonos_to_millibels(20), false)]);
+        // A level read from a speaker no longer bound is ignored.
+        bind(&app, upnp_session(&url));
+        app.speaker_level_on_connect(number, 35);
+        assert_eq!(app.current_volume(), Some(20));
+        assert_eq!(pushed.lock().unwrap().len(), 1);
+    }
+
+    /// The connect step of `select_speaker_inner` for `session`: bind it
+    /// and show the level it reports as it starts, if any.
+    fn connect_with_level(app: &App, session: ActiveSession) {
+        let level = session.level_on_connect();
+        let number = {
+            let mut guard = app.session.lock().unwrap();
+            app.bind_session(&mut guard, session)
+        };
+        if let Some(level) = level {
+            app.speaker_level_on_connect(number, level);
+        }
+    }
+
+    #[test]
+    fn a_sendspin_player_without_a_level_leaves_the_sliders_alone() {
+        use crate::sendspin::server::test_player;
+        let app = test_app();
+        let pushed = record_windows_pushes(&app);
+        app.vsync.driver_changed(50);
+        // It takes the volume command but never says where it is.
+        let (session, player) = test_player::connect(&["volume", "mute"], None);
+        connect_with_level(&app, ActiveSession::Sendspin(session));
+        assert_eq!(app.current_volume(), Some(50));
+        assert!(pushed.lock().unwrap().is_empty());
+        // A level it reports later is its level from then on.
+        player.report(serde_json::json!({"volume": 40}));
+        let reported = || match app.session.lock().unwrap().as_ref() {
+            Some(ActiveSession::Sendspin(s)) => s.volume(),
+            _ => None,
+        };
+        assert!(test_player::eventually(|| reported() == Some(40)));
+    }
+
+    #[test]
+    fn a_sendspin_players_reported_level_moves_the_sliders() {
+        use crate::sendspin::server::test_player;
+        let app = test_app();
+        let pushed = record_windows_pushes(&app);
+        app.vsync.driver_changed(50);
+        let (session, _player) = test_player::connect(&["volume"], Some(30));
+        connect_with_level(&app, ActiveSession::Sendspin(session));
+        assert_eq!(app.current_volume(), Some(30));
+        assert_eq!(*pushed.lock().unwrap(), vec![(sonos_to_millibels(30), false)]);
+    }
+
+    #[test]
+    fn where_the_speaker_settles_reaches_the_windows_slider() {
+        let app = test_app();
+        let pushed = record_windows_pushes(&app);
+        let (url, got, release) = slow_soap_speaker();
+        bind(&app, upnp_session(&url));
+        let wait = Duration::from_secs(5);
+        for level in [30, 60] {
+            assert_eq!(app.vsync.driver_changed(level), Some(level));
+            app.send_to_speaker(SpeakerCommand::Volume(level));
+            assert_eq!(got.recv_timeout(wait), Ok(Soap::Volume(level)));
+            release.send(()).unwrap();
+        }
+        // The speaker's last word names 30: it stopped there.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(app.vsync.sonos_changed(30), None);
+        let deadline = Instant::now() + wait;
+        while pushed.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(*pushed.lock().unwrap(), vec![(sonos_to_millibels(30), false)]);
+        assert_eq!(app.current_volume(), Some(30));
     }
 
     #[test]
