@@ -304,10 +304,12 @@ overlap (a concurrency group per tag).
    (the unsigned rebuilt driver, copies of the reference and shipped
    packages) — expires
    after one day, the minimum; the chain's jobs read them within the
-   hours the run takes. The `cleanup` job deletes `unsigned-service-exe`
-   as soon as `sign-service` succeeded, and `unsigned-setup-exe`,
-   `release-inputs` and `binaries-<ver>` as soon as `sign-release`
-   succeeded, since nothing reads them after that.
+   hours the run takes. The `cleanup` job runs after `sign-release`
+   finishes or is skipped; it then deletes `unsigned-service-exe` if
+   `sign-service` succeeded, and `unsigned-setup-exe`, `release-inputs`
+   and `binaries-<ver>` if `sign-release` succeeded, since nothing reads
+   them after that. Until then they stay downloadable. The gate's
+   comparison artifact is not deleted; it expires.
 
 Final release assets: signed `StreamToSpeakerSetup-<ver>.exe`, signed
 `stream-to-speaker-<ver>.exe`, the `StreamToSpeakerSetup.exe` alias,

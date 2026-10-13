@@ -648,8 +648,9 @@ jobs:
 
   # -------------------------------------------------------------------
   # Tag-push release pipeline: build → sign-service → package →
-  # verify-driver → sign-release → publish (and cleanup, which deletes
-  # artifacts with unsigned binaries once the exes are signed).
+  # verify-driver → sign-release → publish (and cleanup, which runs after
+  # sign-release and deletes artifacts with unsigned binaries that nothing
+  # reads any more).
   #
   # The version is assembled in a DRAFT release (release_draft.py) and
   # becomes public only in the last job, `publish`, once the draft holds
@@ -672,8 +673,9 @@ jobs:
   # The artifacts that carry unsigned binaries between the jobs
   # (release-inputs, unsigned-service-exe, unsigned-setup-exe, the build
   # job's binaries-<ver> and the release gate's comparison artifact) are
-  # kept for one day, and cleanup deletes the first four once nothing
-  # reads them; a tag run uploads no test-signed dev installer. Re-running
+  # kept for one day; cleanup, after sign-release, deletes the first four
+  # once nothing reads them (the gate's artifact expires); a tag run
+  # uploads no test-signed dev installer. Re-running
   # a job after the artifact it reads has expired or been deleted fails
   # before anything is signed; re-run all jobs then.
   #
@@ -784,7 +786,8 @@ jobs:
           if-no-files-found: error
           # Read by the signing repo once the request is approved; one day,
           # the minimum, is enough (a re-run of this job uploads it again).
-          # The cleanup job deletes it once the exe is signed.
+          # The cleanup job deletes it after sign-release finishes or is
+          # skipped, if sign-service succeeded.
           retention-days: 1
           # A re-run of this job replaces the earlier attempt's artifact.
           overwrite: true
@@ -1000,7 +1003,7 @@ jobs:
           if-no-files-found: error
           # Read by verify-driver, sign-release and the signing repo once the
           # request is approved: one day, the minimum. The cleanup job
-          # deletes it once the installer is signed.
+          # deletes it after sign-release, if the installer was signed.
           retention-days: 1
           # A re-run of this job builds and replaces it (new sha256, which
           # the jobs after it follow).
@@ -1181,11 +1184,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "could not remove the assets of an earlier attempt (see above)" }
 
   # Nothing in the run reads the artifacts with unsigned binaries in them
-  # once the exes are signed, so they are deleted then rather than left
-  # downloadable for the rest of their day: unsigned-service-exe once
-  # sign-service succeeded; unsigned-setup-exe, release-inputs and
-  # binaries-<ver> once sign-release succeeded. (A failed chain keeps them
-  # for re-running its failed jobs; they expire after a day.)
+  # once the exes are signed, so they are deleted rather than left
+  # downloadable for the rest of their day. This job runs after
+  # sign-release finishes or is skipped (until then they stay
+  # downloadable) and deletes unsigned-service-exe if sign-service
+  # succeeded, and unsigned-setup-exe, release-inputs and binaries-<ver>
+  # if sign-release succeeded. (A failed chain keeps them for re-running
+  # its failed jobs; they expire after a day, as does the release gate's
+  # comparison artifact, which is not deleted here.)
   cleanup:
     if: >-
       !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
