@@ -1,7 +1,15 @@
-//! One shared mDNS daemon for Sendspin: advertising our source client
-//! (`_sendspin._tcp`) and browsing for players (`_sendspin._tcp` too —
+//! Sendspin over mDNS: advertising our source client (`_sendspin._tcp`)
+//! and recognising it when browsing for players (`_sendspin._tcp` too —
 //! players and sources are both Sendspin *clients*, discovered by the
 //! server the same way).
+//!
+//! The advertisement runs on one process-wide daemon on every network
+//! adapter. Browsing for players runs on a daemon of its own that follows
+//! the discovery adapter choice (`discovery_net`): that choice is about
+//! where to search for speakers, while the advertisement is how Music
+//! Assistant finds this PC. Each adapter announces only addresses in its
+//! own subnet, so the advertisement never hands out an address from the
+//! wrong network.
 
 use anyhow::{anyhow, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
@@ -18,7 +26,7 @@ pub const DEFAULT_PATH: &str = "/sendspin";
 static DAEMON: OnceLock<Mutex<Option<ServiceDaemon>>> = OnceLock::new();
 static OWN_INSTANCES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-/// The process-wide Sendspin mDNS daemon (created on first use).
+/// The process-wide daemon that advertises this PC (created on first use).
 pub fn daemon() -> Result<ServiceDaemon> {
     let slot = DAEMON.get_or_init(|| Mutex::new(None));
     let mut g = slot.lock().map_err(|_| anyhow!("mdns lock poisoned"))?;

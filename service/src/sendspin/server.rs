@@ -27,7 +27,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use log::{debug, info, warn};
-use mdns_sd::{ServiceEvent, ServiceInfo};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -108,6 +108,12 @@ impl SendspinDiscoveryState {
         self.players.lock().unwrap().insert(r.instance.to_ascii_lowercase(), r);
     }
 
+    /// Forget every player (discovery moved to another network, or
+    /// paused).
+    pub fn clear(&self) {
+        self.players.lock().unwrap().clear();
+    }
+
     fn remove_fullname(&self, fullname: &str) {
         let instance = instance_from_fullname(fullname).to_ascii_lowercase();
         self.players.lock().unwrap().remove(&instance);
@@ -147,47 +153,52 @@ fn renderer_from_info(info: &ServiceInfo) -> Option<SendspinRenderer> {
     })
 }
 
-/// Browse `_sendspin._tcp` in the background, skipping our own source
-/// advertisement.
-pub fn spawn_discovery(state: Arc<SendspinDiscoveryState>) -> Result<()> {
-    let daemon = mdns::daemon()?;
+/// Browse `_sendspin._tcp` on `daemon` in the background, skipping our
+/// own source advertisement. The thread ends when the daemon shuts down.
+/// Speaker discovery has a daemon of its own, separate from the one that
+/// advertises this PC (see [`mdns`]), so it can be limited to the
+/// discovery network adapter without taking the advertisement along.
+pub fn spawn_discovery_on(state: Arc<SendspinDiscoveryState>, daemon: ServiceDaemon) -> Result<()> {
     let rx = daemon
         .browse(mdns::CLIENT_SERVICE)
         .map_err(|e| anyhow!("mDNS browse {}: {}", mdns::CLIENT_SERVICE, e))?;
     std::thread::Builder::new()
         .name("sendspin-discovery".into())
-        .spawn(move || loop {
-            match rx.recv_timeout(Duration::from_secs(60)) {
-                Ok(ServiceEvent::ServiceResolved(info)) => {
-                    if mdns::is_own_instance(info.get_fullname()) || mdns::is_source_advert(&info) {
-                        continue;
+        .spawn(move || {
+            // Keeps the daemon alive for as long as the browse runs.
+            let _daemon = daemon;
+            loop {
+                match rx.recv_timeout(Duration::from_secs(60)) {
+                    Ok(ServiceEvent::ServiceResolved(info)) => {
+                        if mdns::is_own_instance(info.get_fullname()) || mdns::is_source_advert(&info) {
+                            continue;
+                        }
+                        if let Some(r) = renderer_from_info(&info) {
+                            debug!("Sendspin player resolved: {} @ {}", r.friendly_name, r.url());
+                            state.insert(r);
+                        }
                     }
-                    if let Some(r) = renderer_from_info(&info) {
-                        debug!("Sendspin player resolved: {} @ {}", r.friendly_name, r.url());
-                        state.insert(r);
+                    Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
+                        debug!("Sendspin player removed: {}", fullname);
+                        state.remove_fullname(&fullname);
                     }
-                }
-                Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
-                    debug!("Sendspin player removed: {}", fullname);
-                    state.remove_fullname(&fullname);
-                }
-                Ok(ServiceEvent::SearchStopped(_)) => return,
-                Ok(_) => {}
-                Err(flume::RecvTimeoutError::Timeout) => {}
-                Err(flume::RecvTimeoutError::Disconnected) => {
-                    debug!("Sendspin mDNS browse ended");
-                    return;
+                    Ok(ServiceEvent::SearchStopped(_)) => return,
+                    Ok(_) => {}
+                    Err(flume::RecvTimeoutError::Timeout) => {}
+                    Err(flume::RecvTimeoutError::Disconnected) => {
+                        debug!("Sendspin mDNS browse ended");
+                        return;
+                    }
                 }
             }
         })?;
     Ok(())
 }
 
-/// Stop the browse started by [`spawn_discovery`]; its thread exits.
-pub fn stop_discovery() {
-    if let Ok(d) = mdns::daemon() {
-        let _ = d.stop_browse(mdns::CLIENT_SERVICE);
-    }
+/// [`spawn_discovery_on`] a new daemon, on every adapter.
+pub fn spawn_discovery(state: Arc<SendspinDiscoveryState>) -> Result<()> {
+    let daemon = ServiceDaemon::new().map_err(|e| anyhow!("mDNS daemon: {}", e))?;
+    spawn_discovery_on(state, daemon)
 }
 
 // ---------------------------------------------------------------------------
