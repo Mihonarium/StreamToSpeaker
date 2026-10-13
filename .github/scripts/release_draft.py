@@ -33,6 +33,10 @@ check), the /releases/latest/download/ links or the public release list.
       the assets that were checked (an asset replaced since gets a new id),
       and that the tag exists and points at SHA (publishing a draft whose
       tag is missing would create the tag at the release's target branch).
+      A -testsigned fallback NAME is published as a pre-release that is
+      never made latest, so releases/latest (the app's update check) and
+      the stable download link stay on the last release with a
+      Microsoft-signed driver.
 
 `ensure`, `require` and `check` write `release_id` to GITHUB_OUTPUT. Uses
 the gh CLI with GH_TOKEN; drafts are visible only to a token with push
@@ -144,6 +148,11 @@ def require_version(tag, version):
         raise ReleaseError(f"version {clean_text(version)!r} is not the version of the tag {tag}")
 
 
+def testsigned(installer):
+    """Whether the setup exe bundles the test-signed fallback driver."""
+    return installer.endswith("-testsigned.exe")
+
+
 def expected_assets(version, installer, provenance):
     if not VERSION_RE.fullmatch(version or ""):
         raise ReleaseError(f"malformed version {clean_text(version)!r}")
@@ -154,7 +163,7 @@ def expected_assets(version, installer, provenance):
     if provenance:
         names |= {service + ".sigstore.json", installer + ".sigstore.json"}
     # The stable download link must never lead to a test-signed fallback.
-    if not installer.endswith("-testsigned.exe"):
+    if not testsigned(installer):
         names |= {ALIAS, ALIAS + ".sha256"}
     return names
 
@@ -291,10 +300,15 @@ def publish(repo, tag, release_id, checked_ids, commit, version, installer, prov
     pointed = tag_commit(repo, tag, run)
     if pointed != commit:
         raise ReleaseError(f"the tag {tag} points at {pointed}, not at {commit} the release was built from")
+    # A test-signed fallback needs testsigning mode: a pre-release, never
+    # the latest release, so the update check and the stable download link
+    # keep pointing at the last release with a Microsoft-signed driver.
+    fallback = testsigned(installer)
     out = run("api", "--method", "PATCH", f"repos/{repo}/releases/{rel['id']}",
-              "-F", "draft=false", "-f", "make_latest=true")
+              "-F", "draft=false", "-F", f"prerelease={str(fallback).lower()}",
+              "-f", f"make_latest={str(not fallback).lower()}")
     result = json.loads(out)
-    if result.get("draft") is not False or result.get("tag_name") != tag:
+    if result.get("draft") is not False or result.get("tag_name") != tag or result.get("prerelease") is not fallback:
         raise ReleaseError(f"publishing {tag} did not take effect")
     return result
 
@@ -336,7 +350,8 @@ def main(argv=None):
                 raise ReleaseError("publish needs --version, --installer, --release-id, --asset-ids and --commit")
             result = publish(a.repo, a.tag, a.release_id, a.asset_ids, a.commit, a.version, a.installer,
                              a.provenance)
-            print(f"published {a.tag}: {clean_text(result.get('html_url', ''))}")
+            kind = "as a pre-release (test-signed driver), not as latest" if testsigned(a.installer) else "as the latest release"
+            print(f"published {a.tag} {kind}: {clean_text(result.get('html_url', ''))}")
             return 0
     except ReleaseError as e:
         print(f"::error::{command_text(e)}")

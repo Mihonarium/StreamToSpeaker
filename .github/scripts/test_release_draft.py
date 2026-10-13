@@ -72,8 +72,11 @@ class FakeGh:
         if args[:3] == ("api", "--method", "PATCH"):
             rid = int(args[3].rsplit("/", 1)[1])
             rel = next(r for r in self.releases if r["id"] == rid)
-            rel["draft"] = False
-            return json.dumps({"id": rid, "draft": False, "tag_name": rel["tag_name"], "html_url": "https://x"})
+            fields = dict(a.split("=", 1) for a in args if "=" in a)
+            rel["draft"] = fields["draft"] == "true"
+            rel["prerelease"] = fields.get("prerelease", "false") == "true"
+            return json.dumps({"id": rid, "draft": rel["draft"], "prerelease": rel["prerelease"],
+                               "tag_name": rel["tag_name"], "html_url": "https://x"})
         raise AssertionError(f"unexpected gh call {args}")
 
 
@@ -302,11 +305,11 @@ class Publish(unittest.TestCase):
     def setUp(self):
         self.names = sorted(complete_files())
 
-    def publish(self, gh, release_id="2", ids=None, commit=COMMIT, version=V):
+    def publish(self, gh, release_id="2", ids=None, commit=COMMIT, version=V, installer=INSTALLER):
         if ids is None:
             rel = next(r for r in gh.releases if r["id"] == int(release_id))
-            ids = rd.asset_ids(rel, rd.expected_assets(V, INSTALLER, True))
-        return rd.publish(REPO, "v0.1.11", release_id, ids, commit, version, INSTALLER, True, gh)
+            ids = rd.asset_ids(rel, rd.expected_assets(V, installer, True))
+        return rd.publish(REPO, "v0.1.11", release_id, ids, commit, version, installer, True, gh)
 
     def patched(self, gh):
         return [c for c in gh.calls if c[:3] == ("api", "--method", "PATCH")]
@@ -317,7 +320,37 @@ class Publish(unittest.TestCase):
         patch = self.patched(gh)[0]
         self.assertEqual(patch[3], f"repos/{REPO}/releases/2")
         self.assertIn("draft=false", patch)
+        self.assertIn("prerelease=false", patch)
         self.assertIn("make_latest=true", patch)
+
+    def test_testsigned_fallback_is_a_prerelease_never_latest(self):
+        installer = f"StreamToSpeakerSetup-{V}-testsigned.exe"
+        gh = FakeGh([release("v0.1.10", rid=1, draft=False),
+                     release("v0.1.11", rid=2, names=sorted(complete_files(installer)))])
+        result = self.publish(gh, installer=installer)
+        patch = self.patched(gh)[0]
+        self.assertIn("draft=false", patch)
+        self.assertIn("prerelease=true", patch)
+        self.assertIn("make_latest=false", patch)
+        self.assertNotIn("make_latest=true", patch)
+        self.assertIs(result["prerelease"], True)
+
+    def test_refuses_a_result_that_is_not_what_was_asked(self):
+        # A release that came out a pre-release (or not one, for the
+        # fallback) would be offered, or hidden, wrongly.
+        gh = FakeGh([release("v0.1.11", rid=2, names=self.names)])
+        real = gh.__call__
+
+        def flipped(*args):
+            out = real(*args)
+            if args[:3] == ("api", "--method", "PATCH"):
+                r = json.loads(out)
+                r["prerelease"] = not r["prerelease"]
+                return json.dumps(r)
+            return out
+        with self.assertRaisesRegex(rd.ReleaseError, "did not take effect"):
+            rd.publish(REPO, "v0.1.11", "2", rd.asset_ids(gh.releases[0], rd.expected_assets(V, INSTALLER, True)),
+                       COMMIT, V, INSTALLER, True, flipped)
 
     def test_annotated_tag_is_peeled(self):
         gh = FakeGh([release("v0.1.11", rid=2, names=self.names)], tags={"v0.1.11": ("tag", "ab" * 20, COMMIT)})

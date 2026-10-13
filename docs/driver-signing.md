@@ -78,8 +78,9 @@ The pairing rule everywhere: a driver-v release records
 and installer builds only bundle a Microsoft-signed driver whose
 `source_hash` equals the driver-source hash of the commit being built.
 Driver changed since the last signing round → installers fall back
-(preview: skipped; release: `-testsigned` suffix + warning) until you run
-the loop again.
+(preview: skipped; release: `-testsigned` suffix + warning, published as a
+pre-release that is never the latest release) until you run the loop
+again.
 
 **Selection order** (`.github/scripts/Get-AttestedDriver.ps1`, used by
 `build.yml` previews and the tagged `package` job): among matching
@@ -229,7 +230,9 @@ overlap (a concurrency group per tag).
    copy. If no Microsoft-signed driver matches, it falls back to the
    test-signed driver + cert and names the installer
    `StreamToSpeakerSetup-<ver>-testsigned.exe` with a warning — run Flow A
-   (or D), then re-tag, if you wanted a production release.
+   (or D), then re-tag, if you wanted a production release. Such a
+   version is published as a pre-release (see "Test-signed fallback
+   releases" below).
 4. `verify-driver` — the release gate. Runs `driver-reproducibility.yml`
    as a reusable workflow for the `driver-v*` release `package` picked:
    rebuilds the driver from the tagged commit (its driver source hash must
@@ -263,20 +266,23 @@ overlap (a concurrency group per tag).
    file, the alias identical to the setup exe, nothing else, every upload
    finished), and every `.exe` on it must carry a valid Authenticode
    signature (`signtool verify /pa`). Then it publishes the draft as the
-   latest release — only if the draft still holds the very assets that
-   were checked (same asset ids) and the tag still points at the commit
-   the chain built (publishing a draft whose tag is gone would create the
-   tag on the default branch). It runs after `sign-release` also in the
-   test-signed fallback (explicit status checks: the skipped gate does not
-   carry through). Until then no release and no release asset of the
-   version is public. The tag is, and so is the run itself: as for any
-   run in a public repository its logs and workflow artifacts can be
-   seen and downloaded by signed-in GitHub users. On a tag run those
-   artifacts include the `build` job's usual ones — the test-signed dev
-   installer `StreamToSpeakerSetup-<ver>` (30 days), `binaries-<ver>` with
-   the unsigned service exe (the repository's default retention) and
-   `release-inputs` (7 days) — and the chain's `unsigned-service-exe` and
-   `unsigned-setup-exe` (3 days).
+   latest release (a `-testsigned` fallback: as a pre-release with
+   `make_latest=false`) — only if the draft still holds the very assets
+   that were checked (same asset ids) and the tag still points at the
+   commit the chain built (publishing a draft whose tag is gone would
+   create the tag on the default branch). It runs after `sign-release`
+   also in the test-signed fallback (explicit status checks: the skipped
+   gate does not carry through). Until then no release and no release
+   asset of the version is public. The tag is, and so is the run itself:
+   as for any run in a public repository its logs and workflow artifacts
+   can be seen and downloaded by signed-in GitHub users. A tag run
+   therefore uploads no test-signed dev installer (the `build` job's
+   `StreamToSpeakerSetup-<ver>` artifact exists only for dev and
+   pull-request builds), and every artifact it uploads with unsigned
+   binaries in it — `binaries-<ver>` (the unsigned service exe and the
+   test-signed driver), `release-inputs`, `unsigned-service-exe` and
+   `unsigned-setup-exe` — expires after one day, the minimum; the chain's
+   jobs read them within the hours the run takes.
 
 Final release assets: signed `StreamToSpeakerSetup-<ver>.exe`, signed
 `stream-to-speaker-<ver>.exe`, the `StreamToSpeakerSetup.exe` alias,
@@ -293,11 +299,27 @@ nothing is published; re-run the failed jobs and the chain continues on
 the same draft. Re-running `package` builds a new installer (new SHA-256) and
 re-runs `verify-driver` and `sign-release` after it, so that rebuild is
 gated and signed in turn. The jobs pass their inputs as workflow
-artifacts, which expire (`unsigned-service-exe` / `unsigned-setup-exe`
-after 3 days, `release-inputs` after 7): re-running a later job after
-that fails before anything is signed — re-run from `package`, or all
-jobs, instead. A published release is never modified: once
-`publish` succeeded, re-running the chain fails at `sign-service`.
+artifacts, which expire after one day: re-running a job (or approving a
+signing request) more than a day after the artifact it reads was
+uploaded fails before anything is signed — re-run all jobs instead,
+which uploads every artifact again and asks for both approvals again. A
+published release is never modified: once `publish` succeeded,
+re-running the chain fails at `sign-service`.
+
+### Test-signed fallback releases
+
+A version whose installer bundles the test-signed driver
+(`StreamToSpeakerSetup-<ver>-testsigned.exe`, because no certified or
+attested driver release matches the tag's driver source) is published as
+a **pre-release** and never made the latest release. `releases/latest`,
+the stable `/releases/latest/download/StreamToSpeakerSetup.exe` link (the
+release carries no alias anyway) and the app's update check, which reads
+`releases/latest` and ignores pre-releases, all keep pointing at the last
+release with a Microsoft-signed driver. Such a release is for testing
+that version on machines with testsigning mode enabled, for example while
+the driver's signing round is still running; it is not offered to users.
+To ship the version, finish Flow A or D for that driver source and tag a
+new version.
 
 ### When the release gate fails
 
@@ -475,7 +497,7 @@ only cleaned (`repro_compare.py` `clean_text`) or between
 - **`Driver attested` fails INF comparison** — the zip doesn't belong to
   that submission (version mixup) or was repacked; re-download from Partner
   Center and attach as-is.
-- **Release says `-testsigned` unexpectedly** — the driver source changed
+- **Release says `-testsigned` (and is a pre-release) unexpectedly** — the driver source changed
   after the last signing round (any edit under `driver/` or `include/`
   changes the hash — a comment counts). Compare the manifest's
   `source_hash` on the newest certified/attested `driver-v*` release with
