@@ -650,8 +650,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "second ensure failed" }
           python .github/scripts/release_draft.py require $env:TAG --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw "require failed" }
-          $n = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \`"$env:TAG\`") | .id").Count
-          if ($n -ne 1) { throw "expected one release for $env:TAG, found $n" }
+          $ids = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.tag_name == env.TAG) | .id')
+          if ($LASTEXITCODE -ne 0) { throw "listing releases failed" }
+          if ($ids.Count -ne 1) { throw "expected one release for $env:TAG, found $($ids.Count)" }
           Write-Host "draft $id1, one release for the tag"
 
       - name: gh by tag on the draft (view / upload / download)
@@ -818,7 +819,8 @@ jobs:
           if ($code -ne "404") { throw "the release page answered $code" }
           $loc = curl.exe -s -o NUL -w "%{redirect_url}" -I "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/StreamToSpeakerSetup.exe"
           if ($loc -ne $env:LOCATION_BEFORE) { throw "the stable link moved to $loc" }
-          $urls = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \`"$env:TAG\`") | .assets[].browser_download_url")
+          $urls = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.tag_name == env.TAG) | .assets[].browser_download_url')
+          if ($LASTEXITCODE -ne 0) { throw "listing releases failed" }
           if (-not $urls) { throw "no draft asset URLs to probe" }
           foreach ($u in $urls) {
               $code = curl.exe -s -o NUL -w "%{http_code}" -I $u
@@ -832,16 +834,25 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $ids = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \`"$env:TAG\`" and .draft) | .id")
-          foreach ($id in $ids) {
-              gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/releases/$id"
-              if ($LASTEXITCODE -ne 0) { throw "could not delete draft $id" }
+          $ErrorActionPreference = "Stop"
+          # Also catches a draft the list shows only a moment later.
+          $deleted = 0
+          foreach ($wait in 0, 5, 10, 20) {
+              Start-Sleep -Seconds $wait
+              $ids = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.tag_name == env.TAG and .draft) | .id')
+              if ($LASTEXITCODE -ne 0) { throw "listing releases failed" }
+              foreach ($id in $ids) {
+                  gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/releases/$id"
+                  if ($LASTEXITCODE -ne 0) { throw "could not delete draft $id" }
+                  $deleted++
+              }
           }
-          $left = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \`"$env:TAG\`") | .id")
+          $left = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.tag_name == env.TAG) | .id')
+          if ($LASTEXITCODE -ne 0) { throw "listing releases failed" }
           if ($left.Count) { throw "releases for $env:TAG remain" }
           git ls-remote --exit-code --tags "https://github.com/$env:GITHUB_REPOSITORY" "refs/tags/$env:TAG" | Out-Null
           if ($LASTEXITCODE -eq 0) { throw "tag $env:TAG exists" }
-          Write-Host "deleted $($ids.Count) draft(s); no release and no tag $env:TAG"
+          Write-Host "deleted $deleted draft(s); no release and no tag $env:TAG"
           exit 0
 
   # Artifacts across re-run attempts: the first attempt of rerun-use fails
