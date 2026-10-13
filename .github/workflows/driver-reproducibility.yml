@@ -73,9 +73,11 @@
 #     `installer_sha256` pin it);
 #   * release gate (workflow_call, build.yml's verify-driver job): `tag`,
 #     `installer_artifact`, `installer_name` and `installer_sha256` are
-#     required and must be non-empty, and nothing is defaulted. The
-#     installer is the unsigned setup exe `package` uploaded as a workflow
-#     artifact of the same run; it is never a release asset.
+#     required and must be non-empty, and nothing is defaulted (`commit`
+#     may be empty: the caller's commit). The installer is the unsigned
+#     setup exe `package` uploaded as a workflow artifact of the same run;
+#     it is never a release asset. The comparison artifact this mode
+#     uploads (the unsigned rebuilt driver among it) is kept for one day.
 #   The mode follows from the workflow that started the run
 #   (github.workflow_ref), not from the inputs.
 #
@@ -134,8 +136,8 @@ on:
         description: "Expected SHA-256 of that setup exe (empty = check against its .sha256 asset if present)"
         required: false
         default: ""
-  # The release gate (build.yml's verify-driver job). Every input is
-  # required and must be non-empty.
+  # The release gate (build.yml's verify-driver job). Every input except
+  # `commit` is required and must be non-empty.
   workflow_call:
     inputs:
       tag:
@@ -926,6 +928,11 @@ jobs:
           name: driver-reproducibility-${{ steps.params.outputs.tag }}${{ steps.params.outputs.artifact_suffix }}
           # A re-run of the job replaces the artifact of an earlier attempt.
           overwrite: true
+          # It holds the unsigned rebuilt driver. As the release gate (called
+          # from another workflow, see Resolve parameters) it is kept for one
+          # day, like the release chain's other artifacts with unsigned
+          # binaries; standalone runs keep the repository default (0).
+          retention-days: ${{ !contains(github.workflow_ref, '/.github/workflows/driver-reproducibility.yml@') && 1 || 0 }}
           path: |
             fresh/
             evidence/
