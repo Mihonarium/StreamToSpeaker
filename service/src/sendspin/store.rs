@@ -4,8 +4,10 @@
 //! Two independent identities: one for our *source client* role (the
 //! `client_id` Music Assistant pairs with) and one for our *server* role
 //! (the `server_id` players pair with). Keys are raw X25519 private keys,
-//! base64url — the same trust level as the AirPlay pairing seeds already
-//! kept in this file.
+//! base64url. Each identity is stored sealed together with the pairings
+//! made with it (`secret_store::SECRET_GROUPS`): the client key, pairing
+//! PSK and server pairings as one entry, the server key and player
+//! pairings as another. Plain in memory.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -236,6 +238,35 @@ mod tests {
         // Older records without an instance still load.
         let r: PlayerPairing = serde_json::from_str(r#"{"psk":"x"}"#).unwrap();
         assert_eq!(r.instance, None);
+    }
+
+    #[test]
+    fn every_secret_field_is_in_a_sealed_group() {
+        let v = serde_json::to_value(SendspinConfig::default()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let groups: Vec<_> = crate::secret_store::SECRET_GROUPS
+            .iter()
+            .filter(|g| g.parent == ["sendspin"])
+            .collect();
+        let settings = [
+            "enabled",
+            "last_playback_server",
+            "pairing_code_failures",
+            "player_extra_latency_ms",
+            "source_enabled",
+            "source_name",
+        ];
+        let mut expected: Vec<&str> =
+            settings.iter().copied().chain(groups.iter().flat_map(|g| g.fields.iter().copied())).collect();
+        expected.sort_unstable();
+        // A new field must be listed here as a setting or join a group.
+        assert_eq!(keys, expected);
+        for g in &groups {
+            // Nor under one its pending identity uses (`<name>_pending`).
+            assert!(!keys.iter().any(|k| k.starts_with(g.name)), "{} is filed under a field name", g.name);
+            assert!(g.pairings.iter().all(|p| g.fields.contains(p)));
+        }
     }
 
     #[test]

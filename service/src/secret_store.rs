@@ -1,7 +1,8 @@
 //! At-rest protection for secrets inside `config.json`.
 //!
-//! Secrets (AirPlay passwords, pairing credentials, the controller seed)
-//! never sit in their normal fields on disk. Each one is moved into a
+//! Secrets (AirPlay passwords, pairing credentials, the controller seed;
+//! Sendspin identities and pairings) never sit in their normal fields on
+//! disk. Each one is moved into a
 //! top-level `protected` object, keyed by its JSON pointer (for example
 //! `/airplay_passwords/airplay:aa`), as `dpapi:v1:<base64>`: the value's
 //! JSON sealed with Windows DPAPI in the current user's scope, so another
@@ -29,6 +30,24 @@
 //!
 //! Secret locations are listed in [`SECRET_PATHS`]; a config section that
 //! gains key material adds its path there.
+//!
+//! **Groups.** An identity key and the pairings made with it only work
+//! together (a peer holds the pairing for that identity and no other), so
+//! they are sealed as one entry, listed in [`SECRET_GROUPS`]. The entry is
+//! filed under a name no plain field uses: a version that knows the fields
+//! but not the group keeps the entry untouched, even after it mints an
+//! identity of its own in the plain fields. Groups follow the rules above,
+//! with one refinement: **an identity nothing is paired with gives way**.
+//! A group with pairings in the plain fields wins over the sealed one (it
+//! was paired again by an older version); plain fields with an identity
+//! but no pairings are what an older version mints when it can't see the
+//! sealed group, so the sealed group wins over them; and a sealed group
+//! that can't be opened is kept until a group with pairings is stored in
+//! its place (an identity minted meanwhile is kept under
+//! `<name>_pending`, used only while the stored group stays shut). A
+//! group replaced by one with pairings is gone, as a replaced AirPlay
+//! value is. Fields in a sealed group that this version doesn't list
+//! (added by a later one) are sealed again with the group on every save.
 
 use base64::Engine as _;
 use serde_json::{Map, Value};
@@ -39,10 +58,6 @@ pub const PROTECTED_PREFIX: &str = "dpapi:v1:";
 /// Top-level key holding every sealed value.
 pub const PROTECTED_KEY: &str = "protected";
 
-/// Largest sealed value we try to open (base64 characters). Real ones are
-/// a few hundred bytes; anything far bigger is not ours.
-const MAX_SEALED_LEN: usize = 16 * 1024;
-
 /// JSON paths holding secrets. Segments are object keys; `*` matches every
 /// key of an object. The sealed unit is the node at the path's last `*`
 /// (a whole map entry, so a struct never loses a required field), or the
@@ -51,6 +66,43 @@ pub const SECRET_PATHS: &[&[&str]] = &[
     &["airplay_controller_seed_hex"],
     &["airplay_passwords", "*"],
     &["airplay_pairings", "*", "controller_seed_hex"],
+];
+
+/// Fields of one object sealed together as a single entry (see the
+/// module docs).
+pub struct SecretGroup {
+    /// Path of the object holding the fields.
+    pub parent: &'static [&'static str],
+    /// Name the sealed entry is filed under, below `parent`. It must never
+    /// be a field of that object.
+    pub name: &'static str,
+    /// The group's fields: the identity and everything made with it.
+    pub fields: &'static [&'static str],
+    /// The fields holding pairings made with the group's identity.
+    pub pairings: &'static [&'static str],
+}
+
+/// Suffix of the name an identity this account minted is kept under while
+/// the stored group can't be opened (see [`seal_with`]).
+pub const PENDING_SUFFIX: &str = "_pending";
+
+pub const SECRET_GROUPS: &[SecretGroup] = &[
+    // Sendspin source client: our client key, the pairing PSK handed out
+    // in pairing tokens, and the long-term PSKs of the servers paired
+    // with that key.
+    SecretGroup {
+        parent: &["sendspin"],
+        name: "client_identity",
+        fields: &["client_key", "pairing_psk", "server_pairings"],
+        pairings: &["server_pairings"],
+    },
+    // Sendspin server: our server key and the players paired with it.
+    SecretGroup {
+        parent: &["sendspin"],
+        name: "server_identity",
+        fields: &["server_key", "player_pairings"],
+        pairings: &["player_pairings"],
+    },
 ];
 
 /// The platform's at-rest protector.
@@ -199,12 +251,69 @@ fn insert_at(root: &mut Value, path: &[String], value: Value) -> bool {
     }
 }
 
+fn group_path(g: &SecretGroup) -> Vec<String> {
+    g.parent.iter().chain([&g.name]).map(|s| s.to_string()).collect()
+}
+
+fn object_at_mut<'a>(root: &'a mut Value, path: &[&str]) -> Option<&'a mut Map<String, Value>> {
+    path.iter()
+        .try_fold(root, |node, key| node.as_object_mut()?.get_mut(*key))?
+        .as_object_mut()
+}
+
+/// [`object_at_mut`], creating missing objects on the way (not replacing
+/// anything that isn't one).
+fn object_entry<'a>(root: &'a mut Value, path: &[&str]) -> Option<&'a mut Map<String, Value>> {
+    path.iter()
+        .try_fold(root, |node, key| {
+            Some(node.as_object_mut()?.entry(*key).or_insert_with(|| Value::Object(Map::new())))
+        })?
+        .as_object_mut()
+}
+
+/// Null, `[]` and `{}`: what a field holds when nothing is stored in it.
+fn is_blank(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
+    }
+}
+
+/// The group's non-blank fields in `obj`.
+fn group_fields(g: &SecretGroup, obj: &Map<String, Value>) -> Map<String, Value> {
+    g.fields
+        .iter()
+        .filter_map(|f| obj.get(*f).filter(|v| !is_blank(v)).map(|v| (f.to_string(), v.clone())))
+        .collect()
+}
+
+fn has_pairings(g: &SecretGroup, fields: &Map<String, Value>) -> bool {
+    g.pairings.iter().any(|f| fields.contains_key(*f))
+}
+
+fn open_group(v: &Value, codec: &dyn SecretCodec) -> Result<Map<String, Value>, String> {
+    match open_sealed(v, codec)? {
+        Value::Object(fields) => Ok(fields),
+        _ => Err("not an object".into()),
+    }
+}
+
+fn seal_value(plain: &Value, codec: &dyn SecretCodec) -> Result<Value, String> {
+    let bytes = serde_json::to_vec(plain).map_err(|e| e.to_string())?;
+    let blob = codec.protect(&bytes).unwrap_or(Err("no protector".into()))?;
+    Ok(Value::String(format!(
+        "{PROTECTED_PREFIX}{}",
+        base64::engine::general_purpose::STANDARD.encode(blob)
+    )))
+}
+
 fn open_sealed(v: &Value, codec: &dyn SecretCodec) -> Result<Value, String> {
     let s = v.as_str().ok_or("not a string")?;
+    // No size limit: whatever `seal_value` wrote must open again (a group
+    // grows with every pairing), and the file is already in memory whole.
     let b64 = s.strip_prefix(PROTECTED_PREFIX).ok_or("unknown format")?;
-    if b64.len() > MAX_SEALED_LEN {
-        return Err(format!("sealed value too large ({} chars)", b64.len()));
-    }
     let blob = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| format!("bad base64: {e}"))?;
@@ -215,12 +324,32 @@ fn open_sealed(v: &Value, codec: &dyn SecretCodec) -> Result<Value, String> {
 /// Move every sealed secret from `protected` back into its normal field.
 /// `protected` itself is removed from the tree.
 pub fn unseal(root: &mut Value, codec: &dyn SecretCodec) -> UnsealReport {
+    unseal_with(root, codec, SECRET_GROUPS)
+}
+
+/// [`unseal`] with an explicit group table (an empty one is what a version
+/// without groups does).
+pub(crate) fn unseal_with(
+    root: &mut Value,
+    codec: &dyn SecretCodec,
+    groups: &[SecretGroup],
+) -> UnsealReport {
+    let plain_groups: Vec<Map<String, Value>> = groups
+        .iter()
+        .map(|g| {
+            let parent: Vec<String> = g.parent.iter().map(|s| s.to_string()).collect();
+            value_at(root, &parent)
+                .and_then(Value::as_object)
+                .map(|obj| group_fields(g, obj))
+                .unwrap_or_default()
+        })
+        .collect();
     let mut report = UnsealReport {
-        needs_save: !present_units(root).is_empty(),
+        needs_save: !present_units(root).is_empty() || plain_groups.iter().any(|f| !f.is_empty()),
         ..Default::default()
     };
     let Some(obj) = root.as_object_mut() else { return report };
-    let sealed = match obj.remove(PROTECTED_KEY) {
+    let mut sealed = match obj.remove(PROTECTED_KEY) {
         None => return report,
         Some(Value::Object(m)) => m,
         Some(other) => {
@@ -229,6 +358,57 @@ pub fn unseal(root: &mut Value, codec: &dyn SecretCodec) -> UnsealReport {
             return report;
         }
     };
+    for (g, plain) in groups.iter().zip(&plain_groups) {
+        let ptr = pointer(&group_path(g));
+        let pending_ptr = format!("{ptr}{PENDING_SUFFIX}");
+        let stored = sealed.remove(&ptr);
+        let pending = sealed.remove(&pending_ptr);
+        if has_pairings(g, plain) {
+            // Paired again by an older version: its group is newer and
+            // replaces the stored one (and a pending identity, which was
+            // never paired). The next save writes it in their place.
+            continue;
+        }
+        // The stored group, or, while it can't be opened, the identity this
+        // account minted meanwhile (see `seal_with`). Once the stored group
+        // opens, that one gives way.
+        let mut restore = None;
+        for (slot, v) in [(ptr.clone(), stored), (pending_ptr, pending)] {
+            let Some(v) = v else { continue };
+            if restore.is_some() {
+                continue;
+            }
+            match open_group(&v, codec) {
+                Ok(fields) => restore = Some((slot, v, fields)),
+                Err(e) => {
+                    log::warn!(
+                        "user_config: can't open protected value {slot} ({e}); keeping it \
+                         stored but unused"
+                    );
+                    report.locked.push(LockedNode { pointer: Some(slot), sealed: v });
+                }
+            }
+        }
+        let Some((slot, v, fields)) = restore else { continue };
+        let Some(parent) = object_entry(root, g.parent) else {
+            log::warn!("user_config: no place for protected value {slot}; keeping it stored");
+            report.locked.push(LockedNode { pointer: Some(slot), sealed: v });
+            continue;
+        };
+        // Whatever the plain fields hold is an identity nothing is paired
+        // with (minted by a version that couldn't see this group).
+        for f in g.fields {
+            parent.remove(*f);
+            if let Some(val) = fields.get(*f) {
+                parent.insert(f.to_string(), val.clone());
+            }
+        }
+        if slot == ptr && fields.keys().any(|k| !g.fields.contains(&k.as_str())) {
+            // Fields a later version added: the stored group is kept as
+            // well, so saves can seal them again with the current fields.
+            report.locked.push(LockedNode { pointer: Some(slot), sealed: v });
+        }
+    }
     for (ptr, v) in sealed {
         let path = match parse_pointer(&ptr) {
             Some(p) if is_secret_unit(&p) => p,
@@ -267,20 +447,74 @@ pub fn unseal(root: &mut Value, codec: &dyn SecretCodec) -> UnsealReport {
 /// `locked` entries back unless their slot holds a new value. Without a
 /// protector (or when sealing fails, logged) a value stays in its field.
 pub fn seal(root: &mut Value, locked: &[LockedNode], codec: &dyn SecretCodec) {
+    seal_with(root, locked, codec, SECRET_GROUPS)
+}
+
+/// [`seal`] with an explicit group table (see [`unseal_with`]).
+pub(crate) fn seal_with(
+    root: &mut Value,
+    locked: &[LockedNode],
+    codec: &dyn SecretCodec,
+    groups: &[SecretGroup],
+) {
     let mut out = Map::new();
+    // Kept groups whose fields were sealed again here.
+    let mut carried: Vec<String> = Vec::new();
     if codec.can_protect() {
+        for g in groups {
+            let ptr = pointer(&group_path(g));
+            let Some(parent) = object_at_mut(root, g.parent) else { continue };
+            let fields = group_fields(g, parent);
+            for f in g.fields {
+                parent.remove(*f);
+            }
+            let kept = locked.iter().find(|n| n.pointer.as_ref() == Some(&ptr));
+            // A kept group that opens holds fields a later version added
+            // (see `unseal_with`); they go along with the current ones.
+            let later = kept.and_then(|n| open_group(&n.sealed, codec).ok()).map(|mut m| {
+                m.retain(|k, _| !g.fields.contains(&k.as_str()));
+                m
+            });
+            if fields.is_empty() {
+                if later.is_some() {
+                    // The identity was cleared; what was added to it goes too.
+                    carried.push(ptr);
+                }
+                continue;
+            }
+            let slot = if !has_pairings(g, &fields) && kept.is_some() && later.is_none() {
+                // An identity nothing is paired with yet doesn't replace a
+                // stored group this account can't open. It is kept beside
+                // it, so it stays the same across launches (a pairing token
+                // may be handed out meanwhile) until it is paired.
+                format!("{ptr}{PENDING_SUFFIX}")
+            } else {
+                ptr
+            };
+            let mut sealed_fields = fields.clone();
+            if let Some(later) = &later {
+                for (k, v) in later {
+                    sealed_fields.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            match seal_value(&Value::Object(sealed_fields), codec) {
+                Ok(text) => {
+                    if later.is_some() {
+                        carried.push(slot.clone());
+                    }
+                    out.insert(slot, text);
+                }
+                Err(e) => {
+                    log::warn!("user_config: can't protect {slot} ({e}); saving it unprotected");
+                    parent.extend(fields);
+                }
+            }
+        }
         for path in present_units(root) {
             let Some(plain) = take_at(root, &path) else { continue };
-            let sealed = serde_json::to_vec(&plain)
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| codec.protect(&bytes).unwrap_or(Err("no protector".into())));
-            match sealed {
-                Ok(blob) => {
-                    let text = format!(
-                        "{PROTECTED_PREFIX}{}",
-                        base64::engine::general_purpose::STANDARD.encode(blob)
-                    );
-                    out.insert(pointer(&path), Value::String(text));
+            match seal_value(&plain, codec) {
+                Ok(text) => {
+                    out.insert(pointer(&path), text);
                 }
                 Err(e) => {
                     log::warn!(
@@ -298,6 +532,9 @@ pub fn seal(root: &mut Value, locked: &[LockedNode], codec: &dyn SecretCodec) {
             passthrough = Some(node.sealed.clone());
             continue;
         };
+        if carried.contains(ptr) {
+            continue;
+        }
         let superseded = out.contains_key(ptr)
             || parse_pointer(ptr).is_some_and(|p| value_at(root, &p).is_some());
         if !superseded {
@@ -550,7 +787,7 @@ pub(crate) mod tests {
             let r = unseal(&mut v, &FakeCodec(3));
             assert_eq!(r.locked.len(), 5, "{bad}");
         }
-        let huge = format!("{PROTECTED_PREFIX}{}", "A".repeat(MAX_SEALED_LEN + 4));
+        let huge = format!("{PROTECTED_PREFIX}{}", "A".repeat(4 << 20));
         let mut v = json!({ PROTECTED_KEY: { "/airplay_controller_seed_hex": huge } });
         assert_eq!(unseal(&mut v, &FakeCodec(3)).locked.len(), 1);
         let mut v = json!({ PROTECTED_KEY: [1, 2] });
@@ -567,5 +804,300 @@ pub(crate) mod tests {
         let mut v = sample();
         seal(&mut v, &[], &PlatformCodec);
         assert_eq!(v, sample());
+        let mut v = sendspin_sample();
+        seal(&mut v, &[], &PlatformCodec);
+        assert_eq!(v, sendspin_sample());
+    }
+
+    const CLIENT_GROUP: &str = "/sendspin/client_identity";
+    const SERVER_GROUP: &str = "/sendspin/server_identity";
+    const SENDSPIN_SECRETS: &[&str] = &["ck-1", "pp-1", "lt-s1", "sk-1", "lt-p1"];
+
+    fn sendspin_sample() -> Value {
+        json!({
+            "last_speaker_id": "x",
+            "sendspin": {
+                "enabled": true,
+                "source_enabled": true,
+                "last_playback_server": "srv-1",
+                "client_key": "ck-1",
+                "pairing_psk": "pp-1",
+                "server_pairings": [
+                    { "server_id": "srv-1", "psk": "lt-s1", "server_name": "MA", "last_used_unix": 5 }
+                ],
+                "server_key": "sk-1",
+                "player_pairings": {
+                    "pl-1": { "psk": "lt-p1", "name": "Kitchen", "instance": "kitchen" }
+                }
+            }
+        })
+    }
+
+    /// An identity minted by a version that can't see the sealed groups,
+    /// with nothing paired to it (blank fields as such a version writes them).
+    fn mint_unpaired(v: &mut Value, n: u8) {
+        let s = &mut v["sendspin"];
+        s["client_key"] = json!(format!("ck-{n}"));
+        s["pairing_psk"] = json!(format!("pp-{n}"));
+        s["server_pairings"] = json!([]);
+        s["server_key"] = json!(format!("sk-{n}"));
+        s["player_pairings"] = json!({});
+    }
+
+    #[test]
+    fn sendspin_identities_seal_as_one_entry_each() {
+        let codec = FakeCodec(0x33);
+        let mut v = sendspin_sample();
+        let r = unseal(&mut v, &codec);
+        assert!(r.needs_save, "plain Sendspin secrets ask for a rewrite");
+        seal(&mut v, &[], &codec);
+        let text = v.to_string();
+        for s in SENDSPIN_SECRETS {
+            assert!(!text.contains(s), "{s} in {text}");
+        }
+        // Only the settings stay in the section; every secret field is out.
+        let s = v["sendspin"].as_object().unwrap();
+        let mut keys: Vec<&str> = s.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["enabled", "last_playback_server", "source_enabled"]);
+        let p = v[PROTECTED_KEY].as_object().unwrap();
+        assert_eq!(p.len(), 2);
+        assert!(p[CLIENT_GROUP].as_str().unwrap().starts_with(PROTECTED_PREFIX));
+        assert!(p[SERVER_GROUP].as_str().unwrap().starts_with(PROTECTED_PREFIX));
+        let r = unseal(&mut v, &codec);
+        assert!(r.locked.is_empty() && !r.needs_save);
+        assert_eq!(v, sendspin_sample());
+        // Blank fields are dropped and nothing is stored for them.
+        let mut v = json!({ "sendspin": { "enabled": false, "client_key": null,
+            "server_pairings": [], "player_pairings": {} } });
+        assert!(!unseal(&mut v, &codec).needs_save);
+        seal(&mut v, &[], &codec);
+        assert_eq!(v, json!({ "sendspin": { "enabled": false } }));
+    }
+
+    #[test]
+    fn versions_without_groups_keep_them_and_their_unpaired_identity_gives_way() {
+        let codec = FakeCodec(0x44);
+        let mut sealed = sendspin_sample();
+        seal(&mut sealed, &[], &codec);
+        // A version without groups: no Sendspin identity in sight, and the
+        // group entries are unknown to it.
+        let mut old = sealed.clone();
+        let r = unseal_with(&mut old, &codec, &[]);
+        assert_eq!(r.locked.len(), 2);
+        assert!(old["sendspin"].get("client_key").is_none());
+        // It mints identities of its own and saves them in the plain fields.
+        mint_unpaired(&mut old, 2);
+        seal_with(&mut old, &r.locked, &codec, &[]);
+        assert_eq!(old["sendspin"]["client_key"], "ck-2");
+        assert_eq!(old[PROTECTED_KEY], sealed[PROTECTED_KEY], "groups kept byte for byte");
+        // Back here: nothing was paired with the minted identities, so the
+        // sealed groups win, and the file is rewritten without them.
+        let r = unseal(&mut old, &codec);
+        assert!(r.needs_save && r.locked.is_empty());
+        assert_eq!(old, sendspin_sample());
+    }
+
+    #[test]
+    fn a_group_paired_again_by_an_older_version_wins() {
+        let codec = FakeCodec(0x45);
+        let mut v = sendspin_sample();
+        seal(&mut v, &[], &codec);
+        let original = v[PROTECTED_KEY].clone();
+        let r = unseal_with(&mut v, &codec, &[]);
+        mint_unpaired(&mut v, 2);
+        // The client role is paired again; the server role is not.
+        v["sendspin"]["server_pairings"] =
+            json!([{ "server_id": "srv-2", "psk": "lt-s2", "last_used_unix": 9 }]);
+        seal_with(&mut v, &r.locked, &codec, &[]);
+        let r = unseal(&mut v, &codec);
+        assert!(r.needs_save);
+        let s = &v["sendspin"];
+        assert_eq!(s["client_key"], "ck-2");
+        assert_eq!(s["pairing_psk"], "pp-2");
+        assert_eq!(s["server_pairings"][0]["psk"], "lt-s2");
+        assert_eq!(s["server_key"], "sk-1");
+        assert_eq!(s["player_pairings"], sendspin_sample()["sendspin"]["player_pairings"]);
+        // The replaced group is gone; the server group is untouched.
+        assert!(r.locked.is_empty());
+        seal(&mut v, &r.locked, &codec);
+        let p = v[PROTECTED_KEY].as_object().unwrap();
+        assert_eq!(p.len(), 2);
+        assert_ne!(p[CLIENT_GROUP], original[CLIENT_GROUP], "replaced");
+        assert_eq!(p[SERVER_GROUP], original[SERVER_GROUP]);
+        let mut back = v.clone();
+        let r = unseal(&mut back, &codec);
+        assert!(r.locked.is_empty() && !r.needs_save);
+        assert_eq!(back["sendspin"]["server_pairings"].as_array().unwrap().len(), 1);
+        assert_eq!(back["sendspin"]["server_pairings"][0]["server_id"], "srv-2");
+
+        // Replaced again: still one group per role.
+        let r = unseal_with(&mut back, &codec, &[]);
+        back["sendspin"]["client_key"] = json!("ck-3");
+        back["sendspin"]["server_pairings"] = json!([{ "server_id": "srv-3", "psk": "lt-s3" }]);
+        seal_with(&mut back, &r.locked, &codec, &[]);
+        let r = unseal(&mut back, &codec);
+        assert_eq!(back["sendspin"]["client_key"], "ck-3");
+        seal(&mut back, &r.locked, &codec);
+        assert_eq!(back[PROTECTED_KEY].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn fields_a_later_version_adds_to_a_group_are_kept() {
+        let codec = FakeCodec(0x48);
+        let mut v = sendspin_sample();
+        seal(&mut v, &[], &codec);
+        let mut group = open_group(&v[PROTECTED_KEY][CLIENT_GROUP], &codec).unwrap();
+        group.insert("server_cert".into(), json!("cert-1"));
+        v[PROTECTED_KEY][CLIENT_GROUP] = seal_value(&Value::Object(group), &codec).unwrap();
+        let reopen = |v: &Value| open_group(&v[PROTECTED_KEY][CLIENT_GROUP], &codec).unwrap();
+
+        let r = unseal(&mut v, &codec);
+        assert_eq!(v, sendspin_sample());
+        let mut saved = v.clone();
+        seal(&mut saved, &r.locked, &codec);
+        assert_eq!(reopen(&saved)["server_cert"], "cert-1");
+        assert_eq!(saved[PROTECTED_KEY].as_object().unwrap().len(), 2, "nothing kept aside");
+        // A change to the group keeps it too.
+        v["sendspin"]["server_pairings"][0]["last_used_unix"] = json!(6);
+        seal(&mut v, &r.locked, &codec);
+        let g = reopen(&v);
+        assert_eq!(g["server_cert"], "cert-1");
+        assert_eq!(g["server_pairings"][0]["last_used_unix"], 6);
+        assert_eq!(v[PROTECTED_KEY].as_object().unwrap().len(), 2);
+        // And through the next load and save.
+        let r = unseal(&mut v, &codec);
+        seal(&mut v, &r.locked, &codec);
+        assert_eq!(reopen(&v)["server_cert"], "cert-1");
+    }
+
+    #[test]
+    fn an_unopenable_group_is_kept_until_a_paired_one_replaces_it() {
+        let mut sealed = sendspin_sample();
+        seal(&mut sealed, &[], &FakeCodec(7));
+        // Another user / machine: the groups don't open, so it mints its
+        // own identities. Saving keeps the stored groups as they are, and
+        // the unpaired identities beside them.
+        let mut v = sealed.clone();
+        let r = unseal(&mut v, &FakeCodec(8));
+        assert_eq!(r.locked.len(), 2);
+        mint_unpaired(&mut v, 3);
+        let mut saved = v.clone();
+        seal(&mut saved, &r.locked, &FakeCodec(8));
+        let p = saved[PROTECTED_KEY].as_object().unwrap();
+        assert_eq!(p[CLIENT_GROUP], sealed[PROTECTED_KEY][CLIENT_GROUP]);
+        assert_eq!(p[SERVER_GROUP], sealed[PROTECTED_KEY][SERVER_GROUP]);
+        assert_eq!(p.len(), 4);
+        assert_eq!(saved["sendspin"], sealed["sendspin"], "nothing plain");
+        // The next launch there gets the same identities back, still with
+        // the stored groups kept.
+        let mut next = saved.clone();
+        let r3 = unseal(&mut next, &FakeCodec(8));
+        assert_eq!(next["sendspin"]["client_key"], "ck-3");
+        assert_eq!(next["sendspin"]["server_key"], "sk-3");
+        let mut resaved = next.clone();
+        seal(&mut resaved, &r3.locked, &FakeCodec(8));
+        assert_eq!(resaved[PROTECTED_KEY][CLIENT_GROUP], sealed[PROTECTED_KEY][CLIENT_GROUP]);
+        // Where the stored groups open, they win and the minted ones go.
+        let mut home = saved.clone();
+        let r4 = unseal(&mut home, &FakeCodec(7));
+        assert!(r4.locked.is_empty());
+        assert_eq!(home, sendspin_sample());
+        seal(&mut home, &r4.locked, &FakeCodec(7));
+        assert_eq!(home[PROTECTED_KEY].as_object().unwrap().len(), 2);
+        // Once a server pairs with the new client identity, its group
+        // replaces the stored one; the server role's group stays.
+        v["sendspin"]["server_pairings"] = json!([{ "server_id": "srv-3", "psk": "lt-s3" }]);
+        seal(&mut v, &r.locked, &FakeCodec(8));
+        let p = v[PROTECTED_KEY].as_object().unwrap();
+        assert_ne!(p[CLIENT_GROUP], sealed[PROTECTED_KEY][CLIENT_GROUP]);
+        assert_eq!(p[SERVER_GROUP], sealed[PROTECTED_KEY][SERVER_GROUP]);
+        // The replaced group and its pending identity are gone; the
+        // unpaired server identity is still pending beside its group.
+        let mut keys: Vec<&str> = p.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, [CLIENT_GROUP, SERVER_GROUP, "/sendspin/server_identity_pending"]);
+        let mut later = v.clone();
+        let r2 = unseal(&mut later, &FakeCodec(8));
+        assert_eq!(r2.locked.len(), 1, "only the server group is kept");
+        seal(&mut later, &r2.locked, &FakeCodec(8));
+        assert_eq!(later[PROTECTED_KEY], v[PROTECTED_KEY]);
+        let mut back = v.clone();
+        unseal(&mut back, &FakeCodec(8));
+        assert_eq!(back["sendspin"]["client_key"], "ck-3");
+        // Without any protector, everything stays where it is.
+        let mut v2 = sealed.clone();
+        let r2 = unseal(&mut v2, &PlatformCodecForTests);
+        mint_unpaired(&mut v2, 4);
+        seal(&mut v2, &r2.locked, &PlatformCodecForTests);
+        assert_eq!(v2[PROTECTED_KEY], sealed[PROTECTED_KEY]);
+        assert_eq!(v2["sendspin"]["client_key"], "ck-4");
+    }
+
+    #[test]
+    fn a_group_with_many_players_still_opens() {
+        let codec = FakeCodec(0x47);
+        let mut v = sendspin_sample();
+        let players = v["sendspin"]["player_pairings"].as_object_mut().unwrap();
+        for i in 0..2000 {
+            players.insert(
+                format!("{i:043}"),
+                json!({ "psk": format!("{i:043}"), "name": "Living Room Speaker",
+                        "instance": "living room speaker" }),
+            );
+        }
+        // And one peer's name of several MB (names are cut when stored,
+        // but whatever is sealed must open again).
+        players["pl-1"]["name"] = json!("n".repeat(3 << 20));
+        let want = v.clone();
+        seal(&mut v, &[], &codec);
+        assert!(v[PROTECTED_KEY][SERVER_GROUP].as_str().unwrap().len() > 4 << 20);
+        let r = unseal(&mut v, &codec);
+        assert!(r.locked.is_empty());
+        assert_eq!(v, want);
+    }
+
+    #[test]
+    fn removed_pairings_stay_removed() {
+        let codec = FakeCodec(0x46);
+        let mut v = sendspin_sample();
+        seal(&mut v, &[], &codec);
+        let r = unseal(&mut v, &codec);
+        // The only server pairing is revoked; the identity stays.
+        v["sendspin"]["server_pairings"] = json!([]);
+        seal(&mut v, &r.locked, &codec);
+        let r = unseal(&mut v, &codec);
+        assert!(r.locked.is_empty());
+        assert_eq!(v["sendspin"]["client_key"], "ck-1");
+        assert!(v["sendspin"].get("server_pairings").is_none());
+        assert_eq!(v["sendspin"]["player_pairings"]["pl-1"]["psk"], "lt-p1");
+    }
+
+    #[test]
+    fn malformed_groups_never_panic() {
+        let codec = FakeCodec(5);
+        let not_an_object = seal_value(&json!("just a string"), &codec).unwrap();
+        for bad in [json!("dpapi:v1:!!!"), json!(3), json!(null), not_an_object] {
+            let mut v = json!({ "sendspin": { "client_key": "ck-9" },
+                PROTECTED_KEY: { CLIENT_GROUP: bad.clone(), SERVER_GROUP: bad.clone() } });
+            let r = unseal(&mut v, &codec);
+            assert_eq!(r.locked.len(), 2, "{bad}");
+            assert_eq!(v["sendspin"]["client_key"], "ck-9");
+            seal(&mut v, &r.locked, &codec);
+            assert_eq!(v[PROTECTED_KEY].get(CLIENT_GROUP), Some(&bad));
+            assert_eq!(v[PROTECTED_KEY].get(SERVER_GROUP), Some(&bad));
+            assert!(v["sendspin"].get("client_key").is_none());
+        }
+        // A group that opens but has nowhere to go is kept as well.
+        let good = seal_value(&json!({ "client_key": "ck-1" }), &codec).unwrap();
+        for parent in [json!(5), json!(null)] {
+            let mut v = json!({ "sendspin": parent, PROTECTED_KEY: { CLIENT_GROUP: good.clone() } });
+            let r = unseal(&mut v, &codec);
+            assert_eq!(r.locked.len(), 1);
+        }
+        // A missing section is created for it.
+        let mut v = json!({ PROTECTED_KEY: { CLIENT_GROUP: good } });
+        assert!(unseal(&mut v, &codec).locked.is_empty());
+        assert_eq!(v["sendspin"]["client_key"], "ck-1");
     }
 }

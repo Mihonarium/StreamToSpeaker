@@ -161,6 +161,8 @@ features = [
     "Win32_Security",
     # DPAPI (CryptProtectData) for the secrets stored in config.json.
     "Win32_Security_Cryptography",
+    # MultiByteToWideChar: config.json saved in the ANSI code page.
+    "Win32_Globalization",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",
     "Win32_System_Com",

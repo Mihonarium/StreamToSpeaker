@@ -483,11 +483,8 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
 
     // server/hello → client/hello.
     let hello = expect(&events, "server/hello", Duration::from_secs(10))?;
-    let mut server_name = payload(&hello)
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("Sendspin server")
-        .to_string();
+    let mut server_name =
+        proto::peer_name(payload(&hello).get("name").and_then(Value::as_str).unwrap_or("Sendspin server"));
     send_hello(sh, &conn, category == PskCategory::LongTerm)?;
 
     let mut active_roles: Vec<String> = Vec::new();
@@ -526,7 +523,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                     writer.set_rekeying(false);
                     // aiosendspin 9.x re-exchanges hellos after a re-handshake.
                     if let Some(n) = payload(&value).get("name").and_then(Value::as_str) {
-                        server_name = n.to_string();
+                        server_name = proto::peer_name(n);
                     }
                     send_hello(sh, &conn, category == PskCategory::LongTerm)?;
                 }
