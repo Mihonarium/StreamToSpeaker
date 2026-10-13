@@ -879,3 +879,15 @@ jobs:
       - run: |
           echo "attempt ${{ github.run_attempt }} sees: $(cat probe.txt)"
           if [ "${{ github.run_attempt }}" = "1" ]; then echo "failing attempt 1 on purpose"; exit 1; fi
+
+  # The same upload without overwrite: re-running this job alone shows what
+  # a re-run does when the artifact of an earlier attempt is still there.
+  rerun-plain:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "uploaded in attempt ${{ github.run_attempt }}" > probe.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rerun-probe-plain
+          path: probe.txt
+          retention-days: 1
