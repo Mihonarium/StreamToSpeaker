@@ -1,0 +1,870 @@
+# Temporary: rehearses build.yml's release chain from a branch without
+# signing or publishing anything.
+#   gate chains - a stand-in `package` (driver picked by the real
+#     Get-AttestedDriver.ps1 from a tagged source, a published installer
+#     uploaded as the unsigned-installer artifact), the verify-driver call
+#     as in build.yml, and a stand-in sign-release with build.yml's
+#     condition that only fetches and hash-checks the artifact:
+#       certified (v0.1.9), attested (v0.1.6) - must pass;
+#       installer-mismatch (v0.1.6 installer vs v0.1.9's driver),
+#       source-mismatch (driver-v1.1.0.209 against v0.1.10's tree),
+#       empty-input (gate called without an installer artifact) - must fail
+#       and leave the stand-in skipped;
+#       fallback (no matching driver) - gate skipped, stand-in runs.
+#   driver-lookup - Get-AttestedDriver.ps1 strict / -WarnOnError on errors.
+#   draft-release - a draft for a tag that does not exist, gh by tag,
+#     release_draft.py ensure/require/check (+ negatives), signature check,
+#     what an unauthenticated client sees, then the draft is deleted. The
+#     draft is never published.
+#   rerun-upload / rerun-use - artifacts across re-run attempts.
+name: Release gate rehearsal
+
+on:
+  push:
+    branches: [ci/release-driver-gate-v2]
+    paths: [".github/workflows/release-gate-rehearsal.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-certified:
+    runs-on: windows-latest
+    outputs:
+      commit: ${{ steps.src.outputs.commit }}
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+      installer_name: ${{ steps.inst.outputs.name }}
+      installer_sha256: ${{ steps.inst.outputs.sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: v0.1.9, path: tagged }
+      - uses: actions/checkout@v4
+        with: { path: tools, sparse-checkout: .github/scripts }
+      - id: src
+        working-directory: tagged
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: attested
+        shell: pwsh
+        run: tools/.github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ hashFiles('tagged/driver/**', 'tagged/include/**') }}" -OutDir attested-driver
+      - id: inst
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "StreamToSpeakerSetup-0.1.9.exe"
+          gh release download v0.1.9 --repo $env:GITHUB_REPOSITORY --pattern $name --dir inst
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$((Get-FileHash "inst/$name" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-setup-exe-certified
+          path: inst/StreamToSpeakerSetup-0.1.9.exe
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  verify-driver-certified:
+    if: needs.package-certified.outputs.driver_found == 'true'
+    needs: package-certified
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package-certified.outputs.driver_tag }}
+      commit: ${{ needs.package-certified.outputs.commit }}
+      installer_artifact: unsigned-setup-exe-certified
+      installer_name: ${{ needs.package-certified.outputs.installer_name }}
+      installer_sha256: ${{ needs.package-certified.outputs.installer_sha256 }}
+
+  sign-release-certified:
+    if: >-
+      !cancelled() &&
+      needs.package-certified.result == 'success' &&
+      ((needs.package-certified.outputs.driver_found == 'true' &&
+        needs.verify-driver-certified.result == 'success' &&
+        needs.verify-driver-certified.outputs.verified == 'true' &&
+        needs.verify-driver-certified.outputs.driver_tag == needs.package-certified.outputs.driver_tag &&
+        needs.verify-driver-certified.outputs.installer_sha256 == needs.package-certified.outputs.installer_sha256) ||
+       (needs.package-certified.outputs.driver_found == 'false' && needs.verify-driver-certified.result == 'skipped'))
+    needs: [package-certified, verify-driver-certified]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned-setup-exe-certified
+          path: setup-unsigned
+      - shell: pwsh
+        run: |
+          $name = "${{ needs.package-certified.outputs.installer_name }}"
+          $sha = (Get-FileHash "setup-unsigned/$name" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne "${{ needs.package-certified.outputs.installer_sha256 }}") { throw "hash differs" }
+          Write-Host "sign-release would sign: $name sha256 $sha (gate ${{ needs.verify-driver-certified.result }}, verified '${{ needs.verify-driver-certified.outputs.verified }}', ${{ needs.verify-driver-certified.outputs.driver_tag }})"
+
+  publish-certified:
+    if: >-
+      !cancelled() &&
+      needs.package-certified.result == 'success' &&
+      needs.sign-release-certified.result == 'success'
+    needs: [package-certified, sign-release-certified]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "publish would run after sign-release (certified)"
+
+  package-attested:
+    runs-on: windows-latest
+    outputs:
+      commit: ${{ steps.src.outputs.commit }}
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+      installer_name: ${{ steps.inst.outputs.name }}
+      installer_sha256: ${{ steps.inst.outputs.sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: v0.1.6, path: tagged }
+      - uses: actions/checkout@v4
+        with: { path: tools, sparse-checkout: .github/scripts }
+      - id: src
+        working-directory: tagged
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: attested
+        shell: pwsh
+        run: tools/.github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ hashFiles('tagged/driver/**', 'tagged/include/**') }}" -OutDir attested-driver
+      - id: inst
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "StreamToSpeakerSetup-0.1.6.exe"
+          gh release download v0.1.6 --repo $env:GITHUB_REPOSITORY --pattern $name --dir inst
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$((Get-FileHash "inst/$name" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-setup-exe-attested
+          path: inst/StreamToSpeakerSetup-0.1.6.exe
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  verify-driver-attested:
+    if: needs.package-attested.outputs.driver_found == 'true'
+    needs: package-attested
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package-attested.outputs.driver_tag }}
+      commit: ${{ needs.package-attested.outputs.commit }}
+      installer_artifact: unsigned-setup-exe-attested
+      installer_name: ${{ needs.package-attested.outputs.installer_name }}
+      installer_sha256: ${{ needs.package-attested.outputs.installer_sha256 }}
+
+  sign-release-attested:
+    if: >-
+      !cancelled() &&
+      needs.package-attested.result == 'success' &&
+      ((needs.package-attested.outputs.driver_found == 'true' &&
+        needs.verify-driver-attested.result == 'success' &&
+        needs.verify-driver-attested.outputs.verified == 'true' &&
+        needs.verify-driver-attested.outputs.driver_tag == needs.package-attested.outputs.driver_tag &&
+        needs.verify-driver-attested.outputs.installer_sha256 == needs.package-attested.outputs.installer_sha256) ||
+       (needs.package-attested.outputs.driver_found == 'false' && needs.verify-driver-attested.result == 'skipped'))
+    needs: [package-attested, verify-driver-attested]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned-setup-exe-attested
+          path: setup-unsigned
+      - shell: pwsh
+        run: |
+          $name = "${{ needs.package-attested.outputs.installer_name }}"
+          $sha = (Get-FileHash "setup-unsigned/$name" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne "${{ needs.package-attested.outputs.installer_sha256 }}") { throw "hash differs" }
+          Write-Host "sign-release would sign: $name sha256 $sha (gate ${{ needs.verify-driver-attested.result }}, verified '${{ needs.verify-driver-attested.outputs.verified }}', ${{ needs.verify-driver-attested.outputs.driver_tag }})"
+
+  publish-attested:
+    if: >-
+      !cancelled() &&
+      needs.package-attested.result == 'success' &&
+      needs.sign-release-attested.result == 'success'
+    needs: [package-attested, sign-release-attested]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "publish would run after sign-release (attested)"
+
+  package-installer-mismatch:
+    runs-on: windows-latest
+    outputs:
+      commit: ${{ steps.src.outputs.commit }}
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+      installer_name: ${{ steps.inst.outputs.name }}
+      installer_sha256: ${{ steps.inst.outputs.sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: v0.1.9, path: tagged }
+      - uses: actions/checkout@v4
+        with: { path: tools, sparse-checkout: .github/scripts }
+      - id: src
+        working-directory: tagged
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: attested
+        shell: pwsh
+        run: tools/.github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ hashFiles('tagged/driver/**', 'tagged/include/**') }}" -OutDir attested-driver
+      - id: inst
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "StreamToSpeakerSetup-0.1.6.exe"
+          gh release download v0.1.6 --repo $env:GITHUB_REPOSITORY --pattern $name --dir inst
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$((Get-FileHash "inst/$name" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-setup-exe-installer-mismatch
+          path: inst/StreamToSpeakerSetup-0.1.6.exe
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  verify-driver-installer-mismatch:
+    if: needs.package-installer-mismatch.outputs.driver_found == 'true'
+    needs: package-installer-mismatch
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package-installer-mismatch.outputs.driver_tag }}
+      commit: ${{ needs.package-installer-mismatch.outputs.commit }}
+      installer_artifact: unsigned-setup-exe-installer-mismatch
+      installer_name: ${{ needs.package-installer-mismatch.outputs.installer_name }}
+      installer_sha256: ${{ needs.package-installer-mismatch.outputs.installer_sha256 }}
+
+  sign-release-installer-mismatch:
+    if: >-
+      !cancelled() &&
+      needs.package-installer-mismatch.result == 'success' &&
+      ((needs.package-installer-mismatch.outputs.driver_found == 'true' &&
+        needs.verify-driver-installer-mismatch.result == 'success' &&
+        needs.verify-driver-installer-mismatch.outputs.verified == 'true' &&
+        needs.verify-driver-installer-mismatch.outputs.driver_tag == needs.package-installer-mismatch.outputs.driver_tag &&
+        needs.verify-driver-installer-mismatch.outputs.installer_sha256 == needs.package-installer-mismatch.outputs.installer_sha256) ||
+       (needs.package-installer-mismatch.outputs.driver_found == 'false' && needs.verify-driver-installer-mismatch.result == 'skipped'))
+    needs: [package-installer-mismatch, verify-driver-installer-mismatch]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned-setup-exe-installer-mismatch
+          path: setup-unsigned
+      - shell: pwsh
+        run: |
+          $name = "${{ needs.package-installer-mismatch.outputs.installer_name }}"
+          $sha = (Get-FileHash "setup-unsigned/$name" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne "${{ needs.package-installer-mismatch.outputs.installer_sha256 }}") { throw "hash differs" }
+          Write-Host "sign-release would sign: $name sha256 $sha (gate ${{ needs.verify-driver-installer-mismatch.result }}, verified '${{ needs.verify-driver-installer-mismatch.outputs.verified }}', ${{ needs.verify-driver-installer-mismatch.outputs.driver_tag }})"
+
+  publish-installer-mismatch:
+    if: >-
+      !cancelled() &&
+      needs.package-installer-mismatch.result == 'success' &&
+      needs.sign-release-installer-mismatch.result == 'success'
+    needs: [package-installer-mismatch, sign-release-installer-mismatch]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "publish would run after sign-release (installer-mismatch)"
+
+  package-source-mismatch:
+    runs-on: windows-latest
+    outputs:
+      commit: ${{ steps.src.outputs.commit }}
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+      installer_name: ${{ steps.inst.outputs.name }}
+      installer_sha256: ${{ steps.inst.outputs.sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: v0.1.9, path: tagged }
+      - uses: actions/checkout@v4
+        with: { path: tools, sparse-checkout: .github/scripts }
+      - id: src
+        working-directory: tagged
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: attested
+        shell: pwsh
+        run: tools/.github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ hashFiles('tagged/driver/**', 'tagged/include/**') }}" -OutDir attested-driver
+      - id: inst
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "StreamToSpeakerSetup-0.1.9.exe"
+          gh release download v0.1.9 --repo $env:GITHUB_REPOSITORY --pattern $name --dir inst
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$((Get-FileHash "inst/$name" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-setup-exe-source-mismatch
+          path: inst/StreamToSpeakerSetup-0.1.9.exe
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  verify-driver-source-mismatch:
+    if: needs.package-source-mismatch.outputs.driver_found == 'true'
+    needs: package-source-mismatch
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package-source-mismatch.outputs.driver_tag }}
+      commit: v0.1.10
+      installer_artifact: unsigned-setup-exe-source-mismatch
+      installer_name: ${{ needs.package-source-mismatch.outputs.installer_name }}
+      installer_sha256: ${{ needs.package-source-mismatch.outputs.installer_sha256 }}
+
+  sign-release-source-mismatch:
+    if: >-
+      !cancelled() &&
+      needs.package-source-mismatch.result == 'success' &&
+      ((needs.package-source-mismatch.outputs.driver_found == 'true' &&
+        needs.verify-driver-source-mismatch.result == 'success' &&
+        needs.verify-driver-source-mismatch.outputs.verified == 'true' &&
+        needs.verify-driver-source-mismatch.outputs.driver_tag == needs.package-source-mismatch.outputs.driver_tag &&
+        needs.verify-driver-source-mismatch.outputs.installer_sha256 == needs.package-source-mismatch.outputs.installer_sha256) ||
+       (needs.package-source-mismatch.outputs.driver_found == 'false' && needs.verify-driver-source-mismatch.result == 'skipped'))
+    needs: [package-source-mismatch, verify-driver-source-mismatch]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned-setup-exe-source-mismatch
+          path: setup-unsigned
+      - shell: pwsh
+        run: |
+          $name = "${{ needs.package-source-mismatch.outputs.installer_name }}"
+          $sha = (Get-FileHash "setup-unsigned/$name" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne "${{ needs.package-source-mismatch.outputs.installer_sha256 }}") { throw "hash differs" }
+          Write-Host "sign-release would sign: $name sha256 $sha (gate ${{ needs.verify-driver-source-mismatch.result }}, verified '${{ needs.verify-driver-source-mismatch.outputs.verified }}', ${{ needs.verify-driver-source-mismatch.outputs.driver_tag }})"
+
+  publish-source-mismatch:
+    if: >-
+      !cancelled() &&
+      needs.package-source-mismatch.result == 'success' &&
+      needs.sign-release-source-mismatch.result == 'success'
+    needs: [package-source-mismatch, sign-release-source-mismatch]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "publish would run after sign-release (source-mismatch)"
+
+  package-empty-input:
+    runs-on: windows-latest
+    outputs:
+      commit: ${{ steps.src.outputs.commit }}
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+      installer_name: ${{ steps.inst.outputs.name }}
+      installer_sha256: ${{ steps.inst.outputs.sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: v0.1.9, path: tagged }
+      - uses: actions/checkout@v4
+        with: { path: tools, sparse-checkout: .github/scripts }
+      - id: src
+        working-directory: tagged
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: attested
+        shell: pwsh
+        run: tools/.github/scripts/Get-AttestedDriver.ps1 -SourceHash "${{ hashFiles('tagged/driver/**', 'tagged/include/**') }}" -OutDir attested-driver
+      - id: inst
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "StreamToSpeakerSetup-0.1.9.exe"
+          gh release download v0.1.9 --repo $env:GITHUB_REPOSITORY --pattern $name --dir inst
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$((Get-FileHash "inst/$name" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-setup-exe-empty-input
+          path: inst/StreamToSpeakerSetup-0.1.9.exe
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  verify-driver-empty-input:
+    if: needs.package-empty-input.outputs.driver_found == 'true'
+    needs: package-empty-input
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package-empty-input.outputs.driver_tag }}
+      commit: ${{ needs.package-empty-input.outputs.commit }}
+      installer_artifact: ''
+      installer_name: ${{ needs.package-empty-input.outputs.installer_name }}
+      installer_sha256: ${{ needs.package-empty-input.outputs.installer_sha256 }}
+
+  sign-release-empty-input:
+    if: >-
+      !cancelled() &&
+      needs.package-empty-input.result == 'success' &&
+      ((needs.package-empty-input.outputs.driver_found == 'true' &&
+        needs.verify-driver-empty-input.result == 'success' &&
+        needs.verify-driver-empty-input.outputs.verified == 'true' &&
+        needs.verify-driver-empty-input.outputs.driver_tag == needs.package-empty-input.outputs.driver_tag &&
+        needs.verify-driver-empty-input.outputs.installer_sha256 == needs.package-empty-input.outputs.installer_sha256) ||
+       (needs.package-empty-input.outputs.driver_found == 'false' && needs.verify-driver-empty-input.result == 'skipped'))
+    needs: [package-empty-input, verify-driver-empty-input]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned-setup-exe-empty-input
+          path: setup-unsigned
+      - shell: pwsh
+        run: |
+          $name = "${{ needs.package-empty-input.outputs.installer_name }}"
+          $sha = (Get-FileHash "setup-unsigned/$name" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne "${{ needs.package-empty-input.outputs.installer_sha256 }}") { throw "hash differs" }
+          Write-Host "sign-release would sign: $name sha256 $sha (gate ${{ needs.verify-driver-empty-input.result }}, verified '${{ needs.verify-driver-empty-input.outputs.verified }}', ${{ needs.verify-driver-empty-input.outputs.driver_tag }})"
+
+  publish-empty-input:
+    if: >-
+      !cancelled() &&
+      needs.package-empty-input.result == 'success' &&
+      needs.sign-release-empty-input.result == 'success'
+    needs: [package-empty-input, sign-release-empty-input]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "publish would run after sign-release (empty-input)"
+
+  package-fallback:
+    runs-on: windows-latest
+    outputs:
+      driver_found: ${{ steps.attested.outputs.found }}
+      driver_tag: ${{ steps.attested.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: .github/scripts }
+      # A driver source no driver-v* release matches.
+      - id: attested
+        shell: pwsh
+        run: .github/scripts/Get-AttestedDriver.ps1 -SourceHash "0000000000000000000000000000000000000000000000000000000000000000" -OutDir attested-driver
+
+  verify-driver-fallback:
+    if: needs.package-fallback.outputs.driver_found == 'true'
+    needs: package-fallback
+    permissions:
+      contents: read
+    uses: ./.github/workflows/driver-reproducibility.yml
+    with:
+      tag: ${{ needs.package-fallback.outputs.driver_tag }}
+      installer_artifact: none
+      installer_name: StreamToSpeakerSetup-0.0.0.exe
+      installer_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+
+  sign-release-fallback:
+    if: >-
+      !cancelled() &&
+      needs.package-fallback.result == 'success' &&
+      ((needs.package-fallback.outputs.driver_found == 'true' &&
+        needs.verify-driver-fallback.result == 'success' &&
+        needs.verify-driver-fallback.outputs.verified == 'true') ||
+       (needs.package-fallback.outputs.driver_found == 'false' && needs.verify-driver-fallback.result == 'skipped'))
+    needs: [package-fallback, verify-driver-fallback]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "sign-release would run (gate ${{ needs.verify-driver-fallback.result }}, driver_found ${{ needs.package-fallback.outputs.driver_found }})"
+
+  # build.yml's publish condition: runs in the fallback.
+  publish-fallback:
+    if: >-
+      !cancelled() &&
+      needs.package-fallback.result == 'success' &&
+      needs.sign-release-fallback.result == 'success'
+    needs: [package-fallback, sign-release-fallback]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "publish would run after sign-release (fallback)"
+
+  # The same job with the default condition: expected to be skipped,
+  # because the skipped verify-driver carries down the needs chain.
+  publish-fallback-default:
+    needs: [package-fallback, sign-release-fallback]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "publish with the default condition ran"
+
+  # Which jobs of the gate chains ran, were skipped or failed - the run's
+  # own conclusion is a failure by design (the negative chains).
+  chains-verdict:
+    if: always()
+    needs: [verify-driver-certified, sign-release-certified, publish-certified,
+            verify-driver-attested, sign-release-attested, publish-attested,
+            verify-driver-installer-mismatch, sign-release-installer-mismatch, publish-installer-mismatch,
+            verify-driver-source-mismatch, sign-release-source-mismatch, publish-source-mismatch,
+            verify-driver-empty-input, sign-release-empty-input, publish-empty-input,
+            verify-driver-fallback, sign-release-fallback, publish-fallback, publish-fallback-default]
+    runs-on: ubuntu-latest
+    steps:
+      - shell: pwsh
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          $r = $env:RESULTS | ConvertFrom-Json
+          $want = [ordered]@{
+              "verify-driver-certified" = "success"; "sign-release-certified" = "success"; "publish-certified" = "success"
+              "verify-driver-attested" = "success"; "sign-release-attested" = "success"; "publish-attested" = "success"
+              "verify-driver-installer-mismatch" = "failure"; "sign-release-installer-mismatch" = "skipped"; "publish-installer-mismatch" = "skipped"
+              "verify-driver-source-mismatch" = "failure"; "sign-release-source-mismatch" = "skipped"; "publish-source-mismatch" = "skipped"
+              "verify-driver-empty-input" = "failure"; "sign-release-empty-input" = "skipped"; "publish-empty-input" = "skipped"
+              "verify-driver-fallback" = "skipped"; "sign-release-fallback" = "success"; "publish-fallback" = "success"
+              "publish-fallback-default" = "skipped"
+          }
+          $bad = 0
+          foreach ($k in $want.Keys) {
+              $got = $r.$k.result
+              $ok = $got -eq $want[$k]
+              if (-not $ok) { $bad++ }
+              Write-Host ("{0,-36} {1,-8} (expected {2}){3}" -f $k, $got, $want[$k], $(if ($ok) { "" } else { "  <-- UNEXPECTED" }))
+          }
+          if ($bad) { throw "$bad job result(s) differ from what the release chain must do" }
+          Write-Host "gate chains: every job ran, failed or was skipped as the release chain requires"
+
+  # Get-AttestedDriver.ps1 on a Windows runner: real lookups, and errors
+  # injected through a gh wrapper (only the release list or the manifest
+  # downloads fail).
+  driver-lookup:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: .github/scripts }
+      - shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $script = (Resolve-Path .github/scripts/Get-AttestedDriver.ps1).Path
+          $real = (Get-Command gh -CommandType Application | Select-Object -First 1).Source
+          function Run([string]$label, [string]$hash, [switch]$Warn, [string]$Repo = $env:GITHUB_REPOSITORY) {
+              $out = Join-Path $env:RUNNER_TEMP ([guid]::NewGuid().ToString("N"))
+              New-Item -ItemType Directory -Path $out | Out-Null
+              $env:GITHUB_OUTPUT = Join-Path $out "gh_output"
+              try {
+                  if ($Warn) { & $script -SourceHash $hash -OutDir (Join-Path $out "drv") -Repo $Repo -WarnOnError | Out-Null }
+                  else { & $script -SourceHash $hash -OutDir (Join-Path $out "drv") -Repo $Repo | Out-Null }
+                  $o = if (Test-Path $env:GITHUB_OUTPUT) { (Get-Content $env:GITHUB_OUTPUT) -join " " } else { "(none)" }
+                  return "$label -> outputs: $o"
+              } catch {
+                  return "$label -> THROWS: $($_.Exception.Message)"
+              }
+          }
+          $results = @()
+          $results += Run "211 source" "f408e31ae347d098a35b15b50d404fc734c64369138bcd2ddbad21d78f5d051f"
+          $results += Run "204 source" "80acdc4b860b5a171f0c6514388e8d8667741c331a19f0cf91870114d163115f"
+          $results += Run "no match" ("0" * 64)
+          $results += Run "release list fails, strict" ("0" * 64) -Repo "$env:GITHUB_REPOSITORY-does-not-exist"
+          $results += Run "release list fails, warn" ("0" * 64) -Warn -Repo "$env:GITHUB_REPOSITORY-does-not-exist"
+          function global:gh { if ($args -contains "manifest.json") { $global:LASTEXITCODE = 1; return }; & $real @args }
+          $results += Run "manifest fetch fails, strict" "f408e31ae347d098a35b15b50d404fc734c64369138bcd2ddbad21d78f5d051f"
+          $results += Run "manifest fetch fails, warn" "f408e31ae347d098a35b15b50d404fc734c64369138bcd2ddbad21d78f5d051f" -Warn
+          $results | ForEach-Object { Write-Host $_ }
+          $want = @(
+              "211 source -> outputs: found=true kind=certified tag=driver-v1.1.1.211 version=1.1.1.211 build=211 zip=*"
+              "204 source -> outputs: found=true kind=attested tag=driver-v1.1.0.204 version=1.1.0.204 build=204 zip=*"
+              "no match -> outputs: found=false"
+              "release list fails, strict -> THROWS: listing the releases of *"
+              "release list fails, warn -> outputs: found=false"
+              "manifest fetch fails, strict -> THROWS: downloading manifest.json from *"
+              "manifest fetch fails, warn -> outputs: found=false"
+          )
+          for ($i = 0; $i -lt $want.Count; $i++) {
+              if ($results[$i] -notlike $want[$i]) { throw "unexpected: $($results[$i])" }
+          }
+          Write-Host "driver lookup: all cases as expected"
+          exit 0
+
+  # A draft release for a tag that does not exist (the tag would only be
+  # created on publishing, which never happens here), deleted at the end.
+  draft-release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: v0.0.0-rehearsal.${{ github.run_id }}
+      VERSION: 0.0.0-rehearsal.${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: .github/scripts }
+
+      - name: Before - what an unauthenticated client sees
+        id: before
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git ls-remote --exit-code --tags "https://github.com/$env:GITHUB_REPOSITORY" "refs/tags/$env:TAG" | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw "tag $env:TAG exists already" }
+          # Unauthenticated, like the app's update check and a browser.
+          $latest = (curl.exe -sf "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/latest" | ConvertFrom-Json).tag_name
+          if (-not $latest) { throw "could not read releases/latest without authentication" }
+          $loc = curl.exe -s -o NUL -w "%{redirect_url}" -I "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/StreamToSpeakerSetup.exe"
+          if (-not $loc) { throw "the stable link did not redirect" }
+          Write-Host "latest release: $latest; stable link -> $loc"
+          "latest=$latest" >> $env:GITHUB_OUTPUT
+          "location=$loc" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Create the draft (twice - the second finds it)
+        id: draft
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python .github/scripts/release_draft.py ensure $env:TAG --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "ensure failed" }
+          $id1 = ((Get-Content $env:GITHUB_OUTPUT | Where-Object { $_ -like "release_id=*" }) -split "=")[-1]
+          python .github/scripts/release_draft.py ensure $env:TAG --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "second ensure failed" }
+          python .github/scripts/release_draft.py require $env:TAG --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw "require failed" }
+          $n = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \`"$env:TAG\`") | .id").Count
+          if ($n -ne 1) { throw "expected one release for $env:TAG, found $n" }
+          Write-Host "draft $id1, one release for the tag"
+
+      - name: gh by tag on the draft (view / upload / download)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $v = gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json isDraft,tagName | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or -not $v.isDraft -or $v.tagName -ne $env:TAG) { throw "gh release view did not find the draft by tag" }
+          Write-Host "gh release view: isDraft=$($v.isDraft) tag=$($v.tagName)"
+          # The complete asset set of a release, from v0.1.10's signed files
+          # under this version's names.
+          New-Item -ItemType Directory -Force src, up | Out-Null
+          gh release download v0.1.10 --repo $env:GITHUB_REPOSITORY --dir src
+          if ($LASTEXITCODE -ne 0) { throw "download of v0.1.10 failed" }
+          $map = @{
+              "stream-to-speaker-0.1.10.exe" = "stream-to-speaker-$env:VERSION.exe"
+              "stream-to-speaker-0.1.10.exe.sigstore.json" = "stream-to-speaker-$env:VERSION.exe.sigstore.json"
+              "StreamToSpeakerSetup-0.1.10.exe" = "StreamToSpeakerSetup-$env:VERSION.exe"
+              "StreamToSpeakerSetup-0.1.10.exe.sigstore.json" = "StreamToSpeakerSetup-$env:VERSION.exe.sigstore.json"
+              "StreamToSpeakerSetup.exe" = "StreamToSpeakerSetup.exe"
+          }
+          foreach ($k in $map.Keys) { Copy-Item "src/$k" "up/$($map[$k])" }
+          foreach ($exe in Get-ChildItem up -Filter *.exe) {
+              "$((Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower())  $($exe.Name)" | Set-Content "$($exe.FullName).sha256" -Encoding ascii -NoNewline
+          }
+          gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY (Get-ChildItem up -File).FullName --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload by tag failed" }
+          # --clobber over an existing asset
+          gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY "up/StreamToSpeakerSetup.exe" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload --clobber failed" }
+          New-Item -ItemType Directory -Force back | Out-Null
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern "StreamToSpeakerSetup-$env:VERSION.exe" --dir back
+          if ($LASTEXITCODE -ne 0) { throw "gh release download by tag failed" }
+          if ((Get-FileHash "back/StreamToSpeakerSetup-$env:VERSION.exe").Hash -ne (Get-FileHash "up/StreamToSpeakerSetup-$env:VERSION.exe").Hash) { throw "downloaded bytes differ" }
+          Write-Host "gh release view / upload / upload --clobber / download by tag work on the draft"
+
+      - name: release_draft.py unit tests
+        shell: pwsh
+        run: |
+          python .github/scripts/test_release_draft.py -b
+          if ($LASTEXITCODE -ne 0) { throw "release_draft.py unit tests failed" }
+
+      - name: publish's checks on the complete draft (must pass)
+        id: check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = Join-Path $env:RUNNER_TEMP "draft-assets"
+          python .github/scripts/release_draft.py check $env:TAG --repo $env:GITHUB_REPOSITORY --version $env:VERSION --installer "StreamToSpeakerSetup-$env:VERSION.exe" --dir $dir --provenance
+          if ($LASTEXITCODE -ne 0) { throw "check failed on a complete draft" }
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          foreach ($exe in @(Get-ChildItem -LiteralPath $dir -Filter *.exe -File)) {
+              & $signtool verify /pa $exe.FullName | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "$($exe.Name) should verify" }
+              Write-Host "signed: $($exe.Name)"
+          }
+
+      # release_draft.publish against the real draft with the PATCH that
+      # would publish it made impossible: each case must be refused.
+      - name: publish's refusals (the publishing call is blocked)
+        shell: pwsh
+        env:
+          RELEASE_ID: ${{ steps.check.outputs.release_id }}
+          ASSET_IDS: ${{ steps.check.outputs.asset_ids }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:RELEASE_ID -or -not $env:ASSET_IDS) { throw "check reported no release_id / asset_ids" }
+          $py = @'
+          import os, sys
+          sys.path.insert(0, ".github/scripts")
+          import release_draft as rd
+
+          def guarded(*args):
+              if "PATCH" in args or "--method" in args:
+                  raise SystemExit("the publishing call was attempted - blocked")
+              return rd.gh(*args)
+
+          case, ids, version, reason = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          env = os.environ
+          try:
+              rd.publish(env["GITHUB_REPOSITORY"], env["TAG"], env["RELEASE_ID"], ids, env["GITHUB_SHA"], version,
+                         f"StreamToSpeakerSetup-{version}.exe", True, run=guarded)
+          except rd.ReleaseError as e:
+              print(f"{case}: refused: {e}")
+              sys.exit(0 if reason in str(e) else f"{case}: refused for another reason than '{reason}'")
+          sys.exit(f"{case}: NOT refused")
+          '@
+          Set-Content -Path publish_case.py -Value ($py -replace '(?m)^          ', '') -Encoding utf8
+          # 1. everything as checked, but the tag does not exist (publishing
+          #    would create it): refused at the tag.
+          python publish_case.py "tag missing" $env:ASSET_IDS $env:VERSION "git/ref/tags/$env:TAG"
+          if ($LASTEXITCODE -ne 0) { throw "case 1" }
+          # 2. a version that is not the tag's.
+          python publish_case.py "wrong version" $env:ASSET_IDS "0.0.1" "is not the version of the tag"
+          if ($LASTEXITCODE -ne 0) { throw "case 2" }
+          # 3. an asset re-uploaded after the check (new asset id).
+          gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY "up/StreamToSpeakerSetup.exe" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "re-upload failed" }
+          python publish_case.py "asset replaced" $env:ASSET_IDS $env:VERSION "replaced after they were checked"
+          if ($LASTEXITCODE -ne 0) { throw "case 3" }
+
+      - name: publish's checks on broken drafts (must fail)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $inst = "StreamToSpeakerSetup-$env:VERSION.exe"
+          function Check([string]$label, [switch]$Provenance) {
+              $dir = Join-Path $env:RUNNER_TEMP ([guid]::NewGuid().ToString("N"))
+              $a = @("check", $env:TAG, "--repo", $env:GITHUB_REPOSITORY, "--version", $env:VERSION, "--installer", $inst, "--dir", $dir)
+              if ($Provenance) { $a += "--provenance" }
+              python .github/scripts/release_draft.py @a | Out-Host
+              return @{ code = $LASTEXITCODE; dir = $dir }
+          }
+          # 1. an extra asset
+          Copy-Item "src/StreamToSpeakerSetup-0.1.10.exe" "up/StreamToSpeakerSetup-$env:VERSION-unsigned.exe"
+          gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY "up/StreamToSpeakerSetup-$env:VERSION-unsigned.exe" --clobber
+          if ((Check "extra" -Provenance).code -eq 0) { throw "check passed with an unexpected asset" }
+          gh release delete-asset $env:TAG "StreamToSpeakerSetup-$env:VERSION-unsigned.exe" --repo $env:GITHUB_REPOSITORY --yes
+          if ($LASTEXITCODE -ne 0) { throw "delete-asset failed" }
+          # 2. a missing alias
+          gh release delete-asset $env:TAG "StreamToSpeakerSetup.exe" --repo $env:GITHUB_REPOSITORY --yes
+          if ((Check "no alias" -Provenance).code -eq 0) { throw "check passed without the alias" }
+          # 3. the installer without its signature (signtool remove /s on a
+          #    copy), with consistent sidecars and no bundles: the asset
+          #    checks pass, the signature check must not.
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          Copy-Item "src/StreamToSpeakerSetup-0.1.10.exe" "up/$inst" -Force
+          & $signtool remove /s "up/$inst" | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "signtool remove /s failed" }
+          if ((Get-AuthenticodeSignature "up/$inst").Status -ne "NotSigned") { throw "the stand-in still carries a signature" }
+          Copy-Item "up/$inst" "up/StreamToSpeakerSetup.exe" -Force
+          foreach ($n in $inst, "StreamToSpeakerSetup.exe") {
+              "$((Get-FileHash "up/$n" -Algorithm SHA256).Hash.ToLower())  $n" | Set-Content "up/$n.sha256" -Encoding ascii -NoNewline
+          }
+          gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY "up/$inst" "up/$inst.sha256" "up/StreamToSpeakerSetup.exe" "up/StreamToSpeakerSetup.exe.sha256" --clobber
+          foreach ($n in "stream-to-speaker-$env:VERSION.exe.sigstore.json", "$inst.sigstore.json") {
+              gh release delete-asset $env:TAG $n --repo $env:GITHUB_REPOSITORY --yes
+          }
+          $r = Check "unsigned installer"
+          if ($r.code -ne 0) { throw "the asset checks should pass here" }
+          & $signtool verify /pa (Join-Path $r.dir $inst) | Out-Host
+          if ($LASTEXITCODE -eq 0) { throw "an unsigned installer passed the signature check" }
+          Write-Host "broken drafts: extra asset, missing alias and unsigned installer all refused"
+          exit 0
+
+      - name: While the draft exists - what an unauthenticated client sees
+        shell: pwsh
+        env:
+          LATEST_BEFORE: ${{ steps.before.outputs.latest }}
+          LOCATION_BEFORE: ${{ steps.before.outputs.location }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $latest = (curl.exe -sf "$api/releases/latest" | ConvertFrom-Json).tag_name
+          if ($latest -ne $env:LATEST_BEFORE) { throw "releases/latest changed: '$latest'" }
+          $list = curl.exe -sf "$api/releases?per_page=100" | ConvertFrom-Json
+          if (-not $list) { throw "could not read the public release list" }
+          if ($list | Where-Object { $_.tag_name -eq $env:TAG }) { throw "the draft is in the public release list" }
+          $code = curl.exe -s -o NUL -w "%{http_code}" "$api/releases/tags/$env:TAG"
+          if ($code -ne "404") { throw "releases/tags/$env:TAG answered $code" }
+          $code = curl.exe -s -o NUL -w "%{http_code}" "https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:TAG"
+          if ($code -ne "404") { throw "the release page answered $code" }
+          $loc = curl.exe -s -o NUL -w "%{redirect_url}" -I "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/StreamToSpeakerSetup.exe"
+          if ($loc -ne $env:LOCATION_BEFORE) { throw "the stable link moved to $loc" }
+          $urls = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \`"$env:TAG\`") | .assets[].browser_download_url")
+          if (-not $urls) { throw "no draft asset URLs to probe" }
+          foreach ($u in $urls) {
+              $code = curl.exe -s -o NUL -w "%{http_code}" -I $u
+              if ($code -ne "404") { throw "draft asset $u answered $code without authentication" }
+          }
+          Write-Host "unauthenticated: releases/latest = $latest (unchanged), draft not listed, releases/tags and the release page 404, stable link unchanged ($env:LOCATION_BEFORE), $(@($urls).Count) draft asset URLs 404"
+          # The draft stays a little longer, for the same checks from other machines.
+          Start-Sleep -Seconds 150
+
+      - name: Delete the draft
+        if: always()
+        shell: pwsh
+        run: |
+          $ids = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \`"$env:TAG\`" and .draft) | .id")
+          foreach ($id in $ids) {
+              gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/releases/$id"
+              if ($LASTEXITCODE -ne 0) { throw "could not delete draft $id" }
+          }
+          $left = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \`"$env:TAG\`") | .id")
+          if ($left.Count) { throw "releases for $env:TAG remain" }
+          git ls-remote --exit-code --tags "https://github.com/$env:GITHUB_REPOSITORY" "refs/tags/$env:TAG" | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw "tag $env:TAG exists" }
+          Write-Host "deleted $($ids.Count) draft(s); no release and no tag $env:TAG"
+          exit 0
+
+  # Artifacts across re-run attempts: the first attempt of rerun-use fails
+  # on purpose; re-running it alone must find rerun-upload's artifact of the
+  # first attempt; re-running rerun-upload must replace its artifact.
+  rerun-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "uploaded in attempt ${{ github.run_attempt }}" > probe.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rerun-probe
+          path: probe.txt
+          retention-days: 1
+          overwrite: true
+
+  rerun-use:
+    needs: rerun-upload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rerun-probe
+      - run: |
+          echo "attempt ${{ github.run_attempt }} sees: $(cat probe.txt)"
+          if [ "${{ github.run_attempt }}" = "1" ]; then echo "failing attempt 1 on purpose"; exit 1; fi
