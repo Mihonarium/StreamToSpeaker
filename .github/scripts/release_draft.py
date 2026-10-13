@@ -6,10 +6,13 @@ complete. Until then nothing about it is public: a draft is visible only to
 accounts with push access, never to `releases/latest` (the app's update
 check), the /releases/latest/download/ links or the public release list.
 
-  release_draft.py ensure  <tag> --repo R [--target SHA]
-      Create the draft for <tag> (generated notes) unless it exists. Without
-      --target the tag must already exist (--verify-tag). Fails when <tag>
-      is already a published release or has more than one release.
+  release_draft.py ensure  <tag> --repo R (--commit SHA | --target SHA)
+      Create the draft for <tag> (generated notes) unless it exists, and
+      wait until the release list shows it (the list lags behind a fresh
+      release by a moment). --commit: the tag must exist and point at SHA.
+      --target: for a tag that does not exist yet (it would be created at
+      SHA on publishing). Fails when <tag> is already a published release
+      or has more than one release.
   release_draft.py require <tag> --repo R
       <tag> must be exactly one release, and a draft.
   release_draft.py check   <tag> --repo R --version V --installer NAME --dir DIR [--provenance]
@@ -43,6 +46,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from repro_compare import clean_text, command_text, gh_output  # noqa: E402
@@ -79,9 +83,19 @@ def releases_for(repo, tag, run=gh):
     return [r for r in list_releases(repo, run) if r.get("tag_name") == tag]
 
 
-def require_draft(repo, tag, run=gh):
-    """The one release carrying `tag`, which must be a draft."""
+# The release list can lag behind a release created a moment ago.
+LIST_WAITS = (1, 2, 4, 8, 15, 30)
+
+
+def require_draft(repo, tag, run=gh, sleep=time.sleep, waits=(2, 5, 10)):
+    """The one release carrying `tag`, which must be a draft. A release
+    that is not listed yet is looked for again a few times."""
     rels = releases_for(repo, tag, run)
+    for w in waits:
+        if rels:
+            break
+        sleep(w)
+        rels = releases_for(repo, tag, run)
     if not rels:
         raise ReleaseError(f"there is no release for {tag}")
     if len(rels) > 1:
@@ -92,15 +106,34 @@ def require_draft(repo, tag, run=gh):
     return rel
 
 
-def ensure_draft(repo, tag, target=None, run=gh):
+def ensure_draft(repo, tag, commit=None, target=None, run=gh, sleep=time.sleep):
     """(release, created): the draft for `tag`, created when missing."""
+    if bool(commit) == bool(target):
+        raise ReleaseError("ensure needs exactly one of --commit (existing tag) and --target (new tag)")
+    sha = commit or target
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ReleaseError("ensure needs a full commit sha")
     rels = releases_for(repo, tag, run)
     if rels:
-        return require_draft(repo, tag, run), False
-    args = ["release", "create", tag, "--repo", repo, "--draft", "--title", tag, "--generate-notes"]
-    args += ["--target", target] if target else ["--verify-tag"]
-    run(*args)
-    return require_draft(repo, tag, run), True
+        return require_draft(repo, tag, run, sleep), False
+    if commit:
+        pointed = tag_commit(repo, tag, run)
+        if pointed != commit:
+            raise ReleaseError(f"the tag {tag} points at {pointed}, not at {commit}")
+    created = json.loads(run("api", "--method", "POST", f"repos/{repo}/releases",
+                             "-f", f"tag_name={tag}", "-f", f"name={tag}", "-f", f"target_commitish={sha}",
+                             "-F", "draft=true", "-F", "generate_release_notes=true"))
+    if created.get("draft") is not True or created.get("tag_name") != tag:
+        raise ReleaseError(f"creating the draft for {tag} returned an unexpected release")
+    for w in (0,) + LIST_WAITS:
+        sleep(w)
+        rels = releases_for(repo, tag, run)
+        if rels:
+            break
+    if [r.get("id") for r in rels] != [created["id"]]:
+        raise ReleaseError(f"the release list shows {len(rels)} release(s) for {tag} instead of the new "
+                           f"draft {created['id']} alone")
+    return require_draft(repo, tag, run, sleep), True
 
 
 # ---------------------------------------------------------------------------
@@ -278,14 +311,14 @@ def main(argv=None):
     ap.add_argument("--dir")
     ap.add_argument("--release-id")
     ap.add_argument("--asset-ids", help="publish: what check wrote as asset_ids")
-    ap.add_argument("--commit", help="publish: the commit the tag must point at")
+    ap.add_argument("--commit", help="ensure / publish: the commit the tag must point at")
     a = ap.parse_args(argv)
     if not TAG_RE.fullmatch(a.tag):
         print(f"::error::{command_text(f'{a.tag} is not a v<major>.<minor>.<patch> tag')}")
         return 1
     try:
         if a.command == "ensure":
-            rel, created = ensure_draft(a.repo, a.tag, a.target)
+            rel, created = ensure_draft(a.repo, a.tag, commit=a.commit, target=a.target)
             print(f"draft release {rel['id']} for {a.tag} ({'created' if created else 'already there'})")
         elif a.command == "require":
             rel = require_draft(a.repo, a.tag)

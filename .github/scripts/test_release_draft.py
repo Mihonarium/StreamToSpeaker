@@ -28,21 +28,30 @@ class FakeGh:
     """Stands in for the gh CLI: `releases` is what the API lists; calls
     are recorded; `files` maps asset name -> bytes for downloads."""
 
-    def __init__(self, releases, files=None, tags=None):
+    def __init__(self, releases, files=None, tags=None, list_lag=0):
         self.releases = releases
         self.files = files or {}
         # tag name -> commit sha, or ("tag", annotated tag object sha, commit sha)
         self.tags = {"v0.1.11": COMMIT} if tags is None else tags
         self.calls = []
+        # How many list calls after a create still miss the new release.
+        self.list_lag = list_lag
+        self.hidden = []
 
     def __call__(self, *args):
         self.calls.append(args)
         if args[:2] == ("api", "--paginate"):
+            if self.hidden and self.list_lag <= 0:
+                self.releases.extend(self.hidden)
+                self.hidden = []
+            self.list_lag -= 1
             return "".join(json.dumps(r) + "\n" for r in self.releases)
-        if args[:2] == ("release", "create"):
-            tag = args[2]
-            self.releases.append(release(tag, rid=99))
-            return ""
+        if args[:3] == ("api", "--method", "POST"):
+            fields = dict(a.split("=", 1) for a in args if "=" in a)
+            rel = release(fields["tag_name"], rid=99)
+            rel["target_commitish"] = fields["target_commitish"]
+            self.hidden.append(rel)
+            return json.dumps(rel)
         if args[:2] == ("release", "download"):
             directory = args[args.index("--dir") + 1]
             for name, data in self.files.items():
@@ -99,40 +108,72 @@ class FindingTheDraft(unittest.TestCase):
 
     def test_require_refuses_missing_published_and_ambiguous(self):
         with self.assertRaisesRegex(rd.ReleaseError, "no release"):
-            rd.require_draft(REPO, "v0.1.11", FakeGh([release("v0.1.10")]))
+            rd.require_draft(REPO, "v0.1.11", FakeGh([release("v0.1.10")]), sleep=lambda s: None)
         with self.assertRaisesRegex(rd.ReleaseError, "already a published release"):
             rd.require_draft(REPO, "v0.1.11", FakeGh([release("v0.1.11", draft=False)]))
         with self.assertRaisesRegex(rd.ReleaseError, "2 releases carry"):
             rd.require_draft(REPO, "v0.1.11", FakeGh([release("v0.1.11", rid=1), release("v0.1.11", rid=2)]))
 
-    def test_ensure_creates_once_with_the_tag_verified(self):
+    def creates(self, gh):
+        return [c for c in gh.calls if c[:3] == ("api", "--method", "POST")]
+
+    def test_ensure_creates_once_for_the_tagged_commit(self):
         gh = FakeGh([release("v0.1.10", rid=1, draft=False)])
-        rel, created = rd.ensure_draft(REPO, "v0.1.11", run=gh)
+        rel, created = rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
         self.assertTrue(created)
         self.assertEqual(rel["id"], 99)
-        create = [c for c in gh.calls if c[:2] == ("release", "create")]
+        create = self.creates(gh)
         self.assertEqual(len(create), 1)
-        self.assertIn("--draft", create[0])
-        self.assertIn("--verify-tag", create[0])
-        self.assertIn("--generate-notes", create[0])
-        self.assertNotIn("--target", create[0])
+        for field in ("tag_name=v0.1.11", "draft=true", "generate_release_notes=true", f"target_commitish={COMMIT}"):
+            self.assertIn(field, create[0])
         # A re-run finds the draft and creates nothing.
-        rel, created = rd.ensure_draft(REPO, "v0.1.11", run=gh)
+        rel, created = rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
         self.assertFalse(created)
-        self.assertEqual(len([c for c in gh.calls if c[:2] == ("release", "create")]), 1)
+        self.assertEqual(len(self.creates(gh)), 1)
+
+    def test_ensure_waits_for_the_release_list(self):
+        waited = []
+        gh = FakeGh([], list_lag=3)
+        rel, created = rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=waited.append)
+        self.assertEqual((rel["id"], created), (99, True))
+        self.assertGreaterEqual(len([w for w in waited if w]), 2)
+        self.assertEqual(len(self.creates(gh)), 1)
+
+    def test_ensure_fails_when_the_draft_never_shows(self):
+        gh = FakeGh([], list_lag=100)
+        with self.assertRaisesRegex(rd.ReleaseError, "shows 0 release"):
+            rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+
+    def test_ensure_refuses_a_tag_at_another_commit_or_missing(self):
+        gh = FakeGh([], tags={"v0.1.11": OTHER})
+        with self.assertRaisesRegex(rd.ReleaseError, "points at"):
+            rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+        gh = FakeGh([], tags={})
+        with self.assertRaisesRegex(rd.ReleaseError, "404"):
+            rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+        self.assertFalse(self.creates(gh))
 
     def test_ensure_with_a_target_for_a_tag_that_does_not_exist_yet(self):
-        gh = FakeGh([])
-        rd.ensure_draft(REPO, "v0.0.0-x", target="abc123", run=gh)
-        create = next(c for c in gh.calls if c[:2] == ("release", "create"))
-        self.assertEqual(create[create.index("--target") + 1], "abc123")
-        self.assertNotIn("--verify-tag", create)
+        gh = FakeGh([], tags={})
+        rd.ensure_draft(REPO, "v0.0.0-x", target=COMMIT, run=gh, sleep=lambda s: None)
+        self.assertIn(f"target_commitish={COMMIT}", self.creates(gh)[0])
+        self.assertFalse([c for c in gh.calls if c[0] == "api" and "/git/ref/" in c[1]])
+
+    def test_ensure_needs_exactly_one_full_sha(self):
+        for kw in ({}, {"commit": COMMIT, "target": COMMIT}, {"commit": "abc"}, {"target": "main"}):
+            with self.assertRaises(rd.ReleaseError):
+                rd.ensure_draft(REPO, "v0.1.11", run=FakeGh([]), sleep=lambda s: None, **kw)
 
     def test_ensure_refuses_a_published_release(self):
         gh = FakeGh([release("v0.1.11", draft=False)])
         with self.assertRaisesRegex(rd.ReleaseError, "already a published release"):
-            rd.ensure_draft(REPO, "v0.1.11", run=gh)
-        self.assertFalse([c for c in gh.calls if c[:2] == ("release", "create")])
+            rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+        self.assertFalse(self.creates(gh))
+
+    def test_require_looks_again_for_a_release_not_listed_yet(self):
+        gh = FakeGh([], list_lag=2)
+        gh.hidden.append(release("v0.1.11", rid=5))
+        self.assertEqual(rd.require_draft(REPO, "v0.1.11", gh, sleep=lambda s: None)["id"], 5)
 
 
 class ExpectedAssets(unittest.TestCase):

@@ -210,7 +210,9 @@ overlap (a concurrency group per tag).
    (test-signed fallback + devcon) to the release jobs.
 2. `sign-service` — creates the **draft** release for the tag
    (generated notes; `release_draft.py ensure`, which refuses a tag whose
-   release is already published), stages `stream-to-speaker-<ver>.exe` as
+   release is already published or that does not point at the commit the
+   run builds, and waits until the release list shows the new draft — the
+   list lags behind a fresh release by a moment), stages `stream-to-speaker-<ver>.exe` as
    a workflow artifact, EV-signs it via the signing repo (**approval
    click 1**) and uploads the signed exe, its `.sha256` and its
    provenance bundle to the draft.
