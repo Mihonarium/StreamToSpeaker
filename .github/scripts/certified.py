@@ -229,9 +229,11 @@ def fetch_signed_package(api, product_id, submission_id, now=time.time,
 # ---------------------------------------------------------------------------
 def build_manifest(version, commit, source_hash, product_id, submission_id,
                    os_list, report_id, ms_zip, lab_zip, signed_zip):
-    """manifest.json for a certified driver-v release. Field set is a
-    superset of the attestation manifest so every consumer (attest.py,
-    Get-AttestedDriver.ps1, the cleanup step) reads it unchanged."""
+    """manifest.json for a certified driver-v release. It carries every
+    attestation-manifest field the shared consumers read (attest.py,
+    Get-AttestedDriver.ps1, the cleanup step), so they read it unchanged;
+    the attestation-only build facts (`build_root`, `driver_h_stamped`)
+    do not apply to a lab build and are not written."""
     prefix, build = version.rsplit(".", 1)
     ms_name = f"StreamToSpeaker-Driver-{version}-Microsoft.zip"
     lab_name = f"StreamToSpeaker-Driver-{version}-lab-testsigned.zip"

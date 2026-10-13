@@ -64,10 +64,12 @@ driver/​** or include/​** change on main
         ▼                                              ▼
 [build.yml, every main push]                 [build.yml, tag v* push]
   extra artifact: installer bundling           sign-service → package →
-  the attested driver (when its                sign-release: release
-  source_hash matches HEAD's driver            installer with attested
-  source — service-only commits keep           driver + EV-signed service
-  matching)                                    exe + EV-signed setup exe
+  the attested driver (when its                verify-driver → sign-release
+  source_hash matches HEAD's driver            → publish: draft release with
+  source — service-only commits keep           attested driver + EV-signed
+  matching)                                    service exe + EV-signed
+                                               setup exe, published when
+                                               complete
                                                ← human: 2 approval clicks
 ```
 
@@ -76,8 +78,9 @@ The pairing rule everywhere: a driver-v release records
 and installer builds only bundle a Microsoft-signed driver whose
 `source_hash` equals the driver-source hash of the commit being built.
 Driver changed since the last signing round → installers fall back
-(preview: skipped; release: `-testsigned` suffix + warning) until you run
-the loop again.
+(preview: skipped; release: `-testsigned` suffix + warning, published as a
+pre-release that is never the latest release) until you run the loop
+again.
 
 **Selection order** (`.github/scripts/Get-AttestedDriver.ps1`, used by
 `build.yml` previews and the tagged `package` job): among matching
@@ -137,7 +140,10 @@ like `build.yml` does.
 1. Push/merge the driver change to main. `Driver submission` runs: builds
    the driver **unsigned** (`SignMode=Off`, build number = commit count),
    packs `StreamToSpeaker-Driver-<ver>-Submission.cab`, creates prerelease
-   `driver-v<ver>`, and dispatches the CAB to the signing repo.
+   `driver-v<ver>`, and dispatches the CAB to the signing repo. The
+   release's `manifest.json` records how the binary was built
+   (`driver_build`, `build_root` = the runner checkout it was linked in,
+   `driver_h_stamped`), which is what the reproducibility check repeats.
 2. **Approve** the signing run in `Mihonarium/signing` (its run name must
    show the sha256 from the workflow summary / release notes). CI then
    swaps the release CAB for the EV-signed one. If you don't approve within
@@ -193,40 +199,228 @@ point: driver attestation is per driver-source state, not per commit.
 
 ## Flow C — tagged release (2 approval clicks)
 
-Tag `vX.Y.Z` → `build.yml` runs the release chain:
+Tag `vX.Y.Z` → `build.yml` runs the release chain. The version is
+assembled in a **draft** release and becomes public only in the last
+job: a draft is visible only to accounts with push access, not to
+`releases/latest` (the app's update check), the
+`/releases/latest/download/` links or the public release list. The
+unsigned installer is never a release asset. Runs for the same tag never
+overlap (a concurrency group per tag).
 
 1. `build` — normal CI build; exports the service exe + driver-cache
    (test-signed fallback + devcon) to the release jobs.
-2. `sign-service` — creates the GitHub release (generated notes), stages
-   `stream-to-speaker-<ver>.exe` as a workflow artifact, EV-signs it via
-   the signing repo (**approval click 1**), uploads the signed exe +
-   `.sha256` to the release (the unsigned exe never becomes a release
-   asset).
-3. `package` — fetches the attested driver matching this tag's driver
-   source; stages it with the *signed* service exe (no test cert) and
-   builds `StreamToSpeakerSetup-<ver>.exe` and attaches it to the release.
-   The attested driver ships *inside* the installer and is deliberately not
-   published as a standalone asset (see `LICENSE-BINARIES.md`); the
-   `driver-v*` prerelease keeps the canonical copy. If no attested driver
-   matches, it falls back
-   to the test-signed driver + cert and names the asset
-   `StreamToSpeakerSetup-<ver>-testsigned.exe` with a warning — run Flow A,
-   then re-tag, if you wanted a production release.
-4. `sign-release` — EV-signs the setup exe (**approval click 2**) and swaps
-   it into the release. Its regenerated `.sha256` sidecar is canonical.
+2. `sign-service` — creates the **draft** release for the tag
+   (generated notes; `release_draft.py ensure`, which refuses a tag whose
+   release is already published or that does not point at the commit the
+   run builds, whether the draft is new or already exists, and waits until
+   the release list shows a new draft — the list lags behind a fresh
+   release by a moment), stages `stream-to-speaker-<ver>.exe` as
+   a workflow artifact, EV-signs it via the signing repo (**approval
+   click 1**) and uploads the signed exe, its `.sha256` and its
+   provenance bundle to the draft. The signed exe's SHA-256 is a job
+   output; `package` and `publish` accept only that exe from the draft.
+3. `package` — fetches the Microsoft-signed driver matching this tag's
+   driver source (certified preferred over attested); an error while
+   looking for it stops the job, and only "no driver release matches"
+   leads to the fallback below. Stages it with the *signed* service exe
+   from the draft (it must hash to what `sign-service` signed in this
+   run; no test cert) and builds
+   `StreamToSpeakerSetup-<ver>.exe`, which leaves the job only as the
+   workflow artifact `unsigned-setup-exe` (name and SHA-256 are job
+   outputs). The Microsoft-signed driver ships *inside* the installer and
+   is deliberately not published as a standalone asset (see
+   `LICENSE-BINARIES.md`); the `driver-v*` prerelease keeps the canonical
+   copy. If no Microsoft-signed driver matches, it falls back to the
+   test-signed driver + cert and names the installer
+   `StreamToSpeakerSetup-<ver>-testsigned.exe` with a warning — run Flow A
+   (or D), then re-tag, if you wanted a production release. Such a
+   version is published as a pre-release (see "Test-signed fallback
+   releases" below).
+4. `verify-driver` — the release gate. Runs `driver-reproducibility.yml`
+   as a reusable workflow for the `driver-v*` release `package` picked:
+   rebuilds the driver from the tagged commit (its driver source hash must
+   equal the manifest's) the way that release's manifest says it was
+   built, compares it with the release's reference package (certified:
+   the lab package; attested: the unsigned driver in the submission CAB)
+   and the shipped `Signed.zip`, then unpacks the `unsigned-setup-exe`
+   artifact (exact name and SHA-256 from `package`) and requires its
+   driver files to be that `Signed.zip` byte for byte, with no test
+   certificate. Read-only token, no secrets. Called this way every input
+   except `commit` must be non-empty (an empty `commit` means the
+   caller's commit), and it reports `verified` / `driver_tag` /
+   `installer_sha256` only when every check passed. For a `-testsigned`
+   fallback it is skipped (that driver is CI's own build of the tag's
+   driver source, from `build` or its driver cache; there is no
+   Microsoft-signed package to compare) and `package` / `sign-release`
+   say so in a warning. See "Reproducibility check" below for what each
+   rebuild repeats.
+5. `sign-release` — runs only when the gate reported `verified` = `true`
+   for exactly the driver release and installer SHA-256 `package`
+   reported (or the gate was skipped for the fallback). EV-signs the
+   `unsigned-setup-exe` artifact (**approval click 2**; the signing
+   request carries the SHA-256, so only those bytes can be signed) and
+   uploads to the draft the signed `StreamToSpeakerSetup-<ver>.exe`, its
+   `.sha256` (canonical), its provenance bundle and the stable
+   `StreamToSpeakerSetup.exe` alias + `.sha256` (not for a `-testsigned`
+   fallback: the permanent link must never lead to an installer that needs
+   testsigning mode). Then it deletes setup exe assets an earlier attempt
+   left on the draft under another name (`release_draft.py prune`: a
+   `-testsigned` installer when this one bundles a Microsoft-signed
+   driver or the other way round, with sidecars and bundles, and the
+   alias when this one is `-testsigned`). The signed installer's SHA-256
+   is a job output.
+6. `publish` — `release_draft.py check`: the draft must hold exactly the
+   assets of a complete release (both exes, every `.sha256` naming its
+   file and hash, a `.sigstore.json` per exe whose in-toto subject is that
+   file, the alias identical to the setup exe, nothing else, every upload
+   finished), the service exe and the setup exe must be exactly the bytes
+   `sign-service` and `sign-release` signed in this run (their SHA-256 job
+   outputs), and every `.exe` on it must carry a valid Authenticode
+   signature (`signtool verify /pa`). Then it publishes the draft — only
+   if the draft still holds the very assets that were checked (same asset
+   ids) and the tag still points at the commit the chain built
+   (publishing a draft whose tag is gone would recreate the tag at the
+   release's target commit). It becomes the latest release
+   (`make_latest=true`) unless a published release that is not a
+   pre-release has a version at least as high, for example when a hotfix
+   of an older line or a chain that finished late is published after a
+   newer version; then `make_latest=false` and a warning, so
+   `releases/latest`, the stable download link and the update check stay
+   on the newer version. A `-testsigned` fallback is published as a
+   pre-release with `make_latest=false` (see below). `publish` runs after
+   `sign-release` also in the test-signed fallback (explicit status
+   checks: the skipped gate does not carry through). Until then no
+   release and no release asset of the version is public. The tag is, and
+   so is the run itself: as for any run in a public repository its logs
+   and workflow artifacts can be seen and downloaded by signed-in GitHub
+   users. A tag run therefore uploads no test-signed dev installer (the
+   `build` job's `StreamToSpeakerSetup-<ver>` artifact, with its
+   `.driver.json` record, exists only for dev and pull-request builds; on
+   a tag run the bundled-driver record is in the step summary only), and
+   every artifact it uploads with unsigned binaries in it —
+   `binaries-<ver>` (the unsigned service exe and the test-signed
+   driver), `release-inputs`, `unsigned-service-exe`, `unsigned-setup-exe`
+   and the release gate's `driver-reproducibility-<driver tag>-unsigned-setup-exe`
+   (the unsigned rebuilt driver, copies of the reference and shipped
+   packages) — expires
+   after one day, the minimum; the chain's jobs read them within the
+   hours the run takes. The `cleanup` job runs after `sign-release`
+   finishes or is skipped; it then deletes `unsigned-service-exe` if
+   `sign-service` succeeded, and `unsigned-setup-exe`, `release-inputs`
+   and `binaries-<ver>` if `sign-release` succeeded, since nothing reads
+   them after that. Until then they stay downloadable. The gate's
+   comparison artifact is not deleted; it expires.
 
 Final release assets: signed `StreamToSpeakerSetup-<ver>.exe`, signed
-`stream-to-speaker-<ver>.exe`, and `.sha256` sidecars for each (plus
-`.sigstore.json` provenance bundles once the repo is public).
+`stream-to-speaker-<ver>.exe`, the `StreamToSpeakerSetup.exe` alias,
+`.sha256` sidecars for each and `.sigstore.json` provenance bundles for
+the two versioned exes.
 
-The release exists from step 2 onward with in-progress assets; unsigned
-bytes travel to the signing repo as Actions artifacts fetched with its
-`FETCH_TOKEN` (works with this repo private — nothing depends on public
-release URLs). Don't announce until `sign-release` is green. If a job dies
-mid-chain, re-run it: every step is idempotent (`--clobber` uploads,
-create-if-missing release). Re-running `package` after `sign-release` has
-finished overwrites the signed setup exe with an unsigned rebuild — re-run
-`sign-release` afterwards.
+Unsigned bytes travel to the signing repo as Actions artifacts fetched
+with its `FETCH_TOKEN` (nothing depends on public release URLs). Uploads
+to the draft go through `gh release upload <tag> --clobber` after
+`release_draft.py require` has checked that the tag has exactly one
+release, that it is a draft and that the tag still points at the run's
+commit (so a run whose tag was moved since neither uploads nor asks for
+the installer signature), and the chain checks that the version is the
+tag's (`vX.Y.Z` ↔ `X.Y.Z`). The `build` job accepts only a version of
+the form `<major>.<minor>.<patch>` plus an optional suffix of letters,
+digits and `.` `+` `-`, and the release jobs' scripts read the tag,
+version and hashes from environment variables, never from expressions
+spliced into the script text. If a job fails or is cancelled,
+nothing is published; re-run the failed jobs and the chain continues on
+the same draft. Re-running `package` builds a new installer (new SHA-256) and
+re-runs `verify-driver` and `sign-release` after it, so that rebuild is
+gated and signed in turn. The jobs pass their inputs as workflow
+artifacts, which expire after one day: re-running a job (or approving a
+signing request) more than a day after the artifact it reads was
+uploaded fails before anything is signed — re-run all jobs instead,
+which uploads every artifact again and asks for both approvals again.
+The same holds once `cleanup` deleted an artifact: after `sign-release`
+succeeded only `publish` can be re-run on its own. A
+published release is never modified: once `publish` succeeded,
+re-running the chain fails at `sign-service`.
+
+### Test-signed fallback releases
+
+A version whose installer bundles the test-signed driver
+(`StreamToSpeakerSetup-<ver>-testsigned.exe`, because no certified or
+attested driver release matches the tag's driver source) is published as
+a **pre-release** and never made the latest release. `releases/latest`,
+the stable `/releases/latest/download/StreamToSpeakerSetup.exe` link (the
+release carries no alias anyway) and the app's update check, which reads
+`releases/latest` and ignores pre-releases, all keep pointing at the last
+release with a Microsoft-signed driver. The pre-release itself is public:
+it is listed on the repository's releases page, marked as a pre-release,
+with its installer as a download. That installer loads the driver only in
+testsigning mode and imports the CI test certificate into the machine's
+`Root` and `TrustedPublisher` stores (uninstalling removes it again).
+Such a release is for testing that version on machines with testsigning
+mode enabled, for example while the driver's signing round is still
+running. To ship the version, finish Flow A or D for that driver source
+and tag a new version.
+
+### When the release gate fails
+
+A failed `verify-driver` leaves only the draft (with the signed service
+exe) and the tag; the installer is unsigned and was never published. The
+failing step and the run summary tell a real mismatch from a broken
+check:
+
+- **Resolve parameters** — the gate was called with an empty or
+  malformed input: `build.yml` was edited, not a driver problem.
+- **Download the installer artifact** — the `unsigned-setup-exe`
+  artifact is missing or expired (it is kept for one day): re-run all
+  jobs, which builds and uploads it again.
+- **Fetch release manifest and reference package** — the manifest is
+  unusable (the field is named), the reference archive does not hash to
+  what the manifest records (the release was altered: investigate), the
+  driver source hash of the tag differs from the manifest's (the tag does
+  not hold the tree that driver release was built from), or no build
+  directory could be derived (attested: the submitted `.sys`'s PDB path
+  has an unexpected form and the manifest records no `build_root`).
+- **Fetch and verify the shipped driver package** — the `Signed.zip`
+  does not hash to the manifest's `signed_zip_sha256` or does not hold
+  exactly one `.sys`/`.inf`/`.cat`, its catalog or (attested) embedded
+  `.sys` signature does not verify with the *Microsoft Windows Hardware
+  Compatibility Publisher*, or (attested) its `.sys`/INF are not the
+  submitted ones. The release was altered or is broken: investigate. A
+  download error is transient: re-run.
+- **WDK steps, `Build driver`** — a runner-image or toolchain problem
+  (WDK download or install, MSBuild failing, or for an attested release
+  "cannot create the build directory": the runner's checkout path no
+  longer matches the path the driver was linked at). A broken check.
+- **Verdict: "differs ... beyond the masked fields"** — read the summary.
+  Differences together with a differing Rich header row (compiler,
+  linker or library build ids) point to codegen drift in the runner
+  image's toolset; a difference with the same toolset, or one in the
+  shipped package only, is a real mismatch — stop and investigate.
+  Differences confined to `.rdata` / debug-directory sizes mean the build
+  directory's path length differs from the original build's.
+- **Check the installer bundles the shipped package** — this step does
+  not stop the job itself (so the summary and the artifact are still
+  written); the job then fails at **Verdict** with "installer check
+  (...) failed", and this step's log says why. "innounp-2.zip
+  sha256 ..." or a download error: the pinned innounp release moved (a
+  broken check; review and re-pin it). "innounp could not unpack": the
+  Inno Setup version Chocolatey installed on the runner writes a format
+  the pinned innounp cannot read (a broken check; update the pin).
+  "does not bundle the shipped package" or "ships a test certificate":
+  a real mismatch in what `package` staged.
+
+The release chain runs the workflow files of the tagged commit, so a fix
+to the check itself (or to the driver pairing) needs a new commit and a
+new tag; re-running only helps with transient failures (network, runner).
+To drop the version: `gh release delete vX.Y.Z --yes` deletes the draft
+(add `--cleanup-tag` to delete the tag as well). A draft that is kept for
+a later re-run may hold setup exe assets of the earlier attempt under
+other names (for example a `-testsigned` installer when the next attempt
+bundles a Microsoft-signed driver); `sign-release` removes those. Any
+other asset that does not belong to a complete release makes `publish`
+refuse the draft; remove it with
+`gh release delete-asset vX.Y.Z <name> --yes`. A moved tag (deleted and
+pushed again at another commit) leaves the draft to the run of the new
+commit: runs of the old commit stop at their next `require`.
 
 ## Flow D — WHQL certification (HLK run by hand, the rest automated)
 
@@ -241,6 +435,12 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
    on an HLK client, package the results in HLK Studio and sign the
    `.hlkx` with the EV cert. Keep the exact INF/SYS/CAT the client ran:
    it is the reference the workflow compares Microsoft's return against.
+   The reproducibility check (below) rebuilds a certified release from
+   the committed tree (`driver.h` not stamped) in `C:\build\src` with
+   `/p:DriverBuildNumber=<build>`; a lab build made differently (stamped
+   `driver.h`, another build number, a build directory whose path has
+   another length) does not verify, and the release gate then stops the
+   installer signature.
 2. **Submit by hand** at Partner Center (Hardware → Submit new hardware →
    upload the `.hlkx`, tick the offered OS, no test-signing options). Note
    the product id and submission id from the URL.
@@ -267,8 +467,9 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
    returned), the canonical flat `…-Signed.zip`, and `manifest.json` with
    `certified: true`, `certification: {product_id, submission_id, os,
    report_id}`, `source_hash` computed on the windows-2022 runner, and
-   the same field set the attestation manifests have (`attested: false`,
-   `ms_state: done`, no submission CAB).
+   the fields the attestation manifests share with it (`attested: false`,
+   `ms_state: done`, no submission CAB; the attestation-only `build_root`
+   and `driver_h_stamped` are not written).
    Already have the zip from the dashboard? Attach it to the release and
    pass its name as `ms_zip_asset` — the API step is skipped and no Azure
    secrets are needed.
@@ -281,6 +482,53 @@ The script behind it is `.github/scripts/certified.py` (`hash`, `fetch`,
 `verify`, `release`; unit tests in `test_certified.py`, run in the
 workflow's guard step). `release` is idempotent and can be run locally
 with `gh` to (re)publish a release from hand-downloaded files.
+
+## Reproducibility check (`driver-reproducibility.yml`)
+
+Run from the Actions tab with a `driver-v*` `tag` to audit a release
+(optionally `commit` = the commit to build when the branch head is not
+that driver's source, and `installer_tag` = a published `v*` release
+whose installer to unpack). Called from another workflow
+(`workflow_call`) it is the `verify-driver` release gate: then `tag`,
+`installer_artifact`, `installer_name` and `installer_sha256` are all
+required and must be non-empty (`commit` may be empty: the caller's
+commit), the installer is a workflow artifact of the same run, the
+comparison artifact is kept for one day, and the outputs `verified` (`true` only when every check
+passed), `driver_tag` and `installer_sha256` say what was verified. How
+the release was built follows from its `manifest.json` (its kind, build
+number and reference package, see the table); a manifest that is neither
+`certified` nor `attested`, or lacks a field the rebuild needs, fails the
+run with the field named.
+
+| | Certified (`certified: true`) | Attested (`attested: true`) |
+| --- | --- | --- |
+| Reference binary | `.sys`/`.inf` in `lab_zip` (test-signed lab package) | unsigned `.sys`/`.inf` in `submission_cab` (the EV-signed CAB on the release, SHA-256 = `submission_cab_signed_sha256`) |
+| `driver.h` build constant | as committed | stamped with `driver_build`, as `Driver submission` does |
+| Build directory | `C:\build\src` | where the submitted `.sys` was linked: from its PDB path, or the manifest's `build_root` when that path has an unexpected form (a `build_root` that disagrees with the binary only warns) - normally the runner checkout, then built in place |
+| Build tree vs checkout | byte-identical | identical except the stamped constant |
+| Shipped `Signed.zip` | catalog verifies (Microsoft); `.sys`/`.inf` match the rebuild | the same, plus: embedded `.sys` signature verifies (Microsoft is the primary signer), `.sys` equals the submitted one with signatures stripped, INF byte-identical to the submitted one |
+
+Both use msbuild `Release|x64`, `SignMode=Off`,
+`DriverBuildNumber=<driver_build>`, require the checkout's driver source
+hash to equal `source_hash`, and compare `.sys` files with signatures
+stripped and only build-varying header fields masked: the COFF
+timestamp, the PE checksum, the debug-directory timestamps and the
+CodeView (PDB GUID, age, path) and REPRO debug payloads; the header block
+is compared from each file's own offset. The INF is compared with the
+DriverVer date masked. The linker embeds the PDB path and its length
+shifts the image layout, so the rebuild has to happen at the same path;
+the path text itself is among the masked fields.
+Compiler/linker build ids (Rich header) are reported and only warn. The
+installer's driver files (`installer_tag` or the gate's artifact) must be
+the `Signed.zip` contents byte for byte and carry no test certificate.
+
+Release files are downloaded and unpacked under the runner's temp
+directory, outside the checkout, and archive members are picked by file
+name and written flat (never to a path taken from the archive). The
+checkout's driver source hash is checked against the manifest before any
+release archive is fetched, and again as the build step starts. Text from release files reaches the log
+only cleaned (`repro_compare.py` `clean_text`) or between
+`::stop-commands::` markers, so it cannot act as a workflow command.
 
 ## What is and isn't signed
 
@@ -306,7 +554,7 @@ with `gh` to (re)publish a release from hand-downloaded files.
 - **`Driver attested` fails INF comparison** — the zip doesn't belong to
   that submission (version mixup) or was repacked; re-download from Partner
   Center and attach as-is.
-- **Release says `-testsigned` unexpectedly** — the driver source changed
+- **Release says `-testsigned` (and is a pre-release) unexpectedly** — the driver source changed
   after the last signing round (any edit under `driver/` or `include/`
   changes the hash — a comment counts). Compare the manifest's
   `source_hash` on the newest certified/attested `driver-v*` release with

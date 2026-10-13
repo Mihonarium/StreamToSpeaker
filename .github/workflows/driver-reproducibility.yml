@@ -1,16 +1,44 @@
 # Driver reproducibility check
 #
-# Rebuilds the kernel driver from the checked-out source with the same
-# msbuild invocation the release pipeline uses, pinned to a given build
-# number, and compares the result against the package that was tested and
-# certified (the `-lab-testsigned.zip` asset on a driver-v* release):
+# Rebuilds the kernel driver from the checked-out source the way a driver-v*
+# release was built, and compares the result with that release: the
+# unsigned or lab-signed reference binary it was signed from, and the
+# Microsoft-signed package installers bundle. How the release was built
+# follows from its manifest.json (`repro_compare.py plan`): its kind, build
+# number and reference package. Nothing about it is an input.
 #
+#   * certified (WHQL, manifest `certified: true`): reference package =
+#     `lab_zip` (the test-signed package the HLK lab tested). Built from the
+#     tree as committed (driver.h's STREAM_TO_SPEAKER_DRIVER_BUILD is NOT
+#     stamped; only the INF DriverVer carries the build number), in
+#     C:\build\src;
+#   * attested (manifest `attested: true`): reference package =
+#     `submission_cab`, the EV-signed CAB driver-submission.yml built and
+#     Microsoft signed from (its SHA-256 must equal
+#     `submission_cab_signed_sha256`). driver.h is stamped with
+#     `driver_build` exactly as that workflow does, and the build happens in
+#     the directory the submitted .sys was linked in: read from its PDB
+#     path (normally the runner checkout D:\a\<repo>\<repo>), or the
+#     manifest's `build_root` when the PDB path does not have the expected
+#     form; a `build_root` that disagrees with the binary only warns. When
+#     that directory is this job's own checkout the build runs in place.
+#
+# A manifest that is neither, or lacks a field the rebuild needs, fails the
+# job at the manifest step. Both kinds use msbuild Release|x64, SignMode=Off
+# and DriverBuildNumber = the manifest's `driver_build`.
+#
+# Release files are downloaded and unpacked under the runner's temp
+# directory, outside the checkout. Archive members are picked by file name
+# and written flat (repro_compare.py `reference` / `package`, innounp -e),
+# never to a path taken from the archive. The checkout's driver source hash
+# is checked against the manifest before any release archive is fetched
+# and again as the build step starts.
+#
+# Checks:
 #   * guard: hashFiles('driver/**','include/**') of the checkout must equal
-#     the release manifest's `source_hash`, i.e. this IS the certified tree,
-#     and the tree msbuild compiles must be byte-identical to that checkout
-#     (nothing rewrites a source file in between: the lab package was built
-#     from the tree as committed, so driver.h's STREAM_TO_SPEAKER_DRIVER_BUILD
-#     is NOT stamped here; only the INF DriverVer carries the build number);
+#     the release manifest's `source_hash`, and the tree msbuild compiles
+#     must be byte-identical to that checkout (certified) or differ from it
+#     only by the stamped build constant in driver/driver.h (attested);
 #   * StreamToSpeaker.sys: Authenticode signature removed from the released
 #     copy, then raw SHA-256, then a normalised comparison that masks the PE
 #     fields known to vary between builds (COFF TimeDateStamp, PE CheckSum,
@@ -22,56 +50,130 @@
 #     (`toolset_identical`) and only warn;
 #   * StreamToSpeaker.inf: compared with the DriverVer date masked (stampinf
 #     writes the build date);
-#   * the .cat is signed and re-issued by Microsoft — not compared.
+#   * the .cat is signed and re-issued by Microsoft - not compared.
 #
 # The package users actually get is the release's `signed_zip` (what
 # Get-AttestedDriver.ps1 hands the installer builds), so that is checked
 # too: its SHA-256 must equal the manifest's `signed_zip_sha256`, its
 # catalog must verify under the kernel policy with a Microsoft Windows
 # Hardware Compatibility Publisher signature, and its .sys/.inf must pass
-# the same comparison against the rebuild.
+# the same comparison against the rebuild. For an attested release its
+# embedded .sys signature must verify under the kernel policy as well, its
+# .sys must be the submitted one once signatures are stripped, and its INF
+# must be byte-identical to the submitted one.
 #
-# With `installer_tag` (a v* release), the setup exe of that release is
-# unpacked (innounp, pinned by hash) and its {app}\driver files must be
-# byte-identical to the shipped package, with no test certificate.
+# The installer: its setup exe is unpacked without running it (innounp,
+# pinned by hash) and its {app}\driver files must be byte-identical to the
+# shipped package, with no test certificate. Two ways to run the check:
+#
+#   * standalone (push, workflow_dispatch) audits releases: `tag` (pushes
+#     use driver-v1.1.1.211), optional `commit`, `build_number`
+#     (cross-check), `build_root` (override) and `installer_tag`, a
+#     published v* release whose setup exe is checked (`installer_name` /
+#     `installer_sha256` pin it);
+#   * release gate (workflow_call, build.yml's verify-driver job): `tag`,
+#     `installer_artifact`, `installer_name` and `installer_sha256` are
+#     required and must be non-empty, and nothing is defaulted (`commit`
+#     may be empty: the caller's commit). The installer is the unsigned
+#     setup exe `package` uploaded as a workflow artifact of the same run;
+#     it is never a release asset. The comparison artifact this mode
+#     uploads (the unsigned rebuilt driver among it) is kept for one day.
+#   The mode follows from the workflow that started the run
+#   (github.workflow_ref), not from the inputs.
 #
 # The job fails when a normalised comparison differs, when the shipped
 # package does not verify, or when the installer check fails. Job outputs:
-# `raw_identical`, `normalised_identical`, `toolset_identical` (lab
-# package), `shipped_identical` (signed_zip) and `installer_identical`
-# (empty without `installer_tag`). Comparison logic:
-# .github/scripts/repro_compare.py.
+# `kind` (certified/attested), `raw_identical`, `normalised_identical`,
+# `toolset_identical` (reference package), `shipped_identical`
+# (signed_zip), `installer_identical`, and - set only when every check
+# passed and an installer was checked - `verified` ('true'), `driver_tag`
+# and `installer_sha256` (the exe that was unpacked and checked); the
+# release gate exposes the last three as workflow_call outputs, and
+# build.yml's sign-release requires them. Text taken from release files is
+# printed only through repro_compare.py's clean_text or between
+# ::stop-commands:: markers, so the runner cannot read it as workflow
+# commands. Comparison logic: .github/scripts/repro_compare.py.
 name: Driver reproducibility
 
 on:
   # Pushes that touch the check itself re-run it with the defaults below.
+  # Branches only: path filters are not evaluated for tag pushes, and v*
+  # tags already run it through build.yml's verify-driver job.
   push:
+    branches: ["**"]
     paths:
       - ".github/workflows/driver-reproducibility.yml"
       - ".github/scripts/repro_compare.py"
+      - ".github/scripts/test_repro_compare.py"
       - ".github/scripts/certified.py"
   workflow_dispatch:
     inputs:
       tag:
-        description: "driver-v* release whose lab package to compare against"
+        description: "driver-v* release to verify (certified or attested)"
         required: true
         default: "driver-v1.1.1.211"
       build_number:
-        description: "DriverBuildNumber to pin (the release's driver_build)"
-        required: true
-        default: "211"
+        description: "Optional cross-check: must equal the release manifest's driver_build (empty = use the manifest's)"
+        required: false
+        default: ""
       commit:
         description: "Commit to build (empty = HEAD of the branch this is run from)"
         required: false
         default: ""
       build_root:
-        description: "Directory the source is copied to before building. The PDB path the linker embeds depends on it, and its length changes the debug-directory layout."
-        required: false
-        default: 'C:\build\src'
-      installer_tag:
-        description: "Optional v* release whose setup exe to unpack and check it bundles exactly this release's signed_zip (empty = skip)"
+        description: "Override the build directory (empty = C:\\build\\src for a certified release, the directory the submitted .sys was linked in for an attested one). The PDB path the linker embeds depends on it, and its length changes the debug-directory layout."
         required: false
         default: ""
+      installer_tag:
+        description: "Optional published v* release whose setup exe to unpack and check it bundles exactly this release's signed_zip (empty = skip)"
+        required: false
+        default: ""
+      installer_name:
+        description: "Exact setup exe asset name on installer_tag (empty = its only StreamToSpeakerSetup-*.exe)"
+        required: false
+        default: ""
+      installer_sha256:
+        description: "Expected SHA-256 of that setup exe (empty = check against its .sha256 asset if present)"
+        required: false
+        default: ""
+  # The release gate (build.yml's verify-driver job). Every input except
+  # `commit` is required and must be non-empty.
+  workflow_call:
+    inputs:
+      tag:
+        description: "driver-v* release the installer bundles"
+        type: string
+        required: true
+      commit:
+        description: "Commit to build (empty = the caller's commit)"
+        type: string
+        required: false
+        default: ""
+      installer_artifact:
+        description: "Workflow artifact of this run holding exactly the unsigned setup exe"
+        type: string
+        required: true
+      installer_name:
+        description: "File name of that setup exe"
+        type: string
+        required: true
+      installer_sha256:
+        description: "SHA-256 that setup exe must have"
+        type: string
+        required: true
+    outputs:
+      verified:
+        description: "'true' only when every check passed, the installer check included (empty otherwise)"
+        value: ${{ jobs.reproduce.outputs.verified }}
+      driver_tag:
+        description: "The driver-v* release that was verified (set with verified)"
+        value: ${{ jobs.reproduce.outputs.driver_tag }}
+      installer_sha256:
+        description: "SHA-256 of the setup exe that was unpacked and checked (set with verified)"
+        value: ${{ jobs.reproduce.outputs.installer_sha256 }}
+      kind:
+        description: "certified or attested"
+        value: ${{ jobs.reproduce.outputs.kind }}
 
 permissions:
   contents: read
@@ -87,32 +189,79 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 60
     outputs:
+      kind: ${{ steps.release.outputs.kind }}
       raw_identical: ${{ steps.cmp_sys.outputs.raw_identical }}
-      normalised_identical: ${{ steps.verdict.outputs.normalised_identical }}
+      normalised_identical: ${{ steps.summary.outputs.normalised_identical }}
       toolset_identical: ${{ steps.cmp_sys.outputs.toolset_identical }}
-      shipped_identical: ${{ steps.verdict.outputs.shipped_identical }}
+      shipped_identical: ${{ steps.summary.outputs.shipped_identical }}
       installer_identical: ${{ steps.installer.outputs.identical }}
+      verified: ${{ steps.final.outputs.verified }}
+      driver_tag: ${{ steps.final.outputs.driver_tag }}
+      installer_sha256: ${{ steps.final.outputs.installer_sha256 }}
 
     steps:
       - name: Resolve parameters
         id: params
         shell: pwsh
         env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          EVENT: ${{ github.event_name }}
           IN_TAG: ${{ inputs.tag }}
           IN_BUILD: ${{ inputs.build_number }}
           IN_ROOT: ${{ inputs.build_root }}
-          IN_INSTALLER: ${{ inputs.installer_tag }}
+          IN_INSTALLER_TAG: ${{ inputs.installer_tag }}
+          IN_ARTIFACT: ${{ inputs.installer_artifact }}
+          IN_INAME: ${{ inputs.installer_name }}
+          IN_ISHA: ${{ inputs.installer_sha256 }}
         run: |
-          $tag = if ($env:IN_TAG) { $env:IN_TAG } else { "driver-v1.1.1.211" }
-          $build = if ($env:IN_BUILD) { $env:IN_BUILD } else { "211" }
-          $root = if ($env:IN_ROOT) { $env:IN_ROOT } else { 'C:\build\src' }
-          $installer = "$env:IN_INSTALLER".Trim()
-          if ($installer -and $installer -notmatch '^v[0-9][0-9A-Za-z.+-]*$') { throw "installer_tag must be a v* release tag, got '$installer'" }
-          Write-Host "tag=$tag build_number=$build build_root=$root installer_tag=$installer"
-          "installer_tag=$installer" >> $env:GITHUB_OUTPUT
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "build_number=$build" >> $env:GITHUB_OUTPUT
-          "build_root=$root" >> $env:GITHUB_OUTPUT
+          $ErrorActionPreference = "Stop"
+          $tag = "$env:IN_TAG".Trim()
+          $build = "$env:IN_BUILD".Trim()
+          $root = "$env:IN_ROOT".Trim()
+          $itag = "$env:IN_INSTALLER_TAG".Trim()
+          $artifact = "$env:IN_ARTIFACT".Trim()
+          $iname = "$env:IN_INAME".Trim()
+          $isha = "$env:IN_ISHA".Trim().ToLower()
+          # Run directly (push / dispatch) the workflow ref is this file;
+          # called from another workflow it is the caller's.
+          if ($env:WORKFLOW_REF -match '/\.github/workflows/driver-reproducibility\.yml@') {
+              $mode = "standalone"
+              if (-not $tag -and $env:EVENT -eq "push") { $tag = "driver-v1.1.1.211" }
+              if ($itag -and $itag -notmatch '^v[0-9][0-9A-Za-z.+-]*$') { throw "installer_tag must be a v* release tag" }
+              if (($iname -or $isha) -and -not $itag) { throw "installer_name / installer_sha256 need installer_tag" }
+              $source = if ($itag) { "release" } else { "none" }
+              $suffix = if ($itag) { "-$itag" } else { "" }
+          } else {
+              # Release gate: what is checked is exactly what the caller
+              # names; nothing is defaulted.
+              $mode = "gate"
+              $missing = @()
+              if (-not $tag) { $missing += "tag" }
+              if (-not $artifact) { $missing += "installer_artifact" }
+              if (-not $iname) { $missing += "installer_name" }
+              if (-not $isha) { $missing += "installer_sha256" }
+              if ($missing) { throw "release gate: empty input(s) $($missing -join ', '); the gate checks a named driver release against a named installer and defaults neither" }
+              if ($artifact -notmatch '^[A-Za-z0-9._-]+$') { throw "installer_artifact must be a plain artifact name" }
+              $source = "artifact"
+              $suffix = "-$artifact"
+          }
+          if ($tag -notmatch '^driver-v\d+\.\d+\.\d+\.\d+$') { throw "tag must be a driver-v<a.b.c.d> release tag" }
+          if ($build -and $build -notmatch '^\d+$') { throw "build_number must be numeric" }
+          if ($iname -and $iname -notmatch '^StreamToSpeakerSetup-[0-9A-Za-z.+-]+\.exe$') { throw "installer_name must be a StreamToSpeakerSetup-*.exe file name" }
+          if ($isha -and $isha -notmatch '^[0-9a-f]{64}$') { throw "installer_sha256 must be 64 hex digits" }
+          Write-Host "mode=$mode tag=$tag build_number=$build build_root=$root installer=$source $itag$artifact $iname $isha"
+          @(
+              "mode=$mode"
+              "tag=$tag"
+              "build_number=$build"
+              "build_root=$root"
+              "installer_source=$source"
+              "installer_tag=$itag"
+              "installer_artifact=$artifact"
+              "installer_name=$iname"
+              "installer_sha256=$isha"
+              "artifact_suffix=$suffix"
+          ) | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
 
       - uses: actions/checkout@v4
         with:
@@ -128,55 +277,80 @@ jobs:
           sparse-checkout: .github/scripts
           persist-credentials: false
 
-      # Identity of the checkout; the build step then proves the tree it
-      # compiles is byte-identical to it.
+      # Identity of the checkout, before anything is fetched from the
+      # release; the build step checks it again as it starts.
       - name: Compute driver source hash
         id: srchash
         shell: pwsh
         run: |
           "hash=${{ hashFiles('driver/**', 'include/**') }}" >> $env:GITHUB_OUTPUT
 
-      - name: Fetch release manifest and lab package
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Unit tests of the comparison script
+        shell: pwsh
+        working-directory: repro-tools/.github/scripts
+        run: |
+          # -b: the tests exercise failure paths that print workflow
+          # commands (::error::); only show output of a failing test.
+          python -m unittest -b test_repro_compare
+          if ($LASTEXITCODE -ne 0) { throw "repro_compare.py unit tests failed" }
+
+      # How the release was built follows from its manifest (kind, build
+      # number, reference package, whether driver.h was stamped), not from
+      # inputs. An unusable manifest stops the job. Release files go to the
+      # runner's temp directory, outside the checkout.
+      - name: Fetch release manifest and reference package
         id: release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.params.outputs.tag }}
           BUILD_NUMBER: ${{ steps.params.outputs.build_number }}
+          ROOT_OVERRIDE: ${{ steps.params.outputs.build_root }}
           SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:BUILD_NUMBER -notmatch '^\d+$') { throw "build_number must be numeric, got '$env:BUILD_NUMBER'" }
-          New-Item -ItemType Directory -Force -Path released | Out-Null
-          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern manifest.json --output released/manifest.json --clobber
+          $rel = Join-Path $env:RUNNER_TEMP "release"
+          if (Test-Path -LiteralPath $rel) { Remove-Item -LiteralPath $rel -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $rel | Out-Null
+          $manifest = Join-Path $rel "manifest.json"
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern manifest.json --output $manifest --clobber
           if ($LASTEXITCODE -ne 0) { throw "could not download manifest.json from release $env:TAG" }
-          $m = Get-Content released/manifest.json -Raw | ConvertFrom-Json
-          Write-Host "Release $env:TAG: driver $($m.driver_version) (build $($m.driver_build)), commit $($m.commit)"
-          Write-Host "  manifest source_hash : $($m.source_hash)"
+          $planArgs = @("plan", $manifest, $env:TAG, "--json", "plan.json")
+          if ($env:BUILD_NUMBER) { $planArgs += @("--build-number", $env:BUILD_NUMBER) }
+          python repro-tools/.github/scripts/repro_compare.py @planArgs
+          if ($LASTEXITCODE -ne 0) { throw "release $env:TAG cannot be verified: its manifest does not say how the driver was built (see the errors above)" }
+          # From here on only values repro_compare.py validated are used.
+          $plan = Get-Content plan.json -Raw | ConvertFrom-Json
+          Write-Host "Release ${env:TAG}: $($plan.kind) driver $($plan.version) (build $($plan.build_number)), manifest commit $(if ($plan.commit) { $plan.commit } else { '(not recorded)' })"
+          Write-Host "  manifest source_hash : $($plan.source_hash)"
           Write-Host "  checkout source_hash : $env:SOURCE_HASH"
-          if (-not $m.source_hash) { throw "manifest has no source_hash" }
-          if ($m.source_hash -ne $env:SOURCE_HASH) {
-              throw "driver source hash of this checkout does not match the release manifest - this is not the tree that was certified"
+          if ($plan.source_hash -ne $env:SOURCE_HASH) {
+              throw "driver source hash of this checkout does not match the release manifest - this is not the tree that $env:TAG was built from"
           }
-          if ("$($m.driver_build)" -ne $env:BUILD_NUMBER) {
-              throw "build_number input ($env:BUILD_NUMBER) differs from the manifest's driver_build ($($m.driver_build))"
+
+          $asset = $plan.reference_asset
+          $archive = Join-Path $rel $asset
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern $asset --output $archive --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not download $asset from release $env:TAG" }
+          $refArgs = @("reference", $archive, (Join-Path $rel "reference"), "--type", $plan.reference_type, "--json", "reference.json")
+          if ($plan.reference_sha256) { $refArgs += @("--sha256", $plan.reference_sha256) }
+          python repro-tools/.github/scripts/repro_compare.py @refArgs
+          if ($LASTEXITCODE -ne 0) { throw "$asset is not the reference package the manifest records, or not exactly one .sys/.inf (see above)" }
+          $refSys = Join-Path $rel "reference\StreamToSpeaker.sys"
+          if ($plan.reference_type -eq "submission_cab") {
+              $sig = Get-AuthenticodeSignature -LiteralPath $refSys
+              if ($sig.Status -ne "NotSigned") { throw "the .sys in $asset is expected to be the unsigned build Microsoft signed from, got signature status $($sig.Status)" }
           }
-          $labZip = $m.lab_zip
-          if (-not $labZip) { $labZip = "StreamToSpeaker-Driver-$($m.driver_version)-lab-testsigned.zip" }
-          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern $labZip --output "released/$labZip" --clobber
-          if ($LASTEXITCODE -ne 0) { throw "could not download $labZip from release $env:TAG" }
-          $sha = (Get-FileHash "released/$labZip" -Algorithm SHA256).Hash.ToLower()
-          Write-Host "  $labZip sha256 $sha"
-          if ($m.lab_zip_sha256 -and $sha -ne $m.lab_zip_sha256.ToLower()) {
-              throw "$labZip sha256 $sha does not match the manifest's lab_zip_sha256 $($m.lab_zip_sha256)"
-          }
-          Expand-Archive "released/$labZip" -DestinationPath released/lab -Force
-          Get-ChildItem released/lab | ForEach-Object { Write-Host "  lab: $($_.Name) ($($_.Length) bytes)" }
-          foreach ($n in "StreamToSpeaker.sys", "StreamToSpeaker.inf") {
-              if (-not (Test-Path "released/lab/$n")) { throw "$n missing from $labZip" }
-          }
-          "version=$($m.driver_version)" >> $env:GITHUB_OUTPUT
-          "lab_zip=$labZip" >> $env:GITHUB_OUTPUT
+
+          $rootArgs = @("buildroot", "plan.json", $refSys)
+          if ($env:ROOT_OVERRIDE) { $rootArgs += @("--build-root", $env:ROOT_OVERRIDE) }
+          python repro-tools/.github/scripts/repro_compare.py @rootArgs
+          if ($LASTEXITCODE -ne 0) { throw "no usable build directory for $env:TAG (see the error above)" }
+          "reference_label=$(if ($plan.kind -eq 'certified') { 'lab package' } else { 'submission CAB' })" >> $env:GITHUB_OUTPUT
 
       # ---- WDK: copied from build.yml (same paths, same cache key) ----
       - name: Exclude WDK paths from Defender real-time scanning
@@ -210,8 +384,12 @@ jobs:
           restore-keys: |
             wdk-${{ env.WDK_INSTALLER_URL }}-v2-
 
+      # Only when nothing was restored. A restore-key match is a tree from
+      # the same WDK installer (its URL is part of every key), as
+      # driver-submission.yml relies on too; running the installer over it
+      # again only adds a way to fail.
       - name: Install WDK (cache miss)
-        if: steps.cache-wdk.outputs.cache-hit != 'true'
+        if: steps.cache-wdk.outputs.cache-hit != 'true' && steps.cache-wdk.outputs.cache-matched-key == ''
         shell: pwsh
         run: |
           $installer = Join-Path $env:RUNNER_TEMP "wdksetup.exe"
@@ -244,9 +422,6 @@ jobs:
         with:
           msbuild-architecture: x64
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
 
       # ---- The shipped package ----
       # Installers bundle the release's signed_zip, not the lab zip: check
@@ -258,46 +433,124 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.params.outputs.tag }}
+          KIND: ${{ steps.release.outputs.kind }}
+          SIGNED_ZIP: ${{ steps.release.outputs.signed_zip }}
+          SIGNED_ZIP_SHA256: ${{ steps.release.outputs.signed_zip_sha256 }}
         run: |
           $ErrorActionPreference = "Stop"
-          $m = Get-Content released/manifest.json -Raw | ConvertFrom-Json
-          if (-not $m.signed_zip -or -not $m.signed_zip_sha256) {
-              throw "the manifest of $env:TAG records no signed_zip / signed_zip_sha256 - no shipped package to verify"
+          function Show-Untrusted([string]$Text) {
+              # Output that quotes release files, printed with workflow
+              # commands switched off.
+              $t = [guid]::NewGuid().ToString("N")
+              Write-Host "::stop-commands::$t"
+              Write-Host $Text
+              Write-Host "::$t::"
           }
-          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern $m.signed_zip --output "released/$($m.signed_zip)" --clobber
-          if ($LASTEXITCODE -ne 0) { throw "could not download $($m.signed_zip) from release $env:TAG" }
-          python repro-tools/.github/scripts/repro_compare.py package "released/$($m.signed_zip)" released/signed --sha256 $m.signed_zip_sha256 --json package-signed.json
-          if ($LASTEXITCODE -ne 0) { throw "$($m.signed_zip) is not the package the manifest records (or not exactly one .sys/.inf/.cat)" }
+          if (-not $env:SIGNED_ZIP -or -not $env:SIGNED_ZIP_SHA256) { throw "no shipped package resolved from the manifest of $env:TAG" }
+          $rel = Join-Path $env:RUNNER_TEMP "release"
+          $signed = Join-Path $rel "signed"
+          $zip = Join-Path $rel $env:SIGNED_ZIP
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern $env:SIGNED_ZIP --output $zip --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not download $env:SIGNED_ZIP from release $env:TAG" }
+          python repro-tools/.github/scripts/repro_compare.py package $zip $signed --sha256 $env:SIGNED_ZIP_SHA256 --json package-signed.json
+          if ($LASTEXITCODE -ne 0) { throw "$env:SIGNED_ZIP is not the package the manifest records (or not exactly one .sys/.inf/.cat)" }
+          $sys = Join-Path $signed "StreamToSpeaker.sys"
 
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
               Where-Object { $_.FullName -match '\\x64\\' } |
               Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
           if (-not $signtool) { throw "signtool.exe not found" }
-          $out = & $signtool verify /kp /v /c released/signed/StreamToSpeaker.cat released/signed/StreamToSpeaker.sys 2>&1 | Out-String
-          Write-Host $out
-          if ($LASTEXITCODE -ne 0) { throw "signtool catalog verification of the shipped package failed" }
+          $out = & $signtool verify /kp /v /c (Join-Path $signed "StreamToSpeaker.cat") $sys 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Show-Untrusted $out
+          if ($code -ne 0) { throw "signtool catalog verification of the shipped package failed" }
           if ($out -notmatch "Hardware Compatibility Publisher") { throw "the shipped catalog is not signed by the Microsoft Windows Hardware Compatibility Publisher" }
-          "signed_zip=$($m.signed_zip)" >> $env:GITHUB_OUTPUT
-          "signed_zip_sha256=$($m.signed_zip_sha256.ToLower())" >> $env:GITHUB_OUTPUT
+          if ($env:KIND -eq "attested") {
+              # Attestation: Microsoft's signature is the primary embedded
+              # one, the code is the submitted binary and the INF comes back
+              # untouched (what driver-attested.yml guaranteed at publish).
+              $emb = & $signtool verify /kp /v $sys 2>&1 | Out-String
+              $code = $LASTEXITCODE
+              Show-Untrusted $emb
+              if ($code -ne 0) { throw "signtool embedded-signature verification of the shipped .sys failed" }
+              if ($emb -notmatch "Hardware Compatibility Publisher") { throw "the shipped .sys is not signed by the Microsoft Windows Hardware Compatibility Publisher" }
+              python repro-tools/.github/scripts/certified.py sys-match --signed $sys --submitted (Join-Path $rel "reference\StreamToSpeaker.sys")
+              if ($LASTEXITCODE -ne 0) { throw "the shipped .sys is not the .sys in the submission CAB" }
+              $a = (Get-FileHash -LiteralPath (Join-Path $signed "StreamToSpeaker.inf") -Algorithm SHA256).Hash
+              $b = (Get-FileHash -LiteralPath (Join-Path $rel "reference\StreamToSpeaker.inf") -Algorithm SHA256).Hash
+              if ($a -ne $b) { throw "the shipped INF is not byte-identical to the INF in the submission CAB" }
+              Write-Host "shipped .sys = submitted .sys (signatures stripped); shipped INF = submitted INF (byte-identical)"
+              "submission_match=true" >> $env:GITHUB_OUTPUT
+          }
+          "signed_zip=$env:SIGNED_ZIP" >> $env:GITHUB_OUTPUT
+          "signed_zip_sha256=$env:SIGNED_ZIP_SHA256" >> $env:GITHUB_OUTPUT
 
       # ---- Build ----
       - name: Build driver (Release|x64, unsigned, pinned build number)
         id: build
         shell: pwsh
         env:
-          BUILD_ROOT: ${{ steps.params.outputs.build_root }}
-          BUILD_NUMBER: ${{ steps.params.outputs.build_number }}
+          BUILD_ROOT: ${{ steps.release.outputs.build_root }}
+          BUILD_NUMBER: ${{ steps.release.outputs.build_number }}
           VERSION: ${{ steps.release.outputs.version }}
+          STAMP: ${{ steps.release.outputs.stamp_driver_h }}
+          EXPECTED_SOURCE_HASH: ${{ steps.release.outputs.source_hash }}
+          # Evaluated as this step starts, after every release file was
+          # fetched and unpacked: the checkout is still the manifest's tree.
+          SOURCE_HASH_NOW: ${{ hashFiles('driver/**', 'include/**') }}
         run: |
           $ErrorActionPreference = "Stop"
+          if (-not $env:EXPECTED_SOURCE_HASH -or $env:SOURCE_HASH_NOW -ne $env:EXPECTED_SOURCE_HASH) {
+              throw "the checkout's driver source hash is now '$env:SOURCE_HASH_NOW', not the manifest's '$env:EXPECTED_SOURCE_HASH': driver/ or include/ changed after the source-hash guard"
+          }
+          Write-Host "driver source hash at build start: $env:SOURCE_HASH_NOW (= manifest)"
           $root = $env:BUILD_ROOT
-          if (Test-Path $root) { Remove-Item -Recurse -Force $root }
-          New-Item -ItemType Directory -Force -Path $root | Out-Null
-          Copy-Item -Recurse driver (Join-Path $root "driver")
-          Copy-Item -Recurse include (Join-Path $root "include")
-          Write-Host "Source copied to $root"
-          python repro-tools/.github/scripts/repro_compare.py tree . $root
-          if ($LASTEXITCODE -ne 0) { throw "the build tree differs from the checkout whose source hash was verified" }
+          if (-not $root -or $env:BUILD_NUMBER -notmatch '^\d+$') { throw "no build root / build number resolved from the release manifest" }
+          # repro_compare.py only hands out plain absolute paths; make sure
+          # Windows reads this one the same way before anything is deleted.
+          if ([IO.Path]::GetFullPath($root).TrimEnd('\') -ine $root.TrimEnd('\')) { throw "build root $root is not a canonical absolute path" }
+          $ws = (Resolve-Path $env:GITHUB_WORKSPACE).Path.TrimEnd('\')
+          $inPlace = $root.TrimEnd('\') -ieq $ws
+          if ($inPlace) {
+              # The release was built in a runner checkout at this very
+              # path: build in place, against a pristine copy of the
+              # verified sources for the tree check.
+              $pristine = Join-Path $env:RUNNER_TEMP "pristine-src"
+              if (Test-Path -LiteralPath $pristine) { Remove-Item -LiteralPath $pristine -Recurse -Force }
+              New-Item -ItemType Directory -Force -Path $pristine | Out-Null
+              Copy-Item -Recurse driver (Join-Path $pristine "driver")
+              Copy-Item -Recurse include (Join-Path $pristine "include")
+              Write-Host "Building in place in $root (the checkout)"
+          } else {
+              $pristine = "."
+              # The directory is emptied first: never one that contains
+              # this checkout or lies inside it.
+              $rootDir = $root.TrimEnd('\') + '\'
+              if ("$ws\".StartsWith($rootDir, [StringComparison]::OrdinalIgnoreCase)) { throw "build root $root contains the job's workspace $ws; refusing to build there" }
+              if ($rootDir.StartsWith("$ws\", [StringComparison]::OrdinalIgnoreCase)) { throw "build root $root is inside the job's workspace $ws; refusing to build there" }
+              try {
+                  if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+                  New-Item -ItemType Directory -Force -Path $root | Out-Null
+              } catch {
+                  throw "cannot create the build directory $root on this runner ($_); the release was linked at that path and the PDB path is part of the image layout"
+              }
+              Copy-Item -Recurse driver (Join-Path $root "driver")
+              Copy-Item -Recurse include (Join-Path $root "include")
+              Write-Host "Source copied to $root"
+          }
+          if ($env:STAMP -eq "true") {
+              # Same edit as driver-submission.yml's "Stamp driver build
+              # number" step.
+              $path = Join-Path $root "driver\driver.h"
+              $content = Get-Content $path -Raw
+              $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}$($env:BUILD_NUMBER)u"
+              Set-Content -Path $path -Value $new -NoNewline
+              python repro-tools/.github/scripts/repro_compare.py tree $pristine $root --stamped-build $env:BUILD_NUMBER
+              if ($LASTEXITCODE -ne 0) { throw "the build tree is not the verified checkout with driver.h stamped to build $env:BUILD_NUMBER" }
+          } else {
+              python repro-tools/.github/scripts/repro_compare.py tree $pristine $root
+              if ($LASTEXITCODE -ne 0) { throw "the build tree differs from the checkout whose source hash was verified" }
+          }
           Write-Host "driver.h: $((Select-String -Path (Join-Path $root 'driver\driver.h') -Pattern 'STREAM_TO_SPEAKER_DRIVER_BUILD').Line.Trim())"
 
           $log = Join-Path $env:GITHUB_WORKSPACE "msbuild-detailed.log"
@@ -358,31 +611,39 @@ jobs:
           [regex]::Matches($log, '(?im)^\s*[A-Z]:\\[^\r\n]*?\\(?:CL|link|stampinf|inf2cat)\.exe .*$') |
               ForEach-Object { $_.Value.Trim() } | Sort-Object -Unique | Set-Content tool-commands.txt
 
+
       # ---- Compare ----
-      - name: Strip the lab package's Authenticode signature (signtool remove /s)
+      - name: Strip the reference .sys's Authenticode signature (signtool remove /s)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $rel = Join-Path $env:RUNNER_TEMP "release"
+          $ref = Join-Path $rel "reference\StreamToSpeaker.sys"
+          $stripped = Join-Path $rel "stripped\StreamToSpeaker.sys"
           $kits = "C:\Program Files (x86)\Windows Kits\10\bin"
           $signtool = Get-ChildItem $kits -Recurse -Filter signtool.exe | Where-Object { $_.FullName -match '\\x64\\' } |
                       Sort-Object FullName -Descending | Select-Object -First 1
-          New-Item -ItemType Directory -Force -Path released/stripped | Out-Null
-          Copy-Item released/lab/StreamToSpeaker.sys released/stripped/StreamToSpeaker.sys
-          Write-Host "lab .sys (signed)   sha256 $((Get-FileHash released/lab/StreamToSpeaker.sys -Algorithm SHA256).Hash.ToLower())"
-          if ($signtool) {
-              & $signtool.FullName remove /s released/stripped/StreamToSpeaker.sys
+          New-Item -ItemType Directory -Force -Path (Split-Path $stripped) | Out-Null
+          Copy-Item -LiteralPath $ref $stripped
+          Write-Host "reference .sys (as released) sha256 $((Get-FileHash -LiteralPath $ref -Algorithm SHA256).Hash.ToLower())"
+          $status = (Get-AuthenticodeSignature -LiteralPath $ref).Status
+          if ($status -eq "NotSigned") {
+              Write-Host "reference .sys carries no signature (submission build); nothing to remove"
+          } elseif ($signtool) {
+              & $signtool.FullName remove /s $stripped
               if ($LASTEXITCODE -ne 0) { throw "signtool remove /s failed with $LASTEXITCODE" }
               Write-Host "signature removed with $($signtool.FullName)"
           } else {
               Write-Host "::warning::signtool.exe not found; the comparison script strips the certificate table itself"
           }
-          Write-Host "lab .sys (stripped) sha256 $((Get-FileHash released/stripped/StreamToSpeaker.sys -Algorithm SHA256).Hash.ToLower())"
+          Write-Host "reference .sys (stripped)    sha256 $((Get-FileHash -LiteralPath $stripped -Algorithm SHA256).Hash.ToLower())"
 
       - name: Compare StreamToSpeaker.sys
         id: cmp_sys
         continue-on-error: true
         shell: pwsh
         run: |
-          python repro-tools/.github/scripts/repro_compare.py sys released/stripped/StreamToSpeaker.sys fresh/StreamToSpeaker.sys --json compare-sys.json
+          python repro-tools/.github/scripts/repro_compare.py sys (Join-Path $env:RUNNER_TEMP "release\stripped\StreamToSpeaker.sys") fresh/StreamToSpeaker.sys --json compare-sys.json
           exit $LASTEXITCODE
 
       - name: Compare StreamToSpeaker.inf
@@ -390,7 +651,7 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          python repro-tools/.github/scripts/repro_compare.py inf released/lab/StreamToSpeaker.inf fresh/StreamToSpeaker.inf --json compare-inf.json
+          python repro-tools/.github/scripts/repro_compare.py inf (Join-Path $env:RUNNER_TEMP "release\reference\StreamToSpeaker.inf") fresh/StreamToSpeaker.inf --json compare-inf.json
           exit $LASTEXITCODE
 
       - name: Compare the shipped StreamToSpeaker.sys
@@ -398,7 +659,7 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          python repro-tools/.github/scripts/repro_compare.py sys released/signed/StreamToSpeaker.sys fresh/StreamToSpeaker.sys --json compare-shipped-sys.json
+          python repro-tools/.github/scripts/repro_compare.py sys (Join-Path $env:RUNNER_TEMP "release\signed\StreamToSpeaker.sys") fresh/StreamToSpeaker.sys --json compare-shipped-sys.json
           exit $LASTEXITCODE
 
       - name: Compare the shipped StreamToSpeaker.inf
@@ -406,44 +667,92 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          python repro-tools/.github/scripts/repro_compare.py inf released/signed/StreamToSpeaker.inf fresh/StreamToSpeaker.inf --json compare-shipped-inf.json
+          python repro-tools/.github/scripts/repro_compare.py inf (Join-Path $env:RUNNER_TEMP "release\signed\StreamToSpeaker.inf") fresh/StreamToSpeaker.inf --json compare-shipped-inf.json
           exit $LASTEXITCODE
 
-      # ---- Installer (optional) ----
-      # Unpacks the release's setup exe without running it and checks that
-      # the {app}\driver files are the shipped package, byte for byte, and
-      # that no test certificate rides along. innounp because innoextract
-      # stops at Inno Setup 6.0.5/6.1; pinned by hash.
+      # ---- Installer ----
+      # Release gate: the unsigned setup exe `package` uploaded as an
+      # artifact of this run.
+      - name: Download the installer artifact
+        if: steps.params.outputs.installer_source == 'artifact'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.params.outputs.installer_artifact }}
+          path: ${{ runner.temp }}/installer-artifact
+
+      # Unpacks the setup exe without running it and checks that the
+      # {app}\driver files are the shipped package, byte for byte, and that
+      # no test certificate rides along. innounp because innoextract stops
+      # at Inno Setup 6.0.5/6.1; pinned by hash. -e extracts without paths,
+      # so no entry can land outside the destination.
       - name: Check the installer bundles the shipped package
         id: installer
-        if: steps.params.outputs.installer_tag != ''
+        if: steps.params.outputs.installer_source != 'none'
         continue-on-error: true
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE: ${{ steps.params.outputs.installer_source }}
           ITAG: ${{ steps.params.outputs.installer_tag }}
+          ARTIFACT: ${{ steps.params.outputs.installer_artifact }}
+          INAME: ${{ steps.params.outputs.installer_name }}
+          ISHA: ${{ steps.params.outputs.installer_sha256 }}
           INNOUNP_URL: https://github.com/jrathlev/InnoUnpacker-Windows-GUI/releases/download/oi_2_2_11/innounp-2.zip
           INNOUNP_SHA256: 851772538a041229102ad9964542d49dc00c74002e3091a70469c079ae368f52
         run: |
           $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force -Path installer | Out-Null
-          gh release download $env:ITAG --repo $env:GITHUB_REPOSITORY --pattern "StreamToSpeakerSetup-*" --dir installer --clobber
-          if ($LASTEXITCODE -ne 0) { throw "could not download the setup exe from release $env:ITAG" }
-          $exes = @(Get-ChildItem installer -Filter "StreamToSpeakerSetup-*.exe")
-          if ($exes.Count -ne 1) { throw "expected exactly one StreamToSpeakerSetup-*.exe on $env:ITAG, found $($exes.Count)" }
-          $exe = $exes[0]
-          $sha = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
-          Write-Host "$($exe.Name) sha256 $sha"
-          $sidecar = "$($exe.FullName).sha256"
-          if (Test-Path $sidecar) {
-              $want = ((Get-Content $sidecar -Raw).Trim() -split '\s+')[0].ToLower()
-              if ($want -ne $sha) { throw "$($exe.Name) hashes to $sha but its .sha256 asset says $want" }
-              Write-Host "  matches $($exe.Name).sha256"
-          } else {
-              Write-Host "::warning::$env:ITAG has no $($exe.Name).sha256 asset"
+          function Show-Untrusted([string]$Text) {
+              # Output that quotes the installer, printed with workflow
+              # commands switched off.
+              $t = [guid]::NewGuid().ToString("N")
+              Write-Host "::stop-commands::$t"
+              Write-Host $Text
+              Write-Host "::$t::"
           }
-          $sig = Get-AuthenticodeSignature $exe.FullName
-          Write-Host "  Authenticode: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          $work = Join-Path $env:RUNNER_TEMP "installer"
+          if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          if ($env:SOURCE -eq "artifact") {
+              $files = @(Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP "installer-artifact") -Recurse -File)
+              if ($files.Count -ne 1 -or $files[0].Name -cne $env:INAME) {
+                  throw "artifact $env:ARTIFACT must hold exactly one file, $env:INAME; it holds $($files.Count) file(s)"
+              }
+              $exe = $files[0]
+              $label = "artifact $env:ARTIFACT"
+          } else {
+              $download = Join-Path $work "download"
+              New-Item -ItemType Directory -Force -Path $download | Out-Null
+              $pattern = if ($env:INAME) { $env:INAME } else { "StreamToSpeakerSetup-*.exe" }
+              gh release download $env:ITAG --repo $env:GITHUB_REPOSITORY --pattern $pattern --pattern "$pattern.sha256" --dir $download --clobber
+              if ($LASTEXITCODE -ne 0) { throw "could not download $pattern from release $env:ITAG" }
+              $exes = @(Get-ChildItem -LiteralPath $download -File | Where-Object { $_.Name -like $pattern -and $_.Name -notlike "*.sha256" })
+              if ($exes.Count -ne 1) { throw "expected exactly one $pattern on $env:ITAG, found $($exes.Count)" }
+              $exe = $exes[0]
+              if ($exe.Name -notmatch '^StreamToSpeakerSetup-[0-9A-Za-z.+-]+\.exe$') { throw "unexpected setup exe name on $env:ITAG" }
+              $label = "release $env:ITAG"
+          }
+          $sha = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          Write-Host "$($exe.Name) ($label) sha256 $sha"
+          "exe=$($exe.Name)" >> $env:GITHUB_OUTPUT
+          "exe_sha256=$sha" >> $env:GITHUB_OUTPUT
+          "label=$label" >> $env:GITHUB_OUTPUT
+          if ($env:ISHA) {
+              if ($sha -ne $env:ISHA) { throw "$($exe.Name) ($label) hashes to $sha, expected $env:ISHA - not the installer this check was asked about" }
+              Write-Host "  matches the expected sha256"
+          }
+          if ($env:SOURCE -eq "release") {
+              $sidecar = "$($exe.FullName).sha256"
+              if (Test-Path -LiteralPath $sidecar) {
+                  $want = ((Get-Content -LiteralPath $sidecar -Raw).Trim() -split '\s+')[0].ToLower()
+                  if ($want -ne $sha) { throw "$($exe.Name) hashes to $sha but its .sha256 asset says otherwise" }
+                  Write-Host "  matches $($exe.Name).sha256"
+              } else {
+                  Write-Host "::warning::$env:ITAG has no $($exe.Name).sha256 asset"
+              }
+          }
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe.FullName
+          Show-Untrusted "  Authenticode: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          "signature=$($sig.Status)" >> $env:GITHUB_OUTPUT
 
           $zip = Join-Path $env:RUNNER_TEMP "innounp-2.zip"
           Invoke-WebRequest -Uri $env:INNOUNP_URL -OutFile $zip -UseBasicParsing
@@ -451,28 +760,37 @@ jobs:
           if ($got -ne $env:INNOUNP_SHA256) { throw "innounp-2.zip sha256 $got, expected $env:INNOUNP_SHA256" }
           $tool = Join-Path $env:RUNNER_TEMP "innounp"
           Expand-Archive $zip -DestinationPath $tool -Force
-          & (Join-Path $tool "innounp.exe") -x -b -y -q -dinstaller\unpacked $exe.FullName "{app}\driver\*.*"
-          if ($LASTEXITCODE -ne 0) { throw "innounp could not unpack $($exe.Name) (exit $LASTEXITCODE)" }
-          $sys = @(Get-ChildItem installer\unpacked -Recurse -Filter StreamToSpeaker.sys)
-          if ($sys.Count -ne 1) { Get-ChildItem -Recurse installer\unpacked | Select-Object FullName; throw "expected one StreamToSpeaker.sys in the installer, found $($sys.Count)" }
-          $dir = $sys[0].DirectoryName
-          Get-ChildItem $dir | ForEach-Object { Write-Host "  installer: $($_.Name) ($($_.Length) bytes)" }
-          "exe=$($exe.Name)" >> $env:GITHUB_OUTPUT
-          "exe_sha256=$sha" >> $env:GITHUB_OUTPUT
-          "signature=$($sig.Status)" >> $env:GITHUB_OUTPUT
-          $cer = @(Get-ChildItem $dir -Filter *.cer)
+          $dest = Join-Path $work "unpacked"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $log = & (Join-Path $tool "innounp.exe") -e -b -y -q "-d$dest" $exe.FullName "{app}\driver\*.*" 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Show-Untrusted $log
+          if ($code -ne 0) { throw "innounp could not unpack $($exe.Name) (exit $code)" }
+          if (@(Get-ChildItem -LiteralPath $dest -Directory).Count) { throw "innounp created subdirectories under $dest; expected a flat extraction" }
+          $files = @(Get-ChildItem -LiteralPath $dest -File)
+          Show-Untrusted (($files | ForEach-Object { "  installer: $($_.Name) ($($_.Length) bytes)" }) -join "`n")
+          $cer = @($files | Where-Object { $_.Extension -ieq ".cer" })
           "test_cert=$([bool]$cer.Count)".ToLower() >> $env:GITHUB_OUTPUT
-          python repro-tools/.github/scripts/repro_compare.py files released/signed $dir --json installer-files.json
+          python repro-tools/.github/scripts/repro_compare.py files (Join-Path $env:RUNNER_TEMP "release\signed") $dest --json installer-files.json
           $same = $LASTEXITCODE -eq 0
           "identical=$($same.ToString().ToLower())" >> $env:GITHUB_OUTPUT
-          if ($cer.Count) { throw "$($exe.Name) ships a test certificate ($($cer.Name -join ', ')) next to the driver" }
+          if ($cer.Count) { throw "$($exe.Name) ships a test certificate next to the driver" }
           if (-not $same) { throw "$($exe.Name) does not bundle the shipped package of this release" }
+          "verified_sha256=$sha" >> $env:GITHUB_OUTPUT
 
       - name: Summary
-        id: verdict
+        id: summary
         shell: pwsh
         env:
           TAG: ${{ steps.params.outputs.tag }}
+          MODE: ${{ steps.params.outputs.mode }}
+          KIND: ${{ steps.release.outputs.kind }}
+          REF_ASSET: ${{ steps.release.outputs.reference_asset }}
+          REF_LABEL: ${{ steps.release.outputs.reference_label }}
+          BUILD_ROOT: ${{ steps.release.outputs.build_root }}
+          BUILD_NUMBER: ${{ steps.release.outputs.build_number }}
+          STAMP: ${{ steps.release.outputs.stamp_driver_h }}
+          SUBMISSION_MATCH: ${{ steps.signed.outputs.submission_match }}
           SYS_RAW: ${{ steps.cmp_sys.outputs.raw_identical }}
           SYS_NORM: ${{ steps.cmp_sys.outputs.normalised_identical }}
           SYS_TOOLSET: ${{ steps.cmp_sys.outputs.toolset_identical }}
@@ -483,8 +801,9 @@ jobs:
           SHIP_SYS_RAW: ${{ steps.cmp_ship_sys.outputs.raw_identical }}
           SHIP_SYS_NORM: ${{ steps.cmp_ship_sys.outputs.normalised_identical }}
           SHIP_INF_NORM: ${{ steps.cmp_ship_inf.outputs.normalised_identical }}
-          ITAG: ${{ steps.params.outputs.installer_tag }}
+          INST_SOURCE: ${{ steps.params.outputs.installer_source }}
           INST_OUTCOME: ${{ steps.installer.outcome }}
+          INST_LABEL: ${{ steps.installer.outputs.label }}
           INST_EXE: ${{ steps.installer.outputs.exe }}
           INST_SHA: ${{ steps.installer.outputs.exe_sha256 }}
           INST_SIG: ${{ steps.installer.outputs.signature }}
@@ -496,7 +815,11 @@ jobs:
           $shipOk = ($env:SHIP_SYS_NORM -eq 'true') -and ($env:SHIP_INF_NORM -eq 'true')
           "shipped_identical=$($shipOk.ToString().ToLower())" >> $env:GITHUB_OUTPUT
           $s = @()
-          $s += "## Driver reproducibility: $env:TAG"
+          $s += "## Driver reproducibility: $env:TAG ($env:KIND)$(if ($env:MODE -eq 'gate') { ' - release gate' })"
+          $s += ""
+          $s += "Rebuilt as the release was built: DriverBuildNumber $env:BUILD_NUMBER, driver.h $(if ($env:STAMP -eq 'true') { "stamped with build $env:BUILD_NUMBER" } else { 'as committed (not stamped)' }), in ``$env:BUILD_ROOT``. Reference: the $env:REF_LABEL ``$env:REF_ASSET``."
+          $s += ""
+          $s += "### Reference package ($env:REF_LABEL)"
           $s += ""
           $s += "| File | raw identical | normalised identical |"
           $s += "|---|---|---|"
@@ -508,13 +831,17 @@ jobs:
           $s += ""
           $s += "``$env:SHIP_ZIP`` sha256 ``$env:SHIP_ZIP_SHA`` (matches the manifest; catalog verified, Microsoft Windows Hardware Compatibility Publisher)"
           $s += ""
+          if ($env:KIND -eq "attested") {
+              $s += "Embedded .sys signature verified (kernel policy, Microsoft Windows Hardware Compatibility Publisher); .sys identical to the submitted one after stripping signatures and INF byte-identical to the submitted one: **$(if ($env:SUBMISSION_MATCH) { $env:SUBMISSION_MATCH } else { 'no verdict' })**"
+              $s += ""
+          }
           $s += "| File | raw identical | normalised identical |"
           $s += "|---|---|---|"
           $s += "| StreamToSpeaker.sys (signatures stripped) | $env:SHIP_SYS_RAW | $env:SHIP_SYS_NORM |"
           $s += "| StreamToSpeaker.inf (DriverVer date masked) | | $env:SHIP_INF_NORM |"
           $s += ""
-          if ($env:ITAG) {
-              $s += "### Installer $env:ITAG"
+          if ($env:INST_SOURCE -ne 'none') {
+              $s += "### Installer ($env:INST_LABEL)"
               $s += ""
               $s += "``$env:INST_EXE`` sha256 ``$env:INST_SHA``, Authenticode $env:INST_SIG"
               $s += ""
@@ -574,17 +901,43 @@ jobs:
               $s += '```'
           }
           $s | Add-Content $env:GITHUB_STEP_SUMMARY
+          # The summary quotes release files (cleaned by repro_compare.py);
+          # echoed with workflow commands switched off all the same.
+          $t = [guid]::NewGuid().ToString("N")
+          Write-Host "::stop-commands::$t"
           $s | ForEach-Object { Write-Host $_ }
+          Write-Host "::$t::"
+
+      # Release files live outside the checkout; copy what is worth keeping
+      # next to the rest of the evidence.
+      - name: Collect the evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $rel = Join-Path $env:RUNNER_TEMP "release"
+          New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          foreach ($name in "manifest.json", "reference", "stripped", "signed") {
+              $p = Join-Path $rel $name
+              if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination evidence -Recurse -Force }
+          }
 
       - name: Upload comparison artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: driver-reproducibility-${{ steps.params.outputs.tag }}
+          name: driver-reproducibility-${{ steps.params.outputs.tag }}${{ steps.params.outputs.artifact_suffix }}
+          # A re-run of the job replaces the artifact of an earlier attempt.
+          overwrite: true
+          # It holds the unsigned rebuilt driver. As the release gate (called
+          # from another workflow, see Resolve parameters) it is kept for one
+          # day, like the release chain's other artifacts with unsigned
+          # binaries; standalone runs keep the repository default (0).
+          retention-days: ${{ !contains(github.workflow_ref, '/.github/workflows/driver-reproducibility.yml@') && 1 || 0 }}
           path: |
             fresh/
-            released/stripped/
-            released/signed/
+            evidence/
+            plan.json
+            reference.json
             compare-sys.json
             compare-inf.json
             compare-shipped-sys.json
@@ -597,26 +950,46 @@ jobs:
           if-no-files-found: warn
 
       - name: Verdict
+        id: final
         shell: pwsh
         env:
-          OK: ${{ steps.verdict.outputs.normalised_identical }}
+          MODE: ${{ steps.params.outputs.mode }}
+          TAG: ${{ steps.params.outputs.tag }}
+          OK: ${{ steps.summary.outputs.normalised_identical }}
+          KIND: ${{ steps.release.outputs.kind }}
+          REF_LABEL: ${{ steps.release.outputs.reference_label }}
+          SUBMISSION_MATCH: ${{ steps.signed.outputs.submission_match }}
           SYS_RAW: ${{ steps.cmp_sys.outputs.raw_identical }}
           SYS_NORM: ${{ steps.cmp_sys.outputs.normalised_identical }}
           SYS_TOOLSET: ${{ steps.cmp_sys.outputs.toolset_identical }}
           INF_NORM: ${{ steps.cmp_inf.outputs.normalised_identical }}
           SHIP_SYS_NORM: ${{ steps.cmp_ship_sys.outputs.normalised_identical }}
           SHIP_INF_NORM: ${{ steps.cmp_ship_inf.outputs.normalised_identical }}
-          SHIP_OK: ${{ steps.verdict.outputs.shipped_identical }}
-          ITAG: ${{ steps.params.outputs.installer_tag }}
+          SHIP_OK: ${{ steps.summary.outputs.shipped_identical }}
+          INST_SOURCE: ${{ steps.params.outputs.installer_source }}
+          INST_LABEL: ${{ steps.installer.outputs.label }}
           INST_OUTCOME: ${{ steps.installer.outcome }}
+          INST_VERIFIED_SHA: ${{ steps.installer.outputs.verified_sha256 }}
         run: |
+          $ErrorActionPreference = "Stop"
           # A comparison that crashed sets no output; that is an error of the
           # check, not evidence that the driver is not reproducible.
           if (-not $env:SYS_NORM -or -not $env:INF_NORM -or -not $env:SHIP_SYS_NORM -or -not $env:SHIP_INF_NORM) { throw "a comparison step did not complete (see its log); no verdict" }
-          if ($env:OK -ne 'true') { throw "the rebuilt driver differs from the released package beyond the masked fields (see summary)" }
+          if ($env:KIND -ne 'certified' -and $env:KIND -ne 'attested') { throw "release kind '$env:KIND' not resolved; no verdict" }
+          if ($env:KIND -eq 'attested' -and $env:SUBMISSION_MATCH -ne 'true') { throw "the shipped package was not tied to the submission CAB; no verdict" }
+          if ($env:OK -ne 'true') { throw "the rebuilt driver differs from the released $env:REF_LABEL beyond the masked fields (see summary)" }
           if ($env:SHIP_OK -ne 'true') { throw "the rebuilt driver differs from the shipped signed_zip beyond the masked fields (see summary)" }
-          if ($env:ITAG -and $env:INST_OUTCOME -ne 'success') { throw "installer check for $env:ITAG failed (see its step log and the summary)" }
-          if ($env:ITAG) { Write-Host "Installer $env:ITAG bundles the shipped package." }
+          if ($env:INST_SOURCE -ne 'none' -and ($env:INST_OUTCOME -ne 'success' -or $env:INST_VERIFIED_SHA -notmatch '^[0-9a-f]{64}$')) { throw "installer check ($env:INST_LABEL) failed (see its step log and the summary)" }
+          if ($env:MODE -eq 'gate' -and $env:INST_SOURCE -ne 'artifact') { throw "release gate: no installer artifact was checked" }
+          if ($env:INST_SOURCE -ne 'none') { Write-Host "Installer ($env:INST_LABEL) bundles the shipped package." }
           if ($env:SYS_RAW -eq 'true') { Write-Host "Byte-for-byte reproducible." }
           elseif ($env:SYS_TOOLSET -eq 'true') { Write-Host "Reproducible up to timestamps / checksum / PDB identity." }
           else { Write-Host "Code and data reproducible; headers differ only in timestamps / checksum / PDB identity / toolset build ids." }
+          # Set only here, after every check passed: what a caller (the
+          # release gate) binds the signature to.
+          if ($env:INST_SOURCE -ne 'none') {
+              "verified=true" >> $env:GITHUB_OUTPUT
+              "driver_tag=$env:TAG" >> $env:GITHUB_OUTPUT
+              "installer_sha256=$env:INST_VERIFIED_SHA" >> $env:GITHUB_OUTPUT
+              Write-Host "verified: $env:TAG, installer sha256 $env:INST_VERIFIED_SHA"
+          }
