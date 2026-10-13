@@ -663,7 +663,8 @@ jobs:
   # exes are not the bytes this run signed. Every job that writes to the
   # draft or asks for a signature first checks that the tag still points
   # at this run's commit. A published release becomes latest only if no
-  # published release has a version at least as high.
+  # published release (other than a pre-release) has a version at least
+  # as high.
   #
   # A release whose installer falls back to the test-signed driver is
   # published as a pre-release and never made latest: releases/latest, the
@@ -1227,9 +1228,10 @@ jobs:
           done <<< "$artifacts"
 
   # The last job: the draft is published (as the latest release unless a
-  # published release has a version at least as high; a pre-release that
-  # is not latest for a test-signed fallback) only when it holds exactly
-  # the assets of a complete release (release_draft.py check: every
+  # published release other than a pre-release has a version at least as
+  # high; a pre-release that is not latest for a test-signed fallback)
+  # only when it holds exactly the assets of a complete release
+  # (release_draft.py check: every
   # expected name, nothing else, the service exe and the setup exe (and
   # the alias) exactly the bytes sign-service and sign-release signed in
   # this run, each sidecar and provenance bundle matching its file) and
@@ -1285,9 +1287,10 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw "$($exe.Name) on the draft does not carry a valid Authenticode signature; nothing was published" }
           }
 
-      # Latest release unless a published release has a version at least as
-      # high; a -testsigned fallback installer makes it a pre-release that
-      # is never latest (release_draft.py publish).
+      # Latest release unless a published release (other than a pre-release)
+      # has a version at least as high; a -testsigned fallback installer
+      # makes it a pre-release that is never latest (release_draft.py
+      # publish).
       - name: Publish the release
         shell: pwsh
         env:

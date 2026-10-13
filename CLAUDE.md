@@ -238,6 +238,6 @@ lightweight tag `vX.Y.Z` on `main` (`git tag vX.Y.Z <merge-commit> && git
 push origin vX.Y.Z`). The tag push runs build → sign-service → package →
 verify-driver → sign-release → publish: it assembles the GitHub Release
 (generated notes) as a draft and publishes it only when it is complete
-(as the latest release unless a published release has a version at least
-as high; a `-testsigned` fallback becomes a pre-release, never latest); the `request-signing` environment may hold the
+(as the latest release unless a published release other than a
+pre-release has a version at least as high; a `-testsigned` fallback becomes a pre-release, never latest); the `request-signing` environment may hold the
 signing jobs for approval.
