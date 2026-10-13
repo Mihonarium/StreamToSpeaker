@@ -35,6 +35,11 @@
     (which would send a release to the test-signed fallback).
     -WarnOnError turns such an error into a warning plus found=false; it is
     for builds where the package is only an extra (dev and PR builds).
+    It does not cover a driver release that contradicts its own manifest:
+    a signed_zip asset the manifest names but the release lacks, a zip that
+    does not hash to signed_zip_sha256, or one without exactly one
+    inf/sys/cat. Those always fail, since they mean the release was altered
+    or broken.
 
 .NOTES
     Requires the gh CLI with GH_TOKEN set (standard on Actions runners).
@@ -49,6 +54,12 @@ param(
 $ErrorActionPreference = "Stop"
 
 $PackageFiles = "StreamToSpeaker.inf", "StreamToSpeaker.sys", "StreamToSpeaker.cat"
+
+# A driver release that contradicts its own manifest. Never downgraded
+# by -WarnOnError.
+function New-IntegrityError([string]$message) {
+    [System.IO.InvalidDataException]::new($message)
+}
 
 function Out-StepOutput([string]$line) {
     if ($env:GITHUB_OUTPUT) { $line >> $env:GITHUB_OUTPUT }
@@ -80,7 +91,7 @@ function Expand-PackageFlat([string]$zipPath, [string]$dest) {
     try {
         foreach ($name in $PackageFiles) {
             $entries = @($zip.Entries | Where-Object { $_.Name -ieq $name })
-            if ($entries.Count -ne 1) { throw "$(Split-Path $zipPath -Leaf) holds $($entries.Count) entries named $name, expected exactly one" }
+            if ($entries.Count -ne 1) { throw (New-IntegrityError "$(Split-Path $zipPath -Leaf) holds $($entries.Count) entries named $name, expected exactly one") }
             [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entries[0], (Join-Path $dest $name), $true)
         }
     } finally {
@@ -136,7 +147,7 @@ function Find-SignedDriver {
     $m = $best.Manifest
     $r = $best.Release
     $kind = $best.Kind
-    if (@($r.assets) -notcontains $m.signed_zip) { throw "$($r.tag_name): manifest says $kind but asset $($m.signed_zip) is missing" }
+    if (@($r.assets) -notcontains $m.signed_zip) { throw (New-IntegrityError "$($r.tag_name): manifest says $kind but asset $($m.signed_zip) is missing") }
 
     New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
     $zipPath = Join-Path (Resolve-Path $OutDir).Path $m.signed_zip
@@ -144,7 +155,7 @@ function Find-SignedDriver {
     if ($LASTEXITCODE -ne 0) { throw "gh release download of $($m.signed_zip) failed" }
     $zipSha = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLower()
     if ($zipSha -ne $m.signed_zip_sha256.ToLower()) {
-        throw "$($m.signed_zip) hashes to $zipSha but the manifest records $($m.signed_zip_sha256) - refusing to use it"
+        throw (New-IntegrityError "$($m.signed_zip) hashes to $zipSha but the manifest records $($m.signed_zip_sha256) - refusing to use it")
     }
     Expand-PackageFlat $zipPath $OutDir
 
@@ -160,7 +171,14 @@ function Find-SignedDriver {
 try {
     Find-SignedDriver
 } catch {
-    if (-not $WarnOnError) { throw }
+    # ZipFile.OpenRead throws InvalidDataException (wrapped by PowerShell)
+    # for a zip that is not one: after the hash matched, that too is the
+    # release's content.
+    $integrity = $false
+    for ($e = $_.Exception; $e; $e = $e.InnerException) {
+        if ($e -is [System.IO.InvalidDataException]) { $integrity = $true }
+    }
+    if (-not $WarnOnError -or $integrity) { throw }
     Write-Host "::warning::Could not determine the Microsoft-signed driver for driver source hash $SourceHash ($($_.Exception.Message)); no production-driver package for this build."
     Out-StepOutput "found=false"
 }
