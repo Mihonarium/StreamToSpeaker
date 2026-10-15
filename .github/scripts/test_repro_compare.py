@@ -5,6 +5,7 @@ import os
 import struct
 import tempfile
 import unittest
+import unittest.mock
 import zipfile
 import zlib
 
@@ -428,8 +429,8 @@ class BuildRoot(unittest.TestCase):
         self.assertEqual(rc.resolve_build_root(plan, "")["root"], RUNNER_ROOT)
 
     def test_shallow_or_relative_roots_are_refused(self):
-        # The build step empties the directory: never a drive root or a
-        # top-level directory, wherever the path came from.
+        # Never a drive root or a top-level directory, wherever the path
+        # came from.
         attested = rc.build_plan(ATTESTED_MANIFEST, "t")
         for shallow in ("C:\\", "C:\\Windows", "D:\\a", "relative\\dir", "\\\\server\\share\\a\\b", "D:\\a\\b\nx",
                         "D:\\a\\x\\..", "D:\\a\\StreamToSpeake[r]"):
@@ -454,6 +455,135 @@ class BuildRoot(unittest.TestCase):
         res = rc.resolve_build_root({"kind": ""}, RUNNER_PDB)
         self.assertIsNone(res["root"])
         self.assertIn("no build plan", res["error"])
+
+    def test_syntax_check_is_not_a_safety_check(self):
+        # Deep system directories are well-formed build roots. What keeps
+        # them safe is BuildDir below: nothing that already exists, other
+        # than the job's own checkout, is ever used.
+        for p in ("C:\\Windows\\System32", "C:\\Program Files (x86)\\Windows Kits", "D:\\a\\_temp",
+                  "C:\\hostedtoolcache\\windows"):
+            self.assertTrue(rc.valid_build_root(p), p)
+
+
+class BuildDir(unittest.TestCase):
+    """The build step builds in its own checkout or in a directory it
+    creates; nothing else that already exists is deleted, emptied or
+    built in.
+    Every test here injects exists/makedirs or patches them, so none
+    creates or looks up a build directory on disk (on Linux,
+    os.makedirs("C:\\build\\src") would create a directory of that name in
+    the working directory)."""
+
+    def action(self, root, exists=False, ws=RUNNER_ROOT):
+        looked_up = []
+
+        def probe(path):
+            looked_up.append(path)
+            return exists
+        result = rc.build_dir_action(root, ws, probe)
+        self.looked_up = looked_up
+        return result
+
+    def test_the_checkout_is_built_in_place(self):
+        for root in (RUNNER_ROOT, RUNNER_ROOT + "\\", RUNNER_ROOT.lower(), "d:\\A\\streamtospeaker\\StreamToSpeaker"):
+            self.assertEqual(self.action(root, exists=True), ("in_place", None), root)
+        for ws in (RUNNER_ROOT + "\\", "D:/a/StreamToSpeaker/StreamToSpeaker", RUNNER_ROOT.upper()):
+            self.assertEqual(self.action(RUNNER_ROOT, exists=True, ws=ws), ("in_place", None), ws)
+
+    def test_a_directory_that_does_not_exist_is_created(self):
+        # The certified lab directory, and attested releases linked in
+        # another runner checkout (a renamed repository, another drive),
+        # including names that only share a prefix with the checkout.
+        for root in ("C:\\build\\src", "D:\\a\\OldName\\OldName", "C:\\a\\StreamToSpeaker\\StreamToSpeaker",
+                     RUNNER_ROOT + "X", RUNNER_ROOT[:-1]):
+            self.assertEqual(self.action(root), ("create", None), root)
+            self.assertEqual(self.looked_up, [root])
+
+    def test_an_existing_path_is_refused_and_left_alone(self):
+        for root in ("C:\\Windows\\System32", "C:\\Program Files (x86)\\Windows Kits", "D:\\a\\_temp",
+                     "D:\\a\\_actions", "C:\\hostedtoolcache\\windows", "C:\\build\\src"):
+            action, error = self.action(root, exists=True)
+            self.assertIsNone(action, root)
+            self.assertIn("already exists on this runner", error)
+            self.assertIn("nothing was deleted", error)
+
+    def test_the_build_root_never_contains_or_lies_inside_the_workspace(self):
+        # Refused before anything is looked up on disk.
+        for root in ("D:\\a\\StreamToSpeaker", "D:\\A\\STREAMTOSPEAKER\\"):
+            action, error = self.action(root)
+            self.assertIsNone(action, root)
+            self.assertIn("contains the job's workspace", error)
+            self.assertEqual(self.looked_up, [])
+        for root in (RUNNER_ROOT + "\\build", RUNNER_ROOT + "\\driver\\x64"):
+            action, error = self.action(root)
+            self.assertIsNone(action, root)
+            self.assertIn("is inside the job's workspace", error)
+            self.assertEqual(self.looked_up, [])
+
+    def test_unusable_roots_and_workspaces_are_refused(self):
+        for root in ("C:\\", "C:\\Windows", "D:\\a", "relative\\dir", "D:\\a\\x\\..", "D:\\a\\b[c]",
+                     "D:\\a\\b\nx", "\\\\server\\share\\a\\b", "", None):
+            action, error = self.action(root)
+            self.assertIsNone(action, repr(root))
+            self.assertIn("refusing to build there", error)
+            self.assertEqual(self.looked_up, [])
+        for ws in ("", "\\", None):
+            action, error = self.action("C:\\build\\src", ws=ws)
+            self.assertIsNone(action, repr(ws))
+            self.assertIn("no workspace", error)
+
+    def test_prepare_creates_only_an_absent_directory(self):
+        made = []
+        rep = rc.prepare_build_dir("C:\\build\\src", RUNNER_ROOT, exists=lambda _p: False, makedirs=made.append)
+        self.assertEqual((rep["created"], rep["in_place"], rep["error"]), (True, False, None))
+        self.assertEqual(made, ["C:\\build\\src"])
+
+    def test_prepare_leaves_an_existing_path_and_the_checkout_alone(self):
+        made = []
+        rep = rc.prepare_build_dir("C:\\Windows\\System32", RUNNER_ROOT, exists=lambda _p: True,
+                                   makedirs=made.append)
+        self.assertEqual((rep["created"], rep["in_place"]), (False, False))
+        self.assertIn("already exists", rep["error"])
+        rep = rc.prepare_build_dir(RUNNER_ROOT, RUNNER_ROOT, exists=lambda _p: True, makedirs=made.append)
+        self.assertEqual((rep["in_place"], rep["created"], rep["error"]), (True, False, None))
+        self.assertEqual(made, [])
+
+    def test_prepare_reports_a_directory_it_cannot_create(self):
+        def no_drive(_p):
+            raise FileNotFoundError(3, "The system cannot find the path specified")
+
+        def appeared_since_the_check(_p):
+            raise FileExistsError(183, "Cannot create a file when that file already exists")
+        for fail in (no_drive, appeared_since_the_check):
+            rep = rc.prepare_build_dir("D:\\a\\OldName\\OldName", "C:\\a\\StreamToSpeaker\\StreamToSpeaker",
+                                       exists=lambda _p: False, makedirs=fail)
+            self.assertFalse(rep["created"])
+            self.assertIn("cannot create the build directory D:\\a\\OldName\\OldName", rep["error"])
+
+    def test_cli(self):
+        report = os.path.join(tempfile.mkdtemp(), "builddir.json")
+        made = []
+
+        def run(argv, lexists):
+            buf = io.StringIO()
+            with unittest.mock.patch.object(rc.os, "makedirs", made.append), \
+                    unittest.mock.patch.object(rc.os.path, "lexists", lexists), \
+                    contextlib.redirect_stdout(buf):
+                code = rc.main(argv)
+            with open(report, encoding="utf-8") as f:
+                return code, buf.getvalue(), json.load(f)
+
+        code, out, rep = run(["builddir", "C:\\build\\src", RUNNER_ROOT, "--json", report], lambda _p: False)
+        self.assertEqual((code, rep["in_place"], rep["created"], rep["error"]), (0, False, True, None))
+        self.assertEqual(made, ["C:\\build\\src"])
+        self.assertIn("build directory: C:\\build\\src (created by this job)", out)
+        code, out, rep = run(["builddir", RUNNER_ROOT, RUNNER_ROOT, "--json", report], lambda _p: True)
+        self.assertEqual((code, rep["in_place"], rep["created"]), (0, True, False))
+        self.assertIn("(this checkout, built in place)", out)
+        code, out, rep = run(["builddir", "C:\\Windows\\System32", RUNNER_ROOT, "--json", report], lambda _p: True)
+        self.assertEqual((code, rep["in_place"], rep["created"]), (1, False, False))
+        self.assertIn("::error::build root C:\\Windows\\System32 already exists on this runner", out)
+        self.assertEqual(made, ["C:\\build\\src"])
 
 
 class PlanCli(unittest.TestCase):
@@ -548,8 +678,7 @@ class PlanCli(unittest.TestCase):
             f.write(make_pe(pdb_path=RUNNER_PDB.encode("ascii")))
         self.assertEqual(rc.main(["buildroot", plan_json, sys_path, "--build-root", "E:\\x\\y"]), 0)
         self.assertEqual(self.outputs()["build_root"], "E:\\x\\y")
-        # The build step empties the directory: never a drive root or a
-        # top-level directory, whoever asks.
+        # Never a drive root or a top-level directory, whoever asks.
         for shallow in ("C:\\", "C:\\Windows", "D:\\a", "relative\\dir"):
             self.assertEqual(rc.main(["buildroot", plan_json, sys_path, "--build-root", shallow]), 1, shallow)
         with open(sys_path, "wb") as f:
@@ -891,6 +1020,17 @@ class WorkflowCommandHygiene(unittest.TestCase):
         commands = [line for line in lines if line.lstrip().startswith("::")]
         self.assertEqual(len(commands), 1)
         self.assertTrue(commands[0].startswith("::error::the submitted .sys records the PDB path"))
+        self.assertNotIn("::", commands[0][len("::error::"):])
+        for line in lines:
+            self.assertNotIn("##[", line)
+
+    def test_builddir_shows_a_hostile_root_cleaned(self):
+        code, lines = self.run_main(["builddir", "D:\\a\\b\n::set-output name=in_place::true\r\n##[error]x",
+                                     RUNNER_ROOT, "--json", os.path.join(self.tmp, "builddir.json")])
+        self.assertEqual(code, 1)
+        commands = [line for line in lines if line.lstrip().startswith("::")]
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(commands[0].startswith("::error::build root "))
         self.assertNotIn("::", commands[0][len("::error::"):])
         for line in lines:
             self.assertNotIn("##[", line)

@@ -390,6 +390,11 @@ check:
   (WDK download or install, MSBuild failing, or for an attested release
   "cannot create the build directory": the runner's checkout path no
   longer matches the path the driver was linked at). A broken check.
+  "already exists on this runner": the build directory (`C:\build\src`
+  for a certified release) was already there when the job went to create
+  it. The check never deletes or reuses a directory it did not create;
+  find out what put it there (a runner-image change) instead of working
+  around it.
 - **Verdict: "differs ... beyond the masked fields"** — read the summary.
   Differences together with a differing Rich header row (compiler,
   linker or library build ids) point to codegen drift in the runner

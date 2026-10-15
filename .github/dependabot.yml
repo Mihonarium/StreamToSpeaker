@@ -1,0 +1,19 @@
+# Every action the workflows use from outside this repository is pinned to a
+# full commit SHA, with its version as a comment on the same line, so a
+# moved or re-pointed tag upstream changes nothing here. Dependabot proposes
+# newer versions as pull requests, rewriting the SHA and the comment
+# together: once a week, in a single pull request that covers every action
+# with a newer version. It holds a version back until 7 days after its
+# release, so a release withdrawn within that week is never proposed.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns:
+          - "*"
