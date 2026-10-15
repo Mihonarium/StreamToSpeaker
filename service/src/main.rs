@@ -158,8 +158,10 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_QUIESCENT_AFTER_PACKETS)]
     silence_packets_threshold: u32,
 
-    /// Bind address for the HTTP server. Default 0.0.0.0; consider
-    /// 127.0.0.1 + a speaker on the loopback alias.
+    /// Bind address for the HTTP server. Default 0.0.0.0. With 127.0.0.1
+    /// only a speaker running on this PC can fetch the stream, and
+    /// discovery doesn't list a speaker on this PC (loopback included): add
+    /// it by address (+ Add, under Speakers in the window).
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
 
@@ -258,13 +260,13 @@ fn main() {
     // installer's AppMutex check (and our own duplicate-launch gate
     // below, for FUTURE launches) keep seeing the kernel object.
     // The Global\ mutex is what the installer watches for a running copy;
-    // its "already existed" answer also covers an instance that never
-    // takes the per-session claim below (--headless, or one running
-    // elevated).
+    // its answer also covers a copy that never takes the per-session
+    // claim below: a --headless one, one in another session or account,
+    // or one running elevated.
     #[cfg(windows)]
-    let (_mutex_handle, global_taken) = create_singleton_mutex();
+    let (_mutex_handle, machine_lock) = create_singleton_mutex();
     #[cfg(not(windows))]
-    let global_taken = false;
+    let machine_lock = stream_to_speaker::single_instance::MachineLock::Created;
 
     // Single-instance gate. If another instance is already running in
     // this session, ask it to show its window and exit — same pattern as
@@ -284,11 +286,15 @@ fn main() {
             info!("another instance is running; asked it to show its window, exiting");
             return;
         }
-        if global_taken {
-            // Running, but not a GUI in this session we could hand over
-            // to (a --headless instance, or an elevated one). Starting
-            // anyway would only fail to bind the stream port.
-            info!("another instance (headless or elevated) is already running; exiting");
+        // Running, but not as a GUI in this session we could hand over
+        // to. Starting anyway would only fail to bind the stream port.
+        if let stream_to_speaker::single_instance::Launch::Exit { log, tell } =
+            stream_to_speaker::single_instance::launch(machine_lock, cli.startup)
+        {
+            info!("{}; exiting", log);
+            if let Some(message) = tell {
+                show_info_dialog(message);
+            }
             return;
         }
     }
@@ -376,6 +382,28 @@ fn show_crash_dialog(body: &str) {
     }
 }
 
+/// Windows MessageBox telling the user why nothing else happens. No-op on
+/// non-Windows.
+#[cfg(windows)]
+fn show_info_dialog(body: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    };
+    let body_w: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
+    let title_w: Vec<u16> = PRODUCT_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body_w.as_ptr(),
+            title_w.as_ptr(),
+            MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_info_dialog(_body: &str) {}
+
 fn open_log_file() -> Option<std::fs::File> {
     let mut path = stream_to_speaker::log_dir()?;
     path.push("stream-to-speaker.log");
@@ -405,28 +433,27 @@ fn attach_parent_console() {
 /// elevated installer process can see a mutex held by the user-session
 /// service.
 ///
-/// Which instance gets to run is decided separately, per session, by
-/// `single_instance::claim`; this one only signals "the app is running"
-/// to Setup.
+/// A launch in the same session hands over to the running GUI through
+/// `single_instance::claim`; this one tells Setup "the app is running",
+/// and tells a GUI launch about a copy it can't hand over to.
 ///
-/// Returns (handle, already running): the mutex already existed, or we
-/// may not open it because an elevated instance owns it.
+/// Returns the handle (None if the mutex wasn't created or opened) and
+/// what the call said about other copies. Another account's or an
+/// elevated copy's mutex can't be opened (access denied): its creator's
+/// default security applies.
 #[cfg(windows)]
-fn create_singleton_mutex() -> (Option<isize>, bool) {
+fn create_singleton_mutex() -> (Option<isize>, stream_to_speaker::single_instance::MachineLock) {
     use std::ffi::CString;
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS};
+    use stream_to_speaker::single_instance::{machine_lock_from, MachineLock};
+    use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::Threading::CreateMutexA;
     let Some(name) = CString::new("Global\\StreamToSpeaker.Singleton").ok() else {
-        return (None, false);
+        return (None, MachineLock::Unavailable);
     };
     unsafe {
         let h = CreateMutexA(std::ptr::null(), 0, name.as_ptr() as *const u8);
-        let err = GetLastError();
-        if h.is_null() {
-            (None, err == ERROR_ACCESS_DENIED)
-        } else {
-            (Some(h as isize), err == ERROR_ALREADY_EXISTS)
-        }
+        let lock = machine_lock_from(!h.is_null(), GetLastError());
+        ((!h.is_null()).then_some(h as isize), lock)
     }
 }
 

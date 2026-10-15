@@ -8,6 +8,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
+use crate::discovery_net::{shown, LanTargets, Reach, Reported, ADD_BY_ADDRESS};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
@@ -73,6 +74,25 @@ pub struct Renderer {
 pub struct DiscoveryState {
     inner: Mutex<Vec<Renderer>>,
     identity: Mutex<IdentityState>,
+    memory: ScanMemory,
+}
+
+/// What the scans into one discovery list remember from one to the next,
+/// forgotten with the list ([`DiscoveryState::clear`]).
+#[derive(Default)]
+pub struct ScanMemory {
+    /// What each Sonos unit last said about itself (bonded, grouped or
+    /// listed), for the scans where asking it fails.
+    pub(crate) self_reports: crate::sonos::SelfReports,
+    /// The targets and devices whose refusal is already in the log.
+    pub(crate) reported: Reported,
+}
+
+impl ScanMemory {
+    fn clear(&self) {
+        self.self_reports.clear();
+        self.reported.clear();
+    }
 }
 
 /// Which addresses each UDN is trusted at. A UDN is self-reported, so
@@ -246,6 +266,11 @@ impl DiscoveryState {
         self.inner.lock().unwrap().clone()
     }
 
+    /// The memory a scan into this list uses (see [`discover_once`]).
+    pub fn memory(&self) -> &ScanMemory {
+        &self.memory
+    }
+
     /// Set the renderer list, deduping by control URL.
     /// Duplicate UDNs from different hosts are settled by
     /// [`resolve_udn_conflicts`].
@@ -268,7 +293,10 @@ impl DiscoveryState {
     /// Look up a renderer by friendly name (substring, case-insensitive)
     /// or IP literal.
     pub fn find(&self, query: &str) -> Option<Renderer> {
-        let q = query.to_ascii_lowercase();
+        // Full Unicode lowercase: room names are whatever the speaker's app
+        // accepts ("küche" finds "KÜCHE", "детская" finds "Детская").
+        let q = query.to_lowercase();
+        let hit = |name: &str| name.to_lowercase().contains(&q);
         let inner = self.inner.lock().unwrap();
         // IP literal match first.
         for r in inner.iter() {
@@ -277,7 +305,7 @@ impl DiscoveryState {
             }
         }
         for r in inner.iter() {
-            if r.friendly_name.to_ascii_lowercase().contains(&q) {
+            if hit(&r.friendly_name) {
                 return Some(r.clone());
             }
         }
@@ -285,15 +313,8 @@ impl DiscoveryState {
         // entry that contains Kitchen even though the row is named after
         // its coordinator.
         for r in inner.iter() {
-            let zone_hit = r
-                .zone_name
-                .as_deref()
-                .map(|z| z.to_ascii_lowercase().contains(&q))
-                .unwrap_or(false);
-            let member_hit = r
-                .group_members
-                .iter()
-                .any(|m| m.to_ascii_lowercase().contains(&q));
+            let zone_hit = r.zone_name.as_deref().is_some_and(hit);
+            let member_hit = r.group_members.iter().any(|m| hit(m));
             if zone_hit || member_hit {
                 return Some(r.clone());
             }
@@ -305,6 +326,7 @@ impl DiscoveryState {
     /// paused because its adapter went away).
     pub fn clear(&self) {
         self.inner.lock().unwrap().clear();
+        self.memory.clear();
     }
 
     pub fn first(&self) -> Option<Renderer> {
@@ -470,7 +492,7 @@ pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, scope: Sc
             let used = scope();
             match used.iface() {
                 None => debug!("SSDP discovery paused (chosen adapter unavailable)"),
-                Some(iface) => match discover_once(Duration::from_secs(3), iface) {
+                Some(iface) => match discover_once(Duration::from_secs(3), iface, state.memory()) {
                     Ok(found) if scope() == used => {
                         info!("SSDP discovery: {} renderer(s) found", found.len());
                         state.replace(found);
@@ -488,12 +510,13 @@ pub fn spawn_discovery(state: Arc<DiscoveryState>, interval: Duration, scope: Sc
 /// `iface` pins the search to one local IPv4 (from `--advertise-ip` /
 /// `--bind`); `None` searches from every non-loopback IPv4 interface,
 /// so a speaker on a second NIC is found even when a VPN owns the
-/// default route.
-pub fn discover_once(timeout: Duration, iface: Option<Ipv4Addr>) -> Result<Vec<Renderer>> {
+/// default route. `memory` is the memory of the list the result goes
+/// into ([`DiscoveryState::memory`]).
+pub fn discover_once(timeout: Duration, iface: Option<Ipv4Addr>, memory: &ScanMemory) -> Result<Vec<Renderer>> {
     // A pinned interface stays strict: failing to search from it is an
     // error, not a silent fallback to whatever the OS picks.
     if let Some(ip) = iface {
-        return collect_renderers(vec![search_socket(ip)?], timeout);
+        return collect_renderers(vec![search_socket(ip)?], timeout, memory);
     }
     let ifaces = local_ipv4_interfaces();
     let mut sockets: Vec<UdpSocket> = Vec::new();
@@ -507,15 +530,16 @@ pub fn discover_once(timeout: Duration, iface: Option<Ipv4Addr>) -> Result<Vec<R
         // No usable interface list (or every bind failed): let the OS pick.
         sockets.push(search_socket(Ipv4Addr::UNSPECIFIED)?);
     }
-    collect_renderers(sockets, timeout)
+    collect_renderers(sockets, timeout, memory)
 }
 
 /// Read M-SEARCH replies on `sockets` until `timeout`, then fetch and
 /// parse each advertised device.
-fn collect_renderers(sockets: Vec<UdpSocket>, timeout: Duration) -> Result<Vec<Renderer>> {
+fn collect_renderers(sockets: Vec<UdpSocket>, timeout: Duration, memory: &ScanMemory) -> Result<Vec<Renderer>> {
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 4096];
-    let mut locations: Vec<String> = Vec::new();
+    // Each LOCATION, with the address of the first reply that gave it.
+    let mut locations: Vec<(String, IpAddr)> = Vec::new();
 
     while Instant::now() < deadline {
         for udp in &sockets {
@@ -523,9 +547,9 @@ fn collect_renderers(sockets: Vec<UdpSocket>, timeout: Duration) -> Result<Vec<R
                 Ok((n, peer)) => {
                     let text = String::from_utf8_lossy(&buf[..n]);
                     if let Some(loc) = extract_header(&text, "LOCATION") {
-                        if !locations.contains(&loc) {
+                        if !locations.iter().any(|(l, _)| *l == loc) {
                             debug!("SSDP response LOCATION={} from {}", loc, peer.ip());
-                            locations.push(loc);
+                            locations.push((loc, peer.ip()));
                         }
                     }
                 }
@@ -536,9 +560,11 @@ fn collect_renderers(sockets: Vec<UdpSocket>, timeout: Duration) -> Result<Vec<R
         }
     }
 
+    let lan = LanTargets::current();
+    let reach = Reach { lan: &lan, reported: &memory.reported };
     let mut renderers = Vec::new();
-    for loc in &locations {
-        match fetch_and_parse_device(loc, Duration::from_secs(3)) {
+    for loc in fetchable_locations(&locations, reach) {
+        match fetch_and_parse_device(loc, Duration::from_secs(3), ServiceUrls::OnItsHost(Some(&memory.reported))) {
             Ok(r) => renderers.push(r),
             Err(e) => debug!("device fetch {} failed: {}", loc, e),
         }
@@ -546,9 +572,22 @@ fn collect_renderers(sockets: Vec<UdpSocket>, timeout: Duration) -> Result<Vec<R
 
     // Sonos: fold zone-group topology in — hides bonded/grouped members,
     // annotates group coordinators. No-op without Sonos devices.
-    crate::sonos::annotate_with_topology(&mut renderers);
+    crate::sonos::annotate_with_topology(&mut renderers, reach, &memory.self_reports);
 
     Ok(renderers)
+}
+
+/// The LOCATIONs discovery may fetch: those naming a device address on
+/// this PC's networks (see [`LanTargets`]). Any device can answer a
+/// search, so a reply could otherwise point the description fetch at
+/// this PC's own services or at hosts elsewhere. Each refused target is
+/// logged once (see [`Reach::allows`]).
+fn fetchable_locations<'a>(locations: &'a [(String, IpAddr)], reach: Reach<'_>) -> Vec<&'a str> {
+    locations
+        .iter()
+        .filter(|(loc, sender)| reach.allows(loc, || format!("from an SSDP reply by {}", sender)))
+        .map(|(loc, _)| loc.as_str())
+        .collect()
 }
 
 /// Non-loopback, non-link-local IPv4 addresses of this machine (from
@@ -619,7 +658,23 @@ fn extract_header(response: &str, header: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn fetch_and_parse_device(location: &str, timeout: Duration) -> Result<Renderer> {
+/// How far the service URLs in a device description are followed.
+#[derive(Clone, Copy)]
+pub(crate) enum ServiceUrls<'a> {
+    /// The device was found by discovery or named in another device's
+    /// topology, so its description came from the network: a service URL
+    /// naming another host is ignored. That ties a discovered device's
+    /// control, event and topology URLs to its own address. The ignored
+    /// URLs are logged, once per device when a discovery list's memory is
+    /// given.
+    OnItsHost(Option<&'a Reported>),
+    /// The user added the device by address. Requests to it are the
+    /// user's choice, and its description may name it by a host name or
+    /// another of its addresses, so its URLs are used as given.
+    AsGiven,
+}
+
+pub(crate) fn fetch_and_parse_device(location: &str, timeout: Duration, urls: ServiceUrls<'_>) -> Result<Renderer> {
     let xml = http_get(location, timeout).with_context(|| format!("GET {}", location))?;
     let url = url::Url::parse(location).with_context(|| format!("parse location {}", location))?;
     let base = format!(
@@ -657,12 +712,12 @@ pub(crate) fn fetch_and_parse_device(location: &str, timeout: Duration) -> Resul
         None => return Err(anyhow!("no host in location {}", location)),
     };
 
-    let mut renderer = parse_device_description(&xml, &base, ip)?;
+    let mut renderer = parse_device_description(&xml, &base, ip, urls)?;
     renderer.host_addrs = host_addrs;
     Ok(renderer)
 }
 
-fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr) -> Result<Renderer> {
+fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr, urls: ServiceUrls<'_>) -> Result<Renderer> {
     let doc = roxmltree::Document::parse(xml.trim_start()).map_err(|e| {
         // Show the first chunk of XML so we can see what failed.
         let head: String = xml.chars().take(120).collect();
@@ -735,22 +790,61 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr) -> Result<Ren
         }
     }
 
-    let av_ctrl = av_ctrl.ok_or_else(|| anyhow!("AVTransport controlURL missing in {}", friendly_name))?;
-    let rc_ctrl = rc_ctrl.ok_or_else(|| anyhow!("RenderingControl controlURL missing in {}", friendly_name))?;
-    let rc_event = rc_event.ok_or_else(|| anyhow!("RenderingControl eventSubURL missing in {}", friendly_name))?;
+    // Every request we later make to this device (SOAP control, GENA
+    // subscriptions, Sonos topology) goes to these URLs, so for a device
+    // that came from the network they must stay on the device: an
+    // absolute URL naming another host is ignored (see `ServiceUrls`).
+    let mut elsewhere: Vec<String> = Vec::new();
+    let mut resolve = |what: &str, raw: Option<String>| -> Option<String> {
+        let raw = raw?;
+        let url = service_url(base_url, &raw, urls);
+        if url.is_none() {
+            elsewhere.push(format!("{} {}", what, shown(&raw)));
+        }
+        url
+    };
+    let av_ctrl = resolve("AVTransport control", av_ctrl);
+    let av_event = resolve("AVTransport events", av_event);
+    let rc_ctrl = resolve("RenderingControl control", rc_ctrl);
+    let rc_event = resolve("RenderingControl events", rc_event);
+    let zgt_ctrl = resolve("ZoneGroupTopology control", zgt_ctrl);
+    let grc_ctrl = resolve("GroupRenderingControl control", grc_ctrl);
+    let grc_event = resolve("GroupRenderingControl events", grc_event);
+    if !elsewhere.is_empty() {
+        let line = || {
+            format!(
+                "Device {} at {} gives service URLs on another host, which are ignored: {}. \
+                 If it is a speaker you want to use, {}.",
+                shown(&friendly_name),
+                base_url,
+                elsewhere.join(", "),
+                ADD_BY_ADDRESS
+            )
+        };
+        match urls {
+            ServiceUrls::OnItsHost(Some(reported)) => {
+                reported.once(&format!("{} {}", base_url, udn.as_deref().unwrap_or("")), line);
+            }
+            _ => info!("{}", line()),
+        }
+    }
+
+    let av_ctrl = av_ctrl.ok_or_else(|| anyhow!("no usable AVTransport controlURL in {:?}", friendly_name))?;
+    let rc_ctrl = rc_ctrl.ok_or_else(|| anyhow!("no usable RenderingControl controlURL in {:?}", friendly_name))?;
+    let rc_event = rc_event.ok_or_else(|| anyhow!("no usable RenderingControl eventSubURL in {:?}", friendly_name))?;
 
     Ok(Renderer {
         friendly_name,
         ip,
         base_url: base_url.to_string(),
-        av_transport_control_url: absolute_url(base_url, &av_ctrl),
-        rendering_control_control_url: absolute_url(base_url, &rc_ctrl),
-        rendering_control_event_url: absolute_url(base_url, &rc_event),
-        av_transport_event_url: av_event.map(|e| absolute_url(base_url, &e)),
+        av_transport_control_url: av_ctrl,
+        rendering_control_control_url: rc_ctrl,
+        rendering_control_event_url: rc_event,
+        av_transport_event_url: av_event,
         udn,
-        zone_group_topology_control_url: zgt_ctrl.map(|u| absolute_url(base_url, &u)),
-        group_rendering_control_control_url: grc_ctrl.map(|u| absolute_url(base_url, &u)),
-        group_rendering_control_event_url: grc_event.map(|u| absolute_url(base_url, &u)),
+        zone_group_topology_control_url: zgt_ctrl,
+        group_rendering_control_control_url: grc_ctrl,
+        group_rendering_control_event_url: grc_event,
         zone_name: None,
         group_members: Vec::new(),
         group_member_addrs: Vec::new(),
@@ -760,14 +854,28 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr) -> Result<Ren
     })
 }
 
-fn absolute_url(base: &str, maybe_relative: &str) -> String {
-    if maybe_relative.starts_with("http://") || maybe_relative.starts_with("https://") {
-        maybe_relative.to_string()
-    } else if maybe_relative.starts_with('/') {
-        format!("{}{}", base.trim_end_matches('/'), maybe_relative)
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), maybe_relative)
+/// A service URL from a device description, made absolute against `base`
+/// (the description's `scheme://host[:port]`). A relative URL stays on
+/// the device by construction. An absolute one is kept as given for a
+/// device the user added, and otherwise only if it names the
+/// description's own host (any port); None otherwise.
+fn service_url(base: &str, raw: &str, urls: ServiceUrls<'_>) -> Option<String> {
+    let scheme: String = raw.chars().take(8).collect::<String>().to_ascii_lowercase();
+    if scheme.starts_with("http://") || scheme.starts_with("https://") {
+        if matches!(urls, ServiceUrls::AsGiven) {
+            return Some(raw.to_string());
+        }
+        let host = |u: &str| url::Url::parse(u).ok().and_then(|u| u.host().map(|h| h.to_owned()));
+        return match (host(raw), host(base)) {
+            (Some(theirs), Some(ours)) if theirs == ours => Some(raw.to_string()),
+            _ => None,
+        };
     }
+    Some(if raw.starts_with('/') {
+        format!("{}{}", base.trim_end_matches('/'), raw)
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), raw)
+    })
 }
 
 /// Largest response [`http_get`] accepts. Device descriptions are a few
@@ -1102,6 +1210,20 @@ mod tests {
     }
 
     #[test]
+    fn player_lookup_matches_non_ascii_names_in_any_case() {
+        let state = DiscoveryState::new();
+        let mut g = r("192.168.1.10 - Sonos One", "uuid:A", "192.168.1.10");
+        g.zone_name = Some("Salón".into());
+        g.group_members = vec!["Küche".into(), "Детская".into()];
+        state.replace(vec![g, r("Bad Ems", "uuid:B", "192.168.1.11")]);
+        for q in ["Küche", "küche", "KÜCHE", "salón", "SALÓN", "детская", "ДЕТСКАЯ"] {
+            assert_eq!(state.find(q).map(|x| x.display_name()).as_deref(), Some("Salón + 2"), "{q}");
+        }
+        assert_eq!(state.find("BAD").map(|x| x.friendly_name).as_deref(), Some("Bad Ems"));
+        assert!(state.find("Köln").is_none());
+    }
+
+    #[test]
     fn conflicted_group_keeps_its_label() {
         let mut g = r("Living Room", "uuid:A", "192.168.1.10");
         g.zone_name = Some("Living Room".into());
@@ -1150,6 +1272,188 @@ mod tests {
         ]);
         assert_eq!(state.find_by_id("192.168.1.10").unwrap().ip.to_string(), "192.168.1.66");
         assert_eq!(state.find_by_id("uuid:A").unwrap().ip.to_string(), "192.168.1.10");
+    }
+
+    /// Replies from 192.168.1.30 giving `locations`.
+    fn replies(locations: &[&str]) -> Vec<(String, IpAddr)> {
+        let sender: IpAddr = "192.168.1.30".parse().unwrap();
+        locations.iter().map(|s| (s.to_string(), sender)).collect()
+    }
+
+    #[test]
+    fn only_locations_on_our_networks_are_fetched() {
+        let lan = LanTargets::from_networks([(Ipv4Addr::new(192, 168, 1, 5), 24)]);
+        let reported = Reported::default();
+        let locations = replies(&[
+            "http://192.168.1.10:1400/xml/device_description.xml",
+            "http://127.0.0.1:8080/admin",
+            // This PC itself: whatever listens on every interface answers here.
+            "http://192.168.1.5:5901/stream.raw",
+            "http://localhost:1400/xml/device_description.xml",
+            "http://10.0.0.1/",
+            "http://192.168.1.255/x",
+            "http://192.168.1.20:49152/description.xml",
+        ]);
+        assert_eq!(
+            fetchable_locations(&locations, Reach { lan: &lan, reported: &reported }),
+            ["http://192.168.1.10:1400/xml/device_description.xml", "http://192.168.1.20:49152/description.xml"]
+        );
+    }
+
+    #[test]
+    fn each_refused_location_is_reported_once_until_the_list_is_cleared() {
+        let lan = LanTargets::from_networks([(Ipv4Addr::new(192, 168, 1, 5), 24)]);
+        let state = DiscoveryState::new();
+        let reach = Reach { lan: &lan, reported: &state.memory().reported };
+        let locations = replies(&[
+            "http://10.0.5.20:1400/xml/device_description.xml",
+            // The same address again, on another port: already reported.
+            "http://10.0.5.20:49152/description.xml",
+            "http://192.168.1.5:5901/",
+        ]);
+        assert!(fetchable_locations(&locations, reach).is_empty());
+        // Both targets are in the log once; the next scan adds no line.
+        let first_time = |target: &str| state.memory().reported.once(target, || "probe".into());
+        assert!(!first_time("10.0.5.20"));
+        assert!(!first_time("192.168.1.5"));
+        assert!(fetchable_locations(&locations, reach).is_empty());
+        // Discovery moving to another network starts afresh.
+        state.clear();
+        assert!(first_time("10.0.5.20"));
+    }
+
+    #[test]
+    fn refusal_lines_name_the_target_and_what_to_do() {
+        let lan = LanTargets::from_networks([(Ipv4Addr::new(192, 168, 1, 5), 24)]);
+        let line = |url: &str| lan.check_url(url).unwrap_err().line(url, "from an SSDP reply by 192.168.1.30");
+        assert_eq!(
+            line("http://10.0.5.20:1400/xml/device_description.xml"),
+            "Not contacting 10.0.5.20 (from an SSDP reply by 192.168.1.30): it isn't on this PC's networks. \
+             To use a speaker there, add it by address (+ Add, under Speakers in the window)."
+        );
+        for this_pc in ["http://192.168.1.5:1400/", "http://127.0.0.1:1400/"] {
+            assert!(
+                line(this_pc).ends_with("To use a speaker running on this PC, add it by address (+ Add, under Speakers in the window)."),
+                "{this_pc}"
+            );
+        }
+        assert!(line("http://kitchen.local:1400/").starts_with("Not contacting \"kitchen.local\""));
+        // An address that names no device: nothing to add.
+        assert!(line("http://239.255.255.250:1900/").ends_with("it isn't a device's address."));
+    }
+
+    fn description(zgt: &str, avt: &str, avt_events: &str, rc_events: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0"><device>
+<friendlyName>Living Room</friendlyName><modelName>One</modelName><UDN>uuid:RINCON_A</UDN>
+<serviceList>
+<service><serviceType>urn:schemas-upnp-org:service:ZoneGroupTopology:1</serviceType><controlURL>{zgt}</controlURL><eventSubURL>/ZoneGroupTopology/Event</eventSubURL></service>
+</serviceList>
+<deviceList><device><serviceList>
+<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><controlURL>{avt}</controlURL><eventSubURL>{avt_events}</eventSubURL></service>
+<service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType><controlURL>MediaRenderer/RenderingControl/Control</controlURL><eventSubURL>{rc_events}</eventSubURL></service>
+</serviceList></device></deviceList>
+</device></root>"#
+        )
+    }
+
+    #[test]
+    fn service_urls_stay_on_the_device() {
+        let base = "http://192.168.1.10:1400";
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+        // Relative and same-host absolute URLs (any port) are used.
+        let ok = description(
+            "/ZoneGroupTopology/Control",
+            "http://192.168.1.10:1401/MediaRenderer/AVTransport/Control",
+            "//127.0.0.1/still/a/path/on/the/device",
+            "/MediaRenderer/RenderingControl/Event",
+        );
+        let r = parse_device_description(&ok, base, ip, ServiceUrls::OnItsHost(None)).unwrap();
+        assert_eq!(r.zone_group_topology_control_url.as_deref(), Some("http://192.168.1.10:1400/ZoneGroupTopology/Control"));
+        assert_eq!(r.av_transport_control_url, "http://192.168.1.10:1401/MediaRenderer/AVTransport/Control");
+        assert_eq!(r.rendering_control_control_url, "http://192.168.1.10:1400/MediaRenderer/RenderingControl/Control");
+        let events = r.av_transport_event_url.unwrap();
+        assert_eq!(url::Url::parse(&events).unwrap().host_str(), Some("192.168.1.10"), "{events}");
+
+        // An optional service on another host is dropped; the device stays.
+        let r = parse_device_description(
+            &description(
+                "HTTP://127.0.0.1:1400/ZoneGroupTopology/Control",
+                "/MediaRenderer/AVTransport/Control",
+                "http://192.168.1.66/MediaRenderer/AVTransport/Event",
+                "/MediaRenderer/RenderingControl/Event",
+            ),
+            base,
+            ip,
+            ServiceUrls::OnItsHost(None),
+        )
+        .unwrap();
+        assert_eq!(r.zone_group_topology_control_url, None);
+        assert_eq!(r.av_transport_event_url, None);
+
+        // A required one on another host: not a usable renderer.
+        for (avt, rc_events) in [
+            ("http://127.0.0.1:9/x", "/MediaRenderer/RenderingControl/Event"),
+            ("/MediaRenderer/AVTransport/Control", "http://192.168.1.66:1400/MediaRenderer/RenderingControl/Event"),
+            ("https://localhost/MediaRenderer/AVTransport/Control", "/MediaRenderer/RenderingControl/Event"),
+        ] {
+            let xml = description("/ZoneGroupTopology/Control", avt, "/e", rc_events);
+            assert!(parse_device_description(&xml, base, ip, ServiceUrls::OnItsHost(None)).is_err(), "{avt} {rc_events}");
+        }
+    }
+
+    #[test]
+    fn ignored_service_urls_are_reported_once_per_device() {
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+        let reported = Reported::default();
+        let foreign_events = description(
+            "/ZoneGroupTopology/Control",
+            "/MediaRenderer/AVTransport/Control",
+            "http://192.168.1.66/MediaRenderer/AVTransport/Event",
+            "/MediaRenderer/RenderingControl/Event",
+        );
+        let parse = |xml: &str, base: &str| {
+            parse_device_description(xml, base, ip, ServiceUrls::OnItsHost(Some(&reported))).unwrap();
+        };
+        // Every scan reads the description again; one report.
+        parse(&foreign_events, "http://192.168.1.10:1400");
+        parse(&foreign_events, "http://192.168.1.10:1400");
+        assert_eq!(reported.len(), 1);
+        // Another device with the same fault: its own report.
+        parse(&foreign_events, "http://192.168.1.11:1400");
+        assert_eq!(reported.len(), 2);
+        // Nothing ignored: nothing reported.
+        let clean = description(
+            "/ZoneGroupTopology/Control",
+            "/MediaRenderer/AVTransport/Control",
+            "/MediaRenderer/AVTransport/Event",
+            "/MediaRenderer/RenderingControl/Event",
+        );
+        parse(&clean, "http://192.168.1.12:1400");
+        assert_eq!(reported.len(), 2);
+    }
+
+    #[test]
+    fn a_speaker_added_by_address_keeps_service_urls_on_other_hosts() {
+        // The user typed http://kitchen.local:1400/...; the description is
+        // fetched from the address that name resolves to, and names the
+        // speaker by its host name and by another of its addresses.
+        let base = "http://192.168.1.10:1400";
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+        let xml = description(
+            "/ZoneGroupTopology/Control",
+            "http://kitchen.local:1400/MediaRenderer/AVTransport/Control",
+            "http://192.168.7.10:1400/MediaRenderer/AVTransport/Event",
+            "http://kitchen.local:1400/MediaRenderer/RenderingControl/Event",
+        );
+        let r = parse_device_description(&xml, base, ip, ServiceUrls::AsGiven).unwrap();
+        assert_eq!(r.av_transport_control_url, "http://kitchen.local:1400/MediaRenderer/AVTransport/Control");
+        assert_eq!(r.av_transport_event_url.as_deref(), Some("http://192.168.7.10:1400/MediaRenderer/AVTransport/Event"));
+        assert_eq!(r.rendering_control_event_url, "http://kitchen.local:1400/MediaRenderer/RenderingControl/Event");
+        assert_eq!(r.rendering_control_control_url, "http://192.168.1.10:1400/MediaRenderer/RenderingControl/Control");
+        // The same description from discovery is no usable renderer.
+        assert!(parse_device_description(&xml, base, ip, ServiceUrls::OnItsHost(None)).is_err());
     }
 
     #[test]
