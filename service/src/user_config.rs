@@ -321,6 +321,13 @@ fn config_path() -> Option<PathBuf> {
 }
 
 impl UserConfig {
+    /// Defaults that `save` never writes, so tests can run code that saves
+    /// the config without touching the developer's real file.
+    #[cfg(test)]
+    pub fn unsaved() -> Self {
+        Self { keep_file: true, ..Self::default() }
+    }
+
     /// Clear a device's stored password, including a sealed copy this
     /// account can't open (otherwise the next save would keep it).
     pub fn remove_airplay_password(&mut self, id: &str) {

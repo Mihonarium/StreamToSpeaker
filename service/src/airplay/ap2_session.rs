@@ -43,9 +43,9 @@ use crate::airplay::ap2_ptp::{spawn_ptp_master, PtpMaster, PtpTimeline};
 use crate::airplay::ap2_resend::Retransmitter;
 use crate::airplay::ap2_crypto::ChannelCipher;
 use crate::airplay::ap2_realtime::{MemberLink, RealtimeGroup, RealtimeRun};
-use crate::airplay::ap2_rtsp::{Ap2Rtsp, InfoPoll, InfoVolume, RealtimeCodec, TransientOutcome};
+use crate::airplay::ap2_rtsp::{Ap2Rtsp, InfoPoll, InfoVolume, PairVerifyError, RealtimeCodec, TransientOutcome};
 use crate::airplay::discovery::AirPlayRenderer;
-use crate::airplay::hap_pairing::PairingCredentials;
+use crate::airplay::hap_pairing::StoredPairing;
 use crate::airplay::rtp::{bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, FRAMES_PER_PACKET};
 use crate::airplay::session::{mute_db, volume_pct_to_raop_db};
 use crate::airplay::timing::{
@@ -91,11 +91,11 @@ pub struct AirPlay2SessionConfig {
     /// `latencyMin/Max` and its sync-packet anchor; below
     /// [`LOW_LATENCY_REALTIME_MS`] buffered mode is skipped outright.
     pub latency_ms: u32,
-    /// Stored HomeKit persistent-pairing credentials for this receiver, if
-    /// it was PIN-paired earlier (Apple TV with access control). When
-    /// present, the session does `pair-verify` with these instead of
-    /// transient pairing.
-    pub pairing_creds: Option<PairingCredentials>,
+    /// This receiver's stored HomeKit pairing, if it was PIN-paired earlier
+    /// (Apple TV with access control), keys already parsed. When present,
+    /// the session pair-verifies with it and never falls back to transient
+    /// pairing.
+    pub stored_pairing: Option<StoredPairing>,
     /// Stream HomePods with the low-latency realtime profile (see
     /// [`AirPlay2Session::start`]); `false` keeps single HomePods on the
     /// general path (buffered when supported). Stereo pairs always use it.
@@ -105,9 +105,13 @@ pub struct AirPlay2SessionConfig {
 }
 
 /// Typed outcome of [`AirPlay2Session::start`], so the caller's policy
-/// decisions (launch the PIN ceremony? invalidate stored credentials?) are
-/// compiler-checked matches instead of string sniffing or fragile anyhow
-/// downcasts that silently break under a future `.map_err` re-wrap.
+/// decisions (launch the PIN ceremony? which words?) are compiler-checked
+/// matches instead of string sniffing or fragile anyhow downcasts that
+/// silently break under a future `.map_err` re-wrap.
+///
+/// No outcome is grounds for deleting the stored pairing: no refusal is
+/// authenticated (see [`PairVerifyError`]). A new PIN pairing replaces it,
+/// and only the user removes it.
 #[derive(Debug, thiserror::Error)]
 pub enum Ap2StartError {
     /// The receiver refused transient pairing (HTTP 470) and no stored
@@ -115,16 +119,19 @@ pub enum Ap2StartError {
     /// access control / "Require Device Verification").
     #[error("receiver requires one-time PIN pairing")]
     NeedsPin,
-    /// The receiver *answered* pair-verify and rejected the stored
-    /// credentials (it forgot the pairing — e.g. the user removed it on
-    /// the Apple TV). The caller clears them and re-pairs; OwnTone's
-    /// "key cleared + re-prompt on verify failure". Transport failures
-    /// during pair-verify deliberately do NOT take this variant — they
-    /// surface as [`Ap2StartError::Other`] and leave the credentials
-    /// intact.
-    #[error("stored pairing no longer accepted by the receiver: {0:#}")]
-    VerifyRejected(#[source] anyhow::Error),
-    /// Everything else (connect failures, SETUP refusals, timeouts, …).
+    /// Pair-verify with the stored pairing got an answer from something
+    /// that never proved it holds the paired accessory's key: another
+    /// device at the address, an impostor, or the accessory reset to new
+    /// keys.
+    #[error("the receiver didn't prove it is the paired device: {0:#}")]
+    PairingNotProven(#[source] anyhow::Error),
+    /// The receiver proved it is the paired accessory, then refused this
+    /// PC's pairing (it no longer knows it — removed on the device, or a
+    /// reset); possibly forged by a relay.
+    #[error("the receiver no longer accepts this PC's pairing: {0:#}")]
+    PairingRefused(#[source] anyhow::Error),
+    /// Everything else (connect failures, SETUP refusals, timeouts, a
+    /// pair-verify that got no answer, …).
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -249,7 +256,7 @@ impl AirPlay2Session {
             warn!("AirPlay 2 GET /info failed (continuing): {:#}", e);
         }
 
-        let audio_key = pair_member(&mut rtsp, cfg.pairing_creds.clone(), &cfg.renderer.friendly_name)?;
+        let audio_key = pair_member(&mut rtsp, cfg.stored_pairing.as_ref(), &cfg.renderer.friendly_name)?;
         info!("AirPlay 2: paired with {}", cfg.renderer.friendly_name);
 
         let event_ciphers = rtsp.take_event_ciphers();
@@ -703,14 +710,14 @@ impl AirPlay2Session {
             // Stored PIN credentials are keyed by the selected entry, so
             // they only apply to a single receiver.
             let audio_key = if members.len() == 1 {
-                pair_member(&mut rtsp, cfg.pairing_creds.clone(), &r.friendly_name)?
+                pair_member(&mut rtsp, cfg.stored_pairing.as_ref(), &r.friendly_name)?
             } else {
                 // A PIN ceremony pairs one receiver under the selected
                 // entry's id, so it can't serve a pair: report it plainly
                 // instead of prompting for a PIN that would never be used.
                 match pair_member(&mut rtsp, None, &r.friendly_name) {
                     Ok(k) => k,
-                    Err(Ap2StartError::NeedsPin | Ap2StartError::VerifyRejected(_)) => {
+                    Err(Ap2StartError::NeedsPin) => {
                         return Err(anyhow::anyhow!(
                             "{}: this stereo-pair member requires PIN pairing, which pairs don't support",
                             r.friendly_name
@@ -1021,38 +1028,42 @@ fn common_codec(members: &[AirPlayRenderer]) -> Option<RealtimeCodec> {
     }
 }
 
-/// Pair one receiver on its RTSP connection: `pair-verify` with stored
-/// credentials when there are some, transient pairing otherwise. Returns
-/// the 32-byte audio key.
+/// Pair one receiver on its RTSP connection: `pair-verify` with its stored
+/// pairing when there is one, transient pairing otherwise. Returns the
+/// 32-byte audio key.
 fn pair_member(
     rtsp: &mut Ap2Rtsp,
-    creds: Option<PairingCredentials>,
+    stored: Option<&StoredPairing>,
     name: &str,
 ) -> std::result::Result<[u8; 32], Ap2StartError> {
-    // Pairing: a PIN-paired receiver (Apple TV with access control)
-    // gets pair-verify from the stored long-term keys; everything else
-    // gets transient pairing. A transient 470 means the receiver *needs*
-    // PIN pairing but we have no stored keys — surface NeedsPin so the
-    // app can run the one-time PIN ceremony. A pair-verify REJECTION
-    // (response received, credentials refused) surfaces as
-    // VerifyRejected so the app clears the stale keys; a mere transport
-    // failure stays a generic error and the keys survive.
-    let key = if let Some(creds) = creds {
+    // A PIN-paired receiver (Apple TV with access control) gets
+    // pair-verify from the stored keys and nothing else: falling back to
+    // transient pairing would let anyone who can fake a refusal get an
+    // unauthenticated session. Every failure leaves the stored pairing as
+    // it is. Everything else gets transient pairing; a 470 there means the
+    // receiver needs the one-time PIN ceremony.
+    let key = if let Some(stored) = stored {
         info!("AirPlay 2: verifying stored pairing with {}", name);
-        match rtsp.pair_verify(&creds) {
+        match rtsp.pair_verify(stored) {
             Ok(key) => key,
-            Err(crate::airplay::ap2_rtsp::PairVerifyError::Rejected(e)) => {
+            Err(PairVerifyError::NoAnswer(e)) => {
+                return Err(Ap2StartError::Other(e.context("AirPlay 2 HomeKit pair-verify: no usable answer")));
+            }
+            Err(PairVerifyError::NotProven(e)) => {
                 warn!(
-                    "AirPlay 2: {} rejected the stored pairing ({:#}) — it will be \
-                     cleared for re-pairing",
+                    "AirPlay 2: {} answered pair-verify without proving it is the paired device ({:#}); \
+                     the stored pairing is kept",
                     name, e
                 );
-                return Err(Ap2StartError::VerifyRejected(e));
+                return Err(Ap2StartError::PairingNotProven(e));
             }
-            Err(crate::airplay::ap2_rtsp::PairVerifyError::Transport(e)) => {
-                return Err(Ap2StartError::Other(
-                    e.context("AirPlay 2 HomeKit pair-verify (transport)"),
-                ));
+            Err(PairVerifyError::Refused(e)) => {
+                warn!(
+                    "AirPlay 2: {} refused this PC's stored pairing ({:#}); it is kept until a new PIN \
+                     pairing replaces it or the user forgets it",
+                    name, e
+                );
+                return Err(Ap2StartError::PairingRefused(e));
             }
         }
     } else {
@@ -1773,6 +1784,38 @@ fn append_samples(ring: &mut Vec<i16>, frame: &PcmFrame) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With a stored pairing, a failed pair-verify ends the attempt with
+    /// the outcome that says what happened — and never moves on to
+    /// transient pairing, which would hand whoever answered an
+    /// unauthenticated session.
+    #[test]
+    fn a_failed_pair_verify_never_falls_back_to_transient_pairing() {
+        use crate::airplay::test_peers::{self, stored_pairing, Peer, M4};
+        for (peer, want) in [
+            (Peer::StatusAtM1("400 Bad Request"), "not proven"),
+            (Peer::OtherDevice, "not proven"),
+            (Peer::Genuine(M4::Error(2)), "refused"),
+            (Peer::SilentAtM1, "other"),
+        ] {
+            let what = format!("{peer:?}");
+            let (port, seen) = test_peers::spawn(peer);
+            let ip: IpAddr = "127.0.0.1".parse().unwrap();
+            let mut rtsp = Ap2Rtsp::connect(ip, port, ip, Duration::from_millis(500)).unwrap();
+            let res = pair_member(&mut rtsp, Some(&stored_pairing()), "Apple TV");
+            drop(rtsp);
+            let got = match res {
+                Err(Ap2StartError::PairingNotProven(_)) => "not proven",
+                Err(Ap2StartError::PairingRefused(_)) => "refused",
+                Err(Ap2StartError::Other(_)) => "other",
+                Err(Ap2StartError::NeedsPin) => "needs PIN",
+                Ok(_) => "ok",
+            };
+            assert_eq!(got, want, "{what}");
+            let seen = seen.join().unwrap();
+            assert!(seen.iter().all(|l| l.starts_with("POST /pair-verify")), "{what}: {seen:?}");
+        }
+    }
 
     #[test]
     fn buffered_framing_length_includes_itself() {

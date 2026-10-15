@@ -16,7 +16,7 @@ use crate::update_check::{self, ReleaseInfo};
 
 use crate::airplay::ap2_rtsp::Ap2Rtsp;
 use crate::airplay::ap2_session::DEFAULT_AIRPLAY_PORT;
-use crate::airplay::hap_pairing::PairingCredentials;
+use crate::airplay::hap_pairing::{PairingCredentials, StoredPairing};
 use crate::airplay::{
     AirPlay2Session, AirPlay2SessionConfig, AirPlayDiscoveryState, AirPlayRenderer, AirPlaySession,
     AirPlaySessionConfig, Ap2StartError, Transport,
@@ -673,12 +673,137 @@ enum PinStage {
 /// so `start_airplay` can surface the PIN requirement only after every
 /// path — including the fallback legacy RAOP that most Apple TVs also
 /// expose — has failed.
+#[derive(Debug)]
 enum AttemptError {
-    /// The receiver requires one-time PIN pairing (an AP2 470 with no
-    /// stored credentials, or stored credentials the receiver rejected).
-    NeedsPin,
+    /// Only the one-time PIN ceremony can get this receiver going.
+    NeedsPin(PinReason),
     /// Any other failure — the message is already user-facing.
     Other(String),
+}
+
+/// Why a receiver needs the PIN ceremony — what the user is told. In none
+/// of these cases is the stored pairing deleted: a successful ceremony
+/// replaces it, and the user can forget it.
+#[derive(Debug, Clone, PartialEq)]
+enum PinReason {
+    /// It asks for PIN pairing (an AP2 470) and has no stored pairing.
+    Required,
+    /// Its stored pairing in the config can't be parsed; nothing was sent.
+    Damaged(String),
+    /// Something answered at `addr` but didn't prove it is the paired
+    /// device: another device there, an impostor, or the device reset.
+    NotProven { addr: IpAddr, detail: String },
+    /// It proved it is the paired device, then refused this PC's pairing
+    /// (e.g. removed on the device or in the Home app, or a reset).
+    Refused,
+}
+
+/// How much of a receiver's answer a message in the window shows. The
+/// answer can run to a MiB (an error body is dumped whole); `pair_member`
+/// logs it in full.
+const RECEIVER_DETAIL_CHARS: usize = 200;
+
+/// `s` cut to at most `max` characters, with "…" when cut.
+fn clip_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &s[..end]),
+        None => s.to_string(),
+    }
+}
+
+/// Map a failed AirPlay 2 bring-up to the attempt's outcome. Kept free of
+/// side effects: whatever the receiver answered, the stored pairing stays.
+fn ap2_attempt_error(e: Ap2StartError, addr: IpAddr) -> AttemptError {
+    match e {
+        // 470 with no stored keys: typed, so start_airplay surfaces the
+        // PIN requirement only after the RAOP fallback has also failed.
+        Ap2StartError::NeedsPin => AttemptError::NeedsPin(PinReason::Required),
+        Ap2StartError::PairingNotProven(e) => AttemptError::NeedsPin(PinReason::NotProven {
+            addr,
+            detail: clip_chars(&format!("{:#}", e), RECEIVER_DETAIL_CHARS),
+        }),
+        Ap2StartError::PairingRefused(_) => AttemptError::NeedsPin(PinReason::Refused),
+        Ap2StartError::Other(e) => AttemptError::Other(format!("{:#}", e)),
+    }
+}
+
+/// What to tell the user when `name` needs the PIN ceremony, by `reason`.
+/// `interactive`: the ceremony is starting now (a click in the window);
+/// otherwise the message says where to start it.
+fn pin_pairing_message(name: &str, reason: &PinReason, interactive: bool) -> String {
+    let why = match reason {
+        PinReason::Required => {
+            return if interactive {
+                format!("{} needs one-time pairing — enter the PIN shown on its screen.", name)
+            } else {
+                format!(
+                    "{} needs one-time PIN pairing — open the {} window and click it in the speaker \
+                     list to pair.",
+                    name, PRODUCT_NAME
+                )
+            };
+        }
+        PinReason::Damaged(detail) => {
+            format!("The stored pairing with {} is damaged and can't be used ({}).", name, detail)
+        }
+        PinReason::NotProven { addr, detail } => format!(
+            "Couldn't verify {name}: the device at {addr} answered but didn't prove it is the {name} \
+             paired with this PC ({detail}). Another device may have its address, or {name} was \
+             reset. The stored pairing is kept."
+        ),
+        PinReason::Refused => format!(
+            "{name} no longer accepts this PC's pairing — it may have been removed on {name} or in \
+             the Home app, or {name} was reset."
+        ),
+    };
+    let next = match (reason, interactive) {
+        (PinReason::NotProven { .. }, true) => {
+            format!("If {} shows a PIN, enter it to pair again; if not, cancel.", name)
+        }
+        (PinReason::NotProven { .. }, false) => format!(
+            "If {} was reset, open the {} window and click it in the speaker list to pair again.",
+            name, PRODUCT_NAME
+        ),
+        (_, true) => "To pair again, enter the PIN shown on its screen.".to_string(),
+        (_, false) => format!(
+            "To pair again, open the {} window and click it in the speaker list.",
+            PRODUCT_NAME
+        ),
+    };
+    format!("{} {}", why, next)
+}
+
+/// The sentence to add where PIN pairing with `name` couldn't start, failed
+/// or may show no PIN while this PC has a stored pairing with it
+/// (`has_pairing`); empty without one. A device that stopped asking for
+/// verification may refuse PIN pairing too, and a device with a stored
+/// pairing is never tried without it, so forgetting the pairing is then
+/// the only way to connect.
+fn forget_pairing_hint(name: &str, has_pairing: bool) -> String {
+    if !has_pairing {
+        return String::new();
+    }
+    format!(
+        " If {name} no longer asks for device verification, forget its pairing to connect without a \
+         PIN: ⚙ next to it in the speaker list → Forget pairing."
+    )
+}
+
+/// The PIN modal's text for `name`. `repair`: this PC has a stored pairing
+/// with it, which didn't verify. Then the user is pairing again — or, if
+/// no PIN appears, talking to another device or to one that no longer
+/// asks for verification, so the text also says where to forget it.
+fn pin_prompt_message(name: &str, repair: bool) -> String {
+    if !repair {
+        return "This receiver needs one-time pairing. A PIN should now be showing on its screen — \
+                enter it here to pair. It'll be remembered, so you won't need to do this again."
+            .to_string();
+    }
+    format!(
+        "A PIN should now be showing on {name}'s screen — enter it here to pair again; the new \
+         pairing replaces the old one. If no PIN appears, cancel.{}",
+        forget_pairing_hint(name, true)
+    )
 }
 
 /// Failure of a whole [`App::start_airplay`] select: either "this device
@@ -690,6 +815,7 @@ enum SelectFailure {
     NeedsPin {
         id: String,
         name: String,
+        reason: PinReason,
         /// The other attempted paths' failures, pre-joined (may be empty).
         details: String,
     },
@@ -2079,7 +2205,7 @@ impl App {
             match self.start_airplay(id, manual.as_ref()) {
                 Ok(s) => s,
                 Err(SelectFailure::Msg(m)) => return Err(m),
-                Err(SelectFailure::NeedsPin { id: pid, name, details }) => {
+                Err(SelectFailure::NeedsPin { id: pid, name, reason, details }) => {
                     // Keep the other paths' failures visible — the RAOP
                     // fallback's reason would otherwise vanish behind the
                     // pairing message.
@@ -2088,24 +2214,16 @@ impl App {
                     } else {
                         format!("  (Other paths tried: {})", details)
                     };
+                    // GUI speaker click: launch the one-time ceremony — the
+                    // receiver will display a PIN and the modal collects
+                    // it; the toast narrates what's happening. Automatic or
+                    // remote callers: nobody could answer a PIN prompt, so
+                    // don't make the receiver display one — the message
+                    // says where to do it instead.
                     if interactive {
-                        // GUI speaker click: launch the one-time ceremony.
-                        // The receiver will display a PIN and the modal
-                        // collects it; the toast narrates what's happening.
                         self.begin_pin_pairing(pid, name.clone());
-                        return Err(format!(
-                            "{} needs one-time pairing — enter the PIN shown on its screen.{}",
-                            name, suffix
-                        ));
                     }
-                    // Automatic/remote caller: nobody could answer a PIN
-                    // prompt, so don't make the receiver display one —
-                    // tell the user where to do it instead.
-                    return Err(format!(
-                        "{} needs one-time PIN pairing — open the {} window and click it in \
-                         the speaker list to pair.{}",
-                        name, PRODUCT_NAME, suffix
-                    ));
+                    return Err(format!("{}{}", pin_pairing_message(&name, &reason, interactive), suffix));
                 }
             }
         } else {
@@ -2386,7 +2504,7 @@ impl App {
         // every path has failed — most Apple TVs also expose a legacy RAOP
         // path that just works, and a working device must never be
         // interrupted with a pairing prompt.
-        let mut pin_target: Option<(String, String)> = None;
+        let mut pin_target: Option<(String, String, PinReason)> = None;
         for (transport, r) in attempts {
             let label = match transport {
                 Transport::AirPlay2 => "AirPlay 2",
@@ -2397,9 +2515,9 @@ impl App {
             let id = r.stable_id();
             match self.start_airplay_one(transport, r, local_ip) {
                 Ok(session) => return Ok(session),
-                Err(AttemptError::NeedsPin) => {
-                    warn!("AirPlay {} to {} needs one-time PIN pairing", label, name);
-                    pin_target = Some((id, name.clone()));
+                Err(AttemptError::NeedsPin(reason)) => {
+                    warn!("AirPlay {} to {} needs one-time PIN pairing ({:?})", label, name, reason);
+                    pin_target = Some((id, name.clone(), reason));
                 }
                 Err(AttemptError::Other(e)) => {
                     warn!("AirPlay {} to {} failed: {}", label, name, e);
@@ -2414,7 +2532,7 @@ impl App {
         // RAOP error.
         let details = errors.join("  |  ");
         match pin_target {
-            Some((id, name)) => Err(SelectFailure::NeedsPin { id, name, details }),
+            Some((id, name, reason)) => Err(SelectFailure::NeedsPin { id, name, reason, details }),
             None => Err(SelectFailure::Msg(details)),
         }
     }
@@ -2544,9 +2662,8 @@ impl App {
                 Ok(ActiveSession::AirPlay(session))
             }
             Transport::AirPlay2 => {
-                let samples_rx = self.hub.subscribe();
                 let stable_id = renderer.stable_id();
-                let (prefer_realtime, pairing_creds, latency_ms, homepod_realtime, homepod_latency_ms) = {
+                let (prefer_realtime, stored, latency_ms, homepod_realtime, homepod_latency_ms) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.prefer_realtime_airplay,
@@ -2556,6 +2673,17 @@ impl App {
                         uc.homepod_latency_ms_for(&stable_id),
                     )
                 };
+                // Parsed before anything is dialled: a damaged entry is the
+                // config's fault, not a refusal from the receiver.
+                let stored_pairing = match stored.as_ref().map(StoredPairing::parse).transpose() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("the stored pairing for {} can't be used: {:#}", stable_id, e);
+                        return Err(AttemptError::NeedsPin(PinReason::Damaged(format!("{:#}", e))));
+                    }
+                };
+                let addr = renderer.ip;
+                let samples_rx = self.hub.subscribe();
                 match AirPlay2Session::start(AirPlay2SessionConfig {
                     renderer,
                     local_ip,
@@ -2563,30 +2691,12 @@ impl App {
                     initial_volume: Some(self.airplay_start_volume()),
                     prefer_realtime,
                     latency_ms,
-                    pairing_creds,
+                    stored_pairing,
                     homepod_realtime,
                     homepod_latency_ms,
                 }) {
                     Ok(session) => Ok(ActiveSession::AirPlay2(session)),
-                    // 470 with no stored keys: typed, so start_airplay
-                    // surfaces the PIN requirement only after the RAOP
-                    // fallback has also failed.
-                    Err(Ap2StartError::NeedsPin) => Err(AttemptError::NeedsPin),
-                    // The receiver ANSWERED pair-verify and rejected the
-                    // stored credentials (it forgot the pairing): drop them
-                    // and re-pair — OwnTone's "key cleared on verify
-                    // failure". Transport failures never take this branch,
-                    // so a Wi-Fi blip / receiver reboot can't wipe a valid
-                    // pairing.
-                    Err(Ap2StartError::VerifyRejected(e)) => {
-                        warn!(
-                            "stored pairing rejected by the receiver ({:#}) — clearing it",
-                            e
-                        );
-                        self.remove_airplay_pairing(&stable_id);
-                        Err(AttemptError::NeedsPin)
-                    }
-                    Err(Ap2StartError::Other(e)) => Err(AttemptError::Other(format!("{:#}", e))),
+                    Err(e) => Err(ap2_attempt_error(e, addr)),
                 }
             }
         }
@@ -2662,7 +2772,12 @@ impl App {
                     rtsp.pin_start()
                 })();
                 if let Err(e) = pin_shown {
-                    app.record_error(format!("Couldn't start pairing on {}: {:#}", name, e));
+                    app.record_error(format!(
+                        "Couldn't start pairing on {}: {:#}.{}",
+                        name,
+                        e,
+                        forget_pairing_hint(&name, app.has_airplay_pairing(&id))
+                    ));
                     return;
                 }
 
@@ -2748,8 +2863,10 @@ impl App {
                     }
                     Err(e) => {
                         app.record_error(format!(
-                            "Pairing {} failed: {:#} (check the PIN and try again)",
-                            name, e
+                            "Pairing {} failed: {:#} (check the PIN and try again).{}",
+                            name,
+                            e,
+                            forget_pairing_hint(&name, app.has_airplay_pairing(&id))
                         ));
                     }
                 }
@@ -2784,9 +2901,26 @@ impl App {
         uc.save();
     }
 
-    /// Remove stored HomeKit pairing credentials for a device id (the
-    /// receiver rejected them — it forgot the pairing).
-    fn remove_airplay_pairing(&self, id: &str) {
+    /// Whether this PC has a stored PIN pairing with device `id`. The
+    /// device's ⚙ settings then offer to forget it, whichever speaker is
+    /// saved: the pairing belongs to that device, and the saved speaker
+    /// may be another one (or none).
+    pub fn has_airplay_pairing(&self, id: &str) -> bool {
+        self.user_config.lock().unwrap().airplay_pairings.contains_key(id)
+    }
+
+    /// GUI: the PIN modal's text for a ceremony pairing `id` (`name`).
+    pub fn pin_prompt_text(&self, id: &str, name: &str) -> String {
+        pin_prompt_message(name, self.has_airplay_pairing(id))
+    }
+
+    /// Forget the stored HomeKit pairing for a device id — only ever on the
+    /// user's request. No answer from the network deletes a stored pairing
+    /// (none is authenticated), and a new PIN pairing replaces it, so this
+    /// is the way out for a device that stopped asking for one. A live
+    /// session keeps its keys; the next connect pairs from scratch.
+    pub fn forget_airplay_pairing(&self, id: &str) {
+        info!("forgetting the stored AirPlay pairing for {} at the user's request", id);
         let mut uc = self.user_config.lock().unwrap();
         if uc.remove_airplay_pairing(id) {
             uc.save();
@@ -4120,6 +4254,14 @@ mod tests {
         app
     }
 
+    /// [`test_app`] with default settings that are never written to disk,
+    /// for tests that run code which saves the config.
+    fn test_app_unsaved() -> Arc<App> {
+        let app = test_app();
+        *app.user_config.lock().unwrap() = UserConfig::unsaved();
+        app
+    }
+
     #[test]
     fn sendspin_discovery_pauses_with_the_discovery_adapter() {
         let app = test_app_defaults();
@@ -4342,5 +4484,203 @@ mod tests {
         app.dismiss_error();
         assert!(!app.stream_client_allowed(ip("192.168.1.99")));
         assert!(app.current_error().is_none());
+    }
+
+    /// Whatever a receiver answers to pair-verify, the outcome only says
+    /// what to tell the user; nothing in it can delete the stored pairing.
+    #[test]
+    fn ap2_failures_map_to_their_pin_reasons() {
+        let addr = ip("192.168.1.30");
+        assert!(matches!(
+            ap2_attempt_error(Ap2StartError::NeedsPin, addr),
+            AttemptError::NeedsPin(PinReason::Required)
+        ));
+        match ap2_attempt_error(Ap2StartError::PairingNotProven(anyhow!("pair-verify M1 → 400 Bad Request")), addr) {
+            AttemptError::NeedsPin(PinReason::NotProven { addr: a, detail }) => {
+                assert_eq!(a, addr);
+                assert!(detail.contains("400"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            ap2_attempt_error(Ap2StartError::PairingRefused(anyhow!("M4 error 2")), addr),
+            AttemptError::NeedsPin(PinReason::Refused)
+        ));
+        assert!(matches!(
+            ap2_attempt_error(Ap2StartError::Other(anyhow!("timed out")), addr),
+            AttemptError::Other(m) if m.contains("timed out")
+        ));
+    }
+
+    /// A receiver's answer can run to a MiB; the window shows its start.
+    #[test]
+    fn a_long_receiver_answer_is_cut_short_in_the_window() {
+        let body = "é".repeat(1 << 20);
+        let e = anyhow!("pair-verify M1 → 400 Bad Request (body: {body})");
+        let reason = match ap2_attempt_error(Ap2StartError::PairingNotProven(e), ip("192.168.1.30")) {
+            AttemptError::NeedsPin(r @ PinReason::NotProven { .. }) => r,
+            other => panic!("{other:?}"),
+        };
+        let PinReason::NotProven { detail, .. } = &reason else { unreachable!() };
+        assert_eq!(detail.chars().count(), RECEIVER_DETAIL_CHARS + 1);
+        assert!(
+            detail.starts_with("pair-verify M1 → 400 Bad Request (body: é") && detail.ends_with("é…"),
+            "{detail}"
+        );
+        let shown = pin_pairing_message("Den TV", &reason, true);
+        assert!(shown.chars().count() < 3 * RECEIVER_DETAIL_CHARS, "{} chars", shown.chars().count());
+        assert_eq!(
+            clip_chars("pair-verify M1 → 400 Bad Request", RECEIVER_DETAIL_CHARS),
+            "pair-verify M1 → 400 Bad Request"
+        );
+        assert_eq!(clip_chars("abc", 3), "abc");
+        assert_eq!(clip_chars("abcd", 3), "abc…");
+    }
+
+    /// Each reason reads differently, and says what happens next: the PIN
+    /// on screen when the ceremony is starting, where to start it when it
+    /// can't (web API, tray, reconnects).
+    #[test]
+    fn pin_messages_say_why_and_what_next() {
+        let not_proven = PinReason::NotProven {
+            addr: ip("192.168.1.30"),
+            detail: "pair-verify M1 → 400 Bad Request".into(),
+        };
+        let damaged = PinReason::Damaged("controller seed: bad hex at offset 4".into());
+        let m = |r: &PinReason, i: bool| pin_pairing_message("Den TV", r, i);
+
+        assert_eq!(
+            m(&PinReason::Required, true),
+            "Den TV needs one-time pairing — enter the PIN shown on its screen."
+        );
+        assert!(m(&PinReason::Required, false).contains("open the Stream To Speaker window"));
+
+        let shown = m(&not_proven, true);
+        assert!(
+            shown.contains("192.168.1.30") && shown.contains("400") && shown.contains("stored pairing is kept"),
+            "{shown}"
+        );
+        assert!(shown.contains("if not, cancel"), "{shown}");
+        assert!(m(&not_proven, false).contains("If Den TV was reset, open the Stream To Speaker window"));
+
+        let refused = m(&PinReason::Refused, true);
+        assert!(
+            refused.contains("no longer accepts this PC's pairing")
+                && refused.ends_with("enter the PIN shown on its screen."),
+            "{refused}"
+        );
+        assert!(m(&PinReason::Refused, false).ends_with("click it in the speaker list."));
+
+        let broken = m(&damaged, false);
+        assert!(broken.contains("damaged") && broken.contains("controller seed"), "{broken}");
+    }
+
+    /// Stored PIN pairing credentials (only parsed when connecting).
+    fn some_pairing(tag: &str) -> PairingCredentials {
+        PairingCredentials {
+            controller_id: format!("ctl-{tag}"),
+            controller_seed_hex: "11".repeat(32),
+            accessory_id: format!("acc-{tag}"),
+            accessory_ltpk_hex: "22".repeat(32),
+        }
+    }
+
+    /// The way out of a stored pairing goes with the device that holds it:
+    /// its settings, the reports of its PIN pairing failing and its PIN
+    /// dialog offer to forget it whichever speaker is saved (another one,
+    /// or none after Forget saved), and only while a pairing is stored.
+    #[test]
+    fn forgetting_a_pairing_is_offered_for_the_device_that_holds_it() {
+        let app = test_app_unsaved();
+        let (den, kitchen) = ("airplay:DEN", "airplay:KITCHEN");
+        {
+            let mut uc = app.user_config.lock().unwrap();
+            uc.airplay_pairings.insert(den.into(), some_pairing("den"));
+            uc.last_speaker_id = Some("uuid:RINCON_000E58000001".into());
+        }
+        assert!(app.has_airplay_pairing(den));
+        assert!(!app.has_airplay_pairing(kitchen));
+        app.user_config.lock().unwrap().last_speaker_id = None;
+        assert!(app.has_airplay_pairing(den));
+
+        let hint = forget_pairing_hint("Den TV", app.has_airplay_pairing(den));
+        assert!(
+            hint.starts_with(" If Den TV no longer asks for device verification")
+                && hint.ends_with("⚙ next to it in the speaker list → Forget pairing."),
+            "{hint}"
+        );
+        assert_eq!(forget_pairing_hint("Kitchen", app.has_airplay_pairing(kitchen)), "");
+
+        let again = app.pin_prompt_text(den, "Den TV");
+        assert!(again.contains("Den TV's screen") && again.contains("pair again"), "{again}");
+        assert!(again.ends_with(&hint), "{again}");
+        let first = app.pin_prompt_text(kitchen, "Kitchen");
+        assert!(first.contains("one-time pairing") && !first.contains("Forget pairing"), "{first}");
+    }
+
+    /// Starting the AirPlay 2 path with a stored pairing, whatever the
+    /// receiver answers to pair-verify: the attempt says why it failed,
+    /// the pairing stays as it was (only a new PIN pairing or the user's
+    /// Forget pairing changes it) and transient pairing is never tried.
+    #[test]
+    fn a_failed_pair_verify_leaves_the_stored_pairing_alone() {
+        use crate::airplay::test_peers::{self, Peer, M4};
+        let app = test_app_unsaved();
+        let creds = test_peers::stored_credentials();
+        for (peer, want) in [
+            (Peer::StatusAtM1("400 Bad Request"), "not proven"),
+            (Peer::Impostor, "not proven"),
+            (Peer::OtherDevice, "not proven"),
+            (Peer::Genuine(M4::Error(2)), "refused"),
+            (Peer::Genuine(M4::Junk), "error"),
+            (Peer::CloseAtM1, "error"),
+        ] {
+            let what = format!("{peer:?}");
+            let (port, seen) = test_peers::spawn(peer);
+            let receiver = AirPlayRenderer {
+                friendly_name: "Den TV".into(),
+                mac_id: "AABBCCDDEEFF".into(),
+                ip: ip("127.0.0.1"),
+                port: 0,
+                airplay_port: Some(port),
+                encryption_types: vec![],
+                codecs: vec![],
+                password_protected: false,
+                encryption_key_required: false,
+                features: None,
+                pk: None,
+                model: None,
+                group: None,
+                pair: None,
+            };
+            let id = receiver.stable_id();
+            app.user_config.lock().unwrap().airplay_pairings.insert(id.clone(), creds.clone());
+            let got = match app.start_airplay_one(Transport::AirPlay2, receiver, ip("127.0.0.1")) {
+                Ok(_) => "connected",
+                Err(AttemptError::NeedsPin(PinReason::NotProven { .. })) => "not proven",
+                Err(AttemptError::NeedsPin(PinReason::Refused)) => "refused",
+                Err(AttemptError::NeedsPin(other)) => panic!("{what}: {other:?}"),
+                Err(AttemptError::Other(_)) => "error",
+            };
+            assert_eq!(got, want, "{what}");
+            assert_eq!(app.user_config.lock().unwrap().airplay_pairings.get(&id), Some(&creds), "{what}");
+            let seen = seen.join().unwrap();
+            assert!(seen.iter().any(|l| l.starts_with("POST /pair-verify")), "{what}: {seen:?}");
+            assert!(!seen.iter().any(|l| l.starts_with("POST /pair-setup")), "{what}: {seen:?}");
+        }
+    }
+
+    /// Forget pairing removes that device's pairing and no other.
+    #[test]
+    fn forget_pairing_removes_only_that_devices_pairing() {
+        let app = test_app_unsaved();
+        {
+            let mut uc = app.user_config.lock().unwrap();
+            uc.airplay_pairings.insert("airplay:DEN".into(), some_pairing("den"));
+            uc.airplay_pairings.insert("airplay:LOFT".into(), some_pairing("loft"));
+        }
+        app.forget_airplay_pairing("airplay:DEN");
+        assert!(!app.has_airplay_pairing("airplay:DEN"));
+        assert!(app.has_airplay_pairing("airplay:LOFT"));
     }
 }

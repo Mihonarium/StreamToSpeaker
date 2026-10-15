@@ -8,7 +8,7 @@
 //!
 //! ```text
 //!   POST /pair-setup  M1: State=1, Method=0, Flags=0x10
-//!   ← response        M2: State=2, Salt(16), PublicKey(B, 384)
+//!   ← response        M2: State=2, Salt(16, or fewer), PublicKey(B, ≤ 384)
 //!   POST /pair-setup  M3: State=3, PublicKey(A, 384), Proof(M1, 64)
 //!   ← response        M4: State=4, Proof(M2, 64)            [verify]
 //!   ⇒ SessionKeys derived from SRP K (64 bytes)
@@ -73,10 +73,9 @@ impl TransientPairing {
         let server_pub = tlv
             .get(TYPE_PUBLIC_KEY)
             .ok_or_else(|| anyhow!("pair-setup M2 missing PublicKey"))?;
-        if salt.len() != 16 {
-            bail!("pair-setup M2 Salt is {} bytes, expected 16", salt.len());
-        }
-
+        // The salt's and B's lengths are checked in `process`, the same way
+        // for PIN pair-setup. pair_ap receivers send a 16-byte random salt
+        // without its leading zero bytes, so 15 bytes one time in 256.
         self.srp
             .process(salt, server_pub)
             .context("SRP processing server M2")?;
@@ -191,6 +190,37 @@ mod tests {
         let mut p = TransientPairing::new();
         let m2 = TlvBuilder::new().add_u8(TYPE_STATE, 5).build();
         assert!(p.handle_m2(&m2).is_err());
+    }
+
+    /// The whole transient exchange, M2 to M4, against receivers of both
+    /// byte conventions — including pair_ap's 15-byte salt and a B that
+    /// starts with a zero byte.
+    #[test]
+    fn transient_pairing_completes_against_receiver_models() {
+        use crate::airplay::srp_test_receiver::{vectors as v, vectors::bytes, Convention, M3Reply, Receiver};
+        for (conv, salt, b) in [
+            (Convention::Adk, v::SALT, v::B_FULL),
+            (Convention::Adk, v::SALT, v::B_SHORT),
+            (Convention::PairAp, v::SALT_SHORT, v::B_FULL),
+            (Convention::PairAp, v::SALT, v::B_SHORT),
+        ] {
+            let rx = Receiver::new(conv, "3939", bytes(salt), bytes(b));
+            assert_eq!(rx.b_top_byte_zero(), b == v::B_SHORT, "vector: {conv:?} B={b}");
+            assert_eq!(rx.salt().len(), if salt == v::SALT_SHORT { 15 } else { 16 });
+            let m2 = TlvBuilder::new()
+                .add_u8(TYPE_STATE, 2)
+                .add(TYPE_SALT, rx.salt())
+                .add(TYPE_PUBLIC_KEY, &rx.b_wire())
+                .build();
+            let mut p = TransientPairing::new();
+            let m3 = Tlv::decode(&p.handle_m2(&m2).unwrap()).unwrap();
+            let reply = rx.m3(m3.get(TYPE_PUBLIC_KEY).unwrap(), m3.get(TYPE_PROOF).unwrap());
+            let M3Reply::Proof { m2: proof, .. } = reply else {
+                panic!("{conv:?} salt={salt} B={b}: the receiver refused M3");
+            };
+            let m4 = TlvBuilder::new().add_u8(TYPE_STATE, 4).add(TYPE_PROOF, &proof).build();
+            assert!(p.handle_m4(&m4).is_ok(), "{conv:?} salt={salt} B={b}");
+        }
     }
 
     #[test]

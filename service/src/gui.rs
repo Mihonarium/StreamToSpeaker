@@ -1271,7 +1271,8 @@ impl eframe::App for StreamToSpeakerApp {
             match self.app.pending_pin_pairing() {
                 Some((id, name)) => {
                     if self.pin_prompt.as_ref().map(|p| p.id != id).unwrap_or(true) {
-                        self.pin_prompt = Some(PinPrompt { id, name, input: String::new() });
+                        let blurb = self.app.pin_prompt_text(&id, &name);
+                        self.pin_prompt = Some(PinPrompt { id, name, blurb, input: String::new() });
                     }
                 }
                 None => self.pin_prompt = None,
@@ -2717,7 +2718,9 @@ impl StreamToSpeakerApp {
         let before = self.app.speaker_settings(&sp.id);
         let mut st = before.clone();
         let is_airplay = sp.id.starts_with("airplay:");
+        let paired = is_airplay && self.app.has_airplay_pairing(&sp.id);
         let mut remove = false;
+        let mut forget_pairing = false;
         egui::Frame::none()
             .fill(p.card_hover)
             .rounding(RADIUS_CONTROL)
@@ -2818,6 +2821,33 @@ impl StreamToSpeakerApp {
                         }
                     }
                 }
+                // This device's PIN pairing (an Apple TV that asks for
+                // device verification), whichever speaker is saved. No
+                // answer from the network deletes it, and a device with one
+                // is never tried without it, so this is the way out when
+                // the device stopped asking for a PIN.
+                if paired {
+                    ui.add_space(sp::S);
+                    ui.label(egui::RichText::new("Paired with this PC by PIN").color(p.text_primary));
+                    ui.label(
+                        egui::RichText::new(
+                            "If this speaker no longer asks for device verification, forget the \
+                             pairing so it can connect without a PIN.",
+                        )
+                        .size(12.0)
+                        .color(p.text_secondary),
+                    );
+                    ui.add_space(sp::XS);
+                    if secondary_button(ui, p, "Forget pairing", 140.0)
+                        .on_hover_text(
+                            "Delete this PC's stored pairing with this speaker. The next connect \
+                             asks for a new PIN if the speaker still requires one.",
+                        )
+                        .clicked()
+                    {
+                        forget_pairing = true;
+                    }
+                }
                 if sp.manual {
                     ui.add_space(sp::S);
                     if danger_button(ui, p, "Remove speaker", 140.0)
@@ -2833,6 +2863,9 @@ impl StreamToSpeakerApp {
             self.speaker_settings_open = None;
             self.app.remove_manual_speaker(&sp.id);
             return;
+        }
+        if forget_pairing {
+            self.app.forget_airplay_pairing(&sp.id);
         }
         if st != before {
             self.app.set_speaker_settings(&sp.id, st);
@@ -3943,9 +3976,7 @@ impl StreamToSpeakerApp {
             ctx,
             p,
             &title,
-            "This receiver needs one-time pairing. A PIN should now be showing \
-             on its screen — enter it here to pair. It'll be remembered, so you \
-             won't need to do this again.",
+            &prompt.blurb,
             "PIN shown on the device",
             false,
             "Pair",
@@ -4514,6 +4545,9 @@ struct PinPrompt {
     id: String,
     /// Friendly name, for the dialog title.
     name: String,
+    /// The dialog's text: first pairing, or pairing again (this PC has a
+    /// stored pairing with the receiver that didn't verify).
+    blurb: String,
     /// The PIN the user is typing (as shown on the receiver's screen).
     input: String,
 }
