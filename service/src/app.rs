@@ -29,9 +29,10 @@ use crate::http_server::{SpeakerInfo, StreamHub};
 use crate::manual_speakers::{self, ManualKind, ManualSpeaker};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use crate::ssdp::{DiscoveryState, Renderer, SearchScope};
-use crate::stream_gate::{canonical_ip, is_local_address, Grant, StreamGate};
+use crate::stream_gate::{canonical_ip, is_local_address, Grant, Refusal, StreamGate};
 use crate::user_config::{AutoConnect, SpeakerSettings, UserConfig};
 use crate::volume_sync::{sonos_to_millibels, PendingCommands, SpeakerCommand, VolumeSync};
+use crate::web_access::{self, WebAccess, WebSecret};
 use crate::{upnp, PRODUCT_NAME, WIRE_SAMPLE_RATE};
 
 /// One running renderer session: the speaker we've handed our stream URL
@@ -43,8 +44,9 @@ pub struct RendererSession {
     /// address on the speaker's network).
     #[allow(dead_code)]
     pub stream_uri: String,
-    /// Privacy-gate grant for this speaker's addresses. Lives exactly as
-    /// long as the session: dropping the session revokes them.
+    /// The stream gate's grant for this speaker's addresses (what privacy
+    /// mode admits). Lives exactly as long as the session: dropping the
+    /// session revokes them.
     pub stream_grant: Option<Grant>,
     /// Id the session reports instead of the renderer's own (a speaker
     /// added by address keeps its manual id, so the list highlights the
@@ -517,14 +519,16 @@ pub struct App {
     // ---- Runtime atomics (audio hot path reads these every packet) ----
     /// Driver's KSSTATE_RUN flag mirror — set by the driver-event consumer.
     pub stream_active: Arc<AtomicBool>,
-    /// User toggle. False ⇒ no UPnP session, audio goes into the void.
+    /// User toggle. False ⇒ no session, audio goes into the void, and no
+    /// device but this PC may pull `/stream.raw` (the stream gate holds
+    /// this same flag).
     pub streaming_enabled: Arc<AtomicBool>,
-    /// Runtime flag for the web UI / JSON API. Initial value comes from
-    /// the `--web` CLI flag, but the user can flip it at runtime from
-    /// the GUI. The `/stream.raw` route is always served (the speaker
-    /// needs it); only the user-facing routes (`/`, `/api/*`) honour
-    /// this flag.
-    pub web_ui_enabled: Arc<AtomicBool>,
+    /// The web UI / JSON API: whether it is on, and the secret its link
+    /// and API key carry (see `web_access`). Starts on with `--web`; the
+    /// user can flip it at runtime from the GUI. The `/stream.raw` route
+    /// is always served (the speaker needs it); only the user-facing
+    /// routes (the page under `/r/<key>/`, `/api/*`) honour this.
+    pub web_access: Arc<WebAccess>,
     /// Pending latency adjustment, in frames. + drops, − duplicates.
     pub drain_frames: Arc<AtomicI64>,
     pub rate_fudge_ppm: Arc<AtomicI32>,
@@ -600,8 +604,10 @@ pub struct App {
     /// [`select_speaker`]: App::select_speaker
     user_picks: AtomicU64,
 
-    /// Privacy gate for `/stream.raw` (see `stream_gate.rs`). Sessions
-    /// hold grants in it; the HTTP threads consult it per request.
+    /// The stream gate for `/stream.raw` (see `stream_gate.rs`): no device
+    /// but this PC while streaming is disabled, and with privacy mode on
+    /// only the speaker being played on. Sessions hold grants in it; the
+    /// HTTP threads consult it per request.
     pub stream_gate: Arc<StreamGate>,
 
     /// The one in-flight HomeKit PIN pairing ceremony, if any. Single
@@ -716,8 +722,9 @@ impl App {
         airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     ) -> Arc<Self> {
         let web_initial = config.web_enabled;
-        // "This machine" for the privacy gate: the advertised IP, but
-        // only if this host actually owns it — a user-supplied
+        // "This machine" for the stream gate, which admits it in both
+        // privacy modes and while streaming is disabled: the advertised
+        // IP, but only if this host actually owns it — a user-supplied
         // --advertise-ip pointing at a proxy must not admit everything
         // behind that proxy.
         let own_ip = config
@@ -738,7 +745,11 @@ impl App {
         let vsync = Arc::new(VolumeSync::new());
         let windows_volume = Arc::new(OnceLock::new());
         let speaker_control = SpeakerControl::new(session.clone(), vsync.clone(), Arc::clone(&windows_volume));
-        Arc::new(Self {
+        // One flag for "streaming enabled", read by the stream gate as it is.
+        let streaming_enabled = Arc::new(AtomicBool::new(true));
+        let stream_gate =
+            StreamGate::new(user_config.privacy_mode, streaming_enabled.clone(), own_ip);
+        let app = Arc::new(Self {
             config,
             discovery,
             airplay_discovery,
@@ -749,8 +760,8 @@ impl App {
             speaker_control,
             windows_volume,
             stream_active: Arc::new(AtomicBool::new(true)),
-            streaming_enabled: Arc::new(AtomicBool::new(true)),
-            web_ui_enabled: Arc::new(AtomicBool::new(web_initial)),
+            streaming_enabled,
+            web_access: WebAccess::new(),
             drain_frames: Arc::new(AtomicI64::new(0)),
             rate_fudge_ppm: Arc::new(AtomicI32::new(0)),
             silence_pace_ms: Arc::new(AtomicU64::new(10)),
@@ -769,7 +780,7 @@ impl App {
             rescan_in_flight: Arc::new(AtomicBool::new(false)),
             last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
             last_rescan_count: Arc::new(AtomicUsize::new(0)),
-            stream_gate: StreamGate::new(user_config.privacy_mode, own_ip),
+            stream_gate,
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
@@ -782,7 +793,13 @@ impl App {
             mdns: Mutex::new(None),
             scope_apply: Mutex::new(()),
             discovery_error: Mutex::new(None),
-        })
+        });
+        if web_initial {
+            if let Err(e) = app.set_web_ui_enabled(true) {
+                app.record_error(format!("Couldn't turn the web UI on: {}", e));
+            }
+        }
+        app
     }
 
     /// Record a user-facing error. Logs it AND stashes it for the GUI
@@ -1202,24 +1219,25 @@ impl App {
         self.stream_gate.is_granted(peer)
     }
 
-    /// Privacy gate for `/stream.raw`, called per request (and once a
-    /// second per open stream) from the HTTP threads. Touches only the
-    /// gate's own brief lock — never `session`, which other threads hold
-    /// across multi-second SOAP calls — so a stalled speaker can't park
-    /// the HTTP accept loop. A refusal is surfaced to the user, rate-
-    /// limited per address, naming the device when discovery knows it.
-    pub fn stream_client_allowed(&self, peer: IpAddr) -> bool {
-        if self.stream_gate.allows(peer) {
-            return true;
-        }
-        if self.stream_gate.note_refusal(peer) {
+    /// The stream gate for `/stream.raw`, called per request (and once a
+    /// second per open stream) from the HTTP threads, which tell the
+    /// refused device and the log why. Touches only the gate's own brief
+    /// lock — never `session`, which other threads hold across
+    /// multi-second SOAP calls — so a stalled speaker can't park the HTTP
+    /// accept loop. A privacy-mode refusal is surfaced to the user,
+    /// rate-limited per address, naming the device when discovery knows
+    /// it. One while streaming is disabled is only logged: closing the
+    /// stream is what Disable is for.
+    pub fn check_stream_client(&self, peer: IpAddr) -> Result<(), Refusal> {
+        let verdict = self.stream_gate.check(peer);
+        if verdict == Err(Refusal::NotGranted) && self.stream_gate.note_refusal(peer) {
             self.record_error(format!(
                 "Privacy mode refused a connection to the audio stream from {}. \
                  Turn privacy mode off (Advanced) to let that device listen.",
                 self.describe_peer(peer)
             ));
         }
-        false
+        verdict
     }
 
     /// "Kitchen (192.168.1.50)" when discovery knows the address, else
@@ -1248,19 +1266,18 @@ impl App {
 
     /// Cut off every `/stream.raw` listener the gate no longer admits —
     /// after a speaker switch, Disable, Forget, or privacy turning on.
-    /// The allow-set is snapshotted first, so the hub's subscriber lock
-    /// (taken by the audio thread per packet) is held only for a pure
-    /// predicate, never while waiting on anything.
+    /// Applies in both privacy modes: with streaming disabled the gate
+    /// admits no device but this PC. The allow-set is snapshotted first,
+    /// so the hub's subscriber lock (taken by the audio thread per packet)
+    /// is held only for a pure predicate, never while waiting on anything.
     pub fn prune_stream_clients(&self) {
         let snapshot = self.stream_gate.snapshot();
-        if !snapshot.privacy() {
-            return;
-        }
         let cut = self.hub.disconnect_clients(|ip| !snapshot.allows(ip));
         if cut > 0 {
             info!(
-                "privacy mode: disconnected {} stream listener(s) no longer allowed",
-                cut
+                "stream: disconnected {} listener(s) no longer allowed ({})",
+                cut,
+                if !snapshot.streaming() { "streaming is disabled" } else { "privacy mode" }
             );
         }
     }
@@ -2266,9 +2283,10 @@ impl App {
             let d = discovery.clone();
             crate::sonos::resolve_group_coordinator(new_r, &move |cid| d.find_by_id(cid))
         };
-        // Grant the speaker's addresses through the privacy gate BEFORE
-        // the SOAP handshake — it HEAD/GETs `/stream.raw` as soon as
-        // Play returns, while `self.session` still holds the old state.
+        // Grant the speaker's addresses in the stream gate (what privacy
+        // mode admits) BEFORE the SOAP handshake — it HEAD/GETs
+        // `/stream.raw` as soon as Play returns, while `self.session`
+        // still holds the old state.
         // The grant moves into the session it produces; if bring-up
         // fails it drops on the error path and the gate forgets it.
         // (`stream_peers` includes the other Sonos group members' addresses
@@ -2947,21 +2965,34 @@ impl App {
     /// without this the only way to clear the saved speaker was to
     /// edit `%APPDATA%\StreamToSpeaker\config.json` by hand).
     pub fn forget_saved_speaker(&self) {
+        self.stop_streaming_and_forget_speaker();
+        {
+            let mut uc = self.user_config.lock().unwrap();
+            uc.last_speaker_id = None;
+            uc.onboarding_dismissed = false;
+            uc.save();
+        }
+        // Revert the Windows endpoint name back to "Stream To Speaker"
+        // since we're no longer streaming to anything specific.
+        #[cfg(windows)]
+        crate::endpoint_name::update_endpoint_name(None);
+    }
+
+    /// What Forget does to playback: streaming off, the session stopped,
+    /// every network listener of `/stream.raw` cut, and the remembered
+    /// speaker cleared.
+    fn stop_streaming_and_forget_speaker(&self) {
+        // The flag first, as Disable does: a connect finishing meanwhile
+        // checks it under the session lock and won't bind, and the prune
+        // below sees streaming off, so it cuts every device but this PC
+        // whatever the privacy setting.
+        self.streaming_enabled.store(false, Ordering::Release);
         let s = self.session.lock().unwrap().take();
         if let Some(s) = s {
             s.stop();
         }
         self.prune_stream_clients();
-        self.streaming_enabled.store(false, Ordering::Release);
         *self.last_speaker_id.lock().unwrap() = None;
-        let mut uc = self.user_config.lock().unwrap();
-        uc.last_speaker_id = None;
-        uc.onboarding_dismissed = false;
-        uc.save();
-        // Revert the Windows endpoint name back to "Stream To Speaker"
-        // since we're no longer streaming to anything specific.
-        #[cfg(windows)]
-        crate::endpoint_name::update_endpoint_name(None);
     }
 
     // -------------------------------------------------------------------
@@ -3242,9 +3273,10 @@ impl App {
     // Enable / disable
     // -------------------------------------------------------------------
 
-    /// User toggle. Disabling tears down the UPnP session (freeing Sonos
-    /// for other use); enabling rebinds to the last-used speaker if one
-    /// is remembered.
+    /// User toggle. Disabling tears down the session (freeing the speaker
+    /// for other use) and closes `/stream.raw` to every device but this
+    /// PC, whatever the privacy setting; enabling rebinds to the last-used
+    /// speaker if one is remembered.
     pub fn set_streaming_enabled(self: &Arc<Self>, enabled: bool) -> Result<(), String> {
         let was = self.streaming_enabled.swap(enabled, Ordering::AcqRel);
         if was == enabled {
@@ -3282,14 +3314,67 @@ impl App {
     // -------------------------------------------------------------------
 
     pub fn is_web_ui_enabled(&self) -> bool {
-        self.web_ui_enabled.load(Ordering::Acquire)
+        self.web_access.is_enabled()
     }
 
-    pub fn set_web_ui_enabled(&self, enabled: bool) {
-        let was = self.web_ui_enabled.swap(enabled, Ordering::AcqRel);
-        if was != enabled {
+    /// Turn the web page and the JSON API on or off. On needs the secret
+    /// their link carries: the stored one, or one made now and saved.
+    pub fn set_web_ui_enabled(&self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.load_or_make_web_secret()?;
+        }
+        if self.web_access.set_enabled(enabled) {
             info!("web UI: {}", if enabled { "enabled" } else { "disabled" });
         }
+        Ok(())
+    }
+
+    /// The web UI's link, `http://<this PC>:<port>/r/<key>/`, while it is
+    /// on. It is the credential: shown in the window and printed by a
+    /// headless `--web` run, never logged.
+    pub fn web_link(&self) -> Option<String> {
+        if !self.web_access.is_enabled() {
+            return None;
+        }
+        let key = self.web_access.secret_hex()?;
+        Some(web_access::link(&self.config.advertise_ip, self.config.bind.port(), &key))
+    }
+
+    /// Replace the web UI's secret: the current link and API key stop
+    /// working with their next request. The new secret takes effect only
+    /// once config.json holds it: one only this run knew would be undone
+    /// by the next start, which brings back the link the user meant to
+    /// retire. If it can't be saved, nothing changes and the error says
+    /// so.
+    pub fn new_web_link(&self) -> Result<(), String> {
+        let secret = WebSecret::generate()?;
+        let mut uc = self.user_config.lock().unwrap();
+        let current = uc.web_secret.replace(secret.to_hex());
+        if let Err(e) = uc.try_save() {
+            // Not left for the next save of another setting to store
+            // either: the link the window still shows would stop working
+            // at the next start.
+            uc.web_secret = current;
+            return Err(format!("the settings couldn't be saved ({e}). The current link still works."));
+        }
+        self.web_access.set_secret(secret);
+        info!("web UI: made a new link; the previous one no longer works");
+        Ok(())
+    }
+
+    /// Put the web UI's secret in force: the one the settings hold; else
+    /// the one config.json holds now, which `--web-link` may have stored
+    /// while this run held none; else one made now and saved (first use,
+    /// or a value this version can't use). `--web-link` prints the one
+    /// config.json holds (see `web_access::stored_or_new_secret`).
+    fn load_or_make_web_secret(&self) -> Result<(), String> {
+        let secret = web_access::stored_or_new_secret(
+            &mut self.user_config.lock().unwrap(),
+            UserConfig::stored_web_secret,
+            UserConfig::save,
+        )?;
+        self.web_access.set_secret(secret);
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -4086,37 +4171,38 @@ mod tests {
     fn privacy_off_allows_everyone() {
         let app = test_app();
         app.stream_gate.set_privacy(false);
-        assert!(app.stream_client_allowed(ip("192.168.1.99")));
+        assert_eq!(app.check_stream_client(ip("192.168.1.99")), Ok(()));
         assert!(app.current_error().is_none());
     }
 
     #[test]
     fn privacy_on_refuses_strangers_admits_loopback() {
         let app = test_app();
-        assert!(!app.stream_client_allowed(ip("192.168.1.99")));
-        assert!(app.stream_client_allowed(ip("127.0.0.1")));
-        assert!(app.stream_client_allowed(ip("::1")));
+        assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::NotGranted));
+        assert_eq!(app.check_stream_client(ip("127.0.0.1")), Ok(()));
+        assert_eq!(app.check_stream_client(ip("::1")), Ok(()));
         // The advertised IP is NOT this test host's address, so it is
         // not admitted as "this machine" (the proxy/NAT case).
-        assert!(!app.stream_client_allowed(ip("192.168.1.10")));
+        assert_eq!(app.check_stream_client(ip("192.168.1.10")), Err(Refusal::NotGranted));
     }
 
     #[test]
     fn grant_lives_and_dies_with_its_holder() {
         let app = test_app();
         let grant = app.stream_gate.grant([ip("192.168.1.50")]);
-        assert!(app.stream_client_allowed(ip("192.168.1.50")));
-        assert!(app.stream_client_allowed(ip("::ffff:192.168.1.50")));
-        assert!(!app.stream_client_allowed(ip("192.168.1.51")));
+        assert_eq!(app.check_stream_client(ip("192.168.1.50")), Ok(()));
+        assert_eq!(app.check_stream_client(ip("::ffff:192.168.1.50")), Ok(()));
+        assert_eq!(app.check_stream_client(ip("192.168.1.51")), Err(Refusal::NotGranted));
         drop(grant);
-        assert!(!app.stream_client_allowed(ip("192.168.1.50")));
+        assert_eq!(app.check_stream_client(ip("192.168.1.50")), Err(Refusal::NotGranted));
     }
 
-    /// [`test_app`] with default settings instead of the developer's
-    /// (in memory only: nothing here saves).
+    /// [`test_app`] with default settings instead of the developer's, in
+    /// memory only (saves don't reach the disk), and no remembered speaker.
     fn test_app_defaults() -> Arc<App> {
         let app = test_app();
-        *app.user_config.lock().unwrap() = UserConfig::default();
+        *app.user_config.lock().unwrap() = UserConfig::in_memory();
+        *app.last_speaker_id.lock().unwrap() = None;
         app
     }
 
@@ -4334,13 +4420,199 @@ mod tests {
     #[test]
     fn refusal_is_surfaced_once_per_peer() {
         let app = test_app();
-        assert!(!app.stream_client_allowed(ip("192.168.1.99")));
+        assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::NotGranted));
         let msg = app.current_error().expect("refusal recorded as a user-visible error");
         assert!(msg.contains("192.168.1.99"), "{msg}");
         assert!(msg.contains("privacy mode off"), "{msg}");
         // A repeat within the report interval is refused silently.
         app.dismiss_error();
-        assert!(!app.stream_client_allowed(ip("192.168.1.99")));
+        assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::NotGranted));
         assert!(app.current_error().is_none());
+    }
+
+    fn assert_cut(rx: &crossbeam_channel::Receiver<crate::http_server::PcmFrame>, who: &str) {
+        assert!(
+            matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)),
+            "{who} still connected"
+        );
+    }
+
+    fn publish(app: &App) {
+        app.hub.publish(crate::http_server::PcmFrame(Arc::new(vec![0u8; 4])));
+    }
+
+    #[test]
+    fn disabling_streaming_cuts_every_network_listener_in_both_modes() {
+        for privacy in [false, true] {
+            let app = test_app_defaults();
+            app.stream_gate.set_privacy(privacy);
+            // The speaker being played on, as its session's grant admits it.
+            let _grant = app.stream_gate.grant([ip("192.168.1.50")]);
+            let stranger = app.hub.subscribe_from(ip("192.168.1.99"));
+            let speaker = app.hub.subscribe_from(ip("192.168.1.50"));
+            let this_pc = app.hub.subscribe_from(ip("127.0.0.1"));
+            let sender = app.hub.subscribe(); // an AirPlay sender, in-process
+            assert_eq!(app.check_stream_client(ip("192.168.1.50")), Ok(()));
+            let verdict = if privacy { Err(Refusal::NotGranted) } else { Ok(()) };
+            assert_eq!(app.check_stream_client(ip("192.168.1.99")), verdict);
+            app.dismiss_error();
+
+            app.set_streaming_enabled(false).unwrap();
+            publish(&app);
+            assert_cut(&stranger, "stranger");
+            assert_cut(&speaker, "speaker");
+            assert!(this_pc.try_recv().is_ok(), "privacy {privacy}");
+            assert!(sender.try_recv().is_ok(), "privacy {privacy}");
+            for other in ["192.168.1.99", "192.168.1.50", "::ffff:192.168.1.50"] {
+                let verdict = app.check_stream_client(ip(other));
+                assert_eq!(verdict, Err(Refusal::StreamingOff), "{other}, privacy {privacy}");
+            }
+            assert_eq!(app.check_stream_client(ip("::1")), Ok(()));
+            // Closing the stream is what Disable is for: no message about it.
+            assert!(app.current_error().is_none(), "{:?}", app.current_error());
+
+            app.set_streaming_enabled(true).unwrap();
+            assert_eq!(app.check_stream_client(ip("192.168.1.50")), Ok(()));
+            let verdict = if privacy { Err(Refusal::NotGranted) } else { Ok(()) };
+            assert_eq!(app.check_stream_client(ip("192.168.1.99")), verdict);
+        }
+    }
+
+    #[test]
+    fn forget_cuts_every_network_listener_at_once() {
+        for privacy in [false, true] {
+            let app = test_app_defaults();
+            app.stream_gate.set_privacy(privacy);
+            *app.last_speaker_id.lock().unwrap() = Some("uuid:kitchen".into());
+            let stranger = app.hub.subscribe_from(ip("192.168.1.99"));
+            let this_pc = app.hub.subscribe_from(ip("::1"));
+            app.stop_streaming_and_forget_speaker();
+            assert!(!app.is_streaming_enabled());
+            assert_eq!(*app.last_speaker_id.lock().unwrap(), None);
+            // Cut by Forget itself, not a second later by the stream's
+            // own recheck of the gate.
+            publish(&app);
+            assert_cut(&stranger, "stranger");
+            assert!(this_pc.try_recv().is_ok(), "privacy {privacy}");
+            assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::StreamingOff));
+        }
+    }
+
+    #[test]
+    fn no_discovery_still_serves_the_stream_to_the_network() {
+        // `--no-discovery` serves HTTP only: no speaker is picked, and
+        // players elsewhere on the network fetch the stream themselves.
+        // That relies on streaming starting enabled and staying so until
+        // the user disables it.
+        let app = test_app_defaults();
+        assert!(app.config.no_discovery && app.discovery.is_none());
+        app.stream_gate.set_privacy(false);
+        assert!(app.is_streaming_enabled());
+        assert_eq!(app.check_stream_client(ip("192.168.1.99")), Ok(()));
+        app.set_streaming_enabled(false).unwrap();
+        assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::StreamingOff));
+        app.set_streaming_enabled(true).unwrap();
+        assert_eq!(app.check_stream_client(ip("192.168.1.99")), Ok(()));
+        // With privacy mode on there is no speaker to grant: this PC only.
+        app.stream_gate.set_privacy(true);
+        assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::NotGranted));
+        assert_eq!(app.check_stream_client(ip("127.0.0.1")), Ok(()));
+    }
+
+    #[test]
+    fn turning_the_web_ui_on_makes_its_secret_once_and_keeps_it() {
+        let app = test_app_defaults();
+        assert!(!app.is_web_ui_enabled());
+        assert_eq!(app.web_link(), None);
+        app.set_web_ui_enabled(true).unwrap();
+        let stored = app.user_config.lock().unwrap().web_secret.clone().expect("stored");
+        assert!(WebSecret::parse(&stored).is_some(), "{stored}");
+        let link = app.web_link().expect("a link while on");
+        assert_eq!(link, format!("http://192.168.1.10:8080/r/{stored}/"));
+        assert!(app.web_access.path_key_ok(&stored));
+        // Off and on again: the same link, so a phone's bookmark still works.
+        app.set_web_ui_enabled(false).unwrap();
+        assert_eq!(app.web_link(), None);
+        assert!(!app.web_access.is_enabled());
+        app.set_web_ui_enabled(true).unwrap();
+        assert_eq!(app.web_link().as_deref(), Some(link.as_str()));
+        // A new link: a new key, stored, and the old one refused at once.
+        app.new_web_link().unwrap();
+        let newer = app.user_config.lock().unwrap().web_secret.clone().unwrap();
+        assert_ne!(newer, stored);
+        assert!(!app.web_access.path_key_ok(&stored));
+        assert!(app.web_access.path_key_ok(&newer));
+        assert_eq!(app.web_link(), Some(format!("http://192.168.1.10:8080/r/{newer}/")));
+        // Nothing about it reached a message the window shows.
+        assert_eq!(app.current_error(), None);
+    }
+
+    #[test]
+    fn a_new_link_that_cant_be_saved_leaves_the_current_one_in_force() {
+        // Settings that can't be saved (config.json couldn't be read at
+        // startup): a key kept only in memory would be undone by the next
+        // start, which brings back the link the user meant to retire.
+        let app = test_app_defaults();
+        let key = "00112233445566778899aabbccddeeff";
+        let mut settings = UserConfig::unsaveable();
+        settings.web_secret = Some(key.into());
+        *app.user_config.lock().unwrap() = settings;
+        app.set_web_ui_enabled(true).unwrap();
+        let link = app.web_link().expect("a link while on");
+        let err = app.new_web_link().unwrap_err();
+        // Nothing changed: the same link, its key still let in, and the
+        // settings still hold it, so a later save can't store a key the
+        // window never showed.
+        assert_eq!(app.web_link().as_deref(), Some(link.as_str()));
+        assert!(app.web_access.path_key_ok(key));
+        assert_eq!(app.user_config.lock().unwrap().web_secret.as_deref(), Some(key));
+        // The window shows this after "Couldn't make a new link: ". It says
+        // the old link still works, and names no key.
+        assert!(err.contains("couldn't be saved") && err.ends_with("The current link still works."), "{err}");
+        assert!(!err.as_bytes().windows(32).any(|w| w.iter().all(u8::is_ascii_hexdigit)), "{err}");
+    }
+
+    #[test]
+    fn a_stored_web_secret_is_used_and_an_unusable_one_replaced() {
+        let app = test_app_defaults();
+        let key = "00112233445566778899aabbccddeeff";
+        app.user_config.lock().unwrap().web_secret = Some(key.into());
+        app.set_web_ui_enabled(true).unwrap();
+        assert_eq!(app.web_link(), Some(format!("http://192.168.1.10:8080/r/{key}/")));
+        for bad in ["", "short", "zz112233445566778899aabbccddeeff"] {
+            let app = test_app_defaults();
+            app.user_config.lock().unwrap().web_secret = Some(bad.into());
+            app.set_web_ui_enabled(true).unwrap();
+            let stored = app.user_config.lock().unwrap().web_secret.clone().unwrap();
+            assert!(WebSecret::parse(&stored).is_some(), "{bad:?} became {stored:?}");
+            assert!(app.web_access.path_key_ok(&stored));
+        }
+    }
+
+    #[test]
+    fn the_web_ui_takes_the_key_web_link_stored_while_the_app_ran() {
+        // The app runs with its web UI off and no key. `--web-link`, a
+        // process of its own, stores one and prints the link; the app saves
+        // a setting; then the web UI is turned on in the window.
+        let dir = std::env::temp_dir().join(format!("sts-app-web-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+        let app = test_app_defaults();
+        *app.user_config.lock().unwrap() = UserConfig::at_path(path.clone());
+        let printed = web_access::link_from_settings(
+            "192.168.1.10",
+            8080,
+            || UserConfig::load_from(&path),
+            |c| c.save_to(&path),
+        )
+        .unwrap();
+        app.dismiss_onboarding();
+        app.set_web_ui_enabled(true).unwrap();
+        assert_eq!(app.web_link().as_deref(), Some(printed.as_str()));
+        // The file holds that key and the app's setting.
+        let disk = UserConfig::load_from(&path);
+        assert_eq!(disk.web_secret, app.web_access.secret_hex());
+        assert!(disk.onboarding_dismissed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

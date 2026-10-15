@@ -8,9 +8,12 @@
 //!     tray. Audio loop runs on the main thread. Use for service installs
 //!     or when running over SSH.
 //!
-//! The HTTP/JSON API (web UI at `:5901/`, `/api/*` endpoints) is OFF by
-//! default — pass `--web` to enable it. Even with `--web`, prefer
-//! `--bind 127.0.0.1` unless you trust everyone on the LAN.
+//! The web UI and its HTTP/JSON API (`/api/*`) are OFF by default — pass
+//! `--web` (or turn them on in the window). Both need the web UI's link,
+//! which carries a secret key: the page lives under `/r/<key>/`, and API
+//! calls send the key as `Authorization: Bearer <key>`. The window shows
+//! the link; `--web-link` prints it and exits, for headless and service
+//! installs, which have no window.
 
 // Windows subsystem = "windows" — no console window ever auto-allocated.
 // GUI mode: the egui window + tray are the entire user-facing surface.
@@ -114,12 +117,21 @@ struct Cli {
     #[arg(long, default_value_t = false, hide = true)]
     startup: bool,
 
-    /// Enable the HTTP / JSON API and built-in web UI. The audio stream
+    /// Enable the HTTP / JSON API and built-in web UI. Both need the web
+    /// UI's link, which carries a secret key (shown in the window; printed
+    /// at start with --headless, and by --web-link). The audio stream
     /// itself (`/stream.raw`) is always served — Sonos needs it — but the
-    /// rest of the endpoints (`/`, `/api/*`) are only registered when
-    /// this flag is set. Off by default to close the LAN-side hole.
+    /// page and `/api/*` only answer while the web UI is on.
     #[arg(long, default_value_t = false)]
     web: bool,
+
+    /// Print the web UI's link and exit, making its key if there is none
+    /// yet. For headless and service installs, which have no window to
+    /// show it in: run it as the account the app runs under (the key is
+    /// kept in that account's settings), with the app's --port and
+    /// --advertise-ip if it has them.
+    #[arg(long, default_value_t = false, conflicts_with = "list_speakers")]
+    web_link: bool,
 
     /// Interval between SSDP re-discoveries (minutes).
     #[arg(long, default_value_t = 5)]
@@ -187,6 +199,15 @@ struct Cli {
     latency_adjust_step_frames: u32,
 }
 
+impl Cli {
+    /// Runs as a console program: output and errors go to the terminal
+    /// that started it (or wherever its caller redirected them), never to
+    /// a window. `--web-link` is one: it prints a link and exits.
+    fn console(&self) -> bool {
+        self.headless || self.web_link
+    }
+}
+
 fn main() {
     // Startup tombstone. Written as the FIRST thing in main, before
     // any state initialization, CLI parsing, panic-hook install, or
@@ -200,11 +221,11 @@ fn main() {
 
     let cli = Cli::parse();
 
-    // Headless mode: try to attach to the parent terminal so the user
-    // sees log output. GUI mode: no console at all (windows_subsystem
-    // = "windows" already takes care of that).
+    // Headless mode (and --web-link): try to attach to the parent terminal
+    // so the user sees the output. GUI mode: no console at all
+    // (windows_subsystem = "windows" already takes care of that).
     #[cfg(windows)]
-    if cli.headless {
+    if cli.console() {
         attach_parent_console();
     }
 
@@ -226,7 +247,7 @@ fn main() {
     //      see WHY the window disappeared, instead of "task manager
     //      shows it but nothing's painted."
     #[allow(unused_variables)]
-    let headless = cli.headless;
+    let console = cli.console();
     std::panic::set_hook(Box::new(move |info| {
         let payload = info.payload();
         let msg: String = if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -244,7 +265,7 @@ fn main() {
         let full = format!("panic at {}: {}\n{}", location, msg, bt);
         log::error!("{}", full);
         #[cfg(windows)]
-        if !headless {
+        if !console {
             show_crash_dialog(&format!("Stream To Speaker hit a fatal error:\n\n{}\n\n{}\n\nFull backtrace is in the log file (Help → Open log folder).",
                 location, msg));
         }
@@ -260,9 +281,11 @@ fn main() {
     // The Global\ mutex is what the installer watches for a running copy;
     // its "already existed" answer also covers an instance that never
     // takes the per-session claim below (--headless, or one running
-    // elevated).
+    // elevated). --web-link is not a running copy — it prints a link and
+    // exits, usually while the app runs — so it takes no part in either.
     #[cfg(windows)]
-    let (_mutex_handle, global_taken) = create_singleton_mutex();
+    let (_mutex_handle, global_taken) =
+        if cli.web_link { (None, false) } else { create_singleton_mutex() };
     #[cfg(not(windows))]
     let global_taken = false;
 
@@ -276,8 +299,8 @@ fn main() {
     // listens on from here on, so it works before that instance has a
     // window too. Skipped in --headless: headless is for service / CLI
     // runs where multiple invocations against the same port are the
-    // caller's problem.
-    if !cli.headless {
+    // caller's problem. Skipped for --web-link too (see above).
+    if !cli.console() {
         if let stream_to_speaker::single_instance::Claim::Another =
             stream_to_speaker::single_instance::claim()
         {
@@ -296,7 +319,7 @@ fn main() {
     if let Err(e) = run(cli) {
         error!("fatal: {:#}", e);
         #[cfg(windows)]
-        if !headless {
+        if !console {
             show_crash_dialog(&format!(
                 "Stream To Speaker couldn't start:\n\n{:#}\n\nSee the log file for details (Help → Open log folder in a working instance, or %LOCALAPPDATA%\\StreamToSpeaker\\stream-to-speaker.log).",
                 e
@@ -345,9 +368,9 @@ fn init_logging(cli: &Cli) {
     // env_logger's default stderr target writes to a dead handle.
     // Pipe to %LOCALAPPDATA%\StreamToSpeaker\stream-to-speaker.log so
     // the user (and the GUI's Help menu) can find the log later.
-    // Headless mode keeps stderr so logs still appear in the attached
-    // parent console.
-    if !cli.headless {
+    // Headless mode (and --web-link) keeps stderr so logs still appear in
+    // the attached parent console.
+    if !cli.console() {
         if let Some(file) = open_log_file() {
             builder.target(env_logger::Target::Pipe(Box::new(file)));
         }
@@ -437,6 +460,11 @@ fn run(cli: Cli) -> Result<()> {
     if cli.list_speakers {
         return cmd_list_speakers(&cli);
     }
+    // --web-link: before anything that claims the driver, the port or the
+    // network, none of which printing a link needs.
+    if cli.web_link {
+        return cmd_web_link(&cli);
+    }
 
     // Build the audio source up front so we fail fast if the driver is
     // missing under --source driver.
@@ -453,18 +481,31 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    // Always start the full HTTP server (audio + API + UI). The /, /api/*
-    // routes honour app.is_web_ui_enabled() at request time, so the GUI
-    // can flip the web UI on and off without re-binding the socket. The
+    // Always start the full HTTP server (audio + API + UI). The page and
+    // /api/* routes check app.web_access at request time, so the GUI can
+    // flip the web UI on and off without re-binding the socket. The
     // initial state mirrors --web.
     let port_chosen = start_http(&app)?;
-    if app.is_web_ui_enabled() {
-        info!("web UI: http://{}:{}/", app.config.advertise_ip, port_chosen);
-    } else {
-        info!(
-            "stream URL: http://{}:{}/stream.raw (web UI off — toggle in the GUI)",
-            app.config.advertise_ip, port_chosen
-        );
+    info!("stream URL: http://{}:{}/stream.raw", app.config.advertise_ip, port_chosen);
+    match app.web_link() {
+        // The link is the web UI's credential: printed once for a headless
+        // run, which has no window to show it in, and never logged. A run
+        // as a service may have no console to print to: --web-link prints
+        // the link at any time.
+        Some(link) if cli.headless => {
+            // Not println!: it panics (here: aborts) when stdout is a
+            // closed pipe.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stdout(),
+                "Web UI: {}\nAnyone with this link can control {} on this network.",
+                link,
+                PRODUCT_NAME
+            );
+            info!("web UI on; its link went to standard output, not this log (--web-link prints it)");
+        }
+        Some(_) => info!("web UI on; its link is in the window's Web UI card"),
+        None => info!("web UI off — turn it on in the window, or start with --web"),
     }
 
     // Driver-event consumer.
@@ -689,18 +730,7 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         .with_context(|| format!("parsing --bind {}", cli.bind))?;
     let bind_socket = SocketAddr::new(bind_addr, cli.port);
 
-    let advertise_ip = match cli.advertise_ip.as_deref() {
-        Some(ip) => ip.to_string(),
-        // Only the default shown in the UI; each speaker gets the address
-        // on its own network. Without a default route (offline LAN), use
-        // any local IPv4.
-        None => stream_to_speaker::app::default_advertise_ip().or_else(|e| {
-            stream_to_speaker::ssdp::local_ipv4_interfaces()
-                .first()
-                .map(|ip| ip.to_string())
-                .ok_or(e)
-        })?,
-    };
+    let advertise_ip = advertise_ip_for(cli)?;
 
     let ssdp_iface = if cli.no_discovery {
         None
@@ -728,6 +758,22 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
     let app = App::new(config, discovery, airplay_discovery);
     app.start_discovery(Duration::from_secs(cli.ssdp_interval * 60));
     Ok(app)
+}
+
+/// The address a run with these flags names this PC by in the window, the
+/// log and the web UI's link: `--advertise-ip`, else the default route's
+/// address, else (an offline LAN) any local IPv4. Only that default: each
+/// speaker gets the address on its own network.
+fn advertise_ip_for(cli: &Cli) -> Result<String> {
+    match cli.advertise_ip.as_deref() {
+        Some(ip) => Ok(ip.to_string()),
+        None => stream_to_speaker::app::default_advertise_ip().or_else(|e| {
+            stream_to_speaker::ssdp::local_ipv4_interfaces()
+                .first()
+                .map(|ip| ip.to_string())
+                .ok_or(e)
+        }),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -787,8 +833,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
     };
     let stream_client_allowed: StreamClientAllowedCallback = {
         let app2 = app.clone();
-        Arc::new(move |ip| app2.stream_client_allowed(ip))
-            as Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>
+        Arc::new(move |ip| app2.check_stream_client(ip))
     };
 
     start_http_server(HttpServerConfig {
@@ -799,7 +844,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         speaker_select: Some(speaker_select),
         resync: Some(resync),
         latency_adjust: Some(latency_adjust),
-        web_ui_enabled: Some(app.web_ui_enabled.clone()),
+        web_access: Some(app.web_access.clone()),
         stream_client_allowed: Some(stream_client_allowed),
         extra_hosts: vec![app.config.advertise_ip.clone()],
         speaker_peer: Some({
@@ -833,6 +878,34 @@ fn cmd_list_speakers(cli: &Cli) -> Result<()> {
     if n == 0 {
         eprintln!("(no speakers found within 5s — check that SSDP isn't blocked)");
     }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// --web-link
+// -----------------------------------------------------------------------------
+
+/// Print the web UI's link and exit. The key comes from the settings of
+/// the account this runs as (made and saved there if there is none yet),
+/// so it must be the account the app runs under; the address and port are
+/// worked out as a run with the same flags does. The link is the web UI's
+/// credential: it goes to standard output only, never to the log.
+fn cmd_web_link(cli: &Cli) -> Result<()> {
+    use std::io::Write as _;
+    use stream_to_speaker::user_config::UserConfig;
+    let link = stream_to_speaker::web_access::link_from_settings(
+        &advertise_ip_for(cli)?,
+        cli.port,
+        UserConfig::load,
+        UserConfig::save,
+    )
+    .map_err(|e| anyhow!("--web-link: {e}"))?;
+    writeln!(std::io::stdout(), "{link}").context("writing the link to standard output")?;
+    let _ = writeln!(
+        std::io::stderr(),
+        "Anyone with this link can control {} on this network.",
+        PRODUCT_NAME
+    );
     Ok(())
 }
 

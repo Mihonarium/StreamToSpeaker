@@ -417,8 +417,11 @@ fn handle_menu(
     } else if *id == ids.switch_speaker || *id == ids.show_window {
         show_window_win32(hwnd.load(Ordering::Relaxed));
     } else if *id == ids.open_web {
-        if app.is_web_ui_enabled() {
-            open_web_ui(&app.config.advertise_ip, app.config.bind.port());
+        if let Some(link) = app.web_link() {
+            // Logged without the link: it carries the web UI's key.
+            if let Err(e) = crate::open_url(&link) {
+                warn!("tray: couldn't open the web UI in a browser: {}", e);
+            }
         }
     } else if *id == ids.open_log {
         if let Some(dir) = crate::log_dir() {
@@ -463,13 +466,6 @@ fn show_window_win32(hwnd: isize) {
             ShowWindowAsync(h, SW_RESTORE);
         }
         SetForegroundWindow(h);
-    }
-}
-
-fn open_web_ui(advertise_ip: &str, port: u16) {
-    let url = format!("http://{}:{}/", advertise_ip, port);
-    if let Err(e) = crate::open_url(&url) {
-        warn!("failed to open browser to {}: {}", url, e);
     }
 }
 
