@@ -8,6 +8,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 import zipfile
 
 import certified
@@ -317,6 +318,99 @@ class Manifest(unittest.TestCase):
         self.assertIn("| Certification report | n/a |", certified.release_notes(m))
         m = certified.build_manifest("1.1.0.209", "abc", "5b" * 32, "", "", [], 95342530, b"", b"", b"")
         self.assertIn("| Certification report | n/a |", certified.release_notes(m))
+
+
+
+class DispatchInputs(unittest.TestCase):
+    SHA = "0123456789abcdef0123456789abcdef01234567"
+
+    def env(self, **kw):
+        base = {"INPUT_VERSION": "1.1.1.211", "INPUT_OS": "WINDOWS_v100_X64_25H2_FULL",
+                "INPUT_DRY_RUN": "false", "GITHUB_SHA": self.SHA,
+                "INPUT_PRODUCT": "13928634707663450", "INPUT_SUBMISSION": "1152921505702104817"}
+        base.update(kw)
+        return base
+
+    def test_hardware_api_run_from_the_dispatched_commit(self):
+        values, problems = certified.check_inputs(self.env())
+        self.assertEqual(problems, [])
+        self.assertEqual(values, {
+            "version": "1.1.1.211", "tag": "driver-v1.1.1.211", "commit": self.SHA, "mode": "api",
+            "product_id": "13928634707663450", "submission_id": "1152921505702104817", "report_id": "",
+            "ms_zip": "StreamToSpeaker-Driver-1.1.1.211-Microsoft.zip",
+            "lab_zip": "StreamToSpeaker-Driver-1.1.1.211-lab-testsigned.zip",
+            "os": "WINDOWS_v100_X64_25H2_FULL", "dry_run": "false"})
+
+    def test_hand_downloaded_zip_for_another_commit(self):
+        other = "f" * 40
+        values, problems = certified.check_inputs(self.env(
+            INPUT_PRODUCT="", INPUT_SUBMISSION="", INPUT_MS_ZIP="signed-whcp.zip", INPUT_COMMIT=other,
+            INPUT_TAG="driver-v1.1.1.211", INPUT_REPORT="95342530", INPUT_DRY_RUN="true"))
+        self.assertEqual(problems, [])
+        self.assertEqual((values["mode"], values["ms_zip"], values["commit"], values["report_id"], values["dry_run"]),
+                         ("asset", "signed-whcp.zip", other, "95342530", "true"))
+
+    def test_spaces_around_a_pasted_value_are_dropped(self):
+        values, problems = certified.check_inputs(self.env(
+            INPUT_COMMIT=self.SHA + " ", INPUT_PRODUCT=" 13928634707663450\t", INPUT_OS="A,\tB"))
+        self.assertEqual(problems, [])
+        self.assertEqual((values["commit"], values["product_id"], values["os"]),
+                         (self.SHA, "13928634707663450", "A,B"))
+
+    def test_spaces_around_the_version_are_refused(self):
+        # The version also names the run's concurrency group, which takes it
+        # as typed: "1.1.1.211 " would run beside a run of "1.1.1.211".
+        for version in (" 1.1.1.211", "1.1.1.211\t"):
+            _, problems = certified.check_inputs(self.env(INPUT_VERSION=version))
+            self.assertEqual(len(problems), 1, version)
+
+    def test_signature_list_is_normalised(self):
+        values, problems = certified.check_inputs(self.env(INPUT_OS=" WINDOWS_v100_X64_25H2_FULL , B_2 ,"))
+        self.assertEqual((problems, values["os"]), ([], "WINDOWS_v100_X64_25H2_FULL,B_2"))
+
+    def test_needs_both_ids_or_an_asset(self):
+        for kw in ({"INPUT_PRODUCT": ""}, {"INPUT_SUBMISSION": ""}):
+            _, problems = certified.check_inputs(self.env(**kw))
+            self.assertEqual(len(problems), 1, kw)
+
+    def test_values_that_could_change_a_script_are_refused(self):
+        for key, bad in [
+            ("INPUT_VERSION", "1.1.1.211\n"), ("INPUT_VERSION", "1.1.1.٢١١"), ("INPUT_VERSION", ""),
+            ("INPUT_TAG", "v1.0.0"), ("INPUT_TAG", "driver-v1.1.1.211; id"),
+            ("INPUT_PRODUCT", "1; id"), ("INPUT_SUBMISSION", "$(id)"), ("INPUT_REPORT", "1\n2"),
+            ("INPUT_MS_ZIP", "a.zip\nx=y"), ("INPUT_MS_ZIP", "a b.zip"), ("INPUT_LAB_ZIP", "../lab.zip"),
+            ("INPUT_LAB_ZIP", "lab.tar"), ("INPUT_OS", "A;B"), ("INPUT_OS", " , "), ("INPUT_OS", "A\n"),
+            ("INPUT_COMMIT", "HEAD"), ("INPUT_COMMIT", self.SHA.upper()), ("INPUT_COMMIT", self.SHA[:7]),
+            ("INPUT_DRY_RUN", "yes"), ("INPUT_DRY_RUN", ""),
+            ("INPUT_LAB_ZIP", "StreamToSpeaker-Driver-1.1.1.211-Microsoft.zip"),
+            ("INPUT_LAB_ZIP", "StreamToSpeaker-Driver-1.1.1.211-Signed.zip"),
+            ("INPUT_MS_ZIP", "StreamToSpeaker-Driver-1.1.1.211-Signed.zip"),
+            ("INPUT_MS_ZIP", "StreamToSpeaker-Driver-1.1.1.211-lab-testsigned.zip"),
+            ("INPUT_LAB_ZIP", "STREAMTOSPEAKER-DRIVER-1.1.1.211-MICROSOFT.zip"),
+        ]:
+            _, problems = certified.check_inputs(self.env(**{key: bad}))
+            self.assertEqual(len(problems), 1, (key, bad, problems))
+
+    def test_command_writes_the_values_to_github_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "output")
+            env = dict(self.env(), GITHUB_OUTPUT=out)
+            with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                    unittest.mock.patch("sys.stdout", io.StringIO()):
+                self.assertEqual(certified.main(["inputs"]), 0)
+            with open(out, encoding="utf-8") as f:
+                written = dict(line.split("=", 1) for line in f.read().splitlines())
+        self.assertEqual(written, certified.check_inputs(self.env())[0])
+
+    def test_command_fails_without_writing(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "output")
+            env = dict(self.env(INPUT_COMMIT="HEAD"), GITHUB_OUTPUT=out)
+            with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                    unittest.mock.patch("sys.stdout", io.StringIO()) as shown:
+                self.assertEqual(certified.main(["inputs"]), 1)
+            self.assertFalse(os.path.exists(out))
+        self.assertIn("::error::commit must be a full commit SHA", shown.getvalue())
 
 
 if __name__ == "__main__":

@@ -112,19 +112,24 @@ like `build.yml` does.
    registration credential and what must sign submission CABs).
 2. **Signing repo**: set up per its README, including the `FETCH_TOKEN`
    environment secret (fine-grained PAT scoped to this repo, Actions:
-   Read-only). This repo is private, so unsigned bytes travel to the
-   signing workflow as Actions artifacts (its private-source mode) —
-   `FETCH_TOKEN` is how it fetches them, after your approval.
+   Read-only). Unsigned bytes travel to the signing workflow as Actions
+   artifacts (its private-source mode) — `FETCH_TOKEN` is how it fetches
+   them, after your approval.
 3. **This repo — environment `request-signing`** (already exists for the
    installer signing): holds secret `SIGNING_REPO_TOKEN` (fine-grained PAT,
    scoped to only the signing repo, Actions Read+Write). **Add branch
    `main` to its "Deployment branches and tags" policy** (previously tags
    `v*` only) — `driver-submission.yml`'s `sign-cab` job runs from main.
    No required reviewers here; the human gate lives in the signing repo.
-4. **This repo — Hardware API secrets** (plain repository secrets; no
-   approval gate by design — the EV-signing approval already vouches for
-   the exact CAB bytes, and the Entra app can only submit to our own
-   Partner Center account):
+4. **This repo — environment `partner-center`** holding the Hardware API
+   secrets. Its "Deployment branches and tags" policy is Selected with the
+   single branch `main` and no tags, so a workflow edited on any other
+   branch or tag can't read them (a repository secret would be readable by
+   any workflow run in this repo; keep no repository-level copies). No
+   required reviewers, by design — the EV-signing approval already vouches
+   for the exact CAB bytes, and the Entra app can only submit to our own
+   Partner Center account. Only `Driver attest`'s `reconcile` job and
+   `Driver certified`'s `download` job run in it:
    - `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` — a
      Microsoft Entra app registration associated with the Partner Center
      account (Partner Center → Account settings → User management →
@@ -132,8 +137,15 @@ like `build.yml` does.
      never used (client-credentials flow) — `https://localhost` is fine.
    - Client secrets **expire** (max 24 months). The failure mode is
      `invalid_client` from the token endpoint in `Driver attest` — create
-     a new secret in Entra (Certificates & secrets), update
-     `AZURE_CLIENT_SECRET`, delete the old one.
+     a new secret in Entra (Certificates & secrets), update the
+     environment's `AZURE_CLIENT_SECRET`, delete the old one.
+5. **This repo — tag ruleset on `v*`**: creating, moving and deleting `v*`
+   tags is restricted, with only the Repository admin role allowed to
+   bypass. A `v*` tag starts the installer release chain, and the
+   `request-signing` environment's policy limits refs, not people: without
+   the ruleset anyone who can push could tag a commit with an edited
+   workflow and have it reach the signing requests. The `driver-v*` tags
+   CI creates don't match `v*`.
 
 ## Flow A — driver changed (1 manual step)
 
@@ -453,10 +465,17 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
    the commit whose `driver/**` + `include/**` tree is what the lab
    tested, and attach the lab package as
    `StreamToSpeaker-Driver-<ver>-lab-testsigned.zip`.
-4. **Run `Driver certified`** (Actions → Run workflow) **from that
-   commit's branch** with `version`, `product_id`, `submission_id`,
-   `report_id` (the seller ID: the first number in the dashboard's
-   certificationReport URL). It polls the Hardware API until the submission is
+4. **Run `Driver certified`** (Actions → Run workflow) **from main** with
+   `version`, `commit` (the full SHA of that commit; leave it empty when
+   it is main's head), `product_id`, `submission_id`, `report_id` (the
+   seller ID: the first number in the dashboard's certificationReport
+   URL). Only main can use the `partner-center` environment that holds the
+   Hardware API secrets; the run takes its scripts from main and hashes
+   and records the `commit` tree, after checking that `commit` has the
+   same `driver/` and `include/` trees as the commit the release's tag
+   points to. `dry_run=true` runs every check below and leaves every
+   release as it is (none is created, uploaded to or changed; the Hardware
+   API is only read). It polls the Hardware API until the submission is
    `completed` with a `signedPackage`, downloads it, and verifies:
    - INF byte-identical to the lab package and carrying DriverVer `<ver>`;
    - `.sys` code identical to the lab `.sys` after stripping the
@@ -476,15 +495,17 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
    `ms_state: done`, no submission CAB; the attestation-only `build_root`
    and `driver_h_stamped` are not written).
    Already have the zip from the dashboard? Attach it to the release and
-   pass its name as `ms_zip_asset` — the API step is skipped and no Azure
-   secrets are needed.
+   pass its name as `ms_zip_asset` — the API step is skipped, no Azure
+   secrets are needed, and the run works from any branch, including that
+   commit's own.
 5. Merge the driver branch. `Driver submission` fires on the `driver/**`
    push and its `certified-guard` stops it; `build.yml` bundles the
    certified package into every installer whose driver tree still hashes
    to the manifest's `source_hash`.
 
-The script behind it is `.github/scripts/certified.py` (`hash`, `fetch`,
-`verify`, `release`; unit tests in `test_certified.py`, run in the
+The script behind it is `.github/scripts/certified.py` (`inputs`, `hash`,
+`fetch`, `verify`, `release`; `inputs` checks every dispatch input and
+writes the values all later steps use; unit tests in `test_certified.py`, run in the
 workflow's guard step). `release` is idempotent and can be run locally
 with `gh` to (re)publish a release from hand-downloaded files.
 
@@ -584,8 +605,14 @@ only cleaned (`repro_compare.py` `clean_text`) or between
   polls 5 min for a run whose title contains the digest, then waits for
   approval; see `.github/actions/request-signing/action.yml`.
 - **`Driver attest` fails at the token step (`invalid_client`)** — the
-  Entra client secret expired or was rotated without updating
-  `AZURE_CLIENT_SECRET` (see one-time setup, step 4).
+  Entra client secret expired or was rotated without updating the
+  `partner-center` environment's `AZURE_CLIENT_SECRET` (see one-time
+  setup, step 4).
+- **`Driver attest` or `Driver certified` is refused with "not allowed to
+  deploy to partner-center"** — the run was dispatched from a ref other
+  than main. Dispatch it from main (for `Driver certified`, with
+  `commit` = the certified commit), or use a dry run of `Driver attest` /
+  `ms_zip_asset` for `Driver certified`, which need no environment.
 - **`Driver attest` fails creating the product/submission** — the Entra
   app lost its Partner Center association or Manager role (Account
   settings → User management → Microsoft Entra applications).
@@ -602,7 +629,8 @@ works end to end:
    hardware* → upload CAB → leave both test-signing options unchecked →
    select the Windows 10 1809+ / Windows 11 **x64** targets → Submit.
 3. Download the signed zip Microsoft returns and attach it to the same
-   `driver-v<ver>` release (any file name; don't rename anything inside).
+   `driver-v<ver>` release (a `.zip` name of letters, digits and
+   `. _ + -`; don't rename anything inside).
 4. Run the **Driver attested** workflow (Actions tab; it auto-picks the
    newest pending release with a zip attached, or pass the tag). Same
    verification as the automatic path.
@@ -620,9 +648,10 @@ calling job must grant `contents: write`, `id-token: write` and
 `attestations: write`, the permissions `driver-attested.yml` declares.
 `Driver submission` needs no dry-run input: while a certified driver
 matches the current source hash its `certified-guard` job ends the run
-before anything is built. `Driver certified` has no dry-run mode; passing
-`ms_zip_asset` avoids the Hardware API but still rewrites the release's
-manifest.
+before anything is built. `Driver certified` with `dry_run=true` runs
+every check and changes no release; its Hardware API path (no
+`ms_zip_asset`) runs from main only, the hand-downloaded path from any
+branch.
 
 ## Future work
 

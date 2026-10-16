@@ -1,8 +1,8 @@
 name: Driver attest
 
 # Reconciles the newest driver-v* release toward Microsoft attestation via
-# the Partner Center Hardware API (spec: docs/superpowers/specs/
-# 2026-08-05-driver-attestation-automation-design.md). Idempotent: all state
+# the Partner Center Hardware API (runbook: docs/driver-signing.md).
+# Idempotent: all state
 # lives in the release's manifest.json (ms_product_id / ms_submission_id /
 # ms_state), IDs are persisted before any upload, and a re-run always resumes
 # from the recorded state — workflow_dispatch is the universal retry. All
@@ -11,8 +11,12 @@ name: Driver attest
 #
 # Secrets: AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — the
 # Entra app associated with the Partner Center account (docs/
-# driver-signing.md, one-time setup). Client secrets expire (≤24 months);
-# the failure mode is invalid_client from the token endpoint.
+# driver-signing.md, one-time setup), held by the `partner-center`
+# environment, whose deployment policy admits branch main alone: a workflow
+# edited on any other branch or tag can't read them. Only the reconcile job
+# runs in it; the dry run needs no credential and runs from any branch.
+# Client secrets expire (≤24 months); the failure mode is invalid_client
+# from the token endpoint.
 #
 # The automatic hand-off from Driver submission is OPT-IN: set the
 # repository variable AUTO_ATTEST=true (Settings → Secrets and variables →
@@ -41,8 +45,9 @@ on:
         required: false
         default: false
 
+# Read-only by default; reconcile and verify declare what they write.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: driver-attest
@@ -59,36 +64,58 @@ jobs:
       - run: |
           echo "::notice::Automatic attestation is OFF (repository variable AUTO_ATTEST != 'true'). Nothing was submitted to Microsoft. To attest the newest driver-v* release, run this workflow manually (Actions → Driver attest → Run workflow), or set AUTO_ATTEST=true to re-enable the hand-off from Driver submission."
 
-  reconcile:
-    # On workflow_run, only act when Driver submission succeeded (its
-    # sign-cab job completed → the EV-signed CAB is on the release) AND
-    # auto-attest is opted in. Manual dispatch always runs.
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && vars.AUTO_ATTEST == 'true')
+  # Wiring check only: no Partner Center call and no credential, so it can
+  # run from the branch a workflow change is made on.
+  dry-run:
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 5
     outputs:
-      verify_tag: ${{ steps.attest.outputs.verify_tag || steps.dry.outputs.verify_tag }}
-      dry_run: ${{ steps.dry.outputs.dry_run || 'false' }}
+      verify_tag: ${{ steps.dry.outputs.verify_tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Unit tests (guard)
         run: python3 -m unittest discover -s .github/scripts
 
       - name: Dry run (no Partner Center call)
         id: dry
-        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           tag="${INPUT_TAG:-driver-v1.1.0.204}"
+          [[ "$tag" =~ ^driver-v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag must be driver-v<version>"; exit 1; }
           echo "::notice::dry run - skipping the Hardware API; handing $tag to Driver attested in dry-run mode"
           echo "verify_tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "dry_run=true" >> "$GITHUB_OUTPUT"
+
+  reconcile:
+    # On workflow_run, only act when Driver submission succeeded (its
+    # sign-cab job completed → the EV-signed CAB is on the release) AND
+    # auto-attest is opted in. A manual dispatch runs unless it is a dry
+    # run. The environment admits main only: workflow_run runs from main,
+    # and a dispatch must be made from main.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && !inputs.dry_run) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && vars.AUTO_ATTEST == 'true')
+    runs-on: ubuntu-latest
+    environment: partner-center
+    timeout-minutes: 55
+    permissions:
+      contents: write            # records the submission state on the release
+    outputs:
+      verify_tag: ${{ steps.attest.outputs.verify_tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Unit tests (guard)
+        run: python3 -m unittest discover -s .github/scripts
 
       - name: Reconcile attestation state
         id: attest
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -98,8 +125,11 @@ jobs:
         run: python3 .github/scripts/attest.py
 
   verify:
-    needs: reconcile
-    if: needs.reconcile.outputs.verify_tag != ''
+    needs: [dry-run, reconcile]
+    # One of the two ran (the other is skipped); neither may have failed.
+    if: >-
+      !cancelled() && !contains(needs.*.result, 'failure') &&
+      (needs.reconcile.outputs.verify_tag != '' || needs.dry-run.outputs.verify_tag != '')
     uses: ./.github/workflows/driver-attested.yml
     # A caller must grant every permission the reusable workflow declares
     # (driver-attested.yml requests id-token + attestations for the
@@ -109,5 +139,5 @@ jobs:
       id-token: write
       attestations: write
     with:
-      tag: ${{ needs.reconcile.outputs.verify_tag }}
-      dry_run: ${{ needs.reconcile.outputs.dry_run == 'true' }}
+      tag: ${{ needs.reconcile.outputs.verify_tag || needs.dry-run.outputs.verify_tag }}
+      dry_run: ${{ needs.dry-run.result == 'success' }}

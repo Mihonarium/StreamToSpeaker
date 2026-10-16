@@ -7,7 +7,7 @@ upload the EV-signed CAB, commit, poll, fetch the signed zip), and records
 every transition back onto the release before acting on it — so a re-run
 always resumes cleanly and duplicate submissions are impossible.
 
-Spec: docs/superpowers/specs/2026-08-05-driver-attestation-automation-design.md
+Runbook: docs/driver-signing.md.
 Stdlib only; release asset I/O goes through the gh CLI.
 """
 import json

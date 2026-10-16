@@ -6,33 +6,52 @@ name: Driver certified
 # automated); this workflow turns Microsoft's return into a driver-v<ver>
 # release that build.yml bundles into installers:
 #
-#   fetch  (ubuntu)   poll the submission via the Hardware API until it is
-#                     completed with a signedPackage and download it — or
-#                     take a hand-downloaded zip already attached to the
-#                     release (ms_zip_asset). Cross-check it against the lab
-#                     package (INF byte-identical, .sys identical after
-#                     stripping signatures, Microsoft publisher present).
-#   verify (windows)  signtool: catalog verification with the kernel policy,
-#                     and a Microsoft Windows Hardware Compatibility
-#                     Publisher signature on the .sys at ANY index — for HLK
-#                     returns Microsoft nests its signature behind the lab's
-#                     test signature, which is why driver-attested.yml
-#                     (primary signer must be Microsoft) can't be reused.
-#                     Then publish the canonical -Signed.zip + manifest.json
-#                     (certified: true, certification ids) on the release.
+#   resolve      (ubuntu)   check the dispatch inputs (certified.py inputs;
+#                           every later step uses only the values it writes),
+#                           find the release (prepared by hand) and its lab
+#                           package, and check that `commit` has the release
+#                           tag's driver/ + include/ trees.
+#   download     (ubuntu)   Hardware API path only: poll the submission until
+#                           it is completed with a signedPackage, download it
+#                           and park it on the release. The only job that
+#                           holds the Partner Center credential: it runs in
+#                           the partner-center environment, which admits
+#                           branch main alone.
+#   cross-check  (ubuntu)   take Microsoft's zip (from download, or a
+#                           hand-downloaded zip already attached to the
+#                           release: ms_zip_asset) and check it against the
+#                           lab package (INF byte-identical, .sys identical
+#                           after stripping signatures, Microsoft publisher
+#                           present).
+#   verify       (windows)  signtool: catalog verification with the kernel
+#                           policy, and a Microsoft Windows Hardware
+#                           Compatibility Publisher signature on the .sys at
+#                           ANY index — for HLK returns Microsoft nests its
+#                           signature behind the lab's test signature, which
+#                           is why driver-attested.yml (primary signer must be
+#                           Microsoft) can't be reused. Then publish the
+#                           canonical -Signed.zip + manifest.json (certified:
+#                           true, certification ids) on the release.
 #
-# Dispatch it from the commit whose driver/** + include/** tree was
-# certified: the manifest records that commit and its hashFiles() source
-# hash, and installers only bundle the package while their driver tree
-# still hashes to the same value. The release must already carry the lab
-# package (INF/SYS/CAT exactly as tested, test-signed) as
-# StreamToSpeaker-Driver-<version>-lab-testsigned.zip — attach it by hand,
-# it is the reference everything is compared against.
+# The certified tree: `commit` (default: the commit this run is dispatched
+# on) names the commit whose driver/** + include/** tree was certified. The
+# manifest records it and its hashFiles() source hash, and installers only
+# bundle the package while their driver tree still hashes to the same value.
+# The scripts always come from the dispatched commit. The Hardware API path
+# runs from main only (the environment refuses other refs), so give `commit`
+# when the certified commit isn't main's head; a hand-downloaded zip
+# (ms_zip_asset) needs no credential and runs from any branch. The release
+# must already carry the lab package (INF/SYS/CAT exactly as tested,
+# test-signed) as StreamToSpeaker-Driver-<version>-lab-testsigned.zip —
+# attach it by hand, it is the reference everything is compared against.
 #
-# Secrets: AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET (same
-# Entra app as Driver attest); not needed when ms_zip_asset is given.
+# dry_run: every check runs and every release stays as it is — none is
+# created, uploaded to or changed — and the Hardware API path only reads.
+#
+# Secrets (environment partner-center): AZURE_TENANT_ID / AZURE_CLIENT_ID /
+# AZURE_CLIENT_SECRET, the same Entra app as Driver attest.
 
-run-name: "Driver certified · ${{ inputs.version }}"
+run-name: "Driver certified · ${{ inputs.version }}${{ inputs.dry_run && ' · dry run' || '' }}"
 
 on:
   workflow_dispatch:
@@ -40,6 +59,10 @@ on:
       version:
         description: "Certified driver version (INF DriverVer), e.g. 1.1.0.209"
         required: true
+      commit:
+        description: "Full SHA of the commit whose driver/** + include/** tree was certified (default: the commit this run is dispatched on)"
+        required: false
+        default: ""
       product_id:
         description: "Partner Center product id of the HLK submission (leave empty with ms_zip_asset)"
         required: false
@@ -65,128 +88,237 @@ on:
         required: false
         default: "WINDOWS_v100_X64_25H2_FULL"
       tag:
-        description: "Release tag (default: driver-v<version>)"
+        description: "Release tag (empty or driver-v<version>)"
         required: false
         default: ""
+      dry_run:
+        description: "Run every check and leave every release as it is (none is created, uploaded to or changed); the Hardware API is only read"
+        type: boolean
+        required: false
+        default: false
 
+# Read-only by default; each job declares what it writes.
 permissions:
-  contents: write
-  id-token: write            # build-provenance attestation (public repo only)
-  attestations: write
+  contents: read
 
+# Dry runs have a group of their own: a queued dry run must not replace a
+# queued real run.
 concurrency:
-  group: driver-certified-${{ inputs.version }}
+  group: driver-certified-${{ inputs.version }}${{ inputs.dry_run && '-dry-run' || '' }}
   cancel-in-progress: false
 
 jobs:
-  fetch:
+  resolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
     outputs:
-      tag: ${{ steps.rel.outputs.tag }}
-      ms_zip: ${{ steps.rel.outputs.ms_zip }}
-      lab_zip: ${{ steps.rel.outputs.lab_zip }}
-      product_id: ${{ steps.rel.outputs.product_id }}
-      submission_id: ${{ steps.rel.outputs.submission_id }}
+      version: ${{ steps.inputs.outputs.version }}
+      tag: ${{ steps.inputs.outputs.tag }}
+      commit: ${{ steps.inputs.outputs.commit }}
+      mode: ${{ steps.inputs.outputs.mode }}
+      ms_zip: ${{ steps.inputs.outputs.ms_zip }}
+      lab_zip: ${{ steps.inputs.outputs.lab_zip }}
+      product_id: ${{ steps.inputs.outputs.product_id }}
+      submission_id: ${{ steps.inputs.outputs.submission_id }}
+      report_id: ${{ steps.inputs.outputs.report_id }}
+      os: ${{ steps.inputs.outputs.os }}
+      dry_run: ${{ steps.inputs.outputs.dry_run }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Unit tests (guard)
         run: python3 -m unittest discover -s .github/scripts
 
-      - name: Resolve release + inputs
-        id: rel
+      # The only step that reads the dispatch inputs.
+      - name: Check inputs
+        id: inputs
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_COMMIT: ${{ inputs.commit }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_MS_ZIP: ${{ inputs.ms_zip_asset }}
           INPUT_LAB_ZIP: ${{ inputs.lab_zip_asset }}
           INPUT_PRODUCT: ${{ inputs.product_id }}
           INPUT_SUBMISSION: ${{ inputs.submission_id }}
-        run: |
-          set -euo pipefail
-          [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be MAJOR.MINOR.BUILD.REVISION, got '$INPUT_VERSION'"; exit 1; }
-          tag="${INPUT_TAG:-driver-v$INPUT_VERSION}"
-          lab="${INPUT_LAB_ZIP:-StreamToSpeaker-Driver-$INPUT_VERSION-lab-testsigned.zip}"
-          if [[ -z "$INPUT_MS_ZIP" && ( -z "$INPUT_PRODUCT" || -z "$INPUT_SUBMISSION" ) ]]; then
-            echo "::error::give product_id + submission_id (Hardware API) or ms_zip_asset (hand-downloaded zip on the release)"; exit 1
-          fi
-          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Creating prerelease $tag at $GITHUB_SHA"
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
-              --title "Driver $INPUT_VERSION — WHQL certification in progress" \
-              --notes "Certified driver $INPUT_VERSION: assets being published by the Driver certified workflow."
-          fi
-          if ! gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$lab" --output "$lab" --clobber; then
-            echo "::error::release $tag has no '$lab' - attach the lab package (INF/SYS/CAT exactly as tested, test-signed) under that name and re-run"; exit 1
-          fi
-          {
-            echo "tag=$tag"
-            echo "lab_zip=$lab"
-            echo "ms_zip=${INPUT_MS_ZIP:-StreamToSpeaker-Driver-$INPUT_VERSION-Microsoft.zip}"
-            echo "product_id=$INPUT_PRODUCT"
-            echo "submission_id=$INPUT_SUBMISSION"
-          } >> "$GITHUB_OUTPUT"
+          INPUT_REPORT: ${{ inputs.report_id }}
+          INPUT_OS: ${{ inputs.os }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: python3 .github/scripts/certified.py inputs
 
-      - name: Take the hand-downloaded Microsoft zip from the release
-        if: inputs.ms_zip_asset != ''
+      - name: Find the release, its lab package and the certified tree
+        env:
+          TAG: ${{ steps.inputs.outputs.tag }}
+          COMMIT: ${{ steps.inputs.outputs.commit }}
+          LAB_ZIP: ${{ steps.inputs.outputs.lab_zip }}
         run: |
           set -euo pipefail
-          gh release download "${{ steps.rel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" \
-            --pattern "${{ steps.rel.outputs.ms_zip }}" --output "${{ steps.rel.outputs.ms_zip }}" --clobber
+          # The release is prepared by hand (Flow D step 3): its tag on the
+          # certified commit, the lab package attached. A release created
+          # here would have neither, and its tag on `commit` would make the
+          # tree check below compare `commit` with itself.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG doesn't exist - create it as a prerelease targeting the certified commit and attach $LAB_ZIP (Flow D step 3)"; exit 1
+          fi
+          failed=0
+          # The tree recorded must be the release's: `commit` and the commit
+          # the tag points to must have the same driver/ and include/ trees.
+          # Otherwise the manifest would record a source hash that isn't the
+          # certified binary's, e.g. main's head on a run from main with
+          # `commit` left empty.
+          tree() { gh api "repos/$GITHUB_REPOSITORY/git/trees/$1" --jq '[.tree[] | select(.path == "driver" or .path == "include") | "\(.path)=\(.sha)"] | sort | join(" ")'; }
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha) || { echo "::error::can't resolve tag $TAG to a commit"; exit 1; }
+          want=$(tree "$tagged") || { echo "::error::can't read the tree of $TAG ($tagged)"; exit 1; }
+          have=$(tree "$COMMIT") || { echo "::error::can't read the tree of commit $COMMIT (is it in $GITHUB_REPOSITORY?)"; exit 1; }
+          [[ "$want" == *driver=* ]] || { echo "::error::$TAG ($tagged) has no driver/ tree"; exit 1; }
+          if [[ "$have" != "$want" ]]; then
+            echo "::error::$COMMIT's driver/ and include/ trees aren't those of $TAG ($tagged) - pass commit=<the certified commit>"; failed=1
+          fi
+          if ! gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$LAB_ZIP" --output "$LAB_ZIP" --clobber; then
+            echo "::error::release $TAG has no '$LAB_ZIP' - attach the lab package (INF/SYS/CAT exactly as tested, test-signed) under that name and re-run"; failed=1
+          fi
+          exit "$failed"
+
+  download:
+    # Hardware API path only. The partner-center environment admits branch
+    # main alone: dispatched from any other ref, this job is refused before
+    # it starts.
+    needs: resolve
+    if: needs.resolve.outputs.mode == 'api'
+    runs-on: ubuntu-latest
+    environment: partner-center
+    timeout-minutes: 60
+    permissions:
+      contents: write            # parks Microsoft's zip on the release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      MS_ZIP: ${{ needs.resolve.outputs.ms_zip }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Fetch the signed package from Partner Center
-        if: inputs.ms_zip_asset == ''
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          PRODUCT_ID: ${{ needs.resolve.outputs.product_id }}
+          SUBMISSION_ID: ${{ needs.resolve.outputs.submission_id }}
         run: |
           set -euo pipefail
           python3 .github/scripts/certified.py fetch \
-            --product-id "${{ steps.rel.outputs.product_id }}" \
-            --submission-id "${{ steps.rel.outputs.submission_id }}" \
-            --out "${{ steps.rel.outputs.ms_zip }}"
-          # Park Microsoft's zip on the release as-is (the audit trail);
-          # the canonical package is published by the verify job.
-          gh release upload "${{ steps.rel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" "${{ steps.rel.outputs.ms_zip }}" --clobber
+            --product-id "$PRODUCT_ID" --submission-id "$SUBMISSION_ID" --out "$MS_ZIP"
+
+      # Microsoft's zip as returned, on the release (the audit trail); the
+      # canonical package is published by the verify job.
+      - name: Park Microsoft's zip on the release
+        if: needs.resolve.outputs.dry_run != 'true'
+        run: gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$MS_ZIP" --clobber
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: microsoft-zip
+          path: ${{ needs.resolve.outputs.ms_zip }}
+          if-no-files-found: error
+          retention-days: 7
+
+  cross-check:
+    needs: [resolve, download]
+    # download is skipped on the hand-downloaded path; it must not have
+    # failed.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.download.result == 'success' || needs.download.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      MS_ZIP: ${{ needs.resolve.outputs.ms_zip }}
+      LAB_ZIP: ${{ needs.resolve.outputs.lab_zip }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Take the hand-downloaded Microsoft zip from the release
+        if: needs.resolve.outputs.mode == 'asset'
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$MS_ZIP" --output "$MS_ZIP" --clobber
+
+      - name: Take Microsoft's zip from the download job
+        if: needs.resolve.outputs.mode == 'api'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: microsoft-zip
+
+      - name: Take the lab package from the release
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$LAB_ZIP" --output "$LAB_ZIP" --clobber
 
       - name: Cross-check Microsoft's zip against the lab package
-        run: |
-          python3 .github/scripts/certified.py verify \
-            --ms-zip "${{ steps.rel.outputs.ms_zip }}" --lab-zip "${{ steps.rel.outputs.lab_zip }}" \
-            --version "${{ inputs.version }}"
+        run: python3 .github/scripts/certified.py verify --ms-zip "$MS_ZIP" --lab-zip "$LAB_ZIP" --version "$VERSION"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: certified-packages
           path: |
-            ${{ steps.rel.outputs.ms_zip }}
-            ${{ steps.rel.outputs.lab_zip }}
+            ${{ needs.resolve.outputs.ms_zip }}
+            ${{ needs.resolve.outputs.lab_zip }}
           if-no-files-found: error
           retention-days: 7
 
   verify:
-    needs: fetch
+    needs: [resolve, cross-check]
+    # Explicit: on the hand-downloaded path the skipped download job would
+    # carry down the needs chain and skip this job under the default
+    # condition.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.cross-check.result == 'success' }}
     # windows-2022, not windows-latest: hashFiles() depends on the checkout
     # (CRLF conversion + NTFS directory order) and must equal what
     # build.yml records on its windows-2022 runner, or installers never
     # pair with this package.
     runs-on: windows-2022
     timeout-minutes: 30
+    permissions:
+      contents: write            # publishes the package and manifest
+      id-token: write            # build-provenance attestation (public repo only)
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      COMMIT: ${{ needs.resolve.outputs.commit }}
+      MS_ZIP: ${{ needs.resolve.outputs.ms_zip }}
+      LAB_ZIP: ${{ needs.resolve.outputs.lab_zip }}
+      PRODUCT_ID: ${{ needs.resolve.outputs.product_id }}
+      SUBMISSION_ID: ${{ needs.resolve.outputs.submission_id }}
+      REPORT_ID: ${{ needs.resolve.outputs.report_id }}
+      SIGNATURES: ${{ needs.resolve.outputs.os }}
     steps:
+      # The certified tree at the workspace root, for hashFiles(), then this
+      # run's own scripts beside it. In this order: the root checkout cleans
+      # the workspace and would delete a folder checked out before it.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: _scripts
+          sparse-checkout: .github/scripts
+          persist-credentials: false
 
       - name: Compute driver source hash
         id: srchash
         shell: pwsh
+        env:
+          SOURCE_HASH: ${{ hashFiles('driver/**', 'include/**') }}
         run: |
-          "hash=${{ hashFiles('driver/**', 'include/**') }}" >> $env:GITHUB_OUTPUT
-          Write-Host "Driver source hash of ${{ github.sha }}: ${{ hashFiles('driver/**', 'include/**') }}"
+          "hash=$env:SOURCE_HASH" >> $env:GITHUB_OUTPUT
+          Write-Host "Driver source hash of ${env:COMMIT}: $env:SOURCE_HASH"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -197,7 +329,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Expand-Archive "packages\${{ needs.fetch.outputs.ms_zip }}" -DestinationPath ms-signed -Force
+          Expand-Archive "packages\$env:MS_ZIP" -DestinationPath ms-signed -Force
           $sysFiles = @(Get-ChildItem ms-signed -Recurse -Filter "StreamToSpeaker.sys")
           if ($sysFiles.Count -ne 1) { throw "expected exactly one StreamToSpeaker.sys in Microsoft's zip, found $($sysFiles.Count)" }
           $sys = $sysFiles[0]
@@ -236,30 +368,50 @@ jobs:
       - name: Cross-check against the lab package (INF + stripped .sys)
         shell: pwsh
         run: |
-          python .github/scripts/certified.py verify `
-            --ms-zip "packages\${{ needs.fetch.outputs.ms_zip }}" --lab-zip "packages\${{ needs.fetch.outputs.lab_zip }}" `
-            --version "${{ inputs.version }}"
+          python _scripts\.github\scripts\certified.py verify `
+            --ms-zip "packages\$env:MS_ZIP" --lab-zip "packages\$env:LAB_ZIP" --version $env:VERSION
           if ($LASTEXITCODE -ne 0) { throw "package cross-check failed" }
+
+      - name: Dry run - checks passed, releases left as they are
+        if: needs.resolve.outputs.dry_run == 'true'
+        shell: pwsh
+        env:
+          SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
+        run: |
+          Write-Host "::notice::dry run - $env:TAG checks passed (signtool + lab package cross-check); no release was changed"
+          @(
+            "## Driver certified - dry run of ``$env:TAG`` passed (no release changed)"
+            ""
+            "| | |"
+            "| --- | --- |"
+            "| Commit | ``$env:COMMIT`` |"
+            "| Driver source hash | ``$env:SOURCE_HASH`` |"
+          ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       - name: Publish canonical package + manifest (certified=true)
         id: publish
+        if: needs.resolve.outputs.dry_run != 'true'
         shell: pwsh
+        env:
+          SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
         run: |
-          $args = @(
+          # Quoted, so an empty id (the ms_zip_asset path may have none)
+          # still reaches python as an empty argument.
+          $cmd = @(
             "release",
-            "--repo", "${{ github.repository }}",
-            "--tag", "${{ needs.fetch.outputs.tag }}",
-            "--version", "${{ inputs.version }}",
-            "--commit", "${{ github.sha }}",
-            "--source-hash", "${{ steps.srchash.outputs.hash }}",
-            "--product-id", "${{ needs.fetch.outputs.product_id || inputs.product_id }}",
-            "--submission-id", "${{ needs.fetch.outputs.submission_id || inputs.submission_id }}",
-            "--os", "${{ inputs.os }}",
-            "--ms-zip", "packages\${{ needs.fetch.outputs.ms_zip }}",
-            "--lab-zip", "packages\${{ needs.fetch.outputs.lab_zip }}"
+            "--repo", "$env:GITHUB_REPOSITORY",
+            "--tag", "$env:TAG",
+            "--version", "$env:VERSION",
+            "--commit", "$env:COMMIT",
+            "--source-hash", "$env:SOURCE_HASH",
+            "--product-id", "$env:PRODUCT_ID",
+            "--submission-id", "$env:SUBMISSION_ID",
+            "--os", "$env:SIGNATURES",
+            "--ms-zip", "packages\$env:MS_ZIP",
+            "--lab-zip", "packages\$env:LAB_ZIP"
           )
-          if ("${{ inputs.report_id }}") { $args += @("--report-id", "${{ inputs.report_id }}") }
-          python .github/scripts/certified.py @args
+          if ($env:REPORT_ID) { $cmd += @("--report-id", $env:REPORT_ID) }
+          python _scripts\.github\scripts\certified.py @cmd
           if ($LASTEXITCODE -ne 0) { throw "publishing the certified release failed" }
 
       # Provenance for the canonical driver package (bytes are final here).
@@ -267,16 +419,19 @@ jobs:
       #   gh attestation verify StreamToSpeaker-Driver-<ver>-Signed.zip -R ${{ github.repository }}
       - name: Attest build provenance (public repo only)
         id: attest
-        if: ${{ !github.event.repository.private }}
+        if: ${{ !github.event.repository.private && needs.resolve.outputs.dry_run != 'true' }}
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: ${{ steps.publish.outputs.signed_zip }}
 
       - name: Publish the attestation bundle
-        if: ${{ !github.event.repository.private }}
+        if: ${{ !github.event.repository.private && needs.resolve.outputs.dry_run != 'true' }}
         shell: pwsh
+        env:
+          SIGNED_ZIP: ${{ steps.publish.outputs.signed_zip }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
-          $bundle = "${{ steps.publish.outputs.signed_zip }}.sigstore.json"
-          Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
-          gh release upload "${{ needs.fetch.outputs.tag }}" --repo "${{ github.repository }}" $bundle --clobber
+          $bundle = "$env:SIGNED_ZIP.sigstore.json"
+          Copy-Item $env:BUNDLE_PATH $bundle
+          gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY $bundle --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
