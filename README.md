@@ -53,16 +53,30 @@ on* in this computer's player settings there, or play the input from Browse.
 
 Closing the window minimises to the tray; quit from the tray menu.
 
-Speakers that stream over UPnP fetch the PC's audio from a plain HTTP URL, so
-by default anyone on the same network who knows the URL can listen in.
+Speakers that stream over UPnP fetch the PC's audio from a plain HTTP URL on
+the PC. By default any device on the same network can play whatever the PC
+plays from that URL, from the moment the app starts (before you pick a
+speaker) and whichever speaker you play on — AirPlay, HomePod, Sendspin and
+Music Assistant included — unless you turn streaming off.
 **Advanced → Privacy mode** serves that URL only to the speaker you're
-streaming to: its addresses are allowed for as long as its session lasts, and
+streaming to and the other speakers of its Sonos group (as grouped when you
+picked it): their addresses are allowed for as long as the session lasts, and
 switching speakers cuts off anything still listening from the old one. A
-refused device is named in a message, so you can tell a phone from a Sonos
-group member (in a group, the coordinator is the unit that fetches the
-stream — pick that one, or turn privacy mode off). Note that the web UI, if
-enabled, lets anyone on your network pick a different speaker, which defeats
-privacy mode; the app warns when both are on.
+refused device is named in a message, so you can tell a phone from a speaker;
+if a speaker stays silent (one grouped after you picked the group, say), pick
+it again or turn privacy mode off. AirPlay, Sendspin and Music Assistant
+playback doesn't use the URL, so privacy mode never affects it. Disabling
+streaming or forgetting the speaker closes the URL to every other device
+either way.
+
+**Web UI:** to switch speakers or nudge latency from your phone, click *Enable
+web UI* in the *Web UI* card and open the link it shows (*Copy link*, or *Open
+in browser* on the PC). The link holds a secret key, so anyone with it can
+control the app on your network; *Make a new link* replaces it, and the old one
+stops working. Running headless or as a service, with no window to show the
+link, `stream-to-speaker.exe --web-link` prints it; run it as the Windows
+account the app runs under. Scripts send the same key with every API call —
+see [TECHNICAL.md](TECHNICAL.md#http-api).
 
 Once a day the app asks GitHub whether a newer release exists and, if so,
 shows a link to it. Nothing is downloaded or installed by itself. Turn the
@@ -73,8 +87,13 @@ check off under **Advanced** if you'd rather not.
 ```
 --headless                No GUI; run as a CLI service.
 --no-tray                 GUI window only, no tray icon.
---web                     Enable the HTTP/JSON API + web UI. Off by default;
-                          when off, only /stream.raw is served.
+--web                     Enable the web UI + HTTP/JSON API, both behind a
+                          secret link (shown in the window; printed once at
+                          start with --headless). Off by default; when off,
+                          only /stream.raw is served.
+--web-link                Print the web UI's link and exit — for headless and
+                          service installs. Run it as the account the app
+                          runs under, with the app's --port / --advertise-ip.
 
 --source <auto|driver|wasapi-loopback|sine>
                           Audio input. Default 'auto': kernel driver, falling

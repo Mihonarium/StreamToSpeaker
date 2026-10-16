@@ -5,7 +5,8 @@
 //!      speakers (plus the `HEAD` probe Sonos sends first).
 //!   2. `NOTIFY ...` — GENA event callbacks from the speaker we hold a
 //!      subscription with.
-//!   3. The optional web UI and JSON API (`/`, `/app.js`, `/api/*`).
+//!   3. The optional web UI and JSON API (`/r/<key>/`, `/api/*`), both
+//!      needing the key in the web UI's link (see `web_access`).
 //!
 //! The PCM stream is fed by a single producer thread (audio path) that
 //! broadcasts each packet to all current subscribers via a fan-out.
@@ -21,15 +22,16 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{debug, info, warn};
+use serde::Serialize;
 use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::gena::{self, NotifyAdmission};
-use crate::stream_gate::canonical_ip;
+use crate::stream_gate::{canonical_ip, Refusal};
+use crate::web_access::{redact_target, WebAccess, LINK_PREFIX};
 use crate::{WIRE_BYTES_PER_FRAME, WIRE_CHANNELS, WIRE_SAMPLE_RATE};
 
 /// Callback invoked from the GENA NOTIFY route with the request path and
@@ -77,10 +79,18 @@ pub type ResyncCallback = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 /// counter so the caller can see how much remains to be applied.
 pub type LatencyAdjustCallback = Arc<dyn Fn(i32) -> i64 + Send + Sync>;
 
-/// Callback deciding whether a client IP may fetch `/stream.raw`
-/// (privacy mode). Consulted per request, so the user can flip the
-/// setting or switch speakers without re-binding the socket.
-pub type StreamClientAllowedCallback = Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>;
+/// Callback deciding whether a client IP may fetch `/stream.raw` (the
+/// stream gate: streaming enabled, privacy mode), and if not, why: the
+/// refused device and the log are told which rule it was. Consulted per
+/// request and once a second per open stream, so the user can disable
+/// streaming, flip the setting or switch speakers without re-binding the
+/// socket.
+pub type StreamClientAllowedCallback =
+    Arc<dyn Fn(std::net::IpAddr) -> Result<(), Refusal> + Send + Sync>;
+
+/// Callback answering whether a client IP is the active speaker's (see
+/// [`HttpServerConfig::speaker_peer`]).
+pub type SpeakerPeerCallback = Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>;
 
 /// One PCM packet to broadcast to subscribers. Pre-encoded as bytes so the
 /// audio thread does the conversion once.
@@ -150,9 +160,10 @@ impl StreamHub {
 
     /// Disconnect the HTTP stream clients whose peer IP matches `pred`.
     /// Dropping a subscriber's Sender makes its `StreamReader` return
-    /// EOF, which closes the connection. Used when privacy mode turns
-    /// on, so a listener connected *before* the flip doesn't keep
-    /// receiving audio forever. Returns how many were cut.
+    /// EOF, which closes the connection. Used when the stream gate stops
+    /// admitting someone (streaming disabled, privacy turned on, speaker
+    /// switched), so a listener connected *before* that doesn't keep
+    /// receiving audio. Returns how many were cut.
     pub fn disconnect_clients(&self, pred: impl Fn(std::net::IpAddr) -> bool) -> usize {
         let mut subs = self.subscribers.lock().unwrap();
         let before = subs.len();
@@ -186,13 +197,14 @@ pub struct HttpServerConfig {
     /// If set, exposes `POST /api/latency/adjust?ms=N` for gradual
     /// runtime latency trim / pad.
     pub latency_adjust: Option<LatencyAdjustCallback>,
-    /// Runtime gate on the user-facing routes (`/`, `/app.js`,
-    /// `/api/*`). The `/stream.raw` route is always served regardless —
-    /// the speaker can't function without it. `None` ⇒ web UI always on.
-    pub web_ui_enabled: Option<Arc<AtomicBool>>,
-    /// If set, GET/HEAD `/stream.raw` is only served when this returns
-    /// `true` for the client's IP — the privacy-mode gate. `None` ⇒
-    /// the stream is served to anyone who connects.
+    /// The web page (under `/r/<key>/`) and the JSON API (`/api/*`):
+    /// whether they are on, and the key they need (see `web_access`).
+    /// The `/stream.raw` route is always served regardless — the speaker
+    /// can't function without it. `None` ⇒ no web page or API.
+    pub web_access: Option<Arc<WebAccess>>,
+    /// If set, GET/HEAD `/stream.raw` is only served when this admits the
+    /// client's IP — the stream gate. `None` ⇒ the stream is served to
+    /// anyone who connects.
     pub stream_client_allowed: Option<StreamClientAllowedCallback>,
     /// Host names / addresses accepted in the `Host` header on top of
     /// `localhost`, this machine's name, the bound address and every
@@ -202,7 +214,7 @@ pub struct HttpServerConfig {
     /// True for the active speaker's addresses. Their connections are
     /// exempt from the shared connection budget, so other clients can't
     /// lock the speaker out.
-    pub speaker_peer: Option<StreamClientAllowedCallback>,
+    pub speaker_peer: Option<SpeakerPeerCallback>,
 }
 
 impl HttpServerConfig {
@@ -215,7 +227,7 @@ impl HttpServerConfig {
             speaker_select: None,
             resync: None,
             latency_adjust: None,
-            web_ui_enabled: None,
+            web_access: None,
             stream_client_allowed: None,
             extra_hosts: Vec::new(),
             speaker_peer: None,
@@ -258,9 +270,9 @@ const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 /// out of its SUBSCRIBE response; wait this long for it to register.
 const NOTIFY_SUBSCRIBE_WAIT: Duration = Duration::from_secs(3);
 
-/// Content-Security-Policy for the status page: scripts only from
-/// `/app.js` (no inline script, so markup injected through a speaker
-/// name or id can't run), requests only to this origin.
+/// Content-Security-Policy for the status page: scripts only from this
+/// server, i.e. the page's `app.js` (no inline script, so markup injected
+/// through a speaker name or id can't run), requests only to this origin.
 const STATUS_PAGE_CSP: &str = "default-src 'none'; script-src 'self'; connect-src 'self'; \
      style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
@@ -285,7 +297,7 @@ pub fn start_http_server(cfg: HttpServerConfig) -> Result<u16> {
         speaker_select: cfg.speaker_select,
         resync: cfg.resync,
         latency_adjust: cfg.latency_adjust,
-        web_ui_enabled: cfg.web_ui_enabled,
+        web_access: cfg.web_access,
         stream_client_allowed: cfg.stream_client_allowed,
         speaker_peer: cfg.speaker_peer,
         notify_lock: Mutex::new(()),
@@ -309,9 +321,9 @@ struct Ctx {
     speaker_select: Option<SpeakerSelectCallback>,
     resync: Option<ResyncCallback>,
     latency_adjust: Option<LatencyAdjustCallback>,
-    web_ui_enabled: Option<Arc<AtomicBool>>,
+    web_access: Option<Arc<WebAccess>>,
     stream_client_allowed: Option<StreamClientAllowedCallback>,
-    speaker_peer: Option<StreamClientAllowedCallback>,
+    speaker_peer: Option<SpeakerPeerCallback>,
     hosts: HostPolicy,
     /// Event callbacks run one at a time, in arrival order, as they did
     /// when a single thread served every request.
@@ -457,7 +469,7 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, speaker: bool, ctx: &C
             }
         };
         timeout = IDLE_TIMEOUT;
-        debug!("http request: {} {}", head.method, head.target);
+        debug!("http request: {} {}", head.method, redact_target(&head.target));
         if !ctx.handle(&mut conn, &head) {
             return;
         }
@@ -477,7 +489,7 @@ impl Ctx {
             info!(
                 "http: refused {} {} from {}: unrecognised Host {:?}",
                 head.method,
-                path,
+                redact_target(path),
                 conn.peer.ip(),
                 head.header("host").unwrap_or("")
             );
@@ -509,31 +521,13 @@ impl Ctx {
                 }
             }
             ("GET", "/healthz") => Reply::text(200, "ok"),
-            ("GET", "/") if self.web_ui_on() => self.status_page(),
-            ("GET", "/app.js") if self.web_ui_on() => Reply {
-                status: 200,
-                content_type: Some("application/javascript; charset=utf-8"),
-                headers: vec![("X-Content-Type-Options", "nosniff".into())],
-                body: STATUS_PAGE_JS.as_bytes().to_vec(),
-            },
-            ("GET", "/api/speakers") if self.web_ui_on() => self.speakers_json(),
-            ("POST", "/api/select" | "/api/resync" | "/api/latency/adjust") if self.web_ui_on() => {
-                if let Some(why) = cross_site_refusal(head) {
-                    info!("http: refused POST {} from {}: {}", path, conn.peer.ip(), why);
-                    Reply::json(403, format!(r#"{{"error":{}}}"#, json_string(why)))
-                } else {
-                    match path {
-                        "/api/select" => self.select(conn, head, &mut body_read),
-                        "/api/resync" => self.resync(),
-                        _ => self.latency_adjust(&head.target),
-                    }
-                }
+            // `/`, `/app.js` and everything under the link's prefix,
+            // whatever the key.
+            ("GET", p) if p == "/" || p == "/app.js" || p.starts_with(LINK_PREFIX) => self.page(p),
+            ("GET", "/api/speakers")
+            | ("POST", "/api/select" | "/api/resync" | "/api/latency/adjust") => {
+                self.api(conn, head, path, &mut body_read)
             }
-            ("GET", "/" | "/app.js" | "/api/speakers")
-            | ("POST", "/api/select" | "/api/resync" | "/api/latency/adjust") => Reply::json(
-                404,
-                r#"{"error":"web UI is disabled — enable it in the GUI"}"#.to_string(),
-            ),
             (m, _) if m.eq_ignore_ascii_case("NOTIFY") => self.notify(conn, head, path, &mut body_read),
             _ => Reply::text(404, "not found"),
         };
@@ -545,22 +539,86 @@ impl Ctx {
         written.is_ok() && reusable
     }
 
-    fn web_ui_on(&self) -> bool {
-        self.web_ui_enabled.as_ref().map(|g| g.load(Ordering::Acquire)).unwrap_or(true)
+    /// The web access state, while the web UI is on.
+    fn web_on(&self) -> Option<&WebAccess> {
+        self.web_access.as_deref().filter(|a| a.is_enabled())
     }
 
-    /// Privacy-mode gate for `/stream.raw`: `None` when the client may
-    /// proceed, else the 403 to send.
+    /// The web page. It lives at `/r/<key>/`, its script at
+    /// `/r/<key>/app.js`; `/`, `/app.js` and a wrong key get a page saying
+    /// where the link is.
+    fn page(&self, path: &str) -> Reply {
+        let Some(access) = self.web_on() else {
+            return Reply::html(404, WEB_UI_OFF_HTML);
+        };
+        let Some(rest) = path.strip_prefix(LINK_PREFIX) else {
+            return Reply::link_needed();
+        };
+        let (key, sub) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+        if !access.path_key_ok(key) {
+            return Reply::link_needed();
+        }
+        let reply = match sub {
+            // The page's script is addressed relative to the page.
+            "" => Reply {
+                status: 308,
+                content_type: None,
+                headers: vec![("Location", format!("{LINK_PREFIX}{key}/"))],
+                body: Vec::new(),
+            },
+            "/" => self.status_page(),
+            "/app.js" => Reply {
+                status: 200,
+                content_type: Some("application/javascript; charset=utf-8"),
+                headers: vec![("X-Content-Type-Options", "nosniff".into())],
+                body: STATUS_PAGE_JS.as_bytes().to_vec(),
+            },
+            _ => Reply::text(404, "not found"),
+        };
+        reply.private()
+    }
+
+    /// The JSON API. Every route needs the web UI's key as a bearer token;
+    /// the state-changing ones are also refused to other sites' pages.
+    fn api(&self, conn: &mut Conn, head: &Head, path: &str, body_read: &mut bool) -> Reply {
+        let Some(access) = self.web_on() else {
+            return Reply::error(404, "web UI is disabled — enable it in the GUI");
+        };
+        if !access.bearer_ok(head.header("authorization")) {
+            debug!("http: refused {} {} from {}: no valid API key", head.method, path, conn.peer.ip());
+            // Script authors read this body raw (curl prints it as it
+            // comes), so it holds nothing JSON or `html_safe` escapes: the
+            // angle brackets of a `<key>` placeholder would reach them as
+            // six-character escapes. ASCII only, for consoles that don't
+            // show UTF-8.
+            return Reply::unauthorized(
+                "missing or wrong API key: send the header 'Authorization: Bearer' followed by a \
+                 space and the key, the 32 hex digits after /r/ in the web UI's link. The Stream \
+                 To Speaker window shows the link in its Web UI card, and stream-to-speaker.exe \
+                 --web-link prints it",
+            );
+        }
+        if head.method == "GET" {
+            return self.speakers_json();
+        }
+        if let Some(why) = cross_site_refusal(head) {
+            info!("http: refused POST {} from {}: {}", path, conn.peer.ip(), why);
+            return Reply::error(403, why);
+        }
+        match path {
+            "/api/select" => self.select(conn, head, body_read),
+            "/api/resync" => self.resync(),
+            _ => self.latency_adjust(&head.target),
+        }
+    }
+
+    /// The stream gate for `/stream.raw`: `None` when the client may
+    /// proceed, else the 403 to send, which says why, as the log does.
     fn check_stream_client(&self, peer: IpAddr, method: &str) -> Option<Reply> {
         let cb = self.stream_client_allowed.as_ref()?;
-        if cb(peer) {
-            return None;
-        }
-        info!("privacy mode: refused {} /stream.raw from {}", method, peer);
-        Some(Reply::text(
-            403,
-            "forbidden: privacy mode is on — the audio stream is only served to the active speaker",
-        ))
+        let refusal = cb(peer).err()?;
+        info!("stream: refused {} /stream.raw from {}: {}", method, peer, refusal.reason());
+        Some(Reply::text(403, &format!("forbidden: {}", refusal.reason())))
     }
 
     /// GENA event callback. Accepted only when the SID names a
@@ -589,9 +647,11 @@ impl Ctx {
         };
         *body_read = true;
         let body = String::from_utf8_lossy(&body);
+        // The path is only ever logged.
+        let path = redact_target(path);
         if let Some(cb) = &self.gena_callback {
             let _serial = self.notify_lock.lock().unwrap();
-            cb(path, &body);
+            cb(&path, &body);
         } else {
             debug!("NOTIFY received but no callback registered; path={}", path);
         }
@@ -633,16 +693,18 @@ impl Ctx {
     }
 
     fn speakers_json(&self) -> Reply {
-        let json = match &self.speaker_list {
-            Some(cb) => speakers_to_json(&cb()),
-            None => "{\"speakers\": [], \"error\": \"discovery disabled\"}".to_string(),
-        };
-        Reply::json(200, json)
+        match &self.speaker_list {
+            Some(cb) => Reply::json(200, &speaker_list(&cb())),
+            None => Reply::json(
+                200,
+                &SpeakerList { speakers: Vec::new(), error: Some("discovery disabled") },
+            ),
+        }
     }
 
     fn select(&self, conn: &mut Conn, head: &Head, body_read: &mut bool) -> Reply {
         if !is_json_content_type(head.header("content-type")) {
-            return Reply::json(415, r#"{"error":"Content-Type must be application/json"}"#.into());
+            return Reply::error(415, "Content-Type must be application/json");
         }
         let body = match read_body(conn, head, MAX_API_BODY) {
             Ok(b) => b,
@@ -651,51 +713,51 @@ impl Ctx {
         *body_read = true;
         let body = String::from_utf8_lossy(&body);
         let Some(id) = extract_json_string(&body, "id") else {
-            return Reply::json(400, r#"{"error":"missing 'id' field"}"#.into());
+            return Reply::error(400, "missing 'id' field");
         };
         let Some(cb) = &self.speaker_select else {
-            return Reply::json(503, r#"{"error":"speaker switching unavailable"}"#.into());
+            return Reply::error(503, "speaker switching unavailable");
         };
         match cb(&id) {
-            Ok(()) => Reply::json(200, r#"{"ok":true}"#.into()),
-            Err(msg) => Reply::json(500, format!(r#"{{"error":{}}}"#, json_string(&msg))),
+            Ok(()) => Reply::json(200, &ApiOk { ok: true }),
+            Err(msg) => Reply::error(500, &msg),
         }
     }
 
     fn resync(&self) -> Reply {
         let Some(cb) = &self.resync else {
-            return Reply::json(503, r#"{"error":"resync unavailable"}"#.into());
+            return Reply::error(503, "resync unavailable");
         };
         match cb() {
-            Ok(()) => Reply::json(200, r#"{"ok":true}"#.into()),
-            Err(msg) => Reply::json(500, format!(r#"{{"error":{}}}"#, json_string(&msg))),
+            Ok(()) => Reply::json(200, &ApiOk { ok: true }),
+            Err(msg) => Reply::error(500, &msg),
         }
     }
 
     fn latency_adjust(&self, target: &str) -> Reply {
         let Some(cb) = &self.latency_adjust else {
-            return Reply::json(503, r#"{"error":"latency adjust unavailable"}"#.into());
+            return Reply::error(503, "latency adjust unavailable");
         };
         let ms = extract_query_int(target, "ms").unwrap_or(0);
         if !(-5000..=5000).contains(&ms) {
-            return Reply::json(400, r#"{"error":"ms must be in [-5000, 5000]"}"#.into());
+            return Reply::error(400, "ms must be in [-5000, 5000]");
         }
         let pending = cb(ms as i32);
-        Reply::json(200, format!(r#"{{"ok":true,"pending_frames":{}}}"#, pending))
+        Reply::json(200, &LatencyOk { ok: true, pending_frames: pending })
     }
 
     /// Serve a single `/stream.raw` connection until the stream ends or
     /// the client goes away.
     fn serve_stream(&self, conn: &mut Conn, head: &Head) {
         // Subscribe BEFORE we send headers so we don't miss the first
-        // frame. Tagged with the peer IP so privacy mode can cut the
+        // frame. Tagged with the peer IP so the stream gate can cut the
         // connection off later if this client stops being allowed.
         let peer = conn.peer.ip();
         let rx = self.hub.subscribe_from(peer);
         // The reader also re-asks the gate once a second while streaming,
-        // so a listener that stops being allowed (speaker switched,
-        // privacy turned on) is cut within a second even if no explicit
-        // prune ran.
+        // so a listener that stops being allowed (streaming disabled,
+        // speaker switched, privacy turned on) is cut within a second even
+        // if no explicit prune ran.
         let recheck = self.stream_client_allowed.clone().map(|cb| (cb, peer));
         let mut reader = StreamReader::new(rx, recheck);
 
@@ -1212,7 +1274,8 @@ impl Reply {
         }
     }
 
-    fn json(status: u16, body: String) -> Self {
+    /// A JSON body, serialised by [`to_json`].
+    fn json<T: Serialize + ?Sized>(status: u16, value: &T) -> Self {
         Self {
             status,
             content_type: Some("application/json; charset=utf-8"),
@@ -1220,15 +1283,66 @@ impl Reply {
                 ("X-Content-Type-Options", "nosniff".into()),
                 ("Cache-Control", "no-store".into()),
             ],
-            body: body.into_bytes(),
+            body: to_json(value).into_bytes(),
         }
     }
+
+    /// `{"error": msg}`.
+    fn error(status: u16, msg: &str) -> Self {
+        Self::json(status, &ApiError { error: msg })
+    }
+
+    /// A 401 for an API request without the key.
+    fn unauthorized(msg: &str) -> Self {
+        let mut reply = Self::error(401, msg);
+        reply.headers.push(("WWW-Authenticate", WWW_AUTHENTICATE.into()));
+        reply
+    }
+
+    /// A short page under the status page's policy (no script at all).
+    fn html(status: u16, body: &'static str) -> Self {
+        Self {
+            status,
+            content_type: Some("text/html; charset=utf-8"),
+            headers: vec![
+                ("Content-Security-Policy", STATUS_PAGE_CSP.into()),
+                ("X-Content-Type-Options", "nosniff".into()),
+            ],
+            body: body.as_bytes().to_vec(),
+        }
+        .private()
+    }
+
+    /// The page for `/`, `/app.js` and a wrong key: where to find the
+    /// link.
+    fn link_needed() -> Self {
+        let mut reply = Self::html(401, LINK_NEEDED_HTML);
+        reply.headers.push(("WWW-Authenticate", WWW_AUTHENTICATE.into()));
+        reply
+    }
+
+    /// For a reply to an address that may hold the key: no `Referer`
+    /// carrying it anywhere, and nothing kept in caches.
+    fn private(mut self) -> Self {
+        for (name, value) in [("Referrer-Policy", "no-referrer"), ("Cache-Control", "no-store")] {
+            if !self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                self.headers.push((name, value.into()));
+            }
+        }
+        self
+    }
 }
+
+/// The challenge a 401 names (RFC 7235 requires one); browsers show the
+/// page's text for it rather than a password prompt.
+const WWW_AUTHENTICATE: &str = "Bearer realm=\"Stream To Speaker\"";
 
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         408 => "Request Timeout",
@@ -1357,7 +1471,7 @@ const STATUS_PAGE_HTML: &str = r#"<!doctype html>
   .actions button { margin-right: 0.5em; }
   #pending { margin-left: 0.6em; color: #666; font-size: 0.9em; }
 </style>
-<script src="/app.js" defer></script>
+<script src="app.js" defer></script>
 </head><body>
 <h1>Stream To Speaker</h1>
 <small>Active marker &#9679; shows the currently-targeted device.</small>
@@ -1376,11 +1490,13 @@ const STATUS_PAGE_HTML: &str = r#"<!doctype html>
 </div>
 </body></html>"#;
 
-/// Served as `/app.js`. Speaker ids reach it only through `data-*`
-/// attributes (read as plain strings), never through generated code.
+/// Served as `/r/<key>/app.js`. Speaker ids reach it only through `data-*`
+/// attributes (read as plain strings), never through generated code. The
+/// API's key is the one in the page's own address.
 const STATUS_PAGE_JS: &str = r#"'use strict';
+const key = location.pathname.split('/')[2] || '';
 function post(url, body) {
-  const opts = {method: 'POST', headers: {}};
+  const opts = {method: 'POST', headers: {'Authorization': 'Bearer ' + key}};
   if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
@@ -1419,6 +1535,35 @@ document.addEventListener('click', ev => {
 setTimeout(() => location.reload(), 5000);
 "#;
 
+/// The answer for `/`, `/app.js` and a link whose key is wrong or was
+/// replaced.
+const LINK_NEEDED_HTML: &str = r#"<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Stream To Speaker</title>
+<style>body { font-family: -apple-system, system-ui, Segoe UI, sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }</style>
+</head><body>
+<h1>Stream To Speaker</h1>
+<p>The web UI opens only from its link, which holds a secret key. On the PC,
+open Stream To Speaker and use <b>Copy link</b> in its Web UI card. If it runs
+without a window (<code>--headless</code>, or as a service), run
+<code>stream-to-speaker.exe --web-link</code> as the Windows account it runs
+under: that prints the link.</p>
+<p>A link stops working when <b>Make a new link</b> is used.</p>
+</body></html>"#;
+
+const WEB_UI_OFF_HTML: &str = r#"<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Stream To Speaker</title>
+<style>body { font-family: -apple-system, system-ui, Segoe UI, sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }</style>
+</head><body>
+<h1>Stream To Speaker</h1>
+<p>The web UI is off. Turn it on in the Stream To Speaker window (Web UI card),
+or start the app with <code>--web</code>, then open its link: the window shows
+it, and <code>stream-to-speaker.exe --web-link</code> prints it.</p>
+</body></html>"#;
+
 /// Pull an integer-valued query parameter from a request URL.
 fn extract_query_int(url: &str, key: &str) -> Option<i64> {
     let q = url.split_once('?')?.1;
@@ -1432,44 +1577,100 @@ fn extract_query_int(url: &str, key: &str) -> Option<i64> {
     None
 }
 
-/// Minimal JSON serialiser for the speaker list — avoids pulling in serde
-/// for ~30 lines of output.
-fn speakers_to_json(list: &[SpeakerInfo]) -> String {
-    let mut s = String::from(r#"{"speakers":["#);
-    for (i, sp) in list.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push_str(&format!(
-            r#"{{"id":{},"name":{},"ip":{},"active":{},"manual":{}}}"#,
-            json_string(&sp.id),
-            json_string(&sp.friendly_name),
-            json_string(&sp.ip),
-            sp.active,
-            sp.manual
-        ));
-    }
-    s.push_str("]}");
-    s
+// -----------------------------------------------------------------------------
+// JSON replies
+// -----------------------------------------------------------------------------
+
+/// One row of `GET /api/speakers`. The field names and their order are the
+/// API's wire format; `SpeakerInfo`'s other fields stay out of it.
+#[derive(Serialize)]
+struct ApiSpeaker<'a> {
+    id: &'a str,
+    name: &'a str,
+    ip: &'a str,
+    active: bool,
+    manual: bool,
 }
 
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str(r#"\""#),
-            '\\' => out.push_str(r"\\"),
-            '\n' => out.push_str(r"\n"),
-            '\r' => out.push_str(r"\r"),
-            '\t' => out.push_str(r"\t"),
-            // `<` too, so the JSON is safe to embed in HTML.
-            '<' => out.push_str(r"<"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+/// `GET /api/speakers`. `error` is present only when discovery is off.
+#[derive(Serialize)]
+struct SpeakerList<'a> {
+    speakers: Vec<ApiSpeaker<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ApiError<'a> {
+    error: &'a str,
+}
+
+#[derive(Serialize)]
+struct ApiOk {
+    ok: bool,
+}
+
+#[derive(Serialize)]
+struct LatencyOk {
+    ok: bool,
+    pending_frames: i64,
+}
+
+fn speaker_list(list: &[SpeakerInfo]) -> SpeakerList<'_> {
+    SpeakerList {
+        speakers: list
+            .iter()
+            .map(|sp| ApiSpeaker {
+                id: &sp.id,
+                name: &sp.friendly_name,
+                ip: &sp.ip,
+                active: sp.active,
+                manual: sp.manual,
+            })
+            .collect(),
+        error: None,
+    }
+}
+
+/// What [`html_safe`] writes as `\u` escapes: `<` (it starts `</script`
+/// and `<!--`), `>`, `&`, and U+2028 / U+2029 (line terminators inside a
+/// JavaScript string in older engines). The set Go's encoding/json escapes
+/// for the same reason.
+const HTML_UNSAFE: [char; 5] = ['<', '>', '&', '\u{2028}', '\u{2029}'];
+
+/// An API body as JSON text that is also safe inside an HTML `<script>`
+/// element. Speaker names and ids come from devices on the network, so
+/// they may hold any text; serde_json keeps them inside their strings, and
+/// [`html_safe`] keeps them from ending a script element if this JSON is
+/// ever embedded in a page.
+fn to_json<T: Serialize + ?Sized>(value: &T) -> String {
+    match serde_json::to_string(value) {
+        Ok(s) => html_safe(s),
+        // Our bodies are structs of strings, numbers and booleans, which
+        // can't fail to serialise; this only keeps a panic out of a
+        // `panic = "abort"` service.
+        Err(_) => r#"{"error":"internal error"}"#.to_string(),
+    }
+}
+
+/// Rewrites every [`HTML_UNSAFE`] character in JSON text as its
+/// six-character `\uXXXX` escape. They can only occur inside string
+/// literals in JSON, where the escape stands for the same character, so
+/// every JSON parser reads the same value.
+fn html_safe(json: String) -> String {
+    if !json.contains(HTML_UNSAFE) {
+        return json;
+    }
+    let mut out = String::with_capacity(json.len() + 16);
+    for c in json.chars() {
+        if HTML_UNSAFE.contains(&c) {
+            // Built with format! from the code point: a hand-typed escape
+            // for `<` is easy to end up as the character itself.
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
         }
     }
-    out.push('"');
     out
 }
 
@@ -1546,7 +1747,9 @@ fn html_escape(s: &str) -> String {
 // PCM stream body
 // -----------------------------------------------------------------------------
 
-/// How often an open stream re-asks the privacy gate about its peer.
+/// How often an open stream re-asks the stream gate about its peer, so
+/// one the gate stops admitting (streaming disabled, privacy mode turned
+/// on, speaker switched) is cut within this long.
 const GATE_RECHECK: Duration = Duration::from_secs(1);
 
 /// `Read` adapter that pulls PCM frames from a crossbeam Receiver. Blocks
@@ -1559,8 +1762,9 @@ struct StreamReader {
     leftover: Vec<u8>,
     /// Offset into `leftover` that has been served.
     leftover_pos: usize,
-    /// Privacy gate + this client's address; re-checked every
-    /// [`GATE_RECHECK`]. `None` when the gate is off.
+    /// The stream gate + this client's address; re-checked every
+    /// [`GATE_RECHECK`]. `None` when the server has no gate (it then
+    /// serves anyone).
     gate: Option<(StreamClientAllowedCallback, std::net::IpAddr)>,
     last_gate_check: std::time::Instant,
 }
@@ -1622,7 +1826,8 @@ impl Read for StreamReader {
             if let Some((cb, peer)) = &self.gate {
                 if self.last_gate_check.elapsed() >= GATE_RECHECK {
                     self.last_gate_check = std::time::Instant::now();
-                    if !cb(*peer) {
+                    if let Err(refusal) = cb(*peer) {
+                        info!("stream: stopped serving {}: {}", peer, refusal.reason());
                         return Ok(0);
                     }
                 }
@@ -1679,6 +1884,46 @@ pub const WIRE_CHANNELS_PUBLIC: u16 = WIRE_CHANNELS;
 mod tests {
     use super::*;
     use std::net::IpAddr;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+    /// What this module writes to the log while the tests run, for tests
+    /// of what a request leaves there. The tests share one process and one
+    /// logger, so each picks out the lines its own requests caused.
+    mod log_capture {
+        use std::sync::{Mutex, Once};
+
+        static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        struct Capture;
+
+        impl log::Log for Capture {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                metadata.target().starts_with("stream_to_speaker::http_server")
+            }
+            fn log(&self, record: &log::Record) {
+                if self.enabled(record.metadata()) {
+                    LINES.lock().unwrap().push(record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+
+        static CAPTURE: Capture = Capture;
+
+        /// Capture from now on, at every level. A logger installed before
+        /// this one would leave the tests looking at nothing, so that fails.
+        pub(super) fn start() {
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                log::set_logger(&CAPTURE).expect("no other logger in the tests");
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+        }
+
+        pub(super) fn lines() -> Vec<String> {
+            LINES.lock().unwrap().clone()
+        }
+    }
 
     #[test]
     fn disconnect_clients_cuts_matching_http_peers_only() {
@@ -1869,6 +2114,11 @@ mod tests {
 
     /// Send `req`, read until close or `n` bytes.
     fn exchange(port: u16, req: &[u8], n: usize) -> String {
+        String::from_utf8_lossy(&exchange_raw(port, req, n)).to_string()
+    }
+
+    /// [`exchange`], returning the bytes as they arrived.
+    fn exchange_raw(port: u16, req: &[u8], n: usize) -> Vec<u8> {
         let mut s = connect(port);
         s.write_all(req).unwrap();
         let mut buf = vec![0u8; n];
@@ -1879,7 +2129,8 @@ mod tests {
                 Ok(k) => got += k,
             }
         }
-        String::from_utf8_lossy(&buf[..got]).to_string()
+        buf.truncate(got);
+        buf
     }
 
     fn healthz(port: u16) -> String {
@@ -2005,6 +2256,76 @@ mod tests {
     }
 
     #[test]
+    fn an_open_stream_ends_when_the_gate_closes() {
+        // The gate closing for a listener — streaming disabled, say — ends
+        // a stream already being served within about a second, and later
+        // requests get a 403. Both, and the log, say which rule refused.
+        log_capture::start();
+        let hub = StreamHub::new();
+        // 0: admitted; 1: streaming disabled; 2: privacy mode refuses.
+        let state = Arc::new(AtomicU8::new(0));
+        let gate = state.clone();
+        let mut cfg = HttpServerConfig::minimal("127.0.0.1:0".parse().unwrap(), hub.clone());
+        cfg.stream_client_allowed = Some(Arc::new(move |_| match gate.load(Ordering::Acquire) {
+            0 => Ok(()),
+            1 => Err(Refusal::StreamingOff),
+            _ => Err(Refusal::NotGranted),
+        }));
+        let port = start(cfg);
+        let h = hub.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                h.publish(PcmFrame(Arc::new(vec![1u8; 256])));
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let mut s = connect(port);
+        s.write_all(b"GET /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = s.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200 OK"));
+        state.store(1, Ordering::Release);
+        let closed_at = Instant::now();
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => assert!(closed_at.elapsed() < Duration::from_secs(4), "still streaming"),
+                Err(e) => panic!("stream didn't end: {e}"),
+            }
+        }
+        assert!(closed_at.elapsed() < Duration::from_millis(2500), "{:?}", closed_at.elapsed());
+        let refused = |method: &str| {
+            let r = exchange(
+                port,
+                format!("{method} /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+                4096,
+            );
+            assert!(r.starts_with("HTTP/1.1 403"), "{method}: {r}");
+            r.split_once("\r\n\r\n").map(|(_, body)| body.to_string()).unwrap_or_default()
+        };
+        let streaming_off = "streaming is disabled on this PC";
+        let privacy = "privacy mode is on: only the speaker being played on (and its group) may listen";
+        assert_eq!(refused("HEAD"), "");
+        assert_eq!(refused("GET"), format!("forbidden: {streaming_off}"));
+        state.store(2, Ordering::Release);
+        assert_eq!(refused("HEAD"), "");
+        assert_eq!(refused("GET"), format!("forbidden: {privacy}"));
+        stop.store(true, Ordering::Relaxed);
+        let log = log_capture::lines();
+        for line in [
+            format!("stream: stopped serving 127.0.0.1: {streaming_off}"),
+            format!("stream: refused HEAD /stream.raw from 127.0.0.1: {streaming_off}"),
+            format!("stream: refused GET /stream.raw from 127.0.0.1: {streaming_off}"),
+            format!("stream: refused GET /stream.raw from 127.0.0.1: {privacy}"),
+        ] {
+            assert!(log.contains(&line), "no {line:?} in {log:#?}");
+        }
+    }
+
+    #[test]
     fn rebinding_host_is_refused() {
         let (port, _hub) = minimal();
         let r = exchange(port, b"GET /stream.raw HTTP/1.1\r\nHost: evil.example:5901\r\n\r\n", 4096);
@@ -2054,10 +2375,27 @@ mod tests {
         assert!(send("uuid:test-http-notify", "<e/>").starts_with("HTTP/1.1 412"));
     }
 
-    fn api_server() -> (u16, Arc<Mutex<Vec<String>>>) {
+    /// The web UI's key in the API tests.
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    fn auth() -> String {
+        format!("Authorization: Bearer {KEY}\r\n")
+    }
+
+    struct ApiServer {
+        port: u16,
+        picked: Arc<Mutex<Vec<String>>>,
+        resyncs: Arc<Mutex<u32>>,
+        access: Arc<WebAccess>,
+    }
+
+    fn api_server() -> ApiServer {
         let hub = StreamHub::new();
         let picked = Arc::new(Mutex::new(Vec::new()));
         let picked2 = picked.clone();
+        let resyncs = Arc::new(Mutex::new(0));
+        let resyncs2 = resyncs.clone();
+        let access = WebAccess::with_secret(crate::web_access::WebSecret::parse(KEY).unwrap());
         let mut cfg = HttpServerConfig::minimal("127.0.0.1:0".parse().unwrap(), hub);
         cfg.speaker_list = Some(Arc::new(|| {
             vec![SpeakerInfo {
@@ -2074,31 +2412,248 @@ mod tests {
             picked2.lock().unwrap().push(id.to_string());
             Ok(())
         }));
+        cfg.resync = Some(Arc::new(move || {
+            *resyncs2.lock().unwrap() += 1;
+            Ok(())
+        }));
         cfg.latency_adjust = Some(Arc::new(|ms| ms as i64 * 10));
-        (start(cfg), picked)
+        cfg.web_access = Some(access.clone());
+        ApiServer { port: start(cfg), picked, resyncs, access }
+    }
+
+    fn get(port: u16, path: &str, extra: &str) -> String {
+        exchange(
+            port,
+            format!("GET {path} HTTP/1.1\r\nHost: localhost:5901\r\nConnection: close\r\n{extra}\r\n").as_bytes(),
+            65536,
+        )
+    }
+
+    fn header<'a>(reply: &'a str, name: &str) -> Option<&'a str> {
+        let head = reply.split("\r\n\r\n").next()?;
+        head.split("\r\n").find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.eq_ignore_ascii_case(name).then(|| v.trim())
+        })
     }
 
     #[test]
     fn status_page_has_csp_and_no_inline_code() {
-        let (port, _) = api_server();
-        let r = exchange(port, b"GET / HTTP/1.1\r\nHost: localhost:5901\r\nConnection: close\r\n\r\n", 65536);
+        let srv = api_server();
+        let r = get(srv.port, &format!("/r/{KEY}/"), "");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
         assert!(r.contains("Content-Security-Policy: default-src 'none'; script-src 'self'"), "{r}");
         assert!(!r.contains("onclick"));
         assert!(!r.contains("<script>"));
         assert!(!r.contains("<img"));
         assert!(r.contains("data-select=\"uuid:x&#39;);alert(1);//&quot;&gt;&lt;script&gt;"), "{r}");
-        let js = exchange(port, b"GET /app.js HTTP/1.1\r\nHost: localhost:5901\r\nConnection: close\r\n\r\n", 65536);
+        // Its script is addressed relative to the page, under the link.
+        assert!(r.contains("<script src=\"app.js\" defer>"), "{r}");
+        let js = get(srv.port, &format!("/r/{KEY}/app.js"), "");
         assert!(js.contains("application/javascript") && js.contains("dataset.select"));
+        assert!(js.contains("'Authorization': 'Bearer ' + key"), "{js}");
+    }
+
+    #[test]
+    fn the_page_opens_only_from_its_link() {
+        let srv = api_server();
+        let page = format!("/r/{KEY}/");
+        for r in [get(srv.port, &page, ""), get(srv.port, &format!("{page}app.js"), "")] {
+            assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+            assert_eq!(header(&r, "Referrer-Policy"), Some("no-referrer"), "{r}");
+            assert_eq!(header(&r, "Cache-Control"), Some("no-store"), "{r}");
+        }
+        // `/`, `/app.js`, a wrong key, a key of the wrong length.
+        for path in [
+            "/".to_string(),
+            "/app.js".to_string(),
+            "/r/00000000000000000000000000000000/".to_string(),
+            format!("/r/{}/", &KEY[..31]),
+            format!("/r/{}/app.js", KEY.replace('0', "1")),
+            "/r//".to_string(),
+        ] {
+            let r = get(srv.port, &path, "");
+            assert!(r.starts_with("HTTP/1.1 401"), "{path}: {r}");
+            assert!(header(&r, "WWW-Authenticate").is_some(), "{r}");
+            // Where the link is: the window, or --web-link without one.
+            assert!(r.contains("Copy link") && r.contains("--web-link"), "{r}");
+            assert!(!r.contains("data-select") && !r.contains("192.168.1.50"), "{path}: {r}");
+            assert_eq!(header(&r, "Referrer-Policy"), Some("no-referrer"), "{r}");
+        }
+        // Without the trailing slash: sent to the page.
+        let r = get(srv.port, &format!("/r/{KEY}"), "");
+        assert!(r.starts_with("HTTP/1.1 308"), "{r}");
+        assert_eq!(header(&r, "Location"), Some(page.as_str()), "{r}");
+        assert!(get(srv.port, &format!("{page}nothing-here"), "").starts_with("HTTP/1.1 404"));
+        // The key in the address is not a key for the API...
+        assert!(get(srv.port, &format!("{page}api/speakers"), "").starts_with("HTTP/1.1 404"));
+        // ...and a bearer token doesn't open `/`.
+        assert!(get(srv.port, "/", &auth()).starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn every_api_route_needs_the_key() {
+        let srv = api_server();
+        let request = |line: &str, extra: &str| {
+            exchange(
+                srv.port,
+                format!(
+                    "{line} HTTP/1.1\r\nHost: 127.0.0.1:5901\r\nConnection: close\r\n\
+                     Content-Type: application/json\r\nContent-Length: 17\r\n{extra}\r\n{{\"id\":\"uuid:abc\"}}"
+                )
+                .as_bytes(),
+                65536,
+            )
+        };
+        let routes = ["GET /api/speakers", "POST /api/select", "POST /api/resync", "POST /api/latency/adjust?ms=25"];
+        let wrong = [
+            String::new(),
+            "Authorization: Bearer 00000000000000000000000000000000\r\n".to_string(),
+            format!("Authorization: Basic {KEY}\r\n"),
+            format!("Authorization: {KEY}\r\n"),
+            format!("Authorization: Bearer {KEY}0\r\n"),
+            format!("X-Api-Key: {KEY}\r\n"),
+        ];
+        for line in routes {
+            for extra in &wrong {
+                let r = request(line, extra);
+                assert!(r.starts_with("HTTP/1.1 401"), "{line} {extra:?}: {r}");
+                assert!(header(&r, "Content-Type").is_some_and(|c| c.starts_with("application/json")), "{r}");
+                assert!(header(&r, "WWW-Authenticate").is_some(), "{r}");
+                let body = r.split("\r\n\r\n").nth(1).unwrap();
+                let doc: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert!(doc["error"].as_str().unwrap().contains("Authorization: Bearer"), "{body}");
+                assert!(!r.contains(KEY), "a reply names the key: {r}");
+            }
+        }
+        // Nothing reached the app.
+        assert!(srv.picked.lock().unwrap().is_empty());
+        assert_eq!(*srv.resyncs.lock().unwrap(), 0);
+        // With it, every route works.
+        for line in routes {
+            assert!(request(line, &auth()).starts_with("HTTP/1.1 200"), "{line}");
+        }
+        assert!(request("POST /api/resync", &format!("authorization: bearer {KEY}\r\n")).starts_with("HTTP/1.1 200"));
+        assert_eq!(*srv.picked.lock().unwrap(), vec!["uuid:abc".to_string()]);
+        assert_eq!(*srv.resyncs.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_script_without_the_key_is_told_what_to_send_in_plain_text() {
+        // Script authors meet this body raw (curl prints it as it comes),
+        // so it must hold nothing JSON or `html_safe` would escape: the
+        // angle brackets of a `<key>` placeholder arrive as six-character
+        // escapes, quotes with a backslash.
+        let expected = concat!(
+            r#"{"error":"missing or wrong API key: send the header 'Authorization: Bearer' "#,
+            r#"followed by a space and the key, the 32 hex digits after /r/ in the web UI's "#,
+            r#"link. The Stream To Speaker window shows the link in its Web UI card, and "#,
+            r#"stream-to-speaker.exe --web-link prints it"}"#,
+        );
+        let srv = api_server();
+        for req in [
+            "GET /api/speakers HTTP/1.1\r\nHost: localhost:5901\r\nConnection: close\r\n\r\n".to_string(),
+            "POST /api/resync HTTP/1.1\r\nHost: localhost:5901\r\nConnection: close\r\n\
+             Authorization: Bearer 00000000000000000000000000000000\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+        ] {
+            let raw = exchange_raw(srv.port, req.as_bytes(), 65536);
+            let text = String::from_utf8_lossy(&raw);
+            assert!(raw.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"), "{text}");
+            let at = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("a complete reply");
+            let body = &raw[at + 4..];
+            assert!(body.is_ascii() && !body.contains(&b'\\'), "{text}");
+            assert_eq!(body, expected.as_bytes(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_new_secret_retires_the_old_link_and_key_at_once() {
+        let srv = api_server();
+        let new = crate::web_access::WebSecret::generate().unwrap();
+        let new_key = new.to_hex();
+        srv.access.set_secret(new);
+        assert!(get(srv.port, &format!("/r/{KEY}/"), "").starts_with("HTTP/1.1 401"));
+        assert!(get(srv.port, "/api/speakers", &auth()).starts_with("HTTP/1.1 401"));
+        assert!(get(srv.port, &format!("/r/{new_key}/"), "").starts_with("HTTP/1.1 200"));
+        let bearer = format!("Authorization: Bearer {new_key}\r\n");
+        assert!(get(srv.port, "/api/speakers", &bearer).starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn link_keys_never_reach_the_log() {
+        // Every line that logs a request path replaces the key after /r/,
+        // the right one or not: the line each request gets, the one for a
+        // request refused for its Host, and an event callback's path.
+        log_capture::start();
+        let srv = api_server();
+        let marker = format!("log-probe-{}", srv.port);
+        let wrong = "fedcba9876543210fedcba9876543210";
+        let request = |method: &str, key: &str, extra: &str| {
+            exchange(
+                srv.port,
+                format!(
+                    "{method} /r/{key}/{marker}?q=1 HTTP/1.1\r\nConnection: close\r\n{}{extra}\r\n",
+                    auth()
+                )
+                .as_bytes(),
+                65536,
+            )
+        };
+        assert!(request("GET", KEY, "Host: localhost:5901\r\n").starts_with("HTTP/1.1 404"));
+        assert!(request("GET", wrong, "Host: localhost:5901\r\n").starts_with("HTTP/1.1 401"));
+        assert!(request("GET", KEY, "Host: evil.example\r\n").starts_with("HTTP/1.1 421"));
+        let sid = format!("uuid:{marker}");
+        let reg = gena::registry();
+        let token = reg.begin_subscribe(vec!["127.0.0.1".parse().unwrap()]);
+        reg.finish_subscribe(token, Some(&sid));
+        let notify = request("NOTIFY", KEY, &format!("Host: 127.0.0.1\r\nSID: {sid}\r\nContent-Length: 0\r\n"));
+        reg.remove(&sid);
+        assert!(notify.starts_with("HTTP/1.1 200"), "{notify}");
+
+        let log = log_capture::lines();
+        let ours: Vec<&String> = log.iter().filter(|l| l.contains(&marker)).collect();
+        let redacted = format!("/r/<key>/{marker}");
+        for expected in [
+            format!("http request: GET {redacted}?q=1"),
+            format!("http request: NOTIFY {redacted}?q=1"),
+            format!("http: refused GET {redacted} from 127.0.0.1: unrecognised Host \"evil.example\""),
+            format!("NOTIFY received but no callback registered; path={redacted}"),
+        ] {
+            assert!(ours.iter().any(|l| **l == expected), "no {expected:?} in {ours:#?}");
+        }
+        assert_eq!(ours.iter().filter(|l| l.starts_with("http request: GET")).count(), 3, "{ours:#?}");
+        // Nor anywhere else, from any test's requests.
+        for line in &log {
+            assert!(!line.contains(KEY) && !line.contains(wrong), "{line}");
+        }
+    }
+
+    #[test]
+    fn with_the_web_ui_off_nothing_answers_even_with_the_key() {
+        let srv = api_server();
+        srv.access.set_enabled(false);
+        let page = get(srv.port, &format!("/r/{KEY}/"), "");
+        assert!(page.starts_with("HTTP/1.1 404") && page.contains("The web UI is off"), "{page}");
+        assert!(page.contains("--web-link"), "{page}");
+        assert!(!page.contains("data-select"));
+        let api = get(srv.port, "/api/speakers", &auth());
+        assert!(api.starts_with("HTTP/1.1 404") && api.contains("web UI is disabled"), "{api}");
+        // No web access configured at all: the same.
+        let (port, _hub) = minimal();
+        assert!(get(port, &format!("/r/{KEY}/"), "").starts_with("HTTP/1.1 404"));
+        assert!(get(port, "/api/speakers", &auth()).starts_with("HTTP/1.1 404"));
     }
 
     #[test]
     fn select_api_checks_origin_and_content_type() {
-        let (port, picked) = api_server();
+        let srv = api_server();
         let post = |extra: &str, body: &str| {
             exchange(
-                port,
+                srv.port,
                 format!(
-                    "POST /api/select HTTP/1.1\r\nHost: 127.0.0.1:5901\r\nConnection: close\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+                    "POST /api/select HTTP/1.1\r\nHost: 127.0.0.1:5901\r\nConnection: close\r\n{}{extra}Content-Length: {}\r\n\r\n{body}",
+                    auth(),
                     body.len()
                 )
                 .as_bytes(),
@@ -2107,7 +2662,10 @@ mod tests {
         };
         let body = r#"{"id":"uuid:abc"}"#;
         assert!(post("Content-Type: text/plain\r\n", body).starts_with("HTTP/1.1 415"));
+        // The key doesn't make another site's page welcome.
         assert!(post("Content-Type: application/json\r\nOrigin: http://evil.example\r\n", body)
+            .starts_with("HTTP/1.1 403"));
+        assert!(post("Content-Type: application/json\r\nSec-Fetch-Site: cross-site\r\n", body)
             .starts_with("HTTP/1.1 403"));
         assert!(post(
             "Content-Type: application/json\r\nOrigin: http://127.0.0.1:5901\r\nSec-Fetch-Site: same-origin\r\n",
@@ -2115,17 +2673,162 @@ mod tests {
         )
         .starts_with("HTTP/1.1 200"));
         assert!(post("Content-Type: application/json\r\n", body).starts_with("HTTP/1.1 200"));
-        assert_eq!(*picked.lock().unwrap(), vec!["uuid:abc".to_string(), "uuid:abc".to_string()]);
+        assert_eq!(*srv.picked.lock().unwrap(), vec!["uuid:abc".to_string(), "uuid:abc".to_string()]);
     }
 
     #[test]
     fn latency_route_matches_with_query() {
-        let (port, _) = api_server();
+        let srv = api_server();
         let r = exchange(
-            port,
-            b"POST /api/latency/adjust?ms=25 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            srv.port,
+            format!(
+                "POST /api/latency/adjust?ms=25 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{}\r\n",
+                auth()
+            )
+            .as_bytes(),
             4096,
         );
         assert!(r.starts_with("HTTP/1.1 200") && r.contains(r#""pending_frames":250"#), "{r}");
+    }
+
+    // ---- JSON replies -------------------------------------------------
+
+    /// Names a LAN device can announce (an SSDP friendlyName, an mDNS
+    /// instance label): markup, JSON-breaking quotes, control characters,
+    /// JavaScript line terminators, non-ASCII.
+    const HOSTILE_NAMES: &[&str] = &[
+        "</script><script>alert(1)</script>",
+        "</SCRIPT ><img src=x onerror=alert(1)>",
+        "<!--<script>",
+        "\"},{\"id\":\"evil\",\"name\":\"x",
+        "back\\slash\\\"quote\\",
+        "nul\u{0}bell\u{7}bs\u{8}ff\u{c}esc\u{1b}us\u{1f}del\u{7f}",
+        "line\u{2028}para\u{2029}end",
+        "Living & Dining <Kitchen>",
+        "Küche \u{1F50A} Гостиная",
+        "",
+    ];
+
+    /// `\u` and four hex digits, built at run time so no escape literal in
+    /// this file can turn into the character it stands for.
+    fn esc(c: char) -> String {
+        format!("\\u{:04x}", c as u32)
+    }
+
+    fn speaker(id: &str, name: &str) -> SpeakerInfo {
+        SpeakerInfo {
+            id: id.into(),
+            friendly_name: name.into(),
+            ip: "192.168.1.50".into(),
+            active: true,
+            note: Some("not in the API".into()),
+            manual: false,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn html_safe_writes_six_character_escapes() {
+        let e = esc('<');
+        assert_eq!(e.as_bytes(), [b'\\', b'u', b'0', b'0', b'3', b'c']);
+        assert_eq!(html_safe("\"<\"".to_string()).as_bytes(), b"\"\\u003c\"");
+        assert_eq!(
+            html_safe("\"a<b>c&d\u{2028}e\u{2029}\"".to_string()),
+            format!("\"a{}b{}c{}d{}e{}\"", esc('<'), esc('>'), esc('&'), esc('\u{2028}'), esc('\u{2029}'))
+        );
+        // Valid on any JSON text, keys included.
+        let v = serde_json::json!({ "</script>": ["<!--", { "a&b": "x\u{2028}y>z" }], "n": 1.5 });
+        let text = html_safe(serde_json::to_string(&v).unwrap());
+        assert!(!text.contains(HTML_UNSAFE), "{text}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), v);
+    }
+
+    #[test]
+    fn speaker_json_is_html_safe_and_carries_the_names_exactly() {
+        for name in HOSTILE_NAMES {
+            let list = [speaker(name, name), speaker("uuid:2", "Kitchen")];
+            let body = to_json(&speaker_list(&list));
+            assert!(!body.contains(HTML_UNSAFE), "{body}");
+            assert!(!body.to_ascii_lowercase().contains("</script"), "{body}");
+            let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(doc.as_object().unwrap().len(), 1, "{body}");
+            let rows = doc["speakers"].as_array().unwrap();
+            assert_eq!(rows.len(), 2, "{body}");
+            assert_eq!(rows[0]["id"], *name);
+            assert_eq!(rows[0]["name"], *name);
+            assert_eq!(rows[1]["name"], "Kitchen");
+            assert!(rows[0].get("note").is_none() && rows[0].get("hidden").is_none());
+        }
+    }
+
+    #[test]
+    fn json_bodies_keep_their_field_names_and_order() {
+        let list = [
+            speaker("uuid:RINCON_000E58A0123401400", "Living Room + Kitchen"),
+            SpeakerInfo { manual: true, active: false, ..speaker("manual:192.168.1.77:7000", "Den \"quoted\" back\\slash\ttab") },
+        ];
+        assert_eq!(
+            to_json(&speaker_list(&list)),
+            concat!(
+                r#"{"speakers":[{"id":"uuid:RINCON_000E58A0123401400","name":"Living Room + Kitchen","#,
+                r#""ip":"192.168.1.50","active":true,"manual":false},"#,
+                r#"{"id":"manual:192.168.1.77:7000","name":"Den \"quoted\" back\\slash\ttab","#,
+                r#""ip":"192.168.1.50","active":false,"manual":true}]}"#,
+            )
+        );
+        assert_eq!(to_json(&speaker_list(&[])), r#"{"speakers":[]}"#);
+        assert_eq!(
+            to_json(&SpeakerList { speakers: Vec::new(), error: Some("discovery disabled") }),
+            r#"{"speakers":[],"error":"discovery disabled"}"#
+        );
+        assert_eq!(to_json(&ApiOk { ok: true }), r#"{"ok":true}"#);
+        assert_eq!(to_json(&LatencyOk { ok: true, pending_frames: -441 }), r#"{"ok":true,"pending_frames":-441}"#);
+        assert_eq!(
+            to_json(&ApiError { error: "Still connecting to <b>Den</b> — try again" }),
+            format!("{{\"error\":\"Still connecting to {0}b{1}Den{0}/b{1} — try again\"}}", esc('<'), esc('>'))
+        );
+    }
+
+    /// Random strings over an alphabet of the characters that matter: every
+    /// error body parses back to exactly the text it carries.
+    #[test]
+    fn json_error_bodies_round_trip_any_text() {
+        const ALPHABET: &[char] = &[
+            '<', '>', '&', '"', '\\', '/', '\'', '!', '-', 's', 'c', 'r', 'i', 'p', 't', 'S',
+            ' ', '\n', '\r', '\t', '\u{0}', '\u{8}', '\u{c}', '\u{1f}', '\u{7f}', '\u{e9}',
+            '\u{2028}', '\u{2029}', '\u{feff}', '\u{1F50A}', 'u', '0',
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 24) as usize;
+            let s: String =
+                (0..len).map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize]).collect();
+            let body = to_json(&ApiError { error: &s });
+            assert!(!body.contains(HTML_UNSAFE), "{body}");
+            let back: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(back["error"], s);
+        }
+    }
+
+    #[test]
+    fn speakers_api_escapes_names_from_the_network() {
+        let srv = api_server();
+        let r = get(srv.port, "/api/speakers", &auth());
+        let (head, body) = r.split_once("\r\n\r\n").expect("a complete reply");
+        assert!(head.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(head.contains("Content-Type: application/json; charset=utf-8"), "{head}");
+        assert!(head.contains("X-Content-Type-Options: nosniff"), "{head}");
+        assert!(!body.contains(HTML_UNSAFE), "{body}");
+        let doc: serde_json::Value = serde_json::from_str(body).unwrap();
+        let row = &doc["speakers"][0];
+        assert_eq!(row["id"], "uuid:x');alert(1);//\"><script>alert(2)</script>");
+        assert_eq!(row["name"], "<img src=x onerror=alert(3)>");
+        assert_eq!(row["active"], true);
     }
 }

@@ -11,9 +11,9 @@
 //!     subsequent launches.
 //!
 //! Secrets (AirPlay passwords, pairing credentials, the controller seed;
-//! Sendspin identity keys and pairing PSKs) are sealed with DPAPI into a
-//! separate `protected` section of the file and plain in memory; see
-//! `secret_store`.
+//! Sendspin identity keys and pairing PSKs; the web UI's key) are sealed
+//! with DPAPI into a separate `protected` section of the file and plain in
+//! memory; see `secret_store`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -103,6 +103,14 @@ pub struct UserConfig {
     pub airplay_controller_id: Option<String>,
     #[serde(default)]
     pub airplay_controller_seed_hex: Option<String>,
+    /// The web UI's secret, 32 hex digits (see `web_access`): the key in
+    /// its link (`/r/<key>/`) and the JSON API's bearer token. Made the
+    /// first time the web UI is turned on or `--web-link` runs, replaced
+    /// by "Make a new link". Stored sealed in the file's `protected`
+    /// section. While it is `None`, saves keep the key the file holds:
+    /// `--web-link` may store one while the app runs.
+    #[serde(default)]
+    pub web_secret: Option<String>,
     /// Catch-all preserving config keys this binary doesn't know about
     /// (a newer version's settings) across load→save round-trips. Without
     /// it, running an older build once silently strips them — which for
@@ -116,11 +124,9 @@ pub struct UserConfig {
     /// back unchanged on every save so they're never lost.
     #[serde(skip)]
     pub locked_secrets: Vec<LockedNode>,
-    /// `config.json` exists but couldn't be read, or couldn't be moved
-    /// aside when it was unusable: these are defaults, not its contents,
-    /// so saves leave the file alone for the rest of the run.
+    /// Where saves go.
     #[serde(skip)]
-    keep_file: bool,
+    saves: Saves,
     /// Forward Windows' "now playing" (title/artist/album from the System
     /// Media Transport Controls) to the speaker as track metadata, so it
     /// shows on the speaker's display / app. **Off by default** — it's a
@@ -137,12 +143,14 @@ pub struct UserConfig {
     #[serde(default)]
     pub airplay_uncompressed_alac: bool,
     /// Privacy mode: only serve `/stream.raw` (the system-audio stream)
-    /// to the speaker we're currently streaming to. Without it, anyone
-    /// on the LAN who knows the URL can listen to everything the PC
-    /// plays. **Off by default** — it can break grouped Sonos playback
-    /// (the group's coordinator, which may be a *different* unit than
-    /// the selected one, is what fetches the stream) and any other
-    /// setup where the fetching IP differs from the selected speaker's.
+    /// to this PC and the speaker we're currently streaming to (with the
+    /// other members of its Sonos group, as grouped when it was picked).
+    /// Without it, anyone on the LAN who knows the URL can listen to
+    /// everything the PC plays while streaming is enabled, whatever kind
+    /// of speaker is playing. **Off by default** — anything else that
+    /// fetches the stream is refused: a speaker grouped after the pick, a
+    /// player on another PC, any setup where the fetching IP differs from
+    /// the selected speaker's.
     #[serde(default)]
     pub privacy_mode: bool,
     /// AirPlay sender-side buffer, in milliseconds: how far behind the RTP
@@ -283,6 +291,27 @@ fn default_airplay_latency_ms() -> u32 {
     AIRPLAY_LATENCY_MS_DEFAULT
 }
 
+/// Where [`UserConfig`]'s saves go.
+#[derive(Clone, Debug, Default)]
+enum Saves {
+    /// To `config.json`.
+    #[default]
+    ToFile,
+    /// Nowhere, and saving fails: `config.json` exists but couldn't be
+    /// read, or couldn't be moved aside when it was unusable. These are
+    /// defaults, not its contents, so saves leave the file alone for the
+    /// rest of the run.
+    KeepFile,
+    /// Nowhere, and saving succeeds: settings for tests of app actions,
+    /// which must never write or read the developer's own file.
+    #[cfg(test)]
+    InMemory,
+    /// To this file instead of `config.json`, and read back from it:
+    /// settings for tests of app actions that need a file of their own.
+    #[cfg(test)]
+    AtPath(PathBuf),
+}
+
 /// Fresh-install defaults come from the same serde defaults a parsed
 /// config uses, so a field's `#[serde(default = ...)]` is its single
 /// source of truth. (The previous `#[derive(Default)]` zeroed every
@@ -376,6 +405,28 @@ impl UserConfig {
         Self::load_from(&path)
     }
 
+    /// Defaults whose saves succeed without touching the disk, for tests
+    /// of app actions that save (which would otherwise write the
+    /// developer's own file).
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
+        Self { saves: Saves::InMemory, ..Self::default() }
+    }
+
+    /// Defaults whose saves fail, as they do all run when `config.json`
+    /// couldn't be read at startup; nothing touches the disk.
+    #[cfg(test)]
+    pub(crate) fn unsaveable() -> Self {
+        Self { saves: Saves::KeepFile, ..Self::default() }
+    }
+
+    /// Defaults saved to `path` and read back from it, for tests of app
+    /// actions that need a settings file of their own.
+    #[cfg(test)]
+    pub(crate) fn at_path(path: PathBuf) -> Self {
+        Self { saves: Saves::AtPath(path), ..Self::default() }
+    }
+
     /// Load from `path`. A missing file is a fresh install. A file that
     /// exists but isn't valid JSON (or isn't text in an encoding
     /// `decode_config_text` reads) is **quarantined** — renamed to
@@ -407,7 +458,7 @@ impl UserConfig {
                     path.display(),
                     e
                 );
-                return Self { keep_file: true, ..Self::default() };
+                return Self { saves: Saves::KeepFile, ..Self::default() };
             }
         };
         let parsed = decode_config_text(&bytes, decode_ansi).and_then(|(json, encoding)| {
@@ -452,7 +503,7 @@ impl UserConfig {
                             e,
                             re
                         );
-                        return Self { keep_file: true, ..Self::default() };
+                        return Self { saves: Saves::KeepFile, ..Self::default() };
                     }
                 }
                 Self::default()
@@ -462,10 +513,56 @@ impl UserConfig {
 
     /// Best-effort save. Logged-on-failure rather than propagated — a
     /// failed config write should never block UI actions like speaker
-    /// selection.
+    /// selection. An action that must not take effect unsaved uses
+    /// [`try_save`](Self::try_save) instead.
     pub fn save(&self) {
-        let Some(path) = config_path() else { return; };
+        let Some(path) = self.file() else { return; };
         self.save_to(&path);
+    }
+
+    /// Save, or say why `config.json` wasn't written.
+    pub fn try_save(&self) -> Result<(), String> {
+        match self.file() {
+            Some(path) => self.try_save_to_with(&path, &PlatformCodec),
+            None => Err("there's no folder to keep the settings in (APPDATA isn't set)".into()),
+        }
+    }
+
+    /// The file these settings are saved to: `config.json`, or a test's own.
+    fn file(&self) -> Option<PathBuf> {
+        match &self.saves {
+            #[cfg(test)]
+            Saves::AtPath(path) => Some(path.clone()),
+            _ => config_path(),
+        }
+    }
+
+    /// The web UI's key as `config.json` holds it now, which may be one
+    /// `--web-link` stored after these settings were loaded (it can run
+    /// while the app does). Read without loading the rest of the file:
+    /// nothing is moved aside, saved or logged. `None` for settings that
+    /// couldn't be read at startup, which take nothing from the file as
+    /// they save nothing over it, and for test settings kept in memory.
+    pub fn stored_web_secret(&self) -> Option<String> {
+        match &self.saves {
+            Saves::ToFile => {}
+            #[cfg(test)]
+            Saves::AtPath(_) => {}
+            _ => return None,
+        }
+        Self::stored_web_secret_at(&self.file()?, &PlatformCodec)
+    }
+
+    /// [`stored_web_secret`](Self::stored_web_secret) for the file at
+    /// `path`, opened with `codec`.
+    pub fn stored_web_secret_at(path: &std::path::Path, codec: &dyn SecretCodec) -> Option<String> {
+        let bytes = std::fs::read(path).ok()?;
+        let (json, _) = decode_config_text(&bytes, decode_ansi).ok()?;
+        let tree: serde_json::Value = serde_json::from_str(&json).ok()?;
+        match secret_store::stored_value(&tree, "web_secret", codec)? {
+            serde_json::Value::String(key) => Some(key),
+            _ => None,
+        }
     }
 
     /// Atomic replace: serialise to a sibling temp file, then rename it
@@ -479,34 +576,53 @@ impl UserConfig {
 
     /// [`save_to`](Self::save_to) with an explicit secret protector.
     pub fn save_to_with(&self, path: &std::path::Path, codec: &dyn SecretCodec) {
-        if self.keep_file {
-            log::warn!(
-                "user_config: not saving over {}: it couldn't be read at startup",
-                path.display()
-            );
-            return;
+        if let Err(e) = self.try_save_to_with(path, codec) {
+            log::warn!("user_config: {e}");
         }
-        let Some(dir) = path.parent() else { return; };
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            log::warn!("user_config: mkdir {}: {}", dir.display(), e);
-            return;
+    }
+
+    /// [`save_to_with`](Self::save_to_with), returning why the file wasn't
+    /// written instead of logging it.
+    pub fn try_save_to_with(
+        &self,
+        path: &std::path::Path,
+        codec: &dyn SecretCodec,
+    ) -> Result<(), String> {
+        match &self.saves {
+            Saves::ToFile => {}
+            Saves::KeepFile => {
+                return Err(format!(
+                    "not saving over {}: it couldn't be read at startup",
+                    path.display()
+                ));
+            }
+            #[cfg(test)]
+            Saves::InMemory => return Ok(()),
+            #[cfg(test)]
+            Saves::AtPath(_) => {}
         }
-        let content = match serde_json::to_value(self).and_then(|mut tree| {
-            secret_store::seal(&mut tree, &self.locked_secrets, codec);
-            serde_json::to_string_pretty(&tree)
-        }) {
-            Ok(s) => s,
-            Err(e) => { log::warn!("user_config: serialize: {}", e); return; }
-        };
+        let dir = path.parent().ok_or_else(|| format!("{} names no file", path.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
+        let mut tree = serde_json::to_value(self).map_err(|e| format!("serialize: {e}"))?;
+        if self.web_secret.is_none() {
+            // The file may hold a key `--web-link` stored while these
+            // settings held none. Writing none over it would break the link
+            // it printed; the app takes that key when its web UI is turned
+            // on (see `web_access::stored_or_new_secret`).
+            if let Some(key) = Self::stored_web_secret_at(path, codec) {
+                if let Some(fields) = tree.as_object_mut() {
+                    fields.insert("web_secret".into(), serde_json::Value::String(key));
+                }
+            }
+        }
+        secret_store::seal(&mut tree, &self.locked_secrets, codec);
+        let content = serde_json::to_string_pretty(&tree).map_err(|e| format!("serialize: {e}"))?;
         let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, content) {
-            log::warn!("user_config: write {}: {}", tmp.display(), e);
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            log::warn!("user_config: replace {}: {}", path.display(), e);
+        std::fs::write(&tmp, content).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+        std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-        }
+            format!("replace {}: {}", path.display(), e)
+        })
     }
 }
 
@@ -606,6 +722,96 @@ mod tests {
         assert!(!c.prefer_realtime_airplay);
         assert!(!c.airplay_homepod_buffered);
         assert_eq!(c.effective_homepod_latency_ms(), HOMEPOD_LATENCY_MS_DEFAULT);
+        assert_eq!(c.web_secret, None);
+    }
+
+    #[test]
+    fn the_web_secret_is_sealed_with_the_other_secrets() {
+        use crate::secret_store::tests::FakeCodec;
+        let dir = temp_config_dir("web-secret");
+        let path = dir.join("config.json");
+        let key = "00112233445566778899aabbccddeeff";
+        let mut c = UserConfig::default();
+        c.web_secret = Some(key.into());
+        c.save_to_with(&path, &FakeCodec(0x42));
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!disk.contains(key), "{disk}");
+        assert!(disk.contains("\"/web_secret\""), "{disk}");
+        let back = UserConfig::load_from_with(&path, &FakeCodec(0x42));
+        assert_eq!(back.web_secret.as_deref(), Some(key));
+        // Another account can't open it, and gets none.
+        let other = UserConfig::load_from_with(&path, &FakeCodec(0x43));
+        assert_eq!(other.web_secret, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saves_holding_no_web_key_keep_the_one_the_file_holds() {
+        use crate::secret_store::tests::FakeCodec;
+        let key = "00112233445566778899aabbccddeeff";
+        let own = "ffeeddccbbaa99887766554433221100";
+        let codecs: [(&str, &dyn SecretCodec); 2] = [("fake", &FakeCodec(0x42)), ("platform", &PlatformCodec)];
+        for (tag, codec) in codecs {
+            let dir = temp_config_dir(&format!("keep-web-key-{tag}"));
+            let path = dir.join("config.json");
+            // The app's settings, loaded before there was a key.
+            UserConfig::default().save_to_with(&path, codec);
+            let mut app = UserConfig::load_from_with(&path, codec);
+            // `--web-link` meanwhile, a process of its own, stores one.
+            let mut other = UserConfig::load_from_with(&path, codec);
+            other.web_secret = Some(key.into());
+            other.save_to_with(&path, codec);
+            // The app saves another setting: the key stays in the file.
+            app.last_speaker_id = Some("uuid:RINCON_KEEP".into());
+            app.try_save_to_with(&path, codec).unwrap();
+            assert_eq!(app.web_secret, None, "{tag}");
+            let back = UserConfig::load_from_with(&path, codec);
+            assert_eq!(back.web_secret.as_deref(), Some(key), "{tag}");
+            assert_eq!(back.last_speaker_id.as_deref(), Some("uuid:RINCON_KEEP"), "{tag}");
+            if codec.can_protect() {
+                let disk = std::fs::read_to_string(&path).unwrap();
+                assert!(!disk.contains(key), "{tag}: {disk}");
+            }
+            // Settings holding a key of their own save theirs.
+            app.web_secret = Some(own.into());
+            app.try_save_to_with(&path, codec).unwrap();
+            assert_eq!(UserConfig::load_from_with(&path, codec).web_secret.as_deref(), Some(own), "{tag}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn reading_the_stored_web_key_changes_nothing() {
+        use crate::secret_store::tests::FakeCodec;
+        let dir = temp_config_dir("stored-web-key");
+        let path = dir.join("config.json");
+        let key = "00112233445566778899aabbccddeeff";
+        let codec = FakeCodec(0x42);
+        assert_eq!(UserConfig::stored_web_secret_at(&path, &codec), None);
+        let mut c = UserConfig::default();
+        c.web_secret = Some(key.into());
+        c.save_to_with(&path, &codec);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(UserConfig::stored_web_secret_at(&path, &codec).as_deref(), Some(key));
+        // Another account can't open it.
+        assert_eq!(UserConfig::stored_web_secret_at(&path, &FakeCodec(0x43)), None);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // A file that isn't JSON stays where it is (loading moves it aside).
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert_eq!(UserConfig::stored_web_secret_at(&path, &codec), None);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // Test settings with a file of their own read it; ones in memory, and
+        // ones that couldn't be read at startup, read nothing.
+        let own = dir.join("own").join("config.json");
+        let mut c = UserConfig::at_path(own.clone());
+        assert_eq!(c.stored_web_secret(), None);
+        c.web_secret = Some(key.into());
+        c.save();
+        assert_eq!(UserConfig::at_path(own).stored_web_secret().as_deref(), Some(key));
+        assert_eq!(UserConfig::in_memory().stored_web_secret(), None);
+        assert_eq!(UserConfig::unsaveable().stored_web_secret(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_config_dir(tag: &str) -> std::path::PathBuf {
@@ -627,6 +833,40 @@ mod tests {
         let back = UserConfig::load_from(&path);
         assert_eq!(back.last_speaker_id.as_deref(), Some("uuid:RINCON_TEST"));
         assert_eq!(back.airplay_latency_ms, 250);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_save_says_why_the_file_was_not_written() {
+        let dir = temp_config_dir("try-save");
+        let path = dir.join("config.json");
+        let mut c = UserConfig::default();
+        c.last_speaker_id = Some("uuid:RINCON_TRY".into());
+        c.try_save_to_with(&path, &PlatformCodec).unwrap();
+        assert_eq!(UserConfig::load_from(&path).last_speaker_id.as_deref(), Some("uuid:RINCON_TRY"));
+        // A file that couldn't be read at startup is left as it is.
+        let before = std::fs::read(&path).unwrap();
+        let err = UserConfig::unsaveable().try_save_to_with(&path, &PlatformCodec).unwrap_err();
+        assert!(err.contains("couldn't be read at startup"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Its folder can't be made: a file has the name.
+        let err = c.try_save_to_with(&path.join("config.json"), &PlatformCodec).unwrap_err();
+        assert!(err.starts_with("mkdir "), "{err}");
+        // The temp file can't be written: a folder has its name.
+        let blocked = dir.join("blocked").join("config.json");
+        std::fs::create_dir_all(blocked.with_extension("json.tmp")).unwrap();
+        let err = c.try_save_to_with(&blocked, &PlatformCodec).unwrap_err();
+        assert!(err.starts_with("write "), "{err}");
+        // It can't replace the file, a folder here: the temp file goes.
+        let occupied = dir.join("occupied").join("config.json");
+        std::fs::create_dir_all(&occupied).unwrap();
+        let err = c.try_save_to_with(&occupied, &PlatformCodec).unwrap_err();
+        assert!(err.starts_with("replace "), "{err}");
+        assert!(!occupied.with_extension("json.tmp").exists());
+        // Test settings in memory: saved, and nothing written.
+        let untouched = dir.join("in-memory").join("config.json");
+        UserConfig::in_memory().try_save_to_with(&untouched, &PlatformCodec).unwrap();
+        assert!(!untouched.parent().unwrap().exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

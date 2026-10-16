@@ -1,8 +1,8 @@
 //! At-rest protection for secrets inside `config.json`.
 //!
 //! Secrets (AirPlay passwords, pairing credentials, the controller seed;
-//! Sendspin identities and pairings) never sit in their normal fields on
-//! disk. Each one is moved into a
+//! Sendspin identities and pairings; the web UI's key) never sit in their
+//! normal fields on disk. Each one is moved into a
 //! top-level `protected` object, keyed by its JSON pointer (for example
 //! `/airplay_passwords/airplay:aa`), as `dpapi:v1:<base64>`: the value's
 //! JSON sealed with Windows DPAPI in the current user's scope, so another
@@ -66,6 +66,8 @@ pub const SECRET_PATHS: &[&[&str]] = &[
     &["airplay_controller_seed_hex"],
     &["airplay_passwords", "*"],
     &["airplay_pairings", "*", "controller_seed_hex"],
+    // The web UI's link key, also the JSON API's bearer token.
+    &["web_secret"],
 ];
 
 /// Fields of one object sealed together as a single entry (see the
@@ -557,6 +559,18 @@ pub fn forget(locked: &mut Vec<LockedNode>, path: &[String]) {
     locked.retain(|n| n.pointer.as_deref() != Some(ptr.as_str()));
 }
 
+/// The secret in top-level field `key` of `root`, a config file's tree as
+/// stored, by [`unseal`]'s rules: its plain value wins, else its sealed
+/// entry if that opens. Nothing else in `root` is opened, and nothing is
+/// logged.
+pub fn stored_value(root: &Value, key: &str, codec: &dyn SecretCodec) -> Option<Value> {
+    if let Some(plain) = root.get(key).filter(|v| !v.is_null()) {
+        return Some(plain.clone());
+    }
+    let sealed = root.get(PROTECTED_KEY)?.get(pointer(&[key.to_string()]))?;
+    open_sealed(sealed, codec).ok()
+}
+
 #[cfg(windows)]
 mod dpapi {
     use windows_sys::Win32::Foundation::LocalFree;
@@ -794,6 +808,29 @@ pub(crate) mod tests {
         let r = unseal(&mut v, &FakeCodec(3));
         seal(&mut v, &r.locked, &FakeCodec(3));
         assert_eq!(v[PROTECTED_KEY], json!([1, 2]));
+    }
+
+    #[test]
+    fn stored_value_reads_one_secret_as_loading_would() {
+        let codec = FakeCodec(4);
+        let mut v = sample();
+        v["web_secret"] = json!("k1");
+        seal(&mut v, &[], &codec);
+        assert!(v.get("web_secret").is_none());
+        assert_eq!(stored_value(&v, "web_secret", &codec), Some(json!("k1")));
+        assert_eq!(stored_value(&v, "airplay_controller_seed_hex", &codec), Some(json!("11".repeat(32))));
+        // Another account's blob doesn't open.
+        assert_eq!(stored_value(&v, "web_secret", &FakeCodec(5)), None);
+        // A plain value wins over the sealed one; a null one is no value.
+        let mut both = v.clone();
+        both["web_secret"] = json!("k2");
+        assert_eq!(stored_value(&both, "web_secret", &codec), Some(json!("k2")));
+        both["web_secret"] = Value::Null;
+        assert_eq!(stored_value(&both, "web_secret", &codec), Some(json!("k1")));
+        // Nothing there, and shapes no save writes.
+        for root in [json!({}), json!({ PROTECTED_KEY: [1] }), json!({ PROTECTED_KEY: { "/web_secret": 3 } }), json!([1])] {
+            assert_eq!(stored_value(&root, "web_secret", &codec), None, "{root}");
+        }
     }
 
     #[test]

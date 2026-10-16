@@ -890,6 +890,7 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
                 homepod_latency_draft: None,
                 diagnostics_open: false,
                 diagnostics_copied_at: None,
+                web_link_copied_at: None,
                 eq_open: false,
                 eq_draft: None,
                 eq_previewed: None,
@@ -931,6 +932,8 @@ struct StreamToSpeakerApp {
     diagnostics_open: bool,
     /// When "Copy diagnostics" last succeeded, for its confirmation.
     diagnostics_copied_at: Option<Instant>,
+    /// When "Copy link" (Web UI card) last succeeded, likewise.
+    web_link_copied_at: Option<Instant>,
     /// Equalizer card expanded. Collapsing it discards an unapplied
     /// draft (the stream returns to the saved curve).
     eq_open: bool,
@@ -2447,7 +2450,7 @@ impl StreamToSpeakerApp {
                     if self.app.saved_speaker_id().is_some() {
                         if link_button(ui, p, "Forget saved", 110.0)
                             .on_hover_text(
-                                "Disconnect from the speaker and clear the saved choice. The next launch will ask you to pick again.",
+                                "Disconnect from the speaker and clear the saved choice. The next launch will ask you to pick again. Until you pick a speaker or restart the app, other devices can't fetch the audio stream either.",
                             )
                             .clicked()
                         {
@@ -3438,7 +3441,7 @@ impl StreamToSpeakerApp {
                 p,
                 "Privacy mode",
                 "Serve the audio stream only to the speaker you're streaming to.",
-                "The speaker fetches your PC's audio from a plain HTTP URL, so by default anyone on your network who knows that URL can listen to whatever your PC plays. Privacy mode serves the stream only to the speaker you're streaming to (and this PC itself): its addresses are allowed for as long as its session lasts, and switching to a different speaker cuts off anything still listening from the previous one. A refused device is named in a message, so you can tell a phone from a speaker. In a Sonos group the unit that fetches the stream is the group's coordinator — pick that one, or turn privacy mode off, if playback breaks. AirPlay speakers are unaffected either way (audio is pushed to them directly, not fetched from the URL).",
+                "Speakers that play over UPnP (Sonos and others) fetch your PC's audio from a plain HTTP address on this PC. With privacy mode off, any device on your network can play whatever your PC plays from that address, from the moment the app starts (before you pick a speaker) and whichever speaker you use — AirPlay, HomePod, Sendspin and Music Assistant included — unless you turn streaming off. Privacy mode serves the stream only to this PC and to the speaker you're streaming to, with the other speakers of its Sonos group as grouped when you picked it: their addresses are allowed for as long as the session lasts, and switching to a different speaker cuts off anything still listening from the previous one. A refused device is named in a message, so you can tell a phone from a speaker; if a speaker stays silent (say, one grouped after you picked the group), pick it again or turn privacy mode off. AirPlay, Sendspin and Music Assistant playback doesn't use the address, so privacy mode never affects it. Disabling streaming or forgetting the speaker closes the address to every other device either way.",
                 |ui| {
                     ui.checkbox(&mut privacy, "Only the active speaker may fetch the stream");
                 },
@@ -3453,17 +3456,6 @@ impl StreamToSpeakerApp {
                     .size(12.0)
                     .color(p.text_secondary),
                 );
-                if self.app.is_web_ui_enabled() {
-                    ui.label(
-                        egui::RichText::new(
-                            "⚠  The web UI is on: anyone on your network who can open it \
-                             can point the stream at another device, which defeats \
-                             privacy mode. Turn one of the two off.",
-                        )
-                        .size(12.0)
-                        .color(p.warn),
-                    );
-                }
             }
         });
     }
@@ -3568,80 +3560,102 @@ impl StreamToSpeakerApp {
         card(ui, p, |ui| {
             section_label(ui, p, "Web UI");
 
-            let on = self.app.is_web_ui_enabled();
-            let url = format!(
-                "http://{}:{}/",
-                self.app.config.advertise_ip,
-                self.app.config.bind.port()
-            );
-
             ui.label(
                 egui::RichText::new(
                     "Browser-based control panel + JSON API. Lets you switch \
-                     speakers, adjust latency, and read stats from another device \
-                     on your LAN (e.g. your phone).",
+                     speakers and adjust latency from another device on your \
+                     LAN (e.g. your phone).",
                 )
                 .size(12.0)
                 .color(p.text_secondary),
             );
             ui.add_space(sp::S);
 
-            ui.horizontal(|ui| {
-                if on {
-                    // Web UI is a side feature, not the screen's primary
-                    // action. Use the lighter link-style button instead
-                    // of competing with Enable streaming in the status
-                    // banner.
-                    if link_button(ui, p, "Open in browser", 150.0)
-                        .on_hover_text(format!("Open {} in your default browser", url))
-                        .clicked()
-                    {
-                        if let Err(e) = open_url(&url) {
-                            // m25: previously the failure was silent.
-                            self.app.record_error(
-                                format!("Couldn't open the browser: {}. URL: {}", e, url),
-                            );
-                        }
-                    }
-                    if secondary_button(ui, p, "Disable web UI", 140.0)
-                        .on_hover_text("Stop serving the web UI")
-                        .clicked()
-                    {
-                        self.app.set_web_ui_enabled(false);
-                    }
-                } else if secondary_button(ui, p, "Enable web UI", 140.0)
+            // The link carries the web UI's key, so it is the credential:
+            // shown here, copied or opened on request, never put in a
+            // message or the log.
+            let Some(link) = self.app.web_link() else {
+                if secondary_button(ui, p, "Enable web UI", 140.0)
                     .on_hover_text(
-                        "Turn on the web control panel. \
-                         The audio stream stays available either way.",
+                        "Turn on the web control panel. It opens from a link with a \
+                         secret key, shown here. The audio stream stays available \
+                         either way.",
                     )
                     .clicked()
                 {
-                    self.app.set_web_ui_enabled(true);
+                    if let Err(e) = self.app.set_web_ui_enabled(true) {
+                        self.app.record_error(format!("Couldn't turn the web UI on: {}", e));
+                    }
+                }
+                return;
+            };
+
+            ui.label(egui::RichText::new(&link).size(12.0).color(p.text_primary).monospace())
+                .on_hover_text(
+                    "Scripts use the part after /r/ as their API key: they send \
+                     Authorization: Bearer <key>.",
+                );
+            ui.label(
+                egui::RichText::new(
+                    "Anyone with this link can control Stream To Speaker on this network.",
+                )
+                .size(12.0)
+                .color(p.text_secondary),
+            );
+            ui.add_space(sp::XS);
+            ui.horizontal_wrapped(|ui| {
+                if secondary_button(ui, p, "Copy link", 110.0)
+                    .on_hover_text("Copy the link, to open it on your phone or another computer")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(link.clone());
+                    self.web_link_copied_at = Some(Instant::now());
+                }
+                // Web UI is a side feature, not the screen's primary
+                // action. Use the lighter link-style button instead
+                // of competing with Enable streaming in the status
+                // banner.
+                if link_button(ui, p, "Open in browser", 150.0)
+                    .on_hover_text("Open the web UI in your default browser")
+                    .clicked()
+                {
+                    if let Err(e) = open_url(&link) {
+                        // The message leaves the link out (it carries the
+                        // key) and points at Copy link instead.
+                        self.app.record_error(format!(
+                            "Couldn't open the browser ({}). Use Copy link and paste the \
+                             link into one.",
+                            e
+                        ));
+                    }
+                }
+                if secondary_button(ui, p, "Make a new link", 150.0)
+                    .on_hover_text(
+                        "Replace the link's key. The current link, and scripts using \
+                         its key, stop working.",
+                    )
+                    .clicked()
+                {
+                    match self.app.new_web_link() {
+                        Ok(()) => self.web_link_copied_at = None,
+                        Err(e) => self.app.record_error(format!("Couldn't make a new link: {}", e)),
+                    }
+                }
+                if secondary_button(ui, p, "Disable web UI", 140.0)
+                    .on_hover_text(
+                        "Stop serving the web UI. The same link works again when you \
+                         turn it back on.",
+                    )
+                    .clicked()
+                {
+                    if let Err(e) = self.app.set_web_ui_enabled(false) {
+                        self.app.record_error(format!("Couldn't turn the web UI off: {}", e));
+                    }
+                }
+                if self.web_link_copied_at.map_or(false, |t| t.elapsed() < Duration::from_secs(3)) {
+                    ui.label(egui::RichText::new("Copied.").size(12.0).color(p.text_secondary));
                 }
             });
-
-            if on && self.app.is_privacy_mode() {
-                ui.add_space(sp::XS);
-                ui.label(
-                    egui::RichText::new(
-                        "⚠  Privacy mode is on, but anyone on your network who can open \
-                         this web UI can switch the stream to another device — which \
-                         defeats it. Turn one of the two off.",
-                    )
-                    .size(12.0)
-                    .color(p.warn),
-                );
-            }
-
-            if on {
-                ui.add_space(sp::XS);
-                ui.label(
-                    egui::RichText::new(&url)
-                        .size(12.0)
-                        .color(p.text_tertiary)
-                        .monospace(),
-                );
-            }
         });
     }
 
