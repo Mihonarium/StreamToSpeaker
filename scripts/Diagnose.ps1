@@ -1,4 +1,4 @@
-# StreamToSpeaker — post-install diagnostic.
+# StreamToSpeaker - post-install diagnostic.
 #
 # Run this in an elevated PowerShell session AFTER installing. It
 # prints six critical values that pinpoint where the audio endpoint
@@ -9,6 +9,12 @@
 #
 # Paste the entire output into a GitHub issue or back to the
 # developer. Non-destructive, runs in ~5 s.
+#
+# Keep this file ASCII. Windows PowerShell reads a script without a
+# byte-order mark in the system's ANSI code page; in the single-byte
+# Windows code pages a UTF-8 dash turns into three characters, one of
+# them a curly quote that ends a string early, and the whole script
+# fails to parse.
 
 $ErrorActionPreference = "Continue"
 
@@ -49,17 +55,17 @@ if (Test-Path $sys32) {
     $sig = Get-AuthenticodeSignature -FilePath $sys32 -ErrorAction SilentlyContinue
     "  Signature : $($sig.Status)  ($($sig.SignerCertificate.Subject))"
 } else {
-    "System32\drivers\StreamToSpeaker.sys NOT FOUND — driver not active"
+    "System32\drivers\StreamToSpeaker.sys NOT FOUND - driver not active"
 }
 $store = Get-ChildItem "$env:windir\System32\DriverStore\FileRepository" -Filter 'streamtospeaker*' -Directory -ErrorAction SilentlyContinue
 if ($store) { foreach ($d in $store) { "Driver store : $($d.FullName)" } }
-else { "Driver store : (no StreamToSpeaker entry — pnputil /add-driver never completed)" }
+else { "Driver store : (no StreamToSpeaker entry - pnputil /add-driver never completed)" }
 
 # pnputil & devcon status (if the installer copied devcon under {app}\driver)
 "-- pnputil /enum-devices /instanceid Root\StreamToSpeaker --"
 & pnputil /enum-devices /instanceid 'Root\StreamToSpeaker' 2>&1 | ForEach-Object { "  $_" }
 
-Write-Header "2. MMDevices registry — the 6 critical values"
+Write-Header "2. MMDevices registry - the 6 critical values"
 $base = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render'
 $ffNames = @{ 0='RemoteNetworkDevice'; 1='Speakers'; 2='LineLevel'; 3='Headphones';
               4='Microphone'; 5='Headset'; 6='Handset'; 7='UnknownDigitalPassthrough';
@@ -94,15 +100,41 @@ if (Test-Path $base) {
 }
 
 Write-Header "3. install.log tail (Pre-Install + Rename-Endpoint output)"
-$log = "$env:LOCALAPPDATA\StreamToSpeaker\install.log"
-if (Test-Path $log) {
-    Get-Content $log -Tail 60 -ErrorAction SilentlyContinue | ForEach-Object { "  $_" }
+# Pre-Install.ps1 and Rename-Endpoint.ps1 log to
+# <install dir>\logs\install.log. Run from <install dir>\scripts, this
+# script takes the install directory from its own location (the folder
+# above its own holds stream-to-speaker.exe); a copy run from anywhere
+# else finds it through the install's Apps & Features entry, named after
+# the AppId in installer\StreamToSpeaker.iss. The 64-bit install
+# registers that entry in the 64-bit registry view, which 32-bit Windows
+# PowerShell only reads when asked for it.
+$appDir = Split-Path -Parent $PSScriptRoot
+if (-not (Test-Path -LiteralPath (Join-Path $appDir 'stream-to-speaker.exe'))) {
+    try {
+        $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')
+        $entry = $hklm.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{8A6C7F92-3E1B-4A2B-9F1C-77F1B6B2A6E0}_is1')
+        if ($entry) {
+            $location = [string]$entry.GetValue('InstallLocation')
+            if ($location) { $appDir = $location.TrimEnd('\') }
+            $entry.Close()
+        }
+        $hklm.Close()
+    } catch {
+        "  (could not read the Apps & Features entry: $($_.Exception.Message))"
+    }
+}
+$log = Join-Path (Join-Path $appDir 'logs') 'install.log'
+if (Test-Path -LiteralPath $log) {
+    Get-Content -LiteralPath $log -Tail 60 -ErrorAction SilentlyContinue | ForEach-Object { "  $_" }
 } else {
-    "  install.log not at $log — the post-install scripts may have run under the SYSTEM"
-    "  account; check: $env:SystemRoot\System32\config\systemprofile\AppData\Local\StreamToSpeaker\install.log"
+    "  install.log not at $log"
+    # Only named, never read: this script runs elevated, and that folder is
+    # in a user profile, where the user's own programs can redirect it.
+    "  (Installs by earlier versions kept it in %LOCALAPPDATA%\StreamToSpeaker"
+    "  of the account that approved the install.)"
 }
 
-Write-Header "4. setupapi.dev.log — last StreamToSpeaker entries"
+Write-Header "4. setupapi.dev.log - last StreamToSpeaker entries"
 $setup = "$env:windir\INF\setupapi.dev.log"
 if (Test-Path $setup) {
     Select-String -Path $setup -Pattern 'StreamToSpeaker' -SimpleMatch |
@@ -111,7 +143,7 @@ if (Test-Path $setup) {
     "  setupapi.dev.log not found"
 }
 
-Write-Header "5. Decision tree — read top to bottom, stop at first match"
+Write-Header "5. Decision tree - read top to bottom, stop at first match"
 @'
 - DeviceState=NOTPRESENT (4) or no entry at all:
     -> driver not loading (check section 1: signature, store entry; and
