@@ -51,8 +51,13 @@ pub mod rtp;
 pub mod rtsp;
 pub mod session;
 pub mod srp;
+#[cfg(test)]
+pub(crate) mod srp_test_receiver;
+#[cfg(test)]
+pub(crate) mod test_peers;
 pub mod timing;
 pub mod tlv8;
+pub mod untrusted_plist;
 
 pub use ap2_session::{AirPlay2Session, AirPlay2SessionConfig, Ap2StartError};
 pub use discovery::{spawn_airplay_discovery, AirPlayDiscoveryState, AirPlayRenderer, Transport};

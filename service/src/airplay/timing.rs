@@ -58,7 +58,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Convert a latency in milliseconds to sample frames at the wire rate —
 /// the unit the sync-packet anchor and `Audio-Latency` speak. 2000 ms →
@@ -358,6 +358,134 @@ mod tests {
         assert_eq!(rb.get(999), None);
     }
 
+    /// A history of `n` small packets with sequence numbers 0..n.
+    fn history(n: u16) -> Arc<ResendBuffer> {
+        let h = ResendBuffer::new(512);
+        for seq in 0..n {
+            h.record(seq, &[0x80, 0x60, (seq >> 8) as u8, seq as u8]);
+        }
+        h
+    }
+
+    fn request(first: u16, count: u16) -> [u8; 8] {
+        let mut r = [0x80, 0xD5, 0, 1, 0, 0, 0, 0];
+        r[4..6].copy_from_slice(&first.to_be_bytes());
+        r[6..8].copy_from_slice(&count.to_be_bytes());
+        r
+    }
+
+    #[test]
+    fn a_resend_flood_is_held_to_the_rate() {
+        let h = history(512);
+        let stats = ResendStats::default();
+        let t0 = Instant::now();
+        let mut limit = ResendLimit::new(t0);
+        let mut sent = 0u64;
+        // Ten full-size requests at once: the burst (two of them) goes out.
+        for _ in 0..10 {
+            sent += answer_resend_request(&request(0, 128), &h, &mut limit, t0, &stats, |_| true).sent as u64;
+        }
+        assert_eq!(sent, 256);
+        assert_eq!(stats.queue_drops.load(Ordering::Relaxed), 8 * 128);
+        // 100 ms later: 100 packets' worth has come back.
+        let out = answer_resend_request(&request(128, 128), &h, &mut limit, t0 + Duration::from_millis(100), &stats, |_| true);
+        assert_eq!(out, ResendOutcome { sent: 100, held_back: 28 });
+        // A flood kept up for ten seconds gets the rate, nothing more.
+        let mut flood_sent = 0u64;
+        for ms in 1..=10_000u64 {
+            let now = t0 + Duration::from_millis(100 + ms);
+            flood_sent += answer_resend_request(&request(0, 128), &h, &mut limit, now, &stats, |_| true).sent as u64;
+        }
+        assert!((9_999..=10_001).contains(&flood_sent), "{flood_sent}");
+        assert_eq!(stats.packets.load(Ordering::Relaxed), 256 + 100 + flood_sent);
+        assert_eq!(stats.requests.load(Ordering::Relaxed), 10 + 1 + 10_000);
+    }
+
+    /// A badly lossy link — 500 lost packets a second, four times the
+    /// stream's packet rate — gets every one of them back.
+    #[test]
+    fn heavy_genuine_loss_is_fully_served() {
+        let h = history(512);
+        let stats = ResendStats::default();
+        let t0 = Instant::now();
+        let mut limit = ResendLimit::new(t0);
+        for i in 0..1250u64 {
+            let now = t0 + Duration::from_millis(i * 8);
+            let first = (i * 4 % 508) as u16;
+            let out = answer_resend_request(&request(first, 4), &h, &mut limit, now, &stats, |_| true);
+            assert_eq!(out, ResendOutcome { sent: 4, held_back: 0 }, "request {i}");
+        }
+        assert_eq!(stats.queue_drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unknown_sequence_numbers_send_nothing_and_cost_nothing() {
+        let h = history(64);
+        let stats = ResendStats::default();
+        let t0 = Instant::now();
+        let mut limit = ResendLimit::new(t0);
+        for _ in 0..100 {
+            let out = answer_resend_request(&request(20_000, 128), &h, &mut limit, t0, &stats, |_| panic!("sent"));
+            assert_eq!(out, ResendOutcome::default());
+        }
+        let out = answer_resend_request(&request(0, 64), &h, &mut limit, t0, &stats, |_| true);
+        assert_eq!(out.sent, 64);
+        assert_eq!(stats.queue_drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn one_request_resends_at_most_128_packets_in_order() {
+        let h = history(512);
+        let stats = ResendStats::default();
+        let mut limit = ResendLimit::new(Instant::now());
+        let mut seqs = Vec::new();
+        let out = answer_resend_request(&request(300, 1000), &h, &mut limit, Instant::now(), &stats, |resp| {
+            seqs.push(u16::from_be_bytes([resp[2], resp[3]]));
+            true
+        });
+        assert_eq!(out.sent, 128);
+        assert_eq!(seqs, (300..428).collect::<Vec<u16>>());
+    }
+
+    /// The responder thread applies the limit: a burst of requests from
+    /// the receiver's address gets the burst allowance back, plus what the
+    /// rate refills while the replies are read, and no more.
+    #[test]
+    fn responder_thread_holds_a_flood_to_the_rate() {
+        let speaker = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let control = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let control_addr = control.local_addr().unwrap();
+        let stats = Arc::new(ResendStats::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let handle = spawn_resend_responder(
+            control,
+            speaker.local_addr().unwrap(),
+            history(512),
+            stats.clone(),
+            stop.clone(),
+            "test".into(),
+        )
+        .unwrap();
+        for i in 0..20u16 {
+            speaker.send_to(&request(i * 16, 128), control_addr).unwrap();
+        }
+        speaker.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut got = 0u64;
+        let mut buf = [0u8; 64];
+        while speaker.recv_from(&mut buf).is_ok() {
+            got += 1;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        stop.store(true, Ordering::Release);
+        handle.join().unwrap();
+        let ceiling = RESEND_BURST + elapsed * RESEND_RATE_PER_SEC + 1.0;
+        assert!(got >= 256 && (got as f64) <= ceiling, "got {got}, ceiling {ceiling}");
+        assert_eq!(stats.packets.load(Ordering::Relaxed), got);
+        assert_eq!(stats.requests.load(Ordering::Relaxed), 20);
+        assert_eq!(stats.packets.load(Ordering::Relaxed) + stats.queue_drops.load(Ordering::Relaxed), 20 * 128);
+    }
+
     #[test]
     fn resend_response_wraps_original_packet() {
         let original = [0x80, 0x60, 0x12, 0x34, 0xDE, 0xAD];
@@ -427,6 +555,16 @@ pub fn build_ptp_sync_homepod(first: bool, cur_rtp: u32, latency: u32, ptp_ns: u
 /// cap so a malformed `count` can't make us flood the receiver.
 const MAX_RESEND_RUN: u16 = 128;
 
+/// Packets re-sent per second, on average, at most. About eight times the
+/// stream's own packet rate (44100 / 352 ≈ 125 a second), so even a very
+/// lossy link gets back every packet it asks for, while a flood of
+/// requests — which takes no more than datagrams that carry the
+/// receiver's address — can't make us send more than this at the speaker.
+const RESEND_RATE_PER_SEC: f64 = 1000.0;
+/// Packets that can be re-sent back to back before the rate applies: two
+/// full-size requests.
+const RESEND_BURST: f64 = 256.0;
+
 /// Ring of recently-sent audio packets keyed by RTP sequence number, so
 /// we can answer the receiver's retransmit (resend) requests when Wi-Fi
 /// drops a packet. Stores the full on-wire bytes (RTP header + payload),
@@ -472,12 +610,6 @@ fn build_resend_response(seq: u16, original_packet: &[u8]) -> Vec<u8> {
     resp
 }
 
-/// Spawn the retransmit responder. Listens on the control socket for
-/// resend *requests* (`0x80 0xD5`: first-missing-seq + run length) and
-/// re-sends matching buffered packets to the receiver's control port.
-///
-/// The control socket is shared with the sync sender via `try_clone`
-/// (the sync sender only writes; this thread reads + writes).
 /// Retransmission counters for one session, shared between the resend
 /// responder (writer) and whoever reports them (the Stats card, the log
 /// line at exit). Resend requests are the receiver telling us packets
@@ -496,7 +628,9 @@ pub struct ResendStats {
     pub missing: AtomicU64,
     /// Requested packets past their playout deadline (not resent).
     pub expired: AtomicU64,
-    /// Requested packets dropped because the pending queue was full.
+    /// Requested packets not re-sent because a limit was reached: the
+    /// pending queue was full (HomePod path) or the rate limit held them
+    /// back (the classic responder).
     pub queue_drops: AtomicU64,
     /// Resends that failed on the socket.
     pub send_errors: AtomicU64,
@@ -518,6 +652,81 @@ pub(crate) fn from_receiver(peer: IpAddr, receiver: IpAddr) -> bool {
     crate::stream_gate::canonical_ip(peer) == crate::stream_gate::canonical_ip(receiver)
 }
 
+/// Token bucket over re-sent packets: holds up to [`RESEND_BURST`] and
+/// refills at [`RESEND_RATE_PER_SEC`].
+struct ResendLimit {
+    tokens: f64,
+    refilled: Instant,
+}
+
+impl ResendLimit {
+    fn new(now: Instant) -> Self {
+        Self { tokens: RESEND_BURST, refilled: now }
+    }
+
+    /// Take one packet's worth, if there is one.
+    fn take(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.refilled).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * RESEND_RATE_PER_SEC).min(RESEND_BURST);
+        self.refilled = self.refilled.max(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// What one resend request came to.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ResendOutcome {
+    /// Packets re-sent.
+    sent: u16,
+    /// Packets still in the history that the rate limit held back.
+    held_back: u16,
+}
+
+/// Answer one resend request (`0x80 0xD5`, seq, first seq, count): re-send
+/// each requested packet still in `history`, at most [`MAX_RESEND_RUN`] of
+/// them and only as far as `limit` allows, through `send` (true = sent).
+/// Unknown sequence numbers cost nothing. Packets held back by the limit
+/// are counted in `stats.queue_drops`.
+fn answer_resend_request(
+    request: &[u8],
+    history: &ResendBuffer,
+    limit: &mut ResendLimit,
+    now: Instant,
+    stats: &ResendStats,
+    mut send: impl FnMut(&[u8]) -> bool,
+) -> ResendOutcome {
+    stats.requests.fetch_add(1, Ordering::Relaxed);
+    let first = BigEndian::read_u16(&request[4..6]);
+    let count = BigEndian::read_u16(&request[6..8]).min(MAX_RESEND_RUN);
+    let mut out = ResendOutcome::default();
+    for i in 0..count {
+        let seq = first.wrapping_add(i);
+        let Some(pkt) = history.get(seq) else { continue };
+        if !limit.take(now) {
+            out.held_back += 1;
+            continue;
+        }
+        if send(&build_resend_response(seq, &pkt)) {
+            out.sent += 1;
+        }
+    }
+    stats.packets.fetch_add(out.sent as u64, Ordering::Relaxed);
+    stats.queue_drops.fetch_add(out.held_back as u64, Ordering::Relaxed);
+    out
+}
+
+/// Spawn the retransmit responder. Listens on the control socket for
+/// resend *requests* (`0x80 0xD5`: first-missing-seq + run length) from
+/// the receiver's address and re-sends matching buffered packets to the
+/// receiver's control port, within [`RESEND_RATE_PER_SEC`].
+///
+/// The control socket is shared with the sync sender via `try_clone`
+/// (the sync sender only writes; this thread reads + writes).
 pub fn spawn_resend_responder(
     control_socket: UdpSocket,
     receiver_control_addr: SocketAddr,
@@ -532,6 +741,8 @@ pub fn spawn_resend_responder(
         .spawn(move || {
             let mut buf = [0u8; 64];
             let mut requests: u64 = 0;
+            let mut limit = ResendLimit::new(Instant::now());
+            let mut limit_logged = false;
             while !stop_flag.load(Ordering::Acquire) {
                 match control_socket.recv_from(&mut buf) {
                     // Resend request: 0x80 0xD5, seq(2), first(2), count(2).
@@ -541,7 +752,6 @@ pub fn spawn_resend_responder(
                             && from_receiver(peer.ip(), receiver_control_addr.ip()) =>
                     {
                         requests += 1;
-                        stats.requests.fetch_add(1, Ordering::Relaxed);
                         if requests == 1 {
                             // A resend request proves the receiver is
                             // consuming our RTP stream (it tracks seq gaps).
@@ -550,22 +760,23 @@ pub fn spawn_resend_responder(
                                 peer
                             );
                         }
-                        let first = BigEndian::read_u16(&buf[4..6]);
-                        let count = BigEndian::read_u16(&buf[6..8]).min(MAX_RESEND_RUN);
-                        let mut sent = 0u16;
-                        for i in 0..count {
-                            let seq = first.wrapping_add(i);
-                            if let Some(pkt) = resend.get(seq) {
-                                let resp = build_resend_response(seq, &pkt);
-                                if control_socket.send_to(&resp, receiver_control_addr).is_ok() {
-                                    sent += 1;
-                                }
-                            }
+                        let out = answer_resend_request(&buf[..n], &resend, &mut limit, Instant::now(), &stats, |resp| {
+                            control_socket.send_to(resp, receiver_control_addr).is_ok()
+                        });
+                        if out.held_back > 0 && !limit_logged {
+                            limit_logged = true;
+                            warn!(
+                                "AirPlay resend: requests from {} ask for more than {} packets a second; \
+                                 holding back the rest",
+                                peer, RESEND_RATE_PER_SEC
+                            );
                         }
-                        stats.packets.fetch_add(sent as u64, Ordering::Relaxed);
                         debug!(
-                            "AirPlay resend: req first={} count={} → re-sent {}",
-                            first, count, sent
+                            "AirPlay resend: req first={} count={} → re-sent {}, held back {}",
+                            BigEndian::read_u16(&buf[4..6]),
+                            BigEndian::read_u16(&buf[6..8]),
+                            out.sent,
+                            out.held_back
                         );
                     }
                     // Anything else on the control socket (e.g. the
@@ -584,8 +795,11 @@ pub fn spawn_resend_responder(
             }
             let (req, pk) = stats.snapshot();
             info!(
-                "AirPlay resend responder: exiting after {} resend request(s), {} packet(s) re-sent",
-                req, pk
+                "AirPlay resend responder: exiting after {} resend request(s), {} packet(s) re-sent, \
+                 {} held back by the rate limit",
+                req,
+                pk,
+                stats.queue_drops.load(Ordering::Relaxed)
             );
         })
 }

@@ -101,7 +101,9 @@ num-bigint = "0.4"
 num-traits = "0.2"
 # Binary property lists for the AirPlay 2 RTSP SETUP request/response.
 plist = "1"
-# Wipe SRP/session key material on drop.
+# Wipes key material kept in plain byte buffers when it is dropped (the SRP
+# session key, AirPlay 2 session keys, handshake secrets). Big numbers
+# (num-bigint, e.g. the SRP private exponent) can't be wiped this way.
 zeroize = "1"
 # Constant-time comparison of the web UI's key (web_access.rs). Already in
 # the tree through the crypto crates.

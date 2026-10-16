@@ -24,7 +24,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
-use crate::airplay::AirPlayRenderer;
+use crate::airplay::{untrusted_plist, AirPlayRenderer};
 
 /// Default AirPlay port offered in the add dialog.
 pub const DEFAULT_AIRPLAY_PORT: u16 = 7000;
@@ -339,7 +339,7 @@ fn read_response(stream: &mut impl Read, deadline: Instant) -> Option<(u16, Vec<
 
 /// Pull the fields we route on out of an `/info` plist (binary or XML).
 fn parse_info(body: &[u8]) -> Option<ReceiverInfo> {
-    let value: Value = plist::from_bytes(body).ok()?;
+    let value: Value = untrusted_plist::parse(body).ok()?;
     let dict = value.as_dictionary()?;
     let string = |k: &str| {
         dict.get(k)
@@ -465,6 +465,29 @@ mod tests {
         assert_eq!(info.model.as_deref(), Some("AudioAccessory5,1"));
         assert_eq!(info.pk.as_deref(), Some("ab01"));
         assert!(parse_info(b"not a plist").is_none());
+    }
+
+    /// A full-size `/info` answer gives the same fields.
+    #[test]
+    fn realistic_info_fields_are_extracted() {
+        use crate::airplay::untrusted_plist::samples::info_answer;
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &info_answer()).unwrap();
+        let info = parse_info(&body).unwrap();
+        assert_eq!(info.features, Some(0x1C340_445F8A00));
+        assert_eq!(info.model.as_deref(), Some("AppleTV11,1"));
+        assert_eq!(info.name.as_deref(), Some("Living Room"));
+        assert_eq!(info.pk, Some("ab".repeat(32)));
+    }
+
+    /// A deeply nested `/info` answer (read before any pairing) is
+    /// treated like any unreadable one, even on a small stack.
+    #[test]
+    fn deeply_nested_info_is_unreadable_not_fatal() {
+        use crate::airplay::untrusted_plist::samples::{nested_arrays_binary, nested_arrays_xml, on_small_stack};
+        for body in [nested_arrays_binary(100_000), nested_arrays_xml(100_000)] {
+            assert!(on_small_stack(move || parse_info(&body).is_none()));
+        }
     }
 
     #[test]

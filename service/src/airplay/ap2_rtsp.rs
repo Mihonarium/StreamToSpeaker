@@ -27,8 +27,11 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use crate::airplay::ap2_crypto::{ChannelCipher, HapReader, SessionKeys};
-use crate::airplay::hap_pairing::{PairSetupPin, PairVerify, PairingCredentials, X_APPLE_HKP_PERSISTENT};
+use crate::airplay::hap_pairing::{
+    M4Failure, PairSetupPin, PairVerify, PairingCredentials, StoredPairing, X_APPLE_HKP_PERSISTENT,
+};
 use crate::airplay::pairing::{TransientPairing, X_APPLE_HKP_VALUE};
+use crate::airplay::untrusted_plist;
 
 const USER_AGENT: &str = "AirPlay/665.13.1";
 
@@ -67,26 +70,34 @@ pub enum TransientOutcome {
     NeedsPin,
 }
 
-/// Why a `pair-verify` failed. The distinction is load-bearing: stored
-/// long-term credentials may only be discarded on [`Rejected`] — a response
-/// was received and the receiver (or its crypto) refused the pairing. A
-/// [`Transport`] failure (socket timeout, reset, half-open hold) proves
-/// nothing about the credentials, and wiping them on it would force the
-/// user through a new PIN ceremony after every Wi-Fi blip. Mirrors
-/// OwnTone, which clears `auth_key` only in the pair-verify response
-/// handlers' error paths, never on connection failures.
-///
-/// [`Rejected`]: PairVerifyError::Rejected
-/// [`Transport`]: PairVerifyError::Transport
+/// Why a `pair-verify` with a stored pairing failed. None of these is
+/// grounds for deleting the stored credentials, because no refusal is
+/// authenticated: any host the app reaches at the receiver's address can
+/// produce the first two, and a relay in the middle can forge the third.
+/// Only a new PIN pairing (which replaces them) or the user removes them.
 #[derive(Debug, thiserror::Error)]
 pub enum PairVerifyError {
-    /// Socket-level failure — no response received. Credentials unproven.
-    #[error("pair-verify transport failure: {0:#}")]
-    Transport(#[source] anyhow::Error),
-    /// The receiver answered and refused (non-200 status, TLV error, or a
-    /// failed signature check). Credentials are stale — re-pair.
-    #[error("pair-verify rejected by receiver: {0:#}")]
-    Rejected(#[source] anyhow::Error),
+    /// No usable answer: the socket failed, timed out or closed, or what
+    /// came back wasn't a well-formed RTSP reply — or, after M3, an M4
+    /// that isn't a TLV or is neither State 4 nor an error. Says nothing
+    /// about the pairing. (A well-formed reply to M1 whose body isn't a
+    /// valid M2 is [`NotProven`](PairVerifyError::NotProven).)
+    #[error("pair-verify got no usable answer: {0:#}")]
+    NoAnswer(#[source] anyhow::Error),
+    /// Something answered but never proved it holds the paired accessory's
+    /// key: a non-200 reply to M1, or an M2 that is malformed, carries an
+    /// error, names another accessory or isn't signed with the stored key.
+    /// An impostor, another device at a stale address and the accessory
+    /// after a reset to new keys all look like this.
+    #[error("pair-verify answered without proving it is the paired accessory: {0:#}")]
+    NotProven(#[source] anyhow::Error),
+    /// The accessory proved its key (M2's signature matched the stored
+    /// one), then refused this controller: a non-200 reply to M3 or an M4
+    /// that carries an error — HAP's answer for a controller it no longer
+    /// knows, e.g. after the PC was removed on the device. M4 is unsigned,
+    /// so a relay in the middle can forge this too.
+    #[error("the paired accessory refused this PC's pairing: {0:#}")]
+    Refused(#[source] anyhow::Error),
 }
 
 /// Payload codec of a realtime stream: raw big-endian PCM (`ct` 1) or
@@ -286,7 +297,7 @@ impl Ap2Rtsp {
         if resp.status != 200 {
             bail!("GET /info → {} {}", resp.status, resp.status_text);
         }
-        if let Ok(v) = plist::from_bytes::<Value>(&resp.body) {
+        if let Ok(v) = untrusted_plist::parse(&resp.body) {
             if let Some(d) = v.as_dictionary() {
                 debug!(
                     "AP2 /info: model={:?} srcvers={:?} ({} keys)",
@@ -461,51 +472,52 @@ impl Ap2Rtsp {
         Ok(creds)
     }
 
-    /// HomeKit pair-verify M1–M4 (X-Apple-HKP: 3) using stored
-    /// [`PairingCredentials`]. On success the channel becomes encrypted
-    /// (like transient pairing) and the 32-byte audio key is returned. The
-    /// session key is the X25519 shared secret run through the same
-    /// derivation as transient (OwnTone's `session_cipher_setup`).
+    /// HomeKit pair-verify M1–M4 (X-Apple-HKP: 3) from a stored pairing.
+    /// On success the channel becomes encrypted (like transient pairing)
+    /// and the 32-byte audio key is returned. The session key is the
+    /// X25519 shared secret run through the same derivation as transient
+    /// (OwnTone's `session_cipher_setup`).
     ///
-    /// The error type distinguishes transport failures from receiver
-    /// rejections so the caller only invalidates stored credentials when
-    /// the receiver actually refused them.
+    /// The error says how far the exchange got (see [`PairVerifyError`]);
+    /// none of its cases proves the stored credentials are stale.
     pub fn pair_verify(
         &mut self,
-        creds: &PairingCredentials,
+        pairing: &StoredPairing,
     ) -> std::result::Result<[u8; 32], PairVerifyError> {
-        use PairVerifyError::{Rejected, Transport};
+        use PairVerifyError::{NoAnswer, NotProven, Refused};
         let hkp = vec![("X-Apple-HKP".to_string(), X_APPLE_HKP_PERSISTENT.to_string())];
-        let mut pv = PairVerify::new(creds.clone());
+        let mut pv = PairVerify::new(pairing.clone());
 
         let m1 = pv.start();
         let r1 = self
             .request("POST", "/pair-verify", &hkp, Some("application/octet-stream"), &m1)
-            .map_err(Transport)?;
+            .map_err(NoAnswer)?;
         if r1.status != 200 {
-            return Err(Rejected(anyhow!(
+            return Err(NotProven(anyhow!(
                 "pair-verify M1 → {} {}{}",
                 r1.status,
                 r1.status_text,
                 describe_error_body(&r1.body)
             )));
         }
-        let m3 = pv
-            .handle_m2(&r1.body)
-            .context("pair-verify M2→M3")
-            .map_err(Rejected)?;
+        let m3 = pv.handle_m2(&r1.body).context("pair-verify M2").map_err(NotProven)?;
+        // From here on the peer has proved it holds the paired accessory's
+        // key, for this exchange.
         let r2 = self
             .request("POST", "/pair-verify", &hkp, Some("application/octet-stream"), &m3)
-            .map_err(Transport)?;
+            .map_err(NoAnswer)?;
         if r2.status != 200 {
-            return Err(Rejected(anyhow!(
+            return Err(Refused(anyhow!(
                 "pair-verify M3 → {} {}{}",
                 r2.status,
                 r2.status_text,
                 describe_error_body(&r2.body)
             )));
         }
-        let mut shared = pv.finish(&r2.body).context("pair-verify M4").map_err(Rejected)?;
+        let mut shared = pv.finish(&r2.body).map_err(|f| match f {
+            M4Failure::Refused(e) => Refused(e.context("pair-verify M4")),
+            M4Failure::Unreadable(e) => NoAnswer(e.context("pair-verify M4")),
+        })?;
         let keys = SessionKeys::from_shared(&shared);
         // The shared secret is the IKM for every session key — wipe our
         // stack copy once the (zeroize-on-Drop) SessionKeys are derived.
@@ -1124,7 +1136,7 @@ fn parse_response(buf: &mut Vec<u8>, strict: bool) -> Result<Option<Resp>> {
 /// `initialVolume` (dB) from a `GET /info` plist — a real or an integer.
 /// Values that aren't finite or lie above 0 dB are rejected as `None`.
 fn parse_initial_volume(body: &[u8]) -> Option<f64> {
-    let v: Value = plist::from_bytes(body).ok()?;
+    let v = untrusted_plist::parse(body).ok()?;
     let raw = v.as_dictionary()?.get("initialVolume")?;
     let db = raw
         .as_real()
@@ -1148,14 +1160,11 @@ fn to_binary_plist(value: &Value) -> Result<Vec<u8>> {
 /// mandatory for AirPlay 2; the timing port is where the receiver expects
 /// our NTP-mode timing traffic to originate.
 fn parse_timing_setup(body: &[u8]) -> TimingSetup {
+    let parsed = untrusted_plist::parse(body).ok();
     let port = |key: &str| -> u16 {
-        plist::from_bytes::<Value>(body)
-            .ok()
-            .and_then(|v| {
-                v.as_dictionary()?
-                    .get(key)
-                    .and_then(|p| p.as_unsigned_integer())
-            })
+        parsed
+            .as_ref()
+            .and_then(|v| v.as_dictionary()?.get(key)?.as_unsigned_integer())
             .map(|p| p as u16)
             .unwrap_or(0)
     };
@@ -1223,7 +1232,7 @@ fn pinned_stream_dict(
 /// `streams[0].latencyMin` from a SETUP(stream) response, when it is a
 /// plausible receiver latency (1 sample .. 10 s).
 fn parse_stream_latency_min(body: &[u8]) -> Option<u32> {
-    let val: Value = plist::from_bytes(body).ok()?;
+    let val = untrusted_plist::parse(body).ok()?;
     let s0 = val.as_dictionary()?.get("streams")?.as_array()?.first()?.as_dictionary()?;
     let v = s0.get("latencyMin")?.as_unsigned_integer()?;
     (1..=10 * 44_100).contains(&v).then_some(v as u32)
@@ -1231,7 +1240,7 @@ fn parse_stream_latency_min(body: &[u8]) -> Option<u32> {
 
 /// Pull `streams[0].dataPort` and `.controlPort` out of a SETUP response.
 fn parse_stream_ports(body: &[u8]) -> Result<StreamPorts> {
-    let val: Value = plist::from_bytes(body).context("parsing SETUP(stream) plist response")?;
+    let val = untrusted_plist::parse(body).context("parsing SETUP(stream) plist response")?;
     let dict = val.as_dictionary().ok_or_else(|| anyhow!("SETUP response not a dict"))?;
     let streams = dict
         .get("streams")
@@ -1260,7 +1269,7 @@ fn describe_error_body(body: &[u8]) -> String {
     if body.is_empty() {
         return String::new();
     }
-    if let Ok(v) = plist::from_bytes::<Value>(body) {
+    if let Ok(v) = untrusted_plist::parse(body) {
         return format!(" (body: {:?})", v);
     }
     let n = body.len().min(64);
@@ -1317,6 +1326,128 @@ fn format_uuid(bytes: [u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::airplay::test_peers::{self, read_request, reply, stored_pairing, Peer, M4};
+    use crate::airplay::untrusted_plist::samples::{
+        info_answer, nested_arrays_binary, nested_arrays_xml, on_small_stack, setup_session_answer,
+        setup_stream_answer,
+    };
+
+    /// Full-size `/info` and SETUP answers give the fields the session
+    /// reads from them.
+    #[test]
+    fn realistic_answers_are_read() {
+        let info = to_binary_plist(&info_answer()).unwrap();
+        assert_eq!(parse_initial_volume(&info), Some(-18.5));
+        let t = parse_timing_setup(&to_binary_plist(&setup_session_answer()).unwrap());
+        assert_eq!((t.event_port, t.timing_port), (50123, 50124));
+        let stream = to_binary_plist(&setup_stream_answer()).unwrap();
+        let ports = parse_stream_ports(&stream).unwrap();
+        assert_eq!((ports.data, ports.control), (50200, 50201));
+        assert_eq!(parse_stream_latency_min(&stream), Some(11025));
+    }
+
+    /// Every parser of a receiver's plist answer takes its usual
+    /// parse-failure path on a deeply nested body, even on a small stack.
+    #[test]
+    fn deeply_nested_answers_are_refused_not_fatal() {
+        for body in [nested_arrays_binary(100_000), nested_arrays_xml(100_000)] {
+            on_small_stack(move || {
+                assert_eq!(parse_initial_volume(&body), None);
+                let t = parse_timing_setup(&body);
+                assert_eq!((t.event_port, t.timing_port), (0, 0));
+                assert_eq!(parse_stream_latency_min(&body), None);
+                assert!(parse_stream_ports(&body).is_err());
+                let shown = describe_error_body(&body);
+                assert!(shown.starts_with(&format!(" (body {}B: ", body.len())), "{shown}");
+            });
+        }
+    }
+
+    /// `GET /info` (sent before pairing) answered with a deeply nested
+    /// plist: `get_info` skips it, as it skips any answer it can't read
+    /// (it only logs a few fields from it), and returns Ok, so the session
+    /// carries on.
+    #[test]
+    fn get_info_survives_a_deeply_nested_answer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = nested_arrays_binary(100_000);
+        assert!(body.len() <= MAX_BODY_BYTES);
+        let peer = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut r = std::io::BufReader::new(sock.try_clone().unwrap());
+            let mut w = sock;
+            let (_, cseq, _) = read_request(&mut r).unwrap();
+            reply(&mut w, cseq, "200 OK", &body);
+        });
+        let answered = on_small_stack(move || {
+            let ip: IpAddr = "127.0.0.1".parse().unwrap();
+            let mut c = Ap2Rtsp::connect(ip, port, ip, Duration::from_secs(5)).unwrap();
+            c.get_info().is_ok()
+        });
+        assert!(answered);
+        peer.join().unwrap();
+    }
+
+    /// Run a pair-verify from the stored pairing against `peer`; returns
+    /// the outcome and the requests the peer saw.
+    fn verify_against(peer: Peer) -> (std::result::Result<[u8; 32], PairVerifyError>, Vec<String>) {
+        let (port, seen) = test_peers::spawn(peer);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut c = Ap2Rtsp::connect(ip, port, ip, Duration::from_millis(500)).unwrap();
+        let res = c.pair_verify(&stored_pairing());
+        drop(c);
+        (res, seen.join().unwrap())
+    }
+
+    fn kind(res: &std::result::Result<[u8; 32], PairVerifyError>) -> &'static str {
+        match res {
+            Ok(_) => "ok",
+            Err(PairVerifyError::NoAnswer(_)) => "no answer",
+            Err(PairVerifyError::NotProven(_)) => "not proven",
+            Err(PairVerifyError::Refused(_)) => "refused",
+        }
+    }
+
+    /// Each way a pair-verify can end lands in the case that says how far
+    /// the peer got — and only a peer holding the paired accessory's key
+    /// gets past "not proven".
+    #[test]
+    fn pair_verify_outcomes_say_how_far_the_peer_got() {
+        for (what, peer, want) in [
+            ("400 to M1", Peer::StatusAtM1("400 Bad Request"), "not proven"),
+            ("470 to M1", Peer::StatusAtM1("470 Connection Authorization Required"), "not proven"),
+            ("503 to M1", Peer::StatusAtM1("503 Service Unavailable"), "not proven"),
+            ("200 with junk", Peer::GarbageAtM1, "not proven"),
+            ("M2 with an error", Peer::ErrorTlvAtM1(7), "not proven"),
+            ("impostor's own key", Peer::Impostor, "not proven"),
+            ("another device", Peer::OtherDevice, "not proven"),
+            ("unreadable reply", Peer::RawAtM1(b"garbage\r\n\r\n"), "no answer"),
+            ("closed at M1", Peer::CloseAtM1, "no answer"),
+            ("silent at M1", Peer::SilentAtM1, "no answer"),
+            ("forgot this PC (M4 error 2)", Peer::Genuine(M4::Error(2)), "refused"),
+            ("non-200 to M3", Peer::Genuine(M4::Status("470 Connection Authorization Required")), "refused"),
+            ("unreadable M4", Peer::Genuine(M4::Junk), "no answer"),
+            ("M4 neither State 4 nor an error", Peer::Genuine(M4::WrongState), "no answer"),
+            ("genuine", Peer::Genuine(M4::Accept), "ok"),
+        ] {
+            let (res, seen) = verify_against(peer);
+            assert_eq!(kind(&res), want, "{what}: {res:?}");
+            assert!(seen[0].starts_with("POST /pair-verify"), "{what}: {seen:?}");
+        }
+    }
+
+    /// A relay that passes the real accessory's M2 through and forges the
+    /// M4 refusal is indistinguishable from a real refusal — which is why
+    /// no refusal deletes the stored pairing.
+    #[test]
+    fn a_relay_can_forge_a_refusal() {
+        let (upstream, real) = test_peers::spawn(Peer::Genuine(M4::Accept));
+        let (res, _) = verify_against(Peer::RelayForgingM4 { upstream });
+        assert_eq!(kind(&res), "refused", "{res:?}");
+        let real_saw = real.join().unwrap();
+        assert_eq!(real_saw.len(), 1, "the real accessory saw M1 only: {real_saw:?}");
+    }
 
     #[test]
     fn binary_plist_setup_stream_roundtrips() {

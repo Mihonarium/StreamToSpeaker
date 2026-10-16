@@ -114,6 +114,29 @@ impl PairingCredentials {
     }
 }
 
+/// Stored credentials with their keys parsed — what pair-verify works
+/// from. They are parsed before anything is sent, so a damaged config
+/// entry is reported as damaged instead of looking like a refusal from the
+/// receiver.
+#[derive(Clone)]
+pub struct StoredPairing {
+    controller_id: String,
+    signing: SigningKey,
+    accessory_id: String,
+    accessory_ltpk: VerifyingKey,
+}
+
+impl StoredPairing {
+    pub fn parse(creds: &PairingCredentials) -> Result<Self> {
+        Ok(Self {
+            controller_id: creds.controller_id.clone(),
+            signing: creds.signing_key()?,
+            accessory_id: creds.accessory_id.clone(),
+            accessory_ltpk: creds.accessory_ltpk()?,
+        })
+    }
+}
+
 /// Parse exactly 32 bytes of hex. Total-function by construction — this
 /// is fed from the hand-editable config.json, and the release profile is
 /// `panic = "abort"`, so a slicing panic on a truncated/multibyte string
@@ -215,7 +238,7 @@ impl PairSetupPin {
     pub fn handle_m2(&mut self, m2: &[u8]) -> Result<Vec<u8>> {
         let tlv = Tlv::decode(m2).context("decoding pair-setup M2")?;
         check_state(&tlv, 2)?;
-        check_error(&tlv)?;
+        check_error(&tlv, Step::SetupM2)?;
         let salt = tlv.get(TYPE_SALT).ok_or_else(|| anyhow!("M2 missing Salt"))?;
         let server_pub = tlv
             .get(TYPE_PUBLIC_KEY)
@@ -232,7 +255,7 @@ impl PairSetupPin {
     pub fn handle_m4(&mut self, m4: &[u8]) -> Result<Vec<u8>> {
         let tlv = Tlv::decode(m4).context("decoding pair-setup M4")?;
         check_state(&tlv, 4)?;
-        check_error(&tlv)?;
+        check_error(&tlv, Step::SetupM4)?;
         let server_proof = tlv.get(TYPE_PROOF).ok_or_else(|| anyhow!("M4 missing Proof"))?;
         if !self.srp.verify_server(server_proof) {
             bail!("pair-setup M4 proof failed — wrong PIN");
@@ -286,7 +309,7 @@ fn build_setup_m5(k: &[u8], controller_id: &str, signing: &SigningKey) -> Vec<u8
 fn parse_setup_m6(k: &[u8], m6: &[u8]) -> Result<(String, [u8; 32])> {
     let tlv = Tlv::decode(m6).context("decoding pair-setup M6")?;
     check_state(&tlv, 6)?;
-    check_error(&tlv)?;
+    check_error(&tlv, Step::SetupM6)?;
     let enc = tlv
         .get(TYPE_ENCRYPTED_DATA)
         .ok_or_else(|| anyhow!("M6 missing EncryptedData"))?;
@@ -324,20 +347,32 @@ fn parse_setup_m6(k: &[u8], m6: &[u8]) -> Result<(String, [u8; 32])> {
 // pair-verify (from stored credentials)
 // ---------------------------------------------------------------------------
 
-/// Drives a `pair-verify` using stored [`PairingCredentials`].
+/// Why pair-verify's M4 didn't complete the exchange.
+#[derive(Debug)]
+pub enum M4Failure {
+    /// M4 carries an error: the accessory's refusal of this controller
+    /// (HAP's answer for one it no longer knows). M4 carries no signature,
+    /// so a relay in the middle can send this as well as the accessory.
+    Refused(anyhow::Error),
+    /// M4 is no answer the exchange can end on: no TLV, or neither State 4
+    /// nor an error. It says nothing about the pairing.
+    Unreadable(anyhow::Error),
+}
+
+/// Drives a `pair-verify` from a [`StoredPairing`].
 pub struct PairVerify {
-    creds: PairingCredentials,
+    pairing: StoredPairing,
     eph_secret: Option<x25519_dalek::EphemeralSecret>,
     eph_public: [u8; 32],
     shared: Option<[u8; 32]>,
 }
 
 impl PairVerify {
-    pub fn new(creds: PairingCredentials) -> Self {
+    pub fn new(pairing: StoredPairing) -> Self {
         let secret = x25519_dalek::EphemeralSecret::random_from_rng(rand::thread_rng());
         let public = x25519_dalek::PublicKey::from(&secret);
         Self {
-            creds,
+            pairing,
             eph_secret: Some(secret),
             eph_public: public.to_bytes(),
             shared: None,
@@ -354,10 +389,14 @@ impl PairVerify {
 
     /// M2 → M3. Derives the shared secret, verifies the accessory's
     /// signature against the stored LTPK, and returns the encrypted M3.
+    /// Every error here means the peer didn't prove it holds the paired
+    /// accessory's key: until the signature check passes, anyone could
+    /// have produced this M2 (decrypting it proves nothing — the key comes
+    /// from the peer's own ephemeral key).
     pub fn handle_m2(&mut self, m2: &[u8]) -> Result<Vec<u8>> {
         let tlv = Tlv::decode(m2).context("decoding pair-verify M2")?;
         check_state(&tlv, 2)?;
-        check_error(&tlv)?;
+        check_error(&tlv, Step::VerifyM2)?;
         let acc_eph = tlv
             .get(TYPE_PUBLIC_KEY)
             .ok_or_else(|| anyhow!("M2 missing accessory PublicKey"))?;
@@ -389,26 +428,29 @@ impl PairVerify {
         let acc_sig = sub
             .get(TYPE_SIGNATURE)
             .ok_or_else(|| anyhow!("M2 missing accessory Signature"))?;
-        if String::from_utf8_lossy(acc_id) != self.creds.accessory_id {
-            bail!("pair-verify: accessory identity changed — re-pair required");
+        if String::from_utf8_lossy(acc_id) != self.pairing.accessory_id {
+            bail!(
+                "it identifies as {:?}, not as the paired accessory",
+                String::from_utf8_lossy(acc_id)
+            );
         }
         let mut material = Vec::new();
         material.extend_from_slice(acc_eph);
         material.extend_from_slice(acc_id);
         material.extend_from_slice(&self.eph_public);
-        let acc_ltpk = self.creds.accessory_ltpk()?;
-        acc_ltpk
+        self.pairing
+            .accessory_ltpk
             .verify(&material, &ed25519_sig(acc_sig)?)
-            .map_err(|_| anyhow!("pair-verify: accessory signature invalid"))?;
+            .map_err(|_| anyhow!("its signature doesn't match the paired accessory's key"))?;
 
         // Build M3: our signature over ourEph ‖ ourId ‖ accEph.
         let mut our_material = Vec::new();
         our_material.extend_from_slice(&self.eph_public);
-        our_material.extend_from_slice(self.creds.controller_id.as_bytes());
+        our_material.extend_from_slice(self.pairing.controller_id.as_bytes());
         our_material.extend_from_slice(acc_eph);
-        let our_sig = self.creds.signing_key()?.sign(&our_material).to_bytes();
+        let our_sig = self.pairing.signing.sign(&our_material).to_bytes();
         let sub = TlvBuilder::new()
-            .add(TYPE_IDENTIFIER, self.creds.controller_id.as_bytes())
+            .add(TYPE_IDENTIFIER, self.pairing.controller_id.as_bytes())
             .add(TYPE_SIGNATURE, &our_sig)
             .build();
         let encrypted = seal(&session_key, b"PV-Msg03", &sub);
@@ -421,20 +463,24 @@ impl PairVerify {
     }
 
     /// M4 (success) → the X25519 shared secret to build the session keys.
-    pub fn finish(self, m4: &[u8]) -> Result<[u8; 32]> {
-        let tlv = Tlv::decode(m4).context("decoding pair-verify M4")?;
-        check_state(&tlv, 4)?;
-        check_error(&tlv)?;
-        self.shared.ok_or_else(|| anyhow!("pair-verify finished before M2"))
+    pub fn finish(self, m4: &[u8]) -> std::result::Result<[u8; 32], M4Failure> {
+        let tlv = Tlv::decode(m4)
+            .context("decoding pair-verify M4")
+            .map_err(M4Failure::Unreadable)?;
+        // An error is the accessory's answer whatever State it came with
+        // (HAP sends it with State 4).
+        check_error(&tlv, Step::VerifyM4).map_err(M4Failure::Refused)?;
+        check_state(&tlv, 4).map_err(M4Failure::Unreadable)?;
+        self.shared
+            .ok_or_else(|| M4Failure::Unreadable(anyhow!("pair-verify finished before M2")))
     }
 }
 
 impl Drop for PairVerify {
     /// The X25519 shared secret is the input keying material for every
-    /// session key — wipe our copy on drop, matching the crate-wide
-    /// convention (srp.rs zeroizes its secrets; SessionKeys zeroizes on
-    /// Drop). `finish` copies the array out; this clears the copy that
-    /// stays behind in the struct.
+    /// session key — wipe our copy on drop, as SessionKeys wipes its keys
+    /// and srp.rs its session key K. `finish` copies the array out; this
+    /// clears the copy that stays behind in the struct.
     fn drop(&mut self) {
         use zeroize::Zeroize;
         if let Some(s) = self.shared.as_mut() {
@@ -467,19 +513,34 @@ fn check_state(tlv: &Tlv, expected: u8) -> Result<()> {
     }
 }
 
-fn check_error(tlv: &Tlv) -> Result<()> {
+/// The message a TLV error came in. The same HAP code means different
+/// things at different steps: Authentication is a wrong PIN in pair-setup
+/// M4, but a controller the accessory no longer knows in pair-verify M4.
+#[derive(Clone, Copy)]
+enum Step {
+    SetupM2,
+    SetupM4,
+    SetupM6,
+    VerifyM2,
+    VerifyM4,
+}
+
+fn check_error(tlv: &Tlv, step: Step) -> Result<()> {
     if let Some(code) = tlv.error() {
-        let meaning = match code {
-            2 => "authentication (wrong PIN)",
-            3 => "backoff (too many attempts — wait)",
-            4 => "max peers — the device's pairing list is full; remove old \
-                  pairings on the device and try again",
-            5 => "max tries (receiver locked out)",
-            6 => "unavailable",
-            7 => "busy (another sender is pairing)",
+        let meaning = match (code, step) {
+            (2, Step::SetupM4) => "authentication: wrong PIN",
+            (2, Step::SetupM6) => "authentication: the device didn't accept this PC's pairing key",
+            (2, Step::VerifyM4) => "authentication: the device no longer accepts this PC's pairing",
+            (2, Step::SetupM2 | Step::VerifyM2) => "authentication",
+            (3, _) => "backoff (too many attempts — wait)",
+            (4, _) => "max peers — the device's pairing list is full; remove old \
+                       pairings on the device and try again",
+            (5, _) => "max tries (receiver locked out)",
+            (6, _) => "unavailable",
+            (7, _) => "busy (another sender is pairing)",
             _ => "unknown",
         };
-        bail!("pairing: device returned error {} ({})", code, meaning);
+        bail!("device returned error {} ({})", code, meaning);
     }
     Ok(())
 }
@@ -573,6 +634,41 @@ mod tests {
         assert_eq!(ltpk, acc_vk.to_bytes());
     }
 
+    /// PIN pair-setup M2 to M6 against receivers of both SRP byte
+    /// conventions, one with a B that starts with a zero byte and one with
+    /// pair_ap's 15-byte salt; ends with stored credentials naming the
+    /// accessory. (The vectors are for the PIN `3939`.)
+    #[test]
+    fn pin_pair_setup_completes_against_receiver_models() {
+        use crate::airplay::srp_test_receiver::{vectors as v, vectors::bytes, Convention, M3Reply, Receiver};
+        let pin = "3939";
+        for (conv, salt, b) in [
+            (Convention::Adk, v::SALT, v::B_SHORT),
+            (Convention::PairAp, v::SALT_SHORT, v::B_FULL),
+        ] {
+            let rx = Receiver::new(conv, pin, bytes(salt), bytes(b));
+            assert!(rx.b_top_byte_zero() || rx.salt().len() == 15, "vector: {conv:?} has its corner");
+            let mut ps = PairSetupPin::new(pin);
+            let m2 = TlvBuilder::new()
+                .add_u8(TYPE_STATE, 2)
+                .add(TYPE_SALT, rx.salt())
+                .add(TYPE_PUBLIC_KEY, &rx.b_wire())
+                .build();
+            let m3 = Tlv::decode(&ps.handle_m2(&m2).unwrap()).unwrap();
+            let M3Reply::Proof { m2: proof, key } =
+                rx.m3(m3.get(TYPE_PUBLIC_KEY).unwrap(), m3.get(TYPE_PROOF).unwrap())
+            else {
+                panic!("{conv:?}: the receiver refused M3 for the right PIN");
+            };
+            let m4 = TlvBuilder::new().add_u8(TYPE_STATE, 4).add(TYPE_PROOF, &proof).build();
+            ps.handle_m4(&m4).expect("client accepts the receiver's proof");
+            let (acc_sk, acc_vk) = accessory_keypair();
+            let creds = ps.handle_m6(&accessory_m6(&key, &acc_sk, "acc-id")).expect("M6 accepted");
+            assert_eq!(creds.accessory_id, "acc-id");
+            assert_eq!(creds.accessory_ltpk_hex, to_hex(&acc_vk.to_bytes()));
+        }
+    }
+
     #[test]
     fn hex32_rejects_malformed_input_without_panicking() {
         // Fed from the hand-editable config.json — every malformed shape
@@ -599,6 +695,83 @@ mod tests {
             ps.signing.verifying_key().to_bytes(),
             ps2.signing.verifying_key().to_bytes()
         );
+    }
+
+    /// A damaged stored entry is caught when it is parsed, naming the
+    /// field — before anything is sent to the receiver.
+    #[test]
+    fn stored_pairing_parse_names_the_damaged_field() {
+        let (_, acc_vk) = accessory_keypair();
+        let good = PairingCredentials {
+            controller_id: "client-uuid".into(),
+            controller_seed_hex: "a0".repeat(32),
+            accessory_id: "acc-uuid".into(),
+            accessory_ltpk_hex: to_hex(&acc_vk.to_bytes()),
+        };
+        assert!(StoredPairing::parse(&good).is_ok());
+        let seed = PairingCredentials { controller_seed_hex: "a0".repeat(31), ..good.clone() };
+        let e = format!("{:#}", StoredPairing::parse(&seed).err().unwrap());
+        assert!(e.contains("controller seed"), "{e}");
+        let ltpk = PairingCredentials { accessory_ltpk_hex: "zz".repeat(32), ..good.clone() };
+        let e = format!("{:#}", StoredPairing::parse(&ltpk).err().unwrap());
+        assert!(e.contains("accessory LTPK"), "{e}");
+        // 32 bytes of hex that are no Ed25519 public key.
+        let not_a_point = (2u8..=255)
+            .map(|k| {
+                let mut b = [0u8; 32];
+                b[0] = k;
+                b
+            })
+            .find(|b| VerifyingKey::from_bytes(b).is_err())
+            .unwrap();
+        let point = PairingCredentials { accessory_ltpk_hex: to_hex(&not_a_point), ..good };
+        let e = format!("{:#}", StoredPairing::parse(&point).err().unwrap());
+        assert!(e.contains("accessory LTPK"), "{e}");
+    }
+
+    /// Error 2 reads as a wrong PIN only where it is one.
+    #[test]
+    fn authentication_error_text_depends_on_the_step() {
+        let m = |state: u8| TlvBuilder::new().add_u8(TYPE_STATE, state).add_u8(0x07, 2).build();
+        let text = |state: u8, step: Step| check_error(&Tlv::decode(&m(state)).unwrap(), step).unwrap_err().to_string();
+        assert!(text(4, Step::SetupM4).contains("wrong PIN"));
+        let verify = text(4, Step::VerifyM4);
+        assert!(verify.contains("no longer accepts this PC's pairing") && !verify.contains("PIN"), "{verify}");
+        assert!(!text(2, Step::VerifyM2).contains("PIN"));
+        assert!(!text(6, Step::SetupM6).contains("PIN"));
+    }
+
+    /// An M4 with an error is the accessory's refusal, whatever State it
+    /// carries; an M4 that can't be read is not one.
+    #[test]
+    fn an_unreadable_m4_is_not_a_refusal() {
+        use crate::airplay::tlv8::TYPE_ERROR;
+        let (_, acc_vk) = accessory_keypair();
+        let creds = PairingCredentials {
+            controller_id: "client-uuid".into(),
+            controller_seed_hex: "a0".repeat(32),
+            accessory_id: "acc-uuid".into(),
+            accessory_ltpk_hex: to_hex(&acc_vk.to_bytes()),
+        };
+        let finish = |m4: &[u8]| PairVerify::new(StoredPairing::parse(&creds).unwrap()).finish(m4);
+        let error = |state: u8| TlvBuilder::new().add_u8(TYPE_STATE, state).add_u8(TYPE_ERROR, 2).build();
+        for state in [4, 2] {
+            match finish(&error(state)) {
+                Err(M4Failure::Refused(e)) => {
+                    assert!(format!("{e:#}").contains("no longer accepts this PC's pairing"), "{e:#}")
+                }
+                other => panic!("State {state} with an error: {other:?}"),
+            }
+        }
+        let no_state = TlvBuilder::new().add_u8(TYPE_ERROR, 2).build();
+        assert!(matches!(finish(&no_state), Err(M4Failure::Refused(_))));
+        for (what, m4) in [
+            ("not a TLV", b"\x99\x99".to_vec()),
+            ("empty", Vec::new()),
+            ("State 2, no error", TlvBuilder::new().add_u8(TYPE_STATE, 2).build()),
+        ] {
+            assert!(matches!(finish(&m4), Err(M4Failure::Unreadable(_))), "{what}");
+        }
     }
 
     #[test]
@@ -641,7 +814,7 @@ mod tests {
             accessory_ltpk_hex: to_hex(&acc_vk.to_bytes()),
         };
 
-        let mut pv = PairVerify::new(creds.clone());
+        let mut pv = PairVerify::new(StoredPairing::parse(&creds).unwrap());
         let m1 = Tlv::decode(&pv.start()).unwrap();
         let client_eph = m1.get(TYPE_PUBLIC_KEY).unwrap().to_vec();
 
