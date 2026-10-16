@@ -9,8 +9,8 @@ name: Driver attested
 #
 # Run this manually after Microsoft returns the attestation-signed driver:
 # download the signed zip from the Partner Center hardware dashboard, attach
-# it (any file name) to the matching driver-v* prerelease, then trigger this
-# workflow. It:
+# it (a .zip named with letters, digits and . _ + -) to the matching
+# driver-v* prerelease, then trigger this workflow. It:
 #   1. verifies Microsoft's signatures (signtool /kp against the catalog AND
 #      the embedded .sys signature; the signer chain must be the
 #      "Microsoft Windows Hardware Compatibility Publisher");
@@ -79,9 +79,9 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           $ErrorActionPreference = "Stop"
-          $repo = "${{ github.repository }}"
+          $repo = $env:GITHUB_REPOSITORY
           $tag = $env:INPUT_TAG
-          if ($tag -and $tag -notmatch '^driver-v[\d.]+$') { throw "unexpected tag input format: $tag" }
+          if ($tag -and $tag -cnotmatch '\Adriver-v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\z') { throw "unexpected tag input format: $tag" }
           $rels = gh api "repos/$repo/releases?per_page=100" | ConvertFrom-Json
 
           if ($tag) {
@@ -89,12 +89,13 @@ jobs:
               if (-not $rel) { throw "release $tag not found" }
           } else {
               $cand = @()
-              foreach ($r in @($rels | Where-Object { $_.tag_name -match '^driver-v\d+\.\d+\.\d+\.\d+$' })) {
+              foreach ($r in @($rels | Where-Object { $_.tag_name -cmatch '\Adriver-v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\z' })) {
                   $manAsset = $r.assets | Where-Object { $_.name -eq "manifest.json" } | Select-Object -First 1
                   if (-not $manAsset) { continue }
                   try {
-                      # Authenticated fetch (private repo); assets can be
-                      # octet-stream, so download + parse.
+                      # Fetched with gh, which also works on a private
+                      # repository; assets can be octet-stream, so
+                      # download + parse.
                       gh release download $r.tag_name --repo $repo --pattern manifest.json --output candidate-manifest.json --clobber
                       if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
                       $m = Get-Content candidate-manifest.json -Raw | ConvertFrom-Json
@@ -110,7 +111,7 @@ jobs:
               $rel = ($cand | Sort-Object { $_.Build } -Descending | Select-Object -First 1).Release
               $tag = $rel.tag_name
           }
-          if ($tag -notmatch '^driver-v(\d+\.\d+\.\d+\.\d+)$') { throw "unexpected tag format: $tag" }
+          if ($tag -cnotmatch '\Adriver-v([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\z') { throw "unexpected tag format: $tag" }
           $version = $Matches[1]
 
           New-Item -ItemType Directory -Force -Path assets | Out-Null
@@ -120,6 +121,7 @@ jobs:
 
           $msZips = @(Get-ChildItem assets -Filter "*.zip" | Where-Object { $_.Name -notlike "StreamToSpeaker-Driver-*-Signed.zip" })
           if ($msZips.Count -ne 1) { throw "expected exactly one Microsoft-signed zip on $tag, found $($msZips.Count) - attach exactly the zip Partner Center returned" }
+          if ($msZips[0].Name -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9._+-]*\.zip\z') { throw "unexpected name for the Microsoft-signed zip: $($msZips[0].Name) - rename it to letters, digits and . _ + -" }
           $cab = Get-Item "assets\StreamToSpeaker-Driver-$version-Submission.cab" -ErrorAction Stop
 
           "tag=$tag" >> $env:GITHUB_OUTPUT
@@ -131,12 +133,16 @@ jobs:
       - name: Verify Microsoft signatures + INF integrity
         id: verify
         shell: pwsh
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          MS_ZIP: ${{ steps.rel.outputs.ms_zip }}
+          CAB: ${{ steps.rel.outputs.cab }}
         run: |
           $ErrorActionPreference = "Stop"
-          $version = "${{ steps.rel.outputs.version }}"
+          $version = $env:VERSION
 
           # --- extract Microsoft's zip --------------------------------
-          Expand-Archive "${{ steps.rel.outputs.ms_zip }}" -DestinationPath ms-signed -Force
+          Expand-Archive $env:MS_ZIP -DestinationPath ms-signed -Force
           $sysFiles = @(Get-ChildItem ms-signed -Recurse -Filter "StreamToSpeaker.sys")
           if ($sysFiles.Count -eq 0) { throw "zip contains no StreamToSpeaker.sys" }
           if (($sysFiles | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash } | Select-Object -Unique).Count -gt 1) {
@@ -152,7 +158,7 @@ jobs:
           # (The EV signature on the CAB container doesn't change the
           # files inside, so extraction works on the signed CAB.)
           New-Item -ItemType Directory -Force -Path cab-contents | Out-Null
-          expand.exe -F:* "${{ steps.rel.outputs.cab }}" cab-contents | Out-Null
+          expand.exe -F:* $env:CAB cab-contents | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "expand.exe failed on the submission CAB" }
           $subInf = Get-ChildItem cab-contents -Recurse -Filter "StreamToSpeaker.inf" | Select-Object -First 1
           if (-not $subInf) { throw "submission CAB contains no INF?" }
@@ -212,26 +218,34 @@ jobs:
       - name: Dry run - verification passed, release untouched
         if: inputs.dry_run
         shell: pwsh
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
-          Write-Host "::notice::dry run - ${{ steps.rel.outputs.tag }} verified (signtool + INF and .sys identity); manifest and release notes left as they are"
-          "## Driver attested - dry run of ``${{ steps.rel.outputs.tag }}`` passed (release untouched)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          Write-Host "::notice::dry run - $env:TAG verified (signtool + INF and .sys identity); manifest and release notes left as they are"
+          "## Driver attested - dry run of ``$env:TAG`` passed (release untouched)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       - name: Finalize release (manifest attested=true)
         if: ${{ !inputs.dry_run }}
         shell: pwsh
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          MS_ZIP_NAME: ${{ steps.rel.outputs.ms_zip_name }}
+          ZIP_NAME: ${{ steps.verify.outputs.zip_name }}
+          ZIP_SHA256: ${{ steps.verify.outputs.zip_sha256 }}
         run: |
           $ErrorActionPreference = "Stop"
-          $tag = "${{ steps.rel.outputs.tag }}"
-          $version = "${{ steps.rel.outputs.version }}"
+          $tag = $env:TAG
+          $version = $env:VERSION
 
           $man = Get-Content assets\manifest.json -Raw | ConvertFrom-Json
           $man.attested = $true
-          $man.signed_zip = "${{ steps.verify.outputs.zip_name }}"
-          $man.signed_zip_sha256 = "${{ steps.verify.outputs.zip_sha256 }}"
-          $man | Add-Member -NotePropertyName ms_zip_asset -NotePropertyValue "${{ steps.rel.outputs.ms_zip_name }}" -Force
+          $man.signed_zip = $env:ZIP_NAME
+          $man.signed_zip_sha256 = $env:ZIP_SHA256
+          $man | Add-Member -NotePropertyName ms_zip_asset -NotePropertyValue $env:MS_ZIP_NAME -Force
           $man | ConvertTo-Json | Set-Content -Path manifest.json -Encoding ascii
 
-          gh release upload $tag --repo "${{ github.repository }}" "${{ steps.verify.outputs.zip_name }}" "${{ steps.verify.outputs.zip_name }}.sha256" manifest.json --clobber
+          gh release upload $tag --repo $env:GITHUB_REPOSITORY $env:ZIP_NAME "$env:ZIP_NAME.sha256" manifest.json --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
           # Replace the "awaiting attestation" runbook with what this
           # release actually is now — the notes are what a human reads
@@ -254,7 +268,7 @@ jobs:
               "Installer builds bundle this driver automatically while ``driver/**`` + ``include/**`` still hash to the source hash above. The other assets here are the submission trail: the EV-signed CAB sent to Microsoft, and the zip Microsoft returned."
           ) -join "`n"
           Set-Content -Path attested-notes.md -Value $notes -Encoding utf8
-          gh release edit $tag --repo "${{ github.repository }}" --title "Driver $version — Microsoft-attested" --notes-file attested-notes.md
+          gh release edit $tag --repo $env:GITHUB_REPOSITORY --title "Driver $version — Microsoft-attested" --notes-file attested-notes.md
           if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
 
           @(
@@ -263,17 +277,16 @@ jobs:
             "| | |"
             "| --- | --- |"
             "| Release | ``$tag`` |"
-            "| Canonical package | ``${{ steps.verify.outputs.zip_name }}`` |"
-            "| SHA256 | ``${{ steps.verify.outputs.zip_sha256 }}`` |"
+            "| Canonical package | ``$env:ZIP_NAME`` |"
+            "| SHA256 | ``$env:ZIP_SHA256`` |"
             ""
             "Installer builds on main (and tag releases) now bundle this driver automatically"
             "as long as ``driver/**`` + ``include/**`` still hash to the manifest's source_hash."
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       # Provenance for the canonical driver package (bytes are final here).
-      # No-op while the repo is private — attestations on private repos
-      # need GitHub Enterprise Cloud; this lights up automatically the day
-      # the repo goes public. Verify with:
+      # Skipped if the repository is ever made private: attestations on
+      # private repositories need GitHub Enterprise Cloud. Verify with:
       #   gh attestation verify StreamToSpeaker-Driver-<ver>-Signed.zip -R Mihonarium/StreamToSpeaker
       - name: Attest build provenance (public repo only)
         id: attest
@@ -289,8 +302,11 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          ZIP_NAME: ${{ steps.verify.outputs.zip_name }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
-          $bundle = "${{ steps.verify.outputs.zip_name }}.sigstore.json"
-          Copy-Item "${{ steps.attest.outputs.bundle-path }}" $bundle
-          gh release upload "${{ steps.rel.outputs.tag }}" --repo "${{ github.repository }}" $bundle --clobber
+          $bundle = "$env:ZIP_NAME.sigstore.json"
+          Copy-Item $env:BUNDLE_PATH $bundle
+          gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY $bundle --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }

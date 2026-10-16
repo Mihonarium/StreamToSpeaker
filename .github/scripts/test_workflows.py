@@ -112,6 +112,28 @@ def job_fields(name):
     return jobs
 
 
+
+def job_lines(name):
+    """(job id, line) for every line under `jobs:` of .github/workflows/<name>
+    below a job's own line: its keys, steps, env, conditions."""
+    with open(os.path.join(WORKFLOWS_DIR, name), encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    out, job, job_depth, in_jobs = [], None, None, False
+    for line in lines:
+        if _content(line) and _depth(line) == 0:
+            in_jobs, job = line.rstrip() == "jobs:", None
+            continue
+        if not in_jobs:
+            continue
+        if _content(line):
+            job_depth = _depth(line) if job_depth is None else job_depth
+            if _depth(line) == job_depth:
+                job = line.strip().rstrip(":")
+                continue
+        if job is not None:
+            out.append((job, line))
+    return out
+
 def step_field(step, key):
     """The value of one of a step's own keys (`uses`, `if`, `run`, ...) as
     written on its line, or None."""
@@ -348,6 +370,71 @@ class ReproducibilityBuildDirectory(unittest.TestCase):
                 "          a", "", "          b", "      # next step", "      - run: c"]
         self.assertEqual(step_script(step), ["a", "b"])
         self.assertEqual(step_script(["      - run: c"]), ["c"])
+
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class PartnerCenterCredential(unittest.TestCase):
+    def test_only_jobs_in_the_partner_center_environment_read_it(self):
+        # AZURE_* are secrets of the partner-center environment, whose
+        # deployment policy admits branch main alone; outside it a job gets
+        # nothing for them. Exactly the two jobs that call the Hardware API
+        # read them, and both run in the environment.
+        readers, inside = set(), set()
+        for name in sorted(os.listdir(WORKFLOWS_DIR)):
+            if not name.endswith((".yml", ".yaml")):
+                continue
+            readers |= {(name, job) for job, line in job_lines(name) if _content(line) and "secrets.AZURE_" in line}
+            inside |= {(name, job) for job, f in job_fields(name).items() if f.get("environment") == "partner-center"}
+        expected = {("driver-attest.yml", "reconcile"), ("driver-certified.yml", "download")}
+        self.assertEqual(readers, expected)
+        self.assertEqual(inside, expected)
+
+    def test_the_credential_free_runs_stay_outside_it(self):
+        # Driver attest's dry run and Driver certified's ms_zip_asset path
+        # are how a change to these workflows is tried from its branch.
+        attest = job_fields("driver-attest.yml")
+        self.assertNotIn("environment", attest["dry-run"])
+        self.assertIn("!inputs.dry_run", attest["reconcile"].get("if", "") + "".join(
+            line for job, line in job_lines("driver-attest.yml") if job == "reconcile"))
+        certified = job_fields("driver-certified.yml")
+        self.assertEqual(expression(certified["download"]["if"]), "needs.resolve.outputs.mode=='api'")
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class DriverWorkflowScripts(unittest.TestCase):
+    # These workflows hold the Partner Center credential or write driver
+    # releases. Their scripts take every value from env:, so no value,
+    # whoever typed it, becomes script text.
+    FILES = ("driver-attest.yml", "driver-attested.yml", "driver-certified.yml")
+    INPUTS_RE = re.compile(r"(?<![\w.])inputs\.")
+
+    def test_no_expression_inside_a_run_script(self):
+        bad = []
+        for name in self.FILES:
+            for job, steps in jobs_steps(name).items():
+                for step in steps:
+                    bad += [f"{name} job {job}: {line}" for line in step_script(step) if "${{" in line]
+        self.assertEqual(bad, [])
+
+    def test_the_script_reader_sees_expressions(self):
+        steps = [["      - name: x", "        run: |", "          echo ${{ inputs.a }}"],
+                 ["      - run: echo ${{ inputs.b }}"],
+                 ["      - name: y", "        env:", "          A: ${{ inputs.c }}", "        run: echo \"$A\""]]
+        self.assertEqual([[l for l in step_script(s) if "${{" in l] for s in steps],
+                         [["echo ${{ inputs.a }}"], ["echo ${{ inputs.b }}"], []])
+
+    def test_only_the_check_step_reads_driver_certifieds_inputs(self):
+        # Every later step of driver-certified.yml uses the values that
+        # certified.py inputs checked (resolve's outputs).
+        uses = lambda line: _content(line) and self.INPUTS_RE.search(line)
+        readers = [job for job, line in job_lines("driver-certified.yml") if uses(line)]
+        check = [s for s in jobs_steps("driver-certified.yml")["resolve"] if step_field(s, "id") == "inputs"]
+        self.assertEqual(len(check), 1)
+        in_check = [line for line in check[0] if uses(line)]
+        self.assertEqual(len(in_check), 10)
+        self.assertEqual(len(readers), len(in_check))
+        self.assertEqual(step_field(check[0], "run"), "python3 .github/scripts/certified.py inputs")
 
 
 if __name__ == "__main__":

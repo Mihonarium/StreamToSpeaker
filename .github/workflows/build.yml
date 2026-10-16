@@ -723,7 +723,10 @@ jobs:
   #     + ref policy means a workflow edited on some branch can neither
   #     read the PAT nor dispatch signing requests; a plain repo secret
   #     would be readable by any workflow run in this repo.
-  #   - Optionally add a tag ruleset restricting who can create v* tags.
+  #   - A tag ruleset restricts creating, moving and deleting v* tags to
+  #     the Repository admin role: the ref policy above limits refs, not
+  #     people, so it is what keeps a tag on an edited workflow from
+  #     reaching the signing requests.
   #   - Unsigned bytes travel to the signing repo as Actions artifacts
   #     (private-source mode): the signing workflow fetches them
   #     post-approval with its FETCH_TOKEN environment secret (fine-grained

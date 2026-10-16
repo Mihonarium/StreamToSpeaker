@@ -19,6 +19,8 @@ The Windows job additionally runs signtool (/kp against the catalog, and
 prefers it over attested manifests with the same source hash.
 
 Subcommands:
+  inputs    check driver-certified.yml's dispatch inputs (INPUT_* env) and
+            write the values every later step uses to GITHUB_OUTPUT
   hash      hashFiles('driver/**','include/**') exactly as the Windows
             runners compute it (see hash_files)
   fetch     poll a Partner Center submission until a signedPackage exists,
@@ -35,6 +37,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -363,8 +366,96 @@ def download_asset(repo, tag, name):
 
 
 # ---------------------------------------------------------------------------
+# Dispatch inputs
+# ---------------------------------------------------------------------------
+# Each value must have a strict form, matched in full: [0-9] rather than \d
+# (which also matches non-ASCII digits), and fullmatch, so a trailing
+# newline is refused too. Spaces and tabs around a value (a paste) are
+# dropped first, except around the version, which also names the run's
+# concurrency group and is refused instead. What passes can't change the
+# meaning of a script line or of a GITHUB_OUTPUT line.
+VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+")
+ID_RE = re.compile(r"[0-9]{1,20}")
+SIGNATURE_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
+ASSET_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,195}\.zip")
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def check_inputs(env):
+    """driver-certified.yml's dispatch inputs, from the INPUT_* variables in
+    `env` (and GITHUB_SHA, the dispatched commit): (values, problems).
+    `values` holds what every later step of the workflow uses; it is only
+    meaningful when `problems` is empty."""
+    get = lambda k: env.get(k, "").strip(" \t")
+    problems, v = [], {}
+    version = env.get("INPUT_VERSION", "")
+    if not VERSION_RE.fullmatch(version):
+        problems.append(f"version must be MAJOR.MINOR.BUILD.REVISION, got {version!r}")
+        version = "<version>"
+    v["version"] = version
+    tag = get("INPUT_TAG") or f"driver-v{version}"
+    if tag != f"driver-v{version}":
+        problems.append(f"tag must be empty or driver-v{version}, got {tag!r}")
+    v["tag"] = tag
+    commit = get("INPUT_COMMIT") or get("GITHUB_SHA")
+    if not COMMIT_RE.fullmatch(commit):
+        problems.append(f"commit must be a full commit SHA (40 lowercase hex digits), got {commit!r}")
+    v["commit"] = commit
+    for key, name in (("INPUT_PRODUCT", "product_id"), ("INPUT_SUBMISSION", "submission_id"),
+                      ("INPUT_REPORT", "report_id")):
+        val = get(key)
+        if val and not ID_RE.fullmatch(val):
+            problems.append(f"{name} must be a number, got {val!r}")
+        v[name] = val
+    for key, name, default in (("INPUT_MS_ZIP", "ms_zip", f"StreamToSpeaker-Driver-{version}-Microsoft.zip"),
+                               ("INPUT_LAB_ZIP", "lab_zip", f"StreamToSpeaker-Driver-{version}-lab-testsigned.zip")):
+        val = get(key)
+        if val and not ASSET_RE.fullmatch(val):
+            problems.append(f"{name}_asset must be a .zip asset name (letters, digits, . _ + -), got {val!r}")
+        v[name] = val or default
+    signed = f"StreamToSpeaker-Driver-{version}-Signed.zip"
+    # Compared without case: the Windows runner's disk doesn't tell them apart.
+    if len({n.lower() for n in (v["ms_zip"], v["lab_zip"], signed)}) < 3:
+        problems.append(f"ms_zip_asset, lab_zip_asset and the canonical {signed} must be three different assets, "
+                        f"got ms_zip_asset={v['ms_zip']!r}, lab_zip_asset={v['lab_zip']!r}")
+    if get("INPUT_MS_ZIP"):
+        v["mode"] = "asset"
+    elif v["product_id"] and v["submission_id"]:
+        v["mode"] = "api"
+    else:
+        v["mode"] = ""
+        problems.append("give product_id + submission_id (Hardware API) or ms_zip_asset "
+                        "(hand-downloaded zip on the release)")
+    signatures = [s.strip(" \t") for s in get("INPUT_OS").split(",") if s.strip(" \t")]
+    bad = [s for s in signatures if not SIGNATURE_RE.fullmatch(s)]
+    if bad or not signatures:
+        problems.append(f"os must be comma-separated requestedSignatures, got {get('INPUT_OS')!r}")
+    v["os"] = ",".join(signatures)
+    dry = get("INPUT_DRY_RUN")
+    if dry not in ("true", "false"):
+        problems.append(f"dry_run must be true or false, got {dry!r}")
+    v["dry_run"] = "true" if dry == "true" else "false"
+    return v, problems
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def cmd_inputs(a):
+    values, problems = check_inputs(os.environ)
+    for p in problems:
+        print(f"::error::{p}")
+    if problems:
+        return 1
+    out_path = os.environ.get("GITHUB_OUTPUT")
+    lines = "".join(f"{k}={values[k]}\n" for k in sorted(values))
+    if out_path:
+        with open(out_path, "a", encoding="utf-8") as f:
+            f.write(lines)
+    print(lines, end="")
+    return 0
+
+
 def cmd_hash(a):
     print(hash_files(a.root))
 
@@ -446,6 +537,8 @@ def cmd_release(a):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("inputs", help="check driver-certified.yml's dispatch inputs (INPUT_* env)")
+    s.set_defaults(fn=cmd_inputs)
     s = sub.add_parser("hash"); s.add_argument("--root", default="."); s.set_defaults(fn=cmd_hash)
     s = sub.add_parser("fetch")
     s.add_argument("--product-id", required=True); s.add_argument("--submission-id", required=True)
