@@ -262,9 +262,15 @@ pub fn get_zone_group_state(control_url: &str) -> Result<String> {
         body,
         1024 * 1024,
     )?;
-    let inner = crate::gena::find_tag_text(&resp, "ZoneGroupState")
+    zone_group_state_from_response(&resp)
+}
+
+/// The topology document a GetZoneGroupState response carries, escaped,
+/// as the text of its `<ZoneGroupState>` element — decoded.
+pub(crate) fn zone_group_state_from_response(resp: &str) -> Result<String> {
+    let inner = crate::gena::find_tag_text(resp, "ZoneGroupState")
         .ok_or_else(|| anyhow!("ZoneGroupState missing in response"))?;
-    Ok(crate::gena::xml_unescape(&inner))
+    Ok(crate::gena::decode_xml_text(&inner))
 }
 
 /// Build the DIDL-Lite metadata blob for SetAVTransportURI.
@@ -415,4 +421,44 @@ fn extract_int_tag(xml: &str, tag: &str) -> Option<u32> {
     let after = &xml[i + open.len()..];
     let j = after.find(&close)?;
     after[..j].trim().parse::<u32>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A GetZoneGroupState response as a Sonos sends it: the topology is
+    /// the escaped text of `<ZoneGroupState>`, non-ASCII as plain UTF-8,
+    /// and a value's own `&` escaped twice.
+    const ZGS_RESPONSE: &str = concat!(
+        r#"<?xml version="1.0" encoding="utf-8"?>"#,
+        r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">"#,
+        r#"<s:Body><u:GetZoneGroupStateResponse xmlns:u="urn:schemas-upnp-org:service:ZoneGroupTopology:1">"#,
+        r#"<ZoneGroupState>&lt;ZoneGroupState&gt;&lt;ZoneGroups&gt;"#,
+        r#"&lt;ZoneGroup Coordinator=&quot;RINCON_AAA&quot; ID=&quot;RINCON_AAA:1&quot;&gt;"#,
+        r#"&lt;ZoneGroupMember UUID=&quot;RINCON_AAA&quot; Location=&quot;http://192.168.1.10:1400/xml/device_description.xml&quot; ZoneName=&quot;Wohnzimmer&quot;/&gt;"#,
+        r#"&lt;ZoneGroupMember UUID=&quot;RINCON_BBB&quot; Location=&quot;http://192.168.1.11:1400/xml/device_description.xml&quot; ZoneName=&quot;Küche&quot;/&gt;"#,
+        r#"&lt;/ZoneGroup&gt;"#,
+        r#"&lt;ZoneGroup Coordinator=&quot;RINCON_CCC&quot; ID=&quot;RINCON_CCC:2&quot;&gt;"#,
+        r#"&lt;ZoneGroupMember UUID=&quot;RINCON_CCC&quot; Location=&quot;http://192.168.1.12:1400/xml/device_description.xml&quot; ZoneName=&quot;Emma’s Room&quot;/&gt;"#,
+        r#"&lt;ZoneGroupMember UUID=&quot;RINCON_DDD&quot; Location=&quot;http://192.168.1.13:1400/xml/device_description.xml&quot; ZoneName=&quot;Tom &amp;amp; Jerry&quot;/&gt;"#,
+        r#"&lt;/ZoneGroup&gt;"#,
+        r#"&lt;/ZoneGroups&gt;&lt;/ZoneGroupState&gt;</ZoneGroupState>"#,
+        r#"</u:GetZoneGroupStateResponse></s:Body></s:Envelope>"#,
+    );
+
+    #[test]
+    fn zone_group_state_is_the_decoded_text_of_the_response() {
+        let zgs = zone_group_state_from_response(ZGS_RESPONSE).unwrap();
+        assert!(zgs.starts_with(r#"<ZoneGroupState><ZoneGroups><ZoneGroup Coordinator="RINCON_AAA""#), "{zgs}");
+        assert!(zgs.contains(r#"ZoneName="Küche""#), "{zgs}");
+        assert!(zgs.contains(r#"ZoneName="Emma’s Room""#), "{zgs}");
+        // The inner document's own escape is left for its parser.
+        assert!(zgs.contains(r#"ZoneName="Tom &amp; Jerry""#), "{zgs}");
+    }
+
+    #[test]
+    fn zone_group_state_missing_is_an_error() {
+        assert!(zone_group_state_from_response("<s:Envelope/>").is_err());
+    }
 }

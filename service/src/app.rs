@@ -2262,9 +2262,13 @@ impl App {
         // out of its group. Re-check topology from the device itself and
         // stream to the group coordinator (= the whole group) instead.
         // No-op for non-Sonos renderers; fails open on network errors.
+        // Discovery found this speaker, so the coordinator its topology
+        // names is followed only to where discovery's own requests go.
         let new_r = {
             let d = discovery.clone();
-            crate::sonos::resolve_group_coordinator(new_r, &move |cid| d.find_by_id(cid))
+            let lan = crate::discovery_net::LanTargets::current();
+            let reach = crate::discovery_net::Reach { lan: &lan, reported: &discovery.memory().reported };
+            crate::sonos::resolve_group_coordinator(new_r, &move |cid| d.find_by_id(cid), Some(reach))
         };
         // Grant the speaker's addresses through the privacy gate BEFORE
         // the SOAP handshake — it HEAD/GETs `/stream.raw` as soon as
@@ -2286,8 +2290,9 @@ impl App {
     }
 
     /// UPnP session to a speaker added by its device-description URL: the
-    /// description is fetched now (exactly as discovery would have) and the
-    /// session keeps the manual id.
+    /// description is fetched now, as discovery would, except that its
+    /// service URLs are used as given (the user chose this device), and
+    /// the session keeps the manual id.
     fn start_upnp_manual(&self, m: &ManualSpeaker) -> Result<ActiveSession, String> {
         // Fetch from an IPv4 address: the stream and the SOAP control
         // paths are IPv4-only, and a hostname may resolve IPv6-first.
@@ -2296,13 +2301,15 @@ impl App {
         let ip = manual_speakers::resolve_ipv4(&host, url.port().unwrap_or(80))?;
         url.set_ip_host(IpAddr::V4(ip))
             .map_err(|_| format!("{}: can't use address {}", m.host, ip))?;
-        let r = crate::ssdp::fetch_and_parse_device(url.as_str(), Duration::from_secs(3))
+        let r = crate::ssdp::fetch_and_parse_device(url.as_str(), Duration::from_secs(3), crate::ssdp::ServiceUrls::AsGiven)
             .map_err(|e| format!("couldn't read {}: {:#}", m.host, e))?;
         let own_udn = r.udn.clone();
         // A Sonos that's grouped streams via its coordinator, as for a
-        // discovered one; the coordinator is looked up in discovery.
+        // discovered one; the coordinator is looked up in discovery. Its
+        // group may sit wherever it does (another subnet, a VLAN, this
+        // PC), so the coordinator is followed wherever its topology says.
         let r = match self.discovery.clone() {
-            Some(d) => crate::sonos::resolve_group_coordinator(r, &move |cid| d.find_by_id(cid)),
+            Some(d) => crate::sonos::resolve_group_coordinator(r, &move |cid| d.find_by_id(cid), None),
             None => r,
         };
         let redirected = r.udn != own_udn;
@@ -3155,7 +3162,7 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("stream-to-speaker-rescan".to_string())
             .spawn(move || {
-                match crate::ssdp::discover_once(Duration::from_secs(3), iface) {
+                match crate::ssdp::discover_once(Duration::from_secs(3), iface, discovery.memory()) {
                     // Searched the old network; the scope moved meanwhile.
                     Ok(_) if app.ssdp_scope() != scope => {}
                     Ok(found) => {
