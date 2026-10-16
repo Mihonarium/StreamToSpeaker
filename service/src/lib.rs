@@ -25,6 +25,7 @@ pub mod user_config;
 pub mod secret_store;
 pub mod update_check;
 pub mod stream_gate;
+pub mod web_access;
 pub mod gui_layout;
 pub mod manual_speakers;
 pub mod discovery_net;
@@ -68,6 +69,7 @@ pub fn is_openable_url(url: &str) -> bool {
 
 /// Open `url` in the default browser via `ShellExecuteW` — no command
 /// interpreter involved. Refuses anything [`is_openable_url`] rejects.
+/// Errors never quote the URL: some carry a key (the web UI's link).
 #[cfg(windows)]
 pub fn open_url(url: &str) -> std::io::Result<()> {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -75,7 +77,7 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     if !is_openable_url(url) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("refusing to open {:?}", url),
+            "refusing to open an address with characters the shell could misread",
         ));
     }
     use windows_sys::Win32::System::Com::{

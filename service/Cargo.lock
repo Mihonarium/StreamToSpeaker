@@ -3693,6 +3693,7 @@ dependencies = [
  "sha1",
  "sha2",
  "socket2",
+ "subtle",
  "thiserror 1.0.69",
  "tray-icon",
  "url",

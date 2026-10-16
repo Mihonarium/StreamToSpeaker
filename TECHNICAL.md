@@ -86,8 +86,10 @@ live — `N` bumps on every shipped binary.
 Output: `installer\out\StreamToSpeakerSetup-<version>.exe`. It installs the
 service to `Program Files`, stages the driver with `pnputil /add-driver
 /install`, runs `scripts\Rename-Endpoint.ps1`, and optionally adds Start Menu,
-desktop and autostart entries. Uninstall removes the driver via
-`Uninstall-Driver.ps1`, removes the test-signing certificate a test-signed
+desktop and autostart entries. `Pre-Install.ps1` and `Rename-Endpoint.ps1`
+log to `logs\install.log` in the install directory, not to
+`%LOCALAPPDATA%`; `scripts\Diagnose.ps1` prints its tail. Uninstall removes the driver
+via `Uninstall-Driver.ps1`, removes the test-signing certificate a test-signed
 build imported into `LocalMachine\Root` and `TrustedPublisher`
 (`Remove-TestCertificate.ps1`; an upgrade removes the replaced build's
 certificate when it differs), and deletes the install directory.
@@ -105,19 +107,22 @@ stale name. `scripts\Rename-Endpoint.ps1`, run elevated, overwrites it
 |---|---|
 | *(none)* | GUI window + tray. Closing the window minimises to tray. |
 | `--no-tray` | GUI only. Closing the window exits. |
-| `--headless` | No GUI; speaker via `--player` or the terminal picker. For service installs and SSH. |
-| `--web` | Adds the HTTP/JSON API and web UI. Combines with any mode. |
+| `--headless` | No GUI; speaker via `--player` or the terminal picker. For service installs and SSH; `--web-link` prints the web UI's link. |
+| `--web` | Adds the web UI and HTTP/JSON API, behind a secret link ([HTTP API](#http-api)). Combines with any mode; with `--headless` the link is printed once at start, to a console that a service may not have. |
+| `--web-link` | Prints the web UI's link and exits (making its key if there is none yet). Run it as the account the app runs under, with the app's `--port` and `--advertise-ip`. |
 
-`/stream.raw` is always served — the speaker pulls from it. The management
-endpoints exist only under `--web`.
+`/stream.raw` is always served — the speaker pulls from it: to this PC, and to
+other devices while streaming is enabled (with privacy mode on, only to the
+speaker being played on and its Sonos group). The management endpoints exist
+only under `--web`.
 
 ## Speaker selection
 
 The GUI and tray lists update as discovery runs. `--player` takes a name
 substring or an IPv4 literal; `--list-speakers` prints and exits. Without
 `--player`, `--headless` on a TTY offers a numbered prompt. Under `--web`,
-`POST /api/select` with `{"id": "<udn-or-ip>"}`. Discovery re-runs every
-`--ssdp-interval` minutes.
+`POST /api/select` with `{"id": "<udn-or-ip>"}` and the API key
+([HTTP API](#http-api)). Discovery re-runs every `--ssdp-interval` minutes.
 
 ### Sonos groups
 
@@ -127,14 +132,22 @@ answered by any player) and folds the zone-group state into the list
 `Invisible="1"` members and `Satellite` children), BRIDGE/BOOST units
 (`IsZoneBridge="1"`), and grouped non-coordinator members are hidden, and
 each group appears as its coordinator, named "Living Room + Kitchen" (or
-"+ N" beyond two). Members are hidden because `SetAVTransportURI` *is*
-Sonos's group-membership mechanism — `x-rincon:<coordinator-UUID>` joins a
-zone to a group, so pointing a member at a normal stream URI changes its
-membership instead of coexisting with it (SoCo hard-errors client-side on
-any transport call to a non-coordinator for the same reason). `--player`
+"+ N" beyond two). One topology, from the first of up to three players on
+this PC's networks that answers, says which units might be hidden, but a unit is hidden only on its own word:
+each unit it would hide is first asked for its own topology, at its own
+address, so a device answering discovery can't make other speakers
+disappear. A unit that answers when asked is named from its own answer;
+the other rows keep the first topology's labels. A unit that can't be
+asked keeps its answer from an earlier scan, or stays listed. Members are
+hidden because `SetAVTransportURI` *is* Sonos's group-membership mechanism —
+`x-rincon:<coordinator-UUID>` joins a zone to a group, so pointing a
+member at a normal stream URI changes its membership instead of coexisting
+with it (SoCo hard-errors client-side on any transport call to a
+non-coordinator for the same reason). `--player`
 also matches group member names. Selecting a speaker re-checks topology from
-the device itself and redirects to its current coordinator, so a list stale
-by up to one discovery interval can't break a group. Group sessions route
+the device itself and redirects to its current coordinator (for a speaker
+discovery found, only one on this PC's networks), so a list stale by up to
+one discovery interval can't break a group. Group sessions route
 volume through `GroupRenderingControl` on the coordinator —
 `SetGroupVolume`/`SetGroupMute` scale every member proportionally like the
 Sonos app's group slider, and error 701 anywhere else — and subscribe GENA
@@ -160,9 +173,10 @@ The GUI and web UI expose:
   prebuffer afterwards.
 
 ```bash
-curl -X POST "http://localhost:5901/api/latency/adjust?ms=100"   # trim 100 ms
-curl -X POST "http://localhost:5901/api/latency/adjust?ms=-25"   # pad 25 ms
-curl -X POST "http://localhost:5901/api/resync"
+KEY=...   # the web UI link's key: see HTTP API, below
+curl -X POST -H "Authorization: Bearer $KEY" "http://localhost:5901/api/latency/adjust?ms=100"   # trim 100 ms
+curl -X POST -H "Authorization: Bearer $KEY" "http://localhost:5901/api/latency/adjust?ms=-25"   # pad 25 ms
+curl -X POST -H "Authorization: Bearer $KEY" "http://localhost:5901/api/resync"
 ```
 
 For *ongoing* drift (typically ±10-100 ppm), set `--rate-fudge-ppm` once at
@@ -225,30 +239,53 @@ the crate version and update checks are off.
 
 ## HTTP API
 
-`--web` serves a status page at `http://<host>:5901/` plus:
+`--web` (or **Enable web UI** in the window) turns on a status page and the
+JSON API. Both need the web UI's link, `http://<host>:5901/r/<key>/`. The
+window's *Web UI* card shows it (*Copy link*, *Open in browser*); a
+`--headless --web` run prints it once to standard output when it starts, and
+never writes it to the log. Headless and service installs get it with
+`stream-to-speaker.exe --web-link`, which prints the link and exits: run it as
+the account the app runs under (the key is in that account's `config.json`),
+with the app's `--port` and `--advertise-ip` if it has them. `<key>` is 32 hex
+digits from the system's random source, made the first time the web UI is
+turned on (or `--web-link` runs) and kept in `config.json` (sealed with DPAPI,
+like the other stored secrets). **Make a new link** replaces it; the old link
+and key stop working at once. Anyone with the link can control the app on the
+network.
 
 | Endpoint | Method | Effect | Always on |
 |---|---|---|---|
 | `/stream.raw` | GET | Raw PCM the speaker pulls. | yes |
+| `/r/<key>/` | GET | The status page (its script: `/r/<key>/app.js`). | `--web` |
 | `/api/speakers` | GET | Discovered speakers. | `--web` |
 | `/api/select` | POST | `{"id": "<udn-or-ip>"}` with `Content-Type: application/json` — switch speaker. | `--web` |
 | `/api/resync` | POST | Restart the session. | `--web` |
 | `/api/latency/adjust?ms=N` | POST | `N>0` drains, `N<0` pads. | `--web` |
 | `/healthz` | GET | Returns `ok`. | yes |
 
-Requests must name this machine in `Host` (`localhost`, its computer name,
-one of its IP addresses, or `--advertise-ip`), and the `POST` routes refuse
-requests a browser marks as coming from another site (`Origin` /
-`Sec-Fetch-Site`), so a web page can't drive the API or read the stream
-through DNS rebinding. Scripts that send neither header are unaffected:
+Every `/api/*` request needs the key as a bearer token,
+`Authorization: Bearer <key>`; without it, or with a wrong one, the answer is
+`401` with a JSON `error`. Scripts send it like this:
 
 ```bash
-curl -X POST -H "Content-Type: application/json" -d '{"id":"uuid:RINCON_..."}' http://localhost:5901/api/select
+KEY=...   # the part of the web UI's link after /r/ (32 hex digits), from the window or --web-link
+curl -H "Authorization: Bearer $KEY" http://localhost:5901/api/speakers
+curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+     -d '{"id":"uuid:RINCON_..."}' http://localhost:5901/api/select
 ```
 
-> ⚠️ The API has no authentication: anyone on the LAN can call it while it
-> is on. Leave it off (the default), bind to `127.0.0.1`, or front it with a
-> reverse proxy that authenticates.
+`/`, `/app.js` and a link with a wrong key answer `401` with a page saying where to find the link. Pages under `/r/` are sent
+with `Referrer-Policy: no-referrer` and `Cache-Control: no-store`, and the key
+is replaced by `<key>` wherever a request path is logged.
+
+Requests must also name this machine in `Host` (`localhost`, its computer
+name, one of its IP addresses, or `--advertise-ip`), and the `POST` routes
+refuse requests a browser marks as coming from another site (`Origin` /
+`Sec-Fetch-Site`), even with the key, so a web page can't drive the API or
+read the stream through DNS rebinding.
+
+`/stream.raw` and the speakers' event callbacks take no key: speakers can't
+send one. The stream follows the streaming switch and privacy mode instead.
 
 ## Continuous integration
 

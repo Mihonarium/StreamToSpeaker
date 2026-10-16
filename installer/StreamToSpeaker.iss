@@ -272,6 +272,13 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\Remove-TestCertificate.ps1"" -CerPath ""{app}\driver\StreamToSpeaker.cer"""; \
     Flags: runhidden waituntilterminated; RunOnceId: "RemoveTestCert"
 
+[UninstallDelete]
+; Pre-Install.ps1 and Rename-Endpoint.ps1 keep their transcript in
+; {app}\logs\install.log. The scripts create it, not [Files], so uninstall
+; only knows to remove it from here (a link put in the folder's place is
+; removed, not followed).
+Type: filesandordirs; Name: "{app}\logs"
+
 [Code]
 
 // SHA-256 of the driver binary Windows was using before this install

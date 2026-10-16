@@ -11,6 +11,16 @@
     a user-data sentinel in %APPDATA%\StreamToSpeaker, which no phase may
     touch (uninstall leaves user data in place).
 
+    In each setup run of the current build, Pre-Install.ps1 and
+    Rename-Endpoint.ps1 must each add one run to
+    <install dir>\logs\install.log, and nothing may change in
+    %LOCALAPPDATA%\StreamToSpeaker, where earlier releases keep that log;
+    Rename-Endpoint.ps1 must compile its COM wrapper in Windows' temp
+    folder, not in the temp folder setup inherits from the user's profile,
+    and load it. After the fresh install, Diagnose.ps1 must find the log.
+    Each setup run's copy of the log goes with the uploaded logs, since
+    uninstall deletes it.
+
     Hosted runners have no test-signing and run Windows Server, so the
     driver is not expected to *load*: the device's status is reported, not
     required. What is required is everything the installer itself controls.
@@ -58,6 +68,14 @@ $ConfigDir = Join-Path $env:APPDATA "StreamToSpeaker"
 $Sentinel = Join-Path $ConfigDir "lifecycle-sentinel.txt"
 $LogDir = Join-Path $WorkDir "logs"
 $StateFile = Join-Path $WorkDir "state.json"
+# Where earlier releases keep install.log: the profile of the account that
+# runs setup.
+$ProfileLogDir = Join-Path $env:LOCALAPPDATA "StreamToSpeaker"
+# Where Rename-Endpoint.ps1 compiles its IPolicyConfig wrapper: Windows' own
+# temp folder, not the temp folder setup inherits from this process, which
+# is in the profile of the account that runs it.
+$WindowsTemp = Join-Path ([Environment]::GetFolderPath("Windows")) "Temp"
+$ProfileTemp = [IO.Path]::GetTempPath()
 
 New-Item -ItemType Directory -Force -Path $WorkDir, $LogDir | Out-Null
 
@@ -124,6 +142,173 @@ function Invoke-Setup([string]$exe, [string]$label) {
         throw "setup did not finish within 15 minutes (a dialog waiting for input?)"
     }
     Check ($p.ExitCode -eq 0) "setup exit code $($p.ExitCode)"
+}
+
+# A file's text; "" when it is missing or empty (Get-Content -Raw then
+# returns nothing, and a [string] cast of nothing is $null).
+function Read-Text([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return "" }
+    "$(Get-Content -LiteralPath $path -Raw)"
+}
+
+# The transcript Pre-Install.ps1 and Rename-Endpoint.ps1 append to.
+function Get-InstallLog { Join-Path (Get-AppDir) "logs\install.log" }
+
+# How many runs of Pre-Install.ps1 and Rename-Endpoint.ps1 the transcript
+# records: each writes a "started" line as soon as its transcript is open.
+function Get-TranscriptStarts {
+    $text = Read-Text (Get-InstallLog)
+    [ordered]@{
+        "Pre-Install.ps1"     = [regex]::Matches($text, '==== Pre-Install started at ').Count
+        "Rename-Endpoint.ps1" = [regex]::Matches($text, '==== Rename-Endpoint started at ').Count
+    }
+}
+
+# What the last Rename-Endpoint.ps1 run in the transcript says about its
+# IPolicyConfig wrapper: the folder it compiled it in ("" when that run
+# logged none) and whether it then loaded it.
+function Get-WrapperCompile {
+    $text = Read-Text (Get-InstallLog)
+    $start = $text.LastIndexOf("==== Rename-Endpoint started at ")
+    $run = if ($start -ge 0) { $text.Substring($start) } else { "" }
+    $m = [regex]::Match($run, '(?m)^Compiling the IPolicyConfig wrapper in (.*?)\r?$')
+    @{
+        folder = if ($m.Success) { $m.Groups[1].Value.Trim() } else { "" }
+        loaded = $run.Contains("Loaded IPolicyConfig wrapper.")
+    }
+}
+
+# Watches $dir and its subfolders for the compiler inputs Windows
+# PowerShell's Add-Type writes into its temp folder, <random>.cmdline and
+# <random>.0.cs, which it deletes again when the compile ends. A probe file
+# shows that the watch sees such files.
+function Start-CompileWatch([string]$dir) {
+    $w = [System.IO.FileSystemWatcher]::new($dir)
+    $w.Filters.Add("*.cmdline")
+    $w.Filters.Add("*.0.cs")
+    $w.IncludeSubdirectories = $true
+    $w.InternalBufferSize = 64KB
+    $null = Register-ObjectEvent -InputObject $w -EventName Created -SourceIdentifier "compile-watch"
+    $null = Register-ObjectEvent -InputObject $w -EventName Error -SourceIdentifier "compile-watch-error"
+    $w.EnableRaisingEvents = $true
+    $probe = Join-Path $dir "lifecycle-compile-watch-probe.cmdline"
+    Set-Content -LiteralPath $probe -Value "probe"
+    Remove-Item -LiteralPath $probe
+    @{ watcher = $w; probe = $probe }
+}
+
+# The compiler inputs the watch saw besides its probe; $null when it can't
+# tell (it missed the probe or lost notifications).
+function Stop-CompileWatch($watch) {
+    Start-Sleep -Seconds 1
+    $watch.watcher.EnableRaisingEvents = $false
+    $seen = @(Get-Event -SourceIdentifier "compile-watch" -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.SourceEventArgs.FullPath })
+    $lost = @(Get-Event -SourceIdentifier "compile-watch-error" -ErrorAction SilentlyContinue).Count -gt 0
+    foreach ($id in "compile-watch", "compile-watch-error") {
+        Unregister-Event -SourceIdentifier $id -ErrorAction SilentlyContinue
+        Remove-Event -SourceIdentifier $id -ErrorAction SilentlyContinue
+    }
+    $watch.watcher.Dispose()
+    if ($lost -or $seen -notcontains $watch.probe) { return $null }
+    , @($seen | Where-Object { $_ -ne $watch.probe })
+}
+
+# Every file and folder under the old per-user log folder with its size and
+# write time, to show that a setup run left it alone.
+function Get-ProfileLogSnapshot {
+    if (-not (Test-Path -LiteralPath $ProfileLogDir)) { return "(absent)" }
+    @(Get-ChildItem -LiteralPath $ProfileLogDir -Recurse -Force |
+        ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" } |
+        Sort-Object) -join "`n"
+}
+
+# Keeps a copy of the install-time transcript with the uploaded logs, since
+# uninstall deletes it: from the install directory, or from the profile for
+# a release that still logs there.
+function Save-InstallLog([string]$label) {
+    $copies = [ordered]@{
+        "$label-install.log"         = Get-InstallLog
+        "$label-install-profile.log" = Join-Path $ProfileLogDir "install.log"
+    }
+    foreach ($name in $copies.Keys) {
+        if (Test-Path -LiteralPath $copies[$name]) {
+            Copy-Item -LiteralPath $copies[$name] (Join-Path $LogDir $name) -Force
+        }
+    }
+}
+
+# Runs this build's installer. Pre-Install.ps1 and Rename-Endpoint.ps1
+# must each add one run to <install dir>\logs\install.log, nothing may
+# change in the per-user folder, and Rename-Endpoint.ps1 must compile its
+# wrapper in Windows' temp folder and load it, with nothing compiled in the
+# temp folder setup inherits: setup runs its scripts elevated, and the
+# profile's folders are ones the user's own programs can redirect or write
+# to.
+function Invoke-CurrentSetup([string]$label) {
+    $before = Get-TranscriptStarts
+    $profileBefore = Get-ProfileLogSnapshot
+    $watch = Start-CompileWatch $ProfileTemp
+    $compiledInProfile = $null
+    try {
+        Invoke-Setup $Installer $label
+    } finally {
+        $compiledInProfile = Stop-CompileWatch $watch
+    }
+    Save-InstallLog $label
+    $after = Get-TranscriptStarts
+    foreach ($name in $before.Keys) {
+        Check ($after[$name] -eq $before[$name] + 1) "$name logged to $(Get-InstallLog) (runs recorded: $($before[$name]) before setup, $($after[$name]) after)"
+    }
+    Check ((Get-ProfileLogSnapshot) -eq $profileBefore) "setup wrote nothing to $ProfileLogDir"
+    $compile = Get-WrapperCompile
+    Check ($compile.folder.TrimEnd("\") -eq $WindowsTemp) "Rename-Endpoint.ps1 compiled its IPolicyConfig wrapper in $WindowsTemp, outside the user's profile (logged: '$($compile.folder)')"
+    Check $compile.loaded "Rename-Endpoint.ps1 loaded the wrapper it compiled"
+    if ($null -eq $compiledInProfile) {
+        Warn "could not watch $ProfileTemp during setup; whether anything was compiled there is unknown"
+    } else {
+        Check ($compiledInProfile.Count -eq 0) "nothing was compiled in $ProfileTemp during setup (compiler inputs seen: $($compiledInProfile -join ', '))"
+    }
+}
+
+# Runs Diagnose.ps1 as users do (Windows PowerShell, elevated), from the
+# install directory and as a copy in another folder (which finds the
+# install through its Apps & Features entry, also from 32-bit Windows
+# PowerShell, whose registry view doesn't show that entry by default): it
+# must parse under Windows PowerShell and print the tail of
+# <install dir>\logs\install.log.
+function Assert-DiagnoseFindsInstallLog([string]$label) {
+    $installed = Join-Path (Get-AppDir) "scripts\Diagnose.ps1"
+    $copyDir = Join-Path $WorkDir "diagnose-copy"
+    New-Item -ItemType Directory -Force -Path $copyDir | Out-Null
+    Copy-Item -LiteralPath $installed $copyDir -Force
+    $copy = Join-Path $copyDir "Diagnose.ps1"
+    $ps = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $ps32 = Join-Path $env:SystemRoot "SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+    $runs = [ordered]@{
+        "from the install directory"                        = $ps, $installed
+        "from another folder"                               = $ps, $copy
+        "from another folder, in 32-bit Windows PowerShell" = $ps32, $copy
+    }
+    $n = 0
+    foreach ($where in $runs.Keys) {
+        $n++
+        $exe, $file = $runs[$where]
+        $out = Join-Path $LogDir "$label-diagnose-$n.txt"
+        $p = Start-Process -FilePath $exe -PassThru -NoNewWindow `
+            -RedirectStandardOutput $out -RedirectStandardError "$out.stderr" -ArgumentList @(
+            "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "`"$file`"")
+        $null = $p.Handle
+        if (-not $p.WaitForExit(5 * 60 * 1000)) {
+            $p | Stop-Process -Force -ErrorAction SilentlyContinue
+            Fail "Diagnose.ps1 $where did not finish within 5 minutes"
+            continue
+        }
+        $text = Read-Text $out
+        Check ($p.ExitCode -eq 0) "Diagnose.ps1 $where ran under Windows PowerShell (exit code $($p.ExitCode))"
+        Check ($text.Contains("==== Rename-Endpoint finished at ")) "Diagnose.ps1 $where printed the tail of $(Get-InstallLog)"
+    }
+    Remove-Item -LiteralPath $copyDir -Recurse -Force
 }
 
 function Invoke-Uninstall([string]$label) {
@@ -301,15 +486,16 @@ switch ($Phase) {
         Ok "sentinel written to $Sentinel"
     }
     "install" {
-        Invoke-Setup $Installer "install"
+        Invoke-CurrentSetup "install"
         Assert-Installed -Full
+        Assert-DiagnoseFindsInstallLog "install"
         Assert-Sentinel
     }
     "repair" {
         $app = Get-AppDir
         $victims = @("README.md", "scripts\Diagnose.ps1")
         foreach ($v in $victims) { Remove-Item (Join-Path $app $v) -Force }
-        Invoke-Setup $Installer "repair"
+        Invoke-CurrentSetup "repair"
         foreach ($v in $victims) { Check (Test-Path (Join-Path $app $v)) "repair restored $v" }
         Assert-Installed -Full
         Assert-Sentinel
@@ -320,11 +506,12 @@ switch ($Phase) {
     }
     "previous" {
         Invoke-Setup $Installer "previous"
+        Save-InstallLog "previous"
         Assert-Installed
         Assert-Sentinel
     }
     "upgrade" {
-        Invoke-Setup $Installer "upgrade"
+        Invoke-CurrentSetup "upgrade"
         Assert-Installed -Full
         Assert-Sentinel
     }

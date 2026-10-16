@@ -310,7 +310,7 @@ pub fn parse_rendering_notify(body: &str) -> Option<RenderingChange> {
         return Some(RenderingChange { volume, mute });
     };
     // LastChange is XML-encoded inside the text node.
-    let decoded = xml_unescape(&lc);
+    let decoded = decode_xml_text(&lc);
 
     // Decoded looks like:
     // <Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT_RCS">
@@ -468,8 +468,9 @@ fn extract_header(response: &str, header: &str) -> Option<String> {
     None
 }
 
-/// Pull the text between the first `<tag>...</tag>` pair. Also used by
-/// upnp.rs / sonos.rs for the ZoneGroupState payload.
+/// Pull the raw (still escaped) content between the first `<tag>...</tag>`
+/// pair; [`decode_xml_text`] turns it into text. Also used by upnp.rs for
+/// the ZoneGroupState payload.
 pub(crate) fn find_tag_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
@@ -479,38 +480,29 @@ pub(crate) fn find_tag_text(xml: &str, tag: &str) -> Option<String> {
     Some(after[..j].to_string())
 }
 
-pub(crate) fn xml_unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    let bytes = s.as_bytes();
-    while i < bytes.len() {
-        if bytes[i] == b'&' {
-            if s[i..].starts_with("&amp;") {
-                out.push('&');
-                i += 5;
-                continue;
-            } else if s[i..].starts_with("&lt;") {
-                out.push('<');
-                i += 4;
-                continue;
-            } else if s[i..].starts_with("&gt;") {
-                out.push('>');
-                i += 4;
-                continue;
-            } else if s[i..].starts_with("&quot;") {
-                out.push('"');
-                i += 6;
-                continue;
-            } else if s[i..].starts_with("&apos;") {
-                out.push('\'');
-                i += 6;
-                continue;
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
+/// Decode element content taken out by [`find_tag_text`] the way an XML
+/// parser reads character data: entity and character references (`&amp;`,
+/// `&#252;`, `&#xFC;`) and CDATA sections become the characters they stand
+/// for, and all other text (any script, emoji, typographic punctuation) is
+/// kept as it is. The decoding is roxmltree's own, so it agrees with the
+/// parse of the decoded document that follows.
+///
+/// Content that is not plain character data is returned unchanged, for the
+/// caller's own parse to judge: child elements (a renderer that writes the
+/// LastChange `<Event>` as markup instead of escaping it), an unknown
+/// entity, or a bare `&`.
+pub(crate) fn decode_xml_text(raw: &str) -> String {
+    let wrapped = format!("<v>{raw}</v>");
+    let Ok(doc) = roxmltree::Document::parse(&wrapped) else {
+        return raw.to_string();
+    };
+    let v = doc.root_element();
+    if v.children().all(|n| n.is_text()) {
+        // roxmltree merges adjacent text and CDATA into one text node.
+        v.text().unwrap_or("").to_string()
+    } else {
+        raw.to_string()
     }
-    out
 }
 
 #[cfg(test)]
@@ -589,8 +581,70 @@ mod tests {
     }
 
     #[test]
-    fn xml_unescape_basic() {
-        assert_eq!(xml_unescape("a &amp; b &lt;c&gt; &quot;d&quot;"), "a & b <c> \"d\"");
+    fn decode_xml_text_basic() {
+        assert_eq!(
+            decode_xml_text("a &amp; b &lt;c&gt; &quot;d&quot; &apos;e&apos;"),
+            "a & b <c> \"d\" 'e'"
+        );
+        // One level only: a double-escaped value keeps its inner escape
+        // for the inner document's parser.
+        assert_eq!(decode_xml_text("Tom &amp;amp; Jerry"), "Tom &amp; Jerry");
+        assert_eq!(decode_xml_text(""), "");
+    }
+
+    #[test]
+    fn decode_xml_text_keeps_non_ascii_text() {
+        for name in ["Küche", "Salón", "Kök", "Séjour", "Emma’s Room", "Детская", "寝室", "🎵 Studio"] {
+            assert_eq!(decode_xml_text(name), name);
+            let escaped = format!("&lt;M ZoneName=&quot;{name}&quot;/&gt;");
+            assert_eq!(decode_xml_text(&escaped), format!("<M ZoneName=\"{name}\"/>"));
+        }
+    }
+
+    #[test]
+    fn decode_xml_text_decodes_character_references_and_cdata() {
+        assert_eq!(decode_xml_text("K&#252;che K&#xFC;che K&#xfc;che"), "Küche Küche Küche");
+        assert_eq!(decode_xml_text("&#x1F3B5;"), "🎵");
+        assert_eq!(decode_xml_text("&#60;Event/&#62;"), "<Event/>");
+        assert_eq!(decode_xml_text("a<![CDATA[<Event a=\"1\"/>]]>b"), "a<Event a=\"1\"/>b");
+    }
+
+    #[test]
+    fn decode_xml_text_leaves_what_is_not_character_data_alone() {
+        // Child markup (an unescaped LastChange payload), an unknown entity,
+        // a bare ampersand, a reference to a character XML forbids: as
+        // written.
+        for raw in [
+            r#"<Event><Volume channel="Master" val="7"/></Event>"#,
+            "a &nbsp; b",
+            "fish & chips",
+            "&#1;",
+        ] {
+            assert_eq!(decode_xml_text(raw), raw);
+        }
+    }
+
+    #[test]
+    fn parses_volume_change_with_non_ascii_text_alongside() {
+        let body = r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property>
+<LastChange>&lt;Event xmlns="urn:schemas-upnp-org:metadata-1-0/RCS/"&gt;&lt;InstanceID val="0"&gt;&lt;PresetNameList val="Küche, Emma’s Room"/&gt;&lt;Volume channel="Master" val="21"/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
+</e:property></e:propertyset>"#;
+        let rc = parse_rendering_notify(body).expect("decode");
+        assert_eq!(rc.volume, Some(21));
+    }
+
+    #[test]
+    fn parses_last_change_written_as_markup_or_cdata() {
+        // Not escaped at all: read as markup.
+        let body = r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property>
+<LastChange><Event xmlns="urn:schemas-upnp-org:metadata-1-0/RCS/"><InstanceID val="0"><Mute channel="Master" val="1"/></InstanceID></Event></LastChange>
+</e:property></e:propertyset>"#;
+        assert_eq!(parse_rendering_notify(body).expect("markup").mute, Some(true));
+        // Wrapped in CDATA: read too.
+        let body = r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property>
+<LastChange><![CDATA[<Event xmlns="urn:schemas-upnp-org:metadata-1-0/RCS/"><InstanceID val="0"><Volume channel="Master" val="9"/></InstanceID></Event>]]></LastChange>
+</e:property></e:propertyset>"#;
+        assert_eq!(parse_rendering_notify(body).expect("cdata").volume, Some(9));
     }
 
     #[test]

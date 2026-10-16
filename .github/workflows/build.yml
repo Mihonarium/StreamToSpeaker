@@ -39,14 +39,18 @@ jobs:
     # actions/runner-images#14017. Revisit with an EWDK or a VS2026-matched
     # WDK when one ships.
     runs-on: windows-2022
-    timeout-minutes: 60
+    # v* tag builds restore no Rust cache (see "Cache Rust dependencies"
+    # below), so every one of them compiles every dependency, as other runs
+    # do only when the cache misses. A timeout there fails the release, and
+    # a re-run compiles cold again, so they get twice the time.
+    timeout-minutes: ${{ startsWith(github.ref, 'refs/tags/v') && 120 || 60 }}
     outputs:
       version: ${{ steps.ver.outputs.version }}
       viversion: ${{ steps.ver.outputs.viversion }}
       source_hash: ${{ steps.srchash.outputs.hash }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Full history — the driver build number is `git rev-list --count
           # HEAD`, which silently evaluates to 1 on the default depth-1
@@ -117,9 +121,12 @@ jobs:
       # -----------------------------------------------------------------
       # Toolchains
       # -----------------------------------------------------------------
+      # The action's v1 requires `toolchain` (only its branches named after
+      # a toolchain, such as `stable`, supply one), so it is named here.
       - name: Set up Rust (stable, x86_64-pc-windows-msvc)
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
 
       # Rust dependency cache. Swatinem/rust-cache instead of a plain
@@ -131,8 +138,15 @@ jobs:
       # worth caching; smaller entries also relieve the repo's 10 GB cache
       # budget that the WDK/driver caches share), and it saves even when a
       # later step fails.
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      #
+      # Skipped on v* tags: the release exe, which the chain below EV-signs,
+      # is built with nothing restored from a Rust cache entry another run
+      # wrote (tag runs can restore main's entries), so tag builds compile
+      # every dependency. Nothing is saved on tags either: only later runs
+      # for the same tag could restore such an entry.
+      - name: Cache Rust dependencies (not on release tags)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: service
           cache-on-failure: true
@@ -164,7 +178,7 @@ jobs:
       # -----------------------------------------------------------------
       - name: Restore prebuilt driver cache
         id: cache-driver
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: driver-cache
           key: driver-${{ runner.os }}-v2-${{ env.WDK_INSTALLER_URL }}-${{ hashFiles('driver/**', 'include/**') }}
@@ -207,7 +221,7 @@ jobs:
       - name: Restore WDK cache
         id: cache-wdk
         if: steps.cache-driver.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             C:\Program Files (x86)\Windows Kits\10
@@ -256,7 +270,7 @@ jobs:
       # to expose msbuild on PATH for the driver toolset.
       - name: Add MSBuild to PATH
         if: steps.cache-driver.outputs.cache-hit != 'true'
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2.0.0
         with:
           msbuild-architecture: x64
 
@@ -369,7 +383,7 @@ jobs:
 
       - name: Save prebuilt driver cache
         if: steps.cache-driver.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: driver-cache
           key: ${{ steps.cache-driver.outputs.cache-primary-key }}
@@ -595,7 +609,7 @@ jobs:
       # installer comes from the `package` job.
       - name: Upload installer artifact
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: StreamToSpeakerSetup-${{ steps.ver.outputs.version }}
           path: |
@@ -611,7 +625,7 @@ jobs:
       # reads this artifact, so it is kept for the minimum of one day there;
       # other builds keep the repository's default retention (0).
       - name: Upload raw driver + service binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaries-${{ steps.ver.outputs.version }}
           overwrite: true
@@ -635,7 +649,7 @@ jobs:
       # sign-service and package read it within the hours the chain runs.
       - name: Upload release inputs (tag push only)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-inputs
           path: |
@@ -746,11 +760,11 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ needs.build.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-inputs
           path: release-inputs
@@ -780,7 +794,7 @@ jobs:
       # (private-source mode) — it is never a release asset; only the signed
       # exe lands on the draft.
       - name: Upload unsigned service exe as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: unsigned-service-exe
           path: ${{ steps.upload.outputs.name }}
@@ -825,7 +839,7 @@ jobs:
       - name: Attest build provenance (public repo only)
         id: attest
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: ${{ steps.sign.outputs.signed-path }}
 
@@ -875,11 +889,11 @@ jobs:
       SOURCE_HASH: ${{ needs.build.outputs.source_hash }}
       SERVICE_SHA256: ${{ needs.sign-service.outputs.signed_sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-inputs
           path: release-inputs
@@ -997,7 +1011,7 @@ jobs:
       # The unsigned installer travels to the release gate and the signing
       # repo as a workflow artifact of this run, never as a release asset.
       - name: Upload the unsigned installer as a workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: unsigned-setup-exe
           path: ${{ steps.iscc.outputs.exe }}
@@ -1076,7 +1090,7 @@ jobs:
       DRIVER_FOUND: ${{ needs.package.outputs.driver_found }}
       PROVENANCE: ${{ !github.event.repository.private }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -1149,7 +1163,7 @@ jobs:
       - name: Attest build provenance (public repo only)
         id: attest
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: ${{ steps.sign.outputs.signed-path }}
 
@@ -1259,7 +1273,7 @@ jobs:
       INSTALLER_SHA256: ${{ needs.sign-release.outputs.signed_sha256 }}
       PROVENANCE: ${{ !github.event.repository.private }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false
@@ -1318,7 +1332,7 @@ jobs:
     outputs:
       changed: ${{ steps.diff.outputs.changed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The PR merge commit and its first parent (the base it merges
           # into): their diff is exactly the PR's change.
@@ -1353,9 +1367,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      # Checks on the workflow files themselves (test_workflows.py). This
+      # job runs in every run of this workflow (every pull request, every
+      # push to main), and the checks need only the runner's own Python, so
+      # they come right after the checkout.
+      - name: Workflow checks (test_workflows.py)
+        working-directory: .github/scripts
+        run: python3 -m unittest -v test_workflows
 
       - name: Read rust-version from Cargo.toml
         id: msrv
@@ -1365,12 +1387,12 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust ${{ steps.msrv.outputs.version }}
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
           targets: x86_64-pc-windows-gnu
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: service
 

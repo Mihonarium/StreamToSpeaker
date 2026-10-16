@@ -66,7 +66,7 @@ jobs:
       # Only the comparison scripts, in their own directory: the steps
       # below work in the workspace root (assets/, ms-signed/, ...), and a
       # full checkout would mix the repository's own assets/ into them.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: repo-scripts
           sparse-checkout: .github/scripts
@@ -278,7 +278,7 @@ jobs:
       - name: Attest build provenance (public repo only)
         id: attest
         if: ${{ !github.event.repository.private && !inputs.dry_run }}
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: ${{ steps.verify.outputs.zip_name }}
 

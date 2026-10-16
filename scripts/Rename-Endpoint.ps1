@@ -10,7 +10,7 @@
 #
 # This script:
 #   1. Finds the render endpoint carrying our product name in any of its
-#      three name properties (see the note by $nameKeys — DeviceDesc, the
+#      three name properties (see the note by $nameKeys - DeviceDesc, the
 #      obvious one, never contains it).
 #   2. Sets its friendly name via IPolicyConfig::SetPropertyValue
 #      (PKEY_Device_FriendlyName) - same path Sound Settings'
@@ -19,9 +19,19 @@
 #      IPolicyConfig::SetEndpointVisibility(id, true) - same path
 #      the Sound Settings Allow / Disable toggle uses.
 #
-# All output is captured to %LOCALAPPDATA%\StreamToSpeaker\
-# install.log so failures are diagnosable after the installer's
-# silent run.
+# All output is captured to logs\install.log in the folder above this
+# script's own (<install dir>\logs\install.log when the installer runs
+# it), so failures are diagnosable after the installer's silent run
+# (Pre-Install.ps1 says why the log is there). Run by hand without
+# elevation from an install directory only administrators can change
+# (the default one, in Program Files), the log can't be written and the
+# output goes to the console only.
+#
+# Keep this file ASCII. Windows PowerShell reads a script without a
+# byte-order mark in the system's ANSI code page; in the single-byte
+# Windows code pages a UTF-8 dash turns into three characters, one of
+# them a curly quote that ends a string early, and the whole script
+# fails to parse.
 
 [CmdletBinding()]
 param(
@@ -31,10 +41,17 @@ param(
 
 $ErrorActionPreference = "Continue"
 
-$logDir = Join-Path $env:LOCALAPPDATA "StreamToSpeaker"
-$null = New-Item -ItemType Directory -Force -Path $logDir -ErrorAction SilentlyContinue
+# The same transcript as Pre-Install.ps1; keep the two equal.
+$logDir = Join-Path (Split-Path -Parent $PSScriptRoot) "logs"
 $logFile = Join-Path $logDir "install.log"
-$null = Start-Transcript -Path $logFile -Append -ErrorAction SilentlyContinue
+$transcribing = $false
+try {
+    $null = New-Item -ItemType Directory -Force -Path $logDir -ErrorAction Stop
+    $null = Start-Transcript -LiteralPath $logFile -Append -ErrorAction Stop
+    $transcribing = $true
+} catch {
+    Write-Host "Not logging to $logFile ($($_.Exception.Message)); output goes to this console only."
+}
 "==== Rename-Endpoint started at $(Get-Date -Format 'u') ====" | Write-Host
 
 try {
@@ -44,7 +61,26 @@ try {
     #    Reference: github.com/frgnca/AudioDeviceCmdlets (MIT).
     # -----------------------------------------------------------------------
     if (-not ("StreamToSpeaker.PolicyConfigBridge" -as [type])) {
-        Add-Type -ErrorAction Stop -Language CSharp -TypeDefinition @'
+        # Windows PowerShell's Add-Type compiles through the temp folder: it
+        # writes the C# there, csc.exe writes the DLL next to it, and this
+        # process then loads that DLL. The installer runs this script
+        # elevated, but the temp folder it inherits is in the profile of the
+        # user who approved the install, where that user's unelevated
+        # programs could change those files between the steps. So the
+        # compile uses Windows' own temp folder, located through Windows
+        # itself (the inherited environment is that user's too). Unelevated
+        # programs can add files of their own there, but can't change the
+        # files an elevated process puts there and by default can't even
+        # list the folder; a run by hand without elevation can still
+        # compile there. The inherited values come back afterwards, so a
+        # run from an open PowerShell window leaves its environment as it
+        # was. The installer lifecycle test checks the "Compiling" line and
+        # the "Loaded" line after the compile.
+        $inheritedTemp = $env:TEMP, $env:TMP
+        $env:TEMP = $env:TMP = Join-Path ([Environment]::GetFolderPath("Windows")) "Temp"
+        try {
+            Write-Host "Compiling the IPolicyConfig wrapper in $([IO.Path]::GetTempPath())"
+            Add-Type -ErrorAction Stop -Language CSharp -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
@@ -115,7 +151,7 @@ namespace StreamToSpeaker {
         }
 
         // Sets a DWORD-valued PKEY (PROPVARIANT.vt = VT_UI4). The
-        // 32-bit value goes in the IntPtr slot directly — no heap
+        // 32-bit value goes in the IntPtr slot directly - no heap
         // allocation needed.
         public static int SetUInt32Property(string endpointId, Guid fmtid, uint pid, uint value) {
             var key = new PROPERTYKEY { fmtid = fmtid, pid = pid };
@@ -126,6 +162,9 @@ namespace StreamToSpeaker {
     }
 }
 '@
+        } finally {
+            $env:TEMP, $env:TMP = $inheritedTemp
+        }
         Write-Host "Loaded IPolicyConfig wrapper."
     }
 
@@ -156,7 +195,7 @@ namespace StreamToSpeaker {
     # obvious one is the wrong one: DeviceDesc is copied from the friendly
     # name registered for the bridge pin's KSNODETYPE_SPEAKER category, so
     # on a healthy install it reads "Speakers" and contains nothing of ours
-    # at all. Our product name lives in the other two — "Speakers (Stream
+    # at all. Our product name lives in the other two - "Speakers (Stream
     # To Speaker)" in FriendlyName and "Stream To Speaker" in the device
     # interface name. Matching DeviceDesc alone found nothing and this
     # script exited 2 every time.
@@ -211,12 +250,12 @@ namespace StreamToSpeaker {
     # PKEY definitions reused below. The {1DA5D803-...} family is the
     # AudioEndpoint property GUID; F3E80BEF is the AudioDevice family.
     $pkeyAudioEndpoint_fmtid = [guid] "1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E"
-    $PKEY_FormFactor_pid                = 0       # VT_UI4 — endpoint form factor
-    $PKEY_Association_pid               = 2       # VT_LPWSTR — KSNODETYPE GUID
+    $PKEY_FormFactor_pid                = 0       # VT_UI4 - endpoint form factor
+    $PKEY_Association_pid               = 2       # VT_LPWSTR - KSNODETYPE GUID
     $PKEY_DisableSysFx_pid              = 5       # VT_UI4
     $PKEY_SupportsEventDriven_pid       = 7       # VT_UI4
     $pkeyAudioDevice_fmtid              = [guid] "F3E80BEF-1723-4FF2-BCC4-7F83DC5E46D4"
-    $PKEY_EnableEndpointByDefault_pid   = 4       # VT_UI4 — flag mask
+    $PKEY_EnableEndpointByDefault_pid   = 4       # VT_UI4 - flag mask
 
     $FORMFACTOR_SPEAKERS = 1
     $ENABLE_RENDER_MASK  = 0x101   # FLAG_ENABLE | FLOW_MASK_RENDER
@@ -232,7 +271,7 @@ namespace StreamToSpeaker {
 
         # --- Visibility FIRST (== "Allow apps to use this device") ---
         # On Win11 24H2, SetPropertyValue can race AudioEndpointBuilder
-        # if the visibility transition is still pending — friendly-name
+        # if the visibility transition is still pending - friendly-name
         # writes get recomposed by AEB seconds later. Promote the
         # endpoint to ACTIVE first, then write properties.
         $hr = [StreamToSpeaker.PolicyConfigBridge]::SetVisible($endpointId, $true)
@@ -246,7 +285,7 @@ namespace StreamToSpeaker {
         # via IPolicyConfig. The INF wrote these too, but on the upgrade
         # path AudioEndpointBuilder may have inherited stale values from
         # the cached MMDevices entry (especially if a previous install
-        # wrote a different KSNODETYPE_SPEAKER GUID — the BE2/CE1 typo
+        # wrote a different KSNODETYPE_SPEAKER GUID - the BE2/CE1 typo
         # we fixed in DriverVer 1.1.x). Forcing them via the audiosrv
         # RPC lands them authoritatively, regardless of cache state.
         $hr = [StreamToSpeaker.PolicyConfigBridge]::SetUInt32Property(
@@ -299,7 +338,7 @@ namespace StreamToSpeaker {
             }
             Write-Host "  DeviceState = $stateName ($state)"
             if ($state -ne 1) {
-                Write-Warning "  Endpoint is not ACTIVE — user may still need to click Allow in Sound Settings."
+                Write-Warning "  Endpoint is not ACTIVE - user may still need to click Allow in Sound Settings."
             }
         }
     }
@@ -310,5 +349,5 @@ namespace StreamToSpeaker {
     Write-Warning ($_.ScriptStackTrace)
 } finally {
     "==== Rename-Endpoint finished at $(Get-Date -Format 'u') ====" | Write-Host
-    $null = Stop-Transcript -ErrorAction SilentlyContinue
+    if ($transcribing) { $null = Stop-Transcript }
 }

@@ -91,7 +91,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Unit tests (guard)
         run: python3 -m unittest discover -s .github/scripts
@@ -159,7 +159,7 @@ jobs:
             --ms-zip "${{ steps.rel.outputs.ms_zip }}" --lab-zip "${{ steps.rel.outputs.lab_zip }}" \
             --version "${{ inputs.version }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: certified-packages
           path: |
@@ -179,7 +179,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Compute driver source hash
         id: srchash
@@ -188,7 +188,7 @@ jobs:
           "hash=${{ hashFiles('driver/**', 'include/**') }}" >> $env:GITHUB_OUTPUT
           Write-Host "Driver source hash of ${{ github.sha }}: ${{ hashFiles('driver/**', 'include/**') }}"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: certified-packages
           path: packages
@@ -268,7 +268,7 @@ jobs:
       - name: Attest build provenance (public repo only)
         id: attest
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: ${{ steps.publish.outputs.signed_zip }}
 

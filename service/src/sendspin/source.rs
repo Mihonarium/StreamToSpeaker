@@ -51,9 +51,18 @@ const MIN_CODE_DIGITS: u32 = 6;
 /// Wrong pairing codes (across connections and restarts) after which
 /// code pairing is paused until the user allows it again.
 pub const PAIRING_FAILURE_LIMIT: u32 = 10;
-/// Most simultaneous connections on the listener; further ones are closed
-/// at once (one Music Assistant server needs one, plus reconnect overlap).
+/// Most simultaneous connections on the listener (one Music Assistant
+/// server needs one, plus reconnect overlap). A connection beyond it
+/// takes over the slot of one that hasn't been admitted (see
+/// `ConnectionSlots`).
 const MAX_CONNECTIONS: usize = 8;
+/// Most simultaneous connections from one address. Connections are taken
+/// before anyone is authenticated; with this, one address alone can't
+/// fill the listener, and its further connections are refused at once
+/// (a host using more addresses: see `ConnectionSlots`). A server needs
+/// one plus reconnect overlap; this leaves room for a second server on
+/// that host.
+const MAX_CONNECTIONS_PER_ADDRESS: usize = 4;
 /// Time a connection gets to finish the handshake and be activated.
 const ADMISSION_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -100,7 +109,7 @@ struct Shared {
     stop: AtomicBool,
     next_conn: AtomicU64,
     /// Open connections on the listener.
-    connections: AtomicUsize,
+    slots: Arc<ConnectionSlots>,
     state: Mutex<SourceState>,
     /// Code on display for an in-progress dynamic pairing: (code, server).
     code: Mutex<Option<(u64, String, String)>>,
@@ -135,7 +144,7 @@ impl SourceService {
             store,
             stop: AtomicBool::new(false),
             next_conn: AtomicU64::new(1),
-            connections: AtomicUsize::new(0),
+            slots: Arc::new(ConnectionSlots::default()),
             state: Mutex::new(SourceState::Waiting),
             code: Mutex::new(None),
             admitted: Mutex::new(None),
@@ -228,28 +237,156 @@ pub fn pairing_token(store: &dyn SendspinStore) -> String {
     token
 }
 
+/// Closes a connection's socket.
+type Close = Box<dyn FnOnce() + Send>;
+
+/// The listener's connection slots: [`MAX_CONNECTIONS`] in all, at most
+/// [`MAX_CONNECTIONS_PER_ADDRESS`] of them for one address.
+///
+/// Slots are taken before anyone is authenticated, and one host can use
+/// several addresses, so the per-address share alone can't keep the
+/// listener from filling up with connections that are reopened before
+/// the admission deadline. When it is full, a new connection takes over
+/// the slot of one that hasn't been admitted, which is closed: the oldest
+/// such connection of the address holding the most of them. A flood that
+/// holds two or more slots from any one address therefore replaces its
+/// own connections, and a server's single connection stays. A flood with
+/// a different address for each connection ranks every address alike, and
+/// then the oldest goes, which can be a server's handshake still in
+/// progress: nothing tells the two apart before the handshake ends.
+#[derive(Default)]
+struct ConnectionSlots {
+    held: Mutex<Vec<Held>>,
+}
+
+/// One open connection's slot.
+struct Held {
+    conn_id: u64,
+    addr: std::net::IpAddr,
+    since: Instant,
+    /// Closes the connection when its slot goes to a newer one.
+    close: Close,
+}
+
+impl ConnectionSlots {
+    /// A slot for connection `conn_id` from `addr`, which `close` closes,
+    /// or None while that address holds its share. `admitted` is the
+    /// connection admitted now, if any. While the listener is full the
+    /// slot is taken over from a connection that hasn't been admitted,
+    /// which is returned for the caller to close. The slot is given back
+    /// when the returned [`Slot`] drops, however the connection ends.
+    fn take(
+        self: &Arc<Self>,
+        conn_id: u64,
+        addr: std::net::IpAddr,
+        close: Close,
+        admitted: Option<u64>,
+    ) -> Option<(Slot, Option<Held>)> {
+        let addr = crate::stream_gate::canonical_ip(addr);
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if held.iter().filter(|h| h.addr == addr).count() >= MAX_CONNECTIONS_PER_ADDRESS {
+            return None;
+        }
+        let replaced = if held.len() >= MAX_CONNECTIONS {
+            let i = make_way(&held, admitted)?;
+            Some(held.swap_remove(i))
+        } else {
+            None
+        };
+        held.push(Held { conn_id, addr, since: Instant::now(), close });
+        Some((Slot { slots: self.clone(), conn_id }, replaced))
+    }
+
+    /// Whether connection `conn_id` still holds its slot: false once a
+    /// newer connection has taken it over.
+    fn holds(&self, conn_id: u64) -> bool {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|h| h.conn_id == conn_id)
+    }
+}
+
+/// A slot for connection `conn_id` from `addr` (see
+/// [`ConnectionSlots::take`]), taken while admission can't change, so the
+/// connection admitted at that moment is never the one that makes way.
+/// [`admit`] admits only a connection that still holds its slot, so the
+/// one that made way isn't admitted afterwards either, even when its
+/// handshake ends before the caller has closed it.
+fn take_slot(sh: &Shared, conn_id: u64, addr: std::net::IpAddr, close: Close) -> Option<(Slot, Option<Held>)> {
+    let admitted = sh.admitted.lock().unwrap();
+    sh.slots.take(conn_id, addr, close, admitted.as_ref().map(|a| a.conn_id))
+}
+
+/// Which connection in `held` gives up its slot to a new one: among those
+/// not `admitted`, the oldest of the address holding the most of them.
+fn make_way(held: &[Held], admitted: Option<u64>) -> Option<usize> {
+    let open = |h: &Held| Some(h.conn_id) != admitted;
+    let share = |addr: std::net::IpAddr| held.iter().filter(|h| open(h) && h.addr == addr).count();
+    held.iter()
+        .enumerate()
+        .filter(|(_, h)| open(h))
+        .max_by_key(|(_, h)| (share(h.addr), std::cmp::Reverse((h.since, h.conn_id))))
+        .map(|(i, _)| i)
+}
+
+/// A connection slot held by one connection.
+struct Slot {
+    slots: Arc<ConnectionSlots>,
+    conn_id: u64,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut held = self.slots.held.lock().unwrap_or_else(|e| e.into_inner());
+        // Gone already if a newer connection took the slot over.
+        let gone = held.iter().position(|h| h.conn_id == self.conn_id).map(|i| held.swap_remove(i));
+        drop(held);
+        drop(gone);
+    }
+}
+
 fn accept_loop(sh: Arc<Shared>, listener: TcpListener) {
     while !sh.stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, peer)) => {
-                if sh.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                    sh.connections.fetch_sub(1, Ordering::SeqCst);
-                    debug!("Sendspin source: refusing {} (too many connections)", peer);
+                // Handed out in accept order, so they also order connections by age.
+                let conn_id = sh.next_conn.fetch_add(1, Ordering::SeqCst);
+                let Ok(handle) = stream.try_clone() else {
+                    debug!("Sendspin source: refusing {} (can't keep a handle on the connection)", peer);
+                    continue;
+                };
+                let close: Close = Box::new(move || {
+                    let _ = handle.shutdown(std::net::Shutdown::Both);
+                });
+                let Some((slot, replaced)) = take_slot(&sh, conn_id, peer.ip(), close) else {
+                    debug!("Sendspin source: refusing {} (too many connections from that address)", peer);
                     drop(stream);
                     continue;
+                };
+                if let Some(old) = replaced {
+                    debug!(
+                        "Sendspin source: all {} connections are taken; closing connection {} from {} \
+                         (open {:?}, not admitted) for one from {}",
+                        MAX_CONNECTIONS,
+                        old.conn_id,
+                        old.addr,
+                        old.since.elapsed(),
+                        peer
+                    );
+                    (old.close)();
                 }
                 let _ = stream.set_nonblocking(false);
                 let sh2 = sh.clone();
+                // The thread owns the slot. If the thread can't start, the
+                // closure is dropped and the slot with it.
                 let spawned = std::thread::Builder::new()
                     .name("sendspin-source-conn".into())
                     .spawn(move || {
-                        if let Err(e) = handle_socket(&sh2, stream, peer) {
+                        let _slot = slot;
+                        if let Err(e) = handle_socket(&sh2, conn_id, stream, peer) {
                             debug!("Sendspin source connection from {} ended: {:#}", peer, e);
                         }
-                        sh2.connections.fetch_sub(1, Ordering::SeqCst);
                     });
-                if spawned.is_err() {
-                    sh.connections.fetch_sub(1, Ordering::SeqCst);
+                if let Err(e) = spawned {
+                    warn!("Sendspin source: can't start a thread for {}: {}", peer, e);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -263,8 +400,7 @@ fn accept_loop(sh: Arc<Shared>, listener: TcpListener) {
     }
 }
 
-fn handle_socket(sh: &Arc<Shared>, stream: TcpStream, peer: SocketAddr) -> Result<()> {
-    let conn_id = sh.next_conn.fetch_add(1, Ordering::SeqCst);
+fn handle_socket(sh: &Arc<Shared>, conn_id: u64, stream: TcpStream, peer: SocketAddr) -> Result<()> {
     let ended = Arc::new(AtomicBool::new(false));
     if let Ok(s) = stream.try_clone() {
         spawn_admission_deadline(sh.clone(), conn_id, s, ended.clone());
@@ -784,6 +920,11 @@ fn may_displace(cur: &Contender<'_>, new: &Contender<'_>, last_playback: Option<
 #[allow(clippy::too_many_arguments)]
 fn admit(sh: &Shared, conn_id: u64, act: &Activation, category: PskCategory, server_id: &str, writer: &Arc<ChannelWriter>, peer: std::net::IpAddr) -> bool {
     let mut adm = sh.admitted.lock().unwrap();
+    // Its slot went to a newer connection, which is closing it (see
+    // `take_slot`): it takes admission from no one.
+    if !sh.slots.holds(conn_id) {
+        return false;
+    }
     let new_rank = rank(act);
     if let Some(cur) = adm.as_ref() {
         let current = Contender {
@@ -1173,6 +1314,232 @@ mod tests {
         assert!(!may_displace(&idle, &contender(2, 0, LongTerm, "b", false), Some("a")));
         assert!(may_displace(&idle, &contender(2, 0, LongTerm, "b", false), Some("b")));
         assert!(may_displace(&idle, &contender(2, 2, LongTerm, "b", false), None));
+    }
+
+    fn addr(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// The connections holding a slot.
+    fn holders(slots: &ConnectionSlots) -> Vec<u64> {
+        let mut ids: Vec<u64> = slots.held.lock().unwrap().iter().map(|h| h.conn_id).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Take a slot for connection `id` from `from` while connection
+    /// `admitted` is admitted: the slot, and the connection that had to
+    /// make way, if one did.
+    fn take(slots: &Arc<ConnectionSlots>, id: u64, from: &str, admitted: Option<u64>) -> Option<(Slot, Option<u64>)> {
+        slots
+            .take(id, addr(from), Box::new(|| {}), admitted)
+            .map(|(slot, replaced)| (slot, replaced.map(|h| h.conn_id)))
+    }
+
+    #[test]
+    fn one_address_cannot_take_every_connection_slot() {
+        let slots = Arc::new(ConnectionSlots::default());
+        let held: Vec<Slot> = (1..=MAX_CONNECTIONS_PER_ADDRESS as u64)
+            .map(|id| take(&slots, id, "192.168.1.66", None).expect("under the per-address limit").0)
+            .collect();
+        assert!(take(&slots, 10, "192.168.1.66", None).is_none());
+        // Its IPv4-mapped IPv6 form is the same address.
+        assert!(take(&slots, 11, "::ffff:192.168.1.66", None).is_none());
+        // Music Assistant, elsewhere, still gets in.
+        let ma = take(&slots, 12, "192.168.1.20", None).expect("another address").0;
+        assert_eq!(holders(&slots), [1, 2, 3, 4, 12]);
+        drop(ma);
+        drop(held);
+        assert!(holders(&slots).is_empty());
+    }
+
+    #[test]
+    fn a_full_listener_makes_room_by_closing_a_connection_not_yet_admitted() {
+        let slots = Arc::new(ConnectionSlots::default());
+        let (a, b) = ("192.168.1.66", "192.168.1.67");
+        // One host's two addresses hold 4 + 4 slots, and connection 1 is
+        // the admitted one.
+        let admitted = Some(1);
+        let mut held = Vec::new();
+        for id in 1..=8 {
+            let (slot, replaced) = take(&slots, id, if id <= 4 { a } else { b }, admitted).expect("a free slot");
+            assert_eq!(replaced, None);
+            held.push(slot);
+        }
+        // Music Assistant, from a third address, still gets in. The oldest
+        // connection of the address holding the most slots not admitted
+        // (b, connection 5) makes way, never the admitted one.
+        let (ma, replaced) = take(&slots, 9, "192.168.1.20", admitted).expect("a slot");
+        assert_eq!(replaced, Some(5));
+        assert_eq!(holders(&slots), [1, 2, 3, 4, 6, 7, 8, 9]);
+        // a holds its share, the admitted connection included.
+        assert!(take(&slots, 10, a, admitted).is_none());
+        // Every new connection from the host gets in by replacing one of
+        // its own, while the admitted connection and Music Assistant's
+        // stay.
+        let mut flood = Vec::new();
+        for id in 11..60 {
+            if let Some((slot, replaced)) = take(&slots, id, if id % 2 == 0 { a } else { b }, admitted) {
+                assert!(!matches!(replaced, Some(1) | Some(9)), "{replaced:?} closed for {id}");
+                flood.push(slot);
+            }
+            assert_eq!(holders(&slots).len(), MAX_CONNECTIONS);
+        }
+        assert!(holders(&slots).contains(&1) && holders(&slots).contains(&9));
+        // The closed connections give their slots back a second time when
+        // they end: that frees nothing of anyone else's.
+        let still_holding: Vec<u64> = holders(&slots).into_iter().filter(|id| *id > 8).collect();
+        drop(held);
+        assert_eq!(holders(&slots), still_holding);
+        drop(flood);
+        drop(ma);
+        assert!(holders(&slots).is_empty());
+    }
+
+    #[test]
+    fn a_flood_does_not_push_out_a_handshake_that_is_still_running() {
+        let slots = Arc::new(ConnectionSlots::default());
+        // Music Assistant connected first; it isn't admitted yet. Being the
+        // oldest, it would be the first to go if age alone decided.
+        let ma = take(&slots, 1, "192.168.1.20", None).unwrap().0;
+        let mut flood = Vec::new();
+        for id in 2..200 {
+            if let Some((slot, replaced)) = take(&slots, id, if id % 2 == 0 { "192.168.1.66" } else { "192.168.1.67" }, None) {
+                assert_ne!(replaced, Some(1), "Music Assistant's connection was closed for {id}");
+                flood.push(slot);
+            }
+        }
+        assert!(holders(&slots).contains(&1));
+        drop(flood);
+        drop(ma);
+        assert!(holders(&slots).is_empty());
+    }
+
+    #[test]
+    fn the_listener_never_holds_more_than_its_limit() {
+        let slots = Arc::new(ConnectionSlots::default());
+        let mut held = Vec::new();
+        for id in 1..=MAX_CONNECTIONS as u64 {
+            let (slot, replaced) = take(&slots, id, &format!("192.168.1.{id}"), None).expect("a free slot");
+            assert_eq!(replaced, None);
+            held.push(slot);
+        }
+        // Each address holds one, so the oldest makes way.
+        let (late, replaced) = take(&slots, 100, "192.168.1.200", None).unwrap();
+        assert_eq!(replaced, Some(1));
+        assert_eq!(holders(&slots).len(), MAX_CONNECTIONS);
+        // A slot given back frees exactly one: the next connection closes
+        // nothing.
+        held.pop();
+        assert_eq!(holders(&slots).len(), MAX_CONNECTIONS - 1);
+        let (again, replaced) = take(&slots, 101, "192.168.1.201", None).unwrap();
+        assert_eq!(replaced, None);
+        drop(again);
+        drop(late);
+        drop(held);
+        assert!(holders(&slots).is_empty());
+    }
+
+    #[test]
+    fn a_slot_is_given_back_however_its_holder_ends() {
+        let slots = Arc::new(ConnectionSlots::default());
+        let a = "10.0.0.7";
+        // A connection thread that ends with an error…
+        let s = take(&slots, 1, a, None).unwrap().0;
+        std::thread::spawn(move || -> Result<()> {
+            let _slot = s;
+            bail!("not a Sendspin request")
+        })
+        .join()
+        .unwrap()
+        .unwrap_err();
+        // …and one that never runs (its closure dropped, as when a thread
+        // can't be started).
+        let s = take(&slots, 2, a, None).unwrap().0;
+        let never_run = move || drop(s);
+        drop(never_run);
+        assert!(holders(&slots).is_empty());
+        let all: Vec<Slot> = (3..3 + MAX_CONNECTIONS_PER_ADDRESS as u64)
+            .map(|id| take(&slots, id, a, None).expect("all of the address's slots are free again").0)
+            .collect();
+        drop(all);
+        assert!(holders(&slots).is_empty());
+    }
+
+    #[test]
+    fn a_replaced_connection_is_handed_back_to_be_closed() {
+        let slots = Arc::new(ConnectionSlots::default());
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        let mut held = Vec::new();
+        for id in 1..=MAX_CONNECTIONS as u64 {
+            let closed = closed.clone();
+            let close: Close = Box::new(move || closed.lock().unwrap().push(id));
+            held.push(slots.take(id, addr(&format!("10.0.0.{id}")), close, None).unwrap().0);
+        }
+        let (_late, replaced) = slots.take(9, addr("10.0.0.9"), Box::new(|| {}), None).unwrap();
+        let replaced = replaced.expect("a connection made way");
+        assert!(closed.lock().unwrap().is_empty(), "closed before the caller asked");
+        (replaced.close)();
+        assert_eq!(*closed.lock().unwrap(), [replaced.conn_id]);
+    }
+
+    /// The source's shared state, with nothing listening or advertised.
+    fn idle_source() -> Shared {
+        Shared {
+            opts: SourceOptions {
+                name: "Test PC".into(),
+                port: 0,
+                software_version: "test".into(),
+                advertise: false,
+                output_selected: Arc::new(AtomicUsize::new(0)),
+            },
+            hub: StreamHub::new(),
+            store: Arc::new(super::super::MemoryStore::default()),
+            stop: AtomicBool::new(false),
+            next_conn: AtomicU64::new(1),
+            slots: Arc::new(ConnectionSlots::default()),
+            state: Mutex::new(SourceState::Waiting),
+            code: Mutex::new(None),
+            admitted: Mutex::new(None),
+            last_event: Mutex::new(None),
+        }
+    }
+
+    /// A channel writer on a loopback connection, and that connection's
+    /// other end.
+    fn loopback_writer() -> (Arc<ChannelWriter>, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (theirs, _) = listener.accept().unwrap();
+        let (reader, writer) = super::super::ws::test_pair_from_stream(ours);
+        (super::super::channel::channel(reader, writer, None).1, theirs)
+    }
+
+    #[test]
+    fn a_connection_that_made_way_is_never_admitted() {
+        let sh = idle_source();
+        let (writer, _other_end) = loopback_writer();
+        let playback = act(true, false, Some(vec!["source@v1"]));
+        let admit_conn = |id: u64| admit(&sh, id, &playback, PskCategory::LongTerm, "ma", &writer, addr("192.168.1.20"));
+        let connect = |id: u64| take_slot(&sh, id, addr(&format!("192.168.1.{id}")), Box::new(|| {})).expect("a slot");
+        // Eight connections from eight addresses fill the listener; none
+        // is admitted yet.
+        let held: Vec<Slot> = (1..=MAX_CONNECTIONS as u64).map(|id| connect(id).0).collect();
+        // A ninth takes over the slot of the oldest, connection 1, whose
+        // handshake ends before the accept loop has closed it: it is not
+        // admitted.
+        let (ninth, replaced) = connect(9);
+        assert_eq!(replaced.map(|h| h.conn_id), Some(1));
+        assert!(!admit_conn(1), "admitted after its slot was taken over");
+        assert!(sh.admitted.lock().unwrap().is_none());
+        // A connection that holds its slot is admitted, and from then on
+        // it never makes way.
+        assert!(admit_conn(2));
+        let (tenth, replaced) = connect(10);
+        assert_eq!(replaced.map(|h| h.conn_id), Some(3));
+        assert!(sh.slots.holds(2));
+        drop((held, ninth, tenth));
+        assert!(holders(&sh.slots).is_empty());
     }
 
     #[test]

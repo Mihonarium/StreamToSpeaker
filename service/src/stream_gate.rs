@@ -1,12 +1,23 @@
-//! Privacy-mode gate for `/stream.raw`: who may pull the audio stream.
+//! The gate for `/stream.raw`: who may pull the audio stream.
 //!
-//! With privacy mode off everyone is admitted. With it on, a peer is
-//! admitted if it is loopback, one of this machine's own addresses, or
-//! covered by a live **grant**. A grant is a set of addresses handed to
-//! a speaker for as long as its session lasts: [`StreamGate::grant`]
-//! returns a [`Grant`] that the session owns, and dropping the session
-//! drops the grant, which revokes the addresses. That gives three
-//! properties the earlier single "pending IP" slot did not:
+//! One rule, applied per request and when pruning open streams:
+//!
+//! - **This PC** (loopback, or one of this machine's own addresses) is
+//!   always admitted.
+//! - **Every other device** is admitted only while streaming is enabled —
+//!   the same flag as `App::streaming_enabled`, shared, not copied — so
+//!   Disable streaming and Forget speaker close the stream to the network
+//!   whatever the privacy setting. Nothing that plays to a speaker needs
+//!   it then: UPnP sessions are stopped, and AirPlay, Sendspin and the
+//!   Music Assistant input take their audio in-process.
+//! - With **privacy mode** on, that other device must also be covered by
+//!   a live **grant**; with it off, any device on the network may listen
+//!   while streaming is enabled.
+//!
+//! A grant is a set of addresses handed to a speaker for as long as its
+//! session lasts: [`StreamGate::grant`] returns a [`Grant`] that the
+//! session owns, and dropping the session drops the grant, which revokes
+//! the addresses. That gives three properties:
 //!
 //! - **No race between overlapping bring-ups.** Two speakers being
 //!   selected at once (GUI click racing a tray Enable, a remote
@@ -39,6 +50,10 @@ pub struct StreamGate {
     /// Mirrors `user_config.privacy_mode`, so the HTTP threads never
     /// touch the config lock.
     privacy: AtomicBool,
+    /// `App::streaming_enabled` itself (the same `Arc`): a copy could
+    /// drift from it and refuse the speaker being played on, or admit
+    /// devices after the user stopped streaming.
+    streaming: Arc<AtomicBool>,
     /// This machine's own address(es) besides loopback — the advertised
     /// IP, admitted only after proving the host actually owns it.
     local: Vec<IpAddr>,
@@ -75,10 +90,57 @@ impl std::fmt::Debug for Grant {
     }
 }
 
+/// Why a device may not pull the stream right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Streaming is disabled: only this PC may listen.
+    StreamingOff,
+    /// Privacy mode, and the device isn't one the speaker being played on
+    /// (or its group) was granted.
+    NotGranted,
+}
+
+impl Refusal {
+    /// The reason in a few words, for the refused device's 403 and the
+    /// log: the two rules are told apart, so a device cut off by Disable
+    /// isn't taken for one privacy mode refused.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Refusal::StreamingOff => "streaming is disabled on this PC",
+            Refusal::NotGranted => {
+                "privacy mode is on: only the speaker being played on (and its group) may listen"
+            }
+        }
+    }
+}
+
+/// The gate's rule (see the module docs), over its inputs at one moment.
+/// `granted` is asked only when privacy mode decides.
+fn decide(
+    peer: IpAddr,
+    privacy: bool,
+    streaming: bool,
+    local: &[IpAddr],
+    granted: impl FnOnce(IpAddr) -> bool,
+) -> Result<(), Refusal> {
+    let peer = canonical_ip(peer);
+    if peer.is_loopback() || local.contains(&peer) {
+        return Ok(());
+    }
+    if !streaming {
+        return Err(Refusal::StreamingOff);
+    }
+    if !privacy || granted(peer) {
+        return Ok(());
+    }
+    Err(Refusal::NotGranted)
+}
+
 /// A point-in-time copy of the allow-set: a pure predicate for pruning.
 #[derive(Clone, Debug)]
 pub struct AllowSnapshot {
     privacy: bool,
+    streaming: bool,
     local: Vec<IpAddr>,
     granted: Vec<IpAddr>,
 }
@@ -88,26 +150,36 @@ impl AllowSnapshot {
         self.privacy
     }
 
+    pub fn streaming(&self) -> bool {
+        self.streaming
+    }
+
     pub fn allows(&self, peer: IpAddr) -> bool {
-        if !self.privacy {
-            return true;
-        }
-        let peer = canonical_ip(peer);
-        peer.is_loopback() || self.local.contains(&peer) || self.granted.contains(&peer)
+        decide(peer, self.privacy, self.streaming, &self.local, |p| self.granted.contains(&p)).is_ok()
     }
 }
 
 impl StreamGate {
+    /// `streaming`: the app's streaming-enabled flag itself.
     /// `local`: this host's own advertised address, if it really is
     /// local (see [`is_local_address`]).
-    pub fn new(privacy: bool, local: impl IntoIterator<Item = IpAddr>) -> Arc<Self> {
+    pub fn new(
+        privacy: bool,
+        streaming: Arc<AtomicBool>,
+        local: impl IntoIterator<Item = IpAddr>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             privacy: AtomicBool::new(privacy),
+            streaming,
             local: local.into_iter().map(canonical_ip).collect(),
             grants: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             refusals: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn streaming(&self) -> bool {
+        self.streaming.load(Ordering::Acquire)
     }
 
     pub fn privacy(&self) -> bool {
@@ -132,18 +204,12 @@ impl StreamGate {
 
     /// May `peer` pull the stream right now? Brief lock only.
     pub fn allows(&self, peer: IpAddr) -> bool {
-        if !self.privacy() {
-            return true;
-        }
-        let peer = canonical_ip(peer);
-        if peer.is_loopback() || self.local.contains(&peer) {
-            return true;
-        }
-        self.grants
-            .lock()
-            .unwrap()
-            .values()
-            .any(|ips| ips.contains(&peer))
+        self.check(peer).is_ok()
+    }
+
+    /// [`allows`](Self::allows), saying why not.
+    pub fn check(&self, peer: IpAddr) -> Result<(), Refusal> {
+        decide(peer, self.privacy(), self.streaming(), &self.local, |p| self.is_granted(p))
     }
 
     /// Is `peer` one of the addresses a live session granted, whatever
@@ -163,6 +229,7 @@ impl StreamGate {
             .collect();
         AllowSnapshot {
             privacy: self.privacy(),
+            streaming: self.streaming(),
             local: self.local.clone(),
             granted,
         }
@@ -219,9 +286,15 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// A gate with streaming enabled; the tests that need the flag keep
+    /// their own handle on it.
+    fn gate(privacy: bool, local: Option<IpAddr>) -> Arc<StreamGate> {
+        StreamGate::new(privacy, Arc::new(AtomicBool::new(true)), local)
+    }
+
     #[test]
     fn is_granted_ignores_privacy_setting() {
-        let g = StreamGate::new(false, None);
+        let g = gate(false, None);
         assert!(!g.is_granted(ip("192.168.1.50")));
         let grant = g.grant([ip("192.168.1.50")]);
         assert!(g.is_granted(ip("::ffff:192.168.1.50")));
@@ -231,14 +304,14 @@ mod tests {
 
     #[test]
     fn privacy_off_allows_everyone() {
-        let g = StreamGate::new(false, None);
+        let g = gate(false, None);
         assert!(g.allows(ip("10.0.0.9")));
         assert!(g.snapshot().allows(ip("10.0.0.9")));
     }
 
     #[test]
     fn privacy_on_admits_loopback_and_local_only() {
-        let g = StreamGate::new(true, Some(ip("192.168.1.10")));
+        let g = gate(true, Some(ip("192.168.1.10")));
         assert!(g.allows(ip("127.0.0.1")));
         assert!(g.allows(ip("::1")));
         assert!(g.allows(ip("192.168.1.10")));
@@ -249,7 +322,7 @@ mod tests {
 
     #[test]
     fn grant_admits_until_dropped() {
-        let g = StreamGate::new(true, None);
+        let g = gate(true, None);
         let grant = g.grant([ip("192.168.1.50"), ip("192.168.1.51"), ip("192.168.1.50")]);
         assert_eq!(grant.ips(), &[ip("192.168.1.50"), ip("192.168.1.51")]);
         assert!(g.allows(ip("192.168.1.50")));
@@ -263,7 +336,7 @@ mod tests {
     #[test]
     fn overlapping_grants_are_independent() {
         // The race the old single slot had: two bring-ups at once.
-        let g = StreamGate::new(true, None);
+        let g = gate(true, None);
         let a = g.grant([ip("192.168.1.50")]);
         let b = g.grant([ip("192.168.1.60"), ip("192.168.1.50")]);
         drop(a);
@@ -277,7 +350,7 @@ mod tests {
 
     #[test]
     fn snapshot_is_a_point_in_time_predicate() {
-        let g = StreamGate::new(true, None);
+        let g = gate(true, None);
         let before = g.snapshot();
         let _grant = g.grant([ip("192.168.1.50")]);
         let after = g.snapshot();
@@ -289,8 +362,52 @@ mod tests {
     }
 
     #[test]
+    fn with_streaming_off_only_this_pc_may_listen_in_both_modes() {
+        for privacy in [false, true] {
+            let streaming = Arc::new(AtomicBool::new(false));
+            let g = StreamGate::new(privacy, streaming.clone(), Some(ip("192.168.1.10")));
+            let _grant = g.grant([ip("192.168.1.50")]);
+            let snap = g.snapshot();
+            assert!(!snap.streaming());
+            for this_pc in ["127.0.0.1", "::1", "192.168.1.10", "::ffff:192.168.1.10"] {
+                assert_eq!(g.check(ip(this_pc)), Ok(()), "{this_pc}, privacy {privacy}");
+                assert!(snap.allows(ip(this_pc)), "{this_pc}, privacy {privacy}");
+            }
+            // Strangers, and the speaker the session was granted for.
+            for other in ["192.168.1.99", "192.168.1.50", "::ffff:192.168.1.50"] {
+                assert_eq!(g.check(ip(other)), Err(Refusal::StreamingOff), "{other}, privacy {privacy}");
+                assert!(!snap.allows(ip(other)), "{other}, privacy {privacy}");
+            }
+        }
+    }
+
+    #[test]
+    fn with_streaming_on_privacy_decides() {
+        let off = gate(false, None);
+        assert_eq!(off.check(ip("192.168.1.99")), Ok(()));
+        let on = gate(true, None);
+        let _grant = on.grant([ip("192.168.1.50")]);
+        assert_eq!(on.check(ip("192.168.1.50")), Ok(()));
+        assert_eq!(on.check(ip("192.168.1.99")), Err(Refusal::NotGranted));
+        assert!(on.snapshot().streaming());
+    }
+
+    #[test]
+    fn the_gate_follows_the_apps_streaming_flag_itself() {
+        // The flag the app flips, not a copy taken at construction.
+        let streaming = Arc::new(AtomicBool::new(true));
+        let g = StreamGate::new(false, streaming.clone(), None);
+        assert!(g.allows(ip("192.168.1.99")));
+        streaming.store(false, Ordering::Release);
+        assert!(!g.allows(ip("192.168.1.99")));
+        assert!(!g.snapshot().allows(ip("192.168.1.99")));
+        streaming.store(true, Ordering::Release);
+        assert!(g.allows(ip("192.168.1.99")));
+    }
+
+    #[test]
     fn refusals_are_rate_limited_per_peer() {
-        let g = StreamGate::new(true, None);
+        let g = gate(true, None);
         assert!(g.note_refusal(ip("192.168.1.99")));
         assert!(!g.note_refusal(ip("192.168.1.99")));
         assert!(!g.note_refusal(ip("::ffff:192.168.1.99")));

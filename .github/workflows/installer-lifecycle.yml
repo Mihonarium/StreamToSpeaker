@@ -9,7 +9,9 @@ name: Installer lifecycle
 #   (→ also over the Microsoft-signed-driver variant, when built)
 #
 # A user-data sentinel in %APPDATA%\StreamToSpeaker must survive all of it:
-# uninstall deliberately leaves user data in place.
+# uninstall deliberately leaves user data in place. This build's
+# Pre-Install.ps1 and Rename-Endpoint.ps1 must log into the install
+# directory, never into the user's profile.
 #
 # Hosted runners run Windows Server without test-signing, so the driver is
 # never expected to load here: the checks cover what the installer itself
@@ -53,7 +55,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Locate the build to test
         id: src
@@ -81,7 +83,7 @@ jobs:
 
       - name: Download installers (this run)
         if: steps.src.outputs.run_id == ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: StreamToSpeakerSetup-*
           path: dist/installer
@@ -89,7 +91,7 @@ jobs:
 
       - name: Download binaries (this run)
         if: steps.src.outputs.run_id == ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: binaries-*
           path: dist/binaries
@@ -97,7 +99,7 @@ jobs:
 
       - name: Download installers (build run ${{ steps.src.outputs.run_id }})
         if: steps.src.outputs.run_id != ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: StreamToSpeakerSetup-*
           path: dist/installer
@@ -107,7 +109,7 @@ jobs:
 
       - name: Download binaries (build run ${{ steps.src.outputs.run_id }})
         if: steps.src.outputs.run_id != ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: binaries-*
           path: dist/binaries
@@ -264,8 +266,18 @@ jobs:
         run: |
           $out = Join-Path $env:RUNNER_TEMP "lifecycle\logs"
           New-Item -ItemType Directory -Force $out | Out-Null
-          $install = Join-Path $env:LOCALAPPDATA "StreamToSpeaker\install.log"
-          if (Test-Path $install) { Copy-Item $install $out }
+          # The test copies the install-time transcript after each setup run,
+          # since uninstall deletes it; these are whatever is still in place
+          # (after a phase that stopped early).
+          $transcripts = [ordered]@{
+              "final-install.log"         = Join-Path $env:ProgramFiles "Stream To Speaker\logs\install.log"
+              "final-install-profile.log" = Join-Path $env:LOCALAPPDATA "StreamToSpeaker\install.log"
+          }
+          foreach ($name in $transcripts.Keys) {
+              if (Test-Path -LiteralPath $transcripts[$name]) {
+                  Copy-Item -LiteralPath $transcripts[$name] (Join-Path $out $name)
+              }
+          }
           $setupapi = Join-Path $env:windir "INF\setupapi.dev.log"
           if (Test-Path $setupapi) {
               Get-Content $setupapi -Tail 3000 | Set-Content (Join-Path $out "setupapi.dev.tail.log")
@@ -273,7 +285,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: installer-lifecycle-logs
           path: ${{ runner.temp }}/lifecycle
