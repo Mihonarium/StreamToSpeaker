@@ -79,7 +79,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Look for a certified driver matching this driver source
         id: check
@@ -124,11 +124,15 @@ jobs:
       cab_name: ${{ steps.cab.outputs.name }}
       cab_sha256: ${{ steps.cab.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Full history — the driver build number is `git rev-list --count
           # HEAD`, which evaluates to 1 on a depth-1 shallow clone.
           fetch-depth: 0
+          # No git command here needs the token (the release steps use gh
+          # with GH_TOKEN), so none is left in .git/config for setup-msbuild
+          # and the build tools to read.
+          persist-credentials: false
 
       # Identity of the driver source going into this submission. Computed
       # BEFORE driver.h is stamped with the build number, so it matches what
@@ -164,7 +168,7 @@ jobs:
 
       - name: Restore WDK cache
         id: cache-wdk
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             C:\Program Files (x86)\Windows Kits\10
@@ -208,7 +212,7 @@ jobs:
           Write-Host "KitsRoot10 = $kitsRoot"
 
       - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2.0.0
         with:
           msbuild-architecture: x64
 
@@ -342,7 +346,7 @@ jobs:
       # auth); the release asset below is the durable record + what
       # driver-attest.yml submits after it's EV-signed.
       - name: Upload submission CAB as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: submission-cab
           path: ${{ steps.cab.outputs.path }}
@@ -466,7 +470,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Sign submission CAB via central signing workflow
         id: sign

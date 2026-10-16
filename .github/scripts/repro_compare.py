@@ -8,6 +8,7 @@ Used by driver-reproducibility.yml. Pure Python, no third-party modules.
   repro_compare.py tree <checkout>     <build_root>  [--stamped-build N] [--json out.json]
   repro_compare.py plan <manifest.json> <tag>        [--build-number N] [--json out.json]
   repro_compare.py buildroot <plan.json> <reference.sys> [--build-root DIR]
+  repro_compare.py builddir <build_root> <workspace>  [--json out.json]
   repro_compare.py package <package.zip> <out_dir> --sha256 <expected> [--json out.json]
   repro_compare.py reference <archive> <out_dir> --type lab_zip|submission_cab [--sha256 <expected>]
   repro_compare.py files <dir_a> <dir_b>              [--json out.json]
@@ -86,6 +87,16 @@ binary decides). A certified release is built at C:\\build\\src.
 `--build-root` overrides either. The result has to be a plain directory
 path at least two levels below a drive root (see valid_build_root), or it
 is an error.
+
+`builddir` gets that directory ready as the build step starts: the job's
+own checkout is built in place, and any other directory must not exist
+yet and is created (`in_place` / `created` in the report). The path comes
+from the release (the submitted .sys's PDB path, the manifest) or from an
+input, so nothing there is ever deleted or emptied: a path that already
+exists, contains the checkout or lies inside it is refused. The
+directories releases were built in are this checkout (an attested build
+made in driver-submission.yml's runner checkout) or C:\\build\\src (a
+certified lab build), which a fresh hosted runner does not have.
 
 `tree --stamped-build N` allows exactly one difference between the two
 trees: driver/driver.h, which must be the checkout's file with
@@ -650,10 +661,14 @@ def valid_build_root(path):
     """Is `path` a plain absolute Windows directory at least two levels
     below a drive root (<drive>:\\a\\b, one trailing backslash tolerated)?
 
-    The build step empties this directory before it copies the source in,
-    so nothing shallower is accepted, and no component that Windows or
-    PowerShell would read as something else: `.` / `..`, a leading space,
-    a trailing dot or space, wildcard brackets, control characters."""
+    A syntax check: Windows, PowerShell and the step-output file must read
+    the path as written, so no component they would read as something else
+    (`.` / `..`, a leading space, a trailing dot or space, wildcard
+    brackets, control characters), and a drive root or a top-level
+    directory is never a build directory. It is not what keeps the runner
+    safe (C:\\Windows\\System32 passes): the build step never deletes or
+    empties anything at the build root, it builds in its own checkout or
+    in a directory it creates (build_dir_action)."""
     if not isinstance(path, str):
         return False
     parts = (path[:-1] if path.endswith("\\") else path).split("\\")
@@ -811,6 +826,63 @@ def resolve_build_root(plan, pdb_path, override=None):
     elif res["root"] is not None and res["root"].endswith("\\"):
         res["root"] = res["root"][:-1]
     return res
+
+
+def build_dir_action(root, workspace, exists):
+    """How the build step gets its build directory: ("in_place", None) when
+    `root` is the job's checkout `workspace`, ("create", None) when nothing
+    is at `root` yet, (None, error) otherwise. `exists(path)` says whether
+    anything (a directory, a file, a dangling link) is at `path`.
+
+    `root` comes from the release (the submitted .sys's PDB path, the
+    manifest) or from a dispatch input, so nothing there is deleted or
+    emptied: a path that exists is refused, whatever it is, and so is one
+    that contains the checkout or lies inside it."""
+    if not valid_build_root(root):
+        return None, (f"build root {root!r} is not a plain directory path at least two levels below a "
+                      "drive root; refusing to build there")
+    if not isinstance(workspace, str) or not workspace.strip("\\/"):
+        return None, "no workspace to compare the build root with; refusing to build"
+
+    def norm(p):
+        return p.rstrip("\\/").replace("/", "\\").lower()
+
+    r, w = norm(root), norm(workspace)
+    if r == w:
+        return "in_place", None
+    if (w + "\\").startswith(r + "\\"):
+        return None, f"build root {root} contains the job's workspace {workspace}; refusing to build there"
+    if (r + "\\").startswith(w + "\\"):
+        return None, f"build root {root} is inside the job's workspace {workspace}; refusing to build there"
+    if exists(root):
+        return None, (f"build root {root} already exists on this runner; the rebuild uses only its own "
+                      "checkout or a directory it creates, and nothing was deleted")
+    return "create", None
+
+
+def prepare_build_dir(root, workspace, exists=None, makedirs=None):
+    """build_dir_action, then create the directory when that is the action.
+    `exists` / `makedirs` default to os.path.lexists / os.makedirs, looked
+    up when called. makedirs fails on a directory that appeared since the
+    check, so the build never runs in one this job did not create.
+    Returns {"root", "workspace", "in_place", "created", "error"}."""
+    exists = exists or os.path.lexists
+    makedirs = makedirs or os.makedirs
+    rep = {"root": root, "workspace": workspace, "in_place": False, "created": False, "error": None}
+    action, error = build_dir_action(root, workspace, exists)
+    if error:
+        rep["error"] = error
+    elif action == "in_place":
+        rep["in_place"] = True
+    else:
+        try:
+            makedirs(root)
+        except OSError as e:
+            rep["error"] = (f"cannot create the build directory {root} on this runner ({e}); the release was "
+                            "linked at that path and the PDB path is part of the image layout")
+        else:
+            rep["created"] = True
+    return rep
 
 
 def reference_pdb_path(sys_path):
@@ -1115,7 +1187,8 @@ def print_files_report(rep):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("kind", choices=("sys", "inf", "tree", "package", "reference", "files", "plan", "buildroot"))
+    ap.add_argument("kind", choices=("sys", "inf", "tree", "package", "reference", "files", "plan", "buildroot",
+                                     "builddir"))
     ap.add_argument("released")
     ap.add_argument("fresh")
     ap.add_argument("--json", help="also write the full report here")
@@ -1136,8 +1209,18 @@ def main(argv=None):
             with open(a.json, "w", encoding="utf-8") as fh:
                 json.dump(rep, fh, indent=2)
 
-    # plan / buildroot print workflow commands of their own (::error::,
-    # ::warning::); what they show of the release goes through clean_text.
+    # plan / buildroot / builddir print workflow commands of their own
+    # (::error::, ::warning::); what they show of the release goes through
+    # clean_text.
+    if a.kind == "builddir":
+        rep = prepare_build_dir(a.released, a.fresh)
+        dump(rep)
+        if rep["error"]:
+            print(f"::error::{command_text(rep['error'])}")
+            return 1
+        print(f"build directory: {clean_text(rep['root'])} "
+              f"({'this checkout, built in place' if rep['in_place'] else 'created by this job'})")
+        return 0
     if a.kind == "plan":
         try:
             with open(a.released, "r", encoding="utf-8-sig") as fh:

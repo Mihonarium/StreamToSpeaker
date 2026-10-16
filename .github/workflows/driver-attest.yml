@@ -70,7 +70,7 @@ jobs:
       verify_tag: ${{ steps.attest.outputs.verify_tag || steps.dry.outputs.verify_tag }}
       dry_run: ${{ steps.dry.outputs.dry_run || 'false' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Unit tests (guard)
         run: python3 -m unittest discover -s .github/scripts

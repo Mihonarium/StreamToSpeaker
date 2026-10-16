@@ -86,8 +86,10 @@ live — `N` bumps on every shipped binary.
 Output: `installer\out\StreamToSpeakerSetup-<version>.exe`. It installs the
 service to `Program Files`, stages the driver with `pnputil /add-driver
 /install`, runs `scripts\Rename-Endpoint.ps1`, and optionally adds Start Menu,
-desktop and autostart entries. Uninstall removes the driver via
-`Uninstall-Driver.ps1`, removes the test-signing certificate a test-signed
+desktop and autostart entries. `Pre-Install.ps1` and `Rename-Endpoint.ps1`
+log to `logs\install.log` in the install directory, not to
+`%LOCALAPPDATA%`; `scripts\Diagnose.ps1` prints its tail. Uninstall removes the driver
+via `Uninstall-Driver.ps1`, removes the test-signing certificate a test-signed
 build imported into `LocalMachine\Root` and `TrustedPublisher`
 (`Remove-TestCertificate.ps1`; an upgrade removes the replaced build's
 certificate when it differs), and deletes the install directory.
@@ -130,14 +132,22 @@ answered by any player) and folds the zone-group state into the list
 `Invisible="1"` members and `Satellite` children), BRIDGE/BOOST units
 (`IsZoneBridge="1"`), and grouped non-coordinator members are hidden, and
 each group appears as its coordinator, named "Living Room + Kitchen" (or
-"+ N" beyond two). Members are hidden because `SetAVTransportURI` *is*
-Sonos's group-membership mechanism — `x-rincon:<coordinator-UUID>` joins a
-zone to a group, so pointing a member at a normal stream URI changes its
-membership instead of coexisting with it (SoCo hard-errors client-side on
-any transport call to a non-coordinator for the same reason). `--player`
+"+ N" beyond two). One topology, from the first of up to three players on
+this PC's networks that answers, says which units might be hidden, but a unit is hidden only on its own word:
+each unit it would hide is first asked for its own topology, at its own
+address, so a device answering discovery can't make other speakers
+disappear. A unit that answers when asked is named from its own answer;
+the other rows keep the first topology's labels. A unit that can't be
+asked keeps its answer from an earlier scan, or stays listed. Members are
+hidden because `SetAVTransportURI` *is* Sonos's group-membership mechanism —
+`x-rincon:<coordinator-UUID>` joins a zone to a group, so pointing a
+member at a normal stream URI changes its membership instead of coexisting
+with it (SoCo hard-errors client-side on any transport call to a
+non-coordinator for the same reason). `--player`
 also matches group member names. Selecting a speaker re-checks topology from
-the device itself and redirects to its current coordinator, so a list stale
-by up to one discovery interval can't break a group. Group sessions route
+the device itself and redirects to its current coordinator (for a speaker
+discovery found, only one on this PC's networks), so a list stale by up to
+one discovery interval can't break a group. Group sessions route
 volume through `GroupRenderingControl` on the coordinator —
 `SetGroupVolume`/`SetGroupMute` scale every member proportionally like the
 Sonos app's group slider, and error 701 anywhere else — and subscribe GENA
