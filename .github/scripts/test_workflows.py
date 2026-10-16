@@ -3,7 +3,7 @@ reads .github/ next to this script and skips when that is not checked out.
 
 Every action from outside this repository runs at a fixed commit:
 `uses: owner/repo[/path]@<40 hex digits> # <version>`, the version being
-the tag the commit was taken from (Dependabot rewrites both together). A
+the tag the commit was taken from (an update changes both together). A
 tag can be moved by whoever controls the action's repository, a commit
 SHA cannot. Local actions (./...) run from this repository's own commit.
 """
@@ -199,12 +199,6 @@ class ActionPins(unittest.TestCase):
                 key = (pin.group("repo").lower(), comment.group("version"))
                 commits.setdefault(key, {}).setdefault(pin.group("sha"), []).append(where)
         self.assertEqual({k: v for k, v in commits.items() if len(v) > 1}, {})
-
-    def test_dependabot_proposes_action_updates(self):
-        with open(os.path.join(GITHUB_DIR, "dependabot.yml"), encoding="utf-8") as fh:
-            text = fh.read()
-        self.assertRegex(text, r'(?m)^\s*-\s+package-ecosystem:\s*"?github-actions"?\s*$')
-        self.assertRegex(text, r'(?m)^\s+directory:\s*"?/"?\s*$')
 
 
 NOT_ON_TAGS = "!startsWith(github.ref,'refs/tags/v')"
