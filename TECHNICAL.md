@@ -100,6 +100,11 @@ a second copy the app reads if the first is damaged) and
 `window-state.ron`, which keeps the window's open sections and zoom). Earlier
 versions kept the window's state in `%APPDATA%\Stream To Speaker\data`; the
 window moves it on its first start and removes that folder once it is empty.
+Files the app sets aside in the settings folder, `config.json.corrupt-<time>` (a
+file it couldn't use, kept as it was) and `config.json.before-reset-<time>` (the
+file as it was before settings it couldn't read were reset; at most three), hold
+whatever settings, pairings and passwords that file held, and can be deleted once
+they aren't needed.
 
 ### Endpoint named "Internal AUX Jack — Stream To Speaker"
 
