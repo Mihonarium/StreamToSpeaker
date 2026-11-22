@@ -7,10 +7,11 @@
 //! metadata. So HEAD, GET and the metadata agree by construction, and the
 //! server needs nothing but the path to know what to send.
 //!
-//! Which profile a renderer gets is decided from what it says it accepts
-//! (the `Sink` list of its ConnectionManager), but that list only selects
-//! among these built-in profiles: nothing a device says ends up in a
-//! header, a URL or the metadata.
+//! A renderer is offered the original stream first (or the profile it
+//! played last time); only when it refuses is it asked which types it
+//! plays (the `Sink` list of its ConnectionManager). That list only
+//! selects among these built-in profiles: nothing a device says ends up
+//! in a header, a URL or the metadata.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -39,8 +40,8 @@ pub enum StreamProfile {
 pub const ALL: [StreamProfile; 5] =
     [StreamProfile::Legacy, StreamProfile::Wav, StreamProfile::XWav, StreamProfile::Wave, StreamProfile::L16];
 
-/// After the first choice and legacy, the order profiles a renderer
-/// doesn't list are tried in: one of each body first.
+/// After the opening offers and those a renderer lists, the order the
+/// profiles it doesn't list are offered in: one of each body first.
 const UNLISTED_ORDER: [StreamProfile; 4] =
     [StreamProfile::Wav, StreamProfile::L16, StreamProfile::XWav, StreamProfile::Wave];
 
@@ -188,23 +189,28 @@ pub fn parse_protocol_list(csv: &str) -> Vec<ProtocolInfo> {
 /// What the renderer said it accepts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Sinks {
-    /// Not asked (a Sonos), or no answer: no ConnectionManager, the call
-    /// failed or took too long.
+    /// No answer: no ConnectionManager, or the call failed or took too
+    /// long.
     Unknown,
     /// Its `Sink` list.
     Listed(Vec<ProtocolInfo>),
 }
 
-/// Why the first profile of a [`Plan`] was chosen.
+/// Why a profile is offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Why {
-    /// A Sonos (or IKEA SYMFONISK): always legacy.
+    /// A Sonos (or IKEA SYMFONISK): the original stream, and only that.
     Sonos,
     /// It played this profile last time.
     Remembered,
+    /// The original stream, what every renderer has been getting.
+    Original,
     /// It lists the profile's type.
     Listed,
-    /// No list, so what every renderer got before.
+    /// It lists types this app makes, but not this one, and refused those
+    /// offered so far.
+    NotListed,
+    /// It gave no list.
     NoList,
     /// Its list is empty.
     EmptyList,
@@ -219,7 +225,9 @@ impl fmt::Display for Why {
         f.write_str(match self {
             Why::Sonos => "it is a Sonos",
             Why::Remembered => "it played that last time",
+            Why::Original => "it is what every renderer has been getting",
             Why::Listed => "it lists that type",
+            Why::NotListed => "it lists no other type this app makes",
             Why::NoList => "it gave no list of the types it plays",
             Why::EmptyList => "its list of the types it plays is empty",
             Why::Wildcard => "its list of types says only that anything goes",
@@ -228,21 +236,29 @@ impl fmt::Display for Why {
     }
 }
 
-/// The profiles to try, in order, and why the first.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Plan {
-    pub attempts: Vec<StreamProfile>,
-    pub why: Why,
+/// The offers that come before any question about the renderer's types:
+/// a Sonos's only one, or the profile it played last time and the
+/// original stream.
+fn opening(sonos: bool, remembered: Option<StreamProfile>) -> Vec<(StreamProfile, Why)> {
+    match (sonos, remembered) {
+        (true, _) => vec![(StreamProfile::Legacy, Why::Sonos)],
+        (false, Some(StreamProfile::Legacy)) => vec![(StreamProfile::Legacy, Why::Remembered)],
+        (false, Some(p)) => vec![(p, Why::Remembered), (StreamProfile::Legacy, Why::Original)],
+        (false, None) => vec![(StreamProfile::Legacy, Why::Original)],
+    }
 }
 
-/// Which profiles to offer a renderer. A Sonos gets legacy and nothing
-/// else. Any other starts with the profile it played last time, else the
-/// first it lists, else legacy (what every renderer that works today
-/// gets); when that is refused, legacy, then those it lists, then the
-/// rest, [`MAX_ATTEMPTS`] in all.
-pub fn plan(sonos: bool, remembered: Option<StreamProfile>, sinks: &Sinks) -> Plan {
+/// Every offer to a renderer, in order, and why each. A Sonos gets the
+/// original stream and nothing else. Any other renderer gets the profile
+/// it played last time, if there is one, and the original stream, which
+/// is what every renderer that works today gets; when those are refused,
+/// the profiles it lists (WAV spellings before L16), then the rest,
+/// [`MAX_ATTEMPTS`] in all. Only the offers after the opening ones depend
+/// on `sinks` (see [`Offers`]).
+pub fn plan(sonos: bool, remembered: Option<StreamProfile>, sinks: &Sinks) -> Vec<(StreamProfile, Why)> {
+    let mut offers = opening(sonos, remembered);
     if sonos {
-        return Plan { attempts: vec![StreamProfile::Legacy], why: Why::Sonos };
+        return offers;
     }
     let http: Vec<&ProtocolInfo> = match sinks {
         Sinks::Unknown => Vec::new(),
@@ -250,29 +266,58 @@ pub fn plan(sonos: bool, remembered: Option<StreamProfile>, sinks: &Sinks) -> Pl
     };
     let listed: Vec<StreamProfile> =
         ALL.into_iter().filter(|p| http.iter().any(|entry| p.matches(&entry.content_format))).collect();
-    let why = match (remembered, listed.first(), sinks) {
-        (Some(_), _, _) => Why::Remembered,
-        (None, Some(_), _) => Why::Listed,
-        (None, None, Sinks::Unknown) => Why::NoList,
-        (None, None, Sinks::Listed(list)) if list.is_empty() => Why::EmptyList,
-        (None, None, Sinks::Listed(_))
+    let unlisted = match sinks {
+        _ if !listed.is_empty() => Why::NotListed,
+        Sinks::Unknown => Why::NoList,
+        Sinks::Listed(list) if list.is_empty() => Why::EmptyList,
+        Sinks::Listed(_)
             if !http.is_empty() && http.iter().all(|e| e.content_format == "*" || e.content_format.ends_with("/*")) =>
         {
             Why::Wildcard
         }
-        (None, None, Sinks::Listed(_)) => Why::NothingWeMake,
+        Sinks::Listed(_) => Why::NothingWeMake,
     };
-    let first = remembered.or(listed.first().copied()).unwrap_or(StreamProfile::Legacy);
-    let mut attempts = Vec::with_capacity(MAX_ATTEMPTS);
-    for p in [first, StreamProfile::Legacy].into_iter().chain(listed).chain(UNLISTED_ORDER) {
-        if attempts.len() == MAX_ATTEMPTS {
+    let rest = listed.into_iter().map(|p| (p, Why::Listed)).chain(UNLISTED_ORDER.map(|p| (p, unlisted)));
+    for (p, why) in rest {
+        if offers.len() == MAX_ATTEMPTS {
             break;
         }
-        if !attempts.contains(&p) {
-            attempts.push(p);
+        if !offers.iter().any(|(q, _)| *q == p) {
+            offers.push((p, why));
         }
     }
-    Plan { attempts, why }
+    offers
+}
+
+/// The offers of one connect, worked out as they come due. The renderer
+/// is asked which types it plays only when the next offer depends on its
+/// list, that is after the opening offers were refused; so a renderer
+/// that takes the original stream (or the profile it played last time)
+/// is asked nothing, and a Sonos never is.
+pub struct Offers {
+    sonos: bool,
+    remembered: Option<StreamProfile>,
+    opening: usize,
+    asked: bool,
+    plan: Vec<(StreamProfile, Why)>,
+}
+
+impl Offers {
+    pub fn new(sonos: bool, remembered: Option<StreamProfile>) -> Self {
+        let plan = opening(sonos, remembered);
+        Offers { sonos, remembered, opening: plan.len(), asked: false, plan }
+    }
+
+    /// Offer number `i` (from 0) and why, or None past the last. `ask`
+    /// gets the renderer's list; it is called at most once, the first
+    /// time an offer depends on it.
+    pub fn get(&mut self, i: usize, ask: impl FnOnce() -> Sinks) -> Option<(StreamProfile, Why)> {
+        if !self.sonos && !self.asked && i >= self.opening && i < MAX_ATTEMPTS {
+            self.asked = true;
+            self.plan = plan(self.sonos, self.remembered, &ask());
+        }
+        self.plan.get(i).copied()
+    }
 }
 
 #[cfg(test)]
@@ -347,47 +392,49 @@ mod tests {
         Sinks::Listed(parse_protocol_list(csv))
     }
 
-    fn attempts(sonos: bool, remembered: Option<StreamProfile>, sinks: &Sinks) -> (Vec<StreamProfile>, Why) {
-        let p = plan(sonos, remembered, sinks);
-        (p.attempts, p.why)
+    fn offers(sonos: bool, remembered: Option<StreamProfile>, sinks: &Sinks) -> Vec<(StreamProfile, Why)> {
+        plan(sonos, remembered, sinks)
+    }
+
+    /// What #117's KEF LSX II LT lists.
+    fn kef() -> Sinks {
+        listed("http-get:*:audio/wav:*,http-get:*:audio/wave:*,http-get:*:audio/x-wav:*,http-get:*:audio/mpeg:*")
     }
 
     #[test]
-    fn a_sonos_gets_legacy_and_nothing_else() {
+    fn a_sonos_gets_the_original_stream_and_nothing_else() {
         for sinks in [Sinks::Unknown, listed("http-get:*:audio/wav:*")] {
             for remembered in [None, Some(Wav)] {
-                assert_eq!(attempts(true, remembered, &sinks), (vec![Legacy], Why::Sonos));
+                assert_eq!(offers(true, remembered, &sinks), [(Legacy, Why::Sonos)]);
             }
         }
     }
 
     #[test]
-    fn a_renderer_gets_the_first_type_it_lists_then_legacy_then_the_rest() {
-        // What #117's KEF LSX II LT lists.
-        let kef = listed("http-get:*:audio/wav:*,http-get:*:audio/wave:*,http-get:*:audio/x-wav:*,http-get:*:audio/mpeg:*");
-        assert_eq!(attempts(false, None, &kef), (vec![Wav, Legacy, XWav], Why::Listed));
-        assert_eq!(attempts(false, None, &listed("http-get:*:AUDIO/WAVE:*")), (vec![Wave, Legacy, Wav], Why::Listed));
-        assert_eq!(attempts(false, None, &listed("http-get:*:audio/x-wav;codec=1:*")), (vec![XWav, Legacy, Wav], Why::Listed));
+    fn a_renderer_gets_the_original_stream_first_then_the_types_it_lists_then_the_rest() {
+        assert_eq!(offers(false, None, &kef()), [(Legacy, Why::Original), (Wav, Why::Listed), (XWav, Why::Listed)]);
+        assert_eq!(offers(false, None, &listed("http-get:*:AUDIO/WAVE:*")), [(Legacy, Why::Original), (Wave, Why::Listed), (Wav, Why::NotListed)]);
+        assert_eq!(offers(false, None, &listed("http-get:*:audio/x-wav;codec=1:*")), [(Legacy, Why::Original), (XWav, Why::Listed), (Wav, Why::NotListed)]);
         // L16 counts with this app's rate and channels, or none named.
-        assert_eq!(attempts(false, None, &listed("http-get:*:audio/L16:*")), (vec![L16, Legacy, Wav], Why::Listed));
+        assert_eq!(offers(false, None, &listed("http-get:*:audio/L16:*")), [(Legacy, Why::Original), (L16, Why::Listed), (Wav, Why::NotListed)]);
         assert_eq!(
-            attempts(false, None, &listed("http-get:*:audio/L16;channels=2;rate=44100:*")),
-            (vec![L16, Legacy, Wav], Why::Listed)
+            offers(false, None, &listed("http-get:*:audio/L16;channels=2;rate=44100:*")),
+            [(Legacy, Why::Original), (L16, Why::Listed), (Wav, Why::NotListed)]
         );
         // WAV spellings come before L16.
         assert_eq!(
-            attempts(false, None, &listed("http-get:*:audio/L16:*,http-get:*:audio/wave:*")),
-            (vec![Wave, Legacy, L16], Why::Listed)
+            offers(false, None, &listed("http-get:*:audio/L16:*,http-get:*:audio/wave:*")),
+            [(Legacy, Why::Original), (Wave, Why::Listed), (L16, Why::Listed)]
         );
-        // A renderer that lists legacy's own type gets legacy first.
+        // Listing the original stream's own type changes nothing.
         assert_eq!(
-            attempts(false, None, &listed("http-get:*:audio/wav:*,http-get:*:audio/vnd.wave;codec=1:*")),
-            (vec![Legacy, Wav, L16], Why::Listed)
+            offers(false, None, &listed("http-get:*:audio/vnd.wave;codec=1:*,http-get:*:audio/wav:*")),
+            [(Legacy, Why::Original), (Wav, Why::Listed), (L16, Why::NotListed)]
         );
     }
 
     #[test]
-    fn without_a_usable_list_legacy_comes_first() {
+    fn without_a_usable_list_the_rest_come_in_a_fixed_order() {
         for (sinks, why) in [
             (Sinks::Unknown, Why::NoList),
             (listed(""), Why::EmptyList),
@@ -399,16 +446,16 @@ mod tests {
             (listed("http-get:*:audio/L16;rate=44100;channels=1:*"), Why::NothingWeMake),
             (listed("rtsp-rtp-udp:*:audio/wav:*"), Why::NothingWeMake),
         ] {
-            assert_eq!(attempts(false, None, &sinks), (vec![Legacy, Wav, L16], why), "{sinks:?}");
+            assert_eq!(offers(false, None, &sinks), [(Legacy, Why::Original), (Wav, why), (L16, why)], "{sinks:?}");
         }
     }
 
     #[test]
-    fn a_remembered_profile_comes_first() {
-        let kef = listed("http-get:*:audio/wav:*,http-get:*:audio/wave:*");
-        assert_eq!(attempts(false, Some(Wave), &kef), (vec![Wave, Legacy, Wav], Why::Remembered));
-        assert_eq!(attempts(false, Some(XWav), &Sinks::Unknown), (vec![XWav, Legacy, Wav], Why::Remembered));
-        assert_eq!(attempts(false, Some(Legacy), &kef), (vec![Legacy, Wav, Wave], Why::Remembered));
+    fn a_remembered_profile_comes_first_then_the_original_stream() {
+        let kef = kef();
+        assert_eq!(offers(false, Some(Wave), &kef), [(Wave, Why::Remembered), (Legacy, Why::Original), (Wav, Why::Listed)]);
+        assert_eq!(offers(false, Some(XWav), &Sinks::Unknown), [(XWav, Why::Remembered), (Legacy, Why::Original), (Wav, Why::NoList)]);
+        assert_eq!(offers(false, Some(Legacy), &kef), [(Legacy, Why::Remembered), (Wav, Why::Listed), (XWav, Why::Listed)]);
     }
 
     #[test]
@@ -419,7 +466,7 @@ mod tests {
         for sonos in [false, true] {
             for remembered in [None, Some(Legacy), Some(Wav), Some(XWav), Some(Wave), Some(L16)] {
                 for sinks in [Sinks::Unknown, listed(""), everything.clone()] {
-                    let a = plan(sonos, remembered, &sinks).attempts;
+                    let a: Vec<StreamProfile> = plan(sonos, remembered, &sinks).into_iter().map(|(p, _)| p).collect();
                     assert!(!a.is_empty() && a.len() <= MAX_ATTEMPTS, "{a:?}");
                     let mut d = a.clone();
                     d.sort_by_key(|p| p.path());
@@ -431,11 +478,40 @@ mod tests {
     }
 
     #[test]
+    fn the_renderer_is_asked_for_its_list_only_when_an_offer_depends_on_it() {
+        let never = || -> Sinks { panic!("asked for the list too early") };
+        let asked = std::cell::Cell::new(0);
+        let ask = || {
+            asked.set(asked.get() + 1);
+            kef()
+        };
+        // Nothing remembered: the original stream needs no list; the next does.
+        let mut o = Offers::new(false, None);
+        assert_eq!(o.get(0, never), Some((Legacy, Why::Original)));
+        assert_eq!(o.get(1, ask), Some((Wav, Why::Listed)));
+        assert_eq!(o.get(2, ask), Some((XWav, Why::Listed)));
+        assert_eq!(o.get(3, ask), None);
+        assert_eq!(asked.get(), 1);
+        // Remembered: it and the original stream come before any question.
+        let mut o = Offers::new(false, Some(Wave));
+        assert_eq!(o.get(0, never), Some((Wave, Why::Remembered)));
+        assert_eq!(o.get(1, never), Some((Legacy, Why::Original)));
+        assert_eq!(o.get(2, ask), Some((Wav, Why::Listed)));
+        assert_eq!(asked.get(), 2);
+        // A Sonos is never asked.
+        let mut o = Offers::new(true, None);
+        assert_eq!(o.get(0, never), Some((Legacy, Why::Sonos)));
+        assert_eq!(o.get(1, never), None);
+    }
+
+    #[test]
     fn profiles_and_reasons_read_well_in_the_log() {
         assert_eq!(Legacy.to_string(), "WAV as audio/vnd.wave;codec=1 (the original stream)");
         assert_eq!(Wav.to_string(), "WAV as audio/wav");
         assert_eq!(L16.to_string(), "L16 as audio/L16;rate=44100;channels=2");
+        assert_eq!(Why::Original.to_string(), "it is what every renderer has been getting");
         assert_eq!(Why::Listed.to_string(), "it lists that type");
+        assert_eq!(Why::NotListed.to_string(), "it lists no other type this app makes");
         assert_eq!(Why::NoList.to_string(), "it gave no list of the types it plays");
     }
 

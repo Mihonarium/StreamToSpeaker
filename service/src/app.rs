@@ -2448,32 +2448,13 @@ impl App {
         Ok(session)
     }
 
-    /// Which stream profiles to offer `r`, in order (see
-    /// [`stream_profile::plan`]): a Sonos gets the original stream only;
-    /// any other renderer is asked which types it plays, and starts with
-    /// the profile it played last time (`settings_id`'s), else one it
-    /// lists, else the original stream.
+    /// What `r` is offered (see [`stream_profile::plan`]): a Sonos the
+    /// original stream only; any other renderer the profile it played last
+    /// time (`settings_id`'s), if any, and the original stream, and when
+    /// those are refused, the types it lists.
     fn stream_offer(&self, r: &Renderer, settings_id: &str, base_url: String) -> StreamOffer {
-        let name = r.display_name();
-        let sonos = r.is_sonos();
-        let sinks = match (&r.connection_manager_control_url, sonos) {
-            (Some(url), false) => match upnp::get_protocol_info(url) {
-                Ok(list) => Sinks::Listed(list),
-                Err(e) => {
-                    debug!("UPnP: {}: no list of the types it plays: {:#}", name, e);
-                    Sinks::Unknown
-                }
-            },
-            _ => Sinks::Unknown,
-        };
-        let remembered = if sonos { None } else { self.speaker_settings(settings_id).upnp_stream_profile };
-        let plan = stream_profile::plan(sonos, remembered, &sinks);
-        if let Some((first, then)) = plan.attempts.split_first() {
-            let then: Vec<String> = then.iter().map(|p| p.to_string()).collect();
-            let fallbacks = if then.is_empty() { String::new() } else { format!("; if refused, {}", then.join(", then ")) };
-            info!("UPnP: {}: offering {}, because {}{}", name, first, plan.why, fallbacks);
-        }
-        StreamOffer { base_url, attempts: plan.attempts, initial_buffer_ms: self.config.initial_buffer_ms }
+        let remembered = if r.is_sonos() { None } else { self.speaker_settings(settings_id).upnp_stream_profile };
+        StreamOffer { base_url, remembered, initial_buffer_ms: self.config.initial_buffer_ms }
     }
 
     /// Log when `name` comes for the stream it was given at `given_at`,
@@ -3927,11 +3908,11 @@ impl App {
 const FETCH_EXPECTED_WITHIN: Duration = Duration::from_secs(10);
 
 /// What a renderer is offered: this PC's stream address on its network
-/// (`http://<ip>:<port>`), the stream profiles to try in order, and the
-/// metadata's buffer hint.
+/// (`http://<ip>:<port>`), the stream profile it played last time, if
+/// any, and the metadata's buffer hint.
 pub struct StreamOffer {
     pub base_url: String,
-    pub attempts: Vec<StreamProfile>,
+    pub remembered: Option<StreamProfile>,
     pub initial_buffer_ms: u32,
 }
 
@@ -3955,10 +3936,12 @@ fn refused_profile(e: &anyhow::Error, at_play: bool) -> bool {
     }
 }
 
-/// Start `renderer` playing the stream: each profile of `offer` in turn
-/// gets a clean Stop, SetAVTransportURI and Play, until one is taken; a
-/// refusal of the profile moves on to the next, anything else ends the
-/// attempt. Then subscribe to its volume events.
+/// Start `renderer` playing the stream: each profile in turn (see
+/// [`stream_profile::Offers`]) gets a clean Stop, SetAVTransportURI and
+/// Play, until one is taken; a refusal of the profile moves on to the
+/// next, anything else ends the attempt. The renderer is asked which types
+/// it plays only when an offer depends on that. Then subscribe to its
+/// volume events.
 pub fn start_session(
     renderer: Renderer,
     offer: &StreamOffer,
@@ -3968,13 +3951,28 @@ pub fn start_session(
     let name = renderer.display_name();
     info!("targeting speaker: {} ({})", name, renderer.ip);
     let avt = renderer.av_transport_control_url.as_str();
+    let ask = || match &renderer.connection_manager_control_url {
+        Some(url) => match upnp::get_protocol_info(url) {
+            Ok(list) => Sinks::Listed(list),
+            Err(e) => {
+                debug!("UPnP: {}: no list of the types it plays: {:#}", name, e);
+                Sinks::Unknown
+            }
+        },
+        None => Sinks::Unknown,
+    };
+    let mut offers = stream_profile::Offers::new(renderer.is_sonos(), offer.remembered);
+    let mut current = offers.get(0, &ask);
+    if let Some((profile, why)) = current {
+        info!("UPnP: {}: offering {}, because {}", name, profile, why);
+    }
     let mut taken = None;
-    for (i, &profile) in offer.attempts.iter().enumerate() {
-        let next = offer.attempts.get(i + 1);
+    let mut i = 0;
+    while let Some((profile, _)) = current {
         let uri = format!("{}{}", offer.base_url, profile.path());
         let didl = upnp::didl_lite_metadata(&uri, PRODUCT_NAME, offer.initial_buffer_ms, profile);
         // Stop first to clear any "Transport Locked" (Sonos 705)
-        // carry-over, and what an attempt before this one left.
+        // carry-over, and what an offer before this one left.
         let _ = upnp::stop(avt);
         std::thread::sleep(Duration::from_millis(100));
         let given_at = Instant::now();
@@ -3984,29 +3982,33 @@ pub fn start_session(
             std::thread::sleep(Duration::from_millis(100));
             play_taken_uri(avt)
         });
-        match started {
+        let e = match started {
             Ok(()) => {
                 info!("UPnP: {} took {}", name, profile);
                 taken = Some((profile, uri, given_at));
                 break;
             }
-            Err(e) => match next {
-                Some(next) if refused_profile(&e, at_play) => {
-                    info!("UPnP: {} didn't take {}: {:#}; offering {}", name, profile, e, next);
+            Err(e) => e,
+        };
+        let next = if refused_profile(&e, at_play) { offers.get(i + 1, &ask) } else { None };
+        match next {
+            Some((next, why)) => {
+                info!("UPnP: {} didn't take {}: {:#}; offering {}, because {}", name, profile, e, next, why);
+                current = Some((next, why));
+                i += 1;
+            }
+            None => {
+                // The renderer may hold our URI and still start on it:
+                // tell it to let go, so a failure reported here is not a
+                // speaker playing.
+                if at_play {
+                    let _ = upnp::stop(avt);
                 }
-                _ => {
-                    // The renderer may hold our URI and still start on it:
-                    // tell it to let go, so a failure reported here is
-                    // not a speaker playing.
-                    if at_play {
-                        let _ = upnp::stop(avt);
-                    }
-                    // The speaker's own answer, in full, for whoever reads
-                    // the log.
-                    warn!("UPnP: {} ({}): {:#}", name, renderer.ip, e);
-                    return Err(StartError { error: e, formats_tried: i + 1 });
-                }
-            },
+                // The speaker's own answer, in full, for whoever reads the
+                // log.
+                warn!("UPnP: {} ({}): {:#}", name, renderer.ip, e);
+                return Err(StartError { error: e, formats_tried: i + 1 });
+            }
         }
     }
     let Some((profile, stream_uri, stream_given_at)) = taken else {
@@ -4304,20 +4306,22 @@ mod tests {
         })
     }
 
-    /// A renderer whose every service is on `fake`.
-    fn renderer_on(fake: &crate::fake_renderer::FakeRenderer) -> Renderer {
+    /// A Sonos whose every service is on `fake`: it is offered the
+    /// original stream only, so one offer is all a test of it sees.
+    fn sonos_on(fake: &crate::fake_renderer::FakeRenderer) -> Renderer {
         let ActiveSession::Upnp(s) = upnp_session(&fake.url("/RenderingControl/Control")) else { unreachable!() };
         Renderer {
             base_url: fake.url(""),
             av_transport_control_url: fake.url("/AVTransport/Control"),
             rendering_control_event_url: fake.url("/RenderingControl/Event"),
+            zone_group_topology_control_url: Some(fake.url("/ZoneGroupTopology/Control")),
             ..s.renderer
         }
     }
 
-    /// The original stream, and nothing else.
-    fn legacy_offer() -> StreamOffer {
-        StreamOffer { base_url: "http://127.0.0.1:1".into(), attempts: vec![StreamProfile::Legacy], initial_buffer_ms: 0 }
+    /// Nothing remembered.
+    fn first_offer() -> StreamOffer {
+        StreamOffer { base_url: "http://127.0.0.1:1".into(), remembered: None, initial_buffer_ms: 0 }
     }
 
     /// A renderer that answers each AVTransport action with `play`'s
@@ -4337,7 +4341,7 @@ mod tests {
     fn a_play_refused_after_the_uri_was_taken_is_followed_by_stop() {
         use crate::fake_renderer::Reply;
         let fake = renderer_answering_play(vec![Reply::soap_fault(704, "Playing failed")]);
-        let r = start_session(renderer_on(&fake), &legacy_offer(), "http://127.0.0.1:1/gena", None);
+        let r = start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None);
         assert!(r.is_err());
         // The renderer holds our URI; it is told to let go of it.
         assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Stop"]);
@@ -4348,7 +4352,7 @@ mod tests {
         use crate::fake_renderer::Reply;
         // 701: the renderer is still busy taking the URI.
         let fake = renderer_answering_play(vec![Reply::soap_fault(701, "Transition not available")]);
-        let session = start_session(renderer_on(&fake), &legacy_offer(), "http://127.0.0.1:1/gena", None)
+        let session = start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None)
             .expect("the second Play is accepted");
         assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Play"]);
         session.gena.unsubscribe();
@@ -4359,7 +4363,7 @@ mod tests {
             Reply::soap_fault(701, "Transition not available"),
             Reply::soap_fault(701, "Transition not available"),
         ]);
-        assert!(start_session(renderer_on(&fake), &legacy_offer(), "http://127.0.0.1:1/gena", None).is_err());
+        assert!(start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None).is_err());
         assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Play", "Stop"]);
     }
 
@@ -4509,16 +4513,65 @@ mod tests {
             &["ConnectionManager"],
         );
         let app = serving_app();
-        let session = app.start_upnp_manual(&manual_upnp(&fake)).expect("the speaker plays");
+        let m = manual_upnp(&fake);
+        let session = app.start_upnp_manual(&m).expect("the speaker plays");
         let p = probed.lock().unwrap();
-        assert_eq!(p.offered.len(), 1, "{p:?}");
-        let (uri, didl_type, head_type) = &p.offered[0];
+        // The original stream first, refused at once; then a type it lists.
+        let paths: Vec<String> = p.offered.iter().map(|(uri, _, _)| url::Url::parse(uri).unwrap().path().to_string()).collect();
+        assert_eq!(paths, ["/stream.raw", "/wav/stream.wav"]);
+        let (uri, didl_type, head_type) = &p.offered[1];
         assert!(uri.ends_with("/wav/stream.wav"), "{uri}");
         assert_eq!((didl_type.as_str(), head_type.as_str()), ("audio/wav", "audio/wav"));
         assert_eq!(p.fetched, ["audio/wav"]);
         drop(p);
+        // Its list was asked for only after the refusal.
+        let actions: Vec<String> = fake.soap_actions();
+        assert_eq!(actions, ["Stop", "SetAVTransportURI", "GetProtocolInfo", "Stop", "SetAVTransportURI", "Play"]);
         let ActiveSession::Upnp(s) = &session else { unreachable!() };
         assert_eq!(s.profile, StreamProfile::Wav);
+        end(session);
+        // Remembered: the next connect plays at the first offer, unasked.
+        probed.lock().unwrap().offered.clear();
+        let before = fake.soap_actions().len();
+        let session = app.start_upnp_manual(&m).unwrap();
+        assert_eq!(offered_paths(&probed), ["/wav/stream.wav"]);
+        assert_eq!(fake.soap_actions()[before..], ["Stop", "SetAVTransportURI", "Play"]);
+        end(session);
+    }
+
+    #[test]
+    fn a_renderer_that_takes_the_original_stream_gets_exactly_the_requests_it_always_got() {
+        // It has a ConnectionManager, and is never asked anything of it.
+        let (fake, probed) = strict_renderer(
+            Some("http-get:*:audio/wav:*"),
+            &["audio/vnd.wave;codec=1", "audio/wav"],
+            &["ConnectionManager"],
+        );
+        let app = serving_app();
+        let session = app.start_upnp_manual(&manual_upnp(&fake)).expect("the speaker plays");
+        let seen: Vec<(String, String, Option<String>)> = fake
+            .requests()
+            .iter()
+            .map(|r| (r.method.clone(), r.target.clone(), r.soap_action().map(str::to_string)))
+            .collect();
+        let req = |m: &str, t: &str, a: Option<&str>| (m.to_string(), t.to_string(), a.map(str::to_string));
+        assert_eq!(
+            seen,
+            [
+                req("GET", "/description.xml", None),
+                req("POST", "/AVTransport/Control", Some("Stop")),
+                req("POST", "/AVTransport/Control", Some("SetAVTransportURI")),
+                req("POST", "/AVTransport/Control", Some("Play")),
+                req("SUBSCRIBE", "/RenderingControl/Event", None),
+            ]
+        );
+        let p = probed.lock().unwrap();
+        let (uri, didl_type, head_type) = &p.offered[0];
+        assert!(uri.ends_with("/stream.raw"), "{uri}");
+        assert_eq!((didl_type.as_str(), head_type.as_str()), ("audio/wav", "audio/vnd.wave;codec=1"));
+        drop(p);
+        let ActiveSession::Upnp(s) = &session else { unreachable!() };
+        assert_eq!(s.profile, StreamProfile::Legacy);
         end(session);
     }
 

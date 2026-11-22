@@ -344,15 +344,16 @@ bytes). How the stream is labelled depends on the speaker
   header and then little-endian samples, served as `audio/vnd.wave;codec=1`
   at `/stream.raw` and announced as `audio/wav` in its DIDL-Lite metadata.
   This is the original stream, and a Sonos is never offered another.
-- Any other renderer is first asked which types it plays (ConnectionManager
-  `GetProtocolInfo`). It is offered the same WAV as `audio/wav`,
-  `audio/x-wav` or `audio/wave` (at `/wav/stream.wav`, `/x-wav/stream.wav`,
-  `/wave/stream.wav`), raw big-endian samples without a header as
-  `audio/L16;rate=44100;channels=2` (RFC 2586, at `/l16/stream.raw`), or the
-  original stream: the one it played last time, else the first it lists,
-  else the original stream. If it refuses one, the next is offered, three at
-  most. Except on the original stream, a HEAD or GET of the stream answers
-  with the type its metadata names.
+- Any other renderer is offered the original stream too, or first the
+  profile it played last time. Only if it refuses the original stream is it
+  asked which types it plays (ConnectionManager `GetProtocolInfo`), and
+  offered those, then the rest: the same WAV as `audio/wav`, `audio/x-wav`
+  or `audio/wave` (at `/wav/stream.wav`, `/x-wav/stream.wav`,
+  `/wave/stream.wav`), or raw big-endian samples without a header as
+  `audio/L16;rate=44100;channels=2` (RFC 2586, at `/l16/stream.raw`). Three
+  offers at most; the one it takes is remembered for the next connect.
+  Except on the original stream, a HEAD or GET of the stream answers with
+  the type its metadata names.
 
 AirPlay: ALAC for RAOP, and AAC-LC via Windows Media Foundation for AirPlay 2
 buffered audio.
