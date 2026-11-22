@@ -517,8 +517,9 @@ pub struct App {
     pub discovery: Option<Arc<DiscoveryState>>,
     pub airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     /// Passwords typed for an AirPlay receiver that announces another
-    /// speaker's identity (a newcomer, see `RaopDetails::newcomer`): used
-    /// for the next connect to it, never stored.
+    /// speaker's identity (a newcomer, see `RaopDetails::newcomer`), by
+    /// its id (`airplay:<MAC>/<instance>`): used for the next connect to
+    /// it, never stored.
     unsaved_airplay_passwords: Mutex<std::collections::HashMap<String, String>>,
     /// AirPlay receivers (by id) that asked for a password in this run,
     /// whether or not they announce one: picking them opens the password
@@ -1245,10 +1246,11 @@ impl App {
     }
 
     /// Store (or clear, when `pw` is empty) the AirPlay password for a
-    /// device id and persist it. For a receiver that announces another
-    /// speaker's identity it is kept only for its next connect.
+    /// device id and persist it. Under a newcomer's id (see
+    /// [`crate::airplay::discovery::is_instance_id`]) nothing is stored,
+    /// whatever its record says now: it is kept only for its next connect.
     pub fn set_airplay_password(&self, id: &str, pw: &str) {
-        if self.is_airplay_newcomer(id) {
+        if crate::airplay::discovery::is_instance_id(id) {
             let mut unsaved = self.unsaved_airplay_passwords.lock().unwrap();
             if pw.is_empty() {
                 unsaved.remove(id);
@@ -2384,7 +2386,7 @@ impl App {
         // click "Hide this guide" themselves.
         // (Not a receiver announcing another speaker's identity: the next
         // launch must not connect to it by itself.)
-        if !is_newcomer {
+        if !is_newcomer && !crate::airplay::discovery::is_instance_id(&actual_id) {
             let mut uc = self.user_config.lock().unwrap();
             if uc.last_speaker_id.as_deref() != Some(actual_id.as_str()) {
                 uc.last_speaker_id = Some(actual_id.clone());
@@ -3038,8 +3040,13 @@ impl App {
         (id, seed)
     }
 
-    /// Persist HomeKit pairing credentials for a device id.
+    /// Persist HomeKit pairing credentials for a device id (never under a
+    /// newcomer's id).
     pub fn store_airplay_pairing(&self, id: &str, creds: PairingCredentials) {
+        if crate::airplay::discovery::is_instance_id(id) {
+            debug!("not storing a pairing under {id}: it names a receiver announcing another speaker's identity");
+            return;
+        }
         let mut uc = self.user_config.lock().unwrap();
         uc.airplay_pairings.insert(id.to_string(), creds);
         uc.save();
@@ -3843,7 +3850,12 @@ impl App {
     }
 
     /// Store one speaker's settings (an all-default value drops its entry).
+    /// Nothing is stored under a newcomer's id.
     pub fn set_speaker_settings(&self, id: &str, settings: SpeakerSettings) {
+        if crate::airplay::discovery::is_instance_id(id) {
+            debug!("not storing settings under {id}: it names a receiver announcing another speaker's identity");
+            return;
+        }
         let mut uc = self.user_config.lock().unwrap();
         let changed = if settings.is_default() {
             uc.speaker_settings.remove(id).is_some()
@@ -5085,6 +5097,24 @@ mod tests {
             Err(_) => panic!("the incumbent connects with its password"),
         }
         assert!(rx.requests().iter().any(|r| r.header("Authorization").is_some()));
+    }
+
+    /// Nothing is stored under a newcomer's id (`airplay:<MAC>/<instance>`),
+    /// also once its conflict has ended and the record left is no longer
+    /// marked: such an id only ever names a newcomer, and nothing would
+    /// read or remove what was stored under it.
+    #[test]
+    fn nothing_is_stored_under_a_newcomers_id() {
+        let (app, discovery) = airplay_test_app_with(conflict_discovery());
+        discovery.remove_for_tests(crate::airplay::discovery::RAOP_SERVICE, "B8E93735AC11@Kitchen._raop._tcp.local.");
+        assert!(!discovery.find_by_id(KITCHEN_2).unwrap().is_newcomer(), "the conflict has ended");
+        app.set_airplay_password(KITCHEN_2, "typed-after-conflict");
+        app.set_speaker_settings(KITCHEN_2, SpeakerSettings { hidden: true, ..Default::default() });
+        app.store_airplay_pairing(KITCHEN_2, some_pairing("kitchen-2"));
+        let uc = app.user_config.lock().unwrap();
+        assert!(uc.airplay_passwords.is_empty() && uc.speaker_settings.is_empty() && uc.airplay_pairings.is_empty());
+        let written = serde_json::to_string(&*uc).unwrap();
+        assert!(!written.contains("typed-after-conflict") && !written.contains("kitchen 2"), "{written}");
     }
 
     /// A password typed for a newcomer is used for its next connect and

@@ -556,6 +556,16 @@ const MAX_CLAIMS_PER_IDENTITY: usize = 4;
 /// reasoning.
 const MAX_AIRPLAY_RECORDS: usize = 256;
 
+/// Does `id` have the form `airplay:<MAC>/<instance>`? Only a newcomer's
+/// id has it (see [`AirPlayRenderer::stable_id`]): it names that one
+/// announcement, so nothing is stored under it, even once the conflict
+/// has ended and the record is no longer marked.
+pub fn is_instance_id(id: &str) -> bool {
+    id.strip_prefix("airplay:")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(mac, instance)| !mac.is_empty() && !mac.contains(':') && !instance.is_empty())
+}
+
 /// Shared discovery state. Mirrors `ssdp::DiscoveryState` semantics.
 #[derive(Default)]
 pub struct AirPlayDiscoveryState {
@@ -671,6 +681,13 @@ impl AirPlayDiscoveryState {
     #[cfg(test)]
     pub(crate) fn ingest_for_tests(&self, service: &str, info: &ServiceInfo) {
         ingest_resolution(self, service, info);
+    }
+
+    /// A goodbye, as the browse threads deliver it (for tests elsewhere in
+    /// the crate).
+    #[cfg(test)]
+    pub(crate) fn remove_for_tests(&self, service: &str, fullname: &str) {
+        ingest_removal(self, service, fullname);
     }
 
     #[cfg(test)]
@@ -1836,6 +1853,16 @@ mod tests {
         assert!(!wants("airplay:AABBCCDDEE02"));
         assert!(!wants("airplay:AABBCCDDEE03"));
         assert_eq!(state.find_by_id("airplay:AABBCCDDEE01").unwrap().raop.metadata, [0, 1, 2]);
+    }
+
+    #[test]
+    fn only_a_newcomers_id_has_the_instance_form() {
+        let state = conflict_state();
+        assert!(is_instance_id(NEWCOMER));
+        assert!(is_instance_id(&state.find_by_id(NEWCOMER).unwrap().stable_id()));
+        for id in ["airplay:B8E93735AC11", "airplay:pair:3F2A/x", "airplay:manual-192.168.1.20:7000", "airplay:/x", "airplay:B8E93735AC11/", "uuid:RINCON_1/x"] {
+            assert!(!is_instance_id(id), "{id}");
+        }
     }
 
     #[test]
