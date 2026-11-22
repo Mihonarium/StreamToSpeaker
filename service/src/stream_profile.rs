@@ -307,6 +307,20 @@ pub fn plan(sonos: bool, remembered: Option<StreamProfile>, sinks: &Sinks) -> Ve
     offers
 }
 
+/// What to remember for a renderer once `played` has played: another
+/// profile than the original only when the original stream was refused
+/// for its content in this connect (`original_refused`); the remembered
+/// one kept when it played again; otherwise nothing, so the next connect
+/// starts from the original stream. The original itself is never stored:
+/// it is offered first anyway.
+pub fn to_remember(remembered: Option<StreamProfile>, played: StreamProfile, original_refused: bool) -> Option<StreamProfile> {
+    match played {
+        StreamProfile::Legacy => None,
+        p if original_refused || remembered == Some(p) => Some(p),
+        _ => None,
+    }
+}
+
 /// The offers of one connect, worked out as they come due. The renderer
 /// is asked which types it plays only when the next offer depends on its
 /// list, that is after the opening offers were refused; so a renderer
@@ -520,6 +534,18 @@ mod tests {
         let mut o = Offers::new(true, None);
         assert_eq!(o.get(0, never), Some((Legacy, Why::Sonos)));
         assert_eq!(o.get(1, never), None);
+    }
+
+    #[test]
+    fn only_a_profile_won_against_a_refused_original_is_remembered() {
+        assert_eq!(to_remember(None, Wav, true), Some(Wav));
+        assert_eq!(to_remember(None, Wav, false), None);
+        assert_eq!(to_remember(Some(Wav), Wav, false), Some(Wav));
+        assert_eq!(to_remember(Some(Wav), XWav, false), None);
+        assert_eq!(to_remember(Some(Wav), XWav, true), Some(XWav));
+        assert_eq!(to_remember(Some(Wav), Legacy, false), None);
+        assert_eq!(to_remember(None, Legacy, false), None);
+        assert_eq!(to_remember(Some(Legacy), Legacy, false), None);
     }
 
     #[test]

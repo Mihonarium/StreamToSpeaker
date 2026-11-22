@@ -425,7 +425,11 @@ impl ActionError {
                         "{speaker} couldn't fetch the audio from this PC. Windows Firewall may be blocking it: \
                          allow Stream To Speaker on this network."
                     ),
-                    Some(701 | 705) => format!("{speaker} is busy and didn't take the stream. Try again in a moment."),
+                    // Busy (701, 715), locked (705), not ready (718): the
+                    // transport's state, not the stream's.
+                    Some(701 | 705 | 715 | 718) => {
+                        format!("{speaker} isn't ready to take the stream. Try again in a moment.")
+                    }
                     _ => format!("{speaker} refused the stream.{airplay}"),
                 };
                 let answered = match fault {
@@ -744,11 +748,11 @@ mod tests {
             "Kitchen couldn't fetch the audio from this PC. Windows Firewall may be blocking it: allow \
              Stream To Speaker on this network. (Kitchen answered: UPnP error 716, \"Resource not found\".)"
         );
-        for code in [701, 705] {
+        for code in [701, 705, 715, 718] {
             assert_eq!(
                 told(Reply::soap_fault(code, "Busy"), false),
                 format!(
-                    "Kitchen is busy and didn't take the stream. Try again in a moment. \
+                    "Kitchen isn't ready to take the stream. Try again in a moment. \
                      (Kitchen answered: UPnP error {code}, \"Busy\".)"
                 )
             );
