@@ -136,6 +136,9 @@ pub struct UserConfig {
     /// What loading found that the person should be told once.
     #[serde(skip)]
     load_notice: LoadNotice,
+    /// Whether saves reach the file (shared with every clone).
+    #[serde(skip)]
+    save_health: SaveHealth,
     /// Forward Windows' "now playing" (title/artist/album from the System
     /// Media Transport Controls) to the speaker as track metadata, so it
     /// shows on the speaker's display / app. **Off by default** — it's a
@@ -414,7 +417,24 @@ impl UserConfig {
     /// couldn't be read at startup; nothing touches the disk.
     #[cfg(test)]
     pub(crate) fn unsaveable() -> Self {
-        Self { saves: Saves::KeepFile, ..Self::default() }
+        Self::not_read("a test".into())
+    }
+
+    /// Defaults that save nothing for the rest of the run, because the
+    /// file couldn't be read (`why`): saving over it would destroy the
+    /// settings it holds.
+    fn not_read(why: String) -> Self {
+        Self {
+            saves: Saves::KeepFile,
+            save_health: SaveHealth::with(Some(SaveProblem::NotRead { why })),
+            ..Self::default()
+        }
+    }
+
+    /// Whether saves reach `config.json`, shared by every copy of these
+    /// settings.
+    pub fn save_health(&self) -> SaveHealth {
+        self.save_health.clone()
     }
 
     /// Defaults saved to `path` and read back from it, for tests of app
@@ -468,7 +488,7 @@ impl UserConfig {
                     path.display(),
                     e
                 );
-                return Self { saves: Saves::KeepFile, ..Self::default() };
+                return Self::not_read(e.to_string());
             }
         };
         // `config.json` is missing or unusable: the backup, if it is good.
@@ -489,7 +509,7 @@ impl UserConfig {
                     backup_path.display(),
                     e
                 );
-                return Self { saves: Saves::KeepFile, ..Self::default() };
+                return Self::not_read(e.to_string());
             }
         };
         if !unusable && backup.is_none() {
@@ -505,18 +525,14 @@ impl UserConfig {
                     path.display(),
                     re
                 );
-                return Self { saves: Saves::KeepFile, ..Self::default() };
+                return Self::not_read(re.to_string());
             }
             log::warn!("user_config: moved {} to {}", path.display(), aside.display());
             notice.unusable_kept_as = Some(aside);
         }
         match backup {
             Some(parsed) => {
-                log::warn!(
-                    "user_config: loaded the settings from the backup {}, the settings as they \
-                     were before the last save",
-                    backup_path.display()
-                );
+                log::warn!("user_config: loaded the settings from the backup {}", backup_path.display());
                 notice.restored_from_backup = true;
                 let c = Self::from_parsed(parsed, path, codec, fs, notice);
                 // So the next start finds them in `config.json` again.
@@ -633,10 +649,10 @@ impl UserConfig {
         self.save_to_ops(path, codec, &Disk)
     }
 
+    /// Failures are logged once each time they change (see
+    /// [`SaveHealth`]).
     fn save_to_ops(&self, path: &std::path::Path, codec: &dyn SecretCodec, fs: &dyn FileOps) {
-        if let Err(e) = self.try_save_to_ops(path, codec, fs) {
-            log::warn!("user_config: {e}");
-        }
+        let _ = self.try_save_to_ops(path, codec, fs);
     }
 
     /// [`save_to_with`](Self::save_to_with), returning why the file wasn't
@@ -649,27 +665,50 @@ impl UserConfig {
         self.try_save_to_ops(path, codec, &Disk)
     }
 
-    /// [`try_save_to_with`](Self::try_save_to_with) through `fs`.
+    /// [`try_save_to_with`](Self::try_save_to_with) through `fs`, noting
+    /// the outcome in [`save_health`](Self::save_health).
     pub(crate) fn try_save_to_ops(
         &self,
         path: &std::path::Path,
         codec: &dyn SecretCodec,
         fs: &dyn FileOps,
     ) -> Result<(), String> {
+        let result = self.write_to_ops(path, codec, fs);
+        match &result {
+            Ok(()) => self.save_health.set(None),
+            Err(SaveFailure::NotRead(_)) => {}
+            Err(SaveFailure::Failed { why, .. }) => {
+                self.save_health.set(Some(SaveProblem::Failed { why: why.clone() }))
+            }
+        }
+        result.map_err(|e| match e {
+            SaveFailure::NotRead(e) => e,
+            SaveFailure::Failed { error, .. } => error,
+        })
+    }
+
+    fn write_to_ops(
+        &self,
+        path: &std::path::Path,
+        codec: &dyn SecretCodec,
+        fs: &dyn FileOps,
+    ) -> Result<(), SaveFailure> {
         match &self.saves {
             Saves::ToFile => {}
             Saves::KeepFile => {
-                return Err(format!(
+                return Err(SaveFailure::NotRead(format!(
                     "not saving over {}: it couldn't be read at startup",
                     path.display()
-                ));
+                )));
             }
             #[cfg(test)]
             Saves::InMemory => return Ok(()),
             #[cfg(test)]
             Saves::AtPath(_) => {}
         }
-        let mut tree = serde_json::to_value(self).map_err(|e| format!("serialize: {e}"))?;
+        let failed = |error: String, why: String| SaveFailure::Failed { error, why };
+        let mut tree =
+            serde_json::to_value(self).map_err(|e| failed(format!("serialize: {e}"), e.to_string()))?;
         if self.web_secret.is_none() {
             // The file may hold a key `--web-link` stored while these
             // settings held none. Writing none over it would break the link
@@ -683,11 +722,14 @@ impl UserConfig {
             }
         }
         secret_store::seal(&mut tree, &self.locked_secrets, codec);
-        let content = serde_json::to_string_pretty(&tree).map_err(|e| format!("serialize: {e}"))?;
+        let content = serde_json::to_string_pretty(&tree)
+            .map_err(|e| failed(format!("serialize: {e}"), e.to_string()))?;
         settings_file::replace(fs, path, content.as_bytes()).map_err(|e| match e {
-            WriteError::Folder(e) => format!("mkdir {}: {}", path.parent().unwrap_or(path).display(), e),
-            WriteError::Write(e) => format!("write beside {}: {}", path.display(), e),
-            WriteError::Replace(e) => format!("replace {}: {}", path.display(), e),
+            WriteError::Folder(e) => {
+                failed(format!("mkdir {}: {}", path.parent().unwrap_or(path).display(), e), e.to_string())
+            }
+            WriteError::Write(e) => failed(format!("write beside {}: {}", path.display(), e), e.to_string()),
+            WriteError::Replace(e) => failed(format!("replace {}: {}", path.display(), e), e.to_string()),
         })
     }
 }
@@ -716,6 +758,122 @@ impl LoadNotice {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// What to tell the person, in a few sentences; `None` when there is
+    /// nothing. File names are given without their folder.
+    pub fn describe(&self) -> Option<String> {
+        let name = |p: &PathBuf| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut out: Vec<String> = Vec::new();
+        if self.restored_from_backup {
+            out.push(match &self.unusable_kept_as {
+                Some(kept) => format!(
+                    "Your settings file was damaged, so the app used its backup copy instead. The \
+                     damaged file is kept as {} in the settings folder.",
+                    name(kept)
+                ),
+                None => "Your settings file was missing, so the app used its backup copy instead.".into(),
+            });
+        } else if self.all_reset {
+            let kept = self
+                .unusable_kept_as
+                .as_ref()
+                .map(|k| format!(" The damaged file is kept as {} in the settings folder.", name(k)))
+                .unwrap_or_default();
+            out.push(format!(
+                "Your settings file was damaged and there was no usable backup copy, so the app \
+                 started with default settings: speakers, pairings and passwords need setting up \
+                 again.{kept}"
+            ));
+        }
+        if !self.reset.is_empty() {
+            const SHOWN: usize = 4;
+            let mut keys: Vec<String> = self.reset.iter().take(SHOWN).map(|p| p.join(" › ")).collect();
+            if self.reset.len() > SHOWN {
+                keys.push(format!("and {} more", self.reset.len() - SHOWN));
+            }
+            let kept = self
+                .reset_kept_as
+                .as_ref()
+                .map(|k| format!(" The file as it was is kept as {} in the settings folder.", name(k)))
+                .unwrap_or_default();
+            out.push(format!(
+                "Some settings couldn't be read and are back to their defaults: {}.{kept}",
+                keys.join(", ")
+            ));
+        }
+        (!out.is_empty()).then(|| out.join(" "))
+    }
+}
+
+/// Why saves aren't reaching `config.json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SaveProblem {
+    /// The file couldn't be read at start (`why`, the system's words), so
+    /// the app runs on defaults and saves nothing over it.
+    NotRead { why: String },
+    /// The last save failed (`why`, the system's words).
+    Failed { why: String },
+}
+
+impl SaveProblem {
+    /// What to tell the person while the problem lasts.
+    pub fn describe(&self) -> String {
+        match self {
+            SaveProblem::NotRead { why } => format!(
+                "Your settings couldn't be read, so the app is using default settings and leaves \
+                 the file alone: changes made now won't be kept. Quit the app and start it again \
+                 to retry. Details: {why}"
+            ),
+            SaveProblem::Failed { why } => format!(
+                "Settings can't be saved, so changes made now will be lost when the app closes. \
+                 Check that the settings folder isn't read-only and that the disk has space. \
+                 Details: {why}"
+            ),
+        }
+    }
+}
+
+/// Whether saves reach `config.json`: the problem since the last save
+/// that failed, until one succeeds. Shared by every copy of the settings
+/// and by whoever shows it; each change is logged once.
+#[derive(Clone, Debug, Default)]
+pub struct SaveHealth(std::sync::Arc<std::sync::Mutex<Option<SaveProblem>>>);
+
+impl SaveHealth {
+    fn with(problem: Option<SaveProblem>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(problem)))
+    }
+
+    /// The current problem, if saves aren't reaching the file.
+    pub fn problem(&self) -> Option<SaveProblem> {
+        self.0.lock().map(|p| p.clone()).unwrap_or(None)
+    }
+
+    fn set(&self, now: Option<SaveProblem>) {
+        let Ok(mut current) = self.0.lock() else { return };
+        if *current == now {
+            return;
+        }
+        match &now {
+            Some(SaveProblem::Failed { why }) => {
+                log::warn!(
+                    "user_config: the settings can't be saved ({why}); changes made now will be \
+                     lost when the app closes"
+                )
+            }
+            Some(SaveProblem::NotRead { .. }) => {}
+            None => log::info!("user_config: the settings are saved again"),
+        }
+        *current = now;
+    }
+}
+
+/// Why [`UserConfig::write_to_ops`] didn't write the file.
+enum SaveFailure {
+    /// The file couldn't be read at start.
+    NotRead(String),
+    /// Writing failed: the full error, and the system's words for it.
+    Failed { error: String, why: String },
 }
 
 /// A settings file `parse_settings` accepted.
@@ -1617,6 +1775,94 @@ mod tests {
             assert_eq!(serde_json::to_value(&loaded).unwrap(), serde_json::to_value(&expected).unwrap(), "{p:?}");
             assert!(notice.reset_kept_as.is_some(), "{p:?}");
         }
+    }
+
+    #[test]
+    fn a_failed_save_is_reported_until_a_save_succeeds() {
+        use crate::settings_file::tests::PowerCutDisk;
+        let file = PathBuf::from("/profile/StreamToSpeaker/config.json");
+        let disk = PowerCutDisk::default();
+        let c = numbered("x");
+        let health = c.save_health();
+        c.try_save_to_ops(&file, &PlatformCodec, &disk).unwrap();
+        assert_eq!(health.problem(), None);
+        // The disk goes away: every save fails, and the problem stays.
+        disk.cut_after(0);
+        assert!(c.try_save_to_ops(&file, &PlatformCodec, &disk).is_err());
+        c.clone().save_to_ops(&file, &PlatformCodec, &disk);
+        let problem = health.problem().unwrap();
+        assert!(matches!(problem, SaveProblem::Failed { .. }), "{problem:?}");
+        assert!(problem.describe().starts_with("Settings can't be saved, so changes made now will be lost"));
+        // It comes back: the next save clears it.
+        disk.cut_after(usize::MAX);
+        c.save_to_ops(&file, &PlatformCodec, &disk);
+        assert_eq!(health.problem(), None);
+    }
+
+    #[test]
+    fn settings_that_could_not_be_read_say_so_from_the_start() {
+        let c = UserConfig::unsaveable();
+        let problem = c.save_health().problem().unwrap();
+        assert!(matches!(problem, SaveProblem::NotRead { .. }));
+        assert!(problem.describe().contains("changes made now won't be kept"), "{}", problem.describe());
+        // Saves are refused, and the problem stays what it was.
+        assert!(c.try_save_to_with(&std::env::temp_dir().join("never-written.json"), &PlatformCodec).is_err());
+        assert_eq!(c.save_health().problem(), Some(problem));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = temp_config_dir("not-read-health");
+            let path = dir.join("config.json");
+            numbered("x").save_to(&path);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&path).is_err() {
+                let loaded = UserConfig::load_from(&path);
+                assert!(matches!(loaded.save_health().problem(), Some(SaveProblem::NotRead { .. })));
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn what_a_load_found_is_said_in_plain_words() {
+        let kept = |n: &str| Some(PathBuf::from("/profile/StreamToSpeaker").join(n));
+        assert_eq!(LoadNotice::default().describe(), None);
+        let restored = LoadNotice {
+            restored_from_backup: true,
+            unusable_kept_as: kept("config.json.corrupt-5"),
+            ..Default::default()
+        };
+        assert_eq!(
+            restored.describe().unwrap(),
+            "Your settings file was damaged, so the app used its backup copy instead. The damaged \
+             file is kept as config.json.corrupt-5 in the settings folder."
+        );
+        let missing = LoadNotice { restored_from_backup: true, ..Default::default() };
+        assert_eq!(
+            missing.describe().unwrap(),
+            "Your settings file was missing, so the app used its backup copy instead."
+        );
+        let all = LoadNotice { all_reset: true, unusable_kept_as: kept("config.json.corrupt-6"), ..Default::default() };
+        assert!(all.describe().unwrap().contains("started with default settings"));
+        assert!(all.describe().unwrap().ends_with("kept as config.json.corrupt-6 in the settings folder."));
+        let path = |p: &str| -> KeyPath { p.split('/').map(String::from).collect() };
+        let some = LoadNotice {
+            reset: vec![path("prefer_realtime_airplay"), path("speaker_settings/uuid:a/auto_connect")],
+            reset_kept_as: kept("config.json.before-reset-7"),
+            ..Default::default()
+        };
+        assert_eq!(
+            some.describe().unwrap(),
+            "Some settings couldn't be read and are back to their defaults: prefer_realtime_airplay, \
+             speaker_settings › uuid:a › auto_connect. The file as it was is kept as \
+             config.json.before-reset-7 in the settings folder."
+        );
+        let many = LoadNotice { reset: (0..6).map(|i| path(&format!("k{i}"))).collect(), ..Default::default() };
+        assert_eq!(
+            many.describe().unwrap(),
+            "Some settings couldn't be read and are back to their defaults: k0, k1, k2, k3, and 2 more."
+        );
     }
 
     #[test]

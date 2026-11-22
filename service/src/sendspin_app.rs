@@ -139,6 +139,13 @@ impl Drop for MaOutputSession {
     }
 }
 
+/// Every pairing in `c` with a Music Assistant server or a Sendspin
+/// speaker: its id and key.
+fn paired_ids(c: &SendspinConfig) -> Vec<(String, String)> {
+    let servers = c.server_pairings.iter().map(|r| (r.server_id.clone(), r.psk.clone()));
+    servers.chain(c.player_pairings.iter().map(|(id, p)| (id.clone(), p.psk.clone()))).collect()
+}
+
 /// Persistence through the app's `config.json` (weak: sessions must not
 /// keep the app alive).
 struct AppStore(Weak<App>);
@@ -154,8 +161,18 @@ impl SendspinStore for AppStore {
     fn update(&self, f: &mut dyn FnMut(&mut SendspinConfig) -> bool) {
         if let Some(app) = self.0.upgrade() {
             let mut uc = app.user_config.lock().unwrap();
-            if f(&mut uc.sendspin) {
-                uc.save();
+            let before = paired_ids(&uc.sendspin);
+            if f(&mut uc.sendspin) && uc.try_save().is_err() {
+                // A pairing made now that isn't kept has to be made again
+                // after a restart: say so where it was made.
+                let new = paired_ids(&uc.sendspin).into_iter().any(|id| !before.contains(&id));
+                drop(uc);
+                if new {
+                    app.record_error(
+                        "Paired, but the pairing can't be saved with the settings: you'll need to \
+                         pair again after the app restarts.",
+                    );
+                }
             }
         }
     }
@@ -845,5 +862,44 @@ mod tests {
     fn ids() {
         assert!(is_sendspin_id("sendspin:kitchen"));
         assert!(!is_sendspin_id("airplay:aa"));
+    }
+
+    #[test]
+    fn a_pairing_that_cannot_be_saved_says_so() {
+        use crate::sendspin::store::{PlayerPairing, ServerPairing};
+        use crate::user_config::UserConfig;
+        let app = App::with_settings(App::test_config(), UserConfig::unsaveable(), None, None);
+        let store = app.sendspin_store();
+        // A setting that isn't a pairing: the settings strip says enough.
+        store.update(&mut |c| {
+            c.pairing_code_failures += 1;
+            true
+        });
+        assert_eq!(app.current_error(), None);
+        // Music Assistant pairs, then a speaker does.
+        let server = ServerPairing {
+            server_id: "srv".into(),
+            psk: "a".repeat(43),
+            server_name: None,
+            last_used_unix: 1,
+        };
+        store.update(&mut |c| {
+            c.store_server_pairing(server.clone());
+            true
+        });
+        assert!(app.current_error().unwrap().contains("pair again after the app restarts"));
+        app.dismiss_error();
+        store.update(&mut |c| {
+            c.player_pairings.insert("p".into(), PlayerPairing { psk: "b".repeat(43), name: None, instance: None });
+            true
+        });
+        assert!(app.current_error().is_some());
+        // With settings that save, no message.
+        let fine = App::for_tests();
+        fine.sendspin_store().update(&mut |c| {
+            c.store_server_pairing(server.clone());
+            true
+        });
+        assert_eq!(fine.current_error(), None);
     }
 }

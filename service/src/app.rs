@@ -602,6 +602,11 @@ pub struct App {
     /// because saves happen lazily from any thread (GUI click,
     /// auto-reconnect bg thread, ...).
     pub user_config: Mutex<UserConfig>,
+    /// Whether settings saves reach `config.json` (shared with the settings).
+    settings_health: crate::user_config::SaveHealth,
+    /// What loading the settings found that the window says once, until
+    /// dismissed.
+    settings_notice: Mutex<Option<String>>,
 
     /// Most recent user-facing error message and when it was recorded.
     /// Surfaced by the GUI as a transient inline banner for ~8 s
@@ -963,6 +968,8 @@ impl App {
             last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
             last_rescan_count: Arc::new(AtomicUsize::new(0)),
             stream_gate,
+            settings_health: user_config.save_health(),
+            settings_notice: Mutex::new(user_config.load_notice().describe()),
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
@@ -1015,6 +1022,19 @@ impl App {
     /// Clear the current error (user dismissed the banner).
     pub fn dismiss_error(&self) {
         *self.last_error.lock().unwrap() = None;
+    }
+
+    /// What the window says about the settings: why they can't be saved,
+    /// for as long as that lasts, and what loading them found, until
+    /// dismissed.
+    pub fn settings_attention(&self) -> (Option<String>, Option<String>) {
+        let problem = self.settings_health.problem().map(|p| p.describe());
+        (problem, self.settings_notice.lock().unwrap().clone())
+    }
+
+    /// The person dismissed what loading the settings found.
+    pub fn dismiss_settings_notice(&self) {
+        *self.settings_notice.lock().unwrap() = None;
     }
 
     /// Drop a "Still connecting to …" notice once that connect has ended:
@@ -1296,7 +1316,13 @@ impl App {
         } else {
             uc.airplay_passwords.insert(id.to_string(), pw.to_string());
         }
-        uc.save();
+        if uc.try_save().is_err() && !pw.is_empty() {
+            drop(uc);
+            self.record_error(
+                "The password can't be saved with the settings, so you'll need to enter it again \
+                 after the app restarts.",
+            );
+        }
     }
 
     /// Whether a discovered device is password-protected (needs a
@@ -3075,7 +3101,12 @@ impl App {
 
                 match setup {
                     Ok(creds) => {
-                        app.store_airplay_pairing(&id, creds);
+                        if !app.store_airplay_pairing(&id, creds) {
+                            app.record_error(format!(
+                                "Paired with {name}, but the pairing can't be saved with the \
+                                 settings: the PIN will be asked for again after the app restarts."
+                            ));
+                        }
                         info!("AirPlay 2: paired {} — connecting", name);
                         // Release the ceremony slot BEFORE reconnecting —
                         // the select guard refuses selects for the pairing
@@ -3128,10 +3159,12 @@ impl App {
     }
 
     /// Persist HomeKit pairing credentials for a device id.
-    pub fn store_airplay_pairing(&self, id: &str, creds: PairingCredentials) {
+    /// Whether it was saved: a pairing that isn't needs the PIN again
+    /// after the app restarts.
+    pub fn store_airplay_pairing(&self, id: &str, creds: PairingCredentials) -> bool {
         let mut uc = self.user_config.lock().unwrap();
         uc.airplay_pairings.insert(id.to_string(), creds);
-        uc.save();
+        uc.try_save().is_ok()
     }
 
     /// Whether this PC has a stored PIN pairing with device `id`. The
@@ -7116,5 +7149,46 @@ mod tests {
         app.forget_airplay_pairing("airplay:DEN");
         assert!(!app.has_airplay_pairing("airplay:DEN"));
         assert!(app.has_airplay_pairing("airplay:LOFT"));
+    }
+
+    #[test]
+    fn settings_that_cannot_be_saved_are_said_so_until_a_save_works() {
+        let app = App::with_settings(App::test_config(), UserConfig::unsaveable(), None, None);
+        // From the start: the file couldn't be read, nothing will be kept.
+        let (problem, notice) = app.settings_attention();
+        assert!(problem.unwrap().contains("changes made now won't be kept"));
+        assert_eq!(notice, None);
+        // A password or a pairing made now says it won't be remembered.
+        app.set_airplay_password("airplay:aa", "hunter2");
+        assert!(app.current_error().unwrap().contains("password can't be saved"), "{:?}", app.current_error());
+        assert!(!app.store_airplay_pairing("airplay:cc", some_pairing("c")));
+        // Removing one is no news.
+        app.dismiss_error();
+        app.set_airplay_password("airplay:aa", "");
+        assert_eq!(app.current_error(), None);
+        // Settings that save: no strip, no message.
+        let fine = test_app();
+        fine.set_airplay_password("airplay:aa", "hunter2");
+        assert_eq!(fine.settings_attention(), (None, None));
+        assert_eq!(fine.current_error(), None);
+        assert!(fine.store_airplay_pairing("airplay:cc", some_pairing("c")));
+    }
+
+    #[test]
+    fn what_loading_the_settings_found_is_shown_until_dismissed() {
+        let dir = std::env::temp_dir().join(format!("sts-app-load-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"last_speaker_id":"x","prefer_realtime_airplay":"true"}"#).unwrap();
+        let app = App::with_settings(App::test_config(), UserConfig::load_from(&path), None, None);
+        let (problem, notice) = app.settings_attention();
+        assert_eq!(problem, None);
+        let notice = notice.unwrap();
+        assert!(notice.starts_with("Some settings couldn't be read and are back to their defaults: \
+             prefer_realtime_airplay."), "{notice}");
+        app.dismiss_settings_notice();
+        assert_eq!(app.settings_attention(), (None, None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

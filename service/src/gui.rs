@@ -902,6 +902,8 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
                 homepod_latency_draft: None,
+                airplay_latency_draft: None,
+                speaker_latency_draft: None,
                 diagnostics_open: false,
                 diagnostics_copied_at: None,
                 web_link_copied_at: None,
@@ -941,6 +943,11 @@ struct StreamToSpeakerApp {
     advanced_open: bool,
     /// HomePod delay while its slider is being dragged; saved on release.
     homepod_latency_draft: Option<i64>,
+    /// The AirPlay buffer slider's value while it is dragged: saved on
+    /// release, not on every frame of the drag.
+    airplay_latency_draft: Option<i64>,
+    /// The same for a speaker's own AirPlay buffer: its id and value.
+    speaker_latency_draft: Option<(String, i64)>,
     /// The Diagnostics card is expanded (its counters are only gathered
     /// while it is).
     diagnostics_open: bool,
@@ -1370,6 +1377,7 @@ impl eframe::App for StreamToSpeakerApp {
                             self.show_status_banner(ui, &p);
                             banner_bottom_px = ui.cursor().top();
                             self.show_error_banner(ui, &p);
+                            self.show_settings_banner(ui, &p);
                             // One ask at a time: an available update
                             // outranks the donation strip.
                             if !self.show_update_banner(ui, &p) {
@@ -2308,6 +2316,49 @@ impl StreamToSpeakerApp {
             });
     }
 
+    /// "Your settings need attention": why they can't be saved, for as
+    /// long as that lasts, and what loading them found, until dismissed.
+    /// The one place in the window for both.
+    fn show_settings_banner(&self, ui: &mut egui::Ui, p: &Palette) {
+        let (problem, notice) = self.app.settings_attention();
+        if problem.is_none() && notice.is_none() {
+            return;
+        }
+        let text = [problem.as_deref(), notice.as_deref()].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
+        let colour = if problem.is_some() { p.danger } else { p.warn };
+        ui.add_space(sp::XS);
+        egui::Frame::none()
+            .fill(p.card)
+            .stroke(egui::Stroke::new(1.0_f32, colour.gamma_multiply(0.6)))
+            .rounding(RADIUS_SURFACE)
+            .inner_margin(egui::Margin::symmetric(sp::M, sp::S))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⚠").color(colour).size(16.0).strong());
+                    ui.add_space(sp::XS);
+                    let (mut open, mut dismiss) = (false, false);
+                    let dismissable = notice.is_some();
+                    let buttons_w = 104.0 + if dismissable { 80.0 + sp::XS } else { 0.0 };
+                    notice_row(ui, egui::RichText::new(text).color(p.text_primary), buttons_w, |ui| {
+                        if dismissable {
+                            dismiss = link_button(ui, p, "Dismiss", 80.0).clicked();
+                        }
+                        open = secondary_button(ui, p, "Open folder", 104.0)
+                            .on_hover_text("Opens the folder that holds the settings in File Explorer.")
+                            .clicked();
+                    });
+                    if open {
+                        if let Some(dir) = crate::folders::settings_dir() {
+                            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                        }
+                    }
+                    if dismiss {
+                        self.app.dismiss_settings_notice();
+                    }
+                });
+            });
+    }
+
     /// What the mark should be reporting right now. The taskbar icon and
     /// the header mark both read this, so they cannot drift apart.
     fn icon_state(&self) -> IconState {
@@ -2849,9 +2900,15 @@ impl StreamToSpeakerApp {
                     }
                     match st.airplay_latency_ms {
                         Some(ms) => {
-                            let mut v = ms as i64;
+                            // Saved on release, like the app-wide buffer.
+                            let saved = i64::from(ms);
+                            let mut v = match &self.speaker_latency_draft {
+                                Some((id, draft)) if *id == sp.id => *draft,
+                                _ => saved,
+                            };
+                            let mut commit = false;
                             ui.horizontal(|ui| {
-                                advanced_slider_row(
+                                commit = advanced_slider_row_commit(
                                     ui,
                                     p,
                                     &mut v,
@@ -2861,7 +2918,10 @@ impl StreamToSpeakerApp {
                                     &format!("{} ms (the app setting)", global),
                                 );
                             });
-                            st.airplay_latency_ms = Some(v as u32);
+                            self.speaker_latency_draft = (!commit && v != saved).then(|| (sp.id.clone(), v));
+                            if commit {
+                                st.airplay_latency_ms = Some(u32::try_from(v).unwrap_or(ms));
+                            }
                         }
                         None => {
                             ui.label(
@@ -3386,8 +3446,9 @@ impl StreamToSpeakerApp {
                 use crate::user_config::{
                     AIRPLAY_LATENCY_MS_DEFAULT, AIRPLAY_LATENCY_MS_MAX, AIRPLAY_LATENCY_MS_MIN,
                 };
-                let mut lat_ms =
-                    self.app.user_config.lock().unwrap().effective_airplay_latency_ms() as i64;
+                let saved_ms = self.app.user_config.lock().unwrap().effective_airplay_latency_ms() as i64;
+                let mut lat_ms = self.airplay_latency_draft.unwrap_or(saved_ms);
+                let mut commit = false;
                 advanced_row(
                     ui,
                     p,
@@ -3395,7 +3456,7 @@ impl StreamToSpeakerApp {
                     "Lower = less delay, less margin for Wi-Fi hiccups. 2000 ms is what iTunes uses.",
                     "How much audio an AirPlay speaker holds before playing it. This is most of the delay you hear on AirPlay, so lowering it lowers the delay in step — but any Wi-Fi hiccup longer than the buffer becomes a dropout. A recent Apple TV copes with very small values on a good network; AirPort Express and most AirPlay speakers need roughly 100–350 ms, and a speaker that reports its own minimum is never driven below it. Applies to AirPlay 1 speakers and the AirPlay 2 realtime stream (HomePods use the HomePod delay setting instead); below 1000 ms an AirPlay 2 speaker is switched to the realtime stream automatically. Takes effect the next time you connect.",
                     |ui| {
-                        advanced_slider_row(
+                        commit = advanced_slider_row_commit(
                             ui,
                             p,
                             &mut lat_ms,
@@ -3406,9 +3467,11 @@ impl StreamToSpeakerApp {
                         )
                     },
                 );
-                let mut uc = self.app.user_config.lock().unwrap();
-                if uc.airplay_latency_ms != lat_ms as u32 {
-                    uc.airplay_latency_ms = lat_ms as u32;
+                // Save on release; hold the dragged value until then.
+                self.airplay_latency_draft = (!commit && lat_ms != saved_ms).then_some(lat_ms);
+                if commit && lat_ms != saved_ms {
+                    let mut uc = self.app.user_config.lock().unwrap();
+                    uc.airplay_latency_ms = u32::try_from(lat_ms).unwrap_or(AIRPLAY_LATENCY_MS_DEFAULT);
                     uc.save();
                 }
             }
