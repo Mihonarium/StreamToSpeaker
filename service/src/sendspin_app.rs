@@ -247,17 +247,20 @@ impl SendspinStore for AppStore {
         if let Some(app) = self.0.upgrade() {
             let mut uc = app.user_config.lock().unwrap();
             let before = paired_ids(&uc.sendspin);
-            if f(&mut uc.sendspin) && uc.try_save().is_err() {
-                // A pairing made now that isn't kept has to be made again
-                // after a restart: say so where it was made.
-                let new = paired_ids(&uc.sendspin).into_iter().any(|id| !before.contains(&id));
-                drop(uc);
-                if new {
-                    app.record_error(
-                        "Paired, but the pairing can't be saved with the settings: you'll need to \
-                         pair again after the app restarts.",
-                    );
-                }
+            if !f(&mut uc.sendspin) {
+                return;
+            }
+            uc.save();
+            let new = paired_ids(&uc.sendspin).into_iter().any(|id| !before.contains(&id));
+            // Written as the lock goes.
+            drop(uc);
+            // A pairing made now that isn't kept has to be made again after a
+            // restart: say so where it was made.
+            if new && app.settings_unsaved() {
+                app.record_error(
+                    "Paired, but the pairing can't be saved with the settings: you'll need to \
+                     pair again after the app restarts.",
+                );
             }
         }
     }

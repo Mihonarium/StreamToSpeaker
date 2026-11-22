@@ -601,7 +601,7 @@ pub struct App {
     /// `App::save_user_config` whenever it changes. Behind a Mutex
     /// because saves happen lazily from any thread (GUI click,
     /// auto-reconnect bg thread, ...).
-    pub user_config: Mutex<UserConfig>,
+    pub user_config: crate::user_config::SettingsCell,
     /// Whether settings saves reach `config.json` (shared with the settings).
     settings_health: crate::user_config::SaveHealth,
     /// What loading the settings found that the window says once, until
@@ -974,7 +974,7 @@ impl App {
             settings_health: user_config.save_health(),
             settings_notice: Mutex::new(user_config.load_notice().describe()),
             settings_retry_at: Mutex::new(None),
-            user_config: Mutex::new(user_config),
+            user_config: crate::user_config::SettingsCell::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
             connect_detail: Mutex::new(None),
@@ -1055,6 +1055,12 @@ impl App {
         }
         self.user_config.lock().unwrap().save();
         true
+    }
+
+    /// Whether settings saves aren't reaching `config.json` now (the last
+    /// one failed, or the file is left alone this run).
+    pub(crate) fn settings_unsaved(&self) -> bool {
+        self.settings_health.problem().is_some()
     }
 
     /// The person dismissed what loading the settings found.
@@ -1341,8 +1347,10 @@ impl App {
         } else {
             uc.airplay_passwords.insert(id.to_string(), pw.to_string());
         }
-        if uc.try_save().is_err() && !pw.is_empty() {
-            drop(uc);
+        uc.save();
+        // Written as the lock goes.
+        drop(uc);
+        if self.settings_unsaved() && !pw.is_empty() {
             self.record_error(
                 "The password can't be saved with the settings, so you'll need to enter it again \
                  after the app restarts.",
@@ -3187,9 +3195,12 @@ impl App {
     /// Whether it was saved: a pairing that isn't needs the PIN again
     /// after the app restarts.
     pub fn store_airplay_pairing(&self, id: &str, creds: PairingCredentials) -> bool {
-        let mut uc = self.user_config.lock().unwrap();
-        uc.airplay_pairings.insert(id.to_string(), creds);
-        uc.try_save().is_ok()
+        {
+            let mut uc = self.user_config.lock().unwrap();
+            uc.airplay_pairings.insert(id.to_string(), creds);
+            uc.save();
+        }
+        !self.settings_unsaved()
     }
 
     /// Whether this PC has a stored PIN pairing with device `id`. The

@@ -139,6 +139,10 @@ pub struct UserConfig {
     /// Whether saves reach the file (shared with every clone).
     #[serde(skip)]
     save_health: SaveHealth,
+    /// The order saves of these settings were prepared in (shared with
+    /// every clone), so the newest state wins.
+    #[serde(skip)]
+    write_order: WriteOrder,
     /// Forward Windows' "now playing" (title/artist/album from the System
     /// Media Transport Controls) to the speaker as track metadata, so it
     /// shows on the speaker's display / app. **Off by default** — it's a
@@ -643,9 +647,21 @@ impl UserConfig {
     /// failed config write should never block UI actions like speaker
     /// selection. An action that must not take effect unsaved uses
     /// [`try_save`](Self::try_save) instead.
+    ///
+    /// Made while this thread holds the app's settings lock
+    /// ([`SettingsCell`]), the save is written when that lock is
+    /// released, so no other thread waits for the disk.
     pub fn save(&self) {
         let Some(path) = self.file() else { return; };
-        self.save_to(&path);
+        match self.prepare(&path, &PlatformCodec, &Disk) {
+            Ok(Some(job)) => {
+                if let Some(job) = stage(job) {
+                    let _ = job.run(&Disk);
+                }
+            }
+            Ok(None) | Err(SaveFailure::NotRead(_)) => {}
+            Err(SaveFailure::Failed { problem, .. }) => self.save_health.set(Some(problem)),
+        }
     }
 
     /// Save, or say why `config.json` wasn't written.
@@ -717,31 +733,53 @@ impl UserConfig {
     }
 
     /// [`try_save_to_with`](Self::try_save_to_with) through `fs`, noting
-    /// the outcome in [`save_health`](Self::save_health).
+    /// the outcome in [`save_health`](Self::save_health). Written now,
+    /// whatever lock the caller holds.
     pub(crate) fn try_save_to_ops(
         &self,
         path: &std::path::Path,
         codec: &dyn SecretCodec,
         fs: &dyn FileOps,
     ) -> Result<(), String> {
-        let result = self.write_to_ops(path, codec, fs);
-        match &result {
-            Ok(()) => self.save_health.set(None),
-            Err(SaveFailure::NotRead(_)) => {}
-            Err(SaveFailure::Failed { problem, .. }) => self.save_health.set(Some(problem.clone())),
+        match self.prepare(path, codec, fs) {
+            Ok(Some(job)) => job.run(fs),
+            Ok(None) => Ok(()),
+            Err(SaveFailure::NotRead(e)) => Err(e),
+            Err(SaveFailure::Failed { error, problem }) => {
+                self.save_health.set(Some(problem));
+                Err(error)
+            }
         }
-        result.map_err(|e| match e {
-            SaveFailure::NotRead(e) => e,
-            SaveFailure::Failed { error, .. } => error,
-        })
     }
 
+    /// The bytes to write for these settings, sealed, as a [`SaveJob`]
+    /// ordered after every save prepared before it; `None` for test
+    /// settings kept in memory.
+    fn prepare(
+        &self,
+        path: &std::path::Path,
+        codec: &dyn SecretCodec,
+        fs: &dyn FileOps,
+    ) -> Result<Option<SaveJob>, SaveFailure> {
+        let Some(bytes) = self.write_to_ops(path, codec, fs)? else { return Ok(None) };
+        let generation = self.write_order.next();
+        Ok(Some(SaveJob {
+            order: self.write_order.clone(),
+            health: self.save_health.clone(),
+            path: path.to_path_buf(),
+            bytes,
+            generation,
+        }))
+    }
+
+    /// The sealed text to save at `path`; `None` for settings kept in
+    /// memory.
     fn write_to_ops(
         &self,
         path: &std::path::Path,
         codec: &dyn SecretCodec,
         fs: &dyn FileOps,
-    ) -> Result<(), SaveFailure> {
+    ) -> Result<Option<Vec<u8>>, SaveFailure> {
         match &self.saves {
             Saves::ToFile => {}
             Saves::KeepFile => {
@@ -751,7 +789,7 @@ impl UserConfig {
                 )));
             }
             #[cfg(test)]
-            Saves::InMemory => return Ok(()),
+            Saves::InMemory => return Ok(None),
             #[cfg(test)]
             Saves::AtPath(_) => {}
         }
@@ -759,7 +797,6 @@ impl UserConfig {
             error: format!("serialize: {e}"),
             problem: SaveProblem::Failed { why: e.to_string(), kind: FailKind::Other },
         };
-        let failed = |error: String, e: &std::io::Error| SaveFailure::Failed { error, problem: SaveProblem::failed(e) };
         let mut tree = serde_json::to_value(self).map_err(unwritable)?;
         if self.web_secret.is_none() {
             // The file may hold a key `--web-link` stored while these
@@ -775,11 +812,7 @@ impl UserConfig {
         }
         secret_store::seal(&mut tree, &self.locked_secrets, codec);
         let content = serde_json::to_string_pretty(&tree).map_err(unwritable)?;
-        settings_file::replace(fs, path, content.as_bytes()).map_err(|e| match e {
-            WriteError::Folder(e) => failed(format!("mkdir {}: {}", path.parent().unwrap_or(path).display(), e), &e),
-            WriteError::Write(e) => failed(format!("write beside {}: {}", path.display(), e), &e),
-            WriteError::Replace(e) => failed(format!("replace {}: {}", path.display(), e), &e),
-        })
+        Ok(Some(content.into_bytes()))
     }
 }
 
@@ -971,7 +1004,148 @@ impl SaveHealth {
     }
 }
 
-/// Why [`UserConfig::write_to_ops`] didn't write the file.
+/// The order of one settings file's saves: each save is numbered when its
+/// text is made (under the settings lock, so in the order of the changes),
+/// and one whose number is lower than a save already written is not
+/// written: the newest state wins.
+#[derive(Clone, Debug, Default)]
+struct WriteOrder(std::sync::Arc<std::sync::Mutex<Written>>);
+
+#[derive(Debug, Default)]
+struct Written {
+    /// The number the next save gets.
+    next: u64,
+    /// The newest save written (or tried), and its outcome.
+    last: Option<(u64, Result<(), String>)>,
+}
+
+impl WriteOrder {
+    fn next(&self) -> u64 {
+        let mut w = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        w.next += 1;
+        w.next
+    }
+}
+
+/// One save's text, to be written to `path`.
+struct SaveJob {
+    order: WriteOrder,
+    health: SaveHealth,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    generation: u64,
+}
+
+impl SaveJob {
+    /// Write it (see `settings_file`), unless a newer save of the same
+    /// settings was written meanwhile, and note the outcome. The writes of
+    /// one settings file take turns under their own lock, not the
+    /// settings lock.
+    fn run(self, fs: &dyn FileOps) -> Result<(), String> {
+        let mut written = self.order.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((newest, outcome)) = &written.last {
+            if *newest >= self.generation {
+                return outcome.clone();
+            }
+        }
+        let path = &self.path;
+        let outcome = settings_file::replace(fs, path, &self.bytes).map_err(|e| {
+            let (error, e) = match e {
+                WriteError::Folder(e) => (format!("mkdir {}: {}", path.parent().unwrap_or(path).display(), e), e),
+                WriteError::Write(e) => (format!("write beside {}: {}", path.display(), e), e),
+                WriteError::Replace(e) => (format!("replace {}: {}", path.display(), e), e),
+            };
+            (error, SaveProblem::failed(&e))
+        });
+        self.health.set(outcome.as_ref().err().map(|(_, problem)| problem.clone()));
+        let outcome = outcome.map_err(|(error, _)| error);
+        written.last = Some((self.generation, outcome.clone()));
+        outcome
+    }
+}
+
+thread_local! {
+    /// Saves made on this thread while it holds the settings lock, to be
+    /// written once it releases it; `None` while it doesn't hold it.
+    static STAGED: std::cell::RefCell<Option<Vec<SaveJob>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keep `job` for when this thread releases the settings lock; it back
+/// when this thread doesn't hold it.
+fn stage(job: SaveJob) -> Option<SaveJob> {
+    STAGED.with(|staged| match staged.borrow_mut().as_mut() {
+        Some(jobs) => {
+            jobs.push(job);
+            None
+        }
+        None => Some(job),
+    })
+}
+
+/// The app's settings behind their lock. A save made while the lock is
+/// held ([`UserConfig::save`]) is written when the lock is released,
+/// outside it: a thread that only reads a setting (a Music Assistant
+/// handshake, the web server) never waits for a flush to the disk, and of
+/// two saves the newer state is the one that stays on the disk.
+pub struct SettingsCell(std::sync::Mutex<UserConfig>);
+
+impl SettingsCell {
+    pub fn new(settings: UserConfig) -> Self {
+        Self(std::sync::Mutex::new(settings))
+    }
+
+    /// The settings, locked (as `Mutex::lock`).
+    pub fn lock(&self) -> std::sync::LockResult<SettingsGuard<'_>> {
+        let owns = STAGED.with(|staged| {
+            let mut staged = staged.borrow_mut();
+            let free = staged.is_none();
+            if free {
+                *staged = Some(Vec::new());
+            }
+            free
+        });
+        let wrap = |guard| SettingsGuard { guard: std::mem::ManuallyDrop::new(guard), owns };
+        match self.0.lock() {
+            Ok(guard) => Ok(wrap(guard)),
+            Err(poisoned) => Err(std::sync::PoisonError::new(wrap(poisoned.into_inner()))),
+        }
+    }
+}
+
+/// The locked settings; saves made through it are written when it drops,
+/// after the lock is released.
+pub struct SettingsGuard<'a> {
+    guard: std::mem::ManuallyDrop<std::sync::MutexGuard<'a, UserConfig>>,
+    /// Whether this guard writes this thread's staged saves.
+    owns: bool,
+}
+
+impl std::ops::Deref for SettingsGuard<'_> {
+    type Target = UserConfig;
+    fn deref(&self) -> &UserConfig {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for SettingsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut UserConfig {
+        &mut self.guard
+    }
+}
+
+impl Drop for SettingsGuard<'_> {
+    fn drop(&mut self) {
+        let staged = if self.owns { STAGED.with(|staged| staged.borrow_mut().take()) } else { None };
+        // SAFETY: the guard is dropped once, here, and not used after.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.guard) };
+        for job in staged.into_iter().flatten() {
+            let _ = job.run(&Disk);
+        }
+    }
+}
+
+/// Why [`UserConfig::write_to_ops`] made no text to write.
+#[derive(Debug)]
 enum SaveFailure {
     /// The file couldn't be read at start.
     NotRead(String),
@@ -1929,6 +2103,50 @@ mod tests {
         disk.cut_after(usize::MAX);
         c.save_to_ops(&file, &PlatformCodec, &disk);
         assert_eq!(health.problem(), None);
+    }
+
+    #[test]
+    fn a_save_under_the_settings_lock_is_written_once_the_lock_is_free() {
+        let dir = temp_config_dir("deferred-save");
+        let path = dir.join("config.json");
+        let cell = std::sync::Arc::new(SettingsCell::new(UserConfig::at_path(path.clone())));
+        {
+            let mut uc = cell.lock().unwrap();
+            uc.last_speaker_id = Some("first".into());
+            uc.save();
+            uc.last_speaker_id = Some("second".into());
+            uc.save();
+            assert!(!path.exists(), "nothing written while the lock is held");
+            // Another thread can read the settings meanwhile without waiting
+            // for this one's writes, and sees the lock held.
+            let other = cell.clone();
+            assert!(std::thread::spawn(move || other.0.try_lock().is_err()).join().unwrap());
+        }
+        // Written as the lock went: the newest state.
+        assert_eq!(UserConfig::load_from(&path).last_speaker_id.as_deref(), Some("second"));
+        assert!(cell.0.try_lock().is_ok());
+        // Without the lock, a save is written at once, as before.
+        let mut plain = UserConfig::at_path(path.clone());
+        plain.last_speaker_id = Some("third".into());
+        plain.save();
+        assert_eq!(UserConfig::load_from(&path).last_speaker_id.as_deref(), Some("third"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn of_two_saves_the_newer_state_stays_on_the_disk() {
+        use crate::settings_file::tests::PowerCutDisk;
+        let path = PathBuf::from("/profile/StreamToSpeaker/config.json");
+        let disk = PowerCutDisk::default();
+        let mut c = numbered("older");
+        let older = c.prepare(&path, &PlatformCodec, &disk).unwrap().unwrap();
+        c.last_speaker_id = Some("newer".into());
+        let newer = c.prepare(&path, &PlatformCodec, &disk).unwrap().unwrap();
+        // Written in the other order (two threads that let go of the lock
+        // in turn): the older one is not written over the newer.
+        newer.run(&disk).unwrap();
+        older.run(&disk).unwrap();
+        assert_eq!(UserConfig::load_with_ops(&path, &PlatformCodec, &disk).last_speaker_id.as_deref(), Some("newer"));
     }
 
     #[test]
