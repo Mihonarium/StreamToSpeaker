@@ -340,6 +340,11 @@ impl Offers {
         Offers { sonos, remembered, opening: plan.len(), asked: false, plan }
     }
 
+    /// Whether there is an offer number `i`, without asking anything.
+    pub fn has(&self, i: usize) -> bool {
+        if self.sonos { i < self.opening } else { i < MAX_ATTEMPTS }
+    }
+
     /// Offer number `i` (from 0) and why, or None past the last. `ask`
     /// gets the renderer's list; it is called at most once, the first
     /// time an offer depends on it.

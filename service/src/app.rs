@@ -597,6 +597,9 @@ pub struct App {
     /// blocking network I/O — pairing, SETUPs, fallbacks — so the GUI
     /// runs it on a worker thread and shows "Connecting…" off this.
     pub connecting: Mutex<Option<String>>,
+    /// What an in-flight UPnP connect is doing, for the banner's second
+    /// line (see [`ConnectStep::text`]); None for the usual line.
+    connect_detail: Mutex<Option<String>>,
 
     /// Counts selections through [`select_speaker_async`],
     /// [`select_speaker`] and a Sendspin pairing answer, the paths the
@@ -916,6 +919,7 @@ impl App {
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
+            connect_detail: Mutex::new(None),
             user_picks: AtomicU64::new(0),
             pin_ceremony: Mutex::new(None),
             sendspin: Default::default(),
@@ -1781,6 +1785,12 @@ impl App {
         self.connecting.lock().unwrap().clone()
     }
 
+    /// What the connect in flight is doing, when there is more to say
+    /// than that it is setting up the session.
+    pub fn connecting_detail(&self) -> Option<String> {
+        self.connect_detail.lock().unwrap().clone()
+    }
+
     /// Non-blocking [`select_speaker`]: runs the (seconds-long) session
     /// bring-up on a worker thread so the GUI stays responsive, exposing
     /// progress via [`connecting_to`] and failures via `record_error`.
@@ -2437,8 +2447,16 @@ impl App {
         let (stream_base, callback_url) = local_urls(local_ip, self.config.bind.port());
         let offer = self.stream_offer(&r, settings_id, stream_base);
         let (name, ip, peers) = (r.display_name(), r.ip, r.stream_peers());
-        let Started { session, remember } = start_session(r, &offer, &callback_url, Some(grant))
-            .map_err(|e| self.upnp_failure_message(&name, ip, &e.error, e.formats_tried))?;
+        struct ClearDetail<'a>(&'a Mutex<Option<String>>);
+        impl Drop for ClearDetail<'_> {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = None;
+            }
+        }
+        let _clear = ClearDetail(&self.connect_detail);
+        let progress = |step: ConnectStep| *self.connect_detail.lock().unwrap() = step.text();
+        let Started { session, remember } = start_session(r, &offer, &callback_url, Some(grant), &progress)
+            .map_err(|e| self.upnp_failure_message(&name, ip, &e))?;
         let mut settings = self.speaker_settings(settings_id);
         if settings.upnp_stream_profile != remember {
             settings.upnp_stream_profile = remember;
@@ -2454,7 +2472,7 @@ impl App {
     /// those are refused, the types it lists.
     fn stream_offer(&self, r: &Renderer, settings_id: &str, base_url: String) -> StreamOffer {
         let remembered = if r.is_sonos() { None } else { self.speaker_settings(settings_id).upnp_stream_profile };
-        StreamOffer { base_url, remembered, initial_buffer_ms: self.config.initial_buffer_ms }
+        StreamOffer { base_url, remembered, initial_buffer_ms: self.config.initial_buffer_ms, budget: CONNECT_BUDGET }
     }
 
     /// Log when `name` comes for the stream it was given at `given_at`,
@@ -2514,13 +2532,19 @@ impl App {
     }
 
     /// What the person is told when starting the UPnP speaker `name` at
-    /// `ip` failed with `e` after `formats_tried` stream profiles: the
-    /// app's own words for what the speaker said (see
-    /// [`upnp::ActionError::for_person`]).
-    fn upnp_failure_message(&self, name: &str, ip: IpAddr, e: &anyhow::Error, formats_tried: usize) -> String {
-        match e.downcast_ref::<upnp::ActionError>() {
-            Some(failure) => failure.for_person(name, self.has_airplay_entry_at(ip), formats_tried),
-            None => format!("{:#}", e),
+    /// `ip` failed with `e`: the app's own words for what the speaker said
+    /// (see [`upnp::ActionError::for_person`]), or that it was too slow.
+    fn upnp_failure_message(&self, name: &str, ip: IpAddr, e: &StartError) -> String {
+        if let Some(budget) = e.out_of_time {
+            return format!(
+                "{name} was too slow to answer, so Stream To Speaker stopped trying after {}. Try again in a \
+                 moment; if it keeps happening, restart {name}.",
+                upnp::seconds(budget)
+            );
+        }
+        match e.error.downcast_ref::<upnp::ActionError>() {
+            Some(failure) => failure.for_person(name, self.has_airplay_entry_at(ip), e.formats_tried),
+            None => format!("{:#}", e.error),
         }
     }
 
@@ -3907,21 +3931,126 @@ impl App {
 /// that is worth a warning.
 const FETCH_EXPECTED_WITHIN: Duration = Duration::from_secs(10);
 
+/// How long a connect may take: every offer, retry and question to the
+/// speaker together. Each action's own limit (30 s for SetAVTransportURI
+/// and Play) still applies; the budget only takes the smaller.
+const CONNECT_BUDGET: Duration = Duration::from_secs(45);
+
+/// Budget a new offer needs to start. A speaker that turns an offer down
+/// at once does so in well under a second, so this only stops an offer
+/// after slow ones: with less left, a speaker that answers in a few
+/// seconds per action would be cut off by the budget anyway, and the
+/// person would be told nothing new.
+const MIN_LEFT_FOR_OFFER: Duration = Duration::from_secs(10);
+
+/// Budget the second Play after a 701 needs: half a second's pause, then
+/// a Play that a renderer which has finished taking the URI answers at
+/// once.
+const MIN_LEFT_FOR_RETRY: Duration = Duration::from_secs(5);
+
+/// An action with less budget than this is not sent: no answer could
+/// arrive in time.
+const MIN_LEFT_FOR_ACTION: Duration = Duration::from_millis(500);
+
+/// How long the speaker may keep the person waiting before the banner
+/// says it is waiting for the speaker.
+const WAITING_NOTICE_AFTER: Duration = Duration::from_secs(3);
+
 /// What a renderer is offered: this PC's stream address on its network
 /// (`http://<ip>:<port>`), the stream profile it played last time, if
-/// any, and the metadata's buffer hint.
+/// any, the metadata's buffer hint, and how long the connect may take
+/// ([`CONNECT_BUDGET`] in the app).
 pub struct StreamOffer {
     pub base_url: String,
     pub remembered: Option<StreamProfile>,
     pub initial_buffer_ms: u32,
+    pub budget: Duration,
 }
 
 /// Why a renderer didn't start: its last answer, after this many stream
-/// profiles were offered.
+/// profiles were offered. `out_of_time`: the connect's budget (this long)
+/// ran out before the speaker had answered.
 #[derive(Debug)]
 pub struct StartError {
     pub error: anyhow::Error,
     pub formats_tried: usize,
+    pub out_of_time: Option<Duration>,
+}
+
+/// Where a connect is, for the banner: which offer (0 is the first), and
+/// whether it has been waiting more than [`WAITING_NOTICE_AFTER`] for the
+/// speaker's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectStep {
+    pub offer: usize,
+    pub waiting: bool,
+}
+
+impl ConnectStep {
+    /// The banner's line under "Connecting to …", or None for the usual
+    /// one.
+    pub fn text(self) -> Option<String> {
+        let way = if self.offer >= 2 { "a third way" } else { "another way" };
+        match (self.offer, self.waiting) {
+            (0, false) => None,
+            (0, true) => Some("Waiting for the speaker to answer…".into()),
+            (1, false) => Some("The speaker didn't take the stream. Offering it another way…".into()),
+            (_, false) => Some("The speaker didn't take that either. Offering the stream a third way…".into()),
+            (_, true) => Some(format!("Offering the stream {way}. Waiting for the speaker to answer…")),
+        }
+    }
+}
+
+/// The time a connect has left.
+struct Budget {
+    until: Instant,
+}
+
+impl Budget {
+    fn left(&self) -> Duration {
+        self.until.saturating_duration_since(Instant::now())
+    }
+
+    /// `own`, shortened to what is left; None when too little is left to
+    /// send the action at all.
+    fn limits(&self, own: &crate::device_http::Limits) -> Option<crate::device_http::Limits> {
+        let left = self.left();
+        (left >= MIN_LEFT_FOR_ACTION).then(|| own.within(left))
+    }
+}
+
+/// The connect's budget ran out before an action could be sent.
+#[derive(Debug)]
+struct OutOfTime(&'static str);
+
+impl std::fmt::Display for OutOfTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: no time left to send it", self.0)
+    }
+}
+
+impl std::error::Error for OutOfTime {}
+
+/// Run one action of a connect. If the speaker keeps it waiting longer
+/// than [`WAITING_NOTICE_AFTER`], `progress` hears so, and hears again
+/// once the answer is in.
+fn waiting_on<T>(progress: &(dyn Fn(ConnectStep) + Sync), offer: usize, action: impl FnOnce() -> T) -> T {
+    let (done, finished) = crossbeam_channel::bounded::<()>(0);
+    std::thread::scope(|scope| {
+        let watcher = std::thread::Builder::new().name("stream-to-speaker-connect-notice".into()).spawn_scoped(scope, move || {
+            let late = finished.recv_timeout(WAITING_NOTICE_AFTER) == Err(crossbeam_channel::RecvTimeoutError::Timeout);
+            if late {
+                progress(ConnectStep { offer, waiting: true });
+            }
+            late
+        });
+        let result = action();
+        drop(done);
+        if watcher.ok().and_then(|w| w.join().ok()).unwrap_or(false) {
+            progress(ConnectStep { offer, waiting: false });
+        }
+        result
+    })
 }
 
 /// A started session, and what the speaker's settings should remember
@@ -3973,19 +4102,21 @@ pub fn start_session(
     offer: &StreamOffer,
     callback_url: &str,
     stream_grant: Option<Grant>,
+    progress: &(dyn Fn(ConnectStep) + Sync),
 ) -> Result<Started, StartError> {
     let name = renderer.display_name();
     info!("targeting speaker: {} ({})", name, renderer.ip);
+    let budget = Budget { until: Instant::now() + offer.budget };
     let avt = renderer.av_transport_control_url.as_str();
-    let ask = || match &renderer.connection_manager_control_url {
-        Some(url) => match upnp::get_protocol_info(url, &upnp::PROTOCOL_LIST) {
+    let ask = || match (&renderer.connection_manager_control_url, budget.limits(&upnp::PROTOCOL_LIST)) {
+        (Some(url), Some(limits)) => match upnp::get_protocol_info(url, &limits) {
             Ok(list) => Sinks::Listed(list),
             Err(e) => {
                 debug!("UPnP: {}: no list of the types it plays: {:#}", name, e);
                 Sinks::Unknown
             }
         },
-        None => Sinks::Unknown,
+        _ => Sinks::Unknown,
     };
     let mut offers = stream_profile::Offers::new(renderer.is_sonos(), offer.remembered);
     let mut current = offers.get(0, &ask);
@@ -4002,15 +4133,19 @@ pub fn start_session(
         let didl = upnp::didl_lite_metadata(&uri, PRODUCT_NAME, offer.initial_buffer_ms, profile);
         // Stop first to clear any "Transport Locked" (Sonos 705)
         // carry-over, and what an offer before this one left.
-        let _ = upnp::stop(avt);
+        if let Some(limits) = budget.limits(&upnp::SHORT) {
+            let _ = waiting_on(progress, i, || upnp::stop_within(avt, &limits));
+        }
         std::thread::sleep(Duration::from_millis(100));
         let given_at = Instant::now();
         let mut at_play = false;
-        let started = upnp::set_av_transport_uri(avt, &uri, &didl, &upnp::TRANSPORT).and_then(|()| {
+        let started = (|| {
+            let limits = budget.limits(&upnp::TRANSPORT).ok_or(OutOfTime("SetAVTransportURI"))?;
+            waiting_on(progress, i, || upnp::set_av_transport_uri(avt, &uri, &didl, &limits))?;
             at_play = true;
             std::thread::sleep(Duration::from_millis(100));
-            play_taken_uri(avt)
-        });
+            play_taken_uri(avt, &budget, progress, i)
+        })();
         let e = match started {
             Ok(()) => {
                 info!("UPnP: {} took {}", name, profile);
@@ -4019,11 +4154,20 @@ pub fn start_session(
             }
             Err(e) => e,
         };
+        let out_of_time = (e.downcast_ref::<OutOfTime>().is_some()
+            || (budget.left() < MIN_LEFT_FOR_ACTION && no_answer_in_time(&e)))
+        .then_some(offer.budget);
         let verdict = verdict(&e, at_play);
         if profile == StreamProfile::Legacy && verdict == Verdict::Content {
             original_refused = true;
         }
-        let next = if verdict == Verdict::End { None } else { offers.get(i + 1, &ask) };
+        let moving_on = verdict != Verdict::End && offers.has(i + 1) && budget.left() >= MIN_LEFT_FOR_OFFER;
+        let next = if moving_on {
+            progress(ConnectStep { offer: i + 1, waiting: false });
+            waiting_on(progress, i + 1, || offers.get(i + 1, &ask))
+        } else {
+            None
+        };
         match next {
             Some((next, why)) => {
                 info!("UPnP: {} didn't take {}: {:#}; offering {}, because {}", name, profile, e, next, why);
@@ -4033,21 +4177,25 @@ pub fn start_session(
             None => {
                 // The renderer may hold our URI and still start on it:
                 // tell it to let go, so a failure reported here is not a
-                // speaker playing.
+                // speaker playing. Best-effort, with Stop's own limit:
+                // this is cleaning up, not a step of the connect.
                 if at_play {
                     let _ = upnp::stop(avt);
                 }
                 // The speaker's own answer, in full, for whoever reads the
                 // log.
                 warn!("UPnP: {} ({}): {:#}", name, renderer.ip, e);
-                return Err(StartError { error: e, formats_tried: i + 1 });
+                return Err(StartError { error: e, formats_tried: i + 1, out_of_time });
             }
         }
     }
     let Some((profile, stream_uri, stream_given_at)) = taken else {
-        return Err(StartError { error: anyhow!("no stream profile to offer"), formats_tried: 0 });
+        return Err(StartError { error: anyhow!("no stream profile to offer"), formats_tried: 0, out_of_time: None });
     };
 
+    // Volume events, with SUBSCRIBE's own limit: the speaker is playing,
+    // and a subscription cut short by the budget would leave the whole
+    // session without volume sync.
     let gena = GenaManager::new(callback_url.to_string());
     // Groups subscribe to GroupRenderingControl (GroupVolume events —
     // the group slider), standalone speakers to RenderingControl.
@@ -4076,16 +4224,26 @@ pub fn start_session(
 /// sent again.
 const PLAY_RETRY_WAIT: Duration = Duration::from_millis(500);
 
-/// Play, right after the renderer accepted our URI. A renderer still busy
-/// taking it answers 701 ("Transition not available"), so that answer gets
-/// Play once more after a moment.
-fn play_taken_uri(avt: &str) -> Result<()> {
-    let mut result = upnp::play_within(avt, &upnp::TRANSPORT);
-    if result.as_ref().err().and_then(upnp::fault_code) == Some(701) {
+/// Play, right after the renderer accepted our URI, within the connect's
+/// budget. A renderer still busy taking it answers 701 ("Transition not
+/// available"), so that answer gets Play once more after a moment, when
+/// the budget leaves room for it.
+fn play_taken_uri(avt: &str, budget: &Budget, progress: &(dyn Fn(ConnectStep) + Sync), offer: usize) -> Result<()> {
+    let limits = budget.limits(&upnp::TRANSPORT).ok_or(OutOfTime("Play"))?;
+    let mut result = waiting_on(progress, offer, || upnp::play_within(avt, &limits));
+    if result.as_ref().err().and_then(upnp::fault_code) == Some(701) && budget.left() >= MIN_LEFT_FOR_RETRY {
         std::thread::sleep(PLAY_RETRY_WAIT);
-        result = upnp::play_within(avt, &upnp::TRANSPORT);
+        if let Some(limits) = budget.limits(&upnp::TRANSPORT) {
+            result = waiting_on(progress, offer, || upnp::play_within(avt, &limits));
+        }
     }
     result
+}
+
+/// Whether `e` is an action the speaker didn't answer in time.
+fn no_answer_in_time(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<upnp::ActionError>()
+        .is_some_and(|a| matches!(a.failure, upnp::Failure::NoAnswer(crate::device_http::HttpError::NoAnswer(_))))
 }
 
 pub fn stop_session(session: &RendererSession) {
@@ -4353,9 +4511,102 @@ mod tests {
         }
     }
 
-    /// Nothing remembered.
+    /// Nothing remembered, the app's own budget.
     fn first_offer() -> StreamOffer {
-        StreamOffer { base_url: "http://127.0.0.1:1".into(), remembered: None, initial_buffer_ms: 0 }
+        StreamOffer { base_url: "http://127.0.0.1:1".into(), remembered: None, initial_buffer_ms: 0, budget: CONNECT_BUDGET }
+    }
+
+    /// A renderer (not a Sonos) whose every service is on `fake`.
+    fn renderer_on(fake: &crate::fake_renderer::FakeRenderer) -> Renderer {
+        Renderer { zone_group_topology_control_url: None, ..sonos_on(fake) }
+    }
+
+    /// Progress reports a connect made, in order.
+    fn steps_of(f: impl FnOnce(&(dyn Fn(ConnectStep) + Sync))) -> Vec<ConnectStep> {
+        let seen = Mutex::new(Vec::new());
+        f(&|step| seen.lock().unwrap().push(step));
+        seen.into_inner().unwrap()
+    }
+
+    #[test]
+    fn no_further_offer_starts_when_the_budget_is_nearly_spent() {
+        use crate::fake_renderer::{FakeRenderer, Reply, AV_TRANSPORT};
+        let fake = FakeRenderer::start(|req| match req.soap_action() {
+            Some("SetAVTransportURI") => Reply::soap_fault(714, "Illegal MIME-type"),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None => Reply::status(404, "Not Found", &[], ""),
+        });
+        // Less than an offer's worth of budget once the first is refused.
+        let offer = StreamOffer { budget: Duration::from_secs(5), ..first_offer() };
+        let e = start_session(renderer_on(&fake), &offer, "http://127.0.0.1:1/gena", None, &|_| {}).err().unwrap();
+        assert_eq!(e.formats_tried, 1);
+        assert_eq!(e.out_of_time, None);
+        assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI"]);
+    }
+
+    #[test]
+    fn a_speaker_that_never_answers_costs_no_more_than_the_budget() {
+        use crate::fake_renderer::{FakeRenderer, Reply, AV_TRANSPORT};
+        let fake = FakeRenderer::start(|req| match req.soap_action() {
+            Some("SetAVTransportURI") => Reply::silent(),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None => Reply::status(404, "Not Found", &[], ""),
+        });
+        let offer = StreamOffer { budget: Duration::from_millis(1500), ..first_offer() };
+        let start = Instant::now();
+        let e = start_session(renderer_on(&fake), &offer, "http://127.0.0.1:1/gena", None, &|_| {}).err().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(15), "{:?}", start.elapsed());
+        assert_eq!(e.out_of_time, Some(Duration::from_millis(1500)), "{:#}", e.error);
+        let app = test_app();
+        assert_eq!(
+            app.upnp_failure_message("Kitchen", "127.0.0.1".parse().unwrap(), &e),
+            "Kitchen was too slow to answer, so Stream To Speaker stopped trying after 1.5 seconds. Try again in a \
+             moment; if it keeps happening, restart Kitchen."
+        );
+    }
+
+    #[test]
+    fn a_slow_answer_and_another_offer_are_reported_as_they_happen() {
+        use crate::fake_renderer::{FakeRenderer, Reply, AV_TRANSPORT};
+        let sets = Mutex::new(0);
+        let fake = FakeRenderer::start(move |req| match req.soap_action() {
+            Some("SetAVTransportURI") => {
+                let mut n = sets.lock().unwrap();
+                *n += 1;
+                match *n {
+                    1 => Reply::soap_fault(714, "Illegal MIME-type"),
+                    // The second offer: answered late.
+                    _ => Reply::soap_ok(AV_TRANSPORT, "SetAVTransportURI", &[]).after(Duration::from_millis(3500)),
+                }
+            }
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None if req.method == "GET" => Reply::status(404, "Not Found", &[], ""),
+            None => Reply::raw("HTTP/1.1 200 OK\r\nSID: uuid:steps\r\nTIMEOUT: Second-1800\r\nContent-Length: 0\r\n\r\n"),
+        });
+        let steps = steps_of(|progress| {
+            let started = start_session(renderer_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None, progress).unwrap();
+            started.session.gena.unsubscribe();
+        });
+        crate::gena::registry().remove("uuid:steps");
+        assert_eq!(
+            steps,
+            [
+                ConnectStep { offer: 1, waiting: false },
+                ConnectStep { offer: 1, waiting: true },
+                ConnectStep { offer: 1, waiting: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_reads_as_what_is_happening() {
+        let text = |offer, waiting| ConnectStep { offer, waiting }.text();
+        assert_eq!(text(0, false), None);
+        assert_eq!(text(0, true).as_deref(), Some("Waiting for the speaker to answer…"));
+        assert_eq!(text(1, false).as_deref(), Some("The speaker didn't take the stream. Offering it another way…"));
+        assert_eq!(text(1, true).as_deref(), Some("Offering the stream another way. Waiting for the speaker to answer…"));
+        assert_eq!(text(2, false).as_deref(), Some("The speaker didn't take that either. Offering the stream a third way…"));
+        assert_eq!(text(2, true).as_deref(), Some("Offering the stream a third way. Waiting for the speaker to answer…"));
     }
 
     /// A renderer that answers each AVTransport action with `play`'s
@@ -4375,7 +4626,7 @@ mod tests {
     fn a_play_refused_after_the_uri_was_taken_is_followed_by_stop() {
         use crate::fake_renderer::Reply;
         let fake = renderer_answering_play(vec![Reply::soap_fault(704, "Playing failed")]);
-        let r = start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None);
+        let r = start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None, &|_| {});
         assert!(r.is_err());
         // The renderer holds our URI; it is told to let go of it.
         assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Stop"]);
@@ -4386,7 +4637,7 @@ mod tests {
         use crate::fake_renderer::Reply;
         // 701: the renderer is still busy taking the URI.
         let fake = renderer_answering_play(vec![Reply::soap_fault(701, "Transition not available")]);
-        let session = start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None)
+        let session = start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None, &|_| {})
             .expect("the second Play is accepted")
             .session;
         assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Play"]);
@@ -4398,7 +4649,7 @@ mod tests {
             Reply::soap_fault(701, "Transition not available"),
             Reply::soap_fault(701, "Transition not available"),
         ]);
-        assert!(start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None).is_err());
+        assert!(start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None, &|_| {}).is_err());
         assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Play", "Stop"]);
     }
 

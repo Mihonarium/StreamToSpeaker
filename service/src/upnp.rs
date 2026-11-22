@@ -409,7 +409,7 @@ impl ActionError {
                 "{speaker} can't be reached. Check that it's switched on and connected to the same network as this PC."
             ),
             Failure::NoAnswer(HttpError::NoAnswer(d)) => {
-                format!("{speaker} didn't answer within {} seconds. Try again in a moment.", d.as_secs_f32())
+                format!("{speaker} didn't answer within {}. Try again in a moment.", seconds(*d))
             }
             Failure::NoAnswer(HttpError::BadUrl(why)) => {
                 format!("{speaker} gave an address for its controls that Stream To Speaker can't use: {why}.")
@@ -439,6 +439,16 @@ impl ActionError {
                 format!("{what} ({speaker} answered: {answered}.)")
             }
         }
+    }
+}
+
+/// `d` for a message: "30 seconds", "1 second", "1.5 seconds".
+pub(crate) fn seconds(d: Duration) -> String {
+    let ms = d.as_millis();
+    match ms {
+        1000 => "1 second".to_string(),
+        _ if ms % 1000 == 0 => format!("{} seconds", ms / 1000),
+        _ => format!("{:.1} seconds", d.as_secs_f32()),
     }
 }
 
