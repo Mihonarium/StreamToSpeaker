@@ -1,6 +1,6 @@
-//! stream-to-speaker-bridge library crate.
+//! The `stream_to_speaker` library crate.
 //!
-//! The binary `stream-to-speaker-bridge` wires these modules together; the library
+//! The binary `stream-to-speaker` wires these modules together; the library
 //! split exists so unit tests can exercise individual pieces (the silence
 //! detector in particular) without booting the whole service.
 
@@ -49,6 +49,7 @@ pub mod gui;
 pub mod tray;
 #[cfg(windows)]
 pub mod endpoint_name;
+pub mod latest;
 
 /// Whether `url` is something we're willing to hand to the shell: an
 /// absolute http(s) URL made only of letters, digits and `-._~/:%[]@`.
@@ -156,17 +157,19 @@ mod url_tests {
 /// User-facing product name (shown in CLI help, web status page, etc).
 /// Internal Rust crate name stays `stream_to_speaker` for code stability.
 pub const PRODUCT_NAME: &str = "Stream To Speaker";
-/// Short slug used in user agents.
+/// Short slug used in the user agent sent to speakers (a manually added
+/// speaker's probe, the Sendspin client). A fixed token, not the release
+/// version: speakers have seen this one.
 pub const PRODUCT_UA: &str = "stream-to-speaker/0.1";
 
 /// Release version CI bakes in on tag builds (`STS_RELEASE_VERSION` = the
 /// git tag minus its `v`, see build.yml). Unset for local/dev builds.
 const RELEASE_VERSION_ENV: Option<&str> = option_env!("STS_RELEASE_VERSION");
 
-/// The release this exe was built for, or `None` for a dev build. NB the
-/// crate version (`CARGO_PKG_VERSION`) is *not* the release version — the
-/// two are versioned independently — so anything user-facing or
-/// comparable against GitHub must use this.
+/// The release this exe was built for, or `None` for a dev build. The crate
+/// version (`CARGO_PKG_VERSION`) tracks the release tag (a release bumps
+/// it, and CI stamps the tag into it on tag builds), but only a tag build
+/// is a release: anything compared against GitHub must use this.
 pub fn release_version() -> Option<&'static str> {
     RELEASE_VERSION_ENV.filter(|s| !s.trim().is_empty())
 }

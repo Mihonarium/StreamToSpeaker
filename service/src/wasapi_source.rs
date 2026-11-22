@@ -70,11 +70,14 @@ impl WasapiLoopbackSource {
         let shutdown_for_thread = shutdown.clone();
 
         // cpal::Stream is !Send. Build, hold, and drop it all on one
-        // dedicated thread.
+        // dedicated thread. The chunk sender goes to the stream's callback
+        // only: when cpal's capture ends (it stops on a device error, such
+        // as the device going away), the channel closes and `recv_packet`
+        // fails, so the audio loop opens the source again.
         let join = std::thread::Builder::new()
             .name("stream-to-speaker-wasapi-loopback".to_string())
             .spawn(move || {
-                let res = build_loopback_stream(device_name_owned.as_deref(), tx_chunk.clone());
+                let res = build_loopback_stream(device_name_owned.as_deref(), tx_chunk);
                 match res {
                     Ok((stream, src_rate, src_channels)) => {
                         if tx_ready.send(Ok((src_rate, src_channels))).is_err() {

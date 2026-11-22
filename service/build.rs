@@ -10,6 +10,10 @@ fn main() {
     // non-tag build is never reused with the old (empty) value.
     println!("cargo:rerun-if-env-changed=STS_RELEASE_VERSION");
 
+    // In a build script `cfg(windows)` is the machine doing the build, not
+    // the target: only a build on Windows embeds the icon. A Windows exe
+    // cross-built elsewhere (the checks run on Linux do that) gets none;
+    // releases are built on Windows.
     #[cfg(windows)]
     {
         const ICON: &str = "../assets/StreamToSpeaker.ico";

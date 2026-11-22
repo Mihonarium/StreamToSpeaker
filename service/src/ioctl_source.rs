@@ -238,7 +238,7 @@ impl IoctlAudioSource {
             // any pending GET_CONTROL_EVENT IRP.
             let event_handle = open_device_handle()
                 .context("opening StreamToSpeaker device (control events)")?;
-            spawn_control_event_thread(event_handle, tx, shutdown.clone());
+            spawn_control_event_thread(event_handle, tx, shutdown.clone())?;
         }
         // else: rx exists but no producer; events() returns an empty channel.
 
@@ -352,10 +352,9 @@ impl AudioSource for IoctlAudioSource {
         }
         // The driver completes pending audio IRPs with Information=0 when
         // the underlying KS stream goes to non-RUN (see IoctlOnStreamStop).
-        // Treat that as a "stream stopped" hint and return synthesized
-        // silence; the main loop will switch to its silence-injection
-        // mode (gated on the StreamStop control event) on the next
-        // iteration.
+        // Return that as a packet of silence marked silent: the audio loop
+        // takes it as "stream stopped" and sends paced silence until the
+        // next packet.
         if returned == 0 {
             return Ok(AudioPacket::silence(
                 crate::WIRE_SAMPLE_RATE as usize / 100, // 10 ms of silence
@@ -640,11 +639,12 @@ fn spawn_control_event_thread(
     handle: SharedHandle,
     tx: Sender<DriverEvent>,
     shutdown: Arc<AtomicBool>,
-) {
+) -> Result<()> {
     thread::Builder::new()
         .name("stream-to-speaker-control".to_string())
         .spawn(move || control_event_loop(handle, tx, shutdown))
-        .expect("spawning control-event thread");
+        .context("spawning the control-event thread")?;
+    Ok(())
 }
 
 fn control_event_loop(handle: SharedHandle, tx: Sender<DriverEvent>, shutdown: Arc<AtomicBool>) {

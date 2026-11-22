@@ -5,8 +5,8 @@
 //!     audio + control planes on background threads. Closing the window
 //!     minimises to tray; only "Quit" in the tray menu actually exits.
 //!   - Headless mode (`--headless`): traditional CLI service, no GUI, no
-//!     tray. Audio loop runs on the main thread. Use for service installs
-//!     or when running over SSH.
+//!     tray; the main thread waits for Ctrl+C while the same background
+//!     threads run. Use for service installs or when running over SSH.
 //!
 //! The web UI and its HTTP/JSON API (`/api/*`) are OFF by default — pass
 //! `--web` (or turn them on in the window). Both need the web UI's link,
@@ -46,7 +46,7 @@ use stream_to_speaker::http_server::{
 use stream_to_speaker::picker;
 use stream_to_speaker::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use stream_to_speaker::sine_source::SineSource;
-use stream_to_speaker::ssdp::{spawn_discovery, DiscoveryState, SearchScope};
+use stream_to_speaker::ssdp::DiscoveryState;
 use stream_to_speaker::{audio_loop, PRODUCT_NAME};
 #[cfg(windows)]
 use stream_to_speaker::wasapi_source::WasapiLoopbackSource;
@@ -71,7 +71,8 @@ enum SourceKind {
 #[command(
     name = "stream-to-speaker",
     version,
-    about = "Stream To Speaker — streams Windows audio to UPnP/OpenHome network speakers."
+    about = "Stream To Speaker — plays this PC's sound on network speakers: Sonos and other UPnP \
+             speakers, AirPlay and AirPlay 2, and Sendspin (Music Assistant)."
 )]
 struct Cli {
     /// Audio source.
@@ -88,12 +89,17 @@ struct Cli {
     #[arg(long)]
     device: Option<String>,
 
-    /// Speaker to send to: friendly name substring, IP, or omit to be
-    /// prompted (in a terminal) / pick the first one (non-interactive).
+    /// Speaker to play on, any kind: its address, its full name, or part of
+    /// a name (see --list-speakers). The app starts anyway. After the first
+    /// search (a few seconds) it takes the best match: the speaker at that
+    /// address, else the one with that full name, else a speaker shown in
+    /// the list whose name contains it; if none matches yet, the first that
+    /// does later. Without it, the speaker used last time; --headless in a
+    /// terminal asks instead.
     #[arg(long)]
     player: Option<String>,
 
-    /// Print discovered speakers and exit.
+    /// Search for speakers, print the ones found and exit.
     #[arg(long, default_value_t = false)]
     list_speakers: bool,
 
@@ -102,9 +108,9 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_interactive: bool,
 
-    /// Run in headless mode (no GUI window, no system tray). Audio loop
-    /// runs on the main thread, lifecycle is the same as before the GUI
-    /// was added.
+    /// Run without the window and the tray icon, as a service or in a
+    /// terminal (Ctrl+C quits). See --player, --web and --web-link for
+    /// choosing a speaker and controlling it.
     #[arg(long, default_value_t = false)]
     headless: bool,
 
@@ -133,12 +139,13 @@ struct Cli {
     #[arg(long, default_value_t = false, conflicts_with = "list_speakers")]
     web_link: bool,
 
-    /// Interval between SSDP re-discoveries (minutes).
+    /// Interval between SSDP re-discoveries (minutes; 0 counts as 1).
     #[arg(long, default_value_t = 5)]
     ssdp_interval: u64,
 
-    /// Initial buffer hint sent to the speaker in DIDL metadata (ms).
-    #[arg(long, default_value_t = 50)]
+    /// Accepted for old shortcuts and services; it has no effect (no
+    /// speaker is sent a prebuffer hint).
+    #[arg(long, default_value_t = 50, hide = true)]
     initial_buffer_ms: u32,
 
     /// Skip SSDP discovery; serve HTTP only.
@@ -177,15 +184,18 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
 
-    /// Local IP to give every speaker (stream URI, callbacks, AirPlay) and
-    /// to search for speakers from. Default: per speaker, the address this
-    /// PC uses to reach that speaker, and discovery on every interface.
+    /// Local IP to give every speaker (stream URI, callbacks, AirPlay), to
+    /// search for speakers from, and to put in the web UI's link. Default:
+    /// per speaker, the address this PC uses to reach that speaker;
+    /// discovery on every interface; in the link, the address worked out
+    /// when it is shown.
     #[arg(long)]
-    advertise_ip: Option<String>,
+    advertise_ip: Option<IpAddr>,
 
-    /// Log level: error, warn, info, debug, trace.
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Log level: error, warn, info, debug, trace. Default: info; warn for
+    /// --list-speakers and --web-link, which print what they are for.
+    #[arg(long)]
+    log_level: Option<String>,
 
     /// Silence-injection pacing (wall-clock ms per 10 ms silence packet).
     /// Default 10 = real-time; >10 drains the speaker's prebuffer.
@@ -202,12 +212,92 @@ struct Cli {
 }
 
 impl Cli {
+    /// Prints something and exits (`--list-speakers`, `--web-link`): not a
+    /// running copy of the app, so it neither hands over to one nor counts
+    /// as one.
+    fn one_shot(&self) -> bool {
+        self.list_speakers || self.web_link
+    }
+
     /// Runs as a console program: output and errors go to the terminal
     /// that started it (or wherever its caller redirected them), never to
-    /// a window. `--web-link` is one: it prints a link and exits.
+    /// a window.
     fn console(&self) -> bool {
-        self.headless || self.web_link
+        self.headless || self.one_shot()
     }
+}
+
+/// What parsing the command line produced instead of a command (help, the
+/// version, or a mistake), as the text a message box shows when there is no
+/// console to print it in.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn argument_message(e: &clap::Error) -> String {
+    let text = e.render().to_string();
+    if !e.use_stderr() {
+        // Help or the version.
+        return text;
+    }
+    format!(
+        "{} couldn't start: its command line has a mistake.\n\n{}\n\nCheck the shortcut or command that \
+         started it.",
+        PRODUCT_NAME,
+        text.trim_end()
+    )
+}
+
+/// Where a message from parsing the command line goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArgumentReport {
+    /// The console it was run from, or its redirected output.
+    Print,
+    /// A message box: a start from a shortcut or the sign-in entry.
+    Dialog,
+    /// Nowhere: a --headless start (a service, a scheduled task) with no
+    /// console, where a message box would wait on a desktop nobody sees.
+    Nowhere,
+}
+
+/// `headless`: the arguments asked for `--headless` (looked up in the raw
+/// arguments, since parsing failed); `can_print`: there is a console or a
+/// redirected output.
+fn argument_report(headless: bool, can_print: bool) -> ArgumentReport {
+    match (can_print, headless) {
+        (true, _) => ArgumentReport::Print,
+        (false, true) => ArgumentReport::Nowhere,
+        (false, false) => ArgumentReport::Dialog,
+    }
+}
+
+/// Whether the raw command line asks for `--headless`.
+fn asks_for_headless(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter().skip(1).take_while(|a| a != "--").any(|a| a == "--headless")
+}
+
+/// Show `e` where the person who ran the program sees it (see
+/// [`argument_report`]). Returns the exit code.
+fn report_arguments(e: &clap::Error) -> i32 {
+    #[cfg(windows)]
+    let can_print = attach_parent_console() || has_standard_output();
+    #[cfg(not(windows))]
+    let can_print = true;
+    match argument_report(asks_for_headless(std::env::args_os()), can_print) {
+        ArgumentReport::Print => {
+            let _ = e.print();
+        }
+        ArgumentReport::Dialog => {
+            let text = argument_message(e);
+            #[cfg(windows)]
+            if e.use_stderr() {
+                show_crash_dialog(&text);
+            } else {
+                show_info_dialog(&text);
+            }
+            #[cfg(not(windows))]
+            let _ = text;
+        }
+        ArgumentReport::Nowhere => {}
+    }
+    e.exit_code()
 }
 
 fn main() {
@@ -221,11 +311,18 @@ fn main() {
     // antivirus quarantine, missing dependency DLL, broken install).
     write_startup_tombstone();
 
-    let cli = Cli::parse();
+    // Help, the version and mistakes in the arguments are printed where
+    // the person will see them, before anything else runs.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => std::process::exit(report_arguments(&e)),
+    };
 
-    // Headless mode (and --web-link): try to attach to the parent terminal
-    // so the user sees the output. GUI mode: no console at all
-    // (windows_subsystem = "windows" already takes care of that).
+    // Console programs (--headless, --list-speakers, --web-link): attach to
+    // the parent terminal so the user sees the output. GUI mode: no console
+    // at all (windows_subsystem = "windows" already takes care of that):
+    // attached, it would also get the terminal's Ctrl+C and be closed with
+    // its window.
     #[cfg(windows)]
     if cli.console() {
         attach_parent_console();
@@ -273,6 +370,40 @@ fn main() {
         }
     }));
 
+    // Single-instance gate. If another instance is already running in
+    // this session, ask it to show its window and exit — same pattern as
+    // Slack / Discord / OBS. Without this, the duplicate launch races to
+    // bind port 5901, the HTTP bind fails with WSAEADDRINUSE, run()
+    // returns Err, the process exits silently — and the user sees the FIRST
+    // instance in task manager and assumes the new install "doesn't
+    // open". The hand-off goes through a named event the first instance
+    // listens on from here on, so it works before that instance has a
+    // window too; a copy that is quitting is waited for instead. Skipped in
+    // --headless: headless is for service / CLI runs where multiple
+    // invocations against the same port are the caller's problem. Skipped
+    // for --web-link and --list-speakers too (see below).
+    if !cli.console() {
+        match stream_to_speaker::single_instance::claim() {
+            stream_to_speaker::single_instance::Claim::First => {
+                // This copy is the one that writes the log from now on.
+                if let Some(path) = log_path() {
+                    LOG.set_aside_if_larger(&path, LOG_MAX_BYTES);
+                }
+            }
+            stream_to_speaker::single_instance::Claim::Another => {
+                info!("another instance is running; asked it to show its window, exiting");
+                return;
+            }
+            stream_to_speaker::single_instance::Claim::StillClosing => {
+                info!("the copy that is quitting hasn't ended yet; exiting");
+                if !cli.startup {
+                    show_info_dialog(stream_to_speaker::single_instance::STILL_CLOSING);
+                }
+                return;
+            }
+        }
+    }
+
     // Create the singleton mutex (one call, one process) AND get the
     // "was another instance already holding it?" signal in the same
     // round-trip — CreateMutexA reports both atomically via the
@@ -282,12 +413,13 @@ fn main() {
     // below, for FUTURE launches) keep seeing the kernel object.
     // The Global\ mutex is what the installer watches for a running copy;
     // its answer also covers a copy that never takes the per-session
-    // claim below: a --headless one, one in another session or account,
-    // or one running elevated. --web-link is not a running copy — it
-    // prints a link and exits, usually while the app runs — so it takes
+    // claim above: a --headless one, one in another session or account,
+    // or one running elevated. After the claim, so a copy that was quitting
+    // has let go of it. --web-link and --list-speakers are not a running
+    // copy — they print and exit, usually while the app runs — so they take
     // no part in either.
     #[cfg(windows)]
-    let (_mutex_handle, machine_lock) = if cli.web_link {
+    let (_mutex_handle, machine_lock) = if cli.one_shot() {
         (None, stream_to_speaker::single_instance::MachineLock::Unavailable)
     } else {
         create_singleton_mutex()
@@ -295,26 +427,9 @@ fn main() {
     #[cfg(not(windows))]
     let machine_lock = stream_to_speaker::single_instance::MachineLock::Created;
 
-    // Single-instance gate. If another instance is already running in
-    // this session, ask it to show its window and exit — same pattern as
-    // Slack / Discord / OBS. Without this, the duplicate launch races to
-    // bind port 5901, the HTTP bind fails with WSAEADDRINUSE, run()
-    // returns Err, the process exits silently — and the user sees the FIRST
-    // instance in task manager and assumes the new install "doesn't
-    // open". The hand-off goes through a named event the first instance
-    // listens on from here on, so it works before that instance has a
-    // window too. Skipped in --headless: headless is for service / CLI
-    // runs where multiple invocations against the same port are the
-    // caller's problem. Skipped for --web-link too (see above).
+    // Running, but not as a GUI in this session we could hand over to.
+    // Starting anyway would only fail to bind the stream port.
     if !cli.console() {
-        if let stream_to_speaker::single_instance::Claim::Another =
-            stream_to_speaker::single_instance::claim()
-        {
-            info!("another instance is running; asked it to show its window, exiting");
-            return;
-        }
-        // Running, but not as a GUI in this session we could hand over
-        // to. Starting anyway would only fail to bind the stream port.
         if let stream_to_speaker::single_instance::Launch::Exit { log, tell } =
             stream_to_speaker::single_instance::launch(machine_lock, cli.startup)
         {
@@ -349,6 +464,7 @@ fn main() {
 fn write_startup_tombstone() {
     if let Some(mut path) = stream_to_speaker::log_dir() {
         path.push("startup.txt");
+        set_aside_if_larger(&path, STARTUP_LOG_MAX_BYTES);
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -370,10 +486,22 @@ fn write_startup_tombstone() {
 }
 
 fn init_logging(cli: &Cli) {
+    let default = if cli.one_shot() { log::LevelFilter::Warn } else { log::LevelFilter::Info };
+    let level = cli.log_level.as_deref().and_then(|l| l.parse().ok()).unwrap_or(default);
     let mut builder = env_logger::Builder::from_default_env();
-    builder
-        .filter_level(cli.log_level.parse().unwrap_or(log::LevelFilter::Info))
-        .format_timestamp_millis();
+    // Log lines carry names devices gave themselves, and a console run
+    // writes them to a terminal: no control characters.
+    builder.filter_level(level).format(|buf, record| {
+        use std::io::Write as _;
+        writeln!(
+            buf,
+            "[{} {:<5} {}] {}",
+            buf.timestamp_millis(),
+            record.level(),
+            record.target(),
+            picker::printable_text(&record.args().to_string())
+        )
+    });
     // GUI mode has no console (windows_subsystem = "windows"), so
     // env_logger's default stderr target writes to a dead handle.
     // Pipe to %LOCALAPPDATA%\StreamToSpeaker\stream-to-speaker.log so
@@ -381,11 +509,55 @@ fn init_logging(cli: &Cli) {
     // Headless mode (and --web-link) keeps stderr so logs still appear in
     // the attached parent console.
     if !cli.console() {
-        if let Some(file) = open_log_file() {
-            builder.target(env_logger::Target::Pipe(Box::new(file)));
+        if let Some(file) = log_path().and_then(|p| open_log_at(&p)) {
+            *LOG.0.lock().unwrap() = Some(file);
+            builder.target(env_logger::Target::Pipe(Box::new(SharedLog)));
         }
     }
     builder.init();
+}
+
+/// The log file this process writes, shared with the logger so that the
+/// copy which becomes the session's instance can set a big log aside and
+/// go on in a fresh one.
+struct LogSlot(std::sync::Mutex<Option<std::fs::File>>);
+
+static LOG: LogSlot = LogSlot(std::sync::Mutex::new(None));
+
+impl LogSlot {
+    /// If the log at `path` is larger than `max_bytes`, move it aside to
+    /// `<path>.1` (replacing an older one) and write a fresh one from now on.
+    fn set_aside_if_larger(&self, path: &std::path::Path, max_bytes: u64) {
+        let mut file = self.0.lock().unwrap();
+        if std::fs::metadata(path).map_or(true, |m| m.len() <= max_bytes) {
+            return;
+        }
+        let mut aside = path.as_os_str().to_owned();
+        aside.push(".1");
+        if std::fs::rename(path, aside).is_ok() {
+            if let Some(fresh) = open_log_at(path) {
+                *file = Some(fresh);
+            }
+        }
+    }
+}
+
+/// The logger's end of [`LOG`].
+struct SharedLog;
+
+impl std::io::Write for SharedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match LOG.0.lock().unwrap().as_mut() {
+            Some(f) => f.write(buf),
+            None => Ok(buf.len()),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match LOG.0.lock().unwrap().as_mut() {
+            Some(f) => f.flush(),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Windows MessageBox for fatal-error visibility. No-op on non-Windows.
@@ -431,28 +603,55 @@ fn show_info_dialog(body: &str) {
 #[cfg(not(windows))]
 fn show_info_dialog(_body: &str) {}
 
-fn open_log_file() -> Option<std::fs::File> {
-    let mut path = stream_to_speaker::log_dir()?;
-    path.push("stream-to-speaker.log");
-    std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&path)
-        .ok()
+/// Largest the log file and `startup.txt` grow before the next start moves
+/// them aside (one older copy is kept, as `<name>.1`).
+const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const STARTUP_LOG_MAX_BYTES: u64 = 256 * 1024;
+
+/// Move `path` aside to `<path>.1` (replacing an older one) if it is
+/// larger than `max_bytes`, so a log written by every run doesn't grow
+/// without end.
+fn set_aside_if_larger(path: &std::path::Path, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    if meta.len() <= max_bytes {
+        return;
+    }
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(".1");
+    let _ = std::fs::rename(path, aside);
+}
+
+fn log_path() -> Option<std::path::PathBuf> {
+    Some(stream_to_speaker::log_dir()?.join("stream-to-speaker.log"))
+}
+
+/// Open the log at `path` for appending. Every launch does this, a second
+/// one too while the first runs: only the session's instance sets a big
+/// log aside (see [`LogSlot::set_aside_if_larger`]).
+fn open_log_at(path: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new().append(true).create(true).open(path).ok()
 }
 
 /// Attach this process to its parent's console, if launched from a
-/// terminal. If the parent had no console (double-click launch), this
-/// is a no-op and output silently goes nowhere — which is the right
-/// thing for service-style runs.
+/// terminal; whether it did. If the parent had no console (double-click
+/// launch), output goes nowhere unless it was redirected — which is the
+/// right thing for service-style runs.
 #[cfg(windows)]
-fn attach_parent_console() {
+fn attach_parent_console() -> bool {
     use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-    unsafe {
-        // Return value is ignored on purpose: failure (no parent
-        // console) just means we operate without one.
-        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-    }
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+}
+
+/// Whether this process was given somewhere to write (its output was
+/// redirected to a file or a pipe), console or not.
+#[cfg(windows)]
+fn has_standard_output() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+    [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].into_iter().any(|which| {
+        let h = unsafe { GetStdHandle(which) };
+        !h.is_null() && h != INVALID_HANDLE_VALUE
+    })
 }
 
 /// Open (or create) the named mutex the Inno Setup installer watches
@@ -499,7 +698,7 @@ fn run(cli: Cli) -> Result<()> {
 
     // Build the audio source up front so we fail fast if the driver is
     // missing under --source driver.
-    let source: Box<dyn AudioSource> = build_source(&cli)?;
+    let Source { audio: source, reopen: reopen_source, driver: uses_driver } = build_source(&cli)?;
     info!("audio source: {}", source.name());
 
     let app = setup_app(&cli)?;
@@ -517,7 +716,7 @@ fn run(cli: Cli) -> Result<()> {
     // flip the web UI on and off without re-binding the socket. The
     // initial state mirrors --web.
     let port_chosen = start_http(&app)?;
-    info!("stream URL: http://{}:{}/stream.raw", app.config.advertise_ip, port_chosen);
+    info!("stream server listening on port {}", port_chosen);
     match app.web_link() {
         // The link is the web UI's credential: printed once for a headless
         // run, which has no window to show it in, and never logged. A run
@@ -543,6 +742,14 @@ fn run(cli: Cli) -> Result<()> {
     #[cfg(windows)]
     spawn_driver_event_consumer(app.clone(), &cli);
 
+    // The driver's device in Windows' sound settings is named after the
+    // speaker being played on ("Stream To Speaker → Kitchen"), and only
+    // while it is.
+    #[cfg(windows)]
+    if uses_driver {
+        app.follow_endpoint_label(stream_to_speaker::endpoint_name::update_endpoint_name);
+    }
+
     // Auto-reconnect watchdog — replaces a dropped AirPlay session with a
     // fresh one so the UI never shows a zombie "streaming" state.
     app.spawn_reconnect_watchdog();
@@ -563,110 +770,126 @@ fn run(cli: Cli) -> Result<()> {
     app.set_rate_fudge_ppm(cli.rate_fudge_ppm);
     app.set_latency_adjust_step_frames(cli.latency_adjust_step_frames);
 
-    // Start the audio loop BEFORE we issue any UPnP Play. With the
-    // old order (Play → spawn audio thread) the speaker connected to
-    // /stream.raw before the audio loop was producing data — Sonos
-    // would receive an empty HTTP body, time out, and stay in a
-    // "I'm connected but not playing" state until the user hit
-    // Resync. Spawning audio first means silence injection is already
-    // running by the time we send Play, so the speaker gets a
-    // populated stream from byte zero.
+    // Start the audio loop before any speaker is told to play: from then
+    // on /stream.raw always carries data, Windows' sound or, while Windows
+    // plays nothing, silence in its place.
     let audio_app = app.clone();
     let _audio_thread = thread::Builder::new()
         .name("stream-to-speaker-audio".to_string())
         .spawn(move || {
-            if let Err(e) = audio_loop::run(audio_app.clone(), source) {
-                error!("audio loop exited with error: {:#}", e);
+            if let Err(e) = audio_loop::run(audio_app.clone(), source, reopen_source) {
+                error!("audio loop couldn't start: {:#}", e);
+                audio_app.record_error(format!(
+                    "Couldn't start reading this PC's sound ({:#}). Quit {} and start it again.",
+                    e, PRODUCT_NAME
+                ));
             }
         })
         .context("spawning audio thread")?;
 
-    // Resolve initial speaker.
+    // The first speaker: see `launch_choice`. With nobody to ask and
+    // nothing saved, none: the window's getting-started card asks the
+    // person, and their pick is saved for next time.
     //
-    // Priority chain:
-    //   1. `--player <hint>`  — explicit override, fuzzy match
-    //   2. interactive headless TTY — prompt the user
-    //   3. saved speaker id from user_config — auto-reconnect to the
-    //      one the user last explicitly picked
-    //   4. otherwise — DON'T auto-select. The GUI's onboarding card
-    //      kicks in so the user picks manually one time; their
-    //      choice gets persisted and step 3 takes over from then on.
-    //
-    // The old fallback ("first discovered") was the reason GUI users
-    // never got to see the onboarding card and ended up with a random
-    // speaker bound at launch.
     // A saved speaker added by address needs no discovery: connect in the
     // background (the window and tray come up meanwhile), with or without
     // --no-discovery.
-    let saved_manual = app
-        .saved_speaker_id()
-        .filter(|_| cli.player.is_none() && app.is_auto_reconnect_on_launch())
-        .filter(|id| app.find_manual_speaker(id).is_some())
-        .filter(|id| app.auto_connect_allowed_at_launch(id));
-    if let Some(id) = saved_manual {
+    let saved = app.saved_speaker_id();
+    let saved_needs_no_search = saved.as_deref().is_some_and(|id| {
+        app.find_manual_speaker(id).is_some()
+            && app.is_auto_reconnect_on_launch()
+            && app.auto_connect_allowed_at_launch(id)
+    });
+    let facts = LaunchFacts {
+        terminal: picker::is_interactive(),
+        saved: saved.as_deref(),
+        saved_needs_no_search,
+        manual_speakers: app.manual_speakers().len(),
+    };
+    let choice = launch_choice(&cli, facts);
+    let saved_manual = match &choice {
+        LaunchChoice::Saved(id) => Some(id.clone())
+            .filter(|_| app.is_auto_reconnect_on_launch())
+            .filter(|id| app.find_manual_speaker(id).is_some())
+            .filter(|id| app.auto_connect_allowed_at_launch(id)),
+        _ => None,
+    };
+    if let LaunchChoice::Wish(query) = &choice {
+        // In the background: the speaker may not be on the network yet.
+        app.connect_when_listed(query.clone());
+    } else if let Some(id) = saved_manual {
         info!("auto-reconnect: connecting to saved manual speaker {:?}", id);
         app.connect_in_background(&id);
+    } else if let LaunchChoice::Ask = choice {
+        match picker::interactive_pick(&app, saved.as_deref())? {
+            Some(id) => {
+                if let Err(e) = app.select_speaker(&id) {
+                    warn!("starting initial session failed: {}", e);
+                }
+            }
+            None => warn!("no speaker selected; pick one with the web UI / POST /api/select"),
+        }
     } else if !cli.no_discovery {
         let discovery = app.discovery.as_ref().unwrap();
         let mut pair_wait_started = false;
-        let initial = if cli.player.is_some() {
-            picker::resolve(discovery, cli.player.as_deref(), false)?
-        } else if !cli.no_interactive && cli.headless {
-            picker::resolve(discovery, None, true)?
-        } else if let Some(saved_id) = app.saved_speaker_id() {
-            if !app.is_auto_reconnect_on_launch() {
-                info!("auto-reconnect disabled by user preference; saved={:?}", saved_id);
-                None
-            } else if !app.auto_connect_allowed_at_launch(&saved_id) {
-                info!("auto-reconnect: {:?} is set to never auto-connect", saved_id);
-                None
-            } else {
-                info!("auto-reconnect: trying saved speaker {:?}", saved_id);
-                // Wait briefly for the first SSDP sweep to populate
-                // discovery before we look the saved id up.
-                picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
-                let found = discovery.find_by_id(&saved_id);
-                if found.is_none() {
-                    match discovery.identity_conflict(&saved_id) {
-                        Some(addrs) => warn!(
-                            "auto-reconnect skipped: different devices at {:?} all claim to be the saved \
-                             speaker {:?}; pick the right one by address",
-                            addrs, saved_id
-                        ),
-                        None if !saved_id.starts_with("airplay:") => {
-                            info!("auto-reconnect: saved speaker {:?} not found on the network", saved_id)
+        let initial = match choice {
+            LaunchChoice::Wish(_) | LaunchChoice::Ask => None,
+            LaunchChoice::Saved(saved_id) => {
+                if !app.is_auto_reconnect_on_launch() {
+                    info!("auto-reconnect disabled by user preference; saved={:?}", saved_id);
+                    None
+                } else if !app.auto_connect_allowed_at_launch(&saved_id) {
+                    info!("auto-reconnect: {:?} is set to never auto-connect", saved_id);
+                    None
+                } else {
+                    info!("auto-reconnect: trying saved speaker {:?}", saved_id);
+                    // Wait briefly for the first SSDP sweep to populate
+                    // discovery before we look the saved id up.
+                    picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
+                    let found = discovery.find_by_id(&saved_id);
+                    if found.is_none() {
+                        match discovery.identity_conflict(&saved_id) {
+                            Some(addrs) => warn!(
+                                "auto-reconnect skipped: different devices at {:?} all claim to be the saved \
+                                 speaker {:?}; pick the right one by address",
+                                addrs, saved_id
+                            ),
+                            None if !saved_id.starts_with("airplay:") => {
+                                info!("auto-reconnect: saved speaker {:?} not found on the network", saved_id)
+                            }
+                            None => {}
                         }
-                        None => {}
                     }
-                }
-                // A saved HomePod stereo pair (or one of its members): give
-                // both members time to resolve in the background, then play
-                // the pair — unless the user picked something meanwhile.
-                if found.is_none() && saved_id.starts_with("airplay:") {
-                    if let Some(ad) = app.airplay_discovery.clone() {
-                        let app = app.clone();
-                        pair_wait_started = std::thread::Builder::new()
-                            .name("stream-to-speaker-pair-reconnect".into())
-                            .spawn(move || {
-                                let Some(id) = ad.wait_for_pair(&saved_id, Duration::from_secs(15)) else {
-                                    return;
-                                };
-                                if app.session.lock().unwrap().is_some()
-                                    || app.connecting.lock().unwrap().is_some()
-                                {
-                                    return;
-                                }
-                                info!("auto-reconnect: stereo pair {:?}", id);
-                                app.select_speaker_async(&id);
-                            })
-                            .is_ok();
+                    // A saved HomePod stereo pair (or one of its members): give
+                    // both members time to resolve in the background, then play
+                    // the pair — unless the user picked something meanwhile.
+                    if found.is_none() && saved_id.starts_with("airplay:") {
+                        if let Some(ad) = app.airplay_discovery.clone() {
+                            let app = app.clone();
+                            pair_wait_started = std::thread::Builder::new()
+                                .name("stream-to-speaker-pair-reconnect".into())
+                                .spawn(move || {
+                                    let Some(id) = ad.wait_for_pair(&saved_id, Duration::from_secs(15)) else {
+                                        return;
+                                    };
+                                    if app.session.lock().unwrap().is_some()
+                                        || app.connecting.lock().unwrap().is_some()
+                                    {
+                                        return;
+                                    }
+                                    info!("auto-reconnect: stereo pair {:?}", id);
+                                    app.select_speaker_async(&id);
+                                })
+                                .is_ok();
+                        }
                     }
+                    found
                 }
-                found
             }
-        } else {
-            info!("first launch (no saved speaker) — waiting for manual pick");
-            None
+            LaunchChoice::Nothing => {
+                info!("first launch (no saved speaker) — waiting for manual pick");
+                None
+            }
         };
         if let Some(r) = initial {
             let id = r.stable_id();
@@ -683,13 +906,25 @@ fn run(cli: Cli) -> Result<()> {
     // Speakers set to connect automatically whenever they appear.
     app.spawn_auto_connect();
 
-    if cli.headless {
+    let ran = if cli.headless {
         run_headless(app)
     } else {
         // Keep an existing sign-in entry pointing at this exe.
         stream_to_speaker::autostart::reapply();
+        // From the moment Quit is chosen, a new launch waits for this copy
+        // to end instead of handing over to it: it is about to have no
+        // window to show.
+        app.on_quit(stream_to_speaker::single_instance::announce_closing);
         run_gui_mode(app, cli.no_tray, cli.startup && !cli.no_tray)
+    };
+    // Nothing plays on a speaker any more: the device's plain name.
+    #[cfg(windows)]
+    if uses_driver {
+        stream_to_speaker::endpoint_name::update_endpoint_name_within(None, Duration::from_secs(1));
     }
+    #[cfg(not(windows))]
+    let _ = uses_driver;
+    ran
 }
 
 // -----------------------------------------------------------------------------
@@ -701,7 +936,7 @@ fn run_headless(app: Arc<App>) -> Result<()> {
     while !app.is_shutting_down() {
         std::thread::sleep(Duration::from_millis(200));
     }
-    shutdown_cleanup(&app);
+    app.shut_down();
     Ok(())
 }
 
@@ -724,14 +959,12 @@ fn run_gui_mode(app: Arc<App>, no_tray: bool, start_hidden: bool) -> Result<()> 
         ));
     }
 
-    // Tell the audio loop to stop. We deliberately do NOT join() it:
-    // it's blocked inside the kernel IOCTL (recv_packet) waiting for
-    // the next audio packet, and joining would hang until the next
-    // packet arrives — which on a paused / idle Sonos can be forever.
-    // Process termination kills the thread cleanly; the kernel handle
-    // is RAII-dropped via the SharedHandle Arc on exit.
+    // Tell the audio loop to stop. Its reader thread is deliberately not
+    // joined: it waits inside the driver's read for the next packet,
+    // which while Windows plays nothing never comes. Process exit ends
+    // it, and Windows closes its handle.
     app.request_shutdown();
-    shutdown_cleanup(&app);
+    app.shut_down();
     Ok(())
 }
 
@@ -740,19 +973,19 @@ fn run_gui_mode(_app: Arc<App>, _no_tray: bool, _start_hidden: bool) -> Result<(
     anyhow::bail!("GUI mode is Windows-only — pass --headless on this platform")
 }
 
-fn shutdown_cleanup(app: &Arc<App>) {
-    app.stop_sendspin();
-    info!("shutdown: tearing down active session");
-    let final_session = app.session.lock().unwrap().take();
-    if let Some(s) = final_session {
-        s.stop();
-    }
-    info!("shutdown: complete");
-}
-
 // -----------------------------------------------------------------------------
 // Setup helpers
 // -----------------------------------------------------------------------------
+
+/// Time between the periodic UPnP searches. 0 used to mean searching
+/// without a pause (and none at all while the chosen adapter was away), so
+/// it counts as 1 minute.
+fn search_interval(cli: &Cli) -> Duration {
+    if cli.ssdp_interval == 0 {
+        warn!("--ssdp-interval 0 would search without a pause; searching every minute instead");
+    }
+    Duration::from_secs(cli.ssdp_interval.max(1).saturating_mul(60))
+}
 
 fn setup_app(cli: &Cli) -> Result<Arc<App>> {
     let bind_addr: IpAddr = cli
@@ -761,12 +994,10 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         .with_context(|| format!("parsing --bind {}", cli.bind))?;
     let bind_socket = SocketAddr::new(bind_addr, cli.port);
 
-    let advertise_ip = advertise_ip_for(cli)?;
-
     let ssdp_iface = if cli.no_discovery {
         None
     } else {
-        stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind)
+        stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip, &cli.bind)
     };
 
     // The browsers are started by the app once its saved settings (the
@@ -775,8 +1006,7 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
     let airplay_discovery = (!cli.no_airplay).then(AirPlayDiscoveryState::new);
 
     let config = AppConfig {
-        advertise_ip,
-        advertise_ip_explicit: cli.advertise_ip.is_some(),
+        advertise_ip: cli.advertise_ip,
         bind: bind_socket,
         initial_buffer_ms: cli.initial_buffer_ms,
         silence_packets_threshold: cli.silence_packets_threshold,
@@ -787,24 +1017,8 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
     };
 
     let app = App::new(config, discovery, airplay_discovery);
-    app.start_discovery(Duration::from_secs(cli.ssdp_interval * 60));
+    app.start_discovery(search_interval(cli));
     Ok(app)
-}
-
-/// The address a run with these flags names this PC by in the window, the
-/// log and the web UI's link: `--advertise-ip`, else the default route's
-/// address, else (an offline LAN) any local IPv4. Only that default: each
-/// speaker gets the address on its own network.
-fn advertise_ip_for(cli: &Cli) -> Result<String> {
-    match cli.advertise_ip.as_deref() {
-        Some(ip) => Ok(ip.to_string()),
-        None => stream_to_speaker::app::default_advertise_ip().or_else(|e| {
-            stream_to_speaker::ssdp::local_ipv4_interfaces()
-                .first()
-                .map(|ip| ip.to_string())
-                .ok_or(e)
-        }),
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -849,7 +1063,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
     };
     let speaker_select: SpeakerSelectCallback = {
         let app2 = app.clone();
-        Arc::new(move |id: &str| app2.select_speaker(id))
+        Arc::new(move |id: &str| app2.select_speaker_from_remote(id))
             as Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>
     };
     let resync: ResyncCallback = {
@@ -877,7 +1091,9 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         latency_adjust: Some(latency_adjust),
         web_access: Some(app.web_access.clone()),
         stream_client_allowed: Some(stream_client_allowed),
-        extra_hosts: vec![app.config.advertise_ip.clone()],
+        // Host names besides this PC's own addresses, which are always
+        // accepted: an --advertise-ip that names a proxy in front of it.
+        extra_hosts: app.config.advertise_ip.iter().map(|ip| ip.to_string()).collect(),
         speaker_peer: Some({
             let app2 = app.clone();
             Arc::new(move |ip| app2.is_speaker_peer(ip))
@@ -890,24 +1106,26 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
 // -----------------------------------------------------------------------------
 
 fn cmd_list_speakers(cli: &Cli) -> Result<()> {
+    use std::io::Write as _;
     if cli.no_discovery {
-        return Err(anyhow!("--list-speakers and --no-discovery are mutually exclusive"));
+        return Err(anyhow!("--list-speakers searches for speakers: leave out --no-discovery"));
     }
-    let state = DiscoveryState::new();
-    let ssdp_iface = stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind);
-    let scope = match ssdp_iface {
-        Some(ip) => SearchScope::Iface(ip),
-        None => SearchScope::All,
-    };
-    spawn_discovery(
-        state.clone(),
-        Duration::from_secs(cli.ssdp_interval * 60),
-        Arc::new(move || scope),
-    );
-    let renderers = picker::wait_for_first_discovery(&state, Duration::from_secs(5));
-    let n = picker::print_speaker_list(&renderers);
-    if n == 0 {
-        eprintln!("(no speakers found within 5s — check that SSDP isn't blocked)");
+    // The same discovery a run with these flags and settings has, without
+    // the stream server or the audio: another copy may be running.
+    let app = setup_app(cli)?;
+    if !cli.no_sendspin {
+        app.browse_sendspin_speakers();
+    }
+    picker::search_and_wait(&app, picker::SEARCH_WAIT);
+    let speakers = app.speaker_view_opts(true).speakers;
+    picker::write_speaker_list(&mut std::io::stdout(), &speakers, app.saved_speaker_id().as_deref());
+    if speakers.is_empty() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "No speakers found. Check that this PC is on the same network as the speakers, and that \
+             the firewall lets {} search it.",
+            PRODUCT_NAME
+        );
     }
     Ok(())
 }
@@ -919,13 +1137,24 @@ fn cmd_list_speakers(cli: &Cli) -> Result<()> {
 /// Print the web UI's link and exit. The key comes from the settings of
 /// the account this runs as (made and saved there if there is none yet),
 /// so it must be the account the app runs under; the address and port are
-/// worked out as a run with the same flags does. The link is the web UI's
-/// credential: it goes to standard output only, never to the log.
+/// worked out as a run with the same flags does before it has a speaker.
+/// The link is the web UI's credential: it goes to standard output only,
+/// never to the log.
 fn cmd_web_link(cli: &Cli) -> Result<()> {
     use std::io::Write as _;
+    use stream_to_speaker::app;
     use stream_to_speaker::user_config::UserConfig;
+    let bind: IpAddr = cli.bind.parse().with_context(|| format!("parsing --bind {}", cli.bind))?;
+    let host = app::this_pc_address_from(
+        cli.advertise_ip,
+        bind,
+        None,
+        || None,
+        app::default_route_ip,
+        app::first_local_ipv4,
+    );
     let link = stream_to_speaker::web_access::link_from_settings(
-        &advertise_ip_for(cli)?,
+        &host.to_string(),
         cli.port,
         UserConfig::load,
         UserConfig::save,
@@ -937,20 +1166,54 @@ fn cmd_web_link(cli: &Cli) -> Result<()> {
         "Anyone with this link can control {} on this network.",
         PRODUCT_NAME
     );
+    if let Some(note) = web_link_note(host, cli.advertise_ip, bind) {
+        let _ = writeln!(std::io::stderr(), "{note}");
+    }
     Ok(())
+}
+
+/// What to add when the link printed for `host` works on this PC only.
+fn web_link_note(host: IpAddr, explicit: Option<IpAddr>, bind: IpAddr) -> Option<&'static str> {
+    if !host.is_loopback() {
+        return None;
+    }
+    if explicit.is_none() && bind.is_unspecified() {
+        Some("This link works on this PC only: it has no network connection yet. Run --web-link again once it has.")
+    } else {
+        Some("This link works on this PC only.")
+    }
 }
 
 // -----------------------------------------------------------------------------
 // Source selection
 // -----------------------------------------------------------------------------
 
-fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
+/// The audio source a run reads.
+struct Source {
+    audio: Box<dyn AudioSource>,
+    /// How to open the same kind again if it fails while the app runs (the
+    /// audio loop does that).
+    reopen: audio_loop::Reopen,
+    /// It is the Stream To Speaker driver.
+    driver: bool,
+}
+
+impl Source {
+    fn new(audio: Box<dyn AudioSource>, reopen: audio_loop::Reopen, driver: bool) -> Self {
+        Self { audio, reopen, driver }
+    }
+}
+
+/// The audio source the flags ask for. Under `auto`, reopening keeps to the
+/// kind found at start: a driver that goes away during a driver update is
+/// waited for, not swapped for WASAPI.
+fn build_source(cli: &Cli) -> Result<Source> {
     match cli.source {
-        SourceKind::Sine => Ok(Box::new(SineSource::new())),
+        SourceKind::Sine => Ok(Source::new(open_sine()?, Box::new(open_sine), false)),
         SourceKind::WasapiLoopback => {
             #[cfg(windows)]
             {
-                Ok(Box::new(WasapiLoopbackSource::new(cli.device.as_deref())?))
+                Ok(Source::new(open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone()), false))
             }
             #[cfg(not(windows))]
             {
@@ -960,10 +1223,9 @@ fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
         SourceKind::Driver => {
             #[cfg(windows)]
             {
-                use stream_to_speaker::ioctl_source::IoctlAudioSource;
-                let src = IoctlAudioSource::open_audio_only()
+                let src = open_driver()
                     .context("opening Stream-To-Speaker kernel driver (--source driver was specified)")?;
-                Ok(Box::new(src))
+                Ok(Source::new(src, Box::new(open_driver), true))
             }
             #[cfg(not(windows))]
             {
@@ -973,22 +1235,40 @@ fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
         SourceKind::Auto => {
             #[cfg(windows)]
             {
-                use stream_to_speaker::ioctl_source::IoctlAudioSource;
-                match IoctlAudioSource::open_audio_only() {
-                    Ok(s) => Ok(Box::new(s)),
+                match open_driver() {
+                    Ok(s) => Ok(Source::new(s, Box::new(open_driver), true)),
                     Err(e) => {
                         info!("driver not present, falling back to WASAPI loopback: {}", e);
-                        Ok(Box::new(WasapiLoopbackSource::new(cli.device.as_deref())?))
+                        Ok(Source::new(open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone()), false))
                     }
                 }
             }
             #[cfg(not(windows))]
             {
                 warn!("non-Windows host; using sine source for --source auto");
-                Ok(Box::new(SineSource::new()))
+                Ok(Source::new(open_sine()?, Box::new(open_sine), false))
             }
         }
     }
+}
+
+fn open_sine() -> Result<Box<dyn AudioSource>> {
+    Ok(Box::new(SineSource::new()))
+}
+
+#[cfg(windows)]
+fn open_driver() -> Result<Box<dyn AudioSource>> {
+    Ok(Box::new(stream_to_speaker::ioctl_source::IoctlAudioSource::open_audio_only()?))
+}
+
+#[cfg(windows)]
+fn open_wasapi(device: Option<&str>) -> Result<Box<dyn AudioSource>> {
+    Ok(Box::new(WasapiLoopbackSource::new(device)?))
+}
+
+#[cfg(windows)]
+fn reopen_wasapi(device: Option<String>) -> audio_loop::Reopen {
+    Box::new(move || open_wasapi(device.as_deref()))
 }
 
 // -----------------------------------------------------------------------------
@@ -1000,68 +1280,98 @@ fn spawn_driver_event_consumer(app: Arc<App>, cli: &Cli) {
     if cli.source == SourceKind::WasapiLoopback || cli.source == SourceKind::Sine {
         return;
     }
-    use stream_to_speaker::ioctl_source::{DriverEvent, IoctlAudioSource};
-    use stream_to_speaker::volume_sync::SpeakerCommand;
+    use stream_to_speaker::ioctl_source::IoctlAudioSource;
     thread::Builder::new()
         .name("stream-to-speaker-driver-events".to_string())
         .spawn(move || {
-            let src = match IoctlAudioSource::open() {
+            // The first open says whether there is a driver at all (`auto`
+            // runs on WASAPI without one). Once open, a consumer that ends
+            // (the device was disabled, removed or updated) is opened
+            // again, as the audio source is. One consumer at a time: two
+            // would split the driver's single event stream between them.
+            let mut src = match IoctlAudioSource::open() {
                 Ok(s) => s,
                 Err(e) => {
                     warn!("driver-event consumer: open failed: {}", e);
                     return;
                 }
             };
-            let rx = src.events();
-            while let Ok(ev) = rx.recv() {
+            let mut attempts = 0;
+            loop {
+                if consume_driver_events(&app, &src) > 0 {
+                    attempts = 0;
+                }
                 if app.is_shutting_down() {
                     return;
                 }
-                match ev {
-                    DriverEvent::VolumeChanged { level_millibels } => {
-                        // Windows maps our hardware volume node's slider
-                        // linearly across its dB range, so convert the dB
-                        // back to a percent linearly to track it 1:1.
-                        let level = stream_to_speaker::volume_sync::millibels_to_sonos(
-                            level_millibels,
-                        );
-                        if let Some(level) = app.vsync.driver_changed(level) {
-                            info!("windows -> speaker: volume {} (mb={})", level, level_millibels);
-                            // Queued for whichever session kind is active
-                            // and sent from the volume thread: a speaker
-                            // round trip here would hold up the events
-                            // behind this one (and, under the session
-                            // lock, the window).
-                            app.send_to_speaker(SpeakerCommand::Volume(level));
-                        }
-                    }
-                    DriverEvent::MuteChanged { muted } => {
-                        info!("driver -> speaker: mute={}", muted);
-                        app.vsync.note_muted(muted);
-                        app.send_to_speaker(SpeakerCommand::Mute(muted));
-                    }
-                    DriverEvent::StreamStart => {
-                        info!("driver: stream start");
-                        app.stream_active.store(true, Ordering::Release);
-                    }
-                    DriverEvent::StreamStop => {
-                        info!("driver: stream stop");
-                        app.stream_active.store(false, Ordering::Release);
-                    }
-                    DriverEvent::FormatChange {
-                        sample_rate,
-                        bits_per_sample,
-                        channels,
-                    } => {
-                        info!(
-                            "driver: format change to {}/{}-bit/{}ch",
-                            sample_rate, bits_per_sample, channels
-                        );
-                    }
-                }
+                app.note_driver_events_lost("the driver ended its event stream");
+                drop(src);
+                let reopened =
+                    audio_loop::open_again(&app, &mut attempts, "the driver's events", IoctlAudioSource::open);
+                src = match reopened {
+                    Some(s) => s,
+                    None => return,
+                };
+                app.note_driver_events_back();
             }
         })
         .ok();
+}
+
+/// Act on the driver's events until its event stream ends or the app
+/// shuts down. Returns how many there were.
+#[cfg(windows)]
+fn consume_driver_events(app: &Arc<App>, src: &stream_to_speaker::ioctl_source::IoctlAudioSource) -> u64 {
+    use stream_to_speaker::ioctl_source::DriverEvent;
+    use stream_to_speaker::volume_sync::SpeakerCommand;
+    let rx = src.events();
+    let mut count = 0;
+    while let Ok(ev) = rx.recv() {
+        if app.is_shutting_down() {
+            return count;
+        }
+        count += 1;
+        match ev {
+            DriverEvent::VolumeChanged { level_millibels } => {
+                // Windows maps our hardware volume node's slider linearly
+                // across its dB range, so convert the dB back to a percent
+                // linearly to track it 1:1.
+                let level = stream_to_speaker::volume_sync::millibels_to_sonos(level_millibels);
+                if let Some(level) = app.vsync.driver_changed(level) {
+                    info!("windows -> speaker: volume {} (mb={})", level, level_millibels);
+                    // Queued for whichever session kind is active and sent
+                    // from the volume thread: a speaker round trip here
+                    // would hold up the events behind this one (and, under
+                    // the session lock, the window).
+                    app.send_to_speaker(SpeakerCommand::Volume(level));
+                }
+            }
+            DriverEvent::MuteChanged { muted } => {
+                info!("driver -> speaker: mute={}", muted);
+                app.vsync.note_muted(muted);
+                app.send_to_speaker(SpeakerCommand::Mute(muted));
+            }
+            DriverEvent::StreamStart => {
+                info!("driver: stream start");
+                app.stream_active.store(true, Ordering::Release);
+            }
+            DriverEvent::StreamStop => {
+                info!("driver: stream stop");
+                app.stream_active.store(false, Ordering::Release);
+            }
+            DriverEvent::FormatChange {
+                sample_rate,
+                bits_per_sample,
+                channels,
+            } => {
+                info!(
+                    "driver: format change to {}/{}-bit/{}ch",
+                    sample_rate, bits_per_sample, channels
+                );
+            }
+        }
+    }
+    count
 }
 
 #[cfg(not(windows))]
@@ -1080,8 +1390,20 @@ struct IoctlPusher {
 #[cfg(windows)]
 impl DriverVolumePush for IoctlPusher {
     fn push(&self, mb: i32, muted: bool) -> Result<()> {
-        let s = self.src.lock().unwrap();
-        s.push_volume(mb, muted)
+        use stream_to_speaker::ioctl_source::IoctlAudioSource;
+        let mut s = self.src.lock().unwrap();
+        match s.push_volume(mb, muted) {
+            Ok(()) => Ok(()),
+            // After the device was restarted under the app (Device Manager,
+            // a driver update) the old handle is dead and a new one works.
+            Err(e) => match IoctlAudioSource::open_audio_only() {
+                Ok(fresh) => {
+                    *s = fresh;
+                    s.push_volume(mb, muted)
+                }
+                Err(_) => Err(e),
+            },
+        }
     }
 }
 
@@ -1108,13 +1430,260 @@ fn build_driver_volume_pusher() -> Option<Box<dyn DriverVolumePush>> {
 // Signal handler
 // -----------------------------------------------------------------------------
 
+/// Which speaker a launch starts with, by the flags and the saved choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LaunchChoice {
+    /// `--player`: the speaker it names.
+    Wish(String),
+    /// Ask in the terminal.
+    Ask,
+    /// The speaker saved last time (if its settings allow reconnecting).
+    Saved(String),
+    /// None: the person picks one.
+    Nothing,
+}
+
+/// What a launch's choice depends on besides the flags.
+#[derive(Clone, Copy, Debug, Default)]
+struct LaunchFacts<'a> {
+    /// Standard input and output are a terminal someone can answer in.
+    terminal: bool,
+    /// The speaker saved last time.
+    saved: Option<&'a str>,
+    /// It is added by address and its settings let it reconnect at
+    /// launch: it needs no search.
+    saved_needs_no_search: bool,
+    /// How many speakers are added by address (listed without a search).
+    manual_speakers: usize,
+}
+
+/// A saved speaker always wins over one that merely answered first:
+/// without someone to ask, nothing is picked for them. A terminal is asked
+/// only when there is something to choose from: without discovery, not
+/// when the saved speaker can be reconnected or nothing could be listed.
+fn launch_choice(cli: &Cli, facts: LaunchFacts) -> LaunchChoice {
+    let nothing_to_choose =
+        cli.no_discovery && (facts.saved_needs_no_search || facts.manual_speakers == 0);
+    if let Some(q) = &cli.player {
+        LaunchChoice::Wish(q.clone())
+    } else if cli.headless && !cli.no_interactive && facts.terminal && !nothing_to_choose {
+        LaunchChoice::Ask
+    } else if let Some(id) = facts.saved {
+        LaunchChoice::Saved(id.to_string())
+    } else {
+        LaunchChoice::Nothing
+    }
+}
+
+/// Ctrl+C quits, telling the speaker first; a second Ctrl+C quits without
+/// waiting for it.
 fn install_signal_handler(app: Arc<App>) {
     if let Err(e) = ctrlc::set_handler(move || {
+        // Not eprintln!: it panics (here: aborts) when stderr is a closed pipe.
+        use std::io::Write as _;
         if !app.is_shutting_down() {
-            eprintln!("shutdown requested — cleaning up...");
+            let line = match app.selected_speaker() {
+                Some(s) => format!(
+                    "Quitting: telling {} to stop (press Ctrl+C again to quit at once)…",
+                    picker::printable(&s.friendly_name)
+                ),
+                None => "Quitting…".to_string(),
+            };
+            let _ = writeln!(std::io::stderr(), "{line}");
             app.request_shutdown();
+        } else {
+            let _ = writeln!(std::io::stderr(), "Quitting without waiting for the speaker.");
+            app.quit_without_waiting();
         }
     }) {
         warn!("could not install Ctrl-C handler: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("stream-to-speaker").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn a_headless_run_without_a_terminal_reconnects_the_saved_speaker() {
+        // A service, a scheduled task, a hidden window: nobody to ask.
+        let saved = LaunchFacts { saved: Some("uuid:A"), ..Default::default() };
+        assert_eq!(launch_choice(&cli(&["--headless"]), saved), LaunchChoice::Saved("uuid:A".into()));
+        assert_eq!(launch_choice(&cli(&["--headless"]), LaunchFacts::default()), LaunchChoice::Nothing);
+    }
+
+    #[test]
+    fn a_headless_run_in_a_terminal_asks_unless_told_not_to() {
+        let facts = LaunchFacts { terminal: true, saved: Some("uuid:A"), ..Default::default() };
+        assert_eq!(launch_choice(&cli(&["--headless"]), facts), LaunchChoice::Ask);
+        assert_eq!(
+            launch_choice(&cli(&["--headless", "--no-interactive"]), facts),
+            LaunchChoice::Saved("uuid:A".into())
+        );
+        // The window is where a GUI run picks, terminal or not.
+        assert_eq!(launch_choice(&cli(&[]), facts), LaunchChoice::Saved("uuid:A".into()));
+    }
+
+    #[test]
+    fn without_discovery_a_terminal_is_asked_only_when_there_is_a_choice() {
+        let headless = cli(&["--headless", "--no-discovery"]);
+        // The saved speaker added by address reconnects, as it always did.
+        let reconnectable = LaunchFacts {
+            terminal: true,
+            saved: Some("manual:den"),
+            saved_needs_no_search: true,
+            manual_speakers: 2,
+        };
+        assert_eq!(launch_choice(&headless, reconnectable), LaunchChoice::Saved("manual:den".into()));
+        // Nothing could be listed: run without a speaker, as it always did.
+        let empty = LaunchFacts { terminal: true, ..Default::default() };
+        assert_eq!(launch_choice(&headless, empty), LaunchChoice::Nothing);
+        // Speakers added by address, and nothing to reconnect: ask.
+        let choice = LaunchFacts { terminal: true, manual_speakers: 2, ..Default::default() };
+        assert_eq!(launch_choice(&headless, choice), LaunchChoice::Ask);
+    }
+
+    #[test]
+    fn listing_speakers_is_a_console_command_that_hands_nothing_over() {
+        assert!(cli(&["--list-speakers"]).console());
+        assert!(cli(&["--list-speakers"]).one_shot());
+        assert!(cli(&["--web-link"]).one_shot());
+        assert!(cli(&["--headless"]).console());
+        assert!(!cli(&["--headless"]).one_shot());
+        assert!(!cli(&[]).console());
+    }
+
+    fn parse_error(args: &[&str]) -> clap::Error {
+        Cli::try_parse_from(std::iter::once("stream-to-speaker").chain(args.iter().copied())).unwrap_err()
+    }
+
+    #[test]
+    fn a_mistake_in_the_arguments_is_shown_with_what_to_check() {
+        let text = argument_message(&parse_error(&["--plaeyr", "Kitchen"]));
+        assert!(text.starts_with("Stream To Speaker couldn't start"), "{text}");
+        assert!(text.contains("--plaeyr"), "{text}");
+        assert!(text.contains("Check the shortcut"), "{text}");
+        assert!(!text.contains('\u{1b}'), "terminal colours in a message box: {text:?}");
+    }
+
+    #[test]
+    fn help_and_the_version_are_shown_as_they_are() {
+        let help = argument_message(&parse_error(&["--help"]));
+        assert!(help.contains("--list-speakers") && !help.contains("couldn't start"), "{help}");
+        let version = argument_message(&parse_error(&["--version"]));
+        assert!(version.contains(env!("CARGO_PKG_VERSION")), "{version}");
+    }
+
+    #[test]
+    fn every_search_interval_that_used_to_start_still_does() {
+        let minutes = |m: &str| search_interval(&cli(&["--ssdp-interval", m]));
+        // 0 searched without a pause: now once a minute.
+        assert_eq!(minutes("0"), Duration::from_secs(60));
+        assert_eq!(minutes("5"), Duration::from_secs(300));
+        assert_eq!(minutes("10000"), Duration::from_secs(600_000));
+        assert_eq!(minutes("18446744073709551615"), Duration::from_secs(u64::MAX));
+        assert_eq!(search_interval(&cli(&[])), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn port_zero_still_starts() {
+        // It streams to AirPlay and Sendspin speakers; UPnP and the web
+        // link don't use the port really bound yet.
+        assert_eq!(cli(&["--port", "0"]).port, 0);
+    }
+
+    #[test]
+    fn a_headless_start_never_waits_on_a_message_box() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(asks_for_headless(args(&["x", "--plaeyr", "K", "--headless"])));
+        assert!(!asks_for_headless(args(&["x", "--plaeyr", "K"])));
+        assert!(!asks_for_headless(args(&["x", "--", "--headless"])));
+        assert_eq!(argument_report(true, false), ArgumentReport::Nowhere);
+        assert_eq!(argument_report(true, true), ArgumentReport::Print);
+        assert_eq!(argument_report(false, false), ArgumentReport::Dialog);
+        assert_eq!(argument_report(false, true), ArgumentReport::Print);
+    }
+
+    #[test]
+    fn opening_the_log_leaves_a_big_one_in_place() {
+        // A second launch opens the running copy's log; it must not move it.
+        let dir = std::env::temp_dir().join(format!("sts-log-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("stream-to-speaker.log");
+        std::fs::write(&log, vec![b'x'; (LOG_MAX_BYTES + 1) as usize]).unwrap();
+        drop(open_log_at(&log));
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), LOG_MAX_BYTES + 1);
+        assert!(!dir.join("stream-to-speaker.log.1").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_instance_sets_a_big_log_aside_and_writes_a_fresh_one() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("sts-log-slot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("stream-to-speaker.log");
+        let slot = LogSlot(std::sync::Mutex::new(open_log_at(&log)));
+        slot.0.lock().unwrap().as_mut().unwrap().write_all(&[b'o'; 101]).unwrap();
+        slot.set_aside_if_larger(&log, 100);
+        slot.0.lock().unwrap().as_mut().unwrap().write_all(b"after").unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), b"after");
+        assert_eq!(std::fs::read(dir.join("stream-to-speaker.log.1")).unwrap(), vec![b'o'; 101]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_for_this_pc_only_says_so() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let any = ip("0.0.0.0");
+        assert!(web_link_note(ip("127.0.0.1"), None, any).unwrap().contains("no network connection"));
+        assert_eq!(web_link_note(ip("127.0.0.1"), None, ip("127.0.0.1")), Some("This link works on this PC only."));
+        assert_eq!(web_link_note(ip("192.168.1.20"), None, any), None);
+    }
+
+    #[test]
+    fn a_log_that_grew_too_big_is_set_aside_once() {
+        let dir = std::env::temp_dir().join(format!("sts-log-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("stream-to-speaker.log");
+        let previous = dir.join("stream-to-speaker.log.1");
+        std::fs::write(&log, vec![b'x'; 100]).unwrap();
+        set_aside_if_larger(&log, 100);
+        assert_eq!(std::fs::read(&log).unwrap().len(), 100, "a log at the cap stays");
+        std::fs::write(&log, vec![b'y'; 101]).unwrap();
+        std::fs::write(&previous, b"older").unwrap();
+        set_aside_if_larger(&log, 100);
+        assert!(!log.exists(), "the big log is moved aside");
+        assert_eq!(std::fs::read(&previous).unwrap(), vec![b'y'; 101], "it replaces the older one");
+        set_aside_if_larger(&log, 100); // no log at all: nothing to do
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_help_offers_no_flag_that_does_nothing() {
+        let help = argument_message(&parse_error(&["--help"]));
+        assert!(!help.contains("--initial-buffer-ms"), "{help}");
+        // Still accepted, so shortcuts and services that pass it start.
+        assert!(Cli::try_parse_from(["x", "--initial-buffer-ms", "50"]).is_ok());
+    }
+
+    #[test]
+    fn player_names_the_speaker_whatever_else_holds() {
+        for terminal in [false, true] {
+            assert_eq!(
+                launch_choice(
+                    &cli(&["--headless", "--player", "Kitchen"]),
+                    LaunchFacts { terminal, saved: Some("uuid:A"), ..Default::default() }
+                ),
+                LaunchChoice::Wish("Kitchen".into())
+            );
+        }
     }
 }

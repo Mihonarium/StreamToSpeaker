@@ -99,19 +99,26 @@ check off under **Advanced** if you'd rather not.
                           Audio input. Default 'auto': kernel driver, falling
                           back to WASAPI loopback.
 
---player <name-or-ip>     Speaker to use: name substring or IPv4. Omit to pick
-                          in the GUI (or the terminal picker in --headless).
---no-interactive          Skip the terminal picker even in a TTY.
---list-speakers           Print discovered speakers and exit.
+--player <name-or-ip>     Speaker to play on, any kind: its address, its full
+                          name, or part of a name. The app starts anyway.
+                          After the first search (a few seconds) it takes the
+                          best match: that address, else that full name, else
+                          a shown speaker whose name contains it; if none
+                          matches yet, the first that does later. Omit to use
+                          the speaker from last time (--headless in a
+                          terminal asks).
+--no-interactive          With --headless, don't ask in the terminal.
+--list-speakers           Search for speakers, print them and exit.
 --no-discovery            Skip discovery; only serve HTTP.
 
 --port <N>                TCP port. Default 5901.
 --bind <ip>               HTTP bind address. Default 0.0.0.0.
---advertise-ip <ip>       IP to give every speaker and to search from.
-                          Default: per speaker, this PC's address on that
-                          speaker's network; search on every interface.
+--advertise-ip <ip>       IP to give every speaker, to search from and to
+                          put in the web UI's link. Default: per speaker,
+                          this PC's address on that speaker's network;
+                          search on every interface; in the link, the address
+                          worked out when it is shown.
 
---initial-buffer-ms <N>   Prebuffer hint sent to the speaker. Default 50.
 --silence-pace-ms <N>     Pacing of silence packets. Default 10 (real-time);
                           higher drains the speaker's buffer between tracks.
 --rate-fudge-ppm <N>      Clock-skew compensation. Default 0.

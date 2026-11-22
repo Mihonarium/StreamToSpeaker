@@ -5,7 +5,7 @@
 //! `Arc<App>` and calls methods. Atomic-backed knobs are exposed directly
 //! for read paths that are on the audio hot path.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -445,6 +445,12 @@ fn run_speaker_control(
 /// speaker this run).
 const AIRPLAY_DEFAULT_VOLUME: u32 = 80;
 
+/// How long quitting waits for a connect still in flight to finish (it then
+/// tears down what it set up).
+const QUIT_CONNECT_WAIT: Duration = Duration::from_secs(5);
+/// How long quitting waits for the speaker to answer its Stop or TEARDOWN.
+const QUIT_TEARDOWN_WAIT: Duration = Duration::from_secs(2);
+
 /// How long an error stays in the GUI's banner (the usual toast time).
 const ERROR_BANNER_TTL: Duration = Duration::from_secs(8);
 /// Start of the notice shown when a speaker is picked mid-connect.
@@ -460,12 +466,11 @@ pub struct SelectedSpeaker {
 /// Stable summary of the runtime config that the GUI / tray can render.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
-    pub advertise_ip: String,
-    /// True when `advertise_ip` came from `--advertise-ip`: it is then used
-    /// for every speaker. Otherwise each speaker gets the local address
-    /// Windows would use to reach it (see [`App::local_ip_toward`]), and
-    /// `advertise_ip` is only the default-route address shown in the UI.
-    pub advertise_ip_explicit: bool,
+    /// `--advertise-ip`: given to every speaker and named in the web UI's
+    /// link. Without it each speaker gets the address this PC uses to reach
+    /// it (see [`App::local_ip_toward`]), and the link the address worked
+    /// out when it is shown (see [`App::this_pc_address`]).
+    pub advertise_ip: Option<IpAddr>,
     pub bind: SocketAddr,
     pub initial_buffer_ms: u32,
     pub silence_packets_threshold: u32,
@@ -525,8 +530,14 @@ pub struct App {
     windows_volume: Arc<OnceLock<WindowsVolumePush>>,
 
     // ---- Runtime atomics (audio hot path reads these every packet) ----
-    /// Driver's KSSTATE_RUN flag mirror — set by the driver-event consumer.
+    /// What the driver last said about Windows' stream on our device:
+    /// running, or stopped. Set by the driver-event consumer only; true at
+    /// launch and while its events can't be read (unknown). For the status
+    /// shown: the audio loop doesn't depend on it.
     pub stream_active: Arc<AtomicBool>,
+    /// Why the audio thread can't read this PC's sound (the sound device
+    /// was disabled, removed or updated), while it tries to open it again.
+    sound_input_lost: Mutex<Option<String>>,
     /// User toggle. False ⇒ no session, audio goes into the void, and no
     /// device but this PC may pull `/stream.raw` (the stream gate holds
     /// this same flag).
@@ -566,6 +577,10 @@ pub struct App {
 
     // ---- Lifecycle ----
     pub shutdown: Arc<AtomicBool>,
+    /// Quit without waiting for the speaker (a second Ctrl+C).
+    quit_now: AtomicBool,
+    /// Run once when quitting begins (see [`App::on_quit`]).
+    on_quit: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Update-check state; see `update_check` and [`App::spawn_update_checker`].
     pub update: Mutex<UpdateState>,
 
@@ -614,6 +629,9 @@ pub struct App {
     /// [`select_speaker_async`]: App::select_speaker_async
     /// [`select_speaker`]: App::select_speaker
     user_picks: AtomicU64,
+
+    /// Where a `--player` wait stands (see [`App::connect_when_listed`]).
+    player_wish: Mutex<Option<PlayerWish>>,
 
     /// The stream gate for `/stream.raw` (see `stream_gate.rs`): no device
     /// but this PC while streaming is disabled, and with privacy mode on
@@ -853,24 +871,46 @@ impl Drop for CeremonyGuard {
 }
 
 impl App {
+    /// The app with the settings saved in `config.json`.
     pub fn new(
         config: AppConfig,
         discovery: Option<Arc<DiscoveryState>>,
         airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     ) -> Arc<Self> {
+        Self::with_settings(config, UserConfig::load(), discovery, airplay_discovery)
+    }
+
+    /// An app for tests: no discovery, and default settings that save
+    /// nowhere (never the developer's own `config.json`).
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Arc<Self> {
+        Self::with_settings(Self::test_config(), UserConfig::in_memory(), None, None)
+    }
+
+    /// The configuration [`App::for_tests`] runs with.
+    #[cfg(test)]
+    pub(crate) fn test_config() -> AppConfig {
+        AppConfig {
+            advertise_ip: Some("192.168.1.10".parse().unwrap()),
+            bind: "0.0.0.0:8080".parse().unwrap(),
+            initial_buffer_ms: 0,
+            silence_packets_threshold: 0,
+            no_silence_injection: false,
+            no_discovery: true,
+            web_enabled: false,
+            ssdp_iface: None,
+        }
+    }
+
+    /// The app with `user_config` as its settings.
+    pub(crate) fn with_settings(
+        config: AppConfig,
+        user_config: UserConfig,
+        discovery: Option<Arc<DiscoveryState>>,
+        airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
+    ) -> Arc<Self> {
         let web_initial = config.web_enabled;
-        // "This machine" for the stream gate, which admits it in both
-        // privacy modes and while streaming is disabled: the advertised
-        // IP, but only if this host actually owns it — a user-supplied
-        // --advertise-ip pointing at a proxy must not admit everything
-        // behind that proxy.
-        let own_ip = config
-            .advertise_ip
-            .parse::<IpAddr>()
-            .ok()
-            .filter(|ip| is_local_address(*ip));
-        let user_config = UserConfig::load();
-        // Seed last_speaker_id from disk so that, even before any user
+        // Seed last_speaker_id from the settings so that, even before any user
         // action, code that asks "what was the last speaker?" gets the
         // persisted answer.
         let last_speaker_id = Mutex::new(user_config.last_speaker_id.clone());
@@ -884,8 +924,10 @@ impl App {
         let speaker_control = SpeakerControl::new(session.clone(), vsync.clone(), Arc::clone(&windows_volume));
         // One flag for "streaming enabled", read by the stream gate as it is.
         let streaming_enabled = Arc::new(AtomicBool::new(true));
+        // The gate admits this PC in both privacy modes and while streaming
+        // is disabled: any address this host owns, at the time it asks.
         let stream_gate =
-            StreamGate::new(user_config.privacy_mode, streaming_enabled.clone(), own_ip);
+            StreamGate::new(user_config.privacy_mode, streaming_enabled.clone(), is_local_address);
         let app = Arc::new(Self {
             config,
             discovery,
@@ -897,6 +939,7 @@ impl App {
             speaker_control,
             windows_volume,
             stream_active: Arc::new(AtomicBool::new(true)),
+            sound_input_lost: Mutex::new(None),
             streaming_enabled,
             web_access: WebAccess::new(),
             drain_frames: Arc::new(AtomicI64::new(0)),
@@ -913,6 +956,8 @@ impl App {
             reconnects: AtomicU32::new(0),
             last_fault: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
+            quit_now: AtomicBool::new(false),
+            on_quit: OnceLock::new(),
             update: Mutex::new(UpdateState::default()),
             rescan_in_flight: Arc::new(AtomicBool::new(false)),
             last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
@@ -923,6 +968,7 @@ impl App {
             connecting: Mutex::new(None),
             connect_detail: Mutex::new(None),
             user_picks: AtomicU64::new(0),
+            player_wish: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
             sendspin: Default::default(),
             manual_resolved: Mutex::new(std::collections::HashMap::new()),
@@ -1142,15 +1188,18 @@ impl App {
     }
 
     /// Sleep `d` in slices, returning false early if shutdown began.
-    fn sleep_unless_shutdown(&self, d: Duration) -> bool {
+    pub(crate) fn sleep_unless_shutdown(&self, d: Duration) -> bool {
         let end = Instant::now() + d;
-        while Instant::now() < end {
+        loop {
             if self.is_shutting_down() {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(250));
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(250)));
         }
-        true
     }
 
     /// Background once-a-day update check: first attempt ~20 s after
@@ -1188,10 +1237,14 @@ impl App {
             st.checking = true;
         }
         let app = self.clone();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("stream-to-speaker-update-check-manual".into())
-            .spawn(move || app.run_update_check(true))
-            .ok();
+            .spawn(move || app.run_update_check(true));
+        if spawned.is_err() {
+            // Nothing will finish the check: don't leave "Checking…" up.
+            self.update.lock().unwrap().checking = false;
+            self.record_error("Couldn't check for updates (no thread available). Try again in a moment.");
+        }
     }
 
     /// Undo the onboarding dismissal (Help menu → "Show getting-
@@ -1472,7 +1525,8 @@ impl App {
     /// Remove a manual speaker: disconnect it if it's the active one and
     /// drop what was stored under its id.
     /// The teardown runs on a worker thread: it is network I/O and this is
-    /// called from the GUI.
+    /// called from the GUI. A connect in flight meanwhile may be to this
+    /// speaker: if it binds it, that is undone once it ends.
     pub fn remove_manual_speaker(self: &Arc<Self>, id: &str) {
         let stopped = {
             let mut guard = self.session.lock().unwrap();
@@ -1518,10 +1572,65 @@ impl App {
         if uc.last_speaker_id.as_deref() == Some(id) {
             uc.last_speaker_id = None;
         }
-        uc.airplay_passwords.remove(id);
-        uc.airplay_pairings.remove(id);
+        // Everything kept for it goes with it: its password and pairing,
+        // sealed copies this account can't open included (a save would
+        // keep those), and its settings, so the same address added again
+        // is a new speaker.
+        uc.remove_airplay_password(id);
+        uc.remove_airplay_pairing(id);
+        uc.speaker_settings.remove(id);
         uc.save();
+        drop(uc);
         info!("manual speaker removed: {}", id);
+        // Gone from the list first, then: a connect that starts from now on
+        // can't find it, and one already under way may have, and is watched.
+        if self.connecting_to().is_some() {
+            self.undo_connect_once_done(id.to_string());
+        }
+    }
+
+    /// Once the connect in flight has ended: if it bound the removed
+    /// speaker `id` (and saved it as the last one), stop it and forget it.
+    /// Off the caller's thread; gives up after a minute.
+    fn undo_connect_once_done(self: &Arc<Self>, id: String) {
+        let app = self.clone();
+        let spawned = std::thread::Builder::new().name("stream-to-speaker-removed".into()).spawn(move || {
+            let end = Instant::now() + Duration::from_secs(60);
+            while app.connecting_to().is_some() && Instant::now() < end {
+                if !app.sleep_unless_shutdown(Duration::from_millis(50)) {
+                    return;
+                }
+            }
+            let stopped = {
+                let mut guard = app.session.lock().unwrap();
+                if guard.as_ref().is_some_and(|s| s.stable_id() == id) {
+                    guard.take()
+                } else {
+                    None
+                }
+            };
+            {
+                let mut last = app.last_speaker_id.lock().unwrap();
+                if last.as_deref() == Some(id.as_str()) {
+                    *last = None;
+                }
+            }
+            {
+                let mut uc = app.user_config.lock().unwrap();
+                if uc.last_speaker_id.as_deref() == Some(id.as_str()) {
+                    uc.last_speaker_id = None;
+                    uc.save();
+                }
+            }
+            if let Some(s) = stopped {
+                info!("stopped {:?}: it was removed while connecting", id);
+                s.stop();
+                app.prune_stream_clients();
+            }
+        });
+        if spawned.is_err() {
+            warn!("couldn't watch the connect under way: if it was to the removed speaker, it stays connected");
+        }
     }
 
     /// Display name for any speaker id: discovered UPnP, discovered
@@ -3051,32 +3160,41 @@ impl App {
         }
     }
 
-    /// The advertised local IP parsed, with a user-facing error.
-    fn advertised_local_ip(&self) -> Result<IpAddr, String> {
-        self.config
-            .advertise_ip
-            .parse()
-            .map_err(|e| format!("bad advertise_ip {:?}: {}", self.config.advertise_ip, e))
-    }
-
     /// The local address to give a speaker at `peer`: `--advertise-ip` when
     /// set, else a specific `--bind` address, else the address Windows
     /// would send from to reach `peer`, so a
     /// speaker on a second NIC is not handed a VPN or other-subnet address.
-    /// Falls back to the startup default if the route lookup fails.
     pub fn local_ip_toward(&self, peer: IpAddr) -> Result<IpAddr, String> {
+        if let Some(ip) = self.config.advertise_ip {
+            return Ok(ip);
+        }
         // `--bind` to a specific address: the HTTP server only listens
         // there, so that is the address speakers must be given.
         let bind_ip = self.config.bind.ip();
-        if !self.config.advertise_ip_explicit && !bind_ip.is_unspecified() {
+        if !bind_ip.is_unspecified() {
             return Ok(bind_ip);
         }
-        if !self.config.advertise_ip_explicit {
-            if let Some(ip) = route_source_ip(peer) {
-                return Ok(ip);
-            }
-        }
-        self.advertised_local_ip()
+        route_source_ip(peer).ok_or_else(|| format!("this PC has no network route to {}", peer))
+    }
+
+    /// The address that names this PC to other devices now (it follows
+    /// network changes; see [`this_pc_address_from`]).
+    pub fn this_pc_address(&self) -> IpAddr {
+        let adapter = match &*self.discovery_scope.lock().unwrap() {
+            Resolved::Active { ip, .. } => Some(*ip),
+            _ => None,
+        };
+        this_pc_address_from(
+            self.config.advertise_ip,
+            self.config.bind.ip(),
+            adapter,
+            || {
+                let speaker = self.session.lock().unwrap().as_ref().map(|s| s.ip());
+                speaker.filter(|ip| !ip.is_unspecified()).and_then(route_source_ip)
+            },
+            default_route_ip,
+            first_local_ipv4,
+        )
     }
 
     /// The device a PIN ceremony is currently pairing (any stage), if one
@@ -3577,7 +3695,7 @@ impl App {
             return None;
         }
         let key = self.web_access.secret_hex()?;
-        Some(web_access::link(&self.config.advertise_ip, self.config.bind.port(), &key))
+        Some(web_access::link(&self.this_pc_address().to_string(), self.config.bind.port(), &key))
     }
 
     /// Replace the web UI's secret: the current link and API key stop
@@ -3695,6 +3813,48 @@ impl App {
     /// stream, whether anything came or not.
     pub fn receiving_windows_audio(&self) -> bool {
         matches!(self.windows_audio(), WindowsAudio::Playing | WindowsAudio::Silent)
+    }
+
+    /// The audio thread lost its source (`why`, for the log and the
+    /// diagnostics) and is trying to open it again; speakers get silence
+    /// meanwhile, and the window says so.
+    pub fn note_sound_input_lost(&self, why: &str) {
+        warn!("lost this PC's sound ({}); trying to open the sound device again", why);
+        self.record_fault(&format!("Lost this PC's sound: {}", why));
+        *self.sound_input_lost.lock().unwrap() = Some(why.to_string());
+    }
+
+    /// The audio thread reads this PC's sound again.
+    pub fn note_sound_input_back(&self) {
+        if self.sound_input_lost.lock().unwrap().take().is_some() {
+            info!("this PC's sound is back");
+        }
+    }
+
+    /// The audio thread can't read this PC's sound and is trying to open
+    /// the sound device again.
+    pub fn sound_input_lost(&self) -> bool {
+        self.sound_input_lost.lock().unwrap().is_some()
+    }
+
+    /// The driver's events (Windows volume, mute, its stream starting and
+    /// stopping) can't be read any more (`why`, for the log); the consumer
+    /// is trying to open them again.
+    pub fn note_driver_events_lost(&self, why: &str) {
+        warn!("lost the sound device's events ({}); trying to open them again", why);
+        // Whether Windows' stream runs is unknown now: let the packets
+        // themselves tell the status.
+        self.stream_active.store(true, Ordering::Release);
+        self.record_fault(&format!("Lost the sound device's events: {}", why));
+        self.record_error(
+            "Lost touch with the sound device: Windows volume changes won't reach the speaker until it \
+             reconnects.",
+        );
+    }
+
+    /// The driver's events can be read again.
+    pub fn note_driver_events_back(&self) {
+        info!("the sound device's events are back");
     }
 
     /// What Windows is giving the audio loop right now.
@@ -3914,12 +4074,284 @@ impl App {
             .ok();
     }
 
+    /// Every listed speaker as `--player` sees it, in list order.
+    pub(crate) fn player_candidates(&self) -> Vec<PlayerCandidate> {
+        let rows = self.speaker_view_opts(true).speakers;
+        let mut candidates: Vec<PlayerCandidate> = rows
+            .iter()
+            .map(|r| {
+                // The names the list shows, without its labels around them
+                // ("Kitchen (AirPlay)", "Den (AirPlay, added manually)").
+                let mut c = PlayerCandidate {
+                    id: r.id.clone(),
+                    address: r.ip.clone(),
+                    names: Vec::new(),
+                    group_rooms: Vec::new(),
+                    device_name: None,
+                    kind: PlayerKind::Other,
+                    manual: r.manual,
+                    hidden: r.hidden,
+                    used_before: r.manual,
+                    never_auto: false,
+                };
+                if r.manual {
+                    c.names.extend(self.find_manual_speaker(&r.id).map(|m| m.display_name()));
+                } else if let Some(d) = self.discovery.as_ref().and_then(|d| d.find_by_id(&r.id)) {
+                    // A Sonos speaker's room is its name too (a group is
+                    // labelled by it).
+                    let shown = d.display_name();
+                    c.names.push(shown.clone());
+                    c.names.extend(d.zone_name.clone());
+                    c.group_rooms = d.group_members.clone();
+                    c.device_name = (d.friendly_name != shown).then(|| d.friendly_name.clone());
+                    c.kind = PlayerKind::Upnp;
+                } else if let Some(a) = self.airplay_discovery.as_ref().and_then(|d| d.find_by_id(&r.id)) {
+                    c.names.push(a.friendly_name);
+                    c.kind = PlayerKind::AirPlay;
+                } else {
+                    c.names.extend(self.speaker_name(&r.id));
+                }
+                if c.names.is_empty() {
+                    c.names.push(r.friendly_name.clone());
+                }
+                c
+            })
+            .collect();
+        // What the settings already record of a speaker having been used:
+        // last time, its own settings, a pairing or a password.
+        let uc = self.user_config.lock().unwrap();
+        for c in candidates.iter_mut() {
+            let settings = uc.speaker_settings.get(&c.id);
+            c.used_before |= uc.last_speaker_id.as_deref() == Some(c.id.as_str())
+                || settings.is_some()
+                || uc.airplay_pairings.contains_key(&c.id)
+                || uc.airplay_passwords.contains_key(&c.id);
+            c.never_auto = settings.is_some_and(|s| s.auto_connect == AutoConnect::Never);
+        }
+        candidates
+    }
+
+    /// The listed speaker `query` names, ranked as `--player` documents it
+    /// (see [`rank_player_match`]), with how it matched.
+    pub fn find_listed_speaker(&self, query: &str) -> Option<PlayerMatch> {
+        rank_player_match(query, &self.player_candidates())
+    }
+
+    /// Where a `--player` wait stands, while there is one.
+    pub fn player_wish(&self) -> Option<PlayerWish> {
+        self.player_wish.lock().unwrap().clone()
+    }
+
+    /// `--player`: connect to the speaker `query` names (see
+    /// [`rank_player_match`]) once discovery has had its first look,
+    /// unless the user picks a speaker first. Each time it appears it is
+    /// tried once, without a PIN prompt; the wait ends when a speaker plays
+    /// or the user picks one.
+    pub fn connect_when_listed(self: &Arc<Self>, query: String) {
+        self.connect_when_listed_every(query, Duration::from_secs(1));
+    }
+
+    /// [`App::connect_when_listed`], looking every `poll`.
+    pub(crate) fn connect_when_listed_every(self: &Arc<Self>, query: String, poll: Duration) {
+        let picks_seen = self.user_pick_count();
+        info!("--player {:?}: connecting when a speaker by that name or address is found", query);
+        *self.player_wish.lock().unwrap() = Some(PlayerWish::Looking { query: query.clone() });
+        let named = query.clone();
+        let app = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("stream-to-speaker-player-wish".into())
+            .spawn(move || {
+                let mut steps = WishSteps::new(Instant::now());
+                // The connect under way: its speaker's id and name, and the
+                // last fault before it, so its own failure can be told.
+                let mut attempt: Option<(String, String, Option<Fault>)> = None;
+                loop {
+                    if app.user_pick_count() != picks_seen {
+                        info!("--player {:?}: a speaker was picked; no longer waiting", query);
+                        break;
+                    }
+                    let busy = app.connecting_to().is_some();
+                    if !busy {
+                        if let Some((id, name, fault_before)) = attempt.take() {
+                            if app.is_speaker_bound() {
+                                break;
+                            }
+                            let fault = app.last_fault().filter(|f| Some(f) != fault_before.as_ref());
+                            let reason = fault.map(|f| {
+                                f.what.strip_prefix(CONNECT_FAILED_PREFIX).unwrap_or(&f.what).to_string()
+                            });
+                            info!("--player {:?}: connecting to {:?} failed; waiting for it to come back", query, id);
+                            *app.player_wish.lock().unwrap() = Some(PlayerWish::failed(&query, name, reason));
+                        }
+                    }
+                    let rows = app.player_candidates();
+                    // The UPnP list is filled once a whole sweep is done.
+                    let searched = app.discovery.as_ref().map_or(true, |d| !d.renderers().is_empty());
+                    match steps.next(Instant::now(), &query, &rows, searched, busy) {
+                        Some(m) => {
+                            let name = app.speaker_name(&m.id).unwrap_or_else(|| m.id.clone());
+                            if let Some(line) = m.explain(&query, &name) {
+                                info!("{}", line);
+                            }
+                            info!("--player {:?}: found {:?}; connecting", query, m.id);
+                            *app.player_wish.lock().unwrap() = Some(PlayerWish::Looking { query: query.clone() });
+                            attempt = Some((m.id.clone(), name, app.last_fault()));
+                            app.connect_unless_user_picked(&m.id, picks_seen);
+                        }
+                        None if steps.tried.is_none() && attempt.is_none() => {
+                            // What it tried has gone from the list: looking again.
+                            *app.player_wish.lock().unwrap() = Some(PlayerWish::Looking { query: query.clone() });
+                        }
+                        None => {}
+                    }
+                    if !app.sleep_unless_shutdown(poll) {
+                        break;
+                    }
+                }
+                *app.player_wish.lock().unwrap() = None;
+            });
+        if let Err(e) = spawned {
+            *self.player_wish.lock().unwrap() = None;
+            self.record_error(format!("Couldn't start looking for the speaker \"{}\" (--player): {}", named, e));
+        }
+    }
+
+    /// Keep the Windows output device's name in step with the speaker being
+    /// played on: `apply(Some(name))` while one is bound, `apply(None)` (the
+    /// plain name) otherwise, at start and whenever that changes, however
+    /// the session ended. Looks every second.
+    pub fn follow_endpoint_label(self: &Arc<Self>, apply: impl Fn(Option<&str>) + Send + 'static) {
+        self.follow_endpoint_label_every(apply, Duration::from_secs(1));
+    }
+
+    /// [`App::follow_endpoint_label`], looking every `poll`.
+    pub(crate) fn follow_endpoint_label_every(
+        self: &Arc<Self>,
+        apply: impl Fn(Option<&str>) + Send + 'static,
+        poll: Duration,
+    ) {
+        let app = self.clone();
+        let spawned = std::thread::Builder::new().name("stream-to-speaker-device-name".into()).spawn(move || {
+            let mut applied: Option<Option<String>> = None;
+            loop {
+                let now = app.selected_speaker().map(|s| s.friendly_name);
+                if applied.as_ref() != Some(&now) {
+                    apply(now.as_deref());
+                    applied = Some(now);
+                }
+                if !app.sleep_unless_shutdown(poll) {
+                    return;
+                }
+            }
+        });
+        if spawned.is_err() {
+            warn!("couldn't start keeping the Windows device name in step with the speaker");
+        }
+    }
+
+    /// Look for Sendspin speakers (when Sendspin is on in the settings)
+    /// without offering this PC's sound to Music Assistant: for listing
+    /// the speakers while another copy of the app may be running.
+    pub fn browse_sendspin_speakers(&self) {
+        self.sendspin.discovery_allowed.store(true, Ordering::SeqCst);
+        self.sync_sendspin_discovery();
+    }
+
     // -------------------------------------------------------------------
     // Shutdown
     // -------------------------------------------------------------------
 
+    /// Quit: end streaming and tear the session down, waiting only so long
+    /// for the speaker. Called once the window or the headless loop has
+    /// ended, after [`App::request_shutdown`].
+    pub fn shut_down(self: &Arc<Self>) {
+        self.shut_down_within(QUIT_CONNECT_WAIT, QUIT_TEARDOWN_WAIT);
+    }
+
+    /// [`App::shut_down`] waiting at most `connect_wait` for a connect in
+    /// flight and `teardown_wait` for the speaker to answer; a second
+    /// Ctrl+C ([`App::quit_without_waiting`]) ends both waits.
+    pub(crate) fn shut_down_within(self: &Arc<Self>, connect_wait: Duration, teardown_wait: Duration) {
+        // A connect still in flight binds only while streaming is enabled
+        // (it checks under the session lock): with it off, it stops what
+        // it set up instead of leaving the speaker with an abandoned
+        // session. Not saved: the next start streams as usual.
+        self.streaming_enabled.store(false, Ordering::Release);
+        let end = Instant::now() + connect_wait;
+        while self.connecting_to().is_some() && Instant::now() < end && !self.quitting_now() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        info!("shutdown: tearing down active session");
+        let (done_tx, done) = crossbeam_channel::bounded::<()>(1);
+        let app = self.clone();
+        let spawned = std::thread::Builder::new().name("stream-to-speaker-quit".into()).spawn(move || {
+            app.stop_sendspin();
+            let s = app.session.lock().unwrap().take();
+            if let Some(s) = s {
+                s.stop();
+            }
+            let _ = done_tx.send(());
+        });
+        match spawned {
+            Ok(_) => {
+                // A speaker that answers is told at once; one that has gone
+                // isn't waited for: this process holds the single-instance
+                // lock until it ends, and a new launch waits for it.
+                let end = Instant::now() + teardown_wait;
+                loop {
+                    match done.recv_timeout(Duration::from_millis(20)) {
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                            if Instant::now() < end && !self.quitting_now() => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            warn!("shutdown: the speaker didn't answer in time; quitting without waiting for it");
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            Err(_) => {
+                self.stop_sendspin();
+                let s = self.session.lock().unwrap().take();
+                if let Some(s) = s {
+                    s.stop();
+                }
+            }
+        }
+        info!("shutdown: complete");
+    }
+
+    /// A second Ctrl+C: quit without waiting for anything.
+    pub fn quit_without_waiting(&self) {
+        self.quit_now.store(true, Ordering::SeqCst);
+    }
+
+    fn quitting_now(&self) -> bool {
+        self.quit_now.load(Ordering::SeqCst)
+    }
+
+    /// A speaker picked from the web API: refused once the app is quitting
+    /// (it would bind a speaker the app is about to leave, after the quit
+    /// switched streaming off for exactly that reason).
+    pub fn select_speaker_from_remote(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        if self.is_shutting_down() {
+            return Err(format!("{} is quitting: no speaker can be chosen now.", PRODUCT_NAME));
+        }
+        self.select_speaker(id)
+    }
+
+    /// Run `hook` once, when quitting begins (Quit chosen, the window closed
+    /// for good, Ctrl+C).
+    pub fn on_quit(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_quit.set(Box::new(hook));
+    }
+
     pub fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        if !self.shutdown.swap(true, Ordering::SeqCst) {
+            if let Some(hook) = self.on_quit.get() {
+                hook();
+            }
+        }
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -4262,15 +4694,275 @@ pub fn stop_session(session: &RendererSession) {
 // IP / bind helpers (moved from main.rs to keep main.rs lean)
 // -----------------------------------------------------------------------------
 
-pub fn default_advertise_ip() -> Result<String> {
-    use std::net::UdpSocket;
-    let s = UdpSocket::bind("0.0.0.0:0").context("binding udp for ip discovery")?;
-    if s.connect("8.8.8.8:53").is_ok() {
-        if let Ok(addr) = s.local_addr() {
-            return Ok(addr.ip().to_string());
+/// How a speaker is reached, where `--player` cares: a Sonos is listed
+/// twice, as UPnP and as AirPlay, and its UPnP entry is the one to take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlayerKind {
+    Upnp,
+    AirPlay,
+    Other,
+}
+
+/// A listed speaker as `--player` sees it.
+#[derive(Clone, Debug)]
+pub(crate) struct PlayerCandidate {
+    pub id: String,
+    /// As the list shows it (a speaker added by address carries its port).
+    pub address: String,
+    /// The names the list shows for it, and a Sonos speaker's room.
+    pub names: Vec<String>,
+    /// The other rooms of the Sonos group it plays to.
+    pub group_rooms: Vec<String>,
+    /// The device's own description name (a UPnP friendlyName with its
+    /// model), where the list shows another.
+    pub device_name: Option<String>,
+    pub kind: PlayerKind,
+    /// Added by address: it needs no search to be found.
+    pub manual: bool,
+    pub hidden: bool,
+    /// The settings record it being used before: the last speaker, its own
+    /// settings, a pairing or password, or added by address.
+    pub used_before: bool,
+    /// Set never to connect by itself.
+    pub never_auto: bool,
+}
+
+/// How `--player`'s text matched the speaker taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerMatchKind {
+    Address,
+    FullName,
+    PartOfName,
+    /// A room inside a Sonos group.
+    GroupRoom,
+    /// Part of the device's own description name.
+    DeviceName,
+}
+
+impl PlayerMatchKind {
+    pub fn describe(self) -> &'static str {
+        match self {
+            PlayerMatchKind::Address => "its address",
+            PlayerMatchKind::FullName => "its full name",
+            PlayerMatchKind::PartOfName => "part of its name",
+            PlayerMatchKind::GroupRoom => "a room in its Sonos group",
+            PlayerMatchKind::DeviceName => "part of its device name",
         }
     }
-    Err(anyhow!("could not determine local IP; pass --advertise-ip"))
+}
+
+/// The speaker `--player` takes, how it matched, and how many others
+/// matched the same way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerMatch {
+    pub id: String,
+    pub how: PlayerMatchKind,
+    pub also_fitted: usize,
+}
+
+impl PlayerMatch {
+    /// The log line that says which speaker (`name`) `query` took, when
+    /// that wasn't plain: a partial match, or one of several. So a wrong
+    /// pick can be understood from the log.
+    pub fn explain(&self, query: &str, name: &str) -> Option<String> {
+        let plain = matches!(self.how, PlayerMatchKind::Address | PlayerMatchKind::FullName);
+        if plain && self.also_fitted == 0 {
+            return None;
+        }
+        Some(format!(
+            "--player {:?}: taking {:?}, matched by {}; {} other speaker(s) matched the same way",
+            query,
+            name,
+            self.how.describe(),
+            self.also_fitted
+        ))
+    }
+}
+
+/// The address in `text` (an IP, with or without a port or brackets), if
+/// it is one.
+fn parse_address(text: &str) -> Option<(IpAddr, Option<u16>)> {
+    if let Ok(sa) = text.parse::<SocketAddr>() {
+        return Some((sa.ip(), Some(sa.port())));
+    }
+    text.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().ok().map(|ip| (ip, None))
+}
+
+/// Which listed speaker (`rows`, in list order) `query` names. An address
+/// (with or without a port) matches addresses only. Otherwise the first
+/// step with any match decides: the full name (any letter case,
+/// surrounding spaces ignored); else part of a name, among the speakers
+/// shown (a part is a search, and a search finds only what the list shows;
+/// hidden ones are reached by full name or address); else part of a room
+/// inside a Sonos group; else part of the device's own description name,
+/// both also among those shown. Among several matches: shown before
+/// hidden, a speaker's UPnP entry before its AirPlay one, then ones used
+/// before, then ones not set never to connect by themselves, then list
+/// order. Nothing is refused for being ambiguous.
+pub(crate) fn rank_player_match(query: &str, rows: &[PlayerCandidate]) -> Option<PlayerMatch> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let lower = q.to_lowercase();
+    let contains = |names: &[String]| names.iter().any(|n| n.to_lowercase().contains(&lower));
+    let steps: Vec<(PlayerMatchKind, Box<dyn Fn(&PlayerCandidate) -> bool + '_>)> = match parse_address(q) {
+        Some((ip, port)) => vec![(
+            PlayerMatchKind::Address,
+            Box::new(move |c: &PlayerCandidate| match parse_address(&c.address) {
+                Some((at, at_port)) => at == ip && (port.is_none() || at_port.is_none() || port == at_port),
+                // A speaker added by a host name: its listed text.
+                None => c.address == q || c.address.strip_prefix(q).is_some_and(|rest| rest.starts_with(':')),
+            }),
+        )],
+        None => vec![
+            (
+                PlayerMatchKind::FullName,
+                Box::new(|c: &PlayerCandidate| c.names.iter().any(|n| n.trim().to_lowercase() == lower)),
+            ),
+            (PlayerMatchKind::PartOfName, Box::new(|c: &PlayerCandidate| !c.hidden && contains(&c.names))),
+            (PlayerMatchKind::GroupRoom, Box::new(|c: &PlayerCandidate| !c.hidden && contains(&c.group_rooms))),
+            (
+                PlayerMatchKind::DeviceName,
+                Box::new(|c: &PlayerCandidate| !c.hidden && c.device_name.iter().any(|n| n.to_lowercase().contains(&lower))),
+            ),
+        ],
+    };
+    steps.iter().find_map(|(how, fits)| {
+        let found: Vec<(usize, &PlayerCandidate)> = rows.iter().enumerate().filter(|(_, c)| fits(c)).collect();
+        let upnp_at: Vec<IpAddr> = found
+            .iter()
+            .filter(|(_, c)| c.kind == PlayerKind::Upnp)
+            .filter_map(|(_, c)| parse_address(&c.address).map(|(ip, _)| ip))
+            .collect();
+        // An AirPlay entry whose speaker also has a UPnP entry among these.
+        let twin = |c: &PlayerCandidate| {
+            c.kind == PlayerKind::AirPlay
+                && parse_address(&c.address).is_some_and(|(ip, _)| upnp_at.contains(&ip))
+        };
+        let best = found
+            .iter()
+            .min_by_key(|(i, c)| (c.hidden, twin(c), !c.used_before, c.never_auto, *i))?;
+        Some(PlayerMatch { id: best.1.id.clone(), how: *how, also_fitted: found.len() - 1 })
+    })
+}
+
+/// How long `--player` waits for discovery's first look before taking a
+/// match from what is listed (as long as the start-up wait for the first
+/// UPnP sweep was).
+const PLAYER_FIRST_LOOK: Duration = Duration::from_secs(5);
+
+/// The `--player` wait's decisions, apart from its thread and its clock.
+pub(crate) struct WishSteps {
+    started: Instant,
+    /// The speaker tried during its current appearance in the list.
+    pub tried: Option<String>,
+}
+
+impl WishSteps {
+    pub fn new(started: Instant) -> Self {
+        Self { started, tried: None }
+    }
+
+    /// The speaker to connect to now, given the listed `rows`; `searched`:
+    /// the first UPnP sweep has been published (or there is no UPnP
+    /// discovery); `busy`: a connect is under way. Nothing is chosen from
+    /// discovery's results before its first look is done: a Sonos's AirPlay
+    /// entry, or a near match, usually answers before the UPnP entry of the
+    /// speaker meant. A speaker added by address needs no search.
+    pub fn next(
+        &mut self,
+        now: Instant,
+        query: &str,
+        rows: &[PlayerCandidate],
+        searched: bool,
+        busy: bool,
+    ) -> Option<PlayerMatch> {
+        let looked = searched || now >= self.started + PLAYER_FIRST_LOOK;
+        let found = if looked {
+            rank_player_match(query, rows)
+        } else {
+            let manual: Vec<PlayerCandidate> = rows.iter().filter(|c| c.manual).cloned().collect();
+            rank_player_match(query, &manual)
+        };
+        match found {
+            None => {
+                if looked {
+                    self.tried = None;
+                }
+                None
+            }
+            Some(m) if busy || self.tried.as_deref() == Some(m.id.as_str()) => None,
+            Some(m) => {
+                self.tried = Some(m.id.clone());
+                Some(m)
+            }
+        }
+    }
+}
+
+/// Where a `--player` wait stands, for the window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlayerWish {
+    /// Looking for a speaker `query` names.
+    Looking { query: String },
+    /// Found `speaker` and connecting to it failed, for `reason` (as the
+    /// connect told it, if it did); it is tried again when it comes back
+    /// to the list. `needs_person`: it can't work without someone at the
+    /// speaker (PIN pairing), and the reason says what to do.
+    Failed { query: String, speaker: String, reason: Option<String>, needs_person: bool },
+}
+
+impl PlayerWish {
+    fn failed(query: &str, speaker: String, reason: Option<String>) -> Self {
+        let needs_person = reason.as_deref().is_some_and(needs_the_person);
+        PlayerWish::Failed { query: query.to_string(), speaker, reason, needs_person }
+    }
+}
+
+/// Whether a connect's failure is one only the person can get past: the
+/// speaker wants PIN pairing, which a connect nobody clicked can't start
+/// (see [`pin_pairing_message`]); trying again would only fail again.
+pub(crate) fn needs_the_person(reason: &str) -> bool {
+    reason.contains("click it in the speaker list")
+}
+
+/// The words a failed background connect's fault begins with.
+const CONNECT_FAILED_PREFIX: &str = "Couldn't connect to speaker: ";
+
+/// The address that names this PC to other devices, the first of: the one
+/// given with `--advertise-ip`; a specific `--bind` address (the server
+/// answers there only); the address of the adapter chosen for discovery;
+/// the one Windows uses toward the speaker being played on; the default
+/// route's; any local IPv4; else loopback, while the PC has no network
+/// (a link then still opens on this PC). Each lookup runs only if the ones
+/// before it found nothing.
+pub fn this_pc_address_from(
+    explicit: Option<IpAddr>,
+    bind: IpAddr,
+    adapter: Option<Ipv4Addr>,
+    toward_speaker: impl FnOnce() -> Option<IpAddr>,
+    default_route: impl FnOnce() -> Option<IpAddr>,
+    any_local: impl FnOnce() -> Option<Ipv4Addr>,
+) -> IpAddr {
+    explicit
+        .or_else(|| (!bind.is_unspecified()).then_some(bind))
+        .or_else(|| adapter.map(IpAddr::V4))
+        .or_else(toward_speaker)
+        .or_else(default_route)
+        .or_else(|| any_local().map(IpAddr::V4))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+/// This PC's address on its default route right now, if it has one.
+pub fn default_route_ip() -> Option<IpAddr> {
+    route_source_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
+}
+
+/// The first usable IPv4 address on any adapter (loopback and link-local
+/// left out), if there is one.
+pub fn first_local_ipv4() -> Option<Ipv4Addr> {
+    crate::ssdp::local_ipv4_interfaces().first().copied()
 }
 
 /// The source address the OS routing table picks for packets to `peer`
@@ -4305,11 +4997,9 @@ fn local_urls(ip: IpAddr, port: u16) -> (String, String) {
 /// The one interface SSDP should search from, if the user pinned one
 /// (`--advertise-ip`, or `--bind` to a specific address). None = search
 /// from every interface.
-pub fn pick_ssdp_iface(advertise_ip: Option<&str>, bind: &str) -> Option<std::net::Ipv4Addr> {
-    if let Some(s) = advertise_ip {
-        if let Ok(IpAddr::V4(v4)) = s.parse() {
-            return Some(v4);
-        }
+pub fn pick_ssdp_iface(advertise_ip: Option<IpAddr>, bind: &str) -> Option<std::net::Ipv4Addr> {
+    if let Some(IpAddr::V4(v4)) = advertise_ip {
+        return Some(v4);
     }
     if let Ok(IpAddr::V4(v4)) = bind.parse::<IpAddr>() {
         if !v4.is_unspecified() {
@@ -4334,6 +5024,7 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn local_urls_bracket_ipv6_hosts() {
@@ -4352,31 +5043,47 @@ mod tests {
     #[test]
     fn ssdp_searches_every_interface_unless_pinned() {
         assert_eq!(pick_ssdp_iface(None, "0.0.0.0"), None);
-        assert_eq!(pick_ssdp_iface(Some("192.168.2.100"), "0.0.0.0"), Some("192.168.2.100".parse().unwrap()));
+        assert_eq!(pick_ssdp_iface(Some(ip("192.168.2.100")), "0.0.0.0"), Some("192.168.2.100".parse().unwrap()));
         assert_eq!(pick_ssdp_iface(None, "10.0.0.5"), Some("10.0.0.5".parse().unwrap()));
     }
 
 
+    /// [`App::for_tests`] with privacy mode on.
     fn test_app() -> Arc<App> {
-        let app = App::new(
-            AppConfig {
-                advertise_ip: "192.168.1.10".into(),
-                advertise_ip_explicit: false,
-                bind: "0.0.0.0:8080".parse().unwrap(),
-                initial_buffer_ms: 0,
-                silence_packets_threshold: 0,
-                no_silence_injection: false,
-                no_discovery: true,
-                web_enabled: false,
-                ssdp_iface: None,
-            },
-            None,
-            None,
-        );
-        // Flip the gate directly — set_privacy_mode would write the
-        // developer's real config file to disk.
-        app.stream_gate.set_privacy(true);
+        let app = App::for_tests();
+        app.set_privacy_mode(true);
         app
+    }
+
+    /// Run only by [`test_app_never_reads_the_settings_file`], in a child
+    /// process whose settings file turns reconnect-on-drop off.
+    #[test]
+    #[ignore = "run in a child process by test_app_never_reads_the_settings_file"]
+    fn test_app_settings_probe() {
+        assert!(test_app().is_auto_reconnect_on_drop(), "test_app() used the settings file");
+    }
+
+    #[test]
+    fn test_app_never_reads_the_settings_file() {
+        // The settings folder comes from APPDATA, which a test can't change
+        // for itself without racing every other test: run the probe in a
+        // process of its own.
+        let dir = std::env::temp_dir().join(format!("sts-test-app-settings-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("StreamToSpeaker")).unwrap();
+        std::fs::write(
+            dir.join("StreamToSpeaker").join("config.json"),
+            r#"{"auto_reconnect_on_drop": false}"#,
+        )
+        .unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "app::tests::test_app_settings_probe", "--test-threads=1"])
+            .env("APPDATA", &dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("1 passed"), "the probe didn't run, or failed:\n{text}");
+        assert!(out.status.success(), "{text}");
     }
 
     fn ip(s: &str) -> IpAddr {
@@ -4690,8 +5397,7 @@ mod tests {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let app = App::new(
             AppConfig {
-                advertise_ip: "127.0.0.1".into(),
-                advertise_ip_explicit: false,
+                advertise_ip: None,
                 bind: SocketAddr::from(([127, 0, 0, 1], port)),
                 initial_buffer_ms: 0,
                 silence_packets_threshold: 0,
@@ -5262,18 +5968,9 @@ mod tests {
         assert_eq!(app.check_stream_client(ip("192.168.1.50")), Err(Refusal::NotGranted));
     }
 
-    /// [`test_app`] with default settings instead of the developer's, in
-    /// memory only (saves don't reach the disk), and no remembered speaker.
-    fn test_app_defaults() -> Arc<App> {
-        let app = test_app();
-        *app.user_config.lock().unwrap() = UserConfig::in_memory();
-        *app.last_speaker_id.lock().unwrap() = None;
-        app
-    }
-
     #[test]
     fn sendspin_discovery_pauses_with_the_discovery_adapter() {
-        let app = test_app_defaults();
+        let app = test_app();
         {
             let mut uc = app.user_config.lock().unwrap();
             uc.sendspin.enabled = true;
@@ -5304,7 +6001,7 @@ mod tests {
     #[test]
     fn sendspin_launch_reconnect_follows_the_speaker_setting() {
         use crate::sendspin_app::{LaunchSkip, SendspinLaunch, MA_OUTPUT_ID};
-        let app = test_app_defaults();
+        let app = test_app();
         app.user_config.lock().unwrap().sendspin.enabled = true;
         let plan = |id: &str, auto_connect: AutoConnect| {
             {
@@ -5352,7 +6049,7 @@ mod tests {
     #[test]
     fn always_auto_connect_sees_sendspin_speakers() {
         use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
-        let app = test_app_defaults();
+        let app = test_app();
         let found = SendspinDiscoveryState::new();
         found.insert(SendspinRenderer {
             instance: "Kitchen".into(),
@@ -5372,7 +6069,7 @@ mod tests {
     #[test]
     fn failed_sendspin_discovery_is_shown_and_retried() {
         use crate::sendspin::server::SendspinDiscoveryState;
-        let app = test_app_defaults();
+        let app = test_app();
         app.user_config.lock().unwrap().sendspin.enabled = true;
         app.sendspin.discovery_allowed.store(true, Ordering::SeqCst);
         // A browse that can't start until `fail` is cleared.
@@ -5426,7 +6123,7 @@ mod tests {
         use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
         use crate::sendspin_app::LaunchStep;
         let id = "sendspin:kitchen";
-        let app = test_app_defaults();
+        let app = test_app();
         {
             let mut uc = app.user_config.lock().unwrap();
             uc.sendspin.enabled = true;
@@ -5509,7 +6206,7 @@ mod tests {
     #[test]
     fn disabling_streaming_cuts_every_network_listener_in_both_modes() {
         for privacy in [false, true] {
-            let app = test_app_defaults();
+            let app = test_app();
             app.stream_gate.set_privacy(privacy);
             // The speaker being played on, as its session's grant admits it.
             let _grant = app.stream_gate.grant([ip("192.168.1.50")]);
@@ -5546,7 +6243,7 @@ mod tests {
     #[test]
     fn forget_cuts_every_network_listener_at_once() {
         for privacy in [false, true] {
-            let app = test_app_defaults();
+            let app = test_app();
             app.stream_gate.set_privacy(privacy);
             *app.last_speaker_id.lock().unwrap() = Some("uuid:kitchen".into());
             let stranger = app.hub.subscribe_from(ip("192.168.1.99"));
@@ -5569,7 +6266,7 @@ mod tests {
         // players elsewhere on the network fetch the stream themselves.
         // That relies on streaming starting enabled and staying so until
         // the user disables it.
-        let app = test_app_defaults();
+        let app = test_app();
         assert!(app.config.no_discovery && app.discovery.is_none());
         app.stream_gate.set_privacy(false);
         assert!(app.is_streaming_enabled());
@@ -5584,9 +6281,551 @@ mod tests {
         assert_eq!(app.check_stream_client(ip("127.0.0.1")), Ok(()));
     }
 
+    /// An app run without `--advertise-ip`, its web UI on.
+    fn app_without_advertise_ip(bind: &str) -> Arc<App> {
+        let mut config = App::test_config();
+        config.advertise_ip = None;
+        config.bind = bind.parse().unwrap();
+        let app = App::with_settings(config, UserConfig::in_memory(), None, None);
+        app.set_web_ui_enabled(true).unwrap();
+        app
+    }
+
+    fn link_host(app: &App) -> String {
+        let link = app.web_link().expect("the web UI is on");
+        let rest = link.strip_prefix("http://").unwrap();
+        rest[..rest.find("/r/").unwrap()].to_string()
+    }
+
+    /// A UPnP session whose speaker takes requests and never answers:
+    /// stopping it waits out the client's timeout. The receiver hears each
+    /// request's first line.
+    fn unanswering_upnp_session() -> (ActiveSession, crossbeam_channel::Receiver<String>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/AVTransport/Control", listener.local_addr().unwrap());
+        let (got_tx, got_rx) = crossbeam_channel::unbounded();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut buf = [0u8; 2048];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let soap_action = text.lines().find(|l| l.to_ascii_lowercase().starts_with("soapaction"));
+                let _ = got_tx.send(soap_action.unwrap_or_default().to_string());
+                held.push(conn);
+            }
+        });
+        let mut session = upnp_session("");
+        if let ActiveSession::Upnp(s) = &mut session {
+            s.renderer.av_transport_control_url = url;
+        }
+        (session, got_rx)
+    }
+
+    #[test]
+    fn quitting_tells_the_speaker_but_doesnt_wait_out_one_that_never_answers() {
+        let app = test_app();
+        let (session, got) = unanswering_upnp_session();
+        bind(&app, session);
+        let started = Instant::now();
+        app.shut_down_within(Duration::from_millis(100), Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(2), "quit took {:?}", started.elapsed());
+        let stop = got.recv_timeout(Duration::from_secs(5)).expect("the speaker was never told");
+        assert!(stop.contains("#Stop"), "{stop}");
+        assert!(!app.is_speaker_bound());
+        // A connect still in flight can't bind after this: it stops what it
+        // set up instead (it binds only while streaming is enabled).
+        assert!(!app.is_streaming_enabled());
+    }
+
+    #[test]
+    fn a_pick_from_the_web_while_quitting_is_refused() {
+        let app = test_app();
+        app.request_shutdown();
+        app.shut_down_within(Duration::from_millis(10), Duration::from_millis(10));
+        let refused = app.select_speaker_from_remote("uuid:kitchen").unwrap_err();
+        assert!(refused.contains("quitting"), "{refused}");
+        // And it didn't turn streaming back on for a session to bind.
+        assert!(!app.is_streaming_enabled());
+    }
+
+    #[test]
+    fn quitting_runs_the_quit_hook_once() {
+        let app = test_app();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        app.on_quit(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        app.request_shutdown();
+        app.request_shutdown();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn quitting_waits_a_moment_for_a_connect_in_flight() {
+        let app = test_app();
+        *app.connecting.lock().unwrap() = Some("Kitchen".into());
+        let finishing = {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                *app.connecting.lock().unwrap() = None;
+            })
+        };
+        let started = Instant::now();
+        app.shut_down_within(Duration::from_secs(30), Duration::from_secs(30));
+        let took = started.elapsed();
+        finishing.join().unwrap();
+        assert!(took >= Duration::from_millis(50), "didn't wait for the connect ({took:?})");
+        assert!(took < Duration::from_secs(5), "waited {took:?}");
+        // One that doesn't finish is waited for only so long.
+        *app.connecting.lock().unwrap() = Some("Kitchen".into());
+        let started = Instant::now();
+        app.shut_down_within(Duration::from_millis(100), Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(2), "waited {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn removing_a_speaker_added_by_address_forgets_everything_kept_for_it() {
+        let app = test_app();
+        let id = app.add_manual_speaker(ManualKind::AirPlay, "Kitchen", "192.168.1.30", "").unwrap();
+        let mut settings = app.speaker_settings(&id);
+        settings.hidden = true;
+        settings.auto_connect = AutoConnect::Always;
+        app.set_speaker_settings(&id, settings);
+        app.set_airplay_password(&id, "secret");
+        app.store_airplay_pairing(&id, some_pairing("k"));
+        // Sealed copies this account can't open (a file from another PC).
+        let locked = |key: &str| crate::secret_store::LockedNode {
+            pointer: Some(crate::secret_store::pointer(&[key.to_string(), id.clone()])),
+            sealed: serde_json::json!("opaque"),
+        };
+        app.user_config.lock().unwrap().locked_secrets =
+            vec![locked("airplay_passwords"), locked("airplay_pairings")];
+
+        app.remove_manual_speaker(&id);
+        {
+            let uc = app.user_config.lock().unwrap();
+            assert!(uc.locked_secrets.is_empty(), "{:?}", uc.locked_secrets);
+            assert!(!uc.airplay_passwords.contains_key(&id));
+            assert!(!uc.airplay_pairings.contains_key(&id));
+        }
+        // Added again: a new speaker, listed and with default settings.
+        assert_eq!(app.add_manual_speaker(ManualKind::AirPlay, "Kitchen", "192.168.1.30", "").unwrap(), id);
+        assert!(app.speaker_settings(&id).is_default());
+        assert!(app.speaker_view().speakers.iter().any(|s| s.id == id));
+    }
+
+    #[test]
+    fn a_connect_that_ends_after_its_speaker_was_removed_is_undone() {
+        let app = test_app();
+        let id = app
+            .add_manual_speaker(ManualKind::Upnp, "Den", "http://192.168.1.31:49152/desc.xml", "")
+            .unwrap();
+        // A connect to it is under way when it is removed…
+        *app.connecting.lock().unwrap() = Some("Den".into());
+        app.remove_manual_speaker(&id);
+        // …and binds (and saves it as the last speaker) before it ends.
+        let (mut session, got) = unanswering_upnp_session();
+        if let ActiveSession::Upnp(s) = &mut session {
+            s.id_override = Some(id.clone());
+        }
+        bind(&app, session);
+        app.user_config.lock().unwrap().last_speaker_id = Some(id.clone());
+        *app.last_speaker_id.lock().unwrap() = Some(id.clone());
+        *app.connecting.lock().unwrap() = None;
+        assert!(eventually(|| !app.is_speaker_bound()), "still playing on a removed speaker");
+        assert!(got.recv_timeout(Duration::from_secs(5)).is_ok_and(|a| a.contains("#Stop")));
+        assert_eq!(app.saved_speaker_id(), None);
+        assert_eq!(*app.last_speaker_id.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn the_windows_device_name_follows_the_speaker_being_played_on() {
+        let app = test_app();
+        let names = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let record = names.clone();
+        app.follow_endpoint_label_every(
+            move |name| record.lock().unwrap().push(name.map(str::to_string)),
+            Duration::from_millis(5),
+        );
+        let seen = |n: usize| eventually(|| names.lock().unwrap().len() >= n);
+        // At start: back to the plain name, whatever a previous run left.
+        assert!(seen(1));
+        bind(&app, upnp_session(""));
+        assert!(seen(2));
+        // Disable takes the session: the plain name again.
+        app.set_streaming_enabled(false).unwrap();
+        assert!(seen(3));
+        std::thread::sleep(Duration::from_millis(50));
+        app.request_shutdown();
+        assert_eq!(*names.lock().unwrap(), [None, Some("Kitchen".to_string()), None]);
+    }
+
+    /// A listed speaker for the ranking table.
+    fn cand(id: &str, address: &str, name: &str) -> PlayerCandidate {
+        PlayerCandidate {
+            id: id.into(),
+            address: address.into(),
+            names: vec![name.into()],
+            group_rooms: Vec::new(),
+            device_name: None,
+            kind: PlayerKind::Other,
+            manual: false,
+            hidden: false,
+            used_before: false,
+            never_auto: false,
+        }
+    }
+
+    fn upnp(id: &str, address: &str, name: &str) -> PlayerCandidate {
+        PlayerCandidate { kind: PlayerKind::Upnp, ..cand(id, address, name) }
+    }
+
+    fn airplay(id: &str, address: &str, name: &str) -> PlayerCandidate {
+        PlayerCandidate { kind: PlayerKind::AirPlay, ..cand(id, address, name) }
+    }
+
+    fn picked(query: &str, rows: &[PlayerCandidate]) -> Option<(String, PlayerMatchKind, usize)> {
+        rank_player_match(query, rows).map(|m| (m.id, m.how, m.also_fitted))
+    }
+
+    #[test]
+    fn player_ranks_a_full_name_above_part_of_one() {
+        let rows = [cand("a", "10.0.0.1", "Kitchen Speaker"), cand("b", "10.0.0.2", "Kitchen")];
+        assert_eq!(picked("kitchen", &rows), Some(("b".into(), PlayerMatchKind::FullName, 0)));
+        assert_eq!(picked("  KITCHEN ", &rows), Some(("b".into(), PlayerMatchKind::FullName, 0)));
+        // An address beats a name that happens to be the same text.
+        let rows = [cand("a", "10.0.0.1", "10.0.0.2"), cand("b", "10.0.0.2", "Den")];
+        assert_eq!(picked("10.0.0.2", &rows), Some(("b".into(), PlayerMatchKind::Address, 0)));
+    }
+
+    #[test]
+    fn player_reaches_a_hidden_speaker_only_by_its_full_name_or_address() {
+        let mut den = cand("den", "10.0.0.31:7000", "Den");
+        den.hidden = true;
+        let rows = [den, cand("kitchen", "10.0.0.30", "Kitchen")];
+        assert_eq!(picked("den", &rows), Some(("den".into(), PlayerMatchKind::FullName, 0)));
+        assert_eq!(picked("10.0.0.31", &rows), Some(("den".into(), PlayerMatchKind::Address, 0)));
+        assert_eq!(picked("de", &rows), None);
+        // A shown speaker of the same name comes first.
+        let mut hidden = cand("hidden", "10.0.0.40", "Office");
+        hidden.hidden = true;
+        let rows = [hidden, cand("shown", "10.0.0.41", "office")];
+        assert_eq!(picked("Office", &rows), Some(("shown".into(), PlayerMatchKind::FullName, 1)));
+    }
+
+    #[test]
+    fn player_prefers_a_speaker_used_before_then_one_allowed_to_connect() {
+        let mut used = cand("used", "10.0.0.2", "Kitchen 2");
+        used.used_before = true;
+        let rows = [cand("new", "10.0.0.1", "Kitchen 1"), used];
+        assert_eq!(picked("kitchen", &rows), Some(("used".into(), PlayerMatchKind::PartOfName, 1)));
+
+        let mut never = cand("never", "10.0.0.1", "Kitchen 1");
+        never.never_auto = true;
+        let rows = [never.clone(), cand("other", "10.0.0.2", "Kitchen 2")];
+        assert_eq!(picked("kitchen", &rows), Some(("other".into(), PlayerMatchKind::PartOfName, 1)));
+        // Set to never connect by itself, but named: still taken when alone.
+        assert_eq!(picked("kitchen", &[never.clone()]), Some(("never".into(), PlayerMatchKind::PartOfName, 0)));
+        assert_eq!(picked("Kitchen 1", &[never]), Some(("never".into(), PlayerMatchKind::FullName, 0)));
+    }
+
+    #[test]
+    fn player_takes_the_first_in_list_order_among_equals() {
+        let rows = [cand("one", "10.0.0.1", "Kitchen 1"), cand("two", "10.0.0.2", "Kitchen 2")];
+        assert_eq!(picked("kitchen", &rows), Some(("one".into(), PlayerMatchKind::PartOfName, 1)));
+        assert_eq!(picked("bathroom", &rows), None);
+        assert_eq!(picked("", &rows), None, "an empty name is no search");
+    }
+
+    /// A Sonos group row as the list builds it: labelled by its room and
+    /// another, with the device's own description name behind it.
+    fn sonos_group() -> PlayerCandidate {
+        let mut g = upnp("group", "192.168.1.10", "Living Room + 2");
+        g.names.push("Living Room".into());
+        g.group_rooms = vec!["Kitchen".into(), "Patio".into()];
+        g.device_name = Some("192.168.1.10 - Sonos One".into());
+        g
+    }
+
+    #[test]
+    fn player_finds_a_room_inside_a_sonos_group_then_its_device_name() {
+        let rows = [sonos_group(), cand("den", "10.0.0.2", "Den")];
+        assert_eq!(picked("Living Room", &rows), Some(("group".into(), PlayerMatchKind::FullName, 0)));
+        assert_eq!(picked("living", &rows), Some(("group".into(), PlayerMatchKind::PartOfName, 0)));
+        assert_eq!(picked(" pati ", &rows), Some(("group".into(), PlayerMatchKind::GroupRoom, 0)));
+        assert_eq!(picked("Sonos One", &rows), Some(("group".into(), PlayerMatchKind::DeviceName, 0)));
+        let mut hidden = rows.clone();
+        hidden[0].hidden = true;
+        assert_eq!(picked("Patio", &hidden), None);
+        assert_eq!(picked("Sonos One", &hidden), None);
+        assert_eq!(picked("Living Room", &hidden), Some(("group".into(), PlayerMatchKind::FullName, 0)));
+    }
+
+    #[test]
+    fn player_finds_what_the_old_upnp_lookup_found() {
+        // The UPnP lookup --player used before matched a renderer by its
+        // exact address, part of its description name, part of its room,
+        // part of a room in its group. Each still finds it.
+        let mut alone = upnp("alone", "192.168.1.20", "192.168.1.20 - Sonos Five");
+        alone.names.push("Bedroom".into());
+        let rows = [sonos_group(), alone];
+        for (query, id) in [
+            ("192.168.1.20", "alone"),
+            ("sonos five", "alone"),
+            ("bedroom", "alone"),
+            ("bed", "alone"),
+            ("192.168.1.10", "group"),
+            ("one", "group"),
+            ("living", "group"),
+            ("kitchen", "group"),
+        ] {
+            assert_eq!(picked(query, &rows).map(|p| p.0).as_deref(), Some(id), "{query}");
+        }
+    }
+
+    #[test]
+    fn player_matches_an_address_with_addresses_only() {
+        // A Sonos's UPnP name holds its address; the speaker meant is off.
+        let rows = [upnp("sonos", "192.168.1.50", "192.168.1.50 - Sonos One"), cand("odd", "10.0.0.9", "192.168.1.5")];
+        assert_eq!(picked("192.168.1.5", &rows), None);
+        assert_eq!(picked("192.168.1.50", &rows).map(|p| p.0).as_deref(), Some("sonos"));
+        // A speaker added by address is listed with its port; either form finds it.
+        let rows = [cand("manual", "192.168.1.40:7000", "Den"), cand("other", "192.168.1.41:7000", "Office")];
+        assert_eq!(picked("192.168.1.40", &rows).map(|p| p.0).as_deref(), Some("manual"));
+        assert_eq!(picked("192.168.1.40:7000", &rows).map(|p| p.0).as_deref(), Some("manual"));
+        assert_eq!(picked("192.168.1.40:7001", &rows), None);
+    }
+
+    #[test]
+    fn player_takes_a_sonoss_upnp_entry_before_its_airplay_one() {
+        // List order would put either first; the UPnP entry wins.
+        let rows = [airplay("airplay:SONOS", "192.168.1.30", "Kitchen"), upnp("uuid:SONOS", "192.168.1.30", "Kitchen")];
+        assert_eq!(picked("Kitchen", &rows), Some(("uuid:SONOS".into(), PlayerMatchKind::FullName, 1)));
+        assert_eq!(picked("192.168.1.30", &rows), Some(("uuid:SONOS".into(), PlayerMatchKind::Address, 1)));
+        // An AirPlay speaker without a UPnP twin is taken as it is.
+        let rows = [airplay("airplay:POD", "192.168.1.31", "Kitchen"), upnp("uuid:OTHER", "192.168.1.32", "Kitchen")];
+        assert_eq!(picked("Kitchen", &rows).map(|p| p.0).as_deref(), Some("airplay:POD"));
+    }
+
+    #[test]
+    fn player_waits_for_discoverys_first_look_before_choosing() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // A Sonos answers mDNS first: its AirPlay entry is listed alone
+        // until the first UPnP sweep is published.
+        let mut steps = WishSteps::new(t0);
+        let early = [airplay("airplay:SONOS", "192.168.1.30", "Kitchen")];
+        assert_eq!(steps.next(at(800), "Kitchen", &early, false, false), None);
+        let both = [airplay("airplay:SONOS", "192.168.1.30", "Kitchen"), upnp("uuid:SONOS", "192.168.1.30", "Kitchen")];
+        assert_eq!(steps.next(at(3500), "Kitchen", &both, true, false).map(|m| m.id).as_deref(), Some("uuid:SONOS"));
+
+        // A near match listed early doesn't win for good.
+        let mut steps = WishSteps::new(t0);
+        let early = [airplay("airplay:NEAR", "192.168.1.40", "Kitchen Speaker")];
+        assert_eq!(steps.next(at(800), "Kitchen", &early, false, false), None);
+        let later = [airplay("airplay:NEAR", "192.168.1.40", "Kitchen Speaker"), upnp("uuid:K", "192.168.1.41", "Kitchen")];
+        assert_eq!(steps.next(at(3500), "Kitchen", &later, true, false).map(|m| m.id).as_deref(), Some("uuid:K"));
+
+        // No UPnP speakers on the network: after the first look's time the
+        // AirPlay speaker is taken.
+        let mut steps = WishSteps::new(t0);
+        let only = [airplay("airplay:POD", "192.168.1.31", "Kitchen")];
+        assert_eq!(steps.next(at(4900), "Kitchen", &only, false, false), None);
+        assert_eq!(steps.next(at(5000), "Kitchen", &only, false, false).map(|m| m.id).as_deref(), Some("airplay:POD"));
+
+        // A speaker added by address is taken at once.
+        let mut steps = WishSteps::new(t0);
+        let manual = [PlayerCandidate { manual: true, ..cand("manual:den", "192.168.1.50:7000", "Den") }];
+        assert_eq!(steps.next(at(1), "Den", &manual, false, false).map(|m| m.id).as_deref(), Some("manual:den"));
+    }
+
+    #[test]
+    fn player_tries_a_speaker_once_per_appearance() {
+        let t0 = Instant::now();
+        let mut steps = WishSteps::new(t0);
+        let rows = [upnp("uuid:K", "192.168.1.41", "Kitchen")];
+        assert!(steps.next(t0, "Kitchen", &rows, true, true).is_none(), "nothing while a connect is under way");
+        assert!(steps.next(t0, "Kitchen", &rows, true, false).is_some());
+        assert!(steps.next(t0, "Kitchen", &rows, true, false).is_none(), "tried already");
+        assert!(steps.next(t0, "Kitchen", &[], true, false).is_none());
+        assert!(steps.next(t0, "Kitchen", &rows, true, false).is_some(), "back in the list: tried again");
+    }
+
+    #[test]
+    fn a_speaker_that_wants_pin_pairing_is_said_to_need_the_person() {
+        let reasons = [
+            PinReason::Required,
+            PinReason::Damaged("bad hex".into()),
+            PinReason::NotProven { addr: "192.168.1.9".parse().unwrap(), detail: "M2".into() },
+            PinReason::Refused,
+        ];
+        for reason in reasons {
+            let text = pin_pairing_message("Living Room", &reason, false);
+            assert!(needs_the_person(&text), "{reason:?}: {text}");
+        }
+        assert!(!needs_the_person("couldn't read http://127.0.0.1:9/desc.xml: Connection refused"));
+    }
+
+    #[test]
+    fn a_partial_or_shared_player_match_is_explained_in_the_log() {
+        let m = |how, also_fitted| PlayerMatch { id: "x".into(), how, also_fitted };
+        assert_eq!(m(PlayerMatchKind::FullName, 0).explain("Kitchen", "Kitchen"), None);
+        assert_eq!(m(PlayerMatchKind::Address, 0).explain("10.0.0.2", "Den"), None);
+        assert_eq!(
+            m(PlayerMatchKind::PartOfName, 2).explain("kit", "Kitchen").as_deref(),
+            Some("--player \"kit\": taking \"Kitchen\", matched by part of its name; 2 other speaker(s) matched the same way")
+        );
+        assert!(m(PlayerMatchKind::FullName, 1).explain("Den", "Den").unwrap().contains("1 other"));
+        assert!(m(PlayerMatchKind::GroupRoom, 0).explain("Patio", "Living Room + 2").unwrap().contains("Sonos group"));
+    }
+
+    #[test]
+    fn a_player_wish_skips_a_hidden_near_match_and_takes_the_full_name() {
+        let app = test_app();
+        let near = app
+            .add_manual_speaker(ManualKind::Upnp, "Den Speaker", "http://127.0.0.1:9/near.xml", "")
+            .unwrap();
+        let mut hide = app.speaker_settings(&near);
+        hide.hidden = true;
+        app.set_speaker_settings(&near, hide);
+        app.connect_when_listed_every("Den".into(), Duration::from_millis(5));
+        // Only the hidden near match is listed: no attempt.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(app.current_error(), None);
+        // The speaker by that full name appears: that one is tried.
+        app.add_manual_speaker(ManualKind::Upnp, "Den", "http://127.0.0.1:9/den.xml", "").unwrap();
+        assert!(
+            eventually(|| app.current_error().is_some_and(|e| e.contains("den.xml"))),
+            "{:?}",
+            app.current_error()
+        );
+    }
+
+    #[test]
+    fn player_finds_any_kind_of_speaker_by_name_or_address() {
+        let app = test_app();
+        let kitchen = app.add_manual_speaker(ManualKind::AirPlay, "Kitchen", "192.168.1.30", "").unwrap();
+        let den = app
+            .add_manual_speaker(ManualKind::Upnp, "Den", "http://192.168.1.31:49152/desc.xml", "")
+            .unwrap();
+        let found = |q: &str| app.find_listed_speaker(q).map(|m| (m.id, m.how));
+        assert_eq!(found("kitchen"), Some((kitchen.clone(), PlayerMatchKind::FullName)));
+        assert_eq!(found("KITCH"), Some((kitchen.clone(), PlayerMatchKind::PartOfName)));
+        assert_eq!(found("192.168.1.30"), Some((kitchen.clone(), PlayerMatchKind::Address)));
+        assert_eq!(found("192.168.1.31"), Some((den.clone(), PlayerMatchKind::Address)));
+        assert_eq!(found("Bathroom"), None);
+        assert_eq!(found("192.168.1.3"), None, "an address matches whole");
+        // The list's label isn't a name: "(AirPlay, added manually)" isn't searched.
+        assert_eq!(found("manually"), None);
+        // A hidden speaker is reached by its full name, not by part of it.
+        let mut hidden = app.speaker_settings(&den);
+        hidden.hidden = true;
+        app.set_speaker_settings(&den, hidden);
+        assert_eq!(found("den"), Some((den.clone(), PlayerMatchKind::FullName)));
+        assert_eq!(found("de"), None);
+    }
+
+    /// Wait for `cond`, polling; false after `PATIENCE`.
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        cond()
+    }
+
+    #[test]
+    fn a_player_wish_waits_for_its_speaker_and_then_connects() {
+        let app = test_app();
+        app.connect_when_listed_every("Den".into(), Duration::from_millis(5));
+        assert_eq!(app.player_wish(), Some(PlayerWish::Looking { query: "Den".into() }));
+        // Nothing by that name yet: no attempt, still waiting.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(app.current_error(), None);
+        // It appears (nothing answers there, so the connect fails at once).
+        app.add_manual_speaker(ManualKind::Upnp, "Den", "http://127.0.0.1:9/desc.xml", "").unwrap();
+        assert!(
+            eventually(|| app.current_error().is_some_and(|e| e.starts_with("Couldn't connect"))),
+            "no connect attempt: {:?}",
+            app.current_error()
+        );
+        // The window says it failed, and why, while it waits for it to come back.
+        assert!(
+            eventually(|| matches!(app.player_wish(), Some(PlayerWish::Failed { .. }))),
+            "{:?}",
+            app.player_wish()
+        );
+        match app.player_wish() {
+            Some(PlayerWish::Failed { speaker, reason, needs_person, .. }) => {
+                assert_eq!(speaker, "Den");
+                let reason = reason.expect("the connect's reason");
+                assert!(reason.contains("127.0.0.1:9") && !reason.starts_with("Couldn't connect"), "{reason}");
+                assert!(!needs_person);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_player_wish_gives_way_to_the_users_pick() {
+        let app = test_app();
+        app.connect_when_listed_every("Den".into(), Duration::from_millis(5));
+        app.note_user_pick();
+        assert!(eventually(|| app.player_wish().is_none()), "still waiting after the user picked");
+    }
+
+    #[test]
+    fn this_pcs_address_is_the_first_one_known() {
+        let v4 = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let any = ip("0.0.0.0");
+        let never = || -> Option<IpAddr> { panic!("looked up after an answer") };
+        let never4 = || -> Option<Ipv4Addr> { panic!("looked up after an answer") };
+        assert_eq!(this_pc_address_from(Some(ip("10.9.9.9")), ip("10.0.0.2"), Some(v4("10.0.0.3")), never, never, never4), ip("10.9.9.9"));
+        assert_eq!(this_pc_address_from(None, ip("10.0.0.2"), Some(v4("10.0.0.3")), never, never, never4), ip("10.0.0.2"));
+        assert_eq!(this_pc_address_from(None, any, Some(v4("10.0.0.3")), never, never, never4), ip("10.0.0.3"));
+        assert_eq!(this_pc_address_from(None, any, None, || Some(ip("10.0.0.4")), never, never4), ip("10.0.0.4"));
+        assert_eq!(this_pc_address_from(None, any, None, || None, || Some(ip("10.0.0.5")), never4), ip("10.0.0.5"));
+        assert_eq!(this_pc_address_from(None, any, None, || None, || None, || Some(v4("10.0.0.6"))), ip("10.0.0.6"));
+        // No network at all: still an address, this PC's own.
+        assert_eq!(this_pc_address_from(None, any, None, || None, || None, || None), ip("127.0.0.1"));
+    }
+
+    #[test]
+    fn the_web_link_names_the_one_address_the_server_listens_on() {
+        let app = app_without_advertise_ip("127.0.0.1:8080");
+        assert_eq!(link_host(&app), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn the_web_link_follows_the_adapter_chosen_for_discovery() {
+        let app = app_without_advertise_ip("0.0.0.0:8080");
+        *app.discovery_scope.lock().unwrap() =
+            Resolved::Active { name: "Wi-Fi".into(), ip: "10.1.2.3".parse().unwrap() };
+        assert_eq!(link_host(&app), "10.1.2.3:8080");
+        // The adapter is down: the link names something else.
+        *app.discovery_scope.lock().unwrap() = Resolved::Paused { name: "Wi-Fi".into() };
+        assert_ne!(link_host(&app), "10.1.2.3:8080");
+    }
+
+    #[test]
+    fn the_web_link_names_this_pc_on_the_speakers_network() {
+        let app = app_without_advertise_ip("0.0.0.0:8080");
+        // The speaker is on this PC: Windows reaches it from loopback.
+        bind(&app, upnp_session(""));
+        assert_eq!(link_host(&app), "127.0.0.1:8080");
+    }
+
     #[test]
     fn turning_the_web_ui_on_makes_its_secret_once_and_keeps_it() {
-        let app = test_app_defaults();
+        let app = test_app();
         assert!(!app.is_web_ui_enabled());
         assert_eq!(app.web_link(), None);
         app.set_web_ui_enabled(true).unwrap();
@@ -5617,7 +6856,7 @@ mod tests {
         // Settings that can't be saved (config.json couldn't be read at
         // startup): a key kept only in memory would be undone by the next
         // start, which brings back the link the user meant to retire.
-        let app = test_app_defaults();
+        let app = test_app();
         let key = "00112233445566778899aabbccddeeff";
         let mut settings = UserConfig::unsaveable();
         settings.web_secret = Some(key.into());
@@ -5639,13 +6878,13 @@ mod tests {
 
     #[test]
     fn a_stored_web_secret_is_used_and_an_unusable_one_replaced() {
-        let app = test_app_defaults();
+        let app = test_app();
         let key = "00112233445566778899aabbccddeeff";
         app.user_config.lock().unwrap().web_secret = Some(key.into());
         app.set_web_ui_enabled(true).unwrap();
         assert_eq!(app.web_link(), Some(format!("http://192.168.1.10:8080/r/{key}/")));
         for bad in ["", "short", "zz112233445566778899aabbccddeeff"] {
-            let app = test_app_defaults();
+            let app = test_app();
             app.user_config.lock().unwrap().web_secret = Some(bad.into());
             app.set_web_ui_enabled(true).unwrap();
             let stored = app.user_config.lock().unwrap().web_secret.clone().unwrap();
@@ -5662,7 +6901,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sts-app-web-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("config.json");
-        let app = test_app_defaults();
+        let app = test_app();
         *app.user_config.lock().unwrap() = UserConfig::at_path(path.clone());
         let printed = web_access::link_from_settings(
             "192.168.1.10",
@@ -5786,7 +7025,7 @@ mod tests {
     /// or none after Forget saved), and only while a pairing is stored.
     #[test]
     fn forgetting_a_pairing_is_offered_for_the_device_that_holds_it() {
-        let app = test_app_defaults();
+        let app = test_app();
         let (den, kitchen) = ("airplay:DEN", "airplay:KITCHEN");
         {
             let mut uc = app.user_config.lock().unwrap();
@@ -5820,7 +7059,7 @@ mod tests {
     #[test]
     fn a_failed_pair_verify_leaves_the_stored_pairing_alone() {
         use crate::airplay::test_peers::{self, Peer, M4};
-        let app = test_app_defaults();
+        let app = test_app();
         let creds = test_peers::stored_credentials();
         for (peer, want) in [
             (Peer::StatusAtM1("400 Bad Request"), "not proven"),
@@ -5868,7 +7107,7 @@ mod tests {
     /// Forget pairing removes that device's pairing and no other.
     #[test]
     fn forget_pairing_removes_only_that_devices_pairing() {
-        let app = test_app_defaults();
+        let app = test_app();
         {
             let mut uc = app.user_config.lock().unwrap();
             uc.airplay_pairings.insert("airplay:DEN".into(), some_pairing("den"));

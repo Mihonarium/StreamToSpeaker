@@ -19,6 +19,10 @@
 use anyhow::{bail, Result};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use crate::latest::Latest;
 
 use windows_sys::core::{GUID, HRESULT};
 use windows_sys::Win32::Foundation::BOOL;
@@ -119,30 +123,46 @@ fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// One worker renames the device, always to the latest name asked for:
+/// renames asked for in quick succession (a bind, then Disable) can't
+/// finish out of order, and a name counts as done only once it was set.
+fn renames() -> &'static Latest<Option<String>> {
+    static RENAMES: OnceLock<Latest<Option<String>>> = OnceLock::new();
+    RENAMES.get_or_init(|| {
+        Latest::new("stream-to-speaker-rename-endpoint", |speaker: &Option<String>| {
+            let new_name = match speaker {
+                Some(s) => format!("Stream To Speaker{}{}", ARROW, s),
+                None => "Stream To Speaker".to_string(),
+            };
+            match do_update(&new_name) {
+                Ok(()) => true,
+                Err(e) => {
+                    // Warn, not debug. This is cosmetic enough to ignore at
+                    // runtime but not so cosmetic that it should be invisible:
+                    // it went unnoticed for a long time precisely because the
+                    // one failure that mattered never showed up in the log.
+                    log::warn!("could not rename the Windows endpoint (cosmetic): {:#}", e);
+                    false
+                }
+            }
+        })
+    })
+}
+
 /// Update the friendly name of the Stream To Speaker endpoint to
 /// reflect the active speaker. Pass `Some(name)` while streaming,
 /// `None` to revert to the default. Logs at warn-level on failure;
-/// caller does not need to handle the error.
+/// caller does not need to handle the error. Returns at once: the whole
+/// thing (registry scan, COM init, IPC) can take 100+ ms.
 pub fn update_endpoint_name(active_speaker: Option<&str>) {
-    let new_name = match active_speaker {
-        Some(s) => format!("Stream To Speaker{}{}", ARROW, s),
-        None => "Stream To Speaker".to_string(),
-    };
-    // The whole thing — registry scan, COM init, IPC — can take
-    // 100+ ms; do it on a detached thread so callers (GUI / select_
-    // speaker) don't block.
-    std::thread::Builder::new()
-        .name("stream-to-speaker-rename-endpoint".to_string())
-        .spawn(move || {
-            if let Err(e) = do_update(&new_name) {
-                // Warn, not debug. This is cosmetic enough to ignore at
-                // runtime but not so cosmetic that it should be invisible:
-                // it went unnoticed for a long time precisely because the
-                // one failure that mattered never showed up in the log.
-                log::warn!("could not rename the Windows endpoint (cosmetic): {:#}", e);
-            }
-        })
-        .ok();
+    renames().want(active_speaker.map(str::to_string));
+}
+
+/// [`update_endpoint_name`], waiting up to `max` for the rename: at quit,
+/// where the process would otherwise end it half-way.
+pub fn update_endpoint_name_within(active_speaker: Option<&str>, max: Duration) {
+    let ticket = renames().want(active_speaker.map(str::to_string));
+    renames().wait(ticket, max);
 }
 
 fn do_update(new_name: &str) -> Result<()> {

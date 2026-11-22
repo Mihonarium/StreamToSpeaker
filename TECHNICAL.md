@@ -43,7 +43,7 @@ End-to-end latency on wired ethernet: ~150-300 ms, tuneable at runtime.
 
 - **Driver**: VS 2022 Build Tools (or EWDK) + WDK 10.0.22621+. See
   `driver/README.md`.
-- **Service**: Rust 1.74+ stable.
+- **Service**: Rust 1.88+ stable.
 - **Installer** (optional): [Inno Setup 6](https://jrsoftware.org/isdl.php).
 
 ## Building from source
@@ -107,7 +107,7 @@ stale name. `scripts\Rename-Endpoint.ps1`, run elevated, overwrites it
 |---|---|
 | *(none)* | GUI window + tray. Closing the window minimises to tray. |
 | `--no-tray` | GUI only. Closing the window exits. |
-| `--headless` | No GUI; speaker via `--player` or the terminal picker. For service installs and SSH; `--web-link` prints the web UI's link. |
+| `--headless` | No GUI; the speaker from last time, `--player`, or (in a terminal) a prompt. For service installs and SSH; `--web-link` prints the web UI's link. |
 | `--web` | Adds the web UI and HTTP/JSON API, behind a secret link ([HTTP API](#http-api)). Combines with any mode; with `--headless` the link is printed once at start, to a console that a service may not have. |
 | `--web-link` | Prints the web UI's link and exits (making its key if there is none yet). Run it as the account the app runs under, with the app's `--port` and `--advertise-ip`. |
 
@@ -118,9 +118,25 @@ only under `--web`.
 
 ## Speaker selection
 
-The GUI and tray lists update as discovery runs. `--player` takes a name
-substring or an IPv4 literal; `--list-speakers` prints and exits. Without
-`--player`, `--headless` on a TTY offers a numbered prompt. Under `--web`,
+The GUI and tray lists update as discovery runs. `--player` names a
+speaker of any kind. The app starts anyway and decides once discovery has
+had its first look (the first UPnP sweep is published, or 5 s; a speaker
+added by address is taken at once), then from whatever is listed when
+something first matches, unless someone picks another first. An address
+(with or without a port) matches addresses only. A name: the full name
+(any letter case), a hidden speaker too; else part of the name of a
+speaker the list shows; else part of a room inside a Sonos group; else
+part of the device's own description name (such as "Sonos One"). Among
+several: shown before hidden, a speaker's UPnP entry before its AirPlay
+one, one used before, one not set never to connect by itself, then list
+order. A partial or shared match is logged with what was taken. If
+connecting fails, the window says so; it is tried again when it comes back
+to the list. `--list-speakers` searches,
+prints what the window would list and exits. Without `--player`, the
+speaker used last time is reconnected; `--headless` in a terminal asks with
+a numbered prompt instead (`r` searches again) when there is something to
+choose from. In that prompt the speaker used last time comes first, Enter
+takes it, and it is taken after 15 s without an answer. Under `--web`,
 `POST /api/select` with `{"id": "<udn-or-ip>"}` and the API key
 ([HTTP API](#http-api)). Discovery re-runs every `--ssdp-interval` minutes.
 
@@ -207,8 +223,6 @@ milliseconds (`airplay_latency_ms` in config.json; default 2000, range
 
 ### Tuning notes
 
-- `--initial-buffer-ms` is a prebuffer hint in the DIDL metadata; Sonos
-  generally ignores it, so prefer the runtime knobs.
 - `--silence-pace-ms` is wall-clock ms between silence packets while the
   audio engine is paused. Default 10 = real-time; higher under-produces,
   draining the speaker's prebuffer between tracks so post-pause latency is
@@ -233,9 +247,11 @@ automatically. "Skip this version" / "Later" and the on/off switch
 
 The version compared is the **release tag**, baked in by CI as
 `STS_RELEASE_VERSION` on `v*` tag builds (`release_version()` /
-`display_version()` in `lib.rs`) — not `CARGO_PKG_VERSION`, which is
-versioned independently. A build without it is a dev build: the label shows
-the crate version and update checks are off.
+`display_version()` in `lib.rs`) — not `CARGO_PKG_VERSION`: the crate
+version tracks the release tag (a release bumps it, and CI stamps the tag
+into it on tag builds), but only a tag build is a release. A build without
+it is a dev build: the label shows the crate version and update checks are
+off.
 
 ## HTTP API
 
@@ -317,7 +333,7 @@ StreamToSpeaker/
 └── service/src/
     ├── main.rs          CLI parsing, mode dispatch
     ├── app.rs           central Arc<App> state + actions
-    ├── audio_loop.rs    audio loop, own thread
+    ├── audio_loop.rs    audio loop; silence while Windows plays nothing
     ├── audio_source.rs  source abstraction
     ├── ioctl_source.rs  driver IOCTL consumer (audio + events)
     ├── wasapi_source.rs loopback fallback · sine_source.rs  test tone
