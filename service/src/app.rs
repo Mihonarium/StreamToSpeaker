@@ -5006,12 +5006,7 @@ mod tests {
         assert!(first.contains("one-time pairing") && !first.contains("Forget pairing"), "{first}");
     }
 
-    /// Starting the AirPlay 2 path with a stored pairing, whatever the
-    /// receiver answers to pair-verify: the attempt says why it failed,
-    /// the pairing stays as it was (only a new PIN pairing or the user's
-    /// Forget pairing changes it) and transient pairing is never tried.
-    /// An app with AirPlay discovery (nothing on disk is written by what
-    /// these tests do).
+    /// An app with AirPlay discovery, on in-memory settings.
     fn airplay_test_app() -> (Arc<App>, Arc<AirPlayDiscoveryState>) {
         airplay_test_app_with(AirPlayDiscoveryState::new())
     }
@@ -5032,6 +5027,8 @@ mod tests {
             None,
             Some(discovery.clone()),
         );
+        // Never the settings of whoever runs the tests.
+        *app.user_config.lock().unwrap() = UserConfig::in_memory();
         (app, discovery)
     }
 
@@ -5231,6 +5228,10 @@ mod tests {
         assert_eq!(discovery.working_address("0D0000000002"), Some(ip("127.0.0.1")));
     }
 
+    /// Starting the AirPlay 2 path with a stored pairing, whatever the
+    /// receiver answers to pair-verify: the attempt says why it failed,
+    /// the pairing stays as it was (only a new PIN pairing or the user's
+    /// Forget pairing changes it) and transient pairing is never tried.
     #[test]
     fn a_failed_pair_verify_leaves_the_stored_pairing_alone() {
         use crate::airplay::test_peers::{self, Peer, M4};
