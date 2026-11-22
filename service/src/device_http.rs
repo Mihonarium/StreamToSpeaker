@@ -44,6 +44,14 @@ pub(crate) struct Limits {
     pub max_bytes: usize,
 }
 
+impl Limits {
+    /// These limits, with no more than `left` for connecting and for the
+    /// whole exchange.
+    pub fn within(&self, left: Duration) -> Limits {
+        Limits { connect: self.connect.min(left), deadline: self.deadline.min(left), max_bytes: self.max_bytes }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Response {
     pub status: u16,

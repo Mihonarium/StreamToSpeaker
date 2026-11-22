@@ -18,11 +18,13 @@ use anyhow::{anyhow, Result};
 use log::debug;
 use std::time::Duration;
 
-/// Issue SetAVTransportURI to point the renderer at our HTTP stream URL.
-pub fn set_av_transport_uri(
+/// Issue SetAVTransportURI to point the renderer at our HTTP stream URL,
+/// within `limits` (a connect gives it [`TRANSPORT`]).
+pub(crate) fn set_av_transport_uri(
     control_url: &str,
     stream_uri: &str,
     didl_metadata: &str,
+    limits: &Limits,
 ) -> Result<()> {
     let body = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -38,11 +40,18 @@ pub fn set_av_transport_uri(
         uri = xml_escape(stream_uri),
         meta = xml_escape(didl_metadata),
     );
-    soap_post(control_url, AV_TRANSPORT, "SetAVTransportURI", &body, &TRANSPORT)?;
+    soap_post(control_url, AV_TRANSPORT, "SetAVTransportURI", &body, limits)?;
     Ok(())
 }
 
+/// Play, within the short limit: what Resync sends, from a thread a
+/// person is waiting on.
 pub fn play(control_url: &str) -> Result<()> {
+    play_within(control_url, &SHORT)
+}
+
+/// Play within `limits` (a connect gives it [`TRANSPORT`]).
+pub(crate) fn play_within(control_url: &str, limits: &Limits) -> Result<()> {
     let body = r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 <s:Body>
@@ -52,11 +61,16 @@ pub fn play(control_url: &str) -> Result<()> {
 </u:Play>
 </s:Body>
 </s:Envelope>"#;
-    soap_post(control_url, AV_TRANSPORT, "Play", body, &TRANSPORT)?;
+    soap_post(control_url, AV_TRANSPORT, "Play", body, limits)?;
     Ok(())
 }
 
 pub fn stop(control_url: &str) -> Result<()> {
+    stop_within(control_url, &SHORT)
+}
+
+/// Stop within `limits`, at most the short limit's.
+pub(crate) fn stop_within(control_url: &str, limits: &Limits) -> Result<()> {
     let body = r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 <s:Body>
@@ -65,7 +79,7 @@ pub fn stop(control_url: &str) -> Result<()> {
 </u:Stop>
 </s:Body>
 </s:Envelope>"#;
-    soap_post(control_url, AV_TRANSPORT, "Stop", body, &SHORT)?;
+    soap_post(control_url, AV_TRANSPORT, "Stop", body, &limits.within(SHORT.deadline))?;
     Ok(())
 }
 
@@ -198,8 +212,9 @@ pub(crate) fn zone_group_state_from_response(resp: &str) -> Result<String> {
 }
 
 /// The types a renderer says it plays: the `Sink` list of its
-/// ConnectionManager's GetProtocolInfo.
-pub fn get_protocol_info(control_url: &str) -> Result<Vec<ProtocolInfo>> {
+/// ConnectionManager's GetProtocolInfo, within `limits` (at most
+/// [`PROTOCOL_LIST`]'s).
+pub(crate) fn get_protocol_info(control_url: &str, limits: &Limits) -> Result<Vec<ProtocolInfo>> {
     let body = r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 <s:Body>
@@ -207,7 +222,8 @@ pub fn get_protocol_info(control_url: &str) -> Result<Vec<ProtocolInfo>> {
 </u:GetProtocolInfo>
 </s:Body>
 </s:Envelope>"#;
-    let resp = soap_post(control_url, CONNECTION_MANAGER, "GetProtocolInfo", body, &PROTOCOL_LIST)?;
+    let limits = limits.within(PROTOCOL_LIST.deadline);
+    let resp = soap_post(control_url, CONNECTION_MANAGER, "GetProtocolInfo", body, &limits)?;
     let doc = roxmltree::Document::parse(resp.trim_start_matches('\u{feff}').trim_start())
         .map_err(|e| anyhow!("GetProtocolInfo answer isn't XML: {e}"))?;
     let sink = doc
@@ -262,17 +278,20 @@ const MAX_SOAP_RESPONSE_BYTES: usize = 4 << 20;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Volume and mute, which someone is waiting on, and the Stop sent before
-/// connecting or when moving to another speaker, which is best-effort.
-const SHORT: Limits = Limits {
+/// Volume and mute, which someone is waiting on, Play and Stop on their
+/// own (Resync, moving to another speaker), and the Stop sent before
+/// connecting, which is best-effort.
+pub(crate) const SHORT: Limits = Limits {
     connect: CONNECT_TIMEOUT,
     deadline: Duration::from_secs(5),
     max_bytes: MAX_SOAP_RESPONSE_BYTES,
 };
 
-/// SetAVTransportURI and Play. A renderer may fetch the stream before it
-/// answers them, and UPnP gives a device 30 s to complete an action.
-const TRANSPORT: Limits = Limits {
+/// SetAVTransportURI and Play while connecting (`app::start_session`). A
+/// renderer may fetch the stream before it answers them, and UPnP gives a
+/// device 30 s to complete an action. Nothing else uses it: a connect runs
+/// on a thread of its own, other calls may run where a person waits.
+pub(crate) const TRANSPORT: Limits = Limits {
     connect: CONNECT_TIMEOUT,
     deadline: Duration::from_secs(30),
     max_bytes: MAX_SOAP_RESPONSE_BYTES,
@@ -291,7 +310,7 @@ const TOPOLOGY: Limits = Limits {
 /// renderer lists only chooses among the app's own stream profiles, and
 /// without it the original stream is offered first. Real lists are a few
 /// KB.
-const PROTOCOL_LIST: Limits = Limits {
+pub(crate) const PROTOCOL_LIST: Limits = Limits {
     connect: Duration::from_secs(3),
     deadline: Duration::from_secs(3),
     max_bytes: 64 * 1024,
@@ -599,8 +618,19 @@ mod tests {
         let fake = FakeRenderer::start(|_| {
             Reply::soap_ok(AV_TRANSPORT, "SetAVTransportURI", &[]).after(Duration::from_secs(6))
         });
-        set_av_transport_uri(&fake.url("/AVTransport/Control"), "http://127.0.0.1:1/stream.raw", "")
+        set_av_transport_uri(&fake.url("/AVTransport/Control"), "http://127.0.0.1:1/stream.raw", "", &TRANSPORT)
             .expect("a slow answer is still an answer");
+    }
+
+    #[test]
+    fn play_on_its_own_gives_up_at_the_short_limit() {
+        // Resync sends Play from the window's thread: a speaker that never
+        // answers must not hold it for the connect's long limit.
+        let fake = FakeRenderer::start(|_| Reply::silent());
+        let start = Instant::now();
+        let e = play(&fake.url("/AVTransport/Control")).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(15), "{:?}", start.elapsed());
+        assert!(format!("{e:#}").contains("no answer within 5 s"), "{e:#}");
     }
 
     #[test]
@@ -655,7 +685,7 @@ mod tests {
     /// What SetAVTransportURI fails with when the renderer answers `reply`.
     fn refusal(reply: Reply) -> anyhow::Error {
         let fake = FakeRenderer::start(move |_| reply.clone());
-        set_av_transport_uri(&fake.url("/AVTransport/Control"), "http://127.0.0.1:1/stream.raw", "")
+        set_av_transport_uri(&fake.url("/AVTransport/Control"), "http://127.0.0.1:1/stream.raw", "", &TRANSPORT)
             .expect_err("refused")
     }
 
@@ -760,24 +790,24 @@ mod tests {
                 &[("Source", "http-get:*:audio/mpeg:*"), ("Sink", "http-get:*:audio/wav:*,http-get:*:audio/L16;rate=44100;channels=2:*")],
             )
         });
-        let sinks = get_protocol_info(&fake.url("/ConnectionManager/Control")).unwrap();
+        let sinks = get_protocol_info(&fake.url("/ConnectionManager/Control"), &PROTOCOL_LIST).unwrap();
         let info = |f: &str| ProtocolInfo { protocol: "http-get".into(), content_format: f.into() };
         assert_eq!(sinks, [info("audio/wav"), info("audio/L16;rate=44100;channels=2")]);
         assert_eq!(fake.soap_actions(), ["GetProtocolInfo"]);
         // A list too large for any real device is refused, not read.
         let big = format!("http-get:*:audio/wav:*,{}", "x".repeat(70 * 1024));
         let fake = FakeRenderer::start(move |_| Reply::soap_ok(CONNECTION_MANAGER, "GetProtocolInfo", &[("Sink", &big)]));
-        assert!(get_protocol_info(&fake.url("/ConnectionManager/Control")).is_err());
+        assert!(get_protocol_info(&fake.url("/ConnectionManager/Control"), &PROTOCOL_LIST).is_err());
         // No Sink in the answer.
         let fake = FakeRenderer::start(|_| Reply::soap_ok(CONNECTION_MANAGER, "GetProtocolInfo", &[]));
-        assert!(get_protocol_info(&fake.url("/ConnectionManager/Control")).is_err());
+        assert!(get_protocol_info(&fake.url("/ConnectionManager/Control"), &PROTOCOL_LIST).is_err());
     }
 
     #[test]
     fn a_renderer_slow_to_list_its_types_is_not_waited_for_long() {
         let fake = FakeRenderer::start(|_| Reply::silent());
         let start = Instant::now();
-        assert!(get_protocol_info(&fake.url("/ConnectionManager/Control")).is_err());
+        assert!(get_protocol_info(&fake.url("/ConnectionManager/Control"), &PROTOCOL_LIST).is_err());
         assert!(start.elapsed() < Duration::from_secs(15), "{:?}", start.elapsed());
     }
 

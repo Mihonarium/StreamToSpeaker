@@ -3952,7 +3952,7 @@ pub fn start_session(
     info!("targeting speaker: {} ({})", name, renderer.ip);
     let avt = renderer.av_transport_control_url.as_str();
     let ask = || match &renderer.connection_manager_control_url {
-        Some(url) => match upnp::get_protocol_info(url) {
+        Some(url) => match upnp::get_protocol_info(url, &upnp::PROTOCOL_LIST) {
             Ok(list) => Sinks::Listed(list),
             Err(e) => {
                 debug!("UPnP: {}: no list of the types it plays: {:#}", name, e);
@@ -3977,7 +3977,7 @@ pub fn start_session(
         std::thread::sleep(Duration::from_millis(100));
         let given_at = Instant::now();
         let mut at_play = false;
-        let started = upnp::set_av_transport_uri(avt, &uri, &didl).and_then(|()| {
+        let started = upnp::set_av_transport_uri(avt, &uri, &didl, &upnp::TRANSPORT).and_then(|()| {
             at_play = true;
             std::thread::sleep(Duration::from_millis(100));
             play_taken_uri(avt)
@@ -4046,10 +4046,10 @@ const PLAY_RETRY_WAIT: Duration = Duration::from_millis(500);
 /// taking it answers 701 ("Transition not available"), so that answer gets
 /// Play once more after a moment.
 fn play_taken_uri(avt: &str) -> Result<()> {
-    let mut result = upnp::play(avt);
+    let mut result = upnp::play_within(avt, &upnp::TRANSPORT);
     if result.as_ref().err().and_then(upnp::fault_code) == Some(701) {
         std::thread::sleep(PLAY_RETRY_WAIT);
-        result = upnp::play(avt);
+        result = upnp::play_within(avt, &upnp::TRANSPORT);
     }
     result
 }
