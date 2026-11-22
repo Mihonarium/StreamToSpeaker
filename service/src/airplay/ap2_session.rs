@@ -219,9 +219,7 @@ impl AirPlay2Session {
     /// unless `homepod_realtime` is off; every other receiver takes the
     /// general path below.
     pub fn start(cfg: AirPlay2SessionConfig) -> std::result::Result<Self, Ap2StartError> {
-        if cfg.renderer.pair.is_some()
-            || (cfg.homepod_realtime && cfg.renderer.is_homepod() && cfg.renderer.expects_ptp())
-        {
+        if bring_up_route(&cfg, aac_encoder_available) == BringUpRoute::HomePodRealtime {
             return Self::start_homepod_realtime(cfg);
         }
         let port = cfg.renderer.airplay_port.unwrap_or(DEFAULT_AIRPLAY_PORT);
@@ -339,10 +337,7 @@ impl AirPlay2Session {
         // SETUP falls back to realtime too. Every rejection is visible.
         let latency_samples = crate::airplay::timing::latency_ms_to_samples(cfg.latency_ms);
         let low_latency = cfg.latency_ms < LOW_LATENCY_REALTIME_MS;
-        let mut want_buffered = use_ptp
-            && cfg.renderer.supports_buffered_audio()
-            && !cfg.prefer_realtime
-            && !low_latency;
+        let mut want_buffered = wants_buffered(&cfg);
         if cfg.prefer_realtime {
             info!("AirPlay 2: prefer_realtime_airplay set — using the realtime stream");
         } else if low_latency && use_ptp && cfg.renderer.supports_buffered_audio() {
@@ -955,6 +950,48 @@ impl AirPlay2Session {
         }
         self.rtsp.lock().unwrap().teardown();
     }
+}
+
+/// Which bring-up a session takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BringUpRoute {
+    /// [`AirPlay2Session::start_homepod_realtime`].
+    HomePodRealtime,
+    /// The general path ([`AirPlay2Session::start_paired`] after pairing).
+    General,
+}
+
+/// The HomePod realtime profile for a stereo pair and for a HomePod with
+/// PTP on its default setting; also for a HomePod set to the buffered
+/// stream when Windows' AAC encoder can't be made (`aac_encoder`), since
+/// that profile is what HomePods get by default. The general path
+/// otherwise.
+fn bring_up_route(cfg: &AirPlay2SessionConfig, aac_encoder: fn() -> Result<()>) -> BringUpRoute {
+    let r = &cfg.renderer;
+    if r.pair.is_some() || (cfg.homepod_realtime && r.is_homepod() && r.expects_ptp()) {
+        return BringUpRoute::HomePodRealtime;
+    }
+    if r.is_homepod() && wants_buffered(cfg) {
+        if let Err(e) = aac_encoder() {
+            info!(
+                "AirPlay 2: the buffered stream needs Windows' AAC encoder, which is not available \
+                 ({e:#}); using the HomePod realtime profile for {} instead",
+                r.friendly_name
+            );
+            return BringUpRoute::HomePodRealtime;
+        }
+    }
+    BringUpRoute::General
+}
+
+/// The general path would offer the buffered stream: the receiver takes it
+/// (bit 40) on PTP, and the person chose neither realtime nor a latency
+/// below what buffered holds.
+fn wants_buffered(cfg: &AirPlay2SessionConfig) -> bool {
+    cfg.renderer.expects_ptp()
+        && cfg.renderer.supports_buffered_audio()
+        && !cfg.prefer_realtime
+        && cfg.latency_ms >= LOW_LATENCY_REALTIME_MS
 }
 
 /// What a general-path bring-up takes from the machine: the PTP ports and
@@ -2746,6 +2783,55 @@ mod tests {
         let aac = stream(&with_aac);
         let field = |k: &str| aac.get(k).and_then(|v| v.as_unsigned_integer());
         assert_eq!((field("type"), field("ct"), field("spf"), field("audioFormat")), (Some(0x67), Some(4), Some(1024), Some(0x40_0000)));
+    }
+
+    /// Which bring-up a session gets: the HomePod realtime profile for a
+    /// stereo pair and for a HomePod on its default setting, as before; and
+    /// now also for a HomePod set to the buffered stream when Windows' AAC
+    /// encoder can't be made, instead of the general realtime path.
+    #[test]
+    fn a_homepod_without_the_aac_encoder_gets_the_homepod_profile() {
+        use crate::airplay::discovery::{FEAT_BUFFERED_AUDIO, FEAT_PTP};
+        let renderer = |model: &str| AirPlayRenderer {
+            friendly_name: "Route test".into(),
+            mac_id: "AA".into(),
+            ip: "10.0.0.2".parse().unwrap(),
+            port: 7000,
+            airplay_port: Some(7000),
+            encryption_types: vec![0],
+            codecs: vec![0, 1],
+            password_protected: false,
+            encryption_key_required: false,
+            features: Some(FEAT_PTP | FEAT_BUFFERED_AUDIO),
+            pk: None,
+            model: Some(model.into()),
+            group: None,
+            pair: None,
+        };
+        let cfg = |model: &str, homepod_realtime: bool, prefer_realtime: bool| AirPlay2SessionConfig {
+            renderer: renderer(model),
+            local_ip: "10.0.0.1".parse().unwrap(),
+            samples_rx: crossbeam_channel::unbounded().1,
+            initial_volume: None,
+            prefer_realtime,
+            latency_ms: 2000,
+            stored_pairing: None,
+            homepod_realtime,
+            homepod_latency_ms: 200,
+        };
+        let available: fn() -> Result<()> = || Ok(());
+        let missing: fn() -> Result<()> = || anyhow::bail!("Media Foundation could not be loaded");
+        use BringUpRoute::*;
+        for (cfg, probe, want) in [
+            (cfg("AudioAccessory5,1", true, false), missing, HomePodRealtime),
+            (cfg("AudioAccessory5,1", false, false), missing, HomePodRealtime),
+            (cfg("AudioAccessory5,1", false, false), available, General),
+            (cfg("AudioAccessory5,1", false, true), missing, General),
+            (cfg("Sonos-Five", false, false), missing, General),
+        ] {
+            let what = format!("{:?} homepod_realtime={} prefer_realtime={}", cfg.renderer.model, cfg.homepod_realtime, cfg.prefer_realtime);
+            assert_eq!(bring_up_route(&cfg, probe), want, "{what}");
+        }
     }
 
     #[test]
