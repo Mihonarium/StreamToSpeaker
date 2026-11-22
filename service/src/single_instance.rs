@@ -7,7 +7,9 @@
 //! exists — so the hand-off works even during startup or while the app
 //! sits hidden in the tray: the request is remembered, the window is
 //! shown as soon as it exists (and a start-at-sign-in launch doesn't hide
-//! it), or raised right away if it already does.
+//! it), or raised right away if it already does. A copy that is quitting
+//! says so first: it has no window left to show, so a launch then waits
+//! for it to end and starts in its place.
 //!
 //! Every instance, `--headless` included, also creates the machine-wide
 //! `Global\StreamToSpeaker.Singleton` mutex (in `main`), which Setup
@@ -19,6 +21,7 @@
 //! audio to only one reader. [`launch`] decides what it does instead.
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::time::Duration;
 
 /// What creating the machine-wide mutex said about other copies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +51,17 @@ pub fn machine_lock_from(handle: bool, last_error: u32) -> MachineLock {
 
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_ALREADY_EXISTS: u32 = 183;
+
+/// Shown to someone who starts the app while a copy in their session is
+/// still quitting after [`CLOSING_WAIT`].
+pub const STILL_CLOSING: &str = "Stream To Speaker is still closing. Start it again in a moment.";
+
+/// How long a launch waits for a copy that is quitting to end, and how
+/// often it looks. A quit waits for the speaker a few seconds at most.
+#[cfg_attr(not(windows), allow(dead_code))]
+const CLOSING_WAIT: Duration = Duration::from_secs(15);
+#[cfg_attr(not(windows), allow(dead_code))]
+const CLOSING_POLL: Duration = Duration::from_millis(100);
 
 /// Shown to someone who starts the app while a copy runs where this
 /// launch can't reach it.
@@ -111,23 +125,63 @@ fn on_activation() {
 }
 
 /// Outcome of [`claim`].
+#[derive(Debug)]
 pub enum Claim {
     /// We are the first instance; keep this alive for the process.
     First,
     /// Another instance owns the session; it has been asked to show
     /// itself. The caller should exit.
     Another,
+    /// A copy in this session is quitting and hadn't ended after
+    /// [`CLOSING_WAIT`]. The caller should exit, saying [`STILL_CLOSING`].
+    StillClosing,
 }
 
-/// Become the session's instance, or hand off to the one that is.
+/// Become the session's instance, or hand off to the one that is; wait
+/// for one that is quitting.
 pub fn claim() -> Claim {
     imp::claim()
 }
 
+/// Say that this copy is quitting, as it stops showing its window: a launch
+/// from now on waits for it to end instead of handing over to it.
+pub fn announce_closing() {
+    imp::announce_closing()
+}
+
+/// One look at the session's instance.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Seen {
+    /// Another copy holds the session's instance lock (else this look took
+    /// it).
+    exists: bool,
+    /// That copy has said it is quitting.
+    closing: bool,
+}
+
+/// Look until no copy holds the session (this launch is first), one runs
+/// (hand over to it), or `pause` gives up on one that is quitting.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn claim_with(mut look: impl FnMut() -> Seen, mut pause: impl FnMut() -> bool) -> Claim {
+    loop {
+        let seen = look();
+        if !seen.exists {
+            return Claim::First;
+        }
+        if !seen.closing {
+            return Claim::Another;
+        }
+        if !pause() {
+            return Claim::StillClosing;
+        }
+    }
+}
+
 #[cfg(windows)]
 mod imp {
-    use super::Claim;
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+    use super::{Claim, Seen};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
     use windows_sys::Win32::System::Threading::{
         CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
         INFINITE,
@@ -135,26 +189,56 @@ mod imp {
 
     const MUTEX_NAME: &str = "Local\\StreamToSpeaker.Instance";
     const EVENT_NAME: &str = "Local\\StreamToSpeaker.Activate";
+    /// Exists while the session's copy is quitting.
+    const CLOSING_NAME: &str = "Local\\StreamToSpeaker.Closing";
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    pub fn claim() -> Claim {
+    /// Take the session's instance lock if no copy holds it; else whether
+    /// the copy that does is quitting.
+    fn look() -> Seen {
         let name = wide(MUTEX_NAME);
-        // The handle is leaked on purpose: it must live as long as the
-        // process.
         let (h, existed) = unsafe {
             let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
             (h, GetLastError() == ERROR_ALREADY_EXISTS)
         };
         if h.is_null() {
             log::warn!("single instance: CreateMutexW failed; continuing without a hand-off");
-            return Claim::First;
+            return Seen { exists: false, closing: false };
         }
-        if existed {
-            signal_first();
-            return Claim::Another;
+        if !existed {
+            // Ours now; the handle is leaked on purpose: it must live as
+            // long as the process.
+            return Seen { exists: false, closing: false };
+        }
+        // Theirs: don't keep it alive past their exit.
+        unsafe { CloseHandle(h) };
+        let closing_name = wide(CLOSING_NAME);
+        let closing = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, closing_name.as_ptr()) };
+        if !closing.is_null() {
+            unsafe { CloseHandle(closing) };
+        }
+        Seen { exists: true, closing: !closing.is_null() }
+    }
+
+    pub fn claim() -> Claim {
+        let started = std::time::Instant::now();
+        let claim = super::claim_with(look, || {
+            if started.elapsed() >= super::CLOSING_WAIT {
+                return false;
+            }
+            std::thread::sleep(super::CLOSING_POLL);
+            true
+        });
+        match claim {
+            Claim::First => {}
+            Claim::Another => {
+                signal_first();
+                return Claim::Another;
+            }
+            Claim::StillClosing => return Claim::StillClosing,
         }
         let ev_name = wide(EVENT_NAME);
         let ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, ev_name.as_ptr()) };
@@ -177,6 +261,15 @@ mod imp {
             })
             .ok();
         Claim::First
+    }
+
+    pub fn announce_closing() {
+        let name = wide(CLOSING_NAME);
+        // Leaked on purpose: it says "quitting" until this process ends.
+        let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
+        if h.is_null() {
+            log::warn!("single instance: couldn't say this copy is quitting; a launch meanwhile may do nothing");
+        }
     }
 
     /// Wake the first instance. Its event can lag its mutex by a moment
@@ -225,6 +318,7 @@ mod imp {
     pub fn claim() -> Claim {
         Claim::First
     }
+    pub fn announce_closing() {}
     #[allow(dead_code)]
     pub fn show_window(_hwnd: isize) {}
 }
@@ -287,6 +381,43 @@ mod tests {
             assert_eq!(launch(MachineLock::Created, at_sign_in), Launch::Run);
             assert_eq!(launch(MachineLock::Unavailable, at_sign_in), Launch::Run);
         }
+    }
+
+    fn seen(exists: bool, closing: bool) -> Seen {
+        Seen { exists, closing }
+    }
+
+    /// `claim_with` over these looks, with a pause that allows `pauses`.
+    fn claim_over(looks: &[Seen], pauses: usize) -> (Claim, usize) {
+        let mut looks = looks.iter().copied();
+        let mut paused = 0;
+        let claim = claim_with(
+            || looks.next().expect("looked once too often"),
+            || {
+                paused += 1;
+                paused <= pauses
+            },
+        );
+        (claim, paused)
+    }
+
+    #[test]
+    fn a_launch_waits_for_a_copy_that_is_closing_and_then_starts() {
+        let (claim, paused) = claim_over(&[seen(true, true), seen(true, true), seen(false, false)], 100);
+        assert!(matches!(claim, Claim::First));
+        assert_eq!(paused, 2);
+    }
+
+    #[test]
+    fn a_launch_hands_over_to_a_copy_that_runs() {
+        assert!(matches!(claim_over(&[seen(true, false)], 100).0, Claim::Another));
+        assert!(matches!(claim_over(&[seen(false, false)], 100).0, Claim::First));
+    }
+
+    #[test]
+    fn a_copy_that_takes_too_long_to_close_is_reported() {
+        let (claim, _) = claim_over(&[seen(true, true); 4], 3);
+        assert!(matches!(claim, Claim::StillClosing));
     }
 
     #[test]

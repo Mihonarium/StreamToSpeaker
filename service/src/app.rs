@@ -437,6 +437,12 @@ fn run_speaker_control(
 /// speaker this run).
 const AIRPLAY_DEFAULT_VOLUME: u32 = 80;
 
+/// How long quitting waits for a connect still in flight to finish (it then
+/// tears down what it set up).
+const QUIT_CONNECT_WAIT: Duration = Duration::from_secs(5);
+/// How long quitting waits for the speaker to answer its Stop or TEARDOWN.
+const QUIT_TEARDOWN_WAIT: Duration = Duration::from_secs(2);
+
 /// How long an error stays in the GUI's banner (the usual toast time).
 const ERROR_BANNER_TTL: Duration = Duration::from_secs(8);
 /// Start of the notice shown when a speaker is picked mid-connect.
@@ -563,6 +569,8 @@ pub struct App {
 
     // ---- Lifecycle ----
     pub shutdown: Arc<AtomicBool>,
+    /// Quit without waiting for the speaker (a second Ctrl+C).
+    quit_now: AtomicBool,
     /// Update-check state; see `update_check` and [`App::spawn_update_checker`].
     pub update: Mutex<UpdateState>,
 
@@ -936,6 +944,7 @@ impl App {
             reconnects: AtomicU32::new(0),
             last_fault: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
+            quit_now: AtomicBool::new(false),
             update: Mutex::new(UpdateState::default()),
             rescan_in_flight: Arc::new(AtomicBool::new(false)),
             last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
@@ -3992,6 +4001,75 @@ impl App {
     // Shutdown
     // -------------------------------------------------------------------
 
+    /// Quit: end streaming and tear the session down, waiting only so long
+    /// for the speaker. Called once the window or the headless loop has
+    /// ended, after [`App::request_shutdown`].
+    pub fn shut_down(self: &Arc<Self>) {
+        self.shut_down_within(QUIT_CONNECT_WAIT, QUIT_TEARDOWN_WAIT);
+    }
+
+    /// [`App::shut_down`] waiting at most `connect_wait` for a connect in
+    /// flight and `teardown_wait` for the speaker to answer; a second
+    /// Ctrl+C ([`App::quit_without_waiting`]) ends both waits.
+    pub(crate) fn shut_down_within(self: &Arc<Self>, connect_wait: Duration, teardown_wait: Duration) {
+        // A connect still in flight binds only while streaming is enabled
+        // (it checks under the session lock): with it off, it stops what
+        // it set up instead of leaving the speaker with an abandoned
+        // session. Not saved: the next start streams as usual.
+        self.streaming_enabled.store(false, Ordering::Release);
+        let end = Instant::now() + connect_wait;
+        while self.connecting_to().is_some() && Instant::now() < end && !self.quitting_now() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        info!("shutdown: tearing down active session");
+        let (done_tx, done) = crossbeam_channel::bounded::<()>(1);
+        let app = self.clone();
+        let spawned = std::thread::Builder::new().name("stream-to-speaker-quit".into()).spawn(move || {
+            app.stop_sendspin();
+            let s = app.session.lock().unwrap().take();
+            if let Some(s) = s {
+                s.stop();
+            }
+            let _ = done_tx.send(());
+        });
+        match spawned {
+            Ok(_) => {
+                // A speaker that answers is told at once; one that has gone
+                // isn't waited for: this process holds the single-instance
+                // lock until it ends, and a new launch waits for it.
+                let end = Instant::now() + teardown_wait;
+                loop {
+                    match done.recv_timeout(Duration::from_millis(20)) {
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                            if Instant::now() < end && !self.quitting_now() => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            warn!("shutdown: the speaker didn't answer in time; quitting without waiting for it");
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            Err(_) => {
+                self.stop_sendspin();
+                let s = self.session.lock().unwrap().take();
+                if let Some(s) = s {
+                    s.stop();
+                }
+            }
+        }
+        info!("shutdown: complete");
+    }
+
+    /// A second Ctrl+C: quit without waiting for anything.
+    pub fn quit_without_waiting(&self) {
+        self.quit_now.store(true, Ordering::SeqCst);
+    }
+
+    fn quitting_now(&self) -> bool {
+        self.quit_now.load(Ordering::SeqCst)
+    }
+
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
     }
@@ -4877,6 +4955,73 @@ mod tests {
         let link = app.web_link().expect("the web UI is on");
         let rest = link.strip_prefix("http://").unwrap();
         rest[..rest.find("/r/").unwrap()].to_string()
+    }
+
+    /// A UPnP session whose speaker takes requests and never answers:
+    /// stopping it waits out the client's timeout. The receiver hears each
+    /// request's first line.
+    fn unanswering_upnp_session() -> (ActiveSession, crossbeam_channel::Receiver<String>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/AVTransport/Control", listener.local_addr().unwrap());
+        let (got_tx, got_rx) = crossbeam_channel::unbounded();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut buf = [0u8; 2048];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let soap_action = text.lines().find(|l| l.to_ascii_lowercase().starts_with("soapaction"));
+                let _ = got_tx.send(soap_action.unwrap_or_default().to_string());
+                held.push(conn);
+            }
+        });
+        let mut session = upnp_session("");
+        if let ActiveSession::Upnp(s) = &mut session {
+            s.renderer.av_transport_control_url = url;
+        }
+        (session, got_rx)
+    }
+
+    #[test]
+    fn quitting_tells_the_speaker_but_doesnt_wait_out_one_that_never_answers() {
+        let app = test_app();
+        let (session, got) = unanswering_upnp_session();
+        bind(&app, session);
+        let started = Instant::now();
+        app.shut_down_within(Duration::from_millis(100), Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(2), "quit took {:?}", started.elapsed());
+        let stop = got.recv_timeout(Duration::from_secs(5)).expect("the speaker was never told");
+        assert!(stop.contains("#Stop"), "{stop}");
+        assert!(!app.is_speaker_bound());
+        // A connect still in flight can't bind after this: it stops what it
+        // set up instead (it binds only while streaming is enabled).
+        assert!(!app.is_streaming_enabled());
+    }
+
+    #[test]
+    fn quitting_waits_a_moment_for_a_connect_in_flight() {
+        let app = test_app();
+        *app.connecting.lock().unwrap() = Some("Kitchen".into());
+        let finishing = {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                *app.connecting.lock().unwrap() = None;
+            })
+        };
+        let started = Instant::now();
+        app.shut_down_within(Duration::from_secs(30), Duration::from_secs(30));
+        let took = started.elapsed();
+        finishing.join().unwrap();
+        assert!(took >= Duration::from_millis(50), "didn't wait for the connect ({took:?})");
+        assert!(took < Duration::from_secs(5), "waited {took:?}");
+        // One that doesn't finish is waited for only so long.
+        *app.connecting.lock().unwrap() = Some("Kitchen".into());
+        let started = Instant::now();
+        app.shut_down_within(Duration::from_millis(100), Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(2), "waited {:?}", started.elapsed());
     }
 
     #[test]

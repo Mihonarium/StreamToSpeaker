@@ -329,6 +329,35 @@ fn main() {
         }
     }));
 
+    // Single-instance gate. If another instance is already running in
+    // this session, ask it to show its window and exit — same pattern as
+    // Slack / Discord / OBS. Without this, the duplicate launch races to
+    // bind port 5901, the HTTP bind fails with WSAEADDRINUSE, run()
+    // returns Err, the process exits silently — and the user sees the FIRST
+    // instance in task manager and assumes the new install "doesn't
+    // open". The hand-off goes through a named event the first instance
+    // listens on from here on, so it works before that instance has a
+    // window too; a copy that is quitting is waited for instead. Skipped in
+    // --headless: headless is for service / CLI runs where multiple
+    // invocations against the same port are the caller's problem. Skipped
+    // for --web-link and --list-speakers too (see below).
+    if !cli.console() {
+        match stream_to_speaker::single_instance::claim() {
+            stream_to_speaker::single_instance::Claim::First => {}
+            stream_to_speaker::single_instance::Claim::Another => {
+                info!("another instance is running; asked it to show its window, exiting");
+                return;
+            }
+            stream_to_speaker::single_instance::Claim::StillClosing => {
+                info!("the copy that is quitting hasn't ended yet; exiting");
+                if !cli.startup {
+                    show_info_dialog(stream_to_speaker::single_instance::STILL_CLOSING);
+                }
+                return;
+            }
+        }
+    }
+
     // Create the singleton mutex (one call, one process) AND get the
     // "was another instance already holding it?" signal in the same
     // round-trip — CreateMutexA reports both atomically via the
@@ -338,10 +367,11 @@ fn main() {
     // below, for FUTURE launches) keep seeing the kernel object.
     // The Global\ mutex is what the installer watches for a running copy;
     // its answer also covers a copy that never takes the per-session
-    // claim below: a --headless one, one in another session or account,
-    // or one running elevated. --web-link and --list-speakers are not a
-    // running copy — they print and exit, usually while the app runs — so
-    // they take no part in either.
+    // claim above: a --headless one, one in another session or account,
+    // or one running elevated. After the claim, so a copy that was quitting
+    // has let go of it. --web-link and --list-speakers are not a running
+    // copy — they print and exit, usually while the app runs — so they take
+    // no part in either.
     #[cfg(windows)]
     let (_mutex_handle, machine_lock) = if cli.one_shot() {
         (None, stream_to_speaker::single_instance::MachineLock::Unavailable)
@@ -351,27 +381,9 @@ fn main() {
     #[cfg(not(windows))]
     let machine_lock = stream_to_speaker::single_instance::MachineLock::Created;
 
-    // Single-instance gate. If another instance is already running in
-    // this session, ask it to show its window and exit — same pattern as
-    // Slack / Discord / OBS. Without this, the duplicate launch races to
-    // bind port 5901, the HTTP bind fails with WSAEADDRINUSE, run()
-    // returns Err, the process exits silently — and the user sees the FIRST
-    // instance in task manager and assumes the new install "doesn't
-    // open". The hand-off goes through a named event the first instance
-    // listens on from here on, so it works before that instance has a
-    // window too. Skipped in --headless: headless is for service / CLI
-    // runs where multiple invocations against the same port are the
-    // caller's problem. Skipped for --web-link and --list-speakers too
-    // (see above).
+    // Running, but not as a GUI in this session we could hand over to.
+    // Starting anyway would only fail to bind the stream port.
     if !cli.console() {
-        if let stream_to_speaker::single_instance::Claim::Another =
-            stream_to_speaker::single_instance::claim()
-        {
-            info!("another instance is running; asked it to show its window, exiting");
-            return;
-        }
-        // Running, but not as a GUI in this session we could hand over
-        // to. Starting anyway would only fail to bind the stream port.
         if let stream_to_speaker::single_instance::Launch::Exit { log, tell } =
             stream_to_speaker::single_instance::launch(machine_lock, cli.startup)
         {
@@ -771,7 +783,7 @@ fn run_headless(app: Arc<App>) -> Result<()> {
     while !app.is_shutting_down() {
         std::thread::sleep(Duration::from_millis(200));
     }
-    shutdown_cleanup(&app);
+    app.shut_down();
     Ok(())
 }
 
@@ -794,28 +806,21 @@ fn run_gui_mode(app: Arc<App>, no_tray: bool, start_hidden: bool) -> Result<()> 
         ));
     }
 
+    // From here a new launch waits for this copy to end instead of
+    // handing over to it: there is no window left to show.
+    stream_to_speaker::single_instance::announce_closing();
     // Tell the audio loop to stop. Its reader thread is deliberately not
     // joined: it waits inside the driver's read for the next packet,
     // which while Windows plays nothing never comes. Process exit ends
     // it, and Windows closes its handle.
     app.request_shutdown();
-    shutdown_cleanup(&app);
+    app.shut_down();
     Ok(())
 }
 
 #[cfg(not(windows))]
 fn run_gui_mode(_app: Arc<App>, _no_tray: bool, _start_hidden: bool) -> Result<()> {
     anyhow::bail!("GUI mode is Windows-only — pass --headless on this platform")
-}
-
-fn shutdown_cleanup(app: &Arc<App>) {
-    app.stop_sendspin();
-    info!("shutdown: tearing down active session");
-    let final_session = app.session.lock().unwrap().take();
-    if let Some(s) = final_session {
-        s.stop();
-    }
-    info!("shutdown: complete");
 }
 
 // -----------------------------------------------------------------------------
@@ -1263,11 +1268,21 @@ fn launch_choice(cli: &Cli, terminal: bool, saved: Option<&str>) -> LaunchChoice
     }
 }
 
+/// Ctrl+C quits, telling the speaker first; a second Ctrl+C quits without
+/// waiting for it.
 fn install_signal_handler(app: Arc<App>) {
     if let Err(e) = ctrlc::set_handler(move || {
+        // Not eprintln!: it panics (here: aborts) when stderr is a closed pipe.
+        use std::io::Write as _;
         if !app.is_shutting_down() {
-            eprintln!("shutdown requested — cleaning up...");
+            let _ = writeln!(
+                std::io::stderr(),
+                "Quitting: telling the speaker to stop (press Ctrl+C again to quit at once)…"
+            );
             app.request_shutdown();
+        } else {
+            let _ = writeln!(std::io::stderr(), "Quitting without waiting for the speaker.");
+            app.quit_without_waiting();
         }
     }) {
         warn!("could not install Ctrl-C handler: {}", e);
