@@ -1286,8 +1286,18 @@ impl App {
 
     /// Take what was typed in `dialog`, as the dialog decided when it
     /// opened (never by asking the record again: it may have changed
-    /// while the dialog was open).
+    /// while the dialog was open). If the entry it was opened for has gone
+    /// meanwhile, nothing is taken, and the error says what to do.
     pub fn enter_airplay_password(&self, dialog: &PasswordDialog, pw: &str) -> Result<(), String> {
+        let listed = self.find_manual_speaker(&dialog.id).is_some()
+            || self.airplay_discovery.as_ref().and_then(|d| d.find_by_id(&dialog.id)).is_some();
+        if !listed {
+            return Err(format!(
+                "Couldn't connect: “{}” is no longer in the speaker list, and the password you typed wasn't kept. \
+                 When it's back in the list, pick it and enter the password again.",
+                dialog.name
+            ));
+        }
         if dialog.one_session {
             self.keep_typed_password(&dialog.id, pw);
         } else {
@@ -5210,6 +5220,38 @@ mod tests {
         // The connect the dialog starts uses it, and only that one.
         assert_eq!(app.airplay_password_for(&left).as_deref(), Some("typed-after-conflict"));
         assert_ne!(app.airplay_password_for(&left).as_deref(), Some("typed-after-conflict"));
+    }
+
+    /// When the entry the dialog was opened for has gone by the time the
+    /// person confirms, nothing is stored or kept, nothing is connected,
+    /// and they are told what to do.
+    #[test]
+    fn a_password_for_an_entry_that_has_gone_is_not_kept() {
+        use mdns_sd::ServiceInfo;
+        let (app, discovery) = airplay_test_app_with(conflict_discovery());
+        let raop = crate::airplay::discovery::RAOP_SERVICE;
+        let txt = &[("et", "0,1"), ("cn", "0,1"), ("pw", "true")][..];
+        discovery.ingest_for_tests(raop, &ServiceInfo::new(raop, "0D0000000009@Den", "d.local.", "192.168.1.70", 5000, txt).unwrap());
+        let dialogs = [app.password_dialog(KITCHEN_2, "Kitchen 2"), app.password_dialog("airplay:0D0000000009", "Den")];
+        assert_eq!(dialogs.iter().map(|d| d.one_session).collect::<Vec<_>>(), [true, false]);
+        discovery.remove_for_tests(raop, "B8E93735AC11@Kitchen 2._raop._tcp.local.");
+        discovery.remove_for_tests(raop, "0D0000000009@Den._raop._tcp.local.");
+        for d in &dialogs {
+            let err = app.submit_password_dialog(d, "typed-for-a-gone-one").expect_err("not taken");
+            assert_eq!(
+                err,
+                format!(
+                    "Couldn't connect: “{}” is no longer in the speaker list, and the password you typed wasn't kept. \
+                     When it's back in the list, pick it and enter the password again.",
+                    d.name
+                )
+            );
+        }
+        assert!(app.connecting_to().is_none());
+        assert!(app.unsaved_airplay_passwords.lock().unwrap().is_empty());
+        let uc = app.user_config.lock().unwrap();
+        assert!(uc.airplay_passwords.is_empty());
+        assert!(!serde_json::to_string(&*uc).unwrap().contains("typed-for-a-gone-one"));
     }
 
     /// A password typed for one connection doesn't outlive the connect it
