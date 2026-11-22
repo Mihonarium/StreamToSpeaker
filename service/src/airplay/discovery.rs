@@ -34,12 +34,11 @@
 //! | `ek`      | Expects an encryption key (classic AirPort Express) |
 //! | `am`      | Apple model, e.g. `AirPort4,107`                |
 //!
-//! `et` decides the encryption: plaintext when 0 is offered (also for
-//! MFi receivers, `et=0,4`, as OwnTone and libraop do), RSA for classic
-//! AirPort Express (see [`AirPlayRenderer::prefers_rsa_encryption`]),
-//! never FairPlay. A receiver that offers 4 but not 0 is refused today,
-//! although OwnTone and libraop stream plaintext to it after
-//! `/auth-setup`; whether such receivers accept plaintext is unverified.
+//! `et` decides the encryption: plaintext when 0 is offered, and for MFi
+//! receivers (`et` lists 4, with or without 0) after `/auth-setup`, as
+//! OwnTone and libraop do; RSA for classic AirPort Express (see
+//! [`AirPlayRenderer::prefers_rsa_encryption`]); never FairPlay, so a
+//! receiver offering only 3 and/or 5 is unsupported.
 //!
 //! ## AirPlay 2 TXT keys (`_airplay._tcp`)
 //!
@@ -329,14 +328,22 @@ impl AirPlayRenderer {
         self.raop.metadata.contains(&0)
     }
 
-    /// The `et` list to go by: as announced, or plaintext (`[0]`) when the
-    /// receiver announced none.
+    /// The `et` list to go by: as announced, with plaintext (0) added when
+    /// the receiver announced none, or announced MFi (4) without 0 or 1.
+    /// The reference senders stream plaintext to both: OwnTone reads `et`
+    /// only to decide on `/auth-setup` and encrypts only for `ek=1` or a
+    /// classic AirPort Express; libraop sends `/auth-setup` when `et`
+    /// lists 4 and encrypts only when its caller asks.
     pub fn raop_encryption_types(&self) -> Vec<u8> {
-        if self.encryption_types.is_empty() {
-            vec![0]
-        } else {
-            self.encryption_types.clone()
+        let et = &self.encryption_types;
+        if et.is_empty() {
+            return vec![0];
         }
+        let mut et = et.clone();
+        if et.contains(&4) && !et.contains(&0) && !et.contains(&1) {
+            et.insert(0, 0);
+        }
+        et
     }
 
     /// Whether to encrypt the audio with the RSA-wrapped-key path rather
@@ -1632,6 +1639,22 @@ mod tests {
         assert!(r.supports_legacy_raop());
         r.encryption_types = vec![3, 5];
         assert!(!r.supports_legacy_raop(), "FairPlay only");
+    }
+
+    /// `et` lists 4 without 0 or 1: an MFi receiver, played like one that
+    /// lists 0 and 4.
+    #[test]
+    fn an_mfi_only_receiver_is_played_like_et_0_4() {
+        for et in [vec![4], vec![3, 4, 5], vec![4, 5]] {
+            let r = renderer(Some("Dock"), et.clone(), None, 5000, None);
+            assert!(r.supports_legacy_raop(), "{et:?}");
+            assert_eq!(r.transport(), Some(Transport::RaopLegacy));
+            assert!(r.raop_encryption_types().contains(&0));
+            assert!(!r.prefers_rsa_encryption());
+        }
+        // Lists that already say what to do are left as they are.
+        assert_eq!(renderer(None, vec![0, 4], None, 5000, None).raop_encryption_types(), [0, 4]);
+        assert_eq!(renderer(None, vec![1, 4], None, 5000, None).raop_encryption_types(), [1, 4]);
     }
 
     #[test]

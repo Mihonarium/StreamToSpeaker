@@ -329,6 +329,16 @@ fn mfi_receiver_with_auth_setup() {
     assert_eq!(connect_and_stop(&rx, cfg), AUTH_SETUP);
 }
 
+/// A receiver whose `et` lists 4 alone (MFi, no plaintext or RSA
+/// announced): opened and streamed like `et=0,4`.
+#[test]
+fn receiver_that_lists_only_mfi() {
+    let rx = FakeRaop::start(|_| Answer::Normal);
+    let (_tx, srx) = samples();
+    let cfg = config(receiver(&rx, "0A000000000A", &[4]), srx);
+    assert_eq!(connect_and_stop(&rx, cfg), AUTH_SETUP);
+}
+
 /// A Sonos-class receiver: `et=0,4` and an AirPlay 2 service.
 #[test]
 fn receiver_that_also_offers_airplay_2() {

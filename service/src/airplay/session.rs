@@ -1906,6 +1906,30 @@ mod tests {
         assert_eq!(methods(&rx), ["0 /auth-setup"]);
     }
 
+    /// An `et=4`-only receiver that refuses gets the same sentences as
+    /// any other (here: busy), not an "unsupported" label; and it gets
+    /// the second opener like `et=0,4`.
+    #[test]
+    fn an_mfi_only_receiver_gets_the_usual_handling() {
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "ANNOUNCE" => busy(),
+            _ => Answer::Normal,
+        });
+        let err = start(&rx, "0B0000000070", &[4], None).err().expect("busy");
+        assert_eq!(format!("{:#}", err), BUSY_SENTENCE);
+
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.uri.as_str()) {
+            ("POST", "/auth-setup") => Answer::Reply(Reply::status(404, "Not Found")),
+            ("OPTIONS", _) => options_without_post(),
+            _ => Answer::Normal,
+        });
+        let session = start(&rx, "0B0000000071", &[4], None).expect("the second opener connects");
+        assert_eq!(session.opener(), Opener::OptionsThenAuthSetup);
+        session.stop();
+        let sdp = String::from_utf8(rx.requests().iter().find(|r| r.method == "ANNOUNCE").unwrap().body.clone()).unwrap();
+        assert!(!sdp.contains("aeskey"), "unencrypted: {sdp}");
+    }
+
     #[test]
     fn a_remembered_opener_reads_leniently() {
         #[derive(serde::Deserialize)]
