@@ -13,6 +13,7 @@
 //! (`device_http`).
 
 use crate::device_http::{self, HttpError, Limits, Version};
+use crate::discovery_net::shown;
 use crate::stream_profile::{parse_protocol_list, ProtocolInfo, StreamProfile};
 use anyhow::{anyhow, Result};
 use log::debug;
@@ -336,15 +337,12 @@ pub(crate) enum Failure {
 
 /// The UPnP error a refusal carries ([UDA] 3.2.5: `<UPnPError>` with
 /// `<errorCode>` and `<errorDescription>`). The description is the
-/// device's own text, so it is kept short and printable.
+/// device's own text, shown only through [`Fault::describe`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Fault {
     pub code: Option<u32>,
     pub description: Option<String>,
 }
-
-/// Longest part of a device's error description that is kept.
-const FAULT_DESCRIPTION_CHARS: usize = 120;
 
 impl Fault {
     /// The fault in a refusal's body, if the body is a SOAP fault. A body
@@ -362,30 +360,68 @@ impl Fault {
                 (child("errorCode"), child("errorDescription"))
             }
             Err(_) => {
-                let child = |name: &str| {
-                    let raw = crate::gena::find_tag_text(text, name)?;
-                    let raw: String = raw.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
-                    Some(crate::gena::decode_xml_text(&raw))
-                };
+                let child = |name: &str| crate::gena::find_tag_text(text, name).map(|raw| decode_entities(&raw));
                 (child("errorCode"), child("errorDescription"))
             }
         };
         let code = code.and_then(|c| c.trim().parse::<u32>().ok());
-        let description = description
-            .map(|d| device_http::printable(&d, FAULT_DESCRIPTION_CHARS).replace('"', "'"))
-            .filter(|d| !d.is_empty());
+        let description = description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
         (code.is_some() || description.is_some()).then_some(Fault { code, description })
     }
 
-    /// `UPnP error 714 "Illegal MIME-type"`, or what of it there is.
+    /// `UPnP error 714 "Illegal MIME-type"`, or what of it there is. The
+    /// description is the device's text: quoted, escaped and bounded by
+    /// `discovery_net::shown`, as all device text is.
     fn describe(&self, separator: &str) -> String {
         match (self.code, &self.description) {
-            (Some(code), Some(d)) => format!("UPnP error {code}{separator}\"{d}\""),
+            (Some(code), Some(d)) => format!("UPnP error {code}{separator}{}", shown(d)),
             (Some(code), None) => format!("UPnP error {code}"),
-            (None, Some(d)) => format!("UPnP error \"{d}\""),
+            (None, Some(d)) => format!("UPnP error {}", shown(d)),
             (None, None) => "UPnP error".to_string(),
         }
     }
+}
+
+/// The character data of text an XML parser refused: the predefined
+/// entities and character references decoded, everything else as it is.
+fn decode_entities(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let Some(end) = rest.find(';').filter(|&e| e <= 10) else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let name = &rest[1..end];
+        let decoded = match name {
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "amp" => Some('&'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => name
+                .strip_prefix("#x")
+                .or_else(|| name.strip_prefix("#X"))
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| name.strip_prefix('#').and_then(|d| d.parse::<u32>().ok()))
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 impl ActionError {
@@ -414,11 +450,19 @@ impl ActionError {
             Failure::NoAnswer(HttpError::BadUrl(why)) => {
                 format!("{speaker} gave an address for its controls that Stream To Speaker can't use: {why}.")
             }
-            Failure::NoAnswer(e) => format!("{speaker} sent an answer Stream To Speaker couldn't read ({e})."),
+            Failure::NoAnswer(HttpError::Closed) => format!(
+                "{speaker} closed the connection without answering. Try again in a moment; if it keeps happening, \
+                 restart {speaker}."
+            ),
+            Failure::NoAnswer(_) => format!(
+                "{speaker} sent an answer Stream To Speaker couldn't read. Try again in a moment; if it keeps \
+                 happening, restart {speaker}."
+            ),
             Failure::Refused { status, fault } => {
                 let what = match self.fault_code() {
                     Some(714) if formats_tried > 1 => format!(
-                        "{speaker} doesn't accept any of the {formats_tried} audio formats Stream To Speaker tried.{airplay}"
+                        "{speaker} didn't take the stream in any of the {formats_tried} ways Stream To Speaker \
+                         offered it.{airplay}"
                     ),
                     Some(714) => format!("{speaker} doesn't accept the audio format Stream To Speaker sent it.{airplay}"),
                     Some(716) => format!(
@@ -714,21 +758,22 @@ mod tests {
         let line = format!("{e:#}");
         assert_eq!(
             line,
-            "SetAVTransportURI refused: HTTP 500 Internal Server Error, UPnP error 714 \"Illegal MIME-type\""
+            "SetAVTransportURI refused: HTTP 500 \"Internal Server Error\", UPnP error 714 \"Illegal MIME-type\""
         );
     }
 
     #[test]
-    fn the_renderers_own_text_is_bounded_and_printable() {
-        let hostile = format!("Evil\u{1b}[2J\r\nnext \"line\"{}", "A".repeat(10_000));
+    fn the_renderers_own_text_is_bounded_and_escaped() {
+        let hostile = format!("Evil\u{1b}[2J\r\nnext \"line\"\u{202e}{}", "A".repeat(10_000));
         let e = refusal(Reply::soap_fault(402, &hostile));
         let line = format!("{e:#}");
-        assert!(!line.chars().any(|c| c.is_control()), "{line:?}");
-        assert!(line.chars().count() < 250, "{} chars: {line}", line.chars().count());
-        assert!(line.contains("UPnP error 402 \"Evil [2J next 'line'AAAA"), "{line}");
+        let unsafe_char = |c: char| c.is_control() || c == '\u{202e}';
+        assert!(!line.chars().any(unsafe_char), "{line:?}");
+        assert!(line.chars().count() < 330, "{} chars: {line}", line.chars().count());
+        assert!(line.contains(r#"UPnP error 402 "Evil\u{1b}[2J\r\nnext \"line\"\u{202e}AAAA"#), "{line}");
         assert!(line.ends_with("…\""), "{line}");
         let told = action_error(&e).for_person("Kitchen", false, 1);
-        assert!(!told.chars().any(|c| c.is_control()) && told.chars().count() < 300, "{told}");
+        assert!(!told.chars().any(unsafe_char) && told.chars().count() < 360, "{told}");
     }
 
     #[test]
@@ -736,7 +781,7 @@ mod tests {
         for body in ["<html><body>Oops</body></html>", "", "<s:Envelope><s:Body><s:Fault/></s:Body></s:Envelope>"] {
             let e = refusal(Reply::status(500, "Internal Server Error", &[], body));
             assert_eq!(action_error(&e).fault_code(), None, "{body}");
-            assert_eq!(format!("{e:#}"), "SetAVTransportURI refused: HTTP 500 Internal Server Error");
+            assert_eq!(format!("{e:#}"), "SetAVTransportURI refused: HTTP 500 \"Internal Server Error\"");
         }
     }
 
@@ -773,7 +818,28 @@ mod tests {
         );
         assert_eq!(
             told(Reply::status(503, "Service Unavailable", &[], ""), false),
-            "Kitchen refused the stream. (Kitchen answered: HTTP 503 Service Unavailable.)"
+            "Kitchen refused the stream. (Kitchen answered: HTTP 503 \"Service Unavailable\".)"
+        );
+        // Offered several ways: counted as ways, not as formats.
+        assert_eq!(
+            action_error(&refusal(Reply::soap_fault(714, "Illegal MIME-type"))).for_person("Kitchen", false, 3),
+            "Kitchen didn't take the stream in any of the 3 ways Stream To Speaker offered it. \
+             (Kitchen answered: UPnP error 714, \"Illegal MIME-type\".)"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_never_came_or_couldnt_be_read_says_what_to_try() {
+        let told = |reply: Reply| action_error(&refusal(reply)).for_person("Kitchen", false, 1);
+        assert_eq!(
+            told(Reply::raw("")),
+            "Kitchen closed the connection without answering. Try again in a moment; if it keeps happening, \
+             restart Kitchen."
+        );
+        assert_eq!(
+            told(Reply::raw("SIP/2.0 200 OK\r\n\r\n")),
+            "Kitchen sent an answer Stream To Speaker couldn't read. Try again in a moment; if it keeps \
+             happening, restart Kitchen."
         );
     }
 

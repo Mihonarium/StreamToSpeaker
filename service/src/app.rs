@@ -4671,7 +4671,7 @@ mod tests {
         // It lists no types, so it is offered three in turn.
         assert_eq!(
             msg,
-            "Den Amp doesn't accept any of the 3 audio formats Stream To Speaker tried. \
+            "Den Amp didn't take the stream in any of the 3 ways Stream To Speaker offered it. \
              (Den Amp answered: UPnP error 714, \"Illegal MIME-type\".)"
         );
     }
@@ -4882,7 +4882,7 @@ mod tests {
         assert_eq!(offered_paths(&probed).len(), 3);
         assert_eq!(
             msg,
-            "Den Amp doesn't accept any of the 3 audio formats Stream To Speaker tried. \
+            "Den Amp didn't take the stream in any of the 3 ways Stream To Speaker offered it. \
              (Den Amp answered: UPnP error 714, \"Illegal MIME-type\".)"
         );
     }

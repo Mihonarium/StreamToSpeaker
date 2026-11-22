@@ -70,12 +70,13 @@ impl Response {
             .map(|(_, v)| v.as_str())
     }
 
-    /// `HTTP 500 Internal Server Error`, for messages.
+    /// `HTTP 500 "Internal Server Error"`, for messages: the reason phrase
+    /// is the device's text, so it is quoted and bounded like any other.
     pub fn status_text(&self) -> String {
         if self.reason.is_empty() {
             format!("HTTP {}", self.status)
         } else {
-            format!("HTTP {} {}", self.status, printable(&self.reason, 80))
+            format!("HTTP {} {}", self.status, shown(&self.reason))
         }
     }
 }
@@ -89,6 +90,9 @@ pub(crate) enum HttpError {
     Connect(std::io::Error),
     /// Connected, but no complete answer before the deadline.
     NoAnswer(Duration),
+    /// The device closed or reset the connection before any byte of an
+    /// answer.
+    Closed,
     /// The connection failed part-way through the answer.
     CutOff(std::io::Error),
     /// What came back isn't an HTTP answer.
@@ -103,6 +107,7 @@ impl fmt::Display for HttpError {
             HttpError::BadUrl(why) => write!(f, "unusable address: {why}"),
             HttpError::Connect(e) => write!(f, "couldn't connect: {e}"),
             HttpError::NoAnswer(d) => write!(f, "no answer within {} s", d.as_secs_f32()),
+            HttpError::Closed => write!(f, "the device closed the connection without answering"),
             HttpError::CutOff(e) => write!(f, "the answer was cut off: {e}"),
             HttpError::Malformed(why) => write!(f, "not an HTTP answer: {why}"),
             HttpError::TooLarge(max) => write!(f, "answer larger than {} KB", max / 1024),
@@ -153,7 +158,7 @@ pub(crate) fn exchange(req: &Request<'_>, limits: &Limits) -> Result<Response, H
         .set_write_timeout(Some(remaining(deadline)))
         .and_then(|_| stream.write_all(&bytes))
         .and_then(|_| stream.flush())
-        .map_err(|e| io_failure(e, limits))?;
+        .map_err(|e| io_failure(e, limits, false))?;
 
     let mut reader = Reader { stream, buf: Vec::new(), deadline, limits: *limits };
     read_response(&mut reader, req.method)
@@ -163,9 +168,13 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))
 }
 
-fn io_failure(e: std::io::Error, limits: &Limits) -> HttpError {
+/// What a failed read or write means. `answered`: some of an answer had
+/// arrived.
+fn io_failure(e: std::io::Error, limits: &Limits, answered: bool) -> HttpError {
+    use std::io::ErrorKind::*;
     match e.kind() {
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => HttpError::NoAnswer(limits.deadline),
+        TimedOut | WouldBlock => HttpError::NoAnswer(limits.deadline),
+        ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof if !answered => HttpError::Closed,
         _ => HttpError::CutOff(e),
     }
 }
@@ -199,7 +208,7 @@ impl Reader {
                     return Ok(true);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(io_failure(e, &self.limits)),
+                Err(e) => return Err(io_failure(e, &self.limits, !self.buf.is_empty())),
             }
         }
     }
@@ -284,7 +293,7 @@ fn read_response(r: &mut Reader, method: &str) -> Result<Response, HttpError> {
             }
             if !r.more()? {
                 return Err(if r.buf.is_empty() {
-                    HttpError::CutOff(std::io::ErrorKind::UnexpectedEof.into())
+                    HttpError::Closed
                 } else {
                     HttpError::Malformed(format!("{} bytes and no end of the head", r.buf.len()))
                 });
@@ -398,19 +407,6 @@ impl Chunks {
     fn at_boundary(&self, data: &[u8]) -> bool {
         self.pos == data.len()
     }
-}
-
-/// Text from a device made fit for a message or a log line: control
-/// characters dropped, runs of whitespace made one space, at most `max`
-/// characters (an ellipsis marks a cut).
-pub(crate) fn printable(s: &str, max: usize) -> String {
-    let words: Vec<&str> = s.split(|c: char| c.is_whitespace() || c.is_control()).filter(|w| !w.is_empty()).collect();
-    let joined = words.join(" ");
-    let mut out: String = joined.chars().take(max).collect();
-    if out.len() < joined.len() {
-        out.push('…');
-    }
-    out
 }
 
 #[cfg(test)]
@@ -572,8 +568,9 @@ mod tests {
         // Closed before a head was complete.
         let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nContent-"));
         assert!(matches!(get(&fake.url("/"), &limits()), Err(HttpError::Malformed(_))));
+        // Closed with nothing said: told apart from an answer cut short.
         let fake = FakeRenderer::start(|_| Reply::raw(""));
-        assert!(matches!(get(&fake.url("/"), &limits()), Err(HttpError::CutOff(_))));
+        assert!(matches!(get(&fake.url("/"), &limits()), Err(HttpError::Closed)));
     }
 
     #[test]
@@ -621,14 +618,37 @@ mod tests {
     }
 
     #[test]
-    fn status_text_is_bounded_and_printable() {
-        let r = Response { status: 500, reason: format!("Bad\u{1b}[31m{}", "x".repeat(500)), headers: Vec::new(), body: Vec::new() };
+    fn the_reason_phrase_is_device_text_quoted_and_bounded() {
+        let r = Response {
+            status: 500,
+            reason: format!("Bad\u{1b}[31m\u{202e}{}", "x".repeat(500)),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
         let t = r.status_text();
-        assert!(t.starts_with("HTTP 500 Bad [31mxxx"), "{t}");
-        assert!(t.ends_with('…') && !t.contains('\u{1b}'), "{t}");
-        assert_eq!(t.chars().count(), "HTTP 500 ".len() + 81, "{t}");
-        assert_eq!(printable("  Illegal\r\n\tMIME-type\u{7}  ", 120), "Illegal MIME-type");
-        assert_eq!(printable("Küche ✓", 120), "Küche ✓");
-        assert_eq!(printable("abcdef", 3), "abc…");
+        assert!(t.starts_with("HTTP 500 \"Bad\\u{1b}[31m\\u{202e}xxx"), "{t}");
+        assert!(t.ends_with("…\"") && !t.chars().any(|c| c.is_control() || c == '\u{202e}'), "{t}");
+        assert!(t.chars().count() < 240, "{t}");
+        let ok = Response { status: 503, reason: "Service Unavailable".into(), headers: Vec::new(), body: Vec::new() };
+        assert_eq!(ok.status_text(), "HTTP 503 \"Service Unavailable\"");
+    }
+
+    #[test]
+    fn a_connection_reset_before_any_answer_is_closed_not_cut_off() {
+        // Reset as the request arrives: what the device "said" is nothing.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let s = socket2::Socket::from(conn);
+                let _ = s.set_linger(Some(Duration::ZERO));
+                drop(s);
+            }
+        });
+        let e = get(&format!("http://127.0.0.1:{port}/"), &limits()).unwrap_err();
+        assert!(matches!(e, HttpError::Closed), "{e:?}");
+        // Some of an answer, then the connection breaks: cut off.
+        let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab"));
+        assert_eq!(body(&get(&fake.url("/"), &limits()).unwrap()), "ab");
     }
 }
