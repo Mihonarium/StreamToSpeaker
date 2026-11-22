@@ -116,7 +116,8 @@ pub const MAX_ROUTES: usize = 3;
 /// receiver at, or one a person added), then the receiver's other
 /// announced addresses that `allowed` passes (the ones a connect may go
 /// to, see [`crate::airplay::discovery::may_contact`]), each with this
-/// PC's address toward it; [`MAX_ROUTES`] in all. `first` itself is not
+/// PC's address toward it; [`MAX_ROUTES`] in all, and only `first` for a
+/// receiver that also offers AirPlay 2. `first` itself is not
 /// checked: for a speaker added by address it is the person's choice
 /// (one on this PC included).
 pub fn routes_for(
@@ -126,6 +127,11 @@ pub fn routes_for(
     local_toward: impl Fn(IpAddr) -> Option<IpAddr>,
 ) -> Vec<Route> {
     let mut routes = vec![first];
+    // A receiver that also offers AirPlay 2 is handed over to it when
+    // AirPlay 1 doesn't answer; more addresses would only delay that.
+    if renderer.supports_airplay2() {
+        return routes;
+    }
     for &a in &renderer.raop.addresses {
         if routes.len() >= MAX_ROUTES {
             break;
@@ -1816,6 +1822,22 @@ mod tests {
         let lo: IpAddr = "127.0.0.1".parse().unwrap();
         let routes = routes_for(&manual, Route { receiver: lo, local: lo }, allowed, |_| Some(lo));
         assert_eq!(routes, [Route { receiver: lo, local: lo }]);
+    }
+
+    /// A receiver that also offers AirPlay 2 gets one AirPlay 1 address,
+    /// so the hand-over to AirPlay 2 takes no longer than it always did.
+    #[test]
+    fn a_receiver_with_airplay_2_gets_one_airplay_1_address() {
+        let rx = FakeRaop::start(|_| Answer::Normal);
+        let mut r = receiver(&rx, "0B0000000034", &[0, 4]);
+        r.ip = "192.168.1.65".parse().unwrap();
+        r.raop.addresses = ["192.168.1.65", "192.168.1.66", "10.0.0.7"].iter().map(|a| a.parse().unwrap()).collect();
+        let local: IpAddr = "192.168.1.10".parse().unwrap();
+        let first = Route { receiver: r.ip, local };
+        assert_eq!(routes_for(&r, first, |_| true, |_| Some(local)).len(), 3);
+        r.features = Some(crate::airplay::discovery::FEAT_AUDIO | crate::airplay::discovery::FEAT_TRANSIENT_PAIRING);
+        r.airplay_port = Some(7000);
+        assert_eq!(routes_for(&r, first, |_| true, |_| Some(local)), [first]);
     }
 
     #[test]
