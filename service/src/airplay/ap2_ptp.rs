@@ -48,7 +48,7 @@ use log::{debug, info, warn};
 use rand::Rng;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -92,6 +92,10 @@ const ORG_APPLE: [u8; 3] = [0x00, 0x0d, 0x93];
 /// Fixed leading bytes of both Apple signaling TLV payloads (libairptp's
 /// `apple_unknown` — meaning unknown, value captured from iOS senders).
 const APPLE_UNKNOWN: [u8; 4] = [0x00, 0x00, 0x03, 0x01];
+
+/// Packets read from the general port per tick at most (a few per tick are
+/// normal: Announce, Follow_Up, Signaling from each receiver).
+const MAX_GENERAL_PER_TICK: usize = 64;
 
 // libairptp's AIRPTP_INTERVAL_MS_*.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(1);
@@ -298,7 +302,11 @@ pub(crate) fn spawn_ptp_master_on(
     let timeline = PtpTimeline::new(PtpMasterClock::new(), clock_id);
     let id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
 
-    let mut services = lock(&SERVICES);
+    let mut registry = lock(&SERVICES);
+    while registry.closing.contains(&(local_ip, ports)) {
+        registry = CLOSED.wait(registry).unwrap_or_else(|e| e.into_inner());
+    }
+    let services = &mut registry.services;
     let index = match services.iter().position(|s| s.local_ip == local_ip && s.ports == ports) {
         Some(i) => i,
         None => {
@@ -313,7 +321,7 @@ pub(crate) fn spawn_ptp_master_on(
         sessions.push(Registration::new(id, members.to_vec(), members_only, timeline.clone(), receiver_name));
         transmit_due(&mut sessions, &service.event, &service.general, ports, Instant::now());
     }
-    drop(services);
+    drop(registry);
 
     info!(
         "AirPlay 2 PTP: serving as grandmaster for {:?} (clock_id={:#018x})",
@@ -343,10 +351,20 @@ struct Shared {
     ports_problem: Option<PortsProblem>,
 }
 
-/// Every running service. Joining, leaving and stopping happen under this
-/// lock, so a session starting while the last one on its address stops
-/// finds the ports either still served or already closed.
-static SERVICES: Mutex<Vec<Service>> = Mutex::new(Vec::new());
+/// Every running service, and the addresses whose service is closing.
+/// Joining and leaving happen under this lock; a service's thread is
+/// joined and its sockets closed outside it (so one slow stop can't hold
+/// up every other start and stop), and a session starting on an address
+/// whose service is closing waits on [`CLOSED`] until the ports are free,
+/// so it never falls back to temporary ports because this app still held
+/// them.
+static SERVICES: Mutex<Registry> = Mutex::new(Registry { services: Vec::new(), closing: Vec::new() });
+static CLOSED: Condvar = Condvar::new();
+
+struct Registry {
+    services: Vec<Service>,
+    closing: Vec<(IpAddr, PtpPorts)>,
+}
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -376,7 +394,7 @@ impl Service {
 /// Remove session `id`; if it was the last one, stop its service and close
 /// the ports before returning.
 fn leave(shared: &Arc<Shared>, id: u64) {
-    let mut services = lock(&SERVICES);
+    let mut registry = lock(&SERVICES);
     let last = {
         let mut sessions = lock(&shared.sessions);
         if let Some(s) = sessions.iter().find(|s| s.id == id) {
@@ -388,13 +406,18 @@ fn leave(shared: &Arc<Shared>, id: u64) {
     if !last {
         return;
     }
-    if let Some(i) = services.iter().position(|s| Arc::ptr_eq(&s.shared, shared)) {
-        let mut service = services.swap_remove(i);
-        service.shared.stop.store(true, Ordering::Release);
-        if let Some(t) = service.thread.take() {
-            let _ = t.join();
-        }
+    let Some(i) = registry.services.iter().position(|s| Arc::ptr_eq(&s.shared, shared)) else { return };
+    let mut service = registry.services.swap_remove(i);
+    let key = (service.local_ip, service.ports);
+    registry.closing.push(key);
+    drop(registry);
+    service.shared.stop.store(true, Ordering::Release);
+    if let Some(t) = service.thread.take() {
+        let _ = t.join();
     }
+    drop(service);
+    lock(&SERVICES).closing.retain(|k| *k != key);
+    CLOSED.notify_all();
 }
 
 /// Why a PTP port could not be opened.
@@ -513,20 +536,31 @@ fn run_service(event: UdpSocket, general: UdpSocket, shared: Arc<Shared>) {
             }
         }
 
-        // General port: Announce / Follow_Up / Signaling / Delay_Resp.
-        while let Ok((n, src)) = general.recv_from(&mut buf) {
-            let mut sessions = lock(&shared.sessions);
-            match recipient(&sessions, src.ip()) {
-                Some(i) => sessions[i].on_general(&buf[..n], src, ports),
-                None => debug!("AP2 PTP: ignoring packet from non-member {}", src),
-            }
-        }
+        drain_general(&general, &shared, &mut buf);
 
         let now = Instant::now();
         for s in lock(&shared.sessions).iter_mut() {
             s.heartbeat(now);
         }
     }
+}
+
+/// General port: Announce / Follow_Up / Signaling / Delay_Resp, up to
+/// [`MAX_GENERAL_PER_TICK`] of what is queued, so a host flooding the port
+/// can't keep the thread from sending or from noticing a stop. Returns how
+/// many packets were read.
+fn drain_general(general: &UdpSocket, shared: &Shared, buf: &mut [u8; 256]) -> usize {
+    let mut read = 0;
+    while read < MAX_GENERAL_PER_TICK {
+        let Ok((n, src)) = general.recv_from(buf) else { break };
+        read += 1;
+        let mut sessions = lock(&shared.sessions);
+        match recipient(&sessions, src.ip()) {
+            Some(i) => sessions[i].on_general(&buf[..n], src, shared.ports),
+            None => debug!("AP2 PTP: ignoring packet from non-member {}", src),
+        }
+    }
+    read
 }
 
 impl Registration {
@@ -1088,6 +1122,47 @@ mod tests {
         solo.stop();
         assert_eq!(clock_of(&m1), [pair.timeline.clock_id]);
         assert_eq!(m1.delay_resp_clock(ports, 0x71), pair.timeline.clock_id);
+    }
+
+    /// However much arrives on the general port, one tick reads a bounded
+    /// number of packets, so the service still sends, and notices a stop,
+    /// every tick while a host floods it.
+    #[test]
+    fn one_tick_reads_a_bounded_number_of_general_packets() {
+        let general = UdpSocket::bind((LOCAL, 0)).unwrap();
+        general.set_nonblocking(true).unwrap();
+        let to = general.local_addr().unwrap();
+        let flooder = UdpSocket::bind("127.0.0.14:0").unwrap();
+        for i in 0..100u16 {
+            flooder.send_to(&build_announce(0x99, i), to).unwrap();
+        }
+        thread::sleep(Duration::from_millis(50)); // loopback delivery
+        let ports = PtpPorts { local_event: 0, local_general: 0, peer_event: 0, peer_general: 0 };
+        let shared = Shared { sessions: Mutex::new(Vec::new()), stop: AtomicBool::new(false), ports, ports_problem: None };
+        let mut buf = [0u8; 256];
+        assert_eq!(drain_general(&general, &shared, &mut buf), MAX_GENERAL_PER_TICK);
+        assert_eq!(drain_general(&general, &shared, &mut buf), 100 - MAX_GENERAL_PER_TICK);
+    }
+
+    /// A session that starts while the last one on its address is stopping
+    /// gets the PTP ports: it waits for them to be closed, never falls back
+    /// to a temporary port because this app still held them.
+    #[test]
+    fn a_session_starting_while_the_last_one_stops_gets_the_ports() {
+        let ports = test_ports("127.0.0.13");
+        let local: IpAddr = LOCAL.parse().unwrap();
+        let rx = FakeReceiver::bind("127.0.0.13", ports);
+        for round in 0..30 {
+            let a = spawn_ptp_master_on(&[rx.ip], local, ports, "A".into(), true).unwrap();
+            let stopper = thread::spawn(move || a.stop());
+            // Aim at the stop's last tick, while A's sockets are still open
+            // (a passing run doesn't depend on hitting it).
+            thread::sleep(Duration::from_millis(5));
+            let b = spawn_ptp_master_on(&[rx.ip], local, ports, "B".into(), true).unwrap();
+            assert!(b.ports_problem().is_none(), "round {round}: {:?}", b.ports_problem());
+            stopper.join().unwrap();
+            b.stop();
+        }
     }
 
     /// When another program holds this PC's PTP port, the session still
