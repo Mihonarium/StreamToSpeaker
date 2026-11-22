@@ -129,6 +129,12 @@ impl RepeatMemory {
         }
         repeat
     }
+
+    /// A session to `host` played: what was noted for it is forgotten, so
+    /// only the reconnect that directly followed a fault can repeat it.
+    pub fn forget(&mut self, host: &str) {
+        self.recent.retain(|(h, _, _)| h != host);
+    }
 }
 
 static REPEATS: Mutex<RepeatMemory> = Mutex::new(RepeatMemory::new());
@@ -203,6 +209,12 @@ impl FaultSlot {
 
     pub fn get(&self) -> Option<Ap2Fault> {
         self.fault.lock().unwrap().clone()
+    }
+
+    /// The session sent its first audio: earlier faults on this receiver
+    /// are no longer "just before" anything ([`RepeatMemory::forget`]).
+    pub fn note_playing(&self) {
+        REPEATS.lock().unwrap_or_else(|e| e.into_inner()).forget(&self.host);
     }
 
     #[cfg(test)]
@@ -658,6 +670,18 @@ mod tests {
         assert!(!m.repeated("Kitchen", "anchor_failed", t - s(20), false, t));
         assert!(!m.repeated("Kitchen", "encoder_failed", t + s(6), false, t + s(7)));
         assert!(!m.repeated("Bedroom", "anchor_failed", t + s(6), false, t + s(8)));
+    }
+
+    #[test]
+    fn a_speaker_that_played_has_nothing_to_repeat() {
+        let t = t0() + Duration::from_secs(3600);
+        let s = Duration::from_secs;
+        let mut m = RepeatMemory::new();
+        assert!(!m.repeated("airplay:A", "anchor_failed", t - s(20), false, t));
+        assert!(!m.repeated("airplay:B", "anchor_failed", t - s(20), false, t));
+        m.forget("airplay:A");
+        assert!(!m.repeated("airplay:A", "anchor_failed", t + s(30), false, t + s(50)), "A played since");
+        assert!(m.repeated("airplay:B", "anchor_failed", t + s(6), false, t + s(25)), "B didn't");
     }
 
     /// The final fault is what the window shows after "Connection to …

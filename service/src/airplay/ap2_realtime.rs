@@ -221,6 +221,7 @@ fn run_realtime(mut run: RealtimeRun) {
     let packet = packet_duration();
     let mut ring: Vec<i16> = Vec::with_capacity(stereo * 4);
     let mut slot: u64 = 0;
+    let mut played = false;
     let mut silence_packets: u64 = 0;
     let mut late_recoveries: u64 = 0;
     let mut got_real_audio = false;
@@ -338,6 +339,9 @@ fn run_realtime(mut run: RealtimeRun) {
                 run.faults.raise(f);
             }
             break;
+        }
+        if !std::mem::replace(&mut played, true) {
+            run.faults.note_playing();
         }
         slot += 1;
     }

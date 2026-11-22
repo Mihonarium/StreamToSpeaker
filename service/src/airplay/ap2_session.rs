@@ -1780,6 +1780,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
                     return;
                 }
                 if packet_count == 0 {
+                    cfg.faults.note_playing();
                     info!("AirPlay 2: buffered AAC-LC audio flowing — first packet ({} bytes framed)", framed.len());
                 }
 
@@ -2017,6 +2018,7 @@ fn run_ap2_sender(mut cfg: Ap2SenderConfig) {
             retransmit.service(control_socket, Instant::now());
         }
         if packet_count == 0 {
+            cfg.faults.note_playing();
             info!(
                 "AirPlay 2: stream open — first packet ({} bytes) sent to {}",
                 packet.len(),
@@ -2376,6 +2378,29 @@ mod tests {
         assert!(rig.packet().is_some(), "no audio after the anchor was accepted");
         rig.stop();
         assert!(rig.faults.get().is_none());
+    }
+
+    /// A session that played clears what was remembered for its speaker,
+    /// so "failed again after reconnecting" is only ever said of the
+    /// reconnect: fail, play, fail is retryable both times.
+    #[test]
+    fn a_session_that_played_clears_what_was_remembered() {
+        let name = "Played test speaker";
+        let fail_at_start = || -> EncoderFactory { Box::new(|| anyhow::bail!("MFStartup: scripted")) };
+        let failed = |encoder| {
+            let mut rig = BufferedRig::start(name, encoder, 1, &["200 OK"]);
+            rig.feed(BUFFERED_SPF * 2);
+            rig.wait_for_exit();
+            rig.faults.get().expect("a fault")
+        };
+        assert!(failed(fail_at_start()).retryable, "first failure");
+        let mut rig = BufferedRig::start(name, scripted_encoder(None), 1, &["200 OK"]);
+        rig.feed(BUFFERED_SPF * 2);
+        assert!(rig.packet().is_some(), "the session in between plays");
+        rig.stop();
+        assert!(rig.faults.get().is_none());
+        let again = failed(fail_at_start());
+        assert!(again.retryable, "a session played in between: {again:?}");
     }
 
     /// The audio source going away means the app is replacing or stopping
