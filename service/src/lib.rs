@@ -26,6 +26,7 @@ pub mod sine_source;
 pub mod qpc;
 pub mod picker;
 pub mod user_config;
+pub mod folders;
 pub mod secret_store;
 pub mod update_check;
 pub mod stream_gate;
@@ -191,13 +192,12 @@ pub const WIRE_BITS_PER_SAMPLE: u16 = 16;
 pub const WIRE_BYTES_PER_FRAME: usize =
     (WIRE_CHANNELS as usize) * (WIRE_BITS_PER_SAMPLE as usize / 8);
 
-/// Per-user log directory (`%LOCALAPPDATA%\StreamToSpeaker`). Created
-/// if missing. Returns None when `LOCALAPPDATA` isn't set (non-Windows
-/// hosts, lint builds). Used by `main.rs` to seed the file logger and
-/// by the GUI Help menu's "Open log folder" item.
+/// Per-user log directory (`%LOCALAPPDATA%\StreamToSpeaker`, see
+/// [`folders`]). Created if missing. `None` when there is no local folder
+/// (off Windows without `LOCALAPPDATA`). Used by `main.rs` to seed the
+/// file logger and by the GUI Help menu's "Open log folder" item.
 pub fn log_dir() -> Option<std::path::PathBuf> {
-    let base = std::env::var("LOCALAPPDATA").ok()?;
-    let dir = std::path::PathBuf::from(base).join("StreamToSpeaker");
+    let dir = folders::local_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }

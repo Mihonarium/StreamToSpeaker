@@ -334,24 +334,8 @@ fn default_auto_reconnect() -> bool {
     true
 }
 
-fn config_dir() -> Option<PathBuf> {
-    // %APPDATA% on Windows. On non-Windows (tests, lint runs), fall
-    // back to $XDG_CONFIG_HOME or $HOME/.config; this binary is
-    // gated to Windows in practice but the module compiles cross-
-    // platform so unit-test builds don't need a cfg fence.
-    if let Ok(p) = std::env::var("APPDATA") {
-        Some(PathBuf::from(p).join("StreamToSpeaker"))
-    } else if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
-        Some(PathBuf::from(p).join("stream-to-speaker"))
-    } else if let Ok(p) = std::env::var("HOME") {
-        Some(PathBuf::from(p).join(".config").join("stream-to-speaker"))
-    } else {
-        None
-    }
-}
-
 fn config_path() -> Option<PathBuf> {
-    config_dir().map(|d| d.join("config.json"))
+    crate::folders::settings_dir().map(|d| d.join("config.json"))
 }
 
 impl UserConfig {
@@ -529,7 +513,7 @@ impl UserConfig {
     pub fn try_save(&self) -> Result<(), String> {
         match self.file() {
             Some(path) => self.try_save_to_with(&path, &PlatformCodec),
-            None => Err("there's no folder to keep the settings in (APPDATA isn't set)".into()),
+            None => Err("there's no folder to keep the settings in".into()),
         }
     }
 

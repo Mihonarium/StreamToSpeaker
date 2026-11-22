@@ -709,6 +709,16 @@ fn palette_for(dark: bool, system_accent: Option<(u8, u8, u8)>) -> Palette {
 // Run
 // -----------------------------------------------------------------------------
 
+/// The file the window's state is kept in, after moving the one older
+/// versions kept in the roaming profile there.
+fn window_state_file() -> Option<std::path::PathBuf> {
+    let file = crate::folders::window_state_file()?;
+    if let Some(roaming) = crate::folders::roaming_base().filter(|p| p.is_absolute()) {
+        crate::folders::move_old_window_state(&roaming, &file);
+    }
+    Some(file)
+}
+
 /// `start_hidden`: launched at sign-in — once the window exists, hide it
 /// to the tray (only when the tray icon was actually created, or the user
 /// would have no way to reach the app).
@@ -754,6 +764,10 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
         // a feature that breaks the window for every tray user is a
         // worse trade than losing "remember last size/position."
         persist_window: false,
+        // What the window remembers (open sections, the zoom) goes in the
+        // local folder beside the log, never in a folder of the
+        // framework's own choosing (see `folders`).
+        persistence_path: window_state_file(),
         ..Default::default()
     };
 
