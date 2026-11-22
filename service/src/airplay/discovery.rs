@@ -164,11 +164,17 @@ pub struct RaopDetails {
     /// describes.
     pub instance: Option<String>,
     /// Set when another live instance claimed this entry's identity (MAC)
-    /// first, or carried a session in this run: this one is then chosen
-    /// only by its own id (`airplay:<MAC>/<instance>`), never by the
-    /// plain `airplay:<MAC>` that the launch reconnect and "connect
-    /// always" use, and gets nothing stored under the plain id.
+    /// before it: this one is then chosen only by its own id
+    /// (`airplay:<MAC>/<instance>`, see [`is_newcomer_id`]), by a person
+    /// and for one session at a time, never by the plain `airplay:<MAC>`
+    /// that the launch reconnect and "connect always" use, and nothing
+    /// stored under the plain id is used with it.
     pub newcomer: bool,
+}
+
+/// Is `id` the id of a newcomer (see [`RaopDetails::newcomer`])?
+pub fn is_newcomer_id(id: &str) -> bool {
+    id.strip_prefix("airplay:").is_some_and(|rest| rest.contains('/'))
 }
 
 /// The addresses of `addrs` this app may connect to, in the order a
@@ -492,8 +498,6 @@ pub struct AirPlayDiscoveryState {
     resolved: AtomicU64,
     /// MAC → the address that last carried a session in this run.
     working: Mutex<HashMap<String, IpAddr>>,
-    /// MAC → the instance that last carried a session in this run.
-    played: Mutex<HashMap<String, String>>,
     lan: LanView,
     airplay: Mutex<HashMap<String, AirPlayInfo>>,
     /// `_airplay._tcp` instance fullname → MAC, so a removal (which only
@@ -515,7 +519,6 @@ impl AirPlayDiscoveryState {
         let singles = {
             let lan = self.lan.get();
             let working = self.working.lock().unwrap().clone();
-            let played = self.played.lock().unwrap().clone();
             let raop = self.raop.lock().unwrap();
             let airplay = self.airplay.lock().unwrap();
             let mut macs: BTreeSet<String> = BTreeSet::new();
@@ -524,8 +527,7 @@ impl AirPlayDiscoveryState {
             macs.into_iter()
                 .flat_map(|mac| {
                     let claims: Vec<&RaopInfo> = raop.values().filter(|r| r.mac == mac).collect();
-                    let known = Known { working: working.get(&mac).copied(), played: played.get(&mac).map(String::as_str) };
-                    entries_for(&mac, &claims, airplay.get(&mac), known, &lan)
+                    entries_for(&mac, &claims, airplay.get(&mac), working.get(&mac).copied(), &lan)
                 })
                 .collect::<Vec<_>>()
         };
@@ -540,11 +542,10 @@ impl AirPlayDiscoveryState {
     fn entries_for_mac(&self, mac: &str) -> Vec<AirPlayRenderer> {
         let lan = self.lan.get();
         let working = self.working.lock().unwrap().get(mac).copied();
-        let played = self.played.lock().unwrap().get(mac).cloned();
         let raop = self.raop.lock().unwrap();
         let airplay = self.airplay.lock().unwrap();
         let claims: Vec<&RaopInfo> = raop.values().filter(|r| r.mac == mac).collect();
-        entries_for(mac, &claims, airplay.get(mac), Known { working, played: played.as_deref() }, &lan)
+        entries_for(mac, &claims, airplay.get(mac), working, &lan)
     }
 
     /// Find by our public `stable_id()` (i.e. with the `airplay:` prefix).
@@ -578,12 +579,11 @@ impl AirPlayDiscoveryState {
     }
 
     /// A session to `r` came up (RECORD answered, any password
-    /// accepted): its address is tried first from now on, and its
-    /// instance is the incumbent if another one claims the same MAC.
+    /// accepted): its address is tried first from now on. A session on a
+    /// newcomer changes nothing: it is one session, nothing more.
     pub fn note_session(&self, r: &AirPlayRenderer) {
-        self.working.lock().unwrap().insert(r.mac_id.clone(), r.ip);
-        if let Some(instance) = &r.raop.instance {
-            self.played.lock().unwrap().insert(r.mac_id.clone(), instance.clone());
+        if !r.raop.newcomer {
+            self.working.lock().unwrap().insert(r.mac_id.clone(), r.ip);
         }
     }
 
@@ -757,40 +757,29 @@ fn fold_pairs(singles: Vec<AirPlayRenderer>, memory: &HashMap<String, BTreeSet<S
     out
 }
 
-/// What this run knows about a MAC: the address and the instance that
-/// last carried a session.
-#[derive(Clone, Copy, Default)]
-struct Known<'a> {
-    working: Option<IpAddr>,
-    played: Option<&'a str>,
-}
-
 /// The entries for one MAC. One `_raop._tcp` instance (or none) makes one
 /// entry, as always. Several live instances claiming one MAC are never
 /// merged, whatever their addresses: anyone can announce a receiver's
 /// MAC, and with it addresses that include the receiver's own. Each is
 /// listed on its own, with only what it announced, named with its
-/// address. The incumbent, the instance that carried a session in this
-/// run or else the one seen first, keeps the plain id, what is stored
-/// under it, and the `_airplay._tcp` record; the others are newcomers
-/// (see [`RaopDetails::newcomer`]). A rename looks like this for as long
-/// as both names are announced; when the old name's goodbye (or expiry)
-/// comes, the new one is the only instance and an ordinary entry.
-fn entries_for(mac: &str, claims: &[&RaopInfo], airplay: Option<&AirPlayInfo>, known: Known<'_>, lan: &LanTargets) -> Vec<AirPlayRenderer> {
+/// address. The incumbent is the instance the app knew before the
+/// conflict began, the one resolved first, and nothing during the
+/// conflict changes that (not a session on another one, not a newer
+/// announcement): it keeps the plain id, what is stored under it, and
+/// the `_airplay._tcp` record; the others are newcomers (see
+/// [`RaopDetails::newcomer`]). The conflict ends when one of them goes
+/// (goodbye or expiry); the one left is then an ordinary entry. A rename
+/// looks like this for as long as both names are announced.
+fn entries_for(mac: &str, claims: &[&RaopInfo], airplay: Option<&AirPlayInfo>, working: Option<IpAddr>, lan: &LanTargets) -> Vec<AirPlayRenderer> {
     let mut claims: Vec<&RaopInfo> = claims.to_vec();
     claims.sort_by_key(|r| r.first_seen);
     if claims.len() <= 1 {
-        return merge(mac, claims.first().copied(), airplay, known.working, lan).into_iter().collect();
+        return merge(mac, claims.first().copied(), airplay, working, lan).into_iter().collect();
     }
-    let incumbent = claims
-        .iter()
-        .find(|r| Some(r.fullname.as_str()) == known.played)
-        .or(claims.first())
-        .map(|r| r.fullname.clone());
     let mut out = Vec::new();
-    for r in claims {
-        let is_incumbent = Some(&r.fullname) == incumbent.as_ref();
-        let working = known.working.filter(|_| is_incumbent);
+    for (i, r) in claims.into_iter().enumerate() {
+        let is_incumbent = i == 0;
+        let working = working.filter(|_| is_incumbent);
         let Some(mut e) = merge(mac, Some(r), airplay.filter(|_| is_incumbent), working, lan) else { continue };
         e.friendly_name = format!("{} ({})", e.friendly_name, e.ip);
         e.raop.newcomer = !is_incumbent;
@@ -1364,17 +1353,40 @@ mod tests {
         assert_eq!((other.port, other.friendly_name.as_str()), (6666, "Kitchen 2 (192.168.1.65)"));
     }
 
-    /// The incumbent is the instance that carried a session in this run,
-    /// else the one seen first; nothing automatic follows a newcomer.
+    /// The incumbent is the instance known before the conflict began;
+    /// a session on the newcomer, or a newer announcement from it,
+    /// changes nothing.
     #[test]
-    fn the_incumbent_is_the_one_played_to_else_the_first_seen() {
+    fn nothing_during_a_conflict_makes_the_newcomer_the_incumbent() {
         let state = conflict_state();
-        assert_eq!(state.find_by_id("airplay:B8E93735AC11").unwrap().port, 5000);
-        // The person picked the other one, and it played: from now on it
-        // is the incumbent.
         state.note_session(&state.find_by_id(NEWCOMER).unwrap());
-        assert_eq!(state.find_by_id("airplay:B8E93735AC11").unwrap().port, 6666);
-        assert!(state.find_by_id("airplay:B8E93735AC11/b8e93735ac11@kitchen._raop._tcp.local.").unwrap().raop.newcomer);
+        let fake = ServiceInfo::new(RAOP_SERVICE, "B8E93735AC11@Kitchen 2", "evil.local.", "192.168.1.66", 6666, &[("et", "1")][..]).unwrap();
+        ingest_resolution(&state, RAOP_SERVICE, &fake);
+        let plain = state.find_by_id("airplay:B8E93735AC11").unwrap();
+        assert_eq!((plain.port, plain.ip, plain.raop.newcomer), (5000, ip("192.168.1.65"), false));
+        assert!(state.find_by_id(NEWCOMER).unwrap().raop.newcomer);
+        assert_eq!(state.working_address("B8E93735AC11"), None, "a newcomer's session marks no address");
+    }
+
+    #[test]
+    fn newcomer_ids_are_told_apart() {
+        assert!(is_newcomer_id(NEWCOMER));
+        assert!(!is_newcomer_id("airplay:B8E93735AC11"));
+        assert!(!is_newcomer_id("airplay:pair:abc"));
+        assert!(!is_newcomer_id("uuid:RINCON_1/2"));
+    }
+
+    /// When the incumbent goes, the conflict is over: the one left is an
+    /// ordinary entry with the plain id (and so what is stored under it).
+    #[test]
+    fn when_the_incumbent_goes_the_other_one_is_the_speaker() {
+        let state = conflict_state();
+        ingest_removal(&state, RAOP_SERVICE, "B8E93735AC11@Kitchen._raop._tcp.local.");
+        let v = state.renderers();
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].stable_id().as_str(), v[0].raop.newcomer, v[0].port), ("airplay:B8E93735AC11", false, 6666));
+        // A pick made by its newcomer id still finds it.
+        assert_eq!(state.find_by_id(NEWCOMER).unwrap().stable_id(), "airplay:B8E93735AC11");
     }
 
     /// A rename: both names announced for a while, then the old name's
