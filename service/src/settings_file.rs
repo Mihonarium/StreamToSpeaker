@@ -191,6 +191,59 @@ fn note_backup(backup: &Path, result: io::Result<()>) {
     }
 }
 
+/// Keep `bytes` as a copy of `path` named `<name>.<label>-<unix time>`
+/// (with `-<n>` added when that name is taken), flushed. A copy for which
+/// `same` holds is already kept: its path is returned and nothing is
+/// written. Beyond `most` copies, the oldest others are removed.
+pub fn keep_copy(
+    fs: &dyn FileOps,
+    path: &Path,
+    label: &str,
+    bytes: &[u8],
+    most: usize,
+    same: &dyn Fn(&[u8]) -> bool,
+) -> io::Result<PathBuf> {
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("config.json");
+    let prefix = format!("{name}.{label}-");
+    let mut kept: Vec<String> = fs.list(dir)?.into_iter().filter(|n| n.starts_with(prefix.as_str())).collect();
+    for copy in &kept {
+        if fs.read(&dir.join(copy)).is_ok_and(|b| same(&b)) {
+            return Ok(dir.join(copy));
+        }
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut written = None;
+    for n in 0..TEMP_TRIES {
+        let candidate = if n == 0 { format!("{prefix}{secs}") } else { format!("{prefix}{secs}-{n}") };
+        match fs.create_flushed(&dir.join(&candidate), bytes) {
+            Ok(()) => {
+                written = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let written = written.ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "no free name"))?;
+    // Oldest first: by the time in the name, then by the number after it.
+    let when = |n: &str| -> (u64, u64) {
+        let mut parts = n.get(prefix.len()..).unwrap_or("").split('-').map(|t| t.parse().unwrap_or(0));
+        (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+    };
+    kept.sort_by_key(|n| when(n));
+    let excess = (kept.len() + 1).saturating_sub(most);
+    for old in kept.iter().take(excess) {
+        if let Err(e) = fs.remove(&dir.join(old)) {
+            log::debug!("user_config: couldn't remove the older copy {old} ({e})");
+        }
+    }
+    Ok(dir.join(written))
+}
+
 /// A temporary file older than this is left from a save that was cut
 /// short (a crash, a power cut): no save takes this long.
 const STALE_TEMP: Duration = Duration::from_secs(60 * 60);
@@ -446,6 +499,32 @@ pub(crate) mod tests {
         }
         remove_stale_temps(&disk, &path());
         assert_eq!(disk.names(), ["config.json", "config.json.bak", "other.tmp"]);
+    }
+
+    #[test]
+    fn copies_kept_aside_are_not_made_twice_and_at_most_three_stay() {
+        let disk = PowerCutDisk::with_file(&path(), b"{}");
+        let never = |_: &[u8]| false;
+        let mut made = Vec::new();
+        for n in 0..5 {
+            let copy = keep_copy(&disk, &path(), "before-reset", format!("copy {n}").as_bytes(), 3, &never).unwrap();
+            assert!(copy.file_name().unwrap().to_str().unwrap().starts_with("config.json.before-reset-"));
+            made.push(copy);
+        }
+        // The newest three stay, made in this order within one second or not.
+        let mut left: Vec<Vec<u8>> = disk
+            .names()
+            .iter()
+            .filter(|n| n.starts_with("config.json.before-reset-"))
+            .map(|n| disk.get(&path().with_file_name(n)).unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, [b"copy 2".to_vec(), b"copy 3".to_vec(), b"copy 4".to_vec()]);
+        // One the same as a kept copy is not made again.
+        let same = |b: &[u8]| b == b"copy 3";
+        let again = keep_copy(&disk, &path(), "before-reset", b"copy 3 again", 3, &same).unwrap();
+        assert_eq!(again, made[3]);
+        assert_eq!(disk.names().len(), 4, "{:?}", disk.names());
     }
 
     #[test]

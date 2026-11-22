@@ -108,23 +108,6 @@ impl EqSettings {
     }
 }
 
-/// Lenient field deserializer for `UserConfig`: a malformed equalizer
-/// entry falls back to the default curve instead of failing the whole
-/// config file (which would quarantine everything else in it).
-pub fn deserialize_lenient<'de, D>(d: D) -> Result<EqSettings, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let v = serde_json::Value::deserialize(d)?;
-    Ok(match serde_json::from_value::<EqSettings>(v) {
-        Ok(s) => s.sanitized(),
-        Err(e) => {
-            log::warn!("user_config: ignoring malformed equalizer settings ({e})");
-            EqSettings::default()
-        }
-    })
-}
-
 /// A named curve offered in the editor. Selecting one sets the bands and
 /// resets the preamp to 0.
 pub struct EqPreset {

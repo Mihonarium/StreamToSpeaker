@@ -1,14 +1,17 @@
-//! Persisted user preferences.
+//! Persisted user preferences: `config.json` in the roaming profile
+//! (`%APPDATA%\StreamToSpeaker`, see `folders`), loaded at start and saved
+//! after each change.
 //!
-//! Tiny JSON file at `%APPDATA%\StreamToSpeaker\config.json` that
-//! survives across launches. Currently holds:
-//!   - `last_speaker_id`: the stable id of the speaker the user last
-//!     explicitly selected. Used to auto-reconnect on next launch.
-//!     `None` on first launch (or after the user clicks "Forget
-//!     speaker"), which is what causes the onboarding card to show.
-//!   - `onboarding_dismissed`: whether the user clicked "Got it" on
-//!     the onboarding card. Persisted so we don't re-show it on
-//!     subsequent launches.
+//! - A save can't lose the settings, whatever moment a crash or a power
+//!   cut hits, and leaves a mirror in `config.json.bak` for a file found
+//!   damaged later (see `settings_file`).
+//! - A load reads each value on its own (see `lenient_json`): one that
+//!   can't be read (a hand edit, a value a later version wrote) takes its
+//!   default, or its list or map entry is left out, and the rest loads. A
+//!   copy of the file as it was is kept beside it, and
+//!   [`UserConfig::load_notice`] says what happened. Only a file that
+//!   isn't a JSON object at all is set aside, after the backup was tried.
+//!   Keys this version doesn't know are kept across saves.
 //!
 //! Secrets (AirPlay passwords, pairing credentials, the controller seed;
 //! Sendspin identity keys and pairing PSKs; the web UI's key) are sealed
@@ -21,6 +24,7 @@ use std::path::PathBuf;
 
 use crate::airplay::hap_pairing::PairingCredentials;
 use crate::secret_store::{self, LockedNode, PlatformCodec, SecretCodec};
+use crate::lenient_json::{self, KeyPath};
 use crate::settings_file::{self, Disk, FileOps, WriteError};
 use crate::discovery_net::SavedAdapter;
 use crate::manual_speakers::ManualSpeaker;
@@ -229,7 +233,7 @@ pub struct UserConfig {
     /// Ten-band equalizer applied to everything streamed (all output
     /// types). Off by default; disabling keeps the curve. A malformed
     /// entry falls back to the default rather than failing the file.
-    #[serde(default, deserialize_with = "crate::equalizer::deserialize_lenient")]
+    #[serde(default)]
     pub equalizer: EqSettings,
 }
 
@@ -261,7 +265,7 @@ pub struct SpeakerSettings {
     pub airplay_latency_ms: Option<u32>,
     /// UPnP: the stream profile this speaker last played; the next
     /// connect starts there (see `stream_profile`).
-    #[serde(default, deserialize_with = "crate::stream_profile::deserialize_remembered")]
+    #[serde(default)]
     pub upnp_stream_profile: Option<StreamProfile>,
 }
 
@@ -534,9 +538,20 @@ impl UserConfig {
         path: &std::path::Path,
         codec: &dyn SecretCodec,
         fs: &dyn FileOps,
-        notice: LoadNotice,
+        mut notice: LoadNotice,
     ) -> Self {
-        let Parsed { mut config, report, encoding } = parsed;
+        let Parsed { mut config, report, encoding, reset } = parsed;
+        if let Some((paths, as_found)) = reset {
+            // Kept before any save drops the values that couldn't be read.
+            notice.reset_kept_as = keep_before_reset(fs, path, as_found, &report.locked, codec);
+            for p in &paths {
+                log::warn!(
+                    "user_config: {} couldn't be read, so it is back to its default",
+                    secret_store::pointer(p)
+                );
+            }
+            notice.reset = paths;
+        }
         config.locked_secrets = report.locked;
         config.load_notice = notice;
         if let Some(encoding) = encoding {
@@ -688,6 +703,12 @@ pub struct LoadNotice {
     /// Every setting is back to its default: `config.json` was unusable
     /// and there was no usable backup.
     pub all_reset: bool,
+    /// Settings that couldn't be read and are back to their defaults, by
+    /// key path (an entry of a list or map that couldn't be read is left
+    /// out as a whole).
+    pub reset: Vec<KeyPath>,
+    /// The copy of the file as it was found, kept when `reset` isn't empty.
+    pub reset_kept_as: Option<PathBuf>,
 }
 
 impl LoadNotice {
@@ -703,15 +724,63 @@ struct Parsed {
     report: secret_store::UnsealReport,
     /// The file's encoding, when it isn't the UTF-8 saves write.
     encoding: Option<&'static str>,
+    /// Values that couldn't be read (their key paths), and the file's tree
+    /// as it was found, secrets unsealed.
+    reset: Option<(Vec<KeyPath>, serde_json::Value)>,
 }
 
 /// The settings in a file's bytes, secrets unsealed with `codec`; why
-/// they aren't usable otherwise.
+/// they aren't usable otherwise. A value that can't be read costs that
+/// value only: it takes its default, or its list or map entry is left out
+/// (see `lenient_json`); only a file that isn't a JSON object is refused.
 fn parse_settings(bytes: &[u8], codec: &dyn SecretCodec) -> Result<Parsed, String> {
     let (mut tree, encoding) = settings_tree(bytes)?;
     let report = secret_store::unseal(&mut tree, codec);
-    let config = serde_json::from_value::<UserConfig>(tree).map_err(|e| format!("not valid JSON: {e}"))?;
-    Ok(Parsed { config, report, encoding })
+    let (mut config, rejected) = lenient_json::from_value::<UserConfig>(&tree)?;
+    config.equalizer = config.equalizer.sanitized();
+    let reset = (!rejected.is_empty()).then_some((rejected, tree));
+    Ok(Parsed { config, report, encoding, reset })
+}
+
+/// Most copies of the settings file kept from before values were reset.
+const RESET_COPIES: usize = 3;
+
+/// Keep a copy of a settings file whose values couldn't all be read, as
+/// it was found (`as_found`, secrets unsealed; sealed again here with
+/// `locked`), beside `path` as `config.json.before-reset-<unix time>`. An
+/// identical copy already kept is used instead; the oldest beyond
+/// [`RESET_COPIES`] are removed. Its path; `None` (logged) when it
+/// couldn't be written.
+fn keep_before_reset(
+    fs: &dyn FileOps,
+    path: &std::path::Path,
+    mut as_found: serde_json::Value,
+    locked: &[LockedNode],
+    codec: &dyn SecretCodec,
+) -> Option<PathBuf> {
+    let plain = as_found.clone();
+    secret_store::seal(&mut as_found, locked, codec);
+    let text = match serde_json::to_string_pretty(&as_found) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("user_config: couldn't keep a copy of the settings ({e})");
+            return None;
+        }
+    };
+    // Sealing twice gives different bytes: copies are compared opened.
+    let same = |bytes: &[u8]| {
+        settings_tree(bytes).is_ok_and(|(mut tree, _)| {
+            let report = secret_store::unseal(&mut tree, codec);
+            tree == plain && report.locked == locked
+        })
+    };
+    match settings_file::keep_copy(fs, path, "before-reset", text.as_bytes(), RESET_COPIES, &same) {
+        Ok(copy) => Some(copy),
+        Err(e) => {
+            log::warn!("user_config: couldn't keep a copy of the settings beside {} ({e})", path.display());
+            None
+        }
+    }
 }
 
 /// A settings file's JSON tree, which must be an object, as stored
@@ -816,6 +885,11 @@ fn quarantine_path(path: &std::path::Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settings read from `text` as a load reads them.
+    fn from_text(text: &str) -> UserConfig {
+        parse_settings(text.as_bytes(), &PlatformCodec).unwrap_or_else(|e| panic!("{text}: {e}")).config
+    }
 
     #[test]
     fn fresh_defaults_match_serde_defaults() {
@@ -1168,6 +1242,381 @@ mod tests {
         // A fresh install has nothing to tell.
         let fresh = UserConfig::load_with_ops(&path, &codec, &PowerCutDisk::default());
         assert!(fresh.load_notice().is_empty());
+    }
+
+    #[test]
+    fn one_value_that_cannot_be_read_costs_that_value_only() {
+        let dir = temp_config_dir("one-value");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let text = r#"{"last_speaker_id":"x","prefer_realtime_airplay":"true","airplay_latency_ms":250.5,
+            "speaker_settings":{"a":{"auto_connect":"when_idle","hidden":true},"b":{"hidden":true}},
+            "manual_speakers":[{"kind":"air_play","host":"10.0.0.5","port":70000},
+                               {"kind":"bluetooth","host":"10.0.0.6"},
+                               {"kind":"upnp","host":5},
+                               {"kind":"upnp","host":"http://10.0.0.7/d.xml"}],
+            "airplay_passwords":{"airplay:aa":"pw","airplay:bb":7},
+            "future_setting":{"anything":1}}"#;
+        std::fs::write(&path, text).unwrap();
+        let c = UserConfig::load_from(&path);
+        assert_eq!(c.last_speaker_id.as_deref(), Some("x"));
+        assert!(!c.prefer_realtime_airplay);
+        assert_eq!(c.airplay_latency_ms, AIRPLAY_LATENCY_MS_DEFAULT);
+        assert_eq!(c.speaker_settings["a"], SpeakerSettings { hidden: true, ..Default::default() });
+        assert!(c.speaker_settings["b"].hidden);
+        let hosts: Vec<(&str, u16)> = c.manual_speakers.iter().map(|m| (m.host.as_str(), m.port)).collect();
+        assert_eq!(hosts, [("10.0.0.5", 0), ("http://10.0.0.7/d.xml", 0)]);
+        assert_eq!(c.airplay_passwords.len(), 1);
+        assert_eq!(c.airplay_passwords["airplay:aa"], "pw");
+        assert!(c.unknown_keys.contains_key("future_setting"));
+        assert!(path.exists(), "the file stays where it is");
+        // The person is told which, and where the file as it was is kept.
+        let keys = |paths: &[KeyPath]| -> Vec<String> { paths.iter().map(|p| secret_store::pointer(p)).collect() };
+        let notice = c.load_notice().clone();
+        assert_eq!(
+            keys(&notice.reset),
+            [
+                "/airplay_latency_ms",
+                "/airplay_passwords/airplay:bb",
+                "/manual_speakers/0/port",
+                "/manual_speakers/1",
+                "/manual_speakers/2",
+                "/prefer_realtime_airplay",
+                "/speaker_settings/a/auto_connect",
+            ]
+        );
+        assert!(!notice.restored_from_backup && !notice.all_reset && notice.unusable_kept_as.is_none());
+        let copy = notice.reset_kept_as.clone().unwrap();
+        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+        let found: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(kept, found, "the copy is the file as it was (nothing to seal off Windows)");
+        // Started again before anything was saved: the same copy, not another.
+        let again = UserConfig::load_from(&path);
+        assert_eq!(again.load_notice().reset_kept_as.as_ref(), Some(&copy));
+        let copies = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("config.json.before-reset-"))
+                .count()
+        };
+        assert_eq!(copies(&dir), 1);
+        // A save drops what couldn't be read: the next start has nothing to tell.
+        again.save_to(&path);
+        assert!(UserConfig::load_from(&path).load_notice().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_copy_kept_aside_holds_secrets_sealed() {
+        use crate::secret_store::tests::FakeCodec;
+        let dir = temp_config_dir("reset-copy-sealed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        // As an older version wrote it, with a value this one can't read.
+        std::fs::write(
+            &path,
+            r#"{"airplay_passwords":{"airplay:aa":"hunter2"},"prefer_realtime_airplay":"true"}"#,
+        )
+        .unwrap();
+        let c = UserConfig::load_from_with(&path, &FakeCodec(0x42));
+        assert_eq!(c.airplay_passwords["airplay:aa"], "hunter2");
+        let copy = c.load_notice().reset_kept_as.clone().unwrap();
+        for (name, text) in folder_text(&dir) {
+            assert!(!text.contains("hunter2"), "{name}: {text}");
+        }
+        // The copy opens to the file as it was, rejected value included.
+        let kept = UserConfig::stored_web_secret_at(&copy, &FakeCodec(0x42));
+        assert_eq!(kept, None);
+        let mut tree: serde_json::Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+        secret_store::unseal(&mut tree, &FakeCodec(0x42));
+        assert_eq!(tree["airplay_passwords"]["airplay:aa"], "hunter2");
+        assert_eq!(tree["prefer_realtime_airplay"], "true");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sealed_value_that_opens_to_the_wrong_type_costs_that_value_only() {
+        use crate::secret_store::tests::FakeCodec;
+        let codec = FakeCodec(0x42);
+        let dir = temp_config_dir("sealed-wrong-type");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        // Sealed as a later version might store it: a number, not text.
+        let mut tree = serde_json::json!({
+            "last_speaker_id": "x",
+            "airplay_passwords": {"airplay:aa": "hunter2", "airplay:bb": 7}
+        });
+        secret_store::seal(&mut tree, &[], &codec);
+        assert!(!tree.to_string().contains("hunter2"));
+        std::fs::write(&path, tree.to_string()).unwrap();
+        let c = UserConfig::load_from_with(&path, &codec);
+        assert_eq!(c.last_speaker_id.as_deref(), Some("x"));
+        assert_eq!(c.airplay_passwords.len(), 1);
+        assert_eq!(c.airplay_passwords["airplay:aa"], "hunter2");
+        let reset: Vec<String> = c.load_notice().reset.iter().map(|p| secret_store::pointer(p)).collect();
+        assert_eq!(reset, ["/airplay_passwords/airplay:bb"]);
+        // One that can't be opened at all is kept as it is, as before, and
+        // isn't a reset.
+        let other = UserConfig::load_from_with(&path, &FakeCodec(0x43));
+        assert_eq!(other.last_speaker_id.as_deref(), Some("x"));
+        assert!(other.airplay_passwords.is_empty());
+        assert!(other.load_notice().reset.is_empty());
+        assert_eq!(other.locked_secrets.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settings in which every field of every struct, and of every entry
+    /// of every list and map, differs from what it is when left out. A
+    /// field added to any of these types must be set here as well:
+    /// `every_field_differs_from_its_default` fails until it is.
+    fn everything_set() -> UserConfig {
+        use crate::discovery_net::SavedAdapter;
+        use crate::manual_speakers::ManualKind;
+        let mut c = UserConfig::default();
+        c.last_speaker_id = Some("uuid:RINCON_ALL".into());
+        c.onboarding_dismissed = true;
+        c.always_minimise_to_tray = true;
+        c.donation_prompt_hidden_until = Some(1_800_000_000);
+        c.auto_reconnect_on_launch = false;
+        c.prefer_realtime_airplay = true;
+        c.auto_reconnect_on_drop = false;
+        c.airplay_mfi_encryption = true;
+        c.airplay_passwords.insert("airplay:aa".into(), "hunter2".into());
+        c.airplay_pairings.insert(
+            "airplay:cc".into(),
+            PairingCredentials {
+                controller_id: "ctl".into(),
+                controller_seed_hex: "ab".repeat(32),
+                accessory_id: "acc".into(),
+                accessory_ltpk_hex: "cd".repeat(32),
+            },
+        );
+        c.airplay_controller_id = Some("ctl".into());
+        c.airplay_controller_seed_hex = Some("ef".repeat(32));
+        c.web_secret = Some("00112233445566778899aabbccddeeff".into());
+        c.unknown_keys.insert("future_setting".into(), serde_json::json!({"x": 1}));
+        c.forward_now_playing = true;
+        c.airplay_uncompressed_alac = true;
+        c.privacy_mode = true;
+        c.airplay_latency_ms = 300;
+        c.airplay_homepod_buffered = true;
+        c.airplay_homepod_latency_ms = 150;
+        c.check_for_updates = false;
+        c.update_last_check_unix = Some(1_700_000_000);
+        c.update_latest_tag = Some("v9.9.9".into());
+        c.update_latest_url = Some("https://example.invalid/r".into());
+        c.update_skipped_tag = Some("v9.9.8".into());
+        c.update_banner_hidden_until = Some(1_700_000_100);
+        c.sendspin = paired_sendspin();
+        c.sendspin.source_name = Some("Office PC".into());
+        c.sendspin.last_playback_server = Some("srv-a".into());
+        c.sendspin.player_extra_latency_ms = 40;
+        c.sendspin.pairing_code_failures = 2;
+        c.manual_speakers.push(ManualSpeaker {
+            kind: ManualKind::AirPlay,
+            name: "Den".into(),
+            host: "10.0.0.5".into(),
+            port: 7000,
+        });
+        c.discovery_adapter = Some(SavedAdapter { key: "{GUID}".into(), name: "Ethernet".into() });
+        c.speaker_settings.insert(
+            "uuid:RINCON_ALL".into(),
+            SpeakerSettings {
+                hidden: true,
+                auto_connect: AutoConnect::Always,
+                airplay_latency_ms: Some(120),
+                upnp_stream_profile: Some(StreamProfile::L16),
+            },
+        );
+        c.equalizer = EqSettings { enabled: true, preamp_db: -3.0, bands_db: [1.5; crate::equalizer::EQ_BANDS] };
+        c.equalizer.bands_db[0] = -2.0;
+        c
+    }
+
+    /// What a field holds when nothing was set (left out, or the entry type
+    /// has no default): null, false, 0, "", [] or {}.
+    fn is_unset(v: &serde_json::Value) -> bool {
+        use serde_json::Value;
+        match v {
+            Value::Null => true,
+            Value::Bool(b) => !b,
+            Value::Number(n) => n.as_f64() == Some(0.0),
+            Value::String(s) => s.is_empty(),
+            Value::Array(a) => a.is_empty(),
+            Value::Object(o) => o.is_empty(),
+        }
+    }
+
+    /// Check that `value` differs everywhere from `default` (the same place
+    /// in the defaults; `None` where they have nothing, such as a list or
+    /// map entry, which then must hold no unset value).
+    fn assert_differs(value: &serde_json::Value, default: Option<&serde_json::Value>, path: &mut Vec<String>) {
+        use serde_json::Value;
+        // Entries of these maps have a default of their own to differ from.
+        let entry_default = |path: &[String]| -> Option<Value> {
+            (path.len() == 2 && path[0] == "speaker_settings")
+                .then(|| serde_json::to_value(SpeakerSettings::default()).unwrap())
+        };
+        match (value, default) {
+            (Value::Object(map), Some(Value::Object(d))) if !d.is_empty() => {
+                for (k, dv) in d {
+                    path.push(k.clone());
+                    let v = map.get(k).unwrap_or_else(|| panic!("{path:?} not saved"));
+                    assert_differs(v, Some(dv), path);
+                    path.pop();
+                }
+                for (k, v) in map.iter().filter(|(k, _)| !d.contains_key(*k)) {
+                    path.push(k.clone());
+                    assert_differs(v, None, path);
+                    path.pop();
+                }
+            }
+            (Value::Object(map), _) => {
+                assert!(!map.is_empty(), "{path:?}: put an entry here");
+                for (k, v) in map {
+                    path.push(k.clone());
+                    let d = entry_default(path);
+                    assert_differs(v, d.as_ref(), path);
+                    path.pop();
+                }
+            }
+            (Value::Array(items), Some(Value::Array(d))) if !d.is_empty() => {
+                assert_eq!(items.len(), d.len(), "{path:?}");
+                for (i, (v, dv)) in items.iter().zip(d).enumerate() {
+                    path.push(i.to_string());
+                    assert_differs(v, Some(dv), path);
+                    path.pop();
+                }
+            }
+            (Value::Array(items), _) => {
+                assert!(!items.is_empty(), "{path:?}: put an entry here");
+                for (i, v) in items.iter().enumerate() {
+                    path.push(i.to_string());
+                    assert_differs(v, None, path);
+                    path.pop();
+                }
+            }
+            (leaf, Some(d)) => assert_ne!(leaf, d, "{path:?} is still its default"),
+            (leaf, None) => assert!(!is_unset(leaf), "{path:?} is unset"),
+        }
+    }
+
+    #[test]
+    fn every_field_differs_from_its_default_and_survives_a_save() {
+        use crate::secret_store::tests::FakeCodec;
+        let all = everything_set();
+        let saved = serde_json::to_value(&all).unwrap();
+        let defaults = serde_json::to_value(UserConfig::default()).unwrap();
+        assert_differs(&saved, Some(&defaults), &mut Vec::new());
+        // Saved (sealed) and loaded again: the whole value comes back.
+        let dir = temp_config_dir("everything");
+        let path = dir.join("config.json");
+        all.try_save_to_with(&path, &FakeCodec(0x42)).unwrap();
+        let back = UserConfig::load_from_with(&path, &FakeCodec(0x42));
+        assert!(back.load_notice().is_empty(), "{:?}", back.load_notice());
+        assert_eq!(serde_json::to_value(&back).unwrap(), saved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every key path in `tree`, each node once, the root left out.
+    fn every_path(tree: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+        let children: Vec<(String, &serde_json::Value)> = match tree {
+            serde_json::Value::Object(m) => m.iter().map(|(k, v)| (k.clone(), v)).collect(),
+            serde_json::Value::Array(a) => a.iter().enumerate().map(|(i, v)| (i.to_string(), v)).collect(),
+            _ => Vec::new(),
+        };
+        for (k, v) in children {
+            path.push(k);
+            out.push(path.clone());
+            every_path(v, path, out);
+            path.pop();
+        }
+    }
+
+    fn node_mut<'a>(tree: &'a mut serde_json::Value, path: &[String]) -> &'a mut serde_json::Value {
+        path.iter().fold(tree, |node, k| match node {
+            serde_json::Value::Array(a) => &mut a[k.parse::<usize>().unwrap()],
+            other => &mut other[k.as_str()],
+        })
+    }
+
+    fn without(tree: &serde_json::Value, path: &[String]) -> serde_json::Value {
+        let mut t = tree.clone();
+        let (last, parent) = path.split_last().unwrap();
+        match node_mut(&mut t, parent) {
+            serde_json::Value::Array(a) => {
+                a.remove(last.parse::<usize>().unwrap());
+            }
+            serde_json::Value::Object(m) => {
+                m.remove(last);
+            }
+            _ => unreachable!(),
+        }
+        t
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_anywhere_costs_that_field_or_entry_only() {
+        use crate::settings_file::tests::PowerCutDisk;
+        let saved = serde_json::to_value(everything_set()).unwrap();
+        let mut paths = Vec::new();
+        every_path(&saved, &mut Vec::new(), &mut paths);
+        assert!(paths.len() > 60, "{}", paths.len());
+        // Fields with no default: an entry without one of them is left out.
+        // Every other field must have a default, so a file from before the
+        // field existed (or one where it can't be read) keeps the rest.
+        let required = [
+            &["airplay_pairings", "*", "controller_id"][..],
+            &["airplay_pairings", "*", "controller_seed_hex"],
+            &["airplay_pairings", "*", "accessory_id"],
+            &["airplay_pairings", "*", "accessory_ltpk_hex"],
+            &["manual_speakers", "*", "kind"],
+            &["manual_speakers", "*", "host"],
+            &["discovery_adapter", "key"],
+            &["discovery_adapter", "name"],
+            &["sendspin", "server_pairings", "*", "server_id"],
+            &["sendspin", "server_pairings", "*", "psk"],
+            &["sendspin", "player_pairings", "*", "psk"],
+        ];
+        let is_required = |p: &[String]| {
+            required.iter().any(|r| r.len() == p.len() && r.iter().zip(p).all(|(r, k)| *r == "*" || r == k))
+        };
+        let in_an_object = |p: &[String]| {
+            let mut tree = saved.clone();
+            p.split_last().is_some_and(|(_, parent)| node_mut(&mut tree, parent).is_object())
+        };
+        for p in paths.iter().filter(|p| in_an_object(p)) {
+            let strict = serde_json::from_value::<UserConfig>(without(&saved, p));
+            assert_eq!(strict.is_err(), is_required(p), "{p:?}: a field left out must take its default");
+        }
+        let file = PathBuf::from("/profile/StreamToSpeaker/config.json");
+        for p in paths.iter().filter(|p| p[0] != "future_setting") {
+            let mut tree = saved.clone();
+            let node = node_mut(&mut tree, p);
+            *node = match node {
+                serde_json::Value::String(_) => serde_json::json!(7),
+                serde_json::Value::Object(_) => serde_json::json!(7),
+                _ => serde_json::json!("x"),
+            };
+            let disk = PowerCutDisk::with_file(&file, serde_json::to_string(&tree).unwrap().as_bytes());
+            let loaded = UserConfig::load_with_ops(&file, &PlatformCodec, &disk);
+            let notice = loaded.load_notice();
+            assert!(!notice.all_reset && !notice.restored_from_backup, "{p:?}: the file was put aside");
+            assert!(disk.get(&file).is_some(), "{p:?}");
+            assert_eq!(notice.reset.len(), 1, "{p:?}: {:?}", notice.reset);
+            let lost = &notice.reset[0];
+            assert!(p.starts_with(lost), "{p:?} cost {lost:?}");
+            // What was lost is the smallest part without which the rest reads:
+            // the value itself, or else its list or map entry.
+            for depth in lost.len() + 1..=p.len() {
+                let rest = without(&saved, &p[..depth]);
+                assert!(serde_json::from_value::<UserConfig>(rest).is_err(), "{p:?}: {:?} would do", &p[..depth]);
+            }
+            let expected = serde_json::from_value::<UserConfig>(without(&saved, lost)).unwrap();
+            assert_eq!(serde_json::to_value(&loaded).unwrap(), serde_json::to_value(&expected).unwrap(), "{p:?}");
+            assert!(notice.reset_kept_as.is_some(), "{p:?}");
+        }
     }
 
     #[test]
@@ -1790,7 +2239,7 @@ mod tests {
                     "uuid:a":{{"hidden":true,"upnp_stream_profile":{value},"airplay_latency_ms":150}},
                     "uuid:b":{{"upnp_stream_profile":"wav"}}}}}}"#
             );
-            let c: UserConfig = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{value}: {e}"));
+            let c = from_text(&text);
             assert_eq!(c.last_speaker_id.as_deref(), Some("uuid:a"), "{value}");
             assert_eq!(c.airplay_latency_ms, 700, "{value}");
             let a = &c.speaker_settings["uuid:a"];
@@ -1844,15 +2293,11 @@ mod tests {
         let back: UserConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back.equalizer, c.equalizer);
         // A broken equalizer entry must not take the rest of the file with it.
-        let c: UserConfig = serde_json::from_str(
-            r#"{"last_speaker_id":"x","equalizer":{"bands_db":[1,2,3]}}"#,
-        )
-        .unwrap();
+        let c = from_text(r#"{"last_speaker_id":"x","equalizer":{"bands_db":[1,2,3],"enabled":true}}"#);
         assert_eq!(c.last_speaker_id.as_deref(), Some("x"));
-        assert_eq!(c.equalizer, EqSettings::default());
+        assert_eq!(c.equalizer, EqSettings { enabled: true, ..EqSettings::default() });
         // Out-of-range values are clamped onto the grid.
-        let c: UserConfig =
-            serde_json::from_str(r#"{"equalizer":{"enabled":true,"preamp_db":40.2}}"#).unwrap();
+        let c = from_text(r#"{"equalizer":{"enabled":true,"preamp_db":40.2}}"#);
         assert!(c.equalizer.enabled);
         assert_eq!(c.equalizer.preamp_db, 0.0);
     }
