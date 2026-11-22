@@ -402,20 +402,19 @@ impl Shared {
         // A socket already on its real port is kept (it is this service's
         // own); one on a temporary port is bound again on the real one.
         let Some(current) = self.sockets() else { return };
-        let real = |socket: &UdpSocket, port: u16| -> std::io::Result<UdpSocket> {
-            if socket.local_addr()?.port() == port {
-                socket.try_clone()
+        let real = |socket: &UdpSocket, port: u16| -> std::result::Result<UdpSocket, PortsProblem> {
+            let problem = |e: std::io::Error| PortsProblem::from_bind(port, local_ip, &e);
+            if socket.local_addr().map_err(&problem)?.port() == port {
+                socket.try_clone().map_err(&problem)
             } else {
-                UdpSocket::bind(SocketAddr::new(local_ip, port))
+                UdpSocket::bind(SocketAddr::new(local_ip, port)).map_err(&problem)
             }
         };
         let moved = real(&current.event, self.ports.local_event)
-            .and_then(|event| Ok((event, real(&current.general, self.ports.local_general)?)))
-            .map_err(anyhow::Error::from)
-            .and_then(|(event, general)| PtpSockets::new(event, general));
+            .and_then(|event| Ok((event, real(&current.general, self.ports.local_general)?)));
         drop(current);
-        match moved {
-            Ok(sockets) => {
+        match moved.map(|(event, general)| PtpSockets::new(event, general)) {
+            Ok(Ok(sockets)) => {
                 *lock(&self.sockets) = Some(Arc::new(sockets));
                 *lock(&self.ports_problem) = None;
                 info!(
@@ -423,7 +422,12 @@ impl Shared {
                     self.ports.local_event, self.ports.local_general, local_ip
                 );
             }
-            Err(e) => debug!("AirPlay 2 PTP: the PTP ports are still not available ({e:#})"),
+            Ok(Err(e)) => debug!("AirPlay 2 PTP: could not move onto the PTP ports ({e:#})"),
+            // Still not free: say which port is in the way now.
+            Err(problem) => {
+                debug!("AirPlay 2 PTP: the PTP ports are still not available ({problem})");
+                *lock(&self.ports_problem) = Some(problem);
+            }
         }
     }
 }
@@ -508,6 +512,12 @@ pub struct PortsProblem {
     pub error: String,
 }
 
+impl PortsProblem {
+    fn from_bind(port: u16, ip: IpAddr, e: &std::io::Error) -> Self {
+        Self { port, ip, in_use: e.kind() == std::io::ErrorKind::AddrInUse, error: e.to_string() }
+    }
+}
+
 impl std::fmt::Display for PortsProblem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.in_use {
@@ -525,12 +535,7 @@ fn bind_ptp(local_ip: IpAddr, port: u16) -> Result<(UdpSocket, Option<PortsProbl
     match UdpSocket::bind(SocketAddr::new(local_ip, port)) {
         Ok(s) => Ok((s, None)),
         Err(e) => {
-            let problem = PortsProblem {
-                port,
-                ip: local_ip,
-                in_use: e.kind() == std::io::ErrorKind::AddrInUse,
-                error: e.to_string(),
-            };
+            let problem = PortsProblem::from_bind(port, local_ip, &e);
             warn!(
                 "AirPlay 2 PTP: {problem}. Using a temporary port instead, which AirPlay 2 speakers \
                  don't answer, so they may not sync to this PC and stay silent."
@@ -1286,6 +1291,26 @@ mod tests {
         b.stop();
         c.stop();
         UdpSocket::bind((local, ports.local_event)).expect("ports released with the last session");
+    }
+
+    /// After a move back that couldn't happen, the reason names the port
+    /// that is taken now, not the one that was taken at the start.
+    #[test]
+    fn a_failed_move_names_the_port_that_is_taken_now() {
+        let ports = test_ports("127.0.0.18");
+        let local: IpAddr = LOCAL.parse().unwrap();
+        let holds_event = UdpSocket::bind((local, ports.local_event)).unwrap();
+        let holds_general = UdpSocket::bind((local, ports.local_general)).unwrap();
+        let (a_rx, b_rx) = (FakeReceiver::bind("127.0.0.18", ports), FakeReceiver::bind("127.0.0.19", ports));
+        let a = spawn_ptp_master_on(&[a_rx.ip], local, ports, "A".into(), true).unwrap();
+        assert_eq!(a.ports_problem().map(|p| p.port), Some(ports.local_event));
+        drop(holds_event);
+        let b = spawn_ptp_master_on(&[b_rx.ip], local, ports, "B".into(), true).unwrap();
+        let now = b.ports_problem().expect("the general port is still held");
+        assert_eq!((now.port, now.in_use), (ports.local_general, true), "{now}");
+        drop(holds_general);
+        a.stop();
+        b.stop();
     }
 
     /// When another program holds this PC's PTP port, the session still

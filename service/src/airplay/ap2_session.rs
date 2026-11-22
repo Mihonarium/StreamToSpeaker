@@ -270,7 +270,7 @@ impl AirPlay2Session {
         let event_ciphers = rtsp.take_event_ciphers();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
-        let faults = FaultSlot::new(dead.clone(), cfg.renderer.friendly_name.clone());
+        let faults = FaultSlot::new(dead.clone(), cfg.renderer.friendly_name.clone()).with_key(cfg.renderer.stable_id());
         let mut bring_up = BringUp::new(&stop_flag, &faults);
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
         // Shared from RECORD on (the buffered sender anchors on it, the
@@ -451,6 +451,11 @@ impl AirPlay2Session {
             // late. Field-tested: this receiver accepts anchors only on
             // ITS OWN timeline, which the PTP layer follows via the
             // receiver's Sync/Follow_Up stream.
+            //
+            // Nothing after this point can fail the bring-up, and the sender's
+            // encoder can fail as soon as its thread starts: its faults count
+            // for the repeat rule from here.
+            faults.arm(Instant::now());
             bring_up.threads.sender = Some(spawn_ap2_buffered_sender(BufferedSenderConfig {
                 stream,
                 audio_key,
@@ -463,11 +468,12 @@ impl AirPlay2Session {
                 last_seq,
                 rtsp: rtsp.clone(),
                 timeline: bring_up.ptp.as_ref().expect("buffered implies PTP").timeline.clone(),
-                encoder: aac_encoder(),
+                encoder: (env.buffered_encoder)(),
                 anchor_retry: AnchorRetry::new(),
                 homepod,
                 faults: faults.clone(),
             })?);
+            (env.after_sender_spawn)();
             info!("AirPlay 2: buffered AAC-LC stream armed — will anchor at first audio");
             drop(timing_socket);
             drop(control_socket);
@@ -656,7 +662,7 @@ impl AirPlay2Session {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
-        let faults = FaultSlot::new(dead.clone(), label.clone());
+        let faults = FaultSlot::new(dead.clone(), label.clone()).with_key(cfg.renderer.stable_id());
         let mut bring_up = BringUp::new(&stop_flag, &faults);
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
 
@@ -998,11 +1004,21 @@ fn wants_buffered(cfg: &AirPlay2SessionConfig) -> bool {
 struct BringUpEnv {
     ptp_ports: PtpPorts,
     aac_encoder: fn() -> Result<()>,
+    /// What makes the buffered sender's encoder, on its thread.
+    buffered_encoder: fn() -> EncoderFactory,
+    /// Runs right after the buffered sender is spawned (nothing in the app;
+    /// tests stand in for a bring-up that is slow to finish).
+    after_sender_spawn: fn(),
 }
 
 impl BringUpEnv {
     fn real() -> Self {
-        Self { ptp_ports: PTP_PORTS, aac_encoder: aac_encoder_available }
+        Self {
+            ptp_ports: PTP_PORTS,
+            aac_encoder: aac_encoder_available,
+            buffered_encoder: aac_encoder,
+            after_sender_spawn: || {},
+        }
     }
 }
 
@@ -1764,6 +1780,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
                     return;
                 }
                 if packet_count == 0 {
+                    cfg.faults.note_playing();
                     info!("AirPlay 2: buffered AAC-LC audio flowing — first packet ({} bytes framed)", framed.len());
                 }
 
@@ -2001,6 +2018,7 @@ fn run_ap2_sender(mut cfg: Ap2SenderConfig) {
             retransmit.service(control_socket, Instant::now());
         }
         if packet_count == 0 {
+            cfg.faults.note_playing();
             info!(
                 "AirPlay 2: stream open — first packet ({} bytes) sent to {}",
                 packet.len(),
@@ -2362,6 +2380,29 @@ mod tests {
         assert!(rig.faults.get().is_none());
     }
 
+    /// A session that played clears what was remembered for its speaker,
+    /// so "failed again after reconnecting" is only ever said of the
+    /// reconnect: fail, play, fail is retryable both times.
+    #[test]
+    fn a_session_that_played_clears_what_was_remembered() {
+        let name = "Played test speaker";
+        let fail_at_start = || -> EncoderFactory { Box::new(|| anyhow::bail!("MFStartup: scripted")) };
+        let failed = |encoder| {
+            let mut rig = BufferedRig::start(name, encoder, 1, &["200 OK"]);
+            rig.feed(BUFFERED_SPF * 2);
+            rig.wait_for_exit();
+            rig.faults.get().expect("a fault")
+        };
+        assert!(failed(fail_at_start()).retryable, "first failure");
+        let mut rig = BufferedRig::start(name, scripted_encoder(None), 1, &["200 OK"]);
+        rig.feed(BUFFERED_SPF * 2);
+        assert!(rig.packet().is_some(), "the session in between plays");
+        rig.stop();
+        assert!(rig.faults.get().is_none());
+        let again = failed(fail_at_start());
+        assert!(again.retryable, "a session played in between: {again:?}");
+    }
+
     /// The audio source going away means the app is replacing or stopping
     /// the session: the sender ends without a fault.
     #[test]
@@ -2646,6 +2687,27 @@ mod tests {
         prefer_realtime: bool,
         aac_encoder: fn() -> Result<()>,
     ) -> Vec<(String, Vec<u8>)> {
+        scripted_general_session_with(name, features, prefer_realtime, aac_encoder, aac_encoder_factory_for_tests, || {}, |_| ())
+            .0
+    }
+
+    /// The real factory on Windows would make a real encoder; tests want a
+    /// platform-independent one that works.
+    fn aac_encoder_factory_for_tests() -> EncoderFactory {
+        scripted_encoder(None)
+    }
+
+    /// [`scripted_general_session`] with the buffered sender's encoder
+    /// chosen, and `inspect` run on the session before it is stopped.
+    fn scripted_general_session_with<T>(
+        name: &str,
+        features: Option<u64>,
+        prefer_realtime: bool,
+        aac_encoder: fn() -> Result<()>,
+        buffered_encoder: fn() -> EncoderFactory,
+        after_sender_spawn: fn(),
+        inspect: impl FnOnce(&AirPlay2Session) -> T,
+    ) -> (Vec<(String, Vec<u8>)>, T) {
         use crate::airplay::test_peers::{read_request, reply};
         use std::io::BufReader;
         let free_udp = || UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2701,7 +2763,8 @@ mod tests {
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         let renderer = AirPlayRenderer {
             friendly_name: name.into(),
-            mac_id: "AA".into(),
+            // Faults are remembered per receiver id: one per test speaker.
+            mac_id: name.into(),
             ip,
             port: control_port,
             airplay_port: Some(control_port),
@@ -2732,12 +2795,13 @@ mod tests {
         // The same reported ports in every run, so stream SETUPs compare.
         let sockets = Ap2Sockets { control_port: 50_000, timing_port: 50_001, audio, control, timing };
         let rtsp = Ap2Rtsp::connect(ip, control_port, ip, Duration::from_secs(5)).unwrap();
-        let env = BringUpEnv { ptp_ports, aac_encoder };
+        let env = BringUpEnv { ptp_ports, aac_encoder, buffered_encoder, after_sender_spawn };
         let session = AirPlay2Session::start_paired(cfg, rtsp, [0u8; 32], sockets, env).unwrap_or_else(|e| panic!("{e:#}"));
+        let seen = inspect(&session);
         drop(events);
         session.stop();
         drop((buffered_data, media));
-        peer.join().unwrap()
+        (peer.join().unwrap(), seen)
     }
 
     /// `streams[0]` of a stream SETUP body.
@@ -2745,6 +2809,37 @@ mod tests {
         let v = plist::Value::from_reader(std::io::Cursor::new(body)).unwrap();
         let streams = v.as_dictionary().unwrap().get("streams").unwrap().as_array().unwrap();
         streams[0].as_dictionary().unwrap().clone()
+    }
+
+    /// An encoder that fails as soon as the buffered sender's thread starts,
+    /// while the bring-up is still finishing, counts for the repeat rule:
+    /// the reconnect that fails the same way before playing is final.
+    #[test]
+    fn an_encoder_that_fails_as_the_sender_starts_is_remembered() {
+        use crate::airplay::discovery::{FEAT_BUFFERED_AUDIO, FEAT_PTP};
+        let available: fn() -> Result<()> = || Ok(());
+        let failing: fn() -> EncoderFactory = || Box::new(|| anyhow::bail!("CoCreateInstance: scripted"));
+        let fault_of = |s: &AirPlay2Session| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !s.is_dead() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            s.fault()
+        };
+        for round in [1, 2] {
+            let (_, fault) = scripted_general_session_with(
+                "Early encoder test speaker",
+                Some(FEAT_PTP | FEAT_BUFFERED_AUDIO),
+                false,
+                available,
+                failing,
+                // The end of the bring-up comes after the sender's failure.
+                || std::thread::sleep(Duration::from_millis(200)),
+                fault_of,
+            );
+            let fault = fault.unwrap_or_else(|| panic!("round {round}: no fault"));
+            assert_eq!((fault.code, fault.retryable), ("encoder_failed", round == 1), "round {round}");
+        }
     }
 
     /// A receiver that takes the buffered stream gets the realtime one when
