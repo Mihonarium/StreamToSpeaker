@@ -544,6 +544,18 @@ impl LanView {
     }
 }
 
+/// Most `_raop._tcp` instances kept, and most claiming one identity
+/// (MAC): far beyond any real network (a rename shows two for a while,
+/// two receiver programs on one machine may share one), small enough that
+/// building the list on every repaint stays cheap whatever is announced.
+/// Instances past either bound are not listed (and logged once); the ones
+/// seen first stay, so an incumbent is never pushed out.
+const MAX_RAOP_INSTANCES: usize = 256;
+const MAX_CLAIMS_PER_IDENTITY: usize = 4;
+/// Most `_airplay._tcp` records kept (one per device ID), on the same
+/// reasoning.
+const MAX_AIRPLAY_RECORDS: usize = 256;
+
 /// Shared discovery state. Mirrors `ssdp::DiscoveryState` semantics.
 #[derive(Default)]
 pub struct AirPlayDiscoveryState {
@@ -578,12 +590,17 @@ impl AirPlayDiscoveryState {
             let working = self.working.lock().unwrap().clone();
             let raop = self.raop.lock().unwrap();
             let airplay = self.airplay.lock().unwrap();
+            // One pass to group instances by identity.
+            let mut by_mac: HashMap<&str, Vec<&RaopInfo>> = HashMap::new();
+            for r in raop.values() {
+                by_mac.entry(r.mac.as_str()).or_default().push(r);
+            }
             let mut macs: BTreeSet<String> = BTreeSet::new();
-            macs.extend(raop.values().map(|r| r.mac.clone()));
+            macs.extend(by_mac.keys().map(|m| m.to_string()));
             macs.extend(airplay.keys().cloned());
             macs.into_iter()
                 .flat_map(|mac| {
-                    let claims: Vec<&RaopInfo> = raop.values().filter(|r| r.mac == mac).collect();
+                    let claims = by_mac.get(mac.as_str()).cloned().unwrap_or_default();
                     entries_for(&mac, &claims, airplay.get(&mac), working.get(&mac).copied(), &lan)
                 })
                 .collect::<Vec<_>>()
@@ -681,20 +698,46 @@ impl AirPlayDiscoveryState {
     /// instance announced before (a new address included).
     fn upsert_raop(&self, mut info: RaopInfo) {
         let mut raop = self.raop.lock().unwrap();
-        info.first_seen = match raop.get(&info.fullname) {
-            Some(known) => known.first_seen,
-            None => self.resolved.fetch_add(1, Ordering::Relaxed),
-        };
-        if let Some(other) = raop.values().find(|r| r.mac == info.mac && r.fullname != info.fullname) {
-            warn!(
-                "AirPlay: {:?} at {:?} claims the identity of {:?} at {:?}; both are listed, each with its address",
-                info.fullname, info.addresses, other.fullname, other.addresses
-            );
+        let known = raop.get(&info.fullname).map(|r| r.first_seen);
+        if known.is_none() {
+            // A new instance. Bounded, so a flood of made-up announcements
+            // can't make the list (built on every repaint) expensive; what
+            // is kept is the instances seen first, the incumbents among
+            // them.
+            let same_identity = raop.values().filter(|r| r.mac == info.mac).count();
+            if same_identity >= MAX_CLAIMS_PER_IDENTITY || raop.len() >= MAX_RAOP_INSTANCES {
+                let name = crate::discovery_net::shown(&info.fullname);
+                self.reported.once(&format!("airplay-full:{}", info.fullname), || {
+                    format!("AirPlay: not listing {}: too many AirPlay receivers, or claims of one identity, announced", name)
+                });
+                return;
+            }
+            if let Some(other) = raop.values().find(|r| r.mac == info.mac) {
+                let (name, theirs) = (crate::discovery_net::shown(&info.fullname), crate::discovery_net::shown(&other.fullname));
+                let (ours_at, theirs_at) = (info.addresses.clone(), other.addresses.clone());
+                self.reported.once(&format!("airplay-claim:{}", info.fullname), || {
+                    format!(
+                        "AirPlay: {} at {:?} announces the identity of {} at {:?}; it is listed as another receiver with the same ID",
+                        name, ours_at, theirs, theirs_at
+                    )
+                });
+            }
         }
+        info.first_seen = known.unwrap_or_else(|| self.resolved.fetch_add(1, Ordering::Relaxed));
         raop.insert(info.fullname.clone(), info);
     }
 
     fn upsert_airplay(&self, mac: String, fullname: &str, info: AirPlayInfo) {
+        {
+            let airplay = self.airplay.lock().unwrap();
+            if !airplay.contains_key(&mac) && airplay.len() >= MAX_AIRPLAY_RECORDS {
+                let name = crate::discovery_net::shown(fullname);
+                self.reported.once(&format!("airplay2-full:{}", fullname), || {
+                    format!("AirPlay: not listing {}: too many AirPlay 2 receivers announced", name)
+                });
+                return;
+            }
+        }
         {
             let mut memory = self.pair_members.lock().unwrap();
             // A device that left a pair (or changed groups) is forgotten
@@ -1584,6 +1627,28 @@ mod tests {
         ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEEFF@New", "192.168.1.65", &TXT));
         let v = state.renderers();
         assert_eq!((v.len(), v[0].friendly_name.as_str(), v[0].raop.newcomer), (1, "New", false));
+    }
+
+    /// A flood of announcements is bounded: a few claims per identity, a
+    /// few hundred instances in all, the first seen kept.
+    #[test]
+    fn a_flood_of_announcements_is_bounded() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("B8E93735AC11@Kitchen", "192.168.1.65", &TXT));
+        for i in 0..20 {
+            ingest_resolution(&state, RAOP_SERVICE, &raop_info(&format!("B8E93735AC11@Fake {i}"), "192.168.1.66", &TXT));
+        }
+        let claims = state.renderers().into_iter().filter(|r| r.mac_id == "B8E93735AC11").count();
+        assert_eq!(claims, MAX_CLAIMS_PER_IDENTITY);
+        assert_eq!(state.find_by_id("airplay:B8E93735AC11").unwrap().raop.instance.as_deref(), Some("b8e93735ac11@kitchen._raop._tcp.local."));
+        for i in 0..(MAX_RAOP_INSTANCES + 50) {
+            let mac = format!("{:012X}", i + 1);
+            ingest_resolution(&state, RAOP_SERVICE, &raop_info(&format!("{mac}@S{i}"), "192.168.1.70", &TXT));
+        }
+        assert_eq!(state.raop.lock().unwrap().len(), MAX_RAOP_INSTANCES);
+        // Instances already kept are still updated.
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("B8E93735AC11@Kitchen", "192.168.1.71", &TXT));
+        assert_eq!(state.find_by_id("airplay:B8E93735AC11").unwrap().ip, ip("192.168.1.71"));
     }
 
     /// A newcomer's goodbye removes only the newcomer.
