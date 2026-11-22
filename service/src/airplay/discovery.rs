@@ -142,6 +142,43 @@ pub struct AirPlayRenderer {
     pub group: Option<GroupTxt>,
     /// Set on the synthetic entry that stands for a whole stereo pair.
     pub pair: Option<StereoPair>,
+    /// What the `_raop._tcp` announcement says beyond the fields above.
+    pub raop: RaopDetails,
+}
+
+/// Details of a receiver's `_raop._tcp` announcement. Default (empty)
+/// for a receiver without one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RaopDetails {
+    /// The TXT record as announced, in order, for the log of a connect.
+    pub txt: Vec<(String, String)>,
+}
+
+/// Most TXT entries, and characters per value, a log line shows.
+const TXT_LOG_ENTRIES: usize = 40;
+const TXT_LOG_VALUE_CHARS: usize = 100;
+
+impl RaopDetails {
+    /// The TXT record for a log line: `key="value"` pairs, values quoted
+    /// and escaped (they come from the network) and cut short.
+    pub fn txt_line(&self) -> String {
+        let mut parts: Vec<String> = self
+            .txt
+            .iter()
+            .take(TXT_LOG_ENTRIES)
+            .map(|(k, v)| {
+                let mut cut: String = v.chars().take(TXT_LOG_VALUE_CHARS).collect();
+                if cut.len() < v.len() {
+                    cut.push('…');
+                }
+                format!("{}={:?}", k.escape_debug(), cut)
+            })
+            .collect();
+        if self.txt.len() > TXT_LOG_ENTRIES {
+            parts.push(format!("(and {} more)", self.txt.len() - TXT_LOG_ENTRIES));
+        }
+        parts.join(" ")
+    }
 }
 
 /// Group-related TXT keys of one receiver.
@@ -320,6 +357,7 @@ impl AirPlayRenderer {
 #[derive(Debug, Clone, Default)]
 struct RaopInfo {
     friendly_name: String,
+    txt: Vec<(String, String)>,
     ip: Option<IpAddr>,
     port: u16,
     encryption_types: Vec<u8>,
@@ -583,6 +621,7 @@ fn merge(mac: &str, raop: Option<&RaopInfo>, airplay: Option<&AirPlayInfo>) -> O
             .or_else(|| raop.and_then(|r| r.model.clone())),
         group: airplay.and_then(|a| a.group.clone()),
         pair: None,
+        raop: RaopDetails { txt: raop.map(|r| r.txt.clone()).unwrap_or_default() },
     })
 }
 
@@ -666,6 +705,10 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
         };
         let r = RaopInfo {
             friendly_name: friendly,
+            txt: txt
+                .iter()
+                .map(|p| (p.key().to_string(), p.val().map(|v| String::from_utf8_lossy(v).into_owned()).unwrap_or_default()))
+                .collect(),
             ip,
             port: info.get_port(),
             encryption_types: read_txt_int_list(txt, "et"),
@@ -850,6 +893,7 @@ mod tests {
             model: model.map(|s| s.to_string()),
             group: None,
             pair: None,
+            raop: RaopDetails::default(),
         }
     }
 
@@ -962,6 +1006,32 @@ mod tests {
         // Unpaired (new tsid): back to two single devices.
         state.upsert_airplay("BB".into(), "b._airplay._tcp.local.", info("t2", true));
         assert_eq!(state.renderers().iter().filter(|r| r.pair.is_none()).count(), 4);
+    }
+
+    fn raop_info(instance: &str, addrs: &str, txt: &[(&str, &str)]) -> ServiceInfo {
+        ServiceInfo::new(RAOP_SERVICE, instance, "speaker.local.", addrs, 5000, txt).unwrap()
+    }
+
+    #[test]
+    fn the_raop_txt_record_is_kept_for_the_log() {
+        let state = AirPlayDiscoveryState::default();
+        let info = raop_info("AABBCCDDEEFF@Dock", "192.168.1.5", &[("et", "0,4"), ("cn", "0,1"), ("am", "Dock\n1")]);
+        ingest_resolution(&state, RAOP_SERVICE, &info);
+        let r = state.find_by_id("airplay:AABBCCDDEEFF").unwrap();
+        let mut txt = r.raop.txt.clone();
+        txt.sort();
+        assert_eq!(txt, [("am".to_string(), "Dock\n1".to_string()), ("cn".into(), "0,1".into()), ("et".into(), "0,4".into())]);
+        // Quoted and escaped, so a value can't break the log line.
+        assert!(r.raop.txt_line().contains(r#"am="Dock\n1""#), "{}", r.raop.txt_line());
+    }
+
+    #[test]
+    fn the_txt_log_line_is_bounded() {
+        let long = "x".repeat(5000);
+        let d = RaopDetails { txt: (0..100).map(|i| (format!("k{i}"), long.clone())).collect() };
+        let line = d.txt_line();
+        assert!(line.len() < 6000, "{}", line.len());
+        assert!(line.ends_with("(and 60 more)"));
     }
 
     #[test]

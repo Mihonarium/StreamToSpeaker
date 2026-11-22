@@ -36,6 +36,7 @@ pub(crate) fn receiver(rx: &FakeRaop, mac: &str, et: &[u8]) -> AirPlayRenderer {
         model: Some("Speaker1,1".into()),
         group: None,
         pair: None,
+        raop: Default::default(),
     }
 }
 

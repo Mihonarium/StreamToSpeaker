@@ -4937,6 +4937,7 @@ mod tests {
                 model: None,
                 group: None,
                 pair: None,
+                raop: Default::default(),
             };
             let id = receiver.stable_id();
             app.user_config.lock().unwrap().airplay_pairings.insert(id.clone(), creds.clone());

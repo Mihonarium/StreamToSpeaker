@@ -468,6 +468,13 @@ impl AirPlaySession {
             "AirPlay: starting session to {} ({}:{})",
             cfg.renderer.friendly_name, cfg.renderer.ip, cfg.renderer.port,
         );
+        // Once per connect, so a report of a receiver that won't connect
+        // carries what it announces.
+        if cfg.renderer.raop.txt.is_empty() {
+            info!("AirPlay: {} announces no AirPlay 1 TXT record (added by address, or not announced)", cfg.renderer.friendly_name);
+        } else {
+            info!("AirPlay: {} announces _raop._tcp TXT: {}", cfg.renderer.friendly_name, cfg.renderer.raop.txt_line());
+        }
 
         if !cfg.renderer.supports_legacy_raop() {
             return Err(anyhow::anyhow!(
