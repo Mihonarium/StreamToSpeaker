@@ -847,12 +847,31 @@ fn entries_for(mac: &str, claims: &[&RaopInfo], airplay: Option<&AirPlayInfo>, w
         return merge(mac, claims.first().copied(), airplay, working, lan).into_iter().collect();
     }
     let mut out = Vec::new();
-    for (i, r) in claims.into_iter().enumerate() {
-        let is_incumbent = i == 0;
-        let working = working.filter(|_| is_incumbent);
-        let Some(mut e) = merge(mac, Some(r), airplay.filter(|_| is_incumbent), working, lan) else { continue };
+    let incumbent = merge(mac, claims.first().copied(), airplay, working, lan);
+    // The speaker's own name, for the newcomers' rows.
+    let speaker = incumbent
+        .as_ref()
+        .map(|e| e.friendly_name.clone())
+        .or_else(|| claims.first().map(|r| r.friendly_name.clone()))
+        .unwrap_or_else(|| mac.to_string());
+    let speaker_addresses: Vec<IpAddr> = claims.first().map(|r| r.addresses.clone()).unwrap_or_default();
+    if let Some(mut e) = incumbent {
         e.friendly_name = format!("{} ({})", e.friendly_name, e.ip);
-        e.raop.newcomer = !is_incumbent;
+        out.push(e);
+    }
+    for r in claims.into_iter().skip(1) {
+        let Some(mut e) = merge(mac, Some(r), None, None, lan) else { continue };
+        // Its own addresses before any it shares with the speaker: that is
+        // where this other receiver is, and what its row shows.
+        e.raop.addresses.sort_by_key(|a| speaker_addresses.contains(a));
+        if let Some(first) = e.raop.addresses.first() {
+            e.ip = *first;
+        }
+        // Says what it is, true also for two receiver programs on one
+        // machine that share an identity; starting with the speaker's name
+        // keeps it below the speaker's row in the sorted list.
+        e.friendly_name = format!("{} — another receiver with the same ID: {} ({})", speaker, e.friendly_name, e.ip);
+        e.raop.newcomer = true;
         out.push(e);
     }
     out
@@ -1469,7 +1488,25 @@ mod tests {
         let other = state.find_by_id(NEWCOMER).expect("the newcomer is picked by its own id");
         assert_eq!(other.stable_id(), NEWCOMER);
         assert!(other.raop.newcomer);
-        assert_eq!((other.port, other.friendly_name.as_str()), (6666, "Kitchen 2 (192.168.1.65)"));
+        assert_eq!(other.port, 6666);
+        // Its row says what it is, shows the address it doesn't share with
+        // the speaker (and connects there first), and sits below the
+        // speaker's row.
+        assert_eq!(other.friendly_name, "Kitchen — another receiver with the same ID: Kitchen 2 (192.168.1.66)");
+        assert_eq!((other.ip, other.raop.addresses.clone()), (ip("192.168.1.66"), vec![ip("192.168.1.66"), ip("192.168.1.65")]));
+        let names: Vec<String> = v.iter().map(|r| r.friendly_name.clone()).collect();
+        assert_eq!(names, [kitchen.friendly_name.clone(), other.friendly_name.clone()]);
+    }
+
+    /// A newcomer whose name sorts before the speaker's still sits below it,
+    /// and one that shares every address shows that address.
+    #[test]
+    fn a_newcomers_row_sits_below_the_speaker() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("B8E93735AC11@Kitchen", "192.168.1.65", &TXT));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("B8E93735AC11@Attic", "192.168.1.65", &TXT));
+        let names: Vec<String> = state.renderers().iter().map(|r| r.friendly_name.clone()).collect();
+        assert_eq!(names, ["Kitchen (192.168.1.65)", "Kitchen — another receiver with the same ID: Attic (192.168.1.65)"]);
     }
 
     /// The incumbent is the instance known before the conflict began;

@@ -5194,12 +5194,18 @@ mod tests {
     /// speaker's stored pairing): it is played over what it announced.
     #[test]
     fn a_newcomer_borrows_no_sibling_record() {
+        use mdns_sd::ServiceInfo;
         let (app, discovery) = airplay_test_app_with(conflict_discovery());
-        let newcomer = discovery.find_by_id(KITCHEN_2).unwrap();
+        // One that announces nothing but the speaker's own address.
+        let raop = crate::airplay::discovery::RAOP_SERVICE;
+        let txt = &[("et", "0,1"), ("cn", "0,1")][..];
+        discovery.ingest_for_tests(raop, &ServiceInfo::new(raop, "B8E93735AC11@Kitchen 3", "e3.local.", "192.168.1.65", 6667, txt).unwrap());
+        let id = "airplay:B8E93735AC11/b8e93735ac11@kitchen 3._raop._tcp.local.";
+        let newcomer = discovery.find_by_id(id).unwrap();
         assert_eq!(newcomer.ip, ip("192.168.1.65"));
         let attempts = app.airplay_attempts(&newcomer, Some(&discovery));
         assert_eq!(attempts.len(), 1);
-        assert_eq!((attempts[0].0, attempts[0].1.stable_id().as_str()), (Transport::RaopLegacy, KITCHEN_2));
+        assert_eq!((attempts[0].0, attempts[0].1.stable_id().as_str()), (Transport::RaopLegacy, id));
         // The speaker itself still gets both paths.
         let kitchen = discovery.find_by_id(KITCHEN).unwrap();
         assert_eq!(app.airplay_attempts(&kitchen, Some(&discovery)).len(), 2);
