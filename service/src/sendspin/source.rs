@@ -104,6 +104,9 @@ struct Admitted {
 
 struct Shared {
     opts: SourceOptions,
+    /// The listening socket, until `stop` takes it: dropping it there gives
+    /// the port back before `stop` returns.
+    listener: Mutex<Option<TcpListener>>,
     hub: Arc<StreamHub>,
     store: Arc<dyn SendspinStore>,
     stop: AtomicBool,
@@ -122,6 +125,49 @@ pub struct SourceService {
     shared: Arc<Shared>,
     mdns_fullname: Option<String>,
     port: u16,
+    /// Why it doesn't listen on the port it was asked for, if it doesn't.
+    refused: Option<PortRefusal>,
+}
+
+/// A listener on `port`; when that port can't be bound, one on a port the
+/// system picks, so the input keeps working for a Music Assistant that
+/// finds it through mDNS, and why `port` couldn't be had. No wait: `stop`
+/// gives the port back before it returns, so a port that is taken now is
+/// another program's.
+fn bind_listener(port: u16) -> std::io::Result<(TcpListener, Option<PortRefusal>)> {
+    bind_listener_with(port, &|p| TcpListener::bind(("0.0.0.0", p)))
+}
+
+fn bind_listener_with(
+    port: u16,
+    bind: &dyn Fn(u16) -> std::io::Result<TcpListener>,
+) -> std::io::Result<(TcpListener, Option<PortRefusal>)> {
+    match bind(port) {
+        Ok(listener) => Ok((listener, None)),
+        Err(e) if port != 0 => {
+            warn!(
+                "Sendspin source: port {port} isn't available ({e}); listening on another port, \
+                 which Music Assistant finds on this network but can't be given by address"
+            );
+            let why = if e.kind() == std::io::ErrorKind::AddrInUse {
+                PortRefusal::InUse
+            } else {
+                PortRefusal::Unavailable(e.to_string())
+            };
+            Ok((bind(0)?, Some(why)))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Why the input doesn't listen on the port it was asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PortRefusal {
+    /// Another program listens on it.
+    InUse,
+    /// Binding it failed otherwise (Windows reserves port ranges for
+    /// Hyper-V and the like, say); the system's words.
+    Unavailable(String),
 }
 
 impl SourceService {
@@ -133,13 +179,12 @@ impl SourceService {
             let (_, b) = c.ensure_pairing_psk();
             a || b
         });
-        let listener = TcpListener::bind(("0.0.0.0", opts.port))
-            .or_else(|_| TcpListener::bind(("0.0.0.0", 0)))
-            .context("binding the Sendspin source listener")?;
+        let (listener, refused) = bind_listener(opts.port).context("binding the Sendspin source listener")?;
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
             opts: opts.clone(),
+            listener: Mutex::new(Some(listener)),
             hub,
             store,
             stop: AtomicBool::new(false),
@@ -153,7 +198,7 @@ impl SourceService {
         let sh = shared.clone();
         std::thread::Builder::new()
             .name("sendspin-source-accept".into())
-            .spawn(move || accept_loop(sh, listener))?;
+            .spawn(move || accept_loop(sh))?;
         let mdns_fullname = match opts.advertise.then(|| mdns::register_client(&opts.name, &opts.name, port)) {
             None => None,
             Some(Ok(f)) => Some(f),
@@ -168,11 +213,25 @@ impl SourceService {
             shared,
             mdns_fullname,
             port,
+            refused,
         })
     }
 
+    /// The port it listens on: the one asked for, unless another program
+    /// held that one.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// The port it was asked to listen on.
+    pub fn wanted_port(&self) -> u16 {
+        self.shared.opts.port
+    }
+
+    /// Why it doesn't listen on [`wanted_port`](Self::wanted_port), if it
+    /// doesn't.
+    pub fn port_refusal(&self) -> Option<PortRefusal> {
+        self.refused.clone()
     }
 
     pub fn state(&self) -> SourceState {
@@ -205,10 +264,13 @@ impl SourceService {
         pairing_token(&*self.shared.store)
     }
 
+    /// Stop accepting and advertising, and end the connection. The port
+    /// is free again when this returns.
     pub fn stop(&self) {
         if self.shared.stop.swap(true, Ordering::SeqCst) {
             return;
         }
+        drop(self.shared.listener.lock().unwrap_or_else(|e| e.into_inner()).take());
         if let Some(f) = &self.mdns_fullname {
             mdns::unregister(f);
         }
@@ -343,9 +405,14 @@ impl Drop for Slot {
     }
 }
 
-fn accept_loop(sh: Arc<Shared>, listener: TcpListener) {
+fn accept_loop(sh: Arc<Shared>) {
     while !sh.stop.load(Ordering::SeqCst) {
-        match listener.accept() {
+        // The lock is held only for the accept, which doesn't block.
+        let accepted = match sh.listener.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(listener) => listener.accept(),
+            None => break,
+        };
+        match accepted {
             Ok((stream, peer)) => {
                 // Handed out in accept order, so they also order connections by age.
                 let conn_id = sh.next_conn.fetch_add(1, Ordering::SeqCst);
@@ -1257,6 +1324,66 @@ fn spawn_audio(sh: Arc<Shared>, conn: Arc<Conn>) {
 mod tests {
     use super::*;
 
+    fn start_on(port: u16) -> SourceService {
+        let opts = SourceOptions {
+            name: "PC".into(),
+            port,
+            software_version: "test".into(),
+            advertise: false,
+            output_selected: Arc::new(AtomicUsize::new(0)),
+        };
+        SourceService::start(opts, StreamHub::new(), Arc::new(super::super::MemoryStore::default()))
+            .unwrap()
+    }
+
+    fn free_port() -> u16 {
+        TcpListener::bind(("0.0.0.0", 0)).unwrap().local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn a_port_another_program_holds_is_left_to_it() {
+        let held = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let svc = start_on(port);
+        assert_eq!(svc.wanted_port(), port);
+        assert_ne!(svc.port(), port, "listens elsewhere");
+        // And works there.
+        TcpStream::connect(("127.0.0.1", svc.port())).unwrap();
+        assert_eq!(svc.port_refusal(), Some(PortRefusal::InUse));
+        svc.stop();
+    }
+
+    #[test]
+    fn a_port_that_cannot_be_bound_for_another_reason_is_told_as_such() {
+        // Windows refuses a port inside a range it reserved (os error 10013).
+        let refuse = |p: u16| {
+            if p == 8928 {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "reserved"))
+            } else {
+                TcpListener::bind(("127.0.0.1", p))
+            }
+        };
+        let (listener, why) = bind_listener_with(8928, &refuse).unwrap();
+        assert_ne!(listener.local_addr().unwrap().port(), 8928);
+        assert_eq!(why, Some(PortRefusal::Unavailable("reserved".into())));
+        // A port that binds: no reason.
+        let (_, why) = bind_listener_with(0, &refuse).unwrap();
+        assert_eq!(why, None);
+    }
+
+    #[test]
+    fn stopping_gives_the_port_back_before_it_returns() {
+        let port = free_port();
+        for i in 0..100 {
+            let svc = start_on(port);
+            assert_eq!(svc.port(), port, "start {i}");
+            svc.stop();
+            // Free the moment `stop` returns: turning the input off and on
+            // lands on the same port.
+            drop(TcpListener::bind(("0.0.0.0", port)).unwrap_or_else(|e| panic!("after stop {i}: {e}")));
+        }
+    }
+
     fn act(playback: bool, pairing: bool, roles: Option<Vec<&str>>) -> Activation {
         Activation {
             playback,
@@ -1493,6 +1620,7 @@ mod tests {
                 advertise: false,
                 output_selected: Arc::new(AtomicUsize::new(0)),
             },
+            listener: Mutex::new(None),
             hub: StreamHub::new(),
             store: Arc::new(super::super::MemoryStore::default()),
             stop: AtomicBool::new(false),

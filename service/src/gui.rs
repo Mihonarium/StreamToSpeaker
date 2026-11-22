@@ -438,102 +438,6 @@ impl Palette {
     }
 }
 
-/// Append Segoe UI Symbol as a fallback for the Proportional and
-/// Monospace font families. egui resolves glyphs by walking each
-/// family's font list in order; the default fonts (Ubuntu Light /
-/// Hack) cover ASCII + Latin but not the geometric-shape, arrow,
-/// chevron, and box-drawing characters used in the UI. Without
-/// this fallback those glyphs render as `□`.
-///
-/// Loads from `%WINDIR%\Fonts\seguisym.ttf` at runtime — present
-/// on every Win7+ install, so no binary-size hit. If the file is
-/// missing (Windows N edition with language packs stripped) we
-/// log and continue; the glyphs keep showing as squares, but
-/// nothing crashes.
-/// Set up the font stack the app uses. egui's bundled defaults are
-/// Ubuntu Light (proportional) and Hack (mono) — neither is what
-/// Windows users expect to see in a Windows-native app, and the
-/// "strong" weight rendered as synthetic-bold instead of the proper
-/// Semibold cut.
-///
-/// Installs (in priority order, per family):
-/// 1. Segoe UI Regular — the canonical Windows 10/11 UI font
-/// 2. Segoe UI Semibold — proper weight when `.strong()` is used
-/// 3. Segoe UI Symbol — geometric shapes / arrows / chevrons
-///    (falls through for glyphs the first two don't cover)
-///
-/// All three load from `%WINDIR%\Fonts\*.ttf` at runtime — present
-/// on every Win7+ install, so no binary-size hit. Each load is
-/// independent: missing files are warned and skipped. CJK
-/// fallback isn't done here (Yu Gothic / Microsoft YaHei /
-/// Malgun Gothic ship as TrueType collections, .ttc, which need
-/// a separate parser to extract the right face) — see Audit M1.
-fn install_symbol_font(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    // Prepend (not append) so Segoe UI wins over the bundled Ubuntu
-    // Light for Latin text. Symbol stays at the END as a fallback
-    // for glyphs Segoe UI doesn't cover (arrows, geometric shapes).
-    let fonts_dir = std::path::PathBuf::from(
-        std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string()),
-    )
-    .join("Fonts");
-
-    if let Some(bytes) = read_font(&fonts_dir.join("segoeui.ttf")) {
-        fonts.font_data.insert(
-            "segoe_ui".to_owned(),
-            egui::FontData::from_owned(bytes),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "segoe_ui".to_owned());
-    }
-    if let Some(bytes) = read_font(&fonts_dir.join("seguisb.ttf")) {
-        fonts.font_data.insert(
-            "segoe_ui_semibold".to_owned(),
-            egui::FontData::from_owned(bytes),
-        );
-        // egui doesn't have separate Regular / Semibold families; the
-        // best we can do without a custom FontFamily::Name is to keep
-        // Semibold available as a fallback (so a glyph absent from
-        // Regular pulls from Semibold first, before Symbol). For an
-        // explicit Semibold path we'd register a named family — TODO.
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(1, "segoe_ui_semibold".to_owned());
-    }
-    if let Some(bytes) = read_font(&fonts_dir.join("seguisym.ttf")) {
-        fonts.font_data.insert(
-            "segoe_ui_symbol".to_owned(),
-            egui::FontData::from_owned(bytes),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .push("segoe_ui_symbol".to_owned());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("segoe_ui_symbol".to_owned());
-    }
-    ctx.set_fonts(fonts);
-}
-
-fn read_font(path: &std::path::Path) -> Option<Vec<u8>> {
-    match std::fs::read(path) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            warn!("font {} not loaded ({}); using fallback", path.display(), e);
-            None
-        }
-    }
-}
-
 fn apply_theme(ctx: &egui::Context, dark: bool, system_accent: Option<(u8, u8, u8)>) {
     // High-contrast OS mode: don't override visuals at all. The user
     // has explicitly opted into a system colour scheme designed for
@@ -709,6 +613,24 @@ fn palette_for(dark: bool, system_accent: Option<(u8, u8, u8)>) -> Palette {
 // Run
 // -----------------------------------------------------------------------------
 
+/// The file the window's state is kept in, after moving the one older
+/// versions kept in the roaming profile there.
+fn window_state_file() -> Option<std::path::PathBuf> {
+    let file = crate::folders::window_state_file()?;
+    // Where `APPDATA` points, and where the framework itself looked (the
+    // folder Windows reports), when the two differ.
+    let mut bases: Vec<std::path::PathBuf> = Vec::new();
+    for base in [crate::folders::roaming_base().filter(|p| p.is_absolute()), crate::folders::known_roaming()] {
+        if let Some(base) = base.filter(|b| !bases.contains(b)) {
+            bases.push(base);
+        }
+    }
+    for roaming in &bases {
+        crate::folders::move_old_window_state(roaming, &file);
+    }
+    Some(file)
+}
+
 /// `start_hidden`: launched at sign-in — once the window exists, hide it
 /// to the tray (only when the tray icon was actually created, or the user
 /// would have no way to reach the app).
@@ -754,6 +676,10 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
         // a feature that breaks the window for every tray user is a
         // worse trade than losing "remember last size/position."
         persist_window: false,
+        // What the window remembers (open sections, the zoom) goes in the
+        // local folder beside the log, never in a folder of the
+        // framework's own choosing (see `folders`).
+        persistence_path: window_state_file(),
         ..Default::default()
     };
 
@@ -763,15 +689,10 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
         options,
         Box::new(move |cc| {
             log::info!("eframe CreationContext callback firing");
-            // Register Segoe UI Symbol as a fallback font for both
-            // Proportional and Monospace families. egui's bundled
-            // Ubuntu Light / Hack don't have the media-control,
-            // chevron, and circled-info glyphs we use (⏵ ⏸ ⏹ ↻ ▾ ▸ ⟳ ⓘ),
-            // so without this they render as `□`. Loading the
-            // system Segoe UI Symbol costs zero binary bytes
-            // (it's on every Win7+ install) and only kicks in for
-            // glyphs the default fonts can't draw.
-            install_symbol_font(&cc.egui_ctx);
+            // Segoe UI, its symbols, and fonts for the scripts it lacks
+            // (Chinese, Japanese, Korean and more), from Windows' own
+            // fonts folder: see `fonts`.
+            crate::fonts::install(&cc.egui_ctx);
 
             // Initial theme — System (which falls back to Light if the OS
             // doesn't expose a preference).
@@ -888,6 +809,9 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
                 theme_mode: ThemeMode::System,
                 advanced_open: false,
                 homepod_latency_draft: None,
+                airplay_latency_draft: None,
+                speaker_latency_draft: None,
+                ma_addresses: None,
                 diagnostics_open: false,
                 diagnostics_copied_at: None,
                 web_link_copied_at: None,
@@ -927,6 +851,14 @@ struct StreamToSpeakerApp {
     advanced_open: bool,
     /// HomePod delay while its slider is being dragged; saved on release.
     homepod_latency_draft: Option<i64>,
+    /// The AirPlay buffer slider's value while it is dragged: saved on
+    /// release, not on every frame of the drag.
+    airplay_latency_draft: Option<i64>,
+    /// The same for a speaker's own AirPlay buffer: its id and value.
+    speaker_latency_draft: Option<(String, i64)>,
+    /// This computer's addresses for a Music Assistant on another network,
+    /// and when they were looked up.
+    ma_addresses: Option<(Instant, Vec<std::net::Ipv4Addr>)>,
     /// The Diagnostics card is expanded (its counters are only gathered
     /// while it is).
     diagnostics_open: bool,
@@ -1356,6 +1288,7 @@ impl eframe::App for StreamToSpeakerApp {
                             self.show_status_banner(ui, &p);
                             banner_bottom_px = ui.cursor().top();
                             self.show_error_banner(ui, &p);
+                            self.show_settings_banner(ui, &p);
                             // One ask at a time: an available update
                             // outranks the donation strip.
                             if !self.show_update_banner(ui, &p) {
@@ -2294,6 +2227,55 @@ impl StreamToSpeakerApp {
             });
     }
 
+    /// "Your settings need attention": why they can't be saved, for as
+    /// long as that lasts, and what loading them found, until dismissed.
+    /// The one place in the window for both.
+    fn show_settings_banner(&self, ui: &mut egui::Ui, p: &Palette) {
+        // While saves fail, try again every few seconds: the strip goes by
+        // itself once a save works.
+        self.app.retry_settings_save_if_due(Instant::now());
+        let (problem, notice) = self.app.settings_attention();
+        if problem.is_none() && notice.is_none() {
+            return;
+        }
+        if problem.is_some() {
+            ui.ctx().request_repaint_after(crate::app::SETTINGS_RETRY);
+        }
+        let text = [problem.as_deref(), notice.as_deref()].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
+        let colour = if problem.is_some() { p.danger } else { p.warn };
+        ui.add_space(sp::XS);
+        egui::Frame::none()
+            .fill(p.card)
+            .stroke(egui::Stroke::new(1.0_f32, colour.gamma_multiply(0.6)))
+            .rounding(RADIUS_SURFACE)
+            .inner_margin(egui::Margin::symmetric(sp::M, sp::S))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⚠").color(colour).size(16.0).strong());
+                    ui.add_space(sp::XS);
+                    let (mut open, mut dismiss) = (false, false);
+                    let dismissable = notice.is_some();
+                    let buttons_w = 104.0 + if dismissable { 80.0 + sp::XS } else { 0.0 };
+                    notice_row(ui, egui::RichText::new(text).color(p.text_primary), buttons_w, |ui| {
+                        if dismissable {
+                            dismiss = link_button(ui, p, "Dismiss", 80.0).clicked();
+                        }
+                        open = secondary_button(ui, p, "Open folder", 104.0)
+                            .on_hover_text("Opens the folder that holds the settings in File Explorer.")
+                            .clicked();
+                    });
+                    if open {
+                        if let Some(dir) = crate::folders::settings_dir() {
+                            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                        }
+                    }
+                    if dismiss {
+                        self.app.dismiss_settings_notice();
+                    }
+                });
+            });
+    }
+
     /// What the mark should be reporting right now. The taskbar icon and
     /// the header mark both read this, so they cannot drift apart.
     fn icon_state(&self) -> IconState {
@@ -2835,9 +2817,15 @@ impl StreamToSpeakerApp {
                     }
                     match st.airplay_latency_ms {
                         Some(ms) => {
-                            let mut v = ms as i64;
+                            // Saved on release, like the app-wide buffer.
+                            let saved = i64::from(ms);
+                            let mut v = match &self.speaker_latency_draft {
+                                Some((id, draft)) if *id == sp.id => *draft,
+                                _ => saved,
+                            };
+                            let mut commit = false;
                             ui.horizontal(|ui| {
-                                advanced_slider_row(
+                                commit = advanced_slider_row_commit(
                                     ui,
                                     p,
                                     &mut v,
@@ -2847,7 +2835,10 @@ impl StreamToSpeakerApp {
                                     &format!("{} ms (the app setting)", global),
                                 );
                             });
-                            st.airplay_latency_ms = Some(v as u32);
+                            self.speaker_latency_draft = (!commit && v != saved).then(|| (sp.id.clone(), v));
+                            if commit {
+                                st.airplay_latency_ms = Some(u32::try_from(v).unwrap_or(ms));
+                            }
                         }
                         None => {
                             ui.label(
@@ -3372,8 +3363,9 @@ impl StreamToSpeakerApp {
                 use crate::user_config::{
                     AIRPLAY_LATENCY_MS_DEFAULT, AIRPLAY_LATENCY_MS_MAX, AIRPLAY_LATENCY_MS_MIN,
                 };
-                let mut lat_ms =
-                    self.app.user_config.lock().unwrap().effective_airplay_latency_ms() as i64;
+                let saved_ms = self.app.user_config.lock().unwrap().effective_airplay_latency_ms() as i64;
+                let mut lat_ms = self.airplay_latency_draft.unwrap_or(saved_ms);
+                let mut commit = false;
                 advanced_row(
                     ui,
                     p,
@@ -3381,7 +3373,7 @@ impl StreamToSpeakerApp {
                     "Lower = less delay, less margin for Wi-Fi hiccups. 2000 ms is what iTunes uses.",
                     "How much audio an AirPlay speaker holds before playing it. This is most of the delay you hear on AirPlay, so lowering it lowers the delay in step — but any Wi-Fi hiccup longer than the buffer becomes a dropout. A recent Apple TV copes with very small values on a good network; AirPort Express and most AirPlay speakers need roughly 100–350 ms, and a speaker that reports its own minimum is never driven below it. Applies to AirPlay 1 speakers and the AirPlay 2 realtime stream (HomePods use the HomePod delay setting instead); below 1000 ms an AirPlay 2 speaker is switched to the realtime stream automatically. Takes effect the next time you connect.",
                     |ui| {
-                        advanced_slider_row(
+                        commit = advanced_slider_row_commit(
                             ui,
                             p,
                             &mut lat_ms,
@@ -3392,9 +3384,11 @@ impl StreamToSpeakerApp {
                         )
                     },
                 );
-                let mut uc = self.app.user_config.lock().unwrap();
-                if uc.airplay_latency_ms != lat_ms as u32 {
-                    uc.airplay_latency_ms = lat_ms as u32;
+                // Save on release; hold the dragged value until then.
+                self.airplay_latency_draft = (!commit && lat_ms != saved_ms).then_some(lat_ms);
+                if commit && lat_ms != saved_ms {
+                    let mut uc = self.app.user_config.lock().unwrap();
+                    uc.airplay_latency_ms = u32::try_from(lat_ms).unwrap_or(AIRPLAY_LATENCY_MS_DEFAULT);
                     uc.save();
                 }
             }
@@ -4379,7 +4373,9 @@ impl StreamToSpeakerApp {
             ui.add_space(sp::XS);
             use crate::sendspin::source::SourceState;
             let name = self.app.sendspin_source_name();
-            let (text, color) = match self.app.sendspin_source_state() {
+            let state = self.app.sendspin_source_state();
+            let waiting = matches!(state, Some(SourceState::Waiting) | None);
+            let (text, color) = match state {
                 Some(SourceState::Waiting) | None => (
                     format!(
                         "Waiting for Music Assistant. Enable the Sendspin Source plugin there; \
@@ -4414,6 +4410,9 @@ impl StreamToSpeakerApp {
                 Some(SourceState::Failed(e)) => (format!("Not available: {}", e), p.warn),
             };
             ui.label(egui::RichText::new(text).size(12.0).color(color));
+            if waiting {
+                self.show_music_assistant_elsewhere(ui, p);
+            }
             if let Some(note) = self.app.sendspin_source_note() {
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new(note).size(12.0).color(p.text_tertiary));
@@ -4478,6 +4477,42 @@ impl StreamToSpeakerApp {
                         .size(12.0)
                         .color(p.text_tertiary),
                 );
+            }
+        });
+    }
+}
+
+impl StreamToSpeakerApp {
+    /// While the Music Assistant input waits: what someone whose Music
+    /// Assistant runs on another network needs, folded away for everyone
+    /// else.
+    fn show_music_assistant_elsewhere(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(ports) = self.app.sendspin_source_ports() else { return };
+        ui.add_space(sp::XS);
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Music Assistant on another network?").size(12.0).color(p.text_tertiary),
+        )
+        .id_salt("ma-elsewhere")
+        .default_open(false)
+        .show(ui, |ui| {
+            // Looked up again every few seconds, not every frame.
+            let fresh = self.ma_addresses.as_ref().is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(3));
+            if !fresh {
+                self.ma_addresses = Some((Instant::now(), self.app.music_assistant_addresses()));
+            }
+            let addresses = self.ma_addresses.as_ref().map(|(_, a)| a.as_slice()).unwrap_or(&[]);
+            let (text, copy) = crate::sendspin_app::music_assistant_elsewhere(&ports, addresses);
+            for paragraph in text {
+                ui.label(egui::RichText::new(paragraph).size(12.0).color(p.text_secondary));
+            }
+            if let Some(address) = copy {
+                ui.add_space(sp::XS);
+                if secondary_button(ui, p, "Copy address", 120.0)
+                    .on_hover_text("Copy this computer's address to paste into Music Assistant")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(address.to_string());
+                }
             }
         });
     }

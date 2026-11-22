@@ -305,16 +305,6 @@ pub fn next_opener_memory(used: Option<Opener>) -> Option<Opener> {
     used.filter(|o| *o == Opener::OptionsThenAuthSetup)
 }
 
-/// Read a remembered opener leniently: anything unknown is "nothing
-/// remembered", never an unreadable settings file.
-pub fn deserialize_opener_lenient<'de, D>(d: D) -> Result<Option<Opener>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let v = <serde_json::Value as serde::Deserialize>::deserialize(d)?;
-    Ok(serde_json::from_value::<Option<Opener>>(v).unwrap_or(None))
-}
-
 /// How long `stop()` waits for a request in flight to finish before it
 /// cuts it short. A keepalive or volume change takes milliseconds; one
 /// still waiting after this is stalled.
@@ -1961,17 +1951,23 @@ mod tests {
 
     #[test]
     fn a_remembered_opener_reads_leniently() {
-        #[derive(serde::Deserialize)]
-        struct S {
-            #[serde(default, deserialize_with = "deserialize_opener_lenient")]
-            o: Option<Opener>,
-        }
-        let read = |j: &str| serde_json::from_str::<S>(j).unwrap().o;
-        assert_eq!(read(r#"{"o":"options-then-auth-setup"}"#), Some(Opener::OptionsThenAuthSetup));
-        assert_eq!(read(r#"{"o":"something-newer"}"#), None);
-        assert_eq!(read(r#"{"o":7}"#), None);
-        assert_eq!(read(r#"{"o":null}"#), None);
-        assert_eq!(read(r#"{}"#), None);
+        // Read as the settings are read: a value this version doesn't know
+        // is nothing remembered, and the rest of the speaker's settings stay.
+        let read = |o: &str| {
+            let tree: serde_json::Value = serde_json::from_str(&format!(
+                r#"{{"speaker_settings":{{"airplay:0B0000000099":{{"hidden":true{o}}}}}}}"#
+            ))
+            .unwrap();
+            let (c, _) = crate::lenient_json::from_value::<crate::user_config::UserConfig>(&tree).unwrap();
+            let s = &c.speaker_settings["airplay:0B0000000099"];
+            assert!(s.hidden, "{o}");
+            s.airplay_opener
+        };
+        assert_eq!(read(r#","airplay_opener":"options-then-auth-setup""#), Some(Opener::OptionsThenAuthSetup));
+        assert_eq!(read(r#","airplay_opener":"something-newer""#), None);
+        assert_eq!(read(r#","airplay_opener":7"#), None);
+        assert_eq!(read(r#","airplay_opener":null"#), None);
+        assert_eq!(read(""), None);
     }
 
     #[test]

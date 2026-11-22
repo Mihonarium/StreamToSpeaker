@@ -92,7 +92,19 @@ log to `logs\install.log` in the install directory, not to
 via `Uninstall-Driver.ps1`, removes the test-signing certificate a test-signed
 build imported into `LocalMachine\Root` and `TrustedPublisher`
 (`Remove-TestCertificate.ps1`; an upgrade removes the replaced build's
-certificate when it differs), and deletes the install directory.
+certificate when it differs), and deletes the install directory. It leaves
+each person's own folders, so a reinstall keeps their speakers and pairings:
+`%APPDATA%\StreamToSpeaker` (`config.json`, the settings, and `config.json.bak`,
+a second copy the app reads if the first is damaged) and
+`%LOCALAPPDATA%\StreamToSpeaker` (the log, `startup.txt`, and
+`window-state.ron`, which keeps the window's open sections and zoom). Earlier
+versions kept the window's state in `%APPDATA%\Stream To Speaker\data`; the
+window moves it on its first start and removes that folder once it is empty.
+Files the app sets aside in the settings folder, `config.json.corrupt-<time>` (a
+file it couldn't use, kept as it was) and `config.json.before-reset-<time>` (the
+file as it was before settings it couldn't read were reset; at most three), hold
+whatever settings, pairings and passwords that file held, and can be deleted once
+they aren't needed.
 
 ### Endpoint named "Internal AUX Jack — Stream To Speaker"
 
