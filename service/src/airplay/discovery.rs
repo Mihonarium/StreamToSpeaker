@@ -166,17 +166,12 @@ pub struct RaopDetails {
     /// describes.
     pub instance: Option<String>,
     /// Set when another live instance claimed this entry's identity (MAC)
-    /// before it: this one is then chosen only by its own id
-    /// (`airplay:<MAC>/<instance>`, see [`is_newcomer_id`]), by a person
-    /// and for one session at a time, never by the plain `airplay:<MAC>`
-    /// that the launch reconnect and "connect always" use, and nothing
-    /// stored under the plain id is used with it.
+    /// before it. Gates ask [`AirPlayRenderer::is_newcomer`]: a newcomer
+    /// is played only when a person picks it (by its own id,
+    /// `airplay:<MAC>/<instance>`), one session at a time, is never folded
+    /// into a stereo pair or taken as another entry's AirPlay 2 sibling,
+    /// and nothing stored for a speaker is used with it.
     pub newcomer: bool,
-}
-
-/// Is `id` the id of a newcomer (see [`RaopDetails::newcomer`])?
-pub fn is_newcomer_id(id: &str) -> bool {
-    id.strip_prefix("airplay:").is_some_and(|rest| rest.contains('/'))
 }
 
 /// The addresses of `addrs` this app may connect to, in the order a
@@ -294,6 +289,12 @@ impl AirPlayRenderer {
         }
         let et = self.raop_encryption_types();
         et.contains(&0) || et.contains(&1)
+    }
+
+    /// Does this entry stand for a newcomer (see [`RaopDetails::newcomer`]):
+    /// it is one, or a pair with one among its members?
+    pub fn is_newcomer(&self) -> bool {
+        self.raop.newcomer || self.pair.as_ref().is_some_and(|p| p.members.iter().any(|m| m.raop.newcomer))
     }
 
     /// Does the receiver take track text (`md` lists 0)? OwnTone sends
@@ -601,8 +602,15 @@ impl AirPlayDiscoveryState {
         self.working.lock().unwrap().get(mac).copied()
     }
 
+    /// A resolution, as the browse threads deliver it (for tests
+    /// elsewhere in the crate).
     #[cfg(test)]
-    fn with_lan(lan: LanTargets) -> Self {
+    pub(crate) fn ingest_for_tests(&self, service: &str, info: &ServiceInfo) {
+        ingest_resolution(self, service, info);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lan(lan: LanTargets) -> Self {
         Self { lan: LanView { fixed: Some(lan), cached: Mutex::new(None) }, ..Default::default() }
     }
 
@@ -732,7 +740,12 @@ fn pair_launch_step(id: &str, found: Option<&AirPlayRenderer>) -> PairLaunch {
 fn fold_pairs(singles: Vec<AirPlayRenderer>, memory: &HashMap<String, BTreeSet<String>>) -> Vec<AirPlayRenderer> {
     let pairs: HashMap<&String, &BTreeSet<String>> =
         memory.iter().filter(|(_, macs)| macs.len() >= 2).collect();
+    // A newcomer claiming a member's MAC is never folded in: it stays an
+    // entry of its own.
     let pair_of = |r: &AirPlayRenderer| -> Option<String> {
+        if r.is_newcomer() {
+            return None;
+        }
         pairs
             .iter()
             .find(|(_, macs)| macs.contains(&r.mac_id))
@@ -1379,12 +1392,28 @@ mod tests {
         assert_eq!(state.working_address("B8E93735AC11"), None, "a newcomer's session marks no address");
     }
 
+    /// A newcomer claiming a stereo-pair member's MAC is never folded into
+    /// the pair; a pair with a newcomer among its members would count as
+    /// one.
     #[test]
-    fn newcomer_ids_are_told_apart() {
-        assert!(is_newcomer_id(NEWCOMER));
-        assert!(!is_newcomer_id("airplay:B8E93735AC11"));
-        assert!(!is_newcomer_id("airplay:pair:abc"));
-        assert!(!is_newcomer_id("uuid:RINCON_1/2"));
+    fn a_newcomer_is_never_folded_into_a_pair() {
+        let mem = memory(&[("t1", &["AA", "BB"])]);
+        let mut fake = pod("AA", Some("t1"), false, None);
+        fake.raop.newcomer = true;
+        fake.raop.instance = Some("aa@fake._raop._tcp.local.".into());
+        let v = fold_pairs(vec![pod("AA", Some("t1"), true, None), pod("BB", Some("t1"), false, None), fake], &mem);
+        assert_eq!(v.len(), 2, "{v:?}");
+        let pair = v.iter().find(|r| r.pair.is_some()).unwrap();
+        assert!(!pair.is_newcomer());
+        assert_eq!(pair.pair.as_ref().unwrap().members.len(), 2);
+        let single = v.iter().find(|r| r.pair.is_none()).unwrap();
+        assert!(single.is_newcomer());
+
+        let mut with_newcomer = pair.clone();
+        if let Some(p) = with_newcomer.pair.as_mut() {
+            p.members[1].raop.newcomer = true;
+        }
+        assert!(with_newcomer.is_newcomer());
     }
 
     /// When the incumbent goes, the conflict is over: the one left is an
