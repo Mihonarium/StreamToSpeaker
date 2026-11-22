@@ -196,13 +196,7 @@ pub struct AirPlay2Session {
     /// Retransmission counters (realtime stream only; buffered has no
     /// resend path and leaves them at zero).
     resend_stats: Arc<crate::airplay::timing::ResendStats>,
-    sender_handle: Option<JoinHandle<()>>,
-    timing_handle: Option<JoinHandle<()>>,
-    sync_handle: Option<JoinHandle<()>>,
-    resend_handle: Option<JoinHandle<()>>,
-    event_handle: Option<JoinHandle<()>>,
-    feedback_handle: Option<JoinHandle<()>>,
-    volume_handle: Option<JoinHandle<()>>,
+    threads: SessionThreads,
     ptp_session: Option<PtpMaster>,
     /// (next 23-bit seq, next rtptime) for the buffered stream — read at
     /// stop() to send the spec's FLUSHBUFFERED before TEARDOWN. None for
@@ -215,8 +209,6 @@ pub struct AirPlay2Session {
     /// Control connections of the other stereo-pair members (the leader's
     /// is `rtsp`). Volume goes to the leader first, then these.
     followers: Vec<Arc<Mutex<Ap2Rtsp>>>,
-    /// Per-member threads beyond the fixed handles above.
-    extra_handles: Vec<JoinHandle<()>>,
 }
 
 impl AirPlay2Session {
@@ -259,9 +251,24 @@ impl AirPlay2Session {
 
         let audio_key = pair_member(&mut rtsp, cfg.stored_pairing.as_ref(), &cfg.renderer.friendly_name)?;
         info!("AirPlay 2: paired with {}", cfg.renderer.friendly_name);
+        let sockets = Ap2Sockets { audio: audio_socket, control: control_socket, timing: timing_socket, control_port, timing_port };
+        Self::start_paired(cfg, rtsp, audio_key, sockets)
+    }
 
+    /// The general path's bring-up after pairing: timing, the event
+    /// channel, the stream, RECORD and the session's threads.
+    fn start_paired(
+        cfg: AirPlay2SessionConfig,
+        mut rtsp: Ap2Rtsp,
+        audio_key: [u8; 32],
+        sockets: Ap2Sockets,
+    ) -> std::result::Result<Self, Ap2StartError> {
+        let Ap2Sockets { audio: audio_socket, control: control_socket, timing: timing_socket, control_port, timing_port } =
+            sockets;
+        let homepod = cfg.renderer.is_homepod();
         let event_ciphers = rtsp.take_event_ciphers();
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let mut bring_up = BringUp::new(&stop_flag);
         let dead = Arc::new(AtomicBool::new(false));
         let faults = FaultSlot::new(dead.clone(), cfg.renderer.friendly_name.clone());
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
@@ -300,7 +307,7 @@ impl AirPlay2Session {
         // HomePod its requests are decrypted and answered 200, and the
         // receiver closing it ends the session; other receivers keep the
         // channel open and drained, as before.
-        let event_handle = spawn_event_channel(
+        bring_up.threads.event = spawn_event_channel(
             cfg.renderer.ip,
             event_port,
             event_ciphers.filter(|_| homepod),
@@ -454,7 +461,7 @@ impl AirPlay2Session {
             .context("clone AP2 control socket")?;
 
         let mut buffered_flush = None;
-        let (sender_handle, timing_handle, sync_handle, resend_handle) = if buffered {
+        if buffered {
             // Buffered: audio goes over the (already-connected) TCP data
             // connection; playback is anchored by SETRATEANCHORTIME. No
             // sync packets, no resend (TCP is reliable), no NTP timing
@@ -469,7 +476,7 @@ impl AirPlay2Session {
             // late. Field-tested: this receiver accepts anchors only on
             // ITS OWN timeline, which the PTP layer follows via the
             // receiver's Sync/Follow_Up stream.
-            let sender = spawn_ap2_buffered_sender(BufferedSenderConfig {
+            bring_up.threads.sender = Some(spawn_ap2_buffered_sender(BufferedSenderConfig {
                 stream,
                 audio_key,
                 initial_seq,
@@ -487,7 +494,7 @@ impl AirPlay2Session {
                 anchor_retry: AnchorRetry::new(),
                 ptp_ports_problem: ptp_session.as_ref().and_then(|p| p.ports_problem()).map(str::to_string),
                 faults: faults.clone(),
-            })?;
+            })?);
             info!(
                 "AirPlay 2: buffered {} stream armed — will anchor at first audio",
                 codec.label()
@@ -495,7 +502,6 @@ impl AirPlay2Session {
             drop(timing_socket);
             drop(control_socket);
             drop(control_for_resend);
-            (sender, None, None, None)
         } else {
             // Anchor before audio: both sync spawners send their initial
             // (extension-bit) sync synchronously before returning, so
@@ -503,7 +509,7 @@ impl AirPlay2Session {
             // receiver has a timeline anchor before the first audio
             // packet arrives — same ordering rule as the RAOP path.
             let sync_addr = SocketAddr::new(cfg.renderer.ip, ports.control);
-            let (timing_handle, sync_handle) = if use_ptp {
+            if use_ptp {
                 let ptp = ptp_session.as_ref().unwrap();
                 let sync = spawn_sync_sender_ptp(
                     control_socket,
@@ -515,9 +521,9 @@ impl AirPlay2Session {
                     cfg.renderer.friendly_name.clone(),
                 )
                 .context("spawning AP2 PTP sync sender")?;
+                bring_up.threads.sync = Some(sync);
                 // The NTP timing responder is unused under PTP; release its socket.
                 drop(timing_socket);
-                (None, Some(sync))
             } else {
                 let timing = spawn_timing_responder(
                     timing_socket,
@@ -525,6 +531,7 @@ impl AirPlay2Session {
                     cfg.renderer.friendly_name.clone(),
                 )
                 .context("spawning AP2 timing responder")?;
+                bring_up.threads.timing = Some(timing);
                 let sync = spawn_sync_sender(
                     control_socket,
                     sync_addr,
@@ -534,8 +541,8 @@ impl AirPlay2Session {
                     cfg.renderer.friendly_name.clone(),
                 )
                 .context("spawning AP2 sync sender")?;
-                (Some(timing), Some(sync))
-            };
+                bring_up.threads.sync = Some(sync);
+            }
 
             // HomePods: resends from the media loop with per-slot budgets
             // and playout deadlines, and a grace period for send errors.
@@ -543,7 +550,7 @@ impl AirPlay2Session {
             // non-blocking mode, which would also apply to the sync
             // thread's sends on the shared socket. Other receivers keep
             // the resend thread and stop on the first send error.
-            let (recovery, resend_handle) = if homepod {
+            let recovery = if homepod {
                 control_for_resend
                     .set_read_timeout(Some(Duration::from_millis(1)))
                     .context("AP2 control socket read timeout")?;
@@ -556,7 +563,7 @@ impl AirPlay2Session {
                     ),
                     latency: Duration::from_millis(cfg.latency_ms as u64),
                 };
-                (recovery, None)
+                recovery
             } else {
                 let resend = ResendBuffer::new(RESEND_BUFFER_PACKETS);
                 let handle = spawn_resend_responder(
@@ -568,9 +575,10 @@ impl AirPlay2Session {
                     cfg.renderer.friendly_name.clone(),
                 )
                 .context("spawning AP2 resend responder")?;
-                (RealtimeRecovery::Classic { resend }, Some(handle))
+                bring_up.threads.resend = Some(handle);
+                RealtimeRecovery::Classic { resend }
             };
-            let sender = spawn_ap2_sender(Ap2SenderConfig {
+            bring_up.threads.sender = Some(spawn_ap2_sender(Ap2SenderConfig {
                 audio_socket: audio_socket.try_clone().context("clone AP2 audio socket")?,
                 receiver_addr: SocketAddr::new(cfg.renderer.ip, ports.data),
                 audio_key,
@@ -583,9 +591,8 @@ impl AirPlay2Session {
                 current_rtptime,
                 recovery,
                 faults: faults.clone(),
-            })?;
-            (sender, timing_handle, sync_handle, resend_handle)
-        };
+            })?);
+        }
 
         info!(
             "AirPlay 2: session up — {} → {}:{} ({} audio), control :{}",
@@ -599,7 +606,7 @@ impl AirPlay2Session {
         // /feedback keepalive — iOS senders POST this every ~2 s; some
         // receivers eventually drop (or never fully start) sessions
         // without it. Shares the RTSP connection via the session mutex.
-        let feedback_handle = spawn_feedback_keepalive(
+        bring_up.threads.feedback = spawn_feedback_keepalive(
             rtsp.clone(),
             stop_flag.clone(),
             faults.clone(),
@@ -607,11 +614,10 @@ impl AirPlay2Session {
             cfg.renderer.friendly_name.clone(),
         );
         // Volume read-back is limited to HomePods.
-        let volume_handle = if homepod {
-            spawn_volume_reader(rtsp.clone(), volume.clone(), stop_flag.clone(), cfg.renderer.friendly_name.clone())
-        } else {
-            None
-        };
+        if homepod {
+            bring_up.threads.volume =
+                spawn_volume_reader(rtsp.clone(), volume.clone(), stop_flag.clone(), cfg.renderer.friendly_name.clone());
+        }
 
         Ok(Self {
             renderer: cfg.renderer,
@@ -622,19 +628,12 @@ impl AirPlay2Session {
             faults,
             volume,
             resend_stats,
-            sender_handle: Some(sender_handle),
-            timing_handle,
-            sync_handle,
-            resend_handle,
-            event_handle,
-            feedback_handle,
-            volume_handle,
+            threads: bring_up.finish(),
             ptp_session,
             buffered_flush,
             data_stream,
             _audio_socket: Some(audio_socket),
             followers: Vec::new(),
-            extra_handles: Vec::new(),
         })
     }
 
@@ -685,7 +684,7 @@ impl AirPlay2Session {
         );
 
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let mut stop_guard = StopOnDrop(Some(stop_flag.clone()));
+        let mut bring_up = BringUp::new(&stop_flag);
         let dead = Arc::new(AtomicBool::new(false));
         let faults = FaultSlot::new(dead.clone(), label.clone());
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
@@ -751,7 +750,6 @@ impl AirPlay2Session {
         let ptp = ptp_guard.0.as_ref().expect("just set");
 
         // 3. Session SETUP + event channel.
-        let mut extra_handles = Vec::new();
         for p in &mut pending {
             let ts = p
                 .rtsp
@@ -769,7 +767,7 @@ impl AirPlay2Session {
                 true,
                 p.renderer.friendly_name.clone(),
             ) {
-                extra_handles.push(h);
+                bring_up.threads.extra.push(h);
             }
         }
 
@@ -848,7 +846,7 @@ impl AirPlay2Session {
 
         // 7. Media, keepalives, read-back.
         let group = RealtimeGroup::new(links, initial_rtptime, ptp.timeline.clock.clone(), ptp.timeline.clock_id);
-        let sender = crate::airplay::ap2_realtime::spawn(RealtimeRun {
+        bring_up.threads.sender = Some(crate::airplay::ap2_realtime::spawn(RealtimeRun {
             group,
             codec,
             samples_rx: cfg.samples_rx,
@@ -856,21 +854,27 @@ impl AirPlay2Session {
             faults: faults.clone(),
             name: label.clone(),
         })
-        .context("spawning AP2 realtime sender")?;
+        .context("spawning AP2 realtime sender")?);
 
         let mut conns = pending
             .into_iter()
             .map(|p| (p.renderer.friendly_name, Arc::new(Mutex::new(p.rtsp))));
         let (leader_name, rtsp) = conns.next().expect("at least one member");
         let followers: Vec<(String, Arc<Mutex<Ap2Rtsp>>)> = conns.collect();
-        let feedback_handle = spawn_feedback_keepalive(rtsp.clone(), stop_flag.clone(), faults.clone(), true, leader_name.clone());
+        bring_up.threads.feedback =
+            spawn_feedback_keepalive(rtsp.clone(), stop_flag.clone(), faults.clone(), true, leader_name.clone());
         for (name, conn) in &followers {
-            extra_handles.extend(spawn_feedback_keepalive(conn.clone(), stop_flag.clone(), faults.clone(), true, name.clone()));
+            bring_up.threads.extra.extend(spawn_feedback_keepalive(
+                conn.clone(),
+                stop_flag.clone(),
+                faults.clone(),
+                true,
+                name.clone(),
+            ));
         }
-        let volume_handle = spawn_volume_reader(rtsp.clone(), volume.clone(), stop_flag.clone(), leader_name);
+        bring_up.threads.volume = spawn_volume_reader(rtsp.clone(), volume.clone(), stop_flag.clone(), leader_name);
 
         info!("AirPlay 2: HomePod realtime session up — {}", label);
-        stop_guard.0 = None;
         let ptp = ptp_guard.0.take().expect("set at bring-up");
         Ok(Self {
             renderer: cfg.renderer,
@@ -881,19 +885,12 @@ impl AirPlay2Session {
             faults,
             volume,
             resend_stats,
-            sender_handle: Some(sender),
-            timing_handle: None,
-            sync_handle: None,
-            resend_handle: None,
-            event_handle: None,
-            feedback_handle,
-            volume_handle,
+            threads: bring_up.finish(),
             ptp_session: Some(ptp),
             buffered_flush: None,
             data_stream: None,
             _audio_socket: None,
             followers: followers.into_iter().map(|(_, c)| c).collect(),
-            extra_handles,
         })
     }
 
@@ -954,21 +951,7 @@ impl AirPlay2Session {
         if let Some(s) = &self.data_stream {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
-        for h in [
-            self.sender_handle.take(),
-            self.timing_handle.take(),
-            self.sync_handle.take(),
-            self.resend_handle.take(),
-            self.event_handle.take(),
-            self.feedback_handle.take(),
-            self.volume_handle.take(),
-        ]
-        .into_iter()
-        .flatten()
-        .chain(self.extra_handles.drain(..))
-        {
-            let _ = h.join();
-        }
+        self.threads.join();
         for f in &self.followers {
             f.lock().unwrap().teardown();
         }
@@ -989,20 +972,81 @@ impl AirPlay2Session {
     }
 }
 
+/// The UDP sockets a general-path session binds before it connects, and
+/// their ports.
+struct Ap2Sockets {
+    audio: UdpSocket,
+    control: UdpSocket,
+    timing: UdpSocket,
+    control_port: u16,
+    timing_port: u16,
+}
+
 impl Drop for AirPlay2Session {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Release);
     }
 }
 
-/// Sets the stop flag when dropped (unless cleared), so the threads of a
-/// bring-up that fails partway exit instead of lingering.
-struct StopOnDrop(Option<Arc<AtomicBool>>);
+/// The threads of one session.
+#[derive(Default)]
+struct SessionThreads {
+    sender: Option<JoinHandle<()>>,
+    timing: Option<JoinHandle<()>>,
+    sync: Option<JoinHandle<()>>,
+    resend: Option<JoinHandle<()>>,
+    event: Option<JoinHandle<()>>,
+    feedback: Option<JoinHandle<()>>,
+    volume: Option<JoinHandle<()>>,
+    /// Per-member threads of a stereo pair beyond those above.
+    extra: Vec<JoinHandle<()>>,
+}
 
-impl Drop for StopOnDrop {
+impl SessionThreads {
+    /// Wait for every thread to end; the caller has set the stop flag.
+    fn join(&mut self) {
+        let fixed = [
+            self.sender.take(),
+            self.timing.take(),
+            self.sync.take(),
+            self.resend.take(),
+            self.event.take(),
+            self.feedback.take(),
+            self.volume.take(),
+        ];
+        for h in fixed.into_iter().flatten().chain(self.extra.drain(..)) {
+            let _ = h.join();
+        }
+    }
+}
+
+/// A bring-up in progress and the threads it has started. If a step fails
+/// (this is dropped before [`BringUp::finish`]), the threads are told to
+/// stop and waited for, so they have closed their connections (the event
+/// channel among them) before the error is returned.
+struct BringUp {
+    stop_flag: Arc<AtomicBool>,
+    threads: SessionThreads,
+    finished: bool,
+}
+
+impl BringUp {
+    fn new(stop_flag: &Arc<AtomicBool>) -> Self {
+        Self { stop_flag: stop_flag.clone(), threads: SessionThreads::default(), finished: false }
+    }
+
+    /// The bring-up succeeded: the threads now belong to the session.
+    fn finish(mut self) -> SessionThreads {
+        self.finished = true;
+        std::mem::take(&mut self.threads)
+    }
+}
+
+impl Drop for BringUp {
     fn drop(&mut self) {
-        if let Some(f) = &self.0 {
-            f.store(true, Ordering::Release);
+        if !self.finished {
+            self.stop_flag.store(true, Ordering::Release);
+            self.threads.join();
         }
     }
 }
@@ -2246,6 +2290,195 @@ mod tests {
             // FLUSHBUFFERED names the next packet in the same numbering.
             assert_eq!(rig.last_seq.load(Ordering::Acquire), 65_530 + packets.len() as u32);
         }
+    }
+
+    /// A bring-up that fails after the event channel is open (here the
+    /// receiver refuses the stream SETUP) has stopped that channel's thread
+    /// and closed its connection by the time the error is returned,
+    /// instead of leaving both behind for every failed attempt.
+    #[test]
+    fn a_failed_bring_up_closes_what_it_opened_before_returning() {
+        use crate::airplay::test_peers::{read_request, reply};
+        use std::io::{BufReader, Read};
+        let events = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let event_port = events.local_addr().unwrap().port();
+        let control = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_port = control.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (sock, _) = control.accept().unwrap();
+            let mut r = BufReader::new(sock.try_clone().unwrap());
+            let mut w = sock;
+            let mut lines = Vec::new();
+            while let Some((line, cseq, _)) = read_request(&mut r) {
+                if line.starts_with("SETUP") && !lines.iter().any(|l: &String| l.starts_with("SETUP")) {
+                    let mut d = plist::Dictionary::new();
+                    d.insert("eventPort".into(), plist::Value::Integer((event_port as u64).into()));
+                    let mut body = Vec::new();
+                    plist::to_writer_binary(&mut body, &plist::Value::Dictionary(d)).unwrap();
+                    reply(&mut w, cseq, "200 OK", &body);
+                } else if line.starts_with("SETUP") {
+                    reply(&mut w, cseq, "500 Internal Server Error", &[]);
+                } else {
+                    reply(&mut w, cseq, "200 OK", &[]);
+                }
+                lines.push(line);
+            }
+            lines
+        });
+
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let renderer = AirPlayRenderer {
+            friendly_name: "Bring-up test speaker".into(),
+            mac_id: "AA".into(),
+            ip,
+            port: control_port,
+            airplay_port: Some(control_port),
+            encryption_types: vec![0],
+            codecs: vec![0, 1],
+            password_protected: false,
+            encryption_key_required: false,
+            features: None,
+            pk: None,
+            model: None,
+            group: None,
+            pair: None,
+        };
+        let (_samples, samples_rx) = crossbeam_channel::unbounded();
+        let cfg = AirPlay2SessionConfig {
+            renderer,
+            local_ip: ip,
+            samples_rx,
+            initial_volume: None,
+            prefer_realtime: false,
+            latency_ms: 2000,
+            stored_pairing: None,
+            homepod_realtime: true,
+            homepod_latency_ms: 200,
+        };
+        let (audio, control, timing) = (bind_udp(ip).unwrap(), bind_udp(ip).unwrap(), bind_udp(ip).unwrap());
+        let sockets = Ap2Sockets {
+            control_port: control.local_addr().unwrap().port(),
+            timing_port: timing.local_addr().unwrap().port(),
+            audio,
+            control,
+            timing,
+        };
+        let rtsp = Ap2Rtsp::connect(ip, control_port, ip, Duration::from_secs(5)).unwrap();
+        let result = AirPlay2Session::start_paired(cfg, rtsp, [0u8; 32], sockets);
+        assert!(matches!(result, Err(Ap2StartError::Other(_))), "the refused stream SETUP fails the bring-up");
+
+        let (mut event_conn, _) = events.accept().unwrap();
+        event_conn.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut b = [0u8; 16];
+        assert!(
+            matches!(event_conn.read(&mut b), Ok(0)),
+            "the event channel was still open after start() returned"
+        );
+        // The control connection closed with the bring-up too (a paired
+        // one sends TEARDOWN first; this test's is unpaired).
+        let lines = peer.join().unwrap();
+        assert_eq!(lines.len(), 2, "SETUP(timing) and the refused SETUP(stream): {lines:?}");
+    }
+
+    /// A realtime bring-up that succeeds sends its requests in the order it
+    /// always has, and stopping the session ends its threads (the event
+    /// channel closes) and sends TEARDOWN.
+    #[test]
+    fn a_session_that_comes_up_stops_everything_it_started() {
+        use crate::airplay::test_peers::{read_request, reply};
+        use std::io::{BufReader, Read};
+        let events = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let event_port = events.local_addr().unwrap().port();
+        let media = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let media_port = media.local_addr().unwrap().port();
+        let control = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_port = control.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (sock, _) = control.accept().unwrap();
+            let mut r = BufReader::new(sock.try_clone().unwrap());
+            let mut w = sock;
+            let mut lines = Vec::new();
+            let plist_body = |d: plist::Dictionary| {
+                let mut body = Vec::new();
+                plist::to_writer_binary(&mut body, &plist::Value::Dictionary(d)).unwrap();
+                body
+            };
+            while let Some((line, cseq, _)) = read_request(&mut r) {
+                let setups = lines.iter().filter(|l: &&String| l.starts_with("SETUP")).count();
+                let body = match (line.starts_with("SETUP"), setups) {
+                    (true, 0) => {
+                        let mut d = plist::Dictionary::new();
+                        d.insert("eventPort".into(), plist::Value::Integer((event_port as u64).into()));
+                        plist_body(d)
+                    }
+                    (true, _) => {
+                        let mut s0 = plist::Dictionary::new();
+                        s0.insert("dataPort".into(), plist::Value::Integer((media_port as u64).into()));
+                        s0.insert("controlPort".into(), plist::Value::Integer((media_port as u64).into()));
+                        let mut d = plist::Dictionary::new();
+                        d.insert("streams".into(), plist::Value::Array(vec![plist::Value::Dictionary(s0)]));
+                        plist_body(d)
+                    }
+                    _ => Vec::new(),
+                };
+                reply(&mut w, cseq, "200 OK", &body);
+                lines.push(line);
+            }
+            lines
+        });
+
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let renderer = AirPlayRenderer {
+            friendly_name: "Session test speaker".into(),
+            mac_id: "AA".into(),
+            ip,
+            port: control_port,
+            airplay_port: Some(control_port),
+            encryption_types: vec![0],
+            codecs: vec![0, 1],
+            password_protected: false,
+            encryption_key_required: false,
+            features: None,
+            pk: None,
+            model: None,
+            group: None,
+            pair: None,
+        };
+        let (_samples, samples_rx) = crossbeam_channel::unbounded();
+        let cfg = AirPlay2SessionConfig {
+            renderer,
+            local_ip: ip,
+            samples_rx,
+            initial_volume: None,
+            prefer_realtime: false,
+            latency_ms: 2000,
+            stored_pairing: None,
+            homepod_realtime: true,
+            homepod_latency_ms: 200,
+        };
+        let (audio, control, timing) = (bind_udp(ip).unwrap(), bind_udp(ip).unwrap(), bind_udp(ip).unwrap());
+        let sockets = Ap2Sockets {
+            control_port: control.local_addr().unwrap().port(),
+            timing_port: timing.local_addr().unwrap().port(),
+            audio,
+            control,
+            timing,
+        };
+        let rtsp = Ap2Rtsp::connect(ip, control_port, ip, Duration::from_secs(5)).unwrap();
+        let session = AirPlay2Session::start_paired(cfg, rtsp, [0u8; 32], sockets).unwrap_or_else(|e| panic!("{e:#}"));
+        let (mut event_conn, _) = events.accept().unwrap();
+        session.stop();
+
+        event_conn.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut b = [0u8; 16];
+        assert!(matches!(event_conn.read(&mut b), Ok(0)), "the event channel was still open after stop()");
+        let lines = peer.join().unwrap();
+        let methods: Vec<&str> = lines
+            .iter()
+            .filter(|l| !l.starts_with("POST /feedback"))
+            .map(|l| l.split_whitespace().next().unwrap_or(""))
+            .collect();
+        assert_eq!(methods, ["SETUP", "SETUP", "RECORD", "TEARDOWN"], "{lines:?}");
     }
 
     #[test]
