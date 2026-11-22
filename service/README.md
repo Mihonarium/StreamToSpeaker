@@ -26,8 +26,9 @@ The binary lands at `target/release/stream-to-speaker.exe`.
 # Interactive picker: lists discovered speakers and prompts.
 stream-to-speaker
 
-# Auto-pick first speaker (skip prompt) — useful in scripts and services
-stream-to-speaker --no-interactive
+# Headless without the terminal prompt — useful in scripts and services:
+# reconnects to the speaker saved last time
+stream-to-speaker --headless --no-interactive
 
 # Target a specific speaker by name or IP
 stream-to-speaker --player "Living Room"

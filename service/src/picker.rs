@@ -4,9 +4,8 @@
 //! `--player`, we list the discovered renderers and let them pick one by
 //! index — modeled on swyh-rs's button list, but text-mode.
 //!
-//! Non-interactive contexts (piped stdin, service host, CI) skip the
-//! prompt and the caller falls back to "first discovered" or errors out
-//! depending on its preference.
+//! Non-interactive contexts (piped stdin, service host, CI) are never
+//! asked, and nothing is picked for them.
 
 use crate::ssdp::{DiscoveryState, Renderer};
 use anyhow::{anyhow, Result};
@@ -115,42 +114,16 @@ pub fn interactive_pick(state: &Arc<DiscoveryState>) -> Result<Option<Renderer>>
     }
 }
 
-/// Resolve a renderer in one of three modes:
-///   1. `hint` Some(query) → substring/IP match (no prompt)
-///   2. interactive TTY    → call `interactive_pick`
-///   3. non-TTY no hint    → first discovered (warn) or None
-pub fn resolve(
-    state: &Arc<DiscoveryState>,
-    hint: Option<&str>,
-    interactive_allowed: bool,
-) -> Result<Option<Renderer>> {
+/// The renderer `hint` names (substring or IP match), once discovery has
+/// had a moment.
+pub fn resolve(state: &Arc<DiscoveryState>, hint: &str) -> Result<Option<Renderer>> {
     let renderers = wait_for_first_discovery(state, Duration::from_secs(5));
-
-    if let Some(q) = hint {
-        match state.find(q) {
-            Some(r) => return Ok(Some(r)),
-            None => {
-                return Err(anyhow!(
-                    "no speaker matched {:?}; discovered: {:?}",
-                    q,
-                    renderers
-                        .iter()
-                        .map(|r| r.display_name())
-                        .collect::<Vec<_>>()
-                ));
-            }
-        }
+    match state.find(hint) {
+        Some(r) => Ok(Some(r)),
+        None => Err(anyhow!(
+            "no speaker matched {:?}; discovered: {:?}",
+            hint,
+            renderers.iter().map(|r| r.display_name()).collect::<Vec<_>>()
+        )),
     }
-
-    if interactive_allowed && is_interactive() {
-        return interactive_pick(state);
-    }
-
-    if renderers.len() > 1 {
-        log::warn!(
-            "multiple speakers discovered; defaulting to first ({}). Use --player <name> to pick.",
-            renderers[0].display_name()
-        );
-    }
-    Ok(renderers.into_iter().next())
 }

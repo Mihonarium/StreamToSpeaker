@@ -88,8 +88,8 @@ struct Cli {
     #[arg(long)]
     device: Option<String>,
 
-    /// Speaker to send to: friendly name substring, IP, or omit to be
-    /// prompted (in a terminal) / pick the first one (non-interactive).
+    /// Speaker to send to: friendly name substring or IP. Without it the
+    /// saved speaker is used; --headless in a terminal asks instead.
     #[arg(long)]
     player: Option<String>,
 
@@ -582,20 +582,10 @@ fn run(cli: Cli) -> Result<()> {
         })
         .context("spawning audio thread")?;
 
-    // Resolve initial speaker.
+    // The first speaker: see `launch_choice`. With nobody to ask and
+    // nothing saved, none: the window's getting-started card asks the
+    // person, and their pick is saved for next time.
     //
-    // Priority chain:
-    //   1. `--player <hint>`  — explicit override, fuzzy match
-    //   2. interactive headless TTY — prompt the user
-    //   3. saved speaker id from user_config — auto-reconnect to the
-    //      one the user last explicitly picked
-    //   4. otherwise — DON'T auto-select. The GUI's onboarding card
-    //      kicks in so the user picks manually one time; their
-    //      choice gets persisted and step 3 takes over from then on.
-    //
-    // The old fallback ("first discovered") was the reason GUI users
-    // never got to see the onboarding card and ended up with a random
-    // speaker bound at launch.
     // A saved speaker added by address needs no discovery: connect in the
     // background (the window and tray come up meanwhile), with or without
     // --no-discovery.
@@ -610,64 +600,66 @@ fn run(cli: Cli) -> Result<()> {
     } else if !cli.no_discovery {
         let discovery = app.discovery.as_ref().unwrap();
         let mut pair_wait_started = false;
-        let initial = if cli.player.is_some() {
-            picker::resolve(discovery, cli.player.as_deref(), false)?
-        } else if !cli.no_interactive && cli.headless {
-            picker::resolve(discovery, None, true)?
-        } else if let Some(saved_id) = app.saved_speaker_id() {
-            if !app.is_auto_reconnect_on_launch() {
-                info!("auto-reconnect disabled by user preference; saved={:?}", saved_id);
-                None
-            } else if !app.auto_connect_allowed_at_launch(&saved_id) {
-                info!("auto-reconnect: {:?} is set to never auto-connect", saved_id);
-                None
-            } else {
-                info!("auto-reconnect: trying saved speaker {:?}", saved_id);
-                // Wait briefly for the first SSDP sweep to populate
-                // discovery before we look the saved id up.
-                picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
-                let found = discovery.find_by_id(&saved_id);
-                if found.is_none() {
-                    match discovery.identity_conflict(&saved_id) {
-                        Some(addrs) => warn!(
-                            "auto-reconnect skipped: different devices at {:?} all claim to be the saved \
-                             speaker {:?}; pick the right one by address",
-                            addrs, saved_id
-                        ),
-                        None if !saved_id.starts_with("airplay:") => {
-                            info!("auto-reconnect: saved speaker {:?} not found on the network", saved_id)
+        let saved = app.saved_speaker_id();
+        let initial = match launch_choice(&cli, picker::is_interactive(), saved.as_deref()) {
+            LaunchChoice::Wish(hint) => picker::resolve(discovery, &hint)?,
+            LaunchChoice::Ask => picker::interactive_pick(discovery)?,
+            LaunchChoice::Saved(saved_id) => {
+                if !app.is_auto_reconnect_on_launch() {
+                    info!("auto-reconnect disabled by user preference; saved={:?}", saved_id);
+                    None
+                } else if !app.auto_connect_allowed_at_launch(&saved_id) {
+                    info!("auto-reconnect: {:?} is set to never auto-connect", saved_id);
+                    None
+                } else {
+                    info!("auto-reconnect: trying saved speaker {:?}", saved_id);
+                    // Wait briefly for the first SSDP sweep to populate
+                    // discovery before we look the saved id up.
+                    picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
+                    let found = discovery.find_by_id(&saved_id);
+                    if found.is_none() {
+                        match discovery.identity_conflict(&saved_id) {
+                            Some(addrs) => warn!(
+                                "auto-reconnect skipped: different devices at {:?} all claim to be the saved \
+                                 speaker {:?}; pick the right one by address",
+                                addrs, saved_id
+                            ),
+                            None if !saved_id.starts_with("airplay:") => {
+                                info!("auto-reconnect: saved speaker {:?} not found on the network", saved_id)
+                            }
+                            None => {}
                         }
-                        None => {}
                     }
-                }
-                // A saved HomePod stereo pair (or one of its members): give
-                // both members time to resolve in the background, then play
-                // the pair — unless the user picked something meanwhile.
-                if found.is_none() && saved_id.starts_with("airplay:") {
-                    if let Some(ad) = app.airplay_discovery.clone() {
-                        let app = app.clone();
-                        pair_wait_started = std::thread::Builder::new()
-                            .name("stream-to-speaker-pair-reconnect".into())
-                            .spawn(move || {
-                                let Some(id) = ad.wait_for_pair(&saved_id, Duration::from_secs(15)) else {
-                                    return;
-                                };
-                                if app.session.lock().unwrap().is_some()
-                                    || app.connecting.lock().unwrap().is_some()
-                                {
-                                    return;
-                                }
-                                info!("auto-reconnect: stereo pair {:?}", id);
-                                app.select_speaker_async(&id);
-                            })
-                            .is_ok();
+                    // A saved HomePod stereo pair (or one of its members): give
+                    // both members time to resolve in the background, then play
+                    // the pair — unless the user picked something meanwhile.
+                    if found.is_none() && saved_id.starts_with("airplay:") {
+                        if let Some(ad) = app.airplay_discovery.clone() {
+                            let app = app.clone();
+                            pair_wait_started = std::thread::Builder::new()
+                                .name("stream-to-speaker-pair-reconnect".into())
+                                .spawn(move || {
+                                    let Some(id) = ad.wait_for_pair(&saved_id, Duration::from_secs(15)) else {
+                                        return;
+                                    };
+                                    if app.session.lock().unwrap().is_some()
+                                        || app.connecting.lock().unwrap().is_some()
+                                    {
+                                        return;
+                                    }
+                                    info!("auto-reconnect: stereo pair {:?}", id);
+                                    app.select_speaker_async(&id);
+                                })
+                                .is_ok();
+                        }
                     }
+                    found
                 }
-                found
             }
-        } else {
-            info!("first launch (no saved speaker) — waiting for manual pick");
-            None
+            LaunchChoice::Nothing => {
+                info!("first launch (no saved speaker) — waiting for manual pick");
+                None
+            }
         };
         if let Some(r) = initial {
             let id = r.stable_id();
@@ -1164,6 +1156,34 @@ fn build_driver_volume_pusher() -> Option<Box<dyn DriverVolumePush>> {
 // Signal handler
 // -----------------------------------------------------------------------------
 
+/// Which speaker a launch starts with, by the flags and the saved choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LaunchChoice {
+    /// `--player`: the speaker it names.
+    Wish(String),
+    /// Ask in the terminal.
+    Ask,
+    /// The speaker saved last time (if its settings allow reconnecting).
+    Saved(String),
+    /// None: the person picks one.
+    Nothing,
+}
+
+/// `terminal`: standard input and output are a terminal someone can
+/// answer in. A saved speaker always wins over one that merely answered
+/// first: without someone to ask, nothing is picked for them.
+fn launch_choice(cli: &Cli, terminal: bool, saved: Option<&str>) -> LaunchChoice {
+    if let Some(q) = &cli.player {
+        LaunchChoice::Wish(q.clone())
+    } else if cli.headless && !cli.no_interactive && terminal {
+        LaunchChoice::Ask
+    } else if let Some(id) = saved {
+        LaunchChoice::Saved(id.to_string())
+    } else {
+        LaunchChoice::Nothing
+    }
+}
+
 fn install_signal_handler(app: Arc<App>) {
     if let Err(e) = ctrlc::set_handler(move || {
         if !app.is_shutting_down() {
@@ -1172,5 +1192,43 @@ fn install_signal_handler(app: Arc<App>) {
         }
     }) {
         warn!("could not install Ctrl-C handler: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("stream-to-speaker").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn a_headless_run_without_a_terminal_reconnects_the_saved_speaker() {
+        // A service, a scheduled task, a hidden window: nobody to ask.
+        assert_eq!(launch_choice(&cli(&["--headless"]), false, Some("uuid:A")), LaunchChoice::Saved("uuid:A".into()));
+        assert_eq!(launch_choice(&cli(&["--headless"]), false, None), LaunchChoice::Nothing);
+    }
+
+    #[test]
+    fn a_headless_run_in_a_terminal_asks_unless_told_not_to() {
+        let saved = Some("uuid:A");
+        assert_eq!(launch_choice(&cli(&["--headless"]), true, saved), LaunchChoice::Ask);
+        assert_eq!(
+            launch_choice(&cli(&["--headless", "--no-interactive"]), true, saved),
+            LaunchChoice::Saved("uuid:A".into())
+        );
+        // The window is where a GUI run picks, terminal or not.
+        assert_eq!(launch_choice(&cli(&[]), true, saved), LaunchChoice::Saved("uuid:A".into()));
+    }
+
+    #[test]
+    fn player_names_the_speaker_whatever_else_holds() {
+        for terminal in [false, true] {
+            assert_eq!(
+                launch_choice(&cli(&["--headless", "--player", "Kitchen"]), terminal, Some("uuid:A")),
+                LaunchChoice::Wish("Kitchen".into())
+            );
+        }
     }
 }
