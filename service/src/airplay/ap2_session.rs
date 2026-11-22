@@ -1878,6 +1878,70 @@ mod tests {
         assert_eq!(common_codec(&[with_cn(vec![0]), with_cn(vec![1])]), None);
     }
 
+    /// Windows refuses to start a program whose load-time imports are
+    /// missing, and N editions have no Media Foundation unless the Media
+    /// Feature Pack is installed. A Media Foundation function called through
+    /// the `windows` crate is linked as such an import, so the AAC encoder
+    /// must find them at run time instead. This guards the source: every
+    /// name taken from `windows::Win32::Media::MediaFoundation` must be an
+    /// interface, constant or type, never a function.
+    #[test]
+    fn media_foundation_functions_are_never_linked() {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        /// Interfaces start with `IMF`; constants, GUIDs and structs carry an
+        /// underscore or are all capitals. Functions are the rest.
+        fn function_shaped(name: &str) -> bool {
+            !name.starts_with("IMF") && !name.contains('_') && name.chars().any(|c| c.is_ascii_lowercase())
+        }
+        let mut files = Vec::new();
+        rust_files(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        assert!(files.len() > 20, "found only {} source files", files.len());
+        let mut bad = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let code: String = text.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+            let mut rest = code.as_str();
+            while let Some(at) = rest.find("MediaFoundation") {
+                rest = &rest[at + "MediaFoundation".len()..];
+                let after = rest.trim_start();
+                let Some(path) = after.strip_prefix("::") else {
+                    // `MediaFoundation as m` or a bare module import would
+                    // hide the names used through it.
+                    if after.starts_with("as ") || after.starts_with(';') || after.starts_with(',') {
+                        bad.push(format!("{}: imports the module itself", file.display()));
+                    }
+                    continue;
+                };
+                let path = path.trim_start();
+                let names: Vec<&str> = if let Some(group) = path.strip_prefix('{') {
+                    let end = group.find('}').unwrap_or(group.len());
+                    group[..end].split(',').map(|n| n.split_whitespace().next().unwrap_or("")).collect()
+                } else {
+                    vec![path.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '*')).next().unwrap_or("")]
+                };
+                for name in names.into_iter().filter(|n| !n.is_empty()) {
+                    if name == "*" || name == "self" || function_shaped(name) {
+                        bad.push(format!("{}: {name}", file.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "Media Foundation functions linked at load time: look them up at run time, as aac_mf.rs \
+             does (if one of these is a type, not a function, teach `function_shaped` about it): {bad:#?}"
+        );
+    }
+
     #[test]
     fn ap2_header_layout() {
         let h = ap2_rtp_header(0x1234, 0xAABBCCDD, 0x01020304, true);
