@@ -107,7 +107,7 @@ stale name. `scripts\Rename-Endpoint.ps1`, run elevated, overwrites it
 |---|---|
 | *(none)* | GUI window + tray. Closing the window minimises to tray. |
 | `--no-tray` | GUI only. Closing the window exits. |
-| `--headless` | No GUI; speaker via `--player` or the terminal picker. For service installs and SSH; `--web-link` prints the web UI's link. |
+| `--headless` | No GUI; the speaker from last time, `--player`, or (in a terminal) a prompt. For service installs and SSH; `--web-link` prints the web UI's link. |
 | `--web` | Adds the web UI and HTTP/JSON API, behind a secret link ([HTTP API](#http-api)). Combines with any mode; with `--headless` the link is printed once at start, to a console that a service may not have. |
 | `--web-link` | Prints the web UI's link and exits (making its key if there is none yet). Run it as the account the app runs under, with the app's `--port` and `--advertise-ip`. |
 
@@ -118,9 +118,13 @@ only under `--web`.
 
 ## Speaker selection
 
-The GUI and tray lists update as discovery runs. `--player` takes a name
-substring or an IPv4 literal; `--list-speakers` prints and exits. Without
-`--player`, `--headless` on a TTY offers a numbered prompt. Under `--web`,
+The GUI and tray lists update as discovery runs. `--player` takes a
+speaker's address or part of its name (any kind of speaker, or a room in a
+Sonos group); the app starts anyway and connects when that speaker is
+listed, unless someone picks another first. `--list-speakers` searches,
+prints what the window would list and exits. Without `--player`, the
+speaker used last time is reconnected; `--headless` in a terminal asks with
+a numbered prompt instead (`r` searches again). Under `--web`,
 `POST /api/select` with `{"id": "<udn-or-ip>"}` and the API key
 ([HTTP API](#http-api)). Discovery re-runs every `--ssdp-interval` minutes.
 

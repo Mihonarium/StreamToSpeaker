@@ -23,18 +23,20 @@ The binary lands at `target/release/stream-to-speaker.exe`.
 ## Run
 
 ```powershell
-# Interactive picker: lists discovered speakers and prompts.
+# The window and the tray icon: the usual way to run it.
 stream-to-speaker
 
-# Headless without the terminal prompt — useful in scripts and services:
-# reconnects to the speaker saved last time
+# No window, for services and terminals. In a terminal it asks which
+# speaker to use; otherwise it reconnects to the speaker used last time.
+stream-to-speaker --headless
 stream-to-speaker --headless --no-interactive
 
-# Target a specific speaker by name or IP
+# Play on a particular speaker (any kind), by part of its name or its
+# address, as soon as it is found
 stream-to-speaker --player "Living Room"
 stream-to-speaker --player 192.168.1.50
 
-# Print discovered speakers and exit
+# Search for speakers, print them and exit
 stream-to-speaker --list-speakers
 
 # Force the kernel driver (will error if not installed)

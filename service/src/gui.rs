@@ -1897,6 +1897,17 @@ impl StreamToSpeakerApp {
             )
         } else {
             match (&current, enabled, active) {
+            // Started with --player: waiting for that speaker to be found.
+            (None, _, _) if self.app.wished_speaker().is_some() => (
+                "⟳",
+                p.warn,
+                format!("Looking for “{}”…", self.app.wished_speaker().unwrap_or_default()),
+                "It connects as soon as a speaker by that name or address is found. Or pick one from \
+                 the list below."
+                    .to_string(),
+                None,
+                None,
+            ),
             (None, _, _) => (
                 "?",
                 p.muted,

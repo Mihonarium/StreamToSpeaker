@@ -609,6 +609,10 @@ pub struct App {
     /// [`select_speaker`]: App::select_speaker
     user_picks: AtomicU64,
 
+    /// What `--player` named, while the app waits for a speaker matching
+    /// it (see [`App::connect_when_listed`]).
+    wished_speaker: Mutex<Option<String>>,
+
     /// The stream gate for `/stream.raw` (see `stream_gate.rs`): no device
     /// but this PC while streaming is disabled, and with privacy mode on
     /// only the speaker being played on. Sessions hold grants in it; the
@@ -941,6 +945,7 @@ impl App {
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
             user_picks: AtomicU64::new(0),
+            wished_speaker: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
             sendspin: Default::default(),
             manual_resolved: Mutex::new(std::collections::HashMap::new()),
@@ -3899,6 +3904,90 @@ impl App {
             .ok();
     }
 
+    /// The listed speaker `query` names, as `--player` documents it: its
+    /// address, else the first whose name contains it (any letter case),
+    /// else a Sonos group one of whose rooms it names. Every kind of
+    /// speaker counts, hidden ones too: naming one is choosing it.
+    pub fn find_listed_speaker(&self, query: &str) -> Option<String> {
+        let rows = self.speaker_view_opts(true).speakers;
+        // An address matches whole, with or without the port a speaker
+        // added by address is listed with.
+        let at = |addr: &str| addr == query || addr.strip_prefix(query).is_some_and(|rest| rest.starts_with(':'));
+        if let Some(r) = rows.iter().find(|r| at(&r.ip)) {
+            return Some(r.id.clone());
+        }
+        let q = query.to_lowercase();
+        if let Some(r) = rows.iter().find(|r| r.friendly_name.to_lowercase().contains(&q)) {
+            return Some(r.id.clone());
+        }
+        let group = self.discovery.as_ref()?.find(query)?.stable_id();
+        rows.iter().any(|r| r.id == group).then_some(group)
+    }
+
+    /// What `--player` named, while the app is waiting for it.
+    pub fn wished_speaker(&self) -> Option<String> {
+        self.wished_speaker.lock().unwrap().clone()
+    }
+
+    /// `--player`: connect to the speaker `query` names (see
+    /// [`App::find_listed_speaker`]) as soon as it is listed, unless the
+    /// user picks a speaker first. Each time it appears it is tried once,
+    /// without a PIN prompt; the wait ends when a speaker plays or the user
+    /// picks one.
+    pub fn connect_when_listed(self: &Arc<Self>, query: String) {
+        self.connect_when_listed_every(query, Duration::from_secs(1));
+    }
+
+    /// [`App::connect_when_listed`], looking every `poll`.
+    pub(crate) fn connect_when_listed_every(self: &Arc<Self>, query: String, poll: Duration) {
+        let picks_seen = self.user_pick_count();
+        info!("--player {:?}: connecting when a speaker by that name or address is found", query);
+        *self.wished_speaker.lock().unwrap() = Some(query.clone());
+        let named = query.clone();
+        let app = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("stream-to-speaker-player-wish".into())
+            .spawn(move || {
+                // The speaker tried during its current appearance in the list.
+                let mut tried: Option<String> = None;
+                loop {
+                    if app.user_pick_count() != picks_seen {
+                        info!("--player {:?}: a speaker was picked; no longer waiting", query);
+                        break;
+                    }
+                    let connecting = app.connecting_to().is_some();
+                    if tried.is_some() && !connecting && app.is_speaker_bound() {
+                        break;
+                    }
+                    match app.find_listed_speaker(&query) {
+                        None => tried = None,
+                        Some(id) if tried.as_deref() != Some(id.as_str()) && !connecting => {
+                            info!("--player {:?}: found {:?}; connecting", query, id);
+                            app.connect_unless_user_picked(&id, picks_seen);
+                            tried = Some(id);
+                        }
+                        Some(_) => {}
+                    }
+                    if !app.sleep_unless_shutdown(poll) {
+                        break;
+                    }
+                }
+                *app.wished_speaker.lock().unwrap() = None;
+            });
+        if let Err(e) = spawned {
+            *self.wished_speaker.lock().unwrap() = None;
+            self.record_error(format!("Couldn't start looking for the speaker \"{}\" (--player): {}", named, e));
+        }
+    }
+
+    /// Look for Sendspin speakers (when Sendspin is on in the settings)
+    /// without offering this PC's sound to Music Assistant: for listing
+    /// the speakers while another copy of the app may be running.
+    pub fn browse_sendspin_speakers(&self) {
+        self.sendspin.discovery_allowed.store(true, Ordering::SeqCst);
+        self.sync_sendspin_discovery();
+    }
+
     // -------------------------------------------------------------------
     // Shutdown
     // -------------------------------------------------------------------
@@ -4788,6 +4877,65 @@ mod tests {
         let link = app.web_link().expect("the web UI is on");
         let rest = link.strip_prefix("http://").unwrap();
         rest[..rest.find("/r/").unwrap()].to_string()
+    }
+
+    #[test]
+    fn player_finds_any_kind_of_speaker_by_name_or_address() {
+        let app = test_app();
+        let kitchen = app.add_manual_speaker(ManualKind::AirPlay, "Kitchen", "192.168.1.30", "").unwrap();
+        let den = app
+            .add_manual_speaker(ManualKind::Upnp, "Den", "http://192.168.1.31:49152/desc.xml", "")
+            .unwrap();
+        assert_eq!(app.find_listed_speaker("kitchen").as_deref(), Some(kitchen.as_str()));
+        assert_eq!(app.find_listed_speaker("KITCH").as_deref(), Some(kitchen.as_str()));
+        assert_eq!(app.find_listed_speaker("192.168.1.30").as_deref(), Some(kitchen.as_str()));
+        assert_eq!(app.find_listed_speaker("192.168.1.31").as_deref(), Some(den.as_str()));
+        assert_eq!(app.find_listed_speaker("Bathroom"), None);
+        assert_eq!(app.find_listed_speaker("192.168.1.3"), None, "an address matches whole");
+        // Hidden speakers count: --player names one on purpose.
+        let mut hidden = app.speaker_settings(&den);
+        hidden.hidden = true;
+        app.set_speaker_settings(&den, hidden);
+        assert_eq!(app.find_listed_speaker("den").as_deref(), Some(den.as_str()));
+    }
+
+    /// Wait for `cond`, polling; false after `PATIENCE`.
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        cond()
+    }
+
+    #[test]
+    fn a_player_wish_waits_for_its_speaker_and_then_connects() {
+        let app = test_app();
+        app.connect_when_listed_every("Den".into(), Duration::from_millis(5));
+        assert_eq!(app.wished_speaker().as_deref(), Some("Den"));
+        // Nothing by that name yet: no attempt, still waiting.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(app.current_error(), None);
+        // It appears (nothing answers there, so the connect fails at once).
+        app.add_manual_speaker(ManualKind::Upnp, "Den", "http://127.0.0.1:9/desc.xml", "").unwrap();
+        assert!(
+            eventually(|| app.current_error().is_some_and(|e| e.starts_with("Couldn't connect"))),
+            "no connect attempt: {:?}",
+            app.current_error()
+        );
+        // Still listed and already tried: it waits for it to come back.
+        assert_eq!(app.wished_speaker().as_deref(), Some("Den"));
+    }
+
+    #[test]
+    fn a_player_wish_gives_way_to_the_users_pick() {
+        let app = test_app();
+        app.connect_when_listed_every("Den".into(), Duration::from_millis(5));
+        app.note_user_pick();
+        assert!(eventually(|| app.wished_speaker().is_none()), "still waiting after the user picked");
     }
 
     #[test]
