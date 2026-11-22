@@ -50,6 +50,12 @@ shows a 6-digit code to type in there. After that, select *Music Assistant* in
 the speaker list to send the PC's audio there; it gets audio only while that is
 selected. Music Assistant chooses the speaker: set *Automatically play line-in
 on* in this computer's player settings there, or play the input from Browse.
+Music Assistant finds the computer by itself only on the same network. If it
+runs on another one (another VLAN or subnet), add the computer's address, shown
+in the card while it waits, under *Manual IP addresses for discovery* in the
+Sendspin provider's settings in Music Assistant; it then connects to port 8928
+on the computer, so that port must be free and a firewall between the networks
+must let the connection through.
 
 Closing the window minimises to the tray; quit from the tray menu.
 

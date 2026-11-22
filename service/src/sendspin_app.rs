@@ -139,6 +139,75 @@ impl Drop for MaOutputSession {
     }
 }
 
+/// Most addresses offered for a Music Assistant on another network.
+const MA_ADDRESSES: usize = 3;
+
+/// The addresses to give a Music Assistant on another network for this
+/// computer, most likely first: `first` (the address that names this
+/// computer to other devices: the one given with `--advertise-ip`, the
+/// discovery adapter's, the default route's…), then this computer's other
+/// IPv4 addresses (`local`); [`MA_ADDRESSES`] at most, and never loopback,
+/// link-local, unspecified, multicast or broadcast.
+pub fn addresses_for_music_assistant(first: IpAddr, local: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+    let usable = |ip: &Ipv4Addr| {
+        !(ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
+    };
+    let first = match first {
+        IpAddr::V4(v4) => Some(v4),
+        IpAddr::V6(_) => None,
+    };
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    for ip in first.into_iter().chain(local.iter().copied()).filter(usable) {
+        if !out.contains(&ip) && out.len() < MA_ADDRESSES {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+/// What the Music Assistant card says, while it waits, to someone whose
+/// Music Assistant runs on another network, where it can't find this
+/// computer by itself: paragraphs, and the address to offer for copying
+/// (`None` when giving an address can't work now). `ports` is the port the
+/// input listens on and the one it was meant to; `addresses` from
+/// [`addresses_for_music_assistant`].
+pub fn music_assistant_elsewhere(ports: (u16, u16), addresses: &[Ipv4Addr]) -> (Vec<String>, Option<Ipv4Addr>) {
+    let (port, wanted) = ports;
+    if port != wanted {
+        return (
+            vec![format!(
+                "Port {wanted}, where Music Assistant connects when it is given an address, is in use \
+                 by another program, so this input listens on port {port}. Music Assistant on this \
+                 network still finds it by itself. For one on another network, close the program \
+                 that uses port {wanted}, then turn this input off and on."
+            )],
+            None,
+        );
+    }
+    let mut text = vec![
+        "Music Assistant finds this computer by itself only on the same network. If it runs on \
+         another one (another VLAN or subnet), open the Sendspin provider's settings in Music \
+         Assistant and add this computer's address under \u{201c}Manual IP addresses for \
+         discovery\u{201d}. Music Assistant then connects to it, and keeps trying until it gets \
+         through (a firewall between the networks has to let it)."
+            .to_string(),
+    ];
+    let Some((first, others)) = addresses.split_first() else {
+        text.push("This computer has no network address right now.".into());
+        return (text, None);
+    };
+    text.push(format!("This computer's address: {first}"));
+    if !others.is_empty() {
+        let others: Vec<String> = others.iter().map(Ipv4Addr::to_string).collect();
+        text.push(format!(
+            "If Music Assistant reaches this computer through another network adapter, use that \
+             one's address instead: {}.",
+            others.join(", ")
+        ));
+    }
+    (text, Some(*first))
+}
+
 /// Every pairing in `c` with a Music Assistant server or a Sendspin
 /// speaker: its id and key.
 fn paired_ids(c: &SendspinConfig) -> Vec<(String, String)> {
@@ -410,6 +479,19 @@ impl App {
 
     pub fn sendspin_source_state(&self) -> Option<SourceState> {
         self.sendspin.source.lock().unwrap().as_ref().map(|s| s.state())
+    }
+
+    /// The port the Music Assistant input listens on and the one it was
+    /// meant to (8928, where Music Assistant dials an address it is
+    /// given); `None` while the input is off.
+    pub fn sendspin_source_ports(&self) -> Option<(u16, u16)> {
+        self.sendspin.source.lock().unwrap().as_ref().map(|s| (s.port(), s.wanted_port()))
+    }
+
+    /// The addresses a Music Assistant on another network can be given for
+    /// this computer (see [`addresses_for_music_assistant`]).
+    pub fn music_assistant_addresses(&self) -> Vec<Ipv4Addr> {
+        addresses_for_music_assistant(self.this_pc_address(), &crate::ssdp::local_ipv4_interfaces())
     }
 
     /// The code to show while Music Assistant pairs with us: (code, server).
@@ -862,6 +944,51 @@ mod tests {
     fn ids() {
         assert!(is_sendspin_id("sendspin:kitchen"));
         assert!(!is_sendspin_id("airplay:aa"));
+    }
+
+    #[test]
+    fn music_assistant_elsewhere_is_offered_this_computers_own_addresses() {
+        let ip = |s: &str| -> Ipv4Addr { s.parse().unwrap() };
+        let local = [ip("10.0.0.5"), ip("169.254.3.4"), ip("192.168.1.20"), ip("172.16.0.9"), ip("127.0.0.1")];
+        // The address that names this PC first, then the others; three at
+        // most; no loopback or link-local, nothing twice.
+        assert_eq!(
+            addresses_for_music_assistant(IpAddr::V4(ip("192.168.1.20")), &local),
+            [ip("192.168.1.20"), ip("10.0.0.5"), ip("172.16.0.9")]
+        );
+        // No network: loopback is what names the PC then, and is no answer.
+        assert!(addresses_for_music_assistant(IpAddr::V4(Ipv4Addr::LOCALHOST), &[]).is_empty());
+        assert_eq!(
+            addresses_for_music_assistant("fe80::1".parse().unwrap(), &[ip("10.0.0.5")]),
+            [ip("10.0.0.5")]
+        );
+        for bad in ["0.0.0.0", "224.0.0.251", "255.255.255.255", "169.254.1.1"] {
+            assert!(addresses_for_music_assistant(IpAddr::V4(ip(bad)), &[]).is_empty(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_card_tells_music_assistant_elsewhere_what_it_needs() {
+        let ip = |s: &str| -> Ipv4Addr { s.parse().unwrap() };
+        let (text, copy) = music_assistant_elsewhere((8928, 8928), &[ip("192.168.1.20"), ip("10.0.0.5")]);
+        assert_eq!(copy, Some(ip("192.168.1.20")));
+        assert!(text[0].contains("\u{201c}Manual IP addresses for discovery\u{201d}"), "{}", text[0]);
+        assert_eq!(text[1], "This computer's address: 192.168.1.20");
+        assert!(text[2].ends_with("use that one's address instead: 10.0.0.5."), "{}", text[2]);
+        // Nothing says an entry may carry a port.
+        assert!(text.iter().all(|t| !t.contains(":8928")));
+        let (text, copy) = music_assistant_elsewhere((8928, 8928), &[ip("192.168.1.20")]);
+        assert_eq!((text.len(), copy), (2, Some(ip("192.168.1.20"))));
+        let (text, copy) = music_assistant_elsewhere((8928, 8928), &[]);
+        assert_eq!(copy, None);
+        assert_eq!(text[1], "This computer has no network address right now.");
+        // Another program holds the port: say which port is used, and that an
+        // address needs the usual one free; offer no address.
+        let (text, copy) = music_assistant_elsewhere((50123, 8928), &[ip("192.168.1.20")]);
+        assert_eq!(copy, None);
+        assert_eq!(text.len(), 1);
+        assert!(text[0].starts_with("Port 8928, where Music Assistant connects"), "{}", text[0]);
+        assert!(text[0].contains("listens on port 50123"), "{}", text[0]);
     }
 
     #[test]

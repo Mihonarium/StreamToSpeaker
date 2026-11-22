@@ -803,6 +803,7 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
                 homepod_latency_draft: None,
                 airplay_latency_draft: None,
                 speaker_latency_draft: None,
+                ma_addresses: None,
                 diagnostics_open: false,
                 diagnostics_copied_at: None,
                 web_link_copied_at: None,
@@ -847,6 +848,9 @@ struct StreamToSpeakerApp {
     airplay_latency_draft: Option<i64>,
     /// The same for a speaker's own AirPlay buffer: its id and value.
     speaker_latency_draft: Option<(String, i64)>,
+    /// This computer's addresses for a Music Assistant on another network,
+    /// and when they were looked up.
+    ma_addresses: Option<(Instant, Vec<std::net::Ipv4Addr>)>,
     /// The Diagnostics card is expanded (its counters are only gathered
     /// while it is).
     diagnostics_open: bool,
@@ -4355,7 +4359,9 @@ impl StreamToSpeakerApp {
             ui.add_space(sp::XS);
             use crate::sendspin::source::SourceState;
             let name = self.app.sendspin_source_name();
-            let (text, color) = match self.app.sendspin_source_state() {
+            let state = self.app.sendspin_source_state();
+            let waiting = matches!(state, Some(SourceState::Waiting) | None);
+            let (text, color) = match state {
                 Some(SourceState::Waiting) | None => (
                     format!(
                         "Waiting for Music Assistant. Enable the Sendspin Source plugin there; \
@@ -4390,6 +4396,9 @@ impl StreamToSpeakerApp {
                 Some(SourceState::Failed(e)) => (format!("Not available: {}", e), p.warn),
             };
             ui.label(egui::RichText::new(text).size(12.0).color(color));
+            if waiting {
+                self.show_music_assistant_elsewhere(ui, p);
+            }
             if let Some(note) = self.app.sendspin_source_note() {
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new(note).size(12.0).color(p.text_tertiary));
@@ -4454,6 +4463,42 @@ impl StreamToSpeakerApp {
                         .size(12.0)
                         .color(p.text_tertiary),
                 );
+            }
+        });
+    }
+}
+
+impl StreamToSpeakerApp {
+    /// While the Music Assistant input waits: what someone whose Music
+    /// Assistant runs on another network needs, folded away for everyone
+    /// else.
+    fn show_music_assistant_elsewhere(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(ports) = self.app.sendspin_source_ports() else { return };
+        ui.add_space(sp::XS);
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Music Assistant on another network?").size(12.0).color(p.text_tertiary),
+        )
+        .id_salt("ma-elsewhere")
+        .default_open(false)
+        .show(ui, |ui| {
+            // Looked up again every few seconds, not every frame.
+            let fresh = self.ma_addresses.as_ref().is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(3));
+            if !fresh {
+                self.ma_addresses = Some((Instant::now(), self.app.music_assistant_addresses()));
+            }
+            let addresses = self.ma_addresses.as_ref().map(|(_, a)| a.as_slice()).unwrap_or(&[]);
+            let (text, copy) = crate::sendspin_app::music_assistant_elsewhere(ports, addresses);
+            for paragraph in text {
+                ui.label(egui::RichText::new(paragraph).size(12.0).color(p.text_secondary));
+            }
+            if let Some(address) = copy {
+                ui.add_space(sp::XS);
+                if secondary_button(ui, p, "Copy address", 120.0)
+                    .on_hover_text("Copy this computer's address to paste into Music Assistant")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(address.to_string());
+                }
             }
         });
     }
