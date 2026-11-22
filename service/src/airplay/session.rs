@@ -63,9 +63,13 @@ fn merge_advertised_latency(setup: Option<u32>, record: Option<u32>) -> Option<u
 /// Configuration to spin up one AirPlay session.
 pub struct AirPlaySessionConfig {
     pub renderer: AirPlayRenderer,
-    /// Local IPv4 we'll bind UDP sockets to and advertise in SDP: this
-    /// PC's address on the receiver's network (or `--advertise-ip`).
-    pub local_ip: IpAddr,
+    /// The receiver's addresses to try, best first (see
+    /// [`crate::airplay::discovery::order_addresses`]), each with the
+    /// local address this PC uses toward it: the one UDP sockets are bound
+    /// to and SDP advertises (this PC's address on the receiver's
+    /// network, or `--advertise-ip`). The next is tried when the TCP
+    /// connection can't be made; at most [`MAX_ROUTES`].
+    pub routes: Vec<Route>,
     /// Subscription on the StreamHub — produces PcmFrame entries the
     /// audio thread consumes.
     pub samples_rx: Receiver<PcmFrame>,
@@ -96,6 +100,17 @@ pub struct AirPlaySessionConfig {
     /// receiver's advertised `Audio-Latency` is honoured as a floor.
     pub latency_ms: u32,
 }
+
+/// One way to reach a receiver: its address, and this PC's address
+/// toward it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Route {
+    pub receiver: IpAddr,
+    pub local: IpAddr,
+}
+
+/// Most of a receiver's addresses one connect tries.
+pub const MAX_ROUTES: usize = 3;
 
 /// Time limits of one AirPlay 1 connect and session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -463,7 +478,7 @@ impl AirPlaySession {
         })
     }
 
-    fn start_inner(cfg: AirPlaySessionConfig, progress: &Progress) -> Result<Self> {
+    fn start_inner(mut cfg: AirPlaySessionConfig, progress: &Progress) -> Result<Self> {
         info!(
             "AirPlay: starting session to {} ({}:{})",
             cfg.renderer.friendly_name, cfg.renderer.ip, cfg.renderer.port,
@@ -487,10 +502,16 @@ impl AirPlaySession {
             ));
         }
 
-        // Bind the three UDP sockets first so we know our ports for SETUP.
-        let audio_socket = bind_udp(cfg.local_ip).context("bind audio UDP")?;
-        let control_socket = bind_udp(cfg.local_ip).context("bind control UDP")?;
-        let timing_socket = bind_udp(cfg.local_ip).context("bind timing UDP")?;
+        // The first connection decides which of the receiver's addresses
+        // the session uses, and with it this PC's local address.
+        let (first, route) = connect_first(&cfg, progress)?;
+        cfg.renderer.ip = route.receiver;
+
+        // Bind the three UDP sockets before the handshake so we know our
+        // ports for SETUP.
+        let audio_socket = bind_udp(route.local).context("bind audio UDP")?;
+        let control_socket = bind_udp(route.local).context("bind control UDP")?;
+        let timing_socket = bind_udp(route.local).context("bind timing UDP")?;
         let audio_port = audio_socket.local_addr()?.port();
         let control_port = control_socket.local_addr()?.port();
         let timing_port = timing_socket.local_addr()?.port();
@@ -538,6 +559,8 @@ impl AirPlaySession {
         let timeouts = cfg.timeouts;
         let bringup = Bringup {
             cfg: &cfg,
+            route,
+            first: std::cell::RefCell::new(Some(first)),
             progress,
             control_port,
             timing_port,
@@ -729,7 +752,7 @@ impl AirPlaySession {
 
         info!(
             "AirPlay: session up — {} ↔ {}:{} (RTSP), audio → {}:{}, control → :{}, timing → :{}",
-            cfg.local_ip,
+            route.local,
             cfg.renderer.ip,
             cfg.renderer.port,
             cfg.renderer.ip,
@@ -903,6 +926,10 @@ impl AttemptFailure {
 /// What every attempt of one connect shares.
 struct Bringup<'a> {
     cfg: &'a AirPlaySessionConfig,
+    /// The address the first connection reached.
+    route: Route,
+    /// That connection, for the first attempt.
+    first: std::cell::RefCell<Option<RtspClient>>,
     progress: &'a Progress,
     control_port: u16,
     timing_port: u16,
@@ -926,24 +953,11 @@ impl Bringup<'_> {
             note_left_session(&id);
             AttemptFailure::new(error, true, true)
         };
-        // Password-protected receivers get RTSP Digest credentials;
-        // the gen-1 AirPort Express (no `am` model) uses the iTunes
-        // digest quirk (username "iTunes" + uppercase hex).
-        let mut rtsp = self
-            .progress
-            .waiting(t.opener, || {
-                RtspClient::connect_auth(
-                    cfg.renderer.ip,
-                    cfg.renderer.port,
-                    cfg.local_ip,
-                    t.opener,
-                    cfg.password.clone(),
-                    cfg.renderer.model.is_none(),
-                )
-            })
-            .context("opening RTSP connection")
-            .map_err(|e| fail(e, false))?;
-        rtsp.set_teardown_limit(t.teardown);
+        let first = self.first.borrow_mut().take();
+        let mut rtsp = match first {
+            Some(c) => c,
+            None => connect(cfg, self.route, self.progress).map_err(|e| fail(e, false))?,
+        };
         let (cipher, opener) = self.open(&mut rtsp, how).map_err(|e| fail(e, true))?;
 
         let reply = t.reply;
@@ -1041,6 +1055,52 @@ impl Bringup<'_> {
         };
         Ok((cipher, opener))
     }
+}
+
+/// Open an RTSP connection to the receiver over `route`.
+fn connect(cfg: &AirPlaySessionConfig, route: Route, progress: &Progress) -> Result<RtspClient> {
+    let t = cfg.timeouts;
+    // Password-protected receivers get RTSP Digest credentials;
+    // the gen-1 AirPort Express (no `am` model) uses the iTunes
+    // digest quirk (username "iTunes" + uppercase hex).
+    let mut rtsp = progress
+        .waiting(t.opener, || {
+            RtspClient::connect_auth(
+                route.receiver,
+                cfg.renderer.port,
+                route.local,
+                t.opener,
+                cfg.password.clone(),
+                cfg.renderer.model.is_none(),
+            )
+        })
+        .context("opening RTSP connection")?;
+    rtsp.set_teardown_limit(t.teardown);
+    Ok(rtsp)
+}
+
+/// The first connection of a connect: the receiver's addresses in
+/// order, the next one tried while the TCP connection can't be made.
+fn connect_first(cfg: &AirPlaySessionConfig, progress: &Progress) -> Result<(RtspClient, Route)> {
+    let mut failed: Vec<String> = Vec::new();
+    for &route in cfg.routes.iter().take(MAX_ROUTES) {
+        match connect(cfg, route, progress) {
+            Ok(c) => {
+                if !failed.is_empty() {
+                    info!("AirPlay: reached {} at {} ({})", cfg.renderer.friendly_name, route.receiver, failed.join("; "));
+                }
+                return Ok((c, route));
+            }
+            Err(e) => {
+                warn!("AirPlay: couldn't reach {} at {} ({:#})", cfg.renderer.friendly_name, route.receiver, e);
+                failed.push(format!("not at {}: {:#}", route.receiver, e));
+            }
+        }
+    }
+    if failed.is_empty() {
+        anyhow::bail!("no address to reach {} at", cfg.renderer.friendly_name);
+    }
+    anyhow::bail!("{}", failed.join("; "))
 }
 
 /// Log an OPTIONS answer other than 200. The handshake goes on either
@@ -1626,6 +1686,38 @@ mod tests {
         assert_eq!(methods(&rx)[..5], ["0 /auth-setup", "0 ANNOUNCE", "0 SETUP", "0 TEARDOWN", "1 /auth-setup"]);
         let gap = rx.connected_at(1).unwrap().duration_since(rx.closed_at(0).unwrap());
         assert!(gap + Duration::from_millis(50) >= quick().retry_pause, "{:?}", gap);
+    }
+
+    /// A receiver that can't be reached at its first address is tried at
+    /// the next one, and the session uses the address that answered.
+    #[test]
+    fn a_connect_tries_the_next_address_when_the_first_refuses() {
+        let rx = FakeRaop::start(|_| Answer::Normal);
+        let (_tx, samples) = crossbeam_channel::unbounded();
+        let mut cfg = config(receiver(&rx, "0B0000000030", &[0, 1]), samples);
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        // Nothing listens at 127.0.0.2 (the receiver is bound to 127.0.0.1).
+        cfg.routes = vec![Route { receiver: "127.0.0.2".parse().unwrap(), local }, Route { receiver: local, local }];
+        cfg.timeouts = quick();
+        let session = AirPlaySession::start(cfg).expect("reached at the second address");
+        assert_eq!(session.renderer.ip, local);
+        session.stop();
+        assert_eq!(rx.requests()[0].method, "OPTIONS");
+    }
+
+    #[test]
+    fn a_connect_tries_three_addresses_at_most() {
+        let (_tx, samples) = crossbeam_channel::unbounded();
+        let rx = FakeRaop::start(|_| Answer::Normal);
+        let mut cfg = config(receiver(&rx, "0B0000000031", &[0, 1]), samples);
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        let nowhere = |n: u8| Route { receiver: IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, n)), local };
+        cfg.routes = vec![nowhere(2), nowhere(3), nowhere(4), Route { receiver: local, local }];
+        cfg.timeouts = quick();
+        let err = AirPlaySession::start(cfg).err().expect("the fourth address isn't tried");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("127.0.0.2") && msg.contains("127.0.0.3") && msg.contains("127.0.0.4"), "{msg}");
+        assert!(rx.requests().is_empty());
     }
 
     #[test]

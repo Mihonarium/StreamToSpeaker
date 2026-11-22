@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::airplay::discovery::{AirPlayRenderer, FEAT_AUDIO, FEAT_TRANSIENT_PAIRING};
 use crate::airplay::fake_raop::{Answer, Event, FakeRaop, Reply, Request};
-use crate::airplay::session::{AirPlaySession, AirPlaySessionConfig, RaopTimeouts};
+use crate::airplay::session::{AirPlaySession, AirPlaySessionConfig, RaopTimeouts, Route};
 
 /// A receiver record pointing at `rx`.
 pub(crate) fn receiver(rx: &FakeRaop, mac: &str, et: &[u8]) -> AirPlayRenderer {
@@ -42,9 +42,10 @@ pub(crate) fn receiver(rx: &FakeRaop, mac: &str, et: &[u8]) -> AirPlayRenderer {
 
 /// The session settings the app uses, for `renderer`.
 pub(crate) fn config(renderer: AirPlayRenderer, samples: crossbeam_channel::Receiver<crate::http_server::PcmFrame>) -> AirPlaySessionConfig {
+    let routes = vec![Route { receiver: renderer.ip, local: "127.0.0.1".parse::<IpAddr>().unwrap() }];
     AirPlaySessionConfig {
         renderer,
-        local_ip: "127.0.0.1".parse::<IpAddr>().unwrap(),
+        routes,
         samples_rx: samples,
         initial_volume: Some(80),
         timeouts: RaopTimeouts::STANDARD,

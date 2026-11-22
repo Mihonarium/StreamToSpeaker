@@ -2475,6 +2475,14 @@ impl App {
                     .airplay_discovery
                     .as_deref()
                     .ok_or_else(|| SelectFailure::Msg("AirPlay discovery disabled".to_string()))?;
+                if let Some(addrs) = discovery.identity_conflict(id) {
+                    let addrs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+                    return Err(SelectFailure::Msg(format!(
+                        "Several different devices on the network ({}) claim to be this speaker, so none was \
+                         picked automatically. Pick the entry with the right address from the speaker list.",
+                        addrs.join(", ")
+                    )));
+                }
                 let Some(renderer) = discovery.find_by_id(id) else {
                     return Err(SelectFailure::Msg(format!("no AirPlay speaker with id {:?}", id)));
                 };
@@ -2671,6 +2679,17 @@ impl App {
                         uc.speaker_settings.get(&stable_id).and_then(|s| s.airplay_opener),
                     )
                 };
+                // The receiver's other announced addresses, tried in turn
+                // when the TCP connection can't be made.
+                let mut routes = vec![crate::airplay::session::Route { receiver: renderer.ip, local: local_ip }];
+                for &other in renderer.raop.addresses.iter().filter(|a| **a != renderer.ip) {
+                    if routes.len() >= crate::airplay::session::MAX_ROUTES {
+                        break;
+                    }
+                    if let Ok(local) = self.local_ip_toward(other) {
+                        routes.push(crate::airplay::session::Route { receiver: other, local });
+                    }
+                }
                 // A connect that takes long says what it waits for, in
                 // the notice the connecting banner clears when it ends.
                 let name = renderer.friendly_name.clone();
@@ -2678,7 +2697,7 @@ impl App {
                 let session = AirPlaySession::start_with_notices(
                     AirPlaySessionConfig {
                         renderer,
-                        local_ip,
+                        routes,
                         samples_rx,
                         initial_volume: Some(self.airplay_start_volume()),
                         timeouts: crate::airplay::session::RaopTimeouts::STANDARD,
@@ -2698,6 +2717,9 @@ impl App {
                     self.set_speaker_settings(&stable_id, settings);
                 }
                 let session = session.map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
+                if let Some(d) = self.airplay_discovery.as_deref() {
+                    d.note_working_address(&session.renderer.mac_id, session.renderer.ip);
+                }
                 Ok(ActiveSession::AirPlay(session))
             }
             Transport::AirPlay2 => {
@@ -2734,7 +2756,12 @@ impl App {
                     homepod_realtime,
                     homepod_latency_ms,
                 }) {
-                    Ok(session) => Ok(ActiveSession::AirPlay2(session)),
+                    Ok(session) => {
+                        if let Some(d) = self.airplay_discovery.as_deref() {
+                            d.note_working_address(&session.renderer.mac_id, addr);
+                        }
+                        Ok(ActiveSession::AirPlay2(session))
+                    }
                     Err(e) => Err(ap2_attempt_error(e, addr)),
                 }
             }
