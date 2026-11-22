@@ -606,7 +606,7 @@ pub struct App {
     settings_health: crate::user_config::SaveHealth,
     /// What loading the settings found that the window says once, until
     /// dismissed.
-    settings_notice: Mutex<Option<String>>,
+    settings_notice: Mutex<Option<crate::user_config::LoadNotice>>,
     /// When a failed save was last tried again (see
     /// [`App::retry_settings_save_if_due`]).
     settings_retry_at: Mutex<Option<Instant>>,
@@ -972,7 +972,7 @@ impl App {
             last_rescan_count: Arc::new(AtomicUsize::new(0)),
             stream_gate,
             settings_health: user_config.save_health(),
-            settings_notice: Mutex::new(user_config.load_notice().describe()),
+            settings_notice: Mutex::new(Some(user_config.load_notice().clone()).filter(|n| !n.is_empty())),
             settings_retry_at: Mutex::new(None),
             user_config: crate::user_config::SettingsCell::new(user_config),
             last_error: Mutex::new(None),
@@ -1033,7 +1033,10 @@ impl App {
     /// dismissed.
     pub fn settings_attention(&self) -> (Option<String>, Option<String>) {
         let problem = self.settings_health.problem().map(|p| p.describe());
-        (problem, self.settings_notice.lock().unwrap().clone())
+        let notice = self.settings_notice.lock().unwrap().clone();
+        // Speakers by the names the app has for them now (discovery may
+        // find one a moment after the start).
+        (problem, notice.and_then(|n| n.describe(&|id| self.speaker_name(id))))
     }
 
     /// While the last save failed (not while the file is left alone on
@@ -7224,8 +7227,8 @@ mod tests {
         let (problem, notice) = app.settings_attention();
         assert_eq!(problem, None);
         let notice = notice.unwrap();
-        assert!(notice.starts_with("Some settings couldn't be read and are back to their defaults: \
-             prefer_realtime_airplay."), "{notice}");
+        assert!(notice.starts_with("Some settings couldn't be read and were reset or left out: \
+             AirPlay 2 stream mode."), "{notice}");
         app.dismiss_settings_notice();
         assert_eq!(app.settings_attention(), (None, None));
         let _ = std::fs::remove_dir_all(&dir);

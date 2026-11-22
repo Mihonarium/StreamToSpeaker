@@ -842,8 +842,10 @@ impl LoadNotice {
     }
 
     /// What to tell the person, in a few sentences; `None` when there is
-    /// nothing. File names are given without their folder.
-    pub fn describe(&self) -> Option<String> {
+    /// nothing. File names are given without their folder; settings by the
+    /// window's words, speakers by the names `name_of` knows for their ids
+    /// (the key paths are in the log).
+    pub fn describe(&self, name_of: &dyn Fn(&str) -> Option<String>) -> Option<String> {
         let name = |p: &PathBuf| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut out: Vec<String> = Vec::new();
         if self.restored_from_backup {
@@ -869,9 +871,17 @@ impl LoadNotice {
         }
         if !self.reset.is_empty() {
             const SHOWN: usize = 4;
-            let mut keys: Vec<String> = self.reset.iter().take(SHOWN).map(|p| p.join(" › ")).collect();
-            if self.reset.len() > SHOWN {
-                keys.push(format!("and {} more", self.reset.len() - SHOWN));
+            let mut labels: Vec<String> = Vec::new();
+            for p in &self.reset {
+                let label = reset_label(p, name_of);
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+            let more = labels.len().saturating_sub(SHOWN);
+            labels.truncate(SHOWN);
+            if more > 0 {
+                labels.push(format!("and {more} more"));
             }
             let kept = self
                 .reset_kept_as
@@ -879,11 +889,72 @@ impl LoadNotice {
                 .map(|k| format!(" The file as it was is kept as {} in the settings folder.", name(k)))
                 .unwrap_or_default();
             out.push(format!(
-                "Some settings couldn't be read and are back to their defaults: {}.{kept}",
-                keys.join(", ")
+                "Some settings couldn't be read and were reset or left out: {}.{kept}",
+                labels.join("; ")
             ));
         }
         (!out.is_empty()).then(|| out.join(" "))
+    }
+}
+
+/// The window's words for a top-level setting, `None` for a key this
+/// version doesn't have.
+fn setting_label(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "last_speaker_id" => "The speaker used last",
+        "onboarding_dismissed" => "The welcome card",
+        "always_minimise_to_tray" => "Always minimise to the tray",
+        "donation_prompt_hidden_until" => "The donation reminder",
+        "auto_reconnect_on_launch" => "Auto-connect when the app launches",
+        "prefer_realtime_airplay" => "AirPlay 2 stream mode",
+        "auto_reconnect_on_drop" => "Reconnect automatically if the connection drops",
+        "airplay_mfi_encryption" => "AirPlay MFi encryption",
+        "airplay_passwords" => "AirPlay passwords",
+        "airplay_pairings" => "PIN pairings with AirPlay devices",
+        "airplay_controller_id" | "airplay_controller_seed_hex" => "This PC's AirPlay pairing identity",
+        "web_secret" => "The web remote's link",
+        "forward_now_playing" => "Show now-playing on the speaker",
+        "airplay_uncompressed_alac" => "AirPlay uncompressed audio",
+        "privacy_mode" => "Privacy mode",
+        "airplay_latency_ms" => "AirPlay buffer",
+        "airplay_homepod_buffered" => "HomePod buffered stream",
+        "airplay_homepod_latency_ms" => "HomePod delay",
+        "check_for_updates" => "Check for updates",
+        "update_last_check_unix"
+        | "update_latest_tag"
+        | "update_latest_url"
+        | "update_skipped_tag"
+        | "update_banner_hidden_until" => "The update check",
+        "sendspin" => "Sendspin and Music Assistant",
+        "manual_speakers" => "Speakers added by address",
+        "discovery_adapter" => "Discovery network adapter",
+        "speaker_settings" => "Speaker settings",
+        "equalizer" => "Equalizer",
+        _ => return None,
+    })
+}
+
+/// The window's words for the setting at `path` that was reset or left
+/// out: the section, and for a speaker's own setting, password or pairing
+/// the speaker's name (from `name_of`) with what it was.
+fn reset_label(path: &[String], name_of: &dyn Fn(&str) -> Option<String>) -> String {
+    let speaker = |id: &str| name_of(id).unwrap_or_else(|| "A speaker".into());
+    let key = path.first().map(String::as_str).unwrap_or_default();
+    match (key, path.get(1), path.get(2).map(String::as_str)) {
+        ("speaker_settings", Some(id), field) => {
+            let what = match field {
+                Some("hidden") => "Hide this speaker from the list",
+                Some("auto_connect") => "Connect automatically",
+                Some("airplay_latency_ms") => "Own AirPlay buffer",
+                Some("upnp_stream_profile") => "The stream format it last played",
+                _ => "its settings",
+            };
+            format!("{}: {what}", speaker(id))
+        }
+        ("airplay_passwords", Some(id), _) => format!("{}: AirPlay password", speaker(id)),
+        ("airplay_pairings", Some(id), _) => format!("{}: PIN pairing", speaker(id)),
+        ("manual_speakers", Some(_), _) => "A speaker added by address".into(),
+        _ => setting_label(key).unwrap_or("A setting from a newer version").into(),
     }
 }
 
@@ -2195,44 +2266,71 @@ mod tests {
         }
     }
 
+    fn no_names(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn every_setting_has_a_name_the_window_uses() {
+        let defaults = serde_json::to_value(UserConfig::default()).unwrap();
+        for key in defaults.as_object().unwrap().keys() {
+            assert!(setting_label(key).is_some(), "{key} has no label for the reset notice");
+        }
+    }
+
     #[test]
     fn what_a_load_found_is_said_in_plain_words() {
         let kept = |n: &str| Some(PathBuf::from("/profile/StreamToSpeaker").join(n));
-        assert_eq!(LoadNotice::default().describe(), None);
+        assert_eq!(LoadNotice::default().describe(&no_names), None);
         let restored = LoadNotice {
             restored_from_backup: true,
             unusable_kept_as: kept("config.json.corrupt-5"),
             ..Default::default()
         };
         assert_eq!(
-            restored.describe().unwrap(),
+            restored.describe(&no_names).unwrap(),
             "Your settings file was damaged, so the app used its backup copy instead. The damaged \
              file is kept as config.json.corrupt-5 in the settings folder."
         );
         let missing = LoadNotice { restored_from_backup: true, ..Default::default() };
         assert_eq!(
-            missing.describe().unwrap(),
+            missing.describe(&no_names).unwrap(),
             "Your settings file was missing, so the app used its backup copy instead."
         );
         let all = LoadNotice { all_reset: true, unusable_kept_as: kept("config.json.corrupt-6"), ..Default::default() };
-        assert!(all.describe().unwrap().contains("started with default settings"));
-        assert!(all.describe().unwrap().ends_with("kept as config.json.corrupt-6 in the settings folder."));
+        assert!(all.describe(&no_names).unwrap().contains("started with default settings"));
+        assert!(all.describe(&no_names).unwrap().ends_with("kept as config.json.corrupt-6 in the settings folder."));
         let path = |p: &str| -> KeyPath { p.split('/').map(String::from).collect() };
         let some = LoadNotice {
-            reset: vec![path("prefer_realtime_airplay"), path("speaker_settings/uuid:a/auto_connect")],
+            reset: vec![
+                path("prefer_realtime_airplay"),
+                path("speaker_settings/uuid:RINCON_1/auto_connect"),
+                path("speaker_settings/uuid:RINCON_1/hidden"),
+                path("airplay_passwords/airplay:aa"),
+            ],
             reset_kept_as: kept("config.json.before-reset-7"),
             ..Default::default()
         };
+        let names = |id: &str| (id == "uuid:RINCON_1").then(|| "Kitchen".to_string());
         assert_eq!(
-            some.describe().unwrap(),
-            "Some settings couldn't be read and are back to their defaults: prefer_realtime_airplay, \
-             speaker_settings › uuid:a › auto_connect. The file as it was is kept as \
-             config.json.before-reset-7 in the settings folder."
+            some.describe(&names).unwrap(),
+            "Some settings couldn't be read and were reset or left out: AirPlay 2 stream mode; \
+             Kitchen: Connect automatically; Kitchen: Hide this speaker from the list; A speaker: \
+             AirPlay password. The file as it was is kept as config.json.before-reset-7 in the \
+             settings folder."
         );
-        let many = LoadNotice { reset: (0..6).map(|i| path(&format!("k{i}"))).collect(), ..Default::default() };
+        // The same label once; more than four: a count.
+        let many = LoadNotice {
+            reset: ["equalizer/bands_db", "equalizer/enabled", "sendspin/enabled", "manual_speakers/0", "privacy_mode", "web_secret", "update_latest_tag"]
+                .iter()
+                .map(|p| path(p))
+                .collect(),
+            ..Default::default()
+        };
         assert_eq!(
-            many.describe().unwrap(),
-            "Some settings couldn't be read and are back to their defaults: k0, k1, k2, k3, and 2 more."
+            many.describe(&no_names).unwrap(),
+            "Some settings couldn't be read and were reset or left out: Equalizer; Sendspin and Music \
+             Assistant; A speaker added by address; Privacy mode; and 2 more."
         );
     }
 
