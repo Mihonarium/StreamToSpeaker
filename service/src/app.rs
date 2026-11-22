@@ -610,6 +610,8 @@ pub struct App {
     /// When a failed save was last tried again (see
     /// [`App::retry_settings_save_if_due`]).
     settings_retry_at: Mutex<Option<Instant>>,
+    /// A retry's thread is running: no second one meanwhile.
+    settings_retrying: Arc<AtomicBool>,
 
     /// Most recent user-facing error message and when it was recorded.
     /// Surfaced by the GUI as a transient inline banner for ~8 s
@@ -974,6 +976,7 @@ impl App {
             settings_health: user_config.save_health(),
             settings_notice: Mutex::new(Some(user_config.load_notice().clone()).filter(|n| !n.is_empty())),
             settings_retry_at: Mutex::new(None),
+            settings_retrying: Arc::new(AtomicBool::new(false)),
             user_config: crate::user_config::SettingsCell::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
@@ -1044,20 +1047,36 @@ impl App {
     /// more, so a passing fault (a virus scanner holding the file, a share
     /// that was offline) heals by itself and the window's strip goes. The
     /// window calls this while it is open; without one, every later change
-    /// saves anyway. Whether it tried.
-    pub fn retry_settings_save_if_due(&self, now: Instant) -> bool {
+    /// saves anyway. The save runs on a thread of its own, so the window
+    /// never waits for the disk (nor for the brief retries of a refused
+    /// rename); its handle, when one was started.
+    pub fn retry_settings_save_if_due(self: &Arc<Self>, now: Instant) -> Option<std::thread::JoinHandle<()>> {
         if !matches!(self.settings_health.problem(), Some(crate::user_config::SaveProblem::Failed { .. })) {
-            return false;
+            return None;
         }
         {
             let mut last = self.settings_retry_at.lock().unwrap();
             if last.is_some_and(|t| now.saturating_duration_since(t) < SETTINGS_RETRY) {
-                return false;
+                return None;
+            }
+            if self.settings_retrying.swap(true, Ordering::SeqCst) {
+                return None;
             }
             *last = Some(now);
         }
-        self.user_config.lock().unwrap().save();
-        true
+        let app = Arc::clone(self);
+        let spawned = std::thread::Builder::new().name("settings-retry".into()).spawn(move || {
+            app.user_config.lock().unwrap().save();
+            app.settings_retrying.store(false, Ordering::SeqCst);
+        });
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                debug!("settings: couldn't start the retry ({e}); the next change saves");
+                self.settings_retrying.store(false, Ordering::SeqCst);
+                None
+            }
+        }
     }
 
     /// Whether settings saves aren't reaching `config.json` now (the last
@@ -7246,16 +7265,19 @@ mod tests {
         app.set_airplay_password("airplay:aa", "hunter2");
         assert!(app.settings_attention().0.is_some(), "the failure shows");
         let t0 = Instant::now();
-        assert!(app.retry_settings_save_if_due(t0), "tried at once");
-        assert!(!app.retry_settings_save_if_due(t0 + Duration::from_secs(1)), "not again so soon");
+        // Tried at once, on a thread of its own (the window doesn't wait).
+        let retry = app.retry_settings_save_if_due(t0).expect("tried at once");
+        assert_ne!(retry.thread().id(), std::thread::current().id());
+        retry.join().unwrap();
+        assert!(app.retry_settings_save_if_due(t0 + Duration::from_secs(1)).is_none(), "not again so soon");
         assert!(app.settings_attention().0.is_some());
         // The fault passes; the next try saves and the strip goes.
         std::fs::remove_file(&folder).unwrap();
-        assert!(app.retry_settings_save_if_due(t0 + Duration::from_secs(6)));
+        app.retry_settings_save_if_due(t0 + Duration::from_secs(6)).expect("tried again").join().unwrap();
         assert_eq!(app.settings_attention().0, None);
         assert_eq!(UserConfig::load_from(&folder.join("config.json")).airplay_passwords["airplay:aa"], "hunter2");
         // Nothing to try while saves work.
-        assert!(!app.retry_settings_save_if_due(t0 + Duration::from_secs(60)));
+        assert!(app.retry_settings_save_if_due(t0 + Duration::from_secs(60)).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
