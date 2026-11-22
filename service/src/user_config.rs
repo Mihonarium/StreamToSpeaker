@@ -897,63 +897,78 @@ impl LoadNotice {
     }
 }
 
-/// The window's words for a top-level setting, `None` for a key this
+/// What the reset notice calls each top-level setting, and whether that
+/// is the window's own text for it (`true`: a test finds it in the
+/// window's code) or a description of something the window doesn't show
+/// (`false`).
+const SETTING_LABELS: &[(&str, &str, bool)] = &[
+    ("last_speaker_id", "The speaker used last", false),
+    ("onboarding_dismissed", "Getting started", true),
+    ("always_minimise_to_tray", "Always minimise to tray", true),
+    ("donation_prompt_hidden_until", "The donation reminder", false),
+    ("auto_reconnect_on_launch", "Auto-connect to this speaker when the app launches", true),
+    ("prefer_realtime_airplay", "AirPlay 2 stream mode", true),
+    ("auto_reconnect_on_drop", "Reconnect automatically if the connection drops", true),
+    ("airplay_mfi_encryption", "AirPlay MFi encryption (experimental)", true),
+    ("airplay_passwords", "AirPlay password", true),
+    ("airplay_pairings", "Paired with this PC by PIN", true),
+    ("airplay_controller_id", "This PC's AirPlay pairing identity", false),
+    ("airplay_controller_seed_hex", "This PC's AirPlay pairing identity", false),
+    ("web_secret", "Web UI", true),
+    ("forward_now_playing", "Show now-playing on the speaker", true),
+    ("airplay_uncompressed_alac", "AirPlay uncompressed audio", false),
+    ("privacy_mode", "Privacy mode", true),
+    ("airplay_latency_ms", "AirPlay buffer (latency)", true),
+    ("airplay_homepod_buffered", "Use the buffered stream for single HomePods", true),
+    ("airplay_homepod_latency_ms", "HomePod delay", true),
+    ("check_for_updates", "Check for updates", true),
+    ("update_last_check_unix", "Check for updates", true),
+    ("update_latest_tag", "Check for updates", true),
+    ("update_latest_url", "Check for updates", true),
+    ("update_skipped_tag", "Check for updates", true),
+    ("update_banner_hidden_until", "Check for updates", true),
+    ("sendspin", "Sendspin and Music Assistant", true),
+    ("manual_speakers", "Speakers added by address", true),
+    ("discovery_adapter", "Discovery network adapter", true),
+    ("speaker_settings", "Each speaker's settings", false),
+    ("equalizer", "Equalizer", true),
+];
+
+/// The same for a speaker's own settings (`speaker_settings.<id>.<key>`).
+const SPEAKER_LABELS: &[(&str, &str, bool)] = &[
+    ("hidden", "Hide this speaker from the list", true),
+    ("auto_connect", "Connect automatically", true),
+    ("airplay_latency_ms", "Own AirPlay buffer for this speaker", true),
+    ("upnp_stream_profile", "The stream format it last played", false),
+];
+
+/// A speaker's settings as a whole.
+const WHOLE_SPEAKER_LABEL: (&str, &str, bool) = ("speaker_settings.<id>", "Settings for this speaker", true);
+
+/// What the reset notice calls a top-level setting; `None` for a key this
 /// version doesn't have.
 fn setting_label(key: &str) -> Option<&'static str> {
-    Some(match key {
-        "last_speaker_id" => "The speaker used last",
-        "onboarding_dismissed" => "The welcome card",
-        "always_minimise_to_tray" => "Always minimise to the tray",
-        "donation_prompt_hidden_until" => "The donation reminder",
-        "auto_reconnect_on_launch" => "Auto-connect when the app launches",
-        "prefer_realtime_airplay" => "AirPlay 2 stream mode",
-        "auto_reconnect_on_drop" => "Reconnect automatically if the connection drops",
-        "airplay_mfi_encryption" => "AirPlay MFi encryption",
-        "airplay_passwords" => "AirPlay passwords",
-        "airplay_pairings" => "PIN pairings with AirPlay devices",
-        "airplay_controller_id" | "airplay_controller_seed_hex" => "This PC's AirPlay pairing identity",
-        "web_secret" => "The web remote's link",
-        "forward_now_playing" => "Show now-playing on the speaker",
-        "airplay_uncompressed_alac" => "AirPlay uncompressed audio",
-        "privacy_mode" => "Privacy mode",
-        "airplay_latency_ms" => "AirPlay buffer",
-        "airplay_homepod_buffered" => "HomePod buffered stream",
-        "airplay_homepod_latency_ms" => "HomePod delay",
-        "check_for_updates" => "Check for updates",
-        "update_last_check_unix"
-        | "update_latest_tag"
-        | "update_latest_url"
-        | "update_skipped_tag"
-        | "update_banner_hidden_until" => "The update check",
-        "sendspin" => "Sendspin and Music Assistant",
-        "manual_speakers" => "Speakers added by address",
-        "discovery_adapter" => "Discovery network adapter",
-        "speaker_settings" => "Speaker settings",
-        "equalizer" => "Equalizer",
-        _ => return None,
-    })
+    SETTING_LABELS.iter().find(|(k, _, _)| *k == key).map(|(_, label, _)| *label)
 }
 
-/// The window's words for the setting at `path` that was reset or left
-/// out: the section, and for a speaker's own setting, password or pairing
-/// the speaker's name (from `name_of`) with what it was.
+/// What the reset notice calls the setting at `path` that was reset or
+/// left out: the window's words for it, and for a speaker's own setting,
+/// password or pairing the speaker's name (from `name_of`) before them.
 fn reset_label(path: &[String], name_of: &dyn Fn(&str) -> Option<String>) -> String {
     let speaker = |id: &str| name_of(id).unwrap_or_else(|| "A speaker".into());
     let key = path.first().map(String::as_str).unwrap_or_default();
+    let label_of = |table: &[(&str, &'static str, bool)], k: &str| {
+        table.iter().find(|(name, _, _)| *name == k).map(|(_, label, _)| *label)
+    };
     match (key, path.get(1), path.get(2).map(String::as_str)) {
         ("speaker_settings", Some(id), field) => {
-            let what = match field {
-                Some("hidden") => "Hide this speaker from the list",
-                Some("auto_connect") => "Connect automatically",
-                Some("airplay_latency_ms") => "Own AirPlay buffer",
-                Some("upnp_stream_profile") => "The stream format it last played",
-                _ => "its settings",
-            };
+            let what = field.and_then(|f| label_of(SPEAKER_LABELS, f)).unwrap_or(WHOLE_SPEAKER_LABEL.1);
             format!("{}: {what}", speaker(id))
         }
-        ("airplay_passwords", Some(id), _) => format!("{}: AirPlay password", speaker(id)),
-        ("airplay_pairings", Some(id), _) => format!("{}: PIN pairing", speaker(id)),
-        ("manual_speakers", Some(_), _) => "A speaker added by address".into(),
+        ("airplay_passwords" | "airplay_pairings", Some(id), _) => {
+            format!("{}: {}", speaker(id), setting_label(key).unwrap_or_default())
+        }
+        ("manual_speakers", Some(_), _) => setting_label(key).unwrap_or_default().into(),
         _ => setting_label(key).unwrap_or("A setting from a newer version").into(),
     }
 }
@@ -2361,6 +2376,15 @@ mod tests {
         for key in defaults.as_object().unwrap().keys() {
             assert!(setting_label(key).is_some(), "{key} has no label for the reset notice");
         }
+        // The names said to be the window's are, word for word, in the
+        // window's code.
+        const WINDOW: &str = include_str!("gui.rs");
+        let named = SETTING_LABELS.iter().chain(SPEAKER_LABELS).chain([&WHOLE_SPEAKER_LABEL]);
+        for (key, label, in_window) in named {
+            if *in_window {
+                assert!(WINDOW.contains(label), "{key}: the window doesn't say {label:?}");
+            }
+        }
     }
 
     #[test]
@@ -2415,7 +2439,7 @@ mod tests {
         assert_eq!(
             many.describe(&no_names).unwrap(),
             "Some settings couldn't be read and were reset or left out: Equalizer; Sendspin and Music \
-             Assistant; A speaker added by address; Privacy mode; and 2 more."
+             Assistant; Speakers added by address; Privacy mode; and 2 more."
         );
     }
 
