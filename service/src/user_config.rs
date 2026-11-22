@@ -1078,23 +1078,23 @@ impl SaveHealth {
 /// The order of one settings file's saves: each save is numbered when its
 /// text is made (under the settings lock, so in the order of the changes),
 /// and one whose number is lower than a save already written is not
-/// written: the newest state wins.
+/// written: the newest state wins. Numbering takes no lock, so a save
+/// never waits for another one being written; only the writes take turns.
 #[derive(Clone, Debug, Default)]
-struct WriteOrder(std::sync::Arc<std::sync::Mutex<Written>>);
+struct WriteOrder(std::sync::Arc<Order>);
 
 #[derive(Debug, Default)]
-struct Written {
-    /// The number the next save gets.
-    next: u64,
-    /// The newest save written (or tried), and its outcome.
-    last: Option<(u64, Result<(), String>)>,
+struct Order {
+    /// The number the last save got.
+    numbered: std::sync::atomic::AtomicU64,
+    /// Held for each write: the newest save written (or tried), and its
+    /// outcome.
+    written: std::sync::Mutex<Option<(u64, Result<(), String>)>>,
 }
 
 impl WriteOrder {
     fn next(&self) -> u64 {
-        let mut w = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        w.next += 1;
-        w.next
+        self.0.numbered.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1)
     }
 }
 
@@ -1113,8 +1113,8 @@ impl SaveJob {
     /// one settings file take turns under their own lock, not the
     /// settings lock.
     fn run(self, fs: &dyn FileOps) -> Result<(), String> {
-        let mut written = self.order.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((newest, outcome)) = &written.last {
+        let mut written = self.order.0.written.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((newest, outcome)) = &*written {
             if *newest >= self.generation {
                 return outcome.clone();
             }
@@ -1130,7 +1130,7 @@ impl SaveJob {
         });
         self.health.set(outcome.as_ref().err().map(|(_, problem)| problem.clone()));
         let outcome = outcome.map_err(|(error, _)| error);
-        written.last = Some((self.generation, outcome.clone()));
+        *written = Some((self.generation, outcome.clone()));
         outcome
     }
 }
@@ -1157,7 +1157,9 @@ fn stage(job: SaveJob) -> Option<SaveJob> {
 /// held ([`UserConfig::save`]) is written when the lock is released,
 /// outside it: a thread that only reads a setting (a Music Assistant
 /// handshake, the web server) never waits for a flush to the disk, and of
-/// two saves the newer state is the one that stays on the disk.
+/// two saves the newer state is the one that stays on the disk. The thread
+/// that made a save writes it once it has let go of the lock; when two
+/// writes overlap, they take turns there, holding nothing else.
 pub struct SettingsCell(std::sync::Mutex<UserConfig>);
 
 impl SettingsCell {
@@ -2201,6 +2203,89 @@ mod tests {
         plain.last_speaker_id = Some("third".into());
         plain.save();
         assert_eq!(UserConfig::load_from(&path).last_speaker_id.as_deref(), Some("third"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_and_a_read_never_wait_for_another_save_being_written() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        /// The real disk, whose first rename waits until it is let go: a
+        /// slow flush.
+        struct Slow {
+            entered: Mutex<Sender<()>>,
+            go: Mutex<Receiver<()>>,
+            held: AtomicBool,
+        }
+        impl FileOps for Slow {
+            fn read(&self, p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                Disk.read(p)
+            }
+            fn create_flushed(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> {
+                Disk.create_flushed(p, b)
+            }
+            fn rename(&self, f: &std::path::Path, t: &std::path::Path) -> std::io::Result<()> {
+                if !self.held.swap(true, Ordering::SeqCst) {
+                    let _ = self.entered.lock().unwrap().send(());
+                    let _ = self.go.lock().unwrap().recv();
+                }
+                Disk.rename(f, t)
+            }
+            fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+                Disk.remove(p)
+            }
+            fn create_dir_all(&self, d: &std::path::Path) -> std::io::Result<()> {
+                Disk.create_dir_all(d)
+            }
+            fn list(&self, d: &std::path::Path) -> std::io::Result<Vec<String>> {
+                Disk.list(d)
+            }
+            fn age(&self, p: &std::path::Path) -> Option<std::time::Duration> {
+                Disk.age(p)
+            }
+        }
+        let dir = temp_config_dir("overlapping-saves");
+        let path = dir.join("config.json");
+        let cell = Arc::new(SettingsCell::new(UserConfig::at_path(path.clone())));
+        let (entered_tx, entered) = channel();
+        let (go, go_rx) = channel();
+        let slow = Slow { entered: Mutex::new(entered_tx), go: Mutex::new(go_rx), held: AtomicBool::new(false) };
+        // One save is being written, slowly.
+        let first = {
+            let mut uc = cell.lock().unwrap();
+            uc.last_speaker_id = Some("first".into());
+            uc.prepare(&path, &PlatformCodec, &Disk).unwrap().unwrap()
+        };
+        let writer = std::thread::spawn(move || first.run(&slow));
+        entered.recv_timeout(Duration::from_secs(10)).expect("the first write started");
+        // Meanwhile another thread changes a setting and saves: the save
+        // returns at once, and the lock is free again for a reader.
+        let (saved_tx, saved) = channel();
+        let saver = {
+            let cell = cell.clone();
+            std::thread::spawn(move || {
+                let mut uc = cell.lock().unwrap();
+                uc.last_speaker_id = Some("second".into());
+                uc.save();
+                saved_tx.send(()).unwrap();
+            })
+        };
+        saved.recv_timeout(Duration::from_secs(5)).expect("a save waited for another save's write");
+        let (read_tx, read) = channel();
+        let reader = {
+            let cell = cell.clone();
+            std::thread::spawn(move || read_tx.send(cell.lock().unwrap().last_speaker_id.clone()).unwrap())
+        };
+        let seen = read.recv_timeout(Duration::from_secs(5)).expect("a reader waited for a write");
+        assert_eq!(seen.as_deref(), Some("second"));
+        // Let the slow write finish: the newer save follows it.
+        go.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        saver.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(UserConfig::load_from(&path).last_speaker_id.as_deref(), Some("second"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
