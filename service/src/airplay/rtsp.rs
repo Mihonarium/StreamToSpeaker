@@ -22,8 +22,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use log::{debug, warn};
 use rand::Rng;
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::airplay::crypto::{base64_nopad, random_apple_challenge, Cipher};
@@ -65,12 +67,77 @@ fn audio_latency_of(resp: &RtspResponse) -> Option<u32> {
         .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
+/// Why a request got no usable answer. It is the root cause of the
+/// client's errors (`err.downcast_ref::<RtspError>()`), so callers can
+/// tell a receiver that is slow from one that has gone.
+#[derive(Debug)]
+pub enum RtspError {
+    /// Nothing of the reply arrived within the time limit. The connection
+    /// is still in step: if the reply comes later, its CSeq marks it as
+    /// an earlier request's and it is skipped.
+    NoAnswer { request: String, waited: Duration },
+    /// The receiver closed or reset the connection.
+    ClosedByReceiver { request: String },
+    /// This connection can't carry another request: a reply arrived only
+    /// in part or malformed, a request went out only in part, or the
+    /// connection was shut down here. The receiver may still hold the
+    /// session.
+    Broken { request: String, why: String },
+}
+
+impl std::fmt::Display for RtspError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RtspError::NoAnswer { request, waited } => {
+                write!(f, "no answer to {} within {:.1} s", request, waited.as_secs_f32())
+            }
+            RtspError::ClosedByReceiver { request } => write!(f, "the receiver closed the connection ({})", request),
+            RtspError::Broken { request, why } => write!(f, "{}: {}", request, why),
+        }
+    }
+}
+
+impl std::error::Error for RtspError {}
+
+/// What a TEARDOWN may add to ending a session: on the session's own
+/// connection the reply is awaited this long; on a new connection, half
+/// of it goes to connecting and half to the reply.
+pub const TEARDOWN_LIMIT: Duration = Duration::from_secs(2);
+
+/// The state of the control connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Link {
+    /// Every reply so far was read whole: the next request can go out.
+    InStep,
+    /// Can't carry another request (see [`RtspError::Broken`]); the
+    /// receiver may still hold the session.
+    Broken,
+    /// The receiver closed or reset it.
+    ClosedByReceiver,
+    /// Ended here, after TEARDOWN.
+    Closed,
+}
+
 /// A live RTSP control connection.
 pub struct RtspClient {
     stream: TcpStream,
+    /// Bytes read from the connection and not used yet: the start of the
+    /// next reply, when a receiver sends more than one reply at once.
+    received: Vec<u8>,
+    link: Link,
+    /// Set by [`AbandonHandle::abandon`] just before it shuts the
+    /// connection down, so the read that then fails is not taken for the
+    /// receiver closing it.
+    abandoned: Arc<AtomicBool>,
+    /// How long one reply may take (the socket's read and write timeout).
+    reply_limit: Duration,
+    /// See [`TEARDOWN_LIMIT`].
+    teardown_limit: Duration,
     cseq: u32,
     /// Receiver IP, used in URI and SDP origin field.
     receiver_ip: IpAddr,
+    /// The receiver's RTSP port, for a TEARDOWN on a new connection.
+    port: u16,
     /// Local IP, used in SDP `o=` line.
     local_ip: IpAddr,
     /// Persistent session id.
@@ -96,12 +163,6 @@ pub struct RtspClient {
     announced: bool,
     /// True once TEARDOWN has been sent (makes it idempotent).
     torn_down: bool,
-    /// Set when a request failed mid-response (read timeout / short
-    /// read): the TCP stream may be positioned mid-message, so any
-    /// further request would mis-pair responses. Once poisoned, every
-    /// request fails fast — the periodic keepalive surfaces it and the
-    /// session is effectively dead.
-    poisoned: bool,
     /// RTSP Digest auth (RFC 2617) for password-protected receivers.
     /// `password` comes from config/UI; `realm`/`nonce` are learned from
     /// the first `401 WWW-Authenticate`. Once we have all three, every
@@ -118,7 +179,9 @@ pub struct RtspClient {
 
 impl RtspClient {
     /// Open a TCP connection to the receiver, derive the per-session
-    /// identifiers, and prepare for the OPTIONS handshake.
+    /// identifiers, and prepare for the OPTIONS handshake. `timeout`
+    /// bounds the TCP connect and each reply until
+    /// [`set_reply_limit`](Self::set_reply_limit) changes it.
     pub fn connect(
         receiver_ip: IpAddr,
         port: u16,
@@ -156,8 +219,14 @@ impl RtspClient {
 
         Ok(Self {
             stream,
+            received: Vec::new(),
+            link: Link::InStep,
+            abandoned: Arc::new(AtomicBool::new(false)),
+            reply_limit: timeout,
+            teardown_limit: TEARDOWN_LIMIT,
             cseq: 0,
             receiver_ip,
+            port,
             local_ip,
             session_id,
             client_instance,
@@ -166,12 +235,31 @@ impl RtspClient {
             session_token: None,
             announced: false,
             torn_down: false,
-            poisoned: false,
             password,
             realm: None,
             nonce: None,
             auth_quirk_itunes,
         })
+    }
+
+    /// How long each reply from now on may take to arrive.
+    pub fn set_reply_limit(&mut self, limit: Duration) {
+        // A zero timeout is refused by the socket; the smallest real one
+        // stands for it.
+        let limit = limit.max(Duration::from_millis(1));
+        self.reply_limit = limit;
+        let _ = self.stream.set_read_timeout(Some(limit));
+        let _ = self.stream.set_write_timeout(Some(limit));
+    }
+
+    /// See [`TEARDOWN_LIMIT`].
+    pub fn set_teardown_limit(&mut self, limit: Duration) {
+        self.teardown_limit = limit;
+    }
+
+    /// True while the connection can carry another request.
+    pub fn is_usable(&self) -> bool {
+        self.link == Link::InStep
     }
 
     /// Compute the `Authorization: Digest …` value for one request, if we
@@ -505,32 +593,15 @@ impl RtspClient {
     /// non-fatal on every reference receiver, so callers should treat a
     /// failure as cosmetic.
     pub fn set_metadata(&mut self, dmap_body: &[u8], rtptime: u32) -> Result<()> {
-        if self.poisoned {
-            bail!("RTSP connection is poisoned");
-        }
         self.cseq += 1;
         let uri = self.session_uri();
-        let mut head = String::new();
-        head.push_str(&format!("SET_PARAMETER {} RTSP/1.0\r\n", uri));
-        head.push_str(&format!("CSeq: {}\r\n", self.cseq));
-        head.push_str(&format!("User-Agent: {}\r\n", RTSP_USER_AGENT));
-        head.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
-        head.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
-        head.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
-        if let Some(auth) = self.auth_header("SET_PARAMETER", &uri) {
-            head.push_str(&format!("Authorization: {}\r\n", auth));
-        }
-        if let Some(token) = &self.session_token {
-            head.push_str(&format!("Session: {}\r\n", token));
-        }
-        head.push_str(&format!("RTP-Info: rtptime={}\r\n", rtptime));
-        head.push_str("Content-Type: application/x-dmap-tagged\r\n");
-        head.push_str(&format!("Content-Length: {}\r\n\r\n", dmap_body.len()));
-
+        let extra = [
+            ("RTP-Info".to_string(), format!("rtptime={}", rtptime)),
+            ("Content-Type".to_string(), "application/x-dmap-tagged".to_string()),
+        ];
+        let raw = self.build_request("SET_PARAMETER", &uri, &extra, dmap_body, true);
         debug!("RTSP > SET_PARAMETER {} (metadata, {}B)", uri, dmap_body.len());
-        let mut raw = head.into_bytes();
-        raw.extend_from_slice(dmap_body);
-        let resp = self.send_and_read(&raw)?;
+        let resp = self.send_and_read(&raw, "SET_PARAMETER")?;
         if resp.status_code != 200 {
             bail!(
                 "SET_PARAMETER metadata → {} {}",
@@ -556,17 +627,59 @@ impl RtspClient {
         Ok(())
     }
 
-    /// TEARDOWN — close the session. Best-effort; receivers eventually
-    /// time out anyway. We swallow errors so a half-broken receiver
-    /// doesn't block shutdown.
+    /// TEARDOWN — end the session, then close the connection. A receiver
+    /// that is not told keeps the session for a while and refuses or
+    /// ignores new ones meanwhile (the Sonos holds it for tens of
+    /// seconds, packet capture), so this is sent whenever the receiver
+    /// may hold one: on the session's connection while it is in step, on
+    /// a new connection when this one broke. It is not sent when the
+    /// receiver closed the connection itself, or before ANNOUNCE was
+    /// accepted. Either way it takes at most [`TEARDOWN_LIMIT`], and
+    /// failures are only logged.
     pub fn teardown(&mut self) {
         if self.torn_down {
             return;
         }
         self.torn_down = true;
-        let uri = self.session_uri();
-        if let Err(e) = self.request("TEARDOWN", &uri, &[], "") {
-            warn!("RTSP TEARDOWN failed (continuing anyway): {}", e);
+        if self.announced {
+            match self.link {
+                Link::InStep => {
+                    self.set_reply_limit(self.teardown_limit);
+                    let uri = self.session_uri();
+                    if let Err(e) = self.request("TEARDOWN", &uri, &[], "") {
+                        warn!("RTSP TEARDOWN failed (continuing anyway): {:#}", e);
+                    }
+                }
+                Link::Broken => self.teardown_on_new_connection(),
+                Link::ClosedByReceiver | Link::Closed => {}
+            }
+        }
+        let _ = self.stream.shutdown(Shutdown::Both);
+        self.link = Link::Closed;
+    }
+
+    /// TEARDOWN for a session whose connection broke: shut that one down
+    /// first, so the receiver sees it end at once (a receiver that keeps
+    /// one session per connection lets go of it there), then send
+    /// TEARDOWN naming the session on a new connection, for receivers
+    /// that keep it by its Session, DACP-ID and Active-Remote.
+    fn teardown_on_new_connection(&mut self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+        let half = (self.teardown_limit / 2).max(Duration::from_millis(1));
+        let addr = SocketAddr::new(self.receiver_ip, self.port);
+        match TcpStream::connect_timeout(&addr, half) {
+            Ok(stream) => {
+                debug!("RTSP: the session's connection broke; sending TEARDOWN on a new connection");
+                self.stream = stream;
+                self.received.clear();
+                self.link = Link::InStep;
+                self.set_reply_limit(half);
+                let uri = self.session_uri();
+                if let Err(e) = self.request("TEARDOWN", &uri, &[], "") {
+                    warn!("RTSP TEARDOWN on a new connection failed (continuing anyway): {:#}", e);
+                }
+            }
+            Err(e) => warn!("RTSP TEARDOWN: couldn't open a new connection to {} ({})", addr, e),
         }
     }
 
@@ -586,11 +699,6 @@ impl RtspClient {
 
     /// Like [`request`](Self::request) but with control over whether the
     /// Session header is attached. iTunes omits it on OPTIONS keepalives.
-    ///
-    /// Handles RTSP Digest auth transparently: once a realm/nonce is
-    /// known each request carries the `Authorization` header, and a
-    /// `401` on the first (un-authed) attempt triggers a challenge parse
-    /// + one retry — mirroring OwnTone's re-run-with-auth flow.
     fn request_opts(
         &mut self,
         method: &str,
@@ -599,32 +707,39 @@ impl RtspClient {
         body: &str,
         include_session: bool,
     ) -> Result<RtspResponse> {
+        self.exchange(method, uri, extra_headers, body.as_bytes(), include_session)
+    }
+
+    /// Like [`request`](Self::request) but with a binary body — used for
+    /// `/auth-setup`, whose payload is raw key bytes rather than text.
+    fn request_bytes(
+        &mut self,
+        method: &str,
+        uri: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<RtspResponse> {
+        let extra = [("Content-Type".to_string(), content_type.to_string())];
+        self.exchange(method, uri, &extra, body, true)
+    }
+
+    /// Send one request and read its reply, handling RTSP Digest auth
+    /// transparently: once a realm/nonce is known each request carries
+    /// the `Authorization` header, and a `401` on the first (un-authed)
+    /// attempt triggers a challenge parse + one retry — mirroring
+    /// OwnTone's re-run-with-auth flow.
+    fn exchange(
+        &mut self,
+        method: &str,
+        uri: &str,
+        extra_headers: &[(String, String)],
+        body: &[u8],
+        include_session: bool,
+    ) -> Result<RtspResponse> {
+        let label = if method == "POST" { format!("POST {}", uri) } else { method.to_string() };
         for attempt in 0..2 {
             self.cseq += 1;
-            let mut req = String::new();
-            req.push_str(&format!("{} {} RTSP/1.0\r\n", method, uri));
-            req.push_str(&format!("CSeq: {}\r\n", self.cseq));
-            req.push_str(&format!("User-Agent: {}\r\n", RTSP_USER_AGENT));
-            req.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
-            req.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
-            req.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
-            if let Some(auth) = self.auth_header(method, uri) {
-                req.push_str(&format!("Authorization: {}\r\n", auth));
-            }
-            if include_session {
-                if let Some(token) = &self.session_token {
-                    req.push_str(&format!("Session: {}\r\n", token));
-                }
-            }
-            for (k, v) in extra_headers {
-                req.push_str(&format!("{}: {}\r\n", k, v));
-            }
-            if !body.is_empty() {
-                req.push_str(&format!("Content-Length: {}\r\n", body.len()));
-            }
-            req.push_str("\r\n");
-            req.push_str(body);
-
+            let raw = self.build_request(method, uri, extra_headers, body, include_session);
             debug!(
                 "RTSP > {} {} (CSeq={}, body={}B)",
                 method,
@@ -632,12 +747,50 @@ impl RtspClient {
                 self.cseq,
                 body.len()
             );
-            let resp = self.send_and_read(req.as_bytes())?;
+            let resp = self.send_and_read(&raw, &label)?;
             if let Some(r) = self.handle_auth(resp, attempt)? {
                 return Ok(r);
             }
         }
-        unreachable!("auth retry loop always returns")
+        bail!("{} was refused twice with 401", label)
+    }
+
+    /// One request's bytes, with the current CSeq. Header order is what
+    /// iTunes sends (packet capture): the identifiers, then the
+    /// request's own headers, then Content-Length when there is a body.
+    fn build_request(
+        &self,
+        method: &str,
+        uri: &str,
+        extra_headers: &[(String, String)],
+        body: &[u8],
+        include_session: bool,
+    ) -> Vec<u8> {
+        let mut head = String::new();
+        head.push_str(&format!("{} {} RTSP/1.0\r\n", method, uri));
+        head.push_str(&format!("CSeq: {}\r\n", self.cseq));
+        head.push_str(&format!("User-Agent: {}\r\n", RTSP_USER_AGENT));
+        head.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
+        head.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
+        head.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
+        if let Some(auth) = self.auth_header(method, uri) {
+            head.push_str(&format!("Authorization: {}\r\n", auth));
+        }
+        if include_session {
+            if let Some(token) = &self.session_token {
+                head.push_str(&format!("Session: {}\r\n", token));
+            }
+        }
+        for (k, v) in extra_headers {
+            head.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        if !body.is_empty() {
+            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+        head.push_str("\r\n");
+        let mut raw = head.into_bytes();
+        raw.extend_from_slice(body);
+        raw
     }
 
     /// Shared 401 handling for the request builders. Returns `Some(resp)`
@@ -665,79 +818,29 @@ impl RtspClient {
         );
     }
 
-    /// Like [`request`](Self::request) but with a binary body — used for
-    /// `/auth-setup`, whose payload is raw key bytes rather than text.
-    fn request_bytes(
-        &mut self,
-        method: &str,
-        uri: &str,
-        content_type: &str,
-        body: &[u8],
-    ) -> Result<RtspResponse> {
-        for attempt in 0..2 {
-            self.cseq += 1;
-            let mut head = String::new();
-            head.push_str(&format!("{} {} RTSP/1.0\r\n", method, uri));
-            head.push_str(&format!("CSeq: {}\r\n", self.cseq));
-            head.push_str(&format!("User-Agent: {}\r\n", RTSP_USER_AGENT));
-            head.push_str(&format!("Client-Instance: {}\r\n", self.client_instance));
-            head.push_str(&format!("DACP-ID: {}\r\n", self.dacp_id));
-            head.push_str(&format!("Active-Remote: {}\r\n", self.active_remote));
-            if let Some(auth) = self.auth_header(method, uri) {
-                head.push_str(&format!("Authorization: {}\r\n", auth));
-            }
-            if let Some(token) = &self.session_token {
-                head.push_str(&format!("Session: {}\r\n", token));
-            }
-            head.push_str(&format!("Content-Type: {}\r\n", content_type));
-            head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-
-            debug!(
-                "RTSP > {} {} (CSeq={}, body={}B)",
-                method,
-                uri,
-                self.cseq,
-                body.len()
-            );
-            let mut raw = head.into_bytes();
-            raw.extend_from_slice(body);
-            let resp = self.send_and_read(&raw)?;
-            if let Some(r) = self.handle_auth(resp, attempt)? {
-                return Ok(r);
-            }
-        }
-        unreachable!("auth retry loop always returns")
-    }
-
-    /// Write a fully-serialised request and read its response, with two
-    /// protections the keepalive-era connection needs:
+    /// Write a fully-serialised request and read its reply, keeping
+    /// requests and replies paired:
     ///
-    /// * **Poisoning** — a request that fails mid-response (read timeout,
-    ///   short read) may leave the TCP stream positioned inside a message;
-    ///   any later read would mis-pair or mis-parse. The connection is
-    ///   marked poisoned and every subsequent request fails fast.
-    /// * **CSeq pairing** — a response that arrives *after* its request
-    ///   timed out (but cleanly, between messages) carries a stale CSeq;
-    ///   it's discarded and the read retried so responses can't shift
-    ///   off-by-one against requests.
-    fn send_and_read(&mut self, raw: &[u8]) -> Result<RtspResponse> {
-        if self.poisoned {
-            bail!("RTSP connection is poisoned (an earlier request failed mid-response)");
+    /// * A reply that doesn't come within the time limit leaves the
+    ///   connection in step as long as none of it arrived ([`RtspError::NoAnswer`]).
+    ///   When it does come, later, it carries that earlier request's
+    ///   CSeq and is skipped here, so replies can't shift one place
+    ///   against requests.
+    /// * A reply that arrived only in part, or a request written only in
+    ///   part, leaves the stream inside a message: the connection is
+    ///   marked broken and every later request fails at once.
+    /// * Bytes read past the end of a reply are kept for the next one.
+    fn send_and_read(&mut self, raw: &[u8], label: &str) -> Result<RtspResponse> {
+        if let Some(e) = self.unusable(label) {
+            return Err(e.into());
         }
         if let Err(e) = self.stream.write_all(raw).and_then(|_| self.stream.flush()) {
-            self.poisoned = true;
-            return Err(e).context("writing RTSP request");
+            return Err(self.lost(label, &e, "writing the request").into());
         }
-        // Up to 3 stale responses discarded before giving up — more than
+        // Up to 3 stale replies skipped before giving up — more than
         // one means something is deeply wrong with the receiver.
         for _ in 0..3 {
-            let resp = match read_response(&mut self.stream) {
-                Ok(r) => r,
-                Err(e) => {
-                    self.poisoned = true;
-                    return Err(e).context("reading RTSP response");
-                }
-            };
+            let resp = self.read_reply(label)?;
             match resp
                 .headers
                 .get("cseq")
@@ -755,8 +858,92 @@ impl RtspClient {
                 _ => return Ok(resp),
             }
         }
-        self.poisoned = true;
-        bail!("RTSP connection desynced: >3 stale responses in a row");
+        self.link = Link::Broken;
+        Err(RtspError::Broken { request: label.to_string(), why: "three stale replies in a row".to_string() }.into())
+    }
+
+    /// Why a request can't go out now, if it can't.
+    fn unusable(&self, label: &str) -> Option<RtspError> {
+        let request = label.to_string();
+        match self.link {
+            Link::InStep => None,
+            Link::Broken => Some(RtspError::Broken { request, why: "an earlier request broke the connection".to_string() }),
+            Link::ClosedByReceiver => Some(RtspError::ClosedByReceiver { request }),
+            Link::Closed => Some(RtspError::Broken { request, why: "the session has ended".to_string() }),
+        }
+    }
+
+    /// The connection failed with `e` while `doing` something: a reset
+    /// or broken pipe is the receiver ending it, anything else leaves it
+    /// broken here.
+    fn lost(&mut self, label: &str, e: &std::io::Error, doing: &str) -> RtspError {
+        let by_receiver = matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::BrokenPipe)
+            && !self.abandoned.load(Ordering::Acquire);
+        if by_receiver {
+            self.link = Link::ClosedByReceiver;
+            RtspError::ClosedByReceiver { request: label.to_string() }
+        } else {
+            self.link = Link::Broken;
+            RtspError::Broken { request: label.to_string(), why: format!("{}: {}", doing, e) }
+        }
+    }
+
+    /// Read one reply: from what was already received if a whole one is
+    /// there, else from the connection, waiting at most the reply limit
+    /// for each read.
+    fn read_reply(&mut self, label: &str) -> Result<RtspResponse, RtspError> {
+        let started = Instant::now();
+        let mut tmp = [0u8; 2048];
+        loop {
+            match parse_reply(&self.received) {
+                Ok(Some((resp, used))) => {
+                    self.received.drain(..used.min(self.received.len()));
+                    debug!(
+                        "RTSP < {} {} ({} headers, {}B body)",
+                        resp.status_code,
+                        resp.status_text,
+                        resp.headers.len(),
+                        resp.body.len()
+                    );
+                    return Ok(resp);
+                }
+                Ok(None) => {}
+                Err(why) => {
+                    self.link = Link::Broken;
+                    return Err(RtspError::Broken { request: label.to_string(), why });
+                }
+            }
+            if started.elapsed() >= RESPONSE_DEADLINE {
+                self.link = Link::Broken;
+                return Err(RtspError::Broken {
+                    request: label.to_string(),
+                    why: format!("the reply took over {} s", RESPONSE_DEADLINE.as_secs()),
+                });
+            }
+            match self.stream.read(&mut tmp) {
+                Ok(0) => {
+                    if self.abandoned.load(Ordering::Acquire) {
+                        self.link = Link::Broken;
+                        return Err(RtspError::Broken { request: label.to_string(), why: "shut down here".to_string() });
+                    }
+                    self.link = Link::ClosedByReceiver;
+                    return Err(RtspError::ClosedByReceiver { request: label.to_string() });
+                }
+                Ok(n) => self.received.extend_from_slice(tmp.get(..n).unwrap_or_default()),
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if self.received.is_empty() && !self.abandoned.load(Ordering::Acquire) {
+                        return Err(RtspError::NoAnswer { request: label.to_string(), waited: started.elapsed() });
+                    }
+                    self.link = Link::Broken;
+                    return Err(RtspError::Broken {
+                        request: label.to_string(),
+                        why: "the reply stopped part way".to_string(),
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.lost(label, &e, "reading the reply")),
+            }
+        }
     }
 }
 
@@ -785,42 +972,32 @@ pub struct RtspResponse {
 /// anything larger is refused rather than buffered.
 const MAX_BODY_BYTES: usize = 1 << 20;
 
-/// Overall time allowed for one response, however slowly it trickles in.
-/// The socket's read timeout bounds each individual read.
+/// Overall time allowed for one reply, however slowly it trickles in.
+/// The reply limit bounds each individual read.
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Read one RTSP/1.0 response off the stream. RTSP/1.0 framing matches
-/// HTTP/1.0 closely: status line + headers + optional body delimited
-/// by Content-Length.
-fn read_response<R: Read>(stream: &mut R) -> Result<RtspResponse> {
-    let deadline = Instant::now() + RESPONSE_DEADLINE;
-    let mut buf = Vec::with_capacity(2048);
-    let mut tmp = [0u8; 1024];
-    let header_end;
-    loop {
-        if Instant::now() >= deadline {
-            bail!("RTSP response timed out");
-        }
-        let n = stream.read(&mut tmp)?;
-        if n == 0 {
-            bail!("RTSP connection closed while waiting for response");
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = find_header_end(&buf) {
-            header_end = pos;
-            break;
-        }
-        if buf.len() > 64 * 1024 {
-            bail!("RTSP response headers too large ({} bytes, no end)", buf.len());
-        }
-    }
+/// Most bytes of status line and headers accepted before their end.
+const MAX_HEAD_BYTES: usize = 64 * 1024;
 
-    let head = std::str::from_utf8(&buf[..header_end])
-        .map_err(|_| anyhow!("RTSP response headers were not UTF-8"))?
-        .to_string();
+/// Parse one RTSP/1.0 reply from the front of `buf`. RTSP/1.0 framing
+/// matches HTTP/1.0 closely: status line + headers + optional body
+/// delimited by Content-Length. `Ok(None)` while the reply is still
+/// incomplete; otherwise the reply and how many bytes of `buf` it took.
+/// `Err` says why the bytes can't be a reply.
+fn parse_reply(buf: &[u8]) -> Result<Option<(RtspResponse, usize)>, String> {
+    let Some(header_end) = find_header_end(buf) else {
+        if buf.len() > MAX_HEAD_BYTES {
+            return Err(format!("reply headers too large ({} bytes, no end)", buf.len()));
+        }
+        return Ok(None);
+    };
+    let head = buf
+        .get(..header_end)
+        .and_then(|h| std::str::from_utf8(h).ok())
+        .ok_or_else(|| "reply headers were not UTF-8".to_string())?;
     let mut lines = head.lines();
-    let status_line = lines.next().ok_or_else(|| anyhow!("empty status line"))?;
-    let (status_code, status_text) = parse_status_line(status_line)?;
+    let status_line = lines.next().ok_or_else(|| "empty status line".to_string())?;
+    let (status_code, status_text) = parse_status_line(status_line).map_err(|e| format!("{:#}", e))?;
     let mut headers: HashMap<String, String> = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
@@ -832,41 +1009,24 @@ fn read_response<R: Read>(stream: &mut R) -> Result<RtspResponse> {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
     if content_length > MAX_BODY_BYTES {
-        bail!("RTSP response body too large ({} bytes)", content_length);
+        return Err(format!("reply body too large ({} bytes)", content_length));
     }
-    let body_start = header_end + 4; // "\r\n\r\n"
-    let mut body = buf[body_start..].to_vec();
-    while body.len() < content_length {
-        if Instant::now() >= deadline {
-            bail!("RTSP response body timed out");
-        }
-        let need = content_length - body.len();
-        let read_cap = tmp.len().min(need);
-        let n = stream.read(&mut tmp[..read_cap])?;
-        if n == 0 {
-            bail!(
-                "RTSP body short read: got {} of {} bytes",
-                body.len(),
-                content_length
-            );
-        }
-        body.extend_from_slice(&tmp[..n]);
-    }
-    body.truncate(content_length);
-
-    debug!(
-        "RTSP < {} {} ({} headers, {}B body)",
-        status_code,
-        status_text,
-        headers.len(),
-        body.len()
-    );
-    Ok(RtspResponse {
-        status_code,
-        status_text,
-        headers,
-        body,
-    })
+    let body_start = header_end.saturating_add(4); // "\r\n\r\n"
+    let Some(end) = body_start.checked_add(content_length) else {
+        return Err("reply body too large".to_string());
+    };
+    let Some(body) = buf.get(body_start..end) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        RtspResponse {
+            status_code,
+            status_text,
+            headers,
+            body: body.to_vec(),
+        },
+        end,
+    )))
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -891,22 +1051,218 @@ fn parse_status_line(line: &str) -> Result<(u16, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use crate::airplay::fake_raop::{Answer, Event, FakeRaop, Reply, Request};
 
-    #[test]
-    fn read_response_reads_body_by_content_length() {
-        let mut c = Cursor::new(b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: 3\r\n\r\nabcEXTRA".to_vec());
-        let r = read_response(&mut c).unwrap();
-        assert_eq!(r.status_code, 200);
-        assert_eq!(r.body, b"abc");
+    /// The per-request time limit these tests give the client.
+    const LIMIT: Duration = Duration::from_millis(300);
+
+    fn client(rx: &FakeRaop) -> RtspClient {
+        RtspClient::connect("127.0.0.1".parse().unwrap(), rx.port(), "127.0.0.1".parse().unwrap(), LIMIT).unwrap()
+    }
+
+    /// Connect and get as far as SETUP, which `setup` answers.
+    fn announced(rx: &FakeRaop) -> RtspClient {
+        let mut c = client(rx);
+        c.announce(&Cipher::None).expect("ANNOUNCE answered");
+        c
+    }
+
+    fn connected(rx: &FakeRaop, conn: usize) -> bool {
+        rx.wait_until(Duration::from_millis(500), |ev| ev.iter().any(|e| matches!(e, Event::Connected { conn: c, .. } if *c == conn)))
+    }
+
+    fn teardowns(rx: &FakeRaop) -> Vec<Request> {
+        rx.requests().into_iter().filter(|r| r.method == "TEARDOWN").collect()
     }
 
     #[test]
-    fn read_response_refuses_oversized_body() {
-        let mut c = Cursor::new(b"RTSP/1.0 200 OK\r\nContent-Length: 99999999999\r\n\r\n".to_vec());
-        assert!(read_response(&mut c).is_err());
+    fn a_setup_left_unanswered_is_torn_down_on_the_same_connection() {
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "SETUP" => Answer::Ignore,
+            _ => Answer::Normal,
+        });
+        let mut c = announced(&rx);
+        assert!(c.setup(1, 2).is_err());
+        drop(c);
+        assert!(rx.wait_for_requests(3, Duration::from_secs(10)), "{:?}", rx.lines());
+        let lines = rx.lines();
+        assert_eq!(lines[2], format!("0 TEARDOWN rtsp://127.0.0.1/{}", lines[1].rsplit('/').next().unwrap()));
+        // And the connection is closed straight after.
+        assert!(rx.wait_until(Duration::from_secs(10), |ev| ev.iter().any(|e| matches!(e, Event::Closed { conn: 0, .. }))));
+    }
+
+    #[test]
+    fn a_late_reply_is_skipped_and_the_next_request_gets_its_own() {
+        // SETUP's reply comes after the client gave up on it, and says 500,
+        // so a keepalive paired with it would fail.
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "SETUP" => Answer::late(LIMIT * 3, Answer::Reply(Reply::status(500, "Late"))),
+            _ => Answer::Normal,
+        });
+        let mut c = announced(&rx);
+        assert!(c.setup(1, 2).is_err());
+        assert!(c.is_usable());
+        // Long enough for the late reply to come in before the
+        // keepalive's own.
+        c.set_reply_limit(LIMIT * 10);
+        c.options_keepalive().expect("the keepalive gets its own reply");
+        c.options_keepalive().expect("and so does the next one");
+        assert_eq!(rx.lines()[2..], ["0 OPTIONS *", "0 OPTIONS *"]);
+    }
+
+    #[test]
+    fn two_replies_read_at_once_are_both_used() {
+        // The receiver answers the first keepalive and, in the same write,
+        // the second one before it was even asked.
+        let rx = FakeRaop::start(|req| match req.cseq() {
+            Some(1) => Answer::Raw(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\nRTSP/1.0 501 Not Implemented\r\nCSeq: 2\r\n\r\n".to_vec()),
+            _ => Answer::Ignore,
+        });
+        let mut c = client(&rx);
+        c.options_keepalive().expect("first reply");
+        // 501 is accepted by the keepalive: it can only have come from the
+        // buffered second reply, since the receiver answers nothing else.
+        c.options_keepalive().expect("second reply, from what was already read");
+    }
+
+    #[test]
+    fn a_reply_cut_off_part_way_breaks_the_connection_and_teardown_uses_a_new_one() {
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
+            ("SETUP", 0) => Answer::Raw(b"RTSP/1.0 200 OK\r\nCSeq: ".to_vec()),
+            _ => Answer::Normal,
+        });
+        let mut c = announced(&rx);
+        assert!(c.setup(1, 2).is_err());
+        // The connection can't carry another request now.
+        assert!(c.options_keepalive().is_err());
+        assert_eq!(rx.requests().len(), 2, "nothing more was sent on the broken connection");
+        drop(c);
+        assert!(rx.wait_for_requests(3, Duration::from_secs(10)));
+        let reqs = rx.requests();
+        let (announce, teardown) = (&reqs[0], &reqs[2]);
+        assert_eq!((teardown.conn, teardown.method.as_str()), (1, "TEARDOWN"));
+        assert_eq!(teardown.uri, announce.uri);
+        for h in ["Client-Instance", "DACP-ID", "Active-Remote", "User-Agent"] {
+            assert_eq!(teardown.header(h), announce.header(h), "{h}");
+        }
+        // The old connection was shut down before the new one was opened.
+        let closed = rx.closed_at(0).expect("the broken connection is closed");
+        assert!(closed <= rx.connected_at(1).unwrap() + Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_teardown_on_a_new_connection_names_the_session() {
+        // SETUP answered (so there is a session token), RECORD cut off.
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
+            ("RECORD", 0) => Answer::Raw(b"RTSP/1.0 2".to_vec()),
+            _ => Answer::Normal,
+        });
+        let mut c = announced(&rx);
+        c.setup(1, 2).expect("SETUP answered");
+        assert!(c.record(1, 1).is_err());
+        drop(c);
+        assert!(rx.wait_for_requests(4, Duration::from_secs(10)));
+        let teardown = &rx.requests()[3];
+        assert_eq!((teardown.conn, teardown.method.as_str()), (1, "TEARDOWN"));
+        assert_eq!(teardown.header("Session"), Some("1"));
+    }
+
+    #[test]
+    fn a_connection_the_receiver_closed_gets_no_teardown() {
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "SETUP" => Answer::Close,
+            _ => Answer::Normal,
+        });
+        let mut c = announced(&rx);
+        assert!(c.setup(1, 2).is_err());
+        drop(c);
+        assert!(!connected(&rx, 1), "a new connection was opened");
+        assert!(teardowns(&rx).is_empty());
+    }
+
+    #[test]
+    fn nothing_is_torn_down_before_announce() {
+        let rx = FakeRaop::start(|_| Answer::Ignore);
+        let mut c = client(&rx);
+        assert!(c.auth_setup().is_err());
+        drop(c);
+        assert!(!connected(&rx, 1));
+        assert!(teardowns(&rx).is_empty());
+        assert_eq!(rx.lines(), ["0 POST /auth-setup"]);
+    }
+
+    #[test]
+    fn an_unanswered_teardown_is_given_up_on_quickly() {
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "SETUP" | "TEARDOWN" => Answer::Ignore,
+            _ => Answer::Normal,
+        });
+        let mut c = announced(&rx);
+        c.set_teardown_limit(LIMIT);
+        assert!(c.setup(1, 2).is_err());
+        let started = Instant::now();
+        drop(c);
+        let took = started.elapsed();
+        assert!(took >= LIMIT && took < LIMIT * 10, "{:?}", took);
+        assert_eq!(teardowns(&rx).len(), 1);
+    }
+
+    #[test]
+    fn a_teardown_on_a_new_connection_is_given_up_on_quickly() {
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
+            ("SETUP", 0) => Answer::Raw(b"RTSP/1.0".to_vec()),
+            ("TEARDOWN", _) => Answer::Ignore,
+            _ => Answer::Normal,
+        });
+        let mut c = announced(&rx);
+        c.set_teardown_limit(LIMIT);
+        assert!(c.setup(1, 2).is_err());
+        let started = Instant::now();
+        drop(c);
+        let took = started.elapsed();
+        assert!(took < LIMIT * 10, "{:?}", took);
+        assert_eq!(teardowns(&rx).len(), 1);
+    }
+
+    #[test]
+    fn a_reply_written_in_pieces_is_read_whole() {
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "SETUP" => Answer::in_pieces(Answer::Normal, &[3, 20, 40, 90], LIMIT / 10),
+            _ => Answer::Normal,
+        });
+        let mut c = announced(&rx);
+        let ports = c.setup(1, 2).expect("SETUP read whole");
+        assert_eq!(ports.audio, rx.udp_ports().audio);
+    }
+
+    #[test]
+    fn parse_reply_reads_body_by_content_length_and_leaves_the_rest() {
+        let buf = b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: 3\r\n\r\nabcRTSP/1.0 501 No\r\n\r\n";
+        let (r, used) = parse_reply(buf).unwrap().unwrap();
+        assert_eq!(r.status_code, 200);
+        assert_eq!(r.body, b"abc");
+        let (next, used2) = parse_reply(&buf[used..]).unwrap().unwrap();
+        assert_eq!((next.status_code, next.status_text.as_str()), (501, "No"));
+        assert_eq!(used + used2, buf.len());
+    }
+
+    #[test]
+    fn parse_reply_waits_for_the_whole_reply() {
+        let full = b"RTSP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+        for cut in 0..full.len() {
+            assert!(parse_reply(&full[..cut]).unwrap().is_none(), "{cut}");
+        }
+        assert!(parse_reply(full).unwrap().is_some());
+    }
+
+    #[test]
+    fn parse_reply_refuses_what_cant_be_a_reply() {
+        assert!(parse_reply(b"RTSP/1.0 200 OK\r\nContent-Length: 99999999999\r\n\r\n").is_err());
         let huge = format!("RTSP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", usize::MAX);
-        let mut c = Cursor::new(huge.into_bytes());
-        assert!(read_response(&mut c).is_err());
+        assert!(parse_reply(huge.as_bytes()).is_err());
+        assert!(parse_reply(b"RTSP/1.0 2x0 OK\r\n\r\n").is_err());
+        assert!(parse_reply(b"\xff\xfe\r\n\r\n").is_err());
+        assert!(parse_reply(b"\r\n\r\n").is_err());
+        assert!(parse_reply(&vec![b'a'; MAX_HEAD_BYTES + 1]).is_err());
     }
 }

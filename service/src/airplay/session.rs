@@ -566,8 +566,9 @@ impl AirPlaySession {
     }
 
     /// Tear down: stop the background threads, TEARDOWN RTSP, close
-    /// sockets. Best-effort — receivers will eventually time us out
-    /// even if we skip this; it's here for clean shutdown only.
+    /// sockets. TEARDOWN matters: a receiver that isn't told keeps the
+    /// session for a while and refuses or ignores the next connect (see
+    /// [`RtspClient::teardown`]).
     pub fn stop(mut self) {
         info!(
             "AirPlay: stopping session to {}",
@@ -666,6 +667,27 @@ pub fn mute_db(muted: bool, last_level_pct: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::airplay::fake_raop::{Answer, FakeRaop};
+    use crate::airplay::raop_transcripts::{config, receiver};
+
+    /// A bring-up that fails after ANNOUNCE tells the receiver, so it
+    /// doesn't keep the session and refuse the next attempt.
+    #[test]
+    fn a_bring_up_that_fails_after_announce_sends_teardown() {
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "SETUP" => Answer::Ignore,
+            _ => Answer::Normal,
+        });
+        let (_tx, samples) = crossbeam_channel::unbounded();
+        let mut cfg = config(receiver(&rx, "0B0000000001", &[0, 4]), samples);
+        cfg.connect_timeout = Duration::from_millis(300);
+        assert!(AirPlaySession::start(cfg).is_err());
+        assert!(rx.wait_for_requests(4, Duration::from_secs(10)), "{:?}", rx.lines());
+        let lines = rx.lines();
+        assert_eq!(lines[..3], ["0 POST /auth-setup".to_string(), lines[1].clone(), lines[2].clone()]);
+        assert!(lines[1].starts_with("0 ANNOUNCE ") && lines[2].starts_with("0 SETUP "));
+        assert!(lines[3].starts_with("0 TEARDOWN "), "{:?}", lines);
+    }
 
     #[test]
     fn volume_mapping_anchor_points() {
