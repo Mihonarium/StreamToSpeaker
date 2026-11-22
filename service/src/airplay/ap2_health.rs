@@ -321,7 +321,7 @@ impl FeedbackMonitor {
                 "authentication_failed",
                 FaultChannel::Feedback,
                 false,
-                format!("the speaker refused this PC's connection (/feedback → {}).", status),
+                format!("the speaker refused this PC's connection (/feedback → {}). Select it again.", status),
             )),
             454 if self.strict => FeedbackAction::Fault(Ap2Fault::new(
                 "session_rejected",
@@ -742,6 +742,11 @@ mod tests {
             _ => None,
         };
         assert_eq!(fault(true, 403), Some(("authentication_failed", false)));
+        // Final, so the window shows it: it says what to try.
+        match FeedbackMonitor::new(true).on_status(403, now) {
+            FeedbackAction::Fault(f) => assert!(f.to_string().ends_with("Select it again."), "{f}"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(fault(true, 401), Some(("authentication_failed", false)));
         assert_eq!(fault(true, 454), Some(("session_rejected", true)));
         assert_eq!(fault(true, 400), None);
