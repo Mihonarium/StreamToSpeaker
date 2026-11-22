@@ -270,7 +270,7 @@ impl AirPlay2Session {
         let event_ciphers = rtsp.take_event_ciphers();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
-        let faults = FaultSlot::new(dead.clone(), cfg.renderer.friendly_name.clone());
+        let faults = FaultSlot::new(dead.clone(), cfg.renderer.friendly_name.clone()).with_key(cfg.renderer.stable_id());
         let mut bring_up = BringUp::new(&stop_flag, &faults);
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
         // Shared from RECORD on (the buffered sender anchors on it, the
@@ -662,7 +662,7 @@ impl AirPlay2Session {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
-        let faults = FaultSlot::new(dead.clone(), label.clone());
+        let faults = FaultSlot::new(dead.clone(), label.clone()).with_key(cfg.renderer.stable_id());
         let mut bring_up = BringUp::new(&stop_flag, &faults);
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
 

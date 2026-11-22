@@ -145,14 +145,18 @@ static REPEATS: Mutex<RepeatMemory> = Mutex::new(RepeatMemory::new());
 pub struct FaultSlot {
     fault: Arc<Mutex<Option<Ap2Fault>>>,
     dead: Arc<AtomicBool>,
+    /// The receiver's name, for the log.
     host: String,
+    /// What its faults are remembered under: the receiver's id when the
+    /// session gave one ([`FaultSlot::with_key`]), else its name.
+    key: String,
     /// When the session finished its bring-up; None until then.
     started: Arc<Mutex<Option<Instant>>>,
 }
 
 impl FaultSlot {
     pub fn new(dead: Arc<AtomicBool>, host: String) -> Self {
-        Self { fault: Arc::new(Mutex::new(None)), dead, host, started: Arc::new(Mutex::new(None)) }
+        Self { fault: Arc::new(Mutex::new(None)), dead, key: host.clone(), host, started: Arc::new(Mutex::new(None)) }
     }
 
     /// The session's bring-up has reached the point where it can no longer
@@ -190,7 +194,7 @@ impl FaultSlot {
         if slot.is_none() {
             let started = *self.started.lock().unwrap();
             let repeated = started.is_some_and(|started| {
-                REPEATS.lock().unwrap_or_else(|e| e.into_inner()).repeated(&self.host, code, started, played, Instant::now())
+                REPEATS.lock().unwrap_or_else(|e| e.into_inner()).repeated(&self.key, code, started, played, Instant::now())
             });
             let fault = if repeated {
                 warn!(
@@ -211,10 +215,17 @@ impl FaultSlot {
         self.fault.lock().unwrap().clone()
     }
 
+    /// Remember this session's faults under `key`, the receiver's own id,
+    /// rather than its name (two receivers can carry the same name).
+    pub fn with_key(mut self, key: String) -> Self {
+        self.key = key;
+        self
+    }
+
     /// The session sent its first audio: earlier faults on this receiver
     /// are no longer "just before" anything ([`RepeatMemory::forget`]).
     pub fn note_playing(&self) {
-        REPEATS.lock().unwrap_or_else(|e| e.into_inner()).forget(&self.host);
+        REPEATS.lock().unwrap_or_else(|e| e.into_inner()).forget(&self.key);
     }
 
     #[cfg(test)]
@@ -682,6 +693,24 @@ mod tests {
         m.forget("airplay:A");
         assert!(!m.repeated("airplay:A", "anchor_failed", t + s(30), false, t + s(50)), "A played since");
         assert!(m.repeated("airplay:B", "anchor_failed", t + s(6), false, t + s(25)), "B didn't");
+    }
+
+    /// Faults are remembered per receiver, by its own id: two speakers that
+    /// carry the same name don't stand in for each other.
+    #[test]
+    fn faults_are_remembered_per_receiver_not_per_name() {
+        let slot = |id: &str| {
+            let s = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Living Room".into()).with_key(id.into());
+            s.arm(Instant::now());
+            s
+        };
+        let retryable = |s: FaultSlot| {
+            s.raise_unless_repeated("test_fault", FaultChannel::Media, "detail".into(), false, || "final".into());
+            s.get().unwrap().retryable
+        };
+        assert!(retryable(slot("airplay:11")), "first fault on speaker 11");
+        assert!(retryable(slot("airplay:22")), "the other Living Room is no reconnect of speaker 11");
+        assert!(!retryable(slot("airplay:11")), "speaker 11's reconnect is");
     }
 
     /// The final fault is what the window shows after "Connection to …
