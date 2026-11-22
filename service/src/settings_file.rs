@@ -7,16 +7,20 @@
 //! 1. writes the new text to a temporary file with a name of its own
 //!    (`config.json.<process>-<n>.tmp`: the app and `--web-link` may save
 //!    at the same moment) and flushes it to the disk;
-//! 2. when the file it replaces is usable, copies that file the same way
-//!    to `config.json.bak` (through a temporary file of its own, then a
-//!    rename);
-//! 3. renames the temporary file over `config.json`.
+//! 2. renames it over `config.json`;
+//! 3. writes the same text to `config.json.bak` the same way: a temporary
+//!    file of its own, flushed, then renamed.
 //!
 //! `config.json` is complete and on the disk at every moment, because a
 //! rename only takes the place of a file whose data is already flushed;
-//! the backup is the settings as they were before the latest save. A
-//! loader that finds `config.json` missing, empty, zero-filled or not a
-//! JSON object reads the backup instead (see `user_config`).
+//! so is the backup. Before step 2 both hold the settings before the save,
+//! between steps 2 and 3 `config.json` holds the new ones and the backup
+//! the old, afterwards both hold the new. The backup is a mirror of what
+//! this app last saved, not a history: it never holds raw bytes from
+//! elsewhere (a broken file, secrets an older version left unsealed), and
+//! a secret removed from the settings leaves the backup with the same
+//! save. A loader that finds `config.json` missing, empty, zero-filled or
+//! not a JSON object reads the backup instead (see `user_config`).
 //!
 //! The file operations go through [`FileOps`] so the tests can cut the
 //! power after each one.
@@ -137,31 +141,54 @@ pub enum WriteError {
     Replace(io::Error),
 }
 
-/// Replace `path` with `bytes` by the steps in the module docs. `current`
-/// is the file as it is now when it is usable settings: it becomes the
-/// backup. A backup that can't be written is logged and the save goes on
-/// (the file itself is still replaced safely). Nothing temporary is left
+/// Replace `path` with `bytes`, then the backup with the same, by the
+/// steps in the module docs. The save has succeeded once `path` is
+/// replaced: a backup that can't be written is logged (once each time
+/// that changes) and doesn't make it fail. Nothing temporary is left
 /// behind, whatever happens.
-pub fn replace(fs: &dyn FileOps, path: &Path, bytes: &[u8], current: Option<&[u8]>) -> Result<(), WriteError> {
+pub fn replace(fs: &dyn FileOps, path: &Path, bytes: &[u8]) -> Result<(), WriteError> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs.create_dir_all(dir).map_err(WriteError::Folder)?;
     }
     let tmp = write_temp(fs, path, bytes).map_err(WriteError::Write)?;
-    if let Some(current) = current {
-        let backup = backup_path(path);
-        let kept = write_temp(fs, &backup, current).and_then(|bak_tmp| {
-            fs.rename(&bak_tmp, &backup).inspect_err(|_| {
-                let _ = fs.remove(&bak_tmp);
-            })
-        });
-        if let Err(e) = kept {
-            log::warn!("user_config: couldn't update the backup {} ({e})", backup.display());
-        }
-    }
     fs.rename(&tmp, path).map_err(|e| {
         let _ = fs.remove(&tmp);
         WriteError::Replace(e)
-    })
+    })?;
+    let backup = backup_path(path);
+    let mirrored = write_temp(fs, &backup, bytes).and_then(|bak_tmp| {
+        fs.rename(&bak_tmp, &backup).inspect_err(|_| {
+            let _ = fs.remove(&bak_tmp);
+        })
+    });
+    note_backup(&backup, mirrored);
+    Ok(())
+}
+
+/// The last backup failure logged, so a failure that repeats at every
+/// save is logged once (and its end once).
+static BACKUP_FAILURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn note_backup(backup: &Path, result: io::Result<()>) {
+    let Ok(mut last) = BACKUP_FAILURE.lock() else { return };
+    match result {
+        Ok(()) => {
+            if last.take().is_some() {
+                log::info!("user_config: the backup {} is written again", backup.display());
+            }
+        }
+        Err(e) => {
+            let why = e.to_string();
+            if last.as_deref() != Some(why.as_str()) {
+                log::warn!(
+                    "user_config: the settings are saved, but their backup {} couldn't be \
+                     written ({why})",
+                    backup.display()
+                );
+                *last = Some(why);
+            }
+        }
+    }
 }
 
 /// A temporary file older than this is left from a save that was cut
@@ -332,41 +359,70 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_save_leaves_the_file_the_backup_and_nothing_else() {
+    fn a_save_leaves_the_file_its_mirror_and_nothing_else() {
         let disk = PowerCutDisk::with_file(&path(), b"{\"old\":1}");
-        replace(&disk, &path(), b"{\"new\":2}", Some(b"{\"old\":1}")).unwrap();
+        replace(&disk, &path(), b"{\"new\":2}").unwrap();
         assert_eq!(disk.get(&path()).unwrap(), b"{\"new\":2}");
-        assert_eq!(disk.get(&backup_path(&path())).unwrap(), b"{\"old\":1}");
+        assert_eq!(disk.get(&backup_path(&path())).unwrap(), b"{\"new\":2}");
         assert_eq!(disk.names(), ["config.json", "config.json.bak"]);
-        // A file that isn't usable doesn't become the backup.
-        replace(&disk, &path(), b"{\"newer\":3}", None).unwrap();
-        assert_eq!(disk.get(&backup_path(&path())).unwrap(), b"{\"old\":1}");
     }
 
     #[test]
     fn a_failed_save_leaves_nothing_temporary() {
         // A full save is four operations; make each one fail in turn (the
-        // others work): the file is the old or the new text, the backup is
-        // never anything but the old text, and no temporary file is left.
+        // others work). The file is the old or the new text, the backup
+        // the old or the new, no temporary file is left, and the save has
+        // failed exactly when the file is still the old text.
         let full = {
             let disk = PowerCutDisk::with_file(&path(), b"{\"old\":1}");
-            replace(&disk, &path(), b"{\"new\":2}", Some(b"{\"old\":1}")).unwrap();
+            replace(&disk, &path(), b"{\"new\":2}").unwrap();
             disk.ops()
         };
         assert_eq!(full, 4);
         for n in 0..full {
             let disk = PowerCutDisk::with_file(&path(), b"{\"old\":1}");
+            disk.create_flushed(&backup_path(&path()), b"{\"old\":1}").unwrap();
+            disk.cut_after(usize::MAX);
             *disk.fail_only.borrow_mut() = Some(n);
-            let result = replace(&disk, &path(), b"{\"new\":2}", Some(b"{\"old\":1}"));
+            let result = replace(&disk, &path(), b"{\"new\":2}");
             let names = disk.names();
             assert!(names.iter().all(|f| !f.ends_with(".tmp")), "op {n}: {names:?}");
             let file = disk.get(&path()).unwrap();
             assert!(file == b"{\"old\":1}" || file == b"{\"new\":2}", "op {n}");
             assert_eq!(result.is_ok(), file == b"{\"new\":2}", "op {n}: {result:?}");
-            if let Some(bak) = disk.get(&backup_path(&path())) {
-                assert_eq!(bak, b"{\"old\":1}", "op {n}");
+            let bak = disk.get(&backup_path(&path())).unwrap();
+            assert!(bak == b"{\"old\":1}" || bak == b"{\"new\":2}", "op {n}");
+        }
+        // A rename that fails takes its temporary file with it.
+        struct NoRename<'a>(&'a PowerCutDisk);
+        impl FileOps for NoRename<'_> {
+            fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+                self.0.read(p)
+            }
+            fn create_flushed(&self, p: &Path, b: &[u8]) -> io::Result<()> {
+                self.0.create_flushed(p, b)
+            }
+            fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+            fn remove(&self, p: &Path) -> io::Result<()> {
+                self.0.remove(p)
+            }
+            fn create_dir_all(&self, d: &Path) -> io::Result<()> {
+                self.0.create_dir_all(d)
+            }
+            fn list(&self, d: &Path) -> io::Result<Vec<String>> {
+                self.0.list(d)
+            }
+            fn age(&self, p: &Path) -> Option<Duration> {
+                self.0.age(p)
             }
         }
+        let disk = PowerCutDisk::with_file(&path(), b"{\"old\":1}");
+        let err = replace(&NoRename(&disk), &path(), b"{\"new\":2}").unwrap_err();
+        assert!(matches!(err, WriteError::Replace(_)), "{err:?}");
+        assert_eq!(disk.names(), ["config.json"]);
+        assert_eq!(disk.get(&path()).unwrap(), b"{\"old\":1}");
     }
 
     #[test]
@@ -377,7 +433,7 @@ pub(crate) mod tests {
         let next = TEMP_COUNTER.load(Ordering::Relaxed);
         let theirs = sibling(&path(), &format!("{}-{next}.tmp", std::process::id()));
         disk.create_flushed(&theirs, b"theirs").unwrap();
-        replace(&disk, &path(), b"{\"mine\":1}", None).unwrap();
+        replace(&disk, &path(), b"{\"mine\":1}").unwrap();
         assert_eq!(disk.get(&theirs).unwrap(), b"theirs");
         assert_eq!(disk.get(&path()).unwrap(), b"{\"mine\":1}");
     }
@@ -397,10 +453,10 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("sts-settings-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("config.json");
-        replace(&Disk, &path, b"{\"a\":1}", None).unwrap();
-        replace(&Disk, &path, b"{\"a\":2}", Some(b"{\"a\":1}")).unwrap();
+        replace(&Disk, &path, b"{\"a\":1}").unwrap();
+        replace(&Disk, &path, b"{\"a\":2}").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":2}");
-        assert_eq!(std::fs::read(backup_path(&path)).unwrap(), b"{\"a\":1}");
+        assert_eq!(std::fs::read(backup_path(&path)).unwrap(), b"{\"a\":2}");
         let mut names: Vec<_> = Disk.list(&dir).unwrap();
         names.sort();
         assert_eq!(names, ["config.json", "config.json.bak"]);
@@ -408,7 +464,7 @@ pub(crate) mod tests {
         let n = TEMP_COUNTER.load(Ordering::Relaxed);
         let blocker = sibling(&path, &format!("{}-{n}.tmp", std::process::id()));
         std::fs::write(&blocker, b"keep").unwrap();
-        replace(&Disk, &path, b"{\"a\":3}", None).unwrap();
+        replace(&Disk, &path, b"{\"a\":3}").unwrap();
         assert_eq!(std::fs::read(&blocker).unwrap(), b"keep");
         let _ = std::fs::remove_dir_all(&dir);
     }

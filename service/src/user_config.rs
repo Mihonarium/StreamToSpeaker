@@ -655,16 +655,13 @@ impl UserConfig {
             Saves::AtPath(_) => {}
         }
         let mut tree = serde_json::to_value(self).map_err(|e| format!("serialize: {e}"))?;
-        // The file as it is now: it becomes the backup when it is usable,
-        // and it may hold a web key stored since these settings were read.
-        let now = fs.read(path).ok();
-        let now_tree = now.as_deref().and_then(|b| settings_tree(b).ok()).map(|(t, _)| t);
         if self.web_secret.is_none() {
             // The file may hold a key `--web-link` stored while these
             // settings held none. Writing none over it would break the link
             // it printed; the app takes that key when its web UI is turned
             // on (see `web_access::stored_or_new_secret`).
-            if let Some(key) = now_tree.as_ref().and_then(|t| stored_web_secret_in(t, codec)) {
+            let now = fs.read(path).ok().and_then(|b| settings_tree(&b).ok());
+            if let Some(key) = now.and_then(|(t, _)| stored_web_secret_in(&t, codec)) {
                 if let Some(fields) = tree.as_object_mut() {
                     fields.insert("web_secret".into(), serde_json::Value::String(key));
                 }
@@ -672,8 +669,7 @@ impl UserConfig {
         }
         secret_store::seal(&mut tree, &self.locked_secrets, codec);
         let content = serde_json::to_string_pretty(&tree).map_err(|e| format!("serialize: {e}"))?;
-        let backup = now.as_deref().filter(|_| now_tree.is_some());
-        settings_file::replace(fs, path, content.as_bytes(), backup).map_err(|e| match e {
+        settings_file::replace(fs, path, content.as_bytes()).map_err(|e| match e {
             WriteError::Folder(e) => format!("mkdir {}: {}", path.parent().unwrap_or(path).display(), e),
             WriteError::Write(e) => format!("write beside {}: {}", path.display(), e),
             WriteError::Replace(e) => format!("replace {}: {}", path.display(), e),
@@ -912,7 +908,8 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
         assert_eq!(UserConfig::stored_web_secret_at(&path, &codec), None);
         assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // Only the file and its backup: nothing was moved aside.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
         // Test settings with a file of their own read it; ones in memory, and
         // ones that couldn't be read at startup, read nothing.
         let own = dir.join("own").join("config.json");
@@ -1040,18 +1037,20 @@ mod tests {
         let mut disk = PowerCutDisk::default();
         numbered("before").try_save_to_ops(&path, &codec, &disk).unwrap();
         numbered("last").try_save_to_ops(&path, &codec, &disk).unwrap();
-        // Something writes the file the way earlier versions did (no flush
-        // before the rename), and the power goes before the data is on the
-        // disk: the file has its length and nothing but zeros.
+        // An earlier version saves the way it did (no flush before the
+        // rename), and the power goes before the data is on the disk: the
+        // file has its length and nothing but zeros.
         disk.cached_writes = true;
         let text = serde_json::to_string_pretty(&numbered("unflushed")).unwrap();
-        crate::settings_file::replace(&disk, &path, text.as_bytes(), None).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        disk.create_flushed(&tmp, text.as_bytes()).unwrap();
+        disk.rename(&tmp, &path).unwrap();
         let after = disk.after_power_cut();
         assert!(after.get(&path).unwrap().iter().all(|&b| b == 0));
         let loaded = UserConfig::load_with_ops(&path, &codec, &after);
-        // The backup: the settings before the last save of this version.
-        assert_eq!(loaded.last_speaker_id.as_deref(), Some("before"));
-        assert_eq!(loaded.airplay_passwords["airplay:aa"], "pw-before");
+        // The backup: the settings this version saved last.
+        assert_eq!(loaded.last_speaker_id.as_deref(), Some("last"));
+        assert_eq!(loaded.airplay_passwords["airplay:aa"], "pw-last");
         let notice = loaded.load_notice();
         assert!(notice.restored_from_backup && !notice.all_reset);
         // The zeroed file is kept aside, never as the backup, and the
@@ -1061,8 +1060,76 @@ mod tests {
         let bak = after.get(&crate::settings_file::backup_path(&path)).unwrap();
         assert!(!bak.iter().all(|&b| b == 0));
         let again = UserConfig::load_with_ops(&path, &codec, &after);
-        assert_eq!(again.last_speaker_id.as_deref(), Some("before"));
+        assert_eq!(again.last_speaker_id.as_deref(), Some("last"));
         assert!(again.load_notice().is_empty(), "told once");
+    }
+
+    /// Every file in `dir` with its text.
+    fn folder_text(dir: &std::path::Path) -> Vec<(String, String)> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let text = String::from_utf8_lossy(&std::fs::read(e.path()).unwrap()).into_owned();
+                (e.file_name().to_string_lossy().into_owned(), text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_file_in_the_folder_keeps_a_secret_an_older_version_left_unsealed() {
+        use crate::secret_store::tests::FakeCodec;
+        let dir = temp_config_dir("plain-secrets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let seed = "ab".repeat(32);
+        // As a version from before sealing wrote it.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"last_speaker_id":"x","airplay_passwords":{{"airplay:aa":"hunter2"}},
+                    "airplay_pairings":{{"airplay:cc":{{"controller_id":"ctl",
+                    "controller_seed_hex":"{seed}","accessory_id":"acc",
+                    "accessory_ltpk_hex":"{}"}}}}}}"#,
+                "cd".repeat(32)
+            ),
+        )
+        .unwrap();
+        // Loading seals them and saves at once.
+        let c = UserConfig::load_from_with(&path, &FakeCodec(0x42));
+        assert_eq!(c.airplay_passwords["airplay:aa"], "hunter2");
+        let files = folder_text(&dir);
+        assert!(files.iter().any(|(n, _)| n == "config.json.bak"), "{files:?}");
+        for (name, text) in &files {
+            assert!(!text.contains("hunter2") && !text.contains(&seed), "{name}: {text}");
+        }
+        // The mirror loads to the same settings as the file.
+        let from_file = UserConfig::load_from_with(&path, &FakeCodec(0x42));
+        let from_backup =
+            UserConfig::load_from_with(&crate::settings_file::backup_path(&path), &FakeCodec(0x42));
+        assert_eq!(serde_json::to_value(&from_backup).unwrap(), serde_json::to_value(&from_file).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_removed_password_leaves_the_file_and_the_backup_with_the_same_save() {
+        use crate::secret_store::tests::FakeCodec;
+        let codec = FakeCodec(0x42);
+        let dir = temp_config_dir("removed-password");
+        let path = dir.join("config.json");
+        let mut c = numbered("x");
+        c.airplay_passwords.insert("airplay:bb".into(), "gone-soon".into());
+        c.save_to_with(&path, &codec);
+        for (name, text) in folder_text(&dir) {
+            assert!(text.contains("/airplay_passwords/airplay:bb"), "{name}: sealed there before");
+        }
+        c.remove_airplay_password("airplay:bb");
+        c.save_to_with(&path, &codec);
+        for (name, text) in folder_text(&dir) {
+            assert!(!text.contains("airplay:bb"), "{name}: {text}");
+            assert!(text.contains("/airplay_passwords/airplay:aa"), "{name}: the other one stays");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1078,8 +1145,8 @@ mod tests {
             ("not an object", Some(&b"[1, 2]"[..])),
         ] {
             let disk = PowerCutDisk::default();
+            numbered("older").try_save_to_ops(&path, &codec, &disk).unwrap();
             numbered("good").try_save_to_ops(&path, &codec, &disk).unwrap();
-            numbered("newer").try_save_to_ops(&path, &codec, &disk).unwrap();
             disk.remove(&path).unwrap();
             if let Some(bytes) = file {
                 disk.create_flushed(&path, bytes).unwrap();
@@ -1248,8 +1315,10 @@ mod tests {
         loaded.save_to(&path);
         loaded.clone().save_to(&path);
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
-        assert_eq!(names, ["config.json"]);
+        let mut names: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["config.json", "config.json.bak"]);
         // The next launch reads it as it was.
         let next = UserConfig::load_from(&path);
         assert_eq!(next.last_speaker_id.as_deref(), Some("kept"));
@@ -1282,7 +1351,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"", "the broken file is left as it is");
         assert_eq!(std::fs::read(&bak).unwrap(), backup);
         // Readable at the next start: the backup is used.
-        assert_eq!(UserConfig::load_from(&path).last_speaker_id.as_deref(), Some("a"));
+        assert_eq!(UserConfig::load_from(&path).last_speaker_id.as_deref(), Some("b"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
