@@ -2420,8 +2420,9 @@ impl App {
         let local_ip = self.local_ip_toward(new_r.ip).map_err(|e| e.to_string())?;
         let (stream_uri, callback_url) = local_urls(local_ip, self.config.bind.port());
         let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms);
+        let (name, ip) = (new_r.display_name(), new_r.ip);
         let session = start_session(new_r, &stream_uri, &didl, &callback_url, Some(grant))
-        .map_err(|e| format!("{:#}", e))?;
+            .map_err(|e| self.upnp_failure_message(&name, ip, &e))?;
         Ok(ActiveSession::Upnp(session))
     }
 
@@ -2453,12 +2454,31 @@ impl App {
         let local_ip = self.local_ip_toward(r.ip).map_err(|e| e.to_string())?;
         let (stream_uri, callback_url) = local_urls(local_ip, self.config.bind.port());
         let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms);
+        let (name, ip) = (r.display_name(), r.ip);
         let mut session = start_session(r, &stream_uri, &didl, &callback_url, Some(grant))
-            .map_err(|e| format!("{:#}", e))?;
+            .map_err(|e| self.upnp_failure_message(&name, ip, &e))?;
         if !redirected {
             session.id_override = Some(m.id());
         }
         Ok(ActiveSession::Upnp(session))
+    }
+
+    /// What the person is told when starting the UPnP speaker `name` at
+    /// `ip` failed with `e`: the app's own words for what the speaker said
+    /// (see [`upnp::ActionError::for_person`]).
+    fn upnp_failure_message(&self, name: &str, ip: IpAddr, e: &anyhow::Error) -> String {
+        match e.downcast_ref::<upnp::ActionError>() {
+            Some(failure) => failure.for_person(name, self.has_airplay_entry_at(ip)),
+            None => format!("{:#}", e),
+        }
+    }
+
+    /// Whether the speaker list has a usable AirPlay entry at `ip` (the
+    /// same device, reachable over AirPlay too).
+    fn has_airplay_entry_at(&self, ip: IpAddr) -> bool {
+        self.airplay_discovery
+            .as_ref()
+            .is_some_and(|d| d.renderers().iter().any(|r| r.ip == ip && r.transport().is_some()))
     }
 
     /// AirPlay session to a discovered receiver (`manual` None) or to one
@@ -3841,14 +3861,16 @@ pub fn start_session(
 ) -> Result<RendererSession> {
     info!("targeting speaker: {} ({})", renderer.display_name(), renderer.ip);
     // Stop first to clear any "Transport Locked" (Sonos 705) carry-over.
-    let _ = upnp::stop(&renderer.av_transport_control_url);
+    let avt = renderer.av_transport_control_url.as_str();
+    let _ = upnp::stop(avt);
     std::thread::sleep(Duration::from_millis(100));
-    upnp::set_av_transport_uri(&renderer.av_transport_control_url, stream_uri, didl)?;
-    std::thread::sleep(Duration::from_millis(100));
-    if let Err(e) = upnp::play(&renderer.av_transport_control_url) {
-        // The renderer holds our URI and may still start on it: tell it
-        // to let go, so a failure reported here is not a speaker playing.
-        let _ = upnp::stop(&renderer.av_transport_control_url);
+    let started = upnp::set_av_transport_uri(avt, stream_uri, didl).and_then(|()| {
+        std::thread::sleep(Duration::from_millis(100));
+        play_taken_uri(avt)
+    });
+    if let Err(e) = started {
+        // The speaker's own answer, in full, for whoever reads the log.
+        warn!("UPnP: {} ({}): {:#}", renderer.display_name(), renderer.ip, e);
         return Err(e);
     }
 
@@ -3871,6 +3893,27 @@ pub fn start_session(
         stream_grant,
         id_override: None,
     })
+}
+
+/// How long a renderer that is still taking the URI gets before Play is
+/// sent again.
+const PLAY_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// Play, right after the renderer accepted our URI. A renderer still busy
+/// taking it answers 701 ("Transition not available"), so that answer gets
+/// Play once more after a moment. If Play still fails, the renderer holds
+/// our URI and may yet start on it: it is told to stop, so a failure
+/// reported here is not a speaker playing.
+fn play_taken_uri(avt: &str) -> Result<()> {
+    let mut result = upnp::play(avt);
+    if result.as_ref().err().and_then(upnp::fault_code) == Some(701) {
+        std::thread::sleep(PLAY_RETRY_WAIT);
+        result = upnp::play(avt);
+    }
+    if result.is_err() {
+        let _ = upnp::stop(avt);
+    }
+    result
 }
 
 pub fn stop_session(session: &RendererSession) {
@@ -4153,6 +4196,48 @@ mod tests {
         assert!(r.is_err());
         // The renderer holds our URI; it is told to let go of it.
         assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Stop"]);
+    }
+
+    #[test]
+    fn play_answered_transition_not_available_is_tried_once_more() {
+        use crate::fake_renderer::Reply;
+        // 701: the renderer is still busy taking the URI.
+        let fake = renderer_answering_play(vec![Reply::soap_fault(701, "Transition not available")]);
+        let session = start_session(renderer_on(&fake), "http://127.0.0.1:1/stream.raw", "", "http://127.0.0.1:1/gena", None)
+            .expect("the second Play is accepted");
+        assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Play"]);
+        session.gena.unsubscribe();
+        crate::gena::registry().remove("uuid:fake-session");
+
+        // Refused twice: given up, and the renderer is stopped.
+        let fake = renderer_answering_play(vec![
+            Reply::soap_fault(701, "Transition not available"),
+            Reply::soap_fault(701, "Transition not available"),
+        ]);
+        assert!(start_session(renderer_on(&fake), "http://127.0.0.1:1/stream.raw", "", "http://127.0.0.1:1/gena", None).is_err());
+        assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Play", "Stop"]);
+    }
+
+    /// A speaker added by the address of `fake`'s description.
+    fn manual_upnp(fake: &crate::fake_renderer::FakeRenderer) -> ManualSpeaker {
+        ManualSpeaker { kind: ManualKind::Upnp, name: String::new(), host: fake.url("/description.xml"), port: 0 }
+    }
+
+    #[test]
+    fn a_refused_connect_tells_the_person_why_in_the_apps_words() {
+        use crate::fake_renderer::{renderer_description, FakeRenderer, Reply, AV_TRANSPORT};
+        let fake = FakeRenderer::start(|req| match req.soap_action() {
+            Some("SetAVTransportURI") => Reply::soap_fault(714, "Illegal MIME-type"),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None => Reply::ok(&renderer_description("Den Amp", false)),
+        });
+        let app = test_app();
+        let Err(msg) = app.start_upnp_manual(&manual_upnp(&fake)) else { panic!("connected") };
+        assert_eq!(
+            msg,
+            "Den Amp doesn't accept the audio format Stream To Speaker sent it. \
+             (Den Amp answered: UPnP error 714, \"Illegal MIME-type\".)"
+        );
     }
 
     #[test]

@@ -157,6 +157,31 @@ impl Reply {
     }
 }
 
+/// A MediaRenderer device description named `name`, its services on the
+/// describing host at `/AVTransport/...`, `/RenderingControl/...` and,
+/// with `connection_manager`, `/ConnectionManager/...`.
+pub(crate) fn renderer_description(name: &str, connection_manager: bool) -> String {
+    let service = |kind: &str| {
+        format!(
+            "<service><serviceType>urn:schemas-upnp-org:service:{kind}:1</serviceType>\
+             <serviceId>urn:upnp-org:serviceId:{kind}</serviceId><SCPDURL>/{kind}/scpd.xml</SCPDURL>\
+             <controlURL>/{kind}/Control</controlURL><eventSubURL>/{kind}/Event</eventSubURL></service>"
+        )
+    };
+    let cm = if connection_manager { service("ConnectionManager") } else { String::new() };
+    format!(
+        "<?xml version=\"1.0\"?>\n<root xmlns=\"urn:schemas-upnp-org:device-1-0\"><specVersion><major>1</major>\
+         <minor>0</minor></specVersion><device><deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>\
+         <friendlyName>{}</friendlyName><modelName>Fake</modelName><UDN>uuid:fake-{}</UDN><serviceList>{}{}{}\
+         </serviceList></device></root>",
+        escape(name),
+        escape(&name.to_ascii_lowercase().replace(' ', "-")),
+        service("AVTransport"),
+        service("RenderingControl"),
+        cm,
+    )
+}
+
 fn envelope(body: &str) -> String {
     format!(
         "<?xml version=\"1.0\"?>\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \

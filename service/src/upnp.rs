@@ -315,15 +315,123 @@ pub(crate) enum Failure {
     /// in time, or what came back couldn't be read.
     NoAnswer(HttpError),
     /// The device answered and refused, with this status (`HTTP 500
-    /// Internal Server Error`).
-    Refused { status: String },
+    /// Internal Server Error`) and the UPnP error it gave, if any.
+    Refused { status: String, fault: Option<Fault> },
+}
+
+/// The UPnP error a refusal carries ([UDA] 3.2.5: `<UPnPError>` with
+/// `<errorCode>` and `<errorDescription>`). The description is the
+/// device's own text, so it is kept short and printable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Fault {
+    pub code: Option<u32>,
+    pub description: Option<String>,
+}
+
+/// Longest part of a device's error description that is kept.
+const FAULT_DESCRIPTION_CHARS: usize = 120;
+
+impl Fault {
+    /// The fault in a refusal's body, if the body is a SOAP fault. A body
+    /// the XML parser refuses (a control character in the description,
+    /// say) still has its two elements read as text.
+    fn parse(body: &[u8]) -> Option<Fault> {
+        let text = String::from_utf8_lossy(body);
+        let text = text.trim_start_matches('\u{feff}').trim_start();
+        let (code, description) = match roxmltree::Document::parse(text) {
+            Ok(doc) => {
+                let err = doc.descendants().find(|n| n.tag_name().name() == "UPnPError")?;
+                let child = |name: &str| {
+                    err.children().find(|n| n.tag_name().name() == name).and_then(|n| n.text()).map(str::to_string)
+                };
+                (child("errorCode"), child("errorDescription"))
+            }
+            Err(_) => {
+                let child = |name: &str| {
+                    let raw = crate::gena::find_tag_text(text, name)?;
+                    let raw: String = raw.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+                    Some(crate::gena::decode_xml_text(&raw))
+                };
+                (child("errorCode"), child("errorDescription"))
+            }
+        };
+        let code = code.and_then(|c| c.trim().parse::<u32>().ok());
+        let description = description
+            .map(|d| device_http::printable(&d, FAULT_DESCRIPTION_CHARS).replace('"', "'"))
+            .filter(|d| !d.is_empty());
+        (code.is_some() || description.is_some()).then_some(Fault { code, description })
+    }
+
+    /// `UPnP error 714 "Illegal MIME-type"`, or what of it there is.
+    fn describe(&self, separator: &str) -> String {
+        match (self.code, &self.description) {
+            (Some(code), Some(d)) => format!("UPnP error {code}{separator}\"{d}\""),
+            (Some(code), None) => format!("UPnP error {code}"),
+            (None, Some(d)) => format!("UPnP error \"{d}\""),
+            (None, None) => "UPnP error".to_string(),
+        }
+    }
+}
+
+impl ActionError {
+    /// The UPnP error code the device refused with, if it gave one.
+    pub fn fault_code(&self) -> Option<u32> {
+        match &self.failure {
+            Failure::Refused { fault: Some(f), .. } => f.code,
+            _ => None,
+        }
+    }
+
+    /// What the person is told when connecting to `speaker` failed this
+    /// way: what happened, the likely cause and what to do, then what the
+    /// speaker itself said. `has_airplay_entry`: the same speaker is also
+    /// in the list as an AirPlay entry, which may work where UPnP didn't.
+    pub fn for_person(&self, speaker: &str, has_airplay_entry: bool) -> String {
+        let airplay = if has_airplay_entry { " Its AirPlay entry may work." } else { "" };
+        match &self.failure {
+            Failure::NoAnswer(HttpError::Connect(_)) => format!(
+                "{speaker} can't be reached. Check that it's switched on and connected to the same network as this PC."
+            ),
+            Failure::NoAnswer(HttpError::NoAnswer(d)) => {
+                format!("{speaker} didn't answer within {} seconds. Try again in a moment.", d.as_secs_f32())
+            }
+            Failure::NoAnswer(HttpError::BadUrl(why)) => {
+                format!("{speaker} gave an address for its controls that Stream To Speaker can't use: {why}.")
+            }
+            Failure::NoAnswer(e) => format!("{speaker} sent an answer Stream To Speaker couldn't read ({e})."),
+            Failure::Refused { status, fault } => {
+                let what = match self.fault_code() {
+                    Some(714) => format!("{speaker} doesn't accept the audio format Stream To Speaker sent it.{airplay}"),
+                    Some(716) => format!(
+                        "{speaker} couldn't fetch the audio from this PC. Windows Firewall may be blocking it: \
+                         allow Stream To Speaker on this network."
+                    ),
+                    Some(701 | 705) => format!("{speaker} is busy and didn't take the stream. Try again in a moment."),
+                    _ => format!("{speaker} refused the stream.{airplay}"),
+                };
+                let answered = match fault {
+                    Some(f) => f.describe(", "),
+                    None => status.clone(),
+                };
+                format!("{what} ({speaker} answered: {answered}.)")
+            }
+        }
+    }
+}
+
+/// The UPnP error code an action refused with, when `e` is such a refusal.
+pub(crate) fn fault_code(e: &anyhow::Error) -> Option<u32> {
+    e.downcast_ref::<ActionError>().and_then(ActionError::fault_code)
 }
 
 impl std::fmt::Display for ActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.failure {
             Failure::NoAnswer(e) => write!(f, "{}: {}", self.action, e),
-            Failure::Refused { status } => write!(f, "{} refused: {}", self.action, status),
+            Failure::Refused { status, fault: None } => write!(f, "{} refused: {}", self.action, status),
+            Failure::Refused { status, fault: Some(fault) } => {
+                write!(f, "{} refused: {}, {}", self.action, status, fault.describe(" "))
+            }
         }
     }
 }
@@ -357,7 +465,7 @@ fn soap_post(
     let resp = device_http::exchange(&request, limits).map_err(|e| fail(Failure::NoAnswer(e)))?;
     debug!("SOAP {}#{} -> {}", service, action, resp.status_text());
     if resp.status != 200 {
-        return Err(fail(Failure::Refused { status: resp.status_text() }));
+        return Err(fail(Failure::Refused { status: resp.status_text(), fault: Fault::parse(&resp.body) }));
     }
     Ok(String::from_utf8_lossy(&resp.body).into_owned())
 }
@@ -507,6 +615,105 @@ mod tests {
         let big = format!("<ZoneGroupState>{}</ZoneGroupState>", "x".repeat(1100 * 1024));
         let fake = FakeRenderer::start(move |_| Reply::ok(&big));
         assert!(get_zone_group_state(&fake.url("/ZoneGroupTopology/Control")).is_err());
+    }
+
+    // ---- refusals ------------------------------------------------------
+
+    /// What SetAVTransportURI fails with when the renderer answers `reply`.
+    fn refusal(reply: Reply) -> anyhow::Error {
+        let fake = FakeRenderer::start(move |_| reply.clone());
+        set_av_transport_uri(&fake.url("/AVTransport/Control"), "http://127.0.0.1:1/stream.raw", "")
+            .expect_err("refused")
+    }
+
+    fn action_error(e: &anyhow::Error) -> &ActionError {
+        e.downcast_ref::<ActionError>().expect("an ActionError")
+    }
+
+    #[test]
+    fn a_refusal_carries_the_renderers_error_code_and_text() {
+        let e = refusal(Reply::soap_fault(714, "Illegal MIME-type"));
+        assert_eq!(action_error(&e).fault_code(), Some(714));
+        let line = format!("{e:#}");
+        assert_eq!(
+            line,
+            "SetAVTransportURI refused: HTTP 500 Internal Server Error, UPnP error 714 \"Illegal MIME-type\""
+        );
+    }
+
+    #[test]
+    fn the_renderers_own_text_is_bounded_and_printable() {
+        let hostile = format!("Evil\u{1b}[2J\r\nnext \"line\"{}", "A".repeat(10_000));
+        let e = refusal(Reply::soap_fault(402, &hostile));
+        let line = format!("{e:#}");
+        assert!(!line.chars().any(|c| c.is_control()), "{line:?}");
+        assert!(line.chars().count() < 250, "{} chars: {line}", line.chars().count());
+        assert!(line.contains("UPnP error 402 \"Evil [2J next 'line'AAAA"), "{line}");
+        assert!(line.ends_with("…\""), "{line}");
+        let told = action_error(&e).for_person("Kitchen", false);
+        assert!(!told.chars().any(|c| c.is_control()) && told.chars().count() < 300, "{told}");
+    }
+
+    #[test]
+    fn a_refusal_without_a_fault_names_the_status() {
+        for body in ["<html><body>Oops</body></html>", "", "<s:Envelope><s:Body><s:Fault/></s:Body></s:Envelope>"] {
+            let e = refusal(Reply::status(500, "Internal Server Error", &[], body));
+            assert_eq!(action_error(&e).fault_code(), None, "{body}");
+            assert_eq!(format!("{e:#}"), "SetAVTransportURI refused: HTTP 500 Internal Server Error");
+        }
+    }
+
+    #[test]
+    fn the_person_is_told_what_happened_and_what_to_do() {
+        let told = |reply: Reply, airplay: bool| action_error(&refusal(reply)).for_person("Kitchen", airplay);
+        assert_eq!(
+            told(Reply::soap_fault(714, "Illegal MIME-type"), true),
+            "Kitchen doesn't accept the audio format Stream To Speaker sent it. Its AirPlay entry may work. \
+             (Kitchen answered: UPnP error 714, \"Illegal MIME-type\".)"
+        );
+        assert_eq!(
+            told(Reply::soap_fault(714, "Illegal MIME-type"), false),
+            "Kitchen doesn't accept the audio format Stream To Speaker sent it. \
+             (Kitchen answered: UPnP error 714, \"Illegal MIME-type\".)"
+        );
+        assert_eq!(
+            told(Reply::soap_fault(716, "Resource not found"), false),
+            "Kitchen couldn't fetch the audio from this PC. Windows Firewall may be blocking it: allow \
+             Stream To Speaker on this network. (Kitchen answered: UPnP error 716, \"Resource not found\".)"
+        );
+        for code in [701, 705] {
+            assert_eq!(
+                told(Reply::soap_fault(code, "Busy"), false),
+                format!(
+                    "Kitchen is busy and didn't take the stream. Try again in a moment. \
+                     (Kitchen answered: UPnP error {code}, \"Busy\".)"
+                )
+            );
+        }
+        assert_eq!(
+            told(Reply::soap_fault(402, ""), true),
+            "Kitchen refused the stream. Its AirPlay entry may work. (Kitchen answered: UPnP error 402.)"
+        );
+        assert_eq!(
+            told(Reply::status(503, "Service Unavailable", &[], ""), false),
+            "Kitchen refused the stream. (Kitchen answered: HTTP 503 Service Unavailable.)"
+        );
+    }
+
+    #[test]
+    fn no_answer_and_no_connection_are_told_apart() {
+        let fake = FakeRenderer::start(|_| Reply::silent());
+        let quick = Limits { deadline: Duration::from_millis(200), ..TRANSPORT };
+        let e = soap_post(&fake.url("/c"), AV_TRANSPORT, "Play", "", &quick).unwrap_err();
+        assert_eq!(e.fault_code(), None);
+        assert_eq!(e.for_person("Kitchen", true), "Kitchen didn't answer within 0.2 seconds. Try again in a moment.");
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let e = play(&format!("http://127.0.0.1:{port}/c")).unwrap_err();
+        assert_eq!(
+            action_error(&e).for_person("Kitchen", true),
+            "Kitchen can't be reached. Check that it's switched on and connected to the same network as this PC."
+        );
     }
 
     #[test]
