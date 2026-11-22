@@ -1005,7 +1005,16 @@ impl RtspClient {
     fn read_reply(&mut self, label: &str) -> Result<RtspResponse, RtspError> {
         let started = Instant::now();
         let mut tmp = [0u8; 2048];
+        let mut skipped = 0usize;
         loop {
+            skipped = skipped.saturating_add(drop_between_replies(&mut self.received));
+            if skipped > MAX_HEAD_BYTES {
+                self.link = Link::Broken;
+                return Err(RtspError::Broken {
+                    request: label.to_string(),
+                    why: format!("more than {} bytes that aren't a reply", MAX_HEAD_BYTES),
+                });
+            }
             match parse_reply(&self.received) {
                 Ok(Some((resp, used))) => {
                     self.received.drain(..used.min(self.received.len()));
@@ -1089,6 +1098,31 @@ const RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Most bytes of status line and headers accepted before their end.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
+
+/// Drop from the front of `buf` what can come between replies but can't
+/// start one: anything before the next `RTSP/` (or `HTTP/`, which the
+/// status line has always been allowed to name) — a line end after a
+/// reply, a body longer than its Content-Length. A tail that may be the
+/// start of one is kept for the next read. Returns how many bytes went.
+/// The client always tolerated these (it used to drop everything read
+/// past a reply); keeping later bytes for the next reply must not change
+/// that.
+fn drop_between_replies(buf: &mut Vec<u8>) -> usize {
+    const STARTS: [&[u8]; 2] = [b"RTSP/", b"HTTP/"];
+    let found = buf.windows(5).position(|w| STARTS.iter().any(|s| w == *s));
+    let cut = match found {
+        Some(at) => at,
+        None => {
+            let keep = (1..5)
+                .rev()
+                .find(|&k| STARTS.iter().any(|s| s.get(..k).is_some_and(|prefix| buf.ends_with(prefix))))
+                .unwrap_or(0);
+            buf.len().saturating_sub(keep)
+        }
+    };
+    buf.drain(..cut.min(buf.len()));
+    cut
+}
 
 /// Parse one RTSP/1.0 reply from the front of `buf`. RTSP/1.0 framing
 /// matches HTTP/1.0 closely: status line + headers + optional body
@@ -1236,6 +1270,45 @@ mod tests {
         c.options_keepalive().expect("second reply, from what was already read");
     }
 
+    /// What a receiver sends after the end of a reply, in the same write,
+    /// is ignored as it always was: a stray line end, or a body longer
+    /// than its Content-Length.
+    #[test]
+    fn bytes_after_a_reply_do_not_break_the_next_request() {
+        for extra in [&b"\r\n"[..], b"\n", b"\r\n\r\n"] {
+            let mut first = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n".to_vec();
+            first.extend_from_slice(extra);
+            let rx = FakeRaop::start(move |req| match req.cseq() {
+                Some(1) => Answer::Raw(first.clone()),
+                Some(2) => Answer::Normal,
+                _ => Answer::Ignore,
+            });
+            let mut c = client(&rx);
+            c.options_keepalive().expect("first");
+            c.options_keepalive().expect("second, after the stray bytes");
+            // And an unanswered request after them is just unanswered.
+            let e = c.options_keepalive().expect_err("third gets no answer");
+            assert!(matches!(e.downcast_ref::<RtspError>(), Some(RtspError::NoAnswer { .. })), "{e:#}");
+            assert!(c.is_usable());
+        }
+        let rx = FakeRaop::start(|req| match req.cseq() {
+            Some(1) => Answer::Raw(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 2\r\n\r\nabXYZ".to_vec()),
+            _ => Answer::Normal,
+        });
+        let mut c = client(&rx);
+        c.options_keepalive().expect("first");
+        c.options_keepalive().expect("second, after the overlong body");
+    }
+
+    /// Junk without any reply in it is still bounded.
+    #[test]
+    fn endless_junk_breaks_the_connection() {
+        let rx = FakeRaop::start(|_| Answer::Raw(vec![b'x'; MAX_HEAD_BYTES + 10]));
+        let mut c = client(&rx);
+        assert!(c.options_keepalive().is_err());
+        assert!(!c.is_usable());
+    }
+
     #[test]
     fn a_reply_cut_off_part_way_breaks_the_connection_and_teardown_uses_a_new_one() {
         let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
@@ -1380,6 +1453,25 @@ mod tests {
         let (next, used2) = parse_reply(&buf[used..]).unwrap().unwrap();
         assert_eq!((next.status_code, next.status_text.as_str()), (501, "No"));
         assert_eq!(used + used2, buf.len());
+    }
+
+    #[test]
+    fn only_what_cant_start_a_reply_is_dropped() {
+        let cases: [(&[u8], &[u8]); 8] = [
+            (b"\r\nRTSP/1.0 200 OK", b"RTSP/1.0 200 OK"),
+            (b"\r\nHTTP/1.1 200 OK", b"HTTP/1.1 200 OK"),
+            (b"xxHTT", b"HTT"),
+            (b"XYZRTSP/1.0", b"RTSP/1.0"),
+            (b"\r\n", b""),
+            (b"abcRTS", b"RTS"),
+            (b"R", b"R"),
+            (b"RTSP/1.0 200 OK\r\n", b"RTSP/1.0 200 OK\r\n"),
+        ];
+        for (given, left) in cases {
+            let mut b = given.to_vec();
+            let dropped = drop_between_replies(&mut b);
+            assert_eq!((b.as_slice(), dropped), (left, given.len() - left.len()), "{:?}", String::from_utf8_lossy(given));
+        }
     }
 
     #[test]
