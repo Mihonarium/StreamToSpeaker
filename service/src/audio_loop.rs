@@ -44,8 +44,61 @@ const REOPEN_DELAYS: &[Duration] = &[
     Duration::from_secs(15),
 ];
 
-/// Packets the reader may queue ahead of the loop.
-const READER_QUEUE: usize = 128;
+/// Packets the reader may queue ahead of the loop: none, it hands each one
+/// over. When the loop falls behind, the sound waits in the driver's ring
+/// (which drops its oldest) rather than in a queue that would deliver it
+/// late, as when reading and processing were one thread.
+const READER_QUEUE: usize = 0;
+
+/// How long a reopened source must stay open without failing before the
+/// window says the sound is back (when no sound has come yet).
+const BACK_AFTER: Duration = Duration::from_secs(3);
+
+/// The loop's timings, shorter in tests.
+struct Timing {
+    reopen_delays: &'static [Duration],
+    back_after: Duration,
+}
+
+const TIMING: Timing = Timing { reopen_delays: REOPEN_DELAYS, back_after: BACK_AFTER };
+
+/// The loop thread's scheduling class while it runs: the "Pro Audio" class
+/// the driver read has too (the source sets that on the reader), so the
+/// processing doesn't fall behind under load as it would at normal
+/// priority. Set and reverted on the thread that runs the loop.
+struct ProAudio {
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl ProAudio {
+    fn for_this_thread() -> Self {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+            let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+            let mut task_index: u32 = 0;
+            // SAFETY: a NUL-terminated wide string and a valid u32 pointer.
+            let handle = unsafe { AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut task_index) };
+            if handle.is_null() {
+                warn!("audio loop: couldn't give the loop thread the Pro Audio priority");
+            }
+            Self { handle }
+        }
+        #[cfg(not(windows))]
+        Self {}
+    }
+}
+
+impl Drop for ProAudio {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if !self.handle.is_null() {
+            // SAFETY: obtained from AvSetMmThreadCharacteristicsW on this thread.
+            unsafe { windows_sys::Win32::System::Threading::AvRevertMmThreadCharacteristics(self.handle) };
+        }
+    }
+}
 
 /// 10 ms of silence per packet, the length the driver's stop marker has.
 const SILENCE_FRAMES: usize = WIRE_SAMPLE_RATE as usize / 100;
@@ -63,44 +116,57 @@ enum FromReader {
 /// own and dropped there (releasing its handles); `reopen` replaces it when
 /// it fails.
 pub fn run(app: Arc<App>, source: Box<dyn AudioSource>, reopen: Reopen) -> Result<()> {
-    run_with(app, source, reopen, REOPEN_DELAYS)
+    run_with(app, source, reopen, &TIMING)
 }
 
-fn run_with(
-    app: Arc<App>,
-    source: Box<dyn AudioSource>,
-    reopen: Reopen,
-    reopen_delays: &'static [Duration],
-) -> Result<()> {
+fn run_with(app: Arc<App>, source: Box<dyn AudioSource>, reopen: Reopen, timing: &'static Timing) -> Result<()> {
     info!("audio loop: source = {}", source.name());
     let (tx, rx) = bounded::<FromReader>(READER_QUEUE);
     let reader_app = app.clone();
     std::thread::Builder::new()
         .name("stream-to-speaker-audio-read".to_string())
-        .spawn(move || read_source(&reader_app, source, reopen, reopen_delays, &tx))
+        .spawn(move || read_source(&reader_app, source, reopen, timing.reopen_delays, &tx))
         .context("spawning the audio reader thread")?;
 
+    let _priority = ProAudio::for_this_thread();
     let mut rx = rx;
     let mut out = Output::new(&app);
     let mut feed = Feed::new(Instant::now());
+    let mut back = BackCheck::new(timing.back_after);
     while !app.is_shutting_down() {
         let pace = Duration::from_millis(app.silence_pace_ms.load(Ordering::Relaxed).max(1));
-        match rx.recv_deadline(feed.wake_at()) {
-            Ok(FromReader::Packet(pkt)) => {
+        let wake = match back.wake_at() {
+            Some(at) => at.min(feed.wake_at()),
+            None => feed.wake_at(),
+        };
+        let got = rx.recv_deadline(wake);
+        match got {
+            Ok(FromReader::Packet(mut pkt)) => {
                 if is_stream_stop(&pkt) {
                     // The driver completes the read it holds with nothing
                     // when Windows stops the stream.
-                    if feed.source_stopped(Instant::now(), pace) {
-                        debug!("audio: stream stopped; sending silence until it starts again");
-                        out.publish(&app, pkt, false);
-                    }
+                    debug!("audio: stream stopped; sending silence until it starts again");
+                    let _ = feed.source_stopped(Instant::now(), pace);
                 } else {
-                    feed.source_packet(Instant::now());
-                    out.publish(&app, pkt, true);
+                    let handover = feed.source_packet(Instant::now(), pkt.frame_count(), pace);
+                    if handover.fill > 0 {
+                        out.publish(&app, AudioPacket::silence(handover.fill), false);
+                    }
+                    if handover.trim > 0 {
+                        let cut = (handover.trim * pkt.channels as usize).min(pkt.samples.len());
+                        pkt.samples.drain(..cut);
+                    }
+                    if !pkt.samples.is_empty() {
+                        out.publish(&app, pkt, true);
+                    }
+                    back.sound();
                 }
             }
-            Ok(FromReader::Lost(why)) => app.note_sound_input_lost(&why),
-            Ok(FromReader::Reopened) => app.note_sound_input_back(),
+            Ok(FromReader::Lost(why)) => {
+                back.lost();
+                app.note_sound_input_lost(&why);
+            }
+            Ok(FromReader::Reopened) => back.reopened(Instant::now()),
             Err(RecvTimeoutError::Timeout) => {
                 if feed.silence_due(Instant::now(), pace) {
                     out.publish(&app, AudioPacket::silence(SILENCE_FRAMES), false);
@@ -111,9 +177,14 @@ fn run_with(
                     break;
                 }
                 // The reader only ends at shutdown; keep the silence going.
+                back.lost();
                 app.note_sound_input_lost("the audio reader stopped");
                 rx = crossbeam_channel::never();
             }
+        }
+        if back.is_back(Instant::now()) {
+            back.told();
+            app.note_sound_input_back();
         }
     }
     info!("audio loop: exiting");
@@ -340,16 +411,108 @@ impl Output {
 const QUIET_BEFORE_SILENCE: Duration = Duration::from_millis(200);
 
 /// A silence schedule this far behind the clock (the PC slept, the thread
-/// was starved) starts again from now instead of catching up in a burst.
-const SILENCE_MAX_BEHIND: Duration = Duration::from_secs(1);
+/// was starved) starts again from now instead of catching up in a burst:
+/// a stall that long may have run a pulling speaker dry, and silence made
+/// up after that only adds to its delay.
+const SILENCE_MAX_BEHIND: Duration = QUIET_BEFORE_SILENCE;
+
+/// What goes out with the first packet from the source after silence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Handover {
+    /// Frames of silence to send first.
+    fill: usize,
+    /// Frames to leave out from the start of the packet.
+    trim: usize,
+}
+
+/// When the window may say this PC's sound is back after the source
+/// failed: once sound comes from it, or once the reopened source has stayed
+/// open for `after` without failing. Not as soon as it opens: a device that
+/// opens and fails at its first read would make the window flicker; and
+/// not only on sound: the driver delivers nothing while Windows plays
+/// nothing, and the window would go on saying it is reconnecting.
+#[derive(Clone, Copy, Debug)]
+struct BackCheck {
+    after: Duration,
+    state: BackState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackState {
+    /// Nothing to report: the source works.
+    Fine,
+    /// Failed, not open again yet.
+    Lost,
+    /// Open again since then.
+    Reopened(Instant),
+    /// Back: sound came, or it stayed open long enough.
+    Back,
+}
+
+impl BackCheck {
+    fn new(after: Duration) -> Self {
+        Self { after, state: BackState::Fine }
+    }
+
+    fn lost(&mut self) {
+        self.state = BackState::Lost;
+    }
+
+    fn reopened(&mut self, now: Instant) {
+        if self.state == BackState::Lost {
+            self.state = BackState::Reopened(now);
+        }
+    }
+
+    fn sound(&mut self) {
+        if matches!(self.state, BackState::Lost | BackState::Reopened(_)) {
+            self.state = BackState::Back;
+        }
+    }
+
+    /// Whether the sound counts as back at `now` (and the window should hear
+    /// so); `Fine` once it has been told.
+    fn is_back(&self, now: Instant) -> bool {
+        match self.state {
+            BackState::Back => true,
+            BackState::Reopened(at) => now >= at + self.after,
+            BackState::Fine | BackState::Lost => false,
+        }
+    }
+
+    /// The window was told.
+    fn told(&mut self) {
+        self.state = BackState::Fine;
+    }
+
+    /// When `is_back` turns true if nothing else happens first.
+    fn wake_at(&self) -> Option<Instant> {
+        match self.state {
+            BackState::Reopened(at) => Some(at + self.after),
+            _ => None,
+        }
+    }
+}
 
 /// Whose packet goes out next: the source's, or silence on a schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Feed {
     /// Waiting on the source, which last delivered at `last`.
     Source { last: Instant },
-    /// The source is quiet; the next silence packet is due at `next`.
+    /// The source is quiet. The next silence packet covers the `pace`
+    /// before `next` and goes out at `next`, once that time has passed, so
+    /// the silence sent never runs ahead of the clock.
     Silence { next: Instant },
+}
+
+/// Frames of sound in `d` at the wire rate.
+fn frames_in(d: Duration) -> usize {
+    (d.as_nanos() * WIRE_SAMPLE_RATE as u128 / 1_000_000_000) as usize
+}
+
+/// How long `frames` of sound last at the wire rate.
+fn duration_of(frames: usize) -> Duration {
+    Duration::from_nanos((frames as u128 * 1_000_000_000 / WIRE_SAMPLE_RATE as u128) as u64)
 }
 
 impl Feed {
@@ -367,22 +530,37 @@ impl Feed {
         }
     }
 
-    /// A packet came from the source: it goes out, and silence waits.
-    fn source_packet(&mut self, now: Instant) {
-        *self = Feed::Source { last: now };
+    /// A packet of `frames` came from the source: it goes out, and silence
+    /// waits. Returns what goes with it: after silence, the stretch between
+    /// the end of the silence sent and the start of this packet's sound
+    /// (its arrival less its length) is filled, or, if the silence already
+    /// covers part of this packet's time, that part of the packet is left
+    /// out, so the stream keeps to the clock across the hand-over.
+    fn source_packet(&mut self, now: Instant, frames: usize, pace: Duration) -> Handover {
+        let was = std::mem::replace(self, Feed::Source { last: now });
+        let Feed::Silence { next } = was else {
+            return Handover::default();
+        };
+        let silence_ends = next - pace;
+        let sound_starts = now.checked_sub(duration_of(frames)).unwrap_or(now);
+        if sound_starts >= silence_ends {
+            // At the rate silence goes out (one packet per pace).
+            let gap = sound_starts - silence_ends;
+            let fill = gap.as_nanos() * SILENCE_FRAMES as u128 / pace.as_nanos().max(1);
+            Handover { fill: fill as usize, trim: 0 }
+        } else {
+            Handover { fill: 0, trim: frames_in(silence_ends - sound_starts).min(frames) }
+        }
     }
 
-    /// The source says its stream stopped, handing over a packet of
-    /// silence. Returns whether that packet goes out now (it does unless
-    /// silence is already on its schedule).
-    fn source_stopped(&mut self, now: Instant, pace: Duration) -> bool {
-        match *self {
-            Feed::Source { .. } => {
-                *self = Feed::Silence { next: now + pace };
-                true
-            }
-            Feed::Silence { .. } => false,
+    /// The source says its stream stopped: silence takes over from now on,
+    /// its first packet going out once its time has passed. Returns how many
+    /// frames of silence go out at once (none).
+    fn source_stopped(&mut self, now: Instant, pace: Duration) -> usize {
+        if let Feed::Source { .. } = *self {
+            *self = Feed::Silence { next: now + pace };
         }
+        0
     }
 
     /// Whether a silence packet is due at `now`; if so it counts as sent.
@@ -391,7 +569,7 @@ impl Feed {
             if now < last + QUIET_BEFORE_SILENCE {
                 return false;
             }
-            *self = Feed::Silence { next: last + QUIET_BEFORE_SILENCE };
+            *self = Feed::Silence { next: last + QUIET_BEFORE_SILENCE + pace };
         }
         let Feed::Silence { next } = self else { return false };
         if now < *next {
@@ -439,7 +617,7 @@ mod feed_tests {
         for gap in [2, 16, 50, 120, 186, 2, 190] {
             assert_eq!(due_at(&mut feed, t + ms(gap)), 0, "silence after a {gap} ms gap");
             t += ms(gap);
-            feed.source_packet(t);
+            feed.source_packet(t, 88, PACE);
         }
     }
 
@@ -447,7 +625,7 @@ mod feed_tests {
     fn a_quiet_source_gets_silence_at_real_time() {
         let t0 = Instant::now();
         let mut feed = Feed::new(t0);
-        feed.source_packet(t0);
+        feed.source_packet(t0, 88, PACE);
         assert_eq!(due_at(&mut feed, t0 + ms(190)), 0);
         // Ten seconds of waking up 7 ms late every time (a coarse system
         // timer): the silence still adds up to the time that passed.
@@ -471,7 +649,7 @@ mod feed_tests {
         let mut feed = Feed::new(t0);
         assert!(due_at(&mut feed, t0 + Duration::from_secs(1)) > 0);
         let t1 = t0 + Duration::from_secs(1) + ms(3);
-        feed.source_packet(t1);
+        feed.source_packet(t1, 88, PACE);
         // A silence packet that was due a moment ago no longer goes out.
         assert_eq!(due_at(&mut feed, t1 + ms(5)), 0);
         assert_eq!(feed.wake_at(), t1 + QUIET_BEFORE_SILENCE);
@@ -481,13 +659,86 @@ mod feed_tests {
     fn a_stop_from_the_source_starts_the_silence_straight_away() {
         let t0 = Instant::now();
         let mut feed = Feed::new(t0);
-        feed.source_packet(t0);
-        assert!(feed.source_stopped(t0 + ms(1), PACE), "the stop's own silence goes out");
+        feed.source_packet(t0, 88, PACE);
+        let _ = feed.source_stopped(t0 + ms(1), PACE);
+        // The first 10 ms of silence goes out once those 10 ms have passed.
         assert_eq!(due_at(&mut feed, t0 + ms(10)), 0);
         assert_eq!(due_at(&mut feed, t0 + ms(11)), 1);
         // A second stop while silence runs adds nothing to the schedule.
-        assert!(!feed.source_stopped(t0 + ms(12), PACE));
+        assert_eq!(feed.source_stopped(t0 + ms(12), PACE), 0);
         assert_eq!(due_at(&mut feed, t0 + ms(21)), 1);
+    }
+
+    /// Silence from a driver stop at `t0` up to the first real packet of
+    /// `frames` at `t0 + after`, waking `late` after each due time: what
+    /// went out, silence and audio together, in frames.
+    fn across_a_restart(after: Duration, frames: usize, late: Duration) -> usize {
+        let t0 = Instant::now() + Duration::from_secs(1);
+        let mut feed = Feed::new(t0 - ms(500));
+        let _ = feed.source_packet(t0 - ms(2), 88, PACE);
+        let mut out = feed.source_stopped(t0, PACE);
+        let t1 = t0 + after;
+        let mut now = t0;
+        loop {
+            let wake = feed.wake_at().max(now) + late;
+            if wake > t1 {
+                break;
+            }
+            now = wake;
+            while feed.silence_due(now, PACE) {
+                out += SILENCE_FRAMES;
+            }
+        }
+        let handover = feed.source_packet(t1, frames, PACE);
+        assert!(handover.trim <= frames);
+        out + handover.fill + frames - handover.trim
+    }
+
+    #[test]
+    fn over_a_stop_and_restart_the_stream_keeps_to_the_clock() {
+        for frames in [44, 88, 441, 2048] {
+            for late in [0, 3, 7] {
+                // The first real packet anywhere from at once to 120 ms after
+                // the stop, before and after each silence packet's time.
+                for step in 0..=480u64 {
+                    let after = Duration::from_micros(step * 250);
+                    let out = across_a_restart(after, frames, ms(late));
+                    let passed = frames_in(after);
+                    assert!(
+                        out <= passed + 1,
+                        "{out} frames went out for {passed} frames of time ({after:?}, {frames}-frame packet, {late} ms late)"
+                    );
+                    assert!(
+                        out + frames_in(ms(1)) >= passed,
+                        "{out} frames went out for {passed} frames of time ({after:?}, {frames}-frame packet, {late} ms late)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn after_a_quiet_spell_the_stream_never_runs_ahead_of_the_clock() {
+        for step in 0..=200u64 {
+            let t0 = Instant::now() + Duration::from_secs(1);
+            let mut feed = Feed::new(t0);
+            let _ = feed.source_packet(t0, 88, PACE);
+            let t1 = t0 + QUIET_BEFORE_SILENCE + Duration::from_micros(step * 500);
+            let mut out = 0;
+            let mut now = t0;
+            while feed.wake_at() <= t1 {
+                now = feed.wake_at().max(now);
+                while feed.silence_due(now, PACE) {
+                    out += SILENCE_FRAMES;
+                }
+            }
+            let handover = feed.source_packet(t1, 88, PACE);
+            let out = out + handover.fill + 88 - handover.trim;
+            let passed = frames_in(t1 - t0);
+            // Short by the quiet spell before silence started, no more.
+            assert!(out <= passed + 1, "{out} > {passed}");
+            assert!(out + frames_in(QUIET_BEFORE_SILENCE + ms(1)) >= passed, "{out} for {passed}");
+        }
     }
 
     #[test]
@@ -495,9 +746,13 @@ mod feed_tests {
         let t0 = Instant::now();
         let mut feed = Feed::new(t0);
         assert!(due_at(&mut feed, t0 + ms(250)) > 0);
-        // A 30 ms hiccup is made up; the PC sleeping for a minute isn't.
+        // A 30 ms hiccup is made up.
         let n = due_at(&mut feed, t0 + ms(300));
         assert!((4..=6).contains(&n), "{n} packets to make up 30 ms");
+        // A stall past the quiet threshold isn't: catching that up would
+        // add it to a pulling speaker's delay once its buffer ran dry.
+        let n = due_at(&mut feed, t0 + ms(700));
+        assert!(n <= 21, "{n} packets after a 400 ms stall");
         let t1 = t0 + Duration::from_secs(60);
         assert_eq!(due_at(&mut feed, t1), 1);
         assert_eq!(due_at(&mut feed, t1 + ms(9)), 0);
@@ -600,6 +855,7 @@ mod tests {
     }
 
     const A_MILLISECOND_APART: &[Duration] = &[Duration::from_millis(1)];
+    const FAST: Timing = Timing { reopen_delays: A_MILLISECOND_APART, back_after: Duration::from_millis(30) };
 
     /// Run the loop on a thread, with reopen attempts a millisecond apart;
     /// the receiver hears when it returns.
@@ -607,7 +863,7 @@ mod tests {
         let (done_tx, done) = unbounded();
         let app = app.clone();
         std::thread::spawn(move || {
-            let _ = run_with(app, source, reopen, A_MILLISECOND_APART);
+            let _ = run_with(app, source, reopen, &FAST);
             let _ = done_tx.send(());
         });
         done
@@ -707,6 +963,57 @@ mod tests {
         let gaps: Vec<Duration> = lost_at.windows(2).map(|w| w[1] - w[0]).collect();
         assert!(gaps[1] >= SCHEDULE[1], "second wait {:?}", gaps[1]);
         assert!(gaps[2] >= SCHEDULE[2], "third wait {:?}", gaps[2]);
+    }
+
+    #[test]
+    fn a_stalled_loop_leaves_the_sound_with_the_driver() {
+        // Ten packets ready, and nobody taking them: the reader may hold one,
+        // as the single thread did, and the rest stays where the driver keeps
+        // it (dropping its oldest), not in a queue that would deliver it late.
+        let app = App::for_tests();
+        let (feeder, source) = fed();
+        for _ in 0..10 {
+            feeder.items.send(Ok(sound())).unwrap();
+        }
+        let (tx, rx) = bounded(READER_QUEUE);
+        let reader = {
+            let app = app.clone();
+            std::thread::spawn(move || read_source(&app, source, gone(), A_MILLISECOND_APART, &tx))
+        };
+        feeder.reads.recv_timeout(PATIENCE).expect("never read");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(feeder.reads.try_recv().is_err(), "read ahead of a loop that took nothing");
+        // Taking one lets exactly one more read happen.
+        assert!(matches!(rx.recv_timeout(PATIENCE), Ok(FromReader::Packet(_))));
+        feeder.reads.recv_timeout(PATIENCE).expect("no read after the hand-over");
+        app.request_shutdown();
+        drop(rx);
+        drop(feeder);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn the_window_hears_the_sound_is_back_once_it_is() {
+        let t0 = Instant::now();
+        let after = Duration::from_millis(100);
+        let mut back = BackCheck::new(after);
+        back.lost();
+        back.reopened(t0);
+        // Opened, but neither sound nor time yet.
+        assert!(!back.is_back(t0 + after / 2));
+        // Sound: back at once.
+        let mut sounding = back;
+        sounding.sound();
+        assert!(sounding.is_back(t0));
+        // Open and failing at once, again and again: never back.
+        let mut failing = back;
+        failing.lost();
+        failing.reopened(t0 + after / 2);
+        failing.lost();
+        assert!(!failing.is_back(t0 + after * 10));
+        // Open and simply quiet (Windows plays nothing): back after a while.
+        assert!(back.is_back(t0 + after));
+        assert_eq!(back.wake_at(), Some(t0 + after));
     }
 
     #[test]
