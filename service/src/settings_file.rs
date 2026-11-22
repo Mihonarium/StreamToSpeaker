@@ -130,9 +130,31 @@ fn write_temp(fs: &dyn FileOps, path: &Path, bytes: &[u8]) -> io::Result<PathBuf
     Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "no free name")))
 }
 
-/// Rename `from` over `to`.
+/// Pauses between tries of a rename Windows refuses because another
+/// program has the file open for a moment (a virus scanner, the indexer):
+/// about a tenth of a second in all, short enough for the thread that
+/// saves.
+const RENAME_PAUSES_MS: [u64; 4] = [10, 20, 30, 40];
+
+/// Whether `e` can be another program holding the file for a moment:
+/// access denied, or (on Windows) a sharing or lock violation.
+pub fn is_refusal(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied || (cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))
+}
+
+/// Rename `from` over `to`, trying again for a moment while that is
+/// refused (see [`RENAME_PAUSES_MS`]).
 fn rename_patiently(fs: &dyn FileOps, from: &Path, to: &Path) -> io::Result<()> {
-    fs.rename(from, to)
+    let mut pauses = RENAME_PAUSES_MS.iter();
+    loop {
+        match fs.rename(from, to) {
+            Err(e) if is_refusal(&e) => match pauses.next() {
+                Some(ms) => std::thread::sleep(Duration::from_millis(*ms)),
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
 }
 
 /// Why a save didn't replace the file.
@@ -156,13 +178,13 @@ pub fn replace(fs: &dyn FileOps, path: &Path, bytes: &[u8]) -> Result<(), WriteE
         fs.create_dir_all(dir).map_err(WriteError::Folder)?;
     }
     let tmp = write_temp(fs, path, bytes).map_err(WriteError::Write)?;
-    fs.rename(&tmp, path).map_err(|e| {
+    rename_patiently(fs, &tmp, path).map_err(|e| {
         let _ = fs.remove(&tmp);
         WriteError::Replace(e)
     })?;
     let backup = backup_path(path);
     let mirrored = write_temp(fs, &backup, bytes).and_then(|bak_tmp| {
-        fs.rename(&bak_tmp, &backup).inspect_err(|_| {
+        rename_patiently(fs, &bak_tmp, &backup).inspect_err(|_| {
             let _ = fs.remove(&bak_tmp);
         })
     });
@@ -500,6 +522,57 @@ pub(crate) mod tests {
         assert!(matches!(err, WriteError::Replace(_)), "{err:?}");
         assert_eq!(disk.names(), ["config.json"]);
         assert_eq!(disk.get(&path()).unwrap(), b"{\"old\":1}");
+    }
+
+    /// A disk on which the first `refusals` renames are refused, as Windows
+    /// refuses one while another program has the file open for a moment.
+    struct Busy<'a>(&'a PowerCutDisk, std::cell::Cell<u32>, io::ErrorKind);
+    impl FileOps for Busy<'_> {
+        fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+            self.0.read(p)
+        }
+        fn create_flushed(&self, p: &Path, b: &[u8]) -> io::Result<()> {
+            self.0.create_flushed(p, b)
+        }
+        fn rename(&self, f: &Path, t: &Path) -> io::Result<()> {
+            if self.1.get() > 0 {
+                self.1.set(self.1.get() - 1);
+                return Err(self.2.into());
+            }
+            self.0.rename(f, t)
+        }
+        fn remove(&self, p: &Path) -> io::Result<()> {
+            self.0.remove(p)
+        }
+        fn create_dir_all(&self, d: &Path) -> io::Result<()> {
+            self.0.create_dir_all(d)
+        }
+        fn list(&self, d: &Path) -> io::Result<Vec<String>> {
+            self.0.list(d)
+        }
+        fn age(&self, p: &Path) -> Option<Duration> {
+            self.0.age(p)
+        }
+    }
+
+    #[test]
+    fn a_rename_refused_for_a_moment_is_tried_again() {
+        let disk = PowerCutDisk::with_file(&path(), b"{\"old\":1}");
+        let busy = Busy(&disk, std::cell::Cell::new(2), io::ErrorKind::PermissionDenied);
+        replace(&busy, &path(), b"{\"new\":2}").unwrap();
+        assert_eq!(disk.get(&path()).unwrap(), b"{\"new\":2}");
+        // Refused for good: a bounded number of tries, then the error, and
+        // no temporary file left.
+        let busy = Busy(&disk, std::cell::Cell::new(1000), io::ErrorKind::PermissionDenied);
+        let started = std::time::Instant::now();
+        assert!(matches!(replace(&busy, &path(), b"{\"newer\":3}"), Err(WriteError::Replace(_))));
+        assert_eq!(1000 - busy.1.get(), RENAME_PAUSES_MS.len() as u32 + 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(disk.names().iter().all(|n| !n.ends_with(".tmp")));
+        // Other errors are not tried again.
+        let busy = Busy(&disk, std::cell::Cell::new(1000), io::ErrorKind::NotFound);
+        assert!(replace(&busy, &path(), b"{\"newer\":3}").is_err());
+        assert_eq!(1000 - busy.1.get(), 1);
     }
 
     #[test]

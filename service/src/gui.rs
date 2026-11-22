@@ -2223,9 +2223,15 @@ impl StreamToSpeakerApp {
     /// long as that lasts, and what loading them found, until dismissed.
     /// The one place in the window for both.
     fn show_settings_banner(&self, ui: &mut egui::Ui, p: &Palette) {
+        // While saves fail, try again every few seconds: the strip goes by
+        // itself once a save works.
+        self.app.retry_settings_save_if_due(Instant::now());
         let (problem, notice) = self.app.settings_attention();
         if problem.is_none() && notice.is_none() {
             return;
+        }
+        if problem.is_some() {
+            ui.ctx().request_repaint_after(crate::app::SETTINGS_RETRY);
         }
         let text = [problem.as_deref(), notice.as_deref()].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
         let colour = if problem.is_some() { p.danger } else { p.warn };

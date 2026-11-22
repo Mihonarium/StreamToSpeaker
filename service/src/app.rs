@@ -607,6 +607,9 @@ pub struct App {
     /// What loading the settings found that the window says once, until
     /// dismissed.
     settings_notice: Mutex<Option<String>>,
+    /// When a failed save was last tried again (see
+    /// [`App::retry_settings_save_if_due`]).
+    settings_retry_at: Mutex<Option<Instant>>,
 
     /// Most recent user-facing error message and when it was recorded.
     /// Surfaced by the GUI as a transient inline banner for ~8 s
@@ -970,6 +973,7 @@ impl App {
             stream_gate,
             settings_health: user_config.save_health(),
             settings_notice: Mutex::new(user_config.load_notice().describe()),
+            settings_retry_at: Mutex::new(None),
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
@@ -1030,6 +1034,27 @@ impl App {
     pub fn settings_attention(&self) -> (Option<String>, Option<String>) {
         let problem = self.settings_health.problem().map(|p| p.describe());
         (problem, self.settings_notice.lock().unwrap().clone())
+    }
+
+    /// While the last save failed (not while the file is left alone on
+    /// purpose), save again if the last try was [`SETTINGS_RETRY`] ago or
+    /// more, so a passing fault (a virus scanner holding the file, a share
+    /// that was offline) heals by itself and the window's strip goes. The
+    /// window calls this while it is open; without one, every later change
+    /// saves anyway. Whether it tried.
+    pub fn retry_settings_save_if_due(&self, now: Instant) -> bool {
+        if !matches!(self.settings_health.problem(), Some(crate::user_config::SaveProblem::Failed { .. })) {
+            return false;
+        }
+        {
+            let mut last = self.settings_retry_at.lock().unwrap();
+            if last.is_some_and(|t| now.saturating_duration_since(t) < SETTINGS_RETRY) {
+                return false;
+            }
+            *last = Some(now);
+        }
+        self.user_config.lock().unwrap().save();
+        true
     }
 
     /// The person dismissed what loading the settings found.
@@ -4960,6 +4985,9 @@ pub(crate) fn needs_the_person(reason: &str) -> bool {
     reason.contains("click it in the speaker list")
 }
 
+/// How often the window tries a failed settings save again.
+pub const SETTINGS_RETRY: Duration = Duration::from_secs(5);
+
 /// The words a failed background connect's fault begins with.
 const CONNECT_FAILED_PREFIX: &str = "Couldn't connect to speaker: ";
 
@@ -7189,6 +7217,31 @@ mod tests {
              prefer_realtime_airplay."), "{notice}");
         app.dismiss_settings_notice();
         assert_eq!(app.settings_attention(), (None, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_is_tried_again_while_the_window_is_open() {
+        let dir = std::env::temp_dir().join(format!("sts-app-retry-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The settings folder can't be made: a file has its name.
+        let folder = dir.join("StreamToSpeaker");
+        std::fs::write(&folder, b"in the way").unwrap();
+        let app = App::with_settings(App::test_config(), UserConfig::at_path(folder.join("config.json")), None, None);
+        app.set_airplay_password("airplay:aa", "hunter2");
+        assert!(app.settings_attention().0.is_some(), "the failure shows");
+        let t0 = Instant::now();
+        assert!(app.retry_settings_save_if_due(t0), "tried at once");
+        assert!(!app.retry_settings_save_if_due(t0 + Duration::from_secs(1)), "not again so soon");
+        assert!(app.settings_attention().0.is_some());
+        // The fault passes; the next try saves and the strip goes.
+        std::fs::remove_file(&folder).unwrap();
+        assert!(app.retry_settings_save_if_due(t0 + Duration::from_secs(6)));
+        assert_eq!(app.settings_attention().0, None);
+        assert_eq!(UserConfig::load_from(&folder.join("config.json")).airplay_passwords["airplay:aa"], "hunter2");
+        // Nothing to try while saves work.
+        assert!(!app.retry_settings_save_if_due(t0 + Duration::from_secs(60)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

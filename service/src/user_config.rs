@@ -728,9 +728,7 @@ impl UserConfig {
         match &result {
             Ok(()) => self.save_health.set(None),
             Err(SaveFailure::NotRead(_)) => {}
-            Err(SaveFailure::Failed { why, .. }) => {
-                self.save_health.set(Some(SaveProblem::Failed { why: why.clone() }))
-            }
+            Err(SaveFailure::Failed { problem, .. }) => self.save_health.set(Some(problem.clone())),
         }
         result.map_err(|e| match e {
             SaveFailure::NotRead(e) => e,
@@ -757,9 +755,12 @@ impl UserConfig {
             #[cfg(test)]
             Saves::AtPath(_) => {}
         }
-        let failed = |error: String, why: String| SaveFailure::Failed { error, why };
-        let mut tree =
-            serde_json::to_value(self).map_err(|e| failed(format!("serialize: {e}"), e.to_string()))?;
+        let unwritable = |e: serde_json::Error| SaveFailure::Failed {
+            error: format!("serialize: {e}"),
+            problem: SaveProblem::Failed { why: e.to_string(), kind: FailKind::Other },
+        };
+        let failed = |error: String, e: &std::io::Error| SaveFailure::Failed { error, problem: SaveProblem::failed(e) };
+        let mut tree = serde_json::to_value(self).map_err(unwritable)?;
         if self.web_secret.is_none() {
             // The file may hold a key `--web-link` stored while these
             // settings held none. Writing none over it would break the link
@@ -773,14 +774,11 @@ impl UserConfig {
             }
         }
         secret_store::seal(&mut tree, &self.locked_secrets, codec);
-        let content = serde_json::to_string_pretty(&tree)
-            .map_err(|e| failed(format!("serialize: {e}"), e.to_string()))?;
+        let content = serde_json::to_string_pretty(&tree).map_err(unwritable)?;
         settings_file::replace(fs, path, content.as_bytes()).map_err(|e| match e {
-            WriteError::Folder(e) => {
-                failed(format!("mkdir {}: {}", path.parent().unwrap_or(path).display(), e), e.to_string())
-            }
-            WriteError::Write(e) => failed(format!("write beside {}: {}", path.display(), e), e.to_string()),
-            WriteError::Replace(e) => failed(format!("replace {}: {}", path.display(), e), e.to_string()),
+            WriteError::Folder(e) => failed(format!("mkdir {}: {}", path.parent().unwrap_or(path).display(), e), &e),
+            WriteError::Write(e) => failed(format!("write beside {}: {}", path.display(), e), &e),
+            WriteError::Replace(e) => failed(format!("replace {}: {}", path.display(), e), &e),
         })
     }
 }
@@ -864,14 +862,41 @@ pub enum SaveProblem {
     /// runs on the backup's settings (`on_backup`) or on defaults, and
     /// saves nothing over the file.
     NotRead { why: String, damaged: bool, on_backup: bool },
-    /// The last save failed (`why`, the system's words).
-    Failed { why: String },
+    /// The last save failed (`why`, the system's words; `kind`, what the
+    /// error shows).
+    Failed { why: String, kind: FailKind },
     /// Some values in the file couldn't be read and no copy of the file
     /// could be kept (`why`), so the app saves nothing over it.
     CopyNotKept { why: String },
 }
 
+/// What a failed save's error shows about its cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailKind {
+    /// Windows refused (access denied, or another program has the file).
+    Refused,
+    /// The disk (or the person's quota on it) is full.
+    DiskFull,
+    /// Anything else: the system's words say what.
+    Other,
+}
+
 impl SaveProblem {
+    /// The problem a save that failed with `e` leaves.
+    pub fn failed(e: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        let kind = if settings_file::is_refusal(e) {
+            FailKind::Refused
+        } else if matches!(e.kind(), ErrorKind::StorageFull | ErrorKind::QuotaExceeded)
+            || (cfg!(windows) && matches!(e.raw_os_error(), Some(39 | 112)))
+        {
+            FailKind::DiskFull
+        } else {
+            FailKind::Other
+        };
+        SaveProblem::Failed { why: e.to_string(), kind }
+    }
+
     /// What to tell the person while the problem lasts.
     pub fn describe(&self) -> String {
         match self {
@@ -890,11 +915,23 @@ impl SaveProblem {
                  beside it, so the app leaves the file as it is: changes made now won't be kept. \
                  Details: {why}"
             ),
-            SaveProblem::Failed { why } => format!(
-                "Settings can't be saved, so changes made now will be lost when the app closes. \
-                 Check that the settings folder isn't read-only and that the disk has space. \
-                 Details: {why}"
-            ),
+            SaveProblem::Failed { why, kind } => {
+                let lost = "changes made now will be lost when the app closes";
+                match kind {
+                    FailKind::Refused => format!(
+                        "Settings can't be saved, so {lost}. Windows refused to write config.json: \
+                         the file or its folder may be read-only, or another program may be holding \
+                         the file. The app keeps trying. Details: {why}"
+                    ),
+                    FailKind::DiskFull => format!(
+                        "Settings can't be saved because the disk is full, so {lost}. The app keeps \
+                         trying, and saves them once there is space. Details: {why}"
+                    ),
+                    FailKind::Other => {
+                        format!("Settings can't be saved, so {lost}. The app keeps trying. Details: {why}")
+                    }
+                }
+            }
         }
     }
 }
@@ -921,7 +958,7 @@ impl SaveHealth {
             return;
         }
         match &now {
-            Some(SaveProblem::Failed { why }) => {
+            Some(SaveProblem::Failed { why, .. }) => {
                 log::warn!(
                     "user_config: the settings can't be saved ({why}); changes made now will be \
                      lost when the app closes"
@@ -938,8 +975,8 @@ impl SaveHealth {
 enum SaveFailure {
     /// The file couldn't be read at start.
     NotRead(String),
-    /// Writing failed: the full error, and the system's words for it.
-    Failed { error: String, why: String },
+    /// Writing failed: the full error, and what to tell the person.
+    Failed { error: String, problem: SaveProblem },
 }
 
 /// A settings file `parse_settings` accepted.
@@ -1892,6 +1929,27 @@ mod tests {
         disk.cut_after(usize::MAX);
         c.save_to_ops(&file, &PlatformCodec, &disk);
         assert_eq!(health.problem(), None);
+    }
+
+    #[test]
+    fn a_failed_save_says_what_the_error_shows() {
+        let failed = |e: std::io::Error| SaveProblem::failed(&e).describe();
+        let refused = failed(std::io::ErrorKind::PermissionDenied.into());
+        assert!(
+            refused.contains("Windows refused to write config.json: the file or its folder may be read-only, or \
+                 another program may be holding the file."),
+            "{refused}"
+        );
+        let full = failed(std::io::ErrorKind::StorageFull.into());
+        assert!(full.starts_with("Settings can't be saved because the disk is full"), "{full}");
+        assert!(!full.contains("read-only"), "{full}");
+        let other = failed(std::io::Error::other("The network path was not found."));
+        assert!(other.ends_with("Details: The network path was not found."), "{other}");
+        assert!(!other.contains("read-only") && !other.contains("disk is full"), "{other}");
+        for text in [refused, full, other] {
+            assert!(text.contains("changes made now will be lost when the app closes"), "{text}");
+            assert!(text.contains("The app keeps trying"), "{text}");
+        }
     }
 
     #[test]
