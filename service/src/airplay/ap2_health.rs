@@ -58,6 +58,23 @@ impl Ap2Fault {
     pub fn new(code: &'static str, channel: FaultChannel, retryable: bool, message: impl Into<String>) -> Self {
         Self { code, channel, retryable, message: message.into() }
     }
+
+    /// For a fault that means the session to `name` couldn't play (the app
+    /// reconnects after it): the diagnostics' fault line and the window's
+    /// notice while reconnecting. None for faults that are a lost
+    /// connection, whose text is the app's own.
+    pub fn reconnect_text(&self, name: &str) -> Option<(String, String)> {
+        match self.code {
+            "anchor_failed" => {
+                Some((format!("{name} didn't start playing"), format!("{name} didn't start playing — reconnecting…")))
+            }
+            "encoder_failed" => Some((
+                format!("Windows' AAC encoder stopped working ({name})"),
+                format!("Windows' AAC encoder stopped working — reconnecting to {name}…"),
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// The message alone: for a fault that ends the session for good, it is
@@ -696,6 +713,24 @@ mod tests {
         assert_eq!(r.on_failure(&refused(), now + s(8)), AnchorAction::Retry { warn: true });
         assert_eq!(r.on_failure(&refused(), now + ANCHOR_GIVE_UP - s(1)), AnchorAction::Retry { warn: false });
         assert_eq!(r.on_failure(&refused(), now + ANCHOR_GIVE_UP), AnchorAction::GiveUp);
+    }
+
+    /// While the app reconnects after a first fault, the window says what
+    /// happened: a session that couldn't play isn't reported as a lost
+    /// connection; faults that are connection losses keep the app's own
+    /// "Lost connection" text (no text here).
+    #[test]
+    fn a_session_that_could_not_play_is_not_reported_as_a_lost_connection() {
+        let fault = |code| Ap2Fault::new(code, FaultChannel::Media, true, "detail");
+        let (line, notice) = fault("anchor_failed").reconnect_text("Kitchen").unwrap();
+        assert_eq!(notice, "Kitchen didn't start playing — reconnecting…");
+        assert_eq!(line, "Kitchen didn't start playing");
+        let (line, notice) = fault("encoder_failed").reconnect_text("Kitchen").unwrap();
+        assert_eq!(notice, "Windows' AAC encoder stopped working — reconnecting to Kitchen…");
+        assert!(!line.contains("dropped") && line.contains("Kitchen"), "{line}");
+        for code in ["peer_closed", "feedback_rejected", "feedback_timeout", "media_send_timeout", "media_write_failed"] {
+            assert_eq!(fault(code).reconnect_text("Kitchen"), None, "{code}");
+        }
     }
 
     #[test]
