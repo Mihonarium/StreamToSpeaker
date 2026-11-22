@@ -160,6 +160,8 @@ pub struct RaopDetails {
     pub addresses: Vec<IpAddr>,
     /// `tp`: the transports it offers (`UDP`, `TCP`), when it says.
     pub transports: Option<Vec<String>>,
+    /// `md`: the metadata it takes: 0 track text, 1 artwork, 2 progress.
+    pub metadata: Vec<u8>,
     /// The `_raop._tcp` instance (full name, lower case) this entry
     /// describes.
     pub instance: Option<String>,
@@ -292,6 +294,12 @@ impl AirPlayRenderer {
         }
         let et = self.raop_encryption_types();
         et.contains(&0) || et.contains(&1)
+    }
+
+    /// Does the receiver take track text (`md` lists 0)? OwnTone sends
+    /// text only then (`RAOP_MD_WANTS_TEXT`), libraop likewise.
+    pub fn wants_track_text(&self) -> bool {
+        self.raop.metadata.contains(&0)
     }
 
     /// The `et` list to go by: as announced, or plaintext (`[0]`) when the
@@ -428,6 +436,7 @@ impl AirPlayRenderer {
 struct RaopInfo {
     /// The instance's full name, lower case: what identifies it.
     fullname: String,
+    metadata: Vec<u8>,
     /// The MAC the instance name claims.
     mac: String,
     transports: Option<Vec<String>>,
@@ -832,6 +841,7 @@ fn merge(
             txt: raop.map(|r| r.txt.clone()).unwrap_or_default(),
             addresses: raop_addresses,
             transports: raop.and_then(|r| r.transports.clone()),
+            metadata: raop.map(|r| r.metadata.clone()).unwrap_or_default(),
             instance: raop.map(|r| r.fullname.clone()),
             newcomer: false,
         },
@@ -924,6 +934,7 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
         };
         let r = RaopInfo {
             fullname: info.get_fullname().to_ascii_lowercase(),
+            metadata: read_txt_int_list(txt, "md"),
             mac,
             transports: read_txt_string(txt, "tp")
                 .map(|tp| tp.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()),
@@ -1570,6 +1581,19 @@ mod tests {
         assert!(r.supports_legacy_raop());
         r.encryption_types = vec![3, 5];
         assert!(!r.supports_legacy_raop(), "FairPlay only");
+    }
+
+    #[test]
+    fn track_text_only_to_receivers_whose_md_lists_text() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE01@A", "192.168.1.5", &[("md", "0,1,2")]));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE02@B", "192.168.1.6", &[("md", "1,2")]));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE03@C", "192.168.1.7", &[("et", "0")]));
+        let wants = |id: &str| state.find_by_id(id).unwrap().wants_track_text();
+        assert!(wants("airplay:AABBCCDDEE01"));
+        assert!(!wants("airplay:AABBCCDDEE02"));
+        assert!(!wants("airplay:AABBCCDDEE03"));
+        assert_eq!(state.find_by_id("airplay:AABBCCDDEE01").unwrap().raop.metadata, [0, 1, 2]);
     }
 
     #[test]

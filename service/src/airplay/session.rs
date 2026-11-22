@@ -431,6 +431,10 @@ pub struct AirPlaySession {
     abandon: AbandonHandle,
     /// The opener this session's connect used.
     opener: Opener,
+    /// The sync anchor's latency (samples): how far the write head runs
+    /// ahead of what plays.
+    latency_samples: u32,
+    timeouts: RaopTimeouts,
     /// Hold the audio socket so it isn't closed prematurely; the
     /// sender thread holds a `try_clone` for sending. Once `stop`
     /// runs we drop these in the right order to wake any blocked
@@ -798,6 +802,8 @@ impl AirPlaySession {
             threads: guard.into_threads(),
             abandon,
             opener,
+            latency_samples,
+            timeouts: cfg.timeouts,
             _audio_socket: audio_socket,
         })
     }
@@ -808,11 +814,16 @@ impl AirPlaySession {
     /// session lock, then calls [`MetadataHandle::send`] — which touches
     /// only the RTSP mutex (shared with the keepalive/volume, never the
     /// session mutex the GUI polls every repaint).
-    pub fn metadata_handle(&self) -> MetadataHandle {
-        MetadataHandle {
+    ///
+    /// None for a receiver that doesn't take track text (see
+    /// [`AirPlayRenderer::wants_track_text`]).
+    pub fn metadata_handle(&self) -> Option<MetadataHandle> {
+        self.renderer.wants_track_text().then(|| MetadataHandle {
             rtsp: self.rtsp.clone(),
             current_rtptime: self.current_rtptime.clone(),
-        }
+            latency_samples: self.latency_samples,
+            timeouts: self.timeouts,
+        })
     }
 
     /// The opener this session's connect used.
@@ -1218,15 +1229,30 @@ fn keepalive_loop(
 pub struct MetadataHandle {
     rtsp: Arc<Mutex<RtspClient>>,
     current_rtptime: Arc<AtomicU32>,
+    latency_samples: u32,
+    timeouts: RaopTimeouts,
 }
 
 impl MetadataHandle {
-    /// Push "now playing" to the receiver (best-effort, non-fatal).
+    /// Push "now playing" to the receiver (best-effort, non-fatal),
+    /// stamped with the position that is playing now. The reply is
+    /// awaited only as long as the opener's limit; a receiver that never
+    /// answers leaves the connection in step and the audio playing.
     pub fn send(&self, title: &str, artist: &str, album: &str) -> Result<()> {
         let body = crate::airplay::dmap::now_playing_body(title, artist, album);
-        let rtptime = self.current_rtptime.load(Ordering::Acquire);
-        self.rtsp.lock().unwrap().set_metadata(&body, rtptime)
+        let rtptime = playing_rtptime(self.current_rtptime.load(Ordering::Acquire), self.latency_samples);
+        let mut c = self.rtsp.lock().unwrap_or_else(|e| e.into_inner());
+        c.set_reply_limit(self.timeouts.opener);
+        let sent = c.set_metadata(&body, rtptime);
+        c.set_reply_limit(self.timeouts.reply);
+        sent
     }
+}
+
+/// The RTP time playing now: the sender's write head runs `latency`
+/// samples ahead of what the receiver plays.
+fn playing_rtptime(write_head: u32, latency: u32) -> u32 {
+    write_head.wrapping_sub(latency)
 }
 
 /// Volume and mute for one RAOP session; see
@@ -1779,6 +1805,49 @@ mod tests {
         assert_eq!(methods(&rx)[..2], ["0 OPTIONS", "0 ANNOUNCE"]);
         let sdp = String::from_utf8(reqs[1].body.clone()).unwrap();
         assert!(!sdp.contains("aeskey") && !sdp.contains("aesiv"), "{sdp}");
+    }
+
+    #[test]
+    fn track_text_is_stamped_with_what_plays_now() {
+        assert_eq!(playing_rtptime(100_000, 88_200), 11_800);
+        assert_eq!(playing_rtptime(5, 10), 5u32.wrapping_sub(10));
+    }
+
+    /// No track text for a receiver that didn't ask for it; one that asked
+    /// and never answers keeps playing.
+    #[test]
+    fn track_text_goes_only_where_wanted_and_a_missing_answer_ends_nothing() {
+        let rx = FakeRaop::start(|req| match req.header("Content-Type") {
+            Some("application/x-dmap-tagged") => Answer::Ignore,
+            _ => Answer::Normal,
+        });
+        let session = start(&rx, "0B0000000050", &[0, 1], None).expect("up");
+        assert!(session.metadata_handle().is_none());
+        session.stop();
+
+        let (_tx, samples) = crossbeam_channel::unbounded();
+        let mut r = receiver(&rx, "0B0000000051", &[0, 1]);
+        r.raop.metadata = vec![0, 1];
+        let mut cfg = config(r, samples);
+        cfg.timeouts = quick();
+        let session = AirPlaySession::start(cfg).expect("up");
+        let handle = session.metadata_handle().expect("it takes text");
+        let started = Instant::now();
+        assert!(handle.send("Song", "Artist", "Album").is_err(), "no answer");
+        assert!(started.elapsed() < quick().reply * 10);
+        // The connection is still in step: the next request is answered.
+        session.set_volume_pct(30).expect("volume after the unanswered text");
+        assert!(!session.is_dead());
+        session.stop();
+        let text = rx.requests().into_iter().find(|r| r.header("Content-Type") == Some("application/x-dmap-tagged")).unwrap();
+        let record = rx.requests().into_iter().filter(|r| r.method == "RECORD").last().unwrap();
+        let rtptime = |v: &str| v.rsplit("rtptime=").next().unwrap().parse::<u32>().unwrap();
+        let start_rtp = rtptime(record.header("RTP-Info").unwrap());
+        let stamped = rtptime(text.header("RTP-Info").unwrap());
+        // About latency (88200) behind the write head, which is a little
+        // past the start.
+        let behind = start_rtp.wrapping_sub(stamped);
+        assert!((44_100..=88_200).contains(&behind), "{behind}");
     }
 
     #[test]

@@ -685,11 +685,14 @@ Session: 1
 fn keepalive_track_text_and_volume() {
     let rx = FakeRaop::start(|_| Answer::Normal);
     let (_tx, srx) = samples();
-    let cfg = config(receiver(&rx, "0A0000000009", &[0, 1]), srx);
+    let mut r = receiver(&rx, "0A0000000009", &[0, 1]);
+    // It takes track text (`md=0`).
+    r.raop.metadata = vec![0];
+    let cfg = config(r, srx);
     let session = AirPlaySession::start(cfg).expect("the session starts");
     // The first keepalive goes out about 2 s after the session is up.
     assert!(rx.wait_for_requests(6, Duration::from_secs(20)), "{:?}", rx.lines());
-    session.metadata_handle().send("Song", "Artist", "Album").expect("track text answered");
+    session.metadata_handle().expect("it takes text").send("Song", "Artist", "Album").expect("track text answered");
     session.set_volume_pct(40).expect("volume answered");
     session.set_mute(true).expect("mute answered");
     session.stop();

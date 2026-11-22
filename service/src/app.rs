@@ -173,7 +173,7 @@ impl ActiveSession {
     /// cheap and lets the caller send without holding the session lock.
     pub fn metadata_handle(&self) -> Option<crate::airplay::session::MetadataHandle> {
         match self {
-            ActiveSession::AirPlay(s) => Some(s.metadata_handle()),
+            ActiveSession::AirPlay(s) => s.metadata_handle(),
             ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) | ActiveSession::Sendspin(_) | ActiveSession::MusicAssistant(_) => None,
         }
     }
