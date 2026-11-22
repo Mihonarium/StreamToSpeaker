@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use crate::airplay::hap_pairing::PairingCredentials;
 use crate::secret_store::{self, LockedNode, PlatformCodec, SecretCodec};
+use crate::settings_file::{self, Disk, FileOps, WriteError};
 use crate::discovery_net::SavedAdapter;
 use crate::manual_speakers::ManualSpeaker;
 use crate::stream_profile::StreamProfile;
@@ -128,6 +129,9 @@ pub struct UserConfig {
     /// Where saves go.
     #[serde(skip)]
     saves: Saves,
+    /// What loading found that the person should be told once.
+    #[serde(skip)]
+    load_notice: LoadNotice,
     /// Forward Windows' "now playing" (title/artist/album from the System
     /// Media Transport Controls) to the speaker as track metadata, so it
     /// shows on the speaker's display / app. **Off by default** — it's a
@@ -417,15 +421,16 @@ impl UserConfig {
     }
 
     /// Load from `path`. A missing file is a fresh install. A file that
-    /// exists but isn't valid JSON (or isn't text in an encoding
-    /// `decode_config_text` reads) is **quarantined** — renamed to
-    /// `config.json.corrupt-<unix time>` beside the original — and the
-    /// defaults are used. The old behaviour was `unwrap_or_default()`,
-    /// which silently reset everything and then let the next save
-    /// overwrite the broken file; `airplay_pairings` alone costs a PIN
-    /// ceremony per Apple TV to recreate, so the data is worth keeping
-    /// for manual recovery. A file that can't be read at all (or moved
-    /// aside) is never overwritten by this run's saves.
+    /// exists but isn't usable (not text in an encoding
+    /// `decode_config_text` reads, not JSON, not a JSON object: empty or
+    /// zero-filled after a power cut, say) gives way to the backup the
+    /// previous save left (`config.json.bak`, see `settings_file`), and is
+    /// **moved aside** to `config.json.corrupt-<unix time>`; the backup's
+    /// settings are saved as `config.json` at once. With no usable backup
+    /// either, the defaults are used. A file that can't be read at all (or
+    /// moved aside), and an unreadable backup, are never overwritten by
+    /// this run's saves. What the person should hear about is in
+    /// [`load_notice`](Self::load_notice).
     pub fn load_from(path: &std::path::Path) -> Self {
         Self::load_from_with(path, &PlatformCodec)
     }
@@ -437,9 +442,21 @@ impl UserConfig {
     /// readable on disk. A file in another encoding than the UTF-8 saves
     /// write is rewritten right away too: older versions read only that.
     pub fn load_from_with(path: &std::path::Path, codec: &dyn SecretCodec) -> Self {
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+        Self::load_with_ops(path, codec, &Disk)
+    }
+
+    /// [`load_from_with`](Self::load_from_with) through `fs`.
+    pub(crate) fn load_with_ops(path: &std::path::Path, codec: &dyn SecretCodec, fs: &dyn FileOps) -> Self {
+        settings_file::remove_stale_temps(fs, path);
+        let unusable = match fs.read(path) {
+            Ok(bytes) => match parse_settings(&bytes, codec) {
+                Ok(parsed) => return Self::from_parsed(parsed, path, codec, fs, LoadNotice::default()),
+                Err(why) => {
+                    log::error!("user_config: can't use {} ({why})", path.display());
+                    true
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
                 log::error!(
                     "user_config: can't read {}: {} — using defaults; the file is left as is \
@@ -450,54 +467,94 @@ impl UserConfig {
                 return Self { saves: Saves::KeepFile, ..Self::default() };
             }
         };
-        let parsed = decode_config_text(&bytes, decode_ansi).and_then(|(json, encoding)| {
-            serde_json::from_str::<serde_json::Value>(&json)
-                .and_then(|mut tree| {
-                    let report = secret_store::unseal(&mut tree, codec);
-                    serde_json::from_value::<UserConfig>(tree).map(|c| (c, report, encoding))
-                })
-                .map_err(|e| format!("not valid JSON: {e}"))
-        });
-        match parsed {
-            Ok((mut c, report, encoding)) => {
-                c.locked_secrets = report.locked;
-                if let Some(encoding) = encoding {
-                    log::info!("user_config: rewriting {} ({encoding}) as UTF-8", path.display());
-                    c.save_to_with(path, codec);
-                } else if report.needs_save && codec.can_protect() {
-                    log::info!(
-                        "user_config: protecting stored secrets written unprotected by an \
-                         earlier version"
-                    );
-                    c.save_to_with(path, codec);
+        // `config.json` is missing or unusable: the backup, if it is good.
+        let backup_path = settings_file::backup_path(path);
+        let backup = match fs.read(&backup_path) {
+            Ok(bytes) => match parse_settings(&bytes, codec) {
+                Ok(parsed) => Some(parsed),
+                Err(why) => {
+                    log::warn!("user_config: can't use the backup {} either ({why})", backup_path.display());
+                    None
                 }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                log::error!(
+                    "user_config: can't read the backup {}: {} — using defaults; both files are \
+                     left as they are and settings changed in this run are not saved",
+                    backup_path.display(),
+                    e
+                );
+                return Self { saves: Saves::KeepFile, ..Self::default() };
+            }
+        };
+        if !unusable && backup.is_none() {
+            return Self::default();
+        }
+        let mut notice = LoadNotice::default();
+        if unusable {
+            let aside = quarantine_path(path);
+            if let Err(re) = fs.rename(path, &aside) {
+                log::error!(
+                    "user_config: could not move {} aside ({}); starting with defaults — the \
+                     file is left as is and settings changed in this run are not saved",
+                    path.display(),
+                    re
+                );
+                return Self { saves: Saves::KeepFile, ..Self::default() };
+            }
+            log::warn!("user_config: moved {} to {}", path.display(), aside.display());
+            notice.unusable_kept_as = Some(aside);
+        }
+        match backup {
+            Some(parsed) => {
+                log::warn!(
+                    "user_config: loaded the settings from the backup {}, the settings as they \
+                     were before the last save",
+                    backup_path.display()
+                );
+                notice.restored_from_backup = true;
+                let c = Self::from_parsed(parsed, path, codec, fs, notice);
+                // So the next start finds them in `config.json` again.
+                c.save_to_ops(path, codec, fs);
                 c
             }
-            Err(e) => {
-                let aside = quarantine_path(path);
-                match std::fs::rename(path, &aside) {
-                    Ok(()) => log::error!(
-                        "user_config: can't use {} ({}); moved it to {} and starting with \
-                         defaults",
-                        path.display(),
-                        e,
-                        aside.display()
-                    ),
-                    Err(re) => {
-                        log::error!(
-                            "user_config: can't use {} ({}) and could not move it aside ({}); \
-                             starting with defaults — the file is left as is and settings \
-                             changed in this run are not saved",
-                            path.display(),
-                            e,
-                            re
-                        );
-                        return Self { saves: Saves::KeepFile, ..Self::default() };
-                    }
-                }
-                Self::default()
+            None => {
+                log::error!("user_config: no usable backup; starting with defaults");
+                notice.all_reset = true;
+                Self { load_notice: notice, ..Self::default() }
             }
         }
+    }
+
+    /// Settings from a file `parse_settings` accepted, saving at once when
+    /// the file needs it (see [`load_from_with`](Self::load_from_with)).
+    fn from_parsed(
+        parsed: Parsed,
+        path: &std::path::Path,
+        codec: &dyn SecretCodec,
+        fs: &dyn FileOps,
+        notice: LoadNotice,
+    ) -> Self {
+        let Parsed { mut config, report, encoding } = parsed;
+        config.locked_secrets = report.locked;
+        config.load_notice = notice;
+        if let Some(encoding) = encoding {
+            log::info!("user_config: rewriting {} ({encoding}) as UTF-8", path.display());
+            config.save_to_ops(path, codec, fs);
+        } else if report.needs_save && codec.can_protect() {
+            log::info!(
+                "user_config: protecting stored secrets written unprotected by an earlier version"
+            );
+            config.save_to_ops(path, codec, fs);
+        }
+        config
+    }
+
+    /// What loading found that the person should be told once: settings
+    /// restored from the backup, or reset.
+    pub fn load_notice(&self) -> &LoadNotice {
+        &self.load_notice
     }
 
     /// Best-effort save. Logged-on-failure rather than propagated — a
@@ -545,27 +602,24 @@ impl UserConfig {
     /// [`stored_web_secret`](Self::stored_web_secret) for the file at
     /// `path`, opened with `codec`.
     pub fn stored_web_secret_at(path: &std::path::Path, codec: &dyn SecretCodec) -> Option<String> {
-        let bytes = std::fs::read(path).ok()?;
-        let (json, _) = decode_config_text(&bytes, decode_ansi).ok()?;
-        let tree: serde_json::Value = serde_json::from_str(&json).ok()?;
-        match secret_store::stored_value(&tree, "web_secret", codec)? {
-            serde_json::Value::String(key) => Some(key),
-            _ => None,
-        }
+        let (tree, _) = settings_tree(&std::fs::read(path).ok()?).ok()?;
+        stored_web_secret_in(&tree, codec)
     }
 
-    /// Atomic replace: serialise to a sibling temp file, then rename it
-    /// over the real one. A crash or power cut mid-write can then never
-    /// leave a truncated `config.json` (which `load_from` would have to
-    /// quarantine). `rename` replaces an existing file on both Windows
-    /// and Unix.
+    /// Save to `path`: see `settings_file` for how a save can't lose the
+    /// settings, whatever moment a crash or a power cut hits. `rename`
+    /// replaces an existing file on both Windows and Unix.
     pub fn save_to(&self, path: &std::path::Path) {
         self.save_to_with(path, &PlatformCodec)
     }
 
     /// [`save_to`](Self::save_to) with an explicit secret protector.
     pub fn save_to_with(&self, path: &std::path::Path, codec: &dyn SecretCodec) {
-        if let Err(e) = self.try_save_to_with(path, codec) {
+        self.save_to_ops(path, codec, &Disk)
+    }
+
+    fn save_to_ops(&self, path: &std::path::Path, codec: &dyn SecretCodec, fs: &dyn FileOps) {
+        if let Err(e) = self.try_save_to_ops(path, codec, fs) {
             log::warn!("user_config: {e}");
         }
     }
@@ -576,6 +630,16 @@ impl UserConfig {
         &self,
         path: &std::path::Path,
         codec: &dyn SecretCodec,
+    ) -> Result<(), String> {
+        self.try_save_to_ops(path, codec, &Disk)
+    }
+
+    /// [`try_save_to_with`](Self::try_save_to_with) through `fs`.
+    pub(crate) fn try_save_to_ops(
+        &self,
+        path: &std::path::Path,
+        codec: &dyn SecretCodec,
+        fs: &dyn FileOps,
     ) -> Result<(), String> {
         match &self.saves {
             Saves::ToFile => {}
@@ -590,15 +654,17 @@ impl UserConfig {
             #[cfg(test)]
             Saves::AtPath(_) => {}
         }
-        let dir = path.parent().ok_or_else(|| format!("{} names no file", path.display()))?;
-        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
         let mut tree = serde_json::to_value(self).map_err(|e| format!("serialize: {e}"))?;
+        // The file as it is now: it becomes the backup when it is usable,
+        // and it may hold a web key stored since these settings were read.
+        let now = fs.read(path).ok();
+        let now_tree = now.as_deref().and_then(|b| settings_tree(b).ok()).map(|(t, _)| t);
         if self.web_secret.is_none() {
             // The file may hold a key `--web-link` stored while these
             // settings held none. Writing none over it would break the link
             // it printed; the app takes that key when its web UI is turned
             // on (see `web_access::stored_or_new_secret`).
-            if let Some(key) = Self::stored_web_secret_at(path, codec) {
+            if let Some(key) = now_tree.as_ref().and_then(|t| stored_web_secret_in(t, codec)) {
                 if let Some(fields) = tree.as_object_mut() {
                     fields.insert("web_secret".into(), serde_json::Value::String(key));
                 }
@@ -606,12 +672,69 @@ impl UserConfig {
         }
         secret_store::seal(&mut tree, &self.locked_secrets, codec);
         let content = serde_json::to_string_pretty(&tree).map_err(|e| format!("serialize: {e}"))?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, content).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("replace {}: {}", path.display(), e)
+        let backup = now.as_deref().filter(|_| now_tree.is_some());
+        settings_file::replace(fs, path, content.as_bytes(), backup).map_err(|e| match e {
+            WriteError::Folder(e) => format!("mkdir {}: {}", path.parent().unwrap_or(path).display(), e),
+            WriteError::Write(e) => format!("write beside {}: {}", path.display(), e),
+            WriteError::Replace(e) => format!("replace {}: {}", path.display(), e),
         })
+    }
+}
+
+/// What loading the settings found that the person should be told once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoadNotice {
+    /// The settings were read from the backup, because `config.json` was
+    /// missing or unusable: they are as they were before the last save.
+    pub restored_from_backup: bool,
+    /// `config.json` as it was found, when it was unusable and moved aside.
+    pub unusable_kept_as: Option<PathBuf>,
+    /// Every setting is back to its default: `config.json` was unusable
+    /// and there was no usable backup.
+    pub all_reset: bool,
+}
+
+impl LoadNotice {
+    /// Whether there is anything to tell.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A settings file `parse_settings` accepted.
+struct Parsed {
+    config: UserConfig,
+    report: secret_store::UnsealReport,
+    /// The file's encoding, when it isn't the UTF-8 saves write.
+    encoding: Option<&'static str>,
+}
+
+/// The settings in a file's bytes, secrets unsealed with `codec`; why
+/// they aren't usable otherwise.
+fn parse_settings(bytes: &[u8], codec: &dyn SecretCodec) -> Result<Parsed, String> {
+    let (mut tree, encoding) = settings_tree(bytes)?;
+    let report = secret_store::unseal(&mut tree, codec);
+    let config = serde_json::from_value::<UserConfig>(tree).map_err(|e| format!("not valid JSON: {e}"))?;
+    Ok(Parsed { config, report, encoding })
+}
+
+/// A settings file's JSON tree, which must be an object, as stored
+/// (sealed), and its encoding when it isn't UTF-8.
+fn settings_tree(bytes: &[u8]) -> Result<(serde_json::Value, Option<&'static str>), String> {
+    let (json, encoding) = decode_config_text(bytes, decode_ansi)?;
+    let tree: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("not valid JSON: {e}"))?;
+    if !tree.is_object() {
+        return Err("not a JSON object".into());
+    }
+    Ok((tree, encoding))
+}
+
+/// The web UI's key in a settings file's tree (see
+/// [`UserConfig::stored_web_secret`]).
+fn stored_web_secret_in(tree: &serde_json::Value, codec: &dyn SecretCodec) -> Option<String> {
+    match secret_store::stored_value(tree, "web_secret", codec)? {
+        serde_json::Value::String(key) => Some(key),
+        _ => None,
     }
 }
 
@@ -841,11 +964,20 @@ mod tests {
         // Its folder can't be made: a file has the name.
         let err = c.try_save_to_with(&path.join("config.json"), &PlatformCodec).unwrap_err();
         assert!(err.starts_with("mkdir "), "{err}");
-        // The temp file can't be written: a folder has its name.
-        let blocked = dir.join("blocked").join("config.json");
-        std::fs::create_dir_all(blocked.with_extension("json.tmp")).unwrap();
-        let err = c.try_save_to_with(&blocked, &PlatformCodec).unwrap_err();
-        assert!(err.starts_with("write "), "{err}");
+        // The temp file can't be written: the folder takes no new files.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let blocked = dir.join("blocked");
+            std::fs::create_dir_all(&blocked).unwrap();
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o500)).unwrap();
+            // Permissions don't apply when running as root: nothing to test.
+            if std::fs::write(blocked.join("probe"), b"").is_err() {
+                let err = c.try_save_to_with(&blocked.join("config.json"), &PlatformCodec).unwrap_err();
+                assert!(err.starts_with("write "), "{err}");
+            }
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         // It can't replace the file, a folder here: the temp file goes.
         let occupied = dir.join("occupied").join("config.json");
         std::fs::create_dir_all(&occupied).unwrap();
@@ -857,6 +989,118 @@ mod tests {
         UserConfig::in_memory().try_save_to_with(&untouched, &PlatformCodec).unwrap();
         assert!(!untouched.parent().unwrap().exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settings told apart by `id`, with a secret that goes with them.
+    fn numbered(id: &str) -> UserConfig {
+        let mut c = UserConfig::default();
+        c.last_speaker_id = Some(id.into());
+        c.airplay_passwords.insert("airplay:aa".into(), format!("pw-{id}"));
+        c
+    }
+
+    #[test]
+    fn a_power_cut_at_any_moment_of_a_save_leaves_the_old_or_the_new_settings() {
+        use crate::secret_store::tests::FakeCodec;
+        use crate::settings_file::tests::PowerCutDisk;
+        let path = PathBuf::from("/profile/StreamToSpeaker/config.json");
+        let codec = FakeCodec(0x42);
+        // The disk after two saves.
+        let start = || {
+            let disk = PowerCutDisk::default();
+            numbered("older").try_save_to_ops(&path, &codec, &disk).unwrap();
+            numbered("old").try_save_to_ops(&path, &codec, &disk).unwrap();
+            disk
+        };
+        let full = {
+            let disk = start();
+            disk.cut_after(usize::MAX);
+            numbered("new").try_save_to_ops(&path, &codec, &disk).unwrap();
+            disk.ops()
+        };
+        for n in 0..=full {
+            let disk = start();
+            disk.cut_after(n);
+            let _ = numbered("new").try_save_to_ops(&path, &codec, &disk);
+            let after = disk.after_power_cut();
+            let loaded = UserConfig::load_with_ops(&path, &codec, &after);
+            let id = loaded.last_speaker_id.clone();
+            assert!(matches!(id.as_deref(), Some("old" | "new")), "power cut after {n} of {full}: {id:?}");
+            assert_eq!(loaded.airplay_passwords["airplay:aa"], format!("pw-{}", id.unwrap()), "{n}");
+            assert!(loaded.load_notice().is_empty(), "{n}: {:?}", loaded.load_notice());
+        }
+    }
+
+    #[test]
+    fn a_file_zeroed_by_a_power_cut_gives_way_to_the_backup() {
+        use crate::secret_store::tests::FakeCodec;
+        use crate::settings_file::tests::PowerCutDisk;
+        let path = PathBuf::from("/profile/StreamToSpeaker/config.json");
+        let codec = FakeCodec(0x42);
+        let mut disk = PowerCutDisk::default();
+        numbered("before").try_save_to_ops(&path, &codec, &disk).unwrap();
+        numbered("last").try_save_to_ops(&path, &codec, &disk).unwrap();
+        // Something writes the file the way earlier versions did (no flush
+        // before the rename), and the power goes before the data is on the
+        // disk: the file has its length and nothing but zeros.
+        disk.cached_writes = true;
+        let text = serde_json::to_string_pretty(&numbered("unflushed")).unwrap();
+        crate::settings_file::replace(&disk, &path, text.as_bytes(), None).unwrap();
+        let after = disk.after_power_cut();
+        assert!(after.get(&path).unwrap().iter().all(|&b| b == 0));
+        let loaded = UserConfig::load_with_ops(&path, &codec, &after);
+        // The backup: the settings before the last save of this version.
+        assert_eq!(loaded.last_speaker_id.as_deref(), Some("before"));
+        assert_eq!(loaded.airplay_passwords["airplay:aa"], "pw-before");
+        let notice = loaded.load_notice();
+        assert!(notice.restored_from_backup && !notice.all_reset);
+        // The zeroed file is kept aside, never as the backup, and the
+        // backup's settings are in config.json again.
+        let aside = notice.unusable_kept_as.clone().unwrap();
+        assert!(after.get(&aside).unwrap().iter().all(|&b| b == 0));
+        let bak = after.get(&crate::settings_file::backup_path(&path)).unwrap();
+        assert!(!bak.iter().all(|&b| b == 0));
+        let again = UserConfig::load_with_ops(&path, &codec, &after);
+        assert_eq!(again.last_speaker_id.as_deref(), Some("before"));
+        assert!(again.load_notice().is_empty(), "told once");
+    }
+
+    #[test]
+    fn a_missing_empty_or_broken_file_gives_way_to_a_good_backup() {
+        use crate::secret_store::tests::FakeCodec;
+        use crate::settings_file::tests::PowerCutDisk;
+        let path = PathBuf::from("/profile/StreamToSpeaker/config.json");
+        let codec = FakeCodec(0x42);
+        for (what, file) in [
+            ("missing", None),
+            ("empty", Some(&b""[..])),
+            ("not JSON", Some(&b"{ \"last_speaker_id\": tru"[..])),
+            ("not an object", Some(&b"[1, 2]"[..])),
+        ] {
+            let disk = PowerCutDisk::default();
+            numbered("good").try_save_to_ops(&path, &codec, &disk).unwrap();
+            numbered("newer").try_save_to_ops(&path, &codec, &disk).unwrap();
+            disk.remove(&path).unwrap();
+            if let Some(bytes) = file {
+                disk.create_flushed(&path, bytes).unwrap();
+            }
+            let loaded = UserConfig::load_with_ops(&path, &codec, &disk);
+            assert_eq!(loaded.last_speaker_id.as_deref(), Some("good"), "{what}");
+            assert!(loaded.load_notice().restored_from_backup, "{what}");
+            assert_eq!(loaded.load_notice().unusable_kept_as.is_some(), file.is_some(), "{what}");
+        }
+        // Neither file usable: defaults, said so, both kept.
+        let disk = PowerCutDisk::default();
+        disk.create_flushed(&path, b"\0\0\0").unwrap();
+        disk.create_flushed(&crate::settings_file::backup_path(&path), b"").unwrap();
+        let loaded = UserConfig::load_with_ops(&path, &codec, &disk);
+        assert_eq!(loaded.last_speaker_id, None);
+        assert!(loaded.load_notice().all_reset && !loaded.load_notice().restored_from_backup);
+        let aside = loaded.load_notice().unusable_kept_as.clone().unwrap();
+        assert_eq!(disk.get(&aside).unwrap(), b"\0\0\0");
+        // A fresh install has nothing to tell.
+        let fresh = UserConfig::load_with_ops(&path, &codec, &PowerCutDisk::default());
+        assert!(fresh.load_notice().is_empty());
     }
 
     #[test]
@@ -894,17 +1138,24 @@ mod tests {
         let c = UserConfig::load_from(&path);
         assert_eq!(c.last_speaker_id.as_deref(), Some("uuid:RINCON_BOM"));
         assert_eq!(c.airplay_latency_ms, 300);
-        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
-        assert_eq!(names, ["config.json"], "nothing quarantined");
+        let mut names: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["config.json", "config.json.bak"], "nothing quarantined");
         // Rewritten without the mark at once, as every version reads it.
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.starts_with(b"{"), "saved without a BOM");
         let back: UserConfig = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.last_speaker_id.as_deref(), Some("uuid:RINCON_BOM"));
-        // Only one: a second mark is not a config file this app wrote.
+        // Only one: a second mark is not a config file this app wrote. It
+        // is moved aside, and the backup (the file as it was before the
+        // rewrite) is read instead.
         std::fs::write(&path, "\u{feff}\u{feff}{}").unwrap();
-        UserConfig::load_from(&path);
-        assert!(!path.exists(), "quarantined");
+        let c = UserConfig::load_from(&path);
+        assert_eq!(c.last_speaker_id.as_deref(), Some("uuid:RINCON_BOM"));
+        assert!(c.load_notice().restored_from_backup);
+        let kept = c.load_notice().unusable_kept_as.clone().unwrap();
+        assert_eq!(std::fs::read(&kept).unwrap(), "\u{feff}\u{feff}{}".as_bytes());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1003,6 +1254,35 @@ mod tests {
         let next = UserConfig::load_from(&path);
         assert_eq!(next.last_speaker_id.as_deref(), Some("kept"));
         assert_eq!(next.airplay_passwords["airplay:aa"], "hunter2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_backup_is_never_overwritten_either() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_config_dir("unreadable-backup");
+        let path = dir.join("config.json");
+        numbered("a").save_to(&path);
+        numbered("b").save_to(&path);
+        let bak = crate::settings_file::backup_path(&path);
+        let backup = std::fs::read(&bak).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&bak).is_ok() {
+            // Permissions don't apply (running as root): nothing to test.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let loaded = UserConfig::load_from(&path);
+        assert_eq!(loaded.last_speaker_id, None);
+        loaded.save_to(&path);
+        loaded.clone().save_to(&path);
+        std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"", "the broken file is left as it is");
+        assert_eq!(std::fs::read(&bak).unwrap(), backup);
+        // Readable at the next start: the backup is used.
+        assert_eq!(UserConfig::load_from(&path).last_speaker_id.as_deref(), Some("a"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

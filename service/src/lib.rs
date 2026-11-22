@@ -27,6 +27,7 @@ pub mod qpc;
 pub mod picker;
 pub mod user_config;
 pub mod folders;
+pub mod settings_file;
 pub mod secret_store;
 pub mod update_check;
 pub mod stream_gate;
