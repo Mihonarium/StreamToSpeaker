@@ -3843,10 +3843,14 @@ pub fn start_session(
     // Stop first to clear any "Transport Locked" (Sonos 705) carry-over.
     let _ = upnp::stop(&renderer.av_transport_control_url);
     std::thread::sleep(Duration::from_millis(100));
-    upnp::set_av_transport_uri(&renderer.av_transport_control_url, stream_uri, didl)
-        .context("SetAVTransportURI")?;
+    upnp::set_av_transport_uri(&renderer.av_transport_control_url, stream_uri, didl)?;
     std::thread::sleep(Duration::from_millis(100));
-    upnp::play(&renderer.av_transport_control_url).context("Play")?;
+    if let Err(e) = upnp::play(&renderer.av_transport_control_url) {
+        // The renderer holds our URI and may still start on it: tell it
+        // to let go, so a failure reported here is not a speaker playing.
+        let _ = upnp::stop(&renderer.av_transport_control_url);
+        return Err(e);
+    }
 
     let gena = GenaManager::new(callback_url.to_string());
     // Groups subscribe to GroupRenderingControl (GroupVolume events —
@@ -4115,6 +4119,40 @@ mod tests {
             stream_grant: None,
             id_override: None,
         })
+    }
+
+    /// A renderer whose every service is on `fake`.
+    fn renderer_on(fake: &crate::fake_renderer::FakeRenderer) -> Renderer {
+        let ActiveSession::Upnp(s) = upnp_session(&fake.url("/RenderingControl/Control")) else { unreachable!() };
+        Renderer {
+            base_url: fake.url(""),
+            av_transport_control_url: fake.url("/AVTransport/Control"),
+            rendering_control_event_url: fake.url("/RenderingControl/Event"),
+            ..s.renderer
+        }
+    }
+
+    /// A renderer that answers each AVTransport action with `play`'s
+    /// answers to Play in turn (then success) and accepts the rest.
+    fn renderer_answering_play(play: Vec<crate::fake_renderer::Reply>) -> crate::fake_renderer::FakeRenderer {
+        use crate::fake_renderer::{FakeRenderer, Reply, AV_TRANSPORT};
+        let play = Mutex::new(play.into_iter());
+        FakeRenderer::start(move |req| match req.soap_action() {
+            Some("Play") => play.lock().unwrap().next().unwrap_or_else(|| Reply::soap_ok(AV_TRANSPORT, "Play", &[])),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            // GENA SUBSCRIBE / UNSUBSCRIBE.
+            None => Reply::raw("HTTP/1.1 200 OK\r\nSID: uuid:fake-session\r\nTIMEOUT: Second-1800\r\nContent-Length: 0\r\n\r\n"),
+        })
+    }
+
+    #[test]
+    fn a_play_refused_after_the_uri_was_taken_is_followed_by_stop() {
+        use crate::fake_renderer::Reply;
+        let fake = renderer_answering_play(vec![Reply::soap_fault(704, "Playing failed")]);
+        let r = start_session(renderer_on(&fake), "http://127.0.0.1:1/stream.raw", "", "http://127.0.0.1:1/gena", None);
+        assert!(r.is_err());
+        // The renderer holds our URI; it is told to let go of it.
+        assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Stop"]);
     }
 
     #[test]

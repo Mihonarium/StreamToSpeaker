@@ -18,13 +18,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
-use std::io::Write;
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::device_http::{self, Limits, Response, Version};
 use crate::stream_gate::canonical_ip;
 
 /// A simple Volume / Mute change decoded from a LastChange notification.
@@ -355,6 +355,17 @@ pub fn parse_rendering_notify(body: &str) -> Option<RenderingChange> {
 // HTTP-level helpers
 // -----------------------------------------------------------------------------
 
+/// SUBSCRIBE and its renewals, answered with headers only. A renderer
+/// that has just been told to play may take a few seconds over it.
+const SUBSCRIBE_LIMITS: Limits = Limits {
+    connect: Duration::from_secs(5),
+    deadline: Duration::from_secs(10),
+    max_bytes: 64 * 1024,
+};
+
+/// UNSUBSCRIBE, sent when moving on from a speaker: best-effort.
+const UNSUBSCRIBE_LIMITS: Limits = Limits { deadline: Duration::from_secs(5), ..SUBSCRIBE_LIMITS };
+
 fn http_subscribe(event_url: &str, callback_url: &str, timeout_secs: u64) -> Result<(String, u64)> {
     let resp = do_request(
         event_url,
@@ -364,10 +375,11 @@ fn http_subscribe(event_url: &str, callback_url: &str, timeout_secs: u64) -> Res
             ("NT", "upnp:event".to_string()),
             ("TIMEOUT", format!("Second-{}", timeout_secs)),
         ],
-        "",
+        &SUBSCRIBE_LIMITS,
     )?;
-    let sid = extract_header(&resp, "SID").ok_or_else(|| anyhow!("SID missing in subscribe response"))?;
-    let to = extract_header(&resp, "TIMEOUT")
+    let sid = resp.header("SID").ok_or_else(|| anyhow!("SID missing in subscribe response"))?.to_string();
+    let to = resp
+        .header("TIMEOUT")
         .and_then(|t| {
             // Format: "Second-1800" or "Second-infinite".
             t.strip_prefix("Second-")
@@ -385,87 +397,36 @@ fn http_renew(event_url: &str, sid: &str, timeout_secs: u64) -> Result<u64> {
             ("SID", sid.to_string()),
             ("TIMEOUT", format!("Second-{}", timeout_secs)),
         ],
-        "",
+        &SUBSCRIBE_LIMITS,
     )?;
-    let to = extract_header(&resp, "TIMEOUT")
+    let to = resp
+        .header("TIMEOUT")
         .and_then(|t| t.strip_prefix("Second-").and_then(|s| s.parse::<u64>().ok()))
         .unwrap_or(timeout_secs);
     Ok(to)
 }
 
 fn http_unsubscribe(event_url: &str, sid: &str) -> Result<()> {
-    let _ = do_request(
-        event_url,
-        "UNSUBSCRIBE",
-        &[("SID", sid.to_string())],
-        "",
-    )?;
+    do_request(event_url, "UNSUBSCRIBE", &[("SID", sid.to_string())], &UNSUBSCRIBE_LIMITS)?;
     Ok(())
 }
 
-fn do_request(
-    url_str: &str,
-    method: &str,
-    extra_headers: &[(&str, String)],
-    body: &str,
-) -> Result<String> {
-    let url = url::Url::parse(url_str).with_context(|| format!("parse {}", url_str))?;
-    let host = url.host_str().ok_or_else(|| anyhow!("no host in {}", url_str))?;
-    let port = url.port().unwrap_or(80);
-    let path = if url.path().is_empty() { "/" } else { url.path() };
-    let path_q = if let Some(q) = url.query() {
-        format!("{}?{}", path, q)
-    } else {
-        path.to_string()
+/// A GENA request (no body) and its answer, which must be `200`.
+fn do_request(url_str: &str, method: &str, extra_headers: &[(&str, String)], limits: &Limits) -> Result<Response> {
+    let mut headers: Vec<(&str, &str)> = extra_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    headers.extend([("Content-Length", "0"), ("Connection", "close"), ("User-Agent", device_http::USER_AGENT)]);
+    let request = device_http::Request {
+        method,
+        url: url_str,
+        version: Version::Http11,
+        headers: &headers,
+        body: b"",
     };
-    let addr: SocketAddr = (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow!("no addrs"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    let mut req = String::new();
-    req.push_str(&format!("{} {} HTTP/1.1\r\n", method, path_q));
-    req.push_str(&format!("Host: {}:{}\r\n", host, port));
-    for (k, v) in extra_headers {
-        req.push_str(&format!("{}: {}\r\n", k, v));
+    let resp = device_http::exchange(&request, limits).with_context(|| format!("{} {}", method, url_str))?;
+    if resp.status != 200 {
+        return Err(anyhow!("{} {} failed: {}", method, url_str, resp.status_text()));
     }
-    req.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    req.push_str("Connection: close\r\n");
-    req.push_str("User-Agent: stream-to-speaker/0.1\r\n");
-    req.push_str("\r\n");
-    req.push_str(body);
-
-    stream.write_all(req.as_bytes())?;
-    stream.flush()?;
-
-    // SUBSCRIBE/UNSUBSCRIBE replies are headers only.
-    let buf = crate::ssdp::read_to_end_bounded(
-        &mut stream,
-        64 * 1024,
-        std::time::Instant::now() + crate::ssdp::RESPONSE_DEADLINE,
-    )
-    .with_context(|| format!("reading {} response", method))?;
-    let text = String::from_utf8_lossy(&buf).to_string();
-
-    let status_line = text.lines().next().unwrap_or("");
-    if !status_line.contains(" 200 ") {
-        return Err(anyhow!("{} {} failed: {}", method, url_str, status_line));
-    }
-    Ok(text)
-}
-
-fn extract_header(response: &str, header: &str) -> Option<String> {
-    let key = format!("{}:", header.to_ascii_uppercase());
-    for line in response.lines() {
-        let upper: String = line.chars().take(key.len()).map(|c| c.to_ascii_uppercase()).collect();
-        if upper == key {
-            return Some(line[key.len()..].trim().to_string());
-        }
-    }
-    None
+    Ok(resp)
 }
 
 /// Pull the raw (still escaped) content between the first `<tag>...</tag>`
@@ -578,6 +539,25 @@ mod tests {
         let m = GenaManager::new("http://127.0.0.1:1/gena".into());
         m.unsubscribe();
         assert!(m.subscribe("http://127.0.0.1:1/Event").is_err());
+    }
+
+    #[test]
+    fn subscribe_completes_on_a_connection_the_renderer_leaves_open() {
+        use crate::fake_renderer::{FakeRenderer, Reply};
+        let fake = FakeRenderer::start(|_| {
+            Reply::raw("HTTP/1.1 200 OK\r\nSID: uuid:held-open\r\nTIMEOUT: Second-1800\r\nContent-Length: 0\r\n\r\n")
+                .then_hold_open()
+        });
+        let m = GenaManager::new("http://127.0.0.1:1/gena".into());
+        let start = Instant::now();
+        assert_eq!(m.subscribe(&fake.url("/RenderingControl/Event")).unwrap(), "uuid:held-open");
+        assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+        let req = fake.next_request(Duration::from_secs(5)).unwrap();
+        assert_eq!((req.method.as_str(), req.target.as_str()), ("SUBSCRIBE", "/RenderingControl/Event"));
+        assert_eq!(req.header("CALLBACK"), Some("<http://127.0.0.1:1/gena>"));
+        assert_eq!(req.header("NT"), Some("upnp:event"));
+        assert_eq!(req.header("TIMEOUT"), Some("Second-1800"));
+        registry().remove("uuid:held-open");
     }
 
     #[test]

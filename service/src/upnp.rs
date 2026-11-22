@@ -8,14 +8,13 @@
 //!   * ZoneGroupTopology (Sonos): GetZoneGroupState
 //!
 //! SOAP is just HTTP POST with a specific Content-Type + SOAPAction header
-//! and an envelope-shaped XML body. We hand-roll it over TCP so we don't
-//! pull in another HTTP client.
+//! and an envelope-shaped XML body, sent with the app's own small client
+//! (`device_http`).
 
-use anyhow::{anyhow, Context, Result};
+use crate::device_http::{self, HttpError, Limits, Version};
+use anyhow::{anyhow, Result};
 use log::debug;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use std::io::Write;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 /// Same as the UPnP examples in swyh-rs: percent-encode only what HTTP
@@ -51,12 +50,8 @@ pub fn set_av_transport_uri(
         uri = xml_escape(stream_uri),
         meta = xml_escape(didl_metadata),
     );
-    soap_post(
-        control_url,
-        "urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI",
-        &body,
-    )
-    .map(|_| ())
+    soap_post(control_url, AV_TRANSPORT, "SetAVTransportURI", &body, &TRANSPORT)?;
+    Ok(())
 }
 
 pub fn play(control_url: &str) -> Result<()> {
@@ -69,12 +64,8 @@ pub fn play(control_url: &str) -> Result<()> {
 </u:Play>
 </s:Body>
 </s:Envelope>"#;
-    soap_post(
-        control_url,
-        "urn:schemas-upnp-org:service:AVTransport:1#Play",
-        body,
-    )
-    .map(|_| ())
+    soap_post(control_url, AV_TRANSPORT, "Play", body, &TRANSPORT)?;
+    Ok(())
 }
 
 pub fn stop(control_url: &str) -> Result<()> {
@@ -86,12 +77,8 @@ pub fn stop(control_url: &str) -> Result<()> {
 </u:Stop>
 </s:Body>
 </s:Envelope>"#;
-    soap_post(
-        control_url,
-        "urn:schemas-upnp-org:service:AVTransport:1#Stop",
-        body,
-    )
-    .map(|_| ())
+    soap_post(control_url, AV_TRANSPORT, "Stop", body, &SHORT)?;
+    Ok(())
 }
 
 /// Set volume (0..=100) on the Master channel.
@@ -109,12 +96,8 @@ pub fn set_volume(control_url: &str, level: u32) -> Result<()> {
 </s:Body>
 </s:Envelope>"#
     );
-    soap_post(
-        control_url,
-        "urn:schemas-upnp-org:service:RenderingControl:1#SetVolume",
-        &body,
-    )
-    .map(|_| ())
+    soap_post(control_url, RENDERING_CONTROL, "SetVolume", &body, &SHORT)?;
+    Ok(())
 }
 
 pub fn set_mute(control_url: &str, muted: bool) -> Result<()> {
@@ -131,12 +114,8 @@ pub fn set_mute(control_url: &str, muted: bool) -> Result<()> {
 </s:Envelope>"#,
         m = if muted { 1 } else { 0 }
     );
-    soap_post(
-        control_url,
-        "urn:schemas-upnp-org:service:RenderingControl:1#SetMute",
-        &body,
-    )
-    .map(|_| ())
+    soap_post(control_url, RENDERING_CONTROL, "SetMute", &body, &SHORT)?;
+    Ok(())
 }
 
 pub fn get_volume(control_url: &str) -> Result<u32> {
@@ -149,11 +128,7 @@ pub fn get_volume(control_url: &str) -> Result<u32> {
 </u:GetVolume>
 </s:Body>
 </s:Envelope>"#;
-    let resp = soap_post(
-        control_url,
-        "urn:schemas-upnp-org:service:RenderingControl:1#GetVolume",
-        body,
-    )?;
+    let resp = soap_post(control_url, RENDERING_CONTROL, "GetVolume", body, &SHORT)?;
     // Parse out <CurrentVolume>NN</CurrentVolume>.
     extract_int_tag(&resp, "CurrentVolume")
         .ok_or_else(|| anyhow!("CurrentVolume missing in response"))
@@ -169,11 +144,7 @@ pub fn get_mute(control_url: &str) -> Result<bool> {
 </u:GetMute>
 </s:Body>
 </s:Envelope>"#;
-    let resp = soap_post(
-        control_url,
-        "urn:schemas-upnp-org:service:RenderingControl:1#GetMute",
-        body,
-    )?;
+    let resp = soap_post(control_url, RENDERING_CONTROL, "GetMute", body, &SHORT)?;
     let n = extract_int_tag(&resp, "CurrentMute")
         .ok_or_else(|| anyhow!("CurrentMute missing"))?;
     Ok(n != 0)
@@ -197,12 +168,8 @@ pub fn set_group_volume(control_url: &str, level: u32) -> Result<()> {
 </s:Body>
 </s:Envelope>"#
     );
-    soap_post(
-        control_url,
-        "urn:schemas-upnp-org:service:GroupRenderingControl:1#SetGroupVolume",
-        &body,
-    )
-    .map(|_| ())
+    soap_post(control_url, GROUP_RENDERING_CONTROL, "SetGroupVolume", &body, &SHORT)?;
+    Ok(())
 }
 
 pub fn get_group_volume(control_url: &str) -> Result<u32> {
@@ -214,11 +181,7 @@ pub fn get_group_volume(control_url: &str) -> Result<u32> {
 </u:GetGroupVolume>
 </s:Body>
 </s:Envelope>"#;
-    let resp = soap_post(
-        control_url,
-        "urn:schemas-upnp-org:service:GroupRenderingControl:1#GetGroupVolume",
-        body,
-    )?;
+    let resp = soap_post(control_url, GROUP_RENDERING_CONTROL, "GetGroupVolume", body, &SHORT)?;
     extract_int_tag(&resp, "CurrentVolume")
         .ok_or_else(|| anyhow!("CurrentVolume missing in GetGroupVolume response"))
 }
@@ -236,12 +199,8 @@ pub fn set_group_mute(control_url: &str, muted: bool) -> Result<()> {
 </s:Envelope>"#,
         m = if muted { 1 } else { 0 }
     );
-    soap_post(
-        control_url,
-        "urn:schemas-upnp-org:service:GroupRenderingControl:1#SetGroupMute",
-        &body,
-    )
-    .map(|_| ())
+    soap_post(control_url, GROUP_RENDERING_CONTROL, "SetGroupMute", &body, &SHORT)?;
+    Ok(())
 }
 
 /// Fetch the entity-decoded ZoneGroupState XML from a Sonos device's
@@ -254,14 +213,7 @@ pub fn get_zone_group_state(control_url: &str) -> Result<String> {
 </u:GetZoneGroupState>
 </s:Body>
 </s:Envelope>"#;
-    // Topology is supplied by an unauthenticated LAN peer.  Keep the wire
-    // response bounded before parsing or entity-decoding it.
-    let resp = soap_post_with_limit(
-        control_url,
-        "urn:schemas-upnp-org:service:ZoneGroupTopology:1#GetZoneGroupState",
-        body,
-        1024 * 1024,
-    )?;
+    let resp = soap_post(control_url, ZONE_GROUP_TOPOLOGY, "GetZoneGroupState", body, &TOPOLOGY)?;
     zone_group_state_from_response(&resp)
 }
 
@@ -314,86 +266,100 @@ pub fn encode_stream_uri(stream_uri: &str) -> String {
 // Low-level SOAP POST + helpers
 // -----------------------------------------------------------------------------
 
-/// Largest SOAP response accepted. The biggest real reply is a Sonos
-/// GetZoneGroupState for a large household (escaped XML, well under 1 MiB).
+const AV_TRANSPORT: &str = "urn:schemas-upnp-org:service:AVTransport:1";
+const RENDERING_CONTROL: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
+const GROUP_RENDERING_CONTROL: &str = "urn:schemas-upnp-org:service:GroupRenderingControl:1";
+const ZONE_GROUP_TOPOLOGY: &str = "urn:schemas-upnp-org:service:ZoneGroupTopology:1";
+
+/// Largest SOAP answer accepted for most actions.
 const MAX_SOAP_RESPONSE_BYTES: usize = 4 << 20;
 
-fn soap_post(control_url: &str, soap_action: &str, body: &str) -> Result<String> {
-    soap_post_with_limit(control_url, soap_action, body, MAX_SOAP_RESPONSE_BYTES)
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Volume and mute, which someone is waiting on, and the Stop sent before
+/// connecting or when moving to another speaker, which is best-effort.
+const SHORT: Limits = Limits {
+    connect: CONNECT_TIMEOUT,
+    deadline: Duration::from_secs(5),
+    max_bytes: MAX_SOAP_RESPONSE_BYTES,
+};
+
+/// SetAVTransportURI and Play. A renderer may fetch the stream before it
+/// answers them, and UPnP gives a device 30 s to complete an action.
+const TRANSPORT: Limits = Limits {
+    connect: CONNECT_TIMEOUT,
+    deadline: Duration::from_secs(30),
+    max_bytes: MAX_SOAP_RESPONSE_BYTES,
+};
+
+/// GetZoneGroupState: a large household's topology (escaped XML, well
+/// under 1 MiB), supplied by an unauthenticated LAN peer, so bounded
+/// before it is parsed or decoded.
+const TOPOLOGY: Limits = Limits {
+    connect: CONNECT_TIMEOUT,
+    deadline: Duration::from_secs(15),
+    max_bytes: 1 << 20,
+};
+
+/// Why a UPnP action did not succeed.
+#[derive(Debug)]
+pub(crate) struct ActionError {
+    /// The action's name, `SetAVTransportURI`.
+    pub action: &'static str,
+    pub failure: Failure,
 }
 
-fn soap_post_with_limit(
-    control_url: &str,
-    soap_action: &str,
-    body: &str,
-    response_limit: usize,
-) -> Result<String> {
-    let url = url::Url::parse(control_url).context("parsing control URL")?;
-    let host = url.host_str().ok_or_else(|| anyhow!("missing host"))?;
-    let port = url.port().unwrap_or(80);
-    let path = if url.path().is_empty() { "/" } else { url.path() };
-    let path_q = if let Some(q) = url.query() {
-        format!("{}?{}", path, q)
-    } else {
-        path.to_string()
-    };
+#[derive(Debug)]
+pub(crate) enum Failure {
+    /// No answer to look at: the device couldn't be reached, didn't answer
+    /// in time, or what came back couldn't be read.
+    NoAnswer(HttpError),
+    /// The device answered and refused, with this status (`HTTP 500
+    /// Internal Server Error`).
+    Refused { status: String },
+}
 
-    let addr: SocketAddr = (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow!("no addrs for {}:{}", host, port))?;
-
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    let body_bytes = body.as_bytes();
-    let request = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: {host}:{port}\r\n\
-         Content-Type: text/xml; charset=\"utf-8\"\r\n\
-         Content-Length: {clen}\r\n\
-         SOAPAction: \"{action}\"\r\n\
-         Connection: close\r\n\
-         User-Agent: stream-to-speaker/0.1\r\n\
-         \r\n",
-        path = path_q,
-        host = host,
-        port = port,
-        clen = body_bytes.len(),
-        action = soap_action,
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(body_bytes)?;
-    stream.flush()?;
-
-    let buf = crate::ssdp::read_to_end_bounded(
-        &mut stream,
-        response_limit,
-        std::time::Instant::now() + crate::ssdp::RESPONSE_DEADLINE,
-    )
-    .with_context(|| format!("reading SOAP {} response", soap_action))?;
-
-    // Split head/body on bytes, then peel chunked transfer-encoding if
-    // present. Sonos chunks HTTP/1.1 responses (same behavior ssdp.rs's
-    // http_get dodges by speaking HTTP/1.0); small SOAP replies fit one
-    // chunk and parsed fine by accident, but GetZoneGroupState bodies
-    // run tens of KB and interior chunk-size lines would corrupt the
-    // escaped XML. decode_maybe_chunked is a no-op for plain bodies.
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-        .unwrap_or(buf.len());
-    let head = String::from_utf8_lossy(&buf[..split]);
-    let body_part = crate::ssdp::decode_maybe_chunked(&buf[split..]);
-
-    let status_line = head.lines().next().unwrap_or("");
-    debug!("SOAP {} -> {}", soap_action, status_line);
-    if !status_line.contains(" 200 ") {
-        return Err(anyhow!("SOAP {} failed: {}", soap_action, status_line));
+impl std::fmt::Display for ActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.failure {
+            Failure::NoAnswer(e) => write!(f, "{}: {}", self.action, e),
+            Failure::Refused { status } => write!(f, "{} refused: {}", self.action, status),
+        }
     }
-    Ok(String::from_utf8_lossy(&body_part).into_owned())
+}
+
+impl std::error::Error for ActionError {}
+
+fn soap_post(
+    control_url: &str,
+    service: &str,
+    action: &'static str,
+    body: &str,
+    limits: &Limits,
+) -> Result<String, ActionError> {
+    let soap_action = format!("\"{service}#{action}\"");
+    let content_length = body.len().to_string();
+    let headers = [
+        ("Content-Type", "text/xml; charset=\"utf-8\""),
+        ("Content-Length", content_length.as_str()),
+        ("SOAPAction", soap_action.as_str()),
+        ("Connection", "close"),
+        ("User-Agent", device_http::USER_AGENT),
+    ];
+    let request = device_http::Request {
+        method: "POST",
+        url: control_url,
+        version: Version::Http11,
+        headers: &headers,
+        body: body.as_bytes(),
+    };
+    let fail = |failure| ActionError { action, failure };
+    let resp = device_http::exchange(&request, limits).map_err(|e| fail(Failure::NoAnswer(e)))?;
+    debug!("SOAP {}#{} -> {}", service, action, resp.status_text());
+    if resp.status != 200 {
+        return Err(fail(Failure::Refused { status: resp.status_text() }));
+    }
+    Ok(String::from_utf8_lossy(&resp.body).into_owned())
 }
 
 /// Minimal XML attribute / text escape.
@@ -460,5 +426,108 @@ mod tests {
     #[test]
     fn zone_group_state_missing_is_an_error() {
         assert!(zone_group_state_from_response("<s:Envelope/>").is_err());
+    }
+
+    // ---- the SOAP client against a renderer -----------------------------
+
+    use crate::fake_renderer::{FakeRenderer, Reply};
+    use std::time::Instant;
+
+    const RC: &str = RENDERING_CONTROL;
+
+    fn volume_body(level: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>\
+             <u:GetVolumeResponse xmlns:u=\"{RC}\"><CurrentVolume>{level}</CurrentVolume></u:GetVolumeResponse>\
+             </s:Body></s:Envelope>"
+        )
+    }
+
+    #[test]
+    fn an_answer_on_a_connection_left_open_is_complete_at_its_length() {
+        // The device ignores `Connection: close`; its answer is whole.
+        let fake = FakeRenderer::start(|_| Reply::soap_ok(AV_TRANSPORT, "Stop", &[]).then_hold_open());
+        let start = Instant::now();
+        stop(&fake.url("/AVTransport/Control")).expect("a complete answer is success");
+        assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn set_av_transport_uri_waits_for_a_slow_renderer() {
+        // UPnP gives a device 30 s to answer an action; this one takes 6.
+        let fake = FakeRenderer::start(|_| {
+            Reply::soap_ok(AV_TRANSPORT, "SetAVTransportURI", &[]).after(Duration::from_secs(6))
+        });
+        set_av_transport_uri(&fake.url("/AVTransport/Control"), "http://127.0.0.1:1/stream.raw", "")
+            .expect("a slow answer is still an answer");
+    }
+
+    #[test]
+    fn a_status_line_without_a_reason_phrase_is_success() {
+        let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n"));
+        stop(&fake.url("/AVTransport/Control")).expect("200 without a reason phrase");
+    }
+
+    #[test]
+    fn a_chunked_answer_is_read_by_its_chunks() {
+        // Sonos chunks HTTP/1.1 answers; this one also comes in pieces and
+        // leaves the connection open.
+        let body = volume_body("37");
+        let (a, b) = (body[..40].to_string(), body[40..].to_string());
+        let fake = FakeRenderer::start(move |_| {
+            Reply::raw(format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/xml\r\n\r\n{:x}\r\n{a}\r\n",
+                a.len()
+            ))
+            .then(Duration::from_millis(100), format!("{:x};ext=1\r\n{b}\r\n0\r\nX-Trailer: 1\r\n\r\n", b.len()))
+            .then_hold_open()
+        });
+        assert_eq!(get_volume(&fake.url("/RenderingControl/Control")).unwrap(), 37);
+    }
+
+    #[test]
+    fn a_body_that_looks_like_a_chunk_is_not_taken_for_one() {
+        // Chunked or not is the header's to say, not the body's.
+        let body = format!("abc\r\n{}", volume_body("37"));
+        let fake = FakeRenderer::start(move |_| Reply::ok(&body));
+        assert_eq!(get_volume(&fake.url("/RenderingControl/Control")).unwrap(), 37);
+    }
+
+    #[test]
+    fn header_lines_ending_in_a_bare_line_feed_are_read() {
+        let body = volume_body("37");
+        let fake = FakeRenderer::start(move |_| {
+            Reply::raw(format!("HTTP/1.1 200 OK\nContent-Type: text/xml\nContent-Length: {}\n\n{body}", body.len()))
+        });
+        assert_eq!(get_volume(&fake.url("/RenderingControl/Control")).unwrap(), 37);
+    }
+
+    #[test]
+    fn an_oversized_topology_answer_is_refused() {
+        let big = format!("<ZoneGroupState>{}</ZoneGroupState>", "x".repeat(1100 * 1024));
+        let fake = FakeRenderer::start(move |_| Reply::ok(&big));
+        assert!(get_zone_group_state(&fake.url("/ZoneGroupTopology/Control")).is_err());
+    }
+
+    #[test]
+    fn soap_requests_keep_their_shape() {
+        // What renderers that work today receive.
+        let fake = FakeRenderer::start(|_| Reply::soap_ok(AV_TRANSPORT, "Play", &[]));
+        play(&fake.url("/MediaRenderer/AVTransport/Control")).unwrap();
+        let req = fake.next_request(Duration::from_secs(5)).unwrap();
+        let port = fake.addr().port();
+        let body = req.body_text();
+        let head = String::from_utf8_lossy(&req.raw[..req.raw.len() - req.body.len()]).into_owned();
+        assert_eq!(
+            head,
+            format!(
+                "POST /MediaRenderer/AVTransport/Control HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                 Content-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\n\
+                 SOAPAction: \"urn:schemas-upnp-org:service:AVTransport:1#Play\"\r\nConnection: close\r\n\
+                 User-Agent: stream-to-speaker/0.1\r\n\r\n",
+                body.len()
+            )
+        );
+        assert_eq!(req.soap_arg("Speed").as_deref(), Some("1"));
     }
 }

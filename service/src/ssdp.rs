@@ -10,8 +10,8 @@ use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
 use crate::discovery_net::{shown, LanTargets, Reach, Reported, ADD_BY_ADDRESS};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
+use crate::device_http::{self, Limits, Version};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -882,191 +882,35 @@ fn service_url(base: &str, raw: &str, urls: ServiceUrls<'_>) -> Option<String> {
 /// KB; anything near this is not one (a stream URL, say).
 const MAX_HTTP_GET_BYTES: usize = 256 * 1024;
 
-/// Tiny blocking HTTP GET. We don't have hyper/reqwest; this is fine for
-/// the few KB of XML SSDP responders return.
+/// Fetch a device description: `timeout` to connect, twice that for the
+/// whole answer, which must be `200`.
 pub fn http_get(url_str: &str, timeout: Duration) -> Result<String> {
-    let url = url::Url::parse(url_str)?;
-    if url.scheme() != "http" {
-        // Sonos device descriptions are HTTP, not HTTPS.
-        return Err(anyhow!("only http:// supported, got {}", url.scheme()));
+    // HTTP/1.0, as devices have always been asked here.
+    let request = device_http::Request {
+        method: "GET",
+        url: url_str,
+        version: Version::Http10,
+        headers: &[
+            ("User-Agent", device_http::USER_AGENT),
+            ("Connection", "close"),
+            ("Accept", "text/xml, application/xml, */*"),
+        ],
+        body: b"",
+    };
+    let limits = Limits { connect: timeout, deadline: timeout * 2, max_bytes: MAX_HTTP_GET_BYTES };
+    let resp = device_http::exchange(&request, &limits)?;
+    if resp.status != 200 {
+        return Err(anyhow!("the device answered {}", resp.status_text()));
     }
-    let host = url.host_str().ok_or_else(|| anyhow!("no host"))?;
-    let port = url.port().unwrap_or(80);
-    let mut path = if url.path().is_empty() { "/".to_string() } else { url.path().to_string() };
-    if let Some(q) = url.query() {
-        path.push('?');
-        path.push_str(q);
-    }
-    // Whole-request deadline: per-read timeouts alone let a server that
-    // trickles bytes hold us indefinitely.
-    let deadline = Instant::now() + timeout * 2;
-
-    let mut stream = TcpStream::connect_timeout(
-        &(host, port).to_socket_addrs_first()?,
-        timeout,
-    )?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
-    // HTTP/1.0 explicitly — avoids the chunked Transfer-Encoding Sonos
-    // uses for HTTP/1.1 responses, which our minimal client doesn't
-    // parse. With HTTP/1.0 + Connection: close the server sends a
-    // plain Content-Length body and closes the socket.
-    let req = format!(
-        "GET {} HTTP/1.0\r\nHost: {}:{}\r\nUser-Agent: stream-to-speaker/0.1\r\nConnection: close\r\nAccept: text/xml, application/xml, */*\r\n\r\n",
-        path, host, port
-    );
-    stream.write_all(req.as_bytes())?;
-
-    let mut buf = Vec::with_capacity(16384);
-    let mut chunk = [0u8; 8192];
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(anyhow!("GET {} took too long", url_str));
-        }
-        stream.set_read_timeout(Some(left.min(timeout)))?;
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() + n > MAX_HTTP_GET_BYTES {
-            return Err(anyhow!(
-                "GET {}: response larger than {} KB",
-                url_str,
-                MAX_HTTP_GET_BYTES / 1024
-            ));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-
-    // Find headers/body split. Robust to header lines being CRLF or LF only.
-    let split_pos = find_header_body_split(&buf)
-        .ok_or_else(|| anyhow!("response missing header/body separator ({} bytes)", buf.len()))?;
-    let body_bytes = &buf[split_pos..];
-
-    // Strip a UTF-8 BOM if Sonos sends one (it usually doesn't, but be
-    // tolerant — roxmltree rejects BOMs).
-    let body_bytes = body_bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body_bytes);
-
-    // If chunked encoding was used despite our HTTP/1.0 request (some
-    // proxies upgrade), peel the chunks. Otherwise this is a no-op.
-    let body = decode_maybe_chunked(body_bytes);
+    // Strip a UTF-8 BOM if the device sends one; roxmltree rejects BOMs.
+    let body = resp.body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&resp.body);
 
     debug!("http_get {} → {} body bytes", url_str, body.len());
     if body.len() < 200 {
-        debug!("  body: {:?}", String::from_utf8_lossy(&body));
+        debug!("  body: {:?}", String::from_utf8_lossy(body));
     }
 
-    Ok(String::from_utf8_lossy(&body).into_owned())
-}
-
-/// Overall time allowed for reading one HTTP response from a LAN device,
-/// however slowly it trickles in. Each read is also bounded by the
-/// socket's read timeout.
-pub(crate) const RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
-
-/// Read until EOF, failing once more than `limit` bytes have arrived or
-/// `deadline` has passed.
-pub(crate) fn read_to_end_bounded<R: Read>(r: &mut R, limit: usize, deadline: Instant) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(limit.min(16384));
-    let mut tmp = [0u8; 8192];
-    loop {
-        if Instant::now() >= deadline {
-            return Err(anyhow!("response not complete within {:?}", RESPONSE_DEADLINE));
-        }
-        let n = match r.read(&mut tmp) {
-            Ok(0) => return Ok(buf),
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
-        };
-        if buf.len() + n > limit {
-            return Err(anyhow!("response exceeds {} bytes", limit));
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-}
-
-/// Find the byte offset where the HTTP body starts (after headers' blank line).
-/// Returns None if no separator is found.
-fn find_header_body_split(buf: &[u8]) -> Option<usize> {
-    // Try \r\n\r\n first (RFC), then \n\n (some servers).
-    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-        return Some(pos + 4);
-    }
-    if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-        return Some(pos + 2);
-    }
-    None
-}
-
-/// If the body starts with a hex chunk-size line (Transfer-Encoding:
-/// chunked), decode the chunks. Otherwise returns the body unchanged.
-/// Shared with upnp.rs's SOAP client — Sonos chunks its HTTP/1.1
-/// responses, and a large GetZoneGroupState body straddles multiple
-/// chunks whose size lines would otherwise corrupt the XML mid-payload.
-pub(crate) fn decode_maybe_chunked(body: &[u8]) -> Vec<u8> {
-    // Heuristic: a hex chunk-size line is short, ends with \r\n, and is
-    // followed by binary data. If the first \r\n we see is preceded by
-    // pure hex digits, treat as chunked.
-    let first_crlf = match body.windows(2).position(|w| w == b"\r\n") {
-        Some(p) => p,
-        None => return body.to_vec(),
-    };
-    if first_crlf == 0 || first_crlf > 8 {
-        return body.to_vec();
-    }
-    let possibly_hex = &body[..first_crlf];
-    if !possibly_hex.iter().all(|&b| b.is_ascii_hexdigit() || b == b';') {
-        return body.to_vec();
-    }
-
-    // It's chunked. Decode.
-    let mut out = Vec::with_capacity(body.len());
-    let mut p = 0;
-    while p < body.len() {
-        let crlf = match body[p..].windows(2).position(|w| w == b"\r\n") {
-            Some(i) => p + i,
-            None => break,
-        };
-        let size_str = std::str::from_utf8(&body[p..crlf]).unwrap_or("0");
-        let size_str = size_str.split(';').next().unwrap_or("0");
-        let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
-        p = crlf + 2;
-        if size == 0 {
-            break;
-        }
-        let Some(chunk_end) = p.checked_add(size) else {
-            break;
-        };
-        if chunk_end > body.len() {
-            break;
-        }
-        out.extend_from_slice(&body[p..chunk_end]);
-        let Some(next_chunk) = chunk_end.checked_add(2) else {
-            break;
-        };
-        if body.get(chunk_end..next_chunk) != Some(b"\r\n") {
-            break;
-        }
-        p = next_chunk; // skip chunk + trailing \r\n
-    }
-    out
-}
-
-trait ToSocketAddrFirst {
-    fn to_socket_addrs_first(&self) -> std::io::Result<SocketAddr>;
-}
-
-impl ToSocketAddrFirst for (&str, u16) {
-    fn to_socket_addrs_first(&self) -> std::io::Result<SocketAddr> {
-        use std::net::ToSocketAddrs;
-        let mut addrs = (self.0, self.1).to_socket_addrs()?;
-        addrs
-            .next()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no addrs"))
-    }
+    Ok(String::from_utf8_lossy(body).into_owned())
 }
 
 #[cfg(test)]
@@ -1456,35 +1300,50 @@ mod tests {
         assert!(parse_device_description(&xml, base, ip, ServiceUrls::OnItsHost(None)).is_err());
     }
 
-    #[test]
-    fn read_to_end_bounded_enforces_limit_and_deadline() {
-        use std::io::Cursor;
-        let far = Instant::now() + Duration::from_secs(60);
-        let data = vec![7u8; 20_000];
-        assert_eq!(read_to_end_bounded(&mut Cursor::new(data.clone()), 20_000, far).unwrap(), data);
-        assert!(read_to_end_bounded(&mut Cursor::new(data), 19_999, far).is_err());
-        let past = Instant::now() - Duration::from_millis(1);
-        assert!(read_to_end_bounded(&mut Cursor::new(vec![1u8; 10]), 100, past).is_err());
+    // ---- fetching a description from a device ---------------------------
+
+    use crate::fake_renderer::{FakeRenderer, Reply};
+
+    fn served_description() -> String {
+        description(
+            "/ZoneGroupTopology/Control",
+            "/MediaRenderer/AVTransport/Control",
+            "/MediaRenderer/AVTransport/Event",
+            "/MediaRenderer/RenderingControl/Event",
+        )
     }
 
     #[test]
-    fn dechunks_multi_chunk_body() {
-        // Two chunks whose boundary lands mid-payload — the case a big
-        // GetZoneGroupState response hits: interior chunk-size lines
-        // must not leak into the reassembled XML.
-        let body = b"c\r\n<ZoneGroupSt\r\n4\r\nate>\r\n0\r\n\r\n";
-        assert_eq!(decode_maybe_chunked(body), b"<ZoneGroupState>");
+    fn a_description_is_complete_at_its_length_on_a_connection_left_open() {
+        let xml = served_description();
+        let fake = FakeRenderer::start(move |_| Reply::ok(&xml).then_hold_open());
+        let start = Instant::now();
+        let r = fetch_and_parse_device(&fake.url("/xml/device_description.xml"), Duration::from_secs(3), ServiceUrls::OnItsHost(None))
+            .expect("the whole description arrived");
+        assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+        assert_eq!(r.friendly_name, "Living Room");
+        assert_eq!(r.av_transport_control_url, fake.url("/MediaRenderer/AVTransport/Control"));
+        // Still asked for as HTTP/1.0, as devices have always been asked.
+        let req = fake.next_request(Duration::from_secs(5)).unwrap();
+        let port = fake.addr().port();
+        assert_eq!(
+            String::from_utf8_lossy(&req.raw),
+            format!(
+                "GET /xml/device_description.xml HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: stream-to-speaker/0.1\r\n\
+                 Connection: close\r\nAccept: text/xml, application/xml, */*\r\n\r\n"
+            )
+        );
     }
 
     #[test]
-    fn plain_body_passes_through() {
-        let body = b"<?xml version=\"1.0\"?><Envelope/>";
-        assert_eq!(decode_maybe_chunked(body), body);
-    }
-
-    #[test]
-    fn oversized_later_chunk_does_not_panic() {
-        let body = b"1\r\nX\r\nffffffffffffffff\r\n";
-        assert_eq!(decode_maybe_chunked(body), b"X");
+    fn a_description_answered_with_an_error_status_says_so() {
+        let fake = FakeRenderer::start(|_| {
+            Reply::status(404, "Not Found", &[("Content-Type", "text/html")], "<html><body>no such page</body></html>")
+        });
+        let e = fetch_and_parse_device(&fake.url("/desc.xml"), Duration::from_secs(3), ServiceUrls::OnItsHost(None))
+            .expect_err("a 404 page is no description");
+        let e = format!("{e:#}");
+        assert!(e.contains("404"), "{e}");
+        assert!(!e.contains("parsing device XML"), "{e}");
     }
 }

@@ -17,6 +17,7 @@ pub mod sonos;
 pub mod ssdp;
 pub mod upnp;
 pub mod gena;
+mod device_http;
 #[cfg(test)]
 mod fake_renderer;
 pub mod volume_sync;
