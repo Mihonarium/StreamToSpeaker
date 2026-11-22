@@ -13,6 +13,9 @@
 //! One master serves every receiver of a session — a HomePod stereo pair's
 //! members all follow the same grandmaster, so they share one timeline.
 //! In HomePod sessions packets from hosts that aren't members are ignored.
+//! The ports belong to one service per local address that every session
+//! joins with its own clock, so two sessions can overlap (a switch from
+//! one speaker to another) and both are served from 319/320.
 //!
 //! Per registered peer we send unicast:
 //!   * **Announce** → port 320, ~1 s cadence
@@ -45,7 +48,7 @@ use log::{debug, info, warn};
 use rand::Rng;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -109,7 +112,12 @@ impl PtpMasterClock {
 
     /// Nanoseconds on our PTP timeline (monotonic since session start).
     pub fn now_ns(&self) -> u64 {
-        self.start.elapsed().as_nanos() as u64
+        self.ns_at(Instant::now())
+    }
+
+    /// `at` on our PTP timeline, in nanoseconds.
+    fn ns_at(&self, at: Instant) -> u64 {
+        at.saturating_duration_since(self.start).as_nanos() as u64
     }
 }
 
@@ -182,49 +190,82 @@ impl PtpTimeline {
     }
 }
 
-/// Handle to a running PTP master.
+/// One session's place in the PTP service: its own clock, served to its
+/// own receivers. Dropping it (or [`PtpMaster::stop`]) leaves the service;
+/// the last session on an address to leave releases the ports.
 pub struct PtpMaster {
     pub timeline: PtpTimeline,
     /// UUID string for the RTSP `timingPeerInfo.ID` field.
     pub clock_uuid: String,
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    shared: Arc<Shared>,
+    id: u64,
 }
 
 impl PtpMaster {
-    pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+    /// Why this PC's PTP ports could not be opened (another program holds
+    /// them, for one), if they couldn't: the session then runs PTP from
+    /// temporary ports, which receivers don't answer.
+    pub fn ports_problem(&self) -> Option<&str> {
+        self.shared.ports_problem.as_deref()
+    }
+
+    /// Leave the service. When this was the last session on its address,
+    /// the service stops and the ports are closed before this returns.
+    pub fn stop(self) {
+        drop(self);
     }
 }
 
 impl Drop for PtpMaster {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        leave(&self.shared, self.id);
     }
 }
 
-/// Start the PTP master serving `members` (every receiver of the session —
-/// one, or each member of a stereo pair). Binds the event (319) and
-/// general (320) ports once — one session at a time owns them — and starts
-/// the announce/sync transmit loop immediately so the clock is live before
-/// the RTSP SETUP that advertises it. `members_only`: ignore PTP traffic
-/// from any other host (otherwise every source is answered, as before).
+/// Start serving PTP for one session's `members` (one receiver, or each
+/// member of a stereo pair) with a new clock of its own. The event (319)
+/// and general (320) ports belong to one service per local address, which
+/// every AirPlay 2 session on that address joins, so a session started
+/// while another still runs (a switch between speakers) gets them too.
+/// The new clock's first Announce, Signaling and Sync are sent before this
+/// returns, so the clock is live before the RTSP SETUP that advertises it.
+/// `members_only`: ignore PTP traffic from any other host (otherwise every
+/// source is answered, as before).
 pub fn spawn_ptp_master(
     members: &[IpAddr],
     local_ip: IpAddr,
     receiver_name: String,
     members_only: bool,
 ) -> Result<PtpMaster> {
-    anyhow::ensure!(!members.is_empty(), "PTP master needs at least one receiver");
-    let members = members.to_vec();
-    let event = bind_ptp(local_ip, PTP_EVENT_PORT).context("bind PTP event :319")?;
-    let general = bind_ptp(local_ip, PTP_GENERAL_PORT).context("bind PTP general :320")?;
-    event.set_read_timeout(Some(Duration::from_millis(25)))?;
-    general.set_nonblocking(true)?;
+    spawn_ptp_master_on(members, local_ip, PTP_PORTS, receiver_name, members_only)
+}
 
+/// The UDP ports PTP runs on: ours and the receivers'. Always
+/// [`PTP_PORTS`] in the app; tests use others, because binding ports
+/// below 1024 needs privileges on Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PtpPorts {
+    pub local_event: u16,
+    pub local_general: u16,
+    pub peer_event: u16,
+    pub peer_general: u16,
+}
+
+pub(crate) const PTP_PORTS: PtpPorts = PtpPorts {
+    local_event: PTP_EVENT_PORT,
+    local_general: PTP_GENERAL_PORT,
+    peer_event: PTP_EVENT_PORT,
+    peer_general: PTP_GENERAL_PORT,
+};
+
+pub(crate) fn spawn_ptp_master_on(
+    members: &[IpAddr],
+    local_ip: IpAddr,
+    ports: PtpPorts,
+    receiver_name: String,
+    members_only: bool,
+) -> Result<PtpMaster> {
+    anyhow::ensure!(!members.is_empty(), "PTP master needs at least one receiver");
     let mut rng = rand::thread_rng();
     // Keep the top bit clear: this id crosses three encodings — raw BE
     // bytes in PTP headers, a plist Integer in the SETUP `ClockID`, and
@@ -233,148 +274,197 @@ pub fn spawn_ptp_master(
     // strict receiver would see two different timeline ids.
     let clock_id: u64 = rng.gen::<u64>() & 0x7FFF_FFFF_FFFF_FFFF;
     let clock_uuid = format_uuid(rng.gen());
-
     let timeline = PtpTimeline::new(PtpMasterClock::new(), clock_id);
-    let stop = Arc::new(AtomicBool::new(false));
+    let id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
 
-    let timeline_t = timeline.clone();
-    let stop_t = stop.clone();
-    let members_t = members.clone();
-    let handle = thread::Builder::new()
-        .name(format!("stream-to-speaker-ap2-ptp:{}", receiver_name))
-        .spawn(move || {
-            run_master(event, general, members_t, members_only, timeline_t, stop_t);
-        })?;
+    let mut services = lock(&SERVICES);
+    let index = match services.iter().position(|s| s.local_ip == local_ip && s.ports == ports) {
+        Some(i) => i,
+        None => {
+            services.push(Service::start(local_ip, ports)?);
+            services.len() - 1
+        }
+    };
+    let service = &services[index];
+    let shared = service.shared.clone();
+    {
+        let mut sessions = lock(&shared.sessions);
+        sessions.push(Registration::new(id, members.to_vec(), members_only, timeline.clone(), receiver_name));
+        transmit_due(&mut sessions, &service.event, &service.general, ports, Instant::now());
+    }
+    drop(services);
 
     info!(
         "AirPlay 2 PTP: serving as grandmaster for {:?} (clock_id={:#018x})",
         members, clock_id
     );
-    Ok(PtpMaster { timeline, clock_uuid, stop, handle: Some(handle) })
+    Ok(PtpMaster { timeline, clock_uuid, shared, id })
 }
 
-fn bind_ptp(local_ip: IpAddr, port: u16) -> Result<UdpSocket> {
-    match UdpSocket::bind(SocketAddr::new(local_ip, port)) {
-        Ok(s) => Ok(s),
-        Err(e) => {
-            warn!(
-                "PTP: bind {} failed ({}); using ephemeral port — receiver will likely not lock",
-                port, e
-            );
-            UdpSocket::bind(SocketAddr::new(local_ip, 0)).map_err(Into::into)
+/// The PTP ports of one local address and the thread that serves every
+/// session on it.
+struct Service {
+    local_ip: IpAddr,
+    ports: PtpPorts,
+    shared: Arc<Shared>,
+    /// Handles on the thread's sockets, for a joining session's first
+    /// messages.
+    event: UdpSocket,
+    general: UdpSocket,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// What a service's thread shares with its sessions.
+struct Shared {
+    sessions: Mutex<Vec<Registration>>,
+    stop: AtomicBool,
+    ports: PtpPorts,
+    ports_problem: Option<String>,
+}
+
+/// Every running service. Joining, leaving and stopping happen under this
+/// lock, so a session starting while the last one on its address stops
+/// finds the ports either still served or already closed.
+static SERVICES: Mutex<Vec<Service>> = Mutex::new(Vec::new());
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Service {
+    fn start(local_ip: IpAddr, ports: PtpPorts) -> Result<Self> {
+        let (event, event_problem) = bind_ptp(local_ip, ports.local_event).context("bind PTP event :319")?;
+        let (general, general_problem) = bind_ptp(local_ip, ports.local_general).context("bind PTP general :320")?;
+        event.set_read_timeout(Some(Duration::from_millis(25)))?;
+        general.set_nonblocking(true)?;
+        let shared = Arc::new(Shared {
+            sessions: Mutex::new(Vec::new()),
+            stop: AtomicBool::new(false),
+            ports,
+            ports_problem: event_problem.or(general_problem),
+        });
+        let (event_t, general_t, shared_t) = (event.try_clone()?, general.try_clone()?, shared.clone());
+        let thread = thread::Builder::new()
+            .name(format!("stream-to-speaker-ap2-ptp:{}", local_ip))
+            .spawn(move || run_service(event_t, general_t, shared_t))?;
+        Ok(Self { local_ip, ports, shared, event, general, thread: Some(thread) })
+    }
+}
+
+/// Remove session `id`; if it was the last one, stop its service and close
+/// the ports before returning.
+fn leave(shared: &Arc<Shared>, id: u64) {
+    let mut services = lock(&SERVICES);
+    let last = {
+        let mut sessions = lock(&shared.sessions);
+        if let Some(s) = sessions.iter().find(|s| s.id == id) {
+            debug!("AirPlay 2 PTP master for {} exiting ({} delay-resps served)", s.name, s.delay_resps);
+        }
+        sessions.retain(|s| s.id != id);
+        sessions.is_empty()
+    };
+    if !last {
+        return;
+    }
+    if let Some(i) = services.iter().position(|s| Arc::ptr_eq(&s.shared, shared)) {
+        let mut service = services.swap_remove(i);
+        service.shared.stop.store(true, Ordering::Release);
+        if let Some(t) = service.thread.take() {
+            let _ = t.join();
         }
     }
 }
 
-fn run_master(
-    event: UdpSocket,
-    general: UdpSocket,
+/// Bind one PTP port. When that fails, fall back to a temporary port (the
+/// session still starts, as before) and return why, for the log and the
+/// session's fault message.
+fn bind_ptp(local_ip: IpAddr, port: u16) -> Result<(UdpSocket, Option<String>)> {
+    match UdpSocket::bind(SocketAddr::new(local_ip, port)) {
+        Ok(s) => Ok((s, None)),
+        Err(e) => {
+            let problem = bind_problem(local_ip, port, &e);
+            warn!(
+                "AirPlay 2 PTP: {problem}. Using a temporary port instead, which AirPlay 2 speakers \
+                 don't answer, so they may not sync to this PC and stay silent."
+            );
+            Ok((UdpSocket::bind(SocketAddr::new(local_ip, 0))?, Some(problem)))
+        }
+    }
+}
+
+fn bind_problem(local_ip: IpAddr, port: u16, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::AddrInUse {
+        format!("another program on this PC is using UDP port {port} on {local_ip}")
+    } else {
+        format!("UDP port {port} on {local_ip} could not be opened ({e})")
+    }
+}
+
+/// One session in a service: its clock and receivers, and the state of its
+/// message exchange (what one master thread per session kept before).
+struct Registration {
+    id: u64,
+    name: String,
     members: Vec<IpAddr>,
     members_only: bool,
     timeline: PtpTimeline,
-    stop: Arc<AtomicBool>,
-) {
-    let clock_id = timeline.clock_id;
-    let clock = timeline.clock.clone();
-    let event_dsts: Vec<SocketAddr> = members.iter().map(|ip| SocketAddr::new(*ip, PTP_EVENT_PORT)).collect();
-    let general_dsts: Vec<SocketAddr> =
-        members.iter().map(|ip| SocketAddr::new(*ip, PTP_GENERAL_PORT)).collect();
-    // Following a receiver's own clock (the Sonos anchor nuance) only
-    // makes sense with a single receiver; several members follow us.
-    let follow_receiver_clock = members.len() == 1;
-    let is_member = |src: &SocketAddr| !members_only || members.contains(&src.ip());
-    let receiver_ip = members[0];
-    // The receiver's most recent Sync (seq, our receive time) awaiting its
-    // Follow_Up — pairing them yields the receiver-clock offset.
-    let mut pending_peer_sync: Option<(u16, u64)> = None;
-    let mut peer_lock_logged = false;
+    /// Following a receiver's own clock (the Sonos anchor nuance) only
+    /// makes sense with a single receiver; several members follow us.
+    follow_receiver_clock: bool,
+    announce_seq: u16,
+    sync_seq: u16,
+    signaling_seq: u16,
+    last_announce: Option<Instant>,
+    last_sync: Option<Instant>,
+    last_signaling: Option<Instant>,
+    /// The receiver's most recent Sync (seq, our receive time) awaiting its
+    /// Follow_Up — pairing them yields the receiver-clock offset.
+    pending_peer_sync: Option<(u16, u64)>,
+    peer_lock_logged: bool,
+    delay_resps: u64,
+    rx_total: u64,
+    seen_types: u16,
+    last_status: Instant,
+}
 
-    let mut announce_seq: u16 = 0;
-    let mut sync_seq: u16 = 0;
-    let mut signaling_seq: u16 = 0;
-    let mut last_announce: Option<Instant> = None;
-    let mut last_sync: Option<Instant> = None;
-    let mut last_signaling: Option<Instant> = None;
-    let mut delay_resps: u64 = 0;
-    let mut rx_total: u64 = 0;
-    let mut seen_types: u16 = 0;
-    let mut last_status = Instant::now();
+/// The session that owns receiver `ip`: the newest one serving it. A
+/// receiver hears one grandmaster at a time, also while a session that
+/// lists it is being replaced.
+fn owner(sessions: &[Registration], ip: IpAddr) -> Option<usize> {
+    sessions.iter().rposition(|s| s.members.contains(&ip))
+}
+
+/// The session a packet from `ip` is for: its owner, else the newest
+/// session that answers every host.
+fn recipient(sessions: &[Registration], ip: IpAddr) -> Option<usize> {
+    owner(sessions, ip).or_else(|| sessions.iter().rposition(|s| !s.members_only))
+}
+
+/// Send what is due, for every session, to the receivers it owns.
+fn transmit_due(sessions: &mut [Registration], event: &UdpSocket, general: &UdpSocket, ports: PtpPorts, now: Instant) {
+    for i in 0..sessions.len() {
+        let owned: Vec<IpAddr> =
+            sessions[i].members.iter().copied().filter(|ip| owner(sessions, *ip) == Some(i)).collect();
+        sessions[i].transmit_due(&owned, event, general, ports, now);
+    }
+}
+
+fn run_service(event: UdpSocket, general: UdpSocket, shared: Arc<Shared>) {
+    let ports = shared.ports;
     let mut buf = [0u8; 256];
-
-    while !stop.load(Ordering::Acquire) {
-        let now = Instant::now();
-
-        if last_announce.map_or(true, |t| now.duration_since(t) >= ANNOUNCE_INTERVAL) {
-            let pkt = build_announce(clock_id, announce_seq);
-            for dst in &general_dsts {
-                let _ = general.send_to(&pkt, dst);
-            }
-            announce_seq = announce_seq.wrapping_add(1);
-            last_announce = Some(now);
-        }
-
-        // Apple-proprietary signaling TLVs — libairptp sends these to every
-        // peer from the moment it's added (1 s cadence). Observed from iOS
-        // senders; receivers appear to expect them before engaging a master.
-        if last_signaling.map_or(true, |t| now.duration_since(t) >= SIGNALING_INTERVAL) {
-            let pkt = build_signaling(clock_id, signaling_seq);
-            for dst in &general_dsts {
-                let _ = general.send_to(&pkt, dst);
-            }
-            signaling_seq = signaling_seq.wrapping_add(1);
-            last_signaling = Some(now);
-        }
-
-        if last_sync.map_or(true, |t| now.duration_since(t) >= SYNC_INTERVAL) {
-            // Two-step: Sync carries a coarse origin, the Follow_Up sent
-            // right behind it carries the precise origin timestamp.
-            // Per member, each with its own precise timestamp.
-            for (edst, gdst) in event_dsts.iter().zip(&general_dsts) {
-                let coarse = clock.now_ns();
-                let sync = build_sync(clock_id, sync_seq, coarse);
-                let _ = event.send_to(&sync, edst);
-                let precise = clock.now_ns();
-                let fup = build_follow_up(clock_id, sync_seq, precise);
-                let _ = general.send_to(&fup, gdst);
-            }
-            sync_seq = sync_seq.wrapping_add(1);
-            last_sync = Some(now);
-        }
+    while !shared.stop.load(Ordering::Acquire) {
+        transmit_due(&mut lock(&shared.sessions), &event, &general, ports, Instant::now());
 
         // Event port: the receiver's Delay_Req arrives here. The 25 ms read
-        // timeout doubles as the loop tick. We log every inbound PTP packet
-        // so the log shows whether the receiver engages our clock at all.
+        // timeout doubles as the loop tick.
         match event.recv_from(&mut buf) {
-            Ok((_, src)) if !is_member(&src) => {
-                debug!("AP2 PTP: ignoring packet from non-member {}", src);
-            }
             Ok((n, src)) => {
-                let t_recv = clock.now_ns();
-                rx_total += 1;
-                if let Some(h) = parse_header(&buf[..n]) {
-                    note_inbound(&mut seen_types, h.msg_type, PTP_EVENT_PORT, src);
-                    match h.msg_type {
-                        0x1 => {
-                            let resp = build_delay_resp(
-                                clock_id,
-                                h.sequence_id,
-                                t_recv,
-                                &h.source_port_identity,
-                            );
-                            let _ = general.send_to(&resp, SocketAddr::new(src.ip(), PTP_GENERAL_PORT));
-                            delay_resps += 1;
-                            if delay_resps == 1 {
-                                info!("AirPlay 2 PTP: receiver {} is exchanging Delay_Req — clock lock in progress", src.ip());
-                            }
-                        }
-                        // The receiver's own Sync (it masters its clock at
-                        // us): remember (seq, our recv time) and pair it
-                        // with the Follow_Up's precise origin timestamp.
-                        0x0 if follow_receiver_clock => {
-                            pending_peer_sync = Some((h.sequence_id, t_recv));
-                        }
-                        _ => {}
-                    }
+                let received = Instant::now();
+                let mut sessions = lock(&shared.sessions);
+                match recipient(&sessions, src.ip()) {
+                    Some(i) => sessions[i].on_event(&buf[..n], src, received, &general, ports),
+                    None => debug!("AP2 PTP: ignoring packet from non-member {}", src),
                 }
             }
             Err(e)
@@ -385,80 +475,185 @@ fn run_master(
             }
         }
 
-        // General port: Announce / Follow_Up / Signaling / Delay_Resp from
-        // the receiver. Logged so we can see e.g. a Signaling handshake.
+        // General port: Announce / Follow_Up / Signaling / Delay_Resp.
         while let Ok((n, src)) = general.recv_from(&mut buf) {
-            if !is_member(&src) {
-                debug!("AP2 PTP: ignoring packet from non-member {}", src);
-                continue;
-            }
-            rx_total += 1;
-            if let Some(h) = parse_header(&buf[..n]) {
-                note_inbound(&mut seen_types, h.msg_type, PTP_GENERAL_PORT, src);
-                match h.msg_type {
-                    0xB if follow_receiver_clock => {
-                        if let Some((gm, class)) = parse_announce_grandmaster(&buf[..n]) {
-                            let prev = timeline.set_peer_clock_id(gm);
-                            if prev != gm {
-                                info!(
-                                    "AirPlay 2 PTP: receiver announces its own clock {:#018x} (clockClass {})",
-                                    gm, class
-                                );
-                            }
-                        }
-                    }
-                    // Follow_Up completing the receiver's two-step Sync:
-                    // its precise origin timestamp + our Sync receive time
-                    // give the receiver-clock offset we anchor with.
-                    0x8 if follow_receiver_clock => {
-                        if let Some((seq, t2)) = pending_peer_sync {
-                            if seq == h.sequence_id {
-                                if let Some(t1) = read_timestamp(&buf[..n], HEADER_LEN) {
-                                    let off = timeline.note_peer_sync(t1, t2);
-                                    if !peer_lock_logged {
-                                        peer_lock_logged = true;
-                                        info!(
-                                            "AirPlay 2 PTP: locked to the receiver's clock (offset {:.3} s) — can anchor on its timeline",
-                                            off as f64 / 1e9
-                                        );
-                                    }
-                                }
-                                pending_peer_sync = None;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+            let mut sessions = lock(&shared.sessions);
+            match recipient(&sessions, src.ip()) {
+                Some(i) => sessions[i].on_general(&buf[..n], src, ports),
+                None => debug!("AP2 PTP: ignoring packet from non-member {}", src),
             }
         }
 
-        // Heartbeat: if the receiver never talks back, the PTP clock can't
-        // lock and playback is silent — say so loudly, with the likely cause.
-        if last_status.elapsed() >= Duration::from_secs(5) {
-            if rx_total == 0 {
-                warn!(
-                    "AirPlay 2 PTP: receiver {} has sent us NOTHING on 319/320 after 5s — it isn't \
-                     engaging our clock. Likely inbound UDP 319/320 is firewall-blocked, or it \
-                     expects unicast-PTP signaling we don't send yet. No clock lock = silent audio.",
-                    if members.len() == 1 { receiver_ip.to_string() } else { format!("{:?}", members) }
-                );
-            } else {
-                // Delay_Resp count is only interesting when nonzero:
-                // receivers that master their own clock (Sonos) never send
-                // Delay_Req, so 0 is the normal state, not a failure.
-                if delay_resps > 0 {
-                    info!(
-                        "AirPlay 2 PTP status: {} packet(s) from receiver, {} Delay_Resp served",
-                        rx_total, delay_resps
-                    );
-                } else {
-                    info!("AirPlay 2 PTP status: {} packet(s) from receiver", rx_total);
-                }
-            }
-            last_status = Instant::now();
+        let now = Instant::now();
+        for s in lock(&shared.sessions).iter_mut() {
+            s.heartbeat(now);
         }
     }
-    debug!("AirPlay 2 PTP master exiting ({} delay-resps served)", delay_resps);
+}
+
+impl Registration {
+    fn new(id: u64, members: Vec<IpAddr>, members_only: bool, timeline: PtpTimeline, name: String) -> Self {
+        Self {
+            id,
+            name,
+            follow_receiver_clock: members.len() == 1,
+            members,
+            members_only,
+            timeline,
+            announce_seq: 0,
+            sync_seq: 0,
+            signaling_seq: 0,
+            last_announce: None,
+            last_sync: None,
+            last_signaling: None,
+            pending_peer_sync: None,
+            peer_lock_logged: false,
+            delay_resps: 0,
+            rx_total: 0,
+            seen_types: 0,
+            last_status: Instant::now(),
+        }
+    }
+
+    fn transmit_due(&mut self, owned: &[IpAddr], event: &UdpSocket, general: &UdpSocket, ports: PtpPorts, now: Instant) {
+        let clock_id = self.timeline.clock_id;
+        let clock = self.timeline.clock.clone();
+        if self.last_announce.map_or(true, |t| now.duration_since(t) >= ANNOUNCE_INTERVAL) {
+            let pkt = build_announce(clock_id, self.announce_seq);
+            for ip in owned {
+                let _ = general.send_to(&pkt, SocketAddr::new(*ip, ports.peer_general));
+            }
+            self.announce_seq = self.announce_seq.wrapping_add(1);
+            self.last_announce = Some(now);
+        }
+
+        // Apple-proprietary signaling TLVs — libairptp sends these to every
+        // peer from the moment it's added (1 s cadence). Observed from iOS
+        // senders; receivers appear to expect them before engaging a master.
+        if self.last_signaling.map_or(true, |t| now.duration_since(t) >= SIGNALING_INTERVAL) {
+            let pkt = build_signaling(clock_id, self.signaling_seq);
+            for ip in owned {
+                let _ = general.send_to(&pkt, SocketAddr::new(*ip, ports.peer_general));
+            }
+            self.signaling_seq = self.signaling_seq.wrapping_add(1);
+            self.last_signaling = Some(now);
+        }
+
+        if self.last_sync.map_or(true, |t| now.duration_since(t) >= SYNC_INTERVAL) {
+            // Two-step: Sync carries a coarse origin, the Follow_Up sent
+            // right behind it carries the precise origin timestamp.
+            // Per member, each with its own precise timestamp.
+            for ip in owned {
+                let coarse = clock.now_ns();
+                let sync = build_sync(clock_id, self.sync_seq, coarse);
+                let _ = event.send_to(&sync, SocketAddr::new(*ip, ports.peer_event));
+                let precise = clock.now_ns();
+                let fup = build_follow_up(clock_id, self.sync_seq, precise);
+                let _ = general.send_to(&fup, SocketAddr::new(*ip, ports.peer_general));
+            }
+            self.sync_seq = self.sync_seq.wrapping_add(1);
+            self.last_sync = Some(now);
+        }
+    }
+
+    /// A packet on the event port, received at `received`. Every inbound
+    /// packet is logged so the log shows whether the receiver engages our
+    /// clock at all.
+    fn on_event(&mut self, pkt: &[u8], src: SocketAddr, received: Instant, general: &UdpSocket, ports: PtpPorts) {
+        let t_recv = self.timeline.clock.ns_at(received);
+        self.rx_total += 1;
+        let Some(h) = parse_header(pkt) else { return };
+        note_inbound(&mut self.seen_types, h.msg_type, ports.local_event, src);
+        match h.msg_type {
+            0x1 => {
+                let resp = build_delay_resp(self.timeline.clock_id, h.sequence_id, t_recv, &h.source_port_identity);
+                let _ = general.send_to(&resp, SocketAddr::new(src.ip(), ports.peer_general));
+                self.delay_resps += 1;
+                if self.delay_resps == 1 {
+                    info!("AirPlay 2 PTP: receiver {} is exchanging Delay_Req — clock lock in progress", src.ip());
+                }
+            }
+            // The receiver's own Sync (it masters its clock at us):
+            // remember (seq, our recv time) and pair it with the
+            // Follow_Up's precise origin timestamp.
+            0x0 if self.follow_receiver_clock => {
+                self.pending_peer_sync = Some((h.sequence_id, t_recv));
+            }
+            _ => {}
+        }
+    }
+
+    /// A packet on the general port: Announce / Follow_Up / Signaling /
+    /// Delay_Resp from the receiver.
+    fn on_general(&mut self, pkt: &[u8], src: SocketAddr, ports: PtpPorts) {
+        self.rx_total += 1;
+        let Some(h) = parse_header(pkt) else { return };
+        note_inbound(&mut self.seen_types, h.msg_type, ports.local_general, src);
+        match h.msg_type {
+            0xB if self.follow_receiver_clock => {
+                if let Some((gm, class)) = parse_announce_grandmaster(pkt) {
+                    let prev = self.timeline.set_peer_clock_id(gm);
+                    if prev != gm {
+                        info!(
+                            "AirPlay 2 PTP: receiver announces its own clock {:#018x} (clockClass {})",
+                            gm, class
+                        );
+                    }
+                }
+            }
+            // Follow_Up completing the receiver's two-step Sync: its
+            // precise origin timestamp + our Sync receive time give the
+            // receiver-clock offset we anchor with.
+            0x8 if self.follow_receiver_clock => {
+                if let Some((seq, t2)) = self.pending_peer_sync {
+                    if seq == h.sequence_id {
+                        if let Some(t1) = read_timestamp(pkt, HEADER_LEN) {
+                            let off = self.timeline.note_peer_sync(t1, t2);
+                            if !self.peer_lock_logged {
+                                self.peer_lock_logged = true;
+                                info!(
+                                    "AirPlay 2 PTP: locked to the receiver's clock (offset {:.3} s) — can anchor on its timeline",
+                                    off as f64 / 1e9
+                                );
+                            }
+                        }
+                        self.pending_peer_sync = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every 5 s: if the receiver never talks back, the PTP clock can't
+    /// lock and playback is silent — say so loudly, with the likely cause.
+    fn heartbeat(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_status) < Duration::from_secs(5) {
+            return;
+        }
+        if self.rx_total == 0 {
+            warn!(
+                "AirPlay 2 PTP: receiver {} has sent us NOTHING on 319/320 after 5s — it isn't \
+                 engaging our clock. Likely inbound UDP 319/320 is firewall-blocked, or it \
+                 expects unicast-PTP signaling we don't send yet. No clock lock = silent audio.",
+                match self.members.as_slice() {
+                    [one] => one.to_string(),
+                    many => format!("{:?}", many),
+                }
+            );
+        } else if self.delay_resps > 0 {
+            // Delay_Resp count is only interesting when nonzero: receivers
+            // that master their own clock (Sonos) never send Delay_Req, so
+            // 0 is the normal state, not a failure.
+            info!(
+                "AirPlay 2 PTP status: {} packet(s) from receiver, {} Delay_Resp served",
+                self.rx_total, self.delay_resps
+            );
+        } else {
+            info!("AirPlay 2 PTP status: {} packet(s) from receiver", self.rx_total);
+        }
+        self.last_status = now;
+    }
 }
 
 /// Log inbound PTP traffic: the first packet of each message type at INFO
@@ -674,6 +869,198 @@ fn format_uuid(bytes: [u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LOCAL: &str = "127.0.0.1";
+
+    /// Free ports for one test: ours on [`LOCAL`], the receivers' found on
+    /// `peer_ip` (every receiver listens on the same pair, as with 319/320).
+    fn test_ports(peer_ip: &str) -> PtpPorts {
+        let (a, b) = (UdpSocket::bind((LOCAL, 0)).unwrap(), UdpSocket::bind((LOCAL, 0)).unwrap());
+        let (c, d) = (UdpSocket::bind((peer_ip, 0)).unwrap(), UdpSocket::bind((peer_ip, 0)).unwrap());
+        let port = |s: &UdpSocket| s.local_addr().unwrap().port();
+        PtpPorts { local_event: port(&a), local_general: port(&b), peer_event: port(&c), peer_general: port(&d) }
+    }
+
+    /// A receiver on a loopback address, listening on the peer ports.
+    struct FakeReceiver {
+        ip: IpAddr,
+        event: UdpSocket,
+        general: UdpSocket,
+    }
+
+    impl FakeReceiver {
+        fn bind(ip: &str, ports: PtpPorts) -> Self {
+            let event = UdpSocket::bind((ip, ports.peer_event)).unwrap();
+            let general = UdpSocket::bind((ip, ports.peer_general)).unwrap();
+            for s in [&event, &general] {
+                s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            }
+            Self { ip: ip.parse().unwrap(), event, general }
+        }
+
+        /// The next message of `msg_type` on `sock`, with where it came from.
+        fn next(sock: &UdpSocket, msg_type: u8) -> (Vec<u8>, SocketAddr) {
+            let mut buf = [0u8; 256];
+            loop {
+                let (n, from) = sock.recv_from(&mut buf).expect("a PTP message");
+                if parse_header(&buf[..n]).is_some_and(|h| h.msg_type == msg_type) {
+                    return (buf[..n].to_vec(), from);
+                }
+            }
+        }
+
+        /// Discard everything already queued.
+        fn drain(&self) {
+            let mut buf = [0u8; 256];
+            for s in [&self.event, &self.general] {
+                s.set_nonblocking(true).unwrap();
+                while s.recv_from(&mut buf).is_ok() {}
+                s.set_nonblocking(false).unwrap();
+            }
+        }
+
+        /// Send a Delay_Req and return the clock id of the Delay_Resp.
+        fn delay_resp_clock(&self, ports: PtpPorts, seq: u16) -> u64 {
+            self.event.send_to(&build_delay_req(0x77, seq), (LOCAL, ports.local_event)).unwrap();
+            loop {
+                let (resp, _) = Self::next(&self.general, MSG_DELAY_RESP);
+                let h = parse_header(&resp).unwrap();
+                if h.sequence_id == seq {
+                    return u64::from_be_bytes(h.source_port_identity[..8].try_into().unwrap());
+                }
+            }
+        }
+    }
+
+    /// Switching from one AirPlay 2 speaker to another starts the new
+    /// session while the old one still runs. Both share this PC's PTP
+    /// ports instead of the new one falling back to a temporary port its
+    /// receiver never talks to; each receiver is answered on its own
+    /// session's clock; the ports outlive the old session and are released
+    /// with the last one.
+    #[test]
+    fn a_second_session_on_the_same_address_shares_the_ptp_ports() {
+        let ports = test_ports("127.0.0.2");
+        let local: IpAddr = LOCAL.parse().unwrap();
+        let a_rx = FakeReceiver::bind("127.0.0.2", ports);
+        let b_rx = FakeReceiver::bind("127.0.0.3", ports);
+        let a = spawn_ptp_master_on(&[a_rx.ip], local, ports, "A".into(), false).unwrap();
+        let b = spawn_ptp_master_on(&[b_rx.ip], local, ports, "B".into(), false).unwrap();
+        assert_ne!(a.timeline.clock_id, b.timeline.clock_id);
+
+        let (_, from) = FakeReceiver::next(&b_rx.event, MSG_SYNC);
+        assert_eq!(from.port(), ports.local_event, "B's Sync comes from the PTP event port");
+        let (announce, from) = FakeReceiver::next(&b_rx.general, MSG_ANNOUNCE);
+        assert_eq!(from.port(), ports.local_general, "B's Announce comes from the PTP general port");
+        assert_eq!(parse_announce_grandmaster(&announce).unwrap().0, b.timeline.clock_id);
+        assert_eq!(b_rx.delay_resp_clock(ports, 0x51), b.timeline.clock_id);
+        assert_eq!(a_rx.delay_resp_clock(ports, 0x52), a.timeline.clock_id);
+
+        a.stop();
+        b_rx.drain();
+        let (_, from) = FakeReceiver::next(&b_rx.event, MSG_SYNC);
+        assert_eq!(from.port(), ports.local_event, "B keeps the ports after A stops");
+        assert_eq!(b_rx.delay_resp_clock(ports, 0x53), b.timeline.clock_id);
+
+        b.stop();
+        UdpSocket::bind((local, ports.local_event)).expect("event port released with the last session");
+        UdpSocket::bind((local, ports.local_general)).expect("general port released with the last session");
+    }
+
+    /// A session's first messages, in the order one master thread per
+    /// session sent them: Announce, Signaling, then Sync and its Follow_Up,
+    /// all numbered from 0 and carrying the session's clock.
+    #[test]
+    fn a_session_opens_with_announce_signaling_and_sync() {
+        let ports = test_ports("127.0.0.8");
+        let rx = FakeReceiver::bind("127.0.0.8", ports);
+        let m = spawn_ptp_master_on(&[rx.ip], LOCAL.parse().unwrap(), ports, "Solo".into(), false).unwrap();
+        let id = m.timeline.clock_id.to_be_bytes();
+        let mut buf = [0u8; 256];
+        let mut general = Vec::new();
+        for _ in 0..3 {
+            let (n, _) = rx.general.recv_from(&mut buf).unwrap();
+            let h = parse_header(&buf[..n]).unwrap();
+            assert_eq!(h.source_port_identity[..8], id);
+            general.push((h.msg_type, h.sequence_id));
+        }
+        assert_eq!(general, [(MSG_ANNOUNCE, 0), (MSG_SIGNALING, 0), (MSG_FOLLOW_UP, 0)]);
+        let (n, _) = rx.event.recv_from(&mut buf).unwrap();
+        let h = parse_header(&buf[..n]).unwrap();
+        assert_eq!((h.msg_type, h.sequence_id), (MSG_SYNC, 0));
+        assert_eq!(h.source_port_identity[..8], id);
+        assert!(m.ports_problem().is_none());
+    }
+
+    /// A stereo pair: one clock for both members; hosts that aren't
+    /// members get no answer.
+    #[test]
+    fn a_stereo_pair_follows_one_clock_and_strangers_are_ignored() {
+        let ports = test_ports("127.0.0.4");
+        let (m1, m2) = (FakeReceiver::bind("127.0.0.4", ports), FakeReceiver::bind("127.0.0.5", ports));
+        let stranger = FakeReceiver::bind("127.0.0.6", ports);
+        let pair = spawn_ptp_master_on(&[m1.ip, m2.ip], LOCAL.parse().unwrap(), ports, "Pair".into(), true).unwrap();
+        for m in [&m1, &m2] {
+            let (fup, from) = FakeReceiver::next(&m.general, MSG_FOLLOW_UP);
+            assert_eq!(from.port(), ports.local_general);
+            assert_eq!(parse_header(&fup).unwrap().source_port_identity[..8], pair.timeline.clock_id.to_be_bytes());
+            assert_eq!(m.delay_resp_clock(ports, 0x60), pair.timeline.clock_id);
+        }
+        stranger.event.send_to(&build_delay_req(0x99, 0x61), (LOCAL, ports.local_event)).unwrap();
+        stranger.general.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut buf = [0u8; 256];
+        assert!(stranger.general.recv_from(&mut buf).is_err(), "a non-member got a PTP message");
+    }
+
+    /// A receiver listed by two sessions (a pair member picked on its own
+    /// while the pair still plays) hears only the newer session's clock,
+    /// and the older one's again once the newer one stops.
+    #[test]
+    fn a_receiver_hears_only_the_newest_session_that_lists_it() {
+        let ports = test_ports("127.0.0.9");
+        let (m1, m2) = (FakeReceiver::bind("127.0.0.9", ports), FakeReceiver::bind("127.0.0.10", ports));
+        let local: IpAddr = LOCAL.parse().unwrap();
+        let pair = spawn_ptp_master_on(&[m1.ip, m2.ip], local, ports, "Pair".into(), true).unwrap();
+        let solo = spawn_ptp_master_on(&[m1.ip], local, ports, "Solo".into(), true).unwrap();
+        let clock_of = |rx: &FakeReceiver| {
+            rx.drain();
+            let (fup, _) = FakeReceiver::next(&rx.general, MSG_FOLLOW_UP);
+            let mut ids = std::collections::BTreeSet::new();
+            ids.insert(u64::from_be_bytes(parse_header(&fup).unwrap().source_port_identity[..8].try_into().unwrap()));
+            // A second round from every session that still sends.
+            std::thread::sleep(SYNC_INTERVAL * 3);
+            let mut buf = [0u8; 256];
+            rx.general.set_nonblocking(true).unwrap();
+            while let Ok((n, _)) = rx.general.recv_from(&mut buf) {
+                if let Some(h) = parse_header(&buf[..n]) {
+                    ids.insert(u64::from_be_bytes(h.source_port_identity[..8].try_into().unwrap()));
+                }
+            }
+            rx.general.set_nonblocking(false).unwrap();
+            ids.into_iter().collect::<Vec<_>>()
+        };
+        assert_eq!(clock_of(&m1), [solo.timeline.clock_id]);
+        assert_eq!(clock_of(&m2), [pair.timeline.clock_id]);
+        assert_eq!(m1.delay_resp_clock(ports, 0x70), solo.timeline.clock_id);
+        solo.stop();
+        assert_eq!(clock_of(&m1), [pair.timeline.clock_id]);
+        assert_eq!(m1.delay_resp_clock(ports, 0x71), pair.timeline.clock_id);
+    }
+
+    /// When another program holds this PC's PTP port, the session still
+    /// starts on a temporary port, and says why.
+    #[test]
+    fn ptp_ports_held_by_another_program_fall_back_and_say_so() {
+        let ports = test_ports("127.0.0.7");
+        let local: IpAddr = LOCAL.parse().unwrap();
+        let _other_program = UdpSocket::bind((local, ports.local_event)).unwrap();
+        let rx = FakeReceiver::bind("127.0.0.7", ports);
+        let m = spawn_ptp_master_on(&[rx.ip], local, ports, "Taken".into(), false).unwrap();
+        let (_, from) = FakeReceiver::next(&rx.event, MSG_SYNC);
+        assert_ne!(from.port(), ports.local_event);
+        let problem = m.ports_problem().expect("the session knows its PTP port is taken");
+        assert!(problem.contains(&format!("UDP port {}", ports.local_event)), "{problem}");
+    }
 
     #[test]
     fn header_carries_type_seq_flags_and_port_identity() {
