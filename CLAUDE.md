@@ -42,7 +42,7 @@ Both get the same N every build, so `1.0.0.42` in Device Manager == `build=42` i
 - **MINOR (`1.0.0 → 1.1.0`)** — new shipped features. Adding AirPlay support, adding alternative codecs, adding a new control device interface, adding a new PKEY in the INF.
 - **BUILD (`1.0.0 → 1.0.1`)** — meaningful bug fixes worth flagging in the version string. The kind of thing a user grepping `1.0.X` would care about. (Note: this is the *third* INF field — not the auto-bumped revision.)
 
-**Also bump `service/Cargo.toml`'s `version =` to match the prefix** when bumping MAJOR or MINOR — the service version shows up in `--version`, in `User-Agent` headers we send to speakers, and is what GitHub Releases use as the tag. (Patch-level disagreements between service and driver are fine; what matters is that the *prefix* tells the same story.)
+**Also bump `service/Cargo.toml`'s `version =` to match the prefix** when bumping MAJOR or MINOR — the service version shows up in `--version` and is what GitHub Releases use as the tag (the `User-Agent` we send to speakers is the fixed `PRODUCT_UA`, `stream-to-speaker/0.1`, not the version). (Patch-level disagreements between service and driver are fine; what matters is that the *prefix* tells the same story.)
 
 Don't bump the prefix for routine fixes — the auto-bumped revision is the right granularity for "the bits changed, no semantic difference." Save prefix bumps for "the user should know something changed."
 

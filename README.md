@@ -117,7 +117,6 @@ check off under **Advanced** if you'd rather not.
                           search on every interface; in the link, the address
                           worked out when it is shown.
 
---initial-buffer-ms <N>   Prebuffer hint sent to the speaker. Default 50.
 --silence-pace-ms <N>     Pacing of silence packets. Default 10 (real-time);
                           higher drains the speaker's buffer between tracks.
 --rate-fudge-ppm <N>      Clock-skew compensation. Default 0.

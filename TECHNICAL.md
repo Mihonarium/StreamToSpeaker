@@ -43,7 +43,7 @@ End-to-end latency on wired ethernet: ~150-300 ms, tuneable at runtime.
 
 - **Driver**: VS 2022 Build Tools (or EWDK) + WDK 10.0.22621+. See
   `driver/README.md`.
-- **Service**: Rust 1.74+ stable.
+- **Service**: Rust 1.88+ stable.
 - **Installer** (optional): [Inno Setup 6](https://jrsoftware.org/isdl.php).
 
 ## Building from source
@@ -215,8 +215,6 @@ milliseconds (`airplay_latency_ms` in config.json; default 2000, range
 
 ### Tuning notes
 
-- `--initial-buffer-ms` is a prebuffer hint in the DIDL metadata; Sonos
-  generally ignores it, so prefer the runtime knobs.
 - `--silence-pace-ms` is wall-clock ms between silence packets while the
   audio engine is paused. Default 10 = real-time; higher under-produces,
   draining the speaker's prebuffer between tracks so post-pause latency is
@@ -241,9 +239,11 @@ automatically. "Skip this version" / "Later" and the on/off switch
 
 The version compared is the **release tag**, baked in by CI as
 `STS_RELEASE_VERSION` on `v*` tag builds (`release_version()` /
-`display_version()` in `lib.rs`) — not `CARGO_PKG_VERSION`, which is
-versioned independently. A build without it is a dev build: the label shows
-the crate version and update checks are off.
+`display_version()` in `lib.rs`) — not `CARGO_PKG_VERSION`: the crate
+version tracks the release tag (a release bumps it, and CI stamps the tag
+into it on tag builds), but only a tag build is a release. A build without
+it is a dev build: the label shows the crate version and update checks are
+off.
 
 ## HTTP API
 

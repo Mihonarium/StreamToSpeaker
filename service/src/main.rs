@@ -5,8 +5,8 @@
 //!     audio + control planes on background threads. Closing the window
 //!     minimises to tray; only "Quit" in the tray menu actually exits.
 //!   - Headless mode (`--headless`): traditional CLI service, no GUI, no
-//!     tray. Audio loop runs on the main thread. Use for service installs
-//!     or when running over SSH.
+//!     tray; the main thread waits for Ctrl+C while the same background
+//!     threads run. Use for service installs or when running over SSH.
 //!
 //! The web UI and its HTTP/JSON API (`/api/*`) are OFF by default — pass
 //! `--web` (or turn them on in the window). Both need the web UI's link,
@@ -106,9 +106,9 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_interactive: bool,
 
-    /// Run in headless mode (no GUI window, no system tray). Audio loop
-    /// runs on the main thread, lifecycle is the same as before the GUI
-    /// was added.
+    /// Run without the window and the tray icon, as a service or in a
+    /// terminal (Ctrl+C quits). See --player, --web and --web-link for
+    /// choosing a speaker and controlling it.
     #[arg(long, default_value_t = false)]
     headless: bool,
 
@@ -141,8 +141,9 @@ struct Cli {
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=1440))]
     ssdp_interval: u64,
 
-    /// Initial buffer hint sent to the speaker in DIDL metadata (ms).
-    #[arg(long, default_value_t = 50)]
+    /// Accepted for old shortcuts and services; it has no effect (no
+    /// speaker is sent a prebuffer hint).
+    #[arg(long, default_value_t = 50, hide = true)]
     initial_buffer_ms: u32,
 
     /// Skip SSDP discovery; serve HTTP only.
@@ -1433,6 +1434,14 @@ mod tests {
         assert_eq!(std::fs::read(&previous).unwrap(), vec![b'y'; 101], "it replaces the older one");
         set_aside_if_larger(&log, 100); // no log at all: nothing to do
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_help_offers_no_flag_that_does_nothing() {
+        let help = argument_message(&parse_error(&["--help"]));
+        assert!(!help.contains("--initial-buffer-ms"), "{help}");
+        // Still accepted, so shortcuts and services that pass it start.
+        assert!(Cli::try_parse_from(["x", "--initial-buffer-ms", "50"]).is_ok());
     }
 
     #[test]

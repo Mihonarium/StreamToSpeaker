@@ -13,7 +13,7 @@ User-mode Rust service that takes PCM audio from either:
 ## Build
 
 ```powershell
-# Stable Rust 1.74+
+# Stable Rust 1.88+
 cd service
 cargo build --release
 ```
