@@ -1515,8 +1515,10 @@ const FAKE_CONTENT_LEN: u64 = (u32::MAX - 1) as u64;
 fn from_start(head: &Head, profile: StreamProfile) -> bool {
     profile != StreamProfile::Legacy
         && head.header("range").is_some_and(|r| {
-            let r = r.trim();
-            r.len() == 8 && r[..6].eq_ignore_ascii_case("bytes=") && &r[6..] == "0-"
+            // Bytes, not string slices: the value came from the network
+            // and may hold any character at any position.
+            let r = r.trim().as_bytes();
+            r.len() == 8 && r[..6].eq_ignore_ascii_case(b"bytes=") && &r[6..] == b"0-"
         })
 }
 
@@ -2680,6 +2682,29 @@ mod tests {
         assert!(String::from_utf8_lossy(&exchange_raw(port, &req, 4096)).starts_with("HTTP/1.1 400"));
         let h = head("GET / HTTP/1.1\nX: Caf\u{e9}\n").unwrap();
         assert_eq!(h.header("x"), Some("Caf\u{e9}"));
+    }
+
+    #[test]
+    fn a_range_value_with_a_character_across_its_unit_is_just_another_range() {
+        // Eight bytes long, with a character straddling byte 6: a UTF-8
+        // "é", and an invalid byte read as U+FFFD (three bytes).
+        let (port, hub) = minimal();
+        let stop = keep_publishing(&hub, vec![1, 2, 3, 4]);
+        for range in [&b"12345\xc3\xa9x"[..], &b"1234\xffx"[..]] {
+            for method in ["HEAD", "GET"] {
+                let mut req = format!("{method} /wav/stream.wav HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nRange: ").into_bytes();
+                req.extend_from_slice(range);
+                req.extend_from_slice(b"\r\n\r\n");
+                let r = exchange_raw(port, &req, 300);
+                assert!(r.starts_with(b"HTTP/1.1 200 OK\r\n"), "{method} {range:?}: {}", String::from_utf8_lossy(&r));
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(healthz(port).starts_with("HTTP/1.1 200"));
+        for value in ["12345\u{e9}x", "1234\u{fffd}x", "bytes=\u{e9}", "\u{e9}\u{e9}\u{e9}\u{e9}"] {
+            let h = head(&format!("GET /wav/stream.wav HTTP/1.1\nRange: {value}\n")).unwrap();
+            assert!(!from_start(&h, StreamProfile::Wav), "{value:?}");
+        }
     }
 
     #[test]
