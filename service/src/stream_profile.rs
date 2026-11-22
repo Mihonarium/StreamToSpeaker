@@ -35,6 +35,24 @@ pub enum StreamProfile {
     L16,
 }
 
+/// Read a remembered profile from the settings file: a name this version
+/// doesn't know (one a later version wrote), or anything that isn't a
+/// name, reads as nothing remembered, so that one field can never make
+/// the whole file unreadable.
+pub fn deserialize_remembered<'de, D>(d: D) -> Result<Option<StreamProfile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match serde_json::from_value::<Option<StreamProfile>>(v) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("user_config: ignoring a stream profile this version doesn't know ({e})");
+            None
+        }
+    })
+}
+
 /// Every profile, in the order the app prefers them when a renderer
 /// lists several: WAV spellings before L16.
 pub const ALL: [StreamProfile; 5] =

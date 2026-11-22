@@ -257,7 +257,7 @@ pub struct SpeakerSettings {
     pub airplay_latency_ms: Option<u32>,
     /// UPnP: the stream profile this speaker last played; the next
     /// connect starts there (see `stream_profile`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::stream_profile::deserialize_remembered")]
     pub upnp_stream_profile: Option<StreamProfile>,
 }
 
@@ -1445,6 +1445,26 @@ mod tests {
         assert_eq!(ids, ["player-b"]);
         assert!(back.locked_secrets.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unknown_or_malformed_stream_profile_means_nothing_remembered() {
+        // A later version's profile name, a wrong type, garbage: that one
+        // field reads as nothing remembered; nothing else is lost.
+        for value in [r#""flac""#, "42", r#"{"x":1}"#, "[]", "null"] {
+            let text = format!(
+                r#"{{"last_speaker_id":"uuid:a","airplay_latency_ms":700,"speaker_settings":{{
+                    "uuid:a":{{"hidden":true,"upnp_stream_profile":{value},"airplay_latency_ms":150}},
+                    "uuid:b":{{"upnp_stream_profile":"wav"}}}}}}"#
+            );
+            let c: UserConfig = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{value}: {e}"));
+            assert_eq!(c.last_speaker_id.as_deref(), Some("uuid:a"), "{value}");
+            assert_eq!(c.airplay_latency_ms, 700, "{value}");
+            let a = &c.speaker_settings["uuid:a"];
+            assert!(a.hidden, "{value}");
+            assert_eq!((a.upnp_stream_profile, a.airplay_latency_ms), (None, Some(150)), "{value}");
+            assert_eq!(c.speaker_settings["uuid:b"].upnp_stream_profile, Some(StreamProfile::Wav), "{value}");
+        }
     }
 
     #[test]
