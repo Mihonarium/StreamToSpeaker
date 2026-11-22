@@ -26,7 +26,7 @@
 //! ```text
 //!  0..1  : 0x80
 //!  1..2  : 0xD3                 # M=1, PT=83=0x53 (timing response)
-//!  2..4  : 0x0007               # constant
+//!  2..4  : sequence             # the request's, echoed (Sonos always sends 0x0007)
 //!  4..8  : zero padding
 //!  8..16 : NTP "reference"   ← copy bytes 24..32 of request
 //! 16..24 : NTP "received"    ← capture immediately at recv
@@ -203,9 +203,10 @@ pub fn sleep_unless_stopped(stop_flag: &AtomicBool, total: Duration) -> bool {
 /// Spawn the sync packet sender. Sends one 20-byte sync packet per
 /// second to the receiver's `control_port` until `stop_flag` is set.
 ///
-/// Latency is the receiver-advertised buffer depth in samples
-/// (typically 11025 = 250 ms at 44.1 kHz) — we use it to compute the
-/// "now should be playing" anchor timestamp.
+/// `latency_samples` is the anchor depth: the larger of the receiver's
+/// `Audio-Latency` (if it sends one) and the configured
+/// `airplay_latency_ms` (default 2000 ms = 88200 samples) — it gives the
+/// "now should be playing" timestamp, current − latency.
 ///
 /// The initial (`0x90` extension-bit) sync is sent **synchronously,
 /// before this function returns** — every field-proven sender strictly

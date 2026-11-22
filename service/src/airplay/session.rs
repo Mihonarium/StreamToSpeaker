@@ -159,7 +159,7 @@ pub struct RaopTimeouts {
     pub retry_pause: Duration,
     /// Before the one retry a busy receiver (453) gets, when the session
     /// it is busy with is likely this app's own (see
-    /// [`left_session_recently`]). OwnTone reconnects a lost speaker after
+    /// `left_session_recently`). OwnTone reconnects a lost speaker after
     /// 5 s (`PLAYER_SPEAKER_RESURRECT_TIME`).
     pub busy_retry: Duration,
 }
@@ -520,9 +520,9 @@ impl AirPlaySession {
         Self::start_with_notices(cfg, &|_| {})
     }
 
-    /// [`start`](Self::start), passing `notice` a line (to follow "Still
-    /// connecting to <name> — ") whenever a connect that has already run
-    /// [`SLOW_CONNECT`] is waiting on the receiver, so the window can say
+    /// [`start`](Self::start), passing `notice` a line (to follow `Still
+    /// connecting to <name> — `) whenever a connect that has already run
+    /// `SLOW_CONNECT` (10 s) is waiting on the receiver, so the window can say
     /// what the wait is for.
     pub fn start_with_notices(cfg: AirPlaySessionConfig, notice: &(dyn Fn(&str) + Sync)) -> Result<Self> {
         let progress = Progress::new();

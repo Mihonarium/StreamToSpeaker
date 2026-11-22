@@ -128,8 +128,9 @@ impl ActiveSession {
     }
 
     /// Tear down — drops GENA subscription / RTSP connection /
-    /// background threads. Best-effort; receivers eventually time out
-    /// anyway, so failures here aren't fatal.
+    /// background threads. Failures aren't fatal, but the AirPlay 1
+    /// TEARDOWN matters: a receiver that isn't told keeps the session for
+    /// a while and refuses the next connect.
     pub fn stop(self) {
         match self {
             ActiveSession::Upnp(s) => stop_session(&s),

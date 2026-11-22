@@ -9,8 +9,8 @@
 //! ## Sequence
 //!
 //! ```text
-//!   OPTIONS *                       — verify reachable, send Apple-Challenge
-//!   ANNOUNCE rtsp://ip/<sess>       — declare codec + rsaaeskey + aesiv (SDP)
+//!   OPTIONS * or POST /auth-setup   — the opener (see `session::Opener`)
+//!   ANNOUNCE rtsp://ip/<sess>       — declare codec [+ rsaaeskey + aesiv] (SDP)
 //!   SETUP    rtsp://ip/<sess>       — request RTP/UDP server ports
 //!   RECORD   rtsp://ip/<sess>       — flip to streaming
 //!     (... audio packets on UDP in parallel ...)

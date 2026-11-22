@@ -25,11 +25,21 @@
 //!
 //! | Key | Meaning                                              |
 //! |-----|------------------------------------------------------|
-//! | `cn`      | Comma-separated codecs: 0=PCM 1=ALAC 2=AAC ... |
-//! | `et`      | Comma-separated encryption types: 0=none 1=RSA 3=FairPlay 4=FairPlay-SAPv2.5 5=MFi |
+//! | `cn`      | Comma-separated codecs: 0=PCM 1=ALAC 2=AAC 3=AAC-ELD; absent = ALAC (every RAOP receiver plays it) |
+//! | `et`      | Comma-separated encryption types: 0=none 1=RSA (AirPort Express key) 3=FairPlay 4=MFi-SAP (third-party MFi devices) 5=FairPlay SAPv2.5; absent = none |
+//! | `tp`      | Transports: `UDP`, `TCP`; one without UDP is unsupported here |
+//! | `md`      | Metadata it takes: 0=track text 1=artwork 2=progress |
 //! | `vn`      | RSA version (3 = the published Apple key)       |
 //! | `pw`      | Password protected                              |
-//! | `am`      | Apple model — purely informational              |
+//! | `ek`      | Expects an encryption key (classic AirPort Express) |
+//! | `am`      | Apple model, e.g. `AirPort4,107`                |
+//!
+//! `et` decides the encryption: plaintext when 0 is offered (also for
+//! MFi receivers, `et=0,4`, as OwnTone and libraop do), RSA for classic
+//! AirPort Express (see [`AirPlayRenderer::prefers_rsa_encryption`]),
+//! never FairPlay. A receiver that offers 4 but not 0 is refused today,
+//! although OwnTone and libraop stream plaintext to it after
+//! `/auth-setup`; whether such receivers accept plaintext is unverified.
 //!
 //! ## AirPlay 2 TXT keys (`_airplay._tcp`)
 //!
@@ -58,7 +68,7 @@ use anyhow::Result;
 use log::{debug, info, warn};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo, TxtProperties};
 use std::collections::{BTreeSet, HashMap};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -119,12 +129,14 @@ pub struct AirPlayRenderer {
     /// RTSP port advertised by `_airplay._tcp` (the AirPlay-2 endpoint),
     /// if present (usually 7000).
     pub airplay_port: Option<u16>,
-    /// Encryption types from RAOP `et=` (0=none 1=RSA 3/4/5=FairPlay).
+    /// Encryption types from RAOP `et=` (0=none 1=RSA 3=FairPlay 4=MFi-SAP
+    /// 5=FairPlay SAPv2.5); see the table at the top of this module.
     pub encryption_types: Vec<u8>,
     /// Codec ids from RAOP `cn=` (1=ALAC).
     pub codecs: Vec<u8>,
-    /// True if the RAOP service set `pw=true` (password protected). We
-    /// don't speak RAOP HTTP-digest auth, so these are legacy-unsupported.
+    /// True if the RAOP service set `pw=true` (password protected). These
+    /// are supported: the session answers RTSP Digest auth with the
+    /// stored password, and the window asks for one.
     pub password_protected: bool,
     /// The RAOP `ek=1` flag — "encryption key (expected)". Classic
     /// AirPort Express advertises it and genuinely wants an RSA-wrapped
@@ -561,7 +573,7 @@ impl AirPlayDiscoveryState {
     /// Find by our public `stable_id()` (i.e. with the `airplay:` prefix).
     /// A stereo-pair member's id resolves to its pair: playing one member
     /// alone would break the pair. While several instances claim one MAC,
-    /// the plain id finds the incumbent (see [`entries_for`]), and
+    /// the plain id finds the incumbent (see `entries_for`), and
     /// `airplay:<MAC>/<instance>` the instance it names, also once the
     /// conflict is over.
     pub fn find_by_id(&self, id: &str) -> Option<AirPlayRenderer> {
@@ -861,24 +873,10 @@ fn merge(
     })
 }
 
-/// Spawn the long-running mDNS browser. Browses **both** `_raop._tcp` and
-/// `_airplay._tcp` on a shared daemon; a consumer thread per service keeps
-/// the corresponding map fresh.
-///
-/// `iface_hint` is informational only — `mdns-sd` listens on all
-/// interfaces and picks the right one per outgoing query.
-pub fn spawn_airplay_discovery(
-    state: Arc<AirPlayDiscoveryState>,
-    iface_hint: Option<Ipv4Addr>,
-) -> Result<()> {
-    let daemon = ServiceDaemon::new().map_err(|e| anyhow::anyhow!("mdns daemon init: {}", e))?;
-    info!("AirPlay discovery: iface hint {:?}", iface_hint);
-    spawn_airplay_discovery_on(state, daemon)
-}
-
-/// Browse both service types on a caller-built daemon (one whose
-/// interface selection the caller controls). Consumers exit when the
-/// daemon shuts down.
+/// Browse both `_raop._tcp` and `_airplay._tcp` on a caller-built daemon
+/// (one whose interface selection the caller controls); a consumer
+/// thread per service keeps the corresponding map fresh. Consumers exit
+/// when the daemon shuts down.
 pub fn spawn_airplay_discovery_on(
     state: Arc<AirPlayDiscoveryState>,
     daemon: ServiceDaemon,

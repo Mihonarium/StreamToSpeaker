@@ -68,8 +68,9 @@ pub struct SessionKey {
 /// We prefer `et=0` when available — it skips a round of RSA per
 /// session and works with the broadest set of modern receivers. If
 /// only `et=1` is on offer we fall back to the encrypted path.
-/// FairPlay-only receivers (`et=3/4/5` only) are unsupported here;
-/// they require HomeKit pairing.
+/// FairPlay (`et=3`, `et=5`) is never spoken; a receiver offering only
+/// those is unsupported here. `et=4` is MFi-SAP (third-party MFi
+/// devices), used only by the opt-in [`Cipher::Mfi`] experiment.
 pub enum Cipher {
     None,
     AesRsa(SessionKey),
