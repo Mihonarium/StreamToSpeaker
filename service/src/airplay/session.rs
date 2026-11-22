@@ -74,6 +74,9 @@ pub struct AirPlaySessionConfig {
     /// Time limits for the connect and the session's requests; the app
     /// uses [`RaopTimeouts::STANDARD`].
     pub timeouts: RaopTimeouts,
+    /// The opener that worked for this receiver last time, if it wasn't
+    /// the usual one (see [`next_opener_memory`]).
+    pub opener_hint: Option<Opener>,
     /// Opt-in `et=4` MFi-encryption experiment (config flag). When true
     /// and the receiver advertises et=4, the session tries the MFi
     /// wrapped-key handshake first, falling back to plaintext/RSA on
@@ -110,6 +113,9 @@ pub struct RaopTimeouts {
     pub reply: Duration,
     /// TEARDOWN (see [`TEARDOWN_LIMIT`]).
     pub teardown: Duration,
+    /// Between an attempt that failed and the next one on another
+    /// connection, so the receiver has let go of the first.
+    pub retry_pause: Duration,
 }
 
 impl RaopTimeouts {
@@ -117,7 +123,60 @@ impl RaopTimeouts {
         opener: Duration::from_secs(3),
         reply: Duration::from_secs(15),
         teardown: TEARDOWN_LIMIT,
+        retry_pause: Duration::from_secs(2),
     };
+}
+
+/// How an attempt opens the RTSP conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Opener {
+    /// `OPTIONS *` with an Apple-Challenge: receivers without MFi or
+    /// AirPlay 2, as iTunes opens them.
+    Options,
+    /// `POST /auth-setup`, which must succeed: MFi (`et` lists 4) and
+    /// AirPlay 2 receivers, as iTunes opens a Sonos (packet capture).
+    AuthSetup,
+    /// The order of the reference senders (OwnTone; libraop skips the
+    /// OPTIONS): `OPTIONS *`, then `POST /auth-setup` only when the
+    /// reply's `Public` lists POST, and a failed `/auth-setup` passed over.
+    OptionsThenAuthSetup,
+}
+
+/// The openers to try, in order. The first is the one that has always
+/// been used for this kind of receiver, unless `hint` says the other one
+/// worked last time. An MFi receiver without AirPlay 2 (third-party
+/// docks and AV receivers) gets a second attempt the reference senders'
+/// way when the first fails; Sonos-class receivers don't (their fallback
+/// is AirPlay 2), nor do plain ones.
+fn opener_plan(renderer: &AirPlayRenderer, hint: Option<Opener>) -> Vec<Opener> {
+    let mfi = renderer.encryption_types.contains(&4);
+    let usual = if mfi || renderer.supports_airplay2() { Opener::AuthSetup } else { Opener::Options };
+    if !mfi || renderer.supports_airplay2() {
+        return vec![usual];
+    }
+    match hint {
+        Some(Opener::OptionsThenAuthSetup) => vec![Opener::OptionsThenAuthSetup, usual],
+        _ => vec![usual, Opener::OptionsThenAuthSetup],
+    }
+}
+
+/// What to remember about a receiver's opener after a connect: the
+/// reference order when it is the one that worked; nothing after a
+/// connect that worked the usual way, or one that failed (a remembered
+/// order that fails is forgotten).
+pub fn next_opener_memory(used: Option<Opener>) -> Option<Opener> {
+    used.filter(|o| *o == Opener::OptionsThenAuthSetup)
+}
+
+/// Read a remembered opener leniently: anything unknown is "nothing
+/// remembered", never an unreadable settings file.
+pub fn deserialize_opener_lenient<'de, D>(d: D) -> Result<Option<Opener>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(d)?;
+    Ok(serde_json::from_value::<Option<Opener>>(v).unwrap_or(None))
 }
 
 /// How long `stop()` waits for a request in flight to finish before it
@@ -248,6 +307,8 @@ pub struct AirPlaySession {
     /// Cuts a stalled request on the control connection short, so
     /// `stop()` never waits for its full time limit.
     abandon: AbandonHandle,
+    /// The opener this session's connect used.
+    opener: Opener,
     /// Hold the audio socket so it isn't closed prematurely; the
     /// sender thread holds a `try_clone` for sending. Once `stop`
     /// runs we drop these in the right order to wake any blocked
@@ -310,7 +371,11 @@ impl AirPlaySession {
         let progress = Progress::new();
         let started = Instant::now();
         std::thread::scope(|scope| {
-            scope.spawn(|| progress.report(started, notice));
+            // Without a thread for them (none left), the connect just
+            // goes without notices.
+            let _ = std::thread::Builder::new()
+                .name("stream-to-speaker-airplay-connect-notices".into())
+                .spawn_scoped(scope, || progress.report(started, notice));
             let out = Self::start_inner(cfg, &progress);
             progress.finish();
             out
@@ -375,7 +440,6 @@ impl AirPlaySession {
         );
 
         let want_mfi = cfg.renderer.encryption_types.contains(&4);
-        let mfi_style = want_mfi || cfg.renderer.supports_airplay2();
         // The et=4 attempt is opt-in: the wrap is a best-grounded guess,
         // and a stalled attempt wedges this receiver class for tens of
         // seconds (capture-proven: after one SETUP stall the Sonos
@@ -383,106 +447,70 @@ impl AirPlaySession {
         // so it must never gate default connectivity.
         let try_mfi_first = cfg.mfi_encryption && want_mfi;
 
-        // One full RTSP bring-up (connect → opener → ANNOUNCE → SETUP →
-        // RECORD). Factored so the opt-in MFi experiment can fall back to
-        // the proven plaintext/RSA recipe.
-        //
-        // Opener: iTunes → Sonos (AirTunes/366) leads with POST /auth-setup
-        // (0x01 + X25519), not OPTIONS + Apple-Challenge. MFi/AP2 devices
-        // get auth-setup; plain legacy receivers keep OPTIONS.
-        let target_latency_samples = crate::airplay::timing::latency_ms_to_samples(cfg.latency_ms);
         let timeouts = cfg.timeouts;
-        let attempt = |try_mfi: bool| -> Result<(RtspClient, Cipher, ServerPorts, u32)> {
-            // Password-protected receivers get RTSP Digest credentials;
-            // the gen-1 AirPort Express (no `am` model) uses the iTunes
-            // digest quirk (username "iTunes" + uppercase hex).
-            let mut rtsp = progress.waiting(timeouts.opener, || {
-                RtspClient::connect_auth(
-                    cfg.renderer.ip,
-                    cfg.renderer.port,
-                    cfg.local_ip,
-                    timeouts.opener,
-                    cfg.password.clone(),
-                    cfg.renderer.model.is_none(),
-                )
-            })
-            .context("opening RTSP connection")?;
-            rtsp.set_teardown_limit(timeouts.teardown);
-
-            let cipher = if try_mfi {
-                // iTunes encrypts audio to et=4 receivers with a key
-                // wrapped under the auth-setup ECDH secret (mfiaeskey).
-                let shared = progress
-                    .waiting(timeouts.opener, || rtsp.auth_setup())
-                    .context("RTSP auth-setup (MFi opener)")?;
-                rtsp.set_reply_limit(timeouts.reply);
-                Cipher::Mfi(MfiKey::derive(&shared))
-            } else {
-                if mfi_style {
-                    // Throwaway unlock — same as OwnTone/libraop: complete
-                    // the auth-setup exchange, ignore the secret, stream
-                    // plaintext. Field-proven recipe for Sonos-class
-                    // receivers.
-                    let _ = progress.waiting(timeouts.opener, || rtsp.auth_setup()).context("RTSP auth-setup")?;
-                } else {
-                    progress.waiting(timeouts.opener, || rtsp.options()).context("RTSP OPTIONS")?;
-                }
-                // The receiver has answered: it is there, and the rest of
-                // the handshake may take it longer.
-                rtsp.set_reply_limit(timeouts.reply);
-                if cfg.renderer.prefers_rsa_encryption() {
-                    // Classic AirPort Express (ek=1 / am=AirPort*) wants an
-                    // RSA-wrapped AES key; plaintext is silent there.
-                    Cipher::rsa()
-                } else {
-                    Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no compatible encryption mode for {} (advertised et={:?})",
-                            cfg.renderer.friendly_name,
-                            cfg.renderer.encryption_types,
-                        )
-                    })?
-                }
-            };
-
-            let reply = timeouts.reply;
-            progress.waiting(reply, || rtsp.announce(&cipher)).context("RTSP ANNOUNCE")?;
-            let ports = progress.waiting(reply, || rtsp.setup(control_port, timing_port)).context("RTSP SETUP")?;
-            let record_latency = progress
-                .waiting(reply, || rtsp.record(initial_seq, initial_rtptime))
-                .context("RTSP RECORD")?;
-            let advertised_latency = merge_advertised_latency(ports.audio_latency, record_latency);
-            let latency = effective_latency_samples(advertised_latency, target_latency_samples);
-            info!(
-                "AirPlay: sync anchor {} samples (~{} ms) — configured {} ms, receiver Audio-Latency: SETUP {:?} / RECORD {:?}",
-                latency,
-                latency as u64 * 1000 / crate::WIRE_SAMPLE_RATE as u64,
-                cfg.latency_ms,
-                ports.audio_latency,
-                record_latency,
-            );
-            Ok((rtsp, cipher, ports, latency))
+        let bringup = Bringup {
+            cfg: &cfg,
+            progress,
+            control_port,
+            timing_port,
+            initial_seq,
+            initial_rtptime,
+            target_latency: crate::airplay::timing::latency_ms_to_samples(cfg.latency_ms),
         };
-
         // On any error below, `guard`'s Drop stops and joins whatever
         // threads exist — the timing responder now, the sync/audio/resend
         // threads once adopted.
-        let handshake = if try_mfi_first {
-            match attempt(true) {
-                Ok(v) => Ok(v),
-                Err(e) => {
+        let mut failed: Vec<String> = Vec::new();
+        let mut handshake = None;
+        if try_mfi_first {
+            match bringup.attempt(How::Mfi) {
+                Ok(h) => handshake = Some(h),
+                Err(f) => {
                     warn!(
                         "AirPlay: et=4 MFi handshake to {} failed ({:#}); \
                          retrying with plaintext/RSA",
-                        cfg.renderer.friendly_name, e
+                        cfg.renderer.friendly_name, f.error
                     );
-                    attempt(false).context("plaintext fallback after MFi handshake failed")
+                    failed.push(format!("MFi encryption: {:#}", f.error));
                 }
             }
-        } else {
-            attempt(false)
+        }
+        if handshake.is_none() {
+            let plan = opener_plan(&cfg.renderer, cfg.opener_hint);
+            for (i, &opener) in plan.iter().enumerate() {
+                if i > 0 {
+                    info!(
+                        "AirPlay: trying {} again, opening with {}",
+                        cfg.renderer.friendly_name,
+                        opener.describe()
+                    );
+                    progress.waiting(timeouts.retry_pause, || std::thread::sleep(timeouts.retry_pause));
+                }
+                match bringup.attempt(How::Plain(opener)) {
+                    Ok(h) => {
+                        handshake = Some(h);
+                        break;
+                    }
+                    Err(f) => {
+                        // Another opener can only help a receiver that took
+                        // the connection and then didn't get as far as
+                        // answering RECORD.
+                        let another_way = f.connected && !f.record_answered;
+                        if plan.len() > 1 {
+                            failed.push(format!("opening with {}: {:#}", opener.describe(), f.error));
+                        } else {
+                            failed.push(format!("{:#}", f.error));
+                        }
+                        if !another_way {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let Some(Handshake { mut rtsp, cipher, ports: server_ports, latency: latency_samples, opener }) = handshake else {
+            return Err(anyhow::anyhow!("{}", failed.join("; then ")));
         };
-        let (mut rtsp, cipher, server_ports, latency_samples) = handshake?;
         info!(
             "AirPlay: cipher={} (receiver et={:?}, mfi_experiment={})",
             cipher.label(),
@@ -614,6 +642,7 @@ impl AirPlaySession {
             volume_pct: Arc::new(AtomicU32::new(cfg.initial_volume.unwrap_or(100))),
             threads: guard.into_threads(),
             abandon,
+            opener,
             _audio_socket: audio_socket,
         })
     }
@@ -629,6 +658,11 @@ impl AirPlaySession {
             rtsp: self.rtsp.clone(),
             current_rtptime: self.current_rtptime.clone(),
         }
+    }
+
+    /// The opener this session's connect used.
+    pub fn opener(&self) -> Opener {
+        self.opener
     }
 
     /// True once a background thread has flagged the session as dead
@@ -706,6 +740,193 @@ impl Drop for AirPlaySession {
         // Belt-and-braces: ensure the audio thread is told to stop if
         // someone drops a session without calling `stop`.
         self.stop_flag.store(true, Ordering::Release);
+    }
+}
+
+/// Which kind of attempt: the opt-in MFi encryption experiment
+/// (`/auth-setup` required, its secret wraps the audio key), or plaintext
+/// / RSA with one of the openers.
+#[derive(Clone, Copy, Debug)]
+enum How {
+    Mfi,
+    Plain(Opener),
+}
+
+impl Opener {
+    /// For log lines and error messages.
+    fn describe(self) -> &'static str {
+        match self {
+            Opener::Options => "OPTIONS",
+            Opener::AuthSetup => "/auth-setup",
+            Opener::OptionsThenAuthSetup => "OPTIONS first",
+        }
+    }
+}
+
+/// A handshake that got through RECORD.
+struct Handshake {
+    rtsp: RtspClient,
+    cipher: Cipher,
+    ports: ServerPorts,
+    latency: u32,
+    opener: Opener,
+}
+
+/// An attempt that failed, and how far it got.
+struct AttemptFailure {
+    error: anyhow::Error,
+    /// The TCP connection was made.
+    connected: bool,
+    /// RECORD was answered (with an error status).
+    record_answered: bool,
+}
+
+/// What every attempt of one connect shares.
+struct Bringup<'a> {
+    cfg: &'a AirPlaySessionConfig,
+    progress: &'a Progress,
+    control_port: u16,
+    timing_port: u16,
+    initial_seq: u16,
+    initial_rtptime: u32,
+    target_latency: u32,
+}
+
+impl Bringup<'_> {
+    /// One full RTSP bring-up on a new connection: connect → opener →
+    /// ANNOUNCE → SETUP → RECORD. A failure after ANNOUNCE ends the
+    /// receiver's session with TEARDOWN as the client is dropped.
+    fn attempt(&self, how: How) -> Result<Handshake, AttemptFailure> {
+        let cfg = self.cfg;
+        let t = cfg.timeouts;
+        let fail = |error: anyhow::Error, connected: bool| AttemptFailure { error, connected, record_answered: false };
+        // Password-protected receivers get RTSP Digest credentials;
+        // the gen-1 AirPort Express (no `am` model) uses the iTunes
+        // digest quirk (username "iTunes" + uppercase hex).
+        let mut rtsp = self
+            .progress
+            .waiting(t.opener, || {
+                RtspClient::connect_auth(
+                    cfg.renderer.ip,
+                    cfg.renderer.port,
+                    cfg.local_ip,
+                    t.opener,
+                    cfg.password.clone(),
+                    cfg.renderer.model.is_none(),
+                )
+            })
+            .context("opening RTSP connection")
+            .map_err(|e| fail(e, false))?;
+        rtsp.set_teardown_limit(t.teardown);
+        let (cipher, opener) = self.open(&mut rtsp, how).map_err(|e| fail(e, true))?;
+
+        let reply = t.reply;
+        let progress = self.progress;
+        progress.waiting(reply, || rtsp.announce(&cipher)).context("RTSP ANNOUNCE").map_err(|e| fail(e, true))?;
+        let ports = progress
+            .waiting(reply, || rtsp.setup(self.control_port, self.timing_port))
+            .context("RTSP SETUP")
+            .map_err(|e| fail(e, true))?;
+        let record_latency = match progress.waiting(reply, || rtsp.record(self.initial_seq, self.initial_rtptime)) {
+            Ok(l) => l,
+            Err(e) => {
+                // A status error means RECORD was answered; no reply at
+                // all, or a broken connection, means it wasn't.
+                let record_answered = e.downcast_ref::<RtspError>().is_none();
+                return Err(AttemptFailure { error: e.context("RTSP RECORD"), connected: true, record_answered });
+            }
+        };
+        let advertised_latency = merge_advertised_latency(ports.audio_latency, record_latency);
+        let latency = effective_latency_samples(advertised_latency, self.target_latency);
+        info!(
+            "AirPlay: sync anchor {} samples (~{} ms) — configured {} ms, receiver Audio-Latency: SETUP {:?} / RECORD {:?}",
+            latency,
+            latency as u64 * 1000 / crate::WIRE_SAMPLE_RATE as u64,
+            cfg.latency_ms,
+            ports.audio_latency,
+            record_latency,
+        );
+        Ok(Handshake { rtsp, cipher, ports, latency, opener })
+    }
+
+    /// The opener, and the cipher it leads to. Once the receiver has
+    /// answered the opener, later requests get the longer reply limit.
+    fn open(&self, rtsp: &mut RtspClient, how: How) -> Result<(Cipher, Opener)> {
+        let cfg = self.cfg;
+        let t = cfg.timeouts;
+        let progress = self.progress;
+        let opener = match how {
+            How::Mfi => {
+                // iTunes encrypts audio to et=4 receivers with a key
+                // wrapped under the auth-setup ECDH secret (mfiaeskey).
+                let shared = progress
+                    .waiting(t.opener, || rtsp.auth_setup())
+                    .context("RTSP auth-setup (MFi opener)")?;
+                rtsp.set_reply_limit(t.reply);
+                return Ok((Cipher::Mfi(MfiKey::derive(&shared)), Opener::AuthSetup));
+            }
+            How::Plain(o) => o,
+        };
+        match opener {
+            Opener::AuthSetup => {
+                // Throwaway unlock — same as OwnTone/libraop: complete
+                // the auth-setup exchange, ignore the secret, stream
+                // plaintext. Field-proven recipe for Sonos-class
+                // receivers.
+                let _ = progress.waiting(t.opener, || rtsp.auth_setup()).context("RTSP auth-setup")?;
+                rtsp.set_reply_limit(t.reply);
+            }
+            Opener::Options => {
+                let reply = progress.waiting(t.opener, || rtsp.options()).context("RTSP OPTIONS")?;
+                note_options_status(&cfg.renderer.friendly_name, &reply);
+                rtsp.set_reply_limit(t.reply);
+            }
+            Opener::OptionsThenAuthSetup => {
+                let reply = progress.waiting(t.opener, || rtsp.options_plain()).context("RTSP OPTIONS")?;
+                note_options_status(&cfg.renderer.friendly_name, &reply);
+                rtsp.set_reply_limit(t.reply);
+                if reply.lists("POST") {
+                    if let Err(e) = progress.waiting(t.reply, || rtsp.auth_setup()) {
+                        if !rtsp.is_usable() {
+                            return Err(e.context("RTSP auth-setup"));
+                        }
+                        warn!(
+                            "AirPlay: {} didn't complete /auth-setup ({:#}); going on without it, as other senders do",
+                            cfg.renderer.friendly_name, e
+                        );
+                    }
+                }
+            }
+        }
+        let cipher = if cfg.renderer.prefers_rsa_encryption() {
+            // Classic AirPort Express (ek=1 / am=AirPort*) wants an
+            // RSA-wrapped AES key; plaintext is silent there.
+            Cipher::rsa()
+        } else {
+            Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no compatible encryption mode for {} (advertised et={:?})",
+                    cfg.renderer.friendly_name,
+                    cfg.renderer.encryption_types,
+                )
+            })?
+        };
+        Ok((cipher, opener))
+    }
+}
+
+/// Log an OPTIONS answer other than 200. The handshake goes on either
+/// way, as it always has: receivers that don't implement OPTIONS answer
+/// 501 and still stream.
+fn note_options_status(name: &str, reply: &crate::airplay::rtsp::OptionsReply) {
+    match reply.status {
+        200 => {}
+        403 => info!(
+            "AirPlay: {} answered OPTIONS with 403 {}; it may want to be paired with a PIN first, which this app \
+             doesn't do over AirPlay 1. Going on.",
+            name, reply.reason
+        ),
+        code => info!("AirPlay: {} answered OPTIONS with {} {}; going on.", name, code, reply.reason),
     }
 }
 
@@ -901,7 +1122,7 @@ mod tests {
         });
         let (_tx, samples) = crossbeam_channel::unbounded();
         let mut cfg = config(receiver(&rx, "0B0000000003", &[0, 1]), samples);
-        cfg.timeouts = RaopTimeouts { opener: Duration::from_millis(100), reply: Duration::from_secs(2), teardown: TEARDOWN_LIMIT };
+        cfg.timeouts = RaopTimeouts { opener: Duration::from_millis(100), reply: Duration::from_secs(2), ..RaopTimeouts::STANDARD };
         let session = AirPlaySession::start(cfg).expect("session up");
         let keepalive = |ev: &[crate::airplay::fake_raop::Event], n: usize| {
             ev.iter()
@@ -925,7 +1146,7 @@ mod tests {
         });
         let (_tx, samples) = crossbeam_channel::unbounded();
         let mut cfg = config(receiver(&rx, "0B0000000004", &[0, 1]), samples);
-        cfg.timeouts = RaopTimeouts { opener: Duration::from_millis(200), reply: Duration::from_secs(4), teardown: TEARDOWN_LIMIT };
+        cfg.timeouts = RaopTimeouts { opener: Duration::from_millis(200), reply: Duration::from_secs(4), ..RaopTimeouts::STANDARD };
         let session = AirPlaySession::start(cfg).expect("SETUP answered within the longer limit");
         session.stop();
     }
@@ -1025,6 +1246,178 @@ mod tests {
             .and_then(|n| n.parse().ok())
             .unwrap_or(0);
         assert!((12..=15).contains(&left), "{lines:?}");
+    }
+
+    use crate::airplay::fake_raop::Reply;
+
+    /// Quick limits for tests of retries: the pause between attempts is
+    /// measurable, the reply limit long against every delay used here.
+    fn quick() -> RaopTimeouts {
+        RaopTimeouts {
+            opener: Duration::from_millis(300),
+            reply: Duration::from_millis(600),
+            teardown: Duration::from_millis(400),
+            retry_pause: Duration::from_millis(200),
+        }
+    }
+
+    /// OPTIONS without POST in `Public`.
+    fn options_without_post() -> Answer {
+        Answer::Reply(Reply::ok().header("Public", "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER"))
+    }
+
+    fn start(rx: &FakeRaop, mac: &str, et: &[u8], hint: Option<Opener>) -> Result<AirPlaySession> {
+        let (_tx, samples) = crossbeam_channel::unbounded();
+        let mut cfg = config(receiver(rx, mac, et), samples);
+        cfg.timeouts = quick();
+        cfg.opener_hint = hint;
+        AirPlaySession::start(cfg)
+    }
+
+    fn methods(rx: &FakeRaop) -> Vec<String> {
+        rx.requests().iter().map(|r| format!("{} {}", r.conn, if r.method == "POST" { r.uri.as_str() } else { r.method.as_str() })).collect()
+    }
+
+    /// An MFi dock that refuses `/auth-setup` and whose OPTIONS doesn't
+    /// list POST connects on the second attempt, opened the way OwnTone
+    /// opens it.
+    #[test]
+    fn a_receiver_that_refuses_auth_setup_is_opened_the_reference_way() {
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.uri.as_str()) {
+            ("POST", "/auth-setup") => Answer::Reply(Reply::status(404, "Not Found")),
+            ("OPTIONS", _) => options_without_post(),
+            _ => Answer::Normal,
+        });
+        let session = start(&rx, "0B0000000010", &[0, 4], None).expect("the second attempt connects");
+        assert_eq!(session.opener(), Opener::OptionsThenAuthSetup);
+        session.stop();
+        assert_eq!(methods(&rx), ["0 /auth-setup", "1 OPTIONS", "1 ANNOUNCE", "1 SETUP", "1 RECORD", "1 SET_PARAMETER", "1 TEARDOWN"]);
+        // The reference order's OPTIONS carries no challenge.
+        assert_eq!(rx.requests()[1].header("Apple-Challenge"), None);
+        // A pause between the two attempts.
+        let first_end = rx.closed_at(0).expect("first connection closed");
+        assert!(rx.connected_at(1).unwrap() >= first_end + quick().retry_pause - Duration::from_millis(50));
+    }
+
+    /// One that never answers `/auth-setup` but lists POST: the second
+    /// attempt asks once more, gives up on it, and goes on to ANNOUNCE on
+    /// the same connection.
+    #[test]
+    fn a_receiver_that_never_answers_auth_setup_is_opened_without_it() {
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.uri.as_str()) {
+            ("POST", "/auth-setup") => Answer::Ignore,
+            _ => Answer::Normal,
+        });
+        let session = start(&rx, "0B0000000011", &[0, 4], None).expect("connects without auth-setup");
+        assert_eq!(session.opener(), Opener::OptionsThenAuthSetup);
+        session.stop();
+        assert_eq!(methods(&rx), ["0 /auth-setup", "1 OPTIONS", "1 /auth-setup", "1 ANNOUNCE", "1 SETUP", "1 RECORD", "1 SET_PARAMETER", "1 TEARDOWN"]);
+    }
+
+    /// A first attempt that fails after ANNOUNCE is ended with TEARDOWN
+    /// before the second one starts.
+    #[test]
+    fn the_first_attempt_is_torn_down_before_the_second() {
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
+            ("SETUP", 0) => Answer::Ignore,
+            _ => Answer::Normal,
+        });
+        let session = start(&rx, "0B0000000012", &[0, 4], None).expect("the second attempt connects");
+        session.stop();
+        let m = methods(&rx);
+        assert_eq!(m[..4], ["0 /auth-setup", "0 ANNOUNCE", "0 SETUP", "0 TEARDOWN"]);
+        assert_eq!(m[4..7], ["1 OPTIONS", "1 /auth-setup", "1 ANNOUNCE"]);
+    }
+
+    /// A receiver remembered as needing the reference order is opened that
+    /// way first; if that fails, the usual way is tried next.
+    #[test]
+    fn a_remembered_opener_goes_first() {
+        let rx = FakeRaop::start(|_| Answer::Normal);
+        let session = start(&rx, "0B0000000013", &[0, 4], Some(Opener::OptionsThenAuthSetup)).expect("connects");
+        assert_eq!(session.opener(), Opener::OptionsThenAuthSetup);
+        session.stop();
+        assert_eq!(methods(&rx)[..3], ["0 OPTIONS", "0 /auth-setup", "0 ANNOUNCE"]);
+
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
+            ("OPTIONS", 0) => Answer::Close,
+            _ => Answer::Normal,
+        });
+        let session = start(&rx, "0B0000000014", &[0, 4], Some(Opener::OptionsThenAuthSetup)).expect("the usual way connects");
+        assert_eq!(session.opener(), Opener::AuthSetup);
+        session.stop();
+        assert_eq!(methods(&rx)[..3], ["0 OPTIONS", "1 /auth-setup", "1 ANNOUNCE"]);
+    }
+
+    #[test]
+    fn only_the_reference_order_is_remembered() {
+        assert_eq!(next_opener_memory(Some(Opener::OptionsThenAuthSetup)), Some(Opener::OptionsThenAuthSetup));
+        assert_eq!(next_opener_memory(Some(Opener::AuthSetup)), None);
+        assert_eq!(next_opener_memory(Some(Opener::Options)), None);
+        assert_eq!(next_opener_memory(None), None);
+    }
+
+    /// Receivers that also offer AirPlay 2 (Sonos), plain ones, and an
+    /// attempt that got as far as an answered RECORD get no second try.
+    #[test]
+    fn no_second_attempt_where_it_cannot_help() {
+        // Sonos class: its fallback is AirPlay 2.
+        let rx = FakeRaop::start(|req| match req.uri.as_str() {
+            "/auth-setup" => Answer::Reply(Reply::status(404, "Not Found")),
+            _ => Answer::Normal,
+        });
+        let (_tx, samples) = crossbeam_channel::unbounded();
+        let mut r = receiver(&rx, "0B0000000015", &[0, 4]);
+        r.features = Some(crate::airplay::discovery::FEAT_AUDIO | crate::airplay::discovery::FEAT_TRANSIENT_PAIRING);
+        r.airplay_port = Some(7000);
+        let mut cfg = config(r, samples);
+        cfg.timeouts = quick();
+        assert!(AirPlaySession::start(cfg).is_err());
+        assert_eq!(methods(&rx), ["0 /auth-setup"]);
+
+        // Plain receiver.
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "ANNOUNCE" => Answer::Reply(Reply::status(500, "Internal Server Error")),
+            _ => Answer::Normal,
+        });
+        assert!(start(&rx, "0B0000000016", &[0, 1], None).is_err());
+        assert_eq!(methods(&rx), ["0 OPTIONS", "0 ANNOUNCE"]);
+
+        // RECORD answered with an error.
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "RECORD" => Answer::Reply(Reply::status(500, "Internal Server Error")),
+            _ => Answer::Normal,
+        });
+        assert!(start(&rx, "0B0000000017", &[0, 4], None).is_err());
+        assert!(rx.requests().iter().all(|r| r.conn == 0), "{:?}", rx.lines());
+
+        // TCP connect refused: nothing to open.
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let (_tx, samples) = crossbeam_channel::unbounded();
+        let mut r = receiver(&rx, "0B0000000018", &[0, 4]);
+        r.port = port;
+        let mut cfg = config(r, samples);
+        // A pause long against everything else a failed start does
+        // (stopping the timing thread takes up to half a second).
+        cfg.timeouts = RaopTimeouts { retry_pause: Duration::from_secs(6), ..quick() };
+        let started = Instant::now();
+        assert!(AirPlaySession::start(cfg).is_err());
+        assert!(started.elapsed() < Duration::from_secs(6), "no pause and no second attempt");
+    }
+
+    #[test]
+    fn a_remembered_opener_reads_leniently() {
+        #[derive(serde::Deserialize)]
+        struct S {
+            #[serde(default, deserialize_with = "deserialize_opener_lenient")]
+            o: Option<Opener>,
+        }
+        let read = |j: &str| serde_json::from_str::<S>(j).unwrap().o;
+        assert_eq!(read(r#"{"o":"options-then-auth-setup"}"#), Some(Opener::OptionsThenAuthSetup));
+        assert_eq!(read(r#"{"o":"something-newer"}"#), None);
+        assert_eq!(read(r#"{"o":7}"#), None);
+        assert_eq!(read(r#"{"o":null}"#), None);
+        assert_eq!(read(r#"{}"#), None);
     }
 
     /// A bring-up that fails after ANNOUNCE tells the receiver, so it

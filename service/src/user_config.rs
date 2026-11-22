@@ -251,6 +251,14 @@ pub struct SpeakerSettings {
     pub hidden: bool,
     #[serde(default)]
     pub auto_connect: AutoConnect,
+    /// The AirPlay 1 opener that worked for this speaker when it wasn't
+    /// the usual one; tried first next time, forgotten when it fails.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::airplay::session::deserialize_opener_lenient"
+    )]
+    pub airplay_opener: Option<crate::airplay::session::Opener>,
     /// AirPlay buffer for this speaker, overriding `airplay_latency_ms`.
     #[serde(default)]
     pub airplay_latency_ms: Option<u32>,

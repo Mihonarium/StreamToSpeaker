@@ -47,6 +47,7 @@ pub(crate) fn config(renderer: AirPlayRenderer, samples: crossbeam_channel::Rece
         samples_rx: samples,
         initial_volume: Some(80),
         timeouts: RaopTimeouts::STANDARD,
+        opener_hint: None,
         mfi_encryption: false,
         uncompressed_alac: false,
         password: None,

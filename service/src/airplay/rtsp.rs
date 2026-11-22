@@ -59,6 +59,31 @@ pub struct ServerPorts {
     pub audio_latency: Option<u32>,
 }
 
+/// What a receiver answered to OPTIONS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionsReply {
+    pub status: u16,
+    pub reason: String,
+    /// The methods its `Public` header lists, as sent.
+    pub methods: Vec<String>,
+}
+
+impl OptionsReply {
+    fn of(resp: &RtspResponse) -> Self {
+        let methods = resp
+            .headers
+            .get("public")
+            .map(|p| p.split(',').map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect())
+            .unwrap_or_default();
+        Self { status: resp.status_code, reason: resp.status_text.clone(), methods }
+    }
+
+    /// Does `Public` list `method`?
+    pub fn lists(&self, method: &str) -> bool {
+        self.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+    }
+}
+
 /// The receiver's advertised `Audio-Latency` header (samples), if any.
 /// Sent on SETUP and/or RECORD responses depending on the receiver.
 fn audio_latency_of(resp: &RtspResponse) -> Option<u32> {
@@ -343,7 +368,10 @@ impl RtspClient {
     /// public key for *verification*, which we don't have a clean way
     /// to derive — receivers sign with their own key); just sending
     /// the challenge is sufficient to make most receivers happy.
-    pub fn options(&mut self) -> Result<()> {
+    ///
+    /// Whatever the status, the handshake goes on (some receivers don't
+    /// implement OPTIONS and answer 501); the caller gets the answer.
+    pub fn options(&mut self) -> Result<OptionsReply> {
         let challenge = random_apple_challenge();
         let challenge_b64 = base64_nopad(&challenge);
         let extra = vec![("Apple-Challenge".to_string(), challenge_b64)];
@@ -353,7 +381,18 @@ impl RtspClient {
             resp.headers.get("public").map(|s| s.as_str()).unwrap_or(""),
             resp.headers.contains_key("apple-response"),
         );
-        Ok(())
+        Ok(OptionsReply::of(&resp))
+    }
+
+    /// `OPTIONS *` with nothing added, the opener OwnTone sends: no
+    /// challenge (OwnTone adds one only to an encrypted ANNOUNCE).
+    pub fn options_plain(&mut self) -> Result<OptionsReply> {
+        let resp = self.request("OPTIONS", "*", &[], "")?;
+        debug!(
+            "RTSP OPTIONS: Public='{}'",
+            resp.headers.get("public").map(|s| s.as_str()).unwrap_or("")
+        );
+        Ok(OptionsReply::of(&resp))
     }
 
     /// Bare `OPTIONS *` keepalive — sent every couple of seconds during
@@ -495,14 +534,12 @@ impl RtspClient {
         // Response: [32B receiver X25519 pubkey][4B certlen][cert]
         //           [4B siglen][sig]. We need the first 32 bytes to
         // complete the ECDH.
-        if resp.body.len() < 32 {
-            bail!(
+        let their_pub: [u8; 32] = resp.body.get(..32).and_then(|b| b.try_into().ok()).ok_or_else(|| {
+            anyhow!(
                 "auth-setup response too short ({}B, need ≥32 for the receiver pubkey)",
                 resp.body.len()
-            );
-        }
-        let mut their_pub = [0u8; 32];
-        their_pub.copy_from_slice(&resp.body[..32]);
+            )
+        })?;
         let shared = secret.diffie_hellman(&PublicKey::from(their_pub));
         debug!(
             "auth-setup OK ({}B response, ECDH shared secret derived)",

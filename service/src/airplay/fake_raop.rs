@@ -241,23 +241,29 @@ impl FakeRaop {
             ports,
         });
         let datagrams: Arc<[AtomicU64; 3]> = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
-        let udp = sockets
-            .into_iter()
-            .enumerate()
-            .map(|(i, sock)| {
-                let shared = shared.clone();
-                let datagrams = datagrams.clone();
-                std::thread::spawn(move || {
-                    sock.set_read_timeout(Some(POLL)).ok();
-                    let mut buf = [0u8; 2048];
-                    while !shared.stop.load(Ordering::Acquire) {
-                        if sock.recv_from(&mut buf).is_ok() {
+        // One thread drains all three UDP ports.
+        let udp = {
+            let shared = shared.clone();
+            let datagrams = datagrams.clone();
+            vec![std::thread::spawn(move || {
+                for sock in &sockets {
+                    sock.set_nonblocking(true).ok();
+                }
+                let mut buf = [0u8; 2048];
+                while !shared.stop.load(Ordering::Acquire) {
+                    let mut idle = true;
+                    for (i, sock) in sockets.iter().enumerate() {
+                        while sock.recv_from(&mut buf).is_ok() {
                             datagrams[i].fetch_add(1, Ordering::Relaxed);
+                            idle = false;
                         }
                     }
-                })
-            })
-            .collect();
+                    if idle {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            })]
+        };
 
         let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let accept = {
@@ -271,8 +277,12 @@ impl FakeRaop {
                             let conn = next;
                             next += 1;
                             shared.push(Event::Connected { conn, at: Instant::now() });
-                            let shared = shared.clone();
-                            threads.lock().unwrap().push(std::thread::spawn(move || serve(conn, sock, &shared)));
+                            let worker = shared.clone();
+                            // Out of threads: the connection is dropped, as a
+                            // receiver that can't serve it would.
+                            if let Ok(h) = std::thread::Builder::new().spawn(move || serve(conn, sock, &worker)) {
+                                threads.lock().unwrap_or_else(|e| e.into_inner()).push(h);
+                            }
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(POLL),
                         Err(_) => std::thread::sleep(POLL),
@@ -389,7 +399,7 @@ impl Drop for FakeRaop {
         if let Some(a) = self.accept.take() {
             let _ = a.join();
         }
-        let threads: Vec<_> = self.threads.lock().unwrap().drain(..).collect();
+        let threads: Vec<_> = self.threads.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
         for t in threads {
             let _ = t.join();
         }

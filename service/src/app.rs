@@ -2660,13 +2660,15 @@ impl App {
         match transport {
             Transport::RaopLegacy => {
                 let samples_rx = self.hub.subscribe();
-                let (mfi_encryption, uncompressed_alac, password, latency_ms) = {
+                let stable_id = renderer.stable_id();
+                let (mfi_encryption, uncompressed_alac, password, latency_ms, opener_hint) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.airplay_mfi_encryption,
                         uc.airplay_uncompressed_alac,
-                        uc.airplay_passwords.get(&renderer.stable_id()).cloned(),
-                        uc.airplay_latency_ms_for(&renderer.stable_id()),
+                        uc.airplay_passwords.get(&stable_id).cloned(),
+                        uc.airplay_latency_ms_for(&stable_id),
+                        uc.speaker_settings.get(&stable_id).and_then(|s| s.airplay_opener),
                     )
                 };
                 // A connect that takes long says what it waits for, in
@@ -2684,10 +2686,18 @@ impl App {
                         uncompressed_alac,
                         password,
                         latency_ms,
+                        opener_hint,
                     },
                     &notice,
-                )
-                .map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
+                );
+                // Start with the opener that worked last time, until it fails.
+                let remembered = crate::airplay::session::next_opener_memory(session.as_ref().ok().map(|s| s.opener()));
+                if remembered != opener_hint {
+                    let mut settings = self.speaker_settings(&stable_id);
+                    settings.airplay_opener = remembered;
+                    self.set_speaker_settings(&stable_id, settings);
+                }
+                let session = session.map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
                 Ok(ActiveSession::AirPlay(session))
             }
             Transport::AirPlay2 => {
