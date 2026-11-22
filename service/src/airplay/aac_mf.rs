@@ -1,9 +1,9 @@
 //! AAC-LC encoding via the Windows-provided Media Foundation encoder.
 //!
-//! AirPlay 2 buffered audio (type 103) from real iOS senders is AAC-LC
-//! 44100/2 — and field testing suggests current Sonos firmware only truly
-//! *plays* that combination (it accepts SETUPs for ALAC/realtime/NTP the
-//! way it accepts RAOP: vestigially, without sound). Windows ships an
+//! AirPlay 2 buffered audio (type 103) from Apple's senders is AAC-LC
+//! 44100/2, which is what they use with a Sonos too (a Sonos accepts SETUPs
+//! for ALAC, realtime and NTP the way it accepts RAOP: without sound). This
+//! app's buffered AAC has not been heard on a Sonos. Windows ships an
 //! AAC-LC encoder MFT (`CLSID_AACMFTEncoder`, Windows 7+), so no
 //! third-party codec or license is needed.
 //!
@@ -36,15 +36,17 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SDK_VERSION,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_MOD_NOT_FOUND};
+use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError, ERROR_MOD_NOT_FOUND};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 
 use crate::WIRE_SAMPLE_RATE;
 
 /// The four Media Foundation functions the encoder calls, from the system's
-/// own `mfplat.dll`. Found once per process, the first time an encoder is
-/// made; a missing library or function is an ordinary error, on which the
-/// session's probe chooses the realtime stream.
+/// own `mfplat.dll`. Found the first time an encoder is made and kept for
+/// the life of the process once found; a missing library or function is an
+/// ordinary error, on which the session's probe chooses the realtime stream,
+/// and is tried again the next time an encoder is needed (once per session
+/// start).
 struct MfPlat {
     startup: unsafe extern "system" fn(version: u32, flags: u32) -> HRESULT,
     create_media_type: unsafe extern "system" fn(out: *mut *mut c_void) -> HRESULT,
@@ -54,8 +56,13 @@ struct MfPlat {
 
 impl MfPlat {
     fn get() -> Result<&'static MfPlat> {
-        static MFPLAT: OnceLock<std::result::Result<MfPlat, String>> = OnceLock::new();
-        MFPLAT.get_or_init(MfPlat::load).as_ref().map_err(|e| anyhow!("{e}"))
+        static MFPLAT: OnceLock<MfPlat> = OnceLock::new();
+        if let Some(api) = MFPLAT.get() {
+            return Ok(api);
+        }
+        // A failure isn't kept: it may be one that passes.
+        let api = MfPlat::load().map_err(|e| anyhow!("{e}"))?;
+        Ok(MFPLAT.get_or_init(|| api))
     }
 
     fn load() -> std::result::Result<MfPlat, String> {
@@ -66,8 +73,11 @@ impl MfPlat {
         if module.is_null() {
             let code = unsafe { GetLastError() };
             return Err(if code == ERROR_MOD_NOT_FOUND {
-                "Media Foundation is not installed on this PC: there is no mfplat.dll in System32. \
-                 Windows N editions get it with the Media Feature Pack"
+                // Also what Windows says when mfplat.dll is there but a
+                // library it needs isn't.
+                "Media Foundation could not be loaded: mfplat.dll, or a library it needs, is missing \
+                 from System32. Windows N editions get it with the Media Feature Pack, Windows Server \
+                 with its Media Foundation feature"
                     .to_string()
             } else {
                 format!("Media Foundation (mfplat.dll) could not be loaded: {}", os_error(code))
@@ -80,16 +90,22 @@ impl MfPlat {
                 format!("mfplat.dll has no {name}: {}", os_error(code))
             })
         };
-        // SAFETY: each pointer is the named export of mfplat.dll, whose
-        // signature is the one declared in `MfPlat` (mfapi.h).
-        unsafe {
-            Ok(MfPlat {
-                startup: std::mem::transmute(find(b"MFStartup\0")?),
-                create_media_type: std::mem::transmute(find(b"MFCreateMediaType\0")?),
-                create_sample: std::mem::transmute(find(b"MFCreateSample\0")?),
-                create_memory_buffer: std::mem::transmute(find(b"MFCreateMemoryBuffer\0")?),
-            })
-        }
+        let resolve = || -> std::result::Result<MfPlat, String> {
+            // SAFETY: each pointer is the named export of mfplat.dll, whose
+            // signature is the one declared in `MfPlat` (mfapi.h).
+            unsafe {
+                Ok(MfPlat {
+                    startup: std::mem::transmute(find(b"MFStartup\0")?),
+                    create_media_type: std::mem::transmute(find(b"MFCreateMediaType\0")?),
+                    create_sample: std::mem::transmute(find(b"MFCreateSample\0")?),
+                    create_memory_buffer: std::mem::transmute(find(b"MFCreateMemoryBuffer\0")?),
+                })
+            }
+        };
+        resolve().inspect_err(|_| {
+            // Not kept, so a later attempt doesn't add a reference each time.
+            unsafe { FreeLibrary(module) };
+        })
     }
 
     unsafe fn startup(&self, version: u32, flags: u32) -> windows::core::Result<()> {
