@@ -273,6 +273,12 @@ impl AirPlay2Session {
         let faults = FaultSlot::new(dead.clone(), cfg.renderer.friendly_name.clone());
         let mut bring_up = BringUp::new(&stop_flag, &faults);
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
+        // Shared from RECORD on (the buffered sender anchors on it, the
+        // feedback keepalive posts to it, volume changes arrive from other
+        // threads); held by the bring-up until then.
+        let rtsp = Arc::new(Mutex::new(rtsp));
+        bring_up.hold(&rtsp);
+        let mut conn = rtsp.lock().unwrap();
 
         // Timing-protocol choice: receivers advertising SupportsPTP (bit 41)
         // get the full PTP path — field-tested on a SYMFONISK whose current
@@ -288,24 +294,20 @@ impl AirPlay2Session {
             if use_ptp { "PTP (we serve as grandmaster)" } else { "NTP" },
             cfg.renderer.model.as_deref().unwrap_or("?"),
         );
-        let (ptp_session, timing_setup) = if use_ptp {
-            let ptp = spawn_ptp_master_on(
-                &[cfg.renderer.ip],
-                cfg.local_ip,
-                env.ptp_ports,
-                cfg.renderer.friendly_name.clone(),
-                homepod,
-            )
-            .context("starting AP2 PTP master")?;
-            let ts = rtsp
-                .setup_timing_ptp(ptp.timeline.clock_id, &ptp.clock_uuid)
-                .context("AP2 SETUP(timing/PTP)")?;
-            (Some(ptp), ts)
+        let timing_setup = if use_ptp {
+            let ptp = bring_up.ptp.insert(
+                spawn_ptp_master_on(
+                    &[cfg.renderer.ip],
+                    cfg.local_ip,
+                    env.ptp_ports,
+                    cfg.renderer.friendly_name.clone(),
+                    homepod,
+                )
+                .context("starting AP2 PTP master")?,
+            );
+            conn.setup_timing_ptp(ptp.timeline.clock_id, &ptp.clock_uuid).context("AP2 SETUP(timing/PTP)")?
         } else {
-            let ts = rtsp
-                .setup_timing_ntp(timing_port)
-                .context("AP2 SETUP(timing/NTP)")?;
-            (None, ts)
+            conn.setup_timing_ntp(timing_port).context("AP2 SETUP(timing/NTP)")?
         };
         let event_port = timing_setup.event_port;
 
@@ -358,21 +360,21 @@ impl AirPlay2Session {
             }
         }
         let (ports, buffered) = if want_buffered {
-            match rtsp.setup_stream_buffered(&audio_key, control_port, 4, BUFFERED_SPF as u64, 0x400000, DEFAULT_LATENCY_SAMPLES) {
+            match conn.setup_stream_buffered(&audio_key, control_port, 4, BUFFERED_SPF as u64, 0x400000, DEFAULT_LATENCY_SAMPLES) {
                 Ok(p) => {
                     info!("AirPlay 2: buffered stream accepted (type 103/AAC-LC, TCP data port {})", p.data);
                     (p, true)
                 }
                 Err(e) => {
                     warn!("AirPlay 2: buffered SETUP rejected ({e:#}); falling back to realtime");
-                    let p = rtsp
+                    let p = conn
                         .setup_stream(&audio_key, control_port, latency_samples)
                         .context("AP2 SETUP(stream, realtime fallback)")?;
                     (p, false)
                 }
             }
         } else {
-            let p = rtsp
+            let p = conn
                 .setup_stream(&audio_key, control_port, latency_samples)
                 .context("AP2 SETUP(stream)")?;
             (p, false)
@@ -403,17 +405,17 @@ impl AirPlay2Session {
         if use_ptp {
             // Hand the receiver the PTP peer address list. OwnTone's order:
             // receiver's address first, then the sender's.
-            if let Err(e) = rtsp.set_peers(&[cfg.renderer.ip, cfg.local_ip]) {
+            if let Err(e) = conn.set_peers(&[cfg.renderer.ip, cfg.local_ip]) {
                 warn!("AirPlay 2 SETPEERS failed (PTP may not lock): {}", e);
             }
         }
 
-        rtsp.record().context("AP2 RECORD")?;
+        conn.record().context("AP2 RECORD")?;
 
         let volume = Arc::new(Mutex::new(VolumeTracker::default()));
         if let Some(vol) = cfg.initial_volume {
             let seq = volume.lock().unwrap().on_write(vol, Instant::now());
-            if let Err(e) = rtsp.set_volume(volume_pct_to_raop_db(vol)) {
+            if let Err(e) = conn.set_volume(volume_pct_to_raop_db(vol)) {
                 warn!("AirPlay 2 initial volume failed: {}", e);
                 volume.lock().unwrap().on_write_failed(seq);
             }
@@ -422,7 +424,7 @@ impl AirPlay2Session {
         // From here the RTSP connection is shared: the buffered sender
         // anchors on it at first audio, the feedback keepalive posts to it,
         // and volume changes arrive from arbitrary threads.
-        let rtsp = Arc::new(Mutex::new(rtsp));
+        drop(conn);
 
         // Background threads.
         let initial_seq = random_initial_seq();
@@ -463,10 +465,10 @@ impl AirPlay2Session {
                 current_rtptime: current_rtptime.clone(),
                 last_seq,
                 rtsp: rtsp.clone(),
-                timeline: ptp_session.as_ref().unwrap().timeline.clone(),
+                timeline: bring_up.ptp.as_ref().expect("buffered implies PTP").timeline.clone(),
                 encoder: aac_encoder(),
                 anchor_retry: AnchorRetry::new(),
-                ptp_ports_problem: ptp_session.as_ref().and_then(|p| p.ports_problem()).map(str::to_string),
+                ptp_ports_problem: bring_up.ptp.as_ref().and_then(|p| p.ports_problem()).map(str::to_string),
                 faults: faults.clone(),
             })?);
             info!("AirPlay 2: buffered AAC-LC stream armed — will anchor at first audio");
@@ -481,7 +483,7 @@ impl AirPlay2Session {
             // packet arrives — same ordering rule as the RAOP path.
             let sync_addr = SocketAddr::new(cfg.renderer.ip, ports.control);
             if use_ptp {
-                let ptp = ptp_session.as_ref().unwrap();
+                let ptp = bring_up.ptp.as_ref().expect("use_ptp started the PTP master");
                 let sync = spawn_sync_sender_ptp(
                     control_socket,
                     sync_addr,
@@ -590,6 +592,7 @@ impl AirPlay2Session {
                 spawn_volume_reader(rtsp.clone(), volume.clone(), stop_flag.clone(), cfg.renderer.friendly_name.clone());
         }
 
+        let (threads, ptp_session) = bring_up.finish();
         Ok(Self {
             renderer: cfg.renderer,
             rtsp,
@@ -599,7 +602,7 @@ impl AirPlay2Session {
             faults,
             volume,
             resend_stats,
-            threads: bring_up.finish(),
+            threads,
             ptp_session,
             buffered_flush,
             data_stream,
@@ -662,7 +665,7 @@ impl AirPlay2Session {
 
         struct Pending {
             renderer: AirPlayRenderer,
-            rtsp: Ap2Rtsp,
+            rtsp: Arc<Mutex<Ap2Rtsp>>,
             audio_key: [u8; 32],
             event_ciphers: Option<(ChannelCipher, ChannelCipher)>,
             audio_socket: Option<UdpSocket>,
@@ -703,6 +706,8 @@ impl AirPlay2Session {
             };
             info!("AirPlay 2: paired with {}", r.friendly_name);
             let event_ciphers = rtsp.take_event_ciphers();
+            let rtsp = Arc::new(Mutex::new(rtsp));
+            bring_up.hold(&rtsp);
             pending.push(Pending {
                 renderer: r.clone(),
                 rtsp,
@@ -715,16 +720,18 @@ impl AirPlay2Session {
 
         // 2. One grandmaster for every member.
         let member_ips: Vec<IpAddr> = members.iter().map(|r| r.ip).collect();
-        let mut ptp_guard = PtpGuard(Some(
-            spawn_ptp_master(&member_ips, cfg.local_ip, label.clone(), true).context("starting AP2 PTP master")?,
-        ));
-        let ptp = ptp_guard.0.as_ref().expect("just set");
+        let ptp = bring_up
+            .ptp
+            .insert(spawn_ptp_master(&member_ips, cfg.local_ip, label.clone(), true).context("starting AP2 PTP master")?);
+        let (ptp_clock_id, ptp_clock_uuid, ptp_clock) = (ptp.timeline.clock_id, ptp.clock_uuid.clone(), ptp.timeline.clock.clone());
 
         // 3. Session SETUP + event channel.
         for p in &mut pending {
             let ts = p
                 .rtsp
-                .setup_timing_ptp_homepod(ptp.timeline.clock_id, &ptp.clock_uuid, crate::PRODUCT_NAME)
+                .lock()
+                .unwrap()
+                .setup_timing_ptp_homepod(ptp_clock_id, &ptp_clock_uuid, crate::PRODUCT_NAME)
                 .with_context(|| format!("AP2 SETUP(session) to {}", p.renderer.friendly_name))?;
             if ts.event_port == 0 {
                 return Err(anyhow::anyhow!("{}: SETUP response has no eventPort", p.renderer.friendly_name).into());
@@ -746,7 +753,7 @@ impl AirPlay2Session {
         let mut peers = member_ips.clone();
         peers.push(cfg.local_ip);
         for p in &mut pending {
-            if let Err(e) = p.rtsp.set_peers(&peers) {
+            if let Err(e) = p.rtsp.lock().unwrap().set_peers(&peers) {
                 warn!("AirPlay 2 SETPEERS to {} failed (PTP may not lock): {:#}", p.renderer.friendly_name, e);
             }
         }
@@ -762,6 +769,8 @@ impl AirPlay2Session {
             let first_seq = random_initial_seq();
             let (ports, reported) = p
                 .rtsp
+                .lock()
+                .unwrap()
                 .setup_stream_pinned(&p.audio_key, control_port, codec, latency_samples, ssrc)
                 .with_context(|| format!("AP2 SETUP(stream) to {}", p.renderer.friendly_name))?;
             let effective = match reported {
@@ -799,6 +808,8 @@ impl AirPlay2Session {
         // 6. RECORD + FLUSH naming each member's first packet.
         for (p, l) in pending.iter_mut().zip(&links) {
             p.rtsp
+                .lock()
+                .unwrap()
                 .record_and_flush_at(l.seq, initial_rtptime)
                 .with_context(|| format!("AP2 RECORD to {}", p.renderer.friendly_name))?;
         }
@@ -808,7 +819,7 @@ impl AirPlay2Session {
         if let Some(vol) = cfg.initial_volume {
             let seq = volume.lock().unwrap().on_write(vol, Instant::now());
             for p in &mut pending {
-                if let Err(e) = p.rtsp.set_volume(volume_pct_to_raop_db(vol)) {
+                if let Err(e) = p.rtsp.lock().unwrap().set_volume(volume_pct_to_raop_db(vol)) {
                     warn!("AirPlay 2 initial volume to {} failed: {}", p.renderer.friendly_name, e);
                     volume.lock().unwrap().on_write_failed(seq);
                 }
@@ -816,7 +827,7 @@ impl AirPlay2Session {
         }
 
         // 7. Media, keepalives, read-back.
-        let group = RealtimeGroup::new(links, initial_rtptime, ptp.timeline.clock.clone(), ptp.timeline.clock_id);
+        let group = RealtimeGroup::new(links, initial_rtptime, ptp_clock, ptp_clock_id);
         bring_up.threads.sender = Some(crate::airplay::ap2_realtime::spawn(RealtimeRun {
             group,
             codec,
@@ -829,7 +840,7 @@ impl AirPlay2Session {
 
         let mut conns = pending
             .into_iter()
-            .map(|p| (p.renderer.friendly_name, Arc::new(Mutex::new(p.rtsp))));
+            .map(|p| (p.renderer.friendly_name, p.rtsp));
         let (leader_name, rtsp) = conns.next().expect("at least one member");
         let followers: Vec<(String, Arc<Mutex<Ap2Rtsp>>)> = conns.collect();
         bring_up.threads.feedback =
@@ -846,7 +857,7 @@ impl AirPlay2Session {
         bring_up.threads.volume = spawn_volume_reader(rtsp.clone(), volume.clone(), stop_flag.clone(), leader_name);
 
         info!("AirPlay 2: HomePod realtime session up — {}", label);
-        let ptp = ptp_guard.0.take().expect("set at bring-up");
+        let (threads, ptp_session) = bring_up.finish();
         Ok(Self {
             renderer: cfg.renderer,
             rtsp,
@@ -856,8 +867,8 @@ impl AirPlay2Session {
             faults,
             volume,
             resend_stats,
-            threads: bring_up.finish(),
-            ptp_session: Some(ptp),
+            threads,
+            ptp_session,
             buffered_flush: None,
             data_stream: None,
             _audio_socket: None,
@@ -1013,28 +1024,48 @@ impl SessionThreads {
     }
 }
 
-/// A bring-up in progress and the threads it has started. If a step fails
-/// (this is dropped before [`BringUp::finish`]), the threads are told to
-/// stop and waited for, so they have closed their connections (the event
-/// channel among them) before the error is returned.
+/// A bring-up in progress: the threads it has started, its PTP
+/// registration and its control connections. If a step fails (this is
+/// dropped before [`BringUp::finish`]), it ends them in this order: stop
+/// flag set and every thread joined, so the threads have closed their
+/// connections (the event channel among them) and none can take the
+/// receiver's reaction to the teardown for a dropped session; then the PTP
+/// registration leaves; then the control connections are let go, and the
+/// last reference to each sends TEARDOWN (once paired). Declaration order
+/// in the bring-up code doesn't matter: the bring-up holds a reference to
+/// every connection until its own drop.
 struct BringUp {
     stop_flag: Arc<AtomicBool>,
     faults: FaultSlot,
     threads: SessionThreads,
+    ptp: Option<PtpMaster>,
+    conns: Vec<Arc<Mutex<Ap2Rtsp>>>,
     finished: bool,
 }
 
 impl BringUp {
     fn new(stop_flag: &Arc<AtomicBool>, faults: &FaultSlot) -> Self {
-        Self { stop_flag: stop_flag.clone(), faults: faults.clone(), threads: SessionThreads::default(), finished: false }
+        Self {
+            stop_flag: stop_flag.clone(),
+            faults: faults.clone(),
+            threads: SessionThreads::default(),
+            ptp: None,
+            conns: Vec::new(),
+            finished: false,
+        }
     }
 
-    /// The bring-up succeeded: the threads now belong to the session, and
-    /// its faults count for the repeat rule from now on.
-    fn finish(mut self) -> SessionThreads {
+    /// Keep `conn` until the bring-up has ended its threads.
+    fn hold(&mut self, conn: &Arc<Mutex<Ap2Rtsp>>) {
+        self.conns.push(conn.clone());
+    }
+
+    /// The bring-up succeeded: the threads and the PTP registration now
+    /// belong to the session, and its faults count for the repeat rule.
+    fn finish(mut self) -> (SessionThreads, Option<PtpMaster>) {
         self.finished = true;
         self.faults.arm(Instant::now());
-        std::mem::take(&mut self.threads)
+        (std::mem::take(&mut self.threads), self.ptp.take())
     }
 }
 
@@ -1043,19 +1074,9 @@ impl Drop for BringUp {
         if !self.finished {
             self.stop_flag.store(true, Ordering::Release);
             self.threads.join();
+            drop(self.ptp.take());
         }
-    }
-}
-
-/// Stops and joins the PTP master when dropped (unless taken), so a
-/// failed bring-up releases ports 319/320 before a retry binds them.
-struct PtpGuard(Option<PtpMaster>);
-
-impl Drop for PtpGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.0.take() {
-            p.stop();
-        }
+        self.conns.clear();
     }
 }
 
@@ -2313,6 +2334,46 @@ mod tests {
         // one sends TEARDOWN first; this test's is unpaired).
         let lines = peer.join().unwrap();
         assert_eq!(lines.len(), 2, "SETUP(timing) and the refused SETUP(stream): {lines:?}");
+    }
+
+    /// A bring-up that fails stops and waits for its threads before it lets
+    /// go of its control connections. A receiver that answers the closing
+    /// control connection (or its TEARDOWN) by resetting the event channel
+    /// is therefore not taken for a session that dropped: no fault, and
+    /// nothing for the repeat rule.
+    #[test]
+    fn a_failed_bring_up_ends_its_threads_before_its_connections() {
+        use crate::airplay::test_peers::read_request;
+        use std::io::BufReader;
+        let events = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let event_port = events.local_addr().unwrap().port();
+        let control = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_port = control.local_addr().unwrap().port();
+        let receiver = std::thread::spawn(move || {
+            let (ctl, _) = control.accept().unwrap();
+            let (event, _) = events.accept().unwrap();
+            // Until the sender closes the control connection, then reset
+            // the event channel at once.
+            let mut r = BufReader::new(ctl);
+            while read_request(&mut r).is_some() {}
+            socket2::SockRef::from(&event).set_linger(Some(Duration::ZERO)).unwrap();
+            drop(event);
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let faults = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Order test HomePod".into());
+        {
+            let mut bring_up = BringUp::new(&stop_flag, &faults);
+            let rtsp = Arc::new(Mutex::new(Ap2Rtsp::connect(ip, control_port, ip, Duration::from_secs(5)).unwrap()));
+            bring_up.hold(&rtsp);
+            bring_up.threads.event =
+                spawn_event_channel(ip, event_port, None, stop_flag.clone(), faults.clone(), true, "Order test HomePod".into());
+            assert!(bring_up.threads.event.is_some());
+            // A later step fails here: everything above is dropped.
+        }
+        receiver.join().unwrap();
+        assert!(faults.get().is_none(), "the bring-up's own teardown was taken for a drop: {:?}", faults.get());
+        assert!(!faults.armed());
     }
 
     /// A realtime bring-up that succeeds sends its requests in the order it
