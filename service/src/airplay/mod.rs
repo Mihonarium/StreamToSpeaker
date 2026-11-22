@@ -45,6 +45,8 @@ pub mod ap2_session;
 pub mod crypto;
 pub mod discovery;
 pub mod dmap;
+#[cfg(test)]
+pub(crate) mod fake_raop;
 pub mod hap_pairing;
 pub mod pairing;
 pub mod rtp;
