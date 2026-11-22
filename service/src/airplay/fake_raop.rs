@@ -525,10 +525,30 @@ fn next_request(conn: usize, sock: &mut TcpStream, buf: &mut Vec<u8>, shared: &S
 mod tests {
     use super::*;
 
-    fn connect(rx: &FakeRaop) -> TcpStream {
+    /// A test client: the connection, and what it has read past the last
+    /// reply (two replies can arrive in one read).
+    struct Client {
+        s: TcpStream,
+        pending: Vec<u8>,
+    }
+
+    impl std::ops::Deref for Client {
+        type Target = TcpStream;
+        fn deref(&self) -> &TcpStream {
+            &self.s
+        }
+    }
+
+    impl std::ops::DerefMut for Client {
+        fn deref_mut(&mut self) -> &mut TcpStream {
+            &mut self.s
+        }
+    }
+
+    fn connect(rx: &FakeRaop) -> Client {
         let s = TcpStream::connect(("127.0.0.1", rx.port())).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        s
+        Client { s, pending: Vec::new() }
     }
 
     fn send(s: &mut TcpStream, method: &str, uri: &str, cseq: u32, body: &[u8]) {
@@ -541,13 +561,14 @@ mod tests {
         s.write_all(body).unwrap();
     }
 
-    /// Read until a whole reply (head and body) has arrived; also return
-    /// how many reads it took.
-    fn read_reply(s: &mut TcpStream) -> (String, usize) {
-        let mut buf = Vec::new();
+    /// Read until a whole reply (head and body) has arrived, keeping any
+    /// bytes after it for the next call; also return how many reads it
+    /// took.
+    fn read_reply(c: &mut Client) -> (String, usize) {
         let mut tmp = [0u8; 4096];
         let mut reads = 0;
         loop {
+            let buf = &c.pending;
             if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 let head = String::from_utf8_lossy(&buf[..end]).to_string();
                 let len = head
@@ -556,13 +577,15 @@ mod tests {
                     .map(|v| v.parse::<usize>().unwrap())
                     .unwrap_or(0);
                 if buf.len() >= end + 4 + len {
-                    return (String::from_utf8_lossy(&buf[..end + 4 + len]).to_string(), reads);
+                    let reply = String::from_utf8_lossy(&buf[..end + 4 + len]).to_string();
+                    c.pending.drain(..end + 4 + len);
+                    return (reply, reads);
                 }
             }
-            let n = s.read(&mut tmp).unwrap_or_else(|e| panic!("reading the reply: {e:?}"));
+            let n = c.s.read(&mut tmp).unwrap_or_else(|e| panic!("reading the reply: {e:?}"));
             assert!(n > 0, "connection closed mid-reply");
             reads += 1;
-            buf.extend_from_slice(&tmp[..n]);
+            c.pending.extend_from_slice(&tmp[..n]);
         }
     }
 
