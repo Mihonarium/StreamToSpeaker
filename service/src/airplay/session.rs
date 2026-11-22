@@ -208,13 +208,15 @@ impl std::fmt::Display for SignInNeeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = &self.name;
         match self.why {
+            // The window is where a password can be entered, also for a
+            // run without it (--headless): the stored one is used there.
             SignIn::PasswordNeeded => write!(
                 f,
-                "{name} asks for its AirPlay password. Pick {name} in the Stream To Speaker window to enter it."
+                "{name} asks for its AirPlay password. It can be entered in the Stream To Speaker window: pick {name} there."
             ),
             SignIn::PasswordRejected => write!(
                 f,
-                "{name} didn't accept the AirPlay password. Pick {name} in the Stream To Speaker window to enter it again."
+                "{name} didn't accept the AirPlay password. It can be changed in the Stream To Speaker window: pick {name} there."
             ),
             SignIn::Unsupported { .. } => write!(
                 f,
@@ -394,19 +396,17 @@ impl Progress {
             let now = Instant::now();
             let (stage, since) = (st.0, st.1);
             let waited = now.saturating_duration_since(since);
-            let left = |limit: Duration| limit.saturating_sub(waited).as_secs_f32().ceil() as u64;
             let line = match stage {
-                Stage::Waiting { limit } if waited >= slow_reply => Some(match left(limit) {
-                    0 | 1 => "it hasn't answered yet; waiting a moment longer.".to_string(),
-                    n => format!("it hasn't answered yet; waiting up to {} more seconds.", n),
-                }),
+                // Stated as facts that stay true while the line is shown,
+                // never as a countdown that goes stale.
+                Stage::Waiting { limit } if waited >= slow_reply => Some(format!(
+                    "it hasn't answered yet; the app waits up to {} seconds for each answer.",
+                    limit.as_secs().max(1)
+                )),
                 Stage::Pausing { why: Pause::AnotherWay, .. } => {
                     Some("the first try didn't work; trying once more another way.".to_string())
                 }
-                Stage::Pausing { why: Pause::Busy, limit } => Some(match left(limit) {
-                    0 | 1 => "it is busy; trying once more.".to_string(),
-                    n => format!("it is busy; trying once more in {} seconds.", n),
-                }),
+                Stage::Pausing { why: Pause::Busy, .. } => Some("it is busy; trying once more shortly.".to_string()),
                 _ => None,
             };
             if let Some(line) = line.filter(|_| now >= started + slow_connect && reported != Some(since)) {
@@ -1519,13 +1519,7 @@ mod tests {
         });
         let lines = lines.into_inner().unwrap();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        // About a second of the 15 has gone by when it is reported.
-        let left: u64 = lines[0]
-            .strip_prefix("it hasn't answered yet; waiting up to ")
-            .and_then(|r| r.split(' ').next())
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(0);
-        assert!((12..=15).contains(&left), "{lines:?}");
+        assert_eq!(lines[0], "it hasn't answered yet; the app waits up to 15 seconds for each answer.");
     }
 
     use crate::airplay::fake_raop::Reply;
@@ -1911,7 +1905,7 @@ mod tests {
         let err = start(&rx, "0B0000000060", &[0, 4], None).err().expect("refused");
         assert_eq!(
             format!("{:#}", err),
-            "Test Speaker asks for its AirPlay password. Pick Test Speaker in the Stream To Speaker window to enter it."
+            "Test Speaker asks for its AirPlay password. It can be entered in the Stream To Speaker window: pick Test Speaker there."
         );
         assert_eq!(err.downcast_ref::<SignInNeeded>().map(|s| s.why.clone()), Some(SignIn::PasswordNeeded));
         assert_eq!(methods(&rx), ["0 /auth-setup"]);
@@ -1969,7 +1963,7 @@ mod tests {
         });
         assert_eq!(
             lines.into_inner().unwrap(),
-            ["the first try didn't work; trying once more another way.", "it is busy; trying once more."]
+            ["the first try didn't work; trying once more another way.", "it is busy; trying once more shortly."]
         );
     }
 

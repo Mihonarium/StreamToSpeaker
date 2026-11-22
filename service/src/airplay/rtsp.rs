@@ -374,17 +374,22 @@ impl RtspClient {
         let Some(hdr) = resp.headers.get("www-authenticate") else {
             return false;
         };
-        let Some(rest) = hdr.strip_prefix("Digest ") else {
+        // The scheme and parameter names are case-insensitive (RFC 7235).
+        let Some((scheme, rest)) = hdr.trim_start().split_once(' ') else {
             return false;
         };
+        if !scheme.eq_ignore_ascii_case("Digest") {
+            return false;
+        }
         let mut realm = None;
         let mut nonce = None;
         for part in rest.split(',') {
-            let part = part.trim();
-            if let Some(v) = part.strip_prefix("realm=") {
-                realm = Some(v.trim().trim_matches('"').to_string());
-            } else if let Some(v) = part.strip_prefix("nonce=") {
-                nonce = Some(v.trim().trim_matches('"').to_string());
+            let Some((k, v)) = part.split_once('=') else { continue };
+            let v = Some(v.trim().trim_matches('"').to_string());
+            match k.trim() {
+                k if k.eq_ignore_ascii_case("realm") => realm = v,
+                k if k.eq_ignore_ascii_case("nonce") => nonce = v,
+                _ => {}
             }
         }
         match (realm, nonce) {
@@ -1424,6 +1429,21 @@ mod tests {
         let mut c = RtspClient::connect_auth(ip, rx.port(), ip, LIMIT, password.map(String::from), false).unwrap();
         let e = c.options().expect_err("refused");
         e.downcast_ref::<SignIn>().cloned().unwrap_or_else(|| panic!("not a sign-in error: {e:#}"))
+    }
+
+    /// A Digest challenge is recognised whatever the case of its scheme
+    /// and parameter names.
+    #[test]
+    fn a_digest_challenge_in_other_case_is_answered() {
+        let rx = FakeRaop::start(|req| match req.header("Authorization") {
+            None => Answer::Reply(Reply::status(401, "Unauthorized").header("WWW-Authenticate", "digest REALM=\"raop\", Nonce=\"n1\"")),
+            Some(_) => Answer::Normal,
+        });
+        let ip = "127.0.0.1".parse().unwrap();
+        let mut c = RtspClient::connect_auth(ip, rx.port(), ip, LIMIT, Some("pw".into()), false).unwrap();
+        c.options().expect("signed in");
+        let auth = rx.requests()[1].header("Authorization").unwrap().to_string();
+        assert!(auth.contains("realm=\"raop\"") && auth.contains("nonce=\"n1\""), "{auth}");
     }
 
     /// The three ways a password can stop a connect are told apart.
