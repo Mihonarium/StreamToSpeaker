@@ -203,7 +203,7 @@ pub struct AirPlay2Session {
     feedback_handle: Option<JoinHandle<()>>,
     volume_handle: Option<JoinHandle<()>>,
     ptp_session: Option<PtpMaster>,
-    /// (last sent seq, current rtptime) for the buffered stream — read at
+    /// (next 23-bit seq, next rtptime) for the buffered stream — read at
     /// stop() to send the spec's FLUSHBUFFERED before TEARDOWN. None for
     /// realtime sessions.
     buffered_flush: Option<(Arc<AtomicU32>, Arc<AtomicU32>)>,
@@ -473,7 +473,7 @@ impl AirPlay2Session {
                 audio_key,
                 initial_seq,
                 initial_rtptime,
-                ssrc,
+                random_ssrc: ssrc,
                 samples_rx: cfg.samples_rx,
                 stop_flag: stop_flag.clone(),
                 receiver_name: cfg.renderer.friendly_name.clone(),
@@ -482,6 +482,7 @@ impl AirPlay2Session {
                 rtsp: rtsp.clone(),
                 timeline: ptp_session.as_ref().unwrap().timeline.clone(),
                 codec,
+                encoder: codec.encoder(),
                 faults: faults.clone(),
             })?;
             info!(
@@ -1277,6 +1278,57 @@ impl BufferedCodecKind {
             BufferedCodecKind::Aac => 1024,
         }
     }
+
+    /// The SSRC Apple's senders put on buffered packets of this format:
+    /// receivers read it as the payload's format (shairport-sync plays no
+    /// block whose SSRC it doesn't know). AAC-LC 44.1 kHz stereo is
+    /// `0x16000000`. Apple's senders send ALAC buffered only at 48 kHz/24
+    /// bit, so 44.1 kHz/16-bit ALAC has no value: None.
+    fn apple_ssrc(self) -> Option<u32> {
+        match self {
+            BufferedCodecKind::Alac => None,
+            BufferedCodecKind::Aac => Some(0x1600_0000),
+        }
+    }
+
+    /// What makes this codec's payloads, on the sender thread: the AAC
+    /// encoder must live on the thread that uses it (COM).
+    fn encoder(self) -> EncoderFactory {
+        match self {
+            BufferedCodecKind::Alac => Box::new(|| Ok(Box::new(UncompressedAlac) as Box<dyn BufferedEncoder>)),
+            #[cfg(windows)]
+            BufferedCodecKind::Aac => Box::new(|| {
+                Ok(Box::new(crate::airplay::aac_mf::AacEncoder::new()?) as Box<dyn BufferedEncoder>)
+            }),
+            #[cfg(not(windows))]
+            BufferedCodecKind::Aac => Box::new(|| Err(anyhow::anyhow!("AAC is only available on Windows"))),
+        }
+    }
+}
+
+/// Turns one packet's worth of PCM (`spf` stereo frames, interleaved) into
+/// zero or more payloads: the AAC MFT buffers a frame or two before its
+/// first output; ALAC is always 1:1.
+trait BufferedEncoder {
+    fn encode(&mut self, pcm: &[i16]) -> Result<Vec<Vec<u8>>>;
+}
+
+/// Makes the buffered sender's encoder; called once, on the sender thread.
+type EncoderFactory = Box<dyn FnOnce() -> Result<Box<dyn BufferedEncoder>> + Send>;
+
+struct UncompressedAlac;
+
+impl BufferedEncoder for UncompressedAlac {
+    fn encode(&mut self, pcm: &[i16]) -> Result<Vec<Vec<u8>>> {
+        Ok(vec![build_uncompressed_alac_frame(pcm)])
+    }
+}
+
+#[cfg(windows)]
+impl BufferedEncoder for crate::airplay::aac_mf::AacEncoder {
+    fn encode(&mut self, pcm: &[i16]) -> Result<Vec<Vec<u8>>> {
+        crate::airplay::aac_mf::AacEncoder::encode(self, pcm)
+    }
 }
 
 struct BufferedSenderConfig {
@@ -1284,12 +1336,15 @@ struct BufferedSenderConfig {
     audio_key: [u8; 32],
     initial_seq: u16,
     initial_rtptime: u32,
-    ssrc: u32,
+    /// The session's random SSRC, for a format Apple's senders have no
+    /// SSRC value for.
+    random_ssrc: u32,
     samples_rx: Receiver<PcmFrame>,
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
     current_rtptime: Arc<AtomicU32>,
-    /// Last RTP sequence number sent — read at stop() for FLUSHBUFFERED.
+    /// The next packet's 23-bit sequence number — FLUSHBUFFERED's
+    /// `flushUntilSeq` at stop().
     last_seq: Arc<AtomicU32>,
     /// Shared RTSP connection — the sender anchors on it at first audio.
     rtsp: Arc<Mutex<Ap2Rtsp>>,
@@ -1297,6 +1352,8 @@ struct BufferedSenderConfig {
     timeline: PtpTimeline,
     /// Negotiated payload codec (must match the SETUP's ct/spf).
     codec: BufferedCodecKind,
+    /// Makes that codec's encoder, on the sender thread.
+    encoder: EncoderFactory,
     faults: FaultSlot,
 }
 
@@ -1346,24 +1403,21 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
     );
     let spf = cfg.codec.spf();
     let mut sealer = AudioSealer::new(&cfg.audio_key, cfg.initial_seq);
-    let mut seq = cfg.initial_seq;
+    let mut seq = cfg.initial_seq as u32;
+    let ssrc = cfg.codec.apple_ssrc().unwrap_or(cfg.random_ssrc);
     let mut rtptime = cfg.initial_rtptime;
     let mut packet_count: u64 = 0;
     let mut ring: Vec<i16> = Vec::with_capacity(spf * 2);
 
     // The AAC encoder must live on this thread (COM); the session already
     // probed availability before negotiating ct=4 in SETUP.
-    #[cfg(windows)]
-    let mut aac_encoder = if cfg.codec == BufferedCodecKind::Aac {
-        match crate::airplay::aac_mf::AacEncoder::new() {
-            Ok(enc) => Some(enc),
-            Err(e) => {
-                warn!("AirPlay 2: AAC encoder init failed on sender thread: {e:#}");
-                return;
-            }
+    let make_encoder = cfg.encoder;
+    let mut encoder = match make_encoder() {
+        Ok(enc) => enc,
+        Err(e) => {
+            warn!("AirPlay 2: {} encoder init failed on sender thread: {e:#}", cfg.codec.label());
+            return;
         }
-    } else {
-        None
     };
 
     let started = Instant::now();
@@ -1454,25 +1508,16 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
         let mut packets_this_round = 0u32;
         while ring.len() >= spf * 2 {
             let pkt_samples: Vec<i16> = ring.drain(..spf * 2).collect();
-            // One spf-sized PCM chunk → zero or more payload frames (the
-            // AAC MFT buffers a frame or two before its first output; ALAC
-            // is always 1:1).
-            let payloads: Vec<Vec<u8>> = match cfg.codec {
-                BufferedCodecKind::Alac => vec![build_uncompressed_alac_frame(&pkt_samples)],
-                #[cfg(windows)]
-                BufferedCodecKind::Aac => match aac_encoder.as_mut().unwrap().encode(&pkt_samples) {
-                    Ok(frames) => frames,
-                    Err(e) => {
-                        warn!("AirPlay 2: AAC encode failed: {e:#}");
-                        return;
-                    }
-                },
-                #[cfg(not(windows))]
-                BufferedCodecKind::Aac => unreachable!("AAC is only negotiated on Windows"),
+            let payloads = match encoder.encode(&pkt_samples) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    warn!("AirPlay 2: {} encode failed: {e:#}", cfg.codec.label());
+                    return;
+                }
             };
 
             for payload in payloads {
-                let header = ap2_rtp_header(seq, rtptime, cfg.ssrc, packet_count == 0);
+                let header = buffered_rtp_header(seq, rtptime, ssrc);
                 let sealed = sealer.seal(&header, &payload);
                 let mut packet = Vec::with_capacity(12 + sealed.len());
                 packet.extend_from_slice(&header);
@@ -1507,10 +1552,10 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
                     );
                 }
 
-                seq = seq.wrapping_add(1);
+                seq = (seq + 1) & BUFFERED_SEQ_MASK;
                 rtptime = rtptime.wrapping_add(spf as u32);
                 cfg.current_rtptime.store(rtptime, Ordering::Release);
-                cfg.last_seq.store(seq as u32, Ordering::Release);
+                cfg.last_seq.store(seq, Ordering::Release);
                 packet_count += 1;
                 if packet_count % 500 == 0 {
                     debug!(
@@ -1759,6 +1804,23 @@ fn run_ap2_sender(mut cfg: Ap2SenderConfig) {
     );
 }
 
+/// Buffered sequence numbers have 23 bits (see [`buffered_rtp_header`]).
+const BUFFERED_SEQ_MASK: u32 = 0x7F_FFFF;
+
+/// Build the 12-byte header of a buffered (type 103) audio packet the way
+/// Apple's senders do: V=2, the marker bit set on every packet, and that
+/// bit's remaining 7 bits plus the next two bytes holding a 23-bit
+/// sequence number — receivers read `bytes 0..4 & 0x7FFFFF`
+/// (shairport-sync's buffered reader) — then the RTP timestamp and the
+/// format SSRC ([`BufferedCodecKind::apple_ssrc`]).
+fn buffered_rtp_header(seq: u32, timestamp: u32, ssrc: u32) -> [u8; 12] {
+    let mut h = [0u8; 12];
+    BigEndian::write_u32(&mut h[0..4], 0x8080_0000 | (seq & BUFFERED_SEQ_MASK));
+    BigEndian::write_u32(&mut h[4..8], timestamp);
+    BigEndian::write_u32(&mut h[8..12], ssrc);
+    h
+}
+
 /// Build the 12-byte RTP header for an AirPlay 2 realtime audio packet
 /// (V=2, PT=96, marker on the first packet only).
 fn ap2_rtp_header(seq: u16, timestamp: u32, ssrc: u32, first: bool) -> [u8; 12] {
@@ -1814,6 +1876,148 @@ mod tests {
             assert_eq!(got, want, "{what}");
             let seen = seen.join().unwrap();
             assert!(seen.iter().all(|l| l.starts_with("POST /pair-verify")), "{what}: {seen:?}");
+        }
+    }
+
+    /// Stands in for the AAC encoder on platforms without one: one payload
+    /// per packet, or an error from the `fail_at`-th call on.
+    struct ScriptedEncoder {
+        calls: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl BufferedEncoder for ScriptedEncoder {
+        fn encode(&mut self, _pcm: &[i16]) -> Result<Vec<Vec<u8>>> {
+            self.calls += 1;
+            if self.fail_at.is_some_and(|n| self.calls >= n) {
+                anyhow::bail!("ProcessInput failed: scripted");
+            }
+            Ok(vec![vec![0xAA; 16]])
+        }
+    }
+
+    fn scripted_encoder(fail_at: Option<usize>) -> EncoderFactory {
+        Box::new(move || Ok(Box::new(ScriptedEncoder { calls: 0, fail_at }) as Box<dyn BufferedEncoder>))
+    }
+
+    /// A buffered sender wired to a scripted receiver on loopback: the
+    /// control connection answers SETRATEANCHORTIME with `anchor_status`
+    /// (everything else 200); the test reads the data connection.
+    struct BufferedRig {
+        samples: Option<crossbeam_channel::Sender<PcmFrame>>,
+        data: TcpStream,
+        stop_flag: Arc<AtomicBool>,
+        last_seq: Arc<AtomicU32>,
+        sender: Option<JoinHandle<()>>,
+    }
+
+    impl BufferedRig {
+        fn start(codec: BufferedCodecKind, encoder: EncoderFactory, initial_seq: u16, anchor_status: &'static str) -> Self {
+            use crate::airplay::test_peers::{read_request, reply};
+            use std::io::BufReader;
+            let control = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let control_port = control.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                let Ok((sock, _)) = control.accept() else { return };
+                let mut r = BufReader::new(sock.try_clone().unwrap());
+                let mut w = sock;
+                while let Some((line, cseq, _)) = read_request(&mut r) {
+                    let status = if line.starts_with("SETRATEANCHORTIME") { anchor_status } else { "200 OK" };
+                    reply(&mut w, cseq, status, &[]);
+                }
+            });
+            let ip: IpAddr = "127.0.0.1".parse().unwrap();
+            let rtsp = Ap2Rtsp::connect(ip, control_port, ip, Duration::from_secs(5)).unwrap();
+
+            let data_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream = TcpStream::connect(data_listener.local_addr().unwrap()).unwrap();
+            let (data, _) = data_listener.accept().unwrap();
+            data.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+            let (samples, samples_rx) = crossbeam_channel::unbounded();
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let faults = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Test speaker".into());
+            let last_seq = Arc::new(AtomicU32::new(initial_seq as u32));
+            let sender = spawn_ap2_buffered_sender(BufferedSenderConfig {
+                stream,
+                audio_key: [3u8; 32],
+                initial_seq,
+                initial_rtptime: 1_000,
+                random_ssrc: 0x0102_0304,
+                samples_rx,
+                stop_flag: stop_flag.clone(),
+                receiver_name: "Test speaker".into(),
+                current_rtptime: Arc::new(AtomicU32::new(1_000)),
+                last_seq: last_seq.clone(),
+                rtsp: Arc::new(Mutex::new(rtsp)),
+                timeline: PtpTimeline::new(crate::airplay::ap2_ptp::PtpMasterClock::new(), 0x42),
+                codec,
+                encoder,
+                faults: faults.clone(),
+            })
+            .unwrap();
+            Self { samples: Some(samples), data, stop_flag, last_seq, sender: Some(sender) }
+        }
+
+        /// Queue `frames` stereo frames of a quiet tone.
+        fn feed(&self, frames: usize) {
+            let bytes: Vec<u8> = (0..frames * 2).flat_map(|i| ((i % 64) as i16).to_le_bytes()).collect();
+            self.samples.as_ref().unwrap().send(PcmFrame(Arc::new(bytes))).unwrap();
+        }
+
+        /// The next packet on the data connection (header and sealed
+        /// payload, length prefix removed); None once the sender closed it.
+        fn packet(&mut self) -> Option<Vec<u8>> {
+            use std::io::Read;
+            let mut len = [0u8; 2];
+            self.data.read_exact(&mut len).ok()?;
+            let mut pkt = vec![0u8; (u16::from_be_bytes(len) as usize).checked_sub(2)?];
+            self.data.read_exact(&mut pkt).ok()?;
+            Some(pkt)
+        }
+
+        /// Stop the sender as the session does and wait for it to exit.
+        fn stop(&mut self) {
+            self.stop_flag.store(true, Ordering::Release);
+            self.samples.take();
+            self.sender.take().unwrap().join().unwrap();
+        }
+    }
+
+    /// Buffered packets look like an Apple sender's: the marker bit on
+    /// every packet with a 23-bit sequence number that runs on past
+    /// 0xFFFF, the SSRC naming the format where Apple has a value for it
+    /// (AAC-LC 44.1 kHz stereo; ALAC at 44.1 kHz has none, so it keeps the
+    /// session's random one), and FLUSHBUFFERED's sequence number in the
+    /// same 23-bit space.
+    #[test]
+    fn buffered_packets_carry_apples_header_and_format_ssrc() {
+        for (codec, encoder, want_ssrc) in [
+            (BufferedCodecKind::Aac, scripted_encoder(None), 0x1600_0000u32),
+            (BufferedCodecKind::Alac, BufferedCodecKind::Alac.encoder(), 0x0102_0304),
+        ] {
+            let spf = codec.spf();
+            let mut rig = BufferedRig::start(codec, encoder, 65_530, "200 OK");
+            rig.feed(spf * 12);
+            let mut packets = Vec::new();
+            for _ in 0..12 {
+                packets.push(rig.packet().expect("a packet"));
+            }
+            rig.stop();
+            while let Some(p) = rig.packet() {
+                packets.push(p);
+            }
+            for (i, p) in packets.iter().enumerate() {
+                let what = format!("{} packet {i}: {:02x?}", codec.label(), &p[..12]);
+                assert_eq!(p[0], 0x80, "{what}");
+                assert_eq!(p[1] & 0x80, 0x80, "marker bit, {what}");
+                let seq = u32::from_be_bytes([p[0], p[1], p[2], p[3]]) & 0x7F_FFFF;
+                assert_eq!(seq, 65_530 + i as u32, "{what}");
+                assert_eq!(u32::from_be_bytes([p[4], p[5], p[6], p[7]]), 1_000 + (i * spf) as u32, "{what}");
+                assert_eq!(u32::from_be_bytes([p[8], p[9], p[10], p[11]]), want_ssrc, "{what}");
+            }
+            // FLUSHBUFFERED names the next packet in the same numbering.
+            assert_eq!(rig.last_seq.load(Ordering::Acquire), 65_530 + packets.len() as u32);
         }
     }
 
@@ -1940,6 +2144,17 @@ mod tests {
             "Media Foundation functions linked at load time: look them up at run time, as aac_mf.rs \
              does (if one of these is a type, not a function, teach `function_shaped` about it): {bad:#?}"
         );
+    }
+
+    #[test]
+    fn buffered_header_holds_a_23_bit_sequence_number() {
+        assert_eq!(
+            buffered_rtp_header(0x12_3456, 0xAABB_CCDD, 0x1600_0000),
+            [0x80, 0x92, 0x34, 0x56, 0xAA, 0xBB, 0xCC, 0xDD, 0x16, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(buffered_rtp_header(0x7F_FFFF, 0, 0)[..4], [0x80, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(buffered_rtp_header(0, 0, 0)[..4], [0x80, 0x80, 0x00, 0x00]);
+        assert_eq!((0x7F_FFFFu32 + 1) & BUFFERED_SEQ_MASK, 0);
     }
 
     #[test]

@@ -132,7 +132,7 @@ pub struct PtpTimeline {
 }
 
 impl PtpTimeline {
-    fn new(clock: Arc<PtpMasterClock>, clock_id: u64) -> Self {
+    pub(crate) fn new(clock: Arc<PtpMasterClock>, clock_id: u64) -> Self {
         Self {
             clock,
             clock_id,
