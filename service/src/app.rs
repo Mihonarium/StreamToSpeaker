@@ -2165,6 +2165,16 @@ impl App {
     /// entry point of the web API / tray toggle / launch reconnect, where
     /// nobody could answer a PIN prompt).
     pub fn select_speaker(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        // A receiver announcing another speaker's identity plays only when
+        // a person picks it in the window, never from the web API (which
+        // scripts drive too), the tray or a reconnect.
+        if self.is_airplay_newcomer(id) {
+            return Err(format!(
+                "{} announces the same identity as another speaker. To play to it, pick it in the Stream To \
+                 Speaker window.",
+                self.speaker_name(id).unwrap_or_else(|| id.to_string())
+            ));
+        }
         self.note_user_pick();
         // Claim the same `connecting` slot the background connects use, so
         // the two can't run at once and auto-connect sees this one.
@@ -5166,6 +5176,17 @@ mod tests {
         let (app, _discovery) = airplay_test_app_with(conflict_discovery());
         let err = app.select_speaker_opts(KITCHEN_2, false, false).expect_err("refused");
         assert!(err.starts_with("Not connecting to ") && err.contains("same identity as another speaker"), "{err}");
+    }
+
+    /// The web API (and the other callers of `select_speaker`: the tray,
+    /// a resync, Enable) refuses a newcomer; the window's pick is the only
+    /// way to play to it.
+    #[test]
+    fn the_web_api_refuses_a_newcomer() {
+        let (app, _discovery) = airplay_test_app_with(conflict_discovery());
+        let err = app.select_speaker(KITCHEN_2).expect_err("refused");
+        assert!(err.ends_with("To play to it, pick it in the Stream To Speaker window."), "{err}");
+        assert!(app.connecting_to().is_none());
     }
 
     /// A newcomer at the speaker's own address is never given the
