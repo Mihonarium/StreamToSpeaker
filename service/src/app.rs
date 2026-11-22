@@ -512,6 +512,19 @@ pub struct PasswordDialog {
     pub one_session: bool,
 }
 
+impl PasswordDialog {
+    /// The dialog's explanation, under its title: what happens to what is
+    /// typed.
+    pub fn message(&self) -> &'static str {
+        if self.one_session {
+            "This receiver requires an AirPlay password. Enter it to connect — it's used for this connection only and \
+             not remembered, since this receiver has the same ID as another speaker."
+        } else {
+            "This speaker requires an AirPlay password. Enter it to connect — it'll be remembered for next time."
+        }
+    }
+}
+
 /// In-memory update-check state (the persistent part lives in `UserConfig`).
 #[derive(Clone, Debug, Default)]
 pub struct UpdateState {
@@ -5220,6 +5233,23 @@ mod tests {
         // The connect the dialog starts uses it, and only that one.
         assert_eq!(app.airplay_password_for(&left).as_deref(), Some("typed-after-conflict"));
         assert_ne!(app.airplay_password_for(&left).as_deref(), Some("typed-after-conflict"));
+    }
+
+    /// The dialog says what happens to what is typed: remembered for a
+    /// speaker, used for this connection only for a receiver with another
+    /// speaker's ID.
+    #[test]
+    fn the_password_dialog_says_whether_the_password_is_remembered() {
+        let (app, _discovery) = airplay_test_app_with(conflict_discovery());
+        assert_eq!(
+            app.password_dialog(KITCHEN, "Kitchen").message(),
+            "This speaker requires an AirPlay password. Enter it to connect — it'll be remembered for next time."
+        );
+        assert_eq!(
+            app.password_dialog(KITCHEN_2, "Kitchen 2").message(),
+            "This receiver requires an AirPlay password. Enter it to connect — it's used for this connection only and \
+             not remembered, since this receiver has the same ID as another speaker."
+        );
     }
 
     /// When the entry the dialog was opened for has gone by the time the

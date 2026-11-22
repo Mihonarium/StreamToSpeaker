@@ -3957,8 +3957,7 @@ impl StreamToSpeakerApp {
             ctx,
             p,
             &title,
-            "This speaker requires an AirPlay password. Enter it to connect — \
-             it'll be remembered for next time.",
+            prompt.dialog.message(),
             "AirPlay password",
             true,
             "Connect",
