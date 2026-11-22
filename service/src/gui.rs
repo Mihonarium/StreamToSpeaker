@@ -4487,7 +4487,7 @@ impl StreamToSpeakerApp {
                 self.ma_addresses = Some((Instant::now(), self.app.music_assistant_addresses()));
             }
             let addresses = self.ma_addresses.as_ref().map(|(_, a)| a.as_slice()).unwrap_or(&[]);
-            let (text, copy) = crate::sendspin_app::music_assistant_elsewhere(ports, addresses);
+            let (text, copy) = crate::sendspin_app::music_assistant_elsewhere(&ports, addresses);
             for paragraph in text {
                 ui.label(egui::RichText::new(paragraph).size(12.0).color(p.text_secondary));
             }

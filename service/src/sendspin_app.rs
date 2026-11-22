@@ -18,7 +18,7 @@ use crate::sendspin::proto::PairMethod;
 use crate::sendspin::server::{
     self, NowPlayingFn, PairingInput, PlayerSession, PlayerSessionConfig, SendspinDiscoveryState, StartError,
 };
-use crate::sendspin::source::{SourceOptions, SourceService, SourceState, PAIRING_FAILURE_LIMIT};
+use crate::sendspin::source::{PortRefusal, SourceOptions, SourceService, SourceState, PAIRING_FAILURE_LIMIT};
 use crate::sendspin::store::SendspinConfig;
 use crate::sendspin::{machine_name, SendspinStore};
 use crate::PRODUCT_NAME;
@@ -165,25 +165,21 @@ pub fn addresses_for_music_assistant(first: IpAddr, local: &[Ipv4Addr]) -> Vec<I
     out
 }
 
+/// The Music Assistant input's ports (see
+/// [`App::sendspin_source_ports`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourcePorts {
+    pub port: u16,
+    pub wanted: u16,
+    pub refused: Option<PortRefusal>,
+}
+
 /// What the Music Assistant card says, while it waits, to someone whose
 /// Music Assistant runs on another network, where it can't find this
-/// computer by itself: paragraphs, and the address to offer for copying
-/// (`None` when giving an address can't work now). `ports` is the port the
-/// input listens on and the one it was meant to; `addresses` from
-/// [`addresses_for_music_assistant`].
-pub fn music_assistant_elsewhere(ports: (u16, u16), addresses: &[Ipv4Addr]) -> (Vec<String>, Option<Ipv4Addr>) {
-    let (port, wanted) = ports;
-    if port != wanted {
-        return (
-            vec![format!(
-                "Port {wanted}, where Music Assistant connects when it is given an address, is in use \
-                 by another program, so this input listens on port {port}. Music Assistant on this \
-                 network still finds it by itself. For one on another network, close the program \
-                 that uses port {wanted}, then turn this input off and on."
-            )],
-            None,
-        );
-    }
+/// computer by itself: paragraphs, and the address to offer for copying.
+/// `addresses` from [`addresses_for_music_assistant`].
+pub fn music_assistant_elsewhere(ports: &SourcePorts, addresses: &[Ipv4Addr]) -> (Vec<String>, Option<Ipv4Addr>) {
+    let SourcePorts { port, wanted, refused } = ports;
     let mut text = vec![
         "Music Assistant finds this computer by itself only on the same network. If it runs on \
          another one (another VLAN or subnet), open the Sendspin provider's settings in Music \
@@ -192,6 +188,26 @@ pub fn music_assistant_elsewhere(ports: (u16, u16), addresses: &[Ipv4Addr]) -> (
          through (a firewall between the networks has to let it)."
             .to_string(),
     ];
+    if port != wanted {
+        text.push(match refused {
+            Some(PortRefusal::InUse) => format!(
+                "Port {wanted}, where Music Assistant connects to an address it is given, is in use \
+                 by another program, so this input listens on port {port}. Music Assistant on this \
+                 network still finds it. For the address to work, close the program that uses port \
+                 {wanted}, then turn this input off and on."
+            ),
+            Some(PortRefusal::Unavailable(why)) => format!(
+                "Port {wanted}, where Music Assistant connects to an address it is given, can't be \
+                 used on this computer right now, so this input listens on port {port}. Music \
+                 Assistant on this network still finds it, but the address works only once port \
+                 {wanted} can be used. Details: {why}"
+            ),
+            None => format!(
+                "This input listens on port {port}, not on port {wanted}, where Music Assistant \
+                 connects to an address it is given. Music Assistant on this network still finds it."
+            ),
+        });
+    }
     let Some((first, others)) = addresses.split_first() else {
         text.push("This computer has no network address right now.".into());
         return (text, None);
@@ -481,11 +497,15 @@ impl App {
         self.sendspin.source.lock().unwrap().as_ref().map(|s| s.state())
     }
 
-    /// The port the Music Assistant input listens on and the one it was
-    /// meant to (8928, where Music Assistant dials an address it is
-    /// given); `None` while the input is off.
-    pub fn sendspin_source_ports(&self) -> Option<(u16, u16)> {
-        self.sendspin.source.lock().unwrap().as_ref().map(|s| (s.port(), s.wanted_port()))
+    /// The port the Music Assistant input listens on, the one it was meant
+    /// to (8928, where Music Assistant dials an address it is given), and
+    /// why it doesn't listen there; `None` while the input is off.
+    pub fn sendspin_source_ports(&self) -> Option<SourcePorts> {
+        self.sendspin.source.lock().unwrap().as_ref().map(|s| SourcePorts {
+            port: s.port(),
+            wanted: s.wanted_port(),
+            refused: s.port_refusal(),
+        })
     }
 
     /// The addresses a Music Assistant on another network can be given for
@@ -970,25 +990,34 @@ mod tests {
     #[test]
     fn the_card_tells_music_assistant_elsewhere_what_it_needs() {
         let ip = |s: &str| -> Ipv4Addr { s.parse().unwrap() };
-        let (text, copy) = music_assistant_elsewhere((8928, 8928), &[ip("192.168.1.20"), ip("10.0.0.5")]);
+        let ports = |port: u16, refused: Option<PortRefusal>| SourcePorts { port, wanted: 8928, refused };
+        let (text, copy) = music_assistant_elsewhere(&ports(8928, None), &[ip("192.168.1.20"), ip("10.0.0.5")]);
         assert_eq!(copy, Some(ip("192.168.1.20")));
         assert!(text[0].contains("\u{201c}Manual IP addresses for discovery\u{201d}"), "{}", text[0]);
         assert_eq!(text[1], "This computer's address: 192.168.1.20");
         assert!(text[2].ends_with("use that one's address instead: 10.0.0.5."), "{}", text[2]);
         // Nothing says an entry may carry a port.
         assert!(text.iter().all(|t| !t.contains(":8928")));
-        let (text, copy) = music_assistant_elsewhere((8928, 8928), &[ip("192.168.1.20")]);
+        let (text, copy) = music_assistant_elsewhere(&ports(8928, None), &[ip("192.168.1.20")]);
         assert_eq!((text.len(), copy), (2, Some(ip("192.168.1.20"))));
-        let (text, copy) = music_assistant_elsewhere((8928, 8928), &[]);
+        let (text, copy) = music_assistant_elsewhere(&ports(8928, None), &[]);
         assert_eq!(copy, None);
         assert_eq!(text[1], "This computer has no network address right now.");
-        // Another program holds the port: say which port is used, and that an
-        // address needs the usual one free; offer no address.
-        let (text, copy) = music_assistant_elsewhere((50123, 8928), &[ip("192.168.1.20")]);
-        assert_eq!(copy, None);
-        assert_eq!(text.len(), 1);
-        assert!(text[0].starts_with("Port 8928, where Music Assistant connects"), "{}", text[0]);
-        assert!(text[0].contains("listens on port 50123"), "{}", text[0]);
+        // Another program holds the port: it is named, with what to do; the
+        // port used and the address stay shown.
+        let (text, copy) = music_assistant_elsewhere(&ports(50123, Some(PortRefusal::InUse)), &[ip("192.168.1.20")]);
+        assert_eq!(copy, Some(ip("192.168.1.20")));
+        assert!(text[1].contains("is in use by another program, so this input listens on port 50123"), "{}", text[1]);
+        assert!(text[1].contains("close the program that uses port 8928"), "{}", text[1]);
+        assert_eq!(text[2], "This computer's address: 192.168.1.20");
+        // Refused for another reason (a range Windows reserved): no culprit,
+        // nothing to close, the system's words.
+        let reserved = PortRefusal::Unavailable("An attempt was made to access a socket … (os error 10013)".into());
+        let (text, copy) = music_assistant_elsewhere(&ports(50123, Some(reserved)), &[ip("192.168.1.20")]);
+        assert_eq!(copy, Some(ip("192.168.1.20")));
+        assert!(text[1].contains("can't be used on this computer right now"), "{}", text[1]);
+        assert!(text[1].contains("listens on port 50123") && text[1].ends_with("(os error 10013)"), "{}", text[1]);
+        assert!(!text[1].contains("program") && !text[1].contains("close"), "{}", text[1]);
     }
 
     #[test]
