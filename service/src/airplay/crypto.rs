@@ -119,7 +119,11 @@ impl MfiKey {
     /// same KEK/KIV from its half of the ECDH and unwraps to recover the
     /// audio key. The `aesiv` we advertise is the plaintext audio IV.
     pub fn derive(shared: &[u8]) -> Self {
-        let audio = SessionKey::random();
+        Self::wrap(shared, SessionKey::random())
+    }
+
+    /// [`derive`](Self::derive) with a given audio key and IV.
+    fn wrap(shared: &[u8], audio: SessionKey) -> Self {
         let kek = sha1_prefixed_16(b"AES-KEY", shared);
         let kiv = sha1_prefixed_16(b"AES-IV", shared);
         // AES-128-CTR keystream for the single counter block == AES-ECB of
@@ -465,28 +469,21 @@ mod tests {
         assert!(h.ends_with('"'));
     }
 
+    /// Pins the et=4 key wrap to a value computed independently (Python
+    /// `hashlib` SHA-1 and OpenSSL AES-128-ECB over the same inputs), so a
+    /// change to the derivation fails here. Whether this wrap is the one a
+    /// receiver expects is not known: that needs a packet capture.
     #[test]
-    fn mfi_wrap_unwraps_to_audio_key() {
-        // The receiver derives the same KEK/KIV from its half of the ECDH
-        // and unwraps `mfiaeskey` to recover the audio key. Verify the
-        // construction round-trips: unwrap(mfiaeskey) == audio.key.
-        let shared = [0x42u8; 32];
-        let mfi = MfiKey::derive(&shared);
-
-        // Receiver side: KEK = SHA1("AES-KEY"‖shared), keystream =
-        // AES-ECB(KEK, KIV), audio_key = mfiaeskey XOR keystream.
-        let kek = sha1_prefixed_16(b"AES-KEY", &shared);
-        let kiv = sha1_prefixed_16(b"AES-IV", &shared);
-        let mut keystream = kiv;
-        aes128_ecb_encrypt_block(&kek, &mut keystream);
-        let mut recovered = [0u8; 16];
-        for i in 0..16 {
-            recovered[i] = mfi.mfiaeskey[i] ^ keystream[i];
-        }
-        assert_eq!(recovered, mfi.audio.key, "unwrapped mfiaeskey must equal audio key");
-        // The wrapped value must not be the raw key (else there's no point
-        // wrapping) — the capture proved iTunes ships a non-raw key.
-        assert_ne!(mfi.mfiaeskey, mfi.audio.key, "mfiaeskey should be wrapped, not raw");
+    fn mfi_key_wrap_matches_an_independent_computation() {
+        let audio = SessionKey { key: core::array::from_fn(|i| i as u8 + 1), iv: [7; 16] };
+        let mfi = MfiKey::wrap(&[0x42u8; 32], audio.clone());
+        assert_eq!(
+            mfi.mfiaeskey,
+            [0x3f, 0x81, 0x4c, 0xa9, 0x5d, 0x9e, 0x18, 0xde, 0x10, 0x8e, 0x62, 0xb8, 0x64, 0xa6, 0xd0, 0x33]
+        );
+        // The audio is encrypted with the key that was wrapped.
+        assert_eq!(mfi.audio.key, audio.key);
+        assert_eq!(mfi.audio.iv, audio.iv);
     }
 
     #[test]

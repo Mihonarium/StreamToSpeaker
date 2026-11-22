@@ -805,7 +805,11 @@ fn read_txt_int_list(txt: &TxtProperties, key: &str) -> Vec<u8> {
 /// comma-separated 32-bit halves, low first: `0x445F8A00,0x1C340`
 /// → `(high << 32) | low`. Decimal is also accepted.
 fn read_features(txt: &TxtProperties) -> Option<u64> {
-    let raw = read_txt_string(txt, "features").or_else(|| read_txt_string(txt, "ft"))?;
+    parse_features(&read_txt_string(txt, "features").or_else(|| read_txt_string(txt, "ft"))?)
+}
+
+/// The flag word of a `features` / `ft` value (see [`read_features`]).
+fn parse_features(raw: &str) -> Option<u64> {
     let parts: Vec<&str> = raw.split(',').map(|p| p.trim()).collect();
     let parse = |s: &str| -> Option<u64> {
         let s = s.trim();
@@ -968,30 +972,19 @@ mod tests {
 
     #[test]
     fn features_single_and_split_hex() {
-        // single
-        let f = parse_features_str("0x40000200");
-        assert_eq!(f, Some(0x40000200));
-        // split low,high
-        let f = parse_features_str("0x445F8A00,0x1C340");
-        assert_eq!(f, Some((0x1C340u64 << 32) | 0x445F8A00));
-    }
-
-    // Tiny shim so the test can exercise the same parse logic without a
-    // TxtProperties (which we can't easily synthesise here).
-    fn parse_features_str(raw: &str) -> Option<u64> {
-        let parts: Vec<&str> = raw.split(',').map(|p| p.trim()).collect();
-        let parse = |s: &str| -> Option<u64> {
-            if let Some(hex) = s.strip_prefix("0x") {
-                u64::from_str_radix(hex, 16).ok()
-            } else {
-                s.parse().ok()
-            }
-        };
-        match parts.as_slice() {
-            [single] => parse(single),
-            [low, high, ..] => Some((parse(high)? << 32) | (parse(low)? & 0xFFFF_FFFF)),
-            _ => None,
-        }
+        assert_eq!(parse_features("0x40000200"), Some(0x40000200));
+        assert_eq!(parse_features("0X40000200"), Some(0x40000200));
+        // Two halves, low first.
+        assert_eq!(parse_features("0x445F8A00,0x1C340"), Some((0x1C340u64 << 32) | 0x445F8A00));
+        assert_eq!(parse_features(" 0x445F8A00 , 0x1C340 "), Some((0x1C340u64 << 32) | 0x445F8A00));
+        // Decimal, and hex digits without a prefix.
+        assert_eq!(parse_features("512"), Some(512));
+        assert_eq!(parse_features("445F8A00"), Some(0x445F8A00));
+        // Nothing usable.
+        assert_eq!(parse_features(""), None);
+        assert_eq!(parse_features("0x"), None);
+        assert_eq!(parse_features("0x445F8A00,zz"), None);
+        assert_eq!(parse_features("0x1FFFFFFFFFFFFFFFF"), None);
     }
 
     #[test]
@@ -1022,18 +1015,20 @@ mod tests {
 
     #[test]
     fn real_sonos_features_classify_as_ap2_with_ptp() {
-        // The exact `features` word a Sonos advertises on _airplay._tcp.
-        // It must decode to AirPlay 2 + PTP so routing prefers AP2 — its
-        // _raop._tcp service is vestigial and times out at OPTIONS.
-        let ft = parse_features_str("0x445F8A00,0x1C340");
+        // The exact `features` word a Sonos advertises on _airplay._tcp:
+        // AirPlay 2 with PTP and buffered audio.
+        let ft = parse_features("0x445F8A00,0x1C340");
         assert!(ft.is_some(), "split-hex features should parse");
-        let r = renderer(Some("One"), vec![0, 1], ft, 5000, Some(7000));
+        let r = renderer(Some("One"), vec![0, 4], ft, 5000, Some(7000));
         assert!(r.supports_airplay2(), "Sonos must support AirPlay 2");
         assert!(r.expects_ptp(), "Sonos advertises PTP (feature bit 41)");
         assert!(r.supports_buffered_audio(), "Sonos advertises buffered audio (bit 40)");
-        // It also advertises a legacy RAOP service we'd otherwise prefer,
-        // which is why blind RAOP routing stalled at OPTIONS.
+        // It is still played over AirPlay 1 first, which is what iTunes
+        // does (packet capture: /auth-setup opener, realtime UDP, NTP
+        // timing); AirPlay 2 is the fallback the app tries next.
         assert!(r.supports_legacy_raop());
+        assert!(!r.requires_airplay2());
+        assert_eq!(r.transport(), Some(Transport::RaopLegacy));
     }
 
     #[test]
