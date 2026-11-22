@@ -160,8 +160,11 @@ pub(crate) fn exchange(req: &Request<'_>, limits: &Limits) -> Result<Response, H
         .and_then(|_| stream.flush())
         .map_err(|e| io_failure(e, limits, false))?;
 
-    let mut reader = Reader { stream, buf: Vec::new(), deadline, limits: *limits };
-    read_response(&mut reader, req.method)
+    // Every request here asks for the close; one that does is answered
+    // knowing the device will end the connection after its answer.
+    let closes = req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close"));
+    let mut reader = Reader { stream, buf: Vec::new(), drained: 0, deadline, limits: *limits };
+    read_response(&mut reader, req.method, closes)
 }
 
 fn remaining(deadline: Instant) -> Duration {
@@ -183,6 +186,9 @@ fn io_failure(e: std::io::Error, limits: &Limits, answered: bool) -> HttpError {
 struct Reader {
     stream: TcpStream,
     buf: Vec<u8>,
+    /// Bytes of interim (1xx) answers already set aside, which count
+    /// against the size bound too.
+    drained: usize,
     deadline: Instant,
     limits: Limits,
 }
@@ -201,7 +207,7 @@ impl Reader {
             match self.stream.read(&mut tmp) {
                 Ok(0) => return Ok(false),
                 Ok(n) => {
-                    if self.buf.len() + n > self.limits.max_bytes {
+                    if self.drained + self.buf.len() + n > self.limits.max_bytes {
                         return Err(HttpError::TooLarge(self.limits.max_bytes));
                     }
                     self.buf.extend_from_slice(&tmp[..n]);
@@ -214,10 +220,12 @@ impl Reader {
     }
 }
 
-/// Where a head ends: after its blank line, CRLF or bare LF.
-fn head_end(buf: &[u8]) -> Option<usize> {
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
-    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
+/// Where a head ends: after its blank line, CRLF or bare LF. The bytes
+/// before `from` are known not to hold one, so the search resumes there.
+fn head_end(buf: &[u8], from: usize) -> Option<usize> {
+    let from = from.saturating_sub(3).min(buf.len());
+    let crlf = buf[from..].windows(4).position(|w| w == b"\r\n\r\n").map(|p| from + p + 4);
+    let lf = buf[from..].windows(2).position(|w| w == b"\n\n").map(|p| from + p + 2);
     match (crlf, lf) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -284,13 +292,17 @@ fn framing(method: &str, head: &Head) -> Result<Framing, HttpError> {
     Ok(length.map_or(Framing::ToClose, Framing::Length))
 }
 
-fn read_response(r: &mut Reader, method: &str) -> Result<Response, HttpError> {
+/// Read the answer to `method`. `closes`: the request asked the device to
+/// close the connection after answering.
+fn read_response(r: &mut Reader, method: &str, closes: bool) -> Result<Response, HttpError> {
     // Interim (1xx) answers come before the real one.
     let (head, body_start) = loop {
+        let mut scanned = 0;
         let end = loop {
-            if let Some(end) = head_end(&r.buf) {
+            if let Some(end) = head_end(&r.buf, scanned) {
                 break end;
             }
+            scanned = r.buf.len();
             if !r.more()? {
                 return Err(if r.buf.is_empty() {
                     HttpError::Closed
@@ -301,6 +313,7 @@ fn read_response(r: &mut Reader, method: &str) -> Result<Response, HttpError> {
         };
         let head = parse_head(&r.buf[..end])?;
         if (100..200).contains(&head.status) && head.status != 101 {
+            r.drained += end;
             r.buf.drain(..end);
             continue;
         }
@@ -310,15 +323,31 @@ fn read_response(r: &mut Reader, method: &str) -> Result<Response, HttpError> {
     let body = match framing(method, &head)? {
         Framing::None => Vec::new(),
         Framing::Length(n) => {
-            while r.buf.len() - body_start < n {
+            let stated_end = body_start.saturating_add(n);
+            while r.buf.len() < stated_end {
                 if !r.more()? {
                     // Closed early: the request asked for the connection
                     // to close, so take what came.
                     break;
                 }
             }
-            let end = body_start.saturating_add(n).min(r.buf.len());
-            r.buf[body_start..end].to_vec()
+            if closes && r.buf.len() > stated_end {
+                // More than the stated length came with it, on a connection
+                // the device was asked to close after its answer: the length
+                // is wrong (a device counting characters, not bytes). Read
+                // on to the close, within the same bounds, and take it all.
+                // A device that states its length right gets no extra wait.
+                loop {
+                    match r.more() {
+                        Ok(true) => {}
+                        Ok(false) | Err(HttpError::NoAnswer(_)) => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                r.buf[body_start..].to_vec()
+            } else {
+                r.buf[body_start..stated_end.min(r.buf.len())].to_vec()
+            }
         }
         Framing::Chunked => {
             let mut chunks = Chunks::default();
@@ -349,17 +378,30 @@ fn read_response(r: &mut Reader, method: &str) -> Result<Response, HttpError> {
 /// it stopped as more arrive.
 #[derive(Default)]
 struct Chunks {
-    /// Offset of the next chunk-size line.
+    /// Offset of the next chunk-size line, or trailer line.
     pos: usize,
+    /// Past the last chunk, reading the trailer section.
+    in_trailer: bool,
     out: Vec<u8>,
 }
 
+/// Longest chunk-size or trailer line accepted. Real ones are a few
+/// bytes; the bound also keeps each search for a line's end short.
+const MAX_CHUNK_LINE: usize = 8 * 1024;
+
 /// One line from `pos`, without its line ending, and where the next
 /// begins. None until the line is complete.
-fn line_at(data: &[u8], pos: usize) -> Option<(&[u8], usize)> {
-    let nl = data.get(pos..)?.iter().position(|&b| b == b'\n')?;
-    let line = &data[pos..pos + nl];
-    Some((line.strip_suffix(b"\r").unwrap_or(line), pos + nl + 1))
+fn line_at(data: &[u8], pos: usize) -> Result<Option<(&[u8], usize)>, HttpError> {
+    let rest = data.get(pos..).unwrap_or(&[]);
+    let window = &rest[..rest.len().min(MAX_CHUNK_LINE + 1)];
+    match window.iter().position(|&b| b == b'\n') {
+        Some(nl) => {
+            let line = &rest[..nl];
+            Ok(Some((line.strip_suffix(b"\r").unwrap_or(line), pos + nl + 1)))
+        }
+        None if window.len() > MAX_CHUNK_LINE => Err(HttpError::Malformed("chunk line too long".into())),
+        None => Ok(None),
+    }
 }
 
 impl Chunks {
@@ -367,7 +409,16 @@ impl Chunks {
     /// section have arrived.
     fn advance(&mut self, data: &[u8]) -> Result<bool, HttpError> {
         loop {
-            let Some((line, start)) = line_at(data, self.pos) else { return Ok(false) };
+            if self.in_trailer {
+                // Trailer fields, up to an empty line, each read once.
+                let Some((line, next)) = line_at(data, self.pos)? else { return Ok(false) };
+                self.pos = next;
+                if line.is_empty() {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let Some((line, start)) = line_at(data, self.pos)? else { return Ok(false) };
             let size = std::str::from_utf8(line).unwrap_or("");
             let size = size.split(';').next().unwrap_or("").trim();
             if size.is_empty() || size.len() > 15 || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -375,15 +426,9 @@ impl Chunks {
             }
             let size = usize::from_str_radix(size, 16).map_err(|_| HttpError::Malformed("chunk size".into()))?;
             if size == 0 {
-                // Trailer fields, up to an empty line.
-                let mut p = start;
-                loop {
-                    let Some((line, next)) = line_at(data, p) else { return Ok(false) };
-                    if line.is_empty() {
-                        return Ok(true);
-                    }
-                    p = next;
-                }
+                self.in_trailer = true;
+                self.pos = start;
+                continue;
             }
             let Some(end) = start.checked_add(size) else {
                 return Err(HttpError::Malformed("chunk size".into()));
@@ -532,6 +577,48 @@ mod tests {
         // Twenty digits of length: refused, not wrapped.
         let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\nab"));
         assert!(matches!(get(&fake.url("/"), &limits()), Err(HttpError::Malformed(_))));
+    }
+
+    #[test]
+    fn a_length_stated_too_short_gives_way_to_what_came_before_the_close() {
+        // Five bytes claimed, eleven sent, then closed, on a request that
+        // asked for the close: the device miscounted.
+        let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello world"));
+        assert_eq!(body(&get(&fake.url("/"), &limits()).unwrap()), "hello world");
+        // The same with the connection left open: what came by the deadline.
+        let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello world").then_hold_open());
+        let quick = Limits { deadline: Duration::from_millis(300), ..limits() };
+        assert_eq!(body(&get(&fake.url("/"), &quick).unwrap()), "hello world");
+        // A request that didn't ask for the close keeps the stated length.
+        let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello world"));
+        let url = fake.url("/");
+        let r = exchange(&Request { method: "GET", url: &url, version: Version::Http11, headers: &[], body: &[] }, &limits()).unwrap();
+        assert_eq!(body(&r), "hello");
+    }
+
+    #[test]
+    fn interim_answers_count_against_the_size_bound() {
+        // One interim answer at a time, each read and set aside before the
+        // next arrives: together far more than the bound.
+        let small = Limits { max_bytes: 1000, ..limits() };
+        let fake = FakeRenderer::start(|_| {
+            let mut r = Reply::raw("HTTP/1.1 100 Continue\r\n\r\n");
+            for _ in 0..100 {
+                r = r.then(Duration::from_millis(2), "HTTP/1.1 100 Continue\r\n\r\n");
+            }
+            r.then(Duration::from_millis(2), "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        });
+        assert!(matches!(get(&fake.url("/"), &small), Err(HttpError::TooLarge(1000))));
+    }
+
+    #[test]
+    fn a_chunk_size_line_without_an_end_is_refused_early() {
+        let fake = FakeRenderer::start(|_| {
+            Reply::raw(format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}", "0".repeat(20_000))).then_hold_open()
+        });
+        let start = Instant::now();
+        assert!(matches!(get(&fake.url("/"), &limits()), Err(HttpError::Malformed(_))));
+        assert!(start.elapsed() < WAIT / 4, "{:?}", start.elapsed());
     }
 
     #[test]

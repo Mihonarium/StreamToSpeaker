@@ -317,6 +317,10 @@ pub(crate) const PROTOCOL_LIST: Limits = Limits {
     max_bytes: 64 * 1024,
 };
 
+/// How much of a refusal's body is read for its fault (see
+/// [`Fault::parse`]).
+const FAULT_BYTES: usize = 64 * 1024;
+
 /// Why a UPnP action did not succeed.
 #[derive(Debug)]
 pub(crate) struct ActionError {
@@ -345,11 +349,14 @@ pub(crate) struct Fault {
 }
 
 impl Fault {
-    /// The fault in a refusal's body, if the body is a SOAP fault. A body
-    /// the XML parser refuses (a control character in the description,
-    /// say) still has its two elements read as text.
+    /// The fault in a refusal's body, if the body is a SOAP fault. Only
+    /// the first [`FAULT_BYTES`] are read: a real fault is well under 1 KB,
+    /// and a device answering every refused key press with megabytes of
+    /// markup should cost nothing to parse. A body the XML parser refuses
+    /// (a control character in the description, say) still has its two
+    /// elements read as text.
     fn parse(body: &[u8]) -> Option<Fault> {
-        let text = String::from_utf8_lossy(body);
+        let text = String::from_utf8_lossy(&body[..body.len().min(FAULT_BYTES)]);
         let text = text.trim_start_matches('\u{feff}').trim_start();
         let (code, description) = match roxmltree::Document::parse(text) {
             Ok(doc) => {
@@ -774,6 +781,24 @@ mod tests {
         assert!(line.ends_with("…\""), "{line}");
         let told = action_error(&e).for_person("Kitchen", false, 1);
         assert!(!told.chars().any(unsafe_char) && told.chars().count() < 360, "{told}");
+    }
+
+    #[test]
+    fn a_fault_is_read_from_the_start_of_the_answer_only() {
+        let padded = |pad: usize| {
+            format!(
+                "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>{}<s:Fault><detail>\
+                 <UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>714</errorCode>\
+                 <errorDescription>Illegal MIME-type</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>",
+                "<x/>".repeat(pad)
+            )
+        };
+        // Up front, with a large tail after it: read.
+        let early = format!("{}{}", padded(0), " ".repeat(1 << 20));
+        assert_eq!(Fault::parse(early.as_bytes()).and_then(|f| f.code), Some(714));
+        // Past the first 64 KiB: not looked for.
+        let late = padded(20_000);
+        assert_eq!(Fault::parse(late.as_bytes()), None);
     }
 
     #[test]
