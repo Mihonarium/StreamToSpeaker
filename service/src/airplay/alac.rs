@@ -149,32 +149,18 @@ mod tests {
 
     #[test]
     fn n_frames_field_is_encoded_big_endian() {
-        // Pass exactly 0x01_02_03_04 frames (16,909,060) — not realistic
-        // but unambiguously verifies the 32-bit field order.
-        //
-        // The header bits before n_frames sum to 23, so n_frames begins
-        // at bit 23. Bit 23 is byte 2's bit-0 (MSB-counted) which is
-        // bit-7 in MSB-first writing. Then it spans bytes 2..6 with the
-        // 8-bit byte values shifted into byte 6's MSB.
-        //
-        // Concretely with n_frames = 0x01020304:
-        //   byte 2 bit 0..6 = previous 7 bits of header (zero pad),
-        //   byte 2 bit 7    = top bit of 0x01 (0)
-        //   byte 3          = next 8 bits = 0x02
-        //   ...
-        // For a robust check, just round-trip the build and read back
-        // the 32-bit field from where we know it ends up.
-        let mut samples = Vec::new();
-        samples.resize(0x10 * 2, 0); // arbitrary, won't be 0x01020304
+        // 0x0123 frames: the count's bytes are 00 00 01 23, so reading the
+        // field back gives 0x0123 only if it was written most significant
+        // byte first (little-endian would read back as 0x23010000).
+        let samples = vec![0i16; 0x0123 * 2];
         let frame = build_uncompressed_alac_frame(&samples);
-        // The first sample's MSB sits at bit 55; bytes 0..6 contain header
-        // bits 0..55. The n_frames field occupies bits 23..55. Extract:
+        // The 32-bit count follows the first 23 header bits, so it ends at
+        // bit 55: bytes 0..7 hold header bits 0..56, most significant first.
         let mut bits = 0u64;
         for b in &frame[0..7] {
             bits = (bits << 8) | (*b as u64);
         }
-        // bits now holds bits 0..56, MSB-first. n_frames is bits 23..55:
         let n = ((bits >> (56 - 55)) & 0xFFFF_FFFF) as u32;
-        assert_eq!(n, 0x10);
+        assert_eq!(n, 0x0123);
     }
 }

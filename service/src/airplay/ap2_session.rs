@@ -1872,6 +1872,7 @@ mod tests {
             model: Some("AudioAccessory5,1".into()),
             group: None,
             pair: None,
+            raop: Default::default(),
         };
         assert_eq!(common_codec(&[with_cn(vec![0, 1, 2, 3]), with_cn(vec![])]), Some(RealtimeCodec::Pcm));
         assert_eq!(common_codec(&[with_cn(vec![0, 1]), with_cn(vec![1])]), Some(RealtimeCodec::Alac));

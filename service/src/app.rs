@@ -101,6 +101,17 @@ impl ActiveSession {
         }
     }
 
+    /// Is this a session to a receiver that announces another speaker's
+    /// identity (see `RaopDetails::newcomer`)? Asked of the record, so
+    /// pairs count their members.
+    pub fn is_newcomer(&self) -> bool {
+        match self {
+            ActiveSession::AirPlay(s) => s.renderer.is_newcomer(),
+            ActiveSession::AirPlay2(s) => s.renderer.is_newcomer(),
+            _ => false,
+        }
+    }
+
     pub fn friendly_name(&self) -> String {
         match self {
             // display_name shows "Living Room + Kitchen" when streaming
@@ -124,8 +135,9 @@ impl ActiveSession {
     }
 
     /// Tear down — drops GENA subscription / RTSP connection /
-    /// background threads. Best-effort; receivers eventually time out
-    /// anyway, so failures here aren't fatal.
+    /// background threads. Failures aren't fatal, but the AirPlay 1
+    /// TEARDOWN matters: a receiver that isn't told keeps the session for
+    /// a while and refuses the next connect.
     pub fn stop(self) {
         match self {
             ActiveSession::Upnp(s) => stop_session(&s),
@@ -180,7 +192,7 @@ impl ActiveSession {
     /// cheap and lets the caller send without holding the session lock.
     pub fn metadata_handle(&self) -> Option<crate::airplay::session::MetadataHandle> {
         match self {
-            ActiveSession::AirPlay(s) => Some(s.metadata_handle()),
+            ActiveSession::AirPlay(s) => s.metadata_handle(),
             ActiveSession::AirPlay2(_) | ActiveSession::Upnp(_) | ActiveSession::Sendspin(_) | ActiveSession::MusicAssistant(_) => None,
         }
     }
@@ -517,6 +529,14 @@ pub struct App {
     // ---- Discovery + active session ----
     pub discovery: Option<Arc<DiscoveryState>>,
     pub airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
+    /// Passwords typed for an AirPlay receiver that announces another
+    /// speaker's identity (a newcomer, see `RaopDetails::newcomer`): used
+    /// for the next connect to it, never stored.
+    unsaved_airplay_passwords: Mutex<std::collections::HashMap<String, String>>,
+    /// AirPlay receivers (by id) that asked for a password in this run,
+    /// whether or not they announce one: picking them opens the password
+    /// dialog, as for one that does.
+    airplay_asked_password: Mutex<std::collections::HashSet<String>>,
     pub session: SharedSession,
     /// Remembered speaker id so Disable→Enable can rebind to the same one.
     pub last_speaker_id: Mutex<Option<String>>,
@@ -932,6 +952,8 @@ impl App {
             config,
             discovery,
             airplay_discovery,
+            unsaved_airplay_passwords: Mutex::new(std::collections::HashMap::new()),
+            airplay_asked_password: Mutex::new(std::collections::HashSet::new()),
             session,
             last_speaker_id,
             hub: StreamHub::new(),
@@ -1288,8 +1310,18 @@ impl App {
     }
 
     /// Store (or clear, when `pw` is empty) the AirPlay password for a
-    /// device id and persist it.
+    /// device id and persist it. For a receiver that announces another
+    /// speaker's identity it is kept only for its next connect.
     pub fn set_airplay_password(&self, id: &str, pw: &str) {
+        if self.is_airplay_newcomer(id) {
+            let mut unsaved = self.unsaved_airplay_passwords.lock().unwrap();
+            if pw.is_empty() {
+                unsaved.remove(id);
+            } else {
+                unsaved.insert(id.to_string(), pw.to_string());
+            }
+            return;
+        }
         let mut uc = self.user_config.lock().unwrap();
         if pw.is_empty() {
             uc.remove_airplay_password(id);
@@ -1299,14 +1331,25 @@ impl App {
         uc.save();
     }
 
-    /// Whether a discovered device is password-protected (needs a
-    /// password entered before it can connect).
-    pub fn is_password_protected(&self, id: &str) -> bool {
+    /// Does `id` name a discovered AirPlay receiver (or pair) that
+    /// announces another speaker's identity? Asked of the record.
+    fn is_airplay_newcomer(&self, id: &str) -> bool {
         self.airplay_discovery
             .as_ref()
             .and_then(|d| d.find_by_id(id))
-            .map(|r| r.password_protected)
-            .unwrap_or(false)
+            .is_some_and(|r| r.is_newcomer())
+    }
+
+    /// Whether a discovered device is password-protected (needs a
+    /// password entered before it can connect).
+    pub fn is_password_protected(&self, id: &str) -> bool {
+        self.airplay_asked_password.lock().unwrap().contains(id)
+            || self
+                .airplay_discovery
+                .as_ref()
+                .and_then(|d| d.find_by_id(id))
+                .map(|r| r.password_protected)
+                .unwrap_or(false)
     }
 
     /// Whether to forward Windows "now playing" to the speaker.
@@ -2249,6 +2292,18 @@ impl App {
     /// entry point of the web API / tray toggle / launch reconnect, where
     /// nobody could answer a PIN prompt).
     pub fn select_speaker(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        // A receiver announcing another speaker's identity plays only when
+        // a person picks it in the window, never through this entry: the
+        // web API (which scripts can drive), the launch connect, a resync
+        // (which leaves the session playing) or Enable.
+        if self.is_airplay_newcomer(id) {
+            // Its name says what it is ("<speaker> — another receiver with
+            // the same ID: …").
+            return Err(format!(
+                "To play to “{}”, pick it in the Stream To Speaker window.",
+                self.speaker_name(id).unwrap_or_else(|| id.to_string())
+            ));
+        }
         self.note_user_pick();
         // Claim the same `connecting` slot the background connects use, so
         // the two can't run at once and auto-connect sees this one.
@@ -2289,6 +2344,16 @@ impl App {
         user_choice: bool,
         sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
     ) -> Result<(), String> {
+        // A receiver that announces another speaker's identity is played
+        // only when a person picks it, one session at a time: no
+        // reconnect, no automatic connect.
+        if !user_choice && self.is_airplay_newcomer(id) {
+            return Err(format!(
+                "Not connecting to {} by itself: it announces the same identity as another speaker. Pick it in the \
+                 speaker list to play to it.",
+                self.speaker_name(id).unwrap_or_else(|| id.to_string())
+            ));
+        }
         if user_choice {
             self.streaming_enabled.store(true, Ordering::Release);
         }
@@ -2374,6 +2439,7 @@ impl App {
             self.start_upnp(id)?
         };
         let actual_id = new_session.stable_id();
+        let is_newcomer = new_session.is_newcomer();
 
         let mut guard = self.session.lock().unwrap();
         if let Some(old) = guard.take() {
@@ -2443,7 +2509,9 @@ impl App {
         // to flow, and a user can complete step 2 without realising
         // they still need step 1. The card stays visible until they
         // click "Hide this guide" themselves.
-        {
+        // (Not a receiver announcing another speaker's identity: the next
+        // launch must not connect to it by itself.)
+        if !is_newcomer {
             let mut uc = self.user_config.lock().unwrap();
             if uc.last_speaker_id.as_deref() != Some(actual_id.as_str()) {
                 uc.last_speaker_id = Some(actual_id.clone());
@@ -2805,6 +2873,11 @@ impl App {
         renderer: &AirPlayRenderer,
         discovery: Option<&AirPlayDiscoveryState>,
     ) -> Vec<(Transport, AirPlayRenderer)> {
+        // A newcomer is played over what it announced itself and nothing
+        // else: no sibling record is borrowed for it.
+        if renderer.is_newcomer() {
+            return renderer.transport().map(|t| vec![(t, renderer.clone())]).unwrap_or_default();
+        }
         // A stereo pair plays over AirPlay 2 on every member, or not at all.
         if renderer.pair.is_some() {
             return renderer
@@ -2821,7 +2894,7 @@ impl App {
             discovery.and_then(|d| {
                 d.renderers()
                     .into_iter()
-                    .find(|r| r.ip == renderer.ip && r.supports_airplay2())
+                    .find(|r| r.ip == renderer.ip && r.supports_airplay2() && !r.is_newcomer())
             })
         };
         let raop = renderer.supports_legacy_raop();
@@ -2868,42 +2941,83 @@ impl App {
         match transport {
             Transport::RaopLegacy => {
                 let samples_rx = self.hub.subscribe();
-                let (mfi_encryption, uncompressed_alac, password, latency_ms) = {
+                let stable_id = renderer.stable_id();
+                // Nothing stored for a speaker goes to a newcomer: only a
+                // password typed for it, once.
+                let stored = !renderer.is_newcomer();
+                let (mfi_encryption, uncompressed_alac, password, latency_ms, opener_hint) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.airplay_mfi_encryption,
                         uc.airplay_uncompressed_alac,
-                        uc.airplay_passwords.get(&renderer.stable_id()).cloned(),
-                        uc.airplay_latency_ms_for(&renderer.stable_id()),
+                        uc.airplay_passwords
+                            .get(&stable_id)
+                            .filter(|_| stored)
+                            .cloned()
+                            .or_else(|| self.unsaved_airplay_passwords.lock().unwrap().remove(&stable_id)),
+                        if stored { uc.airplay_latency_ms_for(&stable_id) } else { uc.effective_airplay_latency_ms() },
+                        uc.speaker_settings.get(&stable_id).and_then(|s| s.airplay_opener).filter(|_| stored),
                     )
                 };
-                let session = AirPlaySession::start(AirPlaySessionConfig {
-                    renderer,
-                    local_ip,
-                    samples_rx,
-                    initial_volume: Some(self.airplay_start_volume()),
-                    // Short — RAOP OPTIONS is a sub-100 ms LAN round-trip, so
-                    // a dead/vestigial RAOP service (Sonos) fails fast and we
-                    // move on to AirPlay 2.
-                    connect_timeout: Duration::from_secs(3),
-                    mfi_encryption,
-                    uncompressed_alac,
-                    password,
-                    latency_ms,
-                })
-                .map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
+                // The receiver's other announced addresses, tried in turn
+                // when the TCP connection can't be made.
+                let lan = crate::discovery_net::LanTargets::current();
+                let routes = crate::airplay::session::routes_for(
+                    &renderer,
+                    crate::airplay::session::Route { receiver: renderer.ip, local: local_ip },
+                    |a| crate::airplay::discovery::may_contact(a, &lan),
+                    |a| self.local_ip_toward(a).ok(),
+                );
+                // A connect that takes long says what it waits for, in
+                // the notice the connecting banner clears when it ends.
+                let name = renderer.friendly_name.clone();
+                let notice = |detail: &str| self.record_error(format!("{}{} — {}", STILL_CONNECTING_PREFIX, name, detail));
+                let session = AirPlaySession::start_with_notices(
+                    AirPlaySessionConfig {
+                        renderer,
+                        routes,
+                        samples_rx,
+                        initial_volume: Some(self.airplay_start_volume()),
+                        timeouts: crate::airplay::session::RaopTimeouts::STANDARD,
+                        mfi_encryption,
+                        uncompressed_alac,
+                        password,
+                        latency_ms,
+                        opener_hint,
+                    },
+                    &notice,
+                );
+                // Start with the opener that worked last time, until it fails.
+                let remembered = crate::airplay::session::next_opener_memory(session.as_ref().ok().map(|s| s.opener()));
+                if stored && remembered != opener_hint {
+                    let mut settings = self.speaker_settings(&stable_id);
+                    settings.airplay_opener = remembered;
+                    self.set_speaker_settings(&stable_id, settings);
+                }
+                if let Some(s) = session.as_ref().err().and_then(|e| e.downcast_ref::<crate::airplay::session::SignInNeeded>()) {
+                    if matches!(s.why, crate::airplay::rtsp::SignIn::PasswordNeeded | crate::airplay::rtsp::SignIn::PasswordRejected) {
+                        self.airplay_asked_password.lock().unwrap().insert(stable_id.clone());
+                    }
+                }
+                let session = session.map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
+                // Up: RECORD answered, any password accepted.
+                if let Some(d) = self.airplay_discovery.as_deref() {
+                    d.note_session(&session.renderer);
+                }
                 Ok(ActiveSession::AirPlay(session))
             }
             Transport::AirPlay2 => {
                 let stable_id = renderer.stable_id();
+                // Nothing stored for a speaker goes to a newcomer.
+                let own = !renderer.is_newcomer();
                 let (prefer_realtime, stored, latency_ms, homepod_realtime, homepod_latency_ms) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.prefer_realtime_airplay,
-                        uc.airplay_pairings.get(&stable_id).cloned(),
-                        uc.airplay_latency_ms_for(&stable_id),
+                        uc.airplay_pairings.get(&stable_id).filter(|_| own).cloned(),
+                        if own { uc.airplay_latency_ms_for(&stable_id) } else { uc.effective_airplay_latency_ms() },
                         !uc.airplay_homepod_buffered,
-                        uc.homepod_latency_ms_for(&stable_id),
+                        if own { uc.homepod_latency_ms_for(&stable_id) } else { uc.effective_homepod_latency_ms() },
                     )
                 };
                 // Parsed before anything is dialled: a damaged entry is the
@@ -2928,7 +3042,12 @@ impl App {
                     homepod_realtime,
                     homepod_latency_ms,
                 }) {
-                    Ok(session) => Ok(ActiveSession::AirPlay2(session)),
+                    Ok(session) => {
+                        if let Some(d) = self.airplay_discovery.as_deref() {
+                            d.note_session(&session.renderer);
+                        }
+                        Ok(ActiveSession::AirPlay2(session))
+                    }
                     Err(e) => Err(ap2_attempt_error(e, addr)),
                 }
             }
@@ -4079,6 +4198,10 @@ impl App {
         let rows = self.speaker_view_opts(true).speakers;
         let mut candidates: Vec<PlayerCandidate> = rows
             .iter()
+            // A receiver announcing another speaker's identity plays only
+            // when a person picks it in the window: `--player` never takes
+            // it, nor lets it stand in for the speaker it claims to be.
+            .filter(|r| !self.is_airplay_newcomer(&r.id))
             .map(|r| {
                 // The names the list shows, without its labels around them
                 // ("Kitchen (AirPlay)", "Den (AirPlay, added manually)").
@@ -7052,6 +7175,258 @@ mod tests {
         assert!(first.contains("one-time pairing") && !first.contains("Forget pairing"), "{first}");
     }
 
+    /// An app with AirPlay discovery, on in-memory settings.
+    fn airplay_test_app() -> (Arc<App>, Arc<AirPlayDiscoveryState>) {
+        airplay_test_app_with(AirPlayDiscoveryState::new())
+    }
+
+    fn airplay_test_app_with(discovery: Arc<AirPlayDiscoveryState>) -> (Arc<App>, Arc<AirPlayDiscoveryState>) {
+        // Never the settings of whoever runs the tests; no `--advertise-ip`,
+        // so each receiver gets this PC's address toward it.
+        let app = App::with_settings(
+            AppConfig { advertise_ip: None, ..App::test_config() },
+            UserConfig::in_memory(),
+            None,
+            Some(discovery.clone()),
+        );
+        (app, discovery)
+    }
+
+    const KITCHEN: &str = "airplay:B8E93735AC11";
+    const KITCHEN_2: &str = "airplay:B8E93735AC11/b8e93735ac11@kitchen 2._raop._tcp.local.";
+
+    /// Discovery on 192.168.1.0/24 that has a speaker (Kitchen, with an
+    /// AirPlay 2 record) and a newcomer claiming its MAC at the same
+    /// address and one more.
+    fn conflict_discovery() -> Arc<AirPlayDiscoveryState> {
+        use mdns_sd::ServiceInfo;
+        let d = AirPlayDiscoveryState::with_lan(crate::discovery_net::LanTargets::from_networks([("192.168.1.10".parse().unwrap(), 24)]));
+        let raop = crate::airplay::discovery::RAOP_SERVICE;
+        let txt = &[("et", "0,1"), ("cn", "0,1")][..];
+        d.ingest_for_tests(raop, &ServiceInfo::new(raop, "B8E93735AC11@Kitchen", "k.local.", "192.168.1.65", 5000, txt).unwrap());
+        d.ingest_for_tests(raop, &ServiceInfo::new(raop, "B8E93735AC11@Kitchen 2", "e.local.", "192.168.1.65,192.168.1.66", 6666, txt).unwrap());
+        let ap2 = crate::airplay::discovery::AIRPLAY_SERVICE;
+        let ap2_txt = &[("deviceid", "B8:E9:37:35:AC:11"), ("features", "0x445F8A00,0x1C340")][..];
+        d.ingest_for_tests(ap2, &ServiceInfo::new(ap2, "Kitchen", "k.local.", "192.168.1.65", 7000, ap2_txt).unwrap());
+        Arc::new(d)
+    }
+
+    /// A newcomer is sent nothing stored for the speaker: not under its own
+    /// id, and not when its record carries the speaker's plain id (the
+    /// gate asks the record). The speaker itself is.
+    #[test]
+    fn a_newcomer_never_gets_the_stored_password() {
+        use crate::airplay::fake_raop::{Answer, FakeRaop, Reply};
+        let rx = FakeRaop::start(|req| match req.header("Authorization") {
+            None => Answer::Reply(Reply::status(401, "Unauthorized").header("WWW-Authenticate", "Digest realm=\"raop\", nonce=\"1\"")),
+            Some(_) => Answer::Normal,
+        });
+        let (app, _discovery) = airplay_test_app();
+        let mut incumbent = crate::airplay::raop_transcripts::receiver(&rx, "0D0000000001", &[0, 1]);
+        incumbent.raop.instance = Some("0d0000000001@speaker._raop._tcp.local.".into());
+        app.user_config.lock().unwrap().airplay_passwords.insert(incumbent.stable_id(), "hunter2".into());
+        let mut newcomer = incumbent.clone();
+        newcomer.raop.instance = Some("0d0000000001@speaker 2._raop._tcp.local.".into());
+        newcomer.raop.newcomer = true;
+        let mut newcomer_plain_id = incumbent.clone();
+        newcomer_plain_id.raop.instance = None;
+        newcomer_plain_id.raop.newcomer = true;
+        assert_eq!(newcomer_plain_id.stable_id(), incumbent.stable_id());
+
+        for n in [newcomer, newcomer_plain_id] {
+            assert!(app.start_airplay_one(Transport::RaopLegacy, n, ip("127.0.0.1")).is_err());
+        }
+        assert!(rx.requests().iter().all(|r| r.header("Authorization").is_none()), "{:?}", rx.lines());
+
+        match app.start_airplay_one(Transport::RaopLegacy, incumbent, ip("127.0.0.1")) {
+            Ok(s) => s.stop(),
+            Err(_) => panic!("the incumbent connects with its password"),
+        }
+        assert!(rx.requests().iter().any(|r| r.header("Authorization").is_some()));
+    }
+
+    /// A password typed for a newcomer is used for its next connect and
+    /// not stored; the speaker's stored password stays the speaker's.
+    #[test]
+    fn a_password_typed_for_a_newcomer_is_used_once_and_not_stored() {
+        use crate::airplay::fake_raop::{Answer, FakeRaop, Reply};
+        let rx = FakeRaop::start(|req| match req.header("Authorization") {
+            None => Answer::Reply(Reply::status(401, "Unauthorized").header("WWW-Authenticate", "Digest realm=\"raop\", nonce=\"1\"")),
+            Some(_) => Answer::Normal,
+        });
+        let (app, discovery) = airplay_test_app_with(conflict_discovery());
+        assert!(discovery.find_by_id(KITCHEN_2).unwrap().is_newcomer());
+        app.user_config.lock().unwrap().airplay_passwords.insert(KITCHEN.into(), "hunter2".into());
+
+        // The window's password dialog stores what was typed, then connects.
+        app.set_airplay_password(KITCHEN_2, "typed");
+        assert!(!app.user_config.lock().unwrap().airplay_passwords.contains_key(KITCHEN_2));
+
+        // The newcomer's record, pointed at the test receiver.
+        let mut newcomer = crate::airplay::raop_transcripts::receiver(&rx, "B8E93735AC11", &[0, 1]);
+        newcomer.raop.instance = Some("b8e93735ac11@kitchen 2._raop._tcp.local.".into());
+        newcomer.raop.newcomer = true;
+        assert_eq!(newcomer.stable_id(), KITCHEN_2);
+        match app.start_airplay_one(Transport::RaopLegacy, newcomer.clone(), ip("127.0.0.1")) {
+            Ok(s) => s.stop(),
+            Err(_) => panic!("the typed password is used"),
+        }
+        let auth: Vec<_> = rx.requests().iter().filter_map(|r| r.header("Authorization").map(str::to_string)).collect();
+        assert!(!auth.is_empty());
+        // Only for that connect.
+        let before = rx.requests().len();
+        assert!(app.start_airplay_one(Transport::RaopLegacy, newcomer, ip("127.0.0.1")).is_err());
+        assert!(rx.requests()[before..].iter().all(|r| r.header("Authorization").is_none()));
+        assert_eq!(app.user_config.lock().unwrap().airplay_passwords.len(), 1);
+    }
+
+    /// A speaker that asks for a password it never announced gets the
+    /// password dialog on the next pick, as one that announces it does.
+    #[test]
+    fn a_speaker_that_asks_for_a_password_gets_the_dialog_next_time() {
+        use crate::airplay::fake_raop::{Answer, FakeRaop, Reply};
+        let rx = FakeRaop::start(|_| {
+            Answer::Reply(Reply::status(401, "Unauthorized").header("WWW-Authenticate", "Digest realm=\"raop\", nonce=\"1\""))
+        });
+        let (app, _discovery) = airplay_test_app();
+        let r = crate::airplay::raop_transcripts::receiver(&rx, "0D0000000005", &[0, 1]);
+        let id = r.stable_id();
+        assert!(!app.is_password_protected(&id));
+        let err = match app.start_airplay_one(Transport::RaopLegacy, r, ip("127.0.0.1")) {
+            Err(AttemptError::Other(e)) => e,
+            _ => panic!("refused"),
+        };
+        assert!(err.starts_with("Test Speaker asks for its AirPlay password."), "{err}");
+        assert!(app.is_password_protected(&id));
+    }
+
+    /// A receiver with an AirPlay 2 path whose AirPlay 1 record the app
+    /// always took for unsupported (`et` with 4 but not 0 or 1, no `cn`,
+    /// no `et`) is still played over AirPlay 2 only, as before: the
+    /// lenient readings of those records are for receivers without
+    /// AirPlay 2.
+    #[test]
+    fn airplay_2_receivers_keep_their_routing() {
+        let (app, _discovery) = airplay_test_app();
+        let ap2 = |et: Vec<u8>, cn: Vec<u8>| {
+            let mut r = crate::airplay::raop_transcripts::receiver_at(ip("192.168.1.5"), 5000, "0D0000000010", &et);
+            r.codecs = cn;
+            r.features = Some(crate::airplay::discovery::FEAT_AUDIO | crate::airplay::discovery::FEAT_TRANSIENT_PAIRING);
+            r.airplay_port = Some(7000);
+            r
+        };
+        for (et, cn) in [(vec![4], vec![0, 1]), (vec![4, 5], vec![0, 1]), (vec![0, 4], vec![]), (vec![], vec![0, 1])] {
+            let r = ap2(et.clone(), cn.clone());
+            let attempts: Vec<Transport> = app.airplay_attempts(&r, None).into_iter().map(|(t, _)| t).collect();
+            assert_eq!(attempts, [Transport::AirPlay2], "et {et:?} cn {cn:?}");
+        }
+        // A record the app has always played keeps its AirPlay 1 attempt
+        // first.
+        let attempts: Vec<Transport> = app.airplay_attempts(&ap2(vec![0, 4], vec![0, 1]), None).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(attempts, [Transport::RaopLegacy, Transport::AirPlay2]);
+    }
+
+    /// Nothing automatic connects to a newcomer (the drop reconnect and
+    /// "connect always" come through here without a person's choice).
+    #[test]
+    fn nothing_automatic_connects_to_a_newcomer() {
+        let (app, _discovery) = airplay_test_app_with(conflict_discovery());
+        let err = app.select_speaker_opts(KITCHEN_2, false, false).expect_err("refused");
+        assert!(err.starts_with("Not connecting to ") && err.contains("same identity as another speaker"), "{err}");
+    }
+
+    /// The web API (and the other callers of `select_speaker`: the launch
+    /// connect, a resync, Enable) refuses a newcomer; the window's pick is
+    /// the only way to play to it.
+    #[test]
+    fn the_web_api_refuses_a_newcomer() {
+        let (app, _discovery) = airplay_test_app_with(conflict_discovery());
+        let err = app.select_speaker(KITCHEN_2).expect_err("refused");
+        assert_eq!(
+            err,
+            "To play to “Kitchen — another receiver with the same ID: Kitchen 2 (192.168.1.66)”, pick it in the Stream To \
+             Speaker window."
+        );
+        assert!(app.connecting_to().is_none());
+    }
+
+    /// `--player` never takes a newcomer, whatever it is asked for: not by
+    /// its address, its own name or its row's name, and not in place of
+    /// the speaker when the speaker is hidden. The speaker is found as
+    /// usual.
+    #[test]
+    fn player_never_takes_a_newcomer() {
+        use mdns_sd::ServiceInfo;
+        let (app, discovery) = airplay_test_app_with(conflict_discovery());
+        // One more, at nothing but the speaker's own address.
+        let raop = crate::airplay::discovery::RAOP_SERVICE;
+        let txt = &[("et", "0,1"), ("cn", "0,1")][..];
+        discovery.ingest_for_tests(raop, &ServiceInfo::new(raop, "B8E93735AC11@Kitchen 3", "e3.local.", "192.168.1.65", 6667, txt).unwrap());
+        let kitchen_3 = "airplay:B8E93735AC11/b8e93735ac11@kitchen 3._raop._tcp.local.";
+        assert!(discovery.find_by_id(kitchen_3).unwrap().is_newcomer());
+        // While the two claims last, each row's name carries its address.
+        let speaker_row = discovery.find_by_id(KITCHEN).unwrap().friendly_name;
+        let newcomer_row = discovery.find_by_id(KITCHEN_2).unwrap().friendly_name;
+        let found = |q: &str| app.find_listed_speaker(q).map(|m| (m.id, m.how));
+
+        assert_eq!(found(&speaker_row), Some((KITCHEN.to_string(), PlayerMatchKind::FullName)));
+        assert_eq!(found("192.168.1.65"), Some((KITCHEN.to_string(), PlayerMatchKind::Address)));
+        assert_eq!(found("Kit").map(|(id, _)| id), Some(KITCHEN.to_string()));
+        for q in ["Kitchen 2", "Kitchen 3", "192.168.1.66", newcomer_row.as_str(), "another receiver"] {
+            assert_eq!(found(q), None, "{q}");
+        }
+        // The speaker hidden: still reached by its address and full name,
+        // and part of a name finds nothing rather than a newcomer.
+        let mut hidden = app.speaker_settings(KITCHEN);
+        hidden.hidden = true;
+        app.set_speaker_settings(KITCHEN, hidden);
+        assert_eq!(found("192.168.1.65"), Some((KITCHEN.to_string(), PlayerMatchKind::Address)));
+        assert_eq!(found(&speaker_row), Some((KITCHEN.to_string(), PlayerMatchKind::FullName)));
+        assert_eq!(found("Kit"), None);
+    }
+
+    /// A newcomer at the speaker's own address is never given the
+    /// speaker's AirPlay 2 record as its sibling (that path would use the
+    /// speaker's stored pairing): it is played over what it announced.
+    #[test]
+    fn a_newcomer_borrows_no_sibling_record() {
+        use mdns_sd::ServiceInfo;
+        let (app, discovery) = airplay_test_app_with(conflict_discovery());
+        // One that announces nothing but the speaker's own address.
+        let raop = crate::airplay::discovery::RAOP_SERVICE;
+        let txt = &[("et", "0,1"), ("cn", "0,1")][..];
+        discovery.ingest_for_tests(raop, &ServiceInfo::new(raop, "B8E93735AC11@Kitchen 3", "e3.local.", "192.168.1.65", 6667, txt).unwrap());
+        let id = "airplay:B8E93735AC11/b8e93735ac11@kitchen 3._raop._tcp.local.";
+        let newcomer = discovery.find_by_id(id).unwrap();
+        assert_eq!(newcomer.ip, ip("192.168.1.65"));
+        let attempts = app.airplay_attempts(&newcomer, Some(&discovery));
+        assert_eq!(attempts.len(), 1);
+        assert_eq!((attempts[0].0, attempts[0].1.stable_id().as_str()), (Transport::RaopLegacy, id));
+        // The speaker itself still gets both paths.
+        let kitchen = discovery.find_by_id(KITCHEN).unwrap();
+        assert_eq!(app.airplay_attempts(&kitchen, Some(&discovery)).len(), 2);
+    }
+
+    /// The address that carried a session is remembered only once the
+    /// session is up, not when a connect got part of the way.
+    #[test]
+    fn only_a_session_that_came_up_marks_its_address() {
+        use crate::airplay::fake_raop::{Answer, FakeRaop, Reply};
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
+            ("RECORD", 0) => Answer::Reply(Reply::status(500, "Internal Server Error")),
+            _ => Answer::Normal,
+        });
+        let (app, discovery) = airplay_test_app();
+        let r = crate::airplay::raop_transcripts::receiver(&rx, "0D0000000002", &[0, 1]);
+        assert!(app.start_airplay_one(Transport::RaopLegacy, r.clone(), ip("127.0.0.1")).is_err());
+        assert_eq!(discovery.working_address("0D0000000002"), None);
+        match app.start_airplay_one(Transport::RaopLegacy, r, ip("127.0.0.1")) {
+            Ok(s) => s.stop(),
+            Err(_) => panic!("the second connect works"),
+        }
+        assert_eq!(discovery.working_address("0D0000000002"), Some(ip("127.0.0.1")));
+    }
+
     /// Starting the AirPlay 2 path with a stored pairing, whatever the
     /// receiver answers to pair-verify: the attempt says why it failed,
     /// the pairing stays as it was (only a new PIN pairing or the user's
@@ -7086,6 +7461,7 @@ mod tests {
                 model: None,
                 group: None,
                 pair: None,
+                raop: Default::default(),
             };
             let id = receiver.stable_id();
             app.user_config.lock().unwrap().airplay_pairings.insert(id.clone(), creds.clone());

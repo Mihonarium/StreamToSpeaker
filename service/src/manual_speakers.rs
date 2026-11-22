@@ -387,6 +387,7 @@ pub fn airplay_renderer(
         model: info.and_then(|i| i.model.clone()),
         group: None,
         pair: None,
+        raop: Default::default(),
     }
 }
 

@@ -25,11 +25,20 @@
 //!
 //! | Key | Meaning                                              |
 //! |-----|------------------------------------------------------|
-//! | `cn`      | Comma-separated codecs: 0=PCM 1=ALAC 2=AAC ... |
-//! | `et`      | Comma-separated encryption types: 0=none 1=RSA 3=FairPlay 4=FairPlay-SAPv2.5 5=MFi |
+//! | `cn`      | Comma-separated codecs: 0=PCM 1=ALAC 2=AAC 3=AAC-ELD; absent = ALAC (every RAOP receiver plays it) |
+//! | `et`      | Comma-separated encryption types: 0=none 1=RSA (AirPort Express key) 3=FairPlay 4=MFi-SAP (third-party MFi devices) 5=FairPlay SAPv2.5; absent = none |
+//! | `tp`      | Transports: `UDP`, `TCP`; one without UDP is unsupported here |
+//! | `md`      | Metadata it takes: 0=track text 1=artwork 2=progress |
 //! | `vn`      | RSA version (3 = the published Apple key)       |
 //! | `pw`      | Password protected                              |
-//! | `am`      | Apple model — purely informational              |
+//! | `ek`      | Expects an encryption key (classic AirPort Express) |
+//! | `am`      | Apple model, e.g. `AirPort4,107`                |
+//!
+//! `et` decides the encryption: plaintext when 0 is offered, and for MFi
+//! receivers (`et` lists 4, with or without 0) after `/auth-setup`, as
+//! OwnTone and libraop do; RSA for classic AirPort Express (see
+//! [`AirPlayRenderer::prefers_rsa_encryption`]); never FairPlay, so a
+//! receiver offering only 3 and/or 5 is unsupported.
 //!
 //! ## AirPlay 2 TXT keys (`_airplay._tcp`)
 //!
@@ -57,11 +66,14 @@
 use anyhow::Result;
 use log::{debug, info, warn};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo, TxtProperties};
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::collections::{BTreeSet, HashMap};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::discovery_net::LanTargets;
 
 /// Service type for AirPlay 1 / RAOP audio receivers.
 pub const RAOP_SERVICE: &str = "_raop._tcp.local.";
@@ -116,12 +128,14 @@ pub struct AirPlayRenderer {
     /// RTSP port advertised by `_airplay._tcp` (the AirPlay-2 endpoint),
     /// if present (usually 7000).
     pub airplay_port: Option<u16>,
-    /// Encryption types from RAOP `et=` (0=none 1=RSA 3/4/5=FairPlay).
+    /// Encryption types from RAOP `et=` (0=none 1=RSA 3=FairPlay 4=MFi-SAP
+    /// 5=FairPlay SAPv2.5); see the table at the top of this module.
     pub encryption_types: Vec<u8>,
     /// Codec ids from RAOP `cn=` (1=ALAC).
     pub codecs: Vec<u8>,
-    /// True if the RAOP service set `pw=true` (password protected). We
-    /// don't speak RAOP HTTP-digest auth, so these are legacy-unsupported.
+    /// True if the RAOP service set `pw=true` (password protected). These
+    /// are supported: the session answers RTSP Digest auth with the
+    /// stored password, and the window asks for one.
     pub password_protected: bool,
     /// The RAOP `ek=1` flag — "encryption key (expected)". Classic
     /// AirPort Express advertises it and genuinely wants an RSA-wrapped
@@ -142,6 +156,103 @@ pub struct AirPlayRenderer {
     pub group: Option<GroupTxt>,
     /// Set on the synthetic entry that stands for a whole stereo pair.
     pub pair: Option<StereoPair>,
+    /// What the `_raop._tcp` announcement says beyond the fields above.
+    pub raop: RaopDetails,
+}
+
+/// Details of a receiver's `_raop._tcp` announcement. Default (empty)
+/// for a receiver without one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RaopDetails {
+    /// The TXT record as announced, in order, for the log of a connect.
+    pub txt: Vec<(String, String)>,
+    /// Every IPv4 address announced for the service, in the order a
+    /// connect tries them (see [`order_addresses`]); `ip` is the first.
+    pub addresses: Vec<IpAddr>,
+    /// `tp`: the transports it offers (`UDP`, `TCP`), when it says.
+    pub transports: Option<Vec<String>>,
+    /// `md`: the metadata it takes: 0 track text, 1 artwork, 2 progress.
+    pub metadata: Vec<u8>,
+    /// The `_raop._tcp` instance (full name, lower case) this entry
+    /// describes.
+    pub instance: Option<String>,
+    /// Set when another live instance claimed this entry's identity (MAC)
+    /// before it. Gates ask [`AirPlayRenderer::is_newcomer`]: a newcomer
+    /// is played only when a person picks it (by its own id,
+    /// `airplay:<MAC>/<instance>`), one session at a time, is never folded
+    /// into a stereo pair or taken as another entry's AirPlay 2 sibling,
+    /// and nothing stored for a speaker is used with it.
+    pub newcomer: bool,
+}
+
+/// May a connect go to `ip`, an address a receiver announced? Each is
+/// judged by the classification UPnP discovery uses
+/// ([`LanTargets::refusal`]; an IPv4-mapped IPv6 address counts as the
+/// IPv4 address it carries): this PC (loopback, one of its own addresses)
+/// and what is no device's address (unspecified, multicast, broadcast,
+/// a subnet's own address) are dropped; an address outside this PC's
+/// subnets stays (a speaker on another VLAN, announced through an mDNS
+/// repeater). Only IPv4: AirPlay 1 has never connected over IPv6 here,
+/// and this PC's own IPv6 addresses aren't known to the classification.
+/// A receiver running on this PC is added by address instead.
+pub fn may_contact(ip: IpAddr, lan: &LanTargets) -> bool {
+    let ip = crate::stream_gate::canonical_ip(ip);
+    match lan.refusal(ip) {
+        None | Some(crate::discovery_net::Refusal::Elsewhere(_)) => ip.is_ipv4(),
+        Some(_) => false,
+    }
+}
+
+/// The addresses of `addrs` a connect tries, in order: the one that last
+/// carried a session in this run, then those on a subnet of one of this
+/// PC's adapters, then other routable ones, then link-local, each group by
+/// address so the order is the same on every start. Only addresses a
+/// connect may go to are kept (see [`may_contact`]); link-local addresses
+/// stay, since a PC and a speaker on a link with no DHCP use them.
+pub fn order_addresses(addrs: &[IpAddr], working: Option<IpAddr>, lan: &LanTargets) -> Vec<IpAddr> {
+    let class = |a: &IpAddr| -> u8 {
+        let link_local = matches!(a, IpAddr::V4(v4) if v4.is_link_local());
+        if Some(*a) == working {
+            0
+        } else if lan.allows(*a) {
+            1
+        } else if !link_local {
+            2
+        } else {
+            3
+        }
+    };
+    let mut v: Vec<IpAddr> = addrs.iter().copied().filter(|a| may_contact(*a, lan)).collect();
+    v.sort_by_key(|a| (class(a), *a));
+    v.dedup();
+    v
+}
+
+/// Most TXT entries, and characters per value, a log line shows.
+const TXT_LOG_ENTRIES: usize = 40;
+const TXT_LOG_VALUE_CHARS: usize = 100;
+
+impl RaopDetails {
+    /// The TXT record for a log line: `key="value"` pairs, values quoted
+    /// and escaped (they come from the network) and cut short.
+    pub fn txt_line(&self) -> String {
+        let mut parts: Vec<String> = self
+            .txt
+            .iter()
+            .take(TXT_LOG_ENTRIES)
+            .map(|(k, v)| {
+                let mut cut: String = v.chars().take(TXT_LOG_VALUE_CHARS).collect();
+                if cut.len() < v.len() {
+                    cut.push('…');
+                }
+                format!("{}={:?}", k.escape_debug(), cut)
+            })
+            .collect();
+        if self.txt.len() > TXT_LOG_ENTRIES {
+            parts.push(format!("(and {} more)", self.txt.len() - TXT_LOG_ENTRIES));
+        }
+        parts.join(" ")
+    }
 }
 
 /// Group-related TXT keys of one receiver.
@@ -176,26 +287,75 @@ impl AirPlayRenderer {
     /// Stable identifier used by the UI / persistence layer. Prefixed so
     /// it can't collide with the UPnP `Renderer::stable_id()`.
     pub fn stable_id(&self) -> String {
-        match &self.pair {
-            Some(p) => format!("{}{}", PAIR_ID_PREFIX, p.tsid),
-            None => format!("airplay:{}", self.mac_id),
+        match (&self.pair, self.raop.newcomer.then_some(self.raop.instance.as_deref()).flatten()) {
+            (Some(p), _) => format!("{}{}", PAIR_ID_PREFIX, p.tsid),
+            (None, Some(instance)) => format!("airplay:{}/{}", self.mac_id, instance),
+            (None, None) => format!("airplay:{}", self.mac_id),
         }
     }
 
     /// True if this device exposes a usable **legacy RAOP** path: a RAOP
-    /// port, ALAC, no password, and either no-encryption or Apple-RSA
-    /// (i.e. not a FairPlay-only `et`).
+    /// port, ALAC, and either no encryption or Apple-RSA (i.e. not a
+    /// FairPlay-only `et`). Password-protected (`pw=true`) receivers are
+    /// supported — we speak RTSP Digest auth.
+    ///
+    /// A receiver that also has an AirPlay 2 path is judged by the rule it
+    /// has always been routed by: its record must list ALAC (`cn` 1) and
+    /// plaintext or RSA (`et` 0 or 1), else it plays over AirPlay 2 only.
+    /// For one without, the record is read as the reference senders read
+    /// it: no codec list means ALAC (every RAOP receiver plays it; OwnTone
+    /// never reads `cn`), no `et`, or `et` with 4 but neither 0 nor 1,
+    /// means plaintext (see [`Self::raop_encryption_types`]), and a `tp`
+    /// that names transports without UDP rules it out (OwnTone discards
+    /// those; we have no TCP transport).
     pub fn supports_legacy_raop(&self) -> bool {
         if self.port == 0 {
             return false;
         }
-        if !self.codecs.contains(&1) {
+        if self.supports_airplay2() {
+            let et = &self.encryption_types;
+            return self.codecs.contains(&1) && (et.contains(&0) || et.contains(&1));
+        }
+        if let Some(tp) = &self.raop.transports {
+            if !tp.iter().any(|t| t.eq_ignore_ascii_case("UDP")) {
+                return false;
+            }
+        }
+        if !self.codecs.is_empty() && !self.codecs.contains(&1) {
             return false;
         }
-        // Password-protected (`pw=true`) receivers ARE supported — we
-        // speak RTSP Digest auth (the session uses the stored password,
-        // or the UI prompts for one).
-        self.encryption_types.contains(&0) || self.encryption_types.contains(&1)
+        let et = self.raop_encryption_types();
+        et.contains(&0) || et.contains(&1)
+    }
+
+    /// Does this entry stand for a newcomer (see [`RaopDetails::newcomer`]):
+    /// it is one, or a pair with one among its members?
+    pub fn is_newcomer(&self) -> bool {
+        self.raop.newcomer || self.pair.as_ref().is_some_and(|p| p.members.iter().any(|m| m.raop.newcomer))
+    }
+
+    /// Does the receiver take track text (`md` lists 0)? OwnTone sends
+    /// text only then (`RAOP_MD_WANTS_TEXT`), libraop likewise.
+    pub fn wants_track_text(&self) -> bool {
+        self.raop.metadata.contains(&0)
+    }
+
+    /// The `et` list to go by: as announced, with plaintext (0) added when
+    /// the receiver announced none, or announced MFi (4) without 0 or 1.
+    /// The reference senders stream plaintext to both: OwnTone reads `et`
+    /// only to decide on `/auth-setup` and encrypts only for `ek=1` or a
+    /// classic AirPort Express; libraop sends `/auth-setup` when `et`
+    /// lists 4 and encrypts only when its caller asks.
+    pub fn raop_encryption_types(&self) -> Vec<u8> {
+        let et = &self.encryption_types;
+        if et.is_empty() {
+            return vec![0];
+        }
+        let mut et = et.clone();
+        if et.contains(&4) && !et.contains(&0) && !et.contains(&1) {
+            et.insert(0, 0);
+        }
+        et
     }
 
     /// Whether to encrypt the audio with the RSA-wrapped-key path rather
@@ -312,15 +472,27 @@ impl AirPlayRenderer {
 }
 
 // ---------------------------------------------------------------------------
-// Per-service partial records. We keep RAOP and AirPlay info in separate
-// maps keyed by normalised MAC, then merge on read so resolution order
-// (and one service vanishing) can't corrupt the other half.
+// Per-service partial records. RAOP records are kept per announced
+// instance (the MAC in an instance name is only a claim), AirPlay ones by
+// MAC; they are merged on read so resolution order (and one service
+// vanishing) can't corrupt the other half.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
 struct RaopInfo {
+    /// The instance's full name, lower case: what identifies it.
+    fullname: String,
+    metadata: Vec<u8>,
+    /// The MAC the instance name claims.
+    mac: String,
+    transports: Option<Vec<String>>,
     friendly_name: String,
-    ip: Option<IpAddr>,
+    txt: Vec<(String, String)>,
+    /// Its IPv4 addresses, sorted.
+    addresses: Vec<IpAddr>,
+    /// When this instance was first resolved, in resolution order (kept
+    /// when it is resolved again).
+    first_seen: u64,
     port: u16,
     encryption_types: Vec<u8>,
     codecs: Vec<u8>,
@@ -332,7 +504,8 @@ struct RaopInfo {
 #[derive(Debug, Clone, Default)]
 struct AirPlayInfo {
     friendly_name: String,
-    ip: Option<IpAddr>,
+    /// Its IPv4 addresses, sorted.
+    addresses: Vec<IpAddr>,
     port: u16,
     features: Option<u64>,
     pk: Option<String>,
@@ -343,10 +516,58 @@ struct AirPlayInfo {
 /// Stable-id prefix of a stereo-pair entry.
 pub const PAIR_ID_PREFIX: &str = "airplay:pair:";
 
+/// How long this PC's adapter list is reused for ordering addresses.
+const LAN_REFRESH: Duration = Duration::from_secs(5);
+
+/// This PC's networks, for ordering addresses: read again every
+/// [`LAN_REFRESH`], or fixed (tests).
+#[derive(Default)]
+struct LanView {
+    fixed: Option<LanTargets>,
+    cached: Mutex<Option<(Instant, LanTargets)>>,
+}
+
+impl LanView {
+    fn get(&self) -> LanTargets {
+        if let Some(f) = &self.fixed {
+            return f.clone();
+        }
+        let mut c = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        match c.as_ref() {
+            Some((at, lan)) if at.elapsed() < LAN_REFRESH => lan.clone(),
+            _ => {
+                let lan = LanTargets::current();
+                *c = Some((Instant::now(), lan.clone()));
+                lan
+            }
+        }
+    }
+}
+
+/// Most `_raop._tcp` instances kept, and most claiming one identity
+/// (MAC): far beyond any real network (a rename shows two for a while,
+/// two receiver programs on one machine may share one), small enough that
+/// building the list on every repaint stays cheap whatever is announced.
+/// Instances past either bound are not listed (and logged once); the ones
+/// seen first stay, so an incumbent is never pushed out.
+const MAX_RAOP_INSTANCES: usize = 256;
+const MAX_CLAIMS_PER_IDENTITY: usize = 4;
+/// Most `_airplay._tcp` records kept (one per device ID), on the same
+/// reasoning.
+const MAX_AIRPLAY_RECORDS: usize = 256;
+
 /// Shared discovery state. Mirrors `ssdp::DiscoveryState` semantics.
 #[derive(Default)]
 pub struct AirPlayDiscoveryState {
+    /// `_raop._tcp` records by instance fullname (lower case).
     raop: Mutex<HashMap<String, RaopInfo>>,
+    /// Resolutions so far, for [`RaopInfo::first_seen`].
+    resolved: AtomicU64,
+    /// MAC → the address that last carried a session in this run.
+    working: Mutex<HashMap<String, IpAddr>>,
+    /// Announcements not listed because of their addresses, reported once.
+    reported: crate::discovery_net::Reported,
+    lan: LanView,
     airplay: Mutex<HashMap<String, AirPlayInfo>>,
     /// `_airplay._tcp` instance fullname → MAC, so a removal (which only
     /// names the instance) can evict the right record.
@@ -365,13 +586,23 @@ impl AirPlayDiscoveryState {
     /// Stereo-pair members are folded into one entry per pair.
     pub fn renderers(&self) -> Vec<AirPlayRenderer> {
         let singles = {
+            let lan = self.lan.get();
+            let working = self.working.lock().unwrap().clone();
             let raop = self.raop.lock().unwrap();
             let airplay = self.airplay.lock().unwrap();
-            let mut macs: HashSet<String> = HashSet::new();
-            macs.extend(raop.keys().cloned());
+            // One pass to group instances by identity.
+            let mut by_mac: HashMap<&str, Vec<&RaopInfo>> = HashMap::new();
+            for r in raop.values() {
+                by_mac.entry(r.mac.as_str()).or_default().push(r);
+            }
+            let mut macs: BTreeSet<String> = BTreeSet::new();
+            macs.extend(by_mac.keys().map(|m| m.to_string()));
             macs.extend(airplay.keys().cloned());
             macs.into_iter()
-                .filter_map(|mac| merge(&mac, raop.get(&mac), airplay.get(&mac)))
+                .flat_map(|mac| {
+                    let claims = by_mac.get(mac.as_str()).cloned().unwrap_or_default();
+                    entries_for(&mac, &claims, airplay.get(&mac), working.get(&mac).copied(), &lan)
+                })
                 .collect::<Vec<_>>()
         };
         let memory = self.pair_members.lock().unwrap().clone();
@@ -380,14 +611,33 @@ impl AirPlayDiscoveryState {
         v
     }
 
+    /// The entries for one MAC: one, or one per instance while several
+    /// claim it (see [`entries_for`]).
+    fn entries_for_mac(&self, mac: &str) -> Vec<AirPlayRenderer> {
+        let lan = self.lan.get();
+        let working = self.working.lock().unwrap().get(mac).copied();
+        let raop = self.raop.lock().unwrap();
+        let airplay = self.airplay.lock().unwrap();
+        let claims: Vec<&RaopInfo> = raop.values().filter(|r| r.mac == mac).collect();
+        entries_for(mac, &claims, airplay.get(mac), working, &lan)
+    }
+
     /// Find by our public `stable_id()` (i.e. with the `airplay:` prefix).
     /// A stereo-pair member's id resolves to its pair: playing one member
-    /// alone would break the pair.
+    /// alone would break the pair. While several instances claim one MAC,
+    /// the plain id finds the incumbent (see `entries_for`), and
+    /// `airplay:<MAC>/<instance>` the instance it names, also once the
+    /// conflict is over.
     pub fn find_by_id(&self, id: &str) -> Option<AirPlayRenderer> {
         if id.starts_with(PAIR_ID_PREFIX) {
             return self.renderers().into_iter().find(|r| r.stable_id() == id);
         }
-        let mac = id.strip_prefix("airplay:")?.to_string();
+        let rest = id.strip_prefix("airplay:")?;
+        if let Some((mac, instance)) = rest.split_once('/') {
+            let instance = instance.to_ascii_lowercase();
+            return self.entries_for_mac(mac).into_iter().find(|r| r.raop.instance.as_deref() == Some(instance.as_str()));
+        }
+        let mac = rest.to_string();
         let tsid = self
             .pair_members
             .lock()
@@ -399,9 +649,33 @@ impl AirPlayDiscoveryState {
             let pair_id = format!("{}{}", PAIR_ID_PREFIX, tsid);
             return self.renderers().into_iter().find(|r| r.stable_id() == pair_id);
         }
-        let raop = self.raop.lock().unwrap();
-        let airplay = self.airplay.lock().unwrap();
-        merge(&mac, raop.get(&mac), airplay.get(&mac))
+        self.entries_for_mac(&mac).into_iter().find(|r| !r.raop.newcomer)
+    }
+
+    /// A session to `r` came up (RECORD answered, any password
+    /// accepted): its address is tried first from now on. A session on a
+    /// newcomer changes nothing: it is one session, nothing more.
+    pub fn note_session(&self, r: &AirPlayRenderer) {
+        if !r.raop.newcomer {
+            self.working.lock().unwrap().insert(r.mac_id.clone(), r.ip);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn working_address(&self, mac: &str) -> Option<IpAddr> {
+        self.working.lock().unwrap().get(mac).copied()
+    }
+
+    /// A resolution, as the browse threads deliver it (for tests
+    /// elsewhere in the crate).
+    #[cfg(test)]
+    pub(crate) fn ingest_for_tests(&self, service: &str, info: &ServiceInfo) {
+        ingest_resolution(self, service, info);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lan(lan: LanTargets) -> Self {
+        Self { lan: LanView { fixed: Some(lan), cached: Mutex::new(None) }, ..Default::default() }
     }
 
     /// Launch reconnect for a saved stereo pair (or a saved id of one of
@@ -420,11 +694,50 @@ impl AirPlayDiscoveryState {
         }
     }
 
-    fn upsert_raop(&self, mac: String, info: RaopInfo) {
-        self.raop.lock().unwrap().insert(mac, info);
+    /// Store the record of one `_raop._tcp` instance, replacing what that
+    /// instance announced before (a new address included).
+    fn upsert_raop(&self, mut info: RaopInfo) {
+        let mut raop = self.raop.lock().unwrap();
+        let known = raop.get(&info.fullname).map(|r| r.first_seen);
+        if known.is_none() {
+            // A new instance. Bounded, so a flood of made-up announcements
+            // can't make the list (built on every repaint) expensive; what
+            // is kept is the instances seen first, the incumbents among
+            // them.
+            let same_identity = raop.values().filter(|r| r.mac == info.mac).count();
+            if same_identity >= MAX_CLAIMS_PER_IDENTITY || raop.len() >= MAX_RAOP_INSTANCES {
+                let name = crate::discovery_net::shown(&info.fullname);
+                self.reported.once(&format!("airplay-full:{}", info.fullname), || {
+                    format!("AirPlay: not listing {}: too many AirPlay receivers, or claims of one identity, announced", name)
+                });
+                return;
+            }
+            if let Some(other) = raop.values().find(|r| r.mac == info.mac) {
+                let (name, theirs) = (crate::discovery_net::shown(&info.fullname), crate::discovery_net::shown(&other.fullname));
+                let (ours_at, theirs_at) = (info.addresses.clone(), other.addresses.clone());
+                self.reported.once(&format!("airplay-claim:{}", info.fullname), || {
+                    format!(
+                        "AirPlay: {} at {:?} announces the identity of {} at {:?}; it is listed as another receiver with the same ID",
+                        name, ours_at, theirs, theirs_at
+                    )
+                });
+            }
+        }
+        info.first_seen = known.unwrap_or_else(|| self.resolved.fetch_add(1, Ordering::Relaxed));
+        raop.insert(info.fullname.clone(), info);
     }
 
     fn upsert_airplay(&self, mac: String, fullname: &str, info: AirPlayInfo) {
+        {
+            let airplay = self.airplay.lock().unwrap();
+            if !airplay.contains_key(&mac) && airplay.len() >= MAX_AIRPLAY_RECORDS {
+                let name = crate::discovery_net::shown(fullname);
+                self.reported.once(&format!("airplay2-full:{}", fullname), || {
+                    format!("AirPlay: not listing {}: too many AirPlay 2 receivers announced", name)
+                });
+                return;
+            }
+        }
         {
             let mut memory = self.pair_members.lock().unwrap();
             // A device that left a pair (or changed groups) is forgotten
@@ -458,14 +771,15 @@ impl AirPlayDiscoveryState {
     pub fn clear(&self) {
         self.raop.lock().unwrap().clear();
         self.airplay.lock().unwrap().clear();
+        self.reported.clear();
     }
 
-    fn remove(&self, mac: &str, service: &str) {
-        if service == RAOP_SERVICE {
-            self.raop.lock().unwrap().remove(mac);
-        } else {
-            self.airplay.lock().unwrap().remove(mac);
-        }
+    /// A goodbye for one `_raop._tcp` instance removes that instance only:
+    /// a renamed receiver's late goodbye for its old name leaves the new
+    /// record, and a device announcing someone else's MAC can't remove
+    /// theirs.
+    fn remove_raop_instance(&self, fullname: &str) {
+        self.raop.lock().unwrap().remove(&fullname.to_ascii_lowercase());
     }
 
     /// Evict the `_airplay._tcp` record named `fullname` — HomePods only,
@@ -517,7 +831,12 @@ fn pair_launch_step(id: &str, found: Option<&AirPlayRenderer>) -> PairLaunch {
 fn fold_pairs(singles: Vec<AirPlayRenderer>, memory: &HashMap<String, BTreeSet<String>>) -> Vec<AirPlayRenderer> {
     let pairs: HashMap<&String, &BTreeSet<String>> =
         memory.iter().filter(|(_, macs)| macs.len() >= 2).collect();
+    // A newcomer claiming a member's MAC is never folded in: it stays an
+    // entry of its own.
     let pair_of = |r: &AirPlayRenderer| -> Option<String> {
+        if r.is_newcomer() {
+            return None;
+        }
         pairs
             .iter()
             .find(|(_, macs)| macs.contains(&r.mac_id))
@@ -551,12 +870,70 @@ fn fold_pairs(singles: Vec<AirPlayRenderer>, memory: &HashMap<String, BTreeSet<S
     out
 }
 
+/// The entries for one MAC. One `_raop._tcp` instance (or none) makes one
+/// entry, as always. Several live instances claiming one MAC are never
+/// merged, whatever their addresses: anyone can announce a receiver's
+/// MAC, and with it addresses that include the receiver's own. Each is
+/// listed on its own, with only what it announced, named with its
+/// address. The incumbent is the instance the app knew before the
+/// conflict began, the one resolved first, and nothing during the
+/// conflict changes that (not a session on another one, not a newer
+/// announcement): it keeps the plain id, what is stored under it, and
+/// the `_airplay._tcp` record; the others are newcomers (see
+/// [`RaopDetails::newcomer`]). The conflict ends when one of them goes
+/// (goodbye or expiry); the one left is then an ordinary entry. A rename
+/// looks like this for as long as both names are announced.
+fn entries_for(mac: &str, claims: &[&RaopInfo], airplay: Option<&AirPlayInfo>, working: Option<IpAddr>, lan: &LanTargets) -> Vec<AirPlayRenderer> {
+    let mut claims: Vec<&RaopInfo> = claims.to_vec();
+    claims.sort_by_key(|r| r.first_seen);
+    if claims.len() <= 1 {
+        return merge(mac, claims.first().copied(), airplay, working, lan).into_iter().collect();
+    }
+    let mut out = Vec::new();
+    let incumbent = merge(mac, claims.first().copied(), airplay, working, lan);
+    // The speaker's own name, for the newcomers' rows.
+    let speaker = incumbent
+        .as_ref()
+        .map(|e| e.friendly_name.clone())
+        .or_else(|| claims.first().map(|r| r.friendly_name.clone()))
+        .unwrap_or_else(|| mac.to_string());
+    let speaker_addresses: Vec<IpAddr> = claims.first().map(|r| r.addresses.clone()).unwrap_or_default();
+    if let Some(mut e) = incumbent {
+        e.friendly_name = format!("{} ({})", e.friendly_name, e.ip);
+        out.push(e);
+    }
+    for r in claims.into_iter().skip(1) {
+        let Some(mut e) = merge(mac, Some(r), None, None, lan) else { continue };
+        // Its own addresses before any it shares with the speaker: that is
+        // where this other receiver is, and what its row shows.
+        e.raop.addresses.sort_by_key(|a| speaker_addresses.contains(a));
+        if let Some(first) = e.raop.addresses.first() {
+            e.ip = *first;
+        }
+        // Says what it is, true also for two receiver programs on one
+        // machine that share an identity; starting with the speaker's name
+        // keeps it below the speaker's row in the sorted list.
+        e.friendly_name = format!("{} — another receiver with the same ID: {} ({})", speaker, e.friendly_name, e.ip);
+        e.raop.newcomer = true;
+        out.push(e);
+    }
+    out
+}
+
 /// Build a public [`AirPlayRenderer`] from whichever partial records we
 /// have for one MAC. Returns None if neither half has a usable IPv4.
-fn merge(mac: &str, raop: Option<&RaopInfo>, airplay: Option<&AirPlayInfo>) -> Option<AirPlayRenderer> {
-    let ip = raop
-        .and_then(|r| r.ip)
-        .or_else(|| airplay.and_then(|a| a.ip))?;
+fn merge(
+    mac: &str,
+    raop: Option<&RaopInfo>,
+    airplay: Option<&AirPlayInfo>,
+    working: Option<IpAddr>,
+    lan: &LanTargets,
+) -> Option<AirPlayRenderer> {
+    let raop_addresses = raop.map(|r| order_addresses(&r.addresses, working, lan)).unwrap_or_default();
+    let ip = raop_addresses
+        .first()
+        .copied()
+        .or_else(|| airplay.and_then(|a| order_addresses(&a.addresses, working, lan).first().copied()))?;
 
     // Prefer the AirPlay-2 instance name (the user-set friendly name);
     // fall back to the RAOP `@`-suffix name.
@@ -583,27 +960,21 @@ fn merge(mac: &str, raop: Option<&RaopInfo>, airplay: Option<&AirPlayInfo>) -> O
             .or_else(|| raop.and_then(|r| r.model.clone())),
         group: airplay.and_then(|a| a.group.clone()),
         pair: None,
+        raop: RaopDetails {
+            txt: raop.map(|r| r.txt.clone()).unwrap_or_default(),
+            addresses: raop_addresses,
+            transports: raop.and_then(|r| r.transports.clone()),
+            metadata: raop.map(|r| r.metadata.clone()).unwrap_or_default(),
+            instance: raop.map(|r| r.fullname.clone()),
+            newcomer: false,
+        },
     })
 }
 
-/// Spawn the long-running mDNS browser. Browses **both** `_raop._tcp` and
-/// `_airplay._tcp` on a shared daemon; a consumer thread per service keeps
-/// the corresponding map fresh.
-///
-/// `iface_hint` is informational only — `mdns-sd` listens on all
-/// interfaces and picks the right one per outgoing query.
-pub fn spawn_airplay_discovery(
-    state: Arc<AirPlayDiscoveryState>,
-    iface_hint: Option<Ipv4Addr>,
-) -> Result<()> {
-    let daemon = ServiceDaemon::new().map_err(|e| anyhow::anyhow!("mdns daemon init: {}", e))?;
-    info!("AirPlay discovery: iface hint {:?}", iface_hint);
-    spawn_airplay_discovery_on(state, daemon)
-}
-
-/// Browse both service types on a caller-built daemon (one whose
-/// interface selection the caller controls). Consumers exit when the
-/// daemon shuts down.
+/// Browse both `_raop._tcp` and `_airplay._tcp` on a caller-built daemon
+/// (one whose interface selection the caller controls); a consumer
+/// thread per service keeps the corresponding map fresh. Consumers exit
+/// when the daemon shuts down.
 pub fn spawn_airplay_discovery_on(
     state: Arc<AirPlayDiscoveryState>,
     daemon: ServiceDaemon,
@@ -629,12 +1000,7 @@ pub fn spawn_airplay_discovery_on(
                             ingest_resolution(&state, service, &info);
                         }
                         Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
-                            debug!("AirPlay removed ({}): {}", service, fullname);
-                            if let Some(mac) = mac_from_event(service, &fullname) {
-                                state.remove(&mac, service);
-                            } else if service == AIRPLAY_SERVICE {
-                                state.remove_airplay_instance(&fullname);
-                            }
+                            ingest_removal(&state, service, &fullname);
                         }
                         Ok(_) => { /* SearchStarted / ServiceFound / etc. */ }
                         Err(flume::RecvTimeoutError::Timeout) => {}
@@ -654,9 +1020,20 @@ pub fn spawn_airplay_discovery_on(
 // Resolution ingestion
 // -----------------------------------------------------------------------------
 
+/// A goodbye (or expiry) of one instance.
+fn ingest_removal(state: &AirPlayDiscoveryState, service: &str, fullname: &str) {
+    debug!("AirPlay removed ({}): {}", service, fullname);
+    if service == RAOP_SERVICE {
+        state.remove_raop_instance(fullname);
+    } else {
+        state.remove_airplay_instance(fullname);
+    }
+}
+
 fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &ServiceInfo) {
-    let ip = first_v4(info);
+    let addresses = v4_addresses(info);
     let txt = info.get_properties();
+    report_refused(state, &state.lan.get(), info.get_fullname(), &addresses);
 
     if service == RAOP_SERVICE {
         // Service name: "<MAC>@<FriendlyName>._raop._tcp.local."
@@ -665,8 +1042,20 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
             return;
         };
         let r = RaopInfo {
+            fullname: info.get_fullname().to_ascii_lowercase(),
+            metadata: read_txt_int_list(txt, "md"),
+            mac,
+            // An empty `tp` says nothing, like none.
+            transports: read_txt_string(txt, "tp")
+                .map(|tp| tp.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect::<Vec<_>>())
+                .filter(|tp| !tp.is_empty()),
             friendly_name: friendly,
-            ip,
+            txt: txt
+                .iter()
+                .map(|p| (p.key().to_string(), p.val().map(|v| String::from_utf8_lossy(v).into_owned()).unwrap_or_default()))
+                .collect(),
+            addresses,
+            first_seen: 0,
             port: info.get_port(),
             encryption_types: read_txt_int_list(txt, "et"),
             codecs: read_txt_int_list(txt, "cn"),
@@ -676,9 +1065,9 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
         };
         debug!(
             "AirPlay RAOP resolved: {} @ {:?}:{} et={:?} cn={:?}",
-            r.friendly_name, r.ip, r.port, r.encryption_types, r.codecs
+            r.friendly_name, r.addresses, r.port, r.encryption_types, r.codecs
         );
-        state.upsert_raop(mac, r);
+        state.upsert_raop(r);
     } else {
         // _airplay._tcp: MAC is in the `deviceid` TXT key; the service
         // instance name is the friendly name.
@@ -688,7 +1077,7 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
         };
         let a = AirPlayInfo {
             friendly_name: airplay_instance_name(info.get_fullname()),
-            ip,
+            addresses,
             port: info.get_port(),
             features: read_features(txt),
             pk: read_txt_string(txt, "pk"),
@@ -701,7 +1090,7 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
         };
         debug!(
             "AirPlay v2 resolved: {} @ {:?}:{} ft={:?} model={:?} group={:?}",
-            a.friendly_name, a.ip, a.port, a.features, a.model, a.group
+            a.friendly_name, a.addresses, a.port, a.features, a.model, a.group
         );
         state.upsert_airplay(mac, info.get_fullname(), a);
     }
@@ -711,11 +1100,41 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
 // Helpers
 // -----------------------------------------------------------------------------
 
-fn first_v4(info: &ServiceInfo) -> Option<IpAddr> {
-    info.get_addresses().iter().find_map(|a| match a {
-        IpAddr::V4(v4) => Some(IpAddr::V4(*v4)),
-        _ => None,
-    })
+/// Say why an announcement whose addresses this app won't contact (see
+/// [`may_contact`]) isn't listed: once per instance at info level, later
+/// at debug (as UPnP discovery reports a refused address). An
+/// announcement with some addresses left says nothing.
+fn report_refused(state: &AirPlayDiscoveryState, lan: &LanTargets, fullname: &str, addresses: &[IpAddr]) {
+    if addresses.iter().any(|a| may_contact(*a, lan)) {
+        return;
+    }
+    let reasons: Vec<String> = addresses
+        .iter()
+        .map(|a| match lan.refusal(crate::stream_gate::canonical_ip(*a)) {
+            Some(why) => format!("{} ({})", a, why),
+            None => format!("{} (an IPv6 address)", a),
+        })
+        .collect();
+    let hint = addresses
+        .iter()
+        .find_map(|a| lan.refusal(crate::stream_gate::canonical_ip(*a)).and_then(|why| why.hint()));
+    let name = crate::discovery_net::shown(fullname);
+    state.reported.once(&format!("airplay:{}", fullname.to_ascii_lowercase()), || {
+        format!(
+            "AirPlay: not listing {}: not contacting it at {}.{}",
+            name,
+            if reasons.is_empty() { "no address".to_string() } else { reasons.join(", ") },
+            hint.map(|h| format!(" {}", h)).unwrap_or_default()
+        )
+    });
+}
+
+/// The instance's IPv4 addresses, sorted (the order is chosen on read,
+/// see [`order_addresses`]).
+fn v4_addresses(info: &ServiceInfo) -> Vec<IpAddr> {
+    let mut v: Vec<IpAddr> = info.get_addresses_v4().into_iter().map(|a| IpAddr::V4(*a)).collect();
+    v.sort();
+    v
 }
 
 /// Normalise a MAC to upper-case hex with no separators so the `deviceid`
@@ -762,18 +1181,6 @@ fn group_txt(tsid: Option<&str>, name: Option<String>, leader: bool) -> Option<G
     Some(GroupTxt { tsid, name: name.map(|n| n.trim().to_string()), leader })
 }
 
-/// On removal we only get the fullname; recover the MAC so we can evict
-/// the right map entry. For RAOP it's in the name; for `_airplay._tcp` the
-/// name is just the friendly name (no MAC), so we can't reliably evict by
-/// MAC — return None and let the stale entry age out / be overwritten.
-fn mac_from_event(service: &str, fullname: &str) -> Option<String> {
-    if service == RAOP_SERVICE {
-        Some(split_raop_name(fullname)?.0)
-    } else {
-        None
-    }
-}
-
 fn read_txt_string(txt: &TxtProperties, key: &str) -> Option<String> {
     txt.get_property_val_str(key).map(|s| s.to_string())
 }
@@ -805,7 +1212,11 @@ fn read_txt_int_list(txt: &TxtProperties, key: &str) -> Vec<u8> {
 /// comma-separated 32-bit halves, low first: `0x445F8A00,0x1C340`
 /// → `(high << 32) | low`. Decimal is also accepted.
 fn read_features(txt: &TxtProperties) -> Option<u64> {
-    let raw = read_txt_string(txt, "features").or_else(|| read_txt_string(txt, "ft"))?;
+    parse_features(&read_txt_string(txt, "features").or_else(|| read_txt_string(txt, "ft"))?)
+}
+
+/// The flag word of a `features` / `ft` value (see [`read_features`]).
+fn parse_features(raw: &str) -> Option<u64> {
     let parts: Vec<&str> = raw.split(',').map(|p| p.trim()).collect();
     let parse = |s: &str| -> Option<u64> {
         let s = s.trim();
@@ -846,6 +1257,7 @@ mod tests {
             model: model.map(|s| s.to_string()),
             group: None,
             pair: None,
+            raop: RaopDetails::default(),
         }
     }
 
@@ -921,10 +1333,10 @@ mod tests {
 
     #[test]
     fn member_id_resolves_to_pair_and_membership_follows_tsid() {
-        let state = AirPlayDiscoveryState::default();
+        let state = AirPlayDiscoveryState::with_lan(LanTargets::from_networks([("10.0.0.1".parse().unwrap(), 24)]));
         let info = |tsid: &str, leader: bool| AirPlayInfo {
             friendly_name: "x".into(),
-            ip: Some("10.0.0.2".parse().unwrap()),
+            addresses: vec!["10.0.0.2".parse().unwrap()],
             port: 7000,
             features: Some(HOMEPOD_FT),
             pk: None,
@@ -960,6 +1372,329 @@ mod tests {
         assert_eq!(state.renderers().iter().filter(|r| r.pair.is_none()).count(), 4);
     }
 
+    fn raop_info(instance: &str, addrs: &str, txt: &[(&str, &str)]) -> ServiceInfo {
+        ServiceInfo::new(RAOP_SERVICE, instance, "speaker.local.", addrs, 5000, txt).unwrap()
+    }
+
+    #[test]
+    fn the_raop_txt_record_is_kept_for_the_log() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        let info = raop_info("AABBCCDDEEFF@Dock", "192.168.1.5", &[("et", "0,4"), ("cn", "0,1"), ("am", "Dock\n1")]);
+        ingest_resolution(&state, RAOP_SERVICE, &info);
+        let r = state.find_by_id("airplay:AABBCCDDEEFF").unwrap();
+        let mut txt = r.raop.txt.clone();
+        txt.sort();
+        assert_eq!(txt, [("am".to_string(), "Dock\n1".to_string()), ("cn".into(), "0,1".into()), ("et".into(), "0,4".into())]);
+        // Quoted and escaped, so a value can't break the log line.
+        assert!(r.raop.txt_line().contains(r#"am="Dock\n1""#), "{}", r.raop.txt_line());
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn home_lan() -> LanTargets {
+        LanTargets::from_networks([("192.168.1.10".parse().unwrap(), 24)])
+    }
+
+    /// The addresses a connect tries: those it may contact, worked address
+    /// first, then this PC's subnets, then others, then link-local, in a
+    /// fixed order whatever order they were announced in.
+    #[test]
+    fn addresses_are_ordered_whatever_order_they_come_in() {
+        let lan = home_lan();
+        let want = vec![ip("192.168.1.65"), ip("10.0.0.9"), ip("169.254.248.229")];
+        let never = [
+            ip("0.0.0.0"),
+            ip("224.0.0.251"),
+            ip("255.255.255.255"),
+            ip("192.168.1.255"),
+            ip("192.168.1.0"),
+            ip("127.0.0.1"),
+            ip("192.168.1.10"),
+        ];
+        for rot in 0..want.len() {
+            let mut given = want.clone();
+            given.rotate_left(rot);
+            given.extend(never);
+            given.rotate_left(rot);
+            assert_eq!(order_addresses(&given, None, &lan), want, "{given:?}");
+        }
+        // The address that last carried a session goes first.
+        assert_eq!(order_addresses(&want, Some(ip("10.0.0.9")), &lan)[0], ip("10.0.0.9"));
+        // Link-local stays, also without a link-local adapter.
+        assert_eq!(order_addresses(&[ip("169.254.248.229")], None, &lan), [ip("169.254.248.229")]);
+    }
+
+    /// This PC and what is no device's address are never candidates, in
+    /// either address family; IPv6 isn't used at all.
+    #[test]
+    fn this_pc_and_non_addresses_are_never_candidates() {
+        let lan = home_lan();
+        for a in [
+            "::1",
+            "::",
+            "ff02::fb",
+            "::ffff:127.0.0.1",
+            "::ffff:0.0.0.0",
+            "::ffff:192.168.1.10",
+            "::ffff:224.0.0.251",
+            "127.0.0.1",
+            "127.1.2.3",
+            "192.168.1.10",
+            "0.0.0.0",
+            "255.255.255.255",
+            "2001:db8::1",
+            "fe80::1",
+        ] {
+            assert!(!may_contact(ip(a), &lan), "{a}");
+        }
+        for a in ["192.168.1.65", "10.20.0.5", "169.254.9.9", "::ffff:192.168.1.65"] {
+            assert!(may_contact(ip(a), &lan), "{a}");
+        }
+    }
+
+    /// Through the real resolution path: an AirPort Express announcing a
+    /// link-local address next to its DHCP one is reached at the DHCP one,
+    /// on every resolution (the announced set has no order of its own).
+    #[test]
+    fn a_receiver_with_a_link_local_address_is_listed_at_its_routable_one() {
+        for _ in 0..20 {
+            let state = AirPlayDiscoveryState::with_lan(home_lan());
+            let info = raop_info("AABBCCDDEEFF@Express", "169.254.248.229,192.168.1.65", &[("et", "0,1"), ("cn", "0,1")]);
+            ingest_resolution(&state, RAOP_SERVICE, &info);
+            let r = state.find_by_id("airplay:AABBCCDDEEFF").unwrap();
+            assert_eq!(r.ip, ip("192.168.1.65"));
+            assert_eq!(r.raop.addresses, [ip("192.168.1.65"), ip("169.254.248.229")]);
+        }
+    }
+
+    /// A speaker outside this PC's subnets (another VLAN, through an mDNS
+    /// repeater) is listed and reached at its address; with one on- and
+    /// one off-subnet address, the on-subnet one first; one that announces
+    /// this PC's address next to a real one is tried at the real one only;
+    /// one that announces only this PC (its own address, loopback) or no
+    /// device's address isn't listed.
+    #[test]
+    fn receivers_are_listed_at_the_addresses_a_connect_may_go_to() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        let txt = &[("et", "0"), ("cn", "1")];
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE01@Vlan", "10.20.0.5", txt));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE02@Here", "192.168.1.10", txt));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE03@Loop", "127.0.0.1", txt));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE04@Both", "10.20.0.6,192.168.1.66", txt));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE05@Nowhere", "224.0.0.251", txt));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE06@Mixed", "192.168.1.10,192.168.1.67", txt));
+        let at = |id: &str| state.find_by_id(id).map(|r| (r.ip, r.raop.addresses.clone()));
+        assert_eq!(at("airplay:AABBCCDDEE01"), Some((ip("10.20.0.5"), vec![ip("10.20.0.5")])));
+        assert_eq!(at("airplay:AABBCCDDEE02"), None);
+        assert_eq!(at("airplay:AABBCCDDEE03"), None);
+        assert_eq!(at("airplay:AABBCCDDEE04"), Some((ip("192.168.1.66"), vec![ip("192.168.1.66"), ip("10.20.0.6")])));
+        assert_eq!(at("airplay:AABBCCDDEE05"), None);
+        assert_eq!(at("airplay:AABBCCDDEE06"), Some((ip("192.168.1.67"), vec![ip("192.168.1.67")])));
+        assert_eq!(state.renderers().len(), 3);
+        // Each instance not listed is reported once.
+        assert_eq!(state.reported.len(), 3);
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE03@Loop", "127.0.0.1", txt));
+        assert_eq!(state.reported.len(), 3);
+    }
+
+    const TXT: [(&str, &str); 2] = [("et", "0,1"), ("cn", "0,1")];
+
+    fn conflict_state() -> AirPlayDiscoveryState {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("B8E93735AC11@Kitchen", "192.168.1.65", &TXT));
+        // Another host claims the MAC, at the receiver's own address and
+        // one more, with its own port and TXT.
+        let fake = ServiceInfo::new(RAOP_SERVICE, "B8E93735AC11@Kitchen 2", "evil.local.", "192.168.1.65,192.168.1.66", 6666, &[("et", "1"), ("cn", "1"), ("md", "0")][..]).unwrap();
+        ingest_resolution(&state, RAOP_SERVICE, &fake);
+        state
+    }
+
+    const NEWCOMER: &str = "airplay:B8E93735AC11/b8e93735ac11@kitchen 2._raop._tcp.local.";
+
+    /// A second instance claiming a receiver's MAC is never merged into
+    /// it, even with an address list that includes the receiver's own:
+    /// both are listed and marked, and the newcomer's port, TXT and
+    /// addresses never reach the incumbent's entry.
+    #[test]
+    fn a_second_instance_claiming_a_mac_never_merges_into_it() {
+        let state = conflict_state();
+        let v = state.renderers();
+        assert_eq!(v.len(), 2, "{v:?}");
+        let kitchen = state.find_by_id("airplay:B8E93735AC11").expect("the incumbent keeps the plain id");
+        assert_eq!(kitchen.friendly_name, "Kitchen (192.168.1.65)");
+        assert_eq!((kitchen.port, kitchen.encryption_types.clone()), (5000, vec![0, 1]));
+        assert_eq!(kitchen.raop.addresses, [ip("192.168.1.65")]);
+        assert_eq!(kitchen.raop.txt.len(), 2);
+        assert!(!kitchen.raop.newcomer);
+        let other = state.find_by_id(NEWCOMER).expect("the newcomer is picked by its own id");
+        assert_eq!(other.stable_id(), NEWCOMER);
+        assert!(other.raop.newcomer);
+        assert_eq!(other.port, 6666);
+        // Its row says what it is, shows the address it doesn't share with
+        // the speaker (and connects there first), and sits below the
+        // speaker's row.
+        assert_eq!(other.friendly_name, "Kitchen — another receiver with the same ID: Kitchen 2 (192.168.1.66)");
+        assert_eq!((other.ip, other.raop.addresses.clone()), (ip("192.168.1.66"), vec![ip("192.168.1.66"), ip("192.168.1.65")]));
+        let names: Vec<String> = v.iter().map(|r| r.friendly_name.clone()).collect();
+        assert_eq!(names, [kitchen.friendly_name.clone(), other.friendly_name.clone()]);
+    }
+
+    /// A newcomer whose name sorts before the speaker's still sits below it,
+    /// and one that shares every address shows that address.
+    #[test]
+    fn a_newcomers_row_sits_below_the_speaker() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("B8E93735AC11@Kitchen", "192.168.1.65", &TXT));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("B8E93735AC11@Attic", "192.168.1.65", &TXT));
+        let names: Vec<String> = state.renderers().iter().map(|r| r.friendly_name.clone()).collect();
+        assert_eq!(names, ["Kitchen (192.168.1.65)", "Kitchen — another receiver with the same ID: Attic (192.168.1.65)"]);
+    }
+
+    /// The incumbent is the instance known before the conflict began;
+    /// a session on the newcomer, or a newer announcement from it,
+    /// changes nothing.
+    #[test]
+    fn nothing_during_a_conflict_makes_the_newcomer_the_incumbent() {
+        let state = conflict_state();
+        state.note_session(&state.find_by_id(NEWCOMER).unwrap());
+        let fake = ServiceInfo::new(RAOP_SERVICE, "B8E93735AC11@Kitchen 2", "evil.local.", "192.168.1.66", 6666, &[("et", "1")][..]).unwrap();
+        ingest_resolution(&state, RAOP_SERVICE, &fake);
+        let plain = state.find_by_id("airplay:B8E93735AC11").unwrap();
+        assert_eq!((plain.port, plain.ip, plain.raop.newcomer), (5000, ip("192.168.1.65"), false));
+        assert!(state.find_by_id(NEWCOMER).unwrap().raop.newcomer);
+        assert_eq!(state.working_address("B8E93735AC11"), None, "a newcomer's session marks no address");
+    }
+
+    /// A newcomer claiming a stereo-pair member's MAC is never folded into
+    /// the pair; a pair with a newcomer among its members would count as
+    /// one.
+    #[test]
+    fn a_newcomer_is_never_folded_into_a_pair() {
+        let mem = memory(&[("t1", &["AA", "BB"])]);
+        let mut fake = pod("AA", Some("t1"), false, None);
+        fake.raop.newcomer = true;
+        fake.raop.instance = Some("aa@fake._raop._tcp.local.".into());
+        let v = fold_pairs(vec![pod("AA", Some("t1"), true, None), pod("BB", Some("t1"), false, None), fake], &mem);
+        assert_eq!(v.len(), 2, "{v:?}");
+        let pair = v.iter().find(|r| r.pair.is_some()).unwrap();
+        assert!(!pair.is_newcomer());
+        assert_eq!(pair.pair.as_ref().unwrap().members.len(), 2);
+        let single = v.iter().find(|r| r.pair.is_none()).unwrap();
+        assert!(single.is_newcomer());
+
+        let mut with_newcomer = pair.clone();
+        if let Some(p) = with_newcomer.pair.as_mut() {
+            p.members[1].raop.newcomer = true;
+        }
+        assert!(with_newcomer.is_newcomer());
+    }
+
+    /// When the incumbent goes, the conflict is over: the one left is an
+    /// ordinary entry with the plain id (and so what is stored under it).
+    #[test]
+    fn when_the_incumbent_goes_the_other_one_is_the_speaker() {
+        let state = conflict_state();
+        ingest_removal(&state, RAOP_SERVICE, "B8E93735AC11@Kitchen._raop._tcp.local.");
+        let v = state.renderers();
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].stable_id().as_str(), v[0].raop.newcomer, v[0].port), ("airplay:B8E93735AC11", false, 6666));
+        // A pick made by its newcomer id still finds it.
+        assert_eq!(state.find_by_id(NEWCOMER).unwrap().stable_id(), "airplay:B8E93735AC11");
+    }
+
+    /// A rename: both names announced for a while, then the old name's
+    /// goodbye. It ends with one ordinary entry under the new name, also
+    /// when the goodbye comes before the new name.
+    #[test]
+    fn a_rename_ends_with_one_unmarked_entry() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEEFF@Old", "192.168.1.65", &TXT));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEEFF@New", "192.168.1.65", &TXT));
+        assert_eq!(state.renderers().len(), 2);
+        ingest_removal(&state, RAOP_SERVICE, "AABBCCDDEEFF@Old._raop._tcp.local.");
+        let v = state.renderers();
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].friendly_name.as_str(), v[0].stable_id().as_str(), v[0].raop.newcomer), ("New", "airplay:AABBCCDDEEFF", false));
+        // A real goodbye (the device switched off) still removes it.
+        ingest_removal(&state, RAOP_SERVICE, "aabbccddeeff@new._raop._tcp.local.");
+        assert!(state.find_by_id("airplay:AABBCCDDEEFF").is_none());
+
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEEFF@Old", "192.168.1.65", &TXT));
+        ingest_removal(&state, RAOP_SERVICE, "AABBCCDDEEFF@Old._raop._tcp.local.");
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEEFF@New", "192.168.1.65", &TXT));
+        let v = state.renderers();
+        assert_eq!((v.len(), v[0].friendly_name.as_str(), v[0].raop.newcomer), (1, "New", false));
+    }
+
+    /// A flood of announcements is bounded: a few claims per identity, a
+    /// few hundred instances in all, the first seen kept.
+    #[test]
+    fn a_flood_of_announcements_is_bounded() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("B8E93735AC11@Kitchen", "192.168.1.65", &TXT));
+        for i in 0..20 {
+            ingest_resolution(&state, RAOP_SERVICE, &raop_info(&format!("B8E93735AC11@Fake {i}"), "192.168.1.66", &TXT));
+        }
+        let claims = state.renderers().into_iter().filter(|r| r.mac_id == "B8E93735AC11").count();
+        assert_eq!(claims, MAX_CLAIMS_PER_IDENTITY);
+        assert_eq!(state.find_by_id("airplay:B8E93735AC11").unwrap().raop.instance.as_deref(), Some("b8e93735ac11@kitchen._raop._tcp.local."));
+        for i in 0..(MAX_RAOP_INSTANCES + 50) {
+            let mac = format!("{:012X}", i + 1);
+            ingest_resolution(&state, RAOP_SERVICE, &raop_info(&format!("{mac}@S{i}"), "192.168.1.70", &TXT));
+        }
+        assert_eq!(state.raop.lock().unwrap().len(), MAX_RAOP_INSTANCES);
+        // Instances already kept are still updated.
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("B8E93735AC11@Kitchen", "192.168.1.71", &TXT));
+        assert_eq!(state.find_by_id("airplay:B8E93735AC11").unwrap().ip, ip("192.168.1.71"));
+    }
+
+    /// A newcomer's goodbye removes only the newcomer.
+    #[test]
+    fn a_newcomers_goodbye_leaves_the_incumbent() {
+        let state = conflict_state();
+        ingest_removal(&state, RAOP_SERVICE, "B8E93735AC11@Kitchen 2._raop._tcp.local.");
+        let v = state.renderers();
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].friendly_name.as_str(), v[0].port, v[0].raop.newcomer), ("Kitchen", 5000, false));
+    }
+
+    /// A receiver whose address changed (its instance re-announced at a
+    /// new address) just moves: no conflict, nothing to do.
+    #[test]
+    fn a_receiver_that_moved_keeps_working() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEEFF@Den", "192.168.1.65", &TXT));
+        state.note_session(&state.find_by_id("airplay:AABBCCDDEEFF").unwrap());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEEFF@Den", "192.168.1.70", &TXT));
+        let v = state.renderers();
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].ip, v[0].stable_id().as_str(), v[0].friendly_name.as_str()), (ip("192.168.1.70"), "airplay:AABBCCDDEEFF", "Den"));
+    }
+
+    /// In a conflict the `_airplay._tcp` half stays with the incumbent.
+    #[test]
+    fn in_a_conflict_the_airplay_2_half_stays_with_the_incumbent() {
+        let state = conflict_state();
+        let ap = ServiceInfo::new(AIRPLAY_SERVICE, "Kitchen", "kitchen.local.", "192.168.1.65", 7000, &[("deviceid", "B8:E9:37:35:AC:11"), ("features", "0x445F8A00,0x1C340")][..]).unwrap();
+        ingest_resolution(&state, AIRPLAY_SERVICE, &ap);
+        let kitchen = state.find_by_id("airplay:B8E93735AC11").unwrap();
+        let other = state.find_by_id(NEWCOMER).unwrap();
+        assert!(kitchen.features.is_some() && kitchen.airplay_port == Some(7000));
+        assert!(other.features.is_none() && other.airplay_port.is_none());
+    }
+
+    #[test]
+    fn the_txt_log_line_is_bounded() {
+        let long = "x".repeat(5000);
+        let d = RaopDetails { txt: (0..100).map(|i| (format!("k{i}"), long.clone())).collect(), ..Default::default() };
+        let line = d.txt_line();
+        assert!(line.len() < 6000, "{}", line.len());
+        assert!(line.ends_with("(and 60 more)"));
+    }
+
     #[test]
     fn normalise_mac_strips_separators_and_uppercases() {
         assert_eq!(normalise_mac("b8:e9:37:35:ac:11"), "B8E93735AC11");
@@ -968,30 +1703,19 @@ mod tests {
 
     #[test]
     fn features_single_and_split_hex() {
-        // single
-        let f = parse_features_str("0x40000200");
-        assert_eq!(f, Some(0x40000200));
-        // split low,high
-        let f = parse_features_str("0x445F8A00,0x1C340");
-        assert_eq!(f, Some((0x1C340u64 << 32) | 0x445F8A00));
-    }
-
-    // Tiny shim so the test can exercise the same parse logic without a
-    // TxtProperties (which we can't easily synthesise here).
-    fn parse_features_str(raw: &str) -> Option<u64> {
-        let parts: Vec<&str> = raw.split(',').map(|p| p.trim()).collect();
-        let parse = |s: &str| -> Option<u64> {
-            if let Some(hex) = s.strip_prefix("0x") {
-                u64::from_str_radix(hex, 16).ok()
-            } else {
-                s.parse().ok()
-            }
-        };
-        match parts.as_slice() {
-            [single] => parse(single),
-            [low, high, ..] => Some((parse(high)? << 32) | (parse(low)? & 0xFFFF_FFFF)),
-            _ => None,
-        }
+        assert_eq!(parse_features("0x40000200"), Some(0x40000200));
+        assert_eq!(parse_features("0X40000200"), Some(0x40000200));
+        // Two halves, low first.
+        assert_eq!(parse_features("0x445F8A00,0x1C340"), Some((0x1C340u64 << 32) | 0x445F8A00));
+        assert_eq!(parse_features(" 0x445F8A00 , 0x1C340 "), Some((0x1C340u64 << 32) | 0x445F8A00));
+        // Decimal, and hex digits without a prefix.
+        assert_eq!(parse_features("512"), Some(512));
+        assert_eq!(parse_features("445F8A00"), Some(0x445F8A00));
+        // Nothing usable.
+        assert_eq!(parse_features(""), None);
+        assert_eq!(parse_features("0x"), None);
+        assert_eq!(parse_features("0x445F8A00,zz"), None);
+        assert_eq!(parse_features("0x1FFFFFFFFFFFFFFFF"), None);
     }
 
     #[test]
@@ -1022,18 +1746,20 @@ mod tests {
 
     #[test]
     fn real_sonos_features_classify_as_ap2_with_ptp() {
-        // The exact `features` word a Sonos advertises on _airplay._tcp.
-        // It must decode to AirPlay 2 + PTP so routing prefers AP2 — its
-        // _raop._tcp service is vestigial and times out at OPTIONS.
-        let ft = parse_features_str("0x445F8A00,0x1C340");
+        // The exact `features` word a Sonos advertises on _airplay._tcp:
+        // AirPlay 2 with PTP and buffered audio.
+        let ft = parse_features("0x445F8A00,0x1C340");
         assert!(ft.is_some(), "split-hex features should parse");
-        let r = renderer(Some("One"), vec![0, 1], ft, 5000, Some(7000));
+        let r = renderer(Some("One"), vec![0, 4], ft, 5000, Some(7000));
         assert!(r.supports_airplay2(), "Sonos must support AirPlay 2");
         assert!(r.expects_ptp(), "Sonos advertises PTP (feature bit 41)");
         assert!(r.supports_buffered_audio(), "Sonos advertises buffered audio (bit 40)");
-        // It also advertises a legacy RAOP service we'd otherwise prefer,
-        // which is why blind RAOP routing stalled at OPTIONS.
+        // It is still played over AirPlay 1 first, which is what iTunes
+        // does (packet capture: /auth-setup opener, realtime UDP, NTP
+        // timing); AirPlay 2 is the fallback the app tries next.
         assert!(r.supports_legacy_raop());
+        assert!(!r.requires_airplay2());
+        assert_eq!(r.transport(), Some(Transport::RaopLegacy));
     }
 
     #[test]
@@ -1058,6 +1784,80 @@ mod tests {
         assert!(!r.supports_airplay2());
         assert_eq!(r.transport(), None);
         assert!(!r.is_supported());
+    }
+
+    /// Follow the reference senders: no `cn` means ALAC, no `et` means
+    /// plaintext; a `tp` without UDP rules the receiver out; FairPlay-only
+    /// stays unsupported.
+    #[test]
+    fn a_receiver_without_a_codec_list_plays_alac() {
+        let mut r = renderer(Some("Dock"), vec![0], None, 5000, None);
+        r.codecs = vec![];
+        assert!(r.supports_legacy_raop());
+        assert_eq!(r.transport(), Some(Transport::RaopLegacy));
+        r.encryption_types = vec![];
+        assert!(r.supports_legacy_raop(), "no et: plaintext");
+        assert_eq!(r.raop_encryption_types(), [0]);
+        r.codecs = vec![0, 2];
+        assert!(!r.supports_legacy_raop(), "a codec list without ALAC");
+        r.codecs = vec![];
+        r.raop.transports = Some(vec!["TCP".into()]);
+        assert!(!r.supports_legacy_raop(), "TCP only");
+        r.raop.transports = Some(vec!["TCP".into(), "udp".into()]);
+        assert!(r.supports_legacy_raop());
+        r.encryption_types = vec![3, 5];
+        assert!(!r.supports_legacy_raop(), "FairPlay only");
+    }
+
+    /// `et` lists 4 without 0 or 1: an MFi receiver, played like one that
+    /// lists 0 and 4.
+    #[test]
+    fn an_mfi_only_receiver_is_played_like_et_0_4() {
+        for et in [vec![4], vec![3, 4, 5], vec![4, 5]] {
+            let r = renderer(Some("Dock"), et.clone(), None, 5000, None);
+            assert!(r.supports_legacy_raop(), "{et:?}");
+            assert_eq!(r.transport(), Some(Transport::RaopLegacy));
+            assert!(r.raop_encryption_types().contains(&0));
+            assert!(!r.prefers_rsa_encryption());
+        }
+        // Lists that already say what to do are left as they are.
+        assert_eq!(renderer(None, vec![0, 4], None, 5000, None).raop_encryption_types(), [0, 4]);
+        assert_eq!(renderer(None, vec![1, 4], None, 5000, None).raop_encryption_types(), [1, 4]);
+    }
+
+    #[test]
+    fn track_text_only_to_receivers_whose_md_lists_text() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE01@A", "192.168.1.5", &[("md", "0,1,2")]));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE02@B", "192.168.1.6", &[("md", "1,2")]));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE03@C", "192.168.1.7", &[("et", "0")]));
+        let wants = |id: &str| state.find_by_id(id).unwrap().wants_track_text();
+        assert!(wants("airplay:AABBCCDDEE01"));
+        assert!(!wants("airplay:AABBCCDDEE02"));
+        assert!(!wants("airplay:AABBCCDDEE03"));
+        assert_eq!(state.find_by_id("airplay:AABBCCDDEE01").unwrap().raop.metadata, [0, 1, 2]);
+    }
+
+    #[test]
+    fn an_empty_tp_counts_as_none() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE11@E", "192.168.1.5", &[("tp", ""), ("et", "0"), ("cn", "1")]));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE12@F", "192.168.1.6", &[("tp", " , "), ("et", "0"), ("cn", "1")]));
+        for id in ["airplay:AABBCCDDEE11", "airplay:AABBCCDDEE12"] {
+            let r = state.find_by_id(id).unwrap();
+            assert_eq!(r.raop.transports, None);
+            assert!(r.supports_legacy_raop());
+        }
+    }
+
+    #[test]
+    fn tp_is_read_from_the_txt_record() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEEFF@T", "192.168.1.5", &[("tp", "TCP"), ("et", "0")]));
+        let r = state.find_by_id("airplay:AABBCCDDEEFF").unwrap();
+        assert_eq!(r.raop.transports, Some(vec!["TCP".to_string()]));
+        assert!(r.codecs.is_empty());
+        assert!(!r.supports_legacy_raop());
     }
 
     #[test]
