@@ -1045,7 +1045,7 @@ impl Bringup<'_> {
             // RSA-wrapped AES key; plaintext is silent there.
             Cipher::rsa()
         } else {
-            Cipher::pick_for(&cfg.renderer.encryption_types).ok_or_else(|| {
+            Cipher::pick_for(&cfg.renderer.raop_encryption_types()).ok_or_else(|| {
                 anyhow::anyhow!(
                     "no compatible encryption mode for {} (advertised et={:?})",
                     cfg.renderer.friendly_name,
@@ -1718,6 +1718,24 @@ mod tests {
         let msg = format!("{:#}", err);
         assert!(msg.contains("127.0.0.2") && msg.contains("127.0.0.3") && msg.contains("127.0.0.4"), "{msg}");
         assert!(rx.requests().is_empty());
+    }
+
+    /// A receiver that announces neither `cn` nor `et` connects in
+    /// plaintext with the plain opener.
+    #[test]
+    fn a_receiver_without_codec_or_encryption_lists_connects_in_plaintext() {
+        let rx = FakeRaop::start(|_| Answer::Normal);
+        let (_tx, samples) = crossbeam_channel::unbounded();
+        let mut r = receiver(&rx, "0B0000000040", &[]);
+        r.codecs = vec![];
+        let mut cfg = config(r, samples);
+        cfg.timeouts = quick();
+        let session = AirPlaySession::start(cfg).expect("connects");
+        session.stop();
+        let reqs = rx.requests();
+        assert_eq!(methods(&rx)[..2], ["0 OPTIONS", "0 ANNOUNCE"]);
+        let sdp = String::from_utf8(reqs[1].body.clone()).unwrap();
+        assert!(!sdp.contains("aeskey") && !sdp.contains("aesiv"), "{sdp}");
     }
 
     #[test]

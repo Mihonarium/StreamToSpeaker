@@ -158,6 +158,8 @@ pub struct RaopDetails {
     /// Every IPv4 address announced for the service, in the order a
     /// connect tries them (see [`order_addresses`]); `ip` is the first.
     pub addresses: Vec<IpAddr>,
+    /// `tp`: the transports it offers (`UDP`, `TCP`), when it says.
+    pub transports: Option<Vec<String>>,
     /// Set when other devices announce the same identity (MAC) at other
     /// addresses and this entry isn't the one this app played to in this
     /// run: it is then chosen only by its address (its id is
@@ -258,19 +260,38 @@ impl AirPlayRenderer {
     }
 
     /// True if this device exposes a usable **legacy RAOP** path: a RAOP
-    /// port, ALAC, no password, and either no-encryption or Apple-RSA
-    /// (i.e. not a FairPlay-only `et`).
+    /// port, UDP transport, ALAC, and either no encryption or Apple-RSA
+    /// (i.e. not a FairPlay-only `et`). As the reference senders do, a
+    /// receiver that announces no codec list is taken to play ALAC (every
+    /// RAOP receiver does; OwnTone never reads `cn`), and one that
+    /// announces no `et` to take plaintext (OwnTone streams plaintext to
+    /// it). What rules a receiver out is a `tp` without UDP (OwnTone
+    /// discards those): we have no TCP transport. Password-protected
+    /// (`pw=true`) receivers are supported — we speak RTSP Digest auth.
     pub fn supports_legacy_raop(&self) -> bool {
         if self.port == 0 {
             return false;
         }
-        if !self.codecs.contains(&1) {
+        if let Some(tp) = &self.raop.transports {
+            if !tp.iter().any(|t| t.eq_ignore_ascii_case("UDP")) {
+                return false;
+            }
+        }
+        if !self.codecs.is_empty() && !self.codecs.contains(&1) {
             return false;
         }
-        // Password-protected (`pw=true`) receivers ARE supported — we
-        // speak RTSP Digest auth (the session uses the stored password,
-        // or the UI prompts for one).
-        self.encryption_types.contains(&0) || self.encryption_types.contains(&1)
+        let et = self.raop_encryption_types();
+        et.contains(&0) || et.contains(&1)
+    }
+
+    /// The `et` list to go by: as announced, or plaintext (`[0]`) when the
+    /// receiver announced none.
+    pub fn raop_encryption_types(&self) -> Vec<u8> {
+        if self.encryption_types.is_empty() {
+            vec![0]
+        } else {
+            self.encryption_types.clone()
+        }
     }
 
     /// Whether to encrypt the audio with the RSA-wrapped-key path rather
@@ -397,6 +418,7 @@ impl AirPlayRenderer {
 struct RaopInfo {
     /// The MAC the instance name claims.
     mac: String,
+    transports: Option<Vec<String>>,
     friendly_name: String,
     txt: Vec<(String, String)>,
     /// Its IPv4 addresses, sorted.
@@ -833,6 +855,7 @@ fn merge(
         raop: RaopDetails {
             txt: raop.map(|r| r.txt.clone()).unwrap_or_default(),
             addresses: raop_addresses,
+            transports: raop.and_then(|r| r.transports.clone()),
             claimant: None,
         },
     })
@@ -923,6 +946,8 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
         };
         let r = RaopInfo {
             mac,
+            transports: read_txt_string(txt, "tp")
+                .map(|tp| tp.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()),
             friendly_name: friendly,
             txt: txt
                 .iter()
@@ -1458,6 +1483,39 @@ mod tests {
         assert!(!r.supports_airplay2());
         assert_eq!(r.transport(), None);
         assert!(!r.is_supported());
+    }
+
+    /// Follow the reference senders: no `cn` means ALAC, no `et` means
+    /// plaintext; a `tp` without UDP rules the receiver out; FairPlay-only
+    /// stays unsupported.
+    #[test]
+    fn a_receiver_without_a_codec_list_plays_alac() {
+        let mut r = renderer(Some("Dock"), vec![0], None, 5000, None);
+        r.codecs = vec![];
+        assert!(r.supports_legacy_raop());
+        assert_eq!(r.transport(), Some(Transport::RaopLegacy));
+        r.encryption_types = vec![];
+        assert!(r.supports_legacy_raop(), "no et: plaintext");
+        assert_eq!(r.raop_encryption_types(), [0]);
+        r.codecs = vec![0, 2];
+        assert!(!r.supports_legacy_raop(), "a codec list without ALAC");
+        r.codecs = vec![];
+        r.raop.transports = Some(vec!["TCP".into()]);
+        assert!(!r.supports_legacy_raop(), "TCP only");
+        r.raop.transports = Some(vec!["TCP".into(), "udp".into()]);
+        assert!(r.supports_legacy_raop());
+        r.encryption_types = vec![3, 5];
+        assert!(!r.supports_legacy_raop(), "FairPlay only");
+    }
+
+    #[test]
+    fn tp_is_read_from_the_txt_record() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEEFF@T", "192.168.1.5", &[("tp", "TCP"), ("et", "0")]));
+        let r = state.find_by_id("airplay:AABBCCDDEEFF").unwrap();
+        assert_eq!(r.raop.transports, Some(vec!["TCP".to_string()]));
+        assert!(r.codecs.is_empty());
+        assert!(!r.supports_legacy_raop());
     }
 
     #[test]
