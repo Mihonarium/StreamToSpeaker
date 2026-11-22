@@ -29,6 +29,7 @@ use crate::http_server::{SpeakerInfo, StreamHub};
 use crate::manual_speakers::{self, ManualKind, ManualSpeaker};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use crate::ssdp::{DiscoveryState, Renderer, SearchScope};
+use crate::stream_profile::StreamProfile;
 use crate::stream_gate::{canonical_ip, is_local_address, Grant, Refusal, StreamGate};
 use crate::user_config::{AutoConnect, SpeakerSettings, UserConfig};
 use crate::volume_sync::{sonos_to_millibels, PendingCommands, SpeakerCommand, VolumeSync};
@@ -2419,7 +2420,7 @@ impl App {
         // has on the speaker's network, not the default-route one.
         let local_ip = self.local_ip_toward(new_r.ip).map_err(|e| e.to_string())?;
         let (stream_uri, callback_url) = local_urls(local_ip, self.config.bind.port());
-        let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms);
+        let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms, StreamProfile::Legacy);
         let (name, ip) = (new_r.display_name(), new_r.ip);
         let session = start_session(new_r, &stream_uri, &didl, &callback_url, Some(grant))
             .map_err(|e| self.upnp_failure_message(&name, ip, &e))?;
@@ -2453,7 +2454,7 @@ impl App {
         let grant = self.stream_gate.grant(r.stream_peers());
         let local_ip = self.local_ip_toward(r.ip).map_err(|e| e.to_string())?;
         let (stream_uri, callback_url) = local_urls(local_ip, self.config.bind.port());
-        let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms);
+        let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms, StreamProfile::Legacy);
         let (name, ip) = (r.display_name(), r.ip);
         let mut session = start_session(r, &stream_uri, &didl, &callback_url, Some(grant))
             .map_err(|e| self.upnp_failure_message(&name, ip, &e))?;

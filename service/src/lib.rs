@@ -18,6 +18,7 @@ pub mod ssdp;
 pub mod upnp;
 pub mod gena;
 mod device_http;
+pub mod stream_profile;
 #[cfg(test)]
 mod fake_renderer;
 pub mod volume_sync;
