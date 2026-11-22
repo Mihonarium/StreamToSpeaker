@@ -294,6 +294,16 @@ impl AirPlayRenderer {
         }
     }
 
+    /// The id of this entry's own announcement, `airplay:<MAC>/<instance>`
+    /// (a newcomer's id; see [`is_instance_id`]), whether it is marked a
+    /// newcomer now or not. `None` for a pair or a record without one.
+    pub fn instance_id(&self) -> Option<String> {
+        if self.pair.is_some() {
+            return None;
+        }
+        self.raop.instance.as_ref().map(|i| format!("airplay:{}/{}", self.mac_id, i))
+    }
+
     /// True if this device exposes a usable **legacy RAOP** path: a RAOP
     /// port, ALAC, and either no encryption or Apple-RSA (i.e. not a
     /// FairPlay-only `et`). Password-protected (`pw=true`) receivers are

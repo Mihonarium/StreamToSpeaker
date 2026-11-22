@@ -2638,8 +2638,7 @@ impl StreamToSpeakerApp {
                                 if self.app.is_password_protected(id) {
                                     let input = self.app.airplay_password(id).unwrap_or_default();
                                     self.password_prompt = Some(PasswordPrompt {
-                                        id: id.to_string(),
-                                        name: sp.friendly_name.clone(),
+                                        dialog: self.app.password_dialog(id, &sp.friendly_name),
                                         input,
                                     });
                                 } else {
@@ -3945,14 +3944,15 @@ impl StreamToSpeakerApp {
     }
 
     /// Password entry modal for a `pw=true` AirPlay speaker. On confirm it
-    /// stores the password (so it's remembered) and kicks off the
-    /// background connect; a wrong password surfaces as an error toast and
-    /// the user can click the speaker again to re-enter.
+    /// stores the password (so it's remembered; for a receiver announcing
+    /// another speaker's identity, kept for this connection only) and
+    /// kicks off the background connect; a wrong password surfaces as an
+    /// error toast and the user can click the speaker again to re-enter.
     fn show_password_modal(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(prompt) = self.password_prompt.as_mut() else {
             return;
         };
-        let title = format!("Password for {}", prompt.name);
+        let title = format!("Password for {}", prompt.dialog.name);
         match show_text_prompt_modal(
             ctx,
             p,
@@ -3968,8 +3968,9 @@ impl StreamToSpeakerApp {
         ) {
             PromptAction::Confirm => {
                 if let Some(prompt) = self.password_prompt.take() {
-                    self.app.set_airplay_password(&prompt.id, prompt.input.trim());
-                    self.app.select_speaker_async(&prompt.id);
+                    if let Err(e) = self.app.submit_password_dialog(&prompt.dialog, prompt.input.trim()) {
+                        self.app.record_error(e);
+                    }
                 }
             }
             PromptAction::Cancel => self.password_prompt = None,
@@ -4543,10 +4544,9 @@ struct SendspinPrompt {
 
 /// State for the AirPlay password entry modal.
 struct PasswordPrompt {
-    /// Stable id of the speaker being connected to.
-    id: String,
-    /// Friendly name, for the dialog title.
-    name: String,
+    /// The speaker being connected to, and what the dialog decided when
+    /// it opened.
+    dialog: crate::app::PasswordDialog,
     /// The password the user is typing.
     input: String,
 }
