@@ -517,8 +517,14 @@ pub struct App {
     windows_volume: Arc<OnceLock<WindowsVolumePush>>,
 
     // ---- Runtime atomics (audio hot path reads these every packet) ----
-    /// Driver's KSSTATE_RUN flag mirror — set by the driver-event consumer.
+    /// What the driver last said about Windows' stream on our device:
+    /// running, or stopped. Set by the driver-event consumer only; true at
+    /// launch and while its events can't be read (unknown). For the status
+    /// shown: the audio loop doesn't depend on it.
     pub stream_active: Arc<AtomicBool>,
+    /// Why the audio thread can't read this PC's sound (the sound device
+    /// was disabled, removed or updated), while it tries to open it again.
+    sound_input_lost: Mutex<Option<String>>,
     /// User toggle. False ⇒ no session, audio goes into the void, and no
     /// device but this PC may pull `/stream.raw` (the stream gate holds
     /// this same flag).
@@ -851,6 +857,28 @@ impl App {
         Self::with_settings(config, UserConfig::load(), discovery, airplay_discovery)
     }
 
+    /// An app for tests: no discovery, and default settings that save
+    /// nowhere (never the developer's own `config.json`).
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Arc<Self> {
+        Self::with_settings(
+            AppConfig {
+                advertise_ip: "192.168.1.10".into(),
+                advertise_ip_explicit: false,
+                bind: "0.0.0.0:8080".parse().unwrap(),
+                initial_buffer_ms: 0,
+                silence_packets_threshold: 0,
+                no_silence_injection: false,
+                no_discovery: true,
+                web_enabled: false,
+                ssdp_iface: None,
+            },
+            UserConfig::in_memory(),
+            None,
+            None,
+        )
+    }
+
     /// The app with `user_config` as its settings.
     pub(crate) fn with_settings(
         config: AppConfig,
@@ -896,6 +924,7 @@ impl App {
             speaker_control,
             windows_volume,
             stream_active: Arc::new(AtomicBool::new(true)),
+            sound_input_lost: Mutex::new(None),
             streaming_enabled,
             web_access: WebAccess::new(),
             drain_frames: Arc::new(AtomicI64::new(0)),
@@ -1140,15 +1169,18 @@ impl App {
     }
 
     /// Sleep `d` in slices, returning false early if shutdown began.
-    fn sleep_unless_shutdown(&self, d: Duration) -> bool {
+    pub(crate) fn sleep_unless_shutdown(&self, d: Duration) -> bool {
         let end = Instant::now() + d;
-        while Instant::now() < end {
+        loop {
             if self.is_shutting_down() {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(250));
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(250)));
         }
-        true
     }
 
     /// Background once-a-day update check: first attempt ~20 s after
@@ -3608,6 +3640,48 @@ impl App {
         matches!(self.windows_audio(), WindowsAudio::Playing | WindowsAudio::Silent)
     }
 
+    /// The audio thread lost its source (`why`, for the log and the
+    /// diagnostics) and is trying to open it again; speakers get silence
+    /// meanwhile, and the window says so.
+    pub fn note_sound_input_lost(&self, why: &str) {
+        warn!("lost this PC's sound ({}); trying to open the sound device again", why);
+        self.record_fault(&format!("Lost this PC's sound: {}", why));
+        *self.sound_input_lost.lock().unwrap() = Some(why.to_string());
+    }
+
+    /// The audio thread reads this PC's sound again.
+    pub fn note_sound_input_back(&self) {
+        if self.sound_input_lost.lock().unwrap().take().is_some() {
+            info!("this PC's sound is back");
+        }
+    }
+
+    /// The audio thread can't read this PC's sound and is trying to open
+    /// the sound device again.
+    pub fn sound_input_lost(&self) -> bool {
+        self.sound_input_lost.lock().unwrap().is_some()
+    }
+
+    /// The driver's events (Windows volume, mute, its stream starting and
+    /// stopping) can't be read any more (`why`, for the log); the consumer
+    /// is trying to open them again.
+    pub fn note_driver_events_lost(&self, why: &str) {
+        warn!("lost the sound device's events ({}); trying to open them again", why);
+        // Whether Windows' stream runs is unknown now: let the packets
+        // themselves tell the status.
+        self.stream_active.store(true, Ordering::Release);
+        self.record_fault(&format!("Lost the sound device's events: {}", why));
+        self.record_error(
+            "Lost touch with the sound device: Windows volume changes won't reach the speaker until it \
+             reconnects.",
+        );
+    }
+
+    /// The driver's events can be read again.
+    pub fn note_driver_events_back(&self) {
+        info!("the sound device's events are back");
+    }
+
     /// What Windows is giving the audio loop right now.
     pub fn windows_audio(&self) -> WindowsAudio {
         let now = self.started_at.elapsed().as_millis() as u64 + 1;
@@ -3984,25 +4058,9 @@ mod tests {
     }
 
 
-    /// An app with default settings that saves nowhere: never the
-    /// developer's own `config.json`.
+    /// [`App::for_tests`] with privacy mode on.
     fn test_app() -> Arc<App> {
-        let app = App::with_settings(
-            AppConfig {
-                advertise_ip: "192.168.1.10".into(),
-                advertise_ip_explicit: false,
-                bind: "0.0.0.0:8080".parse().unwrap(),
-                initial_buffer_ms: 0,
-                silence_packets_threshold: 0,
-                no_silence_injection: false,
-                no_discovery: true,
-                web_enabled: false,
-                ssdp_iface: None,
-            },
-            UserConfig::in_memory(),
-            None,
-            None,
-        );
+        let app = App::for_tests();
         app.set_privacy_mode(true);
         app
     }

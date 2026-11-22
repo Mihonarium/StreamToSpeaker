@@ -499,7 +499,7 @@ fn run(cli: Cli) -> Result<()> {
 
     // Build the audio source up front so we fail fast if the driver is
     // missing under --source driver.
-    let source: Box<dyn AudioSource> = build_source(&cli)?;
+    let (source, reopen_source) = build_source(&cli)?;
     info!("audio source: {}", source.name());
 
     let app = setup_app(&cli)?;
@@ -563,20 +563,19 @@ fn run(cli: Cli) -> Result<()> {
     app.set_rate_fudge_ppm(cli.rate_fudge_ppm);
     app.set_latency_adjust_step_frames(cli.latency_adjust_step_frames);
 
-    // Start the audio loop BEFORE we issue any UPnP Play. With the
-    // old order (Play → spawn audio thread) the speaker connected to
-    // /stream.raw before the audio loop was producing data — Sonos
-    // would receive an empty HTTP body, time out, and stay in a
-    // "I'm connected but not playing" state until the user hit
-    // Resync. Spawning audio first means silence injection is already
-    // running by the time we send Play, so the speaker gets a
-    // populated stream from byte zero.
+    // Start the audio loop before any speaker is told to play: from then
+    // on /stream.raw always carries data, Windows' sound or, while Windows
+    // plays nothing, silence in its place.
     let audio_app = app.clone();
     let _audio_thread = thread::Builder::new()
         .name("stream-to-speaker-audio".to_string())
         .spawn(move || {
-            if let Err(e) = audio_loop::run(audio_app.clone(), source) {
-                error!("audio loop exited with error: {:#}", e);
+            if let Err(e) = audio_loop::run(audio_app.clone(), source, reopen_source) {
+                error!("audio loop couldn't start: {:#}", e);
+                audio_app.record_error(format!(
+                    "Couldn't start reading this PC's sound ({:#}). Quit {} and start it again.",
+                    e, PRODUCT_NAME
+                ));
             }
         })
         .context("spawning audio thread")?;
@@ -724,12 +723,10 @@ fn run_gui_mode(app: Arc<App>, no_tray: bool, start_hidden: bool) -> Result<()> 
         ));
     }
 
-    // Tell the audio loop to stop. We deliberately do NOT join() it:
-    // it's blocked inside the kernel IOCTL (recv_packet) waiting for
-    // the next audio packet, and joining would hang until the next
-    // packet arrives — which on a paused / idle Sonos can be forever.
-    // Process termination kills the thread cleanly; the kernel handle
-    // is RAII-dropped via the SharedHandle Arc on exit.
+    // Tell the audio loop to stop. Its reader thread is deliberately not
+    // joined: it waits inside the driver's read for the next packet,
+    // which while Windows plays nothing never comes. Process exit ends
+    // it, and Windows closes its handle.
     app.request_shutdown();
     shutdown_cleanup(&app);
     Ok(())
@@ -944,13 +941,17 @@ fn cmd_web_link(cli: &Cli) -> Result<()> {
 // Source selection
 // -----------------------------------------------------------------------------
 
-fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
+/// The audio source the flags ask for, and how to open the same kind again
+/// if it fails while the app runs (the audio loop does that). Under `auto`
+/// that is the kind found at start: a driver that goes away during a
+/// driver update is waited for, not swapped for WASAPI.
+fn build_source(cli: &Cli) -> Result<(Box<dyn AudioSource>, audio_loop::Reopen)> {
     match cli.source {
-        SourceKind::Sine => Ok(Box::new(SineSource::new())),
+        SourceKind::Sine => Ok((open_sine()?, Box::new(open_sine))),
         SourceKind::WasapiLoopback => {
             #[cfg(windows)]
             {
-                Ok(Box::new(WasapiLoopbackSource::new(cli.device.as_deref())?))
+                Ok((open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone())))
             }
             #[cfg(not(windows))]
             {
@@ -960,10 +961,9 @@ fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
         SourceKind::Driver => {
             #[cfg(windows)]
             {
-                use stream_to_speaker::ioctl_source::IoctlAudioSource;
-                let src = IoctlAudioSource::open_audio_only()
+                let src = open_driver()
                     .context("opening Stream-To-Speaker kernel driver (--source driver was specified)")?;
-                Ok(Box::new(src))
+                Ok((src, Box::new(open_driver)))
             }
             #[cfg(not(windows))]
             {
@@ -973,22 +973,40 @@ fn build_source(cli: &Cli) -> Result<Box<dyn AudioSource>> {
         SourceKind::Auto => {
             #[cfg(windows)]
             {
-                use stream_to_speaker::ioctl_source::IoctlAudioSource;
-                match IoctlAudioSource::open_audio_only() {
-                    Ok(s) => Ok(Box::new(s)),
+                match open_driver() {
+                    Ok(s) => Ok((s, Box::new(open_driver))),
                     Err(e) => {
                         info!("driver not present, falling back to WASAPI loopback: {}", e);
-                        Ok(Box::new(WasapiLoopbackSource::new(cli.device.as_deref())?))
+                        Ok((open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone())))
                     }
                 }
             }
             #[cfg(not(windows))]
             {
                 warn!("non-Windows host; using sine source for --source auto");
-                Ok(Box::new(SineSource::new()))
+                Ok((open_sine()?, Box::new(open_sine)))
             }
         }
     }
+}
+
+fn open_sine() -> Result<Box<dyn AudioSource>> {
+    Ok(Box::new(SineSource::new()))
+}
+
+#[cfg(windows)]
+fn open_driver() -> Result<Box<dyn AudioSource>> {
+    Ok(Box::new(stream_to_speaker::ioctl_source::IoctlAudioSource::open_audio_only()?))
+}
+
+#[cfg(windows)]
+fn open_wasapi(device: Option<&str>) -> Result<Box<dyn AudioSource>> {
+    Ok(Box::new(WasapiLoopbackSource::new(device)?))
+}
+
+#[cfg(windows)]
+fn reopen_wasapi(device: Option<String>) -> audio_loop::Reopen {
+    Box::new(move || open_wasapi(device.as_deref()))
 }
 
 // -----------------------------------------------------------------------------
@@ -1000,68 +1018,98 @@ fn spawn_driver_event_consumer(app: Arc<App>, cli: &Cli) {
     if cli.source == SourceKind::WasapiLoopback || cli.source == SourceKind::Sine {
         return;
     }
-    use stream_to_speaker::ioctl_source::{DriverEvent, IoctlAudioSource};
-    use stream_to_speaker::volume_sync::SpeakerCommand;
+    use stream_to_speaker::ioctl_source::IoctlAudioSource;
     thread::Builder::new()
         .name("stream-to-speaker-driver-events".to_string())
         .spawn(move || {
-            let src = match IoctlAudioSource::open() {
+            // The first open says whether there is a driver at all (`auto`
+            // runs on WASAPI without one). Once open, a consumer that ends
+            // (the device was disabled, removed or updated) is opened
+            // again, as the audio source is. One consumer at a time: two
+            // would split the driver's single event stream between them.
+            let mut src = match IoctlAudioSource::open() {
                 Ok(s) => s,
                 Err(e) => {
                     warn!("driver-event consumer: open failed: {}", e);
                     return;
                 }
             };
-            let rx = src.events();
-            while let Ok(ev) = rx.recv() {
+            let mut attempts = 0;
+            loop {
+                if consume_driver_events(&app, &src) > 0 {
+                    attempts = 0;
+                }
                 if app.is_shutting_down() {
                     return;
                 }
-                match ev {
-                    DriverEvent::VolumeChanged { level_millibels } => {
-                        // Windows maps our hardware volume node's slider
-                        // linearly across its dB range, so convert the dB
-                        // back to a percent linearly to track it 1:1.
-                        let level = stream_to_speaker::volume_sync::millibels_to_sonos(
-                            level_millibels,
-                        );
-                        if let Some(level) = app.vsync.driver_changed(level) {
-                            info!("windows -> speaker: volume {} (mb={})", level, level_millibels);
-                            // Queued for whichever session kind is active
-                            // and sent from the volume thread: a speaker
-                            // round trip here would hold up the events
-                            // behind this one (and, under the session
-                            // lock, the window).
-                            app.send_to_speaker(SpeakerCommand::Volume(level));
-                        }
-                    }
-                    DriverEvent::MuteChanged { muted } => {
-                        info!("driver -> speaker: mute={}", muted);
-                        app.vsync.note_muted(muted);
-                        app.send_to_speaker(SpeakerCommand::Mute(muted));
-                    }
-                    DriverEvent::StreamStart => {
-                        info!("driver: stream start");
-                        app.stream_active.store(true, Ordering::Release);
-                    }
-                    DriverEvent::StreamStop => {
-                        info!("driver: stream stop");
-                        app.stream_active.store(false, Ordering::Release);
-                    }
-                    DriverEvent::FormatChange {
-                        sample_rate,
-                        bits_per_sample,
-                        channels,
-                    } => {
-                        info!(
-                            "driver: format change to {}/{}-bit/{}ch",
-                            sample_rate, bits_per_sample, channels
-                        );
-                    }
-                }
+                app.note_driver_events_lost("the driver ended its event stream");
+                drop(src);
+                let reopened =
+                    audio_loop::open_again(&app, &mut attempts, "the driver's events", IoctlAudioSource::open);
+                src = match reopened {
+                    Some(s) => s,
+                    None => return,
+                };
+                app.note_driver_events_back();
             }
         })
         .ok();
+}
+
+/// Act on the driver's events until its event stream ends or the app
+/// shuts down. Returns how many there were.
+#[cfg(windows)]
+fn consume_driver_events(app: &Arc<App>, src: &stream_to_speaker::ioctl_source::IoctlAudioSource) -> u64 {
+    use stream_to_speaker::ioctl_source::DriverEvent;
+    use stream_to_speaker::volume_sync::SpeakerCommand;
+    let rx = src.events();
+    let mut count = 0;
+    while let Ok(ev) = rx.recv() {
+        if app.is_shutting_down() {
+            return count;
+        }
+        count += 1;
+        match ev {
+            DriverEvent::VolumeChanged { level_millibels } => {
+                // Windows maps our hardware volume node's slider linearly
+                // across its dB range, so convert the dB back to a percent
+                // linearly to track it 1:1.
+                let level = stream_to_speaker::volume_sync::millibels_to_sonos(level_millibels);
+                if let Some(level) = app.vsync.driver_changed(level) {
+                    info!("windows -> speaker: volume {} (mb={})", level, level_millibels);
+                    // Queued for whichever session kind is active and sent
+                    // from the volume thread: a speaker round trip here
+                    // would hold up the events behind this one (and, under
+                    // the session lock, the window).
+                    app.send_to_speaker(SpeakerCommand::Volume(level));
+                }
+            }
+            DriverEvent::MuteChanged { muted } => {
+                info!("driver -> speaker: mute={}", muted);
+                app.vsync.note_muted(muted);
+                app.send_to_speaker(SpeakerCommand::Mute(muted));
+            }
+            DriverEvent::StreamStart => {
+                info!("driver: stream start");
+                app.stream_active.store(true, Ordering::Release);
+            }
+            DriverEvent::StreamStop => {
+                info!("driver: stream stop");
+                app.stream_active.store(false, Ordering::Release);
+            }
+            DriverEvent::FormatChange {
+                sample_rate,
+                bits_per_sample,
+                channels,
+            } => {
+                info!(
+                    "driver: format change to {}/{}-bit/{}ch",
+                    sample_rate, bits_per_sample, channels
+                );
+            }
+        }
+    }
+    count
 }
 
 #[cfg(not(windows))]
@@ -1080,8 +1128,20 @@ struct IoctlPusher {
 #[cfg(windows)]
 impl DriverVolumePush for IoctlPusher {
     fn push(&self, mb: i32, muted: bool) -> Result<()> {
-        let s = self.src.lock().unwrap();
-        s.push_volume(mb, muted)
+        use stream_to_speaker::ioctl_source::IoctlAudioSource;
+        let mut s = self.src.lock().unwrap();
+        match s.push_volume(mb, muted) {
+            Ok(()) => Ok(()),
+            // After the device was restarted under the app (Device Manager,
+            // a driver update) the old handle is dead and a new one works.
+            Err(e) => match IoctlAudioSource::open_audio_only() {
+                Ok(fresh) => {
+                    *s = fresh;
+                    s.push_volume(mb, muted)
+                }
+                Err(_) => Err(e),
+            },
+        }
     }
 }
 

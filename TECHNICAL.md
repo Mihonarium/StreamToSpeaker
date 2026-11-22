@@ -317,7 +317,7 @@ StreamToSpeaker/
 └── service/src/
     ├── main.rs          CLI parsing, mode dispatch
     ├── app.rs           central Arc<App> state + actions
-    ├── audio_loop.rs    audio loop, own thread
+    ├── audio_loop.rs    audio loop; silence while Windows plays nothing
     ├── audio_source.rs  source abstraction
     ├── ioctl_source.rs  driver IOCTL consumer (audio + events)
     ├── wasapi_source.rs loopback fallback · sine_source.rs  test tone

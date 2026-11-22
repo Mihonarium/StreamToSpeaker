@@ -1880,6 +1880,21 @@ impl StreamToSpeakerApp {
                 None,
                 None,
             )
+        } else if enabled && self.app.sound_input_lost() {
+            // The audio loop is opening the sound device again; speakers
+            // get silence meanwhile.
+            (
+                "⟳",
+                p.warn,
+                "Reconnecting to this PC's sound…".to_string(),
+                "Windows stopped passing sound to Stream To Speaker. The sound device may have been \
+                 disabled, updated or removed."
+                    .to_string(),
+                current.as_ref().map(|_| "Disable streaming"),
+                current
+                    .as_ref()
+                    .map(|_| "Stop streaming and release the speaker for other apps (Ctrl+E)"),
+            )
         } else {
             match (&current, enabled, active) {
             (None, _, _) => (
