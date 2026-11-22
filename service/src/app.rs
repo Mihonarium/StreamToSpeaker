@@ -2169,9 +2169,10 @@ impl App {
         // a person picks it in the window, never from the web API (which
         // scripts drive too), the tray or a reconnect.
         if self.is_airplay_newcomer(id) {
+            // Its name says what it is ("<speaker> — another receiver with
+            // the same ID: …").
             return Err(format!(
-                "{} announces the same identity as another speaker. To play to it, pick it in the Stream To \
-                 Speaker window.",
+                "To play to “{}”, pick it in the Stream To Speaker window.",
                 self.speaker_name(id).unwrap_or_else(|| id.to_string())
             ));
         }
@@ -5182,7 +5183,11 @@ mod tests {
     fn the_web_api_refuses_a_newcomer() {
         let (app, _discovery) = airplay_test_app_with(conflict_discovery());
         let err = app.select_speaker(KITCHEN_2).expect_err("refused");
-        assert!(err.ends_with("To play to it, pick it in the Stream To Speaker window."), "{err}");
+        assert_eq!(
+            err,
+            "To play to “Kitchen — another receiver with the same ID: Kitchen 2 (192.168.1.66)”, pick it in the Stream To \
+             Speaker window."
+        );
         assert!(app.connecting_to().is_none());
     }
 
