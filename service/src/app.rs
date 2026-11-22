@@ -513,6 +513,31 @@ pub enum UpdateOutcome {
     Failed(String),
 }
 
+/// The window's AirPlay password dialog, as it opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasswordDialog {
+    /// The entry it was opened for.
+    pub id: String,
+    /// Its name, for the title.
+    pub name: String,
+    /// What is typed is used for one connection and never stored (the
+    /// entry announced another speaker's identity when the dialog opened).
+    pub one_session: bool,
+}
+
+impl PasswordDialog {
+    /// The dialog's explanation, under its title: what happens to what is
+    /// typed.
+    pub fn message(&self) -> &'static str {
+        if self.one_session {
+            "This receiver requires an AirPlay password. Enter it to connect — it's used for this connection only and \
+             not remembered, since this receiver has the same ID as another speaker."
+        } else {
+            "This speaker requires an AirPlay password. Enter it to connect — it'll be remembered for next time."
+        }
+    }
+}
+
 /// In-memory update-check state (the persistent part lives in `UserConfig`).
 #[derive(Clone, Debug, Default)]
 pub struct UpdateState {
@@ -530,8 +555,9 @@ pub struct App {
     pub discovery: Option<Arc<DiscoveryState>>,
     pub airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     /// Passwords typed for an AirPlay receiver that announces another
-    /// speaker's identity (a newcomer, see `RaopDetails::newcomer`): used
-    /// for the next connect to it, never stored.
+    /// speaker's identity (a newcomer, see `RaopDetails::newcomer`), by
+    /// its id (`airplay:<MAC>/<instance>`): used for the next connect to
+    /// it, never stored.
     unsaved_airplay_passwords: Mutex<std::collections::HashMap<String, String>>,
     /// AirPlay receivers (by id) that asked for a password in this run,
     /// whether or not they announce one: picking them opens the password
@@ -1364,16 +1390,12 @@ impl App {
     }
 
     /// Store (or clear, when `pw` is empty) the AirPlay password for a
-    /// device id and persist it. For a receiver that announces another
-    /// speaker's identity it is kept only for its next connect.
+    /// device id and persist it. Under a newcomer's id (see
+    /// [`crate::airplay::discovery::is_instance_id`]) nothing is stored,
+    /// whatever its record says now: it is kept only for its next connect.
     pub fn set_airplay_password(&self, id: &str, pw: &str) {
-        if self.is_airplay_newcomer(id) {
-            let mut unsaved = self.unsaved_airplay_passwords.lock().unwrap();
-            if pw.is_empty() {
-                unsaved.remove(id);
-            } else {
-                unsaved.insert(id.to_string(), pw.to_string());
-            }
+        if crate::airplay::discovery::is_instance_id(id) {
+            self.keep_typed_password(id, pw);
             return;
         }
         let mut uc = self.user_config.lock().unwrap();
@@ -1391,6 +1413,78 @@ impl App {
                  after the app restarts.",
             );
         }
+    }
+
+    /// The password dialog for `id` (`name` for its title), as it opens:
+    /// whether what is typed there is kept for the speaker or used for one
+    /// connection is decided now, from the record, and travels with the
+    /// dialog.
+    pub fn password_dialog(&self, id: &str, name: &str) -> PasswordDialog {
+        let one_session = self.is_airplay_newcomer(id) || crate::airplay::discovery::is_instance_id(id);
+        PasswordDialog { id: id.to_string(), name: name.to_string(), one_session }
+    }
+
+    /// Take what was typed in `dialog`, as the dialog decided when it
+    /// opened (never by asking the record again: it may have changed
+    /// while the dialog was open). If the entry it was opened for has gone
+    /// meanwhile, nothing is taken, and the error says what to do.
+    pub fn enter_airplay_password(&self, dialog: &PasswordDialog, pw: &str) -> Result<(), String> {
+        let listed = self.find_manual_speaker(&dialog.id).is_some()
+            || self.airplay_discovery.as_ref().and_then(|d| d.find_by_id(&dialog.id)).is_some();
+        if !listed {
+            return Err(format!(
+                "Couldn't connect: “{}” is no longer in the speaker list, and the password you typed wasn't kept. \
+                 When it's back in the list, pick it and enter the password again.",
+                dialog.name
+            ));
+        }
+        if dialog.one_session {
+            self.keep_typed_password(&dialog.id, pw);
+        } else {
+            self.set_airplay_password(&dialog.id, pw);
+        }
+        Ok(())
+    }
+
+    /// The window's password dialog was confirmed: take the password, then
+    /// connect.
+    pub fn submit_password_dialog(self: &Arc<Self>, dialog: &PasswordDialog, pw: &str) -> Result<(), String> {
+        self.enter_airplay_password(dialog, pw)?;
+        self.select_speaker_async(&dialog.id);
+        Ok(())
+    }
+
+    /// Keep `pw` for the next connect to `id` only (an empty one clears
+    /// it); never stored.
+    fn keep_typed_password(&self, id: &str, pw: &str) {
+        let mut typed = self.unsaved_airplay_passwords.lock().unwrap();
+        if pw.is_empty() {
+            typed.remove(id);
+        } else {
+            typed.insert(id.to_string(), pw.to_string());
+        }
+    }
+
+    /// A password typed for one connection lives until the connect it was
+    /// typed for ends, used or not.
+    fn forget_typed_password(&self, id: &str) {
+        self.unsaved_airplay_passwords.lock().unwrap().remove(id);
+    }
+
+    /// The password for a connect to `renderer`: one typed for it for one
+    /// connection (under its id, or its instance's id when the conflict it
+    /// was typed in has ended since), used once; else the stored one,
+    /// which a newcomer never gets.
+    fn airplay_password_for(&self, renderer: &AirPlayRenderer) -> Option<String> {
+        let stable_id = renderer.stable_id();
+        let typed = {
+            let mut typed = self.unsaved_airplay_passwords.lock().unwrap();
+            typed.remove(&stable_id).or_else(|| renderer.instance_id().and_then(|k| typed.remove(&k)))
+        };
+        typed.or_else(|| {
+            let stored = !renderer.is_newcomer();
+            self.user_config.lock().unwrap().airplay_passwords.get(&stable_id).filter(|_| stored).cloned()
+        })
     }
 
     /// Does `id` name a discovered AirPlay receiver (or pair) that
@@ -2093,6 +2187,7 @@ impl App {
             if let Some(name) = guard.as_ref() {
                 if interactive {
                     self.record_error(format!("{}{} — give it a moment.", STILL_CONNECTING_PREFIX, name));
+                    self.forget_typed_password(id);
                 } else {
                     debug!("select of {} skipped — still connecting to {}", id, name);
                 }
@@ -2103,6 +2198,7 @@ impl App {
             *guard = Some(if sendspin_pairing.is_some() { format!("{} (pairing)", name) } else { name });
         }
         let app = self.clone();
+        let requested = id;
         let id = id.to_string();
         if std::thread::Builder::new()
             .name("stream-to-speaker-connect".into())
@@ -2111,6 +2207,7 @@ impl App {
                 // (reconnects, auto-connect) only bind while streaming is
                 // still enabled.
                 let result = app.select_speaker_inner(&id, interactive, interactive, sendspin_pairing);
+                app.forget_typed_password(&id);
                 *app.connecting.lock().unwrap() = None;
                 app.clear_connecting_notice();
                 if let Err(e) = result {
@@ -2122,6 +2219,7 @@ impl App {
             .is_err()
         {
             *self.connecting.lock().unwrap() = None;
+            self.forget_typed_password(requested);
             self.record_error("Couldn't start connecting (no thread available).");
         }
     }
@@ -2582,7 +2680,7 @@ impl App {
         // click "Hide this guide" themselves.
         // (Not a receiver announcing another speaker's identity: the next
         // launch must not connect to it by itself.)
-        if !is_newcomer {
+        if !is_newcomer && !crate::airplay::discovery::is_instance_id(&actual_id) {
             let mut uc = self.user_config.lock().unwrap();
             if uc.last_speaker_id.as_deref() != Some(actual_id.as_str()) {
                 uc.last_speaker_id = Some(actual_id.clone());
@@ -3016,16 +3114,12 @@ impl App {
                 // Nothing stored for a speaker goes to a newcomer: only a
                 // password typed for it, once.
                 let stored = !renderer.is_newcomer();
-                let (mfi_encryption, uncompressed_alac, password, latency_ms, opener_hint) = {
+                let password = self.airplay_password_for(&renderer);
+                let (mfi_encryption, uncompressed_alac, latency_ms, opener_hint) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.airplay_mfi_encryption,
                         uc.airplay_uncompressed_alac,
-                        uc.airplay_passwords
-                            .get(&stable_id)
-                            .filter(|_| stored)
-                            .cloned()
-                            .or_else(|| self.unsaved_airplay_passwords.lock().unwrap().remove(&stable_id)),
                         if stored { uc.airplay_latency_ms_for(&stable_id) } else { uc.effective_airplay_latency_ms() },
                         uc.speaker_settings.get(&stable_id).and_then(|s| s.airplay_opener).filter(|_| stored),
                     )
@@ -3322,10 +3416,14 @@ impl App {
         (id, seed)
     }
 
-    /// Persist HomeKit pairing credentials for a device id.
-    /// Whether it was saved: a pairing that isn't needs the PIN again
-    /// after the app restarts.
+    /// Persist HomeKit pairing credentials for a device id (never under a
+    /// newcomer's id). Whether it was saved: a pairing that isn't needs
+    /// the PIN again after the app restarts.
     pub fn store_airplay_pairing(&self, id: &str, creds: PairingCredentials) -> bool {
+        if crate::airplay::discovery::is_instance_id(id) {
+            debug!("not storing a pairing under {id}: it names a receiver announcing another speaker's identity");
+            return false;
+        }
         {
             let mut uc = self.user_config.lock().unwrap();
             uc.airplay_pairings.insert(id.to_string(), creds);
@@ -4183,7 +4281,12 @@ impl App {
     }
 
     /// Store one speaker's settings (an all-default value drops its entry).
+    /// Nothing is stored under a newcomer's id.
     pub fn set_speaker_settings(&self, id: &str, settings: SpeakerSettings) {
+        if crate::airplay::discovery::is_instance_id(id) {
+            debug!("not storing settings under {id}: it names a receiver announcing another speaker's identity");
+            return;
+        }
         let mut uc = self.user_config.lock().unwrap();
         let changed = if settings.is_default() {
             uc.speaker_settings.remove(id).is_some()
@@ -7327,6 +7430,117 @@ mod tests {
             Err(_) => panic!("the incumbent connects with its password"),
         }
         assert!(rx.requests().iter().any(|r| r.header("Authorization").is_some()));
+    }
+
+    /// Nothing is stored under a newcomer's id (`airplay:<MAC>/<instance>`),
+    /// also once its conflict has ended and the record left is no longer
+    /// marked: such an id only ever names a newcomer, and nothing would
+    /// read or remove what was stored under it.
+    #[test]
+    fn nothing_is_stored_under_a_newcomers_id() {
+        let (app, discovery) = airplay_test_app_with(conflict_discovery());
+        discovery.remove_for_tests(crate::airplay::discovery::RAOP_SERVICE, "B8E93735AC11@Kitchen._raop._tcp.local.");
+        assert!(!discovery.find_by_id(KITCHEN_2).unwrap().is_newcomer(), "the conflict has ended");
+        app.set_airplay_password(KITCHEN_2, "typed-after-conflict");
+        app.set_speaker_settings(KITCHEN_2, SpeakerSettings { hidden: true, ..Default::default() });
+        app.store_airplay_pairing(KITCHEN_2, some_pairing("kitchen-2"));
+        let uc = app.user_config.lock().unwrap();
+        assert!(uc.airplay_passwords.is_empty() && uc.speaker_settings.is_empty() && uc.airplay_pairings.is_empty());
+        let written = serde_json::to_string(&*uc).unwrap();
+        assert!(!written.contains("typed-after-conflict") && !written.contains("kitchen 2"), "{written}");
+    }
+
+    /// Whether a typed password is kept or used for one connection is
+    /// decided when the dialog opens. When the conflict ends while it is
+    /// open (the speaker's own announcement goes, the instance left is no
+    /// longer marked), what is typed for the second claimant is still
+    /// used for that one connection, and is not in the settings or in
+    /// what a save would write.
+    #[test]
+    fn a_password_typed_as_the_conflict_ends_is_for_that_connection_only() {
+        let (app, discovery) = airplay_test_app_with(conflict_discovery());
+        app.user_config.lock().unwrap().airplay_passwords.insert(KITCHEN.into(), "hunter2".into());
+        let dialog = app.password_dialog(KITCHEN_2, "Kitchen 2");
+        assert!(dialog.one_session);
+        discovery.remove_for_tests(crate::airplay::discovery::RAOP_SERVICE, "B8E93735AC11@Kitchen._raop._tcp.local.");
+        let left = discovery.find_by_id(KITCHEN_2).unwrap();
+        assert!(!left.is_newcomer());
+        app.enter_airplay_password(&dialog, "typed-after-conflict").unwrap();
+        {
+            let uc = app.user_config.lock().unwrap();
+            assert_eq!(uc.airplay_passwords.values().collect::<Vec<_>>(), ["hunter2"]);
+            assert!(!serde_json::to_string(&*uc).unwrap().contains("typed-after-conflict"));
+        }
+        // The connect the dialog starts uses it, and only that one.
+        assert_eq!(app.airplay_password_for(&left).as_deref(), Some("typed-after-conflict"));
+        assert_ne!(app.airplay_password_for(&left).as_deref(), Some("typed-after-conflict"));
+    }
+
+    /// The dialog says what happens to what is typed: remembered for a
+    /// speaker, used for this connection only for a receiver with another
+    /// speaker's ID.
+    #[test]
+    fn the_password_dialog_says_whether_the_password_is_remembered() {
+        let (app, _discovery) = airplay_test_app_with(conflict_discovery());
+        assert_eq!(
+            app.password_dialog(KITCHEN, "Kitchen").message(),
+            "This speaker requires an AirPlay password. Enter it to connect — it'll be remembered for next time."
+        );
+        assert_eq!(
+            app.password_dialog(KITCHEN_2, "Kitchen 2").message(),
+            "This receiver requires an AirPlay password. Enter it to connect — it's used for this connection only and \
+             not remembered, since this receiver has the same ID as another speaker."
+        );
+    }
+
+    /// When the entry the dialog was opened for has gone by the time the
+    /// person confirms, nothing is stored or kept, nothing is connected,
+    /// and they are told what to do.
+    #[test]
+    fn a_password_for_an_entry_that_has_gone_is_not_kept() {
+        use mdns_sd::ServiceInfo;
+        let (app, discovery) = airplay_test_app_with(conflict_discovery());
+        let raop = crate::airplay::discovery::RAOP_SERVICE;
+        let txt = &[("et", "0,1"), ("cn", "0,1"), ("pw", "true")][..];
+        discovery.ingest_for_tests(raop, &ServiceInfo::new(raop, "0D0000000009@Den", "d.local.", "192.168.1.70", 5000, txt).unwrap());
+        let dialogs = [app.password_dialog(KITCHEN_2, "Kitchen 2"), app.password_dialog("airplay:0D0000000009", "Den")];
+        assert_eq!(dialogs.iter().map(|d| d.one_session).collect::<Vec<_>>(), [true, false]);
+        discovery.remove_for_tests(raop, "B8E93735AC11@Kitchen 2._raop._tcp.local.");
+        discovery.remove_for_tests(raop, "0D0000000009@Den._raop._tcp.local.");
+        for d in &dialogs {
+            let err = app.submit_password_dialog(d, "typed-for-a-gone-one").expect_err("not taken");
+            assert_eq!(
+                err,
+                format!(
+                    "Couldn't connect: “{}” is no longer in the speaker list, and the password you typed wasn't kept. \
+                     When it's back in the list, pick it and enter the password again.",
+                    d.name
+                )
+            );
+        }
+        assert!(app.connecting_to().is_none());
+        assert!(app.unsaved_airplay_passwords.lock().unwrap().is_empty());
+        let uc = app.user_config.lock().unwrap();
+        assert!(uc.airplay_passwords.is_empty());
+        assert!(!serde_json::to_string(&*uc).unwrap().contains("typed-for-a-gone-one"));
+    }
+
+    /// A password typed for one connection doesn't outlive the connect it
+    /// was typed for, even one that never got as far as using it.
+    #[test]
+    fn a_typed_password_is_forgotten_when_its_connect_ends() {
+        let (app, discovery) = airplay_test_app_with(conflict_discovery());
+        let dialog = app.password_dialog(KITCHEN_2, "Kitchen 2");
+        app.enter_airplay_password(&dialog, "typed").unwrap();
+        // Gone before the connect looks it up, so nothing is contacted.
+        discovery.remove_for_tests(crate::airplay::discovery::RAOP_SERVICE, "B8E93735AC11@Kitchen 2._raop._tcp.local.");
+        app.select_speaker_async(KITCHEN_2);
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.connecting_to().is_some() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.connecting_to().is_none());
+        assert!(app.unsaved_airplay_passwords.lock().unwrap().is_empty());
     }
 
     /// A password typed for a newcomer is used for its next connect and
