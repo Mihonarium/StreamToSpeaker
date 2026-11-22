@@ -1507,8 +1507,12 @@ impl App {
     /// Remove a manual speaker: disconnect it if it's the active one and
     /// drop what was stored under its id.
     /// The teardown runs on a worker thread: it is network I/O and this is
-    /// called from the GUI.
+    /// called from the GUI. A connect in flight meanwhile may be to this
+    /// speaker: if it binds it, that is undone once it ends.
     pub fn remove_manual_speaker(self: &Arc<Self>, id: &str) {
+        if self.connecting_to().is_some() {
+            self.undo_connect_once_done(id.to_string());
+        }
         let stopped = {
             let mut guard = self.session.lock().unwrap();
             if guard.as_ref().map_or(false, |s| s.stable_id() == id) {
@@ -1553,10 +1557,59 @@ impl App {
         if uc.last_speaker_id.as_deref() == Some(id) {
             uc.last_speaker_id = None;
         }
-        uc.airplay_passwords.remove(id);
-        uc.airplay_pairings.remove(id);
+        // Everything kept for it goes with it: its password and pairing,
+        // sealed copies this account can't open included (a save would
+        // keep those), and its settings, so the same address added again
+        // is a new speaker.
+        uc.remove_airplay_password(id);
+        uc.remove_airplay_pairing(id);
+        uc.speaker_settings.remove(id);
         uc.save();
         info!("manual speaker removed: {}", id);
+    }
+
+    /// Once the connect in flight has ended: if it bound the removed
+    /// speaker `id` (and saved it as the last one), stop it and forget it.
+    /// Off the caller's thread; gives up after a minute.
+    fn undo_connect_once_done(self: &Arc<Self>, id: String) {
+        let app = self.clone();
+        let spawned = std::thread::Builder::new().name("stream-to-speaker-removed".into()).spawn(move || {
+            let end = Instant::now() + Duration::from_secs(60);
+            while app.connecting_to().is_some() && Instant::now() < end {
+                if !app.sleep_unless_shutdown(Duration::from_millis(50)) {
+                    return;
+                }
+            }
+            let stopped = {
+                let mut guard = app.session.lock().unwrap();
+                if guard.as_ref().is_some_and(|s| s.stable_id() == id) {
+                    guard.take()
+                } else {
+                    None
+                }
+            };
+            {
+                let mut last = app.last_speaker_id.lock().unwrap();
+                if last.as_deref() == Some(id.as_str()) {
+                    *last = None;
+                }
+            }
+            {
+                let mut uc = app.user_config.lock().unwrap();
+                if uc.last_speaker_id.as_deref() == Some(id.as_str()) {
+                    uc.last_speaker_id = None;
+                    uc.save();
+                }
+            }
+            if let Some(s) = stopped {
+                info!("stopped {:?}: it was removed while connecting", id);
+                s.stop();
+                app.prune_stream_clients();
+            }
+        });
+        if spawned.is_err() {
+            warn!("couldn't watch the connect under way: if it was to the removed speaker, it stays connected");
+        }
     }
 
     /// Display name for any speaker id: discovered UPnP, discovered
@@ -5151,6 +5204,61 @@ mod tests {
         let started = Instant::now();
         app.shut_down_within(Duration::from_millis(100), Duration::from_secs(30));
         assert!(started.elapsed() < Duration::from_secs(2), "waited {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn removing_a_speaker_added_by_address_forgets_everything_kept_for_it() {
+        let app = test_app();
+        let id = app.add_manual_speaker(ManualKind::AirPlay, "Kitchen", "192.168.1.30", "").unwrap();
+        let mut settings = app.speaker_settings(&id);
+        settings.hidden = true;
+        settings.auto_connect = AutoConnect::Always;
+        app.set_speaker_settings(&id, settings);
+        app.set_airplay_password(&id, "secret");
+        app.store_airplay_pairing(&id, some_pairing("k"));
+        // Sealed copies this account can't open (a file from another PC).
+        let locked = |key: &str| crate::secret_store::LockedNode {
+            pointer: Some(crate::secret_store::pointer(&[key.to_string(), id.clone()])),
+            sealed: serde_json::json!("opaque"),
+        };
+        app.user_config.lock().unwrap().locked_secrets =
+            vec![locked("airplay_passwords"), locked("airplay_pairings")];
+
+        app.remove_manual_speaker(&id);
+        {
+            let uc = app.user_config.lock().unwrap();
+            assert!(uc.locked_secrets.is_empty(), "{:?}", uc.locked_secrets);
+            assert!(!uc.airplay_passwords.contains_key(&id));
+            assert!(!uc.airplay_pairings.contains_key(&id));
+        }
+        // Added again: a new speaker, listed and with default settings.
+        assert_eq!(app.add_manual_speaker(ManualKind::AirPlay, "Kitchen", "192.168.1.30", "").unwrap(), id);
+        assert!(app.speaker_settings(&id).is_default());
+        assert!(app.speaker_view().speakers.iter().any(|s| s.id == id));
+    }
+
+    #[test]
+    fn a_connect_that_ends_after_its_speaker_was_removed_is_undone() {
+        let app = test_app();
+        let id = app
+            .add_manual_speaker(ManualKind::Upnp, "Den", "http://192.168.1.31:49152/desc.xml", "")
+            .unwrap();
+        // A connect to it is under way when it is removed…
+        *app.connecting.lock().unwrap() = Some("Den".into());
+        app.remove_manual_speaker(&id);
+        // …and binds (and saves it as the last speaker) before it ends.
+        let (mut session, got) = unanswering_upnp_session();
+        if let ActiveSession::Upnp(s) = &mut session {
+            s.id_override = Some(id.clone());
+        }
+        bind(&app, session);
+        app.user_config.lock().unwrap().last_speaker_id = Some(id.clone());
+        *app.last_speaker_id.lock().unwrap() = Some(id.clone());
+        *app.connecting.lock().unwrap() = None;
+        assert!(eventually(|| !app.is_speaker_bound()), "still playing on a removed speaker");
+        assert!(got.recv_timeout(Duration::from_secs(5)).is_ok_and(|a| a.contains("#Stop")));
+        assert_eq!(app.saved_speaker_id(), None);
+        assert_eq!(*app.last_speaker_id.lock().unwrap(), None);
     }
 
     /// A listed speaker for the ranking table.
