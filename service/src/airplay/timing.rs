@@ -70,16 +70,44 @@ pub fn latency_ms_to_samples(ms: u32) -> u32 {
 /// NTP epoch offset — seconds between 1900-01-01 and 1970-01-01.
 const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 
-/// Convert `SystemTime::now()` to a 64-bit NTP timestamp (seconds
-/// since 1900-01-01 in the high 32 bits, fractional seconds in the
-/// low 32 bits). Saturates on broken clocks.
+/// The clock NTP timestamps are read from: one wall-clock reading
+/// paired with one monotonic reading, taken once; every stamp is that
+/// wall-clock time plus the monotonic time since. The audio is paced on
+/// the same monotonic clock (`rtp.rs`), so the timeline a receiver is
+/// given stays one clock: a step of the Windows clock (a resync after
+/// resume, "Sync now", a manual change) or a slew never shifts it. OwnTone
+/// does the same with `CLOCK_MONOTONIC`.
+#[derive(Clone, Copy, Debug)]
+pub struct NtpClock {
+    /// The wall-clock reading, since the Unix epoch.
+    base_wall: Duration,
+    base_mono: Instant,
+}
+
+impl NtpClock {
+    pub fn starting(wall: SystemTime, mono: Instant) -> Self {
+        Self { base_wall: wall.duration_since(UNIX_EPOCH).unwrap_or_default(), base_mono: mono }
+    }
+
+    /// The NTP timestamp of `mono` (seconds since 1900-01-01 in the high
+    /// 32 bits, fractional seconds in the low 32 bits).
+    pub fn stamp(&self, mono: Instant) -> u64 {
+        let t = self.base_wall + mono.saturating_duration_since(self.base_mono);
+        let secs = t.as_secs().wrapping_add(NTP_EPOCH_OFFSET);
+        let frac = ((t.subsec_nanos() as u64) << 32) / 1_000_000_000;
+        (secs << 32) | frac
+    }
+}
+
+/// The process's [`NtpClock`], started the first time it is read.
+fn clock() -> &'static NtpClock {
+    static CLOCK: std::sync::OnceLock<NtpClock> = std::sync::OnceLock::new();
+    CLOCK.get_or_init(|| NtpClock::starting(SystemTime::now(), Instant::now()))
+}
+
+/// Now, as an NTP timestamp of the process's [`NtpClock`].
 pub fn ntp_now() -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs() + NTP_EPOCH_OFFSET;
-    let frac = ((now.subsec_nanos() as u64) << 32) / 1_000_000_000;
-    (secs << 32) | frac
+    clock().stamp(Instant::now())
 }
 
 /// Spawn the timing responder. Owns the timing socket. Exits when
@@ -298,6 +326,34 @@ mod tests {
         assert!(from_receiver("192.168.1.20".parse().unwrap(), rx));
         assert!(from_receiver("::ffff:192.168.1.20".parse().unwrap(), rx));
         assert!(!from_receiver("192.168.1.21".parse().unwrap(), rx));
+    }
+
+    /// Stamps follow the monotonic clock from one wall-clock reading: a
+    /// wall clock stepped by 5 s while 1 s passes moves them by 1 s.
+    #[test]
+    fn ntp_stamps_follow_monotonic_time_not_the_wall_clock() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000) + Duration::from_millis(250);
+        let i0 = Instant::now();
+        let clock = NtpClock::starting(t0, i0);
+        let first = clock.stamp(i0);
+        // The wall clock is never read again: whatever it says now (5 s
+        // ahead, after a resync), the next stamp is 1 s on.
+        let second = clock.stamp(i0 + Duration::from_secs(1));
+        assert_eq!(second - first, 1 << 32);
+        // The format: seconds since 1900 high, fraction low.
+        assert_eq!(first >> 32, 1_700_000_000 + NTP_EPOCH_OFFSET);
+        assert_eq!(first & 0xFFFF_FFFF, (1u64 << 32) / 4);
+        // A monotonic reading before the base doesn't go back.
+        assert_eq!(NtpClock::starting(t0, i0 + Duration::from_secs(3)).stamp(i0), first);
+    }
+
+    #[test]
+    fn ntp_now_moves_with_monotonic_time() {
+        let a = ntp_now();
+        let i = Instant::now();
+        while i.elapsed() < Duration::from_millis(20) {}
+        let b = ntp_now();
+        assert!(b > a);
     }
 
     #[test]
