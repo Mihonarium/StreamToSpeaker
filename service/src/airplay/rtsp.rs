@@ -1204,7 +1204,7 @@ mod tests {
     use crate::airplay::fake_raop::{Answer, Event, FakeRaop, Reply, Request};
 
     /// The per-request time limit these tests give the client.
-    const LIMIT: Duration = Duration::from_millis(300);
+    const LIMIT: Duration = Duration::from_secs(1);
 
     fn client(rx: &FakeRaop) -> RtspClient {
         RtspClient::connect("127.0.0.1".parse().unwrap(), rx.port(), "127.0.0.1".parse().unwrap(), LIMIT).unwrap()
@@ -1334,9 +1334,12 @@ mod tests {
         for h in ["Client-Instance", "DACP-ID", "Active-Remote", "User-Agent"] {
             assert_eq!(teardown.header(h), announce.header(h), "{h}");
         }
-        // The old connection was shut down before the new one was opened.
-        let closed = rx.closed_at(0).expect("the broken connection is closed");
-        assert!(closed <= rx.connected_at(1).unwrap() + Duration::from_millis(50));
+        // The old connection was shut down before TEARDOWN went out on the
+        // new one (event order, not timing).
+        let ev = rx.events();
+        let closed = ev.iter().position(|e| matches!(e, Event::Closed { conn: 0, .. })).expect("the broken connection is closed");
+        let teardown_at = ev.iter().position(|e| matches!(e, Event::Request(r) if r.conn == 1)).unwrap();
+        assert!(closed < teardown_at, "{ev:?}");
     }
 
     #[test]

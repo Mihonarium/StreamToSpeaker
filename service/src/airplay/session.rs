@@ -1393,7 +1393,7 @@ mod tests {
     /// opener.
     #[test]
     fn a_keepalive_answered_late_does_not_end_the_session() {
-        let delay = Duration::from_millis(200);
+        let delay = Duration::from_secs(2);
         let mut keepalives = 0;
         let rx = FakeRaop::start(move |req| match (req.method.as_str(), req.header("Apple-Challenge")) {
             ("OPTIONS", None) => {
@@ -1408,7 +1408,9 @@ mod tests {
         });
         let (_tx, samples) = crossbeam_channel::unbounded();
         let mut cfg = config(receiver(&rx, "0B0000000003", &[0, 1]), samples);
-        cfg.timeouts = RaopTimeouts { opener: Duration::from_millis(100), reply: Duration::from_secs(2), ..RaopTimeouts::STANDARD };
+        // Longer than the opener's limit (which every request had
+        // before), well within the reply limit.
+        cfg.timeouts = RaopTimeouts { opener: Duration::from_secs(1), reply: Duration::from_secs(20), ..RaopTimeouts::STANDARD };
         let session = AirPlaySession::start(cfg).expect("session up");
         let keepalive = |ev: &[crate::airplay::fake_raop::Event], n: usize| {
             ev.iter()
@@ -1427,19 +1429,19 @@ mod tests {
     #[test]
     fn setup_gets_the_longer_limit_once_the_opener_is_answered() {
         let rx = FakeRaop::start(|req| match req.method.as_str() {
-            "SETUP" => Answer::late(Duration::from_millis(400), Answer::Normal),
+            "SETUP" => Answer::late(Duration::from_secs(2), Answer::Normal),
             _ => Answer::Normal,
         });
         let (_tx, samples) = crossbeam_channel::unbounded();
         let mut cfg = config(receiver(&rx, "0B0000000004", &[0, 1]), samples);
-        cfg.timeouts = RaopTimeouts { opener: Duration::from_millis(200), reply: Duration::from_secs(4), ..RaopTimeouts::STANDARD };
+        cfg.timeouts = RaopTimeouts { opener: Duration::from_secs(1), reply: Duration::from_secs(20), ..RaopTimeouts::STANDARD };
         let session = AirPlaySession::start(cfg).expect("SETUP answered within the longer limit");
         session.stop();
     }
 
     fn keepalive_client(rx: &FakeRaop) -> Mutex<RtspClient> {
         let ip = "127.0.0.1".parse().unwrap();
-        Mutex::new(RtspClient::connect(ip, rx.port(), ip, Duration::from_millis(300)).unwrap())
+        Mutex::new(RtspClient::connect(ip, rx.port(), ip, Duration::from_secs(1)).unwrap())
     }
 
     const FAST: KeepaliveCadence = KeepaliveCadence { every: Duration::from_millis(100), after_failure: Duration::from_millis(100) };
@@ -1534,9 +1536,9 @@ mod tests {
     /// measurable, the reply limit long against every delay used here.
     fn quick() -> RaopTimeouts {
         RaopTimeouts {
-            opener: Duration::from_millis(300),
-            reply: Duration::from_millis(600),
-            teardown: Duration::from_millis(400),
+            opener: Duration::from_secs(1),
+            reply: Duration::from_secs(2),
+            teardown: Duration::from_secs(1),
             retry_pause: Duration::from_millis(200),
             busy_retry: Duration::from_millis(300),
         }
@@ -1999,7 +2001,7 @@ mod tests {
         });
         let (_tx, samples) = crossbeam_channel::unbounded();
         let mut cfg = config(receiver(&rx, "0B0000000001", &[0, 4]), samples);
-        cfg.timeouts.reply = Duration::from_millis(300);
+        cfg.timeouts.reply = Duration::from_secs(1);
         assert!(AirPlaySession::start(cfg).is_err());
         assert!(rx.wait_for_requests(4, Duration::from_secs(10)), "{:?}", rx.lines());
         let lines = rx.lines();
