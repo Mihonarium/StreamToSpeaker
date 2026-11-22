@@ -152,6 +152,9 @@ pub(crate) fn transcript(reqs: &[Request]) -> String {
             assert_eq!(r.body.len(), 33);
             assert_eq!(r.body[0], 0x01);
             out.push_str("[0x01, then a 32-byte X25519 public key]\n");
+        } else if r.body.iter().any(|&b| !(b.is_ascii_graphic() || b == b' ' || b == b'\r' || b == b'\n')) {
+            let hex: Vec<String> = r.body.iter().map(|b| format!("{:02x}", b)).collect();
+            out.push_str(&format!("  [bytes {}]\n", hex.join(" ")));
         } else if !r.body.is_empty() {
             let text = std::str::from_utf8(&r.body).expect("a text body");
             for line in text.split("\r\n") {
@@ -617,4 +620,81 @@ fn receiver_that_never_answers_the_opener_is_given_up_quickly() {
     assert!(took >= limit && took < limit * 10, "{:?}", took);
     assert_eq!(rx.lines(), ["0 POST /auth-setup"]);
     assert!(rx.wait_until(Duration::from_secs(10), |ev| ev.iter().any(|e| matches!(e, Event::Closed { conn: 0, .. }))));
+}
+
+const KEEPALIVE_METADATA_VOLUME: &str = r#"--- connection 0
+OPTIONS * RTSP/1.0
+CSeq: 6
+User-Agent: iTunes/12.13.10 (Windows; Microsoft Windows 11 x64 (Build 26200); x64) (dt:2)
+Client-Instance: <Client-Instance>
+DACP-ID: <DACP-ID>
+Active-Remote: <Active-Remote>
+--- connection 0
+SET_PARAMETER rtsp://127.0.0.1/<session> RTSP/1.0
+CSeq: 7
+User-Agent: iTunes/12.13.10 (Windows; Microsoft Windows 11 x64 (Build 26200); x64) (dt:2)
+Client-Instance: <Client-Instance>
+DACP-ID: <DACP-ID>
+Active-Remote: <Active-Remote>
+Session: 1
+RTP-Info: rtptime=<rtptime>
+Content-Type: application/x-dmap-tagged
+Content-Length: <length of the body>
+  [bytes 6d 6c 69 74 00 00 00 27 6d 69 6e 6d 00 00 00 04 53 6f 6e 67 61 73 61 72 00 00 00 06 41 72 74 69 73 74 61 73 61 6c 00 00 00 05 41 6c 62 75 6d]
+--- connection 0
+SET_PARAMETER rtsp://127.0.0.1/<session> RTSP/1.0
+CSeq: 8
+User-Agent: iTunes/12.13.10 (Windows; Microsoft Windows 11 x64 (Build 26200); x64) (dt:2)
+Client-Instance: <Client-Instance>
+DACP-ID: <DACP-ID>
+Active-Remote: <Active-Remote>
+Session: 1
+Content-Type: text/parameters
+Content-Length: <length of the body>
+  volume: -18.181818
+--- connection 0
+SET_PARAMETER rtsp://127.0.0.1/<session> RTSP/1.0
+CSeq: 9
+User-Agent: iTunes/12.13.10 (Windows; Microsoft Windows 11 x64 (Build 26200); x64) (dt:2)
+Client-Instance: <Client-Instance>
+DACP-ID: <DACP-ID>
+Active-Remote: <Active-Remote>
+Session: 1
+Content-Type: text/parameters
+Content-Length: <length of the body>
+  volume: -144.000000
+--- connection 0
+TEARDOWN rtsp://127.0.0.1/<session> RTSP/1.0
+CSeq: 10
+User-Agent: iTunes/12.13.10 (Windows; Microsoft Windows 11 x64 (Build 26200); x64) (dt:2)
+Client-Instance: <Client-Instance>
+DACP-ID: <DACP-ID>
+Active-Remote: <Active-Remote>
+Session: 1
+"#;
+
+/// What a session sends after it is up: the keepalive, track text and a
+/// volume change, then TEARDOWN.
+#[test]
+fn keepalive_track_text_and_volume() {
+    let rx = FakeRaop::start(|_| Answer::Normal);
+    let (_tx, srx) = samples();
+    let cfg = config(receiver(&rx, "0A0000000009", &[0, 1]), srx);
+    let session = AirPlaySession::start(cfg).expect("the session starts");
+    // The first keepalive goes out about 2 s after the session is up.
+    assert!(rx.wait_for_requests(6, Duration::from_secs(20)), "{:?}", rx.lines());
+    session.metadata_handle().send("Song", "Artist", "Album").expect("track text answered");
+    session.set_volume_pct(40).expect("volume answered");
+    session.set_mute(true).expect("mute answered");
+    session.stop();
+    assert!(rx.wait_until(Duration::from_secs(10), |ev| ev.iter().any(|e| matches!(e, Event::Closed { conn: 0, .. }))));
+    let reqs = rx.requests();
+    // Keep the transcript to the requests whose order doesn't depend on
+    // timing: the first keepalive, and everything from the track text on.
+    let keepalive = reqs.iter().position(|r| r.method == "OPTIONS" && r.cseq() == Some(6)).expect("a keepalive");
+    let text = reqs.iter().position(|r| r.header("Content-Type") == Some("application/x-dmap-tagged")).unwrap();
+    let mut picked = vec![reqs[keepalive].clone()];
+    picked.extend(reqs[text..].iter().cloned());
+    picked.retain(|r| !(r.method == "OPTIONS" && r.cseq() != Some(6)));
+    assert_eq!(transcript(&picked), KEEPALIVE_METADATA_VOLUME);
 }
