@@ -517,7 +517,13 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, speaker: bool, ctx: &C
                     HeadErr::NotImplemented => Some(501),
                 };
                 if let Some(status) = status {
-                    debug!("http: bad request from {}: {}", peer, status);
+                    // The speaker's requests are the ones that matter: a
+                    // refused one may be why it plays nothing.
+                    if speaker {
+                        info!("http: refused a malformed request from the speaker at {}: {}", peer.ip(), status);
+                    } else {
+                        debug!("http: bad request from {}: {}", peer, status);
+                    }
                     let _ = write_reply(&mut conn.stream, 1, &Reply::text(status, ""), false, true);
                 }
                 return;
@@ -540,13 +546,14 @@ impl Ctx {
 
         // DNS-rebinding guard: a browser tricked into treating this
         // server as some other site still sends that site's name.
-        if !self.hosts.allows(head.header("host")) {
+        let host = head.authority.as_deref().or(head.header("host"));
+        if !self.hosts.allows(host) {
             info!(
                 "http: refused {} {} from {}: unrecognised Host {:?}",
                 head.method,
                 redact_target(path),
                 conn.peer.ip(),
-                head.header("host").unwrap_or("")
+                host.unwrap_or("")
             );
             let reply = Reply::text(421, "unrecognised Host header");
             let _ = write_reply(&mut conn.stream, head.minor, &reply, head_only, true);
@@ -574,7 +581,7 @@ impl Ctx {
                 if let Some(refusal) = self.check_stream_client(conn.peer.ip(), &head.method, path) {
                     refusal
                 } else {
-                    let ok = write_stream_head(&mut conn.stream, head.minor, profile, StreamRequest::Head).is_ok();
+                    let ok = write_stream_head(&mut conn.stream, head.minor, profile, StreamRequest::Head, from_start(head, profile)).is_ok();
                     return ok && head.keep_alive() && head.body == BodyKind::None;
                 }
             }
@@ -827,7 +834,7 @@ impl Ctx {
         let write_timeout = (!conn.speaker).then_some(STREAM_WRITE_TIMEOUT);
         let _ = conn.stream.set_write_timeout(write_timeout);
         let mut out = BufWriter::with_capacity(1024, &conn.stream);
-        let result = write_stream_head(&mut out, head.minor, profile, StreamRequest::Get)
+        let result = write_stream_head(&mut out, head.minor, profile, StreamRequest::Get, from_start(head, profile))
             .and_then(|_| std::io::copy(&mut reader, &mut out).map(|_| ()))
             .and_then(|_| out.flush());
         if let Err(e) = result {
@@ -1041,7 +1048,11 @@ enum BodyKind {
 #[derive(Debug)]
 struct Head {
     method: String,
+    /// In origin form (`/path?query`), whichever form it came in.
     target: String,
+    /// The authority of an absolute-form target, which takes the place
+    /// of `Host` (RFC 9112 3.2.2).
+    authority: Option<String>,
     /// HTTP/1.x minor version (0 or 1).
     minor: u8,
     headers: Vec<(String, String)>,
@@ -1120,22 +1131,53 @@ fn is_token(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
+/// The head's lines, split at CRLF.
+fn crlf_lines(mut bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    while let Some(p) = bytes.windows(2).position(|w| w == b"\r\n") {
+        lines.push(&bytes[..p]);
+        bytes = &bytes[p + 2..];
+    }
+    lines.push(bytes);
+    lines
+}
+
+/// An absolute-form target (`http://host:port/path?query`, RFC 9112
+/// 3.2.2) as its authority and the origin-form target it names. None if
+/// it isn't one.
+fn absolute_form(target: &str) -> Option<(&str, String)> {
+    let scheme = target.get(..7).filter(|s| s.eq_ignore_ascii_case("http://"))?;
+    let rest = &target[scheme.len()..];
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let path = if path.starts_with('/') { path.to_string() } else { format!("/{path}") };
+    Some((authority, path))
+}
+
+/// Parse a request head. The request line and field names are ASCII;
+/// field values may carry other bytes (a device name in Latin-1, say),
+/// which are read leniently.
 fn parse_head(bytes: &[u8]) -> Result<Head, HeadErr> {
-    let text = std::str::from_utf8(bytes).map_err(|_| HeadErr::Bad)?;
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next().ok_or(HeadErr::Bad)?;
+    let lines = crlf_lines(bytes);
+    let request_line = std::str::from_utf8(lines[0]).ok().filter(|l| l.is_ascii()).ok_or(HeadErr::Bad)?;
     let mut parts = request_line.split(' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return Err(HeadErr::Bad);
     };
-    if !is_token(method)
-        || !target.starts_with('/')
-        || target.bytes().any(|b| b <= b' ' || b == 0x7f)
-    {
+    if !is_token(method) || target.bytes().any(|b| b <= b' ' || b == 0x7f) {
         return Err(HeadErr::Bad);
     }
+    let (target, authority) = if target.starts_with('/') {
+        (target.to_string(), None)
+    } else {
+        let (authority, path) = absolute_form(target).ok_or(HeadErr::Bad)?;
+        (path, Some(authority.to_string()))
+    };
     let minor = match version {
         "HTTP/1.1" => 1,
         "HTTP/1.0" => 0,
@@ -1144,20 +1186,27 @@ fn parse_head(bytes: &[u8]) -> Result<Head, HeadErr> {
     };
 
     let mut headers: Vec<(String, String)> = Vec::new();
-    for line in lines {
+    for line in &lines[1..] {
         if headers.len() >= MAX_HEADERS {
             return Err(HeadErr::TooLarge);
         }
-        let (name, value) = line.split_once(':').ok_or(HeadErr::Bad)?;
+        let colon = line.iter().position(|&b| b == b':').ok_or(HeadErr::Bad)?;
+        let name = std::str::from_utf8(&line[..colon]).map_err(|_| HeadErr::Bad)?;
         if !is_token(name) {
             // Also rejects obsolete line folding (leading whitespace).
             return Err(HeadErr::Bad);
         }
-        let value = value.trim_matches(|c| c == ' ' || c == '\t');
-        if value.bytes().any(|b| (b < b' ' && b != b'\t') || b == 0x7f) {
+        let mut value = &line[colon + 1..];
+        while let [b' ' | b'\t', rest @ ..] = value {
+            value = rest;
+        }
+        while let [rest @ .., b' ' | b'\t'] = value {
+            value = rest;
+        }
+        if value.iter().any(|&b| (b < b' ' && b != b'\t') || b == 0x7f) {
             return Err(HeadErr::Bad);
         }
-        headers.push((name.to_string(), value.to_string()));
+        headers.push((name.to_string(), String::from_utf8_lossy(value).into_owned()));
     }
 
     let te = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
@@ -1192,7 +1241,7 @@ fn parse_head(bytes: &[u8]) -> Result<Head, HeadErr> {
         BodyKind::None
     };
 
-    Ok(Head { method: method.to_string(), target: target.to_string(), minor, headers, body })
+    Ok(Head { method: method.to_string(), target, authority, minor, headers, body })
 }
 
 /// Path and query of a request target.
@@ -1459,6 +1508,18 @@ fn write_reply(
 /// even though both are technically legal HTTP.
 const FAKE_CONTENT_LEN: u64 = (u32::MAX - 1) as u64;
 
+/// Whether `head` asks for `profile`'s stream from its first byte with
+/// `Range: bytes=0-`, as Linn streamers do (swyh-rs answers 206). Only
+/// that form, and only on the new paths: the original stream answers as
+/// it always has, which Sonos takes.
+fn from_start(head: &Head, profile: StreamProfile) -> bool {
+    profile != StreamProfile::Legacy
+        && head.header("range").is_some_and(|r| {
+            let r = r.trim();
+            r.len() == 8 && r[..6].eq_ignore_ascii_case("bytes=") && &r[6..] == "0-"
+        })
+}
+
 /// Which request a stream head answers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamRequest {
@@ -1476,22 +1537,38 @@ enum StreamRequest {
 /// `TransferMode.dlna.org: Streaming` header tells renderers the body is
 /// a live stream they mustn't seek. Do NOT add Accept-Ranges or
 /// contentFeatures.dlna.org — swyh-rs omits both.
-fn write_stream_head(w: &mut impl Write, minor: u8, profile: StreamProfile, request: StreamRequest) -> std::io::Result<()> {
+///
+/// `from_start`: the request asked for `Range: bytes=0-` (see
+/// [`from_start`]): the same stream as a `206` with its `Content-Range`.
+fn write_stream_head(
+    w: &mut impl Write,
+    minor: u8,
+    profile: StreamProfile,
+    request: StreamRequest,
+    from_start: bool,
+) -> std::io::Result<()> {
     let content_length = match (profile, request) {
         (StreamProfile::Legacy, StreamRequest::Head) => 0,
         _ => FAKE_CONTENT_LEN,
     };
+    let (status, range) = if from_start {
+        ("206 Partial Content", format!("Content-Range: bytes 0-{}/{}\r\n", FAKE_CONTENT_LEN - 1, FAKE_CONTENT_LEN))
+    } else {
+        ("200 OK", String::new())
+    };
     let head = format!(
-        "HTTP/1.{} 200 OK\r\n\
+        "HTTP/1.{} {}\r\n\
          Date: {}\r\n\
          Server: stream-to-speaker tiny-http\r\n\
          Content-Type: {}\r\n\
          TransferMode.dlna.org: Streaming\r\n\
-         Content-Length: {}\r\n\
+         {}Content-Length: {}\r\n\
          \r\n",
         minor,
+        status,
         http_date(SystemTime::now()),
         profile.content_type(),
+        range,
         content_length
     );
     w.write_all(head.as_bytes())?;
@@ -1980,6 +2057,8 @@ mod tests {
         use std::sync::{Mutex, Once};
 
         static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        /// The lines logged at info or above (what a release build keeps).
+        static INFO_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
         struct Capture;
 
@@ -1990,6 +2069,9 @@ mod tests {
             fn log(&self, record: &log::Record) {
                 if self.enabled(record.metadata()) {
                     LINES.lock().unwrap().push(record.args().to_string());
+                    if record.level() <= log::Level::Info {
+                        INFO_LINES.lock().unwrap().push(record.args().to_string());
+                    }
                 }
             }
             fn flush(&self) {}
@@ -2009,6 +2091,10 @@ mod tests {
 
         pub(super) fn lines() -> Vec<String> {
             LINES.lock().unwrap().clone()
+        }
+
+        pub(super) fn info_lines() -> Vec<String> {
+            INFO_LINES.lock().unwrap().clone()
         }
     }
 
@@ -2552,6 +2638,106 @@ mod tests {
         assert!(hub.wait_for_fetch(&[speaker], StreamProfile::Legacy, since, Duration::from_millis(100)).is_none());
         assert!(hub.wait_for_fetch(&[speaker], wav, Instant::now(), Duration::from_millis(100)).is_none());
         drop(s);
+    }
+
+    // ---- request forms a server must accept ----------------------------
+
+    #[test]
+    fn an_absolute_form_target_is_served_when_its_authority_is_ours() {
+        let (port, hub) = minimal();
+        let r = exchange(port, format!("GET http://127.0.0.1:{port}/healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes(), 4096);
+        assert!(r.starts_with("HTTP/1.1 200") && r.ends_with("ok"), "{r}");
+        // The target's authority is what counts (RFC 9112 3.2.2), whatever Host says.
+        let r = exchange(port, b"GET HTTP://Evil.Example:5901/healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", 4096);
+        assert!(r.starts_with("HTTP/1.1 421"), "{r}");
+        let r = exchange(port, b"GET http://localhost/healthz?x=1 HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n", 4096);
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        // A stream, too.
+        let stop = keep_publishing(&hub, vec![1, 2, 3, 4]);
+        let r = exchange_raw(port, format!("GET http://127.0.0.1:{port}/wav/stream.wav HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes(), 600);
+        stop.store(true, Ordering::Relaxed);
+        assert!(head_without_date(&r).contains("Content-Type: audio/wav\r\n"), "{}", String::from_utf8_lossy(&r));
+        // Not a URL: still refused.
+        for target in ["http://", "http:///healthz", "ftp://127.0.0.1/healthz", "healthz"] {
+            let r = exchange(port, format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes(), 4096);
+            assert!(r.starts_with("HTTP/1.1 400"), "{target}: {r}");
+        }
+    }
+
+    #[test]
+    fn header_values_need_not_be_utf8() {
+        let (port, _hub) = minimal();
+        let mut req = b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: Caf\xe9 Renderer/1.0\r\nConnection: close\r\n\r\n".to_vec();
+        let r = String::from_utf8_lossy(&exchange_raw(port, &req, 4096)).into_owned();
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        // Names and the request line stay ASCII.
+        req = b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nUs\xe9r: x\r\n\r\n".to_vec();
+        assert!(String::from_utf8_lossy(&exchange_raw(port, &req, 4096)).starts_with("HTTP/1.1 400"));
+        req = b"GET /h\xe9althz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_vec();
+        assert!(String::from_utf8_lossy(&exchange_raw(port, &req, 4096)).starts_with("HTTP/1.1 400"));
+        // Control characters in a value are still refused.
+        req = b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nX: a\x01b\r\n\r\n".to_vec();
+        assert!(String::from_utf8_lossy(&exchange_raw(port, &req, 4096)).starts_with("HTTP/1.1 400"));
+        let h = head("GET / HTTP/1.1\nX: Caf\u{e9}\n").unwrap();
+        assert_eq!(h.header("x"), Some("Caf\u{e9}"));
+    }
+
+    #[test]
+    fn a_request_the_speaker_sends_that_is_refused_is_logged_where_it_is_seen() {
+        log_capture::start();
+        let hub = StreamHub::new();
+        let mut cfg = HttpServerConfig::minimal("127.0.0.1:0".parse().unwrap(), hub);
+        let speaker: IpAddr = "127.0.0.1".parse().unwrap();
+        cfg.speaker_peer = Some(Arc::new(move |ip| ip == speaker));
+        let port = start(cfg);
+        let bad = b"GET  /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        let mut s = connect(port);
+        s.write_all(bad).unwrap();
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 400"));
+        let mut other = connect_from([127, 0, 0, 22], port);
+        other.write_all(bad).unwrap();
+        let n = other.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 400"));
+        let info = log_capture::info_lines();
+        assert!(info.contains(&"http: refused a malformed request from the speaker at 127.0.0.1: 400".to_string()), "{info:#?}");
+        // Anyone else's stays at debug.
+        assert!(!info.iter().any(|l| l.contains("127.0.0.22")), "{info:#?}");
+        assert!(log_capture::lines().iter().any(|l| l.starts_with("http: bad request from 127.0.0.22:")));
+    }
+
+    #[test]
+    fn a_range_from_the_start_gets_206_on_the_new_paths_only() {
+        let (port, hub) = minimal();
+        let stop = keep_publishing(&hub, vec![1, 2, 3, 4]);
+        for p in new_profiles() {
+            for method in ["HEAD", "GET"] {
+                let r = exchange_raw(port, format!("{method} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n", p.path()).as_bytes(), 600);
+                assert_eq!(
+                    head_without_date(&r),
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nServer: stream-to-speaker tiny-http\r\nContent-Type: {}\r\n\
+                         TransferMode.dlna.org: Streaming\r\nContent-Range: bytes 0-4294967293/4294967294\r\n\
+                         Content-Length: 4294967294\r\n\r\n",
+                        p.content_type()
+                    ),
+                    "{method} {p:?}"
+                );
+            }
+            // Any other range: the whole stream, as before.
+            for range in ["bytes=10-", "bytes=0-99", "bytes=-5", "items=0-"] {
+                let r = exchange_raw(port, format!("HEAD {} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: {range}\r\nConnection: close\r\n\r\n", p.path()).as_bytes(), 600);
+                assert!(r.starts_with(b"HTTP/1.1 200 OK\r\n"), "{range} {p:?}");
+            }
+        }
+        // The original stream answers as it always has.
+        let r = exchange_raw(port, b"GET /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=0-\r\n\r\n", 600);
+        let head = head_without_date(&r);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n") && !head.contains("Content-Range"), "{head}");
+        let r = exchange_raw(port, b"HEAD /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n", 600);
+        assert!(head_without_date(&r).ends_with("Content-Length: 0\r\n\r\n"));
+        stop.store(true, Ordering::Relaxed);
     }
 
     #[test]
