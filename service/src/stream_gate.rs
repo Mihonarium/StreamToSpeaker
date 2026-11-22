@@ -124,7 +124,10 @@ fn decide(
     granted: impl FnOnce(IpAddr) -> bool,
 ) -> Result<(), Refusal> {
     let peer = canonical_ip(peer);
-    if peer.is_loopback() || is_this_pc(peer) {
+    // No device connects from an unspecified or multicast address, though
+    // binding to one (how `is_local_address` checks) can succeed.
+    let ownable = !peer.is_unspecified() && !peer.is_multicast();
+    if peer.is_loopback() || (ownable && is_this_pc(peer)) {
         return Ok(());
     }
     if !streaming {
@@ -342,6 +345,21 @@ mod tests {
         JOINED.store(true, Ordering::SeqCst);
         assert_eq!(g.check(ip("10.0.0.5")), Ok(()));
         assert!(g.snapshot().allows(ip("::ffff:10.0.0.5")));
+    }
+
+    #[test]
+    fn no_peer_counts_as_this_pc_by_an_address_no_device_has() {
+        // Binding to the unspecified address always works, so a check by
+        // binding says "local" for it; a peer never has it, nor a multicast one.
+        fn binds_anything(_: IpAddr) -> bool {
+            true
+        }
+        let g = StreamGate::new(false, Arc::new(AtomicBool::new(false)), binds_anything);
+        for odd in ["0.0.0.0", "::", "224.0.0.251", "ff02::fb"] {
+            assert_eq!(g.check(ip(odd)), Err(Refusal::StreamingOff), "{odd}");
+            assert!(!g.snapshot().allows(ip(odd)), "{odd}");
+        }
+        assert_eq!(g.check(ip("192.168.1.10")), Ok(()));
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub mod gui;
 pub mod tray;
 #[cfg(windows)]
 pub mod endpoint_name;
+pub mod latest;
 
 /// Whether `url` is something we're willing to hand to the shell: an
 /// absolute http(s) URL made only of letters, digits and `-._~/:%[]@`.
