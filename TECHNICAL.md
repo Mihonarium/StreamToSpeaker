@@ -118,10 +118,14 @@ only under `--web`.
 
 ## Speaker selection
 
-The GUI and tray lists update as discovery runs. `--player` takes a
-speaker's address or part of its name (any kind of speaker, or a room in a
-Sonos group); the app starts anyway and connects when that speaker is
-listed, unless someone picks another first. `--list-speakers` searches,
+The GUI and tray lists update as discovery runs. `--player` names a
+speaker of any kind: its address or full name always reaches that speaker
+(a hidden one too); part of a name finds the best match among the speakers
+the list shows (one used before first, then one not set to never connect
+by itself, then the first in the list; a room inside a Sonos group counts
+last). The app starts anyway and connects when that speaker is listed,
+unless someone picks another first; a partial or shared match is logged
+with what was taken. `--list-speakers` searches,
 prints what the window would list and exits. Without `--player`, the
 speaker used last time is reconnected; `--headless` in a terminal asks with
 a numbered prompt instead (`r` searches again). Under `--web`,

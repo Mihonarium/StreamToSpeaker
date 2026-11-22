@@ -3913,24 +3913,49 @@ impl App {
             .ok();
     }
 
-    /// The listed speaker `query` names, as `--player` documents it: its
-    /// address, else the first whose name contains it (any letter case),
-    /// else a Sonos group one of whose rooms it names. Every kind of
-    /// speaker counts, hidden ones too: naming one is choosing it.
-    pub fn find_listed_speaker(&self, query: &str) -> Option<String> {
+    /// The listed speaker `query` names, ranked as `--player` documents it
+    /// (see [`rank_player_match`]), with how it matched.
+    pub fn find_listed_speaker(&self, query: &str) -> Option<PlayerMatch> {
         let rows = self.speaker_view_opts(true).speakers;
-        // An address matches whole, with or without the port a speaker
-        // added by address is listed with.
-        let at = |addr: &str| addr == query || addr.strip_prefix(query).is_some_and(|rest| rest.starts_with(':'));
-        if let Some(r) = rows.iter().find(|r| at(&r.ip)) {
-            return Some(r.id.clone());
+        let mut candidates: Vec<PlayerCandidate> = rows
+            .iter()
+            .map(|r| {
+                // The speaker's own names, not the list's labels around
+                // them ("Kitchen (AirPlay)", "Den (AirPlay, added
+                // manually)"): a name is what the person called it.
+                let mut names: Vec<String> = self.speaker_name(&r.id).into_iter().collect();
+                if let Some(d) = self.discovery.as_ref().and_then(|d| d.find_by_id(&r.id)) {
+                    names.push(d.friendly_name.clone());
+                    names.extend(d.zone_name.clone());
+                }
+                if names.is_empty() {
+                    names.push(r.friendly_name.clone());
+                }
+                PlayerCandidate {
+                    id: r.id.clone(),
+                    address: r.ip.clone(),
+                    names,
+                    hidden: r.hidden,
+                    used_before: r.manual,
+                    never_auto: false,
+                }
+            })
+            .collect();
+        {
+            // What the settings already record of a speaker having been
+            // used: last time, its own settings, a pairing or a password.
+            let uc = self.user_config.lock().unwrap();
+            for c in candidates.iter_mut() {
+                let settings = uc.speaker_settings.get(&c.id);
+                c.used_before |= uc.last_speaker_id.as_deref() == Some(c.id.as_str())
+                    || settings.is_some()
+                    || uc.airplay_pairings.contains_key(&c.id)
+                    || uc.airplay_passwords.contains_key(&c.id);
+                c.never_auto = settings.is_some_and(|s| s.auto_connect == AutoConnect::Never);
+            }
         }
-        let q = query.to_lowercase();
-        if let Some(r) = rows.iter().find(|r| r.friendly_name.to_lowercase().contains(&q)) {
-            return Some(r.id.clone());
-        }
-        let group = self.discovery.as_ref()?.find(query)?.stable_id();
-        rows.iter().any(|r| r.id == group).then_some(group)
+        let group_room = self.discovery.as_ref().and_then(|d| d.find(query)).map(|r| r.stable_id());
+        rank_player_match(query, &candidates, group_room.as_deref())
     }
 
     /// What `--player` named, while the app is waiting for it.
@@ -3970,10 +3995,14 @@ impl App {
                     }
                     match app.find_listed_speaker(&query) {
                         None => tried = None,
-                        Some(id) if tried.as_deref() != Some(id.as_str()) && !connecting => {
-                            info!("--player {:?}: found {:?}; connecting", query, id);
-                            app.connect_unless_user_picked(&id, picks_seen);
-                            tried = Some(id);
+                        Some(m) if tried.as_deref() != Some(m.id.as_str()) && !connecting => {
+                            let name = app.speaker_name(&m.id).unwrap_or_else(|| m.id.clone());
+                            if let Some(line) = m.explain(&query, &name) {
+                                info!("{}", line);
+                            }
+                            info!("--player {:?}: found {:?}; connecting", query, m.id);
+                            app.connect_unless_user_picked(&m.id, picks_seen);
+                            tried = Some(m.id);
                         }
                         Some(_) => {}
                     }
@@ -4130,6 +4159,106 @@ pub fn stop_session(session: &RendererSession) {
 // -----------------------------------------------------------------------------
 // IP / bind helpers (moved from main.rs to keep main.rs lean)
 // -----------------------------------------------------------------------------
+
+/// A listed speaker as `--player` sees it.
+#[derive(Clone, Debug)]
+pub(crate) struct PlayerCandidate {
+    pub id: String,
+    /// As the list shows it (a speaker added by address carries its port).
+    pub address: String,
+    /// The speaker's own names (a Sonos speaker's device name and room).
+    pub names: Vec<String>,
+    pub hidden: bool,
+    /// The settings record it being used before: the last speaker, its own
+    /// settings, a pairing or password, or added by address.
+    pub used_before: bool,
+    /// Set never to connect by itself.
+    pub never_auto: bool,
+}
+
+/// How `--player`'s text matched the speaker taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerMatchKind {
+    Address,
+    FullName,
+    PartOfName,
+    /// A room inside a Sonos group.
+    GroupRoom,
+}
+
+impl PlayerMatchKind {
+    pub fn describe(self) -> &'static str {
+        match self {
+            PlayerMatchKind::Address => "its address",
+            PlayerMatchKind::FullName => "its full name",
+            PlayerMatchKind::PartOfName => "part of its name",
+            PlayerMatchKind::GroupRoom => "a room in its Sonos group",
+        }
+    }
+}
+
+/// The speaker `--player` takes, how it matched, and how many others
+/// matched the same way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerMatch {
+    pub id: String,
+    pub how: PlayerMatchKind,
+    pub also_fitted: usize,
+}
+
+impl PlayerMatch {
+    /// The log line that says which speaker (`name`) `query` took, when
+    /// that wasn't plain: a partial match, or one of several. So a wrong
+    /// pick can be understood from the log.
+    pub fn explain(&self, query: &str, name: &str) -> Option<String> {
+        let plain = matches!(self.how, PlayerMatchKind::Address | PlayerMatchKind::FullName);
+        if plain && self.also_fitted == 0 {
+            return None;
+        }
+        Some(format!(
+            "--player {:?}: taking {:?}, matched by {}; {} other speaker(s) matched the same way",
+            query,
+            name,
+            self.how.describe(),
+            self.also_fitted
+        ))
+    }
+}
+
+/// Which listed speaker (`rows`, in list order) `query` names. The first
+/// step with any match decides: the whole address; else the full name (any
+/// letter case, surrounding spaces ignored); else part of a name, among
+/// the speakers shown (a part is a search, and a search finds only what
+/// the list shows; hidden ones are reached by full name or address);
+/// else a room inside a Sonos group (`group_room`: the row such a room
+/// belongs to), also among those shown. Among several matches: shown before
+/// hidden, then ones used before, then ones not set never to connect by
+/// themselves, then list order. Nothing is refused for being ambiguous.
+pub(crate) fn rank_player_match(
+    query: &str,
+    rows: &[PlayerCandidate],
+    group_room: Option<&str>,
+) -> Option<PlayerMatch> {
+    let q = query.trim();
+    let lower = q.to_lowercase();
+    let at = |addr: &str| addr == q || addr.strip_prefix(q).is_some_and(|rest| rest.starts_with(':'));
+    let steps: [(PlayerMatchKind, &dyn Fn(&PlayerCandidate) -> bool); 4] = [
+        (PlayerMatchKind::Address, &|c| !q.is_empty() && at(&c.address)),
+        (PlayerMatchKind::FullName, &|c| {
+            !q.is_empty() && c.names.iter().any(|n| n.trim().to_lowercase() == lower)
+        }),
+        (PlayerMatchKind::PartOfName, &|c| {
+            !q.is_empty() && !c.hidden && c.names.iter().any(|n| n.to_lowercase().contains(&lower))
+        }),
+        (PlayerMatchKind::GroupRoom, &|c| !c.hidden && group_room == Some(c.id.as_str())),
+    ];
+    steps.iter().find_map(|(how, fits)| {
+        let mut found: Vec<(usize, &PlayerCandidate)> = rows.iter().enumerate().filter(|(_, c)| fits(c)).collect();
+        found.sort_by_key(|(i, c)| (c.hidden, !c.used_before, c.never_auto, *i));
+        let (_, best) = found.first()?;
+        Some(PlayerMatch { id: best.id.clone(), how: *how, also_fitted: found.len() - 1 })
+    })
+}
 
 /// The address that names this PC to other devices, the first of: the one
 /// given with `--advertise-ip`; a specific `--bind` address (the server
@@ -5024,6 +5153,119 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2), "waited {:?}", started.elapsed());
     }
 
+    /// A listed speaker for the ranking table.
+    fn cand(id: &str, address: &str, name: &str) -> PlayerCandidate {
+        PlayerCandidate {
+            id: id.into(),
+            address: address.into(),
+            names: vec![name.into()],
+            hidden: false,
+            used_before: false,
+            never_auto: false,
+        }
+    }
+
+    fn picked(query: &str, rows: &[PlayerCandidate]) -> Option<(String, PlayerMatchKind, usize)> {
+        rank_player_match(query, rows, None).map(|m| (m.id, m.how, m.also_fitted))
+    }
+
+    #[test]
+    fn player_ranks_a_full_name_above_part_of_one() {
+        let rows = [cand("a", "10.0.0.1", "Kitchen Speaker"), cand("b", "10.0.0.2", "Kitchen")];
+        assert_eq!(picked("kitchen", &rows), Some(("b".into(), PlayerMatchKind::FullName, 0)));
+        assert_eq!(picked("  KITCHEN ", &rows), Some(("b".into(), PlayerMatchKind::FullName, 0)));
+        // An address beats a name that happens to be the same text.
+        let rows = [cand("a", "10.0.0.1", "10.0.0.2"), cand("b", "10.0.0.2", "Den")];
+        assert_eq!(picked("10.0.0.2", &rows), Some(("b".into(), PlayerMatchKind::Address, 0)));
+    }
+
+    #[test]
+    fn player_reaches_a_hidden_speaker_only_by_its_full_name_or_address() {
+        let mut den = cand("den", "10.0.0.31:7000", "Den");
+        den.hidden = true;
+        let rows = [den, cand("kitchen", "10.0.0.30", "Kitchen")];
+        assert_eq!(picked("den", &rows), Some(("den".into(), PlayerMatchKind::FullName, 0)));
+        assert_eq!(picked("10.0.0.31", &rows), Some(("den".into(), PlayerMatchKind::Address, 0)));
+        assert_eq!(picked("de", &rows), None);
+        // A shown speaker of the same name comes first.
+        let mut hidden = cand("hidden", "10.0.0.40", "Office");
+        hidden.hidden = true;
+        let rows = [hidden, cand("shown", "10.0.0.41", "office")];
+        assert_eq!(picked("Office", &rows), Some(("shown".into(), PlayerMatchKind::FullName, 1)));
+    }
+
+    #[test]
+    fn player_prefers_a_speaker_used_before_then_one_allowed_to_connect() {
+        let mut used = cand("used", "10.0.0.2", "Kitchen 2");
+        used.used_before = true;
+        let rows = [cand("new", "10.0.0.1", "Kitchen 1"), used];
+        assert_eq!(picked("kitchen", &rows), Some(("used".into(), PlayerMatchKind::PartOfName, 1)));
+
+        let mut never = cand("never", "10.0.0.1", "Kitchen 1");
+        never.never_auto = true;
+        let rows = [never.clone(), cand("other", "10.0.0.2", "Kitchen 2")];
+        assert_eq!(picked("kitchen", &rows), Some(("other".into(), PlayerMatchKind::PartOfName, 1)));
+        // Set to never connect by itself, but named: still taken when alone.
+        assert_eq!(picked("kitchen", &[never.clone()]), Some(("never".into(), PlayerMatchKind::PartOfName, 0)));
+        assert_eq!(picked("Kitchen 1", &[never]), Some(("never".into(), PlayerMatchKind::FullName, 0)));
+    }
+
+    #[test]
+    fn player_takes_the_first_in_list_order_among_equals() {
+        let rows = [cand("one", "10.0.0.1", "Kitchen 1"), cand("two", "10.0.0.2", "Kitchen 2")];
+        assert_eq!(picked("kitchen", &rows), Some(("one".into(), PlayerMatchKind::PartOfName, 1)));
+        assert_eq!(picked("bathroom", &rows), None);
+        assert_eq!(picked("", &rows), None, "an empty name is no search");
+    }
+
+    #[test]
+    fn player_finds_a_room_inside_a_sonos_group_last() {
+        let rows = [cand("group", "10.0.0.1", "Living Room + Kitchen"), cand("den", "10.0.0.2", "Den")];
+        let m = rank_player_match("kitch", &rows, Some("group")).unwrap();
+        // Part of the group row's own name, so found as such.
+        assert_eq!((m.id.as_str(), m.how), ("group", PlayerMatchKind::PartOfName));
+        let m = rank_player_match("Patio", &rows, Some("group")).unwrap();
+        assert_eq!((m.id.as_str(), m.how), ("group", PlayerMatchKind::GroupRoom));
+        let mut hidden = rows.clone();
+        hidden[0].hidden = true;
+        assert!(rank_player_match("Patio", &hidden, Some("group")).is_none());
+    }
+
+    #[test]
+    fn a_partial_or_shared_player_match_is_explained_in_the_log() {
+        let m = |how, also_fitted| PlayerMatch { id: "x".into(), how, also_fitted };
+        assert_eq!(m(PlayerMatchKind::FullName, 0).explain("Kitchen", "Kitchen"), None);
+        assert_eq!(m(PlayerMatchKind::Address, 0).explain("10.0.0.2", "Den"), None);
+        assert_eq!(
+            m(PlayerMatchKind::PartOfName, 2).explain("kit", "Kitchen").as_deref(),
+            Some("--player \"kit\": taking \"Kitchen\", matched by part of its name; 2 other speaker(s) matched the same way")
+        );
+        assert!(m(PlayerMatchKind::FullName, 1).explain("Den", "Den").unwrap().contains("1 other"));
+        assert!(m(PlayerMatchKind::GroupRoom, 0).explain("Patio", "Living Room + 2").unwrap().contains("Sonos group"));
+    }
+
+    #[test]
+    fn a_player_wish_skips_a_hidden_near_match_and_takes_the_full_name() {
+        let app = test_app();
+        let near = app
+            .add_manual_speaker(ManualKind::Upnp, "Den Speaker", "http://127.0.0.1:9/near.xml", "")
+            .unwrap();
+        let mut hide = app.speaker_settings(&near);
+        hide.hidden = true;
+        app.set_speaker_settings(&near, hide);
+        app.connect_when_listed_every("Den".into(), Duration::from_millis(5));
+        // Only the hidden near match is listed: no attempt.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(app.current_error(), None);
+        // The speaker by that full name appears: that one is tried.
+        app.add_manual_speaker(ManualKind::Upnp, "Den", "http://127.0.0.1:9/den.xml", "").unwrap();
+        assert!(
+            eventually(|| app.current_error().is_some_and(|e| e.contains("den.xml"))),
+            "{:?}",
+            app.current_error()
+        );
+    }
+
     #[test]
     fn player_finds_any_kind_of_speaker_by_name_or_address() {
         let app = test_app();
@@ -5031,17 +5273,21 @@ mod tests {
         let den = app
             .add_manual_speaker(ManualKind::Upnp, "Den", "http://192.168.1.31:49152/desc.xml", "")
             .unwrap();
-        assert_eq!(app.find_listed_speaker("kitchen").as_deref(), Some(kitchen.as_str()));
-        assert_eq!(app.find_listed_speaker("KITCH").as_deref(), Some(kitchen.as_str()));
-        assert_eq!(app.find_listed_speaker("192.168.1.30").as_deref(), Some(kitchen.as_str()));
-        assert_eq!(app.find_listed_speaker("192.168.1.31").as_deref(), Some(den.as_str()));
-        assert_eq!(app.find_listed_speaker("Bathroom"), None);
-        assert_eq!(app.find_listed_speaker("192.168.1.3"), None, "an address matches whole");
-        // Hidden speakers count: --player names one on purpose.
+        let found = |q: &str| app.find_listed_speaker(q).map(|m| (m.id, m.how));
+        assert_eq!(found("kitchen"), Some((kitchen.clone(), PlayerMatchKind::FullName)));
+        assert_eq!(found("KITCH"), Some((kitchen.clone(), PlayerMatchKind::PartOfName)));
+        assert_eq!(found("192.168.1.30"), Some((kitchen.clone(), PlayerMatchKind::Address)));
+        assert_eq!(found("192.168.1.31"), Some((den.clone(), PlayerMatchKind::Address)));
+        assert_eq!(found("Bathroom"), None);
+        assert_eq!(found("192.168.1.3"), None, "an address matches whole");
+        // The list's label isn't a name: "(AirPlay, added manually)" isn't searched.
+        assert_eq!(found("manually"), None);
+        // A hidden speaker is reached by its full name, not by part of it.
         let mut hidden = app.speaker_settings(&den);
         hidden.hidden = true;
         app.set_speaker_settings(&den, hidden);
-        assert_eq!(app.find_listed_speaker("den").as_deref(), Some(den.as_str()));
+        assert_eq!(found("den"), Some((den.clone(), PlayerMatchKind::FullName)));
+        assert_eq!(found("de"), None);
     }
 
     /// Wait for `cond`, polling; false after `PATIENCE`.

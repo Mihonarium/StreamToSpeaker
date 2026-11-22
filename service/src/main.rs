@@ -89,10 +89,11 @@ struct Cli {
     #[arg(long)]
     device: Option<String>,
 
-    /// Speaker to play on: its address, or part of its name, as
-    /// --list-speakers shows them (any kind of speaker). The app starts
-    /// anyway and connects when that speaker is found. Without it, the
-    /// speaker used last time; --headless in a terminal asks instead.
+    /// Speaker to play on, any kind. Its address or full name always
+    /// reaches that speaker; part of a name finds the best match among the
+    /// speakers the list shows (see --list-speakers). The app starts anyway
+    /// and connects when that speaker is found. Without it, the speaker
+    /// used last time; --headless in a terminal asks instead.
     #[arg(long)]
     player: Option<String>,
 
