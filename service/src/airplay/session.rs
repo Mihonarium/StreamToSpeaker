@@ -20,7 +20,7 @@ use crate::airplay::rtp::{
     bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, spawn_audio_sender,
     RtpSenderConfig,
 };
-use crate::airplay::rtsp::{AbandonHandle, ReceiverBusy, RtspClient, RtspError, ServerPorts, TEARDOWN_LIMIT};
+use crate::airplay::rtsp::{AbandonHandle, ReceiverBusy, RtspClient, RtspError, ServerPorts, SignIn, TEARDOWN_LIMIT};
 use crate::airplay::timing::{
     sleep_unless_stopped, spawn_resend_responder, spawn_sync_sender, spawn_timing_responder,
     ResendBuffer,
@@ -193,6 +193,37 @@ impl std::fmt::Display for Busy {
 }
 
 impl std::error::Error for Busy {}
+
+/// The receiver wants a sign-in the connect couldn't give. Its message
+/// is the one the person reads.
+#[derive(Debug)]
+pub struct SignInNeeded {
+    pub name: String,
+    pub why: SignIn,
+}
+
+impl std::fmt::Display for SignInNeeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = &self.name;
+        match self.why {
+            SignIn::PasswordNeeded => write!(
+                f,
+                "{name} asks for its AirPlay password. Pick {name} in the Stream To Speaker window to enter it."
+            ),
+            SignIn::PasswordRejected => write!(
+                f,
+                "{name} didn't accept the AirPlay password. Pick {name} in the Stream To Speaker window to enter it again."
+            ),
+            SignIn::Unsupported { .. } => write!(
+                f,
+                "{name} asks for a kind of sign-in this app can't do. To use it here, turn off its password or access \
+                 setting in the speaker's own app."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SignInNeeded {}
 
 /// How long after this app left a session on a receiver a 453 from it is
 /// taken to be about that session.
@@ -644,6 +675,13 @@ impl AirPlaySession {
                         busy_retried = true;
                         info!("AirPlay: {} may still hold this PC's last session; trying once more", name);
                         progress.pause(Pause::Busy, timeouts.busy_retry);
+                    }
+                    Err(f) if f.error.downcast_ref::<SignIn>().is_some() => {
+                        // A password problem isn't about how the connect
+                        // opens either.
+                        let why = f.error.downcast_ref::<SignIn>().cloned().unwrap_or(SignIn::PasswordNeeded);
+                        warn!("AirPlay: {} wants a sign-in ({:#})", name, f.error);
+                        return Err(anyhow::Error::new(SignInNeeded { name: name.clone(), why }));
                     }
                     Err(f) => {
                         // Another opener can only help a receiver that took
@@ -1848,6 +1886,23 @@ mod tests {
         // past the start.
         let behind = start_rtp.wrapping_sub(stamped);
         assert!((44_100..=88_200).contains(&behind), "{behind}");
+    }
+
+    /// A receiver that asks for a password it never announced: the
+    /// message names the speaker and says where to enter it, and no
+    /// second opener is tried.
+    #[test]
+    fn a_password_request_is_reported_by_name_without_a_second_attempt() {
+        let rx = FakeRaop::start(|_| {
+            Answer::Reply(Reply::status(401, "Unauthorized").header("WWW-Authenticate", "Digest realm=\"raop\", nonce=\"1\""))
+        });
+        let err = start(&rx, "0B0000000060", &[0, 4], None).err().expect("refused");
+        assert_eq!(
+            format!("{:#}", err),
+            "Test Speaker asks for its AirPlay password. Pick Test Speaker in the Stream To Speaker window to enter it."
+        );
+        assert_eq!(err.downcast_ref::<SignInNeeded>().map(|s| s.why.clone()), Some(SignIn::PasswordNeeded));
+        assert_eq!(methods(&rx), ["0 /auth-setup"]);
     }
 
     #[test]

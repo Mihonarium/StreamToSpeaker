@@ -124,6 +124,31 @@ impl std::fmt::Display for RtspError {
 
 impl std::error::Error for RtspError {}
 
+/// A 401 that ends the connect: what the receiver wants for a sign-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignIn {
+    /// It asks for a password and none is stored.
+    PasswordNeeded,
+    /// It refused the stored password.
+    PasswordRejected,
+    /// It asks for a sign-in this client can't answer: no Digest
+    /// challenge (`scheme` is the one it named, quoted, if any).
+    Unsupported { scheme: Option<String> },
+}
+
+impl std::fmt::Display for SignIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignIn::PasswordNeeded => f.write_str("the receiver asks for a password (401) and none is stored"),
+            SignIn::PasswordRejected => f.write_str("the receiver refused the password (401 again)"),
+            SignIn::Unsupported { scheme: Some(s) } => write!(f, "the receiver asks for a sign-in this app can't do (401, {})", s),
+            SignIn::Unsupported { scheme: None } => f.write_str("the receiver asks for a sign-in this app can't do (401 with no challenge)"),
+        }
+    }
+}
+
+impl std::error::Error for SignIn {}
+
 /// The receiver answered 453 (Not Enough Bandwidth): it is busy.
 /// shairport-sync answers ANNOUNCE so when another connection holds its
 /// play lock (`rtsp.c`, `handle_announce`); other receivers are reported
@@ -885,22 +910,23 @@ impl RtspClient {
         if resp.status_code != 401 {
             return Ok(Some(resp));
         }
-        // First 401: parse the challenge and retry with auth.
-        if attempt == 0 && self.parse_auth_challenge(&resp) {
-            if self.password.is_none() {
-                bail!(
-                    "{} is password-protected — a password is required",
-                    self.receiver_ip
-                );
-            }
-            return Ok(None); // retry
+        if !self.parse_auth_challenge(&resp) {
+            // No Digest challenge we can answer.
+            let scheme = resp
+                .headers
+                .get("www-authenticate")
+                .and_then(|h| h.split_whitespace().next())
+                .map(crate::discovery_net::shown);
+            return Err(SignIn::Unsupported { scheme }.into());
         }
-        // Second 401 (we already sent auth) or an unparseable challenge:
-        // the password is wrong (or the scheme unsupported).
-        bail!(
-            "authentication failed for {} — wrong AirPlay password?",
-            self.receiver_ip
-        );
+        if self.password.is_none() {
+            return Err(SignIn::PasswordNeeded.into());
+        }
+        if attempt == 0 {
+            return Ok(None); // retry, now with the password
+        }
+        // Refused again with the password sent: it is wrong.
+        Err(SignIn::PasswordRejected.into())
     }
 
     /// Write a fully-serialised request and read its reply, keeping
@@ -1318,6 +1344,31 @@ mod tests {
         let mut c = announced(&rx);
         let ports = c.setup(1, 2).expect("SETUP read whole");
         assert_eq!(ports.audio, rx.udp_ports().audio);
+    }
+
+    fn sign_in(rx: &FakeRaop, password: Option<&str>) -> SignIn {
+        let ip = "127.0.0.1".parse().unwrap();
+        let mut c = RtspClient::connect_auth(ip, rx.port(), ip, LIMIT, password.map(String::from), false).unwrap();
+        let e = c.options().expect_err("refused");
+        e.downcast_ref::<SignIn>().cloned().unwrap_or_else(|| panic!("not a sign-in error: {e:#}"))
+    }
+
+    /// The three ways a password can stop a connect are told apart.
+    #[test]
+    fn sign_in_failures_are_told_apart() {
+        let digest = || FakeRaop::start(|req| match req.header("Authorization") {
+            None => Answer::Reply(Reply::status(401, "Unauthorized").header("WWW-Authenticate", "Digest realm=\"raop\", nonce=\"n1\"")),
+            Some(_) => Answer::Reply(Reply::status(401, "Unauthorized").header("WWW-Authenticate", "Digest realm=\"raop\", nonce=\"n2\"")),
+        });
+        assert_eq!(sign_in(&digest(), None), SignIn::PasswordNeeded);
+        let rx = digest();
+        assert_eq!(sign_in(&rx, Some("wrong")), SignIn::PasswordRejected);
+        assert_eq!(rx.requests().len(), 2, "one retry with the password");
+        let basic = FakeRaop::start(|_| Answer::Reply(Reply::status(401, "Unauthorized").header("WWW-Authenticate", "Basic realm=\"x\"")));
+        assert_eq!(sign_in(&basic, Some("pw")), SignIn::Unsupported { scheme: Some("\"Basic\"".into()) });
+        assert!(basic.requests().iter().all(|r| r.header("Authorization").is_none()), "nothing sent for a scheme we can't do");
+        let bare = FakeRaop::start(|_| Answer::Reply(Reply::status(401, "Unauthorized")));
+        assert_eq!(sign_in(&bare, None), SignIn::Unsupported { scheme: None });
     }
 
     #[test]

@@ -519,6 +519,10 @@ pub struct App {
     /// speaker's identity (a newcomer, see `RaopDetails::newcomer`): used
     /// for the next connect to it, never stored.
     unsaved_airplay_passwords: Mutex<std::collections::HashMap<String, String>>,
+    /// AirPlay receivers (by id) that asked for a password in this run,
+    /// whether or not they announce one: picking them opens the password
+    /// dialog, as for one that does.
+    airplay_asked_password: Mutex<std::collections::HashSet<String>>,
     pub session: SharedSession,
     /// Remembered speaker id so Disable→Enable can rebind to the same one.
     pub last_speaker_id: Mutex<Option<String>>,
@@ -895,6 +899,7 @@ impl App {
             discovery,
             airplay_discovery,
             unsaved_airplay_passwords: Mutex::new(std::collections::HashMap::new()),
+            airplay_asked_password: Mutex::new(std::collections::HashSet::new()),
             session,
             last_speaker_id,
             hub: StreamHub::new(),
@@ -1272,11 +1277,13 @@ impl App {
     /// Whether a discovered device is password-protected (needs a
     /// password entered before it can connect).
     pub fn is_password_protected(&self, id: &str) -> bool {
-        self.airplay_discovery
-            .as_ref()
-            .and_then(|d| d.find_by_id(id))
-            .map(|r| r.password_protected)
-            .unwrap_or(false)
+        self.airplay_asked_password.lock().unwrap().contains(id)
+            || self
+                .airplay_discovery
+                .as_ref()
+                .and_then(|d| d.find_by_id(id))
+                .map(|r| r.password_protected)
+                .unwrap_or(false)
     }
 
     /// Whether to forward Windows "now playing" to the speaker.
@@ -2765,6 +2772,11 @@ impl App {
                     let mut settings = self.speaker_settings(&stable_id);
                     settings.airplay_opener = remembered;
                     self.set_speaker_settings(&stable_id, settings);
+                }
+                if let Some(s) = session.as_ref().err().and_then(|e| e.downcast_ref::<crate::airplay::session::SignInNeeded>()) {
+                    if matches!(s.why, crate::airplay::rtsp::SignIn::PasswordNeeded | crate::airplay::rtsp::SignIn::PasswordRejected) {
+                        self.airplay_asked_password.lock().unwrap().insert(stable_id.clone());
+                    }
                 }
                 let session = session.map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
                 // Up: RECORD answered, any password accepted.
@@ -5098,6 +5110,26 @@ mod tests {
         assert!(app.start_airplay_one(Transport::RaopLegacy, newcomer, ip("127.0.0.1")).is_err());
         assert!(rx.requests()[before..].iter().all(|r| r.header("Authorization").is_none()));
         assert_eq!(app.user_config.lock().unwrap().airplay_passwords.len(), 1);
+    }
+
+    /// A speaker that asks for a password it never announced gets the
+    /// password dialog on the next pick, as one that announces it does.
+    #[test]
+    fn a_speaker_that_asks_for_a_password_gets_the_dialog_next_time() {
+        use crate::airplay::fake_raop::{Answer, FakeRaop, Reply};
+        let rx = FakeRaop::start(|_| {
+            Answer::Reply(Reply::status(401, "Unauthorized").header("WWW-Authenticate", "Digest realm=\"raop\", nonce=\"1\""))
+        });
+        let (app, _discovery) = airplay_test_app();
+        let r = crate::airplay::raop_transcripts::receiver(&rx, "0D0000000005", &[0, 1]);
+        let id = r.stable_id();
+        assert!(!app.is_password_protected(&id));
+        let err = match app.start_airplay_one(Transport::RaopLegacy, r, ip("127.0.0.1")) {
+            Err(AttemptError::Other(e)) => e,
+            _ => panic!("refused"),
+        };
+        assert!(err.starts_with("Test Speaker asks for its AirPlay password."), "{err}");
+        assert!(app.is_password_protected(&id));
     }
 
     /// Nothing automatic connects to a newcomer (the drop reconnect and
