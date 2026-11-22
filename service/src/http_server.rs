@@ -212,14 +212,20 @@ impl StreamHub {
         self.fetched.notify_all();
     }
 
-    /// The first stream fetch from one of `peers` at or after `since`,
-    /// waiting up to `timeout` for one.
-    pub fn wait_for_fetch(&self, peers: &[IpAddr], since: Instant, timeout: Duration) -> Option<StreamFetch> {
+    /// The first fetch of `profile`'s stream from one of `peers` at or
+    /// after `since`, waiting up to `timeout` for one.
+    pub fn wait_for_fetch(
+        &self,
+        peers: &[IpAddr],
+        profile: StreamProfile,
+        since: Instant,
+        timeout: Duration,
+    ) -> Option<StreamFetch> {
         let peers: Vec<IpAddr> = peers.iter().copied().map(canonical_ip).collect();
         let deadline = Instant::now() + timeout;
         let mut f = self.fetches.lock().unwrap();
         loop {
-            if let Some(hit) = f.iter().find(|x| x.at >= since && peers.contains(&x.peer)) {
+            if let Some(hit) = f.iter().find(|x| x.at >= since && x.profile == profile && peers.contains(&x.peer)) {
                 return Some(hit.clone());
             }
             let now = Instant::now();
@@ -2526,11 +2532,12 @@ mod tests {
         let (port, hub) = minimal();
         let speaker: IpAddr = "127.0.0.1".parse().unwrap();
         let since = Instant::now();
+        let wav = StreamProfile::Wav;
         // Nothing fetched yet: the wait ends at its timeout.
-        assert!(hub.wait_for_fetch(&[speaker], since, Duration::from_millis(100)).is_none());
+        assert!(hub.wait_for_fetch(&[speaker], wav, since, Duration::from_millis(100)).is_none());
         let waiter = {
             let hub = hub.clone();
-            thread::spawn(move || hub.wait_for_fetch(&[speaker], since, Duration::from_secs(10)))
+            thread::spawn(move || hub.wait_for_fetch(&[speaker], wav, since, Duration::from_secs(10)))
         };
         // A HEAD is a probe, not a fetch.
         let _ = exchange(port, b"HEAD /wav/stream.wav HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", 4096);
@@ -2539,10 +2546,11 @@ mod tests {
         let fetch = waiter.join().unwrap().expect("the GET was seen");
         assert_eq!((fetch.peer, fetch.profile), (speaker, StreamProfile::Wav));
         assert!(fetch.at >= since);
-        // Another address's fetches are not this speaker's.
-        assert!(hub.wait_for_fetch(&["192.168.1.50".parse().unwrap()], since, Duration::from_millis(100)).is_none());
-        // Nor are fetches from before `since`.
-        assert!(hub.wait_for_fetch(&[speaker], Instant::now(), Duration::from_millis(100)).is_none());
+        // Another address's fetches are not this speaker's, another
+        // profile's not this one's, and earlier ones not later ones.
+        assert!(hub.wait_for_fetch(&["192.168.1.50".parse().unwrap()], wav, since, Duration::from_millis(100)).is_none());
+        assert!(hub.wait_for_fetch(&[speaker], StreamProfile::Legacy, since, Duration::from_millis(100)).is_none());
+        assert!(hub.wait_for_fetch(&[speaker], wav, Instant::now(), Duration::from_millis(100)).is_none());
         drop(s);
     }
 

@@ -158,9 +158,10 @@ impl Reply {
 }
 
 /// A MediaRenderer device description named `name`, its services on the
-/// describing host at `/AVTransport/...`, `/RenderingControl/...` and,
-/// with `connection_manager`, `/ConnectionManager/...`.
-pub(crate) fn renderer_description(name: &str, connection_manager: bool) -> String {
+/// describing host at `/AVTransport/...`, `/RenderingControl/...` and
+/// `/<kind>/...` for each of `more` (`"ConnectionManager"`,
+/// `"ZoneGroupTopology"`).
+pub(crate) fn renderer_description(name: &str, more: &[&str]) -> String {
     let service = |kind: &str| {
         format!(
             "<service><serviceType>urn:schemas-upnp-org:service:{kind}:1</serviceType>\
@@ -168,7 +169,7 @@ pub(crate) fn renderer_description(name: &str, connection_manager: bool) -> Stri
              <controlURL>/{kind}/Control</controlURL><eventSubURL>/{kind}/Event</eventSubURL></service>"
         )
     };
-    let cm = if connection_manager { service("ConnectionManager") } else { String::new() };
+    let cm: String = more.iter().map(|kind| service(kind)).collect();
     format!(
         "<?xml version=\"1.0\"?>\n<root xmlns=\"urn:schemas-upnp-org:device-1-0\"><specVersion><major>1</major>\
          <minor>0</minor></specVersion><device><deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>\

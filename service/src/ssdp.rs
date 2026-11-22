@@ -34,6 +34,9 @@ pub struct Renderer {
     pub rendering_control_event_url: String,
     /// Event subscription URL for AVTransport (handy for transport state).
     pub av_transport_event_url: Option<String>,
+    /// GetProtocolInfo endpoint: the ConnectionManager of the device that
+    /// holds the AVTransport (a Sonos has another under its MediaServer).
+    pub connection_manager_control_url: Option<String>,
     /// Cached UDN if available.
     pub udn: Option<String>,
     /// Sonos only: ZoneGroupTopology control URL (GetZoneGroupState).
@@ -365,6 +368,12 @@ impl Renderer {
         v.sort();
         v.dedup();
         v
+    }
+
+    /// A Sonos (IKEA SYMFONISK included): its description has the
+    /// ZoneGroupTopology service.
+    pub fn is_sonos(&self) -> bool {
+        self.zone_group_topology_control_url.is_some()
     }
 
     pub fn stable_id(&self) -> String {
@@ -759,6 +768,8 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr, urls: Service
     let mut zgt_ctrl: Option<String> = None;
     let mut grc_ctrl: Option<String> = None;
     let mut grc_event: Option<String> = None;
+    // The <device> holding the AVTransport used.
+    let mut av_device = None;
 
     for svc in device.descendants().filter(|n| n.tag_name().name() == "service") {
         let st = svc
@@ -777,6 +788,7 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr, urls: Service
         if st.contains(":AVTransport:") {
             av_ctrl = control.map(|s| s.to_string());
             av_event = event.map(|s| s.to_string());
+            av_device = svc.ancestors().find(|n| n.tag_name().name() == "device");
         } else if st.contains(":RenderingControl:") {
             rc_ctrl = control.map(|s| s.to_string());
             rc_event = event.map(|s| s.to_string());
@@ -789,6 +801,22 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr, urls: Service
             grc_event = event.map(|s| s.to_string());
         }
     }
+
+    // Its ConnectionManager is the one in the same <device>.
+    let cm_ctrl = av_device.and_then(|d| {
+        d.children()
+            .filter(|n| n.tag_name().name() == "serviceList")
+            .flat_map(|list| list.children().filter(|n| n.tag_name().name() == "service"))
+            .find(|svc| {
+                svc.children()
+                    .find(|n| n.tag_name().name() == "serviceType")
+                    .and_then(|n| n.text())
+                    .is_some_and(|t| t.contains(":ConnectionManager:"))
+            })
+            .and_then(|svc| svc.children().find(|n| n.tag_name().name() == "controlURL"))
+            .and_then(|n| n.text())
+            .map(str::to_string)
+    });
 
     // Every request we later make to this device (SOAP control, GENA
     // subscriptions, Sonos topology) goes to these URLs, so for a device
@@ -810,6 +838,7 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr, urls: Service
     let zgt_ctrl = resolve("ZoneGroupTopology control", zgt_ctrl);
     let grc_ctrl = resolve("GroupRenderingControl control", grc_ctrl);
     let grc_event = resolve("GroupRenderingControl events", grc_event);
+    let cm_ctrl = resolve("ConnectionManager control", cm_ctrl);
     if !elsewhere.is_empty() {
         let line = || {
             format!(
@@ -841,6 +870,7 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr, urls: Service
         rendering_control_control_url: rc_ctrl,
         rendering_control_event_url: rc_event,
         av_transport_event_url: av_event,
+        connection_manager_control_url: cm_ctrl,
         udn,
         zone_group_topology_control_url: zgt_ctrl,
         group_rendering_control_control_url: grc_ctrl,
@@ -928,6 +958,7 @@ mod tests {
             rendering_control_event_url: format!("{}/RenderingControl/Event", base),
             base_url: base,
             av_transport_event_url: None,
+            connection_manager_control_url: None,
             udn: Some(udn.into()),
             zone_group_topology_control_url: None,
             group_rendering_control_control_url: None,
@@ -1298,6 +1329,41 @@ mod tests {
         assert_eq!(r.rendering_control_control_url, "http://192.168.1.10:1400/MediaRenderer/RenderingControl/Control");
         // The same description from discovery is no usable renderer.
         assert!(parse_device_description(&xml, base, ip, ServiceUrls::OnItsHost(None)).is_err());
+    }
+
+    #[test]
+    fn the_connection_manager_is_the_one_beside_the_av_transport() {
+        // A Sonos-like layout: the root device holds the topology, an
+        // embedded MediaServer has a ConnectionManager of its own, and the
+        // MediaRenderer holds AVTransport, RenderingControl and its own.
+        let xml = r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0"><device>
+<friendlyName>Living Room</friendlyName><UDN>uuid:RINCON_A</UDN>
+<serviceList><service><serviceType>urn:schemas-upnp-org:service:ZoneGroupTopology:1</serviceType><controlURL>/ZoneGroupTopology/Control</controlURL><eventSubURL>/ZoneGroupTopology/Event</eventSubURL></service></serviceList>
+<deviceList>
+<device><serviceList><service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType><controlURL>/MediaServer/ConnectionManager/Control</controlURL><eventSubURL>/MediaServer/ConnectionManager/Event</eventSubURL></service></serviceList></device>
+<device><serviceList>
+<service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType><controlURL>/MediaRenderer/ConnectionManager/Control</controlURL><eventSubURL>/MediaRenderer/ConnectionManager/Event</eventSubURL></service>
+<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><controlURL>/MediaRenderer/AVTransport/Control</controlURL><eventSubURL>/MediaRenderer/AVTransport/Event</eventSubURL></service>
+<service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType><controlURL>/MediaRenderer/RenderingControl/Control</controlURL><eventSubURL>/MediaRenderer/RenderingControl/Event</eventSubURL></service>
+</serviceList></device>
+</deviceList></device></root>"#;
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+        let base = "http://192.168.1.10:1400";
+        let r = parse_device_description(xml, base, ip, ServiceUrls::OnItsHost(None)).unwrap();
+        assert_eq!(r.connection_manager_control_url.as_deref(), Some("http://192.168.1.10:1400/MediaRenderer/ConnectionManager/Control"));
+        assert!(r.is_sonos());
+        // One on another host is left out, as other service URLs are.
+        let elsewhere = xml.replace("/MediaRenderer/ConnectionManager/Control", "http://192.168.1.66/cm");
+        let r = parse_device_description(&elsewhere, base, ip, ServiceUrls::OnItsHost(None)).unwrap();
+        assert_eq!(r.connection_manager_control_url, None);
+        // A renderer without one.
+        let r = parse_device_description(&served_description(), base, ip, ServiceUrls::OnItsHost(None)).unwrap();
+        assert_eq!(r.connection_manager_control_url, None);
+        let plain = crate::fake_renderer::renderer_description("Den Amp", &["ConnectionManager"]);
+        let r = parse_device_description(&plain, base, ip, ServiceUrls::OnItsHost(None)).unwrap();
+        assert_eq!(r.connection_manager_control_url.as_deref(), Some("http://192.168.1.10:1400/ConnectionManager/Control"));
+        assert!(!r.is_sonos());
     }
 
     // ---- fetching a description from a device ---------------------------

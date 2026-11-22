@@ -12,7 +12,7 @@
 //! (`device_http`).
 
 use crate::device_http::{self, HttpError, Limits, Version};
-use crate::stream_profile::StreamProfile;
+use crate::stream_profile::{parse_protocol_list, ProtocolInfo, StreamProfile};
 use anyhow::{anyhow, Result};
 use log::debug;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -226,6 +226,26 @@ pub(crate) fn zone_group_state_from_response(resp: &str) -> Result<String> {
     Ok(crate::gena::decode_xml_text(&inner))
 }
 
+/// The types a renderer says it plays: the `Sink` list of its
+/// ConnectionManager's GetProtocolInfo.
+pub fn get_protocol_info(control_url: &str) -> Result<Vec<ProtocolInfo>> {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:GetProtocolInfo xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
+</u:GetProtocolInfo>
+</s:Body>
+</s:Envelope>"#;
+    let resp = soap_post(control_url, CONNECTION_MANAGER, "GetProtocolInfo", body, &PROTOCOL_LIST)?;
+    let doc = roxmltree::Document::parse(resp.trim_start_matches('\u{feff}').trim_start())
+        .map_err(|e| anyhow!("GetProtocolInfo answer isn't XML: {e}"))?;
+    let sink = doc
+        .descendants()
+        .find(|n| n.tag_name().name() == "Sink")
+        .ok_or_else(|| anyhow!("GetProtocolInfo answer has no Sink"))?;
+    Ok(parse_protocol_list(sink.text().unwrap_or("")))
+}
+
 /// Build the DIDL-Lite metadata blob for SetAVTransportURI, announcing
 /// `stream_uri` with `profile`'s `protocolInfo` (for a WAV profile,
 /// swyh-rs's `DLNA.ORG_PN=WAV;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=
@@ -269,6 +289,7 @@ const AV_TRANSPORT: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const RENDERING_CONTROL: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
 const GROUP_RENDERING_CONTROL: &str = "urn:schemas-upnp-org:service:GroupRenderingControl:1";
 const ZONE_GROUP_TOPOLOGY: &str = "urn:schemas-upnp-org:service:ZoneGroupTopology:1";
+const CONNECTION_MANAGER: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
 
 /// Largest SOAP answer accepted for most actions.
 const MAX_SOAP_RESPONSE_BYTES: usize = 4 << 20;
@@ -298,6 +319,16 @@ const TOPOLOGY: Limits = Limits {
     connect: CONNECT_TIMEOUT,
     deadline: Duration::from_secs(15),
     max_bytes: 1 << 20,
+};
+
+/// GetProtocolInfo: answered at once or not waited for, since what a
+/// renderer lists only chooses among the app's own stream profiles, and
+/// without it the original stream is offered first. Real lists are a few
+/// KB.
+const PROTOCOL_LIST: Limits = Limits {
+    connect: Duration::from_secs(3),
+    deadline: Duration::from_secs(3),
+    max_bytes: 64 * 1024,
 };
 
 /// Why a UPnP action did not succeed.
@@ -385,7 +416,8 @@ impl ActionError {
     /// way: what happened, the likely cause and what to do, then what the
     /// speaker itself said. `has_airplay_entry`: the same speaker is also
     /// in the list as an AirPlay entry, which may work where UPnP didn't.
-    pub fn for_person(&self, speaker: &str, has_airplay_entry: bool) -> String {
+    /// `formats_tried`: how many stream profiles it was offered.
+    pub fn for_person(&self, speaker: &str, has_airplay_entry: bool, formats_tried: usize) -> String {
         let airplay = if has_airplay_entry { " Its AirPlay entry may work." } else { "" };
         match &self.failure {
             Failure::NoAnswer(HttpError::Connect(_)) => format!(
@@ -400,6 +432,9 @@ impl ActionError {
             Failure::NoAnswer(e) => format!("{speaker} sent an answer Stream To Speaker couldn't read ({e})."),
             Failure::Refused { status, fault } => {
                 let what = match self.fault_code() {
+                    Some(714) if formats_tried > 1 => format!(
+                        "{speaker} doesn't accept any of the {formats_tried} audio formats Stream To Speaker tried.{airplay}"
+                    ),
                     Some(714) => format!("{speaker} doesn't accept the audio format Stream To Speaker sent it.{airplay}"),
                     Some(716) => format!(
                         "{speaker} couldn't fetch the audio from this PC. Windows Firewall may be blocking it: \
@@ -682,7 +717,7 @@ mod tests {
         assert!(line.chars().count() < 250, "{} chars: {line}", line.chars().count());
         assert!(line.contains("UPnP error 402 \"Evil [2J next 'line'AAAA"), "{line}");
         assert!(line.ends_with("…\""), "{line}");
-        let told = action_error(&e).for_person("Kitchen", false);
+        let told = action_error(&e).for_person("Kitchen", false, 1);
         assert!(!told.chars().any(|c| c.is_control()) && told.chars().count() < 300, "{told}");
     }
 
@@ -697,7 +732,7 @@ mod tests {
 
     #[test]
     fn the_person_is_told_what_happened_and_what_to_do() {
-        let told = |reply: Reply, airplay: bool| action_error(&refusal(reply)).for_person("Kitchen", airplay);
+        let told = |reply: Reply, airplay: bool| action_error(&refusal(reply)).for_person("Kitchen", airplay, 1);
         assert_eq!(
             told(Reply::soap_fault(714, "Illegal MIME-type"), true),
             "Kitchen doesn't accept the audio format Stream To Speaker sent it. Its AirPlay entry may work. \
@@ -738,14 +773,46 @@ mod tests {
         let quick = Limits { deadline: Duration::from_millis(200), ..TRANSPORT };
         let e = soap_post(&fake.url("/c"), AV_TRANSPORT, "Play", "", &quick).unwrap_err();
         assert_eq!(e.fault_code(), None);
-        assert_eq!(e.for_person("Kitchen", true), "Kitchen didn't answer within 0.2 seconds. Try again in a moment.");
+        assert_eq!(e.for_person("Kitchen", true, 1), "Kitchen didn't answer within 0.2 seconds. Try again in a moment.");
 
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let e = play(&format!("http://127.0.0.1:{port}/c")).unwrap_err();
         assert_eq!(
-            action_error(&e).for_person("Kitchen", true),
+            action_error(&e).for_person("Kitchen", true, 1),
             "Kitchen can't be reached. Check that it's switched on and connected to the same network as this PC."
         );
+    }
+
+    #[test]
+    fn the_types_a_renderer_plays_come_from_its_sink_list() {
+        use crate::fake_renderer::CONNECTION_MANAGER;
+        use crate::stream_profile::ProtocolInfo;
+        let fake = FakeRenderer::start(|_| {
+            Reply::soap_ok(
+                CONNECTION_MANAGER,
+                "GetProtocolInfo",
+                &[("Source", "http-get:*:audio/mpeg:*"), ("Sink", "http-get:*:audio/wav:*,http-get:*:audio/L16;rate=44100;channels=2:*")],
+            )
+        });
+        let sinks = get_protocol_info(&fake.url("/ConnectionManager/Control")).unwrap();
+        let info = |f: &str| ProtocolInfo { protocol: "http-get".into(), content_format: f.into() };
+        assert_eq!(sinks, [info("audio/wav"), info("audio/L16;rate=44100;channels=2")]);
+        assert_eq!(fake.soap_actions(), ["GetProtocolInfo"]);
+        // A list too large for any real device is refused, not read.
+        let big = format!("http-get:*:audio/wav:*,{}", "x".repeat(70 * 1024));
+        let fake = FakeRenderer::start(move |_| Reply::soap_ok(CONNECTION_MANAGER, "GetProtocolInfo", &[("Sink", &big)]));
+        assert!(get_protocol_info(&fake.url("/ConnectionManager/Control")).is_err());
+        // No Sink in the answer.
+        let fake = FakeRenderer::start(|_| Reply::soap_ok(CONNECTION_MANAGER, "GetProtocolInfo", &[]));
+        assert!(get_protocol_info(&fake.url("/ConnectionManager/Control")).is_err());
+    }
+
+    #[test]
+    fn a_renderer_slow_to_list_its_types_is_not_waited_for_long() {
+        let fake = FakeRenderer::start(|_| Reply::silent());
+        let start = Instant::now();
+        assert!(get_protocol_info(&fake.url("/ConnectionManager/Control")).is_err());
+        assert!(start.elapsed() < Duration::from_secs(15), "{:?}", start.elapsed());
     }
 
     #[test]

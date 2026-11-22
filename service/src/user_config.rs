@@ -23,6 +23,7 @@ use crate::airplay::hap_pairing::PairingCredentials;
 use crate::secret_store::{self, LockedNode, PlatformCodec, SecretCodec};
 use crate::discovery_net::SavedAdapter;
 use crate::manual_speakers::ManualSpeaker;
+use crate::stream_profile::StreamProfile;
 use crate::equalizer::EqSettings;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -254,6 +255,10 @@ pub struct SpeakerSettings {
     /// AirPlay buffer for this speaker, overriding `airplay_latency_ms`.
     #[serde(default)]
     pub airplay_latency_ms: Option<u32>,
+    /// UPnP: the stream profile this speaker last played; the next
+    /// connect starts there (see `stream_profile`).
+    #[serde(default)]
+    pub upnp_stream_profile: Option<StreamProfile>,
 }
 
 impl SpeakerSettings {
