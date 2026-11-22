@@ -608,10 +608,17 @@ impl UserConfig {
                 }
             }
             for p in &paths {
-                log::warn!(
-                    "user_config: {} couldn't be read, so it is back to its default",
-                    secret_store::pointer(p)
-                );
+                if relearned(p) {
+                    log::info!(
+                        "user_config: {} couldn't be read; the app learns it again",
+                        secret_store::pointer(p)
+                    );
+                } else {
+                    log::warn!(
+                        "user_config: {} couldn't be read, so it is back to its default",
+                        secret_store::pointer(p)
+                    );
+                }
             }
             notice.reset = paths;
         }
@@ -836,9 +843,13 @@ pub struct LoadNotice {
 }
 
 impl LoadNotice {
-    /// Whether there is anything to tell.
+    /// Whether there is anything to tell: values the app learns again by
+    /// itself ([`RELEARNED`]) are not.
     pub fn is_empty(&self) -> bool {
-        *self == Self::default()
+        !self.restored_from_backup
+            && self.unusable_kept_as.is_none()
+            && !self.all_reset
+            && self.reset.iter().all(|p| relearned(p))
     }
 
     /// What to tell the person, in a few sentences; `None` when there is
@@ -869,10 +880,10 @@ impl LoadNotice {
                  again.{kept}"
             ));
         }
-        if !self.reset.is_empty() {
+        if self.reset.iter().any(|p| !relearned(p)) {
             const SHOWN: usize = 4;
             let mut labels: Vec<String> = Vec::new();
-            for p in &self.reset {
+            for p in self.reset.iter().filter(|p| !relearned(p)) {
                 let label = reset_label(p, name_of);
                 if !labels.contains(&label) {
                     labels.push(label);
@@ -939,8 +950,23 @@ const SPEAKER_LABELS: &[(&str, &str, bool)] = &[
     ("hidden", "Hide this speaker from the list", true),
     ("auto_connect", "Connect automatically", true),
     ("airplay_latency_ms", "Own AirPlay buffer for this speaker", true),
-    ("upnp_stream_profile", "The stream format it last played", false),
 ];
+
+/// Values the app remembers by itself and learns again at the next
+/// connect, with nothing the person notices but that connect being a
+/// little slower: one that can't be read is left out quietly (the log
+/// names it; the reset notice doesn't). Key paths; `*` matches any key.
+/// Anything the person chose, or would notice losing (a pairing, a
+/// password, the saved speaker), is labelled above instead.
+const RELEARNED: &[&[&str]] = &[
+    // The stream profile a UPnP speaker last played (see `stream_profile`).
+    &["speaker_settings", "*", "upnp_stream_profile"],
+];
+
+/// Whether `path` is one of [`RELEARNED`].
+fn relearned(path: &[String]) -> bool {
+    RELEARNED.iter().any(|p| p.len() == path.len() && p.iter().zip(path).all(|(p, k)| *p == "*" || p == k))
+}
 
 /// A speaker's settings as a whole.
 const WHOLE_SPEAKER_LABEL: (&str, &str, bool) = ("speaker_settings.<id>", "Settings for this speaker", true);
@@ -1858,6 +1884,42 @@ mod tests {
     }
 
     #[test]
+    fn a_value_the_app_learns_again_is_dropped_quietly() {
+        let dir = temp_config_dir("relearned");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let text = r#"{"last_speaker_id":"x","speaker_settings":{"uuid:a":{"hidden":true,"upnp_stream_profile":"flac"}}}"#;
+        std::fs::write(&path, text).unwrap();
+        let c = UserConfig::load_from(&path);
+        assert!(c.speaker_settings["uuid:a"].hidden);
+        assert_eq!(c.speaker_settings["uuid:a"].upnp_stream_profile, None);
+        // Nothing to tell the person...
+        assert!(c.load_notice().is_empty(), "{:?}", c.load_notice());
+        assert_eq!(c.load_notice().describe(&no_names), None);
+        // ...but the copy and the save happen as for any value left out.
+        let copies: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("config.json.before-reset-"))
+            .collect();
+        assert_eq!(copies.len(), 1);
+        let on_disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["speaker_settings"]["uuid:a"]["upnp_stream_profile"], serde_json::Value::Null);
+        // With a value the person chose dropped too, the notice names only that.
+        std::fs::write(
+            &path,
+            r#"{"speaker_settings":{"uuid:a":{"hidden":"yes","upnp_stream_profile":"flac"}}}"#,
+        )
+        .unwrap();
+        let c = UserConfig::load_from(&path);
+        let names = |id: &str| (id == "uuid:a").then(|| "Kitchen".to_string());
+        let said = c.load_notice().describe(&names).unwrap();
+        assert!(said.contains("Kitchen: Hide this speaker from the list."), "{said}");
+        assert!(!said.contains("stream"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_copy_kept_aside_holds_secrets_sealed() {
         use crate::secret_store::tests::FakeCodec;
         let dir = temp_config_dir("reset-copy-sealed");
@@ -2372,9 +2434,18 @@ mod tests {
 
     #[test]
     fn every_setting_has_a_name_the_window_uses() {
+        // Every setting, and every setting of a speaker, has a name for the
+        // reset notice or is one the app learns again by itself.
         let defaults = serde_json::to_value(UserConfig::default()).unwrap();
         for key in defaults.as_object().unwrap().keys() {
-            assert!(setting_label(key).is_some(), "{key} has no label for the reset notice");
+            let path = [key.clone()];
+            assert!(setting_label(key).is_some() || relearned(&path), "{key}: no label for the reset notice");
+        }
+        let speaker = serde_json::to_value(SpeakerSettings::default()).unwrap();
+        for key in speaker.as_object().unwrap().keys() {
+            let labelled = SPEAKER_LABELS.iter().any(|(k, _, _)| k == key);
+            let path = ["speaker_settings".to_string(), "uuid:x".into(), key.clone()];
+            assert!(labelled || relearned(&path), "speaker setting {key}: no label for the reset notice");
         }
         // The names said to be the window's are, word for word, in the
         // window's code.
