@@ -2745,7 +2745,7 @@ impl App {
                 let routes = crate::airplay::session::routes_for(
                     &renderer,
                     crate::airplay::session::Route { receiver: renderer.ip, local: local_ip },
-                    |a| crate::airplay::discovery::could_be_a_device(a, &lan),
+                    |a| crate::airplay::discovery::may_contact(a, &lan),
                     |a| self.local_ip_toward(a).ok(),
                 );
                 // A connect that takes long says what it waits for, in
