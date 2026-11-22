@@ -112,11 +112,11 @@ pub struct Route {
 /// Most of a receiver's addresses one connect tries.
 pub const MAX_ROUTES: usize = 3;
 
-/// The routes of a connect: `first` (the address discovery chose, which
-/// passed the same check, or one a person added), then the receiver's
-/// other announced addresses that `allowed` passes (the check discovery
-/// applies to every address it contacts), each with this PC's address
-/// toward it; [`MAX_ROUTES`] in all.
+/// The routes of a connect: `first` (the address discovery listed the
+/// receiver at, or one a person added), then the receiver's other
+/// announced addresses that `allowed` passes (only what can be a device's,
+/// see [`crate::airplay::discovery::could_be_a_device`]), each with this
+/// PC's address toward it; [`MAX_ROUTES`] in all.
 pub fn routes_for(
     renderer: &AirPlayRenderer,
     first: Route,
@@ -1795,21 +1795,22 @@ mod tests {
         assert_eq!(rx.requests()[0].method, "OPTIONS");
     }
 
-    /// Only addresses the discovery check passes become routes.
+    /// Only addresses that can be a device's become routes; three at most.
     #[test]
-    fn routes_are_only_addresses_the_check_passes() {
+    fn routes_leave_out_only_what_cannot_be_a_device() {
         let rx = FakeRaop::start(|_| Answer::Normal);
         let mut r = receiver(&rx, "0B0000000032", &[0, 1]);
         let lan = crate::discovery_net::LanTargets::from_networks([("192.168.1.10".parse().unwrap(), 24)]);
+        let device = |a: IpAddr| crate::airplay::discovery::could_be_a_device(a, &lan);
         r.ip = "192.168.1.65".parse().unwrap();
-        r.raop.addresses = ["192.168.1.65", "127.0.0.1", "192.168.1.10", "10.9.9.9", "169.254.1.2", "192.168.1.66", "192.168.1.67", "192.168.1.68"]
+        r.raop.addresses = ["192.168.1.65", "0.0.0.0", "224.0.0.251", "255.255.255.255", "192.168.1.255", "10.9.9.9", "127.0.0.1", "192.168.1.10"]
             .iter()
             .map(|a| a.parse().unwrap())
             .collect();
         let local: IpAddr = "192.168.1.10".parse().unwrap();
-        let routes = routes_for(&r, Route { receiver: r.ip, local }, |a| lan.allows(a), |_| Some(local));
+        let routes = routes_for(&r, Route { receiver: r.ip, local }, device, |_| Some(local));
         let tried: Vec<String> = routes.iter().map(|r| r.receiver.to_string()).collect();
-        assert_eq!(tried, ["192.168.1.65", "192.168.1.66", "192.168.1.67"]);
+        assert_eq!(tried, ["192.168.1.65", "10.9.9.9", "127.0.0.1"]);
     }
 
     #[test]

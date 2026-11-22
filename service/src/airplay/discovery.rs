@@ -186,27 +186,41 @@ pub struct RaopDetails {
     pub newcomer: bool,
 }
 
-/// The addresses of `addrs` this app may connect to, in the order a
-/// connect tries them. Only addresses discovery may contact pass (see
-/// [`LanTargets::allows`]: a host inside the subnet of one of this PC's
-/// adapters, never loopback, unspecified, multicast or one of this PC's
-/// own; link-local only when this PC has an address on that link): an
-/// announcement is anyone's to make, and must not point this PC
-/// elsewhere. First the address that last carried a session in this run,
-/// then routable ones before link-local, each by address so the order is
-/// the same on every start.
+/// Could `ip` be a device's address at all? Not when it is unspecified,
+/// multicast, broadcast, or the network or broadcast address of one of
+/// this PC's subnets. Anything else can: addresses outside this PC's
+/// subnets (a speaker on another VLAN, announced through an mDNS
+/// repeater), this PC's own addresses and loopback (a receiver program
+/// running on this PC).
+pub fn could_be_a_device(ip: IpAddr, lan: &LanTargets) -> bool {
+    let IpAddr::V4(v4) = ip else { return true };
+    if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() {
+        return false;
+    }
+    !matches!(lan.refusal(ip), Some(crate::discovery_net::Refusal::NotADevice(_)))
+}
+
+/// The addresses of `addrs` a connect tries, in order: the one that last
+/// carried a session in this run, then those on a subnet of one of this
+/// PC's adapters, then other routable ones, then link-local, each group by
+/// address so the order is the same on every start. Only what can never
+/// be a device is left out (see [`could_be_a_device`]); link-local
+/// addresses stay, since a PC and a speaker on a link with no DHCP use
+/// them.
 pub fn order_addresses(addrs: &[IpAddr], working: Option<IpAddr>, lan: &LanTargets) -> Vec<IpAddr> {
     let class = |a: &IpAddr| -> u8 {
         let link_local = matches!(a, IpAddr::V4(v4) if v4.is_link_local());
         if Some(*a) == working {
             0
-        } else if !link_local {
+        } else if lan.allows(*a) {
             1
-        } else {
+        } else if !link_local {
             2
+        } else {
+            3
         }
     };
-    let mut v: Vec<IpAddr> = addrs.iter().copied().filter(|a| lan.allows(*a)).collect();
+    let mut v: Vec<IpAddr> = addrs.iter().copied().filter(|a| could_be_a_device(*a, lan)).collect();
     v.sort_by_key(|a| (class(a), *a));
     v.dedup();
     v
@@ -1000,28 +1014,23 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// Log the addresses of an announcement this app won't contact (see
-/// [`order_addresses`]): at info level when none is left, so the person
-/// learns why the speaker isn't listed or can't be reached.
+/// Log the addresses of an announcement that can't be a device's (see
+/// [`could_be_a_device`]); at info level when none is left, since the
+/// speaker is then not listed.
 fn report_refused(lan: &LanTargets, fullname: &str, addresses: &[IpAddr]) {
     let refused: Vec<String> = addresses
         .iter()
-        .filter_map(|a| lan.refusal(*a).map(|why| format!("{} ({})", a, why)))
+        .filter(|a| !could_be_a_device(**a, lan))
+        .map(|a| a.to_string())
         .collect();
     if refused.is_empty() {
         return;
     }
     let name = crate::discovery_net::shown(fullname);
     if refused.len() == addresses.len() {
-        let hint = addresses.first().and_then(|a| lan.refusal(*a)).and_then(|why| why.hint());
-        info!(
-            "AirPlay: not contacting {} at {}.{}",
-            name,
-            refused.join(", "),
-            hint.map(|h| format!(" {}", h)).unwrap_or_default()
-        );
+        info!("AirPlay: not listing {}: it announces no address a device can have ({})", name, refused.join(", "));
     } else {
-        debug!("AirPlay: {} also announces {}; not contacting it there", name, refused.join(", "));
+        debug!("AirPlay: {} also announces {}, which no device can have; leaving it out", name, refused.join(", "));
     }
 }
 
@@ -1293,25 +1302,28 @@ mod tests {
         LanTargets::from_networks([("192.168.1.10".parse().unwrap(), 24)])
     }
 
-    /// The addresses a connect tries: only those discovery may contact,
-    /// routable before link-local, in a fixed order whatever order they
-    /// were announced in.
+    /// The addresses a connect tries: everything that can be a device's,
+    /// worked address first, then this PC's subnets, then others, then
+    /// link-local, in a fixed order whatever order they were announced in.
     #[test]
-    fn addresses_are_filtered_and_ordered_whatever_order_they_come_in() {
-        // This PC: 192.168.1.10/24 and a link-local address.
-        let lan = LanTargets::from_networks([("192.168.1.10".parse().unwrap(), 24), ("169.254.7.7".parse().unwrap(), 16)]);
-        let want = vec![ip("192.168.1.65"), ip("192.168.1.70"), ip("169.254.248.229")];
-        let refused = [ip("127.0.0.1"), ip("192.168.1.10"), ip("10.0.0.9"), ip("0.0.0.0"), ip("224.0.0.251"), ip("192.168.1.255")];
-        for perm in [[0, 1, 2], [2, 1, 0], [1, 2, 0], [2, 0, 1]] {
-            let mut given: Vec<IpAddr> = perm.iter().map(|&i| want[i]).collect();
-            given.extend(refused);
-            given.rotate_left(perm[0]);
+    fn addresses_are_ordered_whatever_order_they_come_in() {
+        let lan = home_lan();
+        let want = vec![ip("192.168.1.65"), ip("10.0.0.9"), ip("127.0.0.1"), ip("192.168.1.10"), ip("169.254.248.229")];
+        let never = [ip("0.0.0.0"), ip("224.0.0.251"), ip("255.255.255.255"), ip("192.168.1.255"), ip("192.168.1.0")];
+        for rot in 0..want.len() {
+            let mut given = want.clone();
+            given.rotate_left(rot);
+            given.extend(never);
+            given.rotate_left(rot);
             assert_eq!(order_addresses(&given, None, &lan), want, "{given:?}");
         }
         // The address that last carried a session goes first.
-        assert_eq!(order_addresses(&want, Some(ip("169.254.248.229")), &lan)[0], ip("169.254.248.229"));
-        // Link-local only when this PC has an address on that link.
-        assert!(order_addresses(&[ip("169.254.248.229")], None, &home_lan()).is_empty());
+        assert_eq!(order_addresses(&want, Some(ip("10.0.0.9")), &lan)[0], ip("10.0.0.9"));
+        // Link-local stays, also without a link-local adapter.
+        assert_eq!(order_addresses(&[ip("169.254.248.229")], None, &lan), [ip("169.254.248.229")]);
+        for a in never {
+            assert!(!could_be_a_device(a, &lan), "{a}");
+        }
     }
 
     /// Through the real resolution path: an AirPort Express announcing a
@@ -1325,19 +1337,31 @@ mod tests {
             ingest_resolution(&state, RAOP_SERVICE, &info);
             let r = state.find_by_id("airplay:AABBCCDDEEFF").unwrap();
             assert_eq!(r.ip, ip("192.168.1.65"));
-            assert_eq!(r.raop.addresses, [ip("192.168.1.65")]);
+            assert_eq!(r.raop.addresses, [ip("192.168.1.65"), ip("169.254.248.229")]);
         }
     }
 
-    /// An announcement with no address this app may contact isn't listed.
+    /// A speaker outside this PC's subnets (another VLAN, through an mDNS
+    /// repeater) is listed and reached at its address; one on this PC
+    /// (its own address, or loopback) too; one on- and one off-subnet
+    /// address: the on-subnet one first. Only an announcement with no
+    /// address a device can have isn't listed.
     #[test]
-    fn a_receiver_only_at_addresses_this_pc_wont_contact_is_not_listed() {
+    fn receivers_anywhere_are_listed_and_tried_at_their_own_addresses() {
         let state = AirPlayDiscoveryState::with_lan(home_lan());
-        for (i, addrs) in ["127.0.0.1", "192.168.1.10", "10.0.0.9", "224.0.0.251"].iter().enumerate() {
-            let info = raop_info(&format!("AABBCCDDEE0{}@Elsewhere", i), addrs, &[("et", "0"), ("cn", "1")]);
-            ingest_resolution(&state, RAOP_SERVICE, &info);
-        }
-        assert!(state.renderers().is_empty(), "{:?}", state.renderers());
+        let txt = &[("et", "0"), ("cn", "1")];
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE01@Vlan", "10.20.0.5", txt));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE02@Here", "192.168.1.10", txt));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE03@Loop", "127.0.0.1", txt));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE04@Both", "10.20.0.6,192.168.1.66", txt));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE05@Nowhere", "224.0.0.251", txt));
+        let at = |id: &str| state.find_by_id(id).map(|r| (r.ip, r.raop.addresses.clone()));
+        assert_eq!(at("airplay:AABBCCDDEE01"), Some((ip("10.20.0.5"), vec![ip("10.20.0.5")])));
+        assert_eq!(at("airplay:AABBCCDDEE02"), Some((ip("192.168.1.10"), vec![ip("192.168.1.10")])));
+        assert_eq!(at("airplay:AABBCCDDEE03"), Some((ip("127.0.0.1"), vec![ip("127.0.0.1")])));
+        assert_eq!(at("airplay:AABBCCDDEE04"), Some((ip("192.168.1.66"), vec![ip("192.168.1.66"), ip("10.20.0.6")])));
+        assert_eq!(at("airplay:AABBCCDDEE05"), None);
+        assert_eq!(state.renderers().len(), 4);
     }
 
     const TXT: [(&str, &str); 2] = [("et", "0,1"), ("cn", "0,1")];
