@@ -1,8 +1,10 @@
 //! HTTP server.
 //!
 //! Responsibilities:
-//!   1. `GET /stream.raw` — endless WAV stream of L16 PCM for UPnP
-//!      speakers (plus the `HEAD` probe Sonos sends first).
+//!   1. The audio stream for UPnP speakers: an endless stream of the PC's
+//!      16-bit 44.1 kHz stereo PCM at each `stream_profile` path (WAV at
+//!      `/stream.raw` and three others, raw L16 at one), plus the `HEAD`
+//!      probe renderers send first.
 //!   2. `NOTIFY ...` — GENA event callbacks from the speaker we hold a
 //!      subscription with.
 //!   3. The optional web UI and JSON API (`/r/<key>/`, `/api/*`), both
@@ -25,14 +27,15 @@ use log::{debug, info, warn};
 use serde::Serialize;
 use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::gena::{self, NotifyAdmission};
 use crate::stream_gate::{canonical_ip, Refusal};
+use crate::stream_profile::StreamProfile;
 use crate::web_access::{redact_target, WebAccess, LINK_PREFIX};
-use crate::{WIRE_BYTES_PER_FRAME, WIRE_CHANNELS, WIRE_SAMPLE_RATE};
+use crate::{WIRE_CHANNELS, WIRE_SAMPLE_RATE};
 
 /// Callback invoked from the GENA NOTIFY route with the request path and
 /// the raw XML body. Only called for NOTIFYs that match a live
@@ -79,7 +82,7 @@ pub type ResyncCallback = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 /// counter so the caller can see how much remains to be applied.
 pub type LatencyAdjustCallback = Arc<dyn Fn(i32) -> i64 + Send + Sync>;
 
-/// Callback deciding whether a client IP may fetch `/stream.raw` (the
+/// Callback deciding whether a client IP may fetch the stream (the
 /// stream gate: streaming enabled, privacy mode), and if not, why: the
 /// refused device and the log are told which rule it was. Consulted per
 /// request and once a second per open stream, so the user can disable
@@ -103,11 +106,26 @@ pub struct StreamHub {
     /// Frames a subscriber's full queue had no room for (dropped for that
     /// subscriber only), since launch.
     dropped: std::sync::atomic::AtomicU64,
+    /// The latest stream fetches (GETs of a stream path), oldest first, so
+    /// the app can tell whether a speaker it gave the stream to fetched it.
+    fetches: Mutex<std::collections::VecDeque<StreamFetch>>,
+    fetched: Condvar,
+}
+
+/// Stream fetches remembered (see [`StreamHub::wait_for_fetch`]).
+const REMEMBERED_FETCHES: usize = 64;
+
+/// One GET of a stream path.
+#[derive(Clone, Debug)]
+pub struct StreamFetch {
+    pub peer: IpAddr,
+    pub profile: StreamProfile,
+    pub at: Instant,
 }
 
 struct HubSubscriber {
     tx: Sender<PcmFrame>,
-    /// Peer IP for HTTP `/stream.raw` clients; `None` for internal
+    /// Peer IP for HTTP stream clients; `None` for internal
     /// consumers (the AirPlay senders), which privacy mode never prunes.
     peer: Option<std::net::IpAddr>,
 }
@@ -117,6 +135,8 @@ impl StreamHub {
         Arc::new(Self {
             subscribers: Mutex::new(Vec::new()),
             dropped: std::sync::atomic::AtomicU64::new(0),
+            fetches: Mutex::new(std::collections::VecDeque::new()),
+            fetched: Condvar::new(),
         })
     }
 
@@ -180,6 +200,41 @@ impl StreamHub {
     pub fn subscriber_count(&self) -> usize {
         self.subscribers.lock().unwrap().len()
     }
+
+    /// Note that `peer` started fetching `profile`'s stream.
+    fn note_fetch(&self, peer: IpAddr, profile: StreamProfile) {
+        let mut f = self.fetches.lock().unwrap();
+        f.push_back(StreamFetch { peer: canonical_ip(peer), profile, at: Instant::now() });
+        while f.len() > REMEMBERED_FETCHES {
+            f.pop_front();
+        }
+        drop(f);
+        self.fetched.notify_all();
+    }
+
+    /// The first fetch of `profile`'s stream from one of `peers` at or
+    /// after `since`, waiting up to `timeout` for one.
+    pub fn wait_for_fetch(
+        &self,
+        peers: &[IpAddr],
+        profile: StreamProfile,
+        since: Instant,
+        timeout: Duration,
+    ) -> Option<StreamFetch> {
+        let peers: Vec<IpAddr> = peers.iter().copied().map(canonical_ip).collect();
+        let deadline = Instant::now() + timeout;
+        let mut f = self.fetches.lock().unwrap();
+        loop {
+            if let Some(hit) = f.iter().find(|x| x.at >= since && x.profile == profile && peers.contains(&x.peer)) {
+                return Some(hit.clone());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            f = self.fetched.wait_timeout(f, deadline - now).unwrap().0;
+        }
+    }
 }
 
 /// Configuration for the HTTP server.
@@ -199,10 +254,10 @@ pub struct HttpServerConfig {
     pub latency_adjust: Option<LatencyAdjustCallback>,
     /// The web page (under `/r/<key>/`) and the JSON API (`/api/*`):
     /// whether they are on, and the key they need (see `web_access`).
-    /// The `/stream.raw` route is always served regardless — the speaker
+    /// The stream paths are always served regardless — the speaker
     /// can't function without it. `None` ⇒ no web page or API.
     pub web_access: Option<Arc<WebAccess>>,
-    /// If set, GET/HEAD `/stream.raw` is only served when this admits the
+    /// If set, GET/HEAD of a stream path is only served when this admits the
     /// client's IP — the stream gate. `None` ⇒ the stream is served to
     /// anyone who connects.
     pub stream_client_allowed: Option<StreamClientAllowedCallback>,
@@ -373,7 +428,7 @@ fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
 /// down to make room. Protected connections — from the active speaker's
 /// addresses or from this PC itself (loopback) — are never evicted on
 /// behalf of other clients and don't count towards the shared budget,
-/// so no other host can crowd the speaker out of `/stream.raw` or its
+/// so no other host can crowd the speaker out of the stream or its
 /// event callbacks, or lock the local web UI out.
 #[derive(Default)]
 struct ConnLimiter {
@@ -462,7 +517,13 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, speaker: bool, ctx: &C
                     HeadErr::NotImplemented => Some(501),
                 };
                 if let Some(status) = status {
-                    debug!("http: bad request from {}: {}", peer, status);
+                    // The speaker's requests are the ones that matter: a
+                    // refused one may be why it plays nothing.
+                    if speaker {
+                        info!("http: refused a request from the speaker at {}: {}", peer.ip(), status);
+                    } else {
+                        debug!("http: bad request from {}: {}", peer, status);
+                    }
                     let _ = write_reply(&mut conn.stream, 1, &Reply::text(status, ""), false, true);
                 }
                 return;
@@ -485,13 +546,14 @@ impl Ctx {
 
         // DNS-rebinding guard: a browser tricked into treating this
         // server as some other site still sends that site's name.
-        if !self.hosts.allows(head.header("host")) {
+        let host = head.host();
+        if !self.hosts.allows(host) {
             info!(
                 "http: refused {} {} from {}: unrecognised Host {:?}",
                 head.method,
                 redact_target(path),
                 conn.peer.ip(),
-                head.header("host").unwrap_or("")
+                host.unwrap_or("")
             );
             let reply = Reply::text(421, "unrecognised Host header");
             let _ = write_reply(&mut conn.stream, head.minor, &reply, head_only, true);
@@ -499,36 +561,39 @@ impl Ctx {
         }
 
         let mut body_read = false;
-        let reply = match (head.method.as_str(), path) {
-            ("GET", "/stream.raw") => {
-                if let Some(refusal) = self.check_stream_client(conn.peer.ip(), &head.method) {
+        let stream = StreamProfile::from_path(path);
+        let reply = match (head.method.as_str(), path, stream) {
+            ("GET", _, Some(profile)) => {
+                if let Some(refusal) = self.check_stream_client(conn.peer.ip(), &head.method, path) {
                     refusal
                 } else {
-                    self.serve_stream(conn, head);
+                    self.serve_stream(conn, head, profile);
                     return false;
                 }
             }
-            ("HEAD", "/stream.raw") => {
+            ("HEAD", _, Some(profile)) => {
                 /* Sonos and other DLNA renderers HEAD-probe the URI before
-                 * committing to GET. Reply with the same headers we would
-                 * on GET, but no body. Without this Sonos gives up with
-                 * "Couldn't connect" before ever trying the GET. */
-                if let Some(refusal) = self.check_stream_client(conn.peer.ip(), &head.method) {
+                 * committing to GET, some of them checking its type. The
+                 * answer is GET's head (see `write_stream_head` for the
+                 * original stream's one difference). Without it Sonos
+                 * gives up with "Couldn't connect" before ever trying the
+                 * GET. */
+                if let Some(refusal) = self.check_stream_client(conn.peer.ip(), &head.method, path) {
                     refusal
                 } else {
-                    let ok = write_stream_head(&mut conn.stream, head.minor, 0).is_ok();
+                    let ok = write_stream_head(&mut conn.stream, head.minor, profile, StreamRequest::Head, from_start(head, profile)).is_ok();
                     return ok && head.keep_alive() && head.body == BodyKind::None;
                 }
             }
-            ("GET", "/healthz") => Reply::text(200, "ok"),
+            ("GET", "/healthz", _) => Reply::text(200, "ok"),
             // `/`, `/app.js` and everything under the link's prefix,
             // whatever the key.
-            ("GET", p) if p == "/" || p == "/app.js" || p.starts_with(LINK_PREFIX) => self.page(p),
-            ("GET", "/api/speakers")
-            | ("POST", "/api/select" | "/api/resync" | "/api/latency/adjust") => {
+            ("GET", p, _) if p == "/" || p == "/app.js" || p.starts_with(LINK_PREFIX) => self.page(p),
+            ("GET", "/api/speakers", _)
+            | ("POST", "/api/select" | "/api/resync" | "/api/latency/adjust", _) => {
                 self.api(conn, head, path, &mut body_read)
             }
-            (m, _) if m.eq_ignore_ascii_case("NOTIFY") => self.notify(conn, head, path, &mut body_read),
+            (m, _, _) if m.eq_ignore_ascii_case("NOTIFY") => self.notify(conn, head, path, &mut body_read),
             _ => Reply::text(404, "not found"),
         };
 
@@ -612,12 +677,13 @@ impl Ctx {
         }
     }
 
-    /// The stream gate for `/stream.raw`: `None` when the client may
-    /// proceed, else the 403 to send, which says why, as the log does.
-    fn check_stream_client(&self, peer: IpAddr, method: &str) -> Option<Reply> {
+    /// The stream gate, the same for every stream path: `None` when the
+    /// client may proceed, else the 403 to send, which says why, as the
+    /// log does.
+    fn check_stream_client(&self, peer: IpAddr, method: &str, path: &str) -> Option<Reply> {
         let cb = self.stream_client_allowed.as_ref()?;
         let refusal = cb(peer).err()?;
-        info!("stream: refused {} /stream.raw from {}: {}", method, peer, refusal.reason());
+        info!("stream: refused {} {} from {}: {}", method, path, peer, refusal.reason());
         Some(Reply::text(403, &format!("forbidden: {}", refusal.reason())))
     }
 
@@ -746,20 +812,21 @@ impl Ctx {
         Reply::json(200, &LatencyOk { ok: true, pending_frames: pending })
     }
 
-    /// Serve a single `/stream.raw` connection until the stream ends or
-    /// the client goes away.
-    fn serve_stream(&self, conn: &mut Conn, head: &Head) {
+    /// Serve a single stream connection, in `profile`'s framing, until
+    /// the stream ends or the client goes away.
+    fn serve_stream(&self, conn: &mut Conn, head: &Head, profile: StreamProfile) {
         // Subscribe BEFORE we send headers so we don't miss the first
         // frame. Tagged with the peer IP so the stream gate can cut the
         // connection off later if this client stops being allowed.
         let peer = conn.peer.ip();
         let rx = self.hub.subscribe_from(peer);
+        self.hub.note_fetch(peer, profile);
         // The reader also re-asks the gate once a second while streaming,
         // so a listener that stops being allowed (streaming disabled,
         // speaker switched, privacy turned on) is cut within a second even
         // if no explicit prune ran.
         let recheck = self.stream_client_allowed.clone().map(|cb| (cb, peer));
-        let mut reader = StreamReader::new(rx, recheck);
+        let mut reader = StreamReader::new(rx, recheck, profile);
 
         // The active speaker may stop reading for as long as it is
         // paused and must find the stream still open afterwards. Any
@@ -767,7 +834,7 @@ impl Ctx {
         let write_timeout = (!conn.speaker).then_some(STREAM_WRITE_TIMEOUT);
         let _ = conn.stream.set_write_timeout(write_timeout);
         let mut out = BufWriter::with_capacity(1024, &conn.stream);
-        let result = write_stream_head(&mut out, head.minor, FAKE_CONTENT_LEN)
+        let result = write_stream_head(&mut out, head.minor, profile, StreamRequest::Get, from_start(head, profile))
             .and_then(|_| std::io::copy(&mut reader, &mut out).map(|_| ()))
             .and_then(|_| out.flush());
         if let Err(e) = result {
@@ -908,7 +975,7 @@ fn cross_site_refusal(head: &Head) -> Option<&'static str> {
     }
     if let Some(origin) = head.header("origin") {
         let same = head
-            .header("host")
+            .host()
             .map(|h| origin.trim().eq_ignore_ascii_case(&format!("http://{}", h.trim())))
             .unwrap_or(false);
         if !same {
@@ -981,7 +1048,11 @@ enum BodyKind {
 #[derive(Debug)]
 struct Head {
     method: String,
+    /// In origin form (`/path?query`), whichever form it came in.
     target: String,
+    /// The authority of an absolute-form target, which takes the place
+    /// of `Host` (RFC 9112 3.2.2).
+    authority: Option<String>,
     /// HTTP/1.x minor version (0 or 1).
     minor: u8,
     headers: Vec<(String, String)>,
@@ -994,6 +1065,12 @@ impl Head {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The host the request is for: an absolute-form target's authority,
+    /// else the `Host` header (RFC 9112 3.2.2).
+    fn host(&self) -> Option<&str> {
+        self.authority.as_deref().or(self.header("host"))
     }
 
     fn keep_alive(&self) -> bool {
@@ -1060,22 +1137,53 @@ fn is_token(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
+/// The head's lines, split at CRLF.
+fn crlf_lines(mut bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    while let Some(p) = bytes.windows(2).position(|w| w == b"\r\n") {
+        lines.push(&bytes[..p]);
+        bytes = &bytes[p + 2..];
+    }
+    lines.push(bytes);
+    lines
+}
+
+/// An absolute-form target (`http://host:port/path?query`, RFC 9112
+/// 3.2.2) as its authority and the origin-form target it names. None if
+/// it isn't one.
+fn absolute_form(target: &str) -> Option<(&str, String)> {
+    let scheme = target.get(..7).filter(|s| s.eq_ignore_ascii_case("http://"))?;
+    let rest = &target[scheme.len()..];
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let path = if path.starts_with('/') { path.to_string() } else { format!("/{path}") };
+    Some((authority, path))
+}
+
+/// Parse a request head. The request line and field names are ASCII;
+/// field values may carry other bytes (a device name in Latin-1, say),
+/// which are read leniently.
 fn parse_head(bytes: &[u8]) -> Result<Head, HeadErr> {
-    let text = std::str::from_utf8(bytes).map_err(|_| HeadErr::Bad)?;
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next().ok_or(HeadErr::Bad)?;
+    let lines = crlf_lines(bytes);
+    let request_line = std::str::from_utf8(lines[0]).ok().filter(|l| l.is_ascii()).ok_or(HeadErr::Bad)?;
     let mut parts = request_line.split(' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return Err(HeadErr::Bad);
     };
-    if !is_token(method)
-        || !target.starts_with('/')
-        || target.bytes().any(|b| b <= b' ' || b == 0x7f)
-    {
+    if !is_token(method) || target.bytes().any(|b| b <= b' ' || b == 0x7f) {
         return Err(HeadErr::Bad);
     }
+    let (target, authority) = if target.starts_with('/') {
+        (target.to_string(), None)
+    } else {
+        let (authority, path) = absolute_form(target).ok_or(HeadErr::Bad)?;
+        (path, Some(authority.to_string()))
+    };
     let minor = match version {
         "HTTP/1.1" => 1,
         "HTTP/1.0" => 0,
@@ -1084,20 +1192,27 @@ fn parse_head(bytes: &[u8]) -> Result<Head, HeadErr> {
     };
 
     let mut headers: Vec<(String, String)> = Vec::new();
-    for line in lines {
+    for line in &lines[1..] {
         if headers.len() >= MAX_HEADERS {
             return Err(HeadErr::TooLarge);
         }
-        let (name, value) = line.split_once(':').ok_or(HeadErr::Bad)?;
+        let colon = line.iter().position(|&b| b == b':').ok_or(HeadErr::Bad)?;
+        let name = std::str::from_utf8(&line[..colon]).map_err(|_| HeadErr::Bad)?;
         if !is_token(name) {
             // Also rejects obsolete line folding (leading whitespace).
             return Err(HeadErr::Bad);
         }
-        let value = value.trim_matches(|c| c == ' ' || c == '\t');
-        if value.bytes().any(|b| (b < b' ' && b != b'\t') || b == 0x7f) {
+        let mut value = &line[colon + 1..];
+        while let [b' ' | b'\t', rest @ ..] = value {
+            value = rest;
+        }
+        while let [rest @ .., b' ' | b'\t'] = value {
+            value = rest;
+        }
+        if value.iter().any(|&b| (b < b' ' && b != b'\t') || b == 0x7f) {
             return Err(HeadErr::Bad);
         }
-        headers.push((name.to_string(), value.to_string()));
+        headers.push((name.to_string(), String::from_utf8_lossy(value).into_owned()));
     }
 
     let te = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
@@ -1132,7 +1247,7 @@ fn parse_head(bytes: &[u8]) -> Result<Head, HeadErr> {
         BodyKind::None
     };
 
-    Ok(Head { method: method.to_string(), target: target.to_string(), minor, headers, body })
+    Ok(Head { method: method.to_string(), target, authority, minor, headers, body })
 }
 
 /// Path and query of a request target.
@@ -1399,23 +1514,69 @@ fn write_reply(
 /// even though both are technically legal HTTP.
 const FAKE_CONTENT_LEN: u64 = (u32::MAX - 1) as u64;
 
-/// Status line + headers for GET/HEAD `/stream.raw`. These are the exact
-/// bytes (name, order, values) speakers have been receiving, matching
-/// swyh-rs's stream responses: Sonos's DLNA stack is pedantic. The
+/// Whether `head` asks for `profile`'s stream from its first byte with
+/// `Range: bytes=0-`, as Linn streamers do (swyh-rs answers 206). Only
+/// that form, and only on the new paths: the original stream answers as
+/// it always has, which Sonos takes.
+fn from_start(head: &Head, profile: StreamProfile) -> bool {
+    profile != StreamProfile::Legacy
+        && head.header("range").is_some_and(|r| {
+            // Bytes, not string slices: the value came from the network
+            // and may hold any character at any position.
+            let r = r.trim().as_bytes();
+            r.len() == 8 && r[..6].eq_ignore_ascii_case(b"bytes=") && &r[6..] == b"0-"
+        })
+}
+
+/// Which request a stream head answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamRequest {
+    Head,
+    Get,
+}
+
+/// Status line + headers of a stream, for GET or HEAD. These are the
+/// exact bytes (name, order, values) speakers have been receiving,
+/// matching swyh-rs's stream responses: Sonos's DLNA stack is pedantic.
+/// Only the `Content-Type` differs from one profile to the next. The
+/// original stream (`/stream.raw`, the legacy profile) answers a HEAD
+/// with `Content-Length: 0`, as it always has and as swyh-rs does; every
+/// other profile gives HEAD exactly GET's head. The
 /// `TransferMode.dlna.org: Streaming` header tells renderers the body is
 /// a live stream they mustn't seek. Do NOT add Accept-Ranges or
 /// contentFeatures.dlna.org — swyh-rs omits both.
-fn write_stream_head(w: &mut impl Write, minor: u8, content_length: u64) -> std::io::Result<()> {
+///
+/// `from_start`: the request asked for `Range: bytes=0-` (see
+/// [`from_start`]): the same stream as a `206` with its `Content-Range`.
+fn write_stream_head(
+    w: &mut impl Write,
+    minor: u8,
+    profile: StreamProfile,
+    request: StreamRequest,
+    from_start: bool,
+) -> std::io::Result<()> {
+    let content_length = match (profile, request) {
+        (StreamProfile::Legacy, StreamRequest::Head) => 0,
+        _ => FAKE_CONTENT_LEN,
+    };
+    let (status, range) = if from_start {
+        ("206 Partial Content", format!("Content-Range: bytes 0-{}/{}\r\n", FAKE_CONTENT_LEN - 1, FAKE_CONTENT_LEN))
+    } else {
+        ("200 OK", String::new())
+    };
     let head = format!(
-        "HTTP/1.{} 200 OK\r\n\
+        "HTTP/1.{} {}\r\n\
          Date: {}\r\n\
          Server: stream-to-speaker tiny-http\r\n\
-         Content-Type: audio/vnd.wave;codec=1\r\n\
+         Content-Type: {}\r\n\
          TransferMode.dlna.org: Streaming\r\n\
-         Content-Length: {}\r\n\
+         {}Content-Length: {}\r\n\
          \r\n",
         minor,
+        status,
         http_date(SystemTime::now()),
+        profile.content_type(),
+        range,
         content_length
     );
     w.write_all(head.as_bytes())?;
@@ -1752,10 +1913,9 @@ fn html_escape(s: &str) -> String {
 /// on, speaker switched) is cut within this long.
 const GATE_RECHECK: Duration = Duration::from_secs(1);
 
-/// `Read` adapter that pulls PCM frames from a crossbeam Receiver. Blocks
-/// up to a few seconds for a frame; if nothing arrives it returns EOF
-/// (closing the stream), which is the cleanest way to signal the client we
-/// have nothing to send.
+/// `Read` adapter that pulls PCM frames from a crossbeam Receiver. Waits
+/// up to 30 s for a frame; if none arrives it returns EOF, which closes
+/// the stream.
 struct StreamReader {
     rx: Receiver<PcmFrame>,
     /// Bytes not yet returned from the last received frame.
@@ -1767,22 +1927,27 @@ struct StreamReader {
     /// serves anyone).
     gate: Option<(StreamClientAllowedCallback, std::net::IpAddr)>,
     last_gate_check: std::time::Instant,
+    /// Raw big-endian samples (L16) instead of the hub's little-endian WAV
+    /// data.
+    big_endian: bool,
 }
 
 impl StreamReader {
     fn new(
         rx: Receiver<PcmFrame>,
         gate: Option<(StreamClientAllowedCallback, std::net::IpAddr)>,
+        profile: StreamProfile,
     ) -> Self {
         Self {
             rx,
             gate,
             last_gate_check: std::time::Instant::now(),
-            // Pre-load a 44-byte RIFF/WAVE header so the consumer (Sonos)
-            // sees a valid streaming WAV from byte 0. swyh-rs does the
-            // same thing in audio/rwstream.rs.
-            leftover: wav_header_streaming().to_vec(),
+            // A WAV profile starts with a 44-byte RIFF/WAVE header so the
+            // consumer (Sonos) sees a valid streaming WAV from byte 0.
+            // swyh-rs does the same thing in audio/rwstream.rs.
+            leftover: if profile.is_wav() { wav_header_streaming().to_vec() } else { Vec::new() },
             leftover_pos: 0,
+            big_endian: !profile.is_wav(),
         }
     }
 }
@@ -1836,6 +2001,12 @@ impl Read for StreamReader {
             match self.rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(frame) => {
                     self.leftover = (*frame.0).clone();
+                    if self.big_endian {
+                        // Frames hold whole 16-bit samples.
+                        for sample in self.leftover.chunks_exact_mut(2) {
+                            sample.swap(0, 1);
+                        }
+                    }
                     self.leftover_pos = 0;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => return Ok(0),
@@ -1851,34 +2022,16 @@ impl Read for StreamReader {
     }
 }
 
-/// Convert a Vec<i16> sample buffer to PCM bytes.
-///
-/// We stream WAV (RIFF/WAVE) which uses **little-endian** samples — the
-/// same byte order as Windows i16 internally, so this is effectively a
-/// memcpy reinterpret. We keep the name "_l16_be_bytes" for ABI stability
-/// with main.rs but the impl is little-endian. Renderers receiving the
-/// WAV header (audio/vnd.wave;codec=1, fmt=PCM) decode accordingly.
-///
-/// If we ever support raw L16 over HTTP again (RFC 3551 big-endian, no
-/// WAV header), add a separate helper.
-pub fn samples_to_l16_be_bytes(samples: &[i16]) -> Vec<u8> {
+/// Samples as WAV data: 16-bit little-endian, the byte order of a RIFF
+/// file and of Windows' own `i16`. What the hub carries; the L16 profile
+/// swaps each sample to network byte order as it serves it.
+pub fn samples_to_wav_le_bytes(samples: &[i16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() * 2);
     for s in samples {
-        let b = s.to_le_bytes();
-        out.push(b[0]);
-        out.push(b[1]);
+        out.extend_from_slice(&s.to_le_bytes());
     }
     out
 }
-
-/// Suggested bytes-per-second on the wire, for buffer-sizing math.
-pub fn wire_bytes_per_second() -> usize {
-    (WIRE_SAMPLE_RATE as usize) * WIRE_BYTES_PER_FRAME
-}
-
-/// Just a const stash so users can confirm channel count without importing
-/// from lib.rs directly.
-pub const WIRE_CHANNELS_PUBLIC: u16 = WIRE_CHANNELS;
 
 #[cfg(test)]
 mod tests {
@@ -1893,6 +2046,8 @@ mod tests {
         use std::sync::{Mutex, Once};
 
         static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        /// The lines logged at info or above (what a release build keeps).
+        static INFO_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
         struct Capture;
 
@@ -1903,6 +2058,9 @@ mod tests {
             fn log(&self, record: &log::Record) {
                 if self.enabled(record.metadata()) {
                     LINES.lock().unwrap().push(record.args().to_string());
+                    if record.level() <= log::Level::Info {
+                        INFO_LINES.lock().unwrap().push(record.args().to_string());
+                    }
                 }
             }
             fn flush(&self) {}
@@ -1922,6 +2080,10 @@ mod tests {
 
         pub(super) fn lines() -> Vec<String> {
             LINES.lock().unwrap().clone()
+        }
+
+        pub(super) fn info_lines() -> Vec<String> {
+            INFO_LINES.lock().unwrap().clone()
         }
     }
 
@@ -2024,6 +2186,12 @@ mod tests {
         assert!(cross_site_refusal(&null).is_some());
         let site = head("POST /api/resync HTTP/1.1\nHost: 192.168.1.10:5901\nSec-Fetch-Site: cross-site\n").unwrap();
         assert!(cross_site_refusal(&site).is_some());
+        // An absolute-form target's authority is the request's host, here
+        // as in the Host check.
+        let absolute = head("POST http://192.168.1.10:5901/api/resync HTTP/1.1\nHost: other\nOrigin: http://192.168.1.10:5901\n").unwrap();
+        assert_eq!(cross_site_refusal(&absolute), None);
+        let absolute = head("POST http://other/api/resync HTTP/1.1\nHost: 192.168.1.10:5901\nOrigin: http://192.168.1.10:5901\n").unwrap();
+        assert!(cross_site_refusal(&absolute).is_some());
         assert!(is_json_content_type(Some("application/json; charset=utf-8")));
         assert!(!is_json_content_type(Some("text/plain")));
         assert!(!is_json_content_type(None));
@@ -2176,16 +2344,18 @@ mod tests {
             }
         }
         thread::sleep(Duration::from_millis(300));
-        let probe = |src: [u8; 4]| {
+        let probe = |src: [u8; 4], path: &str| {
             let mut s = connect_from(src, port);
-            s.write_all(b"HEAD /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+            s.write_all(format!("HEAD {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes()).unwrap();
             let mut buf = [0u8; 512];
             let n = s.read(&mut buf).unwrap_or(0);
             String::from_utf8_lossy(&buf[..n]).to_string()
         };
-        // The speaker gets through, and so does a newcomer.
-        assert!(probe([127, 0, 0, 1]).starts_with("HTTP/1.1 200"));
-        assert!(probe([127, 0, 0, 13]).starts_with("HTTP/1.1 200"));
+        // The speaker gets through, and so does a newcomer, on every path.
+        for path in crate::stream_profile::ALL.map(|p| p.path()) {
+            assert!(probe([127, 0, 0, 1], path).starts_with("HTTP/1.1 200"), "{path}");
+            assert!(probe([127, 0, 0, 13], path).starts_with("HTTP/1.1 200"), "{path}");
+        }
         stop.store(true, Ordering::Relaxed);
     }
 
@@ -2330,6 +2500,269 @@ mod tests {
         let (port, _hub) = minimal();
         let r = exchange(port, b"GET /stream.raw HTTP/1.1\r\nHost: evil.example:5901\r\n\r\n", 4096);
         assert!(r.starts_with("HTTP/1.1 421"), "{r}");
+    }
+
+    // ---- stream profiles ----------------------------------------------
+
+    use crate::stream_profile::ALL as PROFILES;
+
+    /// The profiles added beside the original `/stream.raw`.
+    fn new_profiles() -> impl Iterator<Item = StreamProfile> {
+        PROFILES.into_iter().filter(|p| *p != StreamProfile::Legacy)
+    }
+
+    /// A reply's head without its `Date` line, which changes by the second.
+    fn head_without_date(reply: &[u8]) -> String {
+        let at = reply.windows(4).position(|w| w == b"\r\n\r\n").expect("a complete head") + 4;
+        String::from_utf8_lossy(&reply[..at]).split("\r\n").filter(|l| !l.starts_with("Date: ")).collect::<Vec<_>>().join("\r\n")
+    }
+
+    /// Publish frames until the returned flag is set.
+    fn keep_publishing(hub: &Arc<StreamHub>, frame: Vec<u8>) -> Arc<AtomicBool> {
+        let (h, stop) = (hub.clone(), Arc::new(AtomicBool::new(false)));
+        let stop2 = stop.clone();
+        thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                h.publish(PcmFrame(Arc::new(frame.clone())));
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        stop
+    }
+
+    #[test]
+    fn samples_become_little_endian_wav_data() {
+        assert_eq!(samples_to_wav_le_bytes(&[0x0102, -2, 0]), [0x02, 0x01, 0xFE, 0xFF, 0, 0]);
+    }
+
+    #[test]
+    fn every_profile_is_served_at_its_path_with_its_type_on_head_and_get_alike() {
+        let (port, hub) = minimal();
+        let stop = keep_publishing(&hub, vec![1, 2, 3, 4]);
+        for p in new_profiles() {
+            let want = format!(
+                "HTTP/1.1 200 OK\r\nServer: stream-to-speaker tiny-http\r\nContent-Type: {}\r\n\
+                 TransferMode.dlna.org: Streaming\r\nContent-Length: 4294967294\r\n\r\n",
+                p.content_type()
+            );
+            let head = exchange_raw(port, format!("HEAD {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", p.path()).as_bytes(), 4096);
+            assert_eq!(head_without_date(&head), want, "HEAD {p:?}");
+            assert!(head.ends_with(b"\r\n\r\n"), "HEAD {p:?} has a body");
+            let get = exchange_raw(port, format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", p.path()).as_bytes(), 1024);
+            assert_eq!(head_without_date(&get), want, "GET {p:?}");
+            let body = &get[get.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..];
+            if p.is_wav() {
+                assert_eq!(&body[..44], &wav_header_streaming()[..], "{p:?}");
+                assert_eq!(&body[44..48], &[1, 2, 3, 4], "{p:?}");
+            } else {
+                // RFC 2586: network byte order, no header.
+                assert_eq!(&body[..8], &[2, 1, 4, 3, 2, 1, 4, 3], "{p:?}");
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn every_stream_path_passes_the_same_host_check_and_gate() {
+        log_capture::start();
+        let hub = StreamHub::new();
+        let open = Arc::new(AtomicBool::new(true));
+        let gate = open.clone();
+        let mut cfg = HttpServerConfig::minimal("127.0.0.1:0".parse().unwrap(), hub.clone());
+        cfg.stream_client_allowed =
+            Some(Arc::new(move |_| if gate.load(Ordering::Acquire) { Ok(()) } else { Err(Refusal::NotGranted) }));
+        let port = start(cfg);
+        let stop = keep_publishing(&hub, vec![0; 256]);
+        // Streams already open on every path, cut together when the gate closes.
+        let mut streams = Vec::new();
+        for p in PROFILES {
+            let r = exchange(port, format!("GET {} HTTP/1.1\r\nHost: evil.example:5901\r\n\r\n", p.path()).as_bytes(), 4096);
+            assert!(r.starts_with("HTTP/1.1 421"), "{p:?}: {r}");
+            let mut s = connect(port);
+            s.write_all(format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", p.path()).as_bytes()).unwrap();
+            let mut buf = [0u8; 512];
+            let n = s.read(&mut buf).unwrap();
+            assert!(buf[..n].starts_with(b"HTTP/1.1 200 OK"), "{p:?}");
+            streams.push((p, s));
+        }
+        open.store(false, Ordering::Release);
+        let closed_at = Instant::now();
+        // Cut by the once-a-second recheck; ten times that is the margin.
+        for (p, mut s) in streams {
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => assert!(closed_at.elapsed() < GATE_RECHECK * 10, "{p:?} still streaming"),
+                    Err(e) => panic!("{p:?}: stream didn't end: {e}"),
+                }
+            }
+        }
+        assert!(closed_at.elapsed() < GATE_RECHECK * 10, "{:?}", closed_at.elapsed());
+        let refused = "privacy mode is on: only the speaker being played on (and its group) may listen";
+        for p in PROFILES {
+            for method in ["HEAD", "GET"] {
+                let r = exchange(port, format!("{method} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", p.path()).as_bytes(), 4096);
+                assert!(r.starts_with("HTTP/1.1 403"), "{method} {p:?}: {r}");
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let log = log_capture::lines();
+        for p in PROFILES {
+            let line = format!("stream: refused GET {} from 127.0.0.1: {refused}", p.path());
+            assert!(log.contains(&line), "no {line:?} in {log:#?}");
+        }
+    }
+
+    #[test]
+    fn a_speakers_stream_fetch_is_seen_by_whoever_waits_for_it() {
+        let (port, hub) = minimal();
+        let speaker: IpAddr = "127.0.0.1".parse().unwrap();
+        let since = Instant::now();
+        let wav = StreamProfile::Wav;
+        // Nothing fetched yet: the wait ends at its timeout.
+        assert!(hub.wait_for_fetch(&[speaker], wav, since, Duration::from_millis(100)).is_none());
+        let waiter = {
+            let hub = hub.clone();
+            thread::spawn(move || hub.wait_for_fetch(&[speaker], wav, since, Duration::from_secs(10)))
+        };
+        // A HEAD is a probe, not a fetch.
+        let _ = exchange(port, b"HEAD /wav/stream.wav HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", 4096);
+        let mut s = connect(port);
+        s.write_all(b"GET /wav/stream.wav HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let fetch = waiter.join().unwrap().expect("the GET was seen");
+        assert_eq!((fetch.peer, fetch.profile), (speaker, StreamProfile::Wav));
+        assert!(fetch.at >= since);
+        // Another address's fetches are not this speaker's, another
+        // profile's not this one's, and earlier ones not later ones.
+        assert!(hub.wait_for_fetch(&["192.168.1.50".parse().unwrap()], wav, since, Duration::from_millis(100)).is_none());
+        assert!(hub.wait_for_fetch(&[speaker], StreamProfile::Legacy, since, Duration::from_millis(100)).is_none());
+        assert!(hub.wait_for_fetch(&[speaker], wav, Instant::now(), Duration::from_millis(100)).is_none());
+        drop(s);
+    }
+
+    // ---- request forms a server must accept ----------------------------
+
+    #[test]
+    fn an_absolute_form_target_is_served_when_its_authority_is_ours() {
+        let (port, hub) = minimal();
+        let r = exchange(port, format!("GET http://127.0.0.1:{port}/healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes(), 4096);
+        assert!(r.starts_with("HTTP/1.1 200") && r.ends_with("ok"), "{r}");
+        // The target's authority is what counts (RFC 9112 3.2.2), whatever Host says.
+        let r = exchange(port, b"GET HTTP://Evil.Example:5901/healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", 4096);
+        assert!(r.starts_with("HTTP/1.1 421"), "{r}");
+        let r = exchange(port, b"GET http://localhost/healthz?x=1 HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n", 4096);
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        // A stream, too.
+        let stop = keep_publishing(&hub, vec![1, 2, 3, 4]);
+        let r = exchange_raw(port, format!("GET http://127.0.0.1:{port}/wav/stream.wav HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes(), 600);
+        stop.store(true, Ordering::Relaxed);
+        assert!(head_without_date(&r).contains("Content-Type: audio/wav\r\n"), "{}", String::from_utf8_lossy(&r));
+        // Not a URL: still refused.
+        for target in ["http://", "http:///healthz", "ftp://127.0.0.1/healthz", "healthz"] {
+            let r = exchange(port, format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes(), 4096);
+            assert!(r.starts_with("HTTP/1.1 400"), "{target}: {r}");
+        }
+    }
+
+    #[test]
+    fn header_values_need_not_be_utf8() {
+        let (port, _hub) = minimal();
+        let mut req = b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: Caf\xe9 Renderer/1.0\r\nConnection: close\r\n\r\n".to_vec();
+        let r = String::from_utf8_lossy(&exchange_raw(port, &req, 4096)).into_owned();
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        // Names and the request line stay ASCII.
+        req = b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nUs\xe9r: x\r\n\r\n".to_vec();
+        assert!(String::from_utf8_lossy(&exchange_raw(port, &req, 4096)).starts_with("HTTP/1.1 400"));
+        req = b"GET /h\xe9althz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_vec();
+        assert!(String::from_utf8_lossy(&exchange_raw(port, &req, 4096)).starts_with("HTTP/1.1 400"));
+        // Control characters in a value are still refused.
+        req = b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nX: a\x01b\r\n\r\n".to_vec();
+        assert!(String::from_utf8_lossy(&exchange_raw(port, &req, 4096)).starts_with("HTTP/1.1 400"));
+        let h = head("GET / HTTP/1.1\nX: Caf\u{e9}\n").unwrap();
+        assert_eq!(h.header("x"), Some("Caf\u{e9}"));
+    }
+
+    #[test]
+    fn a_range_value_with_a_character_across_its_unit_is_just_another_range() {
+        // Eight bytes long, with a character straddling byte 6: a UTF-8
+        // "é", and an invalid byte read as U+FFFD (three bytes).
+        let (port, hub) = minimal();
+        let stop = keep_publishing(&hub, vec![1, 2, 3, 4]);
+        for range in [&b"12345\xc3\xa9x"[..], &b"1234\xffx"[..]] {
+            for method in ["HEAD", "GET"] {
+                let mut req = format!("{method} /wav/stream.wav HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nRange: ").into_bytes();
+                req.extend_from_slice(range);
+                req.extend_from_slice(b"\r\n\r\n");
+                let r = exchange_raw(port, &req, 300);
+                assert!(r.starts_with(b"HTTP/1.1 200 OK\r\n"), "{method} {range:?}: {}", String::from_utf8_lossy(&r));
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(healthz(port).starts_with("HTTP/1.1 200"));
+        for value in ["12345\u{e9}x", "1234\u{fffd}x", "bytes=\u{e9}", "\u{e9}\u{e9}\u{e9}\u{e9}"] {
+            let h = head(&format!("GET /wav/stream.wav HTTP/1.1\nRange: {value}\n")).unwrap();
+            assert!(!from_start(&h, StreamProfile::Wav), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_request_the_speaker_sends_that_is_refused_is_logged_where_it_is_seen() {
+        log_capture::start();
+        let hub = StreamHub::new();
+        let mut cfg = HttpServerConfig::minimal("127.0.0.1:0".parse().unwrap(), hub);
+        let speaker: IpAddr = "127.0.0.1".parse().unwrap();
+        cfg.speaker_peer = Some(Arc::new(move |ip| ip == speaker));
+        let port = start(cfg);
+        let bad = b"GET  /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        let mut s = connect(port);
+        s.write_all(bad).unwrap();
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 400"));
+        let mut other = connect_from([127, 0, 0, 22], port);
+        other.write_all(bad).unwrap();
+        let n = other.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 400"));
+        let info = log_capture::info_lines();
+        assert!(info.contains(&"http: refused a request from the speaker at 127.0.0.1: 400".to_string()), "{info:#?}");
+        // Anyone else's stays at debug.
+        assert!(!info.iter().any(|l| l.contains("127.0.0.22")), "{info:#?}");
+        assert!(log_capture::lines().iter().any(|l| l.starts_with("http: bad request from 127.0.0.22:")));
+    }
+
+    #[test]
+    fn a_range_from_the_start_gets_206_on_the_new_paths_only() {
+        let (port, hub) = minimal();
+        let stop = keep_publishing(&hub, vec![1, 2, 3, 4]);
+        for p in new_profiles() {
+            for method in ["HEAD", "GET"] {
+                let r = exchange_raw(port, format!("{method} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n", p.path()).as_bytes(), 600);
+                assert_eq!(
+                    head_without_date(&r),
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nServer: stream-to-speaker tiny-http\r\nContent-Type: {}\r\n\
+                         TransferMode.dlna.org: Streaming\r\nContent-Range: bytes 0-4294967293/4294967294\r\n\
+                         Content-Length: 4294967294\r\n\r\n",
+                        p.content_type()
+                    ),
+                    "{method} {p:?}"
+                );
+            }
+            // Any other range: the whole stream, as before.
+            for range in ["bytes=10-", "bytes=0-99", "bytes=-5", "items=0-"] {
+                let r = exchange_raw(port, format!("HEAD {} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: {range}\r\nConnection: close\r\n\r\n", p.path()).as_bytes(), 600);
+                assert!(r.starts_with(b"HTTP/1.1 200 OK\r\n"), "{range} {p:?}");
+            }
+        }
+        // The original stream answers as it always has.
+        let r = exchange_raw(port, b"GET /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=0-\r\n\r\n", 600);
+        let head = head_without_date(&r);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n") && !head.contains("Content-Range"), "{head}");
+        let r = exchange_raw(port, b"HEAD /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n", 600);
+        assert!(head_without_date(&r).ends_with("Content-Length: 0\r\n\r\n"));
+        stop.store(true, Ordering::Relaxed);
     }
 
     #[test]

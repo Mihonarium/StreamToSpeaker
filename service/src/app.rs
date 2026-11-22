@@ -29,6 +29,7 @@ use crate::http_server::{SpeakerInfo, StreamHub};
 use crate::manual_speakers::{self, ManualKind, ManualSpeaker};
 use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use crate::ssdp::{DiscoveryState, Renderer, SearchScope};
+use crate::stream_profile::{self, Sinks, StreamProfile};
 use crate::stream_gate::{canonical_ip, is_local_address, Grant, Refusal, StreamGate};
 use crate::user_config::{AutoConnect, SpeakerSettings, UserConfig};
 use crate::volume_sync::{sonos_to_millibels, PendingCommands, SpeakerCommand, VolumeSync};
@@ -52,6 +53,12 @@ pub struct RendererSession {
     /// added by address keeps its manual id, so the list highlights the
     /// row the user clicked and a relaunch reconnects through it).
     pub id_override: Option<String>,
+    /// How the stream at `stream_uri` is served (see `stream_profile`).
+    pub profile: StreamProfile,
+    /// When the renderer was given `stream_uri`.
+    pub stream_given_at: Instant,
+    /// When it accepted Play.
+    pub played_at: Instant,
 }
 
 /// Active session — either UPnP (pull-style, speaker fetches our HTTP
@@ -198,9 +205,10 @@ impl ActiveSession {
         }
     }
 
-    /// True if the session has died mid-stream (dropped receiver). UPnP
-    /// is HTTP-pull (the speaker reconnects on its own), so only the
-    /// AirPlay push paths report death here.
+    /// True if the session has died mid-stream (dropped receiver). Only
+    /// the push paths can tell: nothing watches whether a UPnP speaker
+    /// still fetches the stream, so a UPnP session is never reported dead
+    /// here, even when its speaker has stopped.
     pub fn is_dead(&self) -> bool {
         match self {
             ActiveSession::Upnp(_) => false,
@@ -591,6 +599,9 @@ pub struct App {
     /// blocking network I/O — pairing, SETUPs, fallbacks — so the GUI
     /// runs it on a worker thread and shows "Connecting…" off this.
     pub connecting: Mutex<Option<String>>,
+    /// What an in-flight UPnP connect is doing, for the banner's second
+    /// line (see [`ConnectStep::text`]); None for the usual line.
+    connect_detail: Mutex<Option<String>>,
 
     /// Counts selections through [`select_speaker_async`],
     /// [`select_speaker`] and a Sendspin pairing answer, the paths the
@@ -910,6 +921,7 @@ impl App {
             user_config: Mutex::new(user_config),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
+            connect_detail: Mutex::new(None),
             user_picks: AtomicU64::new(0),
             pin_ceremony: Mutex::new(None),
             sendspin: Default::default(),
@@ -1775,6 +1787,12 @@ impl App {
         self.connecting.lock().unwrap().clone()
     }
 
+    /// What the connect in flight is doing, when there is more to say
+    /// than that it is setting up the session.
+    pub fn connecting_detail(&self) -> Option<String> {
+        self.connect_detail.lock().unwrap().clone()
+    }
+
     /// Non-blocking [`select_speaker`]: runs the (seconds-long) session
     /// bring-up on a worker thread so the GUI stays responsive, exposing
     /// progress via [`connecting_to`] and failures via `record_error`.
@@ -2405,24 +2423,84 @@ impl App {
             let reach = crate::discovery_net::Reach { lan: &lan, reported: &discovery.memory().reported };
             crate::sonos::resolve_group_coordinator(new_r, &move |cid| d.find_by_id(cid), Some(reach))
         };
+        let settings_id = new_r.stable_id();
+        let session = self.start_upnp_session(new_r, &settings_id)?;
+        Ok(ActiveSession::Upnp(session))
+    }
+
+    /// Hand `r` the stream and start it playing: offer the stream
+    /// profiles chosen for it in turn (see [`Self::stream_offer`]),
+    /// remember the one it took under `settings_id`, and watch for it
+    /// fetching the stream.
+    fn start_upnp_session(&self, r: Renderer, settings_id: &str) -> Result<RendererSession, String> {
         // Grant the speaker's addresses in the stream gate (what privacy
-        // mode admits) BEFORE the SOAP handshake — it HEAD/GETs
-        // `/stream.raw` as soon as Play returns, while `self.session`
-        // still holds the old state.
+        // mode admits) BEFORE the SOAP handshake — it HEAD/GETs the
+        // stream while SetAVTransportURI and Play are answered, while
+        // `self.session` still holds the old state.
         // The grant moves into the session it produces; if bring-up
         // fails it drops on the error path and the gate forgets it.
         // (`stream_peers` includes the other Sonos group members' addresses
-        // resolved above, so the whole group is admitted, whichever unit
-        // ends up fetching.)
-        let grant = self.stream_gate.grant(new_r.stream_peers());
+        // resolved by the caller, so the whole group is admitted, whichever
+        // unit ends up fetching.)
+        let grant = self.stream_gate.grant(r.stream_peers());
         // The URLs the speaker calls back on carry the address this PC
         // has on the speaker's network, not the default-route one.
-        let local_ip = self.local_ip_toward(new_r.ip).map_err(|e| e.to_string())?;
-        let (stream_uri, callback_url) = local_urls(local_ip, self.config.bind.port());
-        let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms);
-        let session = start_session(new_r, &stream_uri, &didl, &callback_url, Some(grant))
-        .map_err(|e| format!("{:#}", e))?;
-        Ok(ActiveSession::Upnp(session))
+        let local_ip = self.local_ip_toward(r.ip).map_err(|e| e.to_string())?;
+        let (stream_base, callback_url) = local_urls(local_ip, self.config.bind.port());
+        let offer = self.stream_offer(&r, settings_id, stream_base);
+        let (name, ip, peers) = (r.display_name(), r.ip, r.stream_peers());
+        struct ClearDetail<'a>(&'a Mutex<Option<String>>);
+        impl Drop for ClearDetail<'_> {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = None;
+            }
+        }
+        let _clear = ClearDetail(&self.connect_detail);
+        let progress = |step: ConnectStep| *self.connect_detail.lock().unwrap() = step.text();
+        let Started { session, remember } = start_session(r, &offer, &callback_url, Some(grant), &progress)
+            .map_err(|e| self.upnp_failure_message(&name, ip, &e))?;
+        let mut settings = self.speaker_settings(settings_id);
+        if settings.upnp_stream_profile != remember {
+            settings.upnp_stream_profile = remember;
+            self.set_speaker_settings(settings_id, settings);
+        }
+        self.watch_first_fetch(name, peers, session.profile, session.stream_given_at, session.played_at);
+        Ok(session)
+    }
+
+    /// What `r` is offered (see [`stream_profile::plan`]): a Sonos the
+    /// original stream only; any other renderer the profile it played last
+    /// time (`settings_id`'s), if any, and the original stream, and when
+    /// those are refused, the types it lists.
+    fn stream_offer(&self, r: &Renderer, settings_id: &str, base_url: String) -> StreamOffer {
+        let remembered = if r.is_sonos() { None } else { self.speaker_settings(settings_id).upnp_stream_profile };
+        StreamOffer { base_url, remembered, initial_buffer_ms: self.config.initial_buffer_ms, budget: CONNECT_BUDGET }
+    }
+
+    /// Log when `name` comes for the stream it was given at `given_at`,
+    /// or warn when it hasn't by [`FETCH_EXPECTED_WITHIN`] after it
+    /// accepted Play at `played_at`: a renderer that took the URI and Play
+    /// may still never ask for it.
+    fn watch_first_fetch(&self, name: String, peers: Vec<IpAddr>, profile: StreamProfile, given_at: Instant, played_at: Instant) {
+        let hub = self.hub.clone();
+        let spawned = std::thread::Builder::new().name("stream-to-speaker-fetch-watch".into()).spawn(move || {
+            let wait = FETCH_EXPECTED_WITHIN.saturating_sub(played_at.elapsed());
+            match hub.wait_for_fetch(&peers, profile, given_at, wait) {
+                Some(f) => info!(
+                    "UPnP: {} started fetching the stream {:.1} s after it was given it",
+                    name,
+                    f.at.saturating_duration_since(given_at).as_secs_f32()
+                ),
+                None => warn!(
+                    "UPnP: {} accepted Play but hadn't fetched the stream {} s later; it may stay silent",
+                    name,
+                    FETCH_EXPECTED_WITHIN.as_secs()
+                ),
+            }
+        });
+        if let Err(e) = spawned {
+            debug!("not watching for {}'s stream fetch: {}", profile, e);
+        }
     }
 
     /// UPnP session to a speaker added by its device-description URL: the
@@ -2449,16 +2527,37 @@ impl App {
             None => r,
         };
         let redirected = r.udn != own_udn;
-        let grant = self.stream_gate.grant(r.stream_peers());
-        let local_ip = self.local_ip_toward(r.ip).map_err(|e| e.to_string())?;
-        let (stream_uri, callback_url) = local_urls(local_ip, self.config.bind.port());
-        let didl = upnp::didl_lite_metadata(&stream_uri, PRODUCT_NAME, self.config.initial_buffer_ms);
-        let mut session = start_session(r, &stream_uri, &didl, &callback_url, Some(grant))
-            .map_err(|e| format!("{:#}", e))?;
+        let settings_id = if redirected { r.stable_id() } else { m.id() };
+        let mut session = self.start_upnp_session(r, &settings_id)?;
         if !redirected {
             session.id_override = Some(m.id());
         }
         Ok(ActiveSession::Upnp(session))
+    }
+
+    /// What the person is told when starting the UPnP speaker `name` at
+    /// `ip` failed with `e`: the app's own words for what the speaker said
+    /// (see [`upnp::ActionError::for_person`]), or that it was too slow.
+    fn upnp_failure_message(&self, name: &str, ip: IpAddr, e: &StartError) -> String {
+        if let Some(budget) = e.out_of_time {
+            return format!(
+                "{name} was too slow to answer, so Stream To Speaker stopped trying after {}. Try again in a \
+                 moment; if it keeps happening, restart {name}.",
+                upnp::seconds(budget)
+            );
+        }
+        match e.error.downcast_ref::<upnp::ActionError>() {
+            Some(failure) => failure.for_person(name, self.has_airplay_entry_at(ip), e.formats_tried),
+            None => format!("{:#}", e.error),
+        }
+    }
+
+    /// Whether the speaker list has a usable AirPlay entry at `ip` (the
+    /// same device, reachable over AirPlay too).
+    fn has_airplay_entry_at(&self, ip: IpAddr) -> bool {
+        self.airplay_discovery
+            .as_ref()
+            .is_some_and(|d| d.renderers().iter().any(|r| r.ip == ip && r.transport().is_some()))
     }
 
     /// AirPlay session to a discovered receiver (`manual` None) or to one
@@ -3832,22 +3931,275 @@ impl App {
 // Session lifecycle helpers
 // -----------------------------------------------------------------------------
 
+/// How long after Play a renderer may take to come for the stream before
+/// that is worth a warning.
+const FETCH_EXPECTED_WITHIN: Duration = Duration::from_secs(10);
+
+/// How long a connect may take: every offer, retry and question to the
+/// speaker together. Each action's own limit (30 s for SetAVTransportURI
+/// and Play) still applies; the budget only takes the smaller.
+const CONNECT_BUDGET: Duration = Duration::from_secs(45);
+
+/// Budget a new offer needs to start. A speaker that turns an offer down
+/// at once does so in well under a second, so this only stops an offer
+/// after slow ones: with less left, a speaker that answers in a few
+/// seconds per action would be cut off by the budget anyway, and the
+/// person would be told nothing new.
+const MIN_LEFT_FOR_OFFER: Duration = Duration::from_secs(10);
+
+/// Budget the second Play after a 701 needs: half a second's pause, then
+/// a Play that a renderer which has finished taking the URI answers at
+/// once.
+const MIN_LEFT_FOR_RETRY: Duration = Duration::from_secs(5);
+
+/// An action with less budget than this is not sent: no answer could
+/// arrive in time.
+const MIN_LEFT_FOR_ACTION: Duration = Duration::from_millis(500);
+
+/// How long the speaker may keep the person waiting before the banner
+/// says it is waiting for the speaker.
+const WAITING_NOTICE_AFTER: Duration = Duration::from_secs(3);
+
+/// What a renderer is offered: this PC's stream address on its network
+/// (`http://<ip>:<port>`), the stream profile it played last time, if
+/// any, the metadata's buffer hint, and how long the connect may take
+/// ([`CONNECT_BUDGET`] in the app).
+pub struct StreamOffer {
+    pub base_url: String,
+    pub remembered: Option<StreamProfile>,
+    pub initial_buffer_ms: u32,
+    pub budget: Duration,
+}
+
+/// Why a renderer didn't start: its last answer, after this many stream
+/// profiles were offered. `out_of_time`: the connect's budget (this long)
+/// ran out before the speaker had answered.
+#[derive(Debug)]
+pub struct StartError {
+    pub error: anyhow::Error,
+    pub formats_tried: usize,
+    pub out_of_time: Option<Duration>,
+}
+
+/// Where a connect is, for the banner: which offer (0 is the first), and
+/// whether it has been waiting more than [`WAITING_NOTICE_AFTER`] for the
+/// speaker's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectStep {
+    pub offer: usize,
+    pub waiting: bool,
+}
+
+impl ConnectStep {
+    /// The banner's line under "Connecting to …", or None for the usual
+    /// one.
+    pub fn text(self) -> Option<String> {
+        let way = if self.offer >= 2 { "a third way" } else { "another way" };
+        match (self.offer, self.waiting) {
+            (0, false) => None,
+            (0, true) => Some("Waiting for the speaker to answer…".into()),
+            (1, false) => Some("The speaker didn't take the stream. Offering it another way…".into()),
+            (_, false) => Some("The speaker didn't take that either. Offering the stream a third way…".into()),
+            (_, true) => Some(format!("Offering the stream {way}. Waiting for the speaker to answer…")),
+        }
+    }
+}
+
+/// The time a connect has left.
+struct Budget {
+    until: Instant,
+}
+
+impl Budget {
+    fn left(&self) -> Duration {
+        self.until.saturating_duration_since(Instant::now())
+    }
+
+    /// `own`, shortened to what is left; None when too little is left to
+    /// send the action at all.
+    fn limits(&self, own: &crate::device_http::Limits) -> Option<crate::device_http::Limits> {
+        let left = self.left();
+        (left >= MIN_LEFT_FOR_ACTION).then(|| own.within(left))
+    }
+}
+
+/// The connect's budget ran out before an action could be sent.
+#[derive(Debug)]
+struct OutOfTime(&'static str);
+
+impl std::fmt::Display for OutOfTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: no time left to send it", self.0)
+    }
+}
+
+impl std::error::Error for OutOfTime {}
+
+/// Run one action of a connect. If the speaker keeps it waiting longer
+/// than [`WAITING_NOTICE_AFTER`], `progress` hears so, and hears again
+/// once the answer is in.
+fn waiting_on<T>(progress: &(dyn Fn(ConnectStep) + Sync), offer: usize, action: impl FnOnce() -> T) -> T {
+    let (done, finished) = crossbeam_channel::bounded::<()>(0);
+    std::thread::scope(|scope| {
+        let watcher = std::thread::Builder::new().name("stream-to-speaker-connect-notice".into()).spawn_scoped(scope, move || {
+            let late = finished.recv_timeout(WAITING_NOTICE_AFTER) == Err(crossbeam_channel::RecvTimeoutError::Timeout);
+            if late {
+                progress(ConnectStep { offer, waiting: true });
+            }
+            late
+        });
+        let result = action();
+        drop(done);
+        if watcher.ok().and_then(|w| w.join().ok()).unwrap_or(false) {
+            progress(ConnectStep { offer, waiting: false });
+        }
+        result
+    })
+}
+
+/// A started session, and what the speaker's settings should remember
+/// from now on (see [`stream_profile::to_remember`]).
+pub struct Started {
+    pub session: RendererSession,
+    pub remember: Option<StreamProfile>,
+}
+
+/// What a failed offer says about the profile offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Refused for its content: SetAVTransportURI with 714 (Illegal
+    /// MIME-type) or 716 (Resource not found); Play with 702 (No
+    /// contents), 703 (Read error), 704 (Format not supported for
+    /// playback), 714 or 716. Another profile may be taken.
+    Content,
+    /// Play refused without saying why (no UPnP code, or the generic
+    /// 501): another profile may be taken, but this says too little to
+    /// move the speaker off the original stream for good.
+    Unclear,
+    /// Anything else ends the connect: no answer (another profile won't
+    /// change that), the transport's state (701 after its retry, 705,
+    /// 715, 718: busy, locked, not ready), other codes.
+    End,
+}
+
+fn verdict(e: &anyhow::Error, at_play: bool) -> Verdict {
+    let Some(a) = e.downcast_ref::<upnp::ActionError>() else { return Verdict::End };
+    if !matches!(a.failure, upnp::Failure::Refused { .. }) {
+        return Verdict::End;
+    }
+    match (at_play, a.fault_code()) {
+        (false, Some(714 | 716)) => Verdict::Content,
+        (true, Some(702 | 703 | 704 | 714 | 716)) => Verdict::Content,
+        (true, None | Some(501)) => Verdict::Unclear,
+        _ => Verdict::End,
+    }
+}
+
+/// Start `renderer` playing the stream: each profile in turn (see
+/// [`stream_profile::Offers`]) gets a clean Stop, SetAVTransportURI and
+/// Play, until one is taken; a refusal of the profile moves on to the
+/// next, anything else ends the attempt. The renderer is asked which types
+/// it plays only when an offer depends on that. Then subscribe to its
+/// volume events.
 pub fn start_session(
     renderer: Renderer,
-    stream_uri: &str,
-    didl: &str,
+    offer: &StreamOffer,
     callback_url: &str,
     stream_grant: Option<Grant>,
-) -> Result<RendererSession> {
-    info!("targeting speaker: {} ({})", renderer.display_name(), renderer.ip);
-    // Stop first to clear any "Transport Locked" (Sonos 705) carry-over.
-    let _ = upnp::stop(&renderer.av_transport_control_url);
-    std::thread::sleep(Duration::from_millis(100));
-    upnp::set_av_transport_uri(&renderer.av_transport_control_url, stream_uri, didl)
-        .context("SetAVTransportURI")?;
-    std::thread::sleep(Duration::from_millis(100));
-    upnp::play(&renderer.av_transport_control_url).context("Play")?;
+    progress: &(dyn Fn(ConnectStep) + Sync),
+) -> Result<Started, StartError> {
+    let name = renderer.display_name();
+    info!("targeting speaker: {} ({})", name, renderer.ip);
+    let budget = Budget { until: Instant::now() + offer.budget };
+    let avt = renderer.av_transport_control_url.as_str();
+    let ask = || match (&renderer.connection_manager_control_url, budget.limits(&upnp::PROTOCOL_LIST)) {
+        (Some(url), Some(limits)) => match upnp::get_protocol_info(url, &limits) {
+            Ok(list) => Sinks::Listed(list),
+            Err(e) => {
+                debug!("UPnP: {}: no list of the types it plays: {:#}", name, e);
+                Sinks::Unknown
+            }
+        },
+        _ => Sinks::Unknown,
+    };
+    let mut offers = stream_profile::Offers::new(renderer.is_sonos(), offer.remembered);
+    let mut current = offers.get(0, &ask);
+    if let Some((profile, why)) = current {
+        info!("UPnP: {}: offering {}, because {}", name, profile, why);
+    }
+    let mut taken = None;
+    // The original stream refused for its content in this connect: the
+    // only reason to remember another profile.
+    let mut original_refused = false;
+    let mut i = 0;
+    while let Some((profile, _)) = current {
+        let uri = format!("{}{}", offer.base_url, profile.path());
+        let didl = upnp::didl_lite_metadata(&uri, PRODUCT_NAME, offer.initial_buffer_ms, profile);
+        // Stop first to clear any "Transport Locked" (Sonos 705)
+        // carry-over, and what an offer before this one left.
+        if let Some(limits) = budget.limits(&upnp::SHORT) {
+            let _ = waiting_on(progress, i, || upnp::stop_within(avt, &limits));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let given_at = Instant::now();
+        let mut at_play = false;
+        let started = (|| {
+            let limits = budget.limits(&upnp::TRANSPORT).ok_or(OutOfTime("SetAVTransportURI"))?;
+            waiting_on(progress, i, || upnp::set_av_transport_uri(avt, &uri, &didl, &limits))?;
+            at_play = true;
+            std::thread::sleep(Duration::from_millis(100));
+            play_taken_uri(avt, &budget, progress, i)
+        })();
+        let e = match started {
+            Ok(()) => {
+                info!("UPnP: {} took {}", name, profile);
+                taken = Some((profile, uri, given_at, Instant::now()));
+                break;
+            }
+            Err(e) => e,
+        };
+        let out_of_time = (e.downcast_ref::<OutOfTime>().is_some()
+            || (budget.left() < MIN_LEFT_FOR_ACTION && no_answer_in_time(&e)))
+        .then_some(offer.budget);
+        let verdict = verdict(&e, at_play);
+        if profile == StreamProfile::Legacy && verdict == Verdict::Content {
+            original_refused = true;
+        }
+        let moving_on = verdict != Verdict::End && offers.has(i + 1) && budget.left() >= MIN_LEFT_FOR_OFFER;
+        let next = if moving_on {
+            progress(ConnectStep { offer: i + 1, waiting: false });
+            waiting_on(progress, i + 1, || offers.get(i + 1, &ask))
+        } else {
+            None
+        };
+        match next {
+            Some((next, why)) => {
+                info!("UPnP: {} didn't take {}: {:#}; offering {}, because {}", name, profile, e, next, why);
+                current = Some((next, why));
+                i += 1;
+            }
+            None => {
+                // The renderer may hold our URI and still start on it:
+                // tell it to let go, so a failure reported here is not a
+                // speaker playing. Best-effort, with Stop's own limit:
+                // this is cleaning up, not a step of the connect.
+                if at_play {
+                    let _ = upnp::stop(avt);
+                }
+                // The speaker's own answer, in full, for whoever reads the
+                // log.
+                warn!("UPnP: {} ({}): {:#}", name, renderer.ip, e);
+                return Err(StartError { error: e, formats_tried: i + 1, out_of_time });
+            }
+        }
+    }
+    let Some((profile, stream_uri, stream_given_at, played_at)) = taken else {
+        return Err(StartError { error: anyhow!("no stream profile to offer"), formats_tried: 0, out_of_time: None });
+    };
 
+    // Volume events, with SUBSCRIBE's own limit: the speaker is playing,
+    // and a subscription cut short by the budget would leave the whole
+    // session without volume sync.
     let gena = GenaManager::new(callback_url.to_string());
     // Groups subscribe to GroupRenderingControl (GroupVolume events —
     // the group slider), standalone speakers to RenderingControl.
@@ -3860,13 +4212,43 @@ pub fn start_session(
         }
     }
 
-    Ok(RendererSession {
+    let session = RendererSession {
         renderer,
         gena,
-        stream_uri: stream_uri.to_string(),
+        stream_uri,
         stream_grant,
         id_override: None,
-    })
+        profile,
+        stream_given_at,
+        played_at,
+    };
+    Ok(Started { session, remember: stream_profile::to_remember(offer.remembered, profile, original_refused) })
+}
+
+/// How long a renderer that is still taking the URI gets before Play is
+/// sent again.
+const PLAY_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// Play, right after the renderer accepted our URI, within the connect's
+/// budget. A renderer still busy taking it answers 701 ("Transition not
+/// available"), so that answer gets Play once more after a moment, when
+/// the budget leaves room for it.
+fn play_taken_uri(avt: &str, budget: &Budget, progress: &(dyn Fn(ConnectStep) + Sync), offer: usize) -> Result<()> {
+    let limits = budget.limits(&upnp::TRANSPORT).ok_or(OutOfTime("Play"))?;
+    let mut result = waiting_on(progress, offer, || upnp::play_within(avt, &limits));
+    if result.as_ref().err().and_then(upnp::fault_code) == Some(701) && budget.left() >= MIN_LEFT_FOR_RETRY {
+        std::thread::sleep(PLAY_RETRY_WAIT);
+        if let Some(limits) = budget.limits(&upnp::TRANSPORT) {
+            result = waiting_on(progress, offer, || upnp::play_within(avt, &limits));
+        }
+    }
+    result
+}
+
+/// Whether `e` is an action the speaker didn't answer in time.
+fn no_answer_in_time(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<upnp::ActionError>()
+        .is_some_and(|a| matches!(a.failure, upnp::Failure::NoAnswer(crate::device_http::HttpError::NoAnswer(_))))
 }
 
 pub fn stop_session(session: &RendererSession) {
@@ -3907,14 +4289,15 @@ pub fn route_source_ip(peer: IpAddr) -> Option<IpAddr> {
     (!ip.is_unspecified()).then_some(ip)
 }
 
-/// `/stream.raw` and `/gena` URLs on `ip`.
+/// The stream server's base URL (a stream profile's path goes after it)
+/// and the `/gena` callback URL, on `ip`.
 fn local_urls(ip: IpAddr, port: u16) -> (String, String) {
     let host = match ip {
         IpAddr::V6(v6) => format!("[{}]", v6),
         IpAddr::V4(v4) => v4.to_string(),
     };
     (
-        format!("http://{}:{}/stream.raw", host, port),
+        format!("http://{}:{}", host, port),
         format!("http://{}:{}/gena", host, port),
     )
 }
@@ -3955,10 +4338,10 @@ mod tests {
     #[test]
     fn local_urls_bracket_ipv6_hosts() {
         let (s, c) = local_urls("192.168.2.100".parse().unwrap(), 8080);
-        assert_eq!(s, "http://192.168.2.100:8080/stream.raw");
+        assert_eq!(s, "http://192.168.2.100:8080");
         assert_eq!(c, "http://192.168.2.100:8080/gena");
         let (s, _) = local_urls("fe80::1".parse().unwrap(), 8080);
-        assert_eq!(s, "http://[fe80::1]:8080/stream.raw");
+        assert_eq!(format!("{s}{}", StreamProfile::Legacy.path()), "http://[fe80::1]:8080/stream.raw");
     }
 
     #[test]
@@ -4099,6 +4482,7 @@ mod tests {
                 rendering_control_control_url: control_url.into(),
                 rendering_control_event_url: String::new(),
                 av_transport_event_url: None,
+                connection_manager_control_url: None,
                 udn: Some("uuid:kitchen".into()),
                 zone_group_topology_control_url: None,
                 group_rendering_control_control_url: None,
@@ -4114,7 +4498,547 @@ mod tests {
             stream_uri: String::new(),
             stream_grant: None,
             id_override: None,
+            profile: StreamProfile::Legacy,
+            stream_given_at: Instant::now(),
+            played_at: Instant::now(),
         })
+    }
+
+    /// A Sonos whose every service is on `fake`: it is offered the
+    /// original stream only, so one offer is all a test of it sees.
+    fn sonos_on(fake: &crate::fake_renderer::FakeRenderer) -> Renderer {
+        let ActiveSession::Upnp(s) = upnp_session(&fake.url("/RenderingControl/Control")) else { unreachable!() };
+        Renderer {
+            base_url: fake.url(""),
+            av_transport_control_url: fake.url("/AVTransport/Control"),
+            rendering_control_event_url: fake.url("/RenderingControl/Event"),
+            zone_group_topology_control_url: Some(fake.url("/ZoneGroupTopology/Control")),
+            ..s.renderer
+        }
+    }
+
+    /// Nothing remembered, the app's own budget.
+    fn first_offer() -> StreamOffer {
+        StreamOffer { base_url: "http://127.0.0.1:1".into(), remembered: None, initial_buffer_ms: 0, budget: CONNECT_BUDGET }
+    }
+
+    /// A renderer (not a Sonos) whose every service is on `fake`.
+    fn renderer_on(fake: &crate::fake_renderer::FakeRenderer) -> Renderer {
+        Renderer { zone_group_topology_control_url: None, ..sonos_on(fake) }
+    }
+
+    /// Progress reports a connect made, in order.
+    fn steps_of(f: impl FnOnce(&(dyn Fn(ConnectStep) + Sync))) -> Vec<ConnectStep> {
+        let seen = Mutex::new(Vec::new());
+        f(&|step| seen.lock().unwrap().push(step));
+        seen.into_inner().unwrap()
+    }
+
+    #[test]
+    fn no_further_offer_starts_when_the_budget_is_nearly_spent() {
+        use crate::fake_renderer::{FakeRenderer, Reply, AV_TRANSPORT};
+        let fake = FakeRenderer::start(|req| match req.soap_action() {
+            Some("SetAVTransportURI") => Reply::soap_fault(714, "Illegal MIME-type"),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None => Reply::status(404, "Not Found", &[], ""),
+        });
+        // Less than an offer's worth of budget once the first is refused.
+        let offer = StreamOffer { budget: Duration::from_secs(5), ..first_offer() };
+        let e = start_session(renderer_on(&fake), &offer, "http://127.0.0.1:1/gena", None, &|_| {}).err().unwrap();
+        assert_eq!(e.formats_tried, 1);
+        assert_eq!(e.out_of_time, None);
+        assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI"]);
+    }
+
+    #[test]
+    fn a_speaker_that_never_answers_costs_no_more_than_the_budget() {
+        use crate::fake_renderer::{FakeRenderer, Reply, AV_TRANSPORT};
+        let fake = FakeRenderer::start(|req| match req.soap_action() {
+            Some("SetAVTransportURI") => Reply::silent(),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None => Reply::status(404, "Not Found", &[], ""),
+        });
+        let offer = StreamOffer { budget: Duration::from_millis(1500), ..first_offer() };
+        let start = Instant::now();
+        let e = start_session(renderer_on(&fake), &offer, "http://127.0.0.1:1/gena", None, &|_| {}).err().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(15), "{:?}", start.elapsed());
+        assert_eq!(e.out_of_time, Some(Duration::from_millis(1500)), "{:#}", e.error);
+        let app = test_app();
+        assert_eq!(
+            app.upnp_failure_message("Kitchen", "127.0.0.1".parse().unwrap(), &e),
+            "Kitchen was too slow to answer, so Stream To Speaker stopped trying after 1.5 seconds. Try again in a \
+             moment; if it keeps happening, restart Kitchen."
+        );
+    }
+
+    #[test]
+    fn a_slow_answer_and_another_offer_are_reported_as_they_happen() {
+        use crate::fake_renderer::{FakeRenderer, Reply, AV_TRANSPORT};
+        let sets = Mutex::new(0);
+        let fake = FakeRenderer::start(move |req| match req.soap_action() {
+            Some("SetAVTransportURI") => {
+                let mut n = sets.lock().unwrap();
+                *n += 1;
+                match *n {
+                    1 => Reply::soap_fault(714, "Illegal MIME-type"),
+                    // The second offer: answered late.
+                    _ => Reply::soap_ok(AV_TRANSPORT, "SetAVTransportURI", &[]).after(Duration::from_millis(3500)),
+                }
+            }
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None if req.method == "GET" => Reply::status(404, "Not Found", &[], ""),
+            None => Reply::raw("HTTP/1.1 200 OK\r\nSID: uuid:steps\r\nTIMEOUT: Second-1800\r\nContent-Length: 0\r\n\r\n"),
+        });
+        let steps = steps_of(|progress| {
+            let started = start_session(renderer_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None, progress).unwrap();
+            started.session.gena.unsubscribe();
+        });
+        crate::gena::registry().remove("uuid:steps");
+        assert_eq!(
+            steps,
+            [
+                ConnectStep { offer: 1, waiting: false },
+                ConnectStep { offer: 1, waiting: true },
+                ConnectStep { offer: 1, waiting: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_reads_as_what_is_happening() {
+        let text = |offer, waiting| ConnectStep { offer, waiting }.text();
+        assert_eq!(text(0, false), None);
+        assert_eq!(text(0, true).as_deref(), Some("Waiting for the speaker to answer…"));
+        assert_eq!(text(1, false).as_deref(), Some("The speaker didn't take the stream. Offering it another way…"));
+        assert_eq!(text(1, true).as_deref(), Some("Offering the stream another way. Waiting for the speaker to answer…"));
+        assert_eq!(text(2, false).as_deref(), Some("The speaker didn't take that either. Offering the stream a third way…"));
+        assert_eq!(text(2, true).as_deref(), Some("Offering the stream a third way. Waiting for the speaker to answer…"));
+    }
+
+    /// A renderer that answers each AVTransport action with `play`'s
+    /// answers to Play in turn (then success) and accepts the rest.
+    fn renderer_answering_play(play: Vec<crate::fake_renderer::Reply>) -> crate::fake_renderer::FakeRenderer {
+        use crate::fake_renderer::{FakeRenderer, Reply, AV_TRANSPORT};
+        let play = Mutex::new(play.into_iter());
+        FakeRenderer::start(move |req| match req.soap_action() {
+            Some("Play") => play.lock().unwrap().next().unwrap_or_else(|| Reply::soap_ok(AV_TRANSPORT, "Play", &[])),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            // GENA SUBSCRIBE / UNSUBSCRIBE.
+            None => Reply::raw("HTTP/1.1 200 OK\r\nSID: uuid:fake-session\r\nTIMEOUT: Second-1800\r\nContent-Length: 0\r\n\r\n"),
+        })
+    }
+
+    #[test]
+    fn a_play_refused_after_the_uri_was_taken_is_followed_by_stop() {
+        use crate::fake_renderer::Reply;
+        let fake = renderer_answering_play(vec![Reply::soap_fault(704, "Playing failed")]);
+        let r = start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None, &|_| {});
+        assert!(r.is_err());
+        // The renderer holds our URI; it is told to let go of it.
+        assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Stop"]);
+    }
+
+    #[test]
+    fn play_answered_transition_not_available_is_tried_once_more() {
+        use crate::fake_renderer::Reply;
+        // 701: the renderer is still busy taking the URI.
+        let fake = renderer_answering_play(vec![Reply::soap_fault(701, "Transition not available")]);
+        let session = start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None, &|_| {})
+            .expect("the second Play is accepted")
+            .session;
+        assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Play"]);
+        session.gena.unsubscribe();
+        crate::gena::registry().remove("uuid:fake-session");
+
+        // Refused twice: given up, and the renderer is stopped.
+        let fake = renderer_answering_play(vec![
+            Reply::soap_fault(701, "Transition not available"),
+            Reply::soap_fault(701, "Transition not available"),
+        ]);
+        assert!(start_session(sonos_on(&fake), &first_offer(), "http://127.0.0.1:1/gena", None, &|_| {}).is_err());
+        assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Play", "Stop"]);
+    }
+
+    /// A speaker added by the address of `fake`'s description.
+    fn manual_upnp(fake: &crate::fake_renderer::FakeRenderer) -> ManualSpeaker {
+        ManualSpeaker { kind: ManualKind::Upnp, name: String::new(), host: fake.url("/description.xml"), port: 0 }
+    }
+
+    #[test]
+    fn a_refused_connect_tells_the_person_why_in_the_apps_words() {
+        use crate::fake_renderer::{renderer_description, FakeRenderer, Reply, AV_TRANSPORT};
+        let fake = FakeRenderer::start(|req| match req.soap_action() {
+            Some("SetAVTransportURI") => Reply::soap_fault(714, "Illegal MIME-type"),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None => Reply::ok(&renderer_description("Den Amp", &[])),
+        });
+        let app = serving_app();
+        let Err(msg) = app.start_upnp_manual(&manual_upnp(&fake)) else { panic!("connected") };
+        // It lists no types, so it is offered three in turn.
+        assert_eq!(
+            msg,
+            "Den Amp didn't take the stream in any of the 3 ways Stream To Speaker offered it. \
+             (Den Amp answered: UPnP error 714, \"Illegal MIME-type\".)"
+        );
+    }
+
+    // ---- stream profiles, end to end ----------------------------------
+
+    /// An app whose HTTP server is up on loopback, so a renderer can fetch
+    /// what it is given, and whose settings stay in memory.
+    fn serving_app() -> Arc<App> {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let app = App::new(
+            AppConfig {
+                advertise_ip: "127.0.0.1".into(),
+                advertise_ip_explicit: false,
+                bind: SocketAddr::from(([127, 0, 0, 1], port)),
+                initial_buffer_ms: 0,
+                silence_packets_threshold: 0,
+                no_silence_injection: false,
+                no_discovery: true,
+                web_enabled: false,
+                ssdp_iface: None,
+            },
+            None,
+            None,
+        );
+        *app.user_config.lock().unwrap() = UserConfig::in_memory();
+        crate::http_server::start_http_server(crate::http_server::HttpServerConfig::minimal(app.config.bind, app.hub.clone()))
+            .unwrap();
+        app
+    }
+
+    /// What a renderer that checks the stream saw of it.
+    #[derive(Default, Debug)]
+    struct Probed {
+        /// Each URI it was given, the type its metadata named, and the
+        /// type a HEAD of it answered with.
+        offered: Vec<(String, String, String)>,
+        /// The type each GET of the stream it plays answered with.
+        fetched: Vec<String>,
+    }
+
+    /// The `Content-Type` of `method uri`, from our own server.
+    fn stream_type(method: &str, uri: &str) -> String {
+        use std::io::{Read, Write};
+        let url = url::Url::parse(uri).unwrap();
+        let mut s = std::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let host = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap());
+        s.write_all(
+            format!("{method} {} HTTP/1.1\r\nHost: {host}\r\ngetContentFeatures.dlna.org: 1\r\nConnection: close\r\n\r\n", url.path())
+                .as_bytes(),
+        )
+        .unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+            head.push(b[0]);
+        }
+        let head = String::from_utf8_lossy(&head).into_owned();
+        head.split("\r\n").find_map(|l| l.strip_prefix("Content-Type: ")).unwrap_or("").to_string()
+    }
+
+    /// A renderer like #117's KEF LSX II LT: its ConnectionManager lists
+    /// `sinks` (None: it has none), it takes a URI only when a HEAD of it
+    /// answers with a type in `plays`, and on Play it fetches the stream.
+    /// `more`: further services in its description.
+    fn strict_renderer(
+        sinks: Option<&'static str>,
+        plays: &'static [&'static str],
+        more: &'static [&'static str],
+    ) -> (crate::fake_renderer::FakeRenderer, Arc<Mutex<Probed>>) {
+        use crate::fake_renderer::{renderer_description, FakeRenderer, Reply, AV_TRANSPORT, CONNECTION_MANAGER};
+        let probed = Arc::new(Mutex::new(Probed::default()));
+        let seen = probed.clone();
+        let current = Mutex::new(String::new());
+        let fake = FakeRenderer::start(move |req| match req.soap_action() {
+            Some("GetProtocolInfo") => match sinks {
+                Some(list) => Reply::soap_ok(CONNECTION_MANAGER, "GetProtocolInfo", &[("Source", ""), ("Sink", list)]),
+                None => Reply::status(404, "Not Found", &[], ""),
+            },
+            Some("SetAVTransportURI") => {
+                let uri = req.soap_arg("CurrentURI").unwrap();
+                let didl = req.soap_arg("CurrentURIMetaData").unwrap();
+                let doc = roxmltree::Document::parse(&didl).unwrap();
+                let info = doc.descendants().find(|n| n.tag_name().name() == "res").unwrap().attribute("protocolInfo").unwrap();
+                let didl_type = info.split(':').nth(2).unwrap().to_string();
+                let head_type = stream_type("HEAD", &uri);
+                seen.lock().unwrap().offered.push((uri.clone(), didl_type, head_type.clone()));
+                if plays.iter().any(|t| t.eq_ignore_ascii_case(&head_type)) {
+                    *current.lock().unwrap() = uri;
+                    Reply::soap_ok(AV_TRANSPORT, "SetAVTransportURI", &[])
+                } else {
+                    Reply::soap_fault(714, "Illegal MIME-type")
+                }
+            }
+            Some("Play") => {
+                let uri = current.lock().unwrap().clone();
+                seen.lock().unwrap().fetched.push(stream_type("GET", &uri));
+                Reply::soap_ok(AV_TRANSPORT, "Play", &[])
+            }
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None if req.method == "GET" => Reply::ok(&renderer_description("Den Amp", more)),
+            // GENA SUBSCRIBE / UNSUBSCRIBE.
+            None => Reply::raw("HTTP/1.1 200 OK\r\nSID: uuid:strict\r\nTIMEOUT: Second-1800\r\nContent-Length: 0\r\n\r\n"),
+        });
+        (fake, probed)
+    }
+
+    /// The stream paths a renderer was offered, in order.
+    fn offered_paths(probed: &Mutex<Probed>) -> Vec<String> {
+        probed.lock().unwrap().offered.iter().map(|(uri, _, _)| url::Url::parse(uri).unwrap().path().to_string()).collect()
+    }
+
+    fn end(session: ActiveSession) {
+        session.stop();
+        crate::gena::registry().remove("uuid:strict");
+    }
+
+    #[test]
+    fn a_renderer_that_checks_the_type_gets_one_it_lists_on_head_get_and_metadata_alike() {
+        // #117: KEF LSX II LT, firmware 2.2.91.
+        let (fake, probed) = strict_renderer(
+            Some("http-get:*:audio/wav:*,http-get:*:audio/wave:*,http-get:*:audio/x-wav:*,http-get:*:audio/mpeg:*"),
+            &["audio/wav", "audio/wave", "audio/x-wav"],
+            &["ConnectionManager"],
+        );
+        let app = serving_app();
+        let m = manual_upnp(&fake);
+        let session = app.start_upnp_manual(&m).expect("the speaker plays");
+        let p = probed.lock().unwrap();
+        // The original stream first, refused at once; then a type it lists.
+        let paths: Vec<String> = p.offered.iter().map(|(uri, _, _)| url::Url::parse(uri).unwrap().path().to_string()).collect();
+        assert_eq!(paths, ["/stream.raw", "/wav/stream.wav"]);
+        let (uri, didl_type, head_type) = &p.offered[1];
+        assert!(uri.ends_with("/wav/stream.wav"), "{uri}");
+        assert_eq!((didl_type.as_str(), head_type.as_str()), ("audio/wav", "audio/wav"));
+        assert_eq!(p.fetched, ["audio/wav"]);
+        drop(p);
+        // Its list was asked for only after the refusal.
+        let actions: Vec<String> = fake.soap_actions();
+        assert_eq!(actions, ["Stop", "SetAVTransportURI", "GetProtocolInfo", "Stop", "SetAVTransportURI", "Play"]);
+        let ActiveSession::Upnp(s) = &session else { unreachable!() };
+        assert_eq!(s.profile, StreamProfile::Wav);
+        end(session);
+        // Remembered: the next connect plays at the first offer, unasked.
+        probed.lock().unwrap().offered.clear();
+        let before = fake.soap_actions().len();
+        let session = app.start_upnp_manual(&m).unwrap();
+        assert_eq!(offered_paths(&probed), ["/wav/stream.wav"]);
+        assert_eq!(fake.soap_actions()[before..], ["Stop", "SetAVTransportURI", "Play"]);
+        end(session);
+    }
+
+    #[test]
+    fn a_renderer_that_takes_the_original_stream_gets_exactly_the_requests_it_always_got() {
+        // It has a ConnectionManager, and is never asked anything of it.
+        let (fake, probed) = strict_renderer(
+            Some("http-get:*:audio/wav:*"),
+            &["audio/vnd.wave;codec=1", "audio/wav"],
+            &["ConnectionManager"],
+        );
+        let app = serving_app();
+        let session = app.start_upnp_manual(&manual_upnp(&fake)).expect("the speaker plays");
+        let seen: Vec<(String, String, Option<String>)> = fake
+            .requests()
+            .iter()
+            .map(|r| (r.method.clone(), r.target.clone(), r.soap_action().map(str::to_string)))
+            .collect();
+        let req = |m: &str, t: &str, a: Option<&str>| (m.to_string(), t.to_string(), a.map(str::to_string));
+        assert_eq!(
+            seen,
+            [
+                req("GET", "/description.xml", None),
+                req("POST", "/AVTransport/Control", Some("Stop")),
+                req("POST", "/AVTransport/Control", Some("SetAVTransportURI")),
+                req("POST", "/AVTransport/Control", Some("Play")),
+                req("SUBSCRIBE", "/RenderingControl/Event", None),
+            ]
+        );
+        let p = probed.lock().unwrap();
+        let (uri, didl_type, head_type) = &p.offered[0];
+        assert!(uri.ends_with("/stream.raw"), "{uri}");
+        assert_eq!((didl_type.as_str(), head_type.as_str()), ("audio/wav", "audio/vnd.wave;codec=1"));
+        drop(p);
+        let ActiveSession::Upnp(s) = &session else { unreachable!() };
+        assert_eq!(s.profile, StreamProfile::Legacy);
+        end(session);
+    }
+
+    #[test]
+    fn without_a_list_the_original_stream_comes_first_and_the_next_follows_a_refusal() {
+        let (fake, probed) = strict_renderer(None, &["audio/L16;rate=44100;channels=2"], &[]);
+        let app = serving_app();
+        let session = app.start_upnp_manual(&manual_upnp(&fake)).expect("the third profile plays");
+        assert_eq!(offered_paths(&probed), ["/stream.raw", "/wav/stream.wav", "/l16/stream.raw"]);
+        assert_eq!(probed.lock().unwrap().fetched, ["audio/L16;rate=44100;channels=2"]);
+        // Each attempt a clean Stop, SetAVTransportURI, Play.
+        let actions: Vec<String> = fake.soap_actions().into_iter().filter(|a| a != "GetProtocolInfo").collect();
+        assert_eq!(actions, ["Stop", "SetAVTransportURI", "Stop", "SetAVTransportURI", "Stop", "SetAVTransportURI", "Play"]);
+        end(session);
+    }
+
+    #[test]
+    fn a_renderer_refusing_everything_costs_three_attempts() {
+        let (fake, probed) = strict_renderer(None, &["audio/flac"], &[]);
+        let app = serving_app();
+        let Err(msg) = app.start_upnp_manual(&manual_upnp(&fake)) else { panic!("connected") };
+        assert_eq!(offered_paths(&probed).len(), 3);
+        assert_eq!(
+            msg,
+            "Den Amp didn't take the stream in any of the 3 ways Stream To Speaker offered it. \
+             (Den Amp answered: UPnP error 714, \"Illegal MIME-type\".)"
+        );
+    }
+
+    #[test]
+    fn a_sonos_gets_the_original_stream_and_nothing_else() {
+        let (fake, probed) = strict_renderer(Some("http-get:*:audio/wav:*"), &[], &["ZoneGroupTopology", "ConnectionManager"]);
+        let app = serving_app();
+        assert!(app.start_upnp_manual(&manual_upnp(&fake)).is_err());
+        assert_eq!(offered_paths(&probed), ["/stream.raw"]);
+        // Never asked for its list.
+        assert!(!fake.soap_actions().iter().any(|a| a == "GetProtocolInfo"), "{:?}", fake.soap_actions());
+        let p = probed.lock().unwrap();
+        assert_eq!((p.offered[0].1.as_str(), p.offered[0].2.as_str()), ("audio/wav", "audio/vnd.wave;codec=1"));
+    }
+
+    #[test]
+    fn the_profile_a_speaker_played_is_where_it_starts_next_time() {
+        let (fake, probed) = strict_renderer(None, &["audio/wav"], &[]);
+        let app = serving_app();
+        let m = manual_upnp(&fake);
+        let session = app.start_upnp_manual(&m).unwrap();
+        assert_eq!(offered_paths(&probed), ["/stream.raw", "/wav/stream.wav"]);
+        assert_eq!(app.speaker_settings(&m.id()).upnp_stream_profile, Some(StreamProfile::Wav));
+        end(session);
+        probed.lock().unwrap().offered.clear();
+        let session = app.start_upnp_manual(&m).unwrap();
+        assert_eq!(offered_paths(&probed), ["/wav/stream.wav"]);
+        end(session);
+    }
+
+    /// A renderer that lists `audio/wav`, takes every URI, and answers
+    /// Play with what `play` gives for the stream path it holds (None:
+    /// it plays); `set` likewise for SetAVTransportURI.
+    fn renderer_answering_by_path(
+        set: impl Fn(&str) -> Option<crate::fake_renderer::Reply> + Send + Sync + 'static,
+        play: impl Fn(&str) -> Option<crate::fake_renderer::Reply> + Send + Sync + 'static,
+    ) -> crate::fake_renderer::FakeRenderer {
+        use crate::fake_renderer::{renderer_description, FakeRenderer, Reply, AV_TRANSPORT, CONNECTION_MANAGER};
+        let current = Mutex::new(String::new());
+        FakeRenderer::start(move |req| match req.soap_action() {
+            Some("GetProtocolInfo") => {
+                Reply::soap_ok(CONNECTION_MANAGER, "GetProtocolInfo", &[("Source", ""), ("Sink", "http-get:*:audio/wav:*")])
+            }
+            Some("SetAVTransportURI") => {
+                let path = url::Url::parse(&req.soap_arg("CurrentURI").unwrap()).unwrap().path().to_string();
+                let answer = set(&path);
+                if answer.is_none() {
+                    *current.lock().unwrap() = path;
+                }
+                answer.unwrap_or_else(|| Reply::soap_ok(AV_TRANSPORT, "SetAVTransportURI", &[]))
+            }
+            Some("Play") => play(&current.lock().unwrap()).unwrap_or_else(|| Reply::soap_ok(AV_TRANSPORT, "Play", &[])),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None if req.method == "GET" => Reply::ok(&renderer_description("Den Amp", &["ConnectionManager"])),
+            None => Reply::raw("HTTP/1.1 200 OK\r\nSID: uuid:strict\r\nTIMEOUT: Second-1800\r\nContent-Length: 0\r\n\r\n"),
+        })
+    }
+
+    /// The stream paths a renderer was given, in order.
+    fn given_paths(fake: &crate::fake_renderer::FakeRenderer) -> Vec<String> {
+        fake.requests()
+            .iter()
+            .filter(|r| r.soap_action() == Some("SetAVTransportURI"))
+            .map(|r| url::Url::parse(&r.soap_arg("CurrentURI").unwrap()).unwrap().path().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_refusal_about_the_transports_state_ends_the_connect() {
+        use crate::fake_renderer::Reply;
+        for code in [701, 705, 715, 718] {
+            let fake = renderer_answering_by_path(|_| None, move |_| Some(Reply::soap_fault(code, "Not now")));
+            let app = serving_app();
+            let Err(msg) = app.start_upnp_manual(&manual_upnp(&fake)) else { panic!("{code}: connected") };
+            assert_eq!(given_paths(&fake), ["/stream.raw"], "{code}");
+            assert!(!fake.soap_actions().iter().any(|a| a == "GetProtocolInfo"), "{code}");
+            assert!(msg.starts_with("Den Amp isn't ready to take the stream. Try again in a moment."), "{code}: {msg}");
+            assert_eq!(app.speaker_settings(&manual_upnp(&fake).id()).upnp_stream_profile, None);
+        }
+    }
+
+    #[test]
+    fn a_refusal_naming_the_content_moves_on_and_what_plays_is_remembered() {
+        use crate::fake_renderer::Reply;
+        let fake = renderer_answering_by_path(|_| None, |path| (path == "/stream.raw").then(|| Reply::soap_fault(704, "Format not supported")));
+        let app = serving_app();
+        let m = manual_upnp(&fake);
+        let session = app.start_upnp_manual(&m).expect("the second offer plays");
+        assert_eq!(given_paths(&fake), ["/stream.raw", "/wav/stream.wav"]);
+        assert_eq!(app.speaker_settings(&m.id()).upnp_stream_profile, Some(StreamProfile::Wav));
+        end(session);
+    }
+
+    #[test]
+    fn after_a_generic_refusal_what_plays_serves_this_session_only() {
+        use crate::fake_renderer::Reply;
+        for refusal in [Reply::status(500, "Internal Server Error", &[], ""), Reply::soap_fault(501, "Action Failed")] {
+            let fake = renderer_answering_by_path(|_| None, move |path| (path == "/stream.raw").then(|| refusal.clone()));
+            let app = serving_app();
+            let m = manual_upnp(&fake);
+            let session = app.start_upnp_manual(&m).expect("the second offer plays");
+            assert_eq!(given_paths(&fake), ["/stream.raw", "/wav/stream.wav"]);
+            let ActiveSession::Upnp(s) = &session else { unreachable!() };
+            assert_eq!(s.profile, StreamProfile::Wav);
+            assert_eq!(app.speaker_settings(&m.id()), SpeakerSettings::default(), "nothing saved");
+            end(session);
+        }
+    }
+
+    #[test]
+    fn the_original_stream_is_never_stored_and_a_refused_memory_is_cleared() {
+        let fake = renderer_answering_by_path(|_| None, |_| None);
+        let app = serving_app();
+        let m = manual_upnp(&fake);
+        // Plays at once: nothing to write.
+        let session = app.start_upnp_manual(&m).unwrap();
+        end(session);
+        assert!(!app.user_config.lock().unwrap().speaker_settings.contains_key(&m.id()));
+
+        // Remembered, then refused: the original stream plays, and the
+        // memory goes.
+        use crate::fake_renderer::Reply;
+        let fake = renderer_answering_by_path(|path| (path == "/wav/stream.wav").then(|| Reply::soap_fault(714, "Illegal MIME-type")), |_| None);
+        let m = manual_upnp(&fake);
+        app.set_speaker_settings(&m.id(), SpeakerSettings { upnp_stream_profile: Some(StreamProfile::Wav), ..Default::default() });
+        let session = app.start_upnp_manual(&m).unwrap();
+        assert_eq!(given_paths(&fake), ["/wav/stream.wav", "/stream.raw"]);
+        assert_eq!(app.speaker_settings(&m.id()).upnp_stream_profile, None);
+        end(session);
+    }
+
+    #[test]
+    fn a_refused_play_moves_on_to_the_next_profile() {
+        use crate::fake_renderer::{renderer_description, FakeRenderer, Reply, AV_TRANSPORT};
+        let current = Mutex::new(String::new());
+        let fake = FakeRenderer::start(move |req| match req.soap_action() {
+            Some("SetAVTransportURI") => {
+                *current.lock().unwrap() = req.soap_arg("CurrentURI").unwrap();
+                Reply::soap_ok(AV_TRANSPORT, "SetAVTransportURI", &[])
+            }
+            Some("Play") if !current.lock().unwrap().ends_with("/wav/stream.wav") => Reply::soap_fault(704, "Playing failed"),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None if req.method == "GET" => Reply::ok(&renderer_description("Den Amp", &[])),
+            None => Reply::raw("HTTP/1.1 200 OK\r\nSID: uuid:strict\r\nTIMEOUT: Second-1800\r\nContent-Length: 0\r\n\r\n"),
+        });
+        let app = serving_app();
+        let session = app.start_upnp_manual(&manual_upnp(&fake)).expect("the second profile plays");
+        assert_eq!(fake.soap_actions(), ["Stop", "SetAVTransportURI", "Play", "Stop", "SetAVTransportURI", "Play"]);
+        end(session);
     }
 
     #[test]

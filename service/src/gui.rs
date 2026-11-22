@@ -1876,7 +1876,7 @@ impl StreamToSpeakerApp {
                 "⟳",
                 p.warn,
                 format!("Connecting to {}…", name),
-                "Setting up the session…".to_string(),
+                self.app.connecting_detail().unwrap_or_else(|| "Setting up the session…".to_string()),
                 None,
                 None,
             )

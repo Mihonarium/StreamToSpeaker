@@ -76,7 +76,10 @@ fn prints_the_same_link_every_time_and_writes_its_key_nowhere_else() {
     assert!(saved.contains("web_secret"), "{saved}");
     #[cfg(windows)]
     assert!(!saved.contains(&key), "{saved}");
-    for (path, text) in files_under(&profile.join("Local")) {
+    let logged = files_under(&profile.join("Local"));
+    // The run's log file is there: otherwise this would check nothing.
+    assert!(!logged.is_empty(), "no file under {}", profile.join("Local").display());
+    for (path, text) in logged {
         assert!(!text.contains(&key), "{}: {text}", path.display());
     }
 

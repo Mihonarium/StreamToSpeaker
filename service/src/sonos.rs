@@ -777,6 +777,7 @@ mod tests {
             rendering_control_event_url:
                 "http://192.168.1.10:1400/MediaRenderer/RenderingControl/Event".into(),
             av_transport_event_url: None,
+            connection_manager_control_url: None,
             udn: Some(udn.to_string()),
             zone_group_topology_control_url: Some(
                 "http://192.168.1.10:1400/ZoneGroupTopology/Control".into(),
