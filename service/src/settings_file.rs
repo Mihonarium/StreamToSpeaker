@@ -130,6 +130,11 @@ fn write_temp(fs: &dyn FileOps, path: &Path, bytes: &[u8]) -> io::Result<PathBuf
     Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "no free name")))
 }
 
+/// Rename `from` over `to`.
+fn rename_patiently(fs: &dyn FileOps, from: &Path, to: &Path) -> io::Result<()> {
+    fs.rename(from, to)
+}
+
 /// Why a save didn't replace the file.
 #[derive(Debug)]
 pub enum WriteError {
@@ -191,8 +196,34 @@ fn note_backup(backup: &Path, result: io::Result<()>) {
     }
 }
 
-/// Keep `bytes` as a copy of `path` named `<name>.<label>-<unix time>`
-/// (with `-<n>` added when that name is taken), flushed. A copy for which
+/// Unix seconds now (0 if the clock is before 1970).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// A name beside `path` that no file has: `<name>.<label>-<secs>`, or with
+/// `-<n>` added when that one is taken (two in the same second).
+pub fn fresh_name(fs: &dyn FileOps, path: &Path, label: &str, secs: u64) -> io::Result<PathBuf> {
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("config.json");
+    let taken = fs.list(dir).unwrap_or_default();
+    (0..TEMP_TRIES)
+        .map(|n| if n == 0 { format!("{name}.{label}-{secs}") } else { format!("{name}.{label}-{secs}-{n}") })
+        .find(|candidate| !taken.contains(candidate))
+        .map(|candidate| dir.join(candidate))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "no free name"))
+}
+
+/// Move `path` aside to a [`fresh_name`] labelled `label`; its new path.
+pub fn move_aside(fs: &dyn FileOps, path: &Path, label: &str) -> io::Result<PathBuf> {
+    let aside = fresh_name(fs, path, label, now_secs())?;
+    fs.rename(path, &aside)?;
+    Ok(aside)
+}
+
+/// Keep `bytes` as a copy of `path` under a [`fresh_name`] labelled
+/// `label`, written the way a save writes (a temporary file, flushed, then
+/// renamed), so the name only ever holds a complete copy. A copy for which
 /// `same` holds is already kept: its path is returned and nothing is
 /// written. Beyond `most` copies, the oldest others are removed.
 pub fn keep_copy(
@@ -206,29 +237,22 @@ pub fn keep_copy(
     let dir = path.parent().unwrap_or(Path::new(""));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("config.json");
     let prefix = format!("{name}.{label}-");
-    let mut kept: Vec<String> = fs.list(dir)?.into_iter().filter(|n| n.starts_with(prefix.as_str())).collect();
+    let mut kept: Vec<String> = fs
+        .list(dir)?
+        .into_iter()
+        .filter(|n| n.starts_with(prefix.as_str()) && !n.ends_with(".tmp"))
+        .collect();
     for copy in &kept {
         if fs.read(&dir.join(copy)).is_ok_and(|b| same(&b)) {
             return Ok(dir.join(copy));
         }
     }
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut written = None;
-    for n in 0..TEMP_TRIES {
-        let candidate = if n == 0 { format!("{prefix}{secs}") } else { format!("{prefix}{secs}-{n}") };
-        match fs.create_flushed(&dir.join(&candidate), bytes) {
-            Ok(()) => {
-                written = Some(candidate);
-                break;
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
+    let copy = fresh_name(fs, path, label, now_secs())?;
+    let tmp = write_temp(fs, &copy, bytes)?;
+    if let Err(e) = rename_patiently(fs, &tmp, &copy) {
+        let _ = fs.remove(&tmp);
+        return Err(e);
     }
-    let written = written.ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "no free name"))?;
     // Oldest first: by the time in the name, then by the number after it.
     let when = |n: &str| -> (u64, u64) {
         let mut parts = n.get(prefix.len()..).unwrap_or("").split('-').map(|t| t.parse().unwrap_or(0));
@@ -241,7 +265,7 @@ pub fn keep_copy(
             log::debug!("user_config: couldn't remove the older copy {old} ({e})");
         }
     }
-    Ok(dir.join(written))
+    Ok(copy)
 }
 
 /// A temporary file older than this is left from a save that was cut
@@ -525,6 +549,20 @@ pub(crate) mod tests {
         let again = keep_copy(&disk, &path(), "before-reset", b"copy 3 again", 3, &same).unwrap();
         assert_eq!(again, made[3]);
         assert_eq!(disk.names().len(), 4, "{:?}", disk.names());
+    }
+
+    #[test]
+    fn a_copy_kept_aside_is_complete_under_its_name_or_not_there() {
+        let never = |_: &[u8]| false;
+        for n in 0..=2 {
+            let disk = PowerCutDisk::with_file(&path(), b"{}");
+            disk.cut_after(n);
+            let _ = keep_copy(&disk, &path(), "before-reset", b"the whole copy", 3, &never);
+            let after = disk.after_power_cut();
+            for name in after.names().iter().filter(|f| f.starts_with("config.json.before-reset-") && !f.ends_with(".tmp")) {
+                assert_eq!(after.get(&path().with_file_name(name)).unwrap(), b"the whole copy", "cut after {n}");
+            }
+        }
     }
 
     #[test]

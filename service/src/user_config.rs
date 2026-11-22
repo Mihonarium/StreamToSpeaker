@@ -517,16 +517,18 @@ impl UserConfig {
         }
         let mut notice = LoadNotice::default();
         if unusable {
-            let aside = quarantine_path(path);
-            if let Err(re) = fs.rename(path, &aside) {
-                log::error!(
-                    "user_config: could not move {} aside ({}); starting with defaults — the \
-                     file is left as is and settings changed in this run are not saved",
-                    path.display(),
-                    re
-                );
-                return Self::not_read(re.to_string());
-            }
+            let aside = match settings_file::move_aside(fs, path, "corrupt") {
+                Ok(aside) => aside,
+                Err(re) => {
+                    log::error!(
+                        "user_config: could not move {} aside ({}); starting with defaults — the \
+                         file is left as is and settings changed in this run are not saved",
+                        path.display(),
+                        re
+                    );
+                    return Self::not_read(re.to_string());
+                }
+            };
             log::warn!("user_config: moved {} to {}", path.display(), aside.display());
             notice.unusable_kept_as = Some(aside);
         }
@@ -1025,19 +1027,6 @@ fn decode_ansi(bytes: &[u8]) -> Option<String> {
 #[cfg(not(windows))]
 fn decode_ansi(_: &[u8]) -> Option<String> {
     None
-}
-
-/// `config.json` → `config.json.corrupt-<unix seconds>` in the same dir.
-fn quarantine_path(path: &std::path::Path) -> PathBuf {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "config.json".into());
-    path.with_file_name(format!("{name}.corrupt-{secs}"))
 }
 
 #[cfg(test)]
@@ -1863,6 +1852,25 @@ mod tests {
             many.describe().unwrap(),
             "Some settings couldn't be read and are back to their defaults: k0, k1, k2, k3, and 2 more."
         );
+    }
+
+    #[test]
+    fn two_files_moved_aside_keep_both() {
+        use crate::settings_file::tests::PowerCutDisk;
+        let path = PathBuf::from("/profile/StreamToSpeaker/config.json");
+        let disk = PowerCutDisk::default();
+        for text in [&b"{ first"[..], b"{ second"] {
+            disk.create_flushed(&path, text).unwrap();
+            UserConfig::load_with_ops(&path, &PlatformCodec, &disk);
+        }
+        let mut kept: Vec<Vec<u8>> = disk
+            .names()
+            .iter()
+            .filter(|n| n.starts_with("config.json.corrupt-"))
+            .map(|n| disk.get(&path.with_file_name(n)).unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, [b"{ first".to_vec(), b"{ second".to_vec()]);
     }
 
     #[test]
