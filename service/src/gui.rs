@@ -617,8 +617,16 @@ fn palette_for(dark: bool, system_accent: Option<(u8, u8, u8)>) -> Palette {
 /// versions kept in the roaming profile there.
 fn window_state_file() -> Option<std::path::PathBuf> {
     let file = crate::folders::window_state_file()?;
-    if let Some(roaming) = crate::folders::roaming_base().filter(|p| p.is_absolute()) {
-        crate::folders::move_old_window_state(&roaming, &file);
+    // Where `APPDATA` points, and where the framework itself looked (the
+    // folder Windows reports), when the two differ.
+    let mut bases: Vec<std::path::PathBuf> = Vec::new();
+    for base in [crate::folders::roaming_base().filter(|p| p.is_absolute()), crate::folders::known_roaming()] {
+        if let Some(base) = base.filter(|b| !bases.contains(b)) {
+            bases.push(base);
+        }
+    }
+    for roaming in &bases {
+        crate::folders::move_old_window_state(roaming, &file);
     }
     Some(file)
 }

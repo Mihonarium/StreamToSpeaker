@@ -47,6 +47,12 @@ pub fn roaming_base() -> Option<PathBuf> {
     base_folder(std::env::var_os("APPDATA"), || known_folder(KnownFolder::Roaming))
 }
 
+/// The roaming profile folder as Windows reports it, whatever `APPDATA`
+/// says: where the window's framework kept its state in earlier versions.
+pub fn known_roaming() -> Option<PathBuf> {
+    known_folder(KnownFolder::Roaming).filter(|p| p.is_absolute())
+}
+
 /// The local profile folder (`%LOCALAPPDATA%`).
 pub fn local_base() -> Option<PathBuf> {
     base_folder(std::env::var_os("LOCALAPPDATA"), || known_folder(KnownFolder::Local))

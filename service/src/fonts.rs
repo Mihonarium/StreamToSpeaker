@@ -303,12 +303,14 @@ mod windows {
     use std::io;
     use std::path::{Path, PathBuf};
 
-    /// `%WINDIR%\Fonts`.
+    /// `%WINDIR%\Fonts`: the system's own Windows folder, also on a
+    /// Terminal Server host, where `GetWindowsDirectoryW` can give a
+    /// private one.
     pub fn fonts_folder() -> PathBuf {
-        use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+        use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
         let mut buf = [0u16; 260];
         // SAFETY: the buffer and its length describe `buf`.
-        let n = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
         let windows = match buf.get(..n) {
             Some(units) if n > 0 => PathBuf::from(String::from_utf16_lossy(units)),
             _ => PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into())),
