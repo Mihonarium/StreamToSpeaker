@@ -269,9 +269,9 @@ impl AirPlay2Session {
         let homepod = cfg.renderer.is_homepod();
         let event_ciphers = rtsp.take_event_ciphers();
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let mut bring_up = BringUp::new(&stop_flag);
         let dead = Arc::new(AtomicBool::new(false));
         let faults = FaultSlot::new(dead.clone(), cfg.renderer.friendly_name.clone());
+        let mut bring_up = BringUp::new(&stop_flag, &faults);
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
 
         // Timing-protocol choice: receivers advertising SupportsPTP (bit 41)
@@ -655,9 +655,9 @@ impl AirPlay2Session {
         );
 
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let mut bring_up = BringUp::new(&stop_flag);
         let dead = Arc::new(AtomicBool::new(false));
         let faults = FaultSlot::new(dead.clone(), label.clone());
+        let mut bring_up = BringUp::new(&stop_flag, &faults);
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
 
         struct Pending {
@@ -1019,18 +1019,21 @@ impl SessionThreads {
 /// channel among them) before the error is returned.
 struct BringUp {
     stop_flag: Arc<AtomicBool>,
+    faults: FaultSlot,
     threads: SessionThreads,
     finished: bool,
 }
 
 impl BringUp {
-    fn new(stop_flag: &Arc<AtomicBool>) -> Self {
-        Self { stop_flag: stop_flag.clone(), threads: SessionThreads::default(), finished: false }
+    fn new(stop_flag: &Arc<AtomicBool>, faults: &FaultSlot) -> Self {
+        Self { stop_flag: stop_flag.clone(), faults: faults.clone(), threads: SessionThreads::default(), finished: false }
     }
 
-    /// The bring-up succeeded: the threads now belong to the session.
+    /// The bring-up succeeded: the threads now belong to the session, and
+    /// its faults count for the repeat rule from now on.
     fn finish(mut self) -> SessionThreads {
         self.finished = true;
+        self.faults.arm(Instant::now());
         std::mem::take(&mut self.threads)
     }
 }
@@ -1400,13 +1403,13 @@ fn frame_buffered_packet(pkt: &[u8]) -> Vec<u8> {
 
 /// The buffered stream's encoder failed: no audio can follow, so the
 /// session ends. SETUP negotiated AAC, so switching codec within the session
-/// isn't possible; a reconnect builds a new encoder, and if that
-/// fails too, the person is told (only AAC, Windows' encoder, can fail).
-fn encoder_failed(faults: &FaultSlot, stop_flag: &AtomicBool, detail: String) {
+/// isn't possible; a reconnect builds a new encoder. If the reconnect's
+/// encoder fails too before it played, the person is told.
+fn encoder_failed(faults: &FaultSlot, stop_flag: &AtomicBool, detail: String, played: bool) {
     if stop_flag.load(Ordering::Acquire) {
         return;
     }
-    faults.raise_unless_repeated("encoder_failed", FaultChannel::Media, detail, || {
+    faults.raise_unless_repeated("encoder_failed", FaultChannel::Media, detail, played, || {
         "Windows' AAC encoder failed again after reconnecting. The realtime stream doesn't use \
          it: turn on \"Prefer low-latency realtime\" in Advanced, then select the speaker again."
             .to_string()
@@ -1430,7 +1433,8 @@ fn anchor_failed(
         return;
     }
     let detail = format!("the speaker accepted no playback anchor (last: {last})");
-    faults.raise_unless_repeated("anchor_failed", FaultChannel::Media, detail, || {
+    // No anchor was accepted, so this session never played.
+    faults.raise_unless_repeated("anchor_failed", FaultChannel::Media, detail, false, || {
         anchor_failed_message(locked_to_receiver, ptp_ports_problem, last)
     });
 }
@@ -1485,7 +1489,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
     let mut encoder = match make_encoder() {
         Ok(enc) => enc,
         Err(e) => {
-            encoder_failed(&cfg.faults, &cfg.stop_flag, format!("AAC-LC encoder could not start: {e:#}"));
+            encoder_failed(&cfg.faults, &cfg.stop_flag, format!("AAC-LC encoder could not start: {e:#}"), false);
             return;
         }
     };
@@ -1592,7 +1596,12 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
             let payloads = match encoder.encode(&pkt_samples) {
                 Ok(frames) => frames,
                 Err(e) => {
-                    encoder_failed(&cfg.faults, &cfg.stop_flag, format!("AAC-LC encoding failed: {e:#}"));
+                    encoder_failed(
+                        &cfg.faults,
+                        &cfg.stop_flag,
+                        format!("AAC-LC encoding failed: {e:#}"),
+                        packet_count > 0,
+                    );
                     return;
                 }
             };
@@ -2037,6 +2046,8 @@ mod tests {
             let stop_flag = Arc::new(AtomicBool::new(false));
             let dead = Arc::new(AtomicBool::new(false));
             let faults = FaultSlot::new(dead.clone(), name.into());
+            // As a session that finished its bring-up.
+            faults.arm(Instant::now());
             let last_seq = Arc::new(AtomicU32::new(initial_seq as u32));
             let sender = spawn_ap2_buffered_sender(BufferedSenderConfig {
                 stream,
@@ -2101,23 +2112,26 @@ mod tests {
         }
     }
 
-    /// The AAC encoder failing, at the start or mid-stream, ends the
-    /// session through the fault path: the first time it is retryable (the
-    /// app reconnects); straight after the reconnect it is final, with a
-    /// sentence for the person instead of a session that shows
-    /// "streaming" and plays nothing.
+    /// The AAC encoder failing ends the session through the fault path:
+    /// retryable (the app reconnects), and final, with a sentence for the
+    /// person, only when the reconnect fails the same way before it plays.
+    /// Failures with playback before them stay retryable.
     #[test]
     fn a_failing_encoder_ends_the_session_and_then_says_why() {
-        let failing_start: EncoderFactory = Box::new(|| anyhow::bail!("MFStartup: scripted"));
-        for (round, encoder) in [(1, failing_start), (2, scripted_encoder(Some(3)))] {
+        let failing_start = || -> EncoderFactory { Box::new(|| anyhow::bail!("MFStartup: scripted")) };
+        for (round, encoder, retryable) in [
+            (1, failing_start(), true),
+            (2, failing_start(), false),
+            (3, scripted_encoder(Some(3)), true),
+            (4, scripted_encoder(Some(3)), true),
+        ] {
             let mut rig = BufferedRig::start("Encoder test speaker", encoder, 100, &["200 OK"]);
             rig.feed(BUFFERED_SPF * 8);
             rig.wait_for_exit();
             assert!(rig.dead.load(Ordering::Acquire), "round {round}: session not marked dead");
             let fault = rig.faults.get().unwrap();
-            assert_eq!(fault.code, "encoder_failed", "round {round}");
-            assert_eq!(fault.retryable, round == 1, "round {round}");
-            if round == 2 {
+            assert_eq!((fault.code, fault.retryable), ("encoder_failed", retryable), "round {round}");
+            if !retryable {
                 assert!(fault.to_string().contains("Prefer low-latency realtime"), "{fault}");
             }
         }
@@ -2389,6 +2403,7 @@ mod tests {
         let session =
             AirPlay2Session::start_paired(cfg, rtsp, [0u8; 32], sockets, BringUpEnv::real()).unwrap_or_else(|e| panic!("{e:#}"));
         let (mut event_conn, _) = events.accept().unwrap();
+        assert!(session.faults.armed(), "a session that came up counts for the repeat rule");
         session.stop();
 
         event_conn.set_read_timeout(Some(Duration::from_secs(1))).unwrap();

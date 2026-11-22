@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::airplay::ap2_crypto::{ChannelCipher, HapReader};
-use crate::airplay::ap2_health::{FaultChannel, FaultSlot};
+use crate::airplay::ap2_health::{Ap2Fault, FaultChannel, FaultSlot};
 
 /// Request header block limit.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -216,9 +216,9 @@ fn run_event_channel(
 
 /// The channel ended from the receiver's side (closed, reset, or a reply
 /// that couldn't be written). Where the channel's end is the session's end
-/// (`close_is_fault`: HomePods), the session faults: retryable, and final
-/// when it happens again straight after the reconnect. Nothing is raised
-/// once the app is stopping the session.
+/// (`close_is_fault`: HomePods), the session faults at once, retryable:
+/// the app reconnects after every such drop. Nothing is raised once the
+/// app is stopping the session.
 fn channel_ended(faults: &FaultSlot, close_is_fault: bool, stop_flag: &AtomicBool, name: &str, detail: String) {
     if stop_flag.load(Ordering::Acquire) {
         return;
@@ -227,11 +227,7 @@ fn channel_ended(faults: &FaultSlot, close_is_fault: bool, stop_flag: &AtomicBoo
         warn!("AirPlay 2 {}: {}", name, detail);
         return;
     }
-    faults.raise_unless_repeated("peer_closed", FaultChannel::Events, detail, || {
-        "it ended the session again right after reconnecting (another device playing to it, or a \
-         network problem, can do that). Select it again to play from this PC."
-            .to_string()
-    });
+    faults.raise(Ap2Fault::new("peer_closed", FaultChannel::Events, true, detail));
 }
 
 #[cfg(test)]
@@ -279,16 +275,17 @@ mod tests {
 
     /// A receiver that resets the event channel (a reboot, a Wi-Fi drop)
     /// has ended the session just as one that closes it: the session is
-    /// marked dead at once, retryable the first time and final when it
-    /// happens again straight after the reconnect. Once the app is
-    /// stopping the session, the same reset is no fault.
+    /// marked dead at once. Every such drop is retryable, however soon one
+    /// follows another (the app reconnects after each, as it always has).
+    /// Once the app is stopping the session, the same reset is no fault.
     #[test]
-    fn a_reset_event_channel_ends_the_session() {
-        let reset_by_peer = |name: &str, stop_first: bool| {
+    fn a_reset_or_closed_event_channel_ends_the_session_retryably() {
+        let ended_by_peer = |name: &str, reset: bool, stop_first: bool| {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let dead = Arc::new(AtomicBool::new(false));
             let faults = FaultSlot::new(dead.clone(), name.into());
+            faults.arm(std::time::Instant::now());
             let stop = Arc::new(AtomicBool::new(false));
             let handle =
                 spawn_event_channel("127.0.0.1".parse().unwrap(), port, None, stop.clone(), faults.clone(), true, name.into())
@@ -297,21 +294,20 @@ mod tests {
             if stop_first {
                 stop.store(true, Ordering::Release);
             }
-            socket2::SockRef::from(&peer).set_linger(Some(Duration::ZERO)).unwrap();
+            if reset {
+                socket2::SockRef::from(&peer).set_linger(Some(Duration::ZERO)).unwrap();
+            }
             drop(peer);
             handle.join().unwrap();
             (dead.load(Ordering::Acquire), faults.get())
         };
-        for round in [1, 2] {
-            let (dead, fault) = reset_by_peer("Reset test HomePod", false);
+        for (round, reset) in [(1, true), (2, true), (3, false), (4, false)] {
+            let (dead, fault) = ended_by_peer("Dropping test HomePod", reset, false);
             assert!(dead, "round {round}: session not marked dead");
             let fault = fault.unwrap();
-            assert_eq!((fault.code, fault.retryable), ("peer_closed", round == 1), "round {round}: {fault:?}");
-            if round == 2 {
-                assert!(fault.to_string().contains("Select it again"), "{fault}");
-            }
+            assert_eq!((fault.code, fault.retryable), ("peer_closed", true), "round {round}: {fault:?}");
         }
-        assert_eq!(reset_by_peer("Stopping test HomePod", true), (false, None));
+        assert_eq!(ended_by_peer("Stopping test HomePod", true, true), (false, None));
     }
 
     /// End to end over loopback: an idle period, then one encrypted

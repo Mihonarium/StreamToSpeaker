@@ -68,14 +68,18 @@ impl std::fmt::Display for Ap2Fault {
     }
 }
 
-/// How long after a fault the same fault on the same receiver counts as
-/// coming back straight after the reconnect: the watchdog reconnects about
-/// 5 s after a drop, and the faults raised through
-/// [`FaultSlot::raise_unless_repeated`] show within about half a minute
-/// of a new session.
+/// How soon after a fault the next session to that speaker must start to
+/// be the reconnect that followed it: the watchdog reconnects about 5 s
+/// after a drop; the person picking the speaker again within this time
+/// counts too.
 pub const REPEAT_WINDOW: Duration = Duration::from_secs(120);
 
-/// Recent faults per receiver, for [`FaultSlot::raise_unless_repeated`].
+/// Notes older than this are dropped: no reconnect that is still failing
+/// can follow them.
+const REPEAT_MEMORY_LIMIT: Duration = Duration::from_secs(3600);
+
+/// Recent faults per receiver of the kinds that mean a session cannot play
+/// (the encoder, the anchor), for [`FaultSlot::raise_unless_repeated`].
 #[derive(Debug, Default)]
 pub struct RepeatMemory {
     recent: Vec<(String, &'static str, Instant)>,
@@ -86,22 +90,27 @@ impl RepeatMemory {
         Self { recent: Vec::new() }
     }
 
-    /// Note fault `code` on `host` at `now`. True when the same fault was
-    /// noted on that host within [`REPEAT_WINDOW`]: it came back straight
-    /// after the reconnect. That earlier note is then forgotten, so a later
-    /// attempt starts over.
-    pub fn repeated(&mut self, host: &str, code: &'static str, now: Instant) -> bool {
-        self.recent.retain(|(_, _, at)| now.saturating_duration_since(*at) < REPEAT_WINDOW);
-        match self.recent.iter().position(|(h, c, _)| h == host && *c == code) {
-            Some(i) => {
-                self.recent.swap_remove(i);
-                true
-            }
-            None => {
-                self.recent.push((host.to_string(), code, now));
-                false
-            }
+    /// Note fault `code`, raised at `now` by a session to `host` that
+    /// finished its bring-up at `started` and had or had not `played`.
+    /// True when this is the same thing again straight after the
+    /// reconnect: the same fault on that host is noted, this session
+    /// started within [`REPEAT_WINDOW`] after it (it is the reconnect), and
+    /// it failed before it played. That note is then forgotten, so a later
+    /// attempt starts over; otherwise this fault replaces it.
+    pub fn repeated(&mut self, host: &str, code: &'static str, started: Instant, played: bool, now: Instant) -> bool {
+        self.recent.retain(|(_, _, at)| now.saturating_duration_since(*at) < REPEAT_MEMORY_LIMIT);
+        let earlier = self.recent.iter().position(|(h, c, _)| h == host && *c == code);
+        let repeat = earlier.is_some_and(|i| {
+            let at = self.recent[i].2;
+            !played && started >= at && started.saturating_duration_since(at) <= REPEAT_WINDOW
+        });
+        if let Some(i) = earlier {
+            self.recent.swap_remove(i);
         }
+        if !repeat {
+            self.recent.push((host.to_string(), code, now));
+        }
+        repeat
     }
 }
 
@@ -114,11 +123,20 @@ pub struct FaultSlot {
     fault: Arc<Mutex<Option<Ap2Fault>>>,
     dead: Arc<AtomicBool>,
     host: String,
+    /// When the session finished its bring-up; None until then.
+    started: Arc<Mutex<Option<Instant>>>,
 }
 
 impl FaultSlot {
     pub fn new(dead: Arc<AtomicBool>, host: String) -> Self {
-        Self { fault: Arc::new(Mutex::new(None)), dead, host }
+        Self { fault: Arc::new(Mutex::new(None)), dead, host, started: Arc::new(Mutex::new(None)) }
+    }
+
+    /// The session finished its bring-up at `started`: from now on its
+    /// faults count for the repeat rule. A bring-up that fails never arms
+    /// its slot, so a session that never existed leaves nothing to repeat.
+    pub fn arm(&self, started: Instant) {
+        *self.started.lock().unwrap() = Some(started);
     }
 
     pub fn raise(&self, fault: Ap2Fault) {
@@ -130,21 +148,26 @@ impl FaultSlot {
         self.dead.store(true, Ordering::Release);
     }
 
-    /// Raise a fault that one reconnect may cure: retryable with `detail`
-    /// the first time; when the same `code` ended a session to this
-    /// receiver within [`REPEAT_WINDOW`] (it came back straight after the
-    /// reconnect), final, with `final_message`: a sentence for the person
-    /// saying what stopped working, the likely cause and what to try.
+    /// Raise a fault that means this session cannot play (the encoder, the
+    /// anchor): retryable with `detail`, so the app reconnects; final, with
+    /// `final_message` (a sentence for the person: what stopped working,
+    /// the likely cause, what to try), when this session is the reconnect
+    /// that followed the same fault on this receiver and failed before it
+    /// `played` ([`RepeatMemory::repeated`]).
     pub fn raise_unless_repeated(
         &self,
         code: &'static str,
         channel: FaultChannel,
         detail: String,
+        played: bool,
         final_message: impl FnOnce() -> String,
     ) {
         let mut slot = self.fault.lock().unwrap();
         if slot.is_none() {
-            let repeated = REPEATS.lock().unwrap_or_else(|e| e.into_inner()).repeated(&self.host, code, Instant::now());
+            let started = *self.started.lock().unwrap();
+            let repeated = started.is_some_and(|started| {
+                REPEATS.lock().unwrap_or_else(|e| e.into_inner()).repeated(&self.host, code, started, played, Instant::now())
+            });
             let fault = if repeated {
                 warn!(
                     "AirPlay 2 session to {}: {} again straight after reconnecting ({}); not retrying",
@@ -162,6 +185,11 @@ impl FaultSlot {
 
     pub fn get(&self) -> Option<Ap2Fault> {
         self.fault.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn armed(&self) -> bool {
+        self.started.lock().unwrap().is_some()
     }
 }
 
@@ -572,32 +600,64 @@ mod tests {
         Instant::now()
     }
 
+    /// "Again" means what the final sentence says: the session raising the
+    /// fault is the reconnect that followed the same fault on the same
+    /// speaker (it started within the window after it), and it failed
+    /// before it played. Everything else is retryable.
     #[test]
-    fn a_fault_that_comes_back_straight_after_the_reconnect_is_final() {
-        let now = t0();
+    fn a_fault_is_final_only_when_the_reconnect_fails_before_playing() {
+        let t = t0() + Duration::from_secs(3600);
         let s = Duration::from_secs;
         let mut m = RepeatMemory::new();
-        assert!(!m.repeated("Kitchen", "anchor_failed", now), "first time: reconnect");
-        assert!(m.repeated("Kitchen", "anchor_failed", now + s(30)), "again after the reconnect: final");
-        assert!(!m.repeated("Kitchen", "anchor_failed", now + s(40)), "a new attempt after that starts over");
-        assert!(!m.repeated("Kitchen", "encoder_failed", now + s(41)), "another fault is no repeat");
-        assert!(!m.repeated("Bedroom", "anchor_failed", now + s(42)), "nor the same fault on another speaker");
-        assert!(
-            !m.repeated("Kitchen", "anchor_failed", now + s(40) + REPEAT_WINDOW),
-            "too late to be the reconnect's"
-        );
+        // A session that had played for a minute: first time, reconnect.
+        assert!(!m.repeated("Kitchen", "anchor_failed", t - s(60), true, t));
+        // Its reconnect, started 6 s later, fails before playing: final.
+        assert!(m.repeated("Kitchen", "anchor_failed", t + s(6), false, t + s(25)));
+        // A later attempt starts over.
+        assert!(!m.repeated("Kitchen", "anchor_failed", t + s(40), false, t + s(60)));
+
+        // A reconnect that played for 85 s before the same fault: retryable.
+        let mut m = RepeatMemory::new();
+        assert!(!m.repeated("Kitchen", "encoder_failed", t - s(60), true, t));
+        assert!(!m.repeated("Kitchen", "encoder_failed", t + s(5), true, t + s(90)));
+
+        // A session that started too long after the fault isn't its reconnect.
+        let mut m = RepeatMemory::new();
+        assert!(!m.repeated("Kitchen", "anchor_failed", t - s(20), false, t));
+        assert!(!m.repeated("Kitchen", "anchor_failed", t + REPEAT_WINDOW + s(1), false, t + REPEAT_WINDOW + s(20)));
+
+        // Nor one that was already running when the fault came.
+        let mut m = RepeatMemory::new();
+        assert!(!m.repeated("Kitchen", "anchor_failed", t - s(20), false, t));
+        assert!(!m.repeated("Kitchen", "anchor_failed", t - s(5), false, t + s(10)));
+
+        // Another fault, or the same fault on another speaker, is no repeat.
+        let mut m = RepeatMemory::new();
+        assert!(!m.repeated("Kitchen", "anchor_failed", t - s(20), false, t));
+        assert!(!m.repeated("Kitchen", "encoder_failed", t + s(6), false, t + s(7)));
+        assert!(!m.repeated("Bedroom", "anchor_failed", t + s(6), false, t + s(8)));
     }
 
     /// The final fault is what the window shows after "Connection to …
-    /// ended:", so it reads as the sentence written for the person.
+    /// ended:", so it reads as the sentence written for the person. A
+    /// session that never finished its bring-up (an unarmed slot) raises
+    /// its fault but leaves nothing to repeat.
     #[test]
     fn a_repeated_fault_ends_the_session_with_its_sentence() {
+        let raise = |slot: &FaultSlot| {
+            slot.raise_unless_repeated("test_fault", FaultChannel::Media, "detail for the log".into(), false, || {
+                "it stopped; select it again.".into()
+            })
+        };
+        // Never finished bring-up: retryable, nothing remembered.
+        let unarmed = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Repeat test speaker".into());
+        raise(&unarmed);
+        assert!(unarmed.get().unwrap().retryable);
         for (round, retryable) in [(1, true), (2, false)] {
             let dead = Arc::new(AtomicBool::new(false));
             let slot = FaultSlot::new(dead.clone(), "Repeat test speaker".into());
-            slot.raise_unless_repeated("test_fault", FaultChannel::Media, "detail for the log".into(), || {
-                "it stopped; select it again.".into()
-            });
+            slot.arm(Instant::now());
+            raise(&slot);
             assert!(dead.load(Ordering::Acquire), "round {round}");
             let f = slot.get().unwrap();
             assert_eq!(f.retryable, retryable, "round {round}");
@@ -607,11 +667,13 @@ mod tests {
         }
         // A slot that already holds a fault keeps it and remembers nothing.
         let slot = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Busy test speaker".into());
+        slot.arm(Instant::now());
         slot.raise(Ap2Fault::new("first", FaultChannel::Feedback, true, "first"));
-        slot.raise_unless_repeated("test_fault", FaultChannel::Media, "x".into(), || "x".into());
+        slot.raise_unless_repeated("test_fault", FaultChannel::Media, "x".into(), false, || "x".into());
         assert_eq!(slot.get().unwrap().code, "first");
         let fresh = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Busy test speaker".into());
-        fresh.raise_unless_repeated("test_fault", FaultChannel::Media, "x".into(), || "x".into());
+        fresh.arm(Instant::now());
+        fresh.raise_unless_repeated("test_fault", FaultChannel::Media, "x".into(), false, || "x".into());
         assert!(fresh.get().unwrap().retryable);
     }
 
