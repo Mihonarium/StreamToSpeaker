@@ -613,10 +613,17 @@ impl UserConfig {
                 }
             }
             for p in &paths {
-                log::warn!(
-                    "user_config: {} couldn't be read, so it is back to its default",
-                    secret_store::pointer(p)
-                );
+                if relearned(p) {
+                    log::info!(
+                        "user_config: {} couldn't be read; the app learns it again",
+                        secret_store::pointer(p)
+                    );
+                } else {
+                    log::warn!(
+                        "user_config: {} couldn't be read, so it is back to its default",
+                        secret_store::pointer(p)
+                    );
+                }
             }
             notice.reset = paths;
         }
@@ -841,9 +848,13 @@ pub struct LoadNotice {
 }
 
 impl LoadNotice {
-    /// Whether there is anything to tell.
+    /// Whether there is anything to tell: values the app learns again by
+    /// itself ([`RELEARNED`]) are not.
     pub fn is_empty(&self) -> bool {
-        *self == Self::default()
+        !self.restored_from_backup
+            && self.unusable_kept_as.is_none()
+            && !self.all_reset
+            && self.reset.iter().all(|p| relearned(p))
     }
 
     /// What to tell the person, in a few sentences; `None` when there is
@@ -874,10 +885,10 @@ impl LoadNotice {
                  again.{kept}"
             ));
         }
-        if !self.reset.is_empty() {
+        if self.reset.iter().any(|p| !relearned(p)) {
             const SHOWN: usize = 4;
             let mut labels: Vec<String> = Vec::new();
-            for p in &self.reset {
+            for p in self.reset.iter().filter(|p| !relearned(p)) {
                 let label = reset_label(p, name_of);
                 if !labels.contains(&label) {
                     labels.push(label);
@@ -902,64 +913,96 @@ impl LoadNotice {
     }
 }
 
-/// The window's words for a top-level setting, `None` for a key this
-/// version doesn't have.
-fn setting_label(key: &str) -> Option<&'static str> {
-    Some(match key {
-        "last_speaker_id" => "The speaker used last",
-        "onboarding_dismissed" => "The welcome card",
-        "always_minimise_to_tray" => "Always minimise to the tray",
-        "donation_prompt_hidden_until" => "The donation reminder",
-        "auto_reconnect_on_launch" => "Auto-connect when the app launches",
-        "prefer_realtime_airplay" => "AirPlay 2 stream mode",
-        "auto_reconnect_on_drop" => "Reconnect automatically if the connection drops",
-        "airplay_mfi_encryption" => "AirPlay MFi encryption",
-        "airplay_passwords" => "AirPlay passwords",
-        "airplay_pairings" => "PIN pairings with AirPlay devices",
-        "airplay_controller_id" | "airplay_controller_seed_hex" => "This PC's AirPlay pairing identity",
-        "web_secret" => "The web remote's link",
-        "forward_now_playing" => "Show now-playing on the speaker",
-        "airplay_uncompressed_alac" => "AirPlay uncompressed audio",
-        "privacy_mode" => "Privacy mode",
-        "airplay_latency_ms" => "AirPlay buffer",
-        "airplay_homepod_buffered" => "HomePod buffered stream",
-        "airplay_homepod_latency_ms" => "HomePod delay",
-        "check_for_updates" => "Check for updates",
-        "update_last_check_unix"
-        | "update_latest_tag"
-        | "update_latest_url"
-        | "update_skipped_tag"
-        | "update_banner_hidden_until" => "The update check",
-        "sendspin" => "Sendspin and Music Assistant",
-        "manual_speakers" => "Speakers added by address",
-        "discovery_adapter" => "Discovery network adapter",
-        "speaker_settings" => "Speaker settings",
-        "equalizer" => "Equalizer",
-        _ => return None,
-    })
+/// What the reset notice calls each top-level setting, and whether that
+/// is the window's own text for it (`true`: a test finds it in the
+/// window's code) or a description of something the window doesn't show
+/// (`false`).
+const SETTING_LABELS: &[(&str, &str, bool)] = &[
+    ("last_speaker_id", "The speaker used last", false),
+    ("onboarding_dismissed", "Getting started", true),
+    ("always_minimise_to_tray", "Always minimise to tray", true),
+    ("donation_prompt_hidden_until", "The donation reminder", false),
+    ("auto_reconnect_on_launch", "Auto-connect to this speaker when the app launches", true),
+    ("prefer_realtime_airplay", "AirPlay 2 stream mode", true),
+    ("auto_reconnect_on_drop", "Reconnect automatically if the connection drops", true),
+    ("airplay_mfi_encryption", "AirPlay MFi encryption (experimental)", true),
+    ("airplay_passwords", "AirPlay password", true),
+    ("airplay_pairings", "Paired with this PC by PIN", true),
+    ("airplay_controller_id", "This PC's AirPlay pairing identity", false),
+    ("airplay_controller_seed_hex", "This PC's AirPlay pairing identity", false),
+    ("web_secret", "Web UI", true),
+    ("forward_now_playing", "Show now-playing on the speaker", true),
+    ("airplay_uncompressed_alac", "AirPlay uncompressed audio", false),
+    ("privacy_mode", "Privacy mode", true),
+    ("airplay_latency_ms", "AirPlay buffer (latency)", true),
+    ("airplay_homepod_buffered", "Use the buffered stream for single HomePods", true),
+    ("airplay_homepod_latency_ms", "HomePod delay", true),
+    ("check_for_updates", "Check for updates", true),
+    ("update_last_check_unix", "Check for updates", true),
+    ("update_latest_tag", "Check for updates", true),
+    ("update_latest_url", "Check for updates", true),
+    ("update_skipped_tag", "Check for updates", true),
+    ("update_banner_hidden_until", "Check for updates", true),
+    ("sendspin", "Sendspin and Music Assistant", true),
+    ("manual_speakers", "Speakers added by address", true),
+    ("discovery_adapter", "Discovery network adapter", true),
+    ("speaker_settings", "Each speaker's settings", false),
+    ("equalizer", "Equalizer", true),
+];
+
+/// The same for a speaker's own settings (`speaker_settings.<id>.<key>`).
+const SPEAKER_LABELS: &[(&str, &str, bool)] = &[
+    ("hidden", "Hide this speaker from the list", true),
+    ("auto_connect", "Connect automatically", true),
+    ("airplay_latency_ms", "Own AirPlay buffer for this speaker", true),
+];
+
+/// Values the app remembers by itself and learns again at the next
+/// connect, with nothing the person notices but that connect being a
+/// little slower: one that can't be read is left out quietly (the log
+/// names it; the reset notice doesn't). Key paths; `*` matches any key.
+/// Anything the person chose, or would notice losing (a pairing, a
+/// password, the saved speaker), is labelled above instead.
+const RELEARNED: &[&[&str]] = &[
+    // The stream profile a UPnP speaker last played (see `stream_profile`).
+    &["speaker_settings", "*", "upnp_stream_profile"],
+    // The AirPlay 1 opener that worked for a speaker when it wasn't the
+    // usual one (see `airplay::session::Opener`).
+    &["speaker_settings", "*", "airplay_opener"],
+];
+
+/// Whether `path` is one of [`RELEARNED`].
+fn relearned(path: &[String]) -> bool {
+    RELEARNED.iter().any(|p| p.len() == path.len() && p.iter().zip(path).all(|(p, k)| *p == "*" || p == k))
 }
 
-/// The window's words for the setting at `path` that was reset or left
-/// out: the section, and for a speaker's own setting, password or pairing
-/// the speaker's name (from `name_of`) with what it was.
+/// A speaker's settings as a whole.
+const WHOLE_SPEAKER_LABEL: (&str, &str, bool) = ("speaker_settings.<id>", "Settings for this speaker", true);
+
+/// What the reset notice calls a top-level setting; `None` for a key this
+/// version doesn't have.
+fn setting_label(key: &str) -> Option<&'static str> {
+    SETTING_LABELS.iter().find(|(k, _, _)| *k == key).map(|(_, label, _)| *label)
+}
+
+/// What the reset notice calls the setting at `path` that was reset or
+/// left out: the window's words for it, and for a speaker's own setting,
+/// password or pairing the speaker's name (from `name_of`) before them.
 fn reset_label(path: &[String], name_of: &dyn Fn(&str) -> Option<String>) -> String {
     let speaker = |id: &str| name_of(id).unwrap_or_else(|| "A speaker".into());
     let key = path.first().map(String::as_str).unwrap_or_default();
+    let label_of = |table: &[(&str, &'static str, bool)], k: &str| {
+        table.iter().find(|(name, _, _)| *name == k).map(|(_, label, _)| *label)
+    };
     match (key, path.get(1), path.get(2).map(String::as_str)) {
         ("speaker_settings", Some(id), field) => {
-            let what = match field {
-                Some("hidden") => "Hide this speaker from the list",
-                Some("auto_connect") => "Connect automatically",
-                Some("airplay_opener") => "The way of connecting over AirPlay that worked for it",
-                Some("airplay_latency_ms") => "Own AirPlay buffer",
-                Some("upnp_stream_profile") => "The stream format it last played",
-                _ => "its settings",
-            };
+            let what = field.and_then(|f| label_of(SPEAKER_LABELS, f)).unwrap_or(WHOLE_SPEAKER_LABEL.1);
             format!("{}: {what}", speaker(id))
         }
-        ("airplay_passwords", Some(id), _) => format!("{}: AirPlay password", speaker(id)),
-        ("airplay_pairings", Some(id), _) => format!("{}: PIN pairing", speaker(id)),
-        ("manual_speakers", Some(_), _) => "A speaker added by address".into(),
+        ("airplay_passwords" | "airplay_pairings", Some(id), _) => {
+            format!("{}: {}", speaker(id), setting_label(key).unwrap_or_default())
+        }
+        ("manual_speakers", Some(_), _) => setting_label(key).unwrap_or_default().into(),
         _ => setting_label(key).unwrap_or("A setting from a newer version").into(),
     }
 }
@@ -1084,23 +1127,23 @@ impl SaveHealth {
 /// The order of one settings file's saves: each save is numbered when its
 /// text is made (under the settings lock, so in the order of the changes),
 /// and one whose number is lower than a save already written is not
-/// written: the newest state wins.
+/// written: the newest state wins. Numbering takes no lock, so a save
+/// never waits for another one being written; only the writes take turns.
 #[derive(Clone, Debug, Default)]
-struct WriteOrder(std::sync::Arc<std::sync::Mutex<Written>>);
+struct WriteOrder(std::sync::Arc<Order>);
 
 #[derive(Debug, Default)]
-struct Written {
-    /// The number the next save gets.
-    next: u64,
-    /// The newest save written (or tried), and its outcome.
-    last: Option<(u64, Result<(), String>)>,
+struct Order {
+    /// The number the last save got.
+    numbered: std::sync::atomic::AtomicU64,
+    /// Held for each write: the newest save written (or tried), and its
+    /// outcome.
+    written: std::sync::Mutex<Option<(u64, Result<(), String>)>>,
 }
 
 impl WriteOrder {
     fn next(&self) -> u64 {
-        let mut w = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        w.next += 1;
-        w.next
+        self.0.numbered.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1)
     }
 }
 
@@ -1119,8 +1162,8 @@ impl SaveJob {
     /// one settings file take turns under their own lock, not the
     /// settings lock.
     fn run(self, fs: &dyn FileOps) -> Result<(), String> {
-        let mut written = self.order.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((newest, outcome)) = &written.last {
+        let mut written = self.order.0.written.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((newest, outcome)) = &*written {
             if *newest >= self.generation {
                 return outcome.clone();
             }
@@ -1136,7 +1179,7 @@ impl SaveJob {
         });
         self.health.set(outcome.as_ref().err().map(|(_, problem)| problem.clone()));
         let outcome = outcome.map_err(|(error, _)| error);
-        written.last = Some((self.generation, outcome.clone()));
+        *written = Some((self.generation, outcome.clone()));
         outcome
     }
 }
@@ -1163,7 +1206,9 @@ fn stage(job: SaveJob) -> Option<SaveJob> {
 /// held ([`UserConfig::save`]) is written when the lock is released,
 /// outside it: a thread that only reads a setting (a Music Assistant
 /// handshake, the web server) never waits for a flush to the disk, and of
-/// two saves the newer state is the one that stays on the disk.
+/// two saves the newer state is the one that stays on the disk. The thread
+/// that made a save writes it once it has let go of the lock; when two
+/// writes overlap, they take turns there, holding nothing else.
 pub struct SettingsCell(std::sync::Mutex<UserConfig>);
 
 impl SettingsCell {
@@ -1847,6 +1892,45 @@ mod tests {
     }
 
     #[test]
+    fn a_value_the_app_learns_again_is_dropped_quietly() {
+        let dir = temp_config_dir("relearned");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let text = r#"{"last_speaker_id":"x","speaker_settings":{"uuid:a":{"hidden":true,"upnp_stream_profile":"flac"},
+            "airplay:B":{"hidden":true,"airplay_opener":"something-newer"}}}"#;
+        std::fs::write(&path, text).unwrap();
+        let c = UserConfig::load_from(&path);
+        assert!(c.speaker_settings["uuid:a"].hidden);
+        assert_eq!(c.speaker_settings["uuid:a"].upnp_stream_profile, None);
+        assert!(c.speaker_settings["airplay:B"].hidden);
+        assert_eq!(c.speaker_settings["airplay:B"].airplay_opener, None);
+        // Nothing to tell the person...
+        assert!(c.load_notice().is_empty(), "{:?}", c.load_notice());
+        assert_eq!(c.load_notice().describe(&no_names), None);
+        // ...but the copy and the save happen as for any value left out.
+        let copies: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("config.json.before-reset-"))
+            .collect();
+        assert_eq!(copies.len(), 1);
+        let on_disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["speaker_settings"]["uuid:a"]["upnp_stream_profile"], serde_json::Value::Null);
+        // With a value the person chose dropped too, the notice names only that.
+        std::fs::write(
+            &path,
+            r#"{"speaker_settings":{"uuid:a":{"hidden":"yes","upnp_stream_profile":"flac"}}}"#,
+        )
+        .unwrap();
+        let c = UserConfig::load_from(&path);
+        let names = |id: &str| (id == "uuid:a").then(|| "Kitchen".to_string());
+        let said = c.load_notice().describe(&names).unwrap();
+        assert!(said.contains("Kitchen: Hide this speaker from the list."), "{said}");
+        assert!(!said.contains("stream"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_copy_kept_aside_holds_secrets_sealed() {
         use crate::secret_store::tests::FakeCodec;
         let dir = temp_config_dir("reset-copy-sealed");
@@ -2212,6 +2296,89 @@ mod tests {
     }
 
     #[test]
+    fn a_save_and_a_read_never_wait_for_another_save_being_written() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        /// The real disk, whose first rename waits until it is let go: a
+        /// slow flush.
+        struct Slow {
+            entered: Mutex<Sender<()>>,
+            go: Mutex<Receiver<()>>,
+            held: AtomicBool,
+        }
+        impl FileOps for Slow {
+            fn read(&self, p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                Disk.read(p)
+            }
+            fn create_flushed(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> {
+                Disk.create_flushed(p, b)
+            }
+            fn rename(&self, f: &std::path::Path, t: &std::path::Path) -> std::io::Result<()> {
+                if !self.held.swap(true, Ordering::SeqCst) {
+                    let _ = self.entered.lock().unwrap().send(());
+                    let _ = self.go.lock().unwrap().recv();
+                }
+                Disk.rename(f, t)
+            }
+            fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+                Disk.remove(p)
+            }
+            fn create_dir_all(&self, d: &std::path::Path) -> std::io::Result<()> {
+                Disk.create_dir_all(d)
+            }
+            fn list(&self, d: &std::path::Path) -> std::io::Result<Vec<String>> {
+                Disk.list(d)
+            }
+            fn age(&self, p: &std::path::Path) -> Option<std::time::Duration> {
+                Disk.age(p)
+            }
+        }
+        let dir = temp_config_dir("overlapping-saves");
+        let path = dir.join("config.json");
+        let cell = Arc::new(SettingsCell::new(UserConfig::at_path(path.clone())));
+        let (entered_tx, entered) = channel();
+        let (go, go_rx) = channel();
+        let slow = Slow { entered: Mutex::new(entered_tx), go: Mutex::new(go_rx), held: AtomicBool::new(false) };
+        // One save is being written, slowly.
+        let first = {
+            let mut uc = cell.lock().unwrap();
+            uc.last_speaker_id = Some("first".into());
+            uc.prepare(&path, &PlatformCodec, &Disk).unwrap().unwrap()
+        };
+        let writer = std::thread::spawn(move || first.run(&slow));
+        entered.recv_timeout(Duration::from_secs(10)).expect("the first write started");
+        // Meanwhile another thread changes a setting and saves: the save
+        // returns at once, and the lock is free again for a reader.
+        let (saved_tx, saved) = channel();
+        let saver = {
+            let cell = cell.clone();
+            std::thread::spawn(move || {
+                let mut uc = cell.lock().unwrap();
+                uc.last_speaker_id = Some("second".into());
+                uc.save();
+                saved_tx.send(()).unwrap();
+            })
+        };
+        saved.recv_timeout(Duration::from_secs(5)).expect("a save waited for another save's write");
+        let (read_tx, read) = channel();
+        let reader = {
+            let cell = cell.clone();
+            std::thread::spawn(move || read_tx.send(cell.lock().unwrap().last_speaker_id.clone()).unwrap())
+        };
+        let seen = read.recv_timeout(Duration::from_secs(5)).expect("a reader waited for a write");
+        assert_eq!(seen.as_deref(), Some("second"));
+        // Let the slow write finish: the newer save follows it.
+        go.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        saver.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(UserConfig::load_from(&path).last_speaker_id.as_deref(), Some("second"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn of_two_saves_the_newer_state_stays_on_the_disk() {
         use crate::settings_file::tests::PowerCutDisk;
         let path = PathBuf::from("/profile/StreamToSpeaker/config.json");
@@ -2279,16 +2446,37 @@ mod tests {
 
     #[test]
     fn every_setting_has_a_name_the_window_uses() {
+        // Every setting, and every setting of a speaker, has a name for the
+        // reset notice or is one the app learns again by itself.
         let defaults = serde_json::to_value(UserConfig::default()).unwrap();
         for key in defaults.as_object().unwrap().keys() {
-            assert!(setting_label(key).is_some(), "{key} has no label for the reset notice");
+            let path = [key.clone()];
+            assert!(setting_label(key).is_some() || relearned(&path), "{key}: no label for the reset notice");
         }
-        // A speaker's own settings too (every field is set in this entry).
+        let speaker = serde_json::to_value(SpeakerSettings::default()).unwrap();
+        for key in speaker.as_object().unwrap().keys() {
+            let labelled = SPEAKER_LABELS.iter().any(|(k, _, _)| k == key);
+            let path = ["speaker_settings".to_string(), "uuid:x".into(), key.clone()];
+            assert!(labelled || relearned(&path), "speaker setting {key}: no label for the reset notice");
+        }
+        // The names said to be the window's are, word for word, in the
+        // window's code.
+        const WINDOW: &str = include_str!("gui.rs");
+        let named = SETTING_LABELS.iter().chain(SPEAKER_LABELS).chain([&WHOLE_SPEAKER_LABEL]);
+        for (key, label, in_window) in named {
+            if *in_window {
+                assert!(WINDOW.contains(label), "{key}: the window doesn't say {label:?}");
+            }
+        }
+        // A speaker setting left out of the saved form while unset
+        // (`skip_serializing_if`) isn't among the defaults' keys: the entry
+        // of `everything_set()`, where every field is set, has them all.
         let all = everything_set();
         let (id, entry) = all.speaker_settings.iter().next().unwrap();
-        for field in serde_json::to_value(entry).unwrap().as_object().unwrap().keys() {
-            let path: KeyPath = vec!["speaker_settings".into(), id.clone(), field.clone()];
-            assert_ne!(reset_label(&path, &no_names), "A speaker: its settings", "{field} has no label for the reset notice");
+        for key in serde_json::to_value(entry).unwrap().as_object().unwrap().keys() {
+            let labelled = SPEAKER_LABELS.iter().any(|(k, _, _)| k == key);
+            let path = ["speaker_settings".to_string(), id.clone(), key.clone()];
+            assert!(labelled || relearned(&path), "speaker setting {key}: no label for the reset notice");
         }
     }
 
@@ -2344,7 +2532,7 @@ mod tests {
         assert_eq!(
             many.describe(&no_names).unwrap(),
             "Some settings couldn't be read and were reset or left out: Equalizer; Sendspin and Music \
-             Assistant; A speaker added by address; Privacy mode; and 2 more."
+             Assistant; Speakers added by address; Privacy mode; and 2 more."
         );
     }
 

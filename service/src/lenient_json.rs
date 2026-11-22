@@ -20,18 +20,17 @@ use std::collections::HashSet;
 /// in the tree as given: hiding an item doesn't renumber the others).
 pub type KeyPath = Vec<String>;
 
-/// Values hidden one by one before a parse gives up on the details and
-/// hides the top-level setting a failure is in: bounds the work on a file
-/// full of values this version can't read. Each hidden value costs a parse
-/// of the whole tree, so the bound is [`PARSE_BUDGET`] nodes in all, and
-/// never fewer than [`FINE_REMOVALS_MIN`] values.
-const FINE_REMOVALS_MIN: usize = 64;
-
-/// Nodes all the parses of one load may visit together, before the bound
-/// above sets in: a few tens of milliseconds.
-const PARSE_BUDGET: usize = 4_000_000;
+/// Values visited (a node of the tree each time a parse reaches it) by
+/// the parses that hide failing values one at a time. Each hidden value
+/// costs a parse up to the next failure, so this bounds the work on a file
+/// full of values this version can't read; past it, each top-level setting
+/// is read once on its own and those that fail are left out whole (see
+/// [`from_value`]). An ordinary settings file has a few hundred nodes and
+/// never comes near it.
+pub const FINE_BUDGET: usize = 2_000_000;
 
 /// The number of values (of any kind) in `tree`.
+#[cfg(test)]
 fn count_nodes(tree: &Value) -> usize {
     let mut stack = vec![tree];
     let mut count = 0usize;
@@ -50,31 +49,69 @@ fn count_nodes(tree: &Value) -> usize {
 /// order they were found (a value left out inside one that was left out
 /// as well is not listed). `Err` when `T` can't be read even with every
 /// value left out (the tree isn't an object, for a struct).
+///
+/// The work is bounded whatever the file: the passes that hide one value
+/// each visit [`FINE_BUDGET`] nodes at most in all; then each top-level
+/// setting is read once on its own, and a last pass reads the rest: about
+/// twice the file more.
 pub fn from_value<T: DeserializeOwned>(tree: &Value) -> Result<(T, Vec<KeyPath>), String> {
-    let fine_removals = (PARSE_BUDGET / count_nodes(tree).max(1)).max(FINE_REMOVALS_MIN);
+    from_value_within(tree, FINE_BUDGET).map(|(t, lost, _)| (t, lost))
+}
+
+/// [`from_value`] with `budget` for [`FINE_BUDGET`]; also the nodes
+/// visited in all.
+fn from_value_within<T: DeserializeOwned>(tree: &Value, budget: usize) -> Result<(T, Vec<KeyPath>, usize), String> {
     let mut hidden: HashSet<KeyPath> = HashSet::new();
     let mut found: Vec<KeyPath> = Vec::new();
+    let mut visits = 0usize;
+    // One parse of `tree` with `hidden` left out: the value, or where (and
+    // why) it failed.
+    let parse = |hidden: &HashSet<KeyPath>, visits: &mut usize| {
+        let ctx = Context { failure: RefCell::new(None), hidden, visits: std::cell::Cell::new(1) };
+        let result = T::deserialize(Tracked { value: tree, path: Vec::new(), ctx: &ctx });
+        *visits = visits.saturating_add(ctx.visits.get());
+        result.map_err(|e| (ctx.failure.into_inner().unwrap_or_default(), e.to_string()))
+    };
+    let lost = |found: &[KeyPath], hidden: &HashSet<KeyPath>| -> Vec<KeyPath> {
+        found
+            .iter()
+            .filter(|p| !(1..p.len()).any(|n| p.get(..n).is_some_and(|a| hidden.contains(a))))
+            .cloned()
+            .collect()
+    };
+    // One value at a time, within the budget.
     loop {
-        let ctx = Context { failure: RefCell::new(None), hidden: &hidden };
-        let error = match T::deserialize(Tracked { value: tree, path: Vec::new(), ctx: &ctx }) {
-            Ok(t) => {
-                let lost = found
-                    .iter()
-                    .filter(|p| !(1..p.len()).any(|n| p.get(..n).is_some_and(|a| hidden.contains(a))))
-                    .cloned()
-                    .collect();
-                return Ok((t, lost));
-            }
-            Err(e) => e,
+        let (path, error) = match parse(&hidden, &mut visits) {
+            Ok(t) => return Ok((t, lost(&found, &hidden), visits)),
+            Err(failed) => failed,
         };
-        let mut path = ctx.failure.into_inner().unwrap_or_default();
-        if found.len() >= fine_removals {
-            path.truncate(1);
+        if path.is_empty() || hidden.contains(&path) {
+            return Err(error);
         }
-        if path.is_empty() || !hidden.insert(path.clone()) {
-            return Err(error.to_string());
+        if visits >= budget {
+            break;
         }
+        hidden.insert(path.clone());
         found.push(path);
+    }
+    // Past the budget: each top-level setting on its own; one that fails
+    // that way is left out whole.
+    let keys: Vec<String> = tree.as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    for key in &keys {
+        let whole = vec![key.clone()];
+        if hidden.contains(&whole) {
+            continue;
+        }
+        let mut alone = hidden.clone();
+        alone.extend(keys.iter().filter(|k| *k != key).map(|k| vec![k.clone()]));
+        if parse(&alone, &mut visits).is_err() {
+            hidden.insert(whole.clone());
+            found.push(whole);
+        }
+    }
+    match parse(&hidden, &mut visits) {
+        Ok(t) => Ok((t, lost(&found, &hidden), visits)),
+        Err((_, error)) => Err(error),
     }
 }
 
@@ -84,6 +121,8 @@ struct Context<'a> {
     failure: RefCell<Option<KeyPath>>,
     /// Values the parse doesn't see.
     hidden: &'a HashSet<KeyPath>,
+    /// Nodes the parse reached.
+    visits: std::cell::Cell<usize>,
 }
 
 /// A value being parsed at `path`.
@@ -95,6 +134,7 @@ struct Tracked<'a> {
 
 impl<'a> Tracked<'a> {
     fn child(&self, key: String, value: &'a Value) -> Tracked<'a> {
+        self.ctx.visits.set(self.ctx.visits.get().saturating_add(1));
         let mut path = self.path.clone();
         path.push(key);
         Tracked { value, path, ctx: self.ctx }
@@ -105,6 +145,8 @@ impl<'a> Tracked<'a> {
     }
 
     fn hides(&self, key: &str) -> bool {
+        // Skipping a hidden value is work too.
+        self.ctx.visits.set(self.ctx.visits.get().saturating_add(1));
         let mut path = self.path.clone();
         path.push(key.to_string());
         self.ctx.hidden.contains(&path)
@@ -415,13 +457,15 @@ mod tests {
     fn a_tree_full_of_bad_values_ends_in_bounded_work() {
         let entries: Vec<Value> = (0..5000).map(|i| json!({"host": i})).collect();
         let tree = json!({"name": "kept", "entries": entries, "by_id": {"x": {"on": true}}});
-        let (o, removed) = from_value::<Outer>(&tree).unwrap();
+        let nodes = count_nodes(&tree);
+        let (o, removed, visits) = from_value_within::<Outer>(&tree, FINE_BUDGET).unwrap();
         assert_eq!(o.name.as_deref(), Some("kept"));
         assert!(o.entries.is_empty());
         assert_eq!(o.by_id.len(), 1, "other settings are not touched");
-        // The entries left out one by one are inside the list left out
-        // as a whole: only the list is listed.
-        assert_eq!(removed, [path(&["entries"])]);
+        // Every entry is bad: each is left out, or the list as a whole once
+        // the budget is spent.
+        assert!(removed.iter().all(|p| p.first().map(String::as_str) == Some("entries")), "{removed:?}");
+        assert!(visits <= FINE_BUDGET + 16 * nodes, "{visits}");
     }
 
     #[test]
@@ -431,6 +475,29 @@ mod tests {
         assert_eq!(o.entries.len(), 300);
         assert!(o.entries.iter().all(|e| e.port == 0));
         assert_eq!(removed.len(), 300);
+    }
+
+    #[test]
+    fn a_huge_file_with_its_failures_at_the_end_costs_a_bounded_number_of_parses() {
+        // Many good entries, then bad ones: each fine-grained pass reads the
+        // whole list before it fails.
+        let mut entries: Vec<Value> = (0..2000).map(|i| json!({"host": format!("h{i}")})).collect();
+        entries.extend((0..100).map(|i| json!({"host": i})));
+        let tree = json!({"name": "kept", "entries": entries, "by_id": {"x": {"on": true}}});
+        let nodes = count_nodes(&tree);
+        let budget = 10 * nodes;
+        let (o, removed, visits) = from_value_within::<Outer>(&tree, budget).unwrap();
+        // The budget, then a few more readings of the file (a reading visits
+        // each node a few times: its key, its value, the check for hiding).
+        assert!(visits <= budget + 16 * nodes, "{visits} visits for {nodes} nodes");
+        // What fails on its own is left out whole; the rest is kept.
+        assert_eq!(o.name.as_deref(), Some("kept"));
+        assert_eq!(o.by_id.len(), 1);
+        assert!(o.entries.is_empty());
+        assert_eq!(removed, [path(&["entries"])]);
+        // An ordinary file never comes near the budget: one reading.
+        let (_, removed, visits) = from_value_within::<Outer>(&json!({"name": "n", "count": 2}), FINE_BUDGET).unwrap();
+        assert!(removed.is_empty() && visits <= 12, "{visits}");
     }
 
     #[test]

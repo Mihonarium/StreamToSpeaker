@@ -2233,7 +2233,7 @@ impl StreamToSpeakerApp {
     fn show_settings_banner(&self, ui: &mut egui::Ui, p: &Palette) {
         // While saves fail, try again every few seconds: the strip goes by
         // itself once a save works.
-        self.app.retry_settings_save_if_due(Instant::now());
+        let _ = self.app.retry_settings_save_if_due(Instant::now());
         let (problem, notice) = self.app.settings_attention();
         if problem.is_none() && notice.is_none() {
             return;

@@ -129,35 +129,80 @@ pub struct SourceService {
     refused: Option<PortRefusal>,
 }
 
-/// A listener on `port`; when that port can't be bound, one on a port the
-/// system picks, so the input keeps working for a Music Assistant that
-/// finds it through mDNS, and why `port` couldn't be had. No wait: `stop`
-/// gives the port back before it returns, so a port that is taken now is
-/// another program's.
-fn bind_listener(port: u16) -> std::io::Result<(TcpListener, Option<PortRefusal>)> {
-    bind_listener_with(port, &|p| TcpListener::bind(("0.0.0.0", p)))
+/// How long after this app gave a port back it counts as its own: Windows
+/// can take a moment to be done with a connection that was just closed.
+const OWN_PORT_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a start waits for a port this app gave back within
+/// [`OWN_PORT_GRACE`] while it is still in use.
+const OWN_PORT_WAIT: Duration = Duration::from_millis(250);
+
+/// Ports this process stopped listening on lately, and when.
+static GIVEN_BACK: Mutex<Vec<(u16, Instant)>> = Mutex::new(Vec::new());
+
+/// Note that this process stopped listening on `port`.
+fn note_given_back(port: u16) {
+    let now = Instant::now();
+    let mut given = GIVEN_BACK.lock().unwrap_or_else(|e| e.into_inner());
+    given.retain(|(p, at)| *p != port && now.saturating_duration_since(*at) < OWN_PORT_GRACE);
+    given.push((port, now));
 }
 
+/// Whether this process gave `port` back less than [`OWN_PORT_GRACE`]
+/// before `now`.
+fn given_back_lately(port: u16, now: Instant) -> bool {
+    let given = GIVEN_BACK.lock().unwrap_or_else(|e| e.into_inner());
+    given.iter().any(|(p, at)| *p == port && now.saturating_duration_since(*at) < OWN_PORT_GRACE)
+}
+
+/// A listener on `port`; when that port can't be bound, one on a port the
+/// system picks, so the input keeps working for a Music Assistant that
+/// finds it through mDNS, and why `port` couldn't be had. A port in use is
+/// waited for only when this app itself gave it back a moment ago (see
+/// [`OWN_PORT_GRACE`]); `stop` gives the port back before it returns, so
+/// otherwise a port that is taken is another program's.
+fn bind_listener(port: u16) -> std::io::Result<(TcpListener, Option<PortRefusal>)> {
+    let ours = given_back_lately(port, Instant::now());
+    bind_listener_with(port, &|p| TcpListener::bind(("0.0.0.0", p)), ours)
+}
+
+/// [`bind_listener`] with `bind`; `ours`: this app gave `port` back a
+/// moment ago.
 fn bind_listener_with(
     port: u16,
     bind: &dyn Fn(u16) -> std::io::Result<TcpListener>,
+    ours: bool,
 ) -> std::io::Result<(TcpListener, Option<PortRefusal>)> {
-    match bind(port) {
-        Ok(listener) => Ok((listener, None)),
-        Err(e) if port != 0 => {
-            warn!(
-                "Sendspin source: port {port} isn't available ({e}); listening on another port, \
-                 which Music Assistant finds on this network but can't be given by address"
-            );
-            let why = if e.kind() == std::io::ErrorKind::AddrInUse {
-                PortRefusal::InUse
-            } else {
-                PortRefusal::Unavailable(e.to_string())
-            };
-            Ok((bind(0)?, Some(why)))
+    let in_use = |e: &std::io::Error| e.kind() == std::io::ErrorKind::AddrInUse;
+    let mut error = match bind(port) {
+        Ok(listener) => return Ok((listener, None)),
+        Err(e) if port == 0 => return Err(e),
+        Err(e) => e,
+    };
+    let mut still_closing = false;
+    if in_use(&error) && ours {
+        let deadline = Instant::now() + OWN_PORT_WAIT;
+        while in_use(&error) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+            match bind(port) {
+                Ok(listener) => return Ok((listener, None)),
+                Err(e) => error = e,
+            }
         }
-        Err(e) => Err(e),
+        still_closing = in_use(&error);
     }
+    warn!(
+        "Sendspin source: port {port} isn't available ({error}); listening on another port, which \
+         Music Assistant finds on this network but can't be given by address"
+    );
+    let why = if still_closing {
+        PortRefusal::StillClosing
+    } else if in_use(&error) {
+        PortRefusal::InUse
+    } else {
+        PortRefusal::Unavailable(error.to_string())
+    };
+    Ok((bind(0)?, Some(why)))
 }
 
 /// Why the input doesn't listen on the port it was asked for.
@@ -165,6 +210,9 @@ fn bind_listener_with(
 pub enum PortRefusal {
     /// Another program listens on it.
     InUse,
+    /// This input listened on it a moment ago, and Windows wasn't done with
+    /// it yet.
+    StillClosing,
     /// Binding it failed otherwise (Windows reserves port ranges for
     /// Hyper-V and the like, say); the system's words.
     Unavailable(String),
@@ -270,7 +318,9 @@ impl SourceService {
         if self.shared.stop.swap(true, Ordering::SeqCst) {
             return;
         }
-        drop(self.shared.listener.lock().unwrap_or_else(|e| e.into_inner()).take());
+        if self.shared.listener.lock().unwrap_or_else(|e| e.into_inner()).take().is_some() {
+            note_given_back(self.port);
+        }
         if let Some(f) = &self.mdns_fullname {
             mdns::unregister(f);
         }
@@ -1363,12 +1413,58 @@ mod tests {
                 TcpListener::bind(("127.0.0.1", p))
             }
         };
-        let (listener, why) = bind_listener_with(8928, &refuse).unwrap();
+        let (listener, why) = bind_listener_with(8928, &refuse, true).unwrap();
         assert_ne!(listener.local_addr().unwrap().port(), 8928);
         assert_eq!(why, Some(PortRefusal::Unavailable("reserved".into())));
         // A port that binds: no reason.
-        let (_, why) = bind_listener_with(0, &refuse).unwrap();
+        let (_, why) = bind_listener_with(0, &refuse, false).unwrap();
         assert_eq!(why, None);
+    }
+
+    /// A bind that refuses the wanted port as in use `refusals` times,
+    /// and counts its calls.
+    fn in_use(refusals: usize) -> (std::cell::Cell<usize>, impl Fn(&std::cell::Cell<usize>, u16) -> std::io::Result<TcpListener>) {
+        let bind = move |calls: &std::cell::Cell<usize>, p: u16| {
+            calls.set(calls.get() + 1);
+            if p == 8928 && calls.get() <= refusals {
+                Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+            } else {
+                TcpListener::bind(("127.0.0.1", if p == 8928 { 0 } else { p }))
+            }
+        };
+        (std::cell::Cell::new(0), bind)
+    }
+
+    #[test]
+    fn a_port_this_app_just_gave_back_is_waited_for_briefly() {
+        // Windows may not be done with it yet (a connection that was just
+        // closed): tried again, and taken.
+        let (calls, bind) = in_use(2);
+        let (_, why) = bind_listener_with(8928, &|p| bind(&calls, p), true).unwrap();
+        assert_eq!((why, calls.get()), (None, 3));
+        // Still not free after the wait: another port for now, and not
+        // blamed on another program.
+        let (calls, bind) = in_use(usize::MAX);
+        let started = Instant::now();
+        let (_, why) = bind_listener_with(8928, &|p| bind(&calls, p), true).unwrap();
+        assert_eq!(why, Some(PortRefusal::StillClosing));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // A port this app didn't hold a moment ago: one try, then another
+        // port at once.
+        let (calls, bind) = in_use(usize::MAX);
+        let (_, why) = bind_listener_with(8928, &|p| bind(&calls, p), false).unwrap();
+        assert_eq!((why, calls.get()), (Some(PortRefusal::InUse), 2));
+    }
+
+    #[test]
+    fn stopping_notes_the_port_it_gave_back() {
+        let port = free_port();
+        let svc = start_on(port);
+        svc.stop();
+        let now = Instant::now();
+        assert!(given_back_lately(port, now));
+        assert!(!given_back_lately(port, now + Duration::from_secs(3)));
+        assert!(!given_back_lately(port.wrapping_add(1), now));
     }
 
     #[test]
