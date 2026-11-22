@@ -278,10 +278,12 @@ impl FakeRaop {
                             next += 1;
                             shared.push(Event::Connected { conn, at: Instant::now() });
                             let worker = shared.clone();
-                            // Out of threads: the connection is dropped, as a
-                            // receiver that can't serve it would.
-                            if let Ok(h) = std::thread::Builder::new().spawn(move || serve(conn, sock, &worker)) {
-                                threads.lock().unwrap_or_else(|e| e.into_inner()).push(h);
+                            // Out of threads (the machine's limit): the
+                            // connection is dropped, as a receiver that can't
+                            // serve it would, and the test's output says so.
+                            match std::thread::Builder::new().spawn(move || serve(conn, sock, &worker)) {
+                                Ok(h) => threads.lock().unwrap_or_else(|e| e.into_inner()).push(h),
+                                Err(e) => eprintln!("fake receiver: no thread to serve connection {} ({}); dropped it", conn, e),
                             }
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(POLL),
@@ -557,7 +559,7 @@ mod tests {
                     return (String::from_utf8_lossy(&buf[..end + 4 + len]).to_string(), reads);
                 }
             }
-            let n = s.read(&mut tmp).unwrap();
+            let n = s.read(&mut tmp).unwrap_or_else(|e| panic!("reading the reply: {e:?}"));
             assert!(n > 0, "connection closed mid-reply");
             reads += 1;
             buf.extend_from_slice(&tmp[..n]);
