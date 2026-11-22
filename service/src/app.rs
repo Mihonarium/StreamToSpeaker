@@ -2467,9 +2467,11 @@ impl App {
         };
         let remembered = if sonos { None } else { self.speaker_settings(settings_id).upnp_stream_profile };
         let plan = stream_profile::plan(sonos, remembered, &sinks);
-        let then: Vec<String> = plan.attempts.iter().skip(1).map(|p| p.to_string()).collect();
-        let fallbacks = if then.is_empty() { String::new() } else { format!("; if refused, {}", then.join(", then ")) };
-        info!("UPnP: {}: offering {}, because {}{}", name, plan.attempts[0], plan.why, fallbacks);
+        if let Some((first, then)) = plan.attempts.split_first() {
+            let then: Vec<String> = then.iter().map(|p| p.to_string()).collect();
+            let fallbacks = if then.is_empty() { String::new() } else { format!("; if refused, {}", then.join(", then ")) };
+            info!("UPnP: {}: offering {}, because {}{}", name, first, plan.why, fallbacks);
+        }
         StreamOffer { base_url, attempts: plan.attempts, initial_buffer_ms: self.config.initial_buffer_ms }
     }
 

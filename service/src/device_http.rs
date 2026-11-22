@@ -300,7 +300,7 @@ fn read_response(r: &mut Reader, method: &str) -> Result<Response, HttpError> {
                     break;
                 }
             }
-            let end = (body_start + n).min(r.buf.len());
+            let end = body_start.saturating_add(n).min(r.buf.len());
             r.buf[body_start..end].to_vec()
         }
         Framing::Chunked => {
@@ -368,7 +368,9 @@ impl Chunks {
                     p = next;
                 }
             }
-            let end = start + size;
+            let Some(end) = start.checked_add(size) else {
+                return Err(HttpError::Malformed("chunk size".into()));
+            };
             let Some(after) = data.get(end..) else { return Ok(false) };
             let skip = if after.starts_with(b"\r\n") {
                 2
@@ -505,6 +507,27 @@ mod tests {
     fn an_answer_closed_before_its_length_keeps_what_came() {
         let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n<short/>"));
         assert_eq!(body(&get(&fake.url("/"), &limits()).unwrap()), "<short/>");
+    }
+
+    #[test]
+    fn the_largest_lengths_a_device_can_name_are_bounded_not_trusted() {
+        // The longest Content-Length accepted, then the device closes.
+        let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 9999999999999999999\r\n\r\n<short/>"));
+        assert_eq!(body(&get(&fake.url("/"), &limits()).unwrap()), "<short/>");
+        // The same, with the connection left open: the size bound ends it.
+        let small = Limits { max_bytes: 1000, ..limits() };
+        let fake = FakeRenderer::start(|_| {
+            Reply::raw(format!("HTTP/1.1 200 OK\r\nContent-Length: 9999999999999999999\r\n\r\n{}", "x".repeat(2000))).then_hold_open()
+        });
+        assert!(matches!(get(&fake.url("/"), &small), Err(HttpError::TooLarge(1000))));
+        // The longest chunk size accepted, cut short; one digit more is refused.
+        let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffff\r\nab"));
+        assert!(matches!(get(&fake.url("/"), &limits()), Err(HttpError::CutOff(_))));
+        let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nab"));
+        assert!(matches!(get(&fake.url("/"), &limits()), Err(HttpError::Malformed(_))));
+        // Twenty digits of length: refused, not wrapped.
+        let fake = FakeRenderer::start(|_| Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\nab"));
+        assert!(matches!(get(&fake.url("/"), &limits()), Err(HttpError::Malformed(_))));
     }
 
     #[test]
