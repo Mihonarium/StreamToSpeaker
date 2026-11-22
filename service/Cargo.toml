@@ -39,7 +39,6 @@ socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"
 byteorder = "1"
 url = "2"
-percent-encoding = "2"
 # Persisted user preferences live in %APPDATA%\StreamToSpeaker\config.json
 # (last selected speaker, onboarding dismissal). Tiny surface, serde is
 # the obvious fit.

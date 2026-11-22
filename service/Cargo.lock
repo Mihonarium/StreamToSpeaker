@@ -3681,7 +3681,6 @@ dependencies = [
  "mdns-sd",
  "num-bigint",
  "num-traits",
- "percent-encoding",
  "plist",
  "rand",
  "raw-window-handle",
