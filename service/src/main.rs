@@ -577,7 +577,7 @@ fn run(cli: Cli) -> Result<()> {
 
     // Build the audio source up front so we fail fast if the driver is
     // missing under --source driver.
-    let (source, reopen_source) = build_source(&cli)?;
+    let Source { audio: source, reopen: reopen_source, driver: uses_driver } = build_source(&cli)?;
     info!("audio source: {}", source.name());
 
     let app = setup_app(&cli)?;
@@ -620,6 +620,14 @@ fn run(cli: Cli) -> Result<()> {
     // Driver-event consumer.
     #[cfg(windows)]
     spawn_driver_event_consumer(app.clone(), &cli);
+
+    // The driver's device in Windows' sound settings is named after the
+    // speaker being played on ("Stream To Speaker → Kitchen"), and only
+    // while it is.
+    #[cfg(windows)]
+    if uses_driver {
+        app.follow_endpoint_label(stream_to_speaker::endpoint_name::update_endpoint_name);
+    }
 
     // Auto-reconnect watchdog — replaces a dropped AirPlay session with a
     // fresh one so the UI never shows a zombie "streaming" state.
@@ -766,13 +774,21 @@ fn run(cli: Cli) -> Result<()> {
     // Speakers set to connect automatically whenever they appear.
     app.spawn_auto_connect();
 
-    if cli.headless {
+    let ran = if cli.headless {
         run_headless(app)
     } else {
         // Keep an existing sign-in entry pointing at this exe.
         stream_to_speaker::autostart::reapply();
         run_gui_mode(app, cli.no_tray, cli.startup && !cli.no_tray)
+    };
+    // Nothing plays on a speaker any more: the device's plain name.
+    #[cfg(windows)]
+    if uses_driver {
+        stream_to_speaker::endpoint_name::update_endpoint_name_within(None, Duration::from_secs(1));
     }
+    #[cfg(not(windows))]
+    let _ = uses_driver;
+    ran
 }
 
 // -----------------------------------------------------------------------------
@@ -1014,17 +1030,32 @@ fn cmd_web_link(cli: &Cli) -> Result<()> {
 // Source selection
 // -----------------------------------------------------------------------------
 
-/// The audio source the flags ask for, and how to open the same kind again
-/// if it fails while the app runs (the audio loop does that). Under `auto`
-/// that is the kind found at start: a driver that goes away during a
-/// driver update is waited for, not swapped for WASAPI.
-fn build_source(cli: &Cli) -> Result<(Box<dyn AudioSource>, audio_loop::Reopen)> {
+/// The audio source a run reads.
+struct Source {
+    audio: Box<dyn AudioSource>,
+    /// How to open the same kind again if it fails while the app runs (the
+    /// audio loop does that).
+    reopen: audio_loop::Reopen,
+    /// It is the Stream To Speaker driver.
+    driver: bool,
+}
+
+impl Source {
+    fn new(audio: Box<dyn AudioSource>, reopen: audio_loop::Reopen, driver: bool) -> Self {
+        Self { audio, reopen, driver }
+    }
+}
+
+/// The audio source the flags ask for. Under `auto`, reopening keeps to the
+/// kind found at start: a driver that goes away during a driver update is
+/// waited for, not swapped for WASAPI.
+fn build_source(cli: &Cli) -> Result<Source> {
     match cli.source {
-        SourceKind::Sine => Ok((open_sine()?, Box::new(open_sine))),
+        SourceKind::Sine => Ok(Source::new(open_sine()?, Box::new(open_sine), false)),
         SourceKind::WasapiLoopback => {
             #[cfg(windows)]
             {
-                Ok((open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone())))
+                Ok(Source::new(open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone()), false))
             }
             #[cfg(not(windows))]
             {
@@ -1036,7 +1067,7 @@ fn build_source(cli: &Cli) -> Result<(Box<dyn AudioSource>, audio_loop::Reopen)>
             {
                 let src = open_driver()
                     .context("opening Stream-To-Speaker kernel driver (--source driver was specified)")?;
-                Ok((src, Box::new(open_driver)))
+                Ok(Source::new(src, Box::new(open_driver), true))
             }
             #[cfg(not(windows))]
             {
@@ -1047,17 +1078,17 @@ fn build_source(cli: &Cli) -> Result<(Box<dyn AudioSource>, audio_loop::Reopen)>
             #[cfg(windows)]
             {
                 match open_driver() {
-                    Ok(s) => Ok((s, Box::new(open_driver))),
+                    Ok(s) => Ok(Source::new(s, Box::new(open_driver), true)),
                     Err(e) => {
                         info!("driver not present, falling back to WASAPI loopback: {}", e);
-                        Ok((open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone())))
+                        Ok(Source::new(open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone()), false))
                     }
                 }
             }
             #[cfg(not(windows))]
             {
                 warn!("non-Windows host; using sine source for --source auto");
-                Ok((open_sine()?, Box::new(open_sine)))
+                Ok(Source::new(open_sine()?, Box::new(open_sine), false))
             }
         }
     }

@@ -4071,6 +4071,39 @@ impl App {
         }
     }
 
+    /// Keep the Windows output device's name in step with the speaker being
+    /// played on: `apply(Some(name))` while one is bound, `apply(None)` (the
+    /// plain name) otherwise, at start and whenever that changes, however
+    /// the session ended. Looks every second.
+    pub fn follow_endpoint_label(self: &Arc<Self>, apply: impl Fn(Option<&str>) + Send + 'static) {
+        self.follow_endpoint_label_every(apply, Duration::from_secs(1));
+    }
+
+    /// [`App::follow_endpoint_label`], looking every `poll`.
+    pub(crate) fn follow_endpoint_label_every(
+        self: &Arc<Self>,
+        apply: impl Fn(Option<&str>) + Send + 'static,
+        poll: Duration,
+    ) {
+        let app = self.clone();
+        let spawned = std::thread::Builder::new().name("stream-to-speaker-device-name".into()).spawn(move || {
+            let mut applied: Option<Option<String>> = None;
+            loop {
+                let now = app.selected_speaker().map(|s| s.friendly_name);
+                if applied.as_ref() != Some(&now) {
+                    apply(now.as_deref());
+                    applied = Some(now);
+                }
+                if !app.sleep_unless_shutdown(poll) {
+                    return;
+                }
+            }
+        });
+        if spawned.is_err() {
+            warn!("couldn't start keeping the Windows device name in step with the speaker");
+        }
+    }
+
     /// Look for Sendspin speakers (when Sendspin is on in the settings)
     /// without offering this PC's sound to Music Assistant: for listing
     /// the speakers while another copy of the app may be running.
@@ -5259,6 +5292,28 @@ mod tests {
         assert!(got.recv_timeout(Duration::from_secs(5)).is_ok_and(|a| a.contains("#Stop")));
         assert_eq!(app.saved_speaker_id(), None);
         assert_eq!(*app.last_speaker_id.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn the_windows_device_name_follows_the_speaker_being_played_on() {
+        let app = test_app();
+        let names = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let record = names.clone();
+        app.follow_endpoint_label_every(
+            move |name| record.lock().unwrap().push(name.map(str::to_string)),
+            Duration::from_millis(5),
+        );
+        let seen = |n: usize| eventually(|| names.lock().unwrap().len() >= n);
+        // At start: back to the plain name, whatever a previous run left.
+        assert!(seen(1));
+        bind(&app, upnp_session(""));
+        assert!(seen(2));
+        // Disable takes the session: the plain name again.
+        app.set_streaming_enabled(false).unwrap();
+        assert!(seen(3));
+        std::thread::sleep(Duration::from_millis(50));
+        app.request_shutdown();
+        assert_eq!(*names.lock().unwrap(), [None, Some("Kitchen".to_string()), None]);
     }
 
     /// A listed speaker for the ranking table.

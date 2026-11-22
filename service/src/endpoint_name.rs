@@ -19,6 +19,8 @@
 use anyhow::{bail, Result};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use windows_sys::core::{GUID, HRESULT};
 use windows_sys::Win32::Foundation::BOOL;
@@ -119,15 +121,42 @@ fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// The name last asked for: asking again for the same one does nothing
+/// (the name follows the session, and more than one place asks).
+static LAST_ASKED: Mutex<Option<Option<String>>> = Mutex::new(None);
+
 /// Update the friendly name of the Stream To Speaker endpoint to
 /// reflect the active speaker. Pass `Some(name)` while streaming,
 /// `None` to revert to the default. Logs at warn-level on failure;
 /// caller does not need to handle the error.
 pub fn update_endpoint_name(active_speaker: Option<&str>) {
+    let _ = rename(active_speaker);
+}
+
+/// [`update_endpoint_name`], waiting up to `max` for the rename: at quit,
+/// where the process would otherwise end it half-way.
+pub fn update_endpoint_name_within(active_speaker: Option<&str>, max: Duration) {
+    if let Some(done) = rename(active_speaker) {
+        let _ = done.recv_timeout(max);
+    }
+}
+
+/// Start the rename unless that name was the last one asked for; the
+/// receiver hears when it is done.
+fn rename(active_speaker: Option<&str>) -> Option<crossbeam_channel::Receiver<()>> {
+    {
+        let wanted = active_speaker.map(str::to_string);
+        let mut last = LAST_ASKED.lock().unwrap();
+        if last.as_ref() == Some(&wanted) {
+            return None;
+        }
+        *last = Some(wanted);
+    }
     let new_name = match active_speaker {
         Some(s) => format!("Stream To Speaker{}{}", ARROW, s),
         None => "Stream To Speaker".to_string(),
     };
+    let (done_tx, done) = crossbeam_channel::bounded(1);
     // The whole thing — registry scan, COM init, IPC — can take
     // 100+ ms; do it on a detached thread so callers (GUI / select_
     // speaker) don't block.
@@ -141,8 +170,10 @@ pub fn update_endpoint_name(active_speaker: Option<&str>) {
                 // one failure that mattered never showed up in the log.
                 log::warn!("could not rename the Windows endpoint (cosmetic): {:#}", e);
             }
+            let _ = done_tx.send(());
         })
-        .ok();
+        .ok()?;
+    Some(done)
 }
 
 fn do_update(new_name: &str) -> Result<()> {
