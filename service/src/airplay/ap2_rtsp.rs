@@ -27,6 +27,7 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use crate::airplay::ap2_crypto::{ChannelCipher, HapReader, SessionKeys};
+use crate::airplay::ap2_health::AnchorFailure;
 use crate::airplay::hap_pairing::{
     M4Failure, PairSetupPin, PairVerify, PairingCredentials, StoredPairing, X_APPLE_HKP_PERSISTENT,
 };
@@ -689,9 +690,10 @@ impl Ap2Rtsp {
     }
 
     /// Second SETUP, buffered variant — type 103 over TCP, the stream kind
-    /// modern iOS senders use (feature bit 40). Codec-parameterized:
-    /// AAC-LC = (ct 4, spf 1024, audioFormat 0x400000) — what iOS sends;
-    /// ALAC   = (ct 2, spf 352,  audioFormat 0x40000).
+    /// modern iOS senders use (feature bit 40). The session offers AAC-LC
+    /// only (ct 4, spf 1024, audioFormat 0x400000 — what iOS sends): no
+    /// Apple sender sends buffered ALAC at 44.1 kHz, and no receiver is
+    /// known to play it.
     /// Playback is anchored via SETRATEANCHORTIME instead of control-port
     /// sync packets. The returned `data` port is **TCP**.
     pub fn setup_stream_buffered(
@@ -760,7 +762,15 @@ impl Ap2Rtsp {
     /// (our PTP grandmaster clock). `rate` 1 = play, 0 = pause. Field
     /// semantics verified against shairport-sync's handler: `networkTimeFrac`
     /// is a 64-bit binary fraction of a second.
-    pub fn set_rate_anchor_time(&mut self, rate: u64, rtp_time: u32, network_ns: u64, timeline_id: u64) -> Result<()> {
+    /// `Ok(Err(..))`: the receiver answered and refused; `Err`: no usable
+    /// answer.
+    pub fn set_rate_anchor_time(
+        &mut self,
+        rate: u64,
+        rtp_time: u32,
+        network_ns: u64,
+        timeline_id: u64,
+    ) -> Result<std::result::Result<(), AnchorFailure>> {
         let (secs, frac) = network_time_parts(network_ns);
         debug!(
             "AP2 SETRATEANCHORTIME: rate={} rtpTime={} secs={} frac={:#018x} timeline={:#018x}",
@@ -783,14 +793,17 @@ impl Ap2Rtsp {
         let uri = self.session_uri();
         let resp = self.request("SETRATEANCHORTIME", &uri, &[], Some("application/x-apple-binary-plist"), &body)?;
         if resp.status != 200 {
-            bail!(
-                "SETRATEANCHORTIME → {} {}{}",
-                resp.status,
-                resp.status_text,
-                describe_error_body(&resp.body)
-            );
+            return Ok(Err(AnchorFailure::Refused {
+                status: resp.status,
+                detail: format!(
+                    "SETRATEANCHORTIME → {} {}{}",
+                    resp.status,
+                    resp.status_text,
+                    describe_error_body(&resp.body)
+                ),
+            }));
         }
-        Ok(())
+        Ok(Ok(()))
     }
 
     /// Send `POST /feedback` — the ~2 s keepalive iOS senders emit — without

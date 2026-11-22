@@ -2135,10 +2135,16 @@ impl App {
                     }
 
                     // Is the bound session dead?
-                    let (id, name) = {
+                    let (id, name, reason) = {
                         let guard = app.session.lock().unwrap();
                         match guard.as_ref() {
-                            Some(s) if s.is_dead() => (s.stable_id(), s.friendly_name()),
+                            Some(s) if s.is_dead() => {
+                                let reason = match s {
+                                    ActiveSession::AirPlay2(a) => a.fault().and_then(|f| f.reconnect_text(&s.friendly_name())),
+                                    _ => None,
+                                };
+                                (s.stable_id(), s.friendly_name(), reason)
+                            }
                             _ => continue,
                         }
                     };
@@ -2148,8 +2154,11 @@ impl App {
                         name,
                         RECONNECT_GRACE.as_secs()
                     );
-                    app.record_fault(&format!("Connection to {} dropped", name));
-                    app.record_error(format!("Lost connection to {} — reconnecting…", name));
+                    let (fault, notice) = reason.unwrap_or_else(|| {
+                        (format!("Connection to {} dropped", name), format!("Lost connection to {} — reconnecting…", name))
+                    });
+                    app.record_fault(&fault);
+                    app.record_error(notice);
 
                     // Grace before the retry, cancellable by shutdown or a
                     // user Disable.

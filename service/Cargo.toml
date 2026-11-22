@@ -127,8 +127,9 @@ alac = "0.5"
 # WASAPI loopback fallback. cpal supports WASAPI loopback on Windows.
 cpal = "0.15"
 # AAC-LC encoding for AirPlay 2 buffered audio via the OS-provided Media
-# Foundation encoder (CLSID_AACMFTEncoder) — iOS senders use AAC-LC in
-# buffered mode and it's the only payload codec field-proven on Sonos.
+# Foundation encoder (CLSID_AACMFTEncoder) — Apple's senders use AAC-LC in
+# buffered mode, with a Sonos too; this app's buffered AAC has not been
+# heard on one.
 # The ergonomic `windows` crate (vs windows-sys) keeps the COM/MFT
 # plumbing sane; scoped to just the Media Foundation surface.
 windows = { version = "0.58", features = [

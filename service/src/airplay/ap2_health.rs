@@ -58,13 +58,80 @@ impl Ap2Fault {
     pub fn new(code: &'static str, channel: FaultChannel, retryable: bool, message: impl Into<String>) -> Self {
         Self { code, channel, retryable, message: message.into() }
     }
-}
 
-impl std::fmt::Display for Ap2Fault {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({}): {}", self.code, self.channel.label(), self.message)
+    /// For a fault that means the session to `name` couldn't play (the app
+    /// reconnects after it): the diagnostics' fault line and the window's
+    /// notice while reconnecting. None for faults that are a lost
+    /// connection, whose text is the app's own.
+    pub fn reconnect_text(&self, name: &str) -> Option<(String, String)> {
+        match self.code {
+            "anchor_failed" => {
+                Some((format!("{name} didn't start playing"), format!("{name} didn't start playing — reconnecting…")))
+            }
+            "encoder_failed" => Some((
+                format!("Windows' AAC encoder stopped working ({name})"),
+                format!("Windows' AAC encoder stopped working — reconnecting to {name}…"),
+            )),
+            _ => None,
+        }
     }
 }
+
+/// The message alone: for a fault that ends the session for good, it is
+/// what the window shows after "Connection to <speaker> ended:".
+impl std::fmt::Display for Ap2Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// How soon after a fault the next session to that speaker must start to
+/// be the reconnect that followed it: the watchdog reconnects about 5 s
+/// after a drop; the person picking the speaker again within this time
+/// counts too.
+pub const REPEAT_WINDOW: Duration = Duration::from_secs(120);
+
+/// Notes older than this are dropped: no reconnect that is still failing
+/// can follow them.
+const REPEAT_MEMORY_LIMIT: Duration = Duration::from_secs(3600);
+
+/// Recent faults per receiver of the kinds that mean a session cannot play
+/// (the encoder, the anchor), for [`FaultSlot::raise_unless_repeated`].
+#[derive(Debug, Default)]
+pub struct RepeatMemory {
+    recent: Vec<(String, &'static str, Instant)>,
+}
+
+impl RepeatMemory {
+    pub const fn new() -> Self {
+        Self { recent: Vec::new() }
+    }
+
+    /// Note fault `code`, raised at `now` by a session to `host` that
+    /// finished its bring-up at `started` and had or had not `played`.
+    /// True when this is the same thing again straight after the
+    /// reconnect: the same fault on that host is noted, this session
+    /// started within [`REPEAT_WINDOW`] after it (it is the reconnect), and
+    /// it failed before it played. That note is then forgotten, so a later
+    /// attempt starts over; otherwise this fault replaces it.
+    pub fn repeated(&mut self, host: &str, code: &'static str, started: Instant, played: bool, now: Instant) -> bool {
+        self.recent.retain(|(_, _, at)| now.saturating_duration_since(*at) < REPEAT_MEMORY_LIMIT);
+        let earlier = self.recent.iter().position(|(h, c, _)| h == host && *c == code);
+        let repeat = earlier.is_some_and(|i| {
+            let at = self.recent[i].2;
+            !played && started >= at && started.saturating_duration_since(at) <= REPEAT_WINDOW
+        });
+        if let Some(i) = earlier {
+            self.recent.swap_remove(i);
+        }
+        if !repeat {
+            self.recent.push((host.to_string(), code, now));
+        }
+        repeat
+    }
+}
+
+static REPEATS: Mutex<RepeatMemory> = Mutex::new(RepeatMemory::new());
 
 /// First-fault-wins slot shared by a session's threads. Raising a fault
 /// also sets the session's `dead` flag so the watchdog notices.
@@ -73,17 +140,61 @@ pub struct FaultSlot {
     fault: Arc<Mutex<Option<Ap2Fault>>>,
     dead: Arc<AtomicBool>,
     host: String,
+    /// When the session finished its bring-up; None until then.
+    started: Arc<Mutex<Option<Instant>>>,
 }
 
 impl FaultSlot {
     pub fn new(dead: Arc<AtomicBool>, host: String) -> Self {
-        Self { fault: Arc::new(Mutex::new(None)), dead, host }
+        Self { fault: Arc::new(Mutex::new(None)), dead, host, started: Arc::new(Mutex::new(None)) }
+    }
+
+    /// The session finished its bring-up at `started`: from now on its
+    /// faults count for the repeat rule. A bring-up that fails never arms
+    /// its slot, so a session that never existed leaves nothing to repeat.
+    pub fn arm(&self, started: Instant) {
+        *self.started.lock().unwrap() = Some(started);
     }
 
     pub fn raise(&self, fault: Ap2Fault) {
         let mut slot = self.fault.lock().unwrap();
         if slot.is_none() {
-            warn!("AirPlay 2 session to {} failed: {}", self.host, fault);
+            log_fault(&self.host, &fault);
+            *slot = Some(fault);
+        }
+        self.dead.store(true, Ordering::Release);
+    }
+
+    /// Raise a fault that means this session cannot play (the encoder, the
+    /// anchor): retryable with `detail`, so the app reconnects; final, with
+    /// `final_message` (a sentence for the person: what stopped working,
+    /// the likely cause, what to try), when this session is the reconnect
+    /// that followed the same fault on this receiver and failed before it
+    /// `played` ([`RepeatMemory::repeated`]).
+    pub fn raise_unless_repeated(
+        &self,
+        code: &'static str,
+        channel: FaultChannel,
+        detail: String,
+        played: bool,
+        final_message: impl FnOnce() -> String,
+    ) {
+        let mut slot = self.fault.lock().unwrap();
+        if slot.is_none() {
+            let started = *self.started.lock().unwrap();
+            let repeated = started.is_some_and(|started| {
+                REPEATS.lock().unwrap_or_else(|e| e.into_inner()).repeated(&self.host, code, started, played, Instant::now())
+            });
+            let fault = if repeated {
+                warn!(
+                    "AirPlay 2 session to {}: {} again straight after reconnecting ({}); not retrying",
+                    self.host, code, detail
+                );
+                Ap2Fault::new(code, channel, false, final_message())
+            } else {
+                Ap2Fault::new(code, channel, true, detail)
+            };
+            log_fault(&self.host, &fault);
             *slot = Some(fault);
         }
         self.dead.store(true, Ordering::Release);
@@ -92,6 +203,15 @@ impl FaultSlot {
     pub fn get(&self) -> Option<Ap2Fault> {
         self.fault.lock().unwrap().clone()
     }
+
+    #[cfg(test)]
+    pub(crate) fn armed(&self) -> bool {
+        self.started.lock().unwrap().is_some()
+    }
+}
+
+fn log_fault(host: &str, fault: &Ap2Fault) {
+    warn!("AirPlay 2 session to {} failed: {} ({}): {}", host, fault.code, fault.channel.label(), fault.message);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +338,7 @@ impl FeedbackMonitor {
                 "authentication_failed",
                 FaultChannel::Feedback,
                 false,
-                format!("/feedback → {}", status),
+                format!("the speaker refused this PC's connection (/feedback → {}). Select it again.", status),
             )),
             454 if self.strict => FeedbackAction::Fault(Ap2Fault::new(
                 "session_rejected",
@@ -228,6 +348,82 @@ impl FeedbackMonitor {
             )),
             other => self.fail(format!("status {}", other)),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Buffered-stream anchor
+// ---------------------------------------------------------------------------
+
+/// How long a buffered session keeps re-sending SETRATEANCHORTIME, with
+/// audio waiting, after the first attempt failed. Long enough for the PTP
+/// layer to lock onto a receiver's own clock: a receiver that only takes
+/// anchors on its own timeline (the Sonos case) refuses the ones on ours
+/// until then.
+pub const ANCHOR_GIVE_UP: Duration = Duration::from_secs(15);
+
+/// Why one SETRATEANCHORTIME attempt failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorFailure {
+    /// The receiver answered with this status.
+    Refused { status: u16, detail: String },
+    /// No usable answer: a timeout or a connection error.
+    NoAnswer(String),
+    /// The receiver's clock reading can't be turned into a playback time.
+    BadClock(String),
+}
+
+impl std::fmt::Display for AnchorFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnchorFailure::Refused { detail, .. } | AnchorFailure::NoAnswer(detail) | AnchorFailure::BadClock(detail) => {
+                f.write_str(detail)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorAction {
+    /// Try again; `warn`: log this failure as a warning (the first one, or
+    /// one unlike the last), otherwise at debug.
+    Retry { warn: bool },
+    /// The bound has passed: end the session.
+    GiveUp,
+}
+
+/// Retry policy for the buffered stream's anchor: retried until
+/// [`ANCHOR_GIVE_UP`] after the first failure.
+#[derive(Debug)]
+pub struct AnchorRetry {
+    give_up: Duration,
+    first_failure: Option<Instant>,
+    last: Option<AnchorFailure>,
+}
+
+impl AnchorRetry {
+    pub fn new() -> Self {
+        Self::giving_up_after(ANCHOR_GIVE_UP)
+    }
+
+    pub fn giving_up_after(give_up: Duration) -> Self {
+        Self { give_up, first_failure: None, last: None }
+    }
+
+    pub fn on_failure(&mut self, failure: &AnchorFailure, now: Instant) -> AnchorAction {
+        let first = *self.first_failure.get_or_insert(now);
+        if now.saturating_duration_since(first) >= self.give_up {
+            return AnchorAction::GiveUp;
+        }
+        let warn = self.last.as_ref() != Some(failure);
+        self.last = Some(failure.clone());
+        AnchorAction::Retry { warn }
+    }
+}
+
+impl Default for AnchorRetry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -425,6 +621,118 @@ mod tests {
         Instant::now()
     }
 
+    /// "Again" means what the final sentence says: the session raising the
+    /// fault is the reconnect that followed the same fault on the same
+    /// speaker (it started within the window after it), and it failed
+    /// before it played. Everything else is retryable.
+    #[test]
+    fn a_fault_is_final_only_when_the_reconnect_fails_before_playing() {
+        let t = t0() + Duration::from_secs(3600);
+        let s = Duration::from_secs;
+        let mut m = RepeatMemory::new();
+        // A session that had played for a minute: first time, reconnect.
+        assert!(!m.repeated("Kitchen", "anchor_failed", t - s(60), true, t));
+        // Its reconnect, started 6 s later, fails before playing: final.
+        assert!(m.repeated("Kitchen", "anchor_failed", t + s(6), false, t + s(25)));
+        // A later attempt starts over.
+        assert!(!m.repeated("Kitchen", "anchor_failed", t + s(40), false, t + s(60)));
+
+        // A reconnect that played for 85 s before the same fault: retryable.
+        let mut m = RepeatMemory::new();
+        assert!(!m.repeated("Kitchen", "encoder_failed", t - s(60), true, t));
+        assert!(!m.repeated("Kitchen", "encoder_failed", t + s(5), true, t + s(90)));
+
+        // A session that started too long after the fault isn't its reconnect.
+        let mut m = RepeatMemory::new();
+        assert!(!m.repeated("Kitchen", "anchor_failed", t - s(20), false, t));
+        assert!(!m.repeated("Kitchen", "anchor_failed", t + REPEAT_WINDOW + s(1), false, t + REPEAT_WINDOW + s(20)));
+
+        // Nor one that was already running when the fault came.
+        let mut m = RepeatMemory::new();
+        assert!(!m.repeated("Kitchen", "anchor_failed", t - s(20), false, t));
+        assert!(!m.repeated("Kitchen", "anchor_failed", t - s(5), false, t + s(10)));
+
+        // Another fault, or the same fault on another speaker, is no repeat.
+        let mut m = RepeatMemory::new();
+        assert!(!m.repeated("Kitchen", "anchor_failed", t - s(20), false, t));
+        assert!(!m.repeated("Kitchen", "encoder_failed", t + s(6), false, t + s(7)));
+        assert!(!m.repeated("Bedroom", "anchor_failed", t + s(6), false, t + s(8)));
+    }
+
+    /// The final fault is what the window shows after "Connection to …
+    /// ended:", so it reads as the sentence written for the person. A
+    /// session that never finished its bring-up (an unarmed slot) raises
+    /// its fault but leaves nothing to repeat.
+    #[test]
+    fn a_repeated_fault_ends_the_session_with_its_sentence() {
+        let raise = |slot: &FaultSlot| {
+            slot.raise_unless_repeated("test_fault", FaultChannel::Media, "detail for the log".into(), false, || {
+                "it stopped; select it again.".into()
+            })
+        };
+        // Never finished bring-up: retryable, nothing remembered.
+        let unarmed = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Repeat test speaker".into());
+        raise(&unarmed);
+        assert!(unarmed.get().unwrap().retryable);
+        for (round, retryable) in [(1, true), (2, false)] {
+            let dead = Arc::new(AtomicBool::new(false));
+            let slot = FaultSlot::new(dead.clone(), "Repeat test speaker".into());
+            slot.arm(Instant::now());
+            raise(&slot);
+            assert!(dead.load(Ordering::Acquire), "round {round}");
+            let f = slot.get().unwrap();
+            assert_eq!(f.retryable, retryable, "round {round}");
+            if !retryable {
+                assert_eq!(f.to_string(), "it stopped; select it again.");
+            }
+        }
+        // A slot that already holds a fault keeps it and remembers nothing.
+        let slot = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Busy test speaker".into());
+        slot.arm(Instant::now());
+        slot.raise(Ap2Fault::new("first", FaultChannel::Feedback, true, "first"));
+        slot.raise_unless_repeated("test_fault", FaultChannel::Media, "x".into(), false, || "x".into());
+        assert_eq!(slot.get().unwrap().code, "first");
+        let fresh = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Busy test speaker".into());
+        fresh.arm(Instant::now());
+        fresh.raise_unless_repeated("test_fault", FaultChannel::Media, "x".into(), false, || "x".into());
+        assert!(fresh.get().unwrap().retryable);
+    }
+
+    /// A refused or unanswered anchor is retried for a bounded time, with
+    /// the warning logged once and again only when the failure changes.
+    #[test]
+    fn anchor_failures_warn_once_per_change_and_give_up_after_the_bound() {
+        let now = t0();
+        let s = Duration::from_secs;
+        let refused = || AnchorFailure::Refused { status: 400, detail: "SETRATEANCHORTIME → 400 Bad Request".into() };
+        let mut r = AnchorRetry::new();
+        assert_eq!(r.on_failure(&refused(), now), AnchorAction::Retry { warn: true });
+        assert_eq!(r.on_failure(&refused(), now + s(1)), AnchorAction::Retry { warn: false });
+        let silent = AnchorFailure::NoAnswer("timed out after 5s".into());
+        assert_eq!(r.on_failure(&silent, now + s(7)), AnchorAction::Retry { warn: true });
+        assert_eq!(r.on_failure(&refused(), now + s(8)), AnchorAction::Retry { warn: true });
+        assert_eq!(r.on_failure(&refused(), now + ANCHOR_GIVE_UP - s(1)), AnchorAction::Retry { warn: false });
+        assert_eq!(r.on_failure(&refused(), now + ANCHOR_GIVE_UP), AnchorAction::GiveUp);
+    }
+
+    /// While the app reconnects after a first fault, the window says what
+    /// happened: a session that couldn't play isn't reported as a lost
+    /// connection; faults that are connection losses keep the app's own
+    /// "Lost connection" text (no text here).
+    #[test]
+    fn a_session_that_could_not_play_is_not_reported_as_a_lost_connection() {
+        let fault = |code| Ap2Fault::new(code, FaultChannel::Media, true, "detail");
+        let (line, notice) = fault("anchor_failed").reconnect_text("Kitchen").unwrap();
+        assert_eq!(notice, "Kitchen didn't start playing — reconnecting…");
+        assert_eq!(line, "Kitchen didn't start playing");
+        let (line, notice) = fault("encoder_failed").reconnect_text("Kitchen").unwrap();
+        assert_eq!(notice, "Windows' AAC encoder stopped working — reconnecting to Kitchen…");
+        assert!(!line.contains("dropped") && line.contains("Kitchen"), "{line}");
+        for code in ["peer_closed", "feedback_rejected", "feedback_timeout", "media_send_timeout", "media_write_failed"] {
+            assert_eq!(fault(code).reconnect_text("Kitchen"), None, "{code}");
+        }
+    }
+
     #[test]
     fn feedback_503_503_200_recovers_without_fault() {
         let now = t0();
@@ -469,6 +777,11 @@ mod tests {
             _ => None,
         };
         assert_eq!(fault(true, 403), Some(("authentication_failed", false)));
+        // Final, so the window shows it: it says what to try.
+        match FeedbackMonitor::new(true).on_status(403, now) {
+            FeedbackAction::Fault(f) => assert!(f.to_string().ends_with("Select it again."), "{f}"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(fault(true, 401), Some(("authentication_failed", false)));
         assert_eq!(fault(true, 454), Some(("session_rejected", true)));
         assert_eq!(fault(true, 400), None);

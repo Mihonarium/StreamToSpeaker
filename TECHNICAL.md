@@ -371,5 +371,8 @@ bytes). How the stream is labelled depends on the speaker
   Except on the original stream, a HEAD or GET of the stream answers with
   the type its metadata names.
 
-AirPlay: ALAC for RAOP, and AAC-LC via Windows Media Foundation for AirPlay 2
-buffered audio.
+AirPlay: ALAC for RAOP. AirPlay 2: AAC-LC for the buffered stream, encoded by
+Windows' own Media Foundation encoder; the realtime stream is ALAC (PCM for
+HomePods that accept it). Without that encoder the realtime stream is used.
+Windows N editions have no Media Foundation unless the Media Feature Pack is
+installed, so there AirPlay 2 speakers get the realtime stream.
