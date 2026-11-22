@@ -60,11 +60,52 @@ impl Ap2Fault {
     }
 }
 
+/// The message alone: for a fault that ends the session for good, it is
+/// what the window shows after "Connection to <speaker> ended:".
 impl std::fmt::Display for Ap2Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({}): {}", self.code, self.channel.label(), self.message)
+        f.write_str(&self.message)
     }
 }
+
+/// How long after a fault the same fault on the same receiver counts as
+/// coming back straight after the reconnect: the watchdog reconnects about
+/// 5 s after a drop, and the faults raised through
+/// [`FaultSlot::raise_unless_repeated`] show within about half a minute
+/// of a new session.
+pub const REPEAT_WINDOW: Duration = Duration::from_secs(120);
+
+/// Recent faults per receiver, for [`FaultSlot::raise_unless_repeated`].
+#[derive(Debug, Default)]
+pub struct RepeatMemory {
+    recent: Vec<(String, &'static str, Instant)>,
+}
+
+impl RepeatMemory {
+    pub const fn new() -> Self {
+        Self { recent: Vec::new() }
+    }
+
+    /// Note fault `code` on `host` at `now`. True when the same fault was
+    /// noted on that host within [`REPEAT_WINDOW`]: it came back straight
+    /// after the reconnect. That earlier note is then forgotten, so a later
+    /// attempt starts over.
+    pub fn repeated(&mut self, host: &str, code: &'static str, now: Instant) -> bool {
+        self.recent.retain(|(_, _, at)| now.saturating_duration_since(*at) < REPEAT_WINDOW);
+        match self.recent.iter().position(|(h, c, _)| h == host && *c == code) {
+            Some(i) => {
+                self.recent.swap_remove(i);
+                true
+            }
+            None => {
+                self.recent.push((host.to_string(), code, now));
+                false
+            }
+        }
+    }
+}
+
+static REPEATS: Mutex<RepeatMemory> = Mutex::new(RepeatMemory::new());
 
 /// First-fault-wins slot shared by a session's threads. Raising a fault
 /// also sets the session's `dead` flag so the watchdog notices.
@@ -83,7 +124,37 @@ impl FaultSlot {
     pub fn raise(&self, fault: Ap2Fault) {
         let mut slot = self.fault.lock().unwrap();
         if slot.is_none() {
-            warn!("AirPlay 2 session to {} failed: {}", self.host, fault);
+            log_fault(&self.host, &fault);
+            *slot = Some(fault);
+        }
+        self.dead.store(true, Ordering::Release);
+    }
+
+    /// Raise a fault that one reconnect may cure: retryable with `detail`
+    /// the first time; when the same `code` ended a session to this
+    /// receiver within [`REPEAT_WINDOW`] (it came back straight after the
+    /// reconnect), final, with `final_message`: a sentence for the person
+    /// saying what stopped working, the likely cause and what to try.
+    pub fn raise_unless_repeated(
+        &self,
+        code: &'static str,
+        channel: FaultChannel,
+        detail: String,
+        final_message: impl FnOnce() -> String,
+    ) {
+        let mut slot = self.fault.lock().unwrap();
+        if slot.is_none() {
+            let repeated = REPEATS.lock().unwrap_or_else(|e| e.into_inner()).repeated(&self.host, code, Instant::now());
+            let fault = if repeated {
+                warn!(
+                    "AirPlay 2 session to {}: {} again straight after reconnecting ({}); not retrying",
+                    self.host, code, detail
+                );
+                Ap2Fault::new(code, channel, false, final_message())
+            } else {
+                Ap2Fault::new(code, channel, true, detail)
+            };
+            log_fault(&self.host, &fault);
             *slot = Some(fault);
         }
         self.dead.store(true, Ordering::Release);
@@ -92,6 +163,10 @@ impl FaultSlot {
     pub fn get(&self) -> Option<Ap2Fault> {
         self.fault.lock().unwrap().clone()
     }
+}
+
+fn log_fault(host: &str, fault: &Ap2Fault) {
+    warn!("AirPlay 2 session to {} failed: {} ({}): {}", host, fault.code, fault.channel.label(), fault.message);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +293,7 @@ impl FeedbackMonitor {
                 "authentication_failed",
                 FaultChannel::Feedback,
                 false,
-                format!("/feedback → {}", status),
+                format!("the speaker refused this PC's connection (/feedback → {}).", status),
             )),
             454 if self.strict => FeedbackAction::Fault(Ap2Fault::new(
                 "session_rejected",
@@ -423,6 +498,49 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn a_fault_that_comes_back_straight_after_the_reconnect_is_final() {
+        let now = t0();
+        let s = Duration::from_secs;
+        let mut m = RepeatMemory::new();
+        assert!(!m.repeated("Kitchen", "anchor_failed", now), "first time: reconnect");
+        assert!(m.repeated("Kitchen", "anchor_failed", now + s(30)), "again after the reconnect: final");
+        assert!(!m.repeated("Kitchen", "anchor_failed", now + s(40)), "a new attempt after that starts over");
+        assert!(!m.repeated("Kitchen", "encoder_failed", now + s(41)), "another fault is no repeat");
+        assert!(!m.repeated("Bedroom", "anchor_failed", now + s(42)), "nor the same fault on another speaker");
+        assert!(
+            !m.repeated("Kitchen", "anchor_failed", now + s(40) + REPEAT_WINDOW),
+            "too late to be the reconnect's"
+        );
+    }
+
+    /// The final fault is what the window shows after "Connection to …
+    /// ended:", so it reads as the sentence written for the person.
+    #[test]
+    fn a_repeated_fault_ends_the_session_with_its_sentence() {
+        for (round, retryable) in [(1, true), (2, false)] {
+            let dead = Arc::new(AtomicBool::new(false));
+            let slot = FaultSlot::new(dead.clone(), "Repeat test speaker".into());
+            slot.raise_unless_repeated("test_fault", FaultChannel::Media, "detail for the log".into(), || {
+                "it stopped; select it again.".into()
+            });
+            assert!(dead.load(Ordering::Acquire), "round {round}");
+            let f = slot.get().unwrap();
+            assert_eq!(f.retryable, retryable, "round {round}");
+            if !retryable {
+                assert_eq!(f.to_string(), "it stopped; select it again.");
+            }
+        }
+        // A slot that already holds a fault keeps it and remembers nothing.
+        let slot = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Busy test speaker".into());
+        slot.raise(Ap2Fault::new("first", FaultChannel::Feedback, true, "first"));
+        slot.raise_unless_repeated("test_fault", FaultChannel::Media, "x".into(), || "x".into());
+        assert_eq!(slot.get().unwrap().code, "first");
+        let fresh = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Busy test speaker".into());
+        fresh.raise_unless_repeated("test_fault", FaultChannel::Media, "x".into(), || "x".into());
+        assert!(fresh.get().unwrap().retryable);
     }
 
     #[test]

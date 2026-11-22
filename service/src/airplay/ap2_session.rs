@@ -1388,6 +1388,21 @@ fn frame_buffered_packet(pkt: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The buffered stream's encoder failed: no audio can follow, so the
+/// session ends. SETUP negotiated the codec, so switching to ALAC within the
+/// session isn't possible; a reconnect builds a new encoder, and if that
+/// fails too, the person is told (only AAC, Windows' encoder, can fail).
+fn encoder_failed(faults: &FaultSlot, stop_flag: &AtomicBool, detail: String) {
+    if stop_flag.load(Ordering::Acquire) {
+        return;
+    }
+    faults.raise_unless_repeated("encoder_failed", FaultChannel::Media, detail, || {
+        "Windows' AAC encoder failed again after reconnecting. The realtime stream doesn't use \
+         it: turn on \"Prefer low-latency realtime\" in Advanced, then select the speaker again."
+            .to_string()
+    });
+}
+
 fn spawn_ap2_buffered_sender(cfg: BufferedSenderConfig) -> Result<JoinHandle<()>> {
     let name = format!("stream-to-speaker-ap2-buffered:{}", cfg.receiver_name);
     Ok(std::thread::Builder::new().name(name).spawn(move || run_ap2_buffered_sender(cfg))?)
@@ -1415,7 +1430,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
     let mut encoder = match make_encoder() {
         Ok(enc) => enc,
         Err(e) => {
-            warn!("AirPlay 2: {} encoder init failed on sender thread: {e:#}", cfg.codec.label());
+            encoder_failed(&cfg.faults, &cfg.stop_flag, format!("{} encoder could not start: {e:#}", cfg.codec.label()));
             return;
         }
     };
@@ -1511,7 +1526,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
             let payloads = match encoder.encode(&pkt_samples) {
                 Ok(frames) => frames,
                 Err(e) => {
-                    warn!("AirPlay 2: {} encode failed: {e:#}", cfg.codec.label());
+                    encoder_failed(&cfg.faults, &cfg.stop_flag, format!("{} encoding failed: {e:#}", cfg.codec.label()));
                     return;
                 }
             };
@@ -1907,12 +1922,21 @@ mod tests {
         samples: Option<crossbeam_channel::Sender<PcmFrame>>,
         data: TcpStream,
         stop_flag: Arc<AtomicBool>,
+        dead: Arc<AtomicBool>,
+        faults: FaultSlot,
         last_seq: Arc<AtomicU32>,
         sender: Option<JoinHandle<()>>,
     }
 
     impl BufferedRig {
-        fn start(codec: BufferedCodecKind, encoder: EncoderFactory, initial_seq: u16, anchor_status: &'static str) -> Self {
+        /// `name`: the receiver's name, which faults are remembered by.
+        fn start(
+            name: &str,
+            codec: BufferedCodecKind,
+            encoder: EncoderFactory,
+            initial_seq: u16,
+            anchor_status: &'static str,
+        ) -> Self {
             use crate::airplay::test_peers::{read_request, reply};
             use std::io::BufReader;
             let control = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1936,7 +1960,8 @@ mod tests {
 
             let (samples, samples_rx) = crossbeam_channel::unbounded();
             let stop_flag = Arc::new(AtomicBool::new(false));
-            let faults = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Test speaker".into());
+            let dead = Arc::new(AtomicBool::new(false));
+            let faults = FaultSlot::new(dead.clone(), name.into());
             let last_seq = Arc::new(AtomicU32::new(initial_seq as u32));
             let sender = spawn_ap2_buffered_sender(BufferedSenderConfig {
                 stream,
@@ -1946,7 +1971,7 @@ mod tests {
                 random_ssrc: 0x0102_0304,
                 samples_rx,
                 stop_flag: stop_flag.clone(),
-                receiver_name: "Test speaker".into(),
+                receiver_name: name.into(),
                 current_rtptime: Arc::new(AtomicU32::new(1_000)),
                 last_seq: last_seq.clone(),
                 rtsp: Arc::new(Mutex::new(rtsp)),
@@ -1956,7 +1981,7 @@ mod tests {
                 faults: faults.clone(),
             })
             .unwrap();
-            Self { samples: Some(samples), data, stop_flag, last_seq, sender: Some(sender) }
+            Self { samples: Some(samples), data, stop_flag, dead, faults, last_seq, sender: Some(sender) }
         }
 
         /// Queue `frames` stereo frames of a quiet tone.
@@ -1982,6 +2007,48 @@ mod tests {
             self.samples.take();
             self.sender.take().unwrap().join().unwrap();
         }
+
+        /// Wait for the sender to end on its own (it closes the data
+        /// connection as it exits).
+        fn wait_for_exit(&mut self) {
+            while self.packet().is_some() {}
+            self.sender.take().unwrap().join().unwrap();
+        }
+    }
+
+    /// The AAC encoder failing, at the start or mid-stream, ends the
+    /// session through the fault path: the first time it is retryable (the
+    /// app reconnects); straight after the reconnect it is final, with a
+    /// sentence for the person instead of a session that shows
+    /// "streaming" and plays nothing.
+    #[test]
+    fn a_failing_encoder_ends_the_session_and_then_says_why() {
+        let failing_start: EncoderFactory = Box::new(|| anyhow::bail!("MFStartup: scripted"));
+        for (round, encoder) in [(1, failing_start), (2, scripted_encoder(Some(3)))] {
+            let mut rig = BufferedRig::start("Encoder test speaker", BufferedCodecKind::Aac, encoder, 100, "200 OK");
+            rig.feed(BufferedCodecKind::Aac.spf() * 8);
+            rig.wait_for_exit();
+            assert!(rig.dead.load(Ordering::Acquire), "round {round}: session not marked dead");
+            let fault = rig.faults.get().unwrap();
+            assert_eq!(fault.code, "encoder_failed", "round {round}");
+            assert_eq!(fault.retryable, round == 1, "round {round}");
+            if round == 2 {
+                assert!(fault.to_string().contains("Prefer low-latency realtime"), "{fault}");
+            }
+        }
+    }
+
+    /// The audio source going away means the app is replacing or stopping
+    /// the session: the sender ends without a fault.
+    #[test]
+    fn the_source_going_away_ends_the_sender_quietly() {
+        let mut rig = BufferedRig::start("Quiet test speaker", BufferedCodecKind::Alac, BufferedCodecKind::Alac.encoder(), 1, "200 OK");
+        rig.feed(BufferedCodecKind::Alac.spf() * 2);
+        assert!(rig.packet().is_some());
+        rig.samples.take();
+        rig.wait_for_exit();
+        assert!(!rig.dead.load(Ordering::Acquire));
+        assert!(rig.faults.get().is_none());
     }
 
     /// Buffered packets look like an Apple sender's: the marker bit on
@@ -1997,7 +2064,7 @@ mod tests {
             (BufferedCodecKind::Alac, BufferedCodecKind::Alac.encoder(), 0x0102_0304),
         ] {
             let spf = codec.spf();
-            let mut rig = BufferedRig::start(codec, encoder, 65_530, "200 OK");
+            let mut rig = BufferedRig::start("Header test speaker", codec, encoder, 65_530, "200 OK");
             rig.feed(spf * 12);
             let mut packets = Vec::new();
             for _ in 0..12 {
