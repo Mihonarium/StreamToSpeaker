@@ -834,7 +834,16 @@ fn parse_device_description(xml: &str, base_url: &str, ip: IpAddr, urls: Service
     let zgt_ctrl = resolve("ZoneGroupTopology control", zgt_ctrl);
     let grc_ctrl = resolve("GroupRenderingControl control", grc_ctrl);
     let grc_event = resolve("GroupRenderingControl events", grc_event);
-    let cm_ctrl = resolve("ConnectionManager control", cm_ctrl);
+    // Its ConnectionManager only helps choose a stream profile; the
+    // renderer plays without it, so one on another host is dropped
+    // without advice.
+    let cm_ctrl = cm_ctrl.and_then(|raw| {
+        let url = service_url(base_url, &raw, urls);
+        if url.is_none() {
+            debug!("{}: ConnectionManager {} is on another host; not used", shown(&friendly_name), shown(&raw));
+        }
+        url
+    });
     if !elsewhere.is_empty() {
         let line = || {
             format!(
@@ -1360,6 +1369,19 @@ mod tests {
         let r = parse_device_description(&plain, base, ip, ServiceUrls::OnItsHost(None)).unwrap();
         assert_eq!(r.connection_manager_control_url.as_deref(), Some("http://192.168.1.10:1400/ConnectionManager/Control"));
         assert!(!r.is_sonos());
+    }
+
+    #[test]
+    fn a_connection_manager_on_another_host_is_left_out_without_advice() {
+        // The renderer plays without it, so adding it by address isn't the
+        // answer: no report, and no URL.
+        let xml = crate::fake_renderer::renderer_description("Den Amp", &["ConnectionManager"])
+            .replace("<controlURL>/ConnectionManager/Control</controlURL>", "<controlURL>http://192.168.1.66/cm</controlURL>");
+        let reported = Reported::default();
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+        let r = parse_device_description(&xml, "http://192.168.1.10:1400", ip, ServiceUrls::OnItsHost(Some(&reported))).unwrap();
+        assert_eq!(r.connection_manager_control_url, None);
+        assert_eq!(reported.len(), 0);
     }
 
     // ---- fetching a description from a device ---------------------------

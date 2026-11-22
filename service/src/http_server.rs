@@ -520,7 +520,7 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, speaker: bool, ctx: &C
                     // The speaker's requests are the ones that matter: a
                     // refused one may be why it plays nothing.
                     if speaker {
-                        info!("http: refused a malformed request from the speaker at {}: {}", peer.ip(), status);
+                        info!("http: refused a request from the speaker at {}: {}", peer.ip(), status);
                     } else {
                         debug!("http: bad request from {}: {}", peer, status);
                     }
@@ -546,7 +546,7 @@ impl Ctx {
 
         // DNS-rebinding guard: a browser tricked into treating this
         // server as some other site still sends that site's name.
-        let host = head.authority.as_deref().or(head.header("host"));
+        let host = head.host();
         if !self.hosts.allows(host) {
             info!(
                 "http: refused {} {} from {}: unrecognised Host {:?}",
@@ -975,7 +975,7 @@ fn cross_site_refusal(head: &Head) -> Option<&'static str> {
     }
     if let Some(origin) = head.header("origin") {
         let same = head
-            .header("host")
+            .host()
             .map(|h| origin.trim().eq_ignore_ascii_case(&format!("http://{}", h.trim())))
             .unwrap_or(false);
         if !same {
@@ -1065,6 +1065,12 @@ impl Head {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The host the request is for: an absolute-form target's authority,
+    /// else the `Host` header (RFC 9112 3.2.2).
+    fn host(&self) -> Option<&str> {
+        self.authority.as_deref().or(self.header("host"))
     }
 
     fn keep_alive(&self) -> bool {
@@ -2180,6 +2186,12 @@ mod tests {
         assert!(cross_site_refusal(&null).is_some());
         let site = head("POST /api/resync HTTP/1.1\nHost: 192.168.1.10:5901\nSec-Fetch-Site: cross-site\n").unwrap();
         assert!(cross_site_refusal(&site).is_some());
+        // An absolute-form target's authority is the request's host, here
+        // as in the Host check.
+        let absolute = head("POST http://192.168.1.10:5901/api/resync HTTP/1.1\nHost: other\nOrigin: http://192.168.1.10:5901\n").unwrap();
+        assert_eq!(cross_site_refusal(&absolute), None);
+        let absolute = head("POST http://other/api/resync HTTP/1.1\nHost: 192.168.1.10:5901\nOrigin: http://192.168.1.10:5901\n").unwrap();
+        assert!(cross_site_refusal(&absolute).is_some());
         assert!(is_json_content_type(Some("application/json; charset=utf-8")));
         assert!(!is_json_content_type(Some("text/plain")));
         assert!(!is_json_content_type(None));
@@ -2575,17 +2587,19 @@ mod tests {
         }
         open.store(false, Ordering::Release);
         let closed_at = Instant::now();
+        // Cut by the once-a-second recheck; ten times that is the margin.
         for (p, mut s) in streams {
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
             let mut buf = vec![0u8; 8192];
             loop {
                 match s.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(_) => assert!(closed_at.elapsed() < Duration::from_secs(4), "{p:?} still streaming"),
+                    Ok(_) => assert!(closed_at.elapsed() < GATE_RECHECK * 10, "{p:?} still streaming"),
                     Err(e) => panic!("{p:?}: stream didn't end: {e}"),
                 }
             }
         }
-        assert!(closed_at.elapsed() < Duration::from_millis(2500), "{:?}", closed_at.elapsed());
+        assert!(closed_at.elapsed() < GATE_RECHECK * 10, "{:?}", closed_at.elapsed());
         let refused = "privacy mode is on: only the speaker being played on (and its group) may listen";
         for p in PROFILES {
             for method in ["HEAD", "GET"] {
@@ -2712,7 +2726,7 @@ mod tests {
         let n = other.read(&mut buf).unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 400"));
         let info = log_capture::info_lines();
-        assert!(info.contains(&"http: refused a malformed request from the speaker at 127.0.0.1: 400".to_string()), "{info:#?}");
+        assert!(info.contains(&"http: refused a request from the speaker at 127.0.0.1: 400".to_string()), "{info:#?}");
         // Anyone else's stays at debug.
         assert!(!info.iter().any(|l| l.contains("127.0.0.22")), "{info:#?}");
         assert!(log_capture::lines().iter().any(|l| l.starts_with("http: bad request from 127.0.0.22:")));

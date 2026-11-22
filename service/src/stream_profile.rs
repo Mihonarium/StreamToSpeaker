@@ -153,11 +153,8 @@ impl StreamProfile {
 
 impl fmt::Display for StreamProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StreamProfile::Legacy => write!(f, "WAV as {} (the original stream)", self.content_type()),
-            StreamProfile::L16 => write!(f, "L16 as {}", self.content_type()),
-            wav => write!(f, "WAV as {}", wav.content_type()),
-        }
+        let body = if self.is_wav() { "WAV" } else { "L16" };
+        write!(f, "{body} as {} at {}", self.content_type(), self.path())
     }
 }
 
@@ -221,7 +218,7 @@ pub enum Why {
     Sonos,
     /// It played this profile last time.
     Remembered,
-    /// The original stream, what every renderer has been getting.
+    /// The original stream, the one every UPnP speaker is offered first.
     Original,
     /// It lists the profile's type.
     Listed,
@@ -243,7 +240,7 @@ impl fmt::Display for Why {
         f.write_str(match self {
             Why::Sonos => "it is a Sonos",
             Why::Remembered => "it played that last time",
-            Why::Original => "it is what every renderer has been getting",
+            Why::Original => "it is the stream every UPnP speaker is offered first",
             Why::Listed => "it lists that type",
             Why::NotListed => "it lists no other type this app makes",
             Why::NoList => "it gave no list of the types it plays",
@@ -555,10 +552,10 @@ mod tests {
 
     #[test]
     fn profiles_and_reasons_read_well_in_the_log() {
-        assert_eq!(Legacy.to_string(), "WAV as audio/vnd.wave;codec=1 (the original stream)");
-        assert_eq!(Wav.to_string(), "WAV as audio/wav");
-        assert_eq!(L16.to_string(), "L16 as audio/L16;rate=44100;channels=2");
-        assert_eq!(Why::Original.to_string(), "it is what every renderer has been getting");
+        assert_eq!(Legacy.to_string(), "WAV as audio/vnd.wave;codec=1 at /stream.raw");
+        assert_eq!(Wav.to_string(), "WAV as audio/wav at /wav/stream.wav");
+        assert_eq!(L16.to_string(), "L16 as audio/L16;rate=44100;channels=2 at /l16/stream.raw");
+        assert_eq!(Why::Original.to_string(), "it is the stream every UPnP speaker is offered first");
         assert_eq!(Why::Listed.to_string(), "it lists that type");
         assert_eq!(Why::NotListed.to_string(), "it lists no other type this app makes");
         assert_eq!(Why::NoList.to_string(), "it gave no list of the types it plays");

@@ -57,6 +57,8 @@ pub struct RendererSession {
     pub profile: StreamProfile,
     /// When the renderer was given `stream_uri`.
     pub stream_given_at: Instant,
+    /// When it accepted Play.
+    pub played_at: Instant,
 }
 
 /// Active session — either UPnP (pull-style, speaker fetches our HTTP
@@ -2462,7 +2464,7 @@ impl App {
             settings.upnp_stream_profile = remember;
             self.set_speaker_settings(settings_id, settings);
         }
-        self.watch_first_fetch(name, peers, session.profile, session.stream_given_at);
+        self.watch_first_fetch(name, peers, session.profile, session.stream_given_at, session.played_at);
         Ok(session)
     }
 
@@ -2476,19 +2478,21 @@ impl App {
     }
 
     /// Log when `name` comes for the stream it was given at `given_at`,
-    /// or warn when it hasn't [`FETCH_EXPECTED_WITHIN`] after Play: a
-    /// renderer that took the URI and Play may still never ask for it.
-    fn watch_first_fetch(&self, name: String, peers: Vec<IpAddr>, profile: StreamProfile, given_at: Instant) {
+    /// or warn when it hasn't by [`FETCH_EXPECTED_WITHIN`] after it
+    /// accepted Play at `played_at`: a renderer that took the URI and Play
+    /// may still never ask for it.
+    fn watch_first_fetch(&self, name: String, peers: Vec<IpAddr>, profile: StreamProfile, given_at: Instant, played_at: Instant) {
         let hub = self.hub.clone();
         let spawned = std::thread::Builder::new().name("stream-to-speaker-fetch-watch".into()).spawn(move || {
-            match hub.wait_for_fetch(&peers, profile, given_at, FETCH_EXPECTED_WITHIN) {
+            let wait = FETCH_EXPECTED_WITHIN.saturating_sub(played_at.elapsed());
+            match hub.wait_for_fetch(&peers, profile, given_at, wait) {
                 Some(f) => info!(
                     "UPnP: {} started fetching the stream {:.1} s after it was given it",
                     name,
                     f.at.saturating_duration_since(given_at).as_secs_f32()
                 ),
                 None => warn!(
-                    "UPnP: {} took the stream but hasn't fetched it {} s after Play; it may stay silent",
+                    "UPnP: {} accepted Play but hadn't fetched the stream {} s later; it may stay silent",
                     name,
                     FETCH_EXPECTED_WITHIN.as_secs()
                 ),
@@ -4149,7 +4153,7 @@ pub fn start_session(
         let e = match started {
             Ok(()) => {
                 info!("UPnP: {} took {}", name, profile);
-                taken = Some((profile, uri, given_at));
+                taken = Some((profile, uri, given_at, Instant::now()));
                 break;
             }
             Err(e) => e,
@@ -4189,7 +4193,7 @@ pub fn start_session(
             }
         }
     }
-    let Some((profile, stream_uri, stream_given_at)) = taken else {
+    let Some((profile, stream_uri, stream_given_at, played_at)) = taken else {
         return Err(StartError { error: anyhow!("no stream profile to offer"), formats_tried: 0, out_of_time: None });
     };
 
@@ -4216,6 +4220,7 @@ pub fn start_session(
         id_override: None,
         profile,
         stream_given_at,
+        played_at,
     };
     Ok(Started { session, remember: stream_profile::to_remember(offer.remembered, profile, original_refused) })
 }
@@ -4495,6 +4500,7 @@ mod tests {
             id_override: None,
             profile: StreamProfile::Legacy,
             stream_given_at: Instant::now(),
+            played_at: Instant::now(),
         })
     }
 
@@ -4666,7 +4672,7 @@ mod tests {
             Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
             None => Reply::ok(&renderer_description("Den Amp", &[])),
         });
-        let app = test_app();
+        let app = serving_app();
         let Err(msg) = app.start_upnp_manual(&manual_upnp(&fake)) else { panic!("connected") };
         // It lists no types, so it is offered three in turn.
         assert_eq!(
