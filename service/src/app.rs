@@ -5,7 +5,7 @@
 //! `Arc<App>` and calls methods. Atomic-backed knobs are exposed directly
 //! for read paths that are on the audio hot path.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -452,12 +452,11 @@ pub struct SelectedSpeaker {
 /// Stable summary of the runtime config that the GUI / tray can render.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
-    pub advertise_ip: String,
-    /// True when `advertise_ip` came from `--advertise-ip`: it is then used
-    /// for every speaker. Otherwise each speaker gets the local address
-    /// Windows would use to reach it (see [`App::local_ip_toward`]), and
-    /// `advertise_ip` is only the default-route address shown in the UI.
-    pub advertise_ip_explicit: bool,
+    /// `--advertise-ip`: given to every speaker and named in the web UI's
+    /// link. Without it each speaker gets the address this PC uses to reach
+    /// it (see [`App::local_ip_toward`]), and the link the address worked
+    /// out when it is shown (see [`App::this_pc_address`]).
+    pub advertise_ip: Option<IpAddr>,
     pub bind: SocketAddr,
     pub initial_buffer_ms: u32,
     pub silence_packets_threshold: u32,
@@ -861,22 +860,22 @@ impl App {
     /// nowhere (never the developer's own `config.json`).
     #[cfg(test)]
     pub(crate) fn for_tests() -> Arc<Self> {
-        Self::with_settings(
-            AppConfig {
-                advertise_ip: "192.168.1.10".into(),
-                advertise_ip_explicit: false,
-                bind: "0.0.0.0:8080".parse().unwrap(),
-                initial_buffer_ms: 0,
-                silence_packets_threshold: 0,
-                no_silence_injection: false,
-                no_discovery: true,
-                web_enabled: false,
-                ssdp_iface: None,
-            },
-            UserConfig::in_memory(),
-            None,
-            None,
-        )
+        Self::with_settings(Self::test_config(), UserConfig::in_memory(), None, None)
+    }
+
+    /// The configuration [`App::for_tests`] runs with.
+    #[cfg(test)]
+    pub(crate) fn test_config() -> AppConfig {
+        AppConfig {
+            advertise_ip: Some("192.168.1.10".parse().unwrap()),
+            bind: "0.0.0.0:8080".parse().unwrap(),
+            initial_buffer_ms: 0,
+            silence_packets_threshold: 0,
+            no_silence_injection: false,
+            no_discovery: true,
+            web_enabled: false,
+            ssdp_iface: None,
+        }
     }
 
     /// The app with `user_config` as its settings.
@@ -887,16 +886,6 @@ impl App {
         airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     ) -> Arc<Self> {
         let web_initial = config.web_enabled;
-        // "This machine" for the stream gate, which admits it in both
-        // privacy modes and while streaming is disabled: the advertised
-        // IP, but only if this host actually owns it — a user-supplied
-        // --advertise-ip pointing at a proxy must not admit everything
-        // behind that proxy.
-        let own_ip = config
-            .advertise_ip
-            .parse::<IpAddr>()
-            .ok()
-            .filter(|ip| is_local_address(*ip));
         // Seed last_speaker_id from the settings so that, even before any user
         // action, code that asks "what was the last speaker?" gets the
         // persisted answer.
@@ -911,8 +900,10 @@ impl App {
         let speaker_control = SpeakerControl::new(session.clone(), vsync.clone(), Arc::clone(&windows_volume));
         // One flag for "streaming enabled", read by the stream gate as it is.
         let streaming_enabled = Arc::new(AtomicBool::new(true));
+        // The gate admits this PC in both privacy modes and while streaming
+        // is disabled: any address this host owns, at the time it asks.
         let stream_gate =
-            StreamGate::new(user_config.privacy_mode, streaming_enabled.clone(), own_ip);
+            StreamGate::new(user_config.privacy_mode, streaming_enabled.clone(), is_local_address);
         let app = Arc::new(Self {
             config,
             discovery,
@@ -2994,32 +2985,41 @@ impl App {
         }
     }
 
-    /// The advertised local IP parsed, with a user-facing error.
-    fn advertised_local_ip(&self) -> Result<IpAddr, String> {
-        self.config
-            .advertise_ip
-            .parse()
-            .map_err(|e| format!("bad advertise_ip {:?}: {}", self.config.advertise_ip, e))
-    }
-
     /// The local address to give a speaker at `peer`: `--advertise-ip` when
     /// set, else a specific `--bind` address, else the address Windows
     /// would send from to reach `peer`, so a
     /// speaker on a second NIC is not handed a VPN or other-subnet address.
-    /// Falls back to the startup default if the route lookup fails.
     pub fn local_ip_toward(&self, peer: IpAddr) -> Result<IpAddr, String> {
+        if let Some(ip) = self.config.advertise_ip {
+            return Ok(ip);
+        }
         // `--bind` to a specific address: the HTTP server only listens
         // there, so that is the address speakers must be given.
         let bind_ip = self.config.bind.ip();
-        if !self.config.advertise_ip_explicit && !bind_ip.is_unspecified() {
+        if !bind_ip.is_unspecified() {
             return Ok(bind_ip);
         }
-        if !self.config.advertise_ip_explicit {
-            if let Some(ip) = route_source_ip(peer) {
-                return Ok(ip);
-            }
-        }
-        self.advertised_local_ip()
+        route_source_ip(peer).ok_or_else(|| format!("this PC has no network route to {}", peer))
+    }
+
+    /// The address that names this PC to other devices now (it follows
+    /// network changes; see [`this_pc_address_from`]).
+    pub fn this_pc_address(&self) -> IpAddr {
+        let adapter = match &*self.discovery_scope.lock().unwrap() {
+            Resolved::Active { ip, .. } => Some(*ip),
+            _ => None,
+        };
+        this_pc_address_from(
+            self.config.advertise_ip,
+            self.config.bind.ip(),
+            adapter,
+            || {
+                let speaker = self.session.lock().unwrap().as_ref().map(|s| s.ip());
+                speaker.filter(|ip| !ip.is_unspecified()).and_then(route_source_ip)
+            },
+            default_route_ip,
+            first_local_ipv4,
+        )
     }
 
     /// The device a PIN ceremony is currently pairing (any stage), if one
@@ -3520,7 +3520,7 @@ impl App {
             return None;
         }
         let key = self.web_access.secret_hex()?;
-        Some(web_access::link(&self.config.advertise_ip, self.config.bind.port(), &key))
+        Some(web_access::link(&self.this_pc_address().to_string(), self.config.bind.port(), &key))
     }
 
     /// Replace the web UI's secret: the current link and API key stop
@@ -3964,15 +3964,39 @@ pub fn stop_session(session: &RendererSession) {
 // IP / bind helpers (moved from main.rs to keep main.rs lean)
 // -----------------------------------------------------------------------------
 
-pub fn default_advertise_ip() -> Result<String> {
-    use std::net::UdpSocket;
-    let s = UdpSocket::bind("0.0.0.0:0").context("binding udp for ip discovery")?;
-    if s.connect("8.8.8.8:53").is_ok() {
-        if let Ok(addr) = s.local_addr() {
-            return Ok(addr.ip().to_string());
-        }
-    }
-    Err(anyhow!("could not determine local IP; pass --advertise-ip"))
+/// The address that names this PC to other devices, the first of: the one
+/// given with `--advertise-ip`; a specific `--bind` address (the server
+/// answers there only); the address of the adapter chosen for discovery;
+/// the one Windows uses toward the speaker being played on; the default
+/// route's; any local IPv4; else loopback, while the PC has no network
+/// (a link then still opens on this PC). Each lookup runs only if the ones
+/// before it found nothing.
+pub fn this_pc_address_from(
+    explicit: Option<IpAddr>,
+    bind: IpAddr,
+    adapter: Option<Ipv4Addr>,
+    toward_speaker: impl FnOnce() -> Option<IpAddr>,
+    default_route: impl FnOnce() -> Option<IpAddr>,
+    any_local: impl FnOnce() -> Option<Ipv4Addr>,
+) -> IpAddr {
+    explicit
+        .or_else(|| (!bind.is_unspecified()).then_some(bind))
+        .or_else(|| adapter.map(IpAddr::V4))
+        .or_else(toward_speaker)
+        .or_else(default_route)
+        .or_else(|| any_local().map(IpAddr::V4))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+/// This PC's address on its default route right now, if it has one.
+pub fn default_route_ip() -> Option<IpAddr> {
+    route_source_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
+}
+
+/// The first usable IPv4 address on any adapter (loopback and link-local
+/// left out), if there is one.
+pub fn first_local_ipv4() -> Option<Ipv4Addr> {
+    crate::ssdp::local_ipv4_interfaces().first().copied()
 }
 
 /// The source address the OS routing table picks for packets to `peer`
@@ -4006,11 +4030,9 @@ fn local_urls(ip: IpAddr, port: u16) -> (String, String) {
 /// The one interface SSDP should search from, if the user pinned one
 /// (`--advertise-ip`, or `--bind` to a specific address). None = search
 /// from every interface.
-pub fn pick_ssdp_iface(advertise_ip: Option<&str>, bind: &str) -> Option<std::net::Ipv4Addr> {
-    if let Some(s) = advertise_ip {
-        if let Ok(IpAddr::V4(v4)) = s.parse() {
-            return Some(v4);
-        }
+pub fn pick_ssdp_iface(advertise_ip: Option<IpAddr>, bind: &str) -> Option<std::net::Ipv4Addr> {
+    if let Some(IpAddr::V4(v4)) = advertise_ip {
+        return Some(v4);
     }
     if let Ok(IpAddr::V4(v4)) = bind.parse::<IpAddr>() {
         if !v4.is_unspecified() {
@@ -4035,6 +4057,7 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn local_urls_bracket_ipv6_hosts() {
@@ -4053,7 +4076,7 @@ mod tests {
     #[test]
     fn ssdp_searches_every_interface_unless_pinned() {
         assert_eq!(pick_ssdp_iface(None, "0.0.0.0"), None);
-        assert_eq!(pick_ssdp_iface(Some("192.168.2.100"), "0.0.0.0"), Some("192.168.2.100".parse().unwrap()));
+        assert_eq!(pick_ssdp_iface(Some(ip("192.168.2.100")), "0.0.0.0"), Some("192.168.2.100".parse().unwrap()));
         assert_eq!(pick_ssdp_iface(None, "10.0.0.5"), Some("10.0.0.5".parse().unwrap()));
     }
 
@@ -4749,6 +4772,63 @@ mod tests {
         app.stream_gate.set_privacy(true);
         assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::NotGranted));
         assert_eq!(app.check_stream_client(ip("127.0.0.1")), Ok(()));
+    }
+
+    /// An app run without `--advertise-ip`, its web UI on.
+    fn app_without_advertise_ip(bind: &str) -> Arc<App> {
+        let mut config = App::test_config();
+        config.advertise_ip = None;
+        config.bind = bind.parse().unwrap();
+        let app = App::with_settings(config, UserConfig::in_memory(), None, None);
+        app.set_web_ui_enabled(true).unwrap();
+        app
+    }
+
+    fn link_host(app: &App) -> String {
+        let link = app.web_link().expect("the web UI is on");
+        let rest = link.strip_prefix("http://").unwrap();
+        rest[..rest.find("/r/").unwrap()].to_string()
+    }
+
+    #[test]
+    fn this_pcs_address_is_the_first_one_known() {
+        let v4 = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let any = ip("0.0.0.0");
+        let never = || -> Option<IpAddr> { panic!("looked up after an answer") };
+        let never4 = || -> Option<Ipv4Addr> { panic!("looked up after an answer") };
+        assert_eq!(this_pc_address_from(Some(ip("10.9.9.9")), ip("10.0.0.2"), Some(v4("10.0.0.3")), never, never, never4), ip("10.9.9.9"));
+        assert_eq!(this_pc_address_from(None, ip("10.0.0.2"), Some(v4("10.0.0.3")), never, never, never4), ip("10.0.0.2"));
+        assert_eq!(this_pc_address_from(None, any, Some(v4("10.0.0.3")), never, never, never4), ip("10.0.0.3"));
+        assert_eq!(this_pc_address_from(None, any, None, || Some(ip("10.0.0.4")), never, never4), ip("10.0.0.4"));
+        assert_eq!(this_pc_address_from(None, any, None, || None, || Some(ip("10.0.0.5")), never4), ip("10.0.0.5"));
+        assert_eq!(this_pc_address_from(None, any, None, || None, || None, || Some(v4("10.0.0.6"))), ip("10.0.0.6"));
+        // No network at all: still an address, this PC's own.
+        assert_eq!(this_pc_address_from(None, any, None, || None, || None, || None), ip("127.0.0.1"));
+    }
+
+    #[test]
+    fn the_web_link_names_the_one_address_the_server_listens_on() {
+        let app = app_without_advertise_ip("127.0.0.1:8080");
+        assert_eq!(link_host(&app), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn the_web_link_follows_the_adapter_chosen_for_discovery() {
+        let app = app_without_advertise_ip("0.0.0.0:8080");
+        *app.discovery_scope.lock().unwrap() =
+            Resolved::Active { name: "Wi-Fi".into(), ip: "10.1.2.3".parse().unwrap() };
+        assert_eq!(link_host(&app), "10.1.2.3:8080");
+        // The adapter is down: the link names something else.
+        *app.discovery_scope.lock().unwrap() = Resolved::Paused { name: "Wi-Fi".into() };
+        assert_ne!(link_host(&app), "10.1.2.3:8080");
+    }
+
+    #[test]
+    fn the_web_link_names_this_pc_on_the_speakers_network() {
+        let app = app_without_advertise_ip("0.0.0.0:8080");
+        // The speaker is on this PC: Windows reaches it from loopback.
+        bind(&app, upnp_session(""));
+        assert_eq!(link_host(&app), "127.0.0.1:8080");
     }
 
     #[test]

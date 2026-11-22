@@ -104,3 +104,14 @@ fn prints_the_link_while_the_app_is_running() {
     link_and_key(&out, "http://192.0.2.10:5999/r/");
     let _ = std::fs::remove_dir_all(&profile);
 }
+
+#[test]
+fn a_mistyped_advertise_ip_is_refused_before_anything_runs() {
+    let profile = profile("mistyped");
+    let out = web_link(&profile, &["--advertise-ip", "192.168.1.300"]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--advertise-ip"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&profile);
+}

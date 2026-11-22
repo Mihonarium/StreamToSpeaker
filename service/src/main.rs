@@ -177,11 +177,13 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
 
-    /// Local IP to give every speaker (stream URI, callbacks, AirPlay) and
-    /// to search for speakers from. Default: per speaker, the address this
-    /// PC uses to reach that speaker, and discovery on every interface.
+    /// Local IP to give every speaker (stream URI, callbacks, AirPlay), to
+    /// search for speakers from, and to put in the web UI's link. Default:
+    /// per speaker, the address this PC uses to reach that speaker;
+    /// discovery on every interface; in the link, the address worked out
+    /// when it is shown.
     #[arg(long)]
-    advertise_ip: Option<String>,
+    advertise_ip: Option<IpAddr>,
 
     /// Log level: error, warn, info, debug, trace.
     #[arg(long, default_value = "info")]
@@ -517,7 +519,7 @@ fn run(cli: Cli) -> Result<()> {
     // flip the web UI on and off without re-binding the socket. The
     // initial state mirrors --web.
     let port_chosen = start_http(&app)?;
-    info!("stream URL: http://{}:{}/stream.raw", app.config.advertise_ip, port_chosen);
+    info!("stream server listening on port {}", port_chosen);
     match app.web_link() {
         // The link is the web UI's credential: printed once for a headless
         // run, which has no window to show it in, and never logged. A run
@@ -758,12 +760,10 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
         .with_context(|| format!("parsing --bind {}", cli.bind))?;
     let bind_socket = SocketAddr::new(bind_addr, cli.port);
 
-    let advertise_ip = advertise_ip_for(cli)?;
-
     let ssdp_iface = if cli.no_discovery {
         None
     } else {
-        stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind)
+        stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip, &cli.bind)
     };
 
     // The browsers are started by the app once its saved settings (the
@@ -772,8 +772,7 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
     let airplay_discovery = (!cli.no_airplay).then(AirPlayDiscoveryState::new);
 
     let config = AppConfig {
-        advertise_ip,
-        advertise_ip_explicit: cli.advertise_ip.is_some(),
+        advertise_ip: cli.advertise_ip,
         bind: bind_socket,
         initial_buffer_ms: cli.initial_buffer_ms,
         silence_packets_threshold: cli.silence_packets_threshold,
@@ -786,22 +785,6 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
     let app = App::new(config, discovery, airplay_discovery);
     app.start_discovery(Duration::from_secs(cli.ssdp_interval * 60));
     Ok(app)
-}
-
-/// The address a run with these flags names this PC by in the window, the
-/// log and the web UI's link: `--advertise-ip`, else the default route's
-/// address, else (an offline LAN) any local IPv4. Only that default: each
-/// speaker gets the address on its own network.
-fn advertise_ip_for(cli: &Cli) -> Result<String> {
-    match cli.advertise_ip.as_deref() {
-        Some(ip) => Ok(ip.to_string()),
-        None => stream_to_speaker::app::default_advertise_ip().or_else(|e| {
-            stream_to_speaker::ssdp::local_ipv4_interfaces()
-                .first()
-                .map(|ip| ip.to_string())
-                .ok_or(e)
-        }),
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -874,7 +857,9 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         latency_adjust: Some(latency_adjust),
         web_access: Some(app.web_access.clone()),
         stream_client_allowed: Some(stream_client_allowed),
-        extra_hosts: vec![app.config.advertise_ip.clone()],
+        // Host names besides this PC's own addresses, which are always
+        // accepted: an --advertise-ip that names a proxy in front of it.
+        extra_hosts: app.config.advertise_ip.iter().map(|ip| ip.to_string()).collect(),
         speaker_peer: Some({
             let app2 = app.clone();
             Arc::new(move |ip| app2.is_speaker_peer(ip))
@@ -891,7 +876,7 @@ fn cmd_list_speakers(cli: &Cli) -> Result<()> {
         return Err(anyhow!("--list-speakers and --no-discovery are mutually exclusive"));
     }
     let state = DiscoveryState::new();
-    let ssdp_iface = stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip.as_deref(), &cli.bind);
+    let ssdp_iface = stream_to_speaker::app::pick_ssdp_iface(cli.advertise_ip, &cli.bind);
     let scope = match ssdp_iface {
         Some(ip) => SearchScope::Iface(ip),
         None => SearchScope::All,
@@ -916,13 +901,24 @@ fn cmd_list_speakers(cli: &Cli) -> Result<()> {
 /// Print the web UI's link and exit. The key comes from the settings of
 /// the account this runs as (made and saved there if there is none yet),
 /// so it must be the account the app runs under; the address and port are
-/// worked out as a run with the same flags does. The link is the web UI's
-/// credential: it goes to standard output only, never to the log.
+/// worked out as a run with the same flags does before it has a speaker.
+/// The link is the web UI's credential: it goes to standard output only,
+/// never to the log.
 fn cmd_web_link(cli: &Cli) -> Result<()> {
     use std::io::Write as _;
+    use stream_to_speaker::app;
     use stream_to_speaker::user_config::UserConfig;
+    let bind: IpAddr = cli.bind.parse().with_context(|| format!("parsing --bind {}", cli.bind))?;
+    let host = app::this_pc_address_from(
+        cli.advertise_ip,
+        bind,
+        None,
+        || None,
+        app::default_route_ip,
+        app::first_local_ipv4,
+    );
     let link = stream_to_speaker::web_access::link_from_settings(
-        &advertise_ip_for(cli)?,
+        &host.to_string(),
         cli.port,
         UserConfig::load,
         UserConfig::save,

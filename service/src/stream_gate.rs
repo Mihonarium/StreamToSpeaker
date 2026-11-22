@@ -54,9 +54,9 @@ pub struct StreamGate {
     /// drift from it and refuse the speaker being played on, or admit
     /// devices after the user stopped streaming.
     streaming: Arc<AtomicBool>,
-    /// This machine's own address(es) besides loopback — the advertised
-    /// IP, admitted only after proving the host actually owns it.
-    local: Vec<IpAddr>,
+    /// Whether an address is one of this machine's own, asked at each
+    /// check: the PC's addresses change as it moves between networks.
+    is_this_pc: fn(IpAddr) -> bool,
     /// Live grants: id → canonical addresses. Held only for lookups.
     grants: Mutex<HashMap<u64, Vec<IpAddr>>>,
     next_id: AtomicU64,
@@ -120,11 +120,11 @@ fn decide(
     peer: IpAddr,
     privacy: bool,
     streaming: bool,
-    local: &[IpAddr],
+    is_this_pc: fn(IpAddr) -> bool,
     granted: impl FnOnce(IpAddr) -> bool,
 ) -> Result<(), Refusal> {
     let peer = canonical_ip(peer);
-    if peer.is_loopback() || local.contains(&peer) {
+    if peer.is_loopback() || is_this_pc(peer) {
         return Ok(());
     }
     if !streaming {
@@ -141,7 +141,7 @@ fn decide(
 pub struct AllowSnapshot {
     privacy: bool,
     streaming: bool,
-    local: Vec<IpAddr>,
+    is_this_pc: fn(IpAddr) -> bool,
     granted: Vec<IpAddr>,
 }
 
@@ -155,23 +155,23 @@ impl AllowSnapshot {
     }
 
     pub fn allows(&self, peer: IpAddr) -> bool {
-        decide(peer, self.privacy, self.streaming, &self.local, |p| self.granted.contains(&p)).is_ok()
+        decide(peer, self.privacy, self.streaming, self.is_this_pc, |p| self.granted.contains(&p)).is_ok()
     }
 }
 
 impl StreamGate {
     /// `streaming`: the app's streaming-enabled flag itself.
-    /// `local`: this host's own advertised address, if it really is
-    /// local (see [`is_local_address`]).
+    /// `is_this_pc`: whether an address (IPv4 as such, not mapped) belongs
+    /// to this host; the app passes [`is_local_address`].
     pub fn new(
         privacy: bool,
         streaming: Arc<AtomicBool>,
-        local: impl IntoIterator<Item = IpAddr>,
+        is_this_pc: fn(IpAddr) -> bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             privacy: AtomicBool::new(privacy),
             streaming,
-            local: local.into_iter().map(canonical_ip).collect(),
+            is_this_pc,
             grants: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             refusals: Mutex::new(HashMap::new()),
@@ -209,7 +209,7 @@ impl StreamGate {
 
     /// [`allows`](Self::allows), saying why not.
     pub fn check(&self, peer: IpAddr) -> Result<(), Refusal> {
-        decide(peer, self.privacy(), self.streaming(), &self.local, |p| self.is_granted(p))
+        decide(peer, self.privacy(), self.streaming(), self.is_this_pc, |p| self.is_granted(p))
     }
 
     /// Is `peer` one of the addresses a live session granted, whatever
@@ -230,7 +230,7 @@ impl StreamGate {
         AllowSnapshot {
             privacy: self.privacy(),
             streaming: self.streaming(),
-            local: self.local.clone(),
+            is_this_pc: self.is_this_pc,
             granted,
         }
     }
@@ -270,9 +270,9 @@ pub fn canonical_ip(ip: IpAddr) -> IpAddr {
 
 /// Does this host own `ip`? Binding a socket to an address succeeds only
 /// for addresses assigned to a local interface, on every OS we run on —
-/// no interface-enumeration crate needed. Used to decide whether the
-/// user-supplied `--advertise-ip` may be admitted as "this machine": an
-/// advertise IP pointing at a proxy or NAT box must not open the gate to
+/// no interface-enumeration crate needed. A device connecting from such an
+/// address is this PC. An address given with `--advertise-ip` that
+/// points at a proxy or NAT box is not one, so it can't open the gate to
 /// everything behind it.
 pub fn is_local_address(ip: IpAddr) -> bool {
     UdpSocket::bind((ip, 0)).is_ok()
@@ -288,13 +288,22 @@ mod tests {
 
     /// A gate with streaming enabled; the tests that need the flag keep
     /// their own handle on it.
-    fn gate(privacy: bool, local: Option<IpAddr>) -> Arc<StreamGate> {
-        StreamGate::new(privacy, Arc::new(AtomicBool::new(true)), local)
+    fn gate(privacy: bool, is_this_pc: fn(IpAddr) -> bool) -> Arc<StreamGate> {
+        StreamGate::new(privacy, Arc::new(AtomicBool::new(true)), is_this_pc)
+    }
+
+    /// A PC whose only address besides loopback is 192.168.1.10.
+    fn at_ten(peer: IpAddr) -> bool {
+        peer == ip("192.168.1.10")
+    }
+
+    fn nowhere(_: IpAddr) -> bool {
+        false
     }
 
     #[test]
     fn is_granted_ignores_privacy_setting() {
-        let g = gate(false, None);
+        let g = gate(false, nowhere);
         assert!(!g.is_granted(ip("192.168.1.50")));
         let grant = g.grant([ip("192.168.1.50")]);
         assert!(g.is_granted(ip("::ffff:192.168.1.50")));
@@ -304,14 +313,14 @@ mod tests {
 
     #[test]
     fn privacy_off_allows_everyone() {
-        let g = gate(false, None);
+        let g = gate(false, nowhere);
         assert!(g.allows(ip("10.0.0.9")));
         assert!(g.snapshot().allows(ip("10.0.0.9")));
     }
 
     #[test]
     fn privacy_on_admits_loopback_and_local_only() {
-        let g = gate(true, Some(ip("192.168.1.10")));
+        let g = gate(true, at_ten);
         assert!(g.allows(ip("127.0.0.1")));
         assert!(g.allows(ip("::1")));
         assert!(g.allows(ip("192.168.1.10")));
@@ -321,8 +330,23 @@ mod tests {
     }
 
     #[test]
+    fn this_pc_is_whatever_addresses_it_has_at_each_check() {
+        static JOINED: AtomicBool = AtomicBool::new(false);
+        fn after_joining(peer: IpAddr) -> bool {
+            JOINED.load(Ordering::SeqCst) && peer == ip("10.0.0.5")
+        }
+        let streaming = Arc::new(AtomicBool::new(false));
+        let g = StreamGate::new(true, streaming, after_joining);
+        assert_eq!(g.check(ip("10.0.0.5")), Err(Refusal::StreamingOff));
+        // The PC joins a network as 10.0.0.5 after the gate was made.
+        JOINED.store(true, Ordering::SeqCst);
+        assert_eq!(g.check(ip("10.0.0.5")), Ok(()));
+        assert!(g.snapshot().allows(ip("::ffff:10.0.0.5")));
+    }
+
+    #[test]
     fn grant_admits_until_dropped() {
-        let g = gate(true, None);
+        let g = gate(true, nowhere);
         let grant = g.grant([ip("192.168.1.50"), ip("192.168.1.51"), ip("192.168.1.50")]);
         assert_eq!(grant.ips(), &[ip("192.168.1.50"), ip("192.168.1.51")]);
         assert!(g.allows(ip("192.168.1.50")));
@@ -336,7 +360,7 @@ mod tests {
     #[test]
     fn overlapping_grants_are_independent() {
         // The race the old single slot had: two bring-ups at once.
-        let g = gate(true, None);
+        let g = gate(true, nowhere);
         let a = g.grant([ip("192.168.1.50")]);
         let b = g.grant([ip("192.168.1.60"), ip("192.168.1.50")]);
         drop(a);
@@ -350,7 +374,7 @@ mod tests {
 
     #[test]
     fn snapshot_is_a_point_in_time_predicate() {
-        let g = gate(true, None);
+        let g = gate(true, nowhere);
         let before = g.snapshot();
         let _grant = g.grant([ip("192.168.1.50")]);
         let after = g.snapshot();
@@ -365,7 +389,7 @@ mod tests {
     fn with_streaming_off_only_this_pc_may_listen_in_both_modes() {
         for privacy in [false, true] {
             let streaming = Arc::new(AtomicBool::new(false));
-            let g = StreamGate::new(privacy, streaming.clone(), Some(ip("192.168.1.10")));
+            let g = StreamGate::new(privacy, streaming.clone(), at_ten);
             let _grant = g.grant([ip("192.168.1.50")]);
             let snap = g.snapshot();
             assert!(!snap.streaming());
@@ -383,9 +407,9 @@ mod tests {
 
     #[test]
     fn with_streaming_on_privacy_decides() {
-        let off = gate(false, None);
+        let off = gate(false, nowhere);
         assert_eq!(off.check(ip("192.168.1.99")), Ok(()));
-        let on = gate(true, None);
+        let on = gate(true, nowhere);
         let _grant = on.grant([ip("192.168.1.50")]);
         assert_eq!(on.check(ip("192.168.1.50")), Ok(()));
         assert_eq!(on.check(ip("192.168.1.99")), Err(Refusal::NotGranted));
@@ -396,7 +420,7 @@ mod tests {
     fn the_gate_follows_the_apps_streaming_flag_itself() {
         // The flag the app flips, not a copy taken at construction.
         let streaming = Arc::new(AtomicBool::new(true));
-        let g = StreamGate::new(false, streaming.clone(), None);
+        let g = StreamGate::new(false, streaming.clone(), nowhere);
         assert!(g.allows(ip("192.168.1.99")));
         streaming.store(false, Ordering::Release);
         assert!(!g.allows(ip("192.168.1.99")));
@@ -407,7 +431,7 @@ mod tests {
 
     #[test]
     fn refusals_are_rate_limited_per_peer() {
-        let g = gate(true, None);
+        let g = gate(true, nowhere);
         assert!(g.note_refusal(ip("192.168.1.99")));
         assert!(!g.note_refusal(ip("192.168.1.99")));
         assert!(!g.note_refusal(ip("::ffff:192.168.1.99")));
