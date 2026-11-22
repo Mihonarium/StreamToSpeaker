@@ -307,6 +307,78 @@ impl FeedbackMonitor {
 }
 
 // ---------------------------------------------------------------------------
+// Buffered-stream anchor
+// ---------------------------------------------------------------------------
+
+/// How long a buffered session keeps re-sending SETRATEANCHORTIME, with
+/// audio waiting, after the first attempt failed. Long enough for the PTP
+/// layer to lock onto a receiver's own clock: a receiver that only takes
+/// anchors on its own timeline (the Sonos case) refuses the ones on ours
+/// until then.
+pub const ANCHOR_GIVE_UP: Duration = Duration::from_secs(15);
+
+/// Why one SETRATEANCHORTIME attempt failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorFailure {
+    /// The receiver answered with this status.
+    Refused { status: u16, detail: String },
+    /// No usable answer: a timeout or a connection error.
+    NoAnswer(String),
+}
+
+impl std::fmt::Display for AnchorFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnchorFailure::Refused { detail, .. } | AnchorFailure::NoAnswer(detail) => f.write_str(detail),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorAction {
+    /// Try again; `warn`: log this failure as a warning (the first one, or
+    /// one unlike the last), otherwise at debug.
+    Retry { warn: bool },
+    /// The bound has passed: end the session.
+    GiveUp,
+}
+
+/// Retry policy for the buffered stream's anchor: retried until
+/// [`ANCHOR_GIVE_UP`] after the first failure.
+#[derive(Debug)]
+pub struct AnchorRetry {
+    give_up: Duration,
+    first_failure: Option<Instant>,
+    last: Option<AnchorFailure>,
+}
+
+impl AnchorRetry {
+    pub fn new() -> Self {
+        Self::giving_up_after(ANCHOR_GIVE_UP)
+    }
+
+    pub fn giving_up_after(give_up: Duration) -> Self {
+        Self { give_up, first_failure: None, last: None }
+    }
+
+    pub fn on_failure(&mut self, failure: &AnchorFailure, now: Instant) -> AnchorAction {
+        let first = *self.first_failure.get_or_insert(now);
+        if now.saturating_duration_since(first) >= self.give_up {
+            return AnchorAction::GiveUp;
+        }
+        let warn = self.last.as_ref() != Some(failure);
+        self.last = Some(failure.clone());
+        AnchorAction::Retry { warn }
+    }
+}
+
+impl Default for AnchorRetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UDP media sends
 // ---------------------------------------------------------------------------
 
@@ -541,6 +613,23 @@ mod tests {
         let fresh = FaultSlot::new(Arc::new(AtomicBool::new(false)), "Busy test speaker".into());
         fresh.raise_unless_repeated("test_fault", FaultChannel::Media, "x".into(), || "x".into());
         assert!(fresh.get().unwrap().retryable);
+    }
+
+    /// A refused or unanswered anchor is retried for a bounded time, with
+    /// the warning logged once and again only when the failure changes.
+    #[test]
+    fn anchor_failures_warn_once_per_change_and_give_up_after_the_bound() {
+        let now = t0();
+        let s = Duration::from_secs;
+        let refused = || AnchorFailure::Refused { status: 400, detail: "SETRATEANCHORTIME → 400 Bad Request".into() };
+        let mut r = AnchorRetry::new();
+        assert_eq!(r.on_failure(&refused(), now), AnchorAction::Retry { warn: true });
+        assert_eq!(r.on_failure(&refused(), now + s(1)), AnchorAction::Retry { warn: false });
+        let silent = AnchorFailure::NoAnswer("timed out after 5s".into());
+        assert_eq!(r.on_failure(&silent, now + s(7)), AnchorAction::Retry { warn: true });
+        assert_eq!(r.on_failure(&refused(), now + s(8)), AnchorAction::Retry { warn: true });
+        assert_eq!(r.on_failure(&refused(), now + ANCHOR_GIVE_UP - s(1)), AnchorAction::Retry { warn: false });
+        assert_eq!(r.on_failure(&refused(), now + ANCHOR_GIVE_UP), AnchorAction::GiveUp);
     }
 
     #[test]

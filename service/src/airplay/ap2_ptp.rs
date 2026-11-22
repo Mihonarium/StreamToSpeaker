@@ -164,7 +164,7 @@ impl PtpTimeline {
         if id == 0 {
             return None;
         }
-        let now = self.clock.now_ns() as i64 + self.peer_offset_ns.load(Ordering::Acquire);
+        let now = (self.clock.now_ns() as i64).checked_add(self.peer_offset_ns.load(Ordering::Acquire))?;
         u64::try_from(now).ok().map(|n| (id, n))
     }
 
@@ -173,7 +173,8 @@ impl PtpTimeline {
     /// delay (sub-ms on a LAN) is absorbed into the offset — irrelevant
     /// at audio-anchor precision.
     fn note_peer_sync(&self, t1_ns: u64, t2_ns: u64) -> i64 {
-        let sample = t1_ns as i64 - t2_ns as i64;
+        // `t1` is the receiver's, off the network: any u64.
+        let sample = (t1_ns as i128 - t2_ns as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
         let next = if self.peer_locked.load(Ordering::Acquire) {
             let prev = self.peer_offset_ns.load(Ordering::Acquire);
             (prev / 8) * 7 + sample / 8
@@ -855,7 +856,8 @@ fn read_timestamp(buf: &[u8], off: usize) -> Option<u64> {
         | ((buf[off + 4] as u64) << 8)
         | (buf[off + 5] as u64);
     let nanos = u32::from_be_bytes([buf[off + 6], buf[off + 7], buf[off + 8], buf[off + 9]]);
-    Some(secs * 1_000_000_000 + nanos as u64)
+    // 48-bit seconds from the network can exceed u64 nanoseconds.
+    secs.checked_mul(1_000_000_000)?.checked_add(nanos as u64)
 }
 
 fn format_uuid(bytes: [u8; 16]) -> String {
@@ -1158,6 +1160,24 @@ mod tests {
         let ns = 123_456_789_012_345u64;
         write_timestamp(&mut buf, ns);
         assert_eq!(read_timestamp(&buf, HEADER_LEN).unwrap(), ns);
+    }
+
+    /// Timestamps come off the network: the largest a Follow_Up can carry
+    /// must neither panic nor wrap into a plausible-looking time.
+    #[test]
+    fn hostile_receiver_timestamps_are_refused_not_wrapped() {
+        let mut buf = vec![0u8; HEADER_LEN];
+        buf.extend_from_slice(&[0xFF; 10]); // 2^48 - 1 s, 4.29 s of ns
+        assert_eq!(read_timestamp(&buf, HEADER_LEN), None);
+
+        for (t1, t2, offset) in [(u64::MAX, 0, i64::MAX), (0, u64::MAX, i64::MIN)] {
+            let tl = PtpTimeline::new(PtpMasterClock::new(), 0x42);
+            tl.set_peer_clock_id(0xABC);
+            assert_eq!(tl.note_peer_sync(t1, t2), offset);
+            assert_eq!(tl.receiver_now_ns(), None, "offset {offset} gives no receiver time");
+            // Later samples are smoothed without overflowing either way.
+            tl.note_peer_sync(t2, t1);
+        }
     }
 
     #[test]

@@ -36,8 +36,9 @@ use crate::airplay::alac::build_uncompressed_alac_frame;
 use crate::airplay::ap2_crypto::AudioSealer;
 use crate::airplay::ap2_events::spawn_event_channel;
 use crate::airplay::ap2_health::{
-    log_notice, raop_db_to_volume_pct, Ap2Fault, DeviceVolume, FaultChannel, FaultSlot, FeedbackAction,
-    FeedbackMonitor, SendAction, SendHealth, VolumeTracker, FEEDBACK_INTERVAL,
+    log_notice, raop_db_to_volume_pct, AnchorAction, AnchorFailure, AnchorRetry, Ap2Fault, DeviceVolume,
+    FaultChannel, FaultSlot, FeedbackAction, FeedbackMonitor, SendAction, SendHealth, VolumeTracker,
+    FEEDBACK_INTERVAL,
 };
 use crate::airplay::ap2_ptp::{spawn_ptp_master, PtpMaster, PtpTimeline};
 use crate::airplay::ap2_resend::Retransmitter;
@@ -483,6 +484,8 @@ impl AirPlay2Session {
                 timeline: ptp_session.as_ref().unwrap().timeline.clone(),
                 codec,
                 encoder: codec.encoder(),
+                anchor_retry: AnchorRetry::new(),
+                ptp_ports_problem: ptp_session.as_ref().and_then(|p| p.ports_problem()).map(str::to_string),
                 faults: faults.clone(),
             })?;
             info!(
@@ -1354,6 +1357,10 @@ struct BufferedSenderConfig {
     codec: BufferedCodecKind,
     /// Makes that codec's encoder, on the sender thread.
     encoder: EncoderFactory,
+    /// How long a refused or unanswered anchor is retried.
+    anchor_retry: AnchorRetry,
+    /// Why this PC's PTP ports couldn't be opened, if they couldn't.
+    ptp_ports_problem: Option<String>,
     faults: FaultSlot,
 }
 
@@ -1362,8 +1369,13 @@ struct BufferedSenderConfig {
 /// layer has locked onto its Sync/Follow_Up stream (field-tested: Sonos
 /// refuses anchors on any other clock); falls back to our own timeline
 /// for receivers that follow the sender instead. Anchors are rounded up
-/// to a whole second so networkTimeFrac is 0.
-fn try_anchor_buffered(rtsp: &Arc<Mutex<Ap2Rtsp>>, timeline: &PtpTimeline, rtp_time: u32) -> Result<u64> {
+/// to a whole second so networkTimeFrac is 0. Returns the timeline the
+/// anchor named.
+fn try_anchor_buffered(
+    rtsp: &Arc<Mutex<Ap2Rtsp>>,
+    timeline: &PtpTimeline,
+    rtp_time: u32,
+) -> std::result::Result<u64, AnchorFailure> {
     // Take the connection first: another request (volume, read-back) may
     // hold it for a while, and an anchor computed before that wait could
     // already be in the past when it is sent.
@@ -1372,9 +1384,19 @@ fn try_anchor_buffered(rtsp: &Arc<Mutex<Ap2Rtsp>>, timeline: &PtpTimeline, rtp_t
         Some((id, now)) => (id, now),
         None => (timeline.clock_id, timeline.our_now_ns()),
     };
-    let anchor_ns = (base_ns + ANCHOR_LEAD_NS).div_ceil(1_000_000_000) * 1_000_000_000;
-    conn.set_rate_anchor_time(1, rtp_time, anchor_ns, timeline_id)?;
-    Ok(timeline_id)
+    // The receiver's clock came off the network: a reading too large to
+    // anchor on is a failed attempt, not a wrapped time.
+    let Some(anchor_ns) = base_ns
+        .checked_add(ANCHOR_LEAD_NS)
+        .and_then(|ns| ns.div_ceil(1_000_000_000).checked_mul(1_000_000_000))
+    else {
+        return Err(AnchorFailure::NoAnswer(format!("the receiver's clock reads {base_ns} ns, too far to anchor on")));
+    };
+    match conn.set_rate_anchor_time(1, rtp_time, anchor_ns, timeline_id) {
+        Ok(Ok(())) => Ok(timeline_id),
+        Ok(Err(refused)) => Err(refused),
+        Err(e) => Err(AnchorFailure::NoAnswer(format!("{e:#}"))),
+    }
 }
 
 /// Frame one sealed RTP packet for the buffered TCP stream: a 2-byte
@@ -1401,6 +1423,51 @@ fn encoder_failed(faults: &FaultSlot, stop_flag: &AtomicBool, detail: String) {
          it: turn on \"Prefer low-latency realtime\" in Advanced, then select the speaker again."
             .to_string()
     });
+}
+
+/// No anchor was accepted within the retry bound: the receiver will not
+/// play the stream, so the session ends. A reconnect may help once (a fresh
+/// session, a fresh PTP exchange); if the same happens again, the person is
+/// told what the code knows: the PTP ports problem if there is one, whether
+/// the receiver's clock ever reached this PC, and whether it refused or
+/// stopped answering.
+fn anchor_failed(
+    faults: &FaultSlot,
+    stop_flag: &AtomicBool,
+    locked_to_receiver: bool,
+    ptp_ports_problem: Option<&str>,
+    last: &AnchorFailure,
+) {
+    if stop_flag.load(Ordering::Acquire) {
+        return;
+    }
+    let detail = format!("the speaker accepted no playback anchor (last: {last})");
+    faults.raise_unless_repeated("anchor_failed", FaultChannel::Media, detail, || {
+        anchor_failed_message(locked_to_receiver, ptp_ports_problem, last)
+    });
+}
+
+/// The sentence after "Connection to <speaker> ended:" when the anchor
+/// failed again after the reconnect.
+fn anchor_failed_message(locked_to_receiver: bool, ptp_ports_problem: Option<&str>, last: &AnchorFailure) -> String {
+    match (ptp_ports_problem, last) {
+        (Some(problem), _) => format!(
+            "it would not start playing. AirPlay 2 needs UDP ports 319 and 320 for the speaker's clock, \
+             but {problem}. Close that program, then select the speaker again."
+        ),
+        (None, AnchorFailure::Refused { .. }) if !locked_to_receiver => format!(
+            "it refused to start playing, and its clock never reached this PC. Check that Windows \
+             Firewall allows {} on private networks (it needs UDP ports 319 and 320), then select the \
+             speaker again.",
+            crate::PRODUCT_NAME
+        ),
+        (None, AnchorFailure::Refused { .. }) => "it refused to start playing. Turn on \"Prefer low-latency \
+             realtime\" in Advanced, then select the speaker again."
+            .to_string(),
+        (None, AnchorFailure::NoAnswer(_)) => "it stopped answering just before playback was to start. Check \
+             that it is switched on and on the same network as this PC, then select it again."
+            .to_string(),
+    }
 }
 
 fn spawn_ap2_buffered_sender(cfg: BufferedSenderConfig) -> Result<JoinHandle<()>> {
@@ -1493,9 +1560,20 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
                             if tid == cfg.timeline.clock_id { " (our clock)" } else { " (receiver's clock)" }
                         );
                     }
-                    Err(e) => {
-                        warn!("AirPlay 2 anchor failed (will retry): {:#}", e);
-                    }
+                    Err(failure) => match cfg.anchor_retry.on_failure(&failure, Instant::now()) {
+                        AnchorAction::Retry { warn: true } => warn!("AirPlay 2 anchor failed (will retry): {failure}"),
+                        AnchorAction::Retry { warn: false } => debug!("AirPlay 2 anchor failed again: {failure}"),
+                        AnchorAction::GiveUp => {
+                            anchor_failed(
+                                &cfg.faults,
+                                &cfg.stop_flag,
+                                cfg.timeline.receiver_now_ns().is_some(),
+                                cfg.ptp_ports_problem.as_deref(),
+                                &failure,
+                            );
+                            return;
+                        }
+                    },
                 }
             }
             if !anchored {
@@ -1935,7 +2013,21 @@ mod tests {
             codec: BufferedCodecKind,
             encoder: EncoderFactory,
             initial_seq: u16,
-            anchor_status: &'static str,
+            anchor_replies: &'static [&'static str],
+        ) -> Self {
+            Self::start_with(name, codec, encoder, initial_seq, anchor_replies, AnchorRetry::new(), None)
+        }
+
+        /// `anchor_replies`: the status lines SETRATEANCHORTIME gets, in
+        /// order, the last one repeated.
+        fn start_with(
+            name: &str,
+            codec: BufferedCodecKind,
+            encoder: EncoderFactory,
+            initial_seq: u16,
+            anchor_replies: &'static [&'static str],
+            anchor_retry: AnchorRetry,
+            ptp_ports_problem: Option<String>,
         ) -> Self {
             use crate::airplay::test_peers::{read_request, reply};
             use std::io::BufReader;
@@ -1945,8 +2037,14 @@ mod tests {
                 let Ok((sock, _)) = control.accept() else { return };
                 let mut r = BufReader::new(sock.try_clone().unwrap());
                 let mut w = sock;
+                let mut anchors = 0;
                 while let Some((line, cseq, _)) = read_request(&mut r) {
-                    let status = if line.starts_with("SETRATEANCHORTIME") { anchor_status } else { "200 OK" };
+                    let status = if line.starts_with("SETRATEANCHORTIME") {
+                        anchors += 1;
+                        anchor_replies[(anchors - 1).min(anchor_replies.len() - 1)]
+                    } else {
+                        "200 OK"
+                    };
                     reply(&mut w, cseq, status, &[]);
                 }
             });
@@ -1978,6 +2076,8 @@ mod tests {
                 timeline: PtpTimeline::new(crate::airplay::ap2_ptp::PtpMasterClock::new(), 0x42),
                 codec,
                 encoder,
+                anchor_retry,
+                ptp_ports_problem,
                 faults: faults.clone(),
             })
             .unwrap();
@@ -2009,10 +2109,20 @@ mod tests {
         }
 
         /// Wait for the sender to end on its own (it closes the data
-        /// connection as it exits).
+        /// connection as it exits). One that is still running after 10 s is
+        /// stopped, so the test reports what it found instead of hanging.
         fn wait_for_exit(&mut self) {
             while self.packet().is_some() {}
-            self.sender.take().unwrap().join().unwrap();
+            let sender = self.sender.take().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !sender.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if !sender.is_finished() {
+                self.stop_flag.store(true, Ordering::Release);
+                self.samples.take();
+            }
+            sender.join().unwrap();
         }
     }
 
@@ -2025,7 +2135,7 @@ mod tests {
     fn a_failing_encoder_ends_the_session_and_then_says_why() {
         let failing_start: EncoderFactory = Box::new(|| anyhow::bail!("MFStartup: scripted"));
         for (round, encoder) in [(1, failing_start), (2, scripted_encoder(Some(3)))] {
-            let mut rig = BufferedRig::start("Encoder test speaker", BufferedCodecKind::Aac, encoder, 100, "200 OK");
+            let mut rig = BufferedRig::start("Encoder test speaker", BufferedCodecKind::Aac, encoder, 100, &["200 OK"]);
             rig.feed(BufferedCodecKind::Aac.spf() * 8);
             rig.wait_for_exit();
             assert!(rig.dead.load(Ordering::Acquire), "round {round}: session not marked dead");
@@ -2038,11 +2148,61 @@ mod tests {
         }
     }
 
+    /// A receiver that refuses every anchor (the Sonos does on our clock
+    /// when this PC never gets its clock) ends the session after the bound
+    /// instead of retrying for ever in silence; after the reconnect the
+    /// same thing is final, with what to check. A receiver that refuses a
+    /// few and then accepts plays on.
+    #[test]
+    fn an_anchor_refused_for_good_ends_the_session_and_then_says_why() {
+        let start = |name, retry_for, ports_problem| {
+            BufferedRig::start_with(
+                name,
+                BufferedCodecKind::Alac,
+                BufferedCodecKind::Alac.encoder(),
+                7,
+                &["400 Bad Request"],
+                AnchorRetry::giving_up_after(retry_for),
+                ports_problem,
+            )
+        };
+        let spf = BufferedCodecKind::Alac.spf();
+        for (round, ports_problem, want) in [
+            (1, None, None),
+            (2, None, Some("UDP ports 319 and 320")),
+            (1, Some("another program on this PC is using UDP port 319 on 10.0.0.5"), None),
+            (2, Some("another program on this PC is using UDP port 319 on 10.0.0.5"), Some("another program on this PC is using UDP port 319")),
+        ] {
+            let name = if ports_problem.is_some() { "Ports test speaker" } else { "Anchor test speaker" };
+            let mut rig = start(name, Duration::from_millis(1500), ports_problem.map(str::to_string));
+            rig.feed(spf * 4);
+            rig.wait_for_exit();
+            assert!(rig.dead.load(Ordering::Acquire), "round {round}: session not marked dead");
+            let fault = rig.faults.get().unwrap();
+            assert_eq!((fault.code, fault.retryable), ("anchor_failed", round == 1), "round {round}: {fault:?}");
+            if let Some(want) = want {
+                assert!(fault.to_string().contains(want), "{fault}");
+            }
+        }
+
+        let mut rig = BufferedRig::start(
+            "Late anchor test speaker",
+            BufferedCodecKind::Alac,
+            BufferedCodecKind::Alac.encoder(),
+            7,
+            &["400 Bad Request", "400 Bad Request", "200 OK"],
+        );
+        rig.feed(spf * 4);
+        assert!(rig.packet().is_some(), "no audio after the anchor was accepted");
+        rig.stop();
+        assert!(rig.faults.get().is_none());
+    }
+
     /// The audio source going away means the app is replacing or stopping
     /// the session: the sender ends without a fault.
     #[test]
     fn the_source_going_away_ends_the_sender_quietly() {
-        let mut rig = BufferedRig::start("Quiet test speaker", BufferedCodecKind::Alac, BufferedCodecKind::Alac.encoder(), 1, "200 OK");
+        let mut rig = BufferedRig::start("Quiet test speaker", BufferedCodecKind::Alac, BufferedCodecKind::Alac.encoder(), 1, &["200 OK"]);
         rig.feed(BufferedCodecKind::Alac.spf() * 2);
         assert!(rig.packet().is_some());
         rig.samples.take();
@@ -2064,7 +2224,7 @@ mod tests {
             (BufferedCodecKind::Alac, BufferedCodecKind::Alac.encoder(), 0x0102_0304),
         ] {
             let spf = codec.spf();
-            let mut rig = BufferedRig::start("Header test speaker", codec, encoder, 65_530, "200 OK");
+            let mut rig = BufferedRig::start("Header test speaker", codec, encoder, 65_530, &["200 OK"]);
             rig.feed(spf * 12);
             let mut packets = Vec::new();
             for _ in 0..12 {
