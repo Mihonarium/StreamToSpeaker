@@ -559,9 +559,20 @@ impl UserConfig {
         mut notice: LoadNotice,
     ) -> Self {
         let Parsed { mut config, report, encoding, reset } = parsed;
+        let mut drop_unread = false;
         if let Some((paths, as_found)) = reset {
-            // Kept before any save drops the values that couldn't be read.
-            notice.reset_kept_as = keep_before_reset(fs, path, as_found, &report.locked, codec);
+            // Kept before any save drops the values that couldn't be read;
+            // without a copy, nothing is saved over the file.
+            match keep_before_reset(fs, path, as_found, &report.locked, codec) {
+                Ok(copy) => {
+                    notice.reset_kept_as = Some(copy);
+                    drop_unread = true;
+                }
+                Err(why) => {
+                    config.saves = Saves::KeepFile;
+                    config.save_health = SaveHealth::with(Some(SaveProblem::CopyNotKept { why }));
+                }
+            }
             for p in &paths {
                 log::warn!(
                     "user_config: {} couldn't be read, so it is back to its default",
@@ -579,6 +590,10 @@ impl UserConfig {
             log::info!(
                 "user_config: protecting stored secrets written unprotected by an earlier version"
             );
+            config.save_to_ops(path, codec, fs);
+        } else if drop_unread {
+            // The file then holds what the app runs with, and the next start
+            // has nothing to report again.
             config.save_to_ops(path, codec, fs);
         }
         config
@@ -815,6 +830,9 @@ pub enum SaveProblem {
     NotRead { why: String },
     /// The last save failed (`why`, the system's words).
     Failed { why: String },
+    /// Some values in the file couldn't be read and no copy of the file
+    /// could be kept (`why`), so the app saves nothing over it.
+    CopyNotKept { why: String },
 }
 
 impl SaveProblem {
@@ -825,6 +843,11 @@ impl SaveProblem {
                 "Your settings couldn't be read, so the app is using default settings and leaves \
                  the file alone: changes made now won't be kept. Quit the app and start it again \
                  to retry. Details: {why}"
+            ),
+            SaveProblem::CopyNotKept { why } => format!(
+                "Some settings couldn't be read, and a copy of the settings file couldn't be kept \
+                 beside it, so the app leaves the file as it is: changes made now won't be kept. \
+                 Details: {why}"
             ),
             SaveProblem::Failed { why } => format!(
                 "Settings can't be saved, so changes made now will be lost when the app closes. \
@@ -863,7 +886,7 @@ impl SaveHealth {
                      lost when the app closes"
                 )
             }
-            Some(SaveProblem::NotRead { .. }) => {}
+            Some(SaveProblem::NotRead { .. } | SaveProblem::CopyNotKept { .. }) => {}
             None => log::info!("user_config: the settings are saved again"),
         }
         *current = now;
@@ -909,7 +932,7 @@ const RESET_COPIES: usize = 3;
 /// it was found (`as_found`, secrets unsealed; sealed again here with
 /// `locked`), beside `path` as `config.json.before-reset-<unix time>`. An
 /// identical copy already kept is used instead; the oldest beyond
-/// [`RESET_COPIES`] are removed. Its path; `None` (logged) when it
+/// [`RESET_COPIES`] are removed. Its path; why not (logged) when it
 /// couldn't be written.
 fn keep_before_reset(
     fs: &dyn FileOps,
@@ -917,16 +940,13 @@ fn keep_before_reset(
     mut as_found: serde_json::Value,
     locked: &[LockedNode],
     codec: &dyn SecretCodec,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, String> {
     let plain = as_found.clone();
     secret_store::seal(&mut as_found, locked, codec);
-    let text = match serde_json::to_string_pretty(&as_found) {
-        Ok(t) => t,
-        Err(e) => {
-            log::warn!("user_config: couldn't keep a copy of the settings ({e})");
-            return None;
-        }
-    };
+    let text = serde_json::to_string_pretty(&as_found).map_err(|e| {
+        log::warn!("user_config: couldn't keep a copy of the settings ({e})");
+        e.to_string()
+    })?;
     // Sealing twice gives different bytes: copies are compared opened.
     let same = |bytes: &[u8]| {
         settings_tree(bytes).is_ok_and(|(mut tree, _)| {
@@ -934,13 +954,10 @@ fn keep_before_reset(
             tree == plain && report.locked == locked
         })
     };
-    match settings_file::keep_copy(fs, path, "before-reset", text.as_bytes(), RESET_COPIES, &same) {
-        Ok(copy) => Some(copy),
-        Err(e) => {
-            log::warn!("user_config: couldn't keep a copy of the settings beside {} ({e})", path.display());
-            None
-        }
-    }
+    settings_file::keep_copy(fs, path, "before-reset", text.as_bytes(), RESET_COPIES, &same).map_err(|e| {
+        log::warn!("user_config: couldn't keep a copy of the settings beside {} ({e})", path.display());
+        e.to_string()
+    })
 }
 
 /// A settings file's JSON tree, which must be an object, as stored
@@ -1437,9 +1454,13 @@ mod tests {
         let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
         let found: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(kept, found, "the copy is the file as it was (nothing to seal off Windows)");
-        // Started again before anything was saved: the same copy, not another.
+        // What was read is saved at once: the file holds what the app runs
+        // with, and the next start has nothing to tell.
+        let on_disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["last_speaker_id"], "x");
+        assert!(on_disk.get("prefer_realtime_airplay").is_some_and(|v| v == false), "{on_disk}");
         let again = UserConfig::load_from(&path);
-        assert_eq!(again.load_notice().reset_kept_as.as_ref(), Some(&copy));
+        assert!(again.load_notice().is_empty(), "{:?}", again.load_notice());
         let copies = |dir: &std::path::Path| {
             std::fs::read_dir(dir)
                 .unwrap()
@@ -1448,10 +1469,52 @@ mod tests {
                 .count()
         };
         assert_eq!(copies(&dir), 1);
-        // A save drops what couldn't be read: the next start has nothing to tell.
-        again.save_to(&path);
-        assert!(UserConfig::load_from(&path).load_notice().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn values_that_cannot_be_read_stay_in_the_file_when_no_copy_can_be_kept() {
+        use crate::settings_file::tests::PowerCutDisk;
+        /// A disk on which no copy kept aside can be made.
+        struct NoCopies(PowerCutDisk);
+        impl FileOps for NoCopies {
+            fn read(&self, p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                self.0.read(p)
+            }
+            fn create_flushed(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> {
+                if p.to_string_lossy().contains("before-reset") {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                self.0.create_flushed(p, b)
+            }
+            fn rename(&self, f: &std::path::Path, t: &std::path::Path) -> std::io::Result<()> {
+                self.0.rename(f, t)
+            }
+            fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+                self.0.remove(p)
+            }
+            fn create_dir_all(&self, d: &std::path::Path) -> std::io::Result<()> {
+                self.0.create_dir_all(d)
+            }
+            fn list(&self, d: &std::path::Path) -> std::io::Result<Vec<String>> {
+                self.0.list(d)
+            }
+            fn age(&self, p: &std::path::Path) -> Option<std::time::Duration> {
+                self.0.age(p)
+            }
+        }
+        let path = PathBuf::from("/profile/StreamToSpeaker/config.json");
+        let text = br#"{"last_speaker_id":"x","prefer_realtime_airplay":"true"}"#;
+        let disk = NoCopies(PowerCutDisk::with_file(&path, text));
+        let c = UserConfig::load_with_ops(&path, &PlatformCodec, &disk);
+        assert_eq!(c.last_speaker_id.as_deref(), Some("x"));
+        // Nothing is written over the file, now or later in the run, and the
+        // window says why.
+        assert!(c.try_save_to_ops(&path, &PlatformCodec, &disk).is_err());
+        assert_eq!(disk.0.get(&path).unwrap(), text);
+        let problem = c.save_health().problem().unwrap();
+        assert!(matches!(problem, SaveProblem::CopyNotKept { .. }), "{problem:?}");
+        assert_eq!(c.load_notice().reset_kept_as, None);
     }
 
     #[test]
@@ -1504,7 +1567,9 @@ mod tests {
         let reset: Vec<String> = c.load_notice().reset.iter().map(|p| secret_store::pointer(p)).collect();
         assert_eq!(reset, ["/airplay_passwords/airplay:bb"]);
         // One that can't be opened at all is kept as it is, as before, and
-        // isn't a reset.
+        // isn't a reset (the file as it was: the load above saved without
+        // the value it couldn't read).
+        std::fs::write(&path, tree.to_string()).unwrap();
         let other = UserConfig::load_from_with(&path, &FakeCodec(0x43));
         assert_eq!(other.last_speaker_id.as_deref(), Some("x"));
         assert!(other.airplay_passwords.is_empty());
