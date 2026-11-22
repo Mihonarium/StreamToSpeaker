@@ -571,6 +571,8 @@ pub struct App {
     pub shutdown: Arc<AtomicBool>,
     /// Quit without waiting for the speaker (a second Ctrl+C).
     quit_now: AtomicBool,
+    /// Run once when quitting begins (see [`App::on_quit`]).
+    on_quit: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Update-check state; see `update_check` and [`App::spawn_update_checker`].
     pub update: Mutex<UpdateState>,
 
@@ -944,6 +946,7 @@ impl App {
             last_fault: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             quit_now: AtomicBool::new(false),
+            on_quit: OnceLock::new(),
             update: Mutex::new(UpdateState::default()),
             rescan_in_flight: Arc::new(AtomicBool::new(false)),
             last_rescan_finished_unix: Arc::new(AtomicI64::new(0)),
@@ -1513,9 +1516,6 @@ impl App {
     /// called from the GUI. A connect in flight meanwhile may be to this
     /// speaker: if it binds it, that is undone once it ends.
     pub fn remove_manual_speaker(self: &Arc<Self>, id: &str) {
-        if self.connecting_to().is_some() {
-            self.undo_connect_once_done(id.to_string());
-        }
         let stopped = {
             let mut guard = self.session.lock().unwrap();
             if guard.as_ref().map_or(false, |s| s.stable_id() == id) {
@@ -1568,7 +1568,13 @@ impl App {
         uc.remove_airplay_pairing(id);
         uc.speaker_settings.remove(id);
         uc.save();
+        drop(uc);
         info!("manual speaker removed: {}", id);
+        // Gone from the list first, then: a connect that starts from now on
+        // can't find it, and one already under way may have, and is watched.
+        if self.connecting_to().is_some() {
+            self.undo_connect_once_done(id.to_string());
+        }
     }
 
     /// Once the connect in flight has ended: if it bound the removed
@@ -4225,8 +4231,28 @@ impl App {
         self.quit_now.load(Ordering::SeqCst)
     }
 
+    /// A speaker picked from the web API: refused once the app is quitting
+    /// (it would bind a speaker the app is about to leave, after the quit
+    /// switched streaming off for exactly that reason).
+    pub fn select_speaker_from_remote(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        if self.is_shutting_down() {
+            return Err(format!("{} is quitting: no speaker can be chosen now.", PRODUCT_NAME));
+        }
+        self.select_speaker(id)
+    }
+
+    /// Run `hook` once, when quitting begins (Quit chosen, the window closed
+    /// for good, Ctrl+C).
+    pub fn on_quit(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_quit.set(Box::new(hook));
+    }
+
     pub fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        if !self.shutdown.swap(true, Ordering::SeqCst) {
+            if let Some(hook) = self.on_quit.get() {
+                hook();
+            }
+        }
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -5389,6 +5415,30 @@ mod tests {
         // A connect still in flight can't bind after this: it stops what it
         // set up instead (it binds only while streaming is enabled).
         assert!(!app.is_streaming_enabled());
+    }
+
+    #[test]
+    fn a_pick_from_the_web_while_quitting_is_refused() {
+        let app = test_app();
+        app.request_shutdown();
+        app.shut_down_within(Duration::from_millis(10), Duration::from_millis(10));
+        let refused = app.select_speaker_from_remote("uuid:kitchen").unwrap_err();
+        assert!(refused.contains("quitting"), "{refused}");
+        // And it didn't turn streaming back on for a session to bind.
+        assert!(!app.is_streaming_enabled());
+    }
+
+    #[test]
+    fn quitting_runs_the_quit_hook_once() {
+        let app = test_app();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        app.on_quit(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        app.request_shutdown();
+        app.request_shutdown();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

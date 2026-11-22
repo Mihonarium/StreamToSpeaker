@@ -911,6 +911,10 @@ fn run(cli: Cli) -> Result<()> {
     } else {
         // Keep an existing sign-in entry pointing at this exe.
         stream_to_speaker::autostart::reapply();
+        // From the moment Quit is chosen, a new launch waits for this copy
+        // to end instead of handing over to it: it is about to have no
+        // window to show.
+        app.on_quit(stream_to_speaker::single_instance::announce_closing);
         run_gui_mode(app, cli.no_tray, cli.startup && !cli.no_tray)
     };
     // Nothing plays on a speaker any more: the device's plain name.
@@ -955,9 +959,6 @@ fn run_gui_mode(app: Arc<App>, no_tray: bool, start_hidden: bool) -> Result<()> 
         ));
     }
 
-    // From here a new launch waits for this copy to end instead of
-    // handing over to it: there is no window left to show.
-    stream_to_speaker::single_instance::announce_closing();
     // Tell the audio loop to stop. Its reader thread is deliberately not
     // joined: it waits inside the driver's read for the next packet,
     // which while Windows plays nothing never comes. Process exit ends
@@ -1062,7 +1063,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
     };
     let speaker_select: SpeakerSelectCallback = {
         let app2 = app.clone();
-        Arc::new(move |id: &str| app2.select_speaker(id))
+        Arc::new(move |id: &str| app2.select_speaker_from_remote(id))
             as Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>
     };
     let resync: ResyncCallback = {
