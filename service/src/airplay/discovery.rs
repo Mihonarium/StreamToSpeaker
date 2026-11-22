@@ -983,8 +983,10 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
             fullname: info.get_fullname().to_ascii_lowercase(),
             metadata: read_txt_int_list(txt, "md"),
             mac,
+            // An empty `tp` says nothing, like none.
             transports: read_txt_string(txt, "tp")
-                .map(|tp| tp.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()),
+                .map(|tp| tp.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect::<Vec<_>>())
+                .filter(|tp| !tp.is_empty()),
             friendly_name: friendly,
             txt: txt
                 .iter()
@@ -1732,6 +1734,18 @@ mod tests {
         assert!(!wants("airplay:AABBCCDDEE02"));
         assert!(!wants("airplay:AABBCCDDEE03"));
         assert_eq!(state.find_by_id("airplay:AABBCCDDEE01").unwrap().raop.metadata, [0, 1, 2]);
+    }
+
+    #[test]
+    fn an_empty_tp_counts_as_none() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE11@E", "192.168.1.5", &[("tp", ""), ("et", "0"), ("cn", "1")]));
+        ingest_resolution(&state, RAOP_SERVICE, &raop_info("AABBCCDDEE12@F", "192.168.1.6", &[("tp", " , "), ("et", "0"), ("cn", "1")]));
+        for id in ["airplay:AABBCCDDEE11", "airplay:AABBCCDDEE12"] {
+            let r = state.find_by_id(id).unwrap();
+            assert_eq!(r.raop.transports, None);
+            assert!(r.supports_legacy_raop());
+        }
     }
 
     #[test]
