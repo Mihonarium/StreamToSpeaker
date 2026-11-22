@@ -137,6 +137,8 @@ pub struct PtpTimeline {
     /// Smoothed (receiver_clock − our_clock) in ns, from its Sync/Follow_Up.
     peer_offset_ns: Arc<AtomicI64>,
     peer_locked: Arc<AtomicBool>,
+    /// Anything at all arrived on the PTP ports for this session.
+    peer_heard: Arc<AtomicBool>,
 }
 
 impl PtpTimeline {
@@ -147,7 +149,25 @@ impl PtpTimeline {
             peer_clock_id: Arc::new(AtomicU64::new(0)),
             peer_offset_ns: Arc::new(AtomicI64::new(0)),
             peer_locked: Arc::new(AtomicBool::new(false)),
+            peer_heard: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether any PTP message arrived for this session (nothing at all
+    /// points at a firewall or at the ports).
+    pub fn heard_from_receiver(&self) -> bool {
+        self.peer_heard.load(Ordering::Acquire)
+    }
+
+    /// Whether the receiver announced a clock of its own (it masters its
+    /// clock at us, the Sonos case) rather than following ours.
+    pub fn receiver_announced_clock(&self) -> bool {
+        self.peer_clock_id.load(Ordering::Acquire) != 0
+    }
+
+    /// Whether its Sync/Follow_Up pairs arrived, so we follow its clock.
+    pub fn locked_to_receiver(&self) -> bool {
+        self.peer_locked.load(Ordering::Acquire)
     }
 
     pub fn our_now_ns(&self) -> u64 {
@@ -203,11 +223,11 @@ pub struct PtpMaster {
 }
 
 impl PtpMaster {
-    /// Why this PC's PTP ports could not be opened (another program holds
-    /// them, for one), if they couldn't: the session then runs PTP from
-    /// temporary ports, which receivers don't answer.
-    pub fn ports_problem(&self) -> Option<&str> {
-        self.shared.ports_problem.as_deref()
+    /// Why this PC's PTP ports could not be opened, if they couldn't: the
+    /// session then runs PTP from temporary ports, which receivers don't
+    /// answer.
+    pub fn ports_problem(&self) -> Option<&PortsProblem> {
+        self.shared.ports_problem.as_ref()
     }
 
     /// Leave the service. When this was the last session on its address,
@@ -320,7 +340,7 @@ struct Shared {
     sessions: Mutex<Vec<Registration>>,
     stop: AtomicBool,
     ports: PtpPorts,
-    ports_problem: Option<String>,
+    ports_problem: Option<PortsProblem>,
 }
 
 /// Every running service. Joining, leaving and stopping happen under this
@@ -377,28 +397,45 @@ fn leave(shared: &Arc<Shared>, id: u64) {
     }
 }
 
+/// Why a PTP port could not be opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortsProblem {
+    pub port: u16,
+    pub ip: IpAddr,
+    /// The OS said the address is in use: another program holds the port.
+    pub in_use: bool,
+    pub error: String,
+}
+
+impl std::fmt::Display for PortsProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.in_use {
+            write!(f, "another program on this PC is using UDP port {} on {}", self.port, self.ip)
+        } else {
+            write!(f, "this PC could not open UDP port {} on {} ({})", self.port, self.ip, self.error)
+        }
+    }
+}
+
 /// Bind one PTP port. When that fails, fall back to a temporary port (the
 /// session still starts, as before) and return why, for the log and the
 /// session's fault message.
-fn bind_ptp(local_ip: IpAddr, port: u16) -> Result<(UdpSocket, Option<String>)> {
+fn bind_ptp(local_ip: IpAddr, port: u16) -> Result<(UdpSocket, Option<PortsProblem>)> {
     match UdpSocket::bind(SocketAddr::new(local_ip, port)) {
         Ok(s) => Ok((s, None)),
         Err(e) => {
-            let problem = bind_problem(local_ip, port, &e);
+            let problem = PortsProblem {
+                port,
+                ip: local_ip,
+                in_use: e.kind() == std::io::ErrorKind::AddrInUse,
+                error: e.to_string(),
+            };
             warn!(
                 "AirPlay 2 PTP: {problem}. Using a temporary port instead, which AirPlay 2 speakers \
                  don't answer, so they may not sync to this PC and stay silent."
             );
             Ok((UdpSocket::bind(SocketAddr::new(local_ip, 0))?, Some(problem)))
         }
-    }
-}
-
-fn bind_problem(local_ip: IpAddr, port: u16, e: &std::io::Error) -> String {
-    if e.kind() == std::io::ErrorKind::AddrInUse {
-        format!("another program on this PC is using UDP port {port} on {local_ip}")
-    } else {
-        format!("UDP port {port} on {local_ip} could not be opened ({e})")
     }
 }
 
@@ -563,6 +600,7 @@ impl Registration {
     fn on_event(&mut self, pkt: &[u8], src: SocketAddr, received: Instant, general: &UdpSocket, ports: PtpPorts) {
         let t_recv = self.timeline.clock.ns_at(received);
         self.rx_total += 1;
+        self.timeline.peer_heard.store(true, Ordering::Release);
         let Some(h) = parse_header(pkt) else { return };
         note_inbound(&mut self.seen_types, h.msg_type, ports.local_event, src);
         match h.msg_type {
@@ -588,6 +626,7 @@ impl Registration {
     /// Delay_Resp from the receiver.
     fn on_general(&mut self, pkt: &[u8], src: SocketAddr, ports: PtpPorts) {
         self.rx_total += 1;
+        self.timeline.peer_heard.store(true, Ordering::Release);
         let Some(h) = parse_header(pkt) else { return };
         note_inbound(&mut self.seen_types, h.msg_type, ports.local_general, src);
         match h.msg_type {
@@ -964,6 +1003,7 @@ mod tests {
         assert_eq!(from.port(), ports.local_event, "B keeps the ports after A stops");
         assert_eq!(b_rx.delay_resp_clock(ports, 0x53), b.timeline.clock_id);
 
+        assert!(b.timeline.heard_from_receiver(), "B's receiver sent a Delay_Req");
         b.stop();
         UdpSocket::bind((local, ports.local_event)).expect("event port released with the last session");
         UdpSocket::bind((local, ports.local_general)).expect("general port released with the last session");
@@ -992,6 +1032,7 @@ mod tests {
         assert_eq!((h.msg_type, h.sequence_id), (MSG_SYNC, 0));
         assert_eq!(h.source_port_identity[..8], id);
         assert!(m.ports_problem().is_none());
+        assert!(!m.timeline.heard_from_receiver(), "nothing came back from this receiver");
     }
 
     /// A stereo pair: one clock for both members; hosts that aren't
@@ -1061,7 +1102,7 @@ mod tests {
         let (_, from) = FakeReceiver::next(&rx.event, MSG_SYNC);
         assert_ne!(from.port(), ports.local_event);
         let problem = m.ports_problem().expect("the session knows its PTP port is taken");
-        assert!(problem.contains(&format!("UDP port {}", ports.local_event)), "{problem}");
+        assert_eq!((problem.port, problem.in_use), (ports.local_event, true), "{problem}");
     }
 
     #[test]

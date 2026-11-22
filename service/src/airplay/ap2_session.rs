@@ -40,7 +40,9 @@ use crate::airplay::ap2_health::{
     FaultChannel, FaultSlot, FeedbackAction, FeedbackMonitor, SendAction, SendHealth, VolumeTracker,
     FEEDBACK_INTERVAL,
 };
-use crate::airplay::ap2_ptp::{spawn_ptp_master, spawn_ptp_master_on, PtpMaster, PtpPorts, PtpTimeline, PTP_PORTS};
+use crate::airplay::ap2_ptp::{
+    spawn_ptp_master, spawn_ptp_master_on, PortsProblem, PtpMaster, PtpPorts, PtpTimeline, PTP_PORTS,
+};
 use crate::airplay::ap2_resend::Retransmitter;
 use crate::airplay::ap2_crypto::ChannelCipher;
 use crate::airplay::ap2_realtime::{MemberLink, RealtimeGroup, RealtimeRun};
@@ -468,7 +470,8 @@ impl AirPlay2Session {
                 timeline: bring_up.ptp.as_ref().expect("buffered implies PTP").timeline.clone(),
                 encoder: aac_encoder(),
                 anchor_retry: AnchorRetry::new(),
-                ptp_ports_problem: bring_up.ptp.as_ref().and_then(|p| p.ports_problem()).map(str::to_string),
+                ptp_ports_problem: bring_up.ptp.as_ref().and_then(|p| p.ports_problem()).cloned(),
+                homepod,
                 faults: faults.clone(),
             })?);
             info!("AirPlay 2: buffered AAC-LC stream armed — will anchor at first audio");
@@ -1372,7 +1375,9 @@ struct BufferedSenderConfig {
     /// How long a refused or unanswered anchor is retried.
     anchor_retry: AnchorRetry,
     /// Why this PC's PTP ports couldn't be opened, if they couldn't.
-    ptp_ports_problem: Option<String>,
+    ptp_ports_problem: Option<PortsProblem>,
+    /// The receiver is a HomePod (its settings differ from the others').
+    homepod: bool,
     faults: FaultSlot,
 }
 
@@ -1402,7 +1407,9 @@ fn try_anchor_buffered(
         .checked_add(ANCHOR_LEAD_NS)
         .and_then(|ns| ns.div_ceil(1_000_000_000).checked_mul(1_000_000_000))
     else {
-        return Err(AnchorFailure::NoAnswer(format!("the receiver's clock reads {base_ns} ns, too far to anchor on")));
+        return Err(AnchorFailure::BadClock(format!(
+            "the receiver's clock reads {base_ns} ns, too far ahead to schedule playback on"
+        )));
     };
     match conn.set_rate_anchor_time(1, rtp_time, anchor_ns, timeline_id) {
         Ok(Ok(())) => Ok(timeline_id),
@@ -1439,15 +1446,14 @@ fn encoder_failed(faults: &FaultSlot, stop_flag: &AtomicBool, detail: String, pl
 
 /// No anchor was accepted within the retry bound: the receiver will not
 /// play the stream, so the session ends. A reconnect may help once (a fresh
-/// session, a fresh PTP exchange); if the same happens again, the person is
-/// told what the code knows: the PTP ports problem if there is one, whether
-/// the receiver's clock ever reached this PC, and whether it refused or
-/// stopped answering.
+/// session, a fresh PTP exchange); if it fails the same way, the person is
+/// told what the code knows ([`anchor_advice`]).
 fn anchor_failed(
     faults: &FaultSlot,
     stop_flag: &AtomicBool,
-    locked_to_receiver: bool,
-    ptp_ports_problem: Option<&str>,
+    clock: ClockEvidence,
+    ptp_ports_problem: Option<&PortsProblem>,
+    homepod: bool,
     last: &AnchorFailure,
 ) {
     if stop_flag.load(Ordering::Acquire) {
@@ -1456,30 +1462,92 @@ fn anchor_failed(
     let detail = format!("the speaker accepted no playback anchor (last: {last})");
     // No anchor was accepted, so this session never played.
     faults.raise_unless_repeated("anchor_failed", FaultChannel::Media, detail, false, || {
-        anchor_failed_message(locked_to_receiver, ptp_ports_problem, last)
+        anchor_failed_message(last, ptp_ports_problem, clock, homepod)
     });
+}
+
+/// What the PTP layer saw of the receiver by the time the anchor gave up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClockEvidence {
+    /// Anything at all arrived on the PTP ports.
+    heard: bool,
+    /// It announced a clock of its own.
+    announced: bool,
+    /// Its Sync/Follow_Up pairs arrived: we follow its clock.
+    locked: bool,
+}
+
+/// Which cause the final anchor sentence names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorAdvice {
+    /// Another program holds a PTP port.
+    OtherProgram,
+    /// A PTP port couldn't be opened for another reason.
+    PortUnavailable,
+    /// The receiver's clock never reached this PC: nothing arrived, or it
+    /// announced its clock but its time signals never came.
+    Firewall,
+    /// It follows this PC's clock and refused every anchor on it.
+    FollowsOurClock,
+    /// We followed its own clock and it refused anyway.
+    RefusedOnItsClock,
+    NoAnswer,
+    BadClock,
+}
+
+fn anchor_advice(last: &AnchorFailure, ports: Option<&PortsProblem>, clock: ClockEvidence) -> AnchorAdvice {
+    match last {
+        AnchorFailure::NoAnswer(_) => AnchorAdvice::NoAnswer,
+        AnchorFailure::BadClock(_) => AnchorAdvice::BadClock,
+        AnchorFailure::Refused { .. } => match ports {
+            Some(p) if p.in_use => AnchorAdvice::OtherProgram,
+            Some(_) => AnchorAdvice::PortUnavailable,
+            None if !clock.heard || (clock.announced && !clock.locked) => AnchorAdvice::Firewall,
+            None if clock.locked => AnchorAdvice::RefusedOnItsClock,
+            None => AnchorAdvice::FollowsOurClock,
+        },
+    }
 }
 
 /// The sentence after "Connection to <speaker> ended:" when the anchor
 /// failed again after the reconnect.
-fn anchor_failed_message(locked_to_receiver: bool, ptp_ports_problem: Option<&str>, last: &AnchorFailure) -> String {
-    match (ptp_ports_problem, last) {
-        (Some(problem), _) => format!(
+fn anchor_failed_message(
+    last: &AnchorFailure,
+    ports: Option<&PortsProblem>,
+    clock: ClockEvidence,
+    homepod: bool,
+) -> String {
+    let ports_text = ports.map(|p| p.to_string()).unwrap_or_default();
+    match anchor_advice(last, ports, clock) {
+        AnchorAdvice::OtherProgram => format!(
             "it would not start playing. AirPlay 2 needs UDP ports 319 and 320 for the speaker's clock, \
-             but {problem}. Close that program, then select the speaker again."
+             but {ports_text}. Close that program, then select the speaker again."
         ),
-        (None, AnchorFailure::Refused { .. }) if !locked_to_receiver => format!(
+        AnchorAdvice::PortUnavailable => format!(
+            "it would not start playing. AirPlay 2 needs UDP ports 319 and 320 for the speaker's clock, \
+             but {ports_text}. Select the speaker again."
+        ),
+        AnchorAdvice::Firewall => format!(
             "it refused to start playing, and its clock never reached this PC. Check that Windows \
-             Firewall allows {} on private networks (it needs UDP ports 319 and 320), then select the \
-             speaker again.",
+             Firewall lets {} receive on the network this PC uses (it needs UDP ports 319 and 320), \
+             then select the speaker again.",
             crate::PRODUCT_NAME
         ),
-        (None, AnchorFailure::Refused { .. }) => "it refused to start playing. Turn on \"Prefer low-latency \
-             realtime\" in Advanced, then select the speaker again."
+        AnchorAdvice::FollowsOurClock if homepod => "it refused to start playing on this PC's clock. Turn off \
+             \"Use the buffered stream for single HomePods\" in Advanced, then select it again."
             .to_string(),
-        (None, AnchorFailure::NoAnswer(_)) => "it stopped answering just before playback was to start. Check \
-             that it is switched on and on the same network as this PC, then select it again."
+        AnchorAdvice::FollowsOurClock => "it refused to start playing on this PC's clock. Turn on \
+             \"Prefer low-latency realtime\" in Advanced, then select the speaker again."
             .to_string(),
+        AnchorAdvice::RefusedOnItsClock => {
+            "it refused to start playing, although this PC was following its clock. Select it again.".to_string()
+        }
+        AnchorAdvice::NoAnswer => "it stopped answering just before playback was to start. Check that it is \
+             switched on and on the same network as this PC, then select it again."
+            .to_string(),
+        AnchorAdvice::BadClock => {
+            "the clock it reported can't be used to schedule playback. Select it again.".to_string()
+        }
     }
 }
 
@@ -1577,11 +1645,17 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
                         AnchorAction::Retry { warn: true } => warn!("AirPlay 2 anchor failed (will retry): {failure}"),
                         AnchorAction::Retry { warn: false } => debug!("AirPlay 2 anchor failed again: {failure}"),
                         AnchorAction::GiveUp => {
+                            let clock = ClockEvidence {
+                                heard: cfg.timeline.heard_from_receiver(),
+                                announced: cfg.timeline.receiver_announced_clock(),
+                                locked: cfg.timeline.locked_to_receiver(),
+                            };
                             anchor_failed(
                                 &cfg.faults,
                                 &cfg.stop_flag,
-                                cfg.timeline.receiver_now_ns().is_some(),
-                                cfg.ptp_ports_problem.as_deref(),
+                                clock,
+                                cfg.ptp_ports_problem.as_ref(),
+                                cfg.homepod,
                                 &failure,
                             );
                             return;
@@ -2034,7 +2108,7 @@ mod tests {
             initial_seq: u16,
             anchor_replies: &'static [&'static str],
             anchor_retry: AnchorRetry,
-            ptp_ports_problem: Option<String>,
+            ptp_ports_problem: Option<crate::airplay::ap2_ptp::PortsProblem>,
         ) -> Self {
             use crate::airplay::test_peers::{read_request, reply};
             use std::io::BufReader;
@@ -2085,6 +2159,7 @@ mod tests {
                 encoder,
                 anchor_retry,
                 ptp_ports_problem,
+                homepod: false,
                 faults: faults.clone(),
             })
             .unwrap();
@@ -2158,6 +2233,47 @@ mod tests {
         }
     }
 
+    /// The final anchor sentence names a cause only where the signal points
+    /// at it: another program for an address-in-use error, the firewall when
+    /// the receiver's clock never reached this PC (nothing arrived, or it
+    /// announced its clock but no time signals came), the realtime setting
+    /// for a receiver that follows this PC's clock.
+    #[test]
+    fn the_anchor_advice_follows_what_the_clock_layer_saw() {
+        use crate::airplay::ap2_ptp::PortsProblem;
+        let refused = AnchorFailure::Refused { status: 400, detail: "SETRATEANCHORTIME → 400".into() };
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        let in_use = PortsProblem { port: 319, ip, in_use: true, error: "address in use".into() };
+        let denied = PortsProblem { port: 319, ip, in_use: false, error: "access denied (os error 10013)".into() };
+        let ev = |heard, announced, locked| ClockEvidence { heard, announced, locked };
+        let none = ev(false, false, false);
+        let follows_us = ev(true, false, false);
+        let announced_only = ev(true, true, false);
+        let locked = ev(true, true, true);
+        use AnchorAdvice::*;
+        for (failure, ports, clock, want) in [
+            (&refused, Some(&in_use), locked, OtherProgram),
+            (&refused, Some(&denied), none, PortUnavailable),
+            (&refused, None, none, Firewall),
+            (&refused, None, announced_only, Firewall),
+            (&refused, None, follows_us, FollowsOurClock),
+            (&refused, None, locked, RefusedOnItsClock),
+            (&AnchorFailure::NoAnswer("timed out".into()), Some(&in_use), none, NoAnswer),
+            (&AnchorFailure::BadClock("too far".into()), None, locked, BadClock),
+        ] {
+            assert_eq!(anchor_advice(failure, ports, clock), want, "{failure:?} {ports:?} {clock:?}");
+        }
+        let text = |failure, ports, clock, homepod| anchor_failed_message(failure, ports, clock, homepod);
+        assert!(text(&refused, Some(&in_use), locked, false).contains("another program on this PC is using UDP port 319"));
+        let neutral = text(&refused, Some(&denied), none, false);
+        assert!(neutral.contains("could not open UDP port 319") && !neutral.contains("program"), "{neutral}");
+        let firewall = text(&refused, None, none, false);
+        assert!(firewall.contains("Windows Firewall") && !firewall.contains("private"), "{firewall}");
+        assert!(text(&refused, None, follows_us, false).contains("Prefer low-latency realtime"));
+        assert!(text(&refused, None, follows_us, true).contains("Use the buffered stream for single HomePods"));
+        assert!(!text(&refused, None, locked, false).contains("Firewall"));
+    }
+
     /// A receiver that refuses every anchor (the Sonos does on our clock
     /// when this PC never gets its clock) ends the session after the bound
     /// instead of retrying for ever in silence; after the reconnect the
@@ -2179,11 +2295,17 @@ mod tests {
         for (round, ports_problem, want) in [
             (1, None, None),
             (2, None, Some("UDP ports 319 and 320")),
-            (1, Some("another program on this PC is using UDP port 319 on 10.0.0.5"), None),
-            (2, Some("another program on this PC is using UDP port 319 on 10.0.0.5"), Some("another program on this PC is using UDP port 319")),
+            (1, Some(true), None),
+            (2, Some(true), Some("another program on this PC is using UDP port 319")),
         ] {
             let name = if ports_problem.is_some() { "Ports test speaker" } else { "Anchor test speaker" };
-            let mut rig = start(name, Duration::from_millis(1500), ports_problem.map(str::to_string));
+            let problem = ports_problem.map(|in_use| crate::airplay::ap2_ptp::PortsProblem {
+                port: 319,
+                ip: "10.0.0.5".parse().unwrap(),
+                in_use,
+                error: "address in use".into(),
+            });
+            let mut rig = start(name, Duration::from_millis(1500), problem);
             rig.feed(spf * 4);
             rig.wait_for_exit();
             assert!(rig.dead.load(Ordering::Acquire), "round {round}: session not marked dead");

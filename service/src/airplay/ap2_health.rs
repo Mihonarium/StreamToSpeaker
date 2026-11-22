@@ -352,12 +352,16 @@ pub enum AnchorFailure {
     Refused { status: u16, detail: String },
     /// No usable answer: a timeout or a connection error.
     NoAnswer(String),
+    /// The receiver's clock reading can't be turned into a playback time.
+    BadClock(String),
 }
 
 impl std::fmt::Display for AnchorFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AnchorFailure::Refused { detail, .. } | AnchorFailure::NoAnswer(detail) => f.write_str(detail),
+            AnchorFailure::Refused { detail, .. } | AnchorFailure::NoAnswer(detail) | AnchorFailure::BadClock(detail) => {
+                f.write_str(detail)
+            }
         }
     }
 }
