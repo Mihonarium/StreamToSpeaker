@@ -465,7 +465,6 @@ impl AirPlay2Session {
                 timeline: bring_up.ptp.as_ref().expect("buffered implies PTP").timeline.clone(),
                 encoder: aac_encoder(),
                 anchor_retry: AnchorRetry::new(),
-                ptp_ports_problem: bring_up.ptp.as_ref().and_then(|p| p.ports_problem()).cloned(),
                 homepod,
                 faults: faults.clone(),
             })?);
@@ -1411,8 +1410,6 @@ struct BufferedSenderConfig {
     encoder: EncoderFactory,
     /// How long a refused or unanswered anchor is retried.
     anchor_retry: AnchorRetry,
-    /// Why this PC's PTP ports couldn't be opened, if they couldn't.
-    ptp_ports_problem: Option<PortsProblem>,
     /// The receiver is a HomePod (its settings differ from the others').
     homepod: bool,
     faults: FaultSlot,
@@ -1691,7 +1688,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
                                 &cfg.faults,
                                 &cfg.stop_flag,
                                 clock,
-                                cfg.ptp_ports_problem.as_ref(),
+                                cfg.timeline.ports_problem().as_ref(),
                                 cfg.homepod,
                                 &failure,
                             );
@@ -2192,10 +2189,10 @@ mod tests {
                 current_rtptime: Arc::new(AtomicU32::new(1_000)),
                 last_seq: last_seq.clone(),
                 rtsp: Arc::new(Mutex::new(rtsp)),
-                timeline: PtpTimeline::new(crate::airplay::ap2_ptp::PtpMasterClock::new(), 0x42),
+                timeline: PtpTimeline::new(crate::airplay::ap2_ptp::PtpMasterClock::new(), 0x42)
+                    .with_ports_problem(ptp_ports_problem),
                 encoder,
                 anchor_retry,
-                ptp_ports_problem,
                 homepod: false,
                 faults: faults.clone(),
             })

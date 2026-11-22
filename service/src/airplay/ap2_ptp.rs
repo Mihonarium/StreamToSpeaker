@@ -143,6 +143,9 @@ pub struct PtpTimeline {
     peer_locked: Arc<AtomicBool>,
     /// Anything at all arrived on the PTP ports for this session.
     peer_heard: Arc<AtomicBool>,
+    /// Why the service this session joined is on temporary ports, if it is
+    /// (shared with the service, so it clears when the service moves back).
+    ports_problem: Arc<Mutex<Option<PortsProblem>>>,
 }
 
 impl PtpTimeline {
@@ -154,7 +157,21 @@ impl PtpTimeline {
             peer_offset_ns: Arc::new(AtomicI64::new(0)),
             peer_locked: Arc::new(AtomicBool::new(false)),
             peer_heard: Arc::new(AtomicBool::new(false)),
+            ports_problem: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Why this PC's PTP ports can't be used for this session now, if
+    /// they can't: it then runs PTP from temporary ports, which receivers
+    /// don't answer.
+    pub fn ports_problem(&self) -> Option<PortsProblem> {
+        lock(&self.ports_problem).clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ports_problem(self, problem: Option<PortsProblem>) -> Self {
+        *lock(&self.ports_problem) = problem;
+        self
     }
 
     /// Whether any PTP message arrived for this session (nothing at all
@@ -227,11 +244,9 @@ pub struct PtpMaster {
 }
 
 impl PtpMaster {
-    /// Why this PC's PTP ports could not be opened, if they couldn't: the
-    /// session then runs PTP from temporary ports, which receivers don't
-    /// answer.
-    pub fn ports_problem(&self) -> Option<&PortsProblem> {
-        self.shared.ports_problem.as_ref()
+    /// See [`PtpTimeline::ports_problem`].
+    pub fn ports_problem(&self) -> Option<PortsProblem> {
+        self.timeline.ports_problem()
     }
 
     /// Leave the service. When this was the last session on its address,
@@ -299,7 +314,7 @@ pub(crate) fn spawn_ptp_master_on(
     // strict receiver would see two different timeline ids.
     let clock_id: u64 = rng.gen::<u64>() & 0x7FFF_FFFF_FFFF_FFFF;
     let clock_uuid = format_uuid(rng.gen());
-    let timeline = PtpTimeline::new(PtpMasterClock::new(), clock_id);
+    let mut timeline = PtpTimeline::new(PtpMasterClock::new(), clock_id);
     let id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
 
     let mut registry = lock(&SERVICES);
@@ -314,12 +329,18 @@ pub(crate) fn spawn_ptp_master_on(
             services.len() - 1
         }
     };
-    let service = &services[index];
-    let shared = service.shared.clone();
+    let shared = services[index].shared.clone();
+    if lock(&shared.ports_problem).is_some() {
+        shared.move_to_real_ports(local_ip);
+    }
+    timeline.ports_problem = shared.ports_problem.clone();
     {
         let mut sessions = lock(&shared.sessions);
         sessions.push(Registration::new(id, members.to_vec(), members_only, timeline.clone(), receiver_name));
-        transmit_due(&mut sessions, &service.event, &service.general, ports, Instant::now());
+        // A service in the registry has its sockets (see `leave`).
+        if let Some(sockets) = shared.sockets() {
+            transmit_due(&mut sessions, &sockets.event, &sockets.general, ports, Instant::now());
+        }
     }
     drop(registry);
 
@@ -336,10 +357,6 @@ struct Service {
     local_ip: IpAddr,
     ports: PtpPorts,
     shared: Arc<Shared>,
-    /// Handles on the thread's sockets, for a joining session's first
-    /// messages.
-    event: UdpSocket,
-    general: UdpSocket,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -348,7 +365,67 @@ struct Shared {
     sessions: Mutex<Vec<Registration>>,
     stop: AtomicBool,
     ports: PtpPorts,
-    ports_problem: Option<PortsProblem>,
+    /// The thread takes them at the start of each tick (and holds no lock
+    /// while it waits on them); a joining session may move them back onto
+    /// the real ports ([`Shared::move_to_real_ports`]). Replaced sockets
+    /// close when the tick that still uses them ends. None once the
+    /// service has stopped: `leave` closes them before it says the ports
+    /// are free.
+    sockets: Mutex<Option<Arc<PtpSockets>>>,
+    /// Set while the service runs on temporary ports.
+    ports_problem: Arc<Mutex<Option<PortsProblem>>>,
+}
+
+struct PtpSockets {
+    event: UdpSocket,
+    general: UdpSocket,
+}
+
+impl PtpSockets {
+    fn new(event: UdpSocket, general: UdpSocket) -> Result<Self> {
+        // The event port's read timeout is the service's tick.
+        event.set_read_timeout(Some(Duration::from_millis(25)))?;
+        general.set_nonblocking(true)?;
+        Ok(Self { event, general })
+    }
+}
+
+impl Shared {
+    fn sockets(&self) -> Option<Arc<PtpSockets>> {
+        lock(&self.sockets).clone()
+    }
+
+    /// The service is on temporary ports because the real ones couldn't be
+    /// opened when it started. If both are free now, move every session's
+    /// PTP onto them; otherwise stay as is.
+    fn move_to_real_ports(&self, local_ip: IpAddr) {
+        // A socket already on its real port is kept (it is this service's
+        // own); one on a temporary port is bound again on the real one.
+        let Some(current) = self.sockets() else { return };
+        let real = |socket: &UdpSocket, port: u16| -> std::io::Result<UdpSocket> {
+            if socket.local_addr()?.port() == port {
+                socket.try_clone()
+            } else {
+                UdpSocket::bind(SocketAddr::new(local_ip, port))
+            }
+        };
+        let moved = real(&current.event, self.ports.local_event)
+            .and_then(|event| Ok((event, real(&current.general, self.ports.local_general)?)))
+            .map_err(anyhow::Error::from)
+            .and_then(|(event, general)| PtpSockets::new(event, general));
+        drop(current);
+        match moved {
+            Ok(sockets) => {
+                *lock(&self.sockets) = Some(Arc::new(sockets));
+                *lock(&self.ports_problem) = None;
+                info!(
+                    "AirPlay 2 PTP: UDP ports {} and {} on {} are free again; serving from them",
+                    self.ports.local_event, self.ports.local_general, local_ip
+                );
+            }
+            Err(e) => debug!("AirPlay 2 PTP: the PTP ports are still not available ({e:#})"),
+        }
+    }
 }
 
 /// Every running service, and the addresses whose service is closing.
@@ -375,19 +452,18 @@ impl Service {
     fn start(local_ip: IpAddr, ports: PtpPorts) -> Result<Self> {
         let (event, event_problem) = bind_ptp(local_ip, ports.local_event).context("bind PTP event :319")?;
         let (general, general_problem) = bind_ptp(local_ip, ports.local_general).context("bind PTP general :320")?;
-        event.set_read_timeout(Some(Duration::from_millis(25)))?;
-        general.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
             sessions: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
             ports,
-            ports_problem: event_problem.or(general_problem),
+            sockets: Mutex::new(Some(Arc::new(PtpSockets::new(event, general)?))),
+            ports_problem: Arc::new(Mutex::new(event_problem.or(general_problem))),
         });
-        let (event_t, general_t, shared_t) = (event.try_clone()?, general.try_clone()?, shared.clone());
+        let shared_t = shared.clone();
         let thread = thread::Builder::new()
             .name(format!("stream-to-speaker-ap2-ptp:{}", local_ip))
-            .spawn(move || run_service(event_t, general_t, shared_t))?;
-        Ok(Self { local_ip, ports, shared, event, general, thread: Some(thread) })
+            .spawn(move || run_service(shared_t))?;
+        Ok(Self { local_ip, ports, shared, thread: Some(thread) })
     }
 }
 
@@ -415,6 +491,8 @@ fn leave(shared: &Arc<Shared>, id: u64) {
     if let Some(t) = service.thread.take() {
         let _ = t.join();
     }
+    // Close the ports now: the last session still holds the shared state.
+    lock(&service.shared.sockets).take();
     drop(service);
     lock(&SERVICES).closing.retain(|k| *k != key);
     CLOSED.notify_all();
@@ -511,11 +589,13 @@ fn transmit_due(sessions: &mut [Registration], event: &UdpSocket, general: &UdpS
     }
 }
 
-fn run_service(event: UdpSocket, general: UdpSocket, shared: Arc<Shared>) {
+fn run_service(shared: Arc<Shared>) {
     let ports = shared.ports;
     let mut buf = [0u8; 256];
     while !shared.stop.load(Ordering::Acquire) {
-        transmit_due(&mut lock(&shared.sessions), &event, &general, ports, Instant::now());
+        let Some(sockets) = shared.sockets() else { break };
+        let (event, general) = (&sockets.event, &sockets.general);
+        transmit_due(&mut lock(&shared.sessions), event, general, ports, Instant::now());
 
         // Event port: the receiver's Delay_Req arrives here. The 25 ms read
         // timeout doubles as the loop tick.
@@ -524,7 +604,7 @@ fn run_service(event: UdpSocket, general: UdpSocket, shared: Arc<Shared>) {
                 let received = Instant::now();
                 let mut sessions = lock(&shared.sessions);
                 match recipient(&sessions, src.ip()) {
-                    Some(i) => sessions[i].on_event(&buf[..n], src, received, &general, ports),
+                    Some(i) => sessions[i].on_event(&buf[..n], src, received, general, ports),
                     None => debug!("AP2 PTP: ignoring packet from non-member {}", src),
                 }
             }
@@ -536,7 +616,8 @@ fn run_service(event: UdpSocket, general: UdpSocket, shared: Arc<Shared>) {
             }
         }
 
-        drain_general(&general, &shared, &mut buf);
+        drain_general(general, &shared, &mut buf);
+        drop(sockets);
 
         let now = Instant::now();
         for s in lock(&shared.sessions).iter_mut() {
@@ -1138,7 +1219,14 @@ mod tests {
         }
         thread::sleep(Duration::from_millis(50)); // loopback delivery
         let ports = PtpPorts { local_event: 0, local_general: 0, peer_event: 0, peer_general: 0 };
-        let shared = Shared { sessions: Mutex::new(Vec::new()), stop: AtomicBool::new(false), ports, ports_problem: None };
+        let sockets = PtpSockets::new(UdpSocket::bind((LOCAL, 0)).unwrap(), UdpSocket::bind((LOCAL, 0)).unwrap()).unwrap();
+        let shared = Shared {
+            sessions: Mutex::new(Vec::new()),
+            stop: AtomicBool::new(false),
+            ports,
+            sockets: Mutex::new(Some(Arc::new(sockets))),
+            ports_problem: Arc::new(Mutex::new(None)),
+        };
         let mut buf = [0u8; 256];
         assert_eq!(drain_general(&general, &shared, &mut buf), MAX_GENERAL_PER_TICK);
         assert_eq!(drain_general(&general, &shared, &mut buf), 100 - MAX_GENERAL_PER_TICK);
@@ -1163,6 +1251,41 @@ mod tests {
             stopper.join().unwrap();
             b.stop();
         }
+    }
+
+    /// A session that joins a service still on temporary ports (another
+    /// program held 319 when it started) moves the service onto the real
+    /// ports once they are free, for every session on it; while they are
+    /// still held, everything stays on the temporary ports.
+    #[test]
+    fn a_joining_session_moves_the_service_back_onto_the_freed_ports() {
+        let ports = test_ports("127.0.0.15");
+        let local: IpAddr = LOCAL.parse().unwrap();
+        let other_program = UdpSocket::bind((local, ports.local_event)).unwrap();
+        let (a_rx, b_rx, c_rx) = (
+            FakeReceiver::bind("127.0.0.15", ports),
+            FakeReceiver::bind("127.0.0.16", ports),
+            FakeReceiver::bind("127.0.0.17", ports),
+        );
+        let a = spawn_ptp_master_on(&[a_rx.ip], local, ports, "A".into(), true).unwrap();
+        assert!(a.ports_problem().is_some());
+        let b = spawn_ptp_master_on(&[b_rx.ip], local, ports, "B".into(), true).unwrap();
+        assert!(b.ports_problem().is_some(), "still held: B joins the temporary ports");
+
+        drop(other_program);
+        let c = spawn_ptp_master_on(&[c_rx.ip], local, ports, "C".into(), true).unwrap();
+        assert!(c.ports_problem().is_none(), "{:?}", c.ports_problem());
+        assert!(a.ports_problem().is_none(), "A's service moved too");
+        for rx in [&a_rx, &c_rx] {
+            rx.drain();
+            let (_, from) = FakeReceiver::next(&rx.event, MSG_SYNC);
+            assert_eq!(from.port(), ports.local_event);
+            assert_eq!(rx.delay_resp_clock(ports, 0x80), if rx.ip == a_rx.ip { a.timeline.clock_id } else { c.timeline.clock_id });
+        }
+        a.stop();
+        b.stop();
+        c.stop();
+        UdpSocket::bind((local, ports.local_event)).expect("ports released with the last session");
     }
 
     /// When another program holds this PC's PTP port, the session still
