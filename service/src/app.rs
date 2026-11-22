@@ -842,8 +842,19 @@ impl Drop for CeremonyGuard {
 }
 
 impl App {
+    /// The app with the settings saved in `config.json`.
     pub fn new(
         config: AppConfig,
+        discovery: Option<Arc<DiscoveryState>>,
+        airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
+    ) -> Arc<Self> {
+        Self::with_settings(config, UserConfig::load(), discovery, airplay_discovery)
+    }
+
+    /// The app with `user_config` as its settings.
+    pub(crate) fn with_settings(
+        config: AppConfig,
+        user_config: UserConfig,
         discovery: Option<Arc<DiscoveryState>>,
         airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     ) -> Arc<Self> {
@@ -858,8 +869,7 @@ impl App {
             .parse::<IpAddr>()
             .ok()
             .filter(|ip| is_local_address(*ip));
-        let user_config = UserConfig::load();
-        // Seed last_speaker_id from disk so that, even before any user
+        // Seed last_speaker_id from the settings so that, even before any user
         // action, code that asks "what was the last speaker?" gets the
         // persisted answer.
         let last_speaker_id = Mutex::new(user_config.last_speaker_id.clone());
@@ -3974,8 +3984,10 @@ mod tests {
     }
 
 
+    /// An app with default settings that saves nowhere: never the
+    /// developer's own `config.json`.
     fn test_app() -> Arc<App> {
-        let app = App::new(
+        let app = App::with_settings(
             AppConfig {
                 advertise_ip: "192.168.1.10".into(),
                 advertise_ip_explicit: false,
@@ -3987,13 +3999,43 @@ mod tests {
                 web_enabled: false,
                 ssdp_iface: None,
             },
+            UserConfig::in_memory(),
             None,
             None,
         );
-        // Flip the gate directly — set_privacy_mode would write the
-        // developer's real config file to disk.
-        app.stream_gate.set_privacy(true);
+        app.set_privacy_mode(true);
         app
+    }
+
+    /// Run only by [`test_app_never_reads_the_settings_file`], in a child
+    /// process whose settings file turns reconnect-on-drop off.
+    #[test]
+    #[ignore = "run in a child process by test_app_never_reads_the_settings_file"]
+    fn test_app_settings_probe() {
+        assert!(test_app().is_auto_reconnect_on_drop(), "test_app() used the settings file");
+    }
+
+    #[test]
+    fn test_app_never_reads_the_settings_file() {
+        // The settings folder comes from APPDATA, which a test can't change
+        // for itself without racing every other test: run the probe in a
+        // process of its own.
+        let dir = std::env::temp_dir().join(format!("sts-test-app-settings-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("StreamToSpeaker")).unwrap();
+        std::fs::write(
+            dir.join("StreamToSpeaker").join("config.json"),
+            r#"{"auto_reconnect_on_drop": false}"#,
+        )
+        .unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "app::tests::test_app_settings_probe", "--test-threads=1"])
+            .env("APPDATA", &dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("1 passed"), "the probe didn't run, or failed:\n{text}");
+        assert!(out.status.success(), "{text}");
     }
 
     fn ip(s: &str) -> IpAddr {
@@ -4338,18 +4380,9 @@ mod tests {
         assert_eq!(app.check_stream_client(ip("192.168.1.50")), Err(Refusal::NotGranted));
     }
 
-    /// [`test_app`] with default settings instead of the developer's, in
-    /// memory only (saves don't reach the disk), and no remembered speaker.
-    fn test_app_defaults() -> Arc<App> {
-        let app = test_app();
-        *app.user_config.lock().unwrap() = UserConfig::in_memory();
-        *app.last_speaker_id.lock().unwrap() = None;
-        app
-    }
-
     #[test]
     fn sendspin_discovery_pauses_with_the_discovery_adapter() {
-        let app = test_app_defaults();
+        let app = test_app();
         {
             let mut uc = app.user_config.lock().unwrap();
             uc.sendspin.enabled = true;
@@ -4380,7 +4413,7 @@ mod tests {
     #[test]
     fn sendspin_launch_reconnect_follows_the_speaker_setting() {
         use crate::sendspin_app::{LaunchSkip, SendspinLaunch, MA_OUTPUT_ID};
-        let app = test_app_defaults();
+        let app = test_app();
         app.user_config.lock().unwrap().sendspin.enabled = true;
         let plan = |id: &str, auto_connect: AutoConnect| {
             {
@@ -4428,7 +4461,7 @@ mod tests {
     #[test]
     fn always_auto_connect_sees_sendspin_speakers() {
         use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
-        let app = test_app_defaults();
+        let app = test_app();
         let found = SendspinDiscoveryState::new();
         found.insert(SendspinRenderer {
             instance: "Kitchen".into(),
@@ -4448,7 +4481,7 @@ mod tests {
     #[test]
     fn failed_sendspin_discovery_is_shown_and_retried() {
         use crate::sendspin::server::SendspinDiscoveryState;
-        let app = test_app_defaults();
+        let app = test_app();
         app.user_config.lock().unwrap().sendspin.enabled = true;
         app.sendspin.discovery_allowed.store(true, Ordering::SeqCst);
         // A browse that can't start until `fail` is cleared.
@@ -4502,7 +4535,7 @@ mod tests {
         use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
         use crate::sendspin_app::LaunchStep;
         let id = "sendspin:kitchen";
-        let app = test_app_defaults();
+        let app = test_app();
         {
             let mut uc = app.user_config.lock().unwrap();
             uc.sendspin.enabled = true;
@@ -4585,7 +4618,7 @@ mod tests {
     #[test]
     fn disabling_streaming_cuts_every_network_listener_in_both_modes() {
         for privacy in [false, true] {
-            let app = test_app_defaults();
+            let app = test_app();
             app.stream_gate.set_privacy(privacy);
             // The speaker being played on, as its session's grant admits it.
             let _grant = app.stream_gate.grant([ip("192.168.1.50")]);
@@ -4622,7 +4655,7 @@ mod tests {
     #[test]
     fn forget_cuts_every_network_listener_at_once() {
         for privacy in [false, true] {
-            let app = test_app_defaults();
+            let app = test_app();
             app.stream_gate.set_privacy(privacy);
             *app.last_speaker_id.lock().unwrap() = Some("uuid:kitchen".into());
             let stranger = app.hub.subscribe_from(ip("192.168.1.99"));
@@ -4645,7 +4678,7 @@ mod tests {
         // players elsewhere on the network fetch the stream themselves.
         // That relies on streaming starting enabled and staying so until
         // the user disables it.
-        let app = test_app_defaults();
+        let app = test_app();
         assert!(app.config.no_discovery && app.discovery.is_none());
         app.stream_gate.set_privacy(false);
         assert!(app.is_streaming_enabled());
@@ -4662,7 +4695,7 @@ mod tests {
 
     #[test]
     fn turning_the_web_ui_on_makes_its_secret_once_and_keeps_it() {
-        let app = test_app_defaults();
+        let app = test_app();
         assert!(!app.is_web_ui_enabled());
         assert_eq!(app.web_link(), None);
         app.set_web_ui_enabled(true).unwrap();
@@ -4693,7 +4726,7 @@ mod tests {
         // Settings that can't be saved (config.json couldn't be read at
         // startup): a key kept only in memory would be undone by the next
         // start, which brings back the link the user meant to retire.
-        let app = test_app_defaults();
+        let app = test_app();
         let key = "00112233445566778899aabbccddeeff";
         let mut settings = UserConfig::unsaveable();
         settings.web_secret = Some(key.into());
@@ -4715,13 +4748,13 @@ mod tests {
 
     #[test]
     fn a_stored_web_secret_is_used_and_an_unusable_one_replaced() {
-        let app = test_app_defaults();
+        let app = test_app();
         let key = "00112233445566778899aabbccddeeff";
         app.user_config.lock().unwrap().web_secret = Some(key.into());
         app.set_web_ui_enabled(true).unwrap();
         assert_eq!(app.web_link(), Some(format!("http://192.168.1.10:8080/r/{key}/")));
         for bad in ["", "short", "zz112233445566778899aabbccddeeff"] {
-            let app = test_app_defaults();
+            let app = test_app();
             app.user_config.lock().unwrap().web_secret = Some(bad.into());
             app.set_web_ui_enabled(true).unwrap();
             let stored = app.user_config.lock().unwrap().web_secret.clone().unwrap();
@@ -4738,7 +4771,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sts-app-web-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("config.json");
-        let app = test_app_defaults();
+        let app = test_app();
         *app.user_config.lock().unwrap() = UserConfig::at_path(path.clone());
         let printed = web_access::link_from_settings(
             "192.168.1.10",
@@ -4862,7 +4895,7 @@ mod tests {
     /// or none after Forget saved), and only while a pairing is stored.
     #[test]
     fn forgetting_a_pairing_is_offered_for_the_device_that_holds_it() {
-        let app = test_app_defaults();
+        let app = test_app();
         let (den, kitchen) = ("airplay:DEN", "airplay:KITCHEN");
         {
             let mut uc = app.user_config.lock().unwrap();
@@ -4896,7 +4929,7 @@ mod tests {
     #[test]
     fn a_failed_pair_verify_leaves_the_stored_pairing_alone() {
         use crate::airplay::test_peers::{self, Peer, M4};
-        let app = test_app_defaults();
+        let app = test_app();
         let creds = test_peers::stored_credentials();
         for (peer, want) in [
             (Peer::StatusAtM1("400 Bad Request"), "not proven"),
@@ -4944,7 +4977,7 @@ mod tests {
     /// Forget pairing removes that device's pairing and no other.
     #[test]
     fn forget_pairing_removes_only_that_devices_pairing() {
-        let app = test_app_defaults();
+        let app = test_app();
         {
             let mut uc = app.user_config.lock().unwrap();
             uc.airplay_pairings.insert("airplay:DEN".into(), some_pairing("den"));
