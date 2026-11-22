@@ -1223,10 +1223,14 @@ impl App {
             st.checking = true;
         }
         let app = self.clone();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("stream-to-speaker-update-check-manual".into())
-            .spawn(move || app.run_update_check(true))
-            .ok();
+            .spawn(move || app.run_update_check(true));
+        if spawned.is_err() {
+            // Nothing will finish the check: don't leave "Checking…" up.
+            self.update.lock().unwrap().checking = false;
+            self.record_error("Couldn't check for updates (no thread available). Try again in a moment.");
+        }
     }
 
     /// Undo the onboarding dismissal (Help menu → "Show getting-

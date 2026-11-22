@@ -81,7 +81,7 @@ struct Cli {
 
     /// TCP port for the optional web UI / API and for serving the
     /// audio stream URL the speaker pulls from.
-    #[arg(long, default_value_t = 5901)]
+    #[arg(long, default_value_t = 5901, value_parser = clap::value_parser!(u16).range(1..))]
     port: u16,
 
     /// Specific WASAPI device name (substring match). Only used for the
@@ -137,8 +137,8 @@ struct Cli {
     #[arg(long, default_value_t = false, conflicts_with = "list_speakers")]
     web_link: bool,
 
-    /// Interval between SSDP re-discoveries (minutes).
-    #[arg(long, default_value_t = 5)]
+    /// Interval between SSDP re-discoveries (minutes, 1 to 1440).
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=1440))]
     ssdp_interval: u64,
 
     /// Initial buffer hint sent to the speaker in DIDL metadata (ms).
@@ -419,6 +419,7 @@ fn main() {
 fn write_startup_tombstone() {
     if let Some(mut path) = stream_to_speaker::log_dir() {
         path.push("startup.txt");
+        set_aside_if_larger(&path, STARTUP_LOG_MAX_BYTES);
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -501,9 +502,28 @@ fn show_info_dialog(body: &str) {
 #[cfg(not(windows))]
 fn show_info_dialog(_body: &str) {}
 
+/// Largest the log file and `startup.txt` grow before the next start moves
+/// them aside (one older copy is kept, as `<name>.1`).
+const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const STARTUP_LOG_MAX_BYTES: u64 = 256 * 1024;
+
+/// Move `path` aside to `<path>.1` (replacing an older one) if it is
+/// larger than `max_bytes`, so a log written by every run doesn't grow
+/// without end.
+fn set_aside_if_larger(path: &std::path::Path, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    if meta.len() <= max_bytes {
+        return;
+    }
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(".1");
+    let _ = std::fs::rename(path, aside);
+}
+
 fn open_log_file() -> Option<std::fs::File> {
     let mut path = stream_to_speaker::log_dir()?;
     path.push("stream-to-speaker.log");
+    set_aside_if_larger(&path, LOG_MAX_BYTES);
     std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -1377,6 +1397,42 @@ mod tests {
         assert!(help.contains("--list-speakers") && !help.contains("couldn't start"), "{help}");
         let version = argument_message(&parse_error(&["--version"]));
         assert!(version.contains(env!("CARGO_PKG_VERSION")), "{version}");
+    }
+
+    #[test]
+    fn the_search_interval_is_a_number_of_minutes_that_works() {
+        assert!(Cli::try_parse_from(["x", "--ssdp-interval", "0"]).is_err(), "0 searches without pause");
+        assert!(Cli::try_parse_from(["x", "--ssdp-interval", "1441"]).is_err());
+        assert!(Cli::try_parse_from(["x", "--ssdp-interval", "18446744073709551615"]).is_err());
+        assert_eq!(cli(&["--ssdp-interval", "1440"]).ssdp_interval, 1440);
+        assert_eq!(cli(&[]).ssdp_interval, 5);
+    }
+
+    #[test]
+    fn the_port_must_be_one_speakers_can_be_given() {
+        // Port 0 would bind some free port while speakers and the web link
+        // were given 0.
+        assert!(Cli::try_parse_from(["x", "--port", "0"]).is_err());
+        assert_eq!(cli(&["--port", "8080"]).port, 8080);
+    }
+
+    #[test]
+    fn a_log_that_grew_too_big_is_set_aside_once() {
+        let dir = std::env::temp_dir().join(format!("sts-log-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("stream-to-speaker.log");
+        let previous = dir.join("stream-to-speaker.log.1");
+        std::fs::write(&log, vec![b'x'; 100]).unwrap();
+        set_aside_if_larger(&log, 100);
+        assert_eq!(std::fs::read(&log).unwrap().len(), 100, "a log at the cap stays");
+        std::fs::write(&log, vec![b'y'; 101]).unwrap();
+        std::fs::write(&previous, b"older").unwrap();
+        set_aside_if_larger(&log, 100);
+        assert!(!log.exists(), "the big log is moved aside");
+        assert_eq!(std::fs::read(&previous).unwrap(), vec![b'y'; 101], "it replaces the older one");
+        set_aside_if_larger(&log, 100); // no log at all: nothing to do
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
