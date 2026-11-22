@@ -3695,6 +3695,7 @@ dependencies = [
  "subtle",
  "thiserror 1.0.69",
  "tray-icon",
+ "ttf-parser",
  "url",
  "windows 0.58.0",
  "windows-sys 0.59.0",

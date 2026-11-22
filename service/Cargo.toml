@@ -50,6 +50,10 @@ semver = "1"
 # the layout skeletons in gui_layout.rs — and their headless tests in
 # tests/gui_layout.rs — build and run on Linux.
 egui = "0.29"
+# The window's fonts (src/fonts.rs): reads face names in Windows' font
+# collections and checks each font the way egui's font library (built on
+# this parser, at this version) will read it.
+ttf-parser = { version = "=0.25.1", default-features = false, features = ["std"] }
 # AirPlay support.
 #
 # mDNS-sd: pure-Rust mDNS browser for `_raop._tcp` / `_airplay._tcp`
@@ -168,6 +172,8 @@ features = [
     # MultiByteToWideChar: config.json saved in the ANSI code page.
     "Win32_Globalization",
     "Win32_System_LibraryLoader",
+    # Font files mapped read-only for the window (src/fonts.rs).
+    "Win32_System_Memory",
     "Win32_System_Performance",
     "Win32_System_Com",
     "Win32_System_SystemServices",
