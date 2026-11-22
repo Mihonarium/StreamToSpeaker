@@ -149,11 +149,12 @@ impl FaultSlot {
         Self { fault: Arc::new(Mutex::new(None)), dead, host, started: Arc::new(Mutex::new(None)) }
     }
 
-    /// The session finished its bring-up at `started`: from now on its
-    /// faults count for the repeat rule. A bring-up that fails never arms
-    /// its slot, so a session that never existed leaves nothing to repeat.
+    /// The session's bring-up has reached the point where it can no longer
+    /// fail, at `started`: from now on its faults count for the repeat rule.
+    /// The first arming counts. A bring-up that fails never arms its slot,
+    /// so a session that never existed leaves nothing to repeat.
     pub fn arm(&self, started: Instant) {
-        *self.started.lock().unwrap() = Some(started);
+        self.started.lock().unwrap().get_or_insert(started);
     }
 
     pub fn raise(&self, fault: Ap2Fault) {
