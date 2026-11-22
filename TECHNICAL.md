@@ -134,7 +134,9 @@ connecting fails, the window says so; it is tried again when it comes back
 to the list. `--list-speakers` searches,
 prints what the window would list and exits. Without `--player`, the
 speaker used last time is reconnected; `--headless` in a terminal asks with
-a numbered prompt instead (`r` searches again). Under `--web`,
+a numbered prompt instead (`r` searches again) when there is something to
+choose from. In that prompt the speaker used last time comes first, Enter
+takes it, and it is taken after 15 s without an answer. Under `--web`,
 `POST /api/select` with `{"id": "<udn-or-ip>"}` and the API key
 ([HTTP API](#http-api)). Discovery re-runs every `--ssdp-interval` minutes.
 

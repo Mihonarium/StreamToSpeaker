@@ -81,7 +81,7 @@ struct Cli {
 
     /// TCP port for the optional web UI / API and for serving the
     /// audio stream URL the speaker pulls from.
-    #[arg(long, default_value_t = 5901, value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long, default_value_t = 5901)]
     port: u16,
 
     /// Specific WASAPI device name (substring match). Only used for the
@@ -139,8 +139,8 @@ struct Cli {
     #[arg(long, default_value_t = false, conflicts_with = "list_speakers")]
     web_link: bool,
 
-    /// Interval between SSDP re-discoveries (minutes, 1 to 1440).
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=1440))]
+    /// Interval between SSDP re-discoveries (minutes; 0 counts as 1).
+    #[arg(long, default_value_t = 5)]
     ssdp_interval: u64,
 
     /// Accepted for old shortcuts and services; it has no effect (no
@@ -245,21 +245,58 @@ fn argument_message(e: &clap::Error) -> String {
     )
 }
 
-/// Show `e` where the person who ran the program sees it: in the console
-/// it was run from (or wherever its output was redirected), else in a
-/// message box. Returns the exit code.
+/// Where a message from parsing the command line goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArgumentReport {
+    /// The console it was run from, or its redirected output.
+    Print,
+    /// A message box: a start from a shortcut or the sign-in entry.
+    Dialog,
+    /// Nowhere: a --headless start (a service, a scheduled task) with no
+    /// console, where a message box would wait on a desktop nobody sees.
+    Nowhere,
+}
+
+/// `headless`: the arguments asked for `--headless` (looked up in the raw
+/// arguments, since parsing failed); `can_print`: there is a console or a
+/// redirected output.
+fn argument_report(headless: bool, can_print: bool) -> ArgumentReport {
+    match (can_print, headless) {
+        (true, _) => ArgumentReport::Print,
+        (false, true) => ArgumentReport::Nowhere,
+        (false, false) => ArgumentReport::Dialog,
+    }
+}
+
+/// Whether the raw command line asks for `--headless`.
+fn asks_for_headless(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter().skip(1).take_while(|a| a != "--").any(|a| a == "--headless")
+}
+
+/// Show `e` where the person who ran the program sees it (see
+/// [`argument_report`]). Returns the exit code.
 fn report_arguments(e: &clap::Error) -> i32 {
     #[cfg(windows)]
-    if !attach_parent_console() && !has_standard_output() {
-        let text = argument_message(e);
-        if e.use_stderr() {
-            show_crash_dialog(&text);
-        } else {
-            show_info_dialog(&text);
+    let can_print = attach_parent_console() || has_standard_output();
+    #[cfg(not(windows))]
+    let can_print = true;
+    match argument_report(asks_for_headless(std::env::args_os()), can_print) {
+        ArgumentReport::Print => {
+            let _ = e.print();
         }
-        return e.exit_code();
+        ArgumentReport::Dialog => {
+            let text = argument_message(e);
+            #[cfg(windows)]
+            if e.use_stderr() {
+                show_crash_dialog(&text);
+            } else {
+                show_info_dialog(&text);
+            }
+            #[cfg(not(windows))]
+            let _ = text;
+        }
+        ArgumentReport::Nowhere => {}
     }
-    let _ = e.print();
     e.exit_code()
 }
 
@@ -347,7 +384,12 @@ fn main() {
     // for --web-link and --list-speakers too (see below).
     if !cli.console() {
         match stream_to_speaker::single_instance::claim() {
-            stream_to_speaker::single_instance::Claim::First => {}
+            stream_to_speaker::single_instance::Claim::First => {
+                // This copy is the one that writes the log from now on.
+                if let Some(path) = log_path() {
+                    LOG.set_aside_if_larger(&path, LOG_MAX_BYTES);
+                }
+            }
             stream_to_speaker::single_instance::Claim::Another => {
                 info!("another instance is running; asked it to show its window, exiting");
                 return;
@@ -447,7 +489,19 @@ fn init_logging(cli: &Cli) {
     let default = if cli.one_shot() { log::LevelFilter::Warn } else { log::LevelFilter::Info };
     let level = cli.log_level.as_deref().and_then(|l| l.parse().ok()).unwrap_or(default);
     let mut builder = env_logger::Builder::from_default_env();
-    builder.filter_level(level).format_timestamp_millis();
+    // Log lines carry names devices gave themselves, and a console run
+    // writes them to a terminal: no control characters.
+    builder.filter_level(level).format(|buf, record| {
+        use std::io::Write as _;
+        writeln!(
+            buf,
+            "[{} {:<5} {}] {}",
+            buf.timestamp_millis(),
+            record.level(),
+            record.target(),
+            picker::printable_text(&record.args().to_string())
+        )
+    });
     // GUI mode has no console (windows_subsystem = "windows"), so
     // env_logger's default stderr target writes to a dead handle.
     // Pipe to %LOCALAPPDATA%\StreamToSpeaker\stream-to-speaker.log so
@@ -455,11 +509,55 @@ fn init_logging(cli: &Cli) {
     // Headless mode (and --web-link) keeps stderr so logs still appear in
     // the attached parent console.
     if !cli.console() {
-        if let Some(file) = open_log_file() {
-            builder.target(env_logger::Target::Pipe(Box::new(file)));
+        if let Some(file) = log_path().and_then(|p| open_log_at(&p)) {
+            *LOG.0.lock().unwrap() = Some(file);
+            builder.target(env_logger::Target::Pipe(Box::new(SharedLog)));
         }
     }
     builder.init();
+}
+
+/// The log file this process writes, shared with the logger so that the
+/// copy which becomes the session's instance can set a big log aside and
+/// go on in a fresh one.
+struct LogSlot(std::sync::Mutex<Option<std::fs::File>>);
+
+static LOG: LogSlot = LogSlot(std::sync::Mutex::new(None));
+
+impl LogSlot {
+    /// If the log at `path` is larger than `max_bytes`, move it aside to
+    /// `<path>.1` (replacing an older one) and write a fresh one from now on.
+    fn set_aside_if_larger(&self, path: &std::path::Path, max_bytes: u64) {
+        let mut file = self.0.lock().unwrap();
+        if std::fs::metadata(path).map_or(true, |m| m.len() <= max_bytes) {
+            return;
+        }
+        let mut aside = path.as_os_str().to_owned();
+        aside.push(".1");
+        if std::fs::rename(path, aside).is_ok() {
+            if let Some(fresh) = open_log_at(path) {
+                *file = Some(fresh);
+            }
+        }
+    }
+}
+
+/// The logger's end of [`LOG`].
+struct SharedLog;
+
+impl std::io::Write for SharedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match LOG.0.lock().unwrap().as_mut() {
+            Some(f) => f.write(buf),
+            None => Ok(buf.len()),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match LOG.0.lock().unwrap().as_mut() {
+            Some(f) => f.flush(),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Windows MessageBox for fatal-error visibility. No-op on non-Windows.
@@ -523,15 +621,15 @@ fn set_aside_if_larger(path: &std::path::Path, max_bytes: u64) {
     let _ = std::fs::rename(path, aside);
 }
 
-fn open_log_file() -> Option<std::fs::File> {
-    let mut path = stream_to_speaker::log_dir()?;
-    path.push("stream-to-speaker.log");
-    set_aside_if_larger(&path, LOG_MAX_BYTES);
-    std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&path)
-        .ok()
+fn log_path() -> Option<std::path::PathBuf> {
+    Some(stream_to_speaker::log_dir()?.join("stream-to-speaker.log"))
+}
+
+/// Open the log at `path` for appending. Every launch does this, a second
+/// one too while the first runs: only the session's instance sets a big
+/// log aside (see [`LogSlot::set_aside_if_larger`]).
+fn open_log_at(path: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new().append(true).create(true).open(path).ok()
 }
 
 /// Attach this process to its parent's console, if launched from a
@@ -697,7 +795,18 @@ fn run(cli: Cli) -> Result<()> {
     // background (the window and tray come up meanwhile), with or without
     // --no-discovery.
     let saved = app.saved_speaker_id();
-    let choice = launch_choice(&cli, picker::is_interactive(), saved.as_deref());
+    let saved_needs_no_search = saved.as_deref().is_some_and(|id| {
+        app.find_manual_speaker(id).is_some()
+            && app.is_auto_reconnect_on_launch()
+            && app.auto_connect_allowed_at_launch(id)
+    });
+    let facts = LaunchFacts {
+        terminal: picker::is_interactive(),
+        saved: saved.as_deref(),
+        saved_needs_no_search,
+        manual_speakers: app.manual_speakers().len(),
+    };
+    let choice = launch_choice(&cli, facts);
     let saved_manual = match &choice {
         LaunchChoice::Saved(id) => Some(id.clone())
             .filter(|_| app.is_auto_reconnect_on_launch())
@@ -712,7 +821,7 @@ fn run(cli: Cli) -> Result<()> {
         info!("auto-reconnect: connecting to saved manual speaker {:?}", id);
         app.connect_in_background(&id);
     } else if let LaunchChoice::Ask = choice {
-        match picker::interactive_pick(&app)? {
+        match picker::interactive_pick(&app, saved.as_deref())? {
             Some(id) => {
                 if let Err(e) = app.select_speaker(&id) {
                     warn!("starting initial session failed: {}", e);
@@ -867,6 +976,16 @@ fn run_gui_mode(_app: Arc<App>, _no_tray: bool, _start_hidden: bool) -> Result<(
 // Setup helpers
 // -----------------------------------------------------------------------------
 
+/// Time between the periodic UPnP searches. 0 used to mean searching
+/// without a pause (and none at all while the chosen adapter was away), so
+/// it counts as 1 minute.
+fn search_interval(cli: &Cli) -> Duration {
+    if cli.ssdp_interval == 0 {
+        warn!("--ssdp-interval 0 would search without a pause; searching every minute instead");
+    }
+    Duration::from_secs(cli.ssdp_interval.max(1).saturating_mul(60))
+}
+
 fn setup_app(cli: &Cli) -> Result<Arc<App>> {
     let bind_addr: IpAddr = cli
         .bind
@@ -897,7 +1016,7 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
     };
 
     let app = App::new(config, discovery, airplay_discovery);
-    app.start_discovery(Duration::from_secs(cli.ssdp_interval * 60));
+    app.start_discovery(search_interval(cli));
     Ok(app)
 }
 
@@ -998,7 +1117,7 @@ fn cmd_list_speakers(cli: &Cli) -> Result<()> {
     }
     picker::search_and_wait(&app, picker::SEARCH_WAIT);
     let speakers = app.speaker_view_opts(true).speakers;
-    picker::write_speaker_list(&mut std::io::stdout(), &speakers);
+    picker::write_speaker_list(&mut std::io::stdout(), &speakers, app.saved_speaker_id().as_deref());
     if speakers.is_empty() {
         let _ = writeln!(
             std::io::stderr(),
@@ -1046,7 +1165,22 @@ fn cmd_web_link(cli: &Cli) -> Result<()> {
         "Anyone with this link can control {} on this network.",
         PRODUCT_NAME
     );
+    if let Some(note) = web_link_note(host, cli.advertise_ip, bind) {
+        let _ = writeln!(std::io::stderr(), "{note}");
+    }
     Ok(())
+}
+
+/// What to add when the link printed for `host` works on this PC only.
+fn web_link_note(host: IpAddr, explicit: Option<IpAddr>, bind: IpAddr) -> Option<&'static str> {
+    if !host.is_loopback() {
+        return None;
+    }
+    if explicit.is_none() && bind.is_unspecified() {
+        Some("This link works on this PC only: it has no network connection yet. Run --web-link again once it has.")
+    } else {
+        Some("This link works on this PC only.")
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1308,15 +1442,32 @@ enum LaunchChoice {
     Nothing,
 }
 
-/// `terminal`: standard input and output are a terminal someone can
-/// answer in. A saved speaker always wins over one that merely answered
-/// first: without someone to ask, nothing is picked for them.
-fn launch_choice(cli: &Cli, terminal: bool, saved: Option<&str>) -> LaunchChoice {
+/// What a launch's choice depends on besides the flags.
+#[derive(Clone, Copy, Debug, Default)]
+struct LaunchFacts<'a> {
+    /// Standard input and output are a terminal someone can answer in.
+    terminal: bool,
+    /// The speaker saved last time.
+    saved: Option<&'a str>,
+    /// It is added by address and its settings let it reconnect at
+    /// launch: it needs no search.
+    saved_needs_no_search: bool,
+    /// How many speakers are added by address (listed without a search).
+    manual_speakers: usize,
+}
+
+/// A saved speaker always wins over one that merely answered first:
+/// without someone to ask, nothing is picked for them. A terminal is asked
+/// only when there is something to choose from: without discovery, not
+/// when the saved speaker can be reconnected or nothing could be listed.
+fn launch_choice(cli: &Cli, facts: LaunchFacts) -> LaunchChoice {
+    let nothing_to_choose =
+        cli.no_discovery && (facts.saved_needs_no_search || facts.manual_speakers == 0);
     if let Some(q) = &cli.player {
         LaunchChoice::Wish(q.clone())
-    } else if cli.headless && !cli.no_interactive && terminal {
+    } else if cli.headless && !cli.no_interactive && facts.terminal && !nothing_to_choose {
         LaunchChoice::Ask
-    } else if let Some(id) = saved {
+    } else if let Some(id) = facts.saved {
         LaunchChoice::Saved(id.to_string())
     } else {
         LaunchChoice::Nothing
@@ -1330,10 +1481,14 @@ fn install_signal_handler(app: Arc<App>) {
         // Not eprintln!: it panics (here: aborts) when stderr is a closed pipe.
         use std::io::Write as _;
         if !app.is_shutting_down() {
-            let _ = writeln!(
-                std::io::stderr(),
-                "Quitting: telling the speaker to stop (press Ctrl+C again to quit at once)…"
-            );
+            let line = match app.selected_speaker() {
+                Some(s) => format!(
+                    "Quitting: telling {} to stop (press Ctrl+C again to quit at once)…",
+                    picker::printable(&s.friendly_name)
+                ),
+                None => "Quitting…".to_string(),
+            };
+            let _ = writeln!(std::io::stderr(), "{line}");
             app.request_shutdown();
         } else {
             let _ = writeln!(std::io::stderr(), "Quitting without waiting for the speaker.");
@@ -1355,20 +1510,40 @@ mod tests {
     #[test]
     fn a_headless_run_without_a_terminal_reconnects_the_saved_speaker() {
         // A service, a scheduled task, a hidden window: nobody to ask.
-        assert_eq!(launch_choice(&cli(&["--headless"]), false, Some("uuid:A")), LaunchChoice::Saved("uuid:A".into()));
-        assert_eq!(launch_choice(&cli(&["--headless"]), false, None), LaunchChoice::Nothing);
+        let saved = LaunchFacts { saved: Some("uuid:A"), ..Default::default() };
+        assert_eq!(launch_choice(&cli(&["--headless"]), saved), LaunchChoice::Saved("uuid:A".into()));
+        assert_eq!(launch_choice(&cli(&["--headless"]), LaunchFacts::default()), LaunchChoice::Nothing);
     }
 
     #[test]
     fn a_headless_run_in_a_terminal_asks_unless_told_not_to() {
-        let saved = Some("uuid:A");
-        assert_eq!(launch_choice(&cli(&["--headless"]), true, saved), LaunchChoice::Ask);
+        let facts = LaunchFacts { terminal: true, saved: Some("uuid:A"), ..Default::default() };
+        assert_eq!(launch_choice(&cli(&["--headless"]), facts), LaunchChoice::Ask);
         assert_eq!(
-            launch_choice(&cli(&["--headless", "--no-interactive"]), true, saved),
+            launch_choice(&cli(&["--headless", "--no-interactive"]), facts),
             LaunchChoice::Saved("uuid:A".into())
         );
         // The window is where a GUI run picks, terminal or not.
-        assert_eq!(launch_choice(&cli(&[]), true, saved), LaunchChoice::Saved("uuid:A".into()));
+        assert_eq!(launch_choice(&cli(&[]), facts), LaunchChoice::Saved("uuid:A".into()));
+    }
+
+    #[test]
+    fn without_discovery_a_terminal_is_asked_only_when_there_is_a_choice() {
+        let headless = cli(&["--headless", "--no-discovery"]);
+        // The saved speaker added by address reconnects, as it always did.
+        let reconnectable = LaunchFacts {
+            terminal: true,
+            saved: Some("manual:den"),
+            saved_needs_no_search: true,
+            manual_speakers: 2,
+        };
+        assert_eq!(launch_choice(&headless, reconnectable), LaunchChoice::Saved("manual:den".into()));
+        // Nothing could be listed: run without a speaker, as it always did.
+        let empty = LaunchFacts { terminal: true, ..Default::default() };
+        assert_eq!(launch_choice(&headless, empty), LaunchChoice::Nothing);
+        // Speakers added by address, and nothing to reconnect: ask.
+        let choice = LaunchFacts { terminal: true, manual_speakers: 2, ..Default::default() };
+        assert_eq!(launch_choice(&headless, choice), LaunchChoice::Ask);
     }
 
     #[test]
@@ -1403,20 +1578,72 @@ mod tests {
     }
 
     #[test]
-    fn the_search_interval_is_a_number_of_minutes_that_works() {
-        assert!(Cli::try_parse_from(["x", "--ssdp-interval", "0"]).is_err(), "0 searches without pause");
-        assert!(Cli::try_parse_from(["x", "--ssdp-interval", "1441"]).is_err());
-        assert!(Cli::try_parse_from(["x", "--ssdp-interval", "18446744073709551615"]).is_err());
-        assert_eq!(cli(&["--ssdp-interval", "1440"]).ssdp_interval, 1440);
-        assert_eq!(cli(&[]).ssdp_interval, 5);
+    fn every_search_interval_that_used_to_start_still_does() {
+        let minutes = |m: &str| search_interval(&cli(&["--ssdp-interval", m]));
+        // 0 searched without a pause: now once a minute.
+        assert_eq!(minutes("0"), Duration::from_secs(60));
+        assert_eq!(minutes("5"), Duration::from_secs(300));
+        assert_eq!(minutes("10000"), Duration::from_secs(600_000));
+        assert_eq!(minutes("18446744073709551615"), Duration::from_secs(u64::MAX));
+        assert_eq!(search_interval(&cli(&[])), Duration::from_secs(300));
     }
 
     #[test]
-    fn the_port_must_be_one_speakers_can_be_given() {
-        // Port 0 would bind some free port while speakers and the web link
-        // were given 0.
-        assert!(Cli::try_parse_from(["x", "--port", "0"]).is_err());
-        assert_eq!(cli(&["--port", "8080"]).port, 8080);
+    fn port_zero_still_starts() {
+        // It streams to AirPlay and Sendspin speakers; UPnP and the web
+        // link don't use the port really bound yet.
+        assert_eq!(cli(&["--port", "0"]).port, 0);
+    }
+
+    #[test]
+    fn a_headless_start_never_waits_on_a_message_box() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(asks_for_headless(args(&["x", "--plaeyr", "K", "--headless"])));
+        assert!(!asks_for_headless(args(&["x", "--plaeyr", "K"])));
+        assert!(!asks_for_headless(args(&["x", "--", "--headless"])));
+        assert_eq!(argument_report(true, false), ArgumentReport::Nowhere);
+        assert_eq!(argument_report(true, true), ArgumentReport::Print);
+        assert_eq!(argument_report(false, false), ArgumentReport::Dialog);
+        assert_eq!(argument_report(false, true), ArgumentReport::Print);
+    }
+
+    #[test]
+    fn opening_the_log_leaves_a_big_one_in_place() {
+        // A second launch opens the running copy's log; it must not move it.
+        let dir = std::env::temp_dir().join(format!("sts-log-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("stream-to-speaker.log");
+        std::fs::write(&log, vec![b'x'; (LOG_MAX_BYTES + 1) as usize]).unwrap();
+        drop(open_log_at(&log));
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), LOG_MAX_BYTES + 1);
+        assert!(!dir.join("stream-to-speaker.log.1").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_instance_sets_a_big_log_aside_and_writes_a_fresh_one() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("sts-log-slot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("stream-to-speaker.log");
+        let slot = LogSlot(std::sync::Mutex::new(open_log_at(&log)));
+        slot.0.lock().unwrap().as_mut().unwrap().write_all(&[b'o'; 101]).unwrap();
+        slot.set_aside_if_larger(&log, 100);
+        slot.0.lock().unwrap().as_mut().unwrap().write_all(b"after").unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), b"after");
+        assert_eq!(std::fs::read(dir.join("stream-to-speaker.log.1")).unwrap(), vec![b'o'; 101]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_for_this_pc_only_says_so() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let any = ip("0.0.0.0");
+        assert!(web_link_note(ip("127.0.0.1"), None, any).unwrap().contains("no network connection"));
+        assert_eq!(web_link_note(ip("127.0.0.1"), None, ip("127.0.0.1")), Some("This link works on this PC only."));
+        assert_eq!(web_link_note(ip("192.168.1.20"), None, any), None);
     }
 
     #[test]
@@ -1450,7 +1677,10 @@ mod tests {
     fn player_names_the_speaker_whatever_else_holds() {
         for terminal in [false, true] {
             assert_eq!(
-                launch_choice(&cli(&["--headless", "--player", "Kitchen"]), terminal, Some("uuid:A")),
+                launch_choice(
+                    &cli(&["--headless", "--player", "Kitchen"]),
+                    LaunchFacts { terminal, saved: Some("uuid:A"), ..Default::default() }
+                ),
                 LaunchChoice::Wish("Kitchen".into())
             );
         }

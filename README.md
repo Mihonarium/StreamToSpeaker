@@ -129,7 +129,7 @@ check off under **Advanced** if you'd rather not.
 --silence-packets-threshold <N>
                           Consecutive silent packets before quiescence.
 
---ssdp-interval <N>       Minutes between re-discoveries, 1 to 1440. Default 5.
+--ssdp-interval <N>       Minutes between re-discoveries. Default 5.
 --log-level <level>       error / warn / info / debug / trace. Default info.
 ```
 
