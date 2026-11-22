@@ -617,9 +617,8 @@ pub struct App {
     /// [`select_speaker`]: App::select_speaker
     user_picks: AtomicU64,
 
-    /// What `--player` named, while the app waits for a speaker matching
-    /// it (see [`App::connect_when_listed`]).
-    wished_speaker: Mutex<Option<String>>,
+    /// Where a `--player` wait stands (see [`App::connect_when_listed`]).
+    player_wish: Mutex<Option<PlayerWish>>,
 
     /// The stream gate for `/stream.raw` (see `stream_gate.rs`): no device
     /// but this PC while streaming is disabled, and with privacy mode on
@@ -954,7 +953,7 @@ impl App {
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
             user_picks: AtomicU64::new(0),
-            wished_speaker: Mutex::new(None),
+            player_wish: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
             sendspin: Default::default(),
             manual_resolved: Mutex::new(std::collections::HashMap::new()),
@@ -3970,61 +3969,79 @@ impl App {
             .ok();
     }
 
-    /// The listed speaker `query` names, ranked as `--player` documents it
-    /// (see [`rank_player_match`]), with how it matched.
-    pub fn find_listed_speaker(&self, query: &str) -> Option<PlayerMatch> {
+    /// Every listed speaker as `--player` sees it, in list order.
+    pub(crate) fn player_candidates(&self) -> Vec<PlayerCandidate> {
         let rows = self.speaker_view_opts(true).speakers;
         let mut candidates: Vec<PlayerCandidate> = rows
             .iter()
             .map(|r| {
-                // The speaker's own names, not the list's labels around
-                // them ("Kitchen (AirPlay)", "Den (AirPlay, added
-                // manually)"): a name is what the person called it.
-                let mut names: Vec<String> = self.speaker_name(&r.id).into_iter().collect();
-                if let Some(d) = self.discovery.as_ref().and_then(|d| d.find_by_id(&r.id)) {
-                    names.push(d.friendly_name.clone());
-                    names.extend(d.zone_name.clone());
-                }
-                if names.is_empty() {
-                    names.push(r.friendly_name.clone());
-                }
-                PlayerCandidate {
+                // The names the list shows, without its labels around them
+                // ("Kitchen (AirPlay)", "Den (AirPlay, added manually)").
+                let mut c = PlayerCandidate {
                     id: r.id.clone(),
                     address: r.ip.clone(),
-                    names,
+                    names: Vec::new(),
+                    group_rooms: Vec::new(),
+                    device_name: None,
+                    kind: PlayerKind::Other,
+                    manual: r.manual,
                     hidden: r.hidden,
                     used_before: r.manual,
                     never_auto: false,
+                };
+                if r.manual {
+                    c.names.extend(self.find_manual_speaker(&r.id).map(|m| m.display_name()));
+                } else if let Some(d) = self.discovery.as_ref().and_then(|d| d.find_by_id(&r.id)) {
+                    // A Sonos speaker's room is its name too (a group is
+                    // labelled by it).
+                    let shown = d.display_name();
+                    c.names.push(shown.clone());
+                    c.names.extend(d.zone_name.clone());
+                    c.group_rooms = d.group_members.clone();
+                    c.device_name = (d.friendly_name != shown).then(|| d.friendly_name.clone());
+                    c.kind = PlayerKind::Upnp;
+                } else if let Some(a) = self.airplay_discovery.as_ref().and_then(|d| d.find_by_id(&r.id)) {
+                    c.names.push(a.friendly_name);
+                    c.kind = PlayerKind::AirPlay;
+                } else {
+                    c.names.extend(self.speaker_name(&r.id));
                 }
+                if c.names.is_empty() {
+                    c.names.push(r.friendly_name.clone());
+                }
+                c
             })
             .collect();
-        {
-            // What the settings already record of a speaker having been
-            // used: last time, its own settings, a pairing or a password.
-            let uc = self.user_config.lock().unwrap();
-            for c in candidates.iter_mut() {
-                let settings = uc.speaker_settings.get(&c.id);
-                c.used_before |= uc.last_speaker_id.as_deref() == Some(c.id.as_str())
-                    || settings.is_some()
-                    || uc.airplay_pairings.contains_key(&c.id)
-                    || uc.airplay_passwords.contains_key(&c.id);
-                c.never_auto = settings.is_some_and(|s| s.auto_connect == AutoConnect::Never);
-            }
+        // What the settings already record of a speaker having been used:
+        // last time, its own settings, a pairing or a password.
+        let uc = self.user_config.lock().unwrap();
+        for c in candidates.iter_mut() {
+            let settings = uc.speaker_settings.get(&c.id);
+            c.used_before |= uc.last_speaker_id.as_deref() == Some(c.id.as_str())
+                || settings.is_some()
+                || uc.airplay_pairings.contains_key(&c.id)
+                || uc.airplay_passwords.contains_key(&c.id);
+            c.never_auto = settings.is_some_and(|s| s.auto_connect == AutoConnect::Never);
         }
-        let group_room = self.discovery.as_ref().and_then(|d| d.find(query)).map(|r| r.stable_id());
-        rank_player_match(query, &candidates, group_room.as_deref())
+        candidates
     }
 
-    /// What `--player` named, while the app is waiting for it.
-    pub fn wished_speaker(&self) -> Option<String> {
-        self.wished_speaker.lock().unwrap().clone()
+    /// The listed speaker `query` names, ranked as `--player` documents it
+    /// (see [`rank_player_match`]), with how it matched.
+    pub fn find_listed_speaker(&self, query: &str) -> Option<PlayerMatch> {
+        rank_player_match(query, &self.player_candidates())
+    }
+
+    /// Where a `--player` wait stands, while there is one.
+    pub fn player_wish(&self) -> Option<PlayerWish> {
+        self.player_wish.lock().unwrap().clone()
     }
 
     /// `--player`: connect to the speaker `query` names (see
-    /// [`App::find_listed_speaker`]) as soon as it is listed, unless the
-    /// user picks a speaker first. Each time it appears it is tried once,
-    /// without a PIN prompt; the wait ends when a speaker plays or the user
-    /// picks one.
+    /// [`rank_player_match`]) once discovery has had its first look,
+    /// unless the user picks a speaker first. Each time it appears it is
+    /// tried once, without a PIN prompt; the wait ends when a speaker plays
+    /// or the user picks one.
     pub fn connect_when_listed(self: &Arc<Self>, query: String) {
         self.connect_when_listed_every(query, Duration::from_secs(1));
     }
@@ -4033,44 +4050,63 @@ impl App {
     pub(crate) fn connect_when_listed_every(self: &Arc<Self>, query: String, poll: Duration) {
         let picks_seen = self.user_pick_count();
         info!("--player {:?}: connecting when a speaker by that name or address is found", query);
-        *self.wished_speaker.lock().unwrap() = Some(query.clone());
+        *self.player_wish.lock().unwrap() = Some(PlayerWish::Looking { query: query.clone() });
         let named = query.clone();
         let app = self.clone();
         let spawned = std::thread::Builder::new()
             .name("stream-to-speaker-player-wish".into())
             .spawn(move || {
-                // The speaker tried during its current appearance in the list.
-                let mut tried: Option<String> = None;
+                let mut steps = WishSteps::new(Instant::now());
+                // The connect under way: its speaker's id and name, and the
+                // last fault before it, so its own failure can be told.
+                let mut attempt: Option<(String, String, Option<Fault>)> = None;
                 loop {
                     if app.user_pick_count() != picks_seen {
                         info!("--player {:?}: a speaker was picked; no longer waiting", query);
                         break;
                     }
-                    let connecting = app.connecting_to().is_some();
-                    if tried.is_some() && !connecting && app.is_speaker_bound() {
-                        break;
+                    let busy = app.connecting_to().is_some();
+                    if !busy {
+                        if let Some((id, name, fault_before)) = attempt.take() {
+                            if app.is_speaker_bound() {
+                                break;
+                            }
+                            let fault = app.last_fault().filter(|f| Some(f) != fault_before.as_ref());
+                            let reason = fault.map(|f| {
+                                f.what.strip_prefix(CONNECT_FAILED_PREFIX).unwrap_or(&f.what).to_string()
+                            });
+                            info!("--player {:?}: connecting to {:?} failed; waiting for it to come back", query, id);
+                            *app.player_wish.lock().unwrap() = Some(PlayerWish::failed(&query, name, reason));
+                        }
                     }
-                    match app.find_listed_speaker(&query) {
-                        None => tried = None,
-                        Some(m) if tried.as_deref() != Some(m.id.as_str()) && !connecting => {
+                    let rows = app.player_candidates();
+                    // The UPnP list is filled once a whole sweep is done.
+                    let searched = app.discovery.as_ref().map_or(true, |d| !d.renderers().is_empty());
+                    match steps.next(Instant::now(), &query, &rows, searched, busy) {
+                        Some(m) => {
                             let name = app.speaker_name(&m.id).unwrap_or_else(|| m.id.clone());
                             if let Some(line) = m.explain(&query, &name) {
                                 info!("{}", line);
                             }
                             info!("--player {:?}: found {:?}; connecting", query, m.id);
+                            *app.player_wish.lock().unwrap() = Some(PlayerWish::Looking { query: query.clone() });
+                            attempt = Some((m.id.clone(), name, app.last_fault()));
                             app.connect_unless_user_picked(&m.id, picks_seen);
-                            tried = Some(m.id);
                         }
-                        Some(_) => {}
+                        None if steps.tried.is_none() && attempt.is_none() => {
+                            // What it tried has gone from the list: looking again.
+                            *app.player_wish.lock().unwrap() = Some(PlayerWish::Looking { query: query.clone() });
+                        }
+                        None => {}
                     }
                     if !app.sleep_unless_shutdown(poll) {
                         break;
                     }
                 }
-                *app.wished_speaker.lock().unwrap() = None;
+                *app.player_wish.lock().unwrap() = None;
             });
         if let Err(e) = spawned {
-            *self.wished_speaker.lock().unwrap() = None;
+            *self.player_wish.lock().unwrap() = None;
             self.record_error(format!("Couldn't start looking for the speaker \"{}\" (--player): {}", named, e));
         }
     }
@@ -4250,14 +4286,31 @@ pub fn stop_session(session: &RendererSession) {
 // IP / bind helpers (moved from main.rs to keep main.rs lean)
 // -----------------------------------------------------------------------------
 
+/// How a speaker is reached, where `--player` cares: a Sonos is listed
+/// twice, as UPnP and as AirPlay, and its UPnP entry is the one to take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlayerKind {
+    Upnp,
+    AirPlay,
+    Other,
+}
+
 /// A listed speaker as `--player` sees it.
 #[derive(Clone, Debug)]
 pub(crate) struct PlayerCandidate {
     pub id: String,
     /// As the list shows it (a speaker added by address carries its port).
     pub address: String,
-    /// The speaker's own names (a Sonos speaker's device name and room).
+    /// The names the list shows for it, and a Sonos speaker's room.
     pub names: Vec<String>,
+    /// The other rooms of the Sonos group it plays to.
+    pub group_rooms: Vec<String>,
+    /// The device's own description name (a UPnP friendlyName with its
+    /// model), where the list shows another.
+    pub device_name: Option<String>,
+    pub kind: PlayerKind,
+    /// Added by address: it needs no search to be found.
+    pub manual: bool,
     pub hidden: bool,
     /// The settings record it being used before: the last speaker, its own
     /// settings, a pairing or password, or added by address.
@@ -4274,6 +4327,8 @@ pub enum PlayerMatchKind {
     PartOfName,
     /// A room inside a Sonos group.
     GroupRoom,
+    /// Part of the device's own description name.
+    DeviceName,
 }
 
 impl PlayerMatchKind {
@@ -4283,6 +4338,7 @@ impl PlayerMatchKind {
             PlayerMatchKind::FullName => "its full name",
             PlayerMatchKind::PartOfName => "part of its name",
             PlayerMatchKind::GroupRoom => "a room in its Sonos group",
+            PlayerMatchKind::DeviceName => "part of its device name",
         }
     }
 }
@@ -4315,40 +4371,156 @@ impl PlayerMatch {
     }
 }
 
-/// Which listed speaker (`rows`, in list order) `query` names. The first
-/// step with any match decides: the whole address; else the full name (any
-/// letter case, surrounding spaces ignored); else part of a name, among
-/// the speakers shown (a part is a search, and a search finds only what
-/// the list shows; hidden ones are reached by full name or address);
-/// else a room inside a Sonos group (`group_room`: the row such a room
-/// belongs to), also among those shown. Among several matches: shown before
-/// hidden, then ones used before, then ones not set never to connect by
-/// themselves, then list order. Nothing is refused for being ambiguous.
-pub(crate) fn rank_player_match(
-    query: &str,
-    rows: &[PlayerCandidate],
-    group_room: Option<&str>,
-) -> Option<PlayerMatch> {
+/// The address in `text` (an IP, with or without a port or brackets), if
+/// it is one.
+fn parse_address(text: &str) -> Option<(IpAddr, Option<u16>)> {
+    if let Ok(sa) = text.parse::<SocketAddr>() {
+        return Some((sa.ip(), Some(sa.port())));
+    }
+    text.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().ok().map(|ip| (ip, None))
+}
+
+/// Which listed speaker (`rows`, in list order) `query` names. An address
+/// (with or without a port) matches addresses only. Otherwise the first
+/// step with any match decides: the full name (any letter case,
+/// surrounding spaces ignored); else part of a name, among the speakers
+/// shown (a part is a search, and a search finds only what the list shows;
+/// hidden ones are reached by full name or address); else part of a room
+/// inside a Sonos group; else part of the device's own description name,
+/// both also among those shown. Among several matches: shown before
+/// hidden, a speaker's UPnP entry before its AirPlay one, then ones used
+/// before, then ones not set never to connect by themselves, then list
+/// order. Nothing is refused for being ambiguous.
+pub(crate) fn rank_player_match(query: &str, rows: &[PlayerCandidate]) -> Option<PlayerMatch> {
     let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
     let lower = q.to_lowercase();
-    let at = |addr: &str| addr == q || addr.strip_prefix(q).is_some_and(|rest| rest.starts_with(':'));
-    let steps: [(PlayerMatchKind, &dyn Fn(&PlayerCandidate) -> bool); 4] = [
-        (PlayerMatchKind::Address, &|c| !q.is_empty() && at(&c.address)),
-        (PlayerMatchKind::FullName, &|c| {
-            !q.is_empty() && c.names.iter().any(|n| n.trim().to_lowercase() == lower)
-        }),
-        (PlayerMatchKind::PartOfName, &|c| {
-            !q.is_empty() && !c.hidden && c.names.iter().any(|n| n.to_lowercase().contains(&lower))
-        }),
-        (PlayerMatchKind::GroupRoom, &|c| !c.hidden && group_room == Some(c.id.as_str())),
-    ];
+    let contains = |names: &[String]| names.iter().any(|n| n.to_lowercase().contains(&lower));
+    let steps: Vec<(PlayerMatchKind, Box<dyn Fn(&PlayerCandidate) -> bool + '_>)> = match parse_address(q) {
+        Some((ip, port)) => vec![(
+            PlayerMatchKind::Address,
+            Box::new(move |c: &PlayerCandidate| match parse_address(&c.address) {
+                Some((at, at_port)) => at == ip && (port.is_none() || at_port.is_none() || port == at_port),
+                // A speaker added by a host name: its listed text.
+                None => c.address == q || c.address.strip_prefix(q).is_some_and(|rest| rest.starts_with(':')),
+            }),
+        )],
+        None => vec![
+            (
+                PlayerMatchKind::FullName,
+                Box::new(|c: &PlayerCandidate| c.names.iter().any(|n| n.trim().to_lowercase() == lower)),
+            ),
+            (PlayerMatchKind::PartOfName, Box::new(|c: &PlayerCandidate| !c.hidden && contains(&c.names))),
+            (PlayerMatchKind::GroupRoom, Box::new(|c: &PlayerCandidate| !c.hidden && contains(&c.group_rooms))),
+            (
+                PlayerMatchKind::DeviceName,
+                Box::new(|c: &PlayerCandidate| !c.hidden && c.device_name.iter().any(|n| n.to_lowercase().contains(&lower))),
+            ),
+        ],
+    };
     steps.iter().find_map(|(how, fits)| {
-        let mut found: Vec<(usize, &PlayerCandidate)> = rows.iter().enumerate().filter(|(_, c)| fits(c)).collect();
-        found.sort_by_key(|(i, c)| (c.hidden, !c.used_before, c.never_auto, *i));
-        let (_, best) = found.first()?;
-        Some(PlayerMatch { id: best.id.clone(), how: *how, also_fitted: found.len() - 1 })
+        let found: Vec<(usize, &PlayerCandidate)> = rows.iter().enumerate().filter(|(_, c)| fits(c)).collect();
+        let upnp_at: Vec<IpAddr> = found
+            .iter()
+            .filter(|(_, c)| c.kind == PlayerKind::Upnp)
+            .filter_map(|(_, c)| parse_address(&c.address).map(|(ip, _)| ip))
+            .collect();
+        // An AirPlay entry whose speaker also has a UPnP entry among these.
+        let twin = |c: &PlayerCandidate| {
+            c.kind == PlayerKind::AirPlay
+                && parse_address(&c.address).is_some_and(|(ip, _)| upnp_at.contains(&ip))
+        };
+        let best = found
+            .iter()
+            .min_by_key(|(i, c)| (c.hidden, twin(c), !c.used_before, c.never_auto, *i))?;
+        Some(PlayerMatch { id: best.1.id.clone(), how: *how, also_fitted: found.len() - 1 })
     })
 }
+
+/// How long `--player` waits for discovery's first look before taking a
+/// match from what is listed (as long as the start-up wait for the first
+/// UPnP sweep was).
+const PLAYER_FIRST_LOOK: Duration = Duration::from_secs(5);
+
+/// The `--player` wait's decisions, apart from its thread and its clock.
+pub(crate) struct WishSteps {
+    started: Instant,
+    /// The speaker tried during its current appearance in the list.
+    pub tried: Option<String>,
+}
+
+impl WishSteps {
+    pub fn new(started: Instant) -> Self {
+        Self { started, tried: None }
+    }
+
+    /// The speaker to connect to now, given the listed `rows`; `searched`:
+    /// the first UPnP sweep has been published (or there is no UPnP
+    /// discovery); `busy`: a connect is under way. Nothing is chosen from
+    /// discovery's results before its first look is done: a Sonos's AirPlay
+    /// entry, or a near match, usually answers before the UPnP entry of the
+    /// speaker meant. A speaker added by address needs no search.
+    pub fn next(
+        &mut self,
+        now: Instant,
+        query: &str,
+        rows: &[PlayerCandidate],
+        searched: bool,
+        busy: bool,
+    ) -> Option<PlayerMatch> {
+        let looked = searched || now >= self.started + PLAYER_FIRST_LOOK;
+        let found = if looked {
+            rank_player_match(query, rows)
+        } else {
+            let manual: Vec<PlayerCandidate> = rows.iter().filter(|c| c.manual).cloned().collect();
+            rank_player_match(query, &manual)
+        };
+        match found {
+            None => {
+                if looked {
+                    self.tried = None;
+                }
+                None
+            }
+            Some(m) if busy || self.tried.as_deref() == Some(m.id.as_str()) => None,
+            Some(m) => {
+                self.tried = Some(m.id.clone());
+                Some(m)
+            }
+        }
+    }
+}
+
+/// Where a `--player` wait stands, for the window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlayerWish {
+    /// Looking for a speaker `query` names.
+    Looking { query: String },
+    /// Found `speaker` and connecting to it failed, for `reason` (as the
+    /// connect told it, if it did); it is tried again when it comes back
+    /// to the list. `needs_person`: it can't work without someone at the
+    /// speaker (PIN pairing), and the reason says what to do.
+    Failed { query: String, speaker: String, reason: Option<String>, needs_person: bool },
+}
+
+impl PlayerWish {
+    fn failed(query: &str, speaker: String, reason: Option<String>) -> Self {
+        let needs_person = reason.as_deref().is_some_and(needs_the_person);
+        PlayerWish::Failed { query: query.to_string(), speaker, reason, needs_person }
+    }
+}
+
+/// Whether a connect's failure is one only the person can get past: the
+/// speaker wants PIN pairing, which a connect nobody clicked can't start
+/// (see [`pin_pairing_message`]); trying again would only fail again.
+pub(crate) fn needs_the_person(reason: &str) -> bool {
+    reason.contains("click it in the speaker list")
+}
+
+/// The words a failed background connect's fault begins with.
+const CONNECT_FAILED_PREFIX: &str = "Couldn't connect to speaker: ";
 
 /// The address that names this PC to other devices, the first of: the one
 /// given with `--advertise-ip`; a specific `--bind` address (the server
@@ -5326,14 +5498,26 @@ mod tests {
             id: id.into(),
             address: address.into(),
             names: vec![name.into()],
+            group_rooms: Vec::new(),
+            device_name: None,
+            kind: PlayerKind::Other,
+            manual: false,
             hidden: false,
             used_before: false,
             never_auto: false,
         }
     }
 
+    fn upnp(id: &str, address: &str, name: &str) -> PlayerCandidate {
+        PlayerCandidate { kind: PlayerKind::Upnp, ..cand(id, address, name) }
+    }
+
+    fn airplay(id: &str, address: &str, name: &str) -> PlayerCandidate {
+        PlayerCandidate { kind: PlayerKind::AirPlay, ..cand(id, address, name) }
+    }
+
     fn picked(query: &str, rows: &[PlayerCandidate]) -> Option<(String, PlayerMatchKind, usize)> {
-        rank_player_match(query, rows, None).map(|m| (m.id, m.how, m.also_fitted))
+        rank_player_match(query, rows).map(|m| (m.id, m.how, m.also_fitted))
     }
 
     #[test]
@@ -5385,17 +5569,133 @@ mod tests {
         assert_eq!(picked("", &rows), None, "an empty name is no search");
     }
 
+    /// A Sonos group row as the list builds it: labelled by its room and
+    /// another, with the device's own description name behind it.
+    fn sonos_group() -> PlayerCandidate {
+        let mut g = upnp("group", "192.168.1.10", "Living Room + 2");
+        g.names.push("Living Room".into());
+        g.group_rooms = vec!["Kitchen".into(), "Patio".into()];
+        g.device_name = Some("192.168.1.10 - Sonos One".into());
+        g
+    }
+
     #[test]
-    fn player_finds_a_room_inside_a_sonos_group_last() {
-        let rows = [cand("group", "10.0.0.1", "Living Room + Kitchen"), cand("den", "10.0.0.2", "Den")];
-        let m = rank_player_match("kitch", &rows, Some("group")).unwrap();
-        // Part of the group row's own name, so found as such.
-        assert_eq!((m.id.as_str(), m.how), ("group", PlayerMatchKind::PartOfName));
-        let m = rank_player_match("Patio", &rows, Some("group")).unwrap();
-        assert_eq!((m.id.as_str(), m.how), ("group", PlayerMatchKind::GroupRoom));
+    fn player_finds_a_room_inside_a_sonos_group_then_its_device_name() {
+        let rows = [sonos_group(), cand("den", "10.0.0.2", "Den")];
+        assert_eq!(picked("Living Room", &rows), Some(("group".into(), PlayerMatchKind::FullName, 0)));
+        assert_eq!(picked("living", &rows), Some(("group".into(), PlayerMatchKind::PartOfName, 0)));
+        assert_eq!(picked(" pati ", &rows), Some(("group".into(), PlayerMatchKind::GroupRoom, 0)));
+        assert_eq!(picked("Sonos One", &rows), Some(("group".into(), PlayerMatchKind::DeviceName, 0)));
         let mut hidden = rows.clone();
         hidden[0].hidden = true;
-        assert!(rank_player_match("Patio", &hidden, Some("group")).is_none());
+        assert_eq!(picked("Patio", &hidden), None);
+        assert_eq!(picked("Sonos One", &hidden), None);
+        assert_eq!(picked("Living Room", &hidden), Some(("group".into(), PlayerMatchKind::FullName, 0)));
+    }
+
+    #[test]
+    fn player_finds_what_the_old_upnp_lookup_found() {
+        // The UPnP lookup --player used before matched a renderer by its
+        // exact address, part of its description name, part of its room,
+        // part of a room in its group. Each still finds it.
+        let mut alone = upnp("alone", "192.168.1.20", "192.168.1.20 - Sonos Five");
+        alone.names.push("Bedroom".into());
+        let rows = [sonos_group(), alone];
+        for (query, id) in [
+            ("192.168.1.20", "alone"),
+            ("sonos five", "alone"),
+            ("bedroom", "alone"),
+            ("bed", "alone"),
+            ("192.168.1.10", "group"),
+            ("one", "group"),
+            ("living", "group"),
+            ("kitchen", "group"),
+        ] {
+            assert_eq!(picked(query, &rows).map(|p| p.0).as_deref(), Some(id), "{query}");
+        }
+    }
+
+    #[test]
+    fn player_matches_an_address_with_addresses_only() {
+        // A Sonos's UPnP name holds its address; the speaker meant is off.
+        let rows = [upnp("sonos", "192.168.1.50", "192.168.1.50 - Sonos One"), cand("odd", "10.0.0.9", "192.168.1.5")];
+        assert_eq!(picked("192.168.1.5", &rows), None);
+        assert_eq!(picked("192.168.1.50", &rows).map(|p| p.0).as_deref(), Some("sonos"));
+        // A speaker added by address is listed with its port; either form finds it.
+        let rows = [cand("manual", "192.168.1.40:7000", "Den"), cand("other", "192.168.1.41:7000", "Office")];
+        assert_eq!(picked("192.168.1.40", &rows).map(|p| p.0).as_deref(), Some("manual"));
+        assert_eq!(picked("192.168.1.40:7000", &rows).map(|p| p.0).as_deref(), Some("manual"));
+        assert_eq!(picked("192.168.1.40:7001", &rows), None);
+    }
+
+    #[test]
+    fn player_takes_a_sonoss_upnp_entry_before_its_airplay_one() {
+        // List order would put either first; the UPnP entry wins.
+        let rows = [airplay("airplay:SONOS", "192.168.1.30", "Kitchen"), upnp("uuid:SONOS", "192.168.1.30", "Kitchen")];
+        assert_eq!(picked("Kitchen", &rows), Some(("uuid:SONOS".into(), PlayerMatchKind::FullName, 1)));
+        assert_eq!(picked("192.168.1.30", &rows), Some(("uuid:SONOS".into(), PlayerMatchKind::Address, 1)));
+        // An AirPlay speaker without a UPnP twin is taken as it is.
+        let rows = [airplay("airplay:POD", "192.168.1.31", "Kitchen"), upnp("uuid:OTHER", "192.168.1.32", "Kitchen")];
+        assert_eq!(picked("Kitchen", &rows).map(|p| p.0).as_deref(), Some("airplay:POD"));
+    }
+
+    #[test]
+    fn player_waits_for_discoverys_first_look_before_choosing() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // A Sonos answers mDNS first: its AirPlay entry is listed alone
+        // until the first UPnP sweep is published.
+        let mut steps = WishSteps::new(t0);
+        let early = [airplay("airplay:SONOS", "192.168.1.30", "Kitchen")];
+        assert_eq!(steps.next(at(800), "Kitchen", &early, false, false), None);
+        let both = [airplay("airplay:SONOS", "192.168.1.30", "Kitchen"), upnp("uuid:SONOS", "192.168.1.30", "Kitchen")];
+        assert_eq!(steps.next(at(3500), "Kitchen", &both, true, false).map(|m| m.id).as_deref(), Some("uuid:SONOS"));
+
+        // A near match listed early doesn't win for good.
+        let mut steps = WishSteps::new(t0);
+        let early = [airplay("airplay:NEAR", "192.168.1.40", "Kitchen Speaker")];
+        assert_eq!(steps.next(at(800), "Kitchen", &early, false, false), None);
+        let later = [airplay("airplay:NEAR", "192.168.1.40", "Kitchen Speaker"), upnp("uuid:K", "192.168.1.41", "Kitchen")];
+        assert_eq!(steps.next(at(3500), "Kitchen", &later, true, false).map(|m| m.id).as_deref(), Some("uuid:K"));
+
+        // No UPnP speakers on the network: after the first look's time the
+        // AirPlay speaker is taken.
+        let mut steps = WishSteps::new(t0);
+        let only = [airplay("airplay:POD", "192.168.1.31", "Kitchen")];
+        assert_eq!(steps.next(at(4900), "Kitchen", &only, false, false), None);
+        assert_eq!(steps.next(at(5000), "Kitchen", &only, false, false).map(|m| m.id).as_deref(), Some("airplay:POD"));
+
+        // A speaker added by address is taken at once.
+        let mut steps = WishSteps::new(t0);
+        let manual = [PlayerCandidate { manual: true, ..cand("manual:den", "192.168.1.50:7000", "Den") }];
+        assert_eq!(steps.next(at(1), "Den", &manual, false, false).map(|m| m.id).as_deref(), Some("manual:den"));
+    }
+
+    #[test]
+    fn player_tries_a_speaker_once_per_appearance() {
+        let t0 = Instant::now();
+        let mut steps = WishSteps::new(t0);
+        let rows = [upnp("uuid:K", "192.168.1.41", "Kitchen")];
+        assert!(steps.next(t0, "Kitchen", &rows, true, true).is_none(), "nothing while a connect is under way");
+        assert!(steps.next(t0, "Kitchen", &rows, true, false).is_some());
+        assert!(steps.next(t0, "Kitchen", &rows, true, false).is_none(), "tried already");
+        assert!(steps.next(t0, "Kitchen", &[], true, false).is_none());
+        assert!(steps.next(t0, "Kitchen", &rows, true, false).is_some(), "back in the list: tried again");
+    }
+
+    #[test]
+    fn a_speaker_that_wants_pin_pairing_is_said_to_need_the_person() {
+        let reasons = [
+            PinReason::Required,
+            PinReason::Damaged("bad hex".into()),
+            PinReason::NotProven { addr: "192.168.1.9".parse().unwrap(), detail: "M2".into() },
+            PinReason::Refused,
+        ];
+        for reason in reasons {
+            let text = pin_pairing_message("Living Room", &reason, false);
+            assert!(needs_the_person(&text), "{reason:?}: {text}");
+        }
+        assert!(!needs_the_person("couldn't read http://127.0.0.1:9/desc.xml: Connection refused"));
     }
 
     #[test]
@@ -5473,7 +5773,7 @@ mod tests {
     fn a_player_wish_waits_for_its_speaker_and_then_connects() {
         let app = test_app();
         app.connect_when_listed_every("Den".into(), Duration::from_millis(5));
-        assert_eq!(app.wished_speaker().as_deref(), Some("Den"));
+        assert_eq!(app.player_wish(), Some(PlayerWish::Looking { query: "Den".into() }));
         // Nothing by that name yet: no attempt, still waiting.
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(app.current_error(), None);
@@ -5484,8 +5784,21 @@ mod tests {
             "no connect attempt: {:?}",
             app.current_error()
         );
-        // Still listed and already tried: it waits for it to come back.
-        assert_eq!(app.wished_speaker().as_deref(), Some("Den"));
+        // The window says it failed, and why, while it waits for it to come back.
+        assert!(
+            eventually(|| matches!(app.player_wish(), Some(PlayerWish::Failed { .. }))),
+            "{:?}",
+            app.player_wish()
+        );
+        match app.player_wish() {
+            Some(PlayerWish::Failed { speaker, reason, needs_person, .. }) => {
+                assert_eq!(speaker, "Den");
+                let reason = reason.expect("the connect's reason");
+                assert!(reason.contains("127.0.0.1:9") && !reason.starts_with("Couldn't connect"), "{reason}");
+                assert!(!needs_person);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -5493,7 +5806,7 @@ mod tests {
         let app = test_app();
         app.connect_when_listed_every("Den".into(), Duration::from_millis(5));
         app.note_user_pick();
-        assert!(eventually(|| app.wished_speaker().is_none()), "still waiting after the user picked");
+        assert!(eventually(|| app.player_wish().is_none()), "still waiting after the user picked");
     }
 
     #[test]

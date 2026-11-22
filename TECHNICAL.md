@@ -119,13 +119,19 @@ only under `--web`.
 ## Speaker selection
 
 The GUI and tray lists update as discovery runs. `--player` names a
-speaker of any kind: its address or full name always reaches that speaker
-(a hidden one too); part of a name finds the best match among the speakers
-the list shows (one used before first, then one not set to never connect
-by itself, then the first in the list; a room inside a Sonos group counts
-last). The app starts anyway and connects when that speaker is listed,
-unless someone picks another first; a partial or shared match is logged
-with what was taken. `--list-speakers` searches,
+speaker of any kind. The app starts anyway and decides once discovery has
+had its first look (the first UPnP sweep is published, or 5 s; a speaker
+added by address is taken at once), then from whatever is listed when
+something first matches, unless someone picks another first. An address
+(with or without a port) matches addresses only. A name: the full name
+(any letter case), a hidden speaker too; else part of the name of a
+speaker the list shows; else part of a room inside a Sonos group; else
+part of the device's own description name (such as "Sonos One"). Among
+several: shown before hidden, a speaker's UPnP entry before its AirPlay
+one, one used before, one not set never to connect by itself, then list
+order. A partial or shared match is logged with what was taken. If
+connecting fails, the window says so; it is tried again when it comes back
+to the list. `--list-speakers` searches,
 prints what the window would list and exits. Without `--player`, the
 speaker used last time is reconnected; `--headless` in a terminal asks with
 a numbered prompt instead (`r` searches again). Under `--web`,

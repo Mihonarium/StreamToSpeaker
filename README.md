@@ -99,12 +99,14 @@ check off under **Advanced** if you'd rather not.
                           Audio input. Default 'auto': kernel driver, falling
                           back to WASAPI loopback.
 
---player <name-or-ip>     Speaker to play on, any kind. Its address or full
-                          name always reaches that speaker; part of a name
-                          finds the best match among the speakers shown. The
-                          app starts anyway and connects when it is found.
-                          Omit to use the speaker from last time (--headless
-                          in a terminal asks).
+--player <name-or-ip>     Speaker to play on, any kind: its address, its full
+                          name, or part of a name. The app starts anyway.
+                          After the first search (a few seconds) it takes the
+                          best match: that address, else that full name, else
+                          a shown speaker whose name contains it; if none
+                          matches yet, the first that does later. Omit to use
+                          the speaker from last time (--headless in a
+                          terminal asks).
 --no-interactive          With --headless, don't ask in the terminal.
 --list-speakers           Search for speakers, print them and exit.
 --no-discovery            Skip discovery; only serve HTTP.

@@ -33,7 +33,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::app::App;
+use crate::app::{App, PlayerWish};
 use crate::equalizer::{
     matching_preset, EqSettings, EQ_BANDS, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_GAIN_STEP_DB,
     EQ_PREAMP_MAX_DB, EQ_PRESETS,
@@ -1898,16 +1898,43 @@ impl StreamToSpeakerApp {
         } else {
             match (&current, enabled, active) {
             // Started with --player: waiting for that speaker to be found.
-            (None, _, _) if self.app.wished_speaker().is_some() => (
-                "⟳",
-                p.warn,
-                format!("Looking for “{}”…", self.app.wished_speaker().unwrap_or_default()),
-                "It connects as soon as a speaker by that name or address is found. Or pick one from \
-                 the list below."
-                    .to_string(),
-                None,
-                None,
-            ),
+            (None, _, _) if matches!(self.app.player_wish(), Some(PlayerWish::Looking { .. })) => {
+                let query = match self.app.player_wish() {
+                    Some(PlayerWish::Looking { query }) => query,
+                    _ => String::new(),
+                };
+                (
+                    "⟳",
+                    p.warn,
+                    format!("Looking for “{}”…", query),
+                    "It connects as soon as a speaker by that name or address is found. Or pick one \
+                     from the list below."
+                        .to_string(),
+                    None,
+                    None,
+                )
+            }
+            // It was found, and connecting failed; tried again only when it
+            // comes back to the list.
+            (None, _, _) if matches!(self.app.player_wish(), Some(PlayerWish::Failed { .. })) => {
+                let (speaker, detail) = match self.app.player_wish() {
+                    Some(PlayerWish::Failed { speaker, reason, needs_person, .. }) => {
+                        let detail = match (reason, needs_person) {
+                            // The reason says what to do (pair it).
+                            (Some(reason), true) => reason,
+                            (Some(reason), false) => format!(
+                                "{}{} Pick it in the list below to try again.",
+                                reason.trim_end(),
+                                if reason.trim_end().ends_with('.') { "" } else { "." }
+                            ),
+                            (None, _) => "Pick it in the list below to try again.".to_string(),
+                        };
+                        (speaker, detail)
+                    }
+                    _ => (String::new(), String::new()),
+                };
+                ("\u{23F8}", p.warn, format!("Couldn't connect to {}", speaker), detail, None, None)
+            }
             (None, _, _) => (
                 "?",
                 p.muted,
