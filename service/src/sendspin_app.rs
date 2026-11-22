@@ -65,6 +65,11 @@ pub struct SendspinAppState {
     /// it runs, is paused with its adapter, or discovery is off.
     pub(crate) discovery_error: Mutex<Option<String>>,
     pub(crate) source: Mutex<Option<SourceService>>,
+    /// Held for the whole of a start or stop of the Music Assistant input,
+    /// so they don't cross; `source` itself is held only to put the
+    /// service in or take it out, so the window can read its state while a
+    /// start waits.
+    pub(crate) source_turning: Mutex<()>,
     pub(crate) prompt: Mutex<Option<PairPrompt>>,
     pub(crate) disabled: AtomicBool,
     /// Speaker discovery may run this session (not `--no-discovery`).
@@ -195,6 +200,12 @@ pub fn music_assistant_elsewhere(ports: &SourcePorts, addresses: &[Ipv4Addr]) ->
                  by another program, so this input listens on port {port}. Music Assistant on this \
                  network still finds it. For the address to work, close the program that uses port \
                  {wanted}, then turn this input off and on."
+            ),
+            Some(PortRefusal::StillClosing) => format!(
+                "Port {wanted}, where Music Assistant connects to an address it is given, wasn't free \
+                 yet when this input was turned on again, so it listens on port {port} for now. \
+                 Music Assistant on this network still finds it. For the address to work, turn \
+                 this input off and on again."
             ),
             Some(PortRefusal::Unavailable(why)) => format!(
                 "Port {wanted}, where Music Assistant connects to an address it is given, can't be \
@@ -454,8 +465,8 @@ impl App {
         if !self.is_sendspin_available() {
             return Err("Sendspin is disabled for this run".into());
         }
-        let mut slot = self.sendspin.source.lock().unwrap();
-        if slot.is_some() {
+        let _turning = self.sendspin.source_turning.lock().unwrap();
+        if self.sendspin.source.lock().unwrap().is_some() {
             return Ok(());
         }
         let opts = SourceOptions {
@@ -467,7 +478,7 @@ impl App {
         };
         let svc = SourceService::start(opts, self.hub.clone(), self.sendspin_store()).map_err(|e| format!("{:#}", e))?;
         info!("Music Assistant input enabled (port {})", svc.port());
-        *slot = Some(svc);
+        *self.sendspin.source.lock().unwrap() = Some(svc);
         Ok(())
     }
 
@@ -487,6 +498,7 @@ impl App {
         if on {
             self.start_sendspin_source()
         } else {
+            let _turning = self.sendspin.source_turning.lock().unwrap();
             let svc = self.sendspin.source.lock().unwrap().take();
             if let Some(svc) = svc {
                 svc.stop();
@@ -567,6 +579,7 @@ impl App {
     }
 
     pub fn stop_sendspin(&self) {
+        let _turning = self.sendspin.source_turning.lock().unwrap();
         let svc = self.sendspin.source.lock().unwrap().take();
         if let Some(svc) = svc {
             svc.stop();
@@ -1021,6 +1034,12 @@ mod tests {
         assert!(text[1].contains("can't be used on this computer right now"), "{}", text[1]);
         assert!(text[1].contains("listens on port 50123") && text[1].ends_with("(os error 10013)"), "{}", text[1]);
         assert!(!text[1].contains("program") && !text[1].contains("close"), "{}", text[1]);
+        // This input's own port, not free yet after a quick off and on: no
+        // other program is blamed.
+        let (text, copy) = music_assistant_elsewhere(&ports(50123, Some(PortRefusal::StillClosing)), &[ip("192.168.1.20")]);
+        assert_eq!(copy, Some(ip("192.168.1.20")));
+        assert!(text[1].contains("wasn't free yet when this input was turned on again"), "{}", text[1]);
+        assert!(text[1].contains("turn this input off and on again") && !text[1].contains("program"), "{}", text[1]);
     }
 
     #[test]
