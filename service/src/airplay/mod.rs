@@ -49,6 +49,8 @@ pub mod dmap;
 pub(crate) mod fake_raop;
 pub mod hap_pairing;
 pub mod pairing;
+#[cfg(test)]
+mod raop_transcripts;
 pub mod rtp;
 pub mod rtsp;
 pub mod session;
