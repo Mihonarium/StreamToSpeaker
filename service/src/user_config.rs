@@ -426,7 +426,7 @@ impl UserConfig {
     fn not_read(why: String) -> Self {
         Self {
             saves: Saves::KeepFile,
-            save_health: SaveHealth::with(Some(SaveProblem::NotRead { why })),
+            save_health: SaveHealth::with(Some(SaveProblem::NotRead { why, damaged: false, on_backup: false })),
             ..Self::default()
         }
     }
@@ -472,26 +472,32 @@ impl UserConfig {
     /// [`load_from_with`](Self::load_from_with) through `fs`.
     pub(crate) fn load_with_ops(path: &std::path::Path, codec: &dyn SecretCodec, fs: &dyn FileOps) -> Self {
         settings_file::remove_stale_temps(fs, path);
-        let unusable = match fs.read(path) {
+        /// What `config.json` turned out to be, when it can't be used.
+        enum Main {
+            Missing,
+            Damaged,
+            Unreadable(String),
+        }
+        let main = match fs.read(path) {
             Ok(bytes) => match parse_settings(&bytes, codec) {
-                Ok(parsed) => return Self::from_parsed(parsed, path, codec, fs, LoadNotice::default()),
+                Ok(parsed) => return Self::from_parsed(parsed, path, codec, fs, LoadNotice::default(), None),
                 Err(why) => {
                     log::error!("user_config: can't use {} ({why})", path.display());
-                    true
+                    Main::Damaged
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Main::Missing,
             Err(e) => {
                 log::error!(
-                    "user_config: can't read {}: {} — using defaults; the file is left as is \
-                     and settings changed in this run are not saved",
+                    "user_config: can't read {}: {} — the file is left as is and settings changed \
+                     in this run are not saved",
                     path.display(),
                     e
                 );
-                return Self::not_read(e.to_string());
+                Main::Unreadable(e.to_string())
             }
         };
-        // `config.json` is missing or unusable: the backup, if it is good.
+        // `config.json` is missing or can't be used: the backup, if it is good.
         let backup_path = settings_file::backup_path(path);
         let backup = match fs.read(&backup_path) {
             Ok(bytes) => match parse_settings(&bytes, codec) {
@@ -509,34 +515,56 @@ impl UserConfig {
                     backup_path.display(),
                     e
                 );
-                return Self::not_read(e.to_string());
+                let why = match main {
+                    Main::Unreadable(why) => why,
+                    _ => e.to_string(),
+                };
+                return Self::not_read(why);
             }
         };
-        if !unusable && backup.is_none() {
-            return Self::default();
-        }
+        // The file can't be replaced this run: the backup's settings if
+        // there is a good one, saving nothing over the file either way.
+        let keep_file = |why: String, damaged: bool, backup: Option<Parsed>| match backup {
+            Some(parsed) => {
+                log::warn!(
+                    "user_config: using the settings in the backup {} for this run",
+                    backup_path.display()
+                );
+                let problem = SaveProblem::NotRead { why, damaged, on_backup: true };
+                Self::from_parsed(parsed, path, codec, fs, LoadNotice::default(), Some(problem))
+            }
+            None => Self {
+                saves: Saves::KeepFile,
+                save_health: SaveHealth::with(Some(SaveProblem::NotRead { why, damaged, on_backup: false })),
+                ..Self::default()
+            },
+        };
         let mut notice = LoadNotice::default();
-        if unusable {
-            let aside = match settings_file::move_aside(fs, path, "corrupt") {
-                Ok(aside) => aside,
+        match main {
+            Main::Missing if backup.is_none() => return Self::default(),
+            Main::Missing => {}
+            Main::Unreadable(why) => return keep_file(why, false, backup),
+            Main::Damaged => match settings_file::move_aside(fs, path, "corrupt") {
+                Ok(aside) => {
+                    log::warn!("user_config: moved {} to {}", path.display(), aside.display());
+                    notice.unusable_kept_as = Some(aside);
+                }
                 Err(re) => {
                     log::error!(
-                        "user_config: could not move {} aside ({}); starting with defaults — the \
-                         file is left as is and settings changed in this run are not saved",
+                        "user_config: could not move {} aside ({}); the file is left as is and \
+                         settings changed in this run are not saved",
                         path.display(),
                         re
                     );
-                    return Self::not_read(re.to_string());
+                    return keep_file(re.to_string(), true, backup);
                 }
-            };
-            log::warn!("user_config: moved {} to {}", path.display(), aside.display());
-            notice.unusable_kept_as = Some(aside);
+            },
         }
         match backup {
             Some(parsed) => {
                 log::warn!("user_config: loaded the settings from the backup {}", backup_path.display());
                 notice.restored_from_backup = true;
-                let c = Self::from_parsed(parsed, path, codec, fs, notice);
+                let c = Self::from_parsed(parsed, path, codec, fs, notice, None);
                 // So the next start finds them in `config.json` again.
                 c.save_to_ops(path, codec, fs);
                 c
@@ -551,12 +579,14 @@ impl UserConfig {
 
     /// Settings from a file `parse_settings` accepted, saving at once when
     /// the file needs it (see [`load_from_with`](Self::load_from_with)).
+    /// `keep`: the file can't be replaced this run, for this reason.
     fn from_parsed(
         parsed: Parsed,
         path: &std::path::Path,
         codec: &dyn SecretCodec,
         fs: &dyn FileOps,
         mut notice: LoadNotice,
+        keep: Option<SaveProblem>,
     ) -> Self {
         let Parsed { mut config, report, encoding, reset } = parsed;
         let mut drop_unread = false;
@@ -583,6 +613,10 @@ impl UserConfig {
         }
         config.locked_secrets = report.locked;
         config.load_notice = notice;
+        if let Some(problem) = keep {
+            config.saves = Saves::KeepFile;
+            config.save_health = SaveHealth::with(Some(problem));
+        }
         if let Some(encoding) = encoding {
             log::info!("user_config: rewriting {} ({encoding}) as UTF-8", path.display());
             config.save_to_ops(path, codec, fs);
@@ -825,9 +859,11 @@ impl LoadNotice {
 /// Why saves aren't reaching `config.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SaveProblem {
-    /// The file couldn't be read at start (`why`, the system's words), so
-    /// the app runs on defaults and saves nothing over it.
-    NotRead { why: String },
+    /// The file couldn't be read at start, or was damaged and couldn't be
+    /// moved aside (`damaged`), for `why` (the system's words); the app
+    /// runs on the backup's settings (`on_backup`) or on defaults, and
+    /// saves nothing over the file.
+    NotRead { why: String, damaged: bool, on_backup: bool },
     /// The last save failed (`why`, the system's words).
     Failed { why: String },
     /// Some values in the file couldn't be read and no copy of the file
@@ -839,10 +875,15 @@ impl SaveProblem {
     /// What to tell the person while the problem lasts.
     pub fn describe(&self) -> String {
         match self {
-            SaveProblem::NotRead { why } => format!(
-                "Your settings couldn't be read, so the app is using default settings and leaves \
-                 the file alone: changes made now won't be kept. Quit the app and start it again \
-                 to retry. Details: {why}"
+            SaveProblem::NotRead { why, damaged, on_backup } => format!(
+                "{}, so the app is using {} and leaves the file alone: changes made now won't be \
+                 kept. Quit the app and start it again to retry. Details: {why}",
+                if *damaged {
+                    "Your settings file is damaged and couldn't be moved aside"
+                } else {
+                    "Your settings file couldn't be read"
+                },
+                if *on_backup { "its backup copy" } else { "default settings" },
             ),
             SaveProblem::CopyNotKept { why } => format!(
                 "Some settings couldn't be read, and a copy of the settings file couldn't be kept \
@@ -2068,6 +2109,9 @@ mod tests {
         c.last_speaker_id = Some("kept".into());
         c.airplay_passwords.insert("airplay:aa".into(), "hunter2".into());
         c.save_to(&path);
+        // No backup: an earlier version's file (with one, see
+        // `an_unreadable_file_with_a_good_backup_runs_on_the_backup_without_saving`).
+        std::fs::remove_file(crate::settings_file::backup_path(&path)).unwrap();
         let before = std::fs::read(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(&path).is_ok() {
@@ -2086,7 +2130,7 @@ mod tests {
         let mut names: Vec<_> =
             std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
         names.sort();
-        assert_eq!(names, ["config.json", "config.json.bak"]);
+        assert_eq!(names, ["config.json"]);
         // The next launch reads it as it was.
         let next = UserConfig::load_from(&path);
         assert_eq!(next.last_speaker_id.as_deref(), Some("kept"));
@@ -2120,6 +2164,88 @@ mod tests {
         assert_eq!(std::fs::read(&bak).unwrap(), backup);
         // Readable at the next start: the backup is used.
         assert_eq!(UserConfig::load_from(&path).last_speaker_id.as_deref(), Some("b"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_used_or_moved_aside_runs_on_the_backup_without_saving() {
+        use crate::settings_file::tests::PowerCutDisk;
+        /// A disk where `config.json` can't be renamed (another program has
+        /// it open without sharing delete, say).
+        struct Stuck(PowerCutDisk, PathBuf);
+        impl FileOps for Stuck {
+            fn read(&self, p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                self.0.read(p)
+            }
+            fn create_flushed(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> {
+                self.0.create_flushed(p, b)
+            }
+            fn rename(&self, f: &std::path::Path, t: &std::path::Path) -> std::io::Result<()> {
+                if f == self.1 || t == self.1 {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                self.0.rename(f, t)
+            }
+            fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+                self.0.remove(p)
+            }
+            fn create_dir_all(&self, d: &std::path::Path) -> std::io::Result<()> {
+                self.0.create_dir_all(d)
+            }
+            fn list(&self, d: &std::path::Path) -> std::io::Result<Vec<String>> {
+                self.0.list(d)
+            }
+            fn age(&self, p: &std::path::Path) -> Option<std::time::Duration> {
+                self.0.age(p)
+            }
+        }
+        let path = PathBuf::from("/profile/StreamToSpeaker/config.json");
+        let inner = PowerCutDisk::default();
+        numbered("saved").try_save_to_ops(&path, &PlatformCodec, &inner).unwrap();
+        inner.remove(&path).unwrap();
+        inner.create_flushed(&path, b"\0\0\0\0").unwrap();
+        let disk = Stuck(inner, path.clone());
+        let c = UserConfig::load_with_ops(&path, &PlatformCodec, &disk);
+        assert_eq!(c.last_speaker_id.as_deref(), Some("saved"), "the backup's settings");
+        assert!(c.try_save_to_ops(&path, &PlatformCodec, &disk).is_err());
+        assert_eq!(disk.0.get(&path).unwrap(), b"\0\0\0\0", "never written over");
+        let problem = c.save_health().problem().unwrap();
+        assert_eq!(problem, SaveProblem::NotRead { why: problem_why(&problem), damaged: true, on_backup: true });
+        assert!(problem.describe().starts_with(
+            "Your settings file is damaged and couldn't be moved aside, so the app is using its backup copy"
+        ), "{}", problem.describe());
+    }
+
+    fn problem_why(p: &SaveProblem) -> String {
+        match p {
+            SaveProblem::NotRead { why, .. } | SaveProblem::Failed { why, .. } | SaveProblem::CopyNotKept { why } => {
+                why.clone()
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_with_a_good_backup_runs_on_the_backup_without_saving() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_config_dir("unreadable-with-backup");
+        let path = dir.join("config.json");
+        numbered("saved").save_to(&path);
+        let before = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // Permissions don't apply (running as root): nothing to test.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let c = UserConfig::load_from(&path);
+        assert_eq!(c.last_speaker_id.as_deref(), Some("saved"));
+        c.save_to(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let problem = c.save_health().problem().unwrap();
+        assert!(matches!(problem, SaveProblem::NotRead { damaged: false, on_backup: true, .. }), "{problem:?}");
+        assert!(problem.describe().starts_with("Your settings file couldn't be read, so the app is using its backup copy"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
