@@ -339,5 +339,8 @@ UPnP/OpenHome: L16 PCM, 44.1 kHz, stereo — wire MIME
 `audio/L16;rate=44100;channels=2`, wrapped in a 44-byte RIFF/WAVE header so
 Sonos accepts it as `audio/wav`. Lowest latency, broadest compatibility.
 
-AirPlay: ALAC for RAOP, and AAC-LC via Windows Media Foundation for AirPlay 2
-buffered audio.
+AirPlay: ALAC for RAOP. AirPlay 2: AAC-LC for the buffered stream, encoded by
+Windows' own Media Foundation encoder; the realtime stream is ALAC (PCM for
+HomePods that accept it). Without that encoder the realtime stream is used.
+Windows N editions have no Media Foundation unless the Media Feature Pack is
+installed, so there AirPlay 2 speakers get the realtime stream.

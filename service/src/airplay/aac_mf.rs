@@ -43,8 +43,8 @@ use crate::WIRE_SAMPLE_RATE;
 
 /// The four Media Foundation functions the encoder calls, from the system's
 /// own `mfplat.dll`. Found once per process, the first time an encoder is
-/// made; a missing library or function is an ordinary error, which the
-/// session's probe turns into its ALAC fallback.
+/// made; a missing library or function is an ordinary error, on which the
+/// session's probe chooses the realtime stream.
 struct MfPlat {
     startup: unsafe extern "system" fn(version: u32, flags: u32) -> HRESULT,
     create_media_type: unsafe extern "system" fn(out: *mut *mut c_void) -> HRESULT,

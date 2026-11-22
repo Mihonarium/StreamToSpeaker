@@ -690,9 +690,10 @@ impl Ap2Rtsp {
     }
 
     /// Second SETUP, buffered variant — type 103 over TCP, the stream kind
-    /// modern iOS senders use (feature bit 40). Codec-parameterized:
-    /// AAC-LC = (ct 4, spf 1024, audioFormat 0x400000) — what iOS sends;
-    /// ALAC   = (ct 2, spf 352,  audioFormat 0x40000).
+    /// modern iOS senders use (feature bit 40). The session offers AAC-LC
+    /// only (ct 4, spf 1024, audioFormat 0x400000 — what iOS sends): no
+    /// Apple sender sends buffered ALAC at 44.1 kHz, and no receiver is
+    /// known to play it.
     /// Playback is anchored via SETRATEANCHORTIME instead of control-port
     /// sync packets. The returned `data` port is **TCP**.
     pub fn setup_stream_buffered(

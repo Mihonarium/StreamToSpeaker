@@ -40,7 +40,7 @@ use crate::airplay::ap2_health::{
     FaultChannel, FaultSlot, FeedbackAction, FeedbackMonitor, SendAction, SendHealth, VolumeTracker,
     FEEDBACK_INTERVAL,
 };
-use crate::airplay::ap2_ptp::{spawn_ptp_master, PtpMaster, PtpTimeline};
+use crate::airplay::ap2_ptp::{spawn_ptp_master, spawn_ptp_master_on, PtpMaster, PtpPorts, PtpTimeline, PTP_PORTS};
 use crate::airplay::ap2_resend::Retransmitter;
 use crate::airplay::ap2_crypto::ChannelCipher;
 use crate::airplay::ap2_realtime::{MemberLink, RealtimeGroup, RealtimeRun};
@@ -252,7 +252,7 @@ impl AirPlay2Session {
         let audio_key = pair_member(&mut rtsp, cfg.stored_pairing.as_ref(), &cfg.renderer.friendly_name)?;
         info!("AirPlay 2: paired with {}", cfg.renderer.friendly_name);
         let sockets = Ap2Sockets { audio: audio_socket, control: control_socket, timing: timing_socket, control_port, timing_port };
-        Self::start_paired(cfg, rtsp, audio_key, sockets)
+        Self::start_paired(cfg, rtsp, audio_key, sockets, BringUpEnv::real())
     }
 
     /// The general path's bring-up after pairing: timing, the event
@@ -262,6 +262,7 @@ impl AirPlay2Session {
         mut rtsp: Ap2Rtsp,
         audio_key: [u8; 32],
         sockets: Ap2Sockets,
+        env: BringUpEnv,
     ) -> std::result::Result<Self, Ap2StartError> {
         let Ap2Sockets { audio: audio_socket, control: control_socket, timing: timing_socket, control_port, timing_port } =
             sockets;
@@ -288,8 +289,14 @@ impl AirPlay2Session {
             cfg.renderer.model.as_deref().unwrap_or("?"),
         );
         let (ptp_session, timing_setup) = if use_ptp {
-            let ptp = spawn_ptp_master(&[cfg.renderer.ip], cfg.local_ip, cfg.renderer.friendly_name.clone(), homepod)
-                .context("starting AP2 PTP master")?;
+            let ptp = spawn_ptp_master_on(
+                &[cfg.renderer.ip],
+                cfg.local_ip,
+                env.ptp_ports,
+                cfg.renderer.friendly_name.clone(),
+                homepod,
+            )
+            .context("starting AP2 PTP master")?;
             let ts = rtsp
                 .setup_timing_ptp(ptp.timeline.clock_id, &ptp.clock_uuid)
                 .context("AP2 SETUP(timing/PTP)")?;
@@ -320,13 +327,15 @@ impl AirPlay2Session {
         // Stream kind: buffered (type 103, TCP — what iOS actually uses,
         // and seemingly the only kind current Sonos firmware truly plays)
         // when the receiver advertises bit 40 and we're on PTP; realtime
-        // (type 96, UDP) otherwise. Codec: AAC-LC via the Windows-provided
-        // Media Foundation encoder — iOS's buffered codec, the only one
-        // field-proven on Sonos — with ALAC as fallback (no encoder needed)
-        // and realtime as the last resort. Every rejection is visible.
+        // (type 96, UDP) otherwise. The buffered codec is AAC-LC via the
+        // Windows-provided Media Foundation encoder — iOS's buffered codec,
+        // the only one field-proven on Sonos. Without that encoder (Windows
+        // N editions without the Media Feature Pack) the session is the
+        // realtime one a person who chose realtime gets; a refused buffered
+        // SETUP falls back to realtime too. Every rejection is visible.
         let latency_samples = crate::airplay::timing::latency_ms_to_samples(cfg.latency_ms);
         let low_latency = cfg.latency_ms < LOW_LATENCY_REALTIME_MS;
-        let want_buffered = use_ptp
+        let mut want_buffered = use_ptp
             && cfg.renderer.supports_buffered_audio()
             && !cfg.prefer_realtime
             && !low_latency;
@@ -339,53 +348,20 @@ impl AirPlay2Session {
                 cfg.latency_ms, LOW_LATENCY_REALTIME_MS
             );
         }
-        let mut codec = BufferedCodecKind::Alac;
-        #[cfg(windows)]
         if want_buffered {
-            match crate::airplay::aac_mf::AacEncoder::new() {
-                Ok(_) => codec = BufferedCodecKind::Aac,
-                Err(e) => {
-                    warn!("AirPlay 2: Windows AAC encoder unavailable ({e:#}); buffered will use ALAC")
-                }
+            if let Err(e) = (env.aac_encoder)() {
+                info!(
+                    "AirPlay 2: the buffered stream needs Windows' AAC encoder, which is not available \
+                     ({e:#}); using the realtime stream instead"
+                );
+                want_buffered = false;
             }
         }
         let (ports, buffered) = if want_buffered {
-            let attempt = |rtsp: &mut Ap2Rtsp, k: BufferedCodecKind| match k {
-                BufferedCodecKind::Aac => {
-                    rtsp.setup_stream_buffered(&audio_key, control_port, 4, 1024, 0x400000, DEFAULT_LATENCY_SAMPLES)
-                }
-                BufferedCodecKind::Alac => {
-                    rtsp.setup_stream_buffered(&audio_key, control_port, 2, 352, 0x40000, DEFAULT_LATENCY_SAMPLES)
-                }
-            };
-            match attempt(&mut rtsp, codec) {
+            match rtsp.setup_stream_buffered(&audio_key, control_port, 4, BUFFERED_SPF as u64, 0x400000, DEFAULT_LATENCY_SAMPLES) {
                 Ok(p) => {
-                    info!(
-                        "AirPlay 2: buffered stream accepted (type 103/{}, TCP data port {})",
-                        codec.label(),
-                        p.data
-                    );
+                    info!("AirPlay 2: buffered stream accepted (type 103/AAC-LC, TCP data port {})", p.data);
                     (p, true)
-                }
-                Err(e) if codec == BufferedCodecKind::Aac => {
-                    warn!("AirPlay 2: buffered AAC SETUP rejected ({e:#}); trying buffered ALAC");
-                    codec = BufferedCodecKind::Alac;
-                    match attempt(&mut rtsp, codec) {
-                        Ok(p) => {
-                            info!(
-                                "AirPlay 2: buffered stream accepted (type 103/ALAC, TCP data port {})",
-                                p.data
-                            );
-                            (p, true)
-                        }
-                        Err(e) => {
-                            warn!("AirPlay 2: buffered ALAC SETUP rejected ({e:#}); falling back to realtime");
-                            let p = rtsp
-                                .setup_stream(&audio_key, control_port, latency_samples)
-                                .context("AP2 SETUP(stream, realtime fallback)")?;
-                            (p, false)
-                        }
-                    }
                 }
                 Err(e) => {
                     warn!("AirPlay 2: buffered SETUP rejected ({e:#}); falling back to realtime");
@@ -481,7 +457,6 @@ impl AirPlay2Session {
                 audio_key,
                 initial_seq,
                 initial_rtptime,
-                random_ssrc: ssrc,
                 samples_rx: cfg.samples_rx,
                 stop_flag: stop_flag.clone(),
                 receiver_name: cfg.renderer.friendly_name.clone(),
@@ -489,16 +464,12 @@ impl AirPlay2Session {
                 last_seq,
                 rtsp: rtsp.clone(),
                 timeline: ptp_session.as_ref().unwrap().timeline.clone(),
-                codec,
-                encoder: codec.encoder(),
+                encoder: aac_encoder(),
                 anchor_retry: AnchorRetry::new(),
                 ptp_ports_problem: ptp_session.as_ref().and_then(|p| p.ports_problem()).map(str::to_string),
                 faults: faults.clone(),
             })?);
-            info!(
-                "AirPlay 2: buffered {} stream armed — will anchor at first audio",
-                codec.label()
-            );
+            info!("AirPlay 2: buffered AAC-LC stream armed — will anchor at first audio");
             drop(timing_socket);
             drop(control_socket);
             drop(control_for_resend);
@@ -972,6 +943,28 @@ impl AirPlay2Session {
     }
 }
 
+/// What a general-path bring-up takes from the machine: the PTP ports and
+/// whether Windows' AAC encoder can be made here. Tests replace both.
+struct BringUpEnv {
+    ptp_ports: PtpPorts,
+    aac_encoder: fn() -> Result<()>,
+}
+
+impl BringUpEnv {
+    fn real() -> Self {
+        Self { ptp_ports: PTP_PORTS, aac_encoder: aac_encoder_available }
+    }
+}
+
+/// Can the buffered stream's encoder be made on this PC? A throwaway
+/// encoder on this thread; the sender builds its own on its thread.
+fn aac_encoder_available() -> Result<()> {
+    #[cfg(windows)]
+    return crate::airplay::aac_mf::AacEncoder::new().map(drop);
+    #[cfg(not(windows))]
+    return Err(anyhow::anyhow!("AAC is only available on Windows"));
+}
+
 /// The UDP sockets a general-path session binds before it connects, and
 /// their ports.
 struct Ap2Sockets {
@@ -1300,76 +1293,32 @@ fn read_volume_once(rtsp: &Arc<Mutex<Ap2Rtsp>>, stop_flag: &AtomicBool) -> Optio
 // Buffered audio sender (type 103 — length-prefixed sealed packets on TCP)
 // ---------------------------------------------------------------------------
 
-/// Payload codec for the buffered stream. AAC-LC is what iOS sends (and
-/// the only codec field-proven on Sonos); ALAC needs no encoder and is
-/// the fallback + the non-Windows dev default.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BufferedCodecKind {
-    Alac,
-    Aac,
+/// Samples per buffered packet: one AAC-LC frame (the SETUP's `spf`).
+const BUFFERED_SPF: usize = 1024;
+
+/// The SSRC Apple's senders put on buffered AAC-LC 44.1 kHz stereo
+/// packets. Receivers read a buffered packet's SSRC as its payload's
+/// format: shairport-sync plays no block whose SSRC it doesn't know.
+const BUFFERED_AAC_SSRC: u32 = 0x1600_0000;
+
+/// What makes the buffered stream's payloads, on the sender thread: the
+/// AAC encoder must live on the thread that uses it (COM).
+fn aac_encoder() -> EncoderFactory {
+    #[cfg(windows)]
+    return Box::new(|| Ok(Box::new(crate::airplay::aac_mf::AacEncoder::new()?) as Box<dyn BufferedEncoder>));
+    #[cfg(not(windows))]
+    return Box::new(|| Err(anyhow::anyhow!("AAC is only available on Windows")));
 }
 
-impl BufferedCodecKind {
-    fn label(self) -> &'static str {
-        match self {
-            BufferedCodecKind::Alac => "ALAC",
-            BufferedCodecKind::Aac => "AAC-LC",
-        }
-    }
-
-    /// Samples per packet: fixed at 1024 by AAC-LC; 352 for ALAC (RAOP
-    /// convention, matches the SETUP `spf`).
-    fn spf(self) -> usize {
-        match self {
-            BufferedCodecKind::Alac => FRAMES_PER_PACKET,
-            BufferedCodecKind::Aac => 1024,
-        }
-    }
-
-    /// The SSRC Apple's senders put on buffered packets of this format:
-    /// receivers read it as the payload's format (shairport-sync plays no
-    /// block whose SSRC it doesn't know). AAC-LC 44.1 kHz stereo is
-    /// `0x16000000`. Apple's senders send ALAC buffered only at 48 kHz/24
-    /// bit, so 44.1 kHz/16-bit ALAC has no value: None.
-    fn apple_ssrc(self) -> Option<u32> {
-        match self {
-            BufferedCodecKind::Alac => None,
-            BufferedCodecKind::Aac => Some(0x1600_0000),
-        }
-    }
-
-    /// What makes this codec's payloads, on the sender thread: the AAC
-    /// encoder must live on the thread that uses it (COM).
-    fn encoder(self) -> EncoderFactory {
-        match self {
-            BufferedCodecKind::Alac => Box::new(|| Ok(Box::new(UncompressedAlac) as Box<dyn BufferedEncoder>)),
-            #[cfg(windows)]
-            BufferedCodecKind::Aac => Box::new(|| {
-                Ok(Box::new(crate::airplay::aac_mf::AacEncoder::new()?) as Box<dyn BufferedEncoder>)
-            }),
-            #[cfg(not(windows))]
-            BufferedCodecKind::Aac => Box::new(|| Err(anyhow::anyhow!("AAC is only available on Windows"))),
-        }
-    }
-}
-
-/// Turns one packet's worth of PCM (`spf` stereo frames, interleaved) into
-/// zero or more payloads: the AAC MFT buffers a frame or two before its
-/// first output; ALAC is always 1:1.
+/// Turns one packet's worth of PCM ([`BUFFERED_SPF`] stereo frames,
+/// interleaved) into zero or more payloads: the AAC MFT buffers a frame or
+/// two before its first output.
 trait BufferedEncoder {
     fn encode(&mut self, pcm: &[i16]) -> Result<Vec<Vec<u8>>>;
 }
 
 /// Makes the buffered sender's encoder; called once, on the sender thread.
 type EncoderFactory = Box<dyn FnOnce() -> Result<Box<dyn BufferedEncoder>> + Send>;
-
-struct UncompressedAlac;
-
-impl BufferedEncoder for UncompressedAlac {
-    fn encode(&mut self, pcm: &[i16]) -> Result<Vec<Vec<u8>>> {
-        Ok(vec![build_uncompressed_alac_frame(pcm)])
-    }
-}
 
 #[cfg(windows)]
 impl BufferedEncoder for crate::airplay::aac_mf::AacEncoder {
@@ -1383,9 +1332,6 @@ struct BufferedSenderConfig {
     audio_key: [u8; 32],
     initial_seq: u16,
     initial_rtptime: u32,
-    /// The session's random SSRC, for a format Apple's senders have no
-    /// SSRC value for.
-    random_ssrc: u32,
     samples_rx: Receiver<PcmFrame>,
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
@@ -1397,9 +1343,7 @@ struct BufferedSenderConfig {
     rtsp: Arc<Mutex<Ap2Rtsp>>,
     /// Both PTP timelines (ours + the receiver's, once locked).
     timeline: PtpTimeline,
-    /// Negotiated payload codec (must match the SETUP's ct/spf).
-    codec: BufferedCodecKind,
-    /// Makes that codec's encoder, on the sender thread.
+    /// Makes the AAC encoder, on the sender thread.
     encoder: EncoderFactory,
     /// How long a refused or unanswered anchor is retried.
     anchor_retry: AnchorRetry,
@@ -1455,8 +1399,8 @@ fn frame_buffered_packet(pkt: &[u8]) -> Vec<u8> {
 }
 
 /// The buffered stream's encoder failed: no audio can follow, so the
-/// session ends. SETUP negotiated the codec, so switching to ALAC within the
-/// session isn't possible; a reconnect builds a new encoder, and if that
+/// session ends. SETUP negotiated AAC, so switching codec within the session
+/// isn't possible; a reconnect builds a new encoder, and if that
 /// fails too, the person is told (only AAC, Windows' encoder, can fail).
 fn encoder_failed(faults: &FaultSlot, stop_flag: &AtomicBool, detail: String) {
     if stop_flag.load(Ordering::Acquire) {
@@ -1527,10 +1471,10 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
         cfg.initial_seq,
         cfg.initial_rtptime
     );
-    let spf = cfg.codec.spf();
+    let spf = BUFFERED_SPF;
     let mut sealer = AudioSealer::new(&cfg.audio_key, cfg.initial_seq);
     let mut seq = cfg.initial_seq as u32;
-    let ssrc = cfg.codec.apple_ssrc().unwrap_or(cfg.random_ssrc);
+    let ssrc = BUFFERED_AAC_SSRC;
     let mut rtptime = cfg.initial_rtptime;
     let mut packet_count: u64 = 0;
     let mut ring: Vec<i16> = Vec::with_capacity(spf * 2);
@@ -1541,7 +1485,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
     let mut encoder = match make_encoder() {
         Ok(enc) => enc,
         Err(e) => {
-            encoder_failed(&cfg.faults, &cfg.stop_flag, format!("{} encoder could not start: {e:#}", cfg.codec.label()));
+            encoder_failed(&cfg.faults, &cfg.stop_flag, format!("AAC-LC encoder could not start: {e:#}"));
             return;
         }
     };
@@ -1648,7 +1592,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
             let payloads = match encoder.encode(&pkt_samples) {
                 Ok(frames) => frames,
                 Err(e) => {
-                    encoder_failed(&cfg.faults, &cfg.stop_flag, format!("{} encoding failed: {e:#}", cfg.codec.label()));
+                    encoder_failed(&cfg.faults, &cfg.stop_flag, format!("AAC-LC encoding failed: {e:#}"));
                     return;
                 }
             };
@@ -1682,11 +1626,7 @@ fn run_ap2_buffered_sender(mut cfg: BufferedSenderConfig) {
                     return;
                 }
                 if packet_count == 0 {
-                    info!(
-                        "AirPlay 2: buffered {} audio flowing — first packet ({} bytes framed)",
-                        cfg.codec.label(),
-                        framed.len()
-                    );
+                    info!("AirPlay 2: buffered AAC-LC audio flowing — first packet ({} bytes framed)", framed.len());
                 }
 
                 seq = (seq + 1) & BUFFERED_SEQ_MASK;
@@ -1949,7 +1889,7 @@ const BUFFERED_SEQ_MASK: u32 = 0x7F_FFFF;
 /// bit's remaining 7 bits plus the next two bytes holding a 23-bit
 /// sequence number — receivers read `bytes 0..4 & 0x7FFFFF`
 /// (shairport-sync's buffered reader) — then the RTP timestamp and the
-/// format SSRC ([`BufferedCodecKind::apple_ssrc`]).
+/// format SSRC ([`BUFFERED_AAC_SSRC`]).
 fn buffered_rtp_header(seq: u32, timestamp: u32, ssrc: u32) -> [u8; 12] {
     let mut h = [0u8; 12];
     BigEndian::write_u32(&mut h[0..4], 0x8080_0000 | (seq & BUFFERED_SEQ_MASK));
@@ -2052,21 +1992,14 @@ mod tests {
 
     impl BufferedRig {
         /// `name`: the receiver's name, which faults are remembered by.
-        fn start(
-            name: &str,
-            codec: BufferedCodecKind,
-            encoder: EncoderFactory,
-            initial_seq: u16,
-            anchor_replies: &'static [&'static str],
-        ) -> Self {
-            Self::start_with(name, codec, encoder, initial_seq, anchor_replies, AnchorRetry::new(), None)
+        fn start(name: &str, encoder: EncoderFactory, initial_seq: u16, anchor_replies: &'static [&'static str]) -> Self {
+            Self::start_with(name, encoder, initial_seq, anchor_replies, AnchorRetry::new(), None)
         }
 
         /// `anchor_replies`: the status lines SETRATEANCHORTIME gets, in
         /// order, the last one repeated.
         fn start_with(
             name: &str,
-            codec: BufferedCodecKind,
             encoder: EncoderFactory,
             initial_seq: u16,
             anchor_replies: &'static [&'static str],
@@ -2110,7 +2043,6 @@ mod tests {
                 audio_key: [3u8; 32],
                 initial_seq,
                 initial_rtptime: 1_000,
-                random_ssrc: 0x0102_0304,
                 samples_rx,
                 stop_flag: stop_flag.clone(),
                 receiver_name: name.into(),
@@ -2118,7 +2050,6 @@ mod tests {
                 last_seq: last_seq.clone(),
                 rtsp: Arc::new(Mutex::new(rtsp)),
                 timeline: PtpTimeline::new(crate::airplay::ap2_ptp::PtpMasterClock::new(), 0x42),
-                codec,
                 encoder,
                 anchor_retry,
                 ptp_ports_problem,
@@ -2179,8 +2110,8 @@ mod tests {
     fn a_failing_encoder_ends_the_session_and_then_says_why() {
         let failing_start: EncoderFactory = Box::new(|| anyhow::bail!("MFStartup: scripted"));
         for (round, encoder) in [(1, failing_start), (2, scripted_encoder(Some(3)))] {
-            let mut rig = BufferedRig::start("Encoder test speaker", BufferedCodecKind::Aac, encoder, 100, &["200 OK"]);
-            rig.feed(BufferedCodecKind::Aac.spf() * 8);
+            let mut rig = BufferedRig::start("Encoder test speaker", encoder, 100, &["200 OK"]);
+            rig.feed(BUFFERED_SPF * 8);
             rig.wait_for_exit();
             assert!(rig.dead.load(Ordering::Acquire), "round {round}: session not marked dead");
             let fault = rig.faults.get().unwrap();
@@ -2202,15 +2133,14 @@ mod tests {
         let start = |name, retry_for, ports_problem| {
             BufferedRig::start_with(
                 name,
-                BufferedCodecKind::Alac,
-                BufferedCodecKind::Alac.encoder(),
+                scripted_encoder(None),
                 7,
                 &["400 Bad Request"],
                 AnchorRetry::giving_up_after(retry_for),
                 ports_problem,
             )
         };
-        let spf = BufferedCodecKind::Alac.spf();
+        let spf = BUFFERED_SPF;
         for (round, ports_problem, want) in [
             (1, None, None),
             (2, None, Some("UDP ports 319 and 320")),
@@ -2231,8 +2161,7 @@ mod tests {
 
         let mut rig = BufferedRig::start(
             "Late anchor test speaker",
-            BufferedCodecKind::Alac,
-            BufferedCodecKind::Alac.encoder(),
+            scripted_encoder(None),
             7,
             &["400 Bad Request", "400 Bad Request", "200 OK"],
         );
@@ -2246,8 +2175,8 @@ mod tests {
     /// the session: the sender ends without a fault.
     #[test]
     fn the_source_going_away_ends_the_sender_quietly() {
-        let mut rig = BufferedRig::start("Quiet test speaker", BufferedCodecKind::Alac, BufferedCodecKind::Alac.encoder(), 1, &["200 OK"]);
-        rig.feed(BufferedCodecKind::Alac.spf() * 2);
+        let mut rig = BufferedRig::start("Quiet test speaker", scripted_encoder(None), 1, &["200 OK"]);
+        rig.feed(BUFFERED_SPF * 2);
         assert!(rig.packet().is_some());
         rig.samples.take();
         rig.wait_for_exit();
@@ -2257,39 +2186,31 @@ mod tests {
 
     /// Buffered packets look like an Apple sender's: the marker bit on
     /// every packet with a 23-bit sequence number that runs on past
-    /// 0xFFFF, the SSRC naming the format where Apple has a value for it
-    /// (AAC-LC 44.1 kHz stereo; ALAC at 44.1 kHz has none, so it keeps the
-    /// session's random one), and FLUSHBUFFERED's sequence number in the
-    /// same 23-bit space.
+    /// 0xFFFF, the SSRC naming the format (AAC-LC 44.1 kHz stereo), and
+    /// FLUSHBUFFERED's sequence number in the same 23-bit space.
     #[test]
     fn buffered_packets_carry_apples_header_and_format_ssrc() {
-        for (codec, encoder, want_ssrc) in [
-            (BufferedCodecKind::Aac, scripted_encoder(None), 0x1600_0000u32),
-            (BufferedCodecKind::Alac, BufferedCodecKind::Alac.encoder(), 0x0102_0304),
-        ] {
-            let spf = codec.spf();
-            let mut rig = BufferedRig::start("Header test speaker", codec, encoder, 65_530, &["200 OK"]);
-            rig.feed(spf * 12);
-            let mut packets = Vec::new();
-            for _ in 0..12 {
-                packets.push(rig.packet().expect("a packet"));
-            }
-            rig.stop();
-            while let Some(p) = rig.packet() {
-                packets.push(p);
-            }
-            for (i, p) in packets.iter().enumerate() {
-                let what = format!("{} packet {i}: {:02x?}", codec.label(), &p[..12]);
-                assert_eq!(p[0], 0x80, "{what}");
-                assert_eq!(p[1] & 0x80, 0x80, "marker bit, {what}");
-                let seq = u32::from_be_bytes([p[0], p[1], p[2], p[3]]) & 0x7F_FFFF;
-                assert_eq!(seq, 65_530 + i as u32, "{what}");
-                assert_eq!(u32::from_be_bytes([p[4], p[5], p[6], p[7]]), 1_000 + (i * spf) as u32, "{what}");
-                assert_eq!(u32::from_be_bytes([p[8], p[9], p[10], p[11]]), want_ssrc, "{what}");
-            }
-            // FLUSHBUFFERED names the next packet in the same numbering.
-            assert_eq!(rig.last_seq.load(Ordering::Acquire), 65_530 + packets.len() as u32);
+        let mut rig = BufferedRig::start("Header test speaker", scripted_encoder(None), 65_530, &["200 OK"]);
+        rig.feed(BUFFERED_SPF * 12);
+        let mut packets = Vec::new();
+        for _ in 0..12 {
+            packets.push(rig.packet().expect("a packet"));
         }
+        rig.stop();
+        while let Some(p) = rig.packet() {
+            packets.push(p);
+        }
+        for (i, p) in packets.iter().enumerate() {
+            let what = format!("packet {i}: {:02x?}", &p[..12]);
+            assert_eq!(p[0], 0x80, "{what}");
+            assert_eq!(p[1] & 0x80, 0x80, "marker bit, {what}");
+            let seq = u32::from_be_bytes([p[0], p[1], p[2], p[3]]) & 0x7F_FFFF;
+            assert_eq!(seq, 65_530 + i as u32, "{what}");
+            assert_eq!(u32::from_be_bytes([p[4], p[5], p[6], p[7]]), 1_000 + (i * BUFFERED_SPF) as u32, "{what}");
+            assert_eq!(u32::from_be_bytes([p[8], p[9], p[10], p[11]]), 0x1600_0000, "{what}");
+        }
+        // FLUSHBUFFERED names the next packet in the same numbering.
+        assert_eq!(rig.last_seq.load(Ordering::Acquire), 65_530 + packets.len() as u32);
     }
 
     /// A bring-up that fails after the event channel is open (here the
@@ -2364,7 +2285,7 @@ mod tests {
             timing,
         };
         let rtsp = Ap2Rtsp::connect(ip, control_port, ip, Duration::from_secs(5)).unwrap();
-        let result = AirPlay2Session::start_paired(cfg, rtsp, [0u8; 32], sockets);
+        let result = AirPlay2Session::start_paired(cfg, rtsp, [0u8; 32], sockets, BringUpEnv::real());
         assert!(matches!(result, Err(Ap2StartError::Other(_))), "the refused stream SETUP fails the bring-up");
 
         let (mut event_conn, _) = events.accept().unwrap();
@@ -2465,7 +2386,8 @@ mod tests {
             timing,
         };
         let rtsp = Ap2Rtsp::connect(ip, control_port, ip, Duration::from_secs(5)).unwrap();
-        let session = AirPlay2Session::start_paired(cfg, rtsp, [0u8; 32], sockets).unwrap_or_else(|e| panic!("{e:#}"));
+        let session =
+            AirPlay2Session::start_paired(cfg, rtsp, [0u8; 32], sockets, BringUpEnv::real()).unwrap_or_else(|e| panic!("{e:#}"));
         let (mut event_conn, _) = events.accept().unwrap();
         session.stop();
 
@@ -2479,6 +2401,153 @@ mod tests {
             .map(|l| l.split_whitespace().next().unwrap_or(""))
             .collect();
         assert_eq!(methods, ["SETUP", "SETUP", "RECORD", "TEARDOWN"], "{lines:?}");
+    }
+
+    /// One general-path session against a scripted receiver that advertises
+    /// `features`, brought up and stopped: the request lines and bodies the
+    /// receiver got. PTP runs on free ports, never 319/320.
+    fn scripted_general_session(
+        name: &str,
+        features: Option<u64>,
+        prefer_realtime: bool,
+        aac_encoder: fn() -> Result<()>,
+    ) -> Vec<(String, Vec<u8>)> {
+        use crate::airplay::test_peers::{read_request, reply};
+        use std::io::BufReader;
+        let free_udp = || UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (a, b, c, d) = (free_udp(), free_udp(), free_udp(), free_udp());
+        let port = |s: &UdpSocket| s.local_addr().unwrap().port();
+        let ptp_ports = PtpPorts { local_event: port(&a), local_general: port(&b), peer_event: port(&c), peer_general: port(&d) };
+        drop((a, b, c, d));
+
+        let events = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let event_port = events.local_addr().unwrap().port();
+        let buffered_data = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let buffered_port = buffered_data.local_addr().unwrap().port();
+        let media = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let media_port = media.local_addr().unwrap().port();
+        let control = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_port = control.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (sock, _) = control.accept().unwrap();
+            let mut r = BufReader::new(sock.try_clone().unwrap());
+            let mut w = sock;
+            let mut seen: Vec<(String, Vec<u8>)> = Vec::new();
+            let plist_body = |d: plist::Dictionary| {
+                let mut body = Vec::new();
+                plist::to_writer_binary(&mut body, &plist::Value::Dictionary(d)).unwrap();
+                body
+            };
+            while let Some((line, cseq, body)) = read_request(&mut r) {
+                let setups = seen.iter().filter(|(l, _)| l.starts_with("SETUP")).count();
+                let answer = match (line.starts_with("SETUP"), setups) {
+                    (true, 0) => {
+                        let mut d = plist::Dictionary::new();
+                        d.insert("eventPort".into(), plist::Value::Integer((event_port as u64).into()));
+                        plist_body(d)
+                    }
+                    (true, _) => {
+                        let buffered = stream_setup(&body).get("type").and_then(|v| v.as_unsigned_integer()) == Some(0x67);
+                        let data = if buffered { buffered_port } else { media_port };
+                        let mut s0 = plist::Dictionary::new();
+                        s0.insert("dataPort".into(), plist::Value::Integer((data as u64).into()));
+                        s0.insert("controlPort".into(), plist::Value::Integer((media_port as u64).into()));
+                        let mut d = plist::Dictionary::new();
+                        d.insert("streams".into(), plist::Value::Array(vec![plist::Value::Dictionary(s0)]));
+                        plist_body(d)
+                    }
+                    _ => Vec::new(),
+                };
+                reply(&mut w, cseq, "200 OK", &answer);
+                seen.push((line, body));
+            }
+            seen
+        });
+
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let renderer = AirPlayRenderer {
+            friendly_name: name.into(),
+            mac_id: "AA".into(),
+            ip,
+            port: control_port,
+            airplay_port: Some(control_port),
+            encryption_types: vec![0],
+            codecs: vec![0, 1],
+            password_protected: false,
+            encryption_key_required: false,
+            features,
+            pk: None,
+            model: None,
+            group: None,
+            pair: None,
+        };
+        let (_samples, samples_rx) = crossbeam_channel::unbounded();
+        let cfg = AirPlay2SessionConfig {
+            renderer,
+            local_ip: ip,
+            samples_rx,
+            initial_volume: None,
+            prefer_realtime,
+            latency_ms: 2000,
+            stored_pairing: None,
+            homepod_realtime: true,
+            homepod_latency_ms: 200,
+        };
+        let (audio, control, timing) = (bind_udp(ip).unwrap(), bind_udp(ip).unwrap(), bind_udp(ip).unwrap());
+        // The same reported ports in every run, so stream SETUPs compare.
+        let sockets = Ap2Sockets { control_port: 50_000, timing_port: 50_001, audio, control, timing };
+        let rtsp = Ap2Rtsp::connect(ip, control_port, ip, Duration::from_secs(5)).unwrap();
+        let env = BringUpEnv { ptp_ports, aac_encoder };
+        let session = AirPlay2Session::start_paired(cfg, rtsp, [0u8; 32], sockets, env).unwrap_or_else(|e| panic!("{e:#}"));
+        drop(events);
+        session.stop();
+        drop((buffered_data, media));
+        peer.join().unwrap()
+    }
+
+    /// `streams[0]` of a stream SETUP body.
+    fn stream_setup(body: &[u8]) -> plist::Dictionary {
+        let v = plist::Value::from_reader(std::io::Cursor::new(body)).unwrap();
+        let streams = v.as_dictionary().unwrap().get("streams").unwrap().as_array().unwrap();
+        streams[0].as_dictionary().unwrap().clone()
+    }
+
+    /// A receiver that takes the buffered stream gets the realtime one when
+    /// Windows' AAC encoder can't be made (a Windows N edition without the
+    /// Media Feature Pack): the same requests, and the same stream SETUP a
+    /// session sends when the person chose realtime. With the encoder, it
+    /// gets buffered AAC as before.
+    #[test]
+    fn without_the_aac_encoder_a_buffered_receiver_gets_the_realtime_stream() {
+        use crate::airplay::discovery::{FEAT_BUFFERED_AUDIO, FEAT_PTP};
+        let buffered_receiver = Some(FEAT_PTP | FEAT_BUFFERED_AUDIO);
+        let available: fn() -> Result<()> = || Ok(());
+        let unavailable: fn() -> Result<()> = || anyhow::bail!("Media Foundation is not installed on this PC");
+        let chosen = scripted_general_session("Realtime chosen test speaker", buffered_receiver, true, available);
+        let missing = scripted_general_session("No encoder test speaker", buffered_receiver, false, unavailable);
+        let with_aac = scripted_general_session("Encoder test speaker 2", buffered_receiver, false, available);
+
+        let methods = |seen: &[(String, Vec<u8>)]| -> Vec<String> {
+            seen.iter()
+                .filter(|(l, _)| !l.starts_with("POST /feedback"))
+                .map(|(l, _)| l.split_whitespace().next().unwrap_or("").to_string())
+                .collect()
+        };
+        assert_eq!(methods(&chosen), ["SETUP", "SETUP", "SETPEERS", "RECORD", "TEARDOWN"]);
+        assert_eq!(methods(&missing), methods(&chosen));
+        // The stream SETUP, apart from streamConnectionID: the connection's
+        // own random RTSP session id, different in any two sessions.
+        let stream = |seen: &[(String, Vec<u8>)]| {
+            let mut d = stream_setup(&seen[1].1);
+            d.remove("streamConnectionID");
+            d
+        };
+        assert_eq!(stream(&missing), stream(&chosen));
+        assert_eq!(stream(&chosen).get("type").and_then(|v| v.as_unsigned_integer()), Some(0x60));
+
+        let aac = stream(&with_aac);
+        let field = |k: &str| aac.get(k).and_then(|v| v.as_unsigned_integer());
+        assert_eq!((field("type"), field("ct"), field("spf"), field("audioFormat")), (Some(0x67), Some(4), Some(1024), Some(0x40_0000)));
     }
 
     #[test]
