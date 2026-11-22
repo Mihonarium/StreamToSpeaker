@@ -203,9 +203,10 @@ impl ActiveSession {
         }
     }
 
-    /// True if the session has died mid-stream (dropped receiver). UPnP
-    /// is HTTP-pull (the speaker reconnects on its own), so only the
-    /// AirPlay push paths report death here.
+    /// True if the session has died mid-stream (dropped receiver). Only
+    /// the push paths can tell: nothing watches whether a UPnP speaker
+    /// still fetches the stream, so a UPnP session is never reported dead
+    /// here, even when its speaker has stopped.
     pub fn is_dead(&self) -> bool {
         match self {
             ActiveSession::Upnp(_) => false,

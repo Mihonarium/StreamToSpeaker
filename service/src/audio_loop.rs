@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::app::App;
 use crate::audio_source::{AudioPacket, AudioSource, PACKET_FLAG_HINT_SILENT, PACKET_FLAG_STREAM_RESTART};
 use crate::equalizer::Equalizer;
-use crate::http_server::{samples_to_l16_be_bytes, PcmFrame};
+use crate::http_server::{samples_to_wav_le_bytes, PcmFrame};
 use crate::silence::SilenceDetector;
 use crate::{WIRE_CHANNELS, WIRE_SAMPLE_RATE};
 
@@ -159,7 +159,7 @@ pub fn run(app: Arc<App>, mut source: Box<dyn AudioSource>) -> Result<()> {
             }
         }
 
-        let bytes = samples_to_l16_be_bytes(&pkt.samples);
+        let bytes = samples_to_wav_le_bytes(&pkt.samples);
         app.hub.publish(PcmFrame(Arc::new(bytes)));
         app.packets_published_total.fetch_add(1, Ordering::Relaxed);
 

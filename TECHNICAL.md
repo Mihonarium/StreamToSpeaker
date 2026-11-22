@@ -335,9 +335,24 @@ StreamToSpeaker/
 
 ## Formats
 
-UPnP/OpenHome: L16 PCM, 44.1 kHz, stereo — wire MIME
-`audio/L16;rate=44100;channels=2`, wrapped in a 44-byte RIFF/WAVE header so
-Sonos accepts it as `audio/wav`. Lowest latency, broadest compatibility.
+UPnP: 16-bit PCM, 44.1 kHz, stereo, which the speaker fetches from this PC
+over HTTP as one endless stream (it declares a length of 4,294,967,294
+bytes). How the stream is labelled depends on the speaker
+(`service/src/stream_profile.rs`):
+
+- A Sonos (IKEA SYMFONISK included) gets a WAV stream, a 44-byte RIFF/WAVE
+  header and then little-endian samples, served as `audio/vnd.wave;codec=1`
+  at `/stream.raw` and announced as `audio/wav` in its DIDL-Lite metadata.
+  This is the original stream, and a Sonos is never offered another.
+- Any other renderer is first asked which types it plays (ConnectionManager
+  `GetProtocolInfo`). It is offered the same WAV as `audio/wav`,
+  `audio/x-wav` or `audio/wave` (at `/wav/stream.wav`, `/x-wav/stream.wav`,
+  `/wave/stream.wav`), raw big-endian samples without a header as
+  `audio/L16;rate=44100;channels=2` (RFC 2586, at `/l16/stream.raw`), or the
+  original stream: the one it played last time, else the first it lists,
+  else the original stream. If it refuses one, the next is offered, three at
+  most. Except on the original stream, a HEAD or GET of the stream answers
+  with the type its metadata names.
 
 AirPlay: ALAC for RAOP, and AAC-LC via Windows Media Foundation for AirPlay 2
 buffered audio.

@@ -2,7 +2,8 @@
 //!
 //! Actions:
 //!   * AVTransport: SetAVTransportURI, Play, Stop
-//!   * RenderingControl: SetVolume, SetMute, GetVolume, GetMute
+//!   * RenderingControl: SetVolume, SetMute, GetVolume
+//!   * ConnectionManager: GetProtocolInfo
 //!   * GroupRenderingControl (Sonos): SetGroupVolume, GetGroupVolume,
 //!     SetGroupMute — group-wide volume, addressed to the coordinator
 //!   * ZoneGroupTopology (Sonos): GetZoneGroupState
@@ -15,21 +16,7 @@ use crate::device_http::{self, HttpError, Limits, Version};
 use crate::stream_profile::{parse_protocol_list, ProtocolInfo, StreamProfile};
 use anyhow::{anyhow, Result};
 use log::debug;
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use std::time::Duration;
-
-/// Same as the UPnP examples in swyh-rs: percent-encode only what HTTP
-/// requires (we keep the SOAP envelope readable in logs).
-const URI_ENCODE_SET: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'<')
-    .add(b'>')
-    .add(b'`')
-    .add(b'#')
-    .add(b'?')
-    .add(b'{')
-    .add(b'}');
 
 /// Issue SetAVTransportURI to point the renderer at our HTTP stream URL.
 pub fn set_av_transport_uri(
@@ -133,22 +120,6 @@ pub fn get_volume(control_url: &str) -> Result<u32> {
     // Parse out <CurrentVolume>NN</CurrentVolume>.
     extract_int_tag(&resp, "CurrentVolume")
         .ok_or_else(|| anyhow!("CurrentVolume missing in response"))
-}
-
-pub fn get_mute(control_url: &str) -> Result<bool> {
-    let body = r#"<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-<s:Body>
-<u:GetMute xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">
-<InstanceID>0</InstanceID>
-<Channel>Master</Channel>
-</u:GetMute>
-</s:Body>
-</s:Envelope>"#;
-    let resp = soap_post(control_url, RENDERING_CONTROL, "GetMute", body, &SHORT)?;
-    let n = extract_int_tag(&resp, "CurrentMute")
-        .ok_or_else(|| anyhow!("CurrentMute missing"))?;
-    Ok(n != 0)
 }
 
 /// Set the Sonos group volume (0..=100) via GroupRenderingControl on the
@@ -274,11 +245,6 @@ pub fn didl_lite_metadata(stream_uri: &str, title: &str, initial_buffer_ms: u32,
         info = xml_escape(&profile.protocol_info()),
         uri = xml_escape(stream_uri),
     )
-}
-
-/// Encode our http://host:port/stream.raw URI for inclusion inside SOAP.
-pub fn encode_stream_uri(stream_uri: &str) -> String {
-    utf8_percent_encode(stream_uri, URI_ENCODE_SET).to_string()
 }
 
 // -----------------------------------------------------------------------------

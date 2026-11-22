@@ -332,10 +332,6 @@ impl DiscoveryState {
         self.memory.clear();
     }
 
-    pub fn first(&self) -> Option<Renderer> {
-        self.inner.lock().unwrap().first().cloned()
-    }
-
     /// Match by stable id (UDN if available, otherwise IP literal).
     /// Used by the `/api/select` HTTP endpoint.
     /// A UDN claimed by several different devices (see
@@ -356,8 +352,6 @@ impl DiscoveryState {
 }
 
 impl Renderer {
-    /// Stable identifier suitable for `find_by_id`. UDN if the device
-    /// advertises one, IP literal as fallback.
     /// Every address this renderer is known to use, for the privacy
     /// gate: the control-plane IP and all addresses its LOCATION host
     /// resolves to.
@@ -376,6 +370,8 @@ impl Renderer {
         self.zone_group_topology_control_url.is_some()
     }
 
+    /// Stable identifier suitable for `find_by_id`. UDN if the device
+    /// advertises one, IP literal as fallback.
     pub fn stable_id(&self) -> String {
         match &self.udn {
             Some(udn) if !self.udn_conflict => udn.clone(),

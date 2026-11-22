@@ -35,7 +35,7 @@ use crate::gena::{self, NotifyAdmission};
 use crate::stream_gate::{canonical_ip, Refusal};
 use crate::stream_profile::StreamProfile;
 use crate::web_access::{redact_target, WebAccess, LINK_PREFIX};
-use crate::{WIRE_BYTES_PER_FRAME, WIRE_CHANNELS, WIRE_SAMPLE_RATE};
+use crate::{WIRE_CHANNELS, WIRE_SAMPLE_RATE};
 
 /// Callback invoked from the GENA NOTIFY route with the request path and
 /// the raw XML body. Only called for NOTIFYs that match a live
@@ -1907,10 +1907,9 @@ fn html_escape(s: &str) -> String {
 /// on, speaker switched) is cut within this long.
 const GATE_RECHECK: Duration = Duration::from_secs(1);
 
-/// `Read` adapter that pulls PCM frames from a crossbeam Receiver. Blocks
-/// up to a few seconds for a frame; if nothing arrives it returns EOF
-/// (closing the stream), which is the cleanest way to signal the client we
-/// have nothing to send.
+/// `Read` adapter that pulls PCM frames from a crossbeam Receiver. Waits
+/// up to 30 s for a frame; if none arrives it returns EOF, which closes
+/// the stream.
 struct StreamReader {
     rx: Receiver<PcmFrame>,
     /// Bytes not yet returned from the last received frame.
@@ -2017,34 +2016,16 @@ impl Read for StreamReader {
     }
 }
 
-/// Convert a Vec<i16> sample buffer to PCM bytes.
-///
-/// We stream WAV (RIFF/WAVE) which uses **little-endian** samples — the
-/// same byte order as Windows i16 internally, so this is effectively a
-/// memcpy reinterpret. We keep the name "_l16_be_bytes" for ABI stability
-/// with main.rs but the impl is little-endian. Renderers receiving the
-/// WAV header (audio/vnd.wave;codec=1, fmt=PCM) decode accordingly.
-///
-/// If we ever support raw L16 over HTTP again (RFC 3551 big-endian, no
-/// WAV header), add a separate helper.
-pub fn samples_to_l16_be_bytes(samples: &[i16]) -> Vec<u8> {
+/// Samples as WAV data: 16-bit little-endian, the byte order of a RIFF
+/// file and of Windows' own `i16`. What the hub carries; the L16 profile
+/// swaps each sample to network byte order as it serves it.
+pub fn samples_to_wav_le_bytes(samples: &[i16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() * 2);
     for s in samples {
-        let b = s.to_le_bytes();
-        out.push(b[0]);
-        out.push(b[1]);
+        out.extend_from_slice(&s.to_le_bytes());
     }
     out
 }
-
-/// Suggested bytes-per-second on the wire, for buffer-sizing math.
-pub fn wire_bytes_per_second() -> usize {
-    (WIRE_SAMPLE_RATE as usize) * WIRE_BYTES_PER_FRAME
-}
-
-/// Just a const stash so users can confirm channel count without importing
-/// from lib.rs directly.
-pub const WIRE_CHANNELS_PUBLIC: u16 = WIRE_CHANNELS;
 
 #[cfg(test)]
 mod tests {
@@ -2535,6 +2516,11 @@ mod tests {
             }
         });
         stop
+    }
+
+    #[test]
+    fn samples_become_little_endian_wav_data() {
+        assert_eq!(samples_to_wav_le_bytes(&[0x0102, -2, 0]), [0x02, 0x01, 0xFE, 0xFF, 0, 0]);
     }
 
     #[test]
