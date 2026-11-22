@@ -295,17 +295,26 @@ impl AirPlayRenderer {
     }
 
     /// True if this device exposes a usable **legacy RAOP** path: a RAOP
-    /// port, UDP transport, ALAC, and either no encryption or Apple-RSA
-    /// (i.e. not a FairPlay-only `et`). As the reference senders do, a
-    /// receiver that announces no codec list is taken to play ALAC (every
-    /// RAOP receiver does; OwnTone never reads `cn`), and one that
-    /// announces no `et` to take plaintext (OwnTone streams plaintext to
-    /// it). What rules a receiver out is a `tp` without UDP (OwnTone
-    /// discards those): we have no TCP transport. Password-protected
-    /// (`pw=true`) receivers are supported — we speak RTSP Digest auth.
+    /// port, ALAC, and either no encryption or Apple-RSA (i.e. not a
+    /// FairPlay-only `et`). Password-protected (`pw=true`) receivers are
+    /// supported — we speak RTSP Digest auth.
+    ///
+    /// A receiver that also has an AirPlay 2 path is judged by the rule it
+    /// has always been routed by: its record must list ALAC (`cn` 1) and
+    /// plaintext or RSA (`et` 0 or 1), else it plays over AirPlay 2 only.
+    /// For one without, the record is read as the reference senders read
+    /// it: no codec list means ALAC (every RAOP receiver plays it; OwnTone
+    /// never reads `cn`), no `et`, or `et` with 4 but neither 0 nor 1,
+    /// means plaintext (see [`Self::raop_encryption_types`]), and a `tp`
+    /// that names transports without UDP rules it out (OwnTone discards
+    /// those; we have no TCP transport).
     pub fn supports_legacy_raop(&self) -> bool {
         if self.port == 0 {
             return false;
+        }
+        if self.supports_airplay2() {
+            let et = &self.encryption_types;
+            return self.codecs.contains(&1) && (et.contains(&0) || et.contains(&1));
         }
         if let Some(tp) = &self.raop.transports {
             if !tp.iter().any(|t| t.eq_ignore_ascii_case("UDP")) {

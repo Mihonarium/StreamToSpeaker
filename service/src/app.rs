@@ -5133,6 +5133,32 @@ mod tests {
         assert!(app.is_password_protected(&id));
     }
 
+    /// A receiver with an AirPlay 2 path whose AirPlay 1 record the app
+    /// always took for unsupported (`et` with 4 but not 0 or 1, no `cn`,
+    /// no `et`) is still played over AirPlay 2 only, as before: the
+    /// lenient readings of those records are for receivers without
+    /// AirPlay 2.
+    #[test]
+    fn airplay_2_receivers_keep_their_routing() {
+        let (app, _discovery) = airplay_test_app();
+        let ap2 = |et: Vec<u8>, cn: Vec<u8>| {
+            let mut r = crate::airplay::raop_transcripts::receiver_at(ip("192.168.1.5"), 5000, "0D0000000010", &et);
+            r.codecs = cn;
+            r.features = Some(crate::airplay::discovery::FEAT_AUDIO | crate::airplay::discovery::FEAT_TRANSIENT_PAIRING);
+            r.airplay_port = Some(7000);
+            r
+        };
+        for (et, cn) in [(vec![4], vec![0, 1]), (vec![4, 5], vec![0, 1]), (vec![0, 4], vec![]), (vec![], vec![0, 1])] {
+            let r = ap2(et.clone(), cn.clone());
+            let attempts: Vec<Transport> = app.airplay_attempts(&r, None).into_iter().map(|(t, _)| t).collect();
+            assert_eq!(attempts, [Transport::AirPlay2], "et {et:?} cn {cn:?}");
+        }
+        // A record the app has always played keeps its AirPlay 1 attempt
+        // first.
+        let attempts: Vec<Transport> = app.airplay_attempts(&ap2(vec![0, 4], vec![0, 1]), None).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(attempts, [Transport::RaopLegacy, Transport::AirPlay2]);
+    }
+
     /// Nothing automatic connects to a newcomer (the drop reconnect and
     /// "connect always" come through here without a person's choice).
     #[test]

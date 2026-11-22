@@ -21,11 +21,16 @@ use crate::airplay::session::{AirPlaySession, AirPlaySessionConfig, RaopTimeouts
 
 /// A receiver record pointing at `rx`.
 pub(crate) fn receiver(rx: &FakeRaop, mac: &str, et: &[u8]) -> AirPlayRenderer {
+    receiver_at("127.0.0.1".parse().unwrap(), rx.port(), mac, et)
+}
+
+/// A receiver record at `ip`:`port`.
+pub(crate) fn receiver_at(ip: IpAddr, port: u16, mac: &str, et: &[u8]) -> AirPlayRenderer {
     AirPlayRenderer {
         friendly_name: "Test Speaker".into(),
         mac_id: mac.into(),
-        ip: "127.0.0.1".parse().unwrap(),
-        port: rx.port(),
+        ip,
+        port,
         airplay_port: None,
         encryption_types: et.to_vec(),
         codecs: vec![0, 1],
