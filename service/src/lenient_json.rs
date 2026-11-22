@@ -22,14 +22,36 @@ pub type KeyPath = Vec<String>;
 
 /// Values hidden one by one before a parse gives up on the details and
 /// hides the top-level setting a failure is in: bounds the work on a file
-/// full of values this version can't read.
-const FINE_REMOVALS: usize = 64;
+/// full of values this version can't read. Each hidden value costs a parse
+/// of the whole tree, so the bound is [`PARSE_BUDGET`] nodes in all, and
+/// never fewer than [`FINE_REMOVALS_MIN`] values.
+const FINE_REMOVALS_MIN: usize = 64;
+
+/// Nodes all the parses of one load may visit together, before the bound
+/// above sets in: a few tens of milliseconds.
+const PARSE_BUDGET: usize = 4_000_000;
+
+/// The number of values (of any kind) in `tree`.
+fn count_nodes(tree: &Value) -> usize {
+    let mut stack = vec![tree];
+    let mut count = 0usize;
+    while let Some(node) = stack.pop() {
+        count = count.saturating_add(1);
+        match node {
+            Value::Object(map) => stack.extend(map.values()),
+            Value::Array(items) => stack.extend(items.iter()),
+            _ => {}
+        }
+    }
+    count
+}
 
 /// `T` from `tree`, and the paths of the values left out to get it, in the
 /// order they were found (a value left out inside one that was left out
 /// as well is not listed). `Err` when `T` can't be read even with every
 /// value left out (the tree isn't an object, for a struct).
 pub fn from_value<T: DeserializeOwned>(tree: &Value) -> Result<(T, Vec<KeyPath>), String> {
+    let fine_removals = (PARSE_BUDGET / count_nodes(tree).max(1)).max(FINE_REMOVALS_MIN);
     let mut hidden: HashSet<KeyPath> = HashSet::new();
     let mut found: Vec<KeyPath> = Vec::new();
     loop {
@@ -46,7 +68,7 @@ pub fn from_value<T: DeserializeOwned>(tree: &Value) -> Result<(T, Vec<KeyPath>)
             Err(e) => e,
         };
         let mut path = ctx.failure.into_inner().unwrap_or_default();
-        if found.len() >= FINE_REMOVALS {
+        if found.len() >= fine_removals {
             path.truncate(1);
         }
         if path.is_empty() || !hidden.insert(path.clone()) {
@@ -400,6 +422,15 @@ mod tests {
         // The entries left out one by one are inside the list left out
         // as a whole: only the list is listed.
         assert_eq!(removed, [path(&["entries"])]);
+    }
+
+    #[test]
+    fn hundreds_of_entries_with_one_bad_value_each_keep_the_rest() {
+        let entries: Vec<Value> = (0..300).map(|i| json!({"host": format!("h{i}"), "port": 70000})).collect();
+        let (o, removed) = from_value::<Outer>(&json!({"entries": entries})).unwrap();
+        assert_eq!(o.entries.len(), 300);
+        assert!(o.entries.iter().all(|e| e.port == 0));
+        assert_eq!(removed.len(), 300);
     }
 
     #[test]
