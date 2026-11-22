@@ -125,35 +125,49 @@ pub struct SourceService {
     shared: Arc<Shared>,
     mdns_fullname: Option<String>,
     port: u16,
+    /// Why it doesn't listen on the port it was asked for, if it doesn't.
+    refused: Option<PortRefusal>,
 }
 
-/// How long [`SourceService::start`] keeps trying the port it was asked
-/// for while another listener still holds it (one that is closing: the
-/// previous run of the app, say).
-const PORT_WAIT: Duration = Duration::from_millis(250);
+/// A listener on `port`; when that port can't be bound, one on a port the
+/// system picks, so the input keeps working for a Music Assistant that
+/// finds it through mDNS, and why `port` couldn't be had. No wait: `stop`
+/// gives the port back before it returns, so a port that is taken now is
+/// another program's.
+fn bind_listener(port: u16) -> std::io::Result<(TcpListener, Option<PortRefusal>)> {
+    bind_listener_with(port, &|p| TcpListener::bind(("0.0.0.0", p)))
+}
 
-/// A listener on `port`, waiting up to [`PORT_WAIT`] while the port is in
-/// use; when it stays in use (another program holds it), a listener on a
-/// port the system picks, so the input keeps working for a Music
-/// Assistant that finds it through mDNS.
-fn bind_listener(port: u16) -> std::io::Result<TcpListener> {
-    let deadline = Instant::now() + PORT_WAIT;
-    loop {
-        match TcpListener::bind(("0.0.0.0", port)) {
-            Ok(listener) => return Ok(listener),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(e) if port != 0 => {
-                warn!(
-                    "Sendspin source: port {port} isn't available ({e}); listening on another port, \
-                     which Music Assistant finds on this network but can't be given by address"
-                );
-                return TcpListener::bind(("0.0.0.0", 0));
-            }
-            Err(e) => return Err(e),
+fn bind_listener_with(
+    port: u16,
+    bind: &dyn Fn(u16) -> std::io::Result<TcpListener>,
+) -> std::io::Result<(TcpListener, Option<PortRefusal>)> {
+    match bind(port) {
+        Ok(listener) => Ok((listener, None)),
+        Err(e) if port != 0 => {
+            warn!(
+                "Sendspin source: port {port} isn't available ({e}); listening on another port, \
+                 which Music Assistant finds on this network but can't be given by address"
+            );
+            let why = if e.kind() == std::io::ErrorKind::AddrInUse {
+                PortRefusal::InUse
+            } else {
+                PortRefusal::Unavailable(e.to_string())
+            };
+            Ok((bind(0)?, Some(why)))
         }
+        Err(e) => Err(e),
     }
+}
+
+/// Why the input doesn't listen on the port it was asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PortRefusal {
+    /// Another program listens on it.
+    InUse,
+    /// Binding it failed otherwise (Windows reserves port ranges for
+    /// Hyper-V and the like, say); the system's words.
+    Unavailable(String),
 }
 
 impl SourceService {
@@ -165,7 +179,7 @@ impl SourceService {
             let (_, b) = c.ensure_pairing_psk();
             a || b
         });
-        let listener = bind_listener(opts.port).context("binding the Sendspin source listener")?;
+        let (listener, refused) = bind_listener(opts.port).context("binding the Sendspin source listener")?;
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
@@ -199,6 +213,7 @@ impl SourceService {
             shared,
             mdns_fullname,
             port,
+            refused,
         })
     }
 
@@ -211,6 +226,12 @@ impl SourceService {
     /// The port it was asked to listen on.
     pub fn wanted_port(&self) -> u16 {
         self.shared.opts.port
+    }
+
+    /// Why it doesn't listen on [`wanted_port`](Self::wanted_port), if it
+    /// doesn't.
+    pub fn port_refusal(&self) -> Option<PortRefusal> {
+        self.refused.clone()
     }
 
     pub fn state(&self) -> SourceState {
@@ -1328,20 +1349,26 @@ mod tests {
         assert_ne!(svc.port(), port, "listens elsewhere");
         // And works there.
         TcpStream::connect(("127.0.0.1", svc.port())).unwrap();
+        assert_eq!(svc.port_refusal(), Some(PortRefusal::InUse));
         svc.stop();
-        // A port that is only briefly taken is waited for.
-        let brief = TcpListener::bind(("0.0.0.0", 0)).unwrap();
-        let port = brief.local_addr().unwrap().port();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let starter = std::thread::spawn(move || {
-            tx.send(()).unwrap();
-            start_on(port).port()
-        });
-        rx.recv().unwrap();
-        drop(brief);
-        // Whether the start ran before or after the drop, it ends on the
-        // port it wanted: the wait (250 ms) covers the drop.
-        assert_eq!(starter.join().unwrap(), port);
+    }
+
+    #[test]
+    fn a_port_that_cannot_be_bound_for_another_reason_is_told_as_such() {
+        // Windows refuses a port inside a range it reserved (os error 10013).
+        let refuse = |p: u16| {
+            if p == 8928 {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "reserved"))
+            } else {
+                TcpListener::bind(("127.0.0.1", p))
+            }
+        };
+        let (listener, why) = bind_listener_with(8928, &refuse).unwrap();
+        assert_ne!(listener.local_addr().unwrap().port(), 8928);
+        assert_eq!(why, Some(PortRefusal::Unavailable("reserved".into())));
+        // A port that binds: no reason.
+        let (_, why) = bind_listener_with(0, &refuse).unwrap();
+        assert_eq!(why, None);
     }
 
     #[test]
