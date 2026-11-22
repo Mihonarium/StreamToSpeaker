@@ -2166,8 +2166,9 @@ impl App {
     /// nobody could answer a PIN prompt).
     pub fn select_speaker(self: &Arc<Self>, id: &str) -> Result<(), String> {
         // A receiver announcing another speaker's identity plays only when
-        // a person picks it in the window, never from the web API (which
-        // scripts drive too), the tray or a reconnect.
+        // a person picks it in the window, never through this entry: the
+        // web API (which scripts can drive), the launch connect, a resync
+        // (which leaves the session playing) or Enable.
         if self.is_airplay_newcomer(id) {
             // Its name says what it is ("<speaker> — another receiver with
             // the same ID: …").
@@ -5176,9 +5177,9 @@ mod tests {
         assert!(err.starts_with("Not connecting to ") && err.contains("same identity as another speaker"), "{err}");
     }
 
-    /// The web API (and the other callers of `select_speaker`: the tray,
-    /// a resync, Enable) refuses a newcomer; the window's pick is the only
-    /// way to play to it.
+    /// The web API (and the other callers of `select_speaker`: the launch
+    /// connect, a resync, Enable) refuses a newcomer; the window's pick is
+    /// the only way to play to it.
     #[test]
     fn the_web_api_refuses_a_newcomer() {
         let (app, _discovery) = airplay_test_app_with(conflict_discovery());
