@@ -104,6 +104,22 @@ impl std::error::Error for RtspError {}
 /// of it goes to connecting and half to the reply.
 pub const TEARDOWN_LIMIT: Duration = Duration::from_secs(2);
 
+/// See [`RtspClient::abandon_handle`].
+pub struct AbandonHandle {
+    stream: TcpStream,
+    abandoned: Arc<AtomicBool>,
+}
+
+impl AbandonHandle {
+    /// Shut the connection down, so a request waiting on it fails at
+    /// once. The client then counts the connection as broken here, and
+    /// its TEARDOWN goes on a new connection.
+    pub fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
+
 /// The state of the control connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Link {
@@ -260,6 +276,11 @@ impl RtspClient {
     /// True while the connection can carry another request.
     pub fn is_usable(&self) -> bool {
         self.link == Link::InStep
+    }
+
+    /// A handle that can cut a stalled request short from another thread.
+    pub fn abandon_handle(&self) -> std::io::Result<AbandonHandle> {
+        Ok(AbandonHandle { stream: self.stream.try_clone()?, abandoned: self.abandoned.clone() })
     }
 
     /// Compute the `Authorization: Digest …` value for one request, if we
@@ -641,6 +662,10 @@ impl RtspClient {
             return;
         }
         self.torn_down = true;
+        if self.abandoned.load(Ordering::Acquire) && self.link == Link::InStep {
+            // Shut down by an abandon handle between two requests.
+            self.link = Link::Broken;
+        }
         if self.announced {
             match self.link {
                 Link::InStep => {

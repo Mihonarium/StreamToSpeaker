@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::airplay::discovery::{AirPlayRenderer, FEAT_AUDIO, FEAT_TRANSIENT_PAIRING};
 use crate::airplay::fake_raop::{Answer, Event, FakeRaop, Reply, Request};
-use crate::airplay::session::{AirPlaySession, AirPlaySessionConfig};
+use crate::airplay::session::{AirPlaySession, AirPlaySessionConfig, RaopTimeouts};
 
 /// A receiver record pointing at `rx`.
 pub(crate) fn receiver(rx: &FakeRaop, mac: &str, et: &[u8]) -> AirPlayRenderer {
@@ -46,7 +46,7 @@ pub(crate) fn config(renderer: AirPlayRenderer, samples: crossbeam_channel::Rece
         local_ip: "127.0.0.1".parse::<IpAddr>().unwrap(),
         samples_rx: samples,
         initial_volume: Some(80),
-        connect_timeout: Duration::from_secs(3),
+        timeouts: RaopTimeouts::STANDARD,
         mfi_encryption: false,
         uncompressed_alac: false,
         password: None,
@@ -603,7 +603,7 @@ fn mfi_encryption_experiment() {
 /// A receiver that also offers AirPlay 2 and never answers the opener
 /// (a Sonos whose AirPlay 1 service is vestigial) is given up on after
 /// the opener's short time limit, with nothing else sent, so the app can
-/// move on to AirPlay 2.
+/// move on to AirPlay 2. The app's limit for it is 3 s.
 #[test]
 fn receiver_that_never_answers_the_opener_is_given_up_quickly() {
     let rx = FakeRaop::start(|_| Answer::Ignore);
@@ -612,14 +612,17 @@ fn receiver_that_never_answers_the_opener_is_given_up_quickly() {
     r.features = Some(FEAT_AUDIO | FEAT_TRANSIENT_PAIRING);
     r.airplay_port = Some(7000);
     let mut cfg = config(r, srx);
+    // The opener's own limit applies, not the longer one of later
+    // requests.
     let limit = Duration::from_millis(300);
-    cfg.connect_timeout = limit;
+    cfg.timeouts = RaopTimeouts { opener: limit, reply: Duration::from_secs(60), ..RaopTimeouts::STANDARD };
     let started = Instant::now();
     assert!(AirPlaySession::start(cfg).is_err());
     let took = started.elapsed();
     assert!(took >= limit && took < limit * 10, "{:?}", took);
     assert_eq!(rx.lines(), ["0 POST /auth-setup"]);
     assert!(rx.wait_until(Duration::from_secs(10), |ev| ev.iter().any(|e| matches!(e, Event::Closed { conn: 0, .. }))));
+    assert_eq!(RaopTimeouts::STANDARD.opener, Duration::from_secs(3));
 }
 
 const KEEPALIVE_METADATA_VOLUME: &str = r#"--- connection 0

@@ -2669,20 +2669,24 @@ impl App {
                         uc.airplay_latency_ms_for(&renderer.stable_id()),
                     )
                 };
-                let session = AirPlaySession::start(AirPlaySessionConfig {
-                    renderer,
-                    local_ip,
-                    samples_rx,
-                    initial_volume: Some(self.airplay_start_volume()),
-                    // Short — RAOP OPTIONS is a sub-100 ms LAN round-trip, so
-                    // a dead/vestigial RAOP service (Sonos) fails fast and we
-                    // move on to AirPlay 2.
-                    connect_timeout: Duration::from_secs(3),
-                    mfi_encryption,
-                    uncompressed_alac,
-                    password,
-                    latency_ms,
-                })
+                // A connect that takes long says what it waits for, in
+                // the notice the connecting banner clears when it ends.
+                let name = renderer.friendly_name.clone();
+                let notice = |detail: &str| self.record_error(format!("{}{} — {}", STILL_CONNECTING_PREFIX, name, detail));
+                let session = AirPlaySession::start_with_notices(
+                    AirPlaySessionConfig {
+                        renderer,
+                        local_ip,
+                        samples_rx,
+                        initial_volume: Some(self.airplay_start_volume()),
+                        timeouts: crate::airplay::session::RaopTimeouts::STANDARD,
+                        mfi_encryption,
+                        uncompressed_alac,
+                        password,
+                        latency_ms,
+                    },
+                    &notice,
+                )
                 .map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
                 Ok(ActiveSession::AirPlay(session))
             }
