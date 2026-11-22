@@ -124,6 +124,23 @@ impl std::fmt::Display for RtspError {
 
 impl std::error::Error for RtspError {}
 
+/// The receiver answered 453 (Not Enough Bandwidth): it is busy.
+/// shairport-sync answers ANNOUNCE so when another connection holds its
+/// play lock (`rtsp.c`, `handle_announce`); other receivers are reported
+/// to use it the same way.
+#[derive(Debug)]
+pub struct ReceiverBusy {
+    pub request: &'static str,
+}
+
+impl std::fmt::Display for ReceiverBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} was answered 453 Not Enough Bandwidth: the receiver is busy", self.request)
+    }
+}
+
+impl std::error::Error for ReceiverBusy {}
+
 /// What a TEARDOWN may add to ending a session: on the session's own
 /// connection the reply is awaited this long; on a new connection, half
 /// of it goes to connecting and half to the reply.
@@ -499,6 +516,9 @@ impl RtspClient {
             let _ = self.auth_setup().context("auth-setup after ANNOUNCE 403")?;
             resp = self.request("ANNOUNCE", &uri, &extra, &sdp)?;
         }
+        if resp.status_code == 453 {
+            return Err(ReceiverBusy { request: "ANNOUNCE" }.into());
+        }
         if resp.status_code != 200 {
             bail!("ANNOUNCE failed: {} {}", resp.status_code, resp.status_text);
         }
@@ -564,6 +584,9 @@ impl RtspClient {
         );
         let extra = vec![("Transport".to_string(), transport)];
         let resp = self.request("SETUP", &uri, &extra, "")?;
+        if resp.status_code == 453 {
+            return Err(ReceiverBusy { request: "SETUP" }.into());
+        }
         if resp.status_code != 200 {
             bail!("SETUP failed: {} {}", resp.status_code, resp.status_text);
         }

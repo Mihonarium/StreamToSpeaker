@@ -20,7 +20,7 @@ use crate::airplay::rtp::{
     bind_udp, random_initial_rtptime, random_initial_seq, random_ssrc, spawn_audio_sender,
     RtpSenderConfig,
 };
-use crate::airplay::rtsp::{AbandonHandle, RtspClient, RtspError, ServerPorts, TEARDOWN_LIMIT};
+use crate::airplay::rtsp::{AbandonHandle, ReceiverBusy, RtspClient, RtspError, ServerPorts, TEARDOWN_LIMIT};
 use crate::airplay::timing::{
     sleep_unless_stopped, spawn_resend_responder, spawn_sync_sender, spawn_timing_responder,
     ResendBuffer,
@@ -116,6 +116,11 @@ pub struct RaopTimeouts {
     /// Between an attempt that failed and the next one on another
     /// connection, so the receiver has let go of the first.
     pub retry_pause: Duration,
+    /// Before the one retry a busy receiver (453) gets, when the session
+    /// it is busy with is likely this app's own (see
+    /// [`left_session_recently`]). OwnTone reconnects a lost speaker after
+    /// 5 s (`PLAYER_SPEAKER_RESURRECT_TIME`).
+    pub busy_retry: Duration,
 }
 
 impl RaopTimeouts {
@@ -124,7 +129,56 @@ impl RaopTimeouts {
         reply: Duration::from_secs(15),
         teardown: TEARDOWN_LIMIT,
         retry_pause: Duration::from_secs(2),
+        busy_retry: Duration::from_secs(5),
     };
+}
+
+/// The receiver refused the connect with 453 and stayed busy. Its
+/// message is the one the person reads.
+#[derive(Debug)]
+pub struct Busy {
+    pub name: String,
+}
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{name} is busy. Another device may be playing to it, or it hasn't let go of this PC's last \
+             connection yet. Try again in a minute; if it stays busy, restart {name}.",
+            name = self.name
+        )
+    }
+}
+
+impl std::error::Error for Busy {}
+
+/// How long after this app left a session on a receiver a 453 from it is
+/// taken to be about that session.
+const OWN_SESSION_WINDOW: Duration = Duration::from_secs(60);
+
+/// When this app last left a session on each receiver (by stable id): a
+/// session that stopped, or an attempt whose ANNOUNCE was accepted and
+/// that then failed. A receiver that answers 453 soon after may still be
+/// holding it.
+fn left_sessions() -> &'static Mutex<std::collections::HashMap<String, Instant>> {
+    static LEFT: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    LEFT.get_or_init(Default::default)
+}
+
+fn note_left_session(id: &str) {
+    let mut left = left_sessions().lock().unwrap_or_else(|e| e.into_inner());
+    left.retain(|_, at| at.elapsed() < OWN_SESSION_WINDOW);
+    left.insert(id.to_string(), Instant::now());
+}
+
+/// Did this app leave a session on receiver `id` within the last minute?
+fn left_session_recently(id: &str) -> bool {
+    left_sessions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .is_some_and(|at| at.elapsed() < OWN_SESSION_WINDOW)
 }
 
 /// How an attempt opens the RTSP conversation.
@@ -200,6 +254,17 @@ enum Stage {
     /// Waiting at most `limit` for the receiver (a TCP connect or a
     /// reply).
     Waiting { limit: Duration },
+    /// Pausing `limit` before another attempt.
+    Pausing { why: Pause, limit: Duration },
+}
+
+/// Why a connect pauses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pause {
+    /// An attempt failed; the next one opens another way.
+    AnotherWay,
+    /// The receiver is busy; one retry follows.
+    Busy,
 }
 
 /// The stage of a connect in progress, shared with the thread that
@@ -229,6 +294,13 @@ impl Progress {
         out
     }
 
+    /// Pause `limit` before another attempt.
+    fn pause(&self, why: Pause, limit: Duration) {
+        self.set(Stage::Pausing { why, limit });
+        std::thread::sleep(limit);
+        self.set(Stage::Working);
+    }
+
     fn finish(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).2 = true;
         self.changed.notify_all();
@@ -246,20 +318,29 @@ impl Progress {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while !st.2 {
             let now = Instant::now();
-            if let (Stage::Waiting { limit }, since) = (st.0, st.1) {
-                let waited = now.saturating_duration_since(since);
-                if now >= started + slow_connect && waited >= slow_reply && reported != Some(since) {
-                    reported = Some(since);
-                    let left = limit.saturating_sub(waited).as_secs_f32().ceil() as u64;
-                    let line = match left {
-                        0 | 1 => "it hasn't answered yet; waiting a moment longer.".to_string(),
-                        n => format!("it hasn't answered yet; waiting up to {} more seconds.", n),
-                    };
-                    drop(st);
-                    notice(&line);
-                    st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    continue;
+            let (stage, since) = (st.0, st.1);
+            let waited = now.saturating_duration_since(since);
+            let left = |limit: Duration| limit.saturating_sub(waited).as_secs_f32().ceil() as u64;
+            let line = match stage {
+                Stage::Waiting { limit } if waited >= slow_reply => Some(match left(limit) {
+                    0 | 1 => "it hasn't answered yet; waiting a moment longer.".to_string(),
+                    n => format!("it hasn't answered yet; waiting up to {} more seconds.", n),
+                }),
+                Stage::Pausing { why: Pause::AnotherWay, .. } => {
+                    Some("the first try didn't work; trying once more another way.".to_string())
                 }
+                Stage::Pausing { why: Pause::Busy, limit } => Some(match left(limit) {
+                    0 | 1 => "it is busy; trying once more.".to_string(),
+                    n => format!("it is busy; trying once more in {} seconds.", n),
+                }),
+                _ => None,
+            };
+            if let Some(line) = line.filter(|_| now >= started + slow_connect && reported != Some(since)) {
+                reported = Some(since);
+                drop(st);
+                notice(&line);
+                st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                continue;
             }
             st = self.changed.wait_timeout(st, Duration::from_millis(250)).unwrap_or_else(|e| e.into_inner()).0;
         }
@@ -462,6 +543,8 @@ impl AirPlaySession {
         // threads once adopted.
         let mut failed: Vec<String> = Vec::new();
         let mut handshake = None;
+        let id = cfg.renderer.stable_id();
+        let name = &cfg.renderer.friendly_name;
         if try_mfi_first {
             match bringup.attempt(How::Mfi) {
                 Ok(h) => handshake = Some(h),
@@ -469,27 +552,38 @@ impl AirPlaySession {
                     warn!(
                         "AirPlay: et=4 MFi handshake to {} failed ({:#}); \
                          retrying with plaintext/RSA",
-                        cfg.renderer.friendly_name, f.error
+                        name, f.error
                     );
                     failed.push(format!("MFi encryption: {:#}", f.error));
+                    if f.announced {
+                        // It got past ANNOUNCE and was torn down: give the
+                        // receiver a moment to let go of it.
+                        progress.pause(Pause::AnotherWay, timeouts.retry_pause);
+                    }
                 }
             }
         }
         if handshake.is_none() {
             let plan = opener_plan(&cfg.renderer, cfg.opener_hint);
-            for (i, &opener) in plan.iter().enumerate() {
-                if i > 0 {
-                    info!(
-                        "AirPlay: trying {} again, opening with {}",
-                        cfg.renderer.friendly_name,
-                        opener.describe()
-                    );
-                    progress.waiting(timeouts.retry_pause, || std::thread::sleep(timeouts.retry_pause));
-                }
+            let mut next = 0;
+            let mut busy_retried = false;
+            while let Some(&opener) = plan.get(next) {
                 match bringup.attempt(How::Plain(opener)) {
                     Ok(h) => {
                         handshake = Some(h);
                         break;
+                    }
+                    Err(f) if f.busy => {
+                        // Busy isn't about how the connect opens: another
+                        // opener won't help. One delayed retry, only when the
+                        // session it is busy with is likely this app's own.
+                        warn!("AirPlay: {} is busy ({:#})", name, f.error);
+                        if busy_retried || !left_session_recently(&id) {
+                            return Err(anyhow::Error::new(Busy { name: name.clone() }));
+                        }
+                        busy_retried = true;
+                        info!("AirPlay: {} may still hold this PC's last session; trying once more", name);
+                        progress.pause(Pause::Busy, timeouts.busy_retry);
                     }
                     Err(f) => {
                         // Another opener can only help a receiver that took
@@ -501,9 +595,14 @@ impl AirPlaySession {
                         } else {
                             failed.push(format!("{:#}", f.error));
                         }
-                        if !another_way {
+                        next += 1;
+                        if !another_way || next >= plan.len() {
                             break;
                         }
+                        if let Some(o) = plan.get(next) {
+                            info!("AirPlay: trying {} again, opening with {}", name, o.describe());
+                        }
+                        progress.pause(Pause::AnotherWay, timeouts.retry_pause);
                     }
                 }
             }
@@ -732,6 +831,7 @@ impl AirPlaySession {
             let _ = h.join();
         }
         guard.teardown();
+        note_left_session(&self.renderer.stable_id());
     }
 }
 
@@ -779,6 +879,18 @@ struct AttemptFailure {
     connected: bool,
     /// RECORD was answered (with an error status).
     record_answered: bool,
+    /// ANNOUNCE was accepted, so the receiver may have held a session
+    /// (it has been sent TEARDOWN).
+    announced: bool,
+    /// The receiver answered 453.
+    busy: bool,
+}
+
+impl AttemptFailure {
+    fn new(error: anyhow::Error, connected: bool, announced: bool) -> Self {
+        let busy = error.downcast_ref::<ReceiverBusy>().is_some();
+        Self { error, connected, record_answered: false, announced, busy }
+    }
 }
 
 /// What every attempt of one connect shares.
@@ -799,7 +911,14 @@ impl Bringup<'_> {
     fn attempt(&self, how: How) -> Result<Handshake, AttemptFailure> {
         let cfg = self.cfg;
         let t = cfg.timeouts;
-        let fail = |error: anyhow::Error, connected: bool| AttemptFailure { error, connected, record_answered: false };
+        let id = cfg.renderer.stable_id();
+        let fail = |error: anyhow::Error, connected: bool| AttemptFailure::new(error, connected, false);
+        // After ANNOUNCE was accepted: the session the receiver may hold
+        // is torn down as `rtsp` drops, and noted as left.
+        let fail_announced = |error: anyhow::Error| {
+            note_left_session(&id);
+            AttemptFailure::new(error, true, true)
+        };
         // Password-protected receivers get RTSP Digest credentials;
         // the gen-1 AirPort Express (no `am` model) uses the iTunes
         // digest quirk (username "iTunes" + uppercase hex).
@@ -826,14 +945,16 @@ impl Bringup<'_> {
         let ports = progress
             .waiting(reply, || rtsp.setup(self.control_port, self.timing_port))
             .context("RTSP SETUP")
-            .map_err(|e| fail(e, true))?;
+            .map_err(fail_announced)?;
         let record_latency = match progress.waiting(reply, || rtsp.record(self.initial_seq, self.initial_rtptime)) {
             Ok(l) => l,
             Err(e) => {
                 // A status error means RECORD was answered; no reply at
                 // all, or a broken connection, means it wasn't.
                 let record_answered = e.downcast_ref::<RtspError>().is_none();
-                return Err(AttemptFailure { error: e.context("RTSP RECORD"), connected: true, record_answered });
+                let mut f = fail_announced(e.context("RTSP RECORD"));
+                f.record_answered = record_answered;
+                return Err(f);
             }
         };
         let advertised_latency = merge_advertised_latency(ports.audio_latency, record_latency);
@@ -1258,6 +1379,7 @@ mod tests {
             reply: Duration::from_millis(600),
             teardown: Duration::from_millis(400),
             retry_pause: Duration::from_millis(200),
+            busy_retry: Duration::from_millis(300),
         }
     }
 
@@ -1405,6 +1527,100 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(6), "no pause and no second attempt");
     }
 
+    fn busy() -> Answer {
+        Answer::Reply(Reply::status(453, "Not Enough Bandwidth"))
+    }
+
+    const BUSY_SENTENCE: &str = "Test Speaker is busy. Another device may be playing to it, or it hasn't let go of \
+        this PC's last connection yet. Try again in a minute; if it stays busy, restart Test Speaker.";
+
+    /// A receiver that answers 453 is reported busy in the app's own
+    /// words, once: no retry when this app had no session on it, and no
+    /// second opener (busy isn't about how the connect opens).
+    #[test]
+    fn a_busy_receiver_is_reported_in_plain_words() {
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "ANNOUNCE" => busy(),
+            _ => Answer::Normal,
+        });
+        let err = start(&rx, "0B0000000020", &[0, 4], None).err().expect("busy");
+        assert_eq!(format!("{:#}", err), BUSY_SENTENCE);
+        assert!(err.downcast_ref::<Busy>().is_some());
+        assert_eq!(methods(&rx), ["0 /auth-setup", "0 ANNOUNCE"]);
+    }
+
+    /// Soon after this app's own session on the receiver, a 453 is
+    /// likely that session: one retry, after a pause.
+    #[test]
+    fn busy_soon_after_our_own_session_is_retried_once_after_a_pause() {
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
+            ("ANNOUNCE", 0) => busy(),
+            _ => Answer::Normal,
+        });
+        let r = receiver(&rx, "0B0000000021", &[0, 1]);
+        note_left_session(&r.stable_id());
+        let session = start(&rx, "0B0000000021", &[0, 1], None).expect("the retry connects");
+        session.stop();
+        assert_eq!(methods(&rx)[..3], ["0 OPTIONS", "0 ANNOUNCE", "1 OPTIONS"]);
+        let gap = rx.connected_at(1).unwrap().duration_since(rx.closed_at(0).unwrap());
+        assert!(gap + Duration::from_millis(50) >= quick().busy_retry, "{:?}", gap);
+
+        // Only once: a receiver that stays busy is reported busy.
+        let rx = FakeRaop::start(|req| match req.method.as_str() {
+            "ANNOUNCE" => busy(),
+            _ => Answer::Normal,
+        });
+        note_left_session(&receiver(&rx, "0B0000000022", &[0, 1]).stable_id());
+        let err = start(&rx, "0B0000000022", &[0, 1], None).err().expect("busy");
+        assert_eq!(format!("{:#}", err), BUSY_SENTENCE);
+        assert_eq!(methods(&rx), ["0 OPTIONS", "0 ANNOUNCE", "1 OPTIONS", "1 ANNOUNCE"]);
+    }
+
+    /// 453 to SETUP is busy too; that attempt's ANNOUNCE was accepted, so
+    /// it is torn down and counts as this app's own session.
+    #[test]
+    fn busy_at_setup_tears_down_and_retries_once() {
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
+            ("SETUP", 0) => busy(),
+            _ => Answer::Normal,
+        });
+        let session = start(&rx, "0B0000000023", &[0, 1], None).expect("the retry connects");
+        session.stop();
+        assert_eq!(methods(&rx)[..5], ["0 OPTIONS", "0 ANNOUNCE", "0 SETUP", "0 TEARDOWN", "1 OPTIONS"]);
+    }
+
+    /// A stopped session counts as this app's own for the next minute.
+    #[test]
+    fn a_stopped_session_makes_the_next_busy_answer_worth_one_retry() {
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
+            ("ANNOUNCE", 1) => busy(),
+            _ => Answer::Normal,
+        });
+        start(&rx, "0B0000000024", &[0, 1], None).expect("first session").stop();
+        start(&rx, "0B0000000024", &[0, 1], None).expect("second session, after one retry").stop();
+        assert_eq!(rx.connected_at(3), None);
+        assert!(rx.connected_at(2).is_some());
+    }
+
+    /// With the MFi experiment on, an MFi attempt that got past ANNOUNCE
+    /// is torn down, and the plaintext attempt waits before it starts.
+    #[test]
+    fn the_mfi_experiment_pauses_before_plaintext_after_a_failed_announce() {
+        let rx = FakeRaop::start(|req| match (req.method.as_str(), req.conn) {
+            ("SETUP", 0) => Answer::Ignore,
+            _ => Answer::Normal,
+        });
+        let (_tx, samples) = crossbeam_channel::unbounded();
+        let mut cfg = config(receiver(&rx, "0B0000000025", &[0, 4]), samples);
+        cfg.timeouts = quick();
+        cfg.mfi_encryption = true;
+        let session = AirPlaySession::start(cfg).expect("plaintext connects");
+        session.stop();
+        assert_eq!(methods(&rx)[..5], ["0 /auth-setup", "0 ANNOUNCE", "0 SETUP", "0 TEARDOWN", "1 /auth-setup"]);
+        let gap = rx.connected_at(1).unwrap().duration_since(rx.closed_at(0).unwrap());
+        assert!(gap + Duration::from_millis(50) >= quick().retry_pause, "{:?}", gap);
+    }
+
     #[test]
     fn a_remembered_opener_reads_leniently() {
         #[derive(serde::Deserialize)]
@@ -1418,6 +1634,23 @@ mod tests {
         assert_eq!(read(r#"{"o":7}"#), None);
         assert_eq!(read(r#"{"o":null}"#), None);
         assert_eq!(read(r#"{}"#), None);
+    }
+
+    #[test]
+    fn pauses_say_why_once_the_connect_is_slow() {
+        let progress = Progress::new();
+        let lines = Mutex::new(Vec::<String>::new());
+        let notice = |l: &str| lines.lock().unwrap().push(l.to_string());
+        std::thread::scope(|sc| {
+            sc.spawn(|| progress.report_after(Instant::now(), Duration::ZERO, Duration::from_secs(60), &notice));
+            progress.pause(Pause::AnotherWay, Duration::from_millis(400));
+            progress.pause(Pause::Busy, Duration::from_millis(400));
+            progress.finish();
+        });
+        assert_eq!(
+            lines.into_inner().unwrap(),
+            ["the first try didn't work; trying once more another way.", "it is busy; trying once more."]
+        );
     }
 
     /// A bring-up that fails after ANNOUNCE tells the receiver, so it
