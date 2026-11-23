@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use stream_to_speaker::http_server::{samples_to_l16_be_bytes, PcmFrame, StreamHub};
+use stream_to_speaker::http_server::{samples_to_wav_le_bytes, PcmFrame, StreamHub};
 use stream_to_speaker::sendspin::store::SendspinConfig;
 use stream_to_speaker::sendspin::SendspinStore;
 
@@ -69,7 +69,7 @@ fn spawn_sine(hub: Arc<StreamHub>) {
                 samples.push(s);
                 phase = (phase + step) % (2.0 * std::f32::consts::PI);
             }
-            hub.publish(PcmFrame(Arc::new(samples_to_l16_be_bytes(&samples))));
+            hub.publish(PcmFrame(Arc::new(samples_to_wav_le_bytes(&samples))));
             next += Duration::from_millis(10);
             let now = Instant::now();
             if next > now {
