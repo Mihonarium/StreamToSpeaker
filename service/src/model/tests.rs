@@ -2215,7 +2215,8 @@ fn every_state_has_words_on_every_surface_and_every_string_is_used() {
     let _ = surfaces::picker_header(EN, "0.2.0", "Wi-Fi");
 
     let used = USED.with(|u| u.borrow().clone());
-    let unused: Vec<&Key> = Key::ALL.iter().filter(|k| !used.contains(k)).collect();
+    // The Settings window's sentences are checked by its own tests.
+    let unused: Vec<&Key> = Key::ALL.iter().filter(|k| !used.contains(k) && !crate::settings::words::is_settings_key(**k)).collect();
     assert!(unused.is_empty(), "sentences no surface uses: {unused:?}");
 }
 

@@ -296,7 +296,7 @@ impl App {
             let uc = self.user_config.lock().unwrap();
             (uc.sendspin.enabled, uc.sendspin.source_enabled)
         };
-        if !enabled && !force_source {
+        if !enabled && !saved && !force_source {
             return;
         }
         if enabled {
@@ -395,8 +395,8 @@ impl App {
     }
 
     /// GUI toggle: persist; on starts speaker discovery (and the Music
-    /// Assistant input if it was left on); off stops the input, speaker
-    /// discovery, any pairing prompt and a session to a Sendspin speaker.
+    /// Assistant input if it was left on); off stops speaker discovery,
+    /// any pairing prompt and a session to a Sendspin speaker.
     pub fn set_sendspin_enabled(self: &Arc<Self>, on: bool) {
         let source_saved = {
             let mut uc = self.user_config.lock().unwrap();
@@ -417,11 +417,12 @@ impl App {
                 }
             }
         } else {
-            self.stop_sendspin();
+            // Sendspin speakers only: the Music Assistant input has a
+            // switch of its own.
             *self.sendspin.prompt.lock().unwrap() = None;
             let session = {
                 let mut g = self.session.lock().unwrap();
-                if g.as_ref().is_some_and(|s| is_sendspin_id(&s.stable_id()) || s.stable_id() == MA_OUTPUT_ID) {
+                if g.as_ref().is_some_and(|s| is_sendspin_id(&s.stable_id())) {
                     g.take()
                 } else {
                     None

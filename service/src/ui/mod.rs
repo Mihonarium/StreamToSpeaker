@@ -35,5 +35,6 @@ pub fn scenes() -> Vec<preview::Scene> {
     // The panel and the tray.
     all.extend(crate::panel::scenes::scenes());
     all.extend(crate::shell::scenes::scenes());
+    all.extend(crate::settings::scenes());
     all
 }

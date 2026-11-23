@@ -254,6 +254,14 @@ pub struct UserConfig {
     /// entry falls back to the default rather than failing the file.
     #[serde(default)]
     pub equalizer: EqSettings,
+    /// About → *Show Lab (experimental settings)*: the Lab page shows in
+    /// the Settings window.
+    #[serde(default)]
+    pub show_lab: bool,
+    /// Lab: Sonos and other UPnP speakers apply a delay change at once,
+    /// with a short skip, instead of gradually (see `delay::catch_up`).
+    #[serde(default)]
+    pub delay_at_once: bool,
 }
 
 /// Whether the app connects to a speaker by itself.
@@ -271,7 +279,7 @@ pub enum AutoConnect {
 }
 
 /// Settings that apply to one speaker.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpeakerSettings {
     /// Left out of the speaker list (and the web API's), unless it's the
     /// one playing. Shown again with "Show hidden".
@@ -314,6 +322,13 @@ pub struct SpeakerSettings {
     /// whose level can't be read starts at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// *Show song titles on Kitchen*; `None` follows `forward_now_playing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub song_titles: Option<bool>,
+    /// The speaker's tone; `None` plays the app-wide equalizer, which is
+    /// what every speaker had before tone was kept per speaker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<EqSettings>,
     /// This speaker's settings that a newer version wrote and this one
     /// doesn't know, kept as they are across saves.
     #[serde(flatten)]
@@ -993,6 +1008,8 @@ const SETTING_LABELS: &[(&str, &str, bool)] = &[
     ("discovery_adapter", "Discovery network adapter", true),
     ("speaker_settings", "Each speaker's settings", false),
     ("equalizer", "Equalizer", true),
+    ("show_lab", "Show Lab (experimental settings)", true),
+    ("delay_at_once", "Apply delay changes on Sonos and UPnP speakers", true),
 ];
 
 /// The same for a speaker's own settings (`speaker_settings.<id>.<key>`).
@@ -1004,6 +1021,8 @@ const SPEAKER_LABELS: &[(&str, &str, bool)] = &[
     ("steady_delay_change_ms", "What was removed from or added to its delay", false),
     ("delay_choice", "Short delay or Steady", false),
     ("level", "The volume last used with it", false),
+    ("song_titles", "Show song titles", false),
+    ("tone", "Tone", true),
 ];
 
 /// Values the app remembers by itself and learns again at the next
@@ -2108,11 +2127,15 @@ mod tests {
                 steady_delay_change_ms: 120,
                 delay_choice: Some(crate::delay::DelayChoice::Short),
                 level: Some(32),
+                song_titles: Some(true),
+                tone: Some(EqSettings { enabled: true, preamp_db: -1.0, bands_db: [2.0; crate::equalizer::EQ_BANDS] }),
                 unknown_keys: [("future_speaker_setting".to_string(), serde_json::json!({"x": 1}))].into_iter().collect(),
             },
         );
         c.equalizer = EqSettings { enabled: true, preamp_db: -3.0, bands_db: [1.5; crate::equalizer::EQ_BANDS] };
         c.equalizer.bands_db[0] = -2.0;
+        c.show_lab = true;
+        c.delay_at_once = true;
         c
     }
 
@@ -2519,7 +2542,7 @@ mod tests {
         }
         // The names said to be the window's are, word for word, in the
         // window's code.
-        const WINDOW: &str = include_str!("gui.rs");
+        const WINDOW: &str = concat!(include_str!("gui.rs"), include_str!("model/text.rs"));
         let named = SETTING_LABELS.iter().chain(SPEAKER_LABELS).chain([&WHOLE_SPEAKER_LABEL]);
         for (key, label, in_window) in named {
             if *in_window {
