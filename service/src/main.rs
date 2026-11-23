@@ -809,7 +809,7 @@ fn run(cli: Cli) -> Result<()> {
     // at quit.
     let engine = stream_to_speaker::engine::Engine::start(
         app.clone(),
-        stream_to_speaker::platform::Platform::passive(),
+        stream_to_speaker::platform::Platform::this_pc(),
         matches!(choice, LaunchChoice::Saved(_)),
     );
     if let LaunchChoice::Wish(query) = &choice {

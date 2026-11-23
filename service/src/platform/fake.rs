@@ -273,6 +273,18 @@ mod tests {
     }
 
     #[test]
+    fn without_switching_every_switch_is_refused_and_the_rest_still_works() {
+        let fake = FakePlatform::new();
+        let p = fake.platform().without_switching();
+        assert!(p.outputs.set_default(&id(OURS), crate::platform::PLAYBACK_ROLES).is_err());
+        assert_eq!(p.outputs.default_output(), Some(id(SPEAKERS)));
+        assert!(fake.switches().is_empty(), "Windows was never asked");
+        assert_eq!(p.outputs.list().len(), 3, "speakers, headphones and ours; not the monitor that is off");
+        p.outputs.set_volume(&id(HEADPHONES), 30, false).unwrap();
+        assert_eq!(fake.level_of(HEADPHONES), Some((30, false)));
+    }
+
+    #[test]
     fn the_passive_platform_knows_nothing() {
         let p = Platform::passive();
         assert!(!p.knows_outputs());

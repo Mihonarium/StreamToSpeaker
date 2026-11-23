@@ -129,6 +129,7 @@ impl Engine {
         let _ = ticket.wait(Duration::from_secs(1));
         let lang = self.port.snapshot().lang;
         let _ = self.platform.device.rename(&crate::model::surfaces::device_name_not_running(lang));
+        self.platform.device.settle(Duration::from_secs(1));
     }
 }
 

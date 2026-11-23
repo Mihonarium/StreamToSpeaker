@@ -14,6 +14,8 @@ pub use crate::model::facts::OutputKind;
 pub use crate::model::PcOutputId;
 
 pub mod fake;
+#[cfg(windows)]
+mod win;
 
 /// One of Windows' sound outputs, with Windows' own names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,8 +99,10 @@ pub trait AudioSessions: Send + Sync {
 
 /// This app's own output in Windows.
 pub trait OurDevice: Send + Sync {
-    /// Name it, e.g. "Kitchen (Stream To Speaker)".
+    /// Name it, e.g. "Kitchen (Stream To Speaker)". Returns at once.
     fn rename(&self, name: &str) -> Result<(), String>;
+    /// Wait up to `max` for the last rename to be done (at quit).
+    fn settle(&self, _max: std::time::Duration) {}
 }
 
 /// What happens to the sound if the app ends without quitting.
@@ -143,7 +147,27 @@ pub struct Platform {
     pub events: Arc<dyn SystemEvents>,
 }
 
+/// The app makes its output Windows' default when a speaker is ready, and
+/// gives it back. `false` leaves the choice to the person: the panel then
+/// says Windows didn't switch and links to Sound settings (the fallback
+/// where switching misbehaves).
+pub const SWITCH_WINDOWS_OUTPUT: bool = true;
+
 impl Platform {
+    /// The PC this runs on: Windows' own outputs, sessions and notices on
+    /// Windows (passive where they can't be reached), passive elsewhere.
+    pub fn this_pc() -> Self {
+        #[cfg(windows)]
+        let p = win::platform();
+        #[cfg(not(windows))]
+        let p = Platform::passive();
+        if SWITCH_WINDOWS_OUTPUT {
+            p
+        } else {
+            p.without_switching()
+        }
+    }
+
     /// Knows nothing and does nothing: Windows' outputs are left to the
     /// person, as before the app could switch them.
     pub fn passive() -> Self {
@@ -151,9 +175,43 @@ impl Platform {
         Platform { outputs: p.clone(), sessions: p.clone(), device: p.clone(), handback: p.clone(), events: p }
     }
 
+    /// The same platform, except that it never changes Windows' default
+    /// output: every switch is refused, so the engine says so and the
+    /// person picks the output in Windows.
+    pub fn without_switching(self) -> Self {
+        Platform { outputs: Arc::new(NoSwitch(self.outputs)), ..self }
+    }
+
     /// Whether this platform can say which output Windows plays through.
     pub fn knows_outputs(&self) -> bool {
         self.outputs.default_output().is_some()
+    }
+}
+
+/// Outputs that never switch (see [`Platform::without_switching`]).
+struct NoSwitch(Arc<dyn Outputs>);
+
+impl Outputs for NoSwitch {
+    fn default_output(&self) -> Option<PcOutputId> {
+        self.0.default_output()
+    }
+    fn our_output(&self) -> Option<PcOutputId> {
+        self.0.our_output()
+    }
+    fn describe(&self, id: &PcOutputId) -> Option<OutputInfo> {
+        self.0.describe(id)
+    }
+    fn list(&self) -> Vec<OutputInfo> {
+        self.0.list()
+    }
+    fn set_default(&self, _: &PcOutputId, _: &[Role]) -> Result<(), String> {
+        Err("Windows' output is left to the person on this PC".into())
+    }
+    fn volume(&self, id: &PcOutputId) -> Option<(u8, bool)> {
+        self.0.volume(id)
+    }
+    fn set_volume(&self, id: &PcOutputId, level: u8, muted: bool) -> Result<(), String> {
+        self.0.set_volume(id, level, muted)
     }
 }
 

@@ -770,3 +770,33 @@ fn picking_one_of_this_pcs_outputs_moves_the_sound_there() {
     assert!(rig.app.user_config.lock().unwrap().pc_outputs_open);
     assert!(rig.driver.snapshot(4).list.this_pc.chevron.as_ref().unwrap().open);
 }
+
+/// Where the app may not switch Windows' output, the speaker still plays
+/// and the state says Windows didn't switch, with Sound settings to fix it.
+#[test]
+fn without_switching_the_speaker_plays_and_the_state_says_windows_did_not_switch() {
+    let fake = plain_renderer();
+    let app = serving_app();
+    let id = add_speaker(&app, &fake);
+    let windows = FakePlatform::new();
+    let (tx, rx) = unbounded();
+    let now = Instant::now();
+    let core = Core::new(None, None, now);
+    let mut driver =
+        Driver::new(app.clone(), windows.platform().without_switching(), core, tx, Arc::new(Mutex::new(None)), now);
+    let port = PortCore::new(driver.snapshot(1));
+    let mut rig = Rig { app, windows, driver, rx, port };
+    rig.play(Surface::Panel, &id).unwrap();
+    rig.plays_on(&id);
+    rig.settle();
+    assert_eq!(windows_default(&rig), SPEAKERS, "Windows' output was left alone");
+    assert!(matches!(rig.state(), NowState::WindowsRefused { .. }), "{:?}", rig.state());
+    let snapshot = rig.driver.snapshot(2);
+    assert!(
+        snapshot.top.actions.iter().any(|b| b.command == Command::Open(crate::model::command::Open::SoundSettings)),
+        "{:?}",
+        snapshot.top.actions
+    );
+    rig.send(Surface::Panel, Command::Play(Place::ThisPc)).unwrap();
+    rig.settle();
+}
