@@ -55,6 +55,7 @@ pub mod tray;
 #[cfg(windows)]
 pub mod endpoint_name;
 pub mod latest;
+pub mod engine;
 pub mod model;
 pub mod platform;
 

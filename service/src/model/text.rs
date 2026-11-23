@@ -136,7 +136,7 @@ impl Lang {
 
 /// A time of day on the PC's clock, as the engine read it. The model has
 /// no clock of its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocalTime {
     pub hour: u8,
     pub minute: u8,
