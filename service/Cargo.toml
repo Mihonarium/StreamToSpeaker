@@ -126,6 +126,9 @@ winresource = "0.1"
 # Reference ALAC decoder — round-trip verifies that the compressed frames
 # our encoder emits decode losslessly under our announced fmtp parameters.
 alac = "0.5"
+# Writes the pictures of the UI (examples/ui_preview.rs). Already in the
+# tree through tray-icon.
+png = "=0.17.16"
 
 [target.'cfg(windows)'.dependencies]
 # WASAPI loopback fallback. cpal supports WASAPI loopback on Windows.

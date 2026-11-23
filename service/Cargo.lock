@@ -3682,6 +3682,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "plist",
+ "png 0.17.16",
  "rand",
  "raw-window-handle",
  "roxmltree",
