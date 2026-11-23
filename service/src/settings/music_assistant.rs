@@ -143,7 +143,7 @@ pub(super) fn code_box(ui: &mut Ui, cx: &mut Cx, st: &mut PageState, code: &str,
             ui.painter().galley(r.min, g, t.c.text);
             copy_button(ui, st, "ma-code", &w!(lang, SetCopy), &w!(lang, SetCopied), code);
             if let Some(s) = left {
-                ui.label(egui::RichText::new(words::left(lang, s)).font(t.font(size::CAPTION)).color(t.c.text_secondary));
+                ui.add(egui::Label::new(egui::RichText::new(words::left(lang, s)).font(t.font(size::CAPTION)).color(t.c.text_secondary)).extend());
             }
         });
     });

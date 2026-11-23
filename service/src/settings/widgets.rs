@@ -30,27 +30,35 @@ pub fn page_title_with(ui: &mut Ui, text: &str, after: impl FnOnce(&mut Ui)) {
 }
 
 /// A sub-page's title: *Speakers › Kitchen*. The first part goes back
-/// (returns true when clicked).
+/// (returns true when clicked). A title too long for the line goes under
+/// the first part.
 pub fn crumb(ui: &mut Ui, parent: &str, title: &str) -> bool {
     let t = Theme::of(ui.ctx());
     ui.add_space(6.0);
     let mut back = false;
-    ui.horizontal_wrapped(|ui| {
+    let parent_g = ui.painter().layout_no_wrap(parent.to_owned(), t.font(size::PAGE), t.c.text_secondary);
+    let title_w = ui.painter().layout_no_wrap(title.to_owned(), t.strong(size::PAGE), t.c.text).size().x;
+    let one_line = parent_g.size().x + 34.0 + title_w <= ui.available_width();
+    ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        let g = ui.painter().layout_no_wrap(parent.to_owned(), t.font(size::PAGE), t.c.text_secondary);
-        let (rect, resp) = ui.allocate_exact_size(g.size(), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(parent_g.size(), Sense::click());
         resp.widget_info(|| WidgetInfo::labeled(WidgetType::Link, true, parent));
         let l = look_as(ui, &resp, parent);
         let color = if l.hovered { t.c.text } else { t.c.text_secondary };
-        ui.painter().galley(rect.min, g, color);
+        ui.painter().galley(rect.min, parent_g, color);
         if l.focused {
             focus_ring(ui.painter(), rect, radius::CONTROL, true, &t);
         }
         back = resp.clicked();
         let (chev, _) = ui.allocate_exact_size(Vec2::new(18.0, rect.height()), Sense::hover());
         Icon::ChevronRight.paint_weight(ui.painter(), Rect::from_center_size(chev.center() + Vec2::new(0.0, 2.0), Vec2::splat(18.0)), t.c.text, 2.2);
-        ui.label(egui::RichText::new(title).font(t.strong(size::PAGE)).color(t.c.text));
+        if one_line {
+            ui.label(egui::RichText::new(title).font(t.strong(size::PAGE)).color(t.c.text));
+        }
     });
+    if !one_line {
+        ui.add(egui::Label::new(egui::RichText::new(title).font(t.strong(size::PAGE)).color(t.c.text)).wrap());
+    }
     ui.add_space(10.0);
     back
 }
@@ -407,4 +415,32 @@ pub fn bar(ui: &mut Ui, kind: crate::ui::notice::BarKind, title: &str, text: &st
         });
     });
     clicked
+}
+
+/// A short grey note at the right of a row, wrapping within `max_width`
+/// (laid out by hand: a wrapping label in a right-to-left layout lands
+/// outside its row).
+pub fn side_note(ui: &mut Ui, text: &str, max_width: f32) {
+    let color = Theme::of(ui.ctx()).c.text_secondary;
+    side_text(ui, text, color, max_width);
+}
+
+/// [`side_note`] in `color`.
+pub fn side_text(ui: &mut Ui, text: &str, color: Color32, max_width: f32) {
+    let t = Theme::of(ui.ctx());
+    let g = ui.painter().layout(text.to_owned(), t.font(size::CAPTION), color, max_width.min(ui.available_width()).max(40.0));
+    let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+    ui.painter().galley(r.min, g, color);
+}
+
+/// `long` when it fits the width left in `ui`, else `short`: a button that
+/// names a speaker drops the name when the name is too long for the line.
+pub fn fitting<'a>(ui: &Ui, long: &'a str, short: &'a str) -> &'a str {
+    let t = Theme::of(ui.ctx());
+    let w = ui.painter().layout_no_wrap(long.to_owned(), t.font(size::CONTROL), Color32::PLACEHOLDER).size().x + 2.0 * crate::ui::theme::space::M + 24.0;
+    if w <= ui.available_width() && w <= ui.max_rect().width() {
+        long
+    } else {
+        short
+    }
 }

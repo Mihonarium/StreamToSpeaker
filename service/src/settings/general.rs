@@ -12,7 +12,7 @@ use crate::ui::text::{Mark, Tone};
 use crate::ui::theme::Theme;
 
 use super::port::{Act, Shortcuts, WhatPlays, WhenStops};
-use super::widgets::{boxed, divider, heading, keycap, keycaps, marked, note_links, page_title, row};
+use super::widgets::{boxed, divider, heading, keycap, keycaps, marked, page_title, row};
 use super::words::w;
 use super::{Cx, PageState};
 
@@ -206,9 +206,9 @@ fn shortcut_line(ui: &mut Ui, cx: &mut Cx, st: &mut PageState, i: usize, label: 
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if taken {
-                let _ = note_links(ui, &w!(lang, SetShortcutTaken), &[]);
+                super::widgets::side_text(ui, &w!(lang, SetShortcutTaken), t.c.amber, 200.0);
             } else {
-                ui.label(egui::RichText::new(w!(lang, SetShortcutReady)).font(t.font(crate::ui::theme::size::CAPTION)).color(t.c.green));
+                super::widgets::side_text(ui, &w!(lang, SetShortcutReady), t.c.green, 200.0);
             }
         });
     });

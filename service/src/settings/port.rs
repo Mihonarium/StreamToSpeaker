@@ -658,8 +658,9 @@ pub struct MaCodeShow {
 }
 
 /// What *Find* found at an address.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum Probe {
+    #[default]
     Idle,
     Checking { address: String },
     Found { address: String, ways: Vec<Found> },
@@ -798,7 +799,9 @@ pub enum Act {
     SubmitCode { id: String, code: String },
     NewCode(String),
     CancelPairing(String),
-    SubmitPassword { id: String, password: String },
+    /// A password typed in the dialog; `connect`: connect with it now
+    /// (otherwise it is only kept for next time).
+    SubmitPassword { id: String, password: String, connect: bool },
     CancelPassword(String),
     SubmitSendspin { id: String, code: String },
     CancelSendspin(String),

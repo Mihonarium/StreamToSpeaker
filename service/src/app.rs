@@ -1054,6 +1054,7 @@ impl App {
             }
         }
         app.delay_watch_back_offs();
+        app.delay.catch_up().set_at_once(app.user_config.lock().unwrap().delay_at_once);
         app
     }
 
@@ -2429,7 +2430,7 @@ impl App {
                         std::thread::sleep(Duration::from_millis(100));
                     }
 
-                    if !app.user_config.lock().unwrap().forward_now_playing {
+                    if !app.song_titles_for_playing() {
                         // Reset so re-enabling re-sends the current track.
                         last_sent = None;
                         continue;
@@ -2578,6 +2579,7 @@ impl App {
         impl Drop for DelayFollows<'_> {
             fn drop(&mut self) {
                 self.0.delay_session_bound();
+                self.0.tone_follows_speaker();
             }
         }
         let _delay_follows = DelayFollows(self);

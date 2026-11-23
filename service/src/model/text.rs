@@ -1249,6 +1249,19 @@ keys! {
     SetReportCopied,
     SetReportSaved,
     SetIssueOpened,
+    SetNothingChanged,
+    SetChoiceSteady,
+    SetChoiceShort,
+    SetDetailStream,
+    SetDetailBuffer,
+    SetDetailLead,
+    SetProbeNoThread,
+    SetReportVersionLine,
+    SetPairingEnded,
+    SetSavePassword,
+    SetSendToThis,
+    SetPlayOnThis,
+    SetForgetThis,
 
 }
 
@@ -2271,6 +2284,19 @@ pub fn english(key: Key) -> Template {
         SetReportCopied => text("Copied. Paste it into an e-mail or a message."),
         SetReportSaved => text("Saved in your log folder, which is open now."),
         SetIssueOpened => text("The issue opened in your browser. Nothing is sent until you submit it there."),
+        SetNothingChanged => text("nothing removed or added"),
+        SetChoiceSteady => text("Steady"),
+        SetChoiceShort => text("Short delay"),
+        SetDetailStream => text("{change} on the stream this PC serves"),
+        SetDetailBuffer => text("AirPlay buffer {buffer} ms ({choice} {base} ms, {change})"),
+        SetDetailLead => text("extra lead {change}"),
+        SetProbeNoThread => text("Couldn’t start looking (no thread available). Try again."),
+        SetReportVersionLine => text("Stream To Speaker {version} · {os}"),
+        SetPairingEnded => text("That pairing had already ended. Pick the speaker again to pair it."),
+        SetSavePassword => text("Save"),
+        SetSendToThis => text("Send it there"),
+        SetPlayOnThis => text("Play on this speaker"),
+        SetForgetThis => text("Forget this speaker"),
 
     }
 }

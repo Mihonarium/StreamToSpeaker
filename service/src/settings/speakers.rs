@@ -58,13 +58,9 @@ pub(super) fn page(ui: &mut Ui, cx: &mut Cx, _st: &mut PageState) {
         if v.networks.is_some() && Button::standard(&w!(lang, SetSearchAgain)).icon(Icon::Refresh).show(ui).clicked() {
             cx.act(Act::SearchAgain);
         }
-        ui.add_space(4.0);
-        ui.vertical(|ui| {
-            ui.add_space(6.0);
-            if link(ui, &w!(lang, SetCantFindLink)) {
-                cx.go(Page::CantFind);
-            }
-        });
+        if link(ui, &w!(lang, SetCantFindLink)) {
+            cx.go(Page::CantFind);
+        }
     });
 
     if let Some(on) = v.sendspin {

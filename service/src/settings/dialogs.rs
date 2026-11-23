@@ -45,7 +45,7 @@ impl Dialog {
     pub fn wanted(port: &dyn SettingsPort) -> Option<Dialog> {
         Some(match port.wanted_dialog()? {
             Wanted::PairingCode(a) => Dialog::Code(CodeDialog { id: a.id, ..Default::default() }),
-            Wanted::Password(a) => Dialog::Password(PasswordDialog { id: a.id, name: a.name, asked: true, ..Default::default() }),
+            Wanted::Password(a) => Dialog::Password(PasswordDialog { id: a.id, name: a.name, asked: true, connect: true, ..Default::default() }),
             Wanted::SendspinCode(a) => Dialog::Sendspin(SendspinDialog { id: a.id, ..Default::default() }),
             Wanted::MaCode(_) => Dialog::MaCode(MaCodeDialog::default()),
         })
@@ -343,15 +343,24 @@ pub struct PasswordDialog {
     /// The speaker asked while connecting (rather than *Change* on its
     /// page).
     asked: bool,
+    /// *Connect* connects with the password (otherwise it is kept for next
+    /// time).
+    connect: bool,
     typed: String,
     shown: bool,
     focus_done: bool,
 }
 
 impl PasswordDialog {
-    /// *Change* on a speaker's page.
+    /// *Change* on a speaker's page: the password is kept for next time.
     pub fn change(id: &str, name: &str) -> Self {
         PasswordDialog { id: id.into(), name: name.into(), ..Default::default() }
+    }
+
+    /// *Enter password…* where a speaker needs its password: *Connect*
+    /// connects with it.
+    pub fn to_connect(id: &str, name: &str) -> Self {
+        PasswordDialog { id: id.into(), name: name.into(), connect: true, ..Default::default() }
     }
 
     fn show(&mut self, ui: &mut Ui, port: &dyn SettingsPort, lang: Lang) -> bool {
@@ -397,13 +406,14 @@ impl PasswordDialog {
                         }
                         keep = false;
                     }
-                    if Button::primary(&w!(lang, SetConnect)).enabled(!self.typed.is_empty()).default_action(true).show(ui).clicked() {
+                    let label = if self.connect { w!(lang, SetConnect) } else { w!(lang, SetSavePassword) };
+                    if Button::primary(&label).enabled(!self.typed.is_empty()).default_action(true).show(ui).clicked() {
                         submit = true;
                     }
                 });
         }
         if submit {
-            port.act(Act::SubmitPassword { id: self.id.clone(), password: std::mem::take(&mut self.typed) });
+            port.act(Act::SubmitPassword { id: self.id.clone(), password: std::mem::take(&mut self.typed), connect: self.connect });
             // Asked while connecting: stays open until the speaker says
             // whether it worked. From the page: done.
             if !self.asked {
@@ -473,6 +483,7 @@ impl SendspinDialog {
                             if Button::link(&label).show(ui).clicked() {
                                 self.token = !self.token;
                                 self.typed.clear();
+                                self.focus_done = false;
                             }
                         });
                     }
@@ -681,7 +692,8 @@ impl AddDialog {
                 let (tile, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
                 ui.painter().rect_filled(tile, radius::CARD, t.c.hover);
                 kind_icon(&chosen.kind).paint(ui.painter(), Rect::from_center_size(tile.center(), Vec2::splat(22.0)), t.c.text);
-                let add = w!(lang, SetAddNamed, speaker = &chosen.name);
+                let add_long = w!(lang, SetAddNamed, speaker = &chosen.name);
+                let add_short = w!(lang, SetAddButton);
                 let text_w = (ui.available_width() - 160.0).max(160.0);
                 ui.allocate_ui(Vec2::new(text_w, 40.0), |ui| {
                     ui.vertical(|ui| {
@@ -695,7 +707,7 @@ impl AddDialog {
                     });
                 });
                 at_right(ui, |ui| {
-                    if Button::primary(&add).show(ui).clicked() {
+                    if Button::primary(super::widgets::fitting(ui, &add_long, &add_short)).accessible_name(add_long.clone()).show(ui).clicked() {
                         port.act(Act::AddFound { way, name: chosen.name.clone() });
                     }
                 });
@@ -849,7 +861,7 @@ fn preset_name(lang: Lang, name: &str) -> String {
         "Bass boost" => w!(lang, SetPresetBassBoost),
         "Bass cut" => w!(lang, SetPresetBassCut),
         "Treble boost" => w!(lang, SetPresetTrebleBoost),
-        "Voice" => w!(lang, SetPresetVoice),
+        "Vocal" => w!(lang, SetPresetVoice),
         "Loudness" => w!(lang, SetPresetLoudness),
         "Small speaker" => w!(lang, SetPresetSmallSpeaker),
         other => other.to_string(),

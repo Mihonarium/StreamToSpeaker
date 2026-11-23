@@ -7,7 +7,6 @@ use crate::ui::button::Button;
 use crate::ui::icon::Icon;
 use crate::ui::inputs::{Choice, Switch};
 use crate::ui::text::{Mark, Tone};
-use crate::ui::theme::{size, Theme};
 
 use super::port::{Act, Api, Phone, Refused};
 use super::widgets::{body, boxed, buttons, copy_button, divider, heading, marked, mono, note, page_title, row};
@@ -59,14 +58,13 @@ fn refused_row(ui: &mut Ui, cx: &mut Cx, r: &Refused) {
     let icon = if r.group_of.is_some() { Icon::Speaker } else { Icon::Phone };
     row(ui, Some(icon), &who, None, |ui| match &r.group_of {
         Some((id, speaker)) => {
-            if Button::standard(&w!(lang, SetAllowFor, speaker = speaker)).show(ui).clicked() {
+            let long = w!(lang, SetAllowFor, speaker = speaker);
+            let short = w!(lang, SetAllowIt);
+            if Button::standard(super::widgets::fitting(ui, &long, &short)).accessible_name(long.clone()).show(ui).clicked() {
                 cx.act(Act::Allow { address: r.address.clone(), speaker: id.clone() });
             }
         }
-        None => {
-            let t = Theme::of(ui.ctx());
-            ui.label(egui::RichText::new(w!(lang, SetNotPartOfSpeaker)).font(t.font(size::CAPTION)).color(t.c.text_secondary));
-        }
+        None => super::widgets::side_note(ui, &w!(lang, SetNotPartOfSpeaker), 160.0),
     });
 }
 

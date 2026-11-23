@@ -199,8 +199,12 @@ pub(super) fn page(ui: &mut Ui, cx: &mut Cx, st: &mut PageState, id: &str) {
             if Button::standard(&w!(lang, SetRemove)).accessible_name(w!(lang, SetRemoveNamed, speaker = &name)).show(ui).clicked() {
                 cx.act(Act::Remove(id.to_string()));
             }
-        } else if Button::standard(&w!(lang, SetForgetNamed, speaker = &name)).show(ui).clicked() {
-            cx.act(Act::Forget(id.to_string()));
+        } else {
+            let long = w!(lang, SetForgetNamed, speaker = &name);
+            let short = w!(lang, SetForgetThis);
+            if Button::standard(super::widgets::fitting(ui, &long, &short)).accessible_name(long.clone()).show(ui).clicked() {
+                cx.act(Act::Forget(id.to_string()));
+            }
         }
         if Button::standard(&w!(lang, SetHideFromList)).show(ui).clicked() {
             cx.act(Act::HideSpeaker(id.to_string()));
@@ -225,45 +229,92 @@ fn header(ui: &mut Ui, cx: &mut Cx, v: &SpeakerView) {
     let what = v.model.clone().unwrap_or_else(|| words::kind(lang, &v.row.kind));
     let line = w!(lang, SetKindStatus, kind = &what, status = &presence);
     let _ = card(ui, SETTINGS_CARD_PAD, |ui| {
-        ui.horizontal_wrapped(|ui| {
+        // The buttons sit at the right when they fit beside the words
+        // (their width is the one measured the frame before), else under
+        // them.
+        let id = ui.id().with(("speaker-header-buttons", &v.row.id));
+        let buttons_w: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(300.0);
+        let avail = ui.available_width();
+        let beside = avail - 70.0 - buttons_w - 14.0 >= 220.0;
+        let text_w = if beside { avail - 70.0 - buttons_w - 14.0 } else { avail - 70.0 };
+        let mut measured = None;
+        ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(14.0, 8.0);
             let (tile, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
             ui.painter().rect_filled(tile, radius::CARD, t.c.hover);
             kind_icon(&v.row.kind).paint(ui.painter(), Rect::from_center_size(tile.center(), Vec2::splat(28.0)), t.c.text);
-            let text_w = (ui.available_width() - 330.0).max(180.0);
-            ui.allocate_ui(Vec2::new(text_w, 56.0), |ui| {
-                ui.vertical(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(text_w);
+                ui.add_space(8.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.add(egui::Label::new(egui::RichText::new(name).font(t.strong(size::TITLE + 2.0)).color(t.c.text)).wrap());
+                ui.add(egui::Label::new(egui::RichText::new(&line).font(t.font(size::CAPTION)).color(t.c.text_secondary)).wrap());
+                if !beside {
                     ui.add_space(8.0);
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.add(egui::Label::new(egui::RichText::new(name).font(t.strong(size::TITLE + 2.0)).color(t.c.text)).wrap());
-                    ui.add(egui::Label::new(egui::RichText::new(&line).font(t.font(size::CAPTION)).color(t.c.text_secondary)).wrap());
-                });
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.set_min_height(56.0);
-                if let Some(()) = v.test_sound {
-                    if Button::standard(&w!(lang, SetTestSound)).icon(Icon::Music).show(ui).clicked() {
-                        cx.act(Act::TestSound(v.row.id.clone()));
-                    }
-                }
-                if v.row.cant_play.is_none() {
-                    match v.row.presence {
-                        Presence::PlayingNow | Presence::Ready => {
-                            let _ = Button::standard(&w!(lang, SetPlayingButton)).enabled(false).show(ui);
-                        }
-                        Presence::Connecting => {
-                            let _ = Button::standard(&w!(lang, SetConnectingButton)).enabled(false).show(ui);
-                        }
-                        _ => {
-                            if Button::primary(&w!(lang, SetPlayOn, speaker = name)).show(ui).clicked() {
-                                cx.act(Act::PlayOn(v.row.id.clone()));
-                            }
-                        }
-                    }
+                    measured = Some(header_buttons(ui, cx, v, egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true)));
                 }
             });
+            if beside {
+                measured = Some(header_buttons(ui, cx, v, egui::Layout::right_to_left(egui::Align::Center)));
+            }
         });
+        if let Some(w) = measured.filter(|w| (w - buttons_w).abs() > 0.5 && *w > 0.0) {
+            ui.ctx().data_mut(|d| d.insert_temp(id, w));
+            ui.ctx().request_discard("the speaker header's buttons changed width");
+        }
     });
+}
+
+/// *Play on Kitchen* (or *Playing*) and *Play a test sound*; their width.
+fn header_buttons(ui: &mut Ui, cx: &mut Cx, v: &SpeakerView, layout: egui::Layout) -> f32 {
+    let lang = cx.lang;
+    let name = &v.row.name;
+    let rtl = layout.main_dir == egui::Direction::RightToLeft;
+    // Beside the words: centred on the 56-point tile; under them: one row.
+    let size = Vec2::new(ui.available_width(), if rtl { 56.0 } else { 32.0 });
+    ui.allocate_ui_with_layout(size, layout, |ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let play = |ui: &mut Ui| {
+            if v.row.cant_play.is_some() {
+                return;
+            }
+            match v.row.presence {
+                Presence::PlayingNow | Presence::Ready => {
+                    let _ = Button::standard(&w!(lang, SetPlayingButton)).enabled(false).show(ui);
+                }
+                Presence::Connecting => {
+                    let _ = Button::standard(&w!(lang, SetConnectingButton)).enabled(false).show(ui);
+                }
+                _ => {
+                    // Beside the words there is room by measure; under
+                    // them, a long name may not fit the line.
+                    let long = w!(lang, SetPlayOn, speaker = name);
+                    let short = w!(lang, SetPlayOnThis);
+                    let label = if rtl { long.as_str() } else { super::widgets::fitting(ui, &long, &short) };
+                    if Button::primary(label).accessible_name(long.clone()).show(ui).clicked() {
+                        cx.act(Act::PlayOn(v.row.id.clone()));
+                    }
+                }
+            }
+        };
+        let test = |ui: &mut Ui| {
+            if let Some(()) = v.test_sound {
+                if Button::standard(&w!(lang, SetTestSound)).icon(Icon::Music).show(ui).clicked() {
+                    cx.act(Act::TestSound(v.row.id.clone()));
+                }
+            }
+        };
+        // Reading order: *Play on Kitchen*, then *Play a test sound*.
+        if rtl {
+            test(ui);
+            play(ui);
+        } else {
+            play(ui);
+            test(ui);
+        }
+        ui.min_rect().width()
+    })
+    .inner
 }
 
 /// The delay card: what the speaker's own delay is, its choice where it

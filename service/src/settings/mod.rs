@@ -288,7 +288,8 @@ impl Window {
 
         // Back: Alt+← or the mouse's back button, as Windows' Settings.
         let back_key = ui.input(|i| {
-            i.key_pressed(Key::ArrowLeft) && i.modifiers.alt || i.pointer.button_pressed(egui::PointerButton::Extra1)
+            let alt_left = i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::ArrowLeft, pressed: true, modifiers, .. } if modifiers.alt));
+            alt_left || i.pointer.button_pressed(egui::PointerButton::Extra1)
         });
         if back_key || cx.back {
             self.go_back();

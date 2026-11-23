@@ -155,7 +155,9 @@ pub(super) fn cant_hear(ui: &mut Ui, cx: &mut Cx) {
                 Err(WindowsSends::Elsewhere { output }) => {
                     all_good = false;
                     check_line(ui, Found::Bad, &w!(lang, SetCheckWindowsElsewhere, output = output), None, |ui| {
-                        if Button::standard(&w!(lang, SetSendTo, speaker = &speaker)).show(ui).clicked() {
+                        let long = w!(lang, SetSendTo, speaker = &speaker);
+                        let short = w!(lang, SetSendToThis);
+                        if Button::standard(super::widgets::fitting(ui, &long, &short)).show(ui).clicked() {
                             cx.act(Act::SendToUs);
                         }
                     });
@@ -261,7 +263,9 @@ pub(super) fn cant_hear(ui: &mut Ui, cx: &mut Cx) {
                 let _ = crate::ui::text::Para::new(&text).lead(&w!(lang, SetCheckAllGood)).size(size::SECONDARY).tone(crate::ui::text::Tone::Primary).show(ui);
             });
             buttons(ui, |ui| {
-                if Button::standard(&w!(lang, SetTestSoundOn, speaker = &speaker)).show(ui).clicked() {
+                let long = w!(lang, SetTestSoundOn, speaker = &speaker);
+                let short = w!(lang, SetTestSound);
+                if Button::standard(super::widgets::fitting(ui, &long, &short)).show(ui).clicked() {
                     cx.act(Act::TestSound(String::new()));
                 }
                 if Button::primary(&w!(lang, SetWriteReport)).show(ui).clicked() {
