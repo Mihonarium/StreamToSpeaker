@@ -30,6 +30,8 @@ pub(crate) fn speaker_list(app: &App) -> Vec<SpeakerFacts> {
     };
     let row = |id: String, name: String, kind: SpeakerKind, address: String, presence: Presence| {
         let s = settings.get(&id);
+        // *Show as*: the person's name for it, everywhere.
+        let name = s.and_then(|s| s.show_as.clone()).filter(|n| !n.trim().is_empty()).unwrap_or(name);
         let status = app.delay_status_of(&id);
         SpeakerFacts {
             delay: Some(SpeakerDelay { own_ms: status.own_delay_ms, measured: false, change_ms: status.change_ms }),

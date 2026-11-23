@@ -995,3 +995,19 @@ fn the_level_sent_to_music_assistant_is_set_and_scales_the_samples() {
     assert_eq!(sample(0), 0);
     assert!((0..10_000).contains(&sample(50)), "{}", sample(50));
 }
+
+/// *Show as*: the person's name for a speaker is the one every surface
+/// shows.
+#[test]
+fn a_speakers_local_name_is_shown_everywhere() {
+    let fake = plain_renderer();
+    let mut rig = Rig::on(serving_app());
+    let id = add_speaker(&rig.app, &fake);
+    let mut settings = rig.app.speaker_settings(&id);
+    settings.show_as = Some("Kitchen shelf".into());
+    rig.app.set_speaker_settings(&id, settings);
+    rig.list_now();
+    let snapshot = rig.driver.snapshot(2);
+    assert!(snapshot.list.speakers.iter().any(|r| r.title == "Kitchen shelf"), "{:?}", snapshot.list.speakers);
+    assert_eq!(rig.app.speaker_name(&id).as_deref(), Some("Kitchen shelf"));
+}
