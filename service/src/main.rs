@@ -982,7 +982,7 @@ fn run_gui_mode(_app: Arc<App>, _no_tray: bool, _start_hidden: bool) -> Result<(
 /// it counts as 1 minute. There is no upper limit: every value released
 /// versions accepted still starts (a value refused when parsing would stop
 /// a service or scheduled task from starting, unseen), and a large one
-/// only finds speakers later; the window can search again at any time.
+/// only finds speakers later; the window's Rescan searches at any time.
 fn search_interval(cli: &Cli) -> Duration {
     if cli.ssdp_interval == 0 {
         warn!("--ssdp-interval 0 would search without a pause; searching every minute instead");
