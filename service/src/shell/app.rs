@@ -86,6 +86,7 @@ pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()
             quit: Box::new(|| {}),
             quitting: Box::new(|| false),
             popups: Some(popups),
+            tick: Box::new(|| {}),
         },
     )
 }
@@ -114,6 +115,12 @@ pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, op
             quit: Box::new(move || quit.request_shutdown()),
             quitting: Box::new(move || quitting.is_shutting_down()),
             popups: None,
+            tick: {
+                let app = app.clone();
+                Box::new(move || {
+                    let _ = app.retry_settings_save_if_due(std::time::Instant::now());
+                })
+            },
         },
     )
 }
@@ -127,7 +134,7 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
         native,
         Box::new(move |cc| {
             crate::fonts::install(&cc.egui_ctx);
-            let Wiring { port, views, contents, route_opens, quit, quitting, popups } = wiring;
+            let Wiring { port, views, contents, route_opens, quit, quitting, popups, tick } = wiring;
             let (popup_tx, popup_rx) = channel::<(PopupKind, Box<dyn PopupContent + Send>)>();
             if let Some(hand) = popups {
                 let ctx = cc.egui_ctx.clone();
@@ -163,6 +170,7 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
                 contents,
                 quit,
                 quitting,
+                tick,
                 opts,
                 desktop: WindowsDesktop::default(),
                 root,
@@ -207,6 +215,7 @@ struct Shell {
     contents: Box<dyn super::Contents>,
     quit: Box<dyn Fn()>,
     quitting: Box<dyn Fn() -> bool>,
+    tick: Box<dyn Fn()>,
     opts: ShellOptions,
     desktop: WindowsDesktop,
     /// The root window's handle.
@@ -594,6 +603,7 @@ impl eframe::App for Shell {
             return;
         }
         let now = ctx.input(|i| i.time);
+        (self.tick)();
         self.keep_root_away();
         self.follow_settings(ctx, now);
         let snap = self.port.snapshot();

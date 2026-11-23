@@ -301,6 +301,10 @@ pub struct Wiring {
     /// Hands the part that shows the confirmation by the clock and
     /// notifications its door to them. `None`: nothing shows them yet.
     pub popups: Option<Box<dyn FnOnce(popup::PopupDoor)>>,
+    /// Called every frame (at least four times a second): what the app
+    /// does while its windows run (a settings save that failed is tried
+    /// again).
+    pub tick: Box<dyn Fn()>,
 }
 
 /// Until Settings and the dialogs are drawn (the scripted engine): their
