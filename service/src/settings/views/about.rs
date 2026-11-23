@@ -65,6 +65,9 @@ impl ViewContent for AboutView {
             self.port.act(Act::Donate);
         }
         sentence(ui, &w!(lang, SetPrivacyLine));
+        if super::parts::sentence_links(ui, &w!(lang, SetLogsSentence), &[&w!(lang, SetOpenLogs)]).is_some() {
+            self.port.act(Act::OpenLogFolder);
+        }
         gap(ui);
         match links(ui, &[&w!(lang, SetLicences), &w!(lang, SetShowWelcome)]) {
             Some(0) => self.port.act(Act::LicenceAndSource),

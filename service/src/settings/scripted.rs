@@ -26,7 +26,6 @@ pub const CHINESE_NAME: &str = "客厅里的索诺斯音箱和餐厅的音箱";
 /// Everything the scripted app knows, all of it changeable.
 #[derive(Clone, Debug)]
 pub struct State {
-    pub header: Header,
     pub speakers: SpeakersView,
     pub pages: Vec<SpeakerView>,
     pub general: GeneralView,
@@ -109,14 +108,10 @@ fn rename(s: &mut State, id: &str, name: &str) {
             t.name = name.into();
         }
     }
-    s.header.status = format!("Playing on {name}");
     s.playback.speaker = Some(name.into());
 }
 
 impl SettingsPort for ScriptedSettings {
-    fn header(&self) -> Header {
-        self.state.lock().unwrap().header.clone()
-    }
     fn speakers(&self) -> SpeakersView {
         self.state.lock().unwrap().speakers.clone()
     }
@@ -339,10 +334,6 @@ fn apply(s: &mut State, act: &Act) {
             }
         }
         Act::DailyUpdateCheck(on) => s.about.updates.daily = Some(*on),
-        Act::ShowLab(on) => {
-            s.about.lab = *on;
-            s.header.lab = *on;
-        }
         Act::Lab(l) => match l {
             LabAct::AtOnce(v) => s.lab.at_once = Some(*v),
             LabAct::CatchUpFrames(v) => s.lab.catch_up_frames = Some(*v),
@@ -494,7 +485,6 @@ pub fn example() -> State {
     let neighbour_p = page(neighbour.clone(), None);
 
     State {
-        header: Header { status: "Playing on Kitchen".into(), lab: false },
         speakers: SpeakersView {
             networks: Some(Networks {
                 adapters: vec![Adapter { key: "wifi".into(), name: "Wi-Fi".into() }, Adapter { key: "eth2".into(), name: "Ethernet 2".into() }],
@@ -559,7 +549,6 @@ pub fn example() -> State {
                 state: UpdateState::Available { version: "0.2.1".into(), at: Some(Seen::Today(LocalTime::new(9, 12))) },
                 installs_here: true,
             },
-            lab: false,
         },
         lab: LabView {
             at_once: Some(false),

@@ -141,10 +141,13 @@ impl H {
         self.click_at(r.center());
     }
 
-    /// Click the switch at the right end of the line that says `label`.
+    /// Click the switch at the right end of the line that says `label`
+    /// (in the middle of its words and the grey line under them).
     fn flip(&mut self, label: &str) {
         let r = self.find(label).unwrap_or_else(|| panic!("no {label:?}"));
-        self.click_at(egui::pos2(self.width - 16.0 - 20.0, r.top() + 9.0));
+        let under = self.texts.iter().find(|t| (t.rect.left() - r.left()).abs() < 1.0 && (t.rect.top() - r.bottom()).abs() < 4.0).map(|t| t.rect);
+        let y = under.map_or(r.center().y, |u| (r.top() + u.bottom()) / 2.0);
+        self.click_at(egui::pos2(self.width - 16.0 - 20.0, y));
     }
 
     /// Click the link `link` after the words of a sentence (the last thing
@@ -520,6 +523,7 @@ fn every_view(port: Arc<ScriptedSettings>) -> Vec<(String, Box<dyn crate::shell:
     let mut v: Vec<(String, Box<dyn crate::shell::ViewContent>)> = vec![
         ("settings".into(), Box::new(SettingsView::new(p.clone()))),
         ("missing".into(), Box::new(MissingView::new(p.clone()).by_hand())),
+        ("missing upnp".into(), Box::new(MissingView::new(p.clone()).by_hand_upnp())),
         ("check".into(), Box::new(CheckView::new(p.clone()))),
         ("cant hear".into(), Box::new(CantHearView::new(p.clone()))),
         ("music assistant".into(), Box::new(MusicAssistantView::new(p.clone()))),
@@ -726,6 +730,31 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
         },
         |s| s.about.updates.state = UpdateState::NotSigned,
         |s| s.about.updates.state = UpdateState::DevBuild,
+        |s| {
+            s.about.updates.state = UpdateState::UpToDate { at: Seen::On(Date { day: 3, month: 1 }) };
+            s.playback.windows = Some(Err(WindowsSends::Elsewhere { output: "Headphones".into() }));
+            s.ma.found_by = None;
+            s.ma.paired_with.clear();
+            s.lab.carried_over = Some(CarriedOver { airplay_ms: Some(500), homepod_ms: None, homepod_buffered: false, speakers: vec!["Office".into()] });
+            for p in &mut s.pages {
+                p.delay.iter_mut().for_each(|d| d.measured = Some((210, Date { day: 12, month: 10 })));
+            }
+        },
+        |s| {
+            s.about.updates.state = UpdateState::Available { version: "0.2.1".into(), at: None };
+            s.about.updates.installs_here = false;
+            s.playback.connected = Some(Err(()));
+            s.ma.found_by = Some(("Music Assistant (Home)".into(), Some("192.168.1.10".into())));
+            s.ma.paired_with.clear();
+        },
+        |s| {
+            s.playback.taking = Some(Ok(Taking::CantTell));
+            s.playback.on_short = true;
+        },
+        |s| {
+            s.playback.untested = true;
+            s.playback.apple_tv = true;
+        },
     ];
     let mut drawn: Vec<String> = Vec::new();
     for v in variants {

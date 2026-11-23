@@ -80,8 +80,14 @@ impl ViewContent for MusicAssistantView {
                 StepMark::Later
             }
         };
+        let port = self.port.clone();
         step(ui, 1, mark(found, !found), &w!(lang, SetMaStep1), |ui| match &v.found_by {
-            Some((server, Some(at))) => sentence(ui, &w!(lang, SetMaFoundAt, server = server, address = at, pc = pc)),
+            Some((server, Some(at))) => {
+                sentence(ui, &w!(lang, SetMaFoundAt, server = server, address = at, pc = pc));
+                if Button::standard(&w!(lang, SetOpenMa)).icon(crate::ui::icon::Icon::External).show(ui).clicked() {
+                    port.act(Act::OpenMusicAssistant);
+                }
+            }
             Some((server, None)) => sentence(ui, &w!(lang, SetMaFound, server = server, pc = pc)),
             None if found => sentence(ui, &w!(lang, SetMaFoundBefore, pc = pc)),
             None => sentence(ui, &w!(lang, SetMaStep1Line, pc = pc)),

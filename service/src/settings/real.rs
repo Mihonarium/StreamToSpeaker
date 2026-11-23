@@ -414,26 +414,6 @@ impl App {
 }
 
 impl SettingsPort for AppSettings {
-    fn header(&self) -> Header {
-        let lang = self.lang();
-        let app = &self.app;
-        let status = if let Some(c) = app.connecting_to() {
-            w!(lang, ConnectingTitle, speaker = &clean_name(&c).0)
-        } else if app.is_ma_output_selected() {
-            w!(lang, MaPlayingTitle)
-        } else if let Some(s) = app.selected_speaker() {
-            let name = clean_name(&s.friendly_name).0;
-            if app.receiving_windows_audio() {
-                w!(lang, PlayingTitle, speaker = &name)
-            } else {
-                w!(lang, ReadyTitle, speaker = &name)
-            }
-        } else {
-            w!(lang, OnPcTitle)
-        };
-        Header { status, lab: app.user_config.lock().unwrap().show_lab }
-    }
-
     fn speakers(&self) -> SpeakersView {
         let app = &self.app;
         let (hidden, shown): (Vec<_>, Vec<_>) = self.rows().into_iter().partition(|(_, h)| *h);
@@ -635,7 +615,6 @@ impl SettingsPort for AppSettings {
             version: crate::display_version().to_string(),
             driver: None,
             updates: Updates { daily: (!dev).then(|| app.is_check_for_updates()), state, installs_here: false },
-            lab: app.user_config.lock().unwrap().show_lab,
         }
     }
 
@@ -1037,13 +1016,6 @@ impl SettingsPort for AppSettings {
             }
             Act::Donate => self.desktop.open_url(DONATE),
             Act::LicenceAndSource => self.desktop.open_url(REPOSITORY),
-            Act::ShowLab(on) => {
-                let mut uc = app.user_config.lock().unwrap();
-                if uc.show_lab != on {
-                    uc.show_lab = on;
-                    uc.save();
-                }
-            }
             Act::Lab(l) => self.lab_act(l),
             Act::SubmitCode { code, .. } => {
                 if !app.submit_pin(Some(code)) {

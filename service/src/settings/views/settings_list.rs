@@ -118,7 +118,9 @@ impl ViewContent for SettingsView {
             }
         }
         if let Some(back) = g.go_back {
-            if let Some(on) = switch_line(ui, &w!(lang, SetGoBack), back) {
+            let label = w!(lang, SetGoBack);
+            let under = w!(lang, SetGoBackLine);
+            if let Some(on) = super::parts::control_line(ui, &label, Some(&under), |ui| crate::ui::inputs::Switch::new(back, &label).without_words().show(ui)) {
                 self.port.act(Act::GoBack(on));
             }
         }
@@ -153,6 +155,7 @@ impl ViewContent for SettingsView {
                 self.port.act(Act::Api(on));
             }
             if let (true, Some(key)) = (api.on, &api.key) {
+                sentence(ui, &w!(lang, SetApiLine));
                 super::parts::buttons(ui, |ui| {
                     crate::settings::widgets::copy_button(ui, &mut self.st, "api-key", &w!(lang, SetCopyKey), &w!(lang, SetCopied), key);
                     if Button::standard(&w!(lang, SetNewKey)).show(ui).clicked() {
@@ -229,7 +232,6 @@ fn sentence_with_link(ui: &mut Ui, text: &str, link: &str) -> bool {
 /// The delay shortcuts while they are on: each combination and whether
 /// it is free, and *Change…*.
 fn shortcuts(ui: &mut Ui, lang: crate::model::text::Lang, k: &Shortcuts, st: &mut PageState, port: &dyn SettingsPort) {
-    let state = |taken: bool| if taken { w!(lang, SetShortcutTaken) } else { w!(lang, SetShortcutReady) };
     let lines =
         [(w!(lang, SetShortcutRemove, ms = 25u32), k.remove.join("+"), k.taken[0]), (w!(lang, SetShortcutAdd, ms = 25u32), k.add.join("+"), k.taken[1])];
     for (i, (what, keys, taken)) in lines.iter().enumerate() {
@@ -240,7 +242,7 @@ fn shortcuts(ui: &mut Ui, lang: crate::model::text::Lang, k: &Shortcuts, st: &mu
         }
         let line = w!(lang, SetShortcutLine, what = what, keys = keys);
         if *taken {
-            marked(ui, Mark::Warning, Tone::Amber, &format!("{line} {}", state(true)), &[]);
+            marked(ui, Mark::Warning, Tone::Amber, &format!("{line} {}", w!(lang, SetShortcutTaken)), &[]);
         } else {
             marked(ui, Mark::Done, Tone::Secondary, &line, &[]);
         }

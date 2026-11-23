@@ -311,6 +311,7 @@ impl SpeakerOptions {
             if let Some(c) = pick {
                 ask(Ask::Command(Command::UseDelayChoice { speaker: self.sid(), choice: c }));
             }
+            sentence(ui, &w!(lang, SetChoiceReconnects, speaker = name));
             gap(ui);
         }
         if let Some((block, view)) = panel_delay_for(lang, &self.id, name, d) {
@@ -319,15 +320,24 @@ impl SpeakerOptions {
             }
         }
         match v.row.kind {
-            SpeakerKind::Sonos | SpeakerKind::SonosGroup | SpeakerKind::Other { .. } | SpeakerKind::Sendspin => {
+            SpeakerKind::Sonos | SpeakerKind::SonosGroup | SpeakerKind::Other { .. } => {
                 gap(ui);
                 sentence(ui, &w!(lang, SetOwnDelay, speaker = name, delay = &words::about(lang, s.own_delay_ms)));
+            }
+            // Why *Remove* can't be pressed.
+            SpeakerKind::Sendspin => {
+                gap(ui);
+                sentence(ui, &format!("{} {}", w!(lang, SetOwnDelay, speaker = name, delay = &words::about(lang, s.own_delay_ms)), w!(lang, SetSendspinOwn)));
             }
             SpeakerKind::HomePodPair => {
                 gap(ui);
                 sentence(ui, &w!(lang, SetPairAlwaysShort, delay = &words::about(lang, s.own_delay_ms)));
             }
             _ => {}
+        }
+        if let Some((ms, on)) = d.measured {
+            let seconds = lang.number(crate::model::text::Number { value: ((ms + 5) / 10) as i64, scale: 2 });
+            sentence(ui, &w!(lang, SetMeasuredOn, speaker = name, seconds = &seconds, date = &words::date(lang, on)));
         }
         let changeable = s.applies.is_ok() && s.limits.is_some_and(|l| l.remove_ms > 0 || l.add_ms > 0);
         if changeable {

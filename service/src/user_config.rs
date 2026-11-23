@@ -267,10 +267,6 @@ pub struct UserConfig {
     /// entry falls back to the default rather than failing the file.
     #[serde(default)]
     pub equalizer: EqSettings,
-    /// About → *Show Lab (experimental settings)*: the Lab page shows in
-    /// the Settings window.
-    #[serde(default)]
-    pub show_lab: bool,
     /// Lab: Sonos and other UPnP speakers apply a delay change at once,
     /// with a short skip, instead of gradually (see `delay::catch_up`).
     #[serde(default)]
@@ -1036,7 +1032,6 @@ const SETTING_LABELS: &[(&str, &str, bool)] = &[
     ("discovery_adapter", "Discovery network adapter", true),
     ("speaker_settings", "Each speaker's settings", false),
     ("equalizer", "Equalizer", true),
-    ("show_lab", "Show Lab (experimental settings)", true),
     ("delay_at_once", "Apply delay changes on Sonos and UPnP speakers", true),
 ];
 
@@ -1050,7 +1045,7 @@ const SPEAKER_LABELS: &[(&str, &str, bool)] = &[
     ("delay_choice", "Short delay or Steady", false),
     ("level", "The volume last used with it", false),
     ("song_titles", "Show song titles", false),
-    ("tone", "Tone", true),
+    ("tone", "Tone", false),
     ("last_played", "When it last played from this PC", false),
     ("volume_limit", "Never louder than", false),
     ("show_as", "Show as", false),
@@ -2172,7 +2167,6 @@ mod tests {
         );
         c.equalizer = EqSettings { enabled: true, preamp_db: -3.0, bands_db: [1.5; crate::equalizer::EQ_BANDS] };
         c.equalizer.bands_db[0] = -2.0;
-        c.show_lab = true;
         c.delay_at_once = true;
         c
     }

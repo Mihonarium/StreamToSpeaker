@@ -73,6 +73,13 @@ impl MissingView {
         self.by_hand = true;
         self
     }
+
+    /// With the fields for a UPnP speaker by hand open (pictures).
+    pub fn by_hand_upnp(mut self) -> Self {
+        self.by_hand = true;
+        self.airplay = false;
+        self
+    }
 }
 
 impl ViewContent for MissingView {
@@ -109,8 +116,8 @@ impl ViewContent for MissingView {
         }
         if let Some(on) = v.sendspin {
             let label = w!(lang, SetLookSendspin);
-            let experimental = w!(lang, SetExperimentalCap);
-            let switched = control_line(ui, &label, Some(&experimental), |ui| crate::ui::inputs::Switch::new(on, &label).without_words().show(ui));
+            let under = format!("{} {}", w!(lang, SetExperimentalCap), w!(lang, SetSendspinLine));
+            let switched = control_line(ui, &label, Some(&under), |ui| crate::ui::inputs::Switch::new(on, &label).without_words().show(ui));
             if let Some(on) = switched {
                 self.port.act(Act::SendspinSpeakers(on));
             }
