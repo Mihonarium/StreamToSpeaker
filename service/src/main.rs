@@ -123,10 +123,6 @@ struct Cli {
     #[arg(long, default_value_t = false, hide = true)]
     startup: bool,
 
-    /// Start the new panel, tray and windows instead of the window.
-    #[arg(long, default_value_t = false, hide = true)]
-    new_shell: bool,
-
     /// Enable the HTTP / JSON API and built-in web UI. Both need the web
     /// UI's link, which carries a secret key (shown in the window; printed
     /// at start with --headless, and by --web-link). The audio stream
@@ -876,17 +872,13 @@ fn run_headless(app: Arc<App>) -> Result<()> {
 
 #[cfg(windows)]
 fn run_gui_mode(app: Arc<App>, engine: Arc<stream_to_speaker::engine::Engine>, cli: &Cli) -> Result<()> {
-    // Run the GUI (blocks until window/tray exits).
-    let ran = if cli.new_shell {
-        let options = stream_to_speaker::shell::ShellOptions {
-            open_at_start: !cli.startup,
-            ..stream_to_speaker::shell::ShellOptions::from_env(!cli.no_tray)
-        };
-        stream_to_speaker::shell::run_app(app.clone(), engine, options)
-    } else {
-        let _ = engine;
-        stream_to_speaker::gui::run(app.clone(), !cli.no_tray, cli.startup && !cli.no_tray)
+    // The panel by the clock, the tray and the app's windows (blocks until
+    // Quit). Started at sign-in, the panel waits for a click.
+    let options = stream_to_speaker::shell::ShellOptions {
+        open_at_start: !cli.startup,
+        ..stream_to_speaker::shell::ShellOptions::from_env(!cli.no_tray)
     };
+    let ran = stream_to_speaker::shell::run_app(app.clone(), engine, options);
     if let Err(e) = ran {
         warn!("GUI exited with error: {:#}", e);
         // Surface to the user — without this the process just
