@@ -45,26 +45,34 @@ pub(crate) fn longer(s: &str) -> String {
     }
 }
 
-/// Whether `k` is one of the Settings window's sentences (the last block
-/// of the table).
+/// Whether `k` is one of the sentences of the views and dialogs (the last
+/// block of the table, which starts with *About*).
 #[cfg(test)]
 pub(crate) fn is_settings_key(k: Key) -> bool {
-    k >= Key::SetWindowTitle
+    k >= Key::SetNavAbout
 }
 
-/// The kind of a speaker as Settings names it: *Sonos*, *AirPlay
-/// speaker*.
-pub fn kind(lang: Lang, k: &SpeakerKind) -> String {
+/// The kind of a speaker as its row says it: *Sonos*, *AirPlay*.
+pub fn kind_short(lang: Lang, k: &SpeakerKind) -> String {
     match k {
         SpeakerKind::Sonos => w!(lang, KindSonos),
         SpeakerKind::SonosGroup => w!(lang, KindSonosGroup),
         SpeakerKind::HomePod => w!(lang, KindHomePod),
         SpeakerKind::HomePodPair => w!(lang, KindHomePodPair),
         SpeakerKind::AppleTv => w!(lang, KindAppleTv),
-        SpeakerKind::AirPlay => w!(lang, SetKindAirPlay),
+        SpeakerKind::AirPlay => w!(lang, KindAirPlay),
         SpeakerKind::Sendspin => w!(lang, KindSendspin),
         SpeakerKind::Other { maker: Some(m) } => m.clone(),
         SpeakerKind::Other { maker: None } => w!(lang, KindSpeaker),
+    }
+}
+
+/// A delay in seconds, rounded as rows round it: 0.3, 2.
+pub fn seconds(ms: u32) -> crate::model::text::Number {
+    use crate::model::delay::{figure, Figure};
+    use crate::model::facts::SpeakerDelay;
+    match figure(SpeakerDelay { own_ms: ms, measured: false, change_ms: 0 }) {
+        Figure::About(n) | Figure::Under(n) | Figure::Measured(n) => n,
     }
 }
 

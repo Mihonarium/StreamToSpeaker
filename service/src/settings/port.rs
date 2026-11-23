@@ -20,9 +20,6 @@ pub trait SettingsPort: Send + Sync {
     fn lang(&self) -> Lang {
         Lang::English
     }
-    /// The line under the app's name in the navigation, and whether Lab is
-    /// shown.
-    fn header(&self) -> Header;
     fn speakers(&self) -> SpeakersView;
     /// One speaker's page; `None` once it is gone (forgotten or removed).
     fn speaker(&self, id: &str) -> Option<SpeakerView>;
@@ -44,14 +41,6 @@ pub trait SettingsPort: Send + Sync {
     fn report(&self, parts: ReportParts) -> String;
     /// Do something. Returns at once; what changed shows in the next read.
     fn act(&self, act: Act);
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Header {
-    /// The state sentence: *Playing on Kitchen*.
-    pub status: String,
-    /// Lab is turned on in About.
-    pub lab: bool,
 }
 
 // -------------------------------------------------------------------------
@@ -414,7 +403,6 @@ pub struct AboutView {
     pub version: String,
     pub driver: Option<Driver>,
     pub updates: Updates,
-    pub lab: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -828,7 +816,6 @@ pub enum Act {
     RestartWindows,
     Donate,
     LicenceAndSource,
-    ShowLab(bool),
     // Lab
     Lab(LabAct),
     // Dialogs
