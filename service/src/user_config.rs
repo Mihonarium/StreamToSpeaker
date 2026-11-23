@@ -1825,9 +1825,12 @@ mod tests {
         );
         assert!(!notice.restored_from_backup && !notice.all_reset && notice.unusable_kept_as.is_none());
         let copy = notice.reset_kept_as.clone().unwrap();
-        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+        let mut kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+        // Where passwords are sealed (Windows), the copy holds them sealed:
+        // opened, it is the file as it was.
+        secret_store::unseal(&mut kept, &PlatformCodec);
         let found: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(kept, found, "the copy is the file as it was (nothing to seal off Windows)");
+        assert_eq!(kept, found, "the copy opens to the file as it was");
         // What was read is saved at once: the file holds what the app runs
         // with, and the next start has nothing to tell.
         let on_disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
