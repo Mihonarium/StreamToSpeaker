@@ -32,7 +32,9 @@ pub(super) fn page(ui: &mut Ui, cx: &mut Cx, st: &mut PageState) {
                     ui.add_space(28.0);
                     ui.vertical(|ui| {
                         let title = w!(lang, SetPlayCalls);
-                        let on = row(ui, None, &title, Some(&w!(lang, SetPlayCallsLine)), |ui| Switch::new(calls, &title).enabled(mode == WhatPlays::Everything).show(ui));
+                        let on = row(ui, None, &title, Some(&w!(lang, SetPlayCallsLine)), |ui| {
+                            Switch::new(calls, &title).enabled(mode == WhatPlays::Everything).show(ui)
+                        });
                         if let Some(on) = on {
                             cx.act(Act::PlayCalls(on));
                         }
@@ -127,10 +129,7 @@ fn shortcuts(ui: &mut Ui, cx: &mut Cx, st: &mut PageState, k: &Shortcuts) {
             return;
         }
         divider(ui);
-        let lines = [
-            (w!(lang, SetShortcutRemove, ms = 25u32), &k.remove),
-            (w!(lang, SetShortcutAdd, ms = 25u32), &k.add),
-        ];
+        let lines = [(w!(lang, SetShortcutRemove, ms = 25u32), &k.remove), (w!(lang, SetShortcutAdd, ms = 25u32), &k.add)];
         for (i, (label, keys)) in lines.iter().enumerate() {
             shortcut_line(ui, cx, st, i, label, |ui| keycaps(ui, keys), k.taken[i]);
         }

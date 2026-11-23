@@ -1,7 +1,7 @@
 //! Settings → Privacy & remote: who can listen, devices recently refused,
 //! the phone remote, and the key for scripts.
 
-use egui::{Rect, Sense, Ui, Vec2};
+use egui::Ui;
 
 use crate::ui::button::Button;
 use crate::ui::icon::Icon;
@@ -82,10 +82,6 @@ fn phone(ui: &mut Ui, cx: &mut Cx, st: &mut PageState, p: &Phone) {
         divider(ui);
         ui.horizontal_top(|ui| {
             ui.add_space(46.0);
-            if let Some(m) = super::qr::matrix(link) {
-                qr(ui, &m, 120.0);
-                ui.add_space(14.0);
-            }
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 body(ui, &w!(lang, SetScanOrOpen));
@@ -127,22 +123,4 @@ fn api(ui: &mut Ui, cx: &mut Cx, st: &mut PageState, a: &Api) {
             });
         }
     });
-}
-
-/// Draw a QR code `side` points wide, with its quiet zone, dark on white
-/// in both themes (phones read it best so).
-fn qr(ui: &mut Ui, m: &[Vec<bool>], side: f32) {
-    let n = m.len() as f32 + 8.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(side), Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, 4.0, egui::Color32::WHITE);
-    let cell = side / n;
-    for (y, line) in m.iter().enumerate() {
-        for (x, dark) in line.iter().enumerate() {
-            if *dark {
-                let min = rect.min + Vec2::new((x as f32 + 4.0) * cell, (y as f32 + 4.0) * cell);
-                p.rect_filled(Rect::from_min_size(min, Vec2::splat(cell + 0.02)), 0.0, egui::Color32::BLACK);
-            }
-        }
-    }
 }

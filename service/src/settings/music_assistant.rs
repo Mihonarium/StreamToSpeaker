@@ -77,7 +77,15 @@ fn steps(ui: &mut Ui, cx: &mut Cx, st: &mut PageState, v: &MaView) {
     let found = v.found_by.is_some() || !v.paired_with.is_empty();
     let paired = !v.paired_with.is_empty();
     let played = v.played.is_some();
-    let mark = |done: bool, current: bool| if done { StepMark::Done } else if current { StepMark::Current } else { StepMark::Later };
+    let mark = |done: bool, current: bool| {
+        if done {
+            StepMark::Done
+        } else if current {
+            StepMark::Current
+        } else {
+            StepMark::Later
+        }
+    };
     boxed(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 6.0;
         step(ui, 1, mark(found, !found), &w!(lang, SetMaStep1), |ui| match &v.found_by {

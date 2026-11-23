@@ -94,10 +94,13 @@ fn updates(ui: &mut Ui, cx: &mut Cx, u: &Updates) {
         UpdateState::UpToDate { at } => (w!(lang, SetUpToDate), checked(&Some(*at))),
         UpdateState::Available { version, at } => {
             let how = if u.installs_here { w!(lang, SetUpdateHow) } else { w!(lang, SetUpdateHowPage) };
-            (w!(lang, NoticeUpdate, version = version), Some(match checked(at) {
-                Some(c) => format!("{c} {how}"),
-                None => how,
-            }))
+            (
+                w!(lang, NoticeUpdate, version = version),
+                Some(match checked(at) {
+                    Some(c) => format!("{c} {how}"),
+                    None => how,
+                }),
+            )
         }
         UpdateState::Failed { why } => (w!(lang, SetUpdateFailed), Some(why.clone())),
         UpdateState::Downloading => (w!(lang, SetDownloading), None),

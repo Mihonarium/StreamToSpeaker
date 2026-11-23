@@ -88,7 +88,16 @@ impl Harness {
     }
 
     fn with(surface: Surface, port: ScriptedSettings, size: Vec2, scale: f32) -> Self {
-        let mut h = Harness { ctx: preview::context(fonts(), Mode::Light), port: Arc::new(port), surface, size, scale, pass: 0, requests: Vec::new(), texts: Vec::new() };
+        let mut h = Harness {
+            ctx: preview::context(fonts(), Mode::Light),
+            port: Arc::new(port),
+            surface,
+            size,
+            scale,
+            pass: 0,
+            requests: Vec::new(),
+            texts: Vec::new(),
+        };
         h.settle();
         h
     }
@@ -157,11 +166,8 @@ impl Harness {
     /// are kept together, so they are no-break spaces there).
     fn click_link(&mut self, link: &str) {
         let glued = link.replace(' ', "\u{a0}");
-        let (t, at) = self
-            .texts
-            .iter()
-            .find_map(|t| t.text.find(&glued).map(|i| (t.clone(), t.text[..i].chars().count())))
-            .unwrap_or_else(|| panic!("no link {link:?}"));
+        let (t, at) =
+            self.texts.iter().find_map(|t| t.text.find(&glued).map(|i| (t.clone(), t.text[..i].chars().count()))).unwrap_or_else(|| panic!("no link {link:?}"));
         let middle = at + link.chars().count() / 2;
         let r = t.galley.pos_from_cursor(&t.galley.from_ccursor(egui::text::CCursor::new(middle)));
         self.click_at(t.pos + r.center().to_vec2());
@@ -227,16 +233,41 @@ fn clicking(page: Page, text: &str, acts: Vec<Act>, check: impl Fn(&State) -> bo
 fn every_control_on_a_speakers_page_makes_its_change() {
     let k = || "kitchen".to_string();
     let table: Vec<(Page, &str, Vec<Act>, Box<dyn Fn(&State) -> bool>)> = vec![
-        (page_of("kitchen"), "Remove 25 ms", vec![Act::Delay(k(), DelayAct::Remove(25))], Box::new(|s| speaker(s, "kitchen").delay.unwrap().status.change_ms == -75)),
-        (page_of("kitchen"), "Remove 100 ms", vec![Act::Delay(k(), DelayAct::Remove(100))], Box::new(|s| speaker(s, "kitchen").delay.unwrap().status.change_ms == -150)),
+        (
+            page_of("kitchen"),
+            "Remove 25 ms",
+            vec![Act::Delay(k(), DelayAct::Remove(25))],
+            Box::new(|s| speaker(s, "kitchen").delay.unwrap().status.change_ms == -75),
+        ),
+        (
+            page_of("kitchen"),
+            "Remove 100 ms",
+            vec![Act::Delay(k(), DelayAct::Remove(100))],
+            Box::new(|s| speaker(s, "kitchen").delay.unwrap().status.change_ms == -150),
+        ),
         (page_of("kitchen"), "Add 25 ms", vec![Act::Delay(k(), DelayAct::Add(25))], Box::new(|s| speaker(s, "kitchen").delay.unwrap().status.change_ms == -25)),
-        (page_of("kitchen"), "Add 100 ms", vec![Act::Delay(k(), DelayAct::Add(100))], Box::new(|s| speaker(s, "kitchen").delay.unwrap().status.change_ms == 50)),
-        (page_of("kitchen"), "AirPlay — about 2 s delay", vec![Act::ConnectWith { id: k(), own_way: false }], Box::new(|s| !speaker(s, "kitchen").connects_with.unwrap().own_way)),
+        (
+            page_of("kitchen"),
+            "Add 100 ms",
+            vec![Act::Delay(k(), DelayAct::Add(100))],
+            Box::new(|s| speaker(s, "kitchen").delay.unwrap().status.change_ms == 50),
+        ),
+        (
+            page_of("kitchen"),
+            "AirPlay — about 2 s delay",
+            vec![Act::ConnectWith { id: k(), own_way: false }],
+            Box::new(|s| !speaker(s, "kitchen").connects_with.unwrap().own_way),
+        ),
         (page_of("kitchen"), "Undo", vec![Act::Tone(k(), ToneAct::Undo)], Box::new(|_| true)),
         (page_of("kitchen"), "Reset to flat", vec![Act::Tone(k(), ToneAct::Flat)], Box::new(|s| speaker(s, "kitchen").tone == Some((0.0, 0.0)))),
         (page_of("kitchen"), "Forget Kitchen", vec![Act::Forget(k())], Box::new(|s| !s.pages.iter().any(|p| p.row.id == "kitchen"))),
         (page_of("kitchen"), "Hide from the list", vec![Act::HideSpeaker(k())], Box::new(|s| s.speakers.hidden.iter().any(|r| r.id == "kitchen"))),
-        (page_of("office"), "Short delay — about 0.3 s", vec![Act::Delay("office".into(), DelayAct::Choose(DelayChoice::Short))], Box::new(|s| speaker(s, "office").delay.unwrap().status.choice == Some(DelayChoice::Short))),
+        (
+            page_of("office"),
+            "Short delay — about 0.3 s",
+            vec![Act::Delay("office".into(), DelayAct::Choose(DelayChoice::Short))],
+            Box::new(|s| speaker(s, "office").delay.unwrap().status.choice == Some(DelayChoice::Short)),
+        ),
         (page_of("office"), "Remove", vec![Act::RemovePassword("office".into())], Box::new(|s| speaker(s, "office").pairing.is_none())),
         (page_of("office"), "Play on Office", vec![Act::PlayOn("office".into())], Box::new(|_| true)),
         (page_of("bedroom"), "Pair again", vec![Act::PairAgain("bedroom".into())], Box::new(|_| true)),
@@ -270,10 +301,7 @@ fn switches_and_choices_change_their_setting() {
     h.click("Any device on this network that asks");
     h.click("Make a new link");
     h.click("Allow for Kitchen");
-    assert_eq!(
-        h.acts(),
-        vec![Act::OnlyPlaying(false), Act::NewLink, Act::Allow { address: "192.168.1.51".into(), speaker: "kitchen".into() }]
-    );
+    assert_eq!(h.acts(), vec![Act::OnlyPlaying(false), Act::NewLink, Act::Allow { address: "192.168.1.51".into(), speaker: "kitchen".into() }]);
     assert!(!h.state().privacy.only_playing);
 
     let mut h = Harness::window(Page::Speakers, ScriptedSettings::new());
@@ -360,7 +388,13 @@ fn links_and_buttons_open_pages_and_dialogs() {
 #[test]
 fn the_navigation_moves_between_pages_and_shows_lab_only_when_on() {
     let mut h = Harness::window(Page::Speakers, ScriptedSettings::new());
-    for (name, page) in [("General", Page::General), ("Music Assistant", Page::MusicAssistant), ("Privacy & remote", Page::Privacy), ("Help", Page::Help), ("About", Page::About)] {
+    for (name, page) in [
+        ("General", Page::General),
+        ("Music Assistant", Page::MusicAssistant),
+        ("Privacy & remote", Page::Privacy),
+        ("Help", Page::Help),
+        ("About", Page::About),
+    ] {
         let r = h.texts.iter().filter(|t| t.text == name).map(|t| t.rect).min_by(|a, b| a.left().total_cmp(&b.left())).unwrap();
         h.click_at(r.center());
         assert_eq!(h.page(), page);
@@ -436,7 +470,15 @@ fn a_password_is_kept_or_used_to_connect() {
 fn a_sendspin_code_or_its_token() {
     let port = ScriptedSettings::new();
     port.set(|s| {
-        s.wanted = Some(Wanted::SendspinCode(SendspinAsk { id: "desk".into(), name: "Desk Speaker".into(), live_code: true, seconds_left: Some(160), identity_changed: false, lost: false, wrong: false }))
+        s.wanted = Some(Wanted::SendspinCode(SendspinAsk {
+            id: "desk".into(),
+            name: "Desk Speaker".into(),
+            live_code: true,
+            seconds_left: Some(160),
+            identity_changed: false,
+            lost: false,
+            wrong: false,
+        }))
     });
     let mut h = Harness::dialog(Dialog::Sendspin(SendspinDialog::new("desk")), port);
     h.click("No code? Paste its pairing token (starts with SP:)");
@@ -453,7 +495,12 @@ fn adding_by_address_finds_then_adds() {
     h.click("Find");
     assert_eq!(h.acts(), vec![Act::Find { address: "192.168.20.40".into(), name: String::new() }]);
     assert!(h.has("Checking 192.168.20.40…"));
-    h.port.set(|s| s.probe = Probe::Found { address: "192.168.20.40".into(), ways: vec![Found { name: "Garage".into(), kind: SpeakerKind::AirPlay, delay_ms: 2000, way: Way::AirPlay }] });
+    h.port.set(|s| {
+        s.probe = Probe::Found {
+            address: "192.168.20.40".into(),
+            ways: vec![Found { name: "Garage".into(), kind: SpeakerKind::AirPlay, delay_ms: 2000, way: Way::AirPlay }],
+        }
+    });
     h.settle();
     assert!(h.has("AirPlay speaker at 192.168.20.40 · about 2 s delay"));
     h.click("Add Garage");
@@ -497,15 +544,38 @@ fn assert_clean(texts: &[Text], right: f32, what: &str) {
         assert!(a.rect.right() <= right + 0.5, "{what}: {:?} runs past the window ({} > {right})", a.text, a.rect.right());
         for b in &texts[i + 1..] {
             let x = a.rect.intersect(b.rect);
-            assert!(!(a.rect.intersects(b.rect) && x.width() > 1.0 && x.height() > 1.0), "{what}: {:?} at {:?} overlaps {:?} at {:?}", a.text, a.rect, b.text, b.rect);
+            assert!(
+                !(a.rect.intersects(b.rect) && x.width() > 1.0 && x.height() > 1.0),
+                "{what}: {:?} at {:?} overlaps {:?} at {:?}",
+                a.text,
+                a.rect,
+                b.text,
+                b.rect
+            );
         }
         let words = a.text.split_whitespace().count();
-        assert!(!(a.words_per_row.len() >= 3 && words >= 3 && a.words_per_row.iter().all(|w| *w <= 1)), "{what}: {:?} is squeezed into a column of single words", a.text);
+        assert!(
+            !(a.words_per_row.len() >= 3 && words >= 3 && a.words_per_row.iter().all(|w| *w <= 1)),
+            "{what}: {:?} is squeezed into a column of single words",
+            a.text
+        );
     }
 }
 
 fn every_page() -> Vec<Page> {
-    let mut pages = vec![Page::Speakers, Page::General, Page::MusicAssistant, Page::Privacy, Page::Help, Page::Guide(1), Page::Guide(2), Page::CantHear, Page::CantFind, Page::About, Page::Lab];
+    let mut pages = vec![
+        Page::Speakers,
+        Page::General,
+        Page::MusicAssistant,
+        Page::Privacy,
+        Page::Help,
+        Page::Guide(1),
+        Page::Guide(2),
+        Page::CantHear,
+        Page::CantFind,
+        Page::About,
+        Page::Lab,
+    ];
     for id in ["kitchen", "living", "bedroom", "office", "garage", "den", "desk"] {
         pages.push(page_of(id));
     }
@@ -514,16 +584,31 @@ fn every_page() -> Vec<Page> {
 
 fn every_dialog() -> Vec<(Dialog, fn(&mut State))> {
     vec![
-        (Dialog::Code(CodeDialog::new("den")), |s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: CHINESE_NAME.into(), stage: CodeStage::Wrong, seconds_left: Some(102) }))),
+        (Dialog::Code(CodeDialog::new("den")), |s| {
+            s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: CHINESE_NAME.into(), stage: CodeStage::Wrong, seconds_left: Some(102) }))
+        }),
         (Dialog::Password(PasswordDialog::to_connect("office", CHINESE_NAME)), |s| s.wanted = None),
         (Dialog::Sendspin(SendspinDialog::new("desk")), |s| {
-            s.wanted = Some(Wanted::SendspinCode(SendspinAsk { id: "desk".into(), name: CHINESE_NAME.into(), live_code: true, seconds_left: Some(160), identity_changed: true, lost: false, wrong: true }))
+            s.wanted = Some(Wanted::SendspinCode(SendspinAsk {
+                id: "desk".into(),
+                name: CHINESE_NAME.into(),
+                live_code: true,
+                seconds_left: Some(160),
+                identity_changed: true,
+                lost: false,
+                wrong: true,
+            }))
         }),
-        (Dialog::MaCode(Default::default()), |s| s.wanted = Some(Wanted::MaCode(MaCodeShow { code: "482917".into(), this_pc: CHINESE_NAME.into(), seconds_left: Some(161) }))),
+        (Dialog::MaCode(Default::default()), |s| {
+            s.wanted = Some(Wanted::MaCode(MaCodeShow { code: "482917".into(), this_pc: CHINESE_NAME.into(), seconds_left: Some(161) }))
+        }),
         (Dialog::AddAddress(AddDialog::by_hand_open()), |s| {
             s.probe = Probe::Found {
                 address: "192.168.20.40".into(),
-                ways: vec![Found { name: CHINESE_NAME.into(), kind: SpeakerKind::Sonos, delay_ms: 200, way: Way::Upnp }, Found { name: CHINESE_NAME.into(), kind: SpeakerKind::AirPlay, delay_ms: 2000, way: Way::AirPlay }],
+                ways: vec![
+                    Found { name: CHINESE_NAME.into(), kind: SpeakerKind::Sonos, delay_ms: 200, way: Way::Upnp },
+                    Found { name: CHINESE_NAME.into(), kind: SpeakerKind::AirPlay, delay_ms: 2000, way: Way::AirPlay },
+                ],
             }
         }),
         (Dialog::Tone(ToneDialog::new("kitchen")), |_| ()),
@@ -540,7 +625,8 @@ fn every_page_holds_at_the_smallest_size_at_200_percent_with_longer_words_and_ch
                 let port = ScriptedSettings::with_names(names);
                 port.set(|s| {
                     s.header.lab = true;
-                    s.lab.carried_over = Some(CarriedOver { airplay_ms: Some(500), homepod_ms: Some(150), homepod_buffered: true, speakers: vec![CHINESE_NAME.into()] });
+                    s.lab.carried_over =
+                        Some(CarriedOver { airplay_ms: Some(500), homepod_ms: Some(150), homepod_buffered: true, speakers: vec![CHINESE_NAME.into()] });
                 });
                 let mut w = Window::new();
                 w.open(page.clone());
@@ -711,11 +797,10 @@ fn every_sentence_of_the_window_is_used_and_none_is_left_unfilled() {
         }
     }
     // Speakers' delay notes and pages in other states.
-    let delay_states: Vec<fn(&mut DelayStatusView)> = vec![
-        |d| d.progress = Progress::CatchingUp { ms_to_go: -25 },
-        |d| d.progress = Progress::WillReconnect,
-        |d| d.notice = Some(DelayNotice::ChoiceSwitched { to: DelayChoice::Short, now_ms: 0, other_ms: -300 }),
-    ];
+    let delay_states: Vec<fn(&mut DelayStatusView)> =
+        vec![|d| d.progress = Progress::CatchingUp { ms_to_go: -25 }, |d| d.progress = Progress::WillReconnect, |d| {
+            d.notice = Some(DelayNotice::ChoiceSwitched { to: DelayChoice::Short, now_ms: 0, other_ms: -300 })
+        }];
     for f in delay_states {
         let port = ScriptedSettings::new();
         port.set(|s| s.pages.iter_mut().filter_map(|p| p.delay.as_mut()).for_each(|d| f(&mut d.status)));
@@ -792,17 +877,37 @@ fn every_sentence_of_the_window_is_used_and_none_is_left_unfilled() {
     look(&Harness::window(page_of("den"), port));
     // Every dialog, in each of its states.
     let mut dialogs = every_dialog();
-    dialogs.push((Dialog::Code(CodeDialog::new("den")), |s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::Starting, seconds_left: None }))));
-    dialogs.push((Dialog::Code(CodeDialog::new("den")), |s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::Checking, seconds_left: None }))));
-    dialogs.push((Dialog::Code(CodeDialog::new("den")), |s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::TimedOut, seconds_left: None }))));
-    dialogs.push((Dialog::Code(CodeDialog::new("den")), |s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::NoAnswer, seconds_left: None }))));
-    dialogs.push((Dialog::Code(CodeDialog::new("den")), |s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::Showing, seconds_left: None }))));
+    dialogs.push((Dialog::Code(CodeDialog::new("den")), |s| {
+        s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::Starting, seconds_left: None }))
+    }));
+    dialogs.push((Dialog::Code(CodeDialog::new("den")), |s| {
+        s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::Checking, seconds_left: None }))
+    }));
+    dialogs.push((Dialog::Code(CodeDialog::new("den")), |s| {
+        s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::TimedOut, seconds_left: None }))
+    }));
+    dialogs.push((Dialog::Code(CodeDialog::new("den")), |s| {
+        s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::NoAnswer, seconds_left: None }))
+    }));
+    dialogs.push((Dialog::Code(CodeDialog::new("den")), |s| {
+        s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::Showing, seconds_left: None }))
+    }));
     dialogs.push((Dialog::Password(PasswordDialog::to_connect("office", "Office")), |s| s.wanted = None));
     dialogs.push((Dialog::Password(PasswordDialog::change("office", "Office")), |s| s.wanted = None));
     dialogs.push((Dialog::Sendspin(SendspinDialog::new("desk")), |s| {
-        s.wanted = Some(Wanted::SendspinCode(SendspinAsk { id: "desk".into(), name: "Desk".into(), live_code: false, seconds_left: None, identity_changed: false, lost: true, wrong: false }))
+        s.wanted = Some(Wanted::SendspinCode(SendspinAsk {
+            id: "desk".into(),
+            name: "Desk".into(),
+            live_code: false,
+            seconds_left: None,
+            identity_changed: false,
+            lost: true,
+            wrong: false,
+        }))
     }));
-    dialogs.push((Dialog::MaCode(Default::default()), |s| s.wanted = Some(Wanted::MaCode(MaCodeShow { code: "482917".into(), this_pc: "PC".into(), seconds_left: None }))));
+    dialogs.push((Dialog::MaCode(Default::default()), |s| {
+        s.wanted = Some(Wanted::MaCode(MaCodeShow { code: "482917".into(), this_pc: "PC".into(), seconds_left: None }))
+    }));
     dialogs.push((Dialog::AddAddress(AddDialog::default()), |s| s.probe = Probe::Nothing { address: "192.168.1.20".into() }));
     dialogs.push((Dialog::AddAddress(AddDialog::default()), |s| s.probe = Probe::Invalid("That speaker is already in the list.".into())));
     dialogs.push((Dialog::AddAddress(AddDialog::default()), |s| s.probe = Probe::Checking { address: "x".into() }));
@@ -832,7 +937,7 @@ fn every_sentence_of_the_window_is_used_and_none_is_left_unfilled() {
             look(&h);
         }
         // The report's buttons say what happened.
-        for b in ["Copy report", "Save as file…", "Open a GitHub issue"] {
+        for b in ["Copy report", "Save as a file", "Open a GitHub issue"] {
             if h.has(b) {
                 h.click(b);
                 look(&h);
@@ -1010,4 +1115,3 @@ fn a_moment_is_said_as_today_yesterday_or_a_date() {
     }
     assert_eq!(super::real::days_from_civil(2026, 11, 23) * 86_400 + 12 * 3600, now as i64);
 }
-

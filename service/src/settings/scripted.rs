@@ -350,9 +350,7 @@ fn apply(s: &mut State, act: &Act) {
         Act::Find { address, .. } => s.probe = Probe::Checking { address: address.clone() },
         Act::AddFound { .. } | Act::AddByHand { .. } => s.probe = Probe::Added,
         Act::ResetProbe => s.probe = Probe::Idle,
-        Act::SubmitCode { .. } | Act::CancelPairing(_) | Act::CancelPassword(_) | Act::CancelSendspin(_) | Act::CancelMaPairing => {
-            s.wanted = None
-        }
+        Act::SubmitCode { .. } | Act::CancelPairing(_) | Act::CancelPassword(_) | Act::CancelSendspin(_) | Act::CancelMaPairing => s.wanted = None,
         _ => {}
     }
 }
@@ -489,10 +487,7 @@ pub fn example() -> State {
         header: Header { status: "Playing on Kitchen".into(), lab: false },
         speakers: SpeakersView {
             networks: Some(Networks {
-                adapters: vec![
-                    Adapter { key: "wifi".into(), name: "Wi-Fi".into() },
-                    Adapter { key: "eth2".into(), name: "Ethernet 2".into() },
-                ],
+                adapters: vec![Adapter { key: "wifi".into(), name: "Wi-Fi".into() }, Adapter { key: "eth2".into(), name: "Ethernet 2".into() }],
                 chosen: None,
                 looking: Looking::On(vec![
                     NetworkPlace { adapter: "Wi-Fi".into(), network: Some("HomeNet".into()), address: "192.168.1.23".into() },
@@ -535,7 +530,12 @@ pub fn example() -> State {
         privacy: PrivacyView {
             only_playing: true,
             refused: Some(vec![
-                Refused { name: Some("Kitchen Sub".into()), address: "192.168.1.51".into(), at: LocalTime::new(20, 40), group_of: Some(("kitchen".into(), "Kitchen".into())) },
+                Refused {
+                    name: Some("Kitchen Sub".into()),
+                    address: "192.168.1.51".into(),
+                    at: LocalTime::new(20, 40),
+                    group_of: Some(("kitchen".into(), "Kitchen".into())),
+                },
                 Refused { name: None, address: "192.168.1.77".into(), at: LocalTime::new(21, 12), group_of: None },
             ]),
             phone: Some(Phone { on: true, link: Some("http://192.168.1.23:5901/r/2f7a9c41d0b85e63a1c4f09b7d2e8a56/".into()), problem: None }),
@@ -544,7 +544,11 @@ pub fn example() -> State {
         about: AboutView {
             version: "0.2.0".into(),
             driver: Some(Driver::Waiting { installed: "1.1.2.215".into(), running: "1.1.1.211".into() }),
-            updates: Updates { daily: Some(true), state: UpdateState::Available { version: "0.2.1".into(), at: Some(Seen::Today(LocalTime::new(9, 12))) }, installs_here: true },
+            updates: Updates {
+                daily: Some(true),
+                state: UpdateState::Available { version: "0.2.1".into(), at: Some(Seen::Today(LocalTime::new(9, 12))) },
+                installs_here: true,
+            },
             lab: false,
         },
         lab: LabView {
@@ -577,7 +581,10 @@ pub fn example() -> State {
         },
         discovery: DiscoveryCheck {
             lines: vec![
-                FindLine::LookingOn { place: NetworkPlace { adapter: "Wi-Fi".into(), network: Some("HomeNet".into()), address: "192.168.1.x".into() }, found: 4 },
+                FindLine::LookingOn {
+                    place: NetworkPlace { adapter: "Wi-Fi".into(), network: Some("HomeNet".into()), address: "192.168.1.x".into() },
+                    found: 4,
+                },
                 FindLine::Vpn {
                     vpn: NetworkPlace { adapter: "Corp VPN".into(), network: None, address: "10.8.0.x".into() },
                     only: Adapter { key: "wifi".into(), name: "Wi-Fi".into() },

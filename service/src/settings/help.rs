@@ -18,15 +18,17 @@ use super::{Cx, Page, Request};
 pub(super) fn page(ui: &mut Ui, cx: &mut Cx) {
     let lang = cx.lang;
     page_title(ui, &w!(lang, SetNavHelp));
-    let r = SettingRow::new(&w!(lang, CantHear)).icon(Icon::Volume).description(&w!(lang, SetCantHearLine)).show(ui, |ui| {
-        Button::primary(&w!(lang, SetCheckNow)).accessible_name(w!(lang, SetCheckPlayback)).show(ui).clicked()
-    });
+    let r = SettingRow::new(&w!(lang, CantHear))
+        .icon(Icon::Volume)
+        .description(&w!(lang, SetCantHearLine))
+        .show(ui, |ui| Button::primary(&w!(lang, SetCheckNow)).accessible_name(w!(lang, SetCheckPlayback)).show(ui).clicked());
     if r.inner {
         cx.go(Page::CantHear);
     }
-    let r = SettingRow::new(&w!(lang, SetCantFindLink)).icon(Icon::Search).description(&w!(lang, SetCantFindLine)).show(ui, |ui| {
-        Button::standard(&w!(lang, SetCheckNow)).accessible_name(w!(lang, SetCheckFinding)).show(ui).clicked()
-    });
+    let r = SettingRow::new(&w!(lang, SetCantFindLink))
+        .icon(Icon::Search)
+        .description(&w!(lang, SetCantFindLine))
+        .show(ui, |ui| Button::standard(&w!(lang, SetCheckNow)).accessible_name(w!(lang, SetCheckFinding)).show(ui).clicked());
     if r.inner {
         cx.go(Page::CantFind);
     }
@@ -229,7 +231,9 @@ pub(super) fn cant_hear(ui: &mut Ui, cx: &mut Cx) {
         if let Some(r) = &c.volume {
             sep(ui);
             match r {
-                Ok(Volume::Level(n)) => check_line(ui, Found::Good, &w!(lang, SetCheckVolume, speaker = &speaker), Some(&w!(lang, SetCheckVolumeLevel, level = *n)), |_| ()),
+                Ok(Volume::Level(n)) => {
+                    check_line(ui, Found::Good, &w!(lang, SetCheckVolume, speaker = &speaker), Some(&w!(lang, SetCheckVolumeLevel, level = *n)), |_| ())
+                }
                 Ok(_) => check_line(ui, Found::Good, &w!(lang, SetCheckVolume, speaker = &speaker), None, |_| ()),
                 Err(Volume::Muted) => {
                     all_good = false;
@@ -297,14 +301,20 @@ pub(super) fn cant_find(ui: &mut Ui, cx: &mut Cx) {
                 divider(ui);
             }
             match line {
-                FindLine::LookingOn { place, found } => {
-                    check_line(ui, Found::Good, &w!(lang, SetFindLooking, network = &place_words(lang, place)), Some(&w!(lang, SetFindFound, count = *found)), |_| ())
+                FindLine::LookingOn { place, found } => check_line(
+                    ui,
+                    Found::Good,
+                    &w!(lang, SetFindLooking, network = &place_words(lang, place)),
+                    Some(&w!(lang, SetFindFound, count = *found)),
+                    |_| (),
+                ),
+                FindLine::Vpn { vpn, only } => {
+                    check_line(ui, Found::Warning, &w!(lang, SetFindVpn, network = &place_words(lang, vpn)), Some(&w!(lang, SetFindVpnLine)), |ui| {
+                        if Button::primary(&w!(lang, SetLookOnlyOn, adapter = &only.name)).show(ui).clicked() {
+                            cx.act(Act::LookOnlyOn(only.key.clone()));
+                        }
+                    })
                 }
-                FindLine::Vpn { vpn, only } => check_line(ui, Found::Warning, &w!(lang, SetFindVpn, network = &place_words(lang, vpn)), Some(&w!(lang, SetFindVpnLine)), |ui| {
-                    if Button::primary(&w!(lang, SetLookOnlyOn, adapter = &only.name)).show(ui).clicked() {
-                        cx.act(Act::LookOnlyOn(only.key.clone()));
-                    }
-                }),
                 FindLine::Profile { network, private: true } => check_line(ui, Found::Good, &w!(lang, SetFindPrivate, network = network), None, |_| ()),
                 FindLine::Profile { network, private: false } => check_line(ui, Found::Bad, &w!(lang, SetFindPublic, network = network), None, |ui| {
                     if Button::standard(&w!(lang, SetOpenNetworkSettings)).icon(Icon::External).show(ui).clicked() {

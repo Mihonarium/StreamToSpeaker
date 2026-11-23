@@ -25,7 +25,6 @@ mod help;
 mod lab;
 mod music_assistant;
 mod privacy;
-mod qr;
 mod scenes;
 mod speaker;
 mod speakers;
@@ -246,10 +245,7 @@ impl Window {
     /// for it.
     pub fn show(&mut self, ctx: &egui::Context, port: &dyn SettingsPort) -> Vec<Request> {
         let t = Theme::of(ctx);
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(t.c.surface))
-            .show(ctx, |ui| self.show_in(ui, port))
-            .inner
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(t.c.surface)).show(ctx, |ui| self.show_in(ui, port)).inner
     }
 
     /// Draw the window in `ui`, which has the window's whole size.
@@ -273,18 +269,15 @@ impl Window {
 
         let mut content_ui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect).layout(egui::Layout::top_down(egui::Align::Min)));
         let page = self.page();
-        egui::ScrollArea::vertical()
-            .id_salt(("settings-page", page_key(&page)))
-            .auto_shrink([false, false])
-            .show(&mut content_ui, |ui| {
-                let pad = egui::Margin { left: if narrow { 16.0 } else { 8.0 }, right: 28.0, top: 4.0, bottom: 20.0 };
-                egui::Frame::none().inner_margin(pad).show(ui, |ui| {
-                    let w = ui.available_width().min(CONTENT_MAX);
-                    ui.set_width(w);
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    self.page_body(ui, &mut cx, &page);
-                });
+        egui::ScrollArea::vertical().id_salt(("settings-page", page_key(&page))).auto_shrink([false, false]).show(&mut content_ui, |ui| {
+            let pad = egui::Margin { left: if narrow { 16.0 } else { 8.0 }, right: 28.0, top: 4.0, bottom: 20.0 };
+            egui::Frame::none().inner_margin(pad).show(ui, |ui| {
+                let w = ui.available_width().min(CONTENT_MAX);
+                ui.set_width(w);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                self.page_body(ui, &mut cx, &page);
             });
+        });
 
         // Back: Alt+← or the mouse's back button, as Windows' Settings.
         let back_key = ui.input(|i| {

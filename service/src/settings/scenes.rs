@@ -242,7 +242,8 @@ fn lab(ui: &mut Ui, _: &mut Stage) {
         s.header.lab = true;
         s.about.lab = true;
         s.lab.catch_up_frames = Some(8);
-        s.lab.carried_over = Some(CarriedOver { airplay_ms: Some(500), homepod_ms: None, homepod_buffered: false, speakers: vec!["Office".into(), "Garage".into()] });
+        s.lab.carried_over =
+            Some(CarriedOver { airplay_ms: Some(500), homepod_ms: None, homepod_buffered: false, speakers: vec!["Office".into(), "Garage".into()] });
     });
 }
 

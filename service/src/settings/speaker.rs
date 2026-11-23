@@ -172,7 +172,10 @@ pub(super) fn page(ui: &mut Ui, cx: &mut Cx, st: &mut PageState, id: &str) {
     }
     if let Some(on) = v.song_titles {
         let title = w!(lang, SetSongTitles, speaker = &name);
-        let r = SettingRow::new(&title).icon(Icon::Music).description(&w!(lang, SetSongTitlesLine, speaker = &name)).show(ui, |ui| Switch::new(on, &title).show(ui));
+        let r = SettingRow::new(&title)
+            .icon(Icon::Music)
+            .description(&w!(lang, SetSongTitlesLine, speaker = &name))
+            .show(ui, |ui| Switch::new(on, &title).show(ui));
         if let Some(on) = r.inner {
             cx.act(Act::SongTitles(id.to_string(), on));
         }
@@ -475,9 +478,7 @@ pub(super) fn delay_view<'a>(lang: Lang, name: &'a str, d: &DelayCard, steady_of
         (Some(DelayNotice::DroppedOut { from_ms, to_ms }), _) => Some(DelayNote::DroppedOut { had_ms: from_ms, now_ms: to_ms }),
         _ if steady_offer && steady && s.applies.is_ok() => Some(DelayNote::SteadyOffer { steady_ms: s.delay_ms, short_ms: s.short_ms }),
         _ if s.limits.is_some() && s.limits.unwrap().remove_ms == 0 && s.change_ms == 0 => Some(DelayNote::AsLittleAsItCan),
-        _ if s.limits.is_some_and(|l| s.change_ms <= -(l.remove_ms as i32)) => {
-            Some(if steady { DelayNote::SteadyMostRemoved } else { DelayNote::MostRemoved })
-        }
+        _ if s.limits.is_some_and(|l| s.change_ms <= -(l.remove_ms as i32)) => Some(if steady { DelayNote::SteadyMostRemoved } else { DelayNote::MostRemoved }),
         _ if s.limits.is_some_and(|l| s.change_ms >= l.add_ms as i32) => Some(DelayNote::MostAdded),
         (_, Progress::CatchingUp { ms_to_go }) if ms_to_go < 0 => Some(DelayNote::Removing { to_go_ms: ms_to_go.unsigned_abs() }),
         (_, Progress::CatchingUp { ms_to_go }) => Some(DelayNote::Adding { to_go_ms: ms_to_go as u32 }),

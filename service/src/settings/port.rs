@@ -421,7 +421,10 @@ pub struct AboutView {
 pub enum Driver {
     Running(String),
     /// A newer one is installed and starts after a restart.
-    Waiting { installed: String, running: String },
+    Waiting {
+        installed: String,
+        running: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -439,13 +442,23 @@ pub enum UpdateState {
     DevBuild,
     NeverChecked,
     Checking,
-    UpToDate { at: Seen },
-    Available { version: String, at: Option<Seen> },
-    Failed { why: String },
+    UpToDate {
+        at: Seen,
+    },
+    Available {
+        version: String,
+        at: Option<Seen>,
+    },
+    Failed {
+        why: String,
+    },
     /// *Update now* is downloading or checking the installer.
     Downloading,
     /// The download is checked: ready to close and install.
-    ReadyToInstall { version: String, speaker: Option<String> },
+    ReadyToInstall {
+        version: String,
+        speaker: Option<String>,
+    },
     /// The download isn't signed by this project.
     NotSigned,
 }
@@ -538,18 +551,28 @@ pub type Link<T> = Option<Result<T, T>>;
 pub enum WindowsSends {
     ToUs,
     /// Windows plays on another output.
-    Elsewhere { output: String },
+    Elsewhere {
+        output: String,
+    },
     /// An app still plays on another output.
-    AppElsewhere { app: String, output: String },
+    AppElsewhere {
+        app: String,
+        output: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Taking {
     Yes,
     /// Accepted the connection but doesn't ask for the sound.
-    NotAsking { two_ways: bool },
+    NotAsking {
+        two_ways: bool,
+    },
     /// A member of its group asked and was refused.
-    Refused { device: String, address: String },
+    Refused {
+        device: String,
+        address: String,
+    },
     /// AirPlay speakers and HomePods don't report it.
     CantTell,
 }
@@ -662,9 +685,16 @@ pub struct MaCodeShow {
 pub enum Probe {
     #[default]
     Idle,
-    Checking { address: String },
-    Found { address: String, ways: Vec<Found> },
-    Nothing { address: String },
+    Checking {
+        address: String,
+    },
+    Found {
+        address: String,
+        ways: Vec<Found>,
+    },
+    Nothing {
+        address: String,
+    },
     /// The address or what was typed can't be used (today's validation
     /// words, already a sentence).
     Invalid(String),
@@ -728,7 +758,10 @@ pub enum Act {
     PlayOn(String),
     TestSound(String),
     Delay(String, DelayAct),
-    ConnectWith { id: String, own_way: bool },
+    ConnectWith {
+        id: String,
+        own_way: bool,
+    },
     VolumeLimit(String, u8),
     Tone(String, ToneAct),
     ComesBack(String, ComesBack),
@@ -762,7 +795,10 @@ pub enum Act {
     CancelMaPairing,
     // Privacy & remote
     OnlyPlaying(bool),
-    Allow { address: String, speaker: String },
+    Allow {
+        address: String,
+        speaker: String,
+    },
     Phone(bool),
     NewLink,
     Api(bool),
@@ -796,18 +832,40 @@ pub enum Act {
     // Lab
     Lab(LabAct),
     // Dialogs
-    SubmitCode { id: String, code: String },
+    SubmitCode {
+        id: String,
+        code: String,
+    },
     NewCode(String),
     CancelPairing(String),
     /// A password typed in the dialog; `connect`: connect with it now
     /// (otherwise it is only kept for next time).
-    SubmitPassword { id: String, password: String, connect: bool },
+    SubmitPassword {
+        id: String,
+        password: String,
+        connect: bool,
+    },
     CancelPassword(String),
-    SubmitSendspin { id: String, code: String },
+    SubmitSendspin {
+        id: String,
+        code: String,
+    },
     CancelSendspin(String),
-    Find { address: String, name: String },
-    AddFound { way: Way, name: String },
-    AddByHand { airplay: bool, host: String, port: Option<u16>, description: String, name: String },
+    Find {
+        address: String,
+        name: String,
+    },
+    AddFound {
+        way: Way,
+        name: String,
+    },
+    AddByHand {
+        airplay: bool,
+        host: String,
+        port: Option<u16>,
+        description: String,
+        name: String,
+    },
     ResetProbe,
     SaveReport(String),
     OpenIssue(String),

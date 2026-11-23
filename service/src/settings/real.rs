@@ -75,9 +75,7 @@ fn local_offset() -> i64 {
         GetLocalTime(&mut local);
         GetSystemTime(&mut utc);
     }
-    let secs = |t: &SYSTEMTIME| {
-        days_from_civil(t.wYear as i64, t.wMonth as i64, t.wDay as i64) * 86_400 + t.wHour as i64 * 3600 + t.wMinute as i64 * 60
-    };
+    let secs = |t: &SYSTEMTIME| days_from_civil(t.wYear as i64, t.wMonth as i64, t.wDay as i64) * 86_400 + t.wHour as i64 * 3600 + t.wMinute as i64 * 60;
     // Round to the quarter hour (the two reads may straddle a minute).
     let raw = secs(&local) - secs(&utc);
     (raw as f64 / 900.0).round() as i64 * 900
@@ -373,11 +371,7 @@ fn probe(lang: Lang, address: &str, name: &str) -> Probe {
     }
     // An AirPlay receiver accepts a connection on port 7000.
     if let Ok(info) = manual_speakers::probe_info(SocketAddr::new(IpAddr::V4(ip), 7000), Duration::from_secs(3)) {
-        let found = if !name.is_empty() {
-            name.to_string()
-        } else {
-            info.and_then(|i| i.name).unwrap_or_else(|| host.to_string())
-        };
+        let found = if !name.is_empty() { name.to_string() } else { info.and_then(|i| i.name).unwrap_or_else(|| host.to_string()) };
         ways.push(Found { name: found, kind: SpeakerKind::AirPlay, delay_ms: crate::delay::STEADY_BASE_MS, way: Way::AirPlay });
     }
     let _ = lang;
@@ -612,7 +606,9 @@ impl SettingsPort for AppSettings {
         } else {
             match st.last {
                 Some((UpdateOutcome::UpToDate, at)) => UpdateState::UpToDate { at: self.seen(at) },
-                Some((UpdateOutcome::Available(r), at)) => UpdateState::Available { version: r.tag.trim_start_matches('v').to_string(), at: Some(self.seen(at)) },
+                Some((UpdateOutcome::Available(r), at)) => {
+                    UpdateState::Available { version: r.tag.trim_start_matches('v').to_string(), at: Some(self.seen(at)) }
+                }
                 Some((UpdateOutcome::Failed(why), _)) => UpdateState::Failed { why },
                 Some((UpdateOutcome::DevBuild, _)) => UpdateState::DevBuild,
                 None => match app.update_banner() {
@@ -666,10 +662,7 @@ impl SettingsPort for AppSettings {
 
     fn playback_check(&self) -> PlaybackCheck {
         let app = &self.app;
-        let speaker = app
-            .selected_speaker()
-            .map(|s| clean_name(&s.friendly_name).0)
-            .or_else(|| app.is_ma_output_selected().then(|| w!(self.lang(), MaName)));
+        let speaker = app.selected_speaker().map(|s| clean_name(&s.friendly_name).0).or_else(|| app.is_ma_output_selected().then(|| w!(self.lang(), MaName)));
         let mut c = PlaybackCheck {
             speaker: speaker.clone(),
             playing: None,
@@ -698,7 +691,8 @@ impl SettingsPort for AppSettings {
         let status = app.delay_status();
         let kind = status.as_ref().map(|s| s.kind);
         c.untested = kind == Some(Kind::HomePodPair);
-        c.on_short = matches!(kind, Some(Kind::AirPlay { .. } | Kind::HomePod { .. })) && status.as_ref().and_then(|s| s.choice) == Some(crate::delay::DelayChoice::Short);
+        c.on_short = matches!(kind, Some(Kind::AirPlay { .. } | Kind::HomePod { .. }))
+            && status.as_ref().and_then(|s| s.choice) == Some(crate::delay::DelayChoice::Short);
         let taking = match kind {
             Some(Kind::Upnp) => {
                 if app.subscriber_count() > 0 {
@@ -727,10 +721,9 @@ impl SettingsPort for AppSettings {
         let found = app.speaker_view().speakers.iter().filter(|s| s.id != MA_OUTPUT_ID).count();
         match &st.scope {
             crate::discovery_net::Resolved::Paused { name } => lines.push(FindLine::AdapterOff { adapter: name.clone() }),
-            crate::discovery_net::Resolved::Active { name, ip } => lines.push(FindLine::LookingOn {
-                place: NetworkPlace { adapter: name.clone(), network: None, address: subnet(&ip.to_string()) },
-                found,
-            }),
+            crate::discovery_net::Resolved::Active { name, ip } => {
+                lines.push(FindLine::LookingOn { place: NetworkPlace { adapter: name.clone(), network: None, address: subnet(&ip.to_string()) }, found })
+            }
             crate::discovery_net::Resolved::All => {
                 let usable: Vec<_> = adapters.iter().filter_map(|a| a.usable_ipv4().map(|ip| (a, ip))).collect();
                 let vpn = |n: &str| {
@@ -827,7 +820,9 @@ impl SettingsPort for AppSettings {
         let described = format!("{act:?}");
         match act {
             Act::LookOn(key) => {
-                let choice = key.and_then(|k| app.network_adapters().into_iter().find(|a| a.key == k)).map(|a| crate::discovery_net::SavedAdapter { key: a.key, name: a.name });
+                let choice = key
+                    .and_then(|k| app.network_adapters().into_iter().find(|a| a.key == k))
+                    .map(|a| crate::discovery_net::SavedAdapter { key: a.key, name: a.name });
                 app.set_discovery_adapter(choice);
             }
             Act::LookOnlyOn(key) => self.act(Act::LookOn(Some(key))),

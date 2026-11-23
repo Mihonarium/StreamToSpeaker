@@ -38,11 +38,7 @@ pub(super) fn page(ui: &mut Ui, cx: &mut Cx, st: &mut PageState) {
             if c.homepod_buffered {
                 body(ui, &w!(lang, SetCarriedBuffered));
             }
-            let line = if c.speakers.is_empty() {
-                w!(lang, SetCarriedNoneKnown)
-            } else {
-                w!(lang, SetCarriedSpeakers, speakers = &c.speakers.join(", "))
-            };
+            let line = if c.speakers.is_empty() { w!(lang, SetCarriedNoneKnown) } else { w!(lang, SetCarriedSpeakers, speakers = &c.speakers.join(", ")) };
             note(ui, &line);
             if Button::standard(&w!(lang, SetCarriedReset)).show(ui).clicked() {
                 cx.act(Act::Lab(LabAct::ResetCarriedOver));
@@ -83,7 +79,9 @@ fn delay_rows(ui: &mut Ui, cx: &mut Cx, v: &LabView) {
         let title = w!(lang, SetLabApply);
         let options = [w!(lang, SetLabGradually), w!(lang, SetLabAtOnce)];
         let refs: Vec<&str> = options.iter().map(String::as_str).collect();
-        if let Some(i) = row(ui, None, &title, Some(&w!(lang, SetLabApplyLine)), |ui| DropDown::new("lab-apply", &title, &refs, at_once as usize).min_width(150.0).show(ui)) {
+        if let Some(i) =
+            row(ui, None, &title, Some(&w!(lang, SetLabApplyLine)), |ui| DropDown::new("lab-apply", &title, &refs, at_once as usize).min_width(150.0).show(ui))
+        {
             cx.act(Act::Lab(LabAct::AtOnce(i == 1)));
         }
     }
@@ -134,7 +132,9 @@ fn connection_rows(ui: &mut Ui, cx: &mut Cx, v: &LabView) {
         let title = w!(lang, SetLabAp2);
         let options = [w!(lang, SetLabAutomatic), w!(lang, SetLabRealtime)];
         let refs: Vec<&str> = options.iter().map(String::as_str).collect();
-        if let Some(i) = row(ui, None, &title, Some(&w!(lang, SetLabAp2Line)), |ui| DropDown::new("lab-ap2", &title, &refs, rt as usize).min_width(150.0).show(ui)) {
+        if let Some(i) =
+            row(ui, None, &title, Some(&w!(lang, SetLabAp2Line)), |ui| DropDown::new("lab-ap2", &title, &refs, rt as usize).min_width(150.0).show(ui))
+        {
             cx.act(Act::Lab(LabAct::Realtime(i == 1)));
         }
     }

@@ -20,7 +20,7 @@ use crate::ui::theme::{focus_ring, radius, size, Theme};
 
 use super::port::*;
 use super::speakers::kind_icon;
-use super::widgets::{body, buttons, mono, note, note_links};
+use super::widgets::{body, mono, note, note_links};
 use super::words::{self, w};
 use super::PageState;
 
@@ -128,7 +128,8 @@ fn frame(ui: &mut Ui, body: impl FnOnce(&mut Ui)) -> Ui {
     });
     ui.painter().rect_filled(foot_rect, 0.0, t.c.card);
     ui.painter().rect_filled(Rect::from_min_size(foot_rect.min, Vec2::new(foot_rect.width(), 1.0)), 0.0, t.c.divider);
-    let mut f = ui.new_child(egui::UiBuilder::new().max_rect(foot_rect.shrink2(Vec2::new(PAD_X, 20.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    let mut f =
+        ui.new_child(egui::UiBuilder::new().max_rect(foot_rect.shrink2(Vec2::new(PAD_X, 20.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
     f.spacing_mut().item_spacing.x = 8.0;
     f
 }
@@ -189,74 +190,74 @@ impl CodeDialog {
         let mut keep = true;
         let name = ask.name.clone();
         let mut foot = frame(ui, |ui| {
-                title(ui, &w!(lang, SetPairWith, speaker = &name));
-                ui.add_space(4.0);
-                ui.spacing_mut().item_spacing.x = 24.0;
-                ui.columns(2, |cols| {
-                    {
-                        let ui = &mut cols[0];
-                        egui::Frame::none().fill(super::widgets::tint(ui)).rounding(radius::CARD).inner_margin(16.0).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.set_min_height(220.0);
-                            column_label(ui, &w!(lang, SetOnYourTv));
-                            ui.add_space(6.0);
-                            tv_drawing(ui, ui.available_width().min(200.0));
-                            ui.add_space(6.0);
-                            body(ui, &w!(lang, SetLookAtTv, speaker = &name));
-                        });
-                    }
-                    {
-                        let ui = &mut cols[1];
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 8.0;
-                            ui.add_space(16.0);
-                            column_label(ui, &w!(lang, SetOnThisPc));
-                            match ask.stage {
-                                CodeStage::Starting => busy(ui, &w!(lang, SetAskingForCode, speaker = &name)),
-                                CodeStage::Checking => busy(ui, &w!(lang, SetCheckingCode)),
-                                CodeStage::NoAnswer => {
-                                    error(ui, &w!(lang, SetNoAnswerPairing, speaker = &name));
-                                    if Button::standard(&w!(lang, SetTryAgain)).show(ui).clicked() {
-                                        port.act(Act::NewCode(self.id.clone()));
-                                    }
-                                }
-                                CodeStage::TimedOut => {
-                                    error(ui, &w!(lang, SetTimeRanOut));
-                                    if Button::primary(&w!(lang, SetNewCode)).show(ui).clicked() {
-                                        port.act(Act::NewCode(self.id.clone()));
-                                    }
-                                }
-                                CodeStage::Showing | CodeStage::Wrong => {
-                                    if ask.stage == CodeStage::Wrong {
-                                        error(ui, &w!(lang, SetCodeWrong, speaker = &name));
-                                    }
-                                    body(ui, &w!(lang, SetTypeCode, speaker = &name));
-                                    if let Some(code) = digit_boxes(ui, &mut self.typed, 4, &mut self.focus, &w!(lang, SetCodeName)) {
-                                        port.act(Act::SubmitCode { id: self.id.clone(), code });
-                                    }
-                                    let left = ask.seconds_left.map(|s| words::left(lang, s));
-                                    let line = match left {
-                                        Some(l) => w!(lang, SetGoesInBy, left = &l),
-                                        None => w!(lang, SetGoesIn),
-                                    };
-                                    if note_links(ui, &line, &[&w!(lang, SetNewCode)]).is_some() {
-                                        port.act(Act::NewCode(self.id.clone()));
-                                    }
+            title(ui, &w!(lang, SetPairWith, speaker = &name));
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.x = 24.0;
+            ui.columns(2, |cols| {
+                {
+                    let ui = &mut cols[0];
+                    egui::Frame::none().fill(super::widgets::tint(ui)).rounding(radius::CARD).inner_margin(16.0).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.set_min_height(220.0);
+                        column_label(ui, &w!(lang, SetOnYourTv));
+                        ui.add_space(6.0);
+                        tv_drawing(ui, ui.available_width().min(200.0));
+                        ui.add_space(6.0);
+                        body(ui, &w!(lang, SetLookAtTv, speaker = &name));
+                    });
+                }
+                {
+                    let ui = &mut cols[1];
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        ui.add_space(16.0);
+                        column_label(ui, &w!(lang, SetOnThisPc));
+                        match ask.stage {
+                            CodeStage::Starting => busy(ui, &w!(lang, SetAskingForCode, speaker = &name)),
+                            CodeStage::Checking => busy(ui, &w!(lang, SetCheckingCode)),
+                            CodeStage::NoAnswer => {
+                                error(ui, &w!(lang, SetNoAnswerPairing, speaker = &name));
+                                if Button::standard(&w!(lang, SetTryAgain)).show(ui).clicked() {
+                                    port.act(Act::NewCode(self.id.clone()));
                                 }
                             }
-                        });
-                    }
-                });
+                            CodeStage::TimedOut => {
+                                error(ui, &w!(lang, SetTimeRanOut));
+                                if Button::primary(&w!(lang, SetNewCode)).show(ui).clicked() {
+                                    port.act(Act::NewCode(self.id.clone()));
+                                }
+                            }
+                            CodeStage::Showing | CodeStage::Wrong => {
+                                if ask.stage == CodeStage::Wrong {
+                                    error(ui, &w!(lang, SetCodeWrong, speaker = &name));
+                                }
+                                body(ui, &w!(lang, SetTypeCode, speaker = &name));
+                                if let Some(code) = digit_boxes(ui, &mut self.typed, 4, &mut self.focus, &w!(lang, SetCodeName)) {
+                                    port.act(Act::SubmitCode { id: self.id.clone(), code });
+                                }
+                                let left = ask.seconds_left.map(|s| words::left(lang, s));
+                                let line = match left {
+                                    Some(l) => w!(lang, SetGoesInBy, left = &l),
+                                    None => w!(lang, SetGoesIn),
+                                };
+                                if note_links(ui, &line, &[&w!(lang, SetNewCode)]).is_some() {
+                                    port.act(Act::NewCode(self.id.clone()));
+                                }
+                            }
+                        }
+                    });
+                }
+            });
         });
         {
             let ui = &mut foot;
-                note(ui, &w!(lang, SetPairOnce));
-                at_right(ui, |ui| {
-                    if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
-                        port.act(Act::CancelPairing(self.id.clone()));
-                        keep = false;
-                    }
-                });
+            note(ui, &w!(lang, SetPairOnce));
+            at_right(ui, |ui| {
+                if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
+                    port.act(Act::CancelPairing(self.id.clone()));
+                    keep = false;
+                }
+            });
         }
         keep
     }
@@ -284,6 +285,7 @@ fn tv_drawing(ui: &mut Ui, width: f32) {
 fn busy(ui: &mut Ui, text: &str) {
     let t = Theme::of(ui.ctx());
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
         let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
         paint_spinner(ui.painter(), r, t.c.accent, ui.input(|i| i.time));
         ui.label(egui::RichText::new(text).font(t.font(size::BODY)).color(t.c.text));
@@ -375,42 +377,42 @@ impl PasswordDialog {
         let mut keep = true;
         let mut submit = false;
         let mut foot = frame(ui, |ui| {
-                title(ui, &w!(lang, SetPasswordFor, speaker = &name));
-                body(ui, &w!(lang, SetAsksPassword, speaker = &name));
-                if wrong {
-                    error(ui, &w!(lang, SetPasswordWrong));
+            title(ui, &w!(lang, SetPasswordFor, speaker = &name));
+            body(ui, &w!(lang, SetAsksPassword, speaker = &name));
+            if wrong {
+                error(ui, &w!(lang, SetPasswordWrong));
+            }
+            ui.horizontal(|ui| {
+                let show_label = if self.shown { w!(lang, SetHide) } else { w!(lang, SetShow) };
+                let field_w = ui.available_width() - 60.0;
+                let r = TextField::new(&mut self.typed, &w!(lang, SetPasswordTitle)).password(!self.shown).width(field_w).show(ui);
+                if !self.focus_done {
+                    r.request_focus();
+                    self.focus_done = true;
                 }
-                ui.horizontal(|ui| {
-                    let show_label = if self.shown { w!(lang, SetHide) } else { w!(lang, SetShow) };
-                    let field_w = ui.available_width() - 60.0;
-                    let r = TextField::new(&mut self.typed, &w!(lang, SetPasswordTitle)).password(!self.shown).width(field_w).show(ui);
-                    if !self.focus_done {
-                        r.request_focus();
-                        self.focus_done = true;
-                    }
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !self.typed.is_empty() {
-                        submit = true;
-                    }
-                    if Button::link(&show_label).show(ui).clicked() {
-                        self.shown = !self.shown;
-                    }
-                });
-                note(ui, &if once { w!(lang, SetPasswordOnce) } else { w!(lang, SetPasswordKept) });
+                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !self.typed.is_empty() {
+                    submit = true;
+                }
+                if Button::link(&show_label).show(ui).clicked() {
+                    self.shown = !self.shown;
+                }
+            });
+            note(ui, &if once { w!(lang, SetPasswordOnce) } else { w!(lang, SetPasswordKept) });
         });
         {
             let ui = &mut foot;
-                at_right(ui, |ui| {
-                    if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
-                        if self.asked {
-                            port.act(Act::CancelPassword(self.id.clone()));
-                        }
-                        keep = false;
+            at_right(ui, |ui| {
+                if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
+                    if self.asked {
+                        port.act(Act::CancelPassword(self.id.clone()));
                     }
-                    let label = if self.connect { w!(lang, SetConnect) } else { w!(lang, SetSavePassword) };
-                    if Button::primary(&label).enabled(!self.typed.is_empty()).default_action(true).show(ui).clicked() {
-                        submit = true;
-                    }
-                });
+                    keep = false;
+                }
+                let label = if self.connect { w!(lang, SetConnect) } else { w!(lang, SetSavePassword) };
+                if Button::primary(&label).enabled(!self.typed.is_empty()).default_action(true).show(ui).clicked() {
+                    submit = true;
+                }
+            });
         }
         if submit {
             port.act(Act::SubmitPassword { id: self.id.clone(), password: std::mem::take(&mut self.typed), connect: self.connect });
@@ -454,52 +456,52 @@ impl SendspinDialog {
         let mut keep = true;
         let mut submit = false;
         let mut foot = frame(ui, |ui| {
-                title(ui, &w!(lang, SetPairWith, speaker = &name));
-                if ask.identity_changed {
-                    let _ = info_bar(ui, &InfoBar { kind: BarKind::Warning, title: None, text: &w!(lang, SetIdentityChanged, speaker = &name), action: None });
-                } else if ask.lost {
-                    marked_line(ui, Mark::Info, &w!(lang, SetSendspinForgot, speaker = &name));
+            title(ui, &w!(lang, SetPairWith, speaker = &name));
+            if ask.identity_changed {
+                let _ = info_bar(ui, &InfoBar { kind: BarKind::Warning, title: None, text: &w!(lang, SetIdentityChanged, speaker = &name), action: None });
+            } else if ask.lost {
+                marked_line(ui, Mark::Info, &w!(lang, SetSendspinForgot, speaker = &name));
+            }
+            if ask.wrong {
+                error(ui, &w!(lang, SetSendspinWrong));
+            }
+            body(ui, &if token { w!(lang, SetPasteToken, speaker = &name) } else { w!(lang, SetSpeakerShowsCode, speaker = &name) });
+            let field = if token { w!(lang, SetTokenName) } else { w!(lang, SetCodeName) };
+            let r = TextField::new(&mut self.typed, &field).show(ui);
+            if !self.focus_done {
+                r.request_focus();
+                self.focus_done = true;
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !self.typed.trim().is_empty() {
+                submit = true;
+            }
+            ui.horizontal(|ui| {
+                if let Some(s) = ask.seconds_left.filter(|_| !token) {
+                    note(ui, &words::left(lang, s));
                 }
-                if ask.wrong {
-                    error(ui, &w!(lang, SetSendspinWrong));
+                if ask.live_code {
+                    at_right(ui, |ui| {
+                        let label = if token { w!(lang, SetUseCodeInstead) } else { w!(lang, SetNoCodeToken) };
+                        if Button::link(&label).show(ui).clicked() {
+                            self.token = !self.token;
+                            self.typed.clear();
+                            self.focus_done = false;
+                        }
+                    });
                 }
-                body(ui, &if token { w!(lang, SetPasteToken, speaker = &name) } else { w!(lang, SetSpeakerShowsCode, speaker = &name) });
-                let field = if token { w!(lang, SetTokenName) } else { w!(lang, SetCodeName) };
-                let r = TextField::new(&mut self.typed, &field).show(ui);
-                if !self.focus_done {
-                    r.request_focus();
-                    self.focus_done = true;
-                }
-                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !self.typed.trim().is_empty() {
-                    submit = true;
-                }
-                ui.horizontal(|ui| {
-                    if let Some(s) = ask.seconds_left.filter(|_| !token) {
-                        note(ui, &words::left(lang, s));
-                    }
-                    if ask.live_code {
-                        at_right(ui, |ui| {
-                            let label = if token { w!(lang, SetUseCodeInstead) } else { w!(lang, SetNoCodeToken) };
-                            if Button::link(&label).show(ui).clicked() {
-                                self.token = !self.token;
-                                self.typed.clear();
-                                self.focus_done = false;
-                            }
-                        });
-                    }
-                });
+            });
         });
         {
             let ui = &mut foot;
-                at_right(ui, |ui| {
-                    if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
-                        port.act(Act::CancelSendspin(self.id.clone()));
-                        keep = false;
-                    }
-                    if Button::primary(&w!(lang, SetPair)).enabled(!self.typed.trim().is_empty()).default_action(true).show(ui).clicked() {
-                        submit = true;
-                    }
-                });
+            at_right(ui, |ui| {
+                if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
+                    port.act(Act::CancelSendspin(self.id.clone()));
+                    keep = false;
+                }
+                if Button::primary(&w!(lang, SetPair)).enabled(!self.typed.trim().is_empty()).default_action(true).show(ui).clicked() {
+                    submit = true;
+                }
+            });
         }
         if submit {
             port.act(Act::SubmitSendspin { id: self.id.clone(), code: self.typed.trim().to_string() });
@@ -533,44 +535,44 @@ impl MaCodeDialog {
         let mut keep = true;
         let t = Theme::of(ui.ctx());
         let mut foot = frame(ui, |ui| {
-                title(ui, &w!(lang, SetMaPairTitle));
-                ui.spacing_mut().item_spacing.x = 24.0;
-                ui.columns(2, |cols| {
-                    {
-                        let ui = &mut cols[0];
-                        ui.vertical(|ui| {
-                            column_label(ui, &w!(lang, SetInMa));
-                            body(ui, &w!(lang, SetMaPairStep1));
-                            body(ui, &w!(lang, SetMaPairStep2, pc = &show.this_pc));
-                            body(ui, &w!(lang, SetMaPairStep3));
-                        });
-                    }
-                    {
-                        let ui = &mut cols[1];
-                        ui.vertical(|ui| {
-                            column_label(ui, &w!(lang, SetOnThisPc));
-                            let g = ui.painter().layout_no_wrap(super::music_assistant::spaced_code(&show.code), t.strong(34.0), t.c.text);
-                            let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
-                            ui.painter().galley(r.min, g, t.c.text);
-                            super::widgets::copy_button(ui, &mut self.st, "ma-code", &w!(lang, SetCopyCode), &w!(lang, SetCopied), &show.code);
-                            let waiting = match show.seconds_left {
-                                Some(s) => w!(lang, SetWaitingForMaLeft, left = &words::left(lang, s)),
-                                None => w!(lang, SetWaitingForMa),
-                            };
-                            busy(ui, &waiting);
-                        });
-                    }
-                });
+            title(ui, &w!(lang, SetMaPairTitle));
+            ui.spacing_mut().item_spacing.x = 24.0;
+            ui.columns(2, |cols| {
+                {
+                    let ui = &mut cols[0];
+                    ui.vertical(|ui| {
+                        column_label(ui, &w!(lang, SetInMa));
+                        body(ui, &w!(lang, SetMaPairStep1));
+                        body(ui, &w!(lang, SetMaPairStep2, pc = &show.this_pc));
+                        body(ui, &w!(lang, SetMaPairStep3));
+                    });
+                }
+                {
+                    let ui = &mut cols[1];
+                    ui.vertical(|ui| {
+                        column_label(ui, &w!(lang, SetOnThisPc));
+                        let g = ui.painter().layout_no_wrap(super::music_assistant::spaced_code(&show.code), t.strong(34.0), t.c.text);
+                        let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+                        ui.painter().galley(r.min, g, t.c.text);
+                        super::widgets::copy_button(ui, &mut self.st, "ma-code", &w!(lang, SetCopyCode), &w!(lang, SetCopied), &show.code);
+                        let waiting = match show.seconds_left {
+                            Some(s) => w!(lang, SetWaitingForMaLeft, left = &words::left(lang, s)),
+                            None => w!(lang, SetWaitingForMa),
+                        };
+                        busy(ui, &waiting);
+                    });
+                }
+            });
         });
         {
             let ui = &mut foot;
-                note(ui, &w!(lang, SetClosesItself));
-                at_right(ui, |ui| {
-                    if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
-                        port.act(Act::CancelMaPairing);
-                        keep = false;
-                    }
-                });
+            note(ui, &w!(lang, SetClosesItself));
+            at_right(ui, |ui| {
+                if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
+                    port.act(Act::CancelMaPairing);
+                    keep = false;
+                }
+            });
         }
         keep
     }
@@ -610,72 +612,73 @@ impl AddDialog {
         let mut keep = true;
         let t = Theme::of(ui.ctx());
         let mut foot = frame(ui, |ui| {
-                title(ui, &w!(lang, SetAddTitle));
-                let _ = Para::new(&w!(lang, SetAddLead)).size(size::BODY).show(ui);
-                let label_w = 130.0;
-                let mut find = false;
-                ui.horizontal(|ui| {
-                    ui.allocate_ui(Vec2::new(label_w, 32.0), |ui| {
-                        ui.set_min_width(label_w);
-                        ui.label(egui::RichText::new(w!(lang, SetAddress)).font(t.font(size::BODY)).color(t.c.text));
-                    });
-                    let field_w = ui.available_width() - 80.0;
-                    let r = TextField::new(&mut self.address, &w!(lang, SetAddress)).hint(&w!(lang, SetAddressHint)).width(field_w).show(ui);
-                    if !self.focus_done {
-                        r.request_focus();
-                        self.focus_done = true;
-                    }
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        find = true;
-                    }
-                    let checking = matches!(probe, Probe::Checking { .. });
-                    if Button::primary(&w!(lang, SetFind)).enabled(!self.address.trim().is_empty() && !checking).show(ui).clicked() {
-                        find = true;
-                    }
+            title(ui, &w!(lang, SetAddTitle));
+            let _ = Para::new(&w!(lang, SetAddLead)).size(size::BODY).show(ui);
+            let label_w = 130.0;
+            let mut find = false;
+            ui.horizontal(|ui| {
+                ui.allocate_ui(Vec2::new(label_w, 32.0), |ui| {
+                    ui.set_min_width(label_w);
+                    ui.label(egui::RichText::new(w!(lang, SetAddress)).font(t.font(size::BODY)).color(t.c.text));
                 });
-                ui.horizontal(|ui| {
-                    ui.allocate_ui(Vec2::new(label_w, 32.0), |ui| {
-                        ui.set_min_width(label_w);
-                        ui.label(egui::RichText::new(w!(lang, SetNameOptional)).font(t.font(size::BODY)).color(t.c.text));
-                    });
-                    let _ = TextField::new(&mut self.name, &w!(lang, SetNameOptional)).show(ui);
+                let field_w = ui.available_width() - 80.0;
+                let r = TextField::new(&mut self.address, &w!(lang, SetAddress)).hint(&w!(lang, SetAddressHint)).width(field_w).show(ui);
+                if !self.focus_done {
+                    r.request_focus();
+                    self.focus_done = true;
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    find = true;
+                }
+                let checking = matches!(probe, Probe::Checking { .. });
+                if Button::primary(&w!(lang, SetFind)).enabled(!self.address.trim().is_empty() && !checking).show(ui).clicked() {
+                    find = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.allocate_ui(Vec2::new(label_w, 32.0), |ui| {
+                    ui.set_min_width(label_w);
+                    ui.label(egui::RichText::new(w!(lang, SetNameOptional)).font(t.font(size::BODY)).color(t.c.text));
                 });
-                if find && !self.address.trim().is_empty() {
-                    self.way = None;
-                    port.act(Act::Find { address: self.address.trim().to_string(), name: self.name.trim().to_string() });
+                let _ = TextField::new(&mut self.name, &w!(lang, SetNameOptional)).show(ui);
+            });
+            if find && !self.address.trim().is_empty() {
+                self.way = None;
+                port.act(Act::Find { address: self.address.trim().to_string(), name: self.name.trim().to_string() });
+            }
+            match &probe {
+                Probe::Checking { address } => busy(ui, &w!(lang, SetCheckingAddress, address = address)),
+                Probe::Nothing { address } => {
+                    let _ = Para::new(&w!(lang, SetNothingAt, address = address)).mark(Mark::Error).tone(Tone::Red).size(size::SECONDARY).show(ui);
                 }
-                match &probe {
-                    Probe::Checking { address } => busy(ui, &w!(lang, SetCheckingAddress, address = address)),
-                    Probe::Nothing { address } => {
-                        let _ = Para::new(&w!(lang, SetNothingAt, address = address)).mark(Mark::Error).tone(Tone::Red).size(size::SECONDARY).show(ui);
+                Probe::Invalid(why) => {
+                    let _ = Para::new(why).mark(Mark::Error).tone(Tone::Red).size(size::SECONDARY).show(ui);
+                }
+                Probe::Found { address, ways } => self.found(ui, port, lang, address, ways),
+                Probe::Idle | Probe::Added => {}
+            }
+            ui.add_space(4.0);
+            if !self.by_hand {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if Button::link(&w!(lang, SetByHand)).show(ui).clicked() {
+                        self.by_hand = true;
                     }
-                    Probe::Invalid(why) => {
-                        let _ = Para::new(why).mark(Mark::Error).tone(Tone::Red).size(size::SECONDARY).show(ui);
-                    }
-                    Probe::Found { address, ways } => self.found(ui, port, lang, address, ways),
-                    Probe::Idle | Probe::Added => {}
-                }
-                ui.add_space(4.0);
-                if !self.by_hand {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        if Button::link(&w!(lang, SetByHand)).show(ui).clicked() {
-                            self.by_hand = true;
-                        }
-                        note(ui, &w!(lang, SetByHandWhat));
-                    });
-                } else {
-                    self.by_hand_fields(ui, port, lang, label_w);
-                }
+                    let t = Theme::of(ui.ctx());
+                    ui.label(egui::RichText::new(w!(lang, SetByHandWhat)).font(t.font(size::CAPTION)).color(t.c.text_secondary));
+                });
+            } else {
+                self.by_hand_fields(ui, port, lang, label_w);
+            }
         });
         {
             let ui = &mut foot;
-                at_right(ui, |ui| {
-                    if Button::standard(&w!(lang, SetClose)).show(ui).clicked() {
-                        port.act(Act::ResetProbe);
-                        keep = false;
-                    }
-                });
+            at_right(ui, |ui| {
+                if Button::standard(&w!(lang, SetClose)).show(ui).clicked() {
+                    port.act(Act::ResetProbe);
+                    keep = false;
+                }
+            });
         }
         keep
     }
@@ -700,7 +703,16 @@ impl AddDialog {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         super::widgets::strong(ui, &w!(lang, SetFoundNamed, speaker = &chosen.name), size::BODY);
                         if ways.len() == 1 {
-                            note(ui, &w!(lang, SetFoundLine, kind = &words::kind(lang, &chosen.kind), address = address, delay = &words::about(lang, chosen.delay_ms)));
+                            note(
+                                ui,
+                                &w!(
+                                    lang,
+                                    SetFoundLine,
+                                    kind = &words::kind(lang, &chosen.kind),
+                                    address = address,
+                                    delay = &words::about(lang, chosen.delay_ms)
+                                ),
+                            );
                         } else {
                             note(ui, &w!(lang, SetFoundTwoWays));
                         }
@@ -792,23 +804,26 @@ impl ToneDialog {
         let mut keep = true;
         let t = Theme::of(ui.ctx());
         let mut foot = frame(ui, |ui| {
-                title(ui, &w!(lang, SetToneTitle, speaker = &v.name));
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(w!(lang, SetPreset)).font(t.font(size::BODY)).color(t.c.text));
-                    let mut names: Vec<String> = EQ_PRESETS.iter().map(|p| preset_name(lang, p.name)).collect();
-                    names.push(w!(lang, SetPresetCustom));
-                    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                    let current = crate::equalizer::matching_preset(&v.eq.bands_db).and_then(|n| EQ_PRESETS.iter().position(|p| p.name == n)).unwrap_or(EQ_PRESETS.len());
-                    if let Some(i) = DropDown::new(("tone-preset", &id), &w!(lang, SetPreset), &refs, current).min_width(240.0).show(ui) {
-                        if i < EQ_PRESETS.len() {
-                            port.act(Act::Tone(id.clone(), ToneAct::Preset(i)));
-                        }
+            title(ui, &w!(lang, SetToneTitle, speaker = &v.name));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(w!(lang, SetPreset)).font(t.font(size::BODY)).color(t.c.text));
+                let mut names: Vec<String> = EQ_PRESETS.iter().map(|p| preset_name(lang, p.name)).collect();
+                names.push(w!(lang, SetPresetCustom));
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                let current =
+                    crate::equalizer::matching_preset(&v.eq.bands_db).and_then(|n| EQ_PRESETS.iter().position(|p| p.name == n)).unwrap_or(EQ_PRESETS.len());
+                if let Some(i) = DropDown::new(("tone-preset", &id), &w!(lang, SetPreset), &refs, current).min_width(240.0).show(ui) {
+                    if i < EQ_PRESETS.len() {
+                        port.act(Act::Tone(id.clone(), ToneAct::Preset(i)));
                     }
-                    if let Some(h) = v.headroom_db {
-                        at_right(ui, |ui| note(ui, &w!(lang, SetHeadroom, db = &super::speaker::db(lang, h))));
-                    }
-                });
-                egui::Frame::none().fill(t.c.card).stroke(t.card_stroke()).rounding(radius::CARD).inner_margin(egui::Margin::symmetric(12.0, 10.0)).show(ui, |ui| {
+                }
+                if let Some(h) = v.headroom_db {
+                    at_right(ui, |ui| note(ui, &w!(lang, SetHeadroom, db = &super::speaker::db(lang, h))));
+                }
+            });
+            egui::Frame::none().fill(t.c.card).stroke(t.card_stroke()).rounding(radius::CARD).inner_margin(egui::Margin::symmetric(12.0, 10.0)).show(
+                ui,
+                |ui| {
                     ui.set_width(ui.available_width());
                     let n = EQ_BANDS + 1;
                     let col = ui.available_width() / n as f32;
@@ -826,22 +841,23 @@ impl ToneDialog {
                             }
                         }
                     });
-                });
-                note(ui, &w!(lang, SetToneDialogLine));
+                },
+            );
+            note(ui, &w!(lang, SetToneDialogLine));
         });
         {
             let ui = &mut foot;
-                if Button::standard(&w!(lang, SetUndo)).enabled(v.can_undo).show(ui).clicked() {
-                    port.act(Act::Tone(id.clone(), ToneAct::Undo));
+            if Button::standard(&w!(lang, SetUndo)).enabled(v.can_undo).show(ui).clicked() {
+                port.act(Act::Tone(id.clone(), ToneAct::Undo));
+            }
+            if Button::standard(&w!(lang, SetResetFlat)).show(ui).clicked() {
+                port.act(Act::Tone(id.clone(), ToneAct::Flat));
+            }
+            at_right(ui, |ui| {
+                if Button::primary(&w!(lang, SetClose)).default_action(true).show(ui).clicked() {
+                    keep = false;
                 }
-                if Button::standard(&w!(lang, SetResetFlat)).show(ui).clicked() {
-                    port.act(Act::Tone(id.clone(), ToneAct::Flat));
-                }
-                at_right(ui, |ui| {
-                    if Button::primary(&w!(lang, SetClose)).default_action(true).show(ui).clicked() {
-                        keep = false;
-                    }
-                });
+            });
         }
         keep
     }
@@ -872,13 +888,13 @@ fn preset_name(lang: Lang, name: &str) -> String {
 /// under it. The new value, in steps of 0.5.
 fn vertical(ui: &mut Ui, width: f32, value: f32, range: std::ops::RangeInclusive<f32>, shown: &str, label: &str, name: &str) -> Option<f32> {
     let t = Theme::of(ui.ctx());
-    let (col, _) = ui.allocate_exact_size(Vec2::new(width, 290.0), Sense::hover());
+    let (col, _) = ui.allocate_exact_size(Vec2::new(width, 240.0), Sense::hover());
     let p = ui.painter().clone();
     let top = p.layout_no_wrap(shown.to_owned(), t.font(size::SECONDARY), t.c.text_secondary);
     p.galley(egui::pos2(col.center().x - top.size().x / 2.0, col.top()), top, t.c.text_secondary);
     let bottom = p.layout_no_wrap(label.to_owned(), t.font(size::SECONDARY), t.c.text);
     p.galley(egui::pos2(col.center().x - bottom.size().x / 2.0, col.bottom() - bottom.size().y), bottom, t.c.text);
-    let track = Rect::from_center_size(egui::pos2(col.center().x, col.center().y), Vec2::new(24.0, 220.0));
+    let track = Rect::from_center_size(egui::pos2(col.center().x, col.center().y), Vec2::new(24.0, 170.0));
     let resp = ui.interact(track, ui.id().with(("band", name)), Sense::click_and_drag());
     resp.widget_info(|| WidgetInfo::slider(true, value as f64, name));
     let (lo, hi) = (*range.start(), *range.end());
@@ -919,7 +935,13 @@ fn vertical(ui: &mut Ui, width: f32, value: f32, range: std::ops::RangeInclusive
     let thumb = egui::pos2(track.center().x, y_of(value));
     p.circle_filled(thumb + Vec2::new(0.0, 0.5), 10.5, t.c.card_border);
     p.circle(thumb, 10.0, t.c.control, Stroke::new(1.0_f32, t.c.control_border));
-    let dot = if l.pressed { 6.5 } else if l.hovered { 10.0 } else { 8.0 };
+    let dot = if l.pressed {
+        6.5
+    } else if l.hovered {
+        10.0
+    } else {
+        8.0
+    };
     p.circle_filled(thumb, dot / 2.0, t.c.accent);
     if l.focused {
         focus_ring(&p, track, 4.0, false, &t);
@@ -937,7 +959,6 @@ fn vertical(ui: &mut Ui, width: f32, value: f32, range: std::ops::RangeInclusive
 pub struct ReportDialog {
     what: String,
     parts: Option<ReportParts>,
-    st: PageState,
     /// The last thing done with it, said under the preview.
     done: Option<String>,
 }
@@ -957,68 +978,70 @@ impl ReportDialog {
         let mut keep = true;
         let t = Theme::of(ui.ctx());
         let mut foot = frame(ui, |ui| {
-                title(ui, &w!(lang, SetReportProblem));
-                body(ui, &w!(lang, SetWhatHappened));
-                let edit = egui::TextEdit::multiline(&mut self.what).desired_rows(2).desired_width(f32::INFINITY).font(t.font(size::BODY));
-                let r = ui.add(edit);
-                r.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, w!(lang, SetWhatHappened)));
-                ui.spacing_mut().item_spacing.x = 24.0;
-                ui.columns(2, |cols| {
-                    {
-                        let ui = &mut cols[0];
-                        ui.vertical(|ui| {
-                            body(ui, &w!(lang, SetReportIncludes));
-                            let p = self.parts.as_mut().unwrap();
-                            if let Some(on) = Check::new(p.last_hour, &w!(lang, SetReportHour)).description(&w!(lang, SetReportHourLine)).show(ui) {
-                                p.last_hour = on;
-                            }
-                            if let Some(on) = Check::new(p.speakers, &w!(lang, SetReportSpeakers)).show(ui) {
-                                p.speakers = on;
-                            }
-                            if let Some(on) = Check::new(p.versions, &w!(lang, SetReportVersions)).show(ui) {
-                                p.versions = on;
-                            }
-                            if let Some(on) = Check::new(p.log, &w!(lang, SetReportLog)).description(&w!(lang, SetReportLogLine)).show(ui) {
-                                p.log = on;
-                            }
-                        });
-                    }
-                    {
-                        let ui = &mut cols[1];
-                        ui.vertical(|ui| {
-                            body(ui, &w!(lang, SetPreview));
-                            egui::Frame::none().fill(t.c.card).stroke(t.card_stroke()).rounding(radius::CARD).inner_margin(10.0).show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                egui::ScrollArea::vertical().max_height(190.0).auto_shrink([false, true]).show(ui, |ui| mono(ui, &text));
-                            });
-                        });
-                    }
-                });
-                note(ui, &w!(lang, SetNothingSent));
-                if let Some(d) = &self.done {
-                    let _ = Para::new(d).mark(Mark::Done).size(size::SECONDARY).show(ui);
+            title(ui, &w!(lang, SetReportProblem));
+            body(ui, &w!(lang, SetWhatHappened));
+            let edit = egui::TextEdit::multiline(&mut self.what).desired_rows(2).desired_width(f32::INFINITY).font(t.font(size::BODY));
+            let r = ui.add(edit);
+            r.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, w!(lang, SetWhatHappened)));
+            ui.spacing_mut().item_spacing.x = 24.0;
+            ui.columns(2, |cols| {
+                {
+                    let ui = &mut cols[0];
+                    ui.vertical(|ui| {
+                        body(ui, &w!(lang, SetReportIncludes));
+                        let p = self.parts.as_mut().unwrap();
+                        if let Some(on) = Check::new(p.last_hour, &w!(lang, SetReportHour)).description(&w!(lang, SetReportHourLine)).show(ui) {
+                            p.last_hour = on;
+                        }
+                        if let Some(on) = Check::new(p.speakers, &w!(lang, SetReportSpeakers)).show(ui) {
+                            p.speakers = on;
+                        }
+                        if let Some(on) = Check::new(p.versions, &w!(lang, SetReportVersions)).show(ui) {
+                            p.versions = on;
+                        }
+                        if let Some(on) = Check::new(p.log, &w!(lang, SetReportLog)).description(&w!(lang, SetReportLogLine)).show(ui) {
+                            p.log = on;
+                        }
+                    });
                 }
+                {
+                    let ui = &mut cols[1];
+                    ui.vertical(|ui| {
+                        body(ui, &w!(lang, SetPreview));
+                        egui::Frame::none().fill(t.c.card).stroke(t.card_stroke()).rounding(radius::CARD).inner_margin(10.0).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            egui::ScrollArea::vertical().max_height(190.0).auto_shrink([false, true]).show(ui, |ui| mono(ui, &text));
+                        });
+                    });
+                }
+            });
+            note(ui, &w!(lang, SetNothingSent));
+            if let Some(d) = &self.done {
+                let _ = Para::new(d).mark(Mark::Done).size(size::SECONDARY).show(ui);
+            }
         });
         {
             let ui = &mut foot;
-                at_right(ui, |ui| {
-                    if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
-                        keep = false;
-                    }
-                    if Button::standard(&w!(lang, SetOpenIssue)).icon(Icon::External).show(ui).clicked() {
-                        port.act(Act::OpenIssue(text.clone()));
-                        self.done = Some(w!(lang, SetIssueOpened));
-                    }
-                    if Button::standard(&w!(lang, SetSaveReport)).show(ui).clicked() {
-                        port.act(Act::SaveReport(text.clone()));
-                        self.done = Some(w!(lang, SetReportSaved));
-                    }
-                    let before = self.st.copied.clone();
-                    buttons(ui, |ui| super::widgets::copy_button(ui, &mut self.st, "report", &w!(lang, SetCopyReport), &w!(lang, SetCopied), &text));
-                    if self.st.copied != before {
-                        self.done = Some(w!(lang, SetReportCopied));
-                    }
-                });
+            at_right(ui, |ui| {
+                if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
+                    keep = false;
+                }
+                if Button::standard(&w!(lang, SetOpenIssue)).icon(Icon::External).show(ui).clicked() {
+                    // The issue page can't be given the text: it is copied
+                    // to paste there.
+                    ui.ctx().copy_text(text.clone());
+                    port.act(Act::OpenIssue(text.clone()));
+                    self.done = Some(w!(lang, SetIssueOpened));
+                }
+                if Button::standard(&w!(lang, SetSaveReport)).show(ui).clicked() {
+                    port.act(Act::SaveReport(text.clone()));
+                    self.done = Some(w!(lang, SetReportSaved));
+                }
+                if Button::primary(&w!(lang, SetCopyReport)).icon(Icon::Copy).show(ui).clicked() {
+                    ui.ctx().copy_text(text.clone());
+                    self.done = Some(w!(lang, SetReportCopied));
+                }
+            });
         }
         keep
     }

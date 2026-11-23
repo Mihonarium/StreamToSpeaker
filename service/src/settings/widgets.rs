@@ -393,27 +393,32 @@ pub fn bar(ui: &mut Ui, kind: crate::ui::notice::BarKind, title: &str, text: &st
         BarKind::Done => (t.c.green_bg, Mark::Done),
     };
     let mut clicked = false;
-    egui::Frame::none().fill(fill).stroke(t.card_stroke()).rounding(radius::CARD).inner_margin(egui::Margin { left: 14.0, right: 14.0, top: 11.0, bottom: 11.0 }).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        let id = ui.next_auto_id().with("bar-button");
-        let button_w: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
-        ui.horizontal(|ui| {
-            let words_w = ui.available_width() - if action.is_some() { button_w + 12.0 } else { 0.0 };
-            ui.allocate_ui(Vec2::new(words_w.max(120.0), 0.0), |ui| {
-                let _ = Para::new(text).mark(mark).lead(title).size(size::SECONDARY).tone(Tone::Primary).show(ui);
-            });
-            if let Some(a) = action {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let r = Button::standard(a).show(ui);
-                    clicked = r.clicked();
-                    if (r.rect.width() - button_w).abs() > 0.5 {
-                        ui.ctx().data_mut(|d| d.insert_temp(id, r.rect.width()));
-                        ui.ctx().request_discard("a bar's button changed width");
-                    }
+    egui::Frame::none()
+        .fill(fill)
+        .stroke(t.card_stroke())
+        .rounding(radius::CARD)
+        .inner_margin(egui::Margin { left: 14.0, right: 14.0, top: 11.0, bottom: 11.0 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let id = ui.next_auto_id().with("bar-button");
+            let button_w: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
+            ui.horizontal(|ui| {
+                let words_w = ui.available_width() - if action.is_some() { button_w + 12.0 } else { 0.0 };
+                ui.allocate_ui(Vec2::new(words_w.max(120.0), 0.0), |ui| {
+                    let _ = Para::new(text).mark(mark).lead(title).size(size::SECONDARY).tone(Tone::Primary).show(ui);
                 });
-            }
+                if let Some(a) = action {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let r = Button::standard(a).show(ui);
+                        clicked = r.clicked();
+                        if (r.rect.width() - button_w).abs() > 0.5 {
+                            ui.ctx().data_mut(|d| d.insert_temp(id, r.rect.width()));
+                            ui.ctx().request_discard("a bar's button changed width");
+                        }
+                    });
+                }
+            });
         });
-    });
     clicked
 }
 
