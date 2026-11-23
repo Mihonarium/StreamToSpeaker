@@ -245,6 +245,11 @@ fn colors(t: &Theme, kind: Kind, l: Look) -> Colors {
 pub struct IconButton<'a> {
     icon: Icon,
     name: &'a str,
+    /// What a reader of the display says, when it says more than the
+    /// tooltip.
+    spoken: Option<&'a str>,
+    /// Whether Tab stops on it.
+    tab_stop: bool,
     side: f32,
     icon_size: f32,
     enabled: bool,
@@ -253,7 +258,20 @@ pub struct IconButton<'a> {
 
 impl<'a> IconButton<'a> {
     pub fn new(icon: Icon, name: &'a str) -> Self {
-        IconButton { icon, name, side: 32.0, icon_size: 17.0, enabled: true, color: None }
+        IconButton { icon, name, spoken: None, tab_stop: true, side: 32.0, icon_size: 17.0, enabled: true, color: None }
+    }
+
+    /// Whether Tab stops on it (a row's › only on the row Tab stops on).
+    pub fn tab_stop(mut self, tab_stop: bool) -> Self {
+        self.tab_stop = tab_stop;
+        self
+    }
+
+    /// Say `spoken` to a reader of the display instead of the tooltip's
+    /// words (*Options for Kitchen, Sonos*).
+    pub fn spoken(mut self, spoken: &'a str) -> Self {
+        self.spoken = Some(spoken);
+        self
     }
 
     /// The square's side and the icon's size, in points.
@@ -276,10 +294,15 @@ impl<'a> IconButton<'a> {
 
     pub fn show(self, ui: &mut Ui) -> Response {
         let t = Theme::of(ui.ctx());
-        let sense = if self.enabled { Sense::click() } else { Sense::hover() };
+        let sense = match (self.enabled, self.tab_stop) {
+            (true, true) => Sense::click(),
+            (true, false) => Sense { click: true, drag: false, focusable: false },
+            (false, _) => Sense::hover(),
+        };
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(self.side), sense);
-        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, self.enabled, self.name));
-        let l = look_as(ui, &response, self.name);
+        let spoken = self.spoken.unwrap_or(self.name);
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, self.enabled, spoken));
+        let l = look_as(ui, &response, spoken);
         if ui.is_rect_visible(rect) {
             let p = ui.painter();
             if l.enabled && (l.hovered || l.pressed) {

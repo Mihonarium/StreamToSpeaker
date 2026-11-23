@@ -277,7 +277,7 @@ pub fn place_list(facts: &Facts) -> PlaceList {
                     error: None,
                     question: None,
                     menu: vec![MenuItem::new(t!(lang, Options), Command::Open(Open::MusicAssistantSettings))],
-                    options: Some(options_button(lang, &t!(lang, MaName), &t!(lang, MaName), Open::MusicAssistantSettings)),
+                    options: Some(options_button(lang, &t!(lang, MaName), None, Open::MusicAssistantSettings)),
                 },
             }
         }),
@@ -496,15 +496,16 @@ fn speaker_row(facts: &Facts, s: &SpeakerFacts, twin: bool) -> Row {
         error,
         question,
         menu,
-        options: Some(options_button(lang, &s.name, &kind_text(lang, &s.kind), Open::SpeakerSettings(id.clone()))),
+        options: Some(options_button(lang, &s.name, Some(&kind_text(lang, &s.kind)), Open::SpeakerSettings(id.clone()))),
     }
 }
 
-/// The *›* that opens a place's own view.
-fn options_button(lang: Lang, name: &str, kind: &str, open: Open) -> Button {
+/// The *›* that opens a place's own view; a reader of the display hears
+/// the kind too, when there is one.
+fn options_button(lang: Lang, name: &str, kind: Option<&str>, open: Open) -> Button {
     Button {
         label: t!(lang, RowOptions, place = name),
-        spoken: Some(t!(lang, SpokenRowOptions, place = name, kind = kind)),
+        spoken: kind.map(|kind| t!(lang, SpokenRowOptions, place = name, kind = kind)),
         command: Command::Open(open),
         style: ButtonStyle::Icon,
         enabled: true,

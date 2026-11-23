@@ -19,6 +19,7 @@
 //! the delay, the notice and the footer; Esc closes; Ctrl+, opens Settings.
 
 pub mod scenes;
+pub mod view;
 
 use egui::{Color32, Event, Id, Key, Margin, Pos2, Rect, Sense, Ui, UiBuilder, Vec2};
 
@@ -438,6 +439,14 @@ fn delay(ui: &mut Ui, d: &PanelDelay, state: &mut crate::ui::delay::DelayState, 
     out.commands.extend(command);
 }
 
+/// The panel's delay block for `d`, wherever it is drawn (the top of the
+/// panel, a speaker's view); the commands its controls send.
+pub fn delay_block(ui: &mut Ui, d: &PanelDelay, state: &mut crate::ui::delay::DelayState) -> Vec<Command> {
+    let mut out = PanelOutput::default();
+    delay(ui, d, state, &mut out);
+    out.commands
+}
+
 // ---------------------------------------------------------------- the list
 
 /// One row of the list as the panel draws it.
@@ -521,6 +530,7 @@ fn draw_list(ui: &mut Ui, snap: &Snapshot, st: &mut PanelState, room: f32, out: 
                                     open_menu(ui.ctx(), row_menu_id(), at);
                                 }
                             }
+                            Some(RowAction::Options) => out.commands.extend(row.options.as_ref().map(|o| o.command.clone())),
                             Some(RowAction::Expand) | None => {}
                         }
                         if let Some(q) = &row.question {
@@ -560,7 +570,7 @@ fn draw_list(ui: &mut Ui, snap: &Snapshot, st: &mut PanelState, room: f32, out: 
     // ↑ and ↓ move between rows; typing jumps to a name.
     if let Some(i) = responses.iter().position(|(_, r)| r.has_focus()) {
         let id = responses[i].1.id;
-        ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { vertical_arrows: true, ..Default::default() }));
+        ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { vertical_arrows: true, horizontal_arrows: true, ..Default::default() }));
         let (up, down, now) = ui.input(|inp| (inp.key_pressed(Key::ArrowUp), inp.key_pressed(Key::ArrowDown), inp.time));
         let to = if up && i > 0 {
             Some(i - 1)
@@ -661,6 +671,7 @@ fn place_row(ui: &mut Ui, row: &Row, tab_stop: bool) -> (Option<RowAction>, egui
         menu: !row.menu.is_empty(),
         spoken: Some(row.spoken.clone()),
         tab_stop,
+        options: row.options.as_ref().map(|o| (o.label.as_str(), o.spoken.as_deref().unwrap_or(o.label.as_str()))),
         ..PlaceRow::new(row_icon(row.icon), &row.title, &row.tooltip)
     };
     ui.push_id(("row", &row.title), |ui| r.show_full(ui, ROW_STYLE)).inner

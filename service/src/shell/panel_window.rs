@@ -109,16 +109,21 @@ const FALLBACK_HEIGHT: f32 = 480.0;
 /// The open panel.
 pub struct PanelWindow {
     pub state: PanelState,
+    /// The views shown over the everyday content, the top one last.
+    pub views: Vec<OpenView>,
     /// The tray icon it opened from, if it did.
     icon: Option<PxRect>,
     phase: Phase,
 }
 
+/// A view in the panel, and what its frame keeps.
+pub type OpenView = (Box<dyn super::ViewContent>, crate::panel::view::ViewState);
+
 impl PanelWindow {
     /// Open the panel from the tray icon at `icon`, or with no icon (from
     /// Start, a second launch, a notification).
     pub fn open(icon: Option<PxRect>) -> Self {
-        PanelWindow { state: PanelState::opened(), icon, phase: Phase::Measuring { last: 0.0, stable: 0, frames: 0 } }
+        PanelWindow { state: PanelState::opened(), views: Vec::new(), icon, phase: Phase::Measuring { last: 0.0, stable: 0, frames: 0 } }
     }
 
     pub fn phase(&self) -> Phase {

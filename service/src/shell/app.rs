@@ -13,10 +13,12 @@ use egui::{Frame, ViewportBuilder, ViewportCommand, ViewportId};
 use windows_sys::Win32::Foundation::HWND;
 
 use super::content::WantedGate;
-use super::panel_window::{PanelWindow, Seen, Step, Toggle, TrayClick};
+use super::panel_window::{OpenView, PanelWindow, Seen, Step, Toggle, TrayClick};
+use super::views::{StandInViews, ViewMemory};
 use super::tray::{Tray, TrayEvent};
 use super::win::{self, WindowsDesktop};
-use super::{centred, panel_builder, root_builder, Ask, Desktop, Placeholders, RootMode, ShellOptions, WindowContent, WindowKind, Wiring, ROOT_TITLE};
+use super::{centred, panel_builder, root_builder, Ask, Desktop, Placeholders, RootMode, ShellOptions, ViewContent, Views, WindowContent, WindowKind, Wiring, ROOT_TITLE};
+use crate::panel::view::{show_view, ViewState};
 use crate::model::command::{Command, Open, Surface};
 use crate::model::state::Place;
 use crate::model::port::Watch;
@@ -55,7 +57,10 @@ pub fn scripted_scenario() -> Option<Scenario> {
 pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()> {
     let engine = Arc::new(ScriptedEngine::new(scenario));
     let _clock = RealTime::start(engine.clone(), Duration::from_millis(50));
-    run(opts, Wiring { port: engine, contents: Box::new(Placeholders), route_opens: None, quit: Box::new(|| {}), quitting: Box::new(|| false) })
+    run(
+        opts,
+        Wiring { port: engine, views: Box::new(StandInViews), contents: Box::new(Placeholders), route_opens: None, quit: Box::new(|| {}), quitting: Box::new(|| false) },
+    )
 }
 
 /// Run the shell on the running app: the engine as its port, the Settings
@@ -69,6 +74,7 @@ pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, op
         opts,
         Wiring {
             port: engine,
+            views: Box::new(StandInViews),
             contents: Box::new(super::content::SettingsContents {
                 port: settings,
                 open_windows_page: win::open_windows_page,
@@ -93,7 +99,7 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
         native,
         Box::new(move |cc| {
             crate::fonts::install(&cc.egui_ctx);
-            let Wiring { port, contents, route_opens, quit, quitting } = wiring;
+            let Wiring { port, views, contents, route_opens, quit, quitting } = wiring;
             let ctx = cc.egui_ctx.clone();
             let watch = port.watch(Arc::new(move || ctx.request_repaint()));
             let (open_tx, open_rx) = channel::<Open>();
@@ -115,6 +121,9 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
             Ok(Box::new(Shell {
                 port,
                 _watch: watch,
+                views,
+                memory: ViewMemory::default(),
+                now: 0.0,
                 contents,
                 quit,
                 quitting,
@@ -151,6 +160,11 @@ pub fn app_icon() -> Arc<egui::IconData> {
 struct Shell {
     port: Arc<dyn crate::model::port::Port>,
     _watch: Watch,
+    views: Box<dyn Views>,
+    /// The views the panel closed on, to open on them again.
+    memory: ViewMemory<OpenView>,
+    /// This frame's time, in egui's seconds.
+    now: f64,
     contents: Box<dyn super::Contents>,
     quit: Box<dyn Fn()>,
     quitting: Box<dyn Fn() -> bool>,
@@ -245,11 +259,33 @@ impl Shell {
             Some(p) if p.shown() => ctx.send_viewport_cmd_to(panel_id(), ViewportCommand::Focus),
             Some(_) => {}
             None => {
-                self.panel = Some(PanelWindow::open(icon.or_else(|| self.tray.as_ref().and_then(|t| t.rect()))));
+                let mut p = PanelWindow::open(icon.or_else(|| self.tray.as_ref().and_then(|t| t.rect())));
+                // On the view it closed on, a moment ago or with text typed.
+                p.views = self.memory.reopen(self.now, |(v, _)| v.holds_unused_text());
+                self.panel = Some(p);
                 // Opened with the mouse: the focus ring waits for a key.
                 crate::ui::look::set_focus_visible(ctx, false);
             }
         }
+    }
+
+    /// Show `view` in the panel: over the one showing (`push`), or in place
+    /// of whatever shows, opening the panel if it is closed.
+    fn show_view(&mut self, ctx: &egui::Context, view: Box<dyn ViewContent>, push: bool) {
+        if self.panel.is_none() {
+            self.open_panel(ctx, None);
+            self.memory.forget();
+            if let Some(p) = &mut self.panel {
+                p.views.clear();
+            }
+        }
+        if let Some(p) = &mut self.panel {
+            if !push {
+                p.views.clear();
+            }
+            p.views.push((view, ViewState::opened()));
+        }
+        ctx.send_viewport_cmd_to(panel_id(), ViewportCommand::Focus);
     }
 
     fn close_panel(&mut self) {
@@ -257,6 +293,7 @@ impl Shell {
             if p.shown() {
                 let _ = self.port.send(Surface::Panel, Command::PanelShown(false));
             }
+            self.memory.closed(p.views, self.now);
         }
         // Without a tray icon the panel is the app's window.
         if !self.opts.tray {
@@ -279,14 +316,24 @@ impl Shell {
         }
     }
 
-    /// Open what `open` asks for: the panel, a page of Settings, a dialog,
-    /// or something outside the app. `from_window`: asked in the panel or
-    /// Settings.
-    fn open(&mut self, ctx: &egui::Context, open: &Open, snap: &Snapshot, from_window: bool) {
+    /// Open what `open` asks for: the panel, one of its views (over the one
+    /// showing with `push`), a dialog, or something outside the app.
+    /// `from_window`: asked in the panel or Settings.
+    fn open(&mut self, ctx: &egui::Context, open: &Open, snap: &Snapshot, from_window: bool, push: bool) {
         if matches!(open, Open::Panel) {
             self.open_panel(ctx, None);
             return;
         }
+        if let Some(view) = self.views.view(open, snap) {
+            self.show_view(ctx, view, push);
+            return;
+        }
+        self.open_window(ctx, open, snap, from_window);
+    }
+
+    /// Open what `open` asks for as a window (or outside the app), even
+    /// where it is also a view.
+    fn open_window(&mut self, ctx: &egui::Context, open: &Open, snap: &Snapshot, from_window: bool) {
         if let Some(s) = &mut self.settings {
             if s.navigate(open) {
                 ctx.send_viewport_cmd_to(settings_id(), ViewportCommand::Focus);
@@ -315,7 +362,7 @@ impl Shell {
             }
         }
         match command {
-            Command::Open(open) => self.open(ctx, &open, snap, window),
+            Command::Open(open) => self.open(ctx, &open, snap, window, false),
             Command::Quit => self.quit_now(),
             command => {
                 let _ = self.port.send(from, command);
@@ -339,9 +386,9 @@ impl Shell {
         }
     }
 
-    /// Draw the panel's window; what it sends.
-    fn panel_frame(&mut self, ctx: &egui::Context, snap: &Snapshot, now: f64) -> Vec<Command> {
-        let Some(panel) = self.panel.as_mut() else { return Vec::new() };
+    /// Draw the panel's window; what it sends and what its view asks.
+    fn panel_frame(&mut self, ctx: &egui::Context, snap: &Snapshot, now: f64) -> (Vec<Command>, Vec<Ask>) {
+        let Some(panel) = self.panel.as_mut() else { return (Vec::new(), Vec::new()) };
         let mode = self.opts.panel;
         let pinned = snap.first_run.is_some();
         let (port, desktop) = (&self.port, &mut self.desktop);
@@ -356,9 +403,22 @@ impl Shell {
                 // Its × (the small-window form): the shell closes it.
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             }
-            let out = egui::CentralPanel::default()
+            let cap = panel.state.height;
+            let depth = panel.views.len().saturating_sub(1);
+            let (out, asks) = egui::CentralPanel::default()
                 .frame(Frame::none().fill(t.c.surface))
-                .show(ctx, |ui| crate::panel::show(ui, snap, port.level(), &mut panel.state))
+                .show(ctx, |ui| match panel.views.last_mut() {
+                    Some((view, vs)) => {
+                        vs.cap = cap;
+                        let o = show_view(ui, view.as_mut(), snap, vs, depth);
+                        let mut asks = o.asks;
+                        if o.back {
+                            asks.push(Ask::Back);
+                        }
+                        (crate::panel::PanelOutput { natural_height: o.natural_height, ..Default::default() }, asks)
+                    }
+                    None => (crate::panel::show(ui, snap, port.level(), &mut panel.state), Vec::new()),
+                })
                 .inner;
             let seen = Seen { natural_height: out.natural_height, close: out.close || close, inner_height, focused };
             let step = panel.after_frame(seen, pinned, mode, desktop);
@@ -367,7 +427,7 @@ impl Shell {
                 ctx.send_viewport_cmd(ViewportCommand::Focus);
             }
             ctx.request_repaint_after(METER);
-            (out.commands, step)
+            ((out.commands, asks), step)
         });
         match step {
             Step::Show => {
@@ -381,6 +441,28 @@ impl Shell {
             Step::Wait => {}
         }
         commands
+    }
+
+    /// Do what a view or a window's content asked.
+    fn answer(&mut self, ctx: &egui::Context, ask: Ask, snap: &Snapshot, sent: &mut Vec<(Surface, Command)>) {
+        match ask {
+            Ask::Command(c) => sent.push((Surface::Panel, c)),
+            Ask::Dialog(d) => self.open_dialog(d),
+            Ask::OpenPanel => self.open_panel(ctx, None),
+            Ask::View(v) => self.show_view(ctx, v, true),
+            Ask::Open(o) => self.open(ctx, &o, snap, true, true),
+            Ask::Window(o) => self.open_window(ctx, &o, snap, true),
+            Ask::Back => {
+                if let Some(p) = &mut self.panel {
+                    p.views.pop();
+                    if p.views.is_empty() {
+                        // Back on the everyday content, the keyboard where
+                        // it starts.
+                        p.state.focus_current_row = true;
+                    }
+                }
+            }
+        }
     }
 
     /// Draw the Settings window or the dialog; what it asks.
@@ -424,6 +506,7 @@ impl eframe::App for Shell {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frames += 1;
+        self.now = ctx.input(|i| i.time);
         if self.closing || (self.quitting)() {
             self.closing = true;
             ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
@@ -454,7 +537,7 @@ impl eframe::App for Shell {
         }
         // From other surfaces, through the engine.
         while let Ok(open) = self.opens.try_recv() {
-            self.open(ctx, &open, &snap, false);
+            self.open(ctx, &open, &snap, false, false);
         }
         // A second launch; at start, first run or a start from the Start
         // menu: the panel.
@@ -472,15 +555,12 @@ impl eframe::App for Shell {
             self.wanted.admit(None, self.dialog.is_some());
         }
 
-        sent.extend(self.panel_frame(ctx, &snap, now).into_iter().map(|c| (Surface::Panel, c)));
-        let mut asks = self.content_frame(ctx, &snap, WindowKind::Settings);
+        let (commands, mut asks) = self.panel_frame(ctx, &snap, now);
+        sent.extend(commands.into_iter().map(|c| (Surface::Panel, c)));
+        asks.extend(self.content_frame(ctx, &snap, WindowKind::Settings));
         asks.extend(self.content_frame(ctx, &snap, WindowKind::Dialog));
         for a in asks {
-            match a {
-                Ask::Command(c) => sent.push((Surface::Settings, c)),
-                Ask::Dialog(d) => self.open_dialog(d),
-                Ask::OpenPanel => self.open_panel(ctx, None),
-            }
+            self.answer(ctx, a, &snap, &mut sent);
         }
         for (from, c) in sent {
             self.route(ctx, from, c, &snap);

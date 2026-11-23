@@ -14,6 +14,7 @@ pub mod icons;
 pub mod panel_window;
 pub mod placement;
 pub mod scenes;
+pub mod views;
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
@@ -161,14 +162,79 @@ pub enum WindowKind {
     Dialog,
 }
 
-/// What a window's content asks of the shell while it is drawn.
+/// What a view or a window's content asks of the shell while it is drawn.
 pub enum Ask {
-    /// Send this to the engine (from the Settings window).
+    /// Send this to the engine, from the app's window.
     Command(Command),
     /// Open this dialog (it waits while another is open).
     Dialog(Box<dyn WindowContent>),
     /// Open the panel by the clock.
     OpenPanel,
+    /// Show this view in the panel, over the one showing; back returns.
+    View(Box<dyn ViewContent>),
+    /// Open what this asks for: a view (over the one showing), a dialog,
+    /// Windows' own settings.
+    Open(Open),
+    /// Go back one view.
+    Back,
+    /// Open this as a window even where it is also a view (the Settings
+    /// window, until its views exist).
+    Window(Open),
+}
+
+/// The bar at the top of a view: the back arrow, then these.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ViewBar {
+    pub title: String,
+    /// Under the title, smaller (*Sonos · playing now*).
+    pub line: Option<String>,
+    /// One button at the right end (*Test sound*); a press calls
+    /// [`ViewContent::bar_button`].
+    pub button: Option<String>,
+}
+
+/// A view of the panel: it replaces the everyday content, at the same
+/// width (a speaker's options, Settings, *Speaker missing?*, *Can't hear
+/// it?*, Music Assistant). The panel draws the bar, the back arrow, the
+/// scrolling and the line of links around it; going back is the panel's
+/// too (the arrow, Esc, Backspace outside a field, Alt+Left). A view
+/// carries what it needs (its port, its id) the way a window's content
+/// does; opening one never changes what plays.
+pub trait ViewContent {
+    /// The bar's words.
+    fn bar(&self, snap: &Snapshot) -> ViewBar;
+    /// The bar's button was pressed.
+    fn bar_button(&mut self, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) {
+        let _ = (snap, ask);
+    }
+    /// The content under the bar, in the panel's width; it scrolls when it
+    /// is taller than the room. What it asks goes through `ask`.
+    fn show(&mut self, ui: &mut egui::Ui, snap: &Snapshot, ask: &mut dyn FnMut(Ask));
+    /// Whether the view has a line of links at the bottom.
+    fn has_links(&self, snap: &Snapshot) -> bool {
+        let _ = snap;
+        false
+    }
+    /// The line of links at the bottom, laid out left to right.
+    fn links(&mut self, ui: &mut egui::Ui, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) {
+        let _ = (ui, snap, ask);
+    }
+    /// A field holds text that wasn't used yet: the panel reopens on this
+    /// view however long it was closed.
+    fn holds_unused_text(&self) -> bool {
+        false
+    }
+}
+
+/// The views another part of the app hands the panel, by what asks for
+/// them. Views are asked before windows.
+pub trait Views {
+    /// The view `open` asks for, if it is one of the panel's:
+    /// `Open::SpeakerSettings(id)` (a speaker's options, one per row, so
+    /// two ways to one speaker are two views), `Open::Settings`,
+    /// `Open::SpeakerMissing`, `Open::CantHear(_)`,
+    /// `Open::MusicAssistantSettings` and `Open::MusicAssistantHowTo`.
+    fn view(&self, open: &Open, snap: &Snapshot) -> Option<Box<dyn ViewContent>>;
 }
 
 /// What a Settings page or a dialog draws, in a window the shell made,
@@ -219,6 +285,9 @@ pub trait Contents {
 pub struct Wiring {
     /// The engine (or the scripted one).
     pub port: std::sync::Arc<dyn crate::model::port::Port>,
+    /// The panel's views (asked first).
+    pub views: Box<dyn Views>,
+    /// The windows of their own (dialogs) and what else opening does.
     pub contents: Box<dyn Contents>,
     /// Hands the engine the shell's door for navigation commands that come
     /// from elsewhere (a notification, the phone page). `None`: only the

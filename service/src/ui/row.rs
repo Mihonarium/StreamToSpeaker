@@ -87,6 +87,11 @@ pub struct PlaceRow<'a> {
     /// Whether Tab stops on the row. A list makes one row the stop and
     /// moves between rows with the arrow keys.
     pub tab_stop: bool,
+    /// The *›* at the right end that opens the place's own view: its
+    /// tooltip (*Options for Kitchen*) and what a reader of the display
+    /// says (*Options for Kitchen, Sonos*). The Right arrow on the row
+    /// presses it too.
+    pub options: Option<(&'a str, &'a str)>,
 }
 
 impl<'a> PlaceRow<'a> {
@@ -103,6 +108,7 @@ impl<'a> PlaceRow<'a> {
             indent: false,
             spoken: None,
             tab_stop: true,
+            options: None,
         }
     }
 }
@@ -119,6 +125,8 @@ pub enum RowAction {
     Expand,
     /// The problem's button.
     Button,
+    /// The *›*, or the Right arrow on the row: the place's own view.
+    Options,
 }
 
 const PAD_L: f32 = 14.0;
@@ -156,14 +164,16 @@ impl PlaceRow<'_> {
         let button_w = self.problem.and_then(|p| p.button).map(|b| {
             ui.painter().layout_no_wrap(b.to_owned(), t.font(size::SECONDARY), Color32::PLACEHOLDER).size().x + 20.0
         });
-        let more_w = if self.menu { 28.0 } else { 0.0 };
+        let more_w = if self.menu && self.options.is_none() { 28.0 } else { 0.0 };
+        // The › sits at the very end, the status just before it.
+        let options_w = if self.options.is_some() { 32.0 } else { 0.0 };
         let status_w = match self.status {
             Status::None => 0.0,
             Status::Words(_) => status_galley.as_ref().map_or(0.0, |g| g.size().x),
             Status::Busy | Status::Warning | Status::Check => 20.0,
             Status::Expand { .. } => 28.0,
         };
-        let right_w = button_w.unwrap_or(0.0).max(status_w).max(more_w);
+        let right_w = button_w.unwrap_or(0.0).max(status_w).max(more_w) + options_w;
         let text_x = PAD_L + icon_box + GAP;
         let text_w = (width - text_x - PAD_R - if right_w > 0.0 { right_w + 8.0 } else { 0.0 }).max(40.0);
 
@@ -237,10 +247,20 @@ impl PlaceRow<'_> {
             p.galley(egui::pos2(rect.left() + text_x, text_top + name_h), g, c);
         }
 
-        // The right end.
-        let right = rect.right() - PAD_R;
+        // The right end: the ›, then what sits before it.
+        let end = rect.right() - PAD_R + if self.options.is_some() { 6.0 } else { 0.0 };
+        if let Some((tip, said)) = self.options {
+            let r = Rect::from_min_size(egui::pos2(end - 28.0, rect.center().y - 14.0), Vec2::splat(28.0));
+            let chevron = super::inside(ui, r, |ui: &mut Ui| {
+                IconButton::new(Icon::ChevronRight, tip).spoken(said).tab_stop(self.tab_stop).size(28.0, 16.0).color(t.c.text_secondary).show(ui)
+            });
+            if chevron.clicked() {
+                action = Some(RowAction::Options);
+            }
+        }
+        let right = end - options_w;
         let slot = |w: f32, h: f32| Rect::from_min_size(egui::pos2(right - w, rect.center().y - h / 2.0), Vec2::new(w, h));
-        let show_more = self.menu && (l.hovered || l.focused || ui.rect_contains_pointer(rect));
+        let show_more = self.menu && self.options.is_none() && (l.hovered || l.focused || ui.rect_contains_pointer(rect));
         if let Some(words) = self.problem.and_then(|p| p.button) {
             let r = slot(button_w.unwrap_or(0.0), space::SMALL_BUTTON_HEIGHT);
             if super::inside(ui, r, |ui: &mut Ui| Button::standard(words).small().show(ui)).clicked() {
@@ -281,7 +301,9 @@ impl PlaceRow<'_> {
         }
 
         if action.is_none() {
-            if resp.clicked() {
+            if self.options.is_some() && resp.has_focus() && ui.input(|i| i.key_pressed(Key::ArrowRight)) {
+                action = Some(RowAction::Options);
+            } else if resp.clicked() {
                 action = Some(RowAction::Choose);
             } else if self.menu && resp.secondary_clicked() {
                 action = Some(RowAction::Menu(resp.interact_pointer_pos().unwrap_or(rect.center())));

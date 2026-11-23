@@ -258,15 +258,17 @@ fn the_keyboard_starts_on_the_current_row_and_tabs_through_the_top_then_the_foot
     for _ in 0..4 {
         order.extend(h.frame(vec![]).focused);
     }
-    for _ in 0..8 {
+    for _ in 0..9 {
         order.extend(h.key(Key::Tab, Modifiers::NONE).focused);
         order.extend(h.frame(vec![]).focused);
     }
     let v = snap.top.volume.clone().unwrap();
     // The panel opens with the keyboard on the current row (no event says
     // so: the focus was given, not moved), so the first Tab goes on to the
-    // top.
+    // row's ›, then to the top.
+    let options = snap.list.rows().find(|r| r.current).and_then(|r| r.options.clone()).unwrap();
     let expected = [
+        options.spoken.clone().unwrap(),
         v.mute.spoken.clone().unwrap_or(v.mute.label.clone()),
         v.spoken.clone(),
         d.spoken.clone(),
@@ -274,7 +276,7 @@ fn the_keyboard_starts_on_the_current_row_and_tabs_through_the_top_then_the_foot
         snap.footer.speaker_missing.label.clone(),
         snap.footer.settings.spoken.clone().unwrap_or(snap.footer.settings.label.clone()),
         current.clone(),
-        v.mute.spoken.clone().unwrap_or(v.mute.label.clone()),
+        options.spoken.clone().unwrap(),
     ];
     let order: Vec<String> = order.into_iter().fold(Vec::new(), |mut acc, x| {
         if acc.last() != Some(&x) {
@@ -320,8 +322,8 @@ fn the_arrow_keys_change_the_delay_on_the_closed_line() {
     let stream_to_speaker::model::delay::DelayBody::Buttons { remove_small, add_large, .. } = &d.body else { panic!() };
     let mut h = Harness::new(snap, PanelState::opened());
     h.settle();
-    // Tab twice from the row to the slider, once more to the delay line.
-    for _ in 0..3 {
+    // Tab from the row to its ›, to mute, to the slider, to the delay line.
+    for _ in 0..4 {
         h.key(Key::Tab, Modifiers::NONE);
     }
     assert_eq!(h.key(Key::ArrowLeft, Modifiers::NONE).out.commands, vec![remove_small.command.clone()]);
@@ -496,4 +498,27 @@ fn the_top_keeps_its_height_in_every_everyday_state() {
     }
     let first = tops[0].1;
     assert!(tops.iter().all(|(_, y)| (y - first).abs() < 0.5), "{tops:?}");
+}
+
+#[test]
+fn a_rows_options_open_from_its_chevron_its_menu_and_the_right_arrow() {
+    let snap = snapshot("playing", Names::Usual);
+    let office = snap.list.rows().find(|r| r.title == "Office").unwrap().clone();
+    let options = office.options.clone().unwrap();
+    let mut h = Harness::new(snap.clone(), PanelState::opened());
+    // The chevron sits at the row's right end, on its centre line.
+    let f = h.settle();
+    let row = f.texts.iter().find(|(t, _)| t == "Office").unwrap().1;
+    assert_eq!(h.click_at(Pos2::new(WIDTH - 24.0, row.center().y)), vec![options.command.clone()]);
+    // The menu's Options is the same.
+    assert_eq!(office.menu.first().map(|m| &m.command), Some(&options.command));
+    // The Right arrow on the row the keyboard is on.
+    let mut h = Harness::new(snap.clone(), PanelState::opened());
+    h.settle();
+    h.key(Key::ArrowDown, Modifiers::NONE);
+    h.key(Key::ArrowDown, Modifiers::NONE);
+    let on = snap.list.rows().skip_while(|r| !r.current).nth(2).unwrap();
+    assert_eq!(h.key(Key::ArrowRight, Modifiers::NONE).out.commands, vec![on.options.clone().unwrap().command]);
+    // This PC has no options of its own.
+    assert!(snap.list.this_pc.options.is_none());
 }
