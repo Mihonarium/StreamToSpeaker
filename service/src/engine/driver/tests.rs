@@ -413,6 +413,86 @@ fn a_receiver_claiming_another_speakers_identity_plays_only_from_the_window() {
     rig.settle();
 }
 
+/// An app whose discovery lists Kitchen and a receiver claiming its
+/// identity, answering on `rx`.
+fn newcomer_app(rx: &crate::airplay::fake_raop::FakeRaop) -> Arc<App> {
+    let discovery = conflict_on_loopback(rx.port());
+    assert!(discovery.find_by_id(KITCHEN_2).unwrap().is_newcomer());
+    App::with_settings(AppConfig { advertise_ip: None, ..App::test_config() }, UserConfig::in_memory(), None, Some(discovery))
+}
+
+/// Run what the core decides at `at` (time the test moves on); how many
+/// connects it started by itself.
+fn tick_at(rig: &mut Rig, at: Instant) -> usize {
+    let w = rig.driver.world(at);
+    let dos = rig.driver.core.tick(&w, at);
+    let n = by_itself(&dos);
+    rig.driver.execute(dos);
+    n
+}
+
+fn by_itself(dos: &[Do]) -> usize {
+    dos.iter().filter(|d| matches!(d, Do::Connect(j) if j.origin == Origin::ByItself)).count()
+}
+
+/// The app never plays to a receiver announcing another speaker's
+/// identity by itself: not at start-up, not when Windows chooses the app's
+/// output, not as a retry after it dropped. Nothing reaches it.
+#[test]
+fn a_receiver_claiming_another_speakers_identity_is_never_played_by_the_app_itself() {
+    use crate::airplay::fake_raop::{Answer, FakeRaop};
+    let rx = FakeRaop::start(|_| Answer::Normal);
+    let newcomer = Place::Speaker(SpeakerId::new(KITCHEN_2));
+
+    // Start-up, with it remembered.
+    let mut rig = Rig::on(newcomer_app(&rx));
+    let now = Instant::now();
+    rig.driver.core = Core::new(Some(newcomer.clone()), Some(newcomer.clone()), now);
+    let w = rig.driver.world(now);
+    let dos = rig.driver.core.event(Event::Started { after_update: false }, &w, now);
+    rig.driver.execute(dos);
+    assert_eq!(tick_at(&mut rig, now + Duration::from_secs(1)), 1, "the start rule returns to it");
+    rig.settle();
+    assert_eq!(rig.bound_in_app(), None);
+    assert!(rx.requests().is_empty(), "start-up: {:?}", rx.lines());
+
+    // Windows chooses the app's output, which is named after it.
+    let mut rig = Rig::on(newcomer_app(&rx));
+    rig.driver.core.named = Some(newcomer.clone());
+    rig.windows.choose_in_windows(OURS);
+    let now = Instant::now();
+    let w = rig.driver.world(now);
+    let dos = rig.driver.core.event(Event::DefaultChanged, &w, now);
+    assert_eq!(by_itself(&dos), 1, "Windows is a second door: {dos:?}");
+    rig.driver.execute(dos);
+    rig.settle();
+    assert_eq!(rig.bound_in_app(), None);
+    assert!(rx.requests().is_empty(), "Windows' choice: {:?}", rx.lines());
+
+    // Picked in the window, it plays; when it drops, the app doesn't try
+    // it again by itself.
+    let mut rig = Rig::on(newcomer_app(&rx));
+    rig.play(Surface::Panel, KITCHEN_2).unwrap();
+    rig.plays_on(KITCHEN_2);
+    rig.settle();
+    rig.app.release_session(true).map(|t| t.join());
+    let heard = rx.requests().len();
+    let now = Instant::now();
+    let w = rig.driver.world(now);
+    let dos = rig.driver.core.event(Event::Dropped, &w, now);
+    rig.driver.execute(dos);
+    let mut tries = 0;
+    for secs in [1, 3, 6, 10, 15, 30] {
+        tries += tick_at(&mut rig, now + Duration::from_secs(secs));
+        rig.settle();
+    }
+    assert!(tries >= 1, "no retry was decided");
+    assert_eq!(rig.bound_in_app(), None);
+    assert_eq!(rx.requests().len(), heard, "a retry reached it: {:?}", rx.lines());
+    // And it was never remembered as the speaker to return to.
+    assert_eq!(rig.app.user_config.lock().unwrap().last_speaker_id, None);
+}
+
 /// The window's own pick reaches the engine as the window's.
 #[test]
 fn todays_entry_points_send_commands_with_their_own_surface() {

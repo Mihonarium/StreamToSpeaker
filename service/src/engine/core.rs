@@ -17,15 +17,27 @@ use crate::model::state::{
 };
 use crate::model::text::LocalTime;
 
+/// Where a connect comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// A person's pick in the app's own window. Only such a pick may play
+    /// to a receiver that announces another speaker's identity, and only
+    /// there can a code or password be asked for.
+    Window,
+    /// A person's choice from anywhere else: the tray, a shortcut, a
+    /// notification, the phone page, the command line, the web API.
+    Elsewhere,
+    /// The app's own decision: a return, a retry, start-up, Windows
+    /// choosing the app's output.
+    ByItself,
+}
+
 /// A connect the driver runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Job {
     pub gen: u64,
     pub place: Place,
-    /// A person asked for it (not a retry or a return).
-    pub person: bool,
-    /// In the app's own window: a code or password may be asked for.
-    pub interactive: bool,
+    pub origin: Origin,
     /// Ask the speaker first whether it is playing something else.
     pub check_busy: bool,
 }
@@ -389,21 +401,21 @@ impl Core {
         self.gen
     }
 
-    /// A command from a surface; `interactive` when it came from the app's
-    /// own window, where a code or password can be asked for.
+    /// A command from a surface: `origin` is [`Origin::Window`] for the
+    /// app's own window, else [`Origin::Elsewhere`].
     pub fn command(
         &mut self,
         cmd: &Command,
-        interactive: bool,
+        origin: Origin,
         w: &World,
         now: Instant,
     ) -> (Result<Effect, Refusal>, Vec<Do>) {
         let before = self.state(w, now);
         let mut out = Vec::new();
         match cmd {
-            Command::Play(Place::Speaker(id)) => self.choose(Place::Speaker(id.clone()), false, interactive, &mut out),
-            Command::PlayTakingOver(id) => self.choose(Place::Speaker(id.clone()), true, interactive, &mut out),
-            Command::Play(Place::MusicAssistant) => self.choose(Place::MusicAssistant, false, interactive, &mut out),
+            Command::Play(Place::Speaker(id)) => self.choose(Place::Speaker(id.clone()), false, origin, &mut out),
+            Command::PlayTakingOver(id) => self.choose(Place::Speaker(id.clone()), true, origin, &mut out),
+            Command::Play(Place::MusicAssistant) => self.choose(Place::MusicAssistant, false, origin, &mut out),
             Command::Play(Place::ThisPc) | Command::StayOnThisPc => {
                 self.to_this_pc(&mut out);
                 self.choice = Some(Place::ThisPc);
@@ -435,8 +447,9 @@ impl Core {
         (Ok(Effect::Done), out)
     }
 
-    /// The person chose `place` (a speaker or Music Assistant).
-    fn choose(&mut self, place: Place, take_over: bool, interactive: bool, out: &mut Vec<Do>) {
+    /// `place` (a speaker or Music Assistant) is chosen: by a person, or
+    /// by the app as if by one (Windows choosing the app's output).
+    fn choose(&mut self, place: Place, take_over: bool, origin: Origin, out: &mut Vec<Do>) {
         if let Place::Speaker(id) = &place {
             self.failures.remove(id);
             if take_over {
@@ -470,13 +483,13 @@ impl Core {
         self.special = Special::None;
         let gen = self.next_gen();
         self.connect = Some(Connecting { gen, place: place.clone(), from: self.sound_at(), stage: ConnectStage::Finding });
-        out.push(Do::Connect(Job { gen, place, person: true, interactive, check_busy: !take_over }));
+        out.push(Do::Connect(Job { gen, place, origin, check_busy: !take_over }));
     }
 
     fn auto_connect(&mut self, place: Place, out: &mut Vec<Do>) {
         let gen = self.next_gen();
         self.auto = Some((gen, place.clone()));
-        out.push(Do::Connect(Job { gen, place, person: false, interactive: false, check_busy: true }));
+        out.push(Do::Connect(Job { gen, place, origin: Origin::ByItself, check_busy: true }));
     }
 
     /// Sound back on this PC, nothing bound, nothing pending.
@@ -721,12 +734,14 @@ impl Core {
             (true, None) => {
                 if let Special::Switched { place, release_at: None, .. } = self.special.clone() {
                     // Windows came back after the speaker was let go.
-                    self.choose(place, false, false, out);
+                    self.choose(place, false, Origin::ByItself, out);
                 } else if self.connect.is_none() {
                     // Windows is a second door: picking this app's output
                     // plays on the speaker it is named after.
                     match self.named.clone() {
-                        Some(place @ (Place::Speaker(_) | Place::MusicAssistant)) => self.choose(place, false, false, out),
+                        Some(place @ (Place::Speaker(_) | Place::MusicAssistant)) => {
+                            self.choose(place, false, Origin::ByItself, out)
+                        }
                         _ => self.special = Special::Choose,
                     }
                 }

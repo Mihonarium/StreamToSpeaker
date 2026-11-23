@@ -4869,16 +4869,16 @@ impl App {
     /// Connect to `id` and make it what plays, for the engine, on the
     /// calling thread (one of the engine's own). `person`: a person chose
     /// it, so a code or password may be asked for.
-    /// `interactive`: in the app's own window, so a code or password may be
-    /// asked for. `person`: a person chose it (not a retry or a return,
-    /// which never play to a receiver announcing another speaker's
-    /// identity).
-    pub(crate) fn engine_connect(self: &Arc<Self>, id: &str, interactive: bool, person: bool) -> Result<(), String> {
+    /// `window`: a person's pick in the app's own window, the only one
+    /// that may play to a receiver announcing another speaker's identity
+    /// and ask for a code or password. `chosen`: a person chose it, there
+    /// or elsewhere (not a return or a retry).
+    pub(crate) fn engine_connect(self: &Arc<Self>, id: &str, window: bool, chosen: bool) -> Result<(), String> {
         *self.connecting.lock().unwrap() = Some(self.speaker_name(id).unwrap_or_else(|| id.to_string()));
-        if person {
+        if chosen {
             self.note_user_pick();
         }
-        let result = self.select_speaker_inner(id, interactive, person, None);
+        let result = self.select_speaker_inner(id, window, window, None);
         self.forget_typed_password(id);
         *self.connecting.lock().unwrap() = None;
         self.clear_connecting_notice();

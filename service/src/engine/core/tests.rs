@@ -42,7 +42,7 @@ impl Run {
         Run { core: Core::new(None, None, now), w: world(), t0: now, now, done: vec![] }
     }
     fn cmd(&mut self, c: Command) -> Vec<Do> {
-        let (_, d) = self.core.command(&c, true, &self.w, self.now);
+        let (_, d) = self.core.command(&c, Origin::Window, &self.w, self.now);
         self.done.extend(d.clone());
         d
     }
@@ -88,7 +88,7 @@ fn choosing_a_speaker_waits_until_it_is_ready_then_moves_windows_too() {
     let mut r = Run::new();
     let d = r.cmd(Command::Play(Place::Speaker(kitchen())));
     let job = Run::job(&d).unwrap();
-    assert!(job.person && job.check_busy);
+    assert!(job.origin == Origin::Window && job.check_busy);
     assert_eq!(
         r.state(),
         NowState::Connecting { target: kitchen(), from: SoundAt::ThisPc, stage: ConnectStage::Finding }
@@ -163,7 +163,7 @@ fn a_speaker_that_drops_gets_three_tries_then_the_sound_comes_back_with_a_note()
     assert_eq!(tries(r.state()), 1);
     assert!(r.at(1.9).is_empty(), "nothing before 2 s");
     let j1 = Run::job(&r.at(2.0)).expect("first try at 2 s");
-    assert!(!j1.person);
+    assert_eq!(j1.origin, Origin::ByItself);
     r.ev(Event::Ended { gen: j1.gen, ended: Ended::Failed(ConnectFailure::NoAnswer) });
     assert_eq!(tries(r.state()), 2);
     assert!(Run::job(&r.at(4.9)).is_none());
@@ -333,7 +333,7 @@ fn an_automatic_return_never_takes_a_busy_speaker_or_asks_for_a_code_by_itself()
     r.core.choice = Some(Place::Speaker(kitchen()));
     r.ev(Event::Started { after_update: false });
     let j = Run::job(&r.at(1.0)).unwrap();
-    assert!(!j.person, "never a dialog by itself");
+    assert_eq!(j.origin, Origin::ByItself, "never a dialog by itself");
     r.ev(Event::Ended { gen: j.gen, ended: Ended::NeedsSecret(Secret::Code) });
     assert_eq!(r.state(), NowState::NeedsSecret { speaker: kitchen(), secret: Secret::Code });
     assert_eq!(r.notified(), Some(N::NeedsSecret(Secret::Code)));
@@ -359,6 +359,7 @@ fn windows_switching_away_lets_the_speaker_go_after_10_seconds_unless_it_comes_b
     r.w.default_output = Some(out("ours"));
     let j = Run::job(&r.ev(Event::DefaultChanged)).expect("Windows is a second door");
     assert_eq!(j.place, Place::Speaker(kitchen()));
+    assert_eq!(j.origin, Origin::ByItself, "Windows' choice is not a pick in the window");
 }
 
 #[test]
@@ -376,6 +377,56 @@ fn picking_this_apps_output_in_windows_plays_on_its_speaker_or_asks_which() {
     r.w.default_output = Some(out("ours"));
     let j = Run::job(&r.ev(Event::DefaultChanged)).unwrap();
     assert_eq!(j.place, Place::Speaker(kitchen()));
+    assert_eq!(j.origin, Origin::ByItself);
+}
+
+/// Only a pick in the app's window is the window's; every other choice
+/// keeps where it came from, and everything the app starts by itself is
+/// its own.
+#[test]
+fn every_connect_says_where_it_came_from() {
+    for (origin, take_over) in [
+        (Origin::Window, false),
+        (Origin::Window, true),
+        (Origin::Elsewhere, false),
+        (Origin::Elsewhere, true),
+    ] {
+        let mut r = Run::new();
+        let cmd = if take_over {
+            Command::PlayTakingOver(kitchen())
+        } else {
+            Command::Play(Place::Speaker(kitchen()))
+        };
+        let (_, d) = r.core.command(&cmd, origin, &r.w, r.now);
+        assert_eq!(Run::job(&d).unwrap().origin, origin, "{cmd:?}");
+    }
+
+    // Start-up, sign-in and wake, and after an update.
+    for ev in [Event::Started { after_update: false }, Event::Started { after_update: true }, Event::Resumed] {
+        let mut r = Run::new();
+        r.core = Core::new(Some(Place::Speaker(kitchen())), Some(Place::Speaker(kitchen())), r.now);
+        r.core.pc_output = Some(out("realtek"));
+        r.ev(ev.clone());
+        r.at(1.0);
+        let j = Run::job(&r.done).unwrap_or_else(|| panic!("{ev:?}: no return"));
+        assert_eq!(j.origin, Origin::ByItself, "{ev:?}");
+    }
+
+    // A retry after a dropout.
+    let mut r = Run::playing_on_kitchen();
+    r.ev(Event::Dropped);
+    let j = Run::job(&r.at(5.0)).expect("a try");
+    assert_eq!(j.origin, Origin::ByItself);
+
+    // A speaker set to come back whenever it appears.
+    let mut r = Run::new();
+    r.core.named = Some(Place::Speaker(kitchen()));
+    r.w.settings.comes_back.insert(kitchen(), ComesBack::WheneverAppears);
+    r.w.found.remove(&kitchen());
+    r.at(1.0);
+    r.w.found.insert(kitchen());
+    let j = Run::job(&r.at(2.0)).expect("it appeared");
+    assert_eq!(j.origin, Origin::ByItself);
 }
 
 #[test]

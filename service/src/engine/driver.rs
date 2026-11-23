@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use log::{debug, info, warn};
 
 use super::cancel;
-use super::core::{Core, Do, Ended, Event, Job, Settings, World};
+use super::core::{Core, Do, Ended, Event, Job, Origin, Settings, World};
 use super::facts;
 use crate::app::{place_of, App};
 use crate::model::command::{
@@ -130,11 +130,19 @@ impl Port for Engine {
     }
 }
 
-/// Whether `from` is the app's own window: only a person picking there may
-/// choose a receiver that announces another speaker's identity, and only
-/// there can a code or password be asked for.
-pub(crate) fn in_window(from: Surface) -> bool {
-    matches!(from, Surface::Panel | Surface::Settings)
+/// Where a command from `from` comes from: only a person picking in the
+/// app's own window may choose a receiver that announces another
+/// speaker's identity, and only there can a code or password be asked for.
+pub(crate) fn origin_of(from: Surface) -> Origin {
+    match from {
+        Surface::Panel | Surface::Settings => Origin::Window,
+        Surface::Tray
+        | Surface::Shortcut
+        | Surface::Notification
+        | Surface::Phone
+        | Surface::CommandLine
+        | Surface::Api => Origin::Elsewhere,
+    }
 }
 
 pub(crate) struct Driver {
@@ -250,11 +258,11 @@ impl Driver {
             Command::Play(Place::Speaker(id)) | Command::PlayTakingOver(id) => {
                 // A receiver announcing another speaker's identity plays
                 // only when a person picks it in the app's own window.
-                if !in_window(from) && app.is_airplay_newcomer(id.as_str()) {
+                if origin_of(from) != Origin::Window && app.is_airplay_newcomer(id.as_str()) {
                     info!("refused a pick of {} from {:?}: it announces another speaker's identity", id.as_str(), from);
                     return Err(Refusal::OnlyFromWindow { speaker: id.clone() });
                 }
-                self.core_command(cmd, in_window(from), now)
+                self.core_command(cmd, origin_of(from), now)
             }
             Command::SetVolume { owner, level } => {
                 self.set_volume(owner, Some(*level), None);
@@ -318,20 +326,20 @@ impl Driver {
                     uc.closed_for_update = true;
                     uc.save();
                 }
-                self.core_command(cmd, false, now)
+                self.core_command(cmd, origin_of(from), now)
             }
             Command::PlayTestSound(_)
             | Command::AllowDevice { .. }
             | Command::TurnOffLab
             | Command::DismissNotice(_)
             | Command::FirstRun(_) => Ok(Effect::Done),
-            _ => self.core_command(cmd, in_window(from), now),
+            _ => self.core_command(cmd, origin_of(from), now),
         }
     }
 
-    fn core_command(&mut self, cmd: &Command, interactive: bool, now: Instant) -> Result<Effect, Refusal> {
+    fn core_command(&mut self, cmd: &Command, origin: Origin, now: Instant) -> Result<Effect, Refusal> {
         let w = self.world(now);
-        let (result, dos) = self.core.command(cmd, interactive, &w, now);
+        let (result, dos) = self.core.command(cmd, origin, &w, now);
         self.execute(dos);
         result
     }
@@ -395,7 +403,13 @@ impl Driver {
                     let mut uc = self.app.user_config.lock().unwrap();
                     match place {
                         Some(Place::Speaker(id)) => {
-                            uc.last_speaker_id = Some(id.as_str().to_string());
+                            // As before: not a receiver announcing another
+                            // speaker's identity, so that the next start
+                            // never connects to it by itself.
+                            let id = id.as_str();
+                            if !self.app.is_airplay_newcomer(id) && !crate::airplay::discovery::is_instance_id(id) {
+                                uc.last_speaker_id = Some(id.to_string());
+                            }
                             uc.chose_this_pc = false;
                         }
                         Some(Place::MusicAssistant) => {
@@ -419,6 +433,17 @@ impl Driver {
     /// Start a connect on a thread of its own; it ends with the connect.
     fn connect(&mut self, job: Job) {
         self.wanted.store(job.gen, Ordering::SeqCst);
+        if let Place::Speaker(id) = &job.place {
+            // Only a person's pick in the window may play to a receiver
+            // announcing another speaker's identity: not a return, a retry,
+            // start-up or Windows choosing the app's output.
+            if job.origin != Origin::Window && self.app.is_airplay_newcomer(id.as_str()) {
+                info!("not connecting to {} by itself: it announces another speaker's identity", id.as_str());
+                let ended = Ended::Failed(ConnectFailure::Other);
+                let _ = self.tx.send(Input::Event(Event::Ended { gen: job.gen, ended }));
+                return;
+            }
+        }
         let app = self.app.clone();
         let tx = self.tx.clone();
         let wanted = self.wanted.clone();
@@ -698,7 +723,7 @@ fn connect_job(app: &Arc<App>, job: &Job, stage: &dyn Fn(ConnectStage)) -> Ended
         return Ended::Cancelled;
     }
     stage(ConnectStage::Asking);
-    match app.engine_connect(&id, job.interactive, job.person) {
+    match app.engine_connect(&id, job.origin == Origin::Window, job.origin != Origin::ByItself) {
         Ok(()) => {
             if cancel::cancelled() {
                 Ended::Cancelled
@@ -715,14 +740,15 @@ fn ended_by(app: &App, id: &str, job: &Job, msg: &str) -> Ended {
     if msg == crate::app::SUPERSEDED || cancel::cancelled() {
         return Ended::Cancelled;
     }
-    if job.interactive && app.pin_ceremony_id().as_deref() == Some(id) {
+    let window = job.origin == Origin::Window;
+    if window && app.pin_ceremony_id().as_deref() == Some(id) {
         return Ended::Pairing;
     }
     if crate::app::needs_the_person(msg) {
-        return if job.interactive { Ended::Failed(ConnectFailure::Other) } else { Ended::NeedsSecret(Secret::Code) };
+        return if window { Ended::Failed(ConnectFailure::Other) } else { Ended::NeedsSecret(Secret::Code) };
     }
     if app.asked_for_password(id) {
-        return if job.interactive {
+        return if window {
             Ended::Failed(ConnectFailure::WrongPassword)
         } else {
             Ended::NeedsSecret(Secret::Password)
