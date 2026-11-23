@@ -413,7 +413,7 @@ mod tests {
         plan(sonos, remembered, sinks)
     }
 
-    /// What #117's KEF LSX II LT lists.
+    /// What a KEF LSX II LT lists.
     fn kef() -> Sinks {
         listed("http-get:*:audio/wav:*,http-get:*:audio/wave:*,http-get:*:audio/x-wav:*,http-get:*:audio/mpeg:*")
     }

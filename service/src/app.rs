@@ -5776,7 +5776,7 @@ mod tests {
         head.split("\r\n").find_map(|l| l.strip_prefix("Content-Type: ")).unwrap_or("").to_string()
     }
 
-    /// A renderer like #117's KEF LSX II LT: its ConnectionManager lists
+    /// A renderer like the KEF LSX II LT: its ConnectionManager lists
     /// `sinks` (None: it has none), it takes a URI only when a HEAD of it
     /// answers with a type in `plays`, and on Play it fetches the stream.
     /// `more`: further services in its description.
@@ -5834,7 +5834,7 @@ mod tests {
 
     #[test]
     fn a_renderer_that_checks_the_type_gets_one_it_lists_on_head_get_and_metadata_alike() {
-        // #117: KEF LSX II LT, firmware 2.2.91.
+        // As a KEF LSX II LT on firmware 2.2.91 does.
         let (fake, probed) = strict_renderer(
             Some("http-get:*:audio/wav:*,http-get:*:audio/wave:*,http-get:*:audio/x-wav:*,http-get:*:audio/mpeg:*"),
             &["audio/wav", "audio/wave", "audio/x-wav"],
