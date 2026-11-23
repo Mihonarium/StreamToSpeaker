@@ -16,7 +16,7 @@ use log::{info, warn};
 
 use super::catch_up::{BackOff, CatchUp};
 use super::reconnect::Schedule;
-use super::{setting, Applies, Bases, DelayChoice, Kind, Limits, Live, Request, Setting, Unchangeable};
+use super::{setting, Applies, DelayChoice, Earlier, Kind, Limits, Live, Request, Setting, Unchangeable};
 use crate::airplay::AirPlayRenderer;
 use crate::app::{ActiveSession, App};
 
@@ -208,14 +208,11 @@ pub fn airplay_kind(r: &AirPlayRenderer, prefer_realtime: bool) -> Kind {
 }
 
 impl App {
-    /// The delay bases the settings hold.
-    fn delay_bases(&self) -> Bases {
-        let uc = self.user_config.lock().unwrap();
-        Bases {
-            steady_ms: uc.effective_airplay_latency_ms(),
-            homepod_ms: uc.effective_homepod_latency_ms(),
-            homepod_steady_by_default: uc.airplay_homepod_buffered,
-        }
+    /// The app-wide AirPlay settings earlier versions used for every
+    /// speaker, which still give an AirPlay speaker without a delay of its
+    /// own its delay.
+    fn delay_earlier(&self) -> Earlier {
+        self.user_config.lock().unwrap().earlier_delays()
     }
 
     /// The speaker that plays, and what its session tells.
@@ -255,10 +252,7 @@ impl App {
         } else if id.starts_with("airplay:") {
             let prefer_realtime = self.user_config.lock().unwrap().prefer_realtime_airplay;
             match self.airplay_discovery.as_deref().and_then(|d| d.find_by_id(id)) {
-                Some(r) => {
-                    self.settle_airplay_delay(&r);
-                    airplay_kind(&r, prefer_realtime)
-                }
+                Some(r) => airplay_kind(&r, prefer_realtime),
                 None => Kind::AirPlay { buffered_on_steady: false },
             }
         } else {
@@ -266,21 +260,11 @@ impl App {
         }
     }
 
-    /// Move an earlier version's buffer for `r` into its delay choice and
-    /// change, if that is still to do.
-    fn settle_airplay_delay(&self, r: &AirPlayRenderer) {
-        let moved = self.user_config.lock().unwrap().settle_airplay_delay(&r.stable_id(), r.is_homepod());
-        if moved {
-            self.delay.state().changes += 1;
-            self.delay.wake();
-        }
-    }
-
     /// `id`'s delay as its settings make it, with `live` from its session.
     fn delay_setting(&self, id: &str, kind: Kind, live: &Live) -> Setting {
-        let bases = self.delay_bases();
-        let stored = self.user_config.lock().unwrap().speaker_settings.get(id).cloned().unwrap_or_default();
-        setting(kind, &stored, &bases, live)
+        let uc = self.user_config.lock().unwrap();
+        let stored = uc.speaker_settings.get(id).cloned().unwrap_or_default();
+        setting(kind, &stored, &uc.earlier_delays(), live)
     }
 
     /// The delay of the speaker that plays; `None` while sound plays on
@@ -352,8 +336,9 @@ impl App {
         let from_ms = s.change_ms;
         {
             let mut uc = self.user_config.lock().unwrap();
+            let earlier = uc.earlier_delays();
             let mut entry = uc.speaker_settings.remove(&id).unwrap_or_default();
-            super::store_change(&mut entry, s.choice, to_ms);
+            super::store(&mut entry, status.kind, &earlier, s.choice, to_ms);
             if !entry.is_default() {
                 uc.speaker_settings.insert(id.clone(), entry);
             }
@@ -391,7 +376,11 @@ impl App {
         }
         let (now_ms, other_ms) = {
             let mut uc = self.user_config.lock().unwrap();
+            let earlier = uc.earlier_delays();
             let entry = uc.speaker_settings.entry(id.to_string()).or_default();
+            // What the speaker had stays with its choice.
+            let (had, had_ms) = super::choice_and_change(before.kind, entry, &earlier);
+            super::store(entry, before.kind, &earlier, had, had_ms);
             entry.delay_choice = Some(choice);
             let other = if choice == DelayChoice::Short { DelayChoice::Steady } else { DelayChoice::Short };
             (super::stored_change(entry, Some(choice)), super::stored_change(entry, Some(other)))
@@ -477,12 +466,11 @@ impl App {
         let id = r.stable_id();
         let prefer_realtime = self.user_config.lock().unwrap().prefer_realtime_airplay;
         let kind = airplay_kind(r, prefer_realtime);
-        self.settle_airplay_delay(r);
         // The stream it ends up with decides whether the change counts:
         // what is asked for is the same either way.
         let live = Live { buffered: Some(false), ..Default::default() };
         let s = self.delay_setting(&id, kind, &live);
-        let bases = self.delay_bases();
+        let earlier = self.delay_earlier();
         let homepod_short = matches!(kind, Kind::HomePodPair)
             || (matches!(kind, Kind::HomePod { .. }) && s.choice == Some(DelayChoice::Short));
         let homepod_ms = if homepod_short {
@@ -491,12 +479,12 @@ impl App {
             // On Steady a HomePod's short delay still has its change, in
             // case the session falls back to the short profile.
             let stored = self.user_config.lock().unwrap().speaker_settings.get(&id).cloned().unwrap_or_default();
-            setting(kind, &crate::user_config::SpeakerSettings { delay_choice: Some(DelayChoice::Short), ..stored }, &bases, &live)
+            setting(kind, &crate::user_config::SpeakerSettings { delay_choice: Some(DelayChoice::Short), ..stored }, &earlier, &live)
                 .buffer_ms()
         };
         self.delay.state().started = Some((id, s.change_ms));
         AirPlayDelay {
-            latency_ms: if homepod_short { bases.steady_ms } else { s.buffer_ms() },
+            latency_ms: if homepod_short { super::STEADY_BASE_MS } else { s.buffer_ms() },
             homepod_realtime: homepod_short,
             homepod_latency_ms: homepod_ms,
         }
@@ -699,8 +687,9 @@ fn reconnect_for_delay(app: &Arc<App>, shared: &Shared, connector: &dyn Connecto
     {
         let choice = app.delay_setting(id, bound.kind, &bound.live).choice;
         let mut uc = app.user_config.lock().unwrap();
+        let earlier = uc.earlier_delays();
         let mut entry = uc.speaker_settings.remove(id).unwrap_or_default();
-        super::store_change(&mut entry, choice, from_ms);
+        super::store(&mut entry, bound.kind, &earlier, choice, from_ms);
         if !entry.is_default() {
             uc.speaker_settings.insert(id.to_string(), entry);
         }
@@ -759,7 +748,12 @@ mod tests {
             uc.speaker_settings.insert("sendspin:desk".into(), SpeakerSettings { delay_change_ms: 300, ..Default::default() });
             uc.speaker_settings.insert(
                 OFFICE.into(),
-                SpeakerSettings { steady_delay_change_ms: -300, delay_change_ms: 50, ..Default::default() },
+                SpeakerSettings {
+                    steady_delay_change_ms: -300,
+                    delay_change_ms: 50,
+                    delay_choice: Some(DelayChoice::Steady),
+                    ..Default::default()
+                },
             );
         }
         // UPnP: the stream's catch-up, from the speaker's first fetch.
@@ -894,7 +888,12 @@ mod tests {
 
     /// A press on Office while it plays (what `change_delay` does then).
     fn press(app: &App, change_ms: i32) {
-        app.user_config.lock().unwrap().speaker_settings.entry(OFFICE.into()).or_default().steady_delay_change_ms = change_ms;
+        {
+            let mut uc = app.user_config.lock().unwrap();
+            let entry = uc.speaker_settings.entry(OFFICE.into()).or_default();
+            entry.delay_choice = Some(DelayChoice::Steady);
+            entry.steady_delay_change_ms = change_ms;
+        }
         let mut state = app.delay.state();
         state.changes += 1;
         state.notice = None;

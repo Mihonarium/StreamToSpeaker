@@ -237,16 +237,6 @@ pub struct UserConfig {
     /// non-default setting have an entry.
     #[serde(default)]
     pub speaker_settings: HashMap<String, SpeakerSettings>,
-    /// Whether each speaker's delay is kept as this version keeps it (a
-    /// delay choice and what was removed or added, per speaker) rather
-    /// than as earlier versions did (AirPlay buffers and a Sendspin delay
-    /// for every speaker at once). Absent in an earlier version's file,
-    /// which is then moved over once (see `delay::upgrade`).
-    #[serde(default)]
-    pub delay_per_speaker: bool,
-    /// What is left of that move: see [`AirPlayDelayUpgrade`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub airplay_delay_upgrade: Option<AirPlayDelayUpgrade>,
     /// Ten-band equalizer applied to everything streamed (all output
     /// types). Off by default; disabling keeps the curve. A malformed
     /// entry falls back to the default rather than failing the file.
@@ -282,10 +272,10 @@ pub struct SpeakerSettings {
     /// value this version doesn't know reads as nothing remembered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub airplay_opener: Option<crate::airplay::session::Opener>,
-    /// AirPlay buffer for this speaker, overriding `airplay_latency_ms`,
-    /// as earlier versions kept it. This version moves it into the
-    /// speaker's delay choice and change (see `delay::upgrade`) and then
-    /// clears it.
+    /// AirPlay buffer for this speaker, overriding `airplay_latency_ms`.
+    /// It gives the speaker its delay until its delay is changed with the
+    /// delay controls, which then keep it in the fields below (see
+    /// `delay::upgrade`).
     #[serde(default)]
     pub airplay_latency_ms: Option<u32>,
     /// UPnP: the stream profile this speaker last played; the next
@@ -302,8 +292,10 @@ pub struct SpeakerSettings {
     /// delay choice keeps its own.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub steady_delay_change_ms: i32,
-    /// Short delay or Steady, for an AirPlay speaker or single HomePod;
-    /// `None` plays the default for its kind.
+    /// Short delay or Steady, for an AirPlay speaker or single HomePod.
+    /// On any AirPlay speaker (a HomePod pair included, which has no
+    /// choice) it also says that the delay is the speaker's own; `None`
+    /// plays what the app-wide AirPlay settings give it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_choice: Option<crate::delay::DelayChoice>,
     /// This speaker's settings that a newer version wrote and this one
@@ -320,24 +312,6 @@ impl SpeakerSettings {
 
 fn is_zero(n: &i32) -> bool {
     *n == 0
-}
-
-/// AirPlay settings an earlier version kept for every speaker at once,
-/// waiting to become each speaker's own delay choice and change: that
-/// needs to know whether the speaker is a HomePod, which only discovery or
-/// a connect tells (see `delay::upgrade`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AirPlayDelayUpgrade {
-    /// The AirPlay buffer the earlier version used for every speaker
-    /// without its own, ms.
-    #[serde(default = "default_airplay_latency_ms")]
-    pub airplay_buffer_ms: u32,
-    /// Its HomePod delay, ms.
-    #[serde(default = "default_homepod_latency_ms")]
-    pub homepod_delay_ms: u32,
-    /// The AirPlay speakers this PC knew then that are still to be moved.
-    #[serde(default)]
-    pub speakers: Vec<String>,
 }
 
 /// Default AirPlay buffer — iTunes' 2 s (88200 samples at 44.1 kHz).
@@ -1000,7 +974,6 @@ const SETTING_LABELS: &[(&str, &str, bool)] = &[
     ("manual_speakers", "Speakers added by address", true),
     ("discovery_adapter", "Discovery network adapter", true),
     ("speaker_settings", "Each speaker's settings", false),
-    ("airplay_delay_upgrade", "AirPlay delays kept from the earlier version", false),
     ("equalizer", "Equalizer", true),
 ];
 
@@ -1008,7 +981,7 @@ const SETTING_LABELS: &[(&str, &str, bool)] = &[
 const SPEAKER_LABELS: &[(&str, &str, bool)] = &[
     ("hidden", "Hide this speaker from the list", true),
     ("auto_connect", "Connect automatically", true),
-    ("airplay_latency_ms", "Own AirPlay buffer for this speaker", false),
+    ("airplay_latency_ms", "Own AirPlay buffer for this speaker", true),
     ("delay_change_ms", "What was removed from or added to its delay", false),
     ("steady_delay_change_ms", "What was removed from or added to its delay", false),
     ("delay_choice", "Short delay or Steady", false),
@@ -1026,9 +999,6 @@ const RELEARNED: &[&[&str]] = &[
     // The AirPlay 1 opener that worked for a speaker when it wasn't the
     // usual one (see `airplay::session::Opener`).
     &["speaker_settings", "*", "airplay_opener"],
-    // Whether the delays were moved over from an earlier version's form:
-    // moving them again never changes a delay a speaker has of its own.
-    &["delay_per_speaker"],
 ];
 
 /// Whether `path` is one of [`RELEARNED`].
@@ -2119,12 +2089,6 @@ mod tests {
                 unknown_keys: [("future_speaker_setting".to_string(), serde_json::json!({"x": 1}))].into_iter().collect(),
             },
         );
-        c.delay_per_speaker = true;
-        c.airplay_delay_upgrade = Some(AirPlayDelayUpgrade {
-            airplay_buffer_ms: 700,
-            homepod_delay_ms: 150,
-            speakers: vec!["airplay:aa".into()],
-        });
         c.equalizer = EqSettings { enabled: true, preamp_db: -3.0, bands_db: [1.5; crate::equalizer::EQ_BANDS] };
         c.equalizer.bands_db[0] = -2.0;
         c

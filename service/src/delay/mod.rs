@@ -20,6 +20,9 @@
 //!   connecting again.
 //! - Music Assistant sets its own speakers' delay.
 //!
+//! An AirPlay speaker or HomePod whose delay nobody changed here plays
+//! what earlier versions' settings give it (see [`upgrade`]).
+//!
 //! This module holds the rules (kinds, limits, what a press does); the
 //! running parts are in [`engine`].
 
@@ -62,20 +65,22 @@ pub enum Kind {
     MusicAssistant,
 }
 
-/// The delays a change starts from on AirPlay and HomePods: the Steady
-/// buffer and the HomePod delay (`airplay_latency_ms` and
-/// `airplay_homepod_latency_ms`), and whether single HomePods default to
-/// Steady (`airplay_homepod_buffered`).
+/// What earlier versions kept for every AirPlay speaker at once, which
+/// still gives an AirPlay speaker or HomePod its delay until it has one of
+/// its own: the AirPlay buffer (`airplay_latency_ms`), the HomePod delay
+/// (`airplay_homepod_latency_ms`), both clamped as earlier versions read
+/// them, and whether single HomePods play the buffered stream
+/// (`airplay_homepod_buffered`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Bases {
-    pub steady_ms: u32,
+pub struct Earlier {
+    pub buffer_ms: u32,
     pub homepod_ms: u32,
-    pub homepod_steady_by_default: bool,
+    pub homepod_buffered: bool,
 }
 
-impl Default for Bases {
+impl Default for Earlier {
     fn default() -> Self {
-        Self { steady_ms: STEADY_BASE_MS, homepod_ms: HOMEPOD_BASE_MS, homepod_steady_by_default: false }
+        Self { buffer_ms: STEADY_BASE_MS, homepod_ms: HOMEPOD_BASE_MS, homepod_buffered: false }
     }
 }
 
@@ -221,22 +226,61 @@ pub enum Request {
     Set(i32),
 }
 
-/// The choice a speaker of `kind` plays with when none is stored.
-pub fn default_choice(kind: Kind, bases: &Bases) -> Option<DelayChoice> {
-    match kind {
-        Kind::AirPlay { .. } => Some(DelayChoice::Steady),
-        Kind::HomePod { .. } if bases.homepod_steady_by_default => Some(DelayChoice::Steady),
-        Kind::HomePod { .. } => Some(DelayChoice::Short),
-        _ => None,
+/// Whether a speaker of `kind` has a delay choice.
+pub fn has_choice(kind: Kind) -> bool {
+    matches!(kind, Kind::AirPlay { .. } | Kind::HomePod { .. })
+}
+
+/// Whether a speaker of `kind` is played over AirPlay (and so may have no
+/// delay of its own yet, see [`upgrade`]).
+fn is_airplay(kind: Kind) -> bool {
+    matches!(kind, Kind::AirPlay { .. } | Kind::HomePod { .. } | Kind::HomePodPair)
+}
+
+/// The delay choice and what was removed or added for a speaker of
+/// `kind`: its own, or for an AirPlay speaker without one, what the
+/// earlier settings give it.
+pub fn choice_and_change(
+    kind: Kind,
+    stored: &crate::user_config::SpeakerSettings,
+    earlier: &Earlier,
+) -> (Option<DelayChoice>, i32) {
+    if is_airplay(kind) && stored.delay_choice.is_none() {
+        return upgrade::from_earlier(kind, stored.airplay_latency_ms, earlier);
     }
+    let choice = stored.delay_choice.filter(|_| has_choice(kind));
+    (choice, stored_change(stored, choice))
+}
+
+/// Store `change_ms` as what is removed from or added to a speaker of
+/// `kind` on `choice`. An AirPlay speaker's delay is its own from then on:
+/// its choice is kept (also for a HomePod pair, which has none, to say
+/// so) and the earlier own-buffer setting is dropped, after what the
+/// earlier settings gave it is kept for its current choice.
+pub fn store(
+    stored: &mut crate::user_config::SpeakerSettings,
+    kind: Kind,
+    earlier: &Earlier,
+    choice: Option<DelayChoice>,
+    change_ms: i32,
+) {
+    if is_airplay(kind) && stored.delay_choice.is_none() {
+        let (was, was_change) = choice_and_change(kind, stored, earlier);
+        store_change(stored, was, was_change);
+        stored.delay_choice = Some(was.unwrap_or(DelayChoice::Short));
+        stored.airplay_latency_ms = None;
+    }
+    if let Some(c) = choice.filter(|_| has_choice(kind)) {
+        stored.delay_choice = Some(c);
+    }
+    store_change(stored, choice, change_ms);
 }
 
 /// The delay of a speaker of `kind` with `stored` settings: its choice,
-/// its own delay, what was removed or added (`change` for its choice, see
-/// [`stored_change`]), its limits and how a change reaches it.
-pub fn setting(kind: Kind, stored: &crate::user_config::SpeakerSettings, bases: &Bases, live: &Live) -> Setting {
-    let choice = stored.delay_choice.filter(|_| default_choice(kind, bases).is_some()).or(default_choice(kind, bases));
-    let raw = stored_change(stored, choice);
+/// its own delay, what was removed or added (see [`choice_and_change`]),
+/// its limits and how a change reaches it.
+pub fn setting(kind: Kind, stored: &crate::user_config::SpeakerSettings, earlier: &Earlier, live: &Live) -> Setting {
+    let (choice, raw) = choice_and_change(kind, stored, earlier);
     let make = |own_ms: u32, limits: Limits, applies: Applies, floor_ms: u32| Setting {
         choice,
         own_ms,
@@ -271,9 +315,8 @@ pub fn setting(kind: Kind, stored: &crate::user_config::SpeakerSettings, bases: 
             if live.buffered.unwrap_or(buffered_on_steady) {
                 return fixed(BUFFERED_MS, Unchangeable::KeptBySpeakerOnSteady);
             }
-            let base = bases.steady_ms;
             let floor = live.receiver_min_ms.unwrap_or(0);
-            make(base, around(base, STEADY_MIN_MS, STEADY_MAX_MS), Applies::Reconnect, floor)
+            make(STEADY_BASE_MS, around(STEADY_BASE_MS, STEADY_MIN_MS, STEADY_MAX_MS), Applies::Reconnect, floor)
         }
         Kind::AirPlay { .. } => {
             let least = live.receiver_min_ms.unwrap_or(0).max(AIRPLAY_MIN_MS).min(SHORT_BASE_MS);
@@ -281,8 +324,7 @@ pub fn setting(kind: Kind, stored: &crate::user_config::SpeakerSettings, bases: 
             make(SHORT_BASE_MS, around(SHORT_BASE_MS, least, SHORT_MAX_MS), Applies::Reconnect, floor)
         }
         Kind::HomePod { .. } | Kind::HomePodPair => {
-            let base = bases.homepod_ms;
-            make(base, around(base, HOMEPOD_MIN_MS, HOMEPOD_MAX_MS), Applies::Reconnect, 0)
+            make(HOMEPOD_BASE_MS, around(HOMEPOD_BASE_MS, HOMEPOD_MIN_MS, HOMEPOD_MAX_MS), Applies::Reconnect, 0)
         }
         Kind::Sendspin => {
             let own = live.sendspin_own_ms.unwrap_or(SENDSPIN_OWN_UNKNOWN_MS);
@@ -325,8 +367,16 @@ mod tests {
     use super::*;
     use crate::user_config::SpeakerSettings;
 
+    /// A speaker's own delay: `change` on Short delay (or with no choice),
+    /// `steady` on Steady, and its choice (Short for a speaker without
+    /// one, which says the delay is its own).
     fn with(change: i32, steady: i32, choice: Option<DelayChoice>) -> SpeakerSettings {
-        SpeakerSettings { delay_change_ms: change, steady_delay_change_ms: steady, delay_choice: choice, ..Default::default() }
+        SpeakerSettings {
+            delay_change_ms: change,
+            steady_delay_change_ms: steady,
+            delay_choice: Some(choice.unwrap_or(DelayChoice::Short)),
+            ..Default::default()
+        }
     }
 
     const PLAIN: Kind = Kind::AirPlay { buffered_on_steady: false };
@@ -337,7 +387,7 @@ mod tests {
     #[test]
     fn each_kind_of_speaker_has_its_range() {
         use DelayChoice::*;
-        let b = Bases::default();
+        let b = Earlier::default();
         let none = Live::default();
         let table: &[(Kind, Option<DelayChoice>, u32, u32, u32, Applies)] = &[
             (Kind::Upnp, None, 200, 200, 1000, Applies::Live),
@@ -359,7 +409,7 @@ mod tests {
 
     #[test]
     fn defaults_are_steady_for_airplay_and_short_for_homepods() {
-        let b = Bases::default();
+        let b = Earlier::default();
         let none = Live::default();
         let d = SpeakerSettings::default();
         assert_eq!(setting(PLAIN, &d, &b, &none).choice, Some(DelayChoice::Steady));
@@ -368,7 +418,7 @@ mod tests {
         assert_eq!(setting(Kind::Upnp, &d, &b, &none).choice, None);
         // The earlier "buffered stream for single HomePods" makes Steady
         // their default.
-        let buffered = Bases { homepod_steady_by_default: true, ..b };
+        let buffered = Earlier { homepod_buffered: true, ..b };
         assert_eq!(setting(HOMEPOD, &d, &buffered, &none).choice, Some(DelayChoice::Steady));
         // A choice stored for a speaker that has none (a pair) is ignored.
         let s = setting(Kind::HomePodPair, &with(-50, 0, Some(DelayChoice::Steady)), &b, &none);
@@ -377,7 +427,7 @@ mod tests {
 
     #[test]
     fn each_choice_keeps_its_own_change() {
-        let b = Bases::default();
+        let b = Earlier::default();
         let none = Live::default();
         let s = with(100, -300, Some(DelayChoice::Steady));
         assert_eq!(setting(PLAIN, &s, &b, &none).change_ms, -300);
@@ -389,7 +439,7 @@ mod tests {
 
     #[test]
     fn a_press_stops_at_the_limit_and_says_so() {
-        let b = Bases::default();
+        let b = Earlier::default();
         let none = Live::default();
         // Remove 100 ms at 150 ms removed on a Sonos: 200 removed, stopped.
         let s = setting(Kind::Upnp, &with(-150, 0, None), &b, &none);
@@ -410,7 +460,7 @@ mod tests {
 
     #[test]
     fn a_stored_change_beyond_the_limits_counts_as_the_limit() {
-        let b = Bases::default();
+        let b = Earlier::default();
         // A Sendspin speaker whose buffer holds less than what was stored.
         let live = Live { sendspin_own_ms: Some(300), sendspin_add_max_ms: Some(800), ..Default::default() };
         let s = setting(Kind::Sendspin, &with(1000, 0, None), &b, &live);
@@ -421,7 +471,7 @@ mod tests {
 
     #[test]
     fn the_receivers_own_minimum_limits_short_delay() {
-        let b = Bases::default();
+        let b = Earlier::default();
         let live = Live { receiver_min_ms: Some(100), ..Default::default() };
         let s = setting(PLAIN, &with(0, 0, Some(DelayChoice::Short)), &b, &live);
         assert_eq!(s.limits, Some(Limits { remove_ms: 200, add_ms: 699 }));
@@ -432,7 +482,7 @@ mod tests {
 
     #[test]
     fn the_buffered_stream_on_steady_cant_be_changed() {
-        let b = Bases::default();
+        let b = Earlier::default();
         let buffered = Kind::AirPlay { buffered_on_steady: true };
         let s = setting(buffered, &with(0, -300, Some(DelayChoice::Steady)), &b, &Live::default());
         assert_eq!((s.applies, s.limits, s.delay_ms()), (Err(Unchangeable::KeptBySpeakerOnSteady), None, 2000));
@@ -441,22 +491,42 @@ mod tests {
         let s = setting(buffered, &with(0, 0, Some(DelayChoice::Short)), &b, &Live::default());
         assert_eq!(s.applies, Ok(Applies::Reconnect));
         // What the session runs decides once it plays.
-        let s = setting(buffered, &with(0, 0, None), &b, &Live { buffered: Some(false), ..Default::default() });
+        let d = SpeakerSettings::default();
+        let s = setting(buffered, &d, &b, &Live { buffered: Some(false), ..Default::default() });
         assert_eq!(s.applies, Ok(Applies::Reconnect));
-        let s = setting(PLAIN, &with(0, 0, None), &b, &Live { buffered: Some(true), ..Default::default() });
+        let s = setting(PLAIN, &d, &b, &Live { buffered: Some(true), ..Default::default() });
         assert_eq!(s.applies, Err(Unchangeable::KeptBySpeakerOnSteady));
-        let s = setting(Kind::MusicAssistant, &with(0, 0, None), &b, &Live::default());
+        let s = setting(Kind::MusicAssistant, &d, &b, &Live::default());
         assert_eq!(s.applies, Err(Unchangeable::MusicAssistant));
     }
 
     #[test]
-    fn other_bases_move_the_range_not_the_ends() {
-        let b = Bases { steady_ms: 1500, homepod_ms: 400, homepod_steady_by_default: false };
+    fn storing_a_change_makes_the_delay_the_speakers_own() {
+        let b = Earlier { buffer_ms: 1700, ..Earlier::default() };
         let none = Live::default();
-        let s = setting(PLAIN, &with(0, 0, None), &b, &none);
-        assert_eq!(s.limits, Some(Limits { remove_ms: 500, add_ms: 1500 }));
-        let s = setting(Kind::HomePodPair, &with(0, 0, None), &b, &none);
-        assert_eq!(s.limits, Some(Limits { remove_ms: 380, add_ms: 1600 }));
+        // Nothing stored: the earlier every-speaker buffer gives Steady with
+        // 300 ms removed.
+        let mut s = SpeakerSettings::default();
+        assert_eq!(choice_and_change(PLAIN, &s, &b), (Some(DelayChoice::Steady), -300));
+        // Removing 25 ms more keeps it there, as its own.
+        store(&mut s, PLAIN, &b, Some(DelayChoice::Steady), -325);
+        assert_eq!((s.delay_choice, s.steady_delay_change_ms), (Some(DelayChoice::Steady), -325));
+        // Whatever the earlier setting becomes.
+        let other = Earlier { buffer_ms: 500, ..b };
+        assert_eq!(setting(PLAIN, &s, &other, &none).buffer_ms(), 1675);
+        // A switch of choice keeps what the earlier settings gave the other.
+        let mut s = SpeakerSettings { airplay_latency_ms: Some(250), ..Default::default() };
+        store(&mut s, PLAIN, &b, Some(DelayChoice::Steady), 0);
+        assert_eq!((s.delay_change_ms, s.steady_delay_change_ms, s.airplay_latency_ms), (-50, 0, None));
+        // A pair has no choice, but its delay is its own too.
+        let mut s = SpeakerSettings::default();
+        store(&mut s, Kind::HomePodPair, &b, None, -20);
+        assert_eq!((s.delay_choice.is_some(), s.delay_change_ms), (true, -20));
+        assert_eq!(setting(Kind::HomePodPair, &s, &Earlier { homepod_ms: 900, ..b }, &none).buffer_ms(), 180);
+        // Other speakers keep a plain change.
+        let mut s = SpeakerSettings::default();
+        store(&mut s, Kind::Upnp, &b, None, -50);
+        assert_eq!((s.delay_choice, s.delay_change_ms), (None, -50));
     }
 
     #[test]
