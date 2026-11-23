@@ -22,7 +22,7 @@ use stream_to_speaker::ui::theme::{Mode, Theme};
 /// The width inside the 360-point panel's top (16 points each side), a
 /// row's width in its list, and the delay control's width on a speaker's
 /// page: the narrowest each part is used at. The full delay control is
-/// also checked at the panel's width.
+/// also checked at the panel's width, in case the panel shows it in full.
 const PANEL_TOP: f32 = 326.0;
 const PANEL_ROW: f32 = 342.0;
 const SPEAKER_PAGE_DELAY: f32 = 470.0;

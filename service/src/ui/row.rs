@@ -7,12 +7,12 @@
 //! One line, 40 points tall: the kind icon, the name (cut with … when it is
 //! too long; the tooltip has all of it) and a short status at the right
 //! end. A second line appears only while something needs the person: the
-//! error after a click, with *Try again*. What a row used to say on its
-//! second line (kind and delay) is its tooltip and what a reader of the
+//! error after a click, with *Try again*. The kind and delay of the place
+//! (*Sonos · about 0.2 s delay*) are its tooltip and what a reader of the
 //! display hears after the name.
 //!
-//! [`ROW_STYLE`] can bring back the earlier form: 52 points, the icon on a
-//! tile, and that second line always shown.
+//! [`ROW_STYLE`] selects the other form: 52 points, the icon on a tile,
+//! and kind and delay always shown on the second line.
 
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{Color32, Key, Rect, Sense, Ui, Vec2, WidgetInfo, WidgetType};

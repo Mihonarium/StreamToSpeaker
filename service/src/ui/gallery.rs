@@ -26,7 +26,7 @@ pub fn scenes() -> Vec<Scene> {
         Scene { name: "parts-delay-interaction", size: [1180.0, 620.0], draw: delay_interaction },
         Scene { name: "parts-rows", size: [1180.0, 580.0], draw: rows },
         Scene { name: "parts-delay-line", size: [1200.0, 1200.0], draw: delay_line },
-        Scene { name: "parts-panel-simpler", size: [1560.0, 640.0], draw: panel_simpler },
+        Scene { name: "parts-panel", size: [1560.0, 640.0], draw: panel_standins },
         Scene { name: "parts-notices", size: [1060.0, 640.0], draw: notices },
         Scene { name: "parts-inputs", size: [1060.0, 620.0], draw: inputs },
         Scene { name: "parts-cards", size: [700.0, 840.0], draw: cards },
@@ -240,7 +240,7 @@ fn delay_states(ui: &mut Ui, st: &mut Stage) {
             case("Sound breaking up: after Add 100 ms", view("Kitchen", 300, 100, Some(DelayNote::Adding { to_go_ms: 50 })), spotify),
             case("Back to Kitchen's own delay (↺)", view("Kitchen", 200, 0, Some(DelayNote::Adding { to_go_ms: 125 })), spotify),
             case("AirPlay on Short delay: a change reconnects", office(250, -50, Some(DelayNote::WillReconnect)), edge),
-            case("S2t · during the reconnect", office(250, -50, Some(DelayNote::Reconnecting)), "Reconnecting to remove 50 ms: a few seconds of silence."),
+            case("During the reconnect", office(250, -50, Some(DelayNote::Reconnecting)), "Reconnecting to remove 50 ms: a few seconds of silence."),
             case("If Office doesn't accept the change", steady(1800, -200, Some(DelayNote::NotAccepted { asked_ms: -300, now_ms: -200 })), edge),
             case("AirPlay on Steady: the first Remove press", steady(1900, -100, Some(DelayNote::SteadyOffer { steady_ms: 2000, short_ms: 300 })), edge),
             case("Just switched to Short delay", office(300, 0, Some(DelayNote::ChoiceSwitched { to_short: true, now_ms: 0, other_ms: -300 })), edge),
@@ -367,7 +367,7 @@ fn rows(ui: &mut Ui, st: &mut Stage) {
                 let _ = r.show(ui);
             }
         });
-        panel_column(ui, "Two lines", |ui| {
+        panel_column(ui, "The other style: two lines", |ui| {
             ui.add_space(6.0);
             let list = [
                 PlaceRow::new(Icon::Laptop, "This PC", "Speakers (Realtek Audio)"),
@@ -487,7 +487,7 @@ fn rows_on(ui: &mut Ui, current: &str, garage: bool, ma: bool) {
     });
 }
 
-fn panel_simpler(ui: &mut Ui, st: &mut Stage) {
+fn panel_standins(ui: &mut Ui, st: &mut Stage) {
     let _ = st;
     ui.add_space(16.0);
     ui.horizontal_top(|ui| {
