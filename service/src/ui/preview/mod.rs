@@ -71,10 +71,34 @@ impl Stage {
         }
     }
 
+    /// Show every control in `area` whose accessible name starts with
+    /// `name` as pointed at: for controls inside a part, such as the delay
+    /// control's *Remove 25 milliseconds of delay*.
+    pub fn hover_named(&mut self, area: Rect, name: &str) {
+        self.force_named(area, name, Force::Hover);
+    }
+
+    pub fn press_named(&mut self, area: Rect, name: &str) {
+        self.force_named(area, name, Force::Press);
+    }
+
+    /// Draw the focus ring on the controls in `area` named so (it doesn't
+    /// move the keyboard focus).
+    pub fn focus_named(&mut self, area: Rect, name: &str) {
+        self.force_named(area, name, Force::Focus);
+    }
+
     fn force(&mut self, r: &Response, f: Force) {
-        let list = self.forced.0.entry(r.id).or_default();
+        let list = self.forced.by_id.entry(r.id).or_default();
         if !list.contains(&f) {
             list.push(f);
+        }
+    }
+
+    fn force_named(&mut self, area: Rect, name: &str, f: Force) {
+        let entry = (area, name.to_owned(), f);
+        if !self.forced.by_name.contains(&entry) {
+            self.forced.by_name.push(entry);
         }
     }
 }

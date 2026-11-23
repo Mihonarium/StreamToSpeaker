@@ -4,7 +4,7 @@
 use egui::{Color32, Rect, Response, Sense, Stroke, Ui, Vec2, Widget, WidgetInfo, WidgetType};
 
 use super::icon::Icon;
-use super::look::{look, Look};
+use super::look::{look_as, Look};
 use super::theme::{focus_ring, radius, size, space, Theme};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,7 +130,7 @@ impl Widget for Button<'_> {
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), sense);
         let name = self.name.clone().unwrap_or_else(|| self.text.to_owned());
         response.widget_info(|| WidgetInfo::labeled(if link { WidgetType::Link } else { WidgetType::Button }, self.enabled, &name));
-        let mut l = look(ui, &response);
+        let mut l = look_as(ui, &response, &name);
         l.enabled = self.enabled;
         if ui.is_rect_visible(rect) {
             let colors = colors(&t, self.kind, l);
@@ -259,7 +259,7 @@ impl<'a> IconButton<'a> {
         let sense = if self.enabled { Sense::click() } else { Sense::hover() };
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(self.side), sense);
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, self.enabled, self.name));
-        let l = look(ui, &response);
+        let l = look_as(ui, &response, self.name);
         if ui.is_rect_visible(rect) {
             let p = ui.painter();
             if l.enabled && (l.hovered || l.pressed) {

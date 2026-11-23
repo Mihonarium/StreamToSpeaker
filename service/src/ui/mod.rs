@@ -7,11 +7,14 @@
 //! lists everything there is a picture of.
 
 pub mod button;
+pub mod delay;
 pub mod gallery;
 pub mod icon;
 pub mod look;
 pub mod preview;
+pub mod text;
 pub mod theme;
+pub mod volume;
 
 /// Every scene the preview can draw. Each surface adds its own here.
 pub fn scenes() -> Vec<preview::Scene> {
