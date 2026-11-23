@@ -27,7 +27,7 @@ impl Views for StandInViews {
             Open::MusicAssistantSettings | Open::MusicAssistantHowTo => StandIn::MusicAssistant,
             _ => return None,
         };
-        Some(Box::new(StandInView { kind, delay: crate::ui::delay::DelayState::opened() }))
+        Some(Box::new(StandInView { kind, delay: crate::panel::delay_block::BlockState::default() }))
     }
 }
 
@@ -44,12 +44,12 @@ pub enum StandIn {
 /// A view with its real bar and a plain line.
 pub struct StandInView {
     pub kind: StandIn,
-    delay: crate::ui::delay::DelayState,
+    delay: crate::panel::delay_block::BlockState,
 }
 
 impl StandInView {
     pub fn new(kind: StandIn) -> Self {
-        StandInView { kind, delay: crate::ui::delay::DelayState::opened() }
+        StandInView { kind, delay: crate::panel::delay_block::BlockState::default() }
     }
 
     fn row<'s>(&self, snap: &'s Snapshot) -> Option<&'s Row> {
@@ -99,7 +99,7 @@ impl ViewContent for StandInView {
         if let (StandIn::Speaker(id), Some(Third::Delay(d))) = (&self.kind, &snap.top.third) {
             let current = snap.list.rows().any(|r| r.current && r.place == Place::Speaker(id.clone()));
             if current {
-                for c in crate::panel::delay_block(ui, d, &mut self.delay) {
+                for c in crate::panel::delay_block(ui, snap, d, &mut self.delay) {
                     ask(Ask::Command(c));
                 }
                 ui.add_space(12.0);

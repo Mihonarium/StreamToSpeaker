@@ -1,5 +1,6 @@
 //! Pictures of the panel in every state the scripted engine knows, as it
-//! looks when it opens (the delay scenarios with the delay open).
+//! looks when it opens; the `amount-open` ones with an amount typed in the
+//! delay block's field.
 
 use egui::{Id, Margin, Ui};
 
@@ -31,9 +32,9 @@ fn panel_scene(ui: &mut Ui, st: &mut Stage, scenario: &str, names: Names, open_d
     let t = Theme::of(ui.ctx());
     let key = Id::new(("panel-scene", scenario.name(), format!("{names:?}"), open_delay));
     let mut kept: Kept = ui.ctx().data(|d| d.get_temp(key)).unwrap_or_else(|| Kept { state: PanelState::default(), ..Default::default() });
-    if open_delay && kept.stable >= 2 && kept.state.height.is_none() {
-        kept.state.height = Some(kept.last_natural);
-        kept.state.delay.set_open(true);
+    // The amount field open, with an amount typed.
+    if open_delay && kept.stable >= 2 && !kept.state.delay.amount_is_open() {
+        kept.state.delay = super::delay_block::BlockState::with_amount("150");
     }
     let mut natural = 0.0;
     ui.add_space(MARGIN);
@@ -78,10 +79,10 @@ scenes! {
     connecting => ("connecting", Names::Usual, false, "panel-connecting"),
     connecting_from_pc => ("connecting-from-pc", Names::Usual, false, "panel-connecting-from-pc"),
     playing => ("playing", Names::Usual, false, "panel-playing"),
-    playing_delay_open => ("playing", Names::Usual, true, "panel-playing-delay-open"),
+    playing_delay_open => ("playing", Names::Usual, true, "panel-playing-amount-open"),
     playing_long => ("playing", Names::Long, false, "panel-playing-long-names"),
     playing_chinese => ("playing", Names::Chinese, false, "panel-playing-chinese-names"),
-    playing_long_delay_open => ("playing", Names::Long, true, "panel-playing-long-names-delay-open"),
+    playing_long_delay_open => ("playing", Names::Long, true, "panel-playing-long-names-amount-open"),
     muted => ("muted", Names::Usual, false, "panel-muted"),
     ready => ("ready", Names::Usual, false, "panel-ready"),
     ready_elsewhere => ("ready-elsewhere", Names::Usual, false, "panel-ready-elsewhere"),
@@ -110,20 +111,20 @@ scenes! {
     row_catalogue => ("row-catalogue", Names::Usual, false, "panel-row-catalogue"),
     row_catalogue_long => ("row-catalogue", Names::Long, false, "panel-row-catalogue-long-names"),
     row_catalogue_chinese => ("row-catalogue", Names::Chinese, false, "panel-row-catalogue-chinese-names"),
-    applying_delay => ("applying-delay", Names::Usual, true, "panel-applying-delay"),
-    delay_own => ("delay-own", Names::Usual, true, "panel-delay-own"),
-    delay_removing => ("delay-removing", Names::Usual, true, "panel-delay-removing"),
-    delay_at_limit => ("delay-at-limit", Names::Usual, true, "panel-delay-at-limit"),
-    delay_adding => ("delay-adding", Names::Usual, true, "panel-delay-adding"),
-    delay_going_back => ("delay-going-back", Names::Usual, true, "panel-delay-going-back"),
-    delay_reconnect_pending => ("delay-reconnect-pending", Names::Usual, true, "panel-delay-reconnect-pending"),
-    delay_not_accepted => ("delay-not-accepted", Names::Usual, true, "panel-delay-not-accepted"),
-    delay_steady_remove => ("delay-steady-remove", Names::Usual, true, "panel-delay-steady-remove"),
-    delay_switched_to_short => ("delay-switched-to-short", Names::Usual, true, "panel-delay-switched-to-short"),
-    delay_fixed_on_steady => ("delay-fixed-on-steady", Names::Usual, true, "panel-delay-fixed-on-steady"),
-    delay_sendspin => ("delay-sendspin", Names::Usual, true, "panel-delay-sendspin"),
-    delay_dropped_out => ("delay-dropped-out", Names::Usual, true, "panel-delay-dropped-out"),
-    delay_dropouts => ("delay-dropouts", Names::Usual, true, "panel-delay-dropouts"),
+    applying_delay => ("applying-delay", Names::Usual, false, "panel-applying-delay"),
+    delay_own => ("delay-own", Names::Usual, false, "panel-delay-own"),
+    delay_removing => ("delay-removing", Names::Usual, false, "panel-delay-removing"),
+    delay_at_limit => ("delay-at-limit", Names::Usual, false, "panel-delay-at-limit"),
+    delay_adding => ("delay-adding", Names::Usual, false, "panel-delay-adding"),
+    delay_going_back => ("delay-going-back", Names::Usual, false, "panel-delay-going-back"),
+    delay_reconnect_pending => ("delay-reconnect-pending", Names::Usual, false, "panel-delay-reconnect-pending"),
+    delay_not_accepted => ("delay-not-accepted", Names::Usual, false, "panel-delay-not-accepted"),
+    delay_steady_remove => ("delay-steady-remove", Names::Usual, false, "panel-delay-steady-remove"),
+    delay_switched_to_short => ("delay-switched-to-short", Names::Usual, false, "panel-delay-switched-to-short"),
+    delay_fixed_on_steady => ("delay-fixed-on-steady", Names::Usual, false, "panel-delay-fixed-on-steady"),
+    delay_sendspin => ("delay-sendspin", Names::Usual, false, "panel-delay-sendspin"),
+    delay_dropped_out => ("delay-dropped-out", Names::Usual, false, "panel-delay-dropped-out"),
+    delay_dropouts => ("delay-dropouts", Names::Usual, false, "panel-delay-dropouts"),
     notice_restart => ("notice-restart", Names::Usual, false, "panel-notice-restart"),
     notice_adapter_off => ("notice-adapter-off", Names::Usual, false, "panel-notice-adapter-off"),
     notice_refused => ("notice-refused", Names::Usual, false, "panel-notice-refused"),
@@ -134,6 +135,9 @@ scenes! {
     first_run_pick => ("first-run-pick", Names::Usual, false, "panel-first-run-pick"),
     first_run_hear => ("first-run-hear", Names::Usual, false, "panel-first-run-hear"),
     first_run_find_it => ("first-run-find-it", Names::Usual, false, "panel-first-run-find-it"),
+    twins => ("twins", Names::Usual, false, "panel-twins"),
+    pc_outputs_closed => ("pc-outputs-closed", Names::Usual, false, "panel-pc-outputs-closed"),
+    pc_outputs_open => ("pc-outputs-open", Names::Usual, false, "panel-pc-outputs-open"),
 }
 
 // ---------------------------------------------------------------- views

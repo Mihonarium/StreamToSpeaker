@@ -187,6 +187,13 @@ pub struct DialogWindow {
     port: Arc<dyn SettingsPort>,
 }
 
+impl DialogWindow {
+    /// `dialog` on `port`, for [`super::Ask::Dialog`].
+    pub fn new(dialog: Dialog, port: Arc<dyn SettingsPort>) -> Self {
+        DialogWindow { dialog, port }
+    }
+}
+
 impl WindowContent for DialogWindow {
     fn title(&self, _snap: &Snapshot) -> String {
         Dialog::window_title(self.port.lang())

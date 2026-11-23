@@ -14,7 +14,8 @@ const PERSONALIZE: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Per
 /// The real desktop.
 #[derive(Default)]
 pub struct WindowsDesktop {
-    /// The panel's window this desktop last gave the flyout's look.
+    /// The panel's window this desktop last gave the flyout's look; found
+    /// while it was hidden, kept for moving it once shown.
     styled: Option<isize>,
 }
 
@@ -69,7 +70,10 @@ impl Desktop for WindowsDesktop {
     }
 
     fn place_panel(&mut self, rect: PxRect, mode: PanelMode) -> bool {
-        let Some(hwnd) = hidden_own_window(PANEL_TITLE) else { return false };
+        // The window found before, while it still is the panel; else the
+        // new panel, hidden until it is placed.
+        let known = self.styled.map(|h| h as HWND).filter(|h| is_own_window_titled(*h, PANEL_TITLE));
+        let Some(hwnd) = known.or_else(|| hidden_own_window(PANEL_TITLE)) else { return false };
         if self.styled != Some(hwnd as isize) {
             self.styled = Some(hwnd as isize);
             if mode == PanelMode::Flyout {
@@ -126,6 +130,27 @@ pub fn hidden_own_window(title: &str) -> Option<HWND> {
     None
 }
 
+/// Whether `hwnd` is still a window of this thread called `title`.
+fn is_own_window_titled(hwnd: HWND, title: &str) -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadProcessId, IsWindow};
+    // SAFETY: IsWindow accepts any value and only answers.
+    if unsafe { IsWindow(hwnd) } == 0 {
+        return false;
+    }
+    // SAFETY: a live handle (a stale one makes the call return 0); no
+    // process id asked for.
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
+    // SAFETY: no arguments.
+    if thread != unsafe { GetCurrentThreadId() } {
+        return false;
+    }
+    let mut buf = [0u16; 128];
+    // SAFETY: the buffer is writable for its whole length, which is given.
+    let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == title
+}
+
 /// Open a page of Windows' settings, on a thread of its own (Windows may
 /// take a moment to start the Settings app).
 pub fn open_windows_page(page: super::content::WindowsPage) {
@@ -165,12 +190,15 @@ fn window_rect(hwnd: HWND) -> Option<PxRect> {
 }
 
 /// Move and size a window to `rect` in physical pixels, without changing
-/// its place in the stacking order or activating it.
+/// its place in the stacking order or activating it. Windows is told not
+/// to copy the old picture to the new place: it would sit at the new top
+/// edge for a frame, so rows would jump; the new frame is drawn at once
+/// instead.
 fn set_rect(hwnd: HWND, rect: PxRect) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOOWNERZORDER, SWP_NOZORDER};
     // SAFETY: a window of this thread; no window to insert after.
     unsafe {
-        SetWindowPos(hwnd, std::ptr::null_mut(), rect.left, rect.top, rect.width(), rect.height(), SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+        SetWindowPos(hwnd, std::ptr::null_mut(), rect.left, rect.top, rect.width(), rect.height(), SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
     }
 }
 

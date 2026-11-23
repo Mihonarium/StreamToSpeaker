@@ -11,8 +11,8 @@
 //! (*Sonos · about 0.2 s delay*) are its tooltip and what a reader of the
 //! display hears after the name.
 //!
-//! [`ROW_STYLE`] selects the other form: 52 points, the icon on a tile,
-//! and kind and delay always shown on the second line.
+//! [`ROW_STYLE`] selects the form: two lines, 52 points, with the kind and
+//! delay always on the second line (the panel's), or one line of 40.
 
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{Color32, Key, Rect, Sense, Ui, Vec2, WidgetInfo, WidgetType};
@@ -28,13 +28,14 @@ use super::theme::{focus_ring, radius, size, space, Theme};
 pub enum RowStyle {
     /// One line, 40 points; a second line only for a problem.
     OneLine,
-    /// Two lines, 52 points, the icon on a tile; the second line is
-    /// [`PlaceRow::about`] unless a problem replaces it.
+    /// Two lines, 52 points; the second line is [`PlaceRow::about`] unless
+    /// a problem replaces it.
     TwoLines,
 }
 
-/// The style every row is drawn in.
-pub const ROW_STYLE: RowStyle = RowStyle::OneLine;
+/// The style every row is drawn in: the name, and under it the kind and
+/// the delay, which tell two ways to one speaker apart.
+pub const ROW_STYLE: RowStyle = RowStyle::TwoLines;
 
 /// What sits at the right end of a row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,7 +153,7 @@ impl PlaceRow<'_> {
         let full_w = ui.available_width();
         let indent = if self.indent { INDENT } else { 0.0 };
         let width = full_w - indent;
-        let (icon_box, min_h) = if two { (space::ROW_ICON_TILE, space::ROW_HEIGHT) } else { (20.0, 40.0) };
+        let (icon_box, min_h) = if two { (24.0, space::ROW_HEIGHT) } else { (20.0, 40.0) };
         let fade = if self.dimmed { 0.5 } else { 1.0 };
         let name_color = t.c.text.gamma_multiply(fade);
 
@@ -234,12 +235,7 @@ impl PlaceRow<'_> {
             p.rect_filled(bar, 1.5, t.c.accent);
         }
         let icon_center = egui::pos2(rect.left() + PAD_L + icon_box / 2.0, rect.center().y);
-        if two {
-            p.rect_filled(Rect::from_center_size(icon_center, Vec2::splat(icon_box)), 6.0, t.c.hover.gamma_multiply(fade));
-            self.icon.paint(&p, Rect::from_center_size(icon_center, Vec2::splat(18.0)), name_color);
-        } else {
-            self.icon.paint(&p, Rect::from_center_size(icon_center, Vec2::splat(20.0)), name_color);
-        }
+        self.icon.paint(&p, Rect::from_center_size(icon_center, Vec2::splat(20.0)), name_color);
         let text_top = rect.center().y - text_h / 2.0;
         let name_h = name.size().y;
         p.galley(egui::pos2(rect.left() + text_x, text_top), name, name_color);
@@ -301,8 +297,11 @@ impl PlaceRow<'_> {
         }
 
         if action.is_none() {
-            if self.options.is_some() && resp.has_focus() && ui.input(|i| i.key_pressed(Key::ArrowRight)) {
+            let (right_key, left_key) = if resp.has_focus() { ui.input(|i| (i.key_pressed(Key::ArrowRight), i.key_pressed(Key::ArrowLeft))) } else { (false, false) };
+            if self.options.is_some() && right_key {
                 action = Some(RowAction::Options);
+            } else if matches!(self.status, Status::Expand { open: false }) && right_key || matches!(self.status, Status::Expand { open: true }) && left_key {
+                action = Some(RowAction::Expand);
             } else if resp.clicked() {
                 action = Some(RowAction::Choose);
             } else if self.menu && resp.secondary_clicked() {
