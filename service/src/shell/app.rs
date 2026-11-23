@@ -19,7 +19,7 @@ use super::views::ViewMemory;
 use super::tray::{Tray, TrayEvent};
 use super::placement::PxRect;
 use super::win::{self, WindowsDesktop};
-use super::{centred, panel_builder, root_builder, Ask, Desktop, Placeholders, RootMode, ShellOptions, ViewContent, Views, WindowContent, WindowKind, Wiring, ROOT_TITLE};
+use super::{centred, panel_builder, root_builder, Ask, Desktop, RootMode, ShellOptions, ViewContent, Views, WindowContent, Wiring, ROOT_TITLE};
 use crate::panel::view::{show_view, ViewState};
 use crate::model::command::{Command, Open, Surface};
 use crate::model::state::Place;
@@ -30,10 +30,6 @@ use crate::ui::theme::{self, Mode};
 
 fn panel_id() -> ViewportId {
     ViewportId::from_hash_of("stream_to_speaker::shell::panel")
-}
-
-fn settings_id() -> ViewportId {
-    ViewportId::from_hash_of("stream_to_speaker::shell::settings")
 }
 
 fn dialog_id() -> ViewportId {
@@ -71,8 +67,8 @@ pub fn scripted_scenario() -> Option<Scenario> {
 pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()> {
     let engine = Arc::new(ScriptedEngine::new(scenario));
     let _clock = RealTime::start(engine.clone(), Duration::from_millis(50));
-    let settings: Arc<dyn crate::settings::SettingsPort> = Arc::new(crate::settings::scripted::ScriptedSettings::new());
-    let views = Box::new(crate::settings::views::SettingsViews::new(settings));
+    let scripted_settings: Arc<dyn crate::settings::SettingsPort> = Arc::new(crate::settings::scripted::ScriptedSettings::new());
+    let views = Box::new(crate::settings::views::SettingsViews::new(scripted_settings.clone()));
     // The two small windows' stand-ins show once at start, to try them.
     let popups: Box<dyn FnOnce(super::popup::PopupDoor)> = Box::new(|door| {
         door(PopupKind::Confirmation, Box::new(StandInPopup::new(PopupKind::Confirmation, "The confirmation by the clock")));
@@ -83,7 +79,11 @@ pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()
         Wiring {
             port: engine,
             views,
-            contents: Box::new(Placeholders),
+            contents: Box::new(super::content::SettingsContents {
+                port: scripted_settings,
+                open_windows_page: win::open_windows_page,
+                needs_password: Box::new(|_| false),
+            }),
             route_opens: None,
             quit: Box::new(|| {}),
             quitting: Box::new(|| false),
@@ -182,7 +182,6 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
                 looked_at: f64::NEG_INFINITY,
                 panel: None,
                 toggle: Toggle::default(),
-                settings: None,
                 dialog: None,
                 waiting: VecDeque::new(),
                 wanted: WantedGate::default(),
@@ -229,7 +228,6 @@ struct Shell {
     looked_at: f64,
     panel: Option<PanelWindow>,
     toggle: Toggle,
-    settings: Option<Box<dyn WindowContent>>,
     dialog: Option<Box<dyn WindowContent>>,
     /// Dialogs asked for while one was open.
     waiting: VecDeque<Box<dyn WindowContent>>,
@@ -384,25 +382,9 @@ impl Shell {
             self.show_view(ctx, view, push);
             return;
         }
-        self.open_window(ctx, open, snap, from_window);
-    }
-
-    /// Open what `open` asks for as a window (or outside the app), even
-    /// where it is also a view.
-    fn open_window(&mut self, ctx: &egui::Context, open: &Open, snap: &Snapshot, from_window: bool) {
-        if let Some(s) = &mut self.settings {
-            if s.navigate(open) {
-                ctx.send_viewport_cmd_to(settings_id(), ViewportCommand::Focus);
-                return;
-            }
-        }
-        match self.contents.open(open, snap, from_window) {
-            Some((WindowKind::Settings, content)) => {
-                self.settings = Some(content);
-                ctx.send_viewport_cmd_to(settings_id(), ViewportCommand::Focus);
-            }
-            Some((WindowKind::Dialog, content)) => self.open_dialog(content),
-            None => {}
+        // A dialog, or something outside the app.
+        if let Some(dialog) = self.contents.open(open, snap, from_window) {
+            self.open_dialog(dialog);
         }
     }
 
@@ -430,16 +412,16 @@ impl Shell {
         }
     }
 
-    fn content_builder(&self, content: &dyn WindowContent, snap: &Snapshot, kind: WindowKind) -> ViewportBuilder {
+    fn dialog_builder(&self, content: &dyn WindowContent, snap: &Snapshot) -> ViewportBuilder {
         let (size, min) = content.sizes();
         let b = ViewportBuilder::default()
             .with_title(content.title(snap))
             .with_inner_size(size)
             .with_min_inner_size(min)
             .with_icon(app_icon())
-            .with_resizable(kind == WindowKind::Settings)
-            .with_minimize_button(kind == WindowKind::Settings)
-            .with_maximize_button(kind == WindowKind::Settings);
+            .with_resizable(false)
+            .with_minimize_button(false)
+            .with_maximize_button(false);
         match centred(&self.desktop.monitors(), size) {
             Some(p) => b.with_position(p),
             None => b,
@@ -545,7 +527,6 @@ impl Shell {
             Ask::OpenPanel => self.open_panel(ctx, None),
             Ask::View(v) => self.show_view(ctx, v, true),
             Ask::Open(o) => self.open(ctx, &o, snap, true, true),
-            Ask::Window(o) => self.open_window(ctx, &o, snap, true),
             Ask::Back => {
                 if let Some(p) = &mut self.panel {
                     p.views.pop();
@@ -559,16 +540,12 @@ impl Shell {
         }
     }
 
-    /// Draw the Settings window or the dialog; what it asks.
-    fn content_frame(&mut self, ctx: &egui::Context, snap: &Snapshot, kind: WindowKind) -> Vec<Ask> {
-        let (id, slot) = match kind {
-            WindowKind::Settings => (settings_id(), self.settings.take()),
-            WindowKind::Dialog => (dialog_id(), self.dialog.take()),
-        };
-        let Some(mut content) = slot else { return Vec::new() };
-        let builder = self.content_builder(content.as_ref(), snap, kind);
+    /// Draw the dialog; what it asks.
+    fn dialog_frame(&mut self, ctx: &egui::Context, snap: &Snapshot) -> Vec<Ask> {
+        let Some(mut content) = self.dialog.take() else { return Vec::new() };
+        let builder = self.dialog_builder(content.as_ref(), snap);
         let mut asks = Vec::new();
-        let keep = ctx.show_viewport_immediate(id, builder, |ctx, _class| {
+        let keep = ctx.show_viewport_immediate(dialog_id(), builder, |ctx, _class| {
             let closing = ctx.input(|i| i.viewport().close_requested());
             if closing {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
@@ -577,15 +554,12 @@ impl Shell {
             let done = content.show(ctx, snap, &mut |a| asks.push(a));
             !(closing || done)
         });
-        match kind {
-            WindowKind::Settings if keep => self.settings = Some(content),
-            WindowKind::Dialog if keep => self.dialog = Some(content),
-            WindowKind::Dialog => {
-                let still = self.contents.wanted().map(|(k, _)| k);
-                self.wanted.closed(still.as_deref());
-                self.dialog = self.waiting.pop_front();
-            }
-            WindowKind::Settings => {}
+        if keep {
+            self.dialog = Some(content);
+        } else {
+            let still = self.contents.wanted().map(|(k, _)| k);
+            self.wanted.closed(still.as_deref());
+            self.dialog = self.waiting.pop_front();
         }
         asks
     }
@@ -672,8 +646,7 @@ impl eframe::App for Shell {
         self.popup_frames(ctx, &snap, now);
         let (commands, mut asks) = self.panel_frame(ctx, &snap, now);
         sent.extend(commands.into_iter().map(|c| (Surface::Panel, c)));
-        asks.extend(self.content_frame(ctx, &snap, WindowKind::Settings));
-        asks.extend(self.content_frame(ctx, &snap, WindowKind::Dialog));
+        asks.extend(self.dialog_frame(ctx, &snap));
         for a in asks {
             self.answer(ctx, a, &snap, &mut sent);
         }

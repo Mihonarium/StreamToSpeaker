@@ -1,7 +1,8 @@
-//! The app's windows as windows: the panel by the clock, the Settings
-//! window, dialogs, the tray icon, and the root window that holds them
-//! while none shows. What a window shows is drawn elsewhere: the panel by
-//! [`crate::panel`], Settings and dialogs by a [`WindowContent`].
+//! The app's windows as windows: the panel by the clock with its views,
+//! dialogs, the small windows by the clock, the tray icon, and the root
+//! window that holds them while none shows. What a window shows is drawn
+//! elsewhere: the panel by [`crate::panel`], a view by a [`ViewContent`],
+//! a dialog by a [`WindowContent`].
 //!
 //! What depends on Windows (the monitors and the taskbar, the light or dark
 //! setting, moving the panel's window) sits behind [`Desktop`], with
@@ -153,16 +154,6 @@ pub fn panel_builder(mode: PanelMode) -> ViewportBuilder {
         .with_decorations(mode == PanelMode::Window)
 }
 
-/// What kind of window a content needs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WindowKind {
-    /// The Settings window: one at a time; asking for another page shows
-    /// it in the open one.
-    Settings,
-    /// A dialog: one at a time; another waits until the open one closes.
-    Dialog,
-}
-
 /// What a view or a window's content asks of the shell while it is drawn.
 pub enum Ask {
     /// Send this to the engine, from the app's window.
@@ -178,9 +169,6 @@ pub enum Ask {
     Open(Open),
     /// Go back one view.
     Back,
-    /// Open this as a window even where it is also a view (the Settings
-    /// window, until its views exist).
-    Window(Open),
 }
 
 /// The bar at the top of a view: the back arrow, then these.
@@ -238,8 +226,7 @@ pub trait Views {
     fn view(&self, open: &Open, snap: &Snapshot) -> Option<Box<dyn ViewContent>>;
 }
 
-/// What a Settings page or a dialog draws, in a window the shell made,
-/// placed and themed.
+/// What a dialog draws, in a window the shell made, placed and themed.
 pub trait WindowContent {
     /// The window's title.
     fn title(&self, snap: &Snapshot) -> String;
@@ -249,12 +236,6 @@ pub trait WindowContent {
     /// through `ask`. True closes the window (a dialog's *Cancel*, or a
     /// dialog the app no longer needs).
     fn show(&mut self, ctx: &egui::Context, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) -> bool;
-    /// Show `open` in this window instead (another page of Settings).
-    /// False when it isn't one of this window's.
-    fn navigate(&mut self, open: &Open) -> bool {
-        let _ = open;
-        false
-    }
     /// The window's × was clicked: undo what an open dialog started.
     fn closed(&mut self) {}
 }
@@ -266,7 +247,7 @@ pub trait Contents {
     /// settings, a web page, starting a pairing) and give `None`.
     /// `from_window` says the request came from the app's own windows (the
     /// panel, Settings); only those may start a connection.
-    fn open(&self, open: &Open, snap: &Snapshot, from_window: bool) -> Option<(WindowKind, Box<dyn WindowContent>)>;
+    fn open(&self, open: &Open, snap: &Snapshot, from_window: bool) -> Option<Box<dyn WindowContent>>;
     /// The dialog the app needs open by itself now (a TV's code, Music
     /// Assistant's code), with a key that stays the same while the request
     /// does: a dialog closed by hand isn't opened again for the same key.
@@ -305,71 +286,6 @@ pub struct Wiring {
     /// does while its windows run (a settings save that failed is tried
     /// again).
     pub tick: Box<dyn Fn()>,
-}
-
-/// Until Settings and the dialogs are drawn (the scripted engine): their
-/// windows, saying which page or dialog was asked for.
-pub struct Placeholders;
-
-impl Contents for Placeholders {
-    fn open(&self, open: &Open, _snap: &Snapshot, _from_window: bool) -> Option<(WindowKind, Box<dyn WindowContent>)> {
-        placeholder(open)
-    }
-}
-
-/// A placeholder window for `open`, if it is one of the app's.
-pub fn placeholder(open: &Open) -> Option<(WindowKind, Box<dyn WindowContent>)> {
-    let kind = placeholder_kind(open)?;
-    Some((kind, Box::new(Placeholder { kind, open: open.clone() })))
-}
-
-fn placeholder_kind(open: &Open) -> Option<WindowKind> {
-    match open {
-        Open::Settings | Open::SpeakerSettings(_) | Open::MusicAssistantSettings | Open::MusicAssistantHowTo | Open::CantHear(_) | Open::SpeakerMissing | Open::WhatsNew => Some(WindowKind::Settings),
-        Open::AddByAddress | Open::Pair(_) => Some(WindowKind::Dialog),
-        _ => None,
-    }
-}
-
-struct Placeholder {
-    kind: WindowKind,
-    open: Open,
-}
-
-impl WindowContent for Placeholder {
-    fn title(&self, _snap: &Snapshot) -> String {
-        match self.kind {
-            WindowKind::Settings => format!("{} Settings", crate::PRODUCT_NAME),
-            WindowKind::Dialog => format!("{} – {:?}", crate::PRODUCT_NAME, self.open),
-        }
-    }
-
-    fn sizes(&self) -> (Vec2, Vec2) {
-        match self.kind {
-            WindowKind::Settings => (Vec2::new(880.0, 640.0), Vec2::new(640.0, 480.0)),
-            WindowKind::Dialog => (Vec2::new(480.0, 260.0), Vec2::new(360.0, 200.0)),
-        }
-    }
-
-    fn show(&mut self, ctx: &egui::Context, _snap: &Snapshot, _ask: &mut dyn FnMut(Ask)) -> bool {
-        let mut close = false;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label(format!("{:?}", self.open));
-            if self.kind == WindowKind::Dialog && ui.button("Close").clicked() {
-                close = true;
-            }
-        });
-        close
-    }
-
-    fn navigate(&mut self, open: &Open) -> bool {
-        if self.kind == WindowKind::Settings && placeholder_kind(open) == Some(WindowKind::Settings) {
-            self.open = open.clone();
-            true
-        } else {
-            false
-        }
-    }
 }
 
 /// Where a window of `size` points opens: in the middle of the primary
@@ -489,31 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn pages_open_settings_dialogs_open_dialogs_and_windows_own_settings_neither() {
-        use crate::model::state::SpeakerId;
-        assert_eq!(placeholder(&Open::Settings).map(|(k, _)| k), Some(WindowKind::Settings));
-        assert_eq!(placeholder(&Open::SpeakerSettings(SpeakerId::new("kitchen"))).map(|(k, _)| k), Some(WindowKind::Settings));
-        assert_eq!(placeholder(&Open::Pair(SpeakerId::new("den-tv"))).map(|(k, _)| k), Some(WindowKind::Dialog));
-        assert!(placeholder(&Open::SoundSettings).is_none());
-        assert!(placeholder(&Open::Donate).is_none());
-        assert!(placeholder(&Open::Panel).is_none());
-        // Another page shows in the open Settings window; a dialog's
-        // request doesn't.
-        let (_, mut settings) = placeholder(&Open::Settings).unwrap();
-        let snap0 = crate::model::port::Port::snapshot(&crate::model::scripted::ScriptedEngine::new(crate::model::scripted::Scenario::Playing));
-        assert!(Placeholders.open(&Open::SoundSettings, &snap0, true).is_none());
-        assert!(settings.navigate(&Open::SpeakerMissing));
-        assert!(!settings.navigate(&Open::AddByAddress));
-        // No window but the panel has the panel's title.
-        let snap = crate::model::scripted::ScriptedEngine::new(crate::model::scripted::Scenario::Playing);
-        let snap = crate::model::port::Port::snapshot(&snap);
-        for open in [Open::Settings, Open::AddByAddress, Open::Pair(SpeakerId::new("den-tv"))] {
-            assert_ne!(placeholder(&open).unwrap().1.title(&snap), PANEL_TITLE);
-        }
-    }
-
-    #[test]
-    fn settings_and_dialogs_open_in_the_middle_of_the_primary_monitor() {
+    fn dialogs_open_in_the_middle_of_the_primary_monitor() {
         let primary = Monitor { bounds: PxRect::new(0, 0, 2880, 1620), work: PxRect::new(0, 0, 2880, 1548), scale: 1.5, primary: true };
         let other = Monitor { bounds: PxRect::new(-1920, 0, 0, 1080), work: PxRect::new(-1920, 0, 0, 1032), scale: 1.0, primary: false };
         let p = centred(&[other, primary], Vec2::new(480.0, 260.0)).unwrap();

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use egui::Vec2;
 
-use super::{Ask, Contents, WindowContent, WindowKind};
+use super::{Ask, Contents, WindowContent};
 use crate::model::command::Open;
 use crate::model::snapshot::Snapshot;
 use crate::model::state::{NowState, Secret, SpeakerId};
@@ -59,8 +59,8 @@ pub struct SettingsContents {
 }
 
 impl SettingsContents {
-    fn dialog(&self, dialog: Dialog) -> Option<(WindowKind, Box<dyn WindowContent>)> {
-        Some((WindowKind::Dialog, Box::new(DialogWindow { dialog, port: self.port.clone() })))
+    fn dialog(&self, dialog: Dialog) -> Option<Box<dyn WindowContent>> {
+        Some(Box::new(DialogWindow { dialog, port: self.port.clone() }))
     }
 }
 
@@ -69,7 +69,7 @@ fn name_of(snap: &Snapshot, id: &SpeakerId) -> String {
 }
 
 impl Contents for SettingsContents {
-    fn open(&self, open: &Open, snap: &Snapshot, from_window: bool) -> Option<(WindowKind, Box<dyn WindowContent>)> {
+    fn open(&self, open: &Open, snap: &Snapshot, from_window: bool) -> Option<Box<dyn WindowContent>> {
         match open {
             // A speaker that asks for its password: the dialog that
             // connects with it once the person types it. Otherwise a
@@ -248,7 +248,7 @@ mod tests {
         if let NowState::NeedsSecret { speaker, secret } = &needs.state {
             let got = c.open(&Open::Pair(speaker.clone()), &needs, true);
             match secret {
-                Secret::Password => assert_eq!(got.map(|(k, _)| k), Some(WindowKind::Dialog)),
+                Secret::Password => assert!(got.is_some(), "the password dialog"),
                 Secret::Code => {
                     assert!(got.is_none());
                     assert_eq!(s.take_acts(), vec![Act::PairAgain(speaker.as_str().to_string())]);
@@ -272,7 +272,7 @@ mod tests {
         engine.set_facts(f);
         let asking = engine.snapshot();
         assert_eq!(pair_from_outside(&Open::Pair(SpeakerId::new("office")), &asking, false), None);
-        assert_eq!(c.open(&Open::Pair(SpeakerId::new("office")), &asking, false).map(|(k, _)| k), Some(WindowKind::Dialog));
+        assert!(c.open(&Open::Pair(SpeakerId::new("office")), &asking, false).is_some(), "the password dialog");
         assert!(s.take_acts().is_empty());
         assert!(c.open(&Open::Donate, &snap(Scenario::Playing), true).is_none());
         assert_eq!(s.take_acts(), vec![Act::Donate]);

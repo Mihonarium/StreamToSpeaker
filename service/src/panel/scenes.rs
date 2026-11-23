@@ -65,11 +65,9 @@ fn panel_scene(ui: &mut Ui, st: &mut Stage, scenario: &str, names: Names, open_d
 macro_rules! scenes {
     ($( $f:ident => ($scenario:literal, $names:expr, $open:expr, $name:literal) ),* $(,)?) => {
         $( fn $f(ui: &mut Ui, st: &mut Stage) { panel_scene(ui, st, $scenario, $names, $open) } )*
-        /// Every picture of the panel, then its views.
+        /// Every picture of the panel.
         pub fn scenes() -> Vec<Scene> {
-            let mut all = vec![ $( Scene { name: $name, size: [WIDTH + 2.0 * MARGIN, 0.0], draw: $f } ),* ];
-            all.extend(view_scenes());
-            all
+            vec![ $( Scene { name: $name, size: [WIDTH + 2.0 * MARGIN, 0.0], draw: $f } ),* ]
         }
     };
 }
@@ -138,66 +136,4 @@ scenes! {
     twins => ("twins", Names::Usual, false, "panel-twins"),
     pc_outputs_closed => ("pc-outputs-closed", Names::Usual, false, "panel-pc-outputs-closed"),
     pc_outputs_open => ("pc-outputs-open", Names::Usual, false, "panel-pc-outputs-open"),
-}
-
-// ---------------------------------------------------------------- views
-
-/// Draw the view `open` asks for in `scenario`, framed as the panel is.
-fn view_scene(ui: &mut Ui, scenario: Scenario, open: fn(&crate::model::snapshot::Snapshot) -> Option<crate::model::command::Open>) {
-    use crate::shell::Views;
-    let snap = ScriptedEngine::new(scenario).snapshot();
-    let Some(open) = open(&snap) else { return };
-    let Some(mut view) = crate::shell::views::StandInViews.view(&open, &snap) else { return };
-    let t = Theme::of(ui.ctx());
-    let key = Id::new(("view-scene", scenario.name(), format!("{open:?}")));
-    let mut vs: super::view::ViewState = ui.ctx().data(|d| d.get_temp(key)).unwrap_or_default();
-    ui.add_space(MARGIN);
-    ui.horizontal(|ui| {
-        ui.add_space(MARGIN);
-        egui::Frame::none().fill(t.c.surface).stroke(t.card_stroke()).rounding(8.0).shadow(t.shadow()).inner_margin(Margin::ZERO).show(ui, |ui| {
-            ui.set_width(WIDTH);
-            let _ = super::view::show_view(ui, view.as_mut(), &snap, &mut vs, 0);
-        });
-    });
-    ui.add_space(MARGIN + 20.0);
-    ui.ctx().data_mut(|d| d.insert_temp(key, vs));
-}
-
-fn kitchen(snap: &crate::model::snapshot::Snapshot) -> Option<crate::model::command::Open> {
-    snap.list.rows().find(|r| r.title == "Kitchen").and_then(|r| r.options.as_ref()).and_then(|o| match &o.command {
-        crate::model::command::Command::Open(open) => Some(open.clone()),
-        _ => None,
-    })
-}
-
-fn view_speaker(ui: &mut Ui, _st: &mut Stage) {
-    view_scene(ui, Scenario::Playing, kitchen);
-}
-
-fn view_settings(ui: &mut Ui, _st: &mut Stage) {
-    view_scene(ui, Scenario::Playing, |_| Some(crate::model::command::Open::Settings));
-}
-
-fn view_speaker_missing(ui: &mut Ui, _st: &mut Stage) {
-    view_scene(ui, Scenario::Playing, |_| Some(crate::model::command::Open::SpeakerMissing));
-}
-
-fn view_cant_hear(ui: &mut Ui, _st: &mut Stage) {
-    view_scene(ui, Scenario::Playing, |_| Some(crate::model::command::Open::CantHear(None)));
-}
-
-fn view_music_assistant(ui: &mut Ui, _st: &mut Stage) {
-    view_scene(ui, Scenario::MaPlaying, |_| Some(crate::model::command::Open::MusicAssistantSettings));
-}
-
-/// The stand-in views in the panel's frame.
-fn view_scenes() -> Vec<Scene> {
-    let size = [WIDTH + 2.0 * MARGIN, 0.0];
-    vec![
-        Scene { name: "view-speaker-stand-in", size, draw: view_speaker },
-        Scene { name: "view-settings-stand-in", size, draw: view_settings },
-        Scene { name: "view-speaker-missing-stand-in", size, draw: view_speaker_missing },
-        Scene { name: "view-cant-hear-stand-in", size, draw: view_cant_hear },
-        Scene { name: "view-music-assistant-stand-in", size, draw: view_music_assistant },
-    ]
 }

@@ -95,7 +95,7 @@ impl H {
                         crate::shell::Ask::Dialog(_) => Asked::Dialog,
                         crate::shell::Ask::Open(o) => Asked::Open(o),
                         crate::shell::Ask::OpenPanel => Asked::OpenPanel,
-                        crate::shell::Ask::Back | crate::shell::Ask::Window(_) => Asked::Back,
+                        crate::shell::Ask::Back => Asked::Back,
                     });
                 }
                 if o.back {
