@@ -751,6 +751,32 @@ mod tests {
     }
 
     #[test]
+    fn each_session_starts_with_the_speakers_stored_change() {
+        let app = App::for_tests();
+        {
+            let mut uc = app.user_config.lock().unwrap();
+            uc.speaker_settings.insert("uuid:kitchen".into(), SpeakerSettings { delay_change_ms: -125, ..Default::default() });
+            uc.speaker_settings.insert("sendspin:desk".into(), SpeakerSettings { delay_change_ms: 300, ..Default::default() });
+            uc.speaker_settings.insert(
+                OFFICE.into(),
+                SpeakerSettings { steady_delay_change_ms: -300, delay_change_ms: 50, ..Default::default() },
+            );
+        }
+        // UPnP: the stream's catch-up, from the speaker's first fetch.
+        app.delay_for_upnp("uuid:kitchen");
+        let catch_up = app.delay.catch_up();
+        assert_eq!((catch_up.target_ms(), catch_up.ms_to_go()), (-125, -125));
+        // Sendspin: the lead it is given.
+        assert_eq!(app.delay_for_sendspin("sendspin:desk"), 300);
+        // AirPlay: the delay asked for, on each choice.
+        let office = crate::airplay::raop_transcripts::receiver_at("192.168.1.9".parse().unwrap(), 5000, "0D0000000042", &[0, 1]);
+        assert_eq!(app.delay_for_airplay(&office).latency_ms, 1700);
+        app.user_config.lock().unwrap().speaker_settings.get_mut(OFFICE).unwrap().delay_choice = Some(DelayChoice::Short);
+        assert_eq!(app.delay_for_airplay(&office).latency_ms, 350);
+        assert_eq!(app.delay.state().started, Some((OFFICE.to_string(), 50)));
+    }
+
+    #[test]
     fn a_change_is_stored_at_once_and_stops_at_the_limit() {
         let app = App::for_tests();
         let out = app.change_delay(Some("uuid:kitchen"), Request::Remove(150)).unwrap();

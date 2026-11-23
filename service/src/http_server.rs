@@ -2628,6 +2628,91 @@ mod tests {
     }
 
     #[test]
+    fn a_speakers_fetch_queues_three_seconds_however_the_packets_are_cut() {
+        let hub = StreamHub::new();
+        let peer: IpAddr = "192.168.1.40".parse().unwrap();
+        let (speaker, queue) = hub.subscribe_speaker(peer);
+        let other = hub.subscribe_from("192.168.1.77".parse().unwrap());
+        // 2 ms packets, as the driver hands them over, for four seconds.
+        let packet = vec![1u8; 88 * 4];
+        for _ in 0..2000 {
+            hub.publish(PcmFrame(Arc::new(packet.clone())));
+        }
+        let held = SPEAKER_QUEUE_FRAMES / 88;
+        assert_eq!(speaker.len(), held);
+        assert_eq!(queue.dropped_frames(), (2000 - held) as u64 * 88);
+        // Anyone else keeps the queue of 128 packets.
+        assert_eq!(other.len(), 128);
+        // What the speaker takes makes room again.
+        let mut taken = 0;
+        while let Ok(f) = speaker.try_recv() {
+            queue.taken(f.0.len() / 4);
+            taken += 1;
+            if taken == 10 {
+                break;
+            }
+        }
+        hub.publish(PcmFrame(Arc::new(packet.clone())));
+        assert_eq!(speaker.len(), held - 10 + 1);
+    }
+
+    #[test]
+    fn the_speaker_gets_its_delay_change_and_anyone_else_the_stream_as_it_is() {
+        use crate::delay::catch_up::CatchUp;
+        let hub = StreamHub::new();
+        let catch_up = CatchUp::new(Arc::new(std::sync::atomic::AtomicU32::new(4)));
+        // 1 ms removed: 44 frames, 4 from the end of each of the first 11
+        // packets.
+        catch_up.begin_session(-1);
+        let mut cfg = HttpServerConfig::minimal("127.0.0.1:0".parse().unwrap(), hub.clone());
+        cfg.speaker_peer = Some(Arc::new(|ip: IpAddr| ip == IpAddr::from([127, 0, 0, 2])));
+        cfg.catch_up = Some(catch_up.clone());
+        let port = start(cfg);
+        let request = b"GET /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        let mut speaker = connect_from([127, 0, 0, 2], port);
+        speaker.write_all(request).unwrap();
+        let mut other = connect_from([127, 0, 0, 3], port);
+        other.write_all(request).unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while hub.subscriber_count() < 2 {
+            assert!(Instant::now() < end, "never subscribed");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // 20 packets of 441 frames whose frames are all different.
+        let packets: Vec<Vec<u8>> = (0..20u16)
+            .map(|p| (0..441u16).flat_map(|f| {
+                let v = (100 + p * 441 + f) as i16;
+                [v.to_le_bytes(), v.to_le_bytes()].concat()
+            }).collect())
+            .collect();
+        for p in &packets {
+            hub.publish(PcmFrame(Arc::new(p.clone())));
+        }
+        // The first `n` bytes of audio after the head and the WAV header.
+        let audio = |s: &mut TcpStream, n: usize| {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut start = None;
+            while start.is_none_or(|at| got.len() < at + n) {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => got.extend_from_slice(&buf[..k]),
+                }
+                if start.is_none() {
+                    start = got.windows(4).position(|w| w == b"\r\n\r\n").map(|at| at + 4 + 44);
+                }
+            }
+            got.split_off(start.expect("a head"))
+        };
+        let whole: Vec<u8> = packets.concat();
+        let edited: Vec<u8> =
+            packets.iter().enumerate().flat_map(|(i, p)| if i < 11 { p[..437 * 4].to_vec() } else { p.clone() }).collect();
+        assert_eq!(audio(&mut other, whole.len()), whole);
+        assert_eq!(audio(&mut speaker, edited.len()), edited);
+        assert_eq!(catch_up.ms_to_go(), 0);
+    }
+
+    #[test]
     fn samples_become_little_endian_wav_data() {
         assert_eq!(samples_to_wav_le_bytes(&[0x0102, -2, 0]), [0x02, 0x01, 0xFE, 0xFF, 0, 0]);
     }

@@ -876,6 +876,26 @@ mod tests {
         quiet_source_gets_silence(false);
     }
 
+    /// A speaker that connects before anything has played on the PC gets a
+    /// stream from the start (silence, at the pace of the clock), so it
+    /// keeps its fetch open and a delay change applies to it at once.
+    #[test]
+    fn a_speaker_connected_before_anything_plays_gets_silence() {
+        let app = App::for_tests();
+        let hub = app.hub.subscribe();
+        let (feeder, source) = fed();
+        let _done = start(&app, source, gone());
+        for _ in 0..20 {
+            let f = next_frame(&hub, "silence before the first play");
+            assert_eq!(f.0.len(), SILENCE_FRAMES * 4);
+            assert!(first_sample(&f).abs() <= 4, "expected silence, got {}", first_sample(&f));
+        }
+        // The first sound takes over.
+        feeder.items.send(Ok(sound())).unwrap();
+        wait_for_sound(&hub);
+        app.request_shutdown();
+    }
+
     #[test]
     fn silence_goes_out_after_a_stop_the_loop_learns_late() {
         quiet_source_gets_silence(true);
