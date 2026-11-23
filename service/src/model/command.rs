@@ -33,6 +33,10 @@ pub enum Command {
     /// the answer to the row's question, or *Play on Kitchen again* after
     /// a takeover.
     PlayTakingOver(SpeakerId),
+    /// Make one of Windows' outputs the one This PC means, and play there.
+    PlayOnPcOutput(PcOutputId),
+    /// Open or close the list of This PC's outputs under its row.
+    ShowPcOutputs(bool),
     /// Stop the connection being made; the sound stays where it is.
     CancelConnect,
     /// Leave a busy speaker alone (*Cancel* on its row's question).

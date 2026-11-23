@@ -43,6 +43,13 @@ pub struct UserConfig {
     /// the speaker whatever played meanwhile.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub closed_for_update: bool,
+    /// The output This PC means (Windows' id for it): where the sound goes
+    /// back to, and what the person picked under This PC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pc_output: Option<String>,
+    /// The list of This PC's outputs is open in the panel.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pc_outputs_open: bool,
     #[serde(default)]
     pub onboarding_dismissed: bool,
     /// User ticked "Always minimise to tray" in the close-confirm
@@ -314,6 +321,10 @@ pub struct SpeakerSettings {
     /// whose level can't be read starts at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// When it last played from this PC (seconds since 1970): of two ways
+    /// to one speaker, the one used last is listed first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_played: Option<u64>,
     /// This speaker's settings that a newer version wrote and this one
     /// doesn't know, kept as they are across saves.
     #[serde(flatten)]
@@ -964,6 +975,8 @@ const SETTING_LABELS: &[(&str, &str, bool)] = &[
     ("last_speaker_id", "The speaker used last", false),
     ("chose_this_pc", "The speaker used last", false),
     ("closed_for_update", "The speaker used last", false),
+    ("pc_output", "The output This PC plays on", false),
+    ("pc_outputs_open", "This PC's outputs shown in the panel", false),
     ("onboarding_dismissed", "Getting started", true),
     ("always_minimise_to_tray", "Always minimise to tray", true),
     ("donation_prompt_hidden_until", "The donation reminder", false),
@@ -1004,6 +1017,7 @@ const SPEAKER_LABELS: &[(&str, &str, bool)] = &[
     ("steady_delay_change_ms", "What was removed from or added to its delay", false),
     ("delay_choice", "Short delay or Steady", false),
     ("level", "The volume last used with it", false),
+    ("last_played", "When it last played from this PC", false),
 ];
 
 /// Values the app remembers by itself and learns again at the next
@@ -2055,6 +2069,8 @@ mod tests {
         c.auto_reconnect_on_launch = false;
         c.chose_this_pc = true;
         c.closed_for_update = true;
+        c.pc_output = Some("{0.0.0.00000000}.{realtek}".into());
+        c.pc_outputs_open = true;
         c.prefer_realtime_airplay = true;
         c.auto_reconnect_on_drop = false;
         c.airplay_mfi_encryption = true;
@@ -2108,6 +2124,7 @@ mod tests {
                 steady_delay_change_ms: 120,
                 delay_choice: Some(crate::delay::DelayChoice::Short),
                 level: Some(32),
+                last_played: Some(1_790_000_000),
                 unknown_keys: [("future_speaker_setting".to_string(), serde_json::json!({"x": 1}))].into_iter().collect(),
             },
         );

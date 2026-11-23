@@ -359,6 +359,8 @@ keys! {
     AppName,
     ListHeading,
     ThisPc,
+    ShowPcOutputs,
+    HidePcOutputs,
     MaHeading,
     MaName,
     CantHear,
@@ -573,6 +575,7 @@ keys! {
     SpokenRowDelayUnder,
     SpokenRowDelayMeasured,
     SpokenPlaying,
+    SpokenPlaysHere,
     SpokenReady,
 
     // Delay.
@@ -766,6 +769,8 @@ pub fn english(key: Key) -> Template {
         AppName => text("Stream To Speaker"),
         ListHeading => text("Play on"),
         ThisPc => text("This PC"),
+        ShowPcOutputs => text("Show this PC’s outputs"),
+        HidePcOutputs => text("Hide this PC’s outputs"),
         MaHeading => text("Through Music Assistant"),
         MaName => text("Music Assistant"),
         CantHear => text("Can’t hear it?"),
@@ -1047,6 +1052,7 @@ pub fn english(key: Key) -> Template {
         SpokenRowDelayUnder => text("under {seconds} second delay"),
         SpokenRowDelayMeasured => text("{seconds} second delay, measured"),
         SpokenPlaying => text("Playing."),
+        SpokenPlaysHere => text("This PC plays here."),
         SpokenReady => text("Ready."),
 
         DelayLabel => text("Delay"),

@@ -77,7 +77,7 @@ impl Engine {
     /// when the command line or the terminal names one).
     pub fn start(app: Arc<App>, platform: Platform, go_back: bool) -> Arc<Engine> {
         let now = Instant::now();
-        let (choice, named, after_update) = {
+        let (choice, named, after_update, pc_output) = {
             let mut uc = app.user_config.lock().unwrap();
             let named = uc.last_speaker_id.as_deref().map(place_of);
             let choice = if uc.chose_this_pc { Some(Place::ThisPc) } else { named.clone() };
@@ -85,9 +85,10 @@ impl Engine {
             if after_update {
                 uc.save();
             }
-            (choice, named, after_update)
+            (choice, named, after_update, uc.pc_output.as_deref().map(crate::model::PcOutputId::new))
         };
-        let core = Core::new(choice, named, now);
+        let mut core = Core::new(choice, named, now);
+        core.pc_output = pc_output;
         let opener: Arc<Mutex<Option<Opener>>> = Arc::new(Mutex::new(None));
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut driver = Driver::new(app.clone(), platform.clone(), core, tx.clone(), opener.clone(), now);
@@ -195,6 +196,8 @@ pub(crate) struct Driver {
     /// Connect and release threads still running.
     threads: Vec<std::thread::JoinHandle<()>>,
     upnp: Option<UpnpFetch>,
+    /// The speaker whose last play was noted.
+    played: Option<String>,
 }
 
 impl Driver {
@@ -224,6 +227,7 @@ impl Driver {
             level: None,
             threads: Vec::new(),
             upnp: None,
+            played: None,
         }
     }
 
@@ -343,6 +347,14 @@ impl Driver {
                 self.list.0 = now - LIST_EVERY * 2;
                 Ok(Effect::Done)
             }
+            Command::ShowPcOutputs(open) => {
+                let mut uc = app.user_config.lock().unwrap();
+                if uc.pc_outputs_open != *open {
+                    uc.pc_outputs_open = *open;
+                    uc.save();
+                }
+                Ok(Effect::Done)
+            }
             Command::DismissNotice(NoticeKind::Donation) => {
                 app.snooze_donation_prompt(30);
                 Ok(Effect::Done)
@@ -421,6 +433,11 @@ impl Driver {
                     }
                     let ok = self.platform.outputs.default_output().as_ref() == Some(&ours);
                     let _ = self.tx.send(Input::Event(Event::SwitchRead { ok }));
+                }
+                Do::UseOutput(output) => {
+                    if let Err(e) = self.platform.outputs.set_default(&output, ALL_ROLES) {
+                        warn!("couldn't make the chosen output Windows' default: {}", e);
+                    }
                 }
                 Do::GiveBack => {
                     let ours = self.platform.outputs.our_output();
@@ -715,6 +732,32 @@ impl Driver {
         let dos = self.core.tick(&w, now);
         self.execute(dos);
         self.remember_level(now);
+        self.remember_places();
+    }
+
+    /// This PC's output and the speaker that plays, across restarts.
+    fn remember_places(&mut self) {
+        let pc = self.core.pc_output.as_ref().map(|o| o.0.to_string());
+        {
+            let mut uc = self.app.user_config.lock().unwrap();
+            if pc.is_some() && uc.pc_output != pc {
+                uc.pc_output = pc;
+                uc.save();
+            }
+        }
+        let bound = match self.core.bound() {
+            Some(Place::Speaker(id)) => Some(id.as_str().to_string()),
+            _ => None,
+        };
+        if bound != self.played {
+            if let Some(id) = &bound {
+                let mut s = self.app.speaker_settings(id);
+                s.last_played = Some(unix_now());
+                self.app.set_speaker_settings(id, s);
+                self.list.0 = Instant::now() - LIST_EVERY * 2;
+            }
+            self.played = bound;
+        }
     }
 
     /// Remember the bound speaker's level once it has settled.
@@ -898,6 +941,11 @@ fn busy(app: &App, id: &str) -> Option<Option<String>> {
     let state = crate::upnp::get_transport_state(&r.av_transport_control_url).ok()?;
     let (uri, title) = crate::upnp::get_media_info(&r.av_transport_control_url).ok()?;
     crate::upnp::is_busy(&state, &uri, &ours).then(|| title.as_deref().and_then(crate::upnp::other_pc_in_title))
+}
+
+/// Seconds since 1970.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
 }
 
 /// The time on the PC's clock.

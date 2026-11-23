@@ -55,6 +55,9 @@ pub enum Do {
     UseOurOutput,
     /// Windows' output back to this PC's (to `Core::pc_output`).
     GiveBack,
+    /// Make one of the PC's outputs Windows' default, whichever was: the
+    /// person picked it under This PC.
+    UseOutput(PcOutputId),
     /// Remember the person's choice across restarts.
     SaveChoice(Option<Place>),
     /// "Has anything played on this PC since" counts from now.
@@ -418,6 +421,15 @@ impl Core {
             Command::Play(Place::MusicAssistant) => self.choose(Place::MusicAssistant, false, origin, &mut out),
             Command::Play(Place::ThisPc) | Command::StayOnThisPc => {
                 self.to_this_pc(&mut out);
+                self.choice = Some(Place::ThisPc);
+                out.push(Do::SaveChoice(self.choice.clone()));
+            }
+            Command::PlayOnPcOutput(output) => {
+                // This PC means that output from now on.
+                self.pc_output = Some(output.clone());
+                self.to_this_pc(&mut out);
+                self.expect_default = Some(output.clone());
+                out.push(Do::UseOutput(output.clone()));
                 self.choice = Some(Place::ThisPc);
                 out.push(Do::SaveChoice(self.choice.clone()));
             }

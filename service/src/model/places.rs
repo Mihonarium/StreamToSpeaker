@@ -1,15 +1,19 @@
-//! The list of places: This PC, the speakers and groups, Music Assistant,
-//! and what each row says.
+//! The list of places: This PC and its outputs, the speakers and groups,
+//! Music Assistant, and what each row says.
 //!
-//! A row is one line: its name, and at the right end a short status only
-//! when there is one. What the row used to say on a second line (the kind
-//! and the delay, or what is true now) is its tooltip and what a reader of
-//! the display hears after the name; the phone remote still shows it as a
-//! second line.
+//! A row has two lines: its name, and under it what tells it apart (a
+//! speaker's kind and delay, the output This PC plays on). A short status
+//! shows at the right end when there is one, and a click that failed adds
+//! its line. A speaker reached two ways (a Sonos speaker by its own
+//! protocol and by AirPlay) is two rows, next to each other, the way used
+//! last first.
 
 use super::command::{Command, Open};
 use super::delay::{figure, row_delay_text, spoken_row_delay};
-use super::facts::{ConnectFailure, Facts, Mode, Presence, SearchCause, SearchPhase, SpeakerFacts, SpeakerKind};
+use super::facts::{
+    ConnectFailure, Facts, Mode, OutputKind, PcOutput, Presence, SearchCause, SearchPhase, SpeakerFacts,
+    SpeakerKind,
+};
 use super::snapshot::{stage_text, Button, MenuItem, Tone};
 use super::state::{Dropout, FellBackCause, NowState, Place, Secret};
 use super::text::{t, Lang};
@@ -23,6 +27,9 @@ pub struct PlaceList {
     /// "Play on". The panel shows no heading; the phone remote does.
     pub heading: String,
     pub this_pc: Row,
+    /// This PC's outputs, under its row while its chevron is open; empty
+    /// when the PC has only one.
+    pub pc_outputs: Vec<OutputRow>,
     /// While nothing is found yet.
     pub searching: Option<Searching>,
     /// Speakers and groups by name; remembered ones that aren't found come
@@ -51,13 +58,17 @@ impl PlaceList {
 pub struct Row {
     pub place: Place,
     pub icon: RowIcon,
-    /// The name; with its address when two entries share the name.
+    /// The name; with its address when two devices answer to one name.
     pub title: String,
+    /// The second line: a speaker's kind and delay (*Sonos · about 0.2 s
+    /// delay*, *AirPlay · about 2 s delay*), the output This PC plays on,
+    /// or what Music Assistant does.
+    pub second: String,
     /// At the right end, when there is something to show.
     pub status: Option<RowStatus>,
-    /// The kind and delay (*Sonos · about 0.2 s delay*), or what is true
-    /// now. The panel shows it as the row's tooltip; the phone remote as
-    /// its second line, in `tone`.
+    /// What is true now when it differs from the second line (*Trying
+    /// again (2 of 3)…*), else the second line: the panel's tooltip; the
+    /// phone remote shows it as the second line, in `tone`.
     pub tooltip: String,
     pub tone: Tone,
     /// Can't be played right now.
@@ -72,7 +83,35 @@ pub struct Row {
     pub question: Option<Question>,
     /// The ⋯ menu (and right-click).
     pub menu: Vec<MenuItem>,
+    /// This PC's chevron, when the PC has more than one output.
+    pub chevron: Option<Chevron>,
     /// What a screen reader says for the row.
+    pub spoken: String,
+}
+
+/// The chevron at This PC's right end, which opens its outputs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Chevron {
+    pub open: bool,
+    /// Opens or closes them (remembered).
+    pub command: Command,
+    /// "Show this PC's outputs" / "Hide this PC's outputs".
+    pub spoken: String,
+}
+
+/// One of This PC's outputs, under its row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputRow {
+    pub icon: RowIcon,
+    /// The output's name: "Speakers", "Headphones".
+    pub title: String,
+    /// Its device: "Realtek Audio".
+    pub second: String,
+    /// The output This PC plays on.
+    pub checked: bool,
+    /// Make it This PC's output and play there; nothing on the checked row
+    /// while the sound is on this PC.
+    pub command: Option<Command>,
     pub spoken: String,
 }
 
@@ -91,6 +130,8 @@ pub enum RowStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowIcon {
     Pc,
+    Headphones,
+    Display,
     Speaker,
     Group,
     HomePodPair,
@@ -190,8 +231,50 @@ fn spoken_kind_and_delay(lang: Lang, s: &SpeakerFacts) -> String {
     }
 }
 
+fn output_icon(kind: OutputKind) -> RowIcon {
+    match kind {
+        OutputKind::Headphones => RowIcon::Headphones,
+        OutputKind::Display => RowIcon::Display,
+        OutputKind::Speakers | OutputKind::Other => RowIcon::Pc,
+    }
+}
+
 fn same_name(a: &str, b: &str) -> bool {
     a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+/// `a` and `b` are two ways to one speaker.
+fn twins(facts: &Facts, a: &Place, b: &Place) -> bool {
+    let (Place::Speaker(a), Place::Speaker(b)) = (a, b) else { return false };
+    facts.speakers.iter().any(|s| &s.id == a && s.twin.as_ref() == Some(b))
+        && facts.speakers.iter().any(|s| &s.id == b && s.twin.as_ref() == Some(a))
+}
+
+/// The speakers in list order: by name, remembered ones that aren't found
+/// last, and two ways to one speaker next to each other, the one used last
+/// first (the one with less delay when neither was used).
+fn in_list_order<'a>(listed: &[&'a SpeakerFacts]) -> Vec<&'a SpeakerFacts> {
+    let twin_of = |s: &SpeakerFacts| -> Option<&'a SpeakerFacts> {
+        let t = s.twin.as_ref()?;
+        listed.iter().copied().find(|o| &o.id == t && o.twin.as_ref() == Some(&s.id))
+    };
+    let goes_first = |a: &SpeakerFacts, b: &SpeakerFacts| {
+        let delay = |s: &SpeakerFacts| s.delay.map(|d| d.own_ms).unwrap_or(u32::MAX);
+        (std::cmp::Reverse(a.last_used), delay(a), &a.id) <= (std::cmp::Reverse(b.last_used), delay(b), &b.id)
+    };
+    let mut units: Vec<Vec<&'a SpeakerFacts>> = Vec::new();
+    for s in listed.iter().copied() {
+        match twin_of(s) {
+            Some(t) if goes_first(t, s) => {} // listed after its twin
+            Some(t) => units.push(vec![s, t]),
+            None => units.push(vec![s]),
+        }
+    }
+    units.sort_by_key(|u| {
+        let gone = u.iter().all(|s| s.presence == Presence::NotFound);
+        (gone, u[0].name.to_lowercase(), u[0].id.clone())
+    });
+    units.into_iter().flatten().collect()
 }
 
 /// Builds the list for `facts`.
@@ -203,13 +286,15 @@ pub fn place_list(facts: &Facts) -> PlaceList {
 
     let listed: Vec<&SpeakerFacts> =
         facts.speakers.iter().filter(|s| !s.hidden && s.presence != Presence::CantPlay).collect();
-    let mut sorted = listed.clone();
-    sorted.sort_by_key(|s| (s.presence == Presence::NotFound, s.name.to_lowercase(), s.id.clone()));
-    let mut rows: Vec<(bool, Row)> = sorted
-        .iter()
+    let mut rows: Vec<(bool, Row)> = in_list_order(&listed)
+        .into_iter()
         .map(|s| {
-            let twin = listed.iter().any(|o| o.id != s.id && same_name(&o.name, &s.name));
-            (s.used_here, speaker_row(facts, s, twin))
+            // Two devices answering to one name, other than one speaker
+            // reached two ways: their names carry the address.
+            let clash = listed
+                .iter()
+                .any(|o| o.id != s.id && same_name(&o.name, &s.name) && s.twin.as_ref() != Some(&o.id));
+            (s.used_here, speaker_row(facts, s, clash))
         })
         .collect();
 
@@ -217,9 +302,22 @@ pub fn place_list(facts: &Facts) -> PlaceList {
     let mut more = None;
     let ma_rows = usize::from(facts.music_assistant.is_some());
     if 1 + rows.len() + ma_rows > UNFOLDED_ROWS {
-        let (kept, folded): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(used, r)| {
+        let keep = |(used, r): &(bool, Row)| {
             *used || r.current || r.status == Some(RowStatus::Spinner) || r.question.is_some() || r.error.is_some()
-        });
+        };
+        // Two ways to one speaker stay together.
+        let stays: Vec<bool> = (0..rows.len())
+            .map(|i| {
+                keep(&rows[i])
+                    || [i.checked_sub(1), Some(i + 1)].into_iter().flatten().any(|j| {
+                        j < rows.len() && keep(&rows[j]) && twins(facts, &rows[i].1.place, &rows[j].1.place)
+                    })
+            })
+            .collect();
+        let (kept, folded): (Vec<_>, Vec<_>) =
+            rows.into_iter().zip(stays).partition(|(_, stays)| *stays);
+        let kept: Vec<(bool, Row)> = kept.into_iter().map(|(r, _)| r).collect();
+        let folded: Vec<(bool, Row)> = folded.into_iter().map(|(r, _)| r).collect();
         rows = kept;
         if !folded.is_empty() {
             more = Some(Folded {
@@ -233,6 +331,11 @@ pub fn place_list(facts: &Facts) -> PlaceList {
     PlaceList {
         heading: t!(lang, ListHeading),
         this_pc: this_pc_row(facts, current == Some(Place::ThisPc)),
+        pc_outputs: if facts.pc.outputs.len() > 1 {
+            facts.pc.outputs.iter().map(|o| output_row(facts, o, current == Some(Place::ThisPc))).collect()
+        } else {
+            Vec::new()
+        },
         searching: searching(facts),
         speakers: rows.into_iter().map(|(_, r)| r).collect(),
         more,
@@ -264,6 +367,7 @@ pub fn place_list(facts: &Facts) -> PlaceList {
                     icon: RowIcon::MusicAssistant,
                     spoken: spoken(lang, &title, &tooltip, status_word(lang, state, is_current)),
                     title,
+                    second: tooltip.clone(),
                     status,
                     tooltip,
                     tone,
@@ -273,6 +377,7 @@ pub fn place_list(facts: &Facts) -> PlaceList {
                     error: None,
                     question: None,
                     menu: vec![MenuItem::new(t!(lang, MaSettings), Command::Open(Open::MusicAssistantSettings))],
+                    chevron: None,
                 },
             }
         }),
@@ -318,11 +423,18 @@ fn this_pc_row(facts: &Facts, current: bool) -> Row {
         }
         _ => (t!(lang, ThisPc), facts.pc.output.friendly.clone()),
     };
+    let open = facts.pc.outputs_open;
+    let chevron = (facts.pc.outputs.len() > 1).then(|| Chevron {
+        open,
+        command: Command::ShowPcOutputs(!open),
+        spoken: if open { t!(lang, HidePcOutputs) } else { t!(lang, ShowPcOutputs) },
+    });
     Row {
         place: Place::ThisPc,
-        icon: RowIcon::Pc,
+        icon: output_icon(facts.pc.output.kind),
         spoken: spoken(lang, &title, &tooltip, None),
         title,
+        second: tooltip.clone(),
         status: None,
         tooltip,
         tone: Tone::Plain,
@@ -332,6 +444,20 @@ fn this_pc_row(facts: &Facts, current: bool) -> Row {
         error: None,
         question: None,
         menu: vec![],
+        chevron,
+    }
+}
+
+fn output_row(facts: &Facts, o: &PcOutput, on_pc: bool) -> OutputRow {
+    let lang = facts.lang;
+    let checked = o.id == facts.pc.output.id;
+    OutputRow {
+        icon: output_icon(o.kind),
+        spoken: spoken(lang, &o.name, &o.device, checked.then(|| t!(lang, SpokenPlaysHere))),
+        title: o.name.clone(),
+        second: o.device.clone(),
+        checked,
+        command: (!(checked && on_pc)).then(|| Command::PlayOnPcOutput(o.id.clone())),
     }
 }
 
@@ -375,7 +501,7 @@ fn searching(facts: &Facts) -> Option<Searching> {
     })
 }
 
-fn speaker_row(facts: &Facts, s: &SpeakerFacts, twin: bool) -> Row {
+fn speaker_row(facts: &Facts, s: &SpeakerFacts, clash: bool) -> Row {
     use NowState::*;
     let lang = facts.lang;
     let state = &facts.state;
@@ -383,7 +509,7 @@ fn speaker_row(facts: &Facts, s: &SpeakerFacts, twin: bool) -> Row {
     let is_current = state.current_place() == Some(Place::Speaker(id.clone()));
     let about_this = state.speaker() == Some(id);
     let kind = kind_text(lang, &s.kind);
-    let title = if twin { t!(lang, RowWithAddress, name = &s.name, address = &s.address) } else { s.name.clone() };
+    let title = if clash { t!(lang, RowWithAddress, name = &s.name, address = &s.address) } else { s.name.clone() };
 
     let mut tone = Tone::Plain;
     let mut dimmed = false;
@@ -430,7 +556,7 @@ fn speaker_row(facts: &Facts, s: &SpeakerFacts, twin: bool) -> Row {
         clickable = false;
         status = Some(RowStatus::Text(t!(lang, RowPartsFound, found = 1u32, all = 2u32)));
         t!(lang, RowWaitingForPair)
-    } else if twin {
+    } else if clash {
         tone = Tone::Warning;
         status = Some(RowStatus::Attention);
         t!(lang, RowTwoDevices, kind = &kind, name = &s.name)
@@ -481,6 +607,7 @@ fn speaker_row(facts: &Facts, s: &SpeakerFacts, twin: bool) -> Row {
         icon: kind_icon(&s.kind),
         spoken: spoken(lang, &title, &detail, status_word(lang, state, is_current)),
         title,
+        second: kind_and_delay(lang, s),
         status,
         tooltip,
         tone,
@@ -490,6 +617,7 @@ fn speaker_row(facts: &Facts, s: &SpeakerFacts, twin: bool) -> Row {
         error,
         question,
         menu,
+        chevron: None,
     }
 }
 

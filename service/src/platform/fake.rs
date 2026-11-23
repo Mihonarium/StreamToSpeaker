@@ -1,5 +1,6 @@
-//! Windows, played in memory for tests and demos: three outputs (the PC's
-//! speakers, headphones, and this app's own), a default that a test can
+//! Windows, played in memory for tests and demos: four outputs (the PC's
+//! speakers, headphones, a monitor that is switched off, and this app's
+//! own), a default that a test can
 //! move as the person would, apps that play, and a record of what the app
 //! asked for.
 
@@ -7,20 +8,24 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::{
-    AppAudio, AudioSessions, EventSink, Handback, OurDevice, OutputInfo, Outputs, PcOutputId, Platform, Role,
-    SystemEvent, SystemEvents,
+    AppAudio, AudioSessions, EventSink, Handback, OurDevice, OutputInfo, OutputKind, Outputs, PcOutputId, Platform,
+    Role, SystemEvent, SystemEvents,
 };
 
 /// The PC's own speakers.
 pub const SPEAKERS: &str = "realtek";
 /// Headphones.
 pub const HEADPHONES: &str = "headphones";
+/// A monitor's speakers, switched off in Windows.
+pub const MONITOR: &str = "monitor";
 /// This app's output.
 pub const OURS: &str = "stream-to-speaker";
 
 #[derive(Default)]
 struct State {
     outputs: Vec<OutputInfo>,
+    /// Switched off in Windows.
+    off: Vec<PcOutputId>,
     levels: HashMap<PcOutputId, (u8, bool)>,
     /// Per role.
     default: HashMap<Role, PcOutputId>,
@@ -45,16 +50,26 @@ fn id(s: &str) -> PcOutputId {
 impl FakePlatform {
     /// The PC's speakers are Windows' default for every role.
     pub fn new() -> Arc<Self> {
+        let output = |key: &str, name: &str, device: &str, kind| OutputInfo {
+            id: id(key),
+            friendly: format!("{name} ({device})"),
+            name: name.into(),
+            device: device.into(),
+            kind,
+        };
         let outputs = vec![
-            OutputInfo { id: id(SPEAKERS), friendly: "Speakers (Realtek Audio)".into(), name: "Speakers".into() },
+            output(SPEAKERS, "Speakers", "Realtek Audio", OutputKind::Speakers),
+            output(HEADPHONES, "Headphones", "WH-1000XM4", OutputKind::Headphones),
+            output(MONITOR, "DELL U2720Q", "NVIDIA High Definition Audio", OutputKind::Display),
             OutputInfo {
-                id: id(HEADPHONES),
-                friendly: "Headphones (WH-1000XM4)".into(),
-                name: "Headphones".into(),
+                id: id(OURS),
+                friendly: "Stream To Speaker".into(),
+                name: "Stream To Speaker".into(),
+                device: "Stream To Speaker".into(),
+                kind: OutputKind::Other,
             },
-            OutputInfo { id: id(OURS), friendly: "Stream To Speaker".into(), name: "Stream To Speaker".into() },
         ];
-        let mut state = State { outputs, ours_present: true, ..Default::default() };
+        let mut state = State { outputs, off: vec![id(MONITOR)], ours_present: true, ..Default::default() };
         for r in super::ALL_ROLES {
             state.default.insert(*r, id(SPEAKERS));
         }
@@ -160,6 +175,15 @@ impl Outputs for FakePlatform {
             return None;
         }
         st.outputs.iter().find(|o| &o.id == output).cloned()
+    }
+
+    fn list(&self) -> Vec<OutputInfo> {
+        let st = self.state.lock().unwrap();
+        st.outputs
+            .iter()
+            .filter(|o| !st.off.contains(&o.id) && (o.id != id(OURS) || st.ours_present))
+            .cloned()
+            .collect()
     }
 
     fn set_default(&self, output: &PcOutputId, roles: &[Role]) -> Result<(), String> {

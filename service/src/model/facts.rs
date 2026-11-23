@@ -56,6 +56,11 @@ pub struct PcFacts {
     /// The output This PC plays on: Windows' default while it isn't this
     /// app's, otherwise the one the app gives the sound back to.
     pub output: PcOutput,
+    /// Every output This PC can play on, `output` among them: Windows'
+    /// outputs that are switched on, never this app's own.
+    pub outputs: Vec<PcOutput>,
+    /// The person opened This PC's outputs under its row (remembered).
+    pub outputs_open: bool,
 }
 
 /// One of Windows' sound outputs, with Windows' own names.
@@ -66,6 +71,19 @@ pub struct PcOutput {
     pub friendly: String,
     /// The endpoint's own name, e.g. "Speakers", "Headphones".
     pub name: String,
+    /// The device it belongs to, e.g. "Realtek Audio".
+    pub device: String,
+    pub kind: OutputKind,
+}
+
+/// What an output is, for its icon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputKind {
+    Speakers,
+    Headphones,
+    /// A monitor or TV over HDMI or DisplayPort.
+    Display,
+    Other,
 }
 
 /// A speaker, group or pair the app knows.
@@ -92,6 +110,12 @@ pub struct SpeakerFacts {
     /// A click on it is waiting for the person's answer because it is
     /// playing something else.
     pub question: Option<TakeOver>,
+    /// The same speaker reached another way (a Sonos speaker by its own
+    /// protocol and by AirPlay): the two are listed next to each other.
+    pub twin: Option<SpeakerId>,
+    /// When it was last played on from this PC, as a number that grows with
+    /// time; of two ways to one speaker, the one used last is listed first.
+    pub last_used: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
