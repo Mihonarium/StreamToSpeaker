@@ -56,6 +56,12 @@ pub struct PanelState {
     pub height: Option<f32>,
     /// Put the keyboard on the current row (when the panel opens).
     pub focus_current_row: bool,
+    /// A row the keyboard is moving to; it takes the focus once it is the
+    /// list's Tab stop.
+    pending_focus: Option<Place>,
+    /// The rows' widget ids in the last pass, to give one the focus before
+    /// it is drawn (so the move is announced like a Tab).
+    row_ids: Vec<(Place, Id)>,
     /// The row Tab stops on: the one the keyboard was last on.
     roving: Option<Place>,
     /// What was typed to find a row, and when.
@@ -90,6 +96,7 @@ type Place = crate::model::state::Place;
 /// level now (0–1).
 pub fn show(ui: &mut Ui, snap: &Snapshot, level: f32, st: &mut PanelState) -> PanelOutput {
     let mut out = PanelOutput::default();
+    crate::ui::look::follow_input(ui.ctx());
     let t = Theme::of(ui.ctx());
     let width = ui.available_width();
     let origin = ui.cursor().min;
@@ -133,7 +140,10 @@ pub fn show(ui: &mut Ui, snap: &Snapshot, level: f32, st: &mut PanelState) -> Pa
     ui.allocate_rect(Rect::from_min_size(origin, Vec2::new(width, total)), Sense::hover());
 
     // Keys for the whole panel.
-    let (esc, settings) = ui.input(|i| (i.key_pressed(Key::Escape), i.modifiers.command && i.key_pressed(Key::Comma)));
+    let (esc, settings) = ui.input(|i| {
+        let ctrl_comma = i.events.iter().any(|e| matches!(e, Event::Key { key: Key::Comma, pressed: true, modifiers, .. } if modifiers.command));
+        (i.key_pressed(Key::Escape), ctrl_comma)
+    });
     if esc && !crate::ui::menu::menu_is_open(ui.ctx(), row_menu_id()) {
         out.close = true;
     }
@@ -289,7 +299,8 @@ fn model_button(ui: &mut Ui, b: &ModelButton) -> egui::Response {
         ButtonStyle::Secondary | ButtonStyle::Icon => Button::standard(&b.label),
         ButtonStyle::Link => Button::link(&b.label),
     }
-    .enabled(b.enabled);
+    .enabled(b.enabled)
+    .max_width(ui.available_width());
     if let Some(s) = &b.spoken {
         button = button.accessible_name(s.clone());
     }
@@ -458,6 +469,17 @@ fn draw_list(ui: &mut Ui, snap: &Snapshot, st: &mut PanelState, room: f32, out: 
         Item::Place(r) if r.current => Some(r.place.clone()),
         _ => None,
     });
+    if st.focus_current_row {
+        st.pending_focus = current.clone();
+        st.focus_current_row = false;
+    }
+    if let Some(p) = &st.pending_focus {
+        st.roving = Some(p.clone());
+        if let Some((_, id)) = st.row_ids.iter().find(|(q, _)| q == p) {
+            let id = *id;
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+    }
     let roving = st.roving.clone().filter(|p| items.iter().any(|i| matches!(i, Item::Place(r) if &r.place == p))).or(current.clone());
 
     let mut content_h = 0.0;
@@ -471,8 +493,12 @@ fn draw_list(ui: &mut Ui, snap: &Snapshot, st: &mut PanelState, room: f32, out: 
                     Item::Place(row) => {
                         let tab = roving.as_ref() == Some(&row.place);
                         let (action, resp) = place_row(ui, row, tab);
-                        if st.focus_current_row && row.current {
-                            resp.request_focus();
+                        if tab && st.pending_focus.as_ref() == Some(&row.place) {
+                            if resp.has_focus() {
+                                st.pending_focus = None;
+                            } else {
+                                resp.request_focus();
+                            }
                         }
                         if resp.has_focus() {
                             st.roving = Some(row.place.clone());
@@ -524,7 +550,7 @@ fn draw_list(ui: &mut Ui, snap: &Snapshot, st: &mut PanelState, room: f32, out: 
         draw(ui, st, out, &mut responses);
         content_h += ui.cursor().min.y - start;
     }
-    st.focus_current_row = false;
+    st.row_ids = responses.iter().map(|(p, r)| (p.clone(), r.id)).collect();
 
     // ↑ and ↓ move between rows; typing jumps to a name.
     if let Some(i) = responses.iter().position(|(_, r)| r.has_focus()) {
@@ -570,8 +596,11 @@ fn draw_list(ui: &mut Ui, snap: &Snapshot, st: &mut PanelState, room: f32, out: 
             (1..=n).map(|k| (i + k) % n).find(|j| titles[*j].starts_with(&wanted)).or_else(|| titles.iter().position(|tt| tt.starts_with(&wanted)))
         });
         if let Some(j) = to {
-            responses[j].1.request_focus();
+            // The row becomes the Tab stop on the next pass, then takes
+            // the focus.
             st.roving = Some(responses[j].0.clone());
+            st.pending_focus = Some(responses[j].0.clone());
+            ui.ctx().request_discard("the keyboard moved to another row");
         }
         if ui.input(|inp| inp.key_pressed(Key::F10) && inp.modifiers.shift) {
             // Handled by the row itself; nothing more here.
@@ -642,7 +671,8 @@ fn question(ui: &mut Ui, q: &crate::model::places::Question, out: &mut PanelOutp
         let _ = Para::new("").lead(&q.title).size(size::CONTROL).show(ui);
         let _ = Para::new(&q.line).size(size::SECONDARY).show(ui);
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
             if model_button(ui, &q.confirm).clicked() {
                 out.commands.push(q.confirm.command.clone());
             }

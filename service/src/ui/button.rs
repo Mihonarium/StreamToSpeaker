@@ -32,11 +32,12 @@ pub struct Button<'a> {
     width: Option<f32>,
     text_size: Option<f32>,
     name: Option<String>,
+    max_width: Option<f32>,
 }
 
 impl<'a> Button<'a> {
     fn new(text: &'a str, kind: Kind) -> Self {
-        Button { text, kind, small: false, icon: None, enabled: true, default: false, width: None, text_size: None, name: None }
+        Button { text, kind, small: false, icon: None, enabled: true, default: false, width: None, text_size: None, name: None, max_width: None }
     }
 
     pub fn primary(text: &'a str) -> Self {
@@ -83,6 +84,13 @@ impl<'a> Button<'a> {
         self
     }
 
+    /// No wider than this: longer words are cut with … and shown whole in
+    /// the tooltip (a button that names a long speaker name).
+    pub fn max_width(mut self, w: f32) -> Self {
+        self.max_width = Some(w);
+        self
+    }
+
     /// The words' size (em, in pixels at 100 %), for a link that continues
     /// a sentence of that size.
     pub fn text_size(mut self, em_px: f32) -> Self {
@@ -114,20 +122,32 @@ impl Widget for Button<'_> {
             size::CONTROL
         });
         let font = t.font(em);
-        let galley = ui.painter().layout_no_wrap(self.text.to_owned(), font, Color32::PLACEHOLDER);
         let icon_size = if self.small { 14.0 } else { 15.0 };
         let icon_w = if self.icon.is_some() { icon_size + 6.0 } else { 0.0 };
-        let (pad, height) = if link {
-            (0.0, galley.size().y.max(20.0))
+        let pad = if link {
+            0.0
         } else if self.small {
-            (10.0, space::SMALL_BUTTON_HEIGHT)
+            10.0
         } else {
-            (space::M, space::BUTTON_HEIGHT)
+            space::M
+        };
+        let room = self.max_width.map_or(f32::INFINITY, |m| (m - icon_w - 2.0 * pad).max(20.0));
+        let mut job = egui::text::LayoutJob::simple_singleline(self.text.to_owned(), font, Color32::PLACEHOLDER);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+        let galley = ui.fonts(|f| f.layout_job(job));
+        let cut = galley.elided;
+        let height = if link {
+            galley.size().y.max(20.0)
+        } else if self.small {
+            space::SMALL_BUTTON_HEIGHT
+        } else {
+            space::BUTTON_HEIGHT
         };
         let natural = galley.size().x + icon_w + 2.0 * pad;
         let width = self.width.unwrap_or(natural);
         let sense = if self.enabled { Sense::click() } else { Sense::hover() };
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), sense);
+        let response = if cut { response.on_hover_text(self.text) } else { response };
         let name = self.name.clone().unwrap_or_else(|| self.text.to_owned());
         response.widget_info(|| WidgetInfo::labeled(if link { WidgetType::Link } else { WidgetType::Button }, self.enabled, &name));
         let mut l = look_as(ui, &response, &name);

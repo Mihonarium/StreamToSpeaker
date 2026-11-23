@@ -276,6 +276,16 @@ fn shown_change(delay: SpeakerDelay, facts: &DelayFacts) -> i32 {
     }
 }
 
+/// The panel's closed line, spoken: as the head line, without the amount
+/// field the panel doesn't have.
+fn spoken_panel_head(lang: Lang, name: &str, fig: Figure, change: i32) -> String {
+    let spoken_fig = spoken_figure(lang, fig);
+    match change {
+        0 => t!(lang, SpokenPanelDelayOwn, speaker = name, figure = &spoken_fig),
+        c => t!(lang, SpokenPanelDelay, speaker = name, figure = &spoken_fig, change = &spoken_change(lang, c, name)),
+    }
+}
+
 fn spoken_head(lang: Lang, name: &str, fig: Figure, change: i32) -> String {
     let spoken_fig = spoken_figure(lang, fig);
     match change {
@@ -398,7 +408,7 @@ pub fn panel_delay(
         label: t!(lang, DelayLabel),
         value,
         reconnecting: reconnecting.is_some(),
-        spoken: spoken_head(lang, name, fig, change),
+        spoken: spoken_panel_head(lang, name, fig, change),
         body: delay_body(lang, name, change, facts, steps),
         line,
         reset: (change != 0).then(|| Button {

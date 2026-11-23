@@ -49,7 +49,7 @@ pub fn look_as(ui: &Ui, response: &Response, name: &str) -> Look {
     let mut l = Look {
         hovered: enabled && response.hovered(),
         pressed: enabled && response.is_pointer_button_down_on(),
-        focused: response.has_focus(),
+        focused: response.has_focus() && focus_visible(ui.ctx()),
         enabled,
     };
     let forces: Vec<Force> = ui.ctx().data(|d| {
@@ -75,4 +75,33 @@ pub fn look_as(ui: &Ui, response: &Response, name: &str) -> Look {
         }
     }
     l
+}
+
+fn focus_visible_id() -> Id {
+    Id::new("stream_to_speaker::ui::look::focus_visible")
+}
+
+/// Whether the keyboard focus ring shows. As in Windows, it shows once the
+/// keyboard is used and hides again after a click; until a window says
+/// otherwise it shows.
+pub fn focus_visible(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(focus_visible_id())).unwrap_or(true)
+}
+
+pub fn set_focus_visible(ctx: &egui::Context, visible: bool) {
+    ctx.data_mut(|d| d.insert_temp(focus_visible_id(), visible));
+}
+
+/// Show the focus ring after a key press and hide it after a click; call
+/// once per frame in a window that does this.
+pub fn follow_input(ctx: &egui::Context) {
+    let (key, click) = ctx.input(|i| {
+        let key = i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }));
+        (key, i.pointer.any_pressed())
+    });
+    if key {
+        set_focus_visible(ctx, true);
+    } else if click {
+        set_focus_visible(ctx, false);
+    }
 }
