@@ -14,8 +14,10 @@ use windows_sys::Win32::Foundation::HWND;
 
 use super::content::WantedGate;
 use super::panel_window::{OpenView, PanelWindow, Seen, Step, Toggle, TrayClick};
+use super::popup::{popup_builder, popup_rect, PopupContent, PopupKind, StandInPopup};
 use super::views::{StandInViews, ViewMemory};
 use super::tray::{Tray, TrayEvent};
+use super::placement::PxRect;
 use super::win::{self, WindowsDesktop};
 use super::{centred, panel_builder, root_builder, Ask, Desktop, Placeholders, RootMode, ShellOptions, ViewContent, Views, WindowContent, WindowKind, Wiring, ROOT_TITLE};
 use crate::panel::view::{show_view, ViewState};
@@ -38,6 +40,18 @@ fn dialog_id() -> ViewportId {
     ViewportId::from_hash_of("stream_to_speaker::shell::dialog")
 }
 
+fn popup_id(kind: PopupKind) -> ViewportId {
+    ViewportId::from_hash_of(("stream_to_speaker::shell::popup", kind))
+}
+
+/// A small window that must not take the focus, while it shows.
+struct OpenPopup {
+    kind: PopupKind,
+    content: Box<dyn PopupContent + Send>,
+    /// Where it was put, once it is there (then it shows).
+    rect: Option<PxRect>,
+}
+
 /// How often the shell looks at what has no event of its own (a second
 /// launch, the light or dark setting, a dialog the app wants) while
 /// nothing is open.
@@ -57,9 +71,22 @@ pub fn scripted_scenario() -> Option<Scenario> {
 pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()> {
     let engine = Arc::new(ScriptedEngine::new(scenario));
     let _clock = RealTime::start(engine.clone(), Duration::from_millis(50));
+    // The two small windows' stand-ins show once at start, to try them.
+    let popups: Box<dyn FnOnce(super::popup::PopupDoor)> = Box::new(|door| {
+        door(PopupKind::Confirmation, Box::new(StandInPopup::new(PopupKind::Confirmation, "The confirmation by the clock")));
+        door(PopupKind::Notification, Box::new(StandInPopup::new(PopupKind::Notification, "A notification")));
+    });
     run(
         opts,
-        Wiring { port: engine, views: Box::new(StandInViews), contents: Box::new(Placeholders), route_opens: None, quit: Box::new(|| {}), quitting: Box::new(|| false) },
+        Wiring {
+            port: engine,
+            views: Box::new(StandInViews),
+            contents: Box::new(Placeholders),
+            route_opens: None,
+            quit: Box::new(|| {}),
+            quitting: Box::new(|| false),
+            popups: Some(popups),
+        },
     )
 }
 
@@ -86,6 +113,7 @@ pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, op
             route_opens: Some(Box::new(move |opener| route.on_open(opener))),
             quit: Box::new(move || quit.request_shutdown()),
             quitting: Box::new(move || quitting.is_shutting_down()),
+            popups: None,
         },
     )
 }
@@ -99,7 +127,15 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
         native,
         Box::new(move |cc| {
             crate::fonts::install(&cc.egui_ctx);
-            let Wiring { port, views, contents, route_opens, quit, quitting } = wiring;
+            let Wiring { port, views, contents, route_opens, quit, quitting, popups } = wiring;
+            let (popup_tx, popup_rx) = channel::<(PopupKind, Box<dyn PopupContent + Send>)>();
+            if let Some(hand) = popups {
+                let ctx = cc.egui_ctx.clone();
+                hand(Box::new(move |kind, content| {
+                    let _ = popup_tx.send((kind, content));
+                    ctx.request_repaint();
+                }));
+            }
             let ctx = cc.egui_ctx.clone();
             let watch = port.watch(Arc::new(move || ctx.request_repaint()));
             let (open_tx, open_rx) = channel::<Open>();
@@ -144,6 +180,9 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
                 tray_tx,
                 tray_rx,
                 opens: open_rx,
+                popups: Vec::new(),
+                popup_rx,
+                tray_tickets: Vec::new(),
                 started: false,
                 closing: false,
             }))
@@ -189,6 +228,10 @@ struct Shell {
     tray_rx: Receiver<TrayEvent>,
     /// Navigation commands from other surfaces, through the engine.
     opens: Receiver<Open>,
+    popups: Vec<OpenPopup>,
+    popup_rx: Receiver<(PopupKind, Box<dyn PopupContent + Send>)>,
+    /// Places picked in the tray's menu, until the engine has answered.
+    tray_tickets: Vec<crate::model::command::Ticket>,
     started: bool,
     closing: bool,
 }
@@ -365,7 +408,11 @@ impl Shell {
             Command::Open(open) => self.open(ctx, &open, snap, window, false),
             Command::Quit => self.quit_now(),
             command => {
-                let _ = self.port.send(from, command);
+                let pick = matches!(command, Command::Play(_) | Command::PlayTakingOver(_));
+                let ticket = self.port.send(from, command);
+                if pick && from == Surface::Tray {
+                    self.tray_tickets.push(ticket);
+                }
             }
         }
     }
@@ -441,6 +488,40 @@ impl Shell {
             Step::Wait => {}
         }
         commands
+    }
+
+    /// Draw the small windows that must not take the focus; place a new
+    /// one, then show it without activating it.
+    fn popup_frames(&mut self, ctx: &egui::Context, snap: &Snapshot, now: f64) {
+        let monitors = self.desktop.monitors();
+        let icon = self.tray.as_ref().and_then(|t| t.rect());
+        let mut under: Option<PxRect> = self.panel.as_ref().and_then(|p| p.rect());
+        let mut keep = Vec::new();
+        for mut p in std::mem::take(&mut self.popups) {
+            let size = p.content.size();
+            if p.rect.is_none() {
+                if let Some(rect) = popup_rect(&monitors, icon, size, under) {
+                    if self.desktop.place_popup(p.kind.title(), rect) {
+                        p.rect = Some(rect);
+                        ctx.send_viewport_cmd_to(popup_id(p.kind), ViewportCommand::Visible(true));
+                    }
+                }
+            }
+            let t = theme::Theme::of(ctx);
+            let content = &mut p.content;
+            let gone = ctx.show_viewport_immediate(popup_id(p.kind), popup_builder(p.kind, size).with_icon(app_icon()), |ctx, _class| {
+                egui::CentralPanel::default()
+                    .frame(Frame::none().fill(t.c.surface).stroke(t.card_stroke()))
+                    .show(ctx, |ui| content.show(ui, snap, now, &mut |_| {}))
+                    .inner
+            });
+            if !gone {
+                under = p.rect.or(under);
+                ctx.request_repaint_after(Duration::from_millis(250));
+                keep.push(p);
+            }
+        }
+        self.popups = keep;
     }
 
     /// Do what a view or a window's content asked.
@@ -539,6 +620,25 @@ impl eframe::App for Shell {
         while let Ok(open) = self.opens.try_recv() {
             self.open(ctx, &open, &snap, false, false);
         }
+        // A newer small window of a kind replaces the one showing.
+        while let Ok((kind, content)) = self.popup_rx.try_recv() {
+            self.popups.retain(|p| p.kind != kind);
+            self.popups.push(OpenPopup { kind, content, rect: None });
+        }
+        // A place picked in the tray's menu that only the window may play
+        // (a receiver that announces another speaker's identity): the
+        // panel, where it can be picked.
+        let mut refused = false;
+        self.tray_tickets.retain(|t| match t.try_outcome() {
+            Some(o) => {
+                refused |= matches!(o.result, Err(crate::model::command::Refusal::OnlyFromWindow { .. }));
+                false
+            }
+            None => true,
+        });
+        if refused {
+            self.open_panel(ctx, None);
+        }
         // A second launch; at start, first run or a start from the Start
         // menu: the panel.
         let at_start = !self.started && (snap.first_run.is_some() || self.opts.open_at_start);
@@ -555,6 +655,7 @@ impl eframe::App for Shell {
             self.wanted.admit(None, self.dialog.is_some());
         }
 
+        self.popup_frames(ctx, &snap, now);
         let (commands, mut asks) = self.panel_frame(ctx, &snap, now);
         sent.extend(commands.into_iter().map(|c| (Surface::Panel, c)));
         asks.extend(self.content_frame(ctx, &snap, WindowKind::Settings));

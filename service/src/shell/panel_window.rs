@@ -134,6 +134,14 @@ impl PanelWindow {
         matches!(self.phase, Phase::Shown { .. })
     }
 
+    /// Where it is on screen, once shown.
+    pub fn rect(&self) -> Option<PxRect> {
+        match self.phase {
+            Phase::Shown { place, .. } => Some(place.rect),
+            _ => None,
+        }
+    }
+
     /// After a frame of the panel's window: move it on in its life.
     pub fn after_frame(&mut self, seen: Seen, pinned: bool, mode: PanelMode, desktop: &mut dyn Desktop) -> Step {
         if seen.close {

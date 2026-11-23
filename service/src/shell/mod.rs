@@ -13,6 +13,7 @@ pub mod content;
 pub mod icons;
 pub mod panel_window;
 pub mod placement;
+pub mod popup;
 pub mod scenes;
 pub mod views;
 #[cfg(windows)]
@@ -297,6 +298,9 @@ pub struct Wiring {
     pub quit: Box<dyn Fn()>,
     /// The app is quitting another way (Ctrl+C, an update): close.
     pub quitting: Box<dyn Fn() -> bool>,
+    /// Hands the part that shows the confirmation by the clock and
+    /// notifications its door to them. `None`: nothing shows them yet.
+    pub popups: Option<Box<dyn FnOnce(popup::PopupDoor)>>,
 }
 
 /// Until Settings and the dialogs are drawn (the scripted engine): their
@@ -386,6 +390,9 @@ pub trait Desktop {
     /// there (moving a window to a monitor of another scale may take
     /// Windows a frame or two).
     fn place_panel(&mut self, rect: PxRect, mode: PanelMode) -> bool;
+    /// Put the hidden small window called `title` at `rect`, never to be
+    /// activated; true once it is there.
+    fn place_popup(&mut self, title: &str, rect: PxRect) -> bool;
 }
 
 /// A desktop for tests: fixed monitors and themes; it records where the
@@ -421,6 +428,11 @@ impl Desktop for FakeDesktop {
         } else {
             true
         }
+    }
+
+    fn place_popup(&mut self, _title: &str, rect: PxRect) -> bool {
+        self.placed.push(rect);
+        true
     }
 }
 

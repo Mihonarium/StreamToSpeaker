@@ -19,7 +19,36 @@ pub fn scenes() -> Vec<Scene> {
     vec![
         Scene { name: "tray-icons", size: [900.0, 0.0], draw: icons },
         Scene { name: "tray-menu", size: [900.0, 0.0], draw: menus },
+        Scene { name: "popup-confirmation-stand-in", size: [360.0, 0.0], draw: popup_confirmation },
+        Scene { name: "popup-notification-stand-in", size: [440.0, 0.0], draw: popup_notification },
     ]
+}
+
+/// A small window's stand-in, framed as its window is, on the desktop.
+fn popup(ui: &mut Ui, kind: super::popup::PopupKind, words: &str) {
+    use super::popup::{PopupContent, StandInPopup};
+    let t = Theme::of(ui.ctx());
+    let snap = ScriptedEngine::new(Scenario::Playing).snapshot();
+    let mut p = StandInPopup::new(kind, words);
+    let size = p.size();
+    ui.add_space(20.0);
+    ui.horizontal(|ui| {
+        ui.add_space(20.0);
+        egui::Frame::none().fill(t.c.surface).stroke(t.card_stroke()).rounding(8.0).shadow(t.shadow()).show(ui, |ui| {
+            ui.set_width(size.x);
+            ui.set_min_height(size.y);
+            let _ = p.show(ui, &snap, 0.0, &mut |_| {});
+        });
+    });
+    ui.add_space(40.0);
+}
+
+fn popup_confirmation(ui: &mut Ui, _st: &mut Stage) {
+    popup(ui, super::popup::PopupKind::Confirmation, "The confirmation by the clock");
+}
+
+fn popup_notification(ui: &mut Ui, _st: &mut Stage) {
+    popup(ui, super::popup::PopupKind::Notification, "A notification");
 }
 
 fn texture(ui: &Ui, arcs: Arcs, badge: Badge, dark: bool) -> TextureHandle {

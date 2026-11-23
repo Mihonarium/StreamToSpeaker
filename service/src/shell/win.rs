@@ -69,6 +69,10 @@ impl Desktop for WindowsDesktop {
         read_dword(PERSONALIZE, "AppsUseLightTheme") == Some(0)
     }
 
+    fn place_popup(&mut self, title: &str, rect: PxRect) -> bool {
+        Self::place_popup_window(title, rect)
+    }
+
     fn place_panel(&mut self, rect: PxRect, mode: PanelMode) -> bool {
         // The window found before, while it still is the panel; else the
         // new panel, hidden until it is placed.
@@ -81,6 +85,17 @@ impl Desktop for WindowsDesktop {
                 keep_out_of_alt_tab(hwnd, false);
             }
         }
+        set_rect(hwnd, rect);
+        window_rect(hwnd) == Some(rect)
+    }
+}
+
+impl WindowsDesktop {
+    /// Style and place a hidden popup window (see [`Desktop::place_popup`]).
+    fn place_popup_window(title: &str, rect: PxRect) -> bool {
+        let Some(hwnd) = hidden_own_window(title) else { return false };
+        round_corners(hwnd);
+        keep_out_of_alt_tab(hwnd, true);
         set_rect(hwnd, rect);
         window_rect(hwnd) == Some(rect)
     }
