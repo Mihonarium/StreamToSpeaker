@@ -335,6 +335,9 @@ pub struct PanelDelay {
     /// "about 0.15 s"; while an AirPlay speaker reconnects to apply a
     /// change, "reconnecting to remove 100 ms…".
     pub value: String,
+    /// The value says a reconnect is applying a change (a phrase, not a
+    /// figure).
+    pub reconnecting: bool,
     /// The closed line, spoken (the keys work on it closed).
     pub spoken: String,
     /// What opening shows.
@@ -394,6 +397,7 @@ pub fn panel_delay(
     PanelDelay {
         label: t!(lang, DelayLabel),
         value,
+        reconnecting: reconnecting.is_some(),
         spoken: spoken_head(lang, name, fig, change),
         body: delay_body(lang, name, change, facts, steps),
         line,

@@ -32,5 +32,7 @@ pub(crate) fn inside<R>(ui: &mut egui::Ui, rect: egui::Rect, add: impl FnOnce(&m
 pub fn scenes() -> Vec<preview::Scene> {
     let mut all = Vec::new();
     all.extend(gallery::scenes());
+    // The panel.
+    all.extend(crate::panel::scenes::scenes());
     all
 }

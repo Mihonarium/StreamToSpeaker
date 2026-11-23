@@ -27,7 +27,6 @@ pub fn scenes() -> Vec<Scene> {
         Scene { name: "parts-rows", size: [1180.0, 580.0], draw: rows },
         Scene { name: "parts-delay-line", size: [1200.0, 1200.0], draw: delay_line },
         Scene { name: "parts-delay-page", size: [680.0, 550.0], draw: delay_page },
-        Scene { name: "parts-panel", size: [1560.0, 640.0], draw: panel_standins },
         Scene { name: "parts-notices", size: [1060.0, 640.0], draw: notices },
         Scene { name: "parts-inputs", size: [1060.0, 620.0], draw: inputs },
         Scene { name: "parts-cards", size: [700.0, 840.0], draw: cards },
@@ -428,30 +427,6 @@ fn top_standin(ui: &mut Ui, sentence: &str, meter: bool, warn: bool, detail: Opt
     divider(ui);
 }
 
-/// The third line when it is the name of the PC's output.
-fn third_words(ui: &mut Ui, words: &str) {
-    let t = Theme::of(ui.ctx());
-    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
-    ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, words, t.font(size::SECONDARY), t.c.text_secondary);
-}
-
-/// A stand-in for the panel's footer: the help links and the gear.
-fn footer_standin(ui: &mut Ui, hear: bool) {
-    divider(ui);
-    egui::Frame::none().inner_margin(egui::Margin { left: 16.0, right: 12.0, top: 6.0, bottom: 8.0 }).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 16.0;
-            if hear {
-                let _ = Button::link("Can't hear it?").show(ui);
-            }
-            let _ = Button::link("Speaker missing?").show(ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let _ = IconButton::new(Icon::Gear, "Settings").show(ui);
-            });
-        });
-    });
-}
-
 /// A panel-shaped column, 360 points wide, with no inner margin.
 fn simple_panel(ui: &mut Ui, caption: &str, add: impl FnOnce(&mut Ui)) {
     let t = Theme::of(ui.ctx());
@@ -463,75 +438,6 @@ fn simple_panel(ui: &mut Ui, caption: &str, add: impl FnOnce(&mut Ui)) {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 add(ui);
             });
-        });
-    });
-}
-
-fn rows_on(ui: &mut Ui, current: &str, garage: bool, ma: bool) {
-    egui::Frame::none().inner_margin(egui::Margin { left: 4.0, right: 4.0, top: 6.0, bottom: 6.0 }).show(ui, |ui| {
-        let list = [
-            (Icon::Laptop, "This PC"),
-            (Icon::Speaker, "Kitchen"),
-            (Icon::Group, "Living Room + Dining Room"),
-            (Icon::Pair, "Bedroom"),
-            (Icon::Speaker, "Office"),
-        ];
-        for (icon, name) in list {
-            let _ = PlaceRow { current: name == current, menu: name != "This PC", ..PlaceRow::new(icon, name, "") }.show(ui);
-        }
-        if garage {
-            let _ = PlaceRow { dimmed: true, status: Status::Words("Not found"), ..PlaceRow::new(Icon::Speaker, "Garage", "") }.show(ui);
-        }
-        if ma {
-            let _ = PlaceRow::new(Icon::Hub, "Music Assistant", "").show(ui);
-        }
-    });
-}
-
-fn panel_standins(ui: &mut Ui, st: &mut Stage) {
-    let _ = st;
-    ui.add_space(16.0);
-    ui.horizontal_top(|ui| {
-        ui.add_space(16.0);
-        ui.spacing_mut().item_spacing.x = 28.0;
-        let kitchen = view("Kitchen", 150, -50, None);
-        simple_panel(ui, "Playing on a speaker", |ui| {
-            top_standin(ui, "Playing on Kitchen", true, false, None, &[], 32, |ui| {
-                let _ = DelayLine::new(&kitchen, &mut DelayState::default()).show(ui);
-            });
-            rows_on(ui, "Kitchen", true, true);
-            footer_standin(ui, true);
-        });
-        simple_panel(ui, "Changing the delay", |ui| {
-            top_standin(ui, "Playing on Kitchen", true, false, None, &[], 32, |ui| {
-                let _ = DelayLine::new(&kitchen, &mut DelayState::opened()).show(ui);
-            });
-            rows_on(ui, "Kitchen", true, true);
-            footer_standin(ui, true);
-        });
-        simple_panel(ui, "Sound on this PC", |ui| {
-            top_standin(ui, "Sound is on this PC", false, false, None, &[], 40, |ui| third_words(ui, "Speakers (Realtek Audio)"));
-            rows_on(ui, "This PC", true, false);
-            footer_standin(ui, false);
-        });
-        simple_panel(ui, "A problem", |ui| {
-            top_standin(
-                ui,
-                "Can't find Kitchen right now",
-                false,
-                true,
-                Some("Your sound stays on this PC. It goes to Kitchen when Kitchen is found, unless something plays here first."),
-                &["Stay on this PC"],
-                40,
-                |ui| third_words(ui, "Speakers (Realtek Audio)"),
-            );
-            egui::Frame::none().inner_margin(egui::Margin { left: 4.0, right: 4.0, top: 6.0, bottom: 6.0 }).show(ui, |ui| {
-                let _ = PlaceRow { current: true, ..PlaceRow::new(Icon::Laptop, "This PC", "") }.show(ui);
-                let _ = PlaceRow { dimmed: true, status: Status::Words("Not found"), ..PlaceRow::new(Icon::Speaker, "Kitchen", "") }.show(ui);
-                let _ = PlaceRow::new(Icon::Group, "Living Room + Dining Room", "").show(ui);
-                let _ = PlaceRow::new(Icon::Pair, "Bedroom", "").show(ui);
-            });
-            footer_standin(ui, false);
         });
     });
 }

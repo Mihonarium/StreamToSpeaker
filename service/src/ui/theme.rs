@@ -388,7 +388,9 @@ pub fn style_for(style: &mut egui::Style, t: &Theme) {
     s.interact_size = Vec2::new(40.0, 24.0);
     s.menu_margin = egui::Margin::same(space::XS);
     s.window_margin = egui::Margin::same(space::L);
-    s.scroll = egui::style::ScrollStyle::floating();
+    // Windows 11's scroll bar: a thin line while the pointer is elsewhere,
+    // so a list that scrolls says so, wider under the pointer.
+    s.scroll = egui::style::ScrollStyle { dormant_handle_opacity: 0.45, floating_width: 2.0, bar_width: 6.0, ..egui::style::ScrollStyle::floating() };
     // Windows' own controls change state in about 80 ms.
     style.animation_time = 0.083;
 }
