@@ -319,6 +319,74 @@ fn a_speaker_refilling_its_buffer_is_not_taken() {
     rig.settle();
 }
 
+/// A UPnP speaker that stops fetching the stream (it was switched off, or
+/// restarted) has dropped out: it is tried again, and plays once it takes
+/// the stream again. One stopped at the speaker is left alone.
+#[test]
+fn a_upnp_speaker_that_stops_fetching_is_tried_again() {
+    let fake = plain_renderer();
+    let mut rig = Rig::on(serving_app());
+    let id = add_speaker(&rig.app, &fake);
+    rig.play(Surface::Panel, &id).unwrap();
+    rig.plays_on(&id);
+    rig.settle();
+    let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let silence = || crate::http_server::PcmFrame(Arc::new(vec![0; 4]));
+
+    // It fetches the stream, then its connection goes.
+    let t0 = Instant::now();
+    let fetch = rig.app.hub.subscribe_from(loopback);
+    rig.driver.look_at(t0);
+    drop(fetch);
+    rig.app.hub.publish(silence());
+    rig.driver.look_at(t0 + Duration::from_secs(2));
+    assert!(matches!(rig.state(), NowState::Ready { .. } | NowState::Playing { .. }), "{:?}", rig.state());
+    rig.driver.look_at(t0 + UPNP_GONE_AFTER + Duration::from_secs(1));
+    assert!(matches!(rig.state(), NowState::NotResponding { .. }), "{:?}", rig.state());
+
+    // The first quick try connects to it again.
+    let plays = |fake: &FakeRenderer| fake.soap_actions().iter().filter(|a| *a == "Play").count();
+    assert_eq!(plays(&fake), 1);
+    let tried = tick_at(&mut rig, t0 + UPNP_GONE_AFTER + Duration::from_secs(4));
+    assert_eq!(tried, 1);
+    rig.plays_on(&id);
+    rig.settle();
+    assert_eq!(plays(&fake), 2);
+    assert_eq!(rig.bound_in_app().as_deref(), Some(id.as_str()));
+
+    // Stopped at the speaker: not a dropout.
+    let t1 = Instant::now();
+    let fetch = rig.app.hub.subscribe_from(loopback);
+    rig.driver.look_at(t1);
+    rig.app.note_transport(crate::gena::TransportChange { state: Some("STOPPED".into()), uri: None });
+    drop(fetch);
+    rig.app.hub.publish(silence());
+    rig.driver.look_at(t1 + Duration::from_secs(1));
+    rig.driver.look_at(t1 + UPNP_GONE_AFTER * 3);
+    assert!(!matches!(rig.state(), NowState::NotResponding { .. }), "{:?}", rig.state());
+    rig.send(Surface::Panel, Command::Play(Place::ThisPc)).unwrap();
+    rig.settle();
+}
+
+/// A UPnP speaker that took Play but never fetched the stream isn't
+/// taking the sound, and the state says so.
+#[test]
+fn a_upnp_speaker_that_never_fetches_is_not_taking_the_sound() {
+    let fake = plain_renderer();
+    let mut rig = Rig::on(serving_app());
+    let id = add_speaker(&rig.app, &fake);
+    rig.play(Surface::Panel, &id).unwrap();
+    rig.plays_on(&id);
+    rig.settle();
+    let t0 = Instant::now();
+    rig.driver.look_at(t0);
+    assert!(!matches!(rig.state(), NowState::NotTaking { .. }));
+    rig.driver.look_at(t0 + UPNP_NOT_TAKING_AFTER + Duration::from_secs(1));
+    assert!(matches!(rig.state(), NowState::NotTaking { .. }), "{:?}", rig.state());
+    rig.send(Surface::Panel, Command::Play(Place::ThisPc)).unwrap();
+    rig.settle();
+}
+
 // ---- a receiver announcing another speaker's identity -----------------
 
 const KITCHEN: &str = "airplay:B8E93735AC11";

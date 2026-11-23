@@ -263,6 +263,16 @@ impl StreamHub {
         self.subscribers.lock().unwrap().len()
     }
 
+    /// Whether one of `peers` is fetching a stream now.
+    pub fn has_listener_from(&self, peers: &[IpAddr]) -> bool {
+        let peers: Vec<IpAddr> = peers.iter().copied().map(canonical_ip).collect();
+        self.subscribers
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.peer.is_some_and(|p| peers.contains(&canonical_ip(p))))
+    }
+
     /// Note that `peer` started fetching `profile`'s stream.
     fn note_fetch(&self, peer: IpAddr, profile: StreamProfile) {
         let mut f = self.fetches.lock().unwrap();

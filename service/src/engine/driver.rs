@@ -32,6 +32,23 @@ const LOOK_EVERY: Duration = Duration::from_millis(250);
 const LIST_EVERY: Duration = Duration::from_secs(1);
 /// A level is remembered for its speaker once it has held this long.
 const LEVEL_SETTLES: Duration = Duration::from_secs(2);
+/// A UPnP speaker that stopped fetching the stream for this long has
+/// dropped out (its own reconnects take far less).
+const UPNP_GONE_AFTER: Duration = Duration::from_secs(4);
+/// A UPnP speaker that took Play but hasn't fetched the stream this long
+/// after isn't taking the sound.
+const UPNP_NOT_TAKING_AFTER: Duration = Duration::from_secs(10);
+
+/// What the engine follows of a bound UPnP speaker's fetch of the stream.
+struct UpnpFetch {
+    /// The session it belongs to.
+    given_at: Instant,
+    /// When it was last seen fetching.
+    seen: Option<Instant>,
+    /// Its transport's last state from its events.
+    state: Option<String>,
+    not_taking_since: Option<LocalTime>,
+}
 
 pub(crate) enum Input {
     Command(Surface, Command, Reply),
@@ -177,6 +194,7 @@ pub(crate) struct Driver {
     level: Option<(String, u8, Instant)>,
     /// Connect and release threads still running.
     threads: Vec<std::thread::JoinHandle<()>>,
+    upnp: Option<UpnpFetch>,
 }
 
 impl Driver {
@@ -205,6 +223,7 @@ impl Driver {
             handback: None,
             level: None,
             threads: Vec::new(),
+            upnp: None,
         }
     }
 
@@ -553,7 +572,7 @@ impl Driver {
             default_output,
             our_output,
             delay_reconnect,
-            not_taking_since: None,
+            not_taking_since: self.upnp.as_ref().and_then(|u| u.not_taking_since),
             ma_connected,
             ma_playing,
             ma_room: None,
@@ -596,14 +615,26 @@ impl Driver {
     /// What the session says by itself: it dropped, someone else took it,
     /// the speaker re-buffers; and a session bound by another path.
     pub(crate) fn look(&mut self) {
-        let now = Instant::now();
+        self.look_at(Instant::now());
+    }
+
+    /// [`Self::look`] at `now`.
+    pub(crate) fn look_at(&mut self, now: Instant) {
         let app = self.app.clone();
         let reconnecting_for_delay = app
             .delay_status()
             .is_some_and(|d| matches!(d.progress, crate::delay::Progress::Reconnecting { .. }));
-        let info = {
+        let (info, fetch) = {
             let guard = app.session.lock().unwrap();
-            guard.as_ref().map(|s| (s.stable_id(), s.is_dead(), s.final_fault(), s.ended_by_speaker(), upnp_info(s)))
+            let info =
+                guard.as_ref().map(|s| (s.stable_id(), s.is_dead(), s.final_fault(), s.ended_by_speaker(), upnp_info(s)));
+            let fetch = match guard.as_ref() {
+                Some(crate::app::ActiveSession::Upnp(r)) => {
+                    Some((r.stream_given_at, r.played_at, r.renderer.stream_peers()))
+                }
+                _ => None,
+            };
+            (info, fetch)
         };
         let mut events = Vec::new();
         match (&info, self.core.bound().cloned()) {
@@ -622,8 +653,45 @@ impl Driver {
             }
             _ => {}
         }
+        let bound_here = matches!((&info, self.core.bound()), (Some((id, ..)), Some(b)) if place_of(id) == *b);
+        match fetch {
+            Some((given_at, played_at, peers)) if bound_here => {
+                if self.upnp.as_ref().map(|u| u.given_at) != Some(given_at) {
+                    self.upnp = Some(UpnpFetch { given_at, seen: None, state: None, not_taking_since: None });
+                }
+                let u = self.upnp.as_mut().expect("set above");
+                if app.hub.has_listener_from(&peers) {
+                    u.seen = Some(now);
+                    u.not_taking_since = None;
+                } else {
+                    // Stopped or paused at the speaker: someone there did
+                    // it, not a dropout.
+                    let stopped_there =
+                        matches!(u.state.as_deref(), Some("STOPPED" | "PAUSED_PLAYBACK" | "NO_MEDIA_PRESENT"));
+                    match u.seen {
+                        Some(seen)
+                            if now.saturating_duration_since(seen) >= UPNP_GONE_AFTER
+                                && !stopped_there
+                                && !reconnecting_for_delay =>
+                        {
+                            events.push(Event::Dropped)
+                        }
+                        None if now.saturating_duration_since(played_at) >= UPNP_NOT_TAKING_AFTER
+                            && u.not_taking_since.is_none() =>
+                        {
+                            u.not_taking_since = Some(local_time());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => self.upnp = None,
+        }
         if let Some(change) = app.take_transport_change() {
             let state = change.state.as_deref().unwrap_or_default().to_ascii_uppercase();
+            if let (Some(u), false) = (self.upnp.as_mut(), state.is_empty()) {
+                u.state = Some(state.clone());
+            }
             if state == "TRANSITIONING" {
                 app.delay.catch_up().speaker_rebuffered();
             }
