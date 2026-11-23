@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+pub use crate::model::facts::OutputKind;
 pub use crate::model::PcOutputId;
 
 pub mod fake;
@@ -22,6 +23,22 @@ pub struct OutputInfo {
     pub friendly: String,
     /// The endpoint's own name, e.g. "Speakers", "Headphones".
     pub name: String,
+    /// The device it belongs to, e.g. "Realtek Audio".
+    pub device: String,
+    pub kind: OutputKind,
+}
+
+impl OutputInfo {
+    /// The model's view of it.
+    pub fn to_model(&self) -> crate::model::facts::PcOutput {
+        crate::model::facts::PcOutput {
+            id: self.id.clone(),
+            friendly: self.friendly.clone(),
+            name: self.name.clone(),
+            device: self.device.clone(),
+            kind: self.kind,
+        }
+    }
 }
 
 /// The roles Windows keeps a default output for.
@@ -47,6 +64,8 @@ pub trait Outputs: Send + Sync {
     fn our_output(&self) -> Option<PcOutputId>;
     /// Windows' names for an output; `None` once it is gone.
     fn describe(&self, id: &PcOutputId) -> Option<OutputInfo>;
+    /// Every output that is switched on, this app's own among them.
+    fn list(&self) -> Vec<OutputInfo>;
     /// Make `id` Windows' default output for `roles`. The caller reads the
     /// default back to know whether Windows took it.
     fn set_default(&self, id: &PcOutputId, roles: &[Role]) -> Result<(), String>;
@@ -149,6 +168,9 @@ impl Outputs for Passive {
     }
     fn describe(&self, _: &PcOutputId) -> Option<OutputInfo> {
         None
+    }
+    fn list(&self) -> Vec<OutputInfo> {
+        Vec::new()
     }
     fn set_default(&self, _: &PcOutputId, _: &[Role]) -> Result<(), String> {
         Err("this platform can't switch Windows' output".into())

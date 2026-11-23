@@ -87,6 +87,12 @@ pub enum Scenario {
     FirstRunPick,
     FirstRunHear,
     FirstRunFindIt,
+    /// Kitchen reached two ways (Sonos and AirPlay), Office likewise.
+    Twins,
+    /// This PC with three outputs, the list under it closed.
+    PcOutputsClosed,
+    /// The same, open.
+    PcOutputsOpen,
 }
 
 impl Scenario {
@@ -145,6 +151,9 @@ impl Scenario {
         Scenario::FirstRunPick,
         Scenario::FirstRunHear,
         Scenario::FirstRunFindIt,
+        Scenario::Twins,
+        Scenario::PcOutputsClosed,
+        Scenario::PcOutputsOpen,
     ];
 
     /// The scenario's name, for preview tools and demos ("fell-back").
@@ -205,6 +214,9 @@ impl Scenario {
             FirstRunPick => "first-run-pick",
             FirstRunHear => "first-run-hear",
             FirstRunFindIt => "first-run-find-it",
+            Twins => "twins",
+            PcOutputsClosed => "pc-outputs-closed",
+            PcOutputsOpen => "pc-outputs-open",
         }
     }
 
@@ -521,6 +533,18 @@ impl Sim {
             }
             Command::Release { .. } => {
                 self.to_this_pc();
+                Ok(Effect::Done)
+            }
+            Command::PlayOnPcOutput(output) => {
+                match self.facts.pc.outputs.iter().find(|o| o.id == output) {
+                    Some(o) => self.facts.pc.output = o.clone(),
+                    None => return Ok(Effect::Done),
+                }
+                self.to_this_pc();
+                Ok(Effect::Done)
+            }
+            Command::ShowPcOutputs(open) => {
+                self.facts.pc.outputs_open = open;
                 Ok(Effect::Done)
             }
             Command::Play(Place::Speaker(id)) => self.play(id, false),
@@ -980,8 +1004,14 @@ fn id(s: &str) -> SpeakerId {
     SpeakerId::new(s)
 }
 
-fn output(id: &str, name: &str, device: &str) -> PcOutput {
-    PcOutput { id: PcOutputId::new(id), friendly: format!("{name} ({device})"), name: name.to_string() }
+fn output(id: &str, name: &str, device: &str, kind: OutputKind) -> PcOutput {
+    PcOutput {
+        id: PcOutputId::new(id),
+        friendly: format!("{name} ({device})"),
+        name: name.to_string(),
+        device: device.to_string(),
+        kind,
+    }
 }
 
 fn speaker(key: &str, name: &str, kind: SpeakerKind, address: &str, own_ms: u32) -> SpeakerFacts {
@@ -997,6 +1027,8 @@ fn speaker(key: &str, name: &str, kind: SpeakerKind, address: &str, own_ms: u32)
         busy: false,
         failure: None,
         question: None,
+        twin: None,
+        last_used: None,
     }
 }
 
@@ -1093,7 +1125,10 @@ fn household(names: Names) -> (Facts, HashMap<SpeakerId, Profile>) {
     let facts = Facts {
         lang: Lang::English,
         state: NowState::OnThisPc,
-        pc: PcFacts { output: output("realtek", "Speakers", "Realtek Audio") },
+        pc: {
+            let speakers = output("realtek", "Speakers", "Realtek Audio", OutputKind::Speakers);
+            PcFacts { outputs: vec![speakers.clone()], output: speakers, outputs_open: false }
+        },
         speakers,
         music_assistant: Some(MaFacts { connected: true, last_seen: None }),
         search: SearchFacts::default(),
@@ -1279,7 +1314,8 @@ fn scenario_facts(scenario: Scenario, names: Names) -> (Facts, HashMap<SpeakerId
             f.state = NowState::LookingFor { speaker: k.clone(), looking: Looking::NotFound(Return::ByItself) };
         }
         WindowsSwitched => {
-            f.pc.output = output("headphones", "Headphones", "WH-1000XM4");
+            f.pc.output = output("headphones", "Headphones", "WH-1000XM4", OutputKind::Headphones);
+            f.pc.outputs.push(f.pc.output.clone());
             f.volume.pc = Some(Level::at(24));
             f.state = NowState::WindowsSwitched { speaker: k.clone(), at: t(21, 50) };
             f.speakers.retain(|s| s.id.as_str() != "garage" && s.id.as_str() != "office");
@@ -1352,6 +1388,46 @@ fn scenario_facts(scenario: Scenario, names: Names) -> (Facts, HashMap<SpeakerId
                 network: Some(NetworkLabel { adapter: "Wi-Fi".into(), network: Some("HomeNet".into()) }),
                 causes: vec![SearchCause::PublicNetwork { network: "HomeNet".into() }],
             };
+        }
+        Twins => {
+            // Kitchen: a Sonos speaker, also reached by AirPlay; played last
+            // by AirPlay. Office: an AirPlay speaker also reached by UPnP,
+            // never played from here.
+            let mut kitchen_airplay = speaker("kitchen-airplay", &f.speakers[0].name, SpeakerKind::AirPlay, "192.168.1.40", 2000);
+            kitchen_airplay.twin = Some(k.clone());
+            kitchen_airplay.last_used = Some(2);
+            f.speakers[0].twin = Some(kitchen_airplay.id.clone());
+            f.speakers[0].last_used = Some(1);
+            let mut office_upnp =
+                speaker("office-upnp", &f.speakers[3].name, SpeakerKind::Other { maker: Some("Denon".into()) }, "192.168.1.43", 300);
+            office_upnp.twin = Some(office.clone());
+            f.speakers[3].twin = Some(office_upnp.id.clone());
+            profiles.insert(kitchen_airplay.id.clone(), airplay_profile(30, false, false));
+            profiles.insert(
+                office_upnp.id.clone(),
+                Profile {
+                    applies: Applies::Live,
+                    range: SONOS,
+                    choice: None,
+                    fixed_on_steady: false,
+                    level: Level::at(30),
+                    needs_code: false,
+                },
+            );
+            let airplay_kitchen = kitchen_airplay.id.clone();
+            f.speakers.push(kitchen_airplay);
+            f.speakers.push(office_upnp);
+            play_on(&mut f, &profiles, &airplay_kitchen, &apps);
+        }
+        PcOutputsClosed | PcOutputsOpen => {
+            let speakers = output("realtek", "Speakers", "Realtek Audio", OutputKind::Speakers);
+            f.pc.outputs = vec![
+                speakers.clone(),
+                output("headphones", "Headphones", "Realtek Audio", OutputKind::Headphones),
+                output("lg-tv", "LG TV", "NVIDIA High Definition Audio", OutputKind::Display),
+            ];
+            f.pc.output = speakers;
+            f.pc.outputs_open = scenario == PcOutputsOpen;
         }
         CrowdedNetwork => {
             let desk = speaker("desk-office", "Desk", SpeakerKind::Sonos, "10.0.4.20", 200);

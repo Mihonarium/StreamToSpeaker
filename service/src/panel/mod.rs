@@ -395,21 +395,23 @@ fn delay(ui: &mut Ui, d: &PanelDelay, state: &mut crate::ui::delay::DelayState, 
         DelayBody::Fixed { text, action } => Some((text.as_str(), action.label.as_str())),
         DelayBody::Buttons { .. } => None,
     };
-    // The line under the buttons: its own action, then Reset.
+    // The line under the buttons: what matters now with its action, else
+    // the change; then Reset.
     let mut links: Vec<&ModelButton> = Vec::new();
-    if let Some(a) = d.line.as_ref().and_then(|l| l.action.as_ref()) {
+    if let Some(a) = d.note.as_ref().and_then(|l| l.action.as_ref()) {
         links.push(a);
     }
     if let Some(r) = &d.reset {
         links.push(r);
     }
-    let line = match &d.line {
-        Some(l) => {
+    let line = match (&d.note, &d.change) {
+        (Some(l), _) => {
             let (mark, tone) = mark_and_tone(l.tone);
             Some(LineNote { text: &l.text, mark, tone, links: links.iter().map(|b| b.label.as_str()).collect() })
         }
-        None if !links.is_empty() => Some(LineNote { text: "", mark: Mark::None, tone: Tone::Secondary, links: links.iter().map(|b| b.label.as_str()).collect() }),
-        None => None,
+        (None, Some(change)) => Some(LineNote { text: change, mark: Mark::None, tone: Tone::Secondary, links: links.iter().map(|b| b.label.as_str()).collect() }),
+        (None, None) if !links.is_empty() => Some(LineNote { text: "", mark: Mark::None, tone: Tone::Secondary, links: links.iter().map(|b| b.label.as_str()).collect() }),
+        (None, None) => None,
     };
     let words = LineWords { label: &d.label, value: &d.value, value_is_figure: !d.reconnecting, spoken: &d.spoken, steps, fixed, line };
     let Some(action) = delay_line(ui, &words, state) else { return };
@@ -647,6 +649,8 @@ fn draw_list(ui: &mut Ui, snap: &Snapshot, st: &mut PanelState, room: f32, out: 
 fn row_icon(icon: RowIcon) -> Icon {
     match icon {
         RowIcon::Pc => Icon::Laptop,
+        RowIcon::Headphones => Icon::Headphones,
+        RowIcon::Display => Icon::Monitor,
         RowIcon::Speaker => Icon::Speaker,
         RowIcon::Group => Icon::Group,
         RowIcon::HomePodPair => Icon::Pair,

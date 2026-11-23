@@ -395,10 +395,12 @@ fn longer(snap: &Snapshot) -> Snapshot {
                     longer_button(action);
                 }
             }
-            if let Some(l) = &mut d.line {
+            if let Some(l) = &mut d.note {
                 third_longer(&mut l.text);
                 l.action.iter_mut().for_each(longer_button);
             }
+            d.change.iter_mut().for_each(third_longer);
+            d.other_amount.iter_mut().for_each(third_longer);
             d.reset.iter_mut().for_each(longer_button);
         }
         None => {}

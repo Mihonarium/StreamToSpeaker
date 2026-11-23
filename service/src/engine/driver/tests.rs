@@ -9,9 +9,9 @@ use crate::airplay::AirPlayDiscoveryState;
 use crate::app::AppConfig;
 use crate::fake_renderer::{renderer_description, FakeRenderer, Reply, AV_TRANSPORT};
 use crate::manual_speakers::{ManualKind, ManualSpeaker};
-use crate::model::state::SpeakerId;
+use crate::model::state::{PcOutputId, SpeakerId};
 use crate::model::NowState;
-use crate::platform::fake::{FakePlatform, OURS, SPEAKERS};
+use crate::platform::fake::{FakePlatform, HEADPHONES, OURS, SPEAKERS};
 use crate::platform::Role;
 use crate::user_config::UserConfig;
 
@@ -732,4 +732,41 @@ fn picks_leave_no_thread_behind() {
         .unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(text.contains("1 passed"), "the probe didn't run, or failed:\n{text}");
+}
+
+// ---- This PC's outputs ----------------------------------------------------
+
+/// This PC's outputs are Windows' outputs that are switched on, never the
+/// app's own; picking one makes it Windows' output, moves the sound there
+/// from a speaker, and is remembered as what This PC means.
+#[test]
+fn picking_one_of_this_pcs_outputs_moves_the_sound_there() {
+    let fake = plain_renderer();
+    let mut rig = Rig::on(serving_app());
+    let id = add_speaker(&rig.app, &fake);
+    let snapshot = rig.driver.snapshot(2);
+    let listed: Vec<&str> = snapshot.list.pc_outputs.iter().map(|o| o.title.as_str()).collect();
+    assert_eq!(listed, ["Speakers", "Headphones"], "not the app's own, not the one switched off");
+    assert!(snapshot.list.pc_outputs[0].checked);
+
+    rig.play(Surface::Panel, &id).unwrap();
+    rig.plays_on(&id);
+    rig.settle();
+    assert_eq!(windows_default(&rig), OURS);
+
+    rig.send(Surface::Panel, Command::PlayOnPcOutput(PcOutputId::new(HEADPHONES))).unwrap();
+    rig.settle();
+    assert_eq!(windows_default(&rig), HEADPHONES);
+    assert_eq!(rig.bound_in_app(), None);
+    assert_eq!(fake.soap_actions().last().map(String::as_str), Some("Stop"));
+    assert_eq!(rig.driver.core.pc_output, Some(PcOutputId::new(HEADPHONES)));
+    rig.driver.look();
+    assert_eq!(rig.app.user_config.lock().unwrap().pc_output.as_deref(), Some(HEADPHONES));
+    let snapshot = rig.driver.snapshot(3);
+    assert_eq!(snapshot.list.this_pc.second, "Headphones (WH-1000XM4)");
+
+    // Open or closed is remembered.
+    rig.send(Surface::Panel, Command::ShowPcOutputs(true)).unwrap();
+    assert!(rig.app.user_config.lock().unwrap().pc_outputs_open);
+    assert!(rig.driver.snapshot(4).list.this_pc.chevron.as_ref().unwrap().open);
 }

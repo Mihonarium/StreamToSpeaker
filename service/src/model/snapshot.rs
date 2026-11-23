@@ -173,7 +173,7 @@ pub struct Top {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Third {
     Text(String),
-    /// A speaker's delay: a closed line that opens.
+    /// A speaker's delay: the block, always open.
     Delay(PanelDelay),
 }
 
@@ -674,7 +674,7 @@ fn top(facts: &Facts, now: &NowCard, view: Option<&DelayView>) -> Top {
                         ApplyingDelay { from_ms, to_ms, .. } => Some((*from_ms, *to_ms)),
                         _ => None,
                     };
-                    Some(Third::Delay(panel_delay(lang, &v.name, v.delay, control, facts.delay_steps, reconnecting)))
+                    Some(Third::Delay(panel_delay(lang, v, control, reconnecting)))
                 }
                 _ if state.current_place() == Some(Place::ThisPc) => {
                     let first_time = *state == OnThisPc && facts.remembered == Remembered::Nothing;

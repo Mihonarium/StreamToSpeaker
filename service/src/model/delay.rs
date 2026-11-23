@@ -297,7 +297,7 @@ fn spoken_head(lang: Lang, name: &str, fig: Figure, change: i32) -> String {
 /// The delay control for one speaker, whole: the head line with what was
 /// removed or added and ↺, the four buttons, and the line under them. The
 /// phone remote and a speaker's page draw this; the panel draws
-/// [`PanelDelay`].
+/// [`PanelDelay`], always open.
 pub fn delay_control(
     lang: Lang,
     name: &str,
@@ -336,8 +336,11 @@ pub fn delay_control(
     }
 }
 
-/// The delay in the panel: one closed line, *Delay  about 0.15 s*, that
-/// opens to the four buttons and one line under them.
+/// The delay in the panel, always open while the place is a speaker whose
+/// delay can be changed: the line *Delay  about 0.15 s*, the four buttons,
+/// and under them one line with what was removed or added and *Reset* at
+/// the left and *Other amount…* at the right, which opens the amount field
+/// in place of the buttons.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelDelay {
     /// "Delay".
@@ -348,16 +351,26 @@ pub struct PanelDelay {
     /// The value says a reconnect is applying a change (a phrase, not a
     /// figure).
     pub reconnecting: bool,
-    /// The closed line, spoken (the keys work on it closed).
+    /// The head line, spoken (the keys work on the block).
     pub spoken: String,
-    /// What opening shows.
+    /// The four buttons, or where the delay can't be changed yet the
+    /// sentence and *Use Short delay*.
     pub body: DelayBody,
-    /// The line under the buttons: what was removed or added, or what
-    /// matters more right now (a limit, a change being applied).
-    pub line: Option<DelayLine>,
-    /// *Reset*: back to the speaker's own delay, while something is
-    /// removed or added.
+    /// What matters right now, between the buttons and the bottom line: a
+    /// limit, a change being applied, a change that didn't hold.
+    pub note: Option<DelayLine>,
+    /// The bottom line's left end: "50 ms removed"; nothing at the
+    /// speaker's own delay.
+    pub change: Option<String>,
+    /// *Reset*, beside `change`: back to the speaker's own delay.
     pub reset: Option<Button>,
+    /// *Other amount…*, the bottom line's right end; nothing where the
+    /// delay can't be changed.
+    pub other_amount: Option<String>,
+    /// The amount field as it opens, before a digit is typed. As digits
+    /// are typed, [`amount_field`] with the snapshot's
+    /// [`delay`](super::Snapshot::delay) gives its words.
+    pub amount: Option<AmountField>,
     /// Announced after each change.
     pub spoken_total: String,
     /// Announced when a change that was still applying is done.
@@ -368,16 +381,18 @@ pub struct PanelDelay {
 /// AirPlay speaker is reconnecting to apply while playing (from, to).
 pub fn panel_delay(
     lang: Lang,
-    name: &str,
-    delay: SpeakerDelay,
+    view: &DelayView,
     facts: &DelayFacts,
-    steps: DelaySteps,
     reconnecting: Option<(i32, i32)>,
 ) -> PanelDelay {
+    let name = view.name.as_str();
+    let delay = view.delay;
+    let steps = view.steps;
     let id = &facts.speaker;
     let fig = figure(delay);
     let change = shown_change(delay, facts);
-    let (value, line) = match reconnecting {
+    let fixed = facts.applies == Applies::Fixed;
+    let (value, note) = match reconnecting {
         Some((from, to)) => {
             let (value, sentence) = if to == 0 {
                 (t!(lang, DelayReconnectingOwn, speaker = name), t!(lang, ApplyingOwn, speaker = name))
@@ -390,18 +405,9 @@ pub fn panel_delay(
             };
             (value, Some(DelayLine { text: sentence, tone: Tone::Busy, action: None }))
         }
-        None => {
-            let line = if facts.applies == Applies::Fixed {
-                None
-            } else {
-                // No symptom hint in the panel; what was removed or added is
-                // the line when nothing matters more.
-                delay_line(lang, name, change, facts, steps, true).or_else(|| {
-                    change_text(lang, change).map(|text| DelayLine { text, tone: Tone::Plain, action: None })
-                })
-            };
-            (figure_text(lang, fig), line)
-        }
+        // No symptom hint in the panel: the bottom line says what was
+        // removed or added.
+        None => (figure_text(lang, fig), if fixed { None } else { delay_line(lang, name, change, facts, steps, true) }),
     };
     let spoken_total = spoken_change(lang, change, name);
     PanelDelay {
@@ -410,7 +416,8 @@ pub fn panel_delay(
         reconnecting: reconnecting.is_some(),
         spoken: spoken_panel_head(lang, name, fig, change),
         body: delay_body(lang, name, change, facts, steps),
-        line,
+        note,
+        change: change_text(lang, change),
         reset: (change != 0).then(|| Button {
             label: t!(lang, Reset),
             spoken: Some(t!(lang, BackToOwn, speaker = name)),
@@ -418,6 +425,8 @@ pub fn panel_delay(
             style: ButtonStyle::Link,
             enabled: true,
         }),
+        other_amount: (!fixed).then(|| t!(lang, OtherAmount)),
+        amount: (!fixed).then(|| amount_field(lang, view, None, Enter::Remove)),
         spoken_done: t!(lang, SpokenDone, result = &spoken_total),
         spoken_total,
     }
