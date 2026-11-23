@@ -817,11 +817,22 @@ fn no_sign_in(_: bool) -> Result<(), String> {
 #[test]
 fn first_run_walks_from_the_pick_to_done() {
     let fake = plain_renderer();
+    let other = plain_renderer();
     let mut rig = Rig::on(serving_app());
     let id = add_speaker(&rig.app, &fake);
+    let scripted = add_speaker(&rig.app, &other);
     rig.driver.first_run = Some(FirstRun::Pick);
     rig.driver.start_at_sign_in = no_sign_in;
-    assert_eq!(rig.driver.snapshot(2).first_run.is_some(), true);
+    assert!(rig.driver.snapshot(2).first_run.is_some());
+
+    // A script's pick (the web API) plays no chime and leaves first run
+    // where it is.
+    rig.play(Surface::Api, &scripted).unwrap();
+    rig.plays_on(&scripted);
+    rig.settle();
+    rig.driver.look();
+    assert_eq!(rig.driver.first_run, Some(FirstRun::Pick));
+    assert!(!rig.app.test_sound_playing());
 
     rig.play(Surface::Panel, &id).unwrap();
     rig.plays_on(&id);

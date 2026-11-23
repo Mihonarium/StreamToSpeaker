@@ -233,6 +233,8 @@ pub(crate) struct Driver {
     first_run_paused: bool,
     /// Play the test sound once this speaker plays.
     chime_when_bound: Option<crate::model::SpeakerId>,
+    /// The speaker picked in the panel during first run's first step.
+    first_run_pick: Option<crate::model::SpeakerId>,
     /// Turns starting at sign-in on or off (Windows' Run key; tests use
     /// their own).
     pub(crate) start_at_sign_in: fn(bool) -> Result<(), String>,
@@ -269,6 +271,7 @@ impl Driver {
             first_run: None,
             first_run_paused: false,
             chime_when_bound: None,
+            first_run_pick: None,
             start_at_sign_in: crate::autostart::set_enabled,
         }
     }
@@ -340,6 +343,11 @@ impl Driver {
                 if origin_of(from) != Origin::Window && app.is_airplay_newcomer(id.as_str()) {
                     info!("refused a pick of {} from {:?}: it announces another speaker's identity", id.as_str(), from);
                     return Err(Refusal::OnlyFromWindow { speaker: id.clone() });
+                }
+                // First run's pick is made in the panel; a script's pick
+                // (the web API, the command line) plays no chime.
+                if self.first_run == Some(FirstRun::Pick) && origin_of(from) == Origin::Window {
+                    self.first_run_pick = Some(id.clone());
                 }
                 self.core_command(cmd, origin_of(from), now)
             }
@@ -504,7 +512,8 @@ impl Driver {
     /// plays once its speaker does.
     fn on_bound(&mut self) {
         let Some(Place::Speaker(id)) = self.core.bound().cloned() else { return };
-        if self.first_run == Some(FirstRun::Pick) {
+        if self.first_run == Some(FirstRun::Pick) && self.first_run_pick.as_ref() == Some(&id) {
+            self.first_run_pick = None;
             self.app.play_test_sound();
             self.first_run = Some(FirstRun::Hear { speaker: id.clone() });
         }
