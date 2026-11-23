@@ -750,10 +750,6 @@ fn run(cli: Cli) -> Result<()> {
         app.follow_endpoint_label(stream_to_speaker::endpoint_name::update_endpoint_name);
     }
 
-    // Auto-reconnect watchdog — replaces a dropped AirPlay session with a
-    // fresh one so the UI never shows a zombie "streaming" state.
-    app.spawn_reconnect_watchdog();
-
     // Once-a-day "newer release on GitHub?" check (Advanced toggle; a
     // dev build without a baked release tag never checks).
     app.spawn_update_checker();
@@ -807,106 +803,34 @@ fn run(cli: Cli) -> Result<()> {
         manual_speakers: app.manual_speakers().len(),
     };
     let choice = launch_choice(&cli, facts);
-    let saved_manual = match &choice {
-        LaunchChoice::Saved(id) => Some(id.clone())
-            .filter(|_| app.is_auto_reconnect_on_launch())
-            .filter(|id| app.find_manual_speaker(id).is_some())
-            .filter(|id| app.auto_connect_allowed_at_launch(id)),
-        _ => None,
-    };
+    // One owner of where the sound plays from here on: the window, the
+    // tray, the web API and the terminal prompt send it commands. It brings
+    // a saved speaker back by its own rule, and gives Windows' sound back
+    // at quit.
+    let engine = stream_to_speaker::engine::Engine::start(
+        app.clone(),
+        stream_to_speaker::platform::Platform::passive(),
+        matches!(choice, LaunchChoice::Saved(_)),
+    );
     if let LaunchChoice::Wish(query) = &choice {
         // In the background: the speaker may not be on the network yet.
         app.connect_when_listed(query.clone());
-    } else if let Some(id) = saved_manual {
-        info!("auto-reconnect: connecting to saved manual speaker {:?}", id);
-        app.connect_in_background(&id);
     } else if let LaunchChoice::Ask = choice {
         match picker::interactive_pick(&app, saved.as_deref())? {
             Some(id) => {
-                if let Err(e) = app.select_speaker(&id) {
+                if let Err(e) = app.select_speaker_from(stream_to_speaker::model::Surface::CommandLine, &id) {
                     warn!("starting initial session failed: {}", e);
                 }
             }
             None => warn!("no speaker selected; pick one with the web UI / POST /api/select"),
         }
-    } else if !cli.no_discovery {
-        let discovery = app.discovery.as_ref().unwrap();
-        let mut pair_wait_started = false;
-        let initial = match choice {
-            LaunchChoice::Wish(_) | LaunchChoice::Ask => None,
-            LaunchChoice::Saved(saved_id) => {
-                if !app.is_auto_reconnect_on_launch() {
-                    info!("auto-reconnect disabled by user preference; saved={:?}", saved_id);
-                    None
-                } else if !app.auto_connect_allowed_at_launch(&saved_id) {
-                    info!("auto-reconnect: {:?} is set to never auto-connect", saved_id);
-                    None
-                } else {
-                    info!("auto-reconnect: trying saved speaker {:?}", saved_id);
-                    // Wait briefly for the first SSDP sweep to populate
-                    // discovery before we look the saved id up.
-                    picker::wait_for_first_discovery(discovery, Duration::from_secs(5));
-                    let found = discovery.find_by_id(&saved_id);
-                    if found.is_none() {
-                        match discovery.identity_conflict(&saved_id) {
-                            Some(addrs) => warn!(
-                                "auto-reconnect skipped: different devices at {:?} all claim to be the saved \
-                                 speaker {:?}; pick the right one by address",
-                                addrs, saved_id
-                            ),
-                            None if !saved_id.starts_with("airplay:") => {
-                                info!("auto-reconnect: saved speaker {:?} not found on the network", saved_id)
-                            }
-                            None => {}
-                        }
-                    }
-                    // A saved HomePod stereo pair (or one of its members): give
-                    // both members time to resolve in the background, then play
-                    // the pair — unless the user picked something meanwhile.
-                    if found.is_none() && saved_id.starts_with("airplay:") {
-                        if let Some(ad) = app.airplay_discovery.clone() {
-                            let app = app.clone();
-                            pair_wait_started = std::thread::Builder::new()
-                                .name("stream-to-speaker-pair-reconnect".into())
-                                .spawn(move || {
-                                    let Some(id) = ad.wait_for_pair(&saved_id, Duration::from_secs(15)) else {
-                                        return;
-                                    };
-                                    if app.session.lock().unwrap().is_some()
-                                        || app.connecting.lock().unwrap().is_some()
-                                    {
-                                        return;
-                                    }
-                                    info!("auto-reconnect: stereo pair {:?}", id);
-                                    app.select_speaker_async(&id);
-                                })
-                                .is_ok();
-                        }
-                    }
-                    found
-                }
-            }
-            LaunchChoice::Nothing => {
-                info!("first launch (no saved speaker) — waiting for manual pick");
-                None
-            }
-        };
-        if let Some(r) = initial {
-            let id = r.stable_id();
-            if let Err(e) = app.select_speaker(&id) {
-                warn!("starting initial session failed: {}", e);
-            }
-        } else if cli.headless && !pair_wait_started {
-            warn!(
-                "no speaker selected; pick one with the GUI / web UI / POST /api/select"
-            );
-        }
+    } else if cli.headless && !matches!(choice, LaunchChoice::Saved(_)) {
+        warn!("no speaker selected; pick one with the GUI / web UI / POST /api/select");
     }
 
-    // Speakers set to connect automatically whenever they appear.
-    app.spawn_auto_connect();
-
     let ran = if cli.headless {
+        let quitting = engine.clone();
+        app.on_quit(move || quitting.quit());
         run_headless(app)
     } else {
         // Keep an existing sign-in entry pointing at this exe.
@@ -914,7 +838,11 @@ fn run(cli: Cli) -> Result<()> {
         // From the moment Quit is chosen, a new launch waits for this copy
         // to end instead of handing over to it: it is about to have no
         // window to show.
-        app.on_quit(stream_to_speaker::single_instance::announce_closing);
+        let quitting = engine.clone();
+        app.on_quit(move || {
+            stream_to_speaker::single_instance::announce_closing();
+            quitting.quit();
+        });
         run_gui_mode(app, cli.no_tray, cli.startup && !cli.no_tray)
     };
     // Nothing plays on a speaker any more: the device's plain name.
@@ -1028,6 +956,7 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
 fn start_http(app: &Arc<App>) -> Result<u16> {
     let gena_callback = {
         let vsync = app.vsync.clone();
+        let transport = app.clone();
         let pusher = build_driver_volume_pusher();
         let pusher = pusher.map(Arc::new);
         // The window's volume slider moves the Windows slider through the
@@ -1037,6 +966,9 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         }
         Arc::new(move |path: &str, body: &str| {
             debug!("GENA NOTIFY on {}: {} bytes", path, body.len());
+            if let Some(change) = stream_to_speaker::gena::parse_transport_notify(body) {
+                transport.note_transport(change);
+            }
             if let Some(change) = parse_rendering_notify(body) {
                 // Set our node's dB to the linear position for the
                 // speaker's percent (Windows then shows the slider at the

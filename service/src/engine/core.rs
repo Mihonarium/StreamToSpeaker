@@ -12,7 +12,7 @@ use crate::model::command::{Command, Effect, Refusal};
 use crate::model::facts::{ComesBack, ConnectFailure, NotificationFacts, NotificationKind, TakeOver};
 use crate::model::rules::{self, AutoMove, MoveFacts, NotifyContext, RetryStep, Trigger};
 use crate::model::state::{
-    AfterTries, Apps, ConnectStage, Dropout, FellBackCause, Looking, NowState, PcOutputId, Place, Return, Secret,
+    AfterTries, Apps, ConnectStage, Dropout, FellBackCause, NowState, PcOutputId, Place, Return, Secret,
     SoundAt, SpeakerId, StayedBecause,
 };
 use crate::model::text::LocalTime;
@@ -22,8 +22,10 @@ use crate::model::text::LocalTime;
 pub struct Job {
     pub gen: u64,
     pub place: Place,
-    /// A person asked for it (a code or password may be asked for).
+    /// A person asked for it (not a retry or a return).
     pub person: bool,
+    /// In the app's own window: a code or password may be asked for.
+    pub interactive: bool,
     /// Ask the speaker first whether it is playing something else.
     pub check_busy: bool,
 }
@@ -255,6 +257,26 @@ impl Core {
         self.bound.as_ref()
     }
 
+    /// Take what plays as it is when another path bound or ended it (a
+    /// delay change's reconnect, a Sendspin pairing answer). Nothing changes
+    /// while a connect of the engine's own is in flight.
+    pub fn adopt(&mut self, place: Option<Place>) {
+        if self.connect.is_some() || self.auto.is_some() || self.bound == place {
+            return;
+        }
+        match (&place, &self.special) {
+            // A dead session stays bound while it is retried.
+            (None, Special::Retrying { .. }) => {}
+            (Some(_), _) => {
+                self.bound = place;
+                if matches!(self.special, Special::Retrying { .. } | Special::Refused) {
+                    self.special = Special::None;
+                }
+            }
+            (None, _) => self.bound = None,
+        }
+    }
+
     /// The generation of the connect a person is waiting on, if any.
     pub fn connecting(&self) -> Option<(u64, &Place)> {
         self.connect.as_ref().map(|c| (c.gen, &c.place))
@@ -367,15 +389,21 @@ impl Core {
         self.gen
     }
 
-    /// A command from a surface. `person` is false for the few commands
-    /// the app sends itself.
-    pub fn command(&mut self, cmd: &Command, w: &World, now: Instant) -> (Result<Effect, Refusal>, Vec<Do>) {
+    /// A command from a surface; `interactive` when it came from the app's
+    /// own window, where a code or password can be asked for.
+    pub fn command(
+        &mut self,
+        cmd: &Command,
+        interactive: bool,
+        w: &World,
+        now: Instant,
+    ) -> (Result<Effect, Refusal>, Vec<Do>) {
         let before = self.state(w, now);
         let mut out = Vec::new();
         match cmd {
-            Command::Play(Place::Speaker(id)) => self.choose(Place::Speaker(id.clone()), false, &mut out),
-            Command::PlayTakingOver(id) => self.choose(Place::Speaker(id.clone()), true, &mut out),
-            Command::Play(Place::MusicAssistant) => self.choose(Place::MusicAssistant, false, &mut out),
+            Command::Play(Place::Speaker(id)) => self.choose(Place::Speaker(id.clone()), false, interactive, &mut out),
+            Command::PlayTakingOver(id) => self.choose(Place::Speaker(id.clone()), true, interactive, &mut out),
+            Command::Play(Place::MusicAssistant) => self.choose(Place::MusicAssistant, false, interactive, &mut out),
             Command::Play(Place::ThisPc) | Command::StayOnThisPc => {
                 self.to_this_pc(&mut out);
                 self.choice = Some(Place::ThisPc);
@@ -408,7 +436,7 @@ impl Core {
     }
 
     /// The person chose `place` (a speaker or Music Assistant).
-    fn choose(&mut self, place: Place, take_over: bool, out: &mut Vec<Do>) {
+    fn choose(&mut self, place: Place, take_over: bool, interactive: bool, out: &mut Vec<Do>) {
         if let Place::Speaker(id) = &place {
             self.failures.remove(id);
             if take_over {
@@ -442,13 +470,13 @@ impl Core {
         self.special = Special::None;
         let gen = self.next_gen();
         self.connect = Some(Connecting { gen, place: place.clone(), from: self.sound_at(), stage: ConnectStage::Finding });
-        out.push(Do::Connect(Job { gen, place, person: true, check_busy: !take_over }));
+        out.push(Do::Connect(Job { gen, place, person: true, interactive, check_busy: !take_over }));
     }
 
     fn auto_connect(&mut self, place: Place, out: &mut Vec<Do>) {
         let gen = self.next_gen();
         self.auto = Some((gen, place.clone()));
-        out.push(Do::Connect(Job { gen, place, person: false, check_busy: true }));
+        out.push(Do::Connect(Job { gen, place, person: false, interactive: false, check_busy: true }));
     }
 
     /// Sound back on this PC, nothing bound, nothing pending.
@@ -456,12 +484,14 @@ impl Core {
         if self.connect.take().is_some() || self.auto.take().is_some() {
             out.push(Do::Supersede);
         }
+        // Windows' output first: the sound is back here before the
+        // speaker stops.
+        self.give_back(out);
         if self.bound.take().is_some() {
             out.push(Do::Release { tell_speaker: true });
         }
         self.special = Special::None;
         self.questions.clear();
-        self.give_back(out);
     }
 
     fn give_back(&mut self, out: &mut Vec<Do>) {
@@ -691,12 +721,12 @@ impl Core {
             (true, None) => {
                 if let Special::Switched { place, release_at: None, .. } = self.special.clone() {
                     // Windows came back after the speaker was let go.
-                    self.choose(place, false, out);
+                    self.choose(place, false, false, out);
                 } else if self.connect.is_none() {
                     // Windows is a second door: picking this app's output
                     // plays on the speaker it is named after.
                     match self.named.clone() {
-                        Some(place @ (Place::Speaker(_) | Place::MusicAssistant)) => self.choose(place, false, out),
+                        Some(place @ (Place::Speaker(_) | Place::MusicAssistant)) => self.choose(place, false, false, out),
                         _ => self.special = Special::Choose,
                     }
                 }

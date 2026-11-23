@@ -749,7 +749,10 @@ pub fn confirmation(lang: Lang, outcome: &Outcome) -> Confirmation {
             small: t!(lang, ConfirmMaDelay),
             warning: false,
         },
-        Ok(Effect::Done) | Err(Refusal::NoDelayHere) | Err(Refusal::UnknownPlace { .. }) => {
+        Ok(Effect::Done)
+        | Err(Refusal::NoDelayHere)
+        | Err(Refusal::UnknownPlace { .. })
+        | Err(Refusal::OnlyFromWindow { .. }) => {
             Confirmation {
                 over: t!(lang, AppName),
                 big: snap.short_status.clone(),
@@ -860,6 +863,9 @@ pub fn refusal_text(lang: Lang, refusal: &Refusal, snap: &Snapshot) -> String {
             t!(lang, RefuseSteady, speaker = snap.speaker_name(speaker))
         }
         Refusal::UnknownPlace { name } => t!(lang, RefuseUnknownPlace, name = name.as_str()),
+        Refusal::OnlyFromWindow { speaker } => {
+            t!(lang, RefuseOnlyFromWindow, speaker = snap.speaker_name(speaker))
+        }
     }
 }
 

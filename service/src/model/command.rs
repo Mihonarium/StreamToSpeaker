@@ -163,6 +163,9 @@ pub enum Refusal {
     FixedOnSteady { speaker: SpeakerId },
     /// `play "name"` named no speaker in the list.
     UnknownPlace { name: String },
+    /// A receiver that announces another speaker's identity plays only
+    /// when a person picks it in the app's own window.
+    OnlyFromWindow { speaker: SpeakerId },
 }
 
 /// What a delay change did, for its confirmation and the command line.

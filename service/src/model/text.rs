@@ -700,6 +700,7 @@ keys! {
     RefuseMaDelay,
     RefuseSteady,
     RefuseUnknownPlace,
+    RefuseOnlyFromWindow,
     NotRunning,
     NoReply,
     PickerHeader,
@@ -1220,6 +1221,7 @@ pub fn english(key: Key) -> Template {
             text("{speaker}: no delay changes on Steady. Use Short delay on {speaker}’s page.")
         }
         RefuseUnknownPlace => text("No speaker called “{name}” is in the list."),
+        RefuseOnlyFromWindow => text("To play to “{speaker}”, pick it in the Stream To Speaker window."),
         NotRunning => text("Stream To Speaker isn’t running."),
         NoReply => text("Stream To Speaker didn’t answer."),
         PickerHeader => text("Stream To Speaker {version} — looking for speakers on {network}…"),

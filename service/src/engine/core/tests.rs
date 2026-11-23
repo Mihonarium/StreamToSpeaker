@@ -1,5 +1,6 @@
 //! The situations the engine has to handle, step by step, on injected time.
 
+use crate::model::state::Looking;
 use super::*;
 use crate::model::command::Command;
 use crate::model::facts::NotificationKind as N;
@@ -41,7 +42,7 @@ impl Run {
         Run { core: Core::new(None, None, now), w: world(), t0: now, now, done: vec![] }
     }
     fn cmd(&mut self, c: Command) -> Vec<Do> {
-        let (_, d) = self.core.command(&c, &self.w, self.now);
+        let (_, d) = self.core.command(&c, true, &self.w, self.now);
         self.done.extend(d.clone());
         d
     }

@@ -629,7 +629,11 @@ impl Sim {
             return;
         }
         match owner {
-            VolumeOwner::PcOutput(_) => f(&mut self.facts.volume.pc),
+            VolumeOwner::PcOutput(_) => {
+                if let Some(l) = self.facts.volume.pc.as_mut() {
+                    f(l)
+                }
+            }
             _ => {
                 if let Some(l) = self.facts.volume.place.as_mut() {
                     f(l)
@@ -1093,7 +1097,7 @@ fn household(names: Names) -> (Facts, HashMap<SpeakerId, Profile>) {
         speakers,
         music_assistant: Some(MaFacts { connected: true, last_seen: None }),
         search: SearchFacts::default(),
-        volume: VolumeFacts { pc: Level::at(40), place: None },
+        volume: VolumeFacts { pc: Some(Level::at(40)), place: None },
         delay: None,
         delay_steps: DelaySteps::default(),
         delay_hint_retired: true,
@@ -1276,7 +1280,7 @@ fn scenario_facts(scenario: Scenario, names: Names) -> (Facts, HashMap<SpeakerId
         }
         WindowsSwitched => {
             f.pc.output = output("headphones", "Headphones", "WH-1000XM4");
-            f.volume.pc = Level::at(24);
+            f.volume.pc = Some(Level::at(24));
             f.state = NowState::WindowsSwitched { speaker: k.clone(), at: t(21, 50) };
             f.speakers.retain(|s| s.id.as_str() != "garage" && s.id.as_str() != "office");
         }

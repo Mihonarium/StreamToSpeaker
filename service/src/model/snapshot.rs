@@ -625,7 +625,7 @@ fn now_card(facts: &Facts, view: Option<&DelayView>) -> NowCard {
 fn volume_row(facts: &Facts, owner: VolumeOwner) -> Option<VolumeRow> {
     let lang = facts.lang;
     let level: Level = match owner {
-        VolumeOwner::PcOutput(_) => facts.volume.pc,
+        VolumeOwner::PcOutput(_) => facts.volume.pc?,
         VolumeOwner::Speaker(_) | VolumeOwner::MusicAssistant => facts.volume.place?,
     };
     let ma = owner == VolumeOwner::MusicAssistant;

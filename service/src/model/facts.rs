@@ -6,7 +6,7 @@ use super::state::{NowState, PcOutputId, Secret, SpeakerId};
 use super::text::{Lang, LocalTime};
 
 /// Everything the everyday surfaces draw at one moment, as facts.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Facts {
     pub lang: Lang,
     pub state: NowState,
@@ -51,7 +51,7 @@ pub enum FirstRun {
 }
 
 /// This PC.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PcFacts {
     /// The output This PC plays on: Windows' default while it isn't this
     /// app's, otherwise the one the app gives the sound back to.
@@ -69,7 +69,7 @@ pub struct PcOutput {
 }
 
 /// A speaker, group or pair the app knows.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SpeakerFacts {
     pub id: SpeakerId,
     /// The name as the speaker's own app shows it (or the person's *Show
@@ -153,14 +153,14 @@ pub struct TakeOver {
 }
 
 /// Music Assistant, when set up.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MaFacts {
     pub connected: bool,
     pub last_seen: Option<LocalTime>,
 }
 
 /// The search for speakers.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SearchFacts {
     pub phase: SearchPhase,
     /// The network searched, when there is one; `None` for several.
@@ -197,8 +197,8 @@ pub enum SearchCause {
 /// Volume levels the Now card may show; the state decides whose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VolumeFacts {
-    /// This PC's output.
-    pub pc: Level,
+    /// This PC's output, when its level can be read.
+    pub pc: Option<Level>,
     /// The current speaker's own level, or the level sent to Music
     /// Assistant.
     pub place: Option<Level>,
@@ -340,7 +340,7 @@ pub enum Remembered {
 }
 
 /// Background facts for the notice line.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct NoticeFacts {
     /// A newer sound driver is installed but not running.
     pub restart_pending: bool,

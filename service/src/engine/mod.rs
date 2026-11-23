@@ -5,6 +5,10 @@
 
 pub mod cancel;
 pub mod core;
+mod driver;
+mod facts;
+
+pub use driver::{Engine, Opener};
 
 /// How many threads this process has now (Linux; 0 where it can't tell).
 pub fn thread_count() -> usize {

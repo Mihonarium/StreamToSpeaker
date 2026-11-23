@@ -55,6 +55,9 @@ pub struct LanTargets {
     /// Every IPv4 address of this PC's interfaces, including those whose
     /// network isn't in `nets`.
     own: Vec<Ipv4Addr>,
+    /// Tests only: fake receivers listen on loopback.
+    #[cfg(test)]
+    fakes_on_loopback: bool,
 }
 
 /// Why discovery won't send a request to a URL.
@@ -277,7 +280,19 @@ impl LanTargets {
         lan.dedup();
         own.sort();
         own.dedup();
-        Self { nets: lan, own }
+        Self {
+            nets: lan,
+            own,
+            #[cfg(test)]
+            fakes_on_loopback: false,
+        }
+    }
+
+    /// Tests only: also list receivers on loopback, where fakes listen.
+    #[cfg(test)]
+    pub(crate) fn with_fakes_on_loopback(mut self) -> Self {
+        self.fakes_on_loopback = true;
+        self
     }
 
     /// May discovery send a request to `ip`?
@@ -295,6 +310,10 @@ impl LanTargets {
             IpAddr::V6(v6) if v6.is_unspecified() || v6.is_multicast() => return Some(Refusal::NotADevice(ip)),
             IpAddr::V6(_) => return Some(Refusal::Elsewhere(ip)),
         };
+        #[cfg(test)]
+        if self.fakes_on_loopback && v4.is_loopback() {
+            return None;
+        }
         if v4.is_loopback() || self.own.contains(&v4) {
             return Some(Refusal::ThisPc(ip));
         }
