@@ -37,6 +37,7 @@ pub mod web_access;
 pub mod gui_layout;
 pub mod ui;
 pub mod panel;
+pub mod shell;
 pub mod fonts;
 pub mod manual_speakers;
 pub mod discovery_net;

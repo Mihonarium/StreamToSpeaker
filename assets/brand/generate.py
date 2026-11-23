@@ -56,7 +56,7 @@ def arc(cx, cy, r, a0, a1):
     return f"M {x0:.1f} {y0:.1f} A {r} {r} 0 0 1 {x1:.1f} {y1:.1f}"
 
 
-def laptop(sw):
+def laptop(sw, ink=INK):
     """Screen outline and base wedge.
 
     Every number here was fitted rather than chosen: fit.mjs renders this
@@ -68,7 +68,7 @@ def laptop(sw):
     of adjusting these by hand.
     """
     return (
-        f'<g fill="none" stroke="{INK}" stroke-width="{sw}" '
+        f'<g fill="none" stroke="{ink}" stroke-width="{sw}" '
         f'stroke-linejoin="round" stroke-linecap="round">'
         f'<rect x="43" y="133" width="94" height="66" rx="3"/>'
         f'<path d="M 43 199 L 137 199 '
@@ -78,7 +78,7 @@ def laptop(sw):
     )
 
 
-def arcs(colour, sw):
+def arcs(colour, sw, opacities=(1, 1, 1)):
     """Three concentric sweeps, centre and radii fitted to the reference.
 
     The radii are evenly spaced and the arcs share one angular span. A later
@@ -90,8 +90,8 @@ def arcs(colour, sw):
     cx, cy = 97, 160
     return "".join(
         f'<path d="{arc(cx, cy, r, 82, 9)}" fill="none" stroke="{colour}" '
-        f'stroke-width="{sw}" stroke-linecap="round"/>'
-        for r in (71, 101, 131)
+        f'stroke-width="{sw}" stroke-linecap="round"' + (f' opacity="{o}"' if o != 1 else "") + "/>"
+        for r, o in zip((71, 101, 131), opacities)
     )
 
 
@@ -108,4 +108,47 @@ for family, sw, arc_sw in [("app", 11, 15), ("tray", 13, 17)]:
 
 write(f"{OUT}/app-brand.svg", laptop(11) + arcs(CORAL, 15))
 
-print("wrote 7 svgs to", OUT)
+# The tray icon of the panel by the clock: the arcs say where the sound
+# is (ink: this PC; green: a speaker; green with the two outer arcs faint:
+# connecting), and a badge that differs in shape as well as colour says
+# something needs a look (amber "!") or doesn't work (red "x"). Each in a
+# version for a light taskbar and one for a dark taskbar, where the ink
+# turns light and the green brighter.
+TASKBARS = {
+    "light": {"ink": INK, "green": GREEN_WAITING, "ring": "#f0f0f0"},
+    "dark": {"ink": "#c9ccf4", "green": "#3ddc84", "ring": "#202020"},
+}
+PLACES = {
+    "pc": lambda t: arcs(t["ink"], 17),
+    "connecting": lambda t: arcs(t["green"], 17, (1, 0.35, 0.15)),
+    "speaker": lambda t: arcs(t["green"], 17),
+}
+
+
+def badge(kind, ring):
+    """A round badge in the bottom right corner, ringed in the taskbar's
+    colour so it stands off the mark."""
+    cx = cy = 196
+    if kind == "attention":
+        fill, mark = "#f2a900", (
+            '<path d="M 196 160 L 196 202" stroke="#1b1b1b" stroke-width="18" stroke-linecap="round"/>'
+            '<circle cx="196" cy="230" r="10" fill="#1b1b1b"/>'
+        )
+    else:
+        fill, mark = "#c42b1c", (
+            '<path d="M 174 174 L 218 218 M 218 174 L 174 218" stroke="#ffffff" stroke-width="16" stroke-linecap="round"/>'
+        )
+    return f'<circle cx="{cx}" cy="{cy}" r="58" fill="{fill}" stroke="{ring}" stroke-width="12"/>' + mark
+
+
+count = 7
+for taskbar, t in TASKBARS.items():
+    for place, draw in PLACES.items():
+        for kind in ("none", "attention", "failure"):
+            body = laptop(13, t["ink"]) + draw(t)
+            if kind != "none":
+                body += badge(kind, t["ring"])
+            write(f"{OUT}/panel-tray-{place}-{kind}-{taskbar}.svg", body)
+            count += 1
+
+print("wrote", count, "svgs to", OUT)

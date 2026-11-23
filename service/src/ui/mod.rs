@@ -34,5 +34,6 @@ pub fn scenes() -> Vec<preview::Scene> {
     all.extend(gallery::scenes());
     // The panel.
     all.extend(crate::panel::scenes::scenes());
+    all.extend(crate::shell::scenes::scenes());
     all
 }
