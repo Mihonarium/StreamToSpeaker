@@ -183,6 +183,8 @@ pub struct UserConfig {
     /// an AirPlay 2 receiver is driven realtime automatically, since the
     /// buffered stream holds seconds regardless of what we ask. Clamped
     /// to [`AIRPLAY_LATENCY_MS_MIN`]..=[`AIRPLAY_LATENCY_MS_MAX`] on read.
+    /// Used for every AirPlay speaker whose delay hasn't been changed with
+    /// the delay controls; one that has keeps its own (see `delay`).
     #[serde(default = "default_airplay_latency_ms")]
     pub airplay_latency_ms: u32,
     /// HomePods (single, `model AudioAccessory*`) normally stream with the
@@ -195,6 +197,8 @@ pub struct UserConfig {
     /// Playout delay requested from HomePods on the realtime profile, in
     /// ms (the stream's pinned `latencyMin`/`latencyMax`). Clamped to
     /// [`HOMEPOD_LATENCY_MS_MIN`]..=[`HOMEPOD_LATENCY_MS_MAX`] on read.
+    /// Like `airplay_latency_ms`, for HomePods without a delay of their
+    /// own.
     #[serde(default = "default_homepod_latency_ms")]
     pub airplay_homepod_latency_ms: u32,
     /// Once-a-day check for a newer release on GitHub (Advanced toggle).

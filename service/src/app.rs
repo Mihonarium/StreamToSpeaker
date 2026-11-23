@@ -967,8 +967,8 @@ impl App {
         airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     ) -> Arc<Self> {
         let web_initial = config.web_enabled;
-        // Delays kept as an earlier version kept them become each speaker's
-        // own, once (see `delay::upgrade`).
+        // The extra delay earlier versions gave every Sendspin speaker
+        // becomes each paired speaker's own, once (see `delay::upgrade`).
         let mut user_config = user_config;
         if user_config.upgrade_delays() {
             user_config.save();

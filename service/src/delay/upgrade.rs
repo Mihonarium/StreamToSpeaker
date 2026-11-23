@@ -182,7 +182,7 @@ mod tests {
         assert_eq!(cases, 9 * 6 * 7 * 2 * 3);
     }
 
-    /// The choices used as examples.
+    /// Buffers, and the choice and change each becomes.
     #[test]
     fn buffers_become_a_choice_and_a_change() {
         use DelayChoice::*;
