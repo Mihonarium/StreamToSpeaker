@@ -1022,3 +1022,15 @@ fn a_speakers_local_name_is_shown_everywhere() {
     assert!(snapshot.list.speakers.iter().any(|r| r.title == "Kitchen shelf"), "{:?}", snapshot.list.speakers);
     assert_eq!(rig.app.speaker_name(&id).as_deref(), Some("Kitchen shelf"));
 }
+
+/// A level the speaker reports reaches Windows' slider the way the app
+/// moves it (through Windows' endpoint volume when set up).
+#[test]
+fn a_level_the_speaker_reports_moves_windows_slider_through_windows() {
+    let app = serving_app();
+    let set = Arc::new(Mutex::new(Vec::new()));
+    let seen = set.clone();
+    app.set_windows_level_through(move |level, muted| seen.lock().unwrap().push((level, muted)));
+    app.speaker_reported_level(Some(32), Some(false));
+    assert_eq!(set.lock().unwrap().last(), Some(&(32, false)));
+}

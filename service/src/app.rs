@@ -3876,6 +3876,15 @@ impl App {
         let _ = self.windows_volume.driver.set(Box::new(push));
     }
 
+    /// The speaker reported its level or mute (a Sonos event): Windows'
+    /// slider follows, by whichever way the app moves it, unless this is
+    /// the echo of the app's own change.
+    pub fn speaker_reported_level(&self, volume: Option<u32>, mute: Option<bool>) {
+        if let Some((mb, muted)) = self.vsync.speaker_event(volume, mute) {
+            push_windows_level(&self.windows_volume, crate::volume_sync::millibels_to_sonos(mb), muted);
+        }
+    }
+
     /// Move Windows' slider for the app's output through `set` (level
     /// 0–100, muted) from now on, instead of the driver's push. The first
     /// registration wins.
