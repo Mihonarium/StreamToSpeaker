@@ -504,7 +504,6 @@ keys! {
     MoreSpeakersEllipsis,
     OpenShort,
     Reset,
-    SpeakerSettings,
     TestSound,
     HideFromList,
 
@@ -635,6 +634,10 @@ keys! {
     // The panel's closed delay line, which has no amount field.
     SpokenPanelDelay,
     SpokenPanelDelayOwn,
+    // A place's own view, opened from the › at the end of its row.
+    Options,
+    RowOptions,
+    SpokenRowOptions,
     SpokenFigureAbout,
     SpokenFigureUnder,
     SpokenFigureMeasured,
@@ -1489,7 +1492,6 @@ pub fn english(key: Key) -> Template {
         MoreSpeakersEllipsis => text("More speakers…"),
         OpenShort => text("Open"),
         Reset => text("Reset"),
-        SpeakerSettings => text("Speaker settings"),
         TestSound => text("Play a test sound"),
         HideFromList => text("Hide from this list"),
 
@@ -1655,6 +1657,9 @@ pub fn english(key: Key) -> Template {
         ),
         SpokenPanelDelay => text("Delay on {speaker}: {figure}, {change}."),
         SpokenPanelDelayOwn => text("Delay on {speaker}: {figure}, nothing removed or added."),
+        Options => text("Options"),
+        RowOptions => text("Options for {place}"),
+        SpokenRowOptions => text("Options for {place}, {kind}"),
         SpokenFigureAbout => plural("seconds", "about {seconds} second", "about {seconds} seconds"),
         SpokenFigureUnder => plural("seconds", "under {seconds} second", "under {seconds} seconds"),
         SpokenFigureMeasured => {

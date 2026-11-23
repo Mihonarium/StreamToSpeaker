@@ -10,7 +10,7 @@
 use super::command::{Command, Open};
 use super::delay::{figure, row_delay_text, spoken_row_delay};
 use super::facts::{ConnectFailure, Facts, Mode, Presence, SearchCause, SearchPhase, SpeakerFacts, SpeakerKind};
-use super::snapshot::{stage_text, Button, MenuItem, Tone};
+use super::snapshot::{stage_text, Button, ButtonStyle, MenuItem, Tone};
 use super::state::{Dropout, FellBackCause, NowState, Place, Secret};
 use super::text::{t, Lang};
 
@@ -72,6 +72,10 @@ pub struct Row {
     pub question: Option<Question>,
     /// The ⋯ menu (and right-click).
     pub menu: Vec<MenuItem>,
+    /// The *›* at the row's end: the place's own view. Its label is the
+    /// tooltip (*Options for Kitchen*), its spoken name adds the kind.
+    /// None for This PC, whose chevron shows its outputs.
+    pub options: Option<Button>,
     /// What a screen reader says for the row.
     pub spoken: String,
 }
@@ -272,7 +276,8 @@ pub fn place_list(facts: &Facts) -> PlaceList {
                     command: (!is_current && !missing).then_some(Command::Play(Place::MusicAssistant)),
                     error: None,
                     question: None,
-                    menu: vec![MenuItem::new(t!(lang, MaSettings), Command::Open(Open::MusicAssistantSettings))],
+                    menu: vec![MenuItem::new(t!(lang, Options), Command::Open(Open::MusicAssistantSettings))],
+                    options: Some(options_button(lang, &t!(lang, MaName), &t!(lang, MaName), Open::MusicAssistantSettings)),
                 },
             }
         }),
@@ -332,6 +337,7 @@ fn this_pc_row(facts: &Facts, current: bool) -> Row {
         error: None,
         question: None,
         menu: vec![],
+        options: None,
     }
 }
 
@@ -460,7 +466,7 @@ fn speaker_row(facts: &Facts, s: &SpeakerFacts, twin: bool) -> Row {
         }
     }
 
-    let mut menu = vec![MenuItem::new(t!(lang, SpeakerSettings), Command::Open(Open::SpeakerSettings(id.clone())))];
+    let mut menu = vec![MenuItem::new(t!(lang, Options), Command::Open(Open::SpeakerSettings(id.clone())))];
     menu.push(MenuItem {
         enabled: s.presence == Presence::Found && *state != OutputMissing,
         ..MenuItem::new(t!(lang, TestSound), Command::PlayTestSound(id.clone()))
@@ -490,6 +496,18 @@ fn speaker_row(facts: &Facts, s: &SpeakerFacts, twin: bool) -> Row {
         error,
         question,
         menu,
+        options: Some(options_button(lang, &s.name, &kind_text(lang, &s.kind), Open::SpeakerSettings(id.clone()))),
+    }
+}
+
+/// The *›* that opens a place's own view.
+fn options_button(lang: Lang, name: &str, kind: &str, open: Open) -> Button {
+    Button {
+        label: t!(lang, RowOptions, place = name),
+        spoken: Some(t!(lang, SpokenRowOptions, place = name, kind = kind)),
+        command: Command::Open(open),
+        style: ButtonStyle::Icon,
+        enabled: true,
     }
 }
 

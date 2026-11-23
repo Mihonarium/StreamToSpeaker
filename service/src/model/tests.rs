@@ -865,9 +865,17 @@ fn rows_by_situation() {
     let r = row(&playing, "Kitchen");
     assert!(r.current && r.command.is_none());
     let menu: Vec<&str> = r.menu.iter().map(|m| m.label.as_str()).collect();
-    assert_eq!(menu, ["Speaker settings", "Play a test sound", "Reconnect", "Hide from this list"]);
+    assert_eq!(menu, ["Options", "Play a test sound", "Reconnect", "Hide from this list"]);
     let other: Vec<&str> = row(&playing, "Bedroom").menu.iter().map(|m| m.label.as_str()).collect();
-    assert_eq!(other, ["Speaker settings", "Play a test sound", "Hide from this list"]);
+    assert_eq!(other, ["Options", "Play a test sound", "Hide from this list"]);
+    // The › at the row's end opens the same view as the menu's Options.
+    let options = r.options.as_ref().unwrap();
+    assert_eq!(options.label, "Options for Kitchen");
+    assert_eq!(options.spoken.as_deref(), Some("Options for Kitchen, Sonos"));
+    assert_eq!(Some(&options.command), r.menu.first().map(|m| &m.command));
+    assert!(playing.list.this_pc.options.is_none(), "This PC's chevron shows its outputs");
+    let ma = &playing.list.music_assistant.as_ref().unwrap().row;
+    assert_eq!(ma.options.as_ref().map(|o| o.command.clone()), Some(Command::Open(Open::MusicAssistantSettings)));
     assert_eq!(row(&playing, "Bedroom").command, Some(Command::Play(Place::Speaker(SpeakerId::new("bedroom")))));
 
     // Screen readers hear the row whole.
