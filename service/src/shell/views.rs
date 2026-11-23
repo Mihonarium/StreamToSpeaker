@@ -60,9 +60,20 @@ impl StandInView {
         }
     }
 
-    /// The row's *Play a test sound*, from its menu.
-    fn test_sound<'s>(&self, snap: &'s Snapshot) -> Option<&'s crate::model::snapshot::MenuItem> {
-        self.row(snap)?.menu.iter().find(|m| matches!(m.command, Command::PlayTestSound(_)) && m.enabled)
+    /// The bar's one button: the test sound while this place is the one
+    /// playing, else what a click on its row does.
+    fn button(&self, snap: &Snapshot) -> Option<(String, Command)> {
+        let row = self.row(snap)?;
+        if !matches!(self.kind, StandIn::Speaker(_)) {
+            return None;
+        }
+        if row.current {
+            let m = row.menu.iter().find(|m| matches!(m.command, Command::PlayTestSound(_)) && m.enabled)?;
+            Some((m.label.clone(), m.command.clone()))
+        } else {
+            let c = row.command.clone()?;
+            Some((t!(snap.lang, PlayOnSpeaker, speaker = &row.title), c))
+        }
     }
 }
 
@@ -75,7 +86,7 @@ impl ViewContent for StandInView {
                 ViewBar {
                     title: row.map(|r| r.title.clone()).unwrap_or_else(|| id.as_str().to_string()),
                     line: row.map(|r| r.tooltip.clone()),
-                    button: self.test_sound(snap).map(|m| m.label.clone()),
+                    button: self.button(snap).map(|(label, _)| label),
                 }
             }
             StandIn::Settings => ViewBar { title: snap.footer.settings.label.clone(), ..Default::default() },
@@ -89,8 +100,8 @@ impl ViewContent for StandInView {
     }
 
     fn bar_button(&mut self, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) {
-        if let Some(m) = self.test_sound(snap) {
-            ask(Ask::Command(m.command.clone()));
+        if let Some((_, c)) = self.button(snap) {
+            ask(Ask::Command(c));
         }
     }
 
@@ -207,10 +218,18 @@ mod tests {
         assert_eq!(views.view(&Open::MusicAssistantSettings, &snap).unwrap().bar(&snap).title, "Music Assistant");
         assert!(views.view(&Open::AddByAddress, &snap).is_none());
         assert!(views.view(&Open::Panel, &snap).is_none());
-        // Its test sound is the row's.
+        // Kitchen plays: its button is the test sound.
         let mut v = views.view(&Open::SpeakerSettings(id.clone()), &snap).unwrap();
         let mut asked = Vec::new();
         v.bar_button(&snap, &mut |a| asked.push(a));
         assert!(matches!(asked.as_slice(), [Ask::Command(Command::PlayTestSound(s))] if *s == id));
+        // Another speaker: what a click on its row does.
+        let office = snap.list.rows().find(|r| r.title == "Office").unwrap();
+        let Place::Speaker(oid) = office.place.clone() else { panic!() };
+        let mut v = views.view(&Open::SpeakerSettings(oid), &snap).unwrap();
+        assert_eq!(v.bar(&snap).button.as_deref(), Some("Play on Office"));
+        let mut asked = Vec::new();
+        v.bar_button(&snap, &mut |a| asked.push(a));
+        assert!(matches!(asked.as_slice(), [Ask::Command(c)] if Some(c) == office.command.as_ref()));
     }
 }
