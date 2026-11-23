@@ -14,7 +14,7 @@ use super::menu::{menu_frame, menu_header, menu_separator, MenuItem};
 use super::notice::{info_bar, notice_line, BarKind, InfoBar, Notice};
 use super::preview::{Scene, Stage};
 use super::row::{PlaceRow, Problem, RowStyle, Status};
-use super::text::{Mark, Tone};
+use super::text::{Mark, Para, Tone};
 use super::theme::{size, space, Theme};
 use super::volume::{volume_row, VolumeView};
 
@@ -26,6 +26,7 @@ pub fn scenes() -> Vec<Scene> {
         Scene { name: "parts-delay-interaction", size: [1180.0, 620.0], draw: delay_interaction },
         Scene { name: "parts-rows", size: [1180.0, 580.0], draw: rows },
         Scene { name: "parts-delay-line", size: [1200.0, 1200.0], draw: delay_line },
+        Scene { name: "parts-delay-page", size: [680.0, 550.0], draw: delay_page },
         Scene { name: "parts-panel", size: [1560.0, 640.0], draw: panel_standins },
         Scene { name: "parts-notices", size: [1060.0, 640.0], draw: notices },
         Scene { name: "parts-inputs", size: [1060.0, 620.0], draw: inputs },
@@ -532,6 +533,33 @@ fn panel_standins(ui: &mut Ui, st: &mut Stage) {
             });
             footer_standin(ui, false);
         });
+    });
+}
+
+/// The full delay control on a speaker's page: in a Settings card, at most
+/// 470 points wide, with *Other amount…*; once closed, once typing.
+fn delay_page(ui: &mut Ui, st: &mut Stage) {
+    let t = Theme::of(ui.ctx());
+    egui::Frame::none().inner_margin(egui::Margin::same(16.0)).show(ui, |ui| {
+        ui.set_width(640.0);
+        ui.spacing_mut().item_spacing.y = 4.0;
+        for (heading, state) in [("Delay", DelayState::default()), ("Delay, typing an amount", DelayState::with_amount("150", false))] {
+            section_heading(ui, heading);
+            let _ = card(ui, SETTINGS_CARD_PAD, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(egui::RichText::new("Kitchen's own delay is about 0.2 s.").font(t.font(size::BODY)).color(t.c.text));
+                let _ = Para::new("Sonos speakers set their own delay.").link("Check sync…").show(ui);
+                ui.add_space(10.0);
+                let v = DelayView { other_amount_link: true, ..view("Kitchen", 150, -50, None) };
+                let mut s = state;
+                let _ = DelayControl::new(&v, &mut s).max_width(470.0).show(ui);
+                if s.amount_is_open() {
+                    st.focus_named(ui.min_rect(), "Milliseconds to remove or add");
+                }
+                ui.add_space(8.0);
+                let _ = Para::new("Sound behind the picture? Remove some delay. Breaking up? Add some.").show(ui);
+            });
+        }
     });
 }
 
