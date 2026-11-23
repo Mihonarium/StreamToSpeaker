@@ -339,7 +339,7 @@ pub(crate) enum Failure {
     Refused { status: String, fault: Option<Fault> },
 }
 
-/// The UPnP error a refusal carries ([UDA], the UPnP Device Architecture,
+/// The UPnP error a refusal carries (\[UDA\], the UPnP Device Architecture,
 /// 3.2.5: `<UPnPError>` with `<errorCode>` and `<errorDescription>`). The
 /// description is the device's own text, shown only through
 /// [`Fault::describe`].
