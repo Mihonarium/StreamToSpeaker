@@ -8,7 +8,8 @@
 //! lacks: Chinese, Japanese and Korean, the rarer Han characters, Indic
 //! scripts, Thai and its neighbours, Ethiopic, Cherokee, Myanmar, Tibetan,
 //! Mongolian and Yi. They come last, so every character drawn before they
-//! were added is drawn by the same font as before.
+//! were added is drawn by the same font as before. A third family, for
+//! semibold text, is Segoe UI Semibold followed by the proportional family.
 //!
 //! Han characters are shared by the Chinese, Japanese and Korean fonts and
 //! are drawn differently in each, so their order follows the person's
@@ -265,7 +266,21 @@ pub fn definitions(han: &[Han], load: &mut dyn FnMut(&str) -> Option<&'static [u
     for slot in fallback_slots(han) {
         add(&mut fonts, slot, &last, true);
     }
+    add_semibold_family(&mut fonts);
     (fonts, loaded)
+}
+
+/// The family for semibold text: Segoe UI Semibold, then the proportional
+/// family for every character it lacks (or for all text, without it).
+pub const SEMIBOLD_FAMILY: &str = "semibold";
+
+fn add_semibold_family(fonts: &mut FontDefinitions) {
+    let semibold = SEGOE_UI_SEMIBOLD.name.to_owned();
+    let mut list: Vec<String> = fonts.families[&FontFamily::Proportional].iter().filter(|n| **n != semibold).cloned().collect();
+    if fonts.font_data.contains_key(&semibold) {
+        list.insert(0, semibold);
+    }
+    fonts.families.insert(FontFamily::Name(SEMIBOLD_FAMILY.into()), list);
 }
 
 /// Set the window's fonts: the files from the Windows fonts folder, the
@@ -602,10 +617,24 @@ mod tests {
         // The bytes are lent to egui as they are: no copy.
         let lent = &defs.font_data["han_japanese"];
         assert!(matches!(&lent.font, Cow::Borrowed(b) if b.as_ptr() == egui_font("emoji-icon-font").as_ptr()));
-        // With no fonts folder at all, egui's defaults as they are.
+        // With no fonts folder at all, egui's defaults as they are, and the
+        // semibold family made of them.
         let (none, loaded) = definitions(&han, &mut |_| None);
-        assert_eq!(none.families, FontDefinitions::default().families);
+        let mut families = none.families.clone();
+        let semibold = families.remove(&FontFamily::Name(SEMIBOLD_FAMILY.into()));
+        assert_eq!(families, FontDefinitions::default().families);
+        assert_eq!(semibold.as_ref(), Some(&FontDefinitions::default().families[&FontFamily::Proportional]));
         assert!(loaded.used.is_empty() && loaded.skipped.is_empty());
+    }
+
+    #[test]
+    fn semibold_text_uses_segoe_ui_semibold_then_the_proportional_fonts() {
+        let (defs, _) = definitions(&han_order(&langs(&["zh-TW"]), None), &mut folder);
+        let semibold = &defs.families[&FontFamily::Name(SEMIBOLD_FAMILY.into())];
+        let mut expected = defs.families[&FontFamily::Proportional].clone();
+        expected.retain(|n| n != "segoe_ui_semibold");
+        expected.insert(0, "segoe_ui_semibold".into());
+        assert_eq!(semibold, &expected);
     }
 
     #[test]
