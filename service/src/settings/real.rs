@@ -470,6 +470,7 @@ impl SettingsPort for AppSettings {
     fn speaker(&self, id: &str) -> Option<SpeakerView> {
         let app = &self.app;
         let (row, _) = self.rows().into_iter().find(|(r, _)| r.id == id)?;
+        let shown_name = row.name.clone();
         let status = app.delay_status_of(id);
         let stored = app.speaker_settings(id);
         let airplay = app.airplay_discovery.as_deref().and_then(|d| d.find_by_id(id));
@@ -525,15 +526,15 @@ impl SettingsPort for AppSettings {
             delay: self.delay_card(&status),
             row,
             model,
-            test_sound: None,
+            test_sound: Some(()),
             connects_with: None,
             group,
-            volume_limit: None,
+            volume_limit: Some(stored.volume_limit.unwrap_or(100).min(100)),
             tone: Some((tone.bands_db[0], tone.bands_db[crate::equalizer::EQ_BANDS - 1])),
             comes_back,
             song_titles,
             pairing,
-            show_as: None,
+            show_as: Some(stored.show_as.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| shown_name.clone())),
         })
     }
 
@@ -549,7 +550,7 @@ impl SettingsPort for AppSettings {
             play_calls: None,
             start_at_sign_in: Some(start),
             go_back: Some(app.is_auto_reconnect_on_launch()),
-            when_stops: None,
+            when_stops: Some(if app.is_auto_reconnect_on_drop() { WhenStops::BringBack } else { WhenStops::StaySilent }),
             notifications: None,
             shortcuts: None,
             language: None,
@@ -589,7 +590,20 @@ impl SettingsPort for AppSettings {
         let on = app.is_web_ui_enabled();
         PrivacyView {
             only_playing: app.is_privacy_mode(),
-            refused: None,
+            refused: Some(
+                app.recently_refused()
+                    .into_iter()
+                    .map(|r| {
+                        let unix = r.at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        let at = match self.seen(unix) {
+                            Seen::Today(t) | Seen::Yesterday(t) => t,
+                            Seen::On(_) => LocalTime::new(0, 0),
+                        };
+                        let address = r.address.to_string();
+                        Refused { name: (r.name != address).then_some(r.name), address, at, group_of: None }
+                    })
+                    .collect(),
+            ),
             phone: Some(Phone { on, link: on.then(|| app.web_link()).flatten(), problem: self.inner.lock().unwrap().phone_problem.clone() }),
             api: None,
         }
@@ -921,6 +935,31 @@ impl SettingsPort for AppSettings {
                 }
             }
             Act::Remove(id) => app.remove_manual_speaker(&id),
+            Act::TestSound(id) => {
+                // Where the sound is: at once. Another speaker is played by
+                // the engine's own command from the window (it moves the
+                // sound there first), never from here.
+                if self.playing_id().as_deref() == Some(id.as_str()) {
+                    app.play_test_sound();
+                }
+            }
+            Act::VolumeLimit(id, limit) => {
+                let mut s = app.speaker_settings(&id);
+                s.volume_limit = (limit < 100).then_some(limit);
+                app.set_speaker_settings(&id, s);
+            }
+            Act::ShowAs(id, name) => {
+                let mut s = app.speaker_settings(&id);
+                // An empty name gives the speaker its own name back.
+                let name = name.trim().to_string();
+                s.show_as = (!name.is_empty()).then_some(name);
+                app.set_speaker_settings(&id, s);
+            }
+            Act::WhenStops(w) => app.set_auto_reconnect_on_drop(w == WhenStops::BringBack),
+            Act::Allow { address, .. } => match address.parse::<IpAddr>() {
+                Ok(ip) => app.allow_device(ip),
+                Err(_) => log::warn!("settings: can't allow {address}: not an address"),
+            },
             Act::StartAtSignIn(on) => {
                 let r = crate::autostart::set_enabled(on);
                 self.inner.lock().unwrap().sign_in_problem = r.err();
@@ -1070,20 +1109,15 @@ impl SettingsPort for AppSettings {
             }
             Act::OpenIssue(_) => self.desktop.open_url(&format!("{REPOSITORY}/issues/new")),
             // Controls the real app's views leave out.
-            Act::TestSound(_)
             | Act::ConnectWith { .. }
-            | Act::VolumeLimit(..)
-            | Act::ShowAs(..)
             | Act::WhatPlays(_)
             | Act::PlayCalls(_)
-            | Act::WhenStops(_)
             | Act::Notifications(_)
             | Act::Shortcuts(_)
             | Act::ShortcutKeys(..)
             | Act::Language(_)
             | Act::OpenVolumeMixer
             | Act::OpenMusicAssistant
-            | Act::Allow { .. }
             | Act::Api(_)
             | Act::NewKey
             | Act::Unmute
@@ -1124,19 +1158,7 @@ impl AppSettings {
             LabAct::Realtime(on) => set_config(&|uc| uc.prefer_realtime_airplay = on),
             LabAct::Mfi(on) => set_config(&|uc| uc.airplay_mfi_encryption = on),
             LabAct::UncompressedAlac(on) => set_config(&|uc| uc.airplay_uncompressed_alac = on),
-            LabAct::ResetAll => {
-                for a in [
-                    LabAct::AtOnce(false),
-                    LabAct::CatchUpFrames(LAB_CATCH_UP_DEFAULT),
-                    LabAct::DriftPpm(0),
-                    LabAct::SilencePace(LAB_SILENCE_PACE_DEFAULT),
-                    LabAct::Realtime(false),
-                    LabAct::Mfi(false),
-                    LabAct::UncompressedAlac(false),
-                ] {
-                    self.lab_act(a);
-                }
-            }
+            LabAct::ResetAll => app.turn_off_lab(),
             LabAct::ResetCarriedOver => set_config(&|uc| {
                 uc.airplay_latency_ms = crate::user_config::AIRPLAY_LATENCY_MS_DEFAULT;
                 uc.airplay_homepod_latency_ms = crate::user_config::HOMEPOD_LATENCY_MS_DEFAULT;

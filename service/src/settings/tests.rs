@@ -1115,3 +1115,41 @@ fn a_moment_is_said_as_today_yesterday_or_a_date() {
     }
     assert_eq!(super::real::days_from_civil(2026, 11, 23) * 86_400 + 12 * 3600, now as i64);
 }
+
+#[test]
+fn the_real_app_keeps_a_limit_a_local_name_and_what_happens_when_a_speaker_stops() {
+    let (app, port, _) = real();
+    let id = with_speaker(&app);
+    assert_eq!(port.speaker(&id).unwrap().volume_limit, Some(100), "no limit");
+    port.act(Act::VolumeLimit(id.clone(), 70));
+    assert_eq!(port.speaker(&id).unwrap().volume_limit, Some(70));
+    assert_eq!(app.volume_limit(&id), Some(70));
+    port.act(Act::VolumeLimit(id.clone(), 100));
+    assert_eq!(app.volume_limit(&id), None, "100 is no limit");
+
+    port.act(Act::ShowAs(id.clone(), "Garage shelf".into()));
+    assert_eq!(app.speaker_settings(&id).show_as.as_deref(), Some("Garage shelf"));
+    assert_eq!(port.speaker(&id).unwrap().show_as.as_deref(), Some("Garage shelf"));
+    port.act(Act::ShowAs(id.clone(), "  ".into()));
+    assert_eq!(app.speaker_settings(&id).show_as, None, "an empty name gives it its own back");
+
+    assert_eq!(port.general().when_stops, Some(WhenStops::BringBack));
+    port.act(Act::WhenStops(WhenStops::StaySilent));
+    assert!(!app.is_auto_reconnect_on_drop());
+    assert_eq!(port.general().when_stops, Some(WhenStops::StaySilent));
+}
+
+#[test]
+fn the_real_app_lists_refused_devices_and_allows_one() {
+    let (app, port, _) = real();
+    app.set_privacy_mode(true);
+    let peer: std::net::IpAddr = "192.0.2.77".parse().unwrap();
+    assert!(app.check_stream_client(peer).is_err());
+    let refused = port.privacy().refused.unwrap();
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].address, "192.0.2.77");
+    assert_eq!(refused[0].name, None, "a device discovery doesn't know has no name");
+    port.act(Act::Allow { address: "192.0.2.77".into(), speaker: String::new() });
+    assert!(port.privacy().refused.unwrap().is_empty());
+    assert!(app.check_stream_client(peer).is_ok(), "allowed for this run");
+}

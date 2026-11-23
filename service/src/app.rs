@@ -5175,6 +5175,8 @@ impl App {
         let uc = self.user_config.lock().unwrap();
         self.rate_fudge_ppm.load(Ordering::Relaxed) != 0
             || self.silence_pace_ms.load(Ordering::Relaxed) != 10
+            || self.latency_adjust_step_frames.load(Ordering::Relaxed) != 4
+            || uc.delay_at_once
             || uc.prefer_realtime_airplay
             || uc.airplay_mfi_encryption
             || uc.airplay_uncompressed_alac
@@ -5184,7 +5186,10 @@ impl App {
     pub fn turn_off_lab(&self) {
         self.rate_fudge_ppm.store(0, Ordering::Relaxed);
         self.silence_pace_ms.store(10, Ordering::Relaxed);
+        self.latency_adjust_step_frames.store(4, Ordering::Relaxed);
+        self.delay.catch_up().set_at_once(false);
         let mut uc = self.user_config.lock().unwrap();
+        uc.delay_at_once = false;
         uc.prefer_realtime_airplay = false;
         uc.airplay_mfi_encryption = false;
         uc.airplay_uncompressed_alac = false;
