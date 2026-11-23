@@ -1,9 +1,9 @@
 //! The snapshot: everything the everyday surfaces draw at one moment, with
 //! their words, built from the engine's [`Facts`] by one pure function.
 
-use super::command::{Command, Open, Refusal, VolumeOwner};
-use super::delay::{delay_control, DelayControl, DelayView};
-use super::facts::{Facts, Level, Mode, SpeakerFacts};
+use super::command::{Command, FirstRunAct, Open, Refusal, VolumeOwner};
+use super::delay::{delay_control, panel_delay, DelayControl, DelayView, PanelDelay};
+use super::facts::{Facts, FirstRun, Level, Mode, Remembered, SpeakerFacts};
 use super::places::{place_list, PlaceList};
 use super::rules::volume_owner;
 use super::state::{
@@ -95,9 +95,15 @@ pub struct Snapshot {
     pub version: u64,
     pub lang: Lang,
     pub state: NowState,
-    /// The panel's Now card (the phone remote shows the same).
+    /// The top of the panel.
+    pub top: Top,
+    /// The state as a card with a second line and the whole delay control:
+    /// what the phone remote shows.
     pub now: NowCard,
-    /// The list under *Play on*.
+    /// First run, while it shows in the panel (in place of the top's
+    /// sentence and detail).
+    pub first_run: Option<FirstRunWords>,
+    /// The list of places.
     pub list: PlaceList,
     /// The notice line, at most one.
     pub notice: Option<Notice>,
@@ -139,8 +145,64 @@ impl Snapshot {
     }
 }
 
-/// The Now card: the state sentence and the controls for where the sound
-/// is.
+/// The top of the panel: the sentence, then in a state the person must know
+/// about a detail and buttons, then the volume row and a third line. In the
+/// everyday states it is three lines of the same height, so choosing a
+/// place never moves the list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Top {
+    pub icon: TitleIcon,
+    pub sentence: String,
+    /// The level meter at the sentence's right end, while this PC sends
+    /// real sound.
+    pub meter: bool,
+    /// At the sentence's right end: *Cancel* while connecting.
+    pub corner: Option<Button>,
+    /// Only in a state the person must know about.
+    pub detail: Option<String>,
+    pub actions: Vec<Button>,
+    /// A line under the buttons.
+    pub note: Option<String>,
+    pub volume: Option<VolumeRow>,
+    pub third: Option<Third>,
+    /// What the live region announces when it changes.
+    pub announce: String,
+}
+
+/// The top's third line, which depends on the place.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Third {
+    Text(String),
+    /// A speaker's delay: a closed line that opens.
+    Delay(PanelDelay),
+}
+
+/// First run's words, by step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FirstRunWords {
+    pub sentence: String,
+    pub detail: String,
+    /// ×, at the sentence's right end.
+    pub close: Button,
+    pub actions: Vec<Button>,
+    pub link: Option<Button>,
+    pub switch: Option<Switch>,
+    /// The list's last row while speakers are still being found.
+    pub looking_more: Option<String>,
+    /// In the footer, beside *Speaker missing?*.
+    pub not_now: Option<Button>,
+}
+
+/// A switch, with the command that flips it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Switch {
+    pub label: String,
+    pub on: bool,
+    pub command: Command,
+}
+
+/// The state as a card: title, second line, buttons, volume and the whole
+/// delay control. The phone remote shows this.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NowCard {
     pub icon: TitleIcon,
@@ -169,8 +231,10 @@ pub struct VolumeRow {
     pub number: String,
     /// The speaker's volume limit, a tick on the track.
     pub limit: Option<u8>,
-    /// A visible label, where the slider isn't the place's own volume.
-    pub label: Option<String>,
+    /// Where the slider isn't the place's own volume, what it is (the
+    /// panel's tooltip; the phone's label).
+    pub tooltip: Option<String>,
+    /// More about it, where a surface has room (the phone).
     pub caption: Option<String>,
     /// The slider's name for screen readers.
     pub spoken: String,
@@ -190,11 +254,13 @@ pub fn build(facts: &Facts, version: u64) -> Snapshot {
     let list = place_list(facts);
     let short = short_status(facts);
     let status = status_line(facts);
-    let tray = tray(facts, &list, &now, delay.as_ref(), &short, badge);
+    let tray = tray(facts, &list, &short, badge);
     Snapshot {
         version,
         lang,
         cli_status: cli_status(facts, &status, delay.as_ref(), &now),
+        top: top(facts, &now, delay.as_ref()),
+        first_run: first_run(facts),
         now,
         notice: notice(facts, badge),
         footer: footer(facts),
@@ -563,15 +629,15 @@ fn volume_row(facts: &Facts, owner: VolumeOwner) -> Option<VolumeRow> {
         VolumeOwner::Speaker(_) | VolumeOwner::MusicAssistant => facts.volume.place?,
     };
     let ma = owner == VolumeOwner::MusicAssistant;
-    let label = ma.then(|| t!(lang, MaLevelLabel));
+    let tooltip = ma.then(|| t!(lang, MaLevelLabel));
     Some(VolumeRow {
         level: level.value,
         muted: level.muted,
         number: if level.muted { t!(lang, Muted) } else { level.value.to_string() },
         limit: level.limit,
-        spoken: label.clone().unwrap_or_else(|| t!(lang, VolumeName)),
+        spoken: tooltip.clone().unwrap_or_else(|| t!(lang, VolumeName)),
         caption: ma.then(|| t!(lang, MaLevelCaption)),
-        label,
+        tooltip,
         mute: Button {
             label: if level.muted { t!(lang, Unmute) } else { t!(lang, Mute) },
             spoken: None,
@@ -581,6 +647,110 @@ fn volume_row(facts: &Facts, owner: VolumeOwner) -> Option<VolumeRow> {
         },
         owner,
     })
+}
+
+/// The top of the panel. Everyday states keep three lines of fixed height;
+/// every other state shows the card's second line as the detail, with its
+/// buttons, except the two the footer already has.
+fn top(facts: &Facts, now: &NowCard, view: Option<&DelayView>) -> Top {
+    use NowState::*;
+    let lang = facts.lang;
+    let state = &facts.state;
+    let everyday = state.is_everyday();
+    let connecting = matches!(state, Connecting { .. });
+    let in_footer = |b: &Button| {
+        matches!(b.command, Command::Open(Open::CantHear(_)) | Command::Open(Open::SpeakerMissing))
+    };
+    let third = if facts.first_run.is_some() {
+        None
+    } else {
+        match state {
+            Connecting { .. } => Some(Third::Text(t!(lang, TopConnecting))),
+            MaPlaying { room: Some(room), .. } => Some(Third::Text(t!(lang, TopMaRoom, room = room))),
+            MaPlaying { room: None, .. } => Some(Third::Text(t!(lang, TopMaChooses))),
+            _ => match (view, facts.delay.as_ref()) {
+                (Some(v), Some(control)) => {
+                    let reconnecting = match state {
+                        ApplyingDelay { from_ms, to_ms, .. } => Some((*from_ms, *to_ms)),
+                        _ => None,
+                    };
+                    Some(Third::Delay(panel_delay(lang, &v.name, v.delay, control, facts.delay_steps, reconnecting)))
+                }
+                _ if state.current_place() == Some(Place::ThisPc) => {
+                    let first_time = *state == OnThisPc && facts.remembered == Remembered::Nothing;
+                    Some(Third::Text(if first_time {
+                        t!(lang, TopPickSpeaker)
+                    } else {
+                        facts.pc.output.friendly.clone()
+                    }))
+                }
+                _ => None,
+            },
+        }
+    };
+    let detail = (!everyday).then(|| now.line2.clone());
+    let announce = match &detail {
+        Some(d) => format!("{} {}", lang.sentence(&now.title), lang.sentence(d)),
+        None => lang.sentence(&now.title),
+    };
+    Top {
+        icon: now.icon,
+        sentence: now.title.clone(),
+        meter: now.meter && !connecting,
+        corner: connecting.then(|| Button::new(t!(lang, Cancel), Command::CancelConnect)),
+        detail,
+        actions: if everyday { vec![] } else { now.actions.iter().filter(|b| !in_footer(b)).cloned().collect() },
+        note: if everyday { None } else { now.note.clone() },
+        volume: now.volume.clone(),
+        third,
+        announce,
+    }
+}
+
+/// First run's words for its step.
+fn first_run(facts: &Facts) -> Option<FirstRunWords> {
+    let lang = facts.lang;
+    let step = facts.first_run.as_ref()?;
+    let act = |a| Command::FirstRun(a);
+    let mut words = FirstRunWords {
+        sentence: String::new(),
+        detail: String::new(),
+        close: Button { style: ButtonStyle::Icon, ..Button::new(t!(lang, Close), act(FirstRunAct::Close)) },
+        actions: vec![],
+        link: None,
+        switch: None,
+        looking_more: None,
+        not_now: None,
+    };
+    match step {
+        FirstRun::Pick => {
+            words.sentence = t!(lang, FirstPickTitle);
+            words.detail = t!(lang, FirstPickLine);
+            words.looking_more = Some(t!(lang, FirstLookingMore));
+            words.not_now = Some(Button::link(t!(lang, NotNow), act(FirstRunAct::NotNow)));
+        }
+        FirstRun::Hear { speaker } => {
+            let n = name_of(facts, speaker);
+            words.sentence = t!(lang, FirstHearTitle, speaker = n);
+            words.detail = t!(lang, FirstHearLine, speaker = n);
+            words.actions = vec![
+                Button::primary(t!(lang, HeardIt), act(FirstRunAct::Heard)),
+                Button::new(t!(lang, DidntHear), Command::Open(Open::CantHear(Some(speaker.clone())))),
+            ];
+            words.link = Some(Button::link(t!(lang, PlayItAgain), act(FirstRunAct::PlayChimeAgain)));
+        }
+        FirstRun::FindIt { speaker, start_at_sign_in } => {
+            words.sentence = t!(lang, FirstFindTitle);
+            words.detail = t!(lang, FirstFindLine);
+            words.switch = Some(Switch {
+                label: t!(lang, FirstStartSwitch, speaker = name_of(facts, speaker)),
+                on: *start_at_sign_in,
+                command: act(FirstRunAct::StartAtSignIn(!start_at_sign_in)),
+            });
+            words.actions = vec![Button::primary(t!(lang, Done), act(FirstRunAct::Done))];
+        }
+    }
+    Some(words)
 }
 
 /// The row's stage words while connecting.

@@ -26,8 +26,8 @@ pub mod text;
 mod tests;
 
 pub use command::{
-    Command, DelayOutcome, DelayStep, Effect, NoticeKind, Open, Outcome, Refusal, Surface, Ticket,
-    VolumeOwner,
+    Command, DelayOutcome, DelayStep, Effect, FirstRunAct, NoticeKind, Open, Outcome, Refusal, Surface,
+    Ticket, VolumeOwner,
 };
 pub use facts::Facts;
 pub use port::{Port, PortCore, Watch, Watcher};

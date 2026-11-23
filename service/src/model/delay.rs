@@ -248,8 +248,46 @@ fn use_choice(lang: Lang, speaker: &SpeakerId, choice: DelayChoice) -> Button {
     )
 }
 
-/// The delay control for one speaker. The panel, the phone and a speaker's
-/// page all draw this.
+fn delay_body(lang: Lang, name: &str, change: i32, facts: &DelayFacts, steps: DelaySteps) -> DelayBody {
+    let id = &facts.speaker;
+    if facts.applies == Applies::Fixed {
+        let short = facts.choice.map(|c| figure_text(lang, estimate(c.short_ms as u64))).unwrap_or_default();
+        return DelayBody::Fixed {
+            text: t!(lang, FixedOnSteady, speaker = name, short = &short),
+            action: use_choice(lang, id, DelayChoice::Short),
+        };
+    }
+    let at_removed_limit = change <= -(facts.range.max_removed_ms as i32);
+    let at_added_limit = change >= facts.range.max_added_ms as i32;
+    DelayBody::Buttons {
+        remove_large: delay_button(lang, id, DelayStep::Remove(steps.large_ms), !at_removed_limit),
+        remove_small: delay_button(lang, id, DelayStep::Remove(steps.small_ms), !at_removed_limit),
+        add_large: delay_button(lang, id, DelayStep::Add(steps.large_ms), !at_added_limit),
+        add_small: delay_button(lang, id, DelayStep::Add(steps.small_ms), !at_added_limit),
+    }
+}
+
+/// The change a speaker shows: nothing where its delay can't be changed.
+fn shown_change(delay: SpeakerDelay, facts: &DelayFacts) -> i32 {
+    if facts.applies == Applies::Fixed {
+        0
+    } else {
+        delay.change_ms
+    }
+}
+
+fn spoken_head(lang: Lang, name: &str, fig: Figure, change: i32) -> String {
+    let spoken_fig = spoken_figure(lang, fig);
+    match change {
+        0 => t!(lang, SpokenDelayOwn, speaker = name, figure = &spoken_fig),
+        c => t!(lang, SpokenDelay, speaker = name, figure = &spoken_fig, change = &spoken_change(lang, c, name)),
+    }
+}
+
+/// The delay control for one speaker, whole: the head line with what was
+/// removed or added and ↺, the four buttons, and the line under them. The
+/// phone remote and a speaker's page draw this; the panel draws
+/// [`PanelDelay`].
 pub fn delay_control(
     lang: Lang,
     name: &str,
@@ -260,46 +298,17 @@ pub fn delay_control(
 ) -> DelayControl {
     let id = &facts.speaker;
     let fig = figure(delay);
-    let fixed = facts.applies == Applies::Fixed;
-    let change = if fixed { 0 } else { delay.change_ms };
-    let change_words = change_text(lang, change);
-    let at_removed_limit = change <= -(facts.range.max_removed_ms as i32);
-    let at_added_limit = change >= facts.range.max_added_ms as i32;
-    let short_figure = |c: &ChoiceFacts| figure_text(lang, estimate(c.short_ms as u64));
-
-    let body = if fixed {
-        let short = facts.choice.as_ref().map(short_figure).unwrap_or_default();
-        DelayBody::Fixed {
-            text: t!(lang, FixedOnSteady, speaker = name, short = &short),
-            action: use_choice(lang, id, DelayChoice::Short),
-        }
+    let change = shown_change(delay, facts);
+    let line = if facts.applies == Applies::Fixed {
+        None
     } else {
-        DelayBody::Buttons {
-            remove_large: delay_button(lang, id, DelayStep::Remove(steps.large_ms), !at_removed_limit),
-            remove_small: delay_button(lang, id, DelayStep::Remove(steps.small_ms), !at_removed_limit),
-            add_large: delay_button(lang, id, DelayStep::Add(steps.large_ms), !at_added_limit),
-            add_small: delay_button(lang, id, DelayStep::Add(steps.small_ms), !at_added_limit),
-        }
-    };
-
-    let line = if fixed { None } else { delay_line(lang, name, change, facts, steps, hint_retired) };
-
-    let spoken_fig = spoken_figure(lang, fig);
-    let spoken = match change {
-        0 => t!(lang, SpokenDelayOwn, speaker = name, figure = &spoken_fig),
-        c => t!(
-            lang,
-            SpokenDelay,
-            speaker = name,
-            figure = &spoken_fig,
-            change = &spoken_change(lang, c, name)
-        ),
+        delay_line(lang, name, change, facts, steps, hint_retired)
     };
     let spoken_total = spoken_change(lang, change, name);
     DelayControl {
         label: t!(lang, DelayLabel),
         figure: figure_text(lang, fig),
-        change: change_words,
+        change: change_text(lang, change),
         reset: (change != 0).then(|| Button {
             label: t!(lang, BackToOwn, speaker = name),
             spoken: None,
@@ -307,13 +316,96 @@ pub fn delay_control(
             style: ButtonStyle::Icon,
             enabled: true,
         }),
-        body,
+        body: delay_body(lang, name, change, facts, steps),
         line,
-        spoken,
+        spoken: spoken_head(lang, name, fig, change),
         spoken_done: t!(lang, SpokenDone, result = &spoken_total),
         spoken_total,
         column_headings: [t!(lang, SoundBehind), t!(lang, SoundBreakingUp)],
         other_amount: t!(lang, OtherAmount),
+    }
+}
+
+/// The delay in the panel: one closed line, *Delay  about 0.15 s*, that
+/// opens to the four buttons and one line under them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelDelay {
+    /// "Delay".
+    pub label: String,
+    /// "about 0.15 s"; while an AirPlay speaker reconnects to apply a
+    /// change, "reconnecting to remove 100 ms…".
+    pub value: String,
+    /// The closed line, spoken (the keys work on it closed).
+    pub spoken: String,
+    /// What opening shows.
+    pub body: DelayBody,
+    /// The line under the buttons: what was removed or added, or what
+    /// matters more right now (a limit, a change being applied).
+    pub line: Option<DelayLine>,
+    /// *Reset*: back to the speaker's own delay, while something is
+    /// removed or added.
+    pub reset: Option<Button>,
+    /// Announced after each change.
+    pub spoken_total: String,
+    /// Announced when a change that was still applying is done.
+    pub spoken_done: String,
+}
+
+/// The delay in the panel for one speaker. `reconnecting` is the change an
+/// AirPlay speaker is reconnecting to apply while playing (from, to).
+pub fn panel_delay(
+    lang: Lang,
+    name: &str,
+    delay: SpeakerDelay,
+    facts: &DelayFacts,
+    steps: DelaySteps,
+    reconnecting: Option<(i32, i32)>,
+) -> PanelDelay {
+    let id = &facts.speaker;
+    let fig = figure(delay);
+    let change = shown_change(delay, facts);
+    let (value, line) = match reconnecting {
+        Some((from, to)) => {
+            let (value, sentence) = if to == 0 {
+                (t!(lang, DelayReconnectingOwn, speaker = name), t!(lang, ApplyingOwn, speaker = name))
+            } else if to < from {
+                let ms = (from - to).unsigned_abs();
+                (t!(lang, DelayReconnectingRemove, ms = ms), t!(lang, ApplyingRemove, ms = ms))
+            } else {
+                let ms = (to - from).unsigned_abs();
+                (t!(lang, DelayReconnectingAdd, ms = ms), t!(lang, ApplyingAdd, ms = ms))
+            };
+            (value, Some(DelayLine { text: sentence, tone: Tone::Busy, action: None }))
+        }
+        None => {
+            let line = if facts.applies == Applies::Fixed {
+                None
+            } else {
+                // No symptom hint in the panel; what was removed or added is
+                // the line when nothing matters more.
+                delay_line(lang, name, change, facts, steps, true).or_else(|| {
+                    change_text(lang, change).map(|text| DelayLine { text, tone: Tone::Plain, action: None })
+                })
+            };
+            (figure_text(lang, fig), line)
+        }
+    };
+    let spoken_total = spoken_change(lang, change, name);
+    PanelDelay {
+        label: t!(lang, DelayLabel),
+        value,
+        spoken: spoken_head(lang, name, fig, change),
+        body: delay_body(lang, name, change, facts, steps),
+        line,
+        reset: (change != 0).then(|| Button {
+            label: t!(lang, Reset),
+            spoken: Some(t!(lang, BackToOwn, speaker = name)),
+            command: Command::ChangeDelay { speaker: id.clone(), step: DelayStep::Reset },
+            style: ButtonStyle::Link,
+            enabled: true,
+        }),
+        spoken_done: t!(lang, SpokenDone, result = &spoken_total),
+        spoken_total,
     }
 }
 

@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use super::command::*;
 use super::delay::*;
+use super::delay::PanelDelay;
 use super::facts::*;
-use super::places::Row;
+use super::places::{Row, RowStatus};
 use super::port::Port;
 use super::scripted::{Names, Scenario, ScriptedEngine};
-use super::snapshot::{build, Button, ButtonStyle, Snapshot, TitleIcon, Tone};
+use super::snapshot::{build, Button, ButtonStyle, Snapshot, Third, TitleIcon, Tone};
 use super::state::*;
 use super::surfaces::{self, MenuEntry};
 use super::text::{Key, Lang, LocalTime, USED};
@@ -185,7 +186,7 @@ fn now_card_in_every_state() {
             "This PC is sending sound, but Kitchen stopped asking for it at 21:14.",
             vec!["Reconnect*", "What else can I try?"],
             Vol::Speaker(32),
-            false,
+            true,
         ),
         (
             "not responding",
@@ -415,7 +416,7 @@ fn now_card_in_every_state() {
     assert_eq!(snap(Scenario::Muted).now.volume.as_ref().unwrap().number, "Muted");
     let ma = snap(Scenario::MaPlaying);
     let v = ma.now.volume.as_ref().unwrap();
-    assert_eq!(v.label.as_deref(), Some("Level sent to Music Assistant"));
+    assert_eq!(v.tooltip.as_deref(), Some("Level sent to Music Assistant"));
     assert_eq!(v.caption.as_deref(), Some("Each speaker’s own volume is set in Music Assistant."));
 
     // The line under the fell-back buttons promises a return only while true.
@@ -449,11 +450,11 @@ fn now_card_in_every_state() {
     // "Only apps I send there": This PC's row says what it really does.
     let sent = snap(Scenario::SentApps);
     assert_eq!(sent.list.this_pc.title, "Stop playing on a speaker");
-    assert_eq!(sent.list.this_pc.line2, "Apps you send here go quiet until you pick a speaker");
+    assert_eq!(sent.list.this_pc.tooltip, "Apps you send here go quiet until you pick a speaker");
 
     // A missing output dims every speaker.
     let missing = snap(Scenario::OutputMissing);
-    assert!(missing.list.speakers.iter().all(|r| r.dimmed && r.line2 == "Repair first" && r.command.is_none()));
+    assert!(missing.list.speakers.iter().all(|r| r.dimmed && r.tooltip == "Repair first" && r.command.is_none()));
 }
 
 /// One state, every surface: panel title, tray icon, tooltip, Windows'
@@ -767,15 +768,15 @@ fn rows_by_situation() {
         ("Den TV", "Apple TV · about 2 s delay"),
         ("Desk Speaker", "Sendspin speaker · about 0.5 s delay"),
     ] {
-        assert_eq!(row(&all, title).line2, line);
+        assert_eq!(row(&all, title).tooltip, line);
     }
     // Every delay figure includes what was removed.
-    assert_eq!(row(&snap(Scenario::OnThisPc), "Kitchen").line2, "Sonos · about 0.15 s delay");
+    assert_eq!(row(&snap(Scenario::OnThisPc), "Kitchen").tooltip, "Sonos · about 0.15 s delay");
     // Measured.
     let measured = snap_with(Scenario::OnThisPc, |f| {
         f.speakers[0].delay = Some(SpeakerDelay { own_ms: 210, measured: true, change_ms: 0 })
     });
-    assert_eq!(row(&measured, "Kitchen").line2, "Sonos · 0.21 s delay, measured");
+    assert_eq!(row(&measured, "Kitchen").tooltip, "Sonos · 0.21 s delay, measured");
 
     // Connecting: the stages.
     for (stage, line) in [
@@ -789,9 +790,9 @@ fn rows_by_situation() {
             set_state(NowState::Connecting { target: k.clone(), from: SoundAt::ThisPc, stage }),
         );
         let r = row(&s, "Kitchen");
-        assert_eq!(r.line2, line);
-        assert!(r.spinner && r.command.is_none());
-        assert_eq!(r.inline.as_ref().map(|b| &b.command), Some(&Command::CancelConnect));
+        assert_eq!(r.tooltip, line);
+        assert!(r.status == Some(RowStatus::Spinner) && r.command.is_none());
+        assert_eq!(s.top.corner.as_ref().map(|b| &b.command), Some(&Command::CancelConnect));
     }
 
     // A click that failed: red, with Try again, until acted on.
@@ -801,14 +802,15 @@ fn rows_by_situation() {
     ] {
         let s = snap_with(Scenario::OnThisPc, |f| f.speakers[0].failure = Some(failure));
         let r = row(&s, "Kitchen");
-        assert_eq!((r.line2.as_str(), r.tone), (line, Tone::Error));
-        assert_eq!(r.inline.as_ref().map(|b| b.label.as_str()), Some("Try again"));
+        assert_eq!((r.tooltip.as_str(), r.tone), (line, Tone::Error));
+        let e = r.error.as_ref().expect("a second line");
+        assert_eq!((e.text.as_str(), e.retry.label.as_str()), (line, "Try again"));
     }
 
     let line = |s: Scenario, title: &str| {
         let snapshot = snap(s);
         let r = row(&snapshot, title);
-        (r.line2.clone(), r.tone, r.dimmed)
+        (r.tooltip.clone(), r.tone, r.dimmed)
     };
     assert_eq!(
         line(Scenario::NotResponding, "Kitchen"),
@@ -823,13 +825,12 @@ fn rows_by_situation() {
     assert_eq!(line(Scenario::BusyQuestion, "Kitchen").0, "Sonos · playing something else");
     assert_eq!(line(Scenario::OnThisPc, "Garage"), ("Not found right now".into(), Tone::Plain, true));
     let cat = snap(Scenario::RowCatalogue);
-    assert_eq!(row(&cat, "Bathroom").line2, "Can’t play to this speaker");
-    assert!(row(&cat, "Bathroom").dimmed);
-    assert_eq!(row(&cat, "Bedroom").line2, "Waiting for the second HomePod");
-    assert_eq!(row(&cat, "Office").line2, "AirPlay · 1.74 s delay, measured");
-    assert_eq!(row(&cat, "Kitchen (192.168.1.20)").line2, "Sonos · two devices answer as Kitchen");
+    assert!(cat.list.rows().all(|r| r.title != "Bathroom"), "a speaker the app can't play to isn't listed");
+    assert_eq!(row(&cat, "Bedroom").tooltip, "Waiting for the second HomePod");
+    assert_eq!(row(&cat, "Office").tooltip, "AirPlay · 1.74 s delay, measured");
+    assert_eq!(row(&cat, "Kitchen (192.168.1.20)").tooltip, "Sonos · two devices answer as Kitchen");
     assert_eq!(row(&cat, "Kitchen (192.168.1.31)").tone, Tone::Warning);
-    assert_eq!(row(&cat, "Den TV").line2, "Couldn’t connect — no answer.");
+    assert_eq!(row(&cat, "Den TV").tooltip, "Couldn’t connect — no answer.");
 
     // The busy question, in place.
     let busy = snap(Scenario::BusyQuestion);
@@ -857,7 +858,7 @@ fn rows_by_situation() {
     let titles: Vec<&str> = playing.list.speakers.iter().map(|r| r.title.as_str()).collect();
     assert_eq!(titles, ["Bedroom", "Kitchen", "Living Room + Dining Room", "Office", "Garage"]);
     assert_eq!(playing.list.this_pc.title, "This PC");
-    assert_eq!(playing.list.this_pc.line2, "Speakers (Realtek Audio)");
+    assert_eq!(playing.list.this_pc.tooltip, "Speakers (Realtek Audio)");
     assert_eq!(playing.list.heading, "Play on");
 
     // The current row: accent, no click, a menu with Reconnect.
@@ -875,29 +876,16 @@ fn rows_by_situation() {
     // A crowded network folds the speakers never used from here.
     let crowded = snap(Scenario::CrowdedNetwork);
     let more = crowded.list.more.as_ref().expect("folded");
-    assert_eq!(more.title, "More speakers on this network (23)");
-    assert_eq!(more.line2, "Never used from this PC");
+    assert_eq!(more.title, "More speakers (23)");
+    assert_eq!(more.tooltip, "Never used from this PC");
     assert_eq!(crowded.list.speakers.len(), 2);
-    assert_eq!(snap(Scenario::RowCatalogue).list.more.as_ref().unwrap().title, "More speakers on this network (12)");
-
-    // This PC's chevron: Windows' outputs, the playing one checked.
-    let outs = snap(Scenario::PcOutputs);
-    let o: Vec<(&str, &str, bool)> =
-        outs.list.pc_outputs.iter().map(|o| (o.title.as_str(), o.line2.as_str(), o.checked)).collect();
-    assert_eq!(
-        o,
-        [
-            ("Speakers", "Realtek Audio", true),
-            ("Headphones", "WH-1000XM4", false),
-            ("Monitor", "NVIDIA High Definition Audio", false)
-        ]
-    );
+    assert_eq!(snap(Scenario::RowCatalogue).list.more.as_ref().unwrap().title, "More speakers (12)");
 
     // Searching.
     let none = snap(Scenario::NothingFound);
     let s = none.list.searching.as_ref().unwrap();
     assert_eq!(s.title, "Looking for speakers on Wi-Fi “HomeNet”…");
-    assert_eq!(s.line2, "Every 10 seconds while this is open");
+    assert_eq!(s.tooltip, "Every 10 seconds while this is open");
     let nf = s.none_found.as_ref().unwrap();
     assert_eq!(nf.title, "No speakers found yet.");
     assert_eq!(nf.causes, ["Windows treats “HomeNet” as a public network, so speakers can’t answer."]);
@@ -1246,8 +1234,7 @@ fn command_line() {
     assert_eq!(surfaces::picker_prompt(EN, 3), "Play on [1-3], Enter = this PC, r = search again: ");
 }
 
-/// The tray menu: the state, the places, then the delay of the speaker
-/// being played on.
+/// The tray menu: the state, the places, Open, Settings, Quit.
 #[test]
 fn tray_menu() {
     fn flat(entries: &[MenuEntry]) -> Vec<String> {
@@ -1256,13 +1243,7 @@ fn tray_menu() {
             .map(|e| match e {
                 MenuEntry::Label(l) => format!("({l})"),
                 MenuEntry::Separator => "—".into(),
-                MenuEntry::Item(i) => format!(
-                    "{}{}{}",
-                    if i.checked { "✓ " } else { "" },
-                    i.label,
-                    if i.enabled { "" } else { " [grey]" }
-                ),
-                MenuEntry::Submenu { label, entries } => format!("{label} › {}", flat(entries).join(" | ")),
+                MenuEntry::Item(i) => format!("{}{}", if i.checked { "✓ " } else { "" }, i.label),
             })
             .collect()
     }
@@ -1278,49 +1259,317 @@ fn tray_menu() {
             "Office",
             "Music Assistant",
             "—",
-            "Delay: about 0.15 s · 50 ms removed › Remove 100 ms | Remove 25 ms | Add 25 ms | Add 100 ms | Other amount… | — | Back to Kitchen’s own delay | Delay settings…",
-            "—",
-            "Can’t hear it?",
-            "Open Stream To Speaker",
+            "Open",
             "Settings",
             "—",
             "Quit (sound returns to this PC)",
         ]
     );
-    let submenu = |s: Scenario| {
-        snap(s)
-            .tray
-            .menu
-            .iter()
-            .find_map(|e| match e {
-                MenuEntry::Submenu { label, entries } => Some(format!("{label} › {}", flat(entries).join(" | "))),
-                _ => None,
-            })
-    };
-    assert_eq!(
-        submenu(Scenario::DelayRemoving).unwrap(),
-        "Delay: under 0.1 s · 125 ms removed (applying) › Remove 100 ms | Remove 25 ms | Add 25 ms | Add 100 ms | Other amount… | — | Back to Kitchen’s own delay | Delay settings…"
-    );
-    assert_eq!(
-        submenu(Scenario::DelayAtLimit).unwrap(),
-        "Delay: under 0.1 s · 200 ms removed › Remove 100 ms [grey] | Remove 25 ms [grey] | Add 25 ms | Add 100 ms | Other amount… | — | Back to Kitchen’s own delay | Delay settings…"
-    );
-    assert_eq!(
-        submenu(Scenario::DelayOwn).unwrap(),
-        "Delay: about 0.2 s › Remove 100 ms | Remove 25 ms | Add 25 ms | Add 100 ms | Other amount… | — | Back to Kitchen’s own delay [grey] | Delay settings…"
-    );
-    assert!(submenu(Scenario::DelaySteadyRemove)
-        .unwrap()
-        .starts_with("Delay: about 1.9 s · 100 ms removed › (Office reconnects to apply a change: a few seconds of silence) | Remove 100 ms"));
-    for s in [Scenario::OnThisPc, Scenario::MaPlaying, Scenario::DelayFixedOnSteady, Scenario::NotResponding] {
-        assert_eq!(submenu(s), None, "{s:?}: no Delay line");
-    }
     let quit = |s: Scenario| flat(&snap(s).tray.menu).last().cloned().unwrap();
     assert_eq!(quit(Scenario::OnThisPc), "Quit Stream To Speaker");
     assert_eq!(quit(Scenario::FellBack), "Quit Stream To Speaker");
     assert_eq!(quit(Scenario::NotResponding), "Quit (sound returns to this PC)");
     let crowded = flat(&snap(Scenario::CrowdedNetwork).tray.menu);
     assert!(crowded.contains(&"More speakers…".to_string()));
+}
+
+#[derive(Debug, PartialEq)]
+enum Third3 {
+    None,
+    Text(String),
+    Delay(String),
+}
+
+fn third(s: &Snapshot) -> Third3 {
+    match &s.top.third {
+        None => Third3::None,
+        Some(Third::Text(t)) => Third3::Text(t.clone()),
+        Some(Third::Delay(d)) => Third3::Delay(format!("{}  {}", d.label, d.value)),
+    }
+}
+
+/// The top of the panel, by state: the sentence, a detail and buttons only
+/// in a state the person must know about, the volume row and a third line
+/// that depends on the place.
+#[test]
+fn panel_top_by_state() {
+    let txt = |s: &str| Third3::Text(s.to_string());
+    let delay = |s: &str| Third3::Delay(s.to_string());
+    let pc = || txt("Speakers (Realtek Audio)");
+    let cases: Vec<(&str, Snapshot, &str, Option<&str>, Vec<&str>, Third3)> = vec![
+        ("on this PC", (*snap(Scenario::OnThisPc)).clone(), "Sound is on this PC", None, vec![], pc()),
+        (
+            "on this PC, before any speaker",
+            (*snap(Scenario::ChooseSpeaker)).clone(),
+            "Where should Stream To Speaker play?",
+            Some("Pick a speaker. If you don’t, your sound goes back to Speakers (Realtek Audio)."),
+            vec![],
+            Third3::None,
+        ),
+        (
+            "connecting",
+            (*snap(Scenario::Connecting)).clone(),
+            "Connecting to Bedroom…",
+            None,
+            vec![],
+            txt("Your sound moves there when it is ready."),
+        ),
+        ("playing", (*snap(Scenario::Playing)).clone(), "Playing on Kitchen", None, vec![], delay("Delay  about 0.15 s")),
+        (
+            "applying a delay change",
+            (*snap(Scenario::ApplyingDelay)).clone(),
+            "Playing on Office",
+            None,
+            vec![],
+            delay("Delay  reconnecting to remove 50 ms…"),
+        ),
+        ("ready", (*snap(Scenario::Ready)).clone(), "Kitchen is ready", None, vec![], delay("Delay  about 0.15 s")),
+        (
+            "Music Assistant",
+            (*snap(Scenario::MaPlaying)).clone(),
+            "Playing through Music Assistant",
+            None,
+            vec![],
+            txt("Music Assistant plays it in Living Room."),
+        ),
+        (
+            "not taking: no second button",
+            (*snap(Scenario::NotTaking)).clone(),
+            "Kitchen isn’t taking the sound",
+            Some("This PC is sending sound, but Kitchen stopped asking for it at 21:14."),
+            vec!["Reconnect*"],
+            delay("Delay  about 0.15 s"),
+        ),
+        (
+            "not responding",
+            (*snap(Scenario::NotResponding)).clone(),
+            "Kitchen isn’t responding",
+            Some("Trying again (2 of 3). If Kitchen doesn’t respond within 15 seconds, your sound comes back to this PC."),
+            vec!["Play on this PC now"],
+            Third3::None,
+        ),
+        (
+            "fell back",
+            (*snap(Scenario::FellBack)).clone(),
+            "Sound is back on this PC",
+            Some("Kitchen stopped responding at 21:14, so your sound came back to Speakers (Realtek Audio)."),
+            vec!["Try Kitchen again*", "Stay on this PC"],
+            pc(),
+        ),
+        (
+            "can't find: Speaker missing? is in the footer",
+            (*snap(Scenario::CantFind)).clone(),
+            "Can’t find Kitchen right now",
+            Some("Your sound stays on this PC. It goes to Kitchen when Kitchen is found, unless something plays here first."),
+            vec!["Stay on this PC"],
+            pc(),
+        ),
+        (
+            "Windows refused",
+            (*snap(Scenario::WindowsRefused)).clone(),
+            "Windows didn’t switch to Kitchen",
+            Some("Windows kept Speakers (Realtek Audio) as its output. In Sound settings, choose “Kitchen (Stream To Speaker)”."),
+            vec!["Open Sound settings*"],
+            delay("Delay  about 0.15 s"),
+        ),
+        (
+            "Windows switched",
+            (*snap(Scenario::WindowsSwitched)).clone(),
+            "Sound is on Headphones",
+            Some("Windows switched its output to Headphones (WH-1000XM4), so Stream To Speaker let go of Kitchen at 21:50."),
+            vec!["Play on Kitchen"],
+            txt("Headphones (WH-1000XM4)"),
+        ),
+        (
+            "output missing",
+            (*snap(Scenario::OutputMissing)).clone(),
+            "The Stream To Speaker sound output is missing",
+            Some("Windows doesn’t have the output this app plays through, so your sound stays on this PC. Repair puts it back; it needs administrator approval."),
+            vec!["Repair*"],
+            pc(),
+        ),
+        (
+            "Music Assistant waiting",
+            (*snap(Scenario::MaWaiting)).clone(),
+            "Waiting for Music Assistant to play it",
+            Some("Music Assistant has this PC’s sound but hasn’t started playing it. Start it there, or set it to start by itself."),
+            vec!["How?", "Play on this PC"],
+            Third3::None,
+        ),
+    ];
+    for (what, s, sentence, detail, actions, want) in cases {
+        assert_eq!(s.top.sentence, sentence, "{what}: sentence");
+        assert_eq!(s.top.detail.as_deref(), detail, "{what}: detail");
+        assert_eq!(labels(&s.top.actions), actions, "{what}: buttons");
+        assert_eq!(third(&s), want, "{what}: third line");
+    }
+    let first = snap_with(Scenario::OnThisPc, |f| f.remembered = Remembered::Nothing);
+    assert_eq!(third(&first), txt("Pick a speaker to play this PC’s sound there."));
+
+    // Connecting: Cancel at the sentence's right end; the volume of where
+    // the sound is now.
+    let c = snap(Scenario::Connecting);
+    assert_eq!(c.top.corner.as_ref().map(|b| b.label.as_str()), Some("Cancel"));
+    assert_eq!(c.top.volume.as_ref().map(|v| v.level), Some(32));
+    assert!(!c.top.meter);
+
+    // Muted shows in the volume row only.
+    let m = snap(Scenario::Muted);
+    assert_eq!((m.top.detail.as_deref(), m.top.volume.as_ref().unwrap().number.as_str()), (None, "Muted"));
+    assert!(m.top.meter);
+
+    // Music Assistant's slider says what it sets in its tooltip.
+    let ma = snap(Scenario::MaPlaying);
+    assert_eq!(ma.top.volume.as_ref().unwrap().tooltip.as_deref(), Some("Level sent to Music Assistant"));
+
+    // The fell-back line under the buttons stays.
+    assert_eq!(snap(Scenario::FellBack).top.note.as_deref(), Some("When Kitchen is back, you’ll be asked."));
+}
+
+fn panel_delay_of(s: &Snapshot) -> &PanelDelay {
+    match &s.top.third {
+        Some(Third::Delay(d)) => d,
+        other => panic!("no delay line: {other:?}"),
+    }
+}
+
+/// Delay in the panel: a closed line that opens to the four buttons and one
+/// line, with *Reset*.
+#[test]
+fn panel_delay() {
+    let line = |s: Scenario| {
+        let snapshot = snap(s);
+        let d = panel_delay_of(&snapshot).clone();
+        (d.line.map(|l| l.text), d.reset.map(|r| r.label))
+    };
+    let some = |s: &str| Some(s.to_string());
+    assert_eq!(line(Scenario::Playing), (some("50 ms removed"), some("Reset")));
+    assert_eq!(line(Scenario::DelayOwn), (None, None), "no symptom hint in the panel");
+    assert_eq!(line(Scenario::DelayRemoving), (some("Removing… 75 ms to go"), some("Reset")));
+    assert_eq!(line(Scenario::DelayAtLimit), (some("Kitchen allows at most 200 ms removed."), some("Reset")));
+    assert_eq!(line(Scenario::DelayAdding), (some("Adding… 50 ms to go"), some("Reset")));
+    assert_eq!(line(Scenario::DelaySendspin), (some("Desk Speaker already plays with as little delay as it can."), None));
+    assert_eq!(
+        line(Scenario::ApplyingDelay),
+        (some("Reconnecting to remove 50 ms: a few seconds of silence."), some("Reset"))
+    );
+
+    let playing = snap(Scenario::Playing);
+    let d = panel_delay_of(&playing);
+    assert_eq!(d.reset.as_ref().unwrap().spoken.as_deref(), Some("Back to Kitchen’s own delay"));
+    assert_eq!(d.spoken, "Delay on Kitchen: about 0.15 seconds, 50 milliseconds removed. Press Enter to type an amount.");
+    let DelayBody::Buttons { remove_large, remove_small, add_large, add_small } = &d.body else { panic!() };
+    assert_eq!(
+        [&remove_large.label, &add_large.label, &remove_small.label, &add_small.label],
+        ["Remove 100 ms", "Add 100 ms", "Remove 25 ms", "Add 25 ms"]
+    );
+
+    // Where it can't be changed yet: the same closed line; opening says why.
+    let fixed = snap(Scenario::DelayFixedOnSteady);
+    let d = panel_delay_of(&fixed);
+    assert_eq!(d.value, "about 2 s");
+    let DelayBody::Fixed { text, action } = &d.body else { panic!() };
+    assert!(text.starts_with("On Steady, Den TV keeps this delay itself"));
+    assert_eq!(action.label, "Use Short delay");
+    assert_eq!(d.reset, None);
+
+    // No delay line for This PC or Music Assistant.
+    assert!(!matches!(snap(Scenario::OnThisPc).top.third, Some(Third::Delay(_))));
+    assert!(!matches!(snap(Scenario::MaPlaying).top.third, Some(Third::Delay(_))));
+}
+
+/// A row is a name and, at its right end, a short status only when there
+/// is one; what it used to say on a second line is its tooltip.
+#[test]
+fn rows_right_ends() {
+    let status = |s: &Snapshot, title: &str| row(s, title).status.clone();
+    let text = |t: &str| Some(RowStatus::Text(t.to_string()));
+    let playing = snap(Scenario::Playing);
+    assert_eq!(status(&playing, "Kitchen"), None);
+    assert_eq!(status(&playing, "Bedroom"), None);
+    assert_eq!(row(&playing, "Bedroom").tooltip, "HomePod pair · about 0.2 s delay");
+    assert_eq!(status(&playing, "Garage"), text("Not found"));
+    assert!(row(&playing, "Garage").dimmed);
+    assert_eq!(status(&snap(Scenario::BusyQuestion), "Kitchen"), text("In use"));
+    assert_eq!(status(&snap(Scenario::Connecting), "Bedroom"), Some(RowStatus::Spinner));
+    assert_eq!(status(&snap(Scenario::NotResponding), "Kitchen"), Some(RowStatus::Attention));
+    assert_eq!(status(&snap(Scenario::WindowsRefused), "Kitchen"), Some(RowStatus::Attention));
+    let cat = snap(Scenario::RowCatalogue);
+    assert_eq!(status(&cat, "Bedroom"), text("1 of 2 found"));
+    assert_eq!(status(&cat, "Kitchen (192.168.1.20)"), Some(RowStatus::Attention));
+    assert_eq!(status(&cat, "Den TV"), None, "a failed click grows a second line instead");
+    assert!(row(&cat, "Den TV").error.is_some());
+
+    // This PC is one row; no heading shows over the list in the panel, but
+    // the phone's words stay.
+    assert_eq!(playing.list.this_pc.title, "This PC");
+    assert_eq!(playing.list.heading, "Play on");
+    assert_eq!(playing.list.menu_name, "More");
+}
+
+/// The footer: Can't hear it? only while the place is a speaker or Music
+/// Assistant; Speaker missing? and Settings always.
+#[test]
+fn footer() {
+    let f = |s: Scenario| {
+        let f = snap(s).footer.clone();
+        (f.cant_hear.map(|b| b.label), f.speaker_missing.label, f.settings.label)
+    };
+    let both = |c: Option<&str>| (c.map(String::from), "Speaker missing?".to_string(), "Settings".to_string());
+    assert_eq!(f(Scenario::OnThisPc), both(None));
+    assert_eq!(f(Scenario::FellBack), both(None));
+    assert_eq!(f(Scenario::Playing), both(Some("Can’t hear it?")));
+    assert_eq!(f(Scenario::MaPlaying), both(Some("Can’t hear it?")));
+    assert_eq!(
+        snap(Scenario::Playing).footer.cant_hear.clone().unwrap().command,
+        Command::Open(Open::CantHear(Some(kitchen())))
+    );
+}
+
+/// First run's three moments, with less to read.
+#[test]
+fn first_run() {
+    let pick = snap(Scenario::FirstRunPick);
+    let w = pick.first_run.as_ref().unwrap();
+    assert_eq!(
+        (w.sentence.as_str(), w.detail.as_str(), w.looking_more.as_deref()),
+        ("Where should this PC’s sound play?", "Speakers show up here as they’re found.", Some("Looking for more speakers…"))
+    );
+    assert_eq!(w.not_now.as_ref().unwrap().label, "Not now");
+    assert_eq!(w.close.label, "Close");
+    assert_eq!(pick.top.third, None, "first run's own words say it");
+
+    let hear = snap(Scenario::FirstRunHear);
+    let w = hear.first_run.as_ref().unwrap();
+    assert_eq!(w.sentence, "Did you hear the chime on Kitchen?");
+    assert_eq!(w.detail, "Kitchen now plays all of this PC’s sound. To bring it back, pick This PC.");
+    assert_eq!(labels(&w.actions), ["I heard it*", "I didn’t hear it"]);
+    assert_eq!(w.link.as_ref().unwrap().label, "Play it again");
+    assert_eq!(hear.top.third, None, "no delay line until first run is over");
+    assert_eq!(hear.top.volume.as_ref().unwrap().level, 25);
+
+    let find = snap(Scenario::FirstRunFindIt);
+    let w = find.first_run.as_ref().unwrap();
+    assert_eq!(w.sentence, "Stream To Speaker stays by the clock");
+    assert_eq!(w.detail, "Windows may tuck its icon under ^. Drag it onto the taskbar to keep it in view.");
+    let sw = w.switch.as_ref().unwrap();
+    assert_eq!((sw.label.as_str(), sw.on), ("Start when I sign in, and go back to Kitchen", true));
+    assert_eq!(labels(&w.actions), ["Done*"]);
+
+    // Walking it with the scripted engine.
+    let e = ScriptedEngine::new(Scenario::FirstRunPick);
+    e.send(Surface::Panel, Command::Play(Place::Speaker(kitchen())));
+    e.settle();
+    assert_eq!(e.snapshot().first_run.as_ref().unwrap().sentence, "Did you hear the chime on Kitchen?");
+    e.send(Surface::Panel, Command::FirstRun(FirstRunAct::Heard));
+    e.send(Surface::Panel, Command::FirstRun(FirstRunAct::StartAtSignIn(false)));
+    e.settle();
+    assert!(!e.snapshot().first_run.as_ref().unwrap().switch.as_ref().unwrap().on);
+    e.send(Surface::Panel, Command::FirstRun(FirstRunAct::Done));
+    e.settle();
+    let s = e.snapshot();
+    assert!(s.first_run.is_none());
+    assert!(matches!(s.top.third, Some(Third::Delay(_))), "the delay line once first run is over");
 }
 
 /// Notifications: one button each, in the panel's words.
@@ -1395,11 +1644,11 @@ fn scripted_engine_walks_through_connecting() {
     assert_eq!(e.snapshot().now.title, "Sound is on this PC", "nothing happens on the caller's thread");
     e.advance(0);
     assert_eq!(e.snapshot().now.title, "Connecting to Kitchen…");
-    assert_eq!(row(&e.snapshot(), "Kitchen").line2, "Finding Kitchen…");
+    assert_eq!(row(&e.snapshot(), "Kitchen").tooltip, "Finding Kitchen…");
     e.advance(600);
-    assert_eq!(row(&e.snapshot(), "Kitchen").line2, "Asking Kitchen to play…");
+    assert_eq!(row(&e.snapshot(), "Kitchen").tooltip, "Asking Kitchen to play…");
     e.advance(600);
-    assert_eq!(row(&e.snapshot(), "Kitchen").line2, "Waiting for Kitchen to start…");
+    assert_eq!(row(&e.snapshot(), "Kitchen").tooltip, "Waiting for Kitchen to start…");
     e.advance(600);
     let s = e.snapshot();
     assert_eq!(s.now.title, "Playing on Kitchen");
@@ -1432,7 +1681,7 @@ fn scripted_engine_walks_through_connecting() {
     e.settle();
     let s = e.snapshot();
     assert_eq!(s.now.title, "Playing on Living Room + Dining Room");
-    assert_eq!(row(&s, "Garage").line2, "Couldn’t connect — no answer.");
+    assert_eq!(row(&s, "Garage").error.as_ref().unwrap().text, "Couldn’t connect — no answer.");
 
     // A busy speaker asks first.
     let e = ScriptedEngine::new(Scenario::OnThisPc);
@@ -1452,7 +1701,7 @@ fn scripted_engine_walks_through_connecting() {
     e.send(Surface::Panel, Command::Play(Place::ThisPc));
     e.send(Surface::Panel, Command::Play(Place::Speaker(SpeakerId::new("den"))));
     e.advance(1300);
-    assert_eq!(row(&e.snapshot(), "Den TV").line2, "Pairing — finish in the window that opened");
+    assert_eq!(row(&e.snapshot(), "Den TV").tooltip, "Pairing — finish in the window that opened");
 
     // Music Assistant: waiting, then playing.
     let e = ScriptedEngine::new(Scenario::Playing);
@@ -1541,6 +1790,73 @@ fn scripted_engine_changes_delay_and_volume() {
 fn all_text(s: &Snapshot) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut put = |w: &str, t: &str| out.push((w.to_string(), t.to_string()));
+    let volume = |v: &super::snapshot::VolumeRow, put: &mut dyn FnMut(&str, &str)| {
+        put("volume", &v.number);
+        put("volume", &v.spoken);
+        put("volume", &v.mute.label);
+        for t in v.tooltip.iter().chain(v.caption.iter()) {
+            put("volume", t);
+        }
+    };
+    let buttons = |body: &DelayBody, put: &mut dyn FnMut(&str, &str)| match body {
+        DelayBody::Buttons { remove_large, remove_small, add_large, add_small } => {
+            for b in [remove_large, remove_small, add_large, add_small] {
+                put("delay button", &b.label);
+                put("delay button", b.spoken.as_deref().unwrap_or(""));
+            }
+        }
+        DelayBody::Fixed { text, action } => {
+            put("delay", text);
+            put("delay", &action.label);
+        }
+    };
+
+    // The panel's top.
+    let top = &s.top;
+    put("sentence", &top.sentence);
+    put("announce", &top.announce);
+    for t in top.detail.iter().chain(top.note.iter()) {
+        put("detail", t);
+    }
+    for b in top.actions.iter().chain(top.corner.iter()) {
+        put("action", &b.label);
+    }
+    if let Some(v) = &top.volume {
+        volume(v, &mut put);
+    }
+    match &top.third {
+        Some(Third::Text(t)) => put("third", t),
+        Some(Third::Delay(d)) => {
+            for t in [&d.label, &d.value, &d.spoken, &d.spoken_total, &d.spoken_done] {
+                put("panel delay", t);
+            }
+            buttons(&d.body, &mut put);
+            if let Some(l) = &d.line {
+                put("panel delay", &l.text);
+                if let Some(a) = &l.action {
+                    put("panel delay", &a.label);
+                }
+            }
+            if let Some(r) = &d.reset {
+                put("panel delay", &r.label);
+                put("panel delay", r.spoken.as_deref().unwrap_or_default());
+            }
+        }
+        None => {}
+    }
+    if let Some(w) = &s.first_run {
+        for t in [&w.sentence, &w.detail, &w.close.label] {
+            put("first run", t);
+        }
+        for b in w.actions.iter().chain(w.link.iter()).chain(w.not_now.iter()) {
+            put("first run", &b.label);
+        }
+        for t in w.looking_more.iter().chain(w.switch.iter().map(|s| &s.label)) {
+            put("first run", t);
+        }
+    }
+
+    // The card the phone remote shows.
     let n = &s.now;
     put("title", &n.title);
     put("line2", &n.line2);
@@ -1552,12 +1868,7 @@ fn all_text(s: &Snapshot) -> Vec<(String, String)> {
         put("note", t);
     }
     if let Some(v) = &n.volume {
-        put("volume", &v.number);
-        put("volume", &v.spoken);
-        put("volume", &v.mute.label);
-        for t in v.label.iter().chain(v.caption.iter()) {
-            put("volume", t);
-        }
+        volume(v, &mut put);
     }
     if let Some(c) = &n.delay {
         for t in [&c.label, &c.figure, &c.spoken, &c.spoken_total, &c.spoken_done, &c.other_amount] {
@@ -1569,18 +1880,7 @@ fn all_text(s: &Snapshot) -> Vec<(String, String)> {
         if let Some(r) = &c.reset {
             put("delay", &r.label);
         }
-        match &c.body {
-            DelayBody::Buttons { remove_large, remove_small, add_large, add_small } => {
-                for b in [remove_large, remove_small, add_large, add_small] {
-                    put("delay button", &b.label);
-                    put("delay button", b.spoken.as_deref().unwrap_or(""));
-                }
-            }
-            DelayBody::Fixed { text, action } => {
-                put("delay", text);
-                put("delay", &action.label);
-            }
-        }
+        buttons(&c.body, &mut put);
         if let Some(l) = &c.line {
             put("delay line", &l.text);
             if let Some(a) = &l.action {
@@ -1588,17 +1888,24 @@ fn all_text(s: &Snapshot) -> Vec<(String, String)> {
             }
         }
     }
+
+    // The list.
     let l = &s.list;
     put("list", &l.heading);
+    put("list", &l.menu_name);
     for r in l.rows() {
         put("row title", &r.title);
-        put("row", &r.line2);
+        put("row", &r.tooltip);
         put("row spoken", &r.spoken);
+        if let Some(RowStatus::Text(t)) = &r.status {
+            put("row", t);
+        }
         for m in &r.menu {
             put("row menu", &m.label);
         }
-        if let Some(b) = &r.inline {
-            put("row", &b.label);
+        if let Some(e) = &r.error {
+            put("row", &e.text);
+            put("row", &e.retry.label);
         }
         if let Some(q) = &r.question {
             for t in [&q.title, &q.line, &q.confirm.label, &q.cancel.label] {
@@ -1606,20 +1913,16 @@ fn all_text(s: &Snapshot) -> Vec<(String, String)> {
             }
         }
     }
-    for o in &l.pc_outputs {
-        put("output", &o.title);
-        put("output", &o.line2);
-    }
     if let Some(m) = &l.more {
         put("more", &m.title);
-        put("more", &m.line2);
+        put("more", &m.tooltip);
     }
     if let Some(m) = &l.music_assistant {
         put("ma", &m.heading);
     }
     if let Some(sr) = &l.searching {
         put("search", &sr.title);
-        put("search", &sr.line2);
+        put("search", &sr.tooltip);
         if let Some(nf) = &sr.none_found {
             put("search", &nf.title);
             for c in &nf.causes {
@@ -1630,6 +1933,8 @@ fn all_text(s: &Snapshot) -> Vec<(String, String)> {
             }
         }
     }
+
+    // The rest of the panel and the other surfaces.
     if let Some(no) = &s.notice {
         put("notice", &no.text);
         for t in no.detail.iter() {
@@ -1640,29 +1945,17 @@ fn all_text(s: &Snapshot) -> Vec<(String, String)> {
         }
     }
     let f = &s.footer;
-    for b in [&f.cant_hear, &f.speaker_missing, &f.settings] {
+    for b in f.cant_hear.iter().chain([&f.speaker_missing, &f.settings]) {
         put("footer", &b.label);
     }
-    put("footer", &f.more);
-    for m in &f.menu {
-        put("footer", &m.label);
-    }
     put("tooltip", &s.tray.tooltip);
-    fn menu(entries: &[MenuEntry], out: &mut Vec<(String, String)>) {
-        for e in entries {
-            match e {
-                MenuEntry::Label(t) => out.push(("tray".into(), t.clone())),
-                MenuEntry::Item(i) => out.push(("tray".into(), i.label.clone())),
-                MenuEntry::Separator => {}
-                MenuEntry::Submenu { label, entries } => {
-                    out.push(("tray".into(), label.clone()));
-                    menu(entries, out);
-                }
-            }
+    for e in &s.tray.menu {
+        match e {
+            MenuEntry::Label(t) => put("tray", t),
+            MenuEntry::Item(i) => put("tray", &i.label),
+            MenuEntry::Separator => {}
         }
     }
-    menu(&s.tray.menu, &mut out);
-    let mut put = |w: &str, t: &str| out.push((w.to_string(), t.to_string()));
     if let Some(d) = &s.device_name {
         put("device", d);
     }

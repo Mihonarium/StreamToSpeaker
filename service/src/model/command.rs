@@ -33,8 +33,6 @@ pub enum Command {
     /// the answer to the row's question, or *Play on Kitchen again* after
     /// a takeover.
     PlayTakingOver(SpeakerId),
-    /// Make one of Windows' outputs This PC's output and play there.
-    PlayOnPcOutput(PcOutputId),
     /// Stop the connection being made; the sound stays where it is.
     CancelConnect,
     /// Leave a busy speaker alone (*Cancel* on its row's question).
@@ -68,6 +66,25 @@ pub enum Command {
     /// Setup does before it updates the app.
     Release { for_update: bool },
     Quit,
+    /// An answer in first run.
+    FirstRun(FirstRunAct),
+}
+
+/// What a person does in first run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstRunAct {
+    /// *Not now*: first run ends; the sound stays on this PC.
+    NotNow,
+    /// ×: first run pauses at this step until the panel opens again.
+    Close,
+    /// *Play it again*: the chime once more.
+    PlayChimeAgain,
+    /// *I heard it*. (*I didn't hear it* opens the "Can't hear it?" check.)
+    Heard,
+    /// The switch *Start when I sign in, and go back to Kitchen*.
+    StartAtSignIn(bool),
+    /// *Done*.
+    Done,
 }
 
 /// What a delay button or command asks for.
@@ -105,11 +122,11 @@ pub enum NoticeKind {
 /// Something to open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Open {
-    /// The panel; `amount_field` opens the delay control's amount field.
-    Panel { amount_field: bool },
+    /// The panel.
+    Panel,
     Settings,
-    /// A speaker's page; `delay` focuses its delay control.
-    SpeakerSettings { speaker: SpeakerId, delay: bool },
+    /// A speaker's page in Settings.
+    SpeakerSettings(SpeakerId),
     MusicAssistantSettings,
     /// How to make Music Assistant start playing this PC's sound.
     MusicAssistantHowTo,
@@ -120,8 +137,6 @@ pub enum Open {
     AddByAddress,
     /// The code or password dialog of a speaker.
     Pair(SpeakerId),
-    Help,
-    About,
     WhatsNew,
     Donate,
     /// Windows: Sound settings.

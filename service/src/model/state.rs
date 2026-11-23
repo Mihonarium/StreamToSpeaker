@@ -320,8 +320,9 @@ impl NowState {
         }
     }
 
-    /// Whether the Now card shows the delay control (when the place is a
-    /// speaker whose delay this app can change).
+    /// Whether the delay of the place shows (the place is a speaker the
+    /// sound is on). Not while a speaker isn't responding: the sound is on
+    /// no place then.
     pub fn shows_delay(&self) -> bool {
         use NowState::*;
         matches!(
@@ -330,9 +331,20 @@ impl NowState {
                 | ApplyingDelay { .. }
                 | Ready { .. }
                 | ReadyPlayingElsewhere { .. }
+                | NotTaking { .. }
                 | WindowsRefused { .. }
                 | PlayingSentApps { .. }
                 | ReadyNoAppSent { .. }
+        )
+    }
+
+    /// The everyday states, whose top is three lines of fixed height; every
+    /// other state is something the person needs to know about.
+    pub fn is_everyday(&self) -> bool {
+        use NowState::*;
+        matches!(
+            self,
+            OnThisPc | Connecting { .. } | Playing { .. } | ApplyingDelay { .. } | Ready { .. } | MaPlaying { .. }
         )
     }
 

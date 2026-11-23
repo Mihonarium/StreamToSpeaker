@@ -35,16 +35,27 @@ pub struct Facts {
     /// The latest notification, if the engine raised one; surfaces show a
     /// notification whose `seq` they haven't shown yet.
     pub notification: Option<NotificationFacts>,
+    /// First run, while it shows in the panel.
+    pub first_run: Option<FirstRun>,
 }
 
-/// This PC's outputs.
+/// The step of first run the panel shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FirstRun {
+    /// Pick a speaker; the list fills as speakers answer.
+    Pick,
+    /// The chime played on `speaker`.
+    Hear { speaker: SpeakerId },
+    /// Where the app lives, and starting at sign-in.
+    FindIt { speaker: SpeakerId, start_at_sign_in: bool },
+}
+
+/// This PC.
 #[derive(Clone, Debug)]
 pub struct PcFacts {
-    /// The output This PC plays on (Windows' default when it isn't this
-    /// app's, else the one the app will restore).
+    /// The output This PC plays on: Windows' default while it isn't this
+    /// app's, otherwise the one the app gives the sound back to.
     pub output: PcOutput,
-    /// Windows' other active outputs, for This PC's chevron.
-    pub others: Vec<PcOutput>,
 }
 
 /// One of Windows' sound outputs, with Windows' own names.
@@ -55,17 +66,6 @@ pub struct PcOutput {
     pub friendly: String,
     /// The endpoint's own name, e.g. "Speakers", "Headphones".
     pub name: String,
-    /// The device it belongs to, e.g. "Realtek Audio".
-    pub device: String,
-    pub kind: OutputKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutputKind {
-    Speakers,
-    Headphones,
-    Display,
-    Other,
 }
 
 /// A speaker, group or pair the app knows.
@@ -126,7 +126,8 @@ pub enum Presence {
     Found,
     /// Remembered, not found right now.
     NotFound,
-    /// Found, but this app can't play to it.
+    /// Found, but this app can't play to it (left out of the panel; its
+    /// page in Settings says why).
     CantPlay,
     /// A stereo pair with one HomePod missing.
     WaitingForPair,

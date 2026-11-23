@@ -11,7 +11,7 @@
 //! let kitchen = engine.speaker_id("Kitchen");
 //! engine.send(Surface::Panel, Command::Play(Place::Speaker(kitchen)));
 //! engine.settle();
-//! assert_eq!(engine.snapshot().now.title, "Kitchen is ready");
+//! assert_eq!(engine.snapshot().top.sentence, "Playing on Kitchen");
 //! ```
 
 use std::collections::{HashMap, VecDeque};
@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::command::{
-    ticket, Command, DelayOutcome, DelayStep, Effect, NoticeKind, Outcome, Refusal, Reply, Surface,
-    Ticket, VolumeOwner,
+    ticket, Command, DelayOutcome, DelayStep, Effect, FirstRunAct, NoticeKind, Outcome, Refusal, Reply,
+    Surface, Ticket, VolumeOwner,
 };
 use super::delay::press;
 use super::facts::*;
@@ -34,7 +34,6 @@ use super::text::{Lang, LocalTime};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Scenario {
     OnThisPc,
-    PcOutputs,
     Connecting,
     ConnectingFromPc,
     Playing,
@@ -85,12 +84,14 @@ pub enum Scenario {
     NoticeUpdate,
     NoticeUpdated,
     NoticeDonation,
+    FirstRunPick,
+    FirstRunHear,
+    FirstRunFindIt,
 }
 
 impl Scenario {
     pub const ALL: &'static [Scenario] = &[
         Scenario::OnThisPc,
-        Scenario::PcOutputs,
         Scenario::Connecting,
         Scenario::ConnectingFromPc,
         Scenario::Playing,
@@ -141,6 +142,9 @@ impl Scenario {
         Scenario::NoticeUpdate,
         Scenario::NoticeUpdated,
         Scenario::NoticeDonation,
+        Scenario::FirstRunPick,
+        Scenario::FirstRunHear,
+        Scenario::FirstRunFindIt,
     ];
 
     /// The scenario's name, for preview tools and demos ("fell-back").
@@ -148,7 +152,6 @@ impl Scenario {
         use Scenario::*;
         match self {
             OnThisPc => "on-this-pc",
-            PcOutputs => "pc-outputs",
             Connecting => "connecting",
             ConnectingFromPc => "connecting-from-pc",
             Playing => "playing",
@@ -199,6 +202,9 @@ impl Scenario {
             NoticeUpdate => "notice-update",
             NoticeUpdated => "notice-updated",
             NoticeDonation => "notice-donation",
+            FirstRunPick => "first-run-pick",
+            FirstRunHear => "first-run-hear",
+            FirstRunFindIt => "first-run-find-it",
         }
     }
 
@@ -528,15 +534,6 @@ impl Sim {
                 self.at(MA_START_MS, Event::MaStarts(gen));
                 Ok(Effect::Done)
             }
-            Command::PlayOnPcOutput(id) => {
-                if let Some(i) = self.facts.pc.others.iter().position(|o| o.id == id) {
-                    let new = self.facts.pc.others.remove(i);
-                    let old = std::mem::replace(&mut self.facts.pc.output, new);
-                    self.facts.pc.others.insert(i, old);
-                }
-                self.to_this_pc();
-                Ok(Effect::Done)
-            }
             Command::CancelConnect => {
                 if let NowState::Connecting { from, .. } = self.facts.state.clone() {
                     self.connect_gen += 1;
@@ -604,8 +601,27 @@ impl Sim {
                 }
                 Ok(Effect::Done)
             }
+            Command::FirstRun(act) => {
+                self.first_run(act);
+                Ok(Effect::Done)
+            }
             Command::PlayTestSound(_) | Command::Open(_) | Command::SettingsShown(_) => Ok(Effect::Done),
         }
+    }
+
+    fn first_run(&mut self, act: FirstRunAct) {
+        let step = self.facts.first_run.clone();
+        self.facts.first_run = match (act, step) {
+            (FirstRunAct::Heard, Some(FirstRun::Hear { speaker })) => {
+                Some(FirstRun::FindIt { speaker, start_at_sign_in: true })
+            }
+            (FirstRunAct::StartAtSignIn(on), Some(FirstRun::FindIt { speaker, .. })) => {
+                Some(FirstRun::FindIt { speaker, start_at_sign_in: on })
+            }
+            (FirstRunAct::PlayChimeAgain, step) => step,
+            (FirstRunAct::NotNow | FirstRunAct::Close | FirstRunAct::Done, _) => None,
+            (_, step) => step,
+        };
     }
 
     fn set_level(&mut self, owner: &VolumeOwner, f: impl FnOnce(&mut Level)) {
@@ -824,6 +840,9 @@ impl Sim {
             s.name.clone()
         });
         self.facts.remembered = Remembered::Speaker { name: name.unwrap_or_default() };
+        if self.facts.first_run == Some(FirstRun::Pick) {
+            self.facts.first_run = Some(FirstRun::Hear { speaker: id.clone() });
+        }
         self.facts.state = if self.apps.0.is_empty() {
             NowState::Ready { speaker: id.clone() }
         } else {
@@ -957,14 +976,8 @@ fn id(s: &str) -> SpeakerId {
     SpeakerId::new(s)
 }
 
-fn output(id: &str, name: &str, device: &str, kind: OutputKind) -> PcOutput {
-    PcOutput {
-        id: PcOutputId::new(id),
-        friendly: format!("{name} ({device})"),
-        name: name.to_string(),
-        device: device.to_string(),
-        kind,
-    }
+fn output(id: &str, name: &str, device: &str) -> PcOutput {
+    PcOutput { id: PcOutputId::new(id), friendly: format!("{name} ({device})"), name: name.to_string() }
 }
 
 fn speaker(key: &str, name: &str, kind: SpeakerKind, address: &str, own_ms: u32) -> SpeakerFacts {
@@ -1076,10 +1089,7 @@ fn household(names: Names) -> (Facts, HashMap<SpeakerId, Profile>) {
     let facts = Facts {
         lang: Lang::English,
         state: NowState::OnThisPc,
-        pc: PcFacts {
-            output: output("realtek", "Speakers", "Realtek Audio", OutputKind::Speakers),
-            others: vec![],
-        },
+        pc: PcFacts { output: output("realtek", "Speakers", "Realtek Audio") },
         speakers,
         music_assistant: Some(MaFacts { connected: true, last_seen: None }),
         search: SearchFacts::default(),
@@ -1093,6 +1103,7 @@ fn household(names: Names) -> (Facts, HashMap<SpeakerId, Profile>) {
         sending_sound: false,
         notices: NoticeFacts::default(),
         notification: None,
+        first_run: None,
     };
     (facts, profiles)
 }
@@ -1144,12 +1155,6 @@ fn scenario_facts(scenario: Scenario, names: Names) -> (Facts, HashMap<SpeakerId
 
     match scenario {
         OnThisPc => {}
-        PcOutputs => {
-            f.pc.others = vec![
-                output("headphones", "Headphones", "WH-1000XM4", OutputKind::Headphones),
-                output("monitor", "Monitor", "NVIDIA High Definition Audio", OutputKind::Display),
-            ];
-        }
         Connecting => {
             play_on(&mut f, &profiles, &k, &apps);
             f.delay = None;
@@ -1190,7 +1195,6 @@ fn scenario_facts(scenario: Scenario, names: Names) -> (Facts, HashMap<SpeakerId
         }
         NotTaking => {
             play_on(&mut f, &profiles, &k, &apps);
-            f.delay = None;
             f.state = NowState::NotTaking { speaker: k.clone(), since: t(21, 14) };
             f.seen = false;
             f.speakers.retain(|s| s.id.as_str() != "garage");
@@ -1271,8 +1275,7 @@ fn scenario_facts(scenario: Scenario, names: Names) -> (Facts, HashMap<SpeakerId
             f.state = NowState::LookingFor { speaker: k.clone(), looking: Looking::NotFound(Return::ByItself) };
         }
         WindowsSwitched => {
-            f.pc.others = vec![f.pc.output.clone()];
-            f.pc.output = output("headphones", "Headphones", "WH-1000XM4", OutputKind::Headphones);
+            f.pc.output = output("headphones", "Headphones", "WH-1000XM4");
             f.volume.pc = Level::at(24);
             f.state = NowState::WindowsSwitched { speaker: k.clone(), at: t(21, 50) };
             f.speakers.retain(|s| s.id.as_str() != "garage" && s.id.as_str() != "office");
@@ -1505,6 +1508,33 @@ fn scenario_facts(scenario: Scenario, names: Names) -> (Facts, HashMap<SpeakerId
         NoticeUpdate => f.notices.update_ready = Some("0.2.1".into()),
         NoticeUpdated => f.notices.updated_to = Some("0.2.1".into()),
         NoticeDonation => f.notices.donation_due = true,
+        FirstRunPick => {
+            f.speakers.retain(|s| s.id.as_str() != "garage");
+            for s in &mut f.speakers {
+                s.used_here = false;
+                if let Some(d) = s.delay.as_mut() {
+                    d.change_ms = 0;
+                }
+            }
+            f.music_assistant = None;
+            f.remembered = Remembered::Nothing;
+            f.first_run = Some(FirstRun::Pick);
+        }
+        FirstRunHear | FirstRunFindIt => {
+            set_change(&mut f, "kitchen", 0);
+            f.speakers.retain(|s| s.id.as_str() != "garage");
+            f.music_assistant = None;
+            play_on(&mut f, &profiles, &k, &Apps::default());
+            if let Some(l) = f.volume.place.as_mut() {
+                l.value = 25;
+            }
+            f.first_run = Some(if scenario == FirstRunHear {
+                FirstRun::Hear { speaker: k.clone() }
+            } else {
+                FirstRun::FindIt { speaker: k.clone(), start_at_sign_in: true }
+            });
+            apps = Apps::default();
+        }
     }
     // Den TV and the desk speaker are only in the scenarios that show them.
     f.speakers.retain(|s| !(s.hidden && matches!(s.id.as_str(), "den" | "desk")));

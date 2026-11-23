@@ -3,9 +3,9 @@
 //! sound output, and the one-line status of the phone remote and the
 //! command line.
 
-use super::command::{Command, DelayStep, NoticeKind, Open};
-use super::delay::{change_text, figure, figure_text, DelayBody, DelayView};
-use super::facts::{Applies, Facts, NotificationKind, Progress, Remembered};
+use super::command::{Command, NoticeKind, Open};
+use super::delay::{change_text, figure, figure_text, DelayView};
+use super::facts::{Applies, Facts, NotificationKind, Remembered};
 use super::places::{kind_text, PlaceList};
 use super::snapshot::{find, name_of, Button, ButtonStyle, MenuItem, NowCard, Tone};
 use super::state::{Arcs, Badge, FellBackCause, Looking, NowState, Place, Secret, SpeakerId};
@@ -29,20 +29,17 @@ pub enum MenuEntry {
     Label(String),
     Item(MenuItem),
     Separator,
-    Submenu { label: String, entries: Vec<MenuEntry> },
 }
 
-/// The panel's footer.
+/// The panel's footer. Help and About are pages of Settings; Quit is in
+/// the tray icon's menu.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Footer {
-    pub cant_hear: Button,
+    /// Only while the place is a speaker or Music Assistant.
+    pub cant_hear: Option<Button>,
     pub speaker_missing: Button,
     /// The gear.
     pub settings: Button,
-    /// The ⋯ button's name.
-    pub more: String,
-    /// The ⋯ menu: Help, About, Quit.
-    pub menu: Vec<MenuItem>,
 }
 
 /// The notice line.
@@ -249,12 +246,13 @@ pub fn picker_prompt(lang: Lang, count: usize) -> String {
     t!(lang, PickerPrompt, count = count)
 }
 
-fn cant_hear(facts: &Facts) -> Command {
-    let speaker = match facts.state.current_place() {
-        Some(Place::Speaker(id)) => Some(id),
-        _ => facts.state.speaker().cloned(),
-    };
-    Command::Open(Open::CantHear(speaker))
+/// *Can't hear it?*, while the place is a speaker or Music Assistant.
+fn cant_hear(facts: &Facts) -> Option<Command> {
+    match facts.state.current_place() {
+        Some(Place::Speaker(id)) => Some(Command::Open(Open::CantHear(Some(id)))),
+        Some(Place::MusicAssistant) => Some(Command::Open(Open::CantHear(None))),
+        _ => None,
+    }
 }
 
 fn quit_label(facts: &Facts) -> String {
@@ -270,27 +268,15 @@ fn quit_label(facts: &Facts) -> String {
 pub fn footer(facts: &Facts) -> Footer {
     let lang = facts.lang;
     Footer {
-        cant_hear: Button::link(t!(lang, CantHear), cant_hear(facts)),
+        cant_hear: cant_hear(facts).map(|c| Button::link(t!(lang, CantHear), c)),
         speaker_missing: Button::link(t!(lang, SpeakerMissing), Command::Open(Open::SpeakerMissing)),
         settings: Button { style: ButtonStyle::Icon, ..Button::new(t!(lang, Settings), Command::Open(Open::Settings)) },
-        more: t!(lang, More),
-        menu: vec![
-            MenuItem::new(t!(lang, Help), Command::Open(Open::Help)),
-            MenuItem::new(t!(lang, About), Command::Open(Open::About)),
-            MenuItem::new(quit_label(facts), Command::Quit),
-        ],
     }
 }
 
-/// The tray icon, tooltip and menu.
-pub fn tray(
-    facts: &Facts,
-    list: &PlaceList,
-    now: &NowCard,
-    delay: Option<&DelayView>,
-    short: &str,
-    badge: Badge,
-) -> Tray {
+/// The tray icon, tooltip and menu: the state, the places, Open, Settings
+/// and Quit. The panel is one click on the same icon for the rest.
+pub fn tray(facts: &Facts, list: &PlaceList, short: &str, badge: Badge) -> Tray {
     let lang = facts.lang;
     let mut menu = vec![MenuEntry::Label(short.to_string()), MenuEntry::Separator];
 
@@ -310,59 +296,10 @@ pub fn tray(
     }
     menu.extend(places.into_iter().map(MenuEntry::Item));
     if more {
-        menu.push(MenuEntry::Item(MenuItem::new(
-            t!(lang, MoreSpeakersEllipsis),
-            Command::Open(Open::Panel { amount_field: false }),
-        )));
+        menu.push(MenuEntry::Item(MenuItem::new(t!(lang, MoreSpeakersEllipsis), Command::Open(Open::Panel))));
     }
     menu.push(MenuEntry::Separator);
-
-    if let (Some(view), Some(control)) = (delay, now.delay.as_ref()) {
-        if let DelayBody::Buttons { remove_large, remove_small, add_large, add_small } = &control.body {
-            let fig = figure_text(lang, figure(view.delay));
-            let mut label = match change_text(lang, view.delay.change_ms) {
-                Some(change) => t!(lang, TrayDelayChange, figure = &fig, change = &change),
-                None => t!(lang, TrayDelay, figure = &fig),
-            };
-            if view.progress != Progress::Settled {
-                label = t!(lang, TrayApplying, line = &label);
-            }
-            let mut entries = Vec::new();
-            if view.applies == Applies::Reconnect {
-                entries.push(MenuEntry::Label(t!(lang, TrayReconnectNote, speaker = &view.name)));
-            }
-            for b in [remove_large, remove_small, add_small, add_large] {
-                entries.push(MenuEntry::Item(MenuItem {
-                    enabled: b.enabled,
-                    ..MenuItem::new(b.label.clone(), b.command.clone())
-                }));
-            }
-            entries.push(MenuEntry::Item(MenuItem::new(
-                t!(lang, OtherAmount),
-                Command::Open(Open::Panel { amount_field: true }),
-            )));
-            entries.push(MenuEntry::Separator);
-            entries.push(MenuEntry::Item(MenuItem {
-                enabled: view.delay.change_ms != 0,
-                ..MenuItem::new(
-                    t!(lang, BackToOwn, speaker = &view.name),
-                    Command::ChangeDelay { speaker: view.speaker.clone(), step: DelayStep::Reset },
-                )
-            }));
-            entries.push(MenuEntry::Item(MenuItem::new(
-                t!(lang, DelaySettings),
-                Command::Open(Open::SpeakerSettings { speaker: view.speaker.clone(), delay: true }),
-            )));
-            menu.push(MenuEntry::Submenu { label, entries });
-            menu.push(MenuEntry::Separator);
-        }
-    }
-
-    menu.push(MenuEntry::Item(MenuItem::new(t!(lang, CantHear), cant_hear(facts))));
-    menu.push(MenuEntry::Item(MenuItem::new(
-        t!(lang, OpenApp),
-        Command::Open(Open::Panel { amount_field: false }),
-    )));
+    menu.push(MenuEntry::Item(MenuItem::new(t!(lang, OpenShort), Command::Open(Open::Panel))));
     menu.push(MenuEntry::Item(MenuItem::new(t!(lang, Settings), Command::Open(Open::Settings))));
     menu.push(MenuEntry::Separator);
     menu.push(MenuEntry::Item(MenuItem::new(quit_label(facts), Command::Quit)));
