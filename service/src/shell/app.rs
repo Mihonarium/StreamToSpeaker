@@ -14,7 +14,7 @@ use windows_sys::Win32::Foundation::HWND;
 
 use super::content::WantedGate;
 use super::panel_window::{OpenView, PanelWindow, Seen, Step, Toggle, TrayClick};
-use super::views::{StandInViews, ViewMemory};
+use super::views::ViewMemory;
 use super::tray::{Tray, TrayEvent};
 use super::win::{self, WindowsDesktop};
 use super::{centred, panel_builder, root_builder, Ask, Desktop, Placeholders, RootMode, ShellOptions, ViewContent, Views, WindowContent, WindowKind, Wiring, ROOT_TITLE};
@@ -52,20 +52,19 @@ pub fn scripted_scenario() -> Option<Scenario> {
     std::env::var("STREAM_TO_SPEAKER_SCENARIO").ok().and_then(|n| Scenario::from_name(n.trim()))
 }
 
-/// Run the shell on the scripted engine in `scenario`, with placeholder
-/// windows for Settings and the dialogs.
+/// Run the shell on the scripted engine in `scenario`, with the views on
+/// the scripted settings and placeholder windows for the rest.
 pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()> {
     let engine = Arc::new(ScriptedEngine::new(scenario));
     let _clock = RealTime::start(engine.clone(), Duration::from_millis(50));
-    run(
-        opts,
-        Wiring { port: engine, views: Box::new(StandInViews), contents: Box::new(Placeholders), route_opens: None, quit: Box::new(|| {}), quitting: Box::new(|| false) },
-    )
+    let settings: Arc<dyn crate::settings::SettingsPort> = Arc::new(crate::settings::scripted::ScriptedSettings::new());
+    let views = Box::new(crate::settings::views::SettingsViews::new(settings));
+    run(opts, Wiring { port: engine, views, contents: Box::new(Placeholders), route_opens: None, quit: Box::new(|| {}), quitting: Box::new(|| false) })
 }
 
-/// Run the shell on the running app: the engine as its port, the Settings
-/// window and dialogs on the app's settings, Quit through the app's own
-/// quit (which gives the sound back).
+/// Run the shell on the running app: the engine as its port, the views and
+/// dialogs on the app's settings, Quit through the app's own quit (which
+/// gives the sound back).
 pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, opts: ShellOptions) -> anyhow::Result<()> {
     let settings: Arc<dyn crate::settings::SettingsPort> = Arc::new(crate::settings::real::AppSettings::new(app.clone()));
     let (quit, quitting) = (app.clone(), app.clone());
@@ -74,7 +73,7 @@ pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, op
         opts,
         Wiring {
             port: engine,
-            views: Box::new(StandInViews),
+            views: Box::new(crate::settings::views::SettingsViews::new(settings.clone())),
             contents: Box::new(super::content::SettingsContents {
                 port: settings,
                 open_windows_page: win::open_windows_page,
@@ -324,6 +323,8 @@ impl Shell {
             self.open_panel(ctx, None);
             return;
         }
+        let redirected = super::content::pair_from_outside(open, snap, from_window);
+        let open = redirected.as_ref().unwrap_or(open);
         if let Some(view) = self.views.view(open, snap) {
             self.show_view(ctx, view, push);
             return;

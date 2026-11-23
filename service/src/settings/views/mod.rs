@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::model::command::Open;
 use crate::model::snapshot::Snapshot;
-use crate::shell::{Ask, ViewContent, Views, WindowContent};
+use crate::shell::{Ask, ViewContent, Views};
 
 pub use about::{AboutView, GuidesView, LabView};
 pub use cant_hear::CantHearView;
@@ -54,6 +54,7 @@ impl Views for SettingsViews {
             Open::SpeakerSettings(id) => Box::new(SpeakerOptions::new(port, id.as_str())),
             Open::Settings => Box::new(SettingsView::new(port)),
             Open::SpeakerMissing => Box::new(MissingView::new(port)),
+            Open::AddByAddress => Box::new(MissingView::new(port).to_add()),
             Open::CantHear(_) => Box::new(CantHearView::new(port)),
             Open::MusicAssistantSettings | Open::MusicAssistantHowTo => Box::new(MusicAssistantView::new(port)),
             Open::WhatsNew => Box::new(AboutView::new(port)),
@@ -62,38 +63,7 @@ impl Views for SettingsViews {
     }
 }
 
-/// A dialog of Settings in a window of its own, for the shell.
-pub struct DialogWindow {
-    dialog: Dialog,
-    port: Arc<dyn SettingsPort>,
-}
-
-impl DialogWindow {
-    pub fn new(dialog: Dialog, port: Arc<dyn SettingsPort>) -> Self {
-        DialogWindow { dialog, port }
-    }
-}
-
-impl WindowContent for DialogWindow {
-    fn title(&self, _snap: &Snapshot) -> String {
-        Dialog::window_title(self.port.lang())
-    }
-
-    fn sizes(&self) -> (egui::Vec2, egui::Vec2) {
-        let s = egui::Vec2::from(self.dialog.size());
-        (s, s)
-    }
-
-    fn show(&mut self, ctx: &egui::Context, _snap: &Snapshot, _ask: &mut dyn FnMut(Ask)) -> bool {
-        !self.dialog.show(ctx, self.port.as_ref())
-    }
-
-    fn closed(&mut self) {
-        self.dialog.cancel(self.port.as_ref());
-    }
-}
-
 /// Ask the shell to open `dialog` in a window of its own.
 fn open_dialog(port: &Arc<dyn SettingsPort>, dialog: Dialog, ask: &mut dyn FnMut(Ask)) {
-    ask(Ask::Dialog(Box::new(DialogWindow::new(dialog, port.clone()))));
+    ask(Ask::Dialog(Box::new(crate::shell::content::DialogWindow::new(dialog, port.clone()))));
 }

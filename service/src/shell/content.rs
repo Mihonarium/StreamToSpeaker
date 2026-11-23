@@ -1,6 +1,6 @@
-//! The Settings window and its dialogs as the shell's window content, on a
-//! settings port (the running app's, or the scripted one), and what each
-//! request to open something does.
+//! The dialogs that keep a window of their own, on a settings port (the
+//! running app's, or the scripted one), and what each request to open
+//! something outside the panel's views does.
 
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use crate::model::command::Open;
 use crate::model::snapshot::Snapshot;
 use crate::model::state::{NowState, Secret, SpeakerId};
 use crate::settings::port::Wanted;
-use crate::settings::{self, Act, AddDialog, Dialog, PasswordDialog, Request, SettingsPort};
+use crate::settings::{Act, Dialog, PasswordDialog, SettingsPort};
 
 /// A page of Windows' own settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,21 +32,23 @@ impl WindowsPage {
     }
 }
 
-/// The page of Settings `open` asks for, if it asks for one.
-pub fn page_of(open: &Open) -> Option<settings::Page> {
-    use settings::Page;
-    Some(match open {
-        Open::Settings => Page::Speakers,
-        Open::SpeakerSettings(id) => Page::Speaker(id.as_str().to_string()),
-        Open::MusicAssistantSettings | Open::MusicAssistantHowTo => Page::MusicAssistant,
-        Open::CantHear(_) => Page::CantHear,
-        Open::SpeakerMissing => Page::CantFind,
-        Open::WhatsNew => Page::About,
-        _ => return None,
-    })
+/// Whether `id` is the speaker that waits for its password now.
+fn wants_password(snap: &Snapshot, id: &SpeakerId) -> bool {
+    matches!(&snap.state, NowState::NeedsSecret { speaker, secret: Secret::Password } if speaker == id)
 }
 
-/// The Settings window and its dialogs on `port`.
+/// What a request to pair opens when it comes from outside the app's
+/// windows (a notification): the speaker's view, where *Enter code…*
+/// starts it, because only a pick in the app's window may connect. A
+/// password is asked for in its dialog wherever the request comes from.
+pub fn pair_from_outside(open: &Open, snap: &Snapshot, from_window: bool) -> Option<Open> {
+    match open {
+        Open::Pair(id) if !from_window && !wants_password(snap, id) => Some(Open::SpeakerSettings(id.clone())),
+        _ => None,
+    }
+}
+
+/// The dialogs on `port`, and what opens outside the app.
 pub struct SettingsContents {
     pub port: Arc<dyn SettingsPort>,
     /// Opens a page of Windows' settings.
@@ -68,32 +70,17 @@ fn name_of(snap: &Snapshot, id: &SpeakerId) -> String {
 
 impl Contents for SettingsContents {
     fn open(&self, open: &Open, snap: &Snapshot, from_window: bool) -> Option<(WindowKind, Box<dyn WindowContent>)> {
-        let page = |page: settings::Page| {
-            let mut window = settings::Window::new();
-            window.open(page);
-            Some((WindowKind::Settings, Box::new(SettingsWindow { window, port: self.port.clone() }) as Box<dyn WindowContent>))
-        };
-        if let Some(p) = page_of(open) {
-            return page(p);
-        }
         match open {
-            Open::AddByAddress => self.dialog(Dialog::AddAddress(AddDialog::default())),
             // A speaker that asks for its password: the dialog that
             // connects with it once the person types it. Otherwise a
-            // pairing with a code: from the window it starts at once (its
-            // dialog then opens by itself); from elsewhere the speaker's
-            // page, where *Pair again* starts it, because only a pick in
-            // the app's window may connect.
-            Open::Pair(id) => match &snap.state {
-                NowState::NeedsSecret { speaker, secret: Secret::Password } if speaker == id => {
-                    self.dialog(Dialog::Password(PasswordDialog::to_connect(id.as_str(), &name_of(snap, id))))
-                }
-                _ if from_window => {
-                    self.port.act(Act::PairAgain(id.as_str().to_string()));
-                    None
-                }
-                _ => page(settings::Page::Speaker(id.as_str().to_string())),
-            },
+            // pairing with a code, from the window: it starts at once (its
+            // dialog then opens by itself). From elsewhere the shell opens
+            // the speaker's view instead (see [`pair_from_outside`]).
+            Open::Pair(id) if wants_password(snap, id) => self.dialog(Dialog::Password(PasswordDialog::to_connect(id.as_str(), &name_of(snap, id)))),
+            Open::Pair(id) if from_window => {
+                self.port.act(Act::PairAgain(id.as_str().to_string()));
+                None
+            }
             Open::Donate => {
                 self.port.act(Act::Donate);
                 None
@@ -135,49 +122,6 @@ impl Contents for SettingsContents {
         };
         let dialog = Dialog::wanted(self.port.as_ref())?;
         Some((key, Box::new(DialogWindow { dialog, port: self.port.clone() })))
-    }
-}
-
-/// The Settings window.
-pub struct SettingsWindow {
-    window: settings::Window,
-    port: Arc<dyn SettingsPort>,
-}
-
-impl SettingsWindow {
-    /// The page it shows.
-    pub fn page(&self) -> settings::Page {
-        self.window.page()
-    }
-}
-
-impl WindowContent for SettingsWindow {
-    fn title(&self, _snap: &Snapshot) -> String {
-        settings::title(self.port.lang())
-    }
-
-    fn sizes(&self) -> (Vec2, Vec2) {
-        (Vec2::from(settings::DEFAULT_SIZE), Vec2::from(settings::MIN_SIZE))
-    }
-
-    fn show(&mut self, ctx: &egui::Context, _snap: &Snapshot, ask: &mut dyn FnMut(Ask)) -> bool {
-        for r in self.window.show(ctx, self.port.as_ref()) {
-            match r {
-                Request::Dialog(dialog) => ask(Ask::Dialog(Box::new(DialogWindow { dialog, port: self.port.clone() }))),
-                Request::OpenPanel => ask(Ask::OpenPanel),
-            }
-        }
-        false
-    }
-
-    fn navigate(&mut self, open: &Open) -> bool {
-        match page_of(open) {
-            Some(page) => {
-                self.window.open(page);
-                true
-            }
-            None => false,
-        }
     }
 }
 
@@ -274,27 +218,26 @@ mod tests {
     }
 
     #[test]
-    fn each_request_opens_its_page_of_the_one_settings_window() {
-        let (c, _) = contents();
+    fn each_request_for_settings_opens_a_view_of_the_panel_not_a_window() {
+        use crate::shell::Views;
+        let (c, s) = contents();
+        let views = crate::settings::views::SettingsViews::new(s.clone());
         let playing = snap(Scenario::Playing);
-        for (open, page) in [
-            (Open::Settings, settings::Page::Speakers),
-            (Open::SpeakerSettings(SpeakerId::new("kitchen")), settings::Page::Speaker("kitchen".into())),
-            (Open::MusicAssistantSettings, settings::Page::MusicAssistant),
-            (Open::MusicAssistantHowTo, settings::Page::MusicAssistant),
-            (Open::CantHear(None), settings::Page::CantHear),
-            (Open::SpeakerMissing, settings::Page::CantFind),
-            (Open::WhatsNew, settings::Page::About),
+        for (open, title) in [
+            (Open::Settings, "Settings"),
+            (Open::SpeakerSettings(SpeakerId::new("kitchen")), "Kitchen"),
+            (Open::MusicAssistantSettings, "Music Assistant"),
+            (Open::MusicAssistantHowTo, "Music Assistant"),
+            (Open::CantHear(None), "Can’t hear it?"),
+            (Open::SpeakerMissing, "Speaker missing?"),
+            (Open::AddByAddress, "Speaker missing?"),
+            (Open::WhatsNew, "About"),
         ] {
-            let (kind, _) = c.open(&open, &playing, true).unwrap();
-            assert_eq!(kind, WindowKind::Settings, "{open:?}");
-            assert_eq!(page_of(&open), Some(page));
+            let view = views.view(&open, &playing).unwrap_or_else(|| panic!("{open:?}: no view"));
+            assert_eq!(view.bar(&playing).title, title, "{open:?}");
+            assert!(c.open(&open, &playing, true).is_none(), "{open:?}: no window");
         }
-        // The open window shows another page instead.
-        let mut w = SettingsWindow { window: settings::Window::new(), port: c.port.clone() };
-        assert!(w.navigate(&Open::SpeakerMissing));
-        assert_eq!(w.page(), settings::Page::CantFind);
-        assert!(!w.navigate(&Open::AddByAddress));
+        assert!(views.view(&Open::Donate, &playing).is_none());
     }
 
     #[test]
@@ -316,14 +259,23 @@ mod tests {
         // the window.
         assert!(c.open(&Open::Pair(SpeakerId::new("den-tv")), &snap(Scenario::Playing), true).is_none());
         assert_eq!(s.take_acts(), vec![Act::PairAgain("den-tv".into())]);
-        // From elsewhere (a notification): the speaker's page, nothing
-        // started.
-        let (kind, _) = c.open(&Open::Pair(SpeakerId::new("den-tv")), &snap(Scenario::Playing), false).unwrap();
-        assert_eq!(kind, WindowKind::Settings);
+        // From elsewhere (a notification): the speaker's view, nothing
+        // started; a password is asked for wherever the request comes from.
+        assert_eq!(
+            pair_from_outside(&Open::Pair(SpeakerId::new("den-tv")), &snap(Scenario::Playing), false),
+            Some(Open::SpeakerSettings(SpeakerId::new("den-tv")))
+        );
+        assert_eq!(pair_from_outside(&Open::Pair(SpeakerId::new("den-tv")), &snap(Scenario::Playing), true), None);
+        let engine = ScriptedEngine::new(Scenario::Playing);
+        let mut f = engine.facts();
+        f.state = NowState::NeedsSecret { speaker: SpeakerId::new("office"), secret: Secret::Password };
+        engine.set_facts(f);
+        let asking = engine.snapshot();
+        assert_eq!(pair_from_outside(&Open::Pair(SpeakerId::new("office")), &asking, false), None);
+        assert_eq!(c.open(&Open::Pair(SpeakerId::new("office")), &asking, false).map(|(k, _)| k), Some(WindowKind::Dialog));
         assert!(s.take_acts().is_empty());
         assert!(c.open(&Open::Donate, &snap(Scenario::Playing), true).is_none());
         assert_eq!(s.take_acts(), vec![Act::Donate]);
-        assert_eq!(c.open(&Open::AddByAddress, &snap(Scenario::Playing), true).map(|(k, _)| k), Some(WindowKind::Dialog));
         OPENED.lock().unwrap().clear();
         for open in [Open::SoundSettings, Open::VolumeMixer, Open::NetworkSettings] {
             assert!(c.open(&open, &snap(Scenario::Playing), true).is_none());

@@ -35,6 +35,8 @@ pub struct MissingView {
     description: String,
     /// The name of the speaker last added, for the line that says so.
     added: Option<String>,
+    /// Put the keyboard in the address field (opened to add a speaker).
+    focus_address: bool,
 }
 
 impl MissingView {
@@ -50,7 +52,14 @@ impl MissingView {
             port_typed: String::new(),
             description: String::new(),
             added: None,
+            focus_address: false,
         }
+    }
+
+    /// Opened to add a speaker by its address: the keyboard in its field.
+    pub fn to_add(mut self) -> Self {
+        self.focus_address = true;
+        self
     }
 
     /// With an address typed (pictures and tests).
@@ -169,6 +178,10 @@ impl MissingView {
                 + 34.0;
             let field_w = (ui.available_width() - button_w - 8.0).max(80.0);
             let r = TextField::new(&mut self.address, &w!(lang, SetAddress)).hint(&w!(lang, SetAddressHint)).width(field_w).show(ui);
+            if std::mem::take(&mut self.focus_address) {
+                r.request_focus();
+                r.scroll_to_me(Some(egui::Align::Center));
+            }
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 go = true;
             }
