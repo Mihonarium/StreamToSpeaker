@@ -206,6 +206,13 @@ pub trait Contents {
     fn wanted(&self) -> Option<(String, Box<dyn WindowContent>)> {
         None
     }
+    /// `speaker` was picked in the app's windows: the dialog to fill in
+    /// before it can play (its password), if one is needed. The pick is
+    /// then made by the dialog.
+    fn before_play(&self, speaker: &crate::model::state::SpeakerId, snap: &Snapshot) -> Option<Box<dyn WindowContent>> {
+        let _ = (speaker, snap);
+        None
+    }
 }
 
 /// The shell's ties to the rest of the app.

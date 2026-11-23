@@ -18,6 +18,7 @@ use super::tray::{Tray, TrayEvent};
 use super::win::{self, WindowsDesktop};
 use super::{centred, panel_builder, root_builder, Ask, Desktop, Placeholders, RootMode, ShellOptions, WindowContent, WindowKind, Wiring, ROOT_TITLE};
 use crate::model::command::{Command, Open, Surface};
+use crate::model::state::Place;
 use crate::model::port::Watch;
 use crate::model::scripted::{RealTime, Scenario, ScriptedEngine};
 use crate::model::snapshot::Snapshot;
@@ -62,13 +63,20 @@ pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()
 /// quit (which gives the sound back).
 pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, opts: ShellOptions) -> anyhow::Result<()> {
     let settings: Arc<dyn crate::settings::SettingsPort> = Arc::new(crate::settings::real::AppSettings::new(app.clone()));
-    let (quit, quitting) = (app.clone(), app);
+    let (quit, quitting) = (app.clone(), app.clone());
     let route = engine.clone();
     run(
         opts,
         Wiring {
             port: engine,
-            contents: Box::new(super::content::SettingsContents { port: settings, open_windows_page: win::open_windows_page }),
+            contents: Box::new(super::content::SettingsContents {
+                port: settings,
+                open_windows_page: win::open_windows_page,
+                needs_password: {
+                    let app = app.clone();
+                    Box::new(move |id| app.is_password_protected(id) && (app.airplay_password(id).is_none() || app.asked_for_password(id)))
+                },
+            }),
             route_opens: Some(Box::new(move |opener| route.on_open(opener))),
             quit: Box::new(move || quit.request_shutdown()),
             quitting: Box::new(move || quitting.is_shutting_down()),
@@ -297,8 +305,17 @@ impl Shell {
 
     /// Do what a command asks of the windows; send the rest to the engine.
     fn route(&mut self, ctx: &egui::Context, from: Surface, command: Command, snap: &Snapshot) {
+        let window = matches!(from, Surface::Panel | Surface::Settings);
+        // A speaker picked in the panel that needs its password first: the
+        // dialog, which connects once it is typed.
+        if let (true, Command::Play(Place::Speaker(id)) | Command::PlayTakingOver(id)) = (window, &command) {
+            if let Some(dialog) = self.contents.before_play(id, snap) {
+                self.open_dialog(dialog);
+                return;
+            }
+        }
         match command {
-            Command::Open(open) => self.open(ctx, &open, snap, matches!(from, Surface::Panel | Surface::Settings)),
+            Command::Open(open) => self.open(ctx, &open, snap, window),
             Command::Quit => self.quit_now(),
             command => {
                 let _ = self.port.send(from, command);

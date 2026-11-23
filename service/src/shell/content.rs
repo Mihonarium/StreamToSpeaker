@@ -51,6 +51,9 @@ pub struct SettingsContents {
     pub port: Arc<dyn SettingsPort>,
     /// Opens a page of Windows' settings.
     pub open_windows_page: fn(WindowsPage),
+    /// Whether a speaker must be given its password before it can play
+    /// (it has one and none is kept, or it refused the one it was given).
+    pub needs_password: Box<dyn Fn(&str) -> bool>,
 }
 
 impl SettingsContents {
@@ -113,6 +116,14 @@ impl Contents for SettingsContents {
             }
             _ => None,
         }
+    }
+
+    fn before_play(&self, speaker: &SpeakerId, snap: &Snapshot) -> Option<Box<dyn WindowContent>> {
+        if !(self.needs_password)(speaker.as_str()) {
+            return None;
+        }
+        let dialog = Dialog::Password(PasswordDialog::to_connect(speaker.as_str(), &name_of(snap, speaker)));
+        Some(Box::new(DialogWindow { dialog, port: self.port.clone() }))
     }
 
     fn wanted(&self) -> Option<(String, Box<dyn WindowContent>)> {
@@ -248,7 +259,7 @@ mod tests {
 
     fn contents() -> (SettingsContents, Arc<ScriptedSettings>) {
         let s = Arc::new(ScriptedSettings::new());
-        (SettingsContents { port: s.clone(), open_windows_page: record }, s)
+        (SettingsContents { port: s.clone(), open_windows_page: record, needs_password: Box::new(|id| id == "office") }, s)
     }
 
     fn snap(s: Scenario) -> Arc<Snapshot> {
@@ -312,6 +323,16 @@ mod tests {
         }
         assert_eq!(*OPENED.lock().unwrap(), vec![WindowsPage::Sound, WindowsPage::VolumeMixer, WindowsPage::Network]);
         assert!(WindowsPage::Sound.uri().starts_with("ms-settings:"));
+    }
+
+    #[test]
+    fn a_speaker_with_a_password_and_none_kept_asks_for_it_before_it_plays() {
+        let (c, s) = contents();
+        let playing = snap(Scenario::Playing);
+        assert!(c.before_play(&SpeakerId::new("kitchen"), &playing).is_none());
+        let d = c.before_play(&SpeakerId::new("office"), &playing).expect("the password dialog");
+        assert_eq!(d.title(&playing), Dialog::window_title(s.lang()));
+        assert!(s.take_acts().is_empty(), "nothing is started before it is typed");
     }
 
     #[test]
