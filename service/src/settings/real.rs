@@ -631,7 +631,6 @@ impl SettingsPort for AppSettings {
         let earlier = uc.earlier_delays();
         let default = crate::delay::Earlier::default();
         let carried_over = (earlier != default).then(|| {
-            drop(uc.clone());
             let speakers = self
                 .rows()
                 .into_iter()
@@ -899,16 +898,26 @@ impl SettingsPort for AppSettings {
                 uc.save();
             }
             Act::Forget(id) => {
+                // Its pairing, password, volume, delay changes, tone and
+                // "comes back" choice go, and nothing else. If it plays,
+                // the session ends (on a thread: stopping talks to it).
+                let playing = self.playing_id().as_deref() == Some(id.as_str());
                 {
                     let mut uc = app.user_config.lock().unwrap();
                     uc.speaker_settings.remove(&id);
                     uc.remove_airplay_password(&id);
                     uc.remove_airplay_pairing(&id);
+                    if uc.last_speaker_id.as_deref() == Some(id.as_str()) {
+                        uc.last_speaker_id = None;
+                    }
                     uc.save();
                 }
                 self.inner.lock().unwrap().tone_undo.remove(&id);
-                if self.playing_id().as_deref() == Some(id.as_str()) {
-                    app.forget_saved_speaker();
+                if playing {
+                    let app = app.clone();
+                    let _ = std::thread::Builder::new().name("stream-to-speaker-forget".into()).spawn(move || {
+                        let _ = app.set_streaming_enabled(false);
+                    });
                 }
             }
             Act::Remove(id) => app.remove_manual_speaker(&id),
@@ -963,7 +972,13 @@ impl SettingsPort for AppSettings {
             }
             Act::ReadGuideOnline => self.desktop.open_url(&format!("{REPOSITORY}#readme")),
             Act::ShowWelcomeAgain => app.reset_onboarding(),
-            Act::Reconnect | Act::TryAirPlay => app.reconnect_speaker(),
+            Act::Reconnect | Act::TryAirPlay => {
+                if app.is_speaker_bound() {
+                    app.reconnect_speaker();
+                } else if let Some(id) = app.saved_speaker_id() {
+                    app.select_speaker_async(&id);
+                }
+            }
             Act::TrySteady => {
                 if let Some(s) = app.delay_status() {
                     let _ = app.set_delay_choice(&s.id, crate::delay::DelayChoice::Steady);
