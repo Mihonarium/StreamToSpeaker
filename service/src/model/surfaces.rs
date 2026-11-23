@@ -69,6 +69,9 @@ pub struct Notification {
     pub buttons: Vec<Button>,
     /// A button that only closes the notification ("Later").
     pub close: Option<String>,
+    /// The speaker it is about: a newer notification about the same
+    /// speaker replaces the older (a speaker back replaces it leaving).
+    pub tag: Option<SpeakerId>,
 }
 
 /// The state's short sentence: the tooltip after "Stream To Speaker –".
@@ -520,5 +523,5 @@ pub fn notification(facts: &Facts) -> Option<Notification> {
         ),
     };
     let close = (raised.kind == NotificationKind::RestartToFinish).then(|| t!(lang, Later));
-    Some(Notification { seq: raised.seq, kind: raised.kind, title, body, buttons, close })
+    Some(Notification { seq: raised.seq, kind: raised.kind, title, body, buttons, close, tag: raised.speaker.clone() })
 }

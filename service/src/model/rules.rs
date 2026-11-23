@@ -296,12 +296,14 @@ pub fn notification_for(before: &NowState, after: &NowState, ctx: NotifyContext)
             N::SpeakerBack
         }
         (FellBack { .. }, FellBack { .. }) => return None,
-        (_, FellBack { cause: FellBackCause::StoppedResponding | FellBackCause::RefusedPairing, .. }) => {
+        (_, FellBack { cause: FellBackCause::StoppedResponding, .. }) => {
             if !ctx.was_playing {
                 return None;
             }
             N::StoppedResponding
         }
+        // The remedy is pairing, so it says that, whatever was playing.
+        (_, FellBack { cause: FellBackCause::RefusedPairing, .. }) => N::NeedsSecret(Secret::Code),
         (
             NotResponding { dropout: Dropout::QuickTries { .. }, .. },
             NotResponding { dropout: Dropout::KeepTrying { .. }, .. },
@@ -391,14 +393,6 @@ impl PlayedDetector {
     pub fn played(&self) -> bool {
         self.played
     }
-}
-
-/// The badge after the panel opens: states that clear on being seen.
-pub fn clears_when_seen(state: &NowState) -> bool {
-    matches!(
-        state,
-        NowState::FellBack { .. } | NowState::SpeakerBack { .. } | NowState::Taken { .. } | NowState::MaBack
-    )
 }
 
 /// The state while looking for a speaker, `elapsed_ms` after sign-in, wake
@@ -567,6 +561,8 @@ mod tests {
         let pairing = NowState::NeedsSecret { speaker: k.clone(), secret: Secret::Code };
         let silent = NowState::NotResponding { speaker: k.clone(), dropout: Dropout::KeepTrying { every_secs: 30 } };
         let c = ctx();
+        let refused =
+            NowState::FellBack { speaker: k.clone(), at: t, cause: FellBackCause::RefusedPairing, returns: Return::WillAsk };
         let retrying_back = retrying(AfterTries::BackToPc);
         let retrying_silent = retrying(AfterTries::StaySilent);
         let cases: Vec<(&str, &NowState, &NowState, NotifyContext, Option<N>)> = vec![
@@ -599,6 +595,13 @@ mod tests {
                 None,
             ),
             ("an automatic return needs a code", &NowState::OnThisPc, &pairing, c, Some(N::NeedsSecret(Secret::Code))),
+            (
+                "a refused pairing says to pair",
+                &playing,
+                &refused,
+                c,
+                Some(N::NeedsSecret(Secret::Code)),
+            ),
             ("the output went missing", &playing, &NowState::OutputMissing, c, Some(N::OutputMissing)),
             (
                 "never while the panel is in front",
