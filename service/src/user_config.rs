@@ -1994,7 +1994,8 @@ mod tests {
     /// Settings in which every field of every struct, and of every entry
     /// of every list and map, differs from what it is when left out. A
     /// field added to any of these types must be set here as well:
-    /// `every_field_differs_from_its_default` fails until it is.
+    /// `every_field_differs_from_its_default_and_survives_a_save` fails
+    /// until it is.
     fn everything_set() -> UserConfig {
         use crate::discovery_net::SavedAdapter;
         use crate::manual_speakers::ManualKind;
