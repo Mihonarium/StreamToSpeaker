@@ -188,6 +188,9 @@ pub struct GenaManager {
     /// Set by [`GenaManager::unsubscribe`]; stops the renewer and keeps
     /// it from re-subscribing a speaker we've moved away from.
     closed: AtomicBool,
+    /// Wakes the renewer when the subscription closes, so its thread ends
+    /// with the session instead of sleeping out the renewal interval.
+    wake: Condvar,
 }
 
 impl GenaManager {
@@ -196,6 +199,7 @@ impl GenaManager {
             state: Mutex::new(None),
             callback_url,
             closed: AtomicBool::new(false),
+            wake: Condvar::new(),
         })
     }
 
@@ -237,17 +241,19 @@ impl GenaManager {
         thread::Builder::new()
             .name("stream-to-speaker-gena-renew".to_string())
             .spawn(move || loop {
-                let to_sleep = {
-                    let st = self.state.lock().unwrap();
-                    if let Some(s) = st.as_ref() {
-                        // Renew at 75% of timeout, min 60s.
-                        let renew_in = (s.timeout_secs * 3 / 4).max(60);
-                        Duration::from_secs(renew_in)
-                    } else {
-                        Duration::from_secs(60)
+                {
+                    let mut st = self.state.lock().unwrap();
+                    // Renew at 75% of timeout, min 60s.
+                    let renew_in = st.as_ref().map_or(60, |s| (s.timeout_secs * 3 / 4).max(60));
+                    let until = Instant::now() + Duration::from_secs(renew_in);
+                    while !self.closed.load(Ordering::Acquire) {
+                        let left = until.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        st = self.wake.wait_timeout(st, left).unwrap().0;
                     }
-                };
-                thread::sleep(to_sleep);
+                }
                 if self.closed.load(Ordering::Acquire) {
                     return;
                 }
@@ -280,7 +286,11 @@ impl GenaManager {
     /// carrying the old SID are refused from here on.
     pub fn unsubscribe(&self) {
         self.closed.store(true, Ordering::Release);
-        let st = self.state.lock().unwrap().take();
+        let st = {
+            let mut guard = self.state.lock().unwrap();
+            self.wake.notify_all();
+            guard.take()
+        };
         if let Some(s) = st {
             registry().remove(&s.sid);
             let _ = http_unsubscribe(&s.event_url, &s.sid);
@@ -349,6 +359,33 @@ pub fn parse_rendering_notify(body: &str) -> Option<RenderingChange> {
     } else {
         Some(RenderingChange { volume, mute })
     }
+}
+
+/// What an AVTransport NOTIFY says about the speaker's transport.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransportChange {
+    /// `TransportState`: "PLAYING", "STOPPED", "TRANSITIONING", …
+    pub state: Option<String>,
+    /// `AVTransportURI`: what the speaker was told to play.
+    pub uri: Option<String>,
+}
+
+/// Parse an AVTransport NOTIFY (a `LastChange` document with
+/// `<TransportState val=…/>` and `<AVTransportURI val=…/>`). None when it
+/// carries neither.
+pub fn parse_transport_notify(body: &str) -> Option<TransportChange> {
+    let lc = find_tag_text(body, "LastChange")?;
+    let decoded = decode_xml_text(&lc);
+    let doc = roxmltree::Document::parse(&decoded).ok()?;
+    let mut change = TransportChange::default();
+    for node in doc.descendants() {
+        match node.tag_name().name() {
+            "TransportState" => change.state = node.attribute("val").map(str::to_string),
+            "AVTransportURI" => change.uri = node.attribute("val").map(str::to_string),
+            _ => {}
+        }
+    }
+    (change.state.is_some() || change.uri.is_some()).then_some(change)
 }
 
 // -----------------------------------------------------------------------------
@@ -647,5 +684,30 @@ mod tests {
 <e:property><GroupVolumeChangeable>1</GroupVolumeChangeable></e:property>
 </e:propertyset>"#;
         assert!(parse_rendering_notify(body).is_none());
+    }
+
+    #[test]
+    fn a_transport_notify_says_the_state_and_the_uri() {
+        let body = r#"<?xml version="1.0"?>
+<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;TransportState val=&quot;TRANSITIONING&quot;/&gt;&lt;AVTransportURI val=&quot;x-sonos-http:radio.mp3&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property></e:propertyset>"#;
+        assert_eq!(
+            parse_transport_notify(body),
+            Some(TransportChange { state: Some("TRANSITIONING".into()), uri: Some("x-sonos-http:radio.mp3".into()) })
+        );
+        let volume_only = r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><LastChange>&lt;Event&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;3&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property></e:propertyset>"#;
+        assert_eq!(parse_transport_notify(volume_only), None);
+    }
+
+    #[test]
+    fn an_unsubscribed_renewer_ends_at_once() {
+        let gena = GenaManager::new("http://127.0.0.1:9/gena".into());
+        let before = crate::engine::thread_count();
+        gena.clone().spawn_renewer();
+        gena.unsubscribe();
+        let started = Instant::now();
+        while crate::engine::thread_count() > before && started.elapsed() < Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "the renewer thread outlived its subscription");
     }
 }

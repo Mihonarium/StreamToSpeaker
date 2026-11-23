@@ -2164,6 +2164,12 @@ fn every_state_has_words_on_every_surface_and_every_string_is_used() {
     let unknown = e.send(Surface::CommandLine, Command::Play(Place::Speaker(SpeakerId::new("nowhere"))));
     e.advance(0);
     outcomes.push(unknown.try_outcome().unwrap());
+    let refused = Outcome {
+        result: Err(Refusal::OnlyFromWindow { speaker: kitchen() }),
+        snapshot: snap(Scenario::OnThisPc),
+    };
+    assert_eq!(cli_reply(EN, &refused).text, "To play to “Kitchen”, pick it in the Stream To Speaker window.");
+    outcomes.push(refused);
     for o in &outcomes {
         check_words("cli reply", "cli", &cli_reply(EN, o).text);
         let c = confirmation(EN, o);

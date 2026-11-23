@@ -49,6 +49,9 @@ pub struct RendererSession {
     /// mode admits). Lives exactly as long as the session: dropping the
     /// session revokes them.
     pub stream_grant: Option<Grant>,
+    /// The subscription to the speaker's transport events (what it plays,
+    /// whether it re-buffers), when it offers them.
+    pub transport: Option<Arc<GenaManager>>,
     /// Id the session reports instead of the renderer's own (a speaker
     /// added by address keeps its manual id, so the list highlights the
     /// row the user clicked and a relaunch reconnects through it).
@@ -452,16 +455,14 @@ fn run_speaker_control(
     }
 }
 
-/// Volume an AirPlay session starts the speaker at when no level is known
-/// yet (nothing has come from the Windows slider, the window's slider or a
-/// speaker this run).
-const AIRPLAY_DEFAULT_VOLUME: u32 = 80;
-
 /// How long quitting waits for a connect still in flight to finish (it then
 /// tears down what it set up).
 const QUIT_CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// How long quitting waits for the speaker to answer its Stop or TEARDOWN.
 const QUIT_TEARDOWN_WAIT: Duration = Duration::from_secs(2);
+
+/// What a connect a newer choice superseded ends with (never shown).
+pub(crate) const SUPERSEDED: &str = "superseded by a newer choice";
 
 /// How long an error stays in the GUI's banner (the usual toast time).
 const ERROR_BANNER_TTL: Duration = Duration::from_secs(8);
@@ -725,6 +726,34 @@ pub struct App {
     scope_apply: Mutex<()>,
     /// Why AirPlay discovery couldn't start, if it couldn't.
     discovery_error: Mutex<Option<String>>,
+    /// Where today's entry points (the window, the tray, the web API, the
+    /// terminal prompt) send their commands once the engine runs.
+    command_sink: OnceLock<CommandSink>,
+    engine_connects: Mutex<EngineConnects>,
+    engine_connect_ended: Condvar,
+    /// The bound UPnP speaker's latest transport event, until the engine
+    /// reads it.
+    transport_change: Mutex<Option<crate::gena::TransportChange>>,
+}
+
+/// Takes a command for the engine (see [`App::set_command_sink`]); the
+/// ticket brings its outcome.
+pub type CommandSink = Box<dyn Fn(crate::model::Surface, crate::model::Command) -> crate::model::Ticket + Send + Sync>;
+
+/// The engine's connects by speaker id: the number of the latest, and how
+/// it ended once it has (`Err` with the words to show).
+#[derive(Default)]
+pub(crate) struct EngineConnects {
+    by_id: std::collections::HashMap<String, (u64, Option<Result<(), String>>)>,
+}
+
+/// The place a speaker id names.
+pub(crate) fn place_of(id: &str) -> crate::model::Place {
+    if id == crate::sendspin_app::MA_OUTPUT_ID {
+        crate::model::Place::MusicAssistant
+    } else {
+        crate::model::Place::Speaker(crate::model::SpeakerId::new(id))
+    }
 }
 
 /// Discovery-network state for the settings UI.
@@ -1047,6 +1076,10 @@ impl App {
             mdns: Mutex::new(None),
             scope_apply: Mutex::new(()),
             discovery_error: Mutex::new(None),
+            command_sink: OnceLock::new(),
+            engine_connects: Mutex::new(EngineConnects::default()),
+            engine_connect_ended: Condvar::new(),
+            transport_change: Mutex::new(None),
         });
         if web_initial {
             if let Err(e) = app.set_web_ui_enabled(true) {
@@ -1517,7 +1550,7 @@ impl App {
 
     /// Does `id` name a discovered AirPlay receiver (or pair) that
     /// announces another speaker's identity? Asked of the record.
-    fn is_airplay_newcomer(&self, id: &str) -> bool {
+    pub(crate) fn is_airplay_newcomer(&self, id: &str) -> bool {
         self.airplay_discovery
             .as_ref()
             .and_then(|d| d.find_by_id(id))
@@ -2143,6 +2176,10 @@ impl App {
     ///
     /// [`select_speaker_async_opts`]: App::select_speaker_async_opts
     pub fn select_speaker_async(self: &Arc<Self>, id: &str) {
+        // The window's click: a person in the app's own window.
+        if self.send_command(crate::model::Surface::Panel, crate::model::Command::Play(place_of(id))) {
+            return;
+        }
         self.note_user_pick();
         self.reconnects.store(0, Ordering::Relaxed);
         self.select_speaker_async_opts(id, true, false);
@@ -2163,6 +2200,10 @@ impl App {
     ///
     /// [`select_speaker_async`]: App::select_speaker_async
     pub fn connect_in_background(self: &Arc<Self>, id: &str) {
+        // With the engine, a launch reconnect is its own decision.
+        if self.command_sink.get().is_some() {
+            return;
+        }
         self.select_speaker_async_opts(id, false, false);
     }
 
@@ -2179,6 +2220,24 @@ impl App {
     ///
     /// [`user_pick_count`]: App::user_pick_count
     pub(crate) fn connect_unless_user_picked(self: &Arc<Self>, id: &str, picks_seen: u64) {
+        // With the engine, a launch reconnect is its own decision.
+        if self.command_sink.get().is_some() {
+            return;
+        }
+        self.select_speaker_async_full(id, false, false, Some(picks_seen), None);
+    }
+
+    /// The speaker named on the command line, now listed: played unless a
+    /// person chose something meanwhile.
+    pub(crate) fn play_wish_unless_user_picked(self: &Arc<Self>, id: &str, picks_seen: u64) {
+        if self.command_sink.get().is_some() {
+            if self.user_pick_count() == picks_seen {
+                if let Err(e) = self.select_speaker_from(crate::model::Surface::CommandLine, id) {
+                    warn!("{}", e);
+                }
+            }
+            return;
+        }
         self.select_speaker_async_full(id, false, false, Some(picks_seen), None);
     }
 
@@ -2192,6 +2251,14 @@ impl App {
         interactive: bool,
         sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
     ) {
+        if sendspin_pairing.is_none() && self.command_sink.get().is_some() {
+            // A pick in the window goes to the engine; an automatic one
+            // (the launch reconnect) is the engine's own decision.
+            if interactive {
+                self.send_command(crate::model::Surface::Panel, crate::model::Command::Play(place_of(id)));
+            }
+            return;
+        }
         self.select_speaker_async_full(id, interactive, false, None, sendspin_pairing);
     }
 
@@ -2489,6 +2556,13 @@ impl App {
     /// entry point of the web API / tray toggle / launch reconnect, where
     /// nobody could answer a PIN prompt).
     pub fn select_speaker(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        self.select_speaker_from(crate::model::Surface::Api, id)
+    }
+
+    /// [`Self::select_speaker`] from `from` (the web API, the terminal
+    /// prompt): with the engine running, the pick goes to it, after the same
+    /// guard as before.
+    pub fn select_speaker_from(self: &Arc<Self>, from: crate::model::Surface, id: &str) -> Result<(), String> {
         // A receiver announcing another speaker's identity plays only when
         // a person picks it in the window, never through this entry: the
         // web API (which scripts can drive), the launch connect, a resync
@@ -2496,6 +2570,74 @@ impl App {
         if self.is_airplay_newcomer(id) {
             // Its name says what it is ("<speaker> — another receiver with
             // the same ID: …").
+            return Err(format!(
+                "To play to “{}”, pick it in the Stream To Speaker window.",
+                self.speaker_name(id).unwrap_or_else(|| id.to_string())
+            ));
+        }
+        if self.command_sink.get().is_some() {
+            return self.play_and_wait(from, id);
+        }
+        self.select_speaker_now(id)
+    }
+
+    /// Ask the engine to play on `id` and wait (on this thread, which does
+    /// no network I/O meanwhile) until the connect it starts has ended:
+    /// `Ok` once the speaker plays, else the words saying why not.
+    fn play_and_wait(self: &Arc<Self>, from: crate::model::Surface, id: &str) -> Result<(), String> {
+        let before = self.engine_connects.lock().unwrap().by_id.get(id).map(|(gen, _)| *gen);
+        let Some(sink) = self.command_sink.get() else { return Err("Stream To Speaker isn't running.".into()) };
+        let outcome = sink(from, crate::model::Command::Play(place_of(id))).wait(Duration::from_secs(10));
+        let Some(outcome) = outcome else {
+            return Err(format!("{} didn't answer. Try again in a moment.", PRODUCT_NAME));
+        };
+        if outcome.result.is_err() {
+            return Err(crate::model::delay::cli_reply(outcome.snapshot.lang, &outcome).text);
+        }
+        // The connect it started, or the one already under way to it.
+        let end = Instant::now() + CONNECT_BUDGET + Duration::from_secs(15);
+        let mut connects = self.engine_connects.lock().unwrap();
+        loop {
+            match connects.by_id.get(id).cloned() {
+                Some((gen, Some(result))) if Some(gen) != before => return result,
+                Some((_, None)) => {}
+                // Nothing new to wait for: it plays there already, or the
+                // engine had no reason to connect.
+                _ => {
+                    let here = self.session.lock().unwrap().as_ref().is_some_and(|s| s.stable_id() == id);
+                    return if here { Ok(()) } else { Err(outcome.snapshot.status.clone()) };
+                }
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(format!(
+                    "{} is still connecting to {}.",
+                    PRODUCT_NAME,
+                    self.speaker_name(id).unwrap_or_else(|| id.to_string())
+                ));
+            }
+            connects = self.engine_connect_ended.wait_timeout(connects, left).unwrap().0;
+        }
+    }
+
+    /// The engine started connect `gen` to `id`.
+    pub(crate) fn engine_connect_started(&self, id: &str, gen: u64) {
+        self.engine_connects.lock().unwrap().by_id.insert(id.to_string(), (gen, None));
+    }
+
+    /// The engine's connect `gen` to `id` ended.
+    pub(crate) fn engine_connect_ended(&self, id: &str, gen: u64, result: Result<(), String>) {
+        let mut connects = self.engine_connects.lock().unwrap();
+        if connects.by_id.get(id).is_some_and(|(g, _)| *g == gen) {
+            connects.by_id.insert(id.to_string(), (gen, Some(result)));
+            self.engine_connect_ended.notify_all();
+        }
+    }
+
+    /// Connect `id` now, on this thread, as a person's choice that can't
+    /// answer a code prompt (today's path, without the engine).
+    pub(crate) fn select_speaker_now(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        if self.is_airplay_newcomer(id) {
             return Err(format!(
                 "To play to “{}”, pick it in the Stream To Speaker window.",
                 self.speaker_name(id).unwrap_or_else(|| id.to_string())
@@ -2670,6 +2812,15 @@ impl App {
             drop(guard);
             old.stop();
             guard = self.session.lock().unwrap();
+        }
+        // A newer choice superseded this connect while it ran: what it set
+        // up is stopped, not used.
+        if crate::engine::cancel::cancelled() {
+            drop(guard);
+            info!("a newer choice superseded the connect to {}; not binding", actual_id);
+            new_session.stop();
+            self.prune_stream_clients();
+            return Err(SUPERSEDED.to_string());
         }
         // Checked under the session lock: Disable flips the flag before it
         // takes the session, so either it sees ours or we see its flag.
@@ -3034,6 +3185,10 @@ impl App {
         // interrupted with a pairing prompt.
         let mut pin_target: Option<(String, String, PinReason)> = None;
         for (transport, r) in attempts {
+            // A newer choice superseded this connect: no further attempt.
+            if crate::engine::cancel::cancelled() {
+                return Err(SelectFailure::Msg(SUPERSEDED.to_string()));
+            }
             let label = match transport {
                 Transport::AirPlay2 => "AirPlay 2",
                 Transport::RaopLegacy => "AirPlay/RAOP",
@@ -3165,6 +3320,7 @@ impl App {
         renderer: AirPlayRenderer,
         local_ip: IpAddr,
     ) -> Result<ActiveSession, AttemptError> {
+        let start_volume = self.airplay_start_volume(&renderer.stable_id());
         match transport {
             Transport::RaopLegacy => {
                 let samples_rx = self.hub.subscribe();
@@ -3200,7 +3356,7 @@ impl App {
                         renderer,
                         routes,
                         samples_rx,
-                        initial_volume: Some(self.airplay_start_volume()),
+                        initial_volume: Some(start_volume),
                         timeouts: crate::airplay::session::RaopTimeouts::STANDARD,
                         mfi_encryption,
                         uncompressed_alac,
@@ -3253,7 +3409,7 @@ impl App {
                     renderer,
                     local_ip,
                     samples_rx,
-                    initial_volume: Some(self.airplay_start_volume()),
+                    initial_volume: Some(start_volume),
                     prefer_realtime,
                     latency_ms: delay.latency_ms,
                     stored_pairing,
@@ -3637,8 +3793,10 @@ impl App {
     /// The level an AirPlay session starts the speaker at: the current
     /// one, so a reconnect or a switch keeps what the window and Windows
     /// show, else a default.
-    fn airplay_start_volume(&self) -> u32 {
-        self.vsync.current_level().unwrap_or(AIRPLAY_DEFAULT_VOLUME)
+    /// The level an AirPlay speaker starts at: the one last used with it,
+    /// 25 the first time. Never louder: its own level can't be read.
+    fn airplay_start_volume(&self, id: &str) -> u32 {
+        crate::model::rules::level_on_connect(None, self.speaker_settings(id).level) as u32
     }
 
     /// The speaker bound as session `session_number` is at `level` as
@@ -3661,6 +3819,19 @@ impl App {
         let _ = self.windows_volume.set(Box::new(push));
     }
 
+    /// Mute or unmute the bound speaker from the app, as
+    /// [`Self::set_speaker_volume`] sets its level.
+    pub fn set_speaker_muted(&self, muted: bool) {
+        if !self.speaker_volume_controllable() {
+            return;
+        }
+        self.vsync.note_muted(muted);
+        if let Some(level) = self.vsync.current_level() {
+            push_windows_level(&self.windows_volume, level, muted);
+        }
+        self.speaker_control.send(SpeakerCommand::Mute(muted));
+    }
+
     /// Queue a volume or mute change from Windows for the bound speaker.
     /// Returns at once; the send happens on the volume thread.
     pub fn send_to_speaker(&self, cmd: SpeakerCommand) {
@@ -3674,7 +3845,12 @@ impl App {
     /// without this the only way to clear the saved speaker was to
     /// edit `%APPDATA%\StreamToSpeaker\config.json` by hand).
     pub fn forget_saved_speaker(&self) {
-        self.stop_streaming_and_forget_speaker();
+        if self.send_command(crate::model::Surface::Settings, crate::model::Command::Play(crate::model::Place::ThisPc)) {
+            // The engine lets the speaker go; the next pick still plays.
+            *self.last_speaker_id.lock().unwrap() = None;
+        } else {
+            self.stop_streaming_and_forget_speaker();
+        }
         {
             let mut uc = self.user_config.lock().unwrap();
             uc.last_speaker_id = None;
@@ -3934,6 +4110,19 @@ impl App {
     /// reliable way to flush RAOP's own jitter buffer (FLUSH is more
     /// surgical but receivers differ on what it actually clears).
     pub fn resync(self: &Arc<Self>) -> Result<(), String> {
+        if let Some(id) = self.session.lock().unwrap().as_ref().map(|s| s.stable_id()) {
+            if self.send_command(
+                crate::model::Surface::Panel,
+                crate::model::Command::Reconnect(crate::model::SpeakerId::new(&id)),
+            ) {
+                return Ok(());
+            }
+        }
+        self.resync_now()
+    }
+
+    /// Reconnect the bound speaker now, on this thread (*Reconnect*).
+    pub(crate) fn resync_now(self: &Arc<Self>) -> Result<(), String> {
         // Look at the active session under the lock briefly to figure
         // out the dispatch, but don't hold the lock during the slow
         // network calls.
@@ -3976,7 +4165,7 @@ impl App {
             }
             Kind::AirPlay(id) => {
                 info!("resync: AirPlay tear-down + reconnect for {}", id);
-                self.select_speaker(&id)
+                self.select_speaker_now(&id)
             }
         }
     }
@@ -3990,6 +4179,28 @@ impl App {
     /// PC, whatever the privacy setting; enabling rebinds to the last-used
     /// speaker if one is remembered.
     pub fn set_streaming_enabled(self: &Arc<Self>, enabled: bool) -> Result<(), String> {
+        if self.command_sink.get().is_some() {
+            // Disable is choosing This PC; Enable plays on the speaker used
+            // last.
+            let last = self.last_speaker_id.lock().unwrap().clone().or_else(|| self.saved_speaker_id());
+            let cmd = match (enabled, last) {
+                (true, Some(id)) => {
+                    // As before: Enable never plays to a receiver announcing
+                    // another speaker's identity.
+                    if self.is_airplay_newcomer(&id) {
+                        return Err(format!(
+                            "To play to “{}”, pick it in the Stream To Speaker window.",
+                            self.speaker_name(&id).unwrap_or_else(|| id.to_string())
+                        ));
+                    }
+                    crate::model::Command::Play(place_of(&id))
+                }
+                (true, None) => return Ok(()),
+                (false, _) => crate::model::Command::Play(crate::model::Place::ThisPc),
+            };
+            self.send_command(crate::model::Surface::Tray, cmd);
+            return Ok(());
+        }
         let was = self.streaming_enabled.swap(enabled, Ordering::AcqRel);
         if was == enabled {
             return Ok(());
@@ -4536,7 +4747,7 @@ impl App {
                             info!("--player {:?}: found {:?}; connecting", query, m.id);
                             *app.player_wish.lock().unwrap() = Some(PlayerWish::Looking { query: query.clone() });
                             attempt = Some((m.id.clone(), name, app.last_fault()));
-                            app.connect_unless_user_picked(&m.id, picks_seen);
+                            app.play_wish_unless_user_picked(&m.id, picks_seen);
                         }
                         None if steps.tried.is_none() && attempt.is_none() => {
                             // What it tried has gone from the list: looking again.
@@ -4677,7 +4888,7 @@ impl App {
         if self.is_shutting_down() {
             return Err(format!("{} is quitting: no speaker can be chosen now.", PRODUCT_NAME));
         }
-        self.select_speaker(id)
+        self.select_speaker_from(crate::model::Surface::Api, id)
     }
 
     /// Run `hook` once, when quitting begins (Quit chosen, the window closed
@@ -4696,6 +4907,107 @@ impl App {
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
+    }
+
+    // -------------------------------------------------------------------
+    // The engine's hooks
+    // -------------------------------------------------------------------
+
+    /// From now on, today's entry points (the window, the tray, the web
+    /// API, the terminal prompt) send their commands to `sink`.
+    pub fn set_command_sink(&self, sink: CommandSink) {
+        let _ = self.command_sink.set(sink);
+    }
+
+    /// Send `cmd` from `from` to the engine, if it runs. Returns whether
+    /// it was sent.
+    fn send_command(&self, from: crate::model::Surface, cmd: crate::model::Command) -> bool {
+        match self.command_sink.get() {
+            Some(sink) => {
+                let _ = sink(from, cmd);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Connect to `id` and make it what plays, for the engine, on the
+    /// calling thread (one of the engine's own). `person`: a person chose
+    /// it, so a code or password may be asked for.
+    /// `window`: a person's pick in the app's own window, the only one
+    /// that may play to a receiver announcing another speaker's identity
+    /// and ask for a code or password. `chosen`: a person chose it, there
+    /// or elsewhere (not a return or a retry).
+    pub(crate) fn engine_connect(self: &Arc<Self>, id: &str, window: bool, chosen: bool) -> Result<(), String> {
+        *self.connecting.lock().unwrap() = Some(self.speaker_name(id).unwrap_or_else(|| id.to_string()));
+        if chosen {
+            self.note_user_pick();
+        }
+        let result = self.select_speaker_inner(id, window, window, None);
+        self.forget_typed_password(id);
+        *self.connecting.lock().unwrap() = None;
+        self.clear_connecting_notice();
+        result
+    }
+
+    /// The speaker a code dialog is open for.
+    pub(crate) fn pin_ceremony_id(&self) -> Option<String> {
+        self.pin_pairing_device().map(|(id, _)| id)
+    }
+
+    /// Whether `id` asked for an AirPlay password in this run.
+    pub(crate) fn asked_for_password(&self, id: &str) -> bool {
+        self.airplay_asked_password.lock().unwrap().contains(id)
+    }
+
+    /// A transport event from the bound UPnP speaker (the NOTIFY route).
+    pub fn note_transport(&self, change: crate::gena::TransportChange) {
+        *self.transport_change.lock().unwrap() = Some(change);
+    }
+
+    pub(crate) fn take_transport_change(&self) -> Option<crate::gena::TransportChange> {
+        self.transport_change.lock().unwrap().take()
+    }
+
+    /// Let the bound speaker go. `tell_speaker` false when someone else
+    /// plays on it now: then it gets no Stop (that would stop them), only
+    /// the subscriptions end. The network part runs on a thread of its own.
+    pub(crate) fn release_session(self: &Arc<Self>, tell_speaker: bool) -> Option<std::thread::JoinHandle<()>> {
+        let session = self.session.lock().unwrap().take()?;
+        self.prune_stream_clients();
+        let cell = Arc::new(Mutex::new(Some(session)));
+        let stop = move |cell: &Mutex<Option<ActiveSession>>| match cell.lock().unwrap().take() {
+            Some(ActiveSession::Upnp(s)) if !tell_speaker => {
+                s.gena.unsubscribe();
+                if let Some(t) = &s.transport {
+                    t.unsubscribe();
+                }
+            }
+            Some(other) => other.stop(),
+            None => {}
+        };
+        let worker_cell = cell.clone();
+        match std::thread::Builder::new()
+            .name("stream-to-speaker-release".into())
+            .spawn(move || stop(&worker_cell))
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                // No thread to spare: let it go here instead.
+                warn!("couldn't start the thread that lets the speaker go ({}); letting it go now", e);
+                stop(&cell);
+                None
+            }
+        }
+    }
+
+    /// When this PC last sent real sound (not silence), since the app
+    /// started.
+    pub(crate) fn last_sound_at(&self) -> Option<Duration> {
+        match self.source_sound_at_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms - 1)),
+        }
     }
 }
 
@@ -4783,7 +5095,12 @@ struct Budget {
 }
 
 impl Budget {
+    /// Time left for the connect: none once a newer choice superseded it,
+    /// so it stops before its next request.
     fn left(&self) -> Duration {
+        if crate::engine::cancel::cancelled() {
+            return Duration::ZERO;
+        }
         self.until.saturating_duration_since(Instant::now())
     }
 
@@ -4984,9 +5301,26 @@ pub fn start_session(
         }
     }
 
+    // Transport events: whether the speaker re-buffers, or plays something
+    // else now that someone else has taken it.
+    let transport = renderer.av_transport_event_url.clone().and_then(|url| {
+        let t = GenaManager::new(callback_url.to_string());
+        match t.subscribe(&url) {
+            Ok(_) => {
+                t.clone().spawn_renewer();
+                Some(t)
+            }
+            Err(e) => {
+                debug!("transport events unavailable from {}: {}", renderer.friendly_name, e);
+                None
+            }
+        }
+    });
+
     let session = RendererSession {
         renderer,
         gena,
+        transport,
         stream_uri,
         stream_grant,
         id_override: None,
@@ -5025,6 +5359,9 @@ fn no_answer_in_time(e: &anyhow::Error) -> bool {
 
 pub fn stop_session(session: &RendererSession) {
     session.gena.unsubscribe();
+    if let Some(t) = &session.transport {
+        t.unsubscribe();
+    }
     if let Err(e) = upnp::stop(&session.renderer.av_transport_control_url) {
         debug!("UPnP Stop on {} failed: {}", session.renderer.friendly_name, e);
     }
@@ -5545,6 +5882,7 @@ mod tests {
                 udn_conflict: false,
             },
             gena: GenaManager::new("http://127.0.0.1:1/gena".into()),
+            transport: None,
             stream_uri: String::new(),
             stream_grant: None,
             id_override: None,
@@ -5904,6 +6242,9 @@ mod tests {
                 req("POST", "/AVTransport/Control", Some("SetAVTransportURI")),
                 req("POST", "/AVTransport/Control", Some("Play")),
                 req("SUBSCRIBE", "/RenderingControl/Event", None),
+                // Its transport's events: whether someone else takes it,
+                // and when it refills its buffer.
+                req("SUBSCRIBE", "/AVTransport/Event", None),
             ]
         );
         let p = probed.lock().unwrap();

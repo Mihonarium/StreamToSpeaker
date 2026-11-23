@@ -137,6 +137,68 @@ pub fn get_volume(control_url: &str) -> Result<u32> {
         .ok_or_else(|| anyhow!("CurrentVolume missing in response"))
 }
 
+/// What the speaker's transport is doing: `TransportState`
+/// ("PLAYING", "STOPPED", "TRANSITIONING", …), from GetTransportInfo.
+pub fn get_transport_state(control_url: &str) -> Result<String> {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:GetTransportInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+<InstanceID>0</InstanceID>
+</u:GetTransportInfo>
+</s:Body>
+</s:Envelope>"#;
+    let resp = soap_post(control_url, AV_TRANSPORT, "GetTransportInfo", body, &SHORT)?;
+    crate::gena::find_tag_text(&resp, "CurrentTransportState")
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| anyhow!("CurrentTransportState missing in response"))
+}
+
+/// What the speaker was given to play: `CurrentURI` and the title in its
+/// `CurrentURIMetaData`, from GetMediaInfo.
+pub fn get_media_info(control_url: &str) -> Result<(String, Option<String>)> {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:GetMediaInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+<InstanceID>0</InstanceID>
+</u:GetMediaInfo>
+</s:Body>
+</s:Envelope>"#;
+    let resp = soap_post(control_url, AV_TRANSPORT, "GetMediaInfo", body, &SHORT)?;
+    let uri = crate::gena::find_tag_text(&resp, "CurrentURI").unwrap_or_default();
+    let title = crate::gena::find_tag_text(&resp, "CurrentURIMetaData").and_then(|m| didl_title(&m));
+    Ok((uri.trim().to_string(), title))
+}
+
+/// The `dc:title` in a DIDL-Lite document, given as it appears inside
+/// a SOAP reply (entity-encoded).
+pub(crate) fn didl_title(metadata: &str) -> Option<String> {
+    let decoded = crate::gena::decode_xml_text(metadata);
+    let doc = roxmltree::Document::parse(&decoded).ok()?;
+    doc.descendants()
+        .find(|n| n.tag_name().name() == "title")
+        .and_then(|n| n.text())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Whether a speaker in `state`, playing `uri`, is busy with something
+/// other than this PC's stream (`ours` is the start of the stream
+/// addresses this PC gives out, `http://<address>:<port>/`). A speaker
+/// whose transport is stopped or paused isn't busy whatever it was given.
+pub fn is_busy(state: &str, uri: &str, ours: &str) -> bool {
+    let playing = matches!(state.trim().to_ascii_uppercase().as_str(), "PLAYING" | "TRANSITIONING");
+    playing && !uri.is_empty() && !uri.starts_with(ours)
+}
+
+/// Another PC running this app, named in a stream title it gave a speaker
+/// ("LAPTOP-ANNA via Stream To Speaker").
+pub fn other_pc_in_title(title: &str) -> Option<String> {
+    let suffix = format!(" via {}", crate::PRODUCT_NAME);
+    title.strip_suffix(&suffix).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Set the Sonos group volume (0..=100) via GroupRenderingControl on the
 /// group coordinator. Scales every member proportionally — the same
 /// semantics as the group slider in the Sonos app. Returns 701 when
@@ -936,5 +998,20 @@ mod tests {
             )
         );
         assert_eq!(req.soap_arg("Speed").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_speaker_playing_someone_elses_stream_is_busy() {
+        let ours = "http://192.168.1.23:5901/";
+        assert!(is_busy("PLAYING", "x-sonos-http:radio.mp3", ours));
+        assert!(is_busy("TRANSITIONING", "http://192.168.1.77:5901/stream.raw", ours), "another PC's stream");
+        assert!(!is_busy("PLAYING", "http://192.168.1.23:5901/stream.raw", ours), "this PC's own stream");
+        assert!(!is_busy("STOPPED", "x-sonos-http:radio.mp3", ours));
+        assert!(!is_busy("PAUSED_PLAYBACK", "x-sonos-http:radio.mp3", ours));
+        assert!(!is_busy("PLAYING", "", ours));
+        assert_eq!(other_pc_in_title("LAPTOP-ANNA via Stream To Speaker").as_deref(), Some("LAPTOP-ANNA"));
+        assert_eq!(other_pc_in_title("Bohemian Rhapsody"), None);
+        let meta = "&lt;DIDL-Lite xmlns:dc=&quot;http://purl.org/dc/elements/1.1/&quot;&gt;&lt;item&gt;&lt;dc:title&gt;LAPTOP-ANNA via Stream To Speaker&lt;/dc:title&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;";
+        assert_eq!(didl_title(meta).as_deref(), Some("LAPTOP-ANNA via Stream To Speaker"));
     }
 }

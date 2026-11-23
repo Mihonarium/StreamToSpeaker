@@ -405,7 +405,7 @@ impl App {
     pub fn reconnect_speaker(self: &Arc<Self>) {
         let app = self.clone();
         let spawned = std::thread::Builder::new().name("stream-to-speaker-reconnect".into()).spawn(move || {
-            if let Err(e) = app.resync() {
+            if let Err(e) = app.resync_now() {
                 app.record_error(format!("Couldn't reconnect: {}", e));
             }
         });
