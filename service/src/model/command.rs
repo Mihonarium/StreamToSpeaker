@@ -39,7 +39,7 @@ pub enum Command {
     DismissQuestion(SpeakerId),
     /// Keep the sound on this PC and stop waiting to return or asking.
     StayOnThisPc,
-    /// Set the volume the Now card shows. `owner` guards against a slider
+    /// Set the volume the volume row shows. `owner` guards against a slider
     /// that was still moving when the place changed.
     SetVolume { owner: VolumeOwner, level: u8 },
     SetMuted { owner: VolumeOwner, muted: bool },
