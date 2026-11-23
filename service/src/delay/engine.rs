@@ -498,25 +498,37 @@ impl App {
         change.max(0) as u32
     }
 
-    /// A session was bound (or a connect ended without one). A change made
-    /// while it connected is applied: the stream's catch-up follows the
-    /// UPnP speaker that plays, and another speaker reconnects if its
-    /// session began with less or more than it now has.
+    /// A connect ended, with a session bound or not. A change made while
+    /// it connected is applied: the stream's catch-up follows the UPnP
+    /// speaker that plays (and nothing when none does), and another
+    /// speaker reconnects if its session began with less or more than it
+    /// now has.
     pub(crate) fn delay_session_bound(self: &Arc<Self>) {
-        let Some(bound) = self.bound_for_delay() else { return };
-        let s = self.delay_setting(&bound.id, bound.kind, &bound.live);
+        let bound = self.bound_for_delay();
+        let s = bound.as_ref().map(|b| self.delay_setting(&b.id, b.kind, &b.live));
         let mut state = self.delay.state();
-        if state.reconnect_for.as_deref().is_some_and(|r| r != bound.id) {
+        let bound_id = bound.as_ref().map(|b| b.id.clone());
+        if state.reconnect_for.is_some() && state.reconnect_for != bound_id {
             state.schedule.cancel();
             state.reconnect_for = None;
         }
+        let (Some(bound), Some(s)) = (bound, s) else {
+            state.upnp = None;
+            self.delay.shared.catch_up.set_target(0);
+            return;
+        };
         match s.applies {
             Ok(Applies::Live) => {
-                if state.upnp.as_deref() == Some(bound.id.as_str()) {
-                    self.delay.shared.catch_up.set_target(s.change_ms);
+                if state.upnp.as_deref() != Some(bound.id.as_str()) {
+                    // A connect to another speaker began and failed: the
+                    // stream's catch-up goes back to this one.
+                    state.upnp = Some(bound.id.clone());
                 }
+                self.delay.shared.catch_up.set_target(s.change_ms);
             }
             Ok(Applies::Reconnect) => {
+                state.upnp = None;
+                self.delay.shared.catch_up.set_target(0);
                 let started = state.started.as_ref().filter(|(sid, _)| *sid == bound.id).map(|(_, c)| *c);
                 if started.is_some_and(|c| c != s.change_ms) && !state.schedule.waiting() {
                     state.reconnect_for = Some(bound.id.clone());
@@ -525,7 +537,10 @@ impl App {
                     self.delay_worker();
                 }
             }
-            Err(_) => {}
+            Err(_) => {
+                state.upnp = None;
+                self.delay.shared.catch_up.set_target(0);
+            }
         }
     }
 

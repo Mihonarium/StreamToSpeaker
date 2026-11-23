@@ -2572,6 +2572,15 @@ impl App {
         if user_choice {
             self.streaming_enabled.store(true, Ordering::Release);
         }
+        // However the connect ends, the delay follows the speaker that plays
+        // then: a change made while it connected applies (see `delay`).
+        struct DelayFollows<'a>(&'a Arc<App>);
+        impl Drop for DelayFollows<'_> {
+            fn drop(&mut self) {
+                self.0.delay_session_bound();
+            }
+        }
+        let _delay_follows = DelayFollows(self);
         // A PIN ceremony in flight for THIS device owns its pairing state:
         // a concurrent transient pair-setup would reset the accessory's
         // single in-progress HAP pairing session and make the ceremony
@@ -2714,8 +2723,6 @@ impl App {
         // The old session — and with it its privacy grant — is gone:
         // cut off any listener the allow-set no longer covers.
         self.prune_stream_clients();
-        // A delay change made while it connected applies now.
-        self.delay_session_bound();
 
         *self.last_speaker_id.lock().unwrap() = Some(actual_id.clone());
         *self.session_started.lock().unwrap() = Some((actual_id.clone(), Instant::now()));
