@@ -632,6 +632,9 @@ keys! {
     SoundBreakingUp,
     SpokenDelay,
     SpokenDelayOwn,
+    // The panel's closed delay line, which has no amount field.
+    SpokenPanelDelay,
+    SpokenPanelDelayOwn,
     SpokenFigureAbout,
     SpokenFigureUnder,
     SpokenFigureMeasured,
@@ -1135,6 +1138,8 @@ pub fn english(key: Key) -> Template {
         SpokenDelayOwn => text(
             "Delay on {speaker}: {figure}, nothing removed or added. Press Enter to type an amount.",
         ),
+        SpokenPanelDelay => text("Delay on {speaker}: {figure}, {change}."),
+        SpokenPanelDelayOwn => text("Delay on {speaker}: {figure}, nothing removed or added."),
         SpokenFigureAbout => plural("seconds", "about {seconds} second", "about {seconds} seconds"),
         SpokenFigureUnder => plural("seconds", "under {seconds} second", "under {seconds} seconds"),
         SpokenFigureMeasured => {

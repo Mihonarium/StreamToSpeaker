@@ -33,6 +33,7 @@ grey, taskbar dark and black alike.
 | `StreamToSpeaker.ico` | the exe resource (`service/build.rs`), `SetupIconFile`, and every shortcut — rendered from `brand/app-brand.svg` |
 | `window-*-128.rgba` | window and taskbar icon, swapped at runtime as state changes |
 | `tray-*-32.rgba` | system-tray icon, swapped the same way |
+| `panel-tray/*-32.rgba` | the tray icon of the panel by the clock: where the sound is (`pc`, `connecting`, `speaker`), a badge (`none`, `attention` "!", `failure` "×"), and the taskbar (`light`, `dark`) — rendered from `brand/panel-tray-*.svg` |
 | `mark-*-64.rgba` | the mark in the app's own header, swapped the same way |
 | `banner.gif` | the README header |
 | `brand/*.svg` | the source of all of the above |
@@ -61,3 +62,6 @@ Rasters are produced by rendering those SVGs at each size and writing the
 `.ico` and `.rgba` files. Any SVG renderer will do; the committed set was
 produced with headless Chromium at 1× so the geometry is interpreted exactly
 as authored.
+
+The panel's tray set was rendered with `rsvg-convert -w 32 -h 32` and its
+pixels written out unchanged (straight alpha, RGBA order).

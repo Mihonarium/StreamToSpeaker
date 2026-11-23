@@ -26,7 +26,8 @@ use super::theme::{self, Mode, Theme};
 pub struct Scene {
     /// Lowercase words joined by hyphens, unique, such as `delay-states`.
     pub name: &'static str,
-    /// Width and height in points (pixels at 100 % scale).
+    /// Width and height in points (pixels at 100 % scale). A height of 0
+    /// fits the picture to what the scene draws.
     pub size: [f32; 2],
     /// Draws the scene. It is called several times per picture (egui lays
     /// out in passes) and must draw the same thing each time.
@@ -206,14 +207,15 @@ fn render_inner(scene: &Scene, fonts: &FontDefinitions, s: Settings) -> Result<P
     // Pictures show where motion ends, never a frame of a fade.
     ctx.style_mut(|st| st.animation_time = 0.0);
     let theme = Theme::new(s.mode);
-    let size = Vec2::from(scene.size);
+    let fit = scene.size[1] <= 0.0;
+    let mut size = Vec2::new(scene.size[0], if fit { 4000.0 } else { scene.size[1] });
     let mut textures = raster::Textures::default();
     let mut forced = Forced::default();
     let mut output = None;
     let mut content = Rect::NOTHING;
     // Pass 1 lays out and learns which controls the scene wants in which
     // state; later passes draw them so, until nothing changes.
-    for pass in 0..6 {
+    for pass in 0..8 {
         ctx.data_mut(|d| d.insert_temp(forced_id(), forced.clone()));
         let mut stage = Stage { mode: s.mode, time: s.time, forced: Forced::default() };
         let out = ctx.run(input(size, s.scale, s.time), |ctx| {
@@ -222,6 +224,16 @@ fn render_inner(scene: &Scene, fonts: &FontDefinitions, s: Settings) -> Result<P
             });
         });
         textures.update(&out.textures_delta);
+        if fit {
+            // Fitted to the drawing; the next passes run at that height.
+            let h = content.max.y.ceil().max(1.0);
+            if (h - size.y).abs() > 0.5 {
+                size.y = h;
+                forced = stage.forced;
+                output = Some(out);
+                continue;
+            }
+        }
         let settled = pass >= 2 && stage.forced == forced;
         forced = stage.forced;
         output = Some(out);

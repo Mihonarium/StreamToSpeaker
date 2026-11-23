@@ -276,6 +276,16 @@ fn shown_change(delay: SpeakerDelay, facts: &DelayFacts) -> i32 {
     }
 }
 
+/// The panel's closed line, spoken: as the head line, without the amount
+/// field the panel doesn't have.
+fn spoken_panel_head(lang: Lang, name: &str, fig: Figure, change: i32) -> String {
+    let spoken_fig = spoken_figure(lang, fig);
+    match change {
+        0 => t!(lang, SpokenPanelDelayOwn, speaker = name, figure = &spoken_fig),
+        c => t!(lang, SpokenPanelDelay, speaker = name, figure = &spoken_fig, change = &spoken_change(lang, c, name)),
+    }
+}
+
 fn spoken_head(lang: Lang, name: &str, fig: Figure, change: i32) -> String {
     let spoken_fig = spoken_figure(lang, fig);
     match change {
@@ -335,6 +345,9 @@ pub struct PanelDelay {
     /// "about 0.15 s"; while an AirPlay speaker reconnects to apply a
     /// change, "reconnecting to remove 100 ms…".
     pub value: String,
+    /// The value says a reconnect is applying a change (a phrase, not a
+    /// figure).
+    pub reconnecting: bool,
     /// The closed line, spoken (the keys work on it closed).
     pub spoken: String,
     /// What opening shows.
@@ -394,7 +407,8 @@ pub fn panel_delay(
     PanelDelay {
         label: t!(lang, DelayLabel),
         value,
-        spoken: spoken_head(lang, name, fig, change),
+        reconnecting: reconnecting.is_some(),
+        spoken: spoken_panel_head(lang, name, fig, change),
         body: delay_body(lang, name, change, facts, steps),
         line,
         reset: (change != 0).then(|| Button {

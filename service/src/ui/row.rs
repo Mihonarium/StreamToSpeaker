@@ -84,6 +84,9 @@ pub struct PlaceRow<'a> {
     /// What a reader of the display says; the name, the status and
     /// [`PlaceRow::about`] by default.
     pub spoken: Option<String>,
+    /// Whether Tab stops on the row. A list makes one row the stop and
+    /// moves between rows with the arrow keys.
+    pub tab_stop: bool,
 }
 
 impl<'a> PlaceRow<'a> {
@@ -99,6 +102,7 @@ impl<'a> PlaceRow<'a> {
             menu: false,
             indent: false,
             spoken: None,
+            tab_stop: true,
         }
     }
 }
@@ -129,6 +133,12 @@ impl PlaceRow<'_> {
 
     /// Draw the row in a given style (pictures show both).
     pub fn show_in(&self, ui: &mut Ui, style: RowStyle) -> Option<RowAction> {
+        self.show_full(ui, style).0
+    }
+
+    /// Draw the row; what the person did, and the row's own response (for
+    /// moving the keyboard focus between rows).
+    pub fn show_full(&self, ui: &mut Ui, style: RowStyle) -> (Option<RowAction>, egui::Response) {
         let t = Theme::of(ui.ctx());
         let two = style == RowStyle::TwoLines;
         let full_w = ui.available_width();
@@ -173,7 +183,8 @@ impl PlaceRow<'_> {
 
         let (outer, alloc) = ui.allocate_exact_size(Vec2::new(full_w, height), Sense::hover());
         let rect = Rect::from_min_max(outer.min + Vec2::new(indent, 0.0), outer.max);
-        let resp = ui.interact(rect, alloc.id.with("place-row"), Sense::click());
+        let sense = if self.tab_stop { Sense::click() } else { Sense { click: true, drag: false, focusable: false } };
+        let resp = ui.interact(rect, alloc.id.with("place-row"), sense);
         let spoken = self.spoken.clone().unwrap_or_else(|| {
             let mut s = format!("{}.", self.name);
             if let Status::Words(w) = self.status {
@@ -286,9 +297,10 @@ impl PlaceRow<'_> {
             (false, false) if !two => Some(self.about.to_owned()),
             _ => None,
         };
-        if let Some(tip) = tip {
-            let _ = resp.on_hover_text(tip);
-        }
-        action
+        let resp = match tip {
+            Some(tip) => resp.on_hover_text(tip),
+            None => resp,
+        };
+        (action, resp)
     }
 }

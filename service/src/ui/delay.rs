@@ -722,21 +722,28 @@ fn step_buttons(ui: &mut Ui, v: &DelayView, width: f32) -> Option<DelayAction> {
 /// the pointer is on the control (which starts at `top`), so nothing below
 /// jumps between two presses.
 fn under_line(ui: &mut Ui, v: &DelayView, state: &mut DelayState, top: egui::Pos2, width: f32, words: Option<NoteWords>, em: f32) -> Option<DelayAction> {
-    let mut action = None;
+    let note = words.as_ref().map(|w| LineNote { text: &w.text, mark: w.mark, tone: w.tone, links: w.links.iter().map(|(l, _)| l.as_str()).collect() });
+    let clicked = held_line(ui, state, top, width, note.as_ref(), em)?;
+    words.and_then(|w| w.links.get(clicked).map(|(_, what)| *what)).map(|what| match what {
+        NoteLink::UseShortDelay => DelayAction::UseShortDelay,
+        NoteLink::UseSteady => DelayAction::UseSteady,
+        NoteLink::AddLarge => DelayAction::Add(v.limits.allowed(v.change_ms, Direction::Add, v.large_step_ms)),
+        NoteLink::BackToOwn => DelayAction::BackToOwn,
+    })
+}
+
+/// The line under the buttons from its words; returns the link clicked.
+fn held_line(ui: &mut Ui, state: &mut DelayState, top: egui::Pos2, width: f32, note: Option<&LineNote>, em: f32) -> Option<usize> {
+    let mut clicked = None;
     let note_top = ui.cursor().min.y;
-    if let Some(w) = words {
+    if let Some(w) = note {
         ui.add_space(if em > size::CAPTION { 8.0 } else { GAP_Y });
-        let mut para = Para::new(&w.text).mark(w.mark).tone(w.tone).size(em);
-        for (l, _) in &w.links {
+        let mut para = Para::new(w.text).mark(w.mark).tone(w.tone).size(em);
+        for l in &w.links {
             para = para.link(l);
         }
         if let Some(ParaClick::Link(i)) = ui.allocate_ui(Vec2::new(width, 0.0), |ui| para.show(ui)).inner {
-            action = w.links.get(i).map(|(_, what)| match what {
-                NoteLink::UseShortDelay => DelayAction::UseShortDelay,
-                NoteLink::UseSteady => DelayAction::UseSteady,
-                NoteLink::AddLarge => DelayAction::Add(v.limits.allowed(v.change_ms, Direction::Add, v.large_step_ms)),
-                NoteLink::BackToOwn => DelayAction::BackToOwn,
-            });
+            clicked = Some(i);
         }
     }
     let note_h = ui.cursor().min.y - note_top;
@@ -747,38 +754,205 @@ fn under_line(ui: &mut Ui, v: &DelayView, state: &mut DelayState, top: egui::Pos
         ui.add_space(keep - note_h);
     }
     state.held_note_height = keep;
-    action
+    clicked
 }
 
-/// The arrow keys on a focused delay line or head line: ←/→ remove or add
-/// the small step, with Shift the large one, with Ctrl 5 ms.
-fn arrow_keys(ui: &mut Ui, id: egui::Id, v: &DelayView) -> Option<DelayAction> {
+/// Which step an arrow key asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyStep {
+    /// ←/→: the small step.
+    Small,
+    /// With Shift: the large step.
+    Large,
+    /// With Ctrl: 5 ms.
+    Fine,
+}
+
+/// The arrow keys on a focused delay line or head line: ← removes, →
+/// adds; the step by the modifiers held with the key.
+fn arrow_key(ui: &mut Ui, id: egui::Id) -> Option<(Direction, KeyStep)> {
     ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { horizontal_arrows: true, ..Default::default() }));
-    // The modifiers held with the key press itself.
-    let press = ui.input(|i| {
+    let (key, mods) = ui.input(|i| {
         i.events.iter().find_map(|e| match e {
             egui::Event::Key { key: k @ (Key::ArrowLeft | Key::ArrowRight), pressed: true, modifiers, .. } => Some((*k, *modifiers)),
             _ => None,
         })
-    });
-    let (key, mods) = press?;
-    let left = key == Key::ArrowLeft;
+    })?;
     let step = if mods.ctrl || mods.command {
-        5
+        KeyStep::Fine
     } else if mods.shift {
-        v.large_step_ms
+        KeyStep::Large
     } else {
-        v.small_step_ms
+        KeyStep::Small
     };
-    let dir = if left { Direction::Remove } else { Direction::Add };
-    let n = v.limits.allowed(v.change_ms, dir, step);
-    (n > 0).then(|| if left { DelayAction::Remove(n) } else { DelayAction::Add(n) })
+    Some((if key == Key::ArrowLeft { Direction::Remove } else { Direction::Add }, step))
 }
 
-/// The delay in the panel: one line, *Delay  about 0.15 s* with a chevron,
-/// that opens the four buttons and one line under them (*50 ms removed ·
-/// Reset*). The arrow keys work on the closed line too. Any other amount
-/// is typed on the speaker's page ([`DelayControl`]).
+fn arrow_keys(ui: &mut Ui, id: egui::Id, v: &DelayView) -> Option<DelayAction> {
+    let (dir, step) = arrow_key(ui, id)?;
+    let ms = match step {
+        KeyStep::Fine => 5,
+        KeyStep::Large => v.large_step_ms,
+        KeyStep::Small => v.small_step_ms,
+    };
+    let n = v.limits.allowed(v.change_ms, dir, ms);
+    (n > 0).then(|| if dir == Direction::Remove { DelayAction::Remove(n) } else { DelayAction::Add(n) })
+}
+
+/// A step button of the panel's delay section, in words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepWords<'a> {
+    pub label: &'a str,
+    /// What a reader of the display says (*Remove 100 milliseconds of delay*).
+    pub spoken: &'a str,
+    pub enabled: bool,
+}
+
+/// The line under the buttons, in words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineNote<'a> {
+    pub text: &'a str,
+    pub mark: Mark,
+    pub tone: Tone,
+    pub links: Vec<&'a str>,
+}
+
+/// Everything the panel's delay line says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineWords<'a> {
+    /// *Delay*.
+    pub label: &'a str,
+    /// *about 0.15 s*, or *reconnecting to remove 100 ms…*.
+    pub value: &'a str,
+    /// The value is a figure (drawn strong), not a phrase (drawn grey).
+    pub value_is_figure: bool,
+    /// The closed line, as a reader of the display says it.
+    pub spoken: &'a str,
+    /// Remove large, Add large, Remove small, Add small.
+    pub steps: Option<[StepWords<'a>; 4]>,
+    /// Instead of the buttons where nothing can be changed: the sentence
+    /// and its one link.
+    pub fixed: Option<(&'a str, &'a str)>,
+    /// The line under the buttons.
+    pub line: Option<LineNote<'a>>,
+}
+
+/// What the person did on the panel's delay line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineAction {
+    /// A step button: 0 Remove large, 1 Add large, 2 Remove small, 3 Add
+    /// small.
+    Step(usize),
+    /// The fixed sentence's link.
+    Fixed,
+    /// A link of the line under the buttons.
+    Link(usize),
+    /// An arrow key on the line, open or closed.
+    Key(Direction, KeyStep),
+}
+
+/// The delay in the panel, from its words: one line, *Delay  about
+/// 0.15 s* with a chevron, the whole line a button, that opens the four
+/// buttons and one line under them. The arrow keys work on the closed line
+/// too. `state.open` says whether it is open; a click on the line flips it.
+pub fn delay_line(ui: &mut Ui, w: &LineWords, state: &mut DelayState) -> Option<LineAction> {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        delay_line_inner(ui, w, state)
+    })
+    .inner
+}
+
+fn delay_line_inner(ui: &mut Ui, w: &LineWords, state: &mut DelayState) -> Option<LineAction> {
+    let t = Theme::of(ui.ctx());
+    let width = ui.available_width();
+    let top = ui.cursor().min;
+    let mut action = None;
+
+    let (line, alloc) = ui.allocate_exact_size(Vec2::new(width, LINE_H), Sense::hover());
+    // The line reaches 8 points past the text on each side, like a menu
+    // item, so its pointed-at fill has room around the words.
+    let hit = line.expand2(Vec2::new(8.0, 0.0));
+    let resp = ui.interact(hit, alloc.id.with("line"), Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::CollapsingHeader, true, state.open, w.spoken));
+    let l = look_as(ui, &resp, w.spoken);
+    let p = ui.painter();
+    if l.pressed || l.hovered {
+        p.rect_filled(hit, radius::CONTROL, if l.pressed { t.c.pressed } else { t.c.hover });
+    }
+    let label = p.layout_no_wrap(w.label.into(), t.font(size::SECONDARY), t.c.text_secondary);
+    let cy = line.center().y;
+    let mut x = line.left();
+    p.galley(egui::pos2(x, cy - label.size().y / 2.0), label.clone(), t.c.text_secondary);
+    x += label.size().x + 6.0;
+    let room = (line.right() - 22.0 - x).max(20.0);
+    let (font, color) = if w.value_is_figure { (t.strong(size::SECONDARY), t.c.text) } else { (t.font(size::SECONDARY), t.c.text_secondary) };
+    let mut job = egui::text::LayoutJob::simple_singleline(w.value.into(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+    let value = ui.fonts(|f| f.layout_job(job));
+    p.galley(egui::pos2(x, cy - value.size().y / 2.0), value, color);
+    let chevron = if state.open { Icon::ChevronUp } else { Icon::ChevronDown };
+    chevron.paint_weight(p, Rect::from_center_size(egui::pos2(line.right() - 7.0, cy), Vec2::splat(14.0)), t.c.text_secondary, 1.6);
+    if l.focused {
+        focus_ring(p, hit, radius::CONTROL, true, &t);
+    }
+    if resp.clicked() {
+        state.open = !state.open;
+    }
+    if resp.has_focus() {
+        if let Some((d, s)) = arrow_key(ui, resp.id) {
+            action = Some(LineAction::Key(d, s));
+        }
+    }
+
+    if state.open {
+        ui.add_space(2.0);
+        let section_top = ui.cursor().min;
+        let note = if let Some((text, link)) = w.fixed {
+            Some(LineNote { text, mark: Mark::Info, tone: Tone::Secondary, links: vec![link] })
+        } else {
+            if let Some(steps) = &w.steps {
+                if let Some(i) = step_grid(ui, steps, width) {
+                    action = Some(LineAction::Step(i));
+                }
+            }
+            w.line.clone()
+        };
+        if let Some(i) = held_line(ui, state, section_top, width, note.as_ref(), size::SMALL) {
+            action = Some(if w.fixed.is_some() { LineAction::Fixed } else { LineAction::Link(i) });
+        }
+        ui.add_space(8.0);
+    }
+    state.last_rect = Some(Rect::from_min_max(top, egui::pos2(top.x + width, ui.cursor().min.y)));
+    action
+}
+
+/// The four step buttons in two columns; returns the one clicked.
+fn step_grid(ui: &mut Ui, steps: &[StepWords; 4], width: f32) -> Option<usize> {
+    let col_w = ((width - GAP_X) / 2.0).max(0.0);
+    let mut clicked = None;
+    for row in 0..2 {
+        if row > 0 {
+            ui.add_space(GAP_Y);
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP_X;
+            for col in 0..2 {
+                let i = row * 2 + col;
+                let s = steps[i];
+                let r = ui.push_id(("step", i), |ui| Button::standard(s.label).small().width(col_w).enabled(s.enabled).accessible_name(s.spoken).show(ui)).inner;
+                if r.clicked() {
+                    clicked = Some(i);
+                }
+            }
+        });
+    }
+    clicked
+}
+
+/// The delay in the panel, from a [`DelayView`]: [`delay_line`] with the
+/// words this module writes. Any other amount is typed on the speaker's
+/// page ([`DelayControl`]).
 #[must_use = "call .show(ui)"]
 pub struct DelayLine<'v, 's> {
     view: &'v DelayView<'v>,
@@ -794,96 +968,72 @@ impl<'v, 's> DelayLine<'v, 's> {
     }
 
     pub fn show(self, ui: &mut Ui) -> Option<DelayAction> {
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            self.show_inner(ui)
-        })
-        .inner
-    }
-
-    fn show_inner(self, ui: &mut Ui) -> Option<DelayAction> {
         let DelayLine { view: v, state } = self;
-        let t = Theme::of(ui.ctx());
-        let width = ui.available_width();
-        let top = ui.cursor().min;
-        let mut action = None;
-
-        let (line, alloc) = ui.allocate_exact_size(Vec2::new(width, LINE_H), Sense::hover());
-        // The line reaches 8 points past the text on each side, like a
-        // menu item, so its pointed-at fill has room around the words.
-        let hit = line.expand2(Vec2::new(8.0, 0.0));
-        let resp = ui.interact(hit, alloc.id.with("line"), Sense::click());
         let spoken = format!("Delay on {}: {}, {}.", v.speaker, v.delay.spoken(), change_spoken(v.change_ms));
-        resp.widget_info(|| WidgetInfo::selected(WidgetType::CollapsingHeader, true, state.open, &spoken));
-        let l = look_as(ui, &resp, &spoken);
-        let p = ui.painter();
-        if l.pressed || l.hovered {
-            p.rect_filled(hit, radius::CONTROL, if l.pressed { t.c.pressed } else { t.c.hover });
-        }
-        let label = p.layout_no_wrap("Delay".into(), t.font(size::SECONDARY), t.c.text_secondary);
-        let cy = line.center().y;
-        let mut x = line.left();
-        p.galley(egui::pos2(x, cy - label.size().y / 2.0), label.clone(), t.c.text_secondary);
-        x += label.size().x + 6.0;
-        let room = (line.right() - 22.0 - x).max(20.0);
-        let (words, font, color) = match &v.reconnecting {
-            Some(r) => (r.words(v.speaker), t.font(size::SECONDARY), t.c.text_secondary),
-            None => (v.delay.short(), t.strong(size::SECONDARY), t.c.text),
+        let value = match &v.reconnecting {
+            Some(r) => r.words(v.speaker),
+            None => v.delay.short(),
         };
-        let mut job = egui::text::LayoutJob::simple_singleline(words, font, color);
-        job.wrap = egui::text::TextWrapping::truncate_at_width(room);
-        let value = ui.fonts(|f| f.layout_job(job));
-        p.galley(egui::pos2(x, cy - value.size().y / 2.0), value, color);
-        let chevron = if state.open { Icon::ChevronUp } else { Icon::ChevronDown };
-        chevron.paint_weight(p, Rect::from_center_size(egui::pos2(line.right() - 7.0, cy), Vec2::splat(14.0)), t.c.text_secondary, 1.6);
-        if l.focused {
-            focus_ring(p, hit, radius::CONTROL, true, &t);
-        }
-        if resp.clicked() {
-            state.open = !state.open;
-        }
-        if resp.has_focus() {
-            action = arrow_keys(ui, resp.id, v);
-        }
-
-        if state.open {
-            ui.add_space(2.0);
-            let section_top = ui.cursor().min;
-            let words = if let Some(short_ms) = v.fixed_with_short_ms {
-                Some(NoteWords {
-                    mark: Mark::Info,
-                    tone: Tone::Secondary,
-                    text: format!(
-                        "On Steady, {} keeps this delay itself, so none of it can be removed yet. For video, use Short delay ({}).",
-                        v.speaker,
-                        DelayFigure::about(short_ms).short()
-                    ),
-                    links: vec![("Use Short delay".into(), NoteLink::UseShortDelay)],
-                })
-            } else {
-                if let Some(a) = step_buttons(ui, v, width) {
-                    action = Some(a);
+        let labels: Vec<(String, String, bool)> = [(Direction::Remove, v.large_step_ms), (Direction::Add, v.large_step_ms), (Direction::Remove, v.small_step_ms), (Direction::Add, v.small_step_ms)]
+            .iter()
+            .map(|(d, ms)| {
+                let verb = if *d == Direction::Remove { "Remove" } else { "Add" };
+                (format!("{verb} {ms} ms"), format!("{verb} {ms} milliseconds of delay"), !v.limits.at_limit(v.change_ms, *d))
+            })
+            .collect();
+        let steps = [0, 1, 2, 3].map(|i| StepWords { label: &labels[i].0, spoken: &labels[i].1, enabled: labels[i].2 });
+        let fixed_text = v.fixed_with_short_ms.map(|short_ms| {
+            format!(
+                "On Steady, {} keeps this delay itself, so none of it can be removed yet. For video, use Short delay ({}).",
+                v.speaker,
+                DelayFigure::about(short_ms).short()
+            )
+        });
+        let reset = ("Reset".to_string(), NoteLink::BackToOwn);
+        let note = match (&v.note, change_words(v.change_ms)) {
+            (Some(n), change) => {
+                let mut w = n.words(v.speaker, v.limits, v.large_step_ms);
+                if change.is_some() {
+                    w.links.push(reset);
                 }
-                let reset = ("Reset".to_string(), NoteLink::BackToOwn);
-                match (&v.note, change_words(v.change_ms)) {
-                    (Some(n), change) => {
-                        let mut w = n.words(v.speaker, v.limits, v.large_step_ms);
-                        if change.is_some() {
-                            w.links.push(reset);
-                        }
-                        Some(w)
-                    }
-                    (None, Some(change)) => Some(NoteWords { mark: Mark::None, tone: Tone::Secondary, text: change, links: vec![reset] }),
-                    (None, None) => None,
-                }
-            };
-            if let Some(a) = under_line(ui, v, state, section_top, width, words, size::SMALL) {
-                action = Some(a);
+                Some(w)
             }
-            ui.add_space(8.0);
+            (None, Some(change)) => Some(NoteWords { mark: Mark::None, tone: Tone::Secondary, text: change, links: vec![reset] }),
+            (None, None) => None,
+        };
+        let words = LineWords {
+            label: "Delay",
+            value: &value,
+            value_is_figure: v.reconnecting.is_none(),
+            spoken: &spoken,
+            steps: Some(steps),
+            fixed: fixed_text.as_deref().map(|t| (t, "Use Short delay")),
+            line: note.as_ref().map(|w| LineNote { text: &w.text, mark: w.mark, tone: w.tone, links: w.links.iter().map(|(l, _)| l.as_str()).collect() }),
+        };
+        let step_ms = |i: usize| if i < 2 { v.large_step_ms } else { v.small_step_ms };
+        match delay_line(ui, &words, state)? {
+            LineAction::Step(i) => {
+                let dir = if i % 2 == 0 { Direction::Remove } else { Direction::Add };
+                let n = v.limits.allowed(v.change_ms, dir, step_ms(i));
+                (n > 0).then(|| if dir == Direction::Remove { DelayAction::Remove(n) } else { DelayAction::Add(n) })
+            }
+            LineAction::Fixed => Some(DelayAction::UseShortDelay),
+            LineAction::Link(i) => note.and_then(|w| w.links.get(i).map(|(_, what)| *what)).map(|what| match what {
+                NoteLink::UseShortDelay => DelayAction::UseShortDelay,
+                NoteLink::UseSteady => DelayAction::UseSteady,
+                NoteLink::AddLarge => DelayAction::Add(v.limits.allowed(v.change_ms, Direction::Add, v.large_step_ms)),
+                NoteLink::BackToOwn => DelayAction::BackToOwn,
+            }),
+            LineAction::Key(dir, step) => {
+                let ms = match step {
+                    KeyStep::Fine => 5,
+                    KeyStep::Large => v.large_step_ms,
+                    KeyStep::Small => v.small_step_ms,
+                };
+                let n = v.limits.allowed(v.change_ms, dir, ms);
+                (n > 0).then(|| if dir == Direction::Remove { DelayAction::Remove(n) } else { DelayAction::Add(n) })
+            }
         }
-        state.last_rect = Some(Rect::from_min_max(top, egui::pos2(top.x + width, ui.cursor().min.y)));
-        action
     }
 }
 

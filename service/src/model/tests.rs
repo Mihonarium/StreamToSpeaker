@@ -1457,7 +1457,8 @@ fn panel_delay() {
     let playing = snap(Scenario::Playing);
     let d = panel_delay_of(&playing);
     assert_eq!(d.reset.as_ref().unwrap().spoken.as_deref(), Some("Back to Kitchen’s own delay"));
-    assert_eq!(d.spoken, "Delay on Kitchen: about 0.15 seconds, 50 milliseconds removed. Press Enter to type an amount.");
+    // The panel has no amount field, so its line doesn't offer one.
+    assert_eq!(d.spoken, "Delay on Kitchen: about 0.15 seconds, 50 milliseconds removed.");
     let DelayBody::Buttons { remove_large, remove_small, add_large, add_small } = &d.body else { panic!() };
     assert_eq!(
         [&remove_large.label, &add_large.label, &remove_small.label, &add_small.label],

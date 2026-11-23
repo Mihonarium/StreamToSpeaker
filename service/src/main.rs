@@ -123,6 +123,11 @@ struct Cli {
     #[arg(long, default_value_t = false, hide = true)]
     startup: bool,
 
+    /// Start the new panel, tray and windows instead of the window, on a
+    /// scripted engine (no sound is sent): for trying them out.
+    #[arg(long, default_value_t = false, hide = true)]
+    new_shell: bool,
+
     /// Enable the HTTP / JSON API and built-in web UI. Both need the web
     /// UI's link, which carries a secret key (shown in the window; printed
     /// at start with --headless, and by --web-link). The audio stream
@@ -439,6 +444,15 @@ fn main() {
             }
             return;
         }
+    }
+
+    #[cfg(windows)]
+    if cli.new_shell {
+        let options = stream_to_speaker::shell::ShellOptions::from_env(!cli.no_tray);
+        if let Err(e) = stream_to_speaker::shell::run_scripted(options) {
+            error!("fatal: {:#}", e);
+        }
+        return;
     }
 
     if let Err(e) = run(cli) {
