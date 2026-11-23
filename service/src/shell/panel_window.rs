@@ -152,9 +152,8 @@ impl PanelWindow {
                 scale: 1.0,
                 max_height: FALLBACK_HEIGHT,
             });
-            // It keeps this height while open: whatever opens later takes
-            // its room from the list.
-            self.state.height = Some(place.rect.height() as f32 / place.scale);
+            // The most it may take; its list scrolls beyond it.
+            self.state.height = Some(place.max_height);
             self.phase = Phase::Placing { place, tries: 0 };
         }
         if let Phase::Placing { place, tries } = self.phase {
@@ -165,11 +164,20 @@ impl PanelWindow {
             self.phase = Phase::Placing { place, tries: tries + 1 };
             return Step::Wait;
         }
-        if let Phase::Shown { place, had_focus } = self.phase {
-            // Draw at the height Windows gave (the small window's title bar
-            // takes some of it).
-            if let Some(h) = seen.inner_height.filter(|h| *h > 40.0) {
-                self.state.height = Some(h);
+        if let Phase::Shown { mut place, had_focus } = self.phase {
+            // The window follows what the panel needs, anchored at the edge
+            // by the taskbar: what appears above the list moves the far
+            // edge, never the rows. The small window's title bar is added
+            // to what the panel needs.
+            let outer = place.rect.height() as f32 / place.scale;
+            let frame = seen.inner_height.filter(|h| *h > 40.0).map_or(0.0, |inner| (outer - inner).max(0.0));
+            self.state.height = Some((place.max_height - frame).max(60.0));
+            let want = (seen.natural_height + frame).min(place.max_height);
+            if seen.natural_height > 1.0 && (want - outer).abs() > 0.5 {
+                let next = placement::resize(&place, &desktop.monitors(), want);
+                if desktop.place_panel(next.rect, mode) {
+                    place = next;
+                }
             }
             let had_focus = had_focus || seen.focused == Some(true);
             self.phase = Phase::Shown { place, had_focus };
@@ -242,8 +250,45 @@ mod tests {
         assert_eq!(p.after_frame(seen(420.0), false, PanelMode::Flyout, &mut d), Step::Show);
         // 420 points at 150 %, 12 points in from the work area's corner.
         assert_eq!(d.placed, vec![PxRect::new(2880 - 18 - 540, 1548 - 18 - 630, 2880 - 18, 1548 - 18)]);
-        assert_eq!(p.state.height, Some(420.0));
+        // The most it may take before its list scrolls: the work area.
+        assert_eq!(p.state.height, Some(1008.0));
         assert!(p.shown());
+    }
+
+    #[test]
+    fn the_window_follows_the_panel_anchored_at_the_taskbar_edge() {
+        let mut d = desktop();
+        let mut p = PanelWindow::open(None);
+        while !p.shown() {
+            p.after_frame(seen(400.0), false, PanelMode::Flyout, &mut d);
+        }
+        let first = *d.placed.last().unwrap();
+        // The delay block appears: 120 points more, the top edge moves up,
+        // the bottom (by the taskbar) stays.
+        p.after_frame(seen(520.0), false, PanelMode::Flyout, &mut d);
+        let grown = *d.placed.last().unwrap();
+        assert_eq!(grown.bottom, first.bottom);
+        assert_eq!(grown.height(), 780);
+        // Nothing changes: nothing is moved.
+        let n = d.placed.len();
+        p.after_frame(seen(520.0), false, PanelMode::Flyout, &mut d);
+        assert_eq!(d.placed.len(), n);
+        // It shrinks back the same way, and never past the work area.
+        p.after_frame(seen(400.0), false, PanelMode::Flyout, &mut d);
+        assert_eq!(*d.placed.last().unwrap(), first);
+        p.after_frame(seen(5000.0), false, PanelMode::Flyout, &mut d);
+        let capped = *d.placed.last().unwrap();
+        assert_eq!((capped.top, capped.bottom), (18, first.bottom));
+        // A taskbar at the top: the panel grows downward from it.
+        let top = Monitor { bounds: PxRect::new(0, 0, 1920, 1080), work: PxRect::new(0, 48, 1920, 1080), scale: 1.0, primary: true };
+        let mut d = FakeDesktop { monitors: vec![top], ..Default::default() };
+        let mut p = PanelWindow::open(None);
+        while !p.shown() {
+            p.after_frame(seen(400.0), false, PanelMode::Flyout, &mut d);
+        }
+        let first = *d.placed.last().unwrap();
+        p.after_frame(seen(450.0), false, PanelMode::Flyout, &mut d);
+        assert_eq!(d.placed.last().unwrap().top, first.top);
     }
 
     #[test]
@@ -293,8 +338,12 @@ mod tests {
         while !p.shown() {
             p.after_frame(seen(400.0), true, PanelMode::Window, &mut d);
         }
+        // Windows gave 32 points to the title bar: the window grows by them
+        // so the panel has the 400 it needs.
+        let before = d.placed.len();
         p.after_frame(Seen { inner_height: Some(368.0), ..seen(400.0) }, true, PanelMode::Window, &mut d);
-        assert_eq!(p.state.height, Some(368.0));
+        assert_eq!(d.placed.len(), before + 1);
+        assert_eq!(d.placed.last().unwrap().height(), (432.0 * 1.5) as i32);
         assert_eq!(p.after_frame(Seen { close: true, ..seen(400.0) }, true, PanelMode::Window, &mut d), Step::Close);
     }
 }

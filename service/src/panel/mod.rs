@@ -7,10 +7,11 @@
 //! panel as a view: whether the delay section or the folded speakers are
 //! open, which row has the keyboard, and its height while it is open.
 //!
-//! Nothing moves under the pointer. The top keeps its height in every
-//! everyday state; the panel keeps the height it opened at, so whatever
-//! opens (the delay's buttons, a notice, a row's question) takes its room
-//! from the list, which scrolls.
+//! Nothing moves under the pointer. The panel is as tall as it needs, and
+//! its window is anchored at the edge by the taskbar and grows away from
+//! it, so what appears above the list (the delay block, a problem's
+//! detail) moves the far edge, not the rows. Past the display's height the
+//! list scrolls.
 //!
 //! The keyboard follows the order people expect from Windows' own flyouts:
 //! the panel opens with the keyboard on the current row; ↑ and ↓ move
@@ -18,18 +19,18 @@
 //! typing a name jumps to it; Tab goes on to the top's buttons, the volume,
 //! the delay, the notice and the footer; Esc closes; Ctrl+, opens Settings.
 
+pub mod delay_block;
 pub mod scenes;
 pub mod view;
 
 use egui::{Color32, Event, Id, Key, Margin, Pos2, Rect, Sense, Ui, UiBuilder, Vec2};
 
-use crate::model::command::{Command, DelayStep};
-use crate::model::delay::{DelayBody, PanelDelay};
+use crate::model::command::Command;
+use crate::model::delay::PanelDelay;
 use crate::model::places::{Row, RowIcon, RowStatus};
 use crate::model::snapshot::{Button as ModelButton, ButtonStyle, FirstRunWords, Snapshot, Third, TitleIcon, Tone as ModelTone, VolumeRow};
 use crate::model::surfaces::Notice as ModelNotice;
 use crate::ui::button::{Button, IconButton};
-use crate::ui::delay::{delay_line, Direction, KeyStep, LineAction, LineNote, LineWords, StepWords};
 use crate::ui::icon::Icon;
 use crate::ui::inputs::Switch;
 use crate::ui::menu::{menu_separator, open_menu, show_menu, MenuItem};
@@ -48,12 +49,12 @@ const PAD_X: f32 = 16.0;
 /// What the panel keeps between frames.
 #[derive(Clone, Debug, Default)]
 pub struct PanelState {
-    /// The delay line: open or closed, and the room its line keeps.
-    pub delay: crate::ui::delay::DelayState,
+    /// The delay block's amount field, while open.
+    pub delay: delay_block::BlockState,
     /// *More speakers (12)* opened.
     pub more_open: bool,
-    /// The height the panel opened at; it keeps it while open. `None` draws
-    /// it at the height it needs.
+    /// The most the panel may take (the display's room); its list scrolls
+    /// beyond it. `None`: as tall as it needs.
     pub height: Option<f32>,
     /// Put the keyboard on the current row (when the panel opens).
     pub focus_current_row: bool,
@@ -69,6 +70,8 @@ pub struct PanelState {
     typed: (String, f64),
     /// The parts' heights in the last pass: top, list, bottom.
     heights: [f32; 3],
+    /// This frame's Esc was taken by a field (the amount field closes).
+    esc_taken: bool,
 }
 
 impl PanelState {
@@ -97,14 +100,15 @@ type Place = crate::model::state::Place;
 /// level now (0–1).
 pub fn show(ui: &mut Ui, snap: &Snapshot, level: f32, st: &mut PanelState) -> PanelOutput {
     let mut out = PanelOutput::default();
+    st.esc_taken = false;
     crate::ui::look::follow_input(ui.ctx());
     let t = Theme::of(ui.ctx());
     let width = ui.available_width();
     let origin = ui.cursor().min;
     let [top_h, list_h_last, bottom_h] = st.heights;
 
-    // The list's room: all of the fixed height the top and bottom leave, or
-    // what the list needs.
+    // The list's room: what the most the panel may take leaves it, or what
+    // it needs. Beyond it, the list scrolls.
     let list_room = match st.height {
         Some(h) => (h - top_h - 1.0 - bottom_h).max(40.0),
         None => f32::INFINITY,
@@ -122,7 +126,7 @@ pub fn show(ui: &mut Ui, snap: &Snapshot, level: f32, st: &mut PanelState) -> Pa
     let mut top_ui = ui.new_child(UiBuilder::new().id_salt("panel-top").max_rect(Rect::from_min_size(origin, Vec2::new(width, 10_000.0))).layout(down));
     let top_used = draw_top(&mut top_ui, snap, level, st, &mut out);
 
-    let list_shown = if list_room.is_finite() { list_room } else { list_used };
+    let list_shown = list_used.min(list_room);
     let bottom_top = list_top + list_shown;
     let mut bottom_ui = ui.new_child(UiBuilder::new().id_salt("panel-bottom").max_rect(Rect::from_min_size(egui::pos2(origin.x, bottom_top), Vec2::new(width, 10_000.0))).layout(down));
     let bottom_used = draw_bottom(&mut bottom_ui, snap, &mut out);
@@ -145,7 +149,7 @@ pub fn show(ui: &mut Ui, snap: &Snapshot, level: f32, st: &mut PanelState) -> Pa
         let ctrl_comma = i.events.iter().any(|e| matches!(e, Event::Key { key: Key::Comma, pressed: true, modifiers, .. } if modifiers.command));
         (i.key_pressed(Key::Escape), ctrl_comma)
     });
-    if esc && !crate::ui::menu::menu_is_open(ui.ctx(), row_menu_id()) {
+    if esc && !st.esc_taken && !crate::ui::menu::menu_is_open(ui.ctx(), row_menu_id()) {
         out.close = true;
     }
     if settings {
@@ -222,8 +226,10 @@ fn draw_top(ui: &mut Ui, snap: &Snapshot, level: f32, st: &mut PanelState, out: 
                     third_words(ui, text);
                 }
                 Some(Third::Delay(d)) => {
-                    ui.add_space(4.0);
-                    delay(ui, d, &mut st.delay, out);
+                    ui.add_space(6.0);
+                    let o = delay_block::block(ui, snap.lang, d, snap.delay.as_ref(), &mut st.delay);
+                    out.commands.extend(o.commands);
+                    st.esc_taken |= o.esc_taken;
                 }
                 None => {}
             }
@@ -385,68 +391,10 @@ fn mark_and_tone(tone: ModelTone) -> (Mark, Tone) {
     }
 }
 
-fn delay(ui: &mut Ui, d: &PanelDelay, state: &mut crate::ui::delay::DelayState, out: &mut PanelOutput) {
-    let buttons: Option<[&ModelButton; 4]> = match &d.body {
-        DelayBody::Buttons { remove_large, remove_small, add_large, add_small } => Some([remove_large, add_large, remove_small, add_small]),
-        DelayBody::Fixed { .. } => None,
-    };
-    let steps = buttons.map(|b| b.map(|b| StepWords { label: &b.label, spoken: b.spoken.as_deref().unwrap_or(&b.label), enabled: b.enabled }));
-    let fixed = match &d.body {
-        DelayBody::Fixed { text, action } => Some((text.as_str(), action.label.as_str())),
-        DelayBody::Buttons { .. } => None,
-    };
-    // The line under the buttons: what matters now with its action, else
-    // the change; then Reset.
-    let mut links: Vec<&ModelButton> = Vec::new();
-    if let Some(a) = d.note.as_ref().and_then(|l| l.action.as_ref()) {
-        links.push(a);
-    }
-    if let Some(r) = &d.reset {
-        links.push(r);
-    }
-    let line = match (&d.note, &d.change) {
-        (Some(l), _) => {
-            let (mark, tone) = mark_and_tone(l.tone);
-            Some(LineNote { text: &l.text, mark, tone, links: links.iter().map(|b| b.label.as_str()).collect() })
-        }
-        (None, Some(change)) => Some(LineNote { text: change, mark: Mark::None, tone: Tone::Secondary, links: links.iter().map(|b| b.label.as_str()).collect() }),
-        (None, None) if !links.is_empty() => Some(LineNote { text: "", mark: Mark::None, tone: Tone::Secondary, links: links.iter().map(|b| b.label.as_str()).collect() }),
-        (None, None) => None,
-    };
-    let words = LineWords { label: &d.label, value: &d.value, value_is_figure: !d.reconnecting, spoken: &d.spoken, steps, fixed, line };
-    let Some(action) = delay_line(ui, &words, state) else { return };
-    let command = match action {
-        LineAction::Step(i) => buttons.map(|b| b[i].command.clone()),
-        LineAction::Fixed => match &d.body {
-            DelayBody::Fixed { action, .. } => Some(action.command.clone()),
-            DelayBody::Buttons { .. } => None,
-        },
-        LineAction::Link(i) => links.get(i).map(|b| b.command.clone()),
-        LineAction::Key(dir, step) => buttons.and_then(|b| {
-            let small = if dir == Direction::Remove { b[2] } else { b[3] };
-            let large = if dir == Direction::Remove { b[0] } else { b[1] };
-            match step {
-                KeyStep::Small => Some(small.command.clone()),
-                KeyStep::Large => Some(large.command.clone()),
-                KeyStep::Fine => match &small.command {
-                    Command::ChangeDelay { speaker, .. } => Some(Command::ChangeDelay {
-                        speaker: speaker.clone(),
-                        step: if dir == Direction::Remove { DelayStep::Remove(5) } else { DelayStep::Add(5) },
-                    }),
-                    _ => None,
-                },
-            }
-        }),
-    };
-    out.commands.extend(command);
-}
-
 /// The panel's delay block for `d`, wherever it is drawn (the top of the
 /// panel, a speaker's view); the commands its controls send.
-pub fn delay_block(ui: &mut Ui, d: &PanelDelay, state: &mut crate::ui::delay::DelayState) -> Vec<Command> {
-    let mut out = PanelOutput::default();
-    delay(ui, d, state, &mut out);
-    out.commands
+pub fn delay_block(ui: &mut Ui, snap: &Snapshot, d: &PanelDelay, state: &mut delay_block::BlockState) -> Vec<Command> {
+    delay_block::block(ui, snap.lang, d, snap.delay.as_ref(), state).commands
 }
 
 // ---------------------------------------------------------------- the list
@@ -454,6 +402,8 @@ pub fn delay_block(ui: &mut Ui, d: &PanelDelay, state: &mut crate::ui::delay::De
 /// One row of the list as the panel draws it.
 enum Item<'a> {
     Place(&'a Row),
+    /// One of This PC's outputs, under its row while they are open.
+    Output(&'a crate::model::places::OutputRow),
     Searching,
     Fold,
     LookingMore(&'a str),
@@ -462,6 +412,9 @@ enum Item<'a> {
 fn draw_list(ui: &mut Ui, snap: &Snapshot, st: &mut PanelState, room: f32, out: &mut PanelOutput) -> f32 {
     let list = &snap.list;
     let mut items: Vec<Item> = vec![Item::Place(&list.this_pc)];
+    if list.this_pc.chevron.as_ref().is_some_and(|c| c.open) {
+        items.extend(list.pc_outputs.iter().map(Item::Output));
+    }
     items.extend(list.speakers.iter().map(Item::Place));
     if list.searching.is_some() {
         items.push(Item::Searching);
@@ -533,12 +486,25 @@ fn draw_list(ui: &mut Ui, snap: &Snapshot, st: &mut PanelState, room: f32, out: 
                                 }
                             }
                             Some(RowAction::Options) => out.commands.extend(row.options.as_ref().map(|o| o.command.clone())),
-                            Some(RowAction::Expand) | None => {}
+                            Some(RowAction::Expand) => out.commands.extend(row.chevron.as_ref().map(|c| c.command.clone())),
+                            None => {}
                         }
                         if let Some(q) = &row.question {
                             question(ui, q, out);
                         }
                         responses.push((row.place.clone(), resp));
+                    }
+                    Item::Output(o) => {
+                        let r = PlaceRow {
+                            status: if o.checked { Status::Check } else { Status::None },
+                            indent: true,
+                            spoken: Some(o.spoken.clone()),
+                            ..PlaceRow::new(row_icon(o.icon), &o.title, &o.second)
+                        };
+                        let action = ui.push_id(("output", &o.title, &o.second), |ui| r.show_full(ui, ROW_STYLE)).inner.0;
+                        if action == Some(RowAction::Choose) {
+                            out.commands.extend(o.command.clone());
+                        }
                     }
                     Item::Searching => searching(ui, snap, out),
                     Item::Fold => {
@@ -558,7 +524,7 @@ fn draw_list(ui: &mut Ui, snap: &Snapshot, st: &mut PanelState, room: f32, out: 
         });
     };
     if room.is_finite() {
-        let scroll = egui::ScrollArea::vertical().id_salt("panel-list-scroll").max_height(room).auto_shrink([false, false]).show(ui, |ui| {
+        let scroll = egui::ScrollArea::vertical().id_salt("panel-list-scroll").max_height(room).auto_shrink([false, true]).show(ui, |ui| {
             draw(ui, st, out, &mut responses);
         });
         content_h = scroll.content_size.y;
@@ -667,6 +633,11 @@ fn place_row(ui: &mut Ui, row: &Row, tab_stop: bool) -> (Option<RowAction>, egui
         None => Status::None,
     };
     let problem = row.error.as_ref().map(|e| Problem { text: &e.text, tone: Tone::Red, button: Some(&e.retry.label) });
+    // This PC's chevron opens its outputs.
+    let status = match &row.chevron {
+        Some(c) if matches!(status, Status::None) => Status::Expand { open: c.open },
+        _ => status,
+    };
     let r = PlaceRow {
         status,
         problem,
@@ -676,9 +647,11 @@ fn place_row(ui: &mut Ui, row: &Row, tab_stop: bool) -> (Option<RowAction>, egui
         spoken: Some(row.spoken.clone()),
         tab_stop,
         options: row.options.as_ref().map(|o| (o.label.as_str(), o.spoken.as_deref().unwrap_or(o.label.as_str()))),
-        ..PlaceRow::new(row_icon(row.icon), &row.title, &row.tooltip)
+        ..PlaceRow::new(row_icon(row.icon), &row.title, &row.second)
     };
-    ui.push_id(("row", &row.title), |ui| r.show_full(ui, ROW_STYLE)).inner
+    // Two ways to one speaker share a name: the second line tells them
+    // apart, and so does the id.
+    ui.push_id(("row", &row.place), |ui| r.show_full(ui, ROW_STYLE)).inner
 }
 
 /// A busy speaker's question, in place under its row.

@@ -151,22 +151,33 @@ fn the_tops_buttons_send_their_commands() {
 }
 
 #[test]
-fn the_delay_opens_and_its_buttons_and_reset_send_their_commands() {
+fn the_delay_blocks_buttons_reset_and_typed_amount_send_their_commands() {
     let snap = snapshot("delay-removing", Names::Usual);
-    let Some(Third::Delay(d)) = snap.top.third.clone() else { panic!("a delay line") };
-    let mut h = Harness::new(snap, PanelState::opened());
-    assert_eq!(h.click(&d.value), vec![], "opening sends nothing");
-    assert!(h.state.delay.is_open());
+    let Some(Third::Delay(d)) = snap.top.third.clone() else { panic!("a delay block") };
+    let mut h = Harness::new(snap.clone(), PanelState::opened());
+    // Open from the start: the buttons are there.
     let stream_to_speaker::model::delay::DelayBody::Buttons { remove_small, add_large, .. } = &d.body else { panic!("buttons") };
     assert_eq!(h.click(&remove_small.label), vec![remove_small.command.clone()]);
     assert_eq!(h.click(&add_large.label), vec![add_large.command.clone()]);
-    if let Some(reset) = &d.reset {
-        // The link sits at the end of the line under the buttons.
-        let f = h.settle();
-        let line = f.texts.iter().find(|(t, _)| t.ends_with(&reset.label)).expect("the line with Reset").1;
-        let sent = h.click_at(Pos2::new(line.right() - 8.0, line.center().y));
-        assert_eq!(sent, vec![reset.command.clone()]);
-    }
+    let reset = d.reset.clone().expect("something is removed");
+    assert_eq!(h.click(&reset.label), vec![reset.command.clone()]);
+    // Other amount… opens the field in place of the buttons; Enter removes
+    // what was typed.
+    let other = d.other_amount.clone().expect("Other amount…");
+    assert_eq!(h.click(&other), vec![], "opening sends nothing");
+    assert!(h.state.delay.amount_is_open());
+    h.settle();
+    h.frame(vec![Event::Text("150".into())]);
+    let sent = h.key(Key::Enter, Modifiers::NONE).out.commands;
+    let Some(stream_to_speaker::model::command::Command::ChangeDelay { step, .. }) = sent.first() else { panic!("{sent:?}") };
+    assert_eq!(*step, stream_to_speaker::model::command::DelayStep::Remove(150));
+    assert!(!h.state.delay.amount_is_open(), "the field closes once used");
+    // Esc in the field closes it, not the panel.
+    h.state.delay.open_amount();
+    h.settle();
+    let esc = h.key(Key::Escape, Modifiers::NONE);
+    assert!(!esc.out.close);
+    assert!(!h.state.delay.amount_is_open());
 }
 
 #[test]
@@ -258,7 +269,7 @@ fn the_keyboard_starts_on_the_current_row_and_tabs_through_the_top_then_the_foot
     for _ in 0..4 {
         order.extend(h.frame(vec![]).focused);
     }
-    for _ in 0..9 {
+    for _ in 0..16 {
         order.extend(h.key(Key::Tab, Modifiers::NONE).focused);
         order.extend(h.frame(vec![]).focused);
     }
@@ -272,12 +283,24 @@ fn the_keyboard_starts_on_the_current_row_and_tabs_through_the_top_then_the_foot
         v.mute.spoken.clone().unwrap_or(v.mute.label.clone()),
         v.spoken.clone(),
         d.spoken.clone(),
+    ];
+    // The delay block: its head line, the four buttons (large step first,
+    // Remove before Add), Reset and Other amount….
+    let stream_to_speaker::model::delay::DelayBody::Buttons { remove_large, remove_small, add_large, add_small } = &d.body else { panic!() };
+    let mut expected: Vec<String> = expected.to_vec();
+    for b in [remove_large, add_large, remove_small, add_small] {
+        expected.push(b.spoken.clone().unwrap_or(b.label.clone()));
+    }
+    let reset = d.reset.clone().unwrap();
+    expected.push(reset.spoken.clone().unwrap_or(reset.label.clone()));
+    expected.push(d.other_amount.clone().unwrap());
+    expected.extend([
         snap.footer.cant_hear.clone().unwrap().label,
         snap.footer.speaker_missing.label.clone(),
         snap.footer.settings.spoken.clone().unwrap_or(snap.footer.settings.label.clone()),
         current.clone(),
         options.spoken.clone().unwrap(),
-    ];
+    ]);
     let order: Vec<String> = order.into_iter().fold(Vec::new(), |mut acc, x| {
         if acc.last() != Some(&x) {
             acc.push(x);
@@ -328,7 +351,7 @@ fn the_arrow_keys_change_the_delay_on_the_closed_line() {
     }
     assert_eq!(h.key(Key::ArrowLeft, Modifiers::NONE).out.commands, vec![remove_small.command.clone()]);
     assert_eq!(h.key(Key::ArrowRight, Modifiers::SHIFT).out.commands, vec![add_large.command.clone()]);
-    assert!(!h.state.delay.is_open(), "the keys work without opening it");
+    assert!(!h.state.delay.amount_is_open(), "the keys work on the head line");
 }
 
 /// `s` a third longer, as words often are in other languages: the start
@@ -452,7 +475,9 @@ fn assert_clean_layout(name: &str, names: Names, scale: f32, open_delay: bool) {
 
 fn assert_clean_layout_of(name: &str, snap: std::sync::Arc<Snapshot>, names: &str, scale: f32, open_delay: bool) {
     let mut state = PanelState::opened();
-    state.delay.set_open(open_delay);
+    if open_delay {
+        state.delay = stream_to_speaker::panel::delay_block::BlockState::with_amount("150");
+    }
     let mut h = Harness::new(snap, state);
     h.scale = scale;
     let f = h.settle();
@@ -487,19 +512,21 @@ fn every_scenario_lays_out_cleanly_with_its_words_a_third_longer_at_200_percent(
 }
 
 #[test]
-fn the_top_keeps_its_height_in_every_everyday_state() {
-    // Choosing a place never moves the list: the top's height is the same
-    // on This PC, while connecting, playing, ready and on Music Assistant.
-    let mut tops = Vec::new();
-    for name in ["on-this-pc", "connecting", "playing", "ready", "music-assistant-playing"] {
+fn the_rows_keep_their_place_from_the_bottom_edge_as_the_top_grows() {
+    // The window is anchored at the edge by the taskbar and grows away
+    // from it: what appears above the list (the delay block, a problem's
+    // detail) moves the far edge, so a row's distance from the bottom edge
+    // is the same on This PC, while connecting, playing and ready.
+    let mut from_bottom = Vec::new();
+    for name in ["on-this-pc", "connecting", "playing", "ready"] {
         let snap = snapshot(name, Names::Usual);
         let mut h = Harness::new(snap.clone(), PanelState::opened());
         let f = h.settle();
-        let first_row = f.texts.iter().find(|(t, _)| t == "This PC").unwrap().1.top();
-        tops.push((name, first_row));
+        let row = f.texts.iter().find(|(t, _)| t == "Bedroom").unwrap().1.top();
+        from_bottom.push((name, f.out.natural_height - row));
     }
-    let first = tops[0].1;
-    assert!(tops.iter().all(|(_, y)| (y - first).abs() < 0.5), "{tops:?}");
+    let first = from_bottom[0].1;
+    assert!(from_bottom.iter().all(|(_, d)| (d - first).abs() < 0.5), "{from_bottom:?}");
 }
 
 #[test]
