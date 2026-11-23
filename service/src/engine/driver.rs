@@ -37,6 +37,9 @@ pub(crate) enum Input {
     Command(Surface, Command, Reply),
     Event(Event),
     System(SystemEvent),
+    /// End the engine's thread (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Stop,
 }
 
 /// Where navigation commands (open a window or a page) go.
@@ -87,8 +90,9 @@ impl Engine {
         }));
         let sink = tx.clone();
         app.set_command_sink(Box::new(move |from, cmd| {
-            let (reply, _) = ticket();
+            let (reply, ticket) = ticket();
             let _ = sink.send(Input::Command(from, cmd, reply));
+            ticket
         }));
         Arc::new(Engine { port, tx, platform, opener })
     }
@@ -107,6 +111,14 @@ impl Engine {
         let _ = ticket.wait(Duration::from_secs(1));
         let lang = self.port.snapshot().lang;
         let _ = self.platform.device.rename(&crate::model::surfaces::device_name_not_running(lang));
+    }
+}
+
+#[cfg(test)]
+impl Engine {
+    /// End the engine's thread.
+    pub(crate) fn stop(&self) {
+        let _ = self.tx.send(Input::Stop);
     }
 }
 
@@ -212,6 +224,7 @@ impl Driver {
         }
         loop {
             match rx.recv_timeout(LOOK_EVERY) {
+                Ok(Input::Stop) => return,
                 Ok(input) => self.input(input, port),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -234,6 +247,7 @@ impl Driver {
                 let dos = self.core.event(ev, &w, now);
                 self.execute(dos);
             }
+            Input::Stop => {}
             Input::System(e) => {
                 let ev = match e {
                     SystemEvent::DefaultOutputChanged => Some(Event::DefaultChanged),
@@ -433,12 +447,21 @@ impl Driver {
     /// Start a connect on a thread of its own; it ends with the connect.
     fn connect(&mut self, job: Job) {
         self.wanted.store(job.gen, Ordering::SeqCst);
+        let id = connect_id(&job.place);
+        if let Some(id) = &id {
+            self.app.engine_connect_started(id, job.gen);
+        }
         if let Place::Speaker(id) = &job.place {
             // Only a person's pick in the window may play to a receiver
             // announcing another speaker's identity: not a return, a retry,
             // start-up or Windows choosing the app's output.
             if job.origin != Origin::Window && self.app.is_airplay_newcomer(id.as_str()) {
                 info!("not connecting to {} by itself: it announces another speaker's identity", id.as_str());
+                let words = format!(
+                    "To play to “{}”, pick it in the Stream To Speaker window.",
+                    self.app.speaker_name(id.as_str()).unwrap_or_else(|| id.as_str().to_string())
+                );
+                self.app.engine_connect_ended(id.as_str(), job.gen, Err(words));
                 let ended = Ended::Failed(ConnectFailure::Other);
                 let _ = self.tx.send(Input::Event(Event::Ended { gen: job.gen, ended }));
                 return;
@@ -448,18 +471,25 @@ impl Driver {
         let tx = self.tx.clone();
         let wanted = self.wanted.clone();
         let gen = job.gen;
+        let job_place = job.place.clone();
         let spawned = std::thread::Builder::new().name("stream-to-speaker-connect".into()).spawn(move || {
             let check = wanted.clone();
             let _scope = cancel::enter(Arc::new(move || check.load(Ordering::SeqCst) != gen));
             let stage_tx = tx.clone();
-            let ended = connect_job(&app, &job, &move |stage| {
+            let (ended, result) = connect_job(&app, &job, &move |stage| {
                 let _ = stage_tx.send(Input::Event(Event::Stage { gen, stage }));
             });
+            if let Some(id) = &id {
+                app.engine_connect_ended(id, gen, result);
+            }
             let _ = tx.send(Input::Event(Event::Ended { gen, ended }));
         });
         if let Ok(t) = spawned {
             self.threads.push(t);
         } else {
+            if let Some(id) = connect_id(&job_place) {
+                self.app.engine_connect_ended(&id, gen, Err("No thread was free to connect. Try again in a moment.".into()));
+            }
             let _ = self.tx.send(Input::Event(Event::Ended { gen, ended: Ended::Failed(ConnectFailure::CouldntStart) }));
         }
     }
@@ -707,31 +737,45 @@ fn refusal(why: crate::delay::Unchangeable, speaker: &crate::model::SpeakerId) -
     }
 }
 
-/// Run one connect on this thread.
-fn connect_job(app: &Arc<App>, job: &Job, stage: &dyn Fn(ConnectStage)) -> Ended {
-    let id = match &job.place {
-        Place::Speaker(id) => id.as_str().to_string(),
-        Place::MusicAssistant => crate::sendspin_app::MA_OUTPUT_ID.to_string(),
-        Place::ThisPc => return Ended::Cancelled,
-    };
+/// The app's id for a place a connect goes to.
+fn connect_id(place: &Place) -> Option<String> {
+    match place {
+        Place::Speaker(id) => Some(id.as_str().to_string()),
+        Place::MusicAssistant => Some(crate::sendspin_app::MA_OUTPUT_ID.to_string()),
+        Place::ThisPc => None,
+    }
+}
+
+/// Run one connect on this thread: how it ended, for the engine and in
+/// words for a caller waiting on it.
+fn connect_job(app: &Arc<App>, job: &Job, stage: &dyn Fn(ConnectStage)) -> (Ended, Result<(), String>) {
+    let Some(id) = connect_id(&job.place) else { return (Ended::Cancelled, Ok(())) };
+    let superseded = || (Ended::Cancelled, Err("A newer choice replaced this one.".to_string()));
     if job.check_busy {
         if let Some(other_pc) = busy(app, &id) {
-            return Ended::Busy { other_pc };
+            let lang = crate::model::text::Lang::English;
+            let name = app.speaker_name(&id).unwrap_or_else(|| id.clone());
+            let words = match &other_pc {
+                Some(pc) => crate::model::text::t!(lang, BusyOtherPcTitle, speaker = name.as_str(), pc = pc.as_str()),
+                None => crate::model::text::t!(lang, BusyTitle, speaker = name.as_str()),
+            };
+            return (Ended::Busy { other_pc }, Err(words));
         }
     }
     if cancel::cancelled() {
-        return Ended::Cancelled;
+        return superseded();
     }
     stage(ConnectStage::Asking);
     match app.engine_connect(&id, job.origin == Origin::Window, job.origin != Origin::ByItself) {
-        Ok(()) => {
-            if cancel::cancelled() {
-                Ended::Cancelled
-            } else {
-                Ended::Bound
+        Ok(()) if cancel::cancelled() => superseded(),
+        Ok(()) => (Ended::Bound, Ok(())),
+        Err(msg) => {
+            let ended = ended_by(app, &id, job, &msg);
+            if ended == Ended::Cancelled {
+                return superseded();
             }
+            (ended, Err(msg))
         }
-        Err(msg) => ended_by(app, &id, job, &msg),
     }
 }
 

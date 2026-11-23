@@ -729,13 +729,23 @@ pub struct App {
     /// Where today's entry points (the window, the tray, the web API, the
     /// terminal prompt) send their commands once the engine runs.
     command_sink: OnceLock<CommandSink>,
+    engine_connects: Mutex<EngineConnects>,
+    engine_connect_ended: Condvar,
     /// The bound UPnP speaker's latest transport event, until the engine
     /// reads it.
     transport_change: Mutex<Option<crate::gena::TransportChange>>,
 }
 
-/// Takes a command for the engine (see [`App::set_command_sink`]).
-pub type CommandSink = Box<dyn Fn(crate::model::Surface, crate::model::Command) + Send + Sync>;
+/// Takes a command for the engine (see [`App::set_command_sink`]); the
+/// ticket brings its outcome.
+pub type CommandSink = Box<dyn Fn(crate::model::Surface, crate::model::Command) -> crate::model::Ticket + Send + Sync>;
+
+/// The engine's connects by speaker id: the number of the latest, and how
+/// it ended once it has (`Err` with the words to show).
+#[derive(Default)]
+pub(crate) struct EngineConnects {
+    by_id: std::collections::HashMap<String, (u64, Option<Result<(), String>>)>,
+}
 
 /// The place a speaker id names.
 pub(crate) fn place_of(id: &str) -> crate::model::Place {
@@ -1067,6 +1077,8 @@ impl App {
             scope_apply: Mutex::new(()),
             discovery_error: Mutex::new(None),
             command_sink: OnceLock::new(),
+            engine_connects: Mutex::new(EngineConnects::default()),
+            engine_connect_ended: Condvar::new(),
             transport_change: Mutex::new(None),
         });
         if web_initial {
@@ -2563,10 +2575,63 @@ impl App {
                 self.speaker_name(id).unwrap_or_else(|| id.to_string())
             ));
         }
-        if self.send_command(from, crate::model::Command::Play(place_of(id))) {
-            return Ok(());
+        if self.command_sink.get().is_some() {
+            return self.play_and_wait(from, id);
         }
         self.select_speaker_now(id)
+    }
+
+    /// Ask the engine to play on `id` and wait (on this thread, which does
+    /// no network I/O meanwhile) until the connect it starts has ended:
+    /// `Ok` once the speaker plays, else the words saying why not.
+    fn play_and_wait(self: &Arc<Self>, from: crate::model::Surface, id: &str) -> Result<(), String> {
+        let before = self.engine_connects.lock().unwrap().by_id.get(id).map(|(gen, _)| *gen);
+        let Some(sink) = self.command_sink.get() else { return Err("Stream To Speaker isn't running.".into()) };
+        let outcome = sink(from, crate::model::Command::Play(place_of(id))).wait(Duration::from_secs(10));
+        let Some(outcome) = outcome else {
+            return Err(format!("{} didn't answer. Try again in a moment.", PRODUCT_NAME));
+        };
+        if outcome.result.is_err() {
+            return Err(crate::model::delay::cli_reply(outcome.snapshot.lang, &outcome).text);
+        }
+        // The connect it started, or the one already under way to it.
+        let end = Instant::now() + CONNECT_BUDGET + Duration::from_secs(15);
+        let mut connects = self.engine_connects.lock().unwrap();
+        loop {
+            match connects.by_id.get(id).cloned() {
+                Some((gen, Some(result))) if Some(gen) != before => return result,
+                Some((_, None)) => {}
+                // Nothing new to wait for: it plays there already, or the
+                // engine had no reason to connect.
+                _ => {
+                    let here = self.session.lock().unwrap().as_ref().is_some_and(|s| s.stable_id() == id);
+                    return if here { Ok(()) } else { Err(outcome.snapshot.status.clone()) };
+                }
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(format!(
+                    "{} is still connecting to {}.",
+                    PRODUCT_NAME,
+                    self.speaker_name(id).unwrap_or_else(|| id.to_string())
+                ));
+            }
+            connects = self.engine_connect_ended.wait_timeout(connects, left).unwrap().0;
+        }
+    }
+
+    /// The engine started connect `gen` to `id`.
+    pub(crate) fn engine_connect_started(&self, id: &str, gen: u64) {
+        self.engine_connects.lock().unwrap().by_id.insert(id.to_string(), (gen, None));
+    }
+
+    /// The engine's connect `gen` to `id` ended.
+    pub(crate) fn engine_connect_ended(&self, id: &str, gen: u64, result: Result<(), String>) {
+        let mut connects = self.engine_connects.lock().unwrap();
+        if connects.by_id.get(id).is_some_and(|(g, _)| *g == gen) {
+            connects.by_id.insert(id.to_string(), (gen, Some(result)));
+            self.engine_connect_ended.notify_all();
+        }
     }
 
     /// Connect `id` now, on this thread, as a person's choice that can't
@@ -4859,7 +4924,7 @@ impl App {
     fn send_command(&self, from: crate::model::Surface, cmd: crate::model::Command) -> bool {
         match self.command_sink.get() {
             Some(sink) => {
-                sink(from, cmd);
+                let _ = sink(from, cmd);
                 true
             }
             None => false,

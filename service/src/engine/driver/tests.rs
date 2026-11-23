@@ -391,6 +391,7 @@ fn a_receiver_claiming_another_speakers_identity_plays_only_from_the_window() {
     let (sink_tx, sink_rx) = unbounded::<(Surface, Command)>();
     app.set_command_sink(Box::new(move |from, cmd| {
         let _ = sink_tx.send((from, cmd));
+        ticket().1
     }));
     assert_eq!(app.select_speaker(KITCHEN_2).unwrap_err(), words);
     assert_eq!(app.select_speaker_from(Surface::CommandLine, KITCHEN_2).unwrap_err(), words);
@@ -502,15 +503,17 @@ fn todays_entry_points_send_commands_with_their_own_surface() {
     let (sink_tx, sink_rx) = unbounded::<(Surface, Command)>();
     app.set_command_sink(Box::new(move |from, cmd| {
         let _ = sink_tx.send((from, cmd));
+        ticket().1
     }));
     let play = Command::Play(Place::Speaker(SpeakerId::new(&id)));
     app.select_speaker_async(&id);
     assert_eq!(sink_rx.try_recv().unwrap(), (Surface::Panel, play.clone()));
-    app.select_speaker(&id).unwrap();
+    // (Nothing answers here, so these return at once.)
+    let _ = app.select_speaker(&id);
     assert_eq!(sink_rx.try_recv().unwrap(), (Surface::Api, play.clone()));
-    app.select_speaker_from_remote(&id).unwrap();
+    let _ = app.select_speaker_from_remote(&id);
     assert_eq!(sink_rx.try_recv().unwrap(), (Surface::Api, play.clone()));
-    app.select_speaker_from(Surface::CommandLine, &id).unwrap();
+    let _ = app.select_speaker_from(Surface::CommandLine, &id);
     assert_eq!(sink_rx.try_recv().unwrap(), (Surface::CommandLine, play.clone()));
     app.set_streaming_enabled(false).unwrap();
     assert_eq!(sink_rx.try_recv().unwrap(), (Surface::Tray, Command::Play(Place::ThisPc)));
@@ -519,6 +522,34 @@ fn todays_entry_points_send_commands_with_their_own_surface() {
     assert!(sink_rx.try_recv().is_err());
     // Nothing was sent to the speaker by any of them.
     assert!(fake.requests().is_empty(), "{:?}", fake.soap_actions());
+}
+
+/// The web API's select answers once the speaker plays, or with the words
+/// saying why it doesn't, as it did before the engine; the connect itself
+/// runs on the engine's thread.
+#[test]
+fn the_web_apis_select_answers_when_the_connect_has_ended() {
+    let plays = plain_renderer();
+    let refuses = FakeRenderer::start(|req| match req.soap_action() {
+        Some("SetAVTransportURI") => Reply::soap_fault(714, "Illegal MIME-type"),
+        _ => answer(req),
+    });
+    let app = serving_app();
+    let good = add_speaker(&app, &plays);
+    let bad = add_speaker(&app, &refuses);
+    let windows = FakePlatform::new();
+    let engine = Engine::start(app.clone(), windows.platform(), false);
+
+    assert_eq!(app.select_speaker_from_remote(&good), Ok(()));
+    assert_eq!(app.session.lock().unwrap().as_ref().map(|s| s.stable_id()).as_deref(), Some(good.as_str()));
+    // Again: it plays there already.
+    assert_eq!(app.select_speaker_from_remote(&good), Ok(()));
+
+    let err = app.select_speaker_from_remote(&bad).unwrap_err();
+    assert!(err.contains("didn't take the stream"), "{err}");
+
+    engine.send(Surface::Panel, Command::Play(Place::ThisPc)).wait(WAIT).unwrap();
+    engine.stop();
 }
 
 // ---- quitting, sleep ---------------------------------------------------
