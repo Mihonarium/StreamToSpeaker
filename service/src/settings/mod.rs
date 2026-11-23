@@ -17,6 +17,8 @@ pub mod port;
 pub mod real;
 pub mod scripted;
 pub(crate) mod words;
+pub(crate) mod common;
+pub mod views;
 
 mod about;
 mod dialogs;
@@ -28,7 +30,7 @@ mod privacy;
 mod scenes;
 mod speaker;
 mod speakers;
-mod widgets;
+pub(crate) mod widgets;
 
 #[cfg(test)]
 mod tests;
@@ -39,7 +41,13 @@ use egui::{Key, Rect, Sense, Ui, Vec2, WidgetInfo, WidgetType};
 
 pub use dialogs::{AddDialog, CodeDialog, Dialog, PasswordDialog, ReportDialog, SendspinDialog, ToneDialog};
 pub use port::{Act, SettingsPort};
-pub use scenes::scenes;
+
+/// Every scene of the views and the window.
+pub fn scenes() -> Vec<crate::ui::preview::Scene> {
+    let mut all = views::scenes::scenes();
+    all.extend(scenes::scenes());
+    all
+}
 
 use crate::model::text::Lang;
 use crate::ui::delay::DelayState;

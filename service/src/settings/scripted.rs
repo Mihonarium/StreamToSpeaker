@@ -151,7 +151,13 @@ impl SettingsPort for ScriptedSettings {
         self.state.lock().unwrap().probe.clone()
     }
     fn tone(&self, id: &str) -> Option<ToneView> {
-        self.state.lock().unwrap().tones.iter().find(|(t, _)| t == id).map(|(_, v)| v.clone())
+        let s = self.state.lock().unwrap();
+        if let Some((_, v)) = s.tones.iter().find(|(t, _)| t == id) {
+            return Some(v.clone());
+        }
+        // Any other speaker: flat.
+        let name = s.pages.iter().find(|p| p.row.id == id)?.row.name.clone();
+        Some(ToneView { name, eq: EqSettings::default(), headroom_db: None, can_undo: false })
     }
     fn report(&self, parts: ReportParts) -> String {
         let mut lines = Vec::new();
@@ -231,6 +237,11 @@ fn apply(s: &mut State, act: &Act) {
             }
         }
         Act::Tone(id, t) => {
+            if !s.tones.iter().any(|(tid, _)| tid == id) {
+                if let Some(name) = s.pages.iter().find(|p| &p.row.id == id).map(|p| p.row.name.clone()) {
+                    s.tones.push((id.clone(), ToneView { name, eq: EqSettings::default(), headroom_db: None, can_undo: false }));
+                }
+            }
             if let Some((_, tv)) = s.tones.iter_mut().find(|(tid, _)| tid == id) {
                 match t {
                     ToneAct::Band(i, db) => tv.eq.bands_db[*i] = *db,
@@ -391,6 +402,7 @@ fn card(s: DelayStatusView) -> Option<DelayCard> {
 
 fn page(row: SpeakerRow, model: Option<&str>) -> SpeakerView {
     let id = row.id.clone();
+    let name = row.name.clone();
     SpeakerView {
         row,
         model: model.map(Into::into),
@@ -399,11 +411,11 @@ fn page(row: SpeakerRow, model: Option<&str>) -> SpeakerView {
         connects_with: None,
         group: None,
         volume_limit: Some(100),
-        tone: None,
+        tone: Some((0.0, 0.0)),
         comes_back: Some(ComesBack::WhenLastChosen),
         song_titles: None,
         pairing: None,
-        show_as: None,
+        show_as: Some(name),
         details: Details { id, ..Default::default() },
     }
 }
@@ -453,14 +465,12 @@ pub fn example() -> State {
     bedroom_p.group = Some(Group::HomePodPair { left: "Bedroom Left".into(), right: "Bedroom Right".into() });
     bedroom_p.pairing = Some(Pairing::Paired { on: Some(Date { day: 3, month: 10 }) });
     bedroom_p.show_as = Some("Bedroom".into());
-    bedroom_p.volume_limit = None;
     bedroom_p.details.connection = Some("AirPlay 2, realtime".into());
 
     let mut office_p = page(office.clone(), None);
     office_p.delay = card(status(2000, -300, (1000, 1000), Ok(Applies::Reconnect), Some(DelayChoice::Steady)));
     office_p.pairing = Some(Pairing::PasswordSaved);
     office_p.song_titles = Some(true);
-    office_p.volume_limit = None;
     office_p.details = Details {
         model: Some("AirPort Express".into()),
         address: Some("192.168.1.44".into()),

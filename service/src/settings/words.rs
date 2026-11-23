@@ -68,6 +68,23 @@ pub fn kind(lang: Lang, k: &SpeakerKind) -> String {
     }
 }
 
+/// The kind of a speaker as its row says it: *Sonos*, *AirPlay*.
+pub fn kind_short(lang: Lang, k: &SpeakerKind) -> String {
+    match k {
+        SpeakerKind::AirPlay => w!(lang, KindAirPlay),
+        other => kind(lang, other),
+    }
+}
+
+/// A delay in seconds, rounded as rows round it: 0.3, 2.
+pub fn seconds(ms: u32) -> crate::model::text::Number {
+    use crate::model::delay::{figure, Figure};
+    use crate::model::facts::SpeakerDelay;
+    match figure(SpeakerDelay { own_ms: ms, measured: false, change_ms: 0 }) {
+        Figure::About(n) | Figure::Under(n) | Figure::Measured(n) => n,
+    }
+}
+
 /// A date as Settings says it: *12 October*.
 pub fn date(lang: Lang, d: Date) -> String {
     let month = match d.month {

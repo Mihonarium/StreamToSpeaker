@@ -946,6 +946,7 @@ fn every_sentence_of_the_window_is_used_and_none_is_left_unfilled() {
     }
     // The window's title.
     let _ = super::title(crate::model::text::Lang::English);
+    drawn.extend(super::views::tests::say_everything());
     for t in &drawn {
         assert!(!t.contains('{') && !t.contains('}'), "an unfilled placeholder: {t:?}");
         assert!(!t.contains('\''), "a straight apostrophe: {t:?}");
