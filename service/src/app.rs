@@ -209,6 +209,14 @@ impl ActiveSession {
         }
     }
 
+    /// The speaker says it plays another source now (Sendspin reports it).
+    pub fn reports_busy(&self) -> bool {
+        match self {
+            ActiveSession::Sendspin(s) => s.reports_busy(),
+            _ => false,
+        }
+    }
+
     /// Short protocol label for diagnostics.
     pub fn transport_label(&self) -> &'static str {
         match self {
@@ -265,6 +273,15 @@ pub type SharedSession = Arc<Mutex<Option<ActiveSession>>>;
 /// Sets level (millibels) and mute on our endpoint, moving the Windows
 /// volume slider.
 pub type WindowsVolumePush = Box<dyn Fn(i32, bool) -> Result<()> + Send + Sync>;
+
+/// How the app moves Windows' slider for its own output: through Windows'
+/// endpoint volume when the engine runs on the real PC, else the driver's
+/// push.
+#[derive(Default)]
+pub struct WindowsSlider {
+    driver: OnceLock<WindowsVolumePush>,
+    endpoint: OnceLock<Box<dyn Fn(u32, bool) + Send + Sync>>,
+}
 
 /// What a volume or mute change needs to reach the bound speaker, cloned
 /// out of the session so the network round trip runs without the session
@@ -332,7 +349,7 @@ struct SpeakerControlShared {
 }
 
 impl SpeakerControl {
-    fn new(session: SharedSession, vsync: Arc<VolumeSync>, windows: Arc<OnceLock<WindowsVolumePush>>) -> Self {
+    fn new(session: SharedSession, vsync: Arc<VolumeSync>, windows: Arc<WindowsSlider>) -> Self {
         let shared = Arc::new(SpeakerControlShared {
             pending: Mutex::new(PendingCommands::default()),
             wake: Condvar::new(),
@@ -376,9 +393,14 @@ impl Drop for SpeakerControl {
     }
 }
 
-/// Set the Windows slider to `level`, if the driver is there to do it.
-fn push_windows_level(windows: &OnceLock<WindowsVolumePush>, level: u32, muted: bool) {
-    if let Some(push) = windows.get() {
+/// Set the Windows slider to `level`: through Windows' endpoint volume when
+/// the engine set that up, else through the driver if it is there.
+fn push_windows_level(windows: &WindowsSlider, level: u32, muted: bool) {
+    if let Some(set) = windows.endpoint.get() {
+        set(level.min(100), muted);
+        return;
+    }
+    if let Some(push) = windows.driver.get() {
         if let Err(e) = push(sonos_to_millibels(level), muted) {
             warn!("failed to push volume to Windows: {:#}", e);
         }
@@ -389,7 +411,7 @@ fn run_speaker_control(
     shared: &SpeakerControlShared,
     session: &SharedSession,
     vsync: &VolumeSync,
-    windows: &OnceLock<WindowsVolumePush>,
+    windows: &WindowsSlider,
 ) {
     // A level went to the speaker since the last settle.
     let mut settle_due = false;
@@ -574,7 +596,7 @@ pub struct App {
     speaker_control: SpeakerControl,
     /// Sets the Windows slider: (millibels, muted). Registered at startup
     /// when the driver is there.
-    windows_volume: Arc<OnceLock<WindowsVolumePush>>,
+    windows_volume: Arc<WindowsSlider>,
 
     // ---- Runtime atomics (audio hot path reads these every packet) ----
     /// What the driver last said about Windows' stream on our device:
@@ -731,6 +753,12 @@ pub struct App {
     command_sink: OnceLock<CommandSink>,
     engine_connects: Mutex<EngineConnects>,
     engine_connect_ended: Condvar,
+    /// The test sound being played: the next frame of it.
+    test_sound: Mutex<Option<usize>>,
+    /// Devices refused the stream lately, newest first.
+    refused: Mutex<Vec<RefusedDevice>>,
+    /// Devices let in by the person for this run.
+    allowed: Mutex<Vec<(IpAddr, crate::stream_gate::Grant)>>,
     /// The bound UPnP speaker's latest transport event, until the engine
     /// reads it.
     transport_change: Mutex<Option<crate::gena::TransportChange>>,
@@ -739,6 +767,22 @@ pub struct App {
 /// Takes a command for the engine (see [`App::set_command_sink`]); the
 /// ticket brings its outcome.
 pub type CommandSink = Box<dyn Fn(crate::model::Surface, crate::model::Command) -> crate::model::Ticket + Send + Sync>;
+
+/// A device that asked for the stream and was refused (privacy mode).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedDevice {
+    pub address: IpAddr,
+    /// Its name when discovery knows it, else its address.
+    pub name: String,
+    pub at: std::time::SystemTime,
+}
+
+/// The most refused devices remembered.
+const REFUSALS_KEPT: usize = 20;
+
+/// The test sound: two notes, 0.3 s each, at -12 dBFS, faded in and out.
+const TEST_SOUND_NOTES: [f32; 2] = [880.0, 1318.5];
+const TEST_SOUND_NOTE_FRAMES: usize = WIRE_SAMPLE_RATE as usize * 3 / 10;
 
 /// The engine's connects by speaker id: the number of the latest, and how
 /// it ended once it has (`Err` with the words to show).
@@ -1006,13 +1050,14 @@ impl App {
         // action, code that asks "what was the last speaker?" gets the
         // persisted answer.
         let last_speaker_id = Mutex::new(user_config.last_speaker_id.clone());
+        let ma_level = user_config.ma_level.unwrap_or(100).min(100);
         let eq = EqControl::new(WIRE_SAMPLE_RATE);
         if user_config.equalizer.enabled {
             eq.request(user_config.equalizer.clone());
         }
         let session: SharedSession = Arc::new(Mutex::new(None));
         let vsync = Arc::new(VolumeSync::new());
-        let windows_volume = Arc::new(OnceLock::new());
+        let windows_volume = Arc::new(WindowsSlider::default());
         let speaker_control = SpeakerControl::new(session.clone(), vsync.clone(), Arc::clone(&windows_volume));
         // One flag for "streaming enabled", read by the stream gate as it is.
         let streaming_enabled = Arc::new(AtomicBool::new(true));
@@ -1069,7 +1114,10 @@ impl App {
             user_picks: AtomicU64::new(0),
             player_wish: Mutex::new(None),
             pin_ceremony: Mutex::new(None),
-            sendspin: Default::default(),
+            sendspin: crate::sendspin_app::SendspinAppState {
+                ma_level: Arc::new(std::sync::atomic::AtomicU8::new(ma_level)),
+                ..Default::default()
+            },
             manual_resolved: Mutex::new(std::collections::HashMap::new()),
             discovery_scope: Mutex::new(Resolved::All),
             adapters_cache: Mutex::new(Vec::new()),
@@ -1079,6 +1127,9 @@ impl App {
             command_sink: OnceLock::new(),
             engine_connects: Mutex::new(EngineConnects::default()),
             engine_connect_ended: Condvar::new(),
+            test_sound: Mutex::new(None),
+            refused: Mutex::new(Vec::new()),
+            allowed: Mutex::new(Vec::new()),
             transport_change: Mutex::new(None),
         });
         if web_initial {
@@ -1682,6 +1733,9 @@ impl App {
     /// stream is what Disable is for.
     pub fn check_stream_client(&self, peer: IpAddr) -> Result<(), Refusal> {
         let verdict = self.stream_gate.check(peer);
+        if verdict == Err(Refusal::NotGranted) {
+            self.note_refused(peer);
+        }
         if verdict == Err(Refusal::NotGranted) && self.stream_gate.note_refusal(peer) {
             self.record_error(format!(
                 "Privacy mode refused a connection to the audio stream from {}. \
@@ -1897,6 +1951,9 @@ impl App {
     /// Display name for any speaker id: discovered UPnP, discovered
     /// AirPlay, or manual.
     pub(crate) fn speaker_name(&self, id: &str) -> Option<String> {
+        if let Some(name) = self.speaker_settings(id).show_as.filter(|n| !n.trim().is_empty()) {
+            return Some(name);
+        }
         if let Some(m) = self.find_manual_speaker(id) {
             return Some(m.display_name());
         }
@@ -3765,7 +3822,7 @@ impl App {
         if !self.speaker_volume_controllable() {
             return;
         }
-        let level = level.min(100);
+        let level = crate::model::rules::within_limit(level.min(100) as u8, self.bound_limit()) as u32;
         let unmute = self.vsync.is_muted();
         if unmute {
             self.vsync.note_muted(false);
@@ -3818,7 +3875,23 @@ impl App {
     /// Register how to set the Windows slider (the driver's volume push).
     /// The first registration wins.
     pub fn set_windows_volume_push(&self, push: impl Fn(i32, bool) -> Result<()> + Send + Sync + 'static) {
-        let _ = self.windows_volume.set(Box::new(push));
+        let _ = self.windows_volume.driver.set(Box::new(push));
+    }
+
+    /// The speaker reported its level or mute (a Sonos event): Windows'
+    /// slider follows, by whichever way the app moves it, unless this is
+    /// the echo of the app's own change.
+    pub fn speaker_reported_level(&self, volume: Option<u32>, mute: Option<bool>) {
+        if let Some((mb, muted)) = self.vsync.speaker_event(volume, mute) {
+            push_windows_level(&self.windows_volume, crate::volume_sync::millibels_to_sonos(mb), muted);
+        }
+    }
+
+    /// Move Windows' slider for the app's output through `set` (level
+    /// 0–100, muted) from now on, instead of the driver's push. The first
+    /// registration wins.
+    pub fn set_windows_level_through(&self, set: impl Fn(u32, bool) + Send + Sync + 'static) {
+        let _ = self.windows_volume.endpoint.set(Box::new(set));
     }
 
     /// Mute or unmute the bound speaker from the app, as
@@ -3837,6 +3910,15 @@ impl App {
     /// Queue a volume or mute change from Windows for the bound speaker.
     /// Returns at once; the send happens on the volume thread.
     pub fn send_to_speaker(&self, cmd: SpeakerCommand) {
+        // Above the speaker's limit: the limit goes to the speaker, and
+        // Windows' slider springs back to it.
+        if let (SpeakerCommand::Volume(level), Some(limit)) = (&cmd, self.bound_limit()) {
+            if *level > limit as u32 {
+                push_windows_level(&self.windows_volume, limit as u32, self.vsync.is_muted());
+                self.speaker_control.send(SpeakerCommand::Volume(limit as u32));
+                return;
+            }
+        }
         self.speaker_control.send(cmd);
     }
 
@@ -5001,6 +5083,139 @@ impl App {
                 None
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Test sound, refused devices, Lab, Music Assistant's level, limits
+    // -------------------------------------------------------------------
+
+    /// Play the test sound on whatever plays now: two short notes mixed
+    /// into the stream.
+    pub fn play_test_sound(&self) {
+        *self.test_sound.lock().unwrap() = Some(0);
+    }
+
+    /// Whether the test sound is still playing.
+    pub fn test_sound_playing(&self) -> bool {
+        self.test_sound.lock().unwrap().is_some()
+    }
+
+    /// Mix the test sound into `samples` (interleaved, `channels` per
+    /// frame), if one is playing.
+    pub(crate) fn mix_test_sound(&self, samples: &mut [i16], channels: u16) {
+        let mut guard = self.test_sound.lock().unwrap();
+        let Some(pos) = guard.as_mut() else { return };
+        let ch = channels.max(1) as usize;
+        let total = TEST_SOUND_NOTE_FRAMES * TEST_SOUND_NOTES.len();
+        for frame in samples.chunks_mut(ch) {
+            if *pos >= total {
+                break;
+            }
+            let note = *pos / TEST_SOUND_NOTE_FRAMES;
+            let at = *pos % TEST_SOUND_NOTE_FRAMES;
+            let fade = (TEST_SOUND_NOTE_FRAMES / 20) as f32;
+            let envelope = (at as f32 / fade).min((TEST_SOUND_NOTE_FRAMES - at) as f32 / fade).min(1.0);
+            let t = at as f32 / WIRE_SAMPLE_RATE as f32;
+            let v = (std::f32::consts::TAU * TEST_SOUND_NOTES[note] * t).sin() * envelope * 0.25 * i16::MAX as f32;
+            for s in frame.iter_mut() {
+                *s = (*s as i32 + v as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            }
+            *pos += 1;
+        }
+        if *pos >= total {
+            *guard = None;
+        }
+    }
+
+    fn note_refused(&self, peer: IpAddr) {
+        let peer = canonical_ip(peer);
+        let name = self.speaker_name_at(peer).unwrap_or_else(|| peer.to_string());
+        let mut list = self.refused.lock().unwrap();
+        list.retain(|r| r.address != peer);
+        list.insert(0, RefusedDevice { address: peer, name, at: std::time::SystemTime::now() });
+        list.truncate(REFUSALS_KEPT);
+    }
+
+    /// The devices refused the stream lately, newest first.
+    pub fn recently_refused(&self) -> Vec<RefusedDevice> {
+        self.refused.lock().unwrap().clone()
+    }
+
+    /// Let `address` fetch the stream for the rest of this run, whatever
+    /// privacy mode says.
+    pub fn allow_device(&self, address: IpAddr) {
+        let address = canonical_ip(address);
+        self.refused.lock().unwrap().retain(|r| r.address != address);
+        let mut allowed = self.allowed.lock().unwrap();
+        if !allowed.iter().any(|(a, _)| *a == address) {
+            info!("{} may fetch the stream for this run", address);
+            allowed.push((address, self.stream_gate.grant([address])));
+        }
+    }
+
+    /// Forget the refusals shown (the notice was dismissed).
+    pub fn dismiss_refusals(&self) {
+        self.refused.lock().unwrap().clear();
+    }
+
+    /// A speaker's name by its address, when discovery knows it.
+    fn speaker_name_at(&self, peer: IpAddr) -> Option<String> {
+        let upnp = self.discovery.as_ref().and_then(|d| {
+            d.renderers().into_iter().find(|r| r.stream_peers().iter().any(|ip| canonical_ip(*ip) == peer)).map(|r| r.display_name())
+        });
+        upnp.or_else(|| {
+            self.airplay_discovery
+                .as_ref()
+                .and_then(|d| d.renderers().into_iter().find(|r| canonical_ip(r.ip) == peer).map(|r| r.friendly_name))
+        })
+    }
+
+    /// Whether any Lab setting is away from its usual value.
+    pub fn lab_on(&self) -> bool {
+        let uc = self.user_config.lock().unwrap();
+        self.rate_fudge_ppm.load(Ordering::Relaxed) != 0
+            || self.silence_pace_ms.load(Ordering::Relaxed) != 10
+            || uc.prefer_realtime_airplay
+            || uc.airplay_mfi_encryption
+            || uc.airplay_uncompressed_alac
+    }
+
+    /// Every Lab setting back to its usual value.
+    pub fn turn_off_lab(&self) {
+        self.rate_fudge_ppm.store(0, Ordering::Relaxed);
+        self.silence_pace_ms.store(10, Ordering::Relaxed);
+        let mut uc = self.user_config.lock().unwrap();
+        uc.prefer_realtime_airplay = false;
+        uc.airplay_mfi_encryption = false;
+        uc.airplay_uncompressed_alac = false;
+        uc.save();
+    }
+
+    /// The level this PC sends to Music Assistant (0–100).
+    pub fn ma_level(&self) -> u8 {
+        self.sendspin.ma_level.load(Ordering::Relaxed)
+    }
+
+    /// Set the level this PC sends to Music Assistant; remembered.
+    pub fn set_ma_level(&self, level: u8) {
+        let level = level.min(100);
+        self.sendspin.ma_level.store(level, Ordering::Relaxed);
+        let mut uc = self.user_config.lock().unwrap();
+        if uc.ma_level != Some(level) {
+            uc.ma_level = Some(level);
+            uc.save();
+        }
+    }
+
+    /// A speaker's *Never louder than*, if set below 100.
+    pub fn volume_limit(&self, id: &str) -> Option<u8> {
+        self.speaker_settings(id).volume_limit.filter(|l| *l < 100)
+    }
+
+    /// The bound speaker's limit.
+    fn bound_limit(&self) -> Option<u8> {
+        let id = self.session.lock().unwrap().as_ref().map(|s| s.stable_id())?;
+        self.volume_limit(&id)
     }
 
     /// When this PC last sent real sound (not silence), since the app

@@ -30,6 +30,8 @@ pub(crate) fn speaker_list(app: &App) -> Vec<SpeakerFacts> {
     };
     let row = |id: String, name: String, kind: SpeakerKind, address: String, presence: Presence| {
         let s = settings.get(&id);
+        // *Show as*: the person's name for it, everywhere.
+        let name = s.and_then(|s| s.show_as.clone()).filter(|n| !n.trim().is_empty()).unwrap_or(name);
         let status = app.delay_status_of(&id);
         SpeakerFacts {
             delay: Some(SpeakerDelay { own_ms: status.own_delay_ms, measured: false, change_ms: status.change_ms }),
@@ -117,6 +119,46 @@ pub(crate) fn speaker_list(app: &App) -> Vec<SpeakerFacts> {
 }
 
 /// The model's facts for now.
+/// How long a refusal from a device in the current speaker's group stays
+/// on the notice line.
+const REFUSAL_SHOWS_FOR: Duration = Duration::from_secs(10 * 60);
+
+/// The notice line's facts.
+fn notices(app: &App) -> NoticeFacts {
+    let version = crate::display_version().to_string();
+    let updated_to = {
+        let uc = app.user_config.lock().unwrap();
+        uc.last_version_seen.as_ref().filter(|v| **v != version).map(|_| version.clone())
+    };
+    let adapter_off = match app.discovery_net_status().scope {
+        crate::discovery_net::Resolved::Paused { name } => Some(name),
+        _ => None,
+    };
+    // A device in the playing speaker's group (a Sonos group member) that
+    // asked for the sound and was refused.
+    let group: Vec<std::net::IpAddr> = match app.session.lock().unwrap().as_ref() {
+        Some(crate::app::ActiveSession::Upnp(r)) => r.renderer.stream_peers(),
+        _ => Vec::new(),
+    };
+    let refused_in_group = app
+        .recently_refused()
+        .into_iter()
+        .find(|r| {
+            group.contains(&r.address) && r.at.elapsed().map(|e| e < REFUSAL_SHOWS_FOR).unwrap_or(false)
+        })
+        .map(|r| RefusedDevice { name: r.name, key: r.address.to_string() });
+    NoticeFacts {
+        restart_pending: false,
+        adapter_off,
+        refused_in_group,
+        lab_on: app.lab_on(),
+        update_ready: app.update_banner().map(|r| r.version.to_string()),
+        updated_to,
+        donation_due: app.should_show_donation_prompt(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn facts(
     app: &App,
     platform: &Platform,
@@ -125,6 +167,7 @@ pub(crate) fn facts(
     now: Instant,
     started: Instant,
     mut speakers: Vec<SpeakerFacts>,
+    first_run: Option<FirstRun>,
 ) -> Facts {
     let lang = Lang::English;
     let state = core.state(w, now);
@@ -188,12 +231,14 @@ pub(crate) fn facts(
     });
 
     let place_level = match core.bound() {
-        Some(Place::Speaker(_)) | None => app.vsync.current_level().map(|l| Level {
+        Some(Place::Speaker(id)) => app.vsync.current_level().map(|l| Level {
             value: l.min(100) as u8,
             muted: app.vsync.is_muted(),
-            limit: None,
+            limit: app.volume_limit(id.as_str()),
         }),
-        _ => None,
+        None => app.vsync.current_level().map(|l| Level { value: l.min(100) as u8, muted: app.vsync.is_muted(), limit: None }),
+        Some(Place::MusicAssistant) => Some(Level::at(app.ma_level())),
+        Some(Place::ThisPc) => None,
     };
 
     let delay = state.speaker().and_then(|id| app.delay_status().filter(|d| d.id == id.as_str()).and_then(|d| delay_facts(id, &d)));
@@ -255,13 +300,9 @@ pub(crate) fn facts(
         remembered,
         seen: core.seen,
         sending_sound: w.sending,
-        notices: NoticeFacts {
-            update_ready: app.update_banner().map(|r| r.version.to_string()),
-            donation_due: app.should_show_donation_prompt(),
-            ..Default::default()
-        },
+        notices: notices(app),
         notification: core.notification.clone(),
-        first_run: None,
+        first_run,
     }
 }
 
