@@ -123,8 +123,7 @@ struct Cli {
     #[arg(long, default_value_t = false, hide = true)]
     startup: bool,
 
-    /// Start the new panel, tray and windows instead of the window, on a
-    /// scripted engine (no sound is sent): for trying them out.
+    /// Start the new panel, tray and windows instead of the window.
     #[arg(long, default_value_t = false, hide = true)]
     new_shell: bool,
 
@@ -446,10 +445,11 @@ fn main() {
         }
     }
 
+    // Every state of the panel without speakers: the scripted engine.
     #[cfg(windows)]
-    if cli.new_shell {
+    if let Some(scenario) = stream_to_speaker::shell::scripted_scenario() {
         let options = stream_to_speaker::shell::ShellOptions::from_env(!cli.no_tray);
-        if let Err(e) = stream_to_speaker::shell::run_scripted(options) {
+        if let Err(e) = stream_to_speaker::shell::run_scripted(options, scenario) {
             error!("fatal: {:#}", e);
         }
         return;
@@ -857,7 +857,7 @@ fn run(cli: Cli) -> Result<()> {
             stream_to_speaker::single_instance::announce_closing();
             quitting.quit();
         });
-        run_gui_mode(app, cli.no_tray, cli.startup && !cli.no_tray)
+        run_gui_mode(app, engine, &cli)
     };
     // Nothing plays on a speaker any more: the device's plain name.
     #[cfg(windows)]
@@ -888,9 +888,19 @@ fn run_headless(app: Arc<App>) -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[cfg(windows)]
-fn run_gui_mode(app: Arc<App>, no_tray: bool, start_hidden: bool) -> Result<()> {
+fn run_gui_mode(app: Arc<App>, engine: Arc<stream_to_speaker::engine::Engine>, cli: &Cli) -> Result<()> {
     // Run the GUI (blocks until window/tray exits).
-    if let Err(e) = stream_to_speaker::gui::run(app.clone(), !no_tray, start_hidden) {
+    let ran = if cli.new_shell {
+        let options = stream_to_speaker::shell::ShellOptions {
+            open_at_start: !cli.startup,
+            ..stream_to_speaker::shell::ShellOptions::from_env(!cli.no_tray)
+        };
+        stream_to_speaker::shell::run_app(app.clone(), engine, options)
+    } else {
+        let _ = engine;
+        stream_to_speaker::gui::run(app.clone(), !cli.no_tray, cli.startup && !cli.no_tray)
+    };
+    if let Err(e) = ran {
         warn!("GUI exited with error: {:#}", e);
         // Surface to the user — without this the process just
         // disappears from the screen (window never created) but
@@ -911,7 +921,7 @@ fn run_gui_mode(app: Arc<App>, no_tray: bool, start_hidden: bool) -> Result<()> 
 }
 
 #[cfg(not(windows))]
-fn run_gui_mode(_app: Arc<App>, _no_tray: bool, _start_hidden: bool) -> Result<()> {
+fn run_gui_mode(_app: Arc<App>, _engine: Arc<stream_to_speaker::engine::Engine>, _cli: &Cli) -> Result<()> {
     anyhow::bail!("GUI mode is Windows-only — pass --headless on this platform")
 }
 

@@ -32,6 +32,7 @@ grey, taskbar dark and black alike.
 | --- | --- |
 | `StreamToSpeaker.ico` | the exe resource (`service/build.rs`), `SetupIconFile`, and every shortcut — rendered from `brand/app-brand.svg` |
 | `window-*-128.rgba` | window and taskbar icon, swapped at runtime as state changes |
+| `window-brand-64.rgba` | the new windows' title bars and taskbar buttons (Settings, dialogs, the panel as a window) — rendered from `brand/app-brand.svg` |
 | `tray-*-32.rgba` | system-tray icon, swapped the same way |
 | `panel-tray/*-32.rgba` | the tray icon of the panel by the clock: where the sound is (`pc`, `connecting`, `speaker`), a badge (`none`, `attention` "!", `failure` "×"), and the taskbar (`light`, `dark`) — rendered from `brand/panel-tray-*.svg` |
 | `mark-*-64.rgba` | the mark in the app's own header, swapped the same way |

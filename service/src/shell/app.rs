@@ -12,12 +12,13 @@ use eframe::egui;
 use egui::{Frame, ViewportBuilder, ViewportCommand, ViewportId};
 use windows_sys::Win32::Foundation::HWND;
 
+use super::content::WantedGate;
 use super::panel_window::{PanelWindow, Seen, Step, Toggle, TrayClick};
 use super::tray::{Tray, TrayEvent};
 use super::win::{self, WindowsDesktop};
-use super::{centred, panel_builder, placeholder, root_builder, Desktop, MakeWindow, RootMode, ShellOptions, WindowContent, WindowKind, ROOT_TITLE};
+use super::{centred, panel_builder, root_builder, Ask, Desktop, Placeholders, RootMode, ShellOptions, WindowContent, WindowKind, Wiring, ROOT_TITLE};
 use crate::model::command::{Command, Open, Surface};
-use crate::model::port::{Port, Watch};
+use crate::model::port::Watch;
 use crate::model::scripted::{RealTime, Scenario, ScriptedEngine};
 use crate::model::snapshot::Snapshot;
 use crate::ui::theme::{self, Mode};
@@ -35,32 +36,66 @@ fn dialog_id() -> ViewportId {
 }
 
 /// How often the shell looks at what has no event of its own (a second
-/// launch, the light or dark setting) while nothing is open.
+/// launch, the light or dark setting, a dialog the app wants) while
+/// nothing is open.
 const IDLE: Duration = Duration::from_millis(250);
 /// How often the open panel redraws (the level meter).
 const METER: Duration = Duration::from_millis(33);
 
-/// Run the shell on a scripted engine, until the engine itself is wired in.
-/// `STREAM_TO_SPEAKER_SCENARIO` names the scenario it starts in (`playing`
-/// when unset or unknown).
-pub fn run_scripted(opts: ShellOptions) -> anyhow::Result<()> {
-    let scenario = std::env::var("STREAM_TO_SPEAKER_SCENARIO").ok().and_then(|n| Scenario::from_name(n.trim())).unwrap_or(Scenario::Playing);
-    let engine = Arc::new(ScriptedEngine::new(scenario));
-    let _clock = RealTime::start(engine.clone(), Duration::from_millis(50));
-    run(opts, engine, placeholder)
+/// The scenario `STREAM_TO_SPEAKER_SCENARIO` names, if it names one: the
+/// shell then runs on the scripted engine, for trying every state without
+/// speakers.
+pub fn scripted_scenario() -> Option<Scenario> {
+    std::env::var("STREAM_TO_SPEAKER_SCENARIO").ok().and_then(|n| Scenario::from_name(n.trim()))
 }
 
-/// Run the shell for `port` until Quit. `make_window` gives the contents of
-/// the Settings window and the dialogs.
-pub fn run(opts: ShellOptions, port: Arc<dyn Port>, make_window: MakeWindow) -> anyhow::Result<()> {
-    let native = eframe::NativeOptions { viewport: root_builder(opts.root), persist_window: false, ..Default::default() };
+/// Run the shell on the scripted engine in `scenario`, with placeholder
+/// windows for Settings and the dialogs.
+pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()> {
+    let engine = Arc::new(ScriptedEngine::new(scenario));
+    let _clock = RealTime::start(engine.clone(), Duration::from_millis(50));
+    run(opts, Wiring { port: engine, contents: Box::new(Placeholders), route_opens: None, quit: Box::new(|| {}), quitting: Box::new(|| false) })
+}
+
+/// Run the shell on the running app: the engine as its port, the Settings
+/// window and dialogs on the app's settings, Quit through the app's own
+/// quit (which gives the sound back).
+pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, opts: ShellOptions) -> anyhow::Result<()> {
+    let settings: Arc<dyn crate::settings::SettingsPort> = Arc::new(crate::settings::real::AppSettings::new(app.clone()));
+    let (quit, quitting) = (app.clone(), app);
+    let route = engine.clone();
+    run(
+        opts,
+        Wiring {
+            port: engine,
+            contents: Box::new(super::content::SettingsContents { port: settings, open_windows_page: win::open_windows_page }),
+            route_opens: Some(Box::new(move |opener| route.on_open(opener))),
+            quit: Box::new(move || quit.request_shutdown()),
+            quitting: Box::new(move || quitting.is_shutting_down()),
+        },
+    )
+}
+
+/// Run the shell until Quit.
+pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
+    let opts = opts.effective();
+    let native = eframe::NativeOptions { viewport: root_builder(opts.root).with_icon(app_icon()), persist_window: false, ..Default::default() };
     eframe::run_native(
         ROOT_TITLE,
         native,
         Box::new(move |cc| {
             crate::fonts::install(&cc.egui_ctx);
+            let Wiring { port, contents, route_opens, quit, quitting } = wiring;
             let ctx = cc.egui_ctx.clone();
             let watch = port.watch(Arc::new(move || ctx.request_repaint()));
+            let (open_tx, open_rx) = channel::<Open>();
+            if let Some(route) = route_opens {
+                let ctx = cc.egui_ctx.clone();
+                route(Box::new(move |o| {
+                    let _ = open_tx.send(o);
+                    ctx.request_repaint();
+                }));
+            }
             let root = {
                 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
                 cc.window_handle().ok().and_then(|h| match h.as_raw() {
@@ -72,8 +107,10 @@ pub fn run(opts: ShellOptions, port: Arc<dyn Port>, make_window: MakeWindow) -> 
             Ok(Box::new(Shell {
                 port,
                 _watch: watch,
+                contents,
+                quit,
+                quitting,
                 opts,
-                make_window,
                 desktop: WindowsDesktop::default(),
                 root,
                 frames: 0,
@@ -85,21 +122,31 @@ pub fn run(opts: ShellOptions, port: Arc<dyn Port>, make_window: MakeWindow) -> 
                 settings: None,
                 dialog: None,
                 waiting: VecDeque::new(),
+                wanted: WantedGate::default(),
                 tray: None,
                 tray_tx,
                 tray_rx,
+                opens: open_rx,
                 started: false,
+                closing: false,
             }))
         }),
     )
     .map_err(|e| anyhow!("the windows couldn't start: {e}"))
 }
 
+/// The app's mark, for the windows' title bars and taskbar buttons.
+pub fn app_icon() -> Arc<egui::IconData> {
+    Arc::new(egui::IconData { rgba: include_bytes!("../../../assets/window-brand-64.rgba").to_vec(), width: 64, height: 64 })
+}
+
 struct Shell {
-    port: Arc<dyn Port>,
+    port: Arc<dyn crate::model::port::Port>,
     _watch: Watch,
+    contents: Box<dyn super::Contents>,
+    quit: Box<dyn Fn()>,
+    quitting: Box<dyn Fn() -> bool>,
     opts: ShellOptions,
-    make_window: MakeWindow,
     desktop: WindowsDesktop,
     /// The root window's handle.
     root: Option<isize>,
@@ -114,10 +161,14 @@ struct Shell {
     dialog: Option<Box<dyn WindowContent>>,
     /// Dialogs asked for while one was open.
     waiting: VecDeque<Box<dyn WindowContent>>,
+    wanted: WantedGate,
     tray: Option<Tray>,
     tray_tx: Sender<TrayEvent>,
     tray_rx: Receiver<TrayEvent>,
+    /// Navigation commands from other surfaces, through the engine.
+    opens: Receiver<Open>,
     started: bool,
+    closing: bool,
 }
 
 impl Shell {
@@ -171,8 +222,10 @@ impl Shell {
                 match Tray::new(&snap.tray, self.dark_taskbar, self.tray_tx.clone(), move || ctx.request_repaint()) {
                     Ok(t) => self.tray = Some(t),
                     Err(e) => {
+                        // Nothing to open the panel from: it becomes a
+                        // window of its own.
                         log::warn!("no tray icon: {e:#}");
-                        self.opts.tray = false;
+                        self.opts = ShellOptions { tray: false, ..self.opts }.effective();
                     }
                 }
             }
@@ -197,40 +250,72 @@ impl Shell {
                 let _ = self.port.send(Surface::Panel, Command::PanelShown(false));
             }
         }
+        // Without a tray icon the panel is the app's window.
+        if !self.opts.tray {
+            self.quit_now();
+        }
     }
 
-    fn open_window(&mut self, ctx: &egui::Context, open: &Open) {
+    fn quit_now(&mut self) {
+        if !self.closing {
+            self.closing = true;
+            (self.quit)();
+        }
+    }
+
+    fn open_dialog(&mut self, content: Box<dyn WindowContent>) {
+        if self.dialog.is_some() {
+            self.waiting.push_back(content);
+        } else {
+            self.dialog = Some(content);
+        }
+    }
+
+    /// Open what `open` asks for: the panel, a page of Settings, a dialog,
+    /// or something outside the app. `from_window`: asked in the panel or
+    /// Settings.
+    fn open(&mut self, ctx: &egui::Context, open: &Open, snap: &Snapshot, from_window: bool) {
+        if matches!(open, Open::Panel) {
+            self.open_panel(ctx, None);
+            return;
+        }
         if let Some(s) = &mut self.settings {
             if s.navigate(open) {
                 ctx.send_viewport_cmd_to(settings_id(), ViewportCommand::Focus);
                 return;
             }
         }
-        let Some((kind, content)) = (self.make_window)(open) else { return };
-        match kind {
-            WindowKind::Settings => {
+        match self.contents.open(open, snap, from_window) {
+            Some((WindowKind::Settings, content)) => {
                 self.settings = Some(content);
                 ctx.send_viewport_cmd_to(settings_id(), ViewportCommand::Focus);
             }
-            WindowKind::Dialog if self.dialog.is_some() => self.waiting.push_back(content),
-            WindowKind::Dialog => self.dialog = Some(content),
+            Some((WindowKind::Dialog, content)) => self.open_dialog(content),
+            None => {}
         }
     }
 
-    /// Do what a command asks of the windows, then hand it to the engine.
-    fn route(&mut self, ctx: &egui::Context, from: Surface, command: Command) {
-        match &command {
-            Command::Open(Open::Panel) => self.open_panel(ctx, None),
-            Command::Open(open) => self.open_window(ctx, open),
-            Command::Quit => ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close),
-            _ => {}
+    /// Do what a command asks of the windows; send the rest to the engine.
+    fn route(&mut self, ctx: &egui::Context, from: Surface, command: Command, snap: &Snapshot) {
+        match command {
+            Command::Open(open) => self.open(ctx, &open, snap, matches!(from, Surface::Panel | Surface::Settings)),
+            Command::Quit => self.quit_now(),
+            command => {
+                let _ = self.port.send(from, command);
+            }
         }
-        let _ = self.port.send(from, command);
     }
 
-    fn content_builder(&self, content: &dyn WindowContent, snap: &Snapshot) -> ViewportBuilder {
+    fn content_builder(&self, content: &dyn WindowContent, snap: &Snapshot, kind: WindowKind) -> ViewportBuilder {
         let (size, min) = content.sizes();
-        let b = ViewportBuilder::default().with_title(content.title(snap)).with_inner_size(size).with_min_inner_size(min);
+        let b = ViewportBuilder::default()
+            .with_title(content.title(snap))
+            .with_inner_size(size)
+            .with_min_inner_size(min)
+            .with_icon(app_icon())
+            .with_resizable(kind == WindowKind::Settings)
+            .with_minimize_button(kind == WindowKind::Settings)
+            .with_maximize_button(kind == WindowKind::Settings);
         match centred(&self.desktop.monitors(), size) {
             Some(p) => b.with_position(p),
             None => b,
@@ -243,7 +328,8 @@ impl Shell {
         let mode = self.opts.panel;
         let pinned = snap.first_run.is_some();
         let (port, desktop) = (&self.port, &mut self.desktop);
-        let (commands, step) = ctx.show_viewport_immediate(panel_id(), panel_builder(mode), |ctx, _class| {
+        let builder = panel_builder(mode).with_icon(app_icon());
+        let (commands, step) = ctx.show_viewport_immediate(panel_id(), builder, |ctx, _class| {
             let t = theme::Theme::of(ctx);
             let (focused, inner_height, close) = ctx.input(|i| {
                 let v = i.viewport();
@@ -280,30 +366,35 @@ impl Shell {
         commands
     }
 
-    /// Draw the Settings window or the dialog in `slot`; what it sends.
-    fn content_frame(&mut self, ctx: &egui::Context, snap: &Snapshot, kind: WindowKind) -> Vec<Command> {
+    /// Draw the Settings window or the dialog; what it asks.
+    fn content_frame(&mut self, ctx: &egui::Context, snap: &Snapshot, kind: WindowKind) -> Vec<Ask> {
         let (id, slot) = match kind {
             WindowKind::Settings => (settings_id(), self.settings.take()),
             WindowKind::Dialog => (dialog_id(), self.dialog.take()),
         };
         let Some(mut content) = slot else { return Vec::new() };
-        let builder = self.content_builder(content.as_ref(), snap);
-        let mut commands = Vec::new();
+        let builder = self.content_builder(content.as_ref(), snap, kind);
+        let mut asks = Vec::new();
         let keep = ctx.show_viewport_immediate(id, builder, |ctx, _class| {
             let closing = ctx.input(|i| i.viewport().close_requested());
             if closing {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                content.closed();
             }
-            let done = content.show(ctx, snap, &mut |c| commands.push(c));
+            let done = content.show(ctx, snap, &mut |a| asks.push(a));
             !(closing || done)
         });
         match kind {
             WindowKind::Settings if keep => self.settings = Some(content),
             WindowKind::Dialog if keep => self.dialog = Some(content),
-            WindowKind::Dialog => self.dialog = self.waiting.pop_front(),
+            WindowKind::Dialog => {
+                let still = self.contents.wanted().map(|(k, _)| k);
+                self.wanted.closed(still.as_deref());
+                self.dialog = self.waiting.pop_front();
+            }
             WindowKind::Settings => {}
         }
-        commands
+        asks
     }
 }
 
@@ -316,6 +407,11 @@ impl eframe::App for Shell {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frames += 1;
+        if self.closing || (self.quitting)() {
+            self.closing = true;
+            ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
+            return;
+        }
         let now = ctx.input(|i| i.time);
         self.keep_root_away();
         self.follow_settings(ctx, now);
@@ -339,17 +435,38 @@ impl eframe::App for Shell {
                 }
             }
         }
-        // A second launch, or the first start in first run: the panel.
-        if crate::single_instance::take_activation() || (!self.started && snap.first_run.is_some()) {
+        // From other surfaces, through the engine.
+        while let Ok(open) = self.opens.try_recv() {
+            self.open(ctx, &open, &snap, false);
+        }
+        // A second launch; at start, first run or a start from the Start
+        // menu: the panel.
+        let at_start = !self.started && (snap.first_run.is_some() || self.opts.open_at_start);
+        if crate::single_instance::take_activation() || at_start {
             self.open_panel(ctx, None);
         }
         self.started = true;
+        // The dialog the app needs now (a TV's code), by itself.
+        if let Some((key, content)) = self.contents.wanted() {
+            if self.wanted.admit(Some(&key), self.dialog.is_some()) {
+                self.dialog = Some(content);
+            }
+        } else {
+            self.wanted.admit(None, self.dialog.is_some());
+        }
 
         sent.extend(self.panel_frame(ctx, &snap, now).into_iter().map(|c| (Surface::Panel, c)));
-        sent.extend(self.content_frame(ctx, &snap, WindowKind::Settings).into_iter().map(|c| (Surface::Settings, c)));
-        sent.extend(self.content_frame(ctx, &snap, WindowKind::Dialog).into_iter().map(|c| (Surface::Settings, c)));
+        let mut asks = self.content_frame(ctx, &snap, WindowKind::Settings);
+        asks.extend(self.content_frame(ctx, &snap, WindowKind::Dialog));
+        for a in asks {
+            match a {
+                Ask::Command(c) => sent.push((Surface::Settings, c)),
+                Ask::Dialog(d) => self.open_dialog(d),
+                Ask::OpenPanel => self.open_panel(ctx, None),
+            }
+        }
         for (from, c) in sent {
-            self.route(ctx, from, c);
+            self.route(ctx, from, c, &snap);
         }
         ctx.request_repaint_after(IDLE);
     }

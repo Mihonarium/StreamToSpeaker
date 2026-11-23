@@ -69,7 +69,7 @@ impl Desktop for WindowsDesktop {
     }
 
     fn place_panel(&mut self, rect: PxRect, mode: PanelMode) -> bool {
-        let Some(hwnd) = own_window(PANEL_TITLE) else { return false };
+        let Some(hwnd) = hidden_own_window(PANEL_TITLE) else { return false };
         if self.styled != Some(hwnd as isize) {
             self.styled = Some(hwnd as isize);
             if mode == PanelMode::Flyout {
@@ -97,21 +97,62 @@ fn read_dword(key: &str, value: &str) -> Option<u32> {
     (rc == 0).then_some(data)
 }
 
-/// The app's top-level window called `title`, if this thread made one.
-pub fn own_window(title: &str) -> Option<HWND> {
+/// The app's hidden top-level window called `title`, if this thread made
+/// one: the panel before it is shown (a dialog may have the same title,
+/// but it is never hidden).
+pub fn hidden_own_window(title: &str) -> Option<HWND> {
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: a NUL-terminated title that outlives the call; no class name.
-    let hwnd = unsafe { FindWindowW(std::ptr::null(), wide.as_ptr()) };
-    if hwnd.is_null() {
-        return None;
-    }
-    // SAFETY: a handle FindWindowW just returned (a stale one only makes the
-    // call return 0); the process id is not asked for.
-    let thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
     // SAFETY: no arguments.
-    (thread == unsafe { GetCurrentThreadId() }).then_some(hwnd)
+    let me = unsafe { GetCurrentThreadId() };
+    let mut after: HWND = std::ptr::null_mut();
+    for _ in 0..64 {
+        // SAFETY: a NUL-terminated title that outlives the call; no parent
+        // (top-level windows), no class; `after` is null or a handle the
+        // previous call returned.
+        let hwnd = unsafe { FindWindowExW(std::ptr::null_mut(), after, std::ptr::null(), wide.as_ptr()) };
+        if hwnd.is_null() {
+            return None;
+        }
+        // SAFETY: a handle FindWindowExW just returned (a stale one only
+        // makes the call return 0); the process id is not asked for.
+        let thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
+        if thread == me && !is_visible(hwnd) {
+            return Some(hwnd);
+        }
+        after = hwnd;
+    }
+    None
+}
+
+/// Open a page of Windows' settings, on a thread of its own (Windows may
+/// take a moment to start the Settings app).
+pub fn open_windows_page(page: super::content::WindowsPage) {
+    let uri = page.uri();
+    let spawned = std::thread::Builder::new().name("stream-to-speaker-open".into()).spawn(move || {
+        use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (verb, file) = (wide("open"), wide(uri));
+        // SAFETY: plain COM initialisation for this new thread, which
+        // ShellExecute's handlers may need.
+        let hr = unsafe { CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32) };
+        // SAFETY: both strings are NUL-terminated and outlive the call; the
+        // address is one of three fixed ms-settings: pages.
+        let rc = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+        if hr >= 0 {
+            // SAFETY: balances the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+        if rc as usize <= 32 {
+            log::warn!("couldn't open Windows' {page:?} settings");
+        }
+    });
+    if spawned.is_err() {
+        log::warn!("couldn't open Windows' {page:?} settings: no thread");
+    }
 }
 
 /// Where a window is, frame included, in physical pixels.

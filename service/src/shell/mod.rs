@@ -9,6 +9,7 @@
 //! switches, [`RootMode`] and [`PanelMode`], so that a fallback is a
 //! setting, not a rewrite.
 
+pub mod content;
 pub mod icons;
 pub mod panel_window;
 pub mod placement;
@@ -21,7 +22,7 @@ mod tray;
 mod win;
 
 #[cfg(windows)]
-pub use app::{run, run_scripted};
+pub use app::{app_icon, run, run_app, run_scripted, scripted_scenario};
 
 use egui::{Pos2, Vec2, ViewportBuilder, WindowLevel};
 
@@ -65,8 +66,12 @@ impl PanelMode {
 pub struct ShellOptions {
     pub root: RootMode,
     pub panel: PanelMode,
-    /// Show the tray icon (off with `--no-tray`).
+    /// Show the tray icon (off with `--no-tray`). Without it the panel is
+    /// a window of its own, open from the start, and closing it quits.
     pub tray: bool,
+    /// Open the panel at start (started from the Start menu, not at
+    /// sign-in). First run opens it either way.
+    pub open_at_start: bool,
 }
 
 impl ShellOptions {
@@ -85,11 +90,22 @@ impl ShellOptions {
                 _ => PanelMode::Flyout,
             },
             tray,
+            open_at_start: false,
         }
     }
 
     pub fn from_env(tray: bool) -> Self {
         Self::from(|k| std::env::var(k).ok(), tray)
+    }
+
+    /// What the shell does with these options: without a tray icon the
+    /// panel is a window and opens at start.
+    pub fn effective(self) -> Self {
+        if self.tray {
+            self
+        } else {
+            ShellOptions { panel: PanelMode::Window, open_at_start: true, ..self }
+        }
     }
 }
 
@@ -116,8 +132,8 @@ pub fn root_builder(mode: RootMode) -> ViewportBuilder {
 }
 
 /// The panel's window title: what Windows and screen readers call it. The
-/// shell finds the panel's window by it, so no other window of the app
-/// may have it.
+/// shell finds the panel's window by it while the panel is hidden
+/// (dialogs have the same title but are never hidden).
 pub const PANEL_TITLE: &str = crate::PRODUCT_NAME;
 
 /// The panel's window for `mode`: hidden until the shell has measured it
@@ -145,31 +161,79 @@ pub enum WindowKind {
     Dialog,
 }
 
+/// What a window's content asks of the shell while it is drawn.
+pub enum Ask {
+    /// Send this to the engine (from the Settings window).
+    Command(Command),
+    /// Open this dialog (it waits while another is open).
+    Dialog(Box<dyn WindowContent>),
+    /// Open the panel by the clock.
+    OpenPanel,
+}
+
 /// What a Settings page or a dialog draws, in a window the shell made,
 /// placed and themed.
 pub trait WindowContent {
-    /// The window's title. Never the bare product name, which is the
-    /// panel's.
+    /// The window's title.
     fn title(&self, snap: &Snapshot) -> String;
     /// The inner size it opens at, and its smallest, in points.
     fn sizes(&self) -> (Vec2, Vec2);
-    /// Draw into the window's `ctx`; commands go out through `send`. True
-    /// closes the window (a dialog's *Cancel*).
-    fn show(&mut self, ctx: &egui::Context, snap: &Snapshot, send: &mut dyn FnMut(Command)) -> bool;
+    /// Draw into the window's `ctx`; what it asks of the shell goes out
+    /// through `ask`. True closes the window (a dialog's *Cancel*, or a
+    /// dialog the app no longer needs).
+    fn show(&mut self, ctx: &egui::Context, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) -> bool;
     /// Show `open` in this window instead (another page of Settings).
     /// False when it isn't one of this window's.
     fn navigate(&mut self, open: &Open) -> bool {
         let _ = open;
         false
     }
+    /// The window's × was clicked: undo what an open dialog started.
+    fn closed(&mut self) {}
 }
 
-/// Makes the content a request to open something asks for, or `None` when
-/// it isn't one of the app's windows (Windows' own settings, a web page).
-pub type MakeWindow = fn(&Open) -> Option<(WindowKind, Box<dyn WindowContent>)>;
+/// What the app's windows hold, and what opening something does.
+pub trait Contents {
+    /// Do what `open` asks: give the content of the window it opens (a
+    /// page of Settings, a dialog), or do it elsewhere (Windows' own
+    /// settings, a web page, starting a pairing) and give `None`.
+    /// `from_window` says the request came from the app's own windows (the
+    /// panel, Settings); only those may start a connection.
+    fn open(&self, open: &Open, snap: &Snapshot, from_window: bool) -> Option<(WindowKind, Box<dyn WindowContent>)>;
+    /// The dialog the app needs open by itself now (a TV's code, Music
+    /// Assistant's code), with a key that stays the same while the request
+    /// does: a dialog closed by hand isn't opened again for the same key.
+    fn wanted(&self) -> Option<(String, Box<dyn WindowContent>)> {
+        None
+    }
+}
 
-/// Until Settings and the dialogs are drawn: their windows, saying which
-/// page or dialog was asked for.
+/// The shell's ties to the rest of the app.
+pub struct Wiring {
+    /// The engine (or the scripted one).
+    pub port: std::sync::Arc<dyn crate::model::port::Port>,
+    pub contents: Box<dyn Contents>,
+    /// Hands the engine the shell's door for navigation commands that come
+    /// from elsewhere (a notification, the phone page). `None`: only the
+    /// shell's own surfaces open things.
+    pub route_opens: Option<Box<dyn FnOnce(Box<dyn Fn(Open) + Send + Sync>)>>,
+    /// Quit for good: give the sound back and end the app.
+    pub quit: Box<dyn Fn()>,
+    /// The app is quitting another way (Ctrl+C, an update): close.
+    pub quitting: Box<dyn Fn() -> bool>,
+}
+
+/// Until Settings and the dialogs are drawn (the scripted engine): their
+/// windows, saying which page or dialog was asked for.
+pub struct Placeholders;
+
+impl Contents for Placeholders {
+    fn open(&self, open: &Open, _snap: &Snapshot, _from_window: bool) -> Option<(WindowKind, Box<dyn WindowContent>)> {
+        placeholder(open)
+    }
+}
+
+/// A placeholder window for `open`, if it is one of the app's.
 pub fn placeholder(open: &Open) -> Option<(WindowKind, Box<dyn WindowContent>)> {
     let kind = placeholder_kind(open)?;
     Some((kind, Box::new(Placeholder { kind, open: open.clone() })))
@@ -203,7 +267,7 @@ impl WindowContent for Placeholder {
         }
     }
 
-    fn show(&mut self, ctx: &egui::Context, _snap: &Snapshot, _send: &mut dyn FnMut(Command)) -> bool {
+    fn show(&mut self, ctx: &egui::Context, _snap: &Snapshot, _ask: &mut dyn FnMut(Ask)) -> bool {
         let mut close = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label(format!("{:?}", self.open));
@@ -344,6 +408,8 @@ mod tests {
         // Another page shows in the open Settings window; a dialog's
         // request doesn't.
         let (_, mut settings) = placeholder(&Open::Settings).unwrap();
+        let snap0 = crate::model::port::Port::snapshot(&crate::model::scripted::ScriptedEngine::new(crate::model::scripted::Scenario::Playing));
+        assert!(Placeholders.open(&Open::SoundSettings, &snap0, true).is_none());
         assert!(settings.navigate(&Open::SpeakerMissing));
         assert!(!settings.navigate(&Open::AddByAddress));
         // No window but the panel has the panel's title.
