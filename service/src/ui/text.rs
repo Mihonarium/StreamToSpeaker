@@ -152,11 +152,14 @@ impl<'a> Para<'a> {
             }
         }
         job.append(self.text, 0.0, plain.clone());
-        for link in &self.links {
-            // A non-breaking space keeps a link's first word with the
-            // sentence it continues only when it fits; the link itself
-            // never breaks inside.
-            job.append(" ", 0.0, plain.clone());
+        // After a full sentence a link follows with a space; after a few
+        // words (*50 ms removed*), and between links, with a middle dot.
+        let words_before = if self.text.is_empty() { self.lead.unwrap_or("") } else { self.text };
+        let ends_sentence = words_before.is_empty() || words_before.trim_end().ends_with(['.', '?', '!', ':']);
+        for (i, link) in self.links.iter().enumerate() {
+            let sep = if i == 0 && ends_sentence { " " } else { " · " };
+            job.append(sep, 0.0, plain.clone());
+            // The link never breaks inside: it moves to the next line whole.
             sections_of_links.push(job.sections.len());
             job.append(&link.replace(' ', "\u{a0}"), 0.0, TextFormat { font_id: font.clone(), color: t.c.accent, ..Default::default() });
         }

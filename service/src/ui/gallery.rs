@@ -6,14 +6,14 @@
 use egui::{Rect, Response, Sense, Ui, Vec2};
 
 use super::button::{Button, IconButton};
-use super::card::{card, divider, list_heading, section_heading, SettingRow, SETTINGS_CARD_PAD};
-use super::delay::{DelayControl, DelayFigure, DelayNote, DelayState, DelayView, Limits};
+use super::card::{card, divider, section_heading, SettingRow, SETTINGS_CARD_PAD};
+use super::delay::{DelayControl, DelayFigure, DelayLine, DelayNote, DelayState, DelayView, Limits, Reconnect};
 use super::icon::Icon;
 use super::inputs::{Check, Choice, DropDown, Switch, TextField};
 use super::menu::{menu_frame, menu_header, menu_separator, MenuItem};
 use super::notice::{info_bar, notice_line, BarKind, InfoBar, Notice};
 use super::preview::{Scene, Stage};
-use super::row::{PlaceRow, Trailing};
+use super::row::{PlaceRow, Problem, RowStyle, Status};
 use super::text::{Mark, Tone};
 use super::theme::{size, space, Theme};
 use super::volume::{volume_row, VolumeView};
@@ -24,7 +24,9 @@ pub fn scenes() -> Vec<Scene> {
         Scene { name: "parts-delay-states", size: [1180.0, 1660.0], draw: delay_states },
         Scene { name: "parts-delay-amount", size: [1560.0, 350.0], draw: delay_amount },
         Scene { name: "parts-delay-interaction", size: [1180.0, 620.0], draw: delay_interaction },
-        Scene { name: "parts-rows", size: [820.0, 1000.0], draw: rows },
+        Scene { name: "parts-rows", size: [1180.0, 580.0], draw: rows },
+        Scene { name: "parts-delay-line", size: [1200.0, 1200.0], draw: delay_line },
+        Scene { name: "parts-panel-simpler", size: [1560.0, 640.0], draw: panel_simpler },
         Scene { name: "parts-notices", size: [1060.0, 640.0], draw: notices },
         Scene { name: "parts-inputs", size: [1060.0, 620.0], draw: inputs },
         Scene { name: "parts-cards", size: [700.0, 840.0], draw: cards },
@@ -130,7 +132,7 @@ fn now_card(ui: &mut Ui, title: &str, line2: &str, level: u8, body: impl FnOnce(
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new(line2).font(t.font(size::SECONDARY)).color(t.c.text_secondary));
                 ui.add_space(10.0);
-                let _ = volume_row(ui, &VolumeView { level, muted: false, limit: None, label: None, name: "Volume" });
+                let _ = volume_row(ui, &VolumeView { level, muted: false, limit: None, label: None, name: "Volume", name_as_tooltip: false });
                 ui.add_space(10.0);
                 let (d, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
                 ui.painter().rect_filled(d, 0.0, t.c.divider);
@@ -151,6 +153,7 @@ fn view(speaker: &'static str, ms: u32, change_ms: i32, note: Option<DelayNote>)
         note,
         fixed_with_short_ms: None,
         other_amount_link: false,
+        reconnecting: None,
     }
 }
 
@@ -290,7 +293,7 @@ fn delay_interaction(ui: &mut Ui, st: &mut Stage) {
 }
 
 /// The panel's width.
-const PANEL_W: f32 = 380.0;
+const PANEL_W: f32 = 360.0;
 
 /// A column the panel's width and colour, with rows inset as the panel's
 /// list insets them.
@@ -314,69 +317,272 @@ fn panel_column(ui: &mut Ui, caption: &str, add: impl FnOnce(&mut Ui)) {
 }
 
 fn rows(ui: &mut Ui, st: &mut Stage) {
-    let t = Theme::of(ui.ctx());
     ui.add_space(16.0);
     ui.horizontal_top(|ui| {
         ui.add_space(16.0);
         ui.spacing_mut().item_spacing.x = 24.0;
-        panel_column(ui, "Play on: the everyday list", |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                list_heading(ui, "Play on");
-            });
-            ui.add_space(4.0);
-            let rows = [
-                PlaceRow { trailing: Trailing::Expand { open: false }, ..PlaceRow::new(Icon::Laptop, "This PC", "Speakers (Realtek Audio)") },
+        panel_column(ui, "One line: the everyday list", |ui| {
+            ui.add_space(6.0);
+            let list = [
+                PlaceRow::new(Icon::Laptop, "This PC", "Speakers (Realtek Audio)"),
                 PlaceRow { current: true, menu: true, ..PlaceRow::new(Icon::Speaker, "Kitchen", "Sonos · about 0.15 s delay") },
                 PlaceRow { menu: true, ..PlaceRow::new(Icon::Group, "Living Room + Dining Room", "Sonos group · about 0.2 s delay") },
                 PlaceRow { menu: true, ..PlaceRow::new(Icon::Pair, "Bedroom", "HomePod pair · about 0.2 s delay") },
                 PlaceRow { menu: true, ..PlaceRow::new(Icon::Speaker, "Office", "AirPlay · about 2 s delay") },
-                PlaceRow { dimmed: true, menu: true, ..PlaceRow::new(Icon::Speaker, "Garage", "Not found right now") },
+                PlaceRow { dimmed: true, menu: true, status: Status::Words("Not found"), ..PlaceRow::new(Icon::Speaker, "Garage", "AirPlay · not found right now") },
+                PlaceRow::new(Icon::Hub, "Music Assistant", "Chooses the speaker in Music Assistant"),
             ];
-            for r in &rows {
+            for r in &list {
                 let _ = r.show(ui);
             }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new("Through Music Assistant").font(t.font(size::CAPTION)).color(t.c.text_secondary));
-            });
-            ui.add_space(2.0);
-            let _ = PlaceRow::new(Icon::Hub, "Music Assistant", "Chooses the speaker in Music Assistant").show(ui);
             ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                list_heading(ui, "This PC's outputs");
-            });
-            ui.add_space(4.0);
-            let _ = PlaceRow { current: true, trailing: Trailing::Expand { open: true }, ..PlaceRow::new(Icon::Laptop, "This PC", "Speakers (Realtek Audio)") }.show(ui);
-            let _ = PlaceRow { indent: true, trailing: Trailing::Check, ..PlaceRow::new(Icon::Laptop, "Speakers", "Realtek Audio") }.show(ui);
-            let _ = PlaceRow { indent: true, ..PlaceRow::new(Icon::Headphones, "Headphones", "WH-1000XM4") }.show(ui);
-            let _ = PlaceRow { indent: true, ..PlaceRow::new(Icon::Monitor, "Monitor", "HDMI · NVIDIA High Definition Audio") }.show(ui);
-        });
-        panel_column(ui, "Rows in the states that matter", |ui| {
-            ui.add_space(4.0);
             let a = ui.cursor().min;
-            let _ = PlaceRow { tone: Tone::Amber, menu: true, ..PlaceRow::new(Icon::Speaker, "Kitchen", "Isn't responding — trying again (2 of 3)") }.show(ui);
-            st.hover_named(Rect::from_min_max(a, ui.cursor().min + Vec2::new(PANEL_W, 0.0)), "Kitchen.");
-            let _ = PlaceRow { tone: Tone::Red, trailing: Trailing::Button("Try again"), ..PlaceRow::new(Icon::Tv, "Den TV", "Couldn't connect — no answer.") }.show(ui);
-            let _ = PlaceRow { trailing: Trailing::Busy, ..PlaceRow::new(Icon::Pair, "Bedroom", "Asking Bedroom to play…") }.show(ui);
-            let _ = PlaceRow { dimmed: true, ..PlaceRow::new(Icon::Pair, "Bedroom", "Waiting for the second HomePod") }.show(ui);
-            let _ = PlaceRow { tone: Tone::Amber, ..PlaceRow::new(Icon::Speaker, "Kitchen (192.168.1.20)", "Sonos · two devices answer as Kitchen") }.show(ui);
-            let _ = PlaceRow { dimmed: true, ..PlaceRow::new(Icon::Speaker, "Bathroom", "Can't play to this speaker") }.show(ui);
-            let _ = PlaceRow::new(Icon::Speaker, "Office", "AirPlay · 1.74 s delay, measured").show(ui);
-            let _ = PlaceRow { trailing: Trailing::Expand { open: false }, ..PlaceRow::new(Icon::List, "More speakers on this network (12)", "Never used from this PC") }.show(ui);
+            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Group, "Upstairs", "Pointed at: ⋯ shows") }.show(ui);
+            st.hover_named(Rect::from_min_max(a, ui.cursor().min + Vec2::new(PANEL_W, 0.0)), "Upstairs.");
             let b = ui.cursor().min;
-            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Group, "Upstairs", "Pressed") }.show(ui);
-            st.press_named(Rect::from_min_max(b, ui.cursor().min + Vec2::new(PANEL_W, 0.0)), "Upstairs.");
+            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Speaker, "Study", "Pressed") }.show(ui);
+            st.press_named(Rect::from_min_max(b, ui.cursor().min + Vec2::new(PANEL_W, 0.0)), "Study.");
             let c = ui.cursor().min;
-            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Speaker, "Study", "Keyboard focus: ⋯ shows too") }.show(ui);
-            st.focus_named(Rect::from_min_max(c, ui.cursor().min + Vec2::new(PANEL_W, 0.0)), "Study.");
-            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Group, "Living Room + Dining Room + Kitchen + Garden Terrace", "Sonos group · about 0.2 s delay") }.show(ui);
+            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Speaker, "Hall", "Keyboard focus") }.show(ui);
+            st.focus_named(Rect::from_min_max(c, ui.cursor().min + Vec2::new(PANEL_W, 0.0)), "Hall.");
+            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Group, "Living Room + Dining Room + Kitchen + Garden Terrace", "Sonos group") }.show(ui);
             let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Speaker, "客厅的音箱", "Sonos · about 0.2 s delay") }.show(ui);
         });
+        panel_column(ui, "Statuses, and the second line for a problem", |ui| {
+            ui.add_space(6.0);
+            let list = [
+                PlaceRow { status: Status::Busy, ..PlaceRow::new(Icon::Pair, "Bedroom", "Asking Bedroom to play…") },
+                PlaceRow { status: Status::Words("In use"), ..PlaceRow::new(Icon::Speaker, "Kitchen", "Sonos · playing something else") },
+                PlaceRow { current: true, status: Status::Warning, ..PlaceRow::new(Icon::Speaker, "Kitchen", "Isn't responding — trying again (2 of 3)") },
+                PlaceRow { dimmed: true, status: Status::Words("1 of 2 found"), ..PlaceRow::new(Icon::Pair, "Bedroom", "Waiting for the second HomePod") },
+                PlaceRow { status: Status::Warning, ..PlaceRow::new(Icon::Speaker, "Kitchen (192.168.1.20)", "Sonos · two devices answer as Kitchen") },
+                PlaceRow { status: Status::Warning, ..PlaceRow::new(Icon::Speaker, "Kitchen (192.168.1.31)", "Sonos · two devices answer as Kitchen") },
+                PlaceRow {
+                    problem: Some(Problem { text: "Couldn't connect — no answer.", tone: Tone::Red, button: Some("Try again") }),
+                    ..PlaceRow::new(Icon::Tv, "Den TV", "Apple TV · about 2 s delay")
+                },
+                PlaceRow { status: Status::Expand { open: false }, ..PlaceRow::new(Icon::List, "More speakers (12)", "Never used from this PC") },
+            ];
+            for r in &list {
+                let _ = r.show(ui);
+            }
+        });
+        panel_column(ui, "Two lines", |ui| {
+            ui.add_space(6.0);
+            let list = [
+                PlaceRow::new(Icon::Laptop, "This PC", "Speakers (Realtek Audio)"),
+                PlaceRow { current: true, ..PlaceRow::new(Icon::Speaker, "Kitchen", "Sonos · about 0.15 s delay") },
+                PlaceRow::new(Icon::Group, "Living Room + Dining Room", "Sonos group · about 0.2 s delay"),
+                PlaceRow { dimmed: true, ..PlaceRow::new(Icon::Speaker, "Garage", "Not found right now") },
+                PlaceRow {
+                    problem: Some(Problem { text: "Couldn't connect — no answer.", tone: Tone::Red, button: Some("Try again") }),
+                    ..PlaceRow::new(Icon::Tv, "Den TV", "Apple TV · about 2 s delay")
+                },
+            ];
+            for r in &list {
+                let _ = r.show_in(ui, RowStyle::TwoLines);
+            }
+        });
     });
+}
+
+/// A stand-in for the panel's top (the panel builds its own): the sentence,
+/// an optional problem detail and buttons, the volume row, and `third`.
+fn top_standin(ui: &mut Ui, sentence: &str, meter: bool, warn: bool, detail: Option<&str>, buttons: &[&str], level: u8, third: impl FnOnce(&mut Ui)) {
+    let t = Theme::of(ui.ctx());
+    egui::Frame::none().inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 14.0, bottom: 6.0 }).show(ui, |ui| {
+        ui.set_width(PANEL_W - 2.0 - 32.0);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+        let mut x = r.left();
+        if warn {
+            Icon::Warning.paint_weight(ui.painter(), Rect::from_center_size(egui::pos2(x + 9.0, r.center().y), Vec2::splat(18.0)), t.c.amber, 1.6);
+            x += 26.0;
+        }
+        ui.painter().text(egui::pos2(x, r.center().y), egui::Align2::LEFT_CENTER, sentence, t.strong(size::TITLE), t.c.text);
+        if meter {
+            for (i, h) in [5.0, 11.0, 8.0, 14.0].into_iter().enumerate() {
+                let bx = r.right() - 15.0 + i as f32 * 5.0;
+                let bar = Rect::from_min_max(egui::pos2(bx - 3.0, r.center().y + 7.0 - h), egui::pos2(bx, r.center().y + 7.0));
+                ui.painter().rect_filled(bar, 1.0, t.c.live);
+            }
+        }
+        if let Some(d) = detail {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(d).font(t.font(size::SECONDARY)).color(t.c.text_secondary));
+        }
+        if !buttons.is_empty() {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                for b in buttons {
+                    let _ = Button::standard(b).show(ui);
+                }
+            });
+        }
+        ui.add_space(8.0);
+        let _ = volume_row(ui, &VolumeView { level, muted: false, limit: None, label: None, name: "Volume", name_as_tooltip: false });
+        ui.add_space(4.0);
+        third(ui);
+    });
+    divider(ui);
+}
+
+/// The third line when it is the name of the PC's output.
+fn third_words(ui: &mut Ui, words: &str) {
+    let t = Theme::of(ui.ctx());
+    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
+    ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, words, t.font(size::SECONDARY), t.c.text_secondary);
+}
+
+/// A stand-in for the panel's footer: the help links and the gear.
+fn footer_standin(ui: &mut Ui, hear: bool) {
+    divider(ui);
+    egui::Frame::none().inner_margin(egui::Margin { left: 16.0, right: 12.0, top: 6.0, bottom: 8.0 }).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            if hear {
+                let _ = Button::link("Can't hear it?").show(ui);
+            }
+            let _ = Button::link("Speaker missing?").show(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let _ = IconButton::new(Icon::Gear, "Settings").show(ui);
+            });
+        });
+    });
+}
+
+/// A panel-shaped column, 360 points wide, with no inner margin.
+fn simple_panel(ui: &mut Ui, caption: &str, add: impl FnOnce(&mut Ui)) {
+    let t = Theme::of(ui.ctx());
+    ui.allocate_ui(Vec2::new(PANEL_W, 0.0), |ui| {
+        ui.vertical(|ui| {
+            board_caption(ui, caption);
+            egui::Frame::none().fill(t.c.surface).stroke(t.card_stroke()).rounding(8.0).show(ui, |ui| {
+                ui.set_width(PANEL_W - 2.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                add(ui);
+            });
+        });
+    });
+}
+
+fn rows_on(ui: &mut Ui, current: &str, garage: bool, ma: bool) {
+    egui::Frame::none().inner_margin(egui::Margin { left: 4.0, right: 4.0, top: 6.0, bottom: 6.0 }).show(ui, |ui| {
+        let list = [
+            (Icon::Laptop, "This PC"),
+            (Icon::Speaker, "Kitchen"),
+            (Icon::Group, "Living Room + Dining Room"),
+            (Icon::Pair, "Bedroom"),
+            (Icon::Speaker, "Office"),
+        ];
+        for (icon, name) in list {
+            let _ = PlaceRow { current: name == current, menu: name != "This PC", ..PlaceRow::new(icon, name, "") }.show(ui);
+        }
+        if garage {
+            let _ = PlaceRow { dimmed: true, status: Status::Words("Not found"), ..PlaceRow::new(Icon::Speaker, "Garage", "") }.show(ui);
+        }
+        if ma {
+            let _ = PlaceRow::new(Icon::Hub, "Music Assistant", "").show(ui);
+        }
+    });
+}
+
+fn panel_simpler(ui: &mut Ui, st: &mut Stage) {
+    let _ = st;
+    ui.add_space(16.0);
+    ui.horizontal_top(|ui| {
+        ui.add_space(16.0);
+        ui.spacing_mut().item_spacing.x = 28.0;
+        let kitchen = view("Kitchen", 150, -50, None);
+        simple_panel(ui, "Playing on a speaker", |ui| {
+            top_standin(ui, "Playing on Kitchen", true, false, None, &[], 32, |ui| {
+                let _ = DelayLine::new(&kitchen, &mut DelayState::default()).show(ui);
+            });
+            rows_on(ui, "Kitchen", true, true);
+            footer_standin(ui, true);
+        });
+        simple_panel(ui, "Changing the delay", |ui| {
+            top_standin(ui, "Playing on Kitchen", true, false, None, &[], 32, |ui| {
+                let _ = DelayLine::new(&kitchen, &mut DelayState::opened()).show(ui);
+            });
+            rows_on(ui, "Kitchen", true, true);
+            footer_standin(ui, true);
+        });
+        simple_panel(ui, "Sound on this PC", |ui| {
+            top_standin(ui, "Sound is on this PC", false, false, None, &[], 40, |ui| third_words(ui, "Speakers (Realtek Audio)"));
+            rows_on(ui, "This PC", true, false);
+            footer_standin(ui, false);
+        });
+        simple_panel(ui, "A problem", |ui| {
+            top_standin(
+                ui,
+                "Can't find Kitchen right now",
+                false,
+                true,
+                Some("Your sound stays on this PC. It goes to Kitchen when Kitchen is found, unless something plays here first."),
+                &["Stay on this PC"],
+                40,
+                |ui| third_words(ui, "Speakers (Realtek Audio)"),
+            );
+            egui::Frame::none().inner_margin(egui::Margin { left: 4.0, right: 4.0, top: 6.0, bottom: 6.0 }).show(ui, |ui| {
+                let _ = PlaceRow { current: true, ..PlaceRow::new(Icon::Laptop, "This PC", "") }.show(ui);
+                let _ = PlaceRow { dimmed: true, status: Status::Words("Not found"), ..PlaceRow::new(Icon::Speaker, "Kitchen", "") }.show(ui);
+                let _ = PlaceRow::new(Icon::Group, "Living Room + Dining Room", "").show(ui);
+                let _ = PlaceRow::new(Icon::Pair, "Bedroom", "").show(ui);
+            });
+            footer_standin(ui, false);
+        });
+    });
+}
+
+/// The panel's delay line in its states, under a stand-in for the top.
+fn delay_line(ui: &mut Ui, st: &mut Stage) {
+    ui.add_space(16.0);
+    let office = |ms, change, note| DelayView { limits: Limits { max_removed_ms: 280, max_added_ms: 699 }, ..view("Office", ms, change, note) };
+    let steady = |ms, change, note| DelayView { limits: Limits { max_removed_ms: 1000, max_added_ms: 1000 }, ..view("Office", ms, change, note) };
+    type Case = (&'static str, DelayView<'static>, bool, Option<(&'static str, &'static str)>);
+    let cases: Vec<Case> = vec![
+        ("Closed: how the panel opens", view("Kitchen", 150, -50, None), false, None),
+        ("Open: 50 ms removed · Reset", view("Kitchen", 150, -50, None), true, None),
+        ("Open, at the speaker's own delay", view("Kitchen", 200, 0, None), true, None),
+        ("Applying a change on a Sonos", view("Kitchen", 75, -125, Some(DelayNote::Removing { to_go_ms: 75 })), true, None),
+        ("At the limit", view("Kitchen", 0, -200, Some(DelayNote::MostRemoved)), true, None),
+        ("Closed while Office reconnects to apply", DelayView { reconnecting: Some(Reconnect::Remove(100)), ..office(150, -150, Some(DelayNote::Reconnecting)) }, false, None),
+        ("Open while Office reconnects", office(150, -150, Some(DelayNote::Reconnecting)), true, None),
+        ("Steady, after a Remove press", steady(1900, -100, Some(DelayNote::SteadyOffer { steady_ms: 2000, short_ms: 300 })), true, None),
+        ("AirPlay 2 on Steady: nothing to remove yet", DelayView { fixed_with_short_ms: Some(300), ..view("Den TV", 2000, 0, None) }, true, None),
+        ("Pointer on the closed line", view("Kitchen", 150, -50, None), false, Some(("hover", "Delay on Kitchen"))),
+        ("Keyboard focus: ←/→ change it closed", view("Kitchen", 150, -50, None), false, Some(("focus", "Delay on Kitchen"))),
+        ("Keyboard focus on Reset", view("Kitchen", 150, -50, None), true, Some(("focus", "Reset"))),
+    ];
+    let mut cases = cases.into_iter().peekable();
+    while cases.peek().is_some() {
+        ui.horizontal_top(|ui| {
+            ui.add_space(16.0);
+            ui.spacing_mut().item_spacing.x = 24.0;
+            for _ in 0..3 {
+                let Some((cap, v, open, force)) = cases.next() else { break };
+                ui.push_id(cap, |ui| {
+                    simple_panel(ui, cap, |ui| {
+                        let mut state = if open { DelayState::opened() } else { DelayState::default() };
+                        let sentence = format!("Playing on {}", v.speaker);
+                        top_standin(ui, &sentence, true, false, None, &[], 32, |ui| {
+                            let _ = DelayLine::new(&v, &mut state).show(ui);
+                        });
+                        ui.add_space(8.0);
+                    });
+                    if let Some((what, name)) = force {
+                        let area = ui.min_rect();
+                        match what {
+                            "focus" => st.focus_named(area, name),
+                            _ => st.hover_named(area, name),
+                        }
+                    }
+                });
+            }
+        });
+        ui.add_space(18.0);
+    }
 }
 
 fn notices(ui: &mut Ui, st: &mut Stage) {
