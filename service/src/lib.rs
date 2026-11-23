@@ -57,6 +57,7 @@ pub mod tray;
 pub mod endpoint_name;
 pub mod latest;
 pub mod model;
+pub mod settings;
 
 /// Whether `url` is something we're willing to hand to the shell: an
 /// absolute http(s) URL made only of letters, digits and `-._~/:%[]@`.
