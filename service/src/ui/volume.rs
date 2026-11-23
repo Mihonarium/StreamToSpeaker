@@ -40,10 +40,10 @@ pub fn volume_row(ui: &mut Ui, v: &VolumeView) -> Option<VolumeAction> {
     let number = if v.muted { "Muted".to_string() } else { v.level.to_string() };
     let num = ui.painter().layout_no_wrap(number, t.font(size::BODY), t.c.text);
     let num_w = num.size().x.max(28.0);
-    let (row, _) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::hover());
+    let (row, alloc) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::hover());
 
     let mute_name = if v.muted { "Unmute" } else { "Mute" };
-    let mute = ui.put(Rect::from_min_size(row.min, Vec2::splat(32.0)), |ui: &mut Ui| {
+    let mute = super::inside(ui, Rect::from_min_size(row.min, Vec2::splat(32.0)), |ui: &mut Ui| {
         IconButton::new(if v.muted { Icon::Mute } else { Icon::Volume }, mute_name).size(32.0, 18.0).show(ui)
     });
     if mute.clicked() {
@@ -54,7 +54,7 @@ pub fn volume_row(ui: &mut Ui, v: &VolumeView) -> Option<VolumeAction> {
         egui::pos2(row.left() + 32.0 + 10.0, row.center().y - SLIDER_H / 2.0),
         egui::pos2(row.right() - num_w - 10.0, row.center().y + SLIDER_H / 2.0),
     );
-    let id = ui.id().with(("volume", v.name));
+    let id = alloc.id.with("slider");
     let resp = ui.interact(track, id, Sense::click_and_drag());
     resp.widget_info(|| WidgetInfo::slider(true, v.level as f64, v.name));
     // The thumb's centre runs from 10 points in at each end.

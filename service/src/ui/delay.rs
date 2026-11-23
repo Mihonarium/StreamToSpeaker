@@ -19,7 +19,7 @@ use egui::{Key, Rect, Sense, Ui, Vec2, WidgetInfo, WidgetType};
 
 use super::button::{Button, IconButton};
 use super::icon::Icon;
-use super::look::look_as;
+use super::look::{look_as, Look};
 use super::text::{Mark, Para, ParaClick, Tone};
 use super::theme::{focus_ring, radius, size, space, Theme};
 
@@ -407,7 +407,6 @@ impl<'v, 's> DelayControl<'v, 's> {
     pub fn show(self, ui: &mut Ui) -> Option<DelayAction> {
         let DelayControl { view: v, state, max_width } = self;
         let t = Theme::of(ui.ctx());
-        let id = ui.id().with(("delay-control", v.speaker));
         let width = ui.available_width().min(max_width);
         let top = ui.cursor().min;
         let mut action = None;
@@ -423,7 +422,8 @@ impl<'v, 's> DelayControl<'v, 's> {
         }
 
         // The head line.
-        let (head_rect, _) = ui.allocate_exact_size(Vec2::new(width, HEAD_H), Sense::hover());
+        let (head_rect, head_alloc) = ui.allocate_exact_size(Vec2::new(width, HEAD_H), Sense::hover());
+        let id = head_alloc.id;
         let label = ui.painter().layout_no_wrap("Delay".into(), t.font(size::SECONDARY), t.c.text_secondary);
         let figure = ui.painter().layout_no_wrap(v.delay.short(), t.strong(size::CONTROL), t.c.text);
         let change = change_words(v.change_ms).map(|w| ui.painter().layout_no_wrap(format!("· {w}"), t.font(size::CONTROL), t.c.text));
@@ -466,7 +466,7 @@ impl<'v, 's> DelayControl<'v, 's> {
         if v.change_ms != 0 && editable {
             let r = Rect::from_center_size(egui::pos2(x + 7.0 + 11.0, cy), Vec2::splat(22.0));
             let name = format!("Back to {}'s own delay", v.speaker);
-            let reset = ui.put(r, |ui: &mut Ui| IconButton::new(Icon::Reset, &name).size(22.0, 14.0).color(t.c.text_secondary).show(ui));
+            let reset = super::inside(ui, r, |ui: &mut Ui| IconButton::new(Icon::Reset, &name).size(22.0, 14.0).color(t.c.text_secondary).show(ui));
             if reset.clicked() {
                 action = Some(DelayAction::BackToOwn);
             }
@@ -474,7 +474,7 @@ impl<'v, 's> DelayControl<'v, 's> {
         if v.other_amount_link && editable {
             let g = ui.painter().layout_no_wrap("Other amount…".into(), t.font(size::SMALL), t.c.accent);
             let r = Rect::from_min_size(egui::pos2(head_rect.right() - g.size().x, cy - 10.0), Vec2::new(g.size().x, 20.0));
-            if ui.put(r, |ui: &mut Ui| Button::link("Other amount…").text_size(size::SMALL).show(ui)).clicked() {
+            if super::inside(ui, r, |ui: &mut Ui| Button::link("Other amount…").text_size(size::SMALL).show(ui)).clicked() {
                 state.amount = Some(Amount { focus_pending: true, ..Default::default() });
             }
         }
@@ -546,19 +546,22 @@ impl<'v, 's> DelayControl<'v, 's> {
             let field_shape = ui.painter().add(egui::Shape::Noop);
             let before = amount.digits.clone();
             let mut text = amount.digits.clone();
-            let edit = ui.put(
-                field.shrink2(Vec2::new(8.0, 2.0)),
-                egui::TextEdit::singleline(&mut text)
+            let edit_rect = field.shrink2(Vec2::new(8.0, 2.0));
+            let edit = super::inside(ui, edit_rect, |ui: &mut Ui| {
+                ui.add_sized(
+                    edit_rect.size(),
+                    egui::TextEdit::singleline(&mut text)
                     .id(field_id)
                     .frame(false)
                     .font(t.strong(size::CONTROL))
                     .text_color(t.c.text)
                     .margin(egui::Margin::ZERO)
                     .vertical_align(egui::Align::Center),
-            );
+            )
+            });
             edit.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, FIELD_NAME));
-            let focused = look_as(ui, &edit, FIELD_NAME).focused;
-            ui.painter().set(field_shape, field_shapes(field, focused, &t));
+            let field_look = look_as(ui, &edit, FIELD_NAME);
+            ui.painter().set(field_shape, field_shapes(field, field_look, &t));
             if text != before {
                 amount.digits.clear();
                 take_typing(amount, &text);
@@ -707,13 +710,22 @@ const FIELD_NAME: &str = "Milliseconds to remove or add";
 
 /// A text field's box: the control fill and border, and a bottom edge that
 /// turns into a 2-point accent line while it has the focus.
-pub(crate) fn field_shapes(rect: Rect, focused: bool, t: &Theme) -> egui::Shape {
-    let (h, color) = if focused { (2.0, t.c.accent) } else { (1.0, t.c.control_strong.gamma_multiply(0.6)) };
+pub(crate) fn field_shapes(rect: Rect, l: Look, t: &Theme) -> egui::Shape {
+    let (h, color) = if l.focused { (2.0, t.c.accent) } else { (1.0, t.c.control_strong.gamma_multiply(0.6)) };
+    let fill = if !l.enabled {
+        t.c.control.gamma_multiply(0.4)
+    } else if l.focused {
+        t.c.card
+    } else if l.hovered {
+        t.c.control_hover
+    } else {
+        t.c.control
+    };
     let bottom = Rect::from_min_max(egui::pos2(rect.left() + 1.0, rect.bottom() - h), egui::pos2(rect.right() - 1.0, rect.bottom()));
     egui::Shape::Vec(vec![
-        egui::Shape::rect_filled(rect, radius::CONTROL, if focused { t.c.card } else { t.c.control }),
+        egui::Shape::rect_filled(rect, radius::CONTROL, fill),
         egui::Shape::rect_stroke(rect.shrink(0.5), radius::CONTROL, egui::Stroke::new(1.0_f32, t.c.control_border)),
-        egui::Shape::rect_filled(bottom, 0.0, color),
+        egui::Shape::rect_filled(bottom, 0.0, if l.enabled { color } else { t.c.control_border }),
     ])
 }
 

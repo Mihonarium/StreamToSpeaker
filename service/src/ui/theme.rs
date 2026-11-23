@@ -3,8 +3,7 @@
 //!
 //! Sizes here are the sizes Windows uses: text sizes are the em size in
 //! pixels at 100 % scale, as in Windows' own apps (14 px Segoe UI for body
-//! text). egui sizes a font by its line height instead of its em, so
-//! [`Theme::font`] converts.
+//! text), which is also how egui sizes fonts.
 
 use egui::{Color32, FontFamily, FontId, Rounding, Shadow, Stroke, Vec2};
 
@@ -251,10 +250,6 @@ pub mod radius {
     pub const CONTROL: f32 = 4.0;
 }
 
-/// Segoe UI's line height (ascender to descender, no line gap) per em.
-/// egui sizes a font by that height, Windows and CSS by the em.
-pub const SEGOE_UI_HEIGHT_PER_EM: f32 = (2210.0 + 514.0) / 2048.0;
-
 /// The font family of Segoe UI Semibold, set up by [`crate::fonts`].
 pub const SEMIBOLD: &str = crate::fonts::SEMIBOLD_FAMILY;
 
@@ -281,12 +276,12 @@ impl Theme {
 
     /// Regular text whose em is `em_px` pixels at 100 % scale.
     pub fn font(&self, em_px: f32) -> FontId {
-        FontId::new(em_px * SEGOE_UI_HEIGHT_PER_EM, FontFamily::Proportional)
+        FontId::new(em_px, FontFamily::Proportional)
     }
 
     /// Semibold text whose em is `em_px` pixels at 100 % scale.
     pub fn strong(&self, em_px: f32) -> FontId {
-        FontId::new(em_px * SEGOE_UI_HEIGHT_PER_EM, FontFamily::Name(SEMIBOLD.into()))
+        FontId::new(em_px, FontFamily::Name(SEMIBOLD.into()))
     }
 
     /// The shadow of a flyout, menu or dialog.
@@ -328,7 +323,7 @@ pub fn style_for(style: &mut egui::Style, t: &Theme) {
         (TextStyle::Body, t.font(size::BODY)),
         (TextStyle::Button, t.font(size::CONTROL)),
         (TextStyle::Heading, t.strong(size::DIALOG)),
-        (TextStyle::Monospace, FontId::monospace(size::SECONDARY * SEGOE_UI_HEIGHT_PER_EM)),
+        (TextStyle::Monospace, FontId::monospace(size::SECONDARY)),
     ]
     .into();
 
@@ -412,13 +407,6 @@ pub fn focus_ring(painter: &egui::Painter, rect: egui::Rect, rounding: f32, outs
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn body_text_is_fourteen_pixel_segoe_ui() {
-        // 14 px em; Segoe UI's line is 1.33 em, which is the size egui wants.
-        let f = Theme::new(Mode::Light).font(size::BODY);
-        assert!((f.size - 18.62).abs() < 0.01, "{}", f.size);
-    }
 
     #[test]
     fn apply_stores_the_theme_for_the_parts() {

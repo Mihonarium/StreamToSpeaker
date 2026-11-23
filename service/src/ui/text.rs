@@ -145,7 +145,7 @@ impl<'a> Para<'a> {
         let mut job = LayoutJob { wrap: egui::text::TextWrapping { max_width: (width - indent).max(20.0), ..Default::default() }, ..Default::default() };
         let plain = TextFormat { font_id: font.clone(), color: self.tone.color(&t), ..Default::default() };
         let mut sections_of_links: Vec<usize> = Vec::new();
-        if let Some(lead) = self.lead {
+        if let Some(lead) = self.lead.filter(|l| !l.is_empty()) {
             job.append(lead, 0.0, TextFormat { font_id: t.strong(self.size), color: t.c.text, ..Default::default() });
             if !self.text.is_empty() {
                 job.append(" ", 0.0, plain.clone());
@@ -168,7 +168,7 @@ impl<'a> Para<'a> {
         });
         let galley = ui.fonts(|f| f.layout_job(job));
         let text_h = galley.size().y.max(row_h);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, text_h), Sense::hover());
+        let (rect, alloc) = ui.allocate_exact_size(Vec2::new(width, text_h), Sense::hover());
         let origin = rect.min + Vec2::new(indent, 0.0);
         if self.mark != Mark::None {
             let m = Rect::from_center_size(rect.min + Vec2::new(mark_side / 2.0, row_h / 2.0), Vec2::splat(mark_side));
@@ -199,7 +199,7 @@ impl<'a> Para<'a> {
             if !area.is_positive() {
                 continue;
             }
-            let id = ui.id().with(("para-link", section));
+            let id = alloc.id.with(("link", section));
             let target = if what == Some(ParaClick::Dismiss) { area.expand2(Vec2::new(4.0, 0.0)) } else { area };
             let resp: Response = ui.interact(target, id, Sense::click());
             let name = match what {

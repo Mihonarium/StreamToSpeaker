@@ -6,9 +6,15 @@
 use egui::{Rect, Response, Sense, Ui, Vec2};
 
 use super::button::{Button, IconButton};
+use super::card::{card, divider, list_heading, section_heading, SettingRow, SETTINGS_CARD_PAD};
 use super::delay::{DelayControl, DelayFigure, DelayNote, DelayState, DelayView, Limits};
 use super::icon::Icon;
+use super::inputs::{Check, Choice, DropDown, Switch, TextField};
+use super::menu::{menu_frame, menu_header, menu_separator, MenuItem};
+use super::notice::{info_bar, notice_line, BarKind, InfoBar, Notice};
 use super::preview::{Scene, Stage};
+use super::row::{PlaceRow, Trailing};
+use super::text::{Mark, Tone};
 use super::theme::{size, space, Theme};
 use super::volume::{volume_row, VolumeView};
 
@@ -17,7 +23,13 @@ pub fn scenes() -> Vec<Scene> {
         Scene { name: "parts-buttons", size: [1000.0, 400.0], draw: buttons },
         Scene { name: "parts-delay-states", size: [1180.0, 1660.0], draw: delay_states },
         Scene { name: "parts-delay-amount", size: [1560.0, 350.0], draw: delay_amount },
-        Scene { name: "parts-delay-interaction", size: [1180.0, 600.0], draw: delay_interaction },
+        Scene { name: "parts-delay-interaction", size: [1180.0, 620.0], draw: delay_interaction },
+        Scene { name: "parts-rows", size: [820.0, 1000.0], draw: rows },
+        Scene { name: "parts-notices", size: [1060.0, 640.0], draw: notices },
+        Scene { name: "parts-inputs", size: [1060.0, 620.0], draw: inputs },
+        Scene { name: "parts-cards", size: [700.0, 840.0], draw: cards },
+        Scene { name: "parts-menus", size: [960.0, 360.0], draw: menus },
+        Scene { name: "parts-icons", size: [700.0, 200.0], draw: icons },
     ]
 }
 
@@ -275,4 +287,331 @@ fn delay_interaction(ui: &mut Ui, st: &mut Stage) {
             },
         ],
     );
+}
+
+/// The panel's width.
+const PANEL_W: f32 = 380.0;
+
+/// A column the panel's width and colour, with rows inset as the panel's
+/// list insets them.
+fn panel_column(ui: &mut Ui, caption: &str, add: impl FnOnce(&mut Ui)) {
+    let t = Theme::of(ui.ctx());
+    ui.allocate_ui(Vec2::new(PANEL_W, 0.0), |ui| {
+        ui.vertical(|ui| {
+            board_caption(ui, caption);
+            egui::Frame::none()
+                .fill(t.c.surface)
+                .stroke(t.card_stroke())
+                .rounding(8.0)
+                .inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 4.0, bottom: 8.0 })
+                .show(ui, |ui| {
+                    ui.set_width(PANEL_W - 18.0);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    add(ui);
+                });
+        });
+    });
+}
+
+fn rows(ui: &mut Ui, st: &mut Stage) {
+    let t = Theme::of(ui.ctx());
+    ui.add_space(16.0);
+    ui.horizontal_top(|ui| {
+        ui.add_space(16.0);
+        ui.spacing_mut().item_spacing.x = 24.0;
+        panel_column(ui, "Play on: the everyday list", |ui| {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                list_heading(ui, "Play on");
+            });
+            ui.add_space(4.0);
+            let rows = [
+                PlaceRow { trailing: Trailing::Expand { open: false }, ..PlaceRow::new(Icon::Laptop, "This PC", "Speakers (Realtek Audio)") },
+                PlaceRow { current: true, menu: true, ..PlaceRow::new(Icon::Speaker, "Kitchen", "Sonos · about 0.15 s delay") },
+                PlaceRow { menu: true, ..PlaceRow::new(Icon::Group, "Living Room + Dining Room", "Sonos group · about 0.2 s delay") },
+                PlaceRow { menu: true, ..PlaceRow::new(Icon::Pair, "Bedroom", "HomePod pair · about 0.2 s delay") },
+                PlaceRow { menu: true, ..PlaceRow::new(Icon::Speaker, "Office", "AirPlay · about 2 s delay") },
+                PlaceRow { dimmed: true, menu: true, ..PlaceRow::new(Icon::Speaker, "Garage", "Not found right now") },
+            ];
+            for r in &rows {
+                let _ = r.show(ui);
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Through Music Assistant").font(t.font(size::CAPTION)).color(t.c.text_secondary));
+            });
+            ui.add_space(2.0);
+            let _ = PlaceRow::new(Icon::Hub, "Music Assistant", "Chooses the speaker in Music Assistant").show(ui);
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                list_heading(ui, "This PC's outputs");
+            });
+            ui.add_space(4.0);
+            let _ = PlaceRow { current: true, trailing: Trailing::Expand { open: true }, ..PlaceRow::new(Icon::Laptop, "This PC", "Speakers (Realtek Audio)") }.show(ui);
+            let _ = PlaceRow { indent: true, trailing: Trailing::Check, ..PlaceRow::new(Icon::Laptop, "Speakers", "Realtek Audio") }.show(ui);
+            let _ = PlaceRow { indent: true, ..PlaceRow::new(Icon::Headphones, "Headphones", "WH-1000XM4") }.show(ui);
+            let _ = PlaceRow { indent: true, ..PlaceRow::new(Icon::Monitor, "Monitor", "HDMI · NVIDIA High Definition Audio") }.show(ui);
+        });
+        panel_column(ui, "Rows in the states that matter", |ui| {
+            ui.add_space(4.0);
+            let a = ui.cursor().min;
+            let _ = PlaceRow { tone: Tone::Amber, menu: true, ..PlaceRow::new(Icon::Speaker, "Kitchen", "Isn't responding — trying again (2 of 3)") }.show(ui);
+            st.hover_named(Rect::from_min_max(a, ui.cursor().min + Vec2::new(PANEL_W, 0.0)), "Kitchen.");
+            let _ = PlaceRow { tone: Tone::Red, trailing: Trailing::Button("Try again"), ..PlaceRow::new(Icon::Tv, "Den TV", "Couldn't connect — no answer.") }.show(ui);
+            let _ = PlaceRow { trailing: Trailing::Busy, ..PlaceRow::new(Icon::Pair, "Bedroom", "Asking Bedroom to play…") }.show(ui);
+            let _ = PlaceRow { dimmed: true, ..PlaceRow::new(Icon::Pair, "Bedroom", "Waiting for the second HomePod") }.show(ui);
+            let _ = PlaceRow { tone: Tone::Amber, ..PlaceRow::new(Icon::Speaker, "Kitchen (192.168.1.20)", "Sonos · two devices answer as Kitchen") }.show(ui);
+            let _ = PlaceRow { dimmed: true, ..PlaceRow::new(Icon::Speaker, "Bathroom", "Can't play to this speaker") }.show(ui);
+            let _ = PlaceRow::new(Icon::Speaker, "Office", "AirPlay · 1.74 s delay, measured").show(ui);
+            let _ = PlaceRow { trailing: Trailing::Expand { open: false }, ..PlaceRow::new(Icon::List, "More speakers on this network (12)", "Never used from this PC") }.show(ui);
+            let b = ui.cursor().min;
+            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Group, "Upstairs", "Pressed") }.show(ui);
+            st.press_named(Rect::from_min_max(b, ui.cursor().min + Vec2::new(PANEL_W, 0.0)), "Upstairs.");
+            let c = ui.cursor().min;
+            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Speaker, "Study", "Keyboard focus: ⋯ shows too") }.show(ui);
+            st.focus_named(Rect::from_min_max(c, ui.cursor().min + Vec2::new(PANEL_W, 0.0)), "Study.");
+            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Group, "Living Room + Dining Room + Kitchen + Garden Terrace", "Sonos group · about 0.2 s delay") }.show(ui);
+            let _ = PlaceRow { menu: true, ..PlaceRow::new(Icon::Speaker, "客厅的音箱", "Sonos · about 0.2 s delay") }.show(ui);
+        });
+    });
+}
+
+fn notices(ui: &mut Ui, st: &mut Stage) {
+    let _ = st;
+    ui.add_space(16.0);
+    ui.horizontal_top(|ui| {
+        ui.add_space(16.0);
+        ui.spacing_mut().item_spacing.x = 24.0;
+        panel_column(ui, "The notice line, one at a time", |ui| {
+            let list: [Notice; 7] = [
+                Notice { mark: Mark::Info, lead: "Restart Windows to finish updating.", text: "", actions: &["Restart…"], dismissable: false },
+                Notice { mark: Mark::Warning, lead: "Not looking for speakers:", text: "the network adapter “Wi-Fi” is off.", actions: &["Settings"], dismissable: false },
+                Notice { mark: Mark::Warning, lead: "Kitchen Sub asked for the sound and was refused.", text: "", actions: &["Allow"], dismissable: false },
+                Notice { mark: Mark::Lab, lead: "Lab settings are on.", text: "", actions: &["Turn off"], dismissable: false },
+                Notice { mark: Mark::Info, lead: "Version 0.2.1 is ready to install.", text: "", actions: &["What's new"], dismissable: false },
+                Notice { mark: Mark::Info, lead: "Updated to 0.2.1.", text: "", actions: &["What's new"], dismissable: true },
+                Notice {
+                    mark: Mark::Person,
+                    lead: "",
+                    text: "Stream To Speaker is free. Donations pay for signing its sound driver.",
+                    actions: &["Donate"],
+                    dismissable: true,
+                },
+            ];
+            for n in &list {
+                ui.add_space(10.0);
+                let _ = notice_line(ui, n);
+            }
+        });
+        ui.allocate_ui(Vec2::new(600.0, 0.0), |ui| {
+            ui.vertical(|ui| {
+                board_caption(ui, "Bars at the top of a page or dialog");
+                ui.spacing_mut().item_spacing.y = 10.0;
+                let bars = [
+                    InfoBar {
+                        kind: BarKind::Warning,
+                        title: Some("Settings for testing speakers that aren't fully supported yet."),
+                        text: "They can stop a speaker from playing. While any of them differs from its default, the panel says “Lab settings are on”.",
+                        action: Some("Reset everything in Lab"),
+                    },
+                    InfoBar { kind: BarKind::Error, title: None, text: "That password didn't work. You can check it in the speaker's own settings.", action: None },
+                    InfoBar {
+                        kind: BarKind::Warning,
+                        title: None,
+                        text: "Pairing with a code is paused because wrong codes were entered too many times. If that wasn't you, something on your network may be trying to pair.",
+                        action: Some("Allow pairing again"),
+                    },
+                    InfoBar { kind: BarKind::Info, title: None, text: "Music Assistant sets the delay for each of its speakers, so it isn't changed here.", action: None },
+                    InfoBar { kind: BarKind::Done, title: None, text: "Paired with Music Assistant (Home).", action: None },
+                ];
+                for b in &bars {
+                    let _ = info_bar(ui, b);
+                }
+            });
+        });
+    });
+}
+
+fn inputs(ui: &mut Ui, st: &mut Stage) {
+    sheet(ui, |ui| {
+        egui::Grid::new("inputs").num_columns(6).spacing(Vec2::new(22.0, 16.0)).min_col_width(120.0).show(ui, |ui| {
+            ui.label("");
+            for s in STATES {
+                caption(ui, s);
+            }
+            ui.end_row();
+            for on in [false, true] {
+                caption(ui, if on { "Switch, on" } else { "Switch, off" });
+                for i in 0..STATES.len() {
+                    let r = ui.push_id((on, i), |ui| Switch::new(on, "Start at sign-in").enabled(i != 4).show(ui)).response;
+                    let _ = r;
+                    let area = ui.min_rect();
+                    let _ = area;
+                }
+                ui.end_row();
+            }
+            for chosen in [false, true] {
+                caption(ui, if chosen { "Choice, chosen" } else { "Choice" });
+                for i in 0..STATES.len() {
+                    ui.push_id((chosen, i), |ui| {
+                        ui.set_max_width(150.0);
+                        let _ = Choice::new(chosen, "Steady").description("about 2 s").enabled(i != 4).show(ui);
+                    });
+                }
+                ui.end_row();
+            }
+            for ticked in [false, true] {
+                caption(ui, if ticked { "Tick box, ticked" } else { "Tick box" });
+                for i in 0..STATES.len() {
+                    ui.push_id((ticked, i, "c"), |ui| {
+                        ui.set_max_width(150.0);
+                        let _ = Check::new(ticked, "The log file").enabled(i != 4).show(ui);
+                    });
+                }
+                ui.end_row();
+            }
+            caption(ui, "Drop-down");
+            for i in 0..STATES.len() {
+                ui.push_id((i, "d"), |ui| {
+                    let _ = DropDown::new(("dd", i), "Look for speakers on", &["All networks", "Wi-Fi", "Ethernet 2"], 0).min_width(140.0).enabled(i != 4).show(ui);
+                });
+            }
+            ui.end_row();
+            caption(ui, "Text field");
+            for i in 0..STATES.len() {
+                ui.push_id((i, "f"), |ui| {
+                    let mut text = if i == 0 { String::new() } else { "192.168.20.40".to_string() };
+                    let r = TextField::new(&mut text, "Address").hint("an address").width(150.0).enabled(i != 4).show(ui);
+                    match i {
+                        1 => st.hover(&r),
+                        3 => st.focus(&r),
+                        _ => {}
+                    }
+                });
+            }
+            ui.end_row();
+        });
+        // States of the inner parts, by their names, column by column.
+        let grid = ui.min_rect();
+        let col = |i: usize| Rect::from_min_max(egui::pos2(grid.left() + 120.0 + 22.0 + (i as f32) * 172.0 - 4.0, grid.top()), egui::pos2(grid.left() + 120.0 + 22.0 + (i as f32 + 1.0) * 172.0 - 8.0, grid.bottom()));
+        for name in ["Start at sign-in", "Steady", "The log file", "Look for speakers on"] {
+            st.hover_named(col(1), name);
+            st.press_named(col(2), name);
+            st.focus_named(col(3), name);
+        }
+    });
+}
+
+fn cards(ui: &mut Ui, st: &mut Stage) {
+    egui::Frame::none().inner_margin(egui::Margin::same(16.0)).show(ui, |ui| {
+        ui.set_width(640.0);
+        ui.spacing_mut().item_spacing.y = 4.0;
+        let _ = SettingRow::new("Look for speakers on")
+            .icon(Icon::Wifi)
+            .description("Looking on Wi-Fi “HomeNet” (192.168.1.23) and Ethernet 2 (10.8.0.4).")
+            .show(ui, |ui| DropDown::new("net", "Look for speakers on", &["All networks", "Wi-Fi", "Ethernet 2"], 0).show(ui));
+        section_heading(ui, "Your speakers");
+        let _ = SettingRow::new("Kitchen").icon(Icon::Speaker).description("Sonos · Playing now · 50 ms removed").opens_page().show(ui, |_| ());
+        let a = ui.cursor().min;
+        let _ = SettingRow::new("Office").icon(Icon::Speaker).description("AirPlay speaker · Steady · 300 ms removed").opens_page().show(ui, |_| ());
+        st.hover_named(Rect::from_min_max(a, ui.cursor().min + Vec2::new(640.0, 0.0)), "Office");
+        let _ = SettingRow::new("Neighbour's TV").icon(Icon::Tv).description("Apple TV · hidden from the panel").show(ui, |ui| Button::standard("Show").show(ui));
+        section_heading(ui, "Start-up");
+        let _ = SettingRow::new("Start Stream To Speaker when I sign in")
+            .icon(Icon::Play)
+            .description("It waits by the clock without opening anything.")
+            .show(ui, |ui| Switch::new(true, "Start Stream To Speaker when I sign in").show(ui));
+        let _ = SettingRow::new("Sendspin speakers (experimental)")
+            .icon(Icon::Flask)
+            .description("ESPHome and other speakers that play from Music Assistant. This PC plays to them directly. Music Assistant has its own page.")
+            .show(ui, |ui| Switch::new(false, "Sendspin speakers (experimental)").show(ui));
+        section_heading(ui, "What plays on your speaker");
+        let _ = card(ui, SETTINGS_CARD_PAD, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            let _ = Choice::new(true, "Everything this PC plays (recommended)").description("Choosing a speaker makes it Windows' sound output; choosing This PC switches back.").show(ui);
+            let _ = Choice::new(false, "Only apps I send there").description("In Windows' Volume mixer, set an app's output to “Stream To Speaker”. The app never changes Windows' own output.").show(ui);
+            divider(ui);
+            let mut text = String::new();
+            let _ = TextField::new(&mut text, "Show as").hint("Kitchen").width(260.0).show(ui);
+        });
+    });
+}
+
+fn menus(ui: &mut Ui, st: &mut Stage) {
+    ui.add_space(16.0);
+    ui.horizontal_top(|ui| {
+        ui.add_space(16.0);
+        ui.spacing_mut().item_spacing.x = 24.0;
+        let frame = menu_frame(ui.ctx());
+        ui.vertical(|ui| {
+            board_caption(ui, "The panel's ⋯ menu");
+            frame.show(ui, |ui| {
+                ui.set_width(250.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let _ = MenuItem::new("Help").show(ui);
+                let _ = MenuItem::new("About").show(ui);
+                menu_separator(ui);
+                let _ = MenuItem::new("Quit (sound returns to this PC)").show(ui);
+            });
+        });
+        ui.vertical(|ui| {
+            board_caption(ui, "A row's menu: pointer on one, one greyed");
+            frame.show(ui, |ui| {
+                ui.set_width(250.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let _ = MenuItem::new("Speaker settings").show(ui);
+                let a = ui.cursor().min;
+                let _ = MenuItem::new("Play a test sound").show(ui);
+                st.hover_named(Rect::from_min_max(a, ui.cursor().min + Vec2::new(250.0, 0.0)), "Play a test sound");
+                let _ = MenuItem::new("Reconnect").enabled(false).show(ui);
+                let _ = MenuItem::new("Hide from this list").show(ui);
+            });
+        });
+        ui.vertical(|ui| {
+            board_caption(ui, "A state line, ticks and a submenu");
+            frame.show(ui, |ui| {
+                ui.set_width(280.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                menu_header(ui, "Playing on Kitchen");
+                menu_separator(ui);
+                let _ = MenuItem::new("This PC").show(ui);
+                let _ = MenuItem::new("Kitchen").checked(true).show(ui);
+                let _ = MenuItem::new("Living Room + Dining Room").show(ui);
+                menu_separator(ui);
+                let _ = MenuItem::new("Delay: about 0.15 s · 50 ms removed").submenu(true).show(ui);
+                let b = ui.cursor().min;
+                let _ = MenuItem::new("Settings").show(ui);
+                st.focus_named(Rect::from_min_max(b, ui.cursor().min + Vec2::new(280.0, 0.0)), "Settings");
+            });
+        });
+    });
+}
+
+fn icons(ui: &mut Ui, st: &mut Stage) {
+    let _ = st;
+    let t = Theme::of(ui.ctx());
+    sheet(ui, |ui| {
+        let all = [
+            Icon::Speaker, Icon::Group, Icon::Pair, Icon::Tv, Icon::Laptop, Icon::Monitor, Icon::Headphones, Icon::Hub,
+            Icon::ChevronRight, Icon::ChevronLeft, Icon::ChevronDown, Icon::ChevronUp, Icon::More, Icon::Gear, Icon::Volume,
+            Icon::Mute, Icon::Check, Icon::Warning, Icon::Error, Icon::ErrorCross, Icon::Info, Icon::Close, Icon::Back,
+            Icon::Search, Icon::Copy, Icon::Refresh, Icon::Reset, Icon::Wifi, Icon::Bell, Icon::Phone, Icon::Lock,
+            Icon::Shield, Icon::Play, Icon::Music, Icon::Clock, Icon::Timer, Icon::List, Icon::Wrench, Icon::User,
+            Icon::Plus, Icon::Sliders, Icon::Flask, Icon::Help, Icon::External, Icon::Keyboard,
+        ];
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(10.0, 10.0);
+            for icon in all {
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                icon.paint(ui.painter(), r.shrink(3.0), t.c.text);
+            }
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+            super::icon::paint_mark(ui.painter(), r.shrink(2.0), t.c.mark_ink, t.c.mark_arcs, false);
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+            super::icon::paint_spinner(ui.painter(), r.shrink(4.0), t.c.accent, 0.25);
+        });
+    });
 }

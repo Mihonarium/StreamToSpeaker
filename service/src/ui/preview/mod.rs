@@ -123,40 +123,44 @@ pub struct Picture {
 /// The fonts for pictures: the app's own font stack (see [`crate::fonts`]),
 /// loaded from `dir` by the Windows file names (`segoeui.ttf`,
 /// `seguisb.ttf`, `seguisym.ttf`, `msyh.ttc` and the rest). On a machine
-/// without Windows' fonts, `dir` can hold other fonts under those names;
-/// ones standing in for Segoe UI are scaled to Segoe UI's size and
-/// baseline, so text takes the room it takes on Windows.
+/// without Windows' fonts, `dir` can hold other fonts under those names.
+/// Every font is given its Windows line metrics (`usWinAscent` and
+/// `usWinDescent`) as the ones egui reads, as Windows itself spaces lines:
+/// for Segoe UI they are the same, and a font made to stand in for it,
+/// such as Selawik, then takes exactly Segoe UI's room.
 pub fn fonts_from_dir(dir: &Path) -> FontDefinitions {
     let mut load = |file: &str| -> Option<&'static [u8]> {
-        let bytes = std::fs::read(dir.join(file)).ok()?;
+        let mut bytes = std::fs::read(dir.join(file)).ok()?;
+        use_windows_line_metrics(&mut bytes);
         Some(Box::leak(bytes.into_boxed_slice()))
     };
-    let (mut defs, _) = crate::fonts::definitions(&crate::fonts::DEFAULT_HAN_ORDER, &mut load);
-    for name in [crate::fonts::SEGOE_UI.name, crate::fonts::SEGOE_UI_SEMIBOLD.name] {
-        if let Some(data) = defs.font_data.get_mut(name) {
-            if let Some(tweak) = segoe_ui_tweak(&data.font, data.index) {
-                data.tweak = tweak;
-            }
-        }
-    }
-    defs
+    crate::fonts::definitions(&crate::fonts::DEFAULT_HAN_ORDER, &mut load).0
 }
 
-/// The scale and shift that give a font standing in for Segoe UI Segoe
-/// UI's em size and baseline, or nothing for Segoe UI itself.
-fn segoe_ui_tweak(bytes: &[u8], index: u32) -> Option<egui::FontTweak> {
-    let face = ttf_parser::Face::parse(bytes, index).ok()?;
-    let (asc, desc, em) = (face.ascender() as f32, face.descender() as f32, face.units_per_em() as f32);
-    let height = asc - desc;
-    let s = (height / em) / theme::SEGOE_UI_HEIGHT_PER_EM;
-    if (s - 1.0).abs() < 0.005 {
-        return None;
+/// Copy a single font file's `OS/2` Windows ascent and descent into its
+/// `hhea` ascender, descender and line gap (0). Collections and files
+/// without those tables are left as they are.
+fn use_windows_line_metrics(font: &mut [u8]) {
+    let be16 = |b: &[u8], at: usize| -> Option<u16> { Some(u16::from_be_bytes([*b.get(at)?, *b.get(at + 1)?])) };
+    let be32 = |b: &[u8], at: usize| -> Option<u32> { Some(u32::from_be_bytes([*b.get(at)?, *b.get(at + 1)?, *b.get(at + 2)?, *b.get(at + 3)?])) };
+    if font.get(0..4) == Some(b"ttcf") {
+        return;
     }
-    let segoe_baseline = 2210.0 / (2210.0 + 514.0);
-    let baseline = asc / height;
-    let middle = (asc + desc) / height;
-    let y_offset_factor = (segoe_baseline - (baseline - (1.0 - s) * 0.5 * middle)) / s;
-    Some(egui::FontTweak { scale: s, y_offset_factor, ..Default::default() })
+    let Some(count) = be16(font, 4) else { return };
+    let table = |tag: &[u8; 4]| -> Option<usize> {
+        (0..count as usize).find_map(|i| {
+            let rec = 12 + 16 * i;
+            (font.get(rec..rec + 4)? == tag).then(|| be32(font, rec + 8).map(|o| o as usize)).flatten()
+        })
+    };
+    let (Some(hhea), Some(os2)) = (table(b"hhea"), table(b"OS/2")) else { return };
+    let (Some(win_ascent), Some(win_descent)) = (be16(font, os2 + 74), be16(font, os2 + 76)) else { return };
+    if font.len() < hhea + 10 {
+        return;
+    }
+    font[hhea + 4..hhea + 6].copy_from_slice(&(win_ascent as i16).to_be_bytes());
+    font[hhea + 6..hhea + 8].copy_from_slice(&(-(win_descent as i16)).to_be_bytes());
+    font[hhea + 8..hhea + 10].copy_from_slice(&0i16.to_be_bytes());
 }
 
 /// A context set up as a window of the app is: `fonts`, the theme in
