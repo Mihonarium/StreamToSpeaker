@@ -808,7 +808,8 @@ impl App {
             .find_by_id(id)
             .ok_or_else(|| format!("no Sendspin speaker with id {:?}", id))?;
         let name = renderer.friendly_name.clone();
-        let extra = self.user_config.lock().unwrap().sendspin.player_extra_latency_ms;
+        // What was added to this speaker's delay (nothing can be removed).
+        let extra = self.delay_for_sendspin(id);
         let weak = Arc::downgrade(self);
         // Track metadata from the OS media session, only while the
         // existing "forward now-playing" setting is on.

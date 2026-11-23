@@ -463,6 +463,9 @@ pub struct AirPlaySession {
     /// The sync anchor's latency (samples): how far the write head runs
     /// ahead of what plays.
     latency_samples: u32,
+    /// The least latency the receiver said it needs (`Audio-Latency`),
+    /// samples; `None` if it said none.
+    receiver_min_samples: Option<u32>,
     timeouts: RaopTimeouts,
     /// Hold the audio socket so it isn't closed prematurely; the
     /// sender thread holds a `try_clone` for sending. Once `stop`
@@ -703,7 +706,7 @@ impl AirPlaySession {
                 }
             }
         }
-        let Some(Handshake { mut rtsp, cipher, ports: server_ports, latency: latency_samples, opener }) = handshake else {
+        let Some(Handshake { mut rtsp, cipher, ports: server_ports, latency: latency_samples, advertised, opener }) = handshake else {
             return Err(anyhow::anyhow!("{}", failed.join("; then ")));
         };
         info!(
@@ -839,6 +842,7 @@ impl AirPlaySession {
             abandon,
             opener,
             latency_samples,
+            receiver_min_samples: advertised,
             timeouts: cfg.timeouts,
             _audio_socket: audio_socket,
         })
@@ -865,6 +869,17 @@ impl AirPlaySession {
     /// The opener this session's connect used.
     pub fn opener(&self) -> Opener {
         self.opener
+    }
+
+    /// The delay this session asks the receiver for, ms: what was
+    /// configured, or the receiver's own minimum if that is more.
+    pub fn latency_ms(&self) -> u32 {
+        (self.latency_samples as u64 * 1000 / crate::WIRE_SAMPLE_RATE as u64) as u32
+    }
+
+    /// The least delay the receiver said it needs, ms, if it said.
+    pub fn receiver_min_ms(&self) -> Option<u32> {
+        self.receiver_min_samples.map(|s| (s as u64 * 1000 / crate::WIRE_SAMPLE_RATE as u64) as u32)
     }
 
     /// True once a background thread has flagged the session as dead
@@ -972,6 +987,8 @@ struct Handshake {
     cipher: Cipher,
     ports: ServerPorts,
     latency: u32,
+    /// The receiver's own `Audio-Latency`, if it stated one.
+    advertised: Option<u32>,
     opener: Opener,
 }
 
@@ -1061,7 +1078,7 @@ impl Bringup<'_> {
             ports.audio_latency,
             record_latency,
         );
-        Ok(Handshake { rtsp, cipher, ports, latency, opener })
+        Ok(Handshake { rtsp, cipher, ports, latency, advertised: advertised_latency, opener })
     }
 
     /// The opener, and the cipher it leads to. Once the receiver has

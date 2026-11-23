@@ -885,6 +885,12 @@ impl AirPlay2Session {
         self.dead.load(Ordering::Acquire)
     }
 
+    /// Whether the session runs the buffered stream, whose delay is its
+    /// own (fixed) rather than the one asked for.
+    pub fn is_buffered(&self) -> bool {
+        self.buffered_flush.is_some()
+    }
+
     /// The fault that ended the session, if one was raised. A
     /// non-retryable fault means reconnecting won't help.
     pub fn fault(&self) -> Option<Ap2Fault> {

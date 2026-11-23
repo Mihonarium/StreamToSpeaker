@@ -488,7 +488,25 @@ impl PlayerSession {
     pub fn format(&self) -> Option<AudioFormat> {
         self.shared.format.lock().unwrap().clone()
     }
+
+    /// The player's own delay (what it asks for: its minimum buffer and
+    /// output delay), ms, and the most extra delay its buffer has room
+    /// for, ms (`None` when it didn't say how much it holds).
+    pub fn delay_bounds(&self) -> (u32, Option<u32>) {
+        let state = self.shared.state.lock().unwrap().clone();
+        let fmt = self.shared.format.lock().unwrap().clone();
+        let own = fmt.as_ref().map_or(0, |f| compute_lead_us(&state, 0, 0, f) / 1000);
+        let most = fmt
+            .as_ref()
+            .filter(|_| self.shared.buffer_capacity > 0)
+            .map(|f| compute_lead_us(&state, MAX_EXTRA_MS, self.shared.buffer_capacity, f) / 1000);
+        (own.max(0) as u32, most.map(|m| (m - own).max(0) as u32))
+    }
 }
+
+/// More extra delay than any player's buffer holds: the lead it asks for
+/// is then capped by the buffer.
+const MAX_EXTRA_MS: u32 = 12_000;
 
 impl Drop for PlayerSession {
     fn drop(&mut self) {

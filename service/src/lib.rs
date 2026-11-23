@@ -9,6 +9,7 @@ pub mod sendspin;
 pub mod sendspin_app;
 pub mod app;
 pub mod audio_loop;
+pub mod delay;
 pub mod audio_source;
 pub mod equalizer;
 pub mod silence;

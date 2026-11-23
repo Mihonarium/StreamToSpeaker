@@ -810,7 +810,6 @@ pub fn run(app: Arc<App>, show_tray: bool, start_hidden: bool) -> Result<()> {
                 advanced_open: false,
                 homepod_latency_draft: None,
                 airplay_latency_draft: None,
-                speaker_latency_draft: None,
                 ma_addresses: None,
                 diagnostics_open: false,
                 diagnostics_copied_at: None,
@@ -854,8 +853,6 @@ struct StreamToSpeakerApp {
     /// The AirPlay buffer slider's value while it is dragged: saved on
     /// release, not on every frame of the drag.
     airplay_latency_draft: Option<i64>,
-    /// The same for a speaker's own AirPlay buffer: its id and value.
-    speaker_latency_draft: Option<(String, i64)>,
     /// This computer's addresses for a Music Assistant on another network,
     /// and when they were looked up.
     ma_addresses: Option<(Instant, Vec<std::net::Ipv4Addr>)>,
@@ -2749,9 +2746,7 @@ impl StreamToSpeakerApp {
         p: &Palette,
         sp: &crate::http_server::SpeakerInfo,
     ) {
-        use crate::user_config::{
-            AutoConnect, AIRPLAY_LATENCY_MS_MAX, AIRPLAY_LATENCY_MS_MIN,
-        };
+        use crate::user_config::AutoConnect;
         let before = self.app.speaker_settings(&sp.id);
         let mut st = before.clone();
         let is_airplay = sp.id.starts_with("airplay:");
@@ -2800,54 +2795,6 @@ impl StreamToSpeakerApp {
                     .size(12.0)
                     .color(p.text_secondary),
                 );
-                if is_airplay {
-                    ui.add_space(sp::S);
-                    let global = self.app.user_config.lock().unwrap().effective_airplay_latency_ms();
-                    let mut own = st.airplay_latency_ms.is_some();
-                    if ui
-                        .checkbox(&mut own, "Own AirPlay buffer for this speaker")
-                        .on_hover_text(
-                            "Overrides the AirPlay buffer in Advanced for this speaker only. \
-                             Takes effect the next time you connect.",
-                        )
-                        .changed()
-                    {
-                        st.airplay_latency_ms = own.then_some(global);
-                    }
-                    match st.airplay_latency_ms {
-                        Some(ms) => {
-                            // Saved on release, like the app-wide buffer.
-                            let saved = i64::from(ms);
-                            let mut v = match &self.speaker_latency_draft {
-                                Some((id, draft)) if *id == sp.id => *draft,
-                                _ => saved,
-                            };
-                            let mut commit = false;
-                            ui.horizontal(|ui| {
-                                commit = advanced_slider_row_commit(
-                                    ui,
-                                    p,
-                                    &mut v,
-                                    (AIRPLAY_LATENCY_MS_MIN as i64)..=(AIRPLAY_LATENCY_MS_MAX as i64),
-                                    " ms",
-                                    global as i64,
-                                    &format!("{} ms (the app setting)", global),
-                                );
-                            });
-                            self.speaker_latency_draft = (!commit && v != saved).then(|| (sp.id.clone(), v));
-                            if commit {
-                                st.airplay_latency_ms = Some(u32::try_from(v).unwrap_or(ms));
-                            }
-                        }
-                        None => {
-                            ui.label(
-                                egui::RichText::new(format!("Uses the app setting ({} ms).", global))
-                                    .size(12.0)
-                                    .color(p.text_secondary),
-                            );
-                        }
-                    }
-                }
                 if sp.manual && is_airplay {
                     ui.add_space(sp::S);
                     ui.label(

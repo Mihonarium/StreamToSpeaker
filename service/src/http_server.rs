@@ -128,6 +128,38 @@ struct HubSubscriber {
     /// Peer IP for HTTP stream clients; `None` for internal
     /// consumers (the AirPlay senders), which privacy mode never prunes.
     peer: Option<std::net::IpAddr>,
+    /// A speaker's fetch: its queue holds up to [`SPEAKER_QUEUE_FRAMES`]
+    /// of audio, however the packets are cut.
+    speaker: Option<Arc<SpeakerQueue>>,
+}
+
+/// How much audio a speaker's fetch can have queued before the stream
+/// drops packets for it: three seconds, so that delay added to the
+/// speaker (up to a second) never fills it, whatever size the packets
+/// from Windows come in.
+pub const SPEAKER_QUEUE_FRAMES: usize = 3 * WIRE_SAMPLE_RATE as usize;
+
+/// Packets a speaker's fetch can have queued, whatever their size.
+const SPEAKER_QUEUE_PACKETS: usize = 8192;
+
+/// What a speaker's fetch has queued, and what the stream couldn't queue
+/// for it.
+#[derive(Default)]
+pub struct SpeakerQueue {
+    queued_frames: std::sync::atomic::AtomicUsize,
+    dropped_frames: std::sync::atomic::AtomicU64,
+}
+
+impl SpeakerQueue {
+    /// The fetch took a packet of `frames` off its queue.
+    fn taken(&self, frames: usize) {
+        self.queued_frames.fetch_sub(frames, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Frames dropped for this fetch so far.
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped_frames.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl StreamHub {
@@ -155,25 +187,55 @@ impl StreamHub {
         // Bounded; if a subscriber stalls we drop frames rather than
         // back-pressure the audio path.
         let (tx, rx) = bounded::<PcmFrame>(128);
-        self.subscribers.lock().unwrap().push(HubSubscriber { tx, peer });
+        self.subscribers.lock().unwrap().push(HubSubscriber { tx, peer, speaker: None });
         rx
+    }
+
+    /// Subscribe a fetch by the speaker that plays, from `peer`: its queue
+    /// is bounded by the audio it holds (see [`SPEAKER_QUEUE_FRAMES`]).
+    pub fn subscribe_speaker(&self, peer: std::net::IpAddr) -> (Receiver<PcmFrame>, Arc<SpeakerQueue>) {
+        let (tx, rx) = bounded::<PcmFrame>(SPEAKER_QUEUE_PACKETS);
+        let queue = Arc::new(SpeakerQueue::default());
+        self.subscribers.lock().unwrap().push(HubSubscriber { tx, peer: Some(peer), speaker: Some(queue.clone()) });
+        (rx, queue)
     }
 
     /// Publish a PCM frame to all subscribers, dropping any whose channel
     /// is closed or full.
     pub fn publish(&self, frame: PcmFrame) {
+        use std::sync::atomic::Ordering;
+        let frames = frame.0.len() / 4;
         let mut subs = self.subscribers.lock().unwrap();
         subs.retain(|sub| {
+            if let Some(q) = &sub.speaker {
+                if q.queued_frames.fetch_add(frames, Ordering::AcqRel) + frames > SPEAKER_QUEUE_FRAMES {
+                    q.queued_frames.fetch_sub(frames, Ordering::AcqRel);
+                    q.dropped_frames.fetch_add(frames as u64, Ordering::AcqRel);
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+            }
+            let undo = || {
+                if let Some(q) = &sub.speaker {
+                    q.queued_frames.fetch_sub(frames, Ordering::AcqRel);
+                }
+            };
             match sub.tx.try_send(frame.clone()) {
                 Ok(()) => true,
                 Err(crossbeam_channel::TrySendError::Full(_)) => {
                     // Drop the frame for this slow subscriber; they'll
                     // catch up.  We keep them subscribed.
-                    self.dropped
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    undo();
+                    if let Some(q) = &sub.speaker {
+                        q.dropped_frames.fetch_add(frames as u64, Ordering::AcqRel);
+                    }
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
                     true
                 }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    undo();
+                    false
+                }
             }
         });
     }
@@ -270,6 +332,10 @@ pub struct HttpServerConfig {
     /// exempt from the shared connection budget, so other clients can't
     /// lock the speaker out.
     pub speaker_peer: Option<SpeakerPeerCallback>,
+    /// What was removed from or added to the delay of the speaker that
+    /// plays: applied to its fetches of the stream (see
+    /// `delay::catch_up`). Other clients get the stream as it is.
+    pub catch_up: Option<Arc<crate::delay::catch_up::CatchUp>>,
 }
 
 impl HttpServerConfig {
@@ -286,6 +352,7 @@ impl HttpServerConfig {
             stream_client_allowed: None,
             extra_hosts: Vec::new(),
             speaker_peer: None,
+            catch_up: None,
         }
     }
 }
@@ -355,6 +422,7 @@ pub fn start_http_server(cfg: HttpServerConfig) -> Result<u16> {
         web_access: cfg.web_access,
         stream_client_allowed: cfg.stream_client_allowed,
         speaker_peer: cfg.speaker_peer,
+        catch_up: cfg.catch_up,
         notify_lock: Mutex::new(()),
     });
     thread::Builder::new()
@@ -379,6 +447,7 @@ struct Ctx {
     web_access: Option<Arc<WebAccess>>,
     stream_client_allowed: Option<StreamClientAllowedCallback>,
     speaker_peer: Option<SpeakerPeerCallback>,
+    catch_up: Option<Arc<crate::delay::catch_up::CatchUp>>,
     hosts: HostPolicy,
     /// Event callbacks run one at a time, in arrival order, as they did
     /// when a single thread served every request.
@@ -819,7 +888,16 @@ impl Ctx {
         // frame. Tagged with the peer IP so the stream gate can cut the
         // connection off later if this client stops being allowed.
         let peer = conn.peer.ip();
-        let rx = self.hub.subscribe_from(peer);
+        // The speaker that plays gets a queue sized in audio, and what was
+        // removed from or added to its delay (each fetch from its own
+        // start); anyone else gets the stream as it is.
+        let (rx, speaker) = match &self.catch_up {
+            Some(catch_up) if conn.speaker => {
+                let (rx, queue) = self.hub.subscribe_speaker(peer);
+                (rx, Some((catch_up.listener(), queue)))
+            }
+            _ => (self.hub.subscribe_from(peer), None),
+        };
         self.hub.note_fetch(peer, profile);
         // The reader also re-asks the gate once a second while streaming,
         // so a listener that stops being allowed (streaming disabled,
@@ -827,6 +905,7 @@ impl Ctx {
         // if no explicit prune ran.
         let recheck = self.stream_client_allowed.clone().map(|cb| (cb, peer));
         let mut reader = StreamReader::new(rx, recheck, profile);
+        reader.speaker = speaker;
 
         // The active speaker may stop reading for as long as it is
         // paused and must find the stream still open afterwards. Any
@@ -1930,6 +2009,10 @@ struct StreamReader {
     /// Raw big-endian samples (L16) instead of the hub's little-endian WAV
     /// data.
     big_endian: bool,
+    /// For the speaker that plays: its delay change, and its queue.
+    speaker: Option<(crate::delay::catch_up::Listener, Arc<SpeakerQueue>)>,
+    /// Frames the stream dropped for it, as last counted.
+    dropped_seen: u64,
 }
 
 impl StreamReader {
@@ -1948,6 +2031,8 @@ impl StreamReader {
             leftover: if profile.is_wav() { wav_header_streaming().to_vec() } else { Vec::new() },
             leftover_pos: 0,
             big_endian: !profile.is_wav(),
+            speaker: None,
+            dropped_seen: 0,
         }
     }
 }
@@ -1986,7 +2071,9 @@ fn wav_header_streaming() -> [u8; 44] {
 
 impl Read for StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.leftover_pos >= self.leftover.len() {
+        // A packet the delay change took whole leaves nothing to send: the
+        // next one is taken.
+        while self.leftover_pos >= self.leftover.len() {
             // Still allowed? EOF closes the connection if not.
             if let Some((cb, peer)) = &self.gate {
                 if self.last_gate_check.elapsed() >= GATE_RECHECK {
@@ -2001,6 +2088,16 @@ impl Read for StreamReader {
             match self.rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(frame) => {
                     self.leftover = (*frame.0).clone();
+                    if let Some((listener, queue)) = self.speaker.as_mut() {
+                        queue.taken(frame.0.len() / 4);
+                        let dropped = queue.dropped_frames();
+                        if dropped > self.dropped_seen {
+                            debug!("stream: {} ms couldn't be queued for the speaker", crate::delay::frames_to_ms((dropped - self.dropped_seen) as i64));
+                            listener.dropped(dropped - self.dropped_seen);
+                            self.dropped_seen = dropped;
+                        }
+                        listener.edit(&mut self.leftover);
+                    }
                     if self.big_endian {
                         // Frames hold whole 16-bit samples.
                         for sample in self.leftover.chunks_exact_mut(2) {

@@ -279,8 +279,9 @@ fn open_again_after<T>(
     }
 }
 
-/// Everything between a packet and the hub: equalizer, silence handling,
-/// clock-skew and latency trims.
+/// Everything between a packet and the hub: equalizer, silence handling
+/// and the clock-skew trim. (A speaker's delay changes are applied to the
+/// stream of the speaker they belong to: see `delay::catch_up`.)
 struct Output {
     silence: SilenceDetector,
     eq: Equalizer,
@@ -359,30 +360,6 @@ impl Output {
             }
         }
 
-        // Runtime latency-adjust: drop / duplicate up to N frames per packet.
-        if !pkt.samples.is_empty() {
-            let pending = app.drain_frames.load(Ordering::Acquire);
-            if pending != 0 {
-                let ch = pkt.channels as usize;
-                let max_step =
-                    app.latency_adjust_step_frames.load(Ordering::Relaxed).max(1) as i64;
-                let step = pending.signum() * pending.abs().min(max_step);
-                if step > 0 {
-                    let drop_samples = (step as usize) * ch;
-                    let new_len = pkt.samples.len().saturating_sub(drop_samples);
-                    pkt.samples.truncate(new_len);
-                    app.drain_frames.fetch_sub(step, Ordering::AcqRel);
-                } else if step < 0 && pkt.samples.len() >= ch {
-                    let start = pkt.samples.len() - ch;
-                    let last_frame: Vec<i16> = pkt.samples[start..].to_vec();
-                    for _ in 0..(-step) {
-                        pkt.samples.extend_from_slice(&last_frame);
-                    }
-                    app.drain_frames.fetch_sub(step, Ordering::AcqRel);
-                }
-            }
-        }
-
         let bytes = samples_to_wav_le_bytes(&pkt.samples);
         app.hub.publish(PcmFrame(Arc::new(bytes)));
         app.packets_published_total.fetch_add(1, Ordering::Relaxed);
@@ -390,10 +367,9 @@ impl Output {
         self.packet_count_since_log += 1;
         if self.last_packet_log.elapsed() >= Duration::from_secs(10) {
             debug!(
-                "{} packets streamed in last 10s, {} subscriber(s), pending latency-adjust {} frames",
+                "{} packets streamed in last 10s, {} subscriber(s)",
                 self.packet_count_since_log,
                 app.hub.subscriber_count(),
-                app.drain_frames.load(Ordering::Relaxed),
             );
             self.packet_count_since_log = 0;
             self.last_packet_log = Instant::now();

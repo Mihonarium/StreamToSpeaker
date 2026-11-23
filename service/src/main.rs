@@ -1098,6 +1098,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
             let app2 = app.clone();
             Arc::new(move |ip| app2.is_speaker_peer(ip))
         }),
+        catch_up: Some(app.delay.catch_up()),
     })
 }
 

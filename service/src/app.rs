@@ -594,8 +594,9 @@ pub struct App {
     /// is always served (the speaker needs it); only the user-facing
     /// routes (the page under `/r/<key>/`, `/api/*`) honour this.
     pub web_access: Arc<WebAccess>,
-    /// Pending latency adjustment, in frames. + drops, − duplicates.
-    pub drain_frames: Arc<AtomicI64>,
+    /// Each speaker's delay: what was removed or added, how it applies
+    /// (see `delay`).
+    pub delay: crate::delay::DelayEngine,
     pub rate_fudge_ppm: Arc<AtomicI32>,
     pub silence_pace_ms: Arc<AtomicU64>,
     pub latency_adjust_step_frames: Arc<AtomicU32>,
@@ -966,6 +967,12 @@ impl App {
         airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     ) -> Arc<Self> {
         let web_initial = config.web_enabled;
+        // Delays kept as an earlier version kept them become each speaker's
+        // own, once (see `delay::upgrade`).
+        let mut user_config = user_config;
+        if user_config.upgrade_delays() {
+            user_config.save();
+        }
         // Seed last_speaker_id from the settings so that, even before any user
         // action, code that asks "what was the last speaker?" gets the
         // persisted answer.
@@ -984,6 +991,7 @@ impl App {
         // is disabled: any address this host owns, at the time it asks.
         let stream_gate =
             StreamGate::new(user_config.privacy_mode, streaming_enabled.clone(), is_local_address);
+        let catch_up_step = Arc::new(AtomicU32::new(4));
         let app = Arc::new(Self {
             config,
             discovery,
@@ -1000,10 +1008,10 @@ impl App {
             sound_input_lost: Mutex::new(None),
             streaming_enabled,
             web_access: WebAccess::new(),
-            drain_frames: Arc::new(AtomicI64::new(0)),
+            delay: crate::delay::DelayEngine::new(catch_up_step.clone()),
             rate_fudge_ppm: Arc::new(AtomicI32::new(0)),
             silence_pace_ms: Arc::new(AtomicU64::new(10)),
-            latency_adjust_step_frames: Arc::new(AtomicU32::new(4)),
+            latency_adjust_step_frames: catch_up_step,
             eq,
             packets_published_total: Arc::new(AtomicU64::new(0)),
             idle_silence_packets: Arc::new(AtomicU64::new(0)),
@@ -1045,6 +1053,7 @@ impl App {
                 app.record_error(format!("Couldn't turn the web UI on: {}", e));
             }
         }
+        app.delay_watch_back_offs();
         app
     }
 
@@ -1853,7 +1862,7 @@ impl App {
 
     /// Display name for any speaker id: discovered UPnP, discovered
     /// AirPlay, or manual.
-    fn speaker_name(&self, id: &str) -> Option<String> {
+    pub(crate) fn speaker_name(&self, id: &str) -> Option<String> {
         if let Some(m) = self.find_manual_speaker(id) {
             return Some(m.display_name());
         }
@@ -2512,6 +2521,24 @@ impl App {
         self.select_speaker_opts(id, false, true)
     }
 
+    /// Connect speaker `id`, which plays, again with what its settings hold
+    /// now (a delay change), on this thread: not the person's pick, never a
+    /// PIN prompt, and only while streaming is enabled. `Err(None)` while
+    /// another connect is under way.
+    pub(crate) fn connect_again(self: &Arc<Self>, id: &str) -> Result<(), Option<String>> {
+        {
+            let mut guard = self.connecting.lock().unwrap();
+            if guard.is_some() {
+                return Err(None);
+            }
+            *guard = Some(self.speaker_name(id).unwrap_or_else(|| id.to_string()));
+        }
+        let result = self.select_speaker_inner(id, false, false, None);
+        *self.connecting.lock().unwrap() = None;
+        self.clear_connecting_notice();
+        result.map_err(Some)
+    }
+
     /// `user_choice`: the user asked for this speaker now, which (re-)enables
     /// streaming up front. Either way the new session binds only if
     /// streaming is still enabled when it is up — a Disable pressed while
@@ -2687,6 +2714,8 @@ impl App {
         // The old session — and with it its privacy grant — is gone:
         // cut off any listener the allow-set no longer covers.
         self.prune_stream_clients();
+        // A delay change made while it connected applies now.
+        self.delay_session_bound();
 
         *self.last_speaker_id.lock().unwrap() = Some(actual_id.clone());
         *self.session_started.lock().unwrap() = Some((actual_id.clone(), Instant::now()));
@@ -2808,6 +2837,9 @@ impl App {
         // resolved by the caller, so the whole group is admitted, whichever
         // unit ends up fetching.)
         let grant = self.stream_gate.grant(r.stream_peers());
+        // What was removed from or added to its delay applies from its
+        // first fetch, which can come before Play is answered.
+        self.delay_for_upnp(settings_id);
         // The URLs the speaker calls back on carry the address this PC
         // has on the speaker's network, not the default-route one.
         let local_ip = self.local_ip_toward(r.ip).map_err(|e| e.to_string())?;
@@ -3134,12 +3166,12 @@ impl App {
                 // password typed for it, once.
                 let stored = !renderer.is_newcomer();
                 let password = self.airplay_password_for(&renderer);
-                let (mfi_encryption, uncompressed_alac, latency_ms, opener_hint) = {
+                let latency_ms = self.delay_for_airplay(&renderer).latency_ms;
+                let (mfi_encryption, uncompressed_alac, opener_hint) = {
                     let uc = self.user_config.lock().unwrap();
                     (
                         uc.airplay_mfi_encryption,
                         uc.airplay_uncompressed_alac,
-                        if stored { uc.airplay_latency_ms_for(&stable_id) } else { uc.effective_airplay_latency_ms() },
                         uc.speaker_settings.get(&stable_id).and_then(|s| s.airplay_opener).filter(|_| stored),
                     )
                 };
@@ -3194,15 +3226,10 @@ impl App {
                 let stable_id = renderer.stable_id();
                 // Nothing stored for a speaker goes to a newcomer.
                 let own = !renderer.is_newcomer();
-                let (prefer_realtime, stored, latency_ms, homepod_realtime, homepod_latency_ms) = {
+                let delay = self.delay_for_airplay(&renderer);
+                let (prefer_realtime, stored) = {
                     let uc = self.user_config.lock().unwrap();
-                    (
-                        uc.prefer_realtime_airplay,
-                        uc.airplay_pairings.get(&stable_id).filter(|_| own).cloned(),
-                        if own { uc.airplay_latency_ms_for(&stable_id) } else { uc.effective_airplay_latency_ms() },
-                        !uc.airplay_homepod_buffered,
-                        if own { uc.homepod_latency_ms_for(&stable_id) } else { uc.effective_homepod_latency_ms() },
-                    )
+                    (uc.prefer_realtime_airplay, uc.airplay_pairings.get(&stable_id).filter(|_| own).cloned())
                 };
                 // Parsed before anything is dialled: a damaged entry is the
                 // config's fault, not a refusal from the receiver.
@@ -3221,10 +3248,10 @@ impl App {
                     samples_rx,
                     initial_volume: Some(self.airplay_start_volume()),
                     prefer_realtime,
-                    latency_ms,
+                    latency_ms: delay.latency_ms,
                     stored_pairing,
-                    homepod_realtime,
-                    homepod_latency_ms,
+                    homepod_realtime: delay.homepod_realtime,
+                    homepod_latency_ms: delay.homepod_latency_ms,
                 }) {
                     Ok(session) => {
                         if let Some(d) = self.airplay_discovery.as_deref() {
@@ -3934,8 +3961,11 @@ impl App {
                     debug!("resync stop ignored: {}", e);
                 }
                 std::thread::sleep(Duration::from_millis(100));
-                upnp::play(&r.av_transport_control_url)
-                    .map_err(|e| format!("play failed: {:#}", e))
+                let played = upnp::play(&r.av_transport_control_url).map_err(|e| format!("play failed: {:#}", e));
+                // The speaker starts over at its own delay: what was removed
+                // or added applies again.
+                self.delay.catch_up().restarted();
+                played
             }
             Kind::AirPlay(id) => {
                 info!("resync: AirPlay tear-down + reconnect for {}", id);
@@ -4050,29 +4080,6 @@ impl App {
         )?;
         self.web_access.set_secret(secret);
         Ok(())
-    }
-
-    // -------------------------------------------------------------------
-    // Latency adjustment
-    // -------------------------------------------------------------------
-
-    /// Schedule a `ms`-millisecond latency adjustment.
-    /// `ms > 0` ⇒ drain (drop frames, lower latency).
-    /// `ms < 0` ⇒ pad (duplicate frames, higher latency).
-    /// Returns the new pending-frames counter.
-    pub fn adjust_latency(&self, ms: i32) -> i64 {
-        let frames = (ms as i64) * (WIRE_SAMPLE_RATE as i64) / 1000;
-        let new = self.drain_frames.fetch_add(frames, Ordering::AcqRel) + frames;
-        info!(
-            "latency adjust: {:+} ms ({:+} frames) → pending {} frames ({} ms)",
-            ms, frames, new, new / 44
-        );
-        new
-    }
-
-    pub fn pending_latency_ms(&self) -> i32 {
-        let f = self.drain_frames.load(Ordering::Acquire);
-        (f * 1000 / (WIRE_SAMPLE_RATE as i64)) as i32
     }
 
     // -------------------------------------------------------------------
@@ -4255,7 +4262,7 @@ impl App {
     }
 
     /// Remember a fault together with the counters just before it.
-    fn record_fault(&self, what: &str) {
+    pub(crate) fn record_fault(&self, what: &str) {
         let before = self.diagnostics_snapshot();
         *self.last_fault.lock().unwrap() = Some(Fault {
             when_unix: now_unix(),
