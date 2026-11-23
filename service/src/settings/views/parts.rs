@@ -6,7 +6,7 @@
 use egui::{Rect, Sense, Ui, Vec2};
 
 use crate::ui::button::Button;
-use crate::ui::inputs::{Choice, Switch, TextField};
+use crate::ui::inputs::{Choice, DropDown, Switch, TextField};
 use crate::ui::text::{Mark, Para, Tone};
 use crate::ui::theme::{size, Theme};
 use crate::ui::volume::Slider;
@@ -26,6 +26,28 @@ pub fn switch_line(ui: &mut Ui, label: &str, on: bool) -> Option<bool> {
 /// rest.
 pub fn control_line<R>(ui: &mut Ui, label: &str, under: Option<&str>, control: impl FnOnce(&mut Ui) -> R) -> R {
     crate::settings::widgets::row(ui, None, label, under, control)
+}
+
+/// A sentence (and a grey line under it) with a drop-down of choices. The
+/// drop-down sits at the right while it fits there at the width of its
+/// longest choice; otherwise the sentence comes first and the drop-down
+/// takes the whole width under it, so no choice is cut off.
+pub fn drop_line(ui: &mut Ui, id: impl std::hash::Hash, label: &str, under: Option<&str>, options: &[&str], chosen: usize) -> Option<usize> {
+    let t = Theme::of(ui.ctx());
+    let font = t.font(size::CONTROL);
+    let widest = options.iter().map(|o| ui.painter().layout_no_wrap((*o).to_owned(), font.clone(), t.c.text).size().x).fold(0.0, f32::max);
+    // The drop-down's arrow and padding; the room a line leaves its
+    // control (see `widgets::row`).
+    let natural = widest + 46.0;
+    let width = ui.available_width();
+    if natural <= width - 154.0 {
+        return control_line(ui, label, under, |ui| DropDown::new(id, label, options, chosen).min_width(natural).show(ui));
+    }
+    plain(ui, label);
+    if let Some(u) = under {
+        sentence(ui, u);
+    }
+    DropDown::new(id, label, options, chosen).min_width(width).show(ui)
 }
 
 /// Words in the main colour, wrapping.

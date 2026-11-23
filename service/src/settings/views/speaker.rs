@@ -15,7 +15,7 @@ use crate::model::text::Lang;
 use crate::shell::{Ask, ViewBar, ViewContent};
 use crate::ui::button::Button;
 use crate::ui::icon::Icon;
-use crate::ui::inputs::{Choice, DropDown};
+use crate::ui::inputs::Choice;
 use crate::ui::text::{Mark, Tone};
 
 use super::parts::{choices, field_line, gap, marked, sentence, sentence_links, slider_line, switch_line, thin};
@@ -213,7 +213,11 @@ impl ViewContent for SpeakerOptions {
             }
             gap(ui);
         }
+        // While it asks for a code it isn't paired any more: *Enter code…*
+        // above says what to do.
+        let asks_code = matches!(&snap.state, NowState::NeedsSecret { speaker, secret: Secret::Code } if speaker.as_str() == id);
         match &v.pairing {
+            Some(Pairing::Paired { .. }) if asks_code => {}
             Some(Pairing::Paired { on }) => {
                 let text = match on {
                     Some(d) => w!(lang, SetPairedSentenceOn, date = &words::date(lang, *d)),
@@ -339,7 +343,8 @@ impl SpeakerOptions {
             let seconds = lang.number(crate::model::text::Number { value: ((ms + 5) / 10) as i64, scale: 2 });
             sentence(ui, &w!(lang, SetMeasuredOn, speaker = name, seconds = &seconds, date = &words::date(lang, on)));
         }
-        let changeable = s.applies.is_ok() && s.limits.is_some_and(|l| l.remove_ms > 0 || l.add_ms > 0);
+        // The hint names both ways: only where both are open.
+        let changeable = s.applies.is_ok() && s.limits.is_some_and(|l| l.remove_ms > 0 && l.add_ms > 0);
         if changeable {
             sentence(ui, &w!(lang, SetSymptoms));
         }
@@ -386,7 +391,7 @@ impl SpeakerOptions {
         names.push(w!(lang, SetPresetCustom));
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let current = crate::equalizer::matching_preset(&t.eq.bands_db).and_then(|n| EQ_PRESETS.iter().position(|p| p.name == n)).unwrap_or(EQ_PRESETS.len());
-        let picked = super::parts::control_line(ui, &label, None, |ui| DropDown::new(("tone-preset", &id), &label, &refs, current).min_width(140.0).show(ui));
+        let picked = super::parts::drop_line(ui, ("tone-preset", &id), &label, None, &refs, current);
         if let Some(i) = picked.filter(|i| *i < EQ_PRESETS.len()) {
             self.port.act(Act::Tone(id.clone(), ToneAct::Preset(i)));
         }

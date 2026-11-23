@@ -11,7 +11,7 @@ use egui::Ui;
 use crate::model::snapshot::Snapshot;
 use crate::shell::{Ask, ViewBar, ViewContent};
 use crate::ui::button::Button;
-use crate::ui::inputs::{Choice, DropDown, TextField};
+use crate::ui::inputs::{Choice, TextField};
 use crate::ui::text::{Mark, Tone};
 
 use super::parts::{control_line, gap, marked, plain, sentence, thin};
@@ -109,7 +109,7 @@ impl ViewContent for MissingView {
                 options.extend(n.adapters.iter().map(|a| a.name.clone()));
                 let refs: Vec<&str> = options.iter().map(String::as_str).collect();
                 let chosen = n.chosen.as_ref().and_then(|k| n.adapters.iter().position(|a| &a.key == k)).map_or(0, |i| i + 1);
-                if let Some(i) = control_line(ui, &label, None, |ui| DropDown::new("look-on", &label, &refs, chosen).min_width(120.0).show(ui)) {
+                if let Some(i) = super::parts::drop_line(ui, "look-on", &label, None, &refs, chosen) {
                     self.port.act(Act::LookOn(if i == 0 { None } else { n.adapters.get(i - 1).map(|a| a.key.clone()) }));
                 }
             }
@@ -193,9 +193,12 @@ impl MissingView {
                 go = true;
             }
             let checking = matches!(probe, Probe::Checking { .. });
-            if Button::standard(&add).enabled(!self.address.trim().is_empty() && !checking).show(ui).clicked() {
-                go = true;
-            }
+            // At the right edge, whatever its width turns out to be.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if Button::standard(&add).enabled(!self.address.trim().is_empty() && !checking).show(ui).clicked() {
+                    go = true;
+                }
+            });
         });
         if go && !self.address.trim().is_empty() {
             self.adding = true;
@@ -223,7 +226,7 @@ impl MissingView {
             Probe::Idle => {}
         }
         if !self.by_hand {
-            if super::parts::sentence_links(ui, "", &[&w!(lang, SetByHandLink)]).is_some() {
+            if Button::link(&w!(lang, SetByHandLink)).text_size(crate::ui::theme::size::SECONDARY).show(ui).clicked() {
                 self.by_hand = true;
             }
         } else {
@@ -273,9 +276,7 @@ impl MissingView {
         let label = w!(lang, SetConnectsBy);
         let options = [w!(lang, KindAirPlay), w!(lang, SetUpnpKind)];
         let refs: Vec<&str> = options.iter().map(String::as_str).collect();
-        if let Some(i) =
-            control_line(ui, &label, None, |ui| DropDown::new("by-hand-kind", &label, &refs, if self.airplay { 0 } else { 1 }).min_width(110.0).show(ui))
-        {
+        if let Some(i) = super::parts::drop_line(ui, "by-hand-kind", &label, None, &refs, if self.airplay { 0 } else { 1 }) {
             self.airplay = i == 0;
         }
         if self.airplay {

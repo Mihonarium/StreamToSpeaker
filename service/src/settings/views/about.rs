@@ -9,11 +9,10 @@ use egui::Ui;
 use crate::model::snapshot::Snapshot;
 use crate::shell::{Ask, ViewBar, ViewContent};
 use crate::ui::button::Button;
-use crate::ui::inputs::DropDown;
 use crate::ui::text::{Mark, Tone};
 use crate::ui::theme::size;
 
-use super::parts::{control_line, gap, links, marked, plain, sentence, switch_line, thin};
+use super::parts::{control_line, gap, links, marked, plain, sentence, thin};
 use crate::settings::port::*;
 use crate::settings::words::{self, w};
 use crate::settings::{PageState, SettingsPort};
@@ -258,15 +257,13 @@ impl ViewContent for LabView {
                 crate::settings::widgets::mono(ui, &text);
             }
         }
-        let _ = switch_line;
     }
 }
 
-/// A sentence with a drop-down of choices; when the sentence and the
-/// choices don't fit one line, the drop-down takes the full width under it.
+/// A sentence with a drop-down of choices.
 fn pick_line(ui: &mut Ui, id: &str, label: &str, under: Option<&str>, options: &[String], chosen: usize) -> Option<usize> {
     let refs: Vec<&str> = options.iter().map(String::as_str).collect();
-    control_line(ui, label, under, |ui| DropDown::new(id, label, &refs, chosen).min_width(90.0).show(ui))
+    super::parts::drop_line(ui, id, label, under, &refs, chosen)
 }
 
 /// `presets` with `current` and `default` in it, in order.

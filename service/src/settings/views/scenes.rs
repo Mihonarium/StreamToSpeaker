@@ -61,6 +61,9 @@ pub fn scenes() -> Vec<Scene> {
         s("view-cant-hear-not-connected", 640.0, cant_hear_not_connected),
         s("view-cant-hear-not-asking", 760.0, cant_hear_not_asking),
         s("view-cant-hear-windows-elsewhere", 640.0, cant_hear_windows),
+        s("view-cant-hear-app-elsewhere", 640.0, cant_hear_app),
+        s("view-cant-hear-refused", 760.0, cant_hear_refused),
+        s("view-cant-hear-volume-zero", 760.0, cant_hear_zero),
         s("view-cant-hear-on-this-pc", 360.0, cant_hear_pc),
         s("view-music-assistant-off", 520.0, ma_off),
         s("view-music-assistant-setting-up", 1120.0, ma_setting_up),
@@ -400,6 +403,26 @@ fn cant_hear_not_asking(ui: &mut Ui, _: &mut Stage) {
         s.playback.taking = Some(Err(Taking::NotAsking { two_ways: true }));
         s.playback.volume = None;
     });
+}
+
+fn cant_hear_app(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-app", Scenario::Playing, |s| {
+        s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers (Realtek Audio)".into() }));
+        s.playback.connected = None;
+        s.playback.taking = None;
+        s.playback.volume = None;
+    });
+}
+
+fn cant_hear_refused(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-refused", Scenario::Playing, |s| {
+        s.playback.taking = Some(Err(Taking::Refused { device: "Kitchen Sub".into(), address: "192.168.1.51".into() }));
+        s.playback.volume = None;
+    });
+}
+
+fn cant_hear_zero(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-zero", Scenario::Playing, |s| s.playback.volume = Some(Err(Volume::Zero)));
 }
 
 fn cant_hear_windows(ui: &mut Ui, _: &mut Stage) {

@@ -12,7 +12,6 @@ use crate::model::snapshot::Snapshot;
 use crate::shell::{Ask, ViewBar, ViewContent};
 use crate::ui::button::Button;
 use crate::ui::icon::Icon;
-use crate::ui::inputs::DropDown;
 use crate::ui::text::{Mark, Tone};
 
 use super::parts::{control_line, gap, marked, sentence, switch_line, thin};
@@ -193,7 +192,7 @@ impl ViewContent for SettingsView {
             let options = [w!(lang, SetLanguageWindows, language = &w!(lang, SetEnglish)), w!(lang, SetEnglish)];
             let refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let i = if chosen.is_some() { 1 } else { 0 };
-            if let Some(i) = control_line(ui, &label, None, |ui| DropDown::new("settings-language", &label, &refs, i).min_width(120.0).show(ui)) {
+            if let Some(i) = super::parts::drop_line(ui, "settings-language", &label, None, &refs, i) {
                 self.port.act(Act::Language(if i == 0 { None } else { Some("en".into()) }));
             }
         }
