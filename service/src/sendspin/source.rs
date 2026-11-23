@@ -90,6 +90,9 @@ pub struct SourceOptions {
     /// while it is non-zero does the input report itself available and
     /// send audio.
     pub output_selected: Arc<AtomicUsize>,
+    /// The level sent, 0–100: the samples are scaled on the way out (100
+    /// leaves them as they are).
+    pub level: Arc<std::sync::atomic::AtomicU8>,
 }
 
 struct Admitted {
@@ -1290,6 +1293,24 @@ impl CaptureClock {
     }
 }
 
+/// Scale 16-bit little-endian samples to `level` (0–100) on the same
+/// curve as Windows' slider for this app's output; 100 leaves them as they
+/// are.
+pub(crate) fn scale_to_level(bytes: &mut [u8], level: u8) {
+    if level >= 100 {
+        return;
+    }
+    let gain = if level == 0 {
+        0.0
+    } else {
+        10f32.powf(crate::volume_sync::sonos_to_millibels(level as u32) as f32 / 2000.0)
+    };
+    for s in bytes.chunks_exact_mut(2) {
+        let v = i16::from_le_bytes([s[0], s[1]]) as f32 * gain;
+        s.copy_from_slice(&(v.round() as i16).to_le_bytes());
+    }
+}
+
 fn spawn_audio(sh: Arc<Shared>, conn: Arc<Conn>) {
     let _ = std::thread::Builder::new().name("sendspin-source-audio".into()).spawn(move || {
         let rx: Receiver<PcmFrame> = sh.hub.subscribe();
@@ -1357,7 +1378,8 @@ fn spawn_audio(sh: Arc<Shared>, conn: Arc<Conn>) {
                 clock.skip(drop / BYTES_PER_FRAME);
             }
             while pending.len() >= CHUNK_FRAMES * BYTES_PER_FRAME {
-                let chunk: Vec<u8> = pending.drain(..CHUNK_FRAMES * BYTES_PER_FRAME).collect();
+                let mut chunk: Vec<u8> = pending.drain(..CHUNK_FRAMES * BYTES_PER_FRAME).collect();
+                scale_to_level(&mut chunk, sh.opts.level.load(Ordering::Relaxed));
                 let local_ts = clock.next(start_us, CHUNK_FRAMES);
                 start_us += CHUNK_FRAMES as i64 * 1_000_000 / WIRE_SAMPLE_RATE as i64;
                 let server_ts = conn.filter.lock().unwrap().compute_server_time(local_ts);
@@ -1381,6 +1403,7 @@ mod tests {
             software_version: "test".into(),
             advertise: false,
             output_selected: Arc::new(AtomicUsize::new(0)),
+            level: Arc::new(std::sync::atomic::AtomicU8::new(100)),
         };
         SourceService::start(opts, StreamHub::new(), Arc::new(super::super::MemoryStore::default()))
             .unwrap()
@@ -1715,6 +1738,7 @@ mod tests {
                 software_version: "test".into(),
                 advertise: false,
                 output_selected: Arc::new(AtomicUsize::new(0)),
+                level: Arc::new(std::sync::atomic::AtomicU8::new(100)),
             },
             listener: Mutex::new(None),
             hub: StreamHub::new(),

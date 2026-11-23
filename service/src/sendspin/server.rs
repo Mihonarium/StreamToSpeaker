@@ -451,6 +451,11 @@ impl PlayerSession {
         self.shared.writer.close();
     }
 
+    /// The player says it is busy with another source now.
+    pub fn reports_busy(&self) -> bool {
+        self.shared.state.lock().unwrap().available == Some(false)
+    }
+
     /// The connection dropped and a reconnect may bring it back.
     pub fn is_dead(&self) -> bool {
         self.shared.dead.load(Ordering::SeqCst) && self.ended_by_speaker().is_none()

@@ -78,6 +78,11 @@ impl Rig {
         self.driver.core.state(&w, now)
     }
 
+    /// Rebuild the speaker list now (it is otherwise rebuilt each second).
+    fn list_now(&mut self) {
+        self.driver.list.0 = Instant::now() - LIST_EVERY * 2;
+    }
+
     fn bound_in_app(&self) -> Option<String> {
         self.app.session.lock().unwrap().as_ref().map(|s| s.stable_id())
     }
@@ -799,4 +804,194 @@ fn without_switching_the_speaker_plays_and_the_state_says_windows_did_not_switch
     );
     rig.send(Surface::Panel, Command::Play(Place::ThisPc)).unwrap();
     rig.settle();
+}
+
+// ---- first run, the test sound, the Lab, refusals, limits ----------------
+
+fn no_sign_in(_: bool) -> Result<(), String> {
+    Ok(())
+}
+
+/// First run: pick, the chime on the speaker picked, *I heard it*, then
+/// where the app lives and starting at sign-in, *Done*.
+#[test]
+fn first_run_walks_from_the_pick_to_done() {
+    let fake = plain_renderer();
+    let mut rig = Rig::on(serving_app());
+    let id = add_speaker(&rig.app, &fake);
+    rig.driver.first_run = Some(FirstRun::Pick);
+    rig.driver.start_at_sign_in = no_sign_in;
+    assert_eq!(rig.driver.snapshot(2).first_run.is_some(), true);
+
+    rig.play(Surface::Panel, &id).unwrap();
+    rig.plays_on(&id);
+    rig.settle();
+    rig.driver.look();
+    let sid = SpeakerId::new(&id);
+    assert_eq!(rig.driver.first_run, Some(FirstRun::Hear { speaker: sid.clone() }));
+    assert!(rig.app.test_sound_playing(), "the chime plays on the speaker picked");
+
+    // × pauses it until the panel opens again.
+    rig.send(Surface::Panel, Command::FirstRun(FirstRunAct::Close)).unwrap();
+    assert!(rig.driver.snapshot(3).first_run.is_none());
+    rig.send(Surface::Panel, Command::PanelShown(true)).unwrap();
+    assert!(rig.driver.snapshot(4).first_run.is_some());
+
+    rig.send(Surface::Panel, Command::FirstRun(FirstRunAct::Heard)).unwrap();
+    assert_eq!(rig.driver.first_run, Some(FirstRun::FindIt { speaker: sid.clone(), start_at_sign_in: true }));
+    rig.send(Surface::Panel, Command::FirstRun(FirstRunAct::StartAtSignIn(false))).unwrap();
+    rig.send(Surface::Panel, Command::FirstRun(FirstRunAct::Done)).unwrap();
+    assert_eq!(rig.driver.first_run, None);
+    let uc = rig.app.user_config.lock().unwrap();
+    assert!(uc.onboarding_dismissed);
+    assert!(!uc.auto_reconnect_on_launch, "the switch was off");
+    drop(uc);
+    rig.send(Surface::Panel, Command::Play(Place::ThisPc)).unwrap();
+    rig.settle();
+}
+
+/// The test sound: two short notes mixed into what plays, then nothing.
+#[test]
+fn the_test_sound_plays_where_the_sound_is_and_ends() {
+    let fake = plain_renderer();
+    let other = plain_renderer();
+    let mut rig = Rig::on(serving_app());
+    let id = add_speaker(&rig.app, &fake);
+    let second = add_speaker(&rig.app, &other);
+    rig.play(Surface::Panel, &id).unwrap();
+    rig.plays_on(&id);
+    rig.settle();
+    rig.send(Surface::Panel, Command::PlayTestSound(SpeakerId::new(&id))).unwrap();
+    assert!(rig.app.test_sound_playing());
+    // Mixed into silence: it is heard, then it ends.
+    let mut samples = vec![0i16; 44_100 * 2];
+    rig.app.mix_test_sound(&mut samples, 2);
+    let loudest = samples.iter().map(|s| s.unsigned_abs()).max().unwrap();
+    assert!(loudest > 4000, "{loudest}");
+    assert!(!rig.app.test_sound_playing(), "0.6 s, then it ends");
+    let mut after = vec![0i16; 4410];
+    rig.app.mix_test_sound(&mut after, 2);
+    assert!(after.iter().all(|s| *s == 0));
+
+    // Another speaker's test sound: it plays there, then the test sound.
+    rig.send(Surface::Panel, Command::PlayTestSound(SpeakerId::new(&second))).unwrap();
+    rig.plays_on(&second);
+    rig.settle();
+    rig.driver.look();
+    assert!(rig.app.test_sound_playing());
+    rig.send(Surface::Panel, Command::Play(Place::ThisPc)).unwrap();
+    rig.settle();
+}
+
+/// A speaker's *Never louder than*: the app's slider stops there, Windows'
+/// keys spring back to it, and the volume row shows it.
+#[test]
+fn a_speakers_limit_holds_whoever_moves_the_level() {
+    let fake = FakeRenderer::start(|req| match req.soap_action() {
+        Some("GetVolume") => Reply::soap_ok(
+            "urn:schemas-upnp-org:service:RenderingControl:1",
+            "GetVolume",
+            &[("CurrentVolume", "20")],
+        ),
+        _ => answer(req),
+    });
+    let mut rig = Rig::on(serving_app());
+    let id = add_speaker(&rig.app, &fake);
+    let mut settings = rig.app.speaker_settings(&id);
+    settings.volume_limit = Some(30);
+    rig.app.set_speaker_settings(&id, settings);
+    rig.play(Surface::Panel, &id).unwrap();
+    rig.plays_on(&id);
+    rig.settle();
+    let set = Arc::new(Mutex::new(Vec::new()));
+    let seen = set.clone();
+    rig.app.set_windows_level_through(move |level, muted| seen.lock().unwrap().push((level, muted)));
+
+    rig.send(Surface::Panel, Command::SetVolume { owner: VolumeOwner::Speaker(SpeakerId::new(&id)), level: 80 })
+        .unwrap();
+    assert_eq!(rig.app.vsync.current_level(), Some(30));
+    assert_eq!(set.lock().unwrap().last(), Some(&(30, false)), "Windows' slider follows, through Windows");
+    // Windows' keys asked for more: back to the limit.
+    rig.app.send_to_speaker(crate::volume_sync::SpeakerCommand::Volume(90));
+    assert_eq!(set.lock().unwrap().last(), Some(&(30, false)));
+    let snapshot = rig.driver.snapshot(5);
+    assert_eq!(snapshot.top.volume.as_ref().and_then(|v| v.limit), Some(30), "{:?}", snapshot.top.volume);
+    rig.send(Surface::Panel, Command::Play(Place::ThisPc)).unwrap();
+    rig.settle();
+}
+
+/// The Lab notice and *Turn off*; *What's new* once after an update.
+#[test]
+fn the_lab_and_whats_new_notices_come_and_go() {
+    let mut rig = Rig::on(serving_app());
+    assert!(!rig.driver.snapshot(2).notice.is_some_and(|n| n.kind == NoticeKind::LabOn));
+    rig.app.rate_fudge_ppm.store(500, Ordering::Relaxed);
+    rig.list_now();
+    let n = rig.driver.snapshot(3).notice;
+    assert_eq!(n.as_ref().map(|n| n.kind), Some(NoticeKind::LabOn), "{n:?}");
+    rig.send(Surface::Panel, Command::TurnOffLab).unwrap();
+    assert_eq!(rig.app.rate_fudge_ppm.load(Ordering::Relaxed), 0);
+    assert!(!rig.app.lab_on());
+
+    rig.app.user_config.lock().unwrap().last_version_seen = Some("0.0.1".into());
+    let n = rig.driver.snapshot(4).notice;
+    assert_eq!(n.as_ref().map(|n| n.kind), Some(NoticeKind::Updated), "{n:?}");
+    rig.send(Surface::Panel, Command::DismissNotice(NoticeKind::Updated)).unwrap();
+    assert!(rig.driver.snapshot(5).notice.is_none());
+}
+
+/// Devices refused the stream are listed, newest first, with their name
+/// where discovery knows it; *Allow* lets one in for this run.
+#[test]
+fn refused_devices_are_listed_and_can_be_let_in() {
+    let mut rig = Rig::on(serving_app());
+    rig.app.set_privacy_mode(true);
+    let tv: std::net::IpAddr = "192.168.1.77".parse().unwrap();
+    let phone: std::net::IpAddr = "192.168.1.78".parse().unwrap();
+    assert!(rig.app.check_stream_client(tv).is_err());
+    assert!(rig.app.check_stream_client(phone).is_err());
+    let list = rig.app.recently_refused();
+    assert_eq!(list.iter().map(|r| r.address).collect::<Vec<_>>(), [phone, tv]);
+    assert_eq!(list[0].name, "192.168.1.78");
+    rig.send(Surface::Settings, Command::AllowDevice { key: tv.to_string() }).unwrap();
+    assert!(rig.app.check_stream_client(tv).is_ok());
+    assert_eq!(rig.app.recently_refused().len(), 1);
+}
+
+/// Forget: the speaker Windows' device was named after is forgotten at
+/// once, not at the next start.
+#[test]
+fn forgetting_the_speaker_takes_effect_at_once() {
+    let fake = plain_renderer();
+    let mut rig = Rig::on(serving_app());
+    let id = add_speaker(&rig.app, &fake);
+    rig.play(Surface::Panel, &id).unwrap();
+    rig.plays_on(&id);
+    rig.settle();
+    assert_eq!(rig.driver.core.named, Some(Place::Speaker(SpeakerId::new(&id))));
+    rig.send(Surface::Settings, Command::Play(Place::ThisPc)).unwrap();
+    rig.settle();
+    rig.app.user_config.lock().unwrap().last_speaker_id = None;
+    rig.driver.look();
+    assert_eq!(rig.driver.core.named, None);
+    assert_eq!(rig.driver.snapshot(2).device_name.as_deref(), Some("Stream To Speaker"));
+}
+
+/// Music Assistant's level: the volume row sets it, it is kept, and the
+/// samples sent are scaled (full level leaves them as they are).
+#[test]
+fn the_level_sent_to_music_assistant_is_set_and_scales_the_samples() {
+    let mut rig = Rig::on(serving_app());
+    assert_eq!(rig.app.ma_level(), 100);
+    rig.send(Surface::Panel, Command::SetVolume { owner: VolumeOwner::MusicAssistant, level: 50 }).unwrap();
+    assert_eq!(rig.app.ma_level(), 50);
+    assert_eq!(rig.app.user_config.lock().unwrap().ma_level, Some(50));
+    let sample = |level| {
+        let mut b = 10_000i16.to_le_bytes().to_vec();
+        crate::sendspin::source::scale_to_level(&mut b, level);
+        i16::from_le_bytes([b[0], b[1]])
+    };
+    assert_eq!(sample(100), 10_000);
+    assert_eq!(sample(0), 0);
+    assert!((0..10_000).contains(&sample(50)), "{}", sample(50));
 }

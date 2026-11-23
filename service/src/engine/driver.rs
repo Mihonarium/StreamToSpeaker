@@ -14,9 +14,10 @@ use super::core::{Core, Do, Ended, Event, Job, Origin, Settings, World};
 use super::facts;
 use crate::app::{place_of, App};
 use crate::model::command::{
-    ticket, Command, DelayOutcome, DelayStep, Effect, NoticeKind, Open, Outcome, Refusal, Reply, Surface, Ticket,
-    VolumeOwner,
+    ticket, Command, DelayOutcome, DelayStep, Effect, FirstRunAct, NoticeKind, Open, Outcome, Refusal, Reply,
+    Surface, Ticket, VolumeOwner,
 };
+use crate::model::facts::FirstRun;
 use crate::model::facts::{ComesBack, ConnectFailure};
 use crate::model::port::{Port, PortCore, Watch, Watcher};
 use crate::model::rules::PlayedDetector;
@@ -25,6 +26,12 @@ use crate::model::text::LocalTime;
 use crate::model::{build, Snapshot};
 use crate::platform::{Platform, SystemEvent, ALL_ROLES, PLAYBACK_ROLES};
 use crate::user_config::AutoConnect;
+
+/// Windows' slider for the app's output is set through Windows' endpoint
+/// volume (on the PC where the engine knows the app's output) rather than
+/// the driver's push. `false` is the fallback if Windows' slider doesn't
+/// follow it.
+pub const LEVEL_THROUGH_WINDOWS: bool = true;
 
 /// How often the engine looks at the world when nothing else happens.
 const LOOK_EVERY: Duration = Duration::from_millis(250);
@@ -89,9 +96,30 @@ impl Engine {
         };
         let mut core = Core::new(choice, named, now);
         core.pc_output = pc_output;
+        let first_run = {
+            let mut uc = app.user_config.lock().unwrap();
+            // The first start of this version: nothing to tell about it.
+            if uc.last_version_seen.is_none() {
+                uc.last_version_seen = Some(crate::display_version().to_string());
+                uc.save();
+            }
+            (!uc.onboarding_dismissed && uc.last_speaker_id.is_none()).then_some(FirstRun::Pick)
+        };
+        if LEVEL_THROUGH_WINDOWS {
+            if let Some(ours) = platform.outputs.our_output() {
+                let outputs = platform.outputs.clone();
+                let levels = crate::latest::Latest::new("stream-to-speaker-windows-level", move |(level, muted): &(u32, bool)| {
+                    outputs.set_volume(&ours, *level as u8, *muted).is_ok()
+                });
+                app.set_windows_level_through(move |level, muted| {
+                    levels.want((level, muted));
+                });
+            }
+        }
         let opener: Arc<Mutex<Option<Opener>>> = Arc::new(Mutex::new(None));
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut driver = Driver::new(app.clone(), platform.clone(), core, tx.clone(), opener.clone(), now);
+        driver.first_run = first_run;
         let first = driver.snapshot(1);
         let port = Arc::new(PortCore::new(first));
         driver.last_facts = None;
@@ -199,6 +227,15 @@ pub(crate) struct Driver {
     upnp: Option<UpnpFetch>,
     /// The speaker whose last play was noted.
     played: Option<String>,
+    /// First run's step while it lasts.
+    pub(crate) first_run: Option<FirstRun>,
+    /// × closed first run; it shows again when the panel opens.
+    first_run_paused: bool,
+    /// Play the test sound once this speaker plays.
+    chime_when_bound: Option<crate::model::SpeakerId>,
+    /// Turns starting at sign-in on or off (Windows' Run key; tests use
+    /// their own).
+    pub(crate) start_at_sign_in: fn(bool) -> Result<(), String>,
 }
 
 impl Driver {
@@ -229,6 +266,10 @@ impl Driver {
             threads: Vec::new(),
             upnp: None,
             played: None,
+            first_run: None,
+            first_run_paused: false,
+            chime_when_bound: None,
+            start_at_sign_in: crate::autostart::set_enabled,
         }
     }
 
@@ -374,12 +415,102 @@ impl Driver {
                 }
                 self.core_command(cmd, origin_of(from), now)
             }
-            Command::PlayTestSound(_)
-            | Command::AllowDevice { .. }
-            | Command::TurnOffLab
-            | Command::DismissNotice(_)
-            | Command::FirstRun(_) => Ok(Effect::Done),
+            Command::PlayTestSound(id) => {
+                if self.core.bound() == Some(&Place::Speaker(id.clone())) {
+                    app.play_test_sound();
+                    return Ok(Effect::Done);
+                }
+                // Elsewhere: it plays there, then the test sound.
+                if origin_of(from) != Origin::Window && app.is_airplay_newcomer(id.as_str()) {
+                    return Err(Refusal::OnlyFromWindow { speaker: id.clone() });
+                }
+                self.chime_when_bound = Some(id.clone());
+                self.core_command(&Command::Play(Place::Speaker(id.clone())), origin_of(from), now)
+            }
+            Command::AllowDevice { key } => {
+                if let Ok(address) = key.parse::<std::net::IpAddr>() {
+                    app.allow_device(address);
+                }
+                Ok(Effect::Done)
+            }
+            Command::TurnOffLab => {
+                app.turn_off_lab();
+                Ok(Effect::Done)
+            }
+            Command::DismissNotice(NoticeKind::Updated) => {
+                let mut uc = app.user_config.lock().unwrap();
+                uc.last_version_seen = Some(crate::display_version().to_string());
+                uc.save();
+                Ok(Effect::Done)
+            }
+            Command::DismissNotice(NoticeKind::RefusedInGroup) => {
+                app.dismiss_refusals();
+                Ok(Effect::Done)
+            }
+            Command::DismissNotice(NoticeKind::UpdateReady) => {
+                app.snooze_update_banner(7);
+                Ok(Effect::Done)
+            }
+            Command::DismissNotice(_) => Ok(Effect::Done),
+            Command::FirstRun(act) => {
+                self.first_run_act(*act);
+                Ok(Effect::Done)
+            }
+            Command::PanelShown(true) => {
+                self.first_run_paused = false;
+                self.core_command(cmd, origin_of(from), now)
+            }
             _ => self.core_command(cmd, origin_of(from), now),
+        }
+    }
+
+    /// A person's answer in first run.
+    fn first_run_act(&mut self, act: FirstRunAct) {
+        let done = |app: &App| {
+            let mut uc = app.user_config.lock().unwrap();
+            uc.onboarding_dismissed = true;
+            uc.save();
+        };
+        match (act, self.first_run.clone()) {
+            (FirstRunAct::NotNow, Some(_)) => {
+                self.first_run = None;
+                done(&self.app);
+            }
+            (FirstRunAct::Close, Some(_)) => self.first_run_paused = true,
+            (FirstRunAct::PlayChimeAgain, Some(FirstRun::Hear { .. })) => self.app.play_test_sound(),
+            (FirstRunAct::Heard, Some(FirstRun::Hear { speaker })) => {
+                self.first_run = Some(FirstRun::FindIt { speaker, start_at_sign_in: true });
+            }
+            (FirstRunAct::StartAtSignIn(on), Some(FirstRun::FindIt { speaker, .. })) => {
+                self.first_run = Some(FirstRun::FindIt { speaker, start_at_sign_in: on });
+            }
+            (FirstRunAct::Done, Some(FirstRun::FindIt { start_at_sign_in, .. })) => {
+                if let Err(e) = (self.start_at_sign_in)(start_at_sign_in) {
+                    warn!("couldn't change start at sign-in: {}", e);
+                }
+                {
+                    let mut uc = self.app.user_config.lock().unwrap();
+                    uc.auto_reconnect_on_launch = start_at_sign_in;
+                }
+                self.first_run = None;
+                done(&self.app);
+            }
+            _ => {}
+        }
+    }
+
+    /// First run moves on when its speaker plays: the chime, and the
+    /// question whether it was heard. A test sound asked for elsewhere
+    /// plays once its speaker does.
+    fn on_bound(&mut self) {
+        let Some(Place::Speaker(id)) = self.core.bound().cloned() else { return };
+        if self.first_run == Some(FirstRun::Pick) {
+            self.app.play_test_sound();
+            self.first_run = Some(FirstRun::Hear { speaker: id.clone() });
+        }
+        if self.chime_when_bound.as_ref() == Some(&id) {
+            self.chime_when_bound = None;
+            self.app.play_test_sound();
         }
     }
 
@@ -411,8 +542,14 @@ impl Driver {
                     debug!("couldn't set this PC's level: {}", e);
                 }
             }
-            // The level sent to Music Assistant isn't scaled yet.
-            VolumeOwner::MusicAssistant => {}
+            VolumeOwner::MusicAssistant => {
+                if let Some(level) = level {
+                    self.app.set_ma_level(level);
+                }
+                if muted == Some(true) {
+                    self.app.set_ma_level(0);
+                }
+            }
         }
     }
 
@@ -642,17 +779,18 @@ impl Driver {
         let reconnecting_for_delay = app
             .delay_status()
             .is_some_and(|d| matches!(d.progress, crate::delay::Progress::Reconnecting { .. }));
-        let (info, fetch) = {
+        let (info, fetch, busy_elsewhere) = {
             let guard = app.session.lock().unwrap();
             let info =
                 guard.as_ref().map(|s| (s.stable_id(), s.is_dead(), s.final_fault(), s.ended_by_speaker(), upnp_info(s)));
+            let busy_elsewhere = guard.as_ref().is_some_and(|s| s.reports_busy());
             let fetch = match guard.as_ref() {
                 Some(crate::app::ActiveSession::Upnp(r)) => {
                     Some((r.stream_given_at, r.played_at, r.renderer.stream_peers()))
                 }
                 _ => None,
             };
-            (info, fetch)
+            (info, fetch, busy_elsewhere)
         };
         let mut events = Vec::new();
         match (&info, self.core.bound().cloned()) {
@@ -672,6 +810,10 @@ impl Driver {
             _ => {}
         }
         let bound_here = matches!((&info, self.core.bound()), (Some((id, ..)), Some(b)) if place_of(id) == *b);
+        // A Sendspin speaker that says it plays another source now.
+        if bound_here && busy_elsewhere {
+            events.push(Event::Taken);
+        }
         match fetch {
             Some((given_at, played_at, peers)) if bound_here => {
                 if self.upnp.as_ref().map(|u| u.given_at) != Some(given_at) {
@@ -734,6 +876,27 @@ impl Driver {
         self.execute(dos);
         self.remember_level(now);
         self.remember_places();
+        self.keep_within_limit();
+        self.on_bound();
+        // Forget: the speaker Windows' device was named after is gone.
+        if matches!(self.core.named, Some(Place::Speaker(_)))
+            && self.app.user_config.lock().unwrap().last_speaker_id.is_none()
+        {
+            self.core.named = None;
+        }
+    }
+
+    /// The bound speaker never plays above its limit, whoever moved it
+    /// (its own app, its buttons).
+    fn keep_within_limit(&mut self) {
+        let Some(Place::Speaker(id)) = self.core.bound().cloned() else { return };
+        let (Some(limit), Some(level)) = (self.app.volume_limit(id.as_str()), self.app.vsync.current_level()) else {
+            return;
+        };
+        if level > limit as u32 {
+            info!("{} went above its limit ({} > {}): back to {}", id.as_str(), level, limit, limit);
+            self.app.set_speaker_volume(limit as u32);
+        }
     }
 
     /// This PC's output and the speaker that plays, across restarts.
@@ -787,7 +950,9 @@ impl Driver {
     pub(crate) fn snapshot(&mut self, version: u64) -> Snapshot {
         let now = Instant::now();
         let w = self.world(now);
-        let facts = facts::facts(&self.app, &self.platform, &self.core, &w, now, self.started, self.list.1.clone());
+        let first_run = if self.first_run_paused { None } else { self.first_run.clone() };
+        let facts =
+            facts::facts(&self.app, &self.platform, &self.core, &w, now, self.started, self.list.1.clone(), first_run);
         let snapshot = build(&facts, version);
         self.last_facts = Some(facts);
         snapshot
@@ -797,7 +962,9 @@ impl Driver {
     pub(crate) fn publish(&mut self, port: &PortCore) -> Arc<Snapshot> {
         let now = Instant::now();
         let w = self.world(now);
-        let facts = facts::facts(&self.app, &self.platform, &self.core, &w, now, self.started, self.list.1.clone());
+        let first_run = if self.first_run_paused { None } else { self.first_run.clone() };
+        let facts =
+            facts::facts(&self.app, &self.platform, &self.core, &w, now, self.started, self.list.1.clone(), first_run);
         let peak = self.platform.outputs.our_output().map(|o| self.platform.sessions.peak(&o)).unwrap_or(0.0);
         port.set_level(if w.sending { peak.max(0.05) } else { 0.0 });
         if self.last_facts.as_ref() == Some(&facts) {
