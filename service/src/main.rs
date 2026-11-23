@@ -756,14 +756,6 @@ fn run(cli: Cli) -> Result<()> {
     #[cfg(windows)]
     spawn_driver_event_consumer(app.clone(), &cli);
 
-    // The driver's device in Windows' sound settings is named after the
-    // speaker being played on ("Stream To Speaker → Kitchen"), and only
-    // while it is.
-    #[cfg(windows)]
-    if uses_driver {
-        app.follow_endpoint_label(stream_to_speaker::endpoint_name::update_endpoint_name);
-    }
-
     // Once-a-day "newer release on GitHub?" check (Advanced toggle; a
     // dev build without a baked release tag never checks).
     app.spawn_update_checker();
@@ -859,12 +851,7 @@ fn run(cli: Cli) -> Result<()> {
         });
         run_gui_mode(app, engine, &cli)
     };
-    // Nothing plays on a speaker any more: the device's plain name.
-    #[cfg(windows)]
-    if uses_driver {
-        stream_to_speaker::endpoint_name::update_endpoint_name_within(None, Duration::from_secs(1));
-    }
-    #[cfg(not(windows))]
+    // The platform names the app's device (and "not running" at quit).
     let _ = uses_driver;
     ran
 }
@@ -979,7 +966,6 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
 
 fn start_http(app: &Arc<App>) -> Result<u16> {
     let gena_callback = {
-        let vsync = app.vsync.clone();
         let transport = app.clone();
         let pusher = build_driver_volume_pusher();
         let pusher = pusher.map(Arc::new);
@@ -994,20 +980,10 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
                 transport.note_transport(change);
             }
             if let Some(change) = parse_rendering_notify(body) {
-                // Set our node's dB to the linear position for the
-                // speaker's percent (Windows then shows the slider at the
-                // same %), keeping level and mute consistent.
-                if let Some((mb, muted)) = vsync.speaker_event(change.volume, change.mute) {
-                    info!(
-                        "speaker -> windows: volume {:?} mute {:?} (mb={}, muted={})",
-                        change.volume, change.mute, mb, muted
-                    );
-                    if let Some(p) = pusher.as_ref() {
-                        if let Err(e) = p.push(mb, muted) {
-                            warn!("failed to push volume/mute to driver: {}", e);
-                        }
-                    }
-                }
+                // A level the speaker reports reaches Windows' slider the
+                // app's way (the endpoint, else the driver's push).
+                info!("speaker -> windows: volume {:?} mute {:?}", change.volume, change.mute);
+                transport.speaker_reported_level(change.volume, change.mute);
             }
         }) as Arc<dyn Fn(&str, &str) + Send + Sync>
     };
