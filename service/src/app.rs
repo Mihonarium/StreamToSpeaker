@@ -4720,8 +4720,9 @@ const WAITING_NOTICE_AFTER: Duration = Duration::from_secs(3);
 
 /// What a renderer is offered: this PC's stream address on its network
 /// (`http://<ip>:<port>`), the stream profile it played last time, if
-/// any, the metadata's buffer hint, and how long the connect may take
-/// ([`CONNECT_BUDGET`] in the app).
+/// any, and how long the connect may take ([`CONNECT_BUDGET`] in the
+/// app). `initial_buffer_ms` (`--initial-buffer-ms`) reaches the metadata
+/// builder, which leaves it out: no renderer is sent a buffer hint.
 pub struct StreamOffer {
     pub base_url: String,
     pub remembered: Option<StreamProfile>,

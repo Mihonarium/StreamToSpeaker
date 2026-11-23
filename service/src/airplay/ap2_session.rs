@@ -330,8 +330,9 @@ impl AirPlay2Session {
         // and seemingly the only kind current Sonos firmware truly plays)
         // when the receiver advertises bit 40 and we're on PTP; realtime
         // (type 96, UDP) otherwise. The buffered codec is AAC-LC via the
-        // Windows-provided Media Foundation encoder — iOS's buffered codec,
-        // the only one field-proven on Sonos. Without that encoder (Windows
+        // Windows-provided Media Foundation encoder — what Apple's senders
+        // send as buffered audio, to a Sonos too; this app's buffered AAC
+        // has not been heard on a Sonos. Without that encoder (Windows
         // N editions without the Media Feature Pack) the session is the
         // realtime one a person who chose realtime gets; a refused buffered
         // SETUP falls back to realtime too. Every rejection is visible.
