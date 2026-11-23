@@ -360,6 +360,7 @@ impl Output {
             }
         }
 
+        app.mix_test_sound(&mut pkt.samples, pkt.channels);
         let bytes = samples_to_wav_le_bytes(&pkt.samples);
         app.hub.publish(PcmFrame(Arc::new(bytes)));
         app.packets_published_total.fetch_add(1, Ordering::Relaxed);

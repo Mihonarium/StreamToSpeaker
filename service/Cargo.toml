@@ -150,6 +150,14 @@ windows = { version = "0.58", features = [
     # (title/artist/album) for the opt-in metadata-forwarding feature.
     "Foundation",
     "Media_Control",
+    # Core Audio for the platform seam (src/platform/win.rs): Windows'
+    # outputs, their names and levels, and which apps play where.
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
 ] }
 # GUI: native window + system tray. Windows-only for now since the
 # kernel driver is anyway Windows-only.
@@ -187,7 +195,8 @@ features = [
     "Win32_UI_Accessibility",
     "Win32_UI_Shell",
     "Win32_Graphics_Dwm",
-    # The monitors, their work areas and scales, for the panel's place.
+    # The monitors, their work areas and scales, for the panel's place;
+    # the hidden window that hears sleep, wake and sign-out.
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",

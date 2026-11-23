@@ -19,6 +19,7 @@
 use anyhow::{bail, Result};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -39,8 +40,8 @@ const S_FALSE: HRESULT = 1;
 const RPC_E_CHANGED_MODE: HRESULT = -2147417850; // 0x80010106
 
 // IPolicyConfig — undocumented but stable Vista+. Documented usage
-// in github.com/frgnca/AudioDeviceCmdlets and others. We only need
-// SetPropertyValue (vtable slot 12).
+// in github.com/frgnca/AudioDeviceCmdlets and others. We need
+// SetPropertyValue (vtable slot 12) and SetDefaultEndpoint (slot 13).
 const CLSID_POLICY_CONFIG_CLIENT: GUID = GUID {
     data1: 0x870af99c,
     data2: 0x171d,
@@ -81,8 +82,8 @@ struct PropVariant {
     _data2: i32,
 }
 
-// Vtable — only SetPropertyValue is typed. Padding fills the 13
-// IPolicyConfig slots; SetPropertyValue is at index 12.
+// Vtable — only the slots called are typed. Padding fills the others;
+// SetPropertyValue is at index 12, SetDefaultEndpoint at 13.
 #[repr(C)]
 struct IPolicyConfigVtbl {
     query_interface: unsafe extern "system" fn(
@@ -108,7 +109,7 @@ struct IPolicyConfigVtbl {
         *const PropertyKey,
         *const PropVariant,
     ) -> HRESULT,
-    _slot13: *const c_void,
+    set_default_endpoint: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> HRESULT,
     _slot14: *const c_void,
 }
 
@@ -123,18 +124,23 @@ fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Set once the platform seam names the device ("Kitchen (Stream To
+/// Speaker)"): from then on the older label path does nothing.
+static PLATFORM_NAMES_IT: AtomicBool = AtomicBool::new(false);
+
+/// The platform seam names the device from now on.
+pub(crate) fn platform_names_the_device() {
+    PLATFORM_NAMES_IT.store(true, Ordering::Release);
+}
+
 /// One worker renames the device, always to the latest name asked for:
 /// renames asked for in quick succession (a bind, then Disable) can't
 /// finish out of order, and a name counts as done only once it was set.
-fn renames() -> &'static Latest<Option<String>> {
-    static RENAMES: OnceLock<Latest<Option<String>>> = OnceLock::new();
+fn renames() -> &'static Latest<String> {
+    static RENAMES: OnceLock<Latest<String>> = OnceLock::new();
     RENAMES.get_or_init(|| {
-        Latest::new("stream-to-speaker-rename-endpoint", |speaker: &Option<String>| {
-            let new_name = match speaker {
-                Some(s) => format!("Stream To Speaker{}{}", ARROW, s),
-                None => "Stream To Speaker".to_string(),
-            };
-            match do_update(&new_name) {
+        Latest::new("stream-to-speaker-rename-endpoint", |new_name: &String| {
+            match do_update(new_name) {
                 Ok(()) => true,
                 Err(e) => {
                     // Warn, not debug. This is cosmetic enough to ignore at
@@ -155,14 +161,45 @@ fn renames() -> &'static Latest<Option<String>> {
 /// caller does not need to handle the error. Returns at once: the whole
 /// thing (registry scan, COM init, IPC) can take 100+ ms.
 pub fn update_endpoint_name(active_speaker: Option<&str>) {
-    renames().want(active_speaker.map(str::to_string));
+    if PLATFORM_NAMES_IT.load(Ordering::Acquire) {
+        return;
+    }
+    renames().want(label(active_speaker));
 }
 
 /// [`update_endpoint_name`], waiting up to `max` for the rename: at quit,
 /// where the process would otherwise end it half-way.
 pub fn update_endpoint_name_within(active_speaker: Option<&str>, max: Duration) {
-    let ticket = renames().want(active_speaker.map(str::to_string));
+    if PLATFORM_NAMES_IT.load(Ordering::Acquire) {
+        return;
+    }
+    let ticket = renames().want(label(active_speaker));
     renames().wait(ticket, max);
+}
+
+fn label(active_speaker: Option<&str>) -> String {
+    match active_speaker {
+        Some(s) => format!("Stream To Speaker{}{}", ARROW, s),
+        None => "Stream To Speaker".to_string(),
+    }
+}
+
+/// Name the device `name`, as it is; returns at once. The ticket waits
+/// for it (see [`wait_for_rename`]).
+pub(crate) fn rename_endpoint(name: &str) -> u64 {
+    renames().want(name.to_string())
+}
+
+/// Wait up to `max` for rename `ticket` to be done.
+pub(crate) fn wait_for_rename(ticket: u64, max: Duration) {
+    renames().wait(ticket, max);
+}
+
+/// Name the device `name` now, on this thread, without the worker: for a
+/// crash and for Windows ending the session, where nothing else will run.
+pub(crate) fn rename_endpoint_now(name: &str) -> Result<()> {
+    let Some(endpoint_id) = find_our_endpoint_id()? else { bail!("no Stream To Speaker endpoint") };
+    set_endpoint_friendly_name(&endpoint_id, name)
 }
 
 fn do_update(new_name: &str) -> Result<()> {
@@ -244,7 +281,7 @@ fn read_string_value(key: HKEY, pkey: &str) -> Option<String> {
 /// (`{0.0.0.00000000}.{<guid>}`) of the first endpoint whose
 /// DeviceDesc contains "Stream To Speaker". Returns None if no such
 /// endpoint exists.
-fn find_our_endpoint_id() -> Result<Option<String>> {
+pub(crate) fn find_our_endpoint_id() -> Result<Option<String>> {
     let base = to_wide_null(r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render");
     let mut render_key: HKEY = ptr::null_mut();
     let r = unsafe {
@@ -343,6 +380,52 @@ struct CloseKeyOnDrop(HKEY);
 impl Drop for CloseKeyOnDrop {
     fn drop(&mut self) {
         unsafe { RegCloseKey(self.0) };
+    }
+}
+
+/// Make `endpoint_id` Windows' default output for `role` (0 console, 1
+/// multimedia, 2 communications), through the same interface Sound
+/// settings uses.
+pub(crate) fn set_default_endpoint(endpoint_id: &str, role: i32) -> Result<()> {
+    with_policy_config(|pc| {
+        let id = to_wide_null(endpoint_id);
+        // SAFETY: `pc` is a live IPolicyConfig from CoCreateInstance (see
+        // `with_policy_config`), and `id` is a NUL-terminated UTF-16 string
+        // that outlives the call.
+        let hr = unsafe { ((*(*pc).vtbl).set_default_endpoint)(pc as *mut c_void, id.as_ptr(), role) };
+        if hr < 0 {
+            bail!("IPolicyConfig::SetDefaultEndpoint: 0x{:08x}", hr);
+        }
+        Ok(())
+    })
+}
+
+/// Run `f` with an IPolicyConfig, COM initialised on this thread for the
+/// call (an apartment already set up is used as it is).
+fn with_policy_config(f: impl FnOnce(*mut IPolicyConfig) -> Result<()>) -> Result<()> {
+    // SAFETY: CoInitializeEx and CoUninitialize are balanced below;
+    // CoCreateInstance writes one interface pointer, released before the
+    // closure returns and never used after.
+    unsafe {
+        let hr = CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let initialized_here = hr == S_OK || hr == S_FALSE;
+        if hr != S_OK && hr != S_FALSE && hr != RPC_E_CHANGED_MODE {
+            bail!("CoInitializeEx: 0x{:08x}", hr);
+        }
+        let mut client: *mut c_void = ptr::null_mut();
+        let hr = CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, ptr::null_mut(), CLSCTX_ALL, &IID_I_POLICY_CONFIG, &mut client);
+        let result = if hr < 0 {
+            Err(anyhow::anyhow!("CoCreateInstance(PolicyConfig): 0x{:08x}", hr))
+        } else {
+            let pc = client as *mut IPolicyConfig;
+            let r = f(pc);
+            ((*(*pc).vtbl).release)(pc as *mut c_void);
+            r
+        };
+        if initialized_here {
+            CoUninitialize();
+        }
+        result
     }
 }
 

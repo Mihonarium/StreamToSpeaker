@@ -76,6 +76,8 @@ pub struct SendspinAppState {
     pub(crate) discovery_allowed: AtomicBool,
     /// Live [`MaOutputSession`]s (Music Assistant is the output while > 0).
     pub(crate) ma_output: Arc<AtomicUsize>,
+    /// The level this PC sends to Music Assistant, 0–100.
+    pub(crate) ma_level: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Speaker-list id of the "Music Assistant" output.
@@ -476,6 +478,7 @@ impl App {
             software_version: crate::display_version().to_string(),
             advertise: true,
             output_selected: self.sendspin.ma_output.clone(),
+            level: self.sendspin.ma_level.clone(),
         };
         let svc = SourceService::start(opts, self.hub.clone(), self.sendspin_store()).map_err(|e| format!("{:#}", e))?;
         info!("Music Assistant input enabled (port {})", svc.port());
