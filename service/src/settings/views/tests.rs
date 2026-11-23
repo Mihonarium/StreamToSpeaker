@@ -235,6 +235,11 @@ fn the_delay_block_and_the_choice_send_the_engines_commands() {
     assert_eq!(h.asks(), vec![Asked::Command(Command::ChangeDelay { speaker: sid("kitchen"), step: DelayStep::Remove(25) })]);
     assert!(h.has("Kitchen’s own delay is about 0.2 s."));
     assert!(h.shows("Sound behind the picture?"));
+    // Another amount, typed, then Enter.
+    h.click("Other amount…");
+    h.type_text("40");
+    h.key(egui::Key::Enter);
+    assert_eq!(h.asks(), vec![Asked::Command(Command::ChangeDelay { speaker: sid("kitchen"), step: DelayStep::Remove(40) })]);
     let mut h = speaker("office");
     h.click("Short delay");
     assert_eq!(h.asks(), vec![Asked::Command(Command::UseDelayChoice { speaker: sid("office"), choice: crate::model::facts::DelayChoice::Short })]);

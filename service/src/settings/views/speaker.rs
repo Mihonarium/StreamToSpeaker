@@ -29,7 +29,7 @@ use crate::settings::{PageState, SettingsPort};
 pub struct SpeakerOptions {
     port: Arc<dyn SettingsPort>,
     id: String,
-    delay: crate::ui::delay::DelayState,
+    delay: crate::panel::delay_block::BlockState,
     st: PageState,
     /// *Forget* was clicked: the view asks first.
     forget_asked: bool,
@@ -47,13 +47,12 @@ enum BarButton {
 
 impl SpeakerOptions {
     pub fn new(port: Arc<dyn SettingsPort>, id: &str) -> Self {
-        SpeakerOptions { port, id: id.to_string(), delay: crate::ui::delay::DelayState::opened(), st: PageState::default(), forget_asked: false, gone: false }
+        SpeakerOptions { port, id: id.to_string(), delay: Default::default(), st: PageState::default(), forget_asked: false, gone: false }
     }
 
     /// With the amount field of the delay open (pictures).
     pub fn with_amount(mut self, digits: &str) -> Self {
-        self.delay = crate::ui::delay::DelayState::with_amount(digits, false);
-        self.delay.set_open(true);
+        self.delay = crate::panel::delay_block::BlockState::with_amount(digits);
         self
     }
 
@@ -314,8 +313,8 @@ impl SpeakerOptions {
             }
             gap(ui);
         }
-        if let Some(block) = panel_delay_for(lang, &self.id, name, d) {
-            for c in crate::panel::delay_block(ui, &block, &mut self.delay) {
+        if let Some((block, view)) = panel_delay_for(lang, &self.id, name, d) {
+            for c in crate::panel::delay_block::block(ui, lang, &block, Some(&view), &mut self.delay).commands {
                 ask(Ask::Command(c));
             }
         }
@@ -468,7 +467,7 @@ fn group_words(lang: Lang, name: &str, g: &Group) -> String {
 /// The panel's delay block for this speaker, from the delay engine's
 /// status: the same block, words and commands the panel has for the
 /// speaker that plays.
-pub fn panel_delay_for(lang: Lang, id: &str, name: &str, d: &DelayCard) -> Option<PanelDelay> {
+pub fn panel_delay_for(lang: Lang, id: &str, name: &str, d: &DelayCard) -> Option<(PanelDelay, crate::model::delay::DelayView)> {
     use crate::model::facts::{Applies as A, ChoiceFacts, DelayChoice as C, DelayFacts, DelayNote as N, DelayRange, DelaySteps, Progress as P, SpeakerDelay};
     let s = &d.status;
     let applies = match s.applies {
@@ -515,5 +514,5 @@ pub fn panel_delay_for(lang: Lang, id: &str, name: &str, d: &DelayCard) -> Optio
         Progress::Reconnecting { from_ms } => Some((from_ms, s.change_ms)),
         _ => None,
     };
-    Some(crate::model::delay::panel_delay(lang, &view, &facts, reconnecting))
+    Some((crate::model::delay::panel_delay(lang, &view, &facts, reconnecting), view))
 }
