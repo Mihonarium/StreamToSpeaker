@@ -488,7 +488,12 @@ impl Driver {
             self.threads.push(t);
         } else {
             if let Some(id) = connect_id(&job_place) {
-                self.app.engine_connect_ended(&id, gen, Err("No thread was free to connect. Try again in a moment.".into()));
+                let name = self.app.speaker_name(&id).unwrap_or_else(|| id.clone());
+                let words = format!(
+                    "Stream To Speaker couldn't start connecting to {name}: this PC is short of resources. Try again in \
+                     a moment."
+                );
+                self.app.engine_connect_ended(&id, gen, Err(words));
             }
             let _ = self.tx.send(Input::Event(Event::Ended { gen, ended: Ended::Failed(ConnectFailure::CouldntStart) }));
         }
@@ -750,7 +755,10 @@ fn connect_id(place: &Place) -> Option<String> {
 /// words for a caller waiting on it.
 fn connect_job(app: &Arc<App>, job: &Job, stage: &dyn Fn(ConnectStage)) -> (Ended, Result<(), String>) {
     let Some(id) = connect_id(&job.place) else { return (Ended::Cancelled, Ok(())) };
-    let superseded = || (Ended::Cancelled, Err("A newer choice replaced this one.".to_string()));
+    let superseded = || {
+        let name = app.speaker_name(&id).unwrap_or_else(|| id.clone());
+        (Ended::Cancelled, Err(format!("Stopped connecting to {name}: something else was chosen meanwhile.")))
+    };
     if job.check_busy {
         if let Some(other_pc) = busy(app, &id) {
             let lang = crate::model::text::Lang::English;
