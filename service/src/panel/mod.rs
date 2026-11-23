@@ -333,8 +333,13 @@ fn first_run_controls(ui: &mut Ui, f: &FirstRunWords, out: &mut PanelOutput) {
             }
             if let Some(l) = &f.link {
                 ui.add_space(4.0);
-                ui.allocate_ui_with_layout(Vec2::new(0.0, 32.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if Button::link(&l.label).show(ui).clicked() {
+                // Its own width, so that it wraps to a line of its own when
+                // it doesn't fit beside the buttons.
+                let row = ui.max_rect().width();
+                let font = Theme::of(ui.ctx()).font(size::SECONDARY);
+                let w = ui.fonts(|fo| fo.layout_no_wrap(l.label.clone(), font, Color32::PLACEHOLDER).size().x).min(row);
+                ui.allocate_ui_with_layout(Vec2::new(w, 32.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if Button::link(&l.label).max_width(row).show(ui).clicked() {
                         out.commands.push(l.command.clone());
                     }
                 });

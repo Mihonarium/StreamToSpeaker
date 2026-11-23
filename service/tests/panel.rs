@@ -1,14 +1,17 @@
 //! The panel driven like a person would drive it, on the scripted engine:
 //! every control sends exactly the command the snapshot gives it; the
 //! keyboard reaches everything in the order Windows' flyouts use; and the
-//! layout holds at 200 %, with long names and with Chinese names.
+//! layout holds at 200 %, with long names, with Chinese names and with
+//! every word a third longer.
 
 use egui::output::OutputEvent;
 use egui::{Event, Key, Modifiers, Pos2, Rect, Shape, Vec2};
 use stream_to_speaker::model::command::Command;
 use stream_to_speaker::model::port::Port;
 use stream_to_speaker::model::scripted::{Names, Scenario, ScriptedEngine};
-use stream_to_speaker::model::snapshot::{Snapshot, Third};
+use stream_to_speaker::model::delay::DelayBody;
+use stream_to_speaker::model::places::{Row, RowStatus};
+use stream_to_speaker::model::snapshot::{Button as ModelButton, Snapshot, Third};
 use stream_to_speaker::panel::{show, PanelOutput, PanelState, WIDTH};
 use stream_to_speaker::ui::preview;
 use stream_to_speaker::ui::theme::Mode;
@@ -326,20 +329,134 @@ fn the_arrow_keys_change_the_delay_on_the_closed_line() {
     assert!(!h.state.delay.is_open(), "the keys work without opening it");
 }
 
+/// `s` a third longer, as words often are in other languages: the start
+/// of it again, after a space so it can wrap.
+fn third_longer(s: &mut String) {
+    let n = s.chars().count();
+    if n == 0 {
+        return;
+    }
+    let more: String = s.chars().take(n.div_ceil(3)).collect();
+    s.push(' ');
+    s.push_str(&more);
+}
+
+fn longer_button(b: &mut ModelButton) {
+    third_longer(&mut b.label);
+}
+
+fn longer_row(r: &mut Row) {
+    third_longer(&mut r.title);
+    if let Some(RowStatus::Text(t)) = &mut r.status {
+        third_longer(t);
+    }
+    if let Some(e) = &mut r.error {
+        third_longer(&mut e.text);
+        longer_button(&mut e.retry);
+    }
+    if let Some(q) = &mut r.question {
+        third_longer(&mut q.title);
+        third_longer(&mut q.line);
+        longer_button(&mut q.confirm);
+        longer_button(&mut q.cancel);
+    }
+    for m in &mut r.menu {
+        third_longer(&mut m.label);
+    }
+}
+
+/// Every word the panel shows a third longer. Rows' titles are names, and
+/// grow too, so a name and the words around it both get longer.
+fn longer(snap: &Snapshot) -> Snapshot {
+    let mut s = snap.clone();
+    let top = &mut s.top;
+    third_longer(&mut top.sentence);
+    for t in [&mut top.detail, &mut top.note].into_iter().flatten() {
+        third_longer(t);
+    }
+    top.actions.iter_mut().for_each(longer_button);
+    if let Some(v) = &mut top.volume {
+        for t in [&mut v.caption].into_iter().flatten() {
+            third_longer(t);
+        }
+    }
+    match &mut top.third {
+        Some(Third::Text(t)) => third_longer(t),
+        Some(Third::Delay(d)) => {
+            third_longer(&mut d.label);
+            match &mut d.body {
+                DelayBody::Buttons { remove_large, remove_small, add_large, add_small } => {
+                    [remove_large, remove_small, add_large, add_small].into_iter().for_each(longer_button);
+                }
+                DelayBody::Fixed { text, action } => {
+                    third_longer(text);
+                    longer_button(action);
+                }
+            }
+            if let Some(l) = &mut d.line {
+                third_longer(&mut l.text);
+                l.action.iter_mut().for_each(longer_button);
+            }
+            d.reset.iter_mut().for_each(longer_button);
+        }
+        None => {}
+    }
+    if let Some(fr) = &mut s.first_run {
+        third_longer(&mut fr.sentence);
+        third_longer(&mut fr.detail);
+        fr.actions.iter_mut().for_each(longer_button);
+        fr.link.iter_mut().chain(fr.not_now.iter_mut()).for_each(longer_button);
+        if let Some(sw) = &mut fr.switch {
+            third_longer(&mut sw.label);
+        }
+        fr.looking_more.iter_mut().for_each(third_longer);
+    }
+    let list = &mut s.list;
+    if let Some(se) = &mut list.searching {
+        third_longer(&mut se.title);
+        if let Some(nf) = &mut se.none_found {
+            third_longer(&mut nf.title);
+            nf.causes.iter_mut().for_each(third_longer);
+            nf.buttons.iter_mut().for_each(longer_button);
+        }
+    }
+    longer_row(&mut list.this_pc);
+    list.speakers.iter_mut().for_each(longer_row);
+    if let Some(m) = &mut list.more {
+        third_longer(&mut m.title);
+        m.rows.iter_mut().for_each(longer_row);
+    }
+    if let Some(ma) = &mut list.music_assistant {
+        longer_row(&mut ma.row);
+    }
+    if let Some(n) = &mut s.notice {
+        third_longer(&mut n.text);
+        n.detail.iter_mut().for_each(third_longer);
+        n.actions.iter_mut().for_each(longer_button);
+    }
+    let footer = &mut s.footer;
+    footer.cant_hear.iter_mut().for_each(longer_button);
+    longer_button(&mut footer.speaker_missing);
+    s
+}
+
 /// The panel at its natural height, then the checks every layout must
 /// pass: no two pieces of text overlap and none runs past the panel.
 fn assert_clean_layout(name: &str, names: Names, scale: f32, open_delay: bool) {
-    let snap = snapshot(name, names);
+    assert_clean_layout_of(name, snapshot(name, names), &format!("{names:?}"), scale, open_delay);
+}
+
+fn assert_clean_layout_of(name: &str, snap: std::sync::Arc<Snapshot>, names: &str, scale: f32, open_delay: bool) {
     let mut state = PanelState::opened();
     state.delay.set_open(open_delay);
     let mut h = Harness::new(snap, state);
     h.scale = scale;
     let f = h.settle();
     for (i, (a, ra)) in f.texts.iter().enumerate() {
-        assert!(ra.left() >= -0.5 && ra.right() <= WIDTH + 0.5, "{name} {names:?} at {scale}: {a:?} runs past the panel ({ra:?})");
+        assert!(ra.left() >= -0.5 && ra.right() <= WIDTH + 0.5, "{name} {names} at {scale}: {a:?} runs past the panel ({ra:?})");
         for (b, rb) in &f.texts[i + 1..] {
             let x = ra.intersect(*rb);
-            assert!(!(ra.intersects(*rb) && x.width() > 1.0 && x.height() > 1.0), "{name} {names:?} at {scale}: {a:?} overlaps {b:?}");
+            assert!(!(ra.intersects(*rb) && x.width() > 1.0 && x.height() > 1.0), "{name} {names} at {scale}: {a:?} overlaps {b:?}");
         }
     }
 }
@@ -351,6 +468,16 @@ fn every_scenario_lays_out_cleanly_with_long_and_chinese_names_at_200_percent() 
             for scale in [1.0, 2.0] {
                 assert_clean_layout(scenario.name(), names, scale, scenario.name().contains("delay"));
             }
+        }
+    }
+}
+
+#[test]
+fn every_scenario_lays_out_cleanly_with_its_words_a_third_longer_at_200_percent() {
+    for scenario in Scenario::ALL {
+        let snap = std::sync::Arc::new(longer(&snapshot(scenario.name(), Names::Usual)));
+        for scale in [1.0, 2.0] {
+            assert_clean_layout_of(scenario.name(), snap.clone(), "a third longer", scale, scenario.name().contains("delay"));
         }
     }
 }
