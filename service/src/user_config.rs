@@ -1919,9 +1919,12 @@ mod tests {
         );
         assert!(!notice.restored_from_backup && !notice.all_reset && notice.unusable_kept_as.is_none());
         let copy = notice.reset_kept_as.clone().unwrap();
-        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+        let mut kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+        // Where passwords are sealed (Windows), the copy holds them sealed:
+        // opened, it is the file as it was.
+        secret_store::unseal(&mut kept, &PlatformCodec);
         let found: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(kept, found, "the copy is the file as it was (nothing to seal off Windows)");
+        assert_eq!(kept, found, "the copy opens to the file as it was");
         // What was read is saved at once: the file holds what the app runs
         // with, and the next start has nothing to tell.
         let on_disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -2088,7 +2091,8 @@ mod tests {
     /// Settings in which every field of every struct, and of every entry
     /// of every list and map, differs from what it is when left out. A
     /// field added to any of these types must be set here as well:
-    /// `every_field_differs_from_its_default` fails until it is.
+    /// `every_field_differs_from_its_default_and_survives_a_save` fails
+    /// until it is.
     fn everything_set() -> UserConfig {
         use crate::discovery_net::SavedAdapter;
         use crate::manual_speakers::ManualKind;

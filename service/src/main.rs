@@ -910,7 +910,10 @@ fn run_gui_mode(_app: Arc<App>, _engine: Arc<stream_to_speaker::engine::Engine>,
 
 /// Time between the periodic UPnP searches. 0 used to mean searching
 /// without a pause (and none at all while the chosen adapter was away), so
-/// it counts as 1 minute.
+/// it counts as 1 minute. There is no upper limit: every value released
+/// versions accepted still starts (a value refused when parsing would stop
+/// a service or scheduled task from starting, unseen), and a large one
+/// only finds speakers later; the window's Rescan searches at any time.
 fn search_interval(cli: &Cli) -> Duration {
     if cli.ssdp_interval == 0 {
         warn!("--ssdp-interval 0 would search without a pause; searching every minute instead");

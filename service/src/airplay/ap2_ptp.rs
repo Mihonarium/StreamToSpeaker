@@ -19,6 +19,7 @@
 //!
 //! Per registered peer we send unicast:
 //!   * **Announce** → port 320, ~1 s cadence
+//!   * **Signaling** with Apple's TLVs → port 320, ~1 s cadence
 //!   * **Sync** (two-step) → port 319, 125 ms cadence, followed by
 //!     **Follow_Up** → port 320 carrying the precise origin timestamp
 //!   * **Delay_Resp** → port 320, answering the peer's Delay_Req (→ our 319)
@@ -794,8 +795,8 @@ impl Registration {
         if self.rx_total == 0 {
             warn!(
                 "AirPlay 2 PTP: receiver {} has sent us NOTHING on 319/320 after 5s — it isn't \
-                 engaging our clock. Likely inbound UDP 319/320 is firewall-blocked, or it \
-                 expects unicast-PTP signaling we don't send yet. No clock lock = silent audio.",
+                 engaging our clock, though it is sent Announce, Signaling and Sync. Likely \
+                 inbound UDP 319/320 is firewall-blocked. No clock lock = silent audio.",
                 match self.members.as_slice() {
                     [one] => one.to_string(),
                     many => format!("{:?}", many),

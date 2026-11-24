@@ -5268,8 +5268,9 @@ const WAITING_NOTICE_AFTER: Duration = Duration::from_secs(3);
 
 /// What a renderer is offered: this PC's stream address on its network
 /// (`http://<ip>:<port>`), the stream profile it played last time, if
-/// any, the metadata's buffer hint, and how long the connect may take
-/// ([`CONNECT_BUDGET`] in the app).
+/// any, and how long the connect may take ([`CONNECT_BUDGET`] in the
+/// app). `initial_buffer_ms` (`--initial-buffer-ms`) reaches the metadata
+/// builder, which leaves it out: no renderer is sent a buffer hint.
 pub struct StreamOffer {
     pub base_url: String,
     pub remembered: Option<StreamProfile>,
@@ -6349,7 +6350,7 @@ mod tests {
         head.split("\r\n").find_map(|l| l.strip_prefix("Content-Type: ")).unwrap_or("").to_string()
     }
 
-    /// A renderer like #117's KEF LSX II LT: its ConnectionManager lists
+    /// A renderer like the KEF LSX II LT: its ConnectionManager lists
     /// `sinks` (None: it has none), it takes a URI only when a HEAD of it
     /// answers with a type in `plays`, and on Play it fetches the stream.
     /// `more`: further services in its description.
@@ -6407,7 +6408,7 @@ mod tests {
 
     #[test]
     fn a_renderer_that_checks_the_type_gets_one_it_lists_on_head_get_and_metadata_alike() {
-        // #117: KEF LSX II LT, firmware 2.2.91.
+        // As a KEF LSX II LT on firmware 2.2.91 does.
         let (fake, probed) = strict_renderer(
             Some("http-get:*:audio/wav:*,http-get:*:audio/wave:*,http-get:*:audio/x-wav:*,http-get:*:audio/mpeg:*"),
             &["audio/wav", "audio/wave", "audio/x-wav"],

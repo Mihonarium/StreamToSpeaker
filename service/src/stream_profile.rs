@@ -140,7 +140,8 @@ impl fmt::Display for StreamProfile {
     }
 }
 
-/// One entry of a protocol list ([CM] 2.5.2:
+/// One entry of a protocol list (\[CM\], the UPnP ConnectionManager service
+/// specification, 2.5.2:
 /// `<protocol>:<network>:<contentFormat>:<additionalInfo>`), the parts
 /// that choose a profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -412,7 +413,7 @@ mod tests {
         plan(sonos, remembered, sinks)
     }
 
-    /// What #117's KEF LSX II LT lists.
+    /// What a KEF LSX II LT lists.
     fn kef() -> Sinks {
         listed("http-get:*:audio/wav:*,http-get:*:audio/wave:*,http-get:*:audio/x-wav:*,http-get:*:audio/mpeg:*")
     }
