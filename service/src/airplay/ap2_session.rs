@@ -2225,10 +2225,12 @@ mod tests {
             Self { samples: Some(samples), data, stop_flag, dead, faults, last_seq, sender: Some(sender) }
         }
 
-        /// Queue `frames` stereo frames of a quiet tone.
+        /// Queue `frames` stereo frames of a quiet tone. A sender that has
+        /// already ended takes nothing (one whose encoder fails to start ends
+        /// before it reads any); what it left behind is for the test to look at.
         fn feed(&self, frames: usize) {
             let bytes: Vec<u8> = (0..frames * 2).flat_map(|i| ((i % 64) as i16).to_le_bytes()).collect();
-            self.samples.as_ref().unwrap().send(PcmFrame(Arc::new(bytes))).unwrap();
+            let _ = self.samples.as_ref().unwrap().send(PcmFrame(Arc::new(bytes)));
         }
 
         /// The next packet on the data connection (header and sealed
