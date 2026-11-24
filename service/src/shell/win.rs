@@ -88,6 +88,65 @@ impl Desktop for WindowsDesktop {
         set_rect(hwnd, rect);
         window_rect(hwnd) == Some(rect)
     }
+
+    fn panel_window_shown(&self) -> Option<bool> {
+        let hwnd = self.styled.map(|h| h as HWND).filter(|h| is_own_window_titled(*h, PANEL_TITLE))?;
+        Some(is_visible(hwnd))
+    }
+
+    fn foreground(&self) -> String {
+        describe_foreground()
+    }
+}
+
+/// For the log: the window that has the foreground, as `class (program)`,
+/// or by its title for one of this app's windows. Other programs' titles
+/// and folders are left out: they can say what someone is doing.
+fn describe_foreground() -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId};
+    // SAFETY: no arguments.
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return "none".to_string();
+    }
+    let mut buf = [0u16; 128];
+    // SAFETY: a handle GetForegroundWindow just gave (a stale one makes the
+    // call return 0); the buffer is writable for the length given.
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+    let mut pid = 0u32;
+    // SAFETY: as above; `pid` is a writable u32.
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid == std::process::id() {
+        let mut title = [0u16; 128];
+        // SAFETY: as above.
+        let n = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+        return format!("this app's window \"{}\" ({class})", String::from_utf16_lossy(&title[..n.max(0) as usize]));
+    }
+    format!("{class} ({})", program_name(pid).unwrap_or_else(|| format!("process {pid}")))
+}
+
+/// The file name of the program process `pid` runs, if Windows says.
+fn program_name(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: asks for the least access there is; a null handle on failure.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: a process handle just opened; the buffer is writable for
+    // `len` characters, which the call sets to what it wrote.
+    let ok = unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) } != 0;
+    // SAFETY: the handle OpenProcess gave, closed once.
+    unsafe { CloseHandle(process) };
+    if !ok {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    path.rsplit(['\\', '/']).next().map(str::to_string)
 }
 
 impl WindowsDesktop {

@@ -114,6 +114,19 @@ pub struct PanelWindow {
     /// The tray icon it opened from, if it did.
     icon: Option<PxRect>,
     phase: Phase,
+    /// What the last frame saw of the focus, to log its changes.
+    focused: Option<bool>,
+    /// The log already said that its window is off screen while it is open.
+    hidden_told: bool,
+}
+
+/// For the log: what a frame saw of the focus.
+fn focus_word(focused: Option<bool>) -> &'static str {
+    match focused {
+        None => "unknown",
+        Some(true) => "yes",
+        Some(false) => "no",
+    }
 }
 
 /// A view in the panel, and what its frame keeps.
@@ -123,7 +136,14 @@ impl PanelWindow {
     /// Open the panel from the tray icon at `icon`, or with no icon (from
     /// Start, a second launch, a notification).
     pub fn open(icon: Option<PxRect>) -> Self {
-        PanelWindow { state: PanelState::opened(), views: Vec::new(), icon, phase: Phase::Measuring { last: 0.0, stable: 0, frames: 0 } }
+        PanelWindow {
+            state: PanelState::opened(),
+            views: Vec::new(),
+            icon,
+            phase: Phase::Measuring { last: 0.0, stable: 0, frames: 0 },
+            focused: None,
+            hidden_told: false,
+        }
     }
 
     pub fn phase(&self) -> Phase {
@@ -144,6 +164,27 @@ impl PanelWindow {
 
     /// After a frame of the panel's window: move it on in its life.
     pub fn after_frame(&mut self, seen: Seen, pinned: bool, mode: PanelMode, desktop: &mut dyn Desktop) -> Step {
+        if self.shown() && !self.hidden_told && desktop.panel_window_shown() == Some(false) {
+            self.hidden_told = true;
+            log::warn!("panel: its window is off screen while the panel is open");
+        }
+        if seen.focused != self.focused {
+            if seen.focused == Some(false) && self.shown() {
+                let window = match desktop.panel_window_shown() {
+                    Some(true) => "on screen",
+                    Some(false) => "off screen",
+                    None => "not found",
+                };
+                log::info!(
+                    "panel: focus {} -> no (its window {window}; the foreground: {})",
+                    focus_word(self.focused),
+                    desktop.foreground()
+                );
+            } else {
+                log::info!("panel: focus {} -> {}", focus_word(self.focused), focus_word(seen.focused));
+            }
+            self.focused = seen.focused;
+        }
         if seen.close {
             return Step::Close;
         }
@@ -162,10 +203,21 @@ impl PanelWindow {
             });
             // The most it may take; its list scrolls beyond it.
             self.state.height = Some(place.max_height);
+            log::info!("panel: measured at {wanted} points after {frames} frames; placing it at {}", place.rect);
             self.phase = Phase::Placing { place, tries: 0 };
         }
         if let Phase::Placing { place, tries } = self.phase {
-            if desktop.place_panel(place.rect, mode) || tries + 1 >= PLACE_TRIES {
+            let placed = desktop.place_panel(place.rect, mode);
+            if placed || tries + 1 >= PLACE_TRIES {
+                if placed {
+                    log::info!("panel: showing it (the foreground: {})", desktop.foreground());
+                } else {
+                    log::warn!(
+                        "panel: showing it, though Windows didn't confirm its place after {} tries (the foreground: {})",
+                        tries + 1,
+                        desktop.foreground()
+                    );
+                }
                 self.phase = Phase::Shown { place, had_focus: false };
                 return Step::Show;
             }

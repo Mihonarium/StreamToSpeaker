@@ -341,6 +341,11 @@ pub trait Desktop {
     /// Put the hidden small window called `title` at `rect`, never to be
     /// activated; true once it is there.
     fn place_popup(&mut self, title: &str, rect: PxRect) -> bool;
+    /// Whether the panel's window is on screen, once it has been placed.
+    fn panel_window_shown(&self) -> Option<bool>;
+    /// For the log: the window that has the foreground, by its class and
+    /// the name of its program.
+    fn foreground(&self) -> String;
 }
 
 /// A desktop for tests: fixed monitors and themes; it records where the
@@ -353,6 +358,8 @@ pub struct FakeDesktop {
     /// How many calls to `place_panel` fail before one succeeds.
     pub slow: u32,
     pub placed: Vec<PxRect>,
+    /// What `panel_window_shown` says.
+    pub panel_shown: Option<bool>,
 }
 
 impl Desktop for FakeDesktop {
@@ -381,6 +388,14 @@ impl Desktop for FakeDesktop {
     fn place_popup(&mut self, _title: &str, rect: PxRect) -> bool {
         self.placed.push(rect);
         true
+    }
+
+    fn panel_window_shown(&self) -> Option<bool> {
+        self.panel_shown
+    }
+
+    fn foreground(&self) -> String {
+        "a test's window".to_string()
     }
 }
 

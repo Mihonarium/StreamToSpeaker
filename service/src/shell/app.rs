@@ -123,6 +123,13 @@ pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, op
 /// Run the shell until Quit.
 pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
     let opts = opts.effective();
+    log::info!(
+        "shell: the panel as {:?}, the root as {:?}, tray icon {}, the panel opens at start: {}",
+        opts.panel,
+        opts.root,
+        if opts.tray { "on" } else { "off" },
+        if opts.open_at_start { "yes" } else { "no" }
+    );
     let native = eframe::NativeOptions { viewport: root_builder(opts.root).with_icon(app_icon()), persist_window: false, ..Default::default() };
     eframe::run_native(
         ROOT_TITLE,
@@ -186,6 +193,7 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
                 popup_rx,
                 tray_tickets: Vec::new(),
                 started: false,
+                first_run: None,
                 closing: false,
             }))
         }),
@@ -235,6 +243,8 @@ struct Shell {
     /// Places picked in the tray's menu, until the engine has answered.
     tray_tickets: Vec<crate::model::command::Ticket>,
     started: bool,
+    /// Whether first run was on at the last frame, to log its changes.
+    first_run: Option<bool>,
     closing: bool,
 }
 
@@ -299,12 +309,22 @@ impl Shell {
         }
     }
 
-    fn open_panel(&mut self, ctx: &egui::Context, icon: Option<super::placement::PxRect>) {
+    /// Open the panel, or give it the focus if it is open; `why` is for
+    /// the log.
+    fn open_panel(&mut self, ctx: &egui::Context, icon: Option<super::placement::PxRect>, why: &str) {
         match &self.panel {
-            Some(p) if p.shown() => ctx.send_viewport_cmd_to(panel_id(), ViewportCommand::Focus),
+            Some(p) if p.shown() => {
+                log::info!("panel: focusing it ({why})");
+                ctx.send_viewport_cmd_to(panel_id(), ViewportCommand::Focus);
+            }
             Some(_) => {}
             None => {
-                let mut p = PanelWindow::open(icon.or_else(|| self.tray.as_ref().and_then(|t| t.rect())));
+                let icon = icon.or_else(|| self.tray.as_ref().and_then(|t| t.rect()));
+                match icon {
+                    Some(r) => log::info!("panel: opening ({why}; the tray icon is {r})"),
+                    None => log::info!("panel: opening ({why}; no tray icon)"),
+                }
+                let mut p = PanelWindow::open(icon);
                 // On the view it closed on, a moment ago or with text typed.
                 p.views = self.memory.reopen(self.now, |(v, _)| v.holds_unused_text());
                 self.panel = Some(p);
@@ -318,7 +338,7 @@ impl Shell {
     /// of whatever shows, opening the panel if it is closed.
     fn show_view(&mut self, ctx: &egui::Context, view: Box<dyn ViewContent>, push: bool) {
         if self.panel.is_none() {
-            self.open_panel(ctx, None);
+            self.open_panel(ctx, None, "a view of it was asked for");
             self.memory.forget();
             if let Some(p) = &mut self.panel {
                 p.views.clear();
@@ -333,8 +353,10 @@ impl Shell {
         ctx.send_viewport_cmd_to(panel_id(), ViewportCommand::Focus);
     }
 
-    fn close_panel(&mut self) {
+    /// Close the panel; `why` is for the log.
+    fn close_panel(&mut self, why: &str) {
         if let Some(p) = self.panel.take() {
+            log::info!("panel: closed ({why})");
             if p.shown() {
                 let _ = self.port.send(Surface::Panel, Command::PanelShown(false));
             }
@@ -366,7 +388,7 @@ impl Shell {
     /// `from_window`: asked in the panel or Settings.
     fn open(&mut self, ctx: &egui::Context, open: &Open, snap: &Snapshot, from_window: bool, push: bool) {
         if matches!(open, Open::Panel) {
-            self.open_panel(ctx, None);
+            self.open_panel(ctx, None, "it was asked for");
             return;
         }
         let redirected = super::content::pair_from_outside(open, snap, from_window);
@@ -428,14 +450,15 @@ impl Shell {
         let pinned = snap.first_run.is_some();
         let (port, desktop) = (&self.port, &mut self.desktop);
         let builder = panel_builder(mode).with_icon(app_icon());
-        let (commands, step) = ctx.show_viewport_immediate(panel_id(), builder, |ctx, _class| {
+        let (commands, step, asked_to_close) = ctx.show_viewport_immediate(panel_id(), builder, |ctx, _class| {
             let t = theme::Theme::of(ctx);
             let (focused, inner_height, close) = ctx.input(|i| {
                 let v = i.viewport();
                 (v.focused, v.inner_rect.map(|r| r.height()), v.close_requested())
             });
             if close {
-                // Its × (the small-window form): the shell closes it.
+                // Its × (the small-window form), or anything else that asks
+                // the window to close: the shell closes it.
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             }
             let cap = panel.state.height;
@@ -462,7 +485,7 @@ impl Shell {
                 ctx.send_viewport_cmd(ViewportCommand::Focus);
             }
             ctx.request_repaint_after(METER);
-            ((out.commands, asks), step)
+            ((out.commands, asks), step, close)
         });
         match step {
             Step::Show => {
@@ -470,9 +493,10 @@ impl Shell {
             }
             Step::CloseOnBlur => {
                 self.toggle.closed_by_blur(now);
-                self.close_panel();
+                self.close_panel("it lost the focus");
             }
-            Step::Close => self.close_panel(),
+            Step::Close if asked_to_close => self.close_panel("its window was asked to close"),
+            Step::Close => self.close_panel("Esc"),
             Step::Wait => {}
         }
         commands
@@ -517,7 +541,7 @@ impl Shell {
         match ask {
             Ask::Command(c) => sent.push((Surface::Panel, c)),
             Ask::Dialog(d) => self.open_dialog(d),
-            Ask::OpenPanel => self.open_panel(ctx, None),
+            Ask::OpenPanel => self.open_panel(ctx, None, "it was asked for"),
             Ask::View(v) => self.show_view(ctx, v, true),
             Ask::Open(o) => self.open(ctx, &o, snap, true, true),
             Ask::Back => {
@@ -579,17 +603,32 @@ impl eframe::App for Shell {
         self.follow_settings(ctx, now);
         let snap = self.port.snapshot();
         self.sync_tray(ctx, &snap);
+        if self.first_run != Some(snap.first_run.is_some()) {
+            self.first_run = Some(snap.first_run.is_some());
+            if snap.first_run.is_some() {
+                log::info!("shell: first run (losing the focus doesn't close the panel until it is finished)");
+            } else if self.started {
+                log::info!("shell: first run is over");
+            }
+        }
 
         let mut sent: Vec<(Surface, Command)> = Vec::new();
         while let Ok(ev) = self.tray_rx.try_recv() {
             let open = self.panel.is_some();
             match ev {
-                TrayEvent::Press => self.toggle.press(open, now),
-                TrayEvent::Release(rect) => match self.toggle.release(open, now) {
-                    TrayClick::Open => self.open_panel(ctx, Some(rect)),
-                    TrayClick::Close => self.close_panel(),
-                    TrayClick::Nothing => {}
-                },
+                TrayEvent::Press => {
+                    log::info!("tray: left button down on the icon (the panel is {})", if open { "open" } else { "closed" });
+                    self.toggle.press(open, now)
+                }
+                TrayEvent::Release(rect) => {
+                    let click = self.toggle.release(open, now);
+                    log::info!("tray: left button up on the icon ({rect}): {click:?}");
+                    match click {
+                        TrayClick::Open => self.open_panel(ctx, Some(rect), "a click on the tray icon"),
+                        TrayClick::Close => self.close_panel("a click on the tray icon"),
+                        TrayClick::Nothing => {}
+                    }
+                }
                 TrayEvent::Menu(id) => {
                     if let Some(c) = self.tray.as_ref().and_then(|t| t.command(&id)) {
                         sent.push((Surface::Tray, c));
@@ -618,13 +657,15 @@ impl eframe::App for Shell {
             None => true,
         });
         if refused {
-            self.open_panel(ctx, None);
+            self.open_panel(ctx, None, "a place picked in the tray's menu can only be picked in it");
         }
         // A second launch; at start, first run or a start from the Start
         // menu: the panel.
         let at_start = !self.started && (snap.first_run.is_some() || self.opts.open_at_start);
-        if crate::single_instance::take_activation() || at_start {
-            self.open_panel(ctx, None);
+        if crate::single_instance::take_activation() {
+            self.open_panel(ctx, None, "the app was started again");
+        } else if at_start {
+            self.open_panel(ctx, None, if snap.first_run.is_some() { "first run" } else { "start" });
         }
         self.started = true;
         // The dialog the app needs now (a TV's code), by itself.

@@ -89,6 +89,16 @@ impl Tray {
                 let ev = match e {
                     TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Down, .. } => TrayEvent::Press,
                     TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, rect, .. } => TrayEvent::Release(rect_of(&rect)),
+                    // The left ones are logged with what they did; these do
+                    // nothing in the shell (the right button opens the menu).
+                    TrayIconEvent::Click { button, button_state, .. } => {
+                        log::info!("tray: {button:?} button {button_state:?} on the icon");
+                        return;
+                    }
+                    TrayIconEvent::DoubleClick { button, .. } => {
+                        log::info!("tray: {button:?} double click on the icon");
+                        return;
+                    }
                     _ => return,
                 };
                 let _ = events.send(ev);

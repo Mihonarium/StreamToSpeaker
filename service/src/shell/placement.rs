@@ -36,6 +36,13 @@ impl PxRect {
     }
 }
 
+/// For the log: `360x480 at 1548,552`.
+impl std::fmt::Display for PxRect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}x{} at {},{}", self.width(), self.height(), self.left, self.top)
+    }
+}
+
 /// One monitor: all of it, the part the taskbar leaves free, and its scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Monitor {
