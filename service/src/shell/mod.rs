@@ -25,11 +25,12 @@ mod tray;
 mod win;
 
 #[cfg(windows)]
-pub use app::{app_icon, run, run_app, run_scripted, scripted_scenario};
+pub use app::{app_icon, run, run_app, run_scripted};
 
 use egui::{Pos2, Vec2, ViewportBuilder, WindowLevel};
 
 use crate::model::command::{Command, Open};
+use crate::model::scripted::Scenario;
 use crate::model::snapshot::Snapshot;
 use placement::{Monitor, PxRect};
 
@@ -78,9 +79,9 @@ pub struct ShellOptions {
 }
 
 impl ShellOptions {
-    /// The options from `get` (the environment): `STREAM_TO_SPEAKER_ROOT`
-    /// is `hidden` or `tool-window` (the default), `STREAM_TO_SPEAKER_PANEL`
-    /// is `flyout` (the default) or `window`.
+    /// The options from `get` (the environment, see [`env_switches`]):
+    /// `STREAM_TO_SPEAKER_ROOT` is `hidden` or `tool-window` (the default),
+    /// `STREAM_TO_SPEAKER_PANEL` is `flyout` (the default) or `window`.
     pub fn from(get: impl Fn(&str) -> Option<String>, tray: bool) -> Self {
         let get = |k: &str| get(k).map(|v| v.trim().to_ascii_lowercase());
         ShellOptions {
@@ -97,8 +98,10 @@ impl ShellOptions {
         }
     }
 
+    /// The options from the environment; the defaults in a release build
+    /// (see [`env_switches`]).
     pub fn from_env(tray: bool) -> Self {
-        Self::from(|k| std::env::var(k).ok(), tray)
+        Self::from(env_switches(), tray)
     }
 
     /// What the shell does with these options: without a tray icon the
@@ -110,6 +113,31 @@ impl ShellOptions {
             ShellOptions { panel: PanelMode::Window, open_at_start: true, ..self }
         }
     }
+}
+
+/// The scenario `STREAM_TO_SPEAKER_SCENARIO` names, if it names one: the
+/// shell then runs on the scripted engine, for trying every state without
+/// speakers. Never in a release build (see [`env_switches`]).
+pub fn scripted_scenario() -> Option<Scenario> {
+    scenario_from(env_switches())
+}
+
+fn scenario_from(get: impl Fn(&str) -> Option<String>) -> Option<Scenario> {
+    get("STREAM_TO_SPEAKER_SCENARIO").and_then(|n| Scenario::from_name(n.trim()))
+}
+
+/// The switches for trying the shell's states and its other forms
+/// (`STREAM_TO_SPEAKER_SCENARIO`, `STREAM_TO_SPEAKER_ROOT`,
+/// `STREAM_TO_SPEAKER_PANEL`), from the environment. Only a debug build
+/// reads them; a release build behaves as if none were set, so nothing
+/// left in someone's environment changes how the app they installed runs.
+fn env_switches() -> impl Fn(&str) -> Option<String> {
+    switches(cfg!(debug_assertions), |name| std::env::var(name).ok())
+}
+
+/// The switches `get` gives when `read`; none otherwise.
+fn switches(read: bool, get: impl Fn(&str) -> Option<String>) -> impl Fn(&str) -> Option<String> {
+    move |name| if read { get(name) } else { None }
 }
 
 /// The root window's title (no one sees it).
@@ -373,6 +401,26 @@ mod tests {
             false,
         );
         assert_eq!((set.root, set.panel, set.tray), (RootMode::Hidden, PanelMode::Window, false));
+    }
+
+    #[test]
+    fn a_release_build_runs_as_if_no_switch_were_set() {
+        let env = |name: &str| match name {
+            "STREAM_TO_SPEAKER_SCENARIO" => Some("playing".to_string()),
+            "STREAM_TO_SPEAKER_ROOT" => Some("hidden".to_string()),
+            "STREAM_TO_SPEAKER_PANEL" => Some("window".to_string()),
+            _ => None,
+        };
+        let release = switches(false, env);
+        assert_eq!(ShellOptions::from(&release, true), ShellOptions::from(|_| None, true));
+        assert_eq!(scenario_from(&release), None);
+        let debug = switches(true, env);
+        let opts = ShellOptions::from(&debug, true);
+        assert_eq!((opts.root, opts.panel), (RootMode::Hidden, PanelMode::Window));
+        assert_eq!(scenario_from(&debug), Some(Scenario::Playing));
+        // This build's own environment, where `PATH` is always set: read in
+        // a debug build only (`cargo test --release` runs the other side).
+        assert_eq!(env_switches()("PATH").is_some(), cfg!(debug_assertions));
     }
 
     #[test]

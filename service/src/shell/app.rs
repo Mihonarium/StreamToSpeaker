@@ -55,13 +55,6 @@ const IDLE: Duration = Duration::from_millis(250);
 /// How often the open panel redraws (the level meter).
 const METER: Duration = Duration::from_millis(33);
 
-/// The scenario `STREAM_TO_SPEAKER_SCENARIO` names, if it names one: the
-/// shell then runs on the scripted engine, for trying every state without
-/// speakers.
-pub fn scripted_scenario() -> Option<Scenario> {
-    std::env::var("STREAM_TO_SPEAKER_SCENARIO").ok().and_then(|n| Scenario::from_name(n.trim()))
-}
-
 /// Run the shell on the scripted engine in `scenario`, with the views on
 /// the scripted settings and placeholder windows for the rest.
 pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()> {
