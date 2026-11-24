@@ -987,6 +987,70 @@ mod tests {
         assert!(!is_sendspin_id("airplay:aa"));
     }
 
+    /// Earlier versions ran the Music Assistant input only while Sendspin
+    /// was on as well. After the update the input runs where it ran
+    /// before, and nowhere else; settings this version saved keep the
+    /// input's own switch as it was.
+    #[test]
+    fn after_an_update_the_music_assistant_input_runs_only_where_it_ran_before() {
+        use crate::user_config::UserConfig;
+        let dir = std::env::temp_dir().join(format!("sts-sendspin-input-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The app as it starts with the settings file at `path`. Sendspin
+        // is off for the run, so that starting the input shows as the
+        // error it records instead of opening a port and advertising.
+        let start = |path: &std::path::Path| {
+            let app = App::with_settings(App::test_config(), UserConfig::load_at_path(path.into()), None, None);
+            app.disable_sendspin();
+            app.init_sendspin(false, false);
+            let started = app
+                .current_error()
+                .is_some_and(|e| e.starts_with("Couldn't start the Music Assistant input"));
+            (app, started)
+        };
+        let file = |name: &str, sendspin_on: bool| {
+            let path = dir.join(name);
+            let text = format!(r#"{{"sendspin": {{"enabled": {sendspin_on}, "source_enabled": true}}}}"#);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let input_saved = |path: &std::path::Path| {
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            saved["sendspin"]["source_enabled"] == true
+        };
+
+        // Sendspin was off, the input left ticked from before: it doesn't
+        // start, isn't on in the settings and stays off on the next start.
+        let path = file("sendspin-off.json", false);
+        let (app, started) = start(&path);
+        assert!(!started, "{:?}", app.current_error());
+        assert!(!app.user_config.lock().unwrap().sendspin.source_enabled);
+        assert!(!input_saved(&path));
+        assert!(!start(&path).1);
+
+        // Both were on: the input starts, as it did before the update.
+        let path = file("both-on.json", true);
+        let (app, started) = start(&path);
+        assert!(started);
+        assert!(app.user_config.lock().unwrap().sendspin.source_enabled);
+        assert!(input_saved(&path));
+        // Sendspin speakers turned off since: the input keeps running.
+        app.set_sendspin_enabled(false);
+        assert!(start(&path).1);
+
+        // A new install: no input, and nothing saved at the start.
+        let path = dir.join("new.json");
+        let (app, started) = start(&path);
+        assert!(!started && !app.user_config.lock().unwrap().sendspin.source_enabled);
+        assert!(!path.exists());
+        // The input turned on with Sendspin off, then a restart: it starts.
+        assert!(app.set_sendspin_source_enabled(true).is_err(), "Sendspin is off for the run");
+        assert!(input_saved(&path));
+        assert!(start(&path).1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn music_assistant_elsewhere_is_offered_this_computers_own_addresses() {
         let ip = |s: &str| -> Ipv4Addr { s.parse().unwrap() };

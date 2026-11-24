@@ -1040,10 +1040,14 @@ impl App {
         airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     ) -> Arc<Self> {
         let web_initial = config.web_enabled;
-        // The extra delay earlier versions gave every Sendspin speaker
-        // becomes each paired speaker's own, once (see `delay::upgrade`).
+        // Settings from earlier versions, once: the extra delay they gave
+        // every Sendspin speaker becomes each paired speaker's own (see
+        // `delay::upgrade`), and the Music Assistant input, which ran only
+        // while Sendspin was on as well, stays on only if Sendspin was.
         let mut user_config = user_config;
-        if user_config.upgrade_delays() {
+        let delays_moved = user_config.upgrade_delays();
+        let input_turned_off = user_config.sendspin.upgrade_source_switch();
+        if delays_moved || input_turned_off {
             user_config.save();
         }
         // Seed last_speaker_id from the settings so that, even before any user

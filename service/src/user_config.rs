@@ -531,6 +531,18 @@ impl UserConfig {
         Self { saves: Saves::AtPath(path), ..Self::default() }
     }
 
+    /// The settings in the file at `path`, read as [`load_from`](Self::load_from)
+    /// reads them and saved back to that file instead of `config.json`, for
+    /// tests of what the app does with the file it starts with.
+    #[cfg(test)]
+    pub(crate) fn load_at_path(path: PathBuf) -> Self {
+        let mut c = Self::load_from(&path);
+        if matches!(c.saves, Saves::ToFile) {
+            c.saves = Saves::AtPath(path);
+        }
+        c
+    }
+
     /// Load from `path`. A missing file is a fresh install. A file that
     /// exists but isn't usable (not text in an encoding
     /// `decode_config_text` reads, not JSON, not a JSON object: empty or
@@ -2142,6 +2154,7 @@ mod tests {
         c.sendspin.last_playback_server = Some("srv-a".into());
         c.sendspin.player_extra_latency_ms = 40;
         c.sendspin.pairing_code_failures = 2;
+        c.sendspin.source_own_switch = true;
         c.manual_speakers.push(ManualSpeaker {
             kind: ManualKind::AirPlay,
             name: "Den".into(),
