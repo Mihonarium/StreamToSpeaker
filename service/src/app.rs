@@ -684,9 +684,8 @@ pub struct App {
     settings_retrying: Arc<AtomicBool>,
 
     /// Most recent user-facing error message and when it was recorded.
-    /// Surfaced by the GUI as a transient inline banner for ~8 s
-    /// (Heuristics F-03 — previously every action that could fail
-    /// just `warn!`'d to the log file and the user saw nothing).
+    /// Surfaced by the GUI as a transient inline banner for ~8 s, so a
+    /// failed action is seen, not only written to the log file.
     pub last_error: Mutex<Option<(String, Instant)>>,
 
     /// Friendly name of the speaker a background connect is currently
@@ -2964,7 +2963,7 @@ impl App {
         {
             crate::endpoint_name::update_endpoint_name(new_friendly_name.as_deref());
         }
-        // m24: start the window, the Windows slider and the speaker out
+        // Start the window, the Windows slider and the speaker out
         // agreeing, on the speaker's level. Without this the window would
         // wait for the first GENA NOTIFY (which can take a few seconds and
         // is silent if the user never adjusts the volume on the speaker
@@ -3929,9 +3928,9 @@ impl App {
     /// Disconnect from the current speaker (if any), clear the
     /// persisted `last_speaker_id`, and reset the onboarding-dismissed
     /// flag so the next launch is a true "first launch" again. Used
-    /// by the GUI's Forget-speaker button (audit Heuristics F-07 —
-    /// without this the only way to clear the saved speaker was to
-    /// edit `%APPDATA%\StreamToSpeaker\config.json` by hand).
+    /// by the GUI's Forget-speaker button, so that clearing the saved
+    /// speaker doesn't take a hand edit of
+    /// `%APPDATA%\StreamToSpeaker\config.json`.
     pub fn forget_saved_speaker(&self) {
         if self.send_command(crate::model::Surface::Settings, crate::model::Command::Play(crate::model::Place::ThisPc)) {
             // The engine lets the speaker go; the next pick still plays.

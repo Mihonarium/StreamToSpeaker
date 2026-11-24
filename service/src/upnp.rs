@@ -401,8 +401,8 @@ pub(crate) enum Failure {
     Refused { status: String, fault: Option<Fault> },
 }
 
-/// The UPnP error a refusal carries (\[UDA\], the UPnP Device Architecture,
-/// 3.2.5: `<UPnPError>` with `<errorCode>` and `<errorDescription>`). The
+/// The UPnP error a refusal carries: the `<UPnPError>` in its SOAP fault,
+/// with an `<errorCode>` (714, say) and an `<errorDescription>`. The
 /// description is the device's own text, shown only through
 /// [`Fault::describe`].
 #[derive(Debug, Clone, PartialEq, Eq)]

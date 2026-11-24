@@ -64,7 +64,7 @@ pub mod sp {
     pub const M: f32 = 16.0;
     pub const L: f32 = 24.0;
 
-    // M14 — three "container padding" tiers, named so we never reach
+    // Three "container padding" tiers, named so we never reach
     // for raw 18 / 16 / 24 / 12 / 8 again.
     //
     //   CARD_*  — sectional cards + status banner. 18 horizontal is

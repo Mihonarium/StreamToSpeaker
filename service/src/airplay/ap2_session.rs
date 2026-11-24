@@ -201,7 +201,7 @@ pub struct AirPlay2Session {
     threads: SessionThreads,
     ptp_session: Option<PtpMaster>,
     /// (next 23-bit seq, next rtptime) for the buffered stream — read at
-    /// stop() to send the spec's FLUSHBUFFERED before TEARDOWN. None for
+    /// stop() to send FLUSHBUFFERED before TEARDOWN. None for
     /// realtime sessions.
     buffered_flush: Option<(Arc<AtomicU32>, Arc<AtomicU32>)>,
     /// Clone of the buffered data TCP stream — stop() shuts it down to
@@ -950,7 +950,7 @@ impl AirPlay2Session {
         if let Some(ptp) = self.ptp_session.take() {
             ptp.stop();
         }
-        // Buffered sessions get the spec's FLUSHBUFFERED before TEARDOWN
+        // Buffered sessions get a FLUSHBUFFERED before TEARDOWN
         // so the receiver drops its buffered tail instead of playing it out.
         if let Some((seq, ts)) = self.buffered_flush.take() {
             let mut guard = self.rtsp.lock().unwrap();

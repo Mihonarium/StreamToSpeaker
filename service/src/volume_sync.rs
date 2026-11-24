@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 /// How long the speaker's reports of levels we sent are taken for echoes,
 /// counted from the last level queued or the last send to the speaker
-/// starting or finishing. UPnP RenderingControl events are moderated (one
-/// LastChange per 0.2 s at most, per the service spec), so a report can
+/// starting or finishing. UPnP RenderingControl events are moderated (the
+/// service sends one LastChange per 0.2 s at most), so a report can
 /// trail the change by that much plus delivery, and during a drag it
 /// names a level from earlier in the drag rather than the latest.
 const SPEAKER_ECHO_WINDOW: Duration = Duration::from_secs(1);
@@ -352,7 +352,7 @@ impl VolumeSync {
 
 impl VolumeSync {
     /// Last-known volume level (`0..=100`), from whichever side set it
-    /// last. The GUI reads this to render the volume slider (m24).
+    /// last. The GUI reads this to render the volume slider.
     pub fn current_level(&self) -> Option<u32> {
         self.inner.lock().unwrap().last_level
     }
