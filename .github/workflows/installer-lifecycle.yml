@@ -4,19 +4,28 @@ name: Installer lifecycle
 # runner and checks what each step leaves behind (logic and checks in
 # .github/scripts/Test-InstallerLifecycle.ps1):
 #
-#   fresh install → repair → uninstall
-#   → previous public release → upgrade to this build → uninstall
-#   (→ also over the Microsoft-signed-driver variant, when built)
+#   the scripts' own tests (Windows PowerShell)
+#   → Setup refuses Windows Server → fresh install → repair
+#   → update while the app runs, here and in another account
+#   → uninstall (with the test certificate's file gone)
+#   → install, repair, uninstall in C:\STS [lifecycle]
+#   → start at sign-in through /TASKS → uninstall
+#   → previous public release → upgrade to this build
+#     (→ to the Microsoft-signed-driver variant, when built) → uninstall
+#   → an older release (default v0.1.6) → upgrade → uninstall
 #
 # A user-data sentinel in %APPDATA%\StreamToSpeaker must survive all of it:
 # uninstall deliberately leaves user data in place. This build's
-# Pre-Install.ps1 and Rename-Endpoint.ps1 must log into the install
-# directory, never into the user's profile.
+# Install-Driver.ps1 must log into the install directory, never into the
+# user's profile.
 #
-# Hosted runners run Windows Server without test-signing, so the driver is
-# never expected to load here: the checks cover what the installer itself
-# does (files, Apps & Features entry, shortcuts, certificate trust, driver
-# store, device node) and only report the device's status.
+# Hosted runners run Windows Server without test-signing, so the driver
+# never starts here. Setup must say so: its exit code and the result its
+# driver step logs must agree with the device Windows has. Everything the
+# installer itself controls is required (files, Apps & Features entry,
+# shortcuts, certificate trust, driver store, exactly one device, the
+# firewall rule, folder rights, start at sign-in). Every phase runs even
+# after one failed; the Verdict step fails the job if any did.
 #
 # Called by build.yml on pull requests that touch the installer (same run,
 # so it tests exactly the installer that run built), or dispatched by hand
@@ -39,6 +48,10 @@ on:
         description: "Release to upgrade from (default: newest vX.Y.Z release with an installer)"
         required: false
         default: ""
+      older_tag:
+        description: "A second, older release to upgrade from (default: v0.1.6, the first with a Microsoft-signed driver)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -53,7 +66,7 @@ jobs:
     # Same image as the build, so the installer meets the OS it was built
     # alongside.
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -154,65 +167,93 @@ jobs:
           ) | Add-Content $env:GITHUB_ENV
           "has_prod=$(if ($prod) { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
 
-      # Newest non-draft, non-prerelease vX.Y.Z release carrying a setup exe
-      # (driver-v* releases are skipped by the tag shape). Its .sha256
+      # Two earlier releases to upgrade from: the newest non-draft,
+      # non-prerelease vX.Y.Z release carrying a setup exe (or previous_tag),
+      # and older_tag (the first release with a Microsoft-signed driver, so
+      # an install made by the oldest kind of setup still in use).
+      # driver-v* releases are skipped by the tag shape. Each one's .sha256
       # sidecar, when published, must match the download.
-      - name: Download the previous release's installer
+      - name: Download earlier releases' installers
         id: prev
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           WANT_TAG: ${{ inputs.previous_tag }}
+          OLDER_TAG: ${{ inputs.older_tag || 'v0.1.6' }}
         run: |
           $rels = gh api --paginate "repos/$env:RELEASES_REPO/releases?per_page=100" --jq '.[]' |
               ForEach-Object { $_ | ConvertFrom-Json }
           $setup = { param($r) @($r.assets | Where-Object { $_.name -match '^StreamToSpeakerSetup-.+\.exe$' }) }
-          if ($env:WANT_TAG) {
-              $rel = $rels | Where-Object { $_.tag_name -eq $env:WANT_TAG } | Select-Object -First 1
-              if (-not $rel) { throw "no release $env:WANT_TAG in $env:RELEASES_REPO" }
-          } else {
-              $rel = $rels |
-                  Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -match '^v\d+\.\d+\.\d+$' -and (& $setup $_).Count -gt 0 } |
-                  Sort-Object { [version]$_.tag_name.Substring(1) } -Descending |
-                  Select-Object -First 1
+          function Get-Release([string]$tag, [string]$key, [string]$envName) {
+              if ($tag) {
+                  $rel = $rels | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
+              } else {
+                  $rel = $rels |
+                      Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -match '^v\d+\.\d+\.\d+$' -and (& $setup $_).Count -gt 0 } |
+                      Sort-Object { [version]$_.tag_name.Substring(1) } -Descending |
+                      Select-Object -First 1
+              }
+              if (-not $rel -or -not (& $setup $rel)) {
+                  Write-Host "::warning::No release $(if ($tag) { $tag } else { 'with an installer' }); skipping its upgrade path."
+                  "$key=false" >> $env:GITHUB_OUTPUT
+                  return
+              }
+              $assets = & $setup $rel
+              # Prefer the Microsoft-signed-driver installer over a -testsigned fallback.
+              $asset = ($assets | Where-Object { $_.name -notmatch '-testsigned\.exe$' } | Select-Object -First 1)
+              if (-not $asset) { $asset = $assets[0] }
+              $dir = "dist/$key"
+              New-Item -ItemType Directory -Force $dir | Out-Null
+              gh release download $rel.tag_name --repo $env:RELEASES_REPO --pattern $asset.name --dir $dir
+              if ($LASTEXITCODE -ne 0) { throw "download failed" }
+              $path = Join-Path $dir $asset.name
+              $hash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
+              if ($rel.assets | Where-Object { $_.name -eq "$($asset.name).sha256" }) {
+                  gh release download $rel.tag_name --repo $env:RELEASES_REPO --pattern "$($asset.name).sha256" --dir $dir
+                  if ($LASTEXITCODE -ne 0) { throw "sidecar download failed" }
+                  $want = ((Get-Content "$path.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
+                  if ($want -ne $hash) { throw "$($asset.name): sha256 $hash does not match the published $want" }
+                  Write-Host "$($asset.name) matches its published sha256"
+              } else {
+                  Write-Host "::warning::$($rel.tag_name) publishes no .sha256 for $($asset.name)"
+              }
+              $sig = Get-AuthenticodeSignature $path
+              Write-Host "$($key): $($rel.tag_name) / $($asset.name) sha256 $hash, Authenticode $($sig.Status) ($($sig.SignerCertificate.Subject))"
+              $version = $rel.tag_name -replace '^v', ''
+              "$key=true" >> $env:GITHUB_OUTPUT
+              "$($key)_version=$version" >> $env:GITHUB_OUTPUT
+              "$($envName)_EXE=$((Resolve-Path $path).Path)" | Add-Content $env:GITHUB_ENV
+              "$($envName)_VERSION=$version" | Add-Content $env:GITHUB_ENV
           }
-          if (-not $rel) {
-              Write-Host "::warning::No previous release with an installer; skipping the upgrade path."
-              "found=false" >> $env:GITHUB_OUTPUT
-              exit 0
-          }
-          $assets = & $setup $rel
-          if (-not $assets) { throw "release $($rel.tag_name) has no setup exe" }
-          # Prefer the Microsoft-signed-driver installer over a -testsigned fallback.
-          $asset = ($assets | Where-Object { $_.name -notmatch '-testsigned\.exe$' } | Select-Object -First 1)
-          if (-not $asset) { $asset = $assets[0] }
-          New-Item -ItemType Directory -Force dist/previous | Out-Null
-          gh release download $rel.tag_name --repo $env:RELEASES_REPO --pattern $asset.name --dir dist/previous
-          if ($LASTEXITCODE -ne 0) { throw "download failed" }
-          $path = Join-Path dist/previous $asset.name
-          $hash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
-          if ($rel.assets | Where-Object { $_.name -eq "$($asset.name).sha256" }) {
-              gh release download $rel.tag_name --repo $env:RELEASES_REPO --pattern "$($asset.name).sha256" --dir dist/previous
-              if ($LASTEXITCODE -ne 0) { throw "sidecar download failed" }
-              $want = ((Get-Content "$path.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
-              if ($want -ne $hash) { throw "$($asset.name): sha256 $hash does not match the published $want" }
-              Write-Host "$($asset.name) matches its published sha256"
-          } else {
-              Write-Host "::warning::$($rel.tag_name) publishes no .sha256 for $($asset.name)"
-          }
-          $sig = Get-AuthenticodeSignature $path
-          Write-Host "Previous release: $($rel.tag_name) / $($asset.name) sha256 $hash, Authenticode $($sig.Status) ($($sig.SignerCertificate.Subject))"
-          $prevVersion = $rel.tag_name -replace '^v', ''
-          "found=true" >> $env:GITHUB_OUTPUT
-          "version=$prevVersion" >> $env:GITHUB_OUTPUT
-          "STS_PREV_EXE=$((Resolve-Path $path).Path)" | Add-Content $env:GITHUB_ENV
-          "STS_PREV_VERSION=$prevVersion" | Add-Content $env:GITHUB_ENV
+          Get-Release $env:WANT_TAG "found" "STS_PREV"
+          Get-Release $env:OLDER_TAG "older" "STS_OLDER"
+
+      # Every phase runs even when an earlier one failed, so that one run
+      # shows every case; the Verdict step at the end fails the job if any
+      # phase did.
+      - name: The scripts' own tests (Windows PowerShell)
+        id: units
+        continue-on-error: true
+        shell: pwsh
+        run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase units
 
       - name: Runner state + user-data sentinel
+        id: env
+        continue-on-error: true
         shell: pwsh
         run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase env
 
+      - name: Setup refuses Windows Server
+        id: refuse_server
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase refuse-server
+          -Installer $env:STS_DEV_EXE
+
       - name: Fresh install
+        id: install
+        continue-on-error: true
         shell: pwsh
         run: >
           .github/scripts/Test-InstallerLifecycle.ps1 -Phase install
@@ -220,25 +261,94 @@ jobs:
           -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
 
       - name: Repair (reinstall over itself)
+        id: repair
+        continue-on-error: true
         shell: pwsh
         run: >
           .github/scripts/Test-InstallerLifecycle.ps1 -Phase repair
           -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
           -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
 
-      - name: Uninstall
+      - name: Silent update while the app runs
+        id: running_app
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase running-app
+          -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+
+      - name: Silent update while the app runs in another account
+        id: other_account
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase other-account
+          -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+
+      - name: Uninstall (after the certificate file went missing)
+        id: uninstall
+        continue-on-error: true
+        shell: pwsh
+        run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase uninstall -DeleteCertificateFile
+
+      - name: Install to a folder outside Program Files, with [ ] in its name
+        id: install_custom
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase install
+          -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+          -InstallDir 'C:\STS [lifecycle]'
+
+      - name: Repair in that folder
+        id: repair_custom
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase repair
+          -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+          -InstallDir 'C:\STS [lifecycle]'
+
+      - name: Uninstall from that folder
+        id: uninstall_custom
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase uninstall
+          -InstallDir 'C:\STS [lifecycle]'
+
+      - name: Start at sign-in through /TASKS
+        id: tasks
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase tasks
+          -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+
+      - name: Uninstall (start at sign-in on)
+        id: uninstall_tasks
+        continue-on-error: true
         shell: pwsh
         run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase uninstall
 
-      - name: Install the previous release (${{ steps.prev.outputs.version }})
+      - name: Install the previous release (${{ steps.prev.outputs.found_version }})
+        id: previous
         if: steps.prev.outputs.found == 'true'
+        continue-on-error: true
         shell: pwsh
         run: >
           .github/scripts/Test-InstallerLifecycle.ps1 -Phase previous
           -Installer $env:STS_PREV_EXE -ExpectVersion $env:STS_PREV_VERSION
 
       - name: Upgrade to this build
+        id: upgrade
         if: steps.prev.outputs.found == 'true'
+        continue-on-error: true
         shell: pwsh
         run: >
           .github/scripts/Test-InstallerLifecycle.ps1 -Phase upgrade
@@ -248,15 +358,45 @@ jobs:
       # Test-signed install → Microsoft-signed-driver install of the same
       # build, the path a tester takes from a dev build to a release.
       - name: Upgrade to the Microsoft-signed-driver installer
+        id: upgrade_prod
         if: steps.prev.outputs.found == 'true' && steps.pick.outputs.has_prod == 'true'
+        continue-on-error: true
         shell: pwsh
         run: >
           .github/scripts/Test-InstallerLifecycle.ps1 -Phase upgrade
           -Installer $env:STS_PROD_EXE -DriverRecord $env:STS_PROD_RECORD
           -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
 
-      - name: Final uninstall
+      - name: Uninstall after the upgrades
+        id: uninstall_upgraded
         if: steps.prev.outputs.found == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase uninstall
+
+      - name: Install an older release (${{ steps.prev.outputs.older_version }})
+        id: older
+        if: steps.prev.outputs.older == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase previous
+          -Installer $env:STS_OLDER_EXE -ExpectVersion $env:STS_OLDER_VERSION
+
+      - name: Upgrade the older release to this build
+        id: upgrade_older
+        if: steps.prev.outputs.older == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase upgrade
+          -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+
+      - name: Final uninstall
+        id: uninstall_final
+        if: steps.prev.outputs.older == 'true'
+        continue-on-error: true
         shell: pwsh
         run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase uninstall
 
@@ -282,6 +422,21 @@ jobs:
           if (Test-Path $setupapi) {
               Get-Content $setupapi -Tail 3000 | Set-Content (Join-Path $out "setupapi.dev.tail.log")
           }
+
+      - name: Verdict
+        if: always()
+        shell: pwsh
+        env:
+          STEPS: ${{ toJson(steps) }}
+        run: |
+          $failed = @()
+          $steps = $env:STEPS | ConvertFrom-Json
+          foreach ($p in $steps.PSObject.Properties) {
+              $outcome = $p.Value.outcome
+              Write-Host "$($p.Name): $outcome"
+              if ($outcome -eq 'failure') { $failed += $p.Name }
+          }
+          if ($failed.Count) { throw "failed: $($failed -join ', ')" }
 
       - name: Upload logs
         if: always()
