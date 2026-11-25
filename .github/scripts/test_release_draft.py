@@ -12,6 +12,13 @@ import unittest.mock
 import fake_gh
 import release_draft as rd
 
+
+def scratch(case):
+    """A temporary folder that is removed when the test `case` ends."""
+    path = tempfile.mkdtemp()
+    case.addCleanup(shutil.rmtree, path, True)
+    return path
+
 REPO = "Mihonarium/StreamToSpeaker"
 V = "0.1.11"
 COMMIT = "c0ffee" + "0" * 34
@@ -332,7 +339,7 @@ class StaleAssets(unittest.TestCase):
 
 class Check(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = scratch(self)
         self.dir = os.path.join(self.tmp, "assets")
 
     def tearDown(self):
@@ -609,7 +616,7 @@ class Versions_(unittest.TestCase):
             rd.expected_assets("1.2.3-testsigned.1", "StreamToSpeakerSetup-1.2.3-testsigned.1.exe", True)
 
     def test_the_command_writes_the_outputs(self):
-        out = os.path.join(tempfile.mkdtemp(), "out")
+        out = os.path.join(scratch(self), "out")
         env = {"GITHUB_REF": "refs/tags/v0.1.11", "GITHUB_EVENT_NAME": "push", "INPUT_VERSION": "",
                "GITHUB_SHA": COMMIT, "GITHUB_OUTPUT": out}
         with unittest.mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
@@ -678,7 +685,7 @@ class Uploading(unittest.TestCase):
     the draft."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = scratch(self)
 
     def tearDown(self):
         shutil.rmtree(self.tmp)

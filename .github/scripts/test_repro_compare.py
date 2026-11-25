@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import struct
 import tempfile
 import unittest
@@ -12,6 +13,13 @@ import zlib
 import repro_compare as rc
 import test_certified
 
+
+
+def scratch(case):
+    """A temporary folder that is removed when the test `case` ends."""
+    path = tempfile.mkdtemp()
+    case.addCleanup(shutil.rmtree, path, True)
+    return path
 
 def rich_block(entries, key=0x1234ABCD):
     """A Rich header: DanS ^ key, 3 x key, (comp.id ^ key, count ^ key)..., Rich, key."""
@@ -51,7 +59,7 @@ def make_pe(code=b"CODE" * 64, pdb_path=b"C:\\src\\driver.pdb", timestamp=0x1000
 
 class SysCompare(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = scratch(self)
 
     def path(self, name, data):
         p = os.path.join(self.tmp, name)
@@ -148,8 +156,8 @@ class SysCompare(unittest.TestCase):
 
 class TreeCompare(unittest.TestCase):
     def setUp(self):
-        self.src = tempfile.mkdtemp()
-        self.build = tempfile.mkdtemp()
+        self.src = scratch(self)
+        self.build = scratch(self)
         for root in (self.src, self.build):
             os.makedirs(os.path.join(root, "driver"))
             os.makedirs(os.path.join(root, "include"))
@@ -182,7 +190,7 @@ class TreeCompare(unittest.TestCase):
         self.assertFalse(rep["identical"])
 
     def test_empty_tree_is_not_identical(self):
-        rep = rc.compare_trees(tempfile.mkdtemp(), tempfile.mkdtemp())
+        rep = rc.compare_trees(scratch(self), scratch(self))
         self.assertFalse(rep["identical"])
 
     # ---- attested releases: driver.h stamped before the build ----
@@ -561,7 +569,7 @@ class BuildDir(unittest.TestCase):
             self.assertIn("cannot create the build directory D:\\a\\OldName\\OldName", rep["error"])
 
     def test_cli(self):
-        report = os.path.join(tempfile.mkdtemp(), "builddir.json")
+        report = os.path.join(scratch(self), "builddir.json")
         made = []
 
         def run(argv, lexists):
@@ -588,7 +596,7 @@ class BuildDir(unittest.TestCase):
 
 class PlanCli(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = scratch(self)
         self.out = os.path.join(self.tmp, "gh_output")
         self._old = os.environ.get("GITHUB_OUTPUT")
         os.environ["GITHUB_OUTPUT"] = self.out
@@ -709,7 +717,7 @@ class PlanCli(unittest.TestCase):
 
 class InfCompare(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = scratch(self)
 
     def path(self, name, text, encoding="utf-8"):
         p = os.path.join(self.tmp, name)
@@ -768,7 +776,7 @@ class DriverVer(unittest.TestCase):
                                                             "1.1.0.209"))
 
     def test_command(self):
-        p = os.path.join(tempfile.mkdtemp(), "x.inf")
+        p = os.path.join(scratch(self), "x.inf")
         with open(p, "wb") as f:
             f.write(self.INF)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -789,7 +797,7 @@ class PackageCheck(unittest.TestCase):
                "drivers/x/streamtospeaker.cat": b"CAT", "drivers/x/readme.txt": b"-"}
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = scratch(self)
         self.zip = os.path.join(self.tmp, "pkg.zip")
         self.out = os.path.join(self.tmp, "out")
 
@@ -836,7 +844,7 @@ class PackageCheck(unittest.TestCase):
 
 class FilesCompare(unittest.TestCase):
     def setUp(self):
-        self.a, self.b = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.a, self.b = scratch(self), scratch(self)
         for d in (self.a, self.b):
             for name, data in (("StreamToSpeaker.sys", b"SYS"), ("StreamToSpeaker.inf", b"INF"),
                                ("StreamToSpeaker.cat", b"CAT")):
@@ -953,7 +961,7 @@ class WorkflowCommandHygiene(unittest.TestCase):
     EVIL = "C:\\b\\x.pdb\n::set-output name=normalised_identical::true\r\n##[error]boom"
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = scratch(self)
         self._env = {k: os.environ.get(k) for k in ("GITHUB_ACTIONS", "GITHUB_OUTPUT")}
         os.environ["GITHUB_ACTIONS"] = "true"
         os.environ["GITHUB_OUTPUT"] = os.path.join(self.tmp, "gh_output")
@@ -1095,7 +1103,7 @@ class ArchiveExtraction(unittest.TestCase):
     INF = b"[Version]\r\nDriverVer = 08/05/2026,1.1.0.204\r\n"
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = scratch(self)
         self.out = os.path.join(self.tmp, "work", "out")      # two levels down: room to escape upwards
         os.makedirs(os.path.dirname(self.out))
 
@@ -1290,7 +1298,7 @@ class ArchiveExtraction(unittest.TestCase):
 @unittest.skipUnless(test_certified.HAVE_REAL, "real 1.1.0.209 packages not on this machine")
 class RealPackages(unittest.TestCase):
     def test_lab_and_microsoft_sys_identical_after_strip(self):
-        tmp = tempfile.mkdtemp()
+        tmp = scratch(self)
         paths = {}
         for label, zpath in (("lab", test_certified.LAB_ZIP), ("ms", test_certified.MS_ZIP)):
             with zipfile.ZipFile(zpath) as z:
