@@ -735,6 +735,46 @@ class InfCompare(unittest.TestCase):
         self.assertEqual(rep["released"]["encoding"], "utf-16-le")
         self.assertTrue(rep["normalised_identical"])
 
+    def test_infs_that_differ_only_in_bytes_that_are_not_utf8_differ(self):
+        # Decoding with errors="replace" turned both into U+FFFD.
+        head = b"[Version]\r\nDriverVer = 09/18/2026,1.1.0.209\r\n; vendor "
+        a, b = os.path.join(self.tmp, "a"), os.path.join(self.tmp, "b")
+        for p, tail in ((a, b"\xff\r\n"), (b, b"\xfe\r\n")):
+            with open(p, "wb") as f:
+                f.write(head + tail)
+        rep = rc.compare_inf(a, b)
+        self.assertFalse(rep["raw_identical"])
+        self.assertFalse(rep["normalised_identical"])
+        self.assertTrue(rc.compare_inf(a, a)["normalised_identical"])
+
+
+class DriverVer(unittest.TestCase):
+    INF = b"[Version]\r\nSignature = \"$WINDOWS NT$\"\r\nDriverVer   = 05/22/2026,1.1.0.209\r\n"
+
+    def test_the_inf_must_carry_exactly_the_version(self):
+        self.assertIsNone(rc.driverver_problem(self.INF, "1.1.0.209"))
+        for version in ("1.1.0.20", "1.1.0.2", "1.1.0", "1.0.209", "1.1.0.2099"):
+            self.assertIn("does not carry DriverVer", rc.driverver_problem(self.INF, version), version)
+
+    def test_spacing_and_a_comment_after_the_version(self):
+        inf = b"[Version]\nDriverVer=05/22/2026 , 1.1.0.209   ; stamped\n"
+        self.assertIsNone(rc.driverver_problem(inf, "1.1.0.209"))
+        self.assertIsNone(rc.driverver_problem("\ufeff[Version]\r\nDriverVer = 05/22/2026,1.1.0.209\r\n"
+                                               .encode("utf-16-le"), "1.1.0.209"))
+
+    def test_no_driverver_or_two(self):
+        self.assertIn("does not carry", rc.driverver_problem(b"[Version]\r\n", "1.1.0.209"))
+        self.assertIn("more than one", rc.driverver_problem(self.INF + b"DriverVer = 05/22/2026,1.1.0.209\r\n",
+                                                            "1.1.0.209"))
+
+    def test_command(self):
+        p = os.path.join(tempfile.mkdtemp(), "x.inf")
+        with open(p, "wb") as f:
+            f.write(self.INF)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(rc.main(["driverver", p, "1.1.0.209"]), 0)
+            self.assertEqual(rc.main(["driverver", p, "1.1.0.20"]), 1)
+
 
 def make_zip(path, members):
     with zipfile.ZipFile(path, "w") as z:

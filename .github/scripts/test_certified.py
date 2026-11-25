@@ -167,6 +167,13 @@ class VerifyPackages(unittest.TestCase):
         ms, lab = fake_packages()
         self.assertTrue(any("DriverVer" in p for p in certified.verify_packages(ms, lab, "1.1.0.210")))
 
+    def test_a_version_that_is_only_the_start_of_the_infs_is_wrong(self):
+        # ",1.1.0.20" is a substring of ",1.1.0.209": the INF's DriverVer
+        # must be the version, not merely contain it.
+        ms, lab = fake_packages()
+        for version in ("1.1.0.20", "1.1.0.2", "1.1.0", "1.0.209"):
+            self.assertTrue(any("DriverVer" in p for p in certified.verify_packages(ms, lab, version)), version)
+
     def test_inf_mismatch(self):
         ms, _ = fake_packages()
         _, lab = fake_packages()

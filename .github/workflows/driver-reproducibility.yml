@@ -577,8 +577,8 @@ jobs:
           if (-not $sys -or -not $inf) { Get-ChildItem -Recurse $out | Select-Object FullName; throw "driver outputs not produced" }
           $sig = Get-AuthenticodeSignature $sys.FullName
           if ($sig.Status -ne "NotSigned") { throw "expected an unsigned .sys, got signature status $($sig.Status)" }
-          $infText = Get-Content $inf.FullName -Raw
-          if ($infText -notmatch [regex]::Escape(",$env:VERSION")) { throw "built INF does not carry DriverVer $env:VERSION - stampinf failed?" }
+          python repro-tools/.github/scripts/repro_compare.py driverver $inf.FullName $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw "built INF does not carry DriverVer $env:VERSION - stampinf failed?" }
           New-Item -ItemType Directory -Force -Path fresh | Out-Null
           Copy-Item $sys.FullName fresh/StreamToSpeaker.sys
           Copy-Item $inf.FullName fresh/StreamToSpeaker.inf

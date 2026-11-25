@@ -291,12 +291,10 @@ jobs:
           $cat = Get-ChildItem -Path "driver\x64\Release" -Recurse -Filter "StreamToSpeaker.cat" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($cat) { Copy-Item $cat.FullName (Join-Path $src "StreamToSpeaker.cat") -Force }
 
-          # The INF must actually carry this build's DriverVer.
+          # The INF must carry exactly this build's DriverVer.
           $version = "${{ steps.drvver.outputs.version }}"
-          $inf = Get-Content (Join-Path $src "StreamToSpeaker.inf") -Raw
-          if ($inf -notmatch [regex]::Escape(",$version")) {
-              throw "built INF does not contain DriverVer $version - stampinf failed?"
-          }
+          python .github/scripts/repro_compare.py driverver (Join-Path $src "StreamToSpeaker.inf") $version
+          if ($LASTEXITCODE -ne 0) { throw "built INF does not carry DriverVer $version - stampinf failed?" }
 
           $name = "StreamToSpeaker-Driver-$version-Submission.cab"
           $outDir = (Resolve-Path ".").Path

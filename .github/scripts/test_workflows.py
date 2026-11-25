@@ -437,5 +437,28 @@ class DriverWorkflowScripts(unittest.TestCase):
         self.assertEqual(step_field(check[0], "run"), "python3 .github/scripts/certified.py inputs")
 
 
+def script_lines(name):
+    """(job, step name, command) for every command of every step script of
+    .github/workflows/<name>."""
+    for job, steps in jobs_steps(name).items():
+        for step in steps:
+            for line in step_script(step):
+                yield job, step_field(step, "name") or step[0].strip(), line
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class DriverVerChecks(unittest.TestCase):
+    def test_every_driverver_check_matches_the_whole_version(self):
+        # ",1.1.0.20" is a substring of ",1.1.0.209": the workflows check
+        # an INF's DriverVer with repro_compare.py driverver instead.
+        bad = []
+        for name in sorted(os.listdir(WORKFLOWS_DIR)):
+            if name.endswith(".yml"):
+                bad += [f"{name} job {job}, {step}: {line}" for job, step, line in script_lines(name)
+                        if re.search(r"-notmatch\s+\[regex\]::Escape\(\",", line)]
+        self.assertEqual(bad, [])
+
+
+
 if __name__ == "__main__":
     unittest.main()

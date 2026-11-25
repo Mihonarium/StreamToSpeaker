@@ -12,6 +12,7 @@ Used by driver-reproducibility.yml. Pure Python, no third-party modules.
   repro_compare.py package <package.zip> <out_dir> --sha256 <expected> [--json out.json]
   repro_compare.py reference <archive> <out_dir> --type lab_zip|submission_cab [--sha256 <expected>]
   repro_compare.py files <dir_a> <dir_b>              [--json out.json]
+  repro_compare.py driverver <file.inf> <version>
 
 `sys` strips the Authenticode certificate table from both files (what
 `signtool remove /s` does; a no-op on an unsigned build), compares the raw
@@ -37,7 +38,11 @@ lists every differing byte range with the section it falls in, and decodes
 both files' headers (linker version, timestamps, PDB, Rich header).
 
 `inf` compares the two INFs with the DriverVer *date* masked (stampinf
-writes the build date); the version part must still match.
+writes the build date); the version part must still match. An INF without
+a BOM that is not UTF-8 is compared byte for byte.
+
+`driverver` checks that the INF's one DriverVer line carries exactly the
+version (the whole value, not a prefix of it).
 
 `tree` checks that driver/ and include/ under the build root are
 byte-identical to the checkout the source-hash guard ran on.
@@ -514,16 +519,43 @@ def print_sys_report(rep):
 DRIVERVER_RE = re.compile(r"(DriverVer\s*=\s*)\d{2}/\d{2}/\d{4}(\s*,)", re.IGNORECASE)
 
 
-def read_inf(path):
-    with open(path, "rb") as fh:
-        raw = fh.read()
+def inf_text(raw):
+    """(text, encoding) of an INF's bytes. Without a BOM: UTF-8, or, when
+    the bytes are not UTF-8, Latin-1, which maps every byte to its own
+    character, so two INFs that differ in any byte never compare equal."""
     if raw.startswith(b"\xff\xfe"):
         return raw[2:].decode("utf-16-le"), "utf-16-le"
     if raw.startswith(b"\xfe\xff"):
         return raw[2:].decode("utf-16-be"), "utf-16-be"
     if raw.startswith(b"\xef\xbb\xbf"):
         return raw[3:].decode("utf-8"), "utf-8-sig"
-    return raw.decode("utf-8", "replace"), "utf-8"
+    try:
+        return raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        return raw.decode("latin-1"), "bytes (not UTF-8)"
+
+
+def read_inf(path):
+    with open(path, "rb") as fh:
+        return inf_text(fh.read())
+
+
+DRIVERVER_LINE_RE = re.compile(r"^[ \t]*DriverVer[ \t]*=[ \t]*(\d{2}/\d{2}/\d{4})[ \t]*,[ \t]*([0-9.]+)[ \t]*(?:;.*)?$",
+                               re.IGNORECASE | re.MULTILINE)
+
+
+def driverver_problem(raw, version):
+    """None when the INF's one DriverVer line carries exactly `version`,
+    else what is wrong. (A substring test would take ",1.1.0.20" for
+    ",1.1.0.209".)"""
+    text, _ = inf_text(raw)
+    lines = [m.group(2) for m in DRIVERVER_LINE_RE.finditer(text.replace("\r\n", "\n").replace("\r", "\n"))]
+    if len(lines) > 1:
+        return f"the INF has more than one DriverVer line ({', '.join(clean_text(v) for v in lines)})"
+    if lines != [version]:
+        found = clean_text(lines[0]) if lines else "none"
+        return f"the INF does not carry DriverVer {clean_text(version)} (its DriverVer version: {found})"
+    return None
 
 
 def compare_inf(released_path, fresh_path):
@@ -1188,7 +1220,7 @@ def print_files_report(rep):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("kind", choices=("sys", "inf", "tree", "package", "reference", "files", "plan", "buildroot",
-                                     "builddir"))
+                                     "builddir", "driverver"))
     ap.add_argument("released")
     ap.add_argument("fresh")
     ap.add_argument("--json", help="also write the full report here")
@@ -1212,6 +1244,18 @@ def main(argv=None):
     # plan / buildroot / builddir print workflow commands of their own
     # (::error::, ::warning::); what they show of the release goes through
     # clean_text.
+    if a.kind == "driverver":
+        # driverver <inf> <version>
+        try:
+            with open(a.released, "rb") as fh:
+                problem = driverver_problem(fh.read(), a.fresh)
+        except OSError as e:
+            problem = f"could not read {a.released}: {e}"
+        if problem:
+            print(f"::error::{command_text(problem)}")
+            return 1
+        print(f"the INF carries DriverVer {clean_text(a.fresh)}")
+        return 0
     if a.kind == "builddir":
         rep = prepare_build_dir(a.released, a.fresh)
         dump(rep)

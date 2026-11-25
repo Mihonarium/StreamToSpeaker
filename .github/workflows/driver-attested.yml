@@ -188,10 +188,8 @@ jobs:
           if ($a -ne $b) {
               throw "returned INF differs from the submitted INF - this zip doesn't match this submission (or the INF was modified)"
           }
-          $infText = Get-Content $inf -Raw
-          if ($infText -notmatch [regex]::Escape(",$version")) {
-              throw "returned INF does not carry DriverVer $version"
-          }
+          python repo-scripts\.github\scripts\repro_compare.py driverver $inf $version
+          if ($LASTEXITCODE -ne 0) { throw "returned INF does not carry DriverVer $version" }
 
           # --- .sys identity check -------------------------------------
           # Attestation only adds Microsoft's signature; the code must be

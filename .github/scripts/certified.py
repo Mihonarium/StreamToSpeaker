@@ -176,8 +176,11 @@ def verify_packages(ms_zip, lab_zip, version=None):
     lab = read_package(lab_zip)
     if ms["streamtospeaker.inf"] != lab["streamtospeaker.inf"]:
         problems.append("INF differs between Microsoft's zip and the lab package")
-    if version and f",{version}".encode() not in ms["streamtospeaker.inf"]:
-        problems.append(f"INF does not carry DriverVer {version}")
+    if version:
+        from repro_compare import driverver_problem  # repro_compare imports this module
+        problem = driverver_problem(ms["streamtospeaker.inf"], version)
+        if problem:
+            problems.append(f"INF does not carry DriverVer {version}: {problem}")
     try:
         if pe_strip_signature(ms["streamtospeaker.sys"]) != pe_strip_signature(lab["streamtospeaker.sys"]):
             problems.append(".sys code differs between Microsoft's zip and the lab package (after stripping signatures)")
