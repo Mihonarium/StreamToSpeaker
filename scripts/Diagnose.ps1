@@ -18,6 +18,11 @@
 # parse.
 
 $ErrorActionPreference = 'Continue'
+# Windows PowerShell's commands load from its own folder. Started from
+# PowerShell 7, this script inherits that version's module path, and Windows
+# PowerShell can't load the modules it finds there: Get-AuthenticodeSignature
+# then fails and the report has no signature.
+if ($PSVersionTable.PSEdition -ne 'Core') { $env:PSModulePath = Join-Path $PSHOME 'Modules' }
 
 $DiagHardwareId = 'Root\StreamToSpeaker'
 $DiagAppId = '{8A6C7F92-3E1B-4A2B-9F1C-77F1B6B2A6E0}_is1'
@@ -267,7 +272,9 @@ function Get-Report {
         "Driver file  : $image"
         if (Test-Path -LiteralPath $image) {
             $item = Get-Item -LiteralPath $image
-            "Version      : $($item.VersionInfo.FileVersion), $($item.Length) bytes, modified $($item.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))"
+            # A driver file may carry no version.
+            $version = [string]$item.VersionInfo.FileVersion
+            "Version      : $(if ($version) { $version + ', ' })$($item.Length) bytes, modified $($item.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))"
             $sig = Get-AuthenticodeSignature -LiteralPath $image -ErrorAction SilentlyContinue
             "Signature    : $($sig.Status)$(if ($sig.SignerCertificate) { ', ' + $sig.SignerCertificate.Subject })"
         } else {
