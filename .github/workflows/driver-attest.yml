@@ -92,7 +92,7 @@ jobs:
           persist-credentials: false
 
       - name: Unit tests (guard)
-        run: python3 -m unittest discover -s .github/scripts
+        run: python3 -m unittest discover -b -s .github/scripts
 
       - name: Dry run (no Partner Center call)
         id: dry
@@ -133,7 +133,7 @@ jobs:
           persist-credentials: false
 
       - name: Unit tests (guard)
-        run: python3 -m unittest discover -s .github/scripts
+        run: python3 -m unittest discover -b -s .github/scripts
 
       - name: Reconcile attestation state
         id: attest
