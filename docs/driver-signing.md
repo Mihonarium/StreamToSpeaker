@@ -136,8 +136,10 @@ Every job of these workflows that writes a driver release does it through
    signed. `Driver attest`: an unfinished attestation round. `Driver
    attested`: a round Microsoft returned. `Driver certified`: a release
    prepared by hand for an HLK return. The jobs that write run on `main`
-   only and never in a dry run; every other job holds a read-only token
-   and no secret.
+   only and never in a dry run, and every job that can run from a branch
+   or in a dry run holds a read-only token and no secret (the jobs that
+   hold the signing or Partner Center secrets, `sign-cab` and Driver
+   certified's `download`, run on main only).
 3. A file the manifest records (with its SHA-256) is never replaced.
 4. Nothing is deleted before its replacement is completely uploaded. A
    replacement goes up as `<name>.pending`; then the old asset is deleted
@@ -320,8 +322,13 @@ release can leave an empty product in Partner Center; that's harmless
 
 A job that waits in `driver-release-writes` (for example Driver attested
 while Driver attest polls Microsoft, up to 55 minutes) starts when the job
-ahead of it is done; nothing waiting there is cancelled unless 100 jobs
-already wait. Don't attach a Microsoft zip by hand (the manual fallback)
+ahead of it is done; the group cancels nothing waiting there unless 100
+jobs already wait. A newer driver push to main does cancel the older
+Driver submission run as a whole (its own run-level group), with its
+`record` or `record-signed` job, waiting or running; the newer run's own
+`record` then writes its release, and whatever the older run left half
+done on its release is finished by the next job that writes that
+release. Don't attach a Microsoft zip by hand (the manual fallback)
 while `Driver attest` runs for the same release: its next write would
 find the release changed and stop.
 
@@ -357,7 +364,14 @@ overlap (a concurrency group per tag).
    `.github/scripts`, the Pester tests among them) run next to it; the
    release jobs wait for them.
 2. `sign-service` — creates the **draft** release for the tag
-   (generated notes; `release_draft.py ensure`, which refuses a tag whose
+   (notes GitHub generates for the tagged commit, ending with a hidden
+   line `<!-- release notes generated for commit <sha> -->` that
+   `release_draft.py ensure` writes. When you edit a draft's notes, keep
+   that line: a re-run of `sign-service` replaces the notes of a draft
+   that lacks it, or whose line names another commit (as after a moved
+   tag), with freshly generated ones. If it was deleted, put it back with
+   the tag's commit SHA before re-running, or your edits are lost.
+   `ensure` refuses a tag whose
    release is already published or that does not point at the commit the
    run builds, whether the draft is new or already exists, and waits until
    the release list shows a new draft — the list lags behind a fresh
