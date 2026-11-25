@@ -10,13 +10,19 @@
 #                    whose copies are "mine" (Get-SetupPerson)
 #
 # Prints one "running-copy:" line per copy and, last,
-#   running-copies: mine=<n> other=<n> closed=none|ok|failed|error person=known|unknown start=yes|no
-# where mine and other count the copies to close that are the person's and
-# another account's (with person=unknown, the account that ran Setup
-# couldn't be told, and every copy counts as other), and start says whether
-# Setup can start a program as that person. closed=error: the script itself
+#   running-copies: mine=<n> other=<n> closed=none|ok|failed|error closed-mine=<n> closed-other=<n>
+#                   person=known|unknown start=yes|no settings=yes|no signin=on|off|none
+# (one line) where mine and other count the copies to close that are the
+# person's and another account's (with person=unknown, the account that ran
+# Setup couldn't be told, and every copy counts as other); closed-mine and
+# closed-other count those that are closed now, also when closed=failed
+# because another couldn't be; start says whether Setup can start a program
+# as that person, without administrator rights; settings whether what Setup
+# runs as the original user changes that person's own settings; signin
+# whether the person's start-at-sign-in entry is on, turned off in Task
+# Manager or Settings, or not there. closed=error: the script itself
 # failed, and Setup goes on without it (Windows' Restart Manager still
-# closes a copy that holds a file Setup replaces).
+# closes a copy that holds a file Setup replaces) and starts no app.
 #
 # Keep this file ASCII (see InstallerFunctions.ps1).
 
@@ -31,7 +37,7 @@ $ErrorActionPreference = 'Continue'
 # module path starts with the profile of the user who approved the
 # elevation, where that user's own programs could put a module.
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
-$line = 'running-copies: mine=0 other=0 closed=error person=unknown start=yes'
+$line = 'running-copies: mine=0 other=0 closed=error closed-mine=0 closed-other=0 person=unknown start=no settings=no signin=none'
 try {
     . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'InstallerFunctions.ps1'))))
     $StsLogPrefix = '[running-copies] '
@@ -43,17 +49,12 @@ try {
         if (-not $c.Close) { Write-Step "Leaving the copy started from $($c.Path) running: it isn't the installed one." }
     }
     $toClose = @($plan | Where-Object { $_.Close })
-    $mine = @($toClose | Where-Object { $_.Mine }).Count
-    $other = $toClose.Count - $mine
-    $closed = 'none'
+    $still = @()
     if ($Close -and $toClose.Count) {
         $still = @(Stop-AppCopies $toClose)
-        $closed = if ($still.Count) { 'failed' } else { 'ok' }
         foreach ($c in $still) { Write-Step "Process $($c.ProcessId) is still running." }
     }
-    $known = if ($person.Sid) { 'known' } else { 'unknown' }
-    $start = if ($person.CanStartAs) { 'yes' } else { 'no' }
-    $line = "running-copies: mine=$mine other=$other closed=$closed person=$known start=$start"
+    $line = Format-CopiesResult -Closing $toClose -Tried ([bool]$Close) -Still $still -Person $person -SignIn (Get-SignInState -Sid $person.Sid)
 } catch {
     Write-Host "Find-RunningCopies failed: $($_.Exception.Message)"
 }

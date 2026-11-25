@@ -28,7 +28,10 @@
 ;      that folder is run.
 ;   8. Says on its last page what happened, starts the app again for the
 ;      person whose copy it closed, and asks for a restart when the new driver
-;      needs one.
+;      needs one. Setup starts the app only as that person, without
+;      administrator rights, which it can when it asked for those rights
+;      itself; started with them ("Run as administrator", an elevated
+;      prompt), it starts nothing and says to use the Start menu.
 ; Uninstall closes the app, removes the device, the driver packages,
 ; Windows' cached sound output entries, the test certificates, the firewall
 ; rules and the start-at-sign-in entries of signed-in accounts, and says
@@ -167,10 +170,13 @@ CloseButton=Close Stream To Speaker and install
 CloseFailedMine=Setup couldn't close Stream To Speaker, so it installed nothing.%n%nQuit Stream To Speaker (right-click its icon in the notification area, then choose Quit), then run Setup again.
 CloseFailedOther=Setup couldn't close Stream To Speaker, which runs in another account on this PC, so it installed nothing.%n%nAsk the person who uses that account to quit it, or restart the PC, then run Setup again.
 CloseFailedUnknown=Setup couldn't close Stream To Speaker, so it installed nothing.%n%nQuit Stream To Speaker wherever it runs on this PC (right-click its icon in the notification area, then choose Quit), or restart the PC, then run Setup again.
+ClosedYoursStarts=Setup did close the copy that ran in your account, and starts it again when you close Setup.
+ClosedYoursStartIt=Setup did close the copy that ran in your account: start it again from the Start menu.
 StatusDriver=Installing the Stream To Speaker sound driver (sound on this PC may stop for a moment)...
 StatusFirewall=Adding the Windows Firewall rule for Stream To Speaker...
 StatusEarlier=Removing the earlier copy of Stream To Speaker...
 DoneNew=Stream To Speaker is installed.%n%nNext: make Stream To Speaker the sound output in Windows (select the speaker icon on the taskbar and choose it), then pick a speaker in the app.
+NextAfterRestart=After the restart: start Stream To Speaker from the Start menu, make it the sound output in Windows (select the speaker icon on the taskbar and choose it), then pick a speaker in the app.
 DoneUpdated=Stream To Speaker is installed.
 DoneStillDefault=Stream To Speaker is installed, and Windows still plays to it.
 DoneLostDefault=Stream To Speaker is installed, but Windows now plays to another output. To play to Stream To Speaker again, select the speaker icon on the taskbar and choose it.
@@ -197,8 +203,11 @@ FirewallFailed=Setup couldn't add the Windows Firewall rule for Stream To Speake
 RestartReplacing=Windows must restart to start Stream To Speaker's new sound driver; until then, the driver it replaces keeps running.
 RestartStarting=Windows must restart before Stream To Speaker's sound driver starts.
 RestartAppAgain=Stream To Speaker starts again after the restart, or when Setup closes if you restart later.
-StartYourself=Start Stream To Speaker from the Start menu: Setup runs as the account that approved it, so it can't start the app for you.
-SignInNotSet=To start Stream To Speaker when you sign in, turn that on in the app: Setup runs as the account that approved it, so it can't change what starts when you sign in.
+RestartStartYourself=Start Stream To Speaker again from the Start menu, now or after the restart.
+StartYourself=Start Stream To Speaker from the Start menu. Setup was started as administrator, so it doesn't start the app itself: the app would run as administrator too.
+StartYourselfUnknown=Start Stream To Speaker from the Start menu. Setup couldn't tell which Windows account started it, so it doesn't start the app itself.
+SignInNotSet=Setup didn't set Stream To Speaker to start when you sign in, because it runs in another Windows account than yours. Turn that on in the app instead.
+SignInNotSetUnknown=Setup didn't set Stream To Speaker to start when you sign in, because it couldn't tell which Windows account started it. Turn that on in the app instead.
 RestartNow=Restart now?
 UninstallLeft=The uninstall couldn't remove everything Stream To Speaker put on this PC. Still there:%n%n%1%n%nTo remove the rest, restart the PC, install Stream To Speaker again and uninstall it.
 
@@ -329,10 +338,19 @@ var
   Moving: Boolean;
   // The files are in place (Setup can no longer roll back).
   Installed: Boolean;
-  // Copies of the app Setup closes: the person's own, and another account's.
-  CopiesMine, CopiesOther: Integer;
+  // Copies of the app Setup closes: the person's own, and another account's;
+  // and how many of each the last try closed.
+  CopiesMine, CopiesOther, CopiesMineClosed, CopiesOtherClosed: Integer;
   CopiesClosed: String;
-  PersonKnown, CanStartAsPerson, ClosedMine, ClosedOther: Boolean;
+  // PersonKnown: Setup could tell which account ran it. CanStartAsPerson:
+  // it can start a program as that person, without administrator rights.
+  // CanActAsPerson: what it runs as the original user changes that
+  // person's own settings. ClosedMine, ClosedOther: Setup closed a copy of
+  // the person's, of another account's (in this try or an earlier one).
+  PersonKnown, CanStartAsPerson, CanActAsPerson, ClosedMine, ClosedOther: Boolean;
+  // The person's start-at-sign-in entry is there, but turned off in Task
+  // Manager or Settings.
+  SignInTurnedOff: Boolean;
   ScriptsExtracted: Boolean;
   TasksPageSeen: Boolean;
   // What the scripts printed last.
@@ -548,20 +566,35 @@ begin
   RunPowerShell(ExpandConstant('{tmp}\Find-RunningCopies.ps1'), Params, Code);
   CopiesMine := StrToIntDef(ResultField(CopiesLine, 'mine'), 0);
   CopiesOther := StrToIntDef(ResultField(CopiesLine, 'other'), 0);
+  CopiesMineClosed := StrToIntDef(ResultField(CopiesLine, 'closed-mine'), 0);
+  CopiesOtherClosed := StrToIntDef(ResultField(CopiesLine, 'closed-other'), 0);
   CopiesClosed := ResultField(CopiesLine, 'closed');
   PersonKnown := ResultField(CopiesLine, 'person') = 'known';
   CanStartAsPerson := ResultField(CopiesLine, 'start') = 'yes';
+  CanActAsPerson := ResultField(CopiesLine, 'settings') = 'yes';
+  SignInTurnedOff := ResultField(CopiesLine, 'signin') = 'off';
   if (CopiesLine = '') or (CopiesClosed = 'error') then begin
     // The script couldn't run (a policy may block PowerShell): Setup goes
     // on as Inno Setup does by itself, and Windows' Restart Manager closes a
-    // copy that holds a file Setup replaces.
+    // copy that holds a file Setup replaces. It starts no app: it can't
+    // tell whether the app would run with administrator rights.
     Log('Could not look for running copies of Stream To Speaker; going on without.');
     CopiesMine := 0;
     CopiesOther := 0;
+    CopiesMineClosed := 0;
+    CopiesOtherClosed := 0;
     CopiesClosed := 'none';
     PersonKnown := False;
-    CanStartAsPerson := True;
+    CanStartAsPerson := False;
+    CanActAsPerson := True;
+    SignInTurnedOff := False;
   end;
+  // Also when another copy couldn't be closed, and kept from an earlier
+  // try: Install can be clicked again after a close that failed.
+  if CopiesMineClosed > 0 then
+    ClosedMine := True;
+  if CopiesOtherClosed > 0 then
+    ClosedOther := True;
   Result := CopiesClosed <> 'failed';
 end;
 
@@ -623,8 +656,9 @@ begin
 end;
 
 // Setup starts the app again: it closed the person's own copy, and can
-// start a program as that person (not when an administrator's account ran
-// Setup with "Run as administrator", and not as SYSTEM).
+// start a program as that person, without administrator rights (not when
+// Setup was started with those rights, by "Run as administrator" or from an
+// elevated prompt: the app would run with them; and not as SYSTEM).
 function StartsAgain(): Boolean;
 begin
   Result := ClosedMine and CanStartAsPerson and not RunningAsSystem();
@@ -646,8 +680,12 @@ begin
     Result := Result + #13#10#13#10 + FmtMessage(CustomMessage('EarlierLeftAlone'), [ExpandConstant('{app}'), EarlierDir]);
   if not FirewallOk then
     Result := Result + #13#10#13#10 + CustomMessage('FirewallFailed');
-  if SignInSkipped then
-    Result := Result + #13#10#13#10 + CustomMessage('SignInNotSet');
+  if SignInSkipped then begin
+    if PersonKnown then
+      Result := Result + #13#10#13#10 + CustomMessage('SignInNotSet')
+    else
+      Result := Result + #13#10#13#10 + CustomMessage('SignInNotSetUnknown');
+  end;
 end;
 
 function FailureText(): String;
@@ -711,10 +749,27 @@ procedure UpdateFinishedPage();
 var
   Text: String;
   Grow: Integer;
+  OffersStart: Boolean;
 begin
   WizardForm.FinishedLabel.ShowAccelChar := False;
+  // The box that starts the app is offered only when Setup can start the
+  // app as the person, without administrator rights: otherwise the box
+  // would start it as the account Setup runs as, with those rights. Inno
+  // Setup starts a ticked entry whether or not its list is shown, so the
+  // entry is unticked before the list is hidden.
+  OffersStart := CanStartAsPerson and not RunningAsSystem();
+  if WizardForm.RunList.Items.Count > 0 then begin
+    if not OffersStart then begin
+      WizardForm.RunList.Checked[0] := False;
+      WizardForm.RunList.Visible := False;
+    end else if Upgrading and not ClosedMine then
+      // On an update, the box is ticked only when Setup closed the
+      // person's own copy: it starts no copy for someone who ran none.
+      WizardForm.RunList.Checked[0] := False;
+  end;
   if DriverRestart then begin
-    // What happened comes first, then why Windows must restart.
+    // What happened comes first, then why Windows must restart, then what
+    // to do about the app.
     if DriverOutcome = 'ok' then
       Text := CustomMessage('DoneUpdated') + ExtraLines()
     else
@@ -724,19 +779,19 @@ begin
     else
       Text := Text + #13#10#13#10 + CustomMessage('RestartStarting');
     if StartsAgain() then
-      Text := Text + ' ' + CustomMessage('RestartAppAgain');
+      Text := Text + ' ' + CustomMessage('RestartAppAgain')
+    else if ClosedMine then
+      Text := Text + ' ' + CustomMessage('RestartStartYourself')
+    else if (DriverOutcome = 'ok') and not Upgrading then
+      Text := Text + #13#10#13#10 + CustomMessage('NextAfterRestart');
     Text := Text + #13#10#13#10 + CustomMessage('RestartNow');
   end else begin
     Text := OutcomeText();
-    if WizardForm.RunList.Items.Count > 0 then begin
-      if not CanStartAsPerson then begin
-        // The box would start the app as the account Setup runs as.
-        WizardForm.RunList.Visible := False;
-        Text := Text + #13#10#13#10 + CustomMessage('StartYourself');
-      end else if Upgrading and not ClosedMine then
-        // On an update, the box is ticked only when Setup closed the
-        // person's own copy: it starts no copy for someone who ran none.
-        WizardForm.RunList.Checked[0] := False;
+    if not OffersStart then begin
+      if PersonKnown then
+        Text := Text + #13#10#13#10 + CustomMessage('StartYourself')
+      else
+        Text := Text + #13#10#13#10 + CustomMessage('StartYourselfUnknown');
     end;
     Text := Text + #13#10#13#10 + SetupMessage(msgClickFinish);
   end;
@@ -805,31 +860,38 @@ var
 begin
   Result := '';
   GetWindowsVersionEx(Version);
-  if (Version.ProductType <> VER_NT_WORKSTATION) and not HasSwitch('ALLOWSERVER') then begin
-    Result := CustomMessage('ServerRefused');
-    Exit;
-  end;
-  if IsTestBuild() and not TestSigningOn() and not HasSwitch('ALLOWTESTBUILD') then begin
-    Result := CustomMessage('TestBuildRefused');
-    Exit;
-  end;
-  if not SamePath(ExpandConstant('{app}'), ProgramFilesDir()) then begin
+  if (Version.ProductType <> VER_NT_WORKSTATION) and not HasSwitch('ALLOWSERVER') then
+    Result := CustomMessage('ServerRefused')
+  else if IsTestBuild() and not TestSigningOn() and not HasSwitch('ALLOWTESTBUILD') then
+    Result := CustomMessage('TestBuildRefused')
+  else if not SamePath(ExpandConstant('{app}'), ProgramFilesDir()) then
     Result := FmtMessage(CustomMessage('DirRefused'), [ProgramFilesDir()]);
+  if Result <> '' then begin
+    Log('Setup stops before changing anything: ' + Result);
     Exit;
   end;
   // Closing the app comes last but one before the files go in, so that
   // nothing can stop Setup between the two.
   if not FindCopies(True) then begin
-    if CopiesMine > 0 then
+    // By what still runs: a copy of the person's, or only another account's.
+    if CopiesMine > CopiesMineClosed then
       Result := CustomMessage('CloseFailedMine')
-    else if PersonKnown and (CopiesOther > 0) then
+    else if PersonKnown and (CopiesOther > CopiesOtherClosed) then
       Result := CustomMessage('CloseFailedOther')
     else
       Result := CustomMessage('CloseFailedUnknown');
+    // The person's own copy is closed although another couldn't be: it
+    // starts again when Setup closes (DeinitializeSetup), or the person
+    // is told to start it.
+    if ClosedMine then begin
+      if StartsAgain() and not Moving then
+        Result := Result + #13#10#13#10 + CustomMessage('ClosedYoursStarts')
+      else
+        Result := Result + #13#10#13#10 + CustomMessage('ClosedYoursStartIt');
+    end;
+    Log('Setup stops: ' + Result);
     Exit;
   end;
-  ClosedMine := (CopiesClosed = 'ok') and (CopiesMine > 0);
-  ClosedOther := (CopiesClosed = 'ok') and (CopiesOther > 0);
   // Before anything can lose it, the earlier build's test certificate.
   RecordCertificate(AddBackslash(EarlierAppDir()) + 'driver\StreamToSpeaker.cer');
 end;
@@ -847,8 +909,9 @@ begin
 end;
 
 // No copy of the app runs after Setup: the one it closed belonged to
-// another account (or Setup couldn't tell whose it was), or Setup runs as
-// SYSTEM.
+// another account (or Setup couldn't tell whose it was), or Setup can't
+// start the person's own again without administrator rights, or it runs
+// as SYSTEM.
 function NoAppAfterwards(): Boolean;
 begin
   Result := (ClosedMine or ClosedOther) and not StartsAgain();
@@ -872,7 +935,7 @@ begin
     if RunningAsSystem() then
       Log('Not starting Stream To Speaker again: Setup runs as SYSTEM, with no person to start it for.')
     else if ClosedMine then
-      Log('Not starting Stream To Speaker again: Setup runs as another account than the person who used it, and can''t start programs as them.')
+      Log('Not starting Stream To Speaker again: Setup was started with administrator rights, and the app would run with them too.')
     else if not PersonKnown then
       Log('Not starting Stream To Speaker again: Setup could not tell which account the copy it closed ran in.')
     else
@@ -933,8 +996,9 @@ end;
 // administrator's). An interactive Setup does what the box on the tasks
 // page says; a silent one only when the tasks are given on its command
 // line (/TASKS or /MERGETASKS), and leaves the setting as it is otherwise.
-// When Setup can't act as the person (started with "Run as administrator"
-// from another account), it leaves the setting alone and says so.
+// When what Setup runs doesn't act on the person's account (started with
+// "Run as administrator" from another account, or the person couldn't be
+// told), it leaves the setting alone and says so.
 procedure ApplySignIn();
 var
   Wanted: Boolean;
@@ -945,8 +1009,8 @@ begin
   if WizardSilent and not (HasSwitch('TASKS') or HasSwitch('MERGETASKS')) then
     Exit;
   Wanted := WizardIsTaskSelected('autostart');
-  if not CanStartAsPerson then begin
-    Log('Start at sign-in: left as it is; Setup runs as another account than the person who ran it.');
+  if not CanActAsPerson then begin
+    Log('Start at sign-in: left as it is; Setup runs as another account than the person who ran it, or could not tell who that is.');
     SignInSkipped := Wanted;
     Exit;
   end;
@@ -957,6 +1021,7 @@ begin
     // Turned off in Task Manager or Settings earlier: the person has now
     // asked for it again.
     RegAsOriginalUser('delete "' + StartupApprovedKey + '" /v "{#MyAppName}" /f');
+    SignInTurnedOff := False;
   end else if SignInEntryExists() then
     Log('Start at sign-in: off, reg.exe exit code ' + IntToStr(RegAsOriginalUser(
       'delete "' + RunKey + '" /v "{#MyAppName}" /f')));
@@ -964,12 +1029,13 @@ end;
 
 // When Windows must restart and the person's copy was closed, the app
 // runs again after the restart too, once, for that account; when start at
-// sign-in is on, that already does it.
+// sign-in is on, that already does it (an entry the person turned off in
+// Task Manager or Settings doesn't).
 procedure ScheduleAfterRestart();
 begin
   if not DriverRestart or not StartsAgain() then
     Exit;
-  if SignInEntryExists() then
+  if SignInEntryExists() and not SignInTurnedOff then
     Exit;
   Log('Starting Stream To Speaker once after the restart: reg.exe exit code ' + IntToStr(RegAsOriginalUser(
     'add "' + RunOnceKey + '" /v "{#MyAppName}" /t REG_SZ /d "\"' + ExpandConstant('{app}\{#MyAppExeName}') + '\" --startup" /f')));

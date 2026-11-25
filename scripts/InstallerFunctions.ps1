@@ -1030,26 +1030,31 @@ function Get-AppCopies {
     })
 }
 
-# The person who ran Setup (Sid; '' when it can't be told) and whether
-# Setup can start a program as that person (CanStartAs).
+# The person who ran Setup (Sid; '' when it can't be told), whether Setup
+# can start a program as that person, without administrator rights
+# (CanStartAs), and whether what Setup runs "as the original user" acts on
+# that person's own account, so that its HKCU is the person's (CanActAs).
 # -SetupProcessId is the process Setup's [Code] runs in (<setup>.tmp),
 # started by the Setup program itself:
 #   - When Setup had to ask for elevation, Inno Setup started the Setup
 #     program again, elevated, from its first <setup>.tmp, which keeps
-#     running as the person to run programs as them: the grandparent is a
-#     process of the same name, and its owner is the person, also when an
-#     administrator's password approved the elevation.
+#     running as the person, without administrator rights, to run programs
+#     as them: the grandparent is a process of the same name, and its owner
+#     is the person, also when an administrator's password approved the
+#     elevation. Only then can Setup start a program as the person.
 #   - Otherwise Setup was started elevated, by the grandparent (Explorer's
-#     "Run as administrator", a prompt, a deployment tool), whose owner is
-#     the person. Setup can then start programs only as its own account, so
-#     only when that is the person's.
+#     "Run as administrator", an elevated prompt, a deployment tool), whose
+#     owner is the person. Whatever Setup starts then runs with
+#     administrator rights, as Setup's own account: it starts no app, and
+#     it changes the person's settings only when that account is the
+#     person's.
 function Get-SetupPerson {
     param(
         [int]$SetupProcessId,
         [scriptblock]$GetProcess = { param($Id) Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$Id" -ErrorAction SilentlyContinue },
         [scriptblock]$GetOwnerSid = { param($Process) try { [string](Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction Stop).Sid } catch { '' } }
     )
-    $person = [pscustomobject]@{ Sid = ''; CanStartAs = $false }
+    $person = [pscustomobject]@{ Sid = ''; CanStartAs = $false; CanActAs = $false }
     if (-not $SetupProcessId) { return $person }
     $chain = @()
     $p = & $GetProcess $SetupProcessId
@@ -1066,13 +1071,52 @@ function Get-SetupPerson {
     if ($chain.Count -lt 3) {
         # Whoever started the Setup program is gone: Setup's own account.
         $person.Sid = $setupAccount
-        $person.CanStartAs = [bool]$setupAccount
+        $person.CanActAs = [bool]$setupAccount
         return $person
     }
     $person.Sid = [string](& $GetOwnerSid $chain[2])
-    $respawned = $chain[2].Name -and $chain[2].Name -ieq $chain[0].Name
-    $person.CanStartAs = [bool]($person.Sid -and ($respawned -or $person.Sid -eq $setupAccount))
+    $respawned = [bool]($chain[2].Name -and $chain[2].Name -ieq $chain[0].Name)
+    $person.CanStartAs = [bool]($person.Sid -and $respawned)
+    $person.CanActAs = [bool]($person.Sid -and ($respawned -or $person.Sid -eq $setupAccount))
     $person
+}
+
+# Whether an account starts the app at sign-in: 'on'; 'off' when its entry
+# is there but turned off in Task Manager or Settings (Windows records that
+# under StartupApproved, with an odd first byte); 'none' without an entry.
+function Get-SignInState {
+    param(
+        [string]$Sid,
+        [string]$UsersRoot = 'Registry::HKEY_USERS',
+        [string]$ValueName = $StsProductName
+    )
+    if (-not $Sid) { return 'none' }
+    $base = "$UsersRoot\$Sid\Software\Microsoft\Windows\CurrentVersion"
+    $value = (Get-ItemProperty -LiteralPath "$base\Run" -Name $ValueName -ErrorAction SilentlyContinue).$ValueName
+    if (-not $value) { return 'none' }
+    $approved = (Get-ItemProperty -LiteralPath "$base\Explorer\StartupApproved\Run" -Name $ValueName -ErrorAction SilentlyContinue).$ValueName
+    if ($approved -is [byte[]] -and $approved.Count -gt 0 -and ($approved[0] -band 1)) { return 'off' }
+    'on'
+}
+
+# The line Setup reads back from Find-RunningCopies.ps1's output.
+#   -Closing  the copies to close (Get-CopyPlan's, those with Close set)
+#   -Tried    closing them was tried
+#   -Still    those of them that still run afterwards
+# closed-mine and closed-other count what is closed now, also when another
+# copy couldn't be closed: Setup then starts the person's copy again, or
+# says that it is closed.
+function Format-CopiesResult {
+    param([object[]]$Closing = @(), [bool]$Tried, [object[]]$Still = @(), $Person, [string]$SignIn = 'none')
+    $mine = @($Closing | Where-Object { $_.Mine }).Count
+    $stillIds = @($Still | ForEach-Object { $_.ProcessId })
+    $gone = @(if ($Tried) { $Closing | Where-Object { $stillIds -notcontains $_.ProcessId } })
+    $goneMine = @($gone | Where-Object { $_.Mine }).Count
+    $closed = if (-not $Tried -or -not $Closing.Count) { 'none' } elseif ($Still.Count) { 'failed' } else { 'ok' }
+    'running-copies: mine={0} other={1} closed={2} closed-mine={3} closed-other={4} person={5} start={6} settings={7} signin={8}' -f
+        $mine, ($Closing.Count - $mine), $closed, $goneMine, ($gone.Count - $goneMine),
+        $(if ($Person.Sid) { 'known' } else { 'unknown' }), $(if ($Person.CanStartAs) { 'yes' } else { 'no' }),
+        $(if ($Person.CanActAs) { 'yes' } else { 'no' }), $SignIn
 }
 
 # Ends these copies by process ID and waits up to 10 s for each; returns the

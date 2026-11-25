@@ -752,7 +752,7 @@ Test 'only copies started from the install folder are closed, and each is told a
     Assert-Equal 0 @($plan | Where-Object { $_.Mine }).Count 'nobody''s when the person is unknown'
 }
 
-Test 'the person who ran Setup is found also when an administrator''s password approved it' {
+Test 'the person who ran Setup is found, and the app is started for them only without administrator rights' {
     $t0 = Get-Date '2026-11-25 10:00:00'
     $p = { param($Id, $Parent, $Name, $Seconds, $Owner) [pscustomobject]@{ ProcessId = $Id; ParentProcessId = $Parent; Name = $Name; CreationDate = $t0.AddSeconds($Seconds); Owner = $Owner } }
     $tmp = 'StreamToSpeakerSetup-0.2.0.tmp'
@@ -766,19 +766,59 @@ Test 'the person who ran Setup is found also when an administrator''s password a
             # "Run as administrator" with an administrator's password.
             @(400, 390, $tmp, 3, 'ADMIN'), @(390, 380, $exe, 2, 'ADMIN'), @(380, 1, 'explorer.exe', 0, 'JANE'),
             # The parent's ID now belongs to a newer process.
-            @(300, 290, $tmp, 0, 'ADMIN'), @(290, 1, 'notepad.exe', 9, 'OTHER'))) {
+            @(300, 290, $tmp, 0, 'ADMIN'), @(290, 1, 'notepad.exe', 9, 'OTHER'),
+            # Whoever started the Setup program is gone.
+            @(500, 490, $tmp, 3, 'ADMIN'), @(490, 480, $exe, 2, 'ADMIN'))) {
         $procs[[int]$x[0]] = & $p $x[0] $x[1] $x[2] $x[3] $x[4]
     }
     $get = { param($Id) $procs[[int]$Id] }
     $owner = { param($P) $P.Owner }
-    $r = Get-SetupPerson -SetupProcessId 100 -GetProcess $get -GetOwnerSid $owner
-    Assert-Equal 'JANE yes' "$($r.Sid) $(if ($r.CanStartAs) { 'yes' } else { 'no' })" 'Setup asked for elevation'
-    $r = Get-SetupPerson -SetupProcessId 200 -GetProcess $get -GetOwnerSid $owner
-    Assert-Equal 'RUNNER yes' "$($r.Sid) $(if ($r.CanStartAs) { 'yes' } else { 'no' })" 'Setup started elevated by the same account'
-    $r = Get-SetupPerson -SetupProcessId 400 -GetProcess $get -GetOwnerSid $owner
-    Assert-Equal 'JANE no' "$($r.Sid) $(if ($r.CanStartAs) { 'yes' } else { 'no' })" 'Run as administrator with another account'
-    Assert-Equal '' (Get-SetupPerson -SetupProcessId 300 -GetProcess $get -GetOwnerSid $owner).Sid 'its parent is gone'
-    Assert-Equal '' (Get-SetupPerson -SetupProcessId 0 -GetProcess $get -GetOwnerSid $owner).Sid 'no process'
+    # The account; whether Setup starts the app for it; whether Setup changes its settings.
+    $say = { param($Id) $r = Get-SetupPerson -SetupProcessId $Id -GetProcess $get -GetOwnerSid $owner
+        "$($r.Sid) start=$(if ($r.CanStartAs) { 'yes' } else { 'no' }) settings=$(if ($r.CanActAs) { 'yes' } else { 'no' })" }
+    Assert-Equal 'JANE start=yes settings=yes' (& $say 100) 'Setup asked for elevation, and an administrator''s password approved it'
+    Assert-Equal 'RUNNER start=no settings=yes' (& $say 200) 'Setup started with administrator rights by the same account: the app would run with them'
+    Assert-Equal 'JANE start=no settings=no' (& $say 400) 'Run as administrator with another account'
+    Assert-Equal 'ADMIN start=no settings=yes' (& $say 500) 'whoever started the Setup program is gone'
+    Assert-Equal ' start=no settings=no' (& $say 300) 'its parent''s ID belongs to another process now'
+    Assert-Equal ' start=no settings=no' (& $say 0) 'no process'
+}
+
+Test 'a close that fails halfway says which copies are closed' {
+    $mine = [pscustomobject]@{ ProcessId = 11; Mine = $true; Close = $true }
+    $theirs = [pscustomobject]@{ ProcessId = 12; Mine = $false; Close = $true }
+    $jane = [pscustomobject]@{ Sid = 'S-1-5-21-9-1001'; CanStartAs = $true; CanActAs = $true }
+    Assert-Equal 'running-copies: mine=1 other=1 closed=failed closed-mine=1 closed-other=0 person=known start=yes settings=yes signin=off' `
+        (Format-CopiesResult -Closing @($mine, $theirs) -Tried $true -Still @($theirs) -Person $jane -SignIn 'off') 'the other account''s copy still runs'
+    Assert-Equal 'running-copies: mine=1 other=1 closed=ok closed-mine=1 closed-other=1 person=known start=yes settings=yes signin=none' `
+        (Format-CopiesResult -Closing @($mine, $theirs) -Tried $true -Person $jane) 'both closed'
+    Assert-Equal 'running-copies: mine=1 other=1 closed=none closed-mine=0 closed-other=0 person=known start=yes settings=yes signin=none' `
+        (Format-CopiesResult -Closing @($mine, $theirs) -Tried $false -Person $jane) 'only looked'
+    $nobody = [pscustomobject]@{ Sid = ''; CanStartAs = $false; CanActAs = $false }
+    Assert-Equal 'running-copies: mine=0 other=0 closed=none closed-mine=0 closed-other=0 person=unknown start=no settings=no signin=none' `
+        (Format-CopiesResult -Closing @() -Tried $true -Person $nobody) 'nothing to close, nobody known'
+}
+
+Test 'the person''s start-at-sign-in entry is read as on, turned off, or not there' {
+    $users = "$TestKey\SignInUsers"
+    $run = 'Software\Microsoft\Windows\CurrentVersion\Run'
+    $approved = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+    foreach ($u in 'S-1-5-21-1-1001', 'S-1-5-21-1-1002', 'S-1-5-21-1-1003', 'S-1-5-21-1-1004') {
+        $null = New-Item -Path "$users\$u\$run" -Force
+        $null = New-Item -Path "$users\$u\$approved" -Force
+    }
+    foreach ($u in 'S-1-5-21-1-1001', 'S-1-5-21-1-1002', 'S-1-5-21-1-1003') {
+        $null = New-ItemProperty -LiteralPath "$users\$u\$run" -Name 'Stream To Speaker' -Value '"C:\Program Files\Stream To Speaker\stream-to-speaker.exe" --startup'
+    }
+    $null = New-ItemProperty -LiteralPath "$users\S-1-5-21-1-1002\$approved" -Name 'Stream To Speaker' -PropertyType Binary -Value ([byte[]](2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    $null = New-ItemProperty -LiteralPath "$users\S-1-5-21-1-1003\$approved" -Name 'Stream To Speaker' -PropertyType Binary -Value ([byte[]](3, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8))
+    $null = New-ItemProperty -LiteralPath "$users\S-1-5-21-1-1004\$approved" -Name 'Stream To Speaker' -PropertyType Binary -Value ([byte[]](3, 0, 0, 0))
+    Assert-Equal 'on' (Get-SignInState -Sid 'S-1-5-21-1-1001' -UsersRoot $users) 'an entry Windows keeps no switch for'
+    Assert-Equal 'on' (Get-SignInState -Sid 'S-1-5-21-1-1002' -UsersRoot $users) 'an entry that is switched on'
+    Assert-Equal 'off' (Get-SignInState -Sid 'S-1-5-21-1-1003' -UsersRoot $users) 'an entry turned off in Task Manager'
+    Assert-Equal 'none' (Get-SignInState -Sid 'S-1-5-21-1-1004' -UsersRoot $users) 'no entry, only a switch left behind'
+    Assert-Equal 'none' (Get-SignInState -Sid 'S-1-5-21-1-1005' -UsersRoot $users) 'an account whose registry isn''t loaded'
+    Assert-Equal 'none' (Get-SignInState -Sid '' -UsersRoot $users) 'nobody'
 }
 
 Test 'without the app, Windows goes back to the output it played to before' {
