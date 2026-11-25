@@ -424,14 +424,14 @@ class ReusableWorkflowPermissions(unittest.TestCase):
         self.assertIsNone(permissions_block(["    runs-on: x"]))
 
 
-def env_of(lines):
-    """{NAME: value} of the `env:` block directly in `lines` (a job's or a
+def block_of(lines, key, name=r"[A-Za-z_][A-Za-z0-9_-]*"):
+    """{name: value} of the block `key:` directly in `lines` (a job's or a
     step's own lines)."""
     out, inside, depth = {}, False, None
     for line in lines:
         if not _content(line):
             continue
-        m = re.match(r"^(\s*)(?:- )?env:\s*$", line)
+        m = re.match(rf"^(\s*)(?:- )?{re.escape(key)}:\s*$", line)
         if m:
             inside, depth = True, len(m.group(1))
             continue
@@ -439,10 +439,15 @@ def env_of(lines):
             if _depth(line) <= depth:
                 inside = False
                 continue
-            k = re.match(r"^\s*([A-Z][A-Z0-9_]*):\s*(.*?)\s*$", line)
+            k = re.match(rf"^\s*({name}):\s*(.*?)\s*$", line)
             if k:
                 out[k.group(1)] = k.group(2)
     return out
+
+
+def env_of(lines):
+    """{NAME: value} of the `env:` block directly in `lines`."""
+    return block_of(lines, "env", r"[A-Z][A-Z0-9_]*")
 
 
 def substituted(text, env):
@@ -497,6 +502,37 @@ class WhatIsAttestedIsWhatIsPublished(unittest.TestCase):
         self.assertEqual(env_of(["    env:", "      A: x", "      B: ${{ y }}", "    steps:"]), {"A": "x", "B": "${{ y }}"})
         self.assertEqual(substituted('--signed-zip "canonical/$NAME" $env:X', {"NAME": "${{ a }}", "X": "b"}),
                          "--signed-zip canonical/${{ a }} b")
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class ThePackagePublishedIsTheOneVerifyMade(unittest.TestCase):
+    """Driver certified's publish job gets the canonical package from the
+    verify job as an artifact. With it, it is given the SHA-256 that the
+    step which made the package reported; certified.py release publishes
+    no file with another one."""
+    NAME = "driver-certified.yml"
+
+    def running(self, job, command):
+        steps = [s for s in jobs_steps(self.NAME)[job] if any(re.search(command, line) for line in step_script(s))]
+        self.assertEqual(len(steps), 1, f"{job}: the steps that run {command}")
+        return steps[0]
+
+    def test_release_is_given_the_digest_the_packing_step_reported(self):
+        made = self.running("verify", r"certified\.py\s+package\b")
+        outputs = block_of(job_block(self.NAME, "verify"), "outputs")
+        self.assertEqual(expression(outputs.get("signed_zip_sha256")),
+                         f"steps.{step_field(made, 'id')}.outputs.signed_zip_sha256")
+        release = self.running("publish", r"certified\.py\s+release\b")
+        given = re.findall(r'--signed-zip-sha256\s+"\$([A-Z0-9_]+)"', "\n".join(step_script(release)))
+        self.assertEqual(len(given), 1, "release is given --signed-zip-sha256 once, from an env value")
+        env = dict(env_of(job_block(self.NAME, "publish")), **env_of(release))
+        self.assertEqual(expression(env.get(given[0])), "needs.verify.outputs.signed_zip_sha256")
+        self.assertIn("verify", re.findall(r"[a-z-]+", job_fields(self.NAME)["publish"]["needs"]))
+
+    def test_the_block_reader(self):
+        lines = ["    outputs:", "      a_b: ${{ steps.x.outputs.a_b }}", "      c: d   ", "    env:", "      E: f"]
+        self.assertEqual(block_of(lines, "outputs"), {"a_b": "${{ steps.x.outputs.a_b }}", "c": "d"})
+        self.assertEqual(block_of(lines, "permissions"), {})
 
 
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")

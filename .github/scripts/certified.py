@@ -29,13 +29,16 @@ Subcommands:
   sys-match check 2 alone on two .sys files (used by driver-attested.yml
             to tie an attestation return to the submitted binary)
   package   verify, then write the canonical -Signed.zip locally (so its
-            provenance can be attested before anything is published)
+            provenance can be attested before anything is published) and
+            report its SHA-256
   release   put the canonical -Signed.zip that `package` made (--signed-zip:
-            the very file, checked against Microsoft's zip and against the
-            digest its provenance bundle names) and the bundle on the
-            driver-v<ver> release (creates it when missing), then
-            manifest.json, last. A certified release is never changed
-            (driver_release.py); the same inputs again change nothing.
+            the very file, which must have the SHA-256 `package` reported,
+            be the canonical package of Microsoft's zip and nothing else,
+            and be named by its provenance bundle when there is one) and
+            the bundle on the driver-v<ver> release (creates it when
+            missing), then manifest.json, last. A certified release is
+            never changed (driver_release.py); the same inputs again change
+            nothing.
 Stdlib only; release asset I/O goes through the gh CLI.
 """
 import argparse
@@ -48,6 +51,7 @@ import struct
 import sys
 import time
 import zipfile
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import attest  # noqa: E402
@@ -199,43 +203,107 @@ def verify_packages(ms_zip, lab_zip, version=None):
     return problems
 
 
-# The "version made by" host recorded for each entry. zipfile takes it
-# from the platform it runs on (0 on Windows, 3 elsewhere); pinned to 0, the
-# host of every package made on Windows (driver-v1.1.1.211's published
-# Signed.zip among them), so the same inputs give the same bytes anywhere.
-# A published package keeps the host it was made with (driver-v1.1.0.209's,
-# made on Linux, records 3): nothing rebuilds a published package, every
-# check compares it with the SHA-256 its manifest records.
+# The "version made by" host recorded for each entry: 0, the host of every
+# package made on Windows (driver-v1.1.1.211's published Signed.zip among
+# them). A published package keeps the host it was made with
+# (driver-v1.1.0.209's, made on Linux by a zip writer that took the host
+# from its platform, records 3): nothing rebuilds a published package,
+# every check compares it with the SHA-256 its manifest records.
 ZIP_HOST = 0
 
 
 def canonical_zip(ms_zip):
-    """Flat StreamToSpeaker.{inf,sys,cat} zip of Microsoft's package, with
-    fixed timestamps, attributes and host, so the same input always gives
-    the same bytes on every platform."""
-    ms = read_package(ms_zip)
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for name in PACKAGE_FILES:
-            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o644 << 16
-            info.create_system = ZIP_HOST
-            z.writestr(info, ms[name.lower()])
-    return buf.getvalue()
+    """The canonical package of Microsoft's zip: its inf, sys and cat,
+    deflated, in canonical_layout. The layout is the same wherever this
+    runs. The deflate streams are those of this Python's zlib, so two
+    platforms make the same bytes only while their zlib deflates alike;
+    nothing relies on that: a package is made once, by `package`, and every
+    later step takes that very file by its SHA-256."""
+    files = read_package(ms_zip)
+    streams = []
+    for name in PACKAGE_FILES:
+        deflate = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
+        streams.append(deflate.compress(files[name.lower()]) + deflate.flush())
+    return canonical_layout(files, streams)
+
+
+def canonical_layout(files, streams):
+    """The canonical package: `streams`, the raw deflate streams of the inf,
+    sys and cat in `files` (as read_package gives them), in PACKAGE_FILES
+    order, each behind its local header, then the central directory and
+    its end record. No folder, no extra field, no comment, nothing between
+    the parts. Every header field is fixed here (deflate, version 2.0, no
+    flags, 1980-01-01 00:00, mode 0644, host ZIP_HOST) or follows from the
+    file (CRC-32, sizes, offset), so the layout depends neither on the
+    platform nor on the Python that runs this. It is the layout Python's
+    zipfile wrote for driver-v1.1.1.211's published package."""
+    entries, directory, offset = [], [], 0
+    for name, stream in zip(PACKAGE_FILES, streams):
+        data, raw = files[name.lower()], name.encode("ascii")
+        # version needed, flags, method, time, date, CRC-32, sizes, name and extra lengths
+        fields = struct.pack("<HHHHHLLLHH", 20, 0, 8, 0, 33, zlib.crc32(data), len(stream), len(data), len(raw), 0)
+        entries.append(b"PK\x03\x04" + fields + raw + stream)
+        # version made by and host, the same fields, then: comment length,
+        # disk, internal attributes, external attributes, offset
+        directory.append(b"PK\x01\x02" + struct.pack("<BB", 20, ZIP_HOST) + fields
+                         + struct.pack("<HHHLL", 0, 0, 0, 0o644 << 16, offset) + raw)
+        offset += len(entries[-1])
+    central = b"".join(directory)
+    end = b"PK\x05\x06" + struct.pack("<HHHHLLH", 0, 0, len(directory), len(directory), len(central), offset, 0)
+    return b"".join(entries) + central + end
+
+
+def laid_out_streams(package):
+    """The three deflate streams of `package`, read from where
+    canonical_layout puts them, or None when the file ends before that.
+    An entry's compressed size is the one field of the layout that the
+    files themselves don't give; it is read from the entry's local header."""
+    streams, at = [], 0
+    for name in PACKAGE_FILES:
+        start = at + 30 + len(name)
+        if len(package) < start:
+            return None
+        size = struct.unpack_from("<L", package, at + 18)[0]
+        streams.append(package[start:start + size])
+        at = start + size
+    return streams
+
+
+def inflates_to(stream, data):
+    """True when `stream` is one whole raw deflate stream of exactly `data`,
+    with nothing after its end."""
+    d = zlib.decompressobj(-15)
+    try:
+        out = d.decompress(stream, len(data) + 1)
+    except zlib.error:
+        return False
+    return out == data and d.eof and not d.unused_data and not d.unconsumed_tail
 
 
 def signed_zip_problem(signed_zip, ms_zip):
-    """None when `signed_zip` is a package of exactly the inf/sys/cat in
-    Microsoft's zip, else what is wrong."""
+    """None when `signed_zip` is the canonical package of Microsoft's zip
+    and nothing else, else what is wrong. Byte for byte it must be
+    canonical_layout around three deflate streams, each of them exactly
+    one of Microsoft's inf, sys and cat: no other member, folder, comment
+    or stray byte passes. How the files were deflated is left open, since
+    that depends on the zlib of the job that packed them; `release`
+    compares the file's SHA-256 with the one that job reported."""
+    want = read_package(ms_zip)
+    streams = laid_out_streams(signed_zip)
+    if (streams is not None and canonical_layout(want, streams) == signed_zip
+            and all(inflates_to(s, want[n.lower()]) for n, s in zip(PACKAGE_FILES, streams))):
+        return None
+    # Refused. The rest says why, reading the file as a zip reader would.
     try:
-        got, want = read_package(signed_zip), read_package(ms_zip)
-    except (ValueError, zipfile.BadZipFile) as e:
-        return f"the canonical package can't be read: {e}"
+        got = read_package(signed_zip)
+    except Exception as e:  # whatever a file that is no package makes zipfile raise
+        return f"the canonical package can't be read as a zip: {e}"
     differ = [n for n in PACKAGE_FILES if got[n.lower()] != want[n.lower()]]
     if differ:
-        return f"the canonical package's {', '.join(differ)} differ from Microsoft's zip"
-    return None
+        return (f"the canonical package's {', '.join(differ)} differ{'s' if len(differ) == 1 else ''} from "
+                "Microsoft's zip")
+    return ("the canonical package holds Microsoft's inf, sys and cat, but not in the layout "
+            "`certified.py package` writes: something was added to it, or it was packed another way")
 
 
 # ---------------------------------------------------------------------------
@@ -531,9 +599,9 @@ def cmd_sys_match(a):
     return 0
 
 
-def checked_package(a):
-    """verify_packages on --ms-zip / --lab-zip, then the canonical zip:
-    (ms, lab, signed), or None after printing the problems."""
+def checked_inputs(a):
+    """verify_packages on --ms-zip / --lab-zip: (ms, lab), or None after
+    printing the problems."""
     with open(a.ms_zip, "rb") as f:
         ms = f.read()
     with open(a.lab_zip, "rb") as f:
@@ -541,42 +609,55 @@ def checked_package(a):
     problems = verify_packages(ms, lab, a.version)
     for p in problems:
         print(f"::error::{p}")
-    return None if problems else (ms, lab, canonical_zip(ms))
+    return None if problems else (ms, lab)
 
 
 def cmd_package(a):
     """The canonical Signed.zip, written to --out-dir before anything is
-    published, so the provenance step can attest it first."""
-    checked = checked_package(a)
+    published, so the provenance step can attest it first. Reports the
+    file's name and SHA-256: `release` takes no file with another one."""
+    checked = checked_inputs(a)
     if not checked:
         return 1
+    signed = canonical_zip(checked[0])
     name = f"StreamToSpeaker-Driver-{a.version}-Signed.zip"
     os.makedirs(a.out_dir, exist_ok=True)
     path = os.path.abspath(os.path.join(a.out_dir, name))
     with open(path, "wb") as f:
-        f.write(checked[2])
-    driver_release.outputs(signed_zip=path, signed_zip_name=name,
-                           signed_zip_sha256=hashlib.sha256(checked[2]).hexdigest())
+        f.write(signed)
+    driver_release.outputs(signed_zip=path, signed_zip_name=name, signed_zip_sha256=hashlib.sha256(signed).hexdigest())
     return 0
 
 
 def cmd_release(a):
-    """Publish the canonical package the verify job made (--signed-zip, the
-    file its provenance was made for), never one made again here."""
-    checked = checked_package(a)
+    """Publish the canonical package the verify job made (--signed-zip),
+    never one made again here. Before anything is written it must have the
+    SHA-256 that job reported (--signed-zip-sha256), be the canonical
+    package of Microsoft's zip and nothing else (signed_zip_problem), and
+    be named by the provenance bundle when there is one (--bundle: a
+    private repository gets none)."""
+    checked = checked_inputs(a)
     if not checked:
         return 1
-    ms, lab, _ = checked
+    ms, lab = checked
     with open(a.signed_zip, "rb") as f:
         signed = f.read()
-    problem = signed_zip_problem(signed, ms)
-    if problem:
-        raise driver_release.ReleaseError(problem)
-    if a.bundle:
+    name, digest = os.path.basename(a.signed_zip), hashlib.sha256(signed).hexdigest()
+    if digest != a.signed_zip_sha256:
+        reported = f"SHA-256 {a.signed_zip_sha256}" if a.signed_zip_sha256 else "no SHA-256"
+        problem = (f"the canonical package this job was given ({name}) is not the file the verify job made: "
+                   f"that job reported {reported} for it, and this file's is {digest}")
+    else:
+        problem = signed_zip_problem(signed, ms)
+    if not problem and a.bundle:
         from release_draft import bundle_problem  # imports repro_compare, which imports this module
-        problem = bundle_problem(a.bundle, os.path.basename(a.signed_zip), hashlib.sha256(signed).hexdigest())
-        if problem:
-            raise driver_release.ReleaseError(f"not publishing a file its provenance doesn't name: {problem}")
+        unnamed = bundle_problem(a.bundle, name, digest)
+        if unnamed:
+            problem = f"the provenance does not name the canonical package: {unnamed}"
+    if problem:
+        raise driver_release.ReleaseError(
+            f"{problem}. Nothing was changed. The package has to be made again: on this run's page, choose "
+            "\"Re-run all jobs\"")
     m = build_manifest(a.version, a.commit, a.source_hash, a.product_id, a.submission_id,
                        [s.strip() for s in a.os.split(",") if s.strip()], a.report_id, ms, lab, signed)
     tag = a.tag or f"driver-v{a.version}"
@@ -634,6 +715,8 @@ def main(argv=None):
     s.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     s.add_argument("--signed-zip", required=True,
                    help="the canonical package `package` made, published as it is (its provenance names it)")
+    s.add_argument("--signed-zip-sha256", required=True,
+                   help="the SHA-256 `package` reported for that file; a file with another one is refused")
     s.add_argument("--bundle", help="provenance bundle of the Signed.zip, published as <Signed.zip>.sigstore.json")
     s.add_argument("--tag"); s.add_argument("--version", required=True)
     s.add_argument("--commit", required=True); s.add_argument("--source-hash", required=True)

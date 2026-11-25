@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import unittest.mock
 import zipfile
+import zlib
 
 import certified
 import fake_gh
@@ -152,14 +153,45 @@ def zip_of(files):
 
 def zip_with_host(ms_zip, host):
     """canonical_zip's bytes as a build that records `host` would make them."""
-    real = zipfile.ZipInfo.__init__
-
-    def init(self, *a, **kw):
-        real(self, *a, **kw)
-        self.create_system = host
-    with unittest.mock.patch.object(zipfile.ZipInfo, "__init__", init), \
-            unittest.mock.patch.object(certified, "ZIP_HOST", host, create=True):
+    with unittest.mock.patch.object(certified, "ZIP_HOST", host):
         return certified.canonical_zip(ms_zip)
+
+
+def zipfile_package(ms_zip, host=0):
+    """The canonical package as Python's zipfile writes it when told the
+    date, the mode and the host: the writer that made driver-v1.1.1.211's
+    published package, and what canonical_layout must give byte for byte."""
+    files = certified.read_package(ms_zip)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in certified.PACKAGE_FILES:
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            info.create_system = host
+            z.writestr(info, files[name.lower()])
+    return buf.getvalue()
+
+
+def deflated(data, level=zlib.Z_DEFAULT_COMPRESSION):
+    """`data` as one raw deflate stream."""
+    z = zlib.compressobj(level, zlib.DEFLATED, -15)
+    return z.compress(data) + z.flush()
+
+
+def unfinished(data):
+    """`data` deflated in full, without the block that ends a deflate
+    stream: zipfile reads it all the same."""
+    z = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
+    return z.compress(data) + z.flush(zlib.Z_SYNC_FLUSH)
+
+
+def package_deflated_at(ms_zip, level):
+    """The canonical package of Microsoft's zip, its files deflated another
+    way than zipfile deflates them here: what another platform's zlib can
+    make of the same files."""
+    files = certified.read_package(ms_zip)
+    return certified.canonical_layout(files, [deflated(files[n.lower()], level) for n in certified.PACKAGE_FILES])
 
 
 def fake_packages(sys_code=b"K" * 64):
@@ -217,12 +249,13 @@ class VerifyPackages(unittest.TestCase):
             certified.read_package(zip_of({"a/StreamToSpeaker.sys": b"1", "b/StreamToSpeaker.sys": b"2",
                                            "StreamToSpeaker.inf": b"", "StreamToSpeaker.cat": b""}))
 
-    def test_canonical_zip_is_the_same_on_every_platform(self):
+    def test_the_canonical_package_has_one_layout_on_every_platform(self):
         # zipfile records the platform that made an entry (the "version
-        # made by" host: 0 on Windows, 3 elsewhere), so the same inputs made
-        # different zips on the Windows verify job and the Linux publish
-        # job. The builder pins it to 0, the host of every Windows-made
-        # package (driver-v1.1.1.211's published one among them).
+        # made by" host: 0 on Windows, 3 elsewhere), so the same inputs
+        # made different zips on Windows and on Linux. The package has the
+        # layout zipfile writes with host 0, the host of every Windows-made
+        # package (driver-v1.1.1.211's published one among them), wherever
+        # it is made.
         ms, _ = fake_packages()
         made = {}
         real = sys.platform
@@ -233,10 +266,12 @@ class VerifyPackages(unittest.TestCase):
             finally:
                 sys.platform = real
         self.assertEqual(made["win32"], made["linux"])
+        self.assertEqual(made["linux"], zipfile_package(ms))
         self.assertEqual({i.create_system for i in zipfile.ZipFile(io.BytesIO(made["linux"])).infolist()}, {0})
         # What used to differ: only that host byte of each central
         # directory entry.
         unix = zip_with_host(ms, 3)
+        self.assertEqual(unix, zipfile_package(ms, host=3))
         self.assertEqual(len(unix), len(made["linux"]))
         differ = [i for i, (a, b) in enumerate(zip(unix, made["linux"])) if a != b]
         self.assertEqual(len(differ), len(certified.PACKAGE_FILES))
@@ -247,6 +282,58 @@ class VerifyPackages(unittest.TestCase):
         z1, z2 = certified.canonical_zip(ms), certified.canonical_zip(ms)
         self.assertEqual(z1, z2)
         self.assertEqual(sorted(zipfile.ZipFile(io.BytesIO(z1)).namelist()), sorted(certified.PACKAGE_FILES))
+
+
+class TheCanonicalPackageAndNothingElse(unittest.TestCase):
+    """signed_zip_problem: the package `release` is given must be, byte for
+    byte, what `package` lays out around Microsoft's three files, however
+    a platform's zlib deflated them."""
+
+    def setUp(self):
+        self.ms, _ = fake_packages()
+        self.package = certified.canonical_zip(self.ms)
+        self.files = certified.read_package(self.ms)
+        self.streams = [deflated(self.files[n.lower()]) for n in certified.PACKAGE_FILES]
+
+    def test_the_layout_is_the_zip_that_package_makes(self):
+        self.assertEqual(certified.canonical_layout(self.files, self.streams), self.package)
+
+    def test_the_package_is_accepted_however_its_files_were_deflated(self):
+        self.assertIsNone(certified.signed_zip_problem(self.package, self.ms))
+        for level in (0, 1, 9):
+            other = package_deflated_at(self.ms, level)
+            self.assertNotEqual(other, self.package)
+            self.assertIsNone(certified.signed_zip_problem(other, self.ms), level)
+
+    def test_anything_else_in_the_file_is_refused(self):
+        # Each of these holds Microsoft's three files, which is all the
+        # check used to look at.
+        flat = {n: self.files[n.lower()] for n in certified.PACKAGE_FILES}
+        cases = {
+            "another member": zip_of({**flat, "readme.txt": b"hello"}),
+            "the files in a folder": zip_of({f"drivers/{n}": d for n, d in flat.items()}),
+            "other dates and attributes": zip_of(flat),
+            "made on another host": zip_with_host(self.ms, 3),
+            "bytes after the archive": self.package + b"more",
+            "bytes before the archive": b"more" + self.package,
+            "an archive comment": self.package[:-2] + struct.pack("<H", 4) + b"more",
+            "bytes after a file's deflate stream": certified.canonical_layout(
+                self.files, [self.streams[0] + b"more"] + self.streams[1:]),
+            "a deflate stream without its end": certified.canonical_layout(
+                self.files, [unfinished(self.files["streamtospeaker.inf"])] + self.streams[1:]),
+        }
+        for what, data in cases.items():
+            with self.subTest(what):
+                self.assertEqual(certified.read_package(data), self.files, "the three files are Microsoft's")
+                self.assertIn("not in the layout", certified.signed_zip_problem(data, self.ms) or "accepted")
+
+    def test_other_files_than_microsofts_are_refused(self):
+        other = certified.canonical_zip(fake_packages(b"L" * 64)[0])
+        self.assertIn("StreamToSpeaker.sys differ", certified.signed_zip_problem(other, self.ms))
+
+    def test_what_is_not_a_package_is_refused(self):
+        for data in (b"", b"not a zip", self.package[:40], zip_of({"StreamToSpeaker.inf": b"x"})):
+            self.assertIn("can't be read", certified.signed_zip_problem(data, self.ms))
 
 
 class PublishingTheRelease(unittest.TestCase):
@@ -275,21 +362,29 @@ class PublishingTheRelease(unittest.TestCase):
         fake.add_release(self.TAG, {self.LAB: self.lab, **assets}, target=self.COMMIT)
         return fake
 
-    def release(self, fake, *extra, signed=None):
-        # The canonical package as the verify job hands it to publish.
+    def release(self, fake, *extra, signed=None, made=None):
+        """`signed`: the canonical package as the verify job hands it to
+        publish (default: the one `package` makes); `made`: the SHA-256
+        the verify job reported for the package it made (default: of that
+        file)."""
         if not os.path.exists("signed.zip") or signed is not None:
             with open("signed.zip", "wb") as fh:
                 fh.write(certified.canonical_zip(self.ms) if signed is None else signed)
+        if made is None:
+            with open("signed.zip", "rb") as fh:
+                made = hashlib.sha256(fh.read()).hexdigest()
         argv = ["release", "--repo", self.REPO, "--tag", self.TAG, "--version", "1.1.0.209",
                 "--commit", self.COMMIT, "--source-hash", "5" * 64, "--product-id", "1",
                 "--submission-id", "2", "--ms-zip", "ms.zip", "--lab-zip", "lab.zip",
-                "--signed-zip", "signed.zip", *extra]
+                "--signed-zip", "signed.zip", "--signed-zip-sha256", made, *extra]
         with unittest.mock.patch("subprocess.run", fake_gh.subprocess_run(fake)), \
-                unittest.mock.patch("sys.stdout", io.StringIO()):
+                unittest.mock.patch("sys.stdout", io.StringIO()) as out:
             try:
                 return certified.main(argv)
             except Exception as e:  # what the workflow step would see as a failure
                 return e
+            finally:
+                self.output = out.getvalue()
 
     def test_the_lab_package_on_the_release_is_never_uploaded_again(self):
         fake = self.fake()
@@ -321,18 +416,92 @@ class PublishingTheRelease(unittest.TestCase):
 
     def test_what_is_published_is_the_file_it_is_given(self):
         # The file the verify job made and the provenance names, not one
-        # made again here.
-        other_host = zip_with_host(self.ms, 3)
+        # made again here: the verify job's zlib need not deflate the files
+        # as this job's does.
+        given = package_deflated_at(self.ms, 1)
+        self.assertNotEqual(given, certified.canonical_zip(self.ms))
         fake = self.fake()
-        self.assertEqual(self.release(fake, signed=other_host), 0)
-        self.assertEqual(fake.files(self.TAG)[self.SIGNED], other_host)
-        self.assertEqual(fake.manifest(self.TAG)["signed_zip_sha256"], hashlib.sha256(other_host).hexdigest())
+        self.assertEqual(self.release(fake, signed=given), 0, self.output)
+        self.assertEqual(fake.files(self.TAG)[self.SIGNED], given)
+        self.assertEqual(fake.manifest(self.TAG)["signed_zip_sha256"], hashlib.sha256(given).hexdigest())
+
+    def test_a_package_that_holds_anything_else_is_refused(self):
+        files = {n: certified.read_package(self.ms)[n.lower()] for n in certified.PACKAGE_FILES}
+        for what, signed in (("another member", zip_of({**files, "readme.txt": b"hello"})),
+                             ("made on another host", zip_with_host(self.ms, 3))):
+            with self.subTest(what):
+                fake = self.fake()
+                self.assertEqual(self.release(fake, signed=signed), 1)
+                self.assertIn("not in the layout", self.output)
+                self.assertIn('Nothing was changed. The package has to be made again', self.output)
+                self.assertIn('choose "Re-run all jobs"', self.output)
+                self.assertEqual(fake.writes(), [])
+
+    def test_a_package_other_than_the_one_the_verify_job_made_is_refused(self):
+        # A correct package, but not the file whose SHA-256 the verify job
+        # reported: its artifact was replaced on the way.
+        made = hashlib.sha256(certified.canonical_zip(self.ms)).hexdigest()
+        given = package_deflated_at(self.ms, 1)
+        fake = self.fake()
+        self.assertEqual(self.release(fake, signed=given, made=made), 1)
+        self.assertIn(f"that job reported SHA-256 {made}", self.output)
+        self.assertIn(f"this file's is {hashlib.sha256(given).hexdigest()}", self.output)
+        self.assertIn("Nothing was changed", self.output)
+        self.assertEqual(fake.writes(), [])
+
+    def test_only_the_whole_digest_as_the_verify_job_reports_it_passes(self):
+        # What a mistake in the workflow could hand over instead of the
+        # digest of the very file this job holds.
+        right = hashlib.sha256(certified.canonical_zip(self.ms)).hexdigest()
+        fake = self.fake()
+        for reported in ("", right.upper(), right[:-1], "sha256:" + right, right + " "):
+            with self.subTest(reported):
+                self.assertEqual(self.release(fake, made=reported), 1)
+                self.assertEqual(fake.writes(), [])
+        self.release(fake, made="")
+        self.assertIn("that job reported no SHA-256", self.output)
+        self.assertEqual(self.release(fake, made=right), 0, self.output)
+
+    def test_release_publishes_what_package_made_and_reported(self):
+        # The two halves as the workflow runs them: `package` writes the
+        # file and reports its name and SHA-256, `release` is given both.
+        with unittest.mock.patch.dict(os.environ, {"GITHUB_OUTPUT": os.path.abspath("out.txt")}), \
+                unittest.mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(certified.main(["package", "--ms-zip", "ms.zip", "--lab-zip", "lab.zip",
+                                             "--version", "1.1.0.209", "--out-dir", "canonical"]), 0)
+        with open("out.txt", encoding="utf-8") as fh:
+            reported = dict(line.rstrip("\n").split("=", 1) for line in fh)
+        self.assertEqual(reported["signed_zip_name"], self.SIGNED)
+        self.assertEqual(os.listdir("canonical"), [self.SIGNED])
+        with open(reported["signed_zip"], "rb") as fh:
+            made = fh.read()
+        self.assertEqual(reported["signed_zip_sha256"], hashlib.sha256(made).hexdigest())
+        self.assertEqual(made, zipfile_package(self.ms))
+        fake = self.fake()
+        argv = ["release", "--repo", self.REPO, "--tag", self.TAG, "--version", "1.1.0.209", "--commit", self.COMMIT,
+                "--source-hash", "5" * 64, "--product-id", "1", "--submission-id", "2", "--ms-zip", "ms.zip",
+                "--lab-zip", "lab.zip", "--signed-zip", os.path.join("canonical", reported["signed_zip_name"]),
+                "--signed-zip-sha256", reported["signed_zip_sha256"]]
+        with unittest.mock.patch("subprocess.run", fake_gh.subprocess_run(fake)), \
+                unittest.mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(certified.main(argv), 0)
+        self.assertEqual(fake.files(self.TAG)[self.SIGNED], made)
+        self.assertEqual(fake.manifest(self.TAG)["signed_zip_sha256"], reported["signed_zip_sha256"])
+
+    def test_the_digest_the_verify_job_reported_is_required(self):
+        argv = ["release", "--repo", self.REPO, "--version", "1.1.0.209", "--commit", self.COMMIT,
+                "--source-hash", "5" * 64, "--product-id", "1", "--submission-id", "2", "--ms-zip", "ms.zip",
+                "--lab-zip", "lab.zip", "--signed-zip", "signed.zip"]
+        with unittest.mock.patch("sys.stderr", io.StringIO()) as err, self.assertRaises(SystemExit):
+            certified.main(argv)
+        self.assertIn("--signed-zip-sha256", err.getvalue())
 
     def test_a_file_the_provenance_does_not_name_is_refused(self):
         fake = self.fake()
         with open("bundle.json", "wb") as fh:
             fh.write(bundle_for(b"another zip", self.SIGNED))
-        self.assertNotEqual(self.release(fake, "--bundle", "bundle.json"), 0)
+        self.assertEqual(self.release(fake, "--bundle", "bundle.json"), 1)
+        self.assertIn("the provenance does not name the canonical package", self.output)
         self.assertEqual(fake.writes(), [])
         with open("bundle.json", "wb") as fh:
             fh.write(bundle_for(certified.canonical_zip(self.ms), self.SIGNED))

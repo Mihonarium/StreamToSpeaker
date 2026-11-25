@@ -296,6 +296,7 @@ jobs:
     outputs:
       source_hash: ${{ steps.srchash.outputs.hash }}
       signed_zip_name: ${{ steps.package.outputs.signed_zip_name }}
+      signed_zip_sha256: ${{ steps.package.outputs.signed_zip_sha256 }}
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.resolve.outputs.tag }}
@@ -469,15 +470,18 @@ jobs:
         with:
           subject-path: canonical/${{ needs.verify.outputs.signed_zip_name }}
 
-      # The very package verify made and the provenance names (release
-      # checks it holds Microsoft's files and is the file the bundle
-      # attests; it never makes one again), Microsoft's zip unless the
-      # release holds it already, the .sha256 sidecars and the bundle, then
-      # the notes, then manifest.json last.
+      # The very package verify made and the provenance names. Before it
+      # writes anything, release checks that the file has the SHA-256
+      # verify reported for the package it made, that byte for byte it is
+      # the canonical package of Microsoft's zip and nothing else, and
+      # that the bundle names it; it never makes one again. Then:
+      # Microsoft's zip unless the release holds it already, the .sha256
+      # sidecars and the bundle, the notes, and manifest.json last.
       - name: Publish canonical package + manifest (certified=true)
         env:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
           SIGNED_ZIP_NAME: ${{ needs.verify.outputs.signed_zip_name }}
+          SIGNED_ZIP_SHA256: ${{ needs.verify.outputs.signed_zip_sha256 }}
         run: |
           set -euo pipefail
           # An empty id (the ms_zip_asset path may have none) reaches python
@@ -485,7 +489,7 @@ jobs:
           args=(--repo "$GITHUB_REPOSITORY" --tag "$TAG" --version "$VERSION" --commit "$COMMIT"
                 --source-hash "$SOURCE_HASH" --product-id "$PRODUCT_ID" --submission-id "$SUBMISSION_ID"
                 --os "$SIGNATURES" --ms-zip "packages/$MS_ZIP" --lab-zip "packages/$LAB_ZIP"
-                --signed-zip "canonical/$SIGNED_ZIP_NAME")
+                --signed-zip "canonical/$SIGNED_ZIP_NAME" --signed-zip-sha256 "$SIGNED_ZIP_SHA256")
           if [ -n "$REPORT_ID" ]; then args+=(--report-id "$REPORT_ID"); fi
           if [ -n "$BUNDLE_PATH" ]; then args+=(--bundle "$BUNDLE_PATH"); fi
           python3 .github/scripts/certified.py release "${args[@]}"

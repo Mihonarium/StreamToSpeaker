@@ -666,15 +666,18 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
      what the kernel relies on), and a *Microsoft Windows Hardware
      Compatibility Publisher* signature on the `.sys` at any index of
      `signtool verify /all`.
-   Then it makes the canonical flat `…-Signed.zip` (the same bytes on any
-   platform: the zip's "version made by" host is pinned to 0, as in every
-   Windows-made package), and the job `publish` (main only, never in a dry
-   run) attests the provenance of that very file and publishes it — it
-   checks that the file holds Microsoft's files and is the one the
-   provenance names, and never makes one again — with
+   Then it makes the canonical `…-Signed.zip`: Microsoft's INF, SYS and
+   CAT and nothing else, in one fixed layout (no folder, fixed dates and
+   attributes, host 0 in the zip's headers as in every Windows-made
+   package). The job `publish` (main only, never in a dry run) attests the
+   provenance of that very file and publishes it; it never makes one
+   again. Before it writes anything it checks that the file has the
+   SHA-256 `verify` reported for the package it made, that byte for byte
+   it is that layout around exactly Microsoft's three files, and that the
+   provenance bundle names it. With the `…-Signed.zip` it publishes
    `StreamToSpeaker-Driver-<ver>-Microsoft.zip`
    (as returned; the hand-attached lab package is checked, never uploaded
-   again), the `…-Signed.zip`, the `.sha256` sidecars and the provenance
+   again), the `.sha256` sidecars and the provenance
    bundle, and last `manifest.json` with
    `certified: true`, `certification: {product_id, submission_id, os,
    report_id}`, `source_hash` computed on the windows-2022 runner, and
@@ -696,14 +699,19 @@ The script behind it is `.github/scripts/certified.py` (`inputs`, `hash`,
 dispatch input and writes the values all later steps use; unit tests in
 `test_certified.py`, run in the workflow's guard step). `release` can be
 run locally with `gh` to publish a release from hand-downloaded files,
-after `package` made the canonical zip it takes as `--signed-zip`: the
+after `package` made the canonical zip: `release` takes that file as
+`--signed-zip` and the SHA-256 that `package` printed for it
+(`signed_zip_sha256=…`) as `--signed-zip-sha256`. The
 same inputs again change nothing, and a release that is already
 certified is never changed (other inputs are refused). Published
 packages keep the bytes they were made with: `driver-v1.1.0.209`'s was
 made on Linux (host 3 in its headers), `driver-v1.1.1.211`'s on Windows
-(host 0, the form `package` makes everywhere now). Nothing rebuilds a
-published package: every check compares it with the SHA-256 its
-manifest records.
+(host 0, the layout `package` writes everywhere now). The layout is the
+same wherever `package` runs; the compressed bytes inside it come from
+that machine's zlib, and another zlib may compress the same files
+differently. So a package is made once and handed on as a file, and
+nothing rebuilds a published package: every check compares it with the
+SHA-256 its manifest records.
 
 ## Reproducibility check (`driver-reproducibility.yml`)
 
