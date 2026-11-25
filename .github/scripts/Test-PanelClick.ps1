@@ -281,19 +281,26 @@ function Start-AppByHand([string]$label) {
     Say "Shortcut on the desktop: $lnkPath ($($argv -join ' '))"
     (New-Object -ComObject Shell.Application).MinimizeAll()
     Say "Showed the desktop (every window minimized); the foreground: $([PanelRig.Windows]::Foreground())"
+    # The windows take a moment to go: look until the shortcut is what is
+    # at its place.
     $item = $null
+    $there = $null
+    $ready = $false
     $deadline = (Get-Date).AddSeconds(15)
-    while (-not $item -and (Get-Date) -lt $deadline) {
+    while (-not $ready -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
         foreach ($class in "Progman", "WorkerW") {
             $top = Get-UiaTopLevel $class
             $item = @(Find-UiaNamed $top "^$([regex]::Escape($ShortcutName))$") | Select-Object -First 1
             if ($item) { break }
         }
+        if ($item) {
+            $there = Get-UiaAt $item.X $item.Y
+            $ready = $there -and $there.Name -eq $ShortcutName
+        }
     }
     if (-not $item) { throw "the shortcut doesn't show on the desktop" }
-    $there = Get-UiaAt $item.X $item.Y
-    if (-not $there -or $there.Name -ne $ShortcutName) {
+    if (-not $ready) {
         throw "at the shortcut's place ($($item.Rect)) is $(if ($there) { $there.What } else { 'nothing UI Automation knows of' }), not the shortcut: not double-clicking"
     }
     $since = Get-Date
@@ -351,8 +358,13 @@ function Invoke-TrayQuit($proc, $rec) {
     $deadline = (Get-Date).AddSeconds(5)
     while (-not $item -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 250
-        # A window's menu is a top-level window of class #32768.
-        $item = @(Find-UiaNamed (Get-UiaTopLevel "#32768") '^Quit') | Select-Object -First 1
+        # A window's menu is a top-level window of class #32768; its Quit
+        # item counts only if it is what is at its place.
+        $found = @(Find-UiaNamed (Get-UiaTopLevel "#32768") '^Quit') | Select-Object -First 1
+        if ($found) {
+            $there = Get-UiaAt $found.X $found.Y
+            if ($there -and $there.Name -match '^Quit') { $item = $found }
+        }
     }
     if (-not $item) {
         $rec.Shot("no-quit-in-the-menu")
