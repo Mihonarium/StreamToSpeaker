@@ -509,6 +509,18 @@ class PanelClick(unittest.TestCase):
         self.assertTrue(run)
         self.assertLessEqual(run, covered)
 
+    def test_a_case_whose_script_never_ran_to_its_end_says_the_rig_failed(self):
+        steps = jobs_steps(self.NAME)["click"]
+        names = [step_field(step, "name") for step in steps]
+        rig = names.index("Start the app and click its tray icon")
+        said = names.index("Say when the rig itself failed")
+        kept = names.index("Keep the pictures and logs")
+        self.assertTrue(rig < said < kept)
+        self.assertEqual(expression(step_field(steps[said], "if")), "always()")
+        self.assertTrue(any("verdict.txt" in line for line in step_script(steps[said])))
+        with open(os.path.join(GITHUB_DIR, "scripts", "Test-PanelClick.ps1"), encoding="utf-8") as fh:
+            self.assertIn('"verdict.txt"', fh.read())
+
     def test_one_build_serves_every_case_and_a_failing_case_stops_none(self):
         jobs = job_fields(self.NAME)
         self.assertNotIn("strategy", jobs["build"])

@@ -218,6 +218,26 @@ jobs:
           -FirstRun:($env:FIRST_RUN -eq "true") -Tray $env:TRAY
           -Out (Join-Path $env:RUNNER_TEMP "panel-click")
 
+      # The script writes its verdict, or why the rig failed, to the step
+      # summary and verdict.txt. Without verdict.txt the script never ran or
+      # was ended before its end (a script that doesn't parse, a timeout):
+      # the page then says that the rig failed, not anything about the panel.
+      - name: Say when the rig itself failed
+        if: always()
+        shell: pwsh
+        env:
+          CASE: ${{ matrix.case.name }}
+        run: |
+          $verdict = Join-Path $env:RUNNER_TEMP "panel-click\verdict.txt"
+          if (-not (Test-Path -LiteralPath $verdict)) {
+            @(
+              "### $($env:CASE): the rig failed before it could judge anything"
+              ""
+              "The case's script didn't run to its end (see the step 'Start the app and click its tray icon'). Nothing about the panel was judged."
+            ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+            Write-Host "::error::the rig failed in case $($env:CASE): its script didn't run to its end"
+          }
+
       - name: Keep the pictures and logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
