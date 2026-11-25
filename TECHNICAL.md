@@ -85,35 +85,65 @@ live — `N` bumps on every shipped binary.
 ```
 
 Output: `installer\out\StreamToSpeakerSetup-<version>.exe`. Needs Inno Setup
-6.3 or later. Setup:
+6.3 or later. Setup installs in `C:\Program Files\Stream To Speaker` and
+nowhere else: it installs a driver and the uninstaller runs its files as
+administrator, so they must be where only administrators can change them.
+It has no folder page and refuses a `/DIR=` that names another folder (exit
+code 1). Setup:
 
-1. refuses Windows Server, where the driver doesn't run (`/ALLOWSERVER` lets the
-   installer lifecycle test run on its Windows Server runners);
-2. once Install is clicked, closes a running copy (also one in another account;
-   a silent install doesn't ask) and starts it again afterwards;
-3. limits changes to an install folder outside Program Files to administrators,
-   since the uninstaller runs files from it as administrator;
-4. runs `scripts\Install-Driver.ps1`, which installs the driver package and
+1. refuses, before changing anything (exit code 7), Windows Server, where the
+   driver doesn't run, and a test build on a PC whose Windows isn't in
+   test-signing mode, where its driver can't start (`/ALLOWSERVER` and
+   `/ALLOWTESTBUILD` let the installer lifecycle test run on its Windows
+   Server runners);
+2. once Install is clicked, closes the copies of the app that run from the
+   install folder, in any account (a silent install doesn't ask), by
+   process; a copy started from anywhere else is left alone. It starts the
+   app again afterwards only for the person whose copy it closed, and only
+   when it can start programs as that person (not when another account's
+   password was used with "Run as administrator", not as SYSTEM); then no
+   copy runs, and Windows' default output goes back to the one it used
+   before (`scripts\Find-RunningCopies.ps1`);
+3. runs `scripts\Install-Driver.ps1`, which installs the driver package and
    reports what happened: an update whose driver is already installed leaves
-   the device, its sound output and Windows' audio services alone; a new driver
-   goes into the driver store first and then onto the existing device (which
-   keeps its sound output and Windows' choice of output); the device is created
-   with `devcon install` only when there is none; an output that still has an
-   early build's cached settings is rebuilt and gets its default-output roles
-   back. The decisions are plain functions in `scripts\InstallerFunctions.ps1`,
-   tested by `scripts\tests\*.Tests.ps1` (Windows PowerShell);
-5. adds an inbound Windows Firewall rule for the app on private and work
+   the device, its sound output and Windows' audio services alone; a new
+   driver goes into the driver store first and then onto the existing device,
+   updated in place, so its sound output and Windows' choice of output should
+   stay (not yet confirmed on real hardware); the device is created with
+   `devcon install` only when there is none; a working device without a sound
+   output, or an output that still has an early build's cached settings, is
+   rebuilt (a new device first, the old one removed only once the new one
+   works) and gets its default-output roles back; with more than one device,
+   the one Windows plays to stays. Earlier driver packages, and the test
+   certificates only they needed, go once the new driver runs. The decisions
+   are plain functions in `scripts\InstallerFunctions.ps1`, tested by
+   `scripts\tests\*.Tests.ps1` (Windows PowerShell). The same script repairs
+   an installed copy on its own, elevated:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Stream To Speaker\scripts\Install-Driver.ps1"`;
+   its last line is `driver-step-result: <result> restart=0|1 ...` and its
+   exit code 0 (working), 3010 (working after a restart) or 20-25 (see the
+   script);
+4. adds an inbound Windows Firewall rule for the app on private and work
    networks (`scripts\Set-FirewallRule.ps1`);
-6. writes "start at sign-in" for the account that ran Setup, not the
-   administrator who approved it.
+5. writes "start at sign-in" for the account that ran Setup, not the
+   administrator who approved it;
+6. when an earlier version was installed in another folder, takes over its
+   uninstall entry, shortcuts and start-at-sign-in entries and removes from
+   that folder, by name, only the files releases put there (nothing in it is
+   run; nothing is deleted through a link or junction); the folder goes when
+   it is empty (`scripts\Remove-EarlierInstall.ps1`).
 
-Its last page says what happened and what to do, and a silent install returns
-exit code 20 when the sound device isn't working (`/RESTARTEXITCODE=` chooses
-the code for a restart that is due; 0 by default). The scripts log to
-`logs\install.log` in the install directory, not to `%LOCALAPPDATA%`;
-`scripts\Diagnose.ps1` prints a report of the driver, the device, the sound
-output and the firewall, with account, computer and speaker names left out, and
-`scripts\Reset-Install.ps1` clears the driver for a fresh start. Uninstall
+The Start-menu entry is always made and carries the AppUserModelID
+`StreamToSpeaker.App`, which the app must use too when it shows Windows
+notifications. Setup's last page says what happened and what to do. Exit
+codes besides Inno Setup's own: 20 when Setup couldn't finish setting up the
+sound driver, 3010 for a silent install that needs a restart (a silent
+install never restarts the PC). The scripts log to `logs\install.log` in the
+install directory, not to `%LOCALAPPDATA%`; `scripts\Diagnose.ps1` prints a
+report of the driver, the device, the sound output and the firewall, with
+names and addresses replaced (it asks, first and last, to be read through
+before it is posted), and `scripts\Reset-Install.ps1` clears the driver for a
+fresh start. Uninstall
 closes the app and removes the device, the driver packages, Windows' cached
 entries for the sound output, the test certificates a test-signed build made
 Windows trust (`LocalMachine\Root` and `TrustedPublisher`), the firewall rules

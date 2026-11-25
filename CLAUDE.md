@@ -48,15 +48,15 @@ Don't bump the prefix for routine fixes — the auto-bumped revision is the righ
 
 ## Install / upgrade flow
 
-End users install via `StreamToSpeakerSetup-<version>.exe` (produced by CI). After copying the files, Setup runs `scripts/Install-Driver.ps1` (decisions in `scripts/InstallerFunctions.ps1`, tests in `scripts/tests/`) and reads back what happened:
+End users install via `StreamToSpeakerSetup-<version>.exe` (produced by CI). Setup installs in `C:\Program Files\Stream To Speaker` only (no folder page; a `/DIR=` elsewhere is refused with exit code 1; an earlier install elsewhere is moved, see `scripts/Remove-EarlierInstall.ps1`). It refuses Windows Server and a test build on a PC without test signing before changing anything (`/ALLOWSERVER`, `/ALLOWTESTBUILD` for the lifecycle test). After copying the files, Setup runs `scripts/Install-Driver.ps1` (decisions in `scripts/InstallerFunctions.ps1`, tests in `scripts/tests/`) and reads back what happened:
 
-1. Test builds only: makes Windows trust the shipped test-signing cert (TrustedPublisher + Root) and records it for the uninstaller
-2. Looks at what is installed: our devices, the driver the service points at, the packages in the store, the cached `HKLM\…\MMDevices\Audio\Render\<id>` entries
-3. **Same driver, working device:** changes nothing (device, endpoint, Windows' default output and the audio services stay as they are)
-4. Otherwise `pnputil /add-driver` stages the new package first (a refused package changes nothing), then `devcon update` puts it on the existing device (which keeps its endpoint ID, so Windows keeps it as the default output), or `devcon install` creates the device when there is none (`pnputil /install` alone doesn't create root-enumerated devices; `devcon install` adds one every time, so it runs only then); old packages are deleted afterwards
-5. An endpoint whose cache still has an early build's association ("Internal AUX Jack", the microphone GUID) is rebuilt: device removed, cache wiped, `AudioEndpointBuilder` restarted, device created, default-output roles restored through `IPolicyConfig::SetDefaultEndpoint`
+1. Test builds only: records the shipped test-signing cert for the uninstaller, then makes Windows trust it (TrustedPublisher + Root); removes it again if the driver step fails with nothing that needs it
+2. Looks at what is installed: our devices, which one Windows plays to, the driver the service points at, the packages in the store, the cached `HKLM\…\MMDevices\Audio\Render\<id>` entries
+3. **Same driver, working device with its endpoint:** changes nothing (device, endpoint, Windows' default output and the audio services stay as they are)
+4. Otherwise `pnputil /add-driver` stages the new package first (a refused package changes nothing), then `devcon updateni` puts it on the existing device (updated in place, so its endpoint ID and Windows' default output should stay: UNVERIFIED on hardware), or `devcon install` creates the device when there is none (`pnputil /install` alone doesn't create root-enumerated devices; `devcon install` adds one every time, so it runs only then); earlier packages are deleted only once the new driver runs (device working, no restart due)
+5. A working device without an endpoint, or an endpoint whose cache still has an early build's association ("Internal AUX Jack", the microphone GUID), is rebuilt: a new device is created, the old one removed only once the new one works, its cached entries wiped, default-output roles restored through `IPolicyConfig::SetDefaultEndpoint`. With more than one device, the one holding Windows' default roles is kept
 6. Writes FormFactor / association / enable-by-default and a made-up name through `IPolicyConfig` only where they differ (a name the person or the app chose stays)
-7. Asks for a restart when the loaded driver image isn't the one just installed
+7. Asks for a restart when the loaded driver image isn't the one just installed, or when pnputil/devcon say Windows needs one; a silent install returns 3010 instead of restarting
 
 User-machine prerequisites that aren't automatable (dev/test-signed builds only — release installers ship the Microsoft-signed driver and need none of the first two):
 - Test-signing mode (`bcdedit /set testsigning on` + reboot) — only for test-signed dev builds (the ones that ship a `.cer`)
