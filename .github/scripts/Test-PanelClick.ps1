@@ -71,6 +71,13 @@
     the pointer), pictures\*.png, and the app's log and startup.txt. A
     summary goes to the job's step summary.
 
+.PARAMETER Tray
+    on: the tray icon, which the case clicks. off: the app started with
+    --no-tray: the panel is then the app's ordinary window, open from the
+    start, with its taskbar button and in Alt+Tab, and closing it quits
+    the app; -Click and -Icon don't apply, and the rig quits the app by the
+    window's close button.
+
 .PARAMETER Panel
     flyout: the panel as people get it. window: the small-window form, which
     the app reads from STREAM_TO_SPEAKER_PANEL only in a build with debug
@@ -84,6 +91,7 @@ param(
     [ValidateSet("flyout", "window")][string]$Panel = "flyout",
     [ValidateSet("menu", "sign-in")][string]$Start = "sign-in",
     [ValidateSet("quiet", "full")][string]$Network = "quiet",
+    [ValidateSet("on", "off")][string]$Tray = "on",
     [switch]$FirstRun,
     [Parameter(Mandatory)][string]$Out
 )
@@ -236,6 +244,7 @@ function Get-AppArguments([bool]$startup) {
         $argv += @("--bind", "127.0.0.1", "--no-discovery", "--no-airplay", "--no-sendspin")
     }
     if ($startup) { $argv += "--startup" }
+    if ($Tray -eq "off") { $argv += "--no-tray" }
     $argv
 }
 
@@ -376,11 +385,29 @@ function Invoke-TrayQuit($proc, $rec) {
     $true
 }
 
-# End the app as a person does: Quit from its tray icon's menu, which runs
-# the app's own quit (the sound back to this PC, the speaker told, the
-# windows closed). The case fails when the app doesn't end within 20 s of
-# Quit, ends with an exit code other than 0, or has to be ended by force
-# (also when the menu couldn't be used).
+# Without a tray icon, quit the app as a person does: a click on the close
+# button of its window (closing the panel then quits the app). True once
+# the button was clicked; throws when it can't be found at its place.
+function Invoke-WindowClose($proc, $rec) {
+    $hwnd = $rec.PanelHandle()
+    if ($hwnd -eq [IntPtr]::Zero) { throw "the app's window isn't shown" }
+    $window = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $close = @(Find-UiaNamed $window '^Close$') | Select-Object -First 1
+    if (-not $close) { throw "its window has no close button UI Automation knows of" }
+    $there = Get-UiaAt $close.X $close.Y
+    if (-not $there -or $there.Name -ne "Close") { throw "at the close button's place is $(if ($there) { $there.What } else { 'nothing' })" }
+    $at = [PanelRig.Mouse]::Click($close.X, $close.Y, 1)
+    $rec.Note("clicked the window's $($close.What) at $at")
+    Say "Clicked the window's $($close.What) at $at"
+    $true
+}
+
+# End the app as a person does: Quit from its tray icon's menu (without a
+# tray icon, the close button of its window), which runs the app's own quit
+# (the sound back to this PC, the speaker told, the windows closed). The
+# case fails when the app doesn't end within 20 s of it, ends with an exit
+# code other than 0, or has to be ended by force (also when the menu or the
+# button couldn't be used).
 function Stop-App($proc, $rec) {
     if ($proc.HasExited) {
         Say "The app had ended already (exit code $($proc.ExitCode))"
@@ -388,16 +415,17 @@ function Stop-App($proc, $rec) {
     }
     $quit = $false
     try {
-        $quit = Invoke-TrayQuit $proc $rec
+        if ($Tray -eq "off") { $quit = Invoke-WindowClose $proc $rec } else { $quit = Invoke-TrayQuit $proc $rec }
     } catch {
-        Warn "couldn't quit the app from its tray icon's menu: $_"
+        Warn "couldn't quit the app as a person does: $_"
     }
+    $how = if ($Tray -eq "off") { "the click on its window's close button" } else { "Quit in its tray menu" }
     if ($quit -and $proc.WaitForExit(20000)) {
         Say "The app quit (exit code $($proc.ExitCode))"
-        if ($proc.ExitCode -ne 0) { $rec.Problem("the app ended with exit code $($proc.ExitCode) after Quit in its tray menu") }
+        if ($proc.ExitCode -ne 0) { $rec.Problem("the app ended with exit code $($proc.ExitCode) after $how") }
         return
     }
-    if ($quit) { $rec.Problem("the app didn't end within 20 s of Quit in its tray menu") }
+    if ($quit) { $rec.Problem("the app didn't end within 20 s of $how") }
     $proc.Kill()
     $null = $proc.WaitForExit(5000)
     $rec.Problem("the app's process had to be ended by force")
@@ -515,121 +543,57 @@ function Invoke-Judge($rec) {
     foreach ($e in $rec.Expectations) { Say "Expectation $e" }
 }
 
-# A taskbar button of one of the app's windows that must have none: an
-# element of the taskbar whose name starts with the app's name and isn't the
-# tray icon's, while no window of the app that belongs on the taskbar is
-# shown. Each is a problem of the run.
-function Test-TaskbarButtons($rec, [string]$when) {
-    if ($rec.TaskbarWindowShown()) {
-        Warn "a window of the app that belongs on the taskbar (a dialog, a message box, the panel as an ordinary window) was shown $when; its taskbar buttons weren't checked then"
-        return
+# Without a tray icon: the panel is the app's ordinary window, open from
+# the start. The rig waits for it (10 s at most), takes pictures for 2 s,
+# looks for its taskbar button, clicks inside it, and judges:
+# - the panel is shown within 10 s of the start, stays shown through the
+#   2 s after the rig first saw it and after the click inside it, and is
+#   shown at the end, until the rig closes it;
+# - its window has its taskbar button (and, checked with every picture,
+#   isn't a tool window: it is in Alt+Tab);
+# - always: inside the work area of its display, never more than one panel.
+function Invoke-WithoutTray($app, $rec) {
+    $script:Clicked = "nothing (no tray icon in this case)"
+    $start = $rec.MarkOf("start")
+    $deadline = (Get-Date).AddSeconds(10)
+    while (-not $rec.PanelShown() -and (Get-Date) -lt $deadline) {
+        if ($app.HasExited) { throw "the app ended (exit code $($app.ExitCode)) before its window showed" }
+        Start-Sleep -Milliseconds 100
     }
-    $bar = Get-UiaTopLevel "Shell_TrayWnd"
-    foreach ($b in @(Find-UiaNamed $bar '^Stream To Speaker')) {
-        if ($b.Name -match $TrayPattern) { continue }
-        $rec.Problem("the taskbar has a button for one of the app's windows: $($b.What) ($when)")
-    }
-}
-
-# Click the button that shows the hidden icons; where the app's icon is
-# among them: an element of the hidden icons' window named as the tray icon
-# is, and found there again by its place.
-function Open-HiddenIcons($rec) {
-    $bar = Get-UiaTopLevel "Shell_TrayWnd"
-    $chevron = @(Find-UiaNamed $bar '(?i)chevron|hidden icons') | Select-Object -First 1
-    if (-not $chevron) { throw "found no button for the hidden icons on the taskbar" }
-    $at = [PanelRig.Mouse]::Click($chevron.X, $chevron.Y, 1)
-    $rec.Note("clicked $($chevron.What) at $at")
-    Say "Clicked $($chevron.What) at $at"
-    $deadline = (Get-Date).AddSeconds(5)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 300
-        foreach ($class in "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland") {
-            foreach ($hit in @(Find-UiaNamed (Get-UiaTopLevel $class) $TrayPattern)) {
-                $icon = Get-TrayIconAt $hit.X $hit.Y
-                if ($icon) {
-                    return [pscustomobject]@{ Where = "hidden"; X = $icon.X; Y = $icon.Y; What = "the hidden icons' button $($icon.What) in $class" }
-                }
-            }
-        }
-    }
-    $rec.Shot("hidden-icons-without-the-app")
-    throw "the hidden icons opened without the app's icon among them ('$TrayTip...')"
-}
-
-# ---------------------------------------------------------------------------
-
-$os = Get-CimInstance Win32_OperatingSystem
-$build = [int]$os.BuildNumber
-$win11Taskbar = $build -ge 22000
-Say "Variation: click $Click, icon $Icon, panel $Panel, start $Start, network $Network, first run $([bool]$FirstRun)"
-Say "Windows: $($os.Caption) $($os.Version), the taskbar of Windows $(if ($win11Taskbar) { '11' } else { '10' })"
-Say "This job: session $((Get-Process -Id $PID).SessionId); $([PanelRig.Desk]::BecomeDpiAware())"
-Say "Explorer: $(@(Get-Process explorer -ErrorAction SilentlyContinue | ForEach-Object { "pid $($_.Id) in session $($_.SessionId)" }) -join '; ')"
-if ([PanelRig.Windows]::Taskbar() -eq [IntPtr]::Zero) {
-    throw "this job's desktop has no taskbar (no Shell_TrayWnd window): there is no tray icon to click here"
-}
-Say "Desktop $([PanelRig.Desk]::Bounds()); taskbar $([PanelRig.Windows]::RectOf([PanelRig.Windows]::Taskbar())); double-click time $([PanelRig.Native]::GetDoubleClickTime()) ms"
-Say "Foreground: $([PanelRig.Windows]::Foreground())"
-if (-not (Test-Path -LiteralPath $Exe)) { throw "no app at $Exe" }
-
-$app = $null
-$rec = [PanelRig.Recorder]::new($PanelTitle, $RootTitle)
-$rec.PanelIsFlyout = ($Panel -eq "flyout")
-try {
-    $rec.Shot("desktop-at-the-start")
-
-    Set-AppEnvironment $true
-    Say "The app's environment: $(@($AppEnvironment.Keys | ForEach-Object { "$_=$($AppEnvironment[$_])" }) -join '; ')"
-
-    # Settings: none (first run), or those of someone who finished first run.
-    if (Test-Path -LiteralPath $SettingsDir) { Remove-Item -LiteralPath $SettingsDir -Recurse -Force }
-    if (-not $FirstRun) {
-        New-Item -ItemType Directory -Force -Path $SettingsDir | Out-Null
-        Set-Content -LiteralPath (Join-Path $SettingsDir "config.json") -Value '{"onboarding_dismissed": true}' -Encoding Ascii
-        Say "Settings: first run finished before"
-    } else {
-        Say "Settings: none (first run)"
-    }
-    if (Test-Path -LiteralPath $LogDir) { Remove-Item -LiteralPath $LogDir -Recurse -Force }
-
-    # Where the icon will sit.
-    if (-not $win11Taskbar) {
-        $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
-        $have = (Get-ItemProperty -Path $key -Name EnableAutoTray -ErrorAction SilentlyContinue).EnableAutoTray
-        if ($null -eq $have) { $have = 1 }
-        $want = if ($Icon -eq "taskbar") { 0 } else { 1 }
-        Say "Windows 10's 'hide icons' setting (EnableAutoTray): $have, wanted $want"
-        if ($have -ne $want) {
-            Set-ItemProperty -Path $key -Name EnableAutoTray -Value $want -Type DWord
-            Restart-Explorer
-        }
-    } else {
-        Say "Windows 11 keeps a setting per program for whether its icon shows on the taskbar; Explorer makes it the first time it shows the icon: a first start for it"
-        $prime = Start-AppByProgram $true "first start, for the icon's setting"
-        Wait-TrayIcon $prime 90
-        Start-Sleep -Seconds 2
-        $n = Set-Promoted $(if ($Icon -eq "taskbar") { 1 } else { 0 })
-        Stop-App $prime $rec
-        Save-AppLog "first-start"
-        if ($n -eq 0) { Warn "Explorer made no setting for the icon; it stays where Windows puts new icons" }
-        Remove-Item -LiteralPath $LogDir -Recurse -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-    }
-
-    # Start.
-    if ($Start -eq "menu") {
-        $app = Start-AppByHand "the run"
-        $rec.Follow([uint32]$app.Id)
-        $rec.Note("the app started by hand, pid $($app.Id)")
-    } else {
-        $app = Start-AppByProgram $true "the run"
-        $rec.Follow([uint32]$app.Id)
-        $rec.Note("the app started with --startup, pid $($app.Id)")
-    }
-    # The panel opens by itself when started by hand, and at first run.
-    $rec.Burst("start", 30, 100)
+    $rec.Mark("panel seen")
+    $seenAfter = $rec.MarkOf("panel seen") - $start
+    $rec.Burst("after-the-start", 21, 100)
     $rec.Save($PictureDir)
+    $bar = Get-UiaTopLevel "Shell_TrayWnd"
+    $button = @(Find-UiaNamed $bar '^Stream To Speaker' | Where-Object { $_.Name -notmatch $TrayPattern }) | Select-Object -First 1
+    $inside = $rec.PanelClient()
+    if ($rec.PanelShown() -and $inside -and -not $inside.IsEmpty) {
+        $at = [PanelRig.Mouse]::Click($inside.CenterX, $inside.Top + 4, 1)
+        $rec.Mark("inside")
+        $rec.Note("clicked inside the panel at $at")
+        Say "Clicked inside the panel ($inside) at $at"
+        $rec.Burst("after-the-click-inside", 11, 100)
+        $rec.Save($PictureDir)
+    }
+    $rec.Shot("the-end")
+    $seen = $rec.Observations
+    $rec.Expect([PanelRig.Judge]::Fact("The panel, the app's window without a tray icon, is shown within 10 s of the start", $seenAfter -lt 10,
+        $(if ($seenAfter -lt 10) { "the rig saw it {0:0.0} s after the start" -f $seenAfter } else { "the rig didn't see it in 10 s" })))
+    $rec.Expect([PanelRig.Judge]::StaysThrough($seen, "after-the-start", $rec.MarkOf("panel seen"), "the 2 s after the rig first saw it"))
+    $rec.Expect([PanelRig.Judge]::ShownThroughout($seen, "after-the-click-inside", "The panel is still shown after the click inside it",
+        "there was no click inside it: the panel wasn't shown"))
+    $rec.Expect([PanelRig.Judge]::ShownIn($seen, "the-end", $true, "The panel is shown at the end, until the rig closes it"))
+    $rec.Expect([PanelRig.Judge]::Fact("The panel's window has its taskbar button", [bool]$button,
+        $(if ($button) { "the taskbar's $($button.What)" } else { "no element of the taskbar is named after the app" })))
+    $rec.Expect([PanelRig.Judge]::InsideWorkArea($seen))
+    $rec.Expect([PanelRig.Judge]::OnePanel($seen))
+    foreach ($e in $rec.Expectations) { Say "Expectation $e" }
+}
+
+# With the tray icon: wait for it, click it (after opening the hidden icons
+# when it is there), take pictures, click inside the panel if it is shown,
+# and judge (see Invoke-Judge).
+function Invoke-WithTray($app, $rec) {
     Test-TaskbarButtons $rec "after the start"
     Wait-TrayIcon $app 90
     Start-Sleep -Seconds 2
@@ -671,6 +635,133 @@ try {
     $rec.Shot("the-end")
     Test-TaskbarButtons $rec "at the end"
     Invoke-Judge $rec
+}
+
+# A taskbar button of one of the app's windows that must have none: an
+# element of the taskbar whose name starts with the app's name and isn't the
+# tray icon's, while no window of the app that belongs on the taskbar is
+# shown. Each is a problem of the run.
+function Test-TaskbarButtons($rec, [string]$when) {
+    if ($rec.TaskbarWindowShown()) {
+        Say "A window of the app that belongs on the taskbar (a dialog, a message box, the panel as an ordinary window) is shown $when: its taskbar buttons aren't checked now"
+        return
+    }
+    $bar = Get-UiaTopLevel "Shell_TrayWnd"
+    foreach ($b in @(Find-UiaNamed $bar '^Stream To Speaker')) {
+        if ($b.Name -match $TrayPattern) { continue }
+        $rec.Problem("the taskbar has a button for one of the app's windows: $($b.What) ($when)")
+    }
+}
+
+# Click the button that shows the hidden icons; where the app's icon is
+# among them: an element of the hidden icons' window named as the tray icon
+# is, and found there again by its place.
+function Open-HiddenIcons($rec) {
+    $bar = Get-UiaTopLevel "Shell_TrayWnd"
+    $chevron = @(Find-UiaNamed $bar '(?i)chevron|hidden icons') | Select-Object -First 1
+    if (-not $chevron) { throw "found no button for the hidden icons on the taskbar" }
+    $at = [PanelRig.Mouse]::Click($chevron.X, $chevron.Y, 1)
+    $rec.Note("clicked $($chevron.What) at $at")
+    Say "Clicked $($chevron.What) at $at"
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 300
+        foreach ($class in "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland") {
+            foreach ($hit in @(Find-UiaNamed (Get-UiaTopLevel $class) $TrayPattern)) {
+                $icon = Get-TrayIconAt $hit.X $hit.Y
+                if ($icon) {
+                    return [pscustomobject]@{ Where = "hidden"; X = $icon.X; Y = $icon.Y; What = "the hidden icons' button $($icon.What) in $class" }
+                }
+            }
+        }
+    }
+    $rec.Shot("hidden-icons-without-the-app")
+    throw "the hidden icons opened without the app's icon among them ('$TrayTip...')"
+}
+
+# ---------------------------------------------------------------------------
+
+$os = Get-CimInstance Win32_OperatingSystem
+$build = [int]$os.BuildNumber
+$win11Taskbar = $build -ge 22000
+Say "Variation: click $Click, icon $Icon, panel $Panel, start $Start, network $Network, first run $([bool]$FirstRun), tray icon $Tray"
+Say "Windows: $($os.Caption) $($os.Version), the taskbar of Windows $(if ($win11Taskbar) { '11' } else { '10' })"
+Say "This job: session $((Get-Process -Id $PID).SessionId); $([PanelRig.Desk]::BecomeDpiAware())"
+Say "Explorer: $(@(Get-Process explorer -ErrorAction SilentlyContinue | ForEach-Object { "pid $($_.Id) in session $($_.SessionId)" }) -join '; ')"
+if ([PanelRig.Windows]::Taskbar() -eq [IntPtr]::Zero) {
+    throw "this job's desktop has no taskbar (no Shell_TrayWnd window): there is no tray icon to click here"
+}
+Say "Desktop $([PanelRig.Desk]::Bounds()); taskbar $([PanelRig.Windows]::RectOf([PanelRig.Windows]::Taskbar())); double-click time $([PanelRig.Native]::GetDoubleClickTime()) ms"
+Say "Foreground: $([PanelRig.Windows]::Foreground())"
+if (-not (Test-Path -LiteralPath $Exe)) { throw "no app at $Exe" }
+
+$app = $null
+$rec = [PanelRig.Recorder]::new($PanelTitle, $RootTitle)
+# Without a tray icon the panel is always the ordinary window.
+$rec.PanelIsFlyout = ($Panel -eq "flyout" -and $Tray -eq "on")
+try {
+    $rec.Shot("desktop-at-the-start")
+
+    Set-AppEnvironment $true
+    Say "The app's environment: $(@($AppEnvironment.Keys | ForEach-Object { "$_=$($AppEnvironment[$_])" }) -join '; ')"
+
+    # Settings: none (first run), or those of someone who finished first run.
+    if (Test-Path -LiteralPath $SettingsDir) { Remove-Item -LiteralPath $SettingsDir -Recurse -Force }
+    if (-not $FirstRun) {
+        New-Item -ItemType Directory -Force -Path $SettingsDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $SettingsDir "config.json") -Value '{"onboarding_dismissed": true}' -Encoding Ascii
+        Say "Settings: first run finished before"
+    } else {
+        Say "Settings: none (first run)"
+    }
+    if (Test-Path -LiteralPath $LogDir) { Remove-Item -LiteralPath $LogDir -Recurse -Force }
+
+    # Where the icon will sit.
+    if ($Tray -eq "off") {
+        Say "No tray icon in this case: nothing to place"
+    } elseif (-not $win11Taskbar) {
+        $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
+        $have = (Get-ItemProperty -Path $key -Name EnableAutoTray -ErrorAction SilentlyContinue).EnableAutoTray
+        if ($null -eq $have) { $have = 1 }
+        $want = if ($Icon -eq "taskbar") { 0 } else { 1 }
+        Say "Windows 10's 'hide icons' setting (EnableAutoTray): $have, wanted $want"
+        if ($have -ne $want) {
+            Set-ItemProperty -Path $key -Name EnableAutoTray -Value $want -Type DWord
+            Restart-Explorer
+        }
+    } else {
+        Say "Windows 11 keeps a setting per program for whether its icon shows on the taskbar; Explorer makes it the first time it shows the icon: a first start for it"
+        $prime = Start-AppByProgram $true "first start, for the icon's setting"
+        Wait-TrayIcon $prime 90
+        Start-Sleep -Seconds 2
+        $n = Set-Promoted $(if ($Icon -eq "taskbar") { 1 } else { 0 })
+        Stop-App $prime $rec
+        Save-AppLog "first-start"
+        if ($n -eq 0) { Warn "Explorer made no setting for the icon; it stays where Windows puts new icons" }
+        Remove-Item -LiteralPath $LogDir -Recurse -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+
+    # Start.
+    if ($Start -eq "menu") {
+        $app = Start-AppByHand "the run"
+        $rec.Follow([uint32]$app.Id)
+        $rec.Note("the app started by hand, pid $($app.Id)")
+    } else {
+        $app = Start-AppByProgram $true "the run"
+        $rec.Follow([uint32]$app.Id)
+        $rec.Note("the app started as a program, pid $($app.Id)")
+    }
+    $rec.Mark("start")
+    # The panel opens by itself when started by hand, at first run, and
+    # without a tray icon.
+    $rec.Burst("start", 30, 100)
+    $rec.Save($PictureDir)
+    if ($Tray -eq "off") {
+        Invoke-WithoutTray $app $rec
+    } else {
+        Invoke-WithTray $app $rec
+    }
 } finally {
     # The quit's own clicks go to the timeline and the pictures too.
     if ($app) {
@@ -697,7 +788,7 @@ try {
             $commands = $counts -join ", "
         }
         $summary = @(
-            "### Panel click: $Click click, icon $Icon, $Panel, start $Start, network $Network$(if ($FirstRun) { ', first run' })"
+            "### Panel click: $Click click, icon $Icon, $Panel, start $Start, network $Network$(if ($FirstRun) { ', first run' })$(if ($Tray -eq 'off') { ', no tray icon' })"
             ""
             "$($os.Caption) (build $build). Pictures with the panel's window on screen: $($rec.ShownCount) of $($rec.PictureCount). Commands the app's windows got: $commands."
             ""

@@ -21,6 +21,7 @@ CHOICES = {
     "start": ("sign-in", "menu"),
     "network": ("quiet", "full"),
     "first_run": ("false", "true"),
+    "tray": ("on", "off"),
 }
 
 DEFAULT = {key: allowed[0] for key, allowed in CHOICES.items()}
@@ -39,10 +40,12 @@ WINDOWS = {"windows-2025": "win11", "windows-2022": "win10"}
 
 
 def name(case):
-    """`win11-single-taskbar-flyout-sign-in-quiet` (+ `-first-run`)."""
+    """`win11-single-taskbar-flyout-sign-in-quiet` (+ `-first-run`, + `-no-tray`)."""
     parts = [WINDOWS[case["runner"]], case["click"], case["icon"], case["panel"], case["start"], case["network"]]
     if case["first_run"] == "true":
         parts.append("first-run")
+    if case["tray"] == "off":
+        parts.append("no-tray")
     return "-".join(parts)
 
 

@@ -32,6 +32,10 @@ class Cases(unittest.TestCase):
                                                 "first_run": "true"})
         self.assertEqual(len(chosen), 1)
         self.assertEqual(chosen[0]["name"], "win10-double-hidden-window-menu-full-first-run")
+        # Without a tray icon (by hand only; a push never runs it).
+        no_tray = pc.cases("workflow_dispatch", {"tray": "off"})
+        self.assertEqual(no_tray[0]["name"], "win11-single-taskbar-flyout-sign-in-quiet-no-tray")
+        self.assertTrue(all(c["tray"] == "on" for c in pc.cases("push", {})))
         # Missing or empty inputs: the defaults.
         self.assertEqual(pc.cases("workflow_dispatch", {"click": ""})[0]["name"],
                          "win11-single-taskbar-flyout-sign-in-quiet")

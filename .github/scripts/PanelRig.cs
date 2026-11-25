@@ -710,6 +710,12 @@ namespace PanelRig
             return E(what, true, "");
         }
 
+        /// <summary>An expectation the rig judged itself (a taskbar button found or not, a time it measured).</summary>
+        public static Expectation Fact(string what, bool met, string why)
+        {
+            return E(what, met, why);
+        }
+
         /// <summary>No picture shows more than one panel.</summary>
         public static Expectation OnePanel(List<Seen> seen)
         {
@@ -926,6 +932,13 @@ namespace PanelRig
         {
             foreach (Win w in Panels()) if (w.Visible && !w.Rect.IsEmpty) return true;
             return false;
+        }
+
+        /// <summary>The shown panel's window; zero when none is shown.</summary>
+        public IntPtr PanelHandle()
+        {
+            foreach (Win w in Panels()) if (w.Visible) return w.Handle;
+            return IntPtr.Zero;
         }
 
         /// <summary>The shown panel's window inside its frame, on the desktop; null when none is shown.</summary>

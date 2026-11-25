@@ -8,7 +8,8 @@ name: Panel click
 # cases in .github/scripts/panel_click_cases.py.
 #
 # It runs in two ways, and in no other:
-#   - started by hand (workflow_dispatch): the one case its inputs give;
+#   - started by hand (workflow_dispatch): the one case its inputs give
+#     (only there: the app without its tray icon);
 #   - on a push to a branch whose name starts with rig/: six cases, the
 #     panel as a flyout in each: the defaults below; started by hand from a
 #     shortcut; the icon among the hidden icons; a double click; Windows
@@ -54,6 +55,11 @@ on:
         description: "First run (no settings: losing the focus doesn't close the panel until first run is finished)"
         type: boolean
         default: false
+      tray:
+        description: "on: the tray icon; off: started with --no-tray, the panel is then the app's ordinary window (the icon and click inputs don't apply)"
+        type: choice
+        options: [on, off]
+        default: on
   push:
     branches: ['rig/**']
 
@@ -86,6 +92,7 @@ jobs:
           CASE_START: ${{ inputs.start }}
           CASE_NETWORK: ${{ inputs.network }}
           CASE_FIRST_RUN: ${{ inputs.first_run }}
+          CASE_TRAY: ${{ inputs.tray }}
         run: python3 .github/scripts/panel_click_cases.py >> "$GITHUB_OUTPUT"
 
   build:
@@ -188,11 +195,12 @@ jobs:
           START: ${{ matrix.case.start }}
           NETWORK: ${{ matrix.case.network }}
           FIRST_RUN: ${{ matrix.case.first_run }}
+          TRAY: ${{ matrix.case.tray }}
         run: >
           .github/scripts/Test-PanelClick.ps1
           -Exe $env:APP_EXE
           -Click $env:CLICK -Icon $env:ICON -Panel $env:PANEL -Start $env:START -Network $env:NETWORK
-          -FirstRun:($env:FIRST_RUN -eq "true")
+          -FirstRun:($env:FIRST_RUN -eq "true") -Tray $env:TRAY
           -Out (Join-Path $env:RUNNER_TEMP "panel-click")
 
       - name: Keep the pictures and logs
