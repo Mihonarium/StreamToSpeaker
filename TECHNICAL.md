@@ -92,30 +92,44 @@ It has no folder page and refuses a `/DIR=` that names another folder (exit
 code 1). Setup:
 
 1. refuses, before changing anything (exit code 7), Windows Server, where the
-   driver doesn't run, and a test build on a PC whose Windows isn't in
-   test-signing mode, where its driver can't start (`/ALLOWSERVER` and
-   `/ALLOWTESTBUILD` let the installer lifecycle test run on its Windows
-   Server runners);
+   driver doesn't run (`/ALLOWSERVER` lets the installer lifecycle test run
+   on its Windows Server runners), and a test build on a PC whose Windows
+   isn't in test-signing mode, where its driver can't start
+   (`/ALLOWTESTBUILD` installs it all the same, for a developer's PC that
+   loads test-signed drivers in another way: a kernel debugger, or signature
+   enforcement turned off at boot, neither of which Setup can see);
 2. once Install is clicked, closes the copies of the app that run from the
    install folder, in any account (a silent install doesn't ask), by
-   process; a copy started from anywhere else is left alone. It starts the
-   app again afterwards only for the person whose copy it closed, and only
-   when it can start programs as that person (not when another account's
-   password was used with "Run as administrator", not as SYSTEM); then no
-   copy runs, and Windows' default output goes back to the one it used
-   before (`scripts\Find-RunningCopies.ps1`);
+   process; a copy started from anywhere else is left alone
+   (`scripts\Find-RunningCopies.ps1`). Afterwards Setup starts the app only
+   as the person who uses it, never with administrator rights. It can do
+   that when it asked for those rights itself: started the usual way, it
+   shows the Windows prompt (an administrator's password there is fine) and
+   keeps its first copy, which has no such rights, to start programs as
+   that person. Started with administrator rights ("Run as administrator",
+   an elevated prompt, a deployment tool) or as SYSTEM, it starts nothing,
+   and its last page says to start the app from the Start menu and why.
+   Until then no copy runs, and Windows' default output is the one it used
+   before;
 3. runs `scripts\Install-Driver.ps1`, which installs the driver package and
    reports what happened: an update whose driver is already installed leaves
    the device, its sound output and Windows' audio services alone; a new
    driver goes into the driver store first and then onto the existing device,
    updated in place, so its sound output and Windows' choice of output should
    stay (not yet confirmed on real hardware); the device is created with
-   `devcon install` only when there is none; a working device without a sound
-   output, or an output that still has an early build's cached settings, is
-   rebuilt (a new device first, the old one removed only once the new one
-   works) and gets its default-output roles back; with more than one device,
-   the one Windows plays to stays. Earlier driver packages, and the test
-   certificates only they needed, go once the new driver runs. The decisions
+   `devcon install` only when there is none; an output that still has an
+   early build's cached settings is rebuilt, and so is a working device when
+   Windows has no Stream To Speaker output at all although its two sound
+   services run (a new device first, the old one removed only once the new
+   one works; the new output gets the old one's default-output roles). While
+   those services are stopped no output can appear: the step changes nothing
+   and reports that the sound output is missing. After an update or a
+   rebuild that failed, it reads the earlier device back before it reports
+   that the device was kept, and removes a device it made itself. With more
+   than one device, the one Windows plays to stays. Earlier driver packages,
+   and the test certificates only they needed, go once the new driver runs;
+   when that takes a restart, they go the next time Setup runs, or at
+   uninstall. The decisions
    are plain functions in `scripts\InstallerFunctions.ps1`, tested by
    `scripts\tests\*.Tests.ps1` (Windows PowerShell). The same script repairs
    an installed copy on its own, elevated:
@@ -139,15 +153,18 @@ notifications. Setup's last page says what happened and what to do. Exit
 codes besides Inno Setup's own: 20 when Setup couldn't finish setting up the
 sound driver, 3010 for a silent install that needs a restart (a silent
 install never restarts the PC). The scripts log to `logs\install.log` in the
-install directory, not to `%LOCALAPPDATA%`; `scripts\Diagnose.ps1` prints a
-report of the driver, the device, the sound output and the firewall, with
-names and addresses replaced (it asks, first and last, to be read through
-before it is posted), and `scripts\Reset-Install.ps1` clears the driver for a
-fresh start. Uninstall
+install directory, not to `%LOCALAPPDATA%`. That file names the Windows
+account and the PC, so a report should carry the output of
+`scripts\Diagnose.ps1` instead: a report of the driver, the device, the sound
+output and the firewall, with names and addresses replaced (it asks, first
+and last, to be read through before it is posted); Setup's last page gives
+that command when Windows refused the driver. `scripts\Reset-Install.ps1`
+clears the driver for a fresh start. Uninstall
 closes the app and removes the device, the driver packages, Windows' cached
 entries for the sound output, the test certificates a test-signed build made
 Windows trust (`LocalMachine\Root` and `TrustedPublisher`), the firewall rules
-for the app and the start-at-sign-in entries of signed-in accounts; run
+for the app and the start-at-sign-in entries of signed-in accounts; its last
+message names what it could not remove; run
 interactively, it asks for a restart when the driver was running. It leaves
 each person's own folders, so a reinstall keeps their speakers and pairings:
 `%APPDATA%\StreamToSpeaker` (`config.json`, the settings, and `config.json.bak`,
@@ -387,6 +404,14 @@ signing repository.
 `driver-submission.yml`, `driver-attest.yml` and `driver-attested.yml` handle
 the driver's Microsoft attestation round-trip:
 [docs/driver-signing.md](docs/driver-signing.md).
+
+`installer-lifecycle.yml` installs, repairs, updates and uninstalls the built
+installer on a hosted Windows machine, upgrades from earlier releases, and
+checks what each step leaves behind: `build.yml` calls it on pull requests
+that touch the installer, and it can be started by hand against an earlier
+build's artifacts. What it cannot see (the name of the sound output, what
+happens after a restart) is covered by the scripts' own tests in
+`scripts\tests`.
 
 The WDK install and Rust dependencies are cached; a cold build is ~15-20 min,
 warm ~5.
