@@ -630,7 +630,9 @@ class DraftNotes(unittest.TestCase):
     earlier run generated for another commit (the tag was moved since).
     The notes' last line says which commit they were generated for and
     holds their SHA-256; GitHub's target_commitish of a draft whose tag
-    exists is not relied on."""
+    exists is never a reason to replace notes. Where notes carry no line,
+    a commit recorded there by the run that made the draft is the one
+    sign that the tag was moved since, and the run then only warns."""
 
     def draft(self, body, target=COMMIT):
         rel = release("v0.1.11", rid=5)
@@ -704,14 +706,35 @@ class DraftNotes(unittest.TestCase):
 
     def test_notes_without_the_line_are_left_as_they_are(self):
         # Written by hand over the generated ones, the line deleted with
-        # them; or the line retyped with a shortened SHA.
+        # them; or the line retyped with a shortened SHA. The draft was
+        # made for this commit, or by hand for a branch.
+        made = rd.with_marker(f"changes up to {OTHER}", OTHER)
+        for body in ("", "Notes the maintainer wrote.", made.replace(OTHER, OTHER[:7])):
+            for target in (COMMIT, "main", OTHER[:7]):
+                gh = self.draft(body, target=target)
+                said = self.ensure(gh)
+                self.assertEqual(self.writes(gh), [], (body, target))
+                self.assertEqual(gh.releases[0]["body"], body)
+                self.assertEqual(said, "")
+
+    def test_notes_without_the_line_are_kept_and_the_run_warns_once_when_the_draft_was_made_for_another_commit(self):
+        # A run of OTHER made the draft; the maintainer then wrote the
+        # notes anew, without the line, and the tag was moved to COMMIT.
         made = rd.with_marker(f"changes up to {OTHER}", OTHER)
         for body in ("", "Notes the maintainer wrote.", made.replace(OTHER, OTHER[:7])):
             gh = self.draft(body, target=OTHER)
             said = self.ensure(gh)
-            self.assertEqual(self.writes(gh), [])
             self.assertEqual(gh.releases[0]["body"], body)
-            self.assertEqual(said, "")
+            self.assertFalse([c for c in self.writes(gh) if any(str(a).startswith("body=") for a in c)])
+            self.assertEqual(gh.releases[0]["target_commitish"], COMMIT)
+            warnings = [line for line in said.splitlines() if line.startswith("::warning::")]
+            self.assertEqual(len(warnings), 1, said)
+            for part in (OTHER, COMMIT, "v0.1.11", "kept"):
+                self.assertIn(part, warnings[0])
+            # The same run again has nothing more to say or to write.
+            before = len(self.writes(gh))
+            self.assertEqual(self.ensure(gh), "")
+            self.assertEqual(len(self.writes(gh)), before)
 
 
 class TwoTagsAtOnce(unittest.TestCase):

@@ -253,7 +253,23 @@ def ensure_draft(repo, tag, commit=None, target=None, run=gh, sleep=time.sleep):
     rels = releases_for(repo, tag, run)
     if rels:
         rel = require_draft(repo, tag, run, sleep)
-        made = generated_for(json.loads(run("api", f"repos/{repo}/releases/{int(rel['id'])}")).get("body"))
+        full = json.loads(run("api", f"repos/{repo}/releases/{int(rel['id'])}"))
+        made = generated_for(full.get("body"))
+        recorded = str(full.get("target_commitish") or "")
+        if commit and made is None and recorded != commit and re.fullmatch(r"[0-9a-f]{40}", recorded):
+            # The notes carry no line that says which commit they were
+            # written for (a person wrote them, or deleted the line). What
+            # is left to go by is the commit this chain recorded when it
+            # made the draft: another one means the tag was moved since.
+            # The notes are a person's, so they stay; the run says so once,
+            # and records the commit the tag points at now.
+            print("::warning::" + command_text(
+                f"The draft for {tag} was made for commit {recorded}, and the tag points at {commit} now. Its "
+                "release notes are kept as they are: check that they describe this release before it is "
+                "published."))
+            run("api", "--method", "PATCH", f"repos/{repo}/releases/{int(rel['id'])}",
+                "-f", f"target_commitish={commit}")
+            rel = require_draft(repo, tag, run, sleep)
         if commit and made and made[0] != commit:
             # The tag was moved since an earlier run made this draft: its
             # notes were generated for another commit. Notes nobody changed
