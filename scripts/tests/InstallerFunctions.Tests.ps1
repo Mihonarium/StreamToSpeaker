@@ -533,18 +533,29 @@ Test 'a cached entry Windows refuses to delete is reported, not counted' {
     $key = "$TestKey\Locked"
     $null = New-Item -Path "$key\Properties" -Force
     $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    $acl = Get-Acl -LiteralPath $key
     $deny = New-Object System.Security.AccessControl.RegistryAccessRule($me, 'Delete', 'Deny')
-    $acl.AddAccessRule($deny)
-    Set-Acl -LiteralPath $key -AclObject $acl
+    # The rule is set and lifted through .NET: Windows PowerShell's Get-Acl
+    # doesn't find a registry key that is given with -LiteralPath.
+    $setRule = {
+        param([bool]$Add)
+        $rights = [System.Security.AccessControl.RegistryRights]'ReadPermissions, ChangePermissions'
+        $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\StreamToSpeakerTests\Locked',
+            [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, $rights)
+        try {
+            $acl = $k.GetAccessControl()
+            if ($Add) { $acl.AddAccessRule($deny) } else { $null = $acl.RemoveAccessRule($deny) }
+            $k.SetAccessControl($acl)
+        } finally {
+            $k.Close()
+        }
+    }
+    & $setRule $true
     try {
         $r = Remove-EndpointEntries @([pscustomobject]@{ Guid = 'Locked'; KeyPath = $key })
         Assert-Equal 0 $r.Removed 'removed'
         Assert-Equal 1 @($r.Failed).Count 'reported'
     } finally {
-        $acl = Get-Acl -LiteralPath $key
-        $null = $acl.RemoveAccessRule($deny)
-        Set-Acl -LiteralPath $key -AclObject $acl
+        & $setRule $false
         Remove-Item -LiteralPath $key -Recurse -Force
     }
     $null = New-Item -Path "$TestKey\Free\Properties" -Force
