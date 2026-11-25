@@ -7,9 +7,12 @@ name: Installer lifecycle
 #   the scripts' own tests (Windows PowerShell)
 #   → Setup refuses Windows Server, a test build without test signing, and
 #     a /DIR= outside Program Files, each before changing anything
+#   → Windows' sound services started, as a PC has them
 #   → fresh install → repair
 #   → update while the app runs, here and in another account
 #   → uninstall (with the test certificate's file gone)
+#   → install and a second run with Windows' sound services stopped
+#     → uninstall
 #   → start at sign-in through /TASKS → uninstall
 #   → previous public release → upgrade to this build
 #     (→ to the Microsoft-signed-driver variant, when built) → uninstall
@@ -23,13 +26,16 @@ name: Installer lifecycle
 # Install-Driver.ps1 must log into the install directory, never into the
 # user's profile.
 #
-# Hosted runners run Windows Server without test-signing, so the driver
-# never starts here. Setup must say so: its exit code and the result its
-# driver step logs must agree with the device Windows has. Everything the
-# installer itself controls is required (files, Apps & Features entry,
-# shortcuts, certificate trust, driver store, exactly one device, the
-# firewall rule, start at sign-in). Every phase runs even after one failed;
-# the Verdict step fails the job if any did.
+# Hosted runners run Windows Server and start Windows with test signing on,
+# so the test-signed driver loads here; they come with Windows' sound
+# services stopped, which the test starts. What each Setup run must report
+# (the result its driver step logs, whether a restart is due, the exit
+# code) is worked out by the test and compared exactly, and Windows must
+# have what the result says: one working device with a sound output.
+# Everything else the installer controls is required too (files, Apps &
+# Features entry, shortcuts, certificate trust, driver store, the firewall
+# rule, start at sign-in). Every phase runs even after one failed; the
+# Verdict step fails the job if any did.
 #
 # Called by build.yml on pull requests that touch the installer (same run,
 # so it tests exactly the installer that run built), or dispatched by hand
@@ -302,6 +308,14 @@ jobs:
           .github/scripts/Test-InstallerLifecycle.ps1 -Phase refuse-dir
           -Installer $env:STS_DEV_EXE -InstallDir 'C:\STS [lifecycle]'
 
+      # The runner comes with Windows' two sound services stopped; a PC runs
+      # them. Started here for every phase but the one that stops them.
+      - name: Start Windows' sound services
+        id: start_audio
+        continue-on-error: true
+        shell: pwsh
+        run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase start-audio
+
       - name: Fresh install
         id: install
         continue-on-error: true
@@ -343,6 +357,21 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase uninstall -DeleteCertificateFile
+
+      - name: Install and run Setup again with Windows' sound services stopped
+        id: no_audio
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          .github/scripts/Test-InstallerLifecycle.ps1 -Phase no-audio
+          -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
+          -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
+
+      - name: Uninstall (after the runs without sound services)
+        id: uninstall_no_audio
+        continue-on-error: true
+        shell: pwsh
+        run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase uninstall
 
       - name: Start at sign-in through /TASKS
         id: tasks

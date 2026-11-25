@@ -13,15 +13,27 @@
     sentinel in %APPDATA%\StreamToSpeaker, which no phase may touch
     (uninstall leaves user data in place).
 
-    Hosted runners run Windows Server without test signing, so the driver
-    never starts here, and every current-build run passes /ALLOWSERVER and
-    /ALLOWTESTBUILD (Setup refuses both otherwise, which phases
-    refuse-server and refuse-test-build check). What is required is that
-    Setup says what happened: its exit code (20 when it couldn't finish
-    setting up the sound driver) and the "driver-step-result:" line in its
-    log must agree with the device Windows has afterwards. Behaviour that needs the driver to run (the
-    sound output, its name, the restart after a driver change) can't be
-    seen here; the scripts' own tests (phase units) cover the decisions.
+    Hosted runners run Windows Server, and every current-build run passes
+    /ALLOWSERVER and /ALLOWTESTBUILD (Setup refuses both otherwise, which
+    phases refuse-server and refuse-test-build check). They start Windows
+    with test signing on, so the test-signed driver loads and its device
+    works. They come with Windows' two sound services stopped, and while
+    those are stopped Windows makes no sound output for any device: phase
+    start-audio starts them, as a PC has them, and phase no-audio stops
+    them for the one case that is about them.
+
+    What each run of this build's Setup must report is worked out here and
+    not taken from Setup (Assert-SetupOutcome): the result in the
+    "driver-step-result:" line of its log, whether a restart is due, and
+    the exit code (0; 3010 with a restart due; 20 when the sound driver
+    isn't set up). A restart is due when a Stream To Speaker driver was
+    loaded before the run and is not this installer's: Windows keeps a
+    loaded driver until it restarts, also through an uninstall, so the
+    runs after the first uninstall may end with a restart due. Windows must
+    also have what the result says: one device that works, with a sound
+    output that is on. The name of the sound output, and what happens after
+    a restart, can't be seen here; the scripts' own tests (phase units)
+    cover the decisions.
 
     Each current-build setup run must add one Install-Driver.ps1 run to
     <install dir>\logs\install.log, leave install.log in
@@ -39,12 +51,16 @@
     refuse-test-build  run -Installer (test build) without /ALLOWTESTBUILD:
                     it must refuse
     refuse-dir      run -Installer with /DIR=-InstallDir: it must refuse
+    start-audio     start Windows' two sound services, as a PC has them
     install         run -Installer on a clean machine
     repair          delete two installed files, re-run -Installer
     running-app     re-run -Installer while the app runs in this account
     other-account   re-run -Installer while the app runs in another account
     tasks           start-at-sign-in through /TASKS (install, then two re-runs)
     uninstall       run the registered uninstaller
+    no-audio        stop the sound services, run -Installer on a clean
+                    machine and once more: Setup must say that there is no
+                    sound output, and keep the device it made
     previous        run -Installer (an older release, into -InstallDir when
                     given) with lighter checks
     plant           put a file of the person's and a fake uninstaller (it
@@ -55,8 +71,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("units", "env", "refuse-server", "refuse-test-build", "refuse-dir", "install", "repair",
-                 "running-app", "other-account", "tasks", "uninstall", "previous", "plant", "upgrade")]
+    [ValidateSet("units", "env", "refuse-server", "refuse-test-build", "refuse-dir", "start-audio", "install", "repair",
+                 "running-app", "other-account", "tasks", "uninstall", "no-audio", "previous", "plant", "upgrade")]
     [string]$Phase,
     # Installer to run.
     [string]$Installer = "",
@@ -167,6 +183,140 @@ function Get-AudioServices {
         $s = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
         if ($s) { "$n=$($s.State)/$($s.ProcessId)" } else { "$n=absent" }
     }) -join ", "
+}
+
+function Start-AudioServices {
+    foreach ($n in "AudioEndpointBuilder", "AudioSrv") {
+        try {
+            if ((Get-Service -Name $n).StartType -eq "Disabled") { Set-Service -Name $n -StartupType Manual }
+            Start-Service -Name $n
+        } catch {
+            Write-Host "  starting ${n}: $($_.Exception.Message)"
+        }
+        Check ((Get-Service -Name $n -ErrorAction SilentlyContinue).Status -eq "Running") "Windows' sound service $n runs"
+    }
+}
+
+function Stop-AudioServices {
+    foreach ($n in "AudioSrv", "AudioEndpointBuilder") {
+        try {
+            Stop-Service -Name $n -Force
+        } catch {
+            Write-Host "  stopping ${n}: $($_.Exception.Message)"
+        }
+        Check ((Get-Service -Name $n -ErrorAction SilentlyContinue).Status -eq "Stopped") "Windows' sound service $n is stopped"
+    }
+}
+
+# Lists the files of the drivers Windows has loaded.
+$KernelSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class LifecycleKernel {
+    [DllImport("psapi.dll", SetLastError = true)]
+    static extern bool EnumDeviceDrivers([Out] IntPtr[] imageBases, uint cb, out uint needed);
+
+    [DllImport("psapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetDeviceDriverFileNameW(IntPtr imageBase, StringBuilder name, uint size);
+
+    // The files of the drivers Windows has loaded; none when it doesn't say.
+    public static string[] LoadedDriverFiles() {
+        var bases = new IntPtr[8192];
+        uint needed;
+        if (!EnumDeviceDrivers(bases, (uint)(bases.Length * IntPtr.Size), out needed)) {
+            return new string[0];
+        }
+        var files = new List<string>();
+        int count = Math.Min(bases.Length, (int)(needed / (uint)IntPtr.Size));
+        for (int i = 0; i < count; i++) {
+            if (bases[i] == IntPtr.Zero) {
+                continue;
+            }
+            var name = new StringBuilder(1024);
+            if (GetDeviceDriverFileNameW(bases[i], name, (uint)name.Capacity) > 0) {
+                files.Add(name.ToString());
+            }
+        }
+        return files.ToArray();
+    }
+}
+'@
+
+# The Stream To Speaker driver Windows has loaded, found here and not taken
+# from Setup. Windows keeps a loaded driver until it restarts, also after
+# its device and its package are gone.
+function Get-LoadedDriver {
+    $driver = @{ known = $false; loaded = $false; file = ""; sha256 = "" }
+    $files = @()
+    try {
+        if (-not ("LifecycleKernel" -as [type])) { Add-Type -TypeDefinition $KernelSource }
+        # Newer Windows gives the list only to a process that has turned
+        # the debug privilege on.
+        try { [System.Diagnostics.Process]::EnterDebugMode() } catch { }
+        $files = @([LifecycleKernel]::LoadedDriverFiles())
+    } catch {
+        Write-Host "  could not list the loaded drivers: $($_.Exception.Message)"
+    }
+    if (-not $files.Count) { return $driver }
+    $driver.known = $true
+    $ours = @($files | Where-Object { [IO.Path]::GetFileName($_) -ieq "StreamToSpeaker.sys" })
+    if (-not $ours.Count) { return $driver }
+    $driver.loaded = $true
+    $driver.file = $ours[0] -replace '^\\SystemRoot\\', "$($env:windir.TrimEnd('\'))\" -replace '^\\\?\?\\', ''
+    if (Test-Path -LiteralPath $driver.file -PathType Leaf) { $driver.sha256 = Get-Sha256 $driver.file }
+    $driver
+}
+
+# Whether the Setup run that follows must end with a restart due: when a
+# Stream To Speaker driver is loaded now and it is not the one in the
+# installer (per the build record), or its file is gone.
+function Get-RestartExpectation {
+    $driver = Get-LoadedDriver
+    $new = ""
+    if ($DriverRecord) {
+        $new = "$((Get-Content -LiteralPath $DriverRecord -Raw | ConvertFrom-Json).files.'StreamToSpeaker.sys')".ToLower()
+    }
+    $due = [bool]($driver.loaded -and $driver.sha256 -ne $new)
+    $text = if (-not $driver.known) {
+        "the drivers Windows has loaded could not be listed"
+    } elseif (-not $new) {
+        "the build record names no StreamToSpeaker.sys"
+    } elseif (-not $driver.loaded) {
+        "no Stream To Speaker driver was loaded"
+    } elseif (-not $driver.sha256) {
+        "a Stream To Speaker driver was loaded whose file is gone ($($driver.file))"
+    } elseif ($due) {
+        "another Stream To Speaker driver than this installer's was loaded ($($driver.file))"
+    } else {
+        "this installer's driver was loaded already ($($driver.file))"
+    }
+    @{ known = [bool]($driver.known -and $new); due = $due; text = $text }
+}
+
+# The sound outputs Windows has for Stream To Speaker, read from where
+# Windows keeps them: the key's name, the state (1: on, 2: turned off,
+# 4: its device is gone) and what Windows records as the output's device.
+function Get-SoundOutputs {
+    $render = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
+    $nameValues = "{a45c254e-df1c-4efd-8020-67d146a850e0},2", "{a45c254e-df1c-4efd-8020-67d146a850e0},14",
+        "{b3f8fa53-0004-438e-9003-51a46e139bfc},6"
+    @(Get-ChildItem -LiteralPath $render -ErrorAction SilentlyContinue | ForEach-Object {
+        $key = $_
+        $props = Get-ItemProperty -LiteralPath (Join-Path $key.PSPath "Properties") -ErrorAction SilentlyContinue
+        if (-not $props) { return }
+        $names = @($nameValues | ForEach-Object { "$($props.$_)" } |
+            Where-Object { $_.IndexOf($AppName, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        if (-not $names.Count) { return }
+        $state = (Get-ItemProperty -LiteralPath $key.PSPath -Name DeviceState -ErrorAction SilentlyContinue).DeviceState
+        [pscustomobject]@{
+            name   = $key.PSChildName
+            state  = if ($null -ne $state) { ([int64]$state) -band 0xF } else { -1 }
+            device = "$($props.'{b3f8fa53-0004-438e-9003-51a46e139bfc},2')"
+        }
+    })
 }
 
 function Get-DriverVer([string]$infPath) {
@@ -349,10 +499,18 @@ function Save-InstallLog([string]$label) {
     }
 }
 
-# Setup's exit code and the result line in its log must agree with the
-# device Windows has afterwards: "ok" only for one device that works (exit
-# code 0, or 3010 when a restart is due), 20 and the reason otherwise.
-function Assert-SetupOutcome($code, [string]$label) {
+# What a run of this build's Setup must report, worked out here and not
+# taken from Setup:
+#   result     -Expect ("ok" unless the phase arranged otherwise); "ok" too
+#              whenever a restart is due, because the new driver doesn't run
+#              before the restart and Setup can't look for its sound output;
+#   restart    due as $Before says (Get-RestartExpectation), or when Windows
+#              asked for one while the driver was installed, which nothing
+#              here can predict (said in a warning);
+#   exit code  0; 3010 with a restart due; 20 for any result but "ok".
+# And Windows must have what the result says: one device that works, with
+# one sound output that is on for "ok", and none for "endpoint-missing".
+function Assert-SetupOutcome($code, [string]$label, [string]$Expect, $Before) {
     $log = Read-Text (Join-Path $LogDir "$label-setup.log")
     $m = [regex]::Match($log, 'driver-step-result: (\S+) restart=(\d) .*?problem=(\d+)')
     $devs = @(Get-OurDevices)
@@ -365,18 +523,40 @@ function Assert-SetupOutcome($code, [string]$label) {
     $result = $m.Groups[1].Value
     $restart = $m.Groups[2].Value -eq "1"
     Write-Host "  driver step: $result, restart $restart, problem $($m.Groups[3].Value); Windows has: $state"
-    Check (($result -eq "ok") -eq $working -or ($restart -and $result -eq "ok")) "Setup's result '$result' agrees with the device ($state)"
-    $want = if ($result -ne "ok") { $NotWorkingExitCode } elseif ($restart) { $RestartExitCode } else { 0 }
-    Check ($code -eq $want) "setup exit code $code (expected $want for '$result'$(if ($restart) { ', restart due' }))"
-    $loaded = Get-CimInstance Win32_SystemDriver -Filter "Name='StreamToSpeaker'" -ErrorAction SilentlyContinue
-    if (-not ($loaded -and $loaded.State -eq "Running") -and -not $log.Contains("Windows asked for a restart")) {
-        Check (-not $restart) "no restart asked while the driver isn't loaded and Windows asked for none"
+    Write-Host "  before the run: $($Before.text)"
+    $outputs = @(Get-SoundOutputs)
+    foreach ($o in $outputs) {
+        Write-Host "  sound output $($o.name): state $($o.state); Windows records as its device: '$($o.device)'"
+    }
+    if (-not $outputs.Count) { Write-Host "  sound output: none" }
+
+    Check ([bool]$Before.known) "whether a restart is due could be worked out before the run ($($Before.text))"
+    $windowsAsked = $log.Contains("Windows asked for a restart")
+    if ($windowsAsked) {
+        Warn "Windows asked for a restart while the driver was installed; that can't be predicted here, so a restart is taken as due"
+    }
+    $wantRestart = [bool]($Before.due -or $windowsAsked)
+    Check ($restart -eq $wantRestart) "Setup says a restart is $(if ($restart) { 'due' } else { 'not due' }) (expected: $(if ($wantRestart) { 'due' } else { 'not due' }); $($Before.text))"
+    $wantResult = if ($wantRestart) { "ok" } else { $Expect }
+    Check ($result -eq $wantResult) "Setup's result is '$result' (expected '$wantResult')"
+    $wantCode = if ($wantResult -ne "ok") { $NotWorkingExitCode } elseif ($wantRestart) { $RestartExitCode } else { 0 }
+    Check ($code -eq $wantCode) "setup exit code $code (expected $wantCode)"
+    Check $working "Windows has exactly one $HardwareId device, and it works ($state)"
+    $on = @($outputs | Where-Object { $_.state -eq 1 })
+    $present = @($outputs | Where-Object { $_.state -eq 1 -or $_.state -eq 2 })
+    if ($wantRestart) {
+        Write-Host "  a restart is due: the sound output can't be checked before it"
+    } elseif ($wantResult -eq "ok") {
+        Check ($on.Count -eq 1) "Windows has one $AppName sound output that is on (found $($on.Count))"
+    } elseif ($wantResult -eq "endpoint-missing") {
+        Check ($present.Count -eq 0) "Windows has no $AppName sound output, as Setup says (found $($present.Count))"
     }
     @{ result = $result; restart = $restart; log = $log }
 }
 
 # Runs this build's installer with the checks every such run gets.
-function Invoke-CurrentSetup([string]$label, [string[]]$Extra = @(), [int]$TimeoutMinutes = 15) {
+function Invoke-CurrentSetup([string]$label, [string[]]$Extra = @(), [int]$TimeoutMinutes = 15, [string]$Expect = "ok") {
+    $restartBefore = Get-RestartExpectation
     $before = Get-TranscriptStarts
     $profileBefore = Get-ProfileLogSnapshot
     $watch = Start-CompileWatch $ProfileTemp
@@ -400,7 +580,7 @@ function Invoke-CurrentSetup([string]$label, [string[]]$Extra = @(), [int]$Timeo
     } else {
         Check ($compiledInProfile.Count -eq 0) "nothing was compiled in $ProfileTemp during setup (compiler inputs seen: $($compiledInProfile -join ', '))"
     }
-    Assert-SetupOutcome $code $label
+    Assert-SetupOutcome $code $label $Expect $restartBefore
 }
 
 # Runs Diagnose.ps1 as people do: from the install directory, as a copy in
@@ -614,8 +794,8 @@ function Assert-Installed {
             Check (-not (Test-Path -LiteralPath $cer)) "no test certificate file after a Microsoft-signed install"
             # The earlier test build's certificate may stay while its driver
             # package does (Setup keeps that until the new driver runs, which
-            # it never does on this runner); the check below makes sure the
-            # uninstaller can still find it.
+            # takes a restart when the earlier one is loaded); the check
+            # below makes sure the uninstaller can still find it.
         }
         # Every Stream To Speaker test certificate Windows trusts is recorded
         # for the uninstaller.
@@ -641,11 +821,9 @@ function Assert-Installed {
         Check (-not $run) "no start-at-sign-in entry (task off by default)"
     }
 
-    # Driver store and device. Loading the driver needs test signing (test-
-    # signed builds) or a client OS (Microsoft-signed client drivers),
-    # neither of which a hosted runner has, so the device isn't required to
-    # work; there must be exactly one, and Setup must have said what it is
-    # (Assert-SetupOutcome).
+    # Driver store and device: exactly one device after this build's Setup.
+    # Whether it works, and what Setup said about it, is checked where Setup
+    # ran (Assert-SetupOutcome).
     $pkgs = @(Get-DriverPackages)
     Write-Host "  driver store: $(@($pkgs | ForEach-Object Name) -join ', ')"
     if ($Full -and $rec) {
@@ -858,6 +1036,11 @@ switch ($Phase) {
             $null = Invoke-Uninstall "refuse-dir-cleanup"
         }
     }
+    "start-audio" {
+        Write-Host "Before: $(Get-AudioServices)"
+        Start-AudioServices
+        Write-Host "After: $(Get-AudioServices)"
+    }
     "install" {
         Assert-CleanStart
         $audio = Get-AudioServices
@@ -935,6 +1118,31 @@ switch ($Phase) {
         }
         $log = Invoke-Uninstall "uninstall-$((Get-Date).ToString('HHmmss'))"
         Assert-Removed $app $log
+    }
+    "no-audio" {
+        # Windows' sound services stopped, as on a PC where someone turned
+        # them off: Windows makes no sound output for the device, and Setup
+        # must say so, not report success. And it must not make a new device
+        # in the hope of an output, on the first run or on the next.
+        Assert-CleanStart
+        Stop-AudioServices
+        try {
+            $audio = Get-AudioServices
+            $outcome = Invoke-CurrentSetup "no-audio-install" -Expect "endpoint-missing"
+            Assert-Installed -Full -Outcome $outcome
+            $before = @((Read-State).device)
+            $outcome = Invoke-CurrentSetup "no-audio-again" -Expect "endpoint-missing"
+            $after = @(Get-DeviceIdentity)
+            Check ($before.Count -eq 1 -and ($before -join ';') -eq ($after -join ';')) "the device was kept, not made anew, when Setup ran again (before: $($before -join '; '); after: $($after -join '; '))"
+            Check ((Get-AudioServices) -eq $audio) "Setup left Windows' sound services as they were ($audio)"
+            if ($outcome) {
+                Check ("$($outcome.log)".Contains("sound services (Windows Audio, Windows Audio Endpoint Builder) are not running")) "Setup's log says that Windows' sound services are not running"
+            }
+            Assert-Installed -Full -Outcome $outcome
+        } finally {
+            Start-AudioServices
+        }
+        Assert-Sentinel
     }
     "previous" {
         Assert-CleanStart
