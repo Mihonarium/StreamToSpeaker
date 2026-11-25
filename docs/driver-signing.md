@@ -379,19 +379,14 @@ overlap (a concurrency group per tag).
    `chain-tests` and `chain-tests-powershell` (every test in
    `.github/scripts`, the Pester tests among them) run next to it; the
    release jobs wait for them.
-2. `sign-service` — creates the **draft** release for the tag
-   (notes GitHub generates for the tagged commit, ending with a hidden
-   line `<!-- release notes generated for commit <sha> -->` that
-   `release_draft.py ensure` writes. When you edit a draft's notes, keep
-   that line: a re-run of `sign-service` replaces the notes of a draft
-   that lacks it, or whose line names another commit (as after a moved
-   tag), with freshly generated ones. If it was deleted, put it back with
-   the tag's commit SHA before re-running, or your edits are lost.
-   `ensure` refuses a tag whose
-   release is already published or that does not point at the commit the
-   run builds, whether the draft is new or already exists, and waits until
-   the release list shows a new draft — the list lags behind a fresh
-   release by a moment), stages `stream-to-speaker-<ver>.exe` as
+2. `sign-service` — creates the **draft** release for the tag, with the
+   notes GitHub generates for the tagged commit (you can edit them: see
+   "Editing the draft's release notes" below). `release_draft.py ensure`
+   refuses a tag whose release is already published or that does not
+   point at the commit the run builds, whether the draft is new or
+   already exists, and waits until the release list shows a new draft
+   (the list lags behind a fresh release by a moment). The job then
+   stages `stream-to-speaker-<ver>.exe` as
    a workflow artifact, EV-signs it via the signing repo (**approval
    click 1**) and uploads the signed exe, its `.sha256` and its
    provenance bundle to the draft. The signed exe's SHA-256 is a job
@@ -526,6 +521,26 @@ succeeded only `publish` can be re-run on its own. A
 published release keeps its assets and notes (`publish` only hands the latest flag back to a higher version published meanwhile): once `publish` succeeded,
 re-running the chain fails at `sign-service`.
 
+### Editing the draft's release notes
+
+You can edit the draft's notes until `publish` runs; they are published
+as they stand. No run replaces notes you changed.
+
+The notes `sign-service` generates end with a comment line that GitHub
+hides when it shows the notes; you see it in the edit box. It names the
+commit the notes were generated for and holds their SHA-256, which is how
+a later run tells generated notes from changed ones. You can leave the
+line where it is or delete it.
+
+A run replaces a draft's notes in one case only: the tag was moved to
+another commit after an earlier run made the draft, and the notes are
+still exactly the generated ones. They are then generated again, for the
+new commit. Notes you changed stay as they are in that case too, and the
+run shows a warning that they were written for another commit: read them
+again before the release is published. (The "Generate release notes"
+button in the draft's edit box makes the list for the commit the tag
+points at now.)
+
 ### Test-signed fallback releases
 
 A version whose installer bundles the test-signed driver
@@ -609,8 +624,9 @@ a later re-run may hold setup exe assets of the earlier attempt under
 other names (for example a `-testsigned` installer when the next attempt
 bundles a Microsoft-signed driver); `sign-release` removes those. A
 draft an earlier run made for another commit (the tag was deleted and
-pushed again elsewhere) gets the new commit as its target and release
-notes generated for it. Any
+pushed again elsewhere) is used again: its generated release notes are
+generated again for the new commit, and notes you changed are kept (see
+"Editing the draft's release notes"). Any
 other asset that does not belong to a complete release makes `publish`
 refuse the draft; remove it with
 `gh release delete-asset vX.Y.Z <name> --yes`. A moved tag (deleted and

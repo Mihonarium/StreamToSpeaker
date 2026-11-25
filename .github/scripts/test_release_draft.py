@@ -166,9 +166,8 @@ class FindingTheDraft(unittest.TestCase):
         self.assertEqual(len(create), 1)
         for field in ("tag_name=v0.1.11", "draft=true", f"target_commitish={COMMIT}"):
             self.assertIn(field, create[0])
-        # Notes generated for this commit, and the commit named in them.
-        self.assertTrue(any(a.startswith("body=changes up to " + COMMIT) and rd.notes_marker(COMMIT) in a
-                            for a in create[0]))
+        # Notes generated for this commit, with the line that says so.
+        self.assertIn("body=" + rd.with_marker("changes up to " + COMMIT, COMMIT), create[0])
         # A re-run finds the draft and creates nothing.
         rel, created = rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
         self.assertFalse(created)
@@ -625,9 +624,13 @@ class Versions_(unittest.TestCase):
             self.assertEqual(fh.read(), "version=0.1.11\nviversion=0.1.11.0\n")
 
 
-class MovedTag(unittest.TestCase):
-    """The draft's notes name the commit they were generated for; GitHub's
-    target_commitish of a draft whose tag exists is not relied on."""
+class DraftNotes(unittest.TestCase):
+    """Notes a person changed are never replaced. A draft's notes are
+    generated again in one case only: they are still exactly the notes an
+    earlier run generated for another commit (the tag was moved since).
+    The notes' last line says which commit they were generated for and
+    holds their SHA-256; GitHub's target_commitish of a draft whose tag
+    exists is not relied on."""
 
     def draft(self, body, target=COMMIT):
         rel = release("v0.1.11", rid=5)
@@ -636,29 +639,79 @@ class MovedTag(unittest.TestCase):
         return FakeGh([rel])
 
     def ensure(self, gh):
-        return rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            found, created = rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+        self.assertFalse(created)
+        return out.getvalue()
 
-    def notes_writes(self, gh):
+    def writes(self, gh):
         return [c for c in gh.calls if c[:3] in (("api", "--method", "PATCH"), ("api", "--method", "POST"))]
 
-    def test_a_draft_made_for_another_commit_gets_the_notes_of_this_one(self):
+    def test_the_last_line_names_the_commit_and_tells_changed_notes_from_generated_ones(self):
+        notes = "## What's Changed\n* A fix\n\n**Full Changelog**: https://example.invalid/compare/a...b"
+        body = rd.with_marker(notes, COMMIT)
+        self.assertTrue(body.startswith(notes + "\n\n<!-- "))
+        self.assertTrue(body.endswith("-->"))
+        self.assertEqual(len(body.splitlines()[-1].split("<!--")), 2, "one comment, on the last line")
+        self.assertEqual(rd.generated_for(body), (COMMIT, True))
+        # GitHub's editor saves CRLF line ends; blanks at a line's end and
+        # around the notes don't show.
+        saved = "\r\n" + body.replace("\n", "\r\n").replace("A fix", "A fix  ") + "\r\n"
+        self.assertEqual(rd.generated_for(saved), (COMMIT, True))
+        for changed in (body.replace("A fix", "A fix for the tray icon"), body + "\n\nP.S. thanks, everyone",
+                        "Before all else.\n\n" + body, body.replace(notes, "")):
+            self.assertEqual(rd.generated_for(changed), (COMMIT, False), changed)
+        # No line of this chain: written by hand, or the line was removed
+        # or damaged.
+        for other in ("", notes, notes + "\n\n<!-- a comment of the maintainer's -->",
+                      body.replace(COMMIT, COMMIT[:7]), body.replace("sha256 ", "sha256: ")):
+            self.assertIsNone(rd.generated_for(other), other)
+
+    def test_generated_notes_of_another_commit_that_nobody_changed_are_generated_again(self):
         # The tag was deleted and pushed again at COMMIT after a run of
         # OTHER made the draft: its generated notes describe OTHER.
-        gh = self.draft(f"changes up to {OTHER}\n\n{rd.notes_marker(OTHER)}", target=OTHER)
-        found, created = self.ensure(gh)
-        self.assertFalse(created)
-        self.assertEqual(gh.releases[0]["body"], f"changes up to {COMMIT}\n\n{rd.notes_marker(COMMIT)}")
+        for body in (rd.with_marker(f"changes up to {OTHER}", OTHER),
+                     rd.with_marker(f"changes up to {OTHER}", OTHER).replace("\n", "\r\n") + "\r\n"):
+            gh = self.draft(body, target=OTHER)
+            said = self.ensure(gh)
+            self.assertEqual(gh.releases[0]["body"], rd.with_marker(f"changes up to {COMMIT}", COMMIT))
+            self.assertEqual(gh.releases[0]["target_commitish"], COMMIT)
+            self.assertIn(OTHER, said)
+            self.assertNotIn("::warning::", said)
+
+    def test_changed_notes_of_another_commit_are_kept_and_the_run_warns(self):
+        made = rd.with_marker(f"changes up to {OTHER}", OTHER)
+        for body in (made.replace("changes up to", "Everything new up to"), made + "\n\nThanks to everyone who tested."):
+            gh = self.draft(body, target=OTHER)
+            said = self.ensure(gh)
+            self.assertEqual(gh.releases[0]["body"], body)
+            self.assertFalse([c for c in self.writes(gh) if any(str(a).startswith("body=") for a in c)])
+            self.assertEqual(gh.releases[0]["target_commitish"], COMMIT)
+            warnings = [line for line in said.splitlines() if line.startswith("::warning::")]
+            self.assertEqual(len(warnings), 1, said)
+            for part in (OTHER, COMMIT, "v0.1.11", "kept"):
+                self.assertIn(part, warnings[0])
 
     def test_the_draft_of_this_commit_is_left_as_it_is_whatever_target_commitish_says(self):
-        gh = self.draft(f"edited by hand\n\n{rd.notes_marker(COMMIT)}", target="main")
-        self.ensure(gh)
-        self.assertEqual(self.notes_writes(gh), [])
-        self.assertEqual(gh.releases[0]["body"], f"edited by hand\n\n{rd.notes_marker(COMMIT)}")
+        made = rd.with_marker(f"changes up to {COMMIT}", COMMIT)
+        for body in (made, made.replace("changes up to", "Everything new up to")):
+            gh = self.draft(body, target="main")
+            said = self.ensure(gh)
+            self.assertEqual(self.writes(gh), [])
+            self.assertEqual(gh.releases[0]["body"], body)
+            self.assertEqual(said, "")
 
-    def test_a_draft_whose_notes_name_no_commit_gets_this_commit_s(self):
-        gh = self.draft("notes of unknown origin")
-        self.ensure(gh)
-        self.assertEqual(gh.releases[0]["body"], f"changes up to {COMMIT}\n\n{rd.notes_marker(COMMIT)}")
+    def test_notes_without_the_line_are_left_as_they_are(self):
+        # Written by hand over the generated ones, the line deleted with
+        # them; or the line retyped with a shortened SHA.
+        made = rd.with_marker(f"changes up to {OTHER}", OTHER)
+        for body in ("", "Notes the maintainer wrote.", made.replace(OTHER, OTHER[:7])):
+            gh = self.draft(body, target=OTHER)
+            said = self.ensure(gh)
+            self.assertEqual(self.writes(gh), [])
+            self.assertEqual(gh.releases[0]["body"], body)
+            self.assertEqual(said, "")
 
 
 class TwoTagsAtOnce(unittest.TestCase):

@@ -19,12 +19,15 @@ with push access, never to `releases/latest` (the app's update check), the
       wait until the release list shows it (the list lags behind a fresh
       release by a moment). --commit: the tag must exist and point at SHA,
       whether the draft is created now or already exists. The notes are
-      generated for the commit and end with a hidden line naming it; a
-      draft whose notes name another commit (the tag was moved since an
-      earlier run made it), or none, gets notes generated for this one. --target: for
-      a tag that does not exist yet (it would be created at SHA on
-      publishing). Fails when <tag> is already a published release or has
-      more than one release.
+      generated for the commit and end with a line, hidden when GitHub
+      shows them, that names the commit and holds their SHA-256. The
+      notes of a draft that exists are replaced in one case only: they
+      are still exactly the notes generated for another commit (the tag
+      was moved since an earlier run made the draft). Notes a person
+      changed are never replaced; when they were written for another
+      commit, a warning says so. --target: for a tag that does not exist
+      yet (it would be created at SHA on publishing). Fails when <tag> is
+      already a published release or has more than one release.
   release_draft.py upload  <tag> --repo R --commit SHA --version V FILE...
       Put signed files on the draft (as `require` checks it), each .exe
       with its .sha256 sidecar, the setup exe also as the stable
@@ -194,17 +197,46 @@ def require_draft(repo, tag, run=gh, sleep=time.sleep, waits=(2, 5, 10), commit=
     return rel
 
 
-def notes_marker(commit):
-    """The line, hidden when GitHub renders the notes, that names the
-    commit a draft's notes were generated for."""
-    return f"<!-- release notes generated for commit {commit} -->"
+# The last line of notes this chain generated. GitHub hides it when it
+# shows the notes; a maintainer sees it in the edit box, so it says what it
+# is for.
+NOTES_LINE = ("<!-- Notes generated for commit {commit} (sha256 {digest}). "
+              "Edit freely: the release workflow never replaces notes that were changed. -->")
+NOTES_LINE_RE = re.compile(r"<!-- Notes generated for commit ([0-9a-f]{40}) \(sha256 ([0-9a-f]{64})\)\.[^\n]*?-->")
+
+
+def notes_digest(notes):
+    """The SHA-256 of `notes` as a reader sees them: GitHub's editor saves
+    CRLF line ends, and blanks at a line's end or around the notes don't
+    show."""
+    lines = notes.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return hashlib.sha256("\n".join(line.rstrip() for line in lines).strip().encode("utf-8")).hexdigest()
+
+
+def with_marker(notes, commit):
+    """`notes`, generated for `commit`, with the line that says so."""
+    return f"{notes}\n\n{NOTES_LINE.format(commit=commit, digest=notes_digest(notes))}"
+
+
+def generated_for(body):
+    """(commit, unchanged) when a draft's notes `body` carry this chain's
+    line: the commit they were generated for, and whether they are still
+    exactly the generated ones (the line last, the notes above it as they
+    were). None without the line: written by hand, or the line was removed
+    or changed."""
+    found = list(NOTES_LINE_RE.finditer(body or ""))
+    if not found:
+        return None
+    line = found[-1]
+    unchanged = not body[line.end():].strip() and notes_digest(body[:line.start()]) == line.group(2)
+    return line.group(1), unchanged
 
 
 def generated_notes(repo, tag, commit, run=gh):
-    """GitHub's generated notes for `tag` at `commit`, with notes_marker."""
+    """GitHub's generated notes for `tag` at `commit`, with_marker."""
     notes = json.loads(run("api", "--method", "POST", f"repos/{repo}/releases/generate-notes",
                            "-f", f"tag_name={tag}", "-f", f"target_commitish={commit}"))
-    return f"{notes.get('body') or ''}\n\n{notes_marker(commit)}"
+    return with_marker(notes.get("body") or "", commit)
 
 
 def ensure_draft(repo, tag, commit=None, target=None, run=gh, sleep=time.sleep):
@@ -221,12 +253,22 @@ def ensure_draft(repo, tag, commit=None, target=None, run=gh, sleep=time.sleep):
     rels = releases_for(repo, tag, run)
     if rels:
         rel = require_draft(repo, tag, run, sleep)
-        body = json.loads(run("api", f"repos/{repo}/releases/{int(rel['id'])}")).get("body") or ""
-        if commit and notes_marker(commit) not in body:
-            # The notes were generated for another commit (the tag was moved
-            # since an earlier run made this draft), or name none.
-            run("api", "--method", "PATCH", f"repos/{repo}/releases/{int(rel['id'])}",
-                "-f", f"target_commitish={commit}", "-f", f"body={generated_notes(repo, tag, commit, run)}")
+        made = generated_for(json.loads(run("api", f"repos/{repo}/releases/{int(rel['id'])}")).get("body"))
+        if commit and made and made[0] != commit:
+            # The tag was moved since an earlier run made this draft: its
+            # notes were generated for another commit. Notes nobody changed
+            # are generated again; notes a person changed are theirs.
+            fields = ["-f", f"target_commitish={commit}"]
+            if made[1]:
+                fields += ["-f", f"body={generated_notes(repo, tag, commit, run)}"]
+                print(f"the draft's notes were generated for commit {made[0]} and nobody changed them: "
+                      f"replaced with notes generated for {commit}")
+            else:
+                print("::warning::" + command_text(
+                    f"The draft's release notes were written for commit {made[0]} and changed by hand. The tag "
+                    f"{tag} points at {commit} now. The notes are kept as they are: check that they describe "
+                    "this release before it is published."))
+            run("api", "--method", "PATCH", f"repos/{repo}/releases/{int(rel['id'])}", *fields)
             rel = require_draft(repo, tag, run, sleep)
         return rel, False
     created = json.loads(run("api", "--method", "POST", f"repos/{repo}/releases",
