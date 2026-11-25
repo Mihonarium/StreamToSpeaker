@@ -4,10 +4,12 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Stream To Speaker\scripts\Diagnose.ps1"
 #
 # It changes nothing and needs no administrator rights (run elevated, it can
-# also read Windows' driver log). Account names, the computer's name, user
-# folders and speaker names are replaced by placeholders such as <account>,
-# and it prints nothing about networks (no network names, no addresses), so
-# the output can be posted in public. Read it before you post it.
+# also read Windows' driver log). Account, computer, domain and speaker
+# names, user folders, servers and shares, account IDs, e-mail addresses and
+# network and hardware addresses are replaced by placeholders such as
+# <account>; of the network it prints only whether it is public or private.
+# No list of patterns catches every name, so the report asks, first and
+# last, to be read through before it is posted.
 #
 # Keep this file ASCII. Windows PowerShell reads a script without a
 # byte-order mark in the system's ANSI code page; in the single-byte
@@ -26,46 +28,83 @@ $DiagArrow = [string][char]0x2192
 # ---------------------------------------------------------------------------
 
 # The names on this PC that identify a person or the machine, with the
-# placeholder each is replaced by.
+# placeholder each is replaced by: as they are, and in the short (8.3) form
+# Windows gives a long folder name.
 function Get-PrivateNames {
+    param(
+        [string]$UserName = $env:USERNAME,
+        [string]$ComputerName = $env:COMPUTERNAME,
+        [string]$UserDomain = $env:USERDOMAIN,
+        [string]$DnsDomain = $env:USERDNSDOMAIN,
+        [string]$LogonServer = $env:LOGONSERVER,
+        [string]$Identity = $(try { [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { '' })
+    )
+    $pairs = @(
+        @($UserName, '<account>'),
+        @((("$Identity" -split '\\')[-1]), '<account>'),
+        @($ComputerName, '<computer>'),
+        @($UserDomain, '<domain>'),
+        @($DnsDomain, '<domain>'),
+        @($LogonServer, '<server>'))
+    # The organisation's own domain too: CORP.CONTOSO.COM also gives CONTOSO.COM.
+    $labels = @("$DnsDomain".Trim('.') -split '\.' | Where-Object { $_ })
+    for ($i = 1; $i -le $labels.Count - 2; $i++) { $pairs += , @(($labels[$i..($labels.Count - 1)] -join '.'), '<domain>') }
     $names = [ordered]@{}
-    foreach ($pair in @(
-            @($env:USERNAME, '<account>'),
-            @($env:COMPUTERNAME, '<computer>'),
-            @($env:USERDOMAIN, '<domain>'),
-            @($env:USERDNSDOMAIN, '<domain>'),
-            @($env:LOGONSERVER, '<server>'))) {
+    foreach ($pair in $pairs) {
         $value = "$($pair[0])".Trim().TrimStart('\')
         if ($value.Length -ge 2 -and -not $names.Contains($value)) { $names[$value] = $pair[1] }
     }
-    try {
-        $full = ([Security.Principal.WindowsIdentity]::GetCurrent().Name -split '\\')[-1]
-        if ($full.Length -ge 2 -and -not $names.Contains($full)) { $names[$full] = '<account>' }
-    } catch { }
+    foreach ($value in @($names.Keys)) {
+        $short = ($value -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
+        if ($short.Length -gt 6) { $short = $short.Substring(0, 6) }
+        $form = "$short~"
+        if ($short.Length -ge 2 -and ($value -match '[^A-Za-z0-9]' -or $value.Length -gt 8) -and -not $names.Contains($form)) {
+            $names[$form] = $names[$value]
+        }
+    }
     $names
 }
 
 # A line as it may be shown in public: no account, computer or domain name,
-# no user folder, no speaker name, no network address.
+# no user folder, server or share, no speaker name, no account ID, no e-mail,
+# network or hardware address.
 function ConvertTo-PublicText {
     param([string]$Text, $PrivateNames = [ordered]@{}, [string]$UserProfile = $env:USERPROFILE)
     $t = "$Text"
     if ($UserProfile -and $UserProfile.Length -ge 4) {
         $t = [regex]::Replace($t, [regex]::Escape($UserProfile), '<user folder>', 'IgnoreCase')
     }
-    # Any user's folder, in any form Windows writes it.
+    # Any user's folder, in any form Windows writes it, and the organisation
+    # in a work OneDrive's folder name.
     $t = [regex]::Replace($t, '(?i)(\\Users\\|\\Documents and Settings\\)[^\\/:*?"<>|\r\n]+', '$1<user>')
+    $t = [regex]::Replace($t, '(?i)(OneDrive - )[^\\/:*?"<>|\r\n]+', '$1<organisation>')
+    # A network path's server and share (not \\?\ and \\.\, which are this PC's).
+    $t = [regex]::Replace($t, '(?<![\\\w])\\\\(?![?.]\\)[^\\/:*?"<>|\s]+\\[^\\/:*?"<>|\r\n]+', '\\<server>\<share>')
+    # E-mail addresses, before the names they may contain.
+    $t = [regex]::Replace($t, '[\w.+-]+@[\w-]+(?:\.[\w-]+)+', '<e-mail>')
+    # A name joined to other letters or digits is another word; joined by a
+    # space, a dash, an underscore or anything else, it is the name.
     foreach ($name in $PrivateNames.Keys) {
-        $t = [regex]::Replace($t, '(?<![\w-])' + [regex]::Escape($name) + '(?![\w-])', $PrivateNames[$name], 'IgnoreCase')
+        $pattern = '(?<![\p{L}\p{N}])' + [regex]::Escape($name)
+        $pattern += if ($name.EndsWith('~')) { '\d+(?![\p{L}\p{N}])' } else { '(?![\p{L}\p{N}])' }
+        $t = [regex]::Replace($t, $pattern, $PrivateNames[$name], 'IgnoreCase')
     }
+    # Account IDs of a person: local and domain accounts, and work or school
+    # (Microsoft Entra) accounts.
+    $t = [regex]::Replace($t, '(?i)\bS-1-(?:5-21|12-1)(?:-\d+)+\b', '<account id>')
     # The app names its sound output after the speaker it plays on.
-    # The name ends where a quote closes it, or at the end of the line.
-    $t = [regex]::Replace($t, '(Stream To Speaker ' + [regex]::Escape($DiagArrow) + ' ).*?(?=''[):,]|''\s*$|"|$)', '$1<speaker>')
-    # Addresses: IPv4 in the ranges home and office networks use, IPv6, and
-    # hardware (MAC) addresses.
-    $t = [regex]::Replace($t, '\b(10|127|169\.254|192\.168|172\.(1[6-9]|2[0-9]|3[01]))(\.\d{1,3}){2,3}\b', '<address>')
-    $t = [regex]::Replace($t, '(?i)(?<![\w:])(?:fe80|f[cd][0-9a-f]{2}|2[0-9a-f]{3}):[0-9a-f:]*[0-9a-f](?:%\d+)?(?![\w:])', '<address>')
+    # The name ends where a single quote closes it, or at the end of the line.
+    $t = [regex]::Replace($t, '(Stream To Speaker ' + [regex]::Escape($DiagArrow) + ' ).*?(?=''[):,]|''\s*$|$)', '$1<speaker>')
+    # Hardware (MAC) addresses: with colons or dashes, dotted, and as 12 hex
+    # digits in a row (not the last part of a GUID).
     $t = [regex]::Replace($t, '(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b', '<address>')
+    $t = [regex]::Replace($t, '(?i)\b[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}\b', '<address>')
+    $t = [regex]::Replace($t, '(?i)(?<![0-9a-f-])[0-9a-f]{12}(?![0-9a-f])', '<address>')
+    # IPv6: anything with "::" or with three or more groups (not a time).
+    $t = [regex]::Replace($t, '(?i)(?<![\w:.])(?=[0-9a-f:.]*::|(?:[0-9a-f]{1,4}:){3})(?:[0-9a-f]{0,4}:){2,7}(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f]{1,4})?(?:%[\w.-]+)?(?![\w:])', '<address>')
+    # IPv4, every address but this PC's own 127.0.0.1; a version number
+    # (after "version" or after the comma of a DriverVer) stays.
+    $t = [regex]::Replace($t, '(?i)(?<![\w.,])(?<!version\W{0,12})(?!127\.0\.0\.1(?![\d.]))(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)', '<address>')
     $t
 }
 
@@ -73,6 +112,32 @@ function ConvertTo-PublicText {
 # transcript; those lines are left out of the report.
 function Test-TranscriptHeaderLine([string]$Line) {
     $Line -match '^\s*(Username|RunAs User|Machine|Host Application|Process ID|Configuration Name)\s*:'
+}
+
+# The lines of a transcript that go into the report: not the blocks between
+# two lines of asterisks that PowerShell writes at a transcript's start and
+# end (in whatever language Windows uses), nor the header lines above.
+function Select-ReportLogLines([string[]]$Lines = @()) {
+    $inHeader = $false
+    foreach ($line in $Lines) {
+        if ($line -match '^\*{10,}\s*$') {
+            $inHeader = -not $inHeader
+            continue
+        }
+        if ($inHeader -or (Test-TranscriptHeaderLine $line)) { continue }
+        $line
+    }
+}
+
+# Asked first and last in every report.
+$DiagReadFirst = 'Read the report through before you post it. It replaces the names of people, computers, speakers and networks, and e-mail and network addresses, where it finds them; replace any it missed.'
+
+# A sound output's name as the report shows it: the app's own names (whose
+# speaker part is replaced later); a name chosen in Sound settings isn't shown.
+function Format-OutputName([string]$Name) {
+    if (-not $Name) { return '(none)' }
+    if ($Name.IndexOf('Stream To Speaker', [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $Name }
+    '(a name chosen in Sound settings)'
 }
 
 # ---------------------------------------------------------------------------
@@ -136,9 +201,10 @@ function Get-Report {
     $elevated = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 
+    $DiagReadFirst
     Write-Section 'About this report'
-    'Made by Diagnose.ps1. Account, computer and speaker names and user folders are replaced by'
-    'placeholders such as <account>; nothing about networks is included. Read it before posting it.'
+    'Made by Diagnose.ps1. Names, user folders, account IDs and addresses are replaced by'
+    'placeholders such as <account>; of the network, only whether it is public or private is shown.'
     "Run as administrator: $(if ($elevated) { 'yes' } else { 'no (Windows'' driver log is left out)' })"
 
     Write-Section 'Windows'
@@ -155,7 +221,7 @@ function Get-Report {
     $testSigning = Test-TestSigningOn $options
     $secureBoot = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -Name UEFISecureBootEnabled -ErrorAction SilentlyContinue).UEFISecureBootEnabled
     "Installed in : $(if ($appDir) { $appDir } else { '(Stream To Speaker is not installed)' })"
-    "Build        : $(if ($testBuild) { 'test build (its driver carries a test signature)' } else { 'release (Microsoft-signed driver)' })"
+    "Build        : $(if (-not $appDir) { '(not installed)' } elseif ($testBuild) { 'test build (its driver carries a test signature)' } else { 'release (Microsoft-signed driver)' })"
     "Test signing : $(if ($testSigning) { 'on' } else { 'off' })$(if ($testBuild -and -not $testSigning) { ' - a test build''s driver does not start like this' })"
     "Secure Boot  : $(if ($null -eq $secureBoot) { 'unknown' } elseif ($secureBoot -eq 1) { 'on' } else { 'off' })"
 
@@ -211,7 +277,7 @@ function Get-Report {
         ''
         "Output       : $($key.PSChildName)"
         "  State      : $(if ($states.ContainsKey([int]$low)) { $states[[int]$low] } else { "0x{0:X}" -f $state })"
-        "  Name       : $fname"
+        "  Name       : $(Format-OutputName $fname)"
         "  Device     : $($props.'{b3f8fa53-0004-438e-9003-51a46e139bfc},2')"
         "  Form factor: $($props.'{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},0') (1 = speakers)"
         "  Association: $($props.'{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},2')"
@@ -241,7 +307,7 @@ function Get-Report {
     Write-Section 'Install log (last 80 lines)'
     $log = if ($appDir) { Join-Path $appDir 'logs\install.log' } else { '' }
     if ($log -and (Test-Path -LiteralPath $log)) {
-        @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Where-Object { -not (Test-TranscriptHeaderLine $_) }) |
+        @(Select-ReportLogLines @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue)) |
             Select-Object -Last 80 | ForEach-Object { "  $_" }
     } else {
         "  No install log at $log."
@@ -273,8 +339,8 @@ Read from the top; the first line that fits is the one that matters.
   restart Windows and run Setup again.
 - Sound output "turned off in Sound settings": open Sound settings, choose Stream To
   Speaker and allow it (or enable it).
-- No sound output although the device works: restart Windows. If it's still missing,
-  run Reset-Install.ps1 (below), restart, and run Setup again.
+- No sound output although the device works: run Setup again, which makes a new one.
+  If it's still missing, run Reset-Install.ps1 (below), restart, and run Setup again.
 - A firewall rule blocks the app, or the network in use is Public: speakers can't reach
   it. Make the network private (Settings > Network & internet), or remove the blocking rule
   in Windows Defender Firewall.
@@ -284,6 +350,8 @@ Commands, each from an elevated PowerShell (Run as administrator):
     $scripts = if ($appDir) { Join-Path $appDir 'scripts' } else { 'C:\Program Files\Stream To Speaker\scripts' }
     "  Name the output again:  powershell -NoProfile -ExecutionPolicy Bypass -File `"$scripts\Rename-Endpoint.ps1`""
     "  Clear the driver:       powershell -NoProfile -ExecutionPolicy Bypass -File `"$scripts\Reset-Install.ps1`""
+    ''
+    $DiagReadFirst
 }
 
 if (-not (Get-Variable -Name DiagnoseLoadOnly -ValueOnly -ErrorAction SilentlyContinue)) {
