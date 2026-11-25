@@ -10,10 +10,20 @@ name: Driver submission
 #   2. wraps inf + sys + pdb (+ cat if produced) into a Partner Center
 #      submission CAB (MakeCab, files under a StreamToSpeaker\ subdir as the
 #      dashboard requires — no files at the CAB root);
-#   3. parks the CAB + a manifest on a driver-v<version> prerelease;
+#   3. records the build (and the unsigned CAB's SHA-256) in the
+#      manifest.json of a driver-v<version> prerelease;
 #   4. EV-signs the CAB through the central signing repo (human approval
-#      there authorizes exactly this CAB's SHA-256) and swaps the release
-#      asset for the signed CAB.
+#      there authorizes exactly this CAB's SHA-256) and adds the signed CAB
+#      to the release.
+#
+# Every write to the release goes through .github/scripts/driver_release.py:
+# a run writes only a release that is new or its own commit's unsigned
+# build, never one that is certified or attested, and nothing on a release
+# is deleted before its replacement is up. A new driver build must be
+# numbered above every driver release there is (driver_release.py
+# submission-check stops the run before the build otherwise). Dispatched
+# from any branch but main, the run builds the CAB (artifact
+# submission-cab) and stops: no release, no signature, no cleanup.
 #
 # When this workflow completes, driver-attest.yml can take over (opt-in via
 # the AUTO_ATTEST repository variable): it submits the EV-signed CAB to
@@ -40,7 +50,7 @@ on:
   workflow_dispatch:
     inputs:
       driver_build:
-        description: "Override the driver build number (default: git commit count)"
+        description: "Driver build number (default: the git commit count); must be above every driver release's"
         required: false
         default: ""
       force:
@@ -49,12 +59,15 @@ on:
         required: false
         default: false
 
-# A newer driver push obsoletes an in-flight submission build. Completed
-# stale prereleases are handled by the cleanup step instead. NB a cancelled
+# A newer driver push obsoletes an in-flight submission build of the same
+# ref (a dispatch from a branch, which writes nothing, no longer cancels
+# main's run). A run cancelled while it writes a release leaves at most a
+# <name>.pending asset, which the next run finishes. Completed stale
+# prereleases are handled by the cleanup step instead. NB a cancelled
 # sign-cab job can leave a signing-repo run Waiting — reject it there (the
 # digest in its run name identifies it).
 concurrency:
-  group: driver-submission
+  group: driver-submission-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -81,34 +94,20 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # Every driver-v* release on every page of the list; a manifest that
+      # can't be read stops the run (it is never taken for "no match").
       - name: Look for a certified driver matching this driver source
         id: check
         shell: pwsh
         env:
+          SOURCE_HASH: ${{ hashFiles('driver/**', 'include/**') }}
           INPUT_FORCE: ${{ inputs.force }}
         run: |
-          $hash = "${{ hashFiles('driver/**', 'include/**') }}"
-          Write-Host "Driver source hash: $hash"
-          $rels = gh api "repos/${{ github.repository }}/releases?per_page=100" | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw "gh api releases failed" }
-          $hit = $null
-          foreach ($r in @($rels | Where-Object { $_.tag_name -like "driver-v*" })) {
-              if (-not ($r.assets | Where-Object { $_.name -eq "manifest.json" })) { continue }
-              try {
-                  gh release download $r.tag_name --pattern manifest.json --output guard-manifest.json --clobber
-                  if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
-                  $m = Get-Content guard-manifest.json -Raw | ConvertFrom-Json
-              } catch { continue }
-              if ($m.certified -and $m.source_hash -eq $hash) { $hit = $r.tag_name; break }
-          }
-          if ($hit -and $env:INPUT_FORCE -ne "true") {
-              Write-Host "##[notice]Certified driver $hit already matches driver source hash $hash - skipping the attestation build + submission. Installers bundle the certified package. (Dispatch with force=true to build anyway.)"
-              "proceed=false" >> $env:GITHUB_OUTPUT
-          } else {
-              if ($hit) { Write-Host "force=true: building although certified driver $hit matches this source." }
-              else { Write-Host "No certified driver matches this driver source - proceeding with the attestation build." }
-              "proceed=true" >> $env:GITHUB_OUTPUT
-          }
+          Write-Host "Driver source hash: $env:SOURCE_HASH"
+          $guardArgs = @("submission-guard", "--source-hash", $env:SOURCE_HASH)
+          if ($env:INPUT_FORCE -eq "true") { $guardArgs += "--force" }
+          python .github/scripts/driver_release.py @guardArgs
+          if ($LASTEXITCODE -ne 0) { throw "could not tell whether a certified driver matches this driver source (see above); nothing was built" }
 
   build-cab:
     needs: certified-guard
@@ -241,6 +240,19 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=driver-v$version" >> $env:GITHUB_OUTPUT
 
+      # Before the build: the release this run would write must be new or
+      # this commit's own unsigned build, and the version must be above
+      # every driver release's.
+      - name: Check this run may write its driver release (main only)
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.drvver.outputs.tag }}
+        run: |
+          python .github/scripts/driver_release.py submission-check --tag $env:TAG --commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "this run may not write $env:TAG (see above); nothing was built" }
+
       - name: Stamp driver build number
         shell: pwsh
         run: |
@@ -340,9 +352,10 @@ jobs:
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       # The signing hand-off uses this artifact (private-source mode — the
-      # repo is private, so release-asset URLs are not fetchable without
-      # auth); the release asset below is the durable record + what
-      # driver-attest.yml submits after it's EV-signed.
+      # signing repo fetches it with its own token). The unsigned CAB is not
+      # a release asset: the manifest records its SHA-256, and the EV-signed
+      # CAB sign-cab adds to the release (what driver-attest.yml submits)
+      # holds the same files.
       - name: Upload submission CAB as workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -351,114 +364,57 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-      - name: Create driver prerelease + upload submission CAB
+      # Creates driver-v<version> (prerelease) or takes over this commit's
+      # own unsigned build of it, then writes manifest.json last.
+      - name: Record the build on its driver release (main only)
+        if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.drvver.outputs.tag }}
+          VERSION: ${{ steps.drvver.outputs.version }}
+          PREFIX: ${{ steps.drvver.outputs.prefix }}
+          BUILD: ${{ steps.drvver.outputs.build }}
+          SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
+          # How this binary was built, for driver-reproducibility.yml: the
+          # linker embeds the PDB path, so a rebuild has to happen in the
+          # same directory.
+          BUILD_ROOT: ${{ github.workspace }}
+          CAB_NAME: ${{ steps.cab.outputs.name }}
+          CAB_SHA256: ${{ steps.cab.outputs.sha256 }}
+          AUTO_ATTEST: ${{ vars.AUTO_ATTEST }}
         run: |
-          $tag = "${{ steps.drvver.outputs.tag }}"
-          $version = "${{ steps.drvver.outputs.version }}"
+          $releaseArgs = @("submission-release", "--tag", $env:TAG, "--commit", $env:GITHUB_SHA,
+              "--version", $env:VERSION, "--prefix", $env:PREFIX, "--build", $env:BUILD,
+              "--source-hash", $env:SOURCE_HASH, "--build-root", $env:BUILD_ROOT,
+              "--cab-name", $env:CAB_NAME, "--cab-sha256", $env:CAB_SHA256, "--auto-attest", "$env:AUTO_ATTEST")
+          python .github/scripts/driver_release.py @releaseArgs
+          if ($LASTEXITCODE -ne 0) { throw "could not record the build on $env:TAG (see above)" }
 
-          @{
-              schema = 1
-              driver_version = $version
-              driver_prefix = "${{ steps.drvver.outputs.prefix }}"
-              driver_build = [int]"${{ steps.drvver.outputs.build }}"
-              commit = "${{ github.sha }}"
-              source_hash = "${{ steps.srchash.outputs.hash }}"
-              # How this binary was built, for driver-reproducibility.yml:
-              # the linker embeds the PDB path, so a rebuild has to happen
-              # in the same directory, with driver.h stamped as above.
-              build_root = "${{ github.workspace }}"
-              driver_h_stamped = $true
-              submission_cab = "${{ steps.cab.outputs.name }}"
-              submission_cab_sha256 = "${{ steps.cab.outputs.sha256 }}"
-              submission_cab_signed_sha256 = $null
-              attested = $false
-              signed_zip = $null
-              signed_zip_sha256 = $null
-          } | ConvertTo-Json | Set-Content -Path manifest.json -Encoding ascii
-
-          $notes = @(
-              "Microsoft attestation submission for driver **$version** (commit ${{ github.sha }})."
-              ""
-              "Driver source hash: ``${{ steps.srchash.outputs.hash }}``"
-              ""
-              "**Status: awaiting Microsoft attestation.** Runbook (details in ``docs/driver-signing.md``):"
-              ""
-              "1. Approve the EV-signing run for the submission CAB in the signing repo (its run name must show sha256 ``${{ steps.cab.outputs.sha256 }}``). CI then replaces the CAB asset here with the EV-signed one."
-              "2. That's it — the **Driver attest** workflow submits the signed CAB to Microsoft via the Hardware API, polls, attaches the returned zip here, verifies the signatures, and marks this driver attested. If it goes red, re-run it from the Actions tab: it resumes exactly where it left off. Manual fallback: ``docs/driver-signing.md``."
-          ) -join "`n"
-          Set-Content -Path release-notes.md -Value $notes -Encoding utf8
-
-          gh release view $tag 2>$null | Out-Null
-          if ($LASTEXITCODE -ne 0) {
-              gh release create $tag --prerelease --target "${{ github.sha }}" `
-                  --title "Driver $version — awaiting Microsoft attestation" `
-                  --notes-file release-notes.md
-              if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
-          }
-          gh release upload $tag "${{ steps.cab.outputs.path }}" manifest.json --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
-          Write-Host "Prerelease $tag ready (CAB not yet EV-signed)"
-
-      # Unattested submissions that a newer driver build supersedes are dead
-      # weight (their CAB was never submitted, or the submission is moot) —
-      # delete them so the release list always shows at most one pending
-      # submission. Attested releases are history of shipped driver bits and
-      # are kept forever.
-      - name: Clean up stale unattested driver prereleases
+      # Older builds that a newer one supersedes and that hold nothing
+      # anyone approved or Microsoft returned (never EV-signed, never
+      # submitted) are deleted, so the release list shows one pending
+      # build. Certified and attested releases, EV-signed CABs and Partner
+      # Center submissions are kept; so is any release whose manifest can't
+      # be read.
+      - name: Clean up superseded unsigned driver builds (main only)
+        if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.drvver.outputs.tag }}
         run: |
-          $current = [int]"${{ steps.drvver.outputs.build }}"
-          $rels = gh api "repos/${{ github.repository }}/releases?per_page=100" | ConvertFrom-Json
-          foreach ($r in @($rels | Where-Object { $_.tag_name -like "driver-v*" -and $_.tag_name -ne "${{ steps.drvver.outputs.tag }}" })) {
-              if ($r.tag_name -notmatch '^driver-v\d+\.\d+\.\d+\.(\d+)$') { continue }
-              $build = [int]$Matches[1]
-              if ($build -ge $current) { continue }
-              # Default to KEEPING a release whose manifest we cannot read —
-              # a fetch failure must never look like "safe to delete" (on a
-              # private repo an unauthenticated fetch fails for every
-              # release, attested ones included).
-              $keep = $true
-              $manAsset = $r.assets | Where-Object { $_.name -eq "manifest.json" } | Select-Object -First 1
-              if ($manAsset) {
-                  try {
-                      gh release download $r.tag_name --pattern manifest.json --output stale-manifest.json --clobber
-                      if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
-                      $man = Get-Content stale-manifest.json -Raw | ConvertFrom-Json
-                      # Keep attested AND certified releases (shipped driver
-                      # history; a certified build is older than any later
-                      # attestation build by construction) AND
-                      # releases with an in-flight Partner Center submission
-                      # (ms_* fields, written by driver-attest.yml) — deleting
-                      # one of those would strand the reconciler mid-run and
-                      # lose the record of the submission. A 'failed'
-                      # submission is safe to clean up. (There remains a
-                      # milliseconds-wide race against driver-attest's
-                      # create→persist step; losing it just orphans one
-                      # Partner Center product — the accepted junk-product
-                      # risk — and fails that run cleanly.)
-                      $inflight = ($man.PSObject.Properties.Name -contains "ms_submission_id") -and
-                                  $man.ms_submission_id -and ($man.ms_state -ne "failed")
-                      $keep = [bool]$man.attested -or [bool]$man.certified -or $inflight
-                  } catch { }
-              }
-              if ($keep) { continue }
-              Write-Host "Deleting stale unattested prerelease $($r.tag_name)"
-              gh release delete $r.tag_name --cleanup-tag --yes
-          }
+          python .github/scripts/driver_release.py submission-cleanup --tag $env:TAG
+          if ($LASTEXITCODE -ne 0) { throw "cleanup failed (see above)" }
 
   # EV-sign the submission CAB through the central signing repo. One human
-  # approval there (check the sha256 in the run name), then this job swaps
-  # the release asset for the signed CAB. NB this job runs on branch `main`,
-  # so the request-signing environment must allow main in its deployment
-  # branches policy (see docs/driver-signing.md, one-time setup).
+  # approval there (check the sha256 in the run name), then this job adds
+  # the signed CAB to the release and records its hash. Runs on branch
+  # `main` only, so the request-signing environment must allow main in its
+  # deployment branches policy (see docs/driver-signing.md, one-time setup).
   sign-cab:
     needs: [certified-guard, build-cab]
-    if: needs.certified-guard.outputs.proceed == 'true'
+    if: needs.certified-guard.outputs.proceed == 'true' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
     environment: request-signing
     timeout-minutes: 150
@@ -482,31 +438,19 @@ jobs:
           token: ${{ secrets.SIGNING_REPO_TOKEN }}
           wait-minutes: "120"
 
-      - name: Replace release CAB with the EV-signed one
+      # Only onto the release that still records exactly the unsigned CAB
+      # this run built; the manifest is written last.
+      - name: Add the EV-signed CAB to the driver release
         shell: pwsh
+        env:
+          TAG: ${{ needs.build-cab.outputs.tag }}
+          CAB_SHA256: ${{ needs.build-cab.outputs.cab_sha256 }}
+          SIGNED: ${{ steps.sign.outputs.signed-path }}
+          SIGNED_SHA256: ${{ steps.sign.outputs.signed-sha256 }}
+          AUTO_ATTEST: ${{ vars.AUTO_ATTEST }}
         run: |
-          $tag = "${{ needs.build-cab.outputs.tag }}"
-          $signed = "${{ steps.sign.outputs.signed-path }}"
-          $signedSha = "${{ steps.sign.outputs.signed-sha256 }}"
-          "$signedSha  $(Split-Path $signed -Leaf)" | Set-Content -Path "$signed.sha256" -Encoding ascii -NoNewline
-
-          # Record the signed CAB's hash in the manifest so the exact bytes
-          # submitted to Microsoft stay identifiable. (Authenticated fetch —
-          # unauthenticated release URLs 404 on this private repo.)
-          gh release download $tag --pattern manifest.json --output manifest.json --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release download of manifest.json failed" }
-          $man = Get-Content manifest.json -Raw | ConvertFrom-Json
-          $man.submission_cab_signed_sha256 = $signedSha
-          $man | ConvertTo-Json | Set-Content -Path manifest.json -Encoding ascii
-
-          gh release upload $tag $signed "$signed.sha256" manifest.json --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
-
-          @(
-            "## Submission CAB EV-signed"
-            ""
-            "``${{ needs.build-cab.outputs.cab_name }}`` on release ``$tag`` is now the EV-signed CAB (sha256 ``$signedSha``)."
-            ""
-            "**Next (automatic):** the **Driver attest** workflow submits it to Microsoft via the Hardware API,"
-            "attaches the signed zip back onto the release, and runs verification. Watch its run in the Actions tab."
-          ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          $signedArgs = @("submission-signed", "--tag", $env:TAG, "--commit", $env:GITHUB_SHA,
+              "--cab-sha256", $env:CAB_SHA256, "--signed", $env:SIGNED, "--signed-sha256", $env:SIGNED_SHA256,
+              "--auto-attest", "$env:AUTO_ATTEST")
+          python .github/scripts/driver_release.py @signedArgs
+          if ($LASTEXITCODE -ne 0) { throw "could not add the EV-signed CAB to $env:TAG (see above)" }

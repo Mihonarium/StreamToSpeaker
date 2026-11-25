@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""Reconcile the newest driver-v* release toward Microsoft attestation.
+"""Reconcile a driver-v* release toward Microsoft attestation.
 
 Driven by driver-attest.yml. Reads manifest.json from a driver-v* release,
 advances whatever state it finds (create Partner Center product+submission,
 upload the EV-signed CAB, commit, poll, fetch the signed zip), and records
 every transition back onto the release before acting on it — so a re-run
-always resumes cleanly and duplicate submissions are impossible.
+resumes where the last one stopped. Without a tag it takes the newest
+unfinished attestation round (by creation, not by build number), of
+INPUT_COMMIT when given; a certified or attested release is never written
+(driver_release.py).
 
 Runbook: docs/driver-signing.md.
-Stdlib only; release asset I/O goes through the gh CLI.
+Stdlib only; release asset I/O goes through driver_release.py and gh.
 """
 import json
 import os
-import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import driver_release  # noqa: E402
 
 API = "https://manage.devcenter.microsoft.com/v2.0/my/hardware"
 
@@ -147,50 +152,51 @@ class HardwareApi:
 
 
 class Release:
-    """Asset I/O for one driver-v* release via the gh CLI."""
+    """Asset I/O for one driver-v* release, under driver_release.py's rules:
+    only an unfinished attestation round is written, nothing is deleted
+    before its replacement is up, the manifest is written last."""
 
-    def __init__(self, repo, tag):
+    def __init__(self, repo, tag, run=None):
         self.repo = repo
         self.tag = tag
+        self.release = driver_release.DriverRelease(repo, tag, run or driver_release.gh)
 
     @staticmethod
-    def resolve(repo, tag):
-        """Return (tag, Release, manifest) for `tag`, or the newest driver-v*."""
-        import re
-        out = subprocess.run(
-            ["gh", "api", f"repos/{repo}/releases?per_page=100"],
-            check=True, capture_output=True, text=True).stdout
-        rels = [r for r in json.loads(out) if r["tag_name"].startswith("driver-v")]
+    def resolve(repo, tag, commit=None, run=None):
+        """(tag, Release, manifest) for `tag`, or for the newest unfinished
+        attestation round (of `commit`, when given)."""
+        run = run or driver_release.gh
         if tag:
-            rels = [r for r in rels if r["tag_name"] == tag]
-            if not rels:
-                sys.exit(f"::error::release {tag} not found")
+            if not driver_release.version_of(tag):
+                sys.exit(f"::error::{tag!r} is not a driver-v<a.b.c.d> tag")
         else:
-            def build(r):
-                mt = re.match(r"^driver-v\d+\.\d+\.\d+\.(\d+)$", r["tag_name"])
-                return int(mt.group(1)) if mt else -1
-            rels = sorted((r for r in rels if build(r) >= 0), key=build, reverse=True)
-            if not rels:
-                sys.exit("::error::no driver-v* releases found")
-        rel = Release(repo, rels[0]["tag_name"])
-        man = json.loads(rel.download_asset("manifest.json"))
-        return rel.tag, rel, man
+            tag, _ = driver_release.unfinished_submission(repo, run, commit=commit)
+            if not tag:
+                sys.exit("::error::no unfinished driver-v* attestation round"
+                         + (f" of commit {commit}" if commit else "") + " to reconcile")
+        rel = Release(repo, tag, run)
+        if rel.release.view is None:
+            sys.exit(f"::error::release {tag} not found")
+        if rel.release.manifest is None:
+            sys.exit(f"::error::release {tag} has no manifest.json")
+        return rel.tag, rel, rel.release.manifest
+
+    def _writable(self):
+        problem = driver_release.attest_problem(self.tag, self.release.manifest)
+        if problem:
+            raise driver_release.ReleaseError(problem)
+        self.release.begin()
 
     def download_asset(self, name):
-        dest = f"_dl_{name}"
-        subprocess.run(["gh", "release", "download", self.tag, "--repo", self.repo,
-                        "--pattern", name, "--output", dest, "--clobber"], check=True)
-        with open(dest, "rb") as f:
-            return f.read()
+        return self.release.download(name)
 
     def save_manifest(self, manifest):
-        with open("manifest.json", "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-        self.upload_asset("manifest.json")
+        self._writable()
+        self.release.write_manifest(manifest)
 
     def upload_asset(self, path):
-        subprocess.run(["gh", "release", "upload", self.tag, path,
-                        "--repo", self.repo, "--clobber"], check=True)
+        self._writable()
+        self.release.put_file(path)
 
 
 def reconcile(api, rel, m, tag, now=time.time, sleep=time.sleep, deadline_s=2700):
@@ -287,9 +293,17 @@ def summary(text):
 
 
 def main():
+    try:
+        return run_main()
+    except driver_release.ReleaseError as e:
+        print(f"::error::{driver_release.command_line(e)}")
+        return 1
+
+
+def run_main():
     repo = os.environ["GITHUB_REPOSITORY"]
     tag_in = os.environ.get("INPUT_TAG") or None
-    tag, rel, m = Release.resolve(repo, tag_in)
+    tag, rel, m = Release.resolve(repo, tag_in, commit=os.environ.get("INPUT_COMMIT") or None)
     print(f"reconciling {tag}: ms_state={m.get('ms_state')} attested={m.get('attested')}")
     if next_action(m) in ("done", "wait-signing", "finalize", "failed"):
         outcome = next_action(m)  # terminal states need no API credentials

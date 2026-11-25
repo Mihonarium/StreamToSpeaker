@@ -821,19 +821,16 @@ jobs:
           sig-description: "Stream To Speaker"
           token: ${{ secrets.SIGNING_REPO_TOKEN }}
 
+      # With its .sha256; only onto the draft of this commit, and nothing on
+      # it is deleted before its replacement is up (release_draft.py upload).
       - name: Upload the signed exe to the draft release
         shell: pwsh
         env:
           SIGNED: ${{ steps.sign.outputs.signed-path }}
-          SIGNED_SHA256: ${{ steps.sign.outputs.signed-sha256 }}
         run: |
-          $ErrorActionPreference = "Stop"
-          python .github/scripts/release_draft.py require $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
-          if ($LASTEXITCODE -ne 0) { throw "no draft release of this commit to upload to (see above)" }
-          "$env:SIGNED_SHA256  $(Split-Path $env:SIGNED -Leaf)" |
-              Set-Content -Path "$env:SIGNED.sha256" -Encoding ascii -NoNewline
-          gh release upload $env:GITHUB_REF_NAME $env:SIGNED "$env:SIGNED.sha256" --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          python .github/scripts/release_draft.py upload $env:GITHUB_REF_NAME $env:SIGNED --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA --version $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw "could not upload the signed exe to the draft release (see above)" }
+
 
       # Provenance for the exact bytes users download (post-signing, so the
       # digest matches the release asset). Gated on visibility: attestations
@@ -856,12 +853,10 @@ jobs:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
           $ErrorActionPreference = "Stop"
-          python .github/scripts/release_draft.py require $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
-          if ($LASTEXITCODE -ne 0) { throw "no draft release of this commit to upload to (see above)" }
           $bundle = "$(Split-Path $env:SIGNED -Leaf).sigstore.json"
           Copy-Item -LiteralPath $env:BUNDLE_PATH $bundle
-          gh release upload $env:GITHUB_REF_NAME $bundle --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          python .github/scripts/release_draft.py upload $env:GITHUB_REF_NAME $bundle --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA --version $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw "could not upload the attestation bundle to the draft release (see above)" }
 
   # Build the RELEASE installer: EV-signed service exe + the
   # Microsoft-signed driver package (WHQL-certified preferred over
@@ -881,6 +876,7 @@ jobs:
     permissions:
       contents: write            # reads the draft release (drafts need push access)
     outputs:
+      version: ${{ needs.build.outputs.version }}
       driver_found: ${{ steps.attested.outputs.found }}
       driver_tag: ${{ steps.attested.outputs.tag }}
       installer_name: ${{ steps.iscc.outputs.name }}
@@ -1088,6 +1084,7 @@ jobs:
       signed_sha256: ${{ steps.sign.outputs.signed-sha256 }}
     env:
       GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.package.outputs.version }}
       INSTALLER_NAME: ${{ needs.package.outputs.installer_name }}
       INSTALLER_SHA256: ${{ needs.package.outputs.installer_sha256 }}
       DRIVER_FOUND: ${{ needs.package.outputs.driver_found }}
@@ -1130,38 +1127,22 @@ jobs:
           sig-description: "Stream To Speaker Setup"
           token: ${{ secrets.SIGNING_REPO_TOKEN }}
 
+      # With its .sha256 and, unless it is a -testsigned fallback, the stable
+      # StreamToSpeakerSetup.exe alias + .sha256 (release_draft.py decides
+      # which, with the same rule `publish` checks). GitHub's
+      # /releases/latest/download/<name> redirect needs a FIXED file name,
+      # so the release carries an unversioned copy of the same bytes — the
+      # URL the README hands to users; a permanent link must never resolve
+      # to an installer that needs testsigning mode.
       - name: Upload the signed installer to the draft release
         shell: pwsh
         env:
           SIGNED: ${{ steps.sign.outputs.signed-path }}
           SIGNED_SHA256: ${{ steps.sign.outputs.signed-sha256 }}
         run: |
-          $ErrorActionPreference = "Stop"
-          python .github/scripts/release_draft.py require $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
-          if ($LASTEXITCODE -ne 0) { throw "no draft release of this commit to upload to (see above)" }
-          "$env:SIGNED_SHA256  $(Split-Path $env:SIGNED -Leaf)" |
-              Set-Content -Path "$env:SIGNED.sha256" -Encoding ascii -NoNewline
-          gh release upload $env:GITHUB_REF_NAME $env:SIGNED "$env:SIGNED.sha256" --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          python .github/scripts/release_draft.py upload $env:GITHUB_REF_NAME $env:SIGNED --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA --version $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw "could not upload the signed installer to the draft release (see above)" }
           Write-Host "Signed installer on the draft release (sha256 $env:SIGNED_SHA256)"
-
-          # Stable download link. GitHub's /releases/latest/download/<name>
-          # redirect needs a FIXED file name, so the release carries an
-          # unversioned copy of the same bytes as well — that is the URL the
-          # README hands to users. Skipped for -testsigned fallback builds: a
-          # permanent link must never resolve to an installer that needs
-          # testsigning mode.
-          $name = Split-Path $env:SIGNED -Leaf
-          if ($name -like "*-testsigned*") {
-              Write-Host "##[warning]test-signed build - no stable StreamToSpeakerSetup.exe link on this release"
-          } else {
-              Copy-Item -LiteralPath $env:SIGNED "StreamToSpeakerSetup.exe" -Force
-              "$env:SIGNED_SHA256  StreamToSpeakerSetup.exe" |
-                  Set-Content -Path "StreamToSpeakerSetup.exe.sha256" -Encoding ascii -NoNewline
-              gh release upload $env:GITHUB_REF_NAME StreamToSpeakerSetup.exe StreamToSpeakerSetup.exe.sha256 --clobber
-              if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
-              Write-Host "Stable link asset on the draft: releases/latest/download/StreamToSpeakerSetup.exe once published"
-          }
 
       - name: Attest build provenance (public repo only)
         id: attest
@@ -1180,12 +1161,10 @@ jobs:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
           $ErrorActionPreference = "Stop"
-          python .github/scripts/release_draft.py require $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
-          if ($LASTEXITCODE -ne 0) { throw "no draft release of this commit to upload to (see above)" }
           $bundle = "$(Split-Path $env:SIGNED -Leaf).sigstore.json"
           Copy-Item -LiteralPath $env:BUNDLE_PATH $bundle
-          gh release upload $env:GITHUB_REF_NAME $bundle --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          python .github/scripts/release_draft.py upload $env:GITHUB_REF_NAME $bundle --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA --version $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw "could not upload the attestation bundle to the draft release (see above)" }
 
       # An earlier attempt that built the other kind of installer (for
       # example -testsigned before a driver release for this source
@@ -1196,7 +1175,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $pruneArgs = @("prune", $env:GITHUB_REF_NAME, "--repo", $env:GITHUB_REPOSITORY, "--commit", $env:GITHUB_SHA, "--version", $env:GITHUB_REF_NAME.Substring(1), "--installer", $env:INSTALLER_NAME)
+          $pruneArgs = @("prune", $env:GITHUB_REF_NAME, "--repo", $env:GITHUB_REPOSITORY, "--commit", $env:GITHUB_SHA, "--version", $env:VERSION, "--installer", $env:INSTALLER_NAME)
           if ($env:PROVENANCE -eq "true") { $pruneArgs += "--provenance" }
           python .github/scripts/release_draft.py @pruneArgs
           if ($LASTEXITCODE -ne 0) { throw "could not remove the assets of an earlier attempt (see above)" }

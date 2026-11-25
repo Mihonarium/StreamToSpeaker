@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""Every change the chain makes to a driver-v* release goes through here.
+
+A driver-v* release is the record of one driver binary: manifest.json says
+how it was built and what Microsoft did with it, and the files beside it
+are what installers bundle and what the release gate compares against.
+The release of a driver Microsoft certified or attested can't be made
+again. These rules hold for every workflow, input and re-run, and
+test_driver_release.py tests each under its own name:
+
+1. A finished release is never changed. A release is finished when its
+   manifest says `certified` or `attested`. Nothing is uploaded to it,
+   replaced on it or deleted from it, and its notes are not edited.
+   Writing bytes it already holds is not a change, and succeeds.
+2. A workflow writes only a release whose current state is its to
+   advance (the `*_problem` functions below); anything else is refused,
+   naming the release.
+3. A file the manifest records (with its SHA-256) is never replaced by
+   other bytes.
+4. Nothing is deleted before its replacement is completely uploaded, and
+   a file already there with the same bytes is not uploaded again
+   (release_assets.py).
+5. manifest.json is written last, in a call of its own, and only when
+   every file it records is on the release.
+
+Releases are always listed with every page.
+
+Commands (each workflow step that writes a driver release runs one):
+
+  submission-guard    Driver submission: is a WHQL-certified driver already
+                      released for this driver source?  --source-hash H [--force]
+  submission-check    Driver submission, before the build: may this run
+                      write --tag (with --commit, --version)?
+  submission-release  Driver submission: create the release (if needed)
+                      and record the unsigned build in manifest.json.
+  submission-signed   Driver submission, sign-cab: add the EV-signed CAB
+                      and record its hash.
+  submission-cleanup  Driver submission: delete superseded releases that
+                      hold nothing anyone approved or Microsoft returned.
+  attested-fetch      Driver attested: pick the release, download the
+                      returned zip and the submitted CAB (hash-checked).
+  attested-record     Driver attested: add the canonical Signed.zip (and
+                      its provenance bundle), then mark the release attested.
+
+Stdlib only; gh with GH_TOKEN does the requests.
+"""
+import argparse
+import copy
+import json
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import release_assets  # noqa: E402
+from release_assets import PENDING, ReleaseError, clean, command_line, gh, sha256  # noqa: E402
+
+TAG_RE = re.compile(r"driver-v([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)")
+VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+")
+SHA_RE = re.compile(r"[0-9a-f]{64}")
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+MANIFEST = "manifest.json"
+MAIN = "refs/heads/main"
+
+
+# ---------------------------------------------------------------------------
+# What a manifest says
+# ---------------------------------------------------------------------------
+def version_of(tag):
+    """(a, b, c, d) of a driver-v<a.b.c.d> tag, or None."""
+    m = TAG_RE.fullmatch(tag or "")
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def finished(m):
+    """A release whose manifest says certified or attested is finished."""
+    return isinstance(m, dict) and (bool(m.get("certified")) or bool(m.get("attested")))
+
+
+def kind(m):
+    return "certified" if isinstance(m, dict) and m.get("certified") else "attested"
+
+
+def submission(m):
+    """Whether the manifest is Driver submission's (an attestation round)."""
+    return isinstance(m, dict) and bool(m.get("submission_cab"))
+
+
+def recorded_files(m):
+    """{asset name: sha256 or None} of the files `m` says its release holds."""
+    out = {}
+    if not isinstance(m, dict):
+        return out
+    for name_key, sha_key in (("signed_zip", "signed_zip_sha256"), ("lab_zip", "lab_zip_sha256"),
+                              ("ms_zip_asset", "ms_zip_sha256")):
+        if isinstance(m.get(name_key), str) and m[name_key]:
+            out[m[name_key]] = m.get(sha_key)
+    if m.get("submission_cab_signed_sha256") and isinstance(m.get("submission_cab"), str):
+        out[m["submission_cab"]] = m["submission_cab_signed_sha256"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Who may write what (rule 2). Each returns why not, or None.
+# ---------------------------------------------------------------------------
+def finished_problem(tag, m):
+    if finished(m):
+        return (f"{tag} is a {kind(m)} driver release; a finished driver release is never changed "
+                "(docs/driver-signing.md)")
+    return None
+
+
+def submission_build_problem(tag, view, m, commit):
+    """Driver submission's build-cab may write `tag`: absent, or this
+    commit's own submission whose CAB nobody has EV-signed or submitted."""
+    if view is None:
+        return None
+    if finished_problem(tag, m):
+        return finished_problem(tag, m)
+    if view.get("draft"):
+        return f"{tag} is a draft release; Driver submission makes none, so it is not this run's"
+    if m is None:
+        if not view.get("assets") and view.get("target_commitish") == commit:
+            return None  # an earlier attempt of this commit stopped right after creating it
+        return f"{tag} exists and holds no manifest.json of commit {commit}: it is not this run's to write"
+    if not submission(m):
+        return f"{tag} is not a Driver submission release (its manifest names no submission CAB)"
+    if m.get("commit") != commit:
+        return (f"{tag} holds the driver of commit {clean(m.get('commit'))}, not of {commit}: "
+                "a driver build number names one binary")
+    if m.get("submission_cab_signed_sha256"):
+        return f"{tag} already holds the EV-signed CAB of this commit; there is nothing to build again"
+    if m.get("ms_submission_id"):
+        return f"{tag} has a Partner Center submission ({clean(m.get('ms_submission_id'))})"
+    return None
+
+
+def submission_numbering_problem(tag, releases):
+    """A new driver build is numbered above every driver release there is,
+    and its build number names no other release's driver."""
+    new = version_of(tag)
+    others = [r["tag_name"] for r in releases if version_of(r.get("tag_name")) and r["tag_name"] != tag]
+    higher = sorted((t for t in others if version_of(t) >= new), key=version_of)
+    if higher:
+        return (f"{tag} would number this driver below {higher[-1]}, which already exists. Every new driver "
+                f"build must be numbered above every driver release, so versions only go up and build=N in "
+                f"the service log names one binary. Dispatch Driver submission with driver_build above "
+                f"{version_of(higher[-1])[3]} (docs/driver-signing.md, \"Driver build numbers\").")
+    same = [t for t in others if version_of(t)[3] == new[3]]
+    if same:
+        return (f"build {new[3]} already names the driver of {same[0]}; build=N in the service log must name "
+                f"one binary. Dispatch Driver submission with another driver_build.")
+    return None
+
+
+def submission_signed_problem(tag, view, m, commit, cab_sha256, signed_sha256):
+    """sign-cab may record its signed CAB: the release records exactly the
+    unsigned CAB this run built and no signed one yet (or this one)."""
+    if view is None:
+        return f"there is no release {tag}"
+    if finished_problem(tag, m):
+        return finished_problem(tag, m)
+    if not submission(m):
+        return f"{tag} holds no Driver submission manifest"
+    if m.get("commit") != commit:
+        return f"{tag} holds the driver of commit {clean(m.get('commit'))}, not of {commit}"
+    if m.get("submission_cab_sha256") != cab_sha256:
+        return (f"{tag} records the unsigned CAB {clean(m.get('submission_cab_sha256'))}, not the one this run "
+                f"had signed ({cab_sha256}): a later build of this commit replaced it")
+    recorded = m.get("submission_cab_signed_sha256")
+    if recorded and recorded != signed_sha256:
+        return f"{tag} already records another EV-signed CAB ({clean(recorded)})"
+    if m.get("ms_submission_id"):
+        return f"{tag} has a Partner Center submission ({clean(m.get('ms_submission_id'))})"
+    return None
+
+
+def attested_problem(tag, m):
+    """Driver attested may finish an attestation round Microsoft returned."""
+    if finished_problem(tag, m):
+        return finished_problem(tag, m)
+    if not submission(m) or not m.get("submission_cab_signed_sha256"):
+        return f"{tag} is not an attestation submission with an EV-signed CAB"
+    return None
+
+
+def attest_problem(tag, m):
+    """Driver attest may advance an unfinished attestation round."""
+    if finished_problem(tag, m):
+        return finished_problem(tag, m)
+    if not submission(m):
+        return f"{tag} is not an attestation submission (its manifest names no submission CAB)"
+    return None
+
+
+def certified_problem(tag, m, new):
+    """Driver certified may write a release prepared by hand for an HLK
+    return, until it is certified (the same manifest again changes nothing)."""
+    if m is not None and m == new:
+        return None
+    if finished_problem(tag, m):
+        return finished_problem(tag, m) + "; this run's manifest differs from the one it holds"
+    if submission(m):
+        return (f"{tag} is an attestation submission (its manifest names a submission CAB); a certified "
+                "driver gets a release of its own")
+    if m is not None:
+        return f"{tag} holds a manifest.json that is neither a certified one nor this run's"
+    return None
+
+
+def stale_submission(view, m, current):
+    """Whether cleanup may delete this release: an older Driver submission
+    build that holds nothing anyone approved or Microsoft returned."""
+    v = version_of(view.get("tag_name"))
+    if not v or v >= current or finished(m) or not submission(m):
+        return False
+    return not m.get("submission_cab_signed_sha256") and not m.get("ms_submission_id")
+
+
+# ---------------------------------------------------------------------------
+# One driver release
+# ---------------------------------------------------------------------------
+class DriverRelease:
+    def __init__(self, repo, tag, run=gh, sleep=time.sleep, workdir=None):
+        if not version_of(tag):
+            raise ReleaseError(f"{clean(tag)!r} is not a driver-v<a.b.c.d> tag")
+        self.repo, self.tag, self.run, self.sleep, self.workdir = repo, tag, run, sleep, workdir
+        self.rel = release_assets.Release.find(repo, tag, run, sleep=sleep, workdir=workdir)
+        self._manifest = self._read_manifest()
+
+    @property
+    def view(self):
+        return self.rel.view if self.rel else None
+
+    @property
+    def manifest(self):
+        """A copy of what the release's manifest.json holds (None without
+        one): changing it changes nothing until write_manifest."""
+        return copy.deepcopy(self._manifest)
+
+    def _read_manifest(self):
+        if not self.rel:
+            return None
+        name = MANIFEST if self.rel.asset(MANIFEST) else (MANIFEST + PENDING if self.rel.asset(MANIFEST + PENDING)
+                                                          else None)
+        if not name:
+            return None
+        try:
+            m = json.loads(self.rel.download(name).decode("utf-8-sig"))
+        except ValueError:
+            raise ReleaseError(f"the manifest.json of {self.tag} is not valid JSON")
+        if not isinstance(m, dict):
+            raise ReleaseError(f"the manifest.json of {self.tag} is not a JSON object")
+        return m
+
+    def download(self, name):
+        return self.rel.download(name)
+
+    def begin(self):
+        """Before writing: refuse a finished release (rule 1) and finish
+        what a stopped run left half done (rule 4)."""
+        if not self.rel:
+            raise ReleaseError(f"there is no release {self.tag}")
+        if finished(self.manifest):
+            return
+        if self.rel.finish_interrupted():
+            self._manifest = self._read_manifest()
+
+    def put(self, data, name):
+        """Rules 1, 3 and 4 for one file."""
+        if not self.rel:
+            raise ReleaseError(f"there is no release {self.tag}")
+        if self.rel.asset(name) and self.rel.holds(name, data):
+            return "unchanged"
+        problem = finished_problem(self.tag, self.manifest)
+        if problem:
+            raise ReleaseError(f"{problem}; it does not hold this {name}")
+        recorded = recorded_files(self.manifest)
+        if name in recorded and self.rel.asset(name):
+            raise ReleaseError(f"the manifest of {self.tag} records {name} (sha256 {clean(recorded[name])}); "
+                               "a recorded file is never replaced")
+        return self.rel.put(data, name)
+
+    def put_file(self, path, name=None):
+        with open(path, "rb") as fh:
+            return self.put(fh.read(), name or os.path.basename(path))
+
+    def require(self, name, data):
+        """The release must already hold `data` as `name` (an input this
+        run read from it, such as a hand-attached package)."""
+        if not self.rel or not self.rel.holds(name, data):
+            raise ReleaseError(f"{self.tag} does not hold {name} with the bytes this run checked")
+
+    def edit(self, title, notes):
+        problem = finished_problem(self.tag, self.manifest)
+        if problem:
+            raise ReleaseError(problem)
+        self.rel.edit(title, notes)
+
+    def write_manifest(self, m):
+        """Rules 1 and 5, then rule 4 for manifest.json itself."""
+        if not self.rel:
+            raise ReleaseError(f"there is no release {self.tag}")
+        if self.manifest == m and self.rel.asset(MANIFEST):
+            return "unchanged"
+        problem = finished_problem(self.tag, self.manifest)
+        if problem:
+            raise ReleaseError(f"{problem}; its manifest.json stays as it is")
+        self.rel.refresh()
+        missing = [n for n in recorded_files(m)
+                   if not (self.rel.asset(n) and self.rel.asset(n).get("state") == "uploaded")]
+        if missing:
+            raise ReleaseError(f"manifest.json would record {', '.join(missing)}, which {self.tag} does not hold")
+        data = (json.dumps(m, indent=2) + "\n").encode("ascii")
+        result = self.rel.put(data, MANIFEST)
+        # A copy: a caller that goes on changing its dict must not change
+        # what this object knows the release holds.
+        self._manifest = json.loads(data)
+        return result
+
+    def delete(self):
+        if finished(self.manifest):
+            raise ReleaseError(finished_problem(self.tag, self.manifest))
+        self.rel.delete()
+
+    @classmethod
+    def create(cls, repo, tag, target, title, notes, run=gh, sleep=time.sleep, workdir=None):
+        release_assets.Release.create(repo, tag, target, title, notes, run=run, sleep=sleep, workdir=workdir)
+        return cls(repo, tag, run=run, sleep=sleep, workdir=workdir)
+
+
+def driver_releases(repo, run=gh):
+    """Every driver-v* release (not drafts), newest first."""
+    rels = [r for r in release_assets.list_releases(repo, run)
+            if version_of(r.get("tag_name")) and not r.get("draft")]
+    return sorted(rels, key=lambda r: r.get("created_at") or "", reverse=True)
+
+
+def manifests(repo, rels, run=gh):
+    """(release, manifest) for each release that has a manifest.json. A
+    manifest that can't be read raises: no caller may take it for
+    "no manifest"."""
+    out = []
+    for r in rels:
+        names = [a.get("name") for a in r.get("assets") or []]
+        if MANIFEST not in names:
+            continue
+        rel = release_assets.Release(repo, r, run)
+        try:
+            m = json.loads(rel.download(MANIFEST).decode("utf-8-sig"))
+        except (ReleaseError, ValueError) as e:
+            raise ReleaseError(f"the manifest.json of {r['tag_name']} cannot be read ({clean(e)})")
+        out.append((r, m))
+    return out
+
+
+def unfinished_submission(repo, run=gh, commit=None, need=None):
+    """The newest driver release (by creation) that is an unfinished
+    attestation round, optionally of `commit` and passing `need(release)`;
+    (tag, manifest) or (None, None)."""
+    for r in driver_releases(repo, run):
+        if need and not need(r):
+            continue
+        if MANIFEST not in [a.get("name") for a in r.get("assets") or []]:
+            continue
+        ((_, m),) = manifests(repo, [r], run)
+        if finished(m) or not submission(m) or (commit and m.get("commit") != commit):
+            continue
+        return r["tag_name"], m
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Words people read: release notes and run summaries, from one place
+# ---------------------------------------------------------------------------
+def attest_next_step(tag, auto_attest):
+    if auto_attest:
+        return ("**Driver attest** starts by itself when Driver submission finishes (the repository variable "
+                "`AUTO_ATTEST` was `true` when this release was made). It submits the signed CAB to Microsoft, "
+                "attaches the zip Microsoft returns and marks this driver attested. If it goes red, run it from "
+                f"`main` with `tag` = `{tag}`: it resumes where it stopped.")
+    return ("Run **Driver attest** from `main` (Actions → Driver attest → Run workflow) with `tag` = "
+            f"`{tag}`. It does not start by itself: the repository variable `AUTO_ATTEST` was not `true` when "
+            "this release was made. It submits the signed CAB to Microsoft, attaches the zip Microsoft returns "
+            "and marks this driver attested. If it goes red, run it again: it resumes where it stopped.")
+
+
+def submission_notes(tag, version, commit, source_hash, cab_sha256, auto_attest):
+    return "\n".join([
+        f"Microsoft attestation submission for driver **{version}** (commit {commit}).",
+        "",
+        f"Driver source hash: `{source_hash}`",
+        "",
+        "**Status: awaiting Microsoft attestation.** Runbook: `docs/driver-signing.md`, Flow A.",
+        "",
+        "1. Approve the EV-signing run for the submission CAB in the signing repo. Its run name must show "
+        f"sha256 `{cab_sha256}`. CI then adds the EV-signed CAB to this release.",
+        f"2. {attest_next_step(tag, auto_attest)}",
+    ])
+
+
+def signed_summary(tag, cab_name, signed_sha256, auto_attest):
+    return "\n".join([
+        "## Submission CAB EV-signed",
+        "",
+        f"`{cab_name}` on release `{tag}` is the EV-signed CAB (sha256 `{signed_sha256}`).",
+        "",
+        f"**Next:** {attest_next_step(tag, auto_attest)}",
+    ])
+
+
+def attested_notes(m, version):
+    return "\n".join([
+        f"Microsoft-attested driver **{version}** (commit {m.get('commit')}).",
+        "",
+        f"Install `StreamToSpeaker-Driver-{version}-Signed.zip` on stock Windows 10 1809+ / Windows 11 — Secure "
+        "Boot on, no test-signing mode. (Attestation-signed drivers do not load on Windows Server 2016+.)",
+        "",
+        "| | |",
+        "| --- | --- |",
+        f"| Driver package | `{m['signed_zip']}` |",
+        f"| SHA256 | `{m['signed_zip_sha256']}` |",
+        f"| Driver source hash | `{m.get('source_hash')}` |",
+        f"| Partner Center product / submission | `{m.get('ms_product_id')}` / `{m.get('ms_submission_id')}` |",
+        "",
+        "Verified in CI: `signtool verify /kp` against the catalog and the embedded `.sys` signature, signer chain "
+        "*Microsoft Windows Hardware Compatibility Publisher*, INF byte-identical to the submitted one and "
+        f"carrying DriverVer {version}, `.sys` identical to the submitted one after stripping signatures.",
+        "",
+        "Installer builds bundle this driver automatically while `driver/**` + `include/**` still hash to the "
+        "source hash above. The other assets here are the submission trail: the EV-signed CAB sent to "
+        "Microsoft, and the zip Microsoft returned.",
+    ])
+
+
+def summary(text):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+
+
+def outputs(**kv):
+    path = os.environ.get("GITHUB_OUTPUT")
+    lines = "".join(f"{k}={v}\n" for k, v in kv.items())
+    if any("\n" in str(v) or "\r" in str(v) for v in kv.values()):
+        raise ReleaseError("a step output may not contain a line break")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(lines)
+    print(lines, end="")
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+def require_main(ref):
+    if ref != MAIN:
+        raise ReleaseError(f"driver releases are written only by runs on main, not {clean(ref)}; "
+                           "a run from another branch builds the CAB and stops")
+
+
+def cmd_submission_guard(a, run):
+    if not SHA_RE.fullmatch(a.source_hash or ""):
+        raise ReleaseError("--source-hash must be 64 lowercase hex digits (hashFiles output)")
+    hit = None
+    for r, m in manifests(a.repo, driver_releases(a.repo, run), run):
+        if m.get("certified") and m.get("source_hash") == a.source_hash:
+            hit = r["tag_name"]
+            break
+    if hit and not a.force:
+        print(f"::notice::Certified driver {hit} already matches driver source hash {a.source_hash}: no "
+              "attestation build or submission. Installers bundle the certified package. (Dispatch with "
+              "force=true to build anyway.)")
+        outputs(proceed="false")
+    else:
+        print(f"force=true: building although certified driver {hit} matches this source." if hit else
+              "No certified driver matches this driver source: proceeding with the attestation build.")
+        outputs(proceed="true")
+
+
+def cmd_submission_check(a, run):
+    require_main(a.ref)
+    if not COMMIT_RE.fullmatch(a.commit or ""):
+        raise ReleaseError("--commit must be a full commit SHA")
+    dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
+    problem = submission_build_problem(a.tag, dr.view, dr.manifest, a.commit) or \
+        submission_numbering_problem(a.tag, driver_releases(a.repo, run))
+    if problem:
+        raise ReleaseError(problem)
+    print(f"{a.tag}: {'an earlier attempt of this commit, not signed yet' if dr.view else 'new'}")
+
+
+def cmd_submission_release(a, run):
+    require_main(a.ref)
+    for value, pattern, what in ((a.commit, COMMIT_RE, "--commit"), (a.source_hash, SHA_RE, "--source-hash"),
+                                 (a.cab_sha256, SHA_RE, "--cab-sha256"), (a.version, VERSION_RE, "--version")):
+        if not pattern.fullmatch(value or ""):
+            raise ReleaseError(f"{what} is malformed: {clean(value)!r}")
+    if a.tag != f"driver-v{a.version}" or not a.version.startswith(a.prefix + ".") or \
+            a.version != f"{a.prefix}.{a.build}":
+        raise ReleaseError(f"tag {clean(a.tag)}, version {clean(a.version)}, prefix {clean(a.prefix)} and build "
+                           f"{clean(a.build)} do not agree")
+    release_assets.check_name(a.cab_name)
+    auto = a.auto_attest == "true"
+    dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
+    problem = submission_build_problem(a.tag, dr.view, dr.manifest, a.commit) or \
+        submission_numbering_problem(a.tag, driver_releases(a.repo, run))
+    if problem:
+        raise ReleaseError(problem)
+    title = f"Driver {a.version} — awaiting Microsoft attestation"
+    notes = submission_notes(a.tag, a.version, a.commit, a.source_hash, a.cab_sha256, auto)
+    if dr.view is None:
+        dr = DriverRelease.create(a.repo, a.tag, a.commit, title, notes, run=run, sleep=a.sleep)
+    else:
+        dr.begin()
+        dr.edit(title, notes)
+    manifest = {
+        "schema": 1,
+        "driver_version": a.version,
+        "driver_prefix": a.prefix,
+        "driver_build": int(a.build),
+        "commit": a.commit,
+        "source_hash": a.source_hash,
+        # How this binary was built, for driver-reproducibility.yml: the
+        # linker embeds the PDB path, so a rebuild has to happen in the
+        # same directory, with driver.h stamped the same way.
+        "build_root": a.build_root,
+        "driver_h_stamped": True,
+        "submission_cab": a.cab_name,
+        "submission_cab_sha256": a.cab_sha256,
+        "submission_cab_signed_sha256": None,
+        "attested": False,
+        "signed_zip": None,
+        "signed_zip_sha256": None,
+    }
+    dr.write_manifest(manifest)
+    print(f"{a.tag} records the unsigned build (CAB sha256 {a.cab_sha256}); waiting for its EV signature")
+
+
+def cmd_submission_signed(a, run):
+    require_main(a.ref)
+    if not os.path.isfile(a.signed):
+        raise ReleaseError(f"no signed CAB at {clean(a.signed)}")
+    with open(a.signed, "rb") as fh:
+        data = fh.read()
+    if sha256(data) != a.signed_sha256:
+        raise ReleaseError(f"{clean(a.signed)} does not hash to the signed sha256 {clean(a.signed_sha256)}")
+    dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
+    problem = submission_signed_problem(a.tag, dr.view, dr.manifest, a.commit, a.cab_sha256, a.signed_sha256)
+    if problem:
+        raise ReleaseError(problem)
+    dr.begin()
+    name = os.path.basename(a.signed)
+    if name != dr.manifest.get("submission_cab"):
+        raise ReleaseError(f"the signed file is {clean(name)}, but {a.tag} records {clean(dr.manifest.get('submission_cab'))}")
+    dr.put(data, name)
+    dr.put(f"{a.signed_sha256}  {name}".encode("ascii"), name + ".sha256")
+    dr.write_manifest(dict(dr.manifest, submission_cab_signed_sha256=a.signed_sha256))
+    summary(signed_summary(a.tag, name, a.signed_sha256, a.auto_attest == "true"))
+    print(f"{a.tag} holds the EV-signed CAB {name} (sha256 {a.signed_sha256})")
+
+
+def cmd_submission_cleanup(a, run):
+    require_main(a.ref)
+    current = version_of(a.tag)
+    if not current:
+        raise ReleaseError(f"{clean(a.tag)!r} is not a driver-v<a.b.c.d> tag")
+    for r in driver_releases(a.repo, run):
+        if r["tag_name"] == a.tag or not version_of(r["tag_name"]) or version_of(r["tag_name"]) >= current:
+            continue
+        try:
+            dr = DriverRelease(a.repo, r["tag_name"], run, sleep=a.sleep)
+        except ReleaseError as e:
+            # Kept: a release that can't be read is never taken for one
+            # that is safe to delete.
+            print(f"::warning::kept {r['tag_name']}: {clean(e)}")
+            continue
+        if not stale_submission(r, dr.manifest, current):
+            continue
+        print(f"Deleting {r['tag_name']}: an older driver build, never EV-signed or submitted, superseded by {a.tag}")
+        dr.delete()
+
+
+def ms_zips(view):
+    """The zips Microsoft returned on an attestation release: every .zip
+    except the canonical Signed.zip."""
+    return [a["name"] for a in view.get("assets") or [] if (a.get("name") or "").endswith(".zip")
+            and not re.fullmatch(r"StreamToSpeaker-Driver-.*-Signed\.zip", a["name"])]
+
+
+def cmd_attested_fetch(a, run):
+    if a.tag:
+        if not version_of(a.tag):
+            raise ReleaseError(f"unexpected tag input format: {clean(a.tag)}")
+        tag = a.tag
+    else:
+        tag, _ = unfinished_submission(a.repo, run, need=lambda r: bool(ms_zips(r)))
+        if not tag:
+            raise ReleaseError("no unfinished driver-v* release with an attached Microsoft zip; attach the "
+                               "signed zip from Partner Center to its driver-v release first")
+    dr = DriverRelease(a.repo, tag, run, sleep=a.sleep)
+    if dr.view is None:
+        raise ReleaseError(f"release {tag} not found")
+    m = dr.manifest
+    if not a.dry_run:
+        problem = attested_problem(tag, m)
+        if problem:
+            raise ReleaseError(problem)
+    if not submission(m) or not SHA_RE.fullmatch(str(m.get("submission_cab_signed_sha256") or "")):
+        raise ReleaseError(f"{tag} records no EV-signed submission CAB to compare Microsoft's return with")
+    zips = ms_zips(dr.view)
+    if len(zips) != 1:
+        raise ReleaseError(f"expected exactly one Microsoft-signed zip on {tag}, found {len(zips)}: attach exactly "
+                           "the zip Partner Center returned")
+    release_assets.check_name(zips[0])
+    os.makedirs(a.dir, exist_ok=True)
+    cab_name = release_assets.check_name(m["submission_cab"])
+    cab = dr.download(cab_name)
+    if sha256(cab) != m["submission_cab_signed_sha256"]:
+        raise ReleaseError(f"{cab_name} on {tag} hashes to {sha256(cab)}, not to the EV-signed CAB the manifest "
+                           f"records ({m['submission_cab_signed_sha256']}): it is not the CAB that was submitted")
+    paths = {}
+    for name, data in ((cab_name, cab), (zips[0], dr.download(zips[0])),
+                       (MANIFEST, (json.dumps(m, indent=2) + "\n").encode())):
+        paths[name] = os.path.abspath(os.path.join(a.dir, name))
+        with open(paths[name], "wb") as fh:
+            fh.write(data)
+        print(f"  {name}: {len(data)} bytes, sha256 {sha256(data)}")
+    outputs(tag=tag, version=".".join(map(str, version_of(tag))), ms_zip=paths[zips[0]], ms_zip_name=zips[0],
+            cab=paths[cab_name])
+
+
+def cmd_attested_record(a, run):
+    dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
+    problem = attested_problem(a.tag, dr.manifest)
+    if problem:
+        raise ReleaseError(problem)
+    dr.begin()
+    if not dr.rel.asset(a.ms_zip_name):
+        raise ReleaseError(f"{a.tag} no longer holds {clean(a.ms_zip_name)}")
+    version = ".".join(map(str, version_of(a.tag)))
+    zip_name = os.path.basename(a.signed_zip)
+    if zip_name != f"StreamToSpeaker-Driver-{version}-Signed.zip":
+        raise ReleaseError(f"the canonical package of {a.tag} is StreamToSpeaker-Driver-{version}-Signed.zip, "
+                           f"not {clean(zip_name)}")
+    with open(a.signed_zip, "rb") as fh:
+        data = fh.read()
+    digest = sha256(data)
+    dr.put(data, zip_name)
+    dr.put(f"{digest}  {zip_name}".encode("ascii"), zip_name + ".sha256")
+    if a.bundle:
+        dr.put_file(a.bundle, zip_name + ".sigstore.json")
+    m = dict(dr.manifest, attested=True, signed_zip=zip_name, signed_zip_sha256=digest,
+             ms_zip_asset=a.ms_zip_name)
+    dr.edit(f"Driver {version} — Microsoft-attested", attested_notes(m, version))
+    dr.write_manifest(m)
+    summary("\n".join([f"## Driver {version} attested ✅", "", "| | |", "| --- | --- |", f"| Release | `{a.tag}` |",
+                       f"| Canonical package | `{zip_name}` |", f"| SHA256 | `{digest}` |", "",
+                       "Installer builds bundle this driver while `driver/**` + `include/**` still hash to the "
+                       "manifest's source_hash."]))
+    print(f"{a.tag} is attested: {zip_name} sha256 {digest}")
+
+
+def main(argv=None, run=gh, sleep=time.sleep):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def command(name, fn, *args):
+        s = sub.add_parser(name)
+        s.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
+        s.add_argument("--ref", default=os.environ.get("GITHUB_REF"), help="the ref the run is on")
+        for arg in args:
+            # attested-fetch picks the release itself when no --tag is given.
+            s.add_argument(arg, required=not (name == "attested-fetch" and arg == "--tag"))
+        s.set_defaults(fn=fn)
+        return s
+
+    s = command("submission-guard", cmd_submission_guard, "--source-hash")
+    s.add_argument("--force", action="store_true")
+    command("submission-check", cmd_submission_check, "--tag", "--commit")
+    s = command("submission-release", cmd_submission_release, "--tag", "--commit", "--version", "--prefix",
+                "--build", "--source-hash", "--build-root", "--cab-name", "--cab-sha256")
+    s.add_argument("--auto-attest", default="false")
+    s = command("submission-signed", cmd_submission_signed, "--tag", "--commit", "--cab-sha256", "--signed",
+                "--signed-sha256")
+    s.add_argument("--auto-attest", default="false")
+    command("submission-cleanup", cmd_submission_cleanup, "--tag")
+    s = command("attested-fetch", cmd_attested_fetch, "--tag", "--dir")
+    s.add_argument("--dry-run", action="store_true")
+    s = command("attested-record", cmd_attested_record, "--tag", "--signed-zip", "--ms-zip-name")
+    s.add_argument("--bundle")
+    a = ap.parse_args(argv)
+    if not a.repo:
+        print("::error::no --repo (GITHUB_REPOSITORY)")
+        return 1
+    a.sleep = sleep
+    try:
+        a.fn(a, run)
+    except ReleaseError as e:
+        print(f"::error::{command_line(e)}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

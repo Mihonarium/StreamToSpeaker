@@ -19,6 +19,12 @@ with push access, never to `releases/latest` (the app's update check), the
       <tag> must be exactly one release, a draft, and the tag must point
       at SHA: a run whose tag has since moved to another commit neither
       uploads to the draft nor asks for a signature.
+  release_draft.py upload  <tag> --repo R --commit SHA --version V FILE...
+      Put signed files on the draft (as `require` checks it), each .exe
+      with its .sha256 sidecar, the setup exe also as the stable
+      StreamToSpeakerSetup.exe alias unless it is a -testsigned fallback.
+      Nothing on the draft is deleted before its replacement is completely
+      uploaded (release_assets.py).
   release_draft.py prune   <tag> --repo R --commit SHA --version V --installer NAME [--provenance]
       Delete setup exe assets an earlier attempt left on the draft under
       another name (a -testsigned installer when NAME bundles a
@@ -67,6 +73,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import release_assets  # noqa: E402
 from repro_compare import clean_text, command_text, gh_output  # noqa: E402
 
 ALIAS = "StreamToSpeakerSetup.exe"
@@ -76,8 +83,8 @@ SHA_RE = re.compile(r"[0-9a-f]{64}")
 BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle"
 
 
-class ReleaseError(Exception):
-    pass
+# One error class for this script and the uploads it makes.
+ReleaseError = release_assets.ReleaseError
 
 
 def gh(*args):
@@ -401,10 +408,49 @@ def prune(repo, tag, commit, version, installer, provenance, run=gh):
     return rel, [a["name"] for a in stale]
 
 
+def upload(repo, tag, commit, version, paths, run=gh, sleep=time.sleep):
+    """Put signed files on the draft of `tag` at `commit`
+    (release_assets.put: nothing is deleted before its replacement is
+    up). Each .exe gets its .sha256 sidecar; the setup exe, unless it is a
+    -testsigned fallback, also the stable StreamToSpeakerSetup.exe alias
+    and its sidecar (expected_assets decides). Only files a release of
+    `version` holds are taken."""
+    exes = {f"stream-to-speaker-{version}.exe", f"StreamToSpeakerSetup-{version}.exe",
+            f"StreamToSpeakerSetup-{version}-testsigned.exe"}
+    for path in paths:
+        name = os.path.basename(path)
+        if not (name in exes or (name.endswith(".sigstore.json") and name[:-len(".sigstore.json")] in exes)):
+            raise ReleaseError(f"{clean_text(name)} is not a file a release of {clean_text(version)} holds")
+    view = require_draft(repo, tag, run, sleep, commit=commit)
+    rel = release_assets.Release(repo, view, run, sleep=sleep)
+    for line in rel.finish_interrupted():
+        print(line)
+    done = []
+    for path in paths:
+        name = os.path.basename(path)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        items = [(name, data)]
+        if name.endswith(".exe"):
+            digest = hashlib.sha256(data).hexdigest()
+            items.append((name + ".sha256", f"{digest}  {name}".encode("ascii")))
+            if name.startswith("StreamToSpeakerSetup-"):
+                if ALIAS in expected_assets(version, name, False):
+                    items += [(ALIAS, data), (ALIAS + ".sha256", f"{digest}  {ALIAS}".encode("ascii"))]
+                else:
+                    print(f"::warning::{name} bundles the test-signed driver: no stable {ALIAS} link on this release")
+        for item, item_data in items:
+            result = rel.put(item_data, item)
+            print(f"{item}: {result}")
+            done.append(item)
+    return done
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=("ensure", "require", "prune", "check", "publish"))
+    ap.add_argument("command", choices=("ensure", "require", "upload", "prune", "check", "publish"))
     ap.add_argument("tag")
+    ap.add_argument("files", nargs="*", help="upload: the signed files")
     ap.add_argument("--repo", required=True)
     ap.add_argument("--target", help="ensure: commit for a tag that does not exist yet")
     ap.add_argument("--version")
@@ -420,7 +466,16 @@ def main(argv=None):
     if not TAG_RE.fullmatch(a.tag):
         print(f"::error::{command_text(f'{a.tag} is not a v<major>.<minor>.<patch> tag')}")
         return 1
+    if a.files and a.command != "upload":
+        print("::error::only upload takes files")
+        return 1
     try:
+        if a.command == "upload":
+            if not (a.commit and a.version and a.files):
+                raise ReleaseError("upload needs --commit, --version and the files")
+            require_version(a.tag, a.version)
+            upload(a.repo, a.tag, a.commit, a.version, a.files)
+            return 0
         if a.command == "ensure":
             rel, created = ensure_draft(a.repo, a.tag, commit=a.commit, target=a.target)
             print(f"draft release {rel['id']} for {a.tag} ({'created' if created else 'already there'})")

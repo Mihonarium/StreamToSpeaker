@@ -28,8 +28,13 @@ Subcommands:
   verify    run checks 1-3 on a Microsoft zip + lab zip
   sys-match check 2 alone on two .sys files (used by driver-attested.yml
             to tie an attestation return to the submitted binary)
-  release   build the canonical -Signed.zip + manifest.json and put them
-            on the driver-v<ver> release (creates it when missing)
+  package   verify, then write the canonical -Signed.zip locally (so its
+            provenance can be attested before anything is published)
+  park      put Microsoft's zip, as returned, on the release
+  release   put the canonical -Signed.zip (and its provenance bundle) on
+            the driver-v<ver> release (creates it when missing), then
+            manifest.json, last. A certified release is never changed
+            (driver_release.py); the same inputs again change nothing.
 Stdlib only; release asset I/O goes through the gh CLI.
 """
 import argparse
@@ -39,13 +44,13 @@ import json
 import os
 import re
 import struct
-import subprocess
 import sys
 import time
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import attest  # noqa: E402
+import driver_release  # noqa: E402
 
 MS_PUBLISHER = b"Microsoft Windows Hardware Compatibility Publisher"
 PACKAGE_FILES = ("StreamToSpeaker.inf", "StreamToSpeaker.sys", "StreamToSpeaker.cat")
@@ -326,42 +331,26 @@ def release_notes(m):
     ])
 
 
-def gh(*args, **kw):
-    r = subprocess.run(["gh", *args], capture_output=True, text=True, **kw)
-    if r.returncode != 0:
-        raise RuntimeError(f"gh {' '.join(args[:3])} failed ({r.returncode}): {r.stderr.strip()[:2000]}")
-    return r.stdout
-
-
-def ensure_release(repo, tag, version, commit):
-    r = subprocess.run(["gh", "release", "view", tag, "--repo", repo], capture_output=True, text=True)
-    if r.returncode == 0:
-        return False
-    gh("release", "create", tag, "--repo", repo, "--prerelease", "--target", commit,
-       "--title", f"Driver {version} — WHQL-certified", "--notes", f"Certified driver {version}: assets being published.")
-    return True
-
-
-def publish_release(repo, tag, manifest, files, notes):
-    """Upload `files` ({name: bytes}) + manifest.json to the release and set
-    the notes. Everything is --clobber so re-runs converge."""
-    names = []
+def publish_release(release, manifest, files, notes, bundle=None):
+    """Put `files` ({name: bytes}: Microsoft's zip, the lab package, the
+    canonical Signed.zip) with their .sha256 sidecars and the provenance
+    bundle on `release` (a driver_release.DriverRelease), edit its notes,
+    and write manifest.json last. Microsoft's zip and the lab package are
+    what this run checked: when the release holds them already they must
+    be those bytes, and they are not uploaded again."""
+    release.begin()
+    inputs = (manifest["lab_zip"], manifest["ms_zip_asset"])
     for name, data in files.items():
-        with open(name, "wb") as f:
-            f.write(data)
-        names.append(name)
-        sha_name = f"{name}.sha256"
-        with open(sha_name, "w", encoding="utf-8") as f:
-            f.write(f"{hashlib.sha256(data).hexdigest()}  {name}")
-        names.append(sha_name)
-    with open("manifest.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-    names.append("manifest.json")
-    gh("release", "upload", tag, "--repo", repo, "--clobber", *names)
-    with open("release-notes.md", "w", encoding="utf-8") as f:
-        f.write(notes)
-    gh("release", "edit", tag, "--repo", repo, "--prerelease",
-       "--title", f"Driver {manifest['driver_version']} — WHQL-certified", "--notes-file", "release-notes.md")
+        if name in inputs and release.rel.asset(name):
+            release.require(name, data)
+        else:
+            release.put(data, name)
+    for name, data in files.items():
+        release.put(f"{hashlib.sha256(data).hexdigest()}  {name}".encode("ascii"), f"{name}.sha256")
+    if bundle:
+        release.put_file(bundle, f"{manifest['signed_zip']}.sigstore.json")
+    release.edit(f"Driver {manifest['driver_version']} — WHQL-certified", notes)
+    release.write_manifest(manifest)
 
 
 def download_asset(repo, tag, name):
@@ -506,24 +495,74 @@ def cmd_sys_match(a):
     return 0
 
 
-def cmd_release(a):
+def checked_package(a):
+    """verify_packages on --ms-zip / --lab-zip, then the canonical zip:
+    (ms, lab, signed), or None after printing the problems."""
     with open(a.ms_zip, "rb") as f:
         ms = f.read()
     with open(a.lab_zip, "rb") as f:
         lab = f.read()
     problems = verify_packages(ms, lab, a.version)
-    if problems:
-        for p in problems:
-            print(f"::error::{p}")
+    for p in problems:
+        print(f"::error::{p}")
+    return None if problems else (ms, lab, canonical_zip(ms))
+
+
+def cmd_package(a):
+    """The canonical Signed.zip, written to --out-dir before anything is
+    published, so the provenance step can attest it first."""
+    checked = checked_package(a)
+    if not checked:
         return 1
-    signed = canonical_zip(ms)
+    name = f"StreamToSpeaker-Driver-{a.version}-Signed.zip"
+    os.makedirs(a.out_dir, exist_ok=True)
+    path = os.path.abspath(os.path.join(a.out_dir, name))
+    with open(path, "wb") as f:
+        f.write(checked[2])
+    driver_release.outputs(signed_zip=path, signed_zip_sha256=hashlib.sha256(checked[2]).hexdigest())
+    return 0
+
+
+def cmd_park(a):
+    """Microsoft's zip as returned, on the release (download job)."""
+    with open(a.ms_zip, "rb") as f:
+        data = f.read()
+    release = driver_release.DriverRelease(a.repo, a.tag)
+    name = os.path.basename(a.ms_zip)
+    if release.view is None:
+        raise driver_release.ReleaseError(f"release {a.tag} doesn't exist (Flow D step 3)")
+    if not (release.rel.asset(name) and release.rel.holds(name, data)):
+        problem = driver_release.certified_problem(a.tag, release.manifest, None)
+        if problem:
+            raise driver_release.ReleaseError(problem)
+        release.begin()
+        release.put(data, name)
+    print(f"{a.tag} holds {name} (sha256 {hashlib.sha256(data).hexdigest()})")
+    return 0
+
+
+def cmd_release(a):
+    checked = checked_package(a)
+    if not checked:
+        return 1
+    ms, lab, signed = checked
     m = build_manifest(a.version, a.commit, a.source_hash, a.product_id, a.submission_id,
                        [s.strip() for s in a.os.split(",") if s.strip()], a.report_id, ms, lab, signed)
     tag = a.tag or f"driver-v{a.version}"
-    created = ensure_release(a.repo, tag, a.version, a.commit)
-    publish_release(a.repo, tag, m, {m["ms_zip_asset"]: ms, m["lab_zip"]: lab, m["signed_zip"]: signed},
-                    release_notes(m))
-    print(f"{'created' if created else 'updated'} {tag}: {m['signed_zip']} sha256 {m['signed_zip_sha256']}")
+    release = driver_release.DriverRelease(a.repo, tag)
+    problem = driver_release.certified_problem(tag, release.manifest, m)
+    if problem:
+        raise driver_release.ReleaseError(problem)
+    if release.manifest == m:
+        print(f"{tag} is already certified with exactly this manifest; nothing to change")
+    else:
+        if release.view is None:
+            release = driver_release.DriverRelease.create(
+                a.repo, tag, a.commit, f"Driver {a.version} — WHQL-certified",
+                f"Certified driver {a.version}: assets being published.")
+        publish_release(release, m, {m["ms_zip_asset"]: ms, m["lab_zip"]: lab, m["signed_zip"]: signed},
+                        release_notes(m), a.bundle)
+        print(f"published {tag}: {m['signed_zip']} sha256 {m['signed_zip_sha256']}")
     out_path = os.environ.get("GITHUB_OUTPUT")
     if out_path:
         with open(out_path, "a", encoding="utf-8") as f:
@@ -552,8 +591,17 @@ def main(argv=None):
     s = sub.add_parser("sys-match", help="a signed .sys is the given unsigned/other-signed .sys")
     s.add_argument("--signed", required=True); s.add_argument("--submitted", required=True)
     s.set_defaults(fn=cmd_sys_match)
+    s = sub.add_parser("package", help="verify, then write the canonical Signed.zip to --out-dir")
+    s.add_argument("--ms-zip", required=True); s.add_argument("--lab-zip", required=True)
+    s.add_argument("--version", required=True); s.add_argument("--out-dir", required=True)
+    s.set_defaults(fn=cmd_package)
+    s = sub.add_parser("park", help="put Microsoft's zip on the release")
+    s.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
+    s.add_argument("--tag", required=True); s.add_argument("--ms-zip", required=True)
+    s.set_defaults(fn=cmd_park)
     s = sub.add_parser("release")
     s.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
+    s.add_argument("--bundle", help="provenance bundle of the Signed.zip, published as <Signed.zip>.sigstore.json")
     s.add_argument("--tag"); s.add_argument("--version", required=True)
     s.add_argument("--commit", required=True); s.add_argument("--source-hash", required=True)
     s.add_argument("--product-id", required=True); s.add_argument("--submission-id", required=True)
@@ -562,7 +610,11 @@ def main(argv=None):
     s.add_argument("--ms-zip", required=True); s.add_argument("--lab-zip", required=True)
     s.set_defaults(fn=cmd_release)
     a = p.parse_args(argv)
-    return a.fn(a) or 0
+    try:
+        return a.fn(a) or 0
+    except driver_release.ReleaseError as e:
+        print(f"::error::{driver_release.command_line(e)}")
+        return 1
 
 
 if __name__ == "__main__":

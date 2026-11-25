@@ -460,5 +460,68 @@ class DriverVerChecks(unittest.TestCase):
 
 
 
+SCRIPTS_DIR = os.path.join(GITHUB_DIR, "scripts")
+DRIVER_WORKFLOWS = ("driver-submission.yml", "driver-attest.yml", "driver-attested.yml", "driver-certified.yml")
+RELEASE_WRITE_RE = re.compile(r"\bgh\s+release\s+(?:upload|create|delete|delete-asset|edit)\b")
+
+
+def text_files():
+    """(relative path, text) of every workflow, action and script."""
+    out = []
+    for path in workflow_files() + sorted(os.path.join(SCRIPTS_DIR, f) for f in os.listdir(SCRIPTS_DIR)
+                                          if f.endswith((".py", ".ps1")) and not f.startswith(("test_", "fake_"))
+                                          and not f.endswith(".Tests.ps1")):
+        with open(path, encoding="utf-8") as fh:
+            out.append((os.path.relpath(path, GITHUB_DIR), fh.read()))
+    return out
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class ReleaseWrites(unittest.TestCase):
+    """What exists on a release is kept: nothing deletes an asset before
+    its replacement is up, and driver releases are written by one script
+    that refuses to change a finished one."""
+
+    def test_no_release_asset_is_replaced_in_place(self):
+        # gh release upload --clobber deletes the old asset first; a failed
+        # or cancelled upload then leaves the release without it.
+        bad = []
+        for rel, text in text_files():
+            for m in re.finditer(r"gh\s+release\s+upload\b[^\n]*--clobber|\"upload\"[^)\]]*\"--clobber\"", text):
+                bad.append(f"{rel}: {m.group(0)[:120]}")
+        self.assertEqual(bad, [])
+
+    def test_driver_releases_are_written_only_through_driver_release_py(self):
+        bad = [f"{name} job {job}, {step}: {line}" for name in DRIVER_WORKFLOWS
+               for job, step, line in script_lines(name) if RELEASE_WRITE_RE.search(line)]
+        self.assertEqual(bad, [])
+
+    def test_driver_submission_writes_releases_only_from_main(self):
+        # A dispatch from any other branch builds the CAB and stops: it
+        # creates, changes and deletes no release.
+        main = "github.ref=='refs/heads/main'"
+        writers = []
+        for job, steps in jobs_steps("driver-submission.yml").items():
+            job_if = expression(job_fields("driver-submission.yml")[job].get("if", ""))
+            for step in steps:
+                lines = step_script(step)
+                if any(RELEASE_WRITE_RE.search(l) or re.search(r"driver_release\.py\s+submission-(?!check|guard)", l)
+                       for l in lines) or step_with(step, "token"):
+                    writers.append((job, step_field(step, "name"), main in job_if or main in expression(
+                        step_field(step, "if") or "")))
+        self.assertTrue(writers)
+        self.assertEqual([w for w in writers if not w[2]], [])
+
+    def test_every_release_listing_reads_every_page(self):
+        # One page holds 100 releases; every version and every driver round
+        # adds one. A listing that stops there misses older releases.
+        bad = []
+        for rel, text in text_files():
+            for m in re.finditer(r"[^\n]*releases\?per_page=[^\n]*", text):
+                if "--paginate" not in m.group(0):
+                    bad.append(f"{rel}: {m.group(0).strip()[:120]}")
+        self.assertEqual(bad, [])
+
+
 if __name__ == "__main__":
     unittest.main()

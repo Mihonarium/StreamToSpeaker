@@ -1,7 +1,10 @@
 name: Driver attest
 
-# Reconciles the newest driver-v* release toward Microsoft attestation via
-# the Partner Center Hardware API (runbook: docs/driver-signing.md).
+# Reconciles a driver-v* release toward Microsoft attestation via the
+# Partner Center Hardware API (runbook: docs/driver-signing.md): the `tag`
+# given, or else the newest unfinished attestation round (by creation, not
+# by build number; started by Driver submission, the round of the commit
+# that run built). A certified or attested release is never written.
 # Idempotent: all state
 # lives in the release's manifest.json (ms_product_id / ms_submission_id /
 # ms_state), IDs are persisted before any upload, and a re-run always resumes
@@ -27,7 +30,7 @@ name: Driver attest
 # certified-guard job in Driver submission already prevents the build;
 # this is the second lock in case that guard is bypassed with force=true).
 
-run-name: "Driver attest · ${{ inputs.tag || 'newest driver release' }}"
+run-name: "Driver attest · ${{ inputs.tag || 'newest unfinished driver release' }}"
 
 on:
   workflow_run:
@@ -36,7 +39,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "driver-v* release tag (default: newest by build number)"
+        description: "driver-v* release tag (default: the newest unfinished attestation round)"
         required: false
         default: ""
       dry_run:
@@ -62,7 +65,7 @@ jobs:
     timeout-minutes: 2
     steps:
       - run: |
-          echo "::notice::Automatic attestation is OFF (repository variable AUTO_ATTEST != 'true'). Nothing was submitted to Microsoft. To attest the newest driver-v* release, run this workflow manually (Actions → Driver attest → Run workflow), or set AUTO_ATTEST=true to re-enable the hand-off from Driver submission."
+          echo "::notice::Automatic attestation is OFF (repository variable AUTO_ATTEST != 'true'). Nothing was submitted to Microsoft. To attest the driver release Driver submission just made, run this workflow from main with its tag (Actions, Driver attest, Run workflow), or set AUTO_ATTEST=true to start it by itself."
 
   # Wiring check only: no Partner Center call and no credential, so it can
   # run from the branch a workflow change is made on.
@@ -122,6 +125,9 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           INPUT_TAG: ${{ inputs.tag }}
+          # Started by Driver submission: the round of the commit it built
+          # (empty on a dispatch).
+          INPUT_COMMIT: ${{ github.event.workflow_run.head_sha }}
         run: python3 .github/scripts/attest.py
 
   verify:

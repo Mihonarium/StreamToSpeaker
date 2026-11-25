@@ -4,8 +4,11 @@ import json
 import os
 import tempfile
 import unittest
+import unittest.mock
 
 import attest
+import driver_release
+import fake_gh
 
 
 def man(**kw):
@@ -292,6 +295,119 @@ class Reconcile(unittest.TestCase):
         out = attest.reconcile(FakeApi([]), FakeRelease(m), m, "driver-v1",
                                now=lambda: 0, sleep=lambda s: None)
         self.assertEqual(out, "wait-signing")
+
+
+REPO = "owner/repo"
+COMMIT = "c0ffee" + "0" * 34
+CERTIFIED_211 = {"schema": 1, "driver_version": "1.1.1.211", "driver_build": 211, "commit": "e" * 40,
+                 "source_hash": "5" * 64, "certified": True, "attested": False, "submission_cab": None,
+                 "signed_zip": "StreamToSpeaker-Driver-1.1.1.211-Signed.zip", "signed_zip_sha256": "6" * 64,
+                 "ms_product_id": "1", "ms_submission_id": "2", "ms_state": "done"}
+
+
+def unsigned(version, commit=COMMIT):
+    return man(driver_version=version, driver_build=int(version.rsplit(".", 1)[1]), commit=commit,
+               submission_cab=f"StreamToSpeaker-Driver-{version}-Submission.cab",
+               submission_cab_signed_sha256=None)
+
+
+class InTemporaryDirectory(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_cwd = os.getcwd()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._tmp.cleanup()
+
+
+class ChoosingTheRelease(InTemporaryDirectory):
+    """Which driver-v* release a run without a `tag` reconciles."""
+
+    def resolve(self, fake, tag=None, **kw):
+        with unittest.mock.patch("subprocess.run", fake_gh.subprocess_run(fake)):
+            return attest.Release.resolve(REPO, tag, **kw)
+
+    def test_without_a_tag_the_newest_unfinished_release_is_chosen_not_the_highest_build(self):
+        # Build numbers restarted with the public history: a new driver
+        # numbers below the certified 211. The run must not pick 211
+        # (certified: "done") and end green without submitting anything.
+        fake = fake_gh.FakeReleases(REPO)
+        fake.add_release("driver-v1.1.1.211", {"manifest.json": CERTIFIED_211}, created_at="2026-10-12T00:00:00Z")
+        fake.add_release("driver-v1.1.1.140", {"manifest.json": unsigned("1.1.1.140")},
+                         created_at="2026-12-01T00:00:00Z")
+        tag, _rel, m = self.resolve(fake)
+        self.assertEqual(tag, "driver-v1.1.1.140")
+        self.assertEqual(attest.next_action(m), "wait-signing")
+
+    def test_a_named_tag_beyond_the_first_page_of_releases_is_found(self):
+        fake = fake_gh.FakeReleases(REPO)
+        fake.add_release("driver-v1.1.0.204", {"manifest.json": unsigned("1.1.0.204")},
+                         created_at="2026-01-01T00:00:00Z")
+        for i in range(120):
+            fake.add_release(f"v0.{i}.0", prerelease=False, created_at=f"2026-06-01T00:{i // 60:02d}:{i % 60:02d}Z")
+        tag, _rel, _m = self.resolve(fake, "driver-v1.1.0.204")
+        self.assertEqual(tag, "driver-v1.1.0.204")
+
+
+class ReconcilingARelease(InTemporaryDirectory):
+    """reconcile() with the real Release against a fake of the release."""
+
+    def fake(self):
+        fake = fake_gh.FakeReleases(REPO, error=driver_release.ReleaseError)
+        m = dict(unsigned("1.1.2.140"), submission_cab_signed_sha256=CAB_SHA)
+        fake.add_release("driver-v1.1.2.140", {"manifest.json": m, m["submission_cab"]: b"CABBYTES"})
+        return fake
+
+    def test_every_transition_reaches_the_release(self):
+        fake = self.fake()
+        tag, rel, m = attest.Release.resolve(REPO, None, run=fake)
+        out = attest.reconcile(FakeApi([DONE_SUB]), rel, m, tag, now=lambda: 0, sleep=lambda s: None)
+        self.assertEqual(out, "finalize")
+        final = fake.manifest(tag)
+        zip_name = "StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip"
+        self.assertEqual((final["ms_product_id"], final["ms_state"], final["ms_zip_asset"]), ("111", "done", zip_name))
+        self.assertEqual(fake.files(tag)[zip_name], b"ZIPBYTES")
+
+    def test_a_finished_release_is_never_written(self):
+        fake = fake_gh.FakeReleases(REPO, error=driver_release.ReleaseError)
+        fake.add_release("driver-v1.1.1.211", {"manifest.json": CERTIFIED_211})
+        tag, rel, m = attest.Release.resolve(REPO, "driver-v1.1.1.211", run=fake)
+        self.assertEqual(attest.reconcile(FakeApi([]), rel, m, tag, now=lambda: 0, sleep=lambda s: None), "done")
+        with self.assertRaisesRegex(driver_release.ReleaseError, "never changed"):
+            rel.save_manifest(attest.apply_created(dict(m), "1", "2"))
+        path = fake_gh.write(self._tmp.name, "StreamToSpeaker-Driver-1.1.1.211-Microsoft.zip", b"other bytes")
+        with self.assertRaisesRegex(driver_release.ReleaseError, "never changed"):
+            rel.upload_asset(path)
+        self.assertEqual(fake.writes(), [])
+
+    def test_the_release_of_the_commit_that_finished_driver_submission_is_taken(self):
+        fake = self.fake()
+        fake.add_release("driver-v1.1.2.150", {"manifest.json": unsigned("1.1.2.150", commit="b" * 40)},
+                         created_at="2099-01-01T00:00:00Z")
+        self.assertEqual(attest.Release.resolve(REPO, None, run=fake)[0], "driver-v1.1.2.150")
+        self.assertEqual(attest.Release.resolve(REPO, None, commit=COMMIT, run=fake)[0], "driver-v1.1.2.140")
+        with self.assertRaises(SystemExit):
+            attest.Release.resolve(REPO, None, commit="d" * 40, run=fake)
+
+
+class SavingTheManifest(InTemporaryDirectory):
+    def test_a_failed_manifest_upload_leaves_the_release_with_a_manifest(self):
+        # gh's --clobber deletes the old asset before it uploads the new
+        # one; a failed upload must not leave the release without the
+        # manifest that holds the Partner Center ids.
+        fake = fake_gh.FakeReleases(REPO)
+        before = dict(unsigned("1.1.1.140"), submission_cab_signed_sha256=CAB_SHA)
+        fake.add_release("driver-v1.1.1.140", {"manifest.json": before})
+        fake.clobber_upload_fails.add("manifest.json")
+        fake.fail_when(fake_gh.uploading("manifest.json.pending"))
+        after = attest.apply_created(dict(before), "111", "222")
+        with unittest.mock.patch("subprocess.run", fake_gh.subprocess_run(fake)):
+            rel = attest.Release.resolve(REPO, "driver-v1.1.1.140")[1]
+            with self.assertRaises(Exception):
+                rel.save_manifest(after)
+        self.assertIn(fake.manifest("driver-v1.1.1.140"), (before, after))
 
 
 if __name__ == "__main__":

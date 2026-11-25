@@ -1,11 +1,14 @@
 import base64
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shutil
 import tempfile
 import unittest
 
+import fake_gh
 import release_draft as rd
 
 REPO = "Mihonarium/StreamToSpeaker"
@@ -533,6 +536,68 @@ class Publish(unittest.TestCase):
         gh = FakeGh([release("v0.1.11", rid=2, draft=False, names=self.names)])
         with self.assertRaisesRegex(rd.ReleaseError, "already a published release"):
             self.publish(gh, ids="1")
+
+
+class Uploading(unittest.TestCase):
+    """release_draft.py upload: what sign-service and sign-release put on
+    the draft."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def fake(self, names=(), draft=True, commit=COMMIT):
+        fake = fake_gh.FakeReleases(REPO, error=rd.ReleaseError)
+        fake.add_release("v0.1.11", {n: b"earlier " + n.encode() for n in names}, draft=draft)
+        fake.tag_commits["v0.1.11"] = commit
+        return fake
+
+    def upload(self, fake, *files):
+        paths = [fake_gh.write(self.tmp, name, data) for name, data in files]
+        with contextlib.redirect_stdout(io.StringIO()):
+            return rd.upload(REPO, "v0.1.11", COMMIT, V, paths, fake, sleep=lambda s: None)
+
+    def test_the_setup_exe_goes_up_with_its_sidecar_and_the_stable_alias(self):
+        fake = self.fake()
+        self.upload(fake, (INSTALLER, b"signed setup exe"))
+        files = fake.files("v0.1.11")
+        digest = hashlib.sha256(b"signed setup exe").hexdigest()
+        self.assertEqual(files, {INSTALLER: b"signed setup exe", INSTALLER + ".sha256": f"{digest}  {INSTALLER}".encode(),
+                                 rd.ALIAS: b"signed setup exe", rd.ALIAS + ".sha256": f"{digest}  {rd.ALIAS}".encode()})
+
+    def test_a_testsigned_setup_exe_gets_no_stable_alias(self):
+        fake = self.fake()
+        name = f"StreamToSpeakerSetup-{V}-testsigned.exe"
+        self.upload(fake, (name, b"x"))
+        self.assertEqual(sorted(fake.files("v0.1.11")), [name, name + ".sha256"])
+
+    def test_the_service_exe_and_a_bundle(self):
+        fake = self.fake()
+        self.upload(fake, (SERVICE, b"svc"), (SERVICE + ".sigstore.json", b"{}"))
+        self.assertEqual(sorted(fake.files("v0.1.11")), [SERVICE, SERVICE + ".sha256", SERVICE + ".sigstore.json"])
+
+    def test_a_failed_upload_leaves_the_draft_with_what_it_had(self):
+        fake = self.fake(names=[SERVICE, SERVICE + ".sha256"])
+        before = fake.files("v0.1.11")
+        fake.fail_when(fake_gh.uploading(SERVICE + ".pending"))
+        with self.assertRaises(rd.ReleaseError):
+            self.upload(fake, (SERVICE, b"a new signature"))
+        self.assertEqual(fake.files("v0.1.11"), before)
+
+    def test_uploads_only_to_the_draft_of_this_commit(self):
+        for fake in (self.fake(commit=OTHER), self.fake(draft=False)):
+            with self.assertRaises(rd.ReleaseError):
+                self.upload(fake, (SERVICE, b"svc"))
+            self.assertEqual(fake.writes(), [])
+
+    def test_only_files_of_a_release_of_this_version(self):
+        for name in ("notes.txt", "StreamToSpeakerSetup-0.1.10.exe", rd.ALIAS, SERVICE + ".sha256"):
+            fake = self.fake()
+            with self.assertRaises(rd.ReleaseError, msg=name):
+                self.upload(fake, (name, b"x"))
+            self.assertEqual(fake.writes(), [])
 
 
 class Cli(unittest.TestCase):

@@ -12,6 +12,7 @@ import unittest.mock
 import zipfile
 
 import certified
+import fake_gh
 
 # The real 1.1.0.209 packages, when this box has them (dev machine only;
 # CI runs the synthetic tests).
@@ -207,6 +208,95 @@ class VerifyPackages(unittest.TestCase):
         z1, z2 = certified.canonical_zip(ms), certified.canonical_zip(ms)
         self.assertEqual(z1, z2)
         self.assertEqual(sorted(zipfile.ZipFile(io.BytesIO(z1)).namelist()), sorted(certified.PACKAGE_FILES))
+
+
+class PublishingTheRelease(unittest.TestCase):
+    """`certified.py release` against a fake of the release it writes."""
+    REPO = "owner/repo"
+    TAG = "driver-v1.1.0.209"
+    LAB = "StreamToSpeaker-Driver-1.1.0.209-lab-testsigned.zip"
+    SIGNED = "StreamToSpeaker-Driver-1.1.0.209-Signed.zip"
+    COMMIT = "a" * 40
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.ms, self.lab = fake_packages()
+        for name, data in (("ms.zip", self.ms), ("lab.zip", self.lab)):
+            with open(name, "wb") as fh:
+                fh.write(data)
+
+    def tearDown(self):
+        os.chdir(self.old_cwd)
+        shutil.rmtree(self.tmp)
+
+    def fake(self, **assets):
+        fake = fake_gh.FakeReleases(self.REPO)
+        fake.add_release(self.TAG, {self.LAB: self.lab, **assets}, target=self.COMMIT)
+        return fake
+
+    def release(self, fake, *extra):
+        argv = ["release", "--repo", self.REPO, "--tag", self.TAG, "--version", "1.1.0.209",
+                "--commit", self.COMMIT, "--source-hash", "5" * 64, "--product-id", "1",
+                "--submission-id", "2", "--ms-zip", "ms.zip", "--lab-zip", "lab.zip", *extra]
+        with unittest.mock.patch("subprocess.run", fake_gh.subprocess_run(fake)), \
+                unittest.mock.patch("sys.stdout", io.StringIO()):
+            try:
+                return certified.main(argv)
+            except Exception as e:  # what the workflow step would see as a failure
+                return e
+
+    def test_the_lab_package_on_the_release_is_never_uploaded_again(self):
+        fake = self.fake()
+        self.assertEqual(self.release(fake), 0)
+        self.assertNotIn(self.LAB, fake.uploaded_names())
+        self.assertEqual(fake.files(self.TAG)[self.LAB], self.lab)
+        self.assertIs(fake.manifest(self.TAG)["certified"], True)
+
+    def test_manifest_json_is_uploaded_last_in_a_call_of_its_own(self):
+        fake = self.fake()
+        self.assertEqual(self.release(fake), 0)
+        calls = fake.upload_calls()
+        self.assertEqual(len(calls[-1]), 1)
+        self.assertTrue(calls[-1][0].startswith("manifest.json"), calls)
+        self.assertFalse([n for c in calls[:-1] for n in c if n.startswith("manifest.json")], calls)
+
+    def test_a_failed_upload_leaves_the_release_with_what_it_had(self):
+        # An earlier attempt left a Signed.zip; this attempt's upload of
+        # it fails half way. The release keeps a Signed.zip and the lab
+        # package, and gets no manifest that names a missing file.
+        fake = self.fake(**{self.SIGNED: b"an earlier attempt's zip"})
+        fake.clobber_upload_fails.add(self.SIGNED)
+        fake.fail_when(fake_gh.uploading(self.SIGNED + ".pending"))
+        self.assertNotEqual(self.release(fake), 0)
+        files = fake.files(self.TAG)
+        self.assertEqual(files[self.SIGNED], b"an earlier attempt's zip")
+        self.assertEqual(files[self.LAB], self.lab)
+        self.assertNotIn("manifest.json", files)
+
+    def test_a_certified_release_is_never_changed(self):
+        fake = self.fake()
+        self.assertEqual(self.release(fake), 0)
+        before = fake.files(self.TAG)
+        writes = len(fake.writes())
+        # The same inputs again change nothing and succeed...
+        self.assertEqual(self.release(fake), 0)
+        self.assertEqual(len(fake.writes()), writes)
+        # ...other inputs are refused.
+        self.assertNotEqual(self.release(fake, "--report-id", "95342530"), 0)
+        self.assertEqual(len(fake.writes()), writes)
+        self.assertEqual(fake.files(self.TAG), before)
+
+    def test_an_attestation_submission_is_not_turned_into_a_certified_release(self):
+        fake = self.fake(**{"manifest.json": {"schema": 1, "driver_version": "1.1.0.209", "attested": False,
+                                              "submission_cab": "StreamToSpeaker-Driver-1.1.0.209-Submission.cab",
+                                              "submission_cab_signed_sha256": "ab" * 32,
+                                              "ms_product_id": "7", "ms_submission_id": "8",
+                                              "ms_state": "committed"}})
+        before = fake.files(self.TAG)
+        self.assertNotEqual(self.release(fake), 0)
+        self.assertEqual(fake.files(self.TAG), before)
 
 
 @unittest.skipUnless(HAVE_REAL, "real 1.1.0.209 packages not on this machine")

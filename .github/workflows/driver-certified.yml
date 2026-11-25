@@ -29,9 +29,16 @@ name: Driver certified
 #                           ANY index — for HLK returns Microsoft nests its
 #                           signature behind the lab's test signature, which
 #                           is why driver-attested.yml (primary signer must be
-#                           Microsoft) can't be reused. Then publish the
-#                           canonical -Signed.zip + manifest.json (certified:
+#                           Microsoft) can't be reused. Then make the
+#                           canonical -Signed.zip, attest its provenance, and
+#                           publish it and, last, manifest.json (certified:
 #                           true, certification ids) on the release.
+#
+# Release writes go through certified.py and driver_release.py: a release
+# that is already certified (or attested, or an attestation submission) is
+# never changed — the same inputs again change nothing, other inputs are
+# refused — the hand-attached lab package is never uploaded again, and
+# nothing on the release is deleted before its replacement is up.
 #
 # The certified tree: `commit` (default: the commit this run is dispatched
 # on) names the commit whose driver/** + include/** tree was certified. The
@@ -218,7 +225,7 @@ jobs:
       # canonical package is published by the verify job.
       - name: Park Microsoft's zip on the release
         if: needs.resolve.outputs.dry_run != 'true'
-        run: gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$MS_ZIP" --clobber
+        run: python3 .github/scripts/certified.py park --tag "$TAG" --ms-zip "$MS_ZIP"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -388,12 +395,33 @@ jobs:
             "| Driver source hash | ``$env:SOURCE_HASH`` |"
           ) -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
+      # The canonical package, made (and its provenance attested) before
+      # anything is published.
+      - name: Make the canonical package
+        id: package
+        shell: pwsh
+        run: |
+          python _scripts\.github\scripts\certified.py package `
+            --ms-zip "packages\$env:MS_ZIP" --lab-zip "packages\$env:LAB_ZIP" --version $env:VERSION --out-dir canonical
+          if ($LASTEXITCODE -ne 0) { throw "could not make the canonical package" }
+
+      # Provenance for the canonical driver package (bytes are final here).
+      # Verify with:
+      #   gh attestation verify StreamToSpeaker-Driver-<ver>-Signed.zip -R ${{ github.repository }}
+      - name: Attest build provenance (public repo only)
+        id: attest
+        if: ${{ !github.event.repository.private && needs.resolve.outputs.dry_run != 'true' }}
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: ${{ steps.package.outputs.signed_zip }}
+
       - name: Publish canonical package + manifest (certified=true)
         id: publish
         if: needs.resolve.outputs.dry_run != 'true'
         shell: pwsh
         env:
           SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
           # Quoted, so an empty id (the ms_zip_asset path may have none)
           # still reaches python as an empty argument.
@@ -411,27 +439,6 @@ jobs:
             "--lab-zip", "packages\$env:LAB_ZIP"
           )
           if ($env:REPORT_ID) { $cmd += @("--report-id", $env:REPORT_ID) }
+          if ($env:BUNDLE_PATH) { $cmd += @("--bundle", $env:BUNDLE_PATH) }
           python _scripts\.github\scripts\certified.py @cmd
           if ($LASTEXITCODE -ne 0) { throw "publishing the certified release failed" }
-
-      # Provenance for the canonical driver package (bytes are final here).
-      # Verify with:
-      #   gh attestation verify StreamToSpeaker-Driver-<ver>-Signed.zip -R ${{ github.repository }}
-      - name: Attest build provenance (public repo only)
-        id: attest
-        if: ${{ !github.event.repository.private && needs.resolve.outputs.dry_run != 'true' }}
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
-        with:
-          subject-path: ${{ steps.publish.outputs.signed_zip }}
-
-      - name: Publish the attestation bundle
-        if: ${{ !github.event.repository.private && needs.resolve.outputs.dry_run != 'true' }}
-        shell: pwsh
-        env:
-          SIGNED_ZIP: ${{ steps.publish.outputs.signed_zip }}
-          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
-        run: |
-          $bundle = "$env:SIGNED_ZIP.sigstore.json"
-          Copy-Item $env:BUNDLE_PATH $bundle
-          gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY $bundle --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
