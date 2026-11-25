@@ -122,8 +122,10 @@ code 1). Setup:
    Windows has no Stream To Speaker output at all although its two sound
    services run (a new device first, the old one removed only once the new
    one works; the new output gets the old one's default-output roles). While
-   those services are stopped no output can appear: the step changes nothing
-   and reports that the sound output is missing. After an update or a
+   those services are stopped no output can appear, so a missing output is
+   no reason to rebuild then: the step does only what is due otherwise (the
+   first device, another driver) and reports that the sound output is
+   missing (exit code 20), or that a restart is due (3010). After an update or a
    rebuild that failed, it reads the earlier device back before it reports
    that the device was kept, and removes a device it made itself. With more
    than one device, the one Windows plays to stays. Earlier driver packages,

@@ -1012,7 +1012,9 @@ end;
 // line (/TASKS or /MERGETASKS), and leaves the setting as it is otherwise.
 // When what Setup runs doesn't act on the person's account (started with
 // "Run as administrator" from another account, or the person couldn't be
-// told), it leaves the setting alone and says so.
+// told), it leaves the setting alone and says so. When the look for running
+// copies, which tells this, couldn't run at all, Setup writes the setting
+// as Inno Setup does by itself, for the account that started it.
 procedure ApplySignIn();
 var
   Wanted: Boolean;
