@@ -7,24 +7,33 @@ complete. Until then no release or release asset of the version is public
 with push access, never to `releases/latest` (the app's update check), the
 /releases/latest/download/ links or the public release list.
 
+  release_draft.py version
+      The version build.yml builds, from GITHUB_REF, GITHUB_EVENT_NAME,
+      INPUT_VERSION and GITHUB_SHA: a v* tag is its version, a dispatch
+      elsewhere may name one, anything else is 0.1.0-<short sha>. Only
+      <major>.<minor>.<patch> with an optional -<pre-release> part passes
+      (no +build metadata, nothing naming testsigned). Writes `version`
+      and `viversion` (X.Y.Z.0) to GITHUB_OUTPUT.
   release_draft.py ensure  <tag> --repo R (--commit SHA | --target SHA)
       Create the draft for <tag> (generated notes) unless it exists, and
       wait until the release list shows it (the list lags behind a fresh
       release by a moment). --commit: the tag must exist and point at SHA,
-      whether the draft is created now or already exists. --target: for a
-      tag that does not exist yet (it would be created at SHA on
+      whether the draft is created now or already exists; a draft an
+      earlier run made for another commit (the tag was moved since) gets
+      this commit as its target and notes generated for it. --target: for
+      a tag that does not exist yet (it would be created at SHA on
       publishing). Fails when <tag> is already a published release or has
       more than one release.
-  release_draft.py require <tag> --repo R --commit SHA
-      <tag> must be exactly one release, a draft, and the tag must point
-      at SHA: a run whose tag has since moved to another commit neither
-      uploads to the draft nor asks for a signature.
   release_draft.py upload  <tag> --repo R --commit SHA --version V FILE...
       Put signed files on the draft (as `require` checks it), each .exe
       with its .sha256 sidecar, the setup exe also as the stable
       StreamToSpeakerSetup.exe alias unless it is a -testsigned fallback.
       Nothing on the draft is deleted before its replacement is completely
       uploaded (release_assets.py).
+  release_draft.py require <tag> --repo R --commit SHA
+      <tag> must be exactly one release, a draft, and the tag must point
+      at SHA: a run whose tag has since moved to another commit neither
+      uploads to the draft nor asks for a signature.
   release_draft.py prune   <tag> --repo R --commit SHA --version V --installer NAME [--provenance]
       Delete setup exe assets an earlier attempt left on the draft under
       another name (a -testsigned installer when NAME bundles a
@@ -53,10 +62,12 @@ with push access, never to `releases/latest` (the app's update check), the
       would recreate the tag at the release's target commit). It becomes
       the latest release only when no published release (other than a
       pre-release) has a version at least as high, so a release published
-      late never takes releases/latest from a newer one. A -testsigned fallback
-      NAME is published as a pre-release that is never made latest, so
-      releases/latest (the app's update check) and the stable download
-      link stay on the last release with a Microsoft-signed driver.
+      late never takes releases/latest from a newer one; when another tag
+      was published meanwhile with a higher version, that one gets latest
+      back. A -testsigned fallback NAME, and a version with a pre-release
+      part (0.1.11-rc.1), is published as a pre-release that is never made
+      latest, so releases/latest (the app's update check) and the stable
+      download link stay on the last full release.
 
 `ensure`, `require` and `check` write `release_id` to GITHUB_OUTPUT. Uses
 the gh CLI with GH_TOKEN; drafts are visible only to a token with push
@@ -77,14 +88,53 @@ import release_assets  # noqa: E402
 from repro_compare import clean_text, command_text, gh_output  # noqa: E402
 
 ALIAS = "StreamToSpeakerSetup.exe"
-TAG_RE = re.compile(r"v\d+\.\d+\.\d+[0-9A-Za-z.+-]*")
-VERSION_RE = re.compile(r"\d+\.\d+\.\d+[0-9A-Za-z.+-]*")
+# <major>.<minor>.<patch>, optionally `-` and a pre-release suffix of
+# dot-separated letters, digits and hyphens (semver). No build metadata
+# (`+`, which GitHub may rename in asset names) and nothing naming
+# testsigned (the -testsigned installer suffix is the build's to add).
+VERSION_PATTERN = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+VERSION_RE = re.compile(VERSION_PATTERN)
+TAG_RE = re.compile("v" + VERSION_PATTERN)
 SHA_RE = re.compile(r"[0-9a-f]{64}")
 BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle"
 
 
 # One error class for this script and the uploads it makes.
 ReleaseError = release_assets.ReleaseError
+
+
+def valid_version(version):
+    return bool(isinstance(version, str) and VERSION_RE.fullmatch(version)
+                and "testsigned" not in version.lower())
+
+
+def pre_release(version):
+    """Whether the version has a pre-release part (`0.1.11-rc.1`): such a
+    release is published as a GitHub pre-release, never as latest."""
+    return "-" in version.split("+", 1)[0]
+
+
+def build_version(ref, event, value, sha):
+    """(version, viversion) of a build.yml run: a v* tag is its version (a
+    dispatch on a tag must leave the version input empty or give the same);
+    a dispatch elsewhere may name one; otherwise 0.1.0-<short sha>.
+    viversion is the numeric X.Y.Z.0 the installer's VersionInfo needs."""
+    if ref.startswith("refs/tags/v"):
+        version = ref[len("refs/tags/v"):]
+        if event == "workflow_dispatch" and value and value != version:
+            raise ReleaseError("a dispatch on a tag builds the tag's version; leave the version input empty")
+    elif event == "workflow_dispatch" and value:
+        version = value
+    else:
+        version = "0.1.0-" + sha[:7]
+    if "testsigned" in version.lower():
+        raise ReleaseError("the version may not name testsigned: the build adds -testsigned to the installer's "
+                           "name itself when it bundles the test-signed driver")
+    if not valid_version(version):
+        raise ReleaseError(f"{clean_text(version)!r} is not a version this chain can publish: "
+                           "<major>.<minor>.<patch>, optionally followed by - and a pre-release part of "
+                           "letters, digits, dots and hyphens (from the tag or the version input)")
+    return version, ".".join(version.split("-", 1)[0].split(".") + ["0"])
 
 
 def gh(*args):
@@ -99,7 +149,7 @@ def gh(*args):
 # ---------------------------------------------------------------------------
 def list_releases(repo, run=gh):
     out = run("api", "--paginate", f"repos/{repo}/releases?per_page=100", "--jq",
-              ".[] | {id, tag_name, draft, prerelease, "
+              ".[] | {id, tag_name, draft, prerelease, target_commitish, "
               "assets: [.assets[] | {id, name, size, state}]} | @json")
     return [json.loads(line) for line in out.splitlines() if line.strip()]
 
@@ -156,7 +206,16 @@ def ensure_draft(repo, tag, commit=None, target=None, run=gh, sleep=time.sleep):
         require_tag_at(repo, tag, commit, run)
     rels = releases_for(repo, tag, run)
     if rels:
-        return require_draft(repo, tag, run, sleep), False
+        rel = require_draft(repo, tag, run, sleep)
+        if commit and rel.get("target_commitish") != commit:
+            # The tag was moved since an earlier run made this draft: its
+            # notes describe the changes up to the old commit.
+            notes = json.loads(run("api", "--method", "POST", f"repos/{repo}/releases/generate-notes",
+                                   "-f", f"tag_name={tag}", "-f", f"target_commitish={commit}"))
+            run("api", "--method", "PATCH", f"repos/{repo}/releases/{int(rel['id'])}",
+                "-f", f"target_commitish={commit}", "-f", f"body={notes.get('body') or ''}")
+            rel = require_draft(repo, tag, run, sleep)
+        return rel, False
     created = json.loads(run("api", "--method", "POST", f"repos/{repo}/releases",
                              "-f", f"tag_name={tag}", "-f", f"name={tag}", "-f", f"target_commitish={sha}",
                              "-F", "draft=true", "-F", "generate_release_notes=true"))
@@ -187,7 +246,7 @@ def testsigned(installer):
 
 
 def expected_assets(version, installer, provenance):
-    if not VERSION_RE.fullmatch(version or ""):
+    if not valid_version(version):
         raise ReleaseError(f"malformed version {clean_text(version)!r}")
     if installer not in (f"StreamToSpeakerSetup-{version}.exe", f"StreamToSpeakerSetup-{version}-testsigned.exe"):
         raise ReleaseError(f"{clean_text(installer)!r} is not the setup exe of version {version}")
@@ -380,21 +439,31 @@ def publish(repo, tag, release_id, checked_ids, commit, version, installer, prov
     pointed = tag_commit(repo, tag, run)
     if pointed != commit:
         raise ReleaseError(f"the tag {tag} points at {pointed}, not at {commit} the release was built from")
-    # A test-signed fallback needs testsigning mode: a pre-release, never
-    # the latest release, so the update check and the stable download link
-    # keep pointing at the last release with a Microsoft-signed driver.
-    fallback = testsigned(installer)
+    # A test-signed fallback needs testsigning mode, and a pre-release
+    # version (0.1.11-rc.1) is not for everyone: both are GitHub
+    # pre-releases, never the latest release, so the update check and the
+    # stable download link keep pointing at the last full release.
+    prerelease = testsigned(installer) or pre_release(version)
     # GitHub makes a newly published release the latest one unless told
     # otherwise; a version published after a higher one (a hotfix of an
     # older line, a chain finished late) must not take that place.
     newer = newer_releases(list_releases(repo, run), tag)
-    latest = not fallback and not newer
+    latest = not prerelease and not newer
     out = run("api", "--method", "PATCH", f"repos/{repo}/releases/{rel['id']}",
-              "-F", "draft=false", "-F", f"prerelease={str(fallback).lower()}",
+              "-F", "draft=false", "-F", f"prerelease={str(prerelease).lower()}",
               "-f", f"make_latest={str(latest).lower()}")
     result = json.loads(out)
-    if result.get("draft") is not False or result.get("tag_name") != tag or result.get("prerelease") is not fallback:
+    if result.get("draft") is not False or result.get("tag_name") != tag or result.get("prerelease") is not prerelease:
         raise ReleaseError(f"publishing {tag} did not take effect")
+    if latest:
+        # Another tag's chain can publish between the look at the list
+        # above and this PATCH, both asking to be latest. Whichever
+        # finished last, the highest version gets latest back.
+        rels = list_releases(repo, run)
+        newer = newer_releases(rels, tag)
+        if newer:
+            top = next(r for r in rels if r.get("tag_name") == newer[-1])
+            run("api", "--method", "PATCH", f"repos/{repo}/releases/{int(top['id'])}", "-f", "make_latest=true")
     return result, newer
 
 
@@ -448,10 +517,10 @@ def upload(repo, tag, commit, version, paths, run=gh, sleep=time.sleep):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=("ensure", "require", "upload", "prune", "check", "publish"))
-    ap.add_argument("tag")
+    ap.add_argument("command", choices=("version", "ensure", "require", "upload", "prune", "check", "publish"))
+    ap.add_argument("tag", nargs="?")
     ap.add_argument("files", nargs="*", help="upload: the signed files")
-    ap.add_argument("--repo", required=True)
+    ap.add_argument("--repo")
     ap.add_argument("--target", help="ensure: commit for a tag that does not exist yet")
     ap.add_argument("--version")
     ap.add_argument("--installer")
@@ -463,8 +532,21 @@ def main(argv=None):
     ap.add_argument("--service-sha256", help="check: sha256 of the signed service exe this run produced")
     ap.add_argument("--installer-sha256", help="check: sha256 of the signed setup exe this run produced")
     a = ap.parse_args(argv)
-    if not TAG_RE.fullmatch(a.tag):
-        print(f"::error::{command_text(f'{a.tag} is not a v<major>.<minor>.<patch> tag')}")
+    if a.command == "version":
+        try:
+            version, viversion = build_version(os.environ.get("GITHUB_REF", ""), os.environ.get("GITHUB_EVENT_NAME", ""),
+                                               os.environ.get("INPUT_VERSION", ""), os.environ.get("GITHUB_SHA", ""))
+        except ReleaseError as e:
+            print(f"::error::{command_text(e)}")
+            return 1
+        print(f"version={version}  viversion={viversion}")
+        gh_output(version=version, viversion=viversion)
+        return 0
+    if not a.tag or not TAG_RE.fullmatch(a.tag) or not valid_version(a.tag[1:]):
+        print(f"::error::{command_text(f'{a.tag} is not a v<major>.<minor>.<patch> tag this chain can publish')}")
+        return 1
+    if not a.repo:
+        print("::error::--repo is required")
         return 1
     if a.files and a.command != "upload":
         print("::error::only upload takes files")

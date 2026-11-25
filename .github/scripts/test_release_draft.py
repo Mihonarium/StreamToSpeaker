@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 
 import fake_gh
 import release_draft as rd
@@ -40,6 +41,8 @@ class FakeGh:
         # How many list calls after a create still miss the new release.
         self.list_lag = list_lag
         self.hidden = []
+        # Called after every PATCH: (fake, release id, fields).
+        self.on_patch = None
 
     def __call__(self, *args):
         self.calls.append(args)
@@ -49,6 +52,9 @@ class FakeGh:
                 self.hidden = []
             self.list_lag -= 1
             return "".join(json.dumps(r) + "\n" for r in self.releases)
+        if args[:3] == ("api", "--method", "POST") and args[3].endswith("/releases/generate-notes"):
+            fields = dict(a.split("=", 1) for a in args if "=" in a)
+            return json.dumps({"name": fields["tag_name"], "body": f"changes up to {fields['target_commitish']}"})
         if args[:3] == ("api", "--method", "POST"):
             fields = dict(a.split("=", 1) for a in args if "=" in a)
             rel = release(fields["tag_name"], rid=99)
@@ -81,8 +87,15 @@ class FakeGh:
             rid = int(args[3].rsplit("/", 1)[1])
             rel = next(r for r in self.releases if r["id"] == rid)
             fields = dict(a.split("=", 1) for a in args if "=" in a)
-            rel["draft"] = fields["draft"] == "true"
-            rel["prerelease"] = fields.get("prerelease", "false") == "true"
+            if "draft" in fields:
+                rel["draft"] = fields["draft"] == "true"
+            if "prerelease" in fields:
+                rel["prerelease"] = fields["prerelease"] == "true"
+            for key in ("body", "target_commitish", "make_latest"):
+                if key in fields:
+                    rel[key] = fields[key]
+            if self.on_patch:
+                self.on_patch(self, rid, fields)
             return json.dumps({"id": rid, "draft": rel["draft"], "prerelease": rel["prerelease"],
                                "tag_name": rel["tag_name"], "html_url": "https://x"})
         raise AssertionError(f"unexpected gh call {args}")
@@ -536,6 +549,104 @@ class Publish(unittest.TestCase):
         gh = FakeGh([release("v0.1.11", rid=2, draft=False, names=self.names)])
         with self.assertRaisesRegex(rd.ReleaseError, "already a published release"):
             self.publish(gh, ids="1")
+
+
+class PreReleases(unittest.TestCase):
+    def test_a_pre_release_version_is_published_as_a_pre_release_never_latest(self):
+        # v0.1.11-rc.1 while v0.1.10 is the newest release: the update
+        # check (releases/latest) and the stable link must stay on v0.1.10.
+        v = "0.1.11-rc.1"
+        installer = f"StreamToSpeakerSetup-{v}.exe"
+        names = sorted(rd.expected_assets(v, installer, True))
+        gh = FakeGh([release("v0.1.10", rid=1, draft=False), release(f"v{v}", rid=2, names=names)],
+                    tags={f"v{v}": COMMIT})
+        ids = rd.asset_ids(gh.releases[1], rd.expected_assets(v, installer, True))
+        result, _newer = rd.publish(REPO, f"v{v}", "2", ids, COMMIT, v, installer, True, gh)
+        patch = [c for c in gh.calls if c[:3] == ("api", "--method", "PATCH")][0]
+        self.assertIn("prerelease=true", patch)
+        self.assertIn("make_latest=false", patch)
+        self.assertIs(result["prerelease"], True)
+        self.assertTrue(rd.pre_release(v))
+        for plain in ("0.1.11", "0.1.11+build.5"):
+            self.assertFalse(rd.pre_release(plain), plain)
+
+
+class Versions_(unittest.TestCase):
+    """The version a run builds (build.yml's Compute version step)."""
+
+    def version(self, ref, event="push", value="", sha="abcdef1234567890" + "0" * 24):
+        return rd.build_version(ref, event, value, sha)
+
+    def test_a_tag_is_its_version(self):
+        self.assertEqual(self.version("refs/tags/v0.1.11"), ("0.1.11", "0.1.11.0"))
+        self.assertEqual(self.version("refs/tags/v0.1.11-rc.1"), ("0.1.11-rc.1", "0.1.11.0"))
+        self.assertEqual(self.version("refs/tags/v1.2.3", "workflow_dispatch", "1.2.3"), ("1.2.3", "1.2.3.0"))
+        with self.assertRaisesRegex(rd.ReleaseError, "leave the version input empty"):
+            self.version("refs/tags/v1.2.3", "workflow_dispatch", "1.2.4")
+
+    def test_other_runs(self):
+        self.assertEqual(self.version("refs/heads/main"), ("0.1.0-abcdef1", "0.1.0.0"))
+        self.assertEqual(self.version("refs/pull/7/merge", "pull_request"), ("0.1.0-abcdef1", "0.1.0.0"))
+        self.assertEqual(self.version("refs/heads/x", "workflow_dispatch", "2.0.0-beta.2"), ("2.0.0-beta.2", "2.0.0.0"))
+        # A version input is only read on a dispatch.
+        self.assertEqual(self.version("refs/heads/main", "push", "9.9.9"), ("0.1.0-abcdef1", "0.1.0.0"))
+
+    def test_versions_that_could_not_be_published_are_refused(self):
+        # "+" may be renamed in asset names; a suffix without "-" and one
+        # naming testsigned would disagree with what the release must hold.
+        for tag in ("v1.2.3+build.5", "v1.2.3rc1", "v1.2.3-testsigned.1", "v1.2.3-TestSigned", "v1.2.3-",
+                    "v1.2.3-rc..1", "v1.2", "v1.2.3$(x)", "v01.2.3", "v1.2.3\n"):
+            with self.assertRaises(rd.ReleaseError, msg=tag):
+                self.version(f"refs/tags/{tag}")
+        with self.assertRaises(rd.ReleaseError):
+            rd.expected_assets("1.2.3-testsigned.1", "StreamToSpeakerSetup-1.2.3-testsigned.1.exe", True)
+
+    def test_the_command_writes_the_outputs(self):
+        out = os.path.join(tempfile.mkdtemp(), "out")
+        env = {"GITHUB_REF": "refs/tags/v0.1.11", "GITHUB_EVENT_NAME": "push", "INPUT_VERSION": "",
+               "GITHUB_SHA": COMMIT, "GITHUB_OUTPUT": out}
+        with unittest.mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(rd.main(["version"]), 0)
+        with open(out) as fh:
+            self.assertEqual(fh.read(), "version=0.1.11\nviversion=0.1.11.0\n")
+
+
+class MovedTag(unittest.TestCase):
+    def test_a_draft_made_for_another_commit_gets_the_notes_of_this_one(self):
+        # The tag was deleted and pushed again at COMMIT after a run of
+        # OTHER made the draft: its generated notes describe OTHER.
+        rel = release("v0.1.11", rid=5)
+        rel["target_commitish"] = OTHER
+        rel["body"] = f"changes up to {OTHER}"
+        gh = FakeGh([rel])
+        found, created = rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+        self.assertFalse(created)
+        self.assertEqual((gh.releases[0]["target_commitish"], gh.releases[0]["body"]),
+                         (COMMIT, f"changes up to {COMMIT}"))
+        # The draft of this commit is left as it is.
+        calls = len(gh.calls)
+        rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+        self.assertFalse([c for c in gh.calls[calls:] if c[:3] in (("api", "--method", "PATCH"),
+                                                                   ("api", "--method", "POST"))])
+
+
+class TwoTagsAtOnce(unittest.TestCase):
+    def test_a_newer_release_published_meanwhile_gets_latest_back(self):
+        # v0.1.12's chain publishes between v0.1.11's look at the release
+        # list and its PATCH: both asked for make_latest=true, v0.1.11 last.
+        names = sorted(complete_files())
+        gh = FakeGh([release("v0.1.10", rid=1, draft=False), release("v0.1.12", rid=3),
+                     release("v0.1.11", rid=2, names=names)])
+
+        def v0112_published(fake, rid, fields):
+            if rid == 2:
+                fake.releases[1]["draft"] = False
+        gh.on_patch = v0112_published
+        ids = rd.asset_ids(gh.releases[2], rd.expected_assets(V, INSTALLER, True))
+        rd.publish(REPO, "v0.1.11", "2", ids, COMMIT, V, INSTALLER, True, gh)
+        patches = [c for c in gh.calls if c[:3] == ("api", "--method", "PATCH")]
+        self.assertEqual(patches[-1][3], f"repos/{REPO}/releases/3")
+        self.assertIn("make_latest=true", patches[-1])
 
 
 class Uploading(unittest.TestCase):

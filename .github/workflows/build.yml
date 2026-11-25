@@ -72,51 +72,27 @@ jobs:
           "hash=${{ hashFiles('driver/**', 'include/**') }}" >> $env:GITHUB_OUTPUT
 
       # -----------------------------------------------------------------
-      # Compute two version strings:
-      #   version   — free-form, used in filename + display ("0.1.0-abc1234")
-      #   viversion — strict X.Y.Z.W numeric, required for the Win32
-      #               VersionInfo resource Inno Setup bakes into setup.exe
+      # Compute two version strings (release_draft.py version):
+      #   version   — used in file names and shown ("0.1.0-abc1234")
+      #   viversion — strict X.Y.Z.0, for the Win32 VersionInfo resource
+      #               Inno Setup bakes into setup.exe
       # Tag push  v1.2.3   → version 1.2.3,        viversion 1.2.3.0
       # Dispatch with a version (not on a tag) → that version
       # Otherwise          → version 0.1.0-<sha>,  viversion 0.1.0.0
-      # The version must be <major>.<minor>.<patch> plus an optional suffix
-      # of letters, digits and . + - ; anything else (a tag such as
-      # v1.2.3$(...) included) fails here, before it reaches a file name,
-      # a step output or a later job. On a tag the tag is the version: a
-      # dispatched version that differs from it is refused.
+      # Only <major>.<minor>.<patch> with an optional -<pre-release> part
+      # passes (letters, digits, dots, hyphens; nothing naming testsigned,
+      # no +build metadata); anything else fails here, before it reaches a
+      # file name, a step output or a later job. On a tag the tag is the
+      # version: a dispatched version that differs from it is refused.
       # -----------------------------------------------------------------
       - name: Compute version
         id: ver
         shell: pwsh
         env:
-          EVENT: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $v = ""
-          if ($env:GITHUB_REF -clike "refs/tags/v*") {
-              $v = $env:GITHUB_REF.Substring("refs/tags/v".Length)
-              if ($env:EVENT -eq "workflow_dispatch" -and $env:INPUT_VERSION -and $env:INPUT_VERSION -cne $v) {
-                  throw "a dispatch on a tag builds the tag's version; leave the version input empty"
-              }
-          } elseif ($env:EVENT -eq "workflow_dispatch" -and $env:INPUT_VERSION) {
-              $v = $env:INPUT_VERSION
-          } else {
-              $v = "0.1.0-" + $env:GITHUB_SHA.Substring(0, 7)
-          }
-          if ($v -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*\z') {
-              throw "the version must be <major>.<minor>.<patch> optionally followed by letters, digits and . + - (from the tag or the version input)"
-          }
-          # Numeric prefix of $v, padded to 4 parts.
-          $prefix = ($v -split "[-+]")[0]
-          $parts = $prefix -split "\."
-          while ($parts.Count -lt 4) { $parts += "0" }
-          # Strip any non-numeric parts (paranoia — Inno rejects them).
-          $parts = $parts | ForEach-Object { if ($_ -match "^\d+$") { $_ } else { "0" } }
-          $vi = $parts[0..3] -join "."
-          Write-Host "version=$v  viversion=$vi"
-          "version=$v" >> $env:GITHUB_OUTPUT
-          "viversion=$vi" >> $env:GITHUB_OUTPUT
+          python .github/scripts/release_draft.py version
+          if ($LASTEXITCODE -ne 0) { throw "no version to build (see above)" }
 
       # -----------------------------------------------------------------
       # Toolchains
@@ -1245,6 +1221,12 @@ jobs:
     needs: [build, sign-service, package, sign-release]
     runs-on: windows-latest
     timeout-minutes: 20
+    # One publish at a time across all tags: two chains that reach this job
+    # together would each see the other as a draft and both ask to be the
+    # latest release (release_draft.py publish also re-checks afterwards).
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
     permissions:
       contents: write
     env:
