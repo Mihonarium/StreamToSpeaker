@@ -19,6 +19,9 @@ use crate::model::surfaces::{MenuEntry, Tray as TrayWords};
 pub enum TrayEvent {
     /// The left button went down on the icon.
     Press,
+    /// The left button went down on the icon a second time, quickly: the
+    /// second press of a double click (instead of `Press`).
+    DoublePress,
     /// The left button came up on the icon, at `rect`.
     Release(PxRect),
     /// An item of the menu was chosen.
@@ -89,6 +92,7 @@ impl Tray {
                 let ev = match e {
                     TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Down, .. } => TrayEvent::Press,
                     TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, rect, .. } => TrayEvent::Release(rect_of(&rect)),
+                    TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => TrayEvent::DoublePress,
                     // The left ones are logged with what they did; these do
                     // nothing in the shell (the right button opens the menu).
                     TrayIconEvent::Click { button, button_state, .. } => {

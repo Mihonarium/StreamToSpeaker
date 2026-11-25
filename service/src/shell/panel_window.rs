@@ -14,24 +14,42 @@ pub enum TrayClick {
     Open,
     Close,
     /// Nothing: pressing the icon already closed the panel by taking the
-    /// focus from it.
+    /// focus from it, or the click ended a double click that leaves it
+    /// closed.
     Nothing,
+    /// Leave it open and give it the focus again: the click ended a double
+    /// click whose first click opened it (its second press may have taken
+    /// the focus from it).
+    Keep,
 }
 
 /// How soon after the panel lost the focus a press on the icon counts as
 /// the press that took it, in seconds.
 pub const PRESS_AFTER_BLUR: f64 = 0.5;
 
+/// How long the second press of a double click keeps the panel from
+/// closing when it loses the focus, at most, in seconds: until the button
+/// comes up, unless that never reaches the icon.
+pub const DOUBLE_CLICK_HOLD: f64 = 1.0;
+
 /// Tells a click on the tray icon that should close the panel from one
 /// that should open it. Pressing the icon takes the focus from a flyout,
 /// which closes, before the button comes up; that click must leave it
-/// closed, not open it again.
+/// closed, not open it again. A double click is one click: it ends with
+/// the panel as its first click left it (open after a double click on a
+/// closed panel, closed after one on an open panel), though its second
+/// press takes the focus again.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Toggle {
     closed_by_blur_at: Option<f64>,
     /// The press of the click under way found the panel open (or just
     /// closed by it).
     press_found_open: Option<bool>,
+    /// What the last click did.
+    last: Option<TrayClick>,
+    /// The second press of a double click came, at this time: whether the
+    /// panel is to end up open.
+    double: Option<(f64, bool)>,
 }
 
 impl Toggle {
@@ -39,27 +57,61 @@ impl Toggle {
         self.closed_by_blur_at.is_some_and(|at| now - at <= PRESS_AFTER_BLUR)
     }
 
-    /// The panel closed because it lost the focus, at `now` (seconds).
-    pub fn closed_by_blur(&mut self, now: f64) {
+    /// The double click under way, if its second press came lately: whether
+    /// the panel is to end up open.
+    fn double_under_way(&self, now: f64) -> Option<bool> {
+        self.double.filter(|(at, _)| now - at <= DOUBLE_CLICK_HOLD).map(|(_, open)| open)
+    }
+
+    /// The panel lost the focus at `now` (seconds): whether that closes
+    /// it. Not while a double click that leaves it open is under way.
+    pub fn blur_closes(&mut self, now: f64) -> bool {
+        if self.double_under_way(now) == Some(true) {
+            return false;
+        }
         self.closed_by_blur_at = Some(now);
+        true
     }
 
     /// The left button went down on the icon.
     pub fn press(&mut self, open: bool, now: f64) {
+        self.double = None;
         self.press_found_open = Some(open || self.just_closed(now));
+    }
+
+    /// The left button went down on the icon a second time, quickly: the
+    /// second press of a double click (it comes instead of `press`).
+    pub fn double_press(&mut self, open: bool, now: f64) {
+        let first_opened = match self.last {
+            Some(click) => click == TrayClick::Open || click == TrayClick::Keep,
+            None => open,
+        };
+        self.double = Some((now, first_opened));
+        self.press_found_open = None;
     }
 
     /// The left button came up on the icon: what to do.
     pub fn release(&mut self, open: bool, now: f64) -> TrayClick {
-        let found_open = self.press_found_open.take().unwrap_or_else(|| self.just_closed(now));
+        let click = match self.double.take().filter(|(at, _)| now - at <= DOUBLE_CLICK_HOLD) {
+            Some((_, true)) if open => TrayClick::Keep,
+            Some((_, true)) => TrayClick::Open,
+            Some((_, false)) if open => TrayClick::Close,
+            Some((_, false)) => TrayClick::Nothing,
+            None => {
+                let found_open = self.press_found_open.take().unwrap_or_else(|| self.just_closed(now));
+                if open {
+                    TrayClick::Close
+                } else if found_open {
+                    TrayClick::Nothing
+                } else {
+                    TrayClick::Open
+                }
+            }
+        };
+        self.press_found_open = None;
         self.closed_by_blur_at = None;
-        if open {
-            TrayClick::Close
-        } else if found_open {
-            TrayClick::Nothing
-        } else {
-            TrayClick::Open
-        }
+        self.last = Some(click);
+        click
     }
 }
 
@@ -174,6 +226,15 @@ impl PanelWindow {
     /// that comparison and with one that sends only changes.
     pub fn builder(&self, mode: PanelMode) -> egui::ViewportBuilder {
         super::panel_builder(mode).with_visible(self.shown()).with_icon(super::app_icon())
+    }
+
+    /// It stays open whatever the focus did so far: losing the focus closes
+    /// it again only after it has had the focus once more (after a double
+    /// click on the icon, whose second press took the focus).
+    pub fn forget_focus(&mut self) {
+        if let Phase::Shown { place, .. } = self.phase {
+            self.phase = Phase::Shown { place, had_focus: false };
+        }
     }
 
     /// Where it is on screen, once shown.
@@ -315,25 +376,109 @@ mod tests {
         // The press reaches the shell after the panel closed on losing the
         // focus to the taskbar.
         let mut t = Toggle::default();
-        t.closed_by_blur(10.0);
+        assert!(t.blur_closes(10.0));
         t.press(false, 10.05);
         // However long the button is held.
         assert_eq!(t.release(false, 11.5), TrayClick::Nothing);
         // Or the press arrives first, while the panel is still open.
         t.press(true, 20.0);
-        t.closed_by_blur(20.02);
+        assert!(t.blur_closes(20.02));
         assert_eq!(t.release(false, 20.1), TrayClick::Nothing);
         // The next click opens it.
         t.press(false, 30.0);
         assert_eq!(t.release(false, 30.1), TrayClick::Open);
         // Losing the focus to another window long before: a click opens.
-        t.closed_by_blur(40.0);
+        assert!(t.blur_closes(40.0));
         t.press(false, 45.0);
         assert_eq!(t.release(false, 45.1), TrayClick::Open);
         // A release with no press seen (the keyboard): by the time alone.
-        t.closed_by_blur(50.0);
+        assert!(t.blur_closes(50.0));
         assert_eq!(t.release(false, 50.2), TrayClick::Nothing);
         assert_eq!(t.release(false, 60.0), TrayClick::Open);
+    }
+
+    /// What reaches the shell from the tray icon and the panel's window,
+    /// at a time in seconds: the left button's press, the second press of a
+    /// double click (tray-icon's `DoubleClick`, which Windows sends instead
+    /// of the second press), its release, and the panel losing the focus.
+    #[derive(Clone, Copy, Debug)]
+    enum Ev {
+        Down(f64),
+        DoubleDown(f64),
+        Up(f64),
+        LostFocus(f64),
+    }
+
+    /// The panel's state after `events`, starting `open` or not, handled as
+    /// the shell handles them.
+    fn after(open: bool, events: &[Ev]) -> bool {
+        let mut t = Toggle::default();
+        let mut open = open;
+        for e in events {
+            match *e {
+                Ev::Down(at) => t.press(open, at),
+                Ev::DoubleDown(at) => t.double_press(open, at),
+                Ev::Up(at) => match t.release(open, at) {
+                    TrayClick::Open => open = true,
+                    TrayClick::Close => open = false,
+                    TrayClick::Nothing | TrayClick::Keep => {}
+                },
+                // The shell hears of it only while the panel is open.
+                Ev::LostFocus(at) => {
+                    if open && t.blur_closes(at) {
+                        open = false;
+                    }
+                }
+            }
+        }
+        open
+    }
+
+    #[test]
+    fn a_single_click_toggles_and_a_double_click_ends_as_its_first_click_left_the_panel() {
+        use Ev::*;
+        // A single click opens a closed panel; on an open one its press
+        // takes the focus, which closes it, before or after the shell hears
+        // of the press, and it stays closed.
+        assert!(after(false, &[Down(1.0), Up(1.1)]));
+        assert!(!after(true, &[Down(1.0), LostFocus(1.01), Up(1.1)]));
+        assert!(!after(true, &[LostFocus(1.0), Down(1.02), Up(1.1)]));
+        // A double click on a closed panel opens it and leaves it open,
+        // though its second press takes the focus from the panel that just
+        // opened, whichever the shell hears of first.
+        assert!(after(false, &[Down(1.0), Up(1.08), DoubleDown(1.25), LostFocus(1.26), Up(1.33)]));
+        assert!(after(false, &[Down(1.0), Up(1.08), LostFocus(1.25), DoubleDown(1.26), Up(1.33)]));
+        assert!(after(false, &[Down(1.0), Up(1.08), DoubleDown(1.25), Up(1.33)]));
+        // A double click on an open panel closes it, once.
+        assert!(!after(true, &[Down(5.0), LostFocus(5.01), Up(5.08), DoubleDown(5.25), Up(5.33)]));
+        // Also as a small window, which doesn't close on losing the focus.
+        assert!(!after(true, &[Down(5.0), Up(5.08), DoubleDown(5.25), Up(5.33)]));
+        // A second press whose release never reaches the icon holds the
+        // panel open for a moment only.
+        assert!(!after(false, &[Down(1.0), Up(1.08), DoubleDown(1.25), LostFocus(3.0)]));
+    }
+
+    #[test]
+    fn a_click_after_the_panel_closed_on_a_lost_focus_opens_it() {
+        use Ev::*;
+        // Someone clicked elsewhere a while ago.
+        assert!(after(true, &[LostFocus(10.0), Down(12.0), Up(12.1)]));
+        // And twice, quickly.
+        assert!(after(true, &[LostFocus(10.0), Down(12.0), Up(12.08), DoubleDown(12.25), Up(12.33)]));
+    }
+
+    #[test]
+    fn a_click_on_the_icon_among_the_hidden_icons_works_as_one_on_the_taskbar() {
+        use Ev::*;
+        // The click on the button that shows the hidden icons sends the app
+        // nothing; the icon among them sends what it sends on the taskbar.
+        assert!(after(false, &[Down(20.0), Up(20.1)]));
+        assert!(after(false, &[Down(20.0), Up(20.08), DoubleDown(20.25), LostFocus(20.26), Up(20.33)]));
+        // With the panel open, the click on that button takes the focus and
+        // closes it; a click on the icon right after leaves it closed, as
+        // the click that closed it, and a later one opens it.
+        assert!(!after(true, &[LostFocus(30.0), Down(30.4), Up(30.5)]));
+        assert!(after(true, &[LostFocus(30.0), Down(30.4), Up(30.5), Down(31.5), Up(31.6)]));
     }
 
     #[test]

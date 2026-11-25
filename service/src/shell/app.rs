@@ -504,8 +504,9 @@ impl Shell {
                 let _ = self.port.send(Surface::Panel, Command::PanelShown(true));
             }
             Step::CloseOnBlur => {
-                self.toggle.closed_by_blur(now);
-                self.close_panel("it lost the focus");
+                if self.toggle.blur_closes(now) {
+                    self.close_panel("it lost the focus");
+                }
             }
             Step::Close if asked_to_close => self.close_panel("its window was asked to close"),
             Step::Close => self.close_panel("Esc"),
@@ -645,6 +646,10 @@ impl eframe::App for Shell {
                     log::info!("tray: left button down on the icon (the panel is {})", if open { "open" } else { "closed" });
                     self.toggle.press(open, now)
                 }
+                TrayEvent::DoublePress => {
+                    log::info!("tray: left button down again on the icon, a double click (the panel is {})", if open { "open" } else { "closed" });
+                    self.toggle.double_press(open, now)
+                }
                 TrayEvent::Release(rect) => {
                     let click = self.toggle.release(open, now);
                     log::info!("tray: left button up on the icon ({rect}): {click:?}");
@@ -652,6 +657,12 @@ impl eframe::App for Shell {
                         TrayClick::Open => self.open_panel(ctx, Some(rect), "a click on the tray icon"),
                         TrayClick::Close => self.close_panel("a click on the tray icon"),
                         TrayClick::Nothing => {}
+                        TrayClick::Keep => {
+                            if let Some(p) = &mut self.panel {
+                                p.forget_focus();
+                            }
+                            self.open_panel(ctx, None, "a double click on the tray icon");
+                        }
                     }
                 }
                 TrayEvent::Menu(id) => {
