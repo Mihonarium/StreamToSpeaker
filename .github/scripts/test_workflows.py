@@ -327,6 +327,94 @@ class WhatTheInstallerBundles(unittest.TestCase):
         self.assertLess(check, names.index("Stage + build release installer"))
 
 
+LEVELS = {"none": 0, "read": 1, "write": 2}
+
+
+def permissions_block(lines):
+    """{scope: level} of a `permissions:` block in `lines` (the lines of a
+    workflow's top level or of one job), or None when there is none.
+    `read-all` / `write-all` give every scope that level."""
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)permissions:\s*(\S*)\s*$", line)
+        if not m:
+            continue
+        if m.group(2) in ("read-all", "write-all"):
+            return {"*": m.group(2).split("-")[0]}
+        if m.group(2) == "{}":
+            return {}
+        out = {}
+        for nxt in lines[i + 1:]:
+            if not _content(nxt):
+                continue
+            if _depth(nxt) <= len(m.group(1)):
+                break
+            k = re.match(r"^\s*([a-z-]+):\s*([a-z]+)", nxt)
+            if k:
+                out[k.group(1)] = k.group(2)
+        return out
+    return None
+
+
+def workflow_permissions(name):
+    with open(os.path.join(WORKFLOWS_DIR, name), encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    top = []
+    for line in lines:
+        if line.rstrip() == "jobs:":
+            break
+        top.append(line)
+    return permissions_block(top)
+
+
+def job_permissions(name, job):
+    """What the job's token gets: its own block, else the workflow's."""
+    own = permissions_block(job_block(name, job))
+    return own if own is not None else workflow_permissions(name)
+
+
+def level(perms, scope):
+    if perms is None:
+        return None
+    return LEVELS[perms.get(scope, perms.get("*", "none"))]
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class ReusableWorkflowPermissions(unittest.TestCase):
+    """A job that calls a workflow of this repository grants it permissions
+    that the called workflow's jobs can only narrow: GitHub refuses the whole
+    run when a called job asks for more than the caller grants."""
+
+    def calls(self):
+        for name in sorted(os.listdir(WORKFLOWS_DIR)):
+            if not name.endswith(".yml"):
+                continue
+            for job, fields in job_fields(name).items():
+                m = re.fullmatch(r"\./\.github/workflows/([\w.-]+\.yml)", fields.get("uses", ""))
+                if m:
+                    yield name, job, m.group(1)
+
+    def test_every_called_job_asks_for_no_more_than_its_caller_grants(self):
+        calls = list(self.calls())
+        self.assertGreaterEqual(len(calls), 3)
+        bad = []
+        for name, job, called in calls:
+            grant = job_permissions(name, job)
+            self.assertIsNotNone(grant, f"{name} job {job} grants no explicit permissions")
+            for cjob in job_fields(called):
+                asked = job_permissions(called, cjob) or {}
+                for scope in asked:
+                    if scope == "*" or level(asked, scope) > level(grant, scope):
+                        bad.append(f"{called} job {cjob} asks {scope}: {asked[scope]}, "
+                                   f"but {name} job {job} grants {grant.get(scope, 'none')}")
+        self.assertEqual(bad, [])
+
+    def test_the_permission_reader(self):
+        lines = ["    permissions:", "      contents: write   # x", "      actions: read", "    steps:"]
+        self.assertEqual(permissions_block(lines), {"contents": "write", "actions": "read"})
+        self.assertEqual(permissions_block(["    permissions: read-all"]), {"*": "read"})
+        self.assertIsNone(permissions_block(["    runs-on: x"]))
+
+
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
 class InstallerLifecycleFilter(unittest.TestCase):
     """build.yml's installer-changes job decides whether a pull request runs

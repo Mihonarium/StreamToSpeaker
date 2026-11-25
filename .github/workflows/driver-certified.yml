@@ -427,7 +427,6 @@ jobs:
       contents: write            # publishes the package and manifest
       id-token: write            # build-provenance attestation (public repo only)
       attestations: write
-      actions: read              # the artifacts of the jobs before
     concurrency:
       group: driver-release-writes
       cancel-in-progress: false
