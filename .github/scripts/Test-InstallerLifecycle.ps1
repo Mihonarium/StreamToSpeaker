@@ -881,6 +881,19 @@ function Assert-Removed([string]$app, [string]$uninstallLog) {
     Check ($rules.Count -eq 0) "no Windows Firewall rule for the app left (left: $(@($rules | ForEach-Object DisplayName) -join ', '))"
     $text = Read-Text $uninstallLog
     Check ($text.Contains("[uninstall-driver]")) "the uninstall log records the driver removal"
+    # What the uninstaller says it couldn't remove ("left:"), and what it
+    # says stays because Windows refuses to delete it ("stays:": the cached
+    # entry of the sound output).
+    $left = @([regex]::Matches($text, '(?m) left: (.*?)\r?$') | ForEach-Object { $_.Groups[1].Value })
+    Check ($left.Count -eq 0) "the uninstaller names nothing it couldn't remove (named: $($left -join '; '))"
+    $stays = @([regex]::Matches($text, '(?m) stays: (.*?)\r?$') | ForEach-Object { $_.Groups[1].Value })
+    foreach ($line in $stays) { Warn "the uninstaller says this stays on the PC: $line" }
+    $outputs = @(Get-SoundOutputs)
+    foreach ($o in $outputs) { Write-Host "  still in Windows' cache of sound outputs: $($o.name), state $($o.state)" }
+    Check (@($outputs | Where-Object { $_.state -eq 1 -or $_.state -eq 2 }).Count -eq 0) "Windows has no $AppName sound output after the uninstall"
+    if ($outputs.Count -gt $stays.Count) {
+        Warn "Windows' cache of sound outputs still holds $($outputs.Count) $AppName entries whose device is gone, and the uninstaller named $($stays.Count)"
+    }
     Assert-Sentinel
 }
 
@@ -910,10 +923,12 @@ function Get-AppStartedSince([string]$app, [datetime]$since) {
 }
 
 # Re-runs this build's installer while a copy of the app runs: Setup must
-# close it without asking (silent) and finish. It starts the app again only
-# for the account whose copy it closed: this one's, or none when the copy
-# was another account's. Nothing here depends on what the app writes when it
-# starts.
+# close it without asking (silent) and finish. Setup runs with administrator
+# rights here, started by a process that has them, so it can't start the app
+# without those rights: it must start no copy, whoever's copy it closed, and
+# say why. (Starting the app again for the person, which Setup does when
+# Windows asked for administrator rights at its start, can't be seen here.)
+# Nothing here depends on what the app writes when it starts.
 function Invoke-SetupOverRunningApp([string]$label, [pscredential]$Credential = $null) {
     $app = Get-AppDir
     $port = if ($Credential) { 59012 } else { 59011 }
@@ -925,19 +940,19 @@ function Invoke-SetupOverRunningApp([string]$label, [pscredential]$Credential = 
         Check $p.HasExited "Setup closed the running app (process $($p.Id))"
         $log = "$($outcome.log)"
         $started = @(Get-AppStartedSince $app $since)
+        Check (-not $log.Contains("Started Stream To Speaker again.") -and -not $started.Count) "Setup started no copy of the app (started: $($started -join ', '))"
         if ($Credential) {
-            Check ($log -match 'running-copies: mine=0 other=1') "Setup saw the copy as another account's"
-            Check (-not $log.Contains("Started Stream To Speaker again.") -and -not $started.Count) "Setup started no copy in this account, where none ran (started: $($started -join ', '))"
-            Check ($log.Contains("the copy Setup closed ran in another account")) "Setup's log says why it started none"
+            Check ($log.Contains("running-copies: mine=0 other=1 closed=ok closed-mine=0 closed-other=1 person=known start=no settings=yes signin=none")) "Setup saw the copy as another account's and closed it"
+            Check ($log.Contains("Not starting Stream To Speaker again: the copy Setup closed ran in another account.")) "Setup's log says why it started none"
         } else {
-            Check ($log -match 'running-copies: mine=1 other=0') "Setup saw the copy as this account's"
-            Check ($log.Contains("Started Stream To Speaker again.")) "Setup started the app again after the silent update"
+            Check ($log.Contains("running-copies: mine=1 other=0 closed=ok closed-mine=1 closed-other=0 person=known start=no settings=yes signin=none")) "Setup saw the copy as this account's, closed it, and found that it can't start the app without administrator rights"
+            Check ($log.Contains("Not starting Stream To Speaker again: Setup was started with administrator rights, and the app would run with them too.")) "Setup's log says why it started none"
         }
         Assert-Installed -Full -Outcome $outcome
     } finally {
         if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
         foreach ($id in @(Get-AppStartedSince $app $since)) {
-            Write-Host "  ending the copy Setup started (process $id)"
+            Write-Host "  ending a copy that was started during the run (process $id)"
             Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
         }
     }
@@ -1102,9 +1117,11 @@ switch ($Phase) {
     }
     "other-account" {
         $user = "stslifecycle"
-        $password = "Sts-" + [guid]::NewGuid().ToString("N").Substring(0, 16) + "!a1"
-        & net.exe user $user $password /add /comment:"installer lifecycle test" | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "could not create the local account $user" }
+        # 14 characters: net.exe asks a question about a longer password,
+        # and nobody is there to answer it.
+        $password = "St1!" + [guid]::NewGuid().ToString("N").Substring(0, 9) + "z"
+        $said = @(& net.exe user $user $password /add /comment:"installer lifecycle test" 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "could not create the local account ${user}: $($said -join ' ')" }
         try {
             Start-Service seclogon -ErrorAction SilentlyContinue
             $cred = New-Object System.Management.Automation.PSCredential($user, (ConvertTo-SecureString $password -AsPlainText -Force))
