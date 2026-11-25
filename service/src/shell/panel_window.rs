@@ -5,6 +5,7 @@
 //! frames come from the shell; Windows' part goes through [`Desktop`].
 
 use super::placement::{self, Placement, PxRect};
+use super::passes::Passes;
 use super::{Ask, Desktop, PanelMode};
 use crate::model::command::Command;
 use crate::panel::{PanelState, WIDTH};
@@ -152,17 +153,12 @@ pub struct Drawn {
     pub asks: Vec<Ask>,
 }
 
-/// What the panel's window did over a frame, all of egui's passes in it
-/// together.
+/// What the panel's window did over a frame: what its content did over
+/// egui's passes (its Esc is the content being done), and where the panel
+/// moved on to in its life.
 #[derive(Default)]
 pub struct FrameOutput {
-    pub commands: Vec<Command>,
-    pub asks: Vec<Ask>,
-    /// Its window was asked to close (its ×, Alt+F4).
-    pub asked_to_close: bool,
-    /// Esc.
-    pub esc: bool,
-    /// Where the panel moved on to in its life.
+    pub passes: Passes,
     pub step: Step,
 }
 
@@ -280,11 +276,8 @@ impl PanelWindow {
     }
 
     /// One of egui's passes over the panel's window; `draw` draws what it
-    /// shows. egui runs a frame twice when its first pass asks to (the
-    /// panel does when its parts change height) and keeps the second
-    /// pass's drawing, but gives that pass no input: a key, a click on a
-    /// row or a request to close the window comes to the first pass only.
-    /// So what every pass sends and sees is gathered in `frame`, and the
+    /// shows. What every pass sends and sees is gathered in `frame` (see
+    /// [`super::passes`]: the second of two passes gets no input), and the
     /// panel moves on in its life once a frame, in the pass egui keeps.
     pub fn pass(
         &mut self,
@@ -295,24 +288,18 @@ impl PanelWindow {
         desktop: &mut dyn Desktop,
         draw: impl FnOnce(&egui::Context, &mut PanelWindow) -> Drawn,
     ) {
-        let (focused, inner_height, close) = ctx.input(|i| {
+        // Its × (the small-window form), or anything else that asks the
+        // window to close: the shell closes it.
+        frame.passes.notice_close(ctx);
+        let (focused, inner_height) = ctx.input(|i| {
             let v = i.viewport();
-            (v.focused, v.inner_rect.map(|r| r.height()), v.close_requested())
+            (v.focused, v.inner_rect.map(|r| r.height()))
         });
-        if close {
-            // Its × (the small-window form), or anything else that asks
-            // the window to close: the shell closes it.
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        }
         let drawn = draw(ctx, self);
-        frame.commands.extend(drawn.commands);
-        frame.asks.extend(drawn.asks);
-        frame.asked_to_close |= close;
-        frame.esc |= drawn.esc;
-        if ctx.will_discard() {
+        if !frame.passes.end(ctx, drawn.esc, drawn.commands, drawn.asks) {
             return;
         }
-        let seen = Seen { natural_height: drawn.natural_height, close: frame.esc || frame.asked_to_close, inner_height, focused };
+        let seen = Seen { natural_height: drawn.natural_height, close: frame.passes.ends_the_window(), inner_height, focused };
         frame.step = self.after_frame(seen, pinned, mode, desktop);
         for command in commands(frame.step) {
             ctx.send_viewport_cmd(command);
@@ -732,15 +719,15 @@ mod tests {
         // Esc.
         let mut p = PanelWindow::open(None);
         let f = frame_twice(&ctx, &mut p, &mut d, vec![key(egui::Key::Escape)], false);
-        assert_eq!((f.step, f.esc, f.asked_to_close), (Step::Close, true, false));
+        assert_eq!((f.step, f.passes.done, f.passes.asked_to_close), (Step::Close, true, false));
         // A request to close its window.
         let mut p = PanelWindow::open(None);
         let f = frame_twice(&ctx, &mut p, &mut d, Vec::new(), true);
-        assert_eq!((f.step, f.asked_to_close), (Step::Close, true));
+        assert_eq!((f.step, f.passes.asked_to_close), (Step::Close, true));
         // A command from the content (a click on a row).
         let mut p = PanelWindow::open(None);
         let f = frame_twice(&ctx, &mut p, &mut d, vec![key(egui::Key::A)], false);
-        assert_eq!(f.commands, vec![Command::Quit]);
+        assert_eq!(f.passes.commands, vec![Command::Quit]);
         assert_eq!(f.step, Step::Wait);
     }
 

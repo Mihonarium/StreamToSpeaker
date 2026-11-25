@@ -62,6 +62,18 @@ pub fn popup_builder(kind: PopupKind, size: Vec2, shown: bool) -> ViewportBuilde
         .with_taskbar(false)
 }
 
+/// One pass over a small window: `content` drawn in its card. Whether it
+/// is done (clicked, or its time up) is gathered in `passes` over the
+/// frame's passes (see [`super::passes`]).
+pub fn popup_pass(ctx: &egui::Context, passes: &mut super::passes::Passes, content: &mut dyn PopupContent, snap: &Snapshot, now: f64) {
+    let t = crate::ui::theme::Theme::of(ctx);
+    let done = egui::CentralPanel::default()
+        .frame(egui::Frame::none().fill(t.c.surface).stroke(t.card_stroke()))
+        .show(ctx, |ui| content.show(ui, snap, now, &mut |_| {}))
+        .inner;
+    passes.end(ctx, done, Vec::new(), Vec::new());
+}
+
 /// Where a popup of `size` points goes: the corner by the clock, on the
 /// monitor of the tray icon; above `under` when another popup or the panel
 /// is already there.

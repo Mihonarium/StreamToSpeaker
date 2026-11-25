@@ -14,7 +14,8 @@ use windows_sys::Win32::Foundation::HWND;
 
 use super::content::WantedGate;
 use super::panel_window::{Drawn, FrameOutput, OpenView, PanelWindow, Step, Toggle, TrayClick};
-use super::popup::{popup_builder, popup_rect, PopupContent, PopupKind, StandInPopup};
+use super::passes::{dialog_pass, Passes};
+use super::popup::{popup_builder, popup_pass, popup_rect, PopupContent, PopupKind, StandInPopup};
 use super::views::ViewMemory;
 use super::tray::{Tray, TrayEvent};
 use super::placement::PxRect;
@@ -497,11 +498,11 @@ impl Shell {
                     self.close_panel("it lost the focus");
                 }
             }
-            Step::Close if frame.asked_to_close => self.close_panel("its window was asked to close"),
+            Step::Close if frame.passes.asked_to_close => self.close_panel("its window was asked to close"),
             Step::Close => self.close_panel("Esc"),
             Step::Wait => {}
         }
-        (frame.commands, frame.asks)
+        (frame.passes.commands, frame.passes.asks)
     }
 
     /// Draw the small windows that must not take the focus; place a new
@@ -534,15 +535,12 @@ impl Shell {
                     p.style = Some(ex);
                 }
             }
-            let t = theme::Theme::of(ctx);
-            let content = &mut p.content;
-            let gone = ctx.show_viewport_immediate(popup_id(p.kind), popup_builder(p.kind, size, p.rect.is_some()).with_icon(app_icon()), |ctx, _class| {
-                egui::CentralPanel::default()
-                    .frame(Frame::none().fill(t.c.surface).stroke(t.card_stroke()))
-                    .show(ctx, |ui| content.show(ui, snap, now, &mut |_| {}))
-                    .inner
+            let mut passes = Passes::default();
+            let content = p.content.as_mut();
+            ctx.show_viewport_immediate(popup_id(p.kind), popup_builder(p.kind, size, p.rect.is_some()).with_icon(app_icon()), |ctx, _class| {
+                popup_pass(ctx, &mut passes, &mut *content, snap, now)
             });
-            if !gone {
+            if !passes.ends_the_window() {
                 under = p.rect.or(under);
                 ctx.request_repaint_after(Duration::from_millis(250));
                 keep.push(p);
@@ -576,24 +574,20 @@ impl Shell {
     fn dialog_frame(&mut self, ctx: &egui::Context, snap: &Snapshot) -> Vec<Ask> {
         let Some(mut content) = self.dialog.take() else { return Vec::new() };
         let builder = self.dialog_builder(content.as_ref(), snap);
-        let mut asks = Vec::new();
-        let keep = ctx.show_viewport_immediate(dialog_id(), builder, |ctx, _class| {
-            let closing = ctx.input(|i| i.viewport().close_requested());
-            if closing {
-                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-                content.closed();
-            }
-            let done = content.show(ctx, snap, &mut |a| asks.push(a));
-            !(closing || done)
-        });
-        if keep {
+        let mut passes = Passes::default();
+        ctx.show_viewport_immediate(dialog_id(), builder, |ctx, _class| dialog_pass(ctx, &mut passes, content.as_mut(), snap));
+        if passes.asked_to_close {
+            // Its ×: undo what the dialog started.
+            content.closed();
+        }
+        if !passes.ends_the_window() {
             self.dialog = Some(content);
         } else {
             let still = self.contents.wanted().map(|(k, _)| k);
             self.wanted.closed(still.as_deref());
             self.dialog = self.waiting.pop_front();
         }
-        asks
+        passes.asks
     }
 }
 

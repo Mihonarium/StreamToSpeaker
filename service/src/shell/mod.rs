@@ -15,6 +15,7 @@ pub mod content;
 mod eframe_model;
 pub mod icons;
 pub mod panel_window;
+pub mod passes;
 pub mod placement;
 pub mod popup;
 pub mod scenes;
