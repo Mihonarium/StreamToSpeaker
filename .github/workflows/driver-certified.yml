@@ -469,19 +469,23 @@ jobs:
         with:
           subject-path: canonical/${{ needs.verify.outputs.signed_zip_name }}
 
-      # The same canonical package again (canonical_zip is deterministic),
-      # Microsoft's zip unless the release holds it already, the .sha256
-      # sidecars and the bundle, then the notes, then manifest.json last.
+      # The very package verify made and the provenance names (release
+      # checks it holds Microsoft's files and is the file the bundle
+      # attests; it never makes one again), Microsoft's zip unless the
+      # release holds it already, the .sha256 sidecars and the bundle, then
+      # the notes, then manifest.json last.
       - name: Publish canonical package + manifest (certified=true)
         env:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          SIGNED_ZIP_NAME: ${{ needs.verify.outputs.signed_zip_name }}
         run: |
           set -euo pipefail
           # An empty id (the ms_zip_asset path may have none) reaches python
           # as an empty argument.
           args=(--repo "$GITHUB_REPOSITORY" --tag "$TAG" --version "$VERSION" --commit "$COMMIT"
                 --source-hash "$SOURCE_HASH" --product-id "$PRODUCT_ID" --submission-id "$SUBMISSION_ID"
-                --os "$SIGNATURES" --ms-zip "packages/$MS_ZIP" --lab-zip "packages/$LAB_ZIP")
+                --os "$SIGNATURES" --ms-zip "packages/$MS_ZIP" --lab-zip "packages/$LAB_ZIP"
+                --signed-zip "canonical/$SIGNED_ZIP_NAME")
           if [ -n "$REPORT_ID" ]; then args+=(--report-id "$REPORT_ID"); fi
           if [ -n "$BUNDLE_PATH" ]; then args+=(--bundle "$BUNDLE_PATH"); fi
           python3 .github/scripts/certified.py release "${args[@]}"

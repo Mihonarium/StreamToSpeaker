@@ -795,6 +795,11 @@ def cmd_attested_record(a, run):
     with open(a.signed_zip, "rb") as fh:
         data = fh.read()
     digest = sha256(data)
+    if a.bundle:
+        from release_draft import bundle_problem  # imports repro_compare, which comes back here
+        problem = bundle_problem(a.bundle, zip_name, digest)
+        if problem:
+            raise ReleaseError(f"not publishing a file its provenance doesn't name: {problem}")
     dr.put(data, zip_name)
     dr.put(f"{digest}  {zip_name}".encode("ascii"), zip_name + ".sha256")
     if a.bundle:

@@ -30,8 +30,10 @@ Subcommands:
             to tie an attestation return to the submitted binary)
   package   verify, then write the canonical -Signed.zip locally (so its
             provenance can be attested before anything is published)
-  release   put the canonical -Signed.zip (and its provenance bundle) on
-            the driver-v<ver> release (creates it when missing), then
+  release   put the canonical -Signed.zip that `package` made (--signed-zip:
+            the very file, checked against Microsoft's zip and against the
+            digest its provenance bundle names) and the bundle on the
+            driver-v<ver> release (creates it when missing), then
             manifest.json, last. A certified release is never changed
             (driver_release.py); the same inputs again change nothing.
 Stdlib only; release asset I/O goes through the gh CLI.
@@ -197,9 +199,20 @@ def verify_packages(ms_zip, lab_zip, version=None):
     return problems
 
 
+# The "version made by" host recorded for each entry. zipfile takes it
+# from the platform it runs on (0 on Windows, 3 elsewhere); pinned to 0, the
+# host of every package made on Windows (driver-v1.1.1.211's published
+# Signed.zip among them), so the same inputs give the same bytes anywhere.
+# A published package keeps the host it was made with (driver-v1.1.0.209's,
+# made on Linux, records 3): nothing rebuilds a published package, every
+# check compares it with the SHA-256 its manifest records.
+ZIP_HOST = 0
+
+
 def canonical_zip(ms_zip):
     """Flat StreamToSpeaker.{inf,sys,cat} zip of Microsoft's package, with
-    fixed timestamps so the same input always gives the same bytes."""
+    fixed timestamps, attributes and host, so the same input always gives
+    the same bytes on every platform."""
     ms = read_package(ms_zip)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -207,8 +220,22 @@ def canonical_zip(ms_zip):
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
+            info.create_system = ZIP_HOST
             z.writestr(info, ms[name.lower()])
     return buf.getvalue()
+
+
+def signed_zip_problem(signed_zip, ms_zip):
+    """None when `signed_zip` is a package of exactly the inf/sys/cat in
+    Microsoft's zip, else what is wrong."""
+    try:
+        got, want = read_package(signed_zip), read_package(ms_zip)
+    except (ValueError, zipfile.BadZipFile) as e:
+        return f"the canonical package can't be read: {e}"
+    differ = [n for n in PACKAGE_FILES if got[n.lower()] != want[n.lower()]]
+    if differ:
+        return f"the canonical package's {', '.join(differ)} differ from Microsoft's zip"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -528,10 +555,22 @@ def cmd_package(a):
 
 
 def cmd_release(a):
+    """Publish the canonical package the verify job made (--signed-zip, the
+    file its provenance was made for), never one made again here."""
     checked = checked_package(a)
     if not checked:
         return 1
-    ms, lab, signed = checked
+    ms, lab, _ = checked
+    with open(a.signed_zip, "rb") as f:
+        signed = f.read()
+    problem = signed_zip_problem(signed, ms)
+    if problem:
+        raise driver_release.ReleaseError(problem)
+    if a.bundle:
+        from release_draft import bundle_problem  # imports repro_compare, which imports this module
+        problem = bundle_problem(a.bundle, os.path.basename(a.signed_zip), hashlib.sha256(signed).hexdigest())
+        if problem:
+            raise driver_release.ReleaseError(f"not publishing a file its provenance doesn't name: {problem}")
     m = build_manifest(a.version, a.commit, a.source_hash, a.product_id, a.submission_id,
                        [s.strip() for s in a.os.split(",") if s.strip()], a.report_id, ms, lab, signed)
     tag = a.tag or f"driver-v{a.version}"
@@ -586,6 +625,8 @@ def main(argv=None):
     s.set_defaults(fn=cmd_package)
     s = sub.add_parser("release")
     s.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
+    s.add_argument("--signed-zip", required=True,
+                   help="the canonical package `package` made, published as it is (its provenance names it)")
     s.add_argument("--bundle", help="provenance bundle of the Signed.zip, published as <Signed.zip>.sigstore.json")
     s.add_argument("--tag"); s.add_argument("--version", required=True)
     s.add_argument("--commit", required=True); s.add_argument("--source-hash", required=True)

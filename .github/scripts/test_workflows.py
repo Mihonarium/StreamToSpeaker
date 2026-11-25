@@ -415,6 +415,81 @@ class ReusableWorkflowPermissions(unittest.TestCase):
         self.assertIsNone(permissions_block(["    runs-on: x"]))
 
 
+def env_of(lines):
+    """{NAME: value} of the `env:` block directly in `lines` (a job's or a
+    step's own lines)."""
+    out, inside, depth = {}, False, None
+    for line in lines:
+        if not _content(line):
+            continue
+        m = re.match(r"^(\s*)(?:- )?env:\s*$", line)
+        if m:
+            inside, depth = True, len(m.group(1))
+            continue
+        if inside:
+            if _depth(line) <= depth:
+                inside = False
+                continue
+            k = re.match(r"^\s*([A-Z][A-Z0-9_]*):\s*(.*?)\s*$", line)
+            if k:
+                out[k.group(1)] = k.group(2)
+    return out
+
+
+def substituted(text, env):
+    """`text` with $NAME, ${NAME} and $env:NAME replaced by the env value
+    they name, quotes dropped."""
+    def sub(m):
+        return env.get(m.group(1) or m.group(2) or m.group(3), m.group(0))
+    text = re.sub(r"\$env:([A-Z][A-Z0-9_]*)|\$\{([A-Z][A-Z0-9_]*)\}|\$([A-Z][A-Z0-9_]*)", sub, text)
+    return text.replace('"', "").replace("'", "")
+
+
+UPLOADED_RE = re.compile(r"--signed-zip\s+(\S+)|release_draft\.py\s+upload\s+\S+\s+(\S+)"
+                         r"|gh\s+release\s+upload\s+\S+\s+(\S+)")
+REMAKE_RE = re.compile(r"certified\.py\s+package\b|Compress-Archive\b|canonical_zip\(")
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class WhatIsAttestedIsWhatIsPublished(unittest.TestCase):
+    """A job that makes a provenance attestation uploads the very file the
+    attestation names, and nothing in that job makes the file again after
+    it was attested."""
+
+    def test_every_attested_file_is_the_file_the_job_uploads(self):
+        checked, bad = 0, []
+        for name in sorted(os.listdir(WORKFLOWS_DIR)):
+            if not name.endswith(".yml"):
+                continue
+            for job, steps in jobs_steps(name).items():
+                attests = [i for i, st in enumerate(steps)
+                           if "attest-build-provenance@" in (step_field(st, "uses") or "")]
+                if not attests:
+                    continue
+                job_env = env_of(job_block(name, job))
+                subject = substituted(step_with(steps[attests[0]], "subject-path") or "", job_env)
+                uploaded = set()
+                for st in steps:
+                    env = dict(job_env, **env_of(st))
+                    for line in step_script(st):
+                        for m in UPLOADED_RE.finditer(line):
+                            # (a bash array's closing parenthesis is not part of it)
+                            uploaded.add(substituted(next(g for g in m.groups() if g), env).rstrip(")"))
+                checked += 1
+                if subject not in uploaded:
+                    bad.append(f"{name} job {job}: attests {subject}, uploads {sorted(uploaded)}")
+                for st in steps[attests[0] + 1:]:
+                    if any(REMAKE_RE.search(line) for line in step_script(st)):
+                        bad.append(f"{name} job {job}: {step_field(st, 'name')} makes a file again after it was attested")
+        self.assertGreaterEqual(checked, 4)
+        self.assertEqual(bad, [])
+
+    def test_the_readers(self):
+        self.assertEqual(env_of(["    env:", "      A: x", "      B: ${{ y }}", "    steps:"]), {"A": "x", "B": "${{ y }}"})
+        self.assertEqual(substituted('--signed-zip "canonical/$NAME" $env:X', {"NAME": "${{ a }}", "X": "b"}),
+                         "--signed-zip canonical/${{ a }} b")
+
+
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
 class InstallerLifecycleFilter(unittest.TestCase):
     """build.yml's installer-changes job decides whether a pull request runs

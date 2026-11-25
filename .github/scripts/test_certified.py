@@ -13,6 +13,8 @@ import zipfile
 
 import certified
 import fake_gh
+import sys
+from test_release_draft import bundle_for
 
 # The real 1.1.0.209 packages, when this box has them (dev machine only;
 # CI runs the synthetic tests).
@@ -148,6 +150,18 @@ def zip_of(files):
     return buf.getvalue()
 
 
+def zip_with_host(ms_zip, host):
+    """canonical_zip's bytes as a build that records `host` would make them."""
+    real = zipfile.ZipInfo.__init__
+
+    def init(self, *a, **kw):
+        real(self, *a, **kw)
+        self.create_system = host
+    with unittest.mock.patch.object(zipfile.ZipInfo, "__init__", init), \
+            unittest.mock.patch.object(certified, "ZIP_HOST", host, create=True):
+        return certified.canonical_zip(ms_zip)
+
+
 def fake_packages(sys_code=b"K" * 64):
     inf = b"[Version]\r\nDriverVer = 09/18/2026,1.1.0.209\r\n"
     lab = zip_of({"StreamToSpeaker.inf": inf,
@@ -203,6 +217,31 @@ class VerifyPackages(unittest.TestCase):
             certified.read_package(zip_of({"a/StreamToSpeaker.sys": b"1", "b/StreamToSpeaker.sys": b"2",
                                            "StreamToSpeaker.inf": b"", "StreamToSpeaker.cat": b""}))
 
+    def test_canonical_zip_is_the_same_on_every_platform(self):
+        # zipfile records the platform that made an entry (the "version
+        # made by" host: 0 on Windows, 3 elsewhere), so the same inputs made
+        # different zips on the Windows verify job and the Linux publish
+        # job. The builder pins it to 0, the host of every Windows-made
+        # package (driver-v1.1.1.211's published one among them).
+        ms, _ = fake_packages()
+        made = {}
+        real = sys.platform
+        for platform in ("win32", "linux"):
+            sys.platform = platform
+            try:
+                made[platform] = certified.canonical_zip(ms)
+            finally:
+                sys.platform = real
+        self.assertEqual(made["win32"], made["linux"])
+        self.assertEqual({i.create_system for i in zipfile.ZipFile(io.BytesIO(made["linux"])).infolist()}, {0})
+        # What used to differ: only that host byte of each central
+        # directory entry.
+        unix = zip_with_host(ms, 3)
+        self.assertEqual(len(unix), len(made["linux"]))
+        differ = [i for i, (a, b) in enumerate(zip(unix, made["linux"])) if a != b]
+        self.assertEqual(len(differ), len(certified.PACKAGE_FILES))
+        self.assertTrue(all(unix[i] == 3 and made["linux"][i] == 0 for i in differ))
+
     def test_canonical_zip_is_flat_and_deterministic(self):
         ms, _ = fake_packages()
         z1, z2 = certified.canonical_zip(ms), certified.canonical_zip(ms)
@@ -236,10 +275,15 @@ class PublishingTheRelease(unittest.TestCase):
         fake.add_release(self.TAG, {self.LAB: self.lab, **assets}, target=self.COMMIT)
         return fake
 
-    def release(self, fake, *extra):
+    def release(self, fake, *extra, signed=None):
+        # The canonical package as the verify job hands it to publish.
+        if not os.path.exists("signed.zip") or signed is not None:
+            with open("signed.zip", "wb") as fh:
+                fh.write(certified.canonical_zip(self.ms) if signed is None else signed)
         argv = ["release", "--repo", self.REPO, "--tag", self.TAG, "--version", "1.1.0.209",
                 "--commit", self.COMMIT, "--source-hash", "5" * 64, "--product-id", "1",
-                "--submission-id", "2", "--ms-zip", "ms.zip", "--lab-zip", "lab.zip", *extra]
+                "--submission-id", "2", "--ms-zip", "ms.zip", "--lab-zip", "lab.zip",
+                "--signed-zip", "signed.zip", *extra]
         with unittest.mock.patch("subprocess.run", fake_gh.subprocess_run(fake)), \
                 unittest.mock.patch("sys.stdout", io.StringIO()):
             try:
@@ -274,6 +318,31 @@ class PublishingTheRelease(unittest.TestCase):
         self.assertEqual(files[self.SIGNED], b"an earlier attempt's zip")
         self.assertEqual(files[self.LAB], self.lab)
         self.assertNotIn("manifest.json", files)
+
+    def test_what_is_published_is_the_file_it_is_given(self):
+        # The file the verify job made and the provenance names, not one
+        # made again here.
+        other_host = zip_with_host(self.ms, 3)
+        fake = self.fake()
+        self.assertEqual(self.release(fake, signed=other_host), 0)
+        self.assertEqual(fake.files(self.TAG)[self.SIGNED], other_host)
+        self.assertEqual(fake.manifest(self.TAG)["signed_zip_sha256"], hashlib.sha256(other_host).hexdigest())
+
+    def test_a_file_the_provenance_does_not_name_is_refused(self):
+        fake = self.fake()
+        with open("bundle.json", "wb") as fh:
+            fh.write(bundle_for(b"another zip", self.SIGNED))
+        self.assertNotEqual(self.release(fake, "--bundle", "bundle.json"), 0)
+        self.assertEqual(fake.writes(), [])
+        with open("bundle.json", "wb") as fh:
+            fh.write(bundle_for(certified.canonical_zip(self.ms), self.SIGNED))
+        self.assertEqual(self.release(fake, "--bundle", "bundle.json"), 0)
+        self.assertIn(self.SIGNED + ".sigstore.json", fake.files(self.TAG))
+
+    def test_a_zip_that_is_not_microsofts_package_is_refused(self):
+        fake = self.fake()
+        self.assertNotEqual(self.release(fake, signed=certified.canonical_zip(fake_packages(b"L" * 64)[0])), 0)
+        self.assertEqual(fake.writes(), [])
 
     def test_a_certified_release_is_never_changed(self):
         fake = self.fake()

@@ -636,8 +636,12 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
      what the kernel relies on), and a *Microsoft Windows Hardware
      Compatibility Publisher* signature on the `.sys` at any index of
      `signtool verify /all`.
-   Then it makes the canonical flat `…-Signed.zip`, and the job `publish`
-   (main only, never in a dry run) attests its provenance and publishes
+   Then it makes the canonical flat `…-Signed.zip` (the same bytes on any
+   platform: the zip's "version made by" host is pinned to 0, as in every
+   Windows-made package), and the job `publish` (main only, never in a dry
+   run) attests the provenance of that very file and publishes it — it
+   checks that the file holds Microsoft's files and is the one the
+   provenance names, and never makes one again — with
    `StreamToSpeaker-Driver-<ver>-Microsoft.zip`
    (as returned; the hand-attached lab package is checked, never uploaded
    again), the `…-Signed.zip`, the `.sha256` sidecars and the provenance
@@ -661,9 +665,15 @@ The script behind it is `.github/scripts/certified.py` (`inputs`, `hash`,
 `fetch`, `verify`, `package`, `park`, `release`; `inputs` checks every
 dispatch input and writes the values all later steps use; unit tests in
 `test_certified.py`, run in the workflow's guard step). `release` can be
-run locally with `gh` to publish a release from hand-downloaded files:
-the same inputs again change nothing, and a release that is already
-certified is never changed (other inputs are refused).
+run locally with `gh` to publish a release from hand-downloaded files,
+after `package` made the canonical zip it takes as `--signed-zip`: the
+same inputs again change nothing, and a release that is already
+certified is never changed (other inputs are refused). Published
+packages keep the bytes they were made with: `driver-v1.1.0.209`'s was
+made on Linux (host 3 in its headers), `driver-v1.1.1.211`'s on Windows
+(host 0, the form `package` makes everywhere now). Nothing rebuilds a
+published package: every check compares it with the SHA-256 its
+manifest records.
 
 ## Reproducibility check (`driver-reproducibility.yml`)
 

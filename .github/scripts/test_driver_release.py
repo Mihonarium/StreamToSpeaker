@@ -16,8 +16,10 @@ import driver_release as dr
 import fake_gh
 import release_assets as ra
 from fake_gh import FakeReleases, sha
+from test_release_draft import bundle_for
 
 REPO = "owner/repo"
+SIGNED_ZIP = "StreamToSpeaker-Driver-1.1.2.140-Signed.zip"
 COMMIT = "c0ffee" + "0" * 34
 OTHER = "badc0de" + "0" * 33
 MAIN = "refs/heads/main"
@@ -26,6 +28,10 @@ CAB_SHA = "ca" * 32
 TAG = "driver-v1.1.2.140"
 HEAD_COMMIT = "d" * 40
 CAB = "StreamToSpeaker-Driver-1.1.2.140-Submission.cab"
+
+
+# The provenance bundle of the canonical zip record() publishes.
+BUNDLE = bundle_for(b"canonical zip", SIGNED_ZIP)
 
 
 def Fake():
@@ -152,6 +158,16 @@ def returned_release(fake, version="1.1.2.140", **kw):
                             ms_zip_asset=f"StreamToSpeaker-Driver-{version}-Microsoft.zip", **kw)
     return fake.add_release(f"driver-v{version}", {"manifest.json": m, m["submission_cab"]: b"signed cab",
                                                     m["ms_zip_asset"]: b"ms zip"})
+
+
+class AttestedRecordPublishesWhatWasAttested(Base):
+    def test_a_zip_its_provenance_does_not_name_is_refused(self):
+        fake = Fake()
+        returned_release(fake)
+        before = fake.files(TAG)
+        self.assertEqual(self.record(fake, bundle=bundle_for(b"another zip", SIGNED_ZIP)), 1)
+        self.assertIn("provenance", self.output)
+        self.assertEqual(fake.files(TAG), before)
 
 
 class AFinishedReleaseIsNeverChanged(Base):
@@ -347,12 +363,12 @@ class EachWorkflowWritesOnlyWhatIsItsToAdvance(Base):
     def test_attested_record_finishes_a_returned_round(self):
         fake = Fake()
         returned_release(fake)
-        self.assertEqual(self.record(fake, bundle=b"{}"), 0, self.output)
+        self.assertEqual(self.record(fake, bundle=BUNDLE), 0, self.output)
         files = fake.files(TAG)
         zip_name = "StreamToSpeaker-Driver-1.1.2.140-Signed.zip"
         self.assertEqual(files[zip_name], b"canonical zip")
         self.assertEqual(files[zip_name + ".sha256"], f"{sha(b'canonical zip')}  {zip_name}".encode())
-        self.assertEqual(files[zip_name + ".sigstore.json"], b"{}")
+        self.assertEqual(files[zip_name + ".sigstore.json"], BUNDLE)
         m = fake.manifest(TAG)
         self.assertEqual((m["attested"], m["signed_zip"], m["signed_zip_sha256"]),
                          (True, zip_name, sha(b"canonical zip")))
@@ -515,7 +531,7 @@ class TheManifestIsWrittenLast(Base):
     def test_attested_record(self):
         fake = Fake()
         returned_release(fake)
-        self.assertEqual(self.record(fake, bundle=b"{}"), 0, self.output)
+        self.assertEqual(self.record(fake, bundle=BUNDLE), 0, self.output)
         self.assertManifestLast(fake)
 
     def test_a_manifest_that_records_a_missing_file_is_refused(self):
@@ -947,7 +963,7 @@ class NoTemporaryFolderIsLeftBehind(Base):
         with unittest.mock.patch.object(tempfile, "tempdir", tmp):
             fake = Fake()
             returned_release(fake)
-            self.assertEqual(self.record(fake, bundle=b"{}"), 0, self.output)
+            self.assertEqual(self.record(fake, bundle=BUNDLE), 0, self.output)
             fake.add_release("driver-v1.1.2.150", target=COMMIT)
             self.assertEqual(self.release(fake, "driver-v1.1.2.150"), 0, self.output)
             self.assertEqual(self.run_cmd(fake, "attested-fetch", "--tag", TAG, "--dry-run",
