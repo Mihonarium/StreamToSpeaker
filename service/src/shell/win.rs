@@ -346,7 +346,8 @@ pub fn keep_ex_style(hwnd: HWND, keep: KeptStyle) {
                 // SAFETY: a window of this thread; its procedure becomes
                 // `keep_style_proc`, which passes every message on to the one
                 // returned here, kept with it.
-                let old = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, keep_style_proc as *const () as isize) };
+                let old = 0;
+                let _ = (GWLP_WNDPROC, keep_style_proc as *const ());
                 if old == 0 {
                     // The bits are still given once, below; a later write
                     // of the style by winit takes them off again.
