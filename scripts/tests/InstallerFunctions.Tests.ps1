@@ -768,6 +768,13 @@ Test 'sign-in entries are removed for every account that starts this install, an
     Assert-True (-not (Test-RunValueInFolder '"C:\Program Files\Stream To Speaker Beta\stream-to-speaker.exe"' $dir)) 'a folder with a longer name'
 }
 
+Test 'an account is named as Windows shows it, and by its ID where Windows has no name' {
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    Assert-Equal $me.Name (Get-AccountName $me.User.Value) 'the account that runs this'
+    Assert-Equal 'S-1-5-21-1-2-3-4999' (Get-AccountName 'S-1-5-21-1-2-3-4999') 'an ID no account has'
+    Assert-Equal '.DEFAULT' (Get-AccountName '.DEFAULT') 'not an ID'
+}
+
 Test 'sign-in entries that start an earlier folder''s copy start the new one' {
     $users = "$TestKey\MoveUsers"
     $run = 'Software\Microsoft\Windows\CurrentVersion\Run'

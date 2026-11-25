@@ -21,7 +21,7 @@ try {
     $n = Remove-SignInEntries -InstallDir $dir
     $left = @(Get-SignInAccounts -InstallDir $dir)
     if (-not $n -and -not $left.Count) { Write-Step 'No signed-in account starts Stream To Speaker at sign-in.' }
-    foreach ($account in $left) { Write-Host "left: the start-at-sign-in entry of the Windows account $account" }
+    foreach ($account in $left) { Write-Host "left: the start-at-sign-in entry of the Windows account $(Get-AccountName $account)" }
     if (-not $left.Count) { $exitCode = 0 }
 } catch {
     Write-Host "left: the start-at-sign-in entries of signed-in accounts (removing them failed: $($_.Exception.Message))"

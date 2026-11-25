@@ -968,6 +968,17 @@ function Get-SignInAccounts {
     }
 }
 
+# An account's name as Windows shows it ("PC\name") for its ID, for a
+# message a person reads. The ID itself where Windows has no name for it
+# (the account was deleted, its domain can't be reached).
+function Get-AccountName([string]$Id) {
+    try {
+        ([System.Security.Principal.SecurityIdentifier]$Id).Translate([System.Security.Principal.NTAccount]).Value
+    } catch {
+        $Id
+    }
+}
+
 # Removes the start-at-sign-in entry of each of those accounts; returns how
 # many are gone afterwards. An account that isn't signed in keeps its
 # entry, which points at a program that is gone and does nothing.
