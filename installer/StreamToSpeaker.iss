@@ -157,7 +157,7 @@ FinishedRestartMessage=Windows must restart to finish installing Stream To Speak
 ConfirmUninstall=Remove %1 from this PC?%n%nIt is closed in every account on this PC. Each account's settings and speakers are kept.
 UninstalledAll=%1's uninstall is finished.%n%nEach account's settings and speakers stay in its AppData\Roaming\StreamToSpeaker folder, and its log in AppData\Local\StreamToSpeaker, so installing it again brings them back. To remove them too, delete those folders.
 UninstalledMost=%1's uninstall is finished, but some of its files couldn't be removed: delete the folder Stream To Speaker in Program Files by hand.%n%nEach account's settings and speakers stay in its AppData\Roaming\StreamToSpeaker folder, and its log in AppData\Local\StreamToSpeaker. To remove them too, delete those folders.
-UninstalledAndNeedsRestart=%1's uninstall is finished. Its sound driver stays loaded until Windows restarts.%n%nEach account's settings and speakers stay in its AppData\Roaming\StreamToSpeaker folder, and its log in AppData\Local\StreamToSpeaker. To remove them too, delete those folders.%n%nRestart now?
+UninstalledAndNeedsRestart=%1's uninstall is finished. Until Windows restarts, its sound driver stays loaded and its sound output can still show in Windows' list of outputs.%n%nEach account's settings and speakers stay in its AppData\Roaming\StreamToSpeaker folder, and its log in AppData\Local\StreamToSpeaker. To remove them too, delete those folders.%n%nRestart now?
 
 [CustomMessages]
 DirRefused=Stream To Speaker installs only in %1: it installs a sound driver and runs parts of itself as administrator, so its files must be in a folder only administrators can change. Run Setup again without /DIR. Nothing was changed.

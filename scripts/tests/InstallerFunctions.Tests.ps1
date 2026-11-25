@@ -596,7 +596,7 @@ Test 'a device Windows removes only when it restarts is said so, and its output 
 Test 'a run that removed a device waits for its output to go, and a run that removed nothing does not wait' {
     New-World -Devices @(Fake-Device) -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint)
     $settling = $FakeTools.Clone()
-    # Windows records the output as not present a moment after its device went.
+    # Here the output shows as not present only after a moment.
     $settling.Pause = { Note 'Pause'; foreach ($e in @($script:W.Endpoints)) { $e.State = 4 } }
     Assert-Equal '' (@(Invoke-DriverRemoval -Tools $settling) -join ',') 'nothing left'
     Assert-Equal 1 (Called 'Pause') 'one wait'
@@ -606,6 +606,19 @@ Test 'a run that removed a device waits for its output to go, and a run that rem
     Assert-Equal '' (@(Invoke-DriverRemoval -Tools $settling) -join ',') 'nothing to say'
     Assert-Equal 0 (Called 'Pause') 'no wait'
     Assert-Equal 0 (Called 'RemoveEndpoints') 'the entry of an output that is still there is left alone'
+}
+
+Test 'a device that could not be removed is named, and its output is not waited for' {
+    New-World -Devices @(Fake-Device) -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint)
+    $failing = $FakeTools.Clone()
+    # As DevCon answers when it could not remove the device: exit code 2,
+    # and Windows still lists it.
+    $failing.RemoveDevice = { param($Id) Note "RemoveDevice:$Id"; 2 }
+    $failing.Pause = { Note 'Pause' }
+    $lines = @(Invoke-DriverRemoval -Tools $failing)
+    Assert-Equal 'left: the Stream To Speaker device ROOT\MEDIA\0000' $lines 'lines'
+    Assert-Equal 0 (Called 'Pause') 'no wait'
+    Assert-Equal 0 (Called 'RemoveEndpoints') 'the entry of its output is left alone'
 }
 
 Test 'the log names the app''s outputs, and no name a person chose' {

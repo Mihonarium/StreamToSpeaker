@@ -45,6 +45,7 @@ Write-Host '1/3  Removing the Stream To Speaker device...' -ForegroundColor Cyan
 $devices = @(Get-OurDevices)
 if (-not $devices.Count) { Write-Step 'There is none.' }
 $removedNow = 0
+$staying = 0
 foreach ($d in $devices) {
     $code = if ([IO.File]::Exists($StsDevcon)) {
         Remove-Device $d.InstanceId
@@ -53,7 +54,9 @@ foreach ($d in $devices) {
         # on Windows 10 version 2004 and later.
         Invoke-Tool -FilePath $StsPnputil -Arguments @('/remove-device', $d.InstanceId)
     }
-    if ($code -eq 0) { $removedNow++ }
+    # 0: the device is removed. 1 (devcon) and 3010 (pnputil): Windows
+    # removes it when it restarts. Anything else: it could not be removed.
+    if ($code -eq 0) { $removedNow++ } else { $staying++ }
     if ($code -ne 0 -and $code -ne 1 -and $code -ne 3010) { $problems += "the device $($d.InstanceId) is still there" }
 }
 
@@ -70,9 +73,10 @@ Write-Host "3/3  Clearing Windows' cached entries for the sound output..." -Fore
 # removes when it restarts is still there. Windows may keep an entry; one
 # that stays does nothing, because Setup's new device gets a new sound
 # output.
-# The output of a device that just went shows as gone a moment later.
+# The output of a device that just went can take a moment to show as gone.
+# While a device stays, so does its output: nothing to wait for.
 $all = @(Get-OurEndpoints)
-for ($i = 0; $i -lt 5 -and $removedNow -and @(Select-PresentEndpoints $all).Count; $i++) {
+for ($i = 0; $i -lt 5 -and $removedNow -and -not $staying -and @(Select-PresentEndpoints $all).Count; $i++) {
     Start-Sleep -Seconds 1
     $all = @(Get-OurEndpoints)
 }

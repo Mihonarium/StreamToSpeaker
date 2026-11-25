@@ -172,8 +172,9 @@ gone is deleted where Windows allows it; Windows can refuse, and an entry that
 stays does nothing (a new device gets an entry of its own). Run interactively,
 the uninstall asks for a restart when the driver was running, or when Windows
 removes the device only at the restart (after an update that itself waits for
-one); until then the device's sound output stays in Windows' list. It leaves
-each person's own folders, so a reinstall keeps their speakers and pairings:
+one); until then the device's sound output stays in Windows' list. The
+uninstall leaves each person's own folders, so a reinstall keeps their
+speakers and pairings:
 `%APPDATA%\StreamToSpeaker` (`config.json`, the settings, and `config.json.bak`,
 a second copy the app reads if the first is damaged) and
 `%LOCALAPPDATA%\StreamToSpeaker` (the log, `startup.txt`, and

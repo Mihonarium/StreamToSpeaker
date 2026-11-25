@@ -1604,18 +1604,20 @@ function Invoke-DriverRemoval([hashtable]$Tools = (New-DriverTools)) {
         Write-Step "Windows removes the device $id when it restarts. Until then its sound output stays in Windows' list."
         $lines += "removed-at-restart: the Stream To Speaker device $id"
     }
-    # The output of a device that just went shows as gone a moment later: a
-    # run that removed a device waits for that. An output that is still
-    # there belongs to a device Windows removes when it restarts (this run
-    # may be a second one, which no longer finds that device and has nothing
-    # to wait for).
+    # The output of a device that just went can take a moment to show as
+    # gone: a run that removed every device it found waits for that. While a
+    # device stays (until the restart, or because it could not be removed),
+    # so does its output, and there is nothing to wait for.
     $entries = @(& $Tools.GetEndpoints)
-    for ($i = 0; $i -lt 5 -and $removedNow -and -not $atRestart.Count -and @(Select-PresentEndpoints $entries).Count; $i++) {
+    for ($i = 0; $i -lt 5 -and $removedNow -and -not $atRestart.Count -and -not $stillThere.Count -and @(Select-PresentEndpoints $entries).Count; $i++) {
         $null = & $Tools.Pause
         $entries = @(& $Tools.GetEndpoints)
     }
     $present = @(Select-PresentEndpoints $entries).Count
-    if ($present -and -not $atRestart.Count) {
+    # An output that is listed although this run left no device behind
+    # belongs to a device an earlier run handed to the restart (the
+    # uninstaller runs the removal twice).
+    if ($present -and -not $atRestart.Count -and -not $stillThere.Count) {
         Write-Step "Windows still lists the app's sound output. It goes when Windows restarts."
     }
     $gone = @(Select-OrphanedEndpoints $entries)
