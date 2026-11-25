@@ -142,9 +142,14 @@ fn switches(read: bool, get: impl Fn(&str) -> Option<String>) -> impl Fn(&str) -
     move |name| if read { get(name) } else { None }
 }
 
-/// The app's mark, for the windows' title bars and taskbar buttons.
+/// The app's mark, for the windows' title bars and taskbar buttons: the
+/// same one every time. egui tells a window's icon from the one before by
+/// where it is kept, so a new copy on every frame would send every window
+/// its icon again on every frame.
 pub fn app_icon() -> std::sync::Arc<egui::IconData> {
-    std::sync::Arc::new(egui::IconData { rgba: include_bytes!("../../../assets/window-brand-64.rgba").to_vec(), width: 64, height: 64 })
+    static ICON: std::sync::OnceLock<std::sync::Arc<egui::IconData>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| std::sync::Arc::new(egui::IconData { rgba: include_bytes!("../../../assets/window-brand-64.rgba").to_vec(), width: 64, height: 64 }))
+        .clone()
 }
 
 /// The root window's title (no one sees it).

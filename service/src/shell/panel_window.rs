@@ -617,6 +617,23 @@ mod tests {
     }
 
     #[test]
+    fn a_window_gets_its_icon_when_it_is_made_and_not_again_every_frame() {
+        use super::super::popup::{popup_builder, PopupKind};
+        let icon_commands = |w: &Window| w.frames.iter().flatten().filter(|c| matches!(c, egui::ViewportCommand::Icon(_))).count();
+        for right_comparison in [false, true] {
+            let (panel, _) = panel_as_eframe_drives_it(PanelMode::Flyout, right_comparison);
+            assert_eq!(icon_commands(&panel), 0, "{right_comparison}");
+            let size = egui::Vec2::new(360.0, 96.0);
+            let builder = || popup_builder(PopupKind::Notification, size, true).with_icon(super::super::app_icon());
+            let mut popup = Window::made(builder(), right_comparison);
+            for k in 0..10 {
+                popup.frame(&builder(), Vec::new(), k == 0);
+            }
+            assert_eq!(icon_commands(&popup), 0, "{right_comparison}");
+        }
+    }
+
+    #[test]
     fn once_a_popup_is_shown_nothing_hides_its_window() {
         use super::super::popup::{popup_builder, PopupKind};
         for right_comparison in [false, true] {
