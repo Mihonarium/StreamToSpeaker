@@ -178,9 +178,12 @@ the write: one API call, well under a second. If that happens, the
 release shows it in one of two ways. Either it holds `<name>.pending` and
 no `<name>` (see Troubleshooting), or a release that had just been
 finished got the other job's `manifest.json`. In the second case, the run
-that finished it records the manifest it wrote in its summary; put that
-back (upload it as `manifest.json.pending`, then delete `manifest.json`
-and rename the pending one).
+that finished it shows the manifest it wrote in its summary, under
+"manifest.json written to `driver-v<ver>`"; put that one back. Save it as
+a file named `manifest.json.pending`, upload it
+(`gh release upload driver-v<ver> manifest.json.pending`), delete
+`manifest.json` and rename the pending one, with the commands and the
+last check under "Clearing a `.pending` asset by hand" (Troubleshooting).
 
 **Readers.** A `manifest.json.pending` is never read as the release's
 manifest. The installers' driver lookup (`Get-AttestedDriver.ps1`), the
@@ -849,12 +852,9 @@ only cleaned (`repro_compare.py` `clean_text`) or between
   Until a pending manifest without `manifest.json` is finished, the
   installers' driver lookup, the certified guard and the fallback check
   stop at that release, so every tag's `package` job and every Driver
-  submission run stop too. For a release nobody will re-run (an older
-  build the cleanup keeps, or one whose run is older than GitHub's 30-day
-  re-run limit), finish it by hand. When `<name>` is missing, rename
-  `<name>.pending` to `<name>`; when both are there and the release is
-  not finished, delete `<name>`, then rename. On a finished release, look
-  at both before changing anything.
+  submission run stop too. When the job that stopped can't be run again
+  (its run is older than GitHub's 30-day re-run limit, or an artifact it
+  needs has expired), see "Clearing a `.pending` asset by hand" below.
 - **A job says "… changed since this run last read it … another run or a
   person is writing it"** — the release changed between the job's read
   and its write (a file attached by hand, or a run from outside the
@@ -901,6 +901,141 @@ only cleaned (`repro_compare.py` `clean_text`) or between
 - **`Driver attest` fails creating the product/submission** — the Entra
   app lost its Partner Center association or Manager role (Account
   settings → User management → Microsoft Entra applications).
+
+### Clearing a `.pending` asset by hand
+
+Do this only when the job that left the file can't finish it (see "A
+release shows an asset named `<name>.pending`" above): GitHub no longer
+re-runs its run (after 30 days), the re-run fails before it reaches the
+release because an artifact it needs has expired (the EV-signed CAB is
+kept 3 days, the canonical packages 7), or no run of these workflows
+left the file. A job finishes only what it can show to be its own
+stopped write. By hand you make its checks yourself, so that the release
+ends up as a run would have left it.
+
+Work in a clone of this repository, with `gh` signed in to an account
+that can write to it, while no run of Driver submission, Driver attest,
+Driver attested or Driver certified is running or waiting. In the
+commands, `driver-v<ver>` is the release's tag; `{owner}` and `{repo}`
+stay as they are (`gh` fills them in from the clone).
+
+**1. List what the release holds.**
+
+```sh
+gh api "repos/{owner}/{repo}/releases/tags/driver-v<ver>" --jq '.assets[] | [.id, .state, .size, .name] | @tsv'
+```
+
+Each line is one asset: its id, its state, its size in bytes and its
+name. The state is `uploaded` once an upload completed; an asset in any
+other state holds nothing.
+
+**2. Deal with every name that ends in `.pending`**, with
+`manifest.json.pending` last. Three commands do all of it:
+
+```sh
+gh release download driver-v<ver> --pattern '<name>' --output <file>
+gh release delete-asset driver-v<ver> '<name>' --yes
+gh api --method PATCH "repos/{owner}/{repo}/releases/assets/<id>" -f name=<new name>
+```
+
+The first fetches an asset so that you can look at it, the second deletes
+one, the third gives the asset with that id a new name.
+
+- **The release is finished** (its `manifest.json` says `certified: true`
+  or `attested: true`). Delete every `.pending` asset and change nothing
+  else. No job renames anything on a finished release.
+- **The state of `<name>.pending` is not `uploaded`.** The upload never
+  completed and the asset holds nothing. Delete it.
+- **`<name>.pending` and `<name>` are both there**, and `<name>` is not
+  `manifest.json`. The release still holds the file as it was. Delete
+  `<name>.pending`; the job that uploads `<name>` uploads it again when
+  it next runs.
+- **`<name>.pending` is there and `<name>` is missing**, and `<name>` is
+  not `manifest.json`. See whether the release's manifest
+  (`manifest.json`, or `manifest.json.pending` when that is all there is)
+  records `<name>`. It does when `<name>` is its `signed_zip`, `lab_zip`
+  or `ms_zip_asset`, or its `submission_cab` once
+  `submission_cab_signed_sha256` has a value.
+  - Not recorded (a `.sha256` file, a provenance bundle, the CAB while
+    `submission_cab_signed_sha256` is still `null`): delete
+    `<name>.pending`; the job uploads the file again when it next runs.
+  - Recorded: the pending copy has to be that very file. The manifest
+    gives the file's SHA-256 (`signed_zip_sha256`, `lab_zip_sha256`,
+    `ms_zip_sha256`, `submission_cab_signed_sha256`). Download
+    `<name>.pending` and compare its SHA-256 (`sha256sum <file>`; on
+    macOS `shasum -a 256 <file>`). The same: rename `<name>.pending` to
+    `<name>`. Not the same, or the manifest has no SHA-256 for it: stop.
+    No run of these workflows leaves a release like that, so find out
+    what changed it before you go on.
+- **`manifest.json.pending`.** Fetch it, and `manifest.json` when the
+  release has one, and compare the two:
+
+  ```sh
+  gh release download driver-v<ver> --pattern manifest.json.pending --output pending.json
+  gh release download driver-v<ver> --pattern manifest.json --output current.json
+  diff current.json pending.json
+  ```
+
+  **`manifest.json` is there.** The release still has its last complete
+  manifest. What to do depends on the lines `diff` shows:
+  - Only `ms_product_id`, `ms_submission_id`, `ms_state` or
+    `ms_zip_asset`: a save of Driver attest. Don't delete it: it can hold
+    the only record of the ids Partner Center gave this submission.
+    Start Driver attest from main with this release as `tag`: any run of
+    it finishes a save of its own. If that run stops at the pending
+    manifest as well, Driver attest did not make this save on this
+    manifest: stop, and find out what changed the release.
+  - Only `submission_cab_signed_sha256`: the stopped job had the CAB
+    EV-signed and was recording that. Download the asset the manifest
+    names as `submission_cab` and compare its SHA-256 with the new value.
+    The same: delete `manifest.json`, then rename `manifest.json.pending`
+    to `manifest.json`, and the signature is kept. Not the same: delete
+    `manifest.json.pending`.
+  - Anything else: delete `manifest.json.pending`. The release is as it
+    was before the stopped job's last write. Start that job's workflow
+    again from main, and it writes its manifest anew. This holds for a
+    pending manifest that says `attested: true` as well: leave finishing
+    a release to a run, which checks what it finishes.
+
+  **`manifest.json` is gone.** The release has no manifest, and installer
+  builds and Driver submission stop at it until it has one again.
+  - If the pending manifest has an `ms_state` and says
+    `attested: false`, start Driver attest from main with this release
+    as `tag` first: a run of it finishes a save of its own, also without
+    `manifest.json`. Go on here only when that run stops at the pending
+    manifest as well.
+  - Put back the manifest the release had before the stopped write. The
+    run that wrote it (the last one that wrote this release before the
+    one that stopped) shows it in its summary, under "manifest.json
+    written to `driver-v<ver>`". Save that text as a file named
+    `manifest.json`, check that it is whole
+    (`python3 -m json.tool manifest.json` prints it), then:
+
+    ```sh
+    gh release upload driver-v<ver> manifest.json
+    gh release delete-asset driver-v<ver> manifest.json.pending --yes
+    ```
+
+    The release is as it was before the stopped write. Start the stopped
+    job's workflow again from main, and it makes its write anew, with
+    its own checks.
+  - If no run shows the earlier manifest, the pending one is the only
+    record there is. Rename `manifest.json.pending` to `manifest.json`
+    when all of these hold; when one doesn't, stop, and find out what
+    changed the release:
+    1. `python3 -m json.tool pending.json` prints it (it is whole).
+    2. Its `driver_version` is the version in the tag, and its `commit`
+       is the commit the tag points at
+       (`gh api "repos/{owner}/{repo}/commits/driver-v<ver>" --jq .sha`).
+    3. Every file it records (as described above) is on the release with
+       state `uploaded`, and has the SHA-256 the manifest gives for it
+       where it gives one.
+
+**3. Check the result.** Run the command of step 1 again. No name ends in
+`.pending`, and `manifest.json` is there with state `uploaded`. Then go
+on with the flow from where the release stands, starting each workflow
+from main. The job that stopped at the pending file before now reads the
+release's manifest and goes on from it.
 
 ## Manual fallback (Partner Center in the browser)
 
