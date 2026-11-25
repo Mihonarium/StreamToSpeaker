@@ -1382,8 +1382,9 @@ jobs:
       - name: Release chain script tests (Python)
         run: python3 -m unittest discover -b -v -s .github/scripts
 
-  # Get-AttestedDriver.ps1 picks the driver every installer bundles; its
-  # Pester tests run against a fake gh (Pester 5 ships with the runner).
+  # The chain's PowerShell: Get-AttestedDriver.ps1, which picks the driver
+  # every installer bundles (against a fake gh), Assert-MicrosoftSigned.ps1
+  # and the signing action's run selection. Pester 5 ships with the runner.
   chain-tests-powershell:
     runs-on: windows-latest
     timeout-minutes: 10
@@ -1397,7 +1398,7 @@ jobs:
         shell: pwsh
         run: |
           Import-Module Pester -MinimumVersion 5.0
-          Invoke-Pester -Path .github/scripts/Get-AttestedDriver.Tests.ps1 -Output Detailed -CI
+          Invoke-Pester -Path .github/scripts/ReleaseChain.Tests.ps1 -Output Detailed -CI
 
   # Minimum-supported-Rust check. `rust-version` in service/Cargo.toml is
   # only a true statement while this job passes: it checks both targets on

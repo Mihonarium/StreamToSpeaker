@@ -1,10 +1,10 @@
 #requires -Version 7
-# Pester 5 tests of Get-AttestedDriver.ps1 against a fake `gh` (which
-# driver-v* release a build bundles, and that found=false means only "no
-# certified or attested release records this source hash"), and of
-# Assert-MicrosoftSigned.ps1. Run by
-# build.yml's chain-tests-powershell job:
-#   Invoke-Pester -Path .github/scripts/Get-AttestedDriver.Tests.ps1 -Output Detailed -CI
+# Pester 5 tests of the release chain's PowerShell: Get-AttestedDriver.ps1
+# against a fake `gh` (which driver-v* release a build bundles, and that
+# found=false means only "no certified or attested release records this
+# source hash"), Assert-MicrosoftSigned.ps1, and the request-signing
+# action's SigningRun.ps1. Run by build.yml's chain-tests-powershell job:
+#   Invoke-Pester -Path .github/scripts/ReleaseChain.Tests.ps1 -Output Detailed -CI
 
 BeforeAll {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -163,5 +163,54 @@ Describe "Assert-MicrosoftSigned.ps1" {
         $file = Join-Path $TestDrive "devcon.exe"
         [IO.File]::WriteAllBytes($file, [byte[]](77, 90, 0, 0))
         { & $Assert -Path $file } | Should -Throw "*no valid Authenticode signature*"
+    }
+}
+
+Describe "SigningRun.ps1 (request-signing)" {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot "..\actions\request-signing\SigningRun.ps1")
+        $Sha = "ab" * 32
+        function Run([int]$id, [string]$sha, [string]$created, [string]$status = "completed", [string]$conclusion = "success") {
+            [pscustomobject]@{ id = $id; display_title = "Sign out.exe sha256 $sha"; created_at = $created
+                               status = $status; conclusion = $conclusion; html_url = "https://example/$id" }
+        }
+    }
+
+    It "follows a run for the same bytes that still waits for approval" {
+        $runs = @((Run 1 $Sha "2026-11-01T10:00:00Z"), (Run 2 $Sha "2026-11-01T11:00:00Z" "waiting" $null))
+        $c = Select-SigningRun $runs $Sha
+        $c.Action | Should -Be "follow"
+        $c.Run.id | Should -Be 2
+    }
+
+    It "reuses a run for the same bytes that succeeded" {
+        $runs = @((Run 1 $Sha "2026-11-01T10:00:00Z"), (Run 3 ("cd" * 32) "2026-11-01T12:00:00Z" "waiting" $null))
+        $c = Select-SigningRun $runs $Sha
+        $c.Action | Should -Be "reuse"
+        $c.Run.id | Should -Be 1
+    }
+
+    It "asks again after a rejected or cancelled run, or when there is none" {
+        (Select-SigningRun @((Run 1 $Sha "2026-11-01T10:00:00Z" "completed" "cancelled")) $Sha).Action | Should -Be "dispatch"
+        (Select-SigningRun @() $Sha).Action | Should -Be "dispatch"
+    }
+
+    It "takes only a run that was not there before the dispatch" {
+        $old = Run 1 $Sha "2026-11-01T10:00:00Z" "completed" "cancelled"
+        Find-DispatchedRun @($old) $Sha @(1) | Should -BeNullOrEmpty
+        $new = Run 7 $Sha "2026-11-01T10:05:00Z" "waiting" $null
+        (Find-DispatchedRun @($new, $old) $Sha @(1)).id | Should -Be 7
+        Find-DispatchedRun @((Run 8 ("cd" * 32) "2026-11-01T10:06:00Z" "waiting" $null), $old) $Sha @(1) | Should -BeNullOrEmpty
+    }
+
+    It "retries a GET that fails for a while, and not one the API refuses" {
+        $script:calls = 0
+        $flaky = { param($u, $h) $script:calls++; if ($script:calls -lt 3) { throw "connection reset" }; "ok" }
+        Invoke-GitHubGet "https://api.github.com/x" @{} $flaky @(0, 0, 0) | Should -Be "ok"
+        $script:calls | Should -Be 3
+        $script:calls = 0
+        $always = { param($u, $h) $script:calls++; throw "connection reset" }
+        { Invoke-GitHubGet "https://api.github.com/x" @{} $always @(0, 0) } | Should -Throw
+        $script:calls | Should -Be 3
     }
 }

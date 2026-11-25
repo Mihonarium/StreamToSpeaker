@@ -5,7 +5,10 @@ description: >
   "signed" artifact, verify it locally with signtool, and expose the signed
   file's path + hash. The approval in the signing repo authorizes exactly
   the SHA-256 this action computes from the source bytes, so nothing can be
-  swapped between dispatch and signature. Two source modes:
+  swapped between dispatch and signature. A re-run for the same bytes
+  follows the signing run already waiting for them, or reuses the signed
+  file of one that succeeded, instead of asking for another approval
+  (SigningRun.ps1). Two source modes:
     - artifact-url: a URL fetchable WITHOUT authentication (public repos /
       presigned URLs only — a private repo's release URLs serve a 404 page).
     - source-run-id + source-artifact: an Actions artifact of a run in THIS
@@ -85,7 +88,9 @@ inputs:
   wait-minutes:
     description: >
       How long to wait for the human approval + run completion before
-      giving up. On timeout, approve the signing run and re-run the job.
+      giving up. On timeout, approve the signing run and re-run the job:
+      the re-run follows that run (or reuses its signed file) instead of
+      asking again.
     required: false
     default: "60"
 
@@ -149,67 +154,89 @@ runs:
         }
         $sha = (Get-FileHash $unsigned -Algorithm SHA256).Hash.ToLower()
         if ($env:REQSIGN_EXPECTED_SHA256 -and $env:REQSIGN_EXPECTED_SHA256.ToLower() -ne $sha) {
-            throw "bytes at $env:REQSIGN_URL hash to $sha, expected $($env:REQSIGN_EXPECTED_SHA256.ToLower()) - refusing to request a signature for unexpected content"
+            $source = if ($env:REQSIGN_SRC_RUN) { "artifact '$($env:REQSIGN_SRC_ART)' of run $($env:REQSIGN_SRC_RUN)" } else { $env:REQSIGN_URL }
+            throw "the bytes of $source hash to $sha, expected $($env:REQSIGN_EXPECTED_SHA256.ToLower()) - refusing to request a signature for unexpected content"
         }
         "unsigned-sha256=$sha" >> $env:GITHUB_OUTPUT
 
-        # --- dispatch the signing workflow ---------------------------------
-        $dispatchInputs = @{
-            sha256          = $sha
-            output_name     = $env:REQSIGN_OUTPUT_NAME
-            sig_description = $env:REQSIGN_SIG_DESCRIPTION
-            sig_url         = $env:REQSIGN_SIG_URL
-        }
-        if ($env:REQSIGN_SRC_RUN) {
-            # Private-source mode: the signing workflow fetches the artifact
-            # post-approval with its FETCH_TOKEN environment secret.
-            $dispatchInputs.source_repo     = $env:GITHUB_REPOSITORY
-            $dispatchInputs.source_run_id   = $env:REQSIGN_SRC_RUN
-            $dispatchInputs.source_artifact = $env:REQSIGN_SRC_ART
-        } else {
-            $dispatchInputs.artifact_url = $env:REQSIGN_URL
-        }
-        $body = @{
-            ref = $env:REQSIGN_REF
-            inputs = $dispatchInputs
-        } | ConvertTo-Json
-        Invoke-RestMethod -Method Post -Headers $hdr -Body $body -Uri `
-            "https://api.github.com/repos/$($env:REQSIGN_REPO)/actions/workflows/$($env:REQSIGN_WORKFLOW)/dispatches"
-        Write-Host "Dispatched signing of $($env:REQSIGN_OUTPUT_NAME) (sha256 $sha)"
+        . (Join-Path $env:GITHUB_ACTION_PATH "SigningRun.ps1")
+        $api = "https://api.github.com/repos/$($env:REQSIGN_REPO)/actions"
+        $runsUri = "$api/workflows/$($env:REQSIGN_WORKFLOW)/runs?event=workflow_dispatch&per_page=30"
 
-        # --- find our run (the run name embeds the sha256) -----------------
-        $run = $null
-        foreach ($i in 1..30) {
-            Start-Sleep -Seconds 10
-            $runs = (Invoke-RestMethod -Headers $hdr -Uri `
-                "https://api.github.com/repos/$($env:REQSIGN_REPO)/actions/workflows/$($env:REQSIGN_WORKFLOW)/runs?event=workflow_dispatch&per_page=10").workflow_runs
-            $run = $runs | Where-Object { $_.display_title -match $sha } | Select-Object -First 1
-            if ($run) { break }
+        # The signed file of a completed run: its "signed" artifact holding
+        # output-name, or $null.
+        function Get-SignedFile($run) {
+            $arts = (Invoke-GitHubGet "$api/runs/$($run.id)/artifacts" $hdr).artifacts
+            $art = $arts | Where-Object { $_.name -eq "signed" -and -not $_.expired } | Select-Object -First 1
+            if (-not $art) { return $null }
+            $zip = Join-Path $work "signed-$($run.id).zip"
+            $dir = Join-Path $work "signed-$($run.id)"
+            Invoke-WebRequest -Uri $art.archive_download_url -Headers $hdr -OutFile $zip
+            Expand-Archive $zip -DestinationPath $dir
+            return Get-ChildItem $dir -Filter $env:REQSIGN_OUTPUT_NAME | Select-Object -First 1
         }
-        if (-not $run) { throw "signing run did not appear within 5 minutes" }
-        Write-Host "Signing run: $($run.html_url)"
-        Write-Host "##[notice]Waiting for approval on the signing run - verify its run name shows sha256 $sha, then approve."
 
-        # --- wait for approval + completion --------------------------------
-        $deadline = (Get-Date).AddMinutes([int]$env:REQSIGN_WAIT_MINUTES)
-        while ($true) {
-            Start-Sleep -Seconds 20
-            $run = Invoke-RestMethod -Headers $hdr -Uri `
-                "https://api.github.com/repos/$($env:REQSIGN_REPO)/actions/runs/$($run.id)"
-            if ($run.status -eq "completed") { break }
-            if ((Get-Date) -gt $deadline) { throw "timed out after $($env:REQSIGN_WAIT_MINUTES) min waiting for the signing run ($($run.status)) - approve it and re-run this job" }
+        # --- follow, reuse or dispatch ---------------------------------------
+        $listed = @((Invoke-GitHubGet $runsUri $hdr).workflow_runs)
+        $choice = Select-SigningRun $listed $sha
+        $signed = $null
+        if ($choice.Action -eq "reuse") {
+            $signed = Get-SignedFile $choice.Run
+            if ($signed) {
+                Write-Host "Signing run $($choice.Run.html_url) already signed sha256 ${sha}; using its signed file (no new approval)"
+            } else {
+                Write-Host "Signing run $($choice.Run.html_url) signed sha256 ${sha}, but its signed file is gone; asking again"
+                $choice = @{ Action = "dispatch"; Run = $null }
+            }
         }
-        if ($run.conclusion -ne "success") { throw "signing run concluded '$($run.conclusion)' - see $($run.html_url)" }
+        if (-not $signed) {
+            if ($choice.Action -eq "follow") {
+                $run = $choice.Run
+                Write-Host "A signing run for sha256 $sha is already waiting; following it instead of asking again"
+            } else {
+                $dispatchInputs = @{
+                    sha256          = $sha
+                    output_name     = $env:REQSIGN_OUTPUT_NAME
+                    sig_description = $env:REQSIGN_SIG_DESCRIPTION
+                    sig_url         = $env:REQSIGN_SIG_URL
+                }
+                if ($env:REQSIGN_SRC_RUN) {
+                    # Private-source mode: the signing workflow fetches the
+                    # artifact post-approval with its FETCH_TOKEN secret.
+                    $dispatchInputs.source_repo     = $env:GITHUB_REPOSITORY
+                    $dispatchInputs.source_run_id   = $env:REQSIGN_SRC_RUN
+                    $dispatchInputs.source_artifact = $env:REQSIGN_SRC_ART
+                } else {
+                    $dispatchInputs.artifact_url = $env:REQSIGN_URL
+                }
+                $body = @{ ref = $env:REQSIGN_REF; inputs = $dispatchInputs } | ConvertTo-Json
+                Invoke-RestMethod -Method Post -Headers $hdr -Body $body -Uri "$api/workflows/$($env:REQSIGN_WORKFLOW)/dispatches"
+                Write-Host "Dispatched signing of $($env:REQSIGN_OUTPUT_NAME) (sha256 $sha)"
+                # Only a run that was not listed before the dispatch is ours.
+                $run = $null
+                foreach ($i in 1..30) {
+                    Start-Sleep -Seconds 10
+                    $run = Find-DispatchedRun @((Invoke-GitHubGet $runsUri $hdr).workflow_runs) $sha @($listed | ForEach-Object { $_.id })
+                    if ($run) { break }
+                }
+                if (-not $run) { throw "signing run did not appear within 5 minutes" }
+            }
+            Write-Host "Signing run: $($run.html_url)"
+            Write-Host "##[notice]Waiting for approval on the signing run - verify its run name shows sha256 $sha, then approve."
 
-        # --- fetch the signed artifact -------------------------------------
-        $arts = (Invoke-RestMethod -Headers $hdr -Uri `
-            "https://api.github.com/repos/$($env:REQSIGN_REPO)/actions/runs/$($run.id)/artifacts").artifacts
-        $signedArt = $arts | Where-Object { $_.name -eq "signed" } | Select-Object -First 1
-        if (-not $signedArt) { throw "run has no 'signed' artifact" }
-        Invoke-WebRequest -Uri $signedArt.archive_download_url -Headers $hdr -OutFile (Join-Path $work "signed.zip")
-        Expand-Archive (Join-Path $work "signed.zip") -DestinationPath (Join-Path $work "signed")
-        $signed = Get-ChildItem (Join-Path $work "signed") -Filter $env:REQSIGN_OUTPUT_NAME | Select-Object -First 1
-        if (-not $signed) { throw "signed artifact does not contain $($env:REQSIGN_OUTPUT_NAME)" }
+            # --- wait for approval + completion ------------------------------
+            $deadline = (Get-Date).AddMinutes([int]$env:REQSIGN_WAIT_MINUTES)
+            while ($run.status -ne "completed") {
+                if ((Get-Date) -gt $deadline) { throw "timed out after $($env:REQSIGN_WAIT_MINUTES) min waiting for the signing run ($($run.status)) - approve it, then re-run this job: the re-run picks up that run" }
+                Start-Sleep -Seconds 20
+                $run = Invoke-GitHubGet "$api/runs/$($run.id)" $hdr
+            }
+            if ($run.conclusion -ne "success") { throw "signing run concluded '$($run.conclusion)' - see $($run.html_url); a re-run of this job asks for a new signature" }
+
+            # --- fetch the signed artifact -----------------------------------
+            $signed = Get-SignedFile $run
+            if (-not $signed) { throw "signing run $($run.html_url) has no 'signed' artifact holding $($env:REQSIGN_OUTPUT_NAME)" }
+        }
 
         # --- independent local verification --------------------------------
         $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
