@@ -174,12 +174,45 @@ function Get-DriverVer([string]$infPath) {
     if ($line) { ($line.Line -split "=", 2)[1].Trim() } else { "" }
 }
 
+# A command line taken apart: the program (quoted: up to the closing quote;
+# unquoted: up to the first space) and what follows it.
+function Split-CommandLine([string]$line) {
+    $m = [regex]::Match("$line".Trim(), '^(?:"([^"]*)"|(\S+))\s*(.*)$')
+    @{
+        program   = if ($m.Success) { "$($m.Groups[1].Value)$($m.Groups[2].Value)" } else { "" }
+        arguments = if ($m.Success) { $m.Groups[3].Value.Trim() } else { "" }
+    }
+}
+
+# Whether a value that came from the registry is a plain full path on a
+# drive: no quotes, wildcards or second colon, and no "." or ".." part.
+function Test-PlainAbsolutePath([string]$path) {
+    if ($path -notmatch '^[A-Za-z]:\\[^"*?<>|/:]+$') { return $false }
+    @($path -split '\\' | Where-Object { $_ -in ".", ".." }).Count -eq 0
+}
+
+# The install folder as registered. It comes from the registry and becomes
+# part of paths this test reads, deletes and runs, so anything but a plain
+# full path stops the phase.
 function Get-AppDir {
     $k = Get-ItemProperty -Path $UninstallKey -ErrorAction SilentlyContinue
     if ($k -and $k.PSObject.Properties["InstallLocation"] -and $k.InstallLocation) {
-        return $k.InstallLocation.TrimEnd("\")
+        $dir = "$($k.InstallLocation)".TrimEnd("\")
+        if (-not (Test-PlainAbsolutePath $dir)) { throw "the registered install folder is not a plain full path: '$dir'" }
+        return $dir
     }
     $ExpectedAppDir
+}
+
+# A phase that installs on a PC without the app says so when an earlier
+# phase left something behind: what it then shows is an update, not an
+# install, and the phase counts as failed.
+function Assert-CleanStart {
+    $left = @()
+    if (Test-Path $UninstallKey) { $left += "the Apps & Features entry" }
+    if (@(Get-OurDevices).Count) { $left += "a $HardwareId device" }
+    if (@(Get-DriverPackages).Count) { $left += "a driver package" }
+    Check ($left.Count -eq 0) "the phase starts on a PC without $AppName (an earlier phase left: $($left -join ', '))"
 }
 
 # Test certificates with our subject in the machine trust stores.
@@ -432,12 +465,26 @@ function Assert-DiagnoseReport([string]$label) {
 function Invoke-Uninstall([string]$label) {
     $k = Get-ItemProperty -Path $UninstallKey -ErrorAction SilentlyContinue
     if (-not $k) { throw "no uninstall entry at $UninstallKey" }
-    $exe = $k.UninstallString.Trim('"')
     $dir = Get-AppDir
+    # What Apps & Features would run. Setup registers the uninstaller with
+    # the switch that makes it keep a log: "<folder>\unins000.exe" /LOG. The
+    # value comes from the registry, so it is taken apart and checked before
+    # anything runs: only unins###.exe in the registered install folder,
+    # followed by that switch or by nothing.
+    $registered = "$($k.UninstallString)"
+    $command = Split-CommandLine $registered
+    $exe = $command.program
+    if (-not (Test-PlainAbsolutePath $exe) -or [IO.Path]::GetDirectoryName($exe) -ine $dir -or
+        [IO.Path]::GetFileName($exe) -notmatch '^unins\d{3}\.exe$' -or $command.arguments -notin "", "/LOG") {
+        throw "the registered uninstall command is not unins###.exe in $dir, with /LOG or nothing after it: $registered"
+    }
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "the registered uninstaller $exe is not there" }
     $log = Join-Path $LogDir "$label-uninstall.log"
-    Write-Host "Running $exe silently (log: $log)"
-    $p = Start-Process -FilePath $exe -PassThru -ArgumentList @(
-        "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$log`"")
+    # The registered switch first: of two /LOG switches the later one, which
+    # names the file, counts.
+    $switches = @($command.arguments | Where-Object { $_ }) + @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$log`"")
+    Write-Host "Running $exe $($switches -join ' ')"
+    $p = Start-Process -FilePath $exe -PassThru -ArgumentList $switches
     $null = $p.Handle
     if (-not $p.WaitForExit(15 * 60 * 1000)) {
         Stop-ProcessTree $p.Id
@@ -542,6 +589,11 @@ function Assert-Installed {
     if ($DriverRecord) { $rec = Get-Content $DriverRecord -Raw | ConvertFrom-Json }
     if ($Full -and $rec) {
         foreach ($p in $rec.files.PSObject.Properties) {
+            # A name from the build record becomes part of a path.
+            if ($p.Name -notmatch '^[A-Za-z0-9._-]+$') {
+                Fail "the build record lists a driver file that is not a plain file name: '$($p.Name)'"
+                continue
+            }
             $installed = Join-Path $app "driver\$($p.Name)"
             if (Test-Path -LiteralPath $installed) {
                 Check ((Get-Sha256 $installed) -eq $p.Value) "driver\$($p.Name) matches the build record"
@@ -583,7 +635,8 @@ function Assert-Installed {
     Check (-not (Test-Path -LiteralPath $DesktopLink)) "no desktop shortcut (task off by default)"
     $run = (Get-ItemProperty -Path $RunKey -Name $AppName -ErrorAction SilentlyContinue).$AppName
     if ($SignInOn) {
-        Check ($run -and $run -like "*$app\$ExeName*--startup*") "start-at-sign-in entry starts $app\$ExeName ($run)"
+        $command = Split-CommandLine "$run"
+        Check ($command.program -ieq (Join-Path $app $ExeName) -and $command.arguments -eq "--startup") "start-at-sign-in entry starts $app\$ExeName --startup (entry: $run)"
     } else {
         Check (-not $run) "no start-at-sign-in entry (task off by default)"
     }
@@ -760,6 +813,7 @@ switch ($Phase) {
         Ok "sentinel written to $Sentinel"
     }
     "refuse-server" {
+        Assert-CleanStart
         $certsBefore = @(Get-TrustedTestCertificates)
         $code = Invoke-Setup $Installer "refuse-server" -Omit "ALLOWSERVER" -TimeoutMinutes 5
         Check ($code -eq 7) "Setup refused Windows Server before changing anything (exit code $code, expected 7)"
@@ -789,6 +843,7 @@ switch ($Phase) {
         }
     }
     "refuse-dir" {
+        Assert-CleanStart
         $certsBefore = @(Get-TrustedTestCertificates)
         $code = Invoke-Setup $Installer "refuse-dir" -TimeoutMinutes 5
         Check ($code -eq $DirRefusedExitCode) "Setup refused /DIR=$InstallDir before changing anything (exit code $code, expected $DirRefusedExitCode)"
@@ -804,6 +859,7 @@ switch ($Phase) {
         }
     }
     "install" {
+        Assert-CleanStart
         $audio = Get-AudioServices
         $outcome = Invoke-CurrentSetup "install"
         Assert-Installed -Full -Outcome $outcome
@@ -813,6 +869,9 @@ switch ($Phase) {
     }
     "repair" {
         $app = Get-AppDir
+        # Two installed files are deleted below: only in the folder this
+        # test installed to.
+        if ($app -ine $DefaultAppDir) { throw "the install to repair is registered in '$app', not in $DefaultAppDir" }
         $before = @((Read-State).device)
         $audio = Get-AudioServices
         $victims = @("README.md", "scripts\Diagnose.ps1")
@@ -847,6 +906,7 @@ switch ($Phase) {
         Assert-Sentinel
     }
     "tasks" {
+        Assert-CleanStart
         $tasks = "/TASKS=autostart"
         $outcome = Invoke-CurrentSetup "tasks-install" -Extra @($tasks)
         Assert-Installed -Full -SignInOn -Outcome $outcome
@@ -877,6 +937,7 @@ switch ($Phase) {
         Assert-Removed $app $log
     }
     "previous" {
+        Assert-CleanStart
         $code = Invoke-Setup $Installer "previous-$((Get-Date).ToString('HHmmss'))"
         Write-Host "  earlier release's setup exit code $code"
         Save-InstallLog "previous"

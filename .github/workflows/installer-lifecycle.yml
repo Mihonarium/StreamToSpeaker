@@ -173,6 +173,10 @@ jobs:
           $dev = $null; $prod = $null
           foreach ($r in $records) {
               $j = Get-Content $r.FullName -Raw | ConvertFrom-Json
+              # The name comes from the record and becomes a path to run.
+              if ("$($j.installer)" -notmatch '^StreamToSpeakerSetup-[A-Za-z0-9._-]+\.exe$') {
+                  throw "record $($r.Name) names an installer that is not a plain StreamToSpeakerSetup-*.exe file name: '$($j.installer)'"
+              }
               $exe = Join-Path $r.DirectoryName $j.installer
               if (-not (Test-Path $exe)) { throw "record $($r.Name) names missing installer $($j.installer)" }
               Write-Host "$($j.installer): driver $($j.driver.kind), test certificate $($j.test_cert)"
@@ -213,7 +217,8 @@ jobs:
         run: |
           $rels = gh api --paginate "repos/$env:RELEASES_REPO/releases?per_page=100" --jq '.[]' |
               ForEach-Object { $_ | ConvertFrom-Json }
-          $setup = { param($r) @($r.assets | Where-Object { $_.name -match '^StreamToSpeakerSetup-.+\.exe$' }) }
+          # An asset's name becomes a file name here and a path to run later.
+          $setup = { param($r) @($r.assets | Where-Object { $_.name -match '^StreamToSpeakerSetup-[A-Za-z0-9._-]+\.exe$' }) }
           function Get-Release([string]$tag, [string]$key, [string]$envName) {
               if ($tag) {
                   $rel = $rels | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
