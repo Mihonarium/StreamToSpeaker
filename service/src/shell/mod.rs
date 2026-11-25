@@ -57,6 +57,9 @@ pub enum PanelMode {
     Flyout,
     /// A small always-on-top window with a title bar by the clock, which
     /// Esc, its × or a click on the icon close; losing the focus doesn't.
+    /// Like any ordinary window it has its taskbar button and is in
+    /// Alt+Tab, so it can't be lost behind other windows (without a tray
+    /// icon, it is the app's only way in).
     Window,
 }
 
@@ -181,7 +184,7 @@ pub fn root_builder(mode: RootMode) -> ViewportBuilder {
 pub const PANEL_TITLE: &str = crate::PRODUCT_NAME;
 
 /// The panel's window for `mode`: hidden until the shell has measured it
-/// and put it in its place.
+/// and put it in its place; on the taskbar only as an ordinary window.
 pub fn panel_builder(mode: PanelMode) -> ViewportBuilder {
     ViewportBuilder::default()
         .with_title(PANEL_TITLE)
@@ -189,7 +192,7 @@ pub fn panel_builder(mode: PanelMode) -> ViewportBuilder {
         .with_visible(false)
         .with_resizable(false)
         .with_window_level(WindowLevel::AlwaysOnTop)
-        .with_taskbar(false)
+        .with_taskbar(mode == PanelMode::Window)
         .with_minimize_button(false)
         .with_maximize_button(false)
         .with_decorations(mode == PanelMode::Window)
@@ -390,9 +393,6 @@ impl KeptStyle {
     /// Out of Alt+Tab and the taskbar and never activated: the root window
     /// and the small windows by the clock.
     pub const NEVER_ACTIVE: KeptStyle = KeptStyle { set: WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, clear: WS_EX_APPWINDOW };
-    /// Not forced onto the taskbar: the panel as a small window, which has a
-    /// title bar and is in Alt+Tab.
-    pub const OFF_THE_TASKBAR: KeptStyle = KeptStyle { set: 0, clear: WS_EX_APPWINDOW };
 
     /// The extended style `ex` as the window keeps it.
     pub fn applied_to(self, ex: u32) -> u32 {
@@ -416,7 +416,9 @@ impl ShellWindow {
             ShellWindow::Root(RootMode::Hidden) => None,
             ShellWindow::Root(RootMode::ToolWindow) | ShellWindow::Popup => Some(KeptStyle::NEVER_ACTIVE),
             ShellWindow::Panel(PanelMode::Flyout) => Some(KeptStyle::OUT_OF_ALT_TAB),
-            ShellWindow::Panel(PanelMode::Window) => Some(KeptStyle::OFF_THE_TASKBAR),
+            // An ordinary window, as winit makes it: on the taskbar and in
+            // Alt+Tab.
+            ShellWindow::Panel(PanelMode::Window) => None,
         }
     }
 }
@@ -630,7 +632,7 @@ mod tests {
         let (plain, app, top, through) = (0x0000_0110, 0x0004_0000, 0x0000_0008, 0x0008_0020);
         let kept = |w: ShellWindow, ex: u32| ex_style_words(w.kept_style().map_or(ex, |k| k.applied_to(ex)));
         assert_eq!(kept(ShellWindow::Panel(PanelMode::Flyout), plain | app | top), "tool window, on top");
-        assert_eq!(kept(ShellWindow::Panel(PanelMode::Window), plain | app | top), "on top");
+        assert_eq!(kept(ShellWindow::Panel(PanelMode::Window), plain | app | top), "app window, on top");
         assert_eq!(
             kept(ShellWindow::Root(RootMode::ToolWindow), plain | app | through),
             "tool window, never active, layered and transparent: clicks pass through"
@@ -659,6 +661,20 @@ mod tests {
         assert!(PanelMode::Flyout.closes_on_blur(false));
         assert!(!PanelMode::Flyout.closes_on_blur(true));
         assert!(!PanelMode::Window.closes_on_blur(false));
+    }
+
+    #[test]
+    fn the_panel_as_an_ordinary_window_has_its_taskbar_button_and_as_a_flyout_none() {
+        // A window that can go behind others needs a button to bring it
+        // back (and a place in Alt+Tab); a flyout by the clock has neither.
+        let window = panel_builder(PanelMode::Window);
+        assert_eq!((window.taskbar, window.decorations), (Some(true), Some(true)));
+        assert_eq!(ShellWindow::Panel(PanelMode::Window).kept_style(), None);
+        let flyout = panel_builder(PanelMode::Flyout);
+        assert_eq!((flyout.taskbar, flyout.decorations), (Some(false), Some(false)));
+        assert_eq!(ShellWindow::Panel(PanelMode::Flyout).kept_style(), Some(KeptStyle::OUT_OF_ALT_TAB));
+        // Without a tray icon the panel is that ordinary window.
+        assert_eq!(ShellOptions::from(|_| None, false).effective().panel, PanelMode::Window);
     }
 
     #[test]
