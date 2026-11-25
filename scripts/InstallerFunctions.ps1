@@ -1478,8 +1478,10 @@ function New-DriverResult([string]$Result, [int]$ExitCode) {
 # app will run).
 #
 # The working driver is never removed before the new package is in the
-# driver store, and earlier packages are deleted only once the new driver
-# runs. Every test certificate is recorded before it is trusted.
+# driver store. Earlier packages are deleted only by a run that finds the new
+# driver working with no restart due: this run, or else the next time the
+# step runs after the restart (nothing deletes them in between). Every test
+# certificate is recorded before it is trusted.
 function Invoke-DriverInstall {
     param(
         [Parameter(Mandatory = $true)][string]$PackageDir,
@@ -1754,7 +1756,9 @@ function Invoke-DriverInstallSteps {
 
     # 7. Earlier packages, and the certificates only they needed, go once
     #    the new driver is known to run: the device works and no restart is
-    #    due. Until then they stay, so that the PC can go back to them.
+    #    due. Until then they stay, so that the PC can go back to them; they
+    #    go the next time this step runs and finds the new driver working
+    #    (after the restart, nothing runs it until Setup is run again).
     $packagesLeft = @(& $Tools.GetPackages | Where-Object { $_ -ine $device.InfName })
     if ($device.ProblemCode -eq 0 -and -not $result.Restart -and $device.InfName) {
         $kept = @()
@@ -1765,7 +1769,7 @@ function Invoke-DriverInstallSteps {
         }
         $packagesLeft = $kept
     } elseif ($packagesLeft.Count) {
-        Write-Step "Keeping the earlier driver package(s) $($packagesLeft -join ', ') until the new driver runs."
+        Write-Step "Keeping the earlier driver package(s) $($packagesLeft -join ', ') for now: Setup deletes them the next time it runs and finds the new driver working."
     }
     $stale = @(Select-CertificatesToRemove -Candidates $recorded -Keep $currentCert)
     if ($stale.Count -and -not $packagesLeft.Count) {

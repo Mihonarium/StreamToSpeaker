@@ -11,7 +11,9 @@
 #     Windows' audio services alone.
 #   - A new driver goes into the driver store first; only then is it
 #     installed on the existing device, which keeps its sound output.
-#     Earlier packages are deleted once the new driver runs.
+#     Earlier packages are deleted by the run that finds the new driver
+#     working: this one when no restart is due, else the next run after
+#     the restart.
 #   - The device is created only when there is none.
 #   - An output that still carries an early build's cached settings is
 #     rebuilt, and so is a working device when Windows has no Stream To
