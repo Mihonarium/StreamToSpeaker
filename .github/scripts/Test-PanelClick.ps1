@@ -37,8 +37,12 @@
        one of them is shown as an app window or without the styles the
        shell keeps on it (out of Alt+Tab, never active), or has a button
        on the taskbar.
-    5. Quits the app as a person does (Quit in its tray icon's menu, by a
-       right click and a click), and keeps its log.
+    5. Judges the case: what it expects of the panel (see Invoke-Judge)
+       against what the pictures saw. Then quits the app as a person does
+       (Quit in its tray icon's menu, by a right click and a click). A case
+       passes only when every expectation is met and no problem was found;
+       the step summary names each expectation, met or failed, in a
+       sentence.
 
     The machine has no sound device and no driver. Started as it is, the
     app would look for its driver, fall back to recording the default
@@ -453,10 +457,58 @@ function Get-IconPlace([int]$appPid) {
     [pscustomobject]@{ Where = "taskbar"; X = $rect.CenterX; Y = $rect.CenterY; What = "the notification area's button $($icon.What)" }
 }
 
-# A taskbar button of one of the app's windows: an element of the taskbar
-# whose name starts with the app's name and isn't the tray icon's. Each is
-# a problem of the run.
+# What the case expects of the panel, from the design and the code, judged
+# on the same observations the timeline prints (one per picture):
+# - the panel closed before the click (a start at sign-in, not first run):
+#   the click on the icon opens it, a double click too (it ends as its first
+#   click left the panel); it is shown within 1.5 s, stays shown through
+#   the 2 s after the click and after the click inside it, and is shown at
+#   the end, until the rig quits the app;
+# - the panel open before the click (a start by hand, or first run, which
+#   opens it even at sign-in): the click on the icon closes it, within 1 s,
+#   and it stays closed (a flyout closes when the press takes its focus, a
+#   pinned or ordinary-window panel on the release; a double click on an
+#   open panel closes it once); except when the icon is among the hidden
+#   icons outside first run: the click on the button that shows them takes
+#   the panel's focus and closes it first, and whether the click on the icon
+#   then opens it again depends on whether it comes within half a second
+#   (the press that closed it), which the rig doesn't control: not judged;
+# - always: whenever shown, the panel's window lies inside the work area of
+#   its display, and there is never more than one panel.
+function Invoke-Judge($rec) {
+    $seen = $rec.Observations
+    $click = $rec.MarkOf("click")
+    $openAtStart = $FirstRun -or ($Start -eq "menu")
+    if (-not $openAtStart) {
+        $rec.Expect([PanelRig.Judge]::OpensWithin($seen, "after-the-click", $click, 1.5, "click on the icon"))
+        $rec.Expect([PanelRig.Judge]::StaysThrough($seen, "after-the-click", $click, "the 2 s after the click"))
+        $rec.Expect([PanelRig.Judge]::ShownIn($seen, "after-the-click", $true, "The panel is still shown 2 s after the click"))
+        $rec.Expect([PanelRig.Judge]::ShownThroughout($seen, "after-the-click-inside", "The panel is still shown after the click inside it",
+            "there was no click inside it: the panel wasn't shown 2 s after the click"))
+        $rec.Expect([PanelRig.Judge]::ShownIn($seen, "the-end", $true, "The panel is shown at the end, until the rig quits the app"))
+    } else {
+        $rec.Expect([PanelRig.Judge]::ShownIn($seen, "before-the-click", $true, "The panel is open before the click (it opened by itself at start)"))
+        if ($Icon -eq "hidden" -and -not $FirstRun) {
+            Say "Not judged: whether the click on the icon among the hidden icons opens the panel again after the click that showed them closed it"
+        } else {
+            $rec.Expect([PanelRig.Judge]::ClosesWithin($seen, "after-the-click", $click, 1.0, "click on the icon"))
+            $rec.Expect([PanelRig.Judge]::ShownIn($seen, "the-end", $false, "The panel is closed at the end"))
+        }
+    }
+    $rec.Expect([PanelRig.Judge]::InsideWorkArea($seen))
+    $rec.Expect([PanelRig.Judge]::OnePanel($seen))
+    foreach ($e in $rec.Expectations) { Say "Expectation $e" }
+}
+
+# A taskbar button of one of the app's windows that must have none: an
+# element of the taskbar whose name starts with the app's name and isn't the
+# tray icon's, while no window of the app that belongs on the taskbar is
+# shown. Each is a problem of the run.
 function Test-TaskbarButtons($rec, [string]$when) {
+    if ($rec.TaskbarWindowShown()) {
+        Warn "a window of the app that belongs on the taskbar (a dialog, a message box, the panel as an ordinary window) was shown $when; its taskbar buttons weren't checked then"
+        return
+    }
     $bar = Get-UiaTopLevel "Shell_TrayWnd"
     foreach ($b in @(Find-UiaNamed $bar '^Stream To Speaker')) {
         if ($b.Name -match $TrayPattern) { continue }
@@ -579,6 +631,7 @@ try {
     }
     $times = if ($Click -eq "double") { 2 } else { 1 }
     $at = [PanelRig.Mouse]::Click($target.X, $target.Y, $times)
+    $rec.Mark("click")
     $script:Clicked = "$($target.What), $times time(s), with the pointer at $at"
     $rec.Note("clicked $script:Clicked")
     Say "Clicked $script:Clicked"
@@ -592,6 +645,7 @@ try {
         $x = $inside.CenterX
         $y = $inside.Top + 4
         $at = [PanelRig.Mouse]::Click($x, $y, 1)
+        $rec.Mark("inside")
         $rec.Note("clicked inside the panel at $at")
         Say "Clicked inside the panel ($inside) at $at"
         $rec.Burst("after-the-click-inside", 11, 100)
@@ -601,6 +655,7 @@ try {
     }
     $rec.Shot("the-end")
     Test-TaskbarButtons $rec "at the end"
+    Invoke-Judge $rec
 } finally {
     # The quit's own clicks go to the timeline and the pictures too.
     if ($app) {
@@ -612,8 +667,9 @@ try {
     Set-AppEnvironment $false
     Remove-Item -LiteralPath (Join-Path ([Environment]::GetFolderPath("Desktop")) "$ShortcutName.lnk") -ErrorAction SilentlyContinue
 
-    # The step summary: the variation, what the pictures show, the commands
-    # the windows got, the shell's lines from the app's log.
+    # The step summary: the variation, the verdict, what the pictures show,
+    # the commands the windows got, the shell's lines from the app's log.
+    $failed = @($rec.Expectations | Where-Object { -not $_.Met })
     if ($env:GITHUB_STEP_SUMMARY) {
         $appLog = Join-Path $Out "app-stream-to-speaker.log"
         $shellLines = @()
@@ -632,7 +688,11 @@ try {
             ""
             "Clicked: $script:Clicked."
             ""
-            "The app's windows' styles and taskbar buttons: $(if ($rec.Problems.Count -eq 0) { 'as the shell keeps them' } else { 'PROBLEMS' })"
+            "Verdict: $(if ($failed.Count -eq 0 -and $rec.Problems.Count -eq 0 -and $rec.Expectations.Count -gt 0) { 'passed' } else { 'FAILED' })"
+            ""
+        ) + @($rec.Expectations | ForEach-Object { "- Expectation $_" }) + @(
+            ""
+            "The app's windows' styles, taskbar buttons and quit: $(if ($rec.Problems.Count -eq 0) { 'as they must be' } else { 'PROBLEMS' })"
             ""
         ) + @($rec.Problems | ForEach-Object { "- Problem: $_" }) + @($script:Warnings | ForEach-Object { "- Not as the case asked: $_" }) + @(
             ""
@@ -643,7 +703,8 @@ try {
         $summary | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
     }
 }
-if ($rec.Problems.Count -gt 0) {
-    throw "the app's windows didn't stay as the shell keeps them: $($rec.Problems -join '; ')"
+$failed = @($rec.Expectations | Where-Object { -not $_.Met })
+if ($failed.Count -gt 0 -or $rec.Problems.Count -gt 0) {
+    throw "the case failed: $(@($failed | ForEach-Object { $_.ToString() }) + @($rec.Problems) -join '; ')"
 }
 Say "Done"

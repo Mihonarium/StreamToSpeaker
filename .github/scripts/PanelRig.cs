@@ -120,6 +120,17 @@ namespace PanelRig
         [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr obj);
         [DllImport("gdi32.dll", SetLastError = true)] public static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, uint rop);
         [DllImport("shell32.dll")] public static extern int Shell_NotifyIconGetRect(ref NOTIFYICONIDENTIFIER id, out RECT r);
+        [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+        [DllImport("user32.dll")] public static extern bool GetMonitorInfoW(IntPtr monitor, ref MONITORINFO info);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MONITORINFO
+        {
+            public uint cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public uint dwFlags;
+        }
     }
 
     /// <summary>A rectangle in physical pixels, as Windows gives them.</summary>
@@ -278,6 +289,17 @@ namespace PanelRig
             var p = new Native.POINT();
             if (!Native.ClientToScreen(h, ref p)) return null;
             return new Box(p.X, p.Y, p.X + r.Right, p.Y + r.Bottom);
+        }
+
+        /// <summary>The work area (the display without the taskbar) of the display window <paramref name="h"/> is on; null when Windows doesn't say.</summary>
+        public static Box WorkAreaOf(IntPtr h)
+        {
+            IntPtr monitor = Native.MonitorFromWindow(h, 2); // MONITOR_DEFAULTTONEAREST
+            if (monitor == IntPtr.Zero) return null;
+            var info = new Native.MONITORINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(Native.MONITORINFO));
+            if (!Native.GetMonitorInfoW(monitor, ref info)) return null;
+            return new Box(info.rcWork.Left, info.rcWork.Top, info.rcWork.Right, info.rcWork.Bottom);
         }
 
         /// <summary>The taskbar's window on the main monitor; zero when there is no taskbar.</summary>
@@ -561,22 +583,170 @@ namespace PanelRig
     /// Pictures and a line about the windows every so often, from a start;
     /// the pictures stay in memory until saved, so the timing holds.
     /// </summary>
+    /// <summary>What one picture saw of the app's panel.</summary>
+    public sealed class Seen
+    {
+        /// <summary>The label of the picture's burst ("start", "after-the-click", ...) or of the single picture.</summary>
+        public string Burst;
+        public string Picture;
+        /// <summary>When, in seconds on the recorder's clock.</summary>
+        public double At;
+        /// <summary>How many panel windows were shown.</summary>
+        public int Panels;
+        /// <summary>The shown panel's place and its display's work area; null when no panel was shown.</summary>
+        public Box Rect;
+        public Box WorkArea;
+    }
+
+    /// <summary>One thing a case expects, and whether the pictures showed it.</summary>
+    public sealed class Expectation
+    {
+        public string What;
+        public bool Met;
+        public string Why;
+
+        public override string ToString()
+        {
+            return (Met ? "met: " : "FAILED: ") + What + (Met || string.IsNullOrEmpty(Why) ? "" : " (" + Why + ")");
+        }
+    }
+
+    /// <summary>
+    /// The expectations a case can state about the panel, judged on the same
+    /// observations the timeline prints, one per picture.
+    /// </summary>
+    public static class Judge
+    {
+        static List<Seen> In(List<Seen> seen, string burst)
+        {
+            var list = new List<Seen>();
+            foreach (Seen s in seen) if (s.Burst == burst) list.Add(s);
+            return list;
+        }
+
+        static Expectation E(string what, bool met, string why)
+        {
+            var e = new Expectation();
+            e.What = what;
+            e.Met = met;
+            e.Why = why;
+            return e;
+        }
+
+        /// <summary>A picture of <paramref name="burst"/> shows the panel within <paramref name="within"/> s of <paramref name="at"/>.</summary>
+        public static Expectation OpensWithin(List<Seen> seen, string burst, double at, double within, string after)
+        {
+            string what = string.Format("The panel is shown within {0:0.0} s of the {1}", within, after);
+            List<Seen> b = In(seen, burst);
+            foreach (Seen s in b)
+            {
+                if (s.Panels < 1) continue;
+                double t = s.At - at;
+                return E(what, t <= within, string.Format("it was first shown {0:0.00} s after it, in picture {1}", t, s.Picture));
+            }
+            return E(what, false, string.Format("none of the {0} pictures of the {1:0.0} s after it shows it", b.Count, b.Count > 0 ? b[b.Count - 1].At - at : 0));
+        }
+
+        /// <summary>From the first picture of <paramref name="burst"/> that shows the panel, every later one of it does, the last included.</summary>
+        public static Expectation StaysThrough(List<Seen> seen, string burst, double at, string during)
+        {
+            string what = "Once shown, the panel stays shown through " + during;
+            List<Seen> b = In(seen, burst);
+            int first = b.FindIndex(delegate (Seen s) { return s.Panels >= 1; });
+            if (first < 0) return E(what, false, "it isn't shown in any of its pictures");
+            for (int i = first + 1; i < b.Count; i++)
+            {
+                if (b[i].Panels < 1)
+                    return E(what, false, string.Format("it was gone in picture {0}, {1:0.00} s after the click, {2:0.00} s after it was first shown", b[i].Picture, b[i].At - at, b[i].At - b[first].At));
+            }
+            return E(what, true, "");
+        }
+
+        /// <summary>Every picture of <paramref name="burst"/> shows the panel (and there are some).</summary>
+        public static Expectation ShownThroughout(List<Seen> seen, string burst, string what, string whenNone)
+        {
+            List<Seen> b = In(seen, burst);
+            if (b.Count == 0) return E(what, false, whenNone);
+            foreach (Seen s in b)
+                if (s.Panels < 1) return E(what, false, "it was gone in picture " + s.Picture);
+            return E(what, true, "");
+        }
+
+        /// <summary>The single picture labelled <paramref name="burst"/> shows the panel, or (with <paramref name="shown"/> false) doesn't.</summary>
+        public static Expectation ShownIn(List<Seen> seen, string burst, bool shown, string what)
+        {
+            List<Seen> b = In(seen, burst);
+            if (b.Count == 0) return E(what, false, "there is no such picture");
+            Seen s = b[b.Count - 1];
+            bool met = shown ? s.Panels >= 1 : s.Panels == 0;
+            return E(what, met, met ? "" : string.Format("picture {0} shows {1} panel(s)", s.Picture, s.Panels));
+        }
+
+        /// <summary>Within <paramref name="within"/> s of <paramref name="at"/> a picture of <paramref name="burst"/> shows no panel, and no later one of it shows one.</summary>
+        public static Expectation ClosesWithin(List<Seen> seen, string burst, double at, double within, string after)
+        {
+            string what = string.Format("The {0} closes the panel within {1:0.0} s, and it stays closed", after, within);
+            List<Seen> b = In(seen, burst);
+            int gone = b.FindIndex(delegate (Seen s) { return s.Panels == 0; });
+            if (gone < 0) return E(what, false, string.Format("it is shown in all {0} pictures after it", b.Count));
+            if (b[gone].At - at > within) return E(what, false, string.Format("it was still shown {0:0.00} s after it", b[gone].At - at));
+            for (int i = gone + 1; i < b.Count; i++)
+                if (b[i].Panels > 0) return E(what, false, "it was shown again in picture " + b[i].Picture);
+            return E(what, true, "");
+        }
+
+        /// <summary>Whenever a picture shows the panel, its window lies inside its display's work area.</summary>
+        public static Expectation InsideWorkArea(List<Seen> seen)
+        {
+            const string what = "Whenever the panel is shown, its window lies inside the work area of its display";
+            foreach (Seen s in seen)
+            {
+                if (s.Panels < 1 || s.Rect == null) continue;
+                Box r = s.Rect, w = s.WorkArea;
+                if (w == null) return E(what, false, "picture " + s.Picture + ": no display found for it");
+                if (r.Left < w.Left || r.Top < w.Top || r.Right > w.Right || r.Bottom > w.Bottom)
+                    return E(what, false, string.Format("picture {0}: it was {1}, the work area {2}", s.Picture, r, w));
+            }
+            return E(what, true, "");
+        }
+
+        /// <summary>No picture shows more than one panel.</summary>
+        public static Expectation OnePanel(List<Seen> seen)
+        {
+            const string what = "There is never more than one panel";
+            foreach (Seen s in seen)
+                if (s.Panels > 1) return E(what, false, string.Format("picture {0} shows {1}", s.Picture, s.Panels));
+            return E(what, true, "");
+        }
+    }
+
+    /// <summary>What a window of the app is, for the checks.</summary>
+    public enum Role { Other, Panel, Root, SmallWindow, Dialog }
+
     public sealed class Recorder
     {
         readonly Stopwatch clock = Stopwatch.StartNew();
         readonly List<Picture> pictures = new List<Picture>();
         readonly List<string> lines = new List<string>();
+        readonly List<Seen> seen = new List<Seen>();
+        readonly Dictionary<string, double> marks = new Dictionary<string, double>();
+        readonly List<Expectation> expectations = new List<Expectation>();
         readonly string panelTitle;
         readonly string rootTitle;
         readonly List<string> problems = new List<string>();
         uint pid;
         int count;
 
-        /// <summary>The panel is a flyout (out of Alt+Tab) rather than a small window.</summary>
+        /// <summary>The panel is a flyout (out of Alt+Tab) rather than an ordinary window.</summary>
         public bool PanelIsFlyout = true;
 
         /// <summary>What went against what the app's windows must be, each once, in the order found.</summary>
         public List<string> Problems { get { return problems; } }
+
+        /// <summary>What the case expected, judged.</summary>
+        public List<Expectation> Expectations { get { return expectations; } }
+
+        public List<Seen> Observations { get { return seen; } }
 
         /// <summary>Note a problem, once.</summary>
         public void Problem(string what)
@@ -586,33 +756,97 @@ namespace PanelRig
             Note("PROBLEM: " + what);
         }
 
-        const long WS_EX_TOOLWINDOW = 0x00000080, WS_EX_NOACTIVATE = 0x08000000, WS_EX_APPWINDOW = 0x00040000;
+        const long WS_EX_TOPMOST = 0x00000008, WS_EX_TOOLWINDOW = 0x00000080, WS_EX_NOACTIVATE = 0x08000000, WS_EX_APPWINDOW = 0x00040000;
+
+        static long ExStyle(Win w)
+        {
+            return Native.GetWindowLongPtrW(w.Handle, -20).ToInt64();
+        }
+
+        /// <summary>
+        /// What a window of the app is. The root window by its own title,
+        /// which no other window has. The panel and the small windows by
+        /// the clock are the app's windows made on top (WS_EX_TOPMOST, which
+        /// winit keeps from the window level), told apart by their titles;
+        /// the app's dialogs share the panel's title but are never made on
+        /// top, so a dialog is never taken for the panel, and a panel that
+        /// lost "on top" is found nowhere, which fails the case's
+        /// expectations of the panel. Message boxes (#32770), menus
+        /// (#32768) and the tray icon's own window are none of these;
+        /// another shown window of the app is a dialog.
+        /// </summary>
+        public Role RoleOf(Win w)
+        {
+            if (w.Title == rootTitle) return Role.Root;
+            if (w.Class == "#32768" || w.Class == "tray_icon_app") return Role.Other;
+            if (w.Class != "#32770" && (ExStyle(w) & WS_EX_TOPMOST) != 0)
+            {
+                if (w.Title == panelTitle) return Role.Panel;
+                if (w.Title.StartsWith(panelTitle + " confirmation") || w.Title.StartsWith(panelTitle + " notification")) return Role.SmallWindow;
+            }
+            return w.Visible ? Role.Dialog : Role.Other;
+        }
+
+        List<Win> WithRole(Role role)
+        {
+            var list = new List<Win>();
+            if (pid == 0) return list;
+            foreach (Win w in Windows.Of(pid)) if (RoleOf(w) == role) list.Add(w);
+            return list;
+        }
 
         /// <summary>
         /// The styles the shell keeps on its windows, checked on every one
-        /// of them that is shown: none an app window (forced onto the
-        /// taskbar); the panel as a flyout, the root window and the small
-        /// windows tool windows (out of the taskbar and Alt+Tab); the root
-        /// window and the small windows never activated. Dialogs and message
-        /// boxes are left out: they belong on the taskbar.
+        /// of them that is shown: the panel as a flyout a tool window (out
+        /// of the taskbar and Alt+Tab) and no app window; the panel as an
+        /// ordinary window no tool window (on the taskbar and in Alt+Tab);
+        /// the root window and the small windows tool windows, never
+        /// activated and no app windows. The app's dialogs and message
+        /// boxes are left out (see RoleOf): they belong on the taskbar.
         /// </summary>
         void CheckStyles()
         {
             if (pid == 0) return;
             foreach (Win w in Windows.Of(pid))
             {
-                if (!w.Visible || w.Class == "#32770") continue;
-                string which;
-                bool tool, never;
-                if (w.Title == panelTitle) { which = "the panel's window"; tool = PanelIsFlyout; never = false; }
-                else if (w.Title == rootTitle) { which = "the root window"; tool = true; never = true; }
-                else if (w.Title.StartsWith(panelTitle + " confirmation") || w.Title.StartsWith(panelTitle + " notification")) { which = "the small window \"" + w.Title + "\""; tool = true; never = true; }
-                else continue;
-                long ex = Native.GetWindowLongPtrW(w.Handle, -20).ToInt64();
-                if ((ex & WS_EX_APPWINDOW) != 0) Problem(which + " is shown as an app window (forced onto the taskbar)");
-                if (tool && (ex & WS_EX_TOOLWINDOW) == 0) Problem(which + " is shown without the tool-window style (in Alt+Tab and the taskbar)");
-                if (never && (ex & WS_EX_NOACTIVATE) == 0) Problem(which + " is shown without the never-activate style");
+                if (!w.Visible) continue;
+                Role role = RoleOf(w);
+                long ex = ExStyle(w);
+                bool tool = (ex & WS_EX_TOOLWINDOW) != 0, never = (ex & WS_EX_NOACTIVATE) != 0, app = (ex & WS_EX_APPWINDOW) != 0;
+                if (role == Role.Panel && PanelIsFlyout)
+                {
+                    if (app) Problem("the panel's window is shown as an app window (forced onto the taskbar)");
+                    if (!tool) Problem("the panel's window is shown without the tool-window style (in Alt+Tab and the taskbar)");
+                }
+                else if (role == Role.Panel)
+                {
+                    if (tool) Problem("the panel as an ordinary window is shown as a tool window (no taskbar button, not in Alt+Tab)");
+                }
+                else if (role == Role.Root || role == Role.SmallWindow)
+                {
+                    string which = role == Role.Root ? "the root window" : "the small window \"" + w.Title + "\"";
+                    if (app) Problem(which + " is shown as an app window (forced onto the taskbar)");
+                    if (!tool) Problem(which + " is shown without the tool-window style (in Alt+Tab and the taskbar)");
+                    if (!never) Problem(which + " is shown without the never-activate style");
+                }
             }
+        }
+
+        /// <summary>
+        /// Whether a window of the app that belongs on the taskbar is shown
+        /// (a dialog, a message box, the panel as an ordinary window): then
+        /// a taskbar button with the app's name is expected.
+        /// </summary>
+        public bool TaskbarWindowShown()
+        {
+            if (pid == 0) return false;
+            foreach (Win w in Windows.Of(pid))
+            {
+                if (!w.Visible) continue;
+                Role role = RoleOf(w);
+                if (role == Role.Dialog || (role == Role.Panel && !PanelIsFlyout)) return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -628,9 +862,10 @@ namespace PanelRig
         /// <summary>The root window: shown or hidden, and its style; "none" when it isn't there.</summary>
         public string Root()
         {
+            List<Win> roots = WithRole(Role.Root);
             if (pid == 0) return "(no app yet)";
-            Win w = Windows.Titled(pid, rootTitle);
-            if (w == null) return "none";
+            if (roots.Count == 0) return "none";
+            Win w = roots[0];
             return (w.Visible ? "shown" : "hidden") + " (" + Windows.Style(w.Handle) + ")";
         }
 
@@ -642,28 +877,62 @@ namespace PanelRig
 
         public List<string> Lines { get { return lines; } }
 
+        /// <summary>Note the time of <paramref name="what"/> ("click", "inside"), for the expectations.</summary>
+        public void Mark(string what)
+        {
+            marks[what] = clock.Elapsed.TotalSeconds;
+            Note("mark: " + what);
+        }
+
+        /// <summary>The time noted for <paramref name="what"/>; negative when it wasn't.</summary>
+        public double MarkOf(string what)
+        {
+            double t;
+            return marks.TryGetValue(what, out t) ? t : -1;
+        }
+
+        public bool Marked(string what)
+        {
+            return marks.ContainsKey(what);
+        }
+
+        /// <summary>Add an expectation's verdict, and note it in the timeline.</summary>
+        public void Expect(Expectation e)
+        {
+            expectations.Add(e);
+            Note("expectation " + e);
+        }
+
+        /// <summary>The panel's windows, shown first.</summary>
+        List<Win> Panels()
+        {
+            List<Win> all = WithRole(Role.Panel);
+            all.Sort(delegate (Win a, Win b) { return b.Visible.CompareTo(a.Visible); });
+            return all;
+        }
+
         /// <summary>The panel's window: shown or hidden, where; "none" when it isn't there.</summary>
         public string Panel()
         {
             if (pid == 0) return "(no app yet)";
-            Win w = Windows.Titled(pid, panelTitle);
-            if (w == null) return "none";
-            return (w.Visible ? "shown " : "hidden ") + w.Rect + " (" + Windows.Style(w.Handle) + ")";
+            List<Win> panels = Panels();
+            if (panels.Count == 0) return "none";
+            Win w = panels[0];
+            string more = panels.Count > 1 ? string.Format(" (and {0} more)", panels.Count - 1) : "";
+            return (w.Visible ? "shown " : "hidden ") + w.Rect + " (" + Windows.Style(w.Handle) + ")" + more;
         }
 
         public bool PanelShown()
         {
-            if (pid == 0) return false;
-            Win w = Windows.Titled(pid, panelTitle);
-            return w != null && w.Visible && !w.Rect.IsEmpty;
+            foreach (Win w in Panels()) if (w.Visible && !w.Rect.IsEmpty) return true;
+            return false;
         }
 
-        /// <summary>The panel's window inside its frame, on the desktop; null when it isn't there.</summary>
+        /// <summary>The shown panel's window inside its frame, on the desktop; null when none is shown.</summary>
         public Box PanelClient()
         {
-            if (pid == 0) return null;
-            Win w = Windows.Titled(pid, panelTitle);
-            return w == null ? null : Windows.ClientOf(w.Handle);
+            foreach (Win w in Panels()) if (w.Visible) return Windows.ClientOf(w.Handle);
+            return null;
         }
 
         /// <summary>How many of the pictures so far show the panel's window on screen.</summary>
@@ -676,17 +945,38 @@ namespace PanelRig
             lines.Add(string.Format("{0} +{1,7:0.000}s  {2}", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"), clock.Elapsed.TotalSeconds, what));
         }
 
-        /// <summary>One picture now, and what the windows were.</summary>
-        public void Shot(string label)
+        /// <summary>One picture now, and what the windows were; <paramref name="burst"/> names it for the expectations.</summary>
+        public void Shot(string label, string burst)
         {
             count++;
             string name = string.Format("{0:000}-{1}", count, label);
             Picture p = Picture.Take(name);
             pictures.Add(p);
+            var s = new Seen();
+            s.Burst = burst;
+            s.Picture = name;
+            s.At = clock.Elapsed.TotalSeconds;
+            foreach (Win w in Panels())
+            {
+                if (!w.Visible || w.Rect.IsEmpty) continue;
+                s.Panels++;
+                if (s.Rect == null)
+                {
+                    s.Rect = w.Rect;
+                    s.WorkArea = Windows.WorkAreaOf(w.Handle);
+                }
+            }
+            seen.Add(s);
             PictureCount++;
-            if (PanelShown()) ShownCount++;
+            if (s.Panels > 0) ShownCount++;
             Note(string.Format("picture {0}: panel {1}; root {2}; foreground {3}; pointer {4}", name, Panel(), Root(), Windows.Foreground(), Desk.Cursor()));
             CheckStyles();
+        }
+
+        /// <summary>One picture now, on its own.</summary>
+        public void Shot(string label)
+        {
+            Shot(label, label);
         }
 
         /// <summary><paramref name="n"/> pictures, one every <paramref name="everyMs"/> milliseconds.</summary>
@@ -698,7 +988,7 @@ namespace PanelRig
                 long due = (long)i * everyMs;
                 long wait = due - start.ElapsedMilliseconds;
                 if (wait > 0) Thread.Sleep((int)wait);
-                Shot(string.Format("{0}-{1:0000}ms", label, start.ElapsedMilliseconds));
+                Shot(string.Format("{0}-{1:0000}ms", label, start.ElapsedMilliseconds), label);
             }
         }
 
