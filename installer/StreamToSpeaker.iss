@@ -185,8 +185,8 @@ ExtrasLeft=Windows still shows more than one Stream To Speaker output, and only 
 SoundMoved=Setup closed Stream To Speaker and doesn't start it again, so Windows now plays to the sound output it used before.
 EarlierNotEmpty=Stream To Speaker is now in %1. The folder it was in before, %2, still holds other files, so Setup left the folder in place.
 EarlierLeftAlone=Stream To Speaker is now in %1. The folder it was in before, %2, is a link or lies inside one, so Setup left it as it was; delete it yourself when you no longer need it.
-StageFailedKept=Stream To Speaker is installed, but Windows didn't accept its new sound driver, so this PC keeps the driver it had.%n%nWhy Windows refused it is in %1; attach that file if you report the problem.
-StageFailed=Stream To Speaker is installed, but Windows didn't accept its sound driver, so it can't play this PC's sound.%n%nWhy Windows refused it is in %1; attach that file if you report the problem.
+StageFailedKept=Stream To Speaker is installed, but Windows didn't accept its new sound driver, so this PC keeps the driver it had.%n%nWhy Windows refused it is in %2. To report the problem, don't post that file (it names your Windows account and this PC): run this in PowerShell and post what it prints.%n%n%1
+StageFailed=Stream To Speaker is installed, but Windows didn't accept its sound driver, so it can't play this PC's sound.%n%nWhy Windows refused it is in %2. To report the problem, don't post that file (it names your Windows account and this PC): run this in PowerShell and post what it prints.%n%n%1
 TrustFailed=Stream To Speaker is installed, but Windows didn't accept this test build's certificate, so its sound driver isn't installed.%n%nDetails are in %1.
 DeviceFailedKept=Stream To Speaker is installed, but Windows couldn't update its sound device; the device still has the driver it had before.%n%nDetails are in %1.
 DeviceFailed=Stream To Speaker is installed, but Windows couldn't set up its sound device.%n%nDetails are in %1.
@@ -690,14 +690,18 @@ end;
 
 function FailureText(): String;
 var
-  LogPath: String;
+  LogPath, Diagnose: String;
 begin
   LogPath := InstallLogPath();
+  // For a report, what the diagnosis script prints and not the install log
+  // itself: the log names the account and the PC, which the script
+  // replaces where it finds them.
+  Diagnose := 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\Diagnose.ps1') + '"';
   if DriverOutcome = 'stage-failed' then begin
     if DriverKeptBefore then
-      Result := FmtMessage(CustomMessage('StageFailedKept'), [LogPath])
+      Result := FmtMessage(CustomMessage('StageFailedKept'), [Diagnose, LogPath])
     else
-      Result := FmtMessage(CustomMessage('StageFailed'), [LogPath]);
+      Result := FmtMessage(CustomMessage('StageFailed'), [Diagnose, LogPath]);
   end else if DriverOutcome = 'trust-failed' then
     Result := FmtMessage(CustomMessage('TrustFailed'), [LogPath])
   else if DriverOutcome = 'test-signing-off' then
