@@ -59,6 +59,7 @@ class FakeGh:
             fields = dict(a.split("=", 1) for a in args if "=" in a)
             rel = release(fields["tag_name"], rid=99)
             rel["target_commitish"] = fields["target_commitish"]
+            rel["body"] = fields.get("body", "")
             self.hidden.append(rel)
             return json.dumps(rel)
         if args[:2] == ("release", "download"):
@@ -67,6 +68,9 @@ class FakeGh:
                 with open(os.path.join(directory, name), "wb") as fh:
                     fh.write(data)
             return ""
+        if args[0] == "api" and len(args) == 2 and "/releases/" in args[1] and args[1].rsplit("/", 1)[1].isdigit():
+            rid = int(args[1].rsplit("/", 1)[1])
+            return json.dumps(next(r for r in self.releases + self.hidden if r["id"] == rid))
         if args[0] == "api" and "/git/ref/tags/" in args[1]:
             target = self.tags.get(args[1].rsplit("/", 1)[1])
             if target is None:
@@ -144,7 +148,7 @@ class FindingTheDraft(unittest.TestCase):
             rd.require_draft(REPO, "v0.1.11", FakeGh([release("v0.1.11", rid=1), release("v0.1.11", rid=2)]))
 
     def creates(self, gh):
-        return [c for c in gh.calls if c[:3] == ("api", "--method", "POST")]
+        return [c for c in gh.calls if c[:3] == ("api", "--method", "POST") and c[3].endswith("/releases")]
 
     def test_ensure_creates_once_for_the_tagged_commit(self):
         gh = FakeGh([release("v0.1.10", rid=1, draft=False)])
@@ -153,8 +157,11 @@ class FindingTheDraft(unittest.TestCase):
         self.assertEqual(rel["id"], 99)
         create = self.creates(gh)
         self.assertEqual(len(create), 1)
-        for field in ("tag_name=v0.1.11", "draft=true", "generate_release_notes=true", f"target_commitish={COMMIT}"):
+        for field in ("tag_name=v0.1.11", "draft=true", f"target_commitish={COMMIT}"):
             self.assertIn(field, create[0])
+        # Notes generated for this commit, and the commit named in them.
+        self.assertTrue(any(a.startswith("body=changes up to " + COMMIT) and rd.notes_marker(COMMIT) in a
+                            for a in create[0]))
         # A re-run finds the draft and creates nothing.
         rel, created = rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
         self.assertFalse(created)
@@ -612,22 +619,39 @@ class Versions_(unittest.TestCase):
 
 
 class MovedTag(unittest.TestCase):
+    """The draft's notes name the commit they were generated for; GitHub's
+    target_commitish of a draft whose tag exists is not relied on."""
+
+    def draft(self, body, target=COMMIT):
+        rel = release("v0.1.11", rid=5)
+        rel["target_commitish"] = target
+        rel["body"] = body
+        return FakeGh([rel])
+
+    def ensure(self, gh):
+        return rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+
+    def notes_writes(self, gh):
+        return [c for c in gh.calls if c[:3] in (("api", "--method", "PATCH"), ("api", "--method", "POST"))]
+
     def test_a_draft_made_for_another_commit_gets_the_notes_of_this_one(self):
         # The tag was deleted and pushed again at COMMIT after a run of
         # OTHER made the draft: its generated notes describe OTHER.
-        rel = release("v0.1.11", rid=5)
-        rel["target_commitish"] = OTHER
-        rel["body"] = f"changes up to {OTHER}"
-        gh = FakeGh([rel])
-        found, created = rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
+        gh = self.draft(f"changes up to {OTHER}\n\n{rd.notes_marker(OTHER)}", target=OTHER)
+        found, created = self.ensure(gh)
         self.assertFalse(created)
-        self.assertEqual((gh.releases[0]["target_commitish"], gh.releases[0]["body"]),
-                         (COMMIT, f"changes up to {COMMIT}"))
-        # The draft of this commit is left as it is.
-        calls = len(gh.calls)
-        rd.ensure_draft(REPO, "v0.1.11", commit=COMMIT, run=gh, sleep=lambda s: None)
-        self.assertFalse([c for c in gh.calls[calls:] if c[:3] in (("api", "--method", "PATCH"),
-                                                                   ("api", "--method", "POST"))])
+        self.assertEqual(gh.releases[0]["body"], f"changes up to {COMMIT}\n\n{rd.notes_marker(COMMIT)}")
+
+    def test_the_draft_of_this_commit_is_left_as_it_is_whatever_target_commitish_says(self):
+        gh = self.draft(f"edited by hand\n\n{rd.notes_marker(COMMIT)}", target="main")
+        self.ensure(gh)
+        self.assertEqual(self.notes_writes(gh), [])
+        self.assertEqual(gh.releases[0]["body"], f"edited by hand\n\n{rd.notes_marker(COMMIT)}")
+
+    def test_a_draft_whose_notes_name_no_commit_gets_this_commit_s(self):
+        gh = self.draft("notes of unknown origin")
+        self.ensure(gh)
+        self.assertEqual(gh.releases[0]["body"], f"changes up to {COMMIT}\n\n{rd.notes_marker(COMMIT)}")
 
 
 class TwoTagsAtOnce(unittest.TestCase):

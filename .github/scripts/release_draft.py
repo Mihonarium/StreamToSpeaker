@@ -18,9 +18,10 @@ with push access, never to `releases/latest` (the app's update check), the
       Create the draft for <tag> (generated notes) unless it exists, and
       wait until the release list shows it (the list lags behind a fresh
       release by a moment). --commit: the tag must exist and point at SHA,
-      whether the draft is created now or already exists; a draft an
-      earlier run made for another commit (the tag was moved since) gets
-      this commit as its target and notes generated for it. --target: for
+      whether the draft is created now or already exists. The notes are
+      generated for the commit and end with a hidden line naming it; a
+      draft whose notes name another commit (the tag was moved since an
+      earlier run made it), or none, gets notes generated for this one. --target: for
       a tag that does not exist yet (it would be created at SHA on
       publishing). Fails when <tag> is already a published release or has
       more than one release.
@@ -189,8 +190,21 @@ def require_draft(repo, tag, run=gh, sleep=time.sleep, waits=(2, 5, 10), commit=
         raise ReleaseError(f"{len(rels)} releases carry the tag {tag}; delete all but one draft")
     rel = rels[0]
     if rel.get("draft") is not True:
-        raise ReleaseError(f"{tag} is already a published release; a published release is never modified")
+        raise ReleaseError(f"{tag} is already a published release; the assets and notes of a published release are never changed")
     return rel
+
+
+def notes_marker(commit):
+    """The line, hidden when GitHub renders the notes, that names the
+    commit a draft's notes were generated for."""
+    return f"<!-- release notes generated for commit {commit} -->"
+
+
+def generated_notes(repo, tag, commit, run=gh):
+    """GitHub's generated notes for `tag` at `commit`, with notes_marker."""
+    notes = json.loads(run("api", "--method", "POST", f"repos/{repo}/releases/generate-notes",
+                           "-f", f"tag_name={tag}", "-f", f"target_commitish={commit}"))
+    return f"{notes.get('body') or ''}\n\n{notes_marker(commit)}"
 
 
 def ensure_draft(repo, tag, commit=None, target=None, run=gh, sleep=time.sleep):
@@ -207,18 +221,17 @@ def ensure_draft(repo, tag, commit=None, target=None, run=gh, sleep=time.sleep):
     rels = releases_for(repo, tag, run)
     if rels:
         rel = require_draft(repo, tag, run, sleep)
-        if commit and rel.get("target_commitish") != commit:
-            # The tag was moved since an earlier run made this draft: its
-            # notes describe the changes up to the old commit.
-            notes = json.loads(run("api", "--method", "POST", f"repos/{repo}/releases/generate-notes",
-                                   "-f", f"tag_name={tag}", "-f", f"target_commitish={commit}"))
+        body = json.loads(run("api", f"repos/{repo}/releases/{int(rel['id'])}")).get("body") or ""
+        if commit and notes_marker(commit) not in body:
+            # The notes were generated for another commit (the tag was moved
+            # since an earlier run made this draft), or name none.
             run("api", "--method", "PATCH", f"repos/{repo}/releases/{int(rel['id'])}",
-                "-f", f"target_commitish={commit}", "-f", f"body={notes.get('body') or ''}")
+                "-f", f"target_commitish={commit}", "-f", f"body={generated_notes(repo, tag, commit, run)}")
             rel = require_draft(repo, tag, run, sleep)
         return rel, False
     created = json.loads(run("api", "--method", "POST", f"repos/{repo}/releases",
                              "-f", f"tag_name={tag}", "-f", f"name={tag}", "-f", f"target_commitish={sha}",
-                             "-F", "draft=true", "-F", "generate_release_notes=true"))
+                             "-f", f"body={generated_notes(repo, tag, sha, run)}", "-F", "draft=true"))
     if created.get("draft") is not True or created.get("tag_name") != tag:
         raise ReleaseError(f"creating the draft for {tag} returned an unexpected release")
     for w in (0,) + LIST_WAITS:
