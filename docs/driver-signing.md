@@ -730,7 +730,10 @@ same wherever `package` runs; the compressed bytes inside it come from
 that machine's zlib, and another zlib may compress the same files
 differently. So a package is made once and handed on as a file, and
 nothing rebuilds a published package: every check compares it with the
-SHA-256 its manifest records.
+SHA-256 its manifest records. For the same reason, running Driver
+certified again with `driver-v1.1.0.209`'s inputs makes a package with
+another SHA-256 than the published one, and the run is refused like any
+run with other inputs; the release stays as it is.
 
 ## Reproducibility check (`driver-reproducibility.yml`)
 
