@@ -45,13 +45,16 @@ pub trait PopupContent {
 /// one of the same kind replaces the one showing.
 pub type PopupDoor = Box<dyn Fn(PopupKind, Box<dyn PopupContent + Send>) + Send + Sync>;
 
-/// The window for a popup of `kind`: hidden until it is placed, then
-/// shown without being activated.
-pub fn popup_builder(kind: PopupKind, size: Vec2) -> ViewportBuilder {
+/// The window for a popup of `kind`, for a frame: hidden until it is placed
+/// (`shown` false), then shown without being activated. Its builder says
+/// what is wanted now, as the panel's does (see
+/// [`super::panel_window::PanelWindow::builder`]): eframe applies it again
+/// every frame.
+pub fn popup_builder(kind: PopupKind, size: Vec2, shown: bool) -> ViewportBuilder {
     ViewportBuilder::default()
         .with_title(kind.title())
         .with_inner_size(size)
-        .with_visible(false)
+        .with_visible(shown)
         .with_active(false)
         .with_decorations(false)
         .with_resizable(false)
@@ -135,7 +138,7 @@ mod tests {
     fn a_popup_sits_in_the_corner_by_the_clock_and_never_takes_the_focus() {
         let r = popup_rect(&[monitor()], None, Vec2::new(280.0, 72.0), None).unwrap();
         assert_eq!(r, PxRect::new(1920 - 12 - 280, 1032 - 12 - 72, 1920 - 12, 1032 - 12));
-        let b = popup_builder(PopupKind::Confirmation, Vec2::new(280.0, 72.0));
+        let b = popup_builder(PopupKind::Confirmation, Vec2::new(280.0, 72.0), false);
         assert_eq!((b.active, b.visible, b.taskbar, b.decorations), (Some(false), Some(false), Some(false), Some(false)));
         assert_eq!(b.window_level, Some(WindowLevel::AlwaysOnTop));
         assert_ne!(PopupKind::Confirmation.title(), super::super::PANEL_TITLE);

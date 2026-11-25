@@ -11,6 +11,8 @@
 //! setting, not a rewrite.
 
 pub mod content;
+#[cfg(test)]
+mod eframe_model;
 pub mod icons;
 pub mod panel_window;
 pub mod placement;
@@ -25,7 +27,7 @@ mod tray;
 mod win;
 
 #[cfg(windows)]
-pub use app::{app_icon, run, run_app, run_scripted};
+pub use app::{run, run_app, run_scripted};
 
 use egui::{Pos2, Vec2, ViewportBuilder, WindowLevel};
 
@@ -138,6 +140,11 @@ fn env_switches() -> impl Fn(&str) -> Option<String> {
 /// The switches `get` gives when `read`; none otherwise.
 fn switches(read: bool, get: impl Fn(&str) -> Option<String>) -> impl Fn(&str) -> Option<String> {
     move |name| if read { get(name) } else { None }
+}
+
+/// The app's mark, for the windows' title bars and taskbar buttons.
+pub fn app_icon() -> std::sync::Arc<egui::IconData> {
+    std::sync::Arc::new(egui::IconData { rgba: include_bytes!("../../../assets/window-brand-64.rgba").to_vec(), width: 64, height: 64 })
 }
 
 /// The root window's title (no one sees it).

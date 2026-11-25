@@ -86,6 +86,15 @@ pub enum Step {
     Close,
 }
 
+/// What the shell tells the panel's window after a frame that ended in
+/// `step`: to show itself and take the focus once it is in its place.
+pub fn commands(step: Step) -> Vec<egui::ViewportCommand> {
+    match step {
+        Step::Show => vec![egui::ViewportCommand::Visible(true), egui::ViewportCommand::Focus],
+        _ => Vec::new(),
+    }
+}
+
 /// What a frame of the panel's window saw.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Seen {
@@ -155,6 +164,16 @@ impl PanelWindow {
 
     pub fn shown(&self) -> bool {
         matches!(self.phase, Phase::Shown { .. })
+    }
+
+    /// Its window's builder for this frame: hidden until it is shown, then
+    /// shown. eframe applies a window's builder again every frame, and
+    /// egui 0.29's comparison sends its `visible` every frame (it compares
+    /// it with `active`): a builder that kept saying "hidden" hid the panel
+    /// the frame after it was shown. Saying what is wanted now holds with
+    /// that comparison and with one that sends only changes.
+    pub fn builder(&self, mode: PanelMode) -> egui::ViewportBuilder {
+        super::panel_builder(mode).with_visible(self.shown()).with_icon(super::app_icon())
     }
 
     /// Where it is on screen, once shown.
@@ -268,6 +287,7 @@ impl PanelWindow {
 
 #[cfg(test)]
 mod tests {
+    use super::super::eframe_model::Window;
     use super::super::placement::Monitor;
     use super::super::FakeDesktop;
     use super::*;
@@ -405,6 +425,84 @@ mod tests {
             assert_eq!(p.after_frame(Seen { focused: Some(false), ..seen(400.0) }, pinned, mode, &mut d), Step::Wait);
             assert_eq!(p.after_frame(Seen { focused: Some(true), ..seen(400.0) }, pinned, mode, &mut d), Step::Wait);
             assert_eq!(p.after_frame(Seen { focused: Some(false), ..seen(400.0) }, pinned, mode, &mut d), expect, "{mode:?} {pinned}");
+        }
+    }
+
+    /// The panel's window frame after frame as eframe drives it, through
+    /// measuring, placing and shown; the frame it was shown in.
+    fn panel_as_eframe_drives_it(mode: PanelMode, right_comparison: bool) -> (Window, usize) {
+        let mut d = desktop();
+        let mut p = PanelWindow::open(None);
+        let mut window: Option<Window> = None;
+        let mut shown_in = None;
+        for frame in 0..30 {
+            // As the shell does: the builder before the frame, the commands
+            // after it.
+            let builder = p.builder(mode);
+            let step = p.after_frame(seen(400.0), false, mode, &mut d);
+            let first = window.is_none();
+            let w = window.get_or_insert_with(|| Window::made(builder.clone(), right_comparison));
+            w.frame(&builder, commands(step), first);
+            if step == Step::Show {
+                shown_in = Some(frame);
+            }
+        }
+        (window.unwrap(), shown_in.expect("the panel was never shown"))
+    }
+
+    #[test]
+    fn once_the_panel_is_shown_nothing_hides_its_window() {
+        // egui 0.29.1's patch compares `visible` with `active`, and so sends
+        // a builder's `visible` again every frame; a library that compares
+        // it with `visible` sends it once. The window stays shown either way.
+        for mode in [PanelMode::Flyout, PanelMode::Window] {
+            for right_comparison in [false, true] {
+                let (w, shown_in) = panel_as_eframe_drives_it(mode, right_comparison);
+                assert!(shown_in >= 2, "it is measured and placed first");
+                for (frame, ran) in w.frames.iter().enumerate() {
+                    let hides = ran.iter().any(|c| matches!(c, egui::ViewportCommand::Visible(false)));
+                    assert!(frame <= shown_in || !hides, "{mode:?} {right_comparison}: frame {frame} hides it: {ran:?}");
+                }
+                assert!(w.visible, "{mode:?} {right_comparison}");
+                // And nothing shows it before it is in its place.
+                let early = w.frames[..shown_in].iter().flatten().any(|c| matches!(c, egui::ViewportCommand::Visible(true)));
+                assert!(!early, "{mode:?} {right_comparison}");
+            }
+        }
+    }
+
+    #[test]
+    fn once_a_popup_is_shown_nothing_hides_its_window() {
+        use super::super::popup::{popup_builder, PopupKind};
+        for right_comparison in [false, true] {
+            let size = egui::Vec2::new(280.0, 72.0);
+            // As the shell does: placed in its second frame, then shown.
+            let builder = |placed: bool| popup_builder(PopupKind::Confirmation, size, placed).with_icon(super::super::app_icon());
+            let mut w = Window::made(builder(false), right_comparison);
+            w.frame(&builder(false), Vec::new(), true);
+            assert!(!w.visible);
+            w.frame(&builder(true), vec![egui::ViewportCommand::Visible(true)], false);
+            for _ in 0..20 {
+                w.frame(&builder(true), Vec::new(), false);
+                assert!(w.visible, "{right_comparison}: {:?}", w.frames.last());
+            }
+        }
+    }
+
+    #[test]
+    fn eframe_never_shows_or_hides_the_root_window_by_itself() {
+        use super::super::{root_builder, RootMode};
+        for mode in [RootMode::Hidden, RootMode::ToolWindow] {
+            for right_comparison in [false, true] {
+                // eframe patches the root's window with what egui holds for
+                // the root: its default builder.
+                let mut w = Window::made(root_builder(mode).with_icon(super::super::app_icon()), right_comparison);
+                for k in 0..20 {
+                    w.frame(&egui::ViewportBuilder::default(), Vec::new(), k == 0);
+                }
+                let visible = w.frames.iter().flatten().filter(|c| matches!(c, egui::ViewportCommand::Visible(_))).count();
+                assert_eq!(visible, 0, "{mode:?} {right_comparison}");
+            }
         }
     }
 

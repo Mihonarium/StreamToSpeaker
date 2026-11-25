@@ -13,13 +13,13 @@ use egui::{Frame, ViewportBuilder, ViewportCommand, ViewportId};
 use windows_sys::Win32::Foundation::HWND;
 
 use super::content::WantedGate;
-use super::panel_window::{OpenView, PanelWindow, Seen, Step, Toggle, TrayClick};
+use super::panel_window::{self, OpenView, PanelWindow, Seen, Step, Toggle, TrayClick};
 use super::popup::{popup_builder, popup_rect, PopupContent, PopupKind, StandInPopup};
 use super::views::ViewMemory;
 use super::tray::{Tray, TrayEvent};
 use super::placement::PxRect;
 use super::win::{self, WindowsDesktop};
-use super::{centred, panel_builder, root_builder, Ask, Desktop, RootMode, ShellOptions, ViewContent, Views, WindowContent, Wiring, ROOT_TITLE};
+use super::{app_icon, centred, root_builder, Ask, Desktop, RootMode, ShellOptions, ViewContent, Views, WindowContent, Wiring, ROOT_TITLE};
 use crate::panel::view::{show_view, ViewState};
 use crate::model::command::{Command, Open, Surface};
 use crate::model::state::Place;
@@ -202,11 +202,6 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
         }),
     )
     .map_err(|e| anyhow!("the windows couldn't start: {e}"))
-}
-
-/// The app's mark, for the windows' title bars and taskbar buttons.
-pub fn app_icon() -> Arc<egui::IconData> {
-    Arc::new(egui::IconData { rgba: include_bytes!("../../../assets/window-brand-64.rgba").to_vec(), width: 64, height: 64 })
 }
 
 struct Shell {
@@ -467,7 +462,7 @@ impl Shell {
         let mode = self.opts.panel;
         let pinned = snap.first_run.is_some();
         let (port, desktop) = (&self.port, &mut self.desktop);
-        let builder = panel_builder(mode).with_icon(app_icon());
+        let builder = panel.builder(mode);
         let (commands, step, asked_to_close) = ctx.show_viewport_immediate(panel_id(), builder, |ctx, _class| {
             let t = theme::Theme::of(ctx);
             let (focused, inner_height, close) = ctx.input(|i| {
@@ -498,9 +493,8 @@ impl Shell {
                 .inner;
             let seen = Seen { natural_height: out.natural_height, close: out.close || close, inner_height, focused };
             let step = panel.after_frame(seen, pinned, mode, desktop);
-            if step == Step::Show {
-                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            for command in panel_window::commands(step) {
+                ctx.send_viewport_cmd(command);
             }
             ctx.request_repaint_after(METER);
             ((out.commands, asks), step, close)
@@ -552,7 +546,7 @@ impl Shell {
             }
             let t = theme::Theme::of(ctx);
             let content = &mut p.content;
-            let gone = ctx.show_viewport_immediate(popup_id(p.kind), popup_builder(p.kind, size).with_icon(app_icon()), |ctx, _class| {
+            let gone = ctx.show_viewport_immediate(popup_id(p.kind), popup_builder(p.kind, size, p.rect.is_some()).with_icon(app_icon()), |ctx, _class| {
                 egui::CentralPanel::default()
                     .frame(Frame::none().fill(t.c.surface).stroke(t.card_stroke()))
                     .show(ctx, |ui| content.show(ui, snap, now, &mut |_| {}))
