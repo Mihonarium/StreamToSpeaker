@@ -39,10 +39,11 @@
        on the taskbar.
     5. Judges the case: what it expects of the panel (see Invoke-Judge)
        against what the pictures saw. Then quits the app as a person does
-       (Quit in its tray icon's menu, by a right click and a click). A case
-       passes only when every expectation is met and no problem was found;
-       the step summary names each expectation, met or failed, in a
-       sentence.
+       (Quit in its tray icon's menu, by a right click and a click); the
+       case fails if the app doesn't end within 20 s, ends with an exit
+       code other than 0, or has to be ended by force. A case passes only
+       when every expectation is met and no problem was found; the step
+       summary names each expectation, met or failed, in a sentence.
 
     The machine has no sound device and no driver. Started as it is, the
     app would look for its driver, fall back to recording the default
@@ -365,8 +366,9 @@ function Invoke-TrayQuit($proc, $rec) {
 
 # End the app as a person does: Quit from its tray icon's menu, which runs
 # the app's own quit (the sound back to this PC, the speaker told, the
-# windows closed). Ends the process only when that can't be done or the app
-# doesn't end within 20 s, and says so in the step summary.
+# windows closed). The case fails when the app doesn't end within 20 s of
+# Quit, ends with an exit code other than 0, or has to be ended by force
+# (also when the menu couldn't be used).
 function Stop-App($proc, $rec) {
     if ($proc.HasExited) {
         Say "The app had ended already (exit code $($proc.ExitCode))"
@@ -380,12 +382,13 @@ function Stop-App($proc, $rec) {
     }
     if ($quit -and $proc.WaitForExit(20000)) {
         Say "The app quit (exit code $($proc.ExitCode))"
+        if ($proc.ExitCode -ne 0) { $rec.Problem("the app ended with exit code $($proc.ExitCode) after Quit in its tray menu") }
         return
     }
-    if ($quit) { Warn "the app didn't end within 20 s of its Quit" }
+    if ($quit) { $rec.Problem("the app didn't end within 20 s of Quit in its tray menu") }
     $proc.Kill()
     $null = $proc.WaitForExit(5000)
-    Warn "the app's process was ended (exit code $($proc.ExitCode))"
+    $rec.Problem("the app's process had to be ended by force")
 }
 
 function Save-AppLog([string]$label) {
