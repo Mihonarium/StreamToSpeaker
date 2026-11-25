@@ -490,6 +490,25 @@ class PanelClick(unittest.TestCase):
                   if (step_field(step, "uses") or "").startswith("Swatinem/rust-cache@")]
         self.assertEqual([step_with(step, "save-if") for step in caches], ["false"])
 
+    def test_the_rigs_powershell_is_parsed_before_anything_is_built(self):
+        # Right after the checkout: Windows PowerShell 5.1 parses the rig's
+        # scripts and compiles its C# in the build job, the first on
+        # Windows; PowerShell 7 parses them in the cases job, earlier still.
+        jobs = jobs_steps(self.NAME)
+        build, cases = jobs["build"], jobs["cases"]
+        self.assertEqual(step_field(build[0], "uses").split("@")[0], "actions/checkout")
+        self.assertEqual((step_field(build[1], "shell"), step_field(build[1], "run")),
+                         ("powershell", ".github/scripts/Test-RigScripts.ps1 -CompileRig"))
+        self.assertEqual(step_field(cases[0], "uses").split("@")[0], "actions/checkout")
+        self.assertEqual((step_field(cases[1], "shell"), step_field(cases[1], "run")),
+                         ("pwsh", ".github/scripts/Test-RigScripts.ps1"))
+        # Every script file the workflow runs is one the parse covers.
+        with open(os.path.join(GITHUB_DIR, "scripts", "Test-RigScripts.ps1"), encoding="utf-8") as fh:
+            covered = set(re.findall(r'"([A-Za-z-]+\.ps1)"', re.search(r"(?m)^\$Files = @\((.*)\)$", fh.read()).group(1)))
+        run = set(re.findall(r"\.github/scripts/([A-Za-z-]+\.ps1)", self.text()))
+        self.assertTrue(run)
+        self.assertLessEqual(run, covered)
+
     def test_one_build_serves_every_case_and_a_failing_case_stops_none(self):
         jobs = job_fields(self.NAME)
         self.assertNotIn("strategy", jobs["build"])
