@@ -211,6 +211,12 @@ pub struct PanelWindow {
     style: Option<u32>,
 }
 
+/// For the log: who has the foreground (by name only for Windows' shell
+/// and this app, unless the log is at the debug level).
+fn foreground(desktop: &dyn Desktop) -> String {
+    super::describe_foreground(desktop.foreground().as_ref(), log::log_enabled!(log::Level::Debug))
+}
+
 /// For the log: what a frame saw of the focus.
 fn focus_word(focused: Option<bool>) -> &'static str {
     match focused {
@@ -341,7 +347,7 @@ impl PanelWindow {
                 log::info!(
                     "panel: focus {} -> no (its window {window}; the foreground: {})",
                     focus_word(self.focused),
-                    desktop.foreground()
+                    foreground(desktop)
                 );
             } else {
                 log::info!("panel: focus {} -> {}", focus_word(self.focused), focus_word(seen.focused));
@@ -375,12 +381,12 @@ impl PanelWindow {
                 self.style = desktop.panel_ex_style();
                 let style = self.style.map_or_else(|| "not found".to_string(), super::ex_style_words);
                 if placed {
-                    log::info!("panel: showing it (its window's style: {style}; the foreground: {})", desktop.foreground());
+                    log::info!("panel: showing it (its window's style: {style}; the foreground: {})", foreground(desktop));
                 } else {
                     log::warn!(
                         "panel: showing it, though Windows didn't confirm its place after {} tries (its window's style: {style}; the foreground: {})",
                         tries + 1,
-                        desktop.foreground()
+                        foreground(desktop)
                     );
                 }
                 self.phase = Phase::Shown { place, had_focus: false };

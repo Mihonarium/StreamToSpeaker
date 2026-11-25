@@ -379,9 +379,60 @@ pub trait Desktop {
     /// The extended style bits of the panel's window, once it has been
     /// placed (see [`ex_style_words`]).
     fn panel_ex_style(&self) -> Option<u32>;
-    /// For the log: the window that has the foreground, by its class and
-    /// the name of its program.
-    fn foreground(&self) -> String;
+    /// The window that has the foreground, if one has (see
+    /// [`describe_foreground`]).
+    fn foreground(&self) -> Option<Foreground>;
+}
+
+/// The window that has the foreground, as Windows tells it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Foreground {
+    /// Its window class.
+    pub class: String,
+    /// Its process.
+    pub pid: u32,
+    /// The file name of its program, if Windows says.
+    pub program: Option<String>,
+    /// Its title, when it is one of this app's windows.
+    pub own_title: Option<String>,
+}
+
+/// Windows' own shell windows, by class and program, and what they are.
+const SHELL_WINDOWS: [(&str, &str, &str); 14] = [
+    ("Shell_TrayWnd", "explorer.exe", "the taskbar"),
+    ("Shell_SecondaryTrayWnd", "explorer.exe", "the taskbar on another display"),
+    ("NotifyIconOverflowWindow", "explorer.exe", "the hidden icons"),
+    ("TopLevelWindowForOverflowXamlIsland", "explorer.exe", "the hidden icons"),
+    ("Progman", "explorer.exe", "the desktop"),
+    ("WorkerW", "explorer.exe", "the desktop"),
+    ("#32768", "explorer.exe", "a menu of the taskbar or the desktop"),
+    ("XamlExplorerHostIslandWindow", "explorer.exe", "switching windows"),
+    ("MultitaskingViewFrame", "explorer.exe", "switching windows"),
+    ("Windows.UI.Core.CoreWindow", "StartMenuExperienceHost.exe", "Start"),
+    ("Windows.UI.Core.CoreWindow", "SearchHost.exe", "search"),
+    ("Windows.UI.Core.CoreWindow", "SearchApp.exe", "search"),
+    ("Windows.UI.Core.CoreWindow", "ShellExperienceHost.exe", "a panel of the taskbar"),
+    ("Windows.UI.Core.CoreWindow", "ShellHost.exe", "a panel of the taskbar"),
+];
+
+/// For the log: who has the foreground. The log file is something people
+/// attach to reports, so at the level a release writes only Windows' own
+/// shell windows (the taskbar, the hidden icons, Start, recognised by their
+/// class and their program) and this app's windows are named; any other
+/// window is "another program". `detailed` (the debug level) names every
+/// window by its class and program.
+pub fn describe_foreground(fg: Option<&Foreground>, detailed: bool) -> String {
+    let Some(fg) = fg else { return "none".to_string() };
+    if let Some(title) = &fg.own_title {
+        return format!("this app's window \"{title}\" ({})", fg.class);
+    }
+    let program = fg.program.as_deref();
+    let shell = SHELL_WINDOWS.iter().find(|(class, shell_program, _)| *class == fg.class && program.is_some_and(|p| p.eq_ignore_ascii_case(shell_program)));
+    match (shell, detailed) {
+        (Some((class, shell_program, what)), _) => format!("{what} ({class}, {shell_program})"),
+        (None, true) => format!("{} ({})", fg.class, program.map_or_else(|| format!("process {}", fg.pid), str::to_string)),
+        (None, false) => "another program".to_string(),
+    }
 }
 
 /// A desktop for tests: fixed monitors and themes; it records where the
@@ -396,6 +447,8 @@ pub struct FakeDesktop {
     pub placed: Vec<PxRect>,
     /// What `panel_window_shown` says.
     pub panel_shown: Option<bool>,
+    /// What `foreground` says.
+    pub foreground: Option<Foreground>,
 }
 
 impl Desktop for FakeDesktop {
@@ -434,8 +487,8 @@ impl Desktop for FakeDesktop {
         None
     }
 
-    fn foreground(&self) -> String {
-        "a test's window".to_string()
+    fn foreground(&self) -> Option<Foreground> {
+        self.foreground.clone()
     }
 }
 
@@ -476,6 +529,34 @@ mod tests {
         // This build's own environment, where `PATH` is always set: read in
         // a debug build only (`cargo test --release` runs the other side).
         assert_eq!(env_switches()("PATH").is_some(), cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn the_log_names_windows_shell_and_this_apps_windows_and_no_other_program_unless_asked() {
+        let fg = |class: &str, program: Option<&str>| Foreground { class: class.into(), pid: 4242, program: program.map(Into::into), own_title: None };
+        let taskbar = fg("Shell_TrayWnd", Some("explorer.exe"));
+        let hidden = fg("TopLevelWindowForOverflowXamlIsland", Some("EXPLORER.EXE"));
+        let start = fg("Windows.UI.Core.CoreWindow", Some("StartMenuExperienceHost.exe"));
+        let chat = fg("Chrome_WidgetWin_1", Some("chat.exe"));
+        // A program that gives its window the taskbar's class is not the taskbar.
+        let lookalike = fg("Shell_TrayWnd", Some("lookalike.exe"));
+        let unknown = fg("SomeClass", None);
+        let own = Foreground { own_title: Some("Stream To Speaker (background)".into()), ..fg("Window Class", Some("stream-to-speaker.exe")) };
+        for detailed in [false, true] {
+            assert_eq!(describe_foreground(Some(&taskbar), detailed), "the taskbar (Shell_TrayWnd, explorer.exe)");
+            assert_eq!(describe_foreground(Some(&hidden), detailed), "the hidden icons (TopLevelWindowForOverflowXamlIsland, explorer.exe)");
+            assert_eq!(describe_foreground(Some(&start), detailed), "Start (Windows.UI.Core.CoreWindow, StartMenuExperienceHost.exe)");
+            assert_eq!(describe_foreground(Some(&own), detailed), "this app's window \"Stream To Speaker (background)\" (Window Class)");
+            assert_eq!(describe_foreground(None, detailed), "none");
+        }
+        // At the level a release writes: no other program by name.
+        for other in [&chat, &lookalike, &unknown] {
+            assert_eq!(describe_foreground(Some(other), false), "another program");
+        }
+        // At the debug level: every window by class and program.
+        assert_eq!(describe_foreground(Some(&chat), true), "Chrome_WidgetWin_1 (chat.exe)");
+        assert_eq!(describe_foreground(Some(&lookalike), true), "Shell_TrayWnd (lookalike.exe)");
+        assert_eq!(describe_foreground(Some(&unknown), true), "SomeClass (process 4242)");
     }
 
     #[test]

@@ -37,7 +37,10 @@
     next to Mesa's opengl32.dll, which this script tells to draw in
     software (GALLIUM_DRIVER). RUST_LOG adds egui-winit's and eframe's own
     lines about the windows to the app's log: every command a window gets
-    (shown, hidden, focused), and windows made and closed.
+    (shown, hidden, focused), and windows made and closed; and it puts the
+    shell's lines at the debug level, where they name any program that
+    takes the foreground (a release's log names only Windows' shell and
+    the app).
     With -Network quiet (the default) the app opens no port to the network
     and searches for no speakers (--bind 127.0.0.1 --no-discovery
     --no-airplay --no-sendspin), so no firewall question comes up; with
@@ -92,7 +95,7 @@ function Say([string]$msg) {
 $PanelSwitch = $null
 if ($Panel -eq "window") { $PanelSwitch = "window" }
 $AppEnvironment = [ordered]@{
-    "RUST_LOG"                = "egui_winit=trace,eframe=debug"
+    "RUST_LOG"                = "egui_winit=trace,eframe=debug,stream_to_speaker::shell=debug"
     "GALLIUM_DRIVER"          = "llvmpipe"
     "STREAM_TO_SPEAKER_PANEL" = $PanelSwitch
 }

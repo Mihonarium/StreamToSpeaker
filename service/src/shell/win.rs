@@ -4,7 +4,7 @@
 //! rounded corners, staying out of Alt+Tab).
 
 use super::placement::{Monitor, PxRect};
-use super::{Desktop, PanelMode, PANEL_TITLE};
+use super::{Desktop, Foreground, PanelMode, PANEL_TITLE};
 
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
@@ -99,20 +99,20 @@ impl Desktop for WindowsDesktop {
         Some(ex_style(hwnd))
     }
 
-    fn foreground(&self) -> String {
-        describe_foreground()
+    fn foreground(&self) -> Option<Foreground> {
+        foreground()
     }
 }
 
-/// For the log: the window that has the foreground, as `class (program)`,
-/// or by its title for one of this app's windows. Other programs' titles
-/// and folders are left out: they can say what someone is doing.
-fn describe_foreground() -> String {
+/// The window that has the foreground: its class, its process and program,
+/// and its title when it is one of this app's windows (another program's
+/// title and folder are never read: they can say what someone is doing).
+fn foreground() -> Option<Foreground> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId};
     // SAFETY: no arguments.
     let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.is_null() {
-        return "none".to_string();
+        return None;
     }
     let mut buf = [0u16; 128];
     // SAFETY: a handle GetForegroundWindow just gave (a stale one makes the
@@ -122,13 +122,13 @@ fn describe_foreground() -> String {
     let mut pid = 0u32;
     // SAFETY: as above; `pid` is a writable u32.
     unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
-    if pid == std::process::id() {
+    let own_title = (pid == std::process::id()).then(|| {
         let mut title = [0u16; 128];
         // SAFETY: as above.
         let n = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
-        return format!("this app's window \"{}\" ({class})", String::from_utf16_lossy(&title[..n.max(0) as usize]));
-    }
-    format!("{class} ({})", program_name(pid).unwrap_or_else(|| format!("process {pid}")))
+        String::from_utf16_lossy(&title[..n.max(0) as usize])
+    });
+    Some(Foreground { class, pid, program: program_name(pid), own_title })
 }
 
 /// The file name of the program process `pid` runs, if Windows says.
