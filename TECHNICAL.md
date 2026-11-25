@@ -162,12 +162,17 @@ output and the firewall, with names and addresses replaced (it asks, first
 and last, to be read through before it is posted); Setup's last page gives
 that command when Windows refused the driver. `scripts\Reset-Install.ps1`
 clears the driver for a fresh start. Uninstall
-closes the app and removes the device, the driver packages, Windows' cached
-entries for the sound output, the test certificates a test-signed build made
-Windows trust (`LocalMachine\Root` and `TrustedPublisher`), the firewall rules
-for the app and the start-at-sign-in entries of signed-in accounts; its last
-message names what it could not remove; run
-interactively, it asks for a restart when the driver was running. It leaves
+closes the app, moves Windows off the app's sound output where the PC has
+another output that works, and removes the device, the driver packages, the
+test certificates a test-signed build made Windows trust (`LocalMachine\Root`
+and `TrustedPublisher`), the firewall rules for the app and the
+start-at-sign-in entries of signed-in accounts; its last message names what it
+could not remove. Windows' cached entry for a sound output whose device is
+gone is deleted where Windows allows it; Windows can refuse, and an entry that
+stays does nothing (a new device gets an entry of its own). Run interactively,
+the uninstall asks for a restart when the driver was running, or when Windows
+removes the device only at the restart (after an update that itself waits for
+one); until then the device's sound output stays in Windows' list. It leaves
 each person's own folders, so a reinstall keeps their speakers and pairings:
 `%APPDATA%\StreamToSpeaker` (`config.json`, the settings, and `config.json.bak`,
 a second copy the app reads if the first is damaged) and

@@ -18,11 +18,6 @@
 # parse.
 
 $ErrorActionPreference = 'Continue'
-# Windows PowerShell's commands load from its own folder. Started from
-# PowerShell 7, this script inherits that version's module path, and Windows
-# PowerShell can't load the modules it finds there: Get-AuthenticodeSignature
-# then fails and the report has no signature.
-if ($PSVersionTable.PSEdition -ne 'Core') { $env:PSModulePath = Join-Path $PSHOME 'Modules' }
 
 $DiagHardwareId = 'Root\StreamToSpeaker'
 $DiagAppId = '{8A6C7F92-3E1B-4A2B-9F1C-77F1B6B2A6E0}_is1'
@@ -274,7 +269,7 @@ function Get-Report {
             $item = Get-Item -LiteralPath $image
             # A driver file may carry no version.
             $version = [string]$item.VersionInfo.FileVersion
-            "Version      : $(if ($version) { $version + ', ' })$($item.Length) bytes, modified $($item.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))"
+            "Version      : $(if ($version) { $version } else { 'none' }), $($item.Length) bytes, modified $($item.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))"
             $sig = Get-AuthenticodeSignature -LiteralPath $image -ErrorAction SilentlyContinue
             "Signature    : $($sig.Status)$(if ($sig.SignerCertificate) { ', ' + $sig.SignerCertificate.Subject })"
         } else {
@@ -403,6 +398,19 @@ if (-not (Get-Variable -Name DiagnoseLoadOnly -ValueOnly -ErrorAction SilentlyCo
         & $native -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
         exit $LASTEXITCODE
     }
-    $private = Get-PrivateNames
-    Get-Report | ForEach-Object { ConvertTo-PublicText -Text $_ -PrivateNames $private }
+    # Windows PowerShell's commands load from its own folder. Started by a
+    # program that passes PowerShell 7's environment on (PowerShell 7's own
+    # Start-Process does), this script inherits that version's module path,
+    # and Windows PowerShell can't load the modules it finds there:
+    # Get-AuthenticodeSignature then fails and the report has no signature.
+    # The path is put back afterwards, for a PowerShell window the script
+    # was run in.
+    $modulePath = $env:PSModulePath
+    if ($PSVersionTable.PSEdition -ne 'Core') { $env:PSModulePath = Join-Path $PSHOME 'Modules' }
+    try {
+        $private = Get-PrivateNames
+        Get-Report | ForEach-Object { ConvertTo-PublicText -Text $_ -PrivateNames $private }
+    } finally {
+        $env:PSModulePath = $modulePath
+    }
 }

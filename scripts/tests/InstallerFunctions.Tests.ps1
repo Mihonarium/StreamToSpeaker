@@ -593,6 +593,21 @@ Test 'a device Windows removes only when it restarts is said so, and its output 
     Assert-Equal 1 (Called 'RemoveEndpoints:1') 'again only the entry whose device is gone'
 }
 
+Test 'a run that removed a device waits for its output to go, and a run that removed nothing does not wait' {
+    New-World -Devices @(Fake-Device) -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint)
+    $settling = $FakeTools.Clone()
+    # Windows records the output as not present a moment after its device went.
+    $settling.Pause = { Note 'Pause'; foreach ($e in @($script:W.Endpoints)) { $e.State = 4 } }
+    Assert-Equal '' (@(Invoke-DriverRemoval -Tools $settling) -join ',') 'nothing left'
+    Assert-Equal 1 (Called 'Pause') 'one wait'
+    Assert-Equal 1 (Called 'RemoveEndpoints:1') 'the entry is deleted once its output is gone'
+    # A second run finds no device: waiting would change nothing.
+    New-World -Endpoints @(Fake-Endpoint)
+    Assert-Equal '' (@(Invoke-DriverRemoval -Tools $settling) -join ',') 'nothing to say'
+    Assert-Equal 0 (Called 'Pause') 'no wait'
+    Assert-Equal 0 (Called 'RemoveEndpoints') 'the entry of an output that is still there is left alone'
+}
+
 Test 'the log names the app''s outputs, and no name a person chose' {
     Assert-Equal "'Stream To Speaker'" (Format-EndpointName 'Stream To Speaker') 'ours'
     Assert-Equal "'Stream To Speaker $([char]0x2192) Kitchen'" (Format-EndpointName "Stream To Speaker $([char]0x2192) Kitchen") 'the app''s'

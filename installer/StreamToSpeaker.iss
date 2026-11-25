@@ -34,10 +34,12 @@
 ;      administrator rights, which it can when it asked for those rights
 ;      itself; started with them ("Run as administrator", an elevated
 ;      prompt), it starts nothing and says to use the Start menu.
-; Uninstall closes the app, removes the device, the driver packages,
-; Windows' cached sound output entries, the test certificates, the firewall
-; rules and the start-at-sign-in entries of signed-in accounts, and says
-; what it couldn't remove. Settings and speakers (each account's
+; Uninstall closes the app, moves Windows off the app's sound output where
+; the PC has another output that works, removes the device, the driver
+; packages, the test certificates, the firewall rules and the
+; start-at-sign-in entries of signed-in accounts, and says what it couldn't
+; remove. Windows' cached entry of a sound output whose device is gone is
+; deleted where Windows allows it. Settings and speakers (each account's
 ; AppData\Roaming\StreamToSpeaker) stay.
 ;
 ; Build with installer\build-installer.ps1, or: ISCC.exe installer\StreamToSpeaker.iss

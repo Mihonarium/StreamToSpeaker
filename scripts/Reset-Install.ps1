@@ -44,6 +44,7 @@ $problems = @()
 Write-Host '1/3  Removing the Stream To Speaker device...' -ForegroundColor Cyan
 $devices = @(Get-OurDevices)
 if (-not $devices.Count) { Write-Step 'There is none.' }
+$removedNow = 0
 foreach ($d in $devices) {
     $code = if ([IO.File]::Exists($StsDevcon)) {
         Remove-Device $d.InstanceId
@@ -52,6 +53,7 @@ foreach ($d in $devices) {
         # on Windows 10 version 2004 and later.
         Invoke-Tool -FilePath $StsPnputil -Arguments @('/remove-device', $d.InstanceId)
     }
+    if ($code -eq 0) { $removedNow++ }
     if ($code -ne 0 -and $code -ne 1 -and $code -ne 3010) { $problems += "the device $($d.InstanceId) is still there" }
 }
 
@@ -68,7 +70,13 @@ Write-Host "3/3  Clearing Windows' cached entries for the sound output..." -Fore
 # removes when it restarts is still there. Windows may keep an entry; one
 # that stays does nothing, because Setup's new device gets a new sound
 # output.
-$entries = @(Select-OrphanedEndpoints @(Get-OurEndpoints))
+# The output of a device that just went shows as gone a moment later.
+$all = @(Get-OurEndpoints)
+for ($i = 0; $i -lt 5 -and $removedNow -and @(Select-PresentEndpoints $all).Count; $i++) {
+    Start-Sleep -Seconds 1
+    $all = @(Get-OurEndpoints)
+}
+$entries = @(Select-OrphanedEndpoints $all)
 if (-not $entries.Count) { Write-Step 'There are none to clear.' }
 if ($entries.Count) {
     $gone = Remove-EndpointEntries $entries

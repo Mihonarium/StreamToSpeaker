@@ -78,7 +78,7 @@ Implemented in `service/src/sonos.rs` (+ ssdp/upnp/gena/app wiring). Facts below
 | Symptom | Real cause | Fix |
 |---|---|---|
 | Device label is "Internal AUX Jack" | Windows derives the prefix from `KSNODETYPE_LINE_CONNECTOR` association | Use `KSNODETYPE_SPEAKER` in INF + `PKEY_Device_FriendlyName` to override cached name |
-| New install shows old endpoint name / state | `HKLM\…\MMDevices\Audio\Render\<id>` is cached per endpoint ID and survives reinstalls | `Reset-Install.ps1` wipes the cached entries; the installer rebuilds an endpoint whose cache still has an early build's association, and otherwise keeps it (wiping it loses Windows' default-output choice) |
+| New install shows old endpoint name / state | `HKLM\…\MMDevices\Audio\Render\<id>` is cached per endpoint ID and survives reinstalls | `Reset-Install.ps1` deletes the cached entries of outputs whose device is gone, where Windows allows it (Windows can refuse; an entry that stays does nothing, and a new device gets an entry of its own); the installer rebuilds an endpoint whose cache still has an early build's association, and otherwise keeps it (wiping it loses Windows' default-output choice) |
 | Device installed but no Sound Settings endpoint | `pnputil /add-driver /install` doesn't create root-enumerated devices | Use `devcon install <inf> Root\<HardwareId>` after pnputil |
 | "Allow apps and Windows to use this device" toggle | Endpoint builder creates certain KSNODETYPE / form-factor combinations as disabled+hidden by default | `PKEY_AudioDevice_EnableEndpointByDefault = 0x101` (FLAG_ENABLE \| FLOW_MASK_RENDER) in INF |
 | OEM APO (Dolby Atmos etc.) attaches and adds latency | FormFactor=1 (Speakers) is the default match for OEM APOs | `PKEY_AudioEndpoint_Disable_SysFx = 1` in INF |

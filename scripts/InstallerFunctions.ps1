@@ -713,8 +713,8 @@ function Remove-DriverPackageForce([string]$Name) { Invoke-Tool -FilePath $StsPn
 # Deletes endpoint entries from Windows' cache where Windows allows it: it
 # keeps these entries for itself and can refuse the delete even to an
 # administrator. Counts only what is gone afterwards. An entry that stays
-# does nothing: its device is gone, Windows shows it nowhere, and a device
-# created later gets an entry of its own.
+# does nothing: its device is gone, Windows records the output as not
+# present, and a device created later gets an entry of its own.
 function Remove-EndpointEntries([object[]]$Endpoints = @()) {
     $removed = 0
     $failed = @()
@@ -1582,10 +1582,13 @@ function Invoke-DriverRemoval([hashtable]$Tools = (New-DriverTools)) {
         Write-Step "Could not move Windows off the app's sound output: $($_.Exception.Message)"
     }
     $atRestart = @()
+    $removedNow = 0
     foreach ($d in @(& $Tools.GetDevices)) {
         Write-Step "Removing the device $($d.InstanceId)..."
-        # DevCon's exit code 1: the device is removed when Windows restarts.
-        if ((& $Tools.RemoveDevice $d.InstanceId) -eq 1) { $atRestart += $d.InstanceId }
+        # DevCon's exit codes: 0, the device is removed; 1, it is removed
+        # when Windows restarts.
+        $code = & $Tools.RemoveDevice $d.InstanceId
+        if ($code -eq 1) { $atRestart += $d.InstanceId } elseif ($code -eq 0) { $removedNow++ }
     }
     $packages = @(& $Tools.GetPackages)
     if (-not $packages.Count) { Write-Step 'No Stream To Speaker driver package in the driver store.' }
@@ -1601,13 +1604,14 @@ function Invoke-DriverRemoval([hashtable]$Tools = (New-DriverTools)) {
         Write-Step "Windows removes the device $id when it restarts. Until then its sound output stays in Windows' list."
         $lines += "removed-at-restart: the Stream To Speaker device $id"
     }
-    # The output of a device that just went shows as gone a moment later.
-    # One that is still there after the wait belongs to a device Windows
-    # removes when it restarts (this run may be a second one, which no
-    # longer finds that device).
+    # The output of a device that just went shows as gone a moment later: a
+    # run that removed a device waits for that. An output that is still
+    # there belongs to a device Windows removes when it restarts (this run
+    # may be a second one, which no longer finds that device and has nothing
+    # to wait for).
     $entries = @(& $Tools.GetEndpoints)
-    for ($i = 0; $i -lt 5 -and -not $atRestart.Count -and @(Select-PresentEndpoints $entries).Count; $i++) {
-        & $Tools.Pause
+    for ($i = 0; $i -lt 5 -and $removedNow -and -not $atRestart.Count -and @(Select-PresentEndpoints $entries).Count; $i++) {
+        $null = & $Tools.Pause
         $entries = @(& $Tools.GetEndpoints)
     }
     $present = @(Select-PresentEndpoints $entries).Count
