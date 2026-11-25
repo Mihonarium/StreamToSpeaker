@@ -552,7 +552,7 @@ function Assert-SetupOutcome($code, [string]$label, [string]$Expect, $Before) {
     } elseif ($wantResult -eq "endpoint-missing") {
         Check ($present.Count -eq 0) "Windows has no $AppName sound output, as Setup says (found $($present.Count))"
     }
-    @{ result = $result; restart = $restart; log = $log }
+    @{ result = $result; restart = $restart; log = $log; expected = $wantResult }
 }
 
 # Runs this build's installer with the checks every such run gets.
@@ -1169,16 +1169,21 @@ switch ($Phase) {
         # Windows' sound services stopped, as on a PC where someone turned
         # them off: Windows makes no sound output for the device, and Setup
         # must say so, not report success. And it must not make a new device
-        # in the hope of an output, on the first run or on the next.
+        # in the hope of an output, on the first run or on the next. A run
+        # with a restart due (the driver an uninstall left loaded) is held
+        # to "ok" with the restart and can't show the missing output, so at
+        # least one of the two runs must have been held to it.
         Assert-CleanStart
         Stop-AudioServices
         try {
             $audio = Get-AudioServices
-            $outcome = Invoke-CurrentSetup "no-audio-install" -Expect "endpoint-missing"
-            Assert-Installed -Full -Outcome $outcome
+            $first = Invoke-CurrentSetup "no-audio-install" -Expect "endpoint-missing"
+            Assert-Installed -Full -Outcome $first
             $before = @((Read-State).device)
             $outcome = Invoke-CurrentSetup "no-audio-again" -Expect "endpoint-missing"
             $after = @(Get-DeviceIdentity)
+            $held = @(@($first, $outcome) | Where-Object { $_ -and $_.expected -eq "endpoint-missing" })
+            Check ($held.Count -ge 1) "at least one of the two runs was held to 'the sound output is missing' ($($held.Count) of 2; a run with a restart due is held to 'ok')"
             Check ($before.Count -eq 1 -and ($before -join ';') -eq ($after -join ';')) "the device was kept, not made anew, when Setup ran again (before: $($before -join '; '); after: $($after -join '; '))"
             Check ((Get-AudioServices) -eq $audio) "Setup left Windows' sound services as they were ($audio)"
             if ($outcome) {
