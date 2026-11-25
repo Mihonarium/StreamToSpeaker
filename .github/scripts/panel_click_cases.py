@@ -1,7 +1,7 @@
 """The cases the Panel click workflow (panel-click.yml) runs.
 
 On a push to a branch whose name starts with rig/: a fixed set, the
-default case and four that each change one thing in it. Started by hand:
+default case and five that each change one thing in it. Started by hand:
 the one case its inputs give, each input checked against its choices.
 
 Prints `cases=<json>` (a list of cases, each with a `name` that tells it
@@ -32,6 +32,7 @@ PUSH_CHANGES = (
     {"icon": "hidden"},
     {"click": "double"},
     {"runner": "windows-2022"},
+    {"first_run": "true"},
 )
 
 WINDOWS = {"windows-2025": "win11", "windows-2022": "win10"}

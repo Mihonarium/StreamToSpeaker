@@ -10,7 +10,7 @@ import panel_click_cases as pc  # noqa: E402
 
 
 class Cases(unittest.TestCase):
-    def test_a_push_runs_the_default_and_four_single_changes_all_as_a_flyout(self):
+    def test_a_push_runs_the_default_and_five_single_changes_all_as_a_flyout(self):
         chosen = pc.cases("push", {})
         self.assertEqual([c["name"] for c in chosen], [
             "win11-single-taskbar-flyout-sign-in-quiet",
@@ -18,8 +18,10 @@ class Cases(unittest.TestCase):
             "win11-single-hidden-flyout-sign-in-quiet",
             "win11-double-taskbar-flyout-sign-in-quiet",
             "win10-single-taskbar-flyout-sign-in-quiet",
+            "win11-single-taskbar-flyout-sign-in-quiet-first-run",
         ])
-        self.assertTrue(all(c["panel"] == "flyout" and c["first_run"] == "false" for c in chosen))
+        self.assertTrue(all(c["panel"] == "flyout" for c in chosen))
+        self.assertEqual([c["first_run"] for c in chosen], ["false"] * 5 + ["true"])
         self.assertEqual(len({c["name"] for c in chosen}), len(chosen))
         # Inputs play no part in a push.
         self.assertEqual(pc.cases("push", {"panel": "window", "runner": "windows-2022"}), chosen)
@@ -50,7 +52,7 @@ class Cases(unittest.TestCase):
 
         push = run({"EVENT": "push"})
         self.assertEqual(push["window"], "false")
-        self.assertEqual(len(json.loads(push["cases"])), 5)
+        self.assertEqual(len(json.loads(push["cases"])), 6)
         hand = run({"EVENT": "workflow_dispatch", "CASE_PANEL": "window"})
         self.assertEqual(hand["window"], "true")
         self.assertEqual([c["panel"] for c in json.loads(hand["cases"])], ["window"])

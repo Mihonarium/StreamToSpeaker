@@ -9,10 +9,10 @@ name: Panel click
 #
 # It runs in two ways, and in no other:
 #   - started by hand (workflow_dispatch): the one case its inputs give;
-#   - on a push to a branch whose name starts with rig/: five cases, the
+#   - on a push to a branch whose name starts with rig/: six cases, the
 #     panel as a flyout in each: the defaults below; started by hand from a
 #     shortcut; the icon among the hidden icons; a double click; Windows
-#     10's taskbar (Server 2022).
+#     10's taskbar (Server 2022); a first run.
 # Either way the app is built once, from the commit the run is for. The
 # workflow uses no secrets, reads the repository only and changes nothing
 # outside the machines it runs on (the Rust cache is restored, never saved).
