@@ -237,26 +237,27 @@ class Release:
                                "writing it; stopped")
         return now
 
-    def finish_interrupted(self, keep=()):
+    def finish_interrupted(self, drop=(), last=()):
         """Finish replacements a stopped run left half done (see the module
-        docstring). Names in `keep` are never replaced, and a pending
-        upload over one of them is left as it is."""
+        docstring): a complete `<name>.pending` is rolled forward, a broken
+        one deleted. For names in `drop` the pending upload is deleted
+        instead (the caller found `<name>` already holds those bytes);
+        names in `last` are finished after all others. A caller that must
+        refuse some states checks them before calling this."""
         changed = []
         known = self.check_unchanged("finishing an interrupted write")
-        for a in self.assets():
-            name = a.get("name") or ""
-            if not name.endswith(PENDING):
-                continue
+        pendings = [a for a in self.assets() if (a.get("name") or "").endswith(PENDING)]
+        pendings.sort(key=lambda a: a["name"][:-len(PENDING)] in last)
+        for a in pendings:
+            name = a["name"]
             final = name[:-len(PENDING)]
-            if a.get("state") != "uploaded":
+            if a.get("state") != "uploaded" or final in drop:
                 self._delete_asset(a)
-                known = self._after(known, removed=a["id"], doing="removing a broken upload")
-                changed.append(f"removed {name}, an upload that never completed")
+                known = self._after(known, removed=a["id"], doing=f"removing {name}")
+                changed.append(f"removed {name}, " + ("an upload that never completed" if a.get("state") != "uploaded"
+                                                     else f"a second copy of what {final} holds"))
                 continue
             old = self.asset(final)
-            if old and final in keep:
-                changed.append(f"left {name}: {final} is recorded and is not replaced")
-                continue
             if old:
                 self._delete_asset(old)
                 known = self._after(known, removed=old["id"], doing=f"finishing the replacement of {final}")

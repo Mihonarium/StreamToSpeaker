@@ -21,7 +21,9 @@ rule under its own name:
 4. Nothing is deleted before its replacement is completely uploaded, and
    a file already there with the same bytes is not uploaded again
    (release_assets.py). A writer first finishes what a stopped one left
-   half done; a manifest.json.pending is never read as the manifest.
+   half done, but only when the release, as those renames would leave
+   it, is one a write of these workflows would have made; a
+   manifest.json.pending is never read as the manifest.
 5. manifest.json is written last, in a call of its own, and only when
    every file it records is on the release.
 
@@ -346,24 +348,25 @@ class DriverRelease:
 
     def begin(self):
         """Before the first write: finish what a stopped writer left half
-        done (release_assets.finish_interrupted). A complete
-        manifest.json.pending without a manifest.json is renamed whatever
-        it says: that completes the write an earlier run had decided.
-        Nothing is rolled forward over a finished manifest or a file the
-        manifest records, and a finished release is not touched at all."""
+        done. A complete `<name>.pending` is rolled forward (a manifest.json
+        one whatever it says, last), a broken one deleted; this completes
+        writes an earlier run had decided. It happens only when the
+        release, as these renames would leave it, is one a write of these
+        workflows would have made (_finish_plan); otherwise nothing is
+        changed and a person has to look. A finished release is not
+        touched at all."""
         if not self.rel:
             raise ReleaseError(f"there is no release {self.tag}")
         if finished(self._manifest):
             return []
         self._same_release("finishing an interrupted write")
-        problem = self._pending_manifest_problem()
+        problem, drop = self._finish_plan()
         if problem:
             raise ReleaseError(
-                f"{self.tag} holds a manifest.json.pending that a write of these workflows would not have made "
-                f"({problem}); nothing was changed. A person has to look at it (docs/driver-signing.md, "
-                "\"A release shows an asset named <name>.pending\")")
-        keep = {n for n in recorded_files(self._manifest) if n != MANIFEST}
-        healed = self.rel.finish_interrupted(keep=keep)
+                f"{self.tag} holds .pending files that a write of these workflows would not have left ({problem}); "
+                "nothing was changed. A person has to look at it (docs/driver-signing.md, \"A release shows an asset "
+                "named <name>.pending\")")
+        healed = self.rel.finish_interrupted(drop=drop, last={MANIFEST})
         for line in healed:
             print(f"{self.tag}: {line}")
         if healed:
@@ -371,25 +374,57 @@ class DriverRelease:
         self.healed += healed
         return healed
 
-    def _pending_manifest_problem(self):
-        """What keeps a complete manifest.json.pending from being put in
-        place: the checks write_manifest makes before it uploads one (a
-        JSON object; every file it records completely uploaded) and, for a
-        finished one, every recorded file hashing to its recorded SHA-256."""
-        if not self.rel.complete(MANIFEST + PENDING):
-            return None
-        try:
-            m = json.loads(self.rel.download(MANIFEST + PENDING).decode("utf-8-sig"))
-        except (ValueError, UnicodeDecodeError):
-            return "it is not valid JSON"
-        if not isinstance(m, dict):
-            return "it is not a JSON object"
-        for name, digest in recorded_files(m).items():
-            if not self.rel.complete(name):
-                return f"it records {clean(name)}, which the release does not hold"
-            if finished(m) and digest and sha256(self.rel.download(name)) != str(digest).lower():
-                return f"it records {clean(name)} with sha256 {clean(digest)}, which the release's file does not have"
-        return None
+    def _finish_plan(self):
+        """(problem or None, names whose pending copy is dropped), checked
+        against the release as finishing the interrupted writes would leave
+        it, before anything is written:
+          - a complete manifest.json.pending is a JSON object that still
+            records every file manifest.json records, with the same SHA-256;
+          - every file the manifest that ends up in place records is there
+            after the renames, completely uploaded, in the bytes it records;
+          - a pending copy of a recorded file has exactly those bytes and
+            is either the only copy (it is renamed) or the same bytes as
+            the file (it is deleted), so none is left beside the file. Any
+            other copy would replace a recorded file, which a write of
+            these workflows never does, and the release is left for a
+            person."""
+        rel = self.rel
+        pending = {a["name"][:-len(PENDING)]: a for a in rel.assets()
+                   if (a.get("name") or "").endswith(PENDING) and a.get("state") == "uploaded"}
+        if not pending:
+            return None, set()
+        current = recorded_files(self._manifest)
+        final = self._manifest
+        if MANIFEST in pending:
+            try:
+                final = json.loads(rel.download(MANIFEST + PENDING).decode("utf-8-sig"))
+            except (ValueError, UnicodeDecodeError):
+                return "manifest.json.pending is not valid JSON", set()
+            if not isinstance(final, dict):
+                return "manifest.json.pending is not a JSON object", set()
+            new = recorded_files(final)
+            for name, digest in current.items():
+                if name not in new:
+                    return f"manifest.json.pending no longer records {clean(name)}, which manifest.json records", set()
+                if digest and str(new[name] or "").lower() != str(digest).lower():
+                    return f"manifest.json.pending records {clean(name)} with another sha256", set()
+        recorded = dict(current, **recorded_files(final))
+        drop = set()
+        for name, digest in recorded.items():
+            source = name + PENDING if name in pending else name
+            if not rel.complete(source):
+                return f"the manifest would record {clean(name)}, which the release does not hold", set()
+            if name in pending and not digest:
+                return f"{clean(name)}.pending would replace {clean(name)}, which the manifest records", set()
+            after = sha256(rel.download(source))
+            if digest and after != str(digest).lower():
+                return (f"{clean(source)} does not have the sha256 {clean(digest)} the manifest records for "
+                        f"{clean(name)}"), set()
+            if name in pending and rel.complete(name):
+                if sha256(rel.download(name)) != after:
+                    return f"{clean(name)}.pending would replace {clean(name)}, which the manifest records", set()
+                drop.add(name)
+        return None, drop
 
     def begin_if_interrupted(self):
         """Finish an interrupted manifest write before what the release

@@ -148,7 +148,10 @@ Every job of these workflows that writes a driver release does it through
    (with or without `<name>`): the next job that writes the release first
    finishes it, by renaming a completely uploaded pending file (deleting
    `<name>` first when it is still there), or deleting one whose upload
-   never completed. Nothing is renamed over a finished `manifest.json`.
+   never completed, with `manifest.json` last. It does so only when the
+   release, as those renames would leave it, is one a write of these
+   workflows would have made (see Troubleshooting); otherwise it changes
+   nothing and stops. Nothing is renamed over a finished `manifest.json`.
 5. `manifest.json` is written last, in a call of its own, and only when
    every file it records is on the release.
 
@@ -784,13 +787,22 @@ only cleaned (`repro_compare.py` `clean_text`) or between
   the job that was writing the release: its first step finishes the
   replacement, and when that was the last write of Driver attested or
   Driver certified, the re-run ends there ("an earlier run's last write
-  was interrupted and is finished now"). A pending manifest is put in
-  place only when a normal write would have written it: valid JSON, every
-  file it records on the release and, for a certified or attested one,
-  each with the SHA-256 it records. Otherwise the job stops with "holds a
-  manifest.json.pending that a write of these workflows would not have
-  made (…); nothing was changed", naming what is wrong. Look at the
-  pending file and the release before you change anything.
+  was interrupted and is finished now"). The renames happen only when the
+  release they would leave is one a write of these workflows would have
+  made:
+  - a pending manifest is valid JSON and still records every file
+    `manifest.json` records, with the same SHA-256;
+  - every file the manifest that ends up in place records is there after
+    the renames, in the bytes it records;
+  - a pending copy of a recorded file has exactly those bytes and is
+    either the only copy (it is renamed) or the same bytes as the file (it
+    is deleted). Any other copy, including one of a file recorded by name
+    only, would replace a recorded file, which no write does.
+
+  Otherwise the job stops with "holds .pending files that a write of these
+  workflows would not have left (…); nothing was changed", naming what is
+  wrong. Look at the pending files and the release before you change
+  anything.
 
   Until a pending manifest without `manifest.json` is finished, the
   installers' driver lookup, the certified guard and the fallback check

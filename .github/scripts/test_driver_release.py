@@ -900,10 +900,13 @@ class APendingManifestIsPutInPlaceOnlyIfAWriteWouldHaveWrittenIt(Base):
                     attested=True, signed_zip=SIGNED_ZIP, signed_zip_sha256=sha(b"canonical zip"), **kw)
 
     def assertLeftForAPerson(self, fake, before, says):
+        writes = len(fake.writes())
         self.assertEqual(self.record(fake), 1)
-        self.assertIn("manifest.json.pending", self.output)
+        self.assertIn(".pending", self.output)
         self.assertIn(says, self.output)
+        self.assertIn("nothing was changed", self.output)
         self.assertEqual(fake.files(TAG), before)
+        self.assertEqual(len(fake.writes()), writes)
 
     def test_a_finishing_manifest_that_records_a_missing_file(self):
         fake = self.returned_with_pending(self.finishing())
@@ -917,6 +920,59 @@ class APendingManifestIsPutInPlaceOnlyIfAWriteWouldHaveWrittenIt(Base):
     def test_a_pending_manifest_that_is_not_json(self):
         fake = self.returned_with_pending(b"not json")
         self.assertLeftForAPerson(fake, fake.files(TAG), "JSON")
+
+    def test_a_pending_twin_of_a_file_only_the_pending_manifest_records(self):
+        # The check found Signed.zip in the bytes the pending manifest
+        # records; finishing would then have rolled Signed.zip.pending, with
+        # other bytes, over it.
+        fake = self.returned_with_pending(self.finishing())
+        rel = fake.release(TAG)
+        fake.add_asset(rel, SIGNED_ZIP, b"canonical zip")
+        fake.add_asset(rel, SIGNED_ZIP + ".pending", b"other bytes")
+        self.assertLeftForAPerson(fake, fake.files(TAG), SIGNED_ZIP)
+
+    def test_a_pending_twin_of_a_file_the_current_manifest_records(self):
+        fake = Fake()
+        rel = returned_release(fake)
+        fake.add_asset(rel, CAB + ".pending", b"another cab")
+        self.assertLeftForAPerson(fake, fake.files(TAG), CAB)
+
+    def test_a_pending_twin_of_a_recorded_file_without_a_recorded_sha256(self):
+        # The manifest records Microsoft's zip by name only: no copy may
+        # replace it.
+        fake = Fake()
+        rel = returned_release(fake)
+        fake.add_asset(rel, "StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip.pending", b"another zip")
+        self.assertLeftForAPerson(fake, fake.files(TAG), "Microsoft.zip")
+
+    def test_a_pending_copy_is_not_renamed_over_a_recorded_file_with_other_bytes(self):
+        # Even when the copy has the bytes the manifest records: a write of
+        # these workflows never replaces a recorded file.
+        fake = Fake()
+        rel = returned_release(fake)
+        next(a for a in rel["assets"] if a["name"] == CAB)["data"] = b"tampered cab"
+        fake.add_asset(rel, CAB + ".pending", b"signed cab")
+        self.assertLeftForAPerson(fake, fake.files(TAG), CAB)
+
+    def test_a_pending_manifest_that_records_fewer_files_than_the_current_one(self):
+        # The current manifest records the EV-signed CAB; the pending one
+        # doesn't any more.
+        fake = Fake()
+        rel = returned_release(fake)
+        fake.add_asset(rel, "manifest.json.pending", submission_manifest(
+            ms_product_id="7", ms_submission_id="8", ms_state="done",
+            ms_zip_asset="StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip"))
+        self.assertLeftForAPerson(fake, fake.files(TAG), CAB)
+
+    def test_a_pending_twin_with_the_recorded_bytes_is_finished(self):
+        fake = self.returned_with_pending(self.finishing())
+        rel = fake.release(TAG)
+        fake.add_asset(rel, SIGNED_ZIP + ".pending", b"canonical zip")
+        self.assertEqual(self.record(fake), 0, self.output)
+        files = fake.files(TAG)
+        self.assertEqual(files[SIGNED_ZIP], b"canonical zip")
+        self.assertFalse([n for n in files if n.endswith(".pending")])
+        self.assertIs(fake.manifest(TAG)["attested"], True)
 
     def test_a_finishing_manifest_whose_files_are_there_is_put_in_place(self):
         fake = self.returned_with_pending(self.finishing())
