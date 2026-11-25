@@ -26,8 +26,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # Pin to the latest published 24H2 WDK at time of writing. Bump
-  # whenever the build switches to a newer header.
+  # whenever the build switches to a newer header. NB this is a redirect
+  # to a web installer, not a fixed kit: it is not pinned to content.
   WDK_INSTALLER_URL: "https://go.microsoft.com/fwlink/?linkid=2272234"
+  # The Inno Setup that compiles every installer (the version the runner
+  # images ship and the release runs used). Bump it together with the
+  # innounp pin in driver-reproducibility.yml, which must read its output.
+  INNO_SETUP_VERSION: "6.7.1"
 
 jobs:
   build:
@@ -127,9 +132,17 @@ jobs:
           workspaces: service
           cache-on-failure: true
 
-      - name: Install Inno Setup
+      - name: Install Inno Setup ${{ env.INNO_SETUP_VERSION }}
         shell: pwsh
-        run: choco install innosetup --no-progress -y
+        run: |
+          choco install innosetup --version $env:INNO_SETUP_VERSION --allow-downgrade --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco could not install Inno Setup $env:INNO_SETUP_VERSION" }
+          # The runner image may already hold another version, which choco
+          # can leave in place: check what ISCC.exe is.
+          $vi = (Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe").VersionInfo
+          $have = "$($vi.FileMajorPart).$($vi.FileMinorPart).$($vi.FileBuildPart)"
+          if ($have -ne $env:INNO_SETUP_VERSION) { throw "ISCC.exe is Inno Setup $have, not $env:INNO_SETUP_VERSION" }
+          Write-Host "Inno Setup $have"
 
       # -----------------------------------------------------------------
       # Prebuilt-driver cache.
@@ -370,6 +383,9 @@ jobs:
       # Cargo.toml keeps its own number between releases; only the built
       # artifact is stamped. First `^version` line only — the file also has
       # a bare `version = "…"` under a dependency table further down.
+      # The lock file follows: `cargo update --workspace` changes only this
+      # crate's own entry, and the build below is --locked, so the release
+      # exe is built from exactly the dependency versions the commit locks.
       - name: Stamp crate version from the tag (tag builds only)
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -384,6 +400,12 @@ jobs:
           $stamped = $re.Replace($toml, "version = `"$v`"", 1)
           Set-Content Cargo.toml $stamped -NoNewline
           Write-Host "Cargo.toml package version stamped to $v"
+          cargo update --workspace
+          if ($LASTEXITCODE -ne 0) { throw "cargo update --workspace failed" }
+          $changed = @(git diff --numstat -- Cargo.lock)
+          if ($changed.Count -gt 1 -or ($changed.Count -eq 1 -and $changed[0] -notmatch '^1\s+1\s')) {
+              throw "stamping the version changed more of Cargo.lock than this crate's own entry: $changed"
+          }
 
       - name: Build service (cargo --release)
         shell: pwsh
@@ -394,7 +416,7 @@ jobs:
           # release*, not the crate version — the two are independent.
           # Empty on non-tag builds → dev build → update checks disabled.
           STS_RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && steps.ver.outputs.version || '' }}
-        run: cargo build --release
+        run: cargo build --release --locked
 
       # The exe must run on a clean Windows install, which has the UCRT but
       # not the Visual C++ runtime DLLs (service/.cargo/config.toml links
@@ -428,9 +450,9 @@ jobs:
           STS_RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && steps.ver.outputs.version || '' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          cargo test --release
+          cargo test --release --locked
           if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
-          cargo test --release -- --ignored live_github_fetch
+          cargo test --release --locked -- --ignored live_github_fetch
           if ($LASTEXITCODE -ne 0) { throw "live update-check fetch failed" }
 
       - name: Stage artifacts for installer
@@ -870,9 +892,17 @@ jobs:
           name: release-inputs
           path: release-inputs
 
-      - name: Install Inno Setup
+      - name: Install Inno Setup ${{ env.INNO_SETUP_VERSION }}
         shell: pwsh
-        run: choco install innosetup --no-progress -y
+        run: |
+          choco install innosetup --version $env:INNO_SETUP_VERSION --allow-downgrade --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco could not install Inno Setup $env:INNO_SETUP_VERSION" }
+          # The runner image may already hold another version, which choco
+          # can leave in place: check what ISCC.exe is.
+          $vi = (Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe").VersionInfo
+          $have = "$($vi.FileMajorPart).$($vi.FileMinorPart).$($vi.FileBuildPart)"
+          if ($have -ne $env:INNO_SETUP_VERSION) { throw "ISCC.exe is Inno Setup $have, not $env:INNO_SETUP_VERSION" }
+          Write-Host "Inno Setup $have"
 
       - name: Fetch Microsoft-signed driver (if one matches the driver source)
         id: attested

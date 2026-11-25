@@ -273,6 +273,39 @@ class ReleaseBuild(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class ReleaseTools(unittest.TestCase):
+    def test_the_service_is_built_and_tested_from_the_locked_dependencies(self):
+        # Without --locked, a Cargo.lock that doesn't satisfy Cargo.toml is
+        # re-resolved to the newest matching crates, which then get
+        # EV-signed. The tag build stamps the crate version, so it updates
+        # the lock entry of the crate itself, and only that.
+        cargo = [(step, line) for job, step, line in script_lines("build.yml")
+                 if job == "build" and re.match(r"cargo (build|test)\b", line)]
+        self.assertGreaterEqual(len(cargo), 3)
+        self.assertEqual([c for c in cargo if "--locked" not in c[1]], [])
+        stamp = [step_script(s) for s in jobs_steps("build.yml")["build"]
+                 if (step_field(s, "name") or "").startswith("Stamp crate version")]
+        self.assertEqual(len(stamp), 1)
+        self.assertIn("cargo update --workspace", stamp[0])
+        self.assertTrue(any("git diff --numstat -- Cargo.lock" in line for line in stamp[0]))
+
+    def test_inno_setup_is_one_pinned_version_everywhere(self):
+        # choco without --version installs whatever is newest, and the
+        # runner image may hold another version already: every install
+        # names the pinned version and checks what ISCC.exe is.
+        with open(os.path.join(WORKFLOWS_DIR, "build.yml"), encoding="utf-8") as fh:
+            pin = re.search(r'(?m)^  INNO_SETUP_VERSION: "(\d+\.\d+\.\d+)"$', fh.read())
+        self.assertTrue(pin)
+        installs = [(name, job, step, line) for name in sorted(os.listdir(WORKFLOWS_DIR)) if name.endswith(".yml")
+                    for job, step, line in script_lines(name) if re.search(r"\bchoco\s+install\b", line)]
+        self.assertGreaterEqual(len(installs), 2)
+        for name, job, step, line in installs:
+            self.assertIn("--version $env:INNO_SETUP_VERSION", line, f"{name} {job}")
+            steps = [s for s in jobs_steps(name)[job] if (step_field(s, "name") or s[0].strip()) == step]
+            self.assertTrue(any("$have -ne $env:INNO_SETUP_VERSION" in l for l in step_script(steps[0])), job)
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
 class WhereTheseChecksRun(unittest.TestCase):
     """Every test of the chain's scripts (this file among them) runs on
     every pull request, push and tag, with a read-only token and no secret,
