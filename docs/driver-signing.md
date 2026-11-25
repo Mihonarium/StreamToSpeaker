@@ -108,10 +108,22 @@ like `build.yml` does.
 ## How the chain writes driver releases
 
 A `driver-v*` release is the record of one driver binary, and the release
-of a driver Microsoft certified or attested can't be made again. Every
-write to one goes through `.github/scripts/driver_release.py` (tests:
-`test_driver_release.py`), with these rules for every workflow, input and
-re-run:
+of a driver Microsoft certified or attested can't be made again.
+
+**Start these workflows from main only.** `Driver submission`, `Driver
+attest`, `Driver attested` and `Driver certified` run the workflow file of
+the ref you pick under "Use workflow from". Branches and tags that exist
+today (older `v*` tags, older branches) carry earlier versions of these
+files, whose jobs can overwrite a release, a finished one included, when
+someone with write access starts them there. Before you click "Run
+workflow", check that "Use workflow from" says `main`. A re-run uses the
+workflow files of the commit the run was started on: re-run only runs
+started from `main`, and for a run from before this version of the
+workflows start a new run instead. To try a change to these workflows,
+use a dry run from the branch of that change only.
+
+Every job of these workflows that writes a driver release does it through
+`.github/scripts/driver_release.py` (tests: `test_driver_release.py`):
 
 1. A **finished** release (manifest `certified: true` or `attested: true`)
    is never changed: nothing is uploaded to it, replaced on it or deleted
@@ -119,23 +131,52 @@ re-run:
    bytes it already holds succeeds and changes nothing; anything else is
    refused with the release named.
 2. Each workflow writes only what is its to advance. `Driver submission`:
-   a new release, or its own commit's build that nobody has EV-signed yet,
-   and only on `main`. Its `sign-cab`: the release that records exactly the
-   CAB it had signed. `Driver attest`: an unfinished attestation round.
-   `Driver attested`: a round Microsoft returned. `Driver certified`: a
-   release prepared by hand for an HLK return.
+   a new release, or its own commit's build that nobody has EV-signed yet.
+   Its `record-signed`: the release that records exactly the CAB it had
+   signed. `Driver attest`: an unfinished attestation round. `Driver
+   attested`: a round Microsoft returned. `Driver certified`: a release
+   prepared by hand for an HLK return. The jobs that write run on `main`
+   only and never in a dry run; every other job holds a read-only token
+   and no secret.
 3. A file the manifest records (with its SHA-256) is never replaced.
 4. Nothing is deleted before its replacement is completely uploaded. A
-   replacement goes up as `<name>.pending`, then the old asset is deleted
-   and the new one renamed. A run stopped between those two calls leaves
-   `<name>.pending` (and no `<name>`); the next run that writes the release
-   finishes the rename. A file already there with the same bytes is not
-   uploaded again.
+   replacement goes up as `<name>.pending`; then the old asset is deleted
+   and the new one renamed. A file already there with the same bytes is
+   not uploaded again. A run that stops half way leaves `<name>.pending`
+   (with or without `<name>`): the next job that writes the release first
+   finishes it, by renaming a completely uploaded pending file (deleting
+   `<name>` first when it is still there), or deleting one whose upload
+   never completed. Nothing is renamed over a finished `manifest.json`.
 5. `manifest.json` is written last, in a call of its own, and only when
    every file it records is on the release.
 
-Release lists are always read with every page. The `v*` drafts of the
-tag pipeline are written with rule 4 too (`release_draft.py upload`).
+**Two jobs at once.** Every job that writes a driver release waits in one
+repository-wide concurrency group, `driver-release-writes` (no job in it
+is cancelled for another: up to 100 can wait), so no two of them write at
+the same time, and no job in it waits for a person. On top of that, each
+write is decided on the release as it is at that moment: just before it,
+the job reads the release again and stops when the release is finished,
+when the tag names another release, or when its files changed since the
+job read or wrote them. GitHub has no lock on release files, so a person
+in the web UI, or a run of an older version of these workflows (see
+above), can still change a release in the moment between that read and
+the write: one API call, well under a second. If that happens, the
+release shows it in one of two ways. Either it holds `<name>.pending` and
+no `<name>` (see Troubleshooting), or a release that had just been
+finished got the other job's `manifest.json`. In the second case, the run
+that finished it records the manifest it wrote in its summary; put that
+back (upload it as `manifest.json.pending`, then delete `manifest.json`
+and rename the pending one).
+
+**Readers.** A `manifest.json.pending` is never read as the release's
+manifest. The installers' driver lookup (`Get-AttestedDriver.ps1`), the
+certified guard and the fallback check stop with an error at a release
+that holds `manifest.json.pending` and no `manifest.json` (a manifest
+write that stopped half way): they can't rule it out, and a tag's
+`package` job fails instead of falling back to the test-signed driver.
+Re-running the job that was writing the release finishes the write.
+Release lists are always read with every page. The `v*` drafts of the tag
+pipeline are written with rule 4 too (`release_draft.py upload`).
 
 ## Driver build numbers
 
@@ -208,27 +249,32 @@ the number.
    commit's own unsigned build) and that the version is above every driver
    release, builds the driver **unsigned** (`SignMode=Off`), packs
    `StreamToSpeaker-Driver-<ver>-Submission.cab`, creates prerelease
-   `driver-v<ver>` with a `manifest.json` that records how the binary was
-   built (`driver_build`, `build_root` = the runner checkout it was linked
-   in, `driver_h_stamped`, which the reproducibility check repeats) and the
-   unsigned CAB's SHA-256, and dispatches the CAB (the run's
-   `submission-cab` artifact) to the signing repo. Dispatched from another
-   branch, it only builds the CAB: no release, no signature, no cleanup.
+   `driver-v<ver>` (job `record`) with a `manifest.json` that records how
+   the binary was built (`driver_build`, `build_root` = the runner checkout
+   it was linked in, `driver_h_stamped`, which the reproducibility check
+   repeats) and the unsigned CAB's SHA-256, and dispatches the CAB (the
+   run's `submission-cab` artifact) to the signing repo (job `sign-cab`).
 2. **Approve** the signing run in `Mihonarium/signing` (its run name must
-   show the sha256 from the workflow summary / release notes). CI then
-   adds the EV-signed CAB to the release and records its hash. If you
-   don't approve within 2 h the `sign-cab` job times out: approve, then
-   re-run just that job; the re-run picks up that signing run (or reuses
-   its signed file) instead of asking again.
+   show the sha256 from the workflow summary / release notes). The job
+   `record-signed` then adds the EV-signed CAB to the release and records
+   its hash. If you don't approve within 2 h the `sign-cab` job times out:
+   approve, then re-run the failed jobs; `sign-cab` picks up that signing
+   run (or reuses its signed file) instead of asking again. If
+   `record-signed` failed, re-run it alone: the signed CAB waits as the
+   run's `signed-cab` artifact for three days.
 3. **Run `Driver attest`** from main with `tag` = `driver-v<ver>` (the
    release notes and the run summary name the tag). It starts by itself
-   when `Driver submission` completes only if the repository variable
-   `AUTO_ATTEST` is `true` (off by default, see "Selection order"); then
-   it takes the attestation round of the commit that run built. It
+   when `Driver submission` completes on main only if the repository
+   variable `AUTO_ATTEST` is `true` (off by default, see "Selection
+   order"); then it takes the attestation round of the commit that run
+   built. (A `Driver submission` run on any other branch also starts
+   main's `Driver attest`, which ignores it.) It
    reconciles the release's `manifest.json` forward: create a Partner
    Center product (`StreamToSpeaker-Driver-<ver>`) + initial submission via
    the Hardware API, record `ms_product_id` / `ms_submission_id` on the
-   manifest **before** uploading (so a re-run resumes the same submission),
+   manifest **before** uploading (so a re-run resumes the same submission:
+   a manifest a stopped run left as `manifest.json.pending` is finished
+   first, never dropped),
    upload the EV-signed CAB (re-hashed against the manifest first), commit,
    poll (attestation typically completes in ~10 minutes), attach the
    returned `StreamToSpeaker-Driver-<ver>-Microsoft.zip`, then call
@@ -258,16 +304,26 @@ runner death never needs cleanup. Outcomes it can report:
 | `failed` | Microsoft rejected the submission | Read Microsoft's error payload in the run summary; fix, push a new driver build |
 
 Notes: rapid successive driver pushes to main cancel in-flight submission
-runs on main, and the newest run deletes older driver-v prereleases that
-hold nothing anyone approved or Microsoft returned (never EV-signed,
-never submitted). Releases with an EV-signed CAB, a Partner Center
-submission (`ms_*` fields), or a manifest the run can't read are kept, and
-certified and attested ones are kept forever as the record of shipped
-kernel bits. A cancelled `sign-cab` can leave a signing-repo run Waiting
-— reject it there; its digest no longer matches anything CI will
-publish. A failed first `Driver attest` run can
-leave an empty product in Partner Center; that's harmless (products can't
-be deleted via the API) and capped at one per driver version.
+runs on main. The newest run's `record` job deletes an older driver
+release only when it can show the release is an unsigned build of main
+that nothing was ever done with: its only file is a completely uploaded
+`manifest.json`, which records nothing but an unsigned build (no
+signature, no submission, no package, no field the cleanup doesn't know),
+and the commit it was built from is its target and in main's history.
+Every other older release is kept and named in the run summary with the
+reason; a release that can't be read is kept. A cancelled `sign-cab` can
+leave a signing-repo run Waiting — reject it there; its digest no longer
+matches anything CI will publish. A `Driver attest` run that stops
+between creating the Partner Center product and recording it on the
+release can leave an empty product in Partner Center; that's harmless
+(products can't be deleted via the API).
+
+A job that waits in `driver-release-writes` (for example Driver attested
+while Driver attest polls Microsoft, up to 55 minutes) starts when the job
+ahead of it is done; nothing waiting there is cancelled unless 100 jobs
+already wait. Don't attach a Microsoft zip by hand (the manual fallback)
+while `Driver attest` runs for the same release: its next write would
+find the release changed and stop.
 
 ## Flow B — every main push (no manual steps)
 
@@ -437,7 +493,7 @@ uploaded fails before anything is signed — re-run all jobs instead,
 which uploads every artifact again and asks for both approvals again.
 The same holds once `cleanup` deleted an artifact: after `sign-release`
 succeeded only `publish` can be re-run on its own. A
-published release is never modified: once `publish` succeeded,
+published release keeps its assets and notes (`publish` only hands the latest flag back to a higher version published meanwhile): once `publish` succeeded,
 re-running the chain fails at `sign-service`.
 
 ### Test-signed fallback releases
@@ -566,8 +622,9 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
    and records the `commit` tree, after checking that `commit` has the
    same `driver/` and `include/` trees as the commit the release's tag
    points to. `dry_run=true` runs every check below and leaves every
-   release as it is (none is created, uploaded to or changed; the Hardware
-   API is only read). It polls the Hardware API until the submission is
+   release as it is (none is created, uploaded to or changed), with
+   `ms_zip_asset` only: a dry run holds no credential, so it doesn't call
+   the Hardware API. It polls the Hardware API until the submission is
    `completed` with a `signedPackage`, downloads it, and verifies:
    - INF byte-identical to the lab package and carrying DriverVer `<ver>`;
    - `.sys` code identical to the lab `.sys` after stripping the
@@ -579,8 +636,9 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
      what the kernel relies on), and a *Microsoft Windows Hardware
      Compatibility Publisher* signature on the `.sys` at any index of
      `signtool verify /all`.
-   Then it makes the canonical flat `…-Signed.zip`, attests its
-   provenance, and publishes `StreamToSpeaker-Driver-<ver>-Microsoft.zip`
+   Then it makes the canonical flat `…-Signed.zip`, and the job `publish`
+   (main only, never in a dry run) attests its provenance and publishes
+   `StreamToSpeaker-Driver-<ver>-Microsoft.zip`
    (as returned; the hand-attached lab package is checked, never uploaded
    again), the `…-Signed.zip`, the `.sha256` sidecars and the provenance
    bundle, and last `manifest.json` with
@@ -590,9 +648,10 @@ Used for driver **1.1.0.209** (product `14599256519720956`, submission
    `ms_state: done`, no submission CAB; the attestation-only `build_root`
    and `driver_h_stamped` are not written).
    Already have the zip from the dashboard? Attach it to the release and
-   pass its name as `ms_zip_asset` — the API step is skipped, no Azure
-   secrets are needed, and the run works from any branch, including that
-   commit's own.
+   pass its name as `ms_zip_asset` — the API step is skipped and no Azure
+   secrets are needed. Run it from main all the same: `publish` runs
+   nowhere else; a dry run works from the branch of a change to this
+   workflow.
 5. Merge the driver branch. `Driver submission` fires on the `driver/**`
    push and its `certified-guard` stops it; `build.yml` bundles the
    certified package into every installer whose driver tree still hashes
@@ -696,9 +755,31 @@ only cleaned (`repro_compare.py` `clean_text`) or between
   computed belongs to another release. Nothing was built or written;
   dispatch with another `driver_build`.
 - **A release shows an asset named `<name>.pending`** — a run stopped while
-  it replaced `<name>`. The next run that writes the release finishes it;
-  by hand, rename it to `<name>` if `<name>` is missing, or delete it if
-  `<name>` is there.
+  it replaced `<name>` (or, rarely, a write from outside the writers'
+  group met one of them; see "How the chain writes driver releases"). Re-run
+  the job that was writing the release: its first step finishes the
+  replacement, and when that was the last write of Driver attested or
+  Driver certified, the re-run ends there ("an earlier run's last write
+  was interrupted and is finished now"). Until then the installers' driver
+  lookup, the certified guard and the fallback check stop at a release
+  that has `manifest.json.pending` but no `manifest.json`. By hand: when
+  `<name>` is missing, rename `<name>.pending` to `<name>`; when both are
+  there and the release is not finished, delete `<name>`, then rename; on
+  a finished release, look at both before changing anything.
+- **A job says "… changed since this run last read it … another run or a
+  person is writing it"** — the release changed between the job's read
+  and its write (a file attached by hand, or a run from outside the
+  writers' group). Nothing more was written. Look at the release, then
+  re-run the job.
+- **`devcon.exe` "carries no valid Authenticode signature" or "is not
+  signed by Microsoft"** — `Assert-MicrosoftSigned.ps1` stopped the
+  installer build: the devcon.exe in the WDK (or in the driver cache built
+  from it) is not the Microsoft-signed one. Look at the signer and SHA-256
+  it printed. If the cached copy is the odd one out (the runner image's
+  WDK changed since), bump the `vN` tag of the driver cache key in
+  `build.yml` so the cache is built again from the current WDK; if the
+  WDK's own devcon.exe is signed differently, the check's expectation
+  needs a look before anything is released.
 - **Installer bundles an attested build although a certified one exists** —
   their `source_hash` differs: the certified manifest pairs only with the
   exact tree the lab tested. Either restore that tree or run a new HLK
@@ -726,8 +807,8 @@ only cleaned (`repro_compare.py` `clean_text`) or between
 - **`Driver attest` or `Driver certified` is refused with "not allowed to
   deploy to partner-center"** — the run was dispatched from a ref other
   than main. Dispatch it from main (for `Driver certified`, with
-  `commit` = the certified commit), or use a dry run of `Driver attest` /
-  `ms_zip_asset` for `Driver certified`, which need no environment.
+  `commit` = the certified commit), or use a dry run (for `Driver
+  certified` with `ms_zip_asset`), which needs no environment.
 - **`Driver attest` fails creating the product/submission** — the Entra
   app lost its Partner Center association or Manager role (Account
   settings → User management → Microsoft Entra applications).
@@ -746,28 +827,36 @@ works end to end:
 3. Download the signed zip Microsoft returns and attach it to the same
    `driver-v<ver>` release (a `.zip` name of letters, digits and
    `. _ + -`; don't rename anything inside).
-4. Run the **Driver attested** workflow (Actions tab; it picks the newest
-   unfinished release with a zip attached, by creation date, or pass the
-   tag). Same verification as the automatic path.
+4. Run the **Driver attested** workflow from main (Actions tab; it picks
+   the newest unfinished release with a zip attached, by creation date,
+   or pass the tag). Same verification as the automatic path. Not while
+   `Driver attest` runs for the same release (see Flow A's notes).
 
 ## Dry runs
 
-`Driver attest` and `Driver attested` take a `dry_run` input on manual
-dispatch. `Driver attested` with `dry_run=true` runs the signtool and INF
+A dry run executes only jobs that hold a read-only token and no secret:
+the jobs that write (Driver attested's `record`, Driver certified's
+`publish`, Driver attest's `reconcile`) are skipped, and no dry-run job
+waits in the writers' group. `Driver attest` and `Driver attested` take a
+`dry_run` input on manual dispatch. `Driver attested` with `dry_run=true` runs the signtool and INF
 checks against the given `tag` (which may already be attested, e.g.
 `driver-v1.1.0.204`) and stops before the release is modified. `Driver
 attest` with `dry_run=true` skips the Hardware API entirely and calls
 `Driver attested` in dry-run mode for `tag` (default
 `driver-v1.1.0.204`), which exercises the reusable-workflow call — the
 calling job must grant `contents: write`, `id-token: write` and
-`attestations: write`, the permissions `driver-attested.yml` declares.
+`attestations: write`, the permissions `driver-attested.yml`'s `record`
+declares; the job a dry run executes there, `verify`, declares
+`contents: read` and gets no more.
 `Driver submission` needs no dry-run input: dispatched from a branch other
-than main it builds the CAB (the `submission-cab` artifact) and writes no
-release, and while a certified driver matches the current source hash its
-`certified-guard` job ends the run before anything is built. `Driver certified` with `dry_run=true` runs
-every check and changes no release; its Hardware API path (no
-`ms_zip_asset`) runs from main only, the hand-downloaded path from any
-branch.
+than main it builds the CAB (the `submission-cab` artifact) with a
+read-only token and writes no release, and while a certified driver
+matches the current source hash its `certified-guard` job ends the run
+before anything is built. When it finishes, GitHub starts main's `Driver
+attest`, which ignores a run that wasn't on main. `Driver certified` with
+`dry_run=true` runs every check and changes no release; it needs
+`ms_zip_asset` (the Hardware API path holds the Partner Center secret and
+is refused in a dry run).
 
 ## Future work
 

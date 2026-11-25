@@ -333,7 +333,9 @@ every pull request (`chain-tests`, `chain-tests-powershell`).
 the driver's Microsoft attestation round-trip, `driver-certified.yml` turns a
 WHQL (HLK) return into a driver release, and `driver-reproducibility.yml`
 rebuilds a driver release and compares: [docs/driver-signing.md](docs/driver-signing.md).
-A driver release that is certified or attested is never changed by any of them.
+Started from main, none of them changes a driver release that is certified or
+attested; older versions of these workflows, still on older branches and tags,
+can, so start them from main only.
 
 The WDK install and Rust dependencies are cached; a cold build is ~15-20 min,
 warm ~5.

@@ -785,7 +785,7 @@ jobs:
           Copy-Item "release-inputs\service\target\release\stream-to-speaker.exe" $name
           $sha = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
           # A draft until `publish`; refuses a tag whose release is already
-          # published (a published release is never modified) and a tag that
+          # published (its assets and notes are never changed) and a tag that
           # no longer points at this run's commit, also when the draft
           # already exists.
           python .github/scripts/release_draft.py ensure $tag --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA
