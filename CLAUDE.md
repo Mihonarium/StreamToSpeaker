@@ -101,7 +101,7 @@ Implemented in `service/src/sonos.rs` (+ ssdp/upnp/gena/app wiring). Facts below
 
 `.github/workflows/build.yml` runs on **`windows-2022` (pinned)** for every push, PR, tag, and `workflow_dispatch` (any branch — the dispatch path builds the same dev + Microsoft-signed-preview installers as a PR, so a branch can be built without opening one). Do NOT move it back to `windows-latest`: that label migrated to Windows Server 2025 + VS 2026 (MSBuild 18) in June 2026, which can't load WDK 26100's MSBuild-17 task DLLs (`MSB4062: ValidateNTTargetVersion … Microsoft.DriverKit.Build.Tasks.18.0.dll not found`). Revisit only with an EWDK or a VS2026-matched WDK. Related war story: stale driver build outputs from a dev machine were once *tracked in git* (`driver/x64/**`, committed before `.gitignore` covered it) — after an msbuild failure, CI's artifact scan happily picked up the stale `.sys` (signed by the dev's personal `WDKTestCert`, mismatching the CI-generated `.cer`). They're untracked now and the build step fails fast on msbuild's exit code; if a `.sys` ever shows a `WDKTestCert <username>` signer in CI logs, something is leaking dev-machine bits again. Steps:
 
-1. Install Inno Setup (chocolatey)
+1. Install Inno Setup `INNO_SETUP_VERSION` (chocolatey), then `.github/scripts/inno_setup.py check` fails unless the compiler engine says it is that version (the version line ISCC prints when compiling; its version resource reads 0.0.0 on the hosted images)
 2. Restore / install WDK (cached — see workflow for keys)
 3. Generate self-signed code-signing cert, import to local trust stores
 4. **Bump driver build to git commit count**

@@ -362,8 +362,11 @@ overlap (a concurrency group per tag).
    `+` and nothing naming `testsigned`). The crate version is stamped from
    the tag and `cargo update --workspace` updates only the crate's own lock
    entry, so the service is built `--locked` from the commit's
-   dependencies. Inno Setup is the pinned `INNO_SETUP_VERSION`, checked on
-   `ISCC.exe`. `chain-tests` and `chain-tests-powershell` (every test in
+   dependencies. Inno Setup is the pinned `INNO_SETUP_VERSION`, checked by
+   the version its compiler engine prints when it compiles
+   (`inno_setup.py check`; `ISCC.exe`'s version resource reads 0.0.0 on
+   the hosted images, and choco can leave another version in place).
+   `chain-tests` and `chain-tests-powershell` (every test in
    `.github/scripts`, the Pester tests among them) run next to it; the
    release jobs wait for them.
 2. `sign-service` — creates the **draft** release for the tag

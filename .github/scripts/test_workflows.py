@@ -292,7 +292,9 @@ class ReleaseTools(unittest.TestCase):
     def test_inno_setup_is_one_pinned_version_everywhere(self):
         # choco without --version installs whatever is newest, and the
         # runner image may hold another version already: every install
-        # names the pinned version and checks what ISCC.exe is.
+        # names the pinned version, then asks the compiler what it is
+        # (inno_setup.py). ISCC.exe's version resource reads 0.0.0 on the
+        # hosted images, so nothing may decide by it.
         with open(os.path.join(WORKFLOWS_DIR, "build.yml"), encoding="utf-8") as fh:
             pin = re.search(r'(?m)^  INNO_SETUP_VERSION: "(\d+\.\d+\.\d+)"$', fh.read())
         self.assertTrue(pin)
@@ -302,7 +304,14 @@ class ReleaseTools(unittest.TestCase):
         for name, job, step, line in installs:
             self.assertIn("--version $env:INNO_SETUP_VERSION", line, f"{name} {job}")
             steps = [s for s in jobs_steps(name)[job] if (step_field(s, "name") or s[0].strip()) == step]
-            self.assertTrue(any("$have -ne $env:INNO_SETUP_VERSION" in l for l in step_script(steps[0])), job)
+            script = step_script(steps[0])
+            self.assertIn("python .github/scripts/inno_setup.py check $env:INNO_SETUP_VERSION", script, job)
+            self.assertGreater(script.index("python .github/scripts/inno_setup.py check $env:INNO_SETUP_VERSION"),
+                               next(i for i, l in enumerate(script) if "choco install" in l), job)
+        for name in sorted(os.listdir(WORKFLOWS_DIR)):
+            if name.endswith(".yml"):
+                for job, step, line in script_lines(name):
+                    self.assertNotRegex(line, r"File(Major|Minor|Build)Part", f"{name} {job} {step}")
 
 
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")

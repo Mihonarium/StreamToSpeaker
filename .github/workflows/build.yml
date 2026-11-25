@@ -138,11 +138,10 @@ jobs:
           choco install innosetup --version $env:INNO_SETUP_VERSION --allow-downgrade --no-progress -y
           if ($LASTEXITCODE -ne 0) { throw "choco could not install Inno Setup $env:INNO_SETUP_VERSION" }
           # The runner image may already hold another version, which choco
-          # can leave in place: check what ISCC.exe is.
-          $vi = (Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe").VersionInfo
-          $have = "$($vi.FileMajorPart).$($vi.FileMinorPart).$($vi.FileBuildPart)"
-          if ($have -ne $env:INNO_SETUP_VERSION) { throw "ISCC.exe is Inno Setup $have, not $env:INNO_SETUP_VERSION" }
-          Write-Host "Inno Setup $have"
+          # can leave in place ("already installed"), and ISCC.exe's version
+          # resource doesn't carry the version: ask the compiler engine
+          # itself (it prints every other source it reads, too).
+          python .github/scripts/inno_setup.py check $env:INNO_SETUP_VERSION
 
       # -----------------------------------------------------------------
       # Prebuilt-driver cache.
@@ -903,11 +902,10 @@ jobs:
           choco install innosetup --version $env:INNO_SETUP_VERSION --allow-downgrade --no-progress -y
           if ($LASTEXITCODE -ne 0) { throw "choco could not install Inno Setup $env:INNO_SETUP_VERSION" }
           # The runner image may already hold another version, which choco
-          # can leave in place: check what ISCC.exe is.
-          $vi = (Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe").VersionInfo
-          $have = "$($vi.FileMajorPart).$($vi.FileMinorPart).$($vi.FileBuildPart)"
-          if ($have -ne $env:INNO_SETUP_VERSION) { throw "ISCC.exe is Inno Setup $have, not $env:INNO_SETUP_VERSION" }
-          Write-Host "Inno Setup $have"
+          # can leave in place ("already installed"), and ISCC.exe's version
+          # resource doesn't carry the version: ask the compiler engine
+          # itself (it prints every other source it reads, too).
+          python .github/scripts/inno_setup.py check $env:INNO_SETUP_VERSION
 
       - name: Fetch Microsoft-signed driver (if one matches the driver source)
         id: attested
