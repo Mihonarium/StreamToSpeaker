@@ -735,13 +735,14 @@ that machine's zlib, and another zlib may compress the same files
 differently. So a package is made once and handed on as a file, and
 nothing rebuilds a published package: every check compares it with the
 SHA-256 its manifest records. Running Driver certified again for a
-published release therefore makes the published package only when that package
-has the layout `package` writes now, and only while the runner's zlib
-compresses as the one that made it did. `driver-v1.1.0.209`'s has the
-other layout (host 3, above), so its inputs make a package with another
-SHA-256 than the published one; a package in today's layout would
-differ in the same way after the runner's zlib changed. Such a run is
-refused like any run with other inputs, and the release stays as it is.
+published release therefore makes the published package only when that
+package has the layout `package` writes now, and only while the
+runner's zlib compresses as the one that made it did.
+`driver-v1.1.0.209`'s has the other layout (host 3, above), so its
+inputs make a package with another SHA-256 than the published one; a
+package in today's layout would differ in the same way after the
+runner's zlib changed. Such a run is refused like any run with other
+inputs, and the release stays as it is.
 
 ## Reproducibility check (`driver-reproducibility.yml`)
 
