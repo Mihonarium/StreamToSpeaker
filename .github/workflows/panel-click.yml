@@ -1,15 +1,21 @@
 name: Panel click
 
-# Starts the app on a hosted Windows machine, clicks its tray icon with
+# Starts the app on hosted Windows machines, clicks its tray icon with
 # real mouse input and keeps pictures of the desktop, a timeline of the
 # panel's window and the foreground, and the app's log: what Windows does
 # to the panel's window and its focus can only be seen on Windows. Logic in
-# .github/scripts/Test-PanelClick.ps1 (and PanelRig.cs next to it).
+# .github/scripts/Test-PanelClick.ps1 (and PanelRig.cs next to it); the
+# cases in .github/scripts/panel_click_cases.py.
 #
-# Only started by hand. It builds its own copy of the app from the
-# dispatched commit, uses no secrets, reads the repository and changes
-# nothing outside the machines it runs on (the Rust cache is restored,
-# never saved).
+# It runs in two ways, and in no other:
+#   - started by hand (workflow_dispatch): the one case its inputs give;
+#   - on a push to a branch whose name starts with rig/: five cases, the
+#     panel as a flyout in each: the defaults below; started by hand from a
+#     shortcut; the icon among the hidden icons; a double click; Windows
+#     10's taskbar (Server 2022).
+# Either way the app is built once, from the commit the run is for. The
+# workflow uses no secrets, reads the repository only and changes nothing
+# outside the machines it runs on (the Rust cache is restored, never saved).
 
 on:
   workflow_dispatch:
@@ -48,6 +54,8 @@ on:
         description: "First run (no settings: losing the focus doesn't close the panel until first run is finished)"
         type: boolean
         default: false
+  push:
+    branches: ['rig/**']
 
 permissions:
   contents: read
@@ -56,7 +64,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      cases: ${{ steps.pick.outputs.cases }}
+      window: ${{ steps.pick.outputs.window }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Pick the cases
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          CASE_RUNNER: ${{ inputs.runner }}
+          CASE_CLICK: ${{ inputs.click }}
+          CASE_ICON: ${{ inputs.icon }}
+          CASE_PANEL: ${{ inputs.panel }}
+          CASE_START: ${{ inputs.start }}
+          CASE_NETWORK: ${{ inputs.network }}
+          CASE_FIRST_RUN: ${{ inputs.first_run }}
+        run: python3 .github/scripts/panel_click_cases.py >> "$GITHUB_OUTPUT"
+
   build:
+    needs: cases
     # The same image the installer's build uses.
     runs-on: windows-2022
     timeout-minutes: 60
@@ -79,18 +112,18 @@ jobs:
 
       # As build.yml builds the app for the installer. The small-window form
       # of the panel is a switch only builds with debug assertions read, so
-      # for it the release build gets them.
+      # when a case wants it the release build gets them.
       - name: Build the app
         shell: pwsh
         working-directory: service
         env:
-          PANEL: ${{ inputs.panel }}
+          WINDOW: ${{ needs.cases.outputs.window }}
         run: |
-          if ($env:PANEL -eq "window") { $env:CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true" }
+          if ($env:WINDOW -eq "true") { $env:CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true" }
           cargo build --release --locked
           if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
-      - name: Keep the app for the next job
+      - name: Keep the app for the cases
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: panel-click-app
@@ -99,8 +132,13 @@ jobs:
           retention-days: 1
 
   click:
-    needs: build
-    runs-on: ${{ inputs.runner }}
+    needs: [cases, build]
+    name: ${{ matrix.case.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(needs.cases.outputs.cases) }}
+    runs-on: ${{ matrix.case.runner }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -134,12 +172,12 @@ jobs:
       - name: Start the app and click its tray icon
         shell: powershell
         env:
-          CLICK: ${{ inputs.click }}
-          ICON: ${{ inputs.icon }}
-          PANEL: ${{ inputs.panel }}
-          START: ${{ inputs.start }}
-          NETWORK: ${{ inputs.network }}
-          FIRST_RUN: ${{ inputs.first_run }}
+          CLICK: ${{ matrix.case.click }}
+          ICON: ${{ matrix.case.icon }}
+          PANEL: ${{ matrix.case.panel }}
+          START: ${{ matrix.case.start }}
+          NETWORK: ${{ matrix.case.network }}
+          FIRST_RUN: ${{ matrix.case.first_run }}
         run: >
           .github/scripts/Test-PanelClick.ps1
           -Exe $env:APP_EXE
@@ -151,7 +189,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: panel-click-${{ inputs.runner }}-${{ inputs.click }}-${{ inputs.icon }}-${{ inputs.panel }}-${{ inputs.start }}-${{ inputs.network }}${{ inputs.first_run && '-first-run' || '' }}
+          name: panel-click-${{ matrix.case.name }}
           path: ${{ runner.temp }}/panel-click
           if-no-files-found: warn
           retention-days: 14
