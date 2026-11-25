@@ -22,7 +22,13 @@
        for a click, except at first run). Then pictures every 100 ms for
        3 s.
     3. Waits for the icon, takes a picture, opens the hidden icons when the
-       icon is there, and clicks the icon once or twice at its centre.
+       icon is there, and clicks the icon once or twice at its centre. The
+       icon is looked for only among the notification area's buttons (at
+       the place the taskbar gives it) and the hidden icons' buttons, and
+       only an element named as the tray icon is ("Stream To Speaker", an
+       en dash, its state) counts: no taskbar button of the app's windows.
+       Found nowhere, the run fails instead of clicking something else.
+       The timeline and the step summary say what was clicked.
     4. Pictures every 100 ms for 2 s; then, if the panel's window is on
        screen, a click inside it near its top edge and pictures every
        100 ms for 1 s.
@@ -75,7 +81,13 @@ $ErrorActionPreference = "Stop"
 
 $PanelTitle = "Stream To Speaker"
 $RootTitle = "Stream To Speaker (background)"
-$TooltipPattern = '^Stream To Speaker'
+# The tray icon's tooltip, and so its name to UI Automation, starts with
+# "Stream To Speaker", an en dash and a space; no window of the app is
+# titled so (the panel's, the root's and the dialogs' titles have no dash).
+# The dash is written as a character code: Windows PowerShell reads a
+# script without a byte-order mark in the ANSI code page.
+$TrayTip = "Stream To Speaker " + [char]0x2013 + " "
+$TrayPattern = '^' + [regex]::Escape($TrayTip)
 $ExeName = "stream-to-speaker.exe"
 $ShortcutName = "Panel click app"
 $SettingsDir = Join-Path $env:APPDATA "StreamToSpeaker"
@@ -89,6 +101,16 @@ function Say([string]$msg) {
     Write-Host $line
     Add-Content -LiteralPath $RigLog -Value $line -Encoding UTF8
 }
+
+# What ran otherwise than the case asked, for rig.log and the step summary.
+$script:Warnings = @()
+function Warn([string]$msg) {
+    Say "WARNING: $msg"
+    $script:Warnings += $msg
+}
+
+# What the click on the icon hit, for the step summary.
+$script:Clicked = "nothing"
 
 # The app's environment. A start by hand goes through Explorer, which takes
 # the user's variables when they change, so they are set for the user too.
@@ -110,6 +132,7 @@ function Set-AppEnvironment([bool]$on) {
 }
 
 Add-Type -Path (Join-Path $PSScriptRoot "PanelRig.cs")
+Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 
@@ -124,6 +147,33 @@ function Get-UiaTopLevel([string]$class) {
         [System.Windows.Automation.TreeScope]::Children, $cond)
 }
 
+# An element's name, class, control type and place on the desktop; $null
+# when it has no place there.
+function Get-UiaInfo($e) {
+    $name = $null
+    $rect = $null
+    try {
+        $name = $e.Current.Name
+        $rect = $e.Current.BoundingRectangle
+        $class = $e.Current.ClassName
+        $type = $e.Current.ControlType.ProgrammaticName
+    } catch {
+        return $null
+    }
+    if ($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0) { return $null }
+    $box = [PanelRig.Box]::new([int]$rect.X, [int]$rect.Y, [int]($rect.X + $rect.Width), [int]($rect.Y + $rect.Height))
+    [pscustomobject]@{
+        Name  = "$name"
+        Class = "$class"
+        Type  = "$type"
+        X     = $box.CenterX
+        Y     = $box.CenterY
+        Box   = $box
+        Rect  = "$box"
+        What  = "'$name' ($class, $type) $box"
+    }
+}
+
 # Elements under $under whose name matches $pattern and that have a place
 # on the desktop.
 function Find-UiaNamed($under, [string]$pattern) {
@@ -132,25 +182,29 @@ function Find-UiaNamed($under, [string]$pattern) {
     $all = $under.FindAll([System.Windows.Automation.TreeScope]::Descendants,
         [System.Windows.Automation.Condition]::TrueCondition)
     foreach ($e in $all) {
-        $name = $null
-        $rect = $null
-        try {
-            $name = $e.Current.Name
-            $rect = $e.Current.BoundingRectangle
-        } catch {
-            continue
-        }
-        if ($name -and ($name -match $pattern) -and -not $rect.IsEmpty -and $rect.Width -gt 0 -and $rect.Height -gt 0) {
-            $found += [pscustomobject]@{
-                Name = $name
-                X    = [int]($rect.X + $rect.Width / 2)
-                Y    = [int]($rect.Y + $rect.Height / 2)
-                Box  = [PanelRig.Box]::new([int]$rect.X, [int]$rect.Y, [int]($rect.X + $rect.Width), [int]($rect.Y + $rect.Height))
-                Rect = "{0}x{1} at {2},{3}" -f [int]$rect.Width, [int]$rect.Height, [int]$rect.X, [int]$rect.Y
-            }
-        }
+        $info = Get-UiaInfo $e
+        if ($info -and $info.Name -and ($info.Name -match $pattern)) { $found += $info }
     }
     $found
+}
+
+# The app's tray icon at (x, y), by UI Automation: the element there, or one
+# inside it whose place holds the point, if it is named as the tray icon is;
+# $null otherwise. What else is there goes to rig.log.
+function Get-TrayIconAt([int]$x, [int]$y) {
+    $e = $null
+    try {
+        $e = [System.Windows.Automation.AutomationElement]::FromPoint([System.Windows.Point]::new($x, $y))
+    } catch {
+        Say "Nothing UI Automation knows of at $x,$y"
+        return $null
+    }
+    $there = Get-UiaInfo $e
+    if ($there -and ($there.Name -match $TrayPattern)) { return $there }
+    $inner = @(Find-UiaNamed $e $TrayPattern | Where-Object { $_.Box.Contains($x, $y) }) | Select-Object -First 1
+    if ($inner) { return $inner }
+    Say "At $x,$y: $(if ($there) { $there.What } else { 'an element with no place' }), not the app's tray icon"
+    $null
 }
 
 # ---------------------------------------------------------------------------
@@ -215,7 +269,7 @@ function Start-AppByHand([string]$label) {
         }
     }
     if (-not $item) {
-        Say "WARNING: the shortcut doesn't show on the desktop; starting the app as a program instead"
+        Warn "the shortcut doesn't show on the desktop; the app was started as a program instead"
         return Start-AppByProgram $false $label
     }
     $since = Get-Date
@@ -316,58 +370,59 @@ function Set-Promoted([int]$value) {
     $n
 }
 
-# Where the icon is now: on the taskbar (with the point to click) or not.
+# Where the icon is now. On the taskbar: the place the taskbar gives the
+# app's icon (Shell_NotifyIconGetRect), and only if what UI Automation finds
+# there is named as the tray icon is (a button of the notification area,
+# never a taskbar button of one of the app's windows); else among the hidden
+# icons. Throws rather than return any other place to click.
 function Get-IconPlace([int]$appPid) {
     $bar = Get-UiaTopLevel "Shell_TrayWnd"
-    $named = @(Find-UiaNamed $bar $TooltipPattern)
+    $named = @(Find-UiaNamed $bar $TrayPattern)
     $rect = Get-IconRect $appPid
     $barRect = [PanelRig.Windows]::RectOf([PanelRig.Windows]::Taskbar())
     $rectOnBar = $rect -and $barRect -and $barRect.Contains($rect.CenterX, $rect.CenterY)
-    # A hidden icon's rectangle can be the button that shows the hidden
-    # icons: that is not the icon on the taskbar.
+    Say "Icon: the taskbar's elements named as the tray icon: $(@($named | ForEach-Object { $_.What }) -join '; '); its place from the taskbar: $rect$(if ($rectOnBar) { ' (on the taskbar)' } else { '' })"
+    # A hidden icon's place can be the button that shows the hidden icons:
+    # that is not the icon on the taskbar.
     $chevron = @(Find-UiaNamed $bar '(?i)chevron|hidden icons') | Select-Object -First 1
     if ($rectOnBar -and $chevron -and $chevron.Box.Contains($rect.CenterX, $rect.CenterY)) {
-        Say "The taskbar gives the icon the place of '$($chevron.Name)' ($($chevron.Rect))"
+        Say "The taskbar gives the icon the place of $($chevron.What)"
         $rectOnBar = $false
     }
-    Say "Icon: taskbar's buttons with its name: $(@($named | ForEach-Object { "'$($_.Name)' $($_.Rect)" }) -join '; '); its rectangle from the taskbar: $rect$(if ($rectOnBar) { ' (on the taskbar)' } else { '' })"
-    if ($named.Count -gt 0) {
-        $x = $named[0].X
-        $y = $named[0].Y
-        if ($rectOnBar) {
-            $x = $rect.CenterX
-            $y = $rect.CenterY
-        }
-        return [pscustomobject]@{ Where = "taskbar"; X = $x; Y = $y }
+    if (-not $rectOnBar) {
+        return [pscustomobject]@{ Where = "hidden"; X = 0; Y = 0; What = "" }
     }
-    if ($rectOnBar) {
-        return [pscustomobject]@{ Where = "taskbar"; X = $rect.CenterX; Y = $rect.CenterY }
+    $icon = Get-TrayIconAt $rect.CenterX $rect.CenterY
+    if (-not $icon) {
+        throw "the taskbar gives the app's icon the place $rect, but nothing there is named as the tray icon is ('$TrayTip...'): not clicking"
     }
-    [pscustomobject]@{ Where = "hidden"; X = 0; Y = 0 }
+    [pscustomobject]@{ Where = "taskbar"; X = $rect.CenterX; Y = $rect.CenterY; What = "the notification area's button $($icon.What)" }
 }
 
 # Click the button that shows the hidden icons; where the app's icon is
-# among them.
+# among them: an element of the hidden icons' window named as the tray icon
+# is, and found there again by its place.
 function Open-HiddenIcons($rec) {
     $bar = Get-UiaTopLevel "Shell_TrayWnd"
     $chevron = @(Find-UiaNamed $bar '(?i)chevron|hidden icons') | Select-Object -First 1
     if (-not $chevron) { throw "found no button for the hidden icons on the taskbar" }
     $at = [PanelRig.Mouse]::Click($chevron.X, $chevron.Y, 1)
-    $rec.Note("clicked '$($chevron.Name)' ($($chevron.Rect)) at $at")
-    Say "Clicked '$($chevron.Name)' ($($chevron.Rect)) at $at"
+    $rec.Note("clicked $($chevron.What) at $at")
+    Say "Clicked $($chevron.What) at $at"
     $deadline = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 300
         foreach ($class in "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland") {
-            $hit = @(Find-UiaNamed (Get-UiaTopLevel $class) $TooltipPattern) | Select-Object -First 1
-            if ($hit) {
-                Say "Among the hidden icons ($class): '$($hit.Name)' $($hit.Rect)"
-                return $hit
+            foreach ($hit in @(Find-UiaNamed (Get-UiaTopLevel $class) $TrayPattern)) {
+                $icon = Get-TrayIconAt $hit.X $hit.Y
+                if ($icon) {
+                    return [pscustomobject]@{ Where = "hidden"; X = $icon.X; Y = $icon.Y; What = "the hidden icons' button $($icon.What) in $class" }
+                }
             }
         }
     }
     $rec.Shot("hidden-icons-without-the-app")
-    throw "the hidden icons opened without the app's icon among them"
+    throw "the hidden icons opened without the app's icon among them ('$TrayTip...')"
 }
 
 # ---------------------------------------------------------------------------
@@ -424,7 +479,7 @@ try {
         $n = Set-Promoted $(if ($Icon -eq "taskbar") { 1 } else { 0 })
         Stop-App $prime
         Save-AppLog "first-start"
-        if ($n -eq 0) { Say "WARNING: Explorer made no setting for the icon; it stays where Windows puts new icons" }
+        if ($n -eq 0) { Warn "Explorer made no setting for the icon; it stays where Windows puts new icons" }
         Remove-Item -LiteralPath $LogDir -Recurse -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
     }
@@ -446,7 +501,7 @@ try {
     Start-Sleep -Seconds 2
     $place = Get-IconPlace $app.Id
     Say "The icon is $(if ($place.Where -eq 'taskbar') { 'on the taskbar' } else { 'among the hidden icons' }) (wanted: $Icon)"
-    if ($place.Where -ne $Icon) { Say "WARNING: the icon isn't where this run wanted it; clicking it where it is" }
+    if ($place.Where -ne $Icon) { Warn "the icon is $(if ($place.Where -eq 'taskbar') { 'on the taskbar' } else { 'among the hidden icons' }), not where this case wanted it; clicked where it is" }
     $rec.Shot("before-the-click")
 
     # The click.
@@ -457,8 +512,9 @@ try {
     }
     $times = if ($Click -eq "double") { 2 } else { 1 }
     $at = [PanelRig.Mouse]::Click($target.X, $target.Y, $times)
-    $rec.Note("clicked the icon $times time(s) at $at")
-    Say "Clicked the icon $times time(s) at $at"
+    $script:Clicked = "$($target.What), $times time(s), with the pointer at $at"
+    $rec.Note("clicked $script:Clicked")
+    Say "Clicked $script:Clicked"
     $rec.Burst("after-the-click", 21, 100)
     $rec.Save($PictureDir)
 
@@ -503,6 +559,10 @@ try {
             "### Panel click: $Click click, icon $Icon, $Panel, start $Start, network $Network$(if ($FirstRun) { ', first run' })"
             ""
             "$($os.Caption) (build $build). Pictures with the panel's window on screen: $($rec.ShownCount) of $($rec.PictureCount). Commands the app's windows got: $commands."
+            ""
+            "Clicked: $script:Clicked."
+            ""
+        ) + @($script:Warnings | ForEach-Object { "- Not as the case asked: $_" }) + @(
             ""
             "The shell's lines in the app's log:"
             ""
