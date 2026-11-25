@@ -14,16 +14,18 @@
     (uninstall leaves user data in place).
 
     Hosted runners run Windows Server without test signing, so the driver
-    never starts here. What is required is that Setup says so: its exit
-    code (20 when the sound device isn't working) and the
-    "driver-step-result:" line in its log must agree with the device
-    Windows has afterwards. Behaviour that needs the driver to run (the
+    never starts here, and every current-build run passes /ALLOWSERVER and
+    /ALLOWTESTBUILD (Setup refuses both otherwise, which phases
+    refuse-server and refuse-test-build check). What is required is that
+    Setup says what happened: its exit code (20 when it couldn't finish
+    setting up the sound driver) and the "driver-step-result:" line in its
+    log must agree with the device Windows has afterwards. Behaviour that needs the driver to run (the
     sound output, its name, the restart after a driver change) can't be
     seen here; the scripts' own tests (phase units) cover the decisions.
 
     Each current-build setup run must add one Install-Driver.ps1 run to
-    <install dir>\logs\install.log, change nothing in
-    %LOCALAPPDATA%\StreamToSpeaker (where earlier releases keep that log),
+    <install dir>\logs\install.log, leave install.log in
+    %LOCALAPPDATA%\StreamToSpeaker (where earlier releases kept it) alone,
     and compile its Windows helpers in Windows' temp folder, not in the
     temp folder setup inherits from the user's profile.
 
@@ -34,20 +36,27 @@
     units           run the scripts' own tests in Windows PowerShell
     env             report the runner; create the sentinel
     refuse-server   run -Installer without /ALLOWSERVER: it must refuse
+    refuse-test-build  run -Installer (test build) without /ALLOWTESTBUILD:
+                    it must refuse
+    refuse-dir      run -Installer with /DIR=-InstallDir: it must refuse
     install         run -Installer on a clean machine
     repair          delete two installed files, re-run -Installer
     running-app     re-run -Installer while the app runs in this account
     other-account   re-run -Installer while the app runs in another account
     tasks           start-at-sign-in through /TASKS (install, then two re-runs)
     uninstall       run the registered uninstaller
-    previous        run -Installer (an older release) with lighter checks
-    upgrade         run -Installer over the previous install
+    previous        run -Installer (an older release, into -InstallDir when
+                    given) with lighter checks
+    plant           put a file of the person's and a fake uninstaller (it
+                    writes a marker when run) in the earlier install folder
+    upgrade         run -Installer over the previous install; with
+                    -EarlierDir, check what Setup did with that folder
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("units", "env", "refuse-server", "install", "repair", "running-app", "other-account",
-                 "tasks", "uninstall", "previous", "upgrade")]
+    [ValidateSet("units", "env", "refuse-server", "refuse-test-build", "refuse-dir", "install", "repair",
+                 "running-app", "other-account", "tasks", "uninstall", "previous", "plant", "upgrade")]
     [string]$Phase,
     # Installer to run.
     [string]$Installer = "",
@@ -57,8 +66,11 @@ param(
     [string]$ExpectVersion = "",
     # The service exe the installer should have put in place (hash compare).
     [string]$ExpectExe = "",
-    # Install folder (/DIR=); the default folder when empty.
+    # Install folder (/DIR=) for an earlier release, or the folder refuse-dir
+    # asks for; the default folder when empty.
     [string]$InstallDir = "",
+    # upgrade: the folder an earlier install was in, which Setup moves from.
+    [string]$EarlierDir = "",
     # uninstall: delete the installed test certificate file first, as an
     # interrupted earlier update could have.
     [switch]$DeleteCertificateFile,
@@ -94,9 +106,15 @@ $ProfileLogDir = Join-Path $env:LOCALAPPDATA "StreamToSpeaker"
 $WindowsTemp = Join-Path ([Environment]::GetFolderPath("Windows")) "Temp"
 $ProfileTemp = [IO.Path]::GetTempPath()
 $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-# Setup's exit code when the app is installed but its sound device isn't
-# working (installer\StreamToSpeaker.iss).
+# Setup's exit codes (installer\StreamToSpeaker.iss): installed, but the
+# sound driver isn't set up; a silent install that needs a restart; a /DIR
+# that isn't Program Files (Inno's "failed to initialize").
 $NotWorkingExitCode = 20
+$RestartExitCode = 3010
+$DirRefusedExitCode = 1
+$AppUserModelID = "StreamToSpeaker.App"
+# The marker the fake uninstaller of phase plant writes when it is run.
+$FakeUninstallerMarker = Join-Path $WorkDir "fake-uninstaller-ran.txt"
 
 New-Item -ItemType Directory -Force -Path $WorkDir, $LogDir | Out-Null
 
@@ -192,12 +210,15 @@ function Stop-ProcessTree([int]$ProcessId) {
 # Runs an installer silently; returns its exit code ($null when it didn't
 # finish in time, after ending it).
 function Invoke-Setup {
-    param([string]$exe, [string]$label, [string[]]$Extra = @(), [int]$TimeoutMinutes = 15, [switch]$NoAllowServer)
+    param([string]$exe, [string]$label, [string[]]$Extra = @(), [int]$TimeoutMinutes = 15, [string[]]$Omit = @())
     if (-not (Test-Path -LiteralPath $exe)) { throw "installer not found: $exe" }
     $log = Join-Path $LogDir "$label-setup.log"
     $setupArgs = @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/LOG=`"$log`"")
-    # The runner is Windows Server, which Setup refuses unless told this is a test.
-    if (-not $NoAllowServer) { $setupArgs += "/ALLOWSERVER" }
+    # The runner is Windows Server without test signing: Setup refuses both
+    # unless told this is a test.
+    foreach ($switch in "ALLOWSERVER", "ALLOWTESTBUILD") {
+        if ($Omit -notcontains $switch) { $setupArgs += "/$switch" }
+    }
     if ($InstallDir) { $setupArgs += "/DIR=`"$InstallDir`"" }
     $setupArgs += $Extra
     Write-Host "Running $(Split-Path $exe -Leaf) $($setupArgs -join ' ')"
@@ -273,11 +294,14 @@ function Stop-CompileWatch($watch) {
     , @($seen | Where-Object { $_ -ne $watch.probe })
 }
 
+# install.log in the per-user folder, where earlier releases kept it. Only
+# that file: the app writes its own log and startup.txt in the same folder
+# whenever it starts, also when Setup starts it again.
 function Get-ProfileLogSnapshot {
-    if (-not (Test-Path -LiteralPath $ProfileLogDir)) { return "(absent)" }
-    @(Get-ChildItem -LiteralPath $ProfileLogDir -Recurse -Force |
-        ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" } |
-        Sort-Object) -join "`n"
+    $file = Join-Path $ProfileLogDir "install.log"
+    if (-not (Test-Path -LiteralPath $file)) { return "(absent)" }
+    $item = Get-Item -LiteralPath $file -Force
+    "$($item.Length)|$($item.LastWriteTimeUtc.Ticks)"
 }
 
 function Save-InstallLog([string]$label) {
@@ -293,11 +317,11 @@ function Save-InstallLog([string]$label) {
 }
 
 # Setup's exit code and the result line in its log must agree with the
-# device Windows has afterwards: 0 and "ok" only for one device that works,
-# 20 and the reason otherwise (a restart that is due counts as working).
+# device Windows has afterwards: "ok" only for one device that works (exit
+# code 0, or 3010 when a restart is due), 20 and the reason otherwise.
 function Assert-SetupOutcome($code, [string]$label) {
     $log = Read-Text (Join-Path $LogDir "$label-setup.log")
-    $m = [regex]::Match($log, 'driver-step-result: (\S+) restart=(\d) new-output=(\d) problem=(\d+)')
+    $m = [regex]::Match($log, 'driver-step-result: (\S+) restart=(\d) .*?problem=(\d+)')
     $devs = @(Get-OurDevices)
     $working = $devs.Count -eq 1 -and [int]$devs[0].ConfigManagerErrorCode -eq 0
     $state = if (-not $devs.Count) { "no device" } else { ($devs | ForEach-Object { "$($_.PNPDeviceID) problem $($_.ConfigManagerErrorCode)" }) -join "; " }
@@ -307,15 +331,15 @@ function Assert-SetupOutcome($code, [string]$label) {
     }
     $result = $m.Groups[1].Value
     $restart = $m.Groups[2].Value -eq "1"
-    Write-Host "  driver step: $result, restart $restart, problem $($m.Groups[4].Value); Windows has: $state"
-    Check (($result -eq "ok") -eq $working -or $restart) "Setup's result '$result' agrees with the device ($state)"
-    $want = if ($result -eq "ok" -or $restart) { 0 } else { $NotWorkingExitCode }
-    Check ($code -eq $want) "setup exit code $code (expected $want for '$result')"
+    Write-Host "  driver step: $result, restart $restart, problem $($m.Groups[3].Value); Windows has: $state"
+    Check (($result -eq "ok") -eq $working -or ($restart -and $result -eq "ok")) "Setup's result '$result' agrees with the device ($state)"
+    $want = if ($result -ne "ok") { $NotWorkingExitCode } elseif ($restart) { $RestartExitCode } else { 0 }
+    Check ($code -eq $want) "setup exit code $code (expected $want for '$result'$(if ($restart) { ', restart due' }))"
     $loaded = Get-CimInstance Win32_SystemDriver -Filter "Name='StreamToSpeaker'" -ErrorAction SilentlyContinue
-    if (-not ($loaded -and $loaded.State -eq "Running")) {
-        Check (-not $restart) "no restart asked while the driver isn't loaded"
+    if (-not ($loaded -and $loaded.State -eq "Running") -and -not $log.Contains("Windows asked for a restart")) {
+        Check (-not $restart) "no restart asked while the driver isn't loaded and Windows asked for none"
     }
-    @{ result = $result; restart = $restart }
+    @{ result = $result; restart = $restart; log = $log }
 }
 
 # Runs this build's installer with the checks every such run gets.
@@ -334,7 +358,7 @@ function Invoke-CurrentSetup([string]$label, [string[]]$Extra = @(), [int]$Timeo
     if ($null -eq $code) { return $null }
     $after = Get-TranscriptStarts
     Check ($after -eq $before + 1) "Install-Driver.ps1 logged to $(Get-InstallLog) (runs recorded: $before before setup, $after after)"
-    Check ((Get-ProfileLogSnapshot) -eq $profileBefore) "setup wrote nothing to $ProfileLogDir"
+    Check ((Get-ProfileLogSnapshot) -eq $profileBefore) "setup left $ProfileLogDir\install.log alone"
     $compile = Get-WrapperCompile
     Check ($compile.folder.TrimEnd("\") -eq $WindowsTemp) "Install-Driver.ps1 compiled its Windows helpers in $WindowsTemp, outside the user's profile (logged: '$($compile.folder)')"
     Check $compile.loaded "Install-Driver.ps1 loaded the helpers it compiled"
@@ -383,16 +407,23 @@ function Assert-DiagnoseReport([string]$label) {
         $text = Read-Text $out
         Check ($p.ExitCode -eq 0) "Diagnose.ps1 $where ran under Windows PowerShell (exit code $($p.ExitCode))"
         Check ($text.Contains("==== Install-Driver finished at ")) "Diagnose.ps1 $where printed the tail of $(Get-InstallLog)"
+        Check ($text.Contains("Read the report through before you post it")) "Diagnose.ps1 $where asks for the report to be read before it is posted"
         if ($imageFile) {
             Check ($text.Contains($imageFile)) "Diagnose.ps1 $where names the driver file the service loads ($imageFile)"
         }
         foreach ($d in @(Get-OurDevices)) {
             Check ($text.Contains($d.PNPDeviceID)) "Diagnose.ps1 $where names the device $($d.PNPDeviceID)"
         }
-        foreach ($private in @($env:USERNAME, $env:COMPUTERNAME) + $addresses) {
+        # A name counts wherever it stands, also joined to others by a dash
+        # or an underscore; an address wherever it isn't part of a longer one.
+        foreach ($private in @($env:USERNAME, $env:COMPUTERNAME)) {
             if (-not $private) { continue }
-            $found = [regex]::IsMatch($text, '(?<![\w-])' + [regex]::Escape($private) + '(?![\w-])', 'IgnoreCase')
+            $found = [regex]::IsMatch($text, '(?<![\p{L}\p{N}])' + [regex]::Escape($private) + '(?![\p{L}\p{N}])', 'IgnoreCase')
             Check (-not $found) "Diagnose.ps1 $where leaves out '$private'"
+        }
+        foreach ($private in $addresses) {
+            $found = [regex]::IsMatch($text, '(?<![\w.:])' + [regex]::Escape($private) + '(?![\w:]|\.\d)', 'IgnoreCase')
+            Check (-not $found) "Diagnose.ps1 $where leaves out the address '$private'"
         }
     }
     Remove-Item -LiteralPath $copyDir -Recurse -Force
@@ -444,28 +475,32 @@ function Assert-FirewallRule([string]$app) {
     Check ($profiles -match "Private" -and $profiles -match "Domain" -and $profiles -notmatch "Public|Any") "firewall rule covers private and work networks only ($profiles)"
 }
 
-# Rights that let someone change, replace or add files in the folder.
-$WriteRights = [System.Security.AccessControl.FileSystemRights]"WriteData, AppendData, WriteExtendedAttributes, WriteAttributes, DeleteSubdirectoriesAndFiles, Delete, ChangePermissions, TakeOwnership"
-$Unprivileged = @{ "S-1-5-32-545" = "Users"; "S-1-5-11" = "Authenticated Users"; "S-1-1-0" = "Everyone"; "S-1-5-4" = "INTERACTIVE" }
-$TrustedOwners = @("S-1-5-32-544", "S-1-5-18", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
+# What releases put in their install folder, by name (as
+# scripts\InstallerFunctions.ps1 lists them for moving an earlier install).
+$ReleaseFileNames = @(
+    "stream-to-speaker.exe", "README.md", "LICENSE", "LICENSE-BINARIES.md", "LICENSE-INSTALLER.txt",
+    "unins000.exe", "unins000.dat", "unins000.msg",
+    "driver\StreamToSpeaker.sys", "driver\StreamToSpeaker.inf", "driver\StreamToSpeaker.cat",
+    "driver\StreamToSpeaker.cer", "driver\devcon.exe",
+    "scripts\Pre-Install.ps1", "scripts\Rename-Endpoint.ps1", "scripts\Reset-Install.ps1", "scripts\Diagnose.ps1",
+    "scripts\Uninstall-Driver.ps1", "scripts\Remove-TestCertificate.ps1", "logs\install.log")
 
-# Nobody but administrators and SYSTEM may change the install folder or
-# anything in it: the uninstaller runs files from it as administrator.
-function Assert-FolderRights([string]$app) {
-    $bad = @()
-    foreach ($item in @(Get-Item -LiteralPath $app -Force) + @(Get-ChildItem -LiteralPath $app -Recurse -Force)) {
-        $acl = Get-Acl -LiteralPath $item.FullName
-        $owner = try {
-            (New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-        } catch { "$($acl.Owner)" }
-        if ($TrustedOwners -notcontains $owner) { $bad += "$($item.FullName): owned by $($acl.Owner)" }
-        foreach ($ace in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
-            $sid = $ace.IdentityReference.Value
-            if ($ace.AccessControlType -ne "Allow" -or -not $Unprivileged.ContainsKey($sid)) { continue }
-            if (($ace.FileSystemRights -band $WriteRights) -ne 0) { $bad += "$($item.FullName): $($Unprivileged[$sid]) may $($ace.FileSystemRights)" }
-        }
-    }
-    Check ($bad.Count -eq 0) "only administrators and SYSTEM can change $app or its files$(if ($bad.Count) { ': ' + (($bad | Select-Object -First 8) -join '; ') })"
+# Whether a shortcut carries this AppUserModelID: the .lnk file keeps it in
+# its property store, as UTF-16 text.
+function Test-ShortcutAppId([string]$link, [string]$id) {
+    if (-not (Test-Path -LiteralPath $link)) { return $false }
+    [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($link)).Contains($id) -or
+        [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($link), 1, (Get-Item -LiteralPath $link).Length - 1).Contains($id)
+}
+
+# The thumbprints Setup recorded for the uninstaller.
+function Get-RecordedCertificates {
+    @((Get-ItemProperty -Path "$InstallerKey\Installer" -Name TestCertificates -ErrorAction SilentlyContinue).TestCertificates |
+        Where-Object { $_ } | ForEach-Object { $_.ToUpperInvariant() })
+}
+
+function Get-ShortcutTarget([string]$link) {
+    try { (New-Object -ComObject WScript.Shell).CreateShortcut($link).TargetPath } catch { "" }
 }
 
 # Everything an install must leave behind. -Full adds the current build's
@@ -492,6 +527,7 @@ function Assert-Installed {
             "scripts\InstallerFunctions.ps1", "scripts\Install-Driver.ps1", "scripts\Rename-Endpoint.ps1",
             "scripts\Reset-Install.ps1", "scripts\Diagnose.ps1", "scripts\Uninstall-Driver.ps1",
             "scripts\Remove-TestCertificate.ps1", "scripts\Set-FirewallRule.ps1", "scripts\Remove-SignInEntries.ps1",
+            "scripts\Find-RunningCopies.ps1", "scripts\Remove-EarlierInstall.ps1",
             "README.md", "LICENSE", "LICENSE-BINARIES.md", "LICENSE-INSTALLER.txt")
         Check (-not (Test-Path -LiteralPath (Join-Path $app "scripts\Pre-Install.ps1"))) "no Pre-Install.ps1 left from an earlier version"
     }
@@ -524,23 +560,26 @@ function Assert-Installed {
             }
         } else {
             Check (-not (Test-Path -LiteralPath $cer)) "no test certificate file after a Microsoft-signed install"
-            if ($s.ContainsKey("cert") -and $s.cert) {
-                $kept = Test-Path "Cert:\LocalMachine\Root\$($s.cert)"
-                if ($Outcome -and $Outcome.result -eq "stage-failed") {
-                    # The new package wasn't accepted, so the test-signed
-                    # driver stays, and with it the certificate it needs.
-                    Check $kept "the earlier test certificate stays while its driver does (the new driver wasn't accepted)"
-                } else {
-                    foreach ($store in "Root", "TrustedPublisher") {
-                        Check (-not (Test-Path "Cert:\LocalMachine\$store\$($s.cert)")) "the earlier test certificate is gone from LocalMachine\$store"
-                    }
-                }
-            }
+            # The earlier test build's certificate may stay while its driver
+            # package does (Setup keeps that until the new driver runs, which
+            # it never does on this runner); the check below makes sure the
+            # uninstaller can still find it.
         }
+        # Every Stream To Speaker test certificate Windows trusts is recorded
+        # for the uninstaller.
+        $recorded = @(Get-RecordedCertificates)
+        $unrecorded = @(Get-TrustedTestCertificates | ForEach-Object { ($_ -split '\\')[-1].ToUpperInvariant() } |
+            Where-Object { $recorded -notcontains $_ } | Select-Object -Unique)
+        Check ($unrecorded.Count -eq 0) "every trusted test certificate is recorded for the uninstaller (not recorded: $($unrecorded -join ', '))"
         Assert-FirewallRule $app
     }
 
-    Check (Test-Path -LiteralPath $StartMenuLink) "Start menu shortcut (default task)"
+    Check (Test-Path -LiteralPath $StartMenuLink) "Start menu shortcut"
+    if ($Full) {
+        Check (Test-ShortcutAppId $StartMenuLink $AppUserModelID) "the Start-menu shortcut carries the AppUserModelID $AppUserModelID"
+        $target = Get-ShortcutTarget $StartMenuLink
+        Check ($target -ieq (Join-Path $app $ExeName)) "the Start-menu shortcut starts $app\$ExeName (starts: '$target')"
+    }
     Check (-not (Test-Path -LiteralPath $DesktopLink)) "no desktop shortcut (task off by default)"
     $run = (Get-ItemProperty -Path $RunKey -Name $AppName -ErrorAction SilentlyContinue).$AppName
     if ($SignInOn) {
@@ -556,19 +595,20 @@ function Assert-Installed {
     # (Assert-SetupOutcome).
     $pkgs = @(Get-DriverPackages)
     Write-Host "  driver store: $(@($pkgs | ForEach-Object Name) -join ', ')"
-    if ($Full -and $rec -and $rec.driver.kind -eq "test-signed") {
-        Check ($pkgs.Count -eq 1) "exactly one driver package staged (found $($pkgs.Count))"
-        if ($pkgs.Count -ge 1) {
-            $want = Get-DriverVer (Join-Path $app "driver\StreamToSpeaker.inf")
-            $have = @($pkgs | ForEach-Object { Get-DriverVer $_.FullName })
-            Check ($have -contains $want) "staged package is this build's driver (DriverVer $want; store: $($have -join ', '))"
+    if ($Full -and $rec) {
+        $want = Get-DriverVer (Join-Path $app "driver\StreamToSpeaker.inf")
+        $have = @($pkgs | ForEach-Object { Get-DriverVer $_.FullName })
+        if ($rec.driver.kind -eq "test-signed") {
+            Check ($have -contains $want) "this build's driver package is in the store (DriverVer $want; store: $($have -join ', '))"
+        } elseif (-not $pkgs.Count) {
+            Check ($Outcome -and $Outcome.result -ne "ok") "Setup reports a problem when no driver package is in the store"
+        }
+        if ($pkgs.Count -gt 1) {
+            # Earlier packages stay only until the new driver runs, and Setup says so.
+            Check ($Outcome -and "$($Outcome.log)".Contains("Keeping the earlier driver package")) "$($pkgs.Count) driver packages in the store, and Setup says it keeps the earlier one until the new driver runs"
         }
     } elseif ($pkgs.Count -eq 0) {
-        if ($Outcome) {
-            Check ($Outcome.result -ne "ok") "Setup reports a problem when no driver package is in the store"
-        } else {
-            Warn "no driver package staged by this installer on this runner"
-        }
+        Warn "no driver package staged by this installer on this runner"
     } elseif ($pkgs.Count -gt 1) {
         Fail "$($pkgs.Count) driver packages staged; the install should replace, not add"
     }
@@ -638,8 +678,10 @@ function Get-AppStartedSince([string]$app, [datetime]$since) {
 }
 
 # Re-runs this build's installer while a copy of the app runs: Setup must
-# close it without asking (silent), finish, and start it again for the
-# account that ran Setup.
+# close it without asking (silent) and finish. It starts the app again only
+# for the account whose copy it closed: this one's, or none when the copy
+# was another account's. Nothing here depends on what the app writes when it
+# starts.
 function Invoke-SetupOverRunningApp([string]$label, [pscredential]$Credential = $null) {
     $app = Get-AppDir
     $port = if ($Credential) { 59012 } else { 59011 }
@@ -649,11 +691,16 @@ function Invoke-SetupOverRunningApp([string]$label, [pscredential]$Credential = 
         $outcome = Invoke-CurrentSetup $label -TimeoutMinutes 5
         if ($null -eq $outcome) { return }
         Check $p.HasExited "Setup closed the running app (process $($p.Id))"
-        $log = Read-Text (Join-Path $LogDir "$label-setup.log")
+        $log = "$($outcome.log)"
+        $started = @(Get-AppStartedSince $app $since)
         if ($Credential) {
-            Check ($log.Contains("Closing the running Stream To Speaker (in another account: 1)")) "Setup saw the copy running in another account"
+            Check ($log -match 'running-copies: mine=0 other=1') "Setup saw the copy as another account's"
+            Check (-not $log.Contains("Started Stream To Speaker again.") -and -not $started.Count) "Setup started no copy in this account, where none ran (started: $($started -join ', '))"
+            Check ($log.Contains("the copy Setup closed ran in another account")) "Setup's log says why it started none"
+        } else {
+            Check ($log -match 'running-copies: mine=1 other=0') "Setup saw the copy as this account's"
+            Check ($log.Contains("Started Stream To Speaker again.")) "Setup started the app again after the silent update"
         }
-        Check ($log.Contains("Started Stream To Speaker again.")) "Setup started the app again after the silent update"
         Assert-Installed -Full -Outcome $outcome
     } finally {
         if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
@@ -662,6 +709,19 @@ function Invoke-SetupOverRunningApp([string]$label, [pscredential]$Credential = 
             Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+# After an update moved an earlier install out of -EarlierDir: nothing in
+# that folder was run, nothing a release put there is left, and the file the
+# person keeps there is untouched.
+function Assert-EarlierFolder([string]$dir, $outcome) {
+    $s = Read-State
+    Check (-not (Test-Path -LiteralPath $FakeUninstallerMarker)) "nothing in the earlier folder was run (the uninstaller planted there didn't run)"
+    $left = @($ReleaseFileNames | Where-Object { Test-Path -LiteralPath (Join-Path $dir $_) })
+    Check ($left.Count -eq 0) "the earlier folder holds nothing a release put there (left: $($left -join ', '))"
+    $notes = Join-Path $dir "notes.txt"
+    Check ((Test-Path -LiteralPath $notes) -and (Get-Sha256 $notes) -eq $s.planted) "the person's own file in the earlier folder is untouched"
+    Check ("$($outcome.log)" -match 'earlier-install-result: not-empty') "Setup says the earlier folder stays because it holds other files"
 }
 
 function Write-PhaseResult {
@@ -701,7 +761,7 @@ switch ($Phase) {
     }
     "refuse-server" {
         $certsBefore = @(Get-TrustedTestCertificates)
-        $code = Invoke-Setup $Installer "refuse-server" -NoAllowServer -TimeoutMinutes 5
+        $code = Invoke-Setup $Installer "refuse-server" -Omit "ALLOWSERVER" -TimeoutMinutes 5
         Check ($code -eq 7) "Setup refused Windows Server before changing anything (exit code $code, expected 7)"
         Check (-not (Test-Path $UninstallKey)) "nothing installed"
         Check (-not (Test-Path -LiteralPath $DefaultAppDir)) "no install folder"
@@ -713,13 +773,42 @@ switch ($Phase) {
             $null = Invoke-Uninstall "refuse-server-cleanup"
         }
     }
+    "refuse-test-build" {
+        $certsBefore = @(Get-TrustedTestCertificates)
+        $code = Invoke-Setup $Installer "refuse-test-build" -Omit "ALLOWTESTBUILD" -TimeoutMinutes 5
+        Check ($code -eq 7) "Setup refused a test build on a PC without test signing before changing anything (exit code $code, expected 7)"
+        Check ("$(Read-Text (Join-Path $LogDir 'refuse-test-build-setup.log'))".Contains("This is a test build")) "Setup's log says why"
+        Check (-not (Test-Path $UninstallKey)) "nothing installed"
+        Check (-not (Test-Path -LiteralPath $DefaultAppDir)) "no install folder"
+        Check (@(Get-DriverPackages).Count -eq 0) "no driver package"
+        Check (@(Get-OurDevices).Count -eq 0) "no device"
+        Check ((($certsBefore | Sort-Object) -join ',') -eq ((@(Get-TrustedTestCertificates) | Sort-Object) -join ',')) "no certificate trusted"
+        if (Test-Path $UninstallKey) {
+            Write-Host "Setup installed anyway; uninstalling so that the next phases start clean."
+            $null = Invoke-Uninstall "refuse-test-build-cleanup"
+        }
+    }
+    "refuse-dir" {
+        $certsBefore = @(Get-TrustedTestCertificates)
+        $code = Invoke-Setup $Installer "refuse-dir" -TimeoutMinutes 5
+        Check ($code -eq $DirRefusedExitCode) "Setup refused /DIR=$InstallDir before changing anything (exit code $code, expected $DirRefusedExitCode)"
+        Check (-not (Test-Path $UninstallKey)) "nothing installed"
+        Check (-not (Test-Path -LiteralPath $InstallDir)) "no folder $InstallDir"
+        Check (-not (Test-Path -LiteralPath $DefaultAppDir)) "no install folder in Program Files"
+        Check (@(Get-DriverPackages).Count -eq 0) "no driver package"
+        Check (@(Get-OurDevices).Count -eq 0) "no device"
+        Check ((($certsBefore | Sort-Object) -join ',') -eq ((@(Get-TrustedTestCertificates) | Sort-Object) -join ',')) "no certificate trusted"
+        if (Test-Path $UninstallKey) {
+            Write-Host "Setup installed anyway; uninstalling so that the next phases start clean."
+            $null = Invoke-Uninstall "refuse-dir-cleanup"
+        }
+    }
     "install" {
         $audio = Get-AudioServices
         $outcome = Invoke-CurrentSetup "install"
         Assert-Installed -Full -Outcome $outcome
-        if ($InstallDir) { Assert-FolderRights (Get-AppDir) }
         Check ((Get-AudioServices) -eq $audio) "Windows' audio services left alone on a first install ($audio)"
-        if (-not $InstallDir) { Assert-DiagnoseReport "install" }
+        Assert-DiagnoseReport "install"
         Assert-Sentinel
     }
     "repair" {
@@ -734,7 +823,6 @@ switch ($Phase) {
         Check (($before -join ';') -eq ($after -join ';')) "the device was kept, not recreated (before: $($before -join '; '); after: $($after -join '; '))"
         Check ((Get-AudioServices) -eq $audio) "Windows' audio services left alone ($audio)"
         Assert-Installed -Full -Outcome $outcome
-        if ($InstallDir) { Assert-FolderRights $app }
         Assert-Sentinel
     }
     "running-app" {
@@ -759,7 +847,7 @@ switch ($Phase) {
         Assert-Sentinel
     }
     "tasks" {
-        $tasks = "/TASKS=startmenuicon,autostart"
+        $tasks = "/TASKS=autostart"
         $outcome = Invoke-CurrentSetup "tasks-install" -Extra @($tasks)
         Assert-Installed -Full -SignInOn -Outcome $outcome
         # Switched off in the app (or in Windows), then Setup run again with
@@ -789,15 +877,42 @@ switch ($Phase) {
         Assert-Removed $app $log
     }
     "previous" {
-        $code = Invoke-Setup $Installer "previous"
-        Write-Host "  previous release's setup exit code $code"
+        $code = Invoke-Setup $Installer "previous-$((Get-Date).ToString('HHmmss'))"
+        Write-Host "  earlier release's setup exit code $code"
         Save-InstallLog "previous"
         Assert-Installed
         Assert-Sentinel
     }
+    "plant" {
+        # What a person (or another program) left in the earlier install's
+        # folder: a file of their own, and an uninstaller that isn't the one
+        # the release installed; Setup must not run it.
+        $s = Read-State
+        $notes = Join-Path $InstallDir "notes.txt"
+        Set-Content -LiteralPath $notes -Value "A file of the person's, kept in the install folder." -Encoding ascii
+        $s.planted = Get-Sha256 $notes
+        Write-State $s
+        if (Test-Path -LiteralPath $FakeUninstallerMarker) { Remove-Item -LiteralPath $FakeUninstallerMarker -Force }
+        $fake = Join-Path $WorkDir "fake-unins000.exe"
+        $maker = Join-Path $WorkDir "make-fake-uninstaller.ps1"
+        $source = @(
+            'Add-Type -OutputType ConsoleApplication -OutputAssembly $args[0] -TypeDefinition @"',
+            'public static class FakeUninstaller {',
+            '    public static void Main() {',
+            '        System.IO.File.WriteAllText(@"$($args[1])", "The uninstaller planted in the earlier folder ran.");',
+            '    }',
+            '}',
+            '"@')
+        Set-Content -LiteralPath $maker -Value $source -Encoding ascii
+        & $WindowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $maker $fake $FakeUninstallerMarker
+        if (-not (Test-Path -LiteralPath $fake)) { throw "could not build the fake uninstaller" }
+        Copy-Item -LiteralPath $fake -Destination (Join-Path $InstallDir "unins000.exe") -Force
+        Ok "planted $notes and a fake unins000.exe in $InstallDir"
+    }
     "upgrade" {
         $outcome = Invoke-CurrentSetup "upgrade-$((Get-Date).ToString('HHmmss'))"
         Assert-Installed -Full -Outcome $outcome
+        if ($EarlierDir) { Assert-EarlierFolder $EarlierDir $outcome }
         Assert-Sentinel
     }
 }
