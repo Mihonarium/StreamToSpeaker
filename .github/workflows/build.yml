@@ -1333,8 +1333,9 @@ jobs:
   # that change what the installer is made of or runs: install / repair /
   # uninstall / upgrade from the previous release, run against the
   # installer this run just built. Counted: all of installer/ and scripts/
-  # (new scripts too), the driver's INF, service/src/autostart.rs (the
-  # --startup value the installer writes and the app keeps), the files the
+  # (new scripts too), driver/ and include/ (a change rebuilds the driver,
+  # whose version and upgrade the test checks), service/src/autostart.rs
+  # (the --startup value the installer writes and the app keeps), the files the
   # installer copies (README.md, LICENSE, LICENSE-BINARIES.md), and the
   # workflow and scripts that build, stage, check and test it. Other PRs
   # skip it; it can also be dispatched on its own.
@@ -1356,7 +1357,7 @@ jobs:
         run: |
           files=$(git diff --name-only HEAD^1 HEAD)
           printf '%s\n' "$files"
-          if printf '%s\n' "$files" | grep -qE '^(installer/|scripts/|driver/StreamToSpeaker\.inf$|service/src/autostart\.rs$|(README\.md|LICENSE|LICENSE-BINARIES\.md)$|\.github/workflows/(build|installer-lifecycle)\.yml$|\.github/scripts/(Test-InstallerLifecycle|Write-DriverRecord|Get-AttestedDriver|Assert-MicrosoftSigned)\.ps1$)'; then
+          if printf '%s\n' "$files" | grep -qE '^(installer/|scripts/|driver/|include/|service/src/autostart\.rs$|(README\.md|LICENSE|LICENSE-BINARIES\.md)$|\.github/workflows/(build|installer-lifecycle)\.yml$|\.github/scripts/(Test-InstallerLifecycle|Write-DriverRecord|Get-AttestedDriver|Assert-MicrosoftSigned)\.ps1$)'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"

@@ -506,13 +506,17 @@ class InstallerLifecycleFilter(unittest.TestCase):
         pattern = self.pattern()
         for path in ("installer/StreamToSpeaker.iss", "installer/Uninstall-Driver.ps1", "installer/build-installer.ps1",
                      "scripts/Pre-Install.ps1", "scripts/Install-Driver.ps1", "scripts/lib/Driver.psm1",
-                     "driver/StreamToSpeaker.inf", "service/src/autostart.rs",
+                     "driver/StreamToSpeaker.inf", "driver/adapter.cpp", "include/stream_to_speaker_ioctl.h",
+                     "service/src/autostart.rs",
                      "README.md", "LICENSE", "LICENSE-BINARIES.md",
                      ".github/workflows/build.yml", ".github/workflows/installer-lifecycle.yml",
                      ".github/scripts/Test-InstallerLifecycle.ps1", ".github/scripts/Write-DriverRecord.ps1",
                      ".github/scripts/Get-AttestedDriver.ps1", ".github/scripts/Assert-MicrosoftSigned.ps1"):
             self.assertTrue(pattern.search(path), path)
-        for path in ("service/src/gui.rs", "docs/driver-signing.md", "driver/adapter.cpp",
+        # A driver change rebuilds the driver, whose version and upgrade
+        # the test checks; the rest of service/ never runs in it (silent
+        # install, "Launch" is skipped).
+        for path in ("service/src/gui.rs", "docs/driver-signing.md",
                      ".github/workflows/driver-attest.yml", "TECHNICAL.md"):
             self.assertFalse(pattern.search(path), path)
 
