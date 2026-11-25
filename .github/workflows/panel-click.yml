@@ -155,6 +155,16 @@ jobs:
       # image's MSYS2 draws OpenGL in software; its opengl32.dll is the one
       # a program finds first when it sits in the program's own folder, so
       # the app runs from the folder Mesa's DLLs are in.
+      #
+      # Mesa is not pinned: `pacman -Sy` installs the mirrors' current Mesa
+      # and what it needs over the image's older MSYS2, which MSYS2 doesn't
+      # support (a partial upgrade), so two runs can draw with different
+      # Mesa versions, and some day this step can fail for reasons that
+      # have nothing to do with the app. When it fails here (a dependency
+      # or file conflict, a missing library when the app starts), update
+      # MSYS2 as a whole first (`pacman -Syu --noconfirm`, run twice: the
+      # first may update only pacman itself), or run again once the image
+      # has a newer MSYS2.
       - name: Put the app next to Mesa's OpenGL
         shell: pwsh
         run: |
