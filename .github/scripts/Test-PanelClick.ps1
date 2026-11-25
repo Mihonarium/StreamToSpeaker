@@ -231,7 +231,7 @@ function Get-TrayIconAt([int]$x, [int]$y) {
     if ($there -and ($there.Name -match $TrayPattern)) { return $there }
     $inner = @(Find-UiaNamed $e $TrayPattern | Where-Object { $_.Box.Contains($x, $y) }) | Select-Object -First 1
     if ($inner) { return $inner }
-    Say "At $x,$y: $(if ($there) { $there.What } else { 'an element with no place' }), not the app's tray icon"
+    Say "At ${x},${y}: $(if ($there) { $there.What } else { 'an element with no place' }), not the app's tray icon"
     $null
 }
 
@@ -279,7 +279,7 @@ function Start-AppByProgram([bool]$startup, [string]$label) {
 # shortcut isn't what is at its place, rather than click something else.
 function Start-AppByHand([string]$label) {
     $desktop = [Environment]::GetFolderPath("Desktop")
-    $lnkPath = Join-Path $desktop "$ShortcutName.lnk"
+    $lnkPath = Join-Path $desktop "${ShortcutName}.lnk"
     $argv = Get-AppArguments $false
     $shell = New-Object -ComObject WScript.Shell
     $lnk = $shell.CreateShortcut($lnkPath)
@@ -643,7 +643,7 @@ function Invoke-WithTray($app, $rec) {
 # shown. Each is a problem of the run.
 function Test-TaskbarButtons($rec, [string]$when) {
     if ($rec.TaskbarWindowShown()) {
-        Say "A window of the app that belongs on the taskbar (a dialog, a message box, the panel as an ordinary window) is shown $when: its taskbar buttons aren't checked now"
+        Say "A window of the app that belongs on the taskbar (a dialog, a message box, the panel as an ordinary window) is shown ${when}: its taskbar buttons aren't checked now"
         return
     }
     $bar = Get-UiaTopLevel "Shell_TrayWnd"
@@ -771,7 +771,7 @@ try {
     $rec.Lines | Set-Content -LiteralPath (Join-Path $Out "timeline.txt") -Encoding UTF8
     Save-AppLog "app"
     Set-AppEnvironment $false
-    Remove-Item -LiteralPath (Join-Path ([Environment]::GetFolderPath("Desktop")) "$ShortcutName.lnk") -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path ([Environment]::GetFolderPath("Desktop")) "${ShortcutName}.lnk") -ErrorAction SilentlyContinue
 
     # The step summary: the variation, the verdict, what the pictures show,
     # the commands the windows got, the shell's lines from the app's log.
