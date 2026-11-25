@@ -1406,7 +1406,8 @@ jobs:
         shell: pwsh
         run: |
           Import-Module Pester -MinimumVersion 5.0
-          Invoke-Pester -Path .github/scripts/ReleaseChain.Tests.ps1 -Output Detailed -CI
+          # Every *.Tests.ps1 under .github/scripts, new ones included.
+          Invoke-Pester -Path .github/scripts -Output Detailed -CI
 
   # Minimum-supported-Rust check. `rust-version` in service/Cargo.toml is
   # only a true statement while this job passes: it checks both targets on

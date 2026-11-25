@@ -367,8 +367,10 @@ class WhereTheseChecksRun(unittest.TestCase):
         self.assertRegex(on, r"(?m)^  push:")
         fields = job_fields("build.yml")
         jobs = jobs_steps("build.yml")
+        # Both find their test files themselves (test*.py, *.Tests.ps1), so
+        # a test file added there runs without an edit here.
         for job, command in (("chain-tests", "python3 -m unittest discover -b -v -s .github/scripts"),
-                             ("chain-tests-powershell", "Invoke-Pester")):
+                             ("chain-tests-powershell", "Invoke-Pester -Path .github/scripts -Output Detailed -CI")):
             self.assertFalse({"if", "needs", "environment"} & set(fields[job]), fields[job])
             steps = jobs[job]
             self.assertEqual(step_field(steps[0], "uses").split("@")[0], "actions/checkout")
