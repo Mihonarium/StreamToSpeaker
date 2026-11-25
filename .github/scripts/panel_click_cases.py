@@ -1,7 +1,7 @@
 """The cases the Panel click workflow (panel-click.yml) runs.
 
 On a push to a branch whose name starts with rig/: a fixed set, the
-default case and four that each change one thing in it. Started by hand:
+default case and five that each change one thing in it. Started by hand:
 the one case its inputs give, each input checked against its choices.
 
 Prints `cases=<json>` (a list of cases, each with a `name` that tells it
@@ -21,6 +21,7 @@ CHOICES = {
     "start": ("sign-in", "menu"),
     "network": ("quiet", "full"),
     "first_run": ("false", "true"),
+    "tray": ("on", "off"),
 }
 
 DEFAULT = {key: allowed[0] for key, allowed in CHOICES.items()}
@@ -32,16 +33,19 @@ PUSH_CHANGES = (
     {"icon": "hidden"},
     {"click": "double"},
     {"runner": "windows-2022"},
+    {"first_run": "true"},
 )
 
 WINDOWS = {"windows-2025": "win11", "windows-2022": "win10"}
 
 
 def name(case):
-    """`win11-single-taskbar-flyout-sign-in-quiet` (+ `-first-run`)."""
+    """`win11-single-taskbar-flyout-sign-in-quiet` (+ `-first-run`, + `-no-tray`)."""
     parts = [WINDOWS[case["runner"]], case["click"], case["icon"], case["panel"], case["start"], case["network"]]
     if case["first_run"] == "true":
         parts.append("first-run")
+    if case["tray"] == "off":
+        parts.append("no-tray")
     return "-".join(parts)
 
 

@@ -8,11 +8,12 @@ name: Panel click
 # cases in .github/scripts/panel_click_cases.py.
 #
 # It runs in two ways, and in no other:
-#   - started by hand (workflow_dispatch): the one case its inputs give;
-#   - on a push to a branch whose name starts with rig/: five cases, the
+#   - started by hand (workflow_dispatch): the one case its inputs give
+#     (only there: the app without its tray icon);
+#   - on a push to a branch whose name starts with rig/: six cases, the
 #     panel as a flyout in each: the defaults below; started by hand from a
 #     shortcut; the icon among the hidden icons; a double click; Windows
-#     10's taskbar (Server 2022).
+#     10's taskbar (Server 2022); a first run.
 # Either way the app is built once, from the commit the run is for. The
 # workflow uses no secrets, reads the repository only and changes nothing
 # outside the machines it runs on (the Rust cache is restored, never saved).
@@ -54,6 +55,11 @@ on:
         description: "First run (no settings: losing the focus doesn't close the panel until first run is finished)"
         type: boolean
         default: false
+      tray:
+        description: "on: the tray icon; off: started with --no-tray, the panel is then the app's ordinary window (the icon and click inputs don't apply)"
+        type: choice
+        options: [on, off]
+        default: on
   push:
     branches: ['rig/**']
 
@@ -86,6 +92,7 @@ jobs:
           CASE_START: ${{ inputs.start }}
           CASE_NETWORK: ${{ inputs.network }}
           CASE_FIRST_RUN: ${{ inputs.first_run }}
+          CASE_TRAY: ${{ inputs.tray }}
         run: python3 .github/scripts/panel_click_cases.py >> "$GITHUB_OUTPUT"
 
   build:
@@ -155,6 +162,16 @@ jobs:
       # image's MSYS2 draws OpenGL in software; its opengl32.dll is the one
       # a program finds first when it sits in the program's own folder, so
       # the app runs from the folder Mesa's DLLs are in.
+      #
+      # Mesa is not pinned: `pacman -Sy` installs the mirrors' current Mesa
+      # and what it needs over the image's older MSYS2, which MSYS2 doesn't
+      # support (a partial upgrade), so two runs can draw with different
+      # Mesa versions, and some day this step can fail for reasons that
+      # have nothing to do with the app. When it fails here (a dependency
+      # or file conflict, a missing library when the app starts), update
+      # MSYS2 as a whole first (`pacman -Syu --noconfirm`, run twice: the
+      # first may update only pacman itself), or run again once the image
+      # has a newer MSYS2.
       - name: Put the app next to Mesa's OpenGL
         shell: pwsh
         run: |
@@ -178,11 +195,12 @@ jobs:
           START: ${{ matrix.case.start }}
           NETWORK: ${{ matrix.case.network }}
           FIRST_RUN: ${{ matrix.case.first_run }}
+          TRAY: ${{ matrix.case.tray }}
         run: >
           .github/scripts/Test-PanelClick.ps1
           -Exe $env:APP_EXE
           -Click $env:CLICK -Icon $env:ICON -Panel $env:PANEL -Start $env:START -Network $env:NETWORK
-          -FirstRun:($env:FIRST_RUN -eq "true")
+          -FirstRun:($env:FIRST_RUN -eq "true") -Tray $env:TRAY
           -Out (Join-Path $env:RUNNER_TEMP "panel-click")
 
       - name: Keep the pictures and logs
