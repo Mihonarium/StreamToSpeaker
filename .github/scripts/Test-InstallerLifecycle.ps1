@@ -13,11 +13,14 @@
     sentinel in %APPDATA%\StreamToSpeaker, which no phase may touch
     (uninstall leaves user data in place).
 
-    Hosted runners run Windows Server, and every current-build run passes
-    /ALLOWSERVER and /ALLOWTESTBUILD (Setup refuses both otherwise, which
-    phases refuse-server and refuse-test-build check). They start Windows
-    with test signing on, so the test-signed driver loads and its device
-    works. They come with Windows' two sound services stopped, and while
+    Hosted runners run Windows Server, which Setup refuses unless it gets
+    /ALLOWSERVER: every run here passes that switch but the one of phase
+    refuse-server. They start Windows with test signing on, so the
+    test-signed driver loads, its device works, and Setup has no reason to
+    refuse a test build: phase refuse-test-build takes TESTSIGNING out of
+    Windows' record of its start options for the one run that must be
+    refused, and puts it back. No run passes /ALLOWTESTBUILD.
+    They come with Windows' two sound services stopped, and while
     those are stopped Windows makes no sound output for any device: phase
     start-audio starts them, as a PC has them, and phase no-audio stops
     them for the one case that is about them.
@@ -48,8 +51,8 @@
     units           run the scripts' own tests in Windows PowerShell
     env             report the runner; create the sentinel
     refuse-server   run -Installer without /ALLOWSERVER: it must refuse
-    refuse-test-build  run -Installer (test build) without /ALLOWTESTBUILD:
-                    it must refuse
+    refuse-test-build  run -Installer (test build) while Windows' record of
+                    its start options shows no test signing: it must refuse
     refuse-dir      run -Installer with /DIR=-InstallDir: it must refuse
     start-audio     start Windows' two sound services, as a PC has them
     install         run -Installer on a clean machine
@@ -397,11 +400,9 @@ function Invoke-Setup {
     if (-not (Test-Path -LiteralPath $exe)) { throw "installer not found: $exe" }
     $log = Join-Path $LogDir "$label-setup.log"
     $setupArgs = @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/LOG=`"$log`"")
-    # The runner is Windows Server without test signing: Setup refuses both
-    # unless told this is a test.
-    foreach ($switch in "ALLOWSERVER", "ALLOWTESTBUILD") {
-        if ($Omit -notcontains $switch) { $setupArgs += "/$switch" }
-    }
+    # The runner is Windows Server, which Setup refuses unless told that
+    # this is a test.
+    if ($Omit -notcontains "ALLOWSERVER") { $setupArgs += "/ALLOWSERVER" }
     if ($InstallDir) { $setupArgs += "/DIR=`"$InstallDir`"" }
     $setupArgs += $Extra
     Write-Host "Running $(Split-Path $exe -Leaf) $($setupArgs -join ' ')"
@@ -978,6 +979,7 @@ switch ($Phase) {
         Write-Host "OS: $($os.Caption) $($os.Version) (product type $($os.ProductType))"
         $opts = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name SystemStartOptions).SystemStartOptions
         Write-Host "Boot options: $opts"
+        Check (@("$opts" -split '\s+') -contains "TESTSIGNING") "the runner started Windows with test signing on, which this build's test-signed driver needs"
         $sb = try { if (Confirm-SecureBootUEFI) { "on" } else { "off" } } catch { "unsupported/unknown" }
         Write-Host "Secure Boot: $sb"
         Write-Host "Audio services: $(Get-AudioServices)"
@@ -995,6 +997,7 @@ switch ($Phase) {
         $certsBefore = @(Get-TrustedTestCertificates)
         $code = Invoke-Setup $Installer "refuse-server" -Omit "ALLOWSERVER" -TimeoutMinutes 5
         Check ($code -eq 7) "Setup refused Windows Server before changing anything (exit code $code, expected 7)"
+        Check ("$(Read-Text (Join-Path $LogDir 'refuse-server-setup.log'))".Contains("Setup stops before changing anything: Stream To Speaker can't be installed on Windows Server")) "Setup's log says that it stops, and why"
         Check (-not (Test-Path $UninstallKey)) "nothing installed"
         Check (-not (Test-Path -LiteralPath $DefaultAppDir)) "no install folder"
         Check (@(Get-DriverPackages).Count -eq 0) "no driver package"
@@ -1006,10 +1009,36 @@ switch ($Phase) {
         }
     }
     "refuse-test-build" {
+        Assert-CleanStart
+        # The runner started Windows with test signing on, so Setup has no
+        # reason to refuse a test build here. For this one run TESTSIGNING
+        # is taken out of Windows' record of its start options, which is
+        # what Setup reads, and put back afterwards: Setup must then stop
+        # before it changes anything. Windows itself still loads test-signed
+        # drivers all the while, so a Setup that went on would install a
+        # working driver, and the checks below would show it.
+        $control = "HKLM:\SYSTEM\CurrentControlSet\Control"
+        $options = "$((Get-ItemProperty -Path $control -Name SystemStartOptions).SystemStartOptions)"
+        $without = @($options -split '\s+' | Where-Object { $_ -and $_ -ine "TESTSIGNING" }) -join " "
         $certsBefore = @(Get-TrustedTestCertificates)
-        $code = Invoke-Setup $Installer "refuse-test-build" -Omit "ALLOWTESTBUILD" -TimeoutMinutes 5
-        Check ($code -eq 7) "Setup refused a test build on a PC without test signing before changing anything (exit code $code, expected 7)"
-        Check ("$(Read-Text (Join-Path $LogDir 'refuse-test-build-setup.log'))".Contains("This is a test build")) "Setup's log says why"
+        $code = $null
+        $changed = $false
+        try {
+            if (@($options -split '\s+') -contains "TESTSIGNING") {
+                Set-ItemProperty -Path $control -Name SystemStartOptions -Value $without
+                $changed = $true
+                Write-Host "Windows' record of its start options for this run: '$without' (was: '$options')"
+            }
+            $code = Invoke-Setup $Installer "refuse-test-build" -TimeoutMinutes 5
+        } finally {
+            if ($changed) { Set-ItemProperty -Path $control -Name SystemStartOptions -Value $options }
+        }
+        $now = "$((Get-ItemProperty -Path $control -Name SystemStartOptions).SystemStartOptions)"
+        Check ($now -ceq $options) "Windows' record of its start options is as it was ('$now')"
+        Check ($code -eq 7) "Setup refused a test build on a PC that shows no test signing, before changing anything (exit code $code, expected 7)"
+        $log = Read-Text (Join-Path $LogDir "refuse-test-build-setup.log")
+        Check ($log.Contains("Setup stops before changing anything: This is a test build")) "Setup's log says that it stops, and why"
+        Check ($log.Contains("run Setup with /ALLOWTESTBUILD")) "Setup's log names the switch for a PC that loads test-signed drivers in another way"
         Check (-not (Test-Path $UninstallKey)) "nothing installed"
         Check (-not (Test-Path -LiteralPath $DefaultAppDir)) "no install folder"
         Check (@(Get-DriverPackages).Count -eq 0) "no driver package"
