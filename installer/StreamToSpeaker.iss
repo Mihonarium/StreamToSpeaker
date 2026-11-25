@@ -105,6 +105,9 @@ WizardStyle=modern
 SetupIconFile={#SourcePath}\..\assets\StreamToSpeaker.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 SetupLogging=yes
+; An uninstall started from Settings writes a log too (in %TEMP%), with the
+; output of each [UninstallRun] step.
+UninstallLogging=yes
 ; pnputil and devcon can set Windows' "restart needed" flag after staging
 ; or installing a driver, which Inno Setup would turn into a restart
 ; prompt. Whether a restart is needed is decided from what
