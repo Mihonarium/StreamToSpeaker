@@ -540,7 +540,10 @@ another commit after an earlier run made the draft, and the notes are
 still exactly the generated ones. They are then generated again, for the
 new commit. Notes you changed stay as they are in that case too, and the
 run shows a warning that they were written for another commit: read them
-again before the release is published. (The "Generate release notes"
+again before the release is published. Notes without the line get that
+warning when a run made the draft for the other commit, once; in a draft
+you created yourself nothing says which commit they were written for,
+and no run warns. (The "Generate release notes"
 button in the draft's edit box makes the list for the commit the tag
 points at now.)
 
@@ -731,9 +734,12 @@ that machine's zlib, and another zlib may compress the same files
 differently. So a package is made once and handed on as a file, and
 nothing rebuilds a published package: every check compares it with the
 SHA-256 its manifest records. For the same reason, running Driver
-certified again with `driver-v1.1.0.209`'s inputs makes a package with
-another SHA-256 than the published one, and the run is refused like any
-run with other inputs; the release stays as it is.
+certified again for a published release makes the published package
+only while the runner's zlib compresses as the one that made it did.
+With `driver-v1.1.0.209`'s inputs it makes a package with another
+SHA-256 than the published one today, and so it would for any release
+after the runner's zlib changed; such a run is refused like any run with
+other inputs, and the release stays as it is.
 
 ## Reproducibility check (`driver-reproducibility.yml`)
 
@@ -1033,6 +1039,12 @@ one, the third gives the asset with that id a new name.
     3. Every file it records (as described above) is on the release with
        state `uploaded`, and has the SHA-256 the manifest gives for it
        where it gives one.
+    4. When it says `attested` or `certified`: its `signed_zip` is
+       `StreamToSpeaker-Driver-<ver>-Signed.zip`, the file of that name
+       with `.sha256` added, on the release, begins with the manifest's
+       `signed_zip_sha256`, and it says `certified` only when Driver
+       certified ran for this version (a release that only Driver
+       attested wrote says `attested` and has no `certified`).
 
 **3. Check the result.** Run the command of step 1 again. No name ends in
 `.pending`, and `manifest.json` is there with state `uploaded`. Then go
