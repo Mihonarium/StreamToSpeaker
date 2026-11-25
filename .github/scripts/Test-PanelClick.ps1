@@ -16,7 +16,8 @@
        Windows 11's: the per-program setting Explorer makes when an icon is
        first shown, after a first start).
     2. Starts the app: with -Start menu by a double click on a shortcut on
-       the desktop, as a person starts it (the panel opens by itself, and
+       the desktop, with every window minimized first as "Show desktop"
+       does, as a person starts it (the panel opens by itself, and
        Windows lets the app take the foreground as it does after a click);
        with -Start sign-in as the sign-in entry does (--startup: it waits
        for a click, except at first run). Then pictures every 100 ms for
@@ -188,6 +189,15 @@ function Find-UiaNamed($under, [string]$pattern) {
     $found
 }
 
+# What UI Automation finds at (x, y) on the desktop; $null for nothing.
+function Get-UiaAt([int]$x, [int]$y) {
+    try {
+        Get-UiaInfo ([System.Windows.Automation.AutomationElement]::FromPoint([System.Windows.Point]::new($x, $y)))
+    } catch {
+        $null
+    }
+}
+
 # The app's tray icon at (x, y), by UI Automation: the element there, or one
 # inside it whose place holds the point, if it is named as the tray icon is;
 # $null otherwise. What else is there goes to rig.log.
@@ -245,8 +255,9 @@ function Start-AppByProgram([bool]$startup, [string]$label) {
 }
 
 # Start the app as a person does: a double click on its shortcut on the
-# desktop. Falls back to starting it as a program when the shortcut can't
-# be found on the desktop.
+# desktop, with the desktop in view (as Explorer's "Show desktop" leaves
+# it: the runner's own window covers the desktop otherwise). Fails when the
+# shortcut isn't what is at its place, rather than click something else.
 function Start-AppByHand([string]$label) {
     $desktop = [Environment]::GetFolderPath("Desktop")
     $lnkPath = Join-Path $desktop "$ShortcutName.lnk"
@@ -258,6 +269,8 @@ function Start-AppByHand([string]$label) {
     $lnk.WorkingDirectory = Split-Path -Parent $Exe
     $lnk.Save()
     Say "Shortcut on the desktop: $lnkPath ($($argv -join ' '))"
+    (New-Object -ComObject Shell.Application).MinimizeAll()
+    Say "Showed the desktop (every window minimized); the foreground: $([PanelRig.Windows]::Foreground())"
     $item = $null
     $deadline = (Get-Date).AddSeconds(15)
     while (-not $item -and (Get-Date) -lt $deadline) {
@@ -268,15 +281,16 @@ function Start-AppByHand([string]$label) {
             if ($item) { break }
         }
     }
-    if (-not $item) {
-        Warn "the shortcut doesn't show on the desktop; the app was started as a program instead"
-        return Start-AppByProgram $false $label
+    if (-not $item) { throw "the shortcut doesn't show on the desktop" }
+    $there = Get-UiaAt $item.X $item.Y
+    if (-not $there -or $there.Name -ne $ShortcutName) {
+        throw "at the shortcut's place ($($item.Rect)) is $(if ($there) { $there.What } else { 'nothing UI Automation knows of' }), not the shortcut: not double-clicking"
     }
     $since = Get-Date
     $at = [PanelRig.Mouse]::Click($item.X, $item.Y, 2)
-    Say "Double-clicked the shortcut '$($item.Name)' ($($item.Rect)) at $at"
+    Say "Double-clicked the desktop's $($there.What) at $at"
     $p = Wait-AppProcess $since.AddSeconds(-1) 20
-    if (-not $p) { throw "the app didn't start from its shortcut" }
+    if (-not $p) { throw "the app didn't start from its shortcut (double-clicked $($there.What) at $at)" }
     Say "Started the app ($label) by hand: pid $($p.Id)"
     $p
 }
