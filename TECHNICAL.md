@@ -70,8 +70,9 @@ cargo build --release
 `pnputil /add-driver` only stages an upgrade, and the driver's control device
 keeps the loaded image in memory until Windows restarts, so a new driver binary
 only runs after a reboot (disabling and re-enabling the device is not enough).
-The installer asks for a restart when an upgrade replaces the driver binary
-that was installed before. The service log line
+The installer asks for a restart when the driver Windows has loaded is not the
+one it just installed (it compares the loaded image, not the file on disk). The
+service log line
 `StreamToSpeaker driver opened (proto=1 build=N ...)` confirms which build is
 live — `N` bumps on every shipped binary.
 
@@ -83,16 +84,41 @@ live — `N` bumps on every shipped binary.
 .\installer\build-installer.ps1 -Version 0.1.0-rc.1
 ```
 
-Output: `installer\out\StreamToSpeakerSetup-<version>.exe`. It installs the
-service to `Program Files`, stages the driver with `pnputil /add-driver
-/install`, runs `scripts\Rename-Endpoint.ps1`, and optionally adds Start Menu,
-desktop and autostart entries. `Pre-Install.ps1` and `Rename-Endpoint.ps1`
-log to `logs\install.log` in the install directory, not to
-`%LOCALAPPDATA%`; `scripts\Diagnose.ps1` prints its tail. Uninstall removes the driver
-via `Uninstall-Driver.ps1`, removes the test-signing certificate a test-signed
-build imported into `LocalMachine\Root` and `TrustedPublisher`
-(`Remove-TestCertificate.ps1`; an upgrade removes the replaced build's
-certificate when it differs), and deletes the install directory. It leaves
+Output: `installer\out\StreamToSpeakerSetup-<version>.exe`. Needs Inno Setup
+6.3 or later. Setup:
+
+1. refuses Windows Server, where the driver doesn't run (`/ALLOWSERVER` lets the
+   installer lifecycle test run on its Windows Server runners);
+2. once Install is clicked, closes a running copy (also one in another account;
+   a silent install doesn't ask) and starts it again afterwards;
+3. limits changes to an install folder outside Program Files to administrators,
+   since the uninstaller runs files from it as administrator;
+4. runs `scripts\Install-Driver.ps1`, which installs the driver package and
+   reports what happened: an update whose driver is already installed leaves
+   the device, its sound output and Windows' audio services alone; a new driver
+   goes into the driver store first and then onto the existing device (which
+   keeps its sound output and Windows' choice of output); the device is created
+   with `devcon install` only when there is none; an output that still has an
+   early build's cached settings is rebuilt and gets its default-output roles
+   back. The decisions are plain functions in `scripts\InstallerFunctions.ps1`,
+   tested by `scripts\tests\*.Tests.ps1` (Windows PowerShell);
+5. adds an inbound Windows Firewall rule for the app on private and work
+   networks (`scripts\Set-FirewallRule.ps1`);
+6. writes "start at sign-in" for the account that ran Setup, not the
+   administrator who approved it.
+
+Its last page says what happened and what to do, and a silent install returns
+exit code 20 when the sound device isn't working (`/RESTARTEXITCODE=` chooses
+the code for a restart that is due; 0 by default). The scripts log to
+`logs\install.log` in the install directory, not to `%LOCALAPPDATA%`;
+`scripts\Diagnose.ps1` prints a report of the driver, the device, the sound
+output and the firewall, with account, computer and speaker names left out, and
+`scripts\Reset-Install.ps1` clears the driver for a fresh start. Uninstall
+closes the app and removes the device, the driver packages, Windows' cached
+entries for the sound output, the test certificates a test-signed build made
+Windows trust (`LocalMachine\Root` and `TrustedPublisher`), the firewall rules
+for the app and the start-at-sign-in entries of signed-in accounts; run
+interactively, it asks for a restart when the driver was running. It leaves
 each person's own folders, so a reinstall keeps their speakers and pairings:
 `%APPDATA%\StreamToSpeaker` (`config.json`, the settings, and `config.json.bak`,
 a second copy the app reads if the first is damaged) and
@@ -110,8 +136,10 @@ they aren't needed.
 
 Windows caches an endpoint's display name in the registry on first enrolment
 and keeps it across reinstalls, so upgrades over an older install show the
-stale name. `scripts\Rename-Endpoint.ps1`, run elevated, overwrites it
-(`-Name` sets a custom one). The installer does this automatically.
+stale name. The installer replaces a name Windows made up ("Speakers (Stream To
+Speaker)", "Internal AUX Jack") and keeps one the person chose;
+`scripts\Rename-Endpoint.ps1`, run elevated, names the output by hand (`-Name`
+sets a custom one).
 
 ## Modes
 
@@ -340,7 +368,7 @@ StreamToSpeaker/
 ├── include/stream_to_speaker_ioctl.h   shared driver↔service ABI
 ├── driver/                             C++ kernel driver (PortCls / WaveRT)
 ├── installer/                          Inno Setup script + build-installer.ps1
-├── scripts/                            endpoint rename, driver uninstall
+├── scripts/                            the installer's driver, firewall and uninstall steps; Diagnose
 ├── docs/                               signing pipeline, specs, plans
 └── service/src/
     ├── main.rs          CLI parsing, mode dispatch

@@ -48,13 +48,15 @@ Don't bump the prefix for routine fixes — the auto-bumped revision is the righ
 
 ## Install / upgrade flow
 
-End users install via `StreamToSpeakerSetup-<version>.exe` (produced by CI). The installer:
+End users install via `StreamToSpeakerSetup-<version>.exe` (produced by CI). After copying the files, Setup runs `scripts/Install-Driver.ps1` (decisions in `scripts/InstallerFunctions.ps1`, tests in `scripts/tests/`) and reads back what happened:
 
-1. Imports our test-signing cert to TrustedPublisher + Root
-2. **Cleans up any prior install** — `Pre-Install.ps1` removes the live device (`devcon remove`), unstages the old driver (`pnputil /delete-driver`), wipes cached `HKLM\…\MMDevices\Audio\Render\<id>` entries that would otherwise keep the old INF properties live
-3. `pnputil /add-driver` stages the new driver
-4. `devcon install` creates the root-enumerated device — `pnputil /install` alone does not for root-enumerated devices
-5. `Rename-Endpoint.ps1` overwrites the cached friendly name + flips `DeviceState = ACTIVE` and restarts `AudioEndpointBuilder` so changes take effect without sign-out
+1. Test builds only: makes Windows trust the shipped test-signing cert (TrustedPublisher + Root) and records it for the uninstaller
+2. Looks at what is installed: our devices, the driver the service points at, the packages in the store, the cached `HKLM\…\MMDevices\Audio\Render\<id>` entries
+3. **Same driver, working device:** changes nothing (device, endpoint, Windows' default output and the audio services stay as they are)
+4. Otherwise `pnputil /add-driver` stages the new package first (a refused package changes nothing), then `devcon update` puts it on the existing device (which keeps its endpoint ID, so Windows keeps it as the default output), or `devcon install` creates the device when there is none (`pnputil /install` alone doesn't create root-enumerated devices; `devcon install` adds one every time, so it runs only then); old packages are deleted afterwards
+5. An endpoint whose cache still has an early build's association ("Internal AUX Jack", the microphone GUID) is rebuilt: device removed, cache wiped, `AudioEndpointBuilder` restarted, device created, default-output roles restored through `IPolicyConfig::SetDefaultEndpoint`
+6. Writes FormFactor / association / enable-by-default and a made-up name through `IPolicyConfig` only where they differ (a name the person or the app chose stays)
+7. Asks for a restart when the loaded driver image isn't the one just installed
 
 User-machine prerequisites that aren't automatable (dev/test-signed builds only — release installers ship the Microsoft-signed driver and need none of the first two):
 - Test-signing mode (`bcdedit /set testsigning on` + reboot) — only for test-signed dev builds (the ones that ship a `.cer`)
@@ -76,7 +78,7 @@ Implemented in `service/src/sonos.rs` (+ ssdp/upnp/gena/app wiring). Facts below
 | Symptom | Real cause | Fix |
 |---|---|---|
 | Device label is "Internal AUX Jack" | Windows derives the prefix from `KSNODETYPE_LINE_CONNECTOR` association | Use `KSNODETYPE_SPEAKER` in INF + `PKEY_Device_FriendlyName` to override cached name |
-| New install shows old endpoint name / state | `HKLM\…\MMDevices\Audio\Render\<id>` is cached per endpoint ID and survives reinstalls | `Reset-Install.ps1` wipes the cached entries; the installer now runs the cleanup automatically |
+| New install shows old endpoint name / state | `HKLM\…\MMDevices\Audio\Render\<id>` is cached per endpoint ID and survives reinstalls | `Reset-Install.ps1` wipes the cached entries; the installer rebuilds an endpoint whose cache still has an early build's association, and otherwise keeps it (wiping it loses Windows' default-output choice) |
 | Device installed but no Sound Settings endpoint | `pnputil /add-driver /install` doesn't create root-enumerated devices | Use `devcon install <inf> Root\<HardwareId>` after pnputil |
 | "Allow apps and Windows to use this device" toggle | Endpoint builder creates certain KSNODETYPE / form-factor combinations as disabled+hidden by default | `PKEY_AudioDevice_EnableEndpointByDefault = 0x101` (FLAG_ENABLE \| FLOW_MASK_RENDER) in INF |
 | OEM APO (Dolby Atmos etc.) attaches and adds latency | FormFactor=1 (Speakers) is the default match for OEM APOs | `PKEY_AudioEndpoint_Disable_SysFx = 1` in INF |
