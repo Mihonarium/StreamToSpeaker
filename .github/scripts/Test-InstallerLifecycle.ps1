@@ -1170,9 +1170,10 @@ switch ($Phase) {
         # them off: Windows makes no sound output for the device, and Setup
         # must say so, not report success. And it must not make a new device
         # in the hope of an output, on the first run or on the next. A run
-        # with a restart due (the driver an uninstall left loaded) is held
-        # to "ok" with the restart and can't show the missing output, so at
-        # least one of the two runs must have been held to it.
+        # with a restart due (the driver an uninstall left loaded, or a
+        # restart Windows asked for) is held to "ok" with the restart and
+        # can't show the missing output, so at least one of the two runs
+        # must have been held to it.
         Assert-CleanStart
         Stop-AudioServices
         try {

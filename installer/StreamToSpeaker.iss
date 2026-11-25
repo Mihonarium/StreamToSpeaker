@@ -1014,7 +1014,9 @@ end;
 // "Run as administrator" from another account, or the person couldn't be
 // told), it leaves the setting alone and says so. When the look for running
 // copies, which tells this, couldn't run at all, Setup writes the setting
-// as Inno Setup does by itself, for the account that started it.
+// as it always did: as the original user (ExecAsOriginalUser), who is the
+// person when Setup asked for administrator rights itself, and Setup's own
+// account when it was started with them.
 procedure ApplySignIn();
 var
   Wanted: Boolean;
