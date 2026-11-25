@@ -1239,9 +1239,187 @@ $StsEarlierInstallFiles = @(
     'logs\install.log')
 $StsEarlierInstallFolders = @('logs', 'scripts', 'driver')
 
+# Deleting an earlier install's files without being led elsewhere. The
+# earlier folder may be one that programs without administrator rights can
+# change. Such a program could wait until Setup has checked a path and then
+# put a link in the path's place, so that the delete lands on another
+# file: one of this install's, in Program Files. So no file is deleted by
+# its path alone: the file is opened, Windows is asked where the opened
+# file really is, and it is deleted through that same handle. Compiled
+# apart from the helpers of the driver step, and only when an earlier
+# install is moved.
+$StsEarlierFilesSource = @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace StreamToSpeaker {
+
+    public static class EarlierFiles {
+        const uint DeleteAccess = 0x00010000;
+        const uint ReadAttributes = 0x0080;
+        const uint ShareAll = 7;
+        const uint OpenExisting = 3;
+        // Needed to open a folder.
+        const uint BackupSemantics = 0x02000000;
+        // Opens a link itself, not what it leads to.
+        const uint OpenReparsePoint = 0x00200000;
+        const uint ReparsePointAttribute = 0x0400;
+        const int FileDispositionInfo = 4;
+        const int FileAttributeTagInfo = 9;
+        const int FileDispositionInfoEx = 21;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct AttributeTagInfo {
+            public uint FileAttributes;
+            public uint ReparseTag;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security,
+            uint disposition, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetFinalPathNameByHandleW(SafeFileHandle file, StringBuilder path, uint size, uint flags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetLongPathNameW(string path, StringBuilder longPath, uint size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetFileInformationByHandleEx(SafeFileHandle file, int infoClass, out AttributeTagInfo info, uint size);
+
+        [DllImport("kernel32.dll", EntryPoint = "SetFileInformationByHandle", SetLastError = true)]
+        static extern bool SetDispositionEx(SafeFileHandle file, int infoClass, ref uint flags, uint size);
+
+        [DllImport("kernel32.dll", EntryPoint = "SetFileInformationByHandle", SetLastError = true)]
+        static extern bool SetDisposition(SafeFileHandle file, int infoClass, ref byte delete, uint size);
+
+        static string LastError() {
+            return new Win32Exception(Marshal.GetLastWin32Error()).Message;
+        }
+
+        // Without the "\\?\" Windows puts in front, and without a "\" at the end.
+        static string Plain(string path) {
+            if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) {
+                path = @"\\" + path.Substring(8);
+            } else if (path.StartsWith(@"\\?\", StringComparison.Ordinal)) {
+                path = path.Substring(4);
+            }
+            return path.Length > 3 ? path.TrimEnd('\\') : path;
+        }
+
+        // Where an opened file or folder is, as Windows gives it: every link
+        // in the path followed, every name in its long form. Null when
+        // Windows doesn't say.
+        static string PathOf(SafeFileHandle handle) {
+            var buffer = new StringBuilder(1024);
+            uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+            if (length > buffer.Capacity) {
+                buffer = new StringBuilder((int)length + 1);
+                length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+            }
+            if (length == 0 || length > buffer.Capacity) {
+                return null;
+            }
+            return Plain(buffer.ToString());
+        }
+
+        // A path with every name in its long form ("C:\PROGRA~1" becomes
+        // "C:\Program Files"). Links in it are not followed. Null when
+        // nothing is at the path.
+        public static string LongPath(string path) {
+            string full = Path.GetFullPath(path);
+            var buffer = new StringBuilder(1024);
+            uint length = GetLongPathNameW(full, buffer, (uint)buffer.Capacity);
+            if (length > buffer.Capacity) {
+                buffer = new StringBuilder((int)length + 1);
+                length = GetLongPathNameW(full, buffer, (uint)buffer.Capacity);
+            }
+            if (length == 0 || length > buffer.Capacity) {
+                return null;
+            }
+            return Plain(buffer.ToString());
+        }
+
+        // Where a folder really is: opened with every link followed. Null
+        // when it can't be opened.
+        public static string RealPath(string folder) {
+            using (SafeFileHandle handle = CreateFileW(folder, ReadAttributes, ShareAll, IntPtr.Zero,
+                                                       OpenExisting, BackupSemantics, IntPtr.Zero)) {
+                if (handle.IsInvalid) {
+                    return null;
+                }
+                return PathOf(handle);
+            }
+        }
+
+        // Deletes the file, or the empty folder, that is at this path, and
+        // only there. The path is opened without following a link in its
+        // last part, and Windows is asked where the opened file is: a link
+        // anywhere above it makes that another path. Only when it is this
+        // very path is the file deleted, through the same handle, so nothing
+        // can be put in its place between the check and the delete.
+        // The path must be in its long form (LongPath). Returns "deleted",
+        // or why not, in words for the log.
+        public static string DeleteIfAt(string path, bool folder) {
+            uint flags = OpenReparsePoint | (folder ? BackupSemantics : 0u);
+            using (SafeFileHandle handle = CreateFileW(path, DeleteAccess | ReadAttributes, ShareAll, IntPtr.Zero,
+                                                       OpenExisting, flags, IntPtr.Zero)) {
+                if (handle.IsInvalid) {
+                    return "Windows refused: " + LastError();
+                }
+                AttributeTagInfo tag;
+                if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, out tag,
+                                                  (uint)Marshal.SizeOf(typeof(AttributeTagInfo)))) {
+                    return "Windows refused: " + LastError();
+                }
+                if ((tag.FileAttributes & ReparsePointAttribute) != 0) {
+                    return "it is a link";
+                }
+                string real = PathOf(handle);
+                if (real == null) {
+                    return "Windows did not say where it really is";
+                }
+                if (!string.Equals(real, path, StringComparison.OrdinalIgnoreCase)) {
+                    return "it is really at " + real;
+                }
+                // Gone as soon as this handle closes, also while another
+                // program has the file open, and also when it is read-only
+                // (Windows 10 version 1809 and later, on NTFS)...
+                uint request = 0x1 | 0x2 | 0x10;
+                if (!SetDispositionEx(handle, FileDispositionInfoEx, ref request, 4)) {
+                    // ...or the plain request, which every Windows knows.
+                    byte yes = 1;
+                    if (!SetDisposition(handle, FileDispositionInfo, ref yes, 1)) {
+                        return "Windows refused: " + LastError();
+                    }
+                }
+                return "deleted";
+            }
+        }
+    }
+}
+'@
+
+# Compiles the helper above, in Windows' own temp folder (see
+# Initialize-NativeHelpers for why).
+function Initialize-EarlierFilesHelper {
+    if ('StreamToSpeaker.EarlierFiles' -as [type]) { return }
+    $inherited = $env:TEMP, $env:TMP
+    $env:TEMP = $env:TMP = Join-Path ([Environment]::GetFolderPath('Windows')) 'Temp'
+    try {
+        Add-Type -ErrorAction Stop -Language CSharp -TypeDefinition $StsEarlierFilesSource
+    } finally {
+        $env:TEMP, $env:TMP = $inherited
+    }
+}
+
 # Whether a path, or any folder above it up to the drive, is a link,
 # junction or other reparse point (or can't be read): then the path may lead
-# somewhere other than it says, and nothing is deleted through it.
+# somewhere other than it says, and the folder is left as it is.
 function Test-PathHasLink([string]$Path) {
     $p = $Path.TrimEnd('\')
     while ($p) {
@@ -1262,11 +1440,16 @@ function Test-PathHasLink([string]$Path) {
 # Removes from an earlier install folder the files releases put there, by
 # name, then the folders they made and the folder itself when empty. Nothing
 # in the folder is run. Nothing at all is done when the folder or a folder
-# above it is a link; files that are links are kept. Result: gone, removed,
-# not-empty (something Setup didn't put there is left) or left-alone.
+# above it is a link, when Windows says the folder really is somewhere other
+# than its path, or when it is the folder of this install (-Keep) or holds
+# it, under whatever name. Each file and folder is deleted only where it
+# really is at its path (see the helper above); one that is a link, or is
+# somewhere else, is kept. Result: gone, removed, not-empty (something Setup
+# didn't put there is left) or left-alone.
 function Remove-EarlierInstall {
     param(
         [Parameter(Mandatory = $true)][string]$Folder,
+        [string]$Keep = '',
         [string[]]$Files = $StsEarlierInstallFiles,
         [string[]]$SubFolders = $StsEarlierInstallFolders
     )
@@ -1280,28 +1463,47 @@ function Remove-EarlierInstall {
         $result.Result = 'left-alone'
         return $result
     }
-    foreach ($name in $Files) {
-        $file = Join-Path $Folder $name
-        if (-not [IO.File]::Exists($file)) { continue }
-        if (Test-PathHasLink $file) {
-            Write-Step "  kept ${name}: it is a link or lies inside one"
-            $result.Kept += $name
-            continue
+    Initialize-EarlierFilesHelper
+    # The folder's path with every name in its long form, and where Windows
+    # says the opened folder is: the same, unless a link leads elsewhere.
+    $path = [StreamToSpeaker.EarlierFiles]::LongPath($Folder)
+    $real = [StreamToSpeaker.EarlierFiles]::RealPath($Folder)
+    if (-not $path -or -not $real -or -not [string]::Equals($real, $path, [StringComparison]::OrdinalIgnoreCase)) {
+        Write-Step "$Folder is really at '$real', which is not '$path': left as it is."
+        $result.Result = 'left-alone'
+        return $result
+    }
+    if ($Keep) {
+        $kept = [StreamToSpeaker.EarlierFiles]::RealPath($Keep)
+        if (-not $kept) {
+            Write-Step "Could not tell where $Keep really is: $Folder is left as it is."
+            $result.Result = 'left-alone'
+            return $result
         }
-        try {
-            [IO.File]::SetAttributes($file, [IO.FileAttributes]::Normal)
-            [IO.File]::Delete($file)
+        if ([string]::Equals($kept, $real, [StringComparison]::OrdinalIgnoreCase) -or
+            $kept.StartsWith($real.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            Write-Step "$Folder holds this install; nothing to remove."
+            $result.Result = 'gone'
+            return $result
+        }
+    }
+    foreach ($name in $Files) {
+        $file = Join-Path $path $name
+        if (-not [IO.File]::Exists($file)) { continue }
+        $outcome = [StreamToSpeaker.EarlierFiles]::DeleteIfAt($file, $false)
+        if ($outcome -eq 'deleted') {
             $result.Removed++
-        } catch {
-            Write-Step "  could not delete ${name}: $($_.Exception.Message)"
+        } else {
+            Write-Step "  kept ${name}: $outcome"
             $result.Kept += $name
         }
     }
     foreach ($sub in $SubFolders + @('')) {
-        $dir = if ($sub) { Join-Path $Folder $sub } else { $Folder }
-        if (-not [IO.Directory]::Exists($dir) -or (Test-PathHasLink $dir)) { continue }
+        $dir = if ($sub) { Join-Path $path $sub } else { $path }
+        if (-not [IO.Directory]::Exists($dir)) { continue }
         if (@([IO.Directory]::EnumerateFileSystemEntries($dir)).Count) { continue }
-        try { [IO.Directory]::Delete($dir) } catch { Write-Step "  could not remove the empty folder ${dir}: $($_.Exception.Message)" }
+        $outcome = [StreamToSpeaker.EarlierFiles]::DeleteIfAt($dir, $true)
+        if ($outcome -ne 'deleted') { Write-Step "  kept the empty folder ${dir}: $outcome" }
     }
     $result.Result = if ([IO.Directory]::Exists($Folder)) { 'not-empty' } else { 'removed' }
     Write-Step "Removed $($result.Removed) file(s) an earlier install put in $Folder$(if ($result.Result -eq 'not-empty') { '; the folder holds other files and stays' })."

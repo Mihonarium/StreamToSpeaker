@@ -943,6 +943,42 @@ Test 'nothing is deleted through a link or junction' {
     [IO.Directory]::Delete((Join-Path $dir 'driver'))
 }
 
+Test 'a link put in place after the folder was checked leads no delete elsewhere' {
+    # The check of the path is made blind, as if each link had appeared just
+    # after it.
+    function Test-PathHasLink { $false }
+
+    $dir = New-EarlierFolder 'earlier [d]'
+    $new = New-EarlierFolder 'new install [d]'
+    [IO.Directory]::Delete((Join-Path $dir 'driver'), $true)
+    $null = & cmd.exe /c mklink /J "$(Join-Path $dir 'driver')" "$(Join-Path $new 'driver')"
+    $r = Remove-EarlierInstall -Folder $dir
+    Assert-Equal 'not-empty' $r.Result 'a folder of the earlier install replaced by a link'
+    Assert-True ([IO.File]::Exists((Join-Path $new 'driver\devcon.exe'))) 'the file the link leads to'
+    Assert-True ($r.Kept -contains 'driver\devcon.exe') 'which is reported as kept'
+    Assert-True (-not [IO.File]::Exists((Join-Path $dir 'stream-to-speaker.exe'))) 'the earlier install''s own files'
+    [IO.Directory]::Delete((Join-Path $dir 'driver'))
+
+    $link = Join-Path $TestDir 'earlier link [d]'
+    $null = & cmd.exe /c mklink /J "$link" "$new"
+    $r = Remove-EarlierInstall -Folder $link
+    Assert-Equal 'left-alone' $r.Result 'the earlier folder itself replaced by a link'
+    Assert-True ([IO.File]::Exists((Join-Path $new 'stream-to-speaker.exe'))) 'the files behind it'
+    Assert-True ([IO.File]::Exists((Join-Path $new 'unins000.exe'))) 'the uninstaller behind it'
+    [IO.Directory]::Delete($link)
+}
+
+Test 'the folder of this install is never emptied as an earlier one' {
+    $dir = New-EarlierFolder 'this install'
+    Assert-Equal 'gone' (Remove-EarlierInstall -Folder $dir -Keep $dir).Result 'the same folder'
+    Assert-Equal 'gone' (Remove-EarlierInstall -Folder $dir.ToUpperInvariant() -Keep $dir).Result 'the same folder, written another way'
+    Assert-Equal 'gone' (Remove-EarlierInstall -Folder $TestDir -Keep $dir).Result 'a folder that holds it'
+    Assert-True ([IO.File]::Exists((Join-Path $dir 'unins000.exe'))) 'its files'
+    $other = New-EarlierFolder 'another install'
+    Assert-Equal 'removed' (Remove-EarlierInstall -Folder $dir -Keep $other).Result 'a folder that is not this install'
+    Assert-True ([IO.File]::Exists((Join-Path $other 'unins000.exe'))) 'this install''s files'
+}
+
 Test 'a shortcut that still starts the earlier copy goes; others stay' {
     $shell = New-Object -ComObject WScript.Shell
     $links = @()

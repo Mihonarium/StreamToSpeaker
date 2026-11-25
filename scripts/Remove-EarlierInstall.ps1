@@ -8,7 +8,9 @@
 # firewall rules for the earlier copy go; then only the files releases put
 # in that folder are deleted, by name, and the folder when it is empty.
 # When the folder, or a folder above it, is a link or junction, no file in
-# it is deleted.
+# it is deleted; and a file is deleted only where Windows says the opened
+# file really is at its path, so that a link put in the path's place while
+# this runs leads no delete to another file (this install's, for one).
 #
 # Prints, last:
 #   earlier-install-result: removed|not-empty|left-alone|gone
@@ -37,7 +39,7 @@ try {
         $null = Move-SignInEntries -FromFolder $old -ToExe $newExe
         $null = Remove-ShortcutsInto -Links @(Get-EarlierShortcuts) -Folder $old
         $null = Remove-AppFirewallRules (Join-Path $old $StsExeName) -OnlyForProgram
-        $r = Remove-EarlierInstall -Folder $old
+        $r = Remove-EarlierInstall -Folder $old -Keep (Split-Path -Parent $PSScriptRoot)
         $line = "earlier-install-result: $($r.Result)"
     }
 } catch {
