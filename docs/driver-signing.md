@@ -734,8 +734,8 @@ same wherever `package` runs; the compressed bytes inside it come from
 that machine's zlib, and another zlib may compress the same files
 differently. So a package is made once and handed on as a file, and
 nothing rebuilds a published package: every check compares it with the
-SHA-256 its manifest records. So running Driver certified again for a
-published release makes the published package only when that package
+SHA-256 its manifest records. Running Driver certified again for a
+published release therefore makes the published package only when that package
 has the layout `package` writes now, and only while the runner's zlib
 compresses as the one that made it did. `driver-v1.1.0.209`'s has the
 other layout (host 3, above), so its inputs make a package with another
