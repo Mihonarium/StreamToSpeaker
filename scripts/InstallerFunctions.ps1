@@ -34,7 +34,12 @@ $StsServiceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\StreamToSpeaker'
 $StsInstallerKey = 'HKLM:\SOFTWARE\StreamToSpeaker\Installer'
 $StsTestCertificateSubject = 'CN=Stream To Speaker (test sign)'
 $StsFirewallRuleName = 'StreamToSpeaker-Inbound'
-$StsPnputil = Join-Path $env:windir 'System32\pnputil.exe'
+# Windows' own folders, from Windows itself: an elevated script inherits the
+# environment of the user who approved it, who could have set %windir% to a
+# folder of their own.
+$StsWindowsDir = [Environment]::GetFolderPath('Windows')
+$StsSystemDir = [Environment]::GetFolderPath('System')
+$StsPnputil = Join-Path $StsSystemDir 'pnputil.exe'
 # Set by the script that loads this file (it knows where the driver folder is).
 $StsDevcon = ''
 # Put in front of every line Write-Step prints.
@@ -140,7 +145,7 @@ function Invoke-Tool {
 # A path as Windows writes it in a service's ImagePath or a loaded driver's
 # file name, as a normal Win32 path.
 function ConvertTo-WindowsPath {
-    param([string]$Path, [string]$WindowsDirectory = $env:windir)
+    param([string]$Path, [string]$WindowsDirectory = $StsWindowsDir)
     if (-not $Path) { return '' }
     $p = $Path.Trim().Trim('"')
     $win = $WindowsDirectory.TrimEnd('\')
@@ -214,7 +219,7 @@ function Get-DeviceProblemText([int]$Code) {
 # Name:", "Published Name:") are translated on non-English Windows. Every
 # published package has its INF copied to %windir%\INF\oemNN.inf, and ours
 # is the one declaring our hardware ID.
-function Get-OurDriverPackageNames([string]$InfDirectory = (Join-Path $env:windir 'INF')) {
+function Get-OurDriverPackageNames([string]$InfDirectory = (Join-Path $StsWindowsDir 'INF')) {
     if (-not (Test-Path -LiteralPath $InfDirectory -PathType Container)) { return @() }
     @(Get-ChildItem -LiteralPath $InfDirectory -Filter 'oem*.inf' -File -ErrorAction SilentlyContinue |
         Where-Object { Select-String -LiteralPath $_.FullName -Pattern $StsHardwareId -SimpleMatch -Quiet -ErrorAction SilentlyContinue } |
@@ -347,35 +352,50 @@ function Get-EndpointChanges {
 # What to do with the driver
 # ---------------------------------------------------------------------------
 
-# Keep:    the device has the driver Setup brings and nothing a reinstall
-#          would fix: leave the device, its endpoint and Windows' audio alone.
+# Keep:    the device has the driver Setup brings, its sound output is there,
+#          and nothing a reinstall would fix is wrong: leave the device, its
+#          output and Windows' audio alone.
 # Update:  install the new driver on the existing device, which keeps its
-#          endpoint, so Windows keeps it as the sound output it was.
+#          output, instead of creating a new device with a new output.
 # Create:  there is no device: create one.
-# Rebuild: the endpoint carries an early build's cache, which only a new
-#          endpoint clears: remove the device, clear the cache, create it
-#          again (the caller puts back the default-output roles it had).
-# Devices beyond the first are removed in every case (one output only).
+# Rebuild: the output carries an early build's cache, or the device works
+#          but Windows has no output for it: create a new device (with a new
+#          output) and only then remove the old one and its cache; the
+#          caller gives the new output the default roles the old one held.
+# The device kept is the one Windows plays to (-PreferredDevice), else a
+# working one; devices beyond it are removed in every plan (one output only).
 function Get-DriverPlan {
     param(
         [object[]]$Devices = @(),
         [bool]$BoundFilesAreNew,
-        [bool]$LegacyEndpointCache
+        [bool]$LegacyEndpointCache,
+        [string]$PreferredDevice = '',
+        [string[]]$DevicesWithOutput = @()
     )
-    $sorted = @($Devices | Sort-Object @{ Expression = { [int]($_.ProblemCode -ne 0) } }, InstanceId)
+    $sorted = @($Devices | Sort-Object @{ Expression = { [int]($_.InstanceId -ne $PreferredDevice) } },
+        @{ Expression = { [int]($_.ProblemCode -ne 0) } }, InstanceId)
     $device = if ($sorted.Count) { $sorted[0] } else { $null }
+    $reason = ''
     if (-not $device) {
         $action = 'Create'
+        $reason = 'there is no Stream To Speaker device'
     } elseif ($LegacyEndpointCache) {
         $action = 'Rebuild'
+        $reason = "Windows' cached copy of the sound output still has an early build's settings"
+    } elseif ($device.ProblemCode -eq 0 -and $DevicesWithOutput -notcontains $device.InstanceId) {
+        $action = 'Rebuild'
+        $reason = 'the device works but Windows has no sound output for it'
     } elseif ($BoundFilesAreNew -and ($device.ProblemCode -eq 0 -or $StsProblemsReinstallDoesNotFix -contains $device.ProblemCode)) {
         $action = 'Keep'
+        $reason = 'the device has this driver already'
     } else {
         $action = 'Update'
+        $reason = if ($BoundFilesAreNew) { "the device has this driver but it isn't working" } else { 'the device has another driver' }
     }
     $extra = if ($action -eq 'Rebuild') { $sorted } else { @($sorted | Select-Object -Skip 1) }
     [pscustomobject]@{
         Action        = $action
+        Reason        = $reason
         Device        = $device
         RemoveDevices = @($extra)
     }
@@ -651,10 +671,12 @@ function Set-EndpointState {
 # ---------------------------------------------------------------------------
 
 function Add-DriverPackage([string]$Inf) { Invoke-Tool -FilePath $StsPnputil -Arguments @('/add-driver', $Inf) }
-function Update-DeviceDriver([string]$Inf) { Invoke-Tool -FilePath $StsDevcon -Arguments @('update', $Inf, $StsHardwareId) }
+# updateni: as update, but never asks a question (nobody could answer it).
+function Update-DeviceDriver([string]$Inf) { Invoke-Tool -FilePath $StsDevcon -Arguments @('updateni', $Inf, $StsHardwareId) }
 function New-Device([string]$Inf) { Invoke-Tool -FilePath $StsDevcon -Arguments @('install', $Inf, $StsHardwareId) }
 function Remove-Device([string]$InstanceId) { Invoke-Tool -FilePath $StsDevcon -Arguments @('remove', "@$InstanceId") }
 function Remove-DriverPackage([string]$Name) { Invoke-Tool -FilePath $StsPnputil -Arguments @('/delete-driver', $Name) }
+function Remove-DriverPackageForce([string]$Name) { Invoke-Tool -FilePath $StsPnputil -Arguments @('/delete-driver', $Name, '/uninstall', '/force') }
 
 # Deletes endpoint entries from Windows' cache. Counts only what is gone
 # afterwards: Windows can refuse the delete.
@@ -838,8 +860,9 @@ function Test-SameProgram([string]$RuleProgram, [string]$Program) {
 
 # Removes Setup's rule and every other rule for the program (the ones
 # Windows' first-run prompt made); returns how many went.
-function Remove-AppFirewallRules([string]$Program) {
-    $rules = @(Get-NetFirewallRule -Name $StsFirewallRuleName -ErrorAction SilentlyContinue)
+function Remove-AppFirewallRules([string]$Program, [switch]$OnlyForProgram) {
+    $rules = @()
+    if (-not $OnlyForProgram) { $rules += @(Get-NetFirewallRule -Name $StsFirewallRuleName -ErrorAction SilentlyContinue) }
     $rules += @(Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
         Where-Object { Test-SameProgram $_.Program $Program } |
         Get-NetFirewallRule -ErrorAction SilentlyContinue)
@@ -905,6 +928,351 @@ function Remove-SignInEntries {
     $removed
 }
 
+# Points the start-at-sign-in entry of every signed-in account that starts
+# the app from -FromFolder at -ToExe instead; returns how many changed.
+function Move-SignInEntries {
+    param(
+        [Parameter(Mandatory = $true)][string]$FromFolder,
+        [Parameter(Mandatory = $true)][string]$ToExe,
+        [string]$UsersRoot = 'Registry::HKEY_USERS',
+        [string]$ValueName = $StsProductName
+    )
+    $moved = 0
+    foreach ($user in @(Get-ChildItem -LiteralPath $UsersRoot -ErrorAction SilentlyContinue)) {
+        $run = Join-Path $user.PSPath 'Software\Microsoft\Windows\CurrentVersion\Run'
+        $value = (Get-ItemProperty -LiteralPath $run -Name $ValueName -ErrorAction SilentlyContinue).$ValueName
+        if (-not $value -or -not (Test-RunValueInFolder $value $FromFolder)) { continue }
+        $null = New-ItemProperty -LiteralPath $run -Name $ValueName -Value "`"$ToExe`" --startup" -PropertyType String -Force
+        $moved++
+        Write-Step "Account $($user.PSChildName) now starts $ToExe at sign-in."
+    }
+    $moved
+}
+
+# ---------------------------------------------------------------------------
+# Running copies of the app
+# ---------------------------------------------------------------------------
+
+# Whether a file is in a folder or below it (paths compared as Windows does).
+function Test-InFolder([string]$Path, [string]$Folder) {
+    if (-not $Path -or -not $Folder) { return $false }
+    $Path.TrimEnd('\').StartsWith($Folder.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
+# Which running copies Setup closes and whose they are. Only copies started
+# from these folders are closed: they hold files Setup replaces or removes.
+# A copy started from anywhere else (a portable copy, a build) is left
+# alone. Mine: the copy belongs to the account that ran Setup.
+function Get-CopyPlan {
+    param([object[]]$Copies = @(), [string[]]$Folders = @(), [string]$PersonSid = '')
+    @($Copies | ForEach-Object {
+        $copy = $_
+        $inFolder = @($Folders | Where-Object { Test-InFolder $copy.Path $_ }).Count -gt 0
+        [pscustomobject]@{
+            ProcessId = $copy.ProcessId
+            Path      = $copy.Path
+            Close     = $inFolder
+            Mine      = [bool]($PersonSid -and $copy.OwnerSid -and $copy.OwnerSid -eq $PersonSid)
+        }
+    })
+}
+
+# Every running copy of the app: process ID, the file it was started from
+# and the account it runs as.
+function Get-AppCopies {
+    @(Get-CimInstance -ClassName Win32_Process -Filter "Name='$StsExeName'" -ErrorAction SilentlyContinue | ForEach-Object {
+        $sid = $null
+        try { $sid = (Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction Stop).Sid } catch { }
+        [pscustomobject]@{ ProcessId = [int]$_.ProcessId; Path = [string]$_.ExecutablePath; OwnerSid = [string]$sid }
+    })
+}
+
+# The person who ran Setup (Sid; '' when it can't be told) and whether
+# Setup can start a program as that person (CanStartAs).
+# -SetupProcessId is the process Setup's [Code] runs in (<setup>.tmp),
+# started by the Setup program itself:
+#   - When Setup had to ask for elevation, Inno Setup started the Setup
+#     program again, elevated, from its first <setup>.tmp, which keeps
+#     running as the person to run programs as them: the grandparent is a
+#     process of the same name, and its owner is the person, also when an
+#     administrator's password approved the elevation.
+#   - Otherwise Setup was started elevated, by the grandparent (Explorer's
+#     "Run as administrator", a prompt, a deployment tool), whose owner is
+#     the person. Setup can then start programs only as its own account, so
+#     only when that is the person's.
+function Get-SetupPerson {
+    param(
+        [int]$SetupProcessId,
+        [scriptblock]$GetProcess = { param($Id) Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$Id" -ErrorAction SilentlyContinue },
+        [scriptblock]$GetOwnerSid = { param($Process) try { [string](Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction Stop).Sid } catch { '' } }
+    )
+    $person = [pscustomobject]@{ Sid = ''; CanStartAs = $false }
+    if (-not $SetupProcessId) { return $person }
+    $chain = @()
+    $p = & $GetProcess $SetupProcessId
+    while ($p -and $chain.Count -lt 3) {
+        $chain += $p
+        if (-not $p.ParentProcessId) { break }
+        $parent = & $GetProcess $p.ParentProcessId
+        # A process that started after this one only reuses its parent's ID.
+        if ($parent -and $parent.CreationDate -and $p.CreationDate -and $parent.CreationDate -gt $p.CreationDate) { break }
+        $p = $parent
+    }
+    if ($chain.Count -lt 2) { return $person }
+    $setupAccount = [string](& $GetOwnerSid $chain[1])
+    if ($chain.Count -lt 3) {
+        # Whoever started the Setup program is gone: Setup's own account.
+        $person.Sid = $setupAccount
+        $person.CanStartAs = [bool]$setupAccount
+        return $person
+    }
+    $person.Sid = [string](& $GetOwnerSid $chain[2])
+    $respawned = $chain[2].Name -and $chain[2].Name -ieq $chain[0].Name
+    $person.CanStartAs = [bool]($person.Sid -and ($respawned -or $person.Sid -eq $setupAccount))
+    $person
+}
+
+# Ends these copies by process ID and waits up to 10 s for each; returns the
+# ones still running.
+function Stop-AppCopies([object[]]$Copies = @()) {
+    try { [System.Diagnostics.Process]::EnterDebugMode() } catch { }
+    foreach ($c in $Copies) {
+        Write-Step "Closing Stream To Speaker (process $($c.ProcessId), $($c.Path))."
+        Stop-Process -Id $c.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    @($Copies | Where-Object {
+        $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+        if ($p) { $null = $p.WaitForExit(10000) }
+        [bool](Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue)
+    })
+}
+
+# ---------------------------------------------------------------------------
+# Windows' default output when the app won't run
+# ---------------------------------------------------------------------------
+
+# A Role:N value of an MMDevices endpoint (a SYSTEMTIME: when the endpoint
+# became the default for that role) as ticks; 0 when it isn't one.
+function ConvertFrom-RoleTime($Bytes) {
+    if (-not ($Bytes -is [byte[]]) -or $Bytes.Length -lt 16) { return [int64]0 }
+    $w = @(0..7 | ForEach-Object { [BitConverter]::ToUInt16($Bytes, $_ * 2) })
+    try {
+        (New-Object DateTime ([int]$w[0]), ([int]$w[1]), ([int]$w[3]), ([int]$w[4]), ([int]$w[5]), ([int]$w[6]), ([int]$w[7]), ([DateTimeKind]::Utc)).Ticks
+    } catch {
+        [int64]0
+    }
+}
+
+# Every render output Windows has: its ID, state, whether it is ours, and
+# when it last became the default for each role.
+function Get-RenderOutputs([string]$RenderKey = $StsRenderKey) {
+    if (-not (Test-Path -LiteralPath $RenderKey)) { return @() }
+    @(Get-ChildItem -LiteralPath $RenderKey -ErrorAction SilentlyContinue | ForEach-Object {
+        $key = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+        $props = Get-ItemProperty -LiteralPath (Join-Path $_.PSPath 'Properties') -ErrorAction SilentlyContinue
+        $names = @($props.($StsPkey.FriendlyName), $props.($StsPkey.InterfaceName), $props.($StsPkey.DeviceDesc))
+        $times = @{}
+        foreach ($role in 0, 1, 2) { $times[$role] = ConvertFrom-RoleTime $key."Role:$role" }
+        [pscustomobject]@{
+            Id        = "{0.0.0.00000000}.$($_.PSChildName)"
+            State     = if ($null -ne $key.DeviceState) { ([int64]$key.DeviceState) -band 0xF } else { $null }
+            Ours      = @($names | Where-Object { $_ -and ([string]$_).IndexOf($StsProductName, [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -gt 0
+            RoleTimes = $times
+        }
+    })
+}
+
+# The output to play to instead of ours for a role: the one Windows played
+# to most recently before (the newest Role time among the others that work
+# now), else any other that works; $null when there is none.
+function Select-FallbackOutput([object[]]$Outputs = @(), [int]$Role) {
+    $others = @($Outputs | Where-Object { -not $_.Ours -and $_.State -eq $StsEndpointActive })
+    if (-not $others.Count) { return $null }
+    ($others | Sort-Object @{ Expression = { [int64]$_.RoleTimes[$Role] }; Descending = $true }, Id | Select-Object -First 1).Id
+}
+
+# When no copy of the app will run after Setup, Windows must not stay on the
+# app's output, which then plays nowhere: each role it holds goes to the
+# output Windows played to before. Returns whether anything moved.
+function Move-DefaultOutputAway {
+    $outputs = @(Get-RenderOutputs)
+    $ours = @($outputs | Where-Object { $_.Ours } | ForEach-Object { $_.Id })
+    if (-not $ours.Count) { return $false }
+    $moved = $false
+    foreach ($role in @(Get-DefaultRoles $ours)) {
+        $to = Select-FallbackOutput -Outputs $outputs -Role $role
+        if (-not $to) {
+            Write-Step "No other sound output works on this PC; Windows stays on Stream To Speaker for role $role."
+            continue
+        }
+        $hr = [StreamToSpeaker.SetupNative]::SetDefault($to, $role)
+        Write-Step ("Windows now plays to {0} for role {1} (HRESULT 0x{2:X8}): no copy of Stream To Speaker runs after Setup." -f $to, $role, $hr)
+        if ($hr -eq 0) { $moved = $true }
+    }
+    $moved
+}
+
+# ---------------------------------------------------------------------------
+# An earlier install in another folder
+# ---------------------------------------------------------------------------
+
+# What releases put in their install folder (and the scripts' log), by name.
+$StsEarlierInstallFiles = @(
+    'stream-to-speaker.exe', 'README.md', 'LICENSE', 'LICENSE-BINARIES.md', 'LICENSE-INSTALLER.txt',
+    'unins000.exe', 'unins000.dat', 'unins000.msg',
+    'driver\StreamToSpeaker.sys', 'driver\StreamToSpeaker.inf', 'driver\StreamToSpeaker.cat',
+    'driver\StreamToSpeaker.cer', 'driver\devcon.exe',
+    'scripts\Pre-Install.ps1', 'scripts\Rename-Endpoint.ps1', 'scripts\Reset-Install.ps1', 'scripts\Diagnose.ps1',
+    'scripts\Uninstall-Driver.ps1', 'scripts\Remove-TestCertificate.ps1', 'scripts\InstallerFunctions.ps1',
+    'scripts\Install-Driver.ps1', 'scripts\Set-FirewallRule.ps1', 'scripts\Remove-SignInEntries.ps1',
+    'scripts\Find-RunningCopies.ps1', 'scripts\Remove-EarlierInstall.ps1',
+    'logs\install.log')
+$StsEarlierInstallFolders = @('logs', 'scripts', 'driver')
+
+# Whether a path, or any folder above it up to the drive, is a link,
+# junction or other reparse point (or can't be read): then the path may lead
+# somewhere other than it says, and nothing is deleted through it.
+function Test-PathHasLink([string]$Path) {
+    $p = $Path.TrimEnd('\')
+    while ($p) {
+        try {
+            $attributes = [IO.File]::GetAttributes($p)
+        } catch {
+            return $true
+        }
+        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+        $parent = [IO.Path]::GetDirectoryName($p)
+        if (-not $parent -or $parent -eq $p) { break }
+        $p = $parent.TrimEnd('\')
+        if ($p.Length -le 2) { break }
+    }
+    $false
+}
+
+# Removes from an earlier install folder the files releases put there, by
+# name, then the folders they made and the folder itself when empty. Nothing
+# in the folder is run. Nothing at all is done when the folder or a folder
+# above it is a link; files that are links are kept. Result: gone, removed,
+# not-empty (something Setup didn't put there is left) or left-alone.
+function Remove-EarlierInstall {
+    param(
+        [Parameter(Mandatory = $true)][string]$Folder,
+        [string[]]$Files = $StsEarlierInstallFiles,
+        [string[]]$SubFolders = $StsEarlierInstallFolders
+    )
+    $result = [pscustomobject]@{ Result = ''; Removed = 0; Kept = @() }
+    if (-not [IO.Directory]::Exists($Folder)) {
+        $result.Result = 'gone'
+        return $result
+    }
+    if (Test-PathHasLink $Folder) {
+        Write-Step "$Folder is a link or lies inside one: left as it is."
+        $result.Result = 'left-alone'
+        return $result
+    }
+    foreach ($name in $Files) {
+        $file = Join-Path $Folder $name
+        if (-not [IO.File]::Exists($file)) { continue }
+        if (Test-PathHasLink $file) {
+            Write-Step "  kept ${name}: it is a link or lies inside one"
+            $result.Kept += $name
+            continue
+        }
+        try {
+            [IO.File]::SetAttributes($file, [IO.FileAttributes]::Normal)
+            [IO.File]::Delete($file)
+            $result.Removed++
+        } catch {
+            Write-Step "  could not delete ${name}: $($_.Exception.Message)"
+            $result.Kept += $name
+        }
+    }
+    foreach ($sub in $SubFolders + @('')) {
+        $dir = if ($sub) { Join-Path $Folder $sub } else { $Folder }
+        if (-not [IO.Directory]::Exists($dir) -or (Test-PathHasLink $dir)) { continue }
+        if (@([IO.Directory]::EnumerateFileSystemEntries($dir)).Count) { continue }
+        try { [IO.Directory]::Delete($dir) } catch { Write-Step "  could not remove the empty folder ${dir}: $($_.Exception.Message)" }
+    }
+    $result.Result = if ([IO.Directory]::Exists($Folder)) { 'not-empty' } else { 'removed' }
+    Write-Step "Removed $($result.Removed) file(s) an earlier install put in $Folder$(if ($result.Result -eq 'not-empty') { '; the folder holds other files and stays' })."
+    $result
+}
+
+# The shortcuts earlier releases made, by path: the Start-menu entry and the
+# desktop shortcut for all users.
+function Get-EarlierShortcuts {
+    @(
+        (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) "$StsProductName\$StsProductName.lnk"),
+        (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) "$StsProductName.lnk"))
+}
+
+# Deletes each of these shortcuts that still starts a program in -Folder
+# (Setup has made the ones it was asked for, pointing at the new folder,
+# before this runs); returns how many went.
+function Remove-ShortcutsInto {
+    param([string[]]$Links = @(), [Parameter(Mandatory = $true)][string]$Folder)
+    $removed = 0
+    $shell = $null
+    foreach ($link in $Links) {
+        if (-not [IO.File]::Exists($link)) { continue }
+        if (-not $shell) { $shell = New-Object -ComObject WScript.Shell }
+        $target = ''
+        try { $target = $shell.CreateShortcut($link).TargetPath } catch { }
+        if (-not (Test-InFolder $target $Folder)) { continue }
+        try {
+            [IO.File]::Delete($link)
+            $removed++
+            Write-Step "Removed the shortcut $link, which started the earlier copy."
+        } catch {
+            Write-Step "Could not remove the shortcut ${link}: $($_.Exception.Message)"
+        }
+    }
+    $removed
+}
+
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+
+# Removes every Stream To Speaker device, every package of ours in the
+# driver store and, once no device is left, Windows' cached entries for the
+# sound output. Returns what is still there afterwards, in words.
+function Invoke-DriverRemoval([hashtable]$Tools = (New-DriverTools)) {
+    foreach ($d in @(& $Tools.GetDevices)) {
+        Write-Step "Removing the device $($d.InstanceId)..."
+        $null = & $Tools.RemoveDevice $d.InstanceId
+    }
+    $packages = @(& $Tools.GetPackages)
+    if (-not $packages.Count) { Write-Step 'No Stream To Speaker driver package in the driver store.' }
+    foreach ($p in $packages) {
+        Write-Step "Deleting the driver package $p..."
+        $null = & $Tools.ForceDeletePackage $p
+    }
+    $left = @()
+    $devices = @(& $Tools.GetDevices)
+    foreach ($d in $devices) { $left += "the Stream To Speaker device $($d.InstanceId)" }
+    foreach ($p in @(& $Tools.GetPackages)) { $left += "the driver package $p in Windows' driver store" }
+    if (-not $devices.Count) {
+        $entries = @(& $Tools.GetEndpoints)
+        if ($entries.Count) {
+            $gone = & $Tools.RemoveEndpoints $entries
+            foreach ($ep in @($gone.Failed)) { $left += "Windows' cached entry $($ep.Guid) for the sound output" }
+        }
+    }
+    $left
+}
+
+# How a sound output's name is written to the log: ours, the app's and the
+# ones Windows makes up as they are; a name the person chose is left out of
+# the log, which people post with bug reports.
+function Format-EndpointName([string]$Name) {
+    if (-not $Name) { return '(no name)' }
+    if ($Name -eq $StsProductName -or $Name.StartsWith("$StsProductName $([char]0x2192) ") -or (Test-ComposedEndpointName $Name)) {
+        return "'$Name'"
+    }
+    '(a name chosen in Sound settings)'
+}
+
 # ---------------------------------------------------------------------------
 # Test signing
 # ---------------------------------------------------------------------------
@@ -923,201 +1291,360 @@ function Test-TestSigningOn([string]$SystemStartOptions) {
 # The real tools Invoke-DriverInstall uses; tests pass script blocks instead.
 function New-DriverTools {
     @{
-        FileExists       = { param($Path) [IO.File]::Exists($Path) }
-        HashFiles        = 'Get-DriverFileHashes'
-        GetDevices       = 'Get-OurDevices'
-        GetBoundFolder   = 'Get-BoundDriverFolder'
-        GetPackages      = 'Get-OurDriverPackageNames'
-        GetEndpoints     = 'Get-OurEndpoints'
-        GetDriverState   = 'Get-LoadedDriverState'
-        HashFile         = { param($Path) if ($Path -and (Test-Path -LiteralPath $Path -PathType Leaf)) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null } }
-        TrustCertificate = 'Add-TestCertificate'
-        CertificateOf    = 'Get-TestCertificateThumbprint'
-        RecordedCerts    = 'Get-RecordedTestCertificates'
-        RecordCerts      = { param($List) Set-RecordedTestCertificates -Thumbprints $List }
-        RemoveCert       = 'Remove-TestCertificateFromStores'
-        Stage            = 'Add-DriverPackage'
-        UpdateDevice     = 'Update-DeviceDriver'
-        CreateDevice     = 'New-Device'
-        RemoveDevice     = 'Remove-Device'
-        DeletePackage    = 'Remove-DriverPackage'
-        RemoveEndpoints  = 'Remove-EndpointEntries'
-        RestartAudio     = 'Restart-AudioServices'
-        DefaultRoles     = 'Get-DefaultRoles'
-        SetDefault       = { param($Id, $Role) [StreamToSpeaker.SetupNative]::SetDefault($Id, $Role) }
-        SetEndpoint      = 'Set-EndpointState'
-        Pause            = { Start-Sleep -Seconds 1 }
+        FileExists         = { param($Path) [IO.File]::Exists($Path) }
+        StartOptions       = { (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name SystemStartOptions -ErrorAction SilentlyContinue).SystemStartOptions }
+        HashFiles          = 'Get-DriverFileHashes'
+        GetDevices         = 'Get-OurDevices'
+        GetBoundFolder     = 'Get-BoundDriverFolder'
+        GetPackages        = 'Get-OurDriverPackageNames'
+        GetEndpoints       = 'Get-OurEndpoints'
+        GetDriverState     = 'Get-LoadedDriverState'
+        HashFile           = { param($Path) if ($Path -and (Test-Path -LiteralPath $Path -PathType Leaf)) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null } }
+        TrustCertificate   = 'Add-TestCertificate'
+        CertificateOf      = 'Get-TestCertificateThumbprint'
+        RecordedCerts      = 'Get-RecordedTestCertificates'
+        RecordCerts        = { param($List) Set-RecordedTestCertificates -Thumbprints $List }
+        RemoveCert         = 'Remove-TestCertificateFromStores'
+        Stage              = 'Add-DriverPackage'
+        UpdateDevice       = 'Update-DeviceDriver'
+        CreateDevice       = 'New-Device'
+        RemoveDevice       = 'Remove-Device'
+        DeletePackage      = 'Remove-DriverPackage'
+        ForceDeletePackage = 'Remove-DriverPackageForce'
+        RemoveEndpoints    = 'Remove-EndpointEntries'
+        RestartAudio       = 'Restart-AudioServices'
+        DefaultRoles       = 'Get-DefaultRoles'
+        SetDefault         = { param($Id, $Role) [StreamToSpeaker.SetupNative]::SetDefault($Id, $Role) }
+        SetEndpoint        = 'Set-EndpointState'
+        MoveDefaultAway    = 'Move-DefaultOutputAway'
+        Pause              = { Start-Sleep -Seconds 1 }
     }
 }
 
 function New-DriverResult([string]$Result, [int]$ExitCode) {
     [pscustomobject]@{
-        Result     = $Result
-        ExitCode   = $ExitCode
-        Problem    = 0
-        Restart    = $false
-        NewOutput  = $false
-        KeptBefore = $false
-        Action     = ''
+        Result        = $Result
+        ExitCode      = $ExitCode
+        Problem       = 0
+        Restart       = $false
+        Replaced      = $false
+        NewOutput     = $false
+        KeptBefore    = $false
+        Action        = ''
+        ExtrasRemoved = 0
+        ExtrasLeft    = 0
+        WasDefault    = $false
+        IsDefault     = $false
+        SoundMoved    = $false
     }
 }
 
 # Installs the driver package in -PackageDir on this PC and makes its sound
 # output usable; returns what happened (Result):
 #   ok                  the device works and its sound output is there
+#   test-signing-off    a test build on a PC whose Windows doesn't run test
+#                       builds' drivers: nothing was changed
 #   trust-failed        a test build's certificate could not be trusted;
 #                       nothing else was changed
 #   stage-failed        Windows didn't accept the driver package; nothing was
-#                       changed (KeptBefore: the earlier driver is still in use)
+#                       changed (KeptBefore: there is an earlier driver)
 #   device-failed       the device could not be created or given the driver
+#                       (KeptBefore: the earlier device is still there)
 #   driver-not-started  the device has the driver but Windows didn't start it
 #                       (Problem: the Device Manager problem code)
 #   endpoint-missing    the driver runs but no sound output appeared
 #   endpoint-off        the sound output is there but turned off in Windows
-# plus Restart (Windows must restart before the new driver runs) and
-# NewOutput (the sound output was created now: Windows plays to it only once
-# someone chooses it, apart from the default roles a rebuilt one gets back).
+# plus Restart (Windows must restart before the new driver runs), Replaced
+# (a different driver is loaded until then), NewOutput (the sound output was
+# created now), ExtrasRemoved and ExtrasLeft (other Stream To Speaker
+# devices removed, and still there), WasDefault and IsDefault (Windows
+# played to Stream To Speaker before, and does now, as checked) and
+# SoundMoved (Windows was moved to another output because no copy of the
+# app will run).
 #
 # The working driver is never removed before the new package is in the
-# driver store, and nothing is removed when it isn't.
+# driver store, and earlier packages are deleted only once the new driver
+# runs. Every test certificate is recorded before it is trusted.
 function Invoke-DriverInstall {
     param(
         [Parameter(Mandatory = $true)][string]$PackageDir,
         [string]$PreviousCertificate = '',
+        [switch]$AllowTestBuild,
+        [switch]$NoAppAfterwards,
         [hashtable]$Tools = (New-DriverTools),
         [int]$DeviceAttempts = 15,
         [int]$EndpointAttempts = 30
     )
+    $stepArgs = @{
+        PackageDir = $PackageDir; PreviousCertificate = $PreviousCertificate; AllowTestBuild = [bool]$AllowTestBuild
+        Tools = $Tools; DeviceAttempts = $DeviceAttempts; EndpointAttempts = $EndpointAttempts
+    }
+    $result = Invoke-DriverInstallSteps @stepArgs
+    if ($NoAppAfterwards -and $result.Result -ne 'test-signing-off') {
+        # No copy of the app runs after Setup, so the app's output would play
+        # nowhere: Windows goes back to the output it played to before.
+        $result.SoundMoved = [bool](& $Tools.MoveDefaultAway)
+        if ($result.SoundMoved) { $result.IsDefault = $false }
+    }
+    $result
+}
+
+function Invoke-DriverInstallSteps {
+    param(
+        [string]$PackageDir,
+        [string]$PreviousCertificate,
+        [bool]$AllowTestBuild,
+        [hashtable]$Tools,
+        [int]$DeviceAttempts,
+        [int]$EndpointAttempts
+    )
     $inf = Join-Path $PackageDir 'StreamToSpeaker.inf'
+    $cer = Join-Path $PackageDir 'StreamToSpeaker.cer'
+    $testBuild = [bool](& $Tools.FileExists $cer)
+
+    # 0. A test build's driver starts only while Windows' test-signing mode is
+    #    on. Setup refuses such a PC before it changes anything; this keeps the
+    #    step safe when it runs on its own.
+    if ($testBuild -and -not $AllowTestBuild -and -not (Test-TestSigningOn (& $Tools.StartOptions))) {
+        Write-Step "This is a test build and Windows' test-signing mode is off: its driver couldn't start on this PC, so nothing was changed."
+        return (New-DriverResult 'test-signing-off' 25)
+    }
     $newFiles = & $Tools.HashFiles $PackageDir
     $newSys = $newFiles['StreamToSpeaker.sys']
 
-    # 1. A test build's certificate, which Windows must trust before it
-    #    accepts the package.
-    $cer = Join-Path $PackageDir 'StreamToSpeaker.cer'
-    $currentCert = $null
+    # 1. Certificates: each is recorded before it is trusted, so that the
+    #    uninstaller always finds it (versions before this one didn't record
+    #    theirs, so the replaced build's comes first).
     $recorded = @(& $Tools.RecordedCerts)
-    # The certificate of the build being replaced (versions before this one
-    # didn't record theirs) is recorded first, so that whatever happens
-    # below, the uninstaller can still find and remove it.
     $previous = if ($PreviousCertificate) { & $Tools.CertificateOf $PreviousCertificate } else { $null }
-    if ($previous -and ($recorded -notcontains $previous)) {
-        $recorded = @($recorded) + $previous
-        $null = & $Tools.RecordCerts $recorded
+    $currentCert = if ($testBuild) { & $Tools.CertificateOf $cer } else { $null }
+    $newlyTrusted = [bool]($currentCert -and $recorded -notcontains $currentCert -and $previous -ne $currentCert)
+    $want = @(@($recorded) + $previous + $currentCert | Where-Object { $_ } | Select-Object -Unique)
+    if (($want -join ',') -ne ($recorded -join ',')) {
+        $null = & $Tools.RecordCerts $want
+        $recorded = $want
     }
-    if (& $Tools.FileExists $cer) {
-        $currentCert = & $Tools.CertificateOf $cer
+    if ($testBuild) {
+        $trusted = $true
         try {
             $null = & $Tools.TrustCertificate $cer
         } catch {
             Write-Step "Could not trust the test certificate: $($_.Exception.Message)"
+            $trusted = $false
+        }
+        if (-not $trusted) {
+            if ($newlyTrusted) {
+                $null = & $Tools.RemoveCert $currentCert
+                $recorded = @($recorded | Where-Object { $_ -ne $currentCert })
+                $null = & $Tools.RecordCerts $recorded
+            }
             return (New-DriverResult 'trust-failed' 20)
         }
-        if ($currentCert) { $null = & $Tools.RecordCerts (@($recorded) + $currentCert) }
     }
 
-    # 2. What is there now.
+    # 2. What is there now, and which device's output Windows plays to.
     $devices = @(& $Tools.GetDevices)
     $boundFolder = & $Tools.GetBoundFolder
     $boundFiles = & $Tools.HashFiles $boundFolder
+    $boundIsNew = Test-SameDriverFiles $boundFiles $newFiles
     $endpoints = @(& $Tools.GetEndpoints)
     $present = @(Select-PresentEndpoints -Endpoints $endpoints -InstanceIds @($devices | ForEach-Object { $_.InstanceId }))
     $legacy = @($present | Where-Object { Test-LegacyEndpointCache $_ }).Count -gt 0
+    $rolesByDevice = @{}
+    $withOutput = @()
+    foreach ($d in $devices) {
+        $ids = @(Select-PresentEndpoints -Endpoints $endpoints -InstanceIds @($d.InstanceId) | ForEach-Object { $_.Id })
+        if ($ids.Count) { $withOutput += $d.InstanceId }
+        $rolesByDevice[$d.InstanceId] = @(if ($ids.Count) { & $Tools.DefaultRoles $ids })
+    }
+    $rolesBefore = @($rolesByDevice.Values | ForEach-Object { $_ } | Select-Object -Unique)
+    $preferred = ''
+    $most = 0
+    foreach ($id in @($rolesByDevice.Keys | Sort-Object)) {
+        if (@($rolesByDevice[$id]).Count -gt $most) {
+            $most = @($rolesByDevice[$id]).Count
+            $preferred = $id
+        }
+    }
     $driverBefore = & $Tools.GetDriverState
     $loadedHash = if ($driverBefore.Image) { & $Tools.HashFile $driverBefore.Image } else { $null }
     foreach ($d in $devices) {
-        Write-Step "Device $($d.InstanceId): $(Get-DeviceProblemText $d.ProblemCode); driver package $($d.InfName)"
+        Write-Step "Device $($d.InstanceId): $(Get-DeviceProblemText $d.ProblemCode); driver package $($d.InfName)$(if (@($rolesByDevice[$d.InstanceId]).Count) { '; Windows plays to its output' })"
     }
     if (-not $devices.Count) { Write-Step 'No Stream To Speaker device yet.' }
-    $plan = Get-DriverPlan -Devices $devices -BoundFilesAreNew (Test-SameDriverFiles $boundFiles $newFiles) -LegacyEndpointCache $legacy
-    Write-Step "Plan: $($plan.Action) (driver installed now: $(if (Test-SameDriverFiles $boundFiles $newFiles) { 'the same as this build''s' } elseif ($boundFolder) { 'a different one' } else { 'none' }))"
+    $plan = Get-DriverPlan -Devices $devices -BoundFilesAreNew $boundIsNew -LegacyEndpointCache $legacy `
+        -PreferredDevice $preferred -DevicesWithOutput $withOutput
+    Write-Step "Plan: $($plan.Action) ($($plan.Reason))."
+    $windowsRestart = $false
 
-    # 3. The new package goes into the driver store first.
+    # 3. The new package goes into the driver store first; a package Windows
+    #    refuses changes nothing.
+    $packagesBefore = @(& $Tools.GetPackages)
     if ($plan.Action -ne 'Keep') {
         $code = & $Tools.Stage $inf
-        if ($code -ne 0 -and $code -ne 3010) {
+        if ($code -eq 3010) {
+            $windowsRestart = $true
+        } elseif ($code -ne 0) {
             Write-Step 'Windows did not accept the driver package; nothing was changed.'
+            if ($newlyTrusted) {
+                # No package needs this build's certificate now.
+                $null = & $Tools.RemoveCert $currentCert
+                $null = & $Tools.RecordCerts @($recorded | Where-Object { $_ -ne $currentCert })
+            }
             $r = New-DriverResult 'stage-failed' 20
             $r.KeptBefore = $devices.Count -gt 0
             $r.Action = $plan.Action
+            $r.WasDefault = $rolesBefore.Count -gt 0
+            $r.IsDefault = $r.WasDefault
             return $r
         }
     }
 
-    # 4. The device.
-    $roles = @()
-    switch ($plan.Action) {
-        'Update' {
-            $code = & $Tools.UpdateDevice $inf
-            if ($code -ne 0 -and $code -ne 1) {
-                $r = New-DriverResult 'device-failed' 21
-                $r.Action = $plan.Action
-                return $r
-            }
+    # When the device step fails, a test build's package and certificate that
+    # this run added go again, so that Windows trusts nothing no driver needs.
+    $undo = {
+        if (-not $newlyTrusted) { return }
+        $added = @(& $Tools.GetPackages | Where-Object { $packagesBefore -notcontains $_ })
+        if (-not $added.Count) {
+            Write-Step "Keeping this build's test certificate: its driver package was in the driver store before."
+            return
         }
-        'Create' {
-            $orphans = @(Select-OrphanedEndpoints $endpoints)
-            if ($orphans.Count) {
-                Write-Step "Clearing $($orphans.Count) cached entr$(if ($orphans.Count -eq 1) { 'y' } else { 'ies' }) of an earlier Stream To Speaker output..."
-                $gone = & $Tools.RemoveEndpoints $orphans
-                if ($gone.Removed) { $null = & $Tools.RestartAudio }
-            }
-            $code = & $Tools.CreateDevice $inf
-            if ($code -ne 0 -and $code -ne 1) {
-                $r = New-DriverResult 'device-failed' 21
-                $r.Action = $plan.Action
-                return $r
-            }
+        $stillThere = @($added | Where-Object { (& $Tools.DeletePackage $_) -ne 0 })
+        if ($stillThere.Count) {
+            Write-Step "Keeping this build's test certificate: its driver package $($stillThere -join ', ') is still in the driver store."
+            return
         }
-        'Rebuild' {
-            $roles = @(& $Tools.DefaultRoles @($present | ForEach-Object { $_.Id }))
-            Write-Step "Rebuilding the sound output: Windows' cached copy still has an early build's settings (default for roles: $(if ($roles.Count) { $roles -join ', ' } else { 'none' }))."
-        }
+        $null = & $Tools.RemoveCert $currentCert
+        $null = & $Tools.RecordCerts @($recorded | Where-Object { $_ -ne $currentCert })
     }
-    foreach ($extra in $plan.RemoveDevices) {
-        Write-Step "Removing the device $($extra.InstanceId)..."
-        $null = & $Tools.RemoveDevice $extra.InstanceId
-    }
-    if ($plan.Action -eq 'Rebuild') {
-        $gone = & $Tools.RemoveEndpoints $endpoints
-        if ($gone.Failed.Count) { Write-Step "  $($gone.Failed.Count) cached entr$(if ($gone.Failed.Count -eq 1) { 'y' } else { 'ies' }) could not be deleted; the settings below are written to the new output instead." }
-        $null = & $Tools.RestartAudio
+
+    # 4. The device. A rebuild creates the new device first, next to the old
+    #    one, and removes the old one only once the new one works, so that a
+    #    failure leaves the old one as it was.
+    $restoreRoles = @()
+    if ($plan.Action -eq 'Update') {
+        $code = & $Tools.UpdateDevice $inf
+        if ($code -eq 1) { $windowsRestart = $true }
+        elseif ($code -ne 0) {
+            & $undo
+            $r = New-DriverResult 'device-failed' 21
+            $r.Action = $plan.Action
+            $r.KeptBefore = $true
+            return $r
+        }
+    } elseif ($plan.Action -eq 'Create') {
+        $orphans = @(Select-OrphanedEndpoints $endpoints)
+        if ($orphans.Count) {
+            Write-Step "Clearing $($orphans.Count) cached entr$(if ($orphans.Count -eq 1) { 'y' } else { 'ies' }) of an earlier Stream To Speaker output..."
+            $gone = & $Tools.RemoveEndpoints $orphans
+            if ($gone.Removed) { $null = & $Tools.RestartAudio }
+        }
         $code = & $Tools.CreateDevice $inf
-        if ($code -ne 0 -and $code -ne 1) {
+        if ($code -eq 1) { $windowsRestart = $true }
+        elseif ($code -ne 0) {
+            & $undo
             $r = New-DriverResult 'device-failed' 21
             $r.Action = $plan.Action
             return $r
         }
+    } elseif ($plan.Action -eq 'Rebuild') {
+        $restoreRoles = $rolesBefore
+        $code = & $Tools.CreateDevice $inf
+        if ($code -eq 1) { $windowsRestart = $true }
+        elseif ($code -ne 0) {
+            & $undo
+            $r = New-DriverResult 'device-failed' 21
+            $r.Action = $plan.Action
+            $r.KeptBefore = $true
+            return $r
+        }
     }
 
-    # 5. The device as Windows has it now.
+    # 5. The device as Windows has it now: the new one after a rebuild or a
+    #    create, else the one kept.
+    $oldIds = @($devices | ForEach-Object { $_.InstanceId })
     $device = $null
     for ($i = 1; $i -le $DeviceAttempts; $i++) {
         $now = @(& $Tools.GetDevices)
-        $device = @($now | Sort-Object @{ Expression = { [int]($_.ProblemCode -ne 0) } }, InstanceId) | Select-Object -First 1
+        $candidates = if ($plan.Action -eq 'Rebuild' -or $plan.Action -eq 'Create') {
+            @($now | Where-Object { $oldIds -notcontains $_.InstanceId })
+        } else {
+            @($now | Where-Object { $_.InstanceId -eq $plan.Device.InstanceId })
+        }
+        $device = $candidates | Select-Object -First 1
         if ($device -and $device.ProblemCode -eq 0) { break }
         if ($i -lt $DeviceAttempts) { $null = & $Tools.Pause }
     }
     if (-not $device) {
+        if ($plan.Action -ne 'Rebuild') { & $undo }
         $r = New-DriverResult 'device-failed' 21
         $r.Action = $plan.Action
+        $r.KeptBefore = $plan.Action -eq 'Rebuild' -or $plan.Action -eq 'Update'
         return $r
     }
-    Write-Step "Device $($device.InstanceId): $(Get-DeviceProblemText $device.ProblemCode); driver package $($device.InfName)"
+    if ($plan.Action -eq 'Rebuild' -and $device.ProblemCode -ne 0 -and $StsProblemsRestartFixes -notcontains $device.ProblemCode) {
+        # The new device doesn't work: it goes, and the old one stays as it was.
+        Write-Step "The new device $($device.InstanceId) doesn't work ($(Get-DeviceProblemText $device.ProblemCode)); removing it and keeping the old one."
+        $null = & $Tools.RemoveDevice $device.InstanceId
+        $r = New-DriverResult 'device-failed' 21
+        $r.Action = $plan.Action
+        $r.KeptBefore = $true
+        $r.Problem = $device.ProblemCode
+        return $r
+    }
 
-    # 6. Driver packages and certificates nothing uses any more. A package is
-    #    deleted only once the device has the new one.
-    $packagesLeft = @()
-    if ($device.InfName) {
-        foreach ($p in @(& $Tools.GetPackages)) {
-            if ($p -ieq $device.InfName) { continue }
+    # The devices beyond the one kept (and, in a rebuild, the old one) go now.
+    $removing = @($plan.RemoveDevices)
+    if ($plan.Action -ne 'Rebuild') {
+        foreach ($x in $removing) { $restoreRoles += @($rolesByDevice[$x.InstanceId]) }
+    }
+    foreach ($x in $removing) {
+        Write-Step "Removing the device $($x.InstanceId)..."
+        $null = & $Tools.RemoveDevice $x.InstanceId
+    }
+    if ($plan.Action -eq 'Rebuild') {
+        # The old outputs' cached entries go too.
+        $gone = & $Tools.RemoveEndpoints $endpoints
+        if (@($gone.Failed).Count) { Write-Step "  Windows kept $(@($gone.Failed).Count) cached entr$(if (@($gone.Failed).Count -eq 1) { 'y' } else { 'ies' }) of the old output." }
+    }
+    $restoreRoles = @($restoreRoles | Where-Object { $null -ne $_ } | Select-Object -Unique)
+    $now = @(& $Tools.GetDevices)
+    $extrasLeft = @($now | Where-Object { $_.InstanceId -ne $device.InstanceId }).Count
+    Write-Step "Device $($device.InstanceId): $(Get-DeviceProblemText $device.ProblemCode); driver package $($device.InfName)"
+    if ($extrasLeft) { Write-Step "$extrasLeft other Stream To Speaker device(s) could not be removed." }
+
+    # 6. Restart: when the driver Windows has loaded isn't this one, or when
+    #    Windows itself said so.
+    $restart = Get-RestartDecision -Running $driverBefore.Running -LoadedKnown $driverBefore.Known `
+        -LoadedHash $loadedHash -PreviousHash $boundFiles['StreamToSpeaker.sys'] -NewHash $newSys
+    $result = New-DriverResult 'ok' 0
+    $result.Action = $plan.Action
+    $result.NewOutput = $plan.Action -eq 'Create' -or $plan.Action -eq 'Rebuild'
+    $result.Problem = $device.ProblemCode
+    $result.Restart = $restart.Needed -or $windowsRestart
+    $result.Replaced = $restart.Needed
+    # The old device of a rebuild is part of the rebuild, not an extra one.
+    $extras = if ($plan.Action -eq 'Rebuild') { @($removing | Where-Object { $_.InstanceId -ne $plan.Device.InstanceId }) } else { $removing }
+    $result.ExtrasRemoved = @($extras | Where-Object { @($now | ForEach-Object { $_.InstanceId }) -notcontains $_.InstanceId }).Count
+    $result.ExtrasLeft = $extrasLeft
+    $result.WasDefault = $rolesBefore.Count -gt 0
+    if ($windowsRestart) { Write-Step 'Windows asked for a restart to finish installing the driver.' }
+    Write-Step "Restart needed: $(if ($result.Restart) { 'yes' } else { 'no' }) ($($restart.Reason)$(if ($windowsRestart) { '; Windows asked for one' }))."
+
+    # 7. Earlier packages, and the certificates only they needed, go once
+    #    the new driver is known to run: the device works and no restart is
+    #    due. Until then they stay, so that the PC can go back to them.
+    $packagesLeft = @(& $Tools.GetPackages | Where-Object { $_ -ine $device.InfName })
+    if ($device.ProblemCode -eq 0 -and -not $result.Restart -and $device.InfName) {
+        $kept = @()
+        foreach ($p in $packagesLeft) {
             Write-Step "Deleting the driver package $p, which nothing uses now..."
             $code = & $Tools.DeletePackage $p
-            if ($code -ne 0) { $packagesLeft += $p }
+            if ($code -ne 0) { $kept += $p }
         }
-    } else {
-        Write-Step 'Windows did not say which driver package the device has; earlier packages are kept.'
-        $packagesLeft = @(& $Tools.GetPackages)
+        $packagesLeft = $kept
+    } elseif ($packagesLeft.Count) {
+        Write-Step "Keeping the earlier driver package(s) $($packagesLeft -join ', ') until the new driver runs."
     }
     $stale = @(Select-CertificatesToRemove -Candidates $recorded -Keep $currentCert)
     if ($stale.Count -and -not $packagesLeft.Count) {
@@ -1127,19 +1654,10 @@ function Invoke-DriverInstall {
         Write-Step 'Keeping the earlier test certificate while its driver package is still in the driver store.'
     }
 
-    # 7. Restart.
-    $restart = Get-RestartDecision -Running $driverBefore.Running -LoadedKnown $driverBefore.Known `
-        -LoadedHash $loadedHash -PreviousHash $boundFiles['StreamToSpeaker.sys'] -NewHash $newSys
-    $result = New-DriverResult 'ok' 0
-    $result.Action = $plan.Action
-    $result.NewOutput = $plan.Action -eq 'Create' -or $plan.Action -eq 'Rebuild'
-    $result.Problem = $device.ProblemCode
-    $result.Restart = $restart.Needed
-    Write-Step "Restart needed: $(if ($result.Restart) { 'yes' } else { 'no' }) ($($restart.Reason))."
-
     if ($device.ProblemCode -ne 0) {
         if ($StsProblemsRestartFixes -contains $device.ProblemCode) {
             $result.Restart = $true
+            if ($result.ExitCode -eq 0) { $result.ExitCode = 3010 }
             return $result
         }
         $result.Result = 'driver-not-started'
@@ -1158,21 +1676,28 @@ function Invoke-DriverInstall {
         if ($i -lt $EndpointAttempts) { $null = & $Tools.Pause }
     }
     if (-not $ours.Count) {
-        if ($result.Restart) { return $result }
+        if ($result.Restart) {
+            $result.ExitCode = 3010
+            return $result
+        }
         $result.Result = 'endpoint-missing'
         $result.ExitCode = 23
         return $result
     }
     foreach ($ep in $ours) {
         $changes = @(Get-EndpointChanges -Endpoint $ep -MakeVisible ($plan.Action -ne 'Keep'))
-        Write-Step "Sound output $($ep.Guid) ('$($ep.FriendlyName)'): $(if ($changes.Count) { 'setting ' + ($changes -join ', ') } else { 'nothing to change' })"
+        Write-Step "Sound output $($ep.Guid) ($(Format-EndpointName $ep.FriendlyName)): $(if ($changes.Count) { 'setting ' + ($changes -join ', ') } else { 'nothing to change' })"
         if ($changes.Count) { $null = & $Tools.SetEndpoint $ep $changes $StsProductName }
-        foreach ($role in $roles) {
-            $hr = & $Tools.SetDefault $ep.Id $role
-            Write-Step ("  default for role {0} again: HRESULT 0x{1:X8}" -f $role, $hr)
-        }
+    }
+    foreach ($role in $restoreRoles) {
+        $hr = & $Tools.SetDefault $ours[0].Id $role
+        Write-Step ("  Windows plays to it again for role {0}: HRESULT 0x{1:X8}" -f $role, $hr)
     }
     $after = @(Select-PresentEndpoints -Endpoints @(& $Tools.GetEndpoints) -InstanceIds @($device.InstanceId))
+    $rolesAfter = @(if ($after.Count) { & $Tools.DefaultRoles @($after | ForEach-Object { $_.Id }) })
+    $result.IsDefault = $rolesAfter.Count -gt 0
+    $lost = @($rolesBefore | Where-Object { $rolesAfter -notcontains $_ })
+    if ($lost.Count) { Write-Step "Windows no longer plays to Stream To Speaker for role(s) $($lost -join ', ')." }
     if (@($after | Where-Object { $_.State -eq $StsEndpointActive }).Count -eq 0) {
         $result.Result = 'endpoint-off'
         $result.ExitCode = 24
@@ -1183,7 +1708,10 @@ function Invoke-DriverInstall {
 
 # The line the installer reads back from Install-Driver.ps1's output.
 function Format-DriverResult($Result) {
-    'driver-step-result: {0} restart={1} new-output={2} problem={3} kept-before={4} action={5}' -f
-        $Result.Result, [int][bool]$Result.Restart, [int][bool]$Result.NewOutput, [int]$Result.Problem,
-        [int][bool]$Result.KeptBefore, $(if ($Result.Action) { $Result.Action } else { 'none' })
+    ('driver-step-result: {0} restart={1} replaced={2} new-output={3} problem={4} kept-before={5} action={6} ' +
+        'extras-removed={7} extras-left={8} was-default={9} is-default={10} sound-moved={11}') -f
+        $Result.Result, [int][bool]$Result.Restart, [int][bool]$Result.Replaced, [int][bool]$Result.NewOutput,
+        [int]$Result.Problem, [int][bool]$Result.KeptBefore, $(if ($Result.Action) { $Result.Action } else { 'none' }),
+        [int]$Result.ExtrasRemoved, [int]$Result.ExtrasLeft, [int][bool]$Result.WasDefault, [int][bool]$Result.IsDefault,
+        [int][bool]$Result.SoundMoved
 }

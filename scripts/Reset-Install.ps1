@@ -15,6 +15,10 @@
 # Keep this file ASCII (see InstallerFunctions.ps1).
 
 $ErrorActionPreference = 'Continue'
+# Modules load only from Windows PowerShell's own folder: the inherited
+# module path starts with the profile of the user who approved the
+# elevation, where that user's own programs could put a module.
+$env:PSModulePath = Join-Path $PSHOME 'Modules'
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {

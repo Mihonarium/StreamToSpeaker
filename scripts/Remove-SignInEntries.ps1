@@ -7,6 +7,10 @@
 # Keep this file ASCII (see InstallerFunctions.ps1).
 
 $ErrorActionPreference = 'Continue'
+# Modules load only from Windows PowerShell's own folder: the inherited
+# module path starts with the profile of the user who approved the
+# elevation, where that user's own programs could put a module.
+$env:PSModulePath = Join-Path $PSHOME 'Modules'
 $exitCode = 1
 try {
     . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'InstallerFunctions.ps1'))))

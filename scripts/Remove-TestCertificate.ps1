@@ -1,8 +1,9 @@
 # Removes the test-signing certificates a test-signed Stream To Speaker
 # installer made Windows trust (LocalMachine\Root and
-# LocalMachine\TrustedPublisher). The uninstaller runs it elevated.
+# LocalMachine\TrustedPublisher). The uninstaller runs it elevated and reads
+# the "left:" lines it prints.
 #
-# Removed: every certificate the installer recorded when it trusted it,
+# Removed: every certificate the installer recorded before trusting it,
 # and the one in -CerPath. Kept: the one in -KeepCerPath. Only our own test
 # certificates are touched (matched by thumbprint, and by subject), so a
 # certificate trusted for other reasons is never removed. Microsoft-signed
@@ -16,6 +17,10 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+# Modules load only from Windows PowerShell's own folder: the inherited
+# module path starts with the profile of the user who approved the
+# elevation, where that user's own programs could put a module.
+$env:PSModulePath = Join-Path $PSHOME 'Modules'
 $exitCode = 1
 try {
     . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'InstallerFunctions.ps1'))))
@@ -26,14 +31,20 @@ try {
     if (-not $remove.Count) {
         Write-Step 'No Stream To Speaker test certificate to remove.'
     }
+    $left = @()
     foreach ($t in $remove) {
-        if (-not (Remove-TestCertificateFromStores $t)) {
-            Write-Step "The test certificate $t is not in the machine's stores."
+        $null = Remove-TestCertificateFromStores $t
+        foreach ($store in 'Root', 'TrustedPublisher') {
+            $still = @(Get-ChildItem -LiteralPath "Cert:\LocalMachine\$store" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Thumbprint -eq $t -and $_.Subject -eq $StsTestCertificateSubject })
+            if ($still.Count) { $left += $t }
         }
     }
-    Set-RecordedTestCertificates -Thumbprints @($keep | Where-Object { $_ })
-    $exitCode = 0
+    $left = @($left | Select-Object -Unique)
+    foreach ($t in $left) { Write-Host "left: the test certificate $t, which Windows still trusts" }
+    Set-RecordedTestCertificates -Thumbprints @(@($keep) + $left | Where-Object { $_ })
+    if (-not $left.Count) { $exitCode = 0 }
 } catch {
-    Write-Host "Removing the test certificate failed: $($_.Exception.Message)"
+    Write-Host "left: a test certificate (removing it failed: $($_.Exception.Message))"
 }
 exit $exitCode

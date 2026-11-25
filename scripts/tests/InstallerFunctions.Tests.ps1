@@ -53,13 +53,16 @@ function Fake-Device([string]$Id = 'ROOT\MEDIA\0000', [int]$Problem = 0, [string
     [pscustomobject]@{ InstanceId = $Id; ProblemCode = $Problem; InfName = $Inf }
 }
 
+# -Roles: the default roles Windows gives this output when the test starts.
 function Fake-Endpoint {
     param([string]$Guid = '{11111111-1111-1111-1111-111111111111}', [int]$State = 1, [string]$Device = 'ROOT\MEDIA\0000',
-          [string]$Name = 'Stream To Speaker', [string]$Association = $StsKsNodeTypeSpeaker, $FormFactor = 1, $Enable = 0x101)
+          [string]$Name = 'Stream To Speaker', [string]$Association = $StsKsNodeTypeSpeaker, $FormFactor = 1, $Enable = 0x101,
+          [int[]]$Roles = @())
     [pscustomobject]@{
         Guid = $Guid; Id = "{0.0.0.00000000}.$Guid"; KeyPath = "fake:$Guid"; State = $State
         FriendlyName = $Name; DeviceDesc = 'Speakers'; InterfaceName = 'Stream To Speaker'
         DeviceInstance = "{1}.$Device"; FormFactor = $FormFactor; Association = $Association; EnableByDefault = $Enable
+        Roles = @($Roles)
     }
 }
 
@@ -84,16 +87,29 @@ function New-World {
         [string]$CurrentThumb = $null,
         [string]$PreviousThumb = $null,
         [string[]]$Recorded = @(),
-        [int[]]$Roles = @()
+        [bool]$TestSigning = $false,
+        [bool]$TrustFails = $false,
+        [string[]]$StuckPackages = @(),
+        [bool]$MoveResult = $true
     )
+    # Which output Windows plays to for each role (0, 1, 2).
+    $roleOf = @{}
+    foreach ($ep in @($Endpoints) + @($EndpointsAfter)) {
+        if ($ep) { foreach ($r in @($ep.Roles)) { $roleOf[[int]$r] = $ep.Id } }
+    }
     $script:W = @{
         Calls = New-Object System.Collections.ArrayList
         Devices = @($Devices); BoundFolder = $BoundFolder; BoundHashes = $BoundHashes; Packages = @($Packages)
         Endpoints = @($Endpoints); EndpointsAfter = $EndpointsAfter; DeviceChanged = $false
         StageCode = $StageCode; UpdateCode = $UpdateCode; CreateCode = $CreateCode; ProblemAfter = $ProblemAfter; NewInf = $NewInf
         Running = $Running; Known = $Known; LoadedHash = $LoadedHash
-        HasCer = $HasCer; CurrentThumb = $CurrentThumb; PreviousThumb = $PreviousThumb; Recorded = @($Recorded); Roles = @($Roles)
+        HasCer = $HasCer; CurrentThumb = $CurrentThumb; PreviousThumb = $PreviousThumb; Recorded = @($Recorded)
+        StartOptions = $(if ($TestSigning) { ' NOEXECUTE=OPTIN  TESTSIGNING' } else { ' NOEXECUTE=OPTIN' })
+        TrustFails = $TrustFails; StuckPackages = @($StuckPackages); MoveResult = $MoveResult; RoleOf = $roleOf
     }
+}
+function Current-Endpoints {
+    if ($script:W.DeviceChanged -and $null -ne $script:W.EndpointsAfter) { @($script:W.EndpointsAfter) } else { @($script:W.Endpoints) }
 }
 function Note([string]$Call) { [void]$script:W.Calls.Add($Call) }
 function Calls { @($script:W.Calls) }
@@ -105,6 +121,7 @@ function Index-Of([string]$Prefix) {
 
 $FakeTools = @{
     FileExists       = { param($Path) $script:W.HasCer -and $Path -like '*StreamToSpeaker.cer' }
+    StartOptions     = { $script:W.StartOptions }
     HashFiles        = { param($Folder)
         if ($Folder -eq 'PKG') { return $NewHashes }
         if ($Folder -and $Folder -eq $script:W.BoundFolder) { return $script:W.BoundHashes }
@@ -112,39 +129,55 @@ $FakeTools = @{
     GetDevices       = { @($script:W.Devices) }
     GetBoundFolder   = { $script:W.BoundFolder }
     GetPackages      = { @($script:W.Packages) }
-    GetEndpoints     = { if ($script:W.DeviceChanged -and $null -ne $script:W.EndpointsAfter) { @($script:W.EndpointsAfter) } else { @($script:W.Endpoints) } }
+    GetEndpoints     = { Current-Endpoints }
     GetDriverState   = { [pscustomobject]@{ Running = $script:W.Running; Known = $script:W.Known; Image = $(if ($script:W.Running) { 'C:\loaded\StreamToSpeaker.sys' } else { '' }) } }
     HashFile         = { param($Path) $script:W.LoadedHash }
-    TrustCertificate = { param($Path) Note 'Trust' }
+    TrustCertificate = { param($Path) Note 'Trust'; if ($script:W.TrustFails) { throw 'TrustedPublisher refused it' } }
     CertificateOf    = { param($Path) if ($Path -like '*previous*') { $script:W.PreviousThumb } else { $script:W.CurrentThumb } }
     RecordedCerts    = { @($script:W.Recorded) }
     RecordCerts      = { param($List) $script:W.Recorded = @($List | Where-Object { $_ }); Note "Record:$(@($script:W.Recorded) -join ',')" }
     RemoveCert       = { param($T) Note "RemoveCert:$T"; 2 }
-    Stage            = { param($Inf) Note 'Stage'; $script:W.StageCode }
+    Stage            = { param($Inf) Note 'Stage'
+        if ($script:W.StageCode -eq 0 -or $script:W.StageCode -eq 3010) {
+            if (@($script:W.Packages) -notcontains $script:W.NewInf) { $script:W.Packages = @($script:W.Packages) + $script:W.NewInf }
+        }
+        $script:W.StageCode }
     UpdateDevice     = { param($Inf) Note 'Update'
-        if ($script:W.UpdateCode -eq 0) {
+        if ($script:W.UpdateCode -eq 0 -or $script:W.UpdateCode -eq 1) {
             $script:W.Devices = @($script:W.Devices | ForEach-Object { Fake-Device $_.InstanceId $script:W.ProblemAfter $script:W.NewInf })
             $script:W.DeviceChanged = $true
         }
         $script:W.UpdateCode }
     CreateDevice     = { param($Inf) Note 'Create'
-        if ($script:W.CreateCode -eq 0) {
+        if ($script:W.CreateCode -eq 0 -or $script:W.CreateCode -eq 1) {
             $script:W.Devices = @($script:W.Devices) + (Fake-Device "ROOT\MEDIA\000$(@($script:W.Devices).Count)" $script:W.ProblemAfter $script:W.NewInf)
             $script:W.DeviceChanged = $true
         }
         $script:W.CreateCode }
-    RemoveDevice     = { param($Id) Note "RemoveDevice:$Id"; $script:W.Devices = @($script:W.Devices | Where-Object { $_.InstanceId -ne $Id }); 0 }
-    DeletePackage    = { param($Name) Note "DeletePackage:$Name"; $script:W.Packages = @($script:W.Packages | Where-Object { $_ -ne $Name }); 0 }
+    # A removed device's output stops being the default: Windows plays elsewhere.
+    RemoveDevice     = { param($Id) Note "RemoveDevice:$Id"
+        $script:W.Devices = @($script:W.Devices | Where-Object { $_.InstanceId -ne $Id })
+        $gone = @(@($script:W.Endpoints) + @($script:W.EndpointsAfter) | Where-Object { $_ -and $_.DeviceInstance -like "*.$Id" } | ForEach-Object { $_.Id })
+        foreach ($r in @($script:W.RoleOf.Keys)) { if ($gone -contains $script:W.RoleOf[$r]) { $script:W.RoleOf[$r] = 'elsewhere' } }
+        0 }
+    DeletePackage    = { param($Name) Note "DeletePackage:$Name"
+        if (@($script:W.StuckPackages) -contains $Name) { return 5 }
+        $script:W.Packages = @($script:W.Packages | Where-Object { $_ -ne $Name }); 0 }
+    ForceDeletePackage = { param($Name) Note "ForceDeletePackage:$Name"
+        if (@($script:W.StuckPackages) -contains $Name) { return 5 }
+        $script:W.Packages = @($script:W.Packages | Where-Object { $_ -ne $Name }); 0 }
     RemoveEndpoints  = { param($List) Note "RemoveEndpoints:$(@($List).Count)"; [pscustomobject]@{ Removed = @($List).Count; Failed = @() } }
     RestartAudio     = { Note 'RestartAudio' }
-    DefaultRoles     = { param($Ids) @($script:W.Roles) }
-    SetDefault       = { param($Id, $Role) Note "SetDefault:$Role"; 0 }
+    DefaultRoles     = { param($Ids) @(@($script:W.RoleOf.Keys | Where-Object { @($Ids) -contains $script:W.RoleOf[$_] }) | Sort-Object) }
+    SetDefault       = { param($Id, $Role) Note "SetDefault:$Role"; $script:W.RoleOf[[int]$Role] = $Id; 0 }
     SetEndpoint      = { param($Ep, $Changes, $Name) Note "SetEndpoint:$(@($Changes) -join ',')"; if (@($Changes) -contains 'Visible') { $Ep.State = 1 } }
+    MoveDefaultAway  = { Note 'MoveDefaultAway'; $script:W.MoveResult }
     Pause            = { }
 }
 
-function Install([string]$Previous = '') {
-    Invoke-DriverInstall -PackageDir 'PKG' -PreviousCertificate $Previous -Tools $FakeTools -DeviceAttempts 3 -EndpointAttempts 3
+function Install([string]$Previous = '', [switch]$AllowTestBuild, [switch]$NoAppAfterwards) {
+    Invoke-DriverInstall -PackageDir 'PKG' -PreviousCertificate $Previous -Tools $FakeTools -DeviceAttempts 3 -EndpointAttempts 3 `
+        -AllowTestBuild:$AllowTestBuild -NoAppAfterwards:$NoAppAfterwards
 }
 
 # ---------------------------------------------------------------------------
@@ -219,19 +252,69 @@ Test 'a signature Windows refuses is reported, and a repair does not reinstall i
 }
 
 Test 'an early build''s cached output is rebuilt and gets its default roles back' {
-    $legacy = Fake-Endpoint -Association '{DFF21BE2-F70F-11D0-B917-00A0C9223196}' -Name 'Internal AUX Jack (Stream To Speaker)'
+    $legacy = Fake-Endpoint -Association '{DFF21BE2-F70F-11D0-B917-00A0C9223196}' -Name 'Internal AUX Jack (Stream To Speaker)' -Roles @(0, 1)
     New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') `
-        -Endpoints @($legacy) -EndpointsAfter @(Fake-Endpoint -Guid '{22222222-2222-2222-2222-222222222222}' -State 2 -Name 'Speakers (Stream To Speaker)') `
-        -Roles @(0, 1)
+        -Endpoints @($legacy) -EndpointsAfter @(Fake-Endpoint -Guid '{22222222-2222-2222-2222-222222222222}' -State 2 -Name 'Speakers (Stream To Speaker)' -Device 'ROOT\MEDIA\0001')
     $r = Install
     Assert-Equal 'Rebuild' $r.Action 'plan'
+    Assert-True ((Index-Of 'Create') -lt (Index-Of 'RemoveDevice:ROOT\MEDIA\0000')) 'the new device made before the old one goes'
     Assert-True ((Index-Of 'RemoveDevice') -lt (Index-Of 'RemoveEndpoints')) 'device removed before its cache'
-    Assert-True ((Index-Of 'RemoveEndpoints') -lt (Index-Of 'RestartAudio')) 'audio restarted after the cache was cleared'
-    Assert-True ((Index-Of 'RestartAudio') -lt (Index-Of 'Create')) 'device created after the restart'
+    Assert-Equal 0 (Called 'RestartAudio') 'Windows audio restarts'
     Assert-Equal 1 (Called 'SetDefault:0') 'console role restored'
     Assert-Equal 1 (Called 'SetDefault:1') 'multimedia role restored'
     Assert-Equal 0 (Called 'SetDefault:2') 'communications role (not held before)'
     Assert-Equal 'SetEndpoint:Visible,Name' ((Calls) | Where-Object { $_ -like 'SetEndpoint*' }) 'what was written to the new output'
+    Assert-True ($r.WasDefault -and $r.IsDefault) 'Windows played to it before and does again, as checked'
+    Assert-Equal 0 $r.ExtrasRemoved 'the old device is part of the rebuild, not an extra one'
+}
+
+Test 'a rebuild whose new device can''t be made, or doesn''t work, keeps the old device as it was' {
+    $legacy = Fake-Endpoint -Association '{DFF21BE2-F70F-11D0-B917-00A0C9223196}' -Roles @(0)
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') -Endpoints @($legacy) -CreateCode 2
+    $r = Install
+    Assert-Equal 'device-failed' $r.Result 'result when the device can''t be made'
+    Assert-True $r.KeptBefore 'says the earlier device is still there'
+    Assert-Equal 0 (Called 'RemoveDevice') 'devices removed'
+    Assert-Equal 0 (Called 'RemoveEndpoints') 'cached entries removed'
+
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') -Endpoints @($legacy) -ProblemAfter 39
+    $r = Install
+    Assert-Equal 'device-failed' $r.Result 'result when the new device doesn''t work'
+    Assert-Equal 'RemoveDevice:ROOT\MEDIA\0001' ((Calls) | Where-Object { $_ -like 'RemoveDevice*' }) 'only the new device removed'
+    Assert-Equal 'ROOT\MEDIA\0000' (@($script:W.Devices) | ForEach-Object { $_.InstanceId }) 'the old device stays'
+}
+
+Test 'a working device whose sound output is missing gets a new device and output' {
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $NewHashes -Packages @('oem5.inf') `
+        -Endpoints @() -EndpointsAfter @(Fake-Endpoint -Guid '{44444444-4444-4444-4444-444444444444}' -Device 'ROOT\MEDIA\0001')
+    $r = Install
+    Assert-Equal 'Rebuild' $r.Action 'plan'
+    Assert-Equal 'ok' $r.Result 'result'
+    Assert-True $r.NewOutput 'a new output'
+    Assert-Equal 'ROOT\MEDIA\0001' (@($script:W.Devices) | ForEach-Object { $_.InstanceId }) 'one device, the new one'
+}
+
+Test 'with two devices, the one Windows plays to is kept, and the page is told one was removed' {
+    New-World -Devices @((Fake-Device 'ROOT\MEDIA\0000' 0), (Fake-Device 'ROOT\MEDIA\0001' 0)) -BoundFolder 'OLD' -BoundHashes $NewHashes `
+        -Packages @('oem5.inf') -Endpoints @(
+            (Fake-Endpoint -Guid '{55555555-0000-0000-0000-000000000000}' -Device 'ROOT\MEDIA\0000'),
+            (Fake-Endpoint -Guid '{55555555-0000-0000-0000-000000000001}' -Device 'ROOT\MEDIA\0001' -Roles @(0, 1, 2)))
+    $r = Install
+    Assert-Equal 'RemoveDevice:ROOT\MEDIA\0000' ((Calls) | Where-Object { $_ -like 'RemoveDevice*' }) 'the other device removed'
+    Assert-Equal 1 $r.ExtrasRemoved 'extras removed'
+    Assert-Equal 0 $r.ExtrasLeft 'extras left'
+    Assert-True ($r.WasDefault -and $r.IsDefault) 'Windows still plays to it, as checked'
+}
+
+Test 'with two devices, the roles of the one removed go to the one kept' {
+    New-World -Devices @((Fake-Device 'ROOT\MEDIA\0000' 0), (Fake-Device 'ROOT\MEDIA\0001' 0)) -BoundFolder 'OLD' -BoundHashes $NewHashes `
+        -Packages @('oem5.inf') -Endpoints @(
+            (Fake-Endpoint -Guid '{66666666-0000-0000-0000-000000000000}' -Device 'ROOT\MEDIA\0000' -Roles @(0, 1)),
+            (Fake-Endpoint -Guid '{66666666-0000-0000-0000-000000000001}' -Device 'ROOT\MEDIA\0001' -Roles @(2)))
+    $r = Install
+    Assert-Equal 'RemoveDevice:ROOT\MEDIA\0001' ((Calls) | Where-Object { $_ -like 'RemoveDevice*' }) 'the device with fewer roles removed'
+    Assert-Equal 1 (Called 'SetDefault:2') 'its role given to the kept output'
+    Assert-Equal '0 | 1 | 2' (& $FakeTools.DefaultRoles @('{0.0.0.00000000}.{66666666-0000-0000-0000-000000000000}')) 'roles now'
 }
 
 Test 'a device that exists is never created again; extra devices are removed' {
@@ -258,9 +341,10 @@ Test 'an install after an uninstall clears the old output''s cached entry first'
 }
 
 Test 'a sound output that is not there is not mistaken for the new one' {
-    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') `
+    New-World -Devices @(Fake-Device -Problem 31) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') `
         -Endpoints @(Fake-Endpoint -State 4) -EndpointsAfter @(Fake-Endpoint -State 4)
     $r = Install
+    Assert-Equal 'Update' $r.Action 'plan'
     Assert-Equal 'endpoint-missing' $r.Result 'result'
     Assert-Equal 0 (Called 'SetEndpoint') 'writes to the absent output'
 }
@@ -309,12 +393,91 @@ Test 'test certificates: the old one goes once its driver is gone, and stays whi
     Assert-Equal 'OLDTHUMB' $script:W.Recorded 'recorded for the uninstaller'
 }
 
-Test 'a test build trusts its certificate before staging, records it and keeps it' {
-    New-World -EndpointsAfter @(Fake-Endpoint) -HasCer $true -CurrentThumb 'NEWTHUMB'
+Test 'a test build records its certificate, then trusts it before staging, and keeps it' {
+    New-World -EndpointsAfter @(Fake-Endpoint) -HasCer $true -CurrentThumb 'NEWTHUMB' -TestSigning $true
     $r = Install
+    Assert-Equal 'ok' $r.Result 'result'
+    Assert-True ((Index-Of 'Record:NEWTHUMB') -lt (Index-Of 'Trust')) 'recorded before it was trusted'
     Assert-True ((Index-Of 'Trust') -lt (Index-Of 'Stage')) 'trusted before staging'
     Assert-Equal 'NEWTHUMB' $script:W.Recorded 'recorded'
     Assert-Equal 0 (Called 'RemoveCert') 'certificates removed'
+}
+
+Test 'a test build on a PC without test signing changes nothing' {
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') `
+        -Endpoints @(Fake-Endpoint -Roles @(0)) -HasCer $true -CurrentThumb 'NEWTHUMB' -PreviousThumb 'OLDTHUMB'
+    $r = Install -Previous 'C:\tmp\previous-test-cert.cer' -NoAppAfterwards
+    Assert-Equal 'test-signing-off' $r.Result 'result'
+    Assert-Equal 25 $r.ExitCode 'exit code'
+    Assert-Equal '' ((Calls) -join ',') 'changes made'
+
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') `
+        -Endpoints @(Fake-Endpoint) -HasCer $true -CurrentThumb 'NEWTHUMB'
+    $r = Install -AllowTestBuild
+    Assert-Equal 'Update' $r.Action 'the test can still install it (-AllowTestBuild)'
+}
+
+Test 'a release keeps the working driver''s package until the new driver runs' {
+    # A different driver is loaded: until Windows restarts, the device runs on
+    # the earlier package, so it stays, and so does the certificate it needs.
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') `
+        -Endpoints @(Fake-Endpoint) -Running $true -LoadedHash '1111' -PreviousThumb 'OLDTHUMB'
+    $r = Install -Previous 'C:\tmp\previous-test-cert.cer'
+    Assert-Equal 'ok' $r.Result 'result'
+    Assert-True ($r.Restart -and $r.Replaced) 'restart, with the earlier driver running until then'
+    Assert-Equal 3010 $r.ExitCode 'exit code'
+    Assert-Equal 0 (Called 'DeletePackage') 'packages deleted'
+    Assert-Equal 0 (Called 'RemoveCert') 'certificates removed'
+    Assert-Equal 'OLDTHUMB' $script:W.Recorded 'still recorded for later'
+}
+
+Test 'a restart Windows asks for is a restart' {
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint) -UpdateCode 1
+    $r = Install
+    Assert-Equal 'ok' $r.Result 'result after devcon''s "restart needed"'
+    Assert-True $r.Restart 'restart'
+    Assert-True (-not $r.Replaced) 'not because another driver is loaded'
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint) -StageCode 3010
+    Assert-True (Install).Restart 'restart after pnputil''s 3010'
+}
+
+Test 'a test certificate that couldn''t be trusted is removed again, and a staged package that couldn''t be used too' {
+    New-World -HasCer $true -CurrentThumb 'NEWTHUMB' -TestSigning $true -TrustFails $true
+    $r = Install
+    Assert-Equal 'trust-failed' $r.Result 'result'
+    Assert-Equal 1 (Called 'RemoveCert:NEWTHUMB') 'removed from the stores it reached'
+    Assert-Equal 0 @($script:W.Recorded).Count 'nothing left recorded'
+    Assert-Equal 0 (Called 'Stage') 'staged'
+
+    New-World -EndpointsAfter @(Fake-Endpoint) -HasCer $true -CurrentThumb 'NEWTHUMB' -TestSigning $true -CreateCode 2
+    $r = Install
+    Assert-Equal 'device-failed' $r.Result 'result'
+    Assert-Equal 1 (Called 'DeletePackage:oem9.inf') 'the package it staged deleted'
+    Assert-Equal 1 (Called 'RemoveCert:NEWTHUMB') 'its certificate removed'
+    Assert-Equal 0 @($script:W.Recorded).Count 'nothing left recorded'
+
+    New-World -EndpointsAfter @(Fake-Endpoint) -HasCer $true -CurrentThumb 'NEWTHUMB' -TestSigning $true -CreateCode 2 -StuckPackages @('oem9.inf')
+    $r = Install
+    Assert-Equal 0 (Called 'RemoveCert') 'kept while its package is still in the store'
+    Assert-Equal 'NEWTHUMB' $script:W.Recorded 'and recorded for the uninstaller'
+}
+
+Test 'an earlier build''s certificate is recorded before anything else' {
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') `
+        -Endpoints @(Fake-Endpoint) -PreviousThumb 'OLDTHUMB' -StageCode 5
+    $null = Install -Previous 'C:\tmp\previous-test-cert.cer'
+    Assert-Equal 'Record:OLDTHUMB' (@(Calls)[0]) 'first change'
+}
+
+Test 'when no copy of the app runs afterwards, Windows is moved off its output' {
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $NewHashes -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint -Roles @(0, 1))
+    $r = Install -NoAppAfterwards
+    Assert-Equal 1 (Called 'MoveDefaultAway') 'moved'
+    Assert-True ($r.SoundMoved -and -not $r.IsDefault) 'says so'
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $NewHashes -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint -Roles @(0, 1))
+    $r = Install
+    Assert-Equal 0 (Called 'MoveDefaultAway') 'not moved when the app runs again'
+    Assert-True ($r.WasDefault -and $r.IsDefault -and -not $r.SoundMoved) 'still the default'
 }
 
 Test 'the result line carries what Setup reads back' {
@@ -322,7 +485,26 @@ Test 'the result line carries what Setup reads back' {
     $r.Problem = 52
     $r.KeptBefore = $true
     $r.Action = 'Update'
-    Assert-Equal 'driver-step-result: driver-not-started restart=0 new-output=0 problem=52 kept-before=1 action=Update' (Format-DriverResult $r) 'line'
+    $r.ExtrasRemoved = 1
+    $r.WasDefault = $true
+    Assert-Equal ('driver-step-result: driver-not-started restart=0 replaced=0 new-output=0 problem=52 kept-before=1 action=Update ' +
+        'extras-removed=1 extras-left=0 was-default=1 is-default=0 sound-moved=0') (Format-DriverResult $r) 'line'
+}
+
+Test 'the uninstall says what it couldn''t remove' {
+    New-World -Devices @(Fake-Device) -Packages @('oem5.inf', 'oem9.inf') -Endpoints @(Fake-Endpoint) -StuckPackages @('oem9.inf')
+    $left = @(Invoke-DriverRemoval -Tools $FakeTools)
+    Assert-Equal "the driver package oem9.inf in Windows' driver store" $left 'left'
+    Assert-Equal 0 @($script:W.Devices).Count 'devices'
+    New-World -Devices @(Fake-Device) -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint -State 4)
+    Assert-Equal '' (@(Invoke-DriverRemoval -Tools $FakeTools) -join ',') 'nothing left'
+    Assert-Equal 1 (Called 'RemoveEndpoints:1') 'cached entries removed once no device is left'
+}
+
+Test 'the log names the app''s outputs, and no name a person chose' {
+    Assert-Equal "'Stream To Speaker'" (Format-EndpointName 'Stream To Speaker') 'ours'
+    Assert-Equal "'Stream To Speaker $([char]0x2192) Kitchen'" (Format-EndpointName "Stream To Speaker $([char]0x2192) Kitchen") 'the app''s'
+    Assert-Equal '(a name chosen in Sound settings)' (Format-EndpointName 'Jane''s speakers') 'chosen'
 }
 
 # ---------------------------------------------------------------------------
@@ -461,6 +643,190 @@ Test 'sign-in entries are removed for every account that starts this install, an
     Assert-True ($null -ne (Get-ItemProperty -LiteralPath "$users\S-1-5-21-1-1002\$run" -Name 'Stream To Speaker' -ErrorAction SilentlyContinue)) 'another copy''s entry stays'
     Assert-True (Test-RunValueInFolder 'C:\Apps\STS\stream-to-speaker.exe --startup' 'C:\Apps\STS') 'unquoted'
     Assert-True (-not (Test-RunValueInFolder '"C:\Program Files\Stream To Speaker Beta\stream-to-speaker.exe"' $dir)) 'a folder with a longer name'
+}
+
+Test 'sign-in entries that start an earlier folder''s copy start the new one' {
+    $users = "$TestKey\MoveUsers"
+    $run = 'Software\Microsoft\Windows\CurrentVersion\Run'
+    foreach ($u in 'S-1-5-21-1-1001', 'S-1-5-21-1-1002') { $null = New-Item -Path "$users\$u\$run" -Force }
+    $null = New-ItemProperty -LiteralPath "$users\S-1-5-21-1-1001\$run" -Name 'Stream To Speaker' -Value '"C:\STS [old]\stream-to-speaker.exe" --startup'
+    $null = New-ItemProperty -LiteralPath "$users\S-1-5-21-1-1002\$run" -Name 'Stream To Speaker' -Value '"D:\Portable\stream-to-speaker.exe" --startup'
+    $new = 'C:\Program Files\Stream To Speaker\stream-to-speaker.exe'
+    Assert-Equal 1 (Move-SignInEntries -FromFolder 'C:\STS [old]' -ToExe $new -UsersRoot $users) 'moved'
+    Assert-Equal "`"$new`" --startup" (Get-ItemProperty -LiteralPath "$users\S-1-5-21-1-1001\$run" -Name 'Stream To Speaker').'Stream To Speaker' 'the earlier folder''s entry'
+    Assert-Equal '"D:\Portable\stream-to-speaker.exe" --startup' (Get-ItemProperty -LiteralPath "$users\S-1-5-21-1-1002\$run" -Name 'Stream To Speaker').'Stream To Speaker' 'another copy''s entry'
+}
+
+# ---------------------------------------------------------------------------
+# Running copies, and Windows' output when none runs afterwards
+# ---------------------------------------------------------------------------
+
+Test 'only copies started from the install folder are closed, and each is told apart by its account' {
+    $copies = @(
+        [pscustomobject]@{ ProcessId = 11; Path = 'C:\Program Files\Stream To Speaker\stream-to-speaker.exe'; OwnerSid = 'S-1-5-21-9-1001' },
+        [pscustomobject]@{ ProcessId = 12; Path = 'C:\Program Files\Stream To Speaker\stream-to-speaker.exe'; OwnerSid = 'S-1-5-21-9-1002' },
+        [pscustomobject]@{ ProcessId = 13; Path = 'D:\dev\target\release\stream-to-speaker.exe'; OwnerSid = 'S-1-5-21-9-1001' },
+        [pscustomobject]@{ ProcessId = 14; Path = 'C:\Program Files\Stream To Speaker Beta\stream-to-speaker.exe'; OwnerSid = 'S-1-5-21-9-1001' })
+    $plan = @(Get-CopyPlan -Copies $copies -Folders @('C:\Program Files\Stream To Speaker') -PersonSid 'S-1-5-21-9-1001')
+    Assert-Equal '11 | 12' ($plan | Where-Object { $_.Close } | ForEach-Object { $_.ProcessId }) 'closed'
+    Assert-Equal '11 | 13 | 14' ($plan | Where-Object { $_.Mine } | ForEach-Object { $_.ProcessId }) 'the person''s'
+    $plan = @(Get-CopyPlan -Copies $copies -Folders @('C:\Program Files\Stream To Speaker') -PersonSid '')
+    Assert-Equal 0 @($plan | Where-Object { $_.Mine }).Count 'nobody''s when the person is unknown'
+}
+
+Test 'the person who ran Setup is found also when an administrator''s password approved it' {
+    $t0 = Get-Date '2026-11-25 10:00:00'
+    $p = { param($Id, $Parent, $Name, $Seconds, $Owner) [pscustomobject]@{ ProcessId = $Id; ParentProcessId = $Parent; Name = $Name; CreationDate = $t0.AddSeconds($Seconds); Owner = $Owner } }
+    $tmp = 'StreamToSpeakerSetup-0.2.0.tmp'
+    $exe = 'StreamToSpeakerSetup-0.2.0.exe'
+    $procs = @{}
+    foreach ($x in @(
+            # Setup asked for elevation and an administrator approved it.
+            @(100, 90, $tmp, 3, 'ADMIN'), @(90, 80, $exe, 2, 'ADMIN'), @(80, 70, $tmp, 1, 'JANE'), @(70, 60, $exe, 0, 'JANE'),
+            # Started elevated from a prompt (the test runner).
+            @(200, 190, $tmp, 3, 'RUNNER'), @(190, 180, $exe, 2, 'RUNNER'), @(180, 1, 'powershell.exe', 0, 'RUNNER'),
+            # "Run as administrator" with an administrator's password.
+            @(400, 390, $tmp, 3, 'ADMIN'), @(390, 380, $exe, 2, 'ADMIN'), @(380, 1, 'explorer.exe', 0, 'JANE'),
+            # The parent's ID now belongs to a newer process.
+            @(300, 290, $tmp, 0, 'ADMIN'), @(290, 1, 'notepad.exe', 9, 'OTHER'))) {
+        $procs[[int]$x[0]] = & $p $x[0] $x[1] $x[2] $x[3] $x[4]
+    }
+    $get = { param($Id) $procs[[int]$Id] }
+    $owner = { param($P) $P.Owner }
+    $r = Get-SetupPerson -SetupProcessId 100 -GetProcess $get -GetOwnerSid $owner
+    Assert-Equal 'JANE yes' "$($r.Sid) $(if ($r.CanStartAs) { 'yes' } else { 'no' })" 'Setup asked for elevation'
+    $r = Get-SetupPerson -SetupProcessId 200 -GetProcess $get -GetOwnerSid $owner
+    Assert-Equal 'RUNNER yes' "$($r.Sid) $(if ($r.CanStartAs) { 'yes' } else { 'no' })" 'Setup started elevated by the same account'
+    $r = Get-SetupPerson -SetupProcessId 400 -GetProcess $get -GetOwnerSid $owner
+    Assert-Equal 'JANE no' "$($r.Sid) $(if ($r.CanStartAs) { 'yes' } else { 'no' })" 'Run as administrator with another account'
+    Assert-Equal '' (Get-SetupPerson -SetupProcessId 300 -GetProcess $get -GetOwnerSid $owner).Sid 'its parent is gone'
+    Assert-Equal '' (Get-SetupPerson -SetupProcessId 0 -GetProcess $get -GetOwnerSid $owner).Sid 'no process'
+}
+
+Test 'without the app, Windows goes back to the output it played to before' {
+    $time = {
+        param([int]$Year, [int]$Month, [int]$Day, [int]$Hour)
+        $b = New-Object byte[] 16
+        $i = 0
+        foreach ($v in $Year, $Month, 0, $Day, $Hour, 0, 0, 0) { [BitConverter]::GetBytes([uint16]$v).CopyTo($b, $i); $i += 2 }
+        , $b
+    }
+    Assert-Equal (Get-Date '2026-11-20 08:00:00').Ticks (ConvertFrom-RoleTime (& $time 2026 11 20 8)) 'a Role time'
+    Assert-Equal 0 (ConvertFrom-RoleTime ([byte[]](1, 2, 3))) 'not a Role time'
+    $outputs = @(
+        [pscustomobject]@{ Id = 'ours'; State = 1; Ours = $true; RoleTimes = @{ 0 = 9; 1 = 9; 2 = 9 } },
+        [pscustomobject]@{ Id = 'realtek'; State = 1; Ours = $false; RoleTimes = @{ 0 = 5; 1 = 5; 2 = 1 } },
+        [pscustomobject]@{ Id = 'headset'; State = 1; Ours = $false; RoleTimes = @{ 0 = 2; 1 = 2; 2 = 7 } },
+        [pscustomobject]@{ Id = 'hdmi'; State = 4; Ours = $false; RoleTimes = @{ 0 = 8; 1 = 8; 2 = 8 } })
+    Assert-Equal 'realtek' (Select-FallbackOutput -Outputs $outputs -Role 0) 'console role'
+    Assert-Equal 'headset' (Select-FallbackOutput -Outputs $outputs -Role 2) 'communications role'
+    Assert-True ($null -eq (Select-FallbackOutput -Outputs @($outputs[0], $outputs[3]) -Role 0)) 'none that works'
+}
+
+# ---------------------------------------------------------------------------
+# An earlier install in another folder
+# ---------------------------------------------------------------------------
+
+function New-EarlierFolder([string]$Name) {
+    $dir = Join-Path $TestDir $Name
+    foreach ($f in 'stream-to-speaker.exe', 'unins000.exe', 'unins000.dat', 'README.md', 'driver\devcon.exe',
+                   'driver\StreamToSpeaker.inf', 'scripts\Diagnose.ps1', 'logs\install.log') {
+        $path = Join-Path $dir $f
+        $null = [IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+        [IO.File]::WriteAllText($path, $f)
+    }
+    $dir
+}
+
+Test 'an earlier folder loses only what releases put there, and goes when empty' {
+    $dir = New-EarlierFolder 'earlier [a]'
+    $r = Remove-EarlierInstall -Folder $dir
+    Assert-Equal 'removed' $r.Result 'result'
+    Assert-True (-not [IO.Directory]::Exists($dir)) 'the folder is gone'
+
+    $dir = New-EarlierFolder 'earlier [b]'
+    [IO.File]::WriteAllText((Join-Path $dir 'notes.txt'), 'mine')
+    [IO.File]::WriteAllText((Join-Path $dir 'scripts\my-script.ps1'), 'mine too')
+    $r = Remove-EarlierInstall -Folder $dir
+    Assert-Equal 'not-empty' $r.Result 'result'
+    Assert-Equal 'mine' ([IO.File]::ReadAllText((Join-Path $dir 'notes.txt'))) 'the person''s file'
+    Assert-True ([IO.File]::Exists((Join-Path $dir 'scripts\my-script.ps1'))) 'the person''s file in a folder of ours'
+    Assert-True (-not [IO.File]::Exists((Join-Path $dir 'unins000.exe'))) 'the earlier uninstaller'
+    Assert-True (-not [IO.Directory]::Exists((Join-Path $dir 'driver'))) 'an emptied folder of ours'
+    Assert-Equal 'gone' (Remove-EarlierInstall -Folder (Join-Path $TestDir 'never there')).Result 'a folder that is gone'
+}
+
+Test 'nothing is deleted through a link or junction' {
+    $target = New-EarlierFolder 'link target'
+    $link = Join-Path $TestDir 'earlier link'
+    $null = & cmd.exe /c mklink /J "$link" "$target"
+    Assert-True (Test-PathHasLink $link) 'a junction is seen'
+    Assert-True (Test-PathHasLink (Join-Path $link 'driver\devcon.exe')) 'so is a file inside one'
+    $r = Remove-EarlierInstall -Folder $link
+    Assert-Equal 'left-alone' $r.Result 'result'
+    Assert-True ([IO.File]::Exists((Join-Path $target 'stream-to-speaker.exe'))) 'files behind the junction'
+
+    $dir = New-EarlierFolder 'earlier [c]'
+    $elsewhere = New-EarlierFolder 'somewhere else'
+    [IO.Directory]::Delete((Join-Path $dir 'driver'), $true)
+    $null = & cmd.exe /c mklink /J "$(Join-Path $dir 'driver')" "$(Join-Path $elsewhere 'driver')"
+    $r = Remove-EarlierInstall -Folder $dir
+    Assert-Equal 'not-empty' $r.Result 'result with a junction inside'
+    Assert-True ([IO.File]::Exists((Join-Path $elsewhere 'driver\devcon.exe'))) 'the file the junction leads to'
+    Assert-True (-not [IO.File]::Exists((Join-Path $dir 'stream-to-speaker.exe'))) 'the files beside it'
+    Assert-True (-not (Test-PathHasLink (Join-Path $elsewhere 'README.md'))) 'a plain path'
+    # Removing a junction itself leaves what it leads to.
+    [IO.Directory]::Delete($link)
+    [IO.Directory]::Delete((Join-Path $dir 'driver'))
+}
+
+Test 'a shortcut that still starts the earlier copy goes; others stay' {
+    $shell = New-Object -ComObject WScript.Shell
+    $links = @()
+    foreach ($pair in @(@('to-old.lnk', 'old copy'), @('to-new.lnk', 'new copy'))) {
+        $exe = Join-Path (Join-Path $TestDir $pair[1]) 'stream-to-speaker.exe'
+        $null = [IO.Directory]::CreateDirectory((Split-Path -Parent $exe))
+        [IO.File]::WriteAllText($exe, 'exe')
+        $path = Join-Path $TestDir $pair[0]
+        $l = $shell.CreateShortcut($path)
+        $l.TargetPath = $exe
+        $l.Save()
+        $links += $path
+    }
+    # The folder as Windows writes it in the shortcut (the temporary folder
+    # can be given in its short 8.3 form).
+    $old = Split-Path -Parent $shell.CreateShortcut($links[0]).TargetPath
+    Assert-Equal 1 (Remove-ShortcutsInto -Links ($links + (Join-Path $TestDir 'missing.lnk')) -Folder $old) 'removed'
+    Assert-True (-not [IO.File]::Exists($links[0])) 'the earlier copy''s shortcut'
+    Assert-True ([IO.File]::Exists($links[1])) 'the new copy''s shortcut'
+}
+
+# ---------------------------------------------------------------------------
+# System programs and modules come from Windows itself
+# ---------------------------------------------------------------------------
+
+Test 'pnputil and the INF folder come from Windows, whatever %windir% says' {
+    $saved = $env:windir
+    $env:windir = Join-Path $TestDir 'not Windows'
+    try {
+        $seen = & { . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $here 'InstallerFunctions.ps1')))); $StsPnputil; $StsWindowsDir }
+    } finally {
+        $env:windir = $saved
+    }
+    Assert-Equal (Join-Path ([Environment]::GetFolderPath('System')) 'pnputil.exe') $seen[0] 'pnputil'
+    Assert-Equal ([Environment]::GetFolderPath('Windows')) $seen[1] 'Windows folder'
+}
+
+Test 'every script that runs as administrator loads modules only from Windows PowerShell''s own folder' {
+    $missing = @()
+    foreach ($name in 'Install-Driver.ps1', 'Uninstall-Driver.ps1', 'Remove-TestCertificate.ps1', 'Set-FirewallRule.ps1',
+                      'Remove-SignInEntries.ps1', 'Rename-Endpoint.ps1', 'Reset-Install.ps1', 'Find-RunningCopies.ps1', 'Remove-EarlierInstall.ps1') {
+        $text = [IO.File]::ReadAllText((Join-Path $here $name))
+        # Before the shared functions load, which load modules.
+        $at = $text.IndexOf("`$env:PSModulePath = Join-Path `$PSHOME 'Modules'")
+        if ($at -lt 0 -or $at -gt $text.IndexOf('ReadAllText')) { $missing += $name }
+    }
+    Assert-Equal '' ($missing -join ', ') 'scripts that don''t'
 }
 
 Test 'test signing is read from the boot options, whatever the language' {
