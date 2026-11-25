@@ -274,20 +274,32 @@ class ReleaseBuild(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
 class WhereTheseChecksRun(unittest.TestCase):
+    """Every test of the chain's scripts (this file among them) runs on
+    every pull request, push and tag, with a read-only token and no secret,
+    and a tag's release jobs wait for them."""
+
     def test_build_yml_runs_them_on_pull_requests_and_pushes(self):
-        # build.yml runs for every pull request and every push to main; its
-        # msrv job has no condition and runs this file right after its
-        # checkout.
         with open(os.path.join(WORKFLOWS_DIR, "build.yml"), encoding="utf-8") as fh:
             on = re.search(r"(?ms)^on:\n(.*?)^\S", fh.read()).group(1)
         self.assertRegex(on, r"(?m)^  pull_request:")
         self.assertRegex(on, r"(?m)^  push:")
-        fields = job_fields("build.yml")["msrv"]
-        self.assertFalse({"if", "needs"} & set(fields), fields)
-        steps = jobs_steps("build.yml")["msrv"]
-        self.assertEqual(step_field(steps[0], "uses").split("@")[0], "actions/checkout")
-        self.assertEqual((step_field(steps[1], "working-directory"), step_field(steps[1], "run")),
-                         (".github/scripts", "python3 -m unittest -v test_workflows"))
+        fields = job_fields("build.yml")
+        jobs = jobs_steps("build.yml")
+        for job, command in (("chain-tests", "python3 -m unittest discover -b -v -s .github/scripts"),
+                             ("chain-tests-powershell", "Invoke-Pester")):
+            self.assertFalse({"if", "needs", "environment"} & set(fields[job]), fields[job])
+            steps = jobs[job]
+            self.assertEqual(step_field(steps[0], "uses").split("@")[0], "actions/checkout")
+            self.assertEqual(step_with(steps[0], "persist-credentials"), "false")
+            self.assertTrue(any(command in line for s in steps for line in step_script(s)), job)
+            lines = [line.strip() for j, line in job_lines("build.yml") if j == job]
+            self.assertIn("contents: read", lines)
+            self.assertFalse([l for l in lines if "secrets." in l or "write" in l], job)
+
+    def test_a_tag_signs_nothing_before_they_pass(self):
+        needs = job_fields("build.yml")["sign-service"]["needs"]
+        for job in ("chain-tests", "chain-tests-powershell"):
+            self.assertIn(job, needs)
 
 
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")

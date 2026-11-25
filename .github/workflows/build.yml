@@ -719,7 +719,7 @@ jobs:
   # a workflow artifact; only the signed exe lands on the draft.
   sign-service:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, chain-tests, chain-tests-powershell]
     runs-on: windows-latest
     environment: request-signing
     timeout-minutes: 75
@@ -755,8 +755,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           $tag = $env:GITHUB_REF_NAME
           if ($tag -cne "v$env:VERSION") { throw "the build job's version is not the version of the tag $tag" }
-          python .github/scripts/test_release_draft.py -b
-          if ($LASTEXITCODE -ne 0) { throw "release_draft.py unit tests failed" }
           $name = "stream-to-speaker-$env:VERSION.exe"
           Copy-Item "release-inputs\service\target\release\stream-to-speaker.exe" $name
           $sha = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
@@ -806,7 +804,6 @@ jobs:
         run: |
           python .github/scripts/release_draft.py upload $env:GITHUB_REF_NAME $env:SIGNED --repo $env:GITHUB_REPOSITORY --commit $env:GITHUB_SHA --version $env:VERSION
           if ($LASTEXITCODE -ne 0) { throw "could not upload the signed exe to the draft release (see above)" }
-
 
       # Provenance for the exact bytes users download (post-signing, so the
       # digest matches the release asset). Gated on visibility: attestations
@@ -1247,8 +1244,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python .github/scripts/test_release_draft.py -b
-          if ($LASTEXITCODE -ne 0) { throw "release_draft.py unit tests failed" }
           $dir = Join-Path $env:RUNNER_TEMP "draft-assets"
           $checkArgs = @("check", $env:GITHUB_REF_NAME, "--repo", $env:GITHUB_REPOSITORY, "--version", $env:VERSION, "--installer", $env:INSTALLER, "--dir", $dir, "--service-sha256", $env:SERVICE_SHA256, "--installer-sha256", $env:INSTALLER_SHA256)
           if ($env:PROVENANCE -eq "true") { $checkArgs += "--provenance" }
@@ -1321,6 +1316,41 @@ jobs:
     with:
       version: ${{ needs.build.outputs.version }}
 
+  # The release chain's own scripts and the checks on the workflow files
+  # (every test in .github/scripts) on every pull request, push and tag,
+  # with a read-only token and no secret. sign-service waits for both jobs,
+  # so a tag whose scripts are broken stops before anything is signed. They
+  # need only the runner's own Python and PowerShell. The Python tests
+  # include the git/tar one, which skips itself without the history.
+  chain-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Release chain script tests (Python)
+        run: python3 -m unittest discover -b -v -s .github/scripts
+
+  # Get-AttestedDriver.ps1 picks the driver every installer bundles; its
+  # Pester tests run against a fake gh (Pester 5 ships with the runner).
+  chain-tests-powershell:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Release chain script tests (PowerShell)
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0
+          Invoke-Pester -Path .github/scripts/Get-AttestedDriver.Tests.ps1 -Output Detailed -CI
+
   # Minimum-supported-Rust check. `rust-version` in service/Cargo.toml is
   # only a true statement while this job passes: it checks both targets on
   # exactly that toolchain with the lockfile as-is (--locked), so a
@@ -1334,14 +1364,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-
-      # Checks on the workflow files themselves (test_workflows.py). This
-      # job runs in every run of this workflow (every pull request, every
-      # push to main), and the checks need only the runner's own Python, so
-      # they come right after the checkout.
-      - name: Workflow checks (test_workflows.py)
-        working-directory: .github/scripts
-        run: python3 -m unittest -v test_workflows
 
       - name: Read rust-version from Cargo.toml
         id: msrv
