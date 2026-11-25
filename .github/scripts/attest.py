@@ -15,6 +15,7 @@ Stdlib only; release asset I/O goes through driver_release.py and gh.
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -84,6 +85,66 @@ def apply_done(m, zip_asset):
     m["ms_state"] = "done"
     m["ms_zip_asset"] = zip_asset
     return m
+
+
+def ms_zip_name(tag, m):
+    """The asset name under which the zip Microsoft returns is attached."""
+    version = m.get("driver_version") or tag.removeprefix("driver-v")
+    return f"StreamToSpeaker-Driver-{version}-Microsoft.zip"
+
+
+# A Partner Center product or submission id, as reconcile() records it.
+ID_RE = re.compile(r"[0-9]{1,20}")
+# The state a save leaves, and the state it was made in.
+STATE_BEFORE = {"uploaded": "created", "committed": "uploaded", "failed": "committed", "done": "committed"}
+
+
+def next_saves(tag, m):
+    """Every manifest reconcile() can save next on a release whose manifest
+    is `m` (ID_RE where only Partner Center knows the value); none when it
+    saves nothing in that state."""
+    try:
+        act = next_action(m)
+    except ValueError:
+        return []
+    if act == "create":
+        return [dict(m, ms_product_id=ID_RE, ms_submission_id=ID_RE, ms_state="created")]
+    if act == "upload":
+        return [dict(m, ms_state="uploaded")]
+    if act == "commit":
+        return [dict(m, ms_state="committed")]
+    if act == "poll":
+        return [dict(m, ms_state="failed"), dict(m, ms_state="done", ms_zip_asset=ms_zip_name(tag, m))]
+    return []
+
+
+def stopped_save(tag):
+    """`mine` for DriverRelease.begin: why the pending manifest `new` is
+    not the save reconcile() makes next on the manifest in place `cur`, or
+    None when it is. That save has to be put in place, not made again: it
+    may hold the ids of a submission that already exists. With
+    manifest.json already deleted (`cur` is None), the manifest it was
+    made on is worked out from the state the pending one records; what
+    only the deleted manifest held can't be compared with anything."""
+    def mine(cur, new):
+        gone = cur is None
+        if gone:
+            state = new.get("ms_state")
+            if state == "created":
+                cur = dict(new, ms_product_id=None, ms_submission_id=None, ms_state=None)
+            elif state in STATE_BEFORE:
+                cur = dict(new, ms_state=STATE_BEFORE[state])
+            else:
+                return f"its ms_state ({driver_release.clean(state, 60)!r}) is not one Driver attest records"
+        problem = driver_release.attest_problem(tag, cur)
+        if problem:
+            return f"there is no manifest.json, and going by the pending one, {problem}" if gone else problem
+        saves = next_saves(tag, cur)
+        if not saves:
+            return "Driver attest has no manifest to write on this release as it stands"
+        reasons = [driver_release.not_this_write(new, want) for want in saves]
+        return None if None in reasons else min(reasons, key=len)
+    return mine
 
 
 def find_download(sub, dtype):
@@ -177,18 +238,25 @@ class Release:
         rel = Release(repo, tag, run)
         if rel.release.view is None:
             sys.exit(f"::error::release {tag} not found")
-        # Finish what a stopped run left half done first: a manifest that
+        # Finish a stopped save of this workflow first: a manifest that
         # holds the Partner Center ids may be waiting as manifest.json.pending.
-        rel.release.begin()
+        rel._begin()
         if rel.release.manifest is None:
             sys.exit(f"::error::release {tag} has no manifest.json")
         return rel.tag, rel, rel.release.manifest
+
+    def _begin(self):
+        """Complete what a stopped run of this workflow left half done
+        (stopped_save; the one file it uploads is Microsoft's zip); any
+        other pending file stops the run before anything is changed."""
+        self.release.begin(mine=stopped_save(self.tag),
+                           files=[ms_zip_name(self.tag, self.release.manifest or {})])
 
     def _writable(self):
         problem = driver_release.attest_problem(self.tag, self.release.manifest)
         if problem:
             raise driver_release.ReleaseError(problem)
-        self.release.begin()
+        self._begin()
 
     def download_asset(self, name):
         return self.release.download(name)
@@ -272,7 +340,7 @@ def reconcile(api, rel, m, tag, now=time.time, sleep=time.sleep, deadline_s=2700
                     break
                 signed_url = find_download(sub, "signedPackage")
                 if state == "completed" and signed_url:
-                    zip_name = f"StreamToSpeaker-Driver-{version}-Microsoft.zip"
+                    zip_name = ms_zip_name(tag, m)
                     with open(zip_name, "wb") as f:
                         f.write(api.download(signed_url))
                     rel.upload_asset(zip_name)

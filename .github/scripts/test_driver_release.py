@@ -160,6 +160,24 @@ def returned_release(fake, version="1.1.2.140", **kw):
                                                     m["ms_zip_asset"]: b"ms zip"})
 
 
+# fail_when predicates: the two calls that follow the upload of
+# `<name>.pending` when a file is replaced.
+def deleting(call):
+    return call[:3] == ("api", "--method", "DELETE") and "/releases/assets/" in call[3]
+
+
+def renaming(call):
+    return call[:3] == ("api", "--method", "PATCH") and "/releases/assets/" in call[3]
+
+
+def another_bundle_for(data, name, attempt):
+    """The provenance bundle another attempt of the job gets for the same
+    file: the same subject, other bytes."""
+    bundle = json.loads(bundle_for(data, name))
+    bundle["verificationMaterial"] = {"tlogEntries": [{"logIndex": str(attempt)}]}
+    return json.dumps(bundle).encode()
+
+
 class AttestedRecordPublishesWhatWasAttested(Base):
     def test_a_zip_its_provenance_does_not_name_is_refused(self):
         fake = Fake()
@@ -503,14 +521,63 @@ class AFailedUploadLeavesTheReleaseWithWhatItHad(Base):
         self.assertEqual(self.record(fake), 0, self.output)
         self.assertIs(fake.manifest(TAG)["attested"], True)
 
-    def test_a_manifest_left_as_pending_is_finished_by_the_next_writer(self):
+    def rebuild_stopped_after_deleting_the_old_manifest(self):
+        """A rebuild's record job was replacing an earlier build's manifest
+        and stopped between the delete and the rename."""
         fake = Fake()
-        fake.add_release(TAG, {"manifest.json.pending": submission_manifest()}, target=COMMIT)
+        fake.add_release(TAG, {"manifest.json": submission_manifest(submission_cab_sha256="cb" * 32)}, target=COMMIT)
+        fake.fail_when(renaming, fake_gh.Stop())
+        with self.assertRaises(fake_gh.Stop):
+            self.release(fake)
+        self.assertEqual(list(fake.files(TAG)), ["manifest.json.pending"])
+        return fake
+
+    def test_a_manifest_left_as_pending_is_finished_by_the_re_run_of_its_job(self):
+        fake = self.rebuild_stopped_after_deleting_the_old_manifest()
         rel = dr.DriverRelease(REPO, TAG, fake, sleep=lambda s: None)
         self.assertIsNone(rel.manifest)
         self.assertTrue(rel.interrupted)
+        self.assertEqual(self.release(fake), 0, self.output)
+        self.assertEqual(list(fake.files(TAG)), ["manifest.json"])
+        self.assertEqual(fake.manifest(TAG), submission_manifest())
         self.assertEqual(self.signed(fake), 0, self.output)
         self.assertEqual(sorted(fake.files(TAG)), sorted([CAB, CAB + ".sha256", "manifest.json"]))
+
+    def test_a_rebuild_stopped_before_deleting_the_old_manifest_is_finished_by_its_re_run(self):
+        fake = Fake()
+        fake.add_release(TAG, {"manifest.json": submission_manifest(submission_cab_sha256="cb" * 32)}, target=COMMIT)
+        fake.fail_when(deleting, fake_gh.Stop())
+        with self.assertRaises(fake_gh.Stop):
+            self.release(fake)
+        self.assertEqual(sorted(fake.files(TAG)), ["manifest.json", "manifest.json.pending"])
+        self.assertEqual(fake.manifest(TAG)["submission_cab_sha256"], "cb" * 32)
+        self.assertEqual(self.release(fake), 0, self.output)
+        self.assertEqual(list(fake.files(TAG)), ["manifest.json"])
+        self.assertEqual(fake.manifest(TAG), submission_manifest())
+
+    def test_a_manifest_left_as_pending_is_not_finished_by_another_job(self):
+        # sign-cab would add its signature to the manifest in place; the
+        # pending one is the record job's write, which that job finishes.
+        fake = self.rebuild_stopped_after_deleting_the_old_manifest()
+        before = fake.files(TAG)
+        self.assertEqual(self.signed(fake), 1)
+        self.assertIn("nothing was changed", self.output)
+        self.assertIn("Re-run failed jobs", self.output)
+        self.assertEqual(fake.files(TAG), before)
+
+    def test_a_sign_cab_stopped_while_replacing_the_manifest_is_finished_by_its_re_run(self):
+        for stopped_at in (deleting, renaming):
+            with self.subTest(stopped_at.__name__):
+                fake = Fake()
+                fake.add_release(TAG, {"manifest.json": submission_manifest()}, target=COMMIT)
+                fake.fail_when(stopped_at, fake_gh.Stop())
+                with self.assertRaises(fake_gh.Stop):
+                    self.signed(fake)
+                self.assertIn("manifest.json.pending", fake.files(TAG))
+                self.assertEqual(self.signed(fake), 0, self.output)
+                self.assertEqual(sorted(fake.files(TAG)), sorted([CAB, CAB + ".sha256", "manifest.json"]))
+                self.assertEqual(fake.manifest(TAG),
+                                 submission_manifest(submission_cab_signed_sha256=sha(b"signed cab")))
 
 
 class TheManifestIsWrittenLast(Base):
@@ -857,23 +924,8 @@ class AnInterruptedManifestWriteIsFinishedByTheReRun(Base):
         self.assertEqual(self.run_cmd(fake, "fallback-check", "--source-hash", "7" * 64, "--commit", "f" * 40), 1)
 
 
-class FinishingAnInterruptedWriteKeepsWhatItRecorded(Base):
-    def test_a_complete_pending_manifest_is_rolled_forward_not_dropped(self):
-        # Driver attest recorded the new Partner Center ids, and the run
-        # stopped after manifest.json.pending was up, before the old
-        # manifest was deleted: the next writer keeps the ids.
-        fake = Fake()
-        fake.add_release(TAG, {"manifest.json": submission_manifest(),
-                               "manifest.json.pending": submission_manifest(ms_product_id="111",
-                                                                            ms_submission_id="222",
-                                                                            ms_state="created")})
-        rel = dr.DriverRelease(REPO, TAG, fake, sleep=lambda s: None)
-        rel.begin()
-        self.assertEqual(fake.manifest(TAG)["ms_submission_id"], "222")
-        self.assertEqual(rel.manifest["ms_submission_id"], "222")
-        self.assertNotIn("manifest.json.pending", fake.files(TAG))
-
-    def test_nothing_is_rolled_forward_over_a_finished_manifest(self):
+class NothingIsRolledForwardOverAFinishedManifest(Base):
+    def test_a_pending_manifest_beside_a_finished_one_is_left_alone(self):
         fake = Fake()
         rel = certified_release(fake)
         fake.add_asset(rel, "manifest.json.pending", json.dumps(certified_manifest(certified=False)).encode())
@@ -882,45 +934,215 @@ class FinishingAnInterruptedWriteKeepsWhatItRecorded(Base):
         self.assertEqual(fake.files("driver-v1.1.1.211"), before)
 
 
-class APendingManifestIsPutInPlaceOnlyIfAWriteWouldHaveWrittenIt(Base):
-    """What a stopped run of these workflows leaves passed write_manifest's
-    checks before it went up. Anything else (placed or left by someone
-    else) is reported and left for a person."""
+class AJobFinishesOnlyItsOwnStoppedWrite(Base):
+    """A job that stops in the middle of a write leaves `<name>.pending`.
+    Run again, the same job completes its own write: a pending manifest
+    that is exactly the one it writes next is put in place, after the
+    files and the notes that come before it, and a pending copy of a file
+    the job uploads is deleted and uploaded again. Any other pending file
+    (another job's stopped write, or a file somebody placed) stops the
+    job, and nothing is changed. The job here is Driver attested's record,
+    given the canonical zip b"canonical zip"."""
+    MS_ZIP = "StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip"
+    SIDECAR = f"{sha(b'canonical zip')}  {SIGNED_ZIP}".encode()
+    BUNDLE_NAME = SIGNED_ZIP + ".sigstore.json"
 
     def returned_with_pending(self, pending):
+        """A returned round with manifest.json.pending beside its manifest:
+        the manifest `pending` as these workflows write one, or the bytes
+        given."""
         fake = Fake()
         rel = returned_release(fake)
-        fake.add_asset(rel, "manifest.json.pending", pending)
+        fake.add_asset(rel, "manifest.json.pending", pending if isinstance(pending, bytes) else dr.as_written(pending))
         return fake
 
     def finishing(self, **kw):
-        return dict(submission_manifest(submission_cab_signed_sha256=sha(b"signed cab"), ms_product_id="7",
-                                        ms_submission_id="8", ms_state="done",
-                                        ms_zip_asset="StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip"),
-                    attested=True, signed_zip=SIGNED_ZIP, signed_zip_sha256=sha(b"canonical zip"), **kw)
+        """The manifest this job writes last (`kw`: what a test changes in it)."""
+        m = submission_manifest(submission_cab_signed_sha256=sha(b"signed cab"), ms_product_id="7",
+                                ms_submission_id="8", ms_state="done", ms_zip_asset=self.MS_ZIP)
+        m.update(attested=True, signed_zip=SIGNED_ZIP, signed_zip_sha256=sha(b"canonical zip"))
+        m.update(kw)
+        return m
 
-    def assertLeftForAPerson(self, fake, before, says):
-        writes = len(fake.writes())
-        self.assertEqual(self.record(fake), 1)
-        self.assertIn(".pending", self.output)
-        self.assertIn(says, self.output)
-        self.assertIn("nothing was changed", self.output)
+    def all_but_the_manifest(self):
+        """A returned round on which this job has put everything but the
+        manifest: the canonical zip, its checksum file and its bundle."""
+        fake = Fake()
+        rel = returned_release(fake)
+        for name, data in ((SIGNED_ZIP, b"canonical zip"), (SIGNED_ZIP + ".sha256", self.SIDECAR),
+                           (self.BUNDLE_NAME, BUNDLE)):
+            fake.add_asset(rel, name, data)
+        return fake
+
+    def assertRefused(self, fake, says, run=None):
+        before, writes = fake.files(TAG), len(fake.writes())
+        self.assertEqual((run or (lambda: self.record(fake)))(), 1)
+        for text in (".pending", says, "nothing was changed"):
+            self.assertIn(text, self.output)
         self.assertEqual(fake.files(TAG), before)
         self.assertEqual(len(fake.writes()), writes)
 
+    def assertCompleted(self, fake, **record):
+        """The job, run again, leaves the release as an uninterrupted run
+        does. The files, for further checks."""
+        self.assertEqual(self.record(fake, **record), 0, self.output)
+        files = fake.files(TAG)
+        self.assertFalse([n for n in files if n.endswith(".pending")])
+        self.assertEqual((files.get(SIGNED_ZIP), files.get(SIGNED_ZIP + ".sha256")), (b"canonical zip", self.SIDECAR))
+        self.assertEqual(files["manifest.json"], dr.as_written(self.finishing()))
+        self.assertIn("Microsoft-attested", fake.release(TAG)["name"])
+        return files
+
+    # -- a pending manifest ---------------------------------------------------
     def test_a_finishing_manifest_that_records_a_missing_file(self):
         fake = self.returned_with_pending(self.finishing())
-        self.assertLeftForAPerson(fake, fake.files(TAG), SIGNED_ZIP)
+        self.assertRefused(fake, SIGNED_ZIP)
 
     def test_a_finishing_manifest_whose_file_has_other_bytes(self):
         fake = self.returned_with_pending(self.finishing())
         fake.add_asset(fake.release(TAG), SIGNED_ZIP, b"other bytes")
-        self.assertLeftForAPerson(fake, fake.files(TAG), "sha256")
+        self.assertRefused(fake, "sha256")
 
     def test_a_pending_manifest_that_is_not_json(self):
         fake = self.returned_with_pending(b"not json")
-        self.assertLeftForAPerson(fake, fake.files(TAG), "JSON")
+        self.assertRefused(fake, "JSON")
 
+    def test_a_pending_manifest_that_is_not_laid_out_as_these_workflows_write_one(self):
+        # The right fields, in bytes no write of these workflows produces.
+        right = dr.as_written(self.finishing())
+        twice = right.replace(b'"attested": true', b'"attested": false,\n  "attested": true')
+        self.assertEqual(json.loads(twice), self.finishing())
+        for what, data in (("one line", json.dumps(self.finishing()).encode()),
+                           ("a byte order mark", b"\xef\xbb\xbf" + right),
+                           ("a field given twice", twice)):
+            with self.subTest(what):
+                fake = self.returned_with_pending(data)
+                fake.add_asset(fake.release(TAG), SIGNED_ZIP, b"canonical zip")
+                self.assertRefused(fake, "laid out")
+
+    def test_a_pending_manifest_with_its_fields_in_another_order(self):
+        # The same fields and values, and the layout of these workflows, but
+        # not the bytes this job uploads.
+        fake = self.returned_with_pending(dict(reversed(list(self.finishing().items()))))
+        fake.add_asset(fake.release(TAG), SIGNED_ZIP, b"canonical zip")
+        self.assertRefused(fake, "order")
+
+    def test_a_finishing_manifest_for_another_commit_and_driver_source(self):
+        # All this job would write, except what the build recorded: the
+        # installers pair a driver with a source tree by that hash.
+        fake = self.returned_with_pending(self.finishing(commit="9" * 40, source_hash="9" * 64))
+        fake.add_asset(fake.release(TAG), SIGNED_ZIP, b"canonical zip")
+        self.assertRefused(fake, "commit, source_hash")
+
+    def test_a_pending_manifest_that_says_certified(self):
+        # No job leaves one: Driver certified writes its manifest in one
+        # upload, onto a release that has none.
+        fake = Fake()
+        rel = returned_release(fake)
+        fake.add_asset(rel, SIGNED_ZIP, b"canonical zip")
+        fake.add_asset(rel, "manifest.json.pending", dr.as_written(dict(
+            fake.manifest(TAG), certified=True, signed_zip=SIGNED_ZIP, signed_zip_sha256=sha(b"canonical zip"))))
+        self.assertRefused(fake, "certified")
+
+    def test_a_finishing_manifest_whose_package_is_microsofts_own_zip(self):
+        fake = self.returned_with_pending(self.finishing(signed_zip=self.MS_ZIP, signed_zip_sha256=sha(b"ms zip")))
+        self.assertRefused(fake, "signed_zip")
+
+    def test_a_finishing_manifest_for_another_zip_than_this_jobs(self):
+        # The zip is on the release in the bytes the pending manifest
+        # records, but it is not the zip this run checked.
+        fake = self.returned_with_pending(self.finishing(signed_zip_sha256=sha(b"another zip")))
+        fake.add_asset(fake.release(TAG), SIGNED_ZIP, b"another zip")
+        self.assertRefused(fake, "signed_zip_sha256")
+
+    def test_a_pending_manifest_one_value_of_which_only_looks_the_same(self):
+        # 1 for true: the same to Python, another manifest to its readers.
+        fake = self.returned_with_pending(self.finishing(attested=1))
+        fake.add_asset(fake.release(TAG), SIGNED_ZIP, b"canonical zip")
+        self.assertRefused(fake, "attested")
+
+    def test_a_pending_manifest_that_records_fewer_files_than_the_current_one(self):
+        # The current manifest records the EV-signed CAB; the pending one
+        # doesn't any more.
+        fake = self.returned_with_pending(submission_manifest(
+            ms_product_id="7", ms_submission_id="8", ms_state="done", ms_zip_asset=self.MS_ZIP))
+        self.assertRefused(fake, "submission_cab_signed_sha256")
+
+    def test_another_jobs_stopped_manifest_write_is_left_for_that_job(self):
+        # Driver attest was recording the Partner Center ids when it
+        # stopped; this job would write another manifest.
+        fake = Fake()
+        cur = submission_manifest(submission_cab_signed_sha256=sha(b"signed cab"))
+        fake.add_release(TAG, {"manifest.json": cur, CAB: b"signed cab", self.MS_ZIP: b"ms zip",
+                               "manifest.json.pending": dr.as_written(dict(
+                                   cur, ms_product_id="7", ms_submission_id="8", ms_state="created"))})
+        self.assertRefused(fake, "ms_submission_id")
+        self.assertIn("Re-run failed jobs", self.output)
+
+    def test_sign_cabs_stopped_manifest_write_is_not_finished_by_a_rebuild(self):
+        # The rebuild would write an unsigned build's manifest over the
+        # signature sign-cab was recording.
+        fake = Fake()
+        fake.add_release(TAG, {"manifest.json": submission_manifest(), CAB: b"signed cab",
+                               "manifest.json.pending": dr.as_written(submission_manifest(
+                                   submission_cab_signed_sha256=sha(b"signed cab")))}, target=COMMIT)
+        self.assertRefused(fake, "submission_cab_signed_sha256", run=lambda: self.release(fake))
+
+    def test_with_the_manifest_in_place_gone_a_pending_one_is_still_checked(self):
+        # (what the refusal names, what the pending manifest says, the zip on the release)
+        cases = [("certified", dict(certified=True), b"canonical zip"),
+                 ("attested", dict(attested=1), b"canonical zip"),
+                 ("signed_zip_sha256", dict(signed_zip_sha256=sha(b"another zip")), b"another zip"),
+                 ("signed_zip", dict(signed_zip=self.MS_ZIP, signed_zip_sha256=sha(b"ms zip")), b"canonical zip"),
+                 ("ms_zip_asset", dict(ms_zip_asset="another.zip"), b"canonical zip")]
+        for says, kw, zip_data in cases:
+            with self.subTest(says):
+                fake = self.returned_with_pending(self.finishing(**kw))
+                rel = fake.release(TAG)
+                rel["assets"] = [a for a in rel["assets"] if a["name"] != "manifest.json"]
+                fake.add_asset(rel, SIGNED_ZIP, zip_data)
+                fake.add_asset(rel, "another.zip", b"ms zip")
+                self.assertRefused(fake, says)
+
+    def test_a_finishing_manifest_whose_files_are_there_is_put_in_place(self):
+        fake = self.returned_with_pending(self.finishing())
+        fake.add_asset(fake.release(TAG), SIGNED_ZIP, b"canonical zip")
+        self.assertCompleted(fake)
+
+    def test_what_comes_before_the_manifest_is_done_before_a_waiting_one_is_put_in_place(self):
+        # The manifest is this job's last write. Its checksum file, its
+        # bundle and the release notes come first also when the manifest
+        # is already waiting: nothing can add them to a finished release.
+        for deleted in (False, True):
+            with self.subTest(manifest_json_already_deleted=deleted):
+                fake = self.returned_with_pending(self.finishing())
+                rel = fake.release(TAG)
+                fake.add_asset(rel, SIGNED_ZIP, b"canonical zip")
+                if deleted:
+                    rel["assets"] = [a for a in rel["assets"] if a["name"] != "manifest.json"]
+                files = self.assertCompleted(fake, bundle=BUNDLE)
+                self.assertEqual(sorted(files), sorted([CAB, self.MS_ZIP, SIGNED_ZIP, SIGNED_ZIP + ".sha256",
+                                                        self.BUNDLE_NAME, "manifest.json"]))
+                self.assertEqual(files[self.BUNDLE_NAME], BUNDLE)
+                self.assertIn(sha(b"canonical zip"), rel["body"])
+                writes = fake.writes()
+                self.assertEqual(writes[-1][:3], ("api", "--method", "PATCH"), "the manifest is put in place last")
+                self.assertIn(("release", "edit"), [w[:2] for w in writes[:-1]])
+
+    def test_a_stop_while_the_job_completes_its_stopped_write_is_completed_by_the_next_run(self):
+        mine = another_bundle_for(b"canonical zip", SIGNED_ZIP, 2)
+        fake = self.all_but_the_manifest()
+        fake.add_asset(fake.release(TAG), "manifest.json.pending", dr.as_written(self.finishing()))
+        # Stopped while it replaces the earlier attempt's bundle with its own.
+        fake.fail_when(deleting, fake_gh.Stop())
+        with self.assertRaises(fake_gh.Stop):
+            self.record(fake, bundle=mine)
+        self.assertEqual(sorted(n for n in fake.files(TAG) if n.endswith(".pending")),
+                         [self.BUNDLE_NAME + ".pending", "manifest.json.pending"])
+        self.assertIs(fake.manifest(TAG)["attested"], False)
+        self.assertEqual(self.assertCompleted(fake, bundle=mine)[self.BUNDLE_NAME], mine)
+
+    # -- a pending copy of a file a manifest records ---------------------------
     def test_a_pending_twin_of_a_file_only_the_pending_manifest_records(self):
         # The check found Signed.zip in the bytes the pending manifest
         # records; finishing would then have rolled Signed.zip.pending, with
@@ -929,21 +1151,21 @@ class APendingManifestIsPutInPlaceOnlyIfAWriteWouldHaveWrittenIt(Base):
         rel = fake.release(TAG)
         fake.add_asset(rel, SIGNED_ZIP, b"canonical zip")
         fake.add_asset(rel, SIGNED_ZIP + ".pending", b"other bytes")
-        self.assertLeftForAPerson(fake, fake.files(TAG), SIGNED_ZIP)
+        self.assertRefused(fake, SIGNED_ZIP)
 
     def test_a_pending_twin_of_a_file_the_current_manifest_records(self):
         fake = Fake()
         rel = returned_release(fake)
         fake.add_asset(rel, CAB + ".pending", b"another cab")
-        self.assertLeftForAPerson(fake, fake.files(TAG), CAB)
+        self.assertRefused(fake, CAB)
 
     def test_a_pending_twin_of_a_recorded_file_without_a_recorded_sha256(self):
         # The manifest records Microsoft's zip by name only: no copy may
         # replace it.
         fake = Fake()
         rel = returned_release(fake)
-        fake.add_asset(rel, "StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip.pending", b"another zip")
-        self.assertLeftForAPerson(fake, fake.files(TAG), "Microsoft.zip")
+        fake.add_asset(rel, self.MS_ZIP + ".pending", b"another zip")
+        self.assertRefused(fake, "Microsoft.zip")
 
     def test_a_pending_copy_is_not_renamed_over_a_recorded_file_with_other_bytes(self):
         # Even when the copy has the bytes the manifest records: a write of
@@ -952,33 +1174,102 @@ class APendingManifestIsPutInPlaceOnlyIfAWriteWouldHaveWrittenIt(Base):
         rel = returned_release(fake)
         next(a for a in rel["assets"] if a["name"] == CAB)["data"] = b"tampered cab"
         fake.add_asset(rel, CAB + ".pending", b"signed cab")
-        self.assertLeftForAPerson(fake, fake.files(TAG), CAB)
-
-    def test_a_pending_manifest_that_records_fewer_files_than_the_current_one(self):
-        # The current manifest records the EV-signed CAB; the pending one
-        # doesn't any more.
-        fake = Fake()
-        rel = returned_release(fake)
-        fake.add_asset(rel, "manifest.json.pending", submission_manifest(
-            ms_product_id="7", ms_submission_id="8", ms_state="done",
-            ms_zip_asset="StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip"))
-        self.assertLeftForAPerson(fake, fake.files(TAG), CAB)
+        self.assertRefused(fake, CAB)
 
     def test_a_pending_twin_with_the_recorded_bytes_is_finished(self):
         fake = self.returned_with_pending(self.finishing())
         rel = fake.release(TAG)
         fake.add_asset(rel, SIGNED_ZIP + ".pending", b"canonical zip")
-        self.assertEqual(self.record(fake), 0, self.output)
-        files = fake.files(TAG)
-        self.assertEqual(files[SIGNED_ZIP], b"canonical zip")
-        self.assertFalse([n for n in files if n.endswith(".pending")])
-        self.assertIs(fake.manifest(TAG)["attested"], True)
+        self.assertCompleted(fake)
 
-    def test_a_finishing_manifest_whose_files_are_there_is_put_in_place(self):
-        fake = self.returned_with_pending(self.finishing())
-        fake.add_asset(fake.release(TAG), SIGNED_ZIP, b"canonical zip")
-        self.assertEqual(self.record(fake), 0, self.output)
-        self.assertIs(fake.manifest(TAG)["attested"], True)
+    # -- a pending copy of a file no manifest records --------------------------
+    EARLIER_SIDECAR = f"{sha(b'an earlier zip')}  {SIGNED_ZIP}".encode()
+
+    def stopped_while_replacing(self, name, there, **record):
+        """The release as this job leaves it when it stops while replacing
+        `name`. `there`: what the release held besides the returned round
+        when the job started, `name` among them with an earlier attempt's
+        bytes. The new bytes are up as `<name>.pending`, the old ones are
+        still in place."""
+        fake = Fake()
+        rel = returned_release(fake)
+        for asset, data in there.items():
+            fake.add_asset(rel, asset, data)
+        fake.fail_when(deleting, fake_gh.Stop())
+        with self.assertRaises(fake_gh.Stop):
+            self.record(fake, **record)
+        self.assertEqual(fake.files(TAG)[name], there[name])
+        self.assertEqual([n for n in fake.files(TAG) if n.endswith(".pending")], [name + ".pending"])
+        return fake
+
+    def test_a_stopped_upload_of_this_jobs_zip_is_made_again_by_the_re_run(self):
+        fake = self.stopped_while_replacing(SIGNED_ZIP, {SIGNED_ZIP: b"an earlier zip",
+                                                         SIGNED_ZIP + ".sha256": self.EARLIER_SIDECAR})
+        self.assertCompleted(fake)
+
+    def test_a_stopped_upload_of_another_attempts_zip_gives_way_to_this_jobs(self):
+        # All jobs were run again and built another zip: the copy the
+        # stopped attempt left is of no use to anyone, and this job uploads
+        # its own.
+        fake = self.stopped_while_replacing(SIGNED_ZIP, {SIGNED_ZIP: b"an earlier zip"})
+        self.assertEqual(self.record(fake, data=b"a third zip"), 0, self.output)
+        files = fake.files(TAG)
+        self.assertFalse([n for n in files if n.endswith(".pending")])
+        self.assertEqual((files[SIGNED_ZIP], files[SIGNED_ZIP + ".sha256"]),
+                         (b"a third zip", f"{sha(b'a third zip')}  {SIGNED_ZIP}".encode()))
+        self.assertEqual(fake.manifest(TAG), self.finishing(signed_zip_sha256=sha(b"a third zip")))
+
+    def test_a_stopped_upload_of_the_checksum_file_is_made_again_by_the_re_run(self):
+        fake = self.stopped_while_replacing(SIGNED_ZIP + ".sha256", {SIGNED_ZIP: b"canonical zip",
+                                                                     SIGNED_ZIP + ".sha256": self.EARLIER_SIDECAR})
+        self.assertCompleted(fake)
+
+    def test_a_stopped_upload_of_the_bundle_gives_way_to_this_attempts(self):
+        # Every attempt gets a new bundle for the same zip.
+        second, third = (another_bundle_for(b"canonical zip", SIGNED_ZIP, attempt) for attempt in (2, 3))
+        fake = self.stopped_while_replacing(
+            self.BUNDLE_NAME, {SIGNED_ZIP: b"canonical zip", SIGNED_ZIP + ".sha256": self.SIDECAR,
+                               self.BUNDLE_NAME: BUNDLE}, bundle=second)
+        self.assertEqual(fake.files(TAG)[self.BUNDLE_NAME + ".pending"], second)
+        self.assertEqual(self.assertCompleted(fake, bundle=third)[self.BUNDLE_NAME], third)
+
+    def test_a_planted_checksum_file_or_bundle_never_reaches_the_release(self):
+        # Placed as <name>.pending beside what this job had uploaded, with
+        # and without the job's own manifest waiting. The job puts no
+        # pending copy of its files in place: it deletes them and uploads
+        # what it checked itself.
+        mine = another_bundle_for(b"canonical zip", SIGNED_ZIP, 2)
+        planted = {SIGNED_ZIP + ".sha256.pending": f"{'0' * 64}  {SIGNED_ZIP}".encode(),
+                   self.BUNDLE_NAME + ".pending": bundle_for(b"another zip", SIGNED_ZIP)}
+        for with_manifest in (False, True):
+            with self.subTest(with_manifest=with_manifest):
+                fake = self.all_but_the_manifest()
+                rel = fake.release(TAG)
+                for name, data in planted.items():
+                    fake.add_asset(rel, name, data)
+                placed = [f"repos/{REPO}/releases/assets/{a['id']}" for a in rel["assets"] if a["name"] in planted]
+                if with_manifest:
+                    fake.add_asset(rel, "manifest.json.pending", dr.as_written(self.finishing()))
+                files = self.assertCompleted(fake, bundle=mine)
+                self.assertEqual(files[self.BUNDLE_NAME], mine)
+                self.assertFalse(set(files.values()) & set(planted.values()))
+                # Deleted, and at no moment renamed to the name people read.
+                touched = [w[2] for w in fake.writes() if w[0] == "api" and w[3] in placed]
+                self.assertEqual(touched, ["DELETE", "DELETE"])
+
+    def test_a_pending_file_this_job_does_not_upload_is_left(self):
+        cases = {"notes.txt": b"placed by hand",
+                 "notes.txt.sha256": f"{sha(b'placed by hand')}  notes.txt".encode(),
+                 "notes.txt.sigstore.json": bundle_for(b"placed by hand", "notes.txt"),
+                 # This run was given no bundle, so it uploads none.
+                 self.BUNDLE_NAME: BUNDLE}
+        for name, data in cases.items():
+            with self.subTest(name):
+                fake = self.all_but_the_manifest()
+                rel = fake.release(TAG)
+                fake.add_asset(rel, "notes.txt", b"placed by hand")
+                fake.add_asset(rel, name + ".pending", data)
+                self.assertRefused(fake, name + ".pending is not a file this job uploads")
 
 
 class ABrokenFirstManifestBlocksNobody(Base):
@@ -1051,6 +1342,19 @@ class TheRunSummaryKeepsEachManifestWritten(Base):
         fake = Fake()
         returned_release(fake)
         self.assertEqual(self.record(fake), 0, self.output)
+        text = open(self.summary).read()
+        self.assertIn("manifest.json written to driver-v1.1.2.140", text)
+        self.assertIn(json.dumps(fake.manifest(TAG), indent=2), text)
+
+    def test_so_is_one_an_earlier_attempt_had_uploaded(self):
+        fake = Fake()
+        returned_release(fake)
+        fake.fail_when(renaming, fake_gh.Stop())
+        with self.assertRaises(fake_gh.Stop):
+            self.record(fake)
+        self.assertFalse(os.path.exists(self.summary), "the stopped attempt wrote no summary")
+        self.assertEqual(self.record(fake), 0, self.output)
+        self.assertIs(fake.manifest(TAG)["attested"], True)
         text = open(self.summary).read()
         self.assertIn("manifest.json written to driver-v1.1.2.140", text)
         self.assertIn(json.dumps(fake.manifest(TAG), indent=2), text)

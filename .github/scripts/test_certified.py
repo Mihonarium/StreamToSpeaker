@@ -357,6 +357,55 @@ class PublishingTheRelease(unittest.TestCase):
         self.assertEqual(len(fake.writes()), writes)
         self.assertEqual(fake.files(self.TAG), before)
 
+    def bundle(self, attempt):
+        """bundle.json: the provenance bundle one attempt of the job gets
+        for the canonical zip (every attempt gets another). Its bytes."""
+        bundle = json.loads(bundle_for(certified.canonical_zip(self.ms), self.SIGNED))
+        bundle["verificationMaterial"] = {"tlogEntries": [{"logIndex": str(attempt)}]}
+        with open("bundle.json", "wb") as fh:
+            fh.write(json.dumps(bundle).encode())
+        return json.dumps(bundle).encode()
+
+    def test_a_stopped_upload_of_the_bundle_is_made_again_by_the_re_run(self):
+        # One attempt put its bundle up and failed later; the next stopped
+        # while replacing it with its own; the third finds the second's as
+        # <name>.pending and uploads its own.
+        name = self.SIGNED + ".sigstore.json"
+        fake = self.fake(**{name: self.bundle(1)})
+        fake.fail_when(lambda call: call[:3] == ("api", "--method", "DELETE"), fake_gh.Stop())
+        second = self.bundle(2)
+        with self.assertRaises(fake_gh.Stop):
+            self.release(fake, "--bundle", "bundle.json")
+        self.assertEqual(fake.files(self.TAG)[name + ".pending"], second)
+        third = self.bundle(3)
+        self.assertEqual(self.release(fake, "--bundle", "bundle.json"), 0)
+        files = fake.files(self.TAG)
+        self.assertEqual(files[name], third)
+        self.assertFalse([n for n in files if n.endswith(".pending")])
+        self.assertIs(fake.manifest(self.TAG)["certified"], True)
+
+    def test_a_pending_file_this_job_did_not_leave_stops_it(self):
+        # This job writes its manifest in one upload, onto a release that
+        # has none, so it never leaves one half written: not even a pending
+        # manifest that says what this run would write is put in place. And
+        # it never replaces the lab package or Microsoft's zip, so it leaves
+        # no pending copy of them either.
+        done = self.fake()
+        self.assertEqual(self.release(done), 0)
+        published = done.files(self.TAG)
+        manifest = published.pop("manifest.json")
+        ms_name = "StreamToSpeaker-Driver-1.1.0.209-Microsoft.zip"
+        self.assertEqual(published[ms_name], self.ms)
+        for name, data in (("manifest.json", manifest), ("notes.txt", b"placed by hand"),
+                           (self.LAB, b"another lab package"), (ms_name, b"another zip")):
+            with self.subTest(name):
+                fake = fake_gh.FakeReleases(self.REPO)
+                fake.add_release(self.TAG, {**published, name + ".pending": data}, target=self.COMMIT)
+                before = fake.files(self.TAG)
+                self.assertEqual(self.release(fake), 1)
+                self.assertEqual(fake.files(self.TAG), before)
+                self.assertEqual(fake.writes(), [])
+
     def test_an_attestation_submission_is_not_turned_into_a_certified_release(self):
         fake = self.fake(**{"manifest.json": {"schema": 1, "driver_version": "1.1.0.209", "attested": False,
                                               "submission_cab": "StreamToSpeaker-Driver-1.1.0.209-Submission.cab",

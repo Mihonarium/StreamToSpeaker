@@ -1,4 +1,5 @@
 import hashlib
+import io
 import itertools
 import json
 import os
@@ -430,6 +431,199 @@ class TwoRunsOnOneRelease(InTemporaryDirectory):
         tag, rel2, man2 = attest.Release.resolve(REPO, "driver-v1.1.2.140", run=fake)
         self.assertEqual(attest.next_action(man2), "upload")
         self.assertEqual(man2["ms_submission_id"], "222")
+
+
+ROUND = "driver-v1.1.2.140"
+ROUND_ZIP = "StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip"
+# What Partner Center answers at every step of these runs: the upload URL
+# and the finished submission with its signed package.
+ANY_STEP = {"commitStatus": "commitComplete",
+            "workflowStatus": {"currentStep": "finalizeIngestion", "state": "completed"},
+            "downloads": {"items": [{"type": "initialPackage", "url": "https://sas/up"},
+                                    {"type": "signedPackage", "url": "https://sas/dl"}]}}
+
+
+# fail_when predicates: the two calls that follow the upload of
+# manifest.json.pending when the manifest is replaced.
+def deleting(call):
+    return call[:3] == ("api", "--method", "DELETE") and "/releases/assets/" in call[3]
+
+
+def renaming(call):
+    return call[:3] == ("api", "--method", "PATCH") and "/releases/assets/" in call[3]
+
+
+def nth(predicate, n):
+    """A fail_when predicate: the n-th call (from 0) that `predicate` matches."""
+    seen = itertools.count()
+    return lambda call: predicate(call) and next(seen) == n
+
+
+def signed_round(**kw):
+    """A fake with an attestation round whose CAB is EV-signed; `kw`: what
+    its manifest records beyond that."""
+    fake = fake_gh.FakeReleases(REPO, error=driver_release.ReleaseError)
+    m = dict(unsigned("1.1.2.140"), submission_cab_signed_sha256=CAB_SHA, **kw)
+    fake.add_release(ROUND, {"manifest.json": m, m["submission_cab"]: b"CABBYTES"})
+    return fake
+
+
+def reconcile_round(fake, api):
+    """One Driver attest run on ROUND."""
+    tag, rel, m = attest.Release.resolve(REPO, ROUND, run=fake)
+    return attest.reconcile(api, rel, m, tag, now=lambda: 0, sleep=lambda s: None)
+
+
+class AStoppedSaveIsFinishedByTheNextRun(InTemporaryDirectory):
+    """Wherever a save of the manifest stops, the next Driver attest run
+    finishes that write first and goes on from what it recorded."""
+
+    def test_every_save_stopped_at_either_point(self):
+        for save, state in enumerate(("created", "uploaded", "committed", "done")):
+            for stopped_at in (deleting, renaming):
+                with self.subTest(state=state, stopped_at=stopped_at.__name__):
+                    fake = signed_round()
+                    fake.fail_when(nth(stopped_at, save), fake_gh.Stop())
+                    with self.assertRaises(fake_gh.Stop):
+                        reconcile_round(fake, FakeApi([ANY_STEP] * 4))
+                    self.assertEqual(json.loads(fake.files(ROUND)["manifest.json.pending"])["ms_state"], state)
+                    again = FakeApi([ANY_STEP] * 4)
+                    self.assertEqual(reconcile_round(fake, again), "finalize")
+                    self.assertNotIn("create_product", [c[0] for c in again.calls])
+                    final = fake.manifest(ROUND)
+                    self.assertEqual((final["ms_product_id"], final["ms_submission_id"], final["ms_state"],
+                                      final["ms_zip_asset"]), ("111", "222", "done", ROUND_ZIP))
+                    self.assertNotIn("manifest.json.pending", fake.files(ROUND))
+
+    def test_the_first_save_on_a_manifest_without_partner_center_fields(self):
+        # Driver submission's manifest names no ms_* field at all; the
+        # first save adds them at its end.
+        for stopped_at in (deleting, renaming):
+            with self.subTest(stopped_at=stopped_at.__name__):
+                fake = fake_gh.FakeReleases(REPO, error=driver_release.ReleaseError)
+                m = {k: v for k, v in unsigned("1.1.2.140").items() if not k.startswith("ms_")}
+                m["submission_cab_signed_sha256"] = CAB_SHA
+                fake.add_release(ROUND, {"manifest.json": m, m["submission_cab"]: b"CABBYTES"})
+                fake.fail_when(stopped_at, fake_gh.Stop())
+                with self.assertRaises(fake_gh.Stop):
+                    reconcile_round(fake, FakeApi([ANY_STEP] * 4))
+                again = FakeApi([ANY_STEP] * 4)
+                self.assertEqual(reconcile_round(fake, again), "finalize")
+                self.assertNotIn("create_product", [c[0] for c in again.calls])
+                self.assertEqual(list(fake.manifest(ROUND))[len(m):],
+                                 ["ms_product_id", "ms_submission_id", "ms_state", "ms_zip_asset"])
+
+    def test_a_stopped_save_of_a_failure(self):
+        failed = {"commitStatus": "commitFailed",
+                  "workflowStatus": {"currentStep": "driverValidation", "state": "failed", "messages": ["bad inf"]}}
+        for stopped_at in (deleting, renaming):
+            with self.subTest(stopped_at=stopped_at.__name__):
+                fake = signed_round(ms_product_id="111", ms_submission_id="222", ms_state="committed")
+                fake.fail_when(stopped_at, fake_gh.Stop())
+                with self.assertRaises(fake_gh.Stop), unittest.mock.patch("sys.stdout", io.StringIO()), \
+                        unittest.mock.patch.object(attest, "summary", lambda text: None):
+                    reconcile_round(fake, FakeApi([failed]))
+                self.assertEqual(reconcile_round(fake, FakeApi([])), "failed")
+                self.assertEqual(fake.manifest(ROUND)["ms_state"], "failed")
+                self.assertNotIn("manifest.json.pending", fake.files(ROUND))
+
+
+class APendingManifestThatIsNotTheReconcilersNextSave(InTemporaryDirectory):
+    """Driver attest finishes a stopped save of its own. Another job's
+    stopped write, or a file somebody placed, stops it, with nothing
+    changed."""
+    SIGNED = "StreamToSpeaker-Driver-1.1.2.140-Signed.zip"
+
+    def assertLeft(self, fake, pending):
+        """`pending`: the manifest waiting as manifest.json.pending, laid
+        out as these workflows write one."""
+        fake.add_asset(fake.release(ROUND), "manifest.json.pending", driver_release.as_written(pending))
+        before, writes = fake.files(ROUND), len(fake.writes())
+        with self.assertRaisesRegex(driver_release.ReleaseError, "manifest.json.pending") as refusal:
+            attest.Release.resolve(REPO, ROUND, run=fake)
+        self.assertIn("nothing was changed", str(refusal.exception))
+        self.assertEqual(fake.files(ROUND), before)
+        self.assertEqual(len(fake.writes()), writes)
+
+    def returned(self):
+        fake = signed_round(ms_product_id="111", ms_submission_id="222", ms_state="done", ms_zip_asset=ROUND_ZIP)
+        rel = fake.release(ROUND)
+        fake.add_asset(rel, ROUND_ZIP, b"ms zip")
+        fake.add_asset(rel, self.SIGNED, b"canonical zip")
+        return fake, dict(fake.manifest(ROUND), signed_zip=self.SIGNED,
+                          signed_zip_sha256=hashlib.sha256(b"canonical zip").hexdigest())
+
+    def test_the_manifest_that_marks_the_release_attested_is_left_for_the_job_that_checked_the_package(self):
+        fake, with_zip = self.returned()
+        self.assertLeft(fake, dict(with_zip, attested=True))
+
+    def test_a_manifest_that_says_certified(self):
+        fake, with_zip = self.returned()
+        self.assertLeft(fake, dict(with_zip, certified=True))
+
+    def test_sign_cabs_stopped_write(self):
+        fake = fake_gh.FakeReleases(REPO, error=driver_release.ReleaseError)
+        m = unsigned("1.1.2.140")
+        fake.add_release(ROUND, {"manifest.json": m, m["submission_cab"]: b"CABBYTES"})
+        self.assertLeft(fake, dict(m, submission_cab_signed_sha256=CAB_SHA))
+
+    def test_a_save_that_is_more_than_the_next_step(self):
+        # From "created" the next save says "uploaded" and nothing else.
+        cases = {"two steps at once": dict(ms_state="committed"),
+                 "another submission": dict(ms_state="uploaded", ms_submission_id="999"),
+                 "another driver source": dict(ms_state="uploaded", source_hash="9" * 64)}
+        for what, kw in cases.items():
+            with self.subTest(what):
+                fake = signed_round(ms_product_id="111", ms_submission_id="222", ms_state="created")
+                self.assertLeft(fake, dict(fake.manifest(ROUND), **kw))
+
+    def test_ids_that_are_not_ids(self):
+        for ids in (dict(ms_product_id=111, ms_submission_id=222), dict(ms_product_id="111", ms_submission_id=""),
+                    dict(ms_product_id="111", ms_submission_id="2; x")):
+            with self.subTest(ids=ids):
+                fake = signed_round()
+                self.assertLeft(fake, dict(fake.manifest(ROUND), ms_state="created", **ids))
+
+    def test_with_the_manifest_in_place_gone_a_pending_one_is_still_checked(self):
+        cases = {"a state Driver attest never saves": dict(ms_state="created", attested=True),
+                 "ids that are not ids": dict(ms_state="created", ms_submission_id="2; x"),
+                 "a state without the ids it needs": dict(ms_state="uploaded", ms_submission_id=None),
+                 "another name for the zip": dict(ms_state="done", ms_zip_asset="another.zip"),
+                 "no state": dict(ms_state=None)}
+        for what, kw in cases.items():
+            with self.subTest(what):
+                fake = signed_round()
+                rel = fake.release(ROUND)
+                pending = {**fake.manifest(ROUND), "ms_product_id": "111", "ms_submission_id": "222", **kw}
+                rel["assets"] = [a for a in rel["assets"] if a["name"] != "manifest.json"]
+                fake.add_asset(rel, "another.zip", b"ms zip")
+                self.assertLeft(fake, pending)
+
+
+class TheReconcilersOwnZip(InTemporaryDirectory):
+    def test_a_stopped_upload_of_microsofts_zip_is_made_again(self):
+        # An earlier attempt had attached a zip and stopped before it
+        # recorded it; this one, replacing it with what Partner Center
+        # gave it, stops too. The next run uploads the zip itself.
+        fake = signed_round(ms_product_id="111", ms_submission_id="222", ms_state="committed")
+        fake.add_asset(fake.release(ROUND), ROUND_ZIP, b"an earlier download")
+        fake.fail_when(deleting, fake_gh.Stop())
+        with self.assertRaises(fake_gh.Stop):
+            reconcile_round(fake, FakeApi([ANY_STEP]))
+        self.assertEqual(fake.files(ROUND)[ROUND_ZIP + ".pending"], b"ZIPBYTES")
+        self.assertEqual(reconcile_round(fake, FakeApi([ANY_STEP])), "finalize")
+        files = fake.files(ROUND)
+        self.assertEqual(files[ROUND_ZIP], b"ZIPBYTES")
+        self.assertNotIn(ROUND_ZIP + ".pending", files)
+        self.assertEqual((fake.manifest(ROUND)["ms_state"], fake.manifest(ROUND)["ms_zip_asset"]), ("done", ROUND_ZIP))
+
+    def test_a_pending_file_the_reconciler_does_not_upload_is_left(self):
+        fake = signed_round()
+        fake.add_asset(fake.release(ROUND), "notes.txt.pending", b"placed by hand")
+        before = fake.files(ROUND)
+        with self.assertRaisesRegex(driver_release.ReleaseError, "notes.txt.pending is not a file this job uploads"):
+            attest.Release.resolve(REPO, ROUND, run=fake)
+        self.assertEqual(fake.files(ROUND), before)
 
 
 class SavingTheManifest(InTemporaryDirectory):

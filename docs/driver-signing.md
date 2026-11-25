@@ -145,13 +145,22 @@ Every job of these workflows that writes a driver release does it through
    replacement goes up as `<name>.pending`; then the old asset is deleted
    and the new one renamed. A file already there with the same bytes is
    not uploaded again. A run that stops half way leaves `<name>.pending`
-   (with or without `<name>`): the next job that writes the release first
-   finishes it, by renaming a completely uploaded pending file (deleting
-   `<name>` first when it is still there), or deleting one whose upload
-   never completed, with `manifest.json` last. It does so only when the
-   release, as those renames would leave it, is one a write of these
-   workflows would have made (see Troubleshooting); otherwise it changes
-   nothing and stops. Nothing is renamed over a finished `manifest.json`.
+   (with or without `<name>`). Before its first write, a job finishes
+   such a file only as its own stopped write:
+   - `manifest.json.pending` is put in place only when it is, byte for
+     byte, the manifest that job writes next, and only after everything
+     the job does before it writes its manifest. (Driver attest can't
+     know the ids Partner Center gave it, so there any two ids pass. When
+     `manifest.json` is already deleted, the job works out from the
+     pending manifest what it would have written over, and can't compare
+     what only the deleted one held.)
+   - A pending copy of a file the job uploads is never put in place: the
+     job deletes it and uploads the file itself.
+   - A pending copy of a file the manifest records is put in place only
+     in exactly the recorded bytes.
+
+   At any other pending file the job stops and changes nothing (see
+   Troubleshooting). Nothing is renamed over a finished `manifest.json`.
 5. `manifest.json` is written last, in a call of its own, and only when
    every file it records is on the release.
 
@@ -329,11 +338,12 @@ ahead of it is done; the group cancels nothing waiting there unless 100
 jobs already wait. A newer driver push to main does cancel the older
 Driver submission run as a whole (its own run-level group), with its
 `record` or `record-signed` job, waiting or running; the newer run's own
-`record` then writes its release, and whatever the older run left half
-done on its release is finished by the next job that writes that
-release. Don't attach a Microsoft zip by hand (the manual fallback)
-while `Driver attest` runs for the same release: its next write would
-find the release changed and stop.
+`record` then writes its release. A job cancelled in the middle of a
+write can leave a `<name>.pending` file on the older run's release; it
+stays there until that job is run again (see Troubleshooting, "A release
+shows an asset named `<name>.pending`"). Don't attach a Microsoft zip by
+hand (the manual fallback) while `Driver attest` runs for the same
+release: its next write would find the release changed and stop.
 
 ## Flow B — every main push (no manual steps)
 
@@ -786,26 +796,31 @@ only cleaned (`repro_compare.py` `clean_text`) or between
   dispatch with another `driver_build`.
 - **A release shows an asset named `<name>.pending`** — a run stopped while
   it replaced `<name>` (or, rarely, a write from outside the writers'
-  group met one of them; see "How the chain writes driver releases"). Re-run
-  the job that was writing the release: its first step finishes the
-  replacement, and when that was the last write of Driver attested or
-  Driver certified, the re-run ends there ("an earlier run's last write
-  was interrupted and is finished now"). The renames happen only when the
-  release they would leave is one a write of these workflows would have
-  made:
-  - a pending manifest is valid JSON and still records every file
-    `manifest.json` records, with the same SHA-256;
-  - every file the manifest that ends up in place records is there after
-    the renames, in the bytes it records;
-  - a pending copy of a recorded file has exactly those bytes and is
-    either the only copy (it is renamed) or the same bytes as the file (it
-    is deleted). Any other copy, including one of a file recorded by name
-    only, would replace a recorded file, which no write does.
+  group met one of them; see "How the chain writes driver releases"). Open
+  the run that stopped and choose "Re-run failed jobs": the job that was
+  writing the release (`record` or `record-signed` of Driver submission,
+  `reconcile` of Driver attest, `record` of Driver attested, `publish` of
+  Driver certified) first finishes its own write, then goes on. Run
+  again, that job
+  - puts `manifest.json.pending` in place when it is, byte for byte, the
+    manifest it writes next, after the files and the release notes it
+    writes before its manifest;
+  - deletes a pending copy of a file it uploads (the EV-signed CAB,
+    Microsoft's zip, the canonical `…-Signed.zip`, a `.sha256` file, a
+    provenance bundle) and uploads the file itself;
+  - puts a pending copy of a file the manifest records in place only in
+    exactly the recorded bytes.
 
-  Otherwise the job stops with "holds .pending files that a write of these
-  workflows would not have left (…); nothing was changed", naming what is
-  wrong. Look at the pending files and the release before you change
-  anything.
+  No other job finishes the write. Any job that meets a pending file
+  that is not its own stopped write stops with "holds a .pending file
+  that this job does not finish: …; nothing was changed", naming the file
+  and what is wrong with it. That includes the same job with other
+  inputs: a new Driver attested run, or "Re-run all jobs" on the one that
+  stopped, makes the canonical zip again, and when its bytes differ from
+  the stopped attempt's, the pending manifest is not the one the new
+  attempt writes. Driver attest is the exception: its save depends on
+  nothing but the release, so any later Driver attest run for the tag
+  finishes it.
 
   Until a pending manifest without `manifest.json` is finished, the
   installers' driver lookup, the certified guard and the fallback check

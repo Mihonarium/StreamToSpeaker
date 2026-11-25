@@ -21,10 +21,14 @@ and the write itself (one API call) GitHub offers no lock; the workflows
 keep their writers in one concurrency group so that only an actor outside
 them can act in that moment.
 
-A run that stops half way leaves `<name>.pending`. `Release.finish_interrupted`,
-which writers call first, rolls a completely uploaded one forward (deletes
-`<name>` if it is there, renames the pending one: the writer had decided)
-and deletes one whose upload never completed (it holds nothing usable).
+A run that stops half way leaves `<name>.pending`. `Release.finish_interrupted`
+rolls a completely uploaded one forward (deletes `<name>` if it is there,
+renames the pending one) or, where its caller says so, deletes it, and
+deletes one whose upload never completed (it holds nothing usable). Which
+of these a job may do to a driver release is decided by
+driver_release.DriverRelease.begin, which every job that writes one calls
+before its first write; the draft of an app release is finished as it
+stands and checked as a whole before it is published (release_draft.py).
 `put` never deletes a pending asset: one it meets belongs to another writer.
 
 Temporary files live in folders that are removed when each step ends.
@@ -206,7 +210,7 @@ class Release:
             except Exception as e:  # retried; the last failure is raised
                 last = e
         raise ReleaseError(f"{self.tag}: {a.get('name')} is uploaded but could not be renamed to {name} "
-                           f"({clean(last)}); the next run that writes this release finishes the rename")
+                           f"({clean(last)}); run this job again (\"Re-run failed jobs\"): it completes the replacement")
 
     def _upload(self, data, name):
         with tempfile.TemporaryDirectory(prefix="release-assets-", dir=self.workdir) as tmp:
@@ -237,25 +241,27 @@ class Release:
                                "writing it; stopped")
         return now
 
-    def finish_interrupted(self, drop=(), last=()):
+    def finish_interrupted(self, drop=None, only=None):
         """Finish replacements a stopped run left half done (see the module
         docstring): a complete `<name>.pending` is rolled forward, a broken
-        one deleted. For names in `drop` the pending upload is deleted
-        instead (the caller found `<name>` already holds those bytes);
-        names in `last` are finished after all others. A caller that must
-        refuse some states checks them before calling this."""
+        one deleted. `drop` ({name: why}): the complete pending uploads to
+        delete instead; `only`: the names whose pending uploads are touched
+        at all (default: every one). A caller that must refuse some states
+        decides that before calling this (driver_release.DriverRelease.begin
+        does)."""
         changed = []
+        drop = drop or {}
         known = self.check_unchanged("finishing an interrupted write")
-        pendings = [a for a in self.assets() if (a.get("name") or "").endswith(PENDING)]
-        pendings.sort(key=lambda a: a["name"][:-len(PENDING)] in last)
-        for a in pendings:
+        for a in [a for a in self.assets() if (a.get("name") or "").endswith(PENDING)]:
             name = a["name"]
             final = name[:-len(PENDING)]
+            if only is not None and final not in only:
+                continue
             if a.get("state") != "uploaded" or final in drop:
                 self._delete_asset(a)
                 known = self._after(known, removed=a["id"], doing=f"removing {name}")
                 changed.append(f"removed {name}, " + ("an upload that never completed" if a.get("state") != "uploaded"
-                                                     else f"a second copy of what {final} holds"))
+                                                     else drop[final]))
                 continue
             old = self.asset(final)
             if old:
@@ -274,7 +280,8 @@ class Release:
         known = self.check_unchanged(f"writing {name}")
         if self.asset(name + PENDING):
             raise ReleaseError(f"{self.tag} holds {name + PENDING}: another run is replacing {name}, or one "
-                               "stopped half way (the next run's first step finishes it); not writing it")
+                               "stopped half way (the job that stopped clears that away when it runs again); "
+                               "not writing it")
         old = self.asset(name)
         if old and old.get("state") == "uploaded" and self.holds(name, data):
             return "unchanged"

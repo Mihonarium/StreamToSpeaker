@@ -68,8 +68,9 @@ on:
 # A newer driver push obsoletes an in-flight submission build of the same
 # ref (a dispatch from a branch, which writes nothing, doesn't cancel
 # main's run). A run cancelled while it writes a release leaves at most a
-# <name>.pending asset, which the next writer finishes. Completed stale
-# prereleases are handled by the cleanup step instead. NB a cancelled
+# <name>.pending asset, which its job finishes when it is run again and
+# no other job touches (docs/driver-signing.md, Troubleshooting). Completed
+# stale prereleases are handled by the cleanup step instead. NB a cancelled
 # sign-cab job can leave a signing-repo run Waiting — reject it there (the
 # digest in its run name identifies it).
 concurrency:

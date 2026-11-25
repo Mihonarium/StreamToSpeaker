@@ -363,9 +363,15 @@ def publish_release(release, manifest, files, notes, bundle=None):
     bundle on `release` (a driver_release.DriverRelease), edit its notes,
     and write manifest.json last. Microsoft's zip and the lab package are
     what this run checked: when the release holds them already they must
-    be those bytes, and they are not uploaded again."""
-    release.begin()
+    be those bytes, and they are not uploaded again. A stopped replacement
+    of a file this job replaces (the Signed.zip, a .sha256, the bundle) is
+    made again. This job leaves no manifest half written (a certified
+    release's is one upload, onto a release that has none) and never
+    replaces one of the two inputs, so a pending copy of those stops it."""
     inputs = (manifest["lab_zip"], manifest["ms_zip_asset"])
+    sidecars = [f"{name}.sha256" for name in files]
+    bundle_name = f"{manifest['signed_zip']}.sigstore.json"
+    release.begin(files=[n for n in files if n not in inputs] + sidecars + ([bundle_name] if bundle else []))
     for name, data in files.items():
         if name in inputs and release.rel.asset(name):
             release.require(name, data)
@@ -374,7 +380,7 @@ def publish_release(release, manifest, files, notes, bundle=None):
     for name, data in files.items():
         release.put(f"{hashlib.sha256(data).hexdigest()}  {name}".encode("ascii"), f"{name}.sha256")
     if bundle:
-        release.put_file(bundle, f"{manifest['signed_zip']}.sigstore.json")
+        release.put_file(bundle, bundle_name)
     release.edit(f"Driver {manifest['driver_version']} — WHQL-certified", notes)
     release.write_manifest(manifest)
 
@@ -576,7 +582,8 @@ def cmd_release(a):
     tag = a.tag or f"driver-v{a.version}"
     release = driver_release.DriverRelease(a.repo, tag)
     if release.view is not None:
-        # A stopped run may have left its manifest as manifest.json.pending.
+        # manifest.json.pending and no manifest.json: another job's stopped
+        # write, which this one does not finish; it stops here.
         release.begin_if_interrupted()
     problem = driver_release.certified_problem(tag, release.manifest, m)
     if problem:

@@ -20,10 +20,23 @@ rule under its own name:
    other bytes.
 4. Nothing is deleted before its replacement is completely uploaded, and
    a file already there with the same bytes is not uploaded again
-   (release_assets.py). A writer first finishes what a stopped one left
-   half done, but only when the release, as those renames would leave
-   it, is one a write of these workflows would have made; a
-   manifest.json.pending is never read as the manifest.
+   (release_assets.py). A job that stops half way leaves <name>.pending.
+   Before its first write, a job finishes such a file only as its own
+   stopped write, and stops, changing nothing, at any other
+   (DriverRelease.begin):
+   - manifest.json.pending is put in place only when it is, byte for
+     byte, the manifest this job writes next, and only after everything
+     the job does before it writes its manifest. Where the job can't
+     know a value in advance (the ids Partner Center gives Driver
+     attest), any value of that form passes. With manifest.json already
+     deleted, the job works out from the pending manifest what it would
+     have written over; what only the deleted one held can't be compared.
+   - A pending copy of a file this job uploads is never put in place: it
+     is deleted, and the job uploads the file itself.
+   - A pending copy of a file a manifest records is put in place only in
+     exactly the recorded bytes (or deleted, beside the file with those
+     bytes).
+   A manifest.json.pending is never read as the manifest.
 5. manifest.json is written last, in a call of its own, and only when
    every file it records is on the release.
 
@@ -280,6 +293,60 @@ def keep_reason(view, m):
 
 
 # ---------------------------------------------------------------------------
+# Whose stopped write a manifest.json.pending is (rule 4)
+# ---------------------------------------------------------------------------
+def as_written(m):
+    """The bytes write_manifest uploads for the manifest `m`."""
+    return (json.dumps(m, indent=2) + "\n").encode("ascii")
+
+
+def differences(new, want):
+    """The fields, sorted, in which the manifest `new` is not `want`.
+    Values are compared as write_manifest writes them (1 is not true, a
+    missing field is not null); a compiled pattern in `want` stands for any
+    string it matches in full."""
+    def same(key):
+        if key not in new or key not in want:
+            return False
+        if isinstance(want[key], re.Pattern):
+            return isinstance(new[key], str) and bool(want[key].fullmatch(new[key]))
+        return json.dumps(new[key]) == json.dumps(want[key])
+    return sorted(k for k in set(new) | set(want) if not same(k))
+
+
+def not_this_write(new, want):
+    """Why the pending manifest `new` is not the manifest `want` that a job
+    writes next, or None: then as_written(new) is as_written(want), with
+    new's own value where `want` holds a pattern."""
+    fields = differences(new, want)
+    if fields:
+        shown = ", ".join(clean(f, 60) for f in fields[:8])
+        more = f" and {len(fields) - 8} more fields" if len(fields) > 8 else ""
+        return f"it differs from the manifest this job writes next in {shown}{more}"
+    if list(new) != list(want):
+        return "its fields are not in the order this job writes them in"
+    return None
+
+
+def own_write(judge, sets, before):
+    """`mine` for DriverRelease.begin, for a job that writes the fields
+    `sets` over a manifest that `judge` lets it write (judge(m): why not,
+    or None). With manifest.json already deleted there is nothing left to
+    write over: the pending manifest is then judged as it stood before this
+    job's write, with `before` in place of the fields the job sets. What
+    only the deleted manifest held can't be compared with anything."""
+    def mine(cur, new):
+        gone = cur is None
+        if gone:
+            cur = dict(new, **before)
+        problem = judge(cur)
+        if problem:
+            return f"there is no manifest.json, and going by the pending one, {problem}" if gone else problem
+        return not_this_write(new, dict(cur, **sets))
+    return mine
+
+
+# ---------------------------------------------------------------------------
 # One driver release
 # ---------------------------------------------------------------------------
 class DriverRelease:
@@ -346,27 +413,45 @@ class DriverRelease:
         if problem:
             raise ReleaseError(f"{problem}; not {doing}")
 
-    def begin(self):
-        """Before the first write: finish what a stopped writer left half
-        done. A complete `<name>.pending` is rolled forward (a manifest.json
-        one whatever it says, last), a broken one deleted; this completes
-        writes an earlier run had decided. It happens only when the
-        release, as these renames would leave it, is one a write of these
-        workflows would have made (_finish_plan); otherwise nothing is
-        changed and a person has to look. A finished release is not
-        touched at all."""
+    def begin(self, mine=None, files=(), before_manifest=None):
+        """Before a job's first write: complete a write of its own that
+        stopped half way, and stop at anything else that is pending
+        (rule 4; _finish_plan decides, before anything is changed).
+
+          mine(cur, new): why the manifest.json.pending `new` is not the
+              manifest this job writes next over the manifest in place
+              `cur` (None when manifest.json is already deleted), or None
+              when it is. A job that never replaces a manifest gives none,
+              and then no pending manifest is its own.
+          files: the names of the files this job uploads and replaces when
+              they are there with other bytes (besides manifest.json);
+              only of these can it have left a pending copy.
+          before_manifest(new): called just before a pending manifest is
+              put in place, for what the job does before it writes its
+              manifest (the manifest is the last write).
+
+        A finished release is not touched at all."""
         if not self.rel:
             raise ReleaseError(f"there is no release {self.tag}")
         if finished(self._manifest):
             return []
         self._same_release("finishing an interrupted write")
-        problem, drop = self._finish_plan()
+        problem, drop, waiting = self._finish_plan(mine, set(files))
         if problem:
             raise ReleaseError(
-                f"{self.tag} holds .pending files that a write of these workflows would not have left ({problem}); "
-                "nothing was changed. A person has to look at it (docs/driver-signing.md, \"A release shows an asset "
-                "named <name>.pending\")")
-        healed = self.rel.finish_interrupted(drop=drop, last={MANIFEST})
+                f"{self.tag} holds a .pending file that this job does not finish: {problem}; nothing was changed. A "
+                "job finishes only its own stopped write. If a run of these workflows stopped while it wrote this "
+                "release, open that run and choose \"Re-run failed jobs\"; otherwise see docs/driver-signing.md, "
+                "\"A release shows an asset named <name>.pending\"")
+        others = {a["name"][:-len(PENDING)] for a in self.rel.assets() if (a.get("name") or "").endswith(PENDING)}
+        if waiting is not None:
+            others.discard(MANIFEST)
+        healed = self.rel.finish_interrupted(drop=drop, only=others)
+        if waiting is not None:
+            if before_manifest:
+                before_manifest(waiting)
+            healed += self.rel.finish_interrupted(only={MANIFEST})
+            self._summarize(as_written(waiting))
         for line in healed:
             print(f"{self.tag}: {line}")
         if healed:
@@ -374,63 +459,74 @@ class DriverRelease:
         self.healed += healed
         return healed
 
-    def _finish_plan(self):
-        """(problem or None, names whose pending copy is dropped), checked
-        against the release as finishing the interrupted writes would leave
-        it, before anything is written:
-          - a complete manifest.json.pending is a JSON object that still
-            records every file manifest.json records, with the same SHA-256;
-          - every file the manifest that ends up in place records is there
-            after the renames, completely uploaded, in the bytes it records;
-          - a pending copy of a recorded file has exactly those bytes and
-            is either the only copy (it is renamed) or the same bytes as
-            the file (it is deleted), so none is left beside the file. Any
-            other copy would replace a recorded file, which a write of
-            these workflows never does, and the release is left for a
-            person."""
+    def _finish_plan(self, mine, files):
+        """(problem or None, {name: why its pending copy is deleted}, the
+        pending manifest to put in place or None). Nothing is written here.
+        For each completely uploaded `<name>.pending`:
+          - manifest.json.pending is put in place when it is laid out as
+            write_manifest lays a manifest out and `mine` finds it to be the
+            manifest this job writes next, and every file it records is on
+            the release, completely uploaded, in the bytes it records;
+          - a pending copy of a file a manifest records (the one in place,
+            or that pending one) must have exactly the recorded bytes, and
+            is renamed when it is the only copy, deleted when the file is
+            there with the same bytes. Any other copy would replace a
+            recorded file, which no job does;
+          - a pending copy of one of `files` that no manifest records is
+            deleted: the job uploads that file itself, and nothing reads a
+            pending copy;
+          - any other pending file is a problem.
+        (A pending upload that never completed holds nothing and is
+        deleted without being looked at.)"""
         rel = self.rel
+        nothing = ({}, None)
         pending = {a["name"][:-len(PENDING)]: a for a in rel.assets()
                    if (a.get("name") or "").endswith(PENDING) and a.get("state") == "uploaded"}
         if not pending:
-            return None, set()
-        current = recorded_files(self._manifest)
-        final = self._manifest
+            return (None,) + nothing
+        waiting = None
         if MANIFEST in pending:
+            data = rel.download(MANIFEST + PENDING)
             try:
-                final = json.loads(rel.download(MANIFEST + PENDING).decode("utf-8-sig"))
+                waiting = json.loads(data.decode("utf-8-sig"))
             except (ValueError, UnicodeDecodeError):
-                return "manifest.json.pending is not valid JSON", set()
-            if not isinstance(final, dict):
-                return "manifest.json.pending is not a JSON object", set()
-            new = recorded_files(final)
-            for name, digest in current.items():
-                if name not in new:
-                    return f"manifest.json.pending no longer records {clean(name)}, which manifest.json records", set()
-                if digest and str(new[name] or "").lower() != str(digest).lower():
-                    return f"manifest.json.pending records {clean(name)} with another sha256", set()
-        recorded = dict(current, **recorded_files(final))
-        drop = set()
+                return ("manifest.json.pending is not valid JSON",) + nothing
+            if not isinstance(waiting, dict):
+                return ("manifest.json.pending is not a JSON object",) + nothing
+            if data != as_written(waiting):
+                return ("manifest.json.pending is not laid out the way these workflows write a manifest",) + nothing
+            reason = mine(self.manifest, copy.deepcopy(waiting)) if mine else \
+                "this job never replaces a manifest, so it leaves none half written"
+            if reason:
+                return (f"manifest.json.pending is not this job's stopped write: {reason}",) + nothing
+        recorded = dict(recorded_files(self._manifest), **recorded_files(waiting))
+        drop = {}
         for name, digest in recorded.items():
             source = name + PENDING if name in pending else name
             if not rel.complete(source):
-                return f"the manifest would record {clean(name)}, which the release does not hold", set()
+                return (f"the manifest would record {clean(name)}, which the release does not hold",) + nothing
             if name in pending and not digest:
-                return f"{clean(name)}.pending would replace {clean(name)}, which the manifest records", set()
+                return (f"{clean(name)}.pending would replace {clean(name)}, which the manifest records",) + nothing
             after = sha256(rel.download(source))
             if digest and after != str(digest).lower():
                 return (f"{clean(source)} does not have the sha256 {clean(digest)} the manifest records for "
-                        f"{clean(name)}"), set()
+                        f"{clean(name)}",) + nothing
             if name in pending and rel.complete(name):
                 if sha256(rel.download(name)) != after:
-                    return f"{clean(name)}.pending would replace {clean(name)}, which the manifest records", set()
-                drop.add(name)
-        return None, drop
+                    return (f"{clean(name)}.pending would replace {clean(name)}, which the manifest records",) + nothing
+                drop[name] = f"a second copy of what {name} holds"
+        for name in sorted(set(pending) - set(recorded) - {MANIFEST}):
+            if name not in files:
+                return (f"{clean(name)}.pending is not a file this job uploads",) + nothing
+            drop[name] = f"a stopped upload of {name}, which this job uploads itself"
+        return None, drop, waiting
 
-    def begin_if_interrupted(self):
-        """Finish an interrupted manifest write before what the release
-        records is judged (nothing else is touched)."""
+    def begin_if_interrupted(self, **how):
+        """begin(**how), when manifest.json is missing and a pending one is
+        there: a job that judges the release by its manifest calls this
+        before it judges."""
         if self.interrupted:
-            self.begin()
+            self.begin(**how)
 
     def put(self, data, name):
         """Rules 1, 3 and 4 for one file."""
@@ -472,16 +568,20 @@ class DriverRelease:
         missing = [n for n in recorded_files(m) if not self.rel.complete(n)]
         if missing:
             raise ReleaseError(f"manifest.json would record {', '.join(missing)}, which {self.tag} does not hold")
-        data = (json.dumps(m, indent=2) + "\n").encode("ascii")
+        data = as_written(m)
         result = self.rel.put(data, MANIFEST)
-        # The record of what this run wrote, for the case where something
-        # outside the writers' group replaced it a moment later.
-        summary(f"<details><summary>manifest.json written to {self.tag}</summary>\n\n```json\n"
-                f"{data.decode('ascii').rstrip()}\n```\n\n</details>")
+        self._summarize(data)
         # A copy: a caller that goes on changing its dict must not change
         # what this object knows the release holds.
         self._manifest = json.loads(data)
         return result
+
+    def _summarize(self, data):
+        """The record of the manifest this run put on the release, for the
+        case where something outside the writers' group replaced it a
+        moment later."""
+        summary(f"<details><summary>manifest.json written to {self.tag}</summary>\n\n```json\n"
+                f"{data.decode('ascii').rstrip()}\n```\n\n</details>")
 
     def delete(self):
         self._current("deleting the release")
@@ -673,20 +773,6 @@ def cmd_submission_release(a, run):
                            f"{clean(a.build)} do not agree")
     release_assets.check_name(a.cab_name)
     auto = a.auto_attest == "true"
-    dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
-    if dr.view is not None:
-        dr.begin_if_interrupted()
-    problem = submission_build_problem(a.tag, dr.view, dr.manifest, a.commit) or \
-        submission_numbering_problem(a.tag, driver_releases(a.repo, run))
-    if problem:
-        raise ReleaseError(problem)
-    title = f"Driver {a.version} — awaiting Microsoft attestation"
-    notes = submission_notes(a.tag, a.version, a.commit, a.source_hash, a.cab_sha256, auto)
-    if dr.view is None:
-        dr = DriverRelease.create(a.repo, a.tag, a.commit, title, notes, run=run, sleep=a.sleep)
-    else:
-        dr.begin()
-        dr.edit(title, notes)
     manifest = {
         "schema": 1,
         "driver_version": a.version,
@@ -706,6 +792,23 @@ def cmd_submission_release(a, run):
         "signed_zip": None,
         "signed_zip_sha256": None,
     }
+    # This job writes the whole manifest: a pending one is its own stopped
+    # write only when it is exactly that.
+    own = {"mine": lambda cur, new: not_this_write(new, manifest)}
+    dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
+    if dr.view is not None:
+        dr.begin_if_interrupted(**own)
+    problem = submission_build_problem(a.tag, dr.view, dr.manifest, a.commit) or \
+        submission_numbering_problem(a.tag, driver_releases(a.repo, run))
+    if problem:
+        raise ReleaseError(problem)
+    title = f"Driver {a.version} — awaiting Microsoft attestation"
+    notes = submission_notes(a.tag, a.version, a.commit, a.source_hash, a.cab_sha256, auto)
+    if dr.view is None:
+        dr = DriverRelease.create(a.repo, a.tag, a.commit, title, notes, run=run, sleep=a.sleep)
+    else:
+        dr.begin(**own)
+        dr.edit(title, notes)
     dr.write_manifest(manifest)
     print(f"{a.tag} records the unsigned build (CAB sha256 {a.cab_sha256}); waiting for its EV signature")
 
@@ -719,15 +822,24 @@ def cmd_submission_signed(a, run):
     if sha256(data) != a.signed_sha256:
         raise ReleaseError(f"{clean(a.signed)} does not hash to the signed sha256 {clean(a.signed_sha256)}")
     dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
+    name = os.path.basename(a.signed)
+
+    def judge(m):
+        return submission_signed_problem(a.tag, dr.view, m, a.commit, a.cab_sha256, a.signed_sha256)
+
+    # This job records the signed CAB's hash, and nothing else, in the
+    # manifest in place.
+    own = {"mine": own_write(judge, {"submission_cab_signed_sha256": a.signed_sha256},
+                             before={"submission_cab_signed_sha256": None}),
+           "files": (name, name + ".sha256")}
     if dr.view is not None:
-        dr.begin_if_interrupted()
-    problem = submission_signed_problem(a.tag, dr.view, dr.manifest, a.commit, a.cab_sha256, a.signed_sha256)
+        dr.begin_if_interrupted(**own)
+    problem = judge(dr.manifest)
     if problem:
         raise ReleaseError(problem)
-    dr.begin()
-    name = os.path.basename(a.signed)
     if name != dr.manifest.get("submission_cab"):
         raise ReleaseError(f"the signed file is {clean(name)}, but {a.tag} records {clean(dr.manifest.get('submission_cab'))}")
+    dr.begin(**own)
     dr.put(data, name)
     dr.put(f"{a.signed_sha256}  {name}".encode("ascii"), name + ".sha256")
     dr.write_manifest(dict(dr.manifest, submission_cab_signed_sha256=a.signed_sha256))
@@ -802,9 +914,11 @@ def cmd_attested_fetch(a, run):
     if dr.view is None:
         raise ReleaseError(f"release {tag} not found")
     if dr.interrupted:
-        raise ReleaseError(f"{tag} holds manifest.json.pending and no manifest.json: an earlier run's last write "
-                           "was interrupted. Run Driver attested for it again with dry_run off: it finishes that "
-                           "write first")
+        raise ReleaseError(f"{tag} holds manifest.json.pending and no manifest.json: a run stopped while it wrote "
+                           "the manifest, so what the release records can't be read. Open the run that stopped and "
+                           "choose \"Re-run failed jobs\": the job that was writing finishes its write. If that run "
+                           "can't be re-run any more, see docs/driver-signing.md, \"A release shows an asset named "
+                           "<name>.pending\"")
     m = dr.manifest
     if not a.dry_run:
         problem = attested_problem(tag, m)
@@ -836,18 +950,9 @@ def cmd_attested_fetch(a, run):
 
 def cmd_attested_record(a, run):
     dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
-    if dr.view is not None:
-        dr.begin()
-        if dr.healed and finished(dr.manifest):
-            # An earlier run had written everything; finishing its last
-            # write (the manifest's) finished the release.
-            print(f"{a.tag} is attested: an earlier run's last write was interrupted and is finished now")
-            return
-    problem = attested_problem(a.tag, dr.manifest)
+    problem = finished_problem(a.tag, dr.manifest)
     if problem:
         raise ReleaseError(problem)
-    if not dr.rel.asset(a.ms_zip_name):
-        raise ReleaseError(f"{a.tag} no longer holds {clean(a.ms_zip_name)}")
     version = ".".join(map(str, version_of(a.tag)))
     zip_name = os.path.basename(a.signed_zip)
     if zip_name != f"StreamToSpeaker-Driver-{version}-Signed.zip":
@@ -856,19 +961,39 @@ def cmd_attested_record(a, run):
     with open(a.signed_zip, "rb") as fh:
         data = fh.read()
     digest = sha256(data)
+    files = {zip_name: data, zip_name + ".sha256": f"{digest}  {zip_name}".encode("ascii")}
     if a.bundle:
         from release_draft import bundle_problem  # imports repro_compare, which comes back here
         problem = bundle_problem(a.bundle, zip_name, digest)
         if problem:
             raise ReleaseError(f"not publishing a file its provenance doesn't name: {problem}")
-    dr.put(data, zip_name)
-    dr.put(f"{digest}  {zip_name}".encode("ascii"), zip_name + ".sha256")
-    if a.bundle:
-        dr.put_file(a.bundle, zip_name + ".sigstore.json")
-    m = dict(dr.manifest, attested=True, signed_zip=zip_name, signed_zip_sha256=digest,
-             ms_zip_asset=a.ms_zip_name)
-    dr.edit(f"Driver {version} — Microsoft-attested", attested_notes(m, version))
-    dr.write_manifest(m)
+        with open(a.bundle, "rb") as fh:
+            files[zip_name + ".sigstore.json"] = fh.read()
+    sets = {"attested": True, "signed_zip": zip_name, "signed_zip_sha256": digest, "ms_zip_asset": a.ms_zip_name}
+
+    def files_and_notes(m):
+        """Everything this job does before it writes the manifest `m`."""
+        for name, content in files.items():
+            dr.put(content, name)
+        dr.edit(f"Driver {version} — Microsoft-attested", attested_notes(m, version))
+
+    if dr.view is not None:
+        # An earlier attempt may have stopped while writing the manifest
+        # that marks the release attested. That manifest is put in place
+        # only as this job's own last write: when it is exactly the one
+        # this job writes, and after the files and the notes.
+        dr.begin(mine=own_write(lambda m: attested_problem(a.tag, m), sets,
+                                before={"attested": False, "signed_zip": None, "signed_zip_sha256": None}),
+                 files=files, before_manifest=files_and_notes)
+    if not (dr.healed and finished(dr.manifest)):
+        problem = attested_problem(a.tag, dr.manifest)
+        if problem:
+            raise ReleaseError(problem)
+        if not dr.rel.asset(a.ms_zip_name):
+            raise ReleaseError(f"{a.tag} no longer holds {clean(a.ms_zip_name)}")
+        m = dict(dr.manifest, **sets)
+        files_and_notes(m)
+        dr.write_manifest(m)
     summary("\n".join([f"## Driver {version} attested ✅", "", "| | |", "| --- | --- |", f"| Release | `{a.tag}` |",
                        f"| Canonical package | `{zip_name}` |", f"| SHA256 | `{digest}` |", "",
                        "Installer builds bundle this driver while `driver/**` + `include/**` still hash to the "
