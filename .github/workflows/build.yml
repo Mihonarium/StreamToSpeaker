@@ -473,6 +473,9 @@ jobs:
               Copy-Item $src "$staging\$name" -Force
               Write-Host "Staged $name"
           }
+          # Nothing here builds devcon.exe, and the installer runs it
+          # elevated: it must carry Microsoft's signature.
+          .github/scripts/Assert-MicrosoftSigned.ps1 -Path "$staging\devcon.exe"
 
       - name: Build installer (Inno Setup)
         shell: pwsh
@@ -910,6 +913,18 @@ jobs:
         run: |
           .github/scripts/Get-AttestedDriver.ps1 -SourceHash $env:SOURCE_HASH -OutDir attested-driver
 
+      # Before falling back to the test-signed driver: when a certified or
+      # attested driver was built from this tag's very driver/ and include/
+      # trees, the source hash changed, not the driver, and the job stops.
+      # Otherwise the warning names the newest Microsoft-signed driver
+      # release and the source hash it records.
+      - name: Check a test-signed fallback is not a source-hash mismatch
+        if: steps.attested.outputs.found == 'false'
+        shell: pwsh
+        run: |
+          python .github/scripts/driver_release.py fallback-check --source-hash $env:SOURCE_HASH --commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "no test-signed fallback (see above)" }
+
       # The service exe on the draft must be exactly the one sign-service
       # signed in this run, not one another run uploaded since.
       - name: Download the EV-signed service exe from the draft release
@@ -969,6 +984,9 @@ jobs:
           } else {
               throw "the driver lookup gave no answer (found='$env:FOUND')"
           }
+          # Nothing here builds devcon.exe, and the installer runs it
+          # elevated: it must carry Microsoft's signature.
+          .github/scripts/Assert-MicrosoftSigned.ps1 -Path "$staging\devcon.exe"
 
           $base = "StreamToSpeakerSetup-$env:VERSION$suffix"
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"

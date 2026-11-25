@@ -41,6 +41,10 @@ Commands (each workflow step that writes a driver release runs one):
                       returned zip and the submitted CAB (hash-checked).
   attested-record     Driver attested: add the canonical Signed.zip (and
                       its provenance bundle), then mark the release attested.
+  fallback-check      build.yml, a tag with no Microsoft-signed driver for
+                      its source hash: stop when a certified or attested
+                      driver was built from the same driver/ + include/
+                      trees (the hash changed, not the driver). Reads only.
 
 Stdlib only; gh with GH_TOKEN does the requests.
 """
@@ -663,6 +667,46 @@ def cmd_attested_record(a, run):
     print(f"{a.tag} is attested: {zip_name} sha256 {digest}")
 
 
+def driver_trees(repo, commit, run):
+    """{"driver": sha, "include": sha} of the commit's top-level trees."""
+    tree = json.loads(run("api", f"repos/{repo}/git/trees/{commit}"))
+    return {e.get("path"): e.get("sha") for e in tree.get("tree") or [] if e.get("path") in ("driver", "include")}
+
+
+def cmd_fallback_check(a, run):
+    """A tag run's driver lookup found no Microsoft-signed driver for this
+    source hash. Before the release falls back to the test-signed driver:
+    if a certified or attested driver was built from the same driver/ and
+    include/ trees, the hash computation changed, not the driver, and the
+    fallback would be wrong. Otherwise say what the newest one records."""
+    if not SHA_RE.fullmatch(a.source_hash or "") or not COMMIT_RE.fullmatch(a.commit or ""):
+        raise ReleaseError("--source-hash and --commit must be full hex digests")
+    signed = [(r, m) for r, m in manifests(a.repo, driver_releases(a.repo, run), run) if finished(m)]
+    mine = driver_trees(a.repo, a.commit, run)
+    for r, m in signed:
+        commit = m.get("commit")
+        if not (isinstance(commit, str) and COMMIT_RE.fullmatch(commit)):
+            continue
+        try:
+            theirs = driver_trees(a.repo, commit, run)
+        except ReleaseError as e:
+            print(f"::warning::could not read the trees of {r['tag_name']}'s commit {commit} ({clean(e)}); "
+                  "not compared")
+            continue
+        if theirs == mine and mine:
+            raise ReleaseError(
+                f"{r['tag_name']} was built from the same driver/ and include/ trees as this commit (its commit "
+                f"{commit}), but records the driver source hash {clean(m.get('source_hash'))}, and this run computed "
+                f"{a.source_hash}. The hash computation changed, not the driver (runner image, .gitattributes, "
+                "checkout settings): no test-signed fallback. See docs/driver-signing.md, \"Release says "
+                "-testsigned\".")
+    if signed:
+        r, m = signed[0]
+        print(f"::warning::No Microsoft-signed driver matches this tag's driver source hash {a.source_hash}. The "
+              f"newest {kind(m)} driver release is {r['tag_name']} (driver source hash "
+              f"{clean(m.get('source_hash'))}, commit {clean(m.get('commit'))}); driver/ or include/ differ from it.")
+
+
 def main(argv=None, run=gh, sleep=time.sleep):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -689,6 +733,7 @@ def main(argv=None, run=gh, sleep=time.sleep):
     command("submission-cleanup", cmd_submission_cleanup, "--tag")
     s = command("attested-fetch", cmd_attested_fetch, "--tag", "--dir")
     s.add_argument("--dry-run", action="store_true")
+    command("fallback-check", cmd_fallback_check, "--source-hash", "--commit")
     s = command("attested-record", cmd_attested_record, "--tag", "--signed-zip", "--ms-zip-name")
     s.add_argument("--bundle")
     a = ap.parse_args(argv)

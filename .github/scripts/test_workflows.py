@@ -306,6 +306,28 @@ class ReleaseTools(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class WhatTheInstallerBundles(unittest.TestCase):
+    def test_devcon_is_checked_wherever_it_is_staged(self):
+        # devcon.exe comes from the WDK through the driver cache, nothing
+        # here builds it, and the installer runs it elevated.
+        staging = [(job, step_field(s, "name"), step_script(s)) for job, steps in jobs_steps("build.yml").items()
+                   for s in steps if any("devcon.exe" in l for l in step_script(s))
+                   and any("$staging" in l for l in step_script(s))]
+        self.assertGreaterEqual(len(staging), 2)
+        for job, name, lines in staging:
+            self.assertTrue(any(re.search(r"Assert-MicrosoftSigned\.ps1 -Path \S*devcon\.exe", l) for l in lines),
+                            f"{job}: {name}")
+
+    def test_a_tag_falls_back_to_the_test_signed_driver_only_after_the_tree_check(self):
+        steps = jobs_steps("build.yml")["package"]
+        names = [step_field(s, "name") for s in steps]
+        check = names.index("Check a test-signed fallback is not a source-hash mismatch")
+        self.assertEqual(expression(step_field(steps[check], "if")), "steps.attested.outputs.found=='false'")
+        self.assertLess(names.index("Fetch Microsoft-signed driver (if one matches the driver source)"), check)
+        self.assertLess(check, names.index("Stage + build release installer"))
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
 class WhereTheseChecksRun(unittest.TestCase):
     """Every test of the chain's scripts (this file among them) runs on
     every pull request, push and tag, with a read-only token and no secret,

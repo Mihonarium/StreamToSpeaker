@@ -616,6 +616,49 @@ class AttestedFetch(Base):
         self.assertIn("no unfinished driver-v* release with an attached Microsoft zip", self.output)
 
 
+class TestSignedFallback(Base):
+    """A tag run whose driver lookup found no Microsoft-signed driver."""
+    TAGGED = "f" * 40
+
+    def fake(self):
+        fake = Fake()
+        certified_release(fake)
+        fake.tags[("tree", "e" * 40)] = {"driver": "d1", "include": "i1", "service": "s1"}
+        return fake
+
+    def fallback(self, fake):
+        return self.run_cmd(fake, "fallback-check", "--source-hash", "7" * 64, "--commit", self.TAGGED)
+
+    def test_a_driver_released_from_the_same_trees_stops_the_fallback(self):
+        # The tree is the certified one, but its hash came out different
+        # (runner image, .gitattributes): shipping test-signed would be wrong.
+        fake = self.fake()
+        fake.tags[("tree", self.TAGGED)] = {"driver": "d1", "include": "i1", "service": "s2"}
+        self.assertEqual(self.fallback(fake), 1)
+        self.assertIn("driver-v1.1.1.211 was built from the same driver/ and include/ trees", self.output)
+        self.assertIn("5" * 64, self.output)
+
+    def test_another_driver_tree_may_fall_back_and_says_what_differs(self):
+        fake = self.fake()
+        fake.tags[("tree", self.TAGGED)] = {"driver": "d2", "include": "i1"}
+        self.assertEqual(self.fallback(fake), 0, self.output)
+        self.assertIn("driver-v1.1.1.211", self.output)
+        self.assertIn("5" * 64, self.output)
+        self.assertIn("7" * 64, self.output)
+
+    def test_a_tree_that_cannot_be_read_stops_the_fallback(self):
+        fake = self.fake()
+        self.assertEqual(self.fallback(fake), 1)
+        self.assertEqual(fake.writes(), [])
+
+    def test_a_released_commit_that_is_gone_is_not_compared(self):
+        fake = self.fake()
+        del fake.tags[("tree", "e" * 40)]
+        fake.tags[("tree", self.TAGGED)] = {"driver": "d1", "include": "i1"}
+        self.assertEqual(self.fallback(fake), 0, self.output)
+        self.assertIn("not compared", self.output)
+
+
 class Words(unittest.TestCase):
     def test_the_next_step_says_whether_attestation_starts_by_itself(self):
         on = dr.submission_notes(TAG, "1.1.2.140", COMMIT, HASH, CAB_SHA, True)

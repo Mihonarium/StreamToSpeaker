@@ -1,7 +1,8 @@
 #requires -Version 7
-# Pester 5 tests of Get-AttestedDriver.ps1 against a fake `gh`: which
+# Pester 5 tests of Get-AttestedDriver.ps1 against a fake `gh` (which
 # driver-v* release a build bundles, and that found=false means only "no
-# certified or attested release records this source hash". Run by
+# certified or attested release records this source hash"), and of
+# Assert-MicrosoftSigned.ps1. Run by
 # build.yml's chain-tests-powershell job:
 #   Invoke-Pester -Path .github/scripts/Get-AttestedDriver.Tests.ps1 -Output Detailed -CI
 
@@ -145,5 +146,22 @@ Describe "Get-AttestedDriver.ps1" {
         foreach ($name in "StreamToSpeaker.inf", "StreamToSpeaker.sys", "StreamToSpeaker.cat") {
             Join-Path (Split-Path $o.zip) $name | Should -Exist
         }
+    }
+}
+
+Describe "Assert-MicrosoftSigned.ps1" {
+    BeforeAll {
+        $Assert = Join-Path $PSScriptRoot "Assert-MicrosoftSigned.ps1"
+        $env:GITHUB_STEP_SUMMARY = $null
+    }
+
+    It "accepts a file Microsoft signed" {
+        { & $Assert -Path (Join-Path $env:SystemRoot "System32\notepad.exe") } | Should -Not -Throw
+    }
+
+    It "refuses an unsigned file" {
+        $file = Join-Path $TestDrive "devcon.exe"
+        [IO.File]::WriteAllBytes($file, [byte[]](77, 90, 0, 0))
+        { & $Assert -Path $file } | Should -Throw "*no valid Authenticode signature*"
     }
 }
