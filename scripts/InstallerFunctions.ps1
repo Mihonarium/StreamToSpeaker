@@ -52,7 +52,10 @@ $StsPkey = @{
     # The device interface's name: "Stream To Speaker" from the INF from the
     # start, and not something the person can rename.
     InterfaceName   = '{b3f8fa53-0004-438e-9003-51a46e139bfc},6'
-    # "{1}." followed by the instance ID of the device the endpoint belongs to.
+    # Expected to hold "{1}." followed by the instance ID of the device the
+    # endpoint belongs to. What it holds on a real PC has not been confirmed,
+    # so it only tells two Stream To Speaker devices' outputs apart; no
+    # device is created or removed because of it.
     DeviceInstance  = '{b3f8fa53-0004-438e-9003-51a46e139bfc},2'
     FormFactor      = '{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},0'
     Association     = '{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},2'
@@ -285,20 +288,28 @@ function Get-OurEndpoints {
     })
 }
 
-# The endpoints that are there now (active or turned off, not "not
-# present") and belong to one of these devices. An endpoint that doesn't say
-# which device it belongs to counts when it is present.
-function Select-PresentEndpoints {
-    param([object[]]$Endpoints = @(), [string[]]$InstanceIds = @())
-    @($Endpoints | Where-Object {
-        $state = $_.State
-        if ($state -ne $StsEndpointActive -and $state -ne $StsEndpointDisabled) { return $false }
-        if (-not $_.DeviceInstance) { return $true }
-        $device = [string]$_.DeviceInstance
-        foreach ($id in $InstanceIds) {
-            if ($id -and $device.EndsWith($id, [StringComparison]::OrdinalIgnoreCase)) { return $true }
-        }
-        $false
+# The endpoints that are there now: active or turned off, not "not present".
+function Select-PresentEndpoints([object[]]$Endpoints = @()) {
+    @($Endpoints | Where-Object { $_.State -eq $StsEndpointActive -or $_.State -eq $StsEndpointDisabled })
+}
+
+# Whether Windows records this device as the endpoint's (see
+# $StsPkey.DeviceInstance for how far that record is trusted).
+function Test-EndpointOfDevice($Endpoint, [string]$InstanceId) {
+    $recorded = [string]$Endpoint.DeviceInstance
+    [bool]($InstanceId -and $recorded -and $recorded.EndsWith($InstanceId, [StringComparison]::OrdinalIgnoreCase))
+}
+
+# The present endpoints to take as one device's: every present endpoint of
+# ours, except those Windows records as another Stream To Speaker device's
+# (-OtherInstanceIds). An endpoint whose record names no device we know
+# counts, so that a record in another form than expected can't make a
+# working device look as if it had no sound output.
+function Select-DeviceEndpoints {
+    param([object[]]$Endpoints = @(), [string]$InstanceId = '', [string[]]$OtherInstanceIds = @())
+    @(Select-PresentEndpoints $Endpoints | Where-Object {
+        $endpoint = $_
+        @($OtherInstanceIds | Where-Object { $_ -and $_ -ine $InstanceId -and (Test-EndpointOfDevice $endpoint $_) }).Count -eq 0
     })
 }
 
@@ -359,8 +370,9 @@ function Get-EndpointChanges {
 #          output, instead of creating a new device with a new output.
 # Create:  there is no device: create one.
 # Rebuild: the output carries an early build's cache, or the device works
-#          but Windows has no output for it: create a new device (with a new
-#          output) and only then remove the old one and its cache; the
+#          but Windows has no Stream To Speaker output at all although its
+#          sound services run (-OutputMissing): create a new device (with a
+#          new output) and only then remove the old one and its cache; the
 #          caller gives the new output the default roles the old one held.
 # The device kept is the one Windows plays to (-PreferredDevice), else a
 # working one; devices beyond it are removed in every plan (one output only).
@@ -370,7 +382,7 @@ function Get-DriverPlan {
         [bool]$BoundFilesAreNew,
         [bool]$LegacyEndpointCache,
         [string]$PreferredDevice = '',
-        [string[]]$DevicesWithOutput = @()
+        [bool]$OutputMissing
     )
     $sorted = @($Devices | Sort-Object @{ Expression = { [int]($_.InstanceId -ne $PreferredDevice) } },
         @{ Expression = { [int]($_.ProblemCode -ne 0) } }, InstanceId)
@@ -382,9 +394,9 @@ function Get-DriverPlan {
     } elseif ($LegacyEndpointCache) {
         $action = 'Rebuild'
         $reason = "Windows' cached copy of the sound output still has an early build's settings"
-    } elseif ($device.ProblemCode -eq 0 -and $DevicesWithOutput -notcontains $device.InstanceId) {
+    } elseif ($OutputMissing -and $device.ProblemCode -eq 0) {
         $action = 'Rebuild'
-        $reason = 'the device works but Windows has no sound output for it'
+        $reason = 'the device works but Windows has no Stream To Speaker sound output'
     } elseif ($BoundFilesAreNew -and ($device.ProblemCode -eq 0 -or $StsProblemsReinstallDoesNotFix -contains $device.ProblemCode)) {
         $action = 'Keep'
         $reason = 'the device has this driver already'
@@ -399,6 +411,26 @@ function Get-DriverPlan {
         Device        = $device
         RemoveDevices = @($extra)
     }
+}
+
+# After a change to the device failed: whether the device that was there
+# before (-Before) is still there as it was, with the same driver package on
+# it and in the same condition, among the devices Windows has now (-Now).
+# It is read back, not assumed: DevCon's "install" puts the driver on every
+# Stream To Speaker device, not only on the one it creates. Says in the log
+# what it found.
+function Test-DeviceAsBefore {
+    param($Before, [object[]]$Now = @())
+    if (-not $Before) { return $false }
+    $device = @($Now | Where-Object { $_.InstanceId -eq $Before.InstanceId }) | Select-Object -First 1
+    if (-not $device) {
+        Write-Step "The device $($Before.InstanceId), which was there before, is gone."
+        return $false
+    }
+    $same = [bool]($device.InfName -and $device.InfName -ieq $Before.InfName -and $device.ProblemCode -eq $Before.ProblemCode)
+    $was = if ($same) { 'as before' } else { "before: $(Get-DeviceProblemText $Before.ProblemCode); driver package $($Before.InfName)" }
+    Write-Step "The device $($device.InstanceId), which was there before: $(Get-DeviceProblemText $device.ProblemCode); driver package $($device.InfName) ($was)."
+    $same
 }
 
 # Whether Windows must restart before the new driver runs. The driver's
@@ -697,6 +729,17 @@ function Remove-EndpointEntries([object[]]$Endpoints = @()) {
         }
     }
     [pscustomobject]@{ Removed = $removed; Failed = $failed }
+}
+
+# Whether both of Windows' sound services run (Windows Audio Endpoint
+# Builder and Windows Audio). While they don't, Windows makes no sound output
+# for any device, so a missing output says nothing about ours.
+function Test-AudioServicesRunning {
+    foreach ($name in 'AudioEndpointBuilder', 'AudioSrv') {
+        $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if (-not $service -or $service.Status -ne 'Running') { return $false }
+    }
+    $true
 }
 
 # Restarts Windows' audio services, and every service that depends on them
@@ -1313,6 +1356,7 @@ function New-DriverTools {
         ForceDeletePackage = 'Remove-DriverPackageForce'
         RemoveEndpoints    = 'Remove-EndpointEntries'
         RestartAudio       = 'Restart-AudioServices'
+        AudioRunning       = 'Test-AudioServicesRunning'
         DefaultRoles       = 'Get-DefaultRoles'
         SetDefault         = { param($Id, $Role) [StreamToSpeaker.SetupNative]::SetDefault($Id, $Role) }
         SetEndpoint        = 'Set-EndpointState'
@@ -1349,7 +1393,8 @@ function New-DriverResult([string]$Result, [int]$ExitCode) {
 #   stage-failed        Windows didn't accept the driver package; nothing was
 #                       changed (KeptBefore: there is an earlier driver)
 #   device-failed       the device could not be created or given the driver
-#                       (KeptBefore: the earlier device is still there)
+#                       (KeptBefore: the earlier device is still there as it
+#                       was, with the driver it had, as read back)
 #   driver-not-started  the device has the driver but Windows didn't start it
 #                       (Problem: the Device Manager problem code)
 #   endpoint-missing    the driver runs but no sound output appeared
@@ -1448,16 +1493,17 @@ function Invoke-DriverInstallSteps {
     $boundFiles = & $Tools.HashFiles $boundFolder
     $boundIsNew = Test-SameDriverFiles $boundFiles $newFiles
     $endpoints = @(& $Tools.GetEndpoints)
-    $present = @(Select-PresentEndpoints -Endpoints $endpoints -InstanceIds @($devices | ForEach-Object { $_.InstanceId }))
+    $present = @(Select-PresentEndpoints $endpoints)
     $legacy = @($present | Where-Object { Test-LegacyEndpointCache $_ }).Count -gt 0
+    $rolesBefore = @(if ($present.Count) { & $Tools.DefaultRoles @($present | ForEach-Object { $_.Id }) })
+    # Which device's output Windows plays to matters only when there is more
+    # than one device; then it is told by what Windows records as each
+    # output's device.
     $rolesByDevice = @{}
-    $withOutput = @()
     foreach ($d in $devices) {
-        $ids = @(Select-PresentEndpoints -Endpoints $endpoints -InstanceIds @($d.InstanceId) | ForEach-Object { $_.Id })
-        if ($ids.Count) { $withOutput += $d.InstanceId }
+        $ids = @($present | Where-Object { $devices.Count -eq 1 -or (Test-EndpointOfDevice $_ $d.InstanceId) } | ForEach-Object { $_.Id })
         $rolesByDevice[$d.InstanceId] = @(if ($ids.Count) { & $Tools.DefaultRoles $ids })
     }
-    $rolesBefore = @($rolesByDevice.Values | ForEach-Object { $_ } | Select-Object -Unique)
     $preferred = ''
     $most = 0
     foreach ($id in @($rolesByDevice.Keys | Sort-Object)) {
@@ -1472,8 +1518,17 @@ function Invoke-DriverInstallSteps {
         Write-Step "Device $($d.InstanceId): $(Get-DeviceProblemText $d.ProblemCode); driver package $($d.InfName)$(if (@($rolesByDevice[$d.InstanceId]).Count) { '; Windows plays to its output' })"
     }
     if (-not $devices.Count) { Write-Step 'No Stream To Speaker device yet.' }
+    foreach ($ep in $present) {
+        Write-Step "Sound output $($ep.Guid): $(if ($ep.State -eq $StsEndpointActive) { 'on' } else { 'turned off' }); Windows records as its device: $(if ($ep.DeviceInstance) { $ep.DeviceInstance } else { '(nothing)' })"
+    }
+    # A device is rebuilt for a missing output only when Windows has no Stream
+    # To Speaker output at all, found by name, and its sound services run.
+    $audioRunning = [bool](& $Tools.AudioRunning)
+    if (-not $present.Count -and $devices.Count) {
+        Write-Step "Windows has no Stream To Speaker sound output$(if (-not $audioRunning) { ', and its sound services (Windows Audio, Windows Audio Endpoint Builder) are not running: none can appear until they run' })."
+    }
     $plan = Get-DriverPlan -Devices $devices -BoundFilesAreNew $boundIsNew -LegacyEndpointCache $legacy `
-        -PreferredDevice $preferred -DevicesWithOutput $withOutput
+        -PreferredDevice $preferred -OutputMissing (-not $present.Count -and $audioRunning)
     Write-Step "Plan: $($plan.Action) ($($plan.Reason))."
     $windowsRestart = $false
 
@@ -1519,18 +1574,31 @@ function Invoke-DriverInstallSteps {
     }
 
     # 4. The device. A rebuild creates the new device first, next to the old
-    #    one, and removes the old one only once the new one works, so that a
-    #    failure leaves the old one as it was.
-    $restoreRoles = @()
+    #    one, and removes the old one only once the new one works. Creating
+    #    it also puts the driver on the old one (see Test-DeviceAsBefore), so
+    #    when a change fails, what became of the old device is read back.
+    $oldIds = @($devices | ForEach-Object { $_.InstanceId })
+    $failed = {
+        param([int]$Problem = 0)
+        $r = New-DriverResult 'device-failed' 21
+        $r.Action = $plan.Action
+        $r.Problem = $Problem
+        $r.KeptBefore = Test-DeviceAsBefore -Before $plan.Device -Now @(& $Tools.GetDevices)
+        $r
+    }
+    # A device this run made goes again when a rebuild fails.
+    $removeNew = {
+        foreach ($x in @(& $Tools.GetDevices | Where-Object { $oldIds -notcontains $_.InstanceId })) {
+            Write-Step "Removing the new device $($x.InstanceId)..."
+            $null = & $Tools.RemoveDevice $x.InstanceId
+        }
+    }
     if ($plan.Action -eq 'Update') {
         $code = & $Tools.UpdateDevice $inf
         if ($code -eq 1) { $windowsRestart = $true }
         elseif ($code -ne 0) {
             & $undo
-            $r = New-DriverResult 'device-failed' 21
-            $r.Action = $plan.Action
-            $r.KeptBefore = $true
-            return $r
+            return (& $failed)
         }
     } elseif ($plan.Action -eq 'Create') {
         $orphans = @(Select-OrphanedEndpoints $endpoints)
@@ -1543,26 +1611,20 @@ function Invoke-DriverInstallSteps {
         if ($code -eq 1) { $windowsRestart = $true }
         elseif ($code -ne 0) {
             & $undo
-            $r = New-DriverResult 'device-failed' 21
-            $r.Action = $plan.Action
-            return $r
+            return (& $failed)
         }
     } elseif ($plan.Action -eq 'Rebuild') {
-        $restoreRoles = $rolesBefore
         $code = & $Tools.CreateDevice $inf
         if ($code -eq 1) { $windowsRestart = $true }
         elseif ($code -ne 0) {
+            & $removeNew
             & $undo
-            $r = New-DriverResult 'device-failed' 21
-            $r.Action = $plan.Action
-            $r.KeptBefore = $true
-            return $r
+            return (& $failed)
         }
     }
 
     # 5. The device as Windows has it now: the new one after a rebuild or a
     #    create, else the one kept.
-    $oldIds = @($devices | ForEach-Object { $_.InstanceId })
     $device = $null
     for ($i = 1; $i -le $DeviceAttempts; $i++) {
         $now = @(& $Tools.GetDevices)
@@ -1577,27 +1639,17 @@ function Invoke-DriverInstallSteps {
     }
     if (-not $device) {
         if ($plan.Action -ne 'Rebuild') { & $undo }
-        $r = New-DriverResult 'device-failed' 21
-        $r.Action = $plan.Action
-        $r.KeptBefore = $plan.Action -eq 'Rebuild' -or $plan.Action -eq 'Update'
-        return $r
+        return (& $failed)
     }
     if ($plan.Action -eq 'Rebuild' -and $device.ProblemCode -ne 0 -and $StsProblemsRestartFixes -notcontains $device.ProblemCode) {
-        # The new device doesn't work: it goes, and the old one stays as it was.
-        Write-Step "The new device $($device.InstanceId) doesn't work ($(Get-DeviceProblemText $device.ProblemCode)); removing it and keeping the old one."
-        $null = & $Tools.RemoveDevice $device.InstanceId
-        $r = New-DriverResult 'device-failed' 21
-        $r.Action = $plan.Action
-        $r.KeptBefore = $true
-        $r.Problem = $device.ProblemCode
-        return $r
+        # The new device doesn't work: it goes, and the old one is not removed.
+        Write-Step "The new device $($device.InstanceId) doesn't work ($(Get-DeviceProblemText $device.ProblemCode))."
+        & $removeNew
+        return (& $failed $device.ProblemCode)
     }
 
     # The devices beyond the one kept (and, in a rebuild, the old one) go now.
     $removing = @($plan.RemoveDevices)
-    if ($plan.Action -ne 'Rebuild') {
-        foreach ($x in $removing) { $restoreRoles += @($rolesByDevice[$x.InstanceId]) }
-    }
     foreach ($x in $removing) {
         Write-Step "Removing the device $($x.InstanceId)..."
         $null = & $Tools.RemoveDevice $x.InstanceId
@@ -1607,7 +1659,6 @@ function Invoke-DriverInstallSteps {
         $gone = & $Tools.RemoveEndpoints $endpoints
         if (@($gone.Failed).Count) { Write-Step "  Windows kept $(@($gone.Failed).Count) cached entr$(if (@($gone.Failed).Count -eq 1) { 'y' } else { 'ies' }) of the old output." }
     }
-    $restoreRoles = @($restoreRoles | Where-Object { $null -ne $_ } | Select-Object -Unique)
     $now = @(& $Tools.GetDevices)
     $extrasLeft = @($now | Where-Object { $_.InstanceId -ne $device.InstanceId }).Count
     Write-Step "Device $($device.InstanceId): $(Get-DeviceProblemText $device.ProblemCode); driver package $($device.InfName)"
@@ -1665,10 +1716,12 @@ function Invoke-DriverInstallSteps {
         return $result
     }
 
-    # 8. The sound output.
+    # 8. The sound output: every Stream To Speaker output that is there now,
+    #    except one Windows records as another Stream To Speaker device's.
+    $otherIds = @($oldIds + @($now | ForEach-Object { $_.InstanceId }) | Select-Object -Unique)
     $ours = @()
     for ($i = 1; $i -le $EndpointAttempts; $i++) {
-        $ours = @(Select-PresentEndpoints -Endpoints @(& $Tools.GetEndpoints) -InstanceIds @($device.InstanceId))
+        $ours = @(Select-DeviceEndpoints -Endpoints @(& $Tools.GetEndpoints) -InstanceId $device.InstanceId -OtherInstanceIds $otherIds)
         if ($ours.Count) {
             if ($i -gt 1) { Write-Step "The sound output appeared after $i tries." }
             break
@@ -1680,6 +1733,9 @@ function Invoke-DriverInstallSteps {
             $result.ExitCode = 3010
             return $result
         }
+        if (-not (& $Tools.AudioRunning)) {
+            Write-Step "No sound output appeared, and Windows' sound services (Windows Audio, Windows Audio Endpoint Builder) are not running: none can appear until they run."
+        }
         $result.Result = 'endpoint-missing'
         $result.ExitCode = 23
         return $result
@@ -1689,11 +1745,16 @@ function Invoke-DriverInstallSteps {
         Write-Step "Sound output $($ep.Guid) ($(Format-EndpointName $ep.FriendlyName)): $(if ($changes.Count) { 'setting ' + ($changes -join ', ') } else { 'nothing to change' })"
         if ($changes.Count) { $null = & $Tools.SetEndpoint $ep $changes $StsProductName }
     }
-    foreach ($role in $restoreRoles) {
-        $hr = & $Tools.SetDefault $ours[0].Id $role
-        Write-Step ("  Windows plays to it again for role {0}: HRESULT 0x{1:X8}" -f $role, $hr)
+    if ($removing.Count -and $rolesBefore.Count) {
+        # Removing a device took the roles its output held: the output that
+        # stays gets every role a Stream To Speaker output held before.
+        $held = @(& $Tools.DefaultRoles @($ours | ForEach-Object { $_.Id }))
+        foreach ($role in @($rolesBefore | Where-Object { $held -notcontains $_ })) {
+            $hr = & $Tools.SetDefault $ours[0].Id $role
+            Write-Step ("  Windows plays to it again for role {0}: HRESULT 0x{1:X8}" -f $role, $hr)
+        }
     }
-    $after = @(Select-PresentEndpoints -Endpoints @(& $Tools.GetEndpoints) -InstanceIds @($device.InstanceId))
+    $after = @(Select-DeviceEndpoints -Endpoints @(& $Tools.GetEndpoints) -InstanceId $device.InstanceId -OtherInstanceIds $otherIds)
     $rolesAfter = @(if ($after.Count) { & $Tools.DefaultRoles @($after | ForEach-Object { $_.Id }) })
     $result.IsDefault = $rolesAfter.Count -gt 0
     $lost = @($rolesBefore | Where-Object { $rolesAfter -notcontains $_ })

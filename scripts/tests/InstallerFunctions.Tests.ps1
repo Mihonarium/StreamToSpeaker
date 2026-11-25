@@ -90,7 +90,8 @@ function New-World {
         [bool]$TestSigning = $false,
         [bool]$TrustFails = $false,
         [string[]]$StuckPackages = @(),
-        [bool]$MoveResult = $true
+        [bool]$MoveResult = $true,
+        [bool]$AudioRunning = $true
     )
     # Which output Windows plays to for each role (0, 1, 2).
     $roleOf = @{}
@@ -106,6 +107,7 @@ function New-World {
         HasCer = $HasCer; CurrentThumb = $CurrentThumb; PreviousThumb = $PreviousThumb; Recorded = @($Recorded)
         StartOptions = $(if ($TestSigning) { ' NOEXECUTE=OPTIN  TESTSIGNING' } else { ' NOEXECUTE=OPTIN' })
         TrustFails = $TrustFails; StuckPackages = @($StuckPackages); MoveResult = $MoveResult; RoleOf = $roleOf
+        AudioRunning = $AudioRunning
     }
 }
 function Current-Endpoints {
@@ -148,9 +150,12 @@ $FakeTools = @{
             $script:W.DeviceChanged = $true
         }
         $script:W.UpdateCode }
+    # As DevCon's "install" does: the driver goes onto every device that is
+    # there already, and onto the new one.
     CreateDevice     = { param($Inf) Note 'Create'
         if ($script:W.CreateCode -eq 0 -or $script:W.CreateCode -eq 1) {
-            $script:W.Devices = @($script:W.Devices) + (Fake-Device "ROOT\MEDIA\000$(@($script:W.Devices).Count)" $script:W.ProblemAfter $script:W.NewInf)
+            $script:W.Devices = @($script:W.Devices | ForEach-Object { Fake-Device $_.InstanceId $script:W.ProblemAfter $script:W.NewInf }) +
+                (Fake-Device "ROOT\MEDIA\000$(@($script:W.Devices).Count)" $script:W.ProblemAfter $script:W.NewInf)
             $script:W.DeviceChanged = $true
         }
         $script:W.CreateCode }
@@ -168,6 +173,7 @@ $FakeTools = @{
         $script:W.Packages = @($script:W.Packages | Where-Object { $_ -ne $Name }); 0 }
     RemoveEndpoints  = { param($List) Note "RemoveEndpoints:$(@($List).Count)"; [pscustomobject]@{ Removed = @($List).Count; Failed = @() } }
     RestartAudio     = { Note 'RestartAudio' }
+    AudioRunning     = { $script:W.AudioRunning }
     DefaultRoles     = { param($Ids) @(@($script:W.RoleOf.Keys | Where-Object { @($Ids) -contains $script:W.RoleOf[$_] }) | Sort-Object) }
     SetDefault       = { param($Id, $Role) Note "SetDefault:$Role"; $script:W.RoleOf[[int]$Role] = $Id; 0 }
     SetEndpoint      = { param($Ep, $Changes, $Name) Note "SetEndpoint:$(@($Changes) -join ',')"; if (@($Changes) -contains 'Visible') { $Ep.State = 1 } }
@@ -268,23 +274,37 @@ Test 'an early build''s cached output is rebuilt and gets its default roles back
     Assert-Equal 0 $r.ExtrasRemoved 'the old device is part of the rebuild, not an extra one'
 }
 
-Test 'a rebuild whose new device can''t be made, or doesn''t work, keeps the old device as it was' {
+Test 'a rebuild that fails removes only the new device, and says what became of the old one as read back' {
     $legacy = Fake-Endpoint -Association '{DFF21BE2-F70F-11D0-B917-00A0C9223196}' -Roles @(0)
     New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') -Endpoints @($legacy) -CreateCode 2
     $r = Install
     Assert-Equal 'device-failed' $r.Result 'result when the device can''t be made'
-    Assert-True $r.KeptBefore 'says the earlier device is still there'
+    Assert-True $r.KeptBefore 'the old device is as it was: same driver package, still working'
     Assert-Equal 0 (Called 'RemoveDevice') 'devices removed'
     Assert-Equal 0 (Called 'RemoveEndpoints') 'cached entries removed'
 
+    # Creating the new device put the new driver on the old one too, and it
+    # doesn't start on either.
     New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') -Endpoints @($legacy) -ProblemAfter 39
     $r = Install
     Assert-Equal 'device-failed' $r.Result 'result when the new device doesn''t work'
     Assert-Equal 'RemoveDevice:ROOT\MEDIA\0001' ((Calls) | Where-Object { $_ -like 'RemoveDevice*' }) 'only the new device removed'
     Assert-Equal 'ROOT\MEDIA\0000' (@($script:W.Devices) | ForEach-Object { $_.InstanceId }) 'the old device stays'
+    Assert-True (-not $r.KeptBefore) 'doesn''t say the old device kept its driver: the new one went onto it'
+    Assert-Equal 0 (Called 'RemoveEndpoints') 'cached entries removed'
 }
 
-Test 'a working device whose sound output is missing gets a new device and output' {
+Test 'a device counts as it was before only with the same driver package and in the same condition' {
+    $before = Fake-Device 'ROOT\MEDIA\0000' 0 'oem5.inf'
+    Assert-True (Test-DeviceAsBefore -Before $before -Now @((Fake-Device 'ROOT\MEDIA\0001' 0 'oem9.inf'), (Fake-Device 'ROOT\MEDIA\0000' 0 'OEM5.INF'))) 'unchanged'
+    Assert-True (-not (Test-DeviceAsBefore -Before $before -Now @(Fake-Device 'ROOT\MEDIA\0000' 0 'oem9.inf'))) 'another driver package'
+    Assert-True (-not (Test-DeviceAsBefore -Before $before -Now @(Fake-Device 'ROOT\MEDIA\0000' 10 'oem5.inf'))) 'no longer working'
+    Assert-True (-not (Test-DeviceAsBefore -Before $before -Now @(Fake-Device 'ROOT\MEDIA\0001' 0 'oem5.inf'))) 'gone'
+    Assert-True (-not (Test-DeviceAsBefore -Before $null -Now @($before))) 'there was none'
+    Assert-True (-not (Test-DeviceAsBefore -Before (Fake-Device 'ROOT\MEDIA\0000' 0 '') -Now @(Fake-Device 'ROOT\MEDIA\0000' 0 ''))) 'Windows doesn''t say which package'
+}
+
+Test 'a working device gets a new device and output when Windows has no Stream To Speaker output at all' {
     New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $NewHashes -Packages @('oem5.inf') `
         -Endpoints @() -EndpointsAfter @(Fake-Endpoint -Guid '{44444444-4444-4444-4444-444444444444}' -Device 'ROOT\MEDIA\0001')
     $r = Install
@@ -292,6 +312,45 @@ Test 'a working device whose sound output is missing gets a new device and outpu
     Assert-Equal 'ok' $r.Result 'result'
     Assert-True $r.NewOutput 'a new output'
     Assert-Equal 'ROOT\MEDIA\0001' (@($script:W.Devices) | ForEach-Object { $_.InstanceId }) 'one device, the new one'
+
+    # An output that is only "not present" is no output either.
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $NewHashes -Packages @('oem5.inf') `
+        -Endpoints @(Fake-Endpoint -State 4) -EndpointsAfter @(Fake-Endpoint -Guid '{44444444-4444-4444-4444-444444444444}' -Device 'ROOT\MEDIA\0001')
+    Assert-Equal 'Rebuild' (Install).Action 'plan with a cached entry of an output that is gone'
+}
+
+Test 'a working device is not rebuilt because of what Windows records as its output''s device' {
+    # The record is in another form than expected, or names a device that is gone.
+    foreach ($recorded in 'SWD\MMDEVAPI\{0.0.0.00000000}.{77777777-7777-7777-7777-777777777777}', 'ROOT\MEDIA\0007', '') {
+        $ep = Fake-Endpoint -Guid '{77777777-7777-7777-7777-777777777777}' -Roles @(0, 1)
+        $ep.DeviceInstance = $recorded
+        New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $NewHashes -Packages @('oem5.inf') -Endpoints @($ep)
+        $r = Install
+        Assert-Equal 'Keep' $r.Action "plan when the record says '$recorded'"
+        Assert-Equal 'ok' $r.Result "result when the record says '$recorded'"
+        Assert-Equal '' ((Calls) -join ',') "changes made when the record says '$recorded'"
+        Assert-True ($r.WasDefault -and $r.IsDefault) "Windows still plays to it when the record says '$recorded'"
+    }
+    # A changed driver goes onto the device in place, as with the expected record.
+    $ep = Fake-Endpoint -Guid '{77777777-7777-7777-7777-777777777777}'
+    $ep.DeviceInstance = 'something else'
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') -Endpoints @($ep)
+    $r = Install
+    Assert-Equal 'Update' $r.Action 'plan with a changed driver'
+    Assert-Equal 'ok' $r.Result 'result with a changed driver'
+    Assert-Equal 0 ((Called 'Create') + (Called 'RemoveDevice')) 'devices created or removed'
+}
+
+Test 'while Windows'' sound services don''t run, a missing output changes nothing' {
+    New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $NewHashes -Packages @('oem5.inf') -Endpoints @() -AudioRunning $false
+    $r = Install
+    Assert-Equal 'Keep' $r.Action 'plan'
+    Assert-Equal 'endpoint-missing' $r.Result 'result'
+    Assert-Equal '' ((Calls) -join ',') 'changes made'
+    Assert-Equal 'ROOT\MEDIA\0000' (@($script:W.Devices) | ForEach-Object { $_.InstanceId }) 'the device is the one it was'
+    Assert-Equal 'Rebuild' (Get-DriverPlan -Devices @(Fake-Device) -BoundFilesAreNew $true -OutputMissing $true).Action 'the plan when they run and no output is there'
+    Assert-Equal 'Keep' (Get-DriverPlan -Devices @(Fake-Device) -BoundFilesAreNew $true -OutputMissing $false).Action 'the plan otherwise'
+    Assert-Equal 'Keep' (Get-DriverPlan -Devices @(Fake-Device -Problem 52) -BoundFilesAreNew $true -OutputMissing $true).Action 'a device that doesn''t work has no output to miss'
 }
 
 Test 'with two devices, the one Windows plays to is kept, and the page is told one was removed' {
@@ -349,14 +408,22 @@ Test 'a sound output that is not there is not mistaken for the new one' {
     Assert-Equal 0 (Called 'SetEndpoint') 'writes to the absent output'
 }
 
-Test 'present endpoints: only active or turned off, only of our device' {
+Test 'present endpoints: only active or turned off; a device''s: all but another known device''s' {
+    $unrecorded = Fake-Endpoint -Guid 'e' -State 1
+    $unrecorded.DeviceInstance = $null
     $list = @(
         (Fake-Endpoint -Guid 'a' -State 1),
         (Fake-Endpoint -Guid 'b' -State 2),
         (Fake-Endpoint -Guid 'c' -State 4),
-        (Fake-Endpoint -Guid 'd' -State 1 -Device 'ROOT\MEDIA\0007'))
-    Assert-Equal 'a | b' (Select-PresentEndpoints -Endpoints $list -InstanceIds @('ROOT\MEDIA\0000') | ForEach-Object { $_.Guid }) 'present'
+        (Fake-Endpoint -Guid 'd' -State 1 -Device 'ROOT\MEDIA\0007'),
+        $unrecorded)
+    Assert-Equal 'a | b | d | e' (Select-PresentEndpoints $list | ForEach-Object { $_.Guid }) 'present'
     Assert-Equal 'c' (Select-OrphanedEndpoints $list | ForEach-Object { $_.Guid }) 'orphaned'
+    Assert-Equal 'a | b | e' (Select-DeviceEndpoints -Endpoints $list -InstanceId 'ROOT\MEDIA\0000' -OtherInstanceIds @('ROOT\MEDIA\0000', 'ROOT\MEDIA\0007') | ForEach-Object { $_.Guid }) 'of the first device'
+    Assert-Equal 'd | e' (Select-DeviceEndpoints -Endpoints $list -InstanceId 'ROOT\MEDIA\0007' -OtherInstanceIds @('ROOT\MEDIA\0000') | ForEach-Object { $_.Guid }) 'of the second'
+    Assert-Equal 'a | b | d | e' (Select-DeviceEndpoints -Endpoints $list -InstanceId 'ROOT\MEDIA\0000' | ForEach-Object { $_.Guid }) 'with no other device known'
+    Assert-True (Test-EndpointOfDevice $list[3] 'root\media\0007') 'the record names the device, in any case'
+    Assert-True (-not (Test-EndpointOfDevice $unrecorded 'ROOT\MEDIA\0000')) 'no record names no device'
 }
 
 Test 'the restart follows the loaded driver, not the file on disk' {

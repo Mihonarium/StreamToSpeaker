@@ -339,8 +339,10 @@ Read from the top; the first line that fits is the one that matters.
   restart Windows and run Setup again.
 - Sound output "turned off in Sound settings": open Sound settings, choose Stream To
   Speaker and allow it (or enable it).
-- No sound output although the device works: run Setup again, which makes a new one.
-  If it's still missing, run Reset-Install.ps1 (below), restart, and run Setup again.
+- No sound output although the device works: check that the Windows services
+  "Windows Audio" and "Windows Audio Endpoint Builder" are running (in Services), then
+  run Setup again, which makes a new device and output when Windows has none. If it's
+  still missing, run Reset-Install.ps1 (below), restart, and run Setup again.
 - A firewall rule blocks the app, or the network in use is Public: speakers can't reach
   it. Make the network private (Settings > Network & internet), or remove the blocking rule
   in Windows Defender Firewall.

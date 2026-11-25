@@ -57,7 +57,7 @@ try {
         }
         $exitCode = 2
     } else {
-        $outputs = @(Select-PresentEndpoints -Endpoints @(Get-OurEndpoints) -InstanceIds @($working | ForEach-Object { $_.InstanceId }))
+        $outputs = @(Select-PresentEndpoints @(Get-OurEndpoints))
         if (-not $outputs.Count) {
             Write-Host 'The Stream To Speaker device works, but Windows shows no sound output for it yet. Restart the PC and run this again.'
             $exitCode = 2
@@ -67,7 +67,7 @@ try {
                 Write-Host "Sound output $($ep.Guid) ('$($ep.FriendlyName)'): $(if ($changes.Count) { 'setting ' + ($changes -join ', ') } else { 'nothing to change' })"
                 if ($changes.Count) { Set-EndpointState -Endpoint $ep -Changes $changes -Name $Name }
             }
-            $after = @(Select-PresentEndpoints -Endpoints @(Get-OurEndpoints) -InstanceIds @($working | ForEach-Object { $_.InstanceId }))
+            $after = @(Select-PresentEndpoints @(Get-OurEndpoints))
             foreach ($ep in $after) {
                 $state = if ($ep.State -eq $StsEndpointActive) { 'on' } else { 'off' }
                 Write-Host "Now: '$($ep.FriendlyName)', $state."

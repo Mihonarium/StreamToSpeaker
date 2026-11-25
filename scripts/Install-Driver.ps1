@@ -13,10 +13,11 @@
 #     installed on the existing device, which keeps its sound output.
 #     Earlier packages are deleted once the new driver runs.
 #   - The device is created only when there is none.
-#   - A working device without a sound output, or an output that still
-#     carries an early build's cached settings, is rebuilt: a new device is
-#     created first, then the old one removed, and the new output gets the
-#     default-output roles the old one held.
+#   - An output that still carries an early build's cached settings is
+#     rebuilt, and so is a working device when Windows has no Stream To
+#     Speaker output at all although its sound services run: a new device
+#     is created first, then the old one removed, and the new output gets
+#     the default-output roles the old one held.
 # The decisions are in InstallerFunctions.ps1 (Invoke-DriverInstall).
 #
 # Exit code: 0 working; 3010 working after a restart; 20 the driver package
