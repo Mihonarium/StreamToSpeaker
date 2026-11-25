@@ -328,6 +328,33 @@ class WhatTheInstallerBundles(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class InstallerLifecycleFilter(unittest.TestCase):
+    """build.yml's installer-changes job decides whether a pull request runs
+    the installer's life-cycle test: every file the installer is made of
+    or runs counts, including scripts added later."""
+
+    def pattern(self):
+        steps = jobs_steps("build.yml")["installer-changes"]
+        lines = [l for s in steps for l in step_script(s) if "grep -qE" in l]
+        self.assertEqual(len(lines), 1)
+        return re.compile(re.search(r"grep -qE '([^']+)'", lines[0]).group(1))
+
+    def test_what_the_installer_is_made_of_counts(self):
+        pattern = self.pattern()
+        for path in ("installer/StreamToSpeaker.iss", "installer/Uninstall-Driver.ps1", "installer/build-installer.ps1",
+                     "scripts/Pre-Install.ps1", "scripts/Install-Driver.ps1", "scripts/lib/Driver.psm1",
+                     "driver/StreamToSpeaker.inf", "service/src/autostart.rs",
+                     "README.md", "LICENSE", "LICENSE-BINARIES.md",
+                     ".github/workflows/build.yml", ".github/workflows/installer-lifecycle.yml",
+                     ".github/scripts/Test-InstallerLifecycle.ps1", ".github/scripts/Write-DriverRecord.ps1",
+                     ".github/scripts/Get-AttestedDriver.ps1", ".github/scripts/Assert-MicrosoftSigned.ps1"):
+            self.assertTrue(pattern.search(path), path)
+        for path in ("service/src/gui.rs", "docs/driver-signing.md", "driver/adapter.cpp",
+                     ".github/workflows/driver-attest.yml", "TECHNICAL.md"):
+            self.assertFalse(pattern.search(path), path)
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
 class WhereTheseChecksRun(unittest.TestCase):
     """Every test of the chain's scripts (this file among them) runs on
     every pull request, push and tag, with a read-only token and no secret,
