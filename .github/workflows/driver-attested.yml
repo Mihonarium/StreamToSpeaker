@@ -29,8 +29,11 @@ name: Driver attested
 # The release is read and written through .github/scripts/driver_release.py:
 # only an unfinished attestation round (an EV-signed CAB recorded, not yet
 # attested or certified) is written, the CAB compared against is the one
-# whose SHA-256 the manifest records, and nothing on the release is deleted
-# before its replacement is up.
+# whose SHA-256 the manifest records, every write is decided on the release
+# as it is at that moment, and nothing on the release is deleted before its
+# replacement is up. `verify` reads only (and is all a dry run executes);
+# `record`, which writes, runs on main only, never in a dry run, in the
+# group driver-release-writes every driver-release writer waits in.
 
 on:
   workflow_dispatch:
@@ -47,7 +50,9 @@ on:
   # Called by driver-attest.yml right after it attaches the zip Microsoft
   # returned; identical checks run on both the automatic and manual paths.
   # NB a caller must grant contents: write + id-token: write +
-  # attestations: write, or GitHub refuses the call at trigger time.
+  # attestations: write (what `record` declares), or GitHub refuses the
+  # call at trigger time; `verify`, the only job a dry run executes,
+  # declares contents: read and gets no more.
   workflow_call:
     inputs:
       tag:
@@ -59,14 +64,18 @@ on:
         default: false
 
 permissions:
-  contents: write
-  id-token: write            # build-provenance attestation (public repo only)
-  attestations: write
+  contents: read
 
 jobs:
   verify:
     runs-on: windows-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.rel.outputs.tag }}
+      ms_zip_name: ${{ steps.rel.outputs.ms_zip_name }}
+      zip_name: ${{ steps.verify.outputs.zip_name }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -183,32 +192,66 @@ jobs:
           Write-Host "::notice::dry run - $env:TAG verified (signtool + INF and .sys identity); manifest and release notes left as they are"
           "## Driver attested - dry run of ``$env:TAG`` passed (release untouched)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
-      # Provenance for the canonical driver package (bytes are final here),
-      # before it is published. Skipped if the repository is ever made
-      # private: attestations on private repositories need GitHub
-      # Enterprise Cloud. Verify with:
+      - name: Hand the canonical package to record
+        if: ${{ !inputs.dry_run }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: attested-package
+          path: ${{ steps.verify.outputs.zip_name }}
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  # Provenance for the canonical driver package (bytes are final here),
+  # then the package, its .sha256 and the bundle go up, the notes are
+  # rewritten, and manifest.json (attested=true) comes last: a run that
+  # stops half way leaves an unfinished round that a re-run completes.
+  record:
+    needs: verify
+    if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write            # build-provenance attestation (public repo only)
+      attestations: write
+      actions: read              # the attested-package artifact
+    concurrency:
+      group: driver-release-writes
+      cancel-in-progress: false
+      queue: max
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: repo-scripts
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: attested-package
+          path: package
+
+      # Skipped if the repository is ever made private: attestations on
+      # private repositories need GitHub Enterprise Cloud. Verify with:
       #   gh attestation verify StreamToSpeaker-Driver-<ver>-Signed.zip -R Mihonarium/StreamToSpeaker
       - name: Attest build provenance (public repo only)
         id: attest
-        if: ${{ !github.event.repository.private && !inputs.dry_run }}
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
-          subject-path: ${{ steps.verify.outputs.zip_name }}
+          subject-path: package/${{ needs.verify.outputs.zip_name }}
 
-      # The Signed.zip, its .sha256 and the provenance bundle go up first,
-      # the notes are rewritten, and manifest.json (attested=true) comes
-      # last: a run that stops half way leaves an unfinished round that a
-      # re-run completes.
       - name: Finalize release (manifest attested=true)
-        if: ${{ !inputs.dry_run }}
-        shell: pwsh
         env:
-          TAG: ${{ steps.rel.outputs.tag }}
-          MS_ZIP_NAME: ${{ steps.rel.outputs.ms_zip_name }}
-          ZIP_NAME: ${{ steps.verify.outputs.zip_name }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          MS_ZIP_NAME: ${{ needs.verify.outputs.ms_zip_name }}
+          ZIP_NAME: ${{ needs.verify.outputs.zip_name }}
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
-          $recordArgs = @("attested-record", "--tag", $env:TAG, "--signed-zip", $env:ZIP_NAME, "--ms-zip-name", $env:MS_ZIP_NAME)
-          if ($env:BUNDLE_PATH) { $recordArgs += @("--bundle", $env:BUNDLE_PATH) }
-          python repo-scripts\.github\scripts\driver_release.py @recordArgs
-          if ($LASTEXITCODE -ne 0) { throw "could not mark $env:TAG attested (see above)" }
+          set -euo pipefail
+          args=(--tag "$TAG" --signed-zip "package/$ZIP_NAME" --ms-zip-name "$MS_ZIP_NAME")
+          if [ -n "$BUNDLE_PATH" ]; then args+=(--bundle "$BUNDLE_PATH"); fi
+          python3 repo-scripts/.github/scripts/driver_release.py attested-record "${args[@]}"

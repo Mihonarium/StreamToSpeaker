@@ -29,8 +29,10 @@
     kind (certified|attested). found=false means exactly one thing: no
     certified or attested driver-v* release records this source hash.
     Anything that keeps the script from knowing that — the release list or
-    a manifest that cannot be fetched or read, a certified/attested
-    manifest with a missing or malformed field — stops it with an error,
+    a manifest that cannot be fetched or read, a release holding
+    manifest.json.pending but no manifest.json (a manifest write that
+    stopped half way), a certified/attested manifest with a missing or
+    malformed field — stops it with an error,
     so a transient failure can never pass for "no Microsoft-signed driver"
     (which would send a release to the test-signed fallback).
     -WarnOnError turns such an error into a warning plus found=false; it is
@@ -102,14 +104,21 @@ function Expand-PackageFlat([string]$zipPath, [string]$dest) {
 function Find-SignedDriver {
     if ($SourceHash -notmatch '^[0-9a-f]{64}$') { throw "-SourceHash must be 64 lowercase hex digits (hashFiles output)" }
 
-    $lines = gh api --paginate "repos/$Repo/releases?per_page=100" --jq '.[] | {tag_name, draft, assets: [.assets[].name]} | @json'
+    # Only completely uploaded assets count: one whose upload broke off
+    # holds nothing usable.
+    $lines = gh api --paginate "repos/$Repo/releases?per_page=100" --jq '.[] | {tag_name, draft, assets: [.assets[] | select(.state == "uploaded") | .name]} | @json'
     if ($LASTEXITCODE -ne 0) { throw "listing the releases of $Repo failed" }
     $rels = @($lines | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
 
     $best = $null
     foreach ($r in @($rels | Where-Object { $_.tag_name -like "driver-v*" -and -not $_.draft })) {
         # Only a manifest can mark a release certified or attested: one
-        # without it is not a candidate.
+        # without it is not a candidate. But manifest.json.pending without
+        # manifest.json is a manifest write that stopped half way: the
+        # release may be a finished one, so it can't be ruled out.
+        if (@($r.assets) -notcontains "manifest.json" -and @($r.assets) -contains "manifest.json.pending") {
+            throw "$($r.tag_name) holds manifest.json.pending and no manifest.json: the write of its manifest was interrupted, so it can't be ruled out. Re-run the job that was writing it (docs/driver-signing.md, `"A release shows an asset named <name>.pending`")"
+        }
         if (@($r.assets) -notcontains "manifest.json") {
             Write-Host "  ($($r.tag_name): no manifest.json, not a Microsoft-signed driver release)"
             continue

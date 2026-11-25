@@ -465,7 +465,7 @@ class PartnerCenterCredential(unittest.TestCase):
         self.assertIn("!inputs.dry_run", attest["reconcile"].get("if", "") + "".join(
             line for job, line in job_lines("driver-attest.yml") if job == "reconcile"))
         certified = job_fields("driver-certified.yml")
-        self.assertEqual(expression(certified["download"]["if"]), "needs.resolve.outputs.mode=='api'")
+        self.assertIn("needs.resolve.outputs.mode=='api'", expression(certified["download"]["if"]))
 
 
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
@@ -529,7 +529,47 @@ class DriverVerChecks(unittest.TestCase):
 
 SCRIPTS_DIR = os.path.join(GITHUB_DIR, "scripts")
 DRIVER_WORKFLOWS = ("driver-submission.yml", "driver-attest.yml", "driver-attested.yml", "driver-certified.yml")
-RELEASE_WRITE_RE = re.compile(r"\bgh\s+release\s+(?:upload|create|delete|delete-asset|edit)\b")
+RELEASE_WRITE_RE = re.compile(r"\bgh\s+release\s+(?:upload|create|delete|delete-asset|edit)\b"
+                              r"|\bgh\s+api\b.*(?:--method|-X)\s+(?:POST|PATCH|PUT|DELETE)\b.*\breleases\b")
+# What a job runs that writes a driver release.
+DRIVER_WRITE_RE = re.compile(r"driver_release\.py\s+(?:submission-(?:release|signed|cleanup)|attested-record)\b"
+                             r"|certified\.py\s+release\b|attest\.py\b")
+MAIN_ONLY = "github.ref=='refs/heads/main'"
+NOT_DRY_RUN = ("!inputs.dry_run", "needs.resolve.outputs.dry_run!='true'")
+
+
+def job_block(name, job):
+    """The lines of one job, without its steps."""
+    lines = [line for j, line in job_lines(name) if j == job]
+    out = []
+    for line in lines:
+        if line.strip() == "steps:":
+            break
+        out.append(line)
+    return out
+
+
+def job_if(name, job):
+    """A job's `if:` as one expression, also when written as a block
+    (`if: >-` and the lines under it)."""
+    lines = [line for j, line in job_lines(name) if j == job]
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)if:\s*(.*?)\s*$", line)
+        if not m or len(m.group(1)) != _depth(next(l for l in lines if _content(l))):
+            continue
+        if m.group(2) not in (">-", ">", "|", "|-"):
+            return expression(m.group(2))
+        block = []
+        for nxt in lines[i + 1:]:
+            if _content(nxt) and _depth(nxt) <= len(m.group(1)):
+                break
+            block.append(nxt.strip())
+        return expression(" ".join(block))
+    return ""
+
+
+def writes_driver_releases(name, job):
+    return any(DRIVER_WRITE_RE.search(line) for j, _step, line in script_lines(name) if j == job)
 
 
 def text_files():
@@ -578,6 +618,60 @@ class ReleaseWrites(unittest.TestCase):
                         step_field(step, "if") or "")))
         self.assertTrue(writers)
         self.assertEqual([w for w in writers if not w[2]], [])
+
+    def test_the_write_check_sees_direct_api_writes(self):
+        for line in ("gh api --method DELETE repos/o/r/releases/assets/1", "gh api -X PATCH repos/o/r/releases/2",
+                     "gh release upload v1 a.zip"):
+            self.assertTrue(RELEASE_WRITE_RE.search(line), line)
+        for line in ("gh api repos/o/r/releases?per_page=100", "gh release download v1 --pattern x"):
+            self.assertFalse(RELEASE_WRITE_RE.search(line), line)
+
+    def test_every_job_that_writes_a_driver_release_waits_for_the_others(self):
+        # One repository-wide group, nothing cancelled: two runs never
+        # write driver releases at the same time.
+        writers = [(name, job) for name in DRIVER_WORKFLOWS for job in jobs_steps(name)
+                   if writes_driver_releases(name, job)]
+        self.assertGreaterEqual(len(writers), 5, writers)
+        for name, job in writers:
+            block = [line.strip() for line in job_block(name, job)]
+            for want in ("group: driver-release-writes", "cancel-in-progress: false", "queue: max"):
+                self.assertIn(want, block, f"{name} job {job}")
+        # Waiting publish jobs of several tags are not cancelled either.
+        block = [line.strip() for line in job_block("build.yml", "publish")]
+        self.assertIn("queue: max", block)
+        # Driver attest's dry run has no group a real run waits in.
+        with open(os.path.join(WORKFLOWS_DIR, "driver-attest.yml"), encoding="utf-8") as fh:
+            self.assertNotRegex(fh.read(), r"(?m)^concurrency:")
+
+    def test_no_dry_run_or_branch_run_holds_a_write_token_or_a_secret(self):
+        # A job that executes in a dry run or from a ref other than main has
+        # contents: read and no id-token, attestations, secret or
+        # environment. A job that holds any of these runs only on main (its
+        # if, or the partner-center environment, which admits main alone)
+        # and, in a workflow with a dry_run input, never in a dry run.
+        bad = []
+        for name in DRIVER_WORKFLOWS:
+            with open(os.path.join(WORKFLOWS_DIR, name), encoding="utf-8") as fh:
+                text = fh.read()
+            top = re.search(r"(?ms)^permissions:\n(.*?)^\S", text).group(1)
+            self.assertEqual([l.strip() for l in top.splitlines() if l.strip()], ["contents: read"], name)
+            has_dry_run = re.search(r"(?m)^      dry_run:", text) is not None
+            for job, fields in job_fields(name).items():
+                if "uses" in fields:
+                    continue  # a called workflow: its own jobs are checked in its file
+                lines = [l for j, l in job_lines(name) if j == job and _content(l)]
+                held = [l.strip() for l in lines if re.search(r":\s*write\b|^\s*environment:|secrets\.", l)]
+                if not held:
+                    continue
+                cond = job_if(name, job)
+                main_only = MAIN_ONLY in cond or fields.get("environment") == "partner-center"
+                not_dry = not has_dry_run or any(c in cond for c in NOT_DRY_RUN)
+                if not (main_only and not_dry):
+                    bad.append(f"{name} job {job} holds {held} with if: {fields.get('if', '')!r}")
+        self.assertEqual(bad, [])
+
+    def test_a_driver_submission_run_from_a_branch_starts_no_attestation(self):
+        self.assertIn("github.event.workflow_run.head_branch=='main'", job_if("driver-attest.yml", "reconcile"))
 
     def test_every_release_listing_reads_every_page(self):
         # One page holds 100 releases; every version and every driver round

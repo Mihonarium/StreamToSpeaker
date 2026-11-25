@@ -392,6 +392,46 @@ class ReconcilingARelease(InTemporaryDirectory):
             attest.Release.resolve(REPO, None, commit="d" * 40, run=fake)
 
 
+class TwoRunsOnOneRelease(InTemporaryDirectory):
+    def test_the_reconciler_does_not_write_over_a_release_finished_meanwhile(self):
+        # Driver attest polls; the zip is attached by hand and Driver
+        # attested finishes the release (docs, "Manual fallback"). The
+        # reconciler's next save must not take attested back.
+        fake = fake_gh.FakeReleases(REPO, error=driver_release.ReleaseError)
+        m = dict(unsigned("1.1.2.140"), submission_cab_signed_sha256=CAB_SHA, ms_product_id="7",
+                 ms_submission_id="8", ms_state="committed")
+        fake.add_release("driver-v1.1.2.140", {"manifest.json": m, m["submission_cab"]: b"CABBYTES"})
+        tag, rel, man = attest.Release.resolve(REPO, "driver-v1.1.2.140", run=fake)
+        finished = dict(m, attested=True, signed_zip="StreamToSpeaker-Driver-1.1.2.140-Signed.zip",
+                        signed_zip_sha256="6" * 64)
+        r = fake.release(tag)
+        fake.add_asset(r, "StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip", b"ms zip")
+        fake.add_asset(r, "StreamToSpeaker-Driver-1.1.2.140-Signed.zip", b"zip")
+        r["assets"] = [a for a in r["assets"] if a["name"] != "manifest.json"]
+        fake.add_asset(r, "manifest.json", finished)
+        attest.apply_done(man, "StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip")
+        with self.assertRaises(driver_release.ReleaseError):
+            rel.save_manifest(man)
+        self.assertIs(fake.manifest(tag)["attested"], True)
+
+    def test_ids_recorded_before_a_stop_are_kept(self):
+        # The run stops after manifest.json.pending (with the new ids) is up
+        # and before the old manifest is deleted: the next run must resume
+        # that submission, not create a second one.
+        fake = fake_gh.FakeReleases(REPO, error=driver_release.ReleaseError)
+        m = dict(unsigned("1.1.2.140"), submission_cab_signed_sha256=CAB_SHA)
+        fake.add_release("driver-v1.1.2.140", {"manifest.json": m, m["submission_cab"]: b"CABBYTES"})
+        tag, rel, man = attest.Release.resolve(REPO, "driver-v1.1.2.140", run=fake)
+        self.assertEqual(attest.next_action(man), "create")
+        attest.apply_created(man, "111", "222")
+        fake.fail_when(lambda a: a[:3] == ("api", "--method", "DELETE"), fake_gh.Stop())
+        with self.assertRaises(fake_gh.Stop):
+            rel.save_manifest(man)
+        tag, rel2, man2 = attest.Release.resolve(REPO, "driver-v1.1.2.140", run=fake)
+        self.assertEqual(attest.next_action(man2), "upload")
+        self.assertEqual(man2["ms_submission_id"], "222")
+
+
 class SavingTheManifest(InTemporaryDirectory):
     def test_a_failed_manifest_upload_leaves_the_release_with_a_manifest(self):
         # gh's --clobber deletes the old asset before it uploads the new

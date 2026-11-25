@@ -465,6 +465,15 @@ class DispatchInputs(unittest.TestCase):
         values, problems = certified.check_inputs(self.env(INPUT_OS=" WINDOWS_v100_X64_25H2_FULL , B_2 ,"))
         self.assertEqual((problems, values["os"]), ([], "WINDOWS_v100_X64_25H2_FULL,B_2"))
 
+    def test_a_dry_run_takes_no_partner_center_credential(self):
+        # A dry run must not hold the Partner Center secret: it checks a zip
+        # already attached to the release.
+        values, problems = certified.check_inputs(self.env(INPUT_PRODUCT="1", INPUT_SUBMISSION="2",
+                                                           INPUT_DRY_RUN="true"))
+        self.assertTrue(any("ms_zip_asset" in p and "dry run" in p for p in problems), problems)
+        values, problems = certified.check_inputs(self.env(INPUT_MS_ZIP="m.zip", INPUT_DRY_RUN="true"))
+        self.assertEqual(problems, [])
+
     def test_needs_both_ids_or_an_asset(self):
         for kw in ({"INPUT_PRODUCT": ""}, {"INPUT_SUBMISSION": ""}):
             _, problems = certified.check_inputs(self.env(**kw))

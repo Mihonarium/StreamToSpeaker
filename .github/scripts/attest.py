@@ -177,6 +177,9 @@ class Release:
         rel = Release(repo, tag, run)
         if rel.release.view is None:
             sys.exit(f"::error::release {tag} not found")
+        # Finish what a stopped run left half done first: a manifest that
+        # holds the Partner Center ids may be waiting as manifest.json.pending.
+        rel.release.begin()
         if rel.release.manifest is None:
             sys.exit(f"::error::release {tag} has no manifest.json")
         return rel.tag, rel, rel.release.manifest
@@ -308,6 +311,9 @@ def run_main():
     if next_action(m) in ("done", "wait-signing", "finalize", "failed"):
         outcome = next_action(m)  # terminal states need no API credentials
     else:
+        # Before anything is created at Partner Center: this release is
+        # this run's to advance.
+        rel._writable()
         token = get_token(os.environ["AZURE_TENANT_ID"],
                           os.environ["AZURE_CLIENT_ID"],
                           os.environ["AZURE_CLIENT_SECRET"])

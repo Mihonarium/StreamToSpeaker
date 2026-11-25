@@ -5,8 +5,9 @@ A driver-v* release is the record of one driver binary: manifest.json says
 how it was built and what Microsoft did with it, and the files beside it
 are what installers bundle and what the release gate compares against.
 The release of a driver Microsoft certified or attested can't be made
-again. These rules hold for every workflow, input and re-run, and
-test_driver_release.py tests each under its own name:
+again. Every job of this repository's workflows that writes a driver
+release does it through this file, and test_driver_release.py tests each
+rule under its own name:
 
 1. A finished release is never changed. A release is finished when its
    manifest says `certified` or `attested`. Nothing is uploaded to it,
@@ -19,9 +20,23 @@ test_driver_release.py tests each under its own name:
    other bytes.
 4. Nothing is deleted before its replacement is completely uploaded, and
    a file already there with the same bytes is not uploaded again
-   (release_assets.py).
+   (release_assets.py). A writer first finishes what a stopped one left
+   half done; a manifest.json.pending is never read as the manifest.
 5. manifest.json is written last, in a call of its own, and only when
    every file it records is on the release.
+
+Each write is decided on the release as it is at that moment: it is read
+again just before, and the write is refused when the release is finished,
+the tag names another release, or its assets changed since this run read
+or wrote them. The workflows run every writing job in one concurrency
+group (driver-release-writes), so two of their jobs never write at once.
+What these rules can't cover: GitHub has no compare-and-swap for assets,
+so an actor outside that group (a person in the web UI, or a run of an
+older version of these workflows from a branch or tag that still carries
+it) can still change the release in the moment between that last read
+and the write; and older versions of the workflows, started from the
+refs that carry them, don't follow these rules at all
+(docs/driver-signing.md, "Start these workflows from main only").
 
 Releases are always listed with every page.
 
@@ -35,8 +50,9 @@ Commands (each workflow step that writes a driver release runs one):
                       and record the unsigned build in manifest.json.
   submission-signed   Driver submission, sign-cab: add the EV-signed CAB
                       and record its hash.
-  submission-cleanup  Driver submission: delete superseded releases that
-                      hold nothing anyone approved or Microsoft returned.
+  submission-cleanup  Driver submission: delete older unsigned builds of
+                      main that nothing was ever done with (keep_reason);
+                      every other older release is kept and named.
   attested-fetch      Driver attested: pick the release, download the
                       returned zip and the submitted CAB (hash-checked).
   attested-record     Driver attested: add the canonical Signed.zip (and
@@ -110,7 +126,8 @@ def recorded_files(m):
 # ---------------------------------------------------------------------------
 def finished_problem(tag, m):
     if finished(m):
-        return (f"{tag} is a {kind(m)} driver release; a finished driver release is never changed "
+        article = "an" if kind(m) == "attested" else "a"
+        return (f"{tag} is {article} {kind(m)} driver release; a finished driver release is never changed "
                 "(docs/driver-signing.md)")
     return None
 
@@ -125,8 +142,14 @@ def submission_build_problem(tag, view, m, commit):
     if view.get("draft"):
         return f"{tag} is a draft release; Driver submission makes none, so it is not this run's"
     if m is None:
-        if not view.get("assets") and view.get("target_commitish") == commit:
-            return None  # an earlier attempt of this commit stopped right after creating it
+        usable = [a for a in view.get("assets") or [] if a.get("state") == "uploaded"]
+        if not usable and view.get("target_commitish") == commit:
+            # An earlier attempt of this commit stopped right after creating
+            # it, or before its first manifest was completely uploaded.
+            return None
+        if any(a.get("name") == MANIFEST + PENDING for a in usable):
+            return (f"{tag} holds manifest.json.pending and no manifest.json: the write of its manifest was "
+                    "interrupted; re-run the job that was writing it, which finishes the write first")
         return f"{tag} exists and holds no manifest.json of commit {commit}: it is not this run's to write"
     if not submission(m):
         return f"{tag} is not a Driver submission release (its manifest names no submission CAB)"
@@ -213,25 +236,66 @@ def certified_problem(tag, m, new):
     return None
 
 
-def stale_submission(view, m, current):
-    """Whether cleanup may delete this release: an older Driver submission
-    build that holds nothing anyone approved or Microsoft returned."""
-    v = version_of(view.get("tag_name"))
-    if not v or v >= current or finished(m) or not submission(m):
-        return False
-    return not m.get("submission_cab_signed_sha256") and not m.get("ms_submission_id")
+# The fields an unsigned build's manifest has (submission-release writes
+# them; older ones lack build_root and driver_h_stamped).
+UNSIGNED_BUILD_FIELDS = {"schema", "driver_version", "driver_prefix", "driver_build", "commit", "source_hash",
+                         "build_root", "driver_h_stamped", "submission_cab", "submission_cab_sha256",
+                         "submission_cab_signed_sha256", "attested", "signed_zip", "signed_zip_sha256"}
+UNSIGNED_BUILD_NEEDS = {"driver_version", "driver_build", "commit", "submission_cab", "submission_cab_sha256"}
+
+
+def keep_reason(view, m):
+    """None when the cleanup may delete this older release: an unsigned
+    build that nothing was ever done with, shown by what it holds (exactly
+    a completely uploaded manifest.json) and by its manifest (only the
+    fields an unsigned build writes; nothing signed, submitted or
+    attested; the commit it was built from is its target). Otherwise why
+    it is kept. (Whether that commit is in main's history is checked
+    separately.)"""
+    if view.get("draft"):
+        return "a draft"
+    assets = view.get("assets") or []
+    names = sorted(a.get("name") for a in assets)
+    if names != [MANIFEST]:
+        return f"holds {', '.join(clean(n) for n in names) or 'no file'}, not only manifest.json"
+    if assets[0].get("state") != "uploaded":
+        return "its manifest.json was never completely uploaded"
+    if not isinstance(m, dict):
+        return "no readable manifest.json"
+    unknown = sorted(set(m) - UNSIGNED_BUILD_FIELDS)
+    if unknown:
+        return f"its manifest records {', '.join(clean(k) for k in unknown)}"
+    missing = sorted(UNSIGNED_BUILD_NEEDS - set(m))
+    if missing:
+        return f"its manifest lacks {', '.join(missing)}"
+    if m.get("submission_cab_signed_sha256") or m.get("attested") or m.get("signed_zip") or m.get("signed_zip_sha256"):
+        return "its manifest records a signature or a signed package"
+    if not (isinstance(m.get("commit"), str) and COMMIT_RE.fullmatch(m["commit"])):
+        return "its manifest names no commit"
+    if view.get("target_commitish") != m["commit"]:
+        return f"its target ({clean(view.get('target_commitish'))}) is not the commit it records"
+    return None
 
 
 # ---------------------------------------------------------------------------
 # One driver release
 # ---------------------------------------------------------------------------
 class DriverRelease:
+    """One driver-v* release under the rules in the module docstring. Every
+    write is decided on the release as it is at that moment: immediately
+    before it the release is read again, and the write is refused when the
+    release is finished, when the tag names another release now, or when
+    its assets changed since this object last read or wrote them
+    (release_assets.Release). Its manifest is the manifest.json asset with
+    that asset id, so an unchanged asset list means an unchanged manifest."""
+
     def __init__(self, repo, tag, run=gh, sleep=time.sleep, workdir=None):
         if not version_of(tag):
             raise ReleaseError(f"{clean(tag)!r} is not a driver-v<a.b.c.d> tag")
         self.repo, self.tag, self.run, self.sleep, self.workdir = repo, tag, run, sleep, workdir
         self.rel = release_assets.Release.find(repo, tag, run, sleep=sleep, workdir=workdir)
         self._manifest = self._read_manifest()
+        self.healed = []
 
     @property
     def view(self):
@@ -239,19 +303,23 @@ class DriverRelease:
 
     @property
     def manifest(self):
-        """A copy of what the release's manifest.json holds (None without
-        one): changing it changes nothing until write_manifest."""
+        """A copy of what the release's manifest.json holds (None without a
+        completely uploaded one): changing it changes nothing until
+        write_manifest. A manifest.json.pending is never read as it."""
         return copy.deepcopy(self._manifest)
 
+    @property
+    def interrupted(self):
+        """manifest.json is missing (or never finished uploading) and a
+        complete manifest.json.pending is there: a write of the manifest
+        stopped between the delete and the rename."""
+        return bool(self.rel) and not self.rel.complete(MANIFEST) and bool(self.rel.complete(MANIFEST + PENDING))
+
     def _read_manifest(self):
-        if not self.rel:
-            return None
-        name = MANIFEST if self.rel.asset(MANIFEST) else (MANIFEST + PENDING if self.rel.asset(MANIFEST + PENDING)
-                                                          else None)
-        if not name:
+        if not self.rel or not self.rel.complete(MANIFEST):
             return None
         try:
-            m = json.loads(self.rel.download(name).decode("utf-8-sig"))
+            m = json.loads(self.rel.download(MANIFEST).decode("utf-8-sig"))
         except ValueError:
             raise ReleaseError(f"the manifest.json of {self.tag} is not valid JSON")
         if not isinstance(m, dict):
@@ -261,26 +329,56 @@ class DriverRelease:
     def download(self, name):
         return self.rel.download(name)
 
-    def begin(self):
-        """Before writing: refuse a finished release (rule 1) and finish
-        what a stopped run left half done (rule 4)."""
+    def _same_release(self, doing):
         if not self.rel:
             raise ReleaseError(f"there is no release {self.tag}")
-        if finished(self.manifest):
-            return
-        if self.rel.finish_interrupted():
+        by_tag = json.loads(self.run("api", f"repos/{self.repo}/releases/tags/{self.tag}"))
+        if by_tag.get("id") != self.rel.view.get("id"):
+            raise ReleaseError(f"the tag {self.tag} names another release now; not {doing}")
+
+    def _current(self, doing):
+        """Immediately before a write (see the class docstring)."""
+        self._same_release(doing)
+        self.rel.check_unchanged(doing)
+        problem = finished_problem(self.tag, self._manifest)
+        if problem:
+            raise ReleaseError(f"{problem}; not {doing}")
+
+    def begin(self):
+        """Before the first write: finish what a stopped writer left half
+        done (release_assets.finish_interrupted). A complete
+        manifest.json.pending without a manifest.json is renamed whatever
+        it says: that completes the write an earlier run had decided.
+        Nothing is rolled forward over a finished manifest or a file the
+        manifest records, and a finished release is not touched at all."""
+        if not self.rel:
+            raise ReleaseError(f"there is no release {self.tag}")
+        if finished(self._manifest):
+            return []
+        self._same_release("finishing an interrupted write")
+        keep = {n for n in recorded_files(self._manifest) if n != MANIFEST}
+        healed = self.rel.finish_interrupted(keep=keep)
+        for line in healed:
+            print(f"{self.tag}: {line}")
+        if healed:
             self._manifest = self._read_manifest()
+        self.healed += healed
+        return healed
+
+    def begin_if_interrupted(self):
+        """Finish an interrupted manifest write before what the release
+        records is judged (nothing else is touched)."""
+        if self.interrupted:
+            self.begin()
 
     def put(self, data, name):
         """Rules 1, 3 and 4 for one file."""
         if not self.rel:
             raise ReleaseError(f"there is no release {self.tag}")
-        if self.rel.asset(name) and self.rel.holds(name, data):
+        if self.rel.complete(name) and self.rel.holds(name, data):
             return "unchanged"
-        problem = finished_problem(self.tag, self.manifest)
-        if problem:
-            raise ReleaseError(f"{problem}; it does not hold this {name}")
-        recorded = recorded_files(self.manifest)
+        self._current(f"writing {name}")
+        recorded = recorded_files(self._manifest)
         if name in recorded and self.rel.asset(name):
             raise ReleaseError(f"the manifest of {self.tag} records {name} (sha256 {clean(recorded[name])}); "
                                "a recorded file is never replaced")
@@ -297,35 +395,35 @@ class DriverRelease:
             raise ReleaseError(f"{self.tag} does not hold {name} with the bytes this run checked")
 
     def edit(self, title, notes):
-        problem = finished_problem(self.tag, self.manifest)
-        if problem:
-            raise ReleaseError(problem)
+        self._current("editing its notes")
         self.rel.edit(title, notes)
 
     def write_manifest(self, m):
         """Rules 1 and 5, then rule 4 for manifest.json itself."""
         if not self.rel:
             raise ReleaseError(f"there is no release {self.tag}")
-        if self.manifest == m and self.rel.asset(MANIFEST):
+        if self._manifest == m and self.rel.complete(MANIFEST):
+            # The manifest this object knows is m; it is still the
+            # release's when nothing changed since.
+            self.rel.check_unchanged("writing manifest.json")
             return "unchanged"
-        problem = finished_problem(self.tag, self.manifest)
-        if problem:
-            raise ReleaseError(f"{problem}; its manifest.json stays as it is")
-        self.rel.refresh()
-        missing = [n for n in recorded_files(m)
-                   if not (self.rel.asset(n) and self.rel.asset(n).get("state") == "uploaded")]
+        self._current("writing manifest.json")
+        missing = [n for n in recorded_files(m) if not self.rel.complete(n)]
         if missing:
             raise ReleaseError(f"manifest.json would record {', '.join(missing)}, which {self.tag} does not hold")
         data = (json.dumps(m, indent=2) + "\n").encode("ascii")
         result = self.rel.put(data, MANIFEST)
+        # The record of what this run wrote, for the case where something
+        # outside the writers' group replaced it a moment later.
+        summary(f"<details><summary>manifest.json written to {self.tag}</summary>\n\n```json\n"
+                f"{data.decode('ascii').rstrip()}\n```\n\n</details>")
         # A copy: a caller that goes on changing its dict must not change
         # what this object knows the release holds.
         self._manifest = json.loads(data)
         return result
 
     def delete(self):
-        if finished(self.manifest):
-            raise ReleaseError(finished_problem(self.tag, self.manifest))
+        self._current("deleting the release")
         self.rel.delete()
 
     @classmethod
@@ -347,8 +445,13 @@ def manifests(repo, rels, run=gh):
     "no manifest"."""
     out = []
     for r in rels:
-        names = [a.get("name") for a in r.get("assets") or []]
+        names = {a.get("name") for a in r.get("assets") or [] if a.get("state") == "uploaded"}
         if MANIFEST not in names:
+            if MANIFEST + PENDING in names:
+                raise ReleaseError(
+                    f"{r['tag_name']} holds manifest.json.pending and no manifest.json: the write of its manifest "
+                    "was interrupted, so what the release records can't be read. Re-run the job that was writing "
+                    "it (docs/driver-signing.md, \"A release shows an asset named <name>.pending\")")
             continue
         rel = release_assets.Release(repo, r, run)
         try:
@@ -366,9 +469,10 @@ def unfinished_submission(repo, run=gh, commit=None, need=None):
     for r in driver_releases(repo, run):
         if need and not need(r):
             continue
-        if MANIFEST not in [a.get("name") for a in r.get("assets") or []]:
+        found = manifests(repo, [r], run)
+        if not found:
             continue
-        ((_, m),) = manifests(repo, [r], run)
+        ((_, m),) = found
         if finished(m) or not submission(m) or (commit and m.get("commit") != commit):
             continue
         return r["tag_name"], m
@@ -509,6 +613,8 @@ def cmd_submission_release(a, run):
     release_assets.check_name(a.cab_name)
     auto = a.auto_attest == "true"
     dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
+    if dr.view is not None:
+        dr.begin_if_interrupted()
     problem = submission_build_problem(a.tag, dr.view, dr.manifest, a.commit) or \
         submission_numbering_problem(a.tag, driver_releases(a.repo, run))
     if problem:
@@ -552,6 +658,8 @@ def cmd_submission_signed(a, run):
     if sha256(data) != a.signed_sha256:
         raise ReleaseError(f"{clean(a.signed)} does not hash to the signed sha256 {clean(a.signed_sha256)}")
     dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
+    if dr.view is not None:
+        dr.begin_if_interrupted()
     problem = submission_signed_problem(a.tag, dr.view, dr.manifest, a.commit, a.cab_sha256, a.signed_sha256)
     if problem:
         raise ReleaseError(problem)
@@ -566,25 +674,50 @@ def cmd_submission_signed(a, run):
     print(f"{a.tag} holds the EV-signed CAB {name} (sha256 {a.signed_sha256})")
 
 
+def in_history(repo, commit, head, run):
+    """Whether `commit` is `head` or one of its ancestors."""
+    status = json.loads(run("api", f"repos/{repo}/compare/{commit}...{head}")).get("status")
+    return status in ("ahead", "identical")
+
+
 def cmd_submission_cleanup(a, run):
+    """Delete older builds of main that nothing was ever done with
+    (keep_reason). Everything else is kept and named in the run summary; a
+    read that fails or is incomplete keeps the release."""
     require_main(a.ref)
     current = version_of(a.tag)
     if not current:
         raise ReleaseError(f"{clean(a.tag)!r} is not a driver-v<a.b.c.d> tag")
-    for r in driver_releases(a.repo, run):
+    if not COMMIT_RE.fullmatch(a.commit or ""):
+        raise ReleaseError("--commit must be this run's full commit SHA")
+    try:
+        rels = driver_releases(a.repo, run)
+    except ReleaseError as e:
+        print(f"::warning::cleanup deleted nothing: the release list could not be read ({clean(e)})")
+        summary("## Older driver builds\n\nNothing deleted: the release list could not be read.")
+        return
+    kept = []
+    for r in rels:
         if r["tag_name"] == a.tag or not version_of(r["tag_name"]) or version_of(r["tag_name"]) >= current:
             continue
         try:
             dr = DriverRelease(a.repo, r["tag_name"], run, sleep=a.sleep)
+            reason = keep_reason(dr.view, dr.manifest)
+            if reason is None and not in_history(a.repo, dr.manifest["commit"], a.commit, run):
+                reason = f"its commit {clean(dr.manifest['commit'])} is not in the history of {a.commit}"
         except ReleaseError as e:
-            # Kept: a release that can't be read is never taken for one
-            # that is safe to delete.
-            print(f"::warning::kept {r['tag_name']}: {clean(e)}")
+            reason = f"it could not be read ({clean(e, 200)})"
+        if reason:
+            kept.append((r["tag_name"], reason))
             continue
-        if not stale_submission(r, dr.manifest, current):
-            continue
-        print(f"Deleting {r['tag_name']}: an older driver build, never EV-signed or submitted, superseded by {a.tag}")
+        print(f"Deleting {r['tag_name']}: an older unsigned build of main that nothing was done with, "
+              f"superseded by {a.tag}")
         dr.delete()
+    if kept:
+        summary("\n".join(["## Older driver builds kept", "", "| Release | Why it is kept |", "| --- | --- |"]
+                          + [f"| `{t}` | {why} |" for t, why in kept]))
+        for t, why in kept:
+            print(f"kept {t}: {why}")
 
 
 def ms_zips(view):
@@ -607,6 +740,10 @@ def cmd_attested_fetch(a, run):
     dr = DriverRelease(a.repo, tag, run, sleep=a.sleep)
     if dr.view is None:
         raise ReleaseError(f"release {tag} not found")
+    if dr.interrupted:
+        raise ReleaseError(f"{tag} holds manifest.json.pending and no manifest.json: an earlier run's last write "
+                           "was interrupted. Run Driver attested for it again with dry_run off: it finishes that "
+                           "write first")
     m = dr.manifest
     if not a.dry_run:
         problem = attested_problem(tag, m)
@@ -638,10 +775,16 @@ def cmd_attested_fetch(a, run):
 
 def cmd_attested_record(a, run):
     dr = DriverRelease(a.repo, a.tag, run, sleep=a.sleep)
+    if dr.view is not None:
+        dr.begin()
+        if dr.healed and finished(dr.manifest):
+            # An earlier run had written everything; finishing its last
+            # write (the manifest's) finished the release.
+            print(f"{a.tag} is attested: an earlier run's last write was interrupted and is finished now")
+            return
     problem = attested_problem(a.tag, dr.manifest)
     if problem:
         raise ReleaseError(problem)
-    dr.begin()
     if not dr.rel.asset(a.ms_zip_name):
         raise ReleaseError(f"{a.tag} no longer holds {clean(a.ms_zip_name)}")
     version = ".".join(map(str, version_of(a.tag)))
@@ -730,7 +873,7 @@ def main(argv=None, run=gh, sleep=time.sleep):
     s = command("submission-signed", cmd_submission_signed, "--tag", "--commit", "--cab-sha256", "--signed",
                 "--signed-sha256")
     s.add_argument("--auto-attest", default="false")
-    command("submission-cleanup", cmd_submission_cleanup, "--tag")
+    command("submission-cleanup", cmd_submission_cleanup, "--tag", "--commit")
     s = command("attested-fetch", cmd_attested_fetch, "--tag", "--dir")
     s.add_argument("--dry-run", action="store_true")
     command("fallback-check", cmd_fallback_check, "--source-hash", "--commit")

@@ -11,12 +11,13 @@ name: Driver certified
 #                           find the release (prepared by hand) and its lab
 #                           package, and check that `commit` has the release
 #                           tag's driver/ + include/ trees.
-#   download     (ubuntu)   Hardware API path only: poll the submission until
-#                           it is completed with a signedPackage, download it
-#                           and park it on the release. The only job that
-#                           holds the Partner Center credential: it runs in
-#                           the partner-center environment, which admits
-#                           branch main alone.
+#   download     (ubuntu)   Hardware API path only, never in a dry run: poll
+#                           the submission until it is completed with a
+#                           signedPackage and download it (an artifact; the
+#                           publish job puts it on the release). The only
+#                           job that holds the Partner Center credential: it
+#                           runs in the partner-center environment, which
+#                           admits branch main alone.
 #   cross-check  (ubuntu)   take Microsoft's zip (from download, or a
 #                           hand-downloaded zip already attached to the
 #                           release: ms_zip_asset) and check it against the
@@ -30,9 +31,14 @@ name: Driver certified
 #                           signature behind the lab's test signature, which
 #                           is why driver-attested.yml (primary signer must be
 #                           Microsoft) can't be reused. Then make the
-#                           canonical -Signed.zip, attest its provenance, and
-#                           publish it and, last, manifest.json (certified:
-#                           true, certification ids) on the release.
+#                           canonical -Signed.zip (an artifact).
+#   publish      (ubuntu)   main only, never in a dry run, in the group
+#                           driver-release-writes every driver-release
+#                           writer waits in: attest the package's
+#                           provenance, publish it and, last, manifest.json
+#                           (certified: true, certification ids) on the
+#                           release. Every job before it holds a read-only
+#                           token.
 #
 # Release writes go through certified.py and driver_release.py: a release
 # that is already certified (or attested, or an attestation submission) is
@@ -44,16 +50,18 @@ name: Driver certified
 # on) names the commit whose driver/** + include/** tree was certified. The
 # manifest records it and its hashFiles() source hash, and installers only
 # bundle the package while their driver tree still hashes to the same value.
-# The scripts always come from the dispatched commit. The Hardware API path
-# runs from main only (the environment refuses other refs), so give `commit`
-# when the certified commit isn't main's head; a hand-downloaded zip
-# (ms_zip_asset) needs no credential and runs from any branch. The release
+# The scripts always come from the dispatched commit. Run it from main
+# (publish runs nowhere else, and the Hardware API's environment admits main
+# alone); give `commit` when the certified commit isn't main's head. A
+# hand-downloaded zip (ms_zip_asset) needs no credential. The release
 # must already carry the lab package (INF/SYS/CAT exactly as tested,
 # test-signed) as StreamToSpeaker-Driver-<version>-lab-testsigned.zip —
 # attach it by hand, it is the reference everything is compared against.
 #
 # dry_run: every check runs and every release stays as it is — none is
-# created, uploaded to or changed — and the Hardware API path only reads.
+# created, uploaded to or changed; every job that runs holds a read-only
+# token and no secret, so a dry run needs ms_zip_asset (it doesn't call the
+# Hardware API).
 #
 # Secrets (environment partner-center): AZURE_TENANT_ID / AZURE_CLIENT_ID /
 # AZURE_CLIENT_SECRET, the same Entra app as Driver attest.
@@ -194,12 +202,12 @@ jobs:
     # main alone: dispatched from any other ref, this job is refused before
     # it starts.
     needs: resolve
-    if: needs.resolve.outputs.mode == 'api'
+    if: needs.resolve.outputs.mode == 'api' && needs.resolve.outputs.dry_run != 'true'
     runs-on: ubuntu-latest
     environment: partner-center
     timeout-minutes: 60
     permissions:
-      contents: write            # parks Microsoft's zip on the release
+      contents: read
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.resolve.outputs.tag }}
@@ -220,12 +228,6 @@ jobs:
           set -euo pipefail
           python3 .github/scripts/certified.py fetch \
             --product-id "$PRODUCT_ID" --submission-id "$SUBMISSION_ID" --out "$MS_ZIP"
-
-      # Microsoft's zip as returned, on the release (the audit trail); the
-      # canonical package is published by the verify job.
-      - name: Park Microsoft's zip on the release
-        if: needs.resolve.outputs.dry_run != 'true'
-        run: python3 .github/scripts/certified.py park --tag "$TAG" --ms-zip "$MS_ZIP"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -290,9 +292,10 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 30
     permissions:
-      contents: write            # publishes the package and manifest
-      id-token: write            # build-provenance attestation (public repo only)
-      attestations: write
+      contents: read
+    outputs:
+      source_hash: ${{ steps.srchash.outputs.hash }}
+      signed_zip_name: ${{ steps.package.outputs.signed_zip_name }}
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.resolve.outputs.tag }}
@@ -405,40 +408,81 @@ jobs:
             --ms-zip "packages\$env:MS_ZIP" --lab-zip "packages\$env:LAB_ZIP" --version $env:VERSION --out-dir canonical
           if ($LASTEXITCODE -ne 0) { throw "could not make the canonical package" }
 
+      - name: Hand the canonical package to publish
+        if: needs.resolve.outputs.dry_run != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: canonical-package
+          path: ${{ steps.package.outputs.signed_zip }}
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  publish:
+    needs: [resolve, verify]
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.resolve.outputs.dry_run != 'true' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write            # publishes the package and manifest
+      id-token: write            # build-provenance attestation (public repo only)
+      attestations: write
+      actions: read              # the artifacts of the jobs before
+    concurrency:
+      group: driver-release-writes
+      cancel-in-progress: false
+      queue: max
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      COMMIT: ${{ needs.resolve.outputs.commit }}
+      MS_ZIP: ${{ needs.resolve.outputs.ms_zip }}
+      LAB_ZIP: ${{ needs.resolve.outputs.lab_zip }}
+      PRODUCT_ID: ${{ needs.resolve.outputs.product_id }}
+      SUBMISSION_ID: ${{ needs.resolve.outputs.submission_id }}
+      REPORT_ID: ${{ needs.resolve.outputs.report_id }}
+      SIGNATURES: ${{ needs.resolve.outputs.os }}
+      SOURCE_HASH: ${{ needs.verify.outputs.source_hash }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: certified-packages
+          path: packages
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: canonical-package
+          path: canonical
+
       # Provenance for the canonical driver package (bytes are final here).
       # Verify with:
       #   gh attestation verify StreamToSpeaker-Driver-<ver>-Signed.zip -R ${{ github.repository }}
       - name: Attest build provenance (public repo only)
         id: attest
-        if: ${{ !github.event.repository.private && needs.resolve.outputs.dry_run != 'true' }}
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
-          subject-path: ${{ steps.package.outputs.signed_zip }}
+          subject-path: canonical/${{ needs.verify.outputs.signed_zip_name }}
 
+      # The same canonical package again (canonical_zip is deterministic),
+      # Microsoft's zip unless the release holds it already, the .sha256
+      # sidecars and the bundle, then the notes, then manifest.json last.
       - name: Publish canonical package + manifest (certified=true)
-        id: publish
-        if: needs.resolve.outputs.dry_run != 'true'
-        shell: pwsh
         env:
-          SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
-          # Quoted, so an empty id (the ms_zip_asset path may have none)
-          # still reaches python as an empty argument.
-          $cmd = @(
-            "release",
-            "--repo", "$env:GITHUB_REPOSITORY",
-            "--tag", "$env:TAG",
-            "--version", "$env:VERSION",
-            "--commit", "$env:COMMIT",
-            "--source-hash", "$env:SOURCE_HASH",
-            "--product-id", "$env:PRODUCT_ID",
-            "--submission-id", "$env:SUBMISSION_ID",
-            "--os", "$env:SIGNATURES",
-            "--ms-zip", "packages\$env:MS_ZIP",
-            "--lab-zip", "packages\$env:LAB_ZIP"
-          )
-          if ($env:REPORT_ID) { $cmd += @("--report-id", $env:REPORT_ID) }
-          if ($env:BUNDLE_PATH) { $cmd += @("--bundle", $env:BUNDLE_PATH) }
-          python _scripts\.github\scripts\certified.py @cmd
-          if ($LASTEXITCODE -ne 0) { throw "publishing the certified release failed" }
+          set -euo pipefail
+          # An empty id (the ms_zip_asset path may have none) reaches python
+          # as an empty argument.
+          args=(--repo "$GITHUB_REPOSITORY" --tag "$TAG" --version "$VERSION" --commit "$COMMIT"
+                --source-hash "$SOURCE_HASH" --product-id "$PRODUCT_ID" --submission-id "$SUBMISSION_ID"
+                --os "$SIGNATURES" --ms-zip "packages/$MS_ZIP" --lab-zip "packages/$LAB_ZIP")
+          if [ -n "$REPORT_ID" ]; then args+=(--report-id "$REPORT_ID"); fi
+          if [ -n "$BUNDLE_PATH" ]; then args+=(--bundle "$BUNDLE_PATH"); fi
+          python3 .github/scripts/certified.py release "${args[@]}"

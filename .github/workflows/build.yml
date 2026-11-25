@@ -1271,9 +1271,12 @@ jobs:
     # One publish at a time across all tags: two chains that reach this job
     # together would each see the other as a draft and both ask to be the
     # latest release (release_draft.py publish also re-checks afterwards).
+    # queue: max: a publish waiting here is not cancelled when a third tag
+    # arrives (up to 100 wait).
     concurrency:
       group: release-publish
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: write
     env:

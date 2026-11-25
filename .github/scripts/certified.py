@@ -30,7 +30,6 @@ Subcommands:
             to tie an attestation return to the submitted binary)
   package   verify, then write the canonical -Signed.zip locally (so its
             provenance can be attested before anything is published)
-  park      put Microsoft's zip, as returned, on the release
   release   put the canonical -Signed.zip (and its provenance bundle) on
             the driver-v<ver> release (creates it when missing), then
             manifest.json, last. A certified release is never changed
@@ -427,6 +426,10 @@ def check_inputs(env):
     if dry not in ("true", "false"):
         problems.append(f"dry_run must be true or false, got {dry!r}")
     v["dry_run"] = "true" if dry == "true" else "false"
+    if v["dry_run"] == "true" and v["mode"] == "api":
+        # A dry run holds no credential: it checks a zip on the release.
+        problems.append("a dry run reads nothing from Partner Center: download Microsoft's zip from the dashboard, "
+                        "attach it to the release and give its name as ms_zip_asset")
     return v, problems
 
 
@@ -519,25 +522,8 @@ def cmd_package(a):
     path = os.path.abspath(os.path.join(a.out_dir, name))
     with open(path, "wb") as f:
         f.write(checked[2])
-    driver_release.outputs(signed_zip=path, signed_zip_sha256=hashlib.sha256(checked[2]).hexdigest())
-    return 0
-
-
-def cmd_park(a):
-    """Microsoft's zip as returned, on the release (download job)."""
-    with open(a.ms_zip, "rb") as f:
-        data = f.read()
-    release = driver_release.DriverRelease(a.repo, a.tag)
-    name = os.path.basename(a.ms_zip)
-    if release.view is None:
-        raise driver_release.ReleaseError(f"release {a.tag} doesn't exist (Flow D step 3)")
-    if not (release.rel.asset(name) and release.rel.holds(name, data)):
-        problem = driver_release.certified_problem(a.tag, release.manifest, None)
-        if problem:
-            raise driver_release.ReleaseError(problem)
-        release.begin()
-        release.put(data, name)
-    print(f"{a.tag} holds {name} (sha256 {hashlib.sha256(data).hexdigest()})")
+    driver_release.outputs(signed_zip=path, signed_zip_name=name,
+                           signed_zip_sha256=hashlib.sha256(checked[2]).hexdigest())
     return 0
 
 
@@ -550,6 +536,9 @@ def cmd_release(a):
                        [s.strip() for s in a.os.split(",") if s.strip()], a.report_id, ms, lab, signed)
     tag = a.tag or f"driver-v{a.version}"
     release = driver_release.DriverRelease(a.repo, tag)
+    if release.view is not None:
+        # A stopped run may have left its manifest as manifest.json.pending.
+        release.begin_if_interrupted()
     problem = driver_release.certified_problem(tag, release.manifest, m)
     if problem:
         raise driver_release.ReleaseError(problem)
@@ -595,10 +584,6 @@ def main(argv=None):
     s.add_argument("--ms-zip", required=True); s.add_argument("--lab-zip", required=True)
     s.add_argument("--version", required=True); s.add_argument("--out-dir", required=True)
     s.set_defaults(fn=cmd_package)
-    s = sub.add_parser("park", help="put Microsoft's zip on the release")
-    s.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
-    s.add_argument("--tag", required=True); s.add_argument("--ms-zip", required=True)
-    s.set_defaults(fn=cmd_park)
     s = sub.add_parser("release")
     s.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     s.add_argument("--bundle", help="provenance bundle of the Signed.zip, published as <Signed.zip>.sigstore.json")

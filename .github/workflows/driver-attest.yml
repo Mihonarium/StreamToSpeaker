@@ -52,19 +52,30 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: driver-attest
-  cancel-in-progress: false
+# No workflow-level group: a dry run must never wait in, or cancel a run
+# waiting in, the group of the real ones. reconcile (and the write job of
+# Driver attested that verify calls) wait in driver-release-writes, the
+# group of every job that writes a driver release.
 
 jobs:
   auto-attest-gate:
     # workflow_run only: explain (visibly, in a green run) why nothing
-    # happened unless auto-attest is switched on.
-    if: github.event_name == 'workflow_run' && vars.AUTO_ATTEST != 'true'
+    # happened: auto-attest is off, or the Driver submission run that
+    # finished was not on main (a branch run builds a CAB and records no
+    # release).
+    if: >-
+      github.event_name == 'workflow_run' &&
+      (vars.AUTO_ATTEST != 'true' || github.event.workflow_run.head_branch != 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - run: |
+      - env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [ "$HEAD_BRANCH" != "main" ]; then
+            echo "::notice::The Driver submission run that finished was on $HEAD_BRANCH, not main: it recorded no driver release, so there is nothing to attest."
+            exit 0
+          fi
           echo "::notice::Automatic attestation is OFF (repository variable AUTO_ATTEST != 'true'). Nothing was submitted to Microsoft. To attest the driver release Driver submission just made, run this workflow from main with its tag (Actions, Driver attest, Run workflow), or set AUTO_ATTEST=true to start it by itself."
 
   # Wiring check only: no Partner Center call and no credential, so it can
@@ -101,12 +112,19 @@ jobs:
     # and a dispatch must be made from main.
     if: >-
       (github.event_name == 'workflow_dispatch' && !inputs.dry_run) ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && vars.AUTO_ATTEST == 'true')
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' && vars.AUTO_ATTEST == 'true')
     runs-on: ubuntu-latest
     environment: partner-center
     timeout-minutes: 55
     permissions:
       contents: write            # records the submission state on the release
+    # With every other job that writes a driver release (queue: max: a
+    # waiting job is not cancelled by the next one).
+    concurrency:
+      group: driver-release-writes
+      cancel-in-progress: false
+      queue: max
     outputs:
       verify_tag: ${{ steps.attest.outputs.verify_tag }}
     steps:

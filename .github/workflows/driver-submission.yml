@@ -16,14 +16,20 @@ name: Driver submission
 #      there authorizes exactly this CAB's SHA-256) and adds the signed CAB
 #      to the release.
 #
-# Every write to the release goes through .github/scripts/driver_release.py:
-# a run writes only a release that is new or its own commit's unsigned
-# build, never one that is certified or attested, and nothing on a release
-# is deleted before its replacement is up. A new driver build must be
-# numbered above every driver release there is (driver_release.py
-# submission-check stops the run before the build otherwise). Dispatched
+# Every write to the release goes through .github/scripts/driver_release.py,
+# in the jobs `record` and `record-signed`, which run on main only and in
+# the repository-wide group driver-release-writes (every job of every
+# workflow that writes a driver release waits there for the others). A run
+# writes only a release that is new or its own commit's unsigned build,
+# never one that is certified or attested, decides each write on the
+# release as it is at that moment, and deletes nothing before its
+# replacement is up. A new driver build must be numbered above every driver
+# release there is (driver_release.py submission-check stops the run before
+# the build otherwise). The other jobs hold a read-only token: dispatched
 # from any branch but main, the run builds the CAB (artifact
-# submission-cab) and stops: no release, no signature, no cleanup.
+# submission-cab) and stops. NB when this workflow completes, GitHub starts
+# main's Driver attest (workflow_run), whatever ref this run was on; that
+# workflow acts only on runs of main.
 #
 # When this workflow completes, driver-attest.yml can take over (opt-in via
 # the AUTO_ATTEST repository variable): it submits the EV-signed CAB to
@@ -60,9 +66,9 @@ on:
         default: false
 
 # A newer driver push obsoletes an in-flight submission build of the same
-# ref (a dispatch from a branch, which writes nothing, no longer cancels
+# ref (a dispatch from a branch, which writes nothing, doesn't cancel
 # main's run). A run cancelled while it writes a release leaves at most a
-# <name>.pending asset, which the next run finishes. Completed stale
+# <name>.pending asset, which the next writer finishes. Completed stale
 # prereleases are handled by the cleanup step instead. NB a cancelled
 # sign-cab job can leave a signing-repo run Waiting — reject it there (the
 # digest in its run name identifies it).
@@ -70,8 +76,9 @@ concurrency:
   group: driver-submission-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only; record and record-signed declare what they write.
 permissions:
-  contents: write
+  contents: read
 
 env:
   # Keep in sync with build.yml — the WDK cache restore below reuses
@@ -118,8 +125,13 @@ jobs:
     timeout-minutes: 60
     outputs:
       version: ${{ steps.drvver.outputs.version }}
+      prefix: ${{ steps.drvver.outputs.prefix }}
       build: ${{ steps.drvver.outputs.build }}
       tag: ${{ steps.drvver.outputs.tag }}
+      source_hash: ${{ steps.srchash.outputs.hash }}
+      # The directory the linker ran in (embedded in the PDB path), which
+      # driver-reproducibility.yml rebuilds in.
+      build_root: ${{ github.workspace }}
       cab_name: ${{ steps.cab.outputs.name }}
       cab_sha256: ${{ steps.cab.outputs.sha256 }}
     steps:
@@ -364,62 +376,70 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-      # Creates driver-v<version> (prerelease) or takes over this commit's
-      # own unsigned build of it, then writes manifest.json last.
-      - name: Record the build on its driver release (main only)
-        if: github.ref == 'refs/heads/main'
-        shell: pwsh
+  # The release writes of the build: driver-v<version> created (or this
+  # commit's own unsigned build of it taken over) with manifest.json, then
+  # the cleanup. Main only, contents: write, and in the group every
+  # driver-release writer waits in (queue: max: a waiting job is not
+  # cancelled by the next one).
+  record:
+    needs: [certified-guard, build-cab]
+    if: needs.certified-guard.outputs.proceed == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: driver-release-writes
+      cancel-in-progress: false
+      queue: max
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.build-cab.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Record the build on its driver release
         env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.drvver.outputs.tag }}
-          VERSION: ${{ steps.drvver.outputs.version }}
-          PREFIX: ${{ steps.drvver.outputs.prefix }}
-          BUILD: ${{ steps.drvver.outputs.build }}
-          SOURCE_HASH: ${{ steps.srchash.outputs.hash }}
-          # How this binary was built, for driver-reproducibility.yml: the
-          # linker embeds the PDB path, so a rebuild has to happen in the
-          # same directory.
-          BUILD_ROOT: ${{ github.workspace }}
-          CAB_NAME: ${{ steps.cab.outputs.name }}
-          CAB_SHA256: ${{ steps.cab.outputs.sha256 }}
+          VERSION: ${{ needs.build-cab.outputs.version }}
+          PREFIX: ${{ needs.build-cab.outputs.prefix }}
+          BUILD: ${{ needs.build-cab.outputs.build }}
+          SOURCE_HASH: ${{ needs.build-cab.outputs.source_hash }}
+          BUILD_ROOT: ${{ needs.build-cab.outputs.build_root }}
+          CAB_NAME: ${{ needs.build-cab.outputs.cab_name }}
+          CAB_SHA256: ${{ needs.build-cab.outputs.cab_sha256 }}
           AUTO_ATTEST: ${{ vars.AUTO_ATTEST }}
         run: |
-          $releaseArgs = @("submission-release", "--tag", $env:TAG, "--commit", $env:GITHUB_SHA,
-              "--version", $env:VERSION, "--prefix", $env:PREFIX, "--build", $env:BUILD,
-              "--source-hash", $env:SOURCE_HASH, "--build-root", $env:BUILD_ROOT,
-              "--cab-name", $env:CAB_NAME, "--cab-sha256", $env:CAB_SHA256, "--auto-attest", "$env:AUTO_ATTEST")
-          python .github/scripts/driver_release.py @releaseArgs
-          if ($LASTEXITCODE -ne 0) { throw "could not record the build on $env:TAG (see above)" }
+          python3 .github/scripts/driver_release.py submission-release --tag "$TAG" --commit "$GITHUB_SHA" \
+            --version "$VERSION" --prefix "$PREFIX" --build "$BUILD" --source-hash "$SOURCE_HASH" \
+            --build-root "$BUILD_ROOT" --cab-name "$CAB_NAME" --cab-sha256 "$CAB_SHA256" --auto-attest "$AUTO_ATTEST"
 
-      # Older builds that a newer one supersedes and that hold nothing
-      # anyone approved or Microsoft returned (never EV-signed, never
-      # submitted) are deleted, so the release list shows one pending
-      # build. Certified and attested releases, EV-signed CABs and Partner
-      # Center submissions are kept; so is any release whose manifest can't
-      # be read.
-      - name: Clean up superseded unsigned driver builds (main only)
-        if: github.ref == 'refs/heads/main'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.drvver.outputs.tag }}
-        run: |
-          python .github/scripts/driver_release.py submission-cleanup --tag $env:TAG
-          if ($LASTEXITCODE -ne 0) { throw "cleanup failed (see above)" }
+      # Older builds that a newer one supersedes and that nothing was ever
+      # done with (only their manifest, nothing signed or submitted, a
+      # commit of main) are deleted, so the release list shows one pending
+      # build. Everything else is kept and named in the run summary.
+      - name: Clean up superseded unsigned driver builds
+        run: python3 .github/scripts/driver_release.py submission-cleanup --tag "$TAG" --commit "$GITHUB_SHA"
 
   # EV-sign the submission CAB through the central signing repo. One human
-  # approval there (check the sha256 in the run name), then this job adds
-  # the signed CAB to the release and records its hash. Runs on branch
-  # `main` only, so the request-signing environment must allow main in its
-  # deployment branches policy (see docs/driver-signing.md, one-time setup).
+  # approval there (check the sha256 in the run name); the signed CAB goes
+  # to record-signed as the artifact signed-cab. This job writes no release
+  # and is not in the writers' group, so its wait for the approval holds no
+  # other writer up. Runs on branch `main` only, so the request-signing
+  # environment must allow main in its deployment branches policy (see
+  # docs/driver-signing.md, one-time setup).
   sign-cab:
-    needs: [certified-guard, build-cab]
+    needs: [certified-guard, build-cab, record]
     if: needs.certified-guard.outputs.proceed == 'true' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
     environment: request-signing
     timeout-minutes: 150
+    outputs:
+      signed_sha256: ${{ steps.sign.outputs.signed-sha256 }}
     permissions:
-      contents: write
+      contents: read
       actions: read              # gh run download of the submission-cab artifact
     env:
       GH_TOKEN: ${{ github.token }}
@@ -438,19 +458,52 @@ jobs:
           token: ${{ secrets.SIGNING_REPO_TOKEN }}
           wait-minutes: "120"
 
-      # Only onto the release that still records exactly the unsigned CAB
-      # this run built; the manifest is written last.
+      # Kept for three days: re-running record-signed alone within them
+      # needs no new signature.
+      - name: Hand the signed CAB to record-signed
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-cab
+          path: ${{ steps.sign.outputs.signed-path }}
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+
+  # Adds the EV-signed CAB to the release that still records exactly the
+  # unsigned CAB this run built, then its hash to the manifest (last).
+  record-signed:
+    needs: [build-cab, sign-cab]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read              # the signed-cab artifact
+    concurrency:
+      group: driver-release-writes
+      cancel-in-progress: false
+      queue: max
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-cab
+          path: signed
+
       - name: Add the EV-signed CAB to the driver release
-        shell: pwsh
         env:
           TAG: ${{ needs.build-cab.outputs.tag }}
+          CAB_NAME: ${{ needs.build-cab.outputs.cab_name }}
           CAB_SHA256: ${{ needs.build-cab.outputs.cab_sha256 }}
-          SIGNED: ${{ steps.sign.outputs.signed-path }}
-          SIGNED_SHA256: ${{ steps.sign.outputs.signed-sha256 }}
+          SIGNED_SHA256: ${{ needs.sign-cab.outputs.signed_sha256 }}
           AUTO_ATTEST: ${{ vars.AUTO_ATTEST }}
         run: |
-          $signedArgs = @("submission-signed", "--tag", $env:TAG, "--commit", $env:GITHUB_SHA,
-              "--cab-sha256", $env:CAB_SHA256, "--signed", $env:SIGNED, "--signed-sha256", $env:SIGNED_SHA256,
-              "--auto-attest", "$env:AUTO_ATTEST")
-          python .github/scripts/driver_release.py @signedArgs
-          if ($LASTEXITCODE -ne 0) { throw "could not add the EV-signed CAB to $env:TAG (see above)" }
+          python3 .github/scripts/driver_release.py submission-signed --tag "$TAG" --commit "$GITHUB_SHA" \
+            --cab-sha256 "$CAB_SHA256" --signed "signed/$CAB_NAME" --signed-sha256 "$SIGNED_SHA256" \
+            --auto-attest "$AUTO_ATTEST"

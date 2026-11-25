@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 
 
 class GhFailed(Exception):
@@ -44,6 +45,13 @@ class FakeReleases:
         # tag name -> the commit it points at (git/ref/tags)
         self.tag_commits = {}
         self.tags = {}
+        # Asset names whose plain upload breaks half way: an empty asset in
+        # state "starter" stays, and the call fails.
+        self.broken_uploads = set()
+        # (base, head) -> compare status ("ahead", "identical", "behind", ...)
+        self.compares = {}
+        self.gates = []
+        self.lock = threading.Lock()
 
     # -- building the fake --------------------------------------------------
     def _id(self):
@@ -83,6 +91,14 @@ class FakeReleases:
         """Make the first call matching `predicate(args)` fail (once)."""
         self.failures.append([predicate, exc])
 
+    def pause_before(self, predicate, arrived=None):
+        """Hold the first call matching `predicate(args)` until the returned
+        gate's `go` is set; `arrived` (an Event, made when not given) is set
+        when the call gets there. For two runs interleaved on threads."""
+        gate = {"predicate": predicate, "arrived": arrived or threading.Event(), "go": threading.Event()}
+        self.gates.append(gate)
+        return gate
+
     # -- what was done ------------------------------------------------------
     def writes(self):
         """The calls that change a release."""
@@ -113,6 +129,16 @@ class FakeReleases:
     # -- gh -------------------------------------------------------------------
     def __call__(self, *args):
         args = tuple(str(a) for a in args)
+        for gate in self.gates:
+            if gate["predicate"] is not None and gate["predicate"](args):
+                gate["predicate"] = None
+                gate["arrived"].set()
+                if not gate["go"].wait(60):
+                    raise AssertionError("a paused call was never let go")
+        with self.lock:
+            return self._call(args)
+
+    def _call(self, args):
         self.calls.append(args)
         for f in self.failures:
             if f[0] is not None and f[0](args):
@@ -161,6 +187,18 @@ class FakeReleases:
             if "--jq" in rest:
                 return "".join(json.dumps(self._view(r)) + "\n" for r in rels)
             return json.dumps([self._view(r) for r in rels])
+        m = re.fullmatch(rf"repos/{re.escape(self.repo)}/releases/tags/(.+)", path)
+        if m and method == "GET":
+            rel = next((r for r in self.releases if r["tag_name"] == m.group(1) and not r["draft"]), None)
+            if rel is None:
+                raise self.error("gh api failed (1): Not Found (HTTP 404)")
+            return json.dumps(self._view(rel))
+        m = re.fullmatch(rf"repos/{re.escape(self.repo)}/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)", path)
+        if m and method == "GET":
+            status = self.compares.get((m.group(1), m.group(2)))
+            if status is None:
+                raise self.error("gh api failed (1): Not Found (HTTP 404)")
+            return json.dumps({"status": status})
         m = re.fullmatch(rf"repos/{re.escape(self.repo)}/releases/(\d+)", path)
         if m:
             rel = self._by_id(int(m.group(1)))
@@ -228,6 +266,10 @@ class FakeReleases:
                         raise self.error(f"gh release upload failed (1): uploading {name}: HTTP 502")
                 elif any(a["name"] == name for a in rel["assets"]):
                     raise self.error(f"gh release upload failed (1): asset under the same name already exists: [{name}]")
+                if name in self.broken_uploads:
+                    self.broken_uploads.discard(name)
+                    self.add_asset(rel, name, b"", state="starter")
+                    raise self.error(f"gh release upload failed (1): uploading {name}: connection reset")
                 with open(path, "rb") as fh:
                     self.add_asset(rel, name, fh.read())
             return ""

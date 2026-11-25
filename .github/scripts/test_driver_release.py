@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 import unittest.mock
 
@@ -23,6 +24,7 @@ MAIN = "refs/heads/main"
 HASH = "5" * 64
 CAB_SHA = "ca" * 32
 TAG = "driver-v1.1.2.140"
+HEAD_COMMIT = "d" * 40
 CAB = "StreamToSpeaker-Driver-1.1.2.140-Submission.cab"
 
 
@@ -126,7 +128,11 @@ class Base(unittest.TestCase):
                             "--signed", path, "--signed-sha256", sha(data), ref=ref)
 
     def cleanup(self, fake, tag=TAG, ref=MAIN):
-        return self.run_cmd(fake, "submission-cleanup", "--tag", tag, ref=ref)
+        # The run's own commit: older builds of commits before it count as
+        # builds of main.
+        for r in fake.releases:
+            fake.compares.setdefault((r["target_commitish"], HEAD_COMMIT), "ahead")
+        return self.run_cmd(fake, "submission-cleanup", "--tag", tag, "--commit", HEAD_COMMIT, ref=ref)
 
     def record(self, fake, tag="driver-v1.1.2.140", data=b"canonical zip", bundle=None):
         version = tag.removeprefix("driver-v")
@@ -207,10 +213,11 @@ class AFinishedReleaseIsNeverChanged(Base):
         rel = dr.DriverRelease(REPO, "driver-v1.1.1.211", fake, sleep=lambda s: None)
         self.assertEqual(rel.put(b"signed zip", "StreamToSpeaker-Driver-1.1.1.211-Signed.zip"), "unchanged")
         self.assertEqual(rel.write_manifest(certified_manifest()), "unchanged")
-        with self.assertRaisesRegex(ra.ReleaseError, "never changed"):
-            rel.put(b"other bytes", "StreamToSpeaker-Driver-1.1.1.211-Signed.zip")
+        # A new file first: no other rule stands in front of this one.
         with self.assertRaisesRegex(ra.ReleaseError, "never changed"):
             rel.put(b"a new file", "notes.txt")
+        with self.assertRaisesRegex(ra.ReleaseError, "never changed"):
+            rel.put(b"other bytes", "StreamToSpeaker-Driver-1.1.1.211-Signed.zip")
         with self.assertRaisesRegex(ra.ReleaseError, "never changed"):
             rel.write_manifest(certified_manifest(ms_state="other"))
         with self.assertRaisesRegex(ra.ReleaseError, "never changed"):
@@ -314,7 +321,7 @@ class EachWorkflowWritesOnlyWhatIsItsToAdvance(Base):
 
     def test_cleanup_deletes_only_older_builds_nobody_signed_or_submitted(self):
         fake = Fake()
-        fake.add_release("driver-v1.1.2.130", {"manifest.json": submission_manifest("1.1.2.130")})
+        fake.add_release("driver-v1.1.2.130", {"manifest.json": submission_manifest("1.1.2.130")}, target=COMMIT)
         fake.add_release("driver-v1.1.2.131", {"manifest.json": submission_manifest(
             "1.1.2.131", submission_cab_signed_sha256=sha(b"s"))})
         fake.add_release("driver-v1.1.2.132", {"manifest.json": submission_manifest(
@@ -403,7 +410,8 @@ class AFailedUploadLeavesTheReleaseWithWhatItHad(Base):
         rel.finish_interrupted()
         self.assertEqual(fake.files("v1"), {"b.txt": b"b", "a.txt": b"new"})
 
-    def test_a_replacement_stopped_before_the_delete_is_dropped_by_the_next_writer(self):
+    def test_a_replacement_stopped_before_the_delete_is_rolled_forward_by_the_next_writer(self):
+        # The new bytes were completely uploaded: the writer had decided.
         fake = Fake()
         fake.add_release("v1", {"a.txt": b"old"})
         rel = ra.Release.find(REPO, "v1", fake, sleep=lambda s: None)
@@ -412,6 +420,13 @@ class AFailedUploadLeavesTheReleaseWithWhatItHad(Base):
             rel.put(b"new", "a.txt")
         rel = ra.Release.find(REPO, "v1", fake, sleep=lambda s: None)
         rel.finish_interrupted()
+        self.assertEqual(fake.files("v1"), {"a.txt": b"new"})
+
+    def test_a_broken_pending_upload_is_removed_by_the_next_writer(self):
+        fake = Fake()
+        rel = fake.add_release("v1", {"a.txt": b"old"})
+        fake.add_asset(rel, "a.txt.pending", b"", state="starter")
+        ra.Release.find(REPO, "v1", fake, sleep=lambda s: None).finish_interrupted()
         self.assertEqual(fake.files("v1"), {"a.txt": b"old"})
 
     def test_a_rename_that_fails_for_a_while_is_retried(self):
@@ -472,11 +487,12 @@ class AFailedUploadLeavesTheReleaseWithWhatItHad(Base):
         self.assertEqual(self.record(fake), 0, self.output)
         self.assertIs(fake.manifest(TAG)["attested"], True)
 
-    def test_a_manifest_left_as_pending_is_read_and_finished(self):
+    def test_a_manifest_left_as_pending_is_finished_by_the_next_writer(self):
         fake = Fake()
         fake.add_release(TAG, {"manifest.json.pending": submission_manifest()}, target=COMMIT)
         rel = dr.DriverRelease(REPO, TAG, fake, sleep=lambda s: None)
-        self.assertEqual(rel.manifest, submission_manifest())
+        self.assertIsNone(rel.manifest)
+        self.assertTrue(rel.interrupted)
         self.assertEqual(self.signed(fake), 0, self.output)
         self.assertEqual(sorted(fake.files(TAG)), sorted([CAB, CAB + ".sha256", "manifest.json"]))
 
@@ -657,6 +673,286 @@ class TestSignedFallback(Base):
         fake.tags[("tree", self.TAGGED)] = {"driver": "d1", "include": "i1"}
         self.assertEqual(self.fallback(fake), 0, self.output)
         self.assertIn("not compared", self.output)
+
+
+class TwoRunsAtOnce(Base):
+    """A write is decided on the release as it is at that moment: a run
+    refuses to write a release another run (or a person) changed since this
+    run read it or last wrote it."""
+
+    def test_a_run_that_read_the_release_before_another_finished_it_writes_nothing(self):
+        fake = Fake()
+        returned_release(fake)
+        early = dr.DriverRelease(REPO, TAG, fake, sleep=lambda s: None)     # run 1 reads the release
+        self.assertEqual(self.record(fake), 0, self.output)                 # run 2 finishes it
+        with self.assertRaises(ra.ReleaseError):
+            early.write_manifest(dict(early.manifest, ms_state="done"))
+        with self.assertRaises(ra.ReleaseError):
+            early.put(b"x", "notes.txt")
+        self.assertIs(fake.manifest(TAG)["attested"], True)
+        self.assertNotIn("notes.txt", fake.files(TAG))
+
+    def test_a_release_changed_by_hand_since_this_run_read_it_is_not_written(self):
+        fake = Fake()
+        fake.add_release(TAG, {"manifest.json": submission_manifest()}, target=COMMIT)
+        rel = dr.DriverRelease(REPO, TAG, fake, sleep=lambda s: None)
+        fake.add_asset(fake.release(TAG), "attached-by-hand.zip", b"zip")
+        writes = len(fake.writes())
+        with self.assertRaisesRegex(ra.ReleaseError, "changed since this run"):
+            rel.write_manifest(submission_manifest(submission_cab_sha256="cb" * 32))
+        self.assertEqual(len(fake.writes()), writes)
+        self.assertEqual(fake.manifest(TAG), submission_manifest())
+
+    def test_its_own_writes_do_not_count_as_a_change(self):
+        fake = Fake()
+        fake.add_release(TAG, {"manifest.json": submission_manifest()}, target=COMMIT)
+        rel = dr.DriverRelease(REPO, TAG, fake, sleep=lambda s: None)
+        rel.put(b"a", "a.txt")
+        rel.put(b"b", "a.txt")
+        rel.write_manifest(submission_manifest(submission_cab_sha256="cb" * 32))
+        self.assertEqual(fake.files(TAG)["a.txt"], b"b")
+
+    def test_another_release_given_the_same_tag_is_not_written(self):
+        fake = Fake()
+        fake.add_release(TAG, {"manifest.json": submission_manifest()}, target=COMMIT)
+        rel = dr.DriverRelease(REPO, TAG, fake, sleep=lambda s: None)
+        fake.releases[0]["tag_name"] = "driver-v1.1.2.141"
+        fake.add_release(TAG, {"manifest.json": submission_manifest()}, target=COMMIT)
+        with self.assertRaises(ra.ReleaseError):
+            rel.put(b"a", "a.txt")
+
+    def test_two_writers_interleaved_never_leave_only_a_pending_manifest(self):
+        # Writer A has uploaded manifest.json.pending and is about to delete
+        # the old manifest; writer B, which read the release just then,
+        # replaces manifest.json too. Whatever B does, the release ends with
+        # a complete manifest.json, and B never deletes A's upload.
+        fake = Fake()
+        fake.add_release(TAG, {"manifest.json": b"old"})
+        a = ra.Release.find(REPO, TAG, fake, sleep=lambda s: None)
+        old_id = a.asset("manifest.json")["id"]
+        results = {}
+
+        def run(name, rel, data, stopped=None):
+            try:
+                results[name] = rel.put(data, "manifest.json")
+            except Exception as e:  # each writer's own outcome is reported
+                results[name] = e
+            if stopped:
+                stopped.set()
+
+        def deleting_old(thread):
+            return lambda c: (threading.current_thread() is thread and c[:3] == ("api", "--method", "DELETE")
+                              and c[3].endswith(f"/{old_id}"))
+        ta = threading.Thread(target=run, args=("A", a, b"A"))
+        a_at_delete = fake.pause_before(deleting_old(ta))
+        ta.start()
+        self.assertTrue(a_at_delete["arrived"].wait(30))
+        b = ra.Release.find(REPO, TAG, fake, sleep=lambda s: None)
+        b_stopped = threading.Event()
+        tb = threading.Thread(target=run, args=("B", b, b"B", b_stopped))
+        b_at_delete = fake.pause_before(deleting_old(tb), arrived=b_stopped)
+        tb.start()
+        self.assertTrue(b_stopped.wait(30))
+        a_at_delete["go"].set()
+        ta.join(30)
+        b_at_delete["go"].set()
+        tb.join(30)
+        files = fake.files(TAG)
+        self.assertIn("manifest.json", files, (results, sorted(files)))
+        self.assertIn(files["manifest.json"], (b"A", b"B"))
+        self.assertNotIn("manifest.json.pending", files)
+
+    def test_put_never_deletes_a_pending_upload_it_did_not_make(self):
+        fake = Fake()
+        fake.add_release(TAG, {"manifest.json": b"old", "manifest.json.pending": b"another run's"})
+        rel = ra.Release.find(REPO, TAG, fake, sleep=lambda s: None)
+        with self.assertRaisesRegex(ra.ReleaseError, "manifest.json.pending"):
+            rel.put(b"mine", "manifest.json")
+        self.assertEqual(fake.files(TAG)["manifest.json.pending"], b"another run's")
+        self.assertEqual(fake.writes(), [])
+
+
+class AnInterruptedManifestWriteIsFinishedByTheReRun(Base):
+    """attested-record's last write replaces manifest.json with the finished
+    one. Wherever that write stops, every reader treats the release
+    correctly and the re-run completes it."""
+    PENDING = "manifest.json.pending"
+
+    def stop_record(self, fake, predicate, exc=None, times=1):
+        for _ in range(times):
+            fake.fail_when(predicate, exc)
+        try:
+            return self.record(fake)
+        except fake_gh.Stop:
+            return "stopped"
+
+    def assertReRunFinishes(self, fake):
+        self.assertEqual(self.record(fake), 0, self.output)
+        files = fake.files(TAG)
+        self.assertNotIn(self.PENDING, files)
+        self.assertIs(fake.manifest(TAG)["attested"], True)
+        self.assertEqual(fake.manifest(TAG)["ms_submission_id"], "8")
+
+    def test_the_rename_fails(self):
+        fake = Fake()
+        returned_release(fake)
+        rename = lambda c: c[:3] == ("api", "--method", "PATCH") and "/releases/assets/" in c[3]
+        self.assertEqual(self.stop_record(fake, rename, times=3), 1)
+        self.assertIn(self.PENDING, fake.files(TAG))
+        self.assertNotIn("manifest.json", fake.files(TAG))
+        self.assertReRunFinishes(fake)
+
+    def test_stopped_after_the_old_manifest_is_deleted(self):
+        fake = Fake()
+        returned_release(fake)
+        rename = lambda c: c[:3] == ("api", "--method", "PATCH") and "/releases/assets/" in c[3]
+        self.assertEqual(self.stop_record(fake, rename, fake_gh.Stop()), "stopped")
+        self.assertReRunFinishes(fake)
+
+    def test_stopped_before_the_old_manifest_is_deleted(self):
+        fake = Fake()
+        returned_release(fake)
+        old_id = next(a["id"] for a in fake.release(TAG)["assets"] if a["name"] == "manifest.json")
+        delete = lambda c: c[:3] == ("api", "--method", "DELETE") and c[3].endswith(f"/{old_id}")
+        self.assertEqual(self.stop_record(fake, delete, fake_gh.Stop()), "stopped")
+        # Readers still see the old, unfinished manifest.
+        self.assertIsNot(dr.DriverRelease(REPO, TAG, fake).manifest.get("attested"), True)
+        self.assertReRunFinishes(fake)
+
+    def test_stopped_during_the_pending_upload(self):
+        fake = Fake()
+        returned_release(fake)
+        fake.broken_uploads.add(self.PENDING)
+        self.assertEqual(self.record(fake), 1)
+        self.assertEqual(self.record(fake), 0, self.output)
+        self.assertIs(fake.manifest(TAG)["attested"], True)
+        self.assertNotIn(self.PENDING, fake.files(TAG))
+
+    def test_readers_never_take_the_pending_manifest_for_the_release_s(self):
+        fake = Fake()
+        returned_release(fake)
+        rename = lambda c: c[:3] == ("api", "--method", "PATCH") and "/releases/assets/" in c[3]
+        self.stop_record(fake, rename, times=3)
+        self.assertIsNone(dr.DriverRelease(REPO, TAG, fake).manifest)
+        with self.assertRaisesRegex(ra.ReleaseError, "manifest.json.pending"):
+            dr.manifests(REPO, dr.driver_releases(REPO, fake), fake)
+        # The certified guard and the fallback check stop instead of answering.
+        self.assertEqual(self.run_cmd(fake, "submission-guard", "--source-hash", HASH), 1)
+        self.assertEqual(self.run_cmd(fake, "fallback-check", "--source-hash", "7" * 64, "--commit", "f" * 40), 1)
+
+
+class FinishingAnInterruptedWriteKeepsWhatItRecorded(Base):
+    def test_a_complete_pending_manifest_is_rolled_forward_not_dropped(self):
+        # Driver attest recorded the new Partner Center ids, and the run
+        # stopped after manifest.json.pending was up, before the old
+        # manifest was deleted: the next writer keeps the ids.
+        fake = Fake()
+        fake.add_release(TAG, {"manifest.json": submission_manifest(),
+                               "manifest.json.pending": submission_manifest(ms_product_id="111",
+                                                                            ms_submission_id="222",
+                                                                            ms_state="created")})
+        rel = dr.DriverRelease(REPO, TAG, fake, sleep=lambda s: None)
+        rel.begin()
+        self.assertEqual(fake.manifest(TAG)["ms_submission_id"], "222")
+        self.assertEqual(rel.manifest["ms_submission_id"], "222")
+        self.assertNotIn("manifest.json.pending", fake.files(TAG))
+
+    def test_nothing_is_rolled_forward_over_a_finished_manifest(self):
+        fake = Fake()
+        rel = certified_release(fake)
+        fake.add_asset(rel, "manifest.json.pending", json.dumps(certified_manifest(certified=False)).encode())
+        before = fake.files("driver-v1.1.1.211")
+        dr.DriverRelease(REPO, "driver-v1.1.1.211", fake).begin()
+        self.assertEqual(fake.files("driver-v1.1.1.211"), before)
+
+
+class ABrokenFirstManifestBlocksNobody(Base):
+    def test_the_run_that_wrote_it_replaces_it(self):
+        fake = Fake()
+        rel = fake.add_release(TAG, target=COMMIT)
+        fake.add_asset(rel, "manifest.json", b"", state="starter")
+        self.assertIsNone(dr.DriverRelease(REPO, TAG, fake).manifest)
+        self.assertEqual(self.check(fake), 0, self.output)
+        self.assertEqual(self.release(fake), 0, self.output)
+        self.assertEqual(fake.manifest(TAG), submission_manifest())
+
+
+class CleanupKeepsWhatItCannotShowIsAnUntouchedBuild(Base):
+    HEAD = "d" * 40
+
+    def cleanup_from(self, fake):
+        return self.run_cmd(fake, "submission-cleanup", "--tag", TAG, "--commit", self.HEAD)
+
+    def old(self, fake, version="1.1.2.130", assets=None, ancestor=True, **kw):
+        m = submission_manifest(version, **kw)
+        rel = fake.add_release(f"driver-v{version}", {"manifest.json": m, **(assets or {})}, target=COMMIT)
+        if ancestor:
+            fake.compares[(COMMIT, self.HEAD)] = "ahead"
+        return rel
+
+    def test_an_untouched_unsigned_build_of_main_is_deleted(self):
+        fake = Fake()
+        self.old(fake)
+        fake.add_release(TAG, {"manifest.json": submission_manifest()})
+        self.assertEqual(self.cleanup_from(fake), 0, self.output)
+        self.assertIsNone(fake.release("driver-v1.1.2.130"))
+
+    def test_an_ev_signed_cab_the_manifest_does_not_record_yet_is_kept(self):
+        fake = Fake()
+        self.old(fake, assets={"StreamToSpeaker-Driver-1.1.2.130-Submission.cab": b"approved, signed"})
+        fake.add_release(TAG, {"manifest.json": submission_manifest()})
+        self.assertEqual(self.cleanup_from(fake), 0, self.output)
+        self.assertIsNotNone(fake.release("driver-v1.1.2.130"))
+        self.assertIn("driver-v1.1.2.130", open(self.summary).read())
+
+    def test_anything_else_is_kept(self):
+        cases = {
+            "an unknown manifest field": dict(extra_field="x"),
+            "a recorded signature": dict(submission_cab_signed_sha256=sha(b"s")),
+            "a Partner Center id": dict(ms_submission_id="5"),
+            "not an ancestor of main": dict(ancestor=False),
+        }
+        for what, kw in cases.items():
+            with self.subTest(what):
+                fake = Fake()
+                self.old(fake, **kw)
+                fake.add_release(TAG, {"manifest.json": submission_manifest()})
+                self.assertEqual(self.cleanup_from(fake), 0, self.output)
+                self.assertIsNotNone(fake.release("driver-v1.1.2.130"), what)
+
+    def test_a_list_that_cannot_be_read_deletes_nothing(self):
+        fake = Fake()
+        self.old(fake)
+        fake.add_release(TAG, {"manifest.json": submission_manifest()})
+        fake.fail_when(lambda c: "--paginate" in c)
+        self.assertEqual(self.cleanup_from(fake), 0, self.output)
+        self.assertIsNotNone(fake.release("driver-v1.1.2.130"))
+
+
+class TheRunSummaryKeepsEachManifestWritten(Base):
+    def test_the_manifest_that_finished_a_release_is_in_the_summary(self):
+        # What a maintainer puts back if a write from outside the group
+        # replaced it in the moment before this run's write.
+        fake = Fake()
+        returned_release(fake)
+        self.assertEqual(self.record(fake), 0, self.output)
+        text = open(self.summary).read()
+        self.assertIn("manifest.json written to driver-v1.1.2.140", text)
+        self.assertIn(json.dumps(fake.manifest(TAG), indent=2), text)
+
+
+class NoTemporaryFolderIsLeftBehind(Base):
+    def test_commands_remove_what_they_create(self):
+        tmp = tempfile.mkdtemp(dir=self.tmp)
+        with unittest.mock.patch.object(tempfile, "tempdir", tmp):
+            fake = Fake()
+            returned_release(fake)
+            self.assertEqual(self.record(fake, bundle=b"{}"), 0, self.output)
+            fake.add_release("driver-v1.1.2.150", target=COMMIT)
+            self.assertEqual(self.release(fake, "driver-v1.1.2.150"), 0, self.output)
+            self.assertEqual(self.run_cmd(fake, "attested-fetch", "--tag", TAG, "--dry-run",
+                                          "--dir", os.path.join(self.tmp, "a")), 0, self.output)
+        self.assertEqual(os.listdir(tmp), [])
 
 
 class Words(unittest.TestCase):

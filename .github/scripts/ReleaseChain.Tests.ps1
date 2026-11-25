@@ -51,8 +51,10 @@ BeforeAll {
         if ($a[0] -eq "api" -and ($a -join " ") -like "*releases?per_page=100*") {
             if ($Fail -contains "list") { $global:LASTEXITCODE = 1; return }
             $global:LASTEXITCODE = 0
+            # As the script's --jq prints them: only completely uploaded assets.
             foreach ($r in $Releases) {
-                [ordered]@{ tag_name = $r.tag_name; draft = $r.draft; assets = @($r.assets.Keys) } | ConvertTo-Json -Compress
+                $names = @($r.assets.Keys | Where-Object { -not $r.broken -or $r.broken -notcontains $_ })
+                [ordered]@{ tag_name = $r.tag_name; draft = $r.draft; assets = $names } | ConvertTo-Json -Compress
             }
             return
         }
@@ -136,6 +138,33 @@ Describe "Get-AttestedDriver.ps1" {
         $rel.assets["StreamToSpeaker-Driver-1.1.1.211-Signed.zip"] = (New-Zip @{ "StreamToSpeaker.inf" = [byte[]](9) })
         $Releases = @($rel)
         { Invoke-Lookup -WarnOnError } | Should -Throw "*refusing to use it*"
+    }
+
+    It "stops when a release's manifest write was interrupted; -WarnOnError makes that found=false" {
+        # manifest.json.pending and no manifest.json: the release may be a
+        # finished one whose last write didn't complete, so it can't be
+        # ruled out.
+        $rel = New-DriverRelease "1.1.1.211" "certified" $Hash $Zip
+        $rel.assets["manifest.json.pending"] = $rel.assets["manifest.json"]
+        $rel.assets.Remove("manifest.json")
+        $Releases = @($rel)
+        { Invoke-Lookup } | Should -Throw "*manifest.json.pending*"
+        (Invoke-Lookup -WarnOnError).found | Should -Be "false"
+    }
+
+    It "reads the manifest.json that is there next to a pending one" {
+        $rel = New-DriverRelease "1.1.1.211" "certified" $Hash $Zip
+        $rel.assets["manifest.json.pending"] = [Text.Encoding]::UTF8.GetBytes("{}")
+        $Releases = @($rel)
+        (Invoke-Lookup).tag | Should -Be "driver-v1.1.1.211"
+    }
+
+    It "takes a manifest whose upload never completed for no manifest" {
+        $rel = New-DriverRelease "1.1.2.140" "none" $Hash $Zip
+        $rel.assets["manifest.json"] = [byte[]]@()
+        $rel.broken = @("manifest.json")
+        $Releases = @($rel, (New-DriverRelease "1.1.1.211" "certified" $Hash $Zip))
+        (Invoke-Lookup).tag | Should -Be "driver-v1.1.1.211"
     }
 
     It "extracts exactly the package files and reports the release" {
