@@ -1,0 +1,157 @@
+name: Panel click
+
+# Starts the app on a hosted Windows machine, clicks its tray icon with
+# real mouse input and keeps pictures of the desktop, a timeline of the
+# panel's window and the foreground, and the app's log: what Windows does
+# to the panel's window and its focus can only be seen on Windows. Logic in
+# .github/scripts/Test-PanelClick.ps1 (and PanelRig.cs next to it).
+#
+# Only started by hand. It builds its own copy of the app from the
+# dispatched commit, uses no secrets, reads the repository and changes
+# nothing outside the machines it runs on (the Rust cache is restored,
+# never saved).
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Windows to run on: Server 2025 has Windows 11's taskbar, Server 2022 Windows 10's"
+        type: choice
+        options: [windows-2025, windows-2022]
+        default: windows-2025
+      click:
+        description: "A single or a double click on the icon"
+        type: choice
+        options: [single, double]
+        default: single
+      icon:
+        description: "Where the icon sits: on the taskbar, or among the hidden icons"
+        type: choice
+        options: [taskbar, hidden]
+        default: taskbar
+      panel:
+        description: "The panel as a flyout (as people get it) or as a small window (a switch only a build with debug assertions reads, so the app is built with them)"
+        type: choice
+        options: [flyout, window]
+        default: flyout
+      start:
+        description: "Started at sign-in (--startup: it waits for the click) or by hand from a shortcut (the panel opens by itself)"
+        type: choice
+        options: [sign-in, menu]
+        default: sign-in
+      network:
+        description: "quiet: no port open to the network and no speaker search, so no firewall question; full: as installed"
+        type: choice
+        options: [quiet, full]
+        default: quiet
+      first_run:
+        description: "First run (no settings: losing the focus doesn't close the panel until first run is finished)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    # The same image the installer's build uses.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust (stable, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Restore Rust dependencies (nothing is saved)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: service
+          save-if: false
+
+      # As build.yml builds the app for the installer. The small-window form
+      # of the panel is a switch only builds with debug assertions read, so
+      # for it the release build gets them.
+      - name: Build the app
+        shell: pwsh
+        working-directory: service
+        env:
+          PANEL: ${{ inputs.panel }}
+        run: |
+          if ($env:PANEL -eq "window") { $env:CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true" }
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+
+      - name: Keep the app for the next job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: panel-click-app
+          path: service/target/release/stream-to-speaker.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  click:
+    needs: build
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: panel-click-app
+          path: ${{ runner.temp }}/app
+
+      # Hosted machines have no graphics driver, and the OpenGL Windows has
+      # without one (1.1) is less than the app's windows need. Mesa from the
+      # image's MSYS2 draws OpenGL in software; its opengl32.dll is the one
+      # a program finds first when it sits in the program's own folder, so
+      # the app runs from the folder Mesa's DLLs are in.
+      - name: Put the app next to Mesa's OpenGL
+        shell: pwsh
+        run: |
+          $msys = "C:\msys64"
+          if (-not (Test-Path "$msys\usr\bin\bash.exe")) { throw "this image has no MSYS2 at $msys" }
+          & "$msys\usr\bin\bash.exe" -lc "pacman -Sy --noconfirm --needed mingw-w64-x86_64-mesa"
+          if ($LASTEXITCODE -ne 0) { throw "pacman couldn't install Mesa" }
+          $bin = "$msys\mingw64\bin"
+          if (-not (Test-Path "$bin\opengl32.dll")) { throw "MSYS2's Mesa brought no opengl32.dll" }
+          Copy-Item (Join-Path $env:RUNNER_TEMP "app\stream-to-speaker.exe") $bin
+          "APP_EXE=$bin\stream-to-speaker.exe" >> $env:GITHUB_ENV
+
+      # Windows PowerShell: it has UI Automation, with which the script
+      # finds the icon and the button for the hidden icons.
+      - name: Start the app and click its tray icon
+        shell: powershell
+        env:
+          CLICK: ${{ inputs.click }}
+          ICON: ${{ inputs.icon }}
+          PANEL: ${{ inputs.panel }}
+          START: ${{ inputs.start }}
+          NETWORK: ${{ inputs.network }}
+          FIRST_RUN: ${{ inputs.first_run }}
+        run: >
+          .github/scripts/Test-PanelClick.ps1
+          -Exe $env:APP_EXE
+          -Click $env:CLICK -Icon $env:ICON -Panel $env:PANEL -Start $env:START -Network $env:NETWORK
+          -FirstRun:($env:FIRST_RUN -eq "true")
+          -Out (Join-Path $env:RUNNER_TEMP "panel-click")
+
+      - name: Keep the pictures and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: panel-click-${{ inputs.runner }}-${{ inputs.click }}-${{ inputs.icon }}-${{ inputs.panel }}-${{ inputs.start }}-${{ inputs.network }}${{ inputs.first_run && '-first-run' || '' }}
+          path: ${{ runner.temp }}/panel-click
+          if-no-files-found: warn
+          retention-days: 14
