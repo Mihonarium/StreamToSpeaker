@@ -94,6 +94,11 @@ impl Desktop for WindowsDesktop {
         Some(is_visible(hwnd))
     }
 
+    fn panel_ex_style(&self) -> Option<u32> {
+        let hwnd = self.styled.map(|h| h as HWND).filter(|h| is_own_window_titled(*h, PANEL_TITLE))?;
+        Some(ex_style(hwnd))
+    }
+
     fn foreground(&self) -> String {
         describe_foreground()
     }
@@ -150,6 +155,12 @@ fn program_name(pid: u32) -> Option<String> {
 }
 
 impl WindowsDesktop {
+    /// The extended style bits of the small window called `title`, shown or
+    /// not, if this thread has one (pop-ups have titles of their own).
+    pub fn popup_ex_style(&self, title: &str) -> Option<u32> {
+        own_window(title, false).map(ex_style)
+    }
+
     /// Style and place a hidden popup window (see [`Desktop::place_popup`]).
     fn place_popup_window(title: &str, rect: PxRect) -> bool {
         let Some(hwnd) = hidden_own_window(title) else { return false };
@@ -179,6 +190,12 @@ fn read_dword(key: &str, value: &str) -> Option<u32> {
 /// one: the panel before it is shown (a dialog may have the same title,
 /// but it is never hidden).
 pub fn hidden_own_window(title: &str) -> Option<HWND> {
+    own_window(title, true)
+}
+
+/// The app's top-level window called `title`, if this thread made one;
+/// with `hidden_only`, only one that is hidden.
+fn own_window(title: &str, hidden_only: bool) -> Option<HWND> {
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
@@ -196,12 +213,19 @@ pub fn hidden_own_window(title: &str) -> Option<HWND> {
         // SAFETY: a handle FindWindowExW just returned (a stale one only
         // makes the call return 0); the process id is not asked for.
         let thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
-        if thread == me && !is_visible(hwnd) {
+        if thread == me && !(hidden_only && is_visible(hwnd)) {
             return Some(hwnd);
         }
         after = hwnd;
     }
     None
+}
+
+/// A window's extended style bits (`GWL_EXSTYLE`).
+pub fn ex_style(hwnd: HWND) -> u32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE};
+    // SAFETY: a window of this thread; reading its style has no effect.
+    unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 }
 }
 
 /// Whether `hwnd` is still a window of this thread called `title`.

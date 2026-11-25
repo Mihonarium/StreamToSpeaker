@@ -118,6 +118,8 @@ pub struct PanelWindow {
     focused: Option<bool>,
     /// The log already said that its window is off screen while it is open.
     hidden_told: bool,
+    /// The extended style bits of its window the log last named.
+    style: Option<u32>,
 }
 
 /// For the log: what a frame saw of the focus.
@@ -143,6 +145,7 @@ impl PanelWindow {
             phase: Phase::Measuring { last: 0.0, stable: 0, frames: 0 },
             focused: None,
             hidden_told: false,
+            style: None,
         }
     }
 
@@ -167,6 +170,18 @@ impl PanelWindow {
         if self.shown() && !self.hidden_told && desktop.panel_window_shown() == Some(false) {
             self.hidden_told = true;
             log::warn!("panel: its window is off screen while the panel is open");
+        }
+        if self.shown() {
+            // The style it was shown with, and any change after: whether
+            // it stays out of Alt+Tab.
+            if let Some(ex) = desktop.panel_ex_style().filter(|ex| Some(*ex) != self.style) {
+                log::info!(
+                    "panel: its window's style is now {} (was {})",
+                    super::ex_style_words(ex),
+                    self.style.map_or_else(|| "not seen".to_string(), super::ex_style_words)
+                );
+                self.style = Some(ex);
+            }
         }
         if seen.focused != self.focused {
             if seen.focused == Some(false) && self.shown() {
@@ -209,11 +224,13 @@ impl PanelWindow {
         if let Phase::Placing { place, tries } = self.phase {
             let placed = desktop.place_panel(place.rect, mode);
             if placed || tries + 1 >= PLACE_TRIES {
+                self.style = desktop.panel_ex_style();
+                let style = self.style.map_or_else(|| "not found".to_string(), super::ex_style_words);
                 if placed {
-                    log::info!("panel: showing it (the foreground: {})", desktop.foreground());
+                    log::info!("panel: showing it (its window's style: {style}; the foreground: {})", desktop.foreground());
                 } else {
                     log::warn!(
-                        "panel: showing it, though Windows didn't confirm its place after {} tries (the foreground: {})",
+                        "panel: showing it, though Windows didn't confirm its place after {} tries (its window's style: {style}; the foreground: {})",
                         tries + 1,
                         desktop.foreground()
                     );

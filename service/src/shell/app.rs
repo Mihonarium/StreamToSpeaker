@@ -46,6 +46,8 @@ struct OpenPopup {
     content: Box<dyn PopupContent + Send>,
     /// Where it was put, once it is there (then it shows).
     rect: Option<PxRect>,
+    /// The extended style bits of its window the log last named.
+    style: Option<u32>,
 }
 
 /// How often the shell looks at what has no event of its own (a second
@@ -194,6 +196,7 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
                 tray_tickets: Vec::new(),
                 started: false,
                 first_run: None,
+                root_seen: None,
                 closing: false,
             }))
         }),
@@ -245,6 +248,9 @@ struct Shell {
     started: bool,
     /// Whether first run was on at the last frame, to log its changes.
     first_run: Option<bool>,
+    /// The root window's visibility and extended style bits the log last
+    /// named.
+    root_seen: Option<(bool, u32)>,
     closing: bool,
 }
 
@@ -267,6 +273,18 @@ impl Shell {
                     win::keep_out_of_alt_tab(root, true);
                 }
             }
+        }
+        // Whether it stays as it was made (hidden, or out of Alt+Tab and
+        // never active), after the shell set it and after Windows showed it.
+        let seen = (win::is_visible(root), win::ex_style(root));
+        if self.root_seen != Some(seen) {
+            log::info!(
+                "shell: the root window is {} (its style: {}){}",
+                if seen.0 { "shown" } else { "hidden" },
+                super::ex_style_words(seen.1),
+                if self.root_seen.is_some() { ", changed" } else { "" }
+            );
+            self.root_seen = Some(seen);
         }
     }
 
@@ -519,6 +537,19 @@ impl Shell {
                     }
                 }
             }
+            // The style it was shown with, and any change after: whether it
+            // stays never active and out of Alt+Tab.
+            if p.rect.is_some() {
+                if let Some(ex) = self.desktop.popup_ex_style(p.kind.title()).filter(|ex| Some(*ex) != p.style) {
+                    log::info!(
+                        "{}: its window's style is now {} (was {})",
+                        p.kind.title(),
+                        super::ex_style_words(ex),
+                        p.style.map_or_else(|| "not seen".to_string(), super::ex_style_words)
+                    );
+                    p.style = Some(ex);
+                }
+            }
             let t = theme::Theme::of(ctx);
             let content = &mut p.content;
             let gone = ctx.show_viewport_immediate(popup_id(p.kind), popup_builder(p.kind, size).with_icon(app_icon()), |ctx, _class| {
@@ -643,7 +674,7 @@ impl eframe::App for Shell {
         // A newer small window of a kind replaces the one showing.
         while let Ok((kind, content)) = self.popup_rx.try_recv() {
             self.popups.retain(|p| p.kind != kind);
-            self.popups.push(OpenPopup { kind, content, rect: None });
+            self.popups.push(OpenPopup { kind, content, rect: None, style: None });
         }
         // A place picked in the tray's menu that only the window may play
         // (a receiver that announces another speaker's identity): the

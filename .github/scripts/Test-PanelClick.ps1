@@ -46,9 +46,10 @@
 
     Everything lands in -Out: rig.log (what this script did and saw, with
     UTC times like the app's log), timeline.txt (one line per picture: the
-    panel's window shown or hidden and where, the foreground window, the
-    pointer), pictures\*.png, and the app's log and startup.txt. A summary
-    goes to the job's step summary.
+    panel's window shown or hidden, where and its extended style, the root
+    window shown or hidden and its extended style, the foreground window,
+    the pointer), pictures\*.png, and the app's log and startup.txt. A
+    summary goes to the job's step summary.
 
 .PARAMETER Panel
     flyout: the panel as people get it. window: the small-window form, which
@@ -70,6 +71,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $PanelTitle = "Stream To Speaker"
+$RootTitle = "Stream To Speaker (background)"
 $TooltipPattern = '^Stream To Speaker'
 $ExeName = "stream-to-speaker.exe"
 $ShortcutName = "Panel click app"
@@ -382,7 +384,7 @@ Say "Foreground: $([PanelRig.Windows]::Foreground())"
 if (-not (Test-Path -LiteralPath $Exe)) { throw "no app at $Exe" }
 
 $app = $null
-$rec = [PanelRig.Recorder]::new($PanelTitle)
+$rec = [PanelRig.Recorder]::new($PanelTitle, $RootTitle)
 try {
     $rec.Shot("desktop-at-the-start")
 

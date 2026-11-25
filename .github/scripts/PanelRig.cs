@@ -98,6 +98,7 @@ namespace PanelRig
         [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
         [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+        [DllImport("user32.dll")] public static extern IntPtr GetWindowLongPtrW(IntPtr h, int index);
         [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
@@ -194,6 +195,24 @@ namespace PanelRig
                 return true;
             }, IntPtr.Zero);
             return list;
+        }
+
+        /// <summary>
+        /// What a window's extended style says about how it behaves, in the
+        /// words the app's log uses: out of Alt+Tab and the taskbar (tool
+        /// window), never activated, on top, clicks passing through.
+        /// </summary>
+        public static string Style(IntPtr h)
+        {
+            long ex = Native.GetWindowLongPtrW(h, -20).ToInt64(); // GWL_EXSTYLE
+            var words = new List<string>();
+            if ((ex & 0x00000080) != 0) words.Add("tool window");
+            if ((ex & 0x08000000) != 0) words.Add("never active");
+            if ((ex & 0x00040000) != 0) words.Add("app window");
+            if ((ex & 0x00000008) != 0) words.Add("on top");
+            if ((ex & 0x00000020) != 0) words.Add("clicks pass through");
+            if ((ex & 0x00080000) != 0) words.Add("layered");
+            return words.Count == 0 ? "plain" : string.Join(", ", words.ToArray());
         }
 
         public static string ProgramOf(uint pid)
@@ -527,13 +546,27 @@ namespace PanelRig
         readonly List<Picture> pictures = new List<Picture>();
         readonly List<string> lines = new List<string>();
         readonly string panelTitle;
+        readonly string rootTitle;
         uint pid;
         int count;
 
-        /// <summary>A recorder whose lines name the window titled <paramref name="panel"/> once it follows a process.</summary>
-        public Recorder(string panel)
+        /// <summary>
+        /// A recorder whose lines name the windows titled <paramref name="panel"/>
+        /// and <paramref name="root"/> once it follows a process.
+        /// </summary>
+        public Recorder(string panel, string root)
         {
             panelTitle = panel;
+            rootTitle = root;
+        }
+
+        /// <summary>The root window: shown or hidden, and its style; "none" when it isn't there.</summary>
+        public string Root()
+        {
+            if (pid == 0) return "(no app yet)";
+            Win w = Windows.Titled(pid, rootTitle);
+            if (w == null) return "none";
+            return (w.Visible ? "shown" : "hidden") + " (" + Windows.Style(w.Handle) + ")";
         }
 
         /// <summary>From now on, the panel is the window of process <paramref name="appPid"/>.</summary>
@@ -550,7 +583,7 @@ namespace PanelRig
             if (pid == 0) return "(no app yet)";
             Win w = Windows.Titled(pid, panelTitle);
             if (w == null) return "none";
-            return (w.Visible ? "shown " : "hidden ") + w.Rect;
+            return (w.Visible ? "shown " : "hidden ") + w.Rect + " (" + Windows.Style(w.Handle) + ")";
         }
 
         public bool PanelShown()
@@ -587,7 +620,7 @@ namespace PanelRig
             pictures.Add(p);
             PictureCount++;
             if (PanelShown()) ShownCount++;
-            Note(string.Format("picture {0}: panel {1}; foreground {2}; pointer {3}", name, Panel(), Windows.Foreground(), Desk.Cursor()));
+            Note(string.Format("picture {0}: panel {1}; root {2}; foreground {3}; pointer {4}", name, Panel(), Root(), Windows.Foreground(), Desk.Cursor()));
         }
 
         /// <summary><paramref name="n"/> pictures, one every <paramref name="everyMs"/> milliseconds.</summary>

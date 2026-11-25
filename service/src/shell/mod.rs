@@ -326,6 +326,27 @@ pub fn centred(monitors: &[Monitor], size: Vec2) -> Option<Pos2> {
     Some(Pos2::new((cx / s - size.x / 2.0).max(m.work.left as f32 / s), (cy / s - size.y / 2.0).max(m.work.top as f32 / s)))
 }
 
+/// For the log: what a window's extended style bits (`GWL_EXSTYLE`) say
+/// about how it behaves, the ones the shell sets or relies on: out of
+/// Alt+Tab and the taskbar (tool window), never activated, on top,
+/// clicks passing through.
+pub fn ex_style_words(ex: u32) -> String {
+    const WORDS: [(u32, &str); 6] = [
+        (0x0000_0080, "tool window"),
+        (0x0800_0000, "never active"),
+        (0x0004_0000, "app window"),
+        (0x0000_0008, "on top"),
+        (0x0000_0020, "clicks pass through"),
+        (0x0008_0000, "layered"),
+    ];
+    let words: Vec<&str> = WORDS.iter().filter(|(bit, _)| ex & bit != 0).map(|(_, w)| *w).collect();
+    if words.is_empty() {
+        "plain".to_string()
+    } else {
+        words.join(", ")
+    }
+}
+
 /// What the shell asks of Windows and does through it.
 pub trait Desktop {
     /// Every monitor, with its work area and scale.
@@ -343,6 +364,9 @@ pub trait Desktop {
     fn place_popup(&mut self, title: &str, rect: PxRect) -> bool;
     /// Whether the panel's window is on screen, once it has been placed.
     fn panel_window_shown(&self) -> Option<bool>;
+    /// The extended style bits of the panel's window, once it has been
+    /// placed (see [`ex_style_words`]).
+    fn panel_ex_style(&self) -> Option<u32>;
     /// For the log: the window that has the foreground, by its class and
     /// the name of its program.
     fn foreground(&self) -> String;
@@ -394,6 +418,10 @@ impl Desktop for FakeDesktop {
         self.panel_shown
     }
 
+    fn panel_ex_style(&self) -> Option<u32> {
+        None
+    }
+
     fn foreground(&self) -> String {
         "a test's window".to_string()
     }
@@ -436,6 +464,15 @@ mod tests {
         // This build's own environment, where `PATH` is always set: read in
         // a debug build only (`cargo test --release` runs the other side).
         assert_eq!(env_switches()("PATH").is_some(), cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn the_log_names_the_window_styles_the_shell_sets_and_relies_on() {
+        // WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, as a pop-up has them.
+        assert_eq!(ex_style_words(0x0800_0088), "tool window, never active, on top");
+        // WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES, what winit gives a plain window.
+        assert_eq!(ex_style_words(0x0000_0110), "plain");
+        assert_eq!(ex_style_words(0x0008_0020 | 0x0004_0000), "app window, clicks pass through, layered");
     }
 
     #[test]
