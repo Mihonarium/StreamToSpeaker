@@ -37,7 +37,8 @@
        one of them is shown as an app window or without the styles the
        shell keeps on it (out of Alt+Tab, never active), or has a button
        on the taskbar.
-    5. Asks the app to close, and keeps its log.
+    5. Quits the app as a person does (Quit in its tray icon's menu, by a
+       right click and a click), and keeps its log.
 
     The machine has no sound device and no driver. Started as it is, the
     app would look for its driver, fall back to recording the default
@@ -332,20 +333,55 @@ function Wait-TrayIcon($proc, [int]$seconds) {
     throw "no tray icon after $seconds s"
 }
 
-# Ask the app to close (its main window gets a close request, as at sign-out),
-# then end it if it doesn't.
-function Stop-App($proc) {
+# Quit the app as a person does: a right click on its tray icon, then a
+# click on the menu's Quit item, both real input. True once Quit was
+# clicked; throws when the icon or the item can't be found.
+function Invoke-TrayQuit($proc, $rec) {
+    $place = Get-IconPlace $proc.Id
+    if ($place.Where -eq "hidden") { $place = Open-HiddenIcons $rec }
+    $at = [PanelRig.Mouse]::RightClick($place.X, $place.Y)
+    $rec.Note("right-clicked $($place.What) at $at")
+    Say "Right-clicked $($place.What) at $at"
+    $item = $null
+    $deadline = (Get-Date).AddSeconds(5)
+    while (-not $item -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+        # A window's menu is a top-level window of class #32768.
+        $item = @(Find-UiaNamed (Get-UiaTopLevel "#32768") '^Quit') | Select-Object -First 1
+    }
+    if (-not $item) {
+        $rec.Shot("no-quit-in-the-menu")
+        throw "the tray icon's menu showed no Quit item"
+    }
+    $at = [PanelRig.Mouse]::Click($item.X, $item.Y, 1)
+    $rec.Note("clicked the menu's $($item.What) at $at")
+    Say "Clicked the menu's $($item.What) at $at"
+    $true
+}
+
+# End the app as a person does: Quit from its tray icon's menu, which runs
+# the app's own quit (the sound back to this PC, the speaker told, the
+# windows closed). Ends the process only when that can't be done or the app
+# doesn't end within 20 s, and says so in the step summary.
+function Stop-App($proc, $rec) {
     if ($proc.HasExited) {
         Say "The app had ended already (exit code $($proc.ExitCode))"
         return
     }
-    $asked = $proc.CloseMainWindow()
-    if (-not $asked -or -not $proc.WaitForExit(15000)) {
-        Say "The app didn't close when asked (the request $(if ($asked) { 'went out' } else { 'had no window to go to' })); ending it"
-        $proc.Kill()
-        $null = $proc.WaitForExit(5000)
+    $quit = $false
+    try {
+        $quit = Invoke-TrayQuit $proc $rec
+    } catch {
+        Warn "couldn't quit the app from its tray icon's menu: $_"
     }
-    Say "The app ended (exit code $($proc.ExitCode))"
+    if ($quit -and $proc.WaitForExit(20000)) {
+        Say "The app quit (exit code $($proc.ExitCode))"
+        return
+    }
+    if ($quit) { Warn "the app didn't end within 20 s of its Quit" }
+    $proc.Kill()
+    $null = $proc.WaitForExit(5000)
+    Warn "the app's process was ended (exit code $($proc.ExitCode))"
 }
 
 function Save-AppLog([string]$label) {
@@ -507,7 +543,7 @@ try {
         Wait-TrayIcon $prime 90
         Start-Sleep -Seconds 2
         $n = Set-Promoted $(if ($Icon -eq "taskbar") { 1 } else { 0 })
-        Stop-App $prime
+        Stop-App $prime $rec
         Save-AppLog "first-start"
         if ($n -eq 0) { Warn "Explorer made no setting for the icon; it stays where Windows puts new icons" }
         Remove-Item -LiteralPath $LogDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -566,11 +602,12 @@ try {
     $rec.Shot("the-end")
     Test-TaskbarButtons $rec "at the end"
 } finally {
+    # The quit's own clicks go to the timeline and the pictures too.
+    if ($app) {
+        try { Stop-App $app $rec } catch { Say "Couldn't stop the app: $_" }
+    }
     try { $rec.Save($PictureDir) } catch { Say "Couldn't save the pictures: $_" }
     $rec.Lines | Set-Content -LiteralPath (Join-Path $Out "timeline.txt") -Encoding UTF8
-    if ($app) {
-        try { Stop-App $app } catch { Say "Couldn't stop the app: $_" }
-    }
     Save-AppLog "app"
     Set-AppEnvironment $false
     Remove-Item -LiteralPath (Join-Path ([Environment]::GetFolderPath("Desktop")) "$ShortcutName.lnk") -ErrorAction SilentlyContinue

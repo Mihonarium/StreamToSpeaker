@@ -498,7 +498,7 @@ namespace PanelRig
     /// <summary>Real mouse input, through the same queue as a mouse's.</summary>
     public static class Mouse
     {
-        const uint MOVE = 0x0001, LEFTDOWN = 0x0002, LEFTUP = 0x0004, VIRTUALDESK = 0x4000, ABSOLUTE = 0x8000;
+        const uint MOVE = 0x0001, LEFTDOWN = 0x0002, LEFTUP = 0x0004, RIGHTDOWN = 0x0008, RIGHTUP = 0x0010, VIRTUALDESK = 0x4000, ABSOLUTE = 0x8000;
 
         static void Send(uint flags, int dx, int dy)
         {
@@ -542,6 +542,17 @@ namespace PanelRig
                 Thread.Sleep(60);
                 Send(LEFTUP, 0, 0);
             }
+            return at;
+        }
+
+        /// <summary>Press and release the right button at (x, y), after resting on the spot a moment.</summary>
+        public static string RightClick(int x, int y)
+        {
+            string at = MoveTo(x, y);
+            Thread.Sleep(150);
+            Send(RIGHTDOWN, 0, 0);
+            Thread.Sleep(60);
+            Send(RIGHTUP, 0, 0);
             return at;
         }
     }
