@@ -901,16 +901,21 @@ function Test-SameProgram([string]$RuleProgram, [string]$Program) {
     [Environment]::ExpandEnvironmentVariables($RuleProgram).Trim().Trim('"') -ieq $Program
 }
 
-# Removes Setup's rule and every other rule for the program (the ones
-# Windows' first-run prompt made); returns how many went.
-function Remove-AppFirewallRules([string]$Program, [switch]$OnlyForProgram) {
+# Setup's rule and every other rule for the program (the ones Windows'
+# first-run prompt made); with -OnlyForProgram, only the latter.
+function Get-AppFirewallRules([string]$Program, [switch]$OnlyForProgram) {
     $rules = @()
     if (-not $OnlyForProgram) { $rules += @(Get-NetFirewallRule -Name $StsFirewallRuleName -ErrorAction SilentlyContinue) }
     $rules += @(Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
         Where-Object { Test-SameProgram $_.Program $Program } |
         Get-NetFirewallRule -ErrorAction SilentlyContinue)
+    @($rules | Sort-Object Name -Unique)
+}
+
+# Removes those rules; returns how many went.
+function Remove-AppFirewallRules([string]$Program, [switch]$OnlyForProgram) {
     $removed = 0
-    foreach ($rule in @($rules | Sort-Object Name -Unique)) {
+    foreach ($rule in @(Get-AppFirewallRules $Program -OnlyForProgram:$OnlyForProgram)) {
         try {
             $rule | Remove-NetFirewallRule -ErrorAction Stop
             $removed++
@@ -947,28 +952,46 @@ function Test-RunValueInFolder([string]$Value, [string]$Folder) {
     $program.Substring(0, $cut).TrimEnd('\', '/') -ieq $Folder.TrimEnd('\', '/')
 }
 
-# Removes the start-at-sign-in entry of every account whose registry is
-# loaded (signed in, or in use by a service) when it starts the app from
-# this folder; returns how many went. An account that isn't signed in keeps
-# its entry, which points at a program that is gone and does nothing.
+# The accounts (their IDs) whose registry is loaded (signed in, or in use by
+# a service) and whose start-at-sign-in entry starts the app from this
+# folder.
+function Get-SignInAccounts {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDir,
+        [string]$UsersRoot = 'Registry::HKEY_USERS',
+        [string]$ValueName = $StsProductName
+    )
+    foreach ($user in @(Get-ChildItem -LiteralPath $UsersRoot -ErrorAction SilentlyContinue)) {
+        $run = Join-Path $user.PSPath 'Software\Microsoft\Windows\CurrentVersion\Run'
+        $value = (Get-ItemProperty -LiteralPath $run -Name $ValueName -ErrorAction SilentlyContinue).$ValueName
+        if ($value -and (Test-RunValueInFolder $value $InstallDir)) { $user.PSChildName }
+    }
+}
+
+# Removes the start-at-sign-in entry of each of those accounts; returns how
+# many are gone afterwards. An account that isn't signed in keeps its
+# entry, which points at a program that is gone and does nothing.
 function Remove-SignInEntries {
     param(
         [Parameter(Mandatory = $true)][string]$InstallDir,
         [string]$UsersRoot = 'Registry::HKEY_USERS',
         [string]$ValueName = $StsProductName
     )
-    $removed = 0
-    foreach ($user in @(Get-ChildItem -LiteralPath $UsersRoot -ErrorAction SilentlyContinue)) {
-        $run = Join-Path $user.PSPath 'Software\Microsoft\Windows\CurrentVersion\Run'
-        $value = (Get-ItemProperty -LiteralPath $run -Name $ValueName -ErrorAction SilentlyContinue).$ValueName
-        if (-not $value -or -not (Test-RunValueInFolder $value $InstallDir)) { continue }
-        Remove-ItemProperty -LiteralPath $run -Name $ValueName -ErrorAction SilentlyContinue
-        $approved = Join-Path $user.PSPath 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        Remove-ItemProperty -LiteralPath $approved -Name $ValueName -ErrorAction SilentlyContinue
-        $removed++
-        Write-Step "Removed the start-at-sign-in entry of account $($user.PSChildName)."
+    $accounts = @(Get-SignInAccounts -InstallDir $InstallDir -UsersRoot $UsersRoot -ValueName $ValueName)
+    foreach ($account in $accounts) {
+        $base = "$UsersRoot\$account\Software\Microsoft\Windows\CurrentVersion"
+        Remove-ItemProperty -LiteralPath "$base\Run" -Name $ValueName -ErrorAction SilentlyContinue
+        Remove-ItemProperty -LiteralPath "$base\Explorer\StartupApproved\Run" -Name $ValueName -ErrorAction SilentlyContinue
     }
-    $removed
+    $left = @(Get-SignInAccounts -InstallDir $InstallDir -UsersRoot $UsersRoot -ValueName $ValueName)
+    foreach ($account in $accounts) {
+        if ($left -contains $account) {
+            Write-Step "Could not remove the start-at-sign-in entry of account $account."
+        } else {
+            Write-Step "Removed the start-at-sign-in entry of account $account."
+        }
+    }
+    $accounts.Count - $left.Count
 }
 
 # Points the start-at-sign-in entry of every signed-in account that starts
@@ -1323,7 +1346,10 @@ function Remove-ShortcutsInto {
 
 # Removes every Stream To Speaker device, every package of ours in the
 # driver store and, once no device is left, Windows' cached entries for the
-# sound output. Returns what is still there afterwards, in words.
+# sound output. Returns what is still there afterwards, as the lines the
+# uninstaller reads: "left: ..." for what uninstalling again may remove,
+# "stays: ..." for a cached entry Windows refused to delete (uninstalling
+# again would only ask Windows the same).
 function Invoke-DriverRemoval([hashtable]$Tools = (New-DriverTools)) {
     foreach ($d in @(& $Tools.GetDevices)) {
         Write-Step "Removing the device $($d.InstanceId)..."
@@ -1337,13 +1363,13 @@ function Invoke-DriverRemoval([hashtable]$Tools = (New-DriverTools)) {
     }
     $left = @()
     $devices = @(& $Tools.GetDevices)
-    foreach ($d in $devices) { $left += "the Stream To Speaker device $($d.InstanceId)" }
-    foreach ($p in @(& $Tools.GetPackages)) { $left += "the driver package $p in Windows' driver store" }
+    foreach ($d in $devices) { $left += "left: the Stream To Speaker device $($d.InstanceId)" }
+    foreach ($p in @(& $Tools.GetPackages)) { $left += "left: the driver package $p in Windows' driver store" }
     if (-not $devices.Count) {
         $entries = @(& $Tools.GetEndpoints)
         if ($entries.Count) {
             $gone = & $Tools.RemoveEndpoints $entries
-            foreach ($ep in @($gone.Failed)) { $left += "Windows' cached entry $($ep.Guid) for the sound output" }
+            foreach ($ep in @($gone.Failed)) { $left += "stays: Windows' cached entry $($ep.Guid) for the sound output: Windows refused to delete it. It does nothing while Stream To Speaker isn't installed." }
         }
     }
     $left

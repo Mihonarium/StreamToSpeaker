@@ -561,11 +561,19 @@ Test 'the result line carries what Setup reads back' {
 Test 'the uninstall says what it couldn''t remove' {
     New-World -Devices @(Fake-Device) -Packages @('oem5.inf', 'oem9.inf') -Endpoints @(Fake-Endpoint) -StuckPackages @('oem9.inf')
     $left = @(Invoke-DriverRemoval -Tools $FakeTools)
-    Assert-Equal "the driver package oem9.inf in Windows' driver store" $left 'left'
+    Assert-Equal "left: the driver package oem9.inf in Windows' driver store" $left 'left'
     Assert-Equal 0 @($script:W.Devices).Count 'devices'
     New-World -Devices @(Fake-Device) -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint -State 4)
     Assert-Equal '' (@(Invoke-DriverRemoval -Tools $FakeTools) -join ',') 'nothing left'
     Assert-Equal 1 (Called 'RemoveEndpoints:1') 'cached entries removed once no device is left'
+    # A cached entry Windows refuses to delete is told apart from what
+    # uninstalling again may remove.
+    New-World -Devices @(Fake-Device) -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint -State 4)
+    $refusing = $FakeTools.Clone()
+    $refusing.RemoveEndpoints = { param($List) [pscustomobject]@{ Removed = 0; Failed = @($List) } }
+    $left = @(Invoke-DriverRemoval -Tools $refusing)
+    Assert-Equal 1 $left.Count 'one line'
+    Assert-True ($left[0].StartsWith("stays: Windows' cached entry {11111111-1111-1111-1111-111111111111} for the sound output")) 'what stays'
 }
 
 Test 'the log names the app''s outputs, and no name a person chose' {
@@ -705,6 +713,41 @@ Test 'the firewall rule is for the program, inbound, on private and work network
     Assert-True (-not (Test-SameProgram 'C:\Other\stream-to-speaker.exe' 'C:\Program Files\Stream To Speaker\stream-to-speaker.exe')) 'another folder'
 }
 
+Test 'a firewall rule Windows refuses to remove is found again afterwards' {
+    $app = 'C:\Program Files\Stream To Speaker\stream-to-speaker.exe'
+    $script:Rules = @(
+        [pscustomobject]@{ Name = $StsFirewallRuleName; DisplayName = 'Stream To Speaker'; Action = 'Allow'; Direction = 'Inbound'; Program = $app; Locked = $false },
+        [pscustomobject]@{ Name = 'Asked'; DisplayName = 'stream-to-speaker.exe'; Action = 'Block'; Direction = 'Inbound'; Program = $app; Locked = $true },
+        [pscustomobject]@{ Name = 'Other'; DisplayName = 'Another program'; Action = 'Allow'; Direction = 'Inbound'; Program = 'C:\Other\other.exe'; Locked = $false })
+    # Stand-ins for Windows' firewall commands, over the list above.
+    function Get-NetFirewallRule {
+        [CmdletBinding()]
+        param([string]$Name, [Parameter(ValueFromPipeline = $true)]$Filter)
+        process {
+            $wanted = if ($Filter) { $Filter.Name } else { $Name }
+            @($script:Rules | Where-Object { $_.Name -eq $wanted })
+        }
+    }
+    function Get-NetFirewallApplicationFilter {
+        [CmdletBinding()]
+        param()
+        $script:Rules
+    }
+    function Remove-NetFirewallRule {
+        [CmdletBinding()]
+        param([Parameter(ValueFromPipeline = $true)]$Rule)
+        process {
+            if ($Rule.Locked) { throw 'Access is denied.' }
+            $script:Rules = @($script:Rules | Where-Object { $_.Name -ne $Rule.Name })
+        }
+    }
+    Assert-Equal 2 @(Get-AppFirewallRules $app).Count 'Setup''s rule and the one Windows'' question made'
+    Assert-Equal 'Other' (@(Get-AppFirewallRules 'C:\Other\other.exe' -OnlyForProgram) | ForEach-Object { $_.Name }) 'only a program''s own rules when asked so'
+    Assert-Equal 1 (Remove-AppFirewallRules $app) 'removed'
+    Assert-Equal 'Asked' (@(Get-AppFirewallRules $app) | ForEach-Object { $_.Name }) 'the refused rule is found again'
+    Assert-Equal 'Asked | Other' ($script:Rules | ForEach-Object { $_.Name }) 'another program''s rule is not touched'
+}
+
 Test 'sign-in entries are removed for every account that starts this install, and only those' {
     $users = "$TestKey\Users"
     $run = 'Software\Microsoft\Windows\CurrentVersion\Run'
@@ -715,7 +758,9 @@ Test 'sign-in entries are removed for every account that starts this install, an
     $null = New-ItemProperty -LiteralPath "$users\S-1-5-21-1-1001\$run" -Name 'Stream To Speaker' -Value "`"$dir\stream-to-speaker.exe`" --startup"
     $null = New-ItemProperty -LiteralPath "$users\S-1-5-21-1-1001\$approved" -Name 'Stream To Speaker' -PropertyType Binary -Value ([byte[]](3, 0, 0, 0))
     $null = New-ItemProperty -LiteralPath "$users\S-1-5-21-1-1002\$run" -Name 'Stream To Speaker' -Value '"D:\Downloads\stream-to-speaker.exe" --startup'
+    Assert-Equal 'S-1-5-21-1-1001' (Get-SignInAccounts -InstallDir $dir -UsersRoot $users) 'the accounts that start this install'
     Assert-Equal 1 (Remove-SignInEntries -InstallDir $dir -UsersRoot $users) 'removed'
+    Assert-Equal '' (@(Get-SignInAccounts -InstallDir $dir -UsersRoot $users) -join ',') 'none is left'
     Assert-True ($null -eq (Get-ItemProperty -LiteralPath "$users\S-1-5-21-1-1001\$run" -Name 'Stream To Speaker' -ErrorAction SilentlyContinue)) 'this install''s entry'
     Assert-True ($null -eq (Get-ItemProperty -LiteralPath "$users\S-1-5-21-1-1001\$approved" -Name 'Stream To Speaker' -ErrorAction SilentlyContinue)) 'its Task Manager state'
     Assert-True ($null -ne (Get-ItemProperty -LiteralPath "$users\S-1-5-21-1-1002\$run" -Name 'Stream To Speaker' -ErrorAction SilentlyContinue)) 'another copy''s entry stays'

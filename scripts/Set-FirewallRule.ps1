@@ -6,7 +6,9 @@
 # What the rule allows, and why, is in InstallerFunctions.ps1
 # (Get-FirewallRuleSpec).
 #
-# -Remove also removes the rules Windows' question made for the program.
+# -Remove also removes the rules Windows' question made for the program,
+# and prints a "left:" line for each rule that is still there afterwards,
+# which the uninstaller names in its last message.
 #
 # Prints "firewall-rule-result: ok" or "firewall-rule-result: failed" last.
 #
@@ -30,12 +32,16 @@ try {
     if ($Remove) {
         $n = Remove-AppFirewallRules $Program
         if (-not $n) { Write-Step "No Windows Firewall rule for $Program." }
+        foreach ($rule in @(Get-AppFirewallRules $Program)) {
+            Write-Host "left: the Windows Firewall rule '$($rule.DisplayName)' for $Program"
+        }
     } else {
         Set-AppFirewallRule $Program
     }
     $ok = $true
 } catch {
     Write-Host "Windows Firewall: $($_.Exception.Message)"
+    if ($Remove) { Write-Host "left: the Windows Firewall rule for Stream To Speaker (removing it failed: $($_.Exception.Message))" }
 }
 Write-Host "firewall-rule-result: $(if ($ok) { 'ok' } else { 'failed' })"
 exit $(if ($ok) { 0 } else { 1 })

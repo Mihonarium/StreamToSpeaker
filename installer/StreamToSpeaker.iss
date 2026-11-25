@@ -150,7 +150,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 WinVersionTooLowError=Stream To Speaker needs Windows 10 version 1809 or later, or Windows 11.
 OnlyOnTheseArchitectures=Stream To Speaker can't be installed on this PC. Its sound driver needs 64-bit Windows on an Intel or AMD processor; it doesn't run on ARM processors or on 32-bit Windows.
 FinishedRestartMessage=Windows must restart to finish installing Stream To Speaker's sound driver.%n%nRestart now?
-ConfirmUninstall=Remove %1 from this PC?%n%nIt closes wherever it runs on this PC. Each account's settings and speakers are kept.
+ConfirmUninstall=Remove %1 from this PC?%n%nIt is closed in every account on this PC. Each account's settings and speakers are kept.
 UninstalledAll=%1's uninstall is finished.%n%nEach account's settings and speakers stay in its AppData\Roaming\StreamToSpeaker folder, and its log in AppData\Local\StreamToSpeaker, so installing it again brings them back. To remove them too, delete those folders.
 UninstalledMost=%1's uninstall is finished, but some of its files couldn't be removed: delete the folder Stream To Speaker in Program Files by hand.%n%nEach account's settings and speakers stay in its AppData\Roaming\StreamToSpeaker folder, and its log in AppData\Local\StreamToSpeaker. To remove them too, delete those folders.
 UninstalledAndNeedsRestart=%1's uninstall is finished. Its sound driver stays loaded until Windows restarts.%n%nEach account's settings and speakers stay in its AppData\Roaming\StreamToSpeaker folder, and its log in AppData\Local\StreamToSpeaker. To remove them too, delete those folders.%n%nRestart now?
@@ -209,7 +209,8 @@ StartYourselfUnknown=Start Stream To Speaker from the Start menu. Setup couldn't
 SignInNotSet=Setup didn't set Stream To Speaker to start when you sign in, because it runs in another Windows account than yours. Turn that on in the app instead.
 SignInNotSetUnknown=Setup didn't set Stream To Speaker to start when you sign in, because it couldn't tell which Windows account started it. Turn that on in the app instead.
 RestartNow=Restart now?
-UninstallLeft=The uninstall couldn't remove everything Stream To Speaker put on this PC. Still there:%n%n%1%n%nTo remove the rest, restart the PC, install Stream To Speaker again and uninstall it.
+UninstallLeft=The uninstall couldn't remove everything Stream To Speaker put on this PC. Still there:%n%n%1
+UninstallRetry=To remove the rest, restart the PC, install Stream To Speaker again and uninstall it.
 
 [Tasks]
 Name: "desktopicon";   Description: "Create a desktop shortcut";       GroupDescription: "Shortcuts:"; Flags: unchecked
@@ -354,7 +355,10 @@ var
   ScriptsExtracted: Boolean;
   TasksPageSeen: Boolean;
   // What the scripts printed last.
-  DriverResultLine, FirewallResultLine, CopiesLine, EarlierLine, LeftLines: String;
+  DriverResultLine, FirewallResultLine, CopiesLine, EarlierLine: String;
+  // What the uninstall couldn't remove: LeftLines, what uninstalling again
+  // may remove; StaysLines, what Windows refused to delete.
+  LeftLines, StaysLines: String;
   DriverOutcome, DriverProblem: String;
   DriverRestart, DriverReplaced, DriverNewOutput, DriverKeptBefore: Boolean;
   DriverWasDefault, DriverIsDefault, DriverSoundMoved: Boolean;
@@ -488,7 +492,9 @@ begin
   else if Pos('earlier-install-result: ', S) = 1 then
     EarlierLine := S
   else if Pos('left: ', S) = 1 then
-    LeftLines := LeftLines + '- ' + Copy(S, 7, Length(S)) + #13#10;
+    LeftLines := LeftLines + '- ' + Copy(S, 7, Length(S)) + #13#10
+  else if Pos('stays: ', S) = 1 then
+    StaysLines := StaysLines + '- ' + Copy(S, 8, Length(S)) + #13#10;
 end;
 
 // Runs a script in 64-bit Windows PowerShell (the one whose registry view
@@ -1125,23 +1131,33 @@ begin
   Result := True;
 end;
 
-// The app is closed and the driver and certificates removed here, before
-// [UninstallRun] and before any file is deleted, reading back what is left.
+// The app is closed and the driver, the certificates, the firewall rules
+// and the start-at-sign-in entries removed here, before [UninstallRun] and
+// before any file is deleted, reading back what is left.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Code: Integer;
+  Text: String;
 begin
   if CurUninstallStep = usUninstall then begin
     LeftLines := '';
+    StaysLines := '';
     RunScript('Find-RunningCopies.ps1', ' -Folders "' + ExpandConstant('{app}') + '" -Close', Code);
     RunScript('Uninstall-Driver.ps1', '', Code);
     RunScript('Remove-TestCertificate.ps1', ' -CerPath "' + ExpandConstant('{app}\driver\StreamToSpeaker.cer') + '"', Code);
-  end else if (CurUninstallStep = usPostUninstall) and (LeftLines <> '') then begin
+    RunScript('Set-FirewallRule.ps1', ' -Remove', Code);
+    RunScript('Remove-SignInEntries.ps1', '', Code);
+  end else if (CurUninstallStep = usPostUninstall) and (LeftLines + StaysLines <> '') then begin
     // Said before Inno Setup's own last message, which then no longer
-    // reads as if everything went.
-    Log('Left on this PC:' + #13#10 + LeftLines);
-    if not UninstallSilent then
-      MsgBox(FmtMessage(CustomMessage('UninstallLeft'), [Trim(LeftLines)]), mbError, MB_OK);
+    // reads as if everything went. Trying again is advised only when
+    // something is left that another uninstall may remove.
+    Log('Left on this PC:' + #13#10 + LeftLines + StaysLines);
+    if not UninstallSilent then begin
+      Text := FmtMessage(CustomMessage('UninstallLeft'), [Trim(LeftLines + StaysLines)]);
+      if LeftLines <> '' then
+        Text := Text + #13#10#13#10 + CustomMessage('UninstallRetry');
+      MsgBox(Text, mbError, MB_OK);
+    end;
   end;
 end;
 

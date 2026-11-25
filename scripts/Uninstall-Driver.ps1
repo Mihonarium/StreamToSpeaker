@@ -1,6 +1,7 @@
 # Removes Stream To Speaker's sound driver from this PC. The uninstaller
-# runs it elevated, after closing the app, and reads the "left:" lines it
-# prints: it names what is still there afterwards on its last page.
+# runs it elevated, after closing the app, and reads the "left:" and
+# "stays:" lines it prints: it names what is still there afterwards in its
+# last message.
 #
 # Removes every Stream To Speaker device, every Stream To Speaker package in
 # the driver store, and Windows' cached entries for the sound output (which
@@ -23,7 +24,7 @@ try {
     $StsLogPrefix = '[uninstall-driver] '
     $StsDevcon = Join-Path (Split-Path -Parent $PSScriptRoot) 'driver\devcon.exe'
     $left = @(Invoke-DriverRemoval)
-    foreach ($item in $left) { Write-Host "left: $item" }
+    foreach ($item in $left) { Write-Host $item }
     if (-not $left.Count) {
         Write-Step 'The driver, its device and its cached sound output entries are removed.'
         $exitCode = 0
