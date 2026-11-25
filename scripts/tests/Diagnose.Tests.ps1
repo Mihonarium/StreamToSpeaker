@@ -84,6 +84,37 @@ Test 'the names to replace include the short form of a long name and the organis
     Assert-Equal 'mail <e-mail>, site <domain>' (ConvertTo-PublicText -Text 'mail jane.smith@corp.contoso.com, site contoso.com' -PrivateNames $names2 -UserProfile '') 'e-mail and domain'
 }
 
+Test 'short forms keep a dash or an underscore, and the last part of a dotted name' {
+    Assert-Equal 'ANN-MA~' (Get-ShortNameForm 'Ann-Marie') 'a dash stays'
+    Assert-Equal 'JANE~.SMI' (Get-ShortNameForm 'jane.smith') 'a dotted name'
+    Assert-Equal 'JANESM~' (Get-ShortNameForm 'Jane Smith') 'a space goes'
+    Assert-Equal 'A_B_CD~' (Get-ShortNameForm 'a+b=cdef') 'characters a short name can''t hold'
+    Assert-Equal 'CORPCO~.COM' (Get-ShortNameForm 'corp.contoso.com') 'only the last dot stays'
+    Assert-Equal '' (Get-ShortNameForm 'x') 'too short to tell apart'
+    $n = Get-PrivateNames -UserName 'Ann-Marie' -ComputerName 'LAPTOP-JANE' -UserDomain 'SMITHS' -DnsDomain '' -LogonServer '' -Identity 'SMITHS\jane.smith'
+    Assert-Equal 'C:\<account>\x and D:\<account>\y' (ConvertTo-PublicText -Text 'C:\ANN-MA~1\x and D:\JANE~2.SMI\y' -PrivateNames $n -UserProfile '') 'in paths'
+    Assert-Equal 'C:\ANN-MARIA\x' (ConvertTo-PublicText -Text 'C:\ANN-MARIA\x' -PrivateNames $n -UserProfile '') 'another name that starts the same'
+}
+
+Test 'names are found in upper and lower case whatever language Windows uses' {
+    $saved = [Threading.Thread]::CurrentThread.CurrentCulture
+    [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]'tr-TR'
+    try {
+        $ivan = [ordered]@{ 'DESKTOP-IVAN' = '<computer>' }
+        Assert-Equal 'on <computer>' (ConvertTo-PublicText -Text 'on desktop-ivan' -PrivateNames $ivan -UserProfile '') 'a name with an I'
+        Assert-Equal '<user folder>\x' (ConvertTo-PublicText -Text 'c:\users\ivan\x' -PrivateNames $ivan -UserProfile 'C:\USERS\IVAN') 'the user folder'
+        Assert-Equal 'C:\DOCUMENTS AND SETTINGS\<user>\x' (ConvertTo-PublicText -Text 'C:\DOCUMENTS AND SETTINGS\Bob\x' -PrivateNames $ivan -UserProfile '') 'another user''s folder'
+    } finally {
+        [Threading.Thread]::CurrentThread.CurrentCulture = $saved
+    }
+}
+
+Test 'an account called like a placeholder leaves the placeholders as they are' {
+    $n = [ordered]@{ 'user' = '<account>'; 'server' = '<computer>' }
+    Assert-Equal 'C:\Users\<user>\x on \\<server>\<share>\y, run by <account>' (ConvertTo-PublicText -Text 'C:\Users\Bob\x on \\NAS\apps\y, run by User' -PrivateNames $n -UserProfile '') 'placeholders'
+    Assert-Equal 'on <computer> as <account>' (ConvertTo-PublicText -Text 'on SERVER as user' -PrivateNames $n -UserProfile '') 'the names themselves'
+}
+
 Test 'servers and shares, a work OneDrive''s organisation and account IDs are replaced' {
     Assert-Equal '\\<server>\<share>\StreamToSpeaker\x.exe' (Public '\\NAS-SMITH\apps\StreamToSpeaker\x.exe') 'network path'
     Assert-Equal '\\?\C:\Windows\x.sys and \\.\pipe\x' (Public '\\?\C:\Windows\x.sys and \\.\pipe\x') 'paths on this PC stay'
@@ -98,6 +129,8 @@ Test 'every IPv4 address but 127.0.0.1 is replaced, and IPv6 and MACs in every f
     Assert-Equal 'cisco <address> sonos RINCON_<address>' (Public 'cisco a483.e712.3456 sonos RINCON_A483E7123456') 'MAC'
     Assert-Equal 'Version      : 1.1.1.211, 41984 bytes' (Public 'Version      : 1.1.1.211, 41984 bytes') 'a file version'
     Assert-Equal '[StreamToSpeaker.SetupNative]::SetDefault and [IO.Directory]::Delete' (Public '[StreamToSpeaker.SetupNative]::SetDefault and [IO.Directory]::Delete') 'PowerShell'
+    Assert-Equal '[Collections.ArrayList]::Add(1) and [Type]::Face' (Public '[Collections.ArrayList]::Add(1) and [Type]::Face') 'PowerShell whose names are made of the letters a to f'
+    Assert-Equal 'from [<address>]:7000' (Public 'from [fe80::1c2d:3e4f]:7000') 'an address in square brackets'
     Assert-Equal 'thumbprint 3C9A1F0E7B2D4C6A8E0F1A2B3C4D5E6F7A8B9C0D' (Public 'thumbprint 3C9A1F0E7B2D4C6A8E0F1A2B3C4D5E6F7A8B9C0D') 'a thumbprint'
 }
 

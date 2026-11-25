@@ -27,6 +27,24 @@ $DiagArrow = [string][char]0x2192
 # Keeping private details out of the report
 # ---------------------------------------------------------------------------
 
+# The short (8.3) name Windows gives a long file or folder name, without
+# the number after its "~": spaces go, and every dot but the last; of the
+# part before the last dot the first six characters stay, of the part after
+# it the first three; + , ; = [ ] become _ (a dash or an underscore stays).
+# "Ann-Marie" gives ANN-MA~ (ANN-MA~1), "jane.smith" JANE~.SMI (JANE~1.SMI).
+function Get-ShortNameForm([string]$Name) {
+    $n = "$Name".ToUpperInvariant() -replace ' ', ''
+    $dot = $n.LastIndexOf('.')
+    $base = if ($dot -gt 0) { $n.Substring(0, $dot) } else { $n }
+    $ext = if ($dot -gt 0) { $n.Substring($dot + 1) } else { '' }
+    $base = ($base -replace '\.', '') -replace '[+,;=\[\]]', '_'
+    $ext = $ext -replace '[+,;=\[\]]', '_'
+    if ($base.Length -gt 6) { $base = $base.Substring(0, 6) }
+    if ($ext.Length -gt 3) { $ext = $ext.Substring(0, 3) }
+    if ($base.Length -lt 2) { return '' }
+    if ($ext) { "$base~.$ext" } else { "$base~" }
+}
+
 # The names on this PC that identify a person or the machine, with the
 # placeholder each is replaced by: as they are, and in the short (8.3) form
 # Windows gives a long folder name.
@@ -55,10 +73,8 @@ function Get-PrivateNames {
         if ($value.Length -ge 2 -and -not $names.Contains($value)) { $names[$value] = $pair[1] }
     }
     foreach ($value in @($names.Keys)) {
-        $short = ($value -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
-        if ($short.Length -gt 6) { $short = $short.Substring(0, 6) }
-        $form = "$short~"
-        if ($short.Length -ge 2 -and ($value -match '[^A-Za-z0-9]' -or $value.Length -gt 8) -and -not $names.Contains($form)) {
+        $form = Get-ShortNameForm $value
+        if ($form -and ($value -match '[^A-Za-z0-9]' -or $value.Length -gt 8) -and -not $names.Contains($form)) {
             $names[$form] = $names[$value]
         }
     }
@@ -71,23 +87,39 @@ function Get-PrivateNames {
 function ConvertTo-PublicText {
     param([string]$Text, $PrivateNames = [ordered]@{}, [string]$UserProfile = $env:USERPROFILE)
     $t = "$Text"
+    # Upper and lower case are matched the same way whatever language
+    # Windows uses (in Turkish, "I" and "i" are otherwise different letters).
+    $anyCase = [System.Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'
     if ($UserProfile -and $UserProfile.Length -ge 4) {
-        $t = [regex]::Replace($t, [regex]::Escape($UserProfile), '<user folder>', 'IgnoreCase')
+        $t = [regex]::Replace($t, [regex]::Escape($UserProfile), '<user folder>', $anyCase)
     }
     # Any user's folder, in any form Windows writes it, and the organisation
     # in a work OneDrive's folder name.
-    $t = [regex]::Replace($t, '(?i)(\\Users\\|\\Documents and Settings\\)[^\\/:*?"<>|\r\n]+', '$1<user>')
-    $t = [regex]::Replace($t, '(?i)(OneDrive - )[^\\/:*?"<>|\r\n]+', '$1<organisation>')
+    $t = [regex]::Replace($t, '(\\Users\\|\\Documents and Settings\\)[^\\/:*?"<>|\r\n]+', '$1<user>', $anyCase)
+    $t = [regex]::Replace($t, '(OneDrive - )[^\\/:*?"<>|\r\n]+', '$1<organisation>', $anyCase)
     # A network path's server and share (not \\?\ and \\.\, which are this PC's).
     $t = [regex]::Replace($t, '(?<![\\\w])\\\\(?![?.]\\)[^\\/:*?"<>|\s]+\\[^\\/:*?"<>|\r\n]+', '\\<server>\<share>')
     # E-mail addresses, before the names they may contain.
     $t = [regex]::Replace($t, '[\w.+-]+@[\w-]+(?:\.[\w-]+)+', '<e-mail>')
     # A name joined to other letters or digits is another word; joined by a
-    # space, a dash, an underscore or anything else, it is the name.
+    # space, a dash, an underscore or anything else, it is the name. A short
+    # form (Get-ShortNameForm) has its number after the "~". A placeholder
+    # that is already in the line stays as it is, also when an account is
+    # called "user" or "server".
+    $placeholders = '(?<placeholder><(?:account|computer|domain|server|user folder|user|organisation|share|e-mail|account id|speaker|address)>)'
     foreach ($name in $PrivateNames.Keys) {
-        $pattern = '(?<![\p{L}\p{N}])' + [regex]::Escape($name)
-        $pattern += if ($name.EndsWith('~')) { '\d+(?![\p{L}\p{N}])' } else { '(?![\p{L}\p{N}])' }
-        $t = [regex]::Replace($t, $pattern, $PrivateNames[$name], 'IgnoreCase')
+        $tilde = if ($name.EndsWith('~') -or $name.Contains('~.')) { $name.LastIndexOf('~') } else { -1 }
+        $body = if ($tilde -ge 0) {
+            [regex]::Escape($name.Substring(0, $tilde)) + '~\d+' + [regex]::Escape($name.Substring($tilde + 1))
+        } else {
+            [regex]::Escape($name)
+        }
+        $with = $PrivateNames[$name]
+        $replace = [System.Text.RegularExpressions.MatchEvaluator] {
+            param($m)
+            if ($m.Groups['placeholder'].Success) { $m.Value } else { $with }
+        }
+        $t = [regex]::Replace($t, $placeholders + '|(?<![\p{L}\p{N}])' + $body + '(?![\p{L}\p{N}])', $replace, $anyCase)
     }
     # Account IDs of a person: local and domain accounts, and work or school
     # (Microsoft Entra) accounts.
@@ -100,11 +132,12 @@ function ConvertTo-PublicText {
     $t = [regex]::Replace($t, '(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b', '<address>')
     $t = [regex]::Replace($t, '(?i)\b[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}\b', '<address>')
     $t = [regex]::Replace($t, '(?i)(?<![0-9a-f-])[0-9a-f]{12}(?![0-9a-f])', '<address>')
-    # IPv6: anything with "::" or with three or more groups (not a time).
-    $t = [regex]::Replace($t, '(?i)(?<![\w:.])(?=[0-9a-f:.]*::|(?:[0-9a-f]{1,4}:){3})(?:[0-9a-f]{0,4}:){2,7}(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f]{1,4})?(?:%[\w.-]+)?(?![\w:])', '<address>')
+    # IPv6: anything with "::" or with three or more groups (not a time, and
+    # not what follows a "]", which is PowerShell such as [Type]::Add).
+    $t = [regex]::Replace($t, '(?i)(?<![\w:.\]])(?=[0-9a-f:.]*::|(?:[0-9a-f]{1,4}:){3})(?:[0-9a-f]{0,4}:){2,7}(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f]{1,4})?(?:%[\w.-]+)?(?![\w:])', '<address>')
     # IPv4, every address but this PC's own 127.0.0.1; a version number
     # (after "version" or after the comma of a DriverVer) stays.
-    $t = [regex]::Replace($t, '(?i)(?<![\w.,])(?<!version\W{0,12})(?!127\.0\.0\.1(?![\d.]))(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)', '<address>')
+    $t = [regex]::Replace($t, '(?<![\w.,])(?<!version\W{0,12})(?!127\.0\.0\.1(?![\d.]))(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)', '<address>', $anyCase)
     $t
 }
 
@@ -130,7 +163,7 @@ function Select-ReportLogLines([string[]]$Lines = @()) {
 }
 
 # Asked first and last in every report.
-$DiagReadFirst = 'Read the report through before you post it. It replaces the names of people, computers, speakers and networks, and e-mail and network addresses, where it finds them; replace any it missed.'
+$DiagReadFirst = 'Read the report through before you post it. It replaces the names of accounts, computers, speakers and networks, and e-mail and network addresses, where it finds them; replace any it missed.'
 
 # A sound output's name as the report shows it: the app's own names (whose
 # speaker part is replaced later); a name chosen in Sound settings isn't shown.
