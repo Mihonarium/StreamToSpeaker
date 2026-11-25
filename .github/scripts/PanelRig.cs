@@ -200,18 +200,28 @@ namespace PanelRig
         /// <summary>
         /// What a window's extended style says about how it behaves, in the
         /// words the app's log uses: out of Alt+Tab and the taskbar (tool
-        /// window), never activated, on top, clicks passing through.
+        /// window), never activated, on top, and whether the mouse passes
+        /// through it. WS_EX_TRANSPARENT alone only orders painting (the
+        /// window is painted after its siblings beneath it); on a layered
+        /// window (WS_EX_LAYERED) it makes the mouse pass through.
         /// </summary>
         public static string Style(IntPtr h)
         {
-            long ex = Native.GetWindowLongPtrW(h, -20).ToInt64(); // GWL_EXSTYLE
+            return StyleWords(Native.GetWindowLongPtrW(h, -20).ToInt64()); // GWL_EXSTYLE
+        }
+
+        /// <summary>The words of <see cref="Style"/> for the extended style bits <paramref name="ex"/>.</summary>
+        public static string StyleWords(long ex)
+        {
             var words = new List<string>();
             if ((ex & 0x00000080) != 0) words.Add("tool window");
             if ((ex & 0x08000000) != 0) words.Add("never active");
             if ((ex & 0x00040000) != 0) words.Add("app window");
             if ((ex & 0x00000008) != 0) words.Add("on top");
-            if ((ex & 0x00000020) != 0) words.Add("clicks pass through");
-            if ((ex & 0x00080000) != 0) words.Add("layered");
+            bool layered = (ex & 0x00080000) != 0, transparent = (ex & 0x00000020) != 0;
+            if (layered && transparent) words.Add("layered and transparent: clicks pass through");
+            else if (layered) words.Add("layered");
+            else if (transparent) words.Add("transparent (painted after its siblings)");
             return words.Count == 0 ? "plain" : string.Join(", ", words.ToArray());
         }
 
