@@ -32,7 +32,11 @@
        The timeline and the step summary say what was clicked.
     4. Pictures every 100 ms for 2 s; then, if the panel's window is on
        screen, a click inside it near its top edge and pictures every
-       100 ms for 1 s.
+       100 ms for 1 s. With every picture, and after the start, the click
+       and at the end, the app's windows are checked: the run fails when
+       one of them is shown as an app window or without the styles the
+       shell keeps on it (out of Alt+Tab, never active), or has a button
+       on the taskbar.
     5. Asks the app to close, and keeps its log.
 
     The machine has no sound device and no driver. Started as it is, the
@@ -413,6 +417,17 @@ function Get-IconPlace([int]$appPid) {
     [pscustomobject]@{ Where = "taskbar"; X = $rect.CenterX; Y = $rect.CenterY; What = "the notification area's button $($icon.What)" }
 }
 
+# A taskbar button of one of the app's windows: an element of the taskbar
+# whose name starts with the app's name and isn't the tray icon's. Each is
+# a problem of the run.
+function Test-TaskbarButtons($rec, [string]$when) {
+    $bar = Get-UiaTopLevel "Shell_TrayWnd"
+    foreach ($b in @(Find-UiaNamed $bar '^Stream To Speaker')) {
+        if ($b.Name -match $TrayPattern) { continue }
+        $rec.Problem("the taskbar has a button for one of the app's windows: $($b.What) ($when)")
+    }
+}
+
 # Click the button that shows the hidden icons; where the app's icon is
 # among them: an element of the hidden icons' window named as the tray icon
 # is, and found there again by its place.
@@ -457,6 +472,7 @@ if (-not (Test-Path -LiteralPath $Exe)) { throw "no app at $Exe" }
 
 $app = $null
 $rec = [PanelRig.Recorder]::new($PanelTitle, $RootTitle)
+$rec.PanelIsFlyout = ($Panel -eq "flyout")
 try {
     $rec.Shot("desktop-at-the-start")
 
@@ -511,6 +527,7 @@ try {
     # The panel opens by itself when started by hand, and at first run.
     $rec.Burst("start", 30, 100)
     $rec.Save($PictureDir)
+    Test-TaskbarButtons $rec "after the start"
     Wait-TrayIcon $app 90
     Start-Sleep -Seconds 2
     $place = Get-IconPlace $app.Id
@@ -531,6 +548,7 @@ try {
     Say "Clicked $script:Clicked"
     $rec.Burst("after-the-click", 21, 100)
     $rec.Save($PictureDir)
+    Test-TaskbarButtons $rec "after the click on the icon"
 
     # A click inside the panel, near the top of its inside.
     $inside = $rec.PanelClient()
@@ -546,6 +564,7 @@ try {
         Say "The panel's window isn't on screen two seconds after the click: no click inside it"
     }
     $rec.Shot("the-end")
+    Test-TaskbarButtons $rec "at the end"
 } finally {
     try { $rec.Save($PictureDir) } catch { Say "Couldn't save the pictures: $_" }
     $rec.Lines | Set-Content -LiteralPath (Join-Path $Out "timeline.txt") -Encoding UTF8
@@ -576,7 +595,9 @@ try {
             ""
             "Clicked: $script:Clicked."
             ""
-        ) + @($script:Warnings | ForEach-Object { "- Not as the case asked: $_" }) + @(
+            "The app's windows' styles and taskbar buttons: $(if ($rec.Problems.Count -eq 0) { 'as the shell keeps them' } else { 'PROBLEMS' })"
+            ""
+        ) + @($rec.Problems | ForEach-Object { "- Problem: $_" }) + @($script:Warnings | ForEach-Object { "- Not as the case asked: $_" }) + @(
             ""
             "The shell's lines in the app's log:"
             ""
@@ -584,5 +605,8 @@ try {
         ) + $shellLines + @('```')
         $summary | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
     }
+}
+if ($rec.Problems.Count -gt 0) {
+    throw "the app's windows didn't stay as the shell keeps them: $($rec.Problems -join '; ')"
 }
 Say "Done"

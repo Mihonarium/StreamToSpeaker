@@ -557,8 +557,52 @@ namespace PanelRig
         readonly List<string> lines = new List<string>();
         readonly string panelTitle;
         readonly string rootTitle;
+        readonly List<string> problems = new List<string>();
         uint pid;
         int count;
+
+        /// <summary>The panel is a flyout (out of Alt+Tab) rather than a small window.</summary>
+        public bool PanelIsFlyout = true;
+
+        /// <summary>What went against what the app's windows must be, each once, in the order found.</summary>
+        public List<string> Problems { get { return problems; } }
+
+        /// <summary>Note a problem, once.</summary>
+        public void Problem(string what)
+        {
+            foreach (string p in problems) if (p.StartsWith(what)) return;
+            problems.Add(what + " (first seen " + DateTime.UtcNow.ToString("HH:mm:ss.fff") + "Z)");
+            Note("PROBLEM: " + what);
+        }
+
+        const long WS_EX_TOOLWINDOW = 0x00000080, WS_EX_NOACTIVATE = 0x08000000, WS_EX_APPWINDOW = 0x00040000;
+
+        /// <summary>
+        /// The styles the shell keeps on its windows, checked on every one
+        /// of them that is shown: none an app window (forced onto the
+        /// taskbar); the panel as a flyout, the root window and the small
+        /// windows tool windows (out of the taskbar and Alt+Tab); the root
+        /// window and the small windows never activated. Dialogs and message
+        /// boxes are left out: they belong on the taskbar.
+        /// </summary>
+        void CheckStyles()
+        {
+            if (pid == 0) return;
+            foreach (Win w in Windows.Of(pid))
+            {
+                if (!w.Visible || w.Class == "#32770") continue;
+                string which;
+                bool tool, never;
+                if (w.Title == panelTitle) { which = "the panel's window"; tool = PanelIsFlyout; never = false; }
+                else if (w.Title == rootTitle) { which = "the root window"; tool = true; never = true; }
+                else if (w.Title.StartsWith(panelTitle + " confirmation") || w.Title.StartsWith(panelTitle + " notification")) { which = "the small window \"" + w.Title + "\""; tool = true; never = true; }
+                else continue;
+                long ex = Native.GetWindowLongPtrW(w.Handle, -20).ToInt64();
+                if ((ex & WS_EX_APPWINDOW) != 0) Problem(which + " is shown as an app window (forced onto the taskbar)");
+                if (tool && (ex & WS_EX_TOOLWINDOW) == 0) Problem(which + " is shown without the tool-window style (in Alt+Tab and the taskbar)");
+                if (never && (ex & WS_EX_NOACTIVATE) == 0) Problem(which + " is shown without the never-activate style");
+            }
+        }
 
         /// <summary>
         /// A recorder whose lines name the windows titled <paramref name="panel"/>
@@ -631,6 +675,7 @@ namespace PanelRig
             PictureCount++;
             if (PanelShown()) ShownCount++;
             Note(string.Format("picture {0}: panel {1}; root {2}; foreground {3}; pointer {4}", name, Panel(), Root(), Windows.Foreground(), Desk.Cursor()));
+            CheckStyles();
         }
 
         /// <summary><paramref name="n"/> pictures, one every <paramref name="everyMs"/> milliseconds.</summary>
