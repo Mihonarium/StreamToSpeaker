@@ -38,6 +38,16 @@ on:
         description: Version the calling build stamped into the installer
         type: string
         required: true
+      previous_tag:
+        description: "Release to upgrade from (default: newest vX.Y.Z release with an installer)"
+        type: string
+        required: false
+        default: ""
+      older_tag:
+        description: "A second, older release to upgrade from (default: v0.1.6, the first with a Microsoft-signed driver)"
+        type: string
+        required: false
+        default: ""
   workflow_dispatch:
     inputs:
       build_run_id:
