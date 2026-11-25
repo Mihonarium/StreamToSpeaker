@@ -4,7 +4,9 @@
 //! rounded corners, staying out of Alt+Tab).
 
 use super::placement::{Monitor, PxRect};
-use super::{Desktop, Foreground, PanelMode, PANEL_TITLE};
+use std::sync::Mutex;
+
+use super::{Desktop, Foreground, KeptStyle, PanelMode, ShellWindow, PANEL_TITLE};
 
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
@@ -82,7 +84,9 @@ impl Desktop for WindowsDesktop {
             self.styled = Some(hwnd as isize);
             if mode == PanelMode::Flyout {
                 round_corners(hwnd);
-                keep_out_of_alt_tab(hwnd, false);
+            }
+            if let Some(keep) = ShellWindow::Panel(mode).kept_style() {
+                keep_ex_style(hwnd, keep);
             }
         }
         set_rect(hwnd, rect);
@@ -165,7 +169,9 @@ impl WindowsDesktop {
     fn place_popup_window(title: &str, rect: PxRect) -> bool {
         let Some(hwnd) = hidden_own_window(title) else { return false };
         round_corners(hwnd);
-        keep_out_of_alt_tab(hwnd, true);
+        if let Some(keep) = ShellWindow::Popup.kept_style() {
+            keep_ex_style(hwnd, keep);
+        }
         set_rect(hwnd, rect);
         window_rect(hwnd) == Some(rect)
     }
@@ -312,28 +318,83 @@ fn round_corners(hwnd: HWND) {
     }
 }
 
-/// Keep a window out of Alt+Tab and the taskbar (a tool window), and with
-/// `never_active` out of the keyboard's way too.
-pub fn keep_out_of_alt_tab(hwnd: HWND, never_active: bool) {
+/// The windows whose extended style the shell keeps: each with the
+/// window procedure it had and the style it keeps.
+static KEPT: Mutex<Vec<(isize, isize, KeptStyle)>> = Mutex::new(Vec::new());
+
+fn kept() -> std::sync::MutexGuard<'static, Vec<(isize, isize, KeptStyle)>> {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Give `hwnd` the extended style bits of `keep` now, and keep them there
+/// for the window's life. winit writes a window's whole extended style again
+/// whenever it changes a flag of its own (showing the window is one), with
+/// no tool-window or never-activate bit and with `WS_EX_APPWINDOW`; that
+/// put the panel and the root window back in Alt+Tab and the root back in
+/// reach of the focus the moment they were shown. The window's procedure is
+/// wrapped so that every change of its extended style keeps these bits
+/// (`WM_STYLECHANGING` lets a window change the style about to be set).
+pub fn keep_ex_style(hwnd: HWND, keep: KeptStyle) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWLP_WNDPROC, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     };
+    {
+        let mut kept = kept();
+        match kept.iter_mut().find(|(h, _, _)| *h == hwnd as isize) {
+            Some(entry) => entry.2 = keep,
+            None => {
+                // SAFETY: a window of this thread; its procedure becomes
+                // `keep_style_proc`, which passes every message on to the one
+                // returned here, kept with it.
+                let old = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, keep_style_proc as *const () as isize) };
+                if old == 0 {
+                    return;
+                }
+                kept.push((hwnd as isize, old, keep));
+            }
+        }
+    }
     // SAFETY: a window of this thread; reading its extended style has no
     // effect.
     let ex = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
-    let mut new = (ex | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW;
-    if never_active {
-        new |= WS_EX_NOACTIVATE;
-    }
+    let new = keep.applied_to(ex);
     if new != ex {
-        // SAFETY: a window of this thread; only the extended style bits
-        // above change, then the frame is told to take them.
+        // SAFETY: a window of this thread; only the kept bits change, then
+        // the frame is told to take them.
         unsafe {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new as isize);
             SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
     }
+}
+
+/// The procedure of a window whose extended style the shell keeps: it keeps
+/// the bits in every change of that style, and passes every message on.
+unsafe extern "system" fn keep_style_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CallWindowProcW, DefWindowProcW, GWL_EXSTYLE, STYLESTRUCT, WM_NCDESTROY, WM_STYLECHANGING, WNDPROC};
+    let found = kept().iter().find(|(h, _, _)| *h == hwnd as isize).map(|(_, old, keep)| (*old, *keep));
+    let Some((old, keep)) = found else {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    };
+    if msg == WM_STYLECHANGING && wparam as i32 == GWL_EXSTYLE && lparam != 0 {
+        // SAFETY: for WM_STYLECHANGING, lParam points at the STYLESTRUCT
+        // Windows is about to apply, which the window may change.
+        let style = &mut *(lparam as *mut STYLESTRUCT);
+        style.styleNew = keep.applied_to(style.styleNew);
+    }
+    // SAFETY: the procedure the window had, a window procedure (a non-zero
+    // GWLP_WNDPROC value), stored when it was replaced.
+    let previous: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+    let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    if msg == WM_NCDESTROY {
+        kept().retain(|(h, _, _)| *h != hwnd as isize);
+    }
+    result
 }
 
 /// Whether a window is shown.

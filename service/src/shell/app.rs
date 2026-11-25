@@ -266,7 +266,9 @@ impl Shell {
             }
             RootMode::ToolWindow => {
                 if self.frames == 1 {
-                    win::keep_out_of_alt_tab(root, true);
+                    if let Some(keep) = super::ShellWindow::Root(RootMode::ToolWindow).kept_style() {
+                        win::keep_ex_style(root, keep);
+                    }
                 }
             }
         }

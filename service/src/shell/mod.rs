@@ -365,6 +365,62 @@ pub fn ex_style_words(ex: u32) -> String {
     }
 }
 
+/// Extended style bits the shell gives one of its windows and keeps there:
+/// `set` always on, `clear` always off, whatever else writes the window's
+/// style. (winit writes a window's whole extended style again whenever it
+/// changes a flag of its own, showing the window among them, and its style
+/// has no tool-window or never-activate bit and has `WS_EX_APPWINDOW`,
+/// which forces a window onto the taskbar.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeptStyle {
+    pub set: u32,
+    pub clear: u32,
+}
+
+/// `WS_EX_TOOLWINDOW`: out of the taskbar and of Alt+Tab.
+const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+/// `WS_EX_NOACTIVATE`: a click doesn't make it the foreground window.
+const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+/// `WS_EX_APPWINDOW`: forced onto the taskbar while shown.
+const WS_EX_APPWINDOW: u32 = 0x0004_0000;
+
+impl KeptStyle {
+    /// Out of Alt+Tab and the taskbar: the panel as a flyout.
+    pub const OUT_OF_ALT_TAB: KeptStyle = KeptStyle { set: WS_EX_TOOLWINDOW, clear: WS_EX_APPWINDOW };
+    /// Out of Alt+Tab and the taskbar and never activated: the root window
+    /// and the small windows by the clock.
+    pub const NEVER_ACTIVE: KeptStyle = KeptStyle { set: WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, clear: WS_EX_APPWINDOW };
+    /// Not forced onto the taskbar: the panel as a small window, which has a
+    /// title bar and is in Alt+Tab.
+    pub const OFF_THE_TASKBAR: KeptStyle = KeptStyle { set: 0, clear: WS_EX_APPWINDOW };
+
+    /// The extended style `ex` as the window keeps it.
+    pub fn applied_to(self, ex: u32) -> u32 {
+        (ex | self.set) & !self.clear
+    }
+}
+
+/// Which window of the shell, for the style it keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellWindow {
+    Root(RootMode),
+    Panel(PanelMode),
+    Popup,
+}
+
+impl ShellWindow {
+    /// The style the shell keeps on this window, if any.
+    pub fn kept_style(self) -> Option<KeptStyle> {
+        match self {
+            // Hidden for good once the first frame is drawn.
+            ShellWindow::Root(RootMode::Hidden) => None,
+            ShellWindow::Root(RootMode::ToolWindow) | ShellWindow::Popup => Some(KeptStyle::NEVER_ACTIVE),
+            ShellWindow::Panel(PanelMode::Flyout) => Some(KeptStyle::OUT_OF_ALT_TAB),
+            ShellWindow::Panel(PanelMode::Window) => Some(KeptStyle::OFF_THE_TASKBAR),
+        }
+    }
+}
+
 /// What the shell asks of Windows and does through it.
 pub trait Desktop {
     /// Every monitor, with its work area and scale.
@@ -563,6 +619,26 @@ mod tests {
         assert_eq!(describe_foreground(Some(&chat), true), "Chrome_WidgetWin_1 (chat.exe)");
         assert_eq!(describe_foreground(Some(&lookalike), true), "Shell_TrayWnd (lookalike.exe)");
         assert_eq!(describe_foreground(Some(&unknown), true), "SomeClass (process 4242)");
+    }
+
+    #[test]
+    fn the_shells_windows_keep_their_styles_when_winit_writes_the_style_again() {
+        // What winit 0.30 writes when it shows a window: WS_EX_WINDOWEDGE |
+        // WS_EX_ACCEPTFILES, WS_EX_APPWINDOW for a window that isn't kept
+        // off the taskbar by a flag of its own, WS_EX_TOPMOST for one on
+        // top, WS_EX_TRANSPARENT | WS_EX_LAYERED for one clicks pass through.
+        let (plain, app, top, through) = (0x0000_0110, 0x0004_0000, 0x0000_0008, 0x0008_0020);
+        let kept = |w: ShellWindow, ex: u32| ex_style_words(w.kept_style().map_or(ex, |k| k.applied_to(ex)));
+        assert_eq!(kept(ShellWindow::Panel(PanelMode::Flyout), plain | app | top), "tool window, on top");
+        assert_eq!(kept(ShellWindow::Panel(PanelMode::Window), plain | app | top), "on top");
+        assert_eq!(
+            kept(ShellWindow::Root(RootMode::ToolWindow), plain | app | through),
+            "tool window, never active, layered and transparent: clicks pass through"
+        );
+        assert_eq!(kept(ShellWindow::Popup, plain | app | top), "tool window, never active, on top");
+        assert_eq!(ShellWindow::Root(RootMode::Hidden).kept_style(), None);
+        // Bits the shell doesn't keep are left as written.
+        assert_eq!(KeptStyle::NEVER_ACTIVE.applied_to(plain | top) & (plain | top), plain | top);
     }
 
     #[test]
