@@ -322,13 +322,18 @@ Pushes to `main` also produce an installer bundling the Microsoft-signed
 driver whenever one matches the current driver source.
 
 A `v*` tag runs the release chain — build → sign the service binary → package
-→ sign the installer — publishing signed binaries with checksums and, on
-public repos, build-provenance attestations. Two approval clicks, both in the
-signing repository.
+→ release gate (rebuild the driver and check the installer bundles the
+Microsoft-signed package) → sign the installer → publish — assembling the
+version in a draft release that becomes public only when complete, with
+checksums and, on public repos, build-provenance attestations. Two approval
+clicks, both in the signing repository. The chain's own scripts are tested on
+every pull request (`chain-tests`, `chain-tests-powershell`).
 
 `driver-submission.yml`, `driver-attest.yml` and `driver-attested.yml` handle
-the driver's Microsoft attestation round-trip:
-[docs/driver-signing.md](docs/driver-signing.md).
+the driver's Microsoft attestation round-trip, `driver-certified.yml` turns a
+WHQL (HLK) return into a driver release, and `driver-reproducibility.yml`
+rebuilds a driver release and compares: [docs/driver-signing.md](docs/driver-signing.md).
+A driver release that is certified or attested is never changed by any of them.
 
 The WDK install and Rust dependencies are cached; a cold build is ~15-20 min,
 warm ~5.

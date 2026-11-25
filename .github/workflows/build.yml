@@ -155,15 +155,16 @@ jobs:
       # installer ships always matches the cached .sys/.cat.
       #
       # Versioning consequence: the driver build number (INF DriverVer
-      # revision + STREAM_TO_SPEAKER_DRIVER_BUILD) is now stamped only when
-      # the driver is actually rebuilt — i.e. it tracks the commit count at
-      # the last driver change rather than HEAD. Still monotonic across
-      # driver changes, so PnP upgrade comparison is unaffected.
+      # revision + STREAM_TO_SPEAKER_DRIVER_BUILD) of these test-signed
+      # builds is stamped only when the driver is actually rebuilt — i.e. it
+      # is the commit count at the last driver change rather than at HEAD.
+      # (The count restarted with the public history; see "Driver build
+      # numbers" in docs/driver-signing.md.)
       #
       # restore/save split (not plain actions/cache) so a build that fails
-      # before the cache is populated can't poison the key. Bump the `v1`
-      # tag to force a rebuild after changing build flags without touching
-      # driver source.
+      # before the cache is populated can't poison the key. Bump the `vN`
+      # tag in the key (now `v2`) to force a rebuild after changing build
+      # flags without touching driver source.
       # -----------------------------------------------------------------
       - name: Restore prebuilt driver cache
         id: cache-driver
@@ -861,10 +862,11 @@ jobs:
   # attestation-signed) when one matches this tag's driver source (then no
   # test cert is shipped and the .iss skips cert import).
   # Falls back to the test-signed driver + cert — clearly labelled
-  # `-testsigned` — when no Microsoft-signed driver matches, so releases
-  # still work before the first signing round-trip. An error while looking
-  # for the driver stops the job instead (Get-AttestedDriver.ps1 without
-  # -WarnOnError). The installer leaves this job only as the workflow
+  # `-testsigned` — when no Microsoft-signed driver matches, unless a
+  # certified or attested driver was built from this tag's very driver/
+  # and include/ trees (then the source hash moved, and the job stops). An
+  # error while looking for the driver stops the job too
+  # (Get-AttestedDriver.ps1 without -WarnOnError). The installer leaves this job only as the workflow
   # artifact `unsigned-setup-exe`; it is never attached to a release.
   package:
     if: startsWith(github.ref, 'refs/tags/v')
