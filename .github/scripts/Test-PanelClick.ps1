@@ -43,7 +43,11 @@
        case fails if the app doesn't end within 20 s, ends with an exit
        code other than 0, or has to be ended by force. A case passes only
        when every expectation is met and no problem was found; the step
-       summary names each expectation, met or failed, in a sentence.
+       summary names each expectation, met or failed, in a sentence. When
+       the rig itself fails (no icon to click, the app not started, a
+       Windows call refused), the case has no verdict about the panel: the
+       summary and verdict.txt say that the rig failed, before or after it
+       started the app, and why.
 
     The machine has no sound device and no driver. Started as it is, the
     app would look for its driver, fall back to recording the default
@@ -231,7 +235,7 @@ function Get-TrayIconAt([int]$x, [int]$y) {
     if ($there -and ($there.Name -match $TrayPattern)) { return $there }
     $inner = @(Find-UiaNamed $e $TrayPattern | Where-Object { $_.Box.Contains($x, $y) }) | Select-Object -First 1
     if ($inner) { return $inner }
-    Say "At $x,$y: $(if ($there) { $there.What } else { 'an element with no place' }), not the app's tray icon"
+    Say "At ${x},${y}: $(if ($there) { $there.What } else { 'an element with no place' }), not the app's tray icon"
     $null
 }
 
@@ -279,7 +283,7 @@ function Start-AppByProgram([bool]$startup, [string]$label) {
 # shortcut isn't what is at its place, rather than click something else.
 function Start-AppByHand([string]$label) {
     $desktop = [Environment]::GetFolderPath("Desktop")
-    $lnkPath = Join-Path $desktop "$ShortcutName.lnk"
+    $lnkPath = Join-Path $desktop "${ShortcutName}.lnk"
     $argv = Get-AppArguments $false
     $shell = New-Object -ComObject WScript.Shell
     $lnk = $shell.CreateShortcut($lnkPath)
@@ -643,7 +647,7 @@ function Invoke-WithTray($app, $rec) {
 # shown. Each is a problem of the run.
 function Test-TaskbarButtons($rec, [string]$when) {
     if ($rec.TaskbarWindowShown()) {
-        Say "A window of the app that belongs on the taskbar (a dialog, a message box, the panel as an ordinary window) is shown $when: its taskbar buttons aren't checked now"
+        Say "A window of the app that belongs on the taskbar (a dialog, a message box, the panel as an ordinary window) is shown ${when}: its taskbar buttons aren't checked now"
         return
     }
     $bar = Get-UiaTopLevel "Shell_TrayWnd"
@@ -696,6 +700,10 @@ Say "Foreground: $([PanelRig.Windows]::Foreground())"
 if (-not (Test-Path -LiteralPath $Exe)) { throw "no app at $Exe" }
 
 $app = $null
+# Why the rig itself failed, if it did, and whether the case's app was
+# started by then: a case that ends so has no verdict about the panel.
+$script:RigError = $null
+$script:AppStarted = $false
 $rec = [PanelRig.Recorder]::new($PanelTitle, $RootTitle)
 # Without a tray icon the panel is always the ordinary window.
 $rec.PanelIsFlyout = ($Panel -eq "flyout" -and $Tray -eq "on")
@@ -745,10 +753,12 @@ try {
     # Start.
     if ($Start -eq "menu") {
         $app = Start-AppByHand "the run"
+        $script:AppStarted = $true
         $rec.Follow([uint32]$app.Id)
         $rec.Note("the app started by hand, pid $($app.Id)")
     } else {
         $app = Start-AppByProgram $true "the run"
+        $script:AppStarted = $true
         $rec.Follow([uint32]$app.Id)
         $rec.Note("the app started as a program, pid $($app.Id)")
     }
@@ -762,6 +772,9 @@ try {
     } else {
         Invoke-WithTray $app $rec
     }
+} catch {
+    $script:RigError = "$_"
+    throw
 } finally {
     # The quit's own clicks go to the timeline and the pictures too.
     if ($app) {
@@ -771,11 +784,22 @@ try {
     $rec.Lines | Set-Content -LiteralPath (Join-Path $Out "timeline.txt") -Encoding UTF8
     Save-AppLog "app"
     Set-AppEnvironment $false
-    Remove-Item -LiteralPath (Join-Path ([Environment]::GetFolderPath("Desktop")) "$ShortcutName.lnk") -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path ([Environment]::GetFolderPath("Desktop")) "${ShortcutName}.lnk") -ErrorAction SilentlyContinue
 
     # The step summary: the variation, the verdict, what the pictures show,
     # the commands the windows got, the shell's lines from the app's log.
     $failed = @($rec.Expectations | Where-Object { -not $_.Met })
+    if ($script:RigError) {
+        $when = "before it could judge the panel"
+        if (-not $script:AppStarted) { $when = "before it started the app" }
+        $verdict = "none: the rig failed $($when): $($script:RigError)"
+    } elseif ($failed.Count -eq 0 -and $rec.Problems.Count -eq 0 -and $rec.Expectations.Count -gt 0) {
+        $verdict = "passed"
+    } else {
+        $verdict = "FAILED"
+    }
+    # The workflow tells from this file that the script ran to its end.
+    Set-Content -LiteralPath (Join-Path $Out "verdict.txt") -Value $verdict -Encoding UTF8
     if ($env:GITHUB_STEP_SUMMARY) {
         $appLog = Join-Path $Out "app-stream-to-speaker.log"
         $shellLines = @()
@@ -787,14 +811,16 @@ try {
             }
             $commands = $counts -join ", "
         }
+        $heading = "### Panel click: $Click click, icon $Icon, $Panel, start $Start, network $Network$(if ($FirstRun) { ', first run' })$(if ($Tray -eq 'off') { ', no tray icon' })"
+        if ($script:RigError) { $heading += " (the rig failed; nothing about the panel was judged)" }
         $summary = @(
-            "### Panel click: $Click click, icon $Icon, $Panel, start $Start, network $Network$(if ($FirstRun) { ', first run' })$(if ($Tray -eq 'off') { ', no tray icon' })"
+            $heading
             ""
             "$($os.Caption) (build $build). Pictures with the panel's window on screen: $($rec.ShownCount) of $($rec.PictureCount). Commands the app's windows got: $commands."
             ""
             "Clicked: $script:Clicked."
             ""
-            "Verdict: $(if ($failed.Count -eq 0 -and $rec.Problems.Count -eq 0 -and $rec.Expectations.Count -gt 0) { 'passed' } else { 'FAILED' })"
+            "Verdict: $verdict"
             ""
         ) + @($rec.Expectations | ForEach-Object { "- Expectation $_" }) + @(
             ""

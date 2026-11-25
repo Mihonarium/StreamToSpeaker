@@ -81,6 +81,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # PowerShell 7 parses the rig's PowerShell here first, seconds into
+      # the run. It is not the dialect the rig runs in (Windows PowerShell
+      # 5.1 accepts less), so the build parses again on Windows.
+      - name: Parse the rig's PowerShell (PowerShell 7)
+        shell: pwsh
+        run: .github/scripts/Test-RigScripts.ps1
+
       - name: Pick the cases
         id: pick
         env:
@@ -104,6 +111,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      # First on Windows, before anything is built: Windows PowerShell 5.1,
+      # the dialect the rig runs in, parses every PowerShell script the run
+      # uses, and the rig's C# is compiled as the rig compiles it. A mistake
+      # there fails the run here, in a minute, with its file, line and column.
+      - name: Parse the rig's scripts and compile its C# (Windows PowerShell)
+        shell: powershell
+        run: .github/scripts/Test-RigScripts.ps1 -CompileRig
 
       - name: Set up Rust (stable, x86_64-pc-windows-msvc)
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
@@ -202,6 +217,26 @@ jobs:
           -Click $env:CLICK -Icon $env:ICON -Panel $env:PANEL -Start $env:START -Network $env:NETWORK
           -FirstRun:($env:FIRST_RUN -eq "true") -Tray $env:TRAY
           -Out (Join-Path $env:RUNNER_TEMP "panel-click")
+
+      # The script writes its verdict, or why the rig failed, to the step
+      # summary and verdict.txt. Without verdict.txt the script never ran or
+      # was ended before its end (a script that doesn't parse, a timeout):
+      # the page then says that the rig failed, not anything about the panel.
+      - name: Say when the rig itself failed
+        if: always()
+        shell: pwsh
+        env:
+          CASE: ${{ matrix.case.name }}
+        run: |
+          $verdict = Join-Path $env:RUNNER_TEMP "panel-click\verdict.txt"
+          if (-not (Test-Path -LiteralPath $verdict)) {
+            @(
+              "### $($env:CASE): the rig failed before it could judge anything"
+              ""
+              "The case's script didn't run to its end (see the step 'Start the app and click its tray icon'). Nothing about the panel was judged."
+            ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+            Write-Host "::error::the rig failed in case $($env:CASE): its script didn't run to its end"
+          }
 
       - name: Keep the pictures and logs
         if: always()
