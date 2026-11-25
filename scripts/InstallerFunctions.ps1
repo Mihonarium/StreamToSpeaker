@@ -710,8 +710,11 @@ function Remove-Device([string]$InstanceId) { Invoke-Tool -FilePath $StsDevcon -
 function Remove-DriverPackage([string]$Name) { Invoke-Tool -FilePath $StsPnputil -Arguments @('/delete-driver', $Name) }
 function Remove-DriverPackageForce([string]$Name) { Invoke-Tool -FilePath $StsPnputil -Arguments @('/delete-driver', $Name, '/uninstall', '/force') }
 
-# Deletes endpoint entries from Windows' cache. Counts only what is gone
-# afterwards: Windows can refuse the delete.
+# Deletes endpoint entries from Windows' cache where Windows allows it: it
+# keeps these entries for itself and can refuse the delete even to an
+# administrator. Counts only what is gone afterwards. An entry that stays
+# does nothing: its device is gone, Windows shows it nowhere, and a device
+# created later gets an entry of its own.
 function Remove-EndpointEntries([object[]]$Endpoints = @()) {
     $removed = 0
     $failed = @()
@@ -719,7 +722,7 @@ function Remove-EndpointEntries([object[]]$Endpoints = @()) {
         try {
             Remove-Item -LiteralPath $ep.KeyPath -Recurse -Force -ErrorAction Stop
         } catch {
-            Write-Step "  Windows refused to delete the cached entry $($ep.Guid): $($_.Exception.Message)"
+            Write-Step "  Windows keeps the cached entry $($ep.Guid): $($_.Exception.Message)"
         }
         if (Test-Path -LiteralPath $ep.KeyPath) {
             $failed += $ep
@@ -1212,9 +1215,10 @@ function Select-FallbackOutput([object[]]$Outputs = @(), [int]$Role) {
     ($others | Sort-Object @{ Expression = { [int64]$_.RoleTimes[$Role] }; Descending = $true }, Id | Select-Object -First 1).Id
 }
 
-# When no copy of the app will run after Setup, Windows must not stay on the
-# app's output, which then plays nowhere: each role it holds goes to the
-# output Windows played to before. Returns whether anything moved.
+# When no copy of the app will run (after a Setup that starts none, and
+# when the app is uninstalled), Windows must not stay on the app's output,
+# which then plays nowhere: each role it holds goes to the output Windows
+# played to before. Returns whether anything moved.
 function Move-DefaultOutputAway {
     $outputs = @(Get-RenderOutputs)
     $ours = @($outputs | Where-Object { $_.Ours } | ForEach-Object { $_.Id })
@@ -1227,7 +1231,7 @@ function Move-DefaultOutputAway {
             continue
         }
         $hr = [StreamToSpeaker.SetupNative]::SetDefault($to, $role)
-        Write-Step ("Windows now plays to {0} for role {1} (HRESULT 0x{2:X8}): no copy of Stream To Speaker runs after Setup." -f $to, $role, $hr)
+        Write-Step ("Windows now plays to {0} for role {1} (HRESULT 0x{2:X8}): no copy of Stream To Speaker will be running." -f $to, $role, $hr)
         if ($hr -eq 0) { $moved = $true }
     }
     $moved
@@ -1557,16 +1561,31 @@ function Remove-ShortcutsInto {
 # Uninstall
 # ---------------------------------------------------------------------------
 
-# Removes every Stream To Speaker device, every package of ours in the
-# driver store and, once no device is left, Windows' cached entries for the
-# sound output. Returns what is still there afterwards, as the lines the
-# uninstaller reads: "left: ..." for what uninstalling again may remove,
-# "stays: ..." for a cached entry Windows refused to delete (uninstalling
-# again would only ask Windows the same).
+# Removes every Stream To Speaker device and every package of ours in the
+# driver store. Returns the lines the uninstaller reads:
+#   "left: ..."                what is still there afterwards and
+#                              uninstalling again may remove;
+#   "removed-at-restart: ..."  a device Windows removes only when it
+#                              restarts. It answers so for a device whose
+#                              driver was replaced and waits for a restart.
+#                              Until then the device's sound output stays
+#                              in Windows' list.
+# Windows is moved off the app's sound output before the devices go: the app
+# no longer runs, so an output that stays until the restart would play
+# nowhere. Windows' cached entries of outputs whose device is gone are
+# deleted where Windows allows it (see Remove-EndpointEntries). The entry of
+# an output that is still there is left alone.
 function Invoke-DriverRemoval([hashtable]$Tools = (New-DriverTools)) {
+    try {
+        $null = & $Tools.MoveDefaultAway
+    } catch {
+        Write-Step "Could not move Windows off the app's sound output: $($_.Exception.Message)"
+    }
+    $atRestart = @()
     foreach ($d in @(& $Tools.GetDevices)) {
         Write-Step "Removing the device $($d.InstanceId)..."
-        $null = & $Tools.RemoveDevice $d.InstanceId
+        # DevCon's exit code 1: the device is removed when Windows restarts.
+        if ((& $Tools.RemoveDevice $d.InstanceId) -eq 1) { $atRestart += $d.InstanceId }
     }
     $packages = @(& $Tools.GetPackages)
     if (-not $packages.Count) { Write-Step 'No Stream To Speaker driver package in the driver store.' }
@@ -1574,18 +1593,31 @@ function Invoke-DriverRemoval([hashtable]$Tools = (New-DriverTools)) {
         Write-Step "Deleting the driver package $p..."
         $null = & $Tools.ForceDeletePackage $p
     }
-    $left = @()
-    $devices = @(& $Tools.GetDevices)
-    foreach ($d in $devices) { $left += "left: the Stream To Speaker device $($d.InstanceId)" }
-    foreach ($p in @(& $Tools.GetPackages)) { $left += "left: the driver package $p in Windows' driver store" }
-    if (-not $devices.Count) {
-        $entries = @(& $Tools.GetEndpoints)
-        if ($entries.Count) {
-            $gone = & $Tools.RemoveEndpoints $entries
-            foreach ($ep in @($gone.Failed)) { $left += "stays: Windows' cached entry $($ep.Guid) for the sound output: Windows refused to delete it. It does nothing while Stream To Speaker isn't installed." }
-        }
+    $lines = @()
+    $stillThere = @(@(& $Tools.GetDevices) | Where-Object { $atRestart -notcontains $_.InstanceId })
+    foreach ($d in $stillThere) { $lines += "left: the Stream To Speaker device $($d.InstanceId)" }
+    foreach ($p in @(& $Tools.GetPackages)) { $lines += "left: the driver package $p in Windows' driver store" }
+    foreach ($id in $atRestart) {
+        Write-Step "Windows removes the device $id when it restarts. Until then its sound output stays in Windows' list."
+        $lines += "removed-at-restart: the Stream To Speaker device $id"
     }
-    $left
+    # The output of a device that just went shows as gone a moment later.
+    # One that is still there after the wait belongs to a device Windows
+    # removes when it restarts (this run may be a second one, which no
+    # longer finds that device).
+    $entries = @(& $Tools.GetEndpoints)
+    for ($i = 0; $i -lt 5 -and -not $atRestart.Count -and @(Select-PresentEndpoints $entries).Count; $i++) {
+        & $Tools.Pause
+        $entries = @(& $Tools.GetEndpoints)
+    }
+    $present = @(Select-PresentEndpoints $entries).Count
+    if ($present -and -not $atRestart.Count) {
+        Write-Step "Windows still lists the app's sound output. It goes when Windows restarts."
+    }
+    $gone = @(Select-OrphanedEndpoints $entries)
+    if ($gone.Count) { $null = & $Tools.RemoveEndpoints $gone }
+    if (-not $lines.Count -and -not $present) { Write-Step 'The driver and its device are removed.' }
+    $lines
 }
 
 # How a sound output's name is written to the log: ours, the app's and the

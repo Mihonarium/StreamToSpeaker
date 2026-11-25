@@ -566,14 +566,31 @@ Test 'the uninstall says what it couldn''t remove' {
     New-World -Devices @(Fake-Device) -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint -State 4)
     Assert-Equal '' (@(Invoke-DriverRemoval -Tools $FakeTools) -join ',') 'nothing left'
     Assert-Equal 1 (Called 'RemoveEndpoints:1') 'cached entries removed once no device is left'
-    # A cached entry Windows refuses to delete is told apart from what
-    # uninstalling again may remove.
+    # A cached entry Windows keeps is no failure: it does nothing.
     New-World -Devices @(Fake-Device) -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint -State 4)
     $refusing = $FakeTools.Clone()
     $refusing.RemoveEndpoints = { param($List) [pscustomobject]@{ Removed = 0; Failed = @($List) } }
-    $left = @(Invoke-DriverRemoval -Tools $refusing)
-    Assert-Equal 1 $left.Count 'one line'
-    Assert-True ($left[0].StartsWith("stays: Windows' cached entry {11111111-1111-1111-1111-111111111111} for the sound output")) 'what stays'
+    Assert-Equal '' (@(Invoke-DriverRemoval -Tools $refusing) -join ',') 'a kept entry is not named'
+}
+
+Test 'a device Windows removes only when it restarts is said so, and its output is left alone' {
+    $other = '{22222222-2222-2222-2222-222222222222}'
+    New-World -Devices @(Fake-Device) -Packages @('oem5.inf') -Endpoints @((Fake-Endpoint), (Fake-Endpoint -Guid $other -State 4))
+    $waiting = $FakeTools.Clone()
+    # As DevCon answers for a device whose driver waits for a restart: exit
+    # code 1, and Windows no longer lists the device.
+    $waiting.RemoveDevice = { param($Id) Note "RemoveDevice:$Id"; $script:W.Devices = @(); 1 }
+    $lines = @(Invoke-DriverRemoval -Tools $waiting)
+    Assert-Equal 'removed-at-restart: the Stream To Speaker device ROOT\MEDIA\0000' $lines 'lines'
+    Assert-True ((Index-Of 'MoveDefaultAway') -ge 0 -and (Index-Of 'MoveDefaultAway') -lt (Index-Of 'RemoveDevice')) 'Windows is moved off the output before the device goes'
+    Assert-Equal 1 (Called 'RemoveEndpoints') 'one delete'
+    Assert-Equal 1 (Called 'RemoveEndpoints:1') 'only the entry whose device is gone'
+    # The uninstaller runs the removal a second time. That run finds no
+    # device, and must not delete the entry of the output that is still there.
+    New-World -Endpoints @((Fake-Endpoint), (Fake-Endpoint -Guid $other -State 4))
+    Assert-Equal '' (@(Invoke-DriverRemoval -Tools $FakeTools) -join ',') 'nothing to say'
+    Assert-Equal 1 (Called 'RemoveEndpoints') 'one delete again'
+    Assert-Equal 1 (Called 'RemoveEndpoints:1') 'again only the entry whose device is gone'
 }
 
 Test 'the log names the app''s outputs, and no name a person chose' {

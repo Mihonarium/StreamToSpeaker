@@ -1,15 +1,20 @@
 # Removes Stream To Speaker's sound driver from this PC. The uninstaller
-# runs it elevated, after closing the app, and reads the "left:" and
-# "stays:" lines it prints: it names what is still there afterwards in its
-# last message.
+# runs it elevated, after closing the app, and reads two kinds of lines it
+# prints: "left: ..." names what is still there afterwards (the uninstaller
+# says so in its last message), and "removed-at-restart: ..." a device
+# Windows removes only when it restarts (the uninstaller then asks for the
+# restart).
 #
-# Removes every Stream To Speaker device, every Stream To Speaker package in
-# the driver store, and Windows' cached entries for the sound output (which
-# would otherwise keep the last speaker's name in Sound settings). The
-# loaded driver stays in memory until Windows restarts; the uninstaller
-# asks for that restart when the driver was running.
+# Moves Windows off the app's sound output (the app no longer runs, so the
+# output would play nowhere), then removes every Stream To Speaker device
+# and every Stream To Speaker package in the driver store. Windows' cached
+# entries for the removed sound output are deleted where Windows allows it;
+# one that stays does nothing. The loaded driver stays in memory until
+# Windows restarts; the uninstaller asks for that restart when the driver
+# was running.
 #
-# Exit code 0 when everything is gone, 1 when something is left.
+# Exit code 0 when nothing is left that uninstalling again may remove, 1
+# otherwise.
 #
 # Keep this file ASCII (see InstallerFunctions.ps1).
 
@@ -23,12 +28,15 @@ try {
     . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'InstallerFunctions.ps1'))))
     $StsLogPrefix = '[uninstall-driver] '
     $StsDevcon = Join-Path (Split-Path -Parent $PSScriptRoot) 'driver\devcon.exe'
-    $left = @(Invoke-DriverRemoval)
-    foreach ($item in $left) { Write-Host $item }
-    if (-not $left.Count) {
-        Write-Step 'The driver, its device and its cached sound output entries are removed.'
-        $exitCode = 0
+    try {
+        # They read and change which output Windows plays to.
+        Initialize-NativeHelpers
+    } catch {
+        Write-Step "Could not load the Windows helpers, so the output Windows plays to is left as it is: $($_.Exception.Message)"
     }
+    $lines = @(Invoke-DriverRemoval)
+    foreach ($line in $lines) { Write-Host $line }
+    if (-not @($lines | Where-Object { $_.StartsWith('left: ') }).Count) { $exitCode = 0 }
 } catch {
     Write-Host "left: the sound driver (removing it failed: $($_.Exception.Message))"
     Write-Host $_.ScriptStackTrace

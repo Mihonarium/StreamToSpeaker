@@ -620,6 +620,8 @@ function Assert-DiagnoseReport([string]$label) {
         }
         $text = Read-Text $out
         Check ($p.ExitCode -eq 0) "Diagnose.ps1 $where ran under Windows PowerShell (exit code $($p.ExitCode))"
+        $errors = "$(Read-Text "$out.stderr")".Trim()
+        Check (-not $errors) "Diagnose.ps1 $where printed no errors (first line: '$(($errors -split "`r?`n")[0])')"
         Check ($text.Contains("==== Install-Driver finished at ")) "Diagnose.ps1 $where printed the tail of $(Get-InstallLog)"
         Check ($text.Contains("Read the report through before you post it")) "Diagnose.ps1 $where asks for the report to be read before it is posted"
         if ($imageFile) {
@@ -881,18 +883,24 @@ function Assert-Removed([string]$app, [string]$uninstallLog) {
     Check ($rules.Count -eq 0) "no Windows Firewall rule for the app left (left: $(@($rules | ForEach-Object DisplayName) -join ', '))"
     $text = Read-Text $uninstallLog
     Check ($text.Contains("[uninstall-driver]")) "the uninstall log records the driver removal"
-    # What the uninstaller says it couldn't remove ("left:"), and what it
-    # says stays because Windows refuses to delete it ("stays:": the cached
-    # entry of the sound output).
+    Check ($text.Contains("Loaded the Windows helpers.")) "the uninstaller loaded the helpers that move Windows off the app's sound output"
+    # What the uninstaller says it couldn't remove ("left:").
     $left = @([regex]::Matches($text, '(?m) left: (.*?)\r?$') | ForEach-Object { $_.Groups[1].Value })
     Check ($left.Count -eq 0) "the uninstaller names nothing it couldn't remove (named: $($left -join '; '))"
-    $stays = @([regex]::Matches($text, '(?m) stays: (.*?)\r?$') | ForEach-Object { $_.Groups[1].Value })
-    foreach ($line in $stays) { Warn "the uninstaller says this stays on the PC: $line" }
+    # A device whose driver was replaced and waits for a restart is removed
+    # by Windows only at that restart. The uninstaller says so
+    # ("removed-at-restart:"), and the device's sound output stays in
+    # Windows' list until then. No runner restarts, so that the output goes
+    # can't be checked here.
+    $atRestart = @([regex]::Matches($text, '(?m) removed-at-restart: (.*?)\r?$') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
     $outputs = @(Get-SoundOutputs)
-    foreach ($o in $outputs) { Write-Host "  still in Windows' cache of sound outputs: $($o.name), state $($o.state)" }
-    Check (@($outputs | Where-Object { $_.state -eq 1 -or $_.state -eq 2 }).Count -eq 0) "Windows has no $AppName sound output after the uninstall"
-    if ($outputs.Count -gt $stays.Count) {
-        Warn "Windows' cache of sound outputs still holds $($outputs.Count) $AppName entries whose device is gone, and the uninstaller named $($stays.Count)"
+    foreach ($o in $outputs) { Write-Host "  in Windows' cache of sound outputs: $($o.name), state $($o.state)" }
+    $present = @($outputs | Where-Object { $_.state -eq 1 -or $_.state -eq 2 })
+    if ($atRestart.Count) {
+        Warn "Windows removes the device only when it restarts ($($atRestart -join '; ')): its sound output stays until then, which can't be checked on a runner"
+        Check ($present.Count -le $atRestart.Count) "no more $AppName sound outputs stay than devices wait for the restart ($($present.Count) output(s), $($atRestart.Count) device(s))"
+    } else {
+        Check ($present.Count -eq 0) "Windows has no $AppName sound output after the uninstall"
     }
     Assert-Sentinel
 }

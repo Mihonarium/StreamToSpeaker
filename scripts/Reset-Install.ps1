@@ -1,11 +1,12 @@
-# Clears Stream To Speaker's driver and Windows' cached copy of its sound
-# output, so that the next run of Setup starts from nothing. For a PC where
+# Clears Stream To Speaker's driver, so that the next run of Setup starts
+# from nothing: a new device, which gets a new sound output. For a PC where
 # running Setup again didn't make the sound output work.
 #
-# It removes the Stream To Speaker device, every Stream To Speaker package
-# in the driver store and Windows' cached entries for the sound output. The
-# app, its settings and its speakers stay. Afterwards: restart the PC, then
-# run StreamToSpeakerSetup.exe again.
+# It removes the Stream To Speaker device and every Stream To Speaker
+# package in the driver store, and deletes Windows' cached entries of the
+# removed sound output where Windows allows it (one that stays does
+# nothing). The app, its settings and its speakers stay. Afterwards: restart
+# the PC, then run StreamToSpeakerSetup.exe again.
 #
 # Run it from an elevated PowerShell (right-click Windows PowerShell, Run as
 # administrator):
@@ -63,11 +64,15 @@ foreach ($p in $packages) {
 }
 
 Write-Host "3/3  Clearing Windows' cached entries for the sound output..." -ForegroundColor Cyan
-$entries = @(Get-OurEndpoints)
-if (-not $entries.Count) { Write-Step 'There are none.' }
+# Only of outputs whose device is gone: the output of a device Windows
+# removes when it restarts is still there. Windows may keep an entry; one
+# that stays does nothing, because Setup's new device gets a new sound
+# output.
+$entries = @(Select-OrphanedEndpoints @(Get-OurEndpoints))
+if (-not $entries.Count) { Write-Step 'There are none to clear.' }
 if ($entries.Count) {
     $gone = Remove-EndpointEntries $entries
-    foreach ($ep in $gone.Failed) { $problems += "Windows kept the cached entry $($ep.Guid)" }
+    if (@($gone.Failed).Count) { Write-Step "Windows keeps $(@($gone.Failed).Count) of them. They do nothing without their device." }
 }
 
 Write-Host ''

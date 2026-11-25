@@ -358,9 +358,10 @@ var
   TasksPageSeen: Boolean;
   // What the scripts printed last.
   DriverResultLine, FirewallResultLine, CopiesLine, EarlierLine: String;
-  // What the uninstall couldn't remove: LeftLines, what uninstalling again
-  // may remove; StaysLines, what Windows refused to delete.
-  LeftLines, StaysLines: String;
+  // Uninstall: what couldn't be removed and uninstalling again may remove.
+  LeftLines: String;
+  // Uninstall: Windows removes a device of ours only when it restarts.
+  RemovedAtRestart: Boolean;
   DriverOutcome, DriverProblem: String;
   DriverRestart, DriverReplaced, DriverNewOutput, DriverKeptBefore: Boolean;
   DriverWasDefault, DriverIsDefault, DriverSoundMoved: Boolean;
@@ -495,8 +496,8 @@ begin
     EarlierLine := S
   else if Pos('left: ', S) = 1 then
     LeftLines := LeftLines + '- ' + Copy(S, 7, Length(S)) + #13#10
-  else if Pos('stays: ', S) = 1 then
-    StaysLines := StaysLines + '- ' + Copy(S, 8, Length(S)) + #13#10;
+  else if Pos('removed-at-restart: ', S) = 1 then
+    RemovedAtRestart := True;
 end;
 
 // Runs a script in 64-bit Windows PowerShell (the one whose registry view
@@ -1145,34 +1146,31 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Code: Integer;
-  Text: String;
 begin
   if CurUninstallStep = usUninstall then begin
     LeftLines := '';
-    StaysLines := '';
+    RemovedAtRestart := False;
     RunScript('Find-RunningCopies.ps1', ' -Folders "' + ExpandConstant('{app}') + '" -Close', Code);
     RunScript('Uninstall-Driver.ps1', '', Code);
     RunScript('Remove-TestCertificate.ps1', ' -CerPath "' + ExpandConstant('{app}\driver\StreamToSpeaker.cer') + '"', Code);
     RunScript('Set-FirewallRule.ps1', ' -Remove', Code);
     RunScript('Remove-SignInEntries.ps1', '', Code);
-  end else if (CurUninstallStep = usPostUninstall) and (LeftLines + StaysLines <> '') then begin
+  end else if (CurUninstallStep = usPostUninstall) and (LeftLines <> '') then begin
     // Said before Inno Setup's own last message, which then no longer
-    // reads as if everything went. Trying again is advised only when
-    // something is left that another uninstall may remove.
-    Log('Left on this PC:' + #13#10 + LeftLines + StaysLines);
-    if not UninstallSilent then begin
-      Text := FmtMessage(CustomMessage('UninstallLeft'), [Trim(LeftLines + StaysLines)]);
-      if LeftLines <> '' then
-        Text := Text + #13#10#13#10 + CustomMessage('UninstallRetry');
-      MsgBox(Text, mbError, MB_OK);
-    end;
+    // reads as if everything went.
+    Log('Left on this PC:' + #13#10 + LeftLines);
+    if not UninstallSilent then
+      MsgBox(FmtMessage(CustomMessage('UninstallLeft'), [Trim(LeftLines)]) + #13#10#13#10 +
+             CustomMessage('UninstallRetry'), mbError, MB_OK);
   end;
 end;
 
 // Only an interactive uninstall asks for the restart: a very silent one
-// without /NORESTART would restart the PC without asking, and the loaded
-// driver does no harm until the next restart.
+// without /NORESTART would restart the PC without asking. Until the restart
+// the loaded driver does no harm. A device Windows removes only then keeps
+// its sound output in Windows' list; Uninstall-Driver.ps1 has moved Windows
+// to another output where there is one.
 function UninstallNeedRestart(): Boolean;
 begin
-  Result := DriverWasLoaded and not UninstallSilent;
+  Result := (DriverWasLoaded or RemovedAtRestart) and not UninstallSilent;
 end;
