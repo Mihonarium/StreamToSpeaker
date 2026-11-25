@@ -37,7 +37,8 @@ param(
     # (Setup saves it before the new files go in).
     [string]$PreviousCertificate = '',
     # Install a test build's driver although Windows' test-signing mode is
-    # off (the installer lifecycle test does, on machines that can't run it).
+    # off: for a developer's PC that loads test-signed drivers in another
+    # way (a kernel debugger, or signature enforcement turned off at boot).
     [switch]$AllowTestBuild,
     # No copy of the app runs after this: if Windows plays to the app's
     # output, it goes back to the output it played to before.

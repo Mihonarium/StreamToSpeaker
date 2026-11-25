@@ -10,8 +10,10 @@
 ;   1. Refuses, before it changes anything (exit code 7): Windows Server,
 ;      where the driver doesn't run (/ALLOWSERVER lets the installer
 ;      lifecycle test run on its Windows Server machines); a test build on a
-;      PC whose Windows doesn't run test builds' drivers (/ALLOWTESTBUILD,
-;      the same).
+;      PC whose Windows isn't in test-signing mode, where its driver can't
+;      start (/ALLOWTESTBUILD installs it all the same: for a developer's PC
+;      that loads test-signed drivers in another way, a kernel debugger or
+;      signature enforcement turned off at boot, which Setup can't see).
 ;   2. If Stream To Speaker runs from its install folder, in this account or
 ;      another one, asks to close it (only once the person has clicked
 ;      Install; a silent install doesn't ask) and closes it. A copy started
@@ -872,9 +874,11 @@ begin
   GetWindowsVersionEx(Version);
   if (Version.ProductType <> VER_NT_WORKSTATION) and not HasSwitch('ALLOWSERVER') then
     Result := CustomMessage('ServerRefused')
-  else if IsTestBuild() and not TestSigningOn() and not HasSwitch('ALLOWTESTBUILD') then
-    Result := CustomMessage('TestBuildRefused')
-  else if not SamePath(ExpandConstant('{app}'), ProgramFilesDir()) then
+  else if IsTestBuild() and not TestSigningOn() and not HasSwitch('ALLOWTESTBUILD') then begin
+    Result := CustomMessage('TestBuildRefused');
+    // For whoever tests drivers and reads the log; not on the page.
+    Log('On a PC that loads test-signed drivers in another way (a kernel debugger, signature enforcement turned off at boot), run Setup with /ALLOWTESTBUILD.');
+  end else if not SamePath(ExpandConstant('{app}'), ProgramFilesDir()) then
     Result := FmtMessage(CustomMessage('DirRefused'), [ProgramFilesDir()]);
   if Result <> '' then begin
     Log('Setup stops before changing anything: ' + Result);

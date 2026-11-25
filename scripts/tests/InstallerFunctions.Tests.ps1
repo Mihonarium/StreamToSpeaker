@@ -481,7 +481,7 @@ Test 'a test build on a PC without test signing changes nothing' {
     New-World -Devices @(Fake-Device) -BoundFolder 'OLD' -BoundHashes $OldHashes -Packages @('oem5.inf') `
         -Endpoints @(Fake-Endpoint) -HasCer $true -CurrentThumb 'NEWTHUMB'
     $r = Install -AllowTestBuild
-    Assert-Equal 'Update' $r.Action 'the test can still install it (-AllowTestBuild)'
+    Assert-Equal 'Update' $r.Action 'a developer can still install it (-AllowTestBuild)'
 }
 
 Test 'a release keeps the working driver''s package until the new driver runs' {
