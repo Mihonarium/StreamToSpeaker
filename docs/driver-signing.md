@@ -770,12 +770,23 @@ only cleaned (`repro_compare.py` `clean_text`) or between
   the job that was writing the release: its first step finishes the
   replacement, and when that was the last write of Driver attested or
   Driver certified, the re-run ends there ("an earlier run's last write
-  was interrupted and is finished now"). Until then the installers' driver
-  lookup, the certified guard and the fallback check stop at a release
-  that has `manifest.json.pending` but no `manifest.json`. By hand: when
-  `<name>` is missing, rename `<name>.pending` to `<name>`; when both are
-  there and the release is not finished, delete `<name>`, then rename; on
-  a finished release, look at both before changing anything.
+  was interrupted and is finished now"). A pending manifest is put in
+  place only when a normal write would have written it: valid JSON, every
+  file it records on the release and, for a certified or attested one,
+  each with the SHA-256 it records. Otherwise the job stops with "holds a
+  manifest.json.pending that a write of these workflows would not have
+  made (…); nothing was changed", naming what is wrong. Look at the
+  pending file and the release before you change anything.
+
+  Until a pending manifest without `manifest.json` is finished, the
+  installers' driver lookup, the certified guard and the fallback check
+  stop at that release, so every tag's `package` job and every Driver
+  submission run stop too. For a release nobody will re-run (an older
+  build the cleanup keeps, or one whose run is older than GitHub's 30-day
+  re-run limit), finish it by hand. When `<name>` is missing, rename
+  `<name>.pending` to `<name>`; when both are there and the release is
+  not finished, delete `<name>`, then rename. On a finished release, look
+  at both before changing anything.
 - **A job says "… changed since this run last read it … another run or a
   person is writing it"** — the release changed between the job's read
   and its write (a file attached by hand, or a run from outside the

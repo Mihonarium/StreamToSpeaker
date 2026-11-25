@@ -356,6 +356,12 @@ class DriverRelease:
         if finished(self._manifest):
             return []
         self._same_release("finishing an interrupted write")
+        problem = self._pending_manifest_problem()
+        if problem:
+            raise ReleaseError(
+                f"{self.tag} holds a manifest.json.pending that a write of these workflows would not have made "
+                f"({problem}); nothing was changed. A person has to look at it (docs/driver-signing.md, "
+                "\"A release shows an asset named <name>.pending\")")
         keep = {n for n in recorded_files(self._manifest) if n != MANIFEST}
         healed = self.rel.finish_interrupted(keep=keep)
         for line in healed:
@@ -364,6 +370,26 @@ class DriverRelease:
             self._manifest = self._read_manifest()
         self.healed += healed
         return healed
+
+    def _pending_manifest_problem(self):
+        """What keeps a complete manifest.json.pending from being put in
+        place: the checks write_manifest makes before it uploads one (a
+        JSON object; every file it records completely uploaded) and, for a
+        finished one, every recorded file hashing to its recorded SHA-256."""
+        if not self.rel.complete(MANIFEST + PENDING):
+            return None
+        try:
+            m = json.loads(self.rel.download(MANIFEST + PENDING).decode("utf-8-sig"))
+        except (ValueError, UnicodeDecodeError):
+            return "it is not valid JSON"
+        if not isinstance(m, dict):
+            return "it is not a JSON object"
+        for name, digest in recorded_files(m).items():
+            if not self.rel.complete(name):
+                return f"it records {clean(name)}, which the release does not hold"
+            if finished(m) and digest and sha256(self.rel.download(name)) != str(digest).lower():
+                return f"it records {clean(name)} with sha256 {clean(digest)}, which the release's file does not have"
+        return None
 
     def begin_if_interrupted(self):
         """Finish an interrupted manifest write before what the release

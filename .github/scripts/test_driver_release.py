@@ -882,6 +882,49 @@ class FinishingAnInterruptedWriteKeepsWhatItRecorded(Base):
         self.assertEqual(fake.files("driver-v1.1.1.211"), before)
 
 
+class APendingManifestIsPutInPlaceOnlyIfAWriteWouldHaveWrittenIt(Base):
+    """What a stopped run of these workflows leaves passed write_manifest's
+    checks before it went up. Anything else (placed or left by someone
+    else) is reported and left for a person."""
+
+    def returned_with_pending(self, pending):
+        fake = Fake()
+        rel = returned_release(fake)
+        fake.add_asset(rel, "manifest.json.pending", pending)
+        return fake
+
+    def finishing(self, **kw):
+        return dict(submission_manifest(submission_cab_signed_sha256=sha(b"signed cab"), ms_product_id="7",
+                                        ms_submission_id="8", ms_state="done",
+                                        ms_zip_asset="StreamToSpeaker-Driver-1.1.2.140-Microsoft.zip"),
+                    attested=True, signed_zip=SIGNED_ZIP, signed_zip_sha256=sha(b"canonical zip"), **kw)
+
+    def assertLeftForAPerson(self, fake, before, says):
+        self.assertEqual(self.record(fake), 1)
+        self.assertIn("manifest.json.pending", self.output)
+        self.assertIn(says, self.output)
+        self.assertEqual(fake.files(TAG), before)
+
+    def test_a_finishing_manifest_that_records_a_missing_file(self):
+        fake = self.returned_with_pending(self.finishing())
+        self.assertLeftForAPerson(fake, fake.files(TAG), SIGNED_ZIP)
+
+    def test_a_finishing_manifest_whose_file_has_other_bytes(self):
+        fake = self.returned_with_pending(self.finishing())
+        fake.add_asset(fake.release(TAG), SIGNED_ZIP, b"other bytes")
+        self.assertLeftForAPerson(fake, fake.files(TAG), "sha256")
+
+    def test_a_pending_manifest_that_is_not_json(self):
+        fake = self.returned_with_pending(b"not json")
+        self.assertLeftForAPerson(fake, fake.files(TAG), "JSON")
+
+    def test_a_finishing_manifest_whose_files_are_there_is_put_in_place(self):
+        fake = self.returned_with_pending(self.finishing())
+        fake.add_asset(fake.release(TAG), SIGNED_ZIP, b"canonical zip")
+        self.assertEqual(self.record(fake), 0, self.output)
+        self.assertIs(fake.manifest(TAG)["attested"], True)
+
+
 class ABrokenFirstManifestBlocksNobody(Base):
     def test_the_run_that_wrote_it_replaces_it(self):
         fake = Fake()
