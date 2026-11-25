@@ -5,7 +5,8 @@
 //! frames come from the shell; Windows' part goes through [`Desktop`].
 
 use super::placement::{self, Placement, PxRect};
-use super::{Desktop, PanelMode};
+use super::{Ask, Desktop, PanelMode};
+use crate::model::command::Command;
 use crate::panel::{PanelState, WIDTH};
 
 /// What a click on the tray icon does.
@@ -127,8 +128,9 @@ pub enum Phase {
 }
 
 /// What the shell does after a frame of the panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Step {
+    #[default]
     Wait,
     /// Show the window and give it the focus.
     Show,
@@ -136,6 +138,32 @@ pub enum Step {
     CloseOnBlur,
     /// Close it (Esc, its ×).
     Close,
+}
+
+/// What one of egui's passes over the panel's window drew and saw.
+pub struct Drawn {
+    /// The height the panel needs, in points.
+    pub natural_height: f32,
+    /// Esc.
+    pub esc: bool,
+    /// What it sends the engine.
+    pub commands: Vec<Command>,
+    /// What its views ask of the shell.
+    pub asks: Vec<Ask>,
+}
+
+/// What the panel's window did over a frame, all of egui's passes in it
+/// together.
+#[derive(Default)]
+pub struct FrameOutput {
+    pub commands: Vec<Command>,
+    pub asks: Vec<Ask>,
+    /// Its window was asked to close (its ×, Alt+F4).
+    pub asked_to_close: bool,
+    /// Esc.
+    pub esc: bool,
+    /// Where the panel moved on to in its life.
+    pub step: Step,
 }
 
 /// What the shell tells the panel's window after a frame that ended in
@@ -242,6 +270,46 @@ impl PanelWindow {
         match self.phase {
             Phase::Shown { place, .. } => Some(place.rect),
             _ => None,
+        }
+    }
+
+    /// One of egui's passes over the panel's window; `draw` draws what it
+    /// shows. egui runs a frame twice when its first pass asks to (the
+    /// panel does when its parts change height) and keeps the second
+    /// pass's drawing, but gives that pass no input: a key, a click on a
+    /// row or a request to close the window comes to the first pass only.
+    /// So what every pass sends and sees is gathered in `frame`, and the
+    /// panel moves on in its life once a frame, in the pass egui keeps.
+    pub fn pass(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &mut FrameOutput,
+        pinned: bool,
+        mode: PanelMode,
+        desktop: &mut dyn Desktop,
+        draw: impl FnOnce(&egui::Context, &mut PanelWindow) -> Drawn,
+    ) {
+        let (focused, inner_height, close) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.focused, v.inner_rect.map(|r| r.height()), v.close_requested())
+        });
+        if close {
+            // Its × (the small-window form), or anything else that asks
+            // the window to close: the shell closes it.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        let drawn = draw(ctx, self);
+        frame.commands.extend(drawn.commands);
+        frame.asks.extend(drawn.asks);
+        frame.asked_to_close |= close;
+        frame.esc |= drawn.esc;
+        if ctx.will_discard() {
+            return;
+        }
+        let seen = Seen { natural_height: drawn.natural_height, close: frame.esc || frame.asked_to_close, inner_height, focused };
+        frame.step = self.after_frame(seen, pinned, mode, desktop);
+        for command in commands(frame.step) {
+            ctx.send_viewport_cmd(command);
         }
     }
 
@@ -614,6 +682,72 @@ mod tests {
                 assert!(!early, "{mode:?} {right_comparison}");
             }
         }
+    }
+
+    /// A frame of egui over the panel's window whose first pass asks for a
+    /// second one, as the panel does when its parts change height. The
+    /// content sends `Command::Quit` for a key A and reports Esc.
+    fn frame_twice(ctx: &egui::Context, p: &mut PanelWindow, d: &mut FakeDesktop, events: Vec<egui::Event>, close_request: bool) -> FrameOutput {
+        let mut info = egui::ViewportInfo { focused: Some(true), ..Default::default() };
+        if close_request {
+            info.events.push(egui::ViewportEvent::Close);
+        }
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 480.0))),
+            viewports: std::iter::once((egui::ViewportId::ROOT, info)).collect(),
+            events,
+            ..Default::default()
+        };
+        let mut frame = FrameOutput::default();
+        let mut passes = 0;
+        let _ = ctx.run(input, |ctx| {
+            passes += 1;
+            let first = passes == 1;
+            p.pass(ctx, &mut frame, false, PanelMode::Flyout, d, |ctx, _panel| {
+                if first {
+                    ctx.request_discard("the panel's parts changed height");
+                }
+                let (esc, key_a) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::A)));
+                Drawn { natural_height: 400.0, esc, commands: if key_a { vec![Command::Quit] } else { Vec::new() }, asks: Vec::new() }
+            });
+        });
+        assert_eq!(passes, 2, "egui ran the frame twice");
+        frame
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn what_the_first_of_two_passes_saw_still_counts() {
+        let ctx = egui::Context::default();
+        let mut d = desktop();
+        // Esc.
+        let mut p = PanelWindow::open(None);
+        let f = frame_twice(&ctx, &mut p, &mut d, vec![key(egui::Key::Escape)], false);
+        assert_eq!((f.step, f.esc, f.asked_to_close), (Step::Close, true, false));
+        // A request to close its window.
+        let mut p = PanelWindow::open(None);
+        let f = frame_twice(&ctx, &mut p, &mut d, Vec::new(), true);
+        assert_eq!((f.step, f.asked_to_close), (Step::Close, true));
+        // A command from the content (a click on a row).
+        let mut p = PanelWindow::open(None);
+        let f = frame_twice(&ctx, &mut p, &mut d, vec![key(egui::Key::A)], false);
+        assert_eq!(f.commands, vec![Command::Quit]);
+        assert_eq!(f.step, Step::Wait);
+    }
+
+    #[test]
+    fn the_panel_moves_on_once_a_frame_and_its_showing_reaches_the_shell() {
+        let ctx = egui::Context::default();
+        let mut d = desktop();
+        let mut p = PanelWindow::open(None);
+        let steps: Vec<Step> = (0..8).map(|_| frame_twice(&ctx, &mut p, &mut d, Vec::new(), false).step).collect();
+        // Measured over three frames, not three passes; shown once.
+        assert_eq!(steps.iter().filter(|s| **s == Step::Show).count(), 1, "{steps:?}");
+        assert_eq!(steps[..3], [Step::Wait, Step::Wait, Step::Show]);
+        assert!(p.shown());
     }
 
     #[test]

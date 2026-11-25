@@ -13,7 +13,7 @@ use egui::{Frame, ViewportBuilder, ViewportCommand, ViewportId};
 use windows_sys::Win32::Foundation::HWND;
 
 use super::content::WantedGate;
-use super::panel_window::{self, OpenView, PanelWindow, Seen, Step, Toggle, TrayClick};
+use super::panel_window::{Drawn, FrameOutput, OpenView, PanelWindow, Step, Toggle, TrayClick};
 use super::popup::{popup_builder, popup_rect, PopupContent, PopupKind, StandInPopup};
 use super::views::ViewMemory;
 use super::tray::{Tray, TrayEvent};
@@ -463,43 +463,32 @@ impl Shell {
         let pinned = snap.first_run.is_some();
         let (port, desktop) = (&self.port, &mut self.desktop);
         let builder = panel.builder(mode);
-        let (commands, step, asked_to_close) = ctx.show_viewport_immediate(panel_id(), builder, |ctx, _class| {
+        let mut frame = FrameOutput::default();
+        ctx.show_viewport_immediate(panel_id(), builder, |ctx, _class| {
             let t = theme::Theme::of(ctx);
-            let (focused, inner_height, close) = ctx.input(|i| {
-                let v = i.viewport();
-                (v.focused, v.inner_rect.map(|r| r.height()), v.close_requested())
-            });
-            if close {
-                // Its × (the small-window form), or anything else that asks
-                // the window to close: the shell closes it.
-                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            }
-            let cap = panel.state.height;
-            let depth = panel.views.len().saturating_sub(1);
-            let (out, asks) = egui::CentralPanel::default()
-                .frame(Frame::none().fill(t.c.surface))
-                .show(ctx, |ui| match panel.views.last_mut() {
-                    Some((view, vs)) => {
-                        vs.cap = cap;
-                        let o = show_view(ui, view.as_mut(), snap, vs, depth);
-                        let mut asks = o.asks;
-                        if o.back {
-                            asks.push(Ask::Back);
+            panel.pass(ctx, &mut frame, pinned, mode, desktop, |ctx, panel| {
+                let cap = panel.state.height;
+                let depth = panel.views.len().saturating_sub(1);
+                let (out, asks) = egui::CentralPanel::default()
+                    .frame(Frame::none().fill(t.c.surface))
+                    .show(ctx, |ui| match panel.views.last_mut() {
+                        Some((view, vs)) => {
+                            vs.cap = cap;
+                            let o = show_view(ui, view.as_mut(), snap, vs, depth);
+                            let mut asks = o.asks;
+                            if o.back {
+                                asks.push(Ask::Back);
+                            }
+                            (crate::panel::PanelOutput { natural_height: o.natural_height, ..Default::default() }, asks)
                         }
-                        (crate::panel::PanelOutput { natural_height: o.natural_height, ..Default::default() }, asks)
-                    }
-                    None => (crate::panel::show(ui, snap, port.level(), &mut panel.state), Vec::new()),
-                })
-                .inner;
-            let seen = Seen { natural_height: out.natural_height, close: out.close || close, inner_height, focused };
-            let step = panel.after_frame(seen, pinned, mode, desktop);
-            for command in panel_window::commands(step) {
-                ctx.send_viewport_cmd(command);
-            }
+                        None => (crate::panel::show(ui, snap, port.level(), &mut panel.state), Vec::new()),
+                    })
+                    .inner;
+                Drawn { natural_height: out.natural_height, esc: out.close, commands: out.commands, asks }
+            });
             ctx.request_repaint_after(METER);
-            ((out.commands, asks), step, close)
         });
-        match step {
+        match frame.step {
             Step::Show => {
                 let _ = self.port.send(Surface::Panel, Command::PanelShown(true));
             }
@@ -508,11 +497,11 @@ impl Shell {
                     self.close_panel("it lost the focus");
                 }
             }
-            Step::Close if asked_to_close => self.close_panel("its window was asked to close"),
+            Step::Close if frame.asked_to_close => self.close_panel("its window was asked to close"),
             Step::Close => self.close_panel("Esc"),
             Step::Wait => {}
         }
-        commands
+        (frame.commands, frame.asks)
     }
 
     /// Draw the small windows that must not take the focus; place a new
