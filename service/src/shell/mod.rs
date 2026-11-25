@@ -626,9 +626,10 @@ mod tests {
     #[test]
     fn the_shells_windows_keep_their_styles_when_winit_writes_the_style_again() {
         // What winit 0.30 writes when it shows a window: WS_EX_WINDOWEDGE |
-        // WS_EX_ACCEPTFILES, WS_EX_APPWINDOW for a window that isn't kept
-        // off the taskbar by a flag of its own, WS_EX_TOPMOST for one on
-        // top, WS_EX_TRANSPARENT | WS_EX_LAYERED for one clicks pass through.
+        // WS_EX_ACCEPTFILES, WS_EX_APPWINDOW for every window without an
+        // owner (one made "off the taskbar" too: winit deletes its taskbar
+        // button instead), WS_EX_TOPMOST for one on top, WS_EX_TRANSPARENT |
+        // WS_EX_LAYERED for one clicks pass through.
         let (plain, app, top, through) = (0x0000_0110, 0x0004_0000, 0x0000_0008, 0x0008_0020);
         let kept = |w: ShellWindow, ex: u32| ex_style_words(w.kept_style().map_or(ex, |k| k.applied_to(ex)));
         assert_eq!(kept(ShellWindow::Panel(PanelMode::Flyout), plain | app | top), "tool window, on top");

@@ -348,9 +348,12 @@ pub fn keep_ex_style(hwnd: HWND, keep: KeptStyle) {
                 // returned here, kept with it.
                 let old = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, keep_style_proc as *const () as isize) };
                 if old == 0 {
-                    return;
+                    // The bits are still given once, below; a later write
+                    // of the style by winit takes them off again.
+                    log::warn!("shell: Windows didn't let the shell keep a window's style; giving it once");
+                } else {
+                    kept.push((hwnd as isize, old, keep));
                 }
-                kept.push((hwnd as isize, old, keep));
             }
         }
     }
@@ -411,5 +414,46 @@ pub fn hide(hwnd: HWND) {
     // SAFETY: a window of this thread; hiding has no other effect.
     unsafe {
         ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, RegisterClassW, SetWindowLongW, GWL_EXSTYLE, WNDCLASSW, WS_EX_ACCEPTFILES,
+        WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_OVERLAPPED,
+    };
+
+    fn is_kept(hwnd: HWND) -> bool {
+        kept().iter().any(|(h, _, _)| *h == hwnd as isize)
+    }
+
+    #[test]
+    fn a_wrapped_window_keeps_the_shells_bits_when_its_style_is_written_again() {
+        let class: Vec<u16> = "StreamToSpeakerKeptStyleTest\0".encode_utf16().collect();
+        // SAFETY: a plain window of this thread, never shown, made from a
+        // class whose procedure is Windows' default one; every handle used
+        // is the one CreateWindowExW returned, until DestroyWindow.
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null());
+            let wc = WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: instance, lpszClassName: class.as_ptr(), ..std::mem::zeroed() };
+            // Registered already when the test runs again in this process.
+            let _ = RegisterClassW(&wc);
+            let hwnd = CreateWindowExW(0, class.as_ptr(), class.as_ptr(), WS_OVERLAPPED, 0, 0, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null());
+            assert!(!hwnd.is_null(), "no window for the test");
+            keep_ex_style(hwnd, KeptStyle::NEVER_ACTIVE);
+            assert!(is_kept(hwnd));
+            // What winit 0.30 writes when it shows a window without an owner.
+            SetWindowLongW(hwnd, GWL_EXSTYLE, (WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES | WS_EX_APPWINDOW) as i32);
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let bits = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_APPWINDOW;
+            assert_eq!(ex & bits, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, "kept: {}", super::super::ex_style_words(ex));
+            // The rest of what was written stays.
+            assert_eq!(ex & (WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES), WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES);
+            DestroyWindow(hwnd);
+            assert!(!is_kept(hwnd), "the window is forgotten once it is gone");
+        }
     }
 }
