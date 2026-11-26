@@ -103,7 +103,7 @@ impl Dialog {
 
 /// Draw a dialog's body, padded; returns the footer to draw its buttons
 /// in, a band of the card colour along the bottom.
-fn frame(ui: &mut Ui, body: impl FnOnce(&mut Ui)) -> Ui {
+pub(super) fn frame(ui: &mut Ui, body: impl FnOnce(&mut Ui)) -> Ui {
     let t = Theme::of(ui.ctx());
     let full = ui.max_rect();
     let foot_h = 72.0;
@@ -590,11 +590,8 @@ impl ReportDialog {
     }
 
     fn show(&mut self, ui: &mut Ui, port: &dyn SettingsPort, lang: Lang) -> bool {
-        let parts = *self.parts.get_or_insert_with(ReportParts::default);
-        let mut text = port.report(parts);
-        if !self.what.trim().is_empty() {
-            text = format!("{}\n\n{text}", self.what.trim());
-        }
+        self.parts.get_or_insert_with(ReportParts::default);
+        let mut text = String::new();
         let mut keep = true;
         let t = Theme::of(ui.ctx());
         let mut foot = frame(ui, |ui| {
@@ -610,8 +607,8 @@ impl ReportDialog {
                     ui.vertical(|ui| {
                         body(ui, &w!(lang, SetReportIncludes));
                         let p = self.parts.as_mut().unwrap();
-                        if let Some(on) = Check::new(p.last_hour, &w!(lang, SetReportHour)).description(&w!(lang, SetReportHourLine)).show(ui) {
-                            p.last_hour = on;
+                        if let Some(on) = Check::new(p.diagnostics, &w!(lang, SetReportDiagnostics)).description(&w!(lang, SetReportDiagnosticsLine)).show(ui) {
+                            p.diagnostics = on;
                         }
                         if let Some(on) = Check::new(p.speakers, &w!(lang, SetReportSpeakers)).show(ui) {
                             p.speakers = on;
@@ -619,12 +616,17 @@ impl ReportDialog {
                         if let Some(on) = Check::new(p.versions, &w!(lang, SetReportVersions)).show(ui) {
                             p.versions = on;
                         }
-                        if let Some(on) = Check::new(p.log, &w!(lang, SetReportLog)).description(&w!(lang, SetReportLogLine)).show(ui) {
+                        if let Some(on) = Check::new(p.log && p.speakers, &w!(lang, SetReportLog)).enabled(p.speakers).description(&w!(lang, SetReportLogLine)).show(ui) {
                             p.log = on;
                         }
                     });
                 }
                 {
+                    let included = self.parts.unwrap();
+                    text = port.report(included);
+                    if !self.what.trim().is_empty() {
+                        text = format!("{}\n\n{text}", self.what.trim());
+                    }
                     let ui = &mut cols[1];
                     ui.vertical(|ui| {
                         body(ui, &w!(lang, SetPreview));
@@ -654,8 +656,11 @@ impl ReportDialog {
                     self.done = Some(w!(lang, SetIssueOpened));
                 }
                 if Button::standard(&w!(lang, SetSaveReport)).show(ui).clicked() {
-                    port.act(Act::SaveReport(text.clone()));
-                    self.done = Some(w!(lang, SetReportSaved));
+                    self.done = Some(match port.save_report(&text) {
+                        ReportSave::Opened => w!(lang, SetReportSaved),
+                        ReportSave::SavedOnly => w!(lang, SetReportFolderClosed),
+                        ReportSave::Failed => w!(lang, SetReportSaveFailed),
+                    });
                 }
                 if Button::primary(&w!(lang, SetCopyReport)).icon(Icon::Copy).show(ui).clicked() {
                     ui.ctx().copy_text(text.clone());

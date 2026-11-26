@@ -3,12 +3,56 @@
 //! together like the words of a sentence do: *Office is about 2 s late on
 //! Steady. For video, use Short delay (about 0.3 s). Use Short delay*.
 
+use std::sync::Arc;
+
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, Rect, Response, Sense, Stroke, Ui, Vec2, WidgetInfo, WidgetType};
+use egui::{Color32, Galley, Rect, Response, Sense, Stroke, Ui, Vec2, WidgetInfo, WidgetType};
 
 use super::icon::{paint_spinner, Icon};
 use super::look::look_as;
 use super::theme::{focus_ring, size, Theme};
+
+pub(crate) const PAGE_TEXT: &str = "panel-page-text";
+
+pub(crate) fn on_page(ui: &Ui) -> bool {
+    ui.stack().iter().any(|s| s.tags().contains(PAGE_TEXT))
+}
+
+/// Reflow a lone final word within three quarters of the original width
+/// and at most one extra line. Keep the original if no such wrap fits.
+pub(crate) fn page_wrap(ui: &Ui, original: Arc<Galley>) -> Arc<Galley> {
+    let [.., previous, last] = original.rows.as_slice() else { return original };
+    if previous.ends_with_newline || !on_page(ui) || last.text().split_whitespace().count() != 1 {
+        return original;
+    }
+
+    let lines = original.rows.len();
+    // egui caches wrap widths in whole points. Round up to respect the lower bound.
+    let min_width = (original.job.wrap.max_width * 0.75).ceil();
+    let mut candidate = original.clone();
+    while candidate.job.wrap.max_width > min_width {
+        let mut job = (*original.job).clone();
+        // Skip the unused space to the right of the longest line.
+        let used = candidate.size().x.min(candidate.job.wrap.max_width);
+        job.wrap.max_width = (used.ceil() - 1.0).max(min_width);
+        candidate = ui.fonts(|f| f.layout_job(job));
+        if candidate.rows.len() > lines + 1 {
+            break;
+        }
+        if candidate.rows.len() >= lines && candidate.rows.last().unwrap().text().split_whitespace().count() >= 2 {
+            return candidate;
+        }
+    }
+    original
+}
+
+/// Keep native label and link interaction when reflowing their text.
+pub(crate) fn page_widget_text(ui: &Ui, text: egui::RichText) -> egui::WidgetText {
+    let text = egui::WidgetText::from(text);
+    if !on_page(ui) { return text; }
+    let galley = text.into_galley(ui, Some(egui::TextWrapMode::Wrap), ui.available_width(), egui::FontSelection::Default);
+    page_wrap(ui, galley).into()
+}
 
 /// The icon before a line, which says what kind of line it is by its shape
 /// as well as its colour.
@@ -169,7 +213,7 @@ impl<'a> Para<'a> {
             job.append("×", 0.0, TextFormat { font_id: font.clone(), color: t.c.text_secondary, ..Default::default() });
             i
         });
-        let galley = ui.fonts(|f| f.layout_job(job));
+        let galley = page_wrap(ui, ui.fonts(|f| f.layout_job(job)));
         let text_h = galley.size().y.max(row_h);
         let (rect, alloc) = ui.allocate_exact_size(Vec2::new(width, text_h), Sense::hover());
         let origin = rect.min + Vec2::new(indent, 0.0);

@@ -675,6 +675,7 @@ fn bring_up(
 
             writer.send_json(&proto::server_hello(server_name))?;
             let hello_msg = wait_for(&writer, &events, Duration::from_secs(10), "client/hello", &|v| msg_type(v) == "client/hello")?;
+            crate::engine::cancel::speaker_answered();
             let mut hello = proto::parse_player_hello(payload(&hello_msg));
             let dialect = hello.dialect.unwrap_or(Dialect::V9);
             if !hello.roles.iter().any(|r| r == "player@v1") {

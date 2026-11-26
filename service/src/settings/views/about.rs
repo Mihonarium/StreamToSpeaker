@@ -1,18 +1,16 @@
-//! The views opened from the bottom of Settings: About (the version,
-//! updates, the sound output, support, the licence, the welcome again),
-//! Lab (settings for testing speakers, its warning first) and the guides.
+//! About, update checks, and the optional Lab page.
 
 use std::sync::Arc;
 
 use egui::Ui;
 
-use crate::model::snapshot::Snapshot;
+use crate::model::Snapshot;
 use crate::shell::{Ask, ViewBar, ViewContent};
 use crate::ui::button::Button;
 use crate::ui::text::{Mark, Tone};
 use crate::ui::theme::size;
 
-use super::parts::{control_line, gap, links, marked, plain, sentence, thin};
+use super::parts::{page_button, page_link, control_line, gap, marked, plain, sentence, thin};
 use crate::settings::port::*;
 use crate::settings::words::{self, w};
 use crate::settings::{PageState, SettingsPort};
@@ -37,8 +35,6 @@ impl ViewContent for AboutView {
         ui.spacing_mut().item_spacing.y = 8.0;
         let v = self.port.about();
         crate::settings::widgets::strong(ui, &w!(lang, SetAppVersion, version = &v.version), size::TITLE);
-        sentence(ui, &w!(lang, SetAppLine));
-        thin(ui);
         updates(ui, lang, &v.updates, self.port.as_ref());
         if let Some(daily) = v.updates.daily {
             if let Some(on) = control_line(ui, &w!(lang, SetDailyCheck), Some(&w!(lang, SetDailyCheckLine)), |ui| {
@@ -47,35 +43,13 @@ impl ViewContent for AboutView {
                 self.port.act(Act::DailyUpdateCheck(on));
             }
         }
-        if let Some(d) = &v.driver {
-            thin(ui);
-            match d {
-                Driver::Running(ver) => sentence(ui, &w!(lang, SetDriverRunning, version = ver)),
-                Driver::Waiting { installed, running } => {
-                    let text = format!("{} {}", w!(lang, SetDriverWaiting, version = installed), w!(lang, SetDriverUntil, version = running));
-                    if marked(ui, Mark::Warning, Tone::Primary, &text, &[&w!(lang, SetRestartNow)]).is_some() {
-                        self.port.act(Act::RestartWindows);
-                    }
-                }
-            }
-        }
-        thin(ui);
-        if super::parts::sentence_links(ui, &w!(lang, SetSupportLine), &[&w!(lang, SetDonate)]).is_some() {
-            self.port.act(Act::Donate);
-        }
-        sentence(ui, &w!(lang, SetPrivacyLine));
-        if super::parts::sentence_links(ui, &w!(lang, SetLogsSentence), &[&w!(lang, SetOpenLogs)]).is_some() {
-            self.port.act(Act::OpenLogFolder);
-        }
         gap(ui);
-        match links(ui, &[&w!(lang, SetLicences), &w!(lang, SetShowWelcome)]) {
-            Some(0) => self.port.act(Act::LicenceAndSource),
-            Some(_) => {
-                self.port.act(Act::ShowWelcomeAgain);
-                ask(Ask::OpenPanel);
-            }
-            None => {}
+        if page_link(&w!(lang, SetLicences)).show(ui).clicked() { self.port.act(Act::LicenceAndSource); }
+        if page_button(&w!(lang, SetShowWelcome)).show(ui).clicked() {
+            ask(Ask::Command(crate::model::Command::FirstRunAction(crate::model::command::FirstRunAction::ShowAgain)));
         }
+        if let Some(on) = super::parts::switch_line(ui, &w!(lang, SetShowLab), v.show_lab) { self.port.act(Act::ShowLab(on)); }
+        if v.show_lab && page_link(&w!(lang, SetNavLab)).show(ui).clicked() { ask(Ask::View(Box::new(LabView::new(self.port.clone())))); }
     }
 }
 
@@ -109,30 +83,30 @@ fn updates(ui: &mut Ui, lang: crate::model::text::Lang, u: &Updates, port: &dyn 
     super::parts::buttons(ui, |ui| match &u.state {
         UpdateState::Available { .. } => {
             if u.installs_here {
-                if Button::primary(&w!(lang, SetUpdateNow)).show(ui).clicked() {
+                if page_button(&w!(lang, SetUpdateNow)).show(ui).clicked() {
                     port.act(Act::UpdateNow);
                 }
-                if Button::standard(&w!(lang, SetWhatsNew)).show(ui).clicked() {
+                if page_button(&w!(lang, SetWhatsNew)).show(ui).clicked() {
                     port.act(Act::WhatsNew);
                 }
-            } else if Button::primary(&w!(lang, SetGetUpdate)).show(ui).clicked() {
+            } else if page_button(&w!(lang, SetGetUpdate)).show(ui).clicked() {
                 port.act(Act::WhatsNew);
             }
-            if Button::standard(&w!(lang, SetSkipVersion)).show(ui).clicked() {
+            if page_button(&w!(lang, SetSkipVersion)).show(ui).clicked() {
                 port.act(Act::SkipVersion);
             }
         }
         UpdateState::ReadyToInstall { .. } => {
-            if Button::primary(&w!(lang, SetInstall)).show(ui).clicked() {
+            if page_button(&w!(lang, SetInstall)).show(ui).clicked() {
                 port.act(Act::Install);
             }
-            if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
+            if page_button(&w!(lang, SetCancel)).show(ui).clicked() {
                 port.act(Act::CancelInstall);
             }
         }
         UpdateState::DevBuild | UpdateState::Checking | UpdateState::Downloading => {}
         _ => {
-            if Button::standard(&w!(lang, SetCheckNow)).accessible_name(w!(lang, SetCheckUpdatesNow)).show(ui).clicked() {
+            if page_button(&w!(lang, SetCheckNow)).accessible_name(w!(lang, SetCheckUpdatesNow)).show(ui).clicked() {
                 port.act(Act::CheckNow);
             }
         }
@@ -245,6 +219,10 @@ impl ViewContent for LabView {
                 self.port.act(Act::Lab(LabAct::UncompressedAlac(on)));
             }
         }
+        let p = self.port.privacy();
+        if let Some(on) = super::parts::switch_line(ui, &w!(lang, SetAnyoneListens), !p.only_playing) { self.port.act(Act::OnlyPlaying(!on)); }
+        if !p.only_playing { marked(ui, Mark::Warning, Tone::Primary, &w!(lang, SetAnyDeviceLine), &[]); }
+        for r in p.refused.iter().flatten().filter(|r| r.group_of.is_none()) { super::settings_list::refused(ui, self.port.as_ref(), r); }
         if let Some(counters) = &v.counters {
             thin(ui);
             let open = self.st.is_open("counters");
@@ -285,48 +263,5 @@ fn signed(n: i64) -> String {
         format!("−{}", n.unsigned_abs())
     } else {
         "0".into()
-    }
-}
-
-/// The guides: where the sound goes, what the delay is, and the rest, one
-/// after the other; the guide online.
-pub struct GuidesView {
-    port: Arc<dyn SettingsPort>,
-}
-
-impl GuidesView {
-    pub fn new(port: Arc<dyn SettingsPort>) -> Self {
-        GuidesView { port }
-    }
-}
-
-impl ViewContent for GuidesView {
-    fn bar(&self, _snap: &Snapshot) -> ViewBar {
-        ViewBar { title: w!(self.port.lang(), SetGuides), ..Default::default() }
-    }
-
-    fn show(&mut self, ui: &mut Ui, _snap: &Snapshot, _ask: &mut dyn FnMut(Ask)) {
-        let lang = self.port.lang();
-        ui.spacing_mut().item_spacing.y = 6.0;
-        let sections = [
-            (w!(lang, SetGuideWhereTitle), w!(lang, SetGuideWhere)),
-            (w!(lang, SetGuideDelayTitle), w!(lang, SetGuideDelay)),
-            (w!(lang, SetGuideOffTitle), w!(lang, SetGuideOff)),
-            (w!(lang, SetGuideRoomsTitle), w!(lang, SetGuideRooms)),
-            (w!(lang, SetGuideBackTitle), w!(lang, SetGuideBack)),
-            (w!(lang, SetGuideAirPlayTitle), w!(lang, SetGuideAirPlay)),
-            (w!(lang, SetGuideMaTitle), w!(lang, SetGuideMa)),
-        ];
-        for (i, (title, text)) in sections.iter().enumerate() {
-            if i > 0 {
-                thin(ui);
-            }
-            crate::settings::widgets::strong(ui, title, size::BODY);
-            plain(ui, text);
-        }
-        gap(ui);
-        if Button::link(&w!(lang, SetReadOnline)).icon(crate::ui::icon::Icon::External).show(ui).clicked() {
-            self.port.act(Act::ReadGuideOnline);
-        }
     }
 }

@@ -44,6 +44,7 @@ pub mod ap2_resend;
 pub mod ap2_rtsp;
 pub mod ap2_session;
 pub mod crypto;
+pub mod dacp;
 pub mod discovery;
 pub mod dmap;
 #[cfg(test)]

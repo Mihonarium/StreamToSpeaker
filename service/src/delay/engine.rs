@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use log::{info, warn};
 
-use super::catch_up::{BackOff, CatchUp};
+use super::catch_up::{CatchUp, CutOut};
 use super::reconnect::Schedule;
 use super::{setting, Applies, DelayChoice, Earlier, Kind, Limits, Live, Request, Setting, Unchangeable};
 use crate::airplay::AirPlayRenderer;
@@ -44,7 +44,32 @@ pub struct DelayStatus {
     pub progress: Progress,
     /// Something to tell about the last change, until the next one.
     pub notice: Option<Notice>,
+    /// What the app offers after the speaker's sound cut out while delay
+    /// was removed, until it is used, closed or the delay is changed.
+    pub offer: Option<DelayOffer>,
 }
+
+/// The app's offer after a speaker's sound cut out, or it stopped
+/// responding, while delay was removed: it never changes a delay itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelayOffer {
+    /// When it cut out.
+    pub at: std::time::SystemTime,
+    pub what: Offered,
+}
+
+/// What [`DelayOffer`] offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Offered {
+    /// Add this much (at most [`OFFER_ADD_MS`], never past the speaker's
+    /// own delay).
+    Add(u32),
+    /// An AirPlay speaker on its short delay: its steady one.
+    UseSteady,
+}
+
+/// What the offer after a cut-out adds.
+pub const OFFER_ADD_MS: u32 = 50;
 
 /// How far the last change has reached the speaker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,8 +93,8 @@ pub enum Progress {
 pub enum Notice {
     /// The speaker didn't accept `tried_ms`, so it plays `back_to_ms`.
     NotAccepted { tried_ms: i32, back_to_ms: i32 },
-    /// The speaker ran dry soon after delay was removed, so some of it
-    /// went back.
+    /// Some removed delay went back after the speaker ran dry. No longer
+    /// made: the app never changes a delay itself (see [`DelayOffer`]).
     DroppedOut { from_ms: i32, to_ms: i32 },
     /// The delay choice was switched to `to`; each choice keeps its own
     /// change: `now_ms` applies, `other_ms` stays with the other choice.
@@ -121,6 +146,9 @@ struct State {
     /// The speaker a reconnect waits or runs for, and its schedule.
     reconnect_for: Option<String>,
     schedule: Schedule,
+    /// A way switch owns its delayed reconnect just as it owns a direct
+    /// connect. The original session number keeps it off a later binding.
+    choice_job: Option<(String, u64, Arc<crate::engine::cancel::Binding>)>,
     /// The reconnect that runs: for whom, from which change.
     reconnecting: Option<(String, i32)>,
     /// What to tell about a speaker's last change.
@@ -129,8 +157,10 @@ struct State {
     /// thread saves; `saved` is the count it last saved.
     changes: u64,
     saved: u64,
-    /// Back-offs the stream made, for the engine's thread to keep.
-    back_offs: Vec<BackOff>,
+    /// Cut-outs the stream saw, for the engine's thread.
+    cut_outs: Vec<CutOut>,
+    /// The offer after a cut-out, and for which speaker.
+    offer: Option<(String, DelayOffer)>,
 }
 
 impl DelayEngine {
@@ -168,7 +198,7 @@ impl DelayEngine {
         let mut state = self.state();
         loop {
             let busy = state.saved != state.changes
-                || !state.back_offs.is_empty()
+                || !state.cut_outs.is_empty()
                 || state.schedule.waiting()
                 || state.schedule.running();
             if !busy {
@@ -288,6 +318,7 @@ impl App {
     fn status_with(&self, id: &str, name: String, kind: Kind, live: &Live, playing: bool) -> DelayStatus {
         let s = self.delay_setting(id, kind, live);
         let state = self.delay.state();
+        let switching_way = state.choice_job.as_ref().is_some_and(|(speaker, _, _)| speaker == id);
         let progress = match s.applies {
             Ok(Applies::Live) if playing && state.upnp.as_deref() == Some(id) => {
                 match self.delay.shared.catch_up.ms_to_go() {
@@ -295,14 +326,16 @@ impl App {
                     ms_to_go => Progress::CatchingUp { ms_to_go },
                 }
             }
-            Ok(Applies::Reconnect) => match &state.reconnecting {
+            applies if applies == Ok(Applies::Reconnect) || switching_way => match &state.reconnecting {
                 Some((rid, from_ms)) if rid == id => Progress::Reconnecting { from_ms: *from_ms },
-                _ if state.reconnect_for.as_deref() == Some(id) && state.schedule.waiting() => Progress::WillReconnect,
+                _ if state.reconnect_for.as_deref() == Some(id)
+                    && (state.schedule.waiting() || (state.schedule.running() && switching_way)) => Progress::WillReconnect,
                 _ => Progress::Done,
             },
             _ => Progress::Done,
         };
         let notice = state.notice.as_ref().filter(|(nid, _)| nid == id).map(|(_, n)| *n);
+        let offer = state.offer.as_ref().filter(|(oid, _)| oid == id).map(|(_, o)| *o);
         DelayStatus {
             id: id.to_string(),
             name,
@@ -315,6 +348,7 @@ impl App {
             applies: s.applies,
             progress,
             notice,
+            offer,
         }
     }
 
@@ -348,6 +382,7 @@ impl App {
             let mut state = self.delay.state();
             state.changes += 1;
             state.notice = None;
+            state.offer = None;
             if playing {
                 match s.applies {
                     Ok(Applies::Live) => self.delay.shared.catch_up.set_target(to_ms),
@@ -385,12 +420,18 @@ impl App {
             let other = if choice == DelayChoice::Short { DelayChoice::Steady } else { DelayChoice::Short };
             (super::stored_change(entry, Some(choice)), super::stored_change(entry, Some(other)))
         };
-        let playing = self.bound_for_delay().is_some_and(|b| b.id == id);
+        let bound = self.session.lock().unwrap().as_ref()
+            .filter(|s| s.stable_id() == id)
+            .map(|_| self.session_number());
+        let choice_job = bound.and_then(|number| {
+            crate::engine::cancel::binding().map(|job| (id.to_string(), number, job))
+        });
         {
             let mut state = self.delay.state();
             state.changes += 1;
             state.notice = Some((id.to_string(), Notice::ChoiceSwitched { to: choice, now_ms, other_ms }));
-            if playing {
+            if bound.is_some() {
+                state.choice_job = choice_job;
                 state.reconnect_for = Some(id.to_string());
                 state.schedule.press(Instant::now());
             }
@@ -511,6 +552,7 @@ impl App {
         if state.reconnect_for.is_some() && state.reconnect_for != bound_id {
             state.schedule.cancel();
             state.reconnect_for = None;
+            state.choice_job = None;
         }
         let (Some(bound), Some(s)) = (bound, s) else {
             state.upnp = None;
@@ -544,21 +586,70 @@ impl App {
         }
     }
 
-    /// The stream gave back some removed delay because the speaker ran
-    /// dry: kept by the engine's thread.
-    fn delay_backed_off(self: &Arc<Self>, b: BackOff) {
-        self.delay.state().back_offs.push(b);
+    /// The stream saw the UPnP speaker run dry soon after delay was
+    /// removed: kept by the engine's thread.
+    fn delay_cut_out(self: &Arc<Self>, c: CutOut) {
+        self.delay.state().cut_outs.push(c);
         self.delay_worker();
     }
 
-    /// Have the stream's back-offs reach the engine.
-    pub(crate) fn delay_watch_back_offs(self: &Arc<Self>) {
+    /// Have the stream's cut-outs reach the engine.
+    pub(crate) fn delay_watch_cut_outs(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
-        self.delay.shared.catch_up.on_back_off(move |b| {
+        self.delay.shared.catch_up.on_cut_out(move |c| {
             if let Some(app) = weak.upgrade() {
-                app.delay_backed_off(b);
+                app.delay_cut_out(c);
             }
         });
+    }
+
+    /// Speaker `id` stopped responding (its sound cut out): where delay
+    /// was removed from it, or it is an AirPlay speaker on its short
+    /// delay, the app offers to add some back, or the steady delay.
+    pub fn note_cut_out(&self, id: &str) {
+        let status = self.delay_status_of(id);
+        let what = if status.choice == Some(DelayChoice::Short) && status.change_ms >= 0 {
+            Offered::UseSteady
+        } else if status.change_ms < 0 {
+            Offered::Add(status.change_ms.unsigned_abs().min(OFFER_ADD_MS))
+        } else {
+            return;
+        };
+        info!("delay: {} cut out with {:+} ms; offering {:?}", id, status.change_ms, what);
+        self.delay.state().offer = Some((id.to_string(), DelayOffer { at: std::time::SystemTime::now(), what }));
+    }
+
+    /// Take the offer made for `id` after its sound cut out (*Add 50 ms*,
+    /// *Use "About 2 s · steady"*). False when there is none.
+    pub fn take_delay_offer(self: &Arc<Self>, id: &str) -> bool {
+        let offer = self.delay.state().offer.take_if(|(oid, _)| oid == id);
+        match offer {
+            Some((_, DelayOffer { what: Offered::Add(ms), .. })) => self.change_delay(Some(id), Request::Add(ms)).is_ok(),
+            Some((_, DelayOffer { what: Offered::UseSteady, .. })) => self.set_delay_choice(id, DelayChoice::Steady).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Close the offer made for `id` (its ×).
+    pub fn close_delay_offer(&self, id: &str) {
+        let mut state = self.delay.state();
+        if state.offer.as_ref().is_some_and(|(oid, _)| oid == id) {
+            state.offer = None;
+        }
+    }
+
+    /// Set speaker `id`'s delay itself to `delay_ms` (its own delay plus
+    /// what is removed or added): the field of *Set the delay…*. A figure
+    /// it can't play with becomes the nearest it can (`clamped`).
+    pub fn set_delay_to(self: &Arc<Self>, id: &str, delay_ms: u32) -> Result<ChangeOutcome, Unchangeable> {
+        let own = self.delay_status_of(id).own_delay_ms;
+        let change = (delay_ms as i64 - own as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        self.change_delay(Some(id), Request::Set(change))
+    }
+
+    /// Speaker `id` back to its usual delay (*Use it*).
+    pub fn use_default_delay(self: &Arc<Self>, id: &str) -> Result<ChangeOutcome, Unchangeable> {
+        self.change_delay(Some(id), Request::Set(0))
     }
 
     // -------------------------------------------------------------------
@@ -615,22 +706,12 @@ fn run_worker(app: Weak<App>, shared: Arc<Shared>, connector: &dyn Connector) {
             return;
         }
         let mut state = shared.state.lock().unwrap();
-        // Back-offs the stream made: kept for the UPnP speaker that plays.
-        let back_offs = std::mem::take(&mut state.back_offs);
+        // Cut-outs the stream saw: an offer for the UPnP speaker that plays.
+        let cut_outs = std::mem::take(&mut state.cut_outs);
         let upnp = state.upnp.clone();
-        if let (Some(last), Some(id)) = (back_offs.last(), upnp.as_ref()) {
-            let first = back_offs[0];
-            state.notice = Some((id.clone(), Notice::DroppedOut { from_ms: first.from_ms, to_ms: last.to_ms }));
-            state.changes += 1;
-            drop(state);
-            let mut uc = app.user_config.lock().unwrap();
-            let mut entry = uc.speaker_settings.remove(id).unwrap_or_default();
-            entry.delay_change_ms = last.to_ms;
-            if !entry.is_default() {
-                uc.speaker_settings.insert(id.clone(), entry);
-            }
-            drop(uc);
-            state = shared.state.lock().unwrap();
+        if let (Some(cut), Some(id)) = (cut_outs.last(), upnp.as_ref()) {
+            let ms = cut.removed_ms.min(OFFER_ADD_MS);
+            state.offer = Some((id.clone(), DelayOffer { at: std::time::SystemTime::now(), what: Offered::Add(ms) }));
         }
         if state.saved != state.changes {
             let changes = state.changes;
@@ -653,9 +734,26 @@ fn run_worker(app: Weak<App>, shared: Arc<Shared>, connector: &dyn Connector) {
             continue;
         };
         state.schedule.begin(now);
+        let choice = state.choice_job.clone().filter(|(speaker, _, _)| *speaker == id);
         drop(state);
-        reconnect_for_delay(&app, &shared, connector, &id);
-        shared.state.lock().unwrap().schedule.finished();
+        if let Some((_, number, job)) = &choice {
+            let _scope = job.enter();
+            if !crate::engine::cancel::cancelled() && *number == app.session_number() {
+                reconnect_for_delay(&app, &shared, connector, &id);
+            }
+            if crate::engine::cancel::cancelled() {
+                if let Some(t) = app.release_job(job) {
+                    let _ = t.join();
+                }
+            }
+        } else {
+            reconnect_for_delay(&app, &shared, connector, &id);
+        }
+        let mut state = shared.state.lock().unwrap();
+        state.schedule.finished();
+        if !state.schedule.waiting() {
+            state.choice_job = None;
+        }
         shared.wake.notify_all();
     }
 }
@@ -676,12 +774,18 @@ fn reconnect_for_delay(app: &Arc<App>, shared: &Shared, connector: &dyn Connecto
         let state = shared.state.lock().unwrap();
         state.started.as_ref().filter(|(sid, _)| sid == id).map_or(to_ms, |(_, c)| *c)
     };
-    if to_ms == from_ms {
+    // Short and Steady can both have zero adjustment and still need
+    // different sessions for a switch of way.
+    if to_ms == from_ms && crate::engine::cancel::binding().is_none() {
         return;
     }
     info!("delay: reconnecting {} to apply {:+} ms (had {:+} ms)", bound.name, to_ms, from_ms);
     shared.state.lock().unwrap().reconnecting = Some((id.to_string(), from_ms));
     let result = connector.connect_again(app, id);
+    if crate::engine::cancel::cancelled() {
+        shared.state.lock().unwrap().reconnecting = None;
+        return;
+    }
     let failed = match result {
         Ok(()) => None,
         Err(None) => {
@@ -717,7 +821,8 @@ fn reconnect_for_delay(app: &Arc<App>, shared: &Shared, connector: &dyn Connecto
     };
     if let Some(at) = again_at {
         while Instant::now() < at {
-            if app.is_shutting_down() {
+            if app.is_shutting_down() || crate::engine::cancel::cancelled() {
+                shared.state.lock().unwrap().reconnecting = None;
                 return;
             }
             std::thread::sleep(at.saturating_duration_since(Instant::now()).min(IDLE_CHECK));
@@ -752,6 +857,80 @@ mod tests {
         assert_eq!(s.limits, Some(Limits { remove_ms: 200, add_ms: 1000 }));
         assert_eq!((s.applies, s.progress, s.notice), (Ok(Applies::Live), Progress::Done, None));
         assert_eq!(app.delay_status(), None, "nothing plays");
+    }
+
+    /// A cut-out while delay was removed (the speaker re-buffered, or it
+    /// stopped responding) changes nothing: the app offers *Add 50 ms*
+    /// (never past the speaker's own delay), or the steady delay for an
+    /// AirPlay speaker on its short one, until it is used, closed or the
+    /// delay is changed.
+    #[test]
+    fn a_cut_out_offers_fifty_ms_and_changes_nothing() {
+        let app = App::for_tests();
+        app.change_delay(Some("uuid:kitchen"), Request::Remove(120)).unwrap();
+        app.delay_for_upnp("uuid:kitchen");
+        // The stream saw it run dry.
+        app.delay_cut_out(CutOut { removed_ms: 120 });
+        assert!(app.delay.wait_idle(Duration::from_secs(5)));
+        let s = app.delay_status_of("uuid:kitchen");
+        assert_eq!(s.change_ms, -120, "nothing went back");
+        assert_eq!(s.offer.map(|o| o.what), Some(Offered::Add(OFFER_ADD_MS)));
+        assert_eq!(app.delay.catch_up().target_ms(), -120);
+        // Taken: 50 ms added, and the offer goes.
+        assert!(app.take_delay_offer("uuid:kitchen"));
+        let s = app.delay_status_of("uuid:kitchen");
+        assert_eq!((s.change_ms, s.offer), (-70, None));
+        assert!(!app.take_delay_offer("uuid:kitchen"));
+        // Less removed than 50 ms: only that much is offered.
+        app.change_delay(Some("uuid:kitchen"), Request::Set(-20)).unwrap();
+        app.note_cut_out("uuid:kitchen");
+        assert_eq!(app.delay_status_of("uuid:kitchen").offer.map(|o| o.what), Some(Offered::Add(20)));
+        // A change of the delay ends it; so does its ×.
+        app.change_delay(Some("uuid:kitchen"), Request::Remove(10)).unwrap();
+        assert_eq!(app.delay_status_of("uuid:kitchen").offer, None);
+        app.note_cut_out("uuid:kitchen");
+        app.close_delay_offer("uuid:kitchen");
+        assert_eq!(app.delay_status_of("uuid:kitchen").offer, None);
+        // Nothing removed: nothing offered.
+        app.change_delay(Some("uuid:kitchen"), Request::Set(0)).unwrap();
+        app.note_cut_out("uuid:kitchen");
+        assert_eq!(app.delay_status_of("uuid:kitchen").offer, None);
+        // An AirPlay speaker on its short delay: the steady one.
+        app.user_config
+            .lock()
+            .unwrap()
+            .speaker_settings
+            .insert(OFFICE.into(), SpeakerSettings { delay_choice: Some(DelayChoice::Short), ..Default::default() });
+        app.note_cut_out(OFFICE);
+        assert_eq!(app.delay_status_of(OFFICE).offer.map(|o| o.what), Some(Offered::UseSteady));
+        assert!(app.take_delay_offer(OFFICE));
+        assert_eq!(app.delay_status_of(OFFICE).choice, Some(DelayChoice::Steady));
+        app.request_shutdown();
+    }
+
+    /// *Set the delay…* sets the delay itself: the speaker's own delay
+    /// plus what is removed or added. A figure it can't play with becomes
+    /// the nearest it can; *Use it* goes back to its own delay.
+    #[test]
+    fn set_delay_sets_the_delay_itself() {
+        let app = App::for_tests();
+        // A UPnP speaker's own delay is 200 ms here.
+        assert_eq!(app.delay_status_of("uuid:kitchen").own_delay_ms, 200);
+        let out = app.set_delay_to("uuid:kitchen", 150).unwrap();
+        assert!(!out.clamped);
+        let s = app.delay_status_of("uuid:kitchen");
+        assert_eq!((s.delay_ms, s.change_ms), (150, -50));
+        app.set_delay_to("uuid:kitchen", 450).unwrap();
+        assert_eq!(app.delay_status_of("uuid:kitchen").delay_ms, 450);
+        // More than it can play with: the most it can.
+        let out = app.set_delay_to("uuid:kitchen", 60_000).unwrap();
+        let s = app.delay_status_of("uuid:kitchen");
+        assert!(out.clamped);
+        assert_eq!(s.delay_ms, 200 + s.limits.unwrap().add_ms);
+        app.use_default_delay("uuid:kitchen").unwrap();
+        let s = app.delay_status_of("uuid:kitchen");
+        assert_eq!((s.delay_ms, s.change_ms), (200, 0));
+        app.request_shutdown();
     }
 
     #[test]

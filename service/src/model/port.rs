@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::command::{Command, Surface, Ticket};
-use super::snapshot::Snapshot;
+use super::Snapshot;
 
 /// Called after every new snapshot.
 pub type Watcher = Arc<dyn Fn() + Send + Sync>;

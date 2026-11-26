@@ -171,6 +171,9 @@ pub struct RaopDetails {
     pub addresses: Vec<IpAddr>,
     /// `tp`: the transports it offers (`UDP`, `TCP`), when it says.
     pub transports: Option<Vec<String>>,
+    /// The status flags it announces: `_airplay._tcp`'s `flags`, else
+    /// `_raop._tcp`'s `sf` (see [`AirPlayRenderer::another_device_sending`]).
+    pub status_flags: Option<u32>,
     /// `md`: the metadata it takes: 0 track text, 1 artwork, 2 progress.
     pub metadata: Vec<u8>,
     /// The `_raop._tcp` instance (full name, lower case) this entry
@@ -283,7 +286,19 @@ impl StereoPair {
     }
 }
 
+/// The status flag `ReceiverSessionIsActive` (bit 17): set while the
+/// receiver receives anything over AirPlay. Bit and name from the
+/// openairplay project's public description of the AirPlay protocol
+/// (its "Status Flags" table); not seen on a receiver here.
+pub const RECEIVER_SESSION_IS_ACTIVE: u32 = 1 << 17;
+
 impl AirPlayRenderer {
+    /// Whether its announcement says a device sends to it now. While this
+    /// PC sends to it, that device is this PC.
+    pub fn another_device_sending(&self) -> bool {
+        self.raop.status_flags.is_some_and(|f| f & RECEIVER_SESSION_IS_ACTIVE != 0)
+    }
+
     /// Stable identifier used by the UI / persistence layer. Prefixed so
     /// it can't collide with the UPnP `Renderer::stable_id()`.
     pub fn stable_id(&self) -> String {
@@ -509,10 +524,14 @@ struct RaopInfo {
     password_protected: bool,
     encryption_key_required: bool,
     model: Option<String>,
+    /// `sf`.
+    status_flags: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct AirPlayInfo {
+    /// `flags`.
+    status_flags: Option<u32>,
     friendly_name: String,
     /// Its IPv4 addresses, sorted.
     addresses: Vec<IpAddr>,
@@ -991,6 +1010,7 @@ fn merge(
             txt: raop.map(|r| r.txt.clone()).unwrap_or_default(),
             addresses: raop_addresses,
             transports: raop.and_then(|r| r.transports.clone()),
+            status_flags: airplay.and_then(|a| a.status_flags).or_else(|| raop.and_then(|r| r.status_flags)),
             metadata: raop.map(|r| r.metadata.clone()).unwrap_or_default(),
             instance: raop.map(|r| r.fullname.clone()),
             newcomer: false,
@@ -1089,6 +1109,7 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
             password_protected: read_txt_bool(txt, "pw"),
             encryption_key_required: read_txt_bool(txt, "ek"),
             model: read_txt_string(txt, "am"),
+            status_flags: read_txt_string(txt, "sf").and_then(|v| parse_flags(&v)),
         };
         debug!(
             "AirPlay RAOP resolved: {} @ {:?}:{} et={:?} cn={:?}",
@@ -1103,6 +1124,7 @@ fn ingest_resolution(state: &AirPlayDiscoveryState, service: &str, info: &Servic
             return;
         };
         let a = AirPlayInfo {
+            status_flags: read_txt_string(txt, "flags").and_then(|v| parse_flags(&v)),
             friendly_name: airplay_instance_name(info.get_fullname()),
             addresses,
             port: info.get_port(),
@@ -1242,6 +1264,15 @@ fn read_features(txt: &TxtProperties) -> Option<u64> {
     parse_features(&read_txt_string(txt, "features").or_else(|| read_txt_string(txt, "ft"))?)
 }
 
+/// A status flag word (`flags`, `sf`): hex with `0x`, else decimal.
+fn parse_flags(raw: &str) -> Option<u32> {
+    let raw = raw.trim();
+    match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => raw.parse().ok(),
+    }
+}
+
 /// The flag word of a `features` / `ft` value (see [`read_features`]).
 fn parse_features(raw: &str) -> Option<u64> {
     let parts: Vec<&str> = raw.split(',').map(|p| p.trim()).collect();
@@ -1369,6 +1400,7 @@ mod tests {
             pk: None,
             model: Some("AudioAccessory5,1".into()),
             group: group_txt(Some(tsid), Some("Pair".into()), leader),
+            status_flags: None,
         };
         state.upsert_airplay("AA".into(), "a._airplay._tcp.local.", info("t1", true));
         state.upsert_airplay("BB".into(), "b._airplay._tcp.local.", info("t1", false));
@@ -1401,6 +1433,45 @@ mod tests {
 
     fn raop_info(instance: &str, addrs: &str, txt: &[(&str, &str)]) -> ServiceInfo {
         ServiceInfo::new(RAOP_SERVICE, instance, "speaker.local.", addrs, 5000, txt).unwrap()
+    }
+
+    /// The announcement's status flag that another device sends to the
+    /// receiver counts: set, it is playing something else; cleared in a
+    /// later announcement, it isn't any more. `_airplay._tcp`'s `flags`
+    /// wins over `_raop._tcp`'s `sf`.
+    #[test]
+    fn the_busy_flag_of_an_airplay_announcement_counts() {
+        let state = AirPlayDiscoveryState::with_lan(home_lan());
+        let id = "airplay:AABBCCDDEE10";
+        let raop = |sf: &str| raop_info("AABBCCDDEE10@Office", "192.168.1.30", &[("et", "0"), ("cn", "1"), ("sf", sf)]);
+        // An idle Apple TV and one that receives (example values of the
+        // same description of the protocol).
+        ingest_resolution(&state, RAOP_SERVICE, &raop("0x10644"));
+        assert!(!state.find_by_id(id).unwrap().another_device_sending());
+        ingest_resolution(&state, RAOP_SERVICE, &raop("0x30e44"));
+        assert!(state.find_by_id(id).unwrap().another_device_sending());
+        ingest_resolution(&state, RAOP_SERVICE, &raop("0x4"));
+        assert!(!state.find_by_id(id).unwrap().another_device_sending());
+        ingest_resolution(&state, RAOP_SERVICE, &raop("not a number"));
+        assert!(!state.find_by_id(id).unwrap().another_device_sending());
+        let airplay = |flags: &str| {
+            ServiceInfo::new(
+                AIRPLAY_SERVICE,
+                "Office",
+                "office.local.",
+                "192.168.1.30",
+                7000,
+                &[("deviceid", "AA:BB:CC:DD:EE:10"), ("features", "0x5A7FFFF7,0x1E"), ("flags", flags)][..],
+            )
+            .unwrap()
+        };
+        ingest_resolution(&state, AIRPLAY_SERVICE, &airplay("0x20044"));
+        assert!(state.find_by_id(id).unwrap().another_device_sending());
+        ingest_resolution(&state, AIRPLAY_SERVICE, &airplay("0x44"));
+        ingest_resolution(&state, RAOP_SERVICE, &raop("0x30e44"));
+        assert!(!state.find_by_id(id).unwrap().another_device_sending());
+        assert_eq!(parse_flags("0x30e44"), Some(0x30e44));
+        assert_eq!(parse_flags("4"), Some(4));
     }
 
     #[test]

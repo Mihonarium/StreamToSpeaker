@@ -6,7 +6,6 @@
 //! Work that touches the network (connecting, probing an address) runs on
 //! a thread of its own; nothing here waits for a speaker.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -14,12 +13,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::app::{App, UpdateOutcome};
-use crate::delay::{DelayStatus, Kind, Request};
+use crate::delay::Kind;
 use crate::equalizer::EQ_PRESETS;
 use crate::manual_speakers::{self, ManualKind};
 use crate::model::text::{Lang, LocalTime};
 use crate::sendspin_app::{is_sendspin_id, PairPromptKind, MA_OUTPUT_ID};
-use crate::user_config::AutoConnect;
 
 use super::port::*;
 use super::words::w;
@@ -29,7 +27,7 @@ use super::words::w;
 /// what was opened.
 pub trait Desktop: Send + Sync {
     fn open_url(&self, url: &str);
-    fn open_folder(&self, dir: &std::path::Path);
+    fn open_folder(&self, dir: &std::path::Path) -> std::io::Result<()>;
     /// The local time's offset from UTC now, in seconds.
     fn utc_offset_secs(&self) -> i64;
 }
@@ -47,13 +45,11 @@ impl Desktop for SystemDesktop {
         log::info!("settings: would open {url}");
     }
 
-    fn open_folder(&self, dir: &std::path::Path) {
-        // explorer.exe opens a folder given as its argument; no shell is
-        // involved.
+    fn open_folder(&self, dir: &std::path::Path) -> std::io::Result<()> {
         #[cfg(windows)]
-        let _ = std::process::Command::new("explorer").arg(dir).spawn();
+        { crate::shell_open(dir.as_os_str()) }
         #[cfg(not(windows))]
-        log::info!("settings: would open {}", dir.display());
+        { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("cannot open {}", dir.display()))) }
     }
 
     fn utc_offset_secs(&self) -> i64 {
@@ -146,8 +142,6 @@ struct Inner {
     /// Counts the probes started, so a late answer to an earlier *Find*
     /// is dropped.
     probe_seq: u64,
-    /// Tone changes to undo, per speaker, newest last.
-    tone_undo: HashMap<String, Vec<crate::equalizer::EqSettings>>,
     /// Music Assistant has played this PC's sound while the app ran.
     ma_played: bool,
     /// Music Assistant's code whose window was closed.
@@ -203,14 +197,10 @@ impl AppSettings {
                 let stored = app.speaker_settings(&s.id);
                 let row = SpeakerRow {
                     id: s.id.clone(),
-                    name,
+                    name: stored.show_as.clone().filter(|n| !n.trim().is_empty()).unwrap_or(name),
                     kind: kind.clone(),
                     presence,
                     added_by_address: s.manual,
-                    change_ms: crate::delay::stored_change(&stored, stored.delay_choice),
-                    choice: stored.delay_choice,
-                    paired: app.has_airplay_pairing(&s.id),
-                    untested: kind == SpeakerKind::HomePodPair,
                     cant_play: unsupported.then_some(CantPlay::AirPlayOff),
                 };
                 (row, s.hidden)
@@ -242,57 +232,37 @@ impl AppSettings {
         }
     }
 
-    fn delay_card(&self, status: &DelayStatus) -> Option<DelayCard> {
-        if status.kind == Kind::MusicAssistant {
-            return None;
-        }
-        let at_once = self.app.user_config.lock().unwrap().delay_at_once;
-        Some(DelayCard { status: status.into(), measured: None, small_step_ms: 25, large_step_ms: 100, at_once })
-    }
-
-    /// The raw values behind the delay, for Details.
-    fn delay_values(&self, status: &DelayStatus) -> Option<String> {
-        let lang = self.lang();
-        let change = crate::model::delay::change_text(lang, status.change_ms).unwrap_or_else(|| w!(lang, SetNothingChanged));
-        match status.kind {
-            Kind::Upnp => Some(w!(lang, SetDetailStream, change = &change)),
-            Kind::AirPlay { .. } | Kind::HomePod { .. } | Kind::HomePodPair => {
-                let choice = match status.choice {
-                    Some(crate::delay::DelayChoice::Steady) => w!(lang, SetChoiceSteady),
-                    _ => w!(lang, SetChoiceShort),
-                };
-                let buffer = (status.own_delay_ms as i64 + status.change_ms as i64).max(0) as u32;
-                Some(w!(lang, SetDetailBuffer, buffer = buffer, choice = &choice, base = status.own_delay_ms, change = &change))
-            }
-            Kind::Sendspin => Some(w!(lang, SetDetailLead, change = &change)),
-            Kind::MusicAssistant => None,
-        }
-    }
-
     /// The tone `id` plays with: its own, or the app-wide curve.
     fn tone_of(&self, id: &str) -> crate::equalizer::EqSettings {
         let uc = self.app.user_config.lock().unwrap();
         uc.speaker_settings.get(id).and_then(|s| s.tone.clone()).unwrap_or_else(|| uc.equalizer.clone())
     }
 
-    fn set_tone(&self, id: &str, eq: crate::equalizer::EqSettings, undoable: bool) {
-        let eq = crate::equalizer::EqSettings { enabled: true, ..eq }.sanitized();
-        let before = self.tone_of(id);
-        if before == eq {
-            return;
+    /// Use the panel's identity check before applying a speaker setting to both ways.
+    fn airplay_twin(&self, id: &str) -> Option<crate::airplay::AirPlayRenderer> {
+        let native = self.app.discovery.as_ref()?.find_by_id(id)?;
+        self.app.airplay_discovery.as_ref()?.renderers().into_iter().find(|r| {
+            r.ip == native.ip && crate::engine::place_driver::speaker_for_pick(&self.app, &r.stable_id()).as_str() == id
+        })
+    }
+
+    fn transport_ids(&self, id: &str) -> Vec<String> {
+        let mut ids = vec![id.to_owned()];
+        if let Some(twin) = self.airplay_twin(id) { ids.push(twin.stable_id()); }
+        ids
+    }
+
+    /// Keep edits to both ways together with other fields the engine may have saved.
+    fn change_speaker(&self, id: &str, edit: impl Fn(&mut crate::user_config::SpeakerSettings)) {
+        let ids = self.transport_ids(id);
+        let mut cfg = self.app.user_config.lock().unwrap();
+        for id in ids {
+            if crate::airplay::discovery::is_instance_id(&id) { continue; }
+            let entry = cfg.speaker_settings.entry(id.clone()).or_default();
+            edit(entry);
+            if entry.is_default() { cfg.speaker_settings.remove(&id); }
         }
-        if undoable {
-            let mut inner = self.inner.lock().unwrap();
-            let stack = inner.tone_undo.entry(id.to_string()).or_default();
-            stack.push(before);
-            if stack.len() > 50 {
-                stack.remove(0);
-            }
-        }
-        let mut settings = self.app.speaker_settings(id);
-        settings.tone = Some(eq);
-        self.app.set_speaker_settings(id, settings);
-        self.app.tone_follows_speaker();
+        cfg.save();
     }
 
     fn playing_id(&self) -> Option<String> {
@@ -449,42 +419,31 @@ impl SettingsPort for AppSettings {
 
     fn speaker(&self, id: &str) -> Option<SpeakerView> {
         let app = &self.app;
-        let (row, _) = self.rows().into_iter().find(|(r, _)| r.id == id)?;
+        let row = self.rows().into_iter().find(|(r, _)| r.id == id).map(|(r, _)| r).or_else(|| {
+            let cfg = app.user_config.lock().unwrap();
+            let stored = cfg.speaker_settings.get(id);
+            let remembered = cfg.sound_place.as_ref().is_some_and(|p| p.named.iter().chain(&p.place).any(|k| k.as_str() == id));
+            if stored.is_none() && !remembered { return None; }
+            let name = stored.and_then(|s| s.show_as.clone()).unwrap_or_else(|| id.into());
+            drop(cfg);
+            Some(SpeakerRow { id: id.into(), kind: self.kind_of(id, &name), name, presence: Presence::NotFound { last_seen: None },
+                added_by_address: false, cant_play: None })
+        })?;
         let shown_name = row.name.clone();
-        let status = app.delay_status_of(id);
         let stored = app.speaker_settings(id);
-        let airplay = app.airplay_discovery.as_deref().and_then(|d| d.find_by_id(id));
-        let upnp = app.discovery.as_deref().and_then(|d| d.find_by_id(id));
-        let model = airplay.as_ref().and_then(|r| r.model.clone());
-        let group = match row.kind {
-            SpeakerKind::SonosGroup => upnp.as_ref().map(|r| {
-                let mut members = vec![r.zone_name.clone().unwrap_or_else(|| r.friendly_name.clone())];
-                members.extend(r.group_members.iter().cloned());
-                Group::Sonos { members }
-            }),
-            SpeakerKind::HomePodPair => airplay.as_ref().and_then(|r| r.pair.as_ref()).and_then(|p| {
-                let names: Vec<String> = p.members.iter().map(|m| m.friendly_name.clone()).collect();
-                (names.len() >= 2).then(|| Group::HomePodPair { left: names[0].clone(), right: names[1].clone() })
-            }),
-            _ => None,
-        };
-        let pairing = if app.has_airplay_pairing(id) {
-            Some(Pairing::Paired { on: None })
-        } else if app.airplay_password(id).is_some() {
-            Some(Pairing::PasswordSaved)
-        } else {
-            None
-        };
-        let comes_back = Some(match stored.auto_connect {
-            AutoConnect::Default => ComesBack::WhenLastChosen,
-            AutoConnect::Always => ComesBack::WhenItAppears,
-            AutoConnect::Never => ComesBack::Never,
-        });
+        let twin = self.airplay_twin(id);
+        let airplay = app.find_airplay_renderer(id).or(twin.clone());
+        let model = app.discovery.as_ref().and_then(|d| d.find_by_id(id)).and_then(|r| r.model_name)
+            .or_else(|| airplay.as_ref().and_then(|r| r.model.clone()));
         // Song titles reach AirPlay 1 receivers and Sendspin speakers.
-        let titles = matches!(row.kind, SpeakerKind::AirPlay | SpeakerKind::AppleTv | SpeakerKind::Sendspin);
+        let titles = matches!(row.kind, SpeakerKind::Sendspin) || airplay.as_ref().map_or(
+            matches!(row.kind, SpeakerKind::AirPlay | SpeakerKind::AppleTv),
+            |r| r.transport() == Some(crate::airplay::Transport::RaopLegacy),
+        );
         let song_titles = titles.then(|| stored.song_titles.unwrap_or(app.is_forward_now_playing()));
         let tone = self.tone_of(id);
         let connection = match &row.kind {
+            SpeakerKind::Sonos | SpeakerKind::SonosGroup if twin.is_some() => "Sonos / AirPlay",
             SpeakerKind::Sonos | SpeakerKind::SonosGroup => "UPnP, Sonos",
             SpeakerKind::Other { .. } => "UPnP",
             SpeakerKind::Sendspin => "Sendspin",
@@ -493,27 +452,16 @@ impl SettingsPort for AppSettings {
             _ => "AirPlay",
         };
         let address = app.speaker_view_opts(true).speakers.into_iter().find(|s| s.id == id).map(|s| s.ip);
-        let last_problem = app.last_fault().filter(|f| f.before.speaker_id.as_deref() == Some(id)).map(|f| f.what);
         Some(SpeakerView {
             details: Details {
                 model: model.clone(),
                 address,
                 connection: Some(connection.to_string()),
-                id: id.to_string(),
-                delay_values: self.delay_values(&status),
-                last_problem,
             },
-            delay: self.delay_card(&status),
             row,
-            model,
-            test_sound: Some(()),
-            connects_with: None,
-            group,
             volume_limit: Some(stored.volume_limit.unwrap_or(100).min(100)),
             tone: Some((tone.bands_db[0], tone.bands_db[crate::equalizer::EQ_BANDS - 1])),
-            comes_back,
             song_titles,
-            pairing,
             show_as: Some(stored.show_as.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| shown_name.clone())),
         })
     }
@@ -525,13 +473,13 @@ impl SettingsPort for AppSettings {
             Some(why) => Err(why),
             None => Ok(crate::autostart::is_enabled()),
         };
+        let cfg = app.user_config.lock().unwrap();
         GeneralView {
             what_plays: None,
             play_calls: None,
+            switch_back_after_quiet: cfg.switch_back_after_quiet,
+            notes_by_clock: cfg.notes_by_clock,
             start_at_sign_in: Some(start),
-            go_back: Some(app.is_auto_reconnect_on_launch()),
-            when_stops: Some(if app.is_auto_reconnect_on_drop() { WhenStops::BringBack } else { WhenStops::StaySilent }),
-            notifications: None,
             shortcuts: None,
             language: None,
         }
@@ -580,12 +528,20 @@ impl SettingsPort for AppSettings {
                             Seen::On(_) => LocalTime::new(0, 0),
                         };
                         let address = r.address.to_string();
-                        Refused { name: (r.name != address).then_some(r.name), address, at, group_of: None }
+                        let group_of = r.speaker.map(|id| {
+                            let id = crate::engine::place_driver::speaker_for_pick(app, &id).as_str().to_owned();
+                            let name = app.speaker_name(&id).unwrap_or_else(|| id.clone());
+                            (id, name)
+                        });
+                        Refused { name: (r.name != address).then_some(r.name), address, at, group_of }
                     })
                     .collect(),
             ),
             phone: Some(Phone { on, link: on.then(|| app.web_link()).flatten(), problem: self.inner.lock().unwrap().phone_problem.clone() }),
-            api: None,
+            api: Some({
+                let cfg = app.user_config.lock().unwrap();
+                Api { on: cfg.scripts_enabled, key: cfg.scripts_key.clone() }
+            }),
         }
     }
 
@@ -613,7 +569,7 @@ impl SettingsPort for AppSettings {
         };
         AboutView {
             version: crate::display_version().to_string(),
-            driver: None,
+            show_lab: app.user_config.lock().unwrap().show_lab,
             updates: Updates { daily: (!dev).then(|| app.is_check_for_updates()), state, installs_here: false },
         }
     }
@@ -654,7 +610,9 @@ impl SettingsPort for AppSettings {
 
     fn playback_check(&self) -> PlaybackCheck {
         let app = &self.app;
-        let speaker = app.selected_speaker().map(|s| clean_name(&s.friendly_name).0).or_else(|| app.is_ma_output_selected().then(|| w!(self.lang(), MaName)));
+        let speaker = app.engine_view().and_then(|view| {
+            view.scene.situation.place_speaker().map(|id| view.scene.speaker_name(id))
+        });
         let mut c = PlaybackCheck {
             speaker: speaker.clone(),
             playing: None,
@@ -772,13 +730,12 @@ impl SettingsPort for AppSettings {
     }
 
     fn tone(&self, id: &str) -> Option<ToneView> {
-        let name = self.rows().into_iter().find(|(r, _)| r.id == id)?.0.name;
+        let name = self.app.speaker_name(id).unwrap_or_else(|| id.into());
         let playing = self.playing_id().as_deref() == Some(id);
         Some(ToneView {
             name,
             eq: self.tone_of(id),
             headroom_db: playing.then(|| self.app.eq_report()).flatten().map(|r| r.auto_attenuation_db).filter(|d| *d < 0.0),
-            can_undo: self.inner.lock().unwrap().tone_undo.get(id).is_some_and(|s| !s.is_empty()),
         })
     }
 
@@ -788,15 +745,15 @@ impl SettingsPort for AppSettings {
         if parts.versions {
             out.push(w!(lang, SetReportVersionLine, version = crate::display_version(), os = std::env::consts::OS));
         }
-        if parts.last_hour {
-            out.push(self.app.diagnostics_report());
+        if parts.diagnostics {
+            out.push(self.app.diagnostics_report(parts.speakers));
         }
         if parts.speakers {
             for s in self.app.speaker_view_opts(true).speakers {
                 out.push(format!("{} — {} ({})", s.friendly_name, s.ip, s.id));
             }
         }
-        if parts.log {
+        if parts.log && parts.speakers {
             if let Some(text) = crate::log_dir().and_then(|d| newest_log(&d)).and_then(|p| std::fs::read_to_string(p).ok()) {
                 // The end of the log: what happened most recently.
                 let lines: Vec<&str> = text.lines().collect();
@@ -805,6 +762,10 @@ impl SettingsPort for AppSettings {
             }
         }
         out.join("\n\n")
+    }
+
+    fn save_report(&self, text: &str) -> ReportSave {
+        self.save_report_in(crate::log_dir().as_deref(), text)
     }
 
     fn act(&self, act: Act) {
@@ -822,18 +783,6 @@ impl SettingsPort for AppSettings {
             Act::ShowSpeaker(id) => self.set_hidden(&id, false),
             Act::HideSpeaker(id) => self.set_hidden(&id, true),
             Act::SendspinSpeakers(on) => app.set_sendspin_enabled(on),
-            Act::PlayOn(id) => app.select_speaker_async(&id),
-            Act::Delay(id, d) => {
-                let r = match d {
-                    DelayAct::Remove(n) => app.change_delay(Some(&id), Request::Remove(n)).map(|_| ()),
-                    DelayAct::Add(n) => app.change_delay(Some(&id), Request::Add(n)).map(|_| ()),
-                    DelayAct::BackToOwn => app.change_delay(Some(&id), Request::Set(0)).map(|_| ()),
-                    DelayAct::Choose(c) => app.set_delay_choice(&id, c).map(|_| ()),
-                };
-                if let Err(e) = r {
-                    log::info!("settings: delay of {id} not changed: {e:?}");
-                }
-            }
             Act::Tone(id, t) => {
                 let mut eq = self.tone_of(&id);
                 match t {
@@ -856,85 +805,51 @@ impl SettingsPort for AppSettings {
                         }
                     }
                     ToneAct::Flat => eq = crate::equalizer::EqSettings::default(),
-                    ToneAct::Undo => {
-                        let last = self.inner.lock().unwrap().tone_undo.get_mut(&id).and_then(|s| s.pop());
-                        if let Some(prev) = last {
-                            self.set_tone(&id, prev, false);
-                        }
-                        return;
-                    }
                 }
-                self.set_tone(&id, eq, true);
-            }
-            Act::ComesBack(id, c) => {
-                let mut s = app.speaker_settings(&id);
-                s.auto_connect = match c {
-                    ComesBack::WhenLastChosen => AutoConnect::Default,
-                    ComesBack::WhenItAppears => AutoConnect::Always,
-                    ComesBack::Never => AutoConnect::Never,
-                };
-                app.set_speaker_settings(&id, s);
+                let eq = crate::equalizer::EqSettings { enabled: true, ..eq }.sanitized();
+                self.change_speaker(&id, |s| s.tone = Some(eq.clone()));
+                app.tone_follows_speaker();
             }
             Act::SongTitles(id, on) => {
-                let mut s = app.speaker_settings(&id);
-                s.song_titles = Some(on);
-                app.set_speaker_settings(&id, s);
+                self.change_speaker(&id, |s| s.song_titles = Some(on));
             }
             Act::PairAgain(id) => {
                 app.forget_airplay_pairing(&id);
                 app.select_speaker_async(&id);
             }
-            Act::ForgetPairing(id) => app.forget_airplay_pairing(&id),
-            Act::RemovePassword(id) => {
-                let mut uc = app.user_config.lock().unwrap();
-                uc.remove_airplay_password(&id);
-                uc.save();
-            }
-            Act::Forget(id) => {
-                // Its pairing, password, volume, delay changes, tone and
-                // "comes back" choice go, and nothing else. If it plays,
-                // the session ends (on a thread: stopping talks to it).
-                let playing = self.playing_id().as_deref() == Some(id.as_str());
-                {
-                    let mut uc = app.user_config.lock().unwrap();
-                    uc.speaker_settings.remove(&id);
-                    uc.remove_airplay_password(&id);
-                    uc.remove_airplay_pairing(&id);
-                    if uc.last_speaker_id.as_deref() == Some(id.as_str()) {
-                        uc.last_speaker_id = None;
+            Act::ClearSpeakerCredentials(id) => {
+                // The place command clears both transports' settings. Clear their
+                // credentials too, before a manual speaker disappears from discovery.
+                let ids = self.transport_ids(&id);
+                let mut cfg = app.user_config.lock().unwrap();
+                for key in ids {
+                    cfg.remove_airplay_password(&key);
+                    cfg.remove_airplay_pairing(&key);
+                    if let Some(stored) = cfg.speaker_settings.get_mut(&key) { stored.tone = None; }
+                    if let Some(instance) = key.strip_prefix("sendspin:") {
+                        if let Some(client) = cfg.sendspin.pinned_client_id(instance) { cfg.sendspin.player_pairings.remove(&client); }
                     }
-                    uc.save();
                 }
-                self.inner.lock().unwrap().tone_undo.remove(&id);
-                if playing {
-                    let app = app.clone();
-                    let _ = std::thread::Builder::new().name("stream-to-speaker-forget".into()).spawn(move || {
-                        let _ = app.set_streaming_enabled(false);
-                    });
-                }
-            }
-            Act::Remove(id) => app.remove_manual_speaker(&id),
-            Act::TestSound(id) => {
-                // Where the sound is: at once. Another speaker is played by
-                // the engine's own command from the window (it moves the
-                // sound there first), never from here.
-                if self.playing_id().as_deref() == Some(id.as_str()) {
-                    app.play_test_sound();
-                }
+                cfg.save();
+                drop(cfg);
+                app.tone_follows_speaker();
             }
             Act::VolumeLimit(id, limit) => {
-                let mut s = app.speaker_settings(&id);
-                s.volume_limit = (limit < 100).then_some(limit);
-                app.set_speaker_settings(&id, s);
+                self.change_speaker(&id, |s| s.volume_limit = (limit < 100).then_some(limit));
             }
             Act::ShowAs(id, name) => {
-                let mut s = app.speaker_settings(&id);
-                // An empty name gives the speaker its own name back.
-                let name = name.trim().to_string();
-                s.show_as = (!name.is_empty()).then_some(name);
-                app.set_speaker_settings(&id, s);
+                let name = name.trim();
+                self.change_speaker(&id, |s| s.show_as = (!name.is_empty()).then(|| name.to_owned()));
             }
-            Act::WhenStops(w) => app.set_auto_reconnect_on_drop(w == WhenStops::BringBack),
+            Act::SwitchBackAfterQuiet(on) | Act::NotesByClock(on) | Act::ShowLab(on) => {
+                let mut cfg = app.user_config.lock().unwrap();
+                match act {
+                    Act::SwitchBackAfterQuiet(_) => cfg.switch_back_after_quiet = on,
+                    Act::NotesByClock(_) => cfg.notes_by_clock = on,
+                    _ => cfg.show_lab = on,
+                }
+                cfg.save();
+            }
             Act::Allow { address, .. } => match address.parse::<IpAddr>() {
                 Ok(ip) => app.allow_device(ip),
                 Err(_) => log::warn!("settings: can't allow {address}: not an address"),
@@ -943,7 +858,6 @@ impl SettingsPort for AppSettings {
                 let r = crate::autostart::set_enabled(on);
                 self.inner.lock().unwrap().sign_in_problem = r.err();
             }
-            Act::GoBack(on) => app.set_auto_reconnect_on_launch(on),
             Act::OfferToMa(on) => {
                 if let Err(e) = app.set_sendspin_source_enabled(on) {
                     log::warn!("settings: Music Assistant input: {e}");
@@ -976,8 +890,20 @@ impl SettingsPort for AppSettings {
             Act::OnlyPlaying(on) => app.set_privacy_mode(on),
             Act::Phone(on) => {
                 let r = app.set_web_ui_enabled(on);
+                if r.is_ok() {
+                    let mut cfg = app.user_config.lock().unwrap();
+                    cfg.phone_enabled = on;
+                    cfg.save();
+                }
                 self.inner.lock().unwrap().phone_problem = r.err();
             }
+            Act::Api(on) => {
+                if let Err(e) = app.set_scripts_access(on, false) { app.record_error(e); }
+            }
+            Act::NewKey => {
+                if let Err(e) = app.set_scripts_access(true, true) { app.record_error(e); }
+            }
+            Act::OpenApiHelp => self.desktop.open_url(&format!("{REPOSITORY}/blob/main/TECHNICAL.md#http-api")),
             Act::NewLink => {
                 if let Err(e) = app.new_web_link() {
                     self.inner.lock().unwrap().phone_problem = Some(e);
@@ -985,11 +911,9 @@ impl SettingsPort for AppSettings {
             }
             Act::OpenLogFolder => {
                 if let Some(d) = crate::log_dir() {
-                    self.desktop.open_folder(&d);
+                    if let Err(e) = self.desktop.open_folder(&d) { app.record_error(e.to_string()); }
                 }
             }
-            Act::ReadGuideOnline => self.desktop.open_url(&format!("{REPOSITORY}#readme")),
-            Act::ShowWelcomeAgain => app.reset_onboarding(),
             Act::Reconnect | Act::TryAirPlay => {
                 if app.is_speaker_bound() {
                     app.reconnect_speaker();
@@ -1069,47 +993,42 @@ impl SettingsPort for AppSettings {
                 inner.probe_seq += 1;
                 inner.probe = Probe::Idle;
             }
-            Act::SaveReport(text) => {
-                if let Some(dir) = crate::log_dir() {
-                    let name = format!("report-{}.txt", now_unix());
-                    let path: PathBuf = dir.join(name);
-                    match std::fs::write(&path, text) {
-                        Ok(()) => self.desktop.open_folder(&dir),
-                        Err(e) => app.record_error(format!("{e}")),
-                    }
-                }
-            }
             Act::OpenIssue(_) => self.desktop.open_url(&format!("{REPOSITORY}/issues/new")),
             // Controls the real app's views leave out.
-            | Act::ConnectWith { .. }
-            | Act::WhatPlays(_)
-            | Act::PlayCalls(_)
-            | Act::Notifications(_)
-            | Act::Shortcuts(_)
+            Act::WhatPlays(_) | Act::PlayCalls(_) | Act::Shortcuts(_)
             | Act::ShortcutKeys(..)
             | Act::Language(_)
-            | Act::OpenVolumeMixer
             | Act::OpenMusicAssistant
-            | Act::Api(_)
-            | Act::NewKey
             | Act::Unmute
             | Act::SendToUs
             | Act::OpenNetworkSettings
             | Act::AllowThroughFirewall
-            | Act::OpenApiHelp
             | Act::Install
             | Act::CancelInstall
-            | Act::RestartWindows
             | Act::CancelPassword(_) => log::debug!("settings: {described} isn't offered by this version"),
         }
     }
 }
 
 impl AppSettings {
+    pub(super) fn save_report_in(&self, dir: Option<&std::path::Path>, text: &str) -> ReportSave {
+        let Some(dir) = dir else { return ReportSave::Failed };
+        let path = dir.join(format!("report-{}.txt", now_unix()));
+        if let Err(e) = std::fs::write(&path, text) {
+            log::warn!("couldn't save the report: {e}");
+            return ReportSave::Failed;
+        }
+        match self.desktop.open_folder(dir) {
+            Ok(()) => ReportSave::Opened,
+            Err(e) => {
+                log::warn!("couldn't open the report folder: {e}");
+                ReportSave::SavedOnly
+            }
+        }
+    }
+
     fn set_hidden(&self, id: &str, hidden: bool) {
-        let mut s = self.app.speaker_settings(id);
-        s.hidden = hidden;
-        self.app.set_speaker_settings(id, s);
+        self.change_speaker(id, |s| s.hidden = hidden);
     }
 
     fn lab_act(&self, l: LabAct) {

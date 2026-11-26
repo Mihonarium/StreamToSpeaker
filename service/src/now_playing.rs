@@ -22,31 +22,67 @@ impl NowPlaying {
     }
 }
 
-/// Current now-playing snapshot, or `None` if nothing is playing / the
+/// Windows' current media session: whose it is, whether it plays, and
+/// its title.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Session {
+    /// The app the session belongs to, as Windows names it: a program's
+    /// file name (`Spotify.exe`) or a Store app's id. None where Windows
+    /// doesn't say.
+    pub app: Option<String>,
+    /// Windows reports that the session is playing.
+    pub playing: bool,
+    pub title: Option<NowPlaying>,
+}
+
+#[cfg(any(windows, test))]
+impl Session {
+    pub(crate) fn from_report(app: Option<String>, playing: Option<bool>, title: Option<NowPlaying>) -> Self {
+        Self { app, playing: playing.unwrap_or(false), title }
+    }
+}
+
+/// Windows' current media session, or `None` if there is none / the
 /// platform doesn't support it.
 #[cfg(windows)]
-pub fn current() -> Option<NowPlaying> {
-    windows_impl::current()
+pub fn current_session() -> Option<Session> {
+    windows_impl::current_session()
 }
 
 #[cfg(not(windows))]
-pub fn current() -> Option<NowPlaying> {
+pub fn current_session() -> Option<Session> {
     None
 }
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::NowPlaying;
+    use super::{NowPlaying, Session};
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSession as MediaSession;
     use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as SessionManager;
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus;
 
     /// Best-effort read via the WinRT SMTC. Any failure → `None`.
-    pub fn current() -> Option<NowPlaying> {
-        // RequestAsync / TryGetMediaPropertiesAsync return IAsyncOperations
-        // we block on with `.get()`. GetCurrentSession returns null when no
-        // app has media focus — the subsequent call then errors, which the
-        // `.ok()?` chain turns into `None`.
+    pub fn current_session() -> Option<Session> {
+        // RequestAsync returns an IAsyncOperation we block on with
+        // `.get()`. GetCurrentSession returns null when no app has media
+        // focus — the calls on it then error, which the `.ok()?` chain
+        // turns into `None`.
         let manager = SessionManager::RequestAsync().ok()?.get().ok()?;
         let session = manager.GetCurrentSession().ok()?;
+        let app = session
+            .SourceAppUserModelId()
+            .ok()
+            .map(|id| id.to_string_lossy().trim().to_string())
+            .filter(|id| !id.is_empty());
+        let playing = session
+            .GetPlaybackInfo()
+            .and_then(|info| info.PlaybackStatus())
+            .ok()
+            .map(|status| status == PlaybackStatus::Playing);
+        Some(Session::from_report(app, playing, title_of(&session)))
+    }
+
+    fn title_of(session: &MediaSession) -> Option<NowPlaying> {
         let props = session.TryGetMediaPropertiesAsync().ok()?.get().ok()?;
 
         let title = props.Title().map(|h| h.to_string_lossy()).unwrap_or_default();

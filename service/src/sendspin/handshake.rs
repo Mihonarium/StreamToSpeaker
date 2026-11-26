@@ -231,6 +231,7 @@ pub fn read_first_frame(ws_reader: &mut WsReader, ws_writer: &WsWriter, timeout:
             Ok(FirstFrame::Noise { raw, client_id, suite })
         }
         "client/hello" => {
+            crate::engine::cancel::speaker_answered();
             ws_reader.set_read_timeout(None)?;
             Ok(FirstFrame::LegacyHello { value: v })
         }

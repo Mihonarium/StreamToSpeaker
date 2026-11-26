@@ -13,39 +13,47 @@ use egui::{Frame, ViewportBuilder, ViewportCommand, ViewportId};
 use windows_sys::Win32::Foundation::HWND;
 
 use super::content::WantedGate;
-use super::panel_window::{OpenView, PanelWindow, Seen, Step, Toggle, TrayClick};
-use super::popup::{popup_builder, popup_rect, PopupContent, PopupKind, StandInPopup};
+use super::panel_window::{FrameOutput, PanelWindow, Step, Toggle, TrayClick};
+use super::passes::{dialog_pass, Passes};
+use super::popup::{popup_builder, popup_pass, popup_rect, PopupKind, Slots};
+use super::main_window::{MainWindow, Windows, OpenView};
 use super::views::ViewMemory;
 use super::tray::{Tray, TrayEvent};
 use super::placement::PxRect;
 use super::win::{self, WindowsDesktop};
-use super::{centred, panel_builder, root_builder, Ask, Desktop, RootMode, ShellOptions, ViewContent, Views, WindowContent, Wiring, ROOT_TITLE};
-use crate::panel::view::{show_view, ViewState};
+use super::{app_icon, centred, root_builder, Ask, Desktop, RootMode, ShellOptions, ViewContent, Views, WindowContent, Wiring, ROOT_TITLE};
 use crate::model::command::{Command, Open, Surface};
 use crate::model::state::Place;
-use crate::model::port::Watch;
-use crate::model::scripted::{RealTime, Scenario, ScriptedEngine};
-use crate::model::snapshot::Snapshot;
+use crate::model::port::{Port, Watch};
+use crate::model::fake::ScriptedEngine;
+use crate::model::Snapshot;
 use crate::ui::theme::{self, Mode};
 
 fn panel_id() -> ViewportId {
     ViewportId::from_hash_of("stream_to_speaker::shell::panel")
 }
 
+fn main_id() -> ViewportId {
+    ViewportId::from_hash_of("stream_to_speaker::shell::main")
+}
+
 fn dialog_id() -> ViewportId {
     ViewportId::from_hash_of("stream_to_speaker::shell::dialog")
 }
 
-fn popup_id(kind: PopupKind) -> ViewportId {
-    ViewportId::from_hash_of(("stream_to_speaker::shell::popup", kind))
+fn popup_id(kind: PopupKind, seq: u64) -> ViewportId {
+    ViewportId::from_hash_of(("stream_to_speaker::shell::popup", kind, seq))
 }
 
 /// A small window that must not take the focus, while it shows.
 struct OpenPopup {
     kind: PopupKind,
-    content: Box<dyn PopupContent + Send>,
+    seq: u64,
+    height: Option<f32>,
     /// Where it was put, once it is there (then it shows).
     rect: Option<PxRect>,
+    /// The extended style bits of its window the log last named.
+    style: Option<u32>,
 }
 
 /// How often the shell looks at what has no event of its own (a second
@@ -55,29 +63,19 @@ const IDLE: Duration = Duration::from_millis(250);
 /// How often the open panel redraws (the level meter).
 const METER: Duration = Duration::from_millis(33);
 
-/// The scenario `STREAM_TO_SPEAKER_SCENARIO` names, if it names one: the
-/// shell then runs on the scripted engine, for trying every state without
-/// speakers.
-pub fn scripted_scenario() -> Option<Scenario> {
-    std::env::var("STREAM_TO_SPEAKER_SCENARIO").ok().and_then(|n| Scenario::from_name(n.trim()))
-}
-
 /// Run the shell on the scripted engine in `scenario`, with the views on
 /// the scripted settings and placeholder windows for the rest.
-pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()> {
+pub fn run_scripted(opts: ShellOptions, scenario: &str) -> anyhow::Result<()> {
     let engine = Arc::new(ScriptedEngine::new(scenario));
-    let _clock = RealTime::start(engine.clone(), Duration::from_millis(50));
+    let clock = engine.clone();
     let scripted_settings: Arc<dyn crate::settings::SettingsPort> = Arc::new(crate::settings::scripted::ScriptedSettings::new());
     let views = Box::new(crate::settings::views::SettingsViews::new(scripted_settings.clone()));
-    // The two small windows' stand-ins show once at start, to try them.
-    let popups: Box<dyn FnOnce(super::popup::PopupDoor)> = Box::new(|door| {
-        door(PopupKind::Confirmation, Box::new(StandInPopup::new(PopupKind::Confirmation, "The confirmation by the clock")));
-        door(PopupKind::Notification, Box::new(StandInPopup::new(PopupKind::Notification, "A notification")));
-    });
     run(
         opts,
         Wiring {
-            port: engine,
+            window_height: None,
+            save_height: Box::new(|_| {}),
+            port: engine.clone(),
             views,
             contents: Box::new(super::content::SettingsContents {
                 port: scripted_settings,
@@ -85,10 +83,10 @@ pub fn run_scripted(opts: ShellOptions, scenario: Scenario) -> anyhow::Result<()
                 needs_password: Box::new(|_| false),
             }),
             route_opens: None,
-            quit: Box::new(|| {}),
+            quit: Box::new(move |from| { engine.send(from, Command::Quit); }),
             quitting: Box::new(|| false),
-            popups: Some(popups),
-            tick: Box::new(|| {}),
+
+            tick: Box::new(move || clock.tick()),
         },
     )
 }
@@ -100,9 +98,19 @@ pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, op
     let settings: Arc<dyn crate::settings::SettingsPort> = Arc::new(crate::settings::real::AppSettings::new(app.clone()));
     let (quit, quitting) = (app.clone(), app.clone());
     let route = engine.clone();
+    let window_height = app.user_config.lock().unwrap().window_height;
     run(
         opts,
         Wiring {
+            window_height,
+            save_height: {
+                let app = app.clone();
+                Box::new(move |height| {
+                    let mut cfg = app.user_config.lock().unwrap();
+                    cfg.window_height = Some(height);
+                    cfg.save();
+                })
+            },
             port: engine,
             views: Box::new(crate::settings::views::SettingsViews::new(settings.clone())),
             contents: Box::new(super::content::SettingsContents {
@@ -113,10 +121,10 @@ pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, op
                     Box::new(move |id| app.is_password_protected(id) && (app.airplay_password(id).is_none() || app.asked_for_password(id)))
                 },
             }),
-            route_opens: Some(Box::new(move |opener| route.on_open(opener))),
-            quit: Box::new(move || quit.request_shutdown()),
+            route_opens: Some(Box::new(move |opener| route.on_open_from(opener))),
+            quit: Box::new(move |from| quit.request_shutdown_from(from)),
             quitting: Box::new(move || quitting.is_shutting_down()),
-            popups: None,
+
             tick: {
                 let app = app.clone();
                 Box::new(move || {
@@ -130,28 +138,28 @@ pub fn run_app(app: Arc<crate::app::App>, engine: Arc<crate::engine::Engine>, op
 /// Run the shell until Quit.
 pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
     let opts = opts.effective();
+    log::info!(
+        "shell: the panel as {:?}, the root as {:?}, tray icon {}, the ordinary window opens at start: {}",
+        opts.panel,
+        opts.root,
+        if opts.tray { "on" } else { "off" },
+        if opts.open_at_start { "yes" } else { "no" }
+    );
     let native = eframe::NativeOptions { viewport: root_builder(opts.root).with_icon(app_icon()), persist_window: false, ..Default::default() };
     eframe::run_native(
         ROOT_TITLE,
         native,
         Box::new(move |cc| {
             crate::fonts::install(&cc.egui_ctx);
-            let Wiring { port, views, contents, route_opens, quit, quitting, popups, tick } = wiring;
-            let (popup_tx, popup_rx) = channel::<(PopupKind, Box<dyn PopupContent + Send>)>();
-            if let Some(hand) = popups {
-                let ctx = cc.egui_ctx.clone();
-                hand(Box::new(move |kind, content| {
-                    let _ = popup_tx.send((kind, content));
-                    ctx.request_repaint();
-                }));
-            }
+            let Wiring { window_height, save_height, port, views, contents, route_opens, quit, quitting, tick } = wiring;
             let ctx = cc.egui_ctx.clone();
             let watch = port.watch(Arc::new(move || ctx.request_repaint()));
-            let (open_tx, open_rx) = channel::<Open>();
+            let (open_tx, open_rx) = channel::<(Surface, Open)>();
+            let local_opens = route_opens.is_none();
             if let Some(route) = route_opens {
                 let ctx = cc.egui_ctx.clone();
-                route(Box::new(move |o| {
-                    let _ = open_tx.send(o);
+                route(Box::new(move |from, o| {
+                    let _ = open_tx.send((from, o));
                     ctx.request_repaint();
                 }));
             }
@@ -180,7 +188,12 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
                 mode: None,
                 dark_taskbar: false,
                 looked_at: f64::NEG_INFINITY,
-                panel: None,
+                monitors: Vec::new(),
+                windows: Windows::default(),
+                panel_reported: false,
+                window_height,
+                save_height,
+                pending_height: None,
                 toggle: Toggle::default(),
                 dialog: None,
                 waiting: VecDeque::new(),
@@ -189,10 +202,13 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
                 tray_tx,
                 tray_rx,
                 opens: open_rx,
-                popups: Vec::new(),
-                popup_rx,
+                popup: None,
+                slots: Slots::default(),
+                local_opens,
                 tray_tickets: Vec::new(),
                 started: false,
+                first_run: None,
+                root_seen: None,
                 closing: false,
             }))
         }),
@@ -200,21 +216,16 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
     .map_err(|e| anyhow!("the windows couldn't start: {e}"))
 }
 
-/// The app's mark, for the windows' title bars and taskbar buttons.
-pub fn app_icon() -> Arc<egui::IconData> {
-    Arc::new(egui::IconData { rgba: include_bytes!("../../../assets/window-brand-64.rgba").to_vec(), width: 64, height: 64 })
-}
-
 struct Shell {
     port: Arc<dyn crate::model::port::Port>,
     _watch: Watch,
     views: Box<dyn Views>,
-    /// The views the panel closed on, to open on them again.
+    /// Pages remembered when the ordinary window closes.
     memory: ViewMemory<OpenView>,
     /// This frame's time, in egui's seconds.
     now: f64,
     contents: Box<dyn super::Contents>,
-    quit: Box<dyn Fn()>,
+    quit: Box<dyn Fn(Surface)>,
     quitting: Box<dyn Fn() -> bool>,
     tick: Box<dyn Fn()>,
     opts: ShellOptions,
@@ -226,7 +237,12 @@ struct Shell {
     dark_taskbar: bool,
     /// When the settings were last read, in egui's seconds.
     looked_at: f64,
-    panel: Option<PanelWindow>,
+    monitors: Vec<super::placement::Monitor>,
+    windows: Windows,
+    panel_reported: bool,
+    window_height: Option<f32>,
+    save_height: Box<dyn Fn(f32)>,
+    pending_height: Option<(f32, f64)>,
     toggle: Toggle,
     dialog: Option<Box<dyn WindowContent>>,
     /// Dialogs asked for while one was open.
@@ -236,12 +252,18 @@ struct Shell {
     tray_tx: Sender<TrayEvent>,
     tray_rx: Receiver<TrayEvent>,
     /// Navigation commands from other surfaces, through the engine.
-    opens: Receiver<Open>,
-    popups: Vec<OpenPopup>,
-    popup_rx: Receiver<(PopupKind, Box<dyn PopupContent + Send>)>,
+    opens: Receiver<(Surface, Open)>,
+    popup: Option<OpenPopup>,
+    slots: Slots,
+    local_opens: bool,
     /// Places picked in the tray's menu, until the engine has answered.
     tray_tickets: Vec<crate::model::command::Ticket>,
     started: bool,
+    /// The previous scene, to raise the window when first run is requested again.
+    first_run: Option<bool>,
+    /// The root window's visibility and extended style bits the log last
+    /// named.
+    root_seen: Option<(bool, u32)>,
     closing: bool,
 }
 
@@ -261,9 +283,23 @@ impl Shell {
             }
             RootMode::ToolWindow => {
                 if self.frames == 1 {
-                    win::keep_out_of_alt_tab(root, true);
+                    if let Some(keep) = super::ShellWindow::Root(RootMode::ToolWindow).kept_style() {
+                        win::keep_ex_style(root, keep);
+                    }
                 }
             }
+        }
+        // Whether it stays as it was made (hidden, or out of Alt+Tab and
+        // never active), after the shell set it and after Windows showed it.
+        let seen = (win::is_visible(root), win::ex_style(root));
+        if self.root_seen != Some(seen) {
+            log::info!(
+                "shell: the root window is {} (its style: {}){}",
+                if seen.0 { "shown" } else { "hidden" },
+                super::ex_style_words(seen.1),
+                if self.root_seen.is_some() { ", changed" } else { "" }
+            );
+            self.root_seen = Some(seen);
         }
     }
 
@@ -283,6 +319,7 @@ impl Shell {
             theme::apply(ctx, mode);
         }
         self.dark_taskbar = self.desktop.taskbar_is_dark();
+        if self.windows.main.is_some() { self.monitors = self.desktop.monitors(); }
     }
 
     fn sync_tray(&mut self, ctx: &egui::Context, snap: &Snapshot) {
@@ -306,57 +343,97 @@ impl Shell {
         }
     }
 
-    fn open_panel(&mut self, ctx: &egui::Context, icon: Option<super::placement::PxRect>) {
-        match &self.panel {
-            Some(p) if p.shown() => ctx.send_viewport_cmd_to(panel_id(), ViewportCommand::Focus),
+    /// Open the panel, or give it the focus if it is open; `why` is for
+    /// the log.
+    fn open_panel(&mut self, ctx: &egui::Context, icon: Option<super::placement::PxRect>, why: &str) {
+        if super::main_window::tray_opens_window(self.opts.tray, self.port.snapshot().scene.situation.first_run.as_ref()) {
+            self.open_window(ctx, true);
+            return;
+        }
+        match &self.windows.flyout {
+            Some(p) if p.shown() => {
+                log::info!("panel: focusing it ({why})");
+                ctx.send_viewport_cmd_to(panel_id(), ViewportCommand::Focus);
+            }
             Some(_) => {}
             None => {
-                let mut p = PanelWindow::open(icon.or_else(|| self.tray.as_ref().and_then(|t| t.rect())));
-                // On the view it closed on, a moment ago or with text typed.
-                p.views = self.memory.reopen(self.now, |(v, _)| v.holds_unused_text());
-                self.panel = Some(p);
+                let icon = icon.or_else(|| self.tray.as_ref().and_then(|t| t.rect()));
+                match icon {
+                    Some(r) => log::info!("panel: opening ({why}; the tray icon is {r})"),
+                    None => log::info!("panel: opening ({why}; no tray icon)"),
+                }
+                self.windows.flyout = Some(PanelWindow::open(icon));
                 // Opened with the mouse: the focus ring waits for a key.
                 crate::ui::look::set_focus_visible(ctx, false);
             }
         }
     }
 
-    /// Show `view` in the panel: over the one showing (`push`), or in place
-    /// of whatever shows, opening the panel if it is closed.
+    fn open_window(&mut self, ctx: &egui::Context, home: bool) {
+        let already_open = self.windows.main.is_some();
+        if !already_open {
+            crate::ui::look::set_focus_visible(ctx, false);
+            self.monitors = self.desktop.monitors();
+        }
+        let window = self.windows.open(|| {
+            let mut w = MainWindow::new(self.window_height, None);
+            w.pages = self.memory.reopen(self.now, |(v, _)| v.holds_unused_text());
+            w
+        });
+        window.sync_first_run(self.port.snapshot().scene.situation.first_run.as_ref());
+        if home { window.home(); }
+        if already_open {
+            for c in super::main_window::foreground_commands() { ctx.send_viewport_cmd_to(main_id(), c); }
+        }
+        ctx.request_repaint();
+    }
+
     fn show_view(&mut self, ctx: &egui::Context, view: Box<dyn ViewContent>, push: bool) {
-        if self.panel.is_none() {
-            self.open_panel(ctx, None);
-            self.memory.forget();
-            if let Some(p) = &mut self.panel {
-                p.views.clear();
-            }
-        }
-        if let Some(p) = &mut self.panel {
-            if !push {
-                p.views.clear();
-            }
-            p.views.push((view, ViewState::opened()));
-        }
-        ctx.send_viewport_cmd_to(panel_id(), ViewportCommand::Focus);
+        self.open_window(ctx, false);
+        self.windows.main.as_mut().unwrap().page(view, push);
     }
 
-    fn close_panel(&mut self) {
-        if let Some(p) = self.panel.take() {
-            if p.shown() {
-                let _ = self.port.send(Surface::Panel, Command::PanelShown(false));
-            }
-            self.memory.closed(p.views, self.now);
-        }
-        // Without a tray icon the panel is the app's window.
-        if !self.opts.tray {
-            self.quit_now();
+    fn close_panel(&mut self, why: &str) {
+        self.windows.flyout = None;
+        log::info!("flyout: closed ({why})");
+    }
+
+    /// Tell the engine whether the panel is in view (then a pop-up by the
+    /// clock would only repeat it): the flyout, or the window showing it.
+    fn report_panel(&mut self) {
+        let open = self.windows.flyout.is_some() || self.windows.main.as_ref().is_some_and(MainWindow::shows_panel);
+        if self.panel_reported != open {
+            self.port.send(Surface::Panel, Command::PanelShown(open));
+            self.panel_reported = open;
         }
     }
 
-    fn quit_now(&mut self) {
+    fn save_window_height(&mut self, flush: bool) {
+        if let Some((height, at)) = self.pending_height {
+            if flush || self.now - at >= 0.5 {
+                (self.save_height)(height);
+                self.pending_height = None;
+            }
+        }
+    }
+
+    fn close_window(&mut self) {
+        if let Some(w) = self.windows.main.take() {
+            let first_run = self.port.snapshot().scene.situation.first_run.is_some();
+            if first_run { self.memory.forget(); } else { self.memory.closed(w.pages, self.now); }
+            self.report_panel();
+            self.save_window_height(true);
+            for command in super::main_window::close_commands(self.opts.tray, first_run) {
+                if command == Command::Quit { self.quit_now(Surface::Panel); }
+                else { self.port.send(Surface::Panel, command); }
+            }
+        }
+    }
+
+    fn quit_now(&mut self, from: Surface) {
         if !self.closing {
             self.closing = true;
-            (self.quit)();
+            (self.quit)(from);
         }
     }
 
@@ -373,7 +450,7 @@ impl Shell {
     /// `from_window`: asked in the panel or Settings.
     fn open(&mut self, ctx: &egui::Context, open: &Open, snap: &Snapshot, from_window: bool, push: bool) {
         if matches!(open, Open::Panel) {
-            self.open_panel(ctx, None);
+            self.open_window(ctx, true);
             return;
         }
         let redirected = super::content::pair_from_outside(open, snap, from_window);
@@ -393,17 +470,24 @@ impl Shell {
         let window = matches!(from, Surface::Panel | Surface::Settings);
         // A speaker picked in the panel that needs its password first: the
         // dialog, which connects once it is typed.
-        if let (true, Command::Play(Place::Speaker(id)) | Command::PlayTakingOver(id)) = (window, &command) {
+        if let (true, Command::Switch { place: Place::Speaker(id), .. } | Command::PlayTakingOver(id)) = (window, &command) {
             if let Some(dialog) = self.contents.before_play(id, snap) {
                 self.open_dialog(dialog);
                 return;
             }
         }
         match command {
-            Command::Open(open) => self.open(ctx, &open, snap, window, false),
-            Command::Quit => self.quit_now(),
+            Command::Open(open) => {
+                self.port.send(from, Command::Open(open.clone()));
+                if self.local_opens { self.open(ctx, &open, snap, window, false); }
+            }
+            Command::FirstRunAction(crate::model::command::FirstRunAction::ShowAgain) => {
+                self.port.send(from, command);
+                if snap.scene.situation.first_run.is_some() { self.open_window(ctx, true); }
+            }
+            Command::Quit => self.quit_now(from),
             command => {
-                let pick = matches!(command, Command::Play(_) | Command::PlayTakingOver(_));
+                let pick = matches!(command, Command::Switch { .. } | Command::PlayTakingOver(_));
                 let ticket = self.port.send(from, command);
                 if pick && from == Surface::Tray {
                     self.tray_tickets.push(ticket);
@@ -428,95 +512,115 @@ impl Shell {
         }
     }
 
-    /// Draw the panel's window; what it sends and what its view asks.
-    fn panel_frame(&mut self, ctx: &egui::Context, snap: &Snapshot, now: f64) -> (Vec<Command>, Vec<Ask>) {
-        let Some(panel) = self.panel.as_mut() else { return (Vec::new(), Vec::new()) };
+    /// Draw the flyout and send its panel actions once per frame.
+    fn panel_frame(&mut self, ctx: &egui::Context, snap: &Snapshot, now: f64) -> Vec<Ask> {
+        let Some(panel) = self.windows.flyout.as_mut() else { return Vec::new() };
         let mode = self.opts.panel;
-        let pinned = snap.first_run.is_some();
-        let (port, desktop) = (&self.port, &mut self.desktop);
-        let builder = panel_builder(mode).with_icon(app_icon());
-        let (commands, step) = ctx.show_viewport_immediate(panel_id(), builder, |ctx, _class| {
+        let desktop = &mut self.desktop;
+        let builder = panel.builder(mode);
+        let mut frame = FrameOutput::default();
+        ctx.show_viewport_immediate(panel_id(), builder, |ctx, _class| {
             let t = theme::Theme::of(ctx);
-            let (focused, inner_height, close) = ctx.input(|i| {
-                let v = i.viewport();
-                (v.focused, v.inner_rect.map(|r| r.height()), v.close_requested())
+            panel.pass(ctx, &mut frame, mode, desktop, |ctx, panel| {
+                egui::CentralPanel::default().frame(Frame::none().fill(t.c.surface).stroke(t.card_stroke()))
+                    .show(ctx, |ui| panel.everyday(ui, snap)).inner
             });
-            if close {
-                // Its × (the small-window form): the shell closes it.
-                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            }
-            let cap = panel.state.height;
-            let depth = panel.views.len().saturating_sub(1);
-            let (out, asks) = egui::CentralPanel::default()
-                .frame(Frame::none().fill(t.c.surface))
-                .show(ctx, |ui| match panel.views.last_mut() {
-                    Some((view, vs)) => {
-                        vs.cap = cap;
-                        let o = show_view(ui, view.as_mut(), snap, vs, depth);
-                        let mut asks = o.asks;
-                        if o.back {
-                            asks.push(Ask::Back);
-                        }
-                        (crate::panel::PanelOutput { natural_height: o.natural_height, ..Default::default() }, asks)
-                    }
-                    None => (crate::panel::show(ui, snap, port.level(), &mut panel.state), Vec::new()),
-                })
-                .inner;
-            let seen = Seen { natural_height: out.natural_height, close: out.close || close, inner_height, focused };
-            let step = panel.after_frame(seen, pinned, mode, desktop);
-            if step == Step::Show {
-                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(ViewportCommand::Focus);
-            }
             ctx.request_repaint_after(METER);
-            ((out.commands, asks), step)
         });
-        match step {
-            Step::Show => {
-                let _ = self.port.send(Surface::Panel, Command::PanelShown(true));
-            }
+        match frame.step {
+            Step::Show => {}
             Step::CloseOnBlur => {
-                self.toggle.closed_by_blur(now);
-                self.close_panel();
+                if self.toggle.blur_closes(now) {
+                    self.close_panel("it lost the focus");
+                }
             }
-            Step::Close => self.close_panel(),
+            Step::Close if frame.passes.asked_to_close => self.close_panel("its window was asked to close"),
+            Step::Close => self.close_panel("Esc"),
             Step::Wait => {}
         }
-        commands
+        self.send_panel(ctx, snap, &mut frame);
+        frame.passes.asks
+    }
+
+    fn send_panel(&mut self, ctx: &egui::Context, snap: &Snapshot, frame: &mut FrameOutput) {
+        let port = self.port.clone();
+        frame.send_panel(port.as_ref(), |command| {
+            if self.local_opens {
+                if let Command::Open(open) = command { self.open(ctx, open, snap, true, false); }
+            }
+        });
+    }
+
+    fn window_frame(&mut self, ctx: &egui::Context, snap: &Snapshot) -> Vec<Ask> {
+        let Some(window) = self.windows.main.as_mut() else { return Vec::new() };
+        let mut frame = FrameOutput::default();
+        let passes = &mut frame.passes;
+        let monitors = &self.monitors;
+        if !window.geometry.shown && window.geometry.target_monitor.is_none() {
+            match self.desktop.opening_monitor(monitors) {
+                std::task::Poll::Ready(m) => window.geometry.target_monitor = m,
+                std::task::Poll::Pending => { ctx.request_repaint_after(METER); return Vec::new(); }
+            }
+        }
+        ctx.show_viewport_immediate(main_id(), window.geometry.builder(), |ctx, _| {
+            passes.notice_close(ctx);
+            let t = theme::Theme::of(ctx);
+            let (inner, outer, minimized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().outer_rect, i.viewport().minimized));
+            window.minimized = minimized.unwrap_or(false);
+            let body = egui::CentralPanel::default().frame(Frame::none().fill(t.c.surface)).show(ctx, |ui| {
+                window.draw(ui, snap, self.opts.tray, ui.available_height())
+            }).inner;
+            if passes.end(ctx, false, body.commands, body.asks) && !passes.asked_to_close {
+                for c in window.geometry.update(body.natural, monitors, inner, outer, ctx.pixels_per_point()) {
+                    ctx.send_viewport_cmd(c);
+                }
+            }
+            ctx.request_repaint_after(METER);
+        });
+        if let Some(h) = window.geometry.chosen.filter(|h| Some(*h) != self.window_height) {
+            self.window_height = Some(h);
+            self.pending_height = Some((h, self.now));
+        }
+        if passes.asked_to_close { self.close_window(); return Vec::new(); }
+        self.send_panel(ctx, snap, &mut frame);
+        frame.passes.asks
     }
 
     /// Draw the small windows that must not take the focus; place a new
     /// one, then show it without activating it.
-    fn popup_frames(&mut self, ctx: &egui::Context, snap: &Snapshot, now: f64) {
-        let monitors = self.desktop.monitors();
-        let icon = self.tray.as_ref().and_then(|t| t.rect());
-        let mut under: Option<PxRect> = self.panel.as_ref().and_then(|p| p.rect());
-        let mut keep = Vec::new();
-        for mut p in std::mem::take(&mut self.popups) {
-            let size = p.content.size();
-            if p.rect.is_none() {
-                if let Some(rect) = popup_rect(&monitors, icon, size, under) {
-                    if self.desktop.place_popup(p.kind.title(), rect) {
-                        p.rect = Some(rect);
-                        ctx.send_viewport_cmd_to(popup_id(p.kind), ViewportCommand::Visible(true));
-                    }
+    fn popup_frames(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        let Some(content) = self.slots.current(snap) else { self.popup = None; return };
+        let (kind, seq) = (content.kind, content.seq);
+        if self.popup.as_ref().is_none_or(|p| (p.kind, p.seq) != (kind, seq)) {
+            self.popup = Some(OpenPopup { kind, seq, height: None, rect: None, style: None });
+        }
+        let p = self.popup.as_mut().unwrap();
+        let size = egui::vec2(super::popup::WIDTH, p.height.unwrap_or(160.0));
+        let id = popup_id(kind, seq);
+        if p.height.is_some() {
+            let icon = self.tray.as_ref().and_then(|t| t.rect());
+            let under = self.windows.flyout.as_ref().and_then(|p| p.rect());
+            if let Some(rect) = popup_rect(&self.desktop.monitors(), icon, size, under) {
+                if p.rect != Some(rect) && self.desktop.place_popup(kind.title(), rect) {
+                    p.rect = Some(rect);
+                    ctx.send_viewport_cmd_to(id, ViewportCommand::Visible(true));
                 }
             }
-            let t = theme::Theme::of(ctx);
-            let content = &mut p.content;
-            let gone = ctx.show_viewport_immediate(popup_id(p.kind), popup_builder(p.kind, size).with_icon(app_icon()), |ctx, _class| {
-                egui::CentralPanel::default()
-                    .frame(Frame::none().fill(t.c.surface).stroke(t.card_stroke()))
-                    .show(ctx, |ui| content.show(ui, snap, now, &mut |_| {}))
-                    .inner
-            });
-            if !gone {
-                under = p.rect.or(under);
-                ctx.request_repaint_after(Duration::from_millis(250));
-                keep.push(p);
-            }
         }
-        self.popups = keep;
+        if let Some(style) = self.desktop.popup_ex_style(kind.title()).filter(|s| Some(*s) != p.style) {
+            log::debug!("{}: {}", kind.title(), super::ex_style_words(style));
+            p.style = Some(style);
+        }
+        let mut passes = Passes::default();
+        ctx.show_viewport_immediate(id, popup_builder(kind, size, p.rect.is_some()).with_icon(app_icon()), |ctx, _| {
+            p.height = Some(popup_pass(ctx, &mut passes, content, snap.lang));
+        });
+        if let Some(command) = passes.commands.into_iter().next() {
+            if let Some((from, command)) = self.slots.take_action(command) {
+                self.route(ctx, from, command, snap);
+            }
+            self.popup = None;
+        }
     }
 
     /// Do what a view or a window's content asked.
@@ -524,18 +628,11 @@ impl Shell {
         match ask {
             Ask::Command(c) => sent.push((Surface::Panel, c)),
             Ask::Dialog(d) => self.open_dialog(d),
-            Ask::OpenPanel => self.open_panel(ctx, None),
+            Ask::OpenPanel => self.open_window(ctx, true),
             Ask::View(v) => self.show_view(ctx, v, true),
             Ask::Open(o) => self.open(ctx, &o, snap, true, true),
             Ask::Back => {
-                if let Some(p) = &mut self.panel {
-                    p.views.pop();
-                    if p.views.is_empty() {
-                        // Back on the everyday content, the keyboard where
-                        // it starts.
-                        p.state.focus_current_row = true;
-                    }
-                }
+                if let Some(w) = &mut self.windows.main { w.back(); }
             }
         }
     }
@@ -544,24 +641,20 @@ impl Shell {
     fn dialog_frame(&mut self, ctx: &egui::Context, snap: &Snapshot) -> Vec<Ask> {
         let Some(mut content) = self.dialog.take() else { return Vec::new() };
         let builder = self.dialog_builder(content.as_ref(), snap);
-        let mut asks = Vec::new();
-        let keep = ctx.show_viewport_immediate(dialog_id(), builder, |ctx, _class| {
-            let closing = ctx.input(|i| i.viewport().close_requested());
-            if closing {
-                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-                content.closed();
-            }
-            let done = content.show(ctx, snap, &mut |a| asks.push(a));
-            !(closing || done)
-        });
-        if keep {
+        let mut passes = Passes::default();
+        ctx.show_viewport_immediate(dialog_id(), builder, |ctx, _class| dialog_pass(ctx, &mut passes, content.as_mut(), snap));
+        if passes.asked_to_close {
+            // Its ×: undo what the dialog started.
+            content.closed();
+        }
+        if !passes.ends_the_window() {
             self.dialog = Some(content);
         } else {
             let still = self.contents.wanted().map(|(k, _)| k);
             self.wanted.closed(still.as_deref());
             self.dialog = self.waiting.pop_front();
         }
-        asks
+        passes.asks
     }
 }
 
@@ -576,6 +669,7 @@ impl eframe::App for Shell {
         self.frames += 1;
         self.now = ctx.input(|i| i.time);
         if self.closing || (self.quitting)() {
+            self.save_window_height(true);
             self.closing = true;
             ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
             return;
@@ -586,17 +680,39 @@ impl eframe::App for Shell {
         self.follow_settings(ctx, now);
         let snap = self.port.snapshot();
         self.sync_tray(ctx, &snap);
+        let first_run = snap.scene.situation.first_run.is_some();
+        if self.first_run == Some(false) && first_run {
+            self.open_window(ctx, true);
+        }
+        self.first_run = Some(first_run);
 
         let mut sent: Vec<(Surface, Command)> = Vec::new();
         while let Ok(ev) = self.tray_rx.try_recv() {
-            let open = self.panel.is_some();
+            let open = self.windows.flyout.is_some();
             match ev {
-                TrayEvent::Press => self.toggle.press(open, now),
-                TrayEvent::Release(rect) => match self.toggle.release(open, now) {
-                    TrayClick::Open => self.open_panel(ctx, Some(rect)),
-                    TrayClick::Close => self.close_panel(),
-                    TrayClick::Nothing => {}
-                },
+                TrayEvent::Press => {
+                    log::info!("tray: left button down on the icon (the panel is {})", if open { "open" } else { "closed" });
+                    self.toggle.press(open, now)
+                }
+                TrayEvent::DoublePress => {
+                    log::info!("tray: left button down again on the icon, a double click (the panel is {})", if open { "open" } else { "closed" });
+                    self.toggle.double_press(open, now)
+                }
+                TrayEvent::Release(rect) => {
+                    let click = self.toggle.release(open, now);
+                    log::info!("tray: left button up on the icon ({rect}): {click:?}");
+                    match click {
+                        TrayClick::Open => self.open_panel(ctx, Some(rect), "a click on the tray icon"),
+                        TrayClick::Close => self.close_panel("a click on the tray icon"),
+                        TrayClick::Nothing => {}
+                        TrayClick::Keep => {
+                            if let Some(p) = &mut self.windows.flyout {
+                                p.forget_focus();
+                            }
+                            self.open_panel(ctx, None, "a double click on the tray icon");
+                        }
+                    }
+                }
                 TrayEvent::Menu(id) => {
                     if let Some(c) = self.tray.as_ref().and_then(|t| t.command(&id)) {
                         sent.push((Surface::Tray, c));
@@ -605,13 +721,8 @@ impl eframe::App for Shell {
             }
         }
         // From other surfaces, through the engine.
-        while let Ok(open) = self.opens.try_recv() {
-            self.open(ctx, &open, &snap, false, false);
-        }
-        // A newer small window of a kind replaces the one showing.
-        while let Ok((kind, content)) = self.popup_rx.try_recv() {
-            self.popups.retain(|p| p.kind != kind);
-            self.popups.push(OpenPopup { kind, content, rect: None });
+        while let Ok((from, open)) = self.opens.try_recv() {
+            self.open(ctx, &open, &snap, matches!(from, Surface::Panel | Surface::Settings), false);
         }
         // A place picked in the tray's menu that only the window may play
         // (a receiver that announces another speaker's identity): the
@@ -625,13 +736,11 @@ impl eframe::App for Shell {
             None => true,
         });
         if refused {
-            self.open_panel(ctx, None);
+            self.open_panel(ctx, None, "a place picked in the tray's menu can only be picked in it");
         }
-        // A second launch; at start, first run or a start from the Start
-        // menu: the panel.
-        let at_start = !self.started && (snap.first_run.is_some() || self.opts.open_at_start);
-        if crate::single_instance::take_activation() || at_start {
-            self.open_panel(ctx, None);
+        // A personal launch, including first run, opens or raises the ordinary window.
+        if super::main_window::activation(!self.started, self.opts, crate::single_instance::take_activation()) {
+            self.open_window(ctx, false);
         }
         self.started = true;
         // The dialog the app needs now (a TV's code), by itself.
@@ -643,9 +752,9 @@ impl eframe::App for Shell {
             self.wanted.admit(None, self.dialog.is_some());
         }
 
-        self.popup_frames(ctx, &snap, now);
-        let (commands, mut asks) = self.panel_frame(ctx, &snap, now);
-        sent.extend(commands.into_iter().map(|c| (Surface::Panel, c)));
+        self.popup_frames(ctx, &snap);
+        let mut asks = self.panel_frame(ctx, &snap, now);
+        asks.extend(self.window_frame(ctx, &snap));
         asks.extend(self.dialog_frame(ctx, &snap));
         for a in asks {
             self.answer(ctx, a, &snap, &mut sent);
@@ -653,6 +762,8 @@ impl eframe::App for Shell {
         for (from, c) in sent {
             self.route(ctx, from, c, &snap);
         }
+        self.report_panel();
+        self.save_window_height(false);
         ctx.request_repaint_after(IDLE);
     }
 }

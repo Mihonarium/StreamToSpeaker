@@ -10,6 +10,8 @@
 
 mod about;
 mod cant_hear;
+mod first_run;
+pub(crate) use first_run::FirstRunPage;
 mod missing;
 mod music_assistant;
 mod parts;
@@ -17,17 +19,17 @@ mod settings_list;
 mod speaker;
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(crate) mod tests;
 
 pub mod scenes;
 
 use std::sync::Arc;
 
 use crate::model::command::Open;
-use crate::model::snapshot::Snapshot;
+use crate::model::Snapshot;
 use crate::shell::{Ask, ViewContent, Views};
 
-pub use about::{AboutView, GuidesView, LabView};
+pub use about::{AboutView, LabView};
 pub use cant_hear::CantHearView;
 pub use missing::{CheckView, MissingView};
 pub use music_assistant::MusicAssistantView;
@@ -55,7 +57,7 @@ impl Views for SettingsViews {
             Open::Settings => Box::new(SettingsView::new(port)),
             Open::SpeakerMissing => Box::new(MissingView::new(port)),
             Open::AddByAddress => Box::new(MissingView::new(port).to_add()),
-            Open::CantHear(_) => Box::new(CantHearView::new(port)),
+            Open::CantHear(target) => Box::new(CantHearView::for_speaker(port, target.clone())),
             Open::MusicAssistantSettings | Open::MusicAssistantHowTo => Box::new(MusicAssistantView::new(port)),
             Open::WhatsNew => Box::new(AboutView::new(port)),
             _ => return None,

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::facts::DelayChoice;
-use super::snapshot::Snapshot;
+use super::situation::WayChoice;
+use super::Snapshot;
 use super::state::{PcOutputId, Place, SpeakerId};
 
 /// The surface a command came from (kept with delay changes, for the
@@ -26,21 +27,12 @@ pub enum Surface {
 /// One request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// Play on a place: a row, the tray, the phone, `play`, a notice's or
-    /// notification's button. The latest choice wins.
-    Play(Place),
     /// Play on a speaker that is playing something else, taking it over:
     /// the answer to the row's question, or *Play on Kitchen again* after
     /// a takeover.
     PlayTakingOver(SpeakerId),
-    /// Make one of Windows' outputs the one This PC means, and play there.
-    PlayOnPcOutput(PcOutputId),
     /// Open or close the list of This PC's outputs under its row.
     ShowPcOutputs(bool),
-    /// Stop the connection being made; the sound stays where it is.
-    CancelConnect,
-    /// Leave a busy speaker alone (*Cancel* on its row's question).
-    DismissQuestion(SpeakerId),
     /// Keep the sound on this PC and stop waiting to return or asking.
     StayOnThisPc,
     /// Set the volume the volume row shows. `owner` guards against a slider
@@ -64,31 +56,89 @@ pub enum Command {
     /// The panel was opened or closed (notifications wait while it is open;
     /// badges for things already shown clear).
     PanelShown(bool),
-    /// The Settings window came to the front or left it.
-    SettingsShown(bool),
+    /// The ordinary window was closed and the app continues in the tray.
+    WindowClosed,
     /// Give Windows' output back to this PC and let the speaker go, as
     /// Setup does before it updates the app.
     Release { for_update: bool },
     Quit,
-    /// An answer in first run.
-    FirstRun(FirstRunAct),
+
+    /// A person's switch: a row, a tray entry, a *Switch to …* button, the
+    /// phone page, the command line, the API. `way` is the way to use
+    /// (a part of the delay block, a right-click entry); `None` uses the
+    /// way last chosen for that speaker. It takes effect when the speaker
+    /// is ready and, where the app asks first, confirmed.
+    Switch { place: Place, way: Option<WayChoice> },
+    /// The speaker named by `--player` appeared. Give way to any newer pick.
+    PlayWhenListed { speaker: SpeakerId, picks_seen: u64 },
+    /// A switch to This PC on one of its outputs (one of This PC's outputs
+    /// under its row).
+    SwitchOutput(PcOutputId),
+    /// *Try Kitchen again*: a switch to that speaker, tried once.
+    TryAgain(SpeakerId),
+    /// *Cancel* while a switch connects: the sound stays where it is.
+    CancelSwitch,
+    /// The answer to the confirmation that shows (*Switch to Kitchen* or
+    /// *Play a test chime*: `yes`; *Cancel* or ×: not).
+    Confirm { yes: bool },
+    /// The × of the note that says why the sound is on this PC: the note
+    /// goes, and the sound stays where it is.
+    CloseNote,
+    /// The × of a pop-up by the clock: only the pop-up goes.
+    ClosePopup,
+    /// A way or base delay chosen in the delay block or a row's menu: for
+    /// the place's speaker a switch to that way, for another speaker the
+    /// way its next switch uses.
+    ChooseWay { speaker: SpeakerId, way: WayChoice },
+    /// *Play a test chime*: a chime on that speaker only, whatever the
+    /// place. `confirmed` when the person already answered the speaker's
+    /// confirmation.
+    PlayChime { speaker: SpeakerId, confirmed: bool },
+    /// The delay block's offer after the sound cut out: `take` for *Add 50
+    /// ms* (or the steady delay), not for its ×.
+    DelayOffer { speaker: SpeakerId, take: bool },
+    /// *Set the delay…*: the delay itself, in ms.
+    SetDelay { speaker: SpeakerId, ms: u32 },
+    /// *Use it* beside *Default: 200 ms*.
+    UseDefaultDelay(SpeakerId),
+    /// *Remove Kitchen…*, answered: the speaker and its settings go.
+    RemoveSpeaker(SpeakerId),
+    /// *Reset Kitchen's settings…*, answered.
+    ResetSpeaker(SpeakerId),
+    /// An act in first run.
+    FirstRunAction(FirstRunAction),
+    /// Setup's `release`: before an update (`for_update`; `new_driver` when
+    /// it also replaces the sound driver) or at uninstall.
+    ReleaseWindows { for_update: bool, new_driver: bool },
 }
 
 /// What a person does in first run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FirstRunAct {
-    /// *Not now*: first run ends; the sound stays on this PC.
-    NotNow,
-    /// ×: first run pauses at this step until the panel opens again.
-    Close,
-    /// *Play it again*: the chime once more.
-    PlayChimeAgain,
-    /// *I heard it*. (*I didn't hear it* opens the "Can't hear it?" check.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FirstRunAction {
+    /// A click on a row in step 1: a chime on that speaker only.
+    Chime(SpeakerId),
+    /// *Play it again* in step 2.
+    ChimeAgain,
+    /// Volume for the next test chime on this speaker.
+    ChimeVolume(u8),
+    /// *I heard it*: the speaker becomes the place.
     Heard,
-    /// The switch *Start when I sign in, and go back to Kitchen*.
+    /// *Use Kitchen without checking*: the speaker becomes the place.
+    UseWithoutChecking,
+    /// *I didn't hear it*: the playback check opens; first run stays on
+    /// step 2.
+    DidntHear,
+    /// *Choose another speaker* (or *Cancel* in a code window): back to
+    /// step 1.
+    ChooseAnother,
+    /// The × of a step: first run ends.
+    Close,
+    /// The switch *Start when I sign in to Windows*.
     StartAtSignIn(bool),
     /// *Done*.
     Done,
+    /// *Show the welcome again*: first run from step 1.
+    ShowAgain,
 }
 
 /// What a delay button or command asks for.
@@ -126,7 +176,7 @@ pub enum NoticeKind {
 /// Something to open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Open {
-    /// The panel.
+    /// The ordinary window, showing the panel.
     Panel,
     Settings,
     /// A speaker's page in Settings.
@@ -149,10 +199,6 @@ pub enum Open {
     VolumeMixer,
     /// Windows: the network's settings (to make it private).
     NetworkSettings,
-    /// The repair of the sound output (asks for administrator approval).
-    Repair,
-    /// Restart Windows (after asking).
-    RestartWindows,
 }
 
 /// Why a command did nothing.
@@ -169,7 +215,15 @@ pub enum Refusal {
     UnknownPlace { name: String },
     /// A receiver that announces another speaker's identity plays only
     /// when a person picks it in the app's own window.
+    /// Also the answer to a switch from the phone page, the command line or
+    /// the API that would need a confirmation: only the app's own windows
+    /// ask one, so nothing changed.
     OnlyFromWindow { speaker: SpeakerId },
+    /// The command belongs to the app's own windows (a confirmation's
+    /// answer where it shows, first run, the × of a note or a pop-up,
+    /// removing or resetting a speaker) and came from elsewhere: nothing
+    /// changed.
+    WindowOnly,
 }
 
 /// What a delay change did, for its confirmation and the command line.

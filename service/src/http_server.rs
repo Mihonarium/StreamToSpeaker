@@ -7,8 +7,8 @@
 //!      probe renderers send first.
 //!   2. `NOTIFY ...` — GENA event callbacks from the speaker we hold a
 //!      subscription with.
-//!   3. The optional web UI and JSON API (`/r/<key>/`, `/api/*`), both
-//!      needing the key in the web UI's link (see `web_access`).
+//!   3. The optional web UI and JSON API (`/r/<key>/`, `/api/*`), with
+//!      separate switches for phone and script access (see `web_access`).
 //!
 //! The PCM stream is fed by a single producer thread (audio path) that
 //! broadcasts each packet to all current subscribers via a fan-out.
@@ -421,8 +421,19 @@ pub fn start_http_server(cfg: HttpServerConfig) -> Result<u16> {
     let actual = listener.local_addr().map(|a| a.port()).unwrap_or(bind.port());
     info!("HTTP server listening on {}", actual);
 
+    serve_on(listener, cfg, || false)?;
+    Ok(actual)
+}
+
+/// Serve an already bound socket. A scoped server can wake accept after
+/// setting `stopped` and join the listener when it is finished with it.
+pub(crate) fn serve_on(
+    listener: TcpListener,
+    cfg: HttpServerConfig,
+    stopped: impl Fn() -> bool + Send + 'static,
+) -> Result<thread::JoinHandle<()>> {
     let ctx = Arc::new(Ctx {
-        hosts: HostPolicy::new(bind.ip(), &cfg.extra_hosts, is_local_ip),
+        hosts: HostPolicy::new(cfg.bind.ip(), &cfg.extra_hosts, is_local_ip),
         hub: cfg.hub,
         gena_callback: cfg.gena_callback,
         speaker_list: cfg.speaker_list,
@@ -437,10 +448,8 @@ pub fn start_http_server(cfg: HttpServerConfig) -> Result<u16> {
     });
     thread::Builder::new()
         .name("stream-to-speaker-http".to_string())
-        .spawn(move || accept_loop(listener, ctx))
-        .context("spawning HTTP server thread")?;
-
-    Ok(actual)
+        .spawn(move || accept_loop(listener, ctx, stopped))
+        .context("spawning HTTP server thread")
 }
 
 fn is_local_ip(ip: IpAddr) -> bool {
@@ -464,11 +473,12 @@ struct Ctx {
     notify_lock: Mutex<()>,
 }
 
-fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
+fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>, stopped: impl Fn() -> bool) {
     let limiter = Arc::new(ConnLimiter::default());
     let mut last_error_log: Option<Instant> = None;
     loop {
         match listener.accept() {
+            _ if stopped() => return,
             Ok((stream, peer)) => {
                 let speaker = ctx.speaker_peer.as_ref().is_some_and(|f| f(peer.ip()));
                 // This PC's own clients (the local web UI, tools) are
@@ -665,6 +675,14 @@ impl Ctx {
                 }
             }
             ("GET", "/healthz", _) => Reply::text(200, "ok"),
+            // The test chime, for a speaker that plays it beside the place:
+            // no sound of this PC's, so no stream gate.
+            ("GET" | "HEAD", crate::app::CHIME_PATH, _) => Reply {
+                status: 200,
+                content_type: Some("audio/wav"),
+                headers: Vec::new(),
+                body: chime_wav(),
+            },
             // `/`, `/app.js` and everything under the link's prefix,
             // whatever the key.
             ("GET", p, _) if p == "/" || p == "/app.js" || p.starts_with(LINK_PREFIX) => self.page(p),
@@ -722,11 +740,11 @@ impl Ctx {
         reply.private()
     }
 
-    /// The JSON API. Every route needs the web UI's key as a bearer token;
+    /// The JSON API. Every route needs an enabled phone or scripts key as a bearer token;
     /// the state-changing ones are also refused to other sites' pages.
     fn api(&self, conn: &mut Conn, head: &Head, path: &str, body_read: &mut bool) -> Reply {
-        let Some(access) = self.web_on() else {
-            return Reply::error(404, "web UI is disabled — enable it in the GUI");
+        let Some(access) = self.web_access.as_deref().filter(|a| a.api_enabled()) else {
+            return Reply::error(404, "API access is off. In Settings turn on Control from your phone or Let scripts and home automation control this app.");
         };
         if !access.bearer_ok(head.header("authorization")) {
             debug!("http: refused {} {} from {}: no valid API key", head.method, path, conn.peer.ip());
@@ -737,9 +755,9 @@ impl Ctx {
             // show UTF-8.
             return Reply::unauthorized(
                 "missing or wrong API key: send the header 'Authorization: Bearer' followed by a \
-                 space and the key, the 32 hex digits after /r/ in the web UI's link. The Stream \
-                 To Speaker window shows the link in its Web UI card, and stream-to-speaker.exe \
-                 --web-link prints it",
+                 space and an enabled key. In Settings use Copy key under Let scripts and home \
+                 automation control this app, or use the 32 hex digits after /r/ in the Control \
+                 from your phone link",
             );
         }
         if head.method == "GET" {
@@ -1795,7 +1813,7 @@ const LINK_NEEDED_HTML: &str = r#"<!doctype html>
 </head><body>
 <h1>Stream To Speaker</h1>
 <p>The web UI opens only from its link, which holds a secret key. On the PC,
-open Stream To Speaker and use <b>Copy link</b> in its Web UI card. If it runs
+open Settings and use <b>Copy link</b> under <b>Control from your phone</b>. If it runs
 without a window (<code>--headless</code>, or as a service), run
 <code>stream-to-speaker.exe --web-link</code> as the Windows account it runs
 under: that prints the link.</p>
@@ -1809,7 +1827,7 @@ const WEB_UI_OFF_HTML: &str = r#"<!doctype html>
 <style>body { font-family: -apple-system, system-ui, Segoe UI, sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }</style>
 </head><body>
 <h1>Stream To Speaker</h1>
-<p>The web UI is off. Turn it on in the Stream To Speaker window (Web UI card),
+<p>The web UI is off. Turn on <b>Control from your phone</b> in Settings,
 or start the app with <code>--web</code>, then open its link: the window shows
 it, and <code>stream-to-speaker.exe --web-link</code> prints it.</p>
 </body></html>"#;
@@ -2127,6 +2145,28 @@ impl Read for StreamReader {
         self.leftover_pos += n;
         Ok(n)
     }
+}
+
+/// The test chime as a complete WAV file (the wire's format).
+fn chime_wav() -> Vec<u8> {
+    let data = samples_to_wav_le_bytes(&crate::app::chime_pcm(crate::WIRE_CHANNELS));
+    let channels = crate::WIRE_CHANNELS as u32;
+    let rate = crate::WIRE_SAMPLE_RATE;
+    let mut out = Vec::with_capacity(44 + data.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&(channels as u16).to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * channels * 2).to_le_bytes());
+    out.extend_from_slice(&((channels * 2) as u16).to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&data);
+    out
 }
 
 /// Samples as WAV data: 16-bit little-endian, the byte order of a RIFF
@@ -3171,9 +3211,8 @@ mod tests {
         // escapes, quotes with a backslash.
         let expected = concat!(
             r#"{"error":"missing or wrong API key: send the header 'Authorization: Bearer' "#,
-            r#"followed by a space and the key, the 32 hex digits after /r/ in the web UI's "#,
-            r#"link. The Stream To Speaker window shows the link in its Web UI card, and "#,
-            r#"stream-to-speaker.exe --web-link prints it"}"#,
+            r#"followed by a space and an enabled key. In Settings use Copy key under Let scripts and home "#,
+            r#"automation control this app, or use the 32 hex digits after /r/ in the Control from your phone link"}"#,
         );
         let srv = api_server();
         for req in [
@@ -3263,7 +3302,7 @@ mod tests {
         assert!(page.contains("--web-link"), "{page}");
         assert!(!page.contains("data-select"));
         let api = get(srv.port, "/api/speakers", &auth());
-        assert!(api.starts_with("HTTP/1.1 404") && api.contains("web UI is disabled"), "{api}");
+        assert!(api.starts_with("HTTP/1.1 404") && api.contains("API access is off"), "{api}");
         // No web access configured at all: the same.
         let (port, _hub) = minimal();
         assert!(get(port, &format!("/r/{KEY}/"), "").starts_with("HTTP/1.1 404"));

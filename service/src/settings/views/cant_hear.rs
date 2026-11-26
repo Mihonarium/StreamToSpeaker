@@ -6,8 +6,8 @@ use std::sync::Arc;
 use egui::Ui;
 
 use crate::model::command::{Command, VolumeOwner};
-use crate::model::snapshot::Snapshot;
-use crate::model::state::{Place, SpeakerId};
+use crate::model::Snapshot;
+use crate::model::state::SpeakerId;
 use crate::shell::{Ask, ViewBar, ViewContent};
 use crate::ui::button::Button;
 use crate::ui::text::{Para, Tone};
@@ -22,11 +22,16 @@ use crate::settings::{Dialog, ReportDialog};
 
 pub struct CantHearView {
     port: Arc<dyn SettingsPort>,
+    target: Option<SpeakerId>,
 }
 
 impl CantHearView {
     pub fn new(port: Arc<dyn SettingsPort>) -> Self {
-        CantHearView { port }
+        Self::for_speaker(port, None)
+    }
+
+    pub fn for_speaker(port: Arc<dyn SettingsPort>, target: Option<SpeakerId>) -> Self {
+        CantHearView { port, target }
     }
 }
 
@@ -38,12 +43,23 @@ impl ViewContent for CantHearView {
     fn show(&mut self, ui: &mut Ui, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) {
         let lang = self.port.lang();
         ui.spacing_mut().item_spacing.y = 8.0;
+        if let Some(crate::model::situation::FirstRunStep::Two { speaker, level, limit }) = &snap.scene.situation.first_run {
+            if self.target.as_ref() == Some(speaker) {
+                // The test session reached this speaker. The live playback chain
+                // belongs to the current place and cannot diagnose this chime.
+                let name = snap.scene.speaker_name(speaker);
+                check_line(ui, Found::Good, &w!(lang, FirstChimeSent, speaker = &name), None, |_| ());
+                super::first_run::chime_volume(ui, snap, &name, *level, *limit, ask);
+                sentence(ui, &w!(lang, SetCheckCantHearRoom, speaker = &name));
+                if Button::standard(&w!(lang, PlayTestChime)).show(ui).clicked() {
+                    ask(Ask::Command(Command::FirstRunAction(crate::model::command::FirstRunAction::ChimeAgain)));
+                }
+                return;
+            }
+        }
         let c = self.port.playback_check();
         // The speaker the sound is on, for the actions that go to it.
-        let id: Option<SpeakerId> = match snap.state.current_place() {
-            Some(Place::Speaker(id)) => Some(id),
-            _ => None,
-        };
+        let id: Option<SpeakerId> = snap.scene.situation.place_speaker().cloned();
         let Some(speaker) = c.speaker.clone() else {
             check_line(ui, Found::Info, &w!(lang, SetCheckOnPc), Some(&w!(lang, SetCheckOnPcLineView)), |_| ());
             return;
@@ -62,7 +78,7 @@ impl ViewContent for CantHearView {
                     all_good = false;
                     check_line(ui, Found::Bad, &w!(lang, ReadyLine), None, |ui| {
                         if let Some(id) = &id {
-                            if Button::standard(&w!(lang, SetTestSoundButton)).show(ui).clicked() {
+                            if Button::standard(&w!(lang, PlayTestChime)).show(ui).clicked() {
                                 send(ask, Command::PlayTestSound(id.clone()));
                             }
                         }
@@ -108,7 +124,7 @@ impl ViewContent for CantHearView {
         // 4. Taking the sound.
         if let Some(r) = &c.taking {
             let reconnect = |ui: &mut Ui, ask: &mut dyn FnMut(Ask)| {
-                if Button::standard(&w!(lang, SetReconnect)).show(ui).clicked() {
+                if Button::standard(&w!(lang, TrySpeakerAgain, speaker = &speaker)).max_width(ui.max_rect().width()).show(ui).clicked() {
                     match &id {
                         Some(id) => ask(Ask::Command(Command::Reconnect(id.clone()))),
                         None => self.port.act(Act::Reconnect),
@@ -134,7 +150,8 @@ impl ViewContent for CantHearView {
                     check_line(ui, Found::Bad, &w!(lang, SetCheckNotAsking, speaker = &speaker), None, |ui| {
                         buttons(ui, |ui| {
                             reconnect(ui, ask);
-                            if *two_ways && Button::standard(&w!(lang, SetTryAirPlay)).show(ui).clicked() {
+                            if *two_ways && Button::standard(&w!(lang, SwitchByWay, speaker = &speaker, way = &w!(lang, KindAirPlay)))
+                                .max_width(ui.max_rect().width()).show(ui).clicked() {
                                 self.port.act(Act::TryAirPlay);
                             }
                         });
@@ -194,7 +211,7 @@ impl ViewContent for CantHearView {
             let _ = Para::new(&text).lead(&w!(lang, SetCheckAllGood)).size(size::SECONDARY).tone(Tone::Primary).show(ui);
             buttons(ui, |ui| {
                 if let Some(id) = &id {
-                    if Button::standard(&w!(lang, SetTestSoundButton)).show(ui).clicked() {
+                    if Button::standard(&w!(lang, PlayTestChime)).show(ui).clicked() {
                         send(ask, Command::PlayTestSound(id.clone()));
                     }
                 }

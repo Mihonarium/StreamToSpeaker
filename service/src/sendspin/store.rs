@@ -20,14 +20,21 @@ pub const MAX_CLIENT_RECORDS: usize = 8;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SendspinConfig {
-    /// Sendspin is opt-in: off (the default) means no Sendspin speaker
-    /// discovery and no Music Assistant input.
+    /// Sendspin speakers are opt-in: off (the default) means no Sendspin
+    /// speaker discovery. The Music Assistant input has a switch of its
+    /// own (`source_enabled`).
     #[serde(default)]
     pub enabled: bool,
     /// Act as a Sendspin source for Music Assistant (advertise
     /// `_sendspin._tcp` and stream system audio when a server asks).
     #[serde(default)]
     pub source_enabled: bool,
+    /// `source_enabled` is the input's own switch, whatever `enabled`
+    /// says. Settings from earlier versions, which ran the input only
+    /// while `enabled` was on as well, don't have it (see
+    /// [`SendspinConfig::upgrade_source_switch`]).
+    #[serde(default)]
+    pub source_own_switch: bool,
     /// Name shown in Music Assistant; `None` = the computer's name.
     #[serde(default)]
     pub source_name: Option<String>,
@@ -83,6 +90,24 @@ pub struct PlayerPairing {
 }
 
 impl SendspinConfig {
+    /// Settings from an earlier version, where the Music Assistant input
+    /// ran only while Sendspin was on as well: the input stays on only if
+    /// Sendspin was, so that nobody gets a listening port and an
+    /// advertisement they didn't have before. From then on
+    /// `source_enabled` is the input's own switch. Returns whether the
+    /// input was turned off, which the caller then saves.
+    pub fn upgrade_source_switch(&mut self) -> bool {
+        if self.source_own_switch {
+            return false;
+        }
+        self.source_own_switch = true;
+        let off = self.source_enabled && !self.enabled;
+        if off {
+            self.source_enabled = false;
+        }
+        off
+    }
+
     /// Our client private key, generating (and returning `true` for
     /// "changed, save me") on first use.
     pub fn ensure_client_key(&mut self) -> ([u8; 32], bool) {
@@ -256,6 +281,7 @@ mod tests {
             "player_extra_latency_ms",
             "source_enabled",
             "source_name",
+            "source_own_switch",
         ];
         let mut expected: Vec<&str> =
             settings.iter().copied().chain(groups.iter().flat_map(|g| g.fields.iter().copied())).collect();

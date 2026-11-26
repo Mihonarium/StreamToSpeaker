@@ -193,7 +193,7 @@ pub fn is_busy(state: &str, uri: &str, ours: &str) -> bool {
 }
 
 /// Another PC running this app, named in a stream title it gave a speaker
-/// ("LAPTOP-ANNA via Stream To Speaker").
+/// ("LAPTOP-7Q2K via Stream To Speaker").
 pub fn other_pc_in_title(title: &str) -> Option<String> {
     let suffix = format!(" via {}", crate::PRODUCT_NAME);
     title.strip_suffix(&suffix).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
@@ -401,8 +401,8 @@ pub(crate) enum Failure {
     Refused { status: String, fault: Option<Fault> },
 }
 
-/// The UPnP error a refusal carries (\[UDA\], the UPnP Device Architecture,
-/// 3.2.5: `<UPnPError>` with `<errorCode>` and `<errorDescription>`). The
+/// The UPnP error a refusal carries: the `<UPnPError>` in its SOAP fault,
+/// with an `<errorCode>` (714, say) and an `<errorDescription>`. The
 /// description is the device's own text, shown only through
 /// [`Fault::describe`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -614,6 +614,7 @@ fn soap_post(
     if resp.status != 200 {
         return Err(fail(Failure::Refused { status: resp.status_text(), fault: Fault::parse(&resp.body) }));
     }
+    crate::engine::cancel::speaker_answered();
     Ok(String::from_utf8_lossy(&resp.body).into_owned())
 }
 
@@ -1010,9 +1011,9 @@ mod tests {
         assert!(!is_busy("STOPPED", "x-sonos-http:radio.mp3", ours));
         assert!(!is_busy("PAUSED_PLAYBACK", "x-sonos-http:radio.mp3", ours));
         assert!(!is_busy("PLAYING", "", ours));
-        assert_eq!(other_pc_in_title("LAPTOP-ANNA via Stream To Speaker").as_deref(), Some("LAPTOP-ANNA"));
+        assert_eq!(other_pc_in_title("LAPTOP-7Q2K via Stream To Speaker").as_deref(), Some("LAPTOP-7Q2K"));
         assert_eq!(other_pc_in_title("Bohemian Rhapsody"), None);
-        let meta = "&lt;DIDL-Lite xmlns:dc=&quot;http://purl.org/dc/elements/1.1/&quot;&gt;&lt;item&gt;&lt;dc:title&gt;LAPTOP-ANNA via Stream To Speaker&lt;/dc:title&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;";
-        assert_eq!(didl_title(meta).as_deref(), Some("LAPTOP-ANNA via Stream To Speaker"));
+        let meta = "&lt;DIDL-Lite xmlns:dc=&quot;http://purl.org/dc/elements/1.1/&quot;&gt;&lt;item&gt;&lt;dc:title&gt;LAPTOP-7Q2K via Stream To Speaker&lt;/dc:title&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;";
+        assert_eq!(didl_title(meta).as_deref(), Some("LAPTOP-7Q2K via Stream To Speaker"));
     }
 }

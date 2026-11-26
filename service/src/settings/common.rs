@@ -2,7 +2,6 @@
 
 use crate::model::text::{Lang, Number};
 
-use super::port::*;
 use super::words::w;
 
 /// *−2 dB*, *+1 dB*, *0 dB*.
@@ -17,30 +16,6 @@ pub fn speaker_db(lang: Lang, v: f32) -> String {
     } else {
         w!(lang, SetDbZero)
     }
-}
-
-/// How a change of a speaker's delay applies, and how far it can go.
-pub fn delay_details(lang: Lang, v: &SpeakerView, d: &DelayCard) -> Vec<String> {
-    let name = v.row.name.as_str();
-    let s = &d.status;
-    let mut out = Vec::new();
-    match (v.row.kind.clone(), s.applies) {
-        (SpeakerKind::HomePodPair, _) => out.push(w!(lang, SetAppliesPair, speaker = name)),
-        (_, Ok(Applies::Live)) if d.at_once => out.push(w!(lang, SetAppliesAtOnce, speaker = name)),
-        (_, Ok(Applies::Live)) => out.push(w!(lang, SetAppliesLive, speaker = name)),
-        (_, Ok(Applies::Reconnect)) => out.push(w!(lang, SetAppliesReconnect, speaker = name)),
-        (_, Err(_)) => out.push(w!(lang, SetRemembered, speaker = name)),
-    }
-    if let Some(l) = s.limits {
-        let line = match (s.choice, l.remove_ms) {
-            (_, 0) => w!(lang, SetRangeAddOnly, speaker = name, add = l.add_ms),
-            (Some(DelayChoice::Steady), _) => w!(lang, SetRangeSteady, speaker = name, remove = l.remove_ms, add = l.add_ms),
-            (Some(DelayChoice::Short), _) => w!(lang, SetRangeShort, speaker = name, remove = l.remove_ms, add = l.add_ms),
-            (None, _) => w!(lang, SetRange, speaker = name, remove = l.remove_ms, add = l.add_ms),
-        };
-        out.push(line);
-    }
-    out
 }
 
 /// *482 917*: a six-digit code in two groups of three.

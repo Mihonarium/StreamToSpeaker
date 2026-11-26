@@ -177,6 +177,61 @@ impl Icon {
         }
     }
 
+    /// Filled status mark with a contrasting symbol, for the compact flyout.
+    pub(crate) fn paint_badge(self, p: &Painter, r: Rect, fill: Color32, ink: Color32) {
+        let c = r.center();
+        let k = r.width() / 16.0;
+        let at = |x, y| c + Vec2::new(x, y) * k;
+        let (stem, dot) = match self {
+            Icon::Warning => {
+                p.add(Shape::convex_polygon(vec![at(0.0, -6.7), at(7.4, 6.4), at(-7.4, 6.4)], fill, Stroke::NONE));
+                ((-2.0, 1.5), 3.8)
+            }
+            Icon::Info => {
+                p.circle_filled(c, 7.5 * k, fill);
+                ((-0.4, 3.4), -3.1)
+            }
+            _ => return self.paint(p, r, fill),
+        };
+        stroke_polyline(p, vec![at(0.0, stem.0), at(0.0, stem.1)], false, Stroke::new(1.5*k, ink));
+        p.circle_filled(at(0.0, dot), 0.9*k, ink);
+    }
+
+    /// The compact flyout speaker family, with both drivers visible on a pair.
+    pub(crate) fn paint_flyout(self, p: &Painter, r: Rect, ink: Color32) {
+        let k = r.width() / 20.0;
+        let stroke = Stroke::new(1.15*k, ink);
+        let speaker = |x, w, h| {
+            let c = r.center() + Vec2::new(x*k, 0.0);
+            p.rect_stroke(Rect::from_center_size(c, Vec2::new(w,h)*k), 2.0*k, stroke);
+            p.circle_stroke(c + Vec2::new(0.0,1.8*k), (w*0.27)*k, stroke);
+            p.circle_filled(c - Vec2::new(0.0,3.3*k), 1.2*k, ink);
+        };
+        match self {
+            Icon::Speaker => speaker(0.0, 8.0, 13.2),
+            Icon::Pair | Icon::Group => {
+                speaker(-4.1, 6.6, 12.8);
+                speaker(4.1, 6.6, 12.8);
+            }
+            Icon::Laptop => self.paint(p, r.shrink(k), ink),
+            _ => self.paint(p, r, ink),
+        }
+    }
+
+    /// Compact cog with six blunt teeth, readable in a 15-point slot.
+    pub(crate) fn paint_cog(p: &Painter, r: Rect, color: Color32) {
+        let mut outline = Vec::new();
+        for tooth in 0..6 {
+            for (angle, radius) in [(-30.0, 0.32), (-16.0, 0.32), (-10.0, 0.43), (10.0, 0.43), (16.0, 0.32)] {
+                let a = (tooth as f32 * 60.0 + angle).to_radians();
+                outline.push(r.center() + Vec2::angled(a) * (radius * r.width()));
+            }
+        }
+        let stroke = Stroke::new(1.0_f32, color);
+        p.add(Shape::closed_line(outline, stroke));
+        p.circle_stroke(r.center(), r.width() * 0.13, stroke);
+    }
+
     /// Draw the icon filling the square `rect` with lines of `color`.
     pub fn paint(self, painter: &Painter, rect: Rect, color: Color32) {
         self.paint_weight(painter, rect, color, 1.5);
@@ -448,15 +503,26 @@ pub fn paint_mark(painter: &Painter, rect: Rect, ink: Color32, arcs: Color32, fa
 /// `time` is the clock in seconds (egui's input time), so a picture at a
 /// given time is always the same.
 pub fn paint_spinner(painter: &Painter, rect: Rect, color: Color32, time: f64) {
+    let r = rect.width().min(rect.height()) / 2.0;
+    spinner_arc(painter, rect, color, time, (r * 0.2).max(1.5), 0.75);
+}
+
+/// A short moving arc on a complete ring, readable beside small status text.
+pub(crate) fn paint_spinner_on_track(painter: &Painter, rect: Rect, color: Color32, track: Color32, time: f64) {
+    let width = 2.0;
+    painter.circle_stroke(rect.center(), (rect.width() - width) / 2.0, Stroke::new(width, track));
+    spinner_arc(painter, rect, color, time - 0.5, width, 0.25);
+}
+
+fn spinner_arc(painter: &Painter, rect: Rect, color: Color32, time: f64, width: f32, turns: f32) {
     use std::f32::consts::TAU;
     let r = rect.width().min(rect.height()) / 2.0;
-    let width = (r * 0.2).max(1.5);
     let radius = r - width / 2.0;
     let start = (time.fract() as f32) * TAU;
     let n = 36;
     let pts: Vec<Pos2> = (0..=n)
         .map(|i| {
-            let a = start + 0.75 * TAU * i as f32 / n as f32;
+            let a = start + turns * TAU * i as f32 / n as f32;
             rect.center() + radius * Vec2::new(a.cos(), a.sin())
         })
         .collect();

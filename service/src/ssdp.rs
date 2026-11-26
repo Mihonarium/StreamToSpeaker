@@ -937,6 +937,7 @@ pub fn http_get(url_str: &str, timeout: Duration) -> Result<String> {
     if resp.status != 200 {
         return Err(anyhow!("the device answered {}", resp.status_text()));
     }
+    crate::engine::cancel::speaker_answered();
     // Strip a UTF-8 BOM if the device sends one; roxmltree rejects BOMs.
     let body = resp.body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&resp.body);
 

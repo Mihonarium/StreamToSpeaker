@@ -289,7 +289,7 @@ impl Ap2Rtsp {
     }
 
     /// GET /info — the canonical first request of an AirPlay 2 session
-    /// (iOS sends it before pairing; spec 7.1.1). The response is a
+    /// (iOS sends it before pairing). The response is a
     /// receiver-capabilities plist; we log a couple of fields. Plaintext,
     /// pre-pairing.
     pub fn get_info(&mut self) -> Result<()> {
@@ -369,8 +369,9 @@ impl Ap2Rtsp {
     }
 
     /// FLUSHBUFFERED — flush the buffered stream up to (seq, ts); sent
-    /// before TEARDOWN when stopping a buffered session (spec 7.1.15;
-    /// `flushUntilSeq`/`flushUntilTS` are the required keys).
+    /// before TEARDOWN when stopping a buffered session, so the receiver
+    /// drops what it holds instead of playing it out. A receiver requires
+    /// both `flushUntilSeq` and `flushUntilTS`.
     pub fn flush_buffered(&mut self, until_seq: u32, until_ts: u32) -> Result<()> {
         let mut dict = plist::Dictionary::new();
         dict.insert("flushUntilSeq".into(), Value::Integer((until_seq as u64).into()));
@@ -960,6 +961,9 @@ impl Ap2Rtsp {
         let hard_deadline = Instant::now() + self.reply_wait_cap;
         loop {
             let parsed = parse_response(&mut self.rx_buf, self.strict);
+            if matches!(parsed, Ok(Some(_))) {
+                crate::engine::cancel::speaker_answered();
+            }
             match parsed {
                 Err(e) => {
                     self.poison();

@@ -45,6 +45,15 @@ pub fn look(ui: &Ui, response: &Response) -> Look {
 
 /// As [`look`], for a control whose accessible name is `name`.
 pub fn look_as(ui: &Ui, response: &Response, name: &str) -> Look {
+    resolve(ui, response, name, false)
+}
+
+/// For nested actions whose name starts with the row name ("Office’s settings").
+pub(crate) fn look_as_exact(ui: &Ui, response: &Response, name: &str) -> Look {
+    resolve(ui, response, name, true)
+}
+
+fn resolve(ui: &Ui, response: &Response, name: &str, exact: bool) -> Look {
     let enabled = response.enabled();
     let mut l = Look {
         hovered: enabled && response.hovered(),
@@ -57,7 +66,8 @@ pub fn look_as(ui: &Ui, response: &Response, name: &str) -> Look {
         let mut out = f.by_id.get(&response.id).cloned().unwrap_or_default();
         if !name.is_empty() {
             for (area, prefix, force) in &f.by_name {
-                if name.starts_with(prefix.as_str()) && area.contains_rect(response.rect) {
+                let matches = if exact { name == prefix } else { name.starts_with(prefix.as_str()) };
+                if matches && area.contains_rect(response.rect) {
                     out.push(*force);
                 }
             }

@@ -86,11 +86,11 @@ fn titled(ui: &Ui, left: f32, top: f32, width: f32, title: &str, description: Op
     let t = Theme::of(ui.ctx());
     let title_color = if enabled { t.c.text } else { t.c.text_disabled };
     let desc_color = if enabled { t.c.text_secondary } else { t.c.text_disabled };
-    let g = ui.painter().layout(title.to_owned(), t.font(size::CONTROL), title_color, width);
+    let g = crate::ui::text::page_wrap(ui, ui.painter().layout(title.to_owned(), t.font(size::CONTROL), title_color, width));
     let mut h = g.size().y;
     let mut out = vec![(egui::pos2(left, top), g, title_color)];
     if let Some(d) = description {
-        let dg = ui.painter().layout(d.to_owned(), t.font(size::CAPTION), desc_color, width);
+        let dg = crate::ui::text::page_wrap(ui, ui.painter().layout(d.to_owned(), t.font(size::CAPTION), desc_color, width));
         out.push((egui::pos2(left, top + h), dg.clone(), desc_color));
         h += dg.size().y;
     }

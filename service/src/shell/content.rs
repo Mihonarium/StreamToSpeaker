@@ -8,8 +8,8 @@ use egui::Vec2;
 
 use super::{Ask, Contents, WindowContent};
 use crate::model::command::Open;
-use crate::model::snapshot::Snapshot;
-use crate::model::state::{NowState, Secret, SpeakerId};
+use crate::model::Snapshot;
+use crate::model::state::{Secret, SpeakerId};
 use crate::settings::port::Wanted;
 use crate::settings::{Act, Dialog, PasswordDialog, SettingsPort};
 
@@ -34,7 +34,7 @@ impl WindowsPage {
 
 /// Whether `id` is the speaker that waits for its password now.
 fn wants_password(snap: &Snapshot, id: &SpeakerId) -> bool {
-    matches!(&snap.state, NowState::NeedsSecret { speaker, secret: Secret::Password } if speaker == id)
+    snap.scene.situation.secret_for(id) == Some(Secret::Password)
 }
 
 /// What a request to pair opens when it comes from outside the app's
@@ -65,7 +65,7 @@ impl SettingsContents {
 }
 
 fn name_of(snap: &Snapshot, id: &SpeakerId) -> String {
-    snap.names.iter().find(|(i, _)| i == id).map(|(_, n)| n.clone()).unwrap_or_else(|| id.as_str().to_string())
+    snap.scene.speaker_name(id)
 }
 
 impl Contents for SettingsContents {
@@ -95,10 +95,6 @@ impl Contents for SettingsContents {
             }
             Open::NetworkSettings => {
                 (self.open_windows_page)(WindowsPage::Network);
-                None
-            }
-            Open::Repair | Open::RestartWindows => {
-                log::warn!("{open:?} isn't available yet");
                 None
             }
             _ => None,
@@ -197,7 +193,7 @@ impl WantedGate {
 mod tests {
     use super::*;
     use crate::model::port::Port;
-    use crate::model::scripted::{Scenario, ScriptedEngine};
+    use crate::model::fake::ScriptedEngine;
     use crate::settings::port::{CodeAsk, CodeStage};
     use crate::settings::scripted::ScriptedSettings;
     use std::sync::Mutex;
@@ -213,7 +209,7 @@ mod tests {
         (SettingsContents { port: s.clone(), open_windows_page: record, needs_password: Box::new(|id| id == "office") }, s)
     }
 
-    fn snap(s: Scenario) -> Arc<Snapshot> {
+    fn snap(s: &str) -> Arc<Snapshot> {
         ScriptedEngine::new(s).snapshot()
     }
 
@@ -222,7 +218,7 @@ mod tests {
         use crate::shell::Views;
         let (c, s) = contents();
         let views = crate::settings::views::SettingsViews::new(s.clone());
-        let playing = snap(Scenario::Playing);
+        let playing = snap("kitchen-playing");
         for (open, title) in [
             (Open::Settings, "Settings"),
             (Open::SpeakerSettings(SpeakerId::new("kitchen")), "Kitchen"),
@@ -244,41 +240,30 @@ mod tests {
     fn pairing_asks_for_the_password_or_starts_from_the_window_and_windows_pages_open_outside() {
         let (c, s) = contents();
         // The scripted engine's speaker that asks for a password.
-        let needs = snap(Scenario::NeedsPairing);
-        if let NowState::NeedsSecret { speaker, secret } = &needs.state {
-            let got = c.open(&Open::Pair(speaker.clone()), &needs, true);
-            match secret {
-                Secret::Password => assert!(got.is_some(), "the password dialog"),
-                Secret::Code => {
-                    assert!(got.is_none());
-                    assert_eq!(s.take_acts(), vec![Act::PairAgain(speaker.as_str().to_string())]);
-                }
-            }
-        }
+        let needs = snap("pc-den-needs-code");
+        assert!(c.open(&Open::Pair(SpeakerId::new("den")), &needs, true).is_none());
+        assert_eq!(s.take_acts(), vec![Act::PairAgain("den".into())]);
         // Another speaker (a pairing the speaker forgot): pair again from
         // the window.
-        assert!(c.open(&Open::Pair(SpeakerId::new("den-tv")), &snap(Scenario::Playing), true).is_none());
+        assert!(c.open(&Open::Pair(SpeakerId::new("den-tv")), &snap("kitchen-playing"), true).is_none());
         assert_eq!(s.take_acts(), vec![Act::PairAgain("den-tv".into())]);
         // From elsewhere (a notification): the speaker's view, nothing
         // started; a password is asked for wherever the request comes from.
         assert_eq!(
-            pair_from_outside(&Open::Pair(SpeakerId::new("den-tv")), &snap(Scenario::Playing), false),
+            pair_from_outside(&Open::Pair(SpeakerId::new("den-tv")), &snap("kitchen-playing"), false),
             Some(Open::SpeakerSettings(SpeakerId::new("den-tv")))
         );
-        assert_eq!(pair_from_outside(&Open::Pair(SpeakerId::new("den-tv")), &snap(Scenario::Playing), true), None);
-        let engine = ScriptedEngine::new(Scenario::Playing);
-        let mut f = engine.facts();
-        f.state = NowState::NeedsSecret { speaker: SpeakerId::new("office"), secret: Secret::Password };
-        engine.set_facts(f);
+        assert_eq!(pair_from_outside(&Open::Pair(SpeakerId::new("den-tv")), &snap("kitchen-playing"), true), None);
+        let engine = ScriptedEngine::new("pc-office-needs-password");
         let asking = engine.snapshot();
         assert_eq!(pair_from_outside(&Open::Pair(SpeakerId::new("office")), &asking, false), None);
         assert!(c.open(&Open::Pair(SpeakerId::new("office")), &asking, false).is_some(), "the password dialog");
         assert!(s.take_acts().is_empty());
-        assert!(c.open(&Open::Donate, &snap(Scenario::Playing), true).is_none());
+        assert!(c.open(&Open::Donate, &snap("kitchen-playing"), true).is_none());
         assert_eq!(s.take_acts(), vec![Act::Donate]);
         OPENED.lock().unwrap().clear();
         for open in [Open::SoundSettings, Open::VolumeMixer, Open::NetworkSettings] {
-            assert!(c.open(&open, &snap(Scenario::Playing), true).is_none());
+            assert!(c.open(&open, &snap("kitchen-playing"), true).is_none());
         }
         assert_eq!(*OPENED.lock().unwrap(), vec![WindowsPage::Sound, WindowsPage::VolumeMixer, WindowsPage::Network]);
         assert!(WindowsPage::Sound.uri().starts_with("ms-settings:"));
@@ -287,7 +272,7 @@ mod tests {
     #[test]
     fn a_speaker_with_a_password_and_none_kept_asks_for_it_before_it_plays() {
         let (c, s) = contents();
-        let playing = snap(Scenario::Playing);
+        let playing = snap("kitchen-playing");
         assert!(c.before_play(&SpeakerId::new("kitchen"), &playing).is_none());
         let d = c.before_play(&SpeakerId::new("office"), &playing).expect("the password dialog");
         assert_eq!(d.title(&playing), Dialog::window_title(s.lang()));

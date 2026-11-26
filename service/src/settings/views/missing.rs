@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use egui::Ui;
 
-use crate::model::snapshot::Snapshot;
+use crate::model::Snapshot;
 use crate::shell::{Ask, ViewBar, ViewContent};
 use crate::ui::button::Button;
 use crate::ui::inputs::{Choice, TextField};

@@ -109,6 +109,20 @@ pub fn fetch_zone_groups(control_url: &str) -> anyhow::Result<Vec<ZoneGroup>> {
     Ok(parse_zone_group_state(&body))
 }
 
+/// The zone groups a ZoneGroupTopology event carries (its
+/// `ZoneGroupState` property, an escaped document); None for an event
+/// without one.
+pub fn parse_topology_notify(body: &str) -> Option<Vec<ZoneGroup>> {
+    let state = crate::gena::find_tag_text(body, "ZoneGroupState")?;
+    let groups = parse_zone_group_state(&crate::gena::decode_xml_text(&state));
+    (!groups.is_empty()).then_some(groups)
+}
+
+/// The event URL of ZoneGroupTopology, from its control URL.
+pub fn topology_event_url(control_url: &str) -> Option<String> {
+    control_url.strip_suffix("/Control").map(|base| format!("{base}/Event"))
+}
+
 /// Parse the (already entity-decoded) ZoneGroupState XML document.
 ///
 /// Shape (current firmware wraps it in `<ZoneGroupState><ZoneGroups>`,
@@ -719,6 +733,25 @@ pub(crate) fn location_host_addr(location: &str) -> Option<std::net::IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    /// The topology a Sonos sends as an event reads as its groups.
+    #[test]
+    fn a_topology_event_reads_as_its_groups() {
+        let inner = r#"<ZoneGroupState><ZoneGroups><ZoneGroup Coordinator="RINCON_L" ID="RINCON_L:1"><ZoneGroupMember UUID="RINCON_L" Location="http://192.168.1.20:1400/xml/device_description.xml" ZoneName="Living Room"/><ZoneGroupMember UUID="RINCON_K" Location="http://192.168.1.21:1400/xml/device_description.xml" ZoneName="Kitchen"/></ZoneGroup></ZoneGroups></ZoneGroupState>"#;
+        let escaped = inner.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+        let body = format!(
+            "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\"><e:property><ZoneGroupState>{escaped}</ZoneGroupState></e:property></e:propertyset>"
+        );
+        let groups = parse_topology_notify(&body).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].coordinator_uuid, "RINCON_L");
+        assert_eq!(groups[0].visible_member_names(), ["Living Room", "Kitchen"]);
+        assert!(parse_topology_notify("<e:propertyset><e:property><Other>1</Other></e:property></e:propertyset>").is_none());
+        assert_eq!(
+            topology_event_url("http://192.168.1.20:1400/ZoneGroupTopology/Control").as_deref(),
+            Some("http://192.168.1.20:1400/ZoneGroupTopology/Event")
+        );
+    }
+
     use super::*;
 
     #[test]

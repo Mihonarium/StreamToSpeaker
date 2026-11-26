@@ -165,14 +165,15 @@ pub fn report(
     now: &Snapshot,
     last_error: Option<&str>,
     fault: Option<&Fault>,
+    speakers: bool,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "{} v{} diagnostics", product, version);
     let _ = writeln!(s, "Taken at unix {}", now.taken_unix);
     let _ = writeln!(s);
     let _ = writeln!(s, "[now]");
-    write_rows(&mut s, now);
-    if let Some(e) = last_error {
+    write_rows(&mut s, now, speakers);
+    if let Some(e) = last_error.filter(|_| speakers) {
         let _ = writeln!(s, "Last message: {}", e);
     }
     let _ = writeln!(s);
@@ -182,10 +183,10 @@ pub fn report(
                 s,
                 "[last fault, {} s ago] {}",
                 now.taken_unix.saturating_sub(f.when_unix),
-                f.what
+                if speakers { &f.what } else { "connection fault" }
             );
             let _ = writeln!(s, "[statistics just before it]");
-            write_rows(&mut s, &f.before);
+            write_rows(&mut s, &f.before, speakers);
         }
         None => {
             let _ = writeln!(s, "[last fault] none this run");
@@ -194,8 +195,14 @@ pub fn report(
     s
 }
 
-fn write_rows(s: &mut String, snap: &Snapshot) {
+fn write_rows(s: &mut String, snap: &Snapshot, speakers: bool) {
     for (k, v) in snap.rows() {
+        // Only counters and fixed audio states can go into a report without speaker details.
+        if !speakers && !matches!(k, "App uptime" | "Session uptime" | "Packets sent"
+            | "  of which idle silence" | "Packets dropped (slow consumer)" | "Audio consumers"
+            | "Windows audio" | "Streaming enabled" | "Speakers listed") {
+            continue;
+        }
         let _ = writeln!(s, "{}: {}", k, v);
     }
 }
@@ -233,7 +240,7 @@ mod tests {
         };
         let before = Snapshot { packets_published: 777, ..now.clone() };
         let fault = Fault { when_unix: 990, what: "Lost connection to Kitchen".into(), before };
-        let text = report("App", "1.2.3", &now, Some("oops"), Some(&fault));
+        let text = report("App", "1.2.3", &now, Some("oops"), Some(&fault), true);
         assert!(text.starts_with("App v1.2.3 diagnostics"));
         assert!(text.contains("Speaker: Kitchen"));
         assert!(text.contains("AirPlay resend requests / packets: 3 / 40"));
@@ -245,7 +252,7 @@ mod tests {
 
     #[test]
     fn report_without_fault() {
-        let text = report("App", "1", &Snapshot::default(), None, None);
+        let text = report("App", "1", &Snapshot::default(), None, None, true);
         assert!(text.contains("[last fault] none this run"));
         assert!(text.contains("Speaker: —"));
     }

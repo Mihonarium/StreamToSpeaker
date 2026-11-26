@@ -4,9 +4,11 @@
 //! and turns what it knows into the model's snapshot.
 
 pub mod cancel;
-pub mod core;
 mod driver;
 mod facts;
+pub mod place;
+pub(crate) mod place_driver;
+pub mod signals;
 
 pub use driver::{Engine, Opener};
 

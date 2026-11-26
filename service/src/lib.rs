@@ -34,9 +34,8 @@ pub mod secret_store;
 pub mod update_check;
 pub mod stream_gate;
 pub mod web_access;
-pub mod gui_layout;
 pub mod ui;
-pub mod panel;
+pub mod surface;
 pub mod shell;
 pub mod fonts;
 pub mod manual_speakers;
@@ -51,10 +50,6 @@ pub mod wasapi_source;
 #[cfg(windows)]
 pub mod ioctl_source;
 
-#[cfg(windows)]
-pub mod gui;
-#[cfg(windows)]
-pub mod tray;
 #[cfg(windows)]
 pub mod endpoint_name;
 pub mod latest;
@@ -89,20 +84,26 @@ pub fn is_openable_url(url: &str) -> bool {
 /// Errors never quote the URL: some carry a key (the web UI's link).
 #[cfg(windows)]
 pub fn open_url(url: &str) -> std::io::Result<()> {
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     if !is_openable_url(url) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "refusing to open an address with characters the shell could misread",
         ));
     }
+    shell_open(std::ffi::OsStr::new(url))
+}
+
+#[cfg(windows)]
+pub(crate) fn shell_open(target: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     use windows_sys::Win32::System::Com::{
         CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
     };
     let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
     let verb = wide("open");
-    let file = wide(url);
+    let file: Vec<u16> = target.encode_wide().chain(Some(0)).collect();
     // ShellExecute may hand off to shell extensions that need COM; the
     // documented requirement is an apartment-threaded apartment. S_OK /
     // S_FALSE (already initialised as STA) both need a matching

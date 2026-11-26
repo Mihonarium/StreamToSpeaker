@@ -35,6 +35,15 @@ use crate::equalizer::EqSettings;
 pub struct UserConfig {
     #[serde(default)]
     pub last_speaker_id: Option<String>,
+    /// Where the sound plays, and what the app remembers about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound_place: Option<crate::engine::place::Kept>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub switch_back_after_quiet: bool,
+    #[serde(default = "default_true")]
+    pub notes_by_clock: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_lab: bool,
     /// The person chose This PC last: at the next start nothing goes back
     /// to `last_speaker_id` (which still names Windows' device).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -50,6 +59,9 @@ pub struct UserConfig {
     /// The list of This PC's outputs is open in the panel.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pc_outputs_open: bool,
+    /// The ordinary window’s inner height after a person resizes it, in points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_height: Option<f32>,
     /// The level this PC sends to Music Assistant (0–100); full when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ma_level: Option<u8>,
@@ -58,13 +70,6 @@ pub struct UserConfig {
     pub last_version_seen: Option<String>,
     #[serde(default)]
     pub onboarding_dismissed: bool,
-    /// User ticked "Always minimise to tray" in the close-confirm
-    /// modal. When true, future window-close events skip the modal
-    /// and silently minimise. Inconsistency with onboarding_dismissed
-    /// — which IS persisted — was confusing; this brings the close
-    /// preference into the same store.
-    #[serde(default)]
-    pub always_minimise_to_tray: bool,
     /// Unix seconds until which the donation prompt stays hidden.
     /// `None` = never shown yet (show it). Set 7 days out by "Remind me
     /// later", and far out once the user has followed the donate link —
@@ -138,6 +143,12 @@ pub struct UserConfig {
     /// `--web-link` may store one while the app runs.
     #[serde(default)]
     pub web_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scripts_key: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scripts_enabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub phone_enabled: bool,
     /// Catch-all preserving config keys this binary doesn't know about
     /// (a newer version's settings) across load→save round-trips. Without
     /// it, running an older build once silently strips them — which for
@@ -290,6 +301,9 @@ pub enum AutoConnect {
 /// Settings that apply to one speaker.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpeakerSettings {
+    /// The network where this speaker was last found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<crate::engine::place::NetId>,
     /// Left out of the speaker list (and the web API's), unless it's the
     /// one playing. Shown again with "Show hidden".
     #[serde(default)]
@@ -331,6 +345,9 @@ pub struct SpeakerSettings {
     /// whose level can't be read starts at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// When that level was last set or heard (seconds since 1970).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_at: Option<u64>,
     /// *Show song titles on Kitchen*; `None` follows `forward_now_playing`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub song_titles: Option<bool>,
@@ -529,6 +546,18 @@ impl UserConfig {
     #[cfg(test)]
     pub(crate) fn at_path(path: PathBuf) -> Self {
         Self { saves: Saves::AtPath(path), ..Self::default() }
+    }
+
+    /// The settings in the file at `path`, read as [`load_from`](Self::load_from)
+    /// reads them and saved back to that file instead of `config.json`, for
+    /// tests of what the app does with the file it starts with.
+    #[cfg(test)]
+    pub(crate) fn load_at_path(path: PathBuf) -> Self {
+        let mut c = Self::load_from(&path);
+        if matches!(c.saves, Saves::ToFile) {
+            c.saves = Saves::AtPath(path);
+        }
+        c
     }
 
     /// Load from `path`. A missing file is a fresh install. A file that
@@ -992,63 +1021,88 @@ impl LoadNotice {
 }
 
 /// What the reset notice calls each top-level setting, and whether that
-/// is the window's own text for it (`true`: a test finds it in the
-/// window's code) or a description of something the window doesn't show
+/// is what the app's views say for it (`true`: a test finds it, word for
+/// word, in the string table the views take their words from) or a
+/// description of something they don't show by a name of its own
 /// (`false`).
 const SETTING_LABELS: &[(&str, &str, bool)] = &[
     ("last_speaker_id", "The speaker used last", false),
     ("chose_this_pc", "The speaker used last", false),
     ("closed_for_update", "The speaker used last", false),
+    ("sound_place", "Where this PC's sound plays", false),
+    ("switch_back_after_quiet", "Switch back to this PC after 30 minutes with nothing playing", true),
+    ("show_lab", "Show Lab", true),
+    ("notes_by_clock", "Show notes by the clock about where the sound is playing", true),
     ("pc_output", "The output This PC plays on", false),
+    ("window_height", "Window height", false),
     ("pc_outputs_open", "This PC's outputs shown in the panel", false),
     ("ma_level", "The level sent to Music Assistant", false),
     ("last_version_seen", "What's new after an update", false),
-    ("onboarding_dismissed", "Getting started", true),
-    ("always_minimise_to_tray", "Always minimise to tray", true),
+    // Whether first run is done: nothing shows it as a setting.
+    ("onboarding_dismissed", "Getting started", false),
     ("donation_prompt_hidden_until", "The donation reminder", false),
-    ("auto_reconnect_on_launch", "Auto-connect to this speaker when the app launches", true),
-    ("prefer_realtime_airplay", "AirPlay 2 stream mode", true),
-    ("auto_reconnect_on_drop", "Reconnect automatically if the connection drops", true),
-    ("airplay_mfi_encryption", "AirPlay MFi encryption (experimental)", true),
+    ("auto_reconnect_on_launch", "…and go back to the speaker I was using", false),
+    ("prefer_realtime_airplay", "AirPlay 2 stream", true),
+    ("auto_reconnect_on_drop", "Bring the sound back to this PC when a speaker stops responding", false),
+    ("airplay_mfi_encryption", "Try MFi encryption (et=4) first", true),
     ("airplay_passwords", "AirPlay password", true),
-    ("airplay_pairings", "Paired with this PC by PIN", true),
+    ("airplay_pairings", "AirPlay pairing", false),
     ("airplay_controller_id", "This PC's AirPlay pairing identity", false),
     ("airplay_controller_seed_hex", "This PC's AirPlay pairing identity", false),
-    ("web_secret", "Web UI", true),
-    ("forward_now_playing", "Show now-playing on the speaker", true),
-    ("airplay_uncompressed_alac", "AirPlay uncompressed audio", false),
-    ("privacy_mode", "Privacy mode", true),
-    ("airplay_latency_ms", "AirPlay buffer (latency)", true),
-    ("airplay_homepod_buffered", "Use the buffered stream for single HomePods", true),
+    ("web_secret", "Control from your phone", true),
+    ("phone_enabled", "Control from your phone", true),
+    ("scripts_enabled", "Let scripts and home automation control this app", true),
+    ("scripts_key", "Scripts and home automation key", false),
+    // What a speaker without a choice of its own does (*Show song titles
+    // on Kitchen*).
+    ("forward_now_playing", "Show song titles", true),
+    ("airplay_uncompressed_alac", "Send uncompressed ALAC", true),
+    // Its switch says the opposite: on, privacy mode is off.
+    ("privacy_mode", "Let any device on this network listen", true),
+    ("airplay_latency_ms", "AirPlay buffer", true),
+    ("airplay_homepod_buffered", "Single HomePods use the buffered stream", true),
     ("airplay_homepod_latency_ms", "HomePod delay", true),
-    ("check_for_updates", "Check for updates", true),
+    ("check_for_updates", "Check for updates once a day", true),
     ("update_last_check_unix", "Check for updates", true),
     ("update_latest_tag", "Check for updates", true),
     ("update_latest_url", "Check for updates", true),
     ("update_skipped_tag", "Check for updates", true),
     ("update_banner_hidden_until", "Check for updates", true),
-    ("sendspin", "Sendspin and Music Assistant", true),
-    ("manual_speakers", "Speakers added by address", true),
-    ("discovery_adapter", "Discovery network adapter", true),
+    // Two switches shown apart (*Look for Sendspin speakers*, *Offer this
+    // PC to Music Assistant*) and the pairings: no one name of the views
+    // covers them all.
+    ("sendspin", "Sendspin and Music Assistant", false),
+    // The speakers are rows of the list; the views name only the way to
+    // add one (*Add a speaker by its address*).
+    ("manual_speakers", "Speakers added by address", false),
+    ("discovery_adapter", "Look for speakers on", true),
     ("speaker_settings", "Each speaker's settings", false),
-    ("equalizer", "Equalizer", true),
+    // The tone of every speaker without one of its own, shown only as
+    // that speaker's *Bass* and *Treble*.
+    ("equalizer", "Equalizer", false),
     ("delay_at_once", "Apply delay changes on Sonos and UPnP speakers", true),
 ];
 
 /// The same for a speaker's own settings (`speaker_settings.<id>.<key>`).
 const SPEAKER_LABELS: &[(&str, &str, bool)] = &[
-    ("hidden", "Hide this speaker from the list", true),
-    ("auto_connect", "Connect automatically", true),
-    ("airplay_latency_ms", "Own AirPlay buffer for this speaker", true),
+    ("network", "The network where the speaker was last found", false),
+    ("hidden", "Hide from the list", true),
+    // Kept for versions that offered automatic switching.
+    ("auto_connect", "When it gets the sound by itself", false),
+    // An earlier version's buffer, which gives the speaker its delay until
+    // the delay is changed (see `delay::upgrade`); not shown.
+    ("airplay_latency_ms", "Own AirPlay buffer for this speaker", false),
     ("delay_change_ms", "What was removed from or added to its delay", false),
     ("steady_delay_change_ms", "What was removed from or added to its delay", false),
     ("delay_choice", "Short delay or Steady", false),
     ("level", "The volume last used with it", false),
-    ("song_titles", "Show song titles", false),
+    ("level_at", "The volume last used with it", false),
+    ("song_titles", "Show song titles", true),
+    // Shown as *Bass*, *Treble* and the bands.
     ("tone", "Tone", false),
     ("last_played", "When it last played from this PC", false),
-    ("volume_limit", "Never louder than", false),
-    ("show_as", "Show as", false),
+    ("volume_limit", "Volume limit", true),
+    ("show_as", "Name in this app", true),
 ];
 
 /// Values the app remembers by itself and learns again at the next
@@ -1070,8 +1124,9 @@ fn relearned(path: &[String]) -> bool {
     RELEARNED.iter().any(|p| p.len() == path.len() && p.iter().zip(path).all(|(p, k)| *p == "*" || p == k))
 }
 
-/// A speaker's settings as a whole.
-const WHOLE_SPEAKER_LABEL: (&str, &str, bool) = ("speaker_settings.<id>", "Settings for this speaker", true);
+/// A speaker's settings as a whole (its view has the speaker's name for
+/// a title).
+const WHOLE_SPEAKER_LABEL: (&str, &str, bool) = ("speaker_settings.<id>", "Settings for this speaker", false);
 
 /// What the reset notice calls a top-level setting; `None` for a key this
 /// version doesn't have.
@@ -2022,7 +2077,7 @@ mod tests {
         let c = UserConfig::load_from(&path);
         let names = |id: &str| (id == "uuid:a").then(|| "Kitchen".to_string());
         let said = c.load_notice().describe(&names).unwrap();
-        assert!(said.contains("Kitchen: Hide this speaker from the list."), "{said}");
+        assert!(said.contains("Kitchen: Hide from the list."), "{said}");
         assert!(!said.contains("stream"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2099,13 +2154,40 @@ mod tests {
         let mut c = UserConfig::default();
         c.last_speaker_id = Some("uuid:RINCON_ALL".into());
         c.onboarding_dismissed = true;
-        c.always_minimise_to_tray = true;
         c.donation_prompt_hidden_until = Some(1_800_000_000);
         c.auto_reconnect_on_launch = false;
         c.chose_this_pc = true;
         c.closed_for_update = true;
         c.pc_output = Some("{0.0.0.00000000}.{realtek}".into());
+        use crate::engine::place::{Kept, KeptHeadphones, KeptLevel, KeptNote};
+        use crate::model::situation::{Ahead, Cause, Note, WallTime, WayChoice};
+        use crate::model::{PcOutputId, SpeakerId};
+        let speaker = SpeakerId::new("Kitchen");
+        let output = PcOutputId::new("headphones");
+        let at = WallTime(1_700_000_000);
+        let note = Note {
+            cause: Cause::Disconnected { speaker: speaker.clone() },
+            at: Some(crate::model::text::LocalTime::new(10, 30)),
+            available_again: true,
+            ahead: Some(Ahead::WhenSoundStarts),
+        };
+        c.sound_place = Some(Kept {
+            place: Some(speaker.clone()), named: Some(speaker.clone()), pc_output: Some(output.clone()),
+            headphones: Some(KeptHeadphones { output: output.clone(), before: speaker.clone(), name: "Headphones".into() }),
+            ways: [(speaker.clone(), WayChoice::AirPlayShort)].into(),
+            note: Some(KeptNote { note: note.clone(), at }), closed_note: Some(note),
+            disconnected: [(speaker.clone(), at)].into(), last_sound: Some(at), last_switch: Some(at),
+            levels: [(speaker.clone(), KeptLevel { level: 47, at })].into(), first_run_done: true,
+            window_close_explained: true, last_outputs: vec![output], screen_reader_answered: [speaker].into(),
+        });
+        c.show_lab = true;
+        c.phone_enabled = true;
+        c.scripts_enabled = true;
+        c.scripts_key = Some("112233445566778899aabbccddeeff00".into());
+        c.switch_back_after_quiet = true;
+        c.notes_by_clock = false;
         c.pc_outputs_open = true;
+        c.window_height = Some(512.0);
         c.ma_level = Some(60);
         c.last_version_seen = Some("0.1.9".into());
         c.prefer_realtime_airplay = true;
@@ -2142,6 +2224,7 @@ mod tests {
         c.sendspin.last_playback_server = Some("srv-a".into());
         c.sendspin.player_extra_latency_ms = 40;
         c.sendspin.pairing_code_failures = 2;
+        c.sendspin.source_own_switch = true;
         c.manual_speakers.push(ManualSpeaker {
             kind: ManualKind::AirPlay,
             name: "Den".into(),
@@ -2152,6 +2235,7 @@ mod tests {
         c.speaker_settings.insert(
             "uuid:RINCON_ALL".into(),
             SpeakerSettings {
+                network: Some(crate::engine::place::NetId("home".into())),
                 hidden: true,
                 auto_connect: AutoConnect::Always,
                 airplay_opener: Some(crate::airplay::session::Opener::OptionsThenAuthSetup),
@@ -2161,6 +2245,7 @@ mod tests {
                 steady_delay_change_ms: 120,
                 delay_choice: Some(crate::delay::DelayChoice::Short),
                 level: Some(32),
+                level_at: Some(1_700_000_200),
                 song_titles: Some(true),
                 tone: Some(EqSettings { enabled: true, preamp_db: -1.0, bands_db: [2.0; crate::equalizer::EQ_BANDS] }),
                 last_played: Some(1_790_000_000),
@@ -2312,6 +2397,20 @@ mod tests {
             &["airplay_pairings", "*", "controller_seed_hex"],
             &["airplay_pairings", "*", "accessory_id"],
             &["airplay_pairings", "*", "accessory_ltpk_hex"],
+            &["sound_place", "headphones", "before"],
+            &["sound_place", "headphones", "output"],
+            &["sound_place", "levels", "*", "level"],
+            &["sound_place", "levels", "*", "at"],
+            &["sound_place", "note", "note"],
+            &["sound_place", "note", "at"],
+            &["sound_place", "note", "note", "available_again"],
+            &["sound_place", "note", "note", "cause"],
+            &["sound_place", "note", "note", "cause", "Disconnected"],
+            &["sound_place", "note", "note", "cause", "Disconnected", "speaker"],
+            &["sound_place", "closed_note", "available_again"],
+            &["sound_place", "closed_note", "cause"],
+            &["sound_place", "closed_note", "cause", "Disconnected"],
+            &["sound_place", "closed_note", "cause", "Disconnected", "speaker"],
             &["manual_speakers", "*", "kind"],
             &["manual_speakers", "*", "host"],
             &["discovery_adapter", "key"],
@@ -2576,15 +2675,6 @@ mod tests {
             let path = ["speaker_settings".to_string(), "uuid:x".into(), key.clone()];
             assert!(labelled || relearned(&path), "speaker setting {key}: no label for the reset notice");
         }
-        // The names said to be the window's are, word for word, in the
-        // window's code.
-        const WINDOW: &str = concat!(include_str!("gui.rs"), include_str!("model/text.rs"));
-        let named = SETTING_LABELS.iter().chain(SPEAKER_LABELS).chain([&WHOLE_SPEAKER_LABEL]);
-        for (key, label, in_window) in named {
-            if *in_window {
-                assert!(WINDOW.contains(label), "{key}: the window doesn't say {label:?}");
-            }
-        }
         // A speaker setting left out of the saved form while unset
         // (`skip_serializing_if`) isn't among the defaults' keys: the entry
         // of `everything_set()`, where every field is set, has them all.
@@ -2597,6 +2687,64 @@ mod tests {
             let path = ["speaker_settings".to_string(), id.clone(), key.clone()];
             assert!(labelled || relearned(&path), "speaker setting {key}: no label for the reset notice");
         }
+    }
+
+    /// The window and tray icon that came before the panel are gone: the
+    /// build has no module of theirs, and the name a setting is known by,
+    /// where it is said to be the app's, is word for word in the string
+    /// table the panel's views take every sentence from.
+    #[test]
+    fn nothing_reaches_the_old_window() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let gone = ["gui", "tray", "gui_layout"];
+        for name in gone {
+            assert!(!src.join(format!("{name}.rs")).exists(), "src/{name}.rs is back");
+        }
+        for line in include_str!("lib.rs").lines() {
+            let declared = line
+                .trim()
+                .trim_start_matches("pub(crate) ")
+                .trim_start_matches("pub ")
+                .strip_prefix("mod ")
+                .map(|m| m.trim_end_matches(';'));
+            assert!(!declared.is_some_and(|m| gone.contains(&m)), "lib.rs declares {line:?}");
+        }
+        const WORDS: &str = include_str!("model/text.rs");
+        let named = SETTING_LABELS.iter().chain(SPEAKER_LABELS).chain([&WHOLE_SPEAKER_LABEL]);
+        for (key, label, the_apps) in named {
+            if *the_apps {
+                assert!(WORDS.contains(label), "{key}: the app's views don't say {label:?}");
+            }
+        }
+    }
+
+    /// A file an older version wrote, with a setting only the window that
+    /// came before the panel used, loads: everything this version knows is
+    /// read, nothing is reported reset, and that setting is kept as it was
+    /// across a save, so the older version finds it again.
+    #[test]
+    fn an_older_settings_file_still_loads() {
+        let dir = temp_config_dir("older-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let text = r#"{"last_speaker_id":"uuid:RINCON_1","onboarding_dismissed":true,
+            "always_minimise_to_tray":true,"auto_reconnect_on_launch":false,
+            "auto_reconnect_on_drop":false,"forward_now_playing":true}"#;
+        std::fs::write(&path, text).unwrap();
+        let mut c = UserConfig::load_from(&path);
+        assert_eq!(c.last_speaker_id.as_deref(), Some("uuid:RINCON_1"));
+        assert!(c.onboarding_dismissed && c.forward_now_playing);
+        assert!(!c.auto_reconnect_on_launch && !c.auto_reconnect_on_drop);
+        assert!(c.load_notice().is_empty(), "{:?}", c.load_notice());
+        assert_eq!(c.unknown_keys.get("always_minimise_to_tray"), Some(&serde_json::Value::Bool(true)));
+        c.last_speaker_id = Some("uuid:RINCON_2".into());
+        c.save_to(&path);
+        let disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk["always_minimise_to_tray"], serde_json::Value::Bool(true));
+        assert_eq!(disk["last_speaker_id"], "uuid:RINCON_2");
+        let back = UserConfig::load_from(&path);
+        assert_eq!(back.unknown_keys.get("always_minimise_to_tray"), Some(&serde_json::Value::Bool(true)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2635,8 +2783,8 @@ mod tests {
         let names = |id: &str| (id == "uuid:RINCON_1").then(|| "Kitchen".to_string());
         assert_eq!(
             some.describe(&names).unwrap(),
-            "Some settings couldn't be read and were reset or left out: AirPlay 2 stream mode; \
-             Kitchen: Connect automatically; Kitchen: Hide this speaker from the list; A speaker: \
+            "Some settings couldn't be read and were reset or left out: AirPlay 2 stream; \
+             Kitchen: When it gets the sound by itself; Kitchen: Hide from the list; A speaker: \
              AirPlay password. The file as it was is kept as config.json.before-reset-7 in the \
              settings folder."
         );
@@ -2651,7 +2799,7 @@ mod tests {
         assert_eq!(
             many.describe(&no_names).unwrap(),
             "Some settings couldn't be read and were reset or left out: Equalizer; Sendspin and Music \
-             Assistant; Speakers added by address; Privacy mode; and 2 more."
+             Assistant; Speakers added by address; Let any device on this network listen; and 2 more."
         );
     }
 

@@ -189,7 +189,7 @@ pub struct AirPlay2Session {
     /// Set by background threads when the session has demonstrably died
     /// (see [`FaultSlot`]: audio sends failing for the grace period, a
     /// buffered TCP write failure, a /feedback fault, the event channel
-    /// closing). Polled by the app watchdog for auto-reconnect.
+    /// closing). The engine looks at it for a dropout.
     dead: Arc<AtomicBool>,
     /// Why the session died, once a thread has raised a fault.
     faults: FaultSlot,
@@ -201,7 +201,7 @@ pub struct AirPlay2Session {
     threads: SessionThreads,
     ptp_session: Option<PtpMaster>,
     /// (next 23-bit seq, next rtptime) for the buffered stream — read at
-    /// stop() to send the spec's FLUSHBUFFERED before TEARDOWN. None for
+    /// stop() to send FLUSHBUFFERED before TEARDOWN. None for
     /// realtime sessions.
     buffered_flush: Option<(Arc<AtomicU32>, Arc<AtomicU32>)>,
     /// Clone of the buffered data TCP stream — stop() shuts it down to
@@ -270,7 +270,9 @@ impl AirPlay2Session {
         let event_ciphers = rtsp.take_event_ciphers();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
-        let faults = FaultSlot::new(dead.clone(), cfg.renderer.friendly_name.clone()).with_key(cfg.renderer.stable_id());
+        let faults = FaultSlot::new(dead.clone(), cfg.renderer.friendly_name.clone())
+            .with_key(cfg.renderer.stable_id())
+            .with_control(SocketAddr::new(cfg.renderer.ip, cfg.renderer.airplay_port.unwrap_or(DEFAULT_AIRPLAY_PORT)));
         let mut bring_up = BringUp::new(&stop_flag, &faults);
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
         // Shared from RECORD on (the buffered sender anchors on it, the
@@ -663,7 +665,9 @@ impl AirPlay2Session {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
-        let faults = FaultSlot::new(dead.clone(), label.clone()).with_key(cfg.renderer.stable_id());
+        let faults = FaultSlot::new(dead.clone(), label.clone())
+            .with_key(cfg.renderer.stable_id())
+            .with_control(SocketAddr::new(cfg.renderer.ip, cfg.renderer.airplay_port.unwrap_or(DEFAULT_AIRPLAY_PORT)));
         let mut bring_up = BringUp::new(&stop_flag, &faults);
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
 
@@ -881,7 +885,7 @@ impl AirPlay2Session {
     }
 
     /// True once a background thread flagged the session dead (dropped
-    /// receiver). Polled by the app watchdog for auto-reconnect.
+    /// receiver). The engine looks at it for a dropout.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
     }
@@ -950,7 +954,7 @@ impl AirPlay2Session {
         if let Some(ptp) = self.ptp_session.take() {
             ptp.stop();
         }
-        // Buffered sessions get the spec's FLUSHBUFFERED before TEARDOWN
+        // Buffered sessions get a FLUSHBUFFERED before TEARDOWN
         // so the receiver drops its buffered tail instead of playing it out.
         if let Some((seq, ts)) = self.buffered_flush.take() {
             let mut guard = self.rtsp.lock().unwrap();

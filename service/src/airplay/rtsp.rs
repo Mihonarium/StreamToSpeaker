@@ -960,6 +960,7 @@ impl RtspClient {
         // one means something is deeply wrong with the receiver.
         for _ in 0..3 {
             let resp = self.read_reply(label)?;
+            crate::engine::cancel::speaker_answered();
             match resp
                 .headers
                 .get("cseq")

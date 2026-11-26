@@ -7,48 +7,120 @@ use egui::{Color32, ColorImage, Id, Rect, RichText, Sense, TextureHandle, Textur
 
 use super::icons::{tray_icon, SIDE};
 use crate::model::port::Port;
-use crate::model::scripted::{Names, Scenario, ScriptedEngine};
+use crate::model::{samples, fake::ScriptedEngine};
 use crate::model::state::{Arcs, Badge};
-use crate::model::surfaces::MenuEntry;
-use crate::ui::menu::{menu_frame, menu_header, menu_separator, MenuItem};
+use crate::ui::menu::{menu_frame, MenuItem};
 use crate::ui::preview::{Scene, Stage};
 use crate::ui::theme::{size, Theme};
 
 /// Every picture of the tray.
 pub fn scenes() -> Vec<Scene> {
-    vec![
-        Scene { name: "tray-icons", size: [900.0, 0.0], draw: icons },
+    let mut scenes = vec![
+        Scene { name: "tray-icons", size: [1000.0, 0.0], draw: icons },
         Scene { name: "tray-menu", size: [900.0, 0.0], draw: menus },
-        Scene { name: "popup-confirmation-stand-in", size: [360.0, 0.0], draw: popup_confirmation },
-        Scene { name: "popup-notification-stand-in", size: [440.0, 0.0], draw: popup_notification },
-    ]
+    ];
+    macro_rules! popups {
+        ($($sample:literal),*) => {
+            $(if super::popup::Contents::from_view(&ScriptedEngine::new($sample).snapshot()).is_some() {
+                scenes.push(Scene { name: concat!("popup-", $sample), size: [368.0, 0.0],
+                    draw: |ui, _| popup(ui, $sample) });
+            })*
+        };
+    }
+    samples::with_sample_names!(popups);
+    macro_rules! windows {
+        ($($sample:literal),*) => { $(scenes.push(Scene { name: concat!("window-", $sample),
+            size: [super::main_window::WIDTH + 42.0, 0.0], draw: |ui, _| ordinary(ui, $sample, None) });)* };
+    }
+    windows!("kitchen-playing", "pc-plain", "pc-kitchen-didnt-respond", "many-speakers", "long-names",
+        "pc-welcome-pick", "pc-welcome-looking", "pc-welcome-none-found", "pc-welcome-busy", "pc-welcome-chime", "kitchen-welcome-done");
+    scenes.extend([
+        Scene { name: "window-speaker", size: [424.0, 0.0], draw: |ui, _| ordinary(ui, "kitchen-playing",
+            Some(crate::model::Open::SpeakerSettings(crate::model::SpeakerId::new("kitchen")))) },
+        Scene { name: "window-settings", size: [424.0, 0.0], draw: |ui, _| ordinary(ui, "kitchen-playing", Some(crate::model::Open::Settings)) },
+        Scene { name: "popup-window-closed-speaker", size: [368.0, 0.0], draw: |ui, _| closed(ui, "kitchen-playing") },
+        Scene { name: "popup-window-closed-pc", size: [368.0, 0.0], draw: |ui, _| closed(ui, "pc-plain") },
+    ]);
+    scenes
 }
 
-/// A small window's stand-in, framed as its window is, on the desktop.
-fn popup(ui: &mut Ui, kind: super::popup::PopupKind, words: &str) {
-    use super::popup::{PopupContent, StandInPopup};
-    let t = Theme::of(ui.ctx());
-    let snap = ScriptedEngine::new(Scenario::Playing).snapshot();
-    let mut p = StandInPopup::new(kind, words);
-    let size = p.size();
+fn popup(ui: &mut Ui, sample: &str) {
+    popup_card(ui, &ScriptedEngine::new(sample).snapshot());
+}
+
+fn popup_card(ui: &mut Ui, view: &crate::model::Snapshot) {
     ui.add_space(20.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
         ui.add_space(20.0);
-        egui::Frame::none().fill(t.c.surface).stroke(t.card_stroke()).rounding(8.0).shadow(t.shadow()).show(ui, |ui| {
-            ui.set_width(size.x);
-            ui.set_min_height(size.y);
-            let _ = p.show(ui, &snap, 0.0, &mut |_| {});
+        ui.vertical(|ui| { super::popup::card(ui, super::popup::Contents::from_view(view).unwrap(), view.lang); });
+    });
+    ui.add_space(20.0);
+}
+
+fn closed(ui: &mut Ui, sample: &str) {
+    let engine = ScriptedEngine::new(sample);
+    engine.send(crate::model::Surface::Panel, crate::model::Command::PanelShown(true));
+    engine.send(crate::model::Surface::Panel, crate::model::Command::PanelShown(false));
+    engine.send(crate::model::Surface::Panel, crate::model::Command::WindowClosed);
+    popup_card(ui, &engine.snapshot());
+}
+
+fn ordinary(ui: &mut Ui, sample: &str, page: Option<crate::model::Open>) {
+    use super::main_window::{MainWindow, TITLE_HEIGHT, WIDTH};
+    use super::Views;
+    let t = Theme::of(ui.ctx());
+    let snap = ScriptedEngine::new(sample).snapshot();
+    crate::ui::look::set_focus_visible(ui.ctx(), false);
+    let mut window = MainWindow::new(None, None);
+    let page_state = egui::Id::new(("window-page", sample));
+    window.sync_first_run(snap.scene.situation.first_run.as_ref());
+    if let Some((_, state)) = &mut window.welcome {
+        *state = ui.ctx().data(|d| d.get_temp(page_state)).unwrap_or_default();
+    }
+    if let Some(open) = page {
+        let views = crate::settings::views::SettingsViews::new(std::sync::Arc::new(crate::settings::scripted::ScriptedSettings::new()));
+        window.page(views.view(&open, &snap).unwrap(), false);
+        window.pages[0].1 = ui.ctx().data(|d| d.get_temp(page_state)).unwrap_or_default();
+    }
+    ui.spacing_mut().item_spacing = Vec2::ZERO;
+    ui.add_space(20.0);
+    ui.horizontal_top(|ui| {
+        ui.add_space(20.0);
+        egui::Frame::none().stroke(t.card_stroke()).shadow(t.shadow()).fill(t.c.surface).rounding(6.0).show(ui, |ui| {
+            ui.set_width(WIDTH);
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                let (bar, _) = ui.allocate_exact_size(egui::vec2(WIDTH, TITLE_HEIGHT), Sense::hover());
+                let cy = bar.center().y;
+                let p = ui.painter();
+                p.rect_filled(bar, 0.0, t.c.chrome);
+                let icon = Rect::from_center_size(egui::pos2(bar.left()+24.0,cy), Vec2::splat(16.0));
+                p.image(super::icons::app_mark(ui).id(), icon, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0,1.0)), t.c.text);
+                p.text(egui::pos2(bar.left()+42.0,cy),egui::Align2::LEFT_CENTER,crate::PRODUCT_NAME,t.font(12.0),t.c.text);
+                let x = bar.right()-115.0;
+                p.hline(x-5.0..=x+5.0,cy,egui::Stroke::new(1.0_f32,t.c.text));
+                p.rect_stroke(Rect::from_center_size(egui::pos2(x+46.0,cy),Vec2::splat(9.0)),0.0,egui::Stroke::new(1.0_f32,t.c.text_disabled));
+                crate::ui::icon::Icon::Close.paint(p,Rect::from_center_size(egui::pos2(x+92.0,cy),Vec2::splat(16.0)),t.c.text);
+                let cap = if sample == "many-speakers" { 620.0 } else { 1024.0 };
+                let body = if window.welcome.is_some() {
+                    ui.ctx().data(|d| d.get_temp::<f32>(page_state.with("height"))).unwrap_or(500.0)
+                } else { window.natural_height(ui, &snap, true) }.min(cap);
+                ui.allocate_ui_with_layout(egui::vec2(WIDTH, body), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    if window.welcome.is_some() { ui.set_min_height(body); }
+                    let drawn = window.draw(ui, &snap, true, body);
+                    if let Some((_, state)) = &window.welcome {
+                        let natural = drawn.natural.max(super::main_window::MIN_HEIGHT);
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(page_state, state.clone());
+                            d.insert_temp(page_state.with("height"), natural);
+                        });
+                        if (natural - body).abs() > 0.5 { ui.ctx().request_discard("welcome page height"); }
+                    }
+                });
+                if let Some((_, state)) = window.pages.last() { ui.ctx().data_mut(|d| d.insert_temp(page_state,state.clone())); }
+            });
         });
     });
-    ui.add_space(40.0);
-}
-
-fn popup_confirmation(ui: &mut Ui, _st: &mut Stage) {
-    popup(ui, super::popup::PopupKind::Confirmation, "The confirmation by the clock");
-}
-
-fn popup_notification(ui: &mut Ui, _st: &mut Stage) {
-    popup(ui, super::popup::PopupKind::Notification, "A notification");
+    ui.add_space(20.0);
 }
 
 fn texture(ui: &Ui, arcs: Arcs, badge: Badge, dark: bool) -> TextureHandle {
@@ -72,14 +144,6 @@ fn on_taskbar(ui: &mut Ui, arcs: Arcs, badge: Badge, dark: bool) {
     ui.painter().image(tex.id(), icon, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
 }
 
-/// The first scenario whose tray shows `arcs` with `badge`.
-fn example(arcs: Arcs, badge: Badge) -> Option<(Scenario, String)> {
-    Scenario::ALL.iter().find_map(|s| {
-        let snap = ScriptedEngine::new(*s).snapshot();
-        (snap.tray.arcs == arcs && snap.tray.badge == badge).then(|| (*s, snap.tray.tooltip.clone()))
-    })
-}
-
 fn icons(ui: &mut Ui, _st: &mut Stage) {
     let t = Theme::of(ui.ctx());
     ui.add_space(20.0);
@@ -90,32 +154,11 @@ fn icons(ui: &mut Ui, _st: &mut Stage) {
                 ui.label(RichText::new(h.to_uppercase()).font(t.strong(11.5)).color(t.c.text_secondary));
             }
             ui.end_row();
-            // From nothing to report to not working, then any other pair a
-            // scenario shows.
-            let mut pairs = vec![
-                (Arcs::Ink, Badge::None),
-                (Arcs::GreenFaint, Badge::None),
-                (Arcs::Green, Badge::None),
-                (Arcs::Green, Badge::Attention),
-                (Arcs::Ink, Badge::Attention),
-                (Arcs::Ink, Badge::Failure),
-            ];
-            for arcs in [Arcs::Ink, Arcs::GreenFaint, Arcs::Green] {
-                for badge in [Badge::None, Badge::Attention, Badge::Failure] {
-                    if !pairs.contains(&(arcs, badge)) {
-                        pairs.push((arcs, badge));
-                    }
-                }
-            }
-            for (arcs, badge) in pairs {
-                let Some((scenario, tooltip)) = example(arcs, badge) else { continue };
-                let what = match (arcs, badge) {
-                    (Arcs::Ink, Badge::None) => "Sound on this PC",
-                    (Arcs::GreenFaint, Badge::None) => "Connecting",
-                    (Arcs::Green, Badge::None) => "On a speaker",
-                    (_, Badge::Attention) => "Needs a look",
-                    (_, Badge::Failure) => "Not working",
-                };
+            for sample in ["pc-plain", "kitchen-playing", "pc-kitchen-stopped-responding", "kitchen-not-responding-trying"] {
+                let view = ScriptedEngine::new(sample).snapshot();
+                let (arcs, badge) = super::icons::appearance(&view.tray);
+                let tooltip = &view.tray.tooltip;
+                let what = if view.tray.amber { "Needs a look" } else if view.tray.accent { "On a speaker" } else { "Sound on this PC" };
                 ui.label(RichText::new(what).font(t.strong(size::BODY)).color(t.c.text));
                 on_taskbar(ui, arcs, badge, false);
                 on_taskbar(ui, arcs, badge, true);
@@ -123,7 +166,7 @@ fn icons(ui: &mut Ui, _st: &mut Stage) {
                     ui.set_width(400.0);
                     ui.add(egui::Label::new(RichText::new(tooltip).font(t.font(size::BODY)).color(t.c.text)).wrap());
                 });
-                ui.label(RichText::new(scenario.name()).font(t.font(size::SMALL)).color(t.c.text_secondary));
+                ui.label(RichText::new(sample).font(t.font(size::SMALL)).color(t.c.text_secondary));
                 ui.end_row();
             }
         });
@@ -131,9 +174,9 @@ fn icons(ui: &mut Ui, _st: &mut Stage) {
     ui.add_space(20.0);
 }
 
-fn menu_of(ui: &mut Ui, caption: &str, scenario: Scenario, names: Names) {
+fn menu_of(ui: &mut Ui, caption: &str, sample: &str) {
     let t = Theme::of(ui.ctx());
-    let snap = ScriptedEngine::with_names(scenario, names).snapshot();
+    let snap = ScriptedEngine::new(sample).snapshot();
     ui.vertical(|ui| {
         ui.label(RichText::new(caption.to_uppercase()).font(t.strong(11.5)).color(t.c.text_secondary));
         ui.add_space(6.0);
@@ -141,13 +184,7 @@ fn menu_of(ui: &mut Ui, caption: &str, scenario: Scenario, names: Names) {
             ui.set_width(260.0);
             ui.spacing_mut().item_spacing.y = 0.0;
             for e in &snap.tray.menu {
-                match e {
-                    MenuEntry::Label(text) => menu_header(ui, text),
-                    MenuEntry::Separator => menu_separator(ui),
-                    MenuEntry::Item(item) => {
-                        let _ = MenuItem::new(&item.label).checked(item.checked).enabled(item.enabled).show(ui);
-                    }
-                }
+                MenuItem::new(&e.label).checked(e.checked).enabled(e.command.is_some() || e.checked).show(ui);
             }
         });
     });
@@ -158,9 +195,9 @@ fn menus(ui: &mut Ui, _st: &mut Stage) {
     ui.horizontal_top(|ui| {
         ui.add_space(20.0);
         ui.spacing_mut().item_spacing.x = 28.0;
-        menu_of(ui, "Playing on a speaker", Scenario::Playing, Names::Usual);
-        menu_of(ui, "Long names", Scenario::Playing, Names::Long);
-        menu_of(ui, "Many speakers", Scenario::RowCatalogue, Names::Usual);
+        menu_of(ui, "Playing on a speaker", "kitchen-playing");
+        menu_of(ui, "Long names", "long-names");
+        menu_of(ui, "Many speakers", "many-speakers");
     });
     ui.add_space(20.0);
 }

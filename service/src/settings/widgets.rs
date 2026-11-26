@@ -6,7 +6,7 @@ use egui::{Color32, Rect, Sense, Ui, Vec2};
 
 use crate::ui::button::Button;
 use crate::ui::icon::Icon;
-use crate::ui::text::Para;
+use crate::ui::text::{page_widget_text, page_wrap, Para};
 use crate::ui::theme::{size, Theme};
 
 use super::PageState;
@@ -14,13 +14,13 @@ use super::PageState;
 /// Words in the main colour, wrapping.
 pub fn body(ui: &mut Ui, text: &str) {
     let t = Theme::of(ui.ctx());
-    ui.add(egui::Label::new(egui::RichText::new(text).font(t.font(size::BODY)).color(t.c.text)).wrap());
+    ui.add(egui::Label::new(page_widget_text(ui, egui::RichText::new(text).font(t.font(size::BODY)).color(t.c.text))).wrap());
 }
 
 /// Words in semibold, wrapping.
 pub fn strong(ui: &mut Ui, text: &str, em: f32) {
     let t = Theme::of(ui.ctx());
-    ui.add(egui::Label::new(egui::RichText::new(text).font(t.strong(em)).color(t.c.text)).wrap());
+    ui.add(egui::Label::new(page_widget_text(ui, egui::RichText::new(text).font(t.strong(em)).color(t.c.text))).wrap());
 }
 
 /// A grey line of help (12 points), wrapping.
@@ -59,8 +59,8 @@ pub fn row<R>(ui: &mut Ui, icon: Option<Icon>, title: &str, description: Option<
     let (control_w, control_h): (f32, f32) = ui.ctx().data(|d| d.get_temp(id)).unwrap_or((0.0, 0.0));
     let gap = if control_w > 0.0 { 14.0 } else { 0.0 };
     let text_w = (width - icon_w - control_w - gap).max(140.0);
-    let title_g = ui.painter().layout(title.to_owned(), t.font(size::BODY), t.c.text, text_w);
-    let desc_g = description.map(|d| ui.painter().layout(d.to_owned(), t.font(size::CAPTION), t.c.text_secondary, text_w));
+    let title_g = page_wrap(ui, ui.painter().layout(title.to_owned(), t.font(size::BODY), t.c.text, text_w));
+    let desc_g = description.map(|d| page_wrap(ui, ui.painter().layout(d.to_owned(), t.font(size::CAPTION), t.c.text_secondary, text_w)));
     let text_h = title_g.size().y + desc_g.as_ref().map_or(0.0, |g| g.size().y + 2.0);
     let height = text_h.max(control_h).max(24.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
@@ -123,7 +123,7 @@ pub fn step(ui: &mut Ui, n: u8, mark: StepMark, title: &str, body: impl FnOnce(&
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             let color = if mark == StepMark::Later { t.c.text_disabled } else { t.c.text };
-            ui.add(egui::Label::new(egui::RichText::new(title).font(t.strong(size::BODY)).color(color)).wrap());
+            ui.add(egui::Label::new(page_widget_text(ui, egui::RichText::new(title).font(t.strong(size::BODY)).color(color))).wrap());
             body(ui);
         });
     });
@@ -157,7 +157,7 @@ pub fn check_line(ui: &mut Ui, found: Found, title: &str, detail: Option<&str>, 
         }
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
-            ui.add(egui::Label::new(egui::RichText::new(title).font(t.font(size::BODY)).color(t.c.text)).wrap());
+            ui.add(egui::Label::new(page_widget_text(ui, egui::RichText::new(title).font(t.font(size::BODY)).color(t.c.text))).wrap());
             if let Some(d) = detail {
                 let _ = Para::new(d).size(size::SECONDARY).show(ui);
             }

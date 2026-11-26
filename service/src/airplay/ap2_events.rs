@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::airplay::ap2_crypto::{ChannelCipher, HapReader};
-use crate::airplay::ap2_health::{Ap2Fault, FaultChannel, FaultSlot};
+use crate::airplay::ap2_health::{FaultChannel, FaultSlot};
 
 /// Request header block limit.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -216,9 +216,10 @@ fn run_event_channel(
 
 /// The channel ended from the receiver's side (closed, reset, or a reply
 /// that couldn't be written). Where the channel's end is the session's end
-/// (`close_is_fault`: HomePods), the session faults at once, retryable:
-/// the app reconnects after every such drop. Nothing is raised once the
-/// app is stopping the session.
+/// (`close_is_fault`: HomePods), the session faults at once: one the
+/// receiver ended while it still answers is final, one it dropped by
+/// going away is retryable ([`FaultSlot::ended_by_peer`]). Nothing is
+/// raised once the app is stopping the session.
 fn channel_ended(faults: &FaultSlot, close_is_fault: bool, stop_flag: &AtomicBool, name: &str, detail: String) {
     if stop_flag.load(Ordering::Acquire) {
         return;
@@ -227,7 +228,7 @@ fn channel_ended(faults: &FaultSlot, close_is_fault: bool, stop_flag: &AtomicBoo
         warn!("AirPlay 2 {}: {}", name, detail);
         return;
     }
-    faults.raise(Ap2Fault::new("peer_closed", FaultChannel::Events, true, detail));
+    faults.ended_by_peer(FaultChannel::Events, detail);
 }
 
 #[cfg(test)]
@@ -308,6 +309,37 @@ mod tests {
             assert_eq!((fault.code, fault.retryable), ("peer_closed", true), "round {round}: {fault:?}");
         }
         assert_eq!(ended_by_peer("Stopping test HomePod", true, true), (false, None));
+    }
+
+    /// A receiver that closes the event channel while it still answers on
+    /// its control port ended the session itself (another device took it):
+    /// a final fault, so nothing reconnects. One whose control port has
+    /// gone dropped out, and a reconnect may follow.
+    #[test]
+    fn an_airplay_session_ended_while_reachable_is_not_retried() {
+        let end = |control_answers: bool| {
+            let events = TcpListener::bind("127.0.0.1:0").unwrap();
+            let control = TcpListener::bind("127.0.0.1:0").unwrap();
+            let control_addr = control.local_addr().unwrap();
+            if !control_answers {
+                drop(control);
+            }
+            let dead = Arc::new(AtomicBool::new(false));
+            let faults = FaultSlot::new(dead.clone(), "Office".into()).with_control(control_addr);
+            let stop = Arc::new(AtomicBool::new(false));
+            let port = events.local_addr().unwrap().port();
+            let handle =
+                spawn_event_channel("127.0.0.1".parse().unwrap(), port, None, stop, faults.clone(), true, "Office".into())
+                    .unwrap();
+            let (peer, _) = events.accept().unwrap();
+            drop(peer);
+            handle.join().unwrap();
+            assert!(dead.load(Ordering::Acquire));
+            let fault = faults.get().unwrap();
+            (fault.code, fault.retryable)
+        };
+        assert_eq!(end(true), (crate::airplay::ap2_health::ENDED_BY_RECEIVER, false));
+        assert_eq!(end(false), ("peer_closed", true));
     }
 
     /// End to end over loopback: an idle period, then one encrypted

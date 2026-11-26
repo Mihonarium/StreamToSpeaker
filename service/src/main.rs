@@ -8,12 +8,9 @@
 //!     tray; the main thread waits for Ctrl+C while the same background
 //!     threads run. Use for service installs or when running over SSH.
 //!
-//! The web UI and its HTTP/JSON API (`/api/*`) are OFF by default — pass
-//! `--web` (or turn them on in the window). Both need the web UI's link,
-//! which carries a secret key: the page lives under `/r/<key>/`, and API
-//! calls send the key as `Authorization: Bearer <key>`. The window shows
-//! the link; `--web-link` prints it and exits, for headless and service
-//! installs, which have no window.
+//! Settings enables phone and script control independently. `--web` enables
+//! the phone page at `/r/<key>/`. API calls send an enabled phone or scripts
+//! key as `Authorization: Bearer <key>`. `--web-link` prints the phone link.
 
 // Windows subsystem = "windows" — no console window ever auto-allocated.
 // GUI mode: the egui window + tray are the entire user-facing surface.
@@ -94,8 +91,8 @@ struct Cli {
     /// search (a few seconds) it takes the best match: the speaker at that
     /// address, else the one with that full name, else a speaker shown in
     /// the list whose name contains it; if none matches yet, the first that
-    /// does later. Without it, the speaker used last time; --headless in a
-    /// terminal asks instead.
+    /// does later. Without it, keep the last place. A headless terminal
+    /// also offers a picker.
     #[arg(long)]
     player: Option<String>,
 
@@ -123,11 +120,9 @@ struct Cli {
     #[arg(long, default_value_t = false, hide = true)]
     startup: bool,
 
-    /// Enable the HTTP / JSON API and built-in web UI. Both need the web
-    /// UI's link, which carries a secret key (shown in the window; printed
-    /// at start with --headless, and by --web-link). The audio stream
-    /// itself (`/stream.raw`) is always served — Sonos needs it — but the
-    /// page and `/api/*` only answer while the web UI is on.
+    /// Enable Control from your phone. Its secret link opens the page and
+    /// authorizes API calls. Settings can also enable a separate scripts key.
+    /// --headless prints the link at start, and --web-link prints it on demand.
     #[arg(long, default_value_t = false)]
     web: bool,
 
@@ -383,7 +378,7 @@ fn main() {
     // invocations against the same port are the caller's problem. Skipped
     // for --web-link and --list-speakers too (see below).
     if !cli.console() {
-        match stream_to_speaker::single_instance::claim() {
+        match stream_to_speaker::single_instance::claim_for_launch(!cli.startup) {
             stream_to_speaker::single_instance::Claim::First => {
                 // This copy is the one that writes the log from now on.
                 if let Some(path) = log_path() {
@@ -444,7 +439,10 @@ fn main() {
     // Every state of the panel without speakers: the scripted engine.
     #[cfg(windows)]
     if let Some(scenario) = stream_to_speaker::shell::scripted_scenario() {
-        let options = stream_to_speaker::shell::ShellOptions::from_env(!cli.no_tray);
+        let options = stream_to_speaker::shell::ShellOptions {
+            open_at_start: !cli.startup,
+            ..stream_to_speaker::shell::ShellOptions::from_env(!cli.no_tray)
+        };
         if let Err(e) = stream_to_speaker::shell::run_scripted(options, scenario) {
             error!("fatal: {:#}", e);
         }
@@ -716,9 +714,6 @@ fn run(cli: Cli) -> Result<()> {
         app.disable_sendspin();
     } else {
         app.init_sendspin(!cli.no_discovery, cli.sendspin_source);
-        if cli.player.is_none() {
-            app.reconnect_saved_sendspin_speaker();
-        }
     }
 
     // Always start the full HTTP server (audio + API + UI). The page and
@@ -744,7 +739,7 @@ fn run(cli: Cli) -> Result<()> {
             );
             info!("web UI on; its link went to standard output, not this log (--web-link prints it)");
         }
-        Some(_) => info!("web UI on; its link is in the window's Web UI card"),
+        Some(_) => info!("web UI on; its link is under Control from your phone in Settings"),
         None => info!("web UI off — turn it on in the window, or start with --web"),
     }
 
@@ -793,11 +788,7 @@ fn run(cli: Cli) -> Result<()> {
     // background (the window and tray come up meanwhile), with or without
     // --no-discovery.
     let saved = app.saved_speaker_id();
-    let saved_needs_no_search = saved.as_deref().is_some_and(|id| {
-        app.find_manual_speaker(id).is_some()
-            && app.is_auto_reconnect_on_launch()
-            && app.auto_connect_allowed_at_launch(id)
-    });
+    let saved_needs_no_search = saved.as_deref().is_some_and(|id| app.find_manual_speaker(id).is_some());
     let facts = LaunchFacts {
         terminal: picker::is_interactive(),
         saved: saved.as_deref(),
@@ -812,8 +803,7 @@ fn run(cli: Cli) -> Result<()> {
     let engine = stream_to_speaker::engine::Engine::start(
         app.clone(),
         stream_to_speaker::platform::Platform::this_pc(),
-        matches!(choice, LaunchChoice::Saved(_)),
-    );
+    )?;
     if let LaunchChoice::Wish(query) = &choice {
         // In the background: the speaker may not be on the network yet.
         app.connect_when_listed(query.clone());
@@ -824,7 +814,7 @@ fn run(cli: Cli) -> Result<()> {
                     warn!("starting initial session failed: {}", e);
                 }
             }
-            None => warn!("no speaker selected; pick one with the web UI / POST /api/select"),
+            None => {}
         }
     } else if cli.headless && !matches!(choice, LaunchChoice::Saved(_)) {
         warn!("no speaker selected; pick one with the GUI / web UI / POST /api/select");
@@ -832,7 +822,7 @@ fn run(cli: Cli) -> Result<()> {
 
     let ran = if cli.headless {
         let quitting = engine.clone();
-        app.on_quit(move || quitting.quit());
+        app.on_quit_from(move |from| quitting.quit_from(from));
         run_headless(app)
     } else {
         // Keep an existing sign-in entry pointing at this exe.
@@ -841,9 +831,9 @@ fn run(cli: Cli) -> Result<()> {
         // to end instead of handing over to it: it is about to have no
         // window to show.
         let quitting = engine.clone();
-        app.on_quit(move || {
+        app.on_quit_from(move |from| {
             stream_to_speaker::single_instance::announce_closing();
-            quitting.quit();
+            quitting.quit_from(from);
         });
         run_gui_mode(app, engine, &cli)
     };
@@ -973,6 +963,9 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
             debug!("GENA NOTIFY on {}: {} bytes", path, body.len());
             if let Some(change) = stream_to_speaker::gena::parse_transport_notify(body) {
                 transport.note_transport(change);
+            }
+            if let Some(groups) = stream_to_speaker::sonos::parse_topology_notify(body) {
+                transport.note_topology(groups);
             }
             if let Some(change) = parse_rendering_notify(body) {
                 // A level the speaker reports reaches Windows' slider the

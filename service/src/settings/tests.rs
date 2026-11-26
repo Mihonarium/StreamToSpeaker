@@ -171,6 +171,15 @@ fn the_code_goes_in_by_itself_after_the_fourth_digit() {
 }
 
 #[test]
+fn asking_for_a_new_code_after_no_answer_requests_one() {
+    let port = ScriptedSettings::new();
+    port.set(|s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::NoAnswer, seconds_left: None })));
+    let mut h = Harness::dialog(Dialog::Code(CodeDialog::new("den")), port);
+    h.click("Ask for a new code");
+    assert_eq!(h.acts(), vec![Act::NewCode("den".into())]);
+}
+
+#[test]
 fn a_wrong_code_clears_the_boxes_and_says_so() {
     let port = ScriptedSettings::new();
     port.set(|s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::Wrong, seconds_left: None })));
@@ -221,12 +230,12 @@ fn a_sendspin_code_or_its_token() {
 #[test]
 fn the_report_previews_exactly_what_is_copied() {
     let mut h = Harness::dialog(Dialog::Report(ReportDialog::default()), ScriptedSettings::new());
-    let preview = |h: &Harness| h.texts.iter().any(|t| t.text.contains("21:41:10 Delay on Kitchen"));
+    let preview = |h: &Harness| h.texts.iter().any(|t| t.text.contains("Last message: Kitchen"));
     assert!(preview(&h));
-    h.click("What happened in the last hour");
+    h.click("Playback diagnostics");
     assert!(!preview(&h), "unticked, it leaves the preview");
     h.click("Open a GitHub issue");
-    assert!(matches!(h.acts().as_slice(), [Act::OpenIssue(t)] if !t.contains("21:41:10")));
+    assert!(matches!(h.acts().as_slice(), [Act::OpenIssue(t)] if !t.contains("Last message: Kitchen")));
 }
 
 // -------------------------------------------------------------------------
@@ -310,12 +319,8 @@ const REAL_ONLY: &[Key] = &[
     Key::SetProbeNoThread,
     Key::SetPairingEnded,
     Key::SetReportVersionLine,
-    Key::SetNothingChanged,
-    Key::SetChoiceSteady,
-    Key::SetChoiceShort,
-    Key::SetDetailStream,
-    Key::SetDetailBuffer,
-    Key::SetDetailLead,
+    Key::SetReportFolderClosed,
+    Key::SetReportSaveFailed,
 ];
 
 #[test]
@@ -379,6 +384,10 @@ fn every_sentence_of_the_settings_block_is_said_and_none_is_left_unfilled() {
             }
         }
     }
+    for expected in ["Set", "Use the default: 150 ms", "Try Kitchen again", "Switch to Kitchen by AirPlay", "Use “Steadier”",
+        "Ask for a new code", "Stream To Speaker closes while Setup runs, and your sound plays on this PC meanwhile. When Setup is done, it plays on Kitchen again."] {
+        assert!(drawn.iter().any(|t| t == expected), "missing {expected:?}");
+    }
     for t in &drawn {
         assert!(!t.contains('{') && !t.contains('}'), "an unfilled placeholder: {t:?}");
         assert!(!t.contains('\''), "a straight apostrophe: {t:?}");
@@ -395,14 +404,19 @@ fn every_sentence_of_the_settings_block_is_said_and_none_is_left_unfilled() {
 #[derive(Default)]
 struct FakeDesktop {
     opened: Mutex<Vec<String>>,
+    refuse_folder: std::sync::atomic::AtomicBool,
 }
 
 impl Desktop for FakeDesktop {
     fn open_url(&self, url: &str) {
         self.opened.lock().unwrap().push(url.into());
     }
-    fn open_folder(&self, dir: &std::path::Path) {
+    fn open_folder(&self, dir: &std::path::Path) -> std::io::Result<()> {
         self.opened.lock().unwrap().push(dir.display().to_string());
+        if self.refuse_folder.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("folder refused"));
+        }
+        Ok(())
     }
     fn utc_offset_secs(&self) -> i64 {
         3600
@@ -430,31 +444,24 @@ fn the_real_app_lists_its_speakers_and_keeps_each_change() {
     assert_eq!((row.name.as_str(), row.added_by_address), ("Garage", true));
     assert_eq!(row.kind, SpeakerKind::AirPlay);
 
+    app.set_airplay_password(&id, "pw");
+    port.act(Act::ClearSpeakerCredentials(id.clone()));
+    assert!(app.airplay_password(&id).is_none());
     port.act(Act::HideSpeaker(id.clone()));
     assert!(port.speakers().hidden.iter().any(|r| r.id == id));
     assert!(app.speaker_settings(&id).hidden);
     port.act(Act::ShowSpeaker(id.clone()));
     assert!(!app.speaker_settings(&id).hidden);
 
-    port.act(Act::ComesBack(id.clone(), ComesBack::Never));
-    assert_eq!(port.speaker(&id).unwrap().comes_back, Some(ComesBack::Never));
-    assert_eq!(app.speaker_settings(&id).auto_connect, crate::user_config::AutoConnect::Never);
-
     port.act(Act::SongTitles(id.clone(), true));
     assert_eq!(port.speaker(&id).unwrap().song_titles, Some(true));
 
-    port.act(Act::Delay(id.clone(), DelayAct::Remove(100)));
-    let d = port.speaker(&id).unwrap().delay.unwrap().status;
-    assert_eq!(d.change_ms, -100, "the delay engine kept it");
-    port.act(Act::Delay(id.clone(), DelayAct::BackToOwn));
-    assert_eq!(port.speaker(&id).unwrap().delay.unwrap().status.change_ms, 0);
-
-    port.act(Act::Remove(id.clone()));
+    app.remove_manual_speaker(&id);
     assert!(port.speaker(&id).is_none(), "removed");
 }
 
 #[test]
-fn the_real_app_keeps_tone_per_speaker_with_undo() {
+fn the_real_app_keeps_tone_per_speaker() {
     let (app, port, _) = real();
     let id = with_speaker(&app);
     assert_eq!(port.speaker(&id).unwrap().tone, Some((0.0, 0.0)), "flat, as the app-wide equalizer");
@@ -462,9 +469,6 @@ fn the_real_app_keeps_tone_per_speaker_with_undo() {
     port.act(Act::Tone(id.clone(), ToneAct::Treble(1.0)));
     assert_eq!(port.speaker(&id).unwrap().tone, Some((-2.0, 1.0)));
     assert_eq!(app.speaker_settings(&id).tone.unwrap().bands_db[0], -2.0);
-    assert!(port.tone(&id).unwrap().can_undo);
-    port.act(Act::Tone(id.clone(), ToneAct::Undo));
-    assert_eq!(port.speaker(&id).unwrap().tone, Some((-2.0, 0.0)));
     port.act(Act::Tone(id.clone(), ToneAct::Flat));
     assert_eq!(port.speaker(&id).unwrap().tone, Some((0.0, 0.0)));
     // The app-wide curve is untouched.
@@ -474,9 +478,16 @@ fn the_real_app_keeps_tone_per_speaker_with_undo() {
 #[test]
 fn the_real_app_keeps_general_privacy_about_and_lab() {
     let (app, port, desk) = real();
-    port.act(Act::GoBack(false));
-    assert_eq!(port.general().go_back, Some(false));
-    assert!(!app.is_auto_reconnect_on_launch());
+    port.act(Act::SwitchBackAfterQuiet(true));
+    port.act(Act::NotesByClock(false));
+    let g = port.general();
+    assert!(g.shortcuts.is_none() && g.play_calls.is_none() && g.what_plays.is_none() && g.language.is_none());
+    port.act(Act::ShowLab(true));
+    assert!(port.general().switch_back_after_quiet && !port.general().notes_by_clock && port.about().show_lab);
+    {
+        let cfg = app.user_config.lock().unwrap();
+        assert!(cfg.switch_back_after_quiet && !cfg.notes_by_clock);
+    }
     port.act(Act::OnlyPlaying(true));
     assert!(port.privacy().only_playing && app.is_privacy_mode());
     port.act(Act::Lab(LabAct::AtOnce(true)));
@@ -511,25 +522,11 @@ fn values_from_an_earlier_version_are_carried_over_not_lab_settings() {
     assert!(c.speakers.contains(&"Garage".to_string()), "the AirPlay speaker whose sound changes");
     assert!(!lab.differs(), "it doesn't turn on the line that Lab settings are on");
     // A speaker with a delay of its own isn't named.
-    port.act(Act::Delay(id.clone(), DelayAct::Remove(100)));
+    app.change_delay(Some(&id), crate::delay::Request::Remove(100)).unwrap();
     assert!(port.lab().carried_over.unwrap().speakers.is_empty());
     port.act(Act::Lab(LabAct::ResetCarriedOver));
     assert!(port.lab().carried_over.is_none());
     assert_eq!(app.user_config.lock().unwrap().airplay_latency_ms, 2000);
-}
-
-#[test]
-fn the_real_app_forgets_a_speaker_entirely() {
-    let (app, port, _) = real();
-    let id = with_speaker(&app);
-    app.set_airplay_password(&id, "pw");
-    port.act(Act::Delay(id.clone(), DelayAct::Add(100)));
-    port.act(Act::Tone(id.clone(), ToneAct::Bass(3.0)));
-    assert!(matches!(port.speaker(&id).unwrap().pairing, Some(Pairing::PasswordSaved)));
-    port.act(Act::Forget(id.clone()));
-    assert!(app.airplay_password(&id).is_none());
-    assert!(app.speaker_settings(&id).is_default());
-    assert_eq!(port.speaker(&id).unwrap().delay.unwrap().status.change_ms, 0);
 }
 
 #[test]
@@ -548,7 +545,7 @@ fn a_moment_is_said_as_today_yesterday_or_a_date() {
 }
 
 #[test]
-fn the_real_app_keeps_a_limit_a_local_name_and_what_happens_when_a_speaker_stops() {
+fn the_real_app_keeps_a_limit_and_a_local_name() {
     let (app, port, _) = real();
     let id = with_speaker(&app);
     assert_eq!(port.speaker(&id).unwrap().volume_limit, Some(100), "no limit");
@@ -560,14 +557,11 @@ fn the_real_app_keeps_a_limit_a_local_name_and_what_happens_when_a_speaker_stops
 
     port.act(Act::ShowAs(id.clone(), "Garage shelf".into()));
     assert_eq!(app.speaker_settings(&id).show_as.as_deref(), Some("Garage shelf"));
-    assert_eq!(port.speaker(&id).unwrap().show_as.as_deref(), Some("Garage shelf"));
+    let page = port.speaker(&id).unwrap();
+    assert_eq!(page.show_as.as_deref(), Some("Garage shelf"));
+    assert_eq!(page.row.name, "Garage shelf");
     port.act(Act::ShowAs(id.clone(), "  ".into()));
     assert_eq!(app.speaker_settings(&id).show_as, None, "an empty name gives it its own back");
-
-    assert_eq!(port.general().when_stops, Some(WhenStops::BringBack));
-    port.act(Act::WhenStops(WhenStops::StaySilent));
-    assert!(!app.is_auto_reconnect_on_drop());
-    assert_eq!(port.general().when_stops, Some(WhenStops::StaySilent));
 }
 
 #[test]
@@ -583,4 +577,69 @@ fn the_real_app_lists_refused_devices_and_allows_one() {
     port.act(Act::Allow { address: "192.0.2.77".into(), speaker: String::new() });
     assert!(port.privacy().refused.unwrap().is_empty());
     assert!(app.check_stream_client(peer).is_ok(), "allowed for this run");
+}
+
+#[test]
+fn the_playback_check_names_the_place_before_its_session_starts() {
+    use crate::model::{samples, view::view, PortCore};
+    let (app, settings, _) = real();
+    let port = Arc::new(PortCore::new(view(samples::named("kitchen-nothing-playing"), None, false, 1)));
+    app.engine_port.set(Arc::downgrade(&port)).unwrap();
+    assert!(!app.is_speaker_bound());
+    assert_eq!(settings.playback_check().speaker.as_deref(), Some("Kitchen"));
+    port.publish(view(samples::named("pc-plain"), None, false, 2));
+    assert_eq!(settings.playback_check().speaker, None);
+}
+
+#[test]
+fn a_report_without_speaker_details_omits_identifying_text_from_every_part() {
+    let (app, port, _) = real();
+    let id = with_speaker(&app);
+    let message = format!("Garage AirPlay {id} 192.0.2.40");
+    *app.connecting.lock().unwrap() = Some(message.clone());
+    app.record_error(&message);
+    app.record_fault(&message);
+    let report = port.report(ReportParts { speakers: false, log: true, ..ReportParts::default() });
+    assert!(report.contains("[now]") && report.contains("[statistics just before it]"));
+    for detail in ["Garage", "AirPlay", &id, "192.0.2.40"] {
+        assert!(!report.contains(detail), "{report}");
+    }
+
+    let mut h = Harness::dialog(Dialog::Report(ReportDialog::with_text("Bedroom is silent")), ScriptedSettings::new());
+    h.click("The log file");
+    h.click("Speaker names, kinds and addresses");
+    h.click("Open a GitHub issue");
+    // The person's own words go as written; the app adds no speaker details.
+    assert!(matches!(h.acts().as_slice(), [Act::OpenIssue(text)] if text.contains("Bedroom is silent")
+        && ["Kitchen", "Sonos", "192.168", "[log file attached]"].iter().all(|detail| !text.contains(detail))));
+}
+
+#[test]
+fn saving_a_report_reports_the_file_and_folder_results() {
+    use std::sync::atomic::Ordering;
+    let (_, settings, desk) = real();
+    let dir = std::env::temp_dir().join(format!("sts-report-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(settings.save_report_in(None, "report"), ReportSave::Failed);
+    assert_eq!(settings.save_report_in(Some(&dir.join("missing")), "report"), ReportSave::Failed);
+    assert!(desk.opened.lock().unwrap().is_empty());
+    desk.refuse_folder.store(true, Ordering::Relaxed);
+    assert_eq!(settings.save_report_in(Some(&dir), "report"), ReportSave::SavedOnly);
+    let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "report");
+    desk.refuse_folder.store(false, Ordering::Relaxed);
+    assert_eq!(settings.save_report_in(Some(&dir), "report"), ReportSave::Opened);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    for (result, words) in [
+        (ReportSave::Failed, "Couldn’t save the report in your log folder."),
+        (ReportSave::SavedOnly, "Saved in your log folder. The folder couldn’t be opened."),
+        (ReportSave::Opened, "Saved in your log folder, which is open now."),
+    ] {
+        let port = ScriptedSettings::new();
+        port.set(|s| s.report_save = result);
+        let mut h = Harness::dialog(Dialog::Report(ReportDialog::default()), port);
+        h.click("Save as a file");
+        assert!(h.shows(words));
+    }
 }

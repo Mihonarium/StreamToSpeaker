@@ -1,0 +1,107 @@
+//! The serial loop for the new surfaces.
+
+use super::*;
+use crate::model::situation::{Doing, Standing};
+use crate::model::view::device_name_not_running;
+use crate::model::view::{view, View};
+
+/// Where the loop sends what it makes.
+pub(crate) struct Outlet {
+    /// Makes a view current for every surface and returns it as published.
+    pub publish: Box<dyn Fn(View) -> Arc<View> + Send>,
+    /// The level meter, from zero to one.
+    pub level: Box<dyn Fn(f32) + Send>,
+}
+
+/// Called once a command has been carried out and its effect published.
+pub(crate) type Answer = Box<dyn FnOnce(Result<Effect, Refusal>, Arc<View>) + Send>;
+
+impl PlaceDriver {
+    /// Runs until Stop arrives or the last caller drops its sender.
+    pub(crate) fn run(mut self, rx: Receiver<PlaceInput>, start: StartKind, out: Outlet) {
+        self.start(start);
+        let mut current = self.publish(&out, None);
+        loop {
+            // Only callers own senders to rx. Windows and the driver's
+            // workers can report events without keeping the loop alive.
+            let received = crossbeam_channel::select! {
+                recv(rx) -> msg => Some(msg.unwrap_or(PlaceInput::Stop)),
+                recv(self.events) -> msg => Some(msg.unwrap_or(PlaceInput::Stop)),
+                default(self.next_wake()) => None,
+            };
+            if matches!(received, Some(PlaceInput::Stop)) {
+                break;
+            }
+            let answer = received.and_then(|i| self.input(i));
+            self.look();
+            current = self.publish(&out, Some(current));
+            if let Some((reply, result)) = answer {
+                reply(result, current.clone());
+            }
+        }
+        self.input(PlaceInput::Stop);
+        for t in self.threads {
+            let _ = t.join();
+        }
+    }
+
+    fn publish(&mut self, out: &Outlet, previous: Option<Arc<View>>) -> Arc<View> {
+        let (scene, ours) = self.scene_and_output();
+        let sit = &scene.situation;
+        let sending = sit.doing == Doing::Playing
+            && sit
+                .place_speaker()
+                .is_some_and(|id| self.core.connected_speaker() == Some(id))
+            && !sit.standing.contains(&Standing::MusicAssistantNotStarted);
+        let level = ours
+            .as_ref()
+            .filter(|_| sending)
+            .map_or(0.0, |id| self.platform.sessions.peak(id).clamp(0.05, 1.0));
+        let version = previous.as_ref().map_or(0, |v| v.version);
+        let mut next = view(scene, self.core.named(), ours.is_none(), version);
+        let current = match previous {
+            Some(old) if *old == next => old,
+            old => {
+                if let Some(name) = &next.device_name {
+                    if old.as_ref().and_then(|v| v.device_name.as_ref()) != Some(name) {
+                        if let Err(e) = self.platform.device.rename(name) {
+                            debug!("couldn't name the app's output: {e}");
+                        }
+                    }
+                }
+                let pc = &next.scene.situation.pc_output;
+                let name = device_name_not_running(next.lang);
+                if old.as_ref().is_none_or(|v| {
+                    &v.scene.situation.pc_output != pc || device_name_not_running(v.lang) != name
+                }) {
+                    self.platform.handback.prepare(pc.as_ref(), &name);
+                }
+                next.version += 1;
+                (out.publish)(next)
+            }
+        };
+        (out.level)(level);
+        current
+    }
+}
+
+/// Starts the place driver on its own thread and subscribes it to Windows.
+pub(crate) fn spawn(
+    app: Arc<App>,
+    platform: Platform,
+    opener: Arc<Mutex<Option<Opener>>>,
+    start: StartKind,
+    out: Outlet,
+) -> std::io::Result<(Sender<PlaceInput>, JoinHandle<()>)> {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let notices = platform.events.clone();
+    let driver = PlaceDriver::new(app, platform, opener, Instant::now());
+    let events = driver.tx.clone();
+    let thread = std::thread::Builder::new()
+        .name("stream-to-speaker-place".into())
+        .spawn(move || driver.run(rx, start, out))?;
+    notices.subscribe(Arc::new(move |e| {
+        let _ = events.send(PlaceInput::System(e));
+    }));
+    Ok((tx, thread))
+}

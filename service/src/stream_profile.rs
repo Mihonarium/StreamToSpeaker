@@ -140,10 +140,10 @@ impl fmt::Display for StreamProfile {
     }
 }
 
-/// One entry of a protocol list (\[CM\], the UPnP ConnectionManager service
-/// specification, 2.5.2:
-/// `<protocol>:<network>:<contentFormat>:<additionalInfo>`), the parts
-/// that choose a profile.
+/// One entry of the protocol list a renderer's ConnectionManager gives
+/// (`<protocol>:<network>:<contentFormat>:<additionalInfo>`, such as
+/// `http-get:*:audio/L16;rate=44100;channels=2:*`): the two parts that
+/// choose a profile, how the stream is fetched and its media type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolInfo {
     pub protocol: String,

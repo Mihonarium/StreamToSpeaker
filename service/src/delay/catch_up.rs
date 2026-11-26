@@ -17,7 +17,8 @@
 //! The person's change is held as a target; each fetch's [`Listener`]
 //! counts what it has applied so far. A speaker that runs dry soon after
 //! delay was removed (it fetches again, or its transport says it is
-//! buffering) gets some back: see [`CatchUp::listener`].
+//! buffering) is reported as a cut-out (see [`CatchUp::listener`]); the
+//! app never changes the delay itself.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,17 +36,15 @@ const FRAME_BYTES: usize = 4;
 /// A fetch that delivered this much before the next one came was playing;
 /// one that ended sooner was the speaker probing the stream.
 const PLAYED_BEFORE_REFETCH: Duration = Duration::from_secs(2);
-/// A speaker that runs dry this soon after delay was removed gets some
-/// back.
+/// A speaker that runs dry this soon after delay was removed cut out
+/// because of it.
 pub const DRY_AFTER_REMOVE: Duration = Duration::from_secs(30);
-/// How much goes back each time.
-pub const BACK_OFF_MS: i32 = 50;
 
-/// Some removed delay went back because the speaker ran dry.
+/// The speaker's sound cut out soon after delay was removed; `removed_ms`
+/// is what was removed then. Nothing changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BackOff {
-    pub from_ms: i32,
-    pub to_ms: i32,
+pub struct CutOut {
+    pub removed_ms: u32,
 }
 
 /// The bound UPnP speaker's catch-up, shared by the fetches serving it.
@@ -57,8 +56,8 @@ pub struct CatchUp {
     /// Apply a change at once, with a short skip, instead of gradually.
     at_once: AtomicBool,
     inner: Mutex<Inner>,
-    /// Told of each back-off, after it took effect.
-    on_back_off: Mutex<Option<Box<dyn Fn(BackOff) + Send + Sync>>>,
+    /// Told of each cut-out.
+    on_cut_out: Mutex<Option<Box<dyn Fn(CutOut) + Send + Sync>>>,
 }
 
 #[derive(Default)]
@@ -91,13 +90,13 @@ impl CatchUp {
             step,
             at_once: AtomicBool::new(false),
             inner: Mutex::new(Inner::default()),
-            on_back_off: Mutex::new(None),
+            on_cut_out: Mutex::new(None),
         })
     }
 
-    /// Call `f` after each back-off (see [`Self::listener`]).
-    pub fn on_back_off(&self, f: impl Fn(BackOff) + Send + Sync + 'static) {
-        *self.on_back_off.lock().unwrap() = Some(Box::new(f));
+    /// Call `f` at each cut-out (see [`Self::listener`]).
+    pub fn on_cut_out(&self, f: impl Fn(CutOut) + Send + Sync + 'static) {
+        *self.on_cut_out.lock().unwrap() = Some(Box::new(f));
     }
 
     /// A speaker's session begins with `change_ms`: nothing is applied
@@ -139,41 +138,41 @@ impl CatchUp {
     /// A new fetch by the speaker. The speaker starts it with its own
     /// delay, so the whole change applies again on it. If a fetch that had
     /// been playing came before it while delay was removed recently, the
-    /// speaker ran dry: [`BACK_OFF_MS`] of what was removed goes back.
+    /// speaker ran dry: a cut-out.
     pub fn listener(self: &Arc<Self>) -> Listener {
-        let (back_off, listener) = {
+        let (cut_out, listener) = {
             let mut inner = self.inner.lock().unwrap();
             let ran_dry = inner.current.is_some_and(|c| c.delivered_frames >= played_frames());
-            let back_off = if ran_dry { self.back_off_if_recent(&inner) } else { None };
+            let cut_out = if ran_dry { self.cut_out_if_recent(&inner) } else { None };
             inner.next_listener += 1;
             let number = inner.next_listener;
             inner.current = Some(Current { number, delivered_frames: 0, applied_frames: 0, dropped_frames: 0 });
             let rebuffers_seen = inner.rebuffers;
-            (back_off, Listener { up: self.clone(), number, applied_frames: 0, delivered_frames: 0, rebuffers_seen })
+            (cut_out, Listener { up: self.clone(), number, applied_frames: 0, delivered_frames: 0, rebuffers_seen })
         };
-        self.told(back_off);
+        self.told(cut_out);
         listener
     }
 
     /// The speaker refilled its buffer on the same fetch (its transport
     /// went through TRANSITIONING): it is back at its own delay, so the
-    /// change applies again; with the same back-off as a new fetch.
+    /// change applies again; a cut-out as for a new fetch.
     pub fn speaker_rebuffered(&self) {
-        let back_off = {
+        let cut_out = {
             let mut inner = self.inner.lock().unwrap();
             let playing = inner.current.is_some_and(|c| c.delivered_frames >= played_frames());
-            let back_off = if playing { self.back_off_if_recent(&inner) } else { None };
+            let cut_out = if playing { self.cut_out_if_recent(&inner) } else { None };
             inner.rebuffers += 1;
             if let Some(c) = inner.current.as_mut() {
                 c.applied_frames = 0;
             }
-            back_off
+            cut_out
         };
-        self.told(back_off);
+        self.told(cut_out);
     }
 
     /// The speaker was told to start over (Stop and Play): like a refill,
-    /// without the back-off, since nobody's change ran it dry.
+    /// without a cut-out, since nobody's change ran it dry.
     pub fn restarted(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.rebuffers += 1;
@@ -183,24 +182,19 @@ impl CatchUp {
         }
     }
 
-    /// Give [`BACK_OFF_MS`] of removed delay back if frames were removed
-    /// within [`DRY_AFTER_REMOVE`].
-    fn back_off_if_recent(&self, inner: &Inner) -> Option<BackOff> {
-        let from_ms = self.target_ms();
+    /// A cut-out, if delay is removed and frames were removed within
+    /// [`DRY_AFTER_REMOVE`].
+    fn cut_out_if_recent(&self, inner: &Inner) -> Option<CutOut> {
+        let change_ms = self.target_ms();
         let recent = inner.last_removed.is_some_and(|t| t.elapsed() <= DRY_AFTER_REMOVE);
-        if from_ms >= 0 || !recent {
-            return None;
-        }
-        let to_ms = (from_ms + BACK_OFF_MS).min(0);
-        self.target_ms.store(to_ms, Ordering::Release);
-        Some(BackOff { from_ms, to_ms })
+        (change_ms < 0 && recent).then_some(CutOut { removed_ms: change_ms.unsigned_abs() })
     }
 
-    fn told(&self, back_off: Option<BackOff>) {
-        if let Some(b) = back_off {
-            log::info!("delay: the speaker ran dry {} ms removed; now {} ms", -b.from_ms, -b.to_ms);
-            if let Some(f) = self.on_back_off.lock().unwrap().as_ref() {
-                f(b);
+    fn told(&self, cut_out: Option<CutOut>) {
+        if let Some(c) = cut_out {
+            log::info!("delay: the speaker ran dry with {} ms removed", c.removed_ms);
+            if let Some(f) = self.on_cut_out.lock().unwrap().as_ref() {
+                f(c);
             }
         }
     }
@@ -403,32 +397,37 @@ mod tests {
         assert_eq!(c.ms_to_go(), 0);
     }
 
+    /// A speaker that runs dry soon after delay was removed cut out: that
+    /// is reported, with what was removed, and nothing changes; the app
+    /// never puts delay back by itself.
     #[test]
-    fn running_dry_soon_after_removing_gives_some_back() {
-        let backs = Arc::new(Mutex::new(Vec::new()));
+    fn a_speaker_that_runs_dry_is_a_cut_out_and_nothing_changes() {
+        let cuts = Arc::new(Mutex::new(Vec::new()));
         let c = catch_up(4);
-        let b = backs.clone();
-        c.on_back_off(move |x| b.lock().unwrap().push(x));
+        let b = cuts.clone();
+        c.on_cut_out(move |x| b.lock().unwrap().push(x));
         c.begin_session(-200);
         let mut l = c.listener();
         // Plays 3 s (removing as it goes), then the speaker fetches again.
         run(&mut l, 300);
         let mut again = c.listener();
-        assert_eq!(c.target_ms(), -150);
-        assert_eq!(*backs.lock().unwrap(), vec![BackOff { from_ms: -200, to_ms: -150 }]);
-        // The new fetch applies the new target (6615 frames, 4 a packet).
-        run(&mut again, 1700);
+        assert_eq!(c.target_ms(), -200, "nothing goes back");
+        assert_eq!(*cuts.lock().unwrap(), vec![CutOut { removed_ms: 200 }]);
+        // The new fetch applies the whole change again (8820 frames, 4 a
+        // packet).
+        run(&mut again, 2300);
         assert_eq!(c.ms_to_go(), 0);
-        // The same for a refill on the same fetch, down to nothing removed.
+        // The same for a refill on the same fetch.
         c.set_target(-30);
         run(&mut again, 300);
         c.speaker_rebuffered();
-        assert_eq!(c.target_ms(), 0);
-        assert_eq!(backs.lock().unwrap().len(), 2);
-        // Nothing removed: nothing to give back.
+        assert_eq!(c.target_ms(), -30);
+        assert_eq!(cuts.lock().unwrap().len(), 2);
+        // Nothing removed: no cut-out of the app's making.
+        c.set_target(0);
         run(&mut again, 300);
         let _third = c.listener();
-        assert_eq!(backs.lock().unwrap().len(), 2);
+        assert_eq!(cuts.lock().unwrap().len(), 2);
     }
 
     #[test]

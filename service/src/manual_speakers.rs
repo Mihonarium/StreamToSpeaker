@@ -285,6 +285,7 @@ pub fn probe_info(addr: SocketAddr, timeout: Duration) -> Result<Option<Receiver
     }
     let deadline = Instant::now() + timeout;
     Ok(read_response(&mut stream, deadline).and_then(|(status, body)| {
+        crate::engine::cancel::speaker_answered();
         (status == 200).then(|| parse_info(&body)).flatten()
     }))
 }

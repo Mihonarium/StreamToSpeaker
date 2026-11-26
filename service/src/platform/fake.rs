@@ -1,15 +1,16 @@
 //! Windows, played in memory for tests and demos: four outputs (the PC's
 //! speakers, headphones, a monitor that is switched off, and this app's
-//! own), a default that a test can
-//! move as the person would, apps that play, and a record of what the app
-//! asked for.
+//! own), a default that a test can move as the person would, apps that
+//! play, players that obey or not, a network that changes, a screen reader
+//! that is on or off, and a record of what the app asked for.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::{
-    AppAudio, AudioSessions, EventSink, Handback, OurDevice, OutputInfo, OutputKind, Outputs, PcOutputId, Platform,
-    Role, SystemEvent, SystemEvents,
+    app_key, AppAudio, AudioSessions, ConnKind, Desk, EventSink, Handback, NetConnection, Network, OurDevice,
+    OutputInfo, OutputKind, Outputs, PassThrough, PcOutputId, Platform, Player, PlayerStatus, Players, Role,
+    SystemEvent, SystemEvents,
 };
 
 /// The PC's own speakers.
@@ -20,6 +21,25 @@ pub const HEADPHONES: &str = "headphones";
 pub const MONITOR: &str = "monitor";
 /// This app's output.
 pub const OURS: &str = "stream-to-speaker";
+/// The network this PC is on at home.
+pub const HOME_NET: &str = "home-wifi";
+
+/// What the app asked a player to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Asked {
+    Pause(String),
+    Play(String),
+}
+
+/// What the app did with the pass-through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Passed {
+    Opened(PcOutputId),
+    /// Frames written while an output was open: how many, at which rate,
+    /// with how many channels.
+    Wrote { frames: usize, rate: u32, channels: u16 },
+    Closed,
+}
 
 #[derive(Default)]
 struct State {
@@ -35,6 +55,16 @@ struct State {
     switches: Vec<(PcOutputId, Vec<Role>)>,
     names: Vec<String>,
     handback: Option<(Option<PcOutputId>, String)>,
+    #[cfg(test)]
+    preparations: usize,
+    players: Vec<Player>,
+    /// Players that take a pause or a play without doing it.
+    deaf: Vec<String>,
+    asked: Vec<Asked>,
+    pass_open: Option<PcOutputId>,
+    passed: Vec<Passed>,
+    connections: Vec<NetConnection>,
+    screen_reader: bool,
 }
 
 /// Windows in memory.
@@ -76,6 +106,8 @@ impl FakePlatform {
         state.levels.insert(id(SPEAKERS), (40, false));
         state.levels.insert(id(HEADPHONES), (24, false));
         state.levels.insert(id(OURS), (100, false));
+        state.connections =
+            vec![NetConnection { id: HOME_NET.into(), name: Some("Home".into()), kind: ConnKind::WiFi }];
         Arc::new(FakePlatform { state: Mutex::new(state), sinks: Mutex::new(Vec::new()) })
     }
 
@@ -87,6 +119,10 @@ impl FakePlatform {
             device: self.clone(),
             handback: self.clone(),
             events: self.clone(),
+            players: self.clone(),
+            pass: self.clone(),
+            network: self.clone(),
+            desk: self.clone(),
         }
     }
 
@@ -125,8 +161,94 @@ impl FakePlatform {
         let mut st = self.state.lock().unwrap();
         st.sessions.retain(|s| !(s.app == app && s.output == id(output)));
         if let Some(peak) = peak {
-            st.sessions.push(AppAudio { app: app.into(), output: id(output), peak, system_sounds: app == "System" });
+            let system_sounds = app == "System";
+            let key = if system_sounds { String::new() } else { app_key(app) };
+            st.sessions.push(AppAudio { app: app.into(), key, output: id(output), peak, system_sounds });
         }
+    }
+
+    /// `app` has a media session that does `status` (it gets one if it had
+    /// none); `None` ends its session. The session's id is the app's key.
+    pub fn player(&self, app: &str, status: Option<PlayerStatus>) {
+        {
+            let mut st = self.state.lock().unwrap();
+            let key = app_key(app);
+            match status {
+                None => st.players.retain(|p| p.id != key),
+                Some(status) => match st.players.iter_mut().find(|p| p.id == key) {
+                    Some(p) => p.status = status,
+                    None => st.players.push(Player {
+                        id: key.clone(),
+                        app: Some(key),
+                        name: Some(app.to_string()),
+                        status,
+                        title: None,
+                    }),
+                },
+            }
+        }
+        self.fire(SystemEvent::PlayersChanged);
+    }
+
+    /// A media session exactly as given (one Windows names in a way that
+    /// matches no program, one with a title); it replaces the session of
+    /// the same id.
+    pub fn put_player(&self, player: Player) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.players.retain(|p| p.id != player.id);
+            st.players.push(player);
+        }
+        self.fire(SystemEvent::PlayersChanged);
+    }
+
+    /// The player of `app` takes a pause or a play without doing it from
+    /// now on (or obeys again).
+    pub fn player_ignores(&self, app: &str, ignores: bool) {
+        let mut st = self.state.lock().unwrap();
+        let key = app_key(app);
+        st.deaf.retain(|k| *k != key);
+        if ignores {
+            st.deaf.push(key);
+        }
+    }
+
+    /// What the app asked of players, in order.
+    pub fn asked(&self) -> Vec<Asked> {
+        self.state.lock().unwrap().asked.clone()
+    }
+
+    /// What the app did with the pass-through, in order.
+    pub fn passed(&self) -> Vec<Passed> {
+        self.state.lock().unwrap().passed.clone()
+    }
+
+    /// The output the pass-through plays on now.
+    pub fn passing_to(&self) -> Option<PcOutputId> {
+        self.state.lock().unwrap().pass_open.clone()
+    }
+
+    /// This PC's connections are these from now on (none: offline).
+    pub fn connect_to(&self, connections: Vec<NetConnection>) {
+        self.state.lock().unwrap().connections = connections;
+        self.fire(SystemEvent::NetworkChanged);
+    }
+
+    /// A screen reader starts or ends.
+    pub fn set_screen_reader(&self, on: bool) {
+        self.state.lock().unwrap().screen_reader = on;
+    }
+
+    /// An output is switched on in Windows (plugged in, connected) or off.
+    pub fn set_output_on(&self, output: &str, on: bool) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.off.retain(|o| *o != id(output));
+            if !on {
+                st.off.push(id(output));
+            }
+        }
+        self.fire(SystemEvent::OutputsChanged);
     }
 
     /// Windows says something.
@@ -152,6 +274,12 @@ impl FakePlatform {
     /// What the app said to do if it dies.
     pub fn handback(&self) -> Option<(Option<PcOutputId>, String)> {
         self.state.lock().unwrap().handback.clone()
+    }
+
+    /// Number of times the engine prepared the crash handback.
+    #[cfg(test)]
+    pub(crate) fn preparations(&self) -> usize {
+        self.state.lock().unwrap().preparations
     }
 
     /// An output's level.
@@ -238,6 +366,10 @@ impl OurDevice for FakePlatform {
 
 impl Handback for FakePlatform {
     fn prepare(&self, output: Option<&PcOutputId>, name: &str) {
+        #[cfg(test)]
+        {
+            self.state.lock().unwrap().preparations += 1;
+        }
         self.state.lock().unwrap().handback = Some((output.cloned(), name.to_string()));
     }
 }
@@ -245,6 +377,85 @@ impl Handback for FakePlatform {
 impl SystemEvents for FakePlatform {
     fn subscribe(&self, sink: EventSink) {
         self.sinks.lock().unwrap().push(sink);
+    }
+}
+
+impl FakePlatform {
+    /// A pause or a play asked of `player`: recorded, and done unless the
+    /// player ignores it.
+    fn ask(&self, player: &str, asked: Asked, becomes: PlayerStatus) -> Result<(), String> {
+        let changed = {
+            let mut st = self.state.lock().unwrap();
+            if !st.players.iter().any(|p| p.id == player) {
+                return Err("no such player".into());
+            }
+            st.asked.push(asked);
+            if st.deaf.iter().any(|k| k == player) {
+                false
+            } else {
+                let p = st.players.iter_mut().find(|p| p.id == player).expect("checked above");
+                let changed = p.status != becomes;
+                p.status = becomes;
+                changed
+            }
+        };
+        if changed {
+            self.fire(SystemEvent::PlayersChanged);
+        }
+        Ok(())
+    }
+}
+
+impl Players for FakePlatform {
+    fn list(&self) -> Vec<Player> {
+        self.state.lock().unwrap().players.clone()
+    }
+
+    fn pause(&self, player: &str) -> Result<(), String> {
+        self.ask(player, Asked::Pause(player.to_string()), PlayerStatus::Paused)
+    }
+
+    fn play(&self, player: &str) -> Result<(), String> {
+        self.ask(player, Asked::Play(player.to_string()), PlayerStatus::Playing)
+    }
+}
+
+impl PassThrough for FakePlatform {
+    fn open(&self, output: &PcOutputId) -> Result<(), String> {
+        let mut st = self.state.lock().unwrap();
+        if st.off.contains(output) || !st.outputs.iter().any(|o| &o.id == output) || *output == id(OURS) {
+            return Err("no such output of this PC".into());
+        }
+        st.pass_open = Some(output.clone());
+        st.passed.push(Passed::Opened(output.clone()));
+        Ok(())
+    }
+
+    fn write(&self, frames: &[i16], rate: u32, channels: u16) {
+        let mut st = self.state.lock().unwrap();
+        if st.pass_open.is_some() {
+            let frames = frames.len() / usize::from(channels.max(1));
+            st.passed.push(Passed::Wrote { frames, rate, channels });
+        }
+    }
+
+    fn close(&self) {
+        let mut st = self.state.lock().unwrap();
+        if st.pass_open.take().is_some() {
+            st.passed.push(Passed::Closed);
+        }
+    }
+}
+
+impl Network for FakePlatform {
+    fn connections(&self) -> Vec<NetConnection> {
+        self.state.lock().unwrap().connections.clone()
+    }
+}
+
+impl Desk for FakePlatform {
+    fn screen_reader(&self) -> bool {
+        self.state.lock().unwrap().screen_reader
     }
 }
 
@@ -290,5 +501,86 @@ mod tests {
         assert!(!p.knows_outputs());
         assert!(p.outputs.set_default(&id(OURS), crate::platform::PLAYBACK_ROLES).is_err());
         assert!(p.sessions.sessions().is_empty());
+        assert!(p.players.list().is_empty());
+        assert!(p.players.pause("spotify").is_err());
+        assert!(p.pass.open(&id(SPEAKERS)).is_err());
+        assert!(!p.desk.screen_reader());
+        assert_eq!(p.network.connections().len(), 1, "it can't tell, so it doesn't say this PC is offline");
+    }
+
+    #[test]
+    fn players_pause_and_play_through_the_seam() {
+        let fake = FakePlatform::new();
+        let p = fake.platform();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let h = heard.clone();
+        p.events.subscribe(Arc::new(move |e| h.lock().unwrap().push(e)));
+        fake.player("Spotify.exe", Some(PlayerStatus::Playing));
+        let list = p.players.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].app.as_deref(), Some("spotify"), "the key its sound carries too");
+        fake.app_plays("Spotify.exe", OURS, Some(0.4));
+        assert_eq!(p.sessions.sessions()[0].key, "spotify");
+
+        p.players.pause("spotify").unwrap();
+        assert_eq!(p.players.list()[0].status, PlayerStatus::Paused);
+        p.players.play("spotify").unwrap();
+        assert_eq!(p.players.list()[0].status, PlayerStatus::Playing);
+        assert_eq!(fake.asked(), vec![Asked::Pause("spotify".into()), Asked::Play("spotify".into())]);
+        assert_eq!(heard.lock().unwrap().iter().filter(|e| **e == SystemEvent::PlayersChanged).count(), 3);
+
+        fake.player_ignores("Spotify.exe", true);
+        p.players.pause("spotify").unwrap();
+        assert_eq!(p.players.list()[0].status, PlayerStatus::Playing, "asked, and it went on playing");
+        assert!(p.players.pause("vlc").is_err(), "no such player");
+        fake.player("Spotify.exe", None);
+        assert!(p.players.list().is_empty());
+    }
+
+    #[test]
+    fn the_pass_through_plays_on_one_of_the_pcs_own_outputs() {
+        let fake = FakePlatform::new();
+        let p = fake.platform();
+        p.pass.write(&[0; 8], 48_000, 2);
+        assert!(fake.passed().is_empty(), "nothing is open: nothing is played");
+        assert!(p.pass.open(&id(OURS)).is_err(), "never the app's own device");
+        assert!(p.pass.open(&id(MONITOR)).is_err(), "an output that is switched off");
+        p.pass.open(&id(SPEAKERS)).unwrap();
+        p.pass.write(&[0; 8], 48_000, 2);
+        p.pass.open(&id(HEADPHONES)).unwrap();
+        assert_eq!(fake.passing_to(), Some(id(HEADPHONES)));
+        p.pass.close();
+        p.pass.close();
+        assert_eq!(
+            fake.passed(),
+            vec![
+                Passed::Opened(id(SPEAKERS)),
+                Passed::Wrote { frames: 4, rate: 48_000, channels: 2 },
+                Passed::Opened(id(HEADPHONES)),
+                Passed::Closed,
+            ]
+        );
+    }
+
+    #[test]
+    fn network_changes_and_outputs_that_come_and_go_are_told() {
+        let fake = FakePlatform::new();
+        let p = fake.platform();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let h = heard.clone();
+        p.events.subscribe(Arc::new(move |e| h.lock().unwrap().push(e)));
+        assert_eq!(p.network.connections()[0].id, HOME_NET);
+        fake.connect_to(Vec::new());
+        assert!(p.network.connections().is_empty(), "offline");
+        fake.set_output_on(HEADPHONES, false);
+        assert!(!p.outputs.list().iter().any(|o| o.id == id(HEADPHONES)));
+        fake.set_output_on(HEADPHONES, true);
+        assert!(p.outputs.list().iter().any(|o| o.id == id(HEADPHONES)));
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![SystemEvent::NetworkChanged, SystemEvent::OutputsChanged, SystemEvent::OutputsChanged]
+        );
+        fake.set_screen_reader(true);
+        assert!(p.desk.screen_reader());
     }
 }

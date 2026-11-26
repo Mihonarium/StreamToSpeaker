@@ -33,7 +33,7 @@ pub mod engine;
 pub mod reconnect;
 pub mod upgrade;
 
-pub use engine::{ChangeOutcome, DelayEngine, DelayStatus, Notice, Progress};
+pub use engine::{ChangeOutcome, DelayEngine, DelayOffer, DelayStatus, Notice, Offered, Progress, OFFER_ADD_MS};
 
 /// Short delay or Steady: the coarse choice of an AirPlay speaker or a
 /// single HomePod. What is removed or added is kept for each.

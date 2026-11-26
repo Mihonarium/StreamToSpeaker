@@ -1,10 +1,10 @@
 //! Who may use the web page and the JSON API (`--web`, or "Enable web UI").
 //!
-//! Both need one secret: 128 random bits from the operating system,
+//! The phone link and optional scripts key each use 128 random bits from the operating system,
 //! written as 32 hex digits. The page is served only under `/r/<secret>/`
 //! (its script too), so the link the app shows is the whole credential for
 //! a browser, and the page's script reads the secret from its own address.
-//! Every `/api/*` request must carry `Authorization: Bearer <secret>`.
+//! Every `/api/*` request must carry an enabled phone or scripts secret in its bearer header.
 //! Requests are checked against it in constant time.
 //!
 //! Not behind it: `/stream.raw` and GENA NOTIFY, which speakers call and
@@ -99,12 +99,13 @@ fn hex_value(c: u8) -> Option<u8> {
 pub struct WebAccess {
     enabled: AtomicBool,
     secret: RwLock<Option<WebSecret>>,
+    scripts: RwLock<Option<WebSecret>>,
 }
 
 impl WebAccess {
     /// Off, with no secret yet.
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { enabled: AtomicBool::new(false), secret: RwLock::new(None) })
+        Arc::new(Self { enabled: AtomicBool::new(false), secret: RwLock::new(None), scripts: RwLock::new(None) })
     }
 
     /// On, with `secret`.
@@ -140,10 +141,20 @@ impl WebAccess {
         self.secret.read().unwrap().as_ref().is_some_and(|s| s.matches(key))
     }
 
+    pub(crate) fn set_scripts_key(&self, key: Option<WebSecret>) {
+        *self.scripts.write().unwrap() = key;
+    }
+
+    pub(crate) fn api_enabled(&self) -> bool {
+        self.is_enabled() || self.scripts.read().unwrap().is_some()
+    }
+
     /// Does this `Authorization` header value carry the secret as a bearer
     /// token?
     pub fn bearer_ok(&self, authorization: Option<&str>) -> bool {
-        authorization.and_then(bearer_token).is_some_and(|token| self.path_key_ok(token))
+        authorization.and_then(bearer_token).is_some_and(|token| {
+            (self.is_enabled() && self.path_key_ok(token)) || self.scripts.read().unwrap().as_ref().is_some_and(|s| s.matches(token))
+        })
     }
 }
 
@@ -281,6 +292,7 @@ mod tests {
         assert!(!access.bearer_ok(Some(&format!("Bearer {HEX}"))));
         access.set_secret(WebSecret::parse(HEX).unwrap());
         assert!(access.path_key_ok(HEX));
+        assert!(access.set_enabled(true));
         for ok in [format!("Bearer {HEX}"), format!("bearer {HEX}"), format!("  BEARER \t{HEX}  ")] {
             assert!(access.bearer_ok(Some(&ok)), "{ok:?}");
         }
@@ -302,7 +314,13 @@ mod tests {
         assert!(!access.path_key_ok(HEX));
         assert!(access.path_key_ok(&new_hex));
         assert_eq!(access.secret_hex().as_deref(), Some(new_hex.as_str()));
-        assert!(access.set_enabled(true) && !access.set_enabled(true) && access.is_enabled());
+        assert!(!access.set_enabled(true) && access.is_enabled());
+        access.set_scripts_key(WebSecret::parse(HEX));
+        assert!(access.set_enabled(false) && access.api_enabled());
+        assert!(access.bearer_ok(Some(&format!("Bearer {HEX}"))));
+        assert!(!access.bearer_ok(Some(&format!("Bearer {new_hex}"))));
+        access.set_scripts_key(None);
+        assert!(!access.api_enabled());
     }
 
     #[test]

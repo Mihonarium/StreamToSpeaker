@@ -4,7 +4,9 @@
 //! rounded corners, staying out of Alt+Tab).
 
 use super::placement::{Monitor, PxRect};
-use super::{Desktop, PanelMode, PANEL_TITLE};
+use std::sync::Mutex;
+
+use super::{Desktop, Foreground, KeptStyle, PanelMode, ShellWindow, PANEL_TITLE};
 
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
@@ -60,6 +62,16 @@ impl Desktop for WindowsDesktop {
         list
     }
 
+    fn opening_monitor(&mut self, screens: &[Monitor]) -> std::task::Poll<Option<Monitor>> {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut p = POINT { x: 0, y: 0 };
+        // SAFETY: GetCursorPos writes the pointer's position, in physical
+        // pixels like the monitors' rectangles, into `p`, which we own.
+        let at = (unsafe { GetCursorPos(&mut p) } != 0).then(|| PxRect::new(p.x, p.y, p.x, p.y));
+        std::task::Poll::Ready(super::placement::monitor_for(screens, at).copied())
+    }
+
     fn taskbar_is_dark(&self) -> bool {
         // Missing (before Windows 10 1903): the taskbar was dark.
         read_dword(PERSONALIZE, "SystemUsesLightTheme") != Some(1)
@@ -82,20 +94,94 @@ impl Desktop for WindowsDesktop {
             self.styled = Some(hwnd as isize);
             if mode == PanelMode::Flyout {
                 round_corners(hwnd);
-                keep_out_of_alt_tab(hwnd, false);
+            }
+            if let Some(keep) = ShellWindow::Panel(mode).kept_style() {
+                keep_ex_style(hwnd, keep);
             }
         }
         set_rect(hwnd, rect);
         window_rect(hwnd) == Some(rect)
     }
+
+    fn panel_window_shown(&self) -> Option<bool> {
+        let hwnd = self.styled.map(|h| h as HWND).filter(|h| is_own_window_titled(*h, PANEL_TITLE))?;
+        Some(is_visible(hwnd))
+    }
+
+    fn panel_ex_style(&self) -> Option<u32> {
+        let hwnd = self.styled.map(|h| h as HWND).filter(|h| is_own_window_titled(*h, PANEL_TITLE))?;
+        Some(ex_style(hwnd))
+    }
+
+    fn foreground(&self) -> Option<Foreground> {
+        foreground()
+    }
+}
+
+/// The window that has the foreground: its class, its process and program,
+/// and its title when it is one of this app’s windows. Only the file name
+/// of its program is kept.
+fn foreground() -> Option<Foreground> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId};
+    // SAFETY: no arguments.
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 128];
+    // SAFETY: a handle GetForegroundWindow just gave (a stale one makes the
+    // call return 0); the buffer is writable for the length given.
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+    let mut pid = 0u32;
+    // SAFETY: as above; `pid` is a writable u32.
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    let own_title = (pid == std::process::id()).then(|| {
+        let mut title = [0u16; 128];
+        // SAFETY: as above.
+        let n = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+        String::from_utf16_lossy(&title[..n.max(0) as usize])
+    });
+    Some(Foreground { class, pid, program: program_name(pid), own_title })
+}
+
+/// Read the full path of the program process `pid` runs and keep its file name.
+fn program_name(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: asks for the least access there is; a null handle on failure.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: a process handle just opened; the buffer is writable for
+    // `len` characters, which the call sets to what it wrote.
+    let ok = unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) } != 0;
+    // SAFETY: the handle OpenProcess gave, closed once.
+    unsafe { CloseHandle(process) };
+    if !ok {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    path.rsplit(['\\', '/']).next().map(str::to_string)
 }
 
 impl WindowsDesktop {
+    /// The extended style bits of the small window called `title`, shown or
+    /// not, if this thread has one (pop-ups have titles of their own).
+    pub fn popup_ex_style(&self, title: &str) -> Option<u32> {
+        own_window(title, false).map(ex_style)
+    }
+
     /// Style and place a hidden popup window (see [`Desktop::place_popup`]).
     fn place_popup_window(title: &str, rect: PxRect) -> bool {
         let Some(hwnd) = hidden_own_window(title) else { return false };
         round_corners(hwnd);
-        keep_out_of_alt_tab(hwnd, true);
+        if let Some(keep) = ShellWindow::Popup.kept_style() {
+            keep_ex_style(hwnd, keep);
+        }
         set_rect(hwnd, rect);
         window_rect(hwnd) == Some(rect)
     }
@@ -120,6 +206,12 @@ fn read_dword(key: &str, value: &str) -> Option<u32> {
 /// one: the panel before it is shown (a dialog may have the same title,
 /// but it is never hidden).
 pub fn hidden_own_window(title: &str) -> Option<HWND> {
+    own_window(title, true)
+}
+
+/// The app's top-level window called `title`, if this thread made one;
+/// with `hidden_only`, only one that is hidden.
+fn own_window(title: &str, hidden_only: bool) -> Option<HWND> {
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
@@ -137,12 +229,19 @@ pub fn hidden_own_window(title: &str) -> Option<HWND> {
         // SAFETY: a handle FindWindowExW just returned (a stale one only
         // makes the call return 0); the process id is not asked for.
         let thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
-        if thread == me && !is_visible(hwnd) {
+        if thread == me && !(hidden_only && is_visible(hwnd)) {
             return Some(hwnd);
         }
         after = hwnd;
     }
     None
+}
+
+/// A window's extended style bits (`GWL_EXSTYLE`).
+pub fn ex_style(hwnd: HWND) -> u32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE};
+    // SAFETY: a window of this thread; reading its style has no effect.
+    unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 }
 }
 
 /// Whether `hwnd` is still a window of this thread called `title`.
@@ -229,28 +328,88 @@ fn round_corners(hwnd: HWND) {
     }
 }
 
-/// Keep a window out of Alt+Tab and the taskbar (a tool window), and with
-/// `never_active` out of the keyboard's way too.
-pub fn keep_out_of_alt_tab(hwnd: HWND, never_active: bool) {
+/// The windows whose extended style the shell keeps: each with the
+/// window procedure it had and the style it keeps.
+static KEPT: Mutex<Vec<(isize, isize, KeptStyle)>> = Mutex::new(Vec::new());
+
+fn kept() -> std::sync::MutexGuard<'static, Vec<(isize, isize, KeptStyle)>> {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Give `hwnd` the extended style bits of `keep` now, and keep them there
+/// for the window's life. winit writes a window's whole extended style again
+/// whenever it changes a flag of its own (showing the window is one), with
+/// no tool-window or never-activate bit and with `WS_EX_APPWINDOW`; that
+/// put the panel and the root window back in Alt+Tab and the root back in
+/// reach of the focus the moment they were shown. The window's procedure is
+/// wrapped so that every change of its extended style keeps these bits
+/// (`WM_STYLECHANGING` lets a window change the style about to be set).
+pub fn keep_ex_style(hwnd: HWND, keep: KeptStyle) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWLP_WNDPROC, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     };
+    {
+        let mut kept = kept();
+        match kept.iter_mut().find(|(h, _, _)| *h == hwnd as isize) {
+            Some(entry) => entry.2 = keep,
+            None => {
+                // SAFETY: a window of this thread; its procedure becomes
+                // `keep_style_proc`, which passes every message on to the one
+                // returned here, kept with it.
+                let old = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, keep_style_proc as *const () as isize) };
+                if old == 0 {
+                    // The bits are still given once, below; a later write
+                    // of the style by winit takes them off again.
+                    log::warn!("shell: Windows didn't let the shell keep a window's style; giving it once");
+                } else {
+                    kept.push((hwnd as isize, old, keep));
+                }
+            }
+        }
+    }
     // SAFETY: a window of this thread; reading its extended style has no
     // effect.
     let ex = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
-    let mut new = (ex | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW;
-    if never_active {
-        new |= WS_EX_NOACTIVATE;
-    }
+    let new = keep.applied_to(ex);
     if new != ex {
-        // SAFETY: a window of this thread; only the extended style bits
-        // above change, then the frame is told to take them.
+        // SAFETY: a window of this thread; only the kept bits change, then
+        // the frame is told to take them.
         unsafe {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new as isize);
             SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
     }
+}
+
+/// The procedure of a window whose extended style the shell keeps: it keeps
+/// the bits in every change of that style, and passes every message on.
+unsafe extern "system" fn keep_style_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CallWindowProcW, DefWindowProcW, GWL_EXSTYLE, STYLESTRUCT, WM_NCDESTROY, WM_STYLECHANGING, WNDPROC};
+    let found = kept().iter().find(|(h, _, _)| *h == hwnd as isize).map(|(_, old, keep)| (*old, *keep));
+    let Some((old, keep)) = found else {
+        // SAFETY: forward the window and message arguments supplied by Windows.
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    };
+    if msg == WM_STYLECHANGING && wparam as i32 == GWL_EXSTYLE && lparam != 0 {
+        // SAFETY: for WM_STYLECHANGING, lParam points at the STYLESTRUCT
+        // Windows is about to apply, which the window may change.
+        let style = &mut *(lparam as *mut STYLESTRUCT);
+        style.styleNew = keep.applied_to(style.styleNew);
+    }
+    // SAFETY: the procedure the window had, a window procedure (a non-zero
+    // GWLP_WNDPROC value), stored when it was replaced.
+    let previous: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+    // SAFETY: forward the original message arguments to this window’s previous procedure.
+    let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    if msg == WM_NCDESTROY {
+        kept().retain(|(h, _, _)| *h != hwnd as isize);
+    }
+    result
 }
 
 /// Whether a window is shown.
@@ -267,5 +426,46 @@ pub fn hide(hwnd: HWND) {
     // SAFETY: a window of this thread; hiding has no other effect.
     unsafe {
         ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, RegisterClassW, SetWindowLongW, GWL_EXSTYLE, WNDCLASSW, WS_EX_ACCEPTFILES,
+        WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_OVERLAPPED,
+    };
+
+    fn is_kept(hwnd: HWND) -> bool {
+        kept().iter().any(|(h, _, _)| *h == hwnd as isize)
+    }
+
+    #[test]
+    fn a_wrapped_window_keeps_the_shells_bits_when_its_style_is_written_again() {
+        let class: Vec<u16> = "StreamToSpeakerKeptStyleTest\0".encode_utf16().collect();
+        // SAFETY: a plain window of this thread, never shown, made from a
+        // class whose procedure is Windows' default one; every handle used
+        // is the one CreateWindowExW returned, until DestroyWindow.
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null());
+            let wc = WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: instance, lpszClassName: class.as_ptr(), ..std::mem::zeroed() };
+            // Registered already when the test runs again in this process.
+            let _ = RegisterClassW(&wc);
+            let hwnd = CreateWindowExW(0, class.as_ptr(), class.as_ptr(), WS_OVERLAPPED, 0, 0, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null());
+            assert!(!hwnd.is_null(), "no window for the test");
+            keep_ex_style(hwnd, KeptStyle::NEVER_ACTIVE);
+            assert!(is_kept(hwnd));
+            // What winit 0.30 writes when it shows a window without an owner.
+            SetWindowLongW(hwnd, GWL_EXSTYLE, (WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES | WS_EX_APPWINDOW) as i32);
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let bits = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_APPWINDOW;
+            assert_eq!(ex & bits, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, "kept: {}", super::super::ex_style_words(ex));
+            // The rest of what was written stays.
+            assert_eq!(ex & (WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES), WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES);
+            DestroyWindow(hwnd);
+            assert!(!is_kept(hwnd), "the window is forgotten once it is gone");
+        }
     }
 }

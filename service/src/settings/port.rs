@@ -9,7 +9,6 @@
 //! [`super::scripted::ScriptedSettings`] answers in memory, for pictures
 //! and tests; [`super::real`] answers from the running app.
 
-pub use crate::delay::{Applies, DelayChoice, Limits, Notice as DelayNotice, Progress, Unchangeable};
 pub use crate::equalizer::{EqSettings, EQ_BANDS};
 pub use crate::model::facts::SpeakerKind;
 use crate::model::text::{Lang, LocalTime};
@@ -39,6 +38,7 @@ pub trait SettingsPort: Send + Sync {
     fn tone(&self, id: &str) -> Option<ToneView>;
     /// The report's text with these parts, exactly as it would be copied.
     fn report(&self, parts: ReportParts) -> String;
+    fn save_report(&self, text: &str) -> ReportSave;
     /// Do something. Returns at once; what changed shows in the next read.
     fn act(&self, act: Act);
 }
@@ -105,13 +105,6 @@ pub struct SpeakerRow {
     pub kind: SpeakerKind,
     pub presence: Presence,
     pub added_by_address: bool,
-    /// What was removed (negative) or added, ms.
-    pub change_ms: i32,
-    /// Short delay or Steady, for speakers that have the choice.
-    pub choice: Option<DelayChoice>,
-    pub paired: bool,
-    /// A route nobody has tried on real hardware (HomePod pairs).
-    pub untested: bool,
     /// Why this app can't play to it, when it can't.
     pub cant_play: Option<CantPlay>,
 }
@@ -160,110 +153,16 @@ pub enum CantPlay {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpeakerView {
     pub row: SpeakerRow,
-    /// *Sonos One*, when the speaker says.
-    pub model: Option<String>,
-    /// `Some` where *Play a test sound* works.
-    pub test_sound: Option<()>,
-    /// The delay card; `None` where the speaker has none (Music Assistant).
-    pub delay: Option<DelayCard>,
-    /// The other way to reach it, for a speaker reachable two ways.
-    pub connects_with: Option<ConnectsWith>,
-    pub group: Option<Group>,
     /// The volume limit (0–100; 100 = none); `None` where the app can't
     /// limit this speaker.
     pub volume_limit: Option<u8>,
     /// Bass and treble in dB; `None` where tone isn't kept per speaker.
     pub tone: Option<(f32, f32)>,
-    pub comes_back: Option<ComesBack>,
     /// *Show song titles on Kitchen*; `None` where it can't show them.
     pub song_titles: Option<bool>,
-    pub pairing: Option<Pairing>,
     /// *Show as*: the name in this app; `None` where it can't be renamed.
     pub show_as: Option<String>,
     pub details: Details,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct DelayCard {
-    /// The delay engine's status for this speaker.
-    pub status: DelayStatusView,
-    /// A sync check measured this (ms) on that day.
-    pub measured: Option<(u32, Date)>,
-    /// The two step sizes of the buttons.
-    pub small_step_ms: u32,
-    pub large_step_ms: u32,
-    /// UPnP: the Lab's *At once, with a short skip* is on.
-    pub at_once: bool,
-}
-
-/// The delay engine's status, as the page needs it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DelayStatusView {
-    pub choice: Option<DelayChoice>,
-    pub delay_ms: u32,
-    pub own_delay_ms: u32,
-    pub change_ms: i32,
-    pub limits: Option<Limits>,
-    pub applies: Result<Applies, Unchangeable>,
-    pub progress: Progress,
-    pub notice: Option<DelayNotice>,
-    /// The delay on Short delay and on Steady, for the choice's words
-    /// (*about 0.3 s*, *about 2 s*).
-    pub short_ms: u32,
-    pub steady_ms: u32,
-}
-
-impl From<&crate::delay::DelayStatus> for DelayStatusView {
-    fn from(s: &crate::delay::DelayStatus) -> Self {
-        let homepod = matches!(s.kind, crate::delay::Kind::HomePod { .. } | crate::delay::Kind::HomePodPair);
-        DelayStatusView {
-            choice: s.choice,
-            delay_ms: s.delay_ms,
-            own_delay_ms: s.own_delay_ms,
-            change_ms: s.change_ms,
-            limits: s.limits,
-            applies: s.applies,
-            progress: s.progress,
-            notice: s.notice,
-            short_ms: if homepod { crate::delay::HOMEPOD_BASE_MS } else { crate::delay::SHORT_BASE_MS },
-            steady_ms: crate::delay::STEADY_BASE_MS,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ConnectsWith {
-    /// The way in use: `true` = the speaker's own (Sonos), `false` =
-    /// AirPlay.
-    pub own_way: bool,
-    pub own_delay_ms: u32,
-    pub airplay_delay_ms: u32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Group {
-    /// A Sonos group: its rooms.
-    Sonos { members: Vec<String> },
-    /// A HomePod stereo pair: left and right.
-    HomePodPair { left: String, right: String },
-    /// An Apple TV that plays through HomePods.
-    AppleTv { members: Vec<String> },
-}
-
-/// *Comes back by itself*.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ComesBack {
-    WhenLastChosen,
-    WhenItAppears,
-    Never,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Pairing {
-    /// Paired with this PC (on that day, when known).
-    Paired { on: Option<Date> },
-    /// An AirPlay password saved on this PC.
-    PasswordSaved,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -273,12 +172,6 @@ pub struct Details {
     pub address: Option<String>,
     /// *UPnP, Sonos*, *AirPlay (RAOP)*, *AirPlay 2, buffered*.
     pub connection: Option<String>,
-    pub id: String,
-    /// The raw values behind the delay: *AirPlay buffer 1700 ms (Steady
-    /// 2000 ms, 300 ms removed)*.
-    pub delay_values: Option<String>,
-    /// The full error behind the last *Couldn't connect*.
-    pub last_problem: Option<String>,
 }
 
 // -------------------------------------------------------------------------
@@ -290,14 +183,11 @@ pub struct GeneralView {
     pub what_plays: Option<WhatPlays>,
     /// *Play calls on the speaker too*.
     pub play_calls: Option<bool>,
-    /// *Start Stream To Speaker when I sign in*, or why it can't be read
+    /// *Start when I sign in to Windows*, or why it can't be read
     /// or set.
     pub start_at_sign_in: Option<Result<bool, String>>,
-    /// *…and go back to the speaker I was using*.
-    pub go_back: Option<bool>,
-    pub when_stops: Option<WhenStops>,
-    /// *Tell me when sound leaves the place I chose*.
-    pub notifications: Option<bool>,
+    pub switch_back_after_quiet: bool,
+    pub notes_by_clock: bool,
     pub shortcuts: Option<Shortcuts>,
     /// The language chosen; `None` follows Windows. `None` as a whole
     /// where there is only one language.
@@ -308,12 +198,6 @@ pub struct GeneralView {
 pub enum WhatPlays {
     Everything,
     OnlySentApps,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WhenStops {
-    BringBack,
-    StaySilent,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -334,7 +218,7 @@ pub struct Shortcuts {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MaView {
-    /// *Offer this PC to Music Assistant*; `None` where Sendspin is off
+    /// *Let Music Assistant play this PC’s sound*; `None` where Sendspin is off
     /// for this run.
     pub offer: Option<bool>,
     /// Why the offer couldn't start.
@@ -401,18 +285,8 @@ pub struct Api {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AboutView {
     pub version: String,
-    pub driver: Option<Driver>,
+    pub show_lab: bool,
     pub updates: Updates,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Driver {
-    Running(String),
-    /// A newer one is installed and starts after a restart.
-    Waiting {
-        installed: String,
-        running: String,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -711,13 +585,18 @@ pub struct ToneView {
     pub eq: EqSettings,
     /// The automatic headroom in dB (negative), when it applies.
     pub headroom_db: Option<f32>,
-    /// Undo has something to reverse.
-    pub can_undo: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportSave {
+    Opened,
+    SavedOnly,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReportParts {
-    pub last_hour: bool,
+    pub diagnostics: bool,
     pub speakers: bool,
     pub versions: bool,
     pub log: bool,
@@ -725,7 +604,7 @@ pub struct ReportParts {
 
 impl Default for ReportParts {
     fn default() -> Self {
-        ReportParts { last_hour: true, speakers: true, versions: true, log: false }
+        ReportParts { diagnostics: true, speakers: true, versions: true, log: false }
     }
 }
 
@@ -743,37 +622,24 @@ pub enum Act {
     HideSpeaker(String),
     SendspinSpeakers(bool),
     // A speaker's page
-    PlayOn(String),
-    TestSound(String),
-    Delay(String, DelayAct),
-    ConnectWith {
-        id: String,
-        own_way: bool,
-    },
     VolumeLimit(String, u8),
     Tone(String, ToneAct),
-    ComesBack(String, ComesBack),
     SongTitles(String, bool),
     PairAgain(String),
-    ForgetPairing(String),
-    RemovePassword(String),
+    ClearSpeakerCredentials(String),
     ShowAs(String, String),
-    Forget(String),
-    /// Remove a speaker added by address.
-    Remove(String),
     // General
     WhatPlays(WhatPlays),
     PlayCalls(bool),
     StartAtSignIn(bool),
-    GoBack(bool),
-    WhenStops(WhenStops),
-    Notifications(bool),
+    SwitchBackAfterQuiet(bool),
+    NotesByClock(bool),
+    ShowLab(bool),
     Shortcuts(bool),
     /// Record a new combination for one shortcut (0 remove, 1 add, 2 the
     /// larger step's key).
     ShortcutKeys(usize, Vec<String>),
     Language(Option<String>),
-    OpenVolumeMixer,
     // Music Assistant
     OfferToMa(bool),
     Unpair(String),
@@ -793,8 +659,6 @@ pub enum Act {
     NewKey,
     // Help
     OpenLogFolder,
-    ReadGuideOnline,
-    ShowWelcomeAgain,
     Reconnect,
     TryAirPlay,
     TrySteady,
@@ -813,7 +677,6 @@ pub enum Act {
     CancelInstall,
     WhatsNew,
     SkipVersion,
-    RestartWindows,
     Donate,
     LicenceAndSource,
     // Lab
@@ -854,16 +717,7 @@ pub enum Act {
         name: String,
     },
     ResetProbe,
-    SaveReport(String),
     OpenIssue(String),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DelayAct {
-    Remove(u32),
-    Add(u32),
-    BackToOwn,
-    Choose(DelayChoice),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -873,7 +727,6 @@ pub enum ToneAct {
     Band(usize, f32),
     Preamp(f32),
     Preset(usize),
-    Undo,
     Flat,
 }
 

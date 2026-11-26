@@ -31,7 +31,9 @@ use crate::silence::DEFAULT_QUIESCENT_AFTER_PACKETS;
 use crate::ssdp::{DiscoveryState, Renderer, SearchScope};
 use crate::stream_profile::{self, Sinks, StreamProfile};
 use crate::stream_gate::{canonical_ip, is_local_address, Grant, Refusal, StreamGate};
-use crate::user_config::{AutoConnect, SpeakerSettings, UserConfig};
+use crate::user_config::{SpeakerSettings, UserConfig};
+#[cfg(test)]
+use crate::user_config::AutoConnect;
 use crate::volume_sync::{sonos_to_millibels, PendingCommands, SpeakerCommand, VolumeSync};
 use crate::web_access::{self, WebAccess, WebSecret};
 use crate::{upnp, PRODUCT_NAME, WIRE_SAMPLE_RATE};
@@ -52,6 +54,9 @@ pub struct RendererSession {
     /// The subscription to the speaker's transport events (what it plays,
     /// whether it re-buffers), when it offers them.
     pub transport: Option<Arc<GenaManager>>,
+    /// A Sonos room's subscription to its system's topology (which rooms
+    /// play together).
+    pub topology: Option<Arc<GenaManager>>,
     /// Id the session reports instead of the renderer's own (a speaker
     /// added by address keeps its manual id, so the list highlights the
     /// row the user clicked and a relaunch reconnects through it).
@@ -137,6 +142,32 @@ impl ActiveSession {
         }
     }
 
+    /// Make the speaker silent, for a speaker that still plays this PC's
+    /// stream, before this PC plays the sound itself: UPnP `Stop`;
+    /// AirPlay 1 `FLUSH`, then `TEARDOWN`; AirPlay 2 its stop as ever
+    /// (`FLUSHBUFFERED` for a buffered stream, then `TEARDOWN`). Whether
+    /// the speaker took it (an AirPlay 2 receiver's stop has no answer to
+    /// read and counts as taken; so do Sendspin's and Music Assistant's).
+    pub fn silence(self) -> bool {
+        match self {
+            ActiveSession::Upnp(s) => {
+                unsubscribe_all(&s);
+                match upnp::stop(&s.renderer.av_transport_control_url) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        debug!("UPnP Stop on {} failed: {}", s.renderer.friendly_name, e);
+                        false
+                    }
+                }
+            }
+            ActiveSession::AirPlay(s) => s.silence(),
+            other => {
+                other.stop();
+                true
+            }
+        }
+    }
+
     /// Tear down — drops GENA subscription / RTSP connection /
     /// background threads. Failures aren't fatal, but the AirPlay 1
     /// TEARDOWN matters: a receiver that isn't told keeps the session for
@@ -205,6 +236,12 @@ impl ActiveSession {
     pub fn ended_by_speaker(&self) -> Option<String> {
         match self {
             ActiveSession::Sendspin(s) => s.ended_by_speaker(),
+            ActiveSession::AirPlay(s) if s.ended_while_reachable() => Some(ENDED_WHILE_REACHABLE.into()),
+            ActiveSession::AirPlay2(s)
+                if s.fault().is_some_and(|f| f.code == crate::airplay::ap2_health::ENDED_BY_RECEIVER) =>
+            {
+                Some(ENDED_WHILE_REACHABLE.into())
+            }
             _ => None,
         }
     }
@@ -244,10 +281,12 @@ impl ActiveSession {
 
     /// The fault that ended the session when a reconnect can't fix it
     /// (e.g. the receiver rejected our authentication). Such a session is
-    /// ended without the drop watchdog's retry.
-    pub fn final_fault(&self) -> Option<String> {
+    /// ended without the engine's tries.
+    pub fn final_fault(&self) -> Option<crate::airplay::ap2_health::Ap2Fault> {
         match self {
-            ActiveSession::AirPlay2(s) => s.fault().filter(|f| !f.retryable).map(|f| f.to_string()),
+            ActiveSession::AirPlay2(s) => s
+                .fault()
+                .filter(|f| !f.retryable && f.code != crate::airplay::ap2_health::ENDED_BY_RECEIVER),
             ActiveSession::Upnp(_)
             | ActiveSession::AirPlay(_)
             | ActiveSession::Sendspin(_)
@@ -483,6 +522,117 @@ const QUIT_CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// How long quitting waits for the speaker to answer its Stop or TEARDOWN.
 const QUIT_TEARDOWN_WAIT: Duration = Duration::from_secs(2);
 
+/// What [`App::take_stream_off_number`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TakenOff {
+    /// The UPnP speaker was told Stop; its session is kept.
+    Stopped,
+    /// The receiver (this id) was let go.
+    LetGo(String),
+}
+
+/// What [`ActiveSession::ended_by_speaker`] says of an AirPlay receiver
+/// that ended this PC's session while it still answers.
+pub(crate) const ENDED_WHILE_REACHABLE: &str = "ended_while_reachable";
+
+pub(crate) const CODE_WINDOW_CLOSED: &str = "The code window closed before the speaker was paired.";
+
+/// The apps whose song titles go to a speaker, by the start of their
+/// program or app name, lower case: music players. Browsers, video
+/// players and every other app are left out, whatever they play.
+pub const MUSIC_APPS: &[&str] = &[
+    "spotify",
+    "applemusic",
+    "appleinc.applemusic",
+    "itunes",
+    "appleinc.itunes",
+    "tidal",
+    "deezer",
+    "amazon music",
+    "amazonmusic",
+    "qobuz",
+    "musicbee",
+    "foobar2000",
+    "aimp",
+    "winamp",
+    "plexamp",
+    "microsoft.zunemusic",
+];
+
+/// Whether `app` (a program or app name, as Windows gives it) is one of
+/// [`MUSIC_APPS`].
+pub fn is_music_app(app: &str) -> bool {
+    music_app(app).is_some()
+}
+
+/// The music app `app` belongs to. A Store app's ID (`AppleInc.AppleMusicWin_…`)
+/// and its program's name (`AppleMusic.exe`) give the same answer, so that
+/// a media session and the sound of its own program are one app.
+fn music_app(app: &str) -> Option<&'static str> {
+    let app = app.trim().to_ascii_lowercase();
+    let app = app.rsplit(['\\', '/']).next().unwrap_or_default();
+    let entry = MUSIC_APPS.iter().copied().find(|m| app.starts_with(m))?;
+    Some(match entry {
+        "appleinc.applemusic" => "applemusic",
+        "appleinc.itunes" => "itunes",
+        "amazon music" => "amazonmusic",
+        other => other,
+    })
+}
+
+/// One player, as song titles see it.
+pub use crate::now_playing::Session as TitleSource;
+
+/// The song title to show on the speaker: the title of a music app that
+/// plays, while no other app's real sound plays on the app's output.
+/// None otherwise: a paused or stopped player, a browser, a video player,
+/// an app Windows doesn't name. Whether titles go at all (the switch, a
+/// speaker that plays this PC's sound) is the caller's.
+pub fn title_to_send(sources: &[TitleSource], sounding_apps: &[String]) -> Option<crate::now_playing::NowPlaying> {
+    sources.iter().filter(|s| s.playing).find_map(|s| {
+        let source = music_app(s.app.as_deref()?)?;
+        if sounding_apps.iter().any(|app| music_app(app) != Some(source)) {
+            return None;
+        }
+        s.title.clone().filter(|t| !t.is_empty())
+    })
+}
+
+/// Windows' current media session as a source of song titles.
+pub fn title_sources() -> Vec<TitleSource> {
+    crate::now_playing::current_session()
+        .into_iter()
+        .collect()
+}
+
+/// An AirPlay speaker's level from this PC is kept this long: within it,
+/// it starts at that level again.
+pub const LEVEL_KEPT_FOR: Duration = Duration::from_secs(3 * 60 * 60);
+/// After [`LEVEL_KEPT_FOR`], a speaker starts at no more than this.
+pub const LEVEL_LATER_AT_MOST: u8 = 30;
+
+/// The level a speaker whose level can't be read (AirPlay) starts at:
+/// the level last set from this PC (`level`, at `level_at`) if that was
+/// within [`LEVEL_KEPT_FOR`] of `now`, later the lower of it and
+/// [`LEVEL_LATER_AT_MOST`]; the first time
+/// [`crate::engine::place::numbers::LEVEL_FIRST`]. Never above `limit`, the
+/// speaker's *Maximum volume from this PC*. All times in seconds since
+/// 1970.
+pub fn start_level(level: Option<u8>, level_at: Option<u64>, now: u64, limit: Option<u8>) -> u8 {
+    let lately = level_at.is_some_and(|at| now.saturating_sub(at) <= LEVEL_KEPT_FOR.as_secs());
+    let level = match level {
+        Some(l) if lately => l,
+        Some(l) => l.min(LEVEL_LATER_AT_MOST),
+        None => crate::engine::place::numbers::LEVEL_FIRST,
+    };
+    level.min(100).min(limit.unwrap_or(100))
+}
+
+/// Seconds since 1970.
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
+}
+
 /// What a connect a newer choice superseded ends with (never shown).
 pub(crate) const SUPERSEDED: &str = "superseded by a newer choice";
 
@@ -546,19 +696,6 @@ pub struct PasswordDialog {
     /// What is typed is used for one connection and never stored (the
     /// entry announced another speaker's identity when the dialog opened).
     pub one_session: bool,
-}
-
-impl PasswordDialog {
-    /// The dialog's explanation, under its title: what happens to what is
-    /// typed.
-    pub fn message(&self) -> &'static str {
-        if self.one_session {
-            "This receiver requires an AirPlay password. Enter it to connect — it's used for this connection only and \
-             not remembered, since this receiver has the same ID as another speaker."
-        } else {
-            "This speaker requires an AirPlay password. Enter it to connect — it'll be remembered for next time."
-        }
-    }
 }
 
 /// In-memory update-check state (the persistent part lives in `UserConfig`).
@@ -650,7 +787,7 @@ pub struct App {
     /// Quit without waiting for the speaker (a second Ctrl+C).
     quit_now: AtomicBool,
     /// Run once when quitting begins (see [`App::on_quit`]).
-    on_quit: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    on_quit: OnceLock<Box<dyn Fn(crate::model::Surface) + Send + Sync>>,
     /// Update-check state; see `update_check` and [`App::spawn_update_checker`].
     pub update: Mutex<UpdateState>,
 
@@ -684,9 +821,8 @@ pub struct App {
     settings_retrying: Arc<AtomicBool>,
 
     /// Most recent user-facing error message and when it was recorded.
-    /// Surfaced by the GUI as a transient inline banner for ~8 s
-    /// (Heuristics F-03 — previously every action that could fail
-    /// just `warn!`'d to the log file and the user saw nothing).
+    /// Surfaced by the GUI as a transient inline banner for ~8 s, so a
+    /// failed action is seen, not only written to the log file.
     pub last_error: Mutex<Option<(String, Instant)>>,
 
     /// Friendly name of the speaker a background connect is currently
@@ -698,16 +834,9 @@ pub struct App {
     /// line (see [`ConnectStep::text`]); None for the usual line.
     connect_detail: Mutex<Option<String>>,
 
-    /// Counts selections through [`select_speaker_async`],
-    /// [`select_speaker`] and a Sendspin pairing answer, the paths the
-    /// window, tray, web API and terminal picker use; the launch and
-    /// stereo-pair reconnects of other speakers go through them too.
-    /// Bumped before the selection claims `connecting`. An automatic
-    /// connect that must not override the user compares it under that
-    /// lock, so even a pick that failed at once is seen.
-    ///
-    /// [`select_speaker_async`]: App::select_speaker_async
-    /// [`select_speaker`]: App::select_speaker
+    /// Counts people's picks, including ones that fail. The engine checks
+    /// this count as it handles a pending `--player` request, before
+    /// starting its switch. That request does not itself advance the count.
     user_picks: AtomicU64,
 
     /// Where a `--player` wait stands (see [`App::connect_when_listed`]).
@@ -751,10 +880,12 @@ pub struct App {
     /// Where today's entry points (the window, the tray, the web API, the
     /// terminal prompt) send their commands once the engine runs.
     command_sink: OnceLock<CommandSink>,
+    pub(crate) engine_port: OnceLock<std::sync::Weak<crate::model::PortCore>>,
     engine_connects: Mutex<EngineConnects>,
     engine_connect_ended: Condvar,
     /// The test sound being played: the next frame of it.
     test_sound: Mutex<Option<usize>>,
+    pub(crate) capture_tap: std::sync::OnceLock<crate::engine::place_driver::tap::Tap>,
     /// Devices refused the stream lately, newest first.
     refused: Mutex<Vec<RefusedDevice>>,
     /// Devices let in by the person for this run.
@@ -762,6 +893,16 @@ pub struct App {
     /// The bound UPnP speaker's latest transport event, until the engine
     /// reads it.
     transport_change: Mutex<Option<crate::gena::TransportChange>>,
+    /// The bound Sonos room's latest topology event, until the engine
+    /// reads it.
+    topology: Mutex<Option<Vec<crate::sonos::ZoneGroup>>>,
+    /// What speakers said of themselves, until the engine reads it.
+    pub signals: crate::engine::signals::SignalLog,
+    /// The programs with real sound on the app's output at the latest sample.
+    pub(crate) sounding_apps: Mutex<Vec<String>>,
+    /// The speaker this PC played on last and when that ended: its
+    /// announcement may still say it receives for a moment.
+    last_ended: Mutex<Option<(String, Instant)>>,
 }
 
 /// Takes a command for the engine (see [`App::set_command_sink`]); the
@@ -771,6 +912,7 @@ pub type CommandSink = Box<dyn Fn(crate::model::Surface, crate::model::Command) 
 /// A device that asked for the stream and was refused (privacy mode).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefusedDevice {
+    pub speaker: Option<String>,
     pub address: IpAddr,
     /// Its name when discovery knows it, else its address.
     pub name: String,
@@ -783,6 +925,50 @@ const REFUSALS_KEPT: usize = 20;
 /// The test sound: two notes, 0.3 s each, at -12 dBFS, faded in and out.
 const TEST_SOUND_NOTES: [f32; 2] = [880.0, 1318.5];
 const TEST_SOUND_NOTE_FRAMES: usize = WIRE_SAMPLE_RATE as usize * 3 / 10;
+/// The chime's length in frames.
+const CHIME_FRAMES: usize = TEST_SOUND_NOTE_FRAMES * TEST_SOUND_NOTES.len();
+
+/// Where the stream server serves the test chime as a file of its own.
+pub const CHIME_PATH: &str = "/chime.wav";
+
+/// The chime's sample at frame `pos` (of [`CHIME_FRAMES`]).
+fn chime_at(pos: usize) -> i16 {
+    let note = pos / TEST_SOUND_NOTE_FRAMES;
+    let at = pos % TEST_SOUND_NOTE_FRAMES;
+    let fade = (TEST_SOUND_NOTE_FRAMES / 20) as f32;
+    let envelope = (at as f32 / fade).min((TEST_SOUND_NOTE_FRAMES - at) as f32 / fade).min(1.0);
+    let t = at as f32 / WIRE_SAMPLE_RATE as f32;
+    ((std::f32::consts::TAU * TEST_SOUND_NOTES[note] * t).sin() * envelope * 0.25 * i16::MAX as f32) as i16
+}
+
+/// The chime, `channels` interleaved, with a fifth of a second of silence
+/// before it (some speakers clip the very start of what they are given).
+pub fn chime_pcm(channels: u16) -> Vec<i16> {
+    let lead = WIRE_SAMPLE_RATE as usize / 5;
+    let ch = channels.max(1) as usize;
+    let mut out = vec![0i16; lead * ch];
+    for pos in 0..CHIME_FRAMES {
+        out.extend(std::iter::repeat(chime_at(pos)).take(ch));
+    }
+    out
+}
+
+/// DIDL-Lite for the chime's file.
+fn chime_didl(uri: &str) -> String {
+    format!(
+        "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
+         xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
+         <item id=\"chime\" parentID=\"0\" restricted=\"1\"><dc:title>{PRODUCT_NAME}</dc:title>\
+         <upnp:class>object.item.audioItem.musicTrack</upnp:class>\
+         <res protocolInfo=\"http-get:*:audio/wav:*\">{}</res></item></DIDL-Lite>",
+        upnp_xml_escape(uri)
+    )
+}
+
+/// `s` with XML's special characters escaped.
+fn upnp_xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
 
 /// The engine's connects by speaker id: the number of the latest, and how
 /// it ended once it has (`Err` with the words to show).
@@ -820,6 +1006,27 @@ struct PinCeremonyState {
     /// Friendly name, for the modal + toasts.
     name: String,
     stage: PinStage,
+    /// What the last code, or the last ask for a new one, came to.
+    code_try: Option<CodeTry>,
+}
+
+/// What became of the last code typed for a pairing, or of the last ask
+/// for a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeTry {
+    /// The code didn't work; the app asked the device to show a new one,
+    /// and `shown`: it accepted.
+    Wrong { shown: bool },
+    /// The person asked for a new code; `shown`: the device accepted.
+    NewCode { shown: bool },
+}
+
+/// What the person gave a pairing waiting for its code.
+enum PinAnswer {
+    Code(String),
+    /// Ask the device for a new code.
+    NewCode,
+    Cancel,
 }
 
 enum PinStage {
@@ -828,7 +1035,7 @@ enum PinStage {
     /// The receiver is displaying its PIN; the ceremony thread is parked
     /// on the receiver end of this channel. The GUI modal is (or is about
     /// to be) up; [`App::submit_pin`] sends the PIN (or `None` = cancel).
-    AwaitingPin(crossbeam_channel::Sender<Option<String>>),
+    AwaitingPin(crossbeam_channel::Sender<PinAnswer>),
     /// PIN received — pair-setup M1–M6 is running.
     Pairing,
 }
@@ -954,23 +1161,6 @@ fn forget_pairing_hint(name: &str, has_pairing: bool) -> String {
     )
 }
 
-/// The PIN modal's text for `name`. `repair`: this PC has a stored pairing
-/// with it, which didn't verify. Then the user is pairing again — or, if
-/// no PIN appears, talking to another device or to one that no longer
-/// asks for verification, so the text also says where to forget it.
-fn pin_prompt_message(name: &str, repair: bool) -> String {
-    if !repair {
-        return "This receiver needs one-time pairing. A PIN should now be showing on its screen — \
-                enter it here to pair. It'll be remembered, so you won't need to do this again."
-            .to_string();
-    }
-    format!(
-        "A PIN should now be showing on {name}'s screen — enter it here to pair again; the new \
-         pairing replaces the old one. If no PIN appears, cancel.{}",
-        forget_pairing_hint(name, true)
-    )
-}
-
 /// Failure of a whole [`App::start_airplay`] select: either "this device
 /// needs a one-time PIN ceremony" (typed, so the caller decides per its
 /// interactivity whether to launch one) or a plain message. Flows through
@@ -1001,6 +1191,13 @@ impl Drop for CeremonyGuard {
 }
 
 impl App {
+    /// The song title to show on a speaker now (see [`title_to_send`]):
+    /// from Windows' current media session, when it is a music app's and
+    /// plays, and no other app's sound plays too.
+    pub fn title_now(&self) -> Option<crate::now_playing::NowPlaying> {
+        title_to_send(&title_sources(), &self.sounding_apps.lock().unwrap())
+    }
+
     /// The app with the settings saved in `config.json`.
     pub fn new(
         config: AppConfig,
@@ -1039,11 +1236,19 @@ impl App {
         discovery: Option<Arc<DiscoveryState>>,
         airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
     ) -> Arc<Self> {
-        let web_initial = config.web_enabled;
-        // The extra delay earlier versions gave every Sendspin speaker
-        // becomes each paired speaker's own, once (see `delay::upgrade`).
+        let web_initial = config.web_enabled || user_config.phone_enabled;
+        let access = WebAccess::new();
+        if user_config.scripts_enabled {
+            access.set_scripts_key(user_config.scripts_key.as_deref().and_then(WebSecret::parse));
+        }
+        // Settings from earlier versions, once: the extra delay they gave
+        // every Sendspin speaker becomes each paired speaker's own (see
+        // `delay::upgrade`), and the Music Assistant input, which ran only
+        // while Sendspin was on as well, stays on only if Sendspin was.
         let mut user_config = user_config;
-        if user_config.upgrade_delays() {
+        let delays_moved = user_config.upgrade_delays();
+        let input_turned_off = user_config.sendspin.upgrade_source_switch();
+        if delays_moved || input_turned_off {
             user_config.save();
         }
         // Seed last_speaker_id from the settings so that, even before any user
@@ -1081,7 +1286,7 @@ impl App {
             stream_active: Arc::new(AtomicBool::new(true)),
             sound_input_lost: Mutex::new(None),
             streaming_enabled,
-            web_access: WebAccess::new(),
+            web_access: access,
             delay: crate::delay::DelayEngine::new(catch_up_step.clone()),
             rate_fudge_ppm: Arc::new(AtomicI32::new(0)),
             silence_pace_ms: Arc::new(AtomicU64::new(10)),
@@ -1125,19 +1330,25 @@ impl App {
             scope_apply: Mutex::new(()),
             discovery_error: Mutex::new(None),
             command_sink: OnceLock::new(),
+            engine_port: OnceLock::new(),
             engine_connects: Mutex::new(EngineConnects::default()),
             engine_connect_ended: Condvar::new(),
             test_sound: Mutex::new(None),
+            capture_tap: Default::default(),
             refused: Mutex::new(Vec::new()),
             allowed: Mutex::new(Vec::new()),
             transport_change: Mutex::new(None),
+            topology: Mutex::new(None),
+            signals: Default::default(),
+            sounding_apps: Mutex::default(),
+            last_ended: Mutex::new(None),
         });
         if web_initial {
             if let Err(e) = app.set_web_ui_enabled(true) {
                 app.record_error(format!("Couldn't turn the web UI on: {}", e));
             }
         }
-        app.delay_watch_back_offs();
+        app.delay_watch_cut_outs();
         app.delay.catch_up().set_at_once(app.user_config.lock().unwrap().delay_at_once);
         app
     }
@@ -1160,12 +1371,6 @@ impl App {
             Some((msg, when)) if when.elapsed() < ERROR_BANNER_TTL => Some(msg.clone()),
             _ => None,
         }
-    }
-
-    /// How long the current error stays on screen, if one is showing.
-    pub fn error_expires_in(&self) -> Option<Duration> {
-        let le = self.last_error.lock().unwrap();
-        le.as_ref().and_then(|(_, when)| ERROR_BANNER_TTL.checked_sub(when.elapsed()))
     }
 
     /// Clear the current error (user dismissed the banner).
@@ -1239,12 +1444,6 @@ impl App {
         if le.as_ref().is_some_and(|(m, _)| m.starts_with(STILL_CONNECTING_PREFIX)) {
             *le = None;
         }
-    }
-
-    /// Returns true if the user has dismissed the onboarding card.
-    /// Persisted across launches via `user_config`.
-    pub fn is_onboarding_dismissed(&self) -> bool {
-        self.user_config.lock().unwrap().onboarding_dismissed
     }
 
     /// Mark the onboarding card as dismissed and persist immediately.
@@ -1465,6 +1664,10 @@ impl App {
     /// Undo the onboarding dismissal (Help menu → "Show getting-
     /// started again"). Persists immediately.
     pub fn reset_onboarding(&self) {
+        if self.send_command(crate::model::Surface::Settings,
+            crate::model::Command::FirstRunAction(crate::model::command::FirstRunAction::ShowAgain)) {
+            return;
+        }
         let mut uc = self.user_config.lock().unwrap();
         if uc.onboarding_dismissed {
             uc.onboarding_dismissed = false;
@@ -1472,29 +1675,10 @@ impl App {
         }
     }
 
-    /// Returns the persisted "always minimise to tray on window close"
-    /// preference (the close-confirm modal's checkbox).
-    pub fn is_always_minimise_to_tray(&self) -> bool {
-        self.user_config.lock().unwrap().always_minimise_to_tray
-    }
-
-    /// Persist the "always minimise to tray" preference.
-    pub fn set_always_minimise_to_tray(&self, on: bool) {
-        let mut uc = self.user_config.lock().unwrap();
-        if uc.always_minimise_to_tray != on {
-            uc.always_minimise_to_tray = on;
-            uc.save();
-        }
-    }
-
-    /// Whether to auto-reconnect to the saved speaker on launch.
+    /// Only the place engine can choose the startup route. The old transport
+    /// launch planner remains callable by older integrations.
     pub fn is_auto_reconnect_on_launch(&self) -> bool {
-        self.user_config.lock().unwrap().auto_reconnect_on_launch
-    }
-
-    /// Whether to auto-reconnect when a live session drops mid-stream.
-    pub fn is_auto_reconnect_on_drop(&self) -> bool {
-        self.user_config.lock().unwrap().auto_reconnect_on_drop
+        false
     }
 
     /// The stored AirPlay password for a device id, if any.
@@ -1626,15 +1810,6 @@ impl App {
         self.user_config.lock().unwrap().forward_now_playing
     }
 
-    /// Persist the now-playing-forwarding preference.
-    pub fn set_forward_now_playing(&self, on: bool) {
-        let mut uc = self.user_config.lock().unwrap();
-        if uc.forward_now_playing != on {
-            uc.forward_now_playing = on;
-            uc.save();
-        }
-    }
-
     // ---- Equalizer -------------------------------------------------------
 
     /// The saved equalizer curve.
@@ -1648,44 +1823,9 @@ impl App {
         self.eq.request(settings.clone());
     }
 
-    /// Apply and persist `settings`.
-    pub fn eq_apply(&self, settings: &EqSettings) {
-        let settings = settings.sanitized();
-        self.eq.request(settings.clone());
-        let mut uc = self.user_config.lock().unwrap();
-        if uc.equalizer != settings {
-            uc.equalizer = settings;
-            uc.save();
-        }
-    }
-
-    /// Drop any previewed curve and return the stream to the saved one.
-    pub fn eq_revert(&self) {
-        let saved = self.eq_saved();
-        self.eq.request(saved);
-    }
-
     /// Headroom figures of the most recently designed curve.
     pub fn eq_report(&self) -> Option<EqReport> {
         self.eq.report()
-    }
-
-    /// Persist the drop-reconnect preference.
-    pub fn set_auto_reconnect_on_drop(&self, on: bool) {
-        let mut uc = self.user_config.lock().unwrap();
-        if uc.auto_reconnect_on_drop != on {
-            uc.auto_reconnect_on_drop = on;
-            uc.save();
-        }
-    }
-
-    /// Persist the auto-reconnect preference.
-    pub fn set_auto_reconnect_on_launch(&self, on: bool) {
-        let mut uc = self.user_config.lock().unwrap();
-        if uc.auto_reconnect_on_launch != on {
-            uc.auto_reconnect_on_launch = on;
-            uc.save();
-        }
     }
 
     // ---- Privacy mode ---------------------------------------------------
@@ -1972,7 +2112,7 @@ impl App {
 
     /// The AirPlay receiver record for an id: discovered, or the last
     /// probe of a manual entry.
-    fn find_airplay_renderer(&self, id: &str) -> Option<AirPlayRenderer> {
+    pub(crate) fn find_airplay_renderer(&self, id: &str) -> Option<AirPlayRenderer> {
         if manual_speakers::is_manual_id(id) {
             return self.manual_resolved.lock().unwrap().get(id).cloned();
         }
@@ -2193,9 +2333,8 @@ impl App {
         })
     }
 
-    /// The bound session has dropped: it stays bound until the drop
-    /// watchdog reconnects (see [`Self::is_auto_reconnect_on_drop`]) or,
-    /// with that off, until the user acts.
+    /// The bound session has dropped: it stays bound until the engine
+    /// lets it go or connects again.
     pub fn selected_session_dead(&self) -> bool {
         self.session.lock().unwrap().as_ref().is_some_and(|s| s.is_dead())
     }
@@ -2214,12 +2353,6 @@ impl App {
         self.connecting.lock().unwrap().clone()
     }
 
-    /// What the connect in flight is doing, when there is more to say
-    /// than that it is setting up the session.
-    pub fn connecting_detail(&self) -> Option<String> {
-        self.connect_detail.lock().unwrap().clone()
-    }
-
     /// Non-blocking [`select_speaker`]: runs the (seconds-long) session
     /// bring-up on a worker thread so the GUI stays responsive, exposing
     /// progress via [`connecting_to`] and failures via `record_error`.
@@ -2227,7 +2360,7 @@ impl App {
     ///
     /// This is the *interactive* entry point (GUI speaker click): a
     /// receiver that turns out to need one-time PIN pairing gets the
-    /// ceremony launched. Automatic callers (reconnect watchdog, the
+    /// ceremony launched. Automatic callers (the engine's tries, the
     /// ceremony's own post-pair reconnect) use
     /// [`select_speaker_async_opts`] with `interactive = false` so an
     /// unattended retry can never pop a PIN prompt on the user's TV.
@@ -2235,7 +2368,7 @@ impl App {
     /// [`select_speaker_async_opts`]: App::select_speaker_async_opts
     pub fn select_speaker_async(self: &Arc<Self>, id: &str) {
         // The window's click: a person in the app's own window.
-        if self.send_command(crate::model::Surface::Panel, crate::model::Command::Play(place_of(id))) {
+        if self.send_command(crate::model::Surface::Panel, crate::model::Command::Switch { place: place_of(id), way: None }) {
             return;
         }
         self.note_user_pick();
@@ -2285,20 +2418,6 @@ impl App {
         self.select_speaker_async_full(id, false, false, Some(picks_seen), None);
     }
 
-    /// The speaker named on the command line, now listed: played unless a
-    /// person chose something meanwhile.
-    pub(crate) fn play_wish_unless_user_picked(self: &Arc<Self>, id: &str, picks_seen: u64) {
-        if self.command_sink.get().is_some() {
-            if self.user_pick_count() == picks_seen {
-                if let Err(e) = self.select_speaker_from(crate::model::Surface::CommandLine, id) {
-                    warn!("{}", e);
-                }
-            }
-            return;
-        }
-        self.select_speaker_async_full(id, false, false, Some(picks_seen), None);
-    }
-
     /// [`select_speaker_async_opts`] carrying a Sendspin pairing input
     /// (token or code) for a speaker that needs pairing.
     ///
@@ -2313,7 +2432,7 @@ impl App {
             // A pick in the window goes to the engine; an automatic one
             // (the launch reconnect) is the engine's own decision.
             if interactive {
-                self.send_command(crate::model::Surface::Panel, crate::model::Command::Play(place_of(id)));
+                self.send_command(crate::model::Surface::Panel, crate::model::Command::Switch { place: place_of(id), way: None });
             }
             return;
         }
@@ -2377,159 +2496,13 @@ impl App {
         }
     }
 
-    /// Background watchdog: when a live session drops mid-stream (speaker
-    /// rebooted / Wi-Fi blip / receiver reaped the session), tear it down
-    /// and reconnect once — so the UI never sits on a zombie "streaming"
-    /// state. Mirrors OwnTone's policy: a single retry, ~5 s after
-    /// detection (the spacing also respects the Sonos half-open hold).
-    /// The reconnect is gated on the `auto_reconnect_on_drop` config
-    /// (default on) and on streaming being enabled (never fights a user
-    /// who hit Disable); a session the speaker ended itself is always
-    /// cleared.
-    pub fn spawn_reconnect_watchdog(self: &Arc<Self>) {
-        let app = self.clone();
-        std::thread::Builder::new()
-            .name("stream-to-speaker-reconnect-watchdog".into())
-            .spawn(move || {
-                const RECONNECT_GRACE: Duration = Duration::from_secs(5);
-                loop {
-                    // Poll ~1 s, sliced so shutdown is prompt.
-                    for _ in 0..10 {
-                        if app.is_shutting_down() {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-
-                    // Did the speaker hand itself to something else? Then
-                    // end our session quietly instead of fighting for it
-                    // (whatever the reconnect settings: it no longer plays).
-                    let ended = {
-                        let mut guard = app.session.lock().unwrap();
-                        let reason = guard.as_ref().and_then(|s| s.ended_by_speaker());
-                        reason.and_then(|r| guard.take().map(|s| (s, r)))
-                    };
-                    if let Some((s, reason)) = ended {
-                        let name = s.friendly_name();
-                        s.stop();
-                        app.record_error(match reason.as_str() {
-                            "another_server" => format!("{} switched to another source.", name),
-                            _ => format!("{} ended the stream ({}).", name, reason.replace('_', " ")),
-                        });
-                        continue;
-                    }
-
-                    // A session that failed for good (not retryable) is
-                    // ended here, whatever the reconnect setting.
-                    let final_fault = {
-                        let mut guard = app.session.lock().unwrap();
-                        match guard.as_ref().and_then(|s| s.is_dead().then(|| s.final_fault()).flatten()) {
-                            Some(fault) => guard.take().map(|s| (s, fault)),
-                            None => None,
-                        }
-                    };
-                    if let Some((s, fault)) = final_fault {
-                        let name = s.friendly_name();
-                        s.stop();
-                        app.prune_stream_clients();
-                        warn!("AirPlay session to {} ended: {}", name, fault);
-                        app.record_error(format!("Connection to {} ended: {}", name, fault));
-                        continue;
-                    }
-
-                    if !app.user_config.lock().unwrap().auto_reconnect_on_drop {
-                        continue;
-                    }
-                    if !app.streaming_enabled.load(Ordering::Acquire) {
-                        continue;
-                    }
-                    if app.connecting.lock().unwrap().is_some() {
-                        continue;
-                    }
-
-                    // Is the bound session dead?
-                    let (id, name, reason) = {
-                        let guard = app.session.lock().unwrap();
-                        match guard.as_ref() {
-                            Some(s) if s.is_dead() => {
-                                let reason = match s {
-                                    ActiveSession::AirPlay2(a) => a.fault().and_then(|f| f.reconnect_text(&s.friendly_name())),
-                                    _ => None,
-                                };
-                                (s.stable_id(), s.friendly_name(), reason)
-                            }
-                            _ => continue,
-                        }
-                    };
-
-                    warn!(
-                        "Session to {} dropped; auto-reconnecting in {} s",
-                        name,
-                        RECONNECT_GRACE.as_secs()
-                    );
-                    let (fault, notice) = reason.unwrap_or_else(|| {
-                        (format!("Connection to {} dropped", name), format!("Lost connection to {} — reconnecting…", name))
-                    });
-                    app.record_fault(&fault);
-                    app.record_error(notice);
-
-                    // Grace before the retry, cancellable by shutdown or a
-                    // user Disable.
-                    let mut cancelled = false;
-                    for _ in 0..(RECONNECT_GRACE.as_millis() / 100) {
-                        if app.is_shutting_down() {
-                            return;
-                        }
-                        if !app.streaming_enabled.load(Ordering::Acquire) {
-                            cancelled = true;
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    if cancelled {
-                        continue;
-                    }
-
-                    // Confirm it's still the same dead session (a manual
-                    // reselect during the grace may have replaced it).
-                    let still_dead = app
-                        .session
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|s| s.is_dead() && s.stable_id() == id)
-                        .unwrap_or(false);
-                    if !still_dead {
-                        continue;
-                    }
-
-                    // Reconnect. `select_speaker` tears the dead session
-                    // down first (replacing_same) then brings up a fresh
-                    // one; async so this thread never blocks on the
-                    // multi-second handshake. One shot per drop: if it
-                    // fails the session ends up None and we stop retrying
-                    // (no hammering a gone speaker / poking the Sonos hold).
-                    // Non-interactive: an unattended retry must never pop
-                    // a PIN pairing prompt on the user's TV.
-                    app.reconnects.fetch_add(1, Ordering::Relaxed);
-                    app.select_speaker_async_opts(&id, false, false);
-                    while app.connecting.lock().unwrap().is_some() {
-                        if app.is_shutting_down() {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
-                }
-            })
-            .ok();
-    }
-
     /// Background forwarder: when enabled, pushes the OS "now playing"
     /// (title/artist/album) to the bound speaker as it changes, so the
-    /// track shows on the speaker's display / app. Off by default; RAOP
-    /// only (AP2/UPnP sessions are skipped). Entirely best-effort —
-    /// metadata is non-fatal on every receiver, so a failure or an
-    /// unsupported OS never touches the audio path.
+    /// track shows on the speaker's display / app: only a music app's
+    /// title, while it plays and no other app's sound plays too (see
+    /// [`title_to_send`]). RAOP only (AP2/UPnP sessions are skipped).
+    /// Entirely best-effort — metadata is non-fatal on every receiver, so
+    /// a failure or an unsupported OS never touches the audio path.
     pub fn spawn_now_playing_forwarder(self: &Arc<Self>) {
         let app = self.clone();
         std::thread::Builder::new()
@@ -2570,7 +2543,7 @@ impl App {
                         continue;
                     };
 
-                    let np = crate::now_playing::current();
+                    let np = app.title_now();
                     if np == last_sent {
                         continue; // unchanged (incl. both None)
                     }
@@ -2634,7 +2607,7 @@ impl App {
             ));
         }
         if self.command_sink.get().is_some() {
-            return self.play_and_wait(from, id);
+            return self.play_and_wait(from, id, None);
         }
         self.select_speaker_now(id)
     }
@@ -2642,28 +2615,43 @@ impl App {
     /// Ask the engine to play on `id` and wait (on this thread, which does
     /// no network I/O meanwhile) until the connect it starts has ended:
     /// `Ok` once the speaker plays, else the words saying why not.
-    fn play_and_wait(self: &Arc<Self>, from: crate::model::Surface, id: &str) -> Result<(), String> {
-        let before = self.engine_connects.lock().unwrap().by_id.get(id).map(|(gen, _)| *gen);
+    fn play_and_wait(self: &Arc<Self>, from: crate::model::Surface, id: &str, picks_seen: Option<u64>) -> Result<(), String> {
+        let speaker = crate::engine::place_driver::speaker_for_pick(self, id);
+        // Only a generation that had already ended can be ignored.
+        let finished_before = self.engine_connects.lock().unwrap().by_id.get(speaker.as_str())
+            .and_then(|(gen, result)| result.as_ref().map(|_| *gen));
         let Some(sink) = self.command_sink.get() else { return Err("Stream To Speaker isn't running.".into()) };
-        let outcome = sink(from, crate::model::Command::Play(place_of(id))).wait(Duration::from_secs(10));
+        let command = match picks_seen {
+            Some(count) => crate::model::Command::PlayWhenListed { speaker: speaker.clone(), picks_seen: count },
+            None => crate::model::Command::Switch { place: crate::model::Place::of_speaker(&speaker), way: None },
+        };
+        let outcome = sink(from, command).wait(Duration::from_secs(10));
         let Some(outcome) = outcome else {
             return Err(format!("{} didn't answer. Try again in a moment.", PRODUCT_NAME));
         };
-        if outcome.result.is_err() {
-            return Err(crate::model::delay::cli_reply(outcome.snapshot.lang, &outcome).text);
+        let latest = || self.engine_view().unwrap_or_else(|| outcome.snapshot.clone());
+        if let Err(why) = &outcome.result {
+            let view = latest();
+            return Err(crate::model::view::refusal_text(view.lang, why, &view));
         }
         // The connect it started, or the one already under way to it.
         let end = Instant::now() + CONNECT_BUDGET + Duration::from_secs(15);
         let mut connects = self.engine_connects.lock().unwrap();
         loop {
-            match connects.by_id.get(id).cloned() {
-                Some((gen, Some(result))) if Some(gen) != before => return result,
+            match connects.by_id.get(speaker.as_str()).cloned() {
+                Some((gen, Some(result))) if Some(gen) != finished_before => return result,
                 Some((_, None)) => {}
                 // Nothing new to wait for: it plays there already, or the
                 // engine had no reason to connect.
                 _ => {
-                    let here = self.session.lock().unwrap().as_ref().is_some_and(|s| s.stable_id() == id);
-                    return if here { Ok(()) } else { Err(outcome.snapshot.status.clone()) };
+                    let view = latest();
+                    return if view.scene.situation.place_speaker() == Some(&speaker) {
+                        Ok(())
+                    } else if from == crate::model::Surface::CommandLine {
+                        Err(view.cli_status.clone())
+                    } else {
+                        Err(view.status.clone())
+                    };
                 }
             }
             let left = end.saturating_duration_since(Instant::now());
@@ -2671,7 +2659,7 @@ impl App {
                 return Err(format!(
                     "{} is still connecting to {}.",
                     PRODUCT_NAME,
-                    self.speaker_name(id).unwrap_or_else(|| id.to_string())
+                    latest().scene.speaker_name(&speaker)
                 ));
             }
             connects = self.engine_connect_ended.wait_timeout(connects, left).unwrap().0;
@@ -2810,18 +2798,14 @@ impl App {
         } else {
             self.discovery.as_ref().and_then(|d| d.find_by_id(id))
         };
-        let replacing_same = self
-            .session
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| s.is_device(id, target.as_ref()))
-            .unwrap_or(false);
-        if replacing_same {
-            if let Some(old) = self.session.lock().unwrap().take() {
-                old.stop();
+        let replacing = {
+            let mut guard = self.session.lock().unwrap();
+            if crate::engine::cancel::cancelled() {
+                return Err(SUPERSEDED.into());
             }
-        }
+            if guard.as_ref().is_some_and(|s| s.is_device(id, target.as_ref())) { guard.take() } else { None }
+        };
+        if let Some(old) = replacing { old.stop(); }
 
         // The session's stable id can legitimately differ from the
         // requested one: selecting a Sonos that joined a group since the
@@ -2829,6 +2813,7 @@ impl App {
         // start_upnp). Remember the id we actually bound so reconnect /
         // active-row highlighting track reality.
         let manual = self.find_manual_speaker(id);
+        let asking = crate::engine::cancel::asking_speaker();
         let new_session = if id == crate::sendspin_app::MA_OUTPUT_ID {
             self.start_ma_output()?
         } else if crate::sendspin_app::is_sendspin_id(id) {
@@ -2855,7 +2840,23 @@ impl App {
                     // don't make the receiver display one — the message
                     // says where to do it instead.
                     if interactive {
-                        self.begin_pin_pairing(pid, name.clone());
+                        if crate::engine::cancel::binding().is_some() && pid == id {
+                            // The engine job owns the reconnect. A closed sender means
+                            // the ceremony ended without a usable code.
+                            let (paired, result) = std::sync::mpsc::channel();
+                            self.begin_pin_pairing(pid, name.clone(), Some(paired));
+                            loop {
+                                if crate::engine::cancel::cancelled() {
+                                    return Err(SUPERSEDED.into());
+                                }
+                                match result.recv_timeout(Duration::from_millis(100)) {
+                                    Ok(()) => return self.select_speaker_inner(id, false, user_choice, None),
+                                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(CODE_WINDOW_CLOSED.into()),
+                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                }
+                            }
+                        }
+                        self.begin_pin_pairing(pid, name.clone(), None);
                     }
                     return Err(format!("{}{}", pin_pairing_message(&name, &reason, interactive), suffix));
                 }
@@ -2863,23 +2864,25 @@ impl App {
         } else {
             self.start_upnp(id)?
         };
+        drop(asking);
         let actual_id = new_session.stable_id();
         let is_newcomer = new_session.is_newcomer();
 
         let mut guard = self.session.lock().unwrap();
-        if let Some(old) = guard.take() {
+        // A newer choice superseded this connect while it ran: what it set
+        // up is stopped, not used.
+        loop {
+            if crate::engine::cancel::cancelled() {
+                drop(guard);
+                info!("a newer choice superseded the connect to {}; not binding", actual_id);
+                new_session.stop();
+                self.prune_stream_clients();
+                return Err(SUPERSEDED.to_string());
+            }
+            let Some(old) = guard.take() else { break };
             drop(guard);
             old.stop();
             guard = self.session.lock().unwrap();
-        }
-        // A newer choice superseded this connect while it ran: what it set
-        // up is stopped, not used.
-        if crate::engine::cancel::cancelled() {
-            drop(guard);
-            info!("a newer choice superseded the connect to {}; not binding", actual_id);
-            new_session.stop();
-            self.prune_stream_clients();
-            return Err(SUPERSEDED.to_string());
         }
         // Checked under the session lock: Disable flips the flag before it
         // takes the session, so either it sees ours or we see its flag.
@@ -2945,7 +2948,7 @@ impl App {
         // click "Hide this guide" themselves.
         // (Not a receiver announcing another speaker's identity: the next
         // launch must not connect to it by itself.)
-        if !is_newcomer && !crate::airplay::discovery::is_instance_id(&actual_id) {
+        if crate::engine::cancel::binding().is_none() && !is_newcomer && !crate::airplay::discovery::is_instance_id(&actual_id) {
             let mut uc = self.user_config.lock().unwrap();
             if uc.last_speaker_id.as_deref() != Some(actual_id.as_str()) {
                 uc.last_speaker_id = Some(actual_id.clone());
@@ -2960,7 +2963,7 @@ impl App {
         {
             crate::endpoint_name::update_endpoint_name(new_friendly_name.as_deref());
         }
-        // m24: start the window, the Windows slider and the speaker out
+        // Start the window, the Windows slider and the speaker out
         // agreeing, on the speaker's level. Without this the window would
         // wait for the first GENA NOTIFY (which can take a few seconds and
         // is silent if the user never adjusts the volume on the speaker
@@ -3001,6 +3004,9 @@ impl App {
     fn bind_session(&self, guard: &mut std::sync::MutexGuard<'_, Option<ActiveSession>>, session: ActiveSession) -> u64 {
         **guard = Some(session);
         let number = self.speaker_control.session_bound();
+        if let Some(job) = crate::engine::cancel::binding() {
+            job.number.store(number, Ordering::Release);
+        }
         self.vsync.speaker_bound();
         number
     }
@@ -3117,11 +3123,10 @@ impl App {
         }
     }
 
-    /// UPnP session to a speaker added by its device-description URL: the
-    /// description is fetched now, as discovery would, except that its
-    /// service URLs are used as given (the user chose this device), and
-    /// the session keeps the manual id.
-    fn start_upnp_manual(&self, m: &ManualSpeaker) -> Result<ActiveSession, String> {
+    /// A speaker added by its device-description URL, as its description
+    /// says now (its service URLs used as given: the person chose this
+    /// device).
+    fn describe_manual(&self, m: &ManualSpeaker) -> Result<Renderer, String> {
         // Fetch from an IPv4 address: the stream and the SOAP control
         // paths are IPv4-only, and a hostname may resolve IPv6-first.
         let mut url = url::Url::parse(&m.host).map_err(|e| format!("{}: {}", m.host, e))?;
@@ -3129,8 +3134,21 @@ impl App {
         let ip = manual_speakers::resolve_ipv4(&host, url.port().unwrap_or(80))?;
         url.set_ip_host(IpAddr::V4(ip))
             .map_err(|_| format!("{}: can't use address {}", m.host, ip))?;
-        let r = crate::ssdp::fetch_and_parse_device(url.as_str(), Duration::from_secs(3), crate::ssdp::ServiceUrls::AsGiven)
-            .map_err(|e| format!("couldn't read {}: {:#}", m.host, e))?;
+        crate::ssdp::fetch_and_parse_device(url.as_str(), Duration::from_secs(3), crate::ssdp::ServiceUrls::AsGiven)
+            .map_err(|e| format!("couldn't read {}: {:#}", m.host, e))
+    }
+
+    /// [`Self::describe_manual`], when it can be read.
+    fn manual_renderer(&self, m: &ManualSpeaker) -> Option<Renderer> {
+        self.describe_manual(m).map_err(|e| debug!("{}", e)).ok()
+    }
+
+    /// UPnP session to a speaker added by its device-description URL: the
+    /// description is fetched now, as discovery would, except that its
+    /// service URLs are used as given (the user chose this device), and
+    /// the session keeps the manual id.
+    fn start_upnp_manual(&self, m: &ManualSpeaker) -> Result<ActiveSession, String> {
+        let r = self.describe_manual(m)?;
         let own_udn = r.udn.clone();
         // A Sonos that's grouped streams via its coordinator, as for a
         // discovered one; the coordinator is looked up in discovery. Its
@@ -3180,6 +3198,16 @@ impl App {
         &self,
         id: &str,
         manual: Option<&ManualSpeaker>,
+    ) -> Result<ActiveSession, SelectFailure> {
+        self.start_airplay_from(id, manual, &self.hub)
+    }
+
+    /// [`Self::start_airplay`], the session taking its sound from `hub`.
+    fn start_airplay_from(
+        &self,
+        id: &str,
+        manual: Option<&ManualSpeaker>,
+        hub: &crate::http_server::StreamHub,
     ) -> Result<ActiveSession, SelectFailure> {
         let (renderer, discovery) = match manual {
             Some(m) => (self.resolve_manual_airplay(m).map_err(SelectFailure::Msg)?, None),
@@ -3255,7 +3283,7 @@ impl App {
             info!("AirPlay: attempting {} to {}", label, r.friendly_name);
             let name = r.friendly_name.clone();
             let id = r.stable_id();
-            match self.start_airplay_one(transport, r, local_ip) {
+            match self.start_airplay_one(transport, r, local_ip, hub) {
                 Ok(session) => return Ok(session),
                 Err(AttemptError::NeedsPin(reason)) => {
                     warn!("AirPlay {} to {} needs one-time PIN pairing ({:?})", label, name, reason);
@@ -3378,11 +3406,12 @@ impl App {
         transport: Transport,
         renderer: AirPlayRenderer,
         local_ip: IpAddr,
+        hub: &crate::http_server::StreamHub,
     ) -> Result<ActiveSession, AttemptError> {
         let start_volume = self.airplay_start_volume(&renderer.stable_id());
         match transport {
             Transport::RaopLegacy => {
-                let samples_rx = self.hub.subscribe();
+                let samples_rx = hub.subscribe();
                 let stable_id = renderer.stable_id();
                 // Nothing stored for a speaker goes to a newcomer: only a
                 // password typed for it, once.
@@ -3463,7 +3492,7 @@ impl App {
                     }
                 };
                 let addr = renderer.ip;
-                let samples_rx = self.hub.subscribe();
+                let samples_rx = hub.subscribe();
                 match AirPlay2Session::start(AirPlay2SessionConfig {
                     renderer,
                     local_ip,
@@ -3505,7 +3534,7 @@ impl App {
     /// automatic retries must not make a TV display a pairing PIN.
     ///
     /// [`submit_pin`]: App::submit_pin
-    fn begin_pin_pairing(self: &Arc<Self>, id: String, name: String) {
+    fn begin_pin_pairing(self: &Arc<Self>, id: String, name: String, paired: Option<std::sync::mpsc::Sender<()>>) {
         // Reserve the single ceremony slot; holding it also blocks
         // re-selects of this device (see select_speaker_opts).
         {
@@ -3521,6 +3550,7 @@ impl App {
                 id: id.clone(),
                 name: name.clone(),
                 stage: PinStage::Starting,
+                code_try: None,
             });
         }
         // From here on the guard owns the slot: every exit — early return,
@@ -3540,23 +3570,27 @@ impl App {
             }
         };
 
+        let job = crate::engine::cancel::binding();
         let app = self.clone();
         std::thread::Builder::new()
             .name("stream-to-speaker-ap2-pair".into())
             .spawn(move || {
+                let _scope = job.as_ref().map(|j| j.enter());
+                let _asking = crate::engine::cancel::asking_speaker();
                 let guard = guard;
                 let port = renderer.airplay_port.unwrap_or(DEFAULT_AIRPLAY_PORT);
 
-                // Connection 1: ask the receiver to display its PIN.
-                let pin_shown = (|| -> Result<()> {
-                    let mut rtsp =
-                        Ap2Rtsp::connect(renderer.ip, port, local_ip, Duration::from_secs(5))?;
+                // Connection 1: ask the receiver to display its PIN. A
+                // fresh connection each time: after a wrong code, and when
+                // the person asks for a new one, it is asked again.
+                let show_code = || -> Result<()> {
+                    let mut rtsp = Ap2Rtsp::connect(renderer.ip, port, local_ip, Duration::from_secs(5))?;
                     if let Err(e) = rtsp.get_info() {
                         debug!("pairing GET /info failed (continuing): {:#}", e);
                     }
                     rtsp.pin_start()
-                })();
-                if let Err(e) = pin_shown {
+                };
+                if let Err(e) = show_code() {
                     app.record_error(format!(
                         "Couldn't start pairing on {}: {:#}.{}",
                         name,
@@ -3566,102 +3600,154 @@ impl App {
                     return;
                 }
 
-                // Publish the awaiting-PIN stage (opens the GUI modal) and
-                // park until the user answers or the window expires. 2 min
-                // matches the window Apple TVs give for on-screen PIN entry.
-                let (tx, rx) = crossbeam_channel::bounded::<Option<String>>(1);
-                {
-                    let mut slot = app.pin_ceremony.lock().unwrap();
-                    match slot.as_mut() {
-                        Some(state) => state.stage = PinStage::AwaitingPin(tx),
-                        None => return, // shutdown raced us
-                    }
-                }
-                let pin = match rx.recv_timeout(Duration::from_secs(120)) {
-                    Ok(Some(pin)) => pin,
-                    Ok(None) => {
-                        info!("PIN pairing for {} cancelled by user", name);
-                        return;
-                    }
-                    Err(_) => {
-                        app.record_error(format!(
-                            "PIN entry for {} timed out — select it again to retry.",
-                            name
-                        ));
-                        return;
-                    }
-                };
-
-                // Stage is Pairing now (submit_pin flipped it). Claim the
-                // "Connecting…" banner while pair-setup runs so the GUI
-                // shows progress and competing selects are refused
-                // (best-effort — if another connect owns it, proceed
-                // without).
-                let claimed_banner = {
-                    let mut c = app.connecting.lock().unwrap();
-                    if c.is_none() {
-                        *c = Some(format!("{} (pairing)", name));
-                        true
-                    } else {
-                        false
-                    }
-                };
-
-                // Connection 2 — fresh, at PIN-entry time. The pairing
-                // identity is per-install and persistent: re-pairing with
-                // the same controller id REPLACES the accessory's stored
-                // pairing record instead of leaking one of its finite
-                // pairing slots per ceremony.
-                let (ctrl_id, ctrl_seed_hex) = app.airplay_controller_identity();
-                let setup = (|| -> Result<PairingCredentials> {
-                    let mut rtsp =
-                        Ap2Rtsp::connect(renderer.ip, port, local_ip, Duration::from_secs(5))?;
-                    if let Err(e) = rtsp.get_info() {
-                        debug!("pairing GET /info failed (continuing): {:#}", e);
-                    }
-                    rtsp.pair_setup_pin(pin.trim(), &ctrl_id, &ctrl_seed_hex)
-                })();
-                if claimed_banner {
-                    *app.connecting.lock().unwrap() = None;
-                }
-
-                match setup {
-                    Ok(creds) => {
-                        if !app.store_airplay_pairing(&id, creds) {
-                            app.record_error(format!(
-                                "Paired with {name}, but the pairing can't be saved with the \
-                                 settings: the PIN will be asked for again after the app restarts."
-                            ));
+                loop {
+                    // Publish the awaiting-PIN stage (opens the code
+                    // window) and park until the person answers or the
+                    // window expires. 2 min matches the window Apple TVs
+                    // give for on-screen PIN entry.
+                    let (tx, rx) = crossbeam_channel::bounded::<PinAnswer>(1);
+                    {
+                        let mut slot = app.pin_ceremony.lock().unwrap();
+                        match slot.as_mut() {
+                            Some(state) => state.stage = PinStage::AwaitingPin(tx),
+                            None => return, // shutdown raced us
                         }
-                        info!("AirPlay 2: paired {} — connecting", name);
-                        // Release the ceremony slot BEFORE reconnecting —
-                        // the select guard refuses selects for the pairing
-                        // device while the slot is held.
-                        drop(guard);
-                        // Wait out any in-flight connect so the reconnect
-                        // isn't swallowed by the connecting guard.
-                        for _ in 0..300 {
-                            if app.is_shutting_down() {
+                    }
+                    let end = Instant::now() + Duration::from_secs(120);
+                    let answer = loop {
+                        let remaining = end.saturating_duration_since(Instant::now());
+                        let wait = if let Some(job) = &job {
+                            if job.cancelled.load(Ordering::SeqCst) { return; }
+                            remaining.min(Duration::from_millis(100))
+                        } else { remaining };
+                        match rx.recv_timeout(wait) {
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) if Instant::now() < end => continue,
+                            answer => break answer,
+                        }
+                    };
+                    let pin = match answer {
+                        Ok(PinAnswer::Code(pin)) => pin,
+                        Ok(PinAnswer::NewCode) => {
+                            let shown = show_code().map_err(|e| info!("{} didn't show a new code: {:#}", name, e)).is_ok();
+                            app.note_code_try(CodeTry::NewCode { shown });
+                            continue;
+                        }
+                        Ok(PinAnswer::Cancel) => {
+                            info!("PIN pairing for {} cancelled by user", name);
+                            return;
+                        }
+                        Err(_) => {
+                            app.record_error(format!(
+                                "PIN entry for {} timed out — select it again to retry.",
+                                name
+                            ));
+                            return;
+                        }
+                    };
+
+                    // Stage is Pairing now (submit_pin flipped it). Claim
+                    // the "Connecting…" banner while pair-setup runs so
+                    // competing selects are refused (best-effort — if
+                    // another connect owns it, proceed without).
+                    let claimed_banner = {
+                        let mut c = app.connecting.lock().unwrap();
+                        if c.is_none() {
+                            *c = Some(format!("{} (pairing)", name));
+                            true
+                        } else {
+                            false
+                        }
+                    };
+
+                    // Connection 2 — fresh, at PIN-entry time. The pairing
+                    // identity is per-install and persistent: re-pairing
+                    // with the same controller id REPLACES the accessory's
+                    // stored pairing record instead of leaking one of its
+                    // finite pairing slots per ceremony.
+                    let (ctrl_id, ctrl_seed_hex) = app.airplay_controller_identity();
+                    let setup = (|| -> Result<PairingCredentials> {
+                        let mut rtsp =
+                            Ap2Rtsp::connect(renderer.ip, port, local_ip, Duration::from_secs(5))?;
+                        if let Err(e) = rtsp.get_info() {
+                            debug!("pairing GET /info failed (continuing): {:#}", e);
+                        }
+                        rtsp.pair_setup_pin(pin.trim(), &ctrl_id, &ctrl_seed_hex)
+                    })();
+                    if claimed_banner {
+                        *app.connecting.lock().unwrap() = None;
+                    }
+
+                    match setup {
+                        Ok(creds) => {
+                            if !app.store_airplay_pairing(&id, creds) {
+                                app.record_error(format!(
+                                    "Paired with {name}, but the pairing can't be saved with the \
+                                     settings: the PIN will be asked for again after the app restarts."
+                                ));
+                            }
+                            info!("AirPlay 2: paired {} — connecting", name);
+                            // Release the ceremony slot BEFORE reconnecting —
+                            // the select guard refuses selects for the
+                            // pairing device while the slot is held.
+                            drop(guard);
+                            if let Some(paired) = paired {
+                                let _ = paired.send(());
                                 return;
                             }
-                            if app.connecting.lock().unwrap().is_none() {
-                                break;
+                            // Wait out any in-flight connect so the
+                            // reconnect isn't swallowed by the connecting
+                            // guard.
+                            for _ in 0..300 {
+                                if app.is_shutting_down() {
+                                    return;
+                                }
+                                if app.connecting.lock().unwrap().is_none() {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(100));
                             }
-                            std::thread::sleep(Duration::from_millis(100));
+                            app.select_speaker_async_opts(&id, false, false);
+                            return;
                         }
-                        app.select_speaker_async_opts(&id, false, false);
-                    }
-                    Err(e) => {
-                        app.record_error(format!(
-                            "Pairing {} failed: {:#} (check the PIN and try again).{}",
-                            name,
-                            e,
-                            forget_pairing_hint(&name, app.has_airplay_pairing(&id))
-                        ));
+                        // A wrong code: the device is asked for a new one,
+                        // and the window waits for it.
+                        Err(e) if format!("{e:#}").contains("wrong PIN") => {
+                            info!("the code for {} didn't work: {:#}; asking it for a new one", name, e);
+                            let shown = show_code().map_err(|e| info!("{} didn't show a new code: {:#}", name, e)).is_ok();
+                            app.note_code_try(CodeTry::Wrong { shown });
+                        }
+                        Err(e) => {
+                            app.record_error(format!(
+                                "Pairing {} failed: {:#} (check the PIN and try again).{}",
+                                name,
+                                e,
+                                forget_pairing_hint(&name, app.has_airplay_pairing(&id))
+                            ));
+                            return;
+                        }
                     }
                 }
             })
             .ok();
+    }
+
+    /// Note what the last code, or ask for a new one, came to.
+    fn note_code_try(&self, code_try: CodeTry) {
+        if let Some(state) = self.pin_ceremony.lock().unwrap().as_mut() {
+            state.code_try = Some(code_try);
+        }
+    }
+
+    /// What the last code typed for the pairing in flight, or the last ask
+    /// for a new code, came to; None before either.
+    pub fn pin_code_try(&self) -> Option<CodeTry> {
+        self.pin_ceremony.lock().unwrap().as_ref().and_then(|s| s.code_try)
+    }
+
+    /// Ask the device that is being paired to show a new code (*Show a new
+    /// code on Den TV*). False when no pairing waits for a code.
+    pub fn ask_for_new_code(&self) -> bool {
+        self.answer_pin(PinAnswer::NewCode)
     }
 
     /// The persistent per-install HomeKit controller identity (pairing id
@@ -3706,11 +3792,6 @@ impl App {
     /// may be another one (or none).
     pub fn has_airplay_pairing(&self, id: &str) -> bool {
         self.user_config.lock().unwrap().airplay_pairings.contains_key(id)
-    }
-
-    /// GUI: the PIN modal's text for a ceremony pairing `id` (`name`).
-    pub fn pin_prompt_text(&self, id: &str, name: &str) -> String {
-        pin_prompt_message(name, self.has_airplay_pairing(id))
     }
 
     /// Forget the stored HomeKit pairing for a device id — only ever on the
@@ -3793,6 +3874,11 @@ impl App {
     /// the caller should tell the user to re-select the speaker, since a
     /// PIN typed into a stale modal would otherwise vanish silently.
     pub fn submit_pin(&self, pin: Option<String>) -> bool {
+        self.answer_pin(pin.map_or(PinAnswer::Cancel, PinAnswer::Code))
+    }
+
+    /// Give the pairing waiting for its code `answer`.
+    fn answer_pin(&self, answer: PinAnswer) -> bool {
         let mut guard = self.pin_ceremony.lock().unwrap();
         let Some(state) = guard.as_mut() else {
             return false;
@@ -3804,7 +3890,7 @@ impl App {
         else {
             unreachable!("stage checked above");
         };
-        tx.send(pin).is_ok()
+        tx.send(answer).is_ok()
     }
 
     /// Current speaker-side volume (0-100) if known: None until a level
@@ -3822,7 +3908,7 @@ impl App {
         if !self.speaker_volume_controllable() {
             return;
         }
-        let level = crate::model::rules::within_limit(level.min(100) as u8, self.bound_limit()) as u32;
+        let level = (level.min(100) as u8).min(self.bound_limit().unwrap_or(100)) as u32;
         let unmute = self.vsync.is_muted();
         if unmute {
             self.vsync.note_muted(false);
@@ -3855,15 +3941,22 @@ impl App {
     /// The level an AirPlay speaker starts at: the one last used with it,
     /// 25 the first time. Never louder: its own level can't be read.
     fn airplay_start_volume(&self, id: &str) -> u32 {
-        crate::model::rules::level_on_connect(None, self.speaker_settings(id).level) as u32
+        let s = self.speaker_settings(id);
+        start_level(s.level, s.level_at, unix_seconds(), self.volume_limit(id)) as u32
     }
 
     /// The speaker bound as session `session_number` is at `level` as
     /// its session starts: show it in the window and on the Windows
     /// slider, unless another speaker has been bound since or a level was
-    /// set for this one meanwhile.
+    /// set for this one meanwhile. Above its *Maximum volume from this
+    /// PC*, it is set to that maximum: the maximum caps every start.
     fn speaker_level_on_connect(&self, session_number: u64, level: u32) {
         if self.speaker_control.session_number() != session_number {
+            return;
+        }
+        if let Some(limit) = self.bound_limit().filter(|l| level > *l as u32) {
+            info!("the speaker started at {} above its maximum: {}", level, limit);
+            self.set_speaker_volume(limit as u32);
             return;
         }
         if let Some(level) = self.vsync.speaker_connected(level) {
@@ -3920,48 +4013,6 @@ impl App {
             }
         }
         self.speaker_control.send(cmd);
-    }
-
-    /// Disconnect from the current speaker (if any), clear the
-    /// persisted `last_speaker_id`, and reset the onboarding-dismissed
-    /// flag so the next launch is a true "first launch" again. Used
-    /// by the GUI's Forget-speaker button (audit Heuristics F-07 —
-    /// without this the only way to clear the saved speaker was to
-    /// edit `%APPDATA%\StreamToSpeaker\config.json` by hand).
-    pub fn forget_saved_speaker(&self) {
-        if self.send_command(crate::model::Surface::Settings, crate::model::Command::Play(crate::model::Place::ThisPc)) {
-            // The engine lets the speaker go; the next pick still plays.
-            *self.last_speaker_id.lock().unwrap() = None;
-        } else {
-            self.stop_streaming_and_forget_speaker();
-        }
-        {
-            let mut uc = self.user_config.lock().unwrap();
-            uc.last_speaker_id = None;
-            uc.onboarding_dismissed = false;
-            uc.save();
-        }
-        // Revert the Windows endpoint name back to "Stream To Speaker"
-        // since we're no longer streaming to anything specific.
-        #[cfg(windows)]
-        crate::endpoint_name::update_endpoint_name(None);
-    }
-
-    /// What Forget does to playback: streaming off, the session stopped,
-    /// every network listener of `/stream.raw` cut, and the remembered
-    /// speaker cleared.
-    fn stop_streaming_and_forget_speaker(&self) {
-        // The flag first, as Disable does: a connect finishing meanwhile
-        // checks it under the session lock and won't bind, and the prune
-        // below sees streaming off, so it cuts every device but this PC
-        // whatever the privacy setting.
-        self.streaming_enabled.store(false, Ordering::Release);
-        let s = self.session.lock().unwrap().take();
-        if let Some(s) = s {
-            s.stop();
-        }
-        self.prune_stream_clients();
-        *self.last_speaker_id.lock().unwrap() = None;
     }
 
     // -------------------------------------------------------------------
@@ -4277,10 +4328,10 @@ impl App {
                             self.speaker_name(&id).unwrap_or_else(|| id.to_string())
                         ));
                     }
-                    crate::model::Command::Play(place_of(&id))
+                    crate::model::Command::Switch { place: place_of(&id), way: None }
                 }
                 (true, None) => return Ok(()),
-                (false, _) => crate::model::Command::Play(crate::model::Place::ThisPc),
+                (false, _) => crate::model::Command::Switch { place: crate::model::Place::ThisPc, way: None },
             };
             self.send_command(crate::model::Surface::Tray, cmd);
             return Ok(());
@@ -4347,6 +4398,28 @@ impl App {
         Some(web_access::link(&self.this_pc_address().to_string(), self.config.bind.port(), &key))
     }
 
+    /// A separate bearer key for scripts. Rotating it never invalidates a phone link.
+    pub(crate) fn set_scripts_access(&self, enabled: bool, renew: bool) -> Result<(), String> {
+        let mut cfg = self.user_config.lock().unwrap();
+        let key = if enabled {
+            Some(match cfg.scripts_key.as_deref().and_then(WebSecret::parse).filter(|_| !renew) {
+                Some(key) => key,
+                None => WebSecret::generate()?,
+            })
+        } else { None };
+        let was = cfg.scripts_enabled;
+        let old = cfg.scripts_key.clone();
+        cfg.scripts_enabled = enabled;
+        if let Some(key) = &key { cfg.scripts_key = Some(key.to_hex()); }
+        if let Err(e) = cfg.try_save() {
+            cfg.scripts_enabled = was;
+            cfg.scripts_key = old;
+            return Err(e.to_string());
+        }
+        self.web_access.set_scripts_key(key);
+        Ok(())
+    }
+
     /// Replace the web UI's secret: the current link and API key stop
     /// working with their next request. The new secret takes effect only
     /// once config.json holds it: one only this run knew would be undone
@@ -4406,13 +4479,6 @@ impl App {
 
     pub fn subscriber_count(&self) -> usize {
         self.hub.subscriber_count()
-    }
-
-    /// Retransmission counters of the live AirPlay session, if any — the
-    /// Stats card shows them so a user running a low AirPlay buffer can
-    /// see whether the network is keeping up.
-    pub fn resend_stats(&self) -> Option<(u64, u64)> {
-        self.session.lock().unwrap().as_ref().and_then(|s| s.resend_stats())
     }
 
     pub fn packets_published(&self) -> u64 {
@@ -4578,7 +4644,7 @@ impl App {
     }
 
     /// Plain-text diagnostics for the clipboard.
-    pub fn diagnostics_report(&self) -> String {
+    pub fn diagnostics_report(&self, speakers: bool) -> String {
         let last_error = self.last_error.lock().unwrap().as_ref().map(|(m, _)| m.clone());
         crate::diagnostics::report(
             PRODUCT_NAME,
@@ -4586,6 +4652,7 @@ impl App {
             &self.diagnostics_snapshot(),
             last_error.as_deref(),
             self.last_fault().as_ref(),
+            speakers,
         )
     }
 
@@ -4629,80 +4696,9 @@ impl App {
         }
     }
 
-    /// Whether launch-time reconnection may pick `id` (its own setting
-    /// can veto it).
-    pub fn auto_connect_allowed_at_launch(&self, id: &str) -> bool {
-        self.speaker_settings(id).auto_connect != AutoConnect::Never
-    }
-
-    /// Background auto-connect for speakers set to "Always": when one is
-    /// listed (for at least a second), nothing is bound or connecting, and
-    /// the user hasn't switched streaming off, connect to it — the
-    /// last-used one first. Each speaker is tried once per appearance:
-    /// it is re-armed only after it drops out of the list and comes back.
-    /// Never interactive, so it can't start a PIN prompt.
-    pub fn spawn_auto_connect(self: &Arc<Self>) {
-        let app = self.clone();
-        std::thread::Builder::new()
-            .name("stream-to-speaker-auto-connect".into())
-            .spawn(move || {
-                let mut first_seen: std::collections::HashMap<String, Instant> =
-                    std::collections::HashMap::new();
-                let mut tried: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                while app.sleep_unless_shutdown(Duration::from_secs(1)) {
-                    let always: Vec<String> = {
-                        let uc = app.user_config.lock().unwrap();
-                        uc.speaker_settings
-                            .iter()
-                            .filter(|(_, s)| s.auto_connect == AutoConnect::Always && !s.hidden)
-                            .map(|(id, _)| id.clone())
-                            .collect()
-                    };
-                    if always.is_empty() {
-                        first_seen.clear();
-                        tried.clear();
-                        continue;
-                    }
-                    let listed: std::collections::HashSet<String> =
-                        app.speaker_view().speakers.into_iter().map(|s| s.id).collect();
-                    first_seen.retain(|id, _| listed.contains(id));
-                    tried.retain(|id| listed.contains(id));
-                    let now = Instant::now();
-                    for id in always.iter().filter(|id| listed.contains(*id)) {
-                        first_seen.entry(id.clone()).or_insert(now);
-                    }
-                    if app.is_speaker_bound()
-                        || app.connecting_to().is_some()
-                        || !app.is_streaming_enabled()
-                        || app.pin_pairing_device().is_some()
-                    {
-                        continue;
-                    }
-                    let mut eligible: Vec<&String> = always
-                        .iter()
-                        .filter(|id| !tried.contains(*id))
-                        .filter(|id| {
-                            first_seen
-                                .get(*id)
-                                .map_or(false, |t| now.duration_since(*t) >= Duration::from_secs(1))
-                        })
-                        .collect();
-                    eligible.sort();
-                    let last = app.last_speaker_id.lock().unwrap().clone();
-                    let pick = eligible
-                        .iter()
-                        .find(|id| Some(id.as_str()) == last.as_deref())
-                        .or_else(|| eligible.first())
-                        .map(|id| (*id).clone());
-                    if let Some(id) = pick {
-                        info!("auto-connect: connecting to {}", id);
-                        tried.insert(id.clone());
-                        app.select_speaker_async_opts(&id, false, true);
-                    }
-                }
-            })
-            .ok();
+    /// The transport launch planner may never pick a speaker on its own.
+    pub fn auto_connect_allowed_at_launch(&self, _id: &str) -> bool {
+        false
     }
 
     /// Every listed speaker as `--player` sees it, in list order.
@@ -4727,7 +4723,6 @@ impl App {
                     manual: r.manual,
                     hidden: r.hidden,
                     used_before: r.manual,
-                    never_auto: false,
                 };
                 if r.manual {
                     c.names.extend(self.find_manual_speaker(&r.id).map(|m| m.display_name()));
@@ -4761,7 +4756,6 @@ impl App {
                 || settings.is_some()
                 || uc.airplay_pairings.contains_key(&c.id)
                 || uc.airplay_passwords.contains_key(&c.id);
-            c.never_auto = settings.is_some_and(|s| s.auto_connect == AutoConnect::Never);
         }
         candidates
     }
@@ -4830,8 +4824,18 @@ impl App {
                             }
                             info!("--player {:?}: found {:?}; connecting", query, m.id);
                             *app.player_wish.lock().unwrap() = Some(PlayerWish::Looking { query: query.clone() });
-                            attempt = Some((m.id.clone(), name, app.last_fault()));
-                            app.play_wish_unless_user_picked(&m.id, picks_seen);
+                            if app.command_sink.get().is_some() {
+                                match app.play_and_wait(crate::model::Surface::CommandLine, &m.id, Some(picks_seen)) {
+                                    Ok(()) => break,
+                                    Err(why) => {
+                                        warn!("--player {:?}: {}", query, why);
+                                        *app.player_wish.lock().unwrap() = Some(PlayerWish::failed(&query, name, Some(why)));
+                                    }
+                                }
+                            } else {
+                                attempt = Some((m.id.clone(), name, app.last_fault()));
+                                app.select_speaker_async_full(&m.id, false, false, Some(picks_seen), None);
+                            }
                         }
                         None if steps.tried.is_none() && attempt.is_none() => {
                             // What it tried has gone from the list: looking again.
@@ -4978,13 +4982,21 @@ impl App {
     /// Run `hook` once, when quitting begins (Quit chosen, the window closed
     /// for good, Ctrl+C).
     pub fn on_quit(&self, hook: impl Fn() + Send + Sync + 'static) {
+        self.on_quit_from(move |_| hook());
+    }
+
+    pub fn on_quit_from(&self, hook: impl Fn(crate::model::Surface) + Send + Sync + 'static) {
         let _ = self.on_quit.set(Box::new(hook));
     }
 
     pub fn request_shutdown(&self) {
+        self.request_shutdown_from(crate::model::Surface::Panel);
+    }
+
+    pub fn request_shutdown_from(&self, from: crate::model::Surface) {
         if !self.shutdown.swap(true, Ordering::SeqCst) {
             if let Some(hook) = self.on_quit.get() {
-                hook();
+                hook(from);
             }
         }
     }
@@ -5003,6 +5015,10 @@ impl App {
         let _ = self.command_sink.set(sink);
     }
 
+    pub(crate) fn engine_view(&self) -> Option<Arc<crate::model::Snapshot>> {
+        self.engine_port.get()?.upgrade().map(|port| port.snapshot())
+    }
+
     /// Send `cmd` from `from` to the engine, if it runs. Returns whether
     /// it was sent.
     fn send_command(&self, from: crate::model::Surface, cmd: crate::model::Command) -> bool {
@@ -5016,27 +5032,14 @@ impl App {
     }
 
     /// Connect to `id` and make it what plays, for the engine, on the
-    /// calling thread (one of the engine's own). `person`: a person chose
-    /// it, so a code or password may be asked for.
-    /// `window`: a person's pick in the app's own window, the only one
-    /// that may play to a receiver announcing another speaker's identity
-    /// and ask for a code or password. `chosen`: a person chose it, there
-    /// or elsewhere (not a return or a retry).
-    pub(crate) fn engine_connect(self: &Arc<Self>, id: &str, window: bool, chosen: bool) -> Result<(), String> {
+    /// calling thread. A pick in the app's own window may ask for a secret.
+    pub(crate) fn engine_connect(self: &Arc<Self>, id: &str, window: bool) -> Result<(), String> {
         *self.connecting.lock().unwrap() = Some(self.speaker_name(id).unwrap_or_else(|| id.to_string()));
-        if chosen {
-            self.note_user_pick();
-        }
         let result = self.select_speaker_inner(id, window, window, None);
         self.forget_typed_password(id);
         *self.connecting.lock().unwrap() = None;
         self.clear_connecting_notice();
         result
-    }
-
-    /// The speaker a code dialog is open for.
-    pub(crate) fn pin_ceremony_id(&self) -> Option<String> {
-        self.pin_pairing_device().map(|(id, _)| id)
     }
 
     /// Whether `id` asked for an AirPlay password in this run.
@@ -5053,27 +5056,191 @@ impl App {
         self.transport_change.lock().unwrap().take()
     }
 
-    /// Let the bound speaker go. `tell_speaker` false when someone else
-    /// plays on it now: then it gets no Stop (that would stop them), only
-    /// the subscriptions end. The network part runs on a thread of its own.
-    pub(crate) fn release_session(self: &Arc<Self>, tell_speaker: bool) -> Option<std::thread::JoinHandle<()>> {
-        let session = self.session.lock().unwrap().take()?;
-        self.prune_stream_clients();
-        let cell = Arc::new(Mutex::new(Some(session)));
-        let stop = move |cell: &Mutex<Option<ActiveSession>>| match cell.lock().unwrap().take() {
-            Some(ActiveSession::Upnp(s)) if !tell_speaker => {
-                s.gena.unsubscribe();
-                if let Some(t) = &s.transport {
-                    t.unsubscribe();
-                }
+    /// A topology event from the bound Sonos room (the NOTIFY route).
+    pub fn note_topology(&self, groups: Vec<crate::sonos::ZoneGroup>) {
+        *self.topology.lock().unwrap() = Some(groups);
+    }
+
+    pub(crate) fn take_topology(&self) -> Option<Vec<crate::sonos::ZoneGroup>> {
+        self.topology.lock().unwrap().take()
+    }
+
+    /// Look at speaker `id` before sound plays on it: whether it answers,
+    /// and whether it plays something else where it shows that. A UPnP
+    /// speaker is asked for its transport and what it plays; an AirPlay
+    /// receiver's announcement says whether another device sends to it,
+    /// and otherwise a connection to its control port (with nothing sent
+    /// on it) says whether it answers. Other speakers show nothing: free.
+    pub fn look_at_speaker(&self, id: &str) -> crate::engine::signals::SpeakerSignal {
+        use crate::engine::signals::{answers_on, SpeakerSignal, STILL_THERE_WAIT};
+        let _asking = crate::engine::cancel::asking_speaker();
+        if let Some(r) = self.discovery.as_ref().and_then(|d| d.find_by_id(id)) {
+            let Ok(local) = self.local_ip_toward(r.ip) else { return SpeakerSignal::NotResponding };
+            let ours = format!("http://{}/", SocketAddr::new(local, self.config.bind.port()));
+            let Ok(state) = upnp::get_transport_state(&r.av_transport_control_url) else {
+                return SpeakerSignal::NotResponding;
+            };
+            let Ok((uri, title)) = upnp::get_media_info(&r.av_transport_control_url) else {
+                return SpeakerSignal::NotResponding;
+            };
+            return if upnp::is_busy(&state, &uri, &ours) {
+                SpeakerSignal::PlayingElse { who: title.as_deref().and_then(upnp::other_pc_in_title) }
+            } else {
+                SpeakerSignal::Free
+            };
+        }
+        if let Some(r) = self.find_airplay_renderer(id) {
+            if self.another_device_sends_to(&r) {
+                return SpeakerSignal::PlayingElse { who: None };
             }
-            Some(other) => other.stop(),
-            None => {}
+            let port = if r.port != 0 { r.port } else { r.airplay_port.unwrap_or(DEFAULT_AIRPLAY_PORT) };
+            return if answers_on(SocketAddr::new(r.ip, port), STILL_THERE_WAIT) {
+                crate::engine::cancel::speaker_answered();
+                SpeakerSignal::Free
+            } else {
+                SpeakerSignal::NotResponding
+            };
+        }
+        SpeakerSignal::Free
+    }
+
+    /// Whether `r`'s announcement says another device sends to it, unless
+    /// this PC played there within the last minute (its own session may
+    /// still be announced for a moment after it ended).
+    pub(crate) fn another_device_sends_to(&self, r: &crate::airplay::AirPlayRenderer) -> bool {
+        const OWN_SESSION_ANNOUNCED_FOR: Duration = Duration::from_secs(60);
+        let ours_lately = self
+            .last_ended
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(id, at)| *id == r.stable_id() && at.elapsed() < OWN_SESSION_ANNOUNCED_FOR);
+        let ours_now = self.session.lock().unwrap().as_ref().is_some_and(|s| s.stable_id() == r.stable_id());
+        !ours_lately && !ours_now && r.another_device_sending()
+    }
+
+    /// Take the stream off the bound speaker after a long quiet, where the
+    /// speaker lets that happen, so that it is free to others meanwhile:
+    /// a UPnP speaker is told `Stop` and its session kept for
+    /// [`Self::restart_upnp_stream_number`]; an AirPlay receiver is made silent
+    /// and let go (connected again when sound starts). Others keep their
+    /// stream. What was done; None for nothing.
+    pub(crate) fn take_stream_off_number(self: &Arc<Self>, number: Option<u64>) -> Option<TakenOff> {
+        let (avt, name) = {
+            let guard = self.session.lock().unwrap();
+            if number.is_some_and(|n| n != self.session_number()) {
+                return None;
+            }
+            match guard.as_ref()? {
+                ActiveSession::Upnp(r) => (r.renderer.av_transport_control_url.clone(), r.renderer.friendly_name.clone()),
+                ActiveSession::AirPlay(_) | ActiveSession::AirPlay2(_) => {
+                    let id = guard.as_ref()?.stable_id();
+                    let number = self.session_number();
+                    drop(guard);
+                    if let Some(h) = self.release_number_then(Some(number), true, Box::new(|| {})) {
+                        let _ = h.join();
+                    }
+                    info!("took the stream off {} after a long quiet", id);
+                    return Some(TakenOff::LetGo(id));
+                }
+                ActiveSession::Sendspin(_) | ActiveSession::MusicAssistant(_) => return None,
+            }
         };
-        let worker_cell = cell.clone();
+        if let Err(e) = upnp::stop(&avt) {
+            warn!("UPnP Stop on {} failed: {}", name, e);
+            return None;
+        }
+        info!("took the stream off {} after a long quiet", name);
+        Some(TakenOff::Stopped)
+    }
+
+    /// Give the bound UPnP speaker its stream again from the start: the
+    /// same address with its metadata, then Play, so that nothing it held
+    /// from before (a long pause, the stream taken off) plays first.
+    pub(crate) fn restart_upnp_stream_number(&self, expected: Option<u64>) -> Result<(), String> {
+        let (avt, uri, profile, number) = {
+            let guard = self.session.lock().unwrap();
+            let Some(ActiveSession::Upnp(r)) = guard.as_ref() else {
+                return Err("not playing on a UPnP speaker".into());
+            };
+            let number = self.session_number();
+            if expected.is_some_and(|n| n != number) || crate::engine::cancel::cancelled() {
+                return Err(SUPERSEDED.into());
+            }
+            if let Some(job) = crate::engine::cancel::binding() {
+                job.number.store(number, Ordering::Release);
+            }
+            (r.renderer.av_transport_control_url.clone(), r.stream_uri.clone(), r.profile, number)
+        };
+        let didl = upnp::didl_lite_metadata(&uri, PRODUCT_NAME, self.config.initial_buffer_ms, profile);
+        let given_at = Instant::now();
+        let _asking = crate::engine::cancel::asking_speaker();
+        upnp::set_av_transport_uri(&avt, &uri, &didl, &upnp::TRANSPORT).map_err(|e| format!("{e:#}"))?;
+        if crate::engine::cancel::cancelled() || self.session_number() != number {
+            return Err(SUPERSEDED.into());
+        }
+        upnp::play(&avt).map_err(|e| format!("{e:#}"))?;
+        let mut guard = self.session.lock().unwrap();
+        if let Some(ActiveSession::Upnp(r)) = guard.as_mut().filter(|_| self.session_number() == number) {
+            r.stream_given_at = given_at;
+            r.played_at = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// Read under the session lock when identifying a particular binding.
+    pub(crate) fn session_number(&self) -> u64 {
+        self.speaker_control.session_number()
+    }
+
+    /// Release the session this job bound, if it still owns it. A zero
+    /// number means the job never bound a session.
+    pub(crate) fn release_job(self: &Arc<Self>, job: &crate::engine::cancel::Binding) -> Option<std::thread::JoinHandle<()>> {
+        let number = job.number.load(Ordering::Acquire);
+        if number == 0 {
+            return None;
+        }
+        self.release_number_then(Some(number), true, Box::new(|| {}))
+    }
+
+    /// A later session, even to the same speaker, belongs to another job.
+    pub(crate) fn release_number_then(
+        self: &Arc<Self>, number: Option<u64>, tell_speaker: bool, then: Box<dyn FnOnce() + Send>,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let session = {
+            let mut guard = self.session.lock().unwrap();
+            if number.is_none_or(|n| n == self.session_number()) { guard.take() } else { None }
+        };
+        let Some(session) = session else {
+            then();
+            return None;
+        };
+        *self.last_ended.lock().unwrap() = Some((session.stable_id(), Instant::now()));
+        self.prune_stream_clients();
+        let cell = Arc::new(Mutex::new(Some((session, then))));
+        let app = self.clone();
+        let stop = move |cell: &Mutex<Option<(ActiveSession, Box<dyn FnOnce() + Send>)>>| {
+            let Some((session, then)) = cell.lock().unwrap().take() else { return };
+            match session {
+                ActiveSession::Upnp(s) if !tell_speaker => unsubscribe_all(&s),
+                other if tell_speaker => {
+                    let (name, id) = (other.friendly_name(), other.stable_id());
+                    if other.silence() {
+                        debug!("{} took the stop", name);
+                        app.signals.push(&id, crate::engine::signals::SpeakerSignal::Silenced);
+                    } else {
+                        info!("{} didn't answer the stop; it plays out what it holds", name);
+                    }
+                }
+                other => other.stop(),
+            }
+            then();
+        };
+        let stop = Arc::new(stop);
+        let (worker_cell, worker_stop) = (cell.clone(), stop.clone());
         match std::thread::Builder::new()
             .name("stream-to-speaker-release".into())
-            .spawn(move || stop(&worker_cell))
+            .spawn(move || worker_stop(&worker_cell))
         {
             Ok(handle) => Some(handle),
             Err(e) => {
@@ -5106,33 +5273,98 @@ impl App {
         let mut guard = self.test_sound.lock().unwrap();
         let Some(pos) = guard.as_mut() else { return };
         let ch = channels.max(1) as usize;
-        let total = TEST_SOUND_NOTE_FRAMES * TEST_SOUND_NOTES.len();
         for frame in samples.chunks_mut(ch) {
-            if *pos >= total {
+            if *pos >= CHIME_FRAMES {
                 break;
             }
-            let note = *pos / TEST_SOUND_NOTE_FRAMES;
-            let at = *pos % TEST_SOUND_NOTE_FRAMES;
-            let fade = (TEST_SOUND_NOTE_FRAMES / 20) as f32;
-            let envelope = (at as f32 / fade).min((TEST_SOUND_NOTE_FRAMES - at) as f32 / fade).min(1.0);
-            let t = at as f32 / WIRE_SAMPLE_RATE as f32;
-            let v = (std::f32::consts::TAU * TEST_SOUND_NOTES[note] * t).sin() * envelope * 0.25 * i16::MAX as f32;
+            let v = chime_at(*pos);
             for s in frame.iter_mut() {
                 *s = (*s as i32 + v as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             }
             *pos += 1;
         }
-        if *pos >= total {
+        if *pos >= CHIME_FRAMES {
             *guard = None;
         }
+    }
+
+    /// Play the test chime on speaker `id`, which isn't the place, while
+    /// the place's sound goes on: a second, short session of its own,
+    /// ended after the chime. A UPnP speaker is given the chime's file at
+    /// a path of the stream server of its own ([`CHIME_PATH`]) and Play;
+    /// an AirPlay receiver gets a session of its own that sends the chime
+    /// and then lets go. A speaker that plays something else is left
+    /// alone (it gets the chime only once a person confirmed that it may
+    /// stop what plays there). Runs on the caller's thread: network I/O.
+    pub(crate) fn chime_beside(self: &Arc<Self>, id: &str, confirmed: bool, level: Option<u8>) -> Result<(), String> {
+        let _asking = crate::engine::cancel::asking_speaker();
+        let name = self.speaker_name(id).unwrap_or_else(|| id.to_string());
+        if !confirmed && matches!(self.look_at_speaker(id), crate::engine::signals::SpeakerSignal::PlayingElse { .. }) {
+            return Err(format!("{name} is playing something else"));
+        }
+        let upnp = self.discovery.as_ref().and_then(|d| d.find_by_id(id)).or_else(|| {
+            self.find_manual_speaker(id).filter(|m| m.kind == ManualKind::Upnp).and_then(|m| self.manual_renderer(&m))
+        });
+        if let Some(r) = upnp {
+            let local = self.local_ip_toward(r.ip)?;
+            let uri = format!("http://{}{}", SocketAddr::new(local, self.config.bind.port()), CHIME_PATH);
+            let didl = chime_didl(&uri);
+            let avt = &r.av_transport_control_url;
+            if let Some(level) = level {
+                let volume = match r.group_volume_control_url() {
+                    Some(url) => VolumeControl::UpnpGroup(url.to_owned()),
+                    None => VolumeControl::Upnp(r.rendering_control_control_url.clone()),
+                };
+                volume.set_volume_pct(u32::from(level)).map_err(|e| format!("{e:#}"))?;
+            }
+            upnp::set_av_transport_uri(avt, &uri, &didl, &upnp::TRANSPORT).map_err(|e| format!("{e:#}"))?;
+            upnp::play(avt).map_err(|e| format!("{e:#}"))?;
+            info!("test chime on {name} beside the place");
+            return Ok(());
+        }
+        let manual = self.find_manual_speaker(id).filter(|m| m.kind == ManualKind::AirPlay);
+        if self.find_airplay_renderer(id).is_none() && manual.is_none() {
+            return Err(format!("{name} can't play a test chime"));
+        }
+        let hub = crate::http_server::StreamHub::new();
+        let session = self.start_airplay_from(id, manual.as_ref(), &hub).map_err(|e| match e {
+            SelectFailure::Msg(m) => m,
+            SelectFailure::NeedsPin { name, .. } => format!("{name} needs its code"),
+        })?;
+        if let (Some(level), Some(control)) = (level, session.volume_control()) {
+            if let Err(e) = control.set_volume_pct(u32::from(level)) {
+                session.stop();
+                return Err(format!("{e:#}"));
+            }
+        }
+        // The chime in the frames the audio loop sends, at their pace,
+        // then silence while the receiver plays out what it holds.
+        // What a receiver holds before it plays (its usual AirPlay buffer),
+        // and a little more.
+        let hold = Duration::from_millis(crate::user_config::AIRPLAY_LATENCY_MS_DEFAULT as u64 + 500);
+        let frames_per_packet = WIRE_SAMPLE_RATE as usize / 100;
+        let chime = chime_pcm(crate::WIRE_CHANNELS);
+        let packets = chime.chunks(frames_per_packet * crate::WIRE_CHANNELS as usize);
+        let silence = vec![0i16; frames_per_packet * crate::WIRE_CHANNELS as usize];
+        let tail = hold.as_millis() as usize / 10;
+        let start = Instant::now();
+        for (n, samples) in packets.chain(std::iter::repeat(silence.as_slice()).take(tail)).enumerate() {
+            hub.publish(crate::http_server::PcmFrame(Arc::new(crate::http_server::samples_to_wav_le_bytes(samples))));
+            let due = start + Duration::from_millis(10 * (n as u64 + 1));
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+        }
+        session.stop();
+        info!("test chime on {name} beside the place");
+        Ok(())
     }
 
     fn note_refused(&self, peer: IpAddr) {
         let peer = canonical_ip(peer);
         let name = self.speaker_name_at(peer).unwrap_or_else(|| peer.to_string());
+        let speaker = self.session.lock().unwrap().as_ref().map(|s| s.stable_id());
         let mut list = self.refused.lock().unwrap();
         list.retain(|r| r.address != peer);
-        list.insert(0, RefusedDevice { address: peer, name, at: std::time::SystemTime::now() });
+        list.insert(0, RefusedDevice { speaker, address: peer, name, at: std::time::SystemTime::now() });
         list.truncate(REFUSALS_KEPT);
     }
 
@@ -5223,14 +5455,7 @@ impl App {
         self.volume_limit(&id)
     }
 
-    /// When this PC last sent real sound (not silence), since the app
-    /// started.
-    pub(crate) fn last_sound_at(&self) -> Option<Duration> {
-        match self.source_sound_at_ms.load(Ordering::Relaxed) {
-            0 => None,
-            ms => Some(Duration::from_millis(ms - 1)),
-        }
-    }
+
 }
 
 // -----------------------------------------------------------------------------
@@ -5540,10 +5765,32 @@ pub fn start_session(
         }
     });
 
+    // A Sonos room's topology events: rooms that join its group, or the
+    // room taken into another room's group.
+    let topology = renderer
+        .zone_group_topology_control_url
+        .as_deref()
+        .filter(|_| renderer.is_sonos())
+        .and_then(crate::sonos::topology_event_url)
+        .and_then(|url| {
+            let t = GenaManager::new(callback_url.to_string());
+            match t.subscribe(&url) {
+                Ok(_) => {
+                    t.clone().spawn_renewer();
+                    Some(t)
+                }
+                Err(e) => {
+                    debug!("topology events unavailable from {}: {}", renderer.friendly_name, e);
+                    None
+                }
+            }
+        });
+
     let session = RendererSession {
         renderer,
         gena,
         transport,
+        topology,
         stream_uri,
         stream_grant,
         id_override: None,
@@ -5580,11 +5827,16 @@ fn no_answer_in_time(e: &anyhow::Error) -> bool {
         .is_some_and(|a| matches!(a.failure, upnp::Failure::NoAnswer(crate::device_http::HttpError::NoAnswer(_))))
 }
 
-pub fn stop_session(session: &RendererSession) {
+/// End every event subscription of `session`.
+fn unsubscribe_all(session: &RendererSession) {
     session.gena.unsubscribe();
-    if let Some(t) = &session.transport {
+    for t in [&session.transport, &session.topology].into_iter().flatten() {
         t.unsubscribe();
     }
+}
+
+pub fn stop_session(session: &RendererSession) {
+    unsubscribe_all(session);
     if let Err(e) = upnp::stop(&session.renderer.av_transport_control_url) {
         debug!("UPnP Stop on {} failed: {}", session.renderer.friendly_name, e);
     }
@@ -5623,8 +5875,6 @@ pub(crate) struct PlayerCandidate {
     /// The settings record it being used before: the last speaker, its own
     /// settings, a pairing or password, or added by address.
     pub used_before: bool,
-    /// Set never to connect by itself.
-    pub never_auto: bool,
 }
 
 /// How `--player`'s text matched the speaker taken.
@@ -5697,8 +5947,7 @@ fn parse_address(text: &str) -> Option<(IpAddr, Option<u16>)> {
 /// inside a Sonos group; else part of the device's own description name,
 /// both also among those shown. Among several matches: shown before
 /// hidden, a speaker's UPnP entry before its AirPlay one, then ones used
-/// before, then ones not set never to connect by themselves, then list
-/// order. Nothing is refused for being ambiguous.
+/// before, then list order. Nothing is refused for being ambiguous.
 pub(crate) fn rank_player_match(query: &str, rows: &[PlayerCandidate]) -> Option<PlayerMatch> {
     let q = query.trim();
     if q.is_empty() {
@@ -5742,7 +5991,7 @@ pub(crate) fn rank_player_match(query: &str, rows: &[PlayerCandidate]) -> Option
         };
         let best = found
             .iter()
-            .min_by_key(|(i, c)| (c.hidden, twin(c), !c.used_before, c.never_auto, *i))?;
+            .min_by_key(|(i, c)| (c.hidden, twin(c), !c.used_before, *i))?;
         Some(PlayerMatch { id: best.1.id.clone(), how: *how, also_fitted: found.len() - 1 })
     })
 }
@@ -5963,7 +6212,7 @@ mod tests {
     #[test]
     #[ignore = "run in a child process by test_app_never_reads_the_settings_file"]
     fn test_app_settings_probe() {
-        assert!(test_app().is_auto_reconnect_on_drop(), "test_app() used the settings file");
+        assert!(test_app().user_config.lock().unwrap().auto_reconnect_on_drop, "test_app() used the settings file");
     }
 
     #[test]
@@ -6106,6 +6355,7 @@ mod tests {
             },
             gena: GenaManager::new("http://127.0.0.1:1/gena".into()),
             transport: None,
+            topology: None,
             stream_uri: String::new(),
             stream_grant: None,
             id_override: None,
@@ -6906,55 +7156,24 @@ mod tests {
     }
 
     #[test]
-    fn sendspin_launch_reconnect_follows_the_speaker_setting() {
+    fn legacy_launch_preferences_cannot_move_the_sound() {
         use crate::sendspin_app::{LaunchSkip, SendspinLaunch, MA_OUTPUT_ID};
         let app = test_app();
-        app.user_config.lock().unwrap().sendspin.enabled = true;
-        let plan = |id: &str, auto_connect: AutoConnect| {
-            {
-                let mut uc = app.user_config.lock().unwrap();
-                uc.last_speaker_id = Some(id.to_string());
-                uc.speaker_settings.insert(
-                    id.to_string(),
-                    SpeakerSettings { auto_connect, ..Default::default() },
-                );
+        for id in ["sendspin:kitchen", MA_OUTPUT_ID] {
+            for setting in [AutoConnect::Default, AutoConnect::Always, AutoConnect::Never] {
+                let mut cfg = app.user_config.lock().unwrap();
+                cfg.last_speaker_id = Some(id.into());
+                cfg.auto_reconnect_on_launch = true;
+                cfg.sendspin.enabled = true;
+                cfg.speaker_settings.entry(id.into()).or_default().auto_connect = setting;
+                drop(cfg);
+                assert_eq!(app.sendspin_launch_plan(), Some(SendspinLaunch::Skip(LaunchSkip::ReconnectOff)));
             }
-            app.sendspin_launch_plan()
-        };
-        let kitchen = || Some(SendspinLaunch::Speaker("sendspin:kitchen".into()));
-        assert_eq!(plan("sendspin:kitchen", AutoConnect::Default), kitchen());
-        assert_eq!(plan("sendspin:kitchen", AutoConnect::Always), kitchen());
-        assert_eq!(
-            plan("sendspin:kitchen", AutoConnect::Never),
-            Some(SendspinLaunch::Skip(LaunchSkip::Never))
-        );
-        assert_eq!(
-            plan(MA_OUTPUT_ID, AutoConnect::Never),
-            Some(SendspinLaunch::Skip(LaunchSkip::Never))
-        );
-        // No Music Assistant input running here, so nothing to select.
-        assert_eq!(
-            plan(MA_OUTPUT_ID, AutoConnect::Default),
-            Some(SendspinLaunch::Skip(LaunchSkip::InputOff))
-        );
-        // Other kinds of speaker are reconnected by `main`.
-        assert_eq!(plan("airplay:AABBCCDDEEFF", AutoConnect::Default), None);
-
-        app.user_config.lock().unwrap().auto_reconnect_on_launch = false;
-        assert_eq!(
-            plan("sendspin:kitchen", AutoConnect::Default),
-            Some(SendspinLaunch::Skip(LaunchSkip::ReconnectOff))
-        );
-        app.user_config.lock().unwrap().auto_reconnect_on_launch = true;
-        app.user_config.lock().unwrap().sendspin.enabled = false;
-        assert_eq!(
-            plan("sendspin:kitchen", AutoConnect::Default),
-            Some(SendspinLaunch::Skip(LaunchSkip::SendspinOff))
-        );
+        }
     }
 
     #[test]
-    fn always_auto_connect_sees_sendspin_speakers() {
+    fn sendspin_speakers_are_listed_while_enabled() {
         use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
         let app = test_app();
         let found = SendspinDiscoveryState::new();
@@ -6966,7 +7185,6 @@ mod tests {
             path: "/sendspin".into(),
         });
         *app.sendspin.discovery.lock().unwrap() = Some(found);
-        // The auto-connect loop picks from this list.
         let listed = || app.speaker_view().speakers.iter().any(|s| s.id == "sendspin:kitchen");
         assert!(!listed(), "listed while Sendspin is off");
         app.user_config.lock().unwrap().sendspin.enabled = true;
@@ -7026,62 +7244,13 @@ mod tests {
     }
 
     #[test]
-    fn sendspin_launch_wait_yields_to_the_user() {
-        use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
-        use crate::sendspin_app::LaunchStep;
-        let id = "sendspin:kitchen";
+    fn a_connect_decided_before_a_user_pick_is_skipped() {
         let app = test_app();
-        {
-            let mut uc = app.user_config.lock().unwrap();
-            uc.sendspin.enabled = true;
-            uc.last_speaker_id = Some(id.to_string());
-        }
-        let found = SendspinDiscoveryState::new();
-        *app.sendspin.discovery.lock().unwrap() = Some(found.clone());
         let seen = app.user_pick_count();
-        let step = |app: &App| app.sendspin_launch_step(id, seen);
-        assert_eq!(step(&app), LaunchStep::Wait);
-        found.insert(SendspinRenderer {
-            instance: "Kitchen".into(),
-            friendly_name: "Kitchen".into(),
-            ip: ip("192.168.1.40"),
-            port: 8928,
-            path: "/sendspin".into(),
-        });
-        assert_eq!(step(&app), LaunchStep::Select);
-
-        let stops = |app: &App| matches!(step(app), LaunchStep::Stop(_));
-        // An automatic connect (an "Always" speaker) still connecting
-        // doesn't end the wait: it isn't a pick.
-        *app.connecting.lock().unwrap() = Some("Den".into());
-        assert_eq!(step(&app), LaunchStep::Select);
-        *app.connecting.lock().unwrap() = None;
-        // The saved speaker was set to "Never".
-        app.user_config.lock().unwrap().speaker_settings.insert(
-            id.to_string(),
-            SpeakerSettings { auto_connect: AutoConnect::Never, ..Default::default() },
-        );
-        assert!(stops(&app));
-        app.user_config.lock().unwrap().speaker_settings.remove(id);
-        assert_eq!(step(&app), LaunchStep::Select);
-        // Another speaker was saved.
-        app.user_config.lock().unwrap().last_speaker_id = Some("airplay:AABBCCDDEEFF".into());
-        assert!(stops(&app));
-        app.user_config.lock().unwrap().last_speaker_id = Some(id.to_string());
-        // Sendspin was turned off.
-        app.user_config.lock().unwrap().sendspin.enabled = false;
-        assert!(stops(&app));
-        app.user_config.lock().unwrap().sendspin.enabled = true;
-        assert_eq!(step(&app), LaunchStep::Select);
-
-        // The user picked a speaker whose connect failed at once: nothing
-        // is bound or connecting afterwards, yet the wait gives up.
         assert!(app.select_speaker("sendspin:nowhere").is_err());
         assert!(!app.is_speaker_bound() && app.connecting_to().is_none());
-        assert!(stops(&app));
-        // A select decided after that pick is skipped as well.
         app.dismiss_error();
-        app.connect_unless_user_picked(id, seen);
+        app.connect_unless_user_picked("sendspin:kitchen", seen);
         assert_eq!(app.connecting_to(), None);
         assert_eq!(app.current_error(), None);
     }
@@ -7144,26 +7313,6 @@ mod tests {
             assert_eq!(app.check_stream_client(ip("192.168.1.50")), Ok(()));
             let verdict = if privacy { Err(Refusal::NotGranted) } else { Ok(()) };
             assert_eq!(app.check_stream_client(ip("192.168.1.99")), verdict);
-        }
-    }
-
-    #[test]
-    fn forget_cuts_every_network_listener_at_once() {
-        for privacy in [false, true] {
-            let app = test_app();
-            app.stream_gate.set_privacy(privacy);
-            *app.last_speaker_id.lock().unwrap() = Some("uuid:kitchen".into());
-            let stranger = app.hub.subscribe_from(ip("192.168.1.99"));
-            let this_pc = app.hub.subscribe_from(ip("::1"));
-            app.stop_streaming_and_forget_speaker();
-            assert!(!app.is_streaming_enabled());
-            assert_eq!(*app.last_speaker_id.lock().unwrap(), None);
-            // Cut by Forget itself, not a second later by the stream's
-            // own recheck of the gate.
-            publish(&app);
-            assert_cut(&stranger, "stranger");
-            assert!(this_pc.try_recv().is_ok(), "privacy {privacy}");
-            assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::StreamingOff));
         }
     }
 
@@ -7384,7 +7533,6 @@ mod tests {
             manual: false,
             hidden: false,
             used_before: false,
-            never_auto: false,
         }
     }
 
@@ -7426,19 +7574,12 @@ mod tests {
     }
 
     #[test]
-    fn player_prefers_a_speaker_used_before_then_one_allowed_to_connect() {
+    fn player_prefers_a_speaker_used_before() {
         let mut used = cand("used", "10.0.0.2", "Kitchen 2");
         used.used_before = true;
         let rows = [cand("new", "10.0.0.1", "Kitchen 1"), used];
         assert_eq!(picked("kitchen", &rows), Some(("used".into(), PlayerMatchKind::PartOfName, 1)));
 
-        let mut never = cand("never", "10.0.0.1", "Kitchen 1");
-        never.never_auto = true;
-        let rows = [never.clone(), cand("other", "10.0.0.2", "Kitchen 2")];
-        assert_eq!(picked("kitchen", &rows), Some(("other".into(), PlayerMatchKind::PartOfName, 1)));
-        // Set to never connect by itself, but named: still taken when alone.
-        assert_eq!(picked("kitchen", &[never.clone()]), Some(("never".into(), PlayerMatchKind::PartOfName, 0)));
-        assert_eq!(picked("Kitchen 1", &[never]), Some(("never".into(), PlayerMatchKind::FullName, 0)));
     }
 
     #[test]
@@ -7679,6 +7820,27 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_player_wish_with_the_engine_retries_only_when_the_speaker_returns() {
+        let app = test_app();
+        let windows = crate::platform::fake::FakePlatform::new();
+        let engine = crate::engine::Engine::start(app.clone(), windows.platform()).unwrap();
+        let add = || app.add_manual_speaker(ManualKind::Upnp, "Den", "http://127.0.0.1:9/den.xml", "").unwrap();
+        let id = add();
+        app.connect_when_listed_every("Den".into(), Duration::from_millis(5));
+        let failed = || matches!(app.player_wish(), Some(PlayerWish::Failed { reason: Some(_), .. }));
+        assert!(eventually(failed), "{:?}", app.player_wish());
+        app.remove_manual_speaker(&id);
+        assert!(eventually(|| matches!(app.player_wish(), Some(PlayerWish::Looking { .. }))));
+        add();
+        assert!(eventually(failed));
+        use crate::model::{Command, Port, Surface};
+        engine.send(Surface::Panel, Command::StayOnThisPc).wait(Duration::from_secs(5)).unwrap();
+        assert!(eventually(|| app.player_wish().is_none()));
+        engine.quit();
+        app.request_shutdown();
     }
 
     #[test]
@@ -7927,9 +8089,9 @@ mod tests {
     }
 
     /// The way out of a stored pairing goes with the device that holds it:
-    /// its settings, the reports of its PIN pairing failing and its PIN
-    /// dialog offer to forget it whichever speaker is saved (another one,
-    /// or none after Forget saved), and only while a pairing is stored.
+    /// its settings and the reports of its PIN pairing failing offer to
+    /// forget it whichever speaker is saved (another one, or none after
+    /// Forget saved), and only while a pairing is stored.
     #[test]
     fn forgetting_a_pairing_is_offered_for_the_device_that_holds_it() {
         let app = test_app();
@@ -7951,12 +8113,70 @@ mod tests {
             "{hint}"
         );
         assert_eq!(forget_pairing_hint("Kitchen", app.has_airplay_pairing(kitchen)), "");
+    }
 
-        let again = app.pin_prompt_text(den, "Den TV");
-        assert!(again.contains("Den TV's screen") && again.contains("pair again"), "{again}");
-        assert!(again.ends_with(&hint), "{again}");
-        let first = app.pin_prompt_text(kitchen, "Kitchen");
-        assert!(first.contains("one-time pairing") && !first.contains("Forget pairing"), "{first}");
+    /// Song titles go only from music apps that play, and never while
+    /// another app's sound plays too: a browser's title never goes out.
+    #[test]
+    fn browser_titles_never_go_out() {
+        let track = |t: &str| crate::now_playing::NowPlaying { title: t.into(), artist: "A".into(), album: "B".into() };
+        let source = |app: Option<&str>, playing, t: &str| TitleSource::from_report(app.map(Into::into), playing, Some(track(t)));
+        let spotify = source(Some("Spotify.exe"), Some(true), "Song");
+        assert_eq!(title_to_send(&[spotify.clone()], &[]), Some(track("Song")));
+        for browser in ["chrome.exe", "msedge.exe", "firefox.exe", "C:\\Program Files\\Opera\\opera.exe", "brave"] {
+            assert_eq!(title_to_send(&[source(Some(browser), Some(true), "A video")], &[]), None, "{browser}");
+        }
+        for video in ["vlc.exe", "Microsoft.ZuneVideo", "mpc-hc64.exe", "Netflix"] {
+            assert_eq!(title_to_send(&[source(Some(video), Some(true), "A film")], &[]), None, "{video}");
+        }
+        // An app Windows doesn't name: nothing.
+        assert_eq!(title_to_send(&[source(None, Some(true), "Song")], &[]), None);
+        for status in [Some(false), None] {
+            assert_eq!(title_to_send(&[source(Some("Spotify.exe"), status, "Song")], &[]), None);
+        }
+        // A browser first and Spotify playing: Spotify's.
+        assert_eq!(
+            title_to_send(&[source(Some("chrome.exe"), Some(true), "A video"), spotify], &[]),
+            Some(track("Song"))
+        );
+        assert!(is_music_app("AppleInc.AppleMusicWin_nzyj5cx40ttqa!App"));
+        // A Store app's media session and its own program's sound are one
+        // app: Apple Music's title goes out while only Apple Music sounds.
+        let apple = source(Some("AppleInc.AppleMusicWin_nzyj5cx40ttqa!App"), Some(true), "Song");
+        assert_eq!(title_to_send(&[apple.clone()], &["applemusic".into()]), Some(track("Song")));
+        assert_eq!(title_to_send(&[apple], &["applemusic".into(), "tidal".into()]), None);
+        assert!(is_music_app("C:\\Users\\x\\AppData\\Roaming\\Spotify\\Spotify.exe"));
+        assert!(!is_music_app(""));
+    }
+
+    /// An AirPlay speaker, whose level can't be read, starts at the level
+    /// last set from this PC within three hours, later at no more than 30;
+    /// the first time at 25; never above its maximum from this PC.
+    #[test]
+    fn airplay_starts_at_most_at_30_after_three_hours() {
+        let now = 1_800_000_000;
+        let hours = |h: u64| now - h * 3600;
+        assert_eq!(start_level(Some(70), Some(hours(1)), now, None), 70);
+        assert_eq!(start_level(Some(70), Some(hours(3)), now, None), 70);
+        assert_eq!(start_level(Some(70), Some(hours(3) - 1), now, None), LEVEL_LATER_AT_MOST);
+        assert_eq!(start_level(Some(20), Some(hours(30)), now, None), 20, "the lower of the two");
+        assert_eq!(start_level(Some(70), None, now, None), LEVEL_LATER_AT_MOST, "a level of unknown age is old");
+        assert_eq!(start_level(None, None, now, None), crate::engine::place::numbers::LEVEL_FIRST);
+        assert_eq!(start_level(Some(70), Some(hours(1)), now, Some(40)), 40);
+        assert_eq!(start_level(None, None, now, Some(10)), 10);
+        // From the stored settings.
+        let app = test_app();
+        let mut s = app.speaker_settings("airplay:AA");
+        s.level = Some(64);
+        s.level_at = Some(unix_seconds() - 600);
+        app.set_speaker_settings("airplay:AA", s.clone());
+        assert_eq!(app.airplay_start_volume("airplay:AA"), 64);
+        s.level_at = Some(unix_seconds() - 4 * 3600);
+        app.set_speaker_settings("airplay:AA", s.clone());
+        assert_eq!(app.airplay_start_volume("airplay:AA"), 30);
+        s.volume_limit = Some(20);
+        app.set_speaker_settings("airplay:AA", s);
+        assert_eq!(app.airplay_start_volume("airplay:AA"), 20);
     }
 
     /// An app with AirPlay discovery, on in-memory settings.
@@ -8018,11 +8238,11 @@ mod tests {
         assert_eq!(newcomer_plain_id.stable_id(), incumbent.stable_id());
 
         for n in [newcomer, newcomer_plain_id] {
-            assert!(app.start_airplay_one(Transport::RaopLegacy, n, ip("127.0.0.1")).is_err());
+            assert!(app.start_airplay_one(Transport::RaopLegacy, n, ip("127.0.0.1"), &app.hub).is_err());
         }
         assert!(rx.requests().iter().all(|r| r.header("Authorization").is_none()), "{:?}", rx.lines());
 
-        match app.start_airplay_one(Transport::RaopLegacy, incumbent, ip("127.0.0.1")) {
+        match app.start_airplay_one(Transport::RaopLegacy, incumbent, ip("127.0.0.1"), &app.hub) {
             Ok(s) => s.stop(),
             Err(_) => panic!("the incumbent connects with its password"),
         }
@@ -8071,23 +8291,6 @@ mod tests {
         // The connect the dialog starts uses it, and only that one.
         assert_eq!(app.airplay_password_for(&left).as_deref(), Some("typed-after-conflict"));
         assert_ne!(app.airplay_password_for(&left).as_deref(), Some("typed-after-conflict"));
-    }
-
-    /// The dialog says what happens to what is typed: remembered for a
-    /// speaker, used for this connection only for a receiver with another
-    /// speaker's ID.
-    #[test]
-    fn the_password_dialog_says_whether_the_password_is_remembered() {
-        let (app, _discovery) = airplay_test_app_with(conflict_discovery());
-        assert_eq!(
-            app.password_dialog(KITCHEN, "Kitchen").message(),
-            "This speaker requires an AirPlay password. Enter it to connect — it'll be remembered for next time."
-        );
-        assert_eq!(
-            app.password_dialog(KITCHEN_2, "Kitchen 2").message(),
-            "This receiver requires an AirPlay password. Enter it to connect — it's used for this connection only and \
-             not remembered, since this receiver has the same ID as another speaker."
-        );
     }
 
     /// When the entry the dialog was opened for has gone by the time the
@@ -8162,7 +8365,7 @@ mod tests {
         newcomer.raop.instance = Some("b8e93735ac11@kitchen 2._raop._tcp.local.".into());
         newcomer.raop.newcomer = true;
         assert_eq!(newcomer.stable_id(), KITCHEN_2);
-        match app.start_airplay_one(Transport::RaopLegacy, newcomer.clone(), ip("127.0.0.1")) {
+        match app.start_airplay_one(Transport::RaopLegacy, newcomer.clone(), ip("127.0.0.1"), &app.hub) {
             Ok(s) => s.stop(),
             Err(_) => panic!("the typed password is used"),
         }
@@ -8170,7 +8373,7 @@ mod tests {
         assert!(!auth.is_empty());
         // Only for that connect.
         let before = rx.requests().len();
-        assert!(app.start_airplay_one(Transport::RaopLegacy, newcomer, ip("127.0.0.1")).is_err());
+        assert!(app.start_airplay_one(Transport::RaopLegacy, newcomer, ip("127.0.0.1"), &app.hub).is_err());
         assert!(rx.requests()[before..].iter().all(|r| r.header("Authorization").is_none()));
         assert_eq!(app.user_config.lock().unwrap().airplay_passwords.len(), 1);
     }
@@ -8187,7 +8390,7 @@ mod tests {
         let r = crate::airplay::raop_transcripts::receiver(&rx, "0D0000000005", &[0, 1]);
         let id = r.stable_id();
         assert!(!app.is_password_protected(&id));
-        let err = match app.start_airplay_one(Transport::RaopLegacy, r, ip("127.0.0.1")) {
+        let err = match app.start_airplay_one(Transport::RaopLegacy, r, ip("127.0.0.1"), &app.hub) {
             Err(AttemptError::Other(e)) => e,
             _ => panic!("refused"),
         };
@@ -8313,9 +8516,9 @@ mod tests {
         });
         let (app, discovery) = airplay_test_app();
         let r = crate::airplay::raop_transcripts::receiver(&rx, "0D0000000002", &[0, 1]);
-        assert!(app.start_airplay_one(Transport::RaopLegacy, r.clone(), ip("127.0.0.1")).is_err());
+        assert!(app.start_airplay_one(Transport::RaopLegacy, r.clone(), ip("127.0.0.1"), &app.hub).is_err());
         assert_eq!(discovery.working_address("0D0000000002"), None);
-        match app.start_airplay_one(Transport::RaopLegacy, r, ip("127.0.0.1")) {
+        match app.start_airplay_one(Transport::RaopLegacy, r, ip("127.0.0.1"), &app.hub) {
             Ok(s) => s.stop(),
             Err(_) => panic!("the second connect works"),
         }
@@ -8360,7 +8563,7 @@ mod tests {
             };
             let id = receiver.stable_id();
             app.user_config.lock().unwrap().airplay_pairings.insert(id.clone(), creds.clone());
-            let got = match app.start_airplay_one(Transport::AirPlay2, receiver, ip("127.0.0.1")) {
+            let got = match app.start_airplay_one(Transport::AirPlay2, receiver, ip("127.0.0.1"), &app.hub) {
                 Ok(_) => "connected",
                 Err(AttemptError::NeedsPin(PinReason::NotProven { .. })) => "not proven",
                 Err(AttemptError::NeedsPin(PinReason::Refused)) => "refused",
@@ -8424,7 +8627,7 @@ mod tests {
         assert_eq!(problem, None);
         let notice = notice.unwrap();
         assert!(notice.starts_with("Some settings couldn't be read and were reset or left out: \
-             AirPlay 2 stream mode."), "{notice}");
+             AirPlay 2 stream."), "{notice}");
         app.dismiss_settings_notice();
         assert_eq!(app.settings_attention(), (None, None));
         let _ = std::fs::remove_dir_all(&dir);

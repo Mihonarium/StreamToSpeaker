@@ -3,10 +3,10 @@
 //! field under its sentence, links, and a thin line between groups. No
 //! headings, no cards. Long words wrap; nothing is cut off.
 
+use crate::ui::button::Button;
 use egui::{Rect, Sense, Ui, Vec2};
 
-use crate::ui::button::Button;
-use crate::ui::inputs::{Choice, DropDown, Switch, TextField};
+use crate::ui::inputs::{DropDown, Switch, TextField};
 use crate::ui::text::{Mark, Para, Tone};
 use crate::ui::theme::{size, Theme};
 use crate::ui::volume::Slider;
@@ -52,8 +52,7 @@ pub fn drop_line(ui: &mut Ui, id: impl std::hash::Hash, label: &str, under: Opti
 
 /// Words in the main colour, wrapping.
 pub fn plain(ui: &mut Ui, text: &str) {
-    let t = Theme::of(ui.ctx());
-    ui.add(egui::Label::new(egui::RichText::new(text).font(t.font(size::BODY)).color(t.c.text)).wrap());
+    crate::settings::widgets::body(ui, text);
 }
 
 /// A grey sentence, wrapping.
@@ -85,20 +84,6 @@ pub fn marked(ui: &mut Ui, mark: Mark, tone: Tone, text: &str, links: &[&str]) -
     }
 }
 
-/// Links in a row, wrapping; the one clicked.
-pub fn links(ui: &mut Ui, words: &[&str]) -> Option<usize> {
-    let mut clicked = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(18.0, 6.0);
-        for (i, w) in words.iter().enumerate() {
-            if Button::link(w).show(ui).clicked() {
-                clicked = Some(i);
-            }
-        }
-    });
-    clicked
-}
-
 /// A thin line across the whole panel between two groups; it has no
 /// title.
 pub fn thin(ui: &mut Ui) {
@@ -111,22 +96,21 @@ pub fn thin(ui: &mut Ui) {
 }
 
 /// A slider with its sentence at the left and its value at the right
-/// (*Never louder than* ━━●━ *70*). When the sentence is too long to
+/// (*Bass* ━━●━ *0 dB*). When the sentence is too long to
 /// share the line it goes above the slider. `spoken` is what a reader of
 /// the display says (*Bass, minus 2 decibels*).
 pub fn slider_line(ui: &mut Ui, label: &str, shown: &str, value: f32, range: std::ops::RangeInclusive<f32>, step: f32, spoken: &str) -> Option<f32> {
     let t = Theme::of(ui.ctx());
-    let width = ui.available_width();
     let label_w = ui.painter().layout_no_wrap(label.to_owned(), t.font(size::BODY), t.c.text).size().x;
     let value_w = ui.painter().layout_no_wrap(shown.to_owned(), t.font(size::BODY), t.c.text).size().x.max(36.0);
-    let label_col = (width * 0.4).min(150.0);
+    let label_col = 54.0;
     let stacked = label_w > label_col;
     if stacked {
         plain(ui, label);
     }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
-        if !stacked {
+        if !stacked && !label.is_empty() {
             ui.allocate_ui(Vec2::new(label_col, 24.0), |ui| {
                 ui.set_min_width(label_col);
                 plain(ui, label);
@@ -145,24 +129,14 @@ pub fn slider_line(ui: &mut Ui, label: &str, shown: &str, value: f32, range: std
     .inner
 }
 
-/// A question with its answers shown at once, one per line, each a plain
-/// outcome; the answer picked.
-pub fn choices(ui: &mut Ui, question: &str, answers: &[String], chosen: usize) -> Option<usize> {
-    plain(ui, question);
-    ui.add_space(2.0);
-    let mut picked = None;
-    for (i, a) in answers.iter().enumerate() {
-        if Choice::new(i == chosen, a).show(ui) {
-            picked = Some(i);
-        }
-    }
-    picked
-}
-
 /// A field under its sentence, the whole width; the text kept when typing
 /// ends (focus leaves, or Enter) and it differs from `value`.
 pub fn field_line(ui: &mut Ui, st: &mut PageState, key: &str, label: &str, value: &str) -> Option<String> {
     plain(ui, label);
+    edit_field(ui, st, key, label, value)
+}
+
+pub fn edit_field(ui: &mut Ui, st: &mut PageState, key: &str, label: &str, value: &str) -> Option<String> {
     let text = st.typing.entry(key.to_string()).or_insert_with(|| value.to_string());
     let resp = TextField::new(text, label).show(ui);
     let done = resp.lost_focus();
@@ -185,21 +159,16 @@ pub fn buttons<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     crate::settings::widgets::buttons(ui, add)
 }
 
-/// A link in red, for what can't be undone (*Forget*).
-pub fn red_link(ui: &mut Ui, text: &str) -> egui::Response {
-    let t = Theme::of(ui.ctx());
-    let g = ui.painter().layout_no_wrap(text.to_owned(), t.font(size::SECONDARY), t.c.red);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(g.size().x, g.size().y.max(20.0)), Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, true, text));
-    let l = crate::ui::look::look_as(ui, &resp, text);
-    let y = rect.center().y - g.size().y / 2.0;
-    let w = g.size().x;
-    ui.painter().galley(egui::pos2(rect.left(), y), g, t.c.red);
-    if l.hovered {
-        ui.painter().hline(rect.left()..=rect.left() + w, y + size::SECONDARY + 2.0, egui::Stroke::new(1.0_f32, t.c.red));
-    }
-    if l.focused {
-        crate::ui::theme::focus_ring(ui.painter(), rect, crate::ui::theme::radius::CONTROL, true, &t);
-    }
-    resp
+
+pub fn page_button(label: &str) -> Button<'_> {
+    Button::standard(label).text_size(size::BODY)
+}
+
+pub fn page_link(label: &str) -> Button<'_> {
+    Button::link(label).text_size(size::BODY)
+}
+
+pub fn wrapped_link(ui: &mut Ui, text: &str) -> egui::Response {
+    let theme = Theme::of(ui.ctx());
+    ui.add(egui::Link::new(crate::ui::text::page_widget_text(ui, egui::RichText::new(text).font(theme.font(size::BODY)))))
 }

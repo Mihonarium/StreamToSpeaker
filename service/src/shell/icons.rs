@@ -20,23 +20,29 @@ pub fn tray_icon(arcs: Arcs, badge: Badge, dark_taskbar: bool) -> &'static [u8] 
     match (arcs, badge, dark_taskbar) {
         (Ink, None, false) => icon!("pc-none-light"),
         (Ink, Attention, false) => icon!("pc-attention-light"),
-        (Ink, Failure, false) => icon!("pc-failure-light"),
-        (GreenFaint, None, false) => icon!("connecting-none-light"),
-        (GreenFaint, Attention, false) => icon!("connecting-attention-light"),
-        (GreenFaint, Failure, false) => icon!("connecting-failure-light"),
         (Green, None, false) => icon!("speaker-none-light"),
         (Green, Attention, false) => icon!("speaker-attention-light"),
-        (Green, Failure, false) => icon!("speaker-failure-light"),
         (Ink, None, true) => icon!("pc-none-dark"),
         (Ink, Attention, true) => icon!("pc-attention-dark"),
-        (Ink, Failure, true) => icon!("pc-failure-dark"),
-        (GreenFaint, None, true) => icon!("connecting-none-dark"),
-        (GreenFaint, Attention, true) => icon!("connecting-attention-dark"),
-        (GreenFaint, Failure, true) => icon!("connecting-failure-dark"),
         (Green, None, true) => icon!("speaker-none-dark"),
         (Green, Attention, true) => icon!("speaker-attention-dark"),
-        (Green, Failure, true) => icon!("speaker-failure-dark"),
     }
+}
+
+pub fn appearance(tray: &crate::model::by_clock::Tray) -> (Arcs, Badge) {
+    (if tray.accent { Arcs::Green } else { Arcs::Ink },
+     if tray.amber { Badge::Attention } else { Badge::None })
+}
+
+pub fn app_mark(ui: &egui::Ui) -> egui::TextureHandle {
+    let id = egui::Id::new("popup-app-icon");
+    if let Some(image) = ui.ctx().data(|d| d.get_temp(id)) { return image; }
+    let pixels = tray_icon(Arcs::Ink, Badge::None, false).chunks_exact(4)
+        .map(|rgba| egui::Color32::from_white_alpha(rgba[3])).collect();
+    let image = egui::ColorImage { size: [SIDE as usize; 2], pixels };
+    let texture = ui.ctx().load_texture("app-mark", image, egui::TextureOptions::LINEAR);
+    ui.ctx().data_mut(|d| d.insert_temp(id, texture.clone()));
+    texture
 }
 
 /// The tray's tooltip, cut to what Windows shows (127 characters).
@@ -57,8 +63,8 @@ mod tests {
     #[test]
     fn every_state_has_a_whole_icon_and_they_differ() {
         let mut seen = std::collections::HashSet::new();
-        for arcs in [Arcs::Ink, Arcs::GreenFaint, Arcs::Green] {
-            for badge in [Badge::None, Badge::Attention, Badge::Failure] {
+        for arcs in [Arcs::Ink, Arcs::Green] {
+            for badge in [Badge::None, Badge::Attention] {
                 for dark in [false, true] {
                     let icon = tray_icon(arcs, badge, dark);
                     assert_eq!(icon.len(), (SIDE * SIDE * 4) as usize);
@@ -70,10 +76,11 @@ mod tests {
 
     #[test]
     fn a_long_tooltip_is_cut_to_what_windows_shows() {
-        let long = "Stream To Speaker – Playing on ".to_string() + &"Living Room ".repeat(20);
+        let long = format!("Stream To Speaker – {} · Playing", "Living Room ".repeat(20));
         let t = tooltip(&long);
         assert_eq!(t.chars().count(), 127);
+        assert!(t.starts_with("Stream To Speaker – Living Room"));
         assert!(t.ends_with('…'));
-        assert_eq!(tooltip("Stream To Speaker – Playing on Kitchen"), "Stream To Speaker – Playing on Kitchen");
+        assert_eq!(tooltip("Stream To Speaker – Kitchen · Playing"), "Stream To Speaker – Kitchen · Playing");
     }
 }

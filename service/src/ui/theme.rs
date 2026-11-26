@@ -47,6 +47,8 @@ pub struct Colors {
 
     /// Window, panel and dialog background.
     pub surface: Color32,
+    /// Ground beneath the flyout list and its footer.
+    pub chrome: Color32,
     pub card: Color32,
     pub card_border: Color32,
     pub divider: Color32,
@@ -132,6 +134,7 @@ impl Colors {
             on_accent_pressed: rgb(0xd5e5f4),
             accent_soft: rgb(0xe8f1fb),
             surface: rgb(0xf9f9f9),
+            chrome: rgb(0xf3f3f3),
             card: rgb(0xffffff),
             card_border: black(0.065),
             divider: black(0.08),
@@ -172,6 +175,7 @@ impl Colors {
             on_accent_pressed: rgb(0x1d3f50),
             accent_soft: rgb(0x1e3446),
             surface: rgb(0x2b2b2b),
+            chrome: rgb(0x252525),
             card: rgb(0x323232),
             card_border: white(0.07),
             divider: white(0.09),

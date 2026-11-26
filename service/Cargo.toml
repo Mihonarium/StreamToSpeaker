@@ -158,6 +158,21 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
+    "Foundation_Collections",
+    "ApplicationModel",
+    "Win32_System_WinRT",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Networking_NetworkListManager",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
 ] }
 # GUI: native window + system tray. Windows-only for now since the
 # kernel driver is anyway Windows-only.

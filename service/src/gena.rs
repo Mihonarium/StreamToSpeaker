@@ -368,6 +368,10 @@ pub struct TransportChange {
     pub state: Option<String>,
     /// `AVTransportURI`: what the speaker was told to play.
     pub uri: Option<String>,
+    /// The title in the metadata given with it (`AVTransportURIMetaData`,
+    /// else `CurrentTrackMetaData`): another PC that plays there through
+    /// this app names itself in it.
+    pub title: Option<String>,
 }
 
 /// Parse an AVTransport NOTIFY (a `LastChange` document with
@@ -378,14 +382,27 @@ pub fn parse_transport_notify(body: &str) -> Option<TransportChange> {
     let decoded = decode_xml_text(&lc);
     let doc = roxmltree::Document::parse(&decoded).ok()?;
     let mut change = TransportChange::default();
+    let mut track_title = None;
     for node in doc.descendants() {
         match node.tag_name().name() {
             "TransportState" => change.state = node.attribute("val").map(str::to_string),
             "AVTransportURI" => change.uri = node.attribute("val").map(str::to_string),
+            "AVTransportURIMetaData" => change.title = node.attribute("val").and_then(didl_title),
+            "CurrentTrackMetaData" => track_title = node.attribute("val").and_then(didl_title),
             _ => {}
         }
     }
+    if change.title.is_none() {
+        change.title = track_title;
+    }
     (change.state.is_some() || change.uri.is_some()).then_some(change)
+}
+
+/// The `dc:title` of a DIDL-Lite document; None when there is none.
+fn didl_title(didl: &str) -> Option<String> {
+    let doc = roxmltree::Document::parse(didl).ok()?;
+    let title = doc.descendants().find(|n| n.tag_name().name() == "title")?.text()?.trim();
+    (!title.is_empty()).then(|| title.to_string())
 }
 
 // -----------------------------------------------------------------------------
@@ -692,7 +709,11 @@ mod tests {
 <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;TransportState val=&quot;TRANSITIONING&quot;/&gt;&lt;AVTransportURI val=&quot;x-sonos-http:radio.mp3&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property></e:propertyset>"#;
         assert_eq!(
             parse_transport_notify(body),
-            Some(TransportChange { state: Some("TRANSITIONING".into()), uri: Some("x-sonos-http:radio.mp3".into()) })
+            Some(TransportChange {
+                state: Some("TRANSITIONING".into()),
+                uri: Some("x-sonos-http:radio.mp3".into()),
+                title: None
+            })
         );
         let volume_only = r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><LastChange>&lt;Event&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume channel=&quot;Master&quot; val=&quot;3&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property></e:propertyset>"#;
         assert_eq!(parse_transport_notify(volume_only), None);

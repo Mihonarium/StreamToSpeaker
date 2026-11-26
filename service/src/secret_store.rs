@@ -68,6 +68,7 @@ pub const SECRET_PATHS: &[&[&str]] = &[
     &["airplay_pairings", "*", "controller_seed_hex"],
     // The web UI's link key, also the JSON API's bearer token.
     &["web_secret"],
+    &["scripts_key"],
 ];
 
 /// Fields of one object sealed together as a single entry (see the

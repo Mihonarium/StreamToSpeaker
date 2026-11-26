@@ -1,0 +1,249 @@
+name: Panel click
+
+# Starts the app on hosted Windows machines, clicks its tray icon with
+# real mouse input and records the app's windows and the foreground.
+# The rig lives in .github/scripts/Test-PanelClick.ps1 and PanelRig.cs.
+# The cases are in .github/scripts/panel_click_cases.py.
+#
+# It runs in two ways, and in no other:
+#   - started by hand (workflow_dispatch): the one case its inputs give
+#     (including the option to run without a tray icon);
+#   - on a push to a branch whose name starts with rig/: six cases that
+#     click the tray icon. Five open the panel by the clock: the defaults,
+#     a shortcut launch, the hidden icons, a double click, and Windows 10's
+#     taskbar (Server 2022). The sixth, first run at sign-in, opens the
+#     ordinary window.
+# Either way the app is built once, from the commit the run is for. The
+# workflow uses no secrets and reads the repository. It keeps the built
+# app as a run artifact for 1 day, keeps the whole case output folder (pictures, timeline,
+# app log, rig log and verdict) as a run artifact for 14 days, and writes a step summary. The Rust cache
+# is restored only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Windows to run on: Server 2025 has Windows 11's taskbar, Server 2022 Windows 10's"
+        type: choice
+        options: [windows-2025, windows-2022]
+        default: windows-2025
+      click:
+        description: "A single or a double click on the icon"
+        type: choice
+        options: [single, double]
+        default: single
+      icon:
+        description: "Where the icon sits: on the taskbar, or among the hidden icons"
+        type: choice
+        options: [taskbar, hidden]
+        default: taskbar
+      panel:
+        description: "The panel by the clock as a flyout or a framed debug window (applies with a tray icon)"
+        type: choice
+        options: [flyout, window]
+        default: flyout
+      start:
+        description: "At sign-in the app waits for the tray click, including at first run. A shortcut opens the ordinary window."
+        type: choice
+        options: [sign-in, menu]
+        default: sign-in
+      network:
+        description: "quiet: no port open to the network and no speaker search, so no firewall question; full: as installed"
+        type: choice
+        options: [quiet, full]
+        default: quiet
+      first_run:
+        description: "First run with no settings (a click on the icon opens the ordinary window on first run)"
+        type: boolean
+        default: false
+      tray:
+        description: "on: click the tray icon. off: --no-tray opens the ordinary window and closing it quits (icon, click and panel inputs don't apply)"
+        type: choice
+        options: [on, off]
+        default: on
+  push:
+    branches: ['rig/**']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      cases: ${{ steps.pick.outputs.cases }}
+      window: ${{ steps.pick.outputs.window }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # PowerShell 7 parses the rig's PowerShell here first, seconds into
+      # the run. It is not the dialect the rig runs in (Windows PowerShell
+      # 5.1 accepts less), so the build parses again on Windows.
+      - name: Parse the rig's PowerShell (PowerShell 7)
+        shell: pwsh
+        run: .github/scripts/Test-RigScripts.ps1
+
+      - name: Pick the cases
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          CASE_RUNNER: ${{ inputs.runner }}
+          CASE_CLICK: ${{ inputs.click }}
+          CASE_ICON: ${{ inputs.icon }}
+          CASE_PANEL: ${{ inputs.panel }}
+          CASE_START: ${{ inputs.start }}
+          CASE_NETWORK: ${{ inputs.network }}
+          CASE_FIRST_RUN: ${{ inputs.first_run }}
+          CASE_TRAY: ${{ inputs.tray }}
+        run: python3 .github/scripts/panel_click_cases.py >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: cases
+    # The same image the installer's build uses.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # First on Windows, before anything is built: Windows PowerShell 5.1,
+      # the dialect the rig runs in, parses every PowerShell script the run
+      # uses, and the rig's C# is compiled as the rig compiles it. A mistake
+      # there fails the run here, in a minute, with its file, line and column.
+      - name: Parse the rig's scripts and compile its C# (Windows PowerShell)
+        shell: powershell
+        run: .github/scripts/Test-RigScripts.ps1 -CompileRig
+
+      - name: Set up Rust (stable, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Restore Rust dependencies (nothing is saved)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: service
+          save-if: false
+
+      # As build.yml builds the app for the installer. The small-window form
+      # of the panel is a switch only builds with debug assertions read, so
+      # when a case wants it the release build gets them.
+      - name: Build the app
+        shell: pwsh
+        working-directory: service
+        env:
+          WINDOW: ${{ needs.cases.outputs.window }}
+        run: |
+          if ($env:WINDOW -eq "true") { $env:CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true" }
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+
+      - name: Keep the app for the cases
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: panel-click-app
+          path: service/target/release/stream-to-speaker.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  click:
+    needs: [cases, build]
+    name: ${{ matrix.case.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(needs.cases.outputs.cases) }}
+    runs-on: ${{ matrix.case.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: panel-click-app
+          path: ${{ runner.temp }}/app
+
+      # Hosted machines have no graphics driver, and the OpenGL Windows has
+      # without one (1.1) is less than the app's windows need. Mesa from the
+      # image's MSYS2 draws OpenGL in software; its opengl32.dll is the one
+      # a program finds first when it sits in the program's own folder, so
+      # the app runs from the folder Mesa's DLLs are in.
+      #
+      # Mesa is not pinned: `pacman -Sy` installs the mirrors' current Mesa
+      # and what it needs over the image's older MSYS2, which MSYS2 doesn't
+      # support (a partial upgrade), so two runs can draw with different
+      # Mesa versions, and some day this step can fail for reasons that
+      # have nothing to do with the app. When it fails here (a dependency
+      # or file conflict, a missing library when the app starts), update
+      # MSYS2 as a whole first (`pacman -Syu --noconfirm`, run twice: the
+      # first may update only pacman itself), or run again once the image
+      # has a newer MSYS2.
+      - name: Put the app next to Mesa's OpenGL
+        shell: pwsh
+        run: |
+          $msys = "C:\msys64"
+          if (-not (Test-Path "$msys\usr\bin\bash.exe")) { throw "this image has no MSYS2 at $msys" }
+          & "$msys\usr\bin\bash.exe" -lc "pacman -Sy --noconfirm --needed mingw-w64-x86_64-mesa"
+          if ($LASTEXITCODE -ne 0) { throw "pacman couldn't install Mesa" }
+          $bin = "$msys\mingw64\bin"
+          if (-not (Test-Path "$bin\opengl32.dll")) { throw "MSYS2's Mesa brought no opengl32.dll" }
+          Copy-Item (Join-Path $env:RUNNER_TEMP "app\stream-to-speaker.exe") $bin
+          "APP_EXE=$bin\stream-to-speaker.exe" >> $env:GITHUB_ENV
+
+      # Windows PowerShell: it has UI Automation, with which the script
+      # finds the icon and the button for the hidden icons.
+      - name: Start the app and click its tray icon
+        shell: powershell
+        env:
+          CLICK: ${{ matrix.case.click }}
+          ICON: ${{ matrix.case.icon }}
+          PANEL: ${{ matrix.case.panel }}
+          START: ${{ matrix.case.start }}
+          NETWORK: ${{ matrix.case.network }}
+          FIRST_RUN: ${{ matrix.case.first_run }}
+          TRAY: ${{ matrix.case.tray }}
+        run: >
+          .github/scripts/Test-PanelClick.ps1
+          -Exe $env:APP_EXE
+          -Click $env:CLICK -Icon $env:ICON -Panel $env:PANEL -Start $env:START -Network $env:NETWORK
+          -FirstRun:($env:FIRST_RUN -eq "true") -Tray $env:TRAY
+          -Out (Join-Path $env:RUNNER_TEMP "panel-click")
+
+      # The script writes its verdict, or why the rig failed, to the step
+      # summary and verdict.txt. Without verdict.txt the script never ran or
+      # was ended before its end (a script that doesn't parse, a timeout):
+      # the page then says that the rig failed, not anything about the panel.
+      - name: Say when the rig itself failed
+        if: always()
+        shell: pwsh
+        env:
+          CASE: ${{ matrix.case.name }}
+        run: |
+          $verdict = Join-Path $env:RUNNER_TEMP "panel-click\verdict.txt"
+          if (-not (Test-Path -LiteralPath $verdict)) {
+            @(
+              "### $($env:CASE): the rig failed before it could judge anything"
+              ""
+              "The case's script didn't run to its end (see the step 'Start the app and click its tray icon'). Nothing about the panel was judged."
+            ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+            Write-Host "::error::the rig failed in case $($env:CASE): its script didn't run to its end"
+          }
+
+      - name: Keep the pictures and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: panel-click-${{ matrix.case.name }}
+          path: ${{ runner.temp }}/panel-click
+          if-no-files-found: warn
+          retention-days: 14

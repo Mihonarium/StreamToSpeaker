@@ -321,7 +321,11 @@ impl Output {
             );
             return;
         }
-        if !from_source {
+        if from_source {
+            if let Some(tap) = app.capture_tap.get() {
+                tap.block(&pkt.samples);
+            }
+        } else {
             app.idle_silence_packets.fetch_add(1, Ordering::Relaxed);
         }
 

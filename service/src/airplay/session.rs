@@ -441,9 +441,15 @@ pub struct AirPlaySession {
     stop_flag: Arc<AtomicBool>,
     /// Set by the background threads when the session has demonstrably
     /// died (audio socket send error, or repeated keepalive failures on
-    /// the RTSP connection). The app-level watchdog polls this to tear
-    /// down the zombie and auto-reconnect.
+    /// the RTSP connection). The engine looks at it for a dropout.
     dead: Arc<AtomicBool>,
+    /// Set with `dead` when the receiver ended the session while it still
+    /// answers (see `keepalive_loop`).
+    ended_by_receiver: Arc<AtomicBool>,
+    /// The first packet's sequence number and RTP time: the next packet's
+    /// follow from the write head (each packet is
+    /// [`crate::airplay::rtp::FRAMES_PER_PACKET`] frames on).
+    first_packet: (u16, u32),
     /// Retransmission counters, fed by the resend responder.
     resend_stats: Arc<crate::airplay::timing::ResendStats>,
     /// Current RTP write head — read to stamp the `RTP-Info` on metadata
@@ -599,6 +605,7 @@ impl AirPlaySession {
         // every stalled-SETUP session on record.
         let stop_flag = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
+        let ended_by_receiver = Arc::new(AtomicBool::new(false));
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
         let mut guard = SpawnGuard::new(stop_flag.clone());
         guard.adopt(
@@ -811,10 +818,14 @@ impl AirPlaySession {
             let rtsp = rtsp.clone();
             let stop_flag = stop_flag.clone();
             let dead = dead.clone();
+            let ended = ended_by_receiver.clone();
             let name = cfg.renderer.friendly_name.clone();
+            let control = SocketAddr::new(cfg.renderer.ip, cfg.renderer.port);
+            let still_there =
+                move || crate::engine::signals::answers_on(control, crate::engine::signals::STILL_THERE_WAIT);
             std::thread::Builder::new()
                 .name(format!("stream-to-speaker-airplay-keepalive:{}", name))
-                .spawn(move || keepalive_loop(&rtsp, &stop_flag, &dead, &name, KEEPALIVE_CADENCE))
+                .spawn(move || keepalive_loop(&rtsp, &stop_flag, &dead, &name, KEEPALIVE_CADENCE, &ended, &still_there))
                 .context("spawning AirPlay keepalive")?
         };
         guard.adopt(keepalive_handle);
@@ -835,6 +846,8 @@ impl AirPlaySession {
             rtsp,
             stop_flag,
             dead,
+            ended_by_receiver,
+            first_packet: (initial_seq, initial_rtptime),
             resend_stats,
             current_rtptime,
             volume_pct: Arc::new(AtomicU32::new(cfg.initial_volume.unwrap_or(100))),
@@ -883,10 +896,22 @@ impl AirPlaySession {
     }
 
     /// True once a background thread has flagged the session as dead
-    /// (unreachable receiver / dropped connection). The app watchdog
-    /// polls this to replace the zombie with a fresh session.
+    /// (unreachable receiver / dropped connection). The engine looks at
+    /// it for a dropout.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+
+    /// The `DACP-ID` and `Active-Remote` this session's requests carry:
+    /// what the receiver's buttons answer to (see `airplay::dacp`).
+    pub fn remote_ids(&self) -> (String, String) {
+        let c = self.rtsp.lock().unwrap_or_else(|e| e.into_inner());
+        (c.dacp_id.clone(), c.active_remote.clone())
+    }
+
+    /// The receiver ended the session itself and still answers.
+    pub fn ended_while_reachable(&self) -> bool {
+        self.ended_by_receiver.load(Ordering::Acquire)
     }
 
     /// `(resend requests, packets re-sent)` so far this session.
@@ -925,7 +950,19 @@ impl AirPlaySession {
     /// sockets. TEARDOWN matters: a receiver that isn't told keeps the
     /// session for a while and refuses or ignores the next connect (see
     /// [`RtspClient::teardown`]).
-    pub fn stop(mut self) {
+    pub fn stop(self) {
+        self.end(false);
+    }
+
+    /// Make the receiver silent before this PC plays the sound itself:
+    /// FLUSH what it holds, then TEARDOWN. Whether it took the FLUSH.
+    pub fn silence(self) -> bool {
+        self.end(true)
+    }
+
+    /// Stop every thread, then FLUSH (with `flush`) and TEARDOWN; whether
+    /// the FLUSH was taken (false without one).
+    fn end(mut self, flush: bool) -> bool {
         info!(
             "AirPlay: stopping session to {}",
             self.renderer.friendly_name
@@ -948,8 +985,21 @@ impl AirPlaySession {
         for h in self.threads.drain(..) {
             let _ = h.join();
         }
+        let flushed = flush && {
+            let rtptime = self.current_rtptime.load(Ordering::Acquire);
+            let (first_seq, first_rtptime) = self.first_packet;
+            let packets = rtptime.wrapping_sub(first_rtptime) / crate::airplay::rtp::FRAMES_PER_PACKET as u32;
+            match guard.flush(first_seq.wrapping_add(packets as u16), rtptime) {
+                Ok(()) => true,
+                Err(e) => {
+                    debug!("AirPlay FLUSH to {} failed (continuing to TEARDOWN): {:#}", self.renderer.friendly_name, e);
+                    false
+                }
+            }
+        };
         guard.teardown();
         note_left_session(&self.renderer.stable_id());
+        flushed
     }
 }
 
@@ -1221,18 +1271,24 @@ const KEEPALIVE_CADENCE: KeepaliveCadence =
     KeepaliveCadence { every: Duration::from_secs(2), after_failure: Duration::from_secs(10) };
 
 /// Send `OPTIONS *` on the session's connection until `stop_flag` is
-/// set, and set `dead` (for the app's watchdog) once the session is
+/// set, and set `dead` (which the engine looks at) once the session is
 /// lost: the connection broke or the receiver closed it, a keepalive got
 /// no answer within the reply limit, or two keepalives in a row were
 /// answered with an error. A keepalive answered late but within the limit
 /// keeps the session; a reply that comes after the limit is skipped by
 /// its CSeq if the connection is used again (TEARDOWN).
+///
+/// A connection the receiver broke or closed while it still answers on
+/// its control port (`still_there`) was ended by the receiver itself:
+/// `ended_by_receiver` is set with `dead`, and no reconnect follows.
 fn keepalive_loop(
     rtsp: &Mutex<RtspClient>,
     stop_flag: &AtomicBool,
     dead: &AtomicBool,
     name: &str,
     cadence: KeepaliveCadence,
+    ended_by_receiver: &AtomicBool,
+    still_there: &dyn Fn() -> bool,
 ) {
     let mut refused = 0u32;
     loop {
@@ -1260,7 +1316,12 @@ fn keepalive_loop(
             Err(e) => {
                 let no_answer = matches!(e.downcast_ref::<RtspError>(), Some(RtspError::NoAnswer { .. }));
                 if no_answer || !client.is_usable() {
-                    warn!("AirPlay: lost the session to {} ({:#})", name, e);
+                    if !no_answer && still_there() {
+                        info!("AirPlay: {} ended the session ({:#}) and still answers", name, e);
+                        ended_by_receiver.store(true, Ordering::Release);
+                    } else {
+                        warn!("AirPlay: lost the session to {} ({:#})", name, e);
+                    }
                     dead.store(true, Ordering::Release);
                     return;
                 }
@@ -1457,9 +1518,9 @@ mod tests {
     /// itself), then stop it; true if it flagged the session dead.
     fn run_keepalive(rx: &FakeRaop, n: usize) -> bool {
         let rtsp = keepalive_client(rx);
-        let (stop, dead) = (AtomicBool::new(false), AtomicBool::new(false));
+        let (stop, dead, ended) = (AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false));
         std::thread::scope(|sc| {
-            let h = sc.spawn(|| keepalive_loop(&rtsp, &stop, &dead, "test", FAST));
+            let h = sc.spawn(|| keepalive_loop(&rtsp, &stop, &dead, "test", FAST, &ended, &|| false));
             let end = Instant::now() + Duration::from_secs(20);
             while !h.is_finished() && Instant::now() < end && !rx.wait_for_requests(n, Duration::from_millis(50)) {}
             stop.store(true, Ordering::Release);
@@ -1483,6 +1544,28 @@ mod tests {
         let rx = FakeRaop::start(|_| Answer::Ignore);
         assert!(run_keepalive(&rx, 50));
         assert_eq!(rx.requests().len(), 1, "it stops once the session is lost");
+    }
+
+    /// A receiver that closes the session's connection while it still
+    /// answers on its port ended the session itself: no reconnect follows.
+    /// One that stops answering, or is gone, dropped out.
+    #[test]
+    fn a_receiver_that_closes_the_session_while_it_answers_ended_it() {
+        let run = |answer: fn(&crate::airplay::fake_raop::Request) -> Answer, still_there: bool| {
+            let rx = FakeRaop::start(answer);
+            let rtsp = keepalive_client(&rx);
+            let (stop, dead, ended) = (AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false));
+            let port = rx.port();
+            let there = move || still_there && crate::engine::signals::answers_on(
+                SocketAddr::new("127.0.0.1".parse().unwrap(), port),
+                Duration::from_secs(1),
+            );
+            keepalive_loop(&rtsp, &stop, &dead, "Office", FAST, &ended, &there);
+            (dead.load(Ordering::Acquire), ended.load(Ordering::Acquire))
+        };
+        assert_eq!(run(|_| Answer::Close, true), (true, true));
+        assert_eq!(run(|_| Answer::Close, false), (true, false));
+        assert_eq!(run(|_| Answer::Ignore, true), (true, false), "no answer at all is a dropout");
     }
 
     #[test]

@@ -20,7 +20,7 @@
 //! second can't bind the stream port, and the driver hands each block of
 //! audio to only one reader. [`launch`] decides what it does instead.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// What creating the machine-wide mutex said about other copies.
@@ -95,15 +95,8 @@ pub fn launch(lock: MachineLock, at_sign_in: bool) -> Launch {
     }
 }
 
-/// Main window handle once the GUI has one (0 = none yet).
-static WINDOW: AtomicIsize = AtomicIsize::new(0);
 /// A second launch asked to be shown and the GUI hasn't acted on it yet.
 static PENDING: AtomicBool = AtomicBool::new(false);
-
-/// GUI: register the main window so later hand-offs can raise it.
-pub fn set_window(hwnd: isize) {
-    WINDOW.store(hwnd, Ordering::Release);
-}
 
 /// GUI: whether a hand-off is waiting, without consuming it.
 pub fn activation_pending() -> bool {
@@ -118,10 +111,6 @@ pub fn take_activation() -> bool {
 #[cfg_attr(not(windows), allow(dead_code))]
 fn on_activation() {
     PENDING.store(true, Ordering::Release);
-    let hwnd = WINDOW.load(Ordering::Acquire);
-    if hwnd != 0 {
-        imp::show_window(hwnd);
-    }
 }
 
 /// Outcome of [`claim`].
@@ -140,7 +129,12 @@ pub enum Claim {
 /// Become the session's instance, or hand off to the one that is; wait
 /// for one that is quitting.
 pub fn claim() -> Claim {
-    imp::claim()
+    claim_for_launch(true)
+}
+
+/// A sign-in launch leaves an existing instance in the tray.
+pub fn claim_for_launch(activate: bool) -> Claim {
+    imp::claim(activate)
 }
 
 /// Say that this copy is quitting, as it stops showing its window: a launch
@@ -223,7 +217,7 @@ mod imp {
         Seen { exists: true, closing: !closing.is_null() }
     }
 
-    pub fn claim() -> Claim {
+    pub fn claim(activate: bool) -> Claim {
         let started = std::time::Instant::now();
         let claim = super::claim_with(look, || {
             if started.elapsed() >= super::CLOSING_WAIT {
@@ -235,7 +229,7 @@ mod imp {
         match claim {
             Claim::First => {}
             Claim::Another => {
-                signal_first();
+                if activate { signal_first(); }
                 return Claim::Another;
             }
             Claim::StillClosing => return Claim::StillClosing,
@@ -294,33 +288,15 @@ mod imp {
         }
         log::warn!("single instance: the running instance didn't answer the hand-off");
     }
-
-    /// Show + raise from another thread (same sequence the tray uses).
-    pub fn show_window(hwnd: isize) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            IsIconic, SetForegroundWindow, SetWindowPos, ShowWindowAsync, HWND_TOP, SWP_NOMOVE,
-            SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
-        };
-        unsafe {
-            let h = hwnd as _;
-            SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-            if IsIconic(h) != 0 {
-                ShowWindowAsync(h, SW_RESTORE);
-            }
-            SetForegroundWindow(h);
-        }
-    }
 }
 
 #[cfg(not(windows))]
 mod imp {
     use super::Claim;
-    pub fn claim() -> Claim {
+    pub fn claim(_activate: bool) -> Claim {
         Claim::First
     }
     pub fn announce_closing() {}
-    #[allow(dead_code)]
-    pub fn show_window(_hwnd: isize) {}
 }
 
 #[cfg(test)]
@@ -422,7 +398,7 @@ mod tests {
 
     #[test]
     fn activation_is_remembered_until_taken() {
-        // No window registered: the request waits for the GUI.
+        // The request waits for the GUI to take it.
         on_activation();
         assert!(activation_pending());
         assert!(take_activation());

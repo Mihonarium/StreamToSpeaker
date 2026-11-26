@@ -6,11 +6,10 @@ use std::sync::Arc;
 use egui::{Id, Margin, Ui};
 
 use crate::model::port::Port;
-use crate::model::scripted::{Scenario, ScriptedEngine};
-use crate::model::snapshot::Snapshot;
-use crate::model::state::{NowState, Secret, SpeakerId};
+use crate::model::fake::ScriptedEngine;
+use crate::model::Snapshot;
 use crate::model::text::LocalTime;
-use crate::panel::view::{show_view, ViewState};
+use crate::shell::page::{show_view, ViewState};
 use crate::shell::ViewContent;
 use crate::ui::preview::{Scene, Stage};
 use crate::ui::theme::Theme;
@@ -20,32 +19,32 @@ use crate::settings::port::*;
 use crate::settings::scripted::{Names, ScriptedSettings, State};
 
 const MARGIN: f32 = 20.0;
-const WIDTH: f32 = crate::panel::WIDTH;
+const WIDTH: f32 = crate::surface::panel::WIDTH;
 
 /// Every scene of the views.
 pub fn scenes() -> Vec<Scene> {
     let s = |name, h: f32, draw| Scene { name, size: [WIDTH + 2.0 * MARGIN, h], draw };
     vec![
         s("view-speaker-sonos-playing", 1180.0, speaker_kitchen),
-        s("view-speaker-airplay-steady", 1220.0, speaker_office),
-        s("view-speaker-airplay-short", 1220.0, speaker_office_short),
+        s("view-speaker-office", 1220.0, speaker_office),
+        s("view-speaker-office-sonos", 1220.0, speaker_office_short),
         s("view-speaker-needs-code", 1080.0, speaker_needs_code),
         s("view-speaker-needs-password", 1220.0, speaker_needs_password),
         s("view-speaker-not-found", 1120.0, speaker_garage),
         s("view-speaker-homepod-pair", 1220.0, speaker_bedroom),
-        s("view-speaker-fixed-on-steady", 1180.0, speaker_den),
+        s("view-speaker-fixed-delay", 1180.0, speaker_den),
         s("view-speaker-sendspin", 1100.0, speaker_desk),
         s("view-speaker-all-bands", 1700.0, speaker_bands),
         s("view-speaker-details", 1500.0, speaker_details),
-        s("view-speaker-amount", 1180.0, speaker_amount),
-        s("view-speaker-forget", 1320.0, speaker_forget),
+        s("view-speaker-amount", 1180.0, speaker_exact_delay),
+        s("view-speaker-busy-chime", 1320.0, speaker_busy),
         s("view-speaker-long-name", 1300.0, speaker_long),
         s("view-speaker-chinese-name", 1300.0, speaker_chinese),
-        s("view-settings", 760.0, settings_start),
-        s("view-settings-parts-open", 1260.0, settings_open),
-        s("view-settings-refused", 880.0, settings_refused),
-        s("view-settings-update-ready", 820.0, settings_update),
-        s("view-settings-shortcut-taken", 980.0, settings_taken),
+        s("view-settings-all-off", 1040.0, settings_start),
+        s("view-settings-all-on", 1590.0, settings_open),
+        s("view-speaker-refused", 1380.0, speaker_kitchen),
+        s("view-settings-update-ready", 1080.0, settings_update),
+        s("view-settings-shortcut-taken", 1080.0, settings_taken),
         s("view-missing", 860.0, missing_start),
         s("view-missing-searching", 760.0, missing_searching),
         s("view-missing-found", 800.0, missing_found),
@@ -71,7 +70,6 @@ pub fn scenes() -> Vec<Scene> {
         s("view-about", 880.0, about),
         s("view-about-up-to-date", 760.0, about_latest),
         s("view-lab", 1300.0, lab),
-        s("view-guides", 1700.0, guides),
     ]
 }
 
@@ -98,103 +96,123 @@ fn port(names: Names, f: impl FnOnce(&mut State)) -> Arc<dyn SettingsPort> {
     Arc::new(p)
 }
 
-fn snap(s: Scenario) -> Arc<Snapshot> {
+fn snap(s: &str) -> Arc<Snapshot> {
     ScriptedEngine::new(s).snapshot()
 }
 
 fn speaker_view(
     ui: &mut Ui,
     key: &str,
-    scenario: Scenario,
+    scenario: &str,
     names: Names,
     id: &str,
     f: impl FnOnce(&mut State),
     tune: impl FnOnce(SpeakerOptions) -> SpeakerOptions,
 ) {
-    let mut v = tune(SpeakerOptions::new(port(names, f), id));
-    frame(ui, key, &mut v, &snap(scenario));
+    let p = port(names, f);
+    let mut scene = crate::model::samples::named(scenario);
+    let page = p.speaker(id).unwrap();
+    let sid = crate::model::SpeakerId::new(id);
+    use crate::model::{samples::{seen, way}, situation::{Confirm, WayChoice}};
+    if scene.speaker(&sid).is_none() { scene.speakers.push(seen(sid.clone(), &page.row.name)); }
+    let speaker = scene.speakers.iter_mut().find(|s| s.id == sid).unwrap();
+    speaker.name = page.row.name.clone();
+    if id == "office" {
+        speaker.ways = vec![way(WayChoice::Native, 150), way(WayChoice::AirPlaySteady, 2000)];
+        speaker.way = if key == "office-sonos" { WayChoice::Native } else { WayChoice::AirPlaySteady };
+    }
+    match id {
+        "desk" => {
+            speaker.kind = crate::model::facts::SpeakerKind::Sendspin;
+            speaker.ways = vec![way(WayChoice::Native, 500)];
+        }
+        "garage" => speaker.ways.clear(),
+        "bedroom" | "den" => {
+            use crate::model::facts::{Applies, SpeakerKind};
+            speaker.kind = if id == "bedroom" { SpeakerKind::HomePodPair } else { SpeakerKind::AppleTv };
+            let mut steady = way(WayChoice::AirPlaySteady, 2000);
+            steady.applies = Applies::Fixed;
+            let mut short = way(WayChoice::AirPlayShort, 200);
+            short.applies = Applies::Reconnect;
+            speaker.way = if id == "bedroom" { short.way } else { steady.way };
+            speaker.ways = vec![short, steady];
+        }
+        _ => {}
+    }
+    let mut v = tune(SpeakerOptions::new(p, id));
+    if key == "exact-delay" {
+        let way = speaker.ways.iter_mut().find(|w| w.way == speaker.way).unwrap();
+        way.delay.own_ms = 200;
+        way.delay.change_ms = -50;
+        v.open_exact_delay(way);
+    }
+    if key == "busy" {
+        scene.situation.confirm_in_panel = Some(Confirm::ChimeBusy { speaker: sid, who: None });
+    }
+    let snapshot = crate::model::view::view(scene, None, false, 1);
+    frame(ui, key, &mut v, &snapshot);
 }
 
 fn speaker_kitchen(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "kitchen", Scenario::Playing, Names::Usual, "kitchen", |_| (), |v| v);
+    speaker_view(ui, "kitchen", "kitchen-playing", Names::Usual, "kitchen", |_| (), |v| v);
 }
 
 fn speaker_office(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "office", Scenario::Playing, Names::Usual, "office", |_| (), |v| v);
+    speaker_view(ui, "office", "kitchen-playing", Names::Usual, "office", |s| s.general.shortcuts.as_mut().unwrap().on = false, |v| v);
 }
 
 fn speaker_office_short(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(
-        ui,
-        "office-short",
-        Scenario::Playing,
-        Names::Usual,
-        "office",
-        |s| {
-            if let Some(d) = s.pages.iter_mut().find(|p| p.row.id == "office").and_then(|p| p.delay.as_mut()) {
-                d.status.choice = Some(DelayChoice::Short);
-                d.status.own_delay_ms = 300;
-                d.status.change_ms = 0;
-                d.status.delay_ms = 300;
-                d.status.limits = Some(Limits { remove_ms: 280, add_ms: 699 });
-            }
-        },
-        |v| v,
-    );
+    speaker_view(ui, "office-sonos", "kitchen-playing", Names::Usual, "office", |s| s.general.shortcuts.as_mut().unwrap().on = false, |v| v);
 }
 
 fn speaker_needs_code(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "den-code", Scenario::NeedsPairing, Names::Usual, "den", |_| (), |v| v);
+    speaker_view(ui, "den-code", "pc-den-needs-code", Names::Usual, "den", |_| (), |v| v);
 }
 
 fn speaker_needs_password(ui: &mut Ui, _: &mut Stage) {
-    let engine = ScriptedEngine::new(Scenario::Playing);
-    let mut f = engine.facts();
-    f.state = NowState::NeedsSecret { speaker: SpeakerId::new("office"), secret: Secret::Password };
-    engine.set_facts(f);
+    let engine = ScriptedEngine::new("pc-office-needs-password");
     let mut v = SpeakerOptions::new(port(Names::Usual, |_| ()), "office");
     frame(ui, "office-password", &mut v, &engine.snapshot());
 }
 
 fn speaker_garage(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "garage", Scenario::Playing, Names::Usual, "garage", |_| (), |v| v);
+    speaker_view(ui, "garage", "kitchen-playing", Names::Usual, "garage", |_| (), |v| v);
 }
 
 fn speaker_bedroom(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "bedroom", Scenario::Playing, Names::Usual, "bedroom", |_| (), |v| v);
+    speaker_view(ui, "bedroom", "kitchen-playing", Names::Usual, "bedroom", |_| (), |v| v);
 }
 
 fn speaker_den(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "den", Scenario::Playing, Names::Usual, "den", |_| (), |v| v);
+    speaker_view(ui, "den", "kitchen-playing", Names::Usual, "den", |_| (), |v| v);
 }
 
 fn speaker_desk(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "desk", Scenario::Playing, Names::Usual, "desk", |_| (), |v| v);
+    speaker_view(ui, "desk", "kitchen-playing", Names::Usual, "desk", |_| (), |v| v);
 }
 
 fn speaker_bands(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "bands", Scenario::Playing, Names::Usual, "kitchen", |_| (), |v| v.with_open("bands"));
+    speaker_view(ui, "bands", "kitchen-playing", Names::Usual, "kitchen", |_| (), |v| v.with_open("bands"));
 }
 
 fn speaker_details(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "details", Scenario::Playing, Names::Usual, "office", |_| (), |v| v.with_open("details"));
+    speaker_view(ui, "details", "kitchen-playing", Names::Usual, "office", |_| (), |v| v.with_open("details"));
 }
 
-fn speaker_amount(ui: &mut Ui, st: &mut Stage) {
-    speaker_view(ui, "amount", Scenario::Playing, Names::Usual, "kitchen", |_| (), |v| v.with_amount("150"));
-    st.focus_named(ui.min_rect(), "Milliseconds to remove or add");
+fn speaker_exact_delay(ui: &mut Ui, _: &mut Stage) {
+    speaker_view(ui, "exact-delay", "kitchen-playing", Names::Usual, "kitchen", |_| (), |v| v);
 }
 
-fn speaker_forget(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "forget", Scenario::Playing, Names::Usual, "kitchen", |_| (), |v| v.asking_to_forget());
+fn speaker_busy(ui: &mut Ui, _: &mut Stage) {
+    speaker_view(ui, "busy", "pc-kitchen-playing-something-else", Names::Usual, "kitchen", |_| (), |v| v);
 }
 
 fn speaker_long(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "long", Scenario::Playing, Names::Long, "kitchen", |_| (), |v| v);
+    speaker_view(ui, "long", "kitchen-playing", Names::Long, "kitchen", |_| (), |v| v);
 }
 
 fn speaker_chinese(ui: &mut Ui, _: &mut Stage) {
-    speaker_view(ui, "chinese", Scenario::Playing, Names::Chinese, "kitchen", |_| (), |v| v);
+    speaker_view(ui, "chinese", "kitchen-playing", Names::Chinese, "kitchen", |_| (), |v| v);
 }
 
 fn starting(s: &mut State) {
@@ -207,11 +225,14 @@ fn starting(s: &mut State) {
     }
     s.privacy.refused = Some(Vec::new());
     s.ma.offer = Some(false);
+    s.general.start_at_sign_in = Some(Ok(false));
+    s.general.notes_by_clock = false;
+    s.general.language = None;
 }
 
 fn settings_view(ui: &mut Ui, key: &str, f: impl FnOnce(&mut State)) {
     let mut v = SettingsView::new(port(Names::Usual, f));
-    frame(ui, key, &mut v, &snap(Scenario::Playing));
+    frame(ui, key, &mut v, &snap("kitchen-playing"));
 }
 
 fn settings_start(ui: &mut Ui, _: &mut Stage) {
@@ -225,20 +246,13 @@ fn settings_open(ui: &mut Ui, _: &mut Stage) {
     settings_view(ui, "settings-open", |s| {
         s.privacy.refused = Some(Vec::new());
         s.general.what_plays = Some(WhatPlays::OnlySentApps);
-        s.general.when_stops = Some(WhenStops::StaySilent);
+        s.general.switch_back_after_quiet = true;
+        s.general.play_calls = Some(true);
+        s.general.language = None;
         s.privacy.only_playing = false;
         if let Some(a) = &mut s.privacy.api {
             a.on = true;
         }
-        s.about.updates.state = UpdateState::UpToDate { at: Seen::Today(LocalTime::new(9, 12)) };
-    });
-}
-
-fn settings_refused(ui: &mut Ui, _: &mut Stage) {
-    settings_view(ui, "settings-refused", |s| {
-        let refused = s.privacy.refused.clone();
-        starting(s);
-        s.privacy.refused = refused;
         s.about.updates.state = UpdateState::UpToDate { at: Seen::Today(LocalTime::new(9, 12)) };
     });
 }
@@ -265,7 +279,7 @@ fn missing_view(ui: &mut Ui, key: &str, f: impl FnOnce(&mut State), tune: impl F
     // The view starts a new search for an address when it opens: the
     // state to show is set after.
     scripted.set(f);
-    frame(ui, key, &mut v, &snap(Scenario::Playing));
+    frame(ui, key, &mut v, &snap("kitchen-playing"));
 }
 
 fn no_hidden(s: &mut State) {
@@ -355,21 +369,22 @@ fn check(ui: &mut Ui, _: &mut Stage) {
     let mut v = CheckView::new(port(Names::Usual, |s| {
         s.discovery.lines.push(FindLine::AirPlaySearchFailed);
     }));
-    frame(ui, "check", &mut v, &snap(Scenario::Playing));
+    frame(ui, "check", &mut v, &snap("kitchen-playing"));
 }
 
-fn cant_hear(ui: &mut Ui, key: &str, scenario: Scenario, f: impl FnOnce(&mut State)) {
+fn cant_hear(ui: &mut Ui, key: &str, scenario: &str, f: impl FnOnce(&mut State)) {
     let mut v = CantHearView::new(port(Names::Usual, f));
     frame(ui, key, &mut v, &snap(scenario));
 }
 
 fn cant_hear_good(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-good", Scenario::Playing, |_| ());
+    cant_hear(ui, "cant-hear-good", "kitchen-playing", |_| ());
 }
 
 fn cant_hear_cant_tell(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-cant-tell", Scenario::Playing, |s| {
+    cant_hear(ui, "cant-hear-cant-tell", "kitchen-playing", |s| {
         s.playback.speaker = Some("Bedroom".into());
+        s.playback.on_short = true;
         s.playback.taking = Some(Ok(Taking::CantTell));
         s.playback.volume = Some(Ok(Volume::Level(18)));
         s.playback.untested = true;
@@ -377,11 +392,11 @@ fn cant_hear_cant_tell(ui: &mut Ui, _: &mut Stage) {
 }
 
 fn cant_hear_muted(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-muted", Scenario::Playing, |s| s.playback.volume = Some(Err(Volume::Muted)));
+    cant_hear(ui, "cant-hear-muted", "kitchen-playing", |s| s.playback.volume = Some(Err(Volume::Muted)));
 }
 
 fn cant_hear_nothing(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-nothing", Scenario::Playing, |s| {
+    cant_hear(ui, "cant-hear-nothing", "kitchen-playing", |s| {
         s.playback.playing = Some(Err(None));
         s.playback.windows = None;
         s.playback.connected = None;
@@ -391,7 +406,7 @@ fn cant_hear_nothing(ui: &mut Ui, _: &mut Stage) {
 }
 
 fn cant_hear_not_connected(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-not-connected", Scenario::Playing, |s| {
+    cant_hear(ui, "cant-hear-not-connected", "kitchen-playing", |s| {
         s.playback.connected = Some(Err(()));
         s.playback.taking = None;
         s.playback.volume = None;
@@ -399,14 +414,14 @@ fn cant_hear_not_connected(ui: &mut Ui, _: &mut Stage) {
 }
 
 fn cant_hear_not_asking(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-not-asking", Scenario::Playing, |s| {
+    cant_hear(ui, "cant-hear-not-asking", "kitchen-playing", |s| {
         s.playback.taking = Some(Err(Taking::NotAsking { two_ways: true }));
         s.playback.volume = None;
     });
 }
 
 fn cant_hear_app(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-app", Scenario::Playing, |s| {
+    cant_hear(ui, "cant-hear-app", "kitchen-playing", |s| {
         s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers (Realtek Audio)".into() }));
         s.playback.connected = None;
         s.playback.taking = None;
@@ -415,18 +430,18 @@ fn cant_hear_app(ui: &mut Ui, _: &mut Stage) {
 }
 
 fn cant_hear_refused(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-refused", Scenario::Playing, |s| {
+    cant_hear(ui, "cant-hear-refused", "kitchen-playing", |s| {
         s.playback.taking = Some(Err(Taking::Refused { device: "Kitchen Sub".into(), address: "192.168.1.51".into() }));
         s.playback.volume = None;
     });
 }
 
 fn cant_hear_zero(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-zero", Scenario::Playing, |s| s.playback.volume = Some(Err(Volume::Zero)));
+    cant_hear(ui, "cant-hear-zero", "kitchen-playing", |s| s.playback.volume = Some(Err(Volume::Zero)));
 }
 
 fn cant_hear_windows(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-windows", Scenario::Playing, |s| {
+    cant_hear(ui, "cant-hear-windows", "kitchen-playing", |s| {
         s.playback.windows = Some(Err(WindowsSends::Elsewhere { output: "Headphones (WH-1000XM4)".into() }));
         s.playback.connected = None;
         s.playback.taking = None;
@@ -435,12 +450,12 @@ fn cant_hear_windows(ui: &mut Ui, _: &mut Stage) {
 }
 
 fn cant_hear_pc(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-pc", Scenario::OnThisPc, |s| s.playback.speaker = None);
+    cant_hear(ui, "cant-hear-pc", "pc-plain", |s| s.playback.speaker = None);
 }
 
 fn ma(ui: &mut Ui, key: &str, f: impl FnOnce(&mut State)) {
     let mut v = MusicAssistantView::new(port(Names::Usual, f));
-    frame(ui, key, &mut v, &snap(Scenario::Playing));
+    frame(ui, key, &mut v, &snap("kitchen-playing"));
 }
 
 fn ma_off(ui: &mut Ui, _: &mut Stage) {
@@ -461,15 +476,15 @@ fn ma_done(ui: &mut Ui, _: &mut Stage) {
 
 fn about(ui: &mut Ui, _: &mut Stage) {
     let mut v = super::AboutView::new(port(Names::Usual, |_| ()));
-    frame(ui, "about", &mut v, &snap(Scenario::Playing));
+    frame(ui, "about", &mut v, &snap("kitchen-playing"));
 }
 
 fn about_latest(ui: &mut Ui, _: &mut Stage) {
     let mut v = super::AboutView::new(port(Names::Usual, |s| {
-        s.about.driver = Some(Driver::Running("1.1.2.215".into()));
+        s.about.show_lab = true;
         s.about.updates.state = UpdateState::UpToDate { at: Seen::Today(LocalTime::new(9, 12)) };
     }));
-    frame(ui, "about-latest", &mut v, &snap(Scenario::Playing));
+    frame(ui, "about-latest", &mut v, &snap("kitchen-playing"));
 }
 
 fn lab(ui: &mut Ui, _: &mut Stage) {
@@ -479,10 +494,5 @@ fn lab(ui: &mut Ui, _: &mut Stage) {
             Some(CarriedOver { airplay_ms: Some(500), homepod_ms: None, homepod_buffered: false, speakers: vec!["Office".into(), "Garage".into()] });
     }))
     .with_counters();
-    frame(ui, "lab", &mut v, &snap(Scenario::Playing));
-}
-
-fn guides(ui: &mut Ui, _: &mut Stage) {
-    let mut v = GuidesView::new(port(Names::Usual, |_| ()));
-    frame(ui, "guides", &mut v, &snap(Scenario::Playing));
+    frame(ui, "lab", &mut v, &snap("kitchen-playing"));
 }

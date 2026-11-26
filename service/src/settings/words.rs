@@ -49,7 +49,7 @@ pub(crate) fn longer(s: &str) -> String {
 /// block of the table, which starts with *About*).
 #[cfg(test)]
 pub(crate) fn is_settings_key(k: Key) -> bool {
-    k >= Key::SetNavAbout
+    k >= Key::SetNavAbout || matches!(k, Key::Unmute | Key::ReadyLine | Key::NoticeUpdate | Key::DelayLabel | Key::MsUnit | Key::Reset)
 }
 
 /// The kind of a speaker as its row says it: *Sonos*, *AirPlay*.
@@ -64,15 +64,6 @@ pub fn kind_short(lang: Lang, k: &SpeakerKind) -> String {
         SpeakerKind::Sendspin => w!(lang, KindSendspin),
         SpeakerKind::Other { maker: Some(m) } => m.clone(),
         SpeakerKind::Other { maker: None } => w!(lang, KindSpeaker),
-    }
-}
-
-/// A delay in seconds, rounded as rows round it: 0.3, 2.
-pub fn seconds(ms: u32) -> crate::model::text::Number {
-    use crate::model::delay::{figure, Figure};
-    use crate::model::facts::SpeakerDelay;
-    match figure(SpeakerDelay { own_ms: ms, measured: false, change_ms: 0 }) {
-        Figure::About(n) | Figure::Under(n) | Figure::Measured(n) => n,
     }
 }
 
@@ -117,7 +108,5 @@ pub fn left(lang: Lang, seconds: u32) -> String {
 
 /// A delay as the delay choice and *Connects with* say it: *about 0.3 s*.
 pub fn about(lang: Lang, ms: u32) -> String {
-    use crate::model::delay::{figure, figure_text};
-    use crate::model::facts::SpeakerDelay;
-    figure_text(lang, figure(SpeakerDelay { own_ms: ms, measured: false, change_ms: 0 }))
+    crate::model::panel::delay_figure(lang, crate::model::facts::SpeakerDelay { own_ms: ms, measured: false, change_ms: 0 })
 }

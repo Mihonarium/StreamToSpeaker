@@ -34,6 +34,7 @@ pub struct State {
     pub about: AboutView,
     pub lab: LabView,
     pub playback: PlaybackCheck,
+    pub report_save: ReportSave,
     pub discovery: DiscoveryCheck,
     pub wanted: Option<Wanted>,
     pub probe: Probe,
@@ -152,26 +153,32 @@ impl SettingsPort for ScriptedSettings {
         }
         // Any other speaker: flat.
         let name = s.pages.iter().find(|p| p.row.id == id)?.row.name.clone();
-        Some(ToneView { name, eq: EqSettings::default(), headroom_db: None, can_undo: false })
+        Some(ToneView { name, eq: EqSettings::default(), headroom_db: None })
     }
     fn report(&self, parts: ReportParts) -> String {
         let mut lines = Vec::new();
         if parts.versions {
-            lines.push("Stream To Speaker 0.2.0 · driver 1.1.1.211 (running) · Windows 11 26100".to_string());
+            lines.push("Stream To Speaker 0.2.0 · Windows".to_string());
         }
-        if parts.last_hour {
-            lines.push("21:40:02 Playing on Bedroom (HomePod pair, Short delay 200 ms, nothing removed or added)".into());
-            lines.push("21:40:07 Bedroom Right: no PTP reply for 5 s (Left: OK)".into());
-            lines.push("21:41:10 Delay on Kitchen: 50 → 125 ms removed (panel)".into());
+        if parts.diagnostics {
+            lines.push("Windows audio: playing".into());
+            if parts.speakers {
+                lines.push("Speaker: Kitchen".into());
+                lines.push("Last message: Kitchen stopped responding".into());
+            }
         }
         if parts.speakers {
             lines.push("Speakers: Kitchen (Sonos, 192.168.1.20)".into());
             lines.push("Bedroom (192.168.1.33, .34)".into());
         }
-        if parts.log {
+        if parts.log && parts.speakers {
             lines.push("[log file attached]".into());
         }
         lines.join("\n")
+    }
+
+    fn save_report(&self, _: &str) -> ReportSave {
+        self.state.lock().unwrap().report_save
     }
 
     fn act(&self, act: Act) {
@@ -201,31 +208,6 @@ fn apply(s: &mut State, act: &Act) {
             }
         }
         Act::SendspinSpeakers(on) => s.speakers.sendspin = Some(*on),
-        Act::Delay(id, d) => {
-            if let Some(p) = s.pages.iter_mut().find(|p| &p.row.id == id) {
-                if let Some(card) = &mut p.delay {
-                    let st = &mut card.status;
-                    let limits = st.limits.unwrap_or(Limits { remove_ms: 0, add_ms: 0 });
-                    match d {
-                        DelayAct::Remove(n) => st.change_ms = limits.clamp(st.change_ms as i64 - *n as i64),
-                        DelayAct::Add(n) => st.change_ms = limits.clamp(st.change_ms as i64 + *n as i64),
-                        DelayAct::BackToOwn => st.change_ms = 0,
-                        DelayAct::Choose(c) => st.choice = Some(*c),
-                    }
-                    st.delay_ms = (st.own_delay_ms as i64 + st.change_ms as i64).max(0) as u32;
-                    st.notice = None;
-                    p.row.change_ms = st.change_ms;
-                    p.row.choice = st.choice;
-                }
-            }
-        }
-        Act::ConnectWith { id, own_way } => {
-            if let Some(p) = s.pages.iter_mut().find(|p| &p.row.id == id) {
-                if let Some(c) = &mut p.connects_with {
-                    c.own_way = *own_way;
-                }
-            }
-        }
         Act::VolumeLimit(id, v) => {
             if let Some(p) = s.pages.iter_mut().find(|p| &p.row.id == id) {
                 p.volume_limit = Some(*v);
@@ -234,7 +216,7 @@ fn apply(s: &mut State, act: &Act) {
         Act::Tone(id, t) => {
             if !s.tones.iter().any(|(tid, _)| tid == id) {
                 if let Some(name) = s.pages.iter().find(|p| &p.row.id == id).map(|p| p.row.name.clone()) {
-                    s.tones.push((id.clone(), ToneView { name, eq: EqSettings::default(), headroom_db: None, can_undo: false }));
+                    s.tones.push((id.clone(), ToneView { name, eq: EqSettings::default(), headroom_db: None }));
                 }
             }
             if let Some((_, tv)) = s.tones.iter_mut().find(|(tid, _)| tid == id) {
@@ -253,28 +235,16 @@ fn apply(s: &mut State, act: &Act) {
                         tv.eq.bands_db[9] = *tr;
                     }
                     ToneAct::Preset(i) => tv.eq.bands_db = crate::equalizer::EQ_PRESETS[*i].bands_db,
-                    ToneAct::Undo => {}
                 }
-                tv.can_undo = !matches!(t, ToneAct::Undo);
                 let (b, tr) = (tv.eq.bands_db[0], tv.eq.bands_db[9]);
                 if let Some(p) = s.pages.iter_mut().find(|p| &p.row.id == id) {
                     p.tone = Some((b, tr));
                 }
             }
         }
-        Act::ComesBack(id, c) => {
-            if let Some(p) = s.pages.iter_mut().find(|p| &p.row.id == id) {
-                p.comes_back = Some(*c);
-            }
-        }
         Act::SongTitles(id, on) => {
             if let Some(p) = s.pages.iter_mut().find(|p| &p.row.id == id) {
                 p.song_titles = Some(*on);
-            }
-        }
-        Act::ForgetPairing(id) | Act::RemovePassword(id) => {
-            if let Some(p) = s.pages.iter_mut().find(|p| &p.row.id == id) {
-                p.pairing = None;
             }
         }
         Act::ShowAs(id, name) => {
@@ -286,17 +256,12 @@ fn apply(s: &mut State, act: &Act) {
                 r.name = name.clone();
             }
         }
-        Act::Forget(id) | Act::Remove(id) => {
-            s.pages.retain(|p| &p.row.id != id);
-            s.speakers.speakers.retain(|r| &r.id != id);
-            s.speakers.hidden.retain(|r| &r.id != id);
-        }
         Act::WhatPlays(m) => s.general.what_plays = Some(*m),
         Act::PlayCalls(on) => s.general.play_calls = Some(*on),
         Act::StartAtSignIn(on) => s.general.start_at_sign_in = Some(Ok(*on)),
-        Act::GoBack(on) => s.general.go_back = Some(*on),
-        Act::WhenStops(w) => s.general.when_stops = Some(*w),
-        Act::Notifications(on) => s.general.notifications = Some(*on),
+        Act::SwitchBackAfterQuiet(on) => s.general.switch_back_after_quiet = *on,
+        Act::NotesByClock(on) => s.general.notes_by_clock = *on,
+        Act::ShowLab(on) => s.about.show_lab = *on,
         Act::Shortcuts(on) => {
             if let Some(k) = &mut s.general.shortcuts {
                 k.on = *on;
@@ -364,65 +329,28 @@ fn row(id: &str, name: &str, kind: SpeakerKind, presence: Presence) -> SpeakerRo
         kind,
         presence,
         added_by_address: false,
-        change_ms: 0,
-        choice: None,
-        paired: false,
-        untested: false,
         cant_play: None,
     }
 }
 
-fn status(own: u32, change: i32, limits: (u32, u32), applies: Result<Applies, Unchangeable>, choice: Option<DelayChoice>) -> DelayStatusView {
-    DelayStatusView {
-        choice,
-        delay_ms: (own as i64 + change as i64).max(0) as u32,
-        own_delay_ms: own,
-        change_ms: change,
-        limits: Some(Limits { remove_ms: limits.0, add_ms: limits.1 }),
-        applies,
-        progress: Progress::Done,
-        notice: None,
-        short_ms: 300,
-        steady_ms: 2000,
-    }
-}
-
-fn card(s: DelayStatusView) -> Option<DelayCard> {
-    Some(DelayCard { status: s, measured: None, small_step_ms: 25, large_step_ms: 100, at_once: false })
-}
-
 fn page(row: SpeakerRow, model: Option<&str>) -> SpeakerView {
-    let id = row.id.clone();
     let name = row.name.clone();
     SpeakerView {
         row,
-        model: model.map(Into::into),
-        test_sound: Some(()),
-        delay: None,
-        connects_with: None,
-        group: None,
         volume_limit: Some(100),
         tone: Some((0.0, 0.0)),
-        comes_back: Some(ComesBack::WhenLastChosen),
         song_titles: None,
-        pairing: None,
         show_as: Some(name),
-        details: Details { id, ..Default::default() },
+        details: Details { model: model.map(Into::into), ..Default::default() },
     }
 }
 
 /// The example home.
 pub fn example() -> State {
-    let mut kitchen_row = row("kitchen", "Kitchen", SpeakerKind::Sonos, Presence::PlayingNow);
-    kitchen_row.change_ms = -50;
-    let mut living = row("living", "Living Room + Dining Room", SpeakerKind::SonosGroup, Presence::Available);
-    living.change_ms = 0;
-    let mut bedroom = row("bedroom", "Bedroom", SpeakerKind::HomePodPair, Presence::Available);
-    bedroom.paired = true;
-    bedroom.untested = true;
-    let mut office = row("office", "Office", SpeakerKind::AirPlay, Presence::Available);
-    office.change_ms = -300;
-    office.choice = Some(DelayChoice::Steady);
+    let kitchen_row = row("kitchen", "Kitchen", SpeakerKind::Sonos, Presence::PlayingNow);
+    let living = row("living", "Living Room + Dining Room", SpeakerKind::SonosGroup, Presence::Available);
+    let bedroom = row("bedroom", "Bedroom", SpeakerKind::HomePodPair, Presence::Available);
+    let office = row("office", "Office", SpeakerKind::Sonos, Presence::Available);
     let mut garage = row("garage", "Garage", SpeakerKind::AirPlay, Presence::NotFound { last_seen: Some(Seen::Yesterday(LocalTime::new(22, 10))) });
     garage.added_by_address = true;
     let den = row("den", "Den TV", SpeakerKind::AppleTv, Presence::Available);
@@ -430,8 +358,6 @@ pub fn example() -> State {
     let neighbour = row("neighbour", "Neighbour’s TV", SpeakerKind::AppleTv, Presence::Available);
 
     let mut kitchen = page(kitchen_row.clone(), Some("Sonos One"));
-    kitchen.delay = card(status(200, -50, (200, 1000), Ok(Applies::Live), None));
-    kitchen.connects_with = Some(ConnectsWith { own_way: true, own_delay_ms: 200, airplay_delay_ms: 2000 });
     kitchen.volume_limit = Some(70);
     kitchen.tone = Some((-2.0, 1.0));
     kitchen.song_titles = Some(true);
@@ -440,47 +366,29 @@ pub fn example() -> State {
         model: Some("Sonos One".into()),
         address: Some("192.168.1.40".into()),
         connection: Some("UPnP, Sonos".into()),
-        id: "uuid:RINCON_48A6B8C2D1E001400".into(),
-        delay_values: Some("50 ms removed from the stream".into()),
-        last_problem: None,
     };
 
     let mut living_p = page(living.clone(), None);
-    living_p.delay = card(status(200, 0, (200, 1000), Ok(Applies::Live), None));
-    living_p.group = Some(Group::Sonos { members: vec!["Living Room".into(), "Dining Room".into()] });
     living_p.song_titles = Some(true);
     living_p.show_as = Some("Living Room + Dining Room".into());
 
     let mut bedroom_p = page(bedroom.clone(), None);
-    bedroom_p.delay = card(status(200, 0, (180, 1800), Ok(Applies::Reconnect), None));
-    bedroom_p.group = Some(Group::HomePodPair { left: "Bedroom Left".into(), right: "Bedroom Right".into() });
-    bedroom_p.pairing = Some(Pairing::Paired { on: Some(Date { day: 3, month: 10 }) });
     bedroom_p.show_as = Some("Bedroom".into());
     bedroom_p.details.connection = Some("AirPlay 2, realtime".into());
 
     let mut office_p = page(office.clone(), None);
-    office_p.delay = card(status(2000, -300, (1000, 1000), Ok(Applies::Reconnect), Some(DelayChoice::Steady)));
-    office_p.pairing = Some(Pairing::PasswordSaved);
     office_p.song_titles = Some(true);
     office_p.details = Details {
-        model: Some("AirPort Express".into()),
+        model: Some("Sonos One".into()),
         address: Some("192.168.1.44".into()),
-        connection: Some("AirPlay (RAOP)".into()),
-        id: "airplay:00005E00539A".into(),
-        delay_values: Some("AirPlay buffer 1700 ms (Steady 2000 ms, 300 ms removed)".into()),
-        last_problem: None,
+        connection: Some("Sonos / AirPlay".into()),
     };
 
-    let mut garage_p = page(garage.clone(), None);
-    garage_p.delay = card(status(2000, 0, (1000, 1000), Ok(Applies::Reconnect), Some(DelayChoice::Steady)));
-    garage_p.test_sound = None;
+    let garage_p = page(garage.clone(), None);
 
-    let mut den_p = page(den.clone(), None);
-    den_p.delay = card(status(2000, 0, (0, 0), Err(Unchangeable::KeptBySpeakerOnSteady), Some(DelayChoice::Steady)));
-    den_p.pairing = Some(Pairing::Paired { on: None });
+    let den_p = page(den.clone(), None);
 
-    let mut desk_p = page(desk.clone(), None);
-    desk_p.delay = card(status(500, 0, (0, 800), Ok(Applies::Reconnect), None));
+    let desk_p = page(desk.clone(), None);
 
     let neighbour_p = page(neighbour.clone(), None);
 
@@ -504,9 +412,8 @@ pub fn example() -> State {
             what_plays: Some(WhatPlays::Everything),
             play_calls: Some(false),
             start_at_sign_in: Some(Ok(true)),
-            go_back: Some(true),
-            when_stops: Some(WhenStops::BringBack),
-            notifications: Some(true),
+            switch_back_after_quiet: false,
+            notes_by_clock: true,
             shortcuts: Some(Shortcuts {
                 on: true,
                 remove: vec!["Ctrl".into(), "Win".into(), ",".into()],
@@ -543,7 +450,7 @@ pub fn example() -> State {
         },
         about: AboutView {
             version: "0.2.0".into(),
-            driver: Some(Driver::Waiting { installed: "1.1.2.215".into(), running: "1.1.1.211".into() }),
+            show_lab: false,
             updates: Updates {
                 daily: Some(true),
                 state: UpdateState::Available { version: "0.2.1".into(), at: Some(Seen::Today(LocalTime::new(9, 12))) },
@@ -567,6 +474,7 @@ pub fn example() -> State {
             ]),
             carried_over: None,
         },
+        report_save: ReportSave::Opened,
         playback: PlaybackCheck {
             speaker: Some("Kitchen".into()),
             playing: Some(Ok(Some("Edge".into()))),
@@ -600,7 +508,6 @@ pub fn example() -> State {
                 name: "Kitchen".into(),
                 eq: EqSettings { enabled: true, preamp_db: 0.0, bands_db: [-2.0, -2.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0] },
                 headroom_db: Some(-3.0),
-                can_undo: true,
             },
         )],
     }

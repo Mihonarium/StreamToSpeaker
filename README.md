@@ -75,14 +75,16 @@ playback doesn't use the URL, so privacy mode never affects it. Disabling
 streaming or forgetting the speaker closes the URL to every other device
 either way.
 
-**Web UI:** to switch speakers or nudge latency from your phone, click *Enable
-web UI* in the *Web UI* card and open the link it shows (*Copy link*, or *Open
-in browser* on the PC). The link holds a secret key, so anyone with it can
-control the app on your network; *Make a new link* replaces it, and the old one
-stops working. Running headless or as a service, with no window to show the
-link, `stream-to-speaker.exe --web-link` prints it; run it as the Windows
-account the app runs under. Scripts send the same key with every API call —
-see [TECHNICAL.md](TECHNICAL.md#http-api).
+**Control from your phone:** in Settings, turn on *Control from your phone*,
+then scan the QR code or choose *Copy link*. Anyone with the link can switch
+speakers and change the delay on your network. *Make a new link* replaces it.
+For a headless or service install, `stream-to-speaker.exe --web-link` prints
+the link when run as the app’s Windows account.
+
+For scripts, turn on *Let scripts and home automation control this app* and
+choose *Copy key*. The API accepts either enabled key. With both controls off
+it returns 404. With either on, a missing or incorrect bearer key gets 401.
+See [TECHNICAL.md](TECHNICAL.md#http-api).
 
 Once a day the app asks GitHub whether a newer release exists and, if so,
 shows a link to it. Nothing is downloaded or installed by itself. Turn the
@@ -93,10 +95,9 @@ check off under **Advanced** if you'd rather not.
 ```
 --headless                No GUI; run as a CLI service.
 --no-tray                 GUI window only, no tray icon.
---web                     Enable the web UI + HTTP/JSON API, both behind a
-                          secret link (shown in the window; printed once at
-                          start with --headless). Off by default; when off,
-                          only /stream.raw is served.
+--web                     Enable phone control and its HTTP/JSON API.
+                          The window shows the link, and --headless prints
+                          it once at start.
 --web-link                Print the web UI's link and exit — for headless and
                           service installs. Run it as the account the app
                           runs under, with the app's --port / --advertise-ip.
@@ -110,9 +111,9 @@ check off under **Advanced** if you'd rather not.
                           After the first search (a few seconds) it takes the
                           best match: that address, else that full name, else
                           a shown speaker whose name contains it; if none
-                          matches yet, the first that does later. Omit to use
-                          the speaker from last time (--headless in a
-                          terminal asks).
+                          matches yet, the first that does later. Omit to keep
+                          the last place. A headless terminal also offers a
+                          picker.
 --no-interactive          With --headless, don't ask in the terminal.
 --list-speakers           Search for speakers, print them and exit.
 --no-discovery            Skip discovery; only serve HTTP.

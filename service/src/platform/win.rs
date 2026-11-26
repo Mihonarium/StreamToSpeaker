@@ -4,7 +4,7 @@
 //! that hears sleep, wake, sign-out and shutdown; and the hand-back that
 //! runs when the app ends without quitting.
 //!
-//! One worker thread owns every Core Audio object. It looks at Windows
+//! One worker thread watches Core Audio outputs and sessions. It looks at Windows
 //! every quarter second, keeps what it saw for the engine to read without
 //! waiting, and tells the engine when the default output or the set of
 //! outputs changed. Switching and setting a level go to the worker and wait for it
@@ -12,6 +12,11 @@
 //! for long.
 
 #![cfg(windows)]
+
+mod desk;
+mod network;
+mod pass;
+mod players;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -45,20 +50,100 @@ const WAIT_FOR_WORKER: Duration = Duration::from_secs(2);
 /// The words every name of the app's own output carries.
 const OUR_NAME: &str = "Stream To Speaker";
 
-/// The real PC's platform; passive when Core Audio can't be reached.
+/// The workers and subscriptions belong to this Windows process.
 pub(crate) fn platform() -> Platform {
-    match Shared::start() {
-        Some(shared) => {
-            crate::endpoint_name::platform_names_the_device();
-            install_crash_handback();
-            start_session_window(shared.clone());
-            let w = Arc::new(Windows(shared));
-            Platform { outputs: w.clone(), sessions: w.clone(), device: w.clone(), handback: w.clone(), events: w }
+    static PLATFORM: OnceLock<Platform> = OnceLock::new();
+    PLATFORM
+        .get_or_init(|| {
+            let mut p = Platform::passive();
+            if let Some(shared) = Shared::start() {
+                crate::endpoint_name::platform_names_the_device();
+                install_crash_handback();
+                start_session_window();
+                let w = Arc::new(Windows(shared));
+                p.outputs = w.clone();
+                p.sessions = w.clone();
+                p.device = w.clone();
+                p.handback = w;
+            } else {
+                warn!("Windows' sound outputs can't be read here; the person chooses the output in Windows");
+            }
+            p.events = notices().clone();
+            p.players = players::players().clone();
+            p.network = network::start();
+            p.pass = Arc::new(pass::WindowsPass::new(p.outputs.clone()));
+            p.desk = Arc::new(desk::WindowsDesk::default());
+            p
+        })
+        .clone()
+}
+
+#[derive(Default)]
+struct Notices(Mutex<Vec<EventSink>>);
+
+fn notices() -> &'static Arc<Notices> {
+    static NOTICES: OnceLock<Arc<Notices>> = OnceLock::new();
+    NOTICES.get_or_init(Arc::default)
+}
+
+impl Notices {
+    fn tell(&self, event: SystemEvent) {
+        let sinks = self.0.lock().unwrap().clone();
+        for sink in sinks {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink(event.clone()))).is_err() {
+                debug!("A Windows event subscriber stopped while handling a notice");
+            }
         }
-        None => {
-            warn!("Windows' sound outputs can't be read here; the person chooses the output in Windows");
-            Platform::passive()
+    }
+}
+
+impl SystemEvents for Notices {
+    fn subscribe(&self, sink: EventSink) {
+        self.0.lock().unwrap().push(sink);
+    }
+}
+
+/// Initialises WinRT and COM on a worker. The guard stays on that thread
+/// and is dropped after its last interface.
+struct Apartment(std::marker::PhantomData<std::rc::Rc<()>>);
+
+impl Apartment {
+    fn enter() -> windows::core::Result<Self> {
+        use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+        // SAFETY: a new worker enters its MTA and balances success in Drop.
+        unsafe { RoInitialize(RO_INIT_MULTITHREADED)? };
+        Ok(Self(std::marker::PhantomData))
+    }
+}
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        // SAFETY: this guard owns one successful RoInitialize on this thread.
+        unsafe { windows::Win32::System::WinRT::RoUninitialize() };
+    }
+}
+
+/// Walk a process snapshot until the visitor finds its process.
+fn find_process(mut visit: impl FnMut(u32, &str) -> bool) -> bool {
+    use windows::core::Owned;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: the snapshot's sole handle belongs to Owned. Each successful
+    // call fills the sized entry, whose inline name is read within its bounds.
+    unsafe {
+        let Ok(handle) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return false };
+        let snapshot = Owned::new(handle);
+        let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut next = Process32FirstW(*snapshot, &mut entry);
+        while next.is_ok() {
+            let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            if visit(entry.th32ProcessID, &String::from_utf16_lossy(&entry.szExeFile[..end])) {
+                return true;
+            }
+            next = Process32NextW(*snapshot, &mut entry);
         }
+        false
     }
 }
 
@@ -81,23 +166,20 @@ enum Job {
 struct Shared {
     seen: Mutex<Seen>,
     jobs: Sender<Job>,
-    sinks: Mutex<Vec<EventSink>>,
 }
 
 impl Shared {
     /// Start the worker; `None` when Core Audio can't be reached.
     fn start() -> Option<Arc<Shared>> {
         let (jobs, rx) = unbounded();
-        let shared = Arc::new(Shared { seen: Mutex::new(Seen::default()), jobs, sinks: Mutex::new(Vec::new()) });
+        let shared = Arc::new(Shared { seen: Mutex::new(Seen::default()), jobs });
         let (ready_tx, ready) = bounded(1);
         let for_worker = shared.clone();
         let spawned = std::thread::Builder::new().name("stream-to-speaker-windows-audio".into()).spawn(move || {
-            // SAFETY: COM is initialised once for this thread, which owns
-            // every Core Audio object it creates and runs as long as the app.
-            if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
+            let Ok(_apartment) = Apartment::enter() else {
                 let _ = ready_tx.send(false);
                 return;
-            }
+            };
             // SAFETY: plain object creation on a COM thread.
             let enumerator: IMMDeviceEnumerator = match unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) } {
                 Ok(e) => e,
@@ -109,8 +191,9 @@ impl Shared {
             };
             let mut worker = Worker { enumerator, endpoints: HashMap::new(), apps: HashMap::new() };
             worker.look(&for_worker);
-            let _ = ready_tx.send(true);
-            worker.run(&rx, &for_worker);
+            if ready_tx.send(true).is_ok() {
+                worker.run(&rx, &for_worker);
+            }
         });
         if spawned.is_err() {
             return None;
@@ -122,13 +205,6 @@ impl Shared {
         let (tx, rx) = bounded(1);
         self.jobs.send(job(tx)).map_err(|_| "the Windows audio worker has stopped".to_string())?;
         rx.recv_timeout(WAIT_FOR_WORKER).unwrap_or_else(|_| Err("Windows didn't answer in time".into()))
-    }
-
-    fn tell(&self, event: SystemEvent) {
-        let sinks: Vec<EventSink> = self.sinks.lock().unwrap().clone();
-        for s in sinks {
-            s(event.clone());
-        }
     }
 }
 
@@ -144,7 +220,8 @@ struct Worker {
     enumerator: IMMDeviceEnumerator,
     endpoints: HashMap<PcOutputId, Endpoint>,
     /// Process id → the app's name.
-    apps: HashMap<u32, String>,
+    /// Each process's name and key, read once.
+    apps: HashMap<u32, (String, String)>,
 }
 
 impl Worker {
@@ -230,10 +307,10 @@ impl Worker {
             }
         };
         if outputs_changed {
-            shared.tell(SystemEvent::OutputsChanged);
+            notices().tell(SystemEvent::OutputsChanged);
         }
         if default_changed {
-            shared.tell(SystemEvent::DefaultOutputChanged);
+            notices().tell(SystemEvent::DefaultOutputChanged);
         }
     }
 
@@ -265,12 +342,12 @@ impl Worker {
             let system_sounds = control.IsSystemSoundsSession().0 == 0;
             let pid = control.GetProcessId().unwrap_or(0);
             let peak = session.cast::<IAudioMeterInformation>().ok().and_then(|m| m.GetPeakValue().ok()).unwrap_or(0.0);
-            let app = if system_sounds {
-                "System".to_string()
+            let (app, key) = if system_sounds {
+                ("System".to_string(), String::new())
             } else {
-                self.apps.entry(pid).or_insert_with(|| app_name(pid)).clone()
+                self.apps.entry(pid).or_insert_with(|| app_name_and_key(pid)).clone()
             };
-            out.push(AppAudio { app, output: id.clone(), peak, system_sounds });
+            out.push(AppAudio { app, key, output: id.clone(), peak, system_sounds });
         }
     }
 
@@ -316,11 +393,11 @@ unsafe fn text_of(store: &IPropertyStore, key: &PROPERTYKEY) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Open an active output's names and the objects the worker reads.
+/// Read an output's names and form factor from its property store.
 ///
 /// # Safety
 /// `device` must be a live IMMDevice on this thread.
-unsafe fn open_endpoint(id: &PcOutputId, device: &IMMDevice) -> Option<Endpoint> {
+unsafe fn endpoint_info(id: &PcOutputId, device: &IMMDevice) -> Option<OutputInfo> {
     let store = device.OpenPropertyStore(STGM_READ).ok()?;
     let friendly = text_of(&store, &PKEY_Device_FriendlyName).unwrap_or_default();
     let name = text_of(&store, &PKEY_Device_DeviceDesc).unwrap_or_else(|| friendly.clone());
@@ -335,7 +412,15 @@ unsafe fn open_endpoint(id: &PcOutputId, device: &IMMDevice) -> Option<Endpoint>
         Some(9) => OutputKind::Display,
         _ => OutputKind::Other,
     };
-    let info = OutputInfo { id: id.clone(), friendly, name, device: device_name, kind };
+    Some(OutputInfo { id: id.clone(), friendly, name, device: device_name, kind })
+}
+
+/// Activate the objects used to monitor this output.
+///
+/// # Safety
+/// `device` must be a live IMMDevice on this thread.
+unsafe fn open_endpoint(id: &PcOutputId, device: &IMMDevice) -> Option<Endpoint> {
+    let info = endpoint_info(id, device)?;
     Some(Endpoint {
         volume: device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok(),
         meter: device.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None).ok(),
@@ -367,9 +452,24 @@ fn set_default(id: &PcOutputId, roles: &[Role]) -> Result<(), String> {
     Ok(())
 }
 
-/// An app's name for the Volume mixer: its file description ("Spotify",
-/// "Google Chrome"), else its file name without ".exe".
-fn app_name(pid: u32) -> String {
+/// An app's name for the Volume mixer and its key: the name is its file
+/// description ("Spotify", "Google Chrome"), else its file name without
+/// ".exe"; the key is made from its file name ([`super::app_key`]) and is
+/// empty where the program can't be read.
+fn app_name_and_key(pid: u32) -> (String, String) {
+    let Some(path) = program_path(pid) else {
+        return (format!("Process {pid}"), String::new());
+    };
+    let name = file_description(&path).unwrap_or_else(|| {
+        let file = path.rsplit('\\').next().unwrap_or(&path);
+        file.strip_suffix(".exe").or_else(|| file.strip_suffix(".EXE")).unwrap_or(file).to_string()
+    });
+    (name, super::app_key(&path))
+}
+
+/// The full path of a process's program, where Windows lets this process
+/// read it.
+fn program_path(pid: u32) -> Option<String> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
     let mut path = [0u16; 1024];
@@ -379,20 +479,13 @@ fn app_name(pid: u32) -> String {
     let ok = unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
-            return format!("Process {pid}");
+            return None;
         }
         let ok = QueryFullProcessImageNameW(h, 0, path.as_mut_ptr(), &mut len) != 0;
         CloseHandle(h);
         ok
     };
-    if !ok {
-        return format!("Process {pid}");
-    }
-    let path = String::from_utf16_lossy(&path[..len as usize]);
-    file_description(&path).unwrap_or_else(|| {
-        let file = path.rsplit('\\').next().unwrap_or(&path);
-        file.strip_suffix(".exe").or_else(|| file.strip_suffix(".EXE")).unwrap_or(file).to_string()
-    })
+    ok.then(|| String::from_utf16_lossy(&path[..len as usize]))
 }
 
 /// The FileDescription in an executable's version resource.
@@ -535,26 +628,14 @@ fn install_crash_handback() {
     });
 }
 
-impl SystemEvents for Windows {
-    fn subscribe(&self, sink: EventSink) {
-        self.0.sinks.lock().unwrap().push(sink);
-    }
-}
-
-/// The platform the hidden window tells.
-static SESSION: OnceLock<Arc<Shared>> = OnceLock::new();
-
 /// A hidden top-level window on its own thread: Windows sends it the
 /// power and session messages every top-level window gets.
-fn start_session_window(shared: Arc<Shared>) {
+fn start_session_window() {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DispatchMessageW, GetMessageW, RegisterClassW, TranslateMessage, MSG, WNDCLASSW,
         WS_OVERLAPPED,
     };
-    if SESSION.set(shared).is_err() {
-        return;
-    }
     let spawned = std::thread::Builder::new().name("stream-to-speaker-session".into()).spawn(|| {
         let class: Vec<u16> = "StreamToSpeakerSession\0".encode_utf16().collect();
         // SAFETY: the class name outlives the class and the window (it lives
@@ -618,20 +699,15 @@ unsafe extern "system" fn session_window_proc(
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION,
     };
-    let tell = |e: SystemEvent| {
-        if let Some(s) = SESSION.get() {
-            s.tell(e);
-        }
-    };
     match msg {
         WM_POWERBROADCAST if wparam == PBT_APMSUSPEND as usize => {
             debug!("Windows is going to sleep");
-            tell(SystemEvent::Suspending);
+            notices().tell(SystemEvent::Suspending);
             1
         }
         WM_POWERBROADCAST if wparam == PBT_APMRESUMEAUTOMATIC as usize => {
             debug!("Windows woke");
-            tell(SystemEvent::Resumed);
+            notices().tell(SystemEvent::Resumed);
             1
         }
         // Signing out or shutting down is fine by this app.
@@ -641,7 +717,7 @@ unsafe extern "system" fn session_window_proc(
             // back here, then let the engine do the rest if it still can.
             info!("Windows is ending the session: giving the sound back");
             hand_back_now();
-            tell(SystemEvent::SessionEnding);
+            notices().tell(SystemEvent::SessionEnding);
             0
         }
         // SAFETY: the arguments are the ones Windows passed in.

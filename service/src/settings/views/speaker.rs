@@ -1,386 +1,283 @@
-//! A speaker's options, opened from the *›* at the end of its row: its
-//! delay (the panel's own block), its tone, its loudest level, song titles,
-//! when it gets the sound by itself, its name in this app, and at the
-//! bottom its details, hiding it and forgetting it.
-
+//! The page for one panel row. Playback state and delay commands come from the same snapshot as the panel.
 use std::sync::Arc;
 
 use egui::Ui;
-
-use crate::model::command::{Command, Open};
-use crate::model::delay::PanelDelay;
-use crate::model::snapshot::Snapshot;
-use crate::model::state::{NowState, Place, Secret, SpeakerId};
+use crate::model::{Command, Snapshot, SpeakerId};
+use crate::model::command::{DelayStep, Open};
+use crate::model::facts::Applies;
+use crate::model::panel::{self, About, Row};
+use crate::model::situation::{Confirm, Doing, RowState, WayChoice};
+use crate::model::state::Secret;
 use crate::model::text::Lang;
-use crate::shell::{Ask, ViewBar, ViewContent};
-use crate::ui::button::Button;
-use crate::ui::icon::Icon;
-use crate::ui::inputs::Choice;
-use crate::ui::text::{Mark, Tone};
+use crate::settings::{exact_delay::ExactDelay, port::*, words::w, widgets, PageState};
+use crate::shell::{Ask, ViewBar, ViewContent, WindowContent};
+use crate::ui::theme::{size, Theme};
 
-use super::parts::{choices, field_line, gap, marked, sentence, sentence_links, slider_line, switch_line, thin};
-use crate::settings::port::*;
-use crate::settings::words::{self, w};
-use crate::settings::{Dialog, PasswordDialog, ReportDialog};
-use crate::settings::{PageState, SettingsPort};
+use super::parts::{page_button, page_link, buttons, edit_field, gap, plain, sentence, slider_line, switch_line, thin};
 
-/// A speaker's options: one view per row, so a speaker reached two ways
-/// has two.
 pub struct SpeakerOptions {
     port: Arc<dyn SettingsPort>,
     id: String,
-    delay: crate::panel::delay_block::BlockState,
+    exact_delay: Option<(WayChoice, ExactDelay)>,
     st: PageState,
-    /// *Forget* was clicked: the view asks first.
-    forget_asked: bool,
-    /// The speaker left the list (removed): back once.
+    saved_at: Option<f64>,
     gone: bool,
-}
-
-/// What the bar's one button does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BarButton {
-    TestSound,
-    PlayHere,
-    SearchAgain,
 }
 
 impl SpeakerOptions {
     pub fn new(port: Arc<dyn SettingsPort>, id: &str) -> Self {
-        SpeakerOptions { port, id: id.to_string(), delay: Default::default(), st: PageState::default(), forget_asked: false, gone: false }
+        Self { port, id: id.into(), exact_delay: None, st: PageState::default(), saved_at: None, gone: false }
     }
 
-    /// With the amount field of the delay open (pictures).
-    pub fn with_amount(mut self, digits: &str) -> Self {
-        self.delay = crate::panel::delay_block::BlockState::with_amount(digits);
-        self
+    pub(super) fn open_exact_delay(&mut self, way: &crate::model::scene::WaySeen) {
+        self.exact_delay = Some((way.way, ExactDelay::new(way.delay)));
     }
 
-    /// Asking whether to forget it (pictures).
-    pub fn asking_to_forget(mut self) -> Self {
-        self.forget_asked = true;
-        self
-    }
-
-    /// With all bands, or the details, open (pictures and tests).
     pub fn with_open(mut self, fold: &str) -> Self {
-        self.st.open.insert(fold.to_string());
+        self.st.open.insert(fold.into());
         self
     }
 
-    fn sid(&self) -> SpeakerId {
-        SpeakerId::new(&self.id)
+    fn row<'a>(&self, snap: &'a Snapshot) -> Option<&'a Row> {
+        let list = &snap.panel.list;
+        list.rows.iter().chain(list.more.iter().flat_map(|fold| &fold.rows))
+            .find(|r| r.place.speaker().is_some_and(|id| id.as_str() == self.id))
     }
 
-    fn button(&self, v: &SpeakerView) -> Option<BarButton> {
-        match v.row.presence {
-            // While this speaker is the place: hear it.
-            Presence::PlayingNow | Presence::Ready => v.test_sound.map(|_| BarButton::TestSound),
-            Presence::NotFound { .. } => Some(BarButton::SearchAgain),
-            Presence::Connecting => None,
-            Presence::Available => v.row.cant_play.is_none().then_some(BarButton::PlayHere),
-        }
-    }
-}
-
-/// *Sonos · playing now*: the kind and the state.
-fn kind_and_state(lang: Lang, row: &SpeakerRow) -> String {
-    let kind = words::kind_short(lang, &row.kind);
-    let state = match &row.presence {
-        Presence::PlayingNow => Some(w!(lang, SetStatePlaying)),
-        Presence::Ready => Some(w!(lang, SetStateReady)),
-        Presence::Connecting => Some(w!(lang, SetStateConnecting)),
-        Presence::NotFound { .. } => Some(w!(lang, SetStateNotFound)),
-        Presence::Available => None,
-    };
-    match state {
-        Some(s) => w!(lang, SetKindStatus, kind = &kind, status = &s),
-        None => kind,
+    fn playing(&self, snap: &Snapshot) -> bool {
+        snap.scene.situation.place_speaker() == Some(&SpeakerId::new(&self.id)) && snap.scene.situation.doing == Doing::Playing
     }
 }
 
 impl ViewContent for SpeakerOptions {
     fn bar(&self, snap: &Snapshot) -> ViewBar {
-        let lang = self.port.lang();
-        let Some(v) = self.port.speaker(&self.id) else {
-            let name = snap.names.iter().find(|(i, _)| i.as_str() == self.id).map(|(_, n)| n.clone()).unwrap_or_else(|| self.id.clone());
-            return ViewBar { title: name, ..Default::default() };
-        };
-        let button = self.button(&v).map(|b| match b {
-            BarButton::TestSound => w!(lang, SetTestSoundButton),
-            BarButton::PlayHere => w!(lang, SetPlayHere),
-            BarButton::SearchAgain => w!(lang, SetSearchAgain),
-        });
-        ViewBar { title: v.row.name.clone(), line: Some(kind_and_state(lang, &v.row)), button }
-    }
-
-    fn bar_button(&mut self, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) {
-        let Some(v) = self.port.speaker(&self.id) else { return };
-        match self.button(&v) {
-            Some(BarButton::TestSound) => ask(Ask::Command(Command::PlayTestSound(self.sid()))),
-            // What a click on the speaker's row does.
-            Some(BarButton::PlayHere) => {
-                let place = Place::Speaker(self.sid());
-                let command = snap.list.rows().find(|r| r.place == place).and_then(|r| r.command.clone()).unwrap_or(Command::Play(place));
-                ask(Ask::Command(command));
-            }
-            Some(BarButton::SearchAgain) => self.port.act(Act::SearchAgain),
-            None => {}
-        }
+        let row = self.row(snap);
+        let lang = snap.lang;
+        let v = self.port.speaker(&self.id);
+        let title = v.as_ref().map(|v| v.row.name.clone()).unwrap_or_else(|| snap.scene.speaker_name(&SpeakerId::new(&self.id)));
+        let line = if self.playing(snap) { Some(w!(lang, Playing)) }
+            else if let Some(row) = row { row.text.clone() }
+            else if v.is_some_and(|v| matches!(v.row.presence, Presence::NotFound { .. })) { Some(w!(lang, RowNotFoundShort)) }
+            else { None };
+        ViewBar { title, line, button: None }
     }
 
     fn show(&mut self, ui: &mut Ui, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) {
-        let lang = self.port.lang();
-        ui.spacing_mut().item_spacing.y = 6.0;
+        let lang = snap.lang;
+        ui.spacing_mut().item_spacing.y = 8.0;
         let Some(v) = self.port.speaker(&self.id) else {
             sentence(ui, &w!(lang, SetSpeakerGone));
-            if !self.gone {
-                self.gone = true;
-                ask(Ask::Back);
-            }
+            if !self.gone { self.gone = true; ask(Ask::Back); }
             return;
         };
-        let id = self.id.clone();
-        let name = v.row.name.clone();
-
-        // A code or a password, while the speaker asks for one.
-        if let NowState::NeedsSecret { speaker, secret } = &snap.state {
-            if speaker.as_str() == id {
-                let label = match secret {
-                    Secret::Code => w!(lang, SetEnterCode),
-                    Secret::Password => w!(lang, SetEnterPassword),
-                };
-                if Button::primary(&label).show(ui).clicked() {
-                    ask(Ask::Open(Open::Pair(self.sid())));
-                }
-                gap(ui);
-            }
-        }
-        if v.row.untested
-            && marked(ui, Mark::Warning, Tone::Primary, &w!(lang, SetUntestedPairShort, speaker = &name), &[&w!(lang, SetReportProblem)]).is_some()
-        {
-            super::open_dialog(&self.port, Dialog::Report(ReportDialog::default()), ask);
-        }
-
-        // The delay: the panel's block, the same value.
-        if let Some(d) = &v.delay {
-            self.delay_part(ui, lang, &v, d, ask);
-        }
-        if let Some(g) = &v.group {
-            gap(ui);
-            sentence(ui, &group_words(lang, &name, g));
-        }
-
-        // Tone and the loudest level.
-        if v.tone.is_some() || v.volume_limit.is_some() {
-            thin(ui);
-        }
-        if let Some((bass, treble)) = v.tone {
-            self.tone_part(ui, lang, bass, treble);
-        }
-        if let Some(limit) = v.volume_limit {
-            let shown = if limit >= 100 { w!(lang, SetNoLimit) } else { limit.to_string() };
-            let label = w!(lang, SetNeverLouder);
-            let spoken = if limit >= 100 { w!(lang, SetSpokenNoLimit, what = &label) } else { w!(lang, SetSpokenLevel, what = &label, level = limit) };
-            if let Some(n) = slider_line(ui, &label, &shown, limit as f32, 0.0..=100.0, 1.0, &spoken) {
-                self.port.act(Act::VolumeLimit(id.clone(), n.round() as u8));
-            }
-        }
-
-        // Song titles, coming back, the name here.
-        thin(ui);
-        if let Some(on) = v.song_titles {
-            if let Some(on) = switch_line(ui, &w!(lang, SetSongTitles, speaker = &name), on) {
-                self.port.act(Act::SongTitles(id.clone(), on));
-            }
-            gap(ui);
-        }
-        if let Some(cb) = v.comes_back {
-            let answers = [w!(lang, SetMoveResume, speaker = &name), w!(lang, SetMoveWhenOn, speaker = &name), w!(lang, SetMoveNever)];
-            let chosen = match cb {
-                ComesBack::WhenLastChosen => 0,
-                ComesBack::WhenItAppears => 1,
-                ComesBack::Never => 2,
-            };
-            if let Some(i) = choices(ui, &w!(lang, SetMoveAutomatically, speaker = &name), &answers, chosen) {
-                self.port.act(Act::ComesBack(id.clone(), [ComesBack::WhenLastChosen, ComesBack::WhenItAppears, ComesBack::Never][i]));
-            }
-            gap(ui);
-        }
-        if let Some(shown) = &v.show_as {
-            if let Some(n) = field_line(ui, &mut self.st, "name-here", &w!(lang, SetNameInApp), shown) {
-                self.port.act(Act::ShowAs(id.clone(), n));
-            }
-            gap(ui);
-        }
-        // While it asks for a code it isn't paired any more: *Enter code…*
-        // above says what to do.
-        let asks_code = matches!(&snap.state, NowState::NeedsSecret { speaker, secret: Secret::Code } if speaker.as_str() == id);
-        match &v.pairing {
-            Some(Pairing::Paired { .. }) if asks_code => {}
-            Some(Pairing::Paired { on }) => {
-                let text = match on {
-                    Some(d) => w!(lang, SetPairedSentenceOn, date = &words::date(lang, *d)),
-                    None => w!(lang, SetPairedSentence),
-                };
-                match sentence_links(ui, &text, &[&w!(lang, SetPairAgain), &w!(lang, SetForgetPairing)]) {
-                    Some(0) => self.port.act(Act::PairAgain(id.clone())),
-                    Some(_) => self.port.act(Act::ForgetPairing(id.clone())),
-                    None => {}
-                }
-            }
-            Some(Pairing::PasswordSaved) => match sentence_links(ui, &w!(lang, SetPasswordSavedSentence), &[&w!(lang, SetChange), &w!(lang, SetRemove)]) {
-                Some(0) => super::open_dialog(&self.port, Dialog::Password(PasswordDialog::change(&id, &name)), ask),
-                Some(_) => self.port.act(Act::RemovePassword(id.clone())),
-                None => {}
-            },
-            None => {}
-        }
-
-        // Details and forgetting, opened from the links at the bottom.
-        if self.st.is_open("details") {
-            thin(ui);
-            self.details_part(ui, lang, &v);
-        }
-        if self.forget_asked {
-            thin(ui);
-            let (question, confirm) = if v.row.added_by_address {
-                (w!(lang, SetRemoveAsk, speaker = &name), w!(lang, SetRemoveNamed, speaker = &name))
+        let id = SpeakerId::new(&self.id);
+        let name = v.row.name.as_str();
+        let row = self.row(snap);
+        let missing = row.map_or(matches!(v.row.presence, Presence::NotFound { .. }), |r| r.state == RowState::NotFound);
+        let here = snap.scene.situation.place_speaker() == Some(&id);
+        let chime = w!(lang, PlayTestChime);
+        buttons(ui, |ui| {
+            if missing {
+                if page_button(&w!(lang, SetSearchAgain)).show(ui).clicked() { self.port.act(Act::SearchAgain); }
             } else {
-                (w!(lang, SetForgetAsk, speaker = &name), w!(lang, SetForgetNamed, speaker = &name))
-            };
-            marked(ui, Mark::Warning, Tone::Primary, &question, &[]);
-            let confirm_short = w!(lang, SetForgetThis);
-            super::parts::buttons(ui, |ui| {
-                let label = crate::settings::widgets::fitting(ui, &confirm, &confirm_short);
-                let r = Button::danger(label).accessible_name(confirm.clone()).show(ui);
-                if r.clicked() {
-                    self.port.act(if v.row.added_by_address { Act::Remove(id.clone()) } else { Act::Forget(id.clone()) });
-                    self.forget_asked = false;
+                if !here {
+                    let command = row.and_then(|r| r.command.as_ref());
+                    let label = w!(lang, SwitchToSpeaker, speaker = name);
+                    let short = w!(lang, SetSwitch);
+                    let font = Theme::of(ui.ctx()).font(size::BODY);
+                    let pair_width = ui.fonts(|fonts| [&label, &chime].into_iter().map(|s|
+                        fonts.layout_no_wrap(s.clone(), font.clone(), egui::Color32::PLACEHOLDER).size().x
+                    ).sum::<f32>()) + 4.0 * crate::ui::theme::space::M + 8.0;
+                    let label_fit = if pair_width <= ui.available_width() { &label } else { &short };
+                    if page_button(label_fit).accessible_name(&label).enabled(command.is_some()).show(ui).clicked() {
+                        ask(Ask::Command(command.unwrap().clone()));
+                    }
                 }
-                if Button::standard(&w!(lang, SetCancel)).show(ui).clicked() {
-                    self.forget_asked = false;
+                if page_button(&chime).show(ui).on_hover_text(w!(lang, SetChimeTip, speaker = name)).clicked() {
+                    ask(Ask::Command(Command::PlayChime { speaker: id.clone(), confirmed: false }));
                 }
-                r.scroll_to_me(None);
-            });
-        }
-    }
-
-    fn has_links(&self, _snap: &Snapshot) -> bool {
-        self.port.speaker(&self.id).is_some()
-    }
-
-    fn links(&mut self, ui: &mut Ui, _snap: &Snapshot, _ask: &mut dyn FnMut(Ask)) {
-        let lang = self.port.lang();
-        let Some(v) = self.port.speaker(&self.id) else { return };
-        let hidden = self.port.speakers().hidden.iter().any(|r| r.id == self.id);
-        if Button::link(&w!(lang, SetDetails)).show(ui).clicked() {
-            self.st.toggle("details");
-        }
-        let hide = if hidden { w!(lang, SetShowInList) } else { w!(lang, SetHideFromList) };
-        if Button::link(&hide).show(ui).clicked() {
-            self.port.act(if hidden { Act::ShowSpeaker(self.id.clone()) } else { Act::HideSpeaker(self.id.clone()) });
-        }
-        let forget = if v.row.added_by_address { w!(lang, SetRemove) } else { w!(lang, SetForget) };
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if super::parts::red_link(ui, &forget).clicked() {
-                self.forget_asked = true;
             }
         });
+
+        // The engine can discover that a speaker is busy after the initial click.
+        if let Some(q) = snap.scene.situation.confirm_in_panel.as_ref().filter(|q| q.speaker() == &id) {
+            if let About::Question(question) = &snap.panel.about {
+                let text = if matches!(q, Confirm::ChimeBusy { .. }) { w!(lang, SetChimeBusy, speaker = name) }
+                    else { format!("{} {}", question.title, question.sentence) };
+                egui::Frame::none().fill(widgets::tint(ui)).inner_margin(12.0).show(ui, |ui| {
+                    plain(ui, &text);
+                    buttons(ui, |ui| {
+                        for a in [&question.yes, &question.no] {
+                            if page_button(&a.label).show(ui).clicked() { ask(Ask::Command(a.command.clone())); }
+                        }
+                    });
+                });
+            }
+        }
+        if let Some(secret) = snap.scene.situation.secret_for(&id) {
+            let label = match secret { Secret::Code => w!(lang, SetEnterCode), Secret::Password => w!(lang, SetEnterPassword) };
+            if page_button(&label).show(ui).clicked() { ask(Ask::Open(Open::Pair(id.clone()))); }
+        }
+        let about = panel::delay_about(&snap.scene, &id);
+        thin(ui);
+        widgets::strong(ui, &w!(lang, DelayLabel), size::BODY);
+        if let About::Delay(d) = &about {
+            for c in crate::surface::panel::page_delay(ui, &about) { ask(Ask::Command(c)); }
+            let way = snap.scene.speaker(&id).and_then(|s| s.ways.iter().find(|w| w.way == s.way && w.applies != Applies::Fixed));
+            if let Some(way) = way {
+                if self.exact_delay.as_ref().is_some_and(|(opened, _)| *opened != way.way) {
+                    self.exact_delay = None;
+                }
+                ui.add_enabled_ui(!d.dimmed, |ui| {
+                    if let Some((_, editor)) = &mut self.exact_delay {
+                        let (close, step) = editor.show(ui, lang, way.delay.own_ms);
+                        if let Some(step) = step { ask(Ask::Command(Command::ChangeDelay { speaker: id.clone(), step })); }
+                        if close { self.exact_delay = None; }
+                    } else if page_link(&w!(lang, SetExactDelay)).show(ui).clicked() {
+                        self.open_exact_delay(way);
+                    }
+                    if way.delay.change_ms != 0 && page_link(&w!(lang, SetDefaultDelay, ms = way.delay.own_ms)).show(ui).clicked() {
+                        ask(Ask::Command(Command::ChangeDelay { speaker: id.clone(), step: DelayStep::Reset }));
+                        self.exact_delay = None;
+                    }
+                });
+            } else {
+                self.exact_delay = None;
+            }
+        } else {
+            self.exact_delay = None;
+        }
+        if let Some(k) = self.port.general().shortcuts {
+            let label = if k.on { w!(lang, SetDelayKeysOn, remove = &k.remove.join("+"), add = &k.add.join("+")) }
+                else { w!(lang, SetDelayKeysLink) };
+            if super::parts::wrapped_link(ui, &label).clicked() { ask(Ask::Open(Open::Settings)); }
+        }
+        if !self.playing(snap) { widgets::note(ui, &w!(lang, SetInactiveDelay, speaker = name)); }
+        if let Some((bass, treble)) = v.tone {
+            thin(ui);
+            widgets::strong(ui, &w!(lang, SetTone), size::BODY);
+            self.tone_part(ui, lang, name, bass, treble);
+        }
+
+        thin(ui);
+        if let Some(limit) = v.volume_limit {
+            let label = w!(lang, SetVolumeLimit);
+            plain(ui, &label);
+            let spoken = w!(lang, SetSpokenLevel, what = &label, level = limit);
+            if let Some(n) = slider_line(ui, "", &limit.to_string(), limit as f32, 0.0..=100.0, 1.0, &spoken) {
+                self.port.act(Act::VolumeLimit(self.id.clone(), n.round() as u8));
+            }
+            widgets::note(ui, &w!(lang, SetVolumeLimitLine, speaker = name));
+            gap(ui);
+        }
+        if let Some(on) = v.song_titles {
+            if let Some(on) = switch_line(ui, &w!(lang, SetSongTitles, speaker = name), on) { self.port.act(Act::SongTitles(self.id.clone(), on)); }
+            widgets::note(ui, &w!(lang, SetTitlesLine, speaker = name));
+            gap(ui);
+        }
+        for r in self.port.privacy().refused.iter().flatten().filter(|r| r.group_of.as_ref().is_some_and(|(id, _)| id == &self.id)) {
+            super::settings_list::refused(ui, self.port.as_ref(), r);
+        }
+        if let Some(value) = &v.show_as {
+            let label = w!(lang, SetNameInApp);
+            ui.horizontal(|ui| {
+                plain(ui, &label);
+                if self.saved_at.is_some_and(|at| ui.input(|i| i.time) - at < 2.0) {
+                    widgets::note(ui, &w!(lang, SetNameSaved));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            });
+            if let Some(n) = edit_field(ui, &mut self.st, "name-here", &label, value) {
+                self.port.act(Act::ShowAs(self.id.clone(), n));
+                self.saved_at = Some(ui.input(|i| i.time));
+            }
+        }
+        thin(ui);
+        let remove = missing || v.row.added_by_address;
+        let hidden = self.port.speakers().hidden.iter().any(|r| r.id == self.id);
+        buttons(ui, |ui| {
+            if !remove && page_button(&w!(lang, SetResetSettings)).show(ui).clicked() {
+                ask(Ask::Dialog(Box::new(ConfirmSettings { port: self.port.clone(), id: id.clone(), name: name.into(), remove: false })));
+            }
+            let hide = if hidden { w!(lang, SetShowInList) } else { w!(lang, SetHideFromList) };
+            if page_button(&hide).show(ui).clicked() {
+                self.port.act(if hidden { Act::ShowSpeaker(self.id.clone()) } else { Act::HideSpeaker(self.id.clone()) });
+            }
+            if remove {
+                let label = w!(lang, SetRemoveNamed, speaker = name);
+                let short = w!(lang, SetRemove);
+                if page_button(widgets::fitting(ui, &label, &short)).accessible_name(&label).show(ui).clicked() {
+                    ask(Ask::Dialog(Box::new(ConfirmSettings { port: self.port.clone(), id: id.clone(), name: name.into(), remove: true })));
+                }
+            }
+        });
+        widgets::note(ui, &w!(lang, SetHiddenHelp));
+        if page_link(&w!(lang, SetTechnicalDetails)).show(ui).clicked() { self.st.toggle("details"); }
+        if self.st.is_open("details") {
+            let mut lines = Vec::new();
+            if let Some(m) = &v.details.model { lines.push(w!(lang, SetDetailModel, value = m)); }
+            if let Some(a) = &v.details.address { lines.push(w!(lang, SetDetailAddress, value = a)); }
+            if let Some(c) = &v.details.connection { lines.push(w!(lang, SetDetailConnection, value = c)); }
+            let text = lines.join("\n");
+            widgets::mono(ui, &text);
+            widgets::copy_button(ui, &mut self.st, "details", &w!(lang, SetCopy), &w!(lang, SetCopied), &text);
+        }
     }
 
     fn holds_unused_text(&self) -> bool {
-        self.port.speaker(&self.id).and_then(|v| v.show_as).is_some_and(|shown| self.st.typing.get("name-here").is_some_and(|t| t.trim() != shown))
+        self.exact_delay.as_ref().is_some_and(|(_, editor)| editor.has_edit()) || self.port.speaker(&self.id).and_then(|v| v.show_as)
+            .is_some_and(|shown| self.st.typing.get("name-here").is_some_and(|t| t.trim() != shown))
+    }
+}
+
+pub(super) struct ConfirmSettings {
+    pub port: Arc<dyn SettingsPort>,
+    pub id: SpeakerId,
+    pub name: String,
+    pub remove: bool,
+}
+
+impl WindowContent for ConfirmSettings {
+    fn title(&self, snap: &Snapshot) -> String { w!(snap.lang, AppName) }
+    fn sizes(&self) -> (egui::Vec2, egui::Vec2) { (egui::vec2(420.0, 260.0), egui::vec2(320.0, 220.0)) }
+    fn show(&mut self, ctx: &egui::Context, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) -> bool {
+        let lang = snap.lang;
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(Theme::of(ctx).c.surface)).show(ctx, |ui| {
+            let mut footer = crate::settings::dialogs::frame(ui, |ui| {
+                let text = if self.remove { w!(lang, SetRemoveQuestion, speaker = &self.name) } else { w!(lang, SetResetQuestion, speaker = &self.name) };
+                plain(ui, &text);
+                if self.remove && snap.scene.situation.place_speaker() == Some(&self.id) { plain(ui, &w!(lang, SetRemovalToPc)); }
+            });
+            let label = if self.remove { w!(lang, SetRemove) } else { w!(lang, Reset) };
+            if page_button(&label).show(&mut footer).clicked() {
+                self.port.act(Act::ClearSpeakerCredentials(self.id.as_str().into()));
+                ask(Ask::Command(if self.remove { Command::RemoveSpeaker(self.id.clone()) } else { Command::ResetSpeaker(self.id.clone()) }));
+                return true;
+            }
+            page_button(&w!(lang, SetCancel)).show(&mut footer).clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        }).inner
     }
 }
 
 impl SpeakerOptions {
-    /// The choice of an AirPlay speaker, the panel's delay block, what the
-    /// speaker's own delay is, and the hint that tells which way helps.
-    fn delay_part(&mut self, ui: &mut Ui, lang: Lang, v: &SpeakerView, d: &DelayCard, ask: &mut dyn FnMut(Ask)) {
-        let s = &d.status;
-        let name = v.row.name.as_str();
-        if let Some(choice) = s.choice {
-            let steady = w!(lang, SetChoiceSteady);
-            let short = w!(lang, SetChoiceShort);
-            let steady_line = w!(lang, SetChoiceSteadyLine, seconds = words::seconds(s.steady_ms));
-            let short_line = w!(lang, SetChoiceShortLine, seconds = words::seconds(s.short_ms));
-            let mut pick = None;
-            if Choice::new(choice == DelayChoice::Steady, &steady).description(&steady_line).show(ui) {
-                pick = Some(crate::model::facts::DelayChoice::Steady);
-            }
-            if Choice::new(choice == DelayChoice::Short, &short).description(&short_line).show(ui) {
-                pick = Some(crate::model::facts::DelayChoice::Short);
-            }
-            if let Some(c) = pick {
-                ask(Ask::Command(Command::UseDelayChoice { speaker: self.sid(), choice: c }));
-            }
-            sentence(ui, &w!(lang, SetChoiceReconnects, speaker = name));
-            gap(ui);
-        }
-        if let Some((block, view)) = panel_delay_for(lang, &self.id, name, d) {
-            for c in crate::panel::delay_block::block(ui, lang, &block, Some(&view), &mut self.delay).commands {
-                ask(Ask::Command(c));
-            }
-        }
-        match v.row.kind {
-            SpeakerKind::Sonos | SpeakerKind::SonosGroup | SpeakerKind::Other { .. } => {
-                gap(ui);
-                sentence(ui, &w!(lang, SetOwnDelay, speaker = name, delay = &words::about(lang, s.own_delay_ms)));
-            }
-            // Why *Remove* can't be pressed.
-            SpeakerKind::Sendspin => {
-                gap(ui);
-                sentence(ui, &format!("{} {}", w!(lang, SetOwnDelay, speaker = name, delay = &words::about(lang, s.own_delay_ms)), w!(lang, SetSendspinOwn)));
-            }
-            SpeakerKind::HomePodPair => {
-                gap(ui);
-                sentence(ui, &w!(lang, SetPairAlwaysShort, delay = &words::about(lang, s.own_delay_ms)));
-            }
-            _ => {}
-        }
-        if let Some((ms, on)) = d.measured {
-            let seconds = lang.number(crate::model::text::Number { value: ((ms + 5) / 10) as i64, scale: 2 });
-            sentence(ui, &w!(lang, SetMeasuredOn, speaker = name, seconds = &seconds, date = &words::date(lang, on)));
-        }
-        // The hint names both ways: only where both are open.
-        let changeable = s.applies.is_ok() && s.limits.is_some_and(|l| l.remove_ms > 0 && l.add_ms > 0);
-        if changeable {
-            sentence(ui, &w!(lang, SetSymptoms));
-        }
-    }
-
-    /// *Bass* and *Treble*, *Reset to flat* while the tone isn't flat, and
-    /// *All bands…*, which opens the ten bands here.
-    fn tone_part(&mut self, ui: &mut Ui, lang: Lang, bass: f32, treble: f32) {
-        let id = self.id.clone();
-        let tone = self.port.tone(&id);
+    fn tone_part(&mut self, ui: &mut Ui, lang: Lang, name: &str, bass: f32, treble: f32) {
         for (label, value, act) in [(w!(lang, SetBass), bass, ToneAct::Bass as fn(f32) -> ToneAct), (w!(lang, SetTreble), treble, ToneAct::Treble)] {
-            let spoken = spoken_db(lang, &label, value);
-            if let Some(db) = slider_line(ui, &label, &crate::settings::common::speaker_db(lang, value), value, -12.0..=12.0, 0.5, &spoken) {
-                self.port.act(Act::Tone(id.clone(), act(db)));
+            if let Some(db) = slider_line(ui, &label, &crate::settings::common::speaker_db(lang, value), value, -12.0..=12.0, 0.5, &spoken_db(lang, &label, value)) {
+                self.port.act(Act::Tone(self.id.clone(), act(db)));
             }
         }
-        let flat = tone.as_ref().map_or(bass == 0.0 && treble == 0.0, |t| t.eq.bands_db.iter().all(|b| *b == 0.0) && t.eq.preamp_db == 0.0);
+        widgets::note(ui, &w!(lang, SetToneLine, speaker = name));
         let open = self.st.is_open("bands");
-        let bands_link = if open { w!(lang, SetFewerBands) } else { w!(lang, SetAllBands) };
-        ui.horizontal(|ui| {
-            if !flat && Button::link(&w!(lang, SetResetFlat)).show(ui).clicked() {
-                self.port.act(Act::Tone(id.clone(), ToneAct::Flat));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if Button::link(&bands_link).show(ui).clicked() {
-                    self.st.toggle("bands");
-                }
-            });
-        });
-        if open {
-            if let Some(t) = tone {
-                self.bands(ui, lang, &t);
+        let label = if open { w!(lang, SetFewerBands) } else { w!(lang, SetMoreTone) };
+        if page_link(&label).show(ui).clicked() { self.st.toggle("bands"); }
+        if let Some(t) = self.port.tone(&self.id) {
+            if open { self.bands(ui, lang, &t); }
+            if (t.eq.bands_db.iter().any(|n| *n != 0.0) || t.eq.preamp_db != 0.0)
+                && page_button(&w!(lang, SetResetTone)).show(ui).clicked() {
+                self.port.act(Act::Tone(self.id.clone(), ToneAct::Flat));
             }
         }
     }
-
     /// The ten bands, the preamp and the presets, in place.
     fn bands(&mut self, ui: &mut Ui, lang: Lang, t: &ToneView) {
         use crate::equalizer::{EQ_BAND_HZ, EQ_PRESETS};
@@ -419,37 +316,6 @@ impl SpeakerOptions {
         }
     }
 
-    /// Model, address, the way it connects, the values behind the delay,
-    /// the last problem; *Copy*.
-    fn details_part(&mut self, ui: &mut Ui, lang: Lang, v: &SpeakerView) {
-        let d = &v.details;
-        let mut lines: Vec<String> = Vec::new();
-        if let Some(m) = &d.model {
-            lines.push(w!(lang, SetDetailModel, value = m));
-        }
-        if let Some(a) = &d.address {
-            lines.push(w!(lang, SetDetailAddress, value = a));
-        }
-        if let Some(c) = &d.connection {
-            lines.push(w!(lang, SetDetailConnection, value = c));
-        }
-        if let Some(dv) = &d.delay_values {
-            lines.push(w!(lang, SetDetailDelay, value = dv));
-        }
-        let none = w!(lang, SetDetailNone);
-        lines.push(w!(lang, SetDetailProblem, value = d.last_problem.as_deref().unwrap_or(&none)));
-        lines.push(w!(lang, SetDetailId, value = &d.id));
-        let text = lines.join("\n");
-        crate::settings::widgets::mono(ui, &text);
-        if let Some(card) = &v.delay {
-            for line in crate::settings::common::delay_details(lang, v, card) {
-                sentence(ui, &line);
-            }
-        }
-        let key = format!("details:{}", self.id);
-        crate::settings::widgets::copy_button(ui, &mut self.st, &key, &w!(lang, SetCopy), &w!(lang, SetCopied), &text);
-        let _ = Icon::Copy;
-    }
 }
 
 /// *Bass, minus 2 decibels*.
@@ -463,71 +329,4 @@ fn spoken_db(lang: Lang, what: &str, v: f32) -> String {
     } else {
         w!(lang, SetSpokenDbZero, what = what)
     }
-}
-
-/// The group's members, as a sentence.
-fn group_words(lang: Lang, name: &str, g: &Group) -> String {
-    let and = |items: &[String]| match items {
-        [] => String::new(),
-        [one] => one.clone(),
-        [rest @ .., last] => w!(lang, SetListAnd, list = &rest.join(", "), last = last),
-    };
-    match g {
-        Group::Sonos { members } => w!(lang, SetSonosGroupLine, rooms = &and(members)),
-        Group::HomePodPair { left, right } => w!(lang, SetPairLine, left = left, right = right),
-        Group::AppleTv { members } => w!(lang, SetAppleTvGroupLine, speaker = name, members = &and(members)),
-    }
-}
-
-/// The panel's delay block for this speaker, from the delay engine's
-/// status: the same block, words and commands the panel has for the
-/// speaker that plays.
-pub fn panel_delay_for(lang: Lang, id: &str, name: &str, d: &DelayCard) -> Option<(PanelDelay, crate::model::delay::DelayView)> {
-    use crate::model::facts::{Applies as A, ChoiceFacts, DelayChoice as C, DelayFacts, DelayNote as N, DelayRange, DelaySteps, Progress as P, SpeakerDelay};
-    let s = &d.status;
-    let applies = match s.applies {
-        Ok(Applies::Live) => A::Live,
-        Ok(Applies::Reconnect) => A::Reconnect,
-        Err(Unchangeable::KeptBySpeakerOnSteady) => A::Fixed,
-        Err(_) => return None,
-    };
-    let range = s.limits.map_or(DelayRange { max_removed_ms: 0, max_added_ms: 0 }, |l| DelayRange { max_removed_ms: l.remove_ms, max_added_ms: l.add_ms });
-    let choice = s.choice.map(|c| ChoiceFacts {
-        current: match c {
-            DelayChoice::Short => C::Short,
-            DelayChoice::Steady => C::Steady,
-        },
-        steady_ms: s.steady_ms,
-        short_ms: s.short_ms,
-    });
-    let progress = match s.progress {
-        Progress::Done => P::Settled,
-        Progress::CatchingUp { ms_to_go } => P::Live { to_go_ms: ms_to_go },
-        Progress::WillReconnect => P::ReconnectPending,
-        Progress::Reconnecting { .. } => P::Reconnecting,
-    };
-    let note = s.notice.map(|n| match n {
-        DelayNotice::NotAccepted { tried_ms, back_to_ms } => N::NotAccepted { tried_ms, back_to_ms },
-        DelayNotice::DroppedOut { from_ms, to_ms } => N::DroppedOut { with_ms: from_ms, back_to_ms: to_ms },
-        DelayNotice::ChoiceSwitched { other_ms, .. } => N::ChoiceSwitched { other_kept_ms: other_ms },
-    });
-    let speaker = SpeakerId::new(id);
-    let steps = DelaySteps { small_ms: d.small_step_ms, large_ms: d.large_step_ms };
-    let facts = DelayFacts { speaker: speaker.clone(), range, applies, choice, progress, note };
-    let own = d.measured.map_or(s.own_delay_ms, |(ms, _)| ms);
-    let view = crate::model::delay::DelayView {
-        speaker,
-        name: name.to_string(),
-        delay: SpeakerDelay { own_ms: own, measured: d.measured.is_some(), change_ms: s.change_ms },
-        range,
-        applies,
-        progress,
-        steps,
-        choice,
-    };
-    let reconnecting = match s.progress {
-        Progress::Reconnecting { from_ms } => Some((from_ms, s.change_ms)),
-        _ => None,
-    };
-    Some((crate::model::delay::panel_delay(lang, &view, &facts, reconnecting), view))
 }

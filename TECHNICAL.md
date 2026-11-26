@@ -119,14 +119,14 @@ stale name. `scripts\Rename-Endpoint.ps1`, run elevated, overwrites it
 |---|---|
 | *(none)* | GUI window + tray. Closing the window minimises to tray. |
 | `--no-tray` | GUI only. Closing the window exits. |
-| `--headless` | No GUI; the speaker from last time, `--player`, or (in a terminal) a prompt. For service installs and SSH; `--web-link` prints the web UI's link. |
+| `--headless` | No GUI; the last place, `--player`, or (in a terminal) a prompt. For service installs and SSH; `--web-link` prints the web UI's link. |
 | `--web` | Adds the web UI and HTTP/JSON API, behind a secret link ([HTTP API](#http-api)). Combines with any mode; with `--headless` the link is printed once at start, to a console that a service may not have. |
 | `--web-link` | Prints the web UI's link and exits (making its key if there is none yet). Run it as the account the app runs under, with the app's `--port` and `--advertise-ip`. |
 
 `/stream.raw` is always served — the speaker pulls from it: to this PC, and to
 other devices while streaming is enabled (with privacy mode on, only to the
-speaker being played on and its Sonos group). The management endpoints exist
-only under `--web`.
+speaker being played on and its Sonos group). The API is available with either control switch in Settings,
+or with `--web` ([HTTP API](#http-api)).
 
 ## Speaker selection
 
@@ -140,15 +140,15 @@ something first matches, unless someone picks another first. An address
 speaker the list shows; else part of a room inside a Sonos group; else
 part of the device's own description name (such as "Sonos One"). Among
 several: shown before hidden, a speaker's UPnP entry before its AirPlay
-one, one used before, one not set never to connect by itself, then list
-order. A partial or shared match is logged with what was taken. If
+one, then a speaker used before, then list order. A partial or shared match is logged with what was taken. If
 connecting fails, the window says so; it is tried again when it comes back
-to the list. `--list-speakers` searches,
-prints what the window would list and exits. Without `--player`, the
-speaker used last time is reconnected; `--headless` in a terminal asks with
-a numbered prompt instead (`r` searches again) when there is something to
-choose from. In that prompt the speaker used last time comes first, Enter
-takes it, and it is taken after 15 s without an answer. Under `--web`,
+to the list. `--list-speakers` searches, prints every way to reach each
+speaker, including hidden speakers, and exits. At startup the engine
+restores the last place. Without `--player`, a headless run in a terminal
+also offers a numbered prompt when there is something to choose from
+(`r` searches again). The speaker used last time comes first when listed.
+Enter takes it. After 15 s without an answer to that offer, the place stays
+as it was. When API access is on, switch with
 `POST /api/select` with `{"id": "<udn-or-ip>"}` and the API key
 ([HTTP API](#http-api)). Discovery re-runs every `--ssdp-interval` minutes.
 
@@ -267,41 +267,44 @@ off.
 
 ## HTTP API
 
-`--web` (or **Enable web UI** in the window) turns on a status page and the
-JSON API. Both need the web UI's link, `http://<host>:5901/r/<key>/`. The
-window's *Web UI* card shows it (*Copy link*, *Open in browser*); a
-`--headless --web` run prints it once to standard output when it starts, and
-never writes it to the log. Headless and service installs get it with
-`stream-to-speaker.exe --web-link`, which prints the link and exits: run it as
-the account the app runs under (the key is in that account's `config.json`),
-with the app's `--port` and `--advertise-ip` if it has them. `<key>` is 32 hex
-digits from the system's random source, made the first time the web UI is
-turned on (or `--web-link` runs) and kept in `config.json` (sealed with DPAPI,
-like the other stored secrets). **Make a new link** replaces it; the old link
-and key stop working at once. Anyone with the link can control the app on the
-network.
+In Settings, turn on **Let scripts and home automation control this app**
+and choose **Copy key**. Send the key in the HTTP authorization header.
+**Make a new key** immediately retires the previous scripts key.
 
-| Endpoint | Method | Effect | Always on |
+**Control from your phone** in Settings, or `--web` at launch, enables the
+status page and JSON API using a phone link, `http://<host>:5901/r/<key>/`.
+Scan the QR code or choose **Copy link**. A `--headless --web` run prints
+the link to standard output once at startup. For a service, run
+`stream-to-speaker.exe --web-link` under its Windows account with the same
+`--port` and `--advertise-ip` options. **Make a new link** immediately
+retires the previous phone link. The phone link and scripts key rotate
+independently. Both credentials use 32 random hex digits and are sealed
+with DPAPI in the account's `config.json`. Anyone holding an enabled
+credential can control the app on this network.
+
+| Endpoint | Method | Effect | Available with |
 |---|---|---|---|
 | `/stream.raw` | GET | Raw PCM the speaker pulls. | yes |
-| `/r/<key>/` | GET | The status page (its script: `/r/<key>/app.js`). | `--web` |
-| `/api/speakers` | GET | Discovered speakers. | `--web` |
-| `/api/select` | POST | `{"id": "<udn-or-ip>"}` with `Content-Type: application/json` — switch speaker. | `--web` |
-| `/api/resync` | POST | Restart the session. | `--web` |
-| `/api/latency/adjust?ms=N` | POST | `N>0` drains, `N<0` pads. | `--web` |
+| `/r/<key>/` | GET | The status page (its script: `/r/<key>/app.js`). | phone control or `--web` |
+| `/api/speakers` | GET | Discovered speakers. | scripts, phone control or `--web` |
+| `/api/select` | POST | `{"id": "<udn-or-ip>"}` with `Content-Type: application/json` — switch speaker. | scripts, phone control or `--web` |
+| `/api/resync` | POST | Restart the session. | scripts, phone control or `--web` |
+| `/api/latency/adjust?ms=N` | POST | `N>0` drains, `N<0` pads. | scripts, phone control or `--web` |
 | `/healthz` | GET | Returns `ok`. | yes |
 
-Every `/api/*` request needs the key as a bearer token,
-`Authorization: Bearer <key>`; without it, or with a wrong one, the answer is
-`401` with a JSON `error`. Scripts send it like this:
+With phone and script access both off, API routes return `404` before checking
+a key. With either on, send an enabled scripts or phone key in the
+`Authorization: Bearer <key>` header. An incorrect or missing key returns
+`401` with a JSON `error`.
 
 ```bash
-KEY=...   # the part of the web UI's link after /r/ (32 hex digits), from the window or --web-link
+KEY=...   # Copy key in Settings, or the 32 hex digits after /r/ in the phone link
 curl -H "Authorization: Bearer $KEY" http://localhost:5901/api/speakers
 curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
      -d '{"id":"uuid:RINCON_..."}' http://localhost:5901/api/select
 ```
 
+With phone control off the page returns `404`. With it on,
 `/`, `/app.js` and a link with a wrong key answer `401` with a page saying where to find the link. Pages under `/r/` are sent
 with `Referrer-Policy: no-referrer` and `Cache-Control: no-store`, and the key
 is replaced by `<key>` wherever a request path is logged.
@@ -349,7 +352,7 @@ StreamToSpeaker/
     ├── audio_source.rs  source abstraction
     ├── ioctl_source.rs  driver IOCTL consumer (audio + events)
     ├── wasapi_source.rs loopback fallback · sine_source.rs  test tone
-    ├── gui.rs           eframe/egui window · tray.rs  tray icon + menu
+    ├── shell/           eframe/egui windows · tray.rs  tray icon + menu
     ├── picker.rs        terminal picker (--headless)
     ├── http_server.rs   /stream.raw + /api/*
     ├── ssdp.rs          discovery · upnp.rs  SOAP + DIDL · gena.rs  events

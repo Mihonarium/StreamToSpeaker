@@ -22,13 +22,14 @@ pub struct Slider<'a> {
     tick: Option<f32>,
     max_allowed: Option<f32>,
     faint: bool,
+    flyout: bool,
 }
 
 impl<'a> Slider<'a> {
     /// `name` is what it sets, for readers of the display (*Kitchen's
     /// volume*, *Bass*).
     pub fn new(value: f32, range: std::ops::RangeInclusive<f32>, name: &'a str) -> Self {
-        Slider { value, range, step: 1.0, name, tick: None, max_allowed: None, faint: false }
+        Slider { value, range, step: 1.0, name, tick: None, max_allowed: None, faint: false, flyout: false }
     }
 
     /// The unit a key press moves (1 by default); values snap to it.
@@ -55,12 +56,20 @@ impl<'a> Slider<'a> {
         self
     }
 
+    /// Align the track with thumb travel. A track press seeks immediately,
+    /// while grabbing the thumb preserves the pointer’s offset.
+    pub(crate) fn flyout(mut self) -> Self {
+        self.flyout = true;
+        self
+    }
+
     /// Draw it across the available width, 20 points tall; the new value
     /// while the person drags, clicks or uses the keys.
     pub fn show(self, ui: &mut Ui) -> Option<f32> {
         let t = Theme::of(ui.ctx());
-        let (track, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), Sense::click_and_drag());
-        resp.widget_info(|| WidgetInfo::slider(true, self.value as f64, self.name));
+        let sense = if self.flyout && !ui.is_enabled() { Sense::hover() } else { Sense::click_and_drag() };
+        let (track, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), sense);
+        resp.widget_info(|| WidgetInfo::slider(!self.flyout || ui.is_enabled(), self.value as f64, self.name));
         let (lo, hi) = (*self.range.start(), *self.range.end());
         let top = self.max_allowed.unwrap_or(hi).min(hi);
         let snap = |v: f32| ((v / self.step).round() * self.step).clamp(lo, top);
@@ -69,13 +78,19 @@ impl<'a> Slider<'a> {
         let frac = |v: f32| if hi > lo { (v - lo) / (hi - lo) } else { 0.0 };
         let x_of = |v: f32| x0 + (x1 - x0) * frac(v).clamp(0.0, 1.0);
         let mut out = None;
-        if let Some(p) = resp.interact_pointer_pos() {
-            if resp.dragged() || resp.clicked() || resp.is_pointer_button_down_on() {
-                let f = ((p.x - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
-                let to = snap(lo + f * (hi - lo));
-                if to != self.value {
-                    out = Some(to);
-                }
+        let pointer_x = if self.flyout {
+            let center = egui::pos2(ui.painter().round_to_pixel(x_of(self.value)), track.center().y);
+            flyout_pointer_x(ui, &resp, center)
+        } else {
+            resp.interact_pointer_pos()
+                .filter(|_| resp.dragged() || resp.clicked() || resp.is_pointer_button_down_on())
+                .map(|p| p.x)
+        };
+        if let Some(x) = pointer_x {
+            let f = ((x - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
+            let to = snap(lo + f * (hi - lo));
+            if to != self.value {
+                out = Some(to);
             }
         }
         if resp.has_focus() {
@@ -107,17 +122,27 @@ impl<'a> Slider<'a> {
         let l = look_as(ui, &resp, self.name);
         let p = ui.painter();
         let cy = track.center().y;
-        let bar = |from: f32, to: f32| Rect::from_min_max(egui::pos2(from, cy - 2.0), egui::pos2(to, cy + 2.0));
-        let thumb_x = x_of(self.value);
+        let bar = |from: f32, to: f32| {
+            let r = Rect::from_min_max(egui::pos2(from, cy - 2.0), egui::pos2(to, cy + 2.0));
+            if self.flyout { p.round_rect_to_pixels(r) } else { r }
+        };
+        let thumb_x = if self.flyout { p.round_to_pixel(x_of(out.unwrap_or(self.value))) } else { x_of(self.value) };
         let fill = if self.faint { t.c.text_disabled } else { t.c.accent };
-        p.rect_filled(bar(track.left(), track.right()), 2.0, t.c.track);
-        p.rect_filled(bar(track.left(), thumb_x), 2.0, fill);
+        let (left, right) = if self.flyout { (x0, x1) } else { (track.left(), track.right()) };
+        p.rect_filled(bar(left, right), 2.0, t.c.track);
+        p.rect_filled(bar(left, thumb_x), 2.0, fill);
         if let Some(at) = self.tick {
-            p.rect_filled(Rect::from_center_size(egui::pos2(x_of(at), cy), Vec2::new(2.0, 14.0)), 1.0, t.c.text_secondary);
+            let mut tick = Rect::from_center_size(egui::pos2(x_of(at), cy), Vec2::new(2.0, 14.0));
+            if self.flyout {
+                // Remains visible below the thumb when the level is at its limit.
+                tick.max.y = cy + 14.0;
+                tick = p.round_rect_to_pixels(tick);
+            }
+            p.rect_filled(tick, 1.0, t.c.text_secondary);
         }
         let thumb = egui::pos2(thumb_x, cy);
         p.circle_filled(thumb + Vec2::new(0.0, 0.5), 10.5, t.c.card_border);
-        p.circle(thumb, 10.0, t.c.control, Stroke::new(1.0_f32, t.c.control_border));
+        p.circle(thumb, 10.0, if self.flyout { t.c.card } else { t.c.control }, Stroke::new(1.0_f32, t.c.control_border));
         let dot = if l.pressed {
             6.5
         } else if l.hovered {
@@ -131,6 +156,35 @@ impl<'a> Slider<'a> {
         }
         out
     }
+}
+
+/// Return a new thumb position only when a press seeks or its pointer moves.
+fn flyout_pointer_x(ui: &Ui, resp: &egui::Response, center: egui::Pos2) -> Option<f32> {
+    let grab = resp.id.with("thumb grab");
+    let (press, down) = ui.input(|i| {
+        let press = i.events.iter().find_map(|e| match e {
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => Some(*pos),
+            _ => None,
+        });
+        (press, i.pointer.primary_down())
+    });
+    let pointer = resp.interact_pointer_pos();
+    ui.data_mut(|data| {
+        // Take and reinsert only for the lifetime of this primary gesture.
+        let previous = data.remove_temp::<(f32, Option<f32>)>(grab);
+        let (offset, last_x) = match press {
+            Some(p) if pointer.is_some() && resp.enabled() => {
+                if p.distance(center) <= 10.0 { (p.x - center.x, Some(p.x)) } else { (0.0, None) }
+            }
+            Some(_) => return None,
+            None => previous?,
+        };
+        let x = pointer?.x;
+        if down {
+            data.insert_temp(grab, (offset, Some(x)));
+        }
+        (Some(x) != last_x).then_some(x - offset)
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

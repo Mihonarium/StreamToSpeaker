@@ -24,7 +24,7 @@ pub fn scenes() -> Vec<Scene> {
         Scene { name: "parts-delay-states", size: [1180.0, 1660.0], draw: delay_states },
         Scene { name: "parts-delay-amount", size: [1560.0, 350.0], draw: delay_amount },
         Scene { name: "parts-delay-interaction", size: [1180.0, 620.0], draw: delay_interaction },
-        Scene { name: "parts-rows", size: [1180.0, 580.0], draw: rows },
+        Scene { name: "parts-rows", size: [1180.0, 0.0], draw: rows },
         Scene { name: "parts-delay-line", size: [1200.0, 1200.0], draw: delay_line },
         Scene { name: "parts-delay-page", size: [680.0, 550.0], draw: delay_page },
         Scene { name: "parts-notices", size: [1060.0, 640.0], draw: notices },

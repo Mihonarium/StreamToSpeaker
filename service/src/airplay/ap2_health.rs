@@ -14,9 +14,9 @@
 //!   `initialVolume`) against the last commanded value.
 //!
 //! A fault ends the session. Retryable faults set the session's `dead`
-//! flag, which the app's drop watchdog turns into one reconnect;
+//! flag, which the engine takes as a dropout and follows with its tries;
 //! non-retryable ones (authentication, a receiver that rejected the
-//! session outright) end it without a retry.
+//! session outright, one that ended it itself) end it without a retry.
 
 use log::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,26 +54,13 @@ pub struct Ap2Fault {
     pub message: String,
 }
 
+/// The code of a fault raised when the receiver ended the session while
+/// it still answers (see [`FaultSlot::ended_by_peer`]).
+pub const ENDED_BY_RECEIVER: &str = "ended_by_receiver";
+
 impl Ap2Fault {
     pub fn new(code: &'static str, channel: FaultChannel, retryable: bool, message: impl Into<String>) -> Self {
         Self { code, channel, retryable, message: message.into() }
-    }
-
-    /// For a fault that means the session to `name` couldn't play (the app
-    /// reconnects after it): the diagnostics' fault line and the window's
-    /// notice while reconnecting. None for faults that are a lost
-    /// connection, whose text is the app's own.
-    pub fn reconnect_text(&self, name: &str) -> Option<(String, String)> {
-        match self.code {
-            "anchor_failed" => {
-                Some((format!("{name} didn't start playing"), format!("{name} didn't start playing — reconnecting…")))
-            }
-            "encoder_failed" => Some((
-                format!("Windows' AAC encoder stopped working ({name})"),
-                format!("Windows' AAC encoder stopped working — reconnecting to {name}…"),
-            )),
-            _ => None,
-        }
     }
 }
 
@@ -86,9 +73,9 @@ impl std::fmt::Display for Ap2Fault {
 }
 
 /// How soon after a fault the next session to that speaker must start to
-/// be the reconnect that followed it: the watchdog reconnects about 5 s
-/// after a drop; the person picking the speaker again within this time
-/// counts too.
+/// be the reconnect that followed it: the engine's tries come within
+/// seconds of a drop; the person picking the speaker again within this
+/// time counts too.
 pub const REPEAT_WINDOW: Duration = Duration::from_secs(120);
 
 /// Notes older than this are dropped: no reconnect that is still failing
@@ -140,7 +127,7 @@ impl RepeatMemory {
 static REPEATS: Mutex<RepeatMemory> = Mutex::new(RepeatMemory::new());
 
 /// First-fault-wins slot shared by a session's threads. Raising a fault
-/// also sets the session's `dead` flag so the watchdog notices.
+/// also sets the session's `dead` flag, which the engine looks at.
 #[derive(Clone)]
 pub struct FaultSlot {
     fault: Arc<Mutex<Option<Ap2Fault>>>,
@@ -152,11 +139,43 @@ pub struct FaultSlot {
     key: String,
     /// When the session finished its bring-up; None until then.
     started: Arc<Mutex<Option<Instant>>>,
+    /// The receiver's control port: whether it still answers there tells
+    /// a receiver that ended the session from one that went away.
+    control: Option<std::net::SocketAddr>,
 }
 
 impl FaultSlot {
     pub fn new(dead: Arc<AtomicBool>, host: String) -> Self {
-        Self { fault: Arc::new(Mutex::new(None)), dead, key: host.clone(), host, started: Arc::new(Mutex::new(None)) }
+        Self {
+            fault: Arc::new(Mutex::new(None)),
+            dead,
+            key: host.clone(),
+            host,
+            started: Arc::new(Mutex::new(None)),
+            control: None,
+        }
+    }
+
+    /// The receiver's control port (see [`FaultSlot::ended_by_peer`]).
+    pub fn with_control(mut self, control: std::net::SocketAddr) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    /// The receiver closed the session's channel (`detail`): where it
+    /// still answers on its control port it ended the session itself
+    /// (another device took it, a person stopped it there), a fault no
+    /// reconnect follows (`ended_by_receiver`); otherwise it went away,
+    /// and a reconnect may help (`peer_closed`).
+    pub fn ended_by_peer(&self, channel: FaultChannel, detail: String) {
+        let still_there = self.control.is_some_and(|addr| {
+            crate::engine::signals::answers_on(addr, crate::engine::signals::STILL_THERE_WAIT)
+        });
+        if still_there {
+            self.raise(Ap2Fault::new(ENDED_BY_RECEIVER, channel, false, detail));
+        } else {
+            self.raise(Ap2Fault::new("peer_closed", channel, true, detail));
+        }
     }
 
     /// The session's bring-up has reached the point where it can no longer
@@ -767,24 +786,6 @@ mod tests {
         assert_eq!(r.on_failure(&refused(), now + s(8)), AnchorAction::Retry { warn: true });
         assert_eq!(r.on_failure(&refused(), now + ANCHOR_GIVE_UP - s(1)), AnchorAction::Retry { warn: false });
         assert_eq!(r.on_failure(&refused(), now + ANCHOR_GIVE_UP), AnchorAction::GiveUp);
-    }
-
-    /// While the app reconnects after a first fault, the window says what
-    /// happened: a session that couldn't play isn't reported as a lost
-    /// connection; faults that are connection losses keep the app's own
-    /// "Lost connection" text (no text here).
-    #[test]
-    fn a_session_that_could_not_play_is_not_reported_as_a_lost_connection() {
-        let fault = |code| Ap2Fault::new(code, FaultChannel::Media, true, "detail");
-        let (line, notice) = fault("anchor_failed").reconnect_text("Kitchen").unwrap();
-        assert_eq!(notice, "Kitchen didn't start playing — reconnecting…");
-        assert_eq!(line, "Kitchen didn't start playing");
-        let (line, notice) = fault("encoder_failed").reconnect_text("Kitchen").unwrap();
-        assert_eq!(notice, "Windows' AAC encoder stopped working — reconnecting to Kitchen…");
-        assert!(!line.contains("dropped") && line.contains("Kitchen"), "{line}");
-        for code in ["peer_closed", "feedback_rejected", "feedback_timeout", "media_send_timeout", "media_write_failed"] {
-            assert_eq!(fault(code).reconnect_text("Kitchen"), None, "{code}");
-        }
     }
 
     #[test]

@@ -24,13 +24,13 @@
 use log::debug;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How long the speaker's reports of levels we sent are taken for echoes,
 /// counted from the last level queued or the last send to the speaker
-/// starting or finishing. UPnP RenderingControl events are moderated (one
-/// LastChange per 0.2 s at most, per the service spec), so a report can
+/// starting or finishing. UPnP RenderingControl events are moderated (the
+/// service sends one LastChange per 0.2 s at most), so a report can
 /// trail the change by that much plus delivery, and during a drag it
 /// names a level from earlier in the drag rather than the latest.
 const SPEAKER_ECHO_WINDOW: Duration = Duration::from_secs(1);
@@ -45,14 +45,10 @@ const WINDOWS_ECHO_WINDOW: Duration = Duration::from_millis(250);
 /// across `[VOLUME_MIN_MILLIBELS, 0]`, so this is the 0 % anchor.
 const VOLUME_MIN_MILLIBELS: i32 = -9600;
 
-/// Called after the level changes; see [`VolumeSync::set_on_change`].
-type ChangeHook = Arc<dyn Fn() + Send + Sync>;
-
 pub struct VolumeSync {
     inner: Mutex<Inner>,
     /// Last known mute state of the shared endpoint, from either side.
     muted: AtomicBool,
-    on_change: Mutex<Option<ChangeHook>>,
 }
 
 #[derive(Debug, Default)]
@@ -165,23 +161,6 @@ impl VolumeSync {
         Self {
             inner: Mutex::new(Inner::default()),
             muted: AtomicBool::new(false),
-            on_change: Mutex::new(None),
-        }
-    }
-
-    /// Run `hook` whenever the level changes, from whichever side. The
-    /// window uses it to repaint at once: the level arrives on other
-    /// threads, and waiting for the next heartbeat or input would leave
-    /// the volume row behind the Windows slider. Called without any lock
-    /// held.
-    pub fn set_on_change(&self, hook: impl Fn() + Send + Sync + 'static) {
-        *self.on_change.lock().unwrap() = Some(Arc::new(hook));
-    }
-
-    fn notify_change(&self) {
-        let hook = self.on_change.lock().unwrap().clone();
-        if let Some(hook) = hook {
-            hook();
         }
     }
 
@@ -209,7 +188,6 @@ impl VolumeSync {
             inner.level_set_since_bound = true;
             inner.last_level = Some(level);
         }
-        self.notify_change();
         Some(level)
     }
 
@@ -246,7 +224,6 @@ impl VolumeSync {
             inner.sent_to_windows.remember(level, WINDOWS_ECHO_WINDOW, now);
             inner.last_level = Some(level);
         }
-        self.notify_change();
         Some(level)
     }
 
@@ -270,7 +247,6 @@ impl VolumeSync {
             inner.sent_to_windows.remember(level, WINDOWS_ECHO_WINDOW, now);
             inner.last_level = Some(level);
         }
-        self.notify_change();
         true
     }
 
@@ -325,7 +301,6 @@ impl VolumeSync {
             reported
         };
         debug!("speaker ended its run of changes at {}", level);
-        self.notify_change();
         Some(level)
     }
 
@@ -352,7 +327,7 @@ impl VolumeSync {
 
 impl VolumeSync {
     /// Last-known volume level (`0..=100`), from whichever side set it
-    /// last. The GUI reads this to render the volume slider (m24).
+    /// last. The GUI reads this to render the volume slider.
     pub fn current_level(&self) -> Option<u32> {
         self.inner.lock().unwrap().last_level
     }
@@ -763,34 +738,6 @@ mod tests {
         assert_eq!(s.current_level(), Some(70));
         // Past the window the same level is the user moving the slider.
         assert_eq!(s.driver_changed_at(64, t0 + ms(800)), Some(64));
-    }
-
-    #[test]
-    fn level_changes_wake_the_window() {
-        let s = VolumeSync::new();
-        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let w = wakes.clone();
-        s.set_on_change(move || {
-            w.fetch_add(1, Ordering::SeqCst);
-        });
-        let count = || wakes.load(Ordering::SeqCst);
-        assert_eq!(s.driver_changed(20), Some(20));
-        assert_eq!(count(), 1);
-        // Each step of a slider drag is a change the window must show.
-        assert_eq!(s.driver_changed(21), Some(21));
-        assert_eq!(count(), 2);
-        // Repeats and echoes change nothing.
-        assert_eq!(s.driver_changed(21), None);
-        assert_eq!(s.sonos_changed(21), None);
-        assert_eq!(count(), 2);
-        assert_eq!(s.sonos_changed(60), Some(60));
-        assert_eq!(count(), 3);
-        s.speaker_bound();
-        assert_eq!(s.speaker_connected(60), None);
-        assert_eq!(count(), 3);
-        assert_eq!(s.speaker_connected(35), Some(35));
-        assert_eq!(count(), 4);
-        assert_eq!(s.current_level(), Some(35));
     }
 
     fn drain(p: &mut PendingCommands) -> Vec<SpeakerCommand> {

@@ -33,11 +33,12 @@ pub struct Button<'a> {
     text_size: Option<f32>,
     name: Option<String>,
     max_width: Option<f32>,
+    grid_padding: Option<f32>,
 }
 
 impl<'a> Button<'a> {
     fn new(text: &'a str, kind: Kind) -> Self {
-        Button { text, kind, small: false, icon: None, enabled: true, default: false, width: None, text_size: None, name: None, max_width: None }
+        Button { text, kind, small: false, icon: None, enabled: true, default: false, width: None, text_size: None, name: None, max_width: None, grid_padding: None }
     }
 
     pub fn primary(text: &'a str) -> Self {
@@ -75,6 +76,12 @@ impl<'a> Button<'a> {
     /// Outline it in the accent colour: Enter presses it.
     pub fn default_action(mut self, default: bool) -> Self {
         self.default = default;
+        self
+    }
+
+    /// Horizontal padding for a button set on a fixed pixel grid.
+    pub(crate) fn grid_padding(mut self, pad: f32) -> Self {
+        self.grid_padding = Some(pad);
         self
     }
 
@@ -124,13 +131,13 @@ impl Widget for Button<'_> {
         let font = t.font(em);
         let icon_size = if self.small { 14.0 } else { 15.0 };
         let icon_w = if self.icon.is_some() { icon_size + 6.0 } else { 0.0 };
-        let pad = if link {
+        let pad = self.grid_padding.unwrap_or(if link {
             0.0
         } else if self.small {
             10.0
         } else {
             space::M
-        };
+        });
         let room = self.max_width.map_or(f32::INFINITY, |m| (m - icon_w - 2.0 * pad).max(20.0));
         let mut job = egui::text::LayoutJob::simple_singleline(self.text.to_owned(), font, Color32::PLACEHOLDER);
         job.wrap = egui::text::TextWrapping::truncate_at_width(room);
@@ -155,15 +162,22 @@ impl Widget for Button<'_> {
         if ui.is_rect_visible(rect) {
             let colors = colors(&t, self.kind, l);
             let p = ui.painter();
+            let rect = p.round_rect_to_pixels(rect);
+            // As many whole physical pixels as fit in one point: 1 at 100 to
+            // 175 %, 2 at 200 %.
+            let ppp = ui.ctx().pixels_per_point();
+            let edge = ppp.floor().max(1.0) / ppp;
             let rounding = radius::CONTROL;
             if let Some(fill) = colors.fill {
                 p.rect_filled(rect, rounding, fill);
             }
             if let Some(border) = colors.border {
-                p.rect_stroke(rect.shrink(0.5), rounding, Stroke::new(1.0_f32, border));
+                // epaint 0.29 strokes a rectangle outside its path.
+                p.rect_stroke(rect.shrink(edge), rounding - edge, Stroke::new(edge, border));
             }
             if self.default && self.enabled {
-                p.rect_stroke(rect.shrink(1.0), rounding, Stroke::new(2.0_f32, t.c.accent));
+                let stroke = p.round_to_pixel(2.0).max(edge);
+                p.rect_stroke(rect.shrink(stroke), rounding - stroke, Stroke::new(stroke, t.c.accent));
             }
             let content_w = galley.size().x + icon_w;
             let left = rect.center().x - content_w / 2.0;
@@ -176,6 +190,7 @@ impl Widget for Button<'_> {
                 let y = text_pos.y + galley.size().y - 2.0;
                 p.hline(text_pos.x..=text_pos.x + galley.size().x, y, Stroke::new(1.0_f32, colors.text));
             }
+            let text_pos = if self.grid_padding.is_some() { egui::pos2(text_pos.x.round(), text_pos.y.round()) } else { text_pos };
             p.galley(text_pos, galley, colors.text);
             if l.focused {
                 focus_ring(p, if link { rect.expand2(Vec2::new(2.0, 0.0)) } else { rect }, rounding, true, &t);
@@ -324,6 +339,35 @@ impl<'a> IconButton<'a> {
             response.on_hover_text(self.name)
         } else {
             response
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn painted_button_and_both_sides_of_its_edge_land_on_physical_pixels() {
+        for scale in [1.25, 1.5, 1.75] {
+            let ctx = crate::ui::preview::context(crate::fonts::definitions(&[], &mut |_| None).0, super::super::theme::Mode::Light);
+            let output = ctx.run(crate::ui::preview::input(Vec2::splat(200.0), scale, 0.0), |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
+                    ui.add_space(7.3);
+                    Button::standard("25 ms").width(62.3).show(ui);
+                });
+            });
+            let border = output.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if r.stroke.color == Theme::of(&ctx).c.control_border => Some(r),
+                _ => None,
+            }).unwrap();
+            let px = border.stroke.width * scale;
+            assert!((px - 1.0).abs() < 0.001);
+            for r in [border.rect, border.rect.expand(border.stroke.width)] {
+                for x in [r.left(), r.top(), r.right(), r.bottom()] {
+                    assert!((x * scale - (x * scale).round()).abs() < 0.001, "{r:?} at {scale}");
+                }
+            }
         }
     }
 }

@@ -20,9 +20,7 @@ use std::time::{Duration, Instant};
 /// How long a search may take before the list is shown anyway.
 pub const SEARCH_WAIT: Duration = Duration::from_secs(15);
 
-/// How long the prompt waits for an answer before taking the speaker used
-/// last time, when that one is listed: an unattended start in a terminal
-/// mustn't wait for ever.
+/// How long an unanswered prompt stays open when the saved speaker is listed.
 pub const SAVED_SPEAKER_WAIT: Duration = Duration::from_secs(15);
 
 /// `text` from a device, for a terminal: every control character (which a
@@ -195,7 +193,7 @@ impl Answers for Threaded {
 
 /// Ask on this terminal which speaker to use: its id, or None if the
 /// person skipped. `last_used`: the speaker used last time; when it is
-/// listed it comes first, Enter takes it, and it is taken if nobody answers
+/// listed it comes first, Enter takes it, and the prompt closes if nobody answers
 /// within [`SAVED_SPEAKER_WAIT`].
 pub fn interactive_pick(app: &Arc<App>, last_used: Option<&str>) -> Result<Option<String>> {
     let mut output = io::stdout();
@@ -227,7 +225,7 @@ fn saved_first(mut speakers: Vec<SpeakerInfo>, last_used: Option<&str>) -> Vec<S
 /// The prompt itself: searches first, lists, and reads a choice from
 /// `answers`. Accepts a number, Enter for the first speaker, "r" to search
 /// again, "q" (or the end of input) to skip. While `last_used` is the first
-/// speaker listed and nobody has answered yet, it is taken after `wait`.
+/// speaker listed and nobody has answered yet, the prompt closes after `wait`.
 fn pick_from(
     answers: &mut dyn Answers,
     out: &mut dyn Write,
@@ -252,32 +250,19 @@ fn pick_from(
             let _ = writeln!(out);
             write_speaker_list(out, &speakers, last_used);
             let _ = writeln!(out);
-            match (saved_first, limit) {
-                (Some(saved), Some(wait)) => {
-                    let _ = writeln!(out, "Pick a speaker [1-{}] (Enter = 1, r = search again, q = skip).", n);
-                    let _ = write!(
-                        out,
-                        "{}, used last time, is taken if nobody answers within {} seconds: ",
-                        printable(&saved.friendly_name),
-                        wait.as_secs()
-                    );
-                }
-                _ => {
-                    let _ = write!(out, "Pick a speaker [1-{}] (Enter = the first, r = search again, q = skip): ", n);
-                }
+            let _ = write!(out, "Pick a speaker [1-{}] (Enter = the first, r = search again, q = skip)", n);
+            if let Some(wait) = limit {
+                let _ = write!(out, " or leave the sound where it is after {} seconds", wait.as_secs());
             }
+            let _ = write!(out, ": ");
         }
         let _ = out.flush();
         let line = match answers.next_line(limit)? {
             Answer::Line(line) => line,
             Answer::End => return Ok(None),
             Answer::NoneInTime => {
-                let saved = saved_first.map(|s| s.id.clone());
-                if let Some(s) = speakers.first() {
-                    let _ = writeln!(out);
-                    let _ = writeln!(out, "No answer: using {}.", printable(&s.friendly_name));
-                }
-                return Ok(saved);
+                let _ = writeln!(out, "\nNo answer. The sound stays where it is.");
+                return Ok(None);
             }
         };
         answered = true;
@@ -390,12 +375,11 @@ mod tests {
     }
 
     #[test]
-    fn nobody_answering_takes_the_speaker_used_last_time_after_the_wait() {
+    fn an_unanswered_picker_leaves_the_restored_place_alone() {
         let (picked, limits, printed) = pick_with_saved(vec![Answer::NoneInTime], Some("uuid:RINCON_A"));
-        assert_eq!(picked.as_deref(), Some("uuid:RINCON_A"));
+        assert_eq!(picked, None);
         assert_eq!(limits, [Some(Duration::from_secs(15))]);
-        assert!(printed.contains("Living Room, used last time, is taken if nobody answers within 15 seconds"), "{printed}");
-        assert!(printed.contains("No answer: using Living Room."), "{printed}");
+        assert!(printed.contains("No answer. The sound stays where it is."), "{printed}");
     }
 
     #[test]

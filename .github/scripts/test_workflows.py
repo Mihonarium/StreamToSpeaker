@@ -437,5 +437,108 @@ class DriverWorkflowScripts(unittest.TestCase):
         self.assertEqual(step_field(check[0], "run"), "python3 .github/scripts/certified.py inputs")
 
 
+def top_block(name, key):
+    """The content lines of a top-level key's block in
+    .github/workflows/<name> (`on:`, `permissions:`), without comments."""
+    with open(os.path.join(WORKFLOWS_DIR, name), encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    out, inside = [], False
+    for line in lines:
+        if _content(line) and _depth(line) == 0:
+            inside = line.rstrip() == f"{key}:"
+            continue
+        if inside and _content(line):
+            out.append(re.sub(r"\s+#.*$", "", line.rstrip()))
+    return out
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")
+class PanelClick(unittest.TestCase):
+    # panel-click.yml runs the app on hosted Windows machines and clicks its
+    # tray icon. It runs by hand or on a push to a rig/ branch, reads the
+    # repository only, uses no secrets and saves no cache.
+    NAME = "panel-click.yml"
+
+    def text(self):
+        with open(os.path.join(WORKFLOWS_DIR, self.NAME), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_it_runs_by_hand_and_on_a_push_to_a_rig_branch_only(self):
+        on = top_block(self.NAME, "on")
+        triggers = [line.strip().rstrip(":") for line in on if _depth(line) == 2]
+        self.assertEqual(triggers, ["workflow_dispatch", "push"])
+        push = on[[line.strip() for line in on].index("push:") + 1:]
+        self.assertEqual([line.strip() for line in push], ["branches: ['rig/**']"])
+
+    def test_its_repository_permissions_are_read_only(self):
+        self.assertEqual([line.strip() for line in top_block(self.NAME, "permissions")], ["contents: read"])
+        jobs = job_fields(self.NAME)
+        self.assertEqual(set(jobs), {"cases", "build", "click"})
+        self.assertEqual([job for job, fields in jobs.items() if "permissions" in fields], [])
+        self.assertNotIn("secrets.", self.text())
+        scripts = [line for steps in jobs_steps(self.NAME).values() for step in steps for line in step_script(step)]
+        self.assertTrue(scripts)
+        self.assertEqual([line for line in scripts if "${{" in line], [])
+
+    def test_its_actions_are_pinned_and_no_cache_is_saved(self):
+        refs = [(ref, rest) for where, ref, rest in uses_lines() if where.startswith(f"workflows/{self.NAME}:")]
+        self.assertGreater(len(refs), 0)
+        self.assertEqual([ref for ref, rest in refs
+                          if not (PINNED_RE.fullmatch(ref) and VERSION_COMMENT_RE.fullmatch(rest))], [])
+        self.assertFalse([ref for ref, _ in refs if ref.startswith("actions/cache")])
+        caches = [step for steps in jobs_steps(self.NAME).values() for step in steps
+                  if (step_field(step, "uses") or "").startswith("Swatinem/rust-cache@")]
+        self.assertEqual([step_with(step, "save-if") for step in caches], ["false"])
+
+    def test_the_rigs_powershell_is_parsed_before_anything_is_built(self):
+        # Right after the checkout: Windows PowerShell 5.1 parses the rig's
+        # scripts and compiles its C# in the build job, the first on
+        # Windows; PowerShell 7 parses them in the cases job, earlier still.
+        jobs = jobs_steps(self.NAME)
+        build, cases = jobs["build"], jobs["cases"]
+        self.assertEqual(step_field(build[0], "uses").split("@")[0], "actions/checkout")
+        self.assertEqual((step_field(build[1], "shell"), step_field(build[1], "run")),
+                         ("powershell", ".github/scripts/Test-RigScripts.ps1 -CompileRig"))
+        self.assertEqual(step_field(cases[0], "uses").split("@")[0], "actions/checkout")
+        self.assertEqual((step_field(cases[1], "shell"), step_field(cases[1], "run")),
+                         ("pwsh", ".github/scripts/Test-RigScripts.ps1"))
+        # Every script file the workflow runs is one the parse covers.
+        with open(os.path.join(GITHUB_DIR, "scripts", "Test-RigScripts.ps1"), encoding="utf-8") as fh:
+            covered = set(re.findall(r'"([A-Za-z-]+\.ps1)"', re.search(r"(?m)^\$Files = @\((.*)\)$", fh.read()).group(1)))
+        run = set(re.findall(r"\.github/scripts/([A-Za-z-]+\.ps1)", self.text()))
+        self.assertTrue(run)
+        self.assertLessEqual(run, covered)
+
+    def test_a_case_whose_script_never_ran_to_its_end_says_the_rig_failed(self):
+        steps = jobs_steps(self.NAME)["click"]
+        names = [step_field(step, "name") for step in steps]
+        rig = names.index("Start the app and click its tray icon")
+        said = names.index("Say when the rig itself failed")
+        kept = names.index("Keep the pictures and logs")
+        self.assertTrue(rig < said < kept)
+        self.assertEqual(expression(step_field(steps[said], "if")), "always()")
+        self.assertTrue(any("verdict.txt" in line for line in step_script(steps[said])))
+        with open(os.path.join(GITHUB_DIR, "scripts", "Test-PanelClick.ps1"), encoding="utf-8") as fh:
+            self.assertIn('"verdict.txt"', fh.read())
+
+    def test_one_build_serves_every_case_and_a_failing_case_stops_none(self):
+        jobs = job_fields(self.NAME)
+        self.assertNotIn("strategy", jobs["build"])
+        self.assertEqual(expression(jobs["click"]["runs-on"]), "matrix.case.runner")
+        click = [line.strip() for job, line in job_lines(self.NAME) if job == "click"]
+        self.assertIn("fail-fast: false", click)
+        self.assertIn("case: ${{ fromJSON(needs.cases.outputs.cases) }}", click)
+
+    def test_it_keeps_the_app_for_a_day_and_the_evidence_for_fourteen_and_writes_a_summary(self):
+        jobs = jobs_steps(self.NAME)
+        uploads = [(job, step_with(s, "name"), step_with(s, "retention-days"))
+                   for job, steps in jobs.items() for s in steps
+                   if (step_field(s, "uses") or "").startswith("actions/upload-artifact@")]
+        self.assertEqual(uploads, [("build", "panel-click-app", "1"),
+                                   ("click", "panel-click-${{ matrix.case.name }}", "14")])
+        with open(os.path.join(GITHUB_DIR, "scripts", "Test-PanelClick.ps1"), encoding="utf-8") as fh:
+            self.assertIn("Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY", fh.read())
+
+
 if __name__ == "__main__":
     unittest.main()

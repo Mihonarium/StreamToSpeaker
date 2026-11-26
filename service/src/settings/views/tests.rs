@@ -11,11 +11,11 @@ use egui::{Color32, Event, Pos2, Rect, Shape, Vec2};
 use super::*;
 use crate::model::command::{Command, DelayStep, Open, VolumeOwner};
 use crate::model::port::Port;
-use crate::model::scripted::{Scenario, ScriptedEngine};
-use crate::model::snapshot::Snapshot;
-use crate::model::state::{NowState, Place, Secret, SpeakerId};
+use crate::model::fake::ScriptedEngine;
+use crate::model::Snapshot;
+use crate::model::state::{Place, SpeakerId};
 
-use crate::panel::view::{show_view, ViewState};
+use crate::shell::page::{show_view, ViewState};
 use crate::settings::port::*;
 use crate::settings::scripted::{Names, ScriptedSettings, State};
 use crate::settings::words::STRETCH;
@@ -69,7 +69,7 @@ struct H {
 
 impl H {
     fn new(port: Arc<ScriptedSettings>, view: Box<dyn crate::shell::ViewContent>, snap: Arc<Snapshot>) -> Self {
-        Self::sized(port, view, snap, crate::panel::WIDTH, 1.0)
+        Self::sized(port, view, snap, crate::surface::panel::WIDTH, 1.0)
     }
 
     fn sized(port: Arc<ScriptedSettings>, view: Box<dyn crate::shell::ViewContent>, snap: Arc<Snapshot>, width: f32, scale: f32) -> Self {
@@ -190,15 +190,15 @@ fn scripted(f: impl FnOnce(&mut State)) -> Arc<ScriptedSettings> {
     Arc::new(p)
 }
 
-fn snap(s: Scenario) -> Arc<Snapshot> {
+fn snap(s: &str) -> Arc<Snapshot> {
     ScriptedEngine::new(s).snapshot()
 }
 
 fn speaker(id: &str) -> H {
-    speaker_in(id, Scenario::Playing, |_| ())
+    speaker_in(id, "kitchen-playing", |_| ())
 }
 
-fn speaker_in(id: &str, scenario: Scenario, f: impl FnOnce(&mut State)) -> H {
+fn speaker_in(id: &str, scenario: &str, f: impl FnOnce(&mut State)) -> H {
     let port = scripted(f);
     let view = SpeakerOptions::new(port.clone(), id);
     H::new(port, Box::new(view), snap(scenario))
@@ -212,187 +212,249 @@ fn sid(id: &str) -> SpeakerId {
 // A speaker's view
 // -------------------------------------------------------------------------
 
-#[test]
-fn the_bar_tests_the_speaker_that_plays_and_plays_another_here() {
-    let mut h = speaker("kitchen");
-    h.click("Test sound");
-    assert_eq!(h.asks(), vec![Asked::Command(Command::PlayTestSound(sid("kitchen")))]);
-    // Another speaker: what a click on its row does; a test never moves
-    // the sound.
-    let mut h = speaker("office");
-    assert!(!h.has("Test sound"));
-    h.click("Play here");
-    let row = h.snap.list.rows().find(|r| r.place == Place::Speaker(sid("office"))).and_then(|r| r.command.clone()).unwrap();
-    assert_eq!(h.asks(), vec![Asked::Command(row)]);
-    // One that isn't found: search again.
-    let mut h = speaker("garage");
-    h.click("Search again");
-    assert_eq!(h.acts(), vec![Act::SearchAgain]);
-    assert!(h.shows("not found right now"));
+fn draw_confirmation(remove: bool, confirm: bool) -> Vec<Command> {
+    use crate::shell::WindowContent;
+    let port = scripted(|_| ());
+    let snap = snap("kitchen-playing");
+    let mut dialog = super::speaker::ConfirmSettings { id: sid("kitchen"), name: "Kitchen".into(), remove, port: port.clone() };
+    let ctx = preview::context(crate::fonts::definitions(&[], &mut |_| None).0, Mode::Light);
+    let mut commands = Vec::new();
+    let mut pos = Pos2::ZERO;
+    for frame in 0..5 {
+        let mut input = preview::input(dialog.sizes().0, 1.0, frame as f64 * 0.05);
+        if frame >= 2 {
+            input.events.push(Event::PointerMoved(pos));
+            if frame > 2 { input.events.push(Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: frame == 3, modifiers: Default::default() }); }
+        }
+        let out = ctx.run(input, |ctx| {
+            dialog.show(ctx, &snap, &mut |a| if let crate::shell::Ask::Command(c) = a { commands.push(c); });
+        });
+        if frame == 1 {
+            let mut text = Vec::new(); for s in out.shapes { collect(&s.shape, s.clip_rect, &mut text); }
+            if remove { assert!(text.iter().any(|t| t.text == "The sound moves to this PC.")); }
+            let label = if !confirm { "Cancel" } else if remove { "Remove" } else { "Reset" };
+            pos = text.iter().find(|t| t.text == label).unwrap().rect.center();
+        }
+    }
+    assert_eq!(port.acts(), if confirm { vec![Act::ClearSpeakerCredentials("kitchen".into())] } else { Vec::new() });
+    commands
 }
 
 #[test]
-fn the_delay_block_and_the_choice_send_the_engines_commands() {
-    let mut h = speaker("kitchen");
-    h.click("Remove 25 ms");
-    assert_eq!(h.asks(), vec![Asked::Command(Command::ChangeDelay { speaker: sid("kitchen"), step: DelayStep::Remove(25) })]);
-    assert!(h.has("Kitchen’s own delay is about 0.2 s."));
-    assert!(h.shows("Sound behind the picture?"));
-    // Another amount, typed, then Enter.
-    h.click("Other amount…");
-    h.type_text("40");
-    h.key(egui::Key::Enter);
-    assert_eq!(h.asks(), vec![Asked::Command(Command::ChangeDelay { speaker: sid("kitchen"), step: DelayStep::Remove(40) })]);
-    let mut h = speaker("office");
-    h.click("Short delay");
-    assert_eq!(h.asks(), vec![Asked::Command(Command::UseDelayChoice { speaker: sid("office"), choice: crate::model::facts::DelayChoice::Short })]);
-    assert!(h.has("About 0.3 s. Can break up on weak Wi-Fi."));
+fn reset_and_remove_only_act_after_confirmation() {
+    assert!(draw_confirmation(false, false).is_empty());
+    assert!(draw_confirmation(true, false).is_empty());
+    assert_eq!(draw_confirmation(false, true), vec![Command::ResetSpeaker(sid("kitchen"))]);
+    assert_eq!(draw_confirmation(true, true), vec![Command::RemoveSpeaker(sid("kitchen"))]);
 }
 
 #[test]
-fn tone_limit_titles_coming_back_and_the_name_change_at_once() {
+fn unavailable_settings_and_their_shortcut_link_are_hidden() {
+    let port = scripted(|s| { s.general.shortcuts = None; s.general.play_calls = None; s.general.what_plays = None; s.general.language = None; });
+    let h = H::new(port.clone(), Box::new(SettingsView::new(port.clone())), snap("kitchen-playing"));
+    for label in ["Keyboard shortcuts for the delay", "Play calls on the speaker too", "Only send some apps to the speaker", "Language"] {
+        assert!(!h.shows(label));
+    }
+    let h = H::new(port.clone(), Box::new(SpeakerOptions::new(port, "kitchen")), snap("kitchen-playing"));
+    assert!(!h.shows("Keyboard shortcuts") && !h.shows("From the keyboard"));
+}
+
+#[test]
+fn speaker_pages_keep_the_controls_in_reading_order() {
+    for (id, scenario, first, closing) in [
+        ("kitchen", "kitchen-playing", "Play a test chime", "Reset these settings…"),
+        ("office", "kitchen-playing", "Switch to Office", "Reset these settings…"),
+        ("kitchen", "pc-kitchen-playing-something-else", "Switch to Kitchen", "Reset these settings…"),
+        ("garage", "kitchen-playing", "Search again", "Remove Garage…"),
+        ("den", "pc-den-needs-code", "Enter code…", "Reset these settings…"),
+    ] {
+        let mut h = speaker_in(id, scenario, |_| ());
+        let mut y = -1.0;
+        for label in [first, "Delay", "Tone", "Volume limit", "Name in this app", closing, "Technical details"] {
+            let r = h.find(label).unwrap_or_else(|| panic!("{id}: {label}"));
+            assert!(r.top() > y, "{id}: {label}"); y = r.top();
+        }
+        if id == "garage" {
+            assert!(!h.has("Reset these settings…") && !h.has("Play a test chime"));
+            h.click("Search again"); assert_eq!(h.acts(), vec![Act::SearchAgain]);
+        } else if id == "office" {
+            h.click(first);
+            let row = h.snap.panel.list.rows.iter().find(|r| r.place == Place::Speaker(sid(id))).unwrap();
+            assert_eq!(h.asked, vec![Asked::Command(row.command.clone().unwrap())]);
+        }
+        h.click(closing); assert!(h.asks().contains(&Asked::Dialog));
+    }
+}
+
+#[test]
+fn a_busy_chime_asks_in_the_page_before_playing() {
+    let mut h = speaker_in("kitchen", "pc-kitchen-playing-something-else", |_| ());
+    h.click("Play a test chime");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::PlayChime { speaker: sid("kitchen"), confirmed: false })]);
+    let mut scene = h.snap.scene.clone();
+    scene.situation.confirm_in_panel = Some(crate::model::situation::Confirm::ChimeBusy { speaker: sid("kitchen"), who: None });
+    h.snap = Arc::new(crate::model::view::view(scene, None, false, 2));
+    h.settle();
+    assert!(h.has("Kitchen is playing something else. A test chime stops it, and it may not start again by itself."));
+    let yes = h.texts.iter().rfind(|t| t.text == "Play a test chime").unwrap().rect;
+    h.click_at(yes.center());
+    assert_eq!(h.asks(), vec![Asked::Command(Command::Confirm { yes: true })]);
+}
+
+#[test]
+fn the_page_uses_the_panel_delay_commands_and_the_selected_ways_limits() {
     let mut h = speaker("kitchen");
-    h.click("Reset to flat");
+    let crate::model::panel::About::Delay(d) = h.snap.panel.about.clone() else { panic!() };
+    for (i,row) in d.rows.iter().enumerate() {
+        for button in [&row.small, &row.large] {
+            let r = h.texts.iter().filter(|t| t.text == button.label).nth(i).unwrap().rect;
+            h.click_at(r.center()); assert_eq!(h.asks(), vec![Asked::Command(button.command.clone())]);
+        }
+    }
+    let mut h = speaker_in("kitchen", "pc-plain", |_| ());
+    h.click("AirPlay");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::ChooseWay { speaker: sid("kitchen"), way: crate::model::situation::WayChoice::AirPlaySteady })]);
+}
+
+#[test]
+fn exact_delay_sets_the_displayed_total_and_the_reply_reports_the_limit() {
+    use crate::engine::place_driver::PlaceDriver;
+    use crate::model::{Effect, Surface};
+    let app = crate::app::App::for_tests();
+    let mut driver = PlaceDriver::new(app.clone(), crate::platform::fake::FakePlatform::new().platform(),
+        Default::default(), std::time::Instant::now());
+    app.set_delay_to("kitchen", 150).unwrap();
+    let mut h = speaker("kitchen");
+    let refresh = |h: &mut H| {
+        let status = app.delay_status_of("kitchen");
+        let mut scene = h.snap.scene.clone();
+        let kitchen = scene.speakers.iter_mut().find(|s| s.id == sid("kitchen")).unwrap();
+        let way = kitchen.ways.iter_mut().find(|w| w.way == kitchen.way).unwrap();
+        way.delay.own_ms = status.own_delay_ms;
+        way.delay.change_ms = status.change_ms;
+        let limits = status.limits.unwrap();
+        way.range = crate::model::facts::DelayRange { max_removed_ms: limits.remove_ms, max_added_ms: limits.add_ms };
+        h.snap = Arc::new(crate::model::view::view(scene, None, false, h.snap.version + 1));
+        h.settle();
+    };
+    refresh(&mut h);
+    for (target, expected_step, enter) in [("175", -25, false), ("99999", 99799, true)] {
+        h.click("Type an exact delay…");
+        let before = app.delay_status_of("kitchen");
+        assert!(h.has(&before.delay_ms.to_string()));
+        assert!(!h.view.holds_unused_text());
+        h.type_text(target);
+        assert!(h.has(target) && h.view.holds_unused_text(), "typing replaces the selected total");
+        if enter { h.key(egui::Key::Enter); } else { h.click("Set"); }
+        let command = Command::ChangeDelay { speaker: sid("kitchen"), step: DelayStep::SetTotal(expected_step) };
+        assert_eq!(h.asks(), vec![Asked::Command(command.clone())]);
+        assert!(h.has("Type an exact delay…"));
+        let Effect::Delay(reply) = driver.command(Surface::Panel, &command).unwrap() else { panic!("missing delay reply") };
+        let upper = before.limits.unwrap().add_ms as i32;
+        assert_eq!((reply.after_ms, reply.stopped_at_limit), (expected_step.min(upper), expected_step > upper));
+        refresh(&mut h);
+    }
+    assert!(h.has("Kitchen can’t play with more delay than this."));
+    h.click("Type an exact delay…");
+    h.click("Use the default: 200 ms");
+    let reset = Command::ChangeDelay { speaker: sid("kitchen"), step: DelayStep::Reset };
+    assert_eq!(h.asks(), vec![Asked::Command(reset.clone())]);
+    driver.command(Surface::Panel, &reset).unwrap();
+    refresh(&mut h);
+    assert!(h.has("Type an exact delay…") && !h.shows("Use the default"));
+    h.click("Type an exact delay…");
+    assert!(h.has("200") && !h.shows("Use the default"));
+    app.request_shutdown();
+}
+
+#[test]
+fn exact_delay_can_be_dismissed_and_is_hidden_for_a_fixed_way() {
+    let mut h = speaker("kitchen");
+    for escape in [true, false] {
+        h.click("Type an exact delay…");
+        h.type_text("25");
+        if escape {
+            h.key(egui::Key::Escape);
+        } else {
+            // Tab from the field to Set, then to the close button.
+            h.key(egui::Key::Tab);
+            h.key(egui::Key::Tab);
+            h.key(egui::Key::Enter);
+        }
+        assert!(h.asks().is_empty() && h.has("Type an exact delay…"));
+    }
+    let h = speaker_in("kitchen", "kitchen-fixed-way", |_| ());
+    assert!(!h.has("Type an exact delay…") && !h.has("Set"));
+}
+
+#[test]
+fn tone_name_and_speaker_commands() {
+    let mut h = speaker("kitchen");
+    h.click("Reset tone");
     assert_eq!(h.acts(), vec![Act::Tone("kitchen".into(), ToneAct::Flat)]);
-    assert!(!h.has("Reset to flat"), "flat: nothing to reset");
-    h.click("All bands…");
-    assert!(h.has("31 Hz") && h.has("16k Hz") && h.has("Preamp"), "the bands open in place");
-    h.click("Fewer bands");
-    assert!(!h.has("31 Hz"));
+    h.click("More tone controls…"); assert!(h.has("31 Hz"));
+    h.click("Allow");
+    assert_eq!(h.acts(), vec![Act::Allow { address: "192.168.1.51".into(), speaker: "kitchen".into() }]);
     h.flip("Show song titles on Kitchen");
     assert_eq!(h.acts(), vec![Act::SongTitles("kitchen".into(), false)]);
-    h.click("Never");
-    assert_eq!(h.acts(), vec![Act::ComesBack("kitchen".into(), ComesBack::Never)]);
-    assert!(h.has("Move sound to Kitchen automatically"));
-    let field = h.find("Kitchen").unwrap();
-    let _ = field;
-    // The name: typed, then Enter.
-    let name_label = h.find("Name in this app").unwrap();
-    h.click_at(egui::pos2(name_label.left() + 40.0, name_label.bottom() + 16.0));
-    h.run(vec![Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND }]);
-    h.type_text("Kitchen shelf");
-    h.key(egui::Key::Enter);
-    assert_eq!(h.acts(), vec![Act::ShowAs("kitchen".into(), "Kitchen shelf".into())]);
-    // The limit: a click on its slider.
-    let mut h = speaker("kitchen");
-    let label = h.find("Never louder than").unwrap();
-    h.click_at(egui::pos2(label.right() + 60.0, label.center().y));
-    assert!(matches!(h.acts().as_slice(), [Act::VolumeLimit(id, _)] if id == "kitchen"));
+    let label = h.find("Name in this app").unwrap();
+    h.click_at(egui::pos2(label.left()+40.0,label.bottom()+20.0));
+    h.type_text(" shelf"); h.key(egui::Key::Enter);
+    assert!(matches!(h.acts().as_slice(), [Act::ShowAs(id, _)] if id == "kitchen"));
+    assert!(h.has("Saved"));
+    h.click("Technical details"); assert!(h.shows("Connection:") && h.has("Copy"));
+    h.click("Hide from the list"); assert_eq!(h.acts(), vec![Act::HideSpeaker("kitchen".into())]);
+    let mut h = speaker_in("den", "pc-den-needs-code", |_| ());
+    h.click("Enter code…"); assert_eq!(h.asks(), vec![Asked::Open(Open::Pair(sid("den")))]);
 }
 
 #[test]
-fn details_hiding_and_forgetting_are_at_the_bottom_and_forget_asks_first() {
-    let mut h = speaker("office");
-    h.click("Details");
-    assert!(h.has("Model: AirPort Express\nAddress: 192.168.1.44\nConnection: AirPlay (RAOP)\nDelay: AirPlay buffer 1700 ms (Steady 2000 ms, 300 ms removed)\nLast problem: none\nId: airplay:00005E00539A"));
-    h.click("Hide from the list");
-    assert_eq!(h.acts(), vec![Act::HideSpeaker("office".into())]);
-    h.click("Show in the list");
-    assert_eq!(h.acts(), vec![Act::ShowSpeaker("office".into())]);
-    h.click("Forget");
-    assert!(h.acts().is_empty(), "it asks first");
-    assert!(h.shows("Forget Office?"));
-    h.click("Cancel");
-    assert!(!h.shows("Forget Office?"));
-    h.click("Forget");
-    h.click("Forget Office");
-    assert_eq!(h.acts(), vec![Act::Forget("office".into())]);
-    // Added by address: Remove, which leaves the list, and the view goes
-    // back.
-    let mut h = speaker("garage");
-    h.click("Remove");
-    h.click("Remove Garage");
-    assert_eq!(h.acts(), vec![Act::Remove("garage".into())]);
-    assert!(h.asks().contains(&Asked::Back));
-}
-
-#[test]
-fn a_code_or_a_password_is_asked_for_where_the_speaker_needs_one() {
-    let mut h = speaker_in("den", Scenario::NeedsPairing, |_| ());
-    h.click("Enter code…");
-    assert_eq!(h.asks(), vec![Asked::Open(Open::Pair(sid("den")))]);
-    let engine = ScriptedEngine::new(Scenario::Playing);
-    let mut f = engine.facts();
-    f.state = NowState::NeedsSecret { speaker: sid("office"), secret: Secret::Password };
-    engine.set_facts(f);
-    let port = scripted(|_| ());
-    let mut h = H::new(port.clone(), Box::new(SpeakerOptions::new(port, "office")), engine.snapshot());
-    h.click("Enter password…");
-    assert_eq!(h.asks(), vec![Asked::Open(Open::Pair(sid("office")))]);
-    h.click_link("Change");
-    assert_eq!(h.asks(), vec![Asked::Dialog]);
-    h.click_link("Remove");
-    assert_eq!(h.acts(), vec![Act::RemovePassword("office".into())]);
-    let mut h = speaker("bedroom");
-    h.click_link("Pair again");
-    h.click_link("Forget pairing");
-    assert_eq!(h.acts(), vec![Act::PairAgain("bedroom".into()), Act::ForgetPairing("bedroom".into())]);
-    let mut h = speaker("bedroom");
-    h.click_link("Report a problem");
-    assert_eq!(h.asks(), vec![Asked::Dialog]);
-}
-
-// -------------------------------------------------------------------------
-// Settings, Speaker missing?, Can't hear it?, Music Assistant, About, Lab
-// -------------------------------------------------------------------------
-
-#[test]
-fn each_switch_of_settings_changes_its_setting() {
-    let port = scripted(|s| {
-        if let Some(k) = &mut s.general.shortcuts {
-            k.on = false;
-        }
-    });
-    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap(Scenario::Playing));
+fn each_settings_switch_changes_its_own_field() {
+    let port = scripted(|s| { s.general.shortcuts.as_mut().unwrap().on = false; s.ma.offer = Some(false); });
+    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
+    for label in ["Guides", "Lab", "…and go back to the speaker I was using", "Bring the sound back to this PC when a speaker stops responding",
+        "Tell me when sound leaves the place I chose", "Let any device on this network listen", "Start Stream To Speaker when I sign in", "Offer this PC to Music Assistant"] {
+        assert!(!h.has(label));
+    }
     for (label, act) in [
-        ("Remove or add delay from the keyboard, in any app", Act::Shortcuts(true)),
-        ("Control Stream To Speaker from your phone", Act::Phone(false)),
+        ("Keyboard shortcuts for the delay", Act::Shortcuts(true)),
+        ("Control from your phone", Act::Phone(false)),
         ("Play calls on the speaker too", Act::PlayCalls(true)),
         ("Only send some apps to the speaker", Act::WhatPlays(WhatPlays::OnlySentApps)),
-        ("Start Stream To Speaker when I sign in", Act::StartAtSignIn(false)),
-        ("…and go back to the speaker I was using", Act::GoBack(false)),
-        ("Bring the sound back to this PC when a speaker stops responding", Act::WhenStops(WhenStops::StaySilent)),
-        ("Tell me when sound leaves the place I chose", Act::Notifications(false)),
+        ("Start when I sign in to Windows", Act::StartAtSignIn(false)),
+        ("Switch back to this PC after 30 minutes with nothing playing", Act::SwitchBackAfterQuiet(true)),
+        ("Show notes by the clock about where the sound is playing", Act::NotesByClock(false)),
+        ("Let Music Assistant play this PC’s sound", Act::OfferToMa(true)),
         ("Let scripts and home automation control this app", Act::Api(true)),
-        ("Let any device on this network listen", Act::OnlyPlaying(false)),
     ] {
-        h.flip(label);
-        assert_eq!(h.acts(), vec![act], "{label}");
+        let mut expected = h.port.state();
+        match &act {
+            Act::Shortcuts(v) => expected.general.shortcuts.as_mut().unwrap().on = *v,
+            Act::Phone(v) => { let p = expected.privacy.phone.as_mut().unwrap(); p.on = *v; p.link = None; }
+            Act::PlayCalls(v) => expected.general.play_calls = Some(*v),
+            Act::WhatPlays(v) => expected.general.what_plays = Some(*v),
+            Act::StartAtSignIn(v) => expected.general.start_at_sign_in = Some(Ok(*v)),
+            Act::SwitchBackAfterQuiet(v) => expected.general.switch_back_after_quiet = *v,
+            Act::NotesByClock(v) => expected.general.notes_by_clock = *v,
+            Act::OfferToMa(v) => expected.ma.offer = Some(*v),
+            Act::Api(v) => expected.privacy.api.as_mut().unwrap().on = *v,
+            _ => unreachable!(),
+        }
+        h.flip(label); assert_eq!(h.acts(), vec![act], "{label}");
+        let actual = h.port.state();
+        assert_eq!((actual.general, actual.privacy, actual.ma), (expected.general, expected.privacy, expected.ma));
     }
-    let s = h.port.state();
-    assert_eq!(s.general.when_stops, Some(WhenStops::StaySilent));
-    assert!(h.shows("Off: it keeps trying every 30 seconds"));
-    assert!(h.shows("Anyone on this network who knows the address"));
-    // Turning Music Assistant on opens its set-up.
-    let port = scripted(|s| s.ma.offer = Some(false));
-    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap(Scenario::Playing));
-    h.flip("Offer this PC to Music Assistant");
-    assert_eq!(h.acts(), vec![Act::OfferToMa(true)]);
     assert_eq!(h.asks(), vec![Asked::Open(Open::MusicAssistantSettings)]);
-}
-
-#[test]
-fn settings_lists_refused_devices_an_update_and_its_links() {
-    let port = scripted(|_| ());
-    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap(Scenario::Playing));
-    assert!(h.has("Version 0.2.1 is ready to install."), "an update is the first line");
-    h.click("Update now");
-    assert_eq!(h.acts(), vec![Act::UpdateNow]);
-    let allow = h.texts.iter().filter(|t| t.text == "Allow").map(|t| t.rect).next().unwrap();
-    h.click_at(allow.center());
-    assert_eq!(h.acts(), vec![Act::Allow { address: "192.168.1.51".into(), speaker: "kitchen".into() }]);
-    for (link, title) in [("Guides", "Guides"), ("Lab", "Lab"), ("About", "About")] {
-        h.click(link);
-        assert_eq!(h.asks(), vec![Asked::View(title.into())], "{link}");
-    }
-    h.click("Report a problem");
-    assert_eq!(h.asks(), vec![Asked::Dialog]);
+    h.click("Update now"); assert_eq!(h.acts(), vec![Act::UpdateNow]);
+    h.click("Report a problem"); assert_eq!(h.asks(), vec![Asked::Dialog]);
+    h.click("About"); assert_eq!(h.asks(), vec![Asked::View("About".into())]);
+    h.click("Quit, and play the sound on this PC"); assert_eq!(h.asks(), vec![Asked::Command(Command::Quit)]);
 }
 
 #[test]
 fn speaker_missing_adds_by_address_in_place() {
     let port = scripted(|_| ());
-    let mut h = H::new(port.clone(), Box::new(MissingView::new(port.clone())), snap(Scenario::Playing));
+    let mut h = H::new(port.clone(), Box::new(MissingView::new(port.clone())), snap("kitchen-playing"));
     assert_eq!(h.acts(), vec![Act::ResetProbe], "a new search when it opens");
     let field = h.find("192.168.1.20 or kitchen.local").unwrap();
     h.click_at(field.center());
@@ -412,7 +474,7 @@ fn speaker_missing_adds_by_address_in_place() {
     assert!(h.shows("Added Garage."));
     // Two ways: which one, then *Add*.
     let port = scripted(|_| ());
-    let mut h = H::new(port.clone(), Box::new(MissingView::new(port.clone()).with_address("192.168.20.40")), snap(Scenario::Playing));
+    let mut h = H::new(port.clone(), Box::new(MissingView::new(port.clone()).with_address("192.168.20.40")), snap("kitchen-playing"));
     h.acts();
     port.set(|s| {
         s.probe = Probe::Found {
@@ -431,7 +493,7 @@ fn speaker_missing_adds_by_address_in_place() {
     assert!(!h.view.holds_unused_text(), "added: nothing is left to lose");
     // Nothing answered: the address typed keeps the view open.
     let port = scripted(|_| ());
-    let mut h = H::new(port.clone(), Box::new(MissingView::new(port.clone()).with_address("192.168.1.20")), snap(Scenario::Playing));
+    let mut h = H::new(port.clone(), Box::new(MissingView::new(port.clone()).with_address("192.168.1.20")), snap("kitchen-playing"));
     h.click("Add");
     port.set(|s| s.probe = Probe::Nothing { address: "192.168.1.20".into() });
     h.settle();
@@ -448,7 +510,7 @@ fn speaker_missing_searches_shows_hidden_speakers_and_opens_the_check() {
         tv.cant_play = Some(CantPlay::AirPlayOff);
         s.speakers.speakers.push(tv);
     });
-    let mut h = H::new(port.clone(), Box::new(MissingView::new(port)), snap(Scenario::Playing));
+    let mut h = H::new(port.clone(), Box::new(MissingView::new(port)), snap("kitchen-playing"));
     h.acts();
     assert!(h.has("Looking on Wi-Fi “HomeNet” and Ethernet 2"), "no count of speakers");
     h.click("Search again");
@@ -466,49 +528,59 @@ fn speaker_missing_searches_shows_hidden_speakers_and_opens_the_check() {
 #[test]
 fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     let port = scripted(|s| s.playback.volume = Some(Err(Volume::Muted)));
-    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap(Scenario::Playing));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
     h.click("Unmute");
-    assert_eq!(h.asks(), vec![Asked::Command(Command::SetMuted { owner: VolumeOwner::Speaker(sid("kitchen")), muted: false })]);
+    assert_eq!(h.asks(), vec![Asked::Command(Command::SetMuted { owner: VolumeOwner::Speaker(crate::model::samples::kitchen()), muted: false })]);
     let port = scripted(|s| {
         s.playback.taking = Some(Err(Taking::NotAsking { two_ways: true }));
         s.playback.volume = None;
     });
-    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap(Scenario::Playing));
-    h.click("Reconnect");
-    assert_eq!(h.asks(), vec![Asked::Command(Command::Reconnect(sid("kitchen")))]);
-    h.click("Try the AirPlay connection");
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    h.click("Try Kitchen again");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::Reconnect(crate::model::samples::kitchen()))]);
+    h.click("Switch to Kitchen by AirPlay");
     assert_eq!(h.acts(), vec![Act::TryAirPlay]);
     assert!(!h.shows("volume"), "the check stops at the first broken step");
+    let port = scripted(|s| {
+        s.playback.taking = Some(Ok(Taking::CantTell));
+        s.playback.on_short = true;
+    });
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    h.click("Use “Steadier”");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::UseDelayChoice { speaker: sid("kitchen"), choice: crate::model::facts::DelayChoice::Steady })]);
     let port = scripted(|_| ());
-    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap(Scenario::Playing));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
     assert!(h.shows("Everything this PC can check looks right."));
-    h.click("Test sound");
-    assert_eq!(h.asks(), vec![Asked::Command(Command::PlayTestSound(sid("kitchen")))]);
+    h.click("Play a test chime");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::PlayTestSound(crate::model::samples::kitchen()))]);
 }
 
 #[test]
 fn music_assistant_about_and_lab_act_at_once() {
     let port = scripted(|s| s.ma.paused = true);
-    let mut h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap(Scenario::Playing));
+    let mut h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap("kitchen-playing"));
     h.click_link("Allow pairing again");
-    h.flip("Offer this PC to Music Assistant");
+    h.flip("Let Music Assistant play this PC’s sound");
     assert_eq!(h.acts(), vec![Act::AllowPairingAgain, Act::OfferToMa(false)]);
     let port = scripted(|s| s.ma.paired_with = vec!["Music Assistant (Home)".into()]);
-    let mut h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap(Scenario::Playing));
+    let mut h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap("kitchen-playing"));
     h.click_link("Unpair");
     assert_eq!(h.acts(), vec![Act::Unpair("Music Assistant (Home)".into())]);
 
     let port = scripted(|s| s.about.updates.state = UpdateState::UpToDate { at: Seen::Today(crate::model::text::LocalTime::new(9, 12)) });
-    let mut h = H::new(port.clone(), Box::new(super::AboutView::new(port)), snap(Scenario::Playing));
+    let mut h = H::new(port.clone(), Box::new(super::AboutView::new(port)), snap("kitchen-playing"));
     h.click("Check now");
-    h.click_link("Donate");
+    assert!(!h.has("Lab"));
+    h.flip("Show Lab");
+    h.click("Lab");
+    assert_eq!(h.asks(), vec![Asked::View("Lab".into())]);
     h.click("Licences and source");
     h.click("Show the welcome again");
-    assert_eq!(h.acts(), vec![Act::CheckNow, Act::Donate, Act::LicenceAndSource, Act::ShowWelcomeAgain]);
-    assert_eq!(h.asks(), vec![Asked::OpenPanel]);
+    assert_eq!(h.acts(), vec![Act::CheckNow, Act::ShowLab(true), Act::LicenceAndSource]);
+    assert_eq!(h.asks(), vec![Asked::Command(Command::FirstRunAction(crate::model::command::FirstRunAction::ShowAgain))]);
 
     let port = scripted(|s| s.lab.mfi = Some(true));
-    let mut h = H::new(port.clone(), Box::new(super::LabView::new(port)), snap(Scenario::Playing));
+    let mut h = H::new(port.clone(), Box::new(super::LabView::new(port)), snap("kitchen-playing"));
     assert!(h.shows("Settings for testing speakers"), "its warning first");
     h.click_link("Reset everything in Lab");
     assert_eq!(h.acts(), vec![Act::Lab(LabAct::ResetAll)]);
@@ -529,10 +601,9 @@ fn every_view(port: Arc<ScriptedSettings>) -> Vec<(String, Box<dyn crate::shell:
         ("music assistant".into(), Box::new(MusicAssistantView::new(p.clone()))),
         ("about".into(), Box::new(super::AboutView::new(p.clone()))),
         ("lab".into(), Box::new(super::LabView::new(p.clone()).with_counters())),
-        ("guides".into(), Box::new(GuidesView::new(p.clone()))),
     ];
     for id in ["kitchen", "living", "bedroom", "office", "garage", "den", "desk"] {
-        v.push((id.into(), Box::new(SpeakerOptions::new(p.clone(), id).with_open("bands").with_open("details").asking_to_forget())));
+        v.push((id.into(), Box::new(SpeakerOptions::new(p.clone(), id).with_open("bands").with_open("details"))));
     }
     v
 }
@@ -561,6 +632,34 @@ fn assert_clean(texts: &[Text], right: f32, what: &str) {
 }
 
 #[test]
+fn office_inactive_sentence_keeps_its_last_two_words_at_both_scales() {
+    let sentence = "Office isn’t playing now: you’ll hear a change the next time it plays.";
+    for scale in [1.0, 2.0] {
+        let mut h = speaker("office");
+        h.scale = scale;
+        h.settle();
+        // Choose a page width where the original wrap ends in just “plays.”
+        // even when the test machine uses fallback fonts.
+        let office = h.texts.iter().find(|t| t.text == sentence).unwrap();
+        assert!(office.words_per_row.last().unwrap() >= &2, "at panel width, scale {scale}");
+        let mut job = (*office.galley.job).clone();
+        job.wrap.max_width = f32::INFINITY;
+        let unwrapped = h.ctx.fonts(|f| f.layout_job(job.clone()));
+        let row = &unwrapped.rows[0];
+        let width = row.x_offset(row.glyphs.len() - "plays.".len()).ceil() + 1.0;
+        job.wrap.max_width = width;
+        let original = h.ctx.fonts(|f| f.layout_job(job));
+        assert_eq!(original.rows.last().unwrap().text(), "plays.");
+        h.width = width + 32.0;
+        h.settle();
+        let wrapped = h.texts.iter().find(|t| t.text == sentence).unwrap();
+        assert!(wrapped.galley.rows.last().unwrap().text().ends_with("it plays."));
+        assert!((original.rows.len()..=original.rows.len()+1).contains(&wrapped.words_per_row.len()));
+        assert!((width*0.75..width).contains(&wrapped.galley.job.wrap.max_width));
+    }
+}
+
+#[test]
 fn every_view_holds_at_the_panels_width_at_200_percent_with_longer_words_and_long_names() {
     STRETCH.with(|s| s.set(true));
     for scale in [1.0, 2.0] {
@@ -581,7 +680,6 @@ fn every_view_holds_at_the_panels_width_at_200_percent_with_longer_words_and_lon
                     ],
                 };
                 s.general.what_plays = Some(WhatPlays::OnlySentApps);
-                s.general.when_stops = Some(WhenStops::StaySilent);
                 s.privacy.only_playing = false;
                 if let Some(a) = &mut s.privacy.api {
                     a.on = true;
@@ -599,8 +697,8 @@ fn every_view_holds_at_the_panels_width_at_200_percent_with_longer_words_and_lon
                         s.probe = Probe::Nothing { address: "192.168.1.20".into() };
                     }
                 });
-                let h = H::sized(port.clone(), view, snap(Scenario::Playing), crate::panel::WIDTH, scale);
-                assert_clean(&h.texts, crate::panel::WIDTH, &format!("{what} {names:?} at {scale}"));
+                let h = H::sized(port.clone(), view, snap("kitchen-playing"), crate::surface::panel::WIDTH, scale);
+                assert_clean(&h.texts, crate::surface::panel::WIDTH, &format!("{what} {names:?} at {scale}"));
             }
         }
     }
@@ -630,13 +728,20 @@ fn tab_goes_through_a_speakers_view_in_reading_order() {
 /// the table's Settings block is said: what they drew.
 pub(in crate::settings) fn say_everything() -> Vec<String> {
     let lang = crate::model::text::Lang::English;
+    reset_and_remove_only_act_after_confirmation();
+    a_busy_chime_asks_in_the_page_before_playing();
+    tone_name_and_speaker_commands();
+    the_page_uses_the_panel_delay_commands_and_the_selected_ways_limits();
+    // Draw the exact-delay row with a saved change so the reset link is covered too.
+    let mut editor = speaker_in("kitchen", "kitchen-least-delay", |_| ());
+    editor.click("Type an exact delay…");
+    let mut drawn: Vec<String> = editor.texts.iter().map(|t| t.text.clone()).collect();
     // Every view in the states the example and these variants give.
     let variants: Vec<fn(&mut State)> = vec![
         |_| (),
         |s| {
             s.privacy.only_playing = false;
             s.general.what_plays = Some(WhatPlays::OnlySentApps);
-            s.general.when_stops = Some(WhenStops::StaySilent);
             s.general.start_at_sign_in = Some(Err("access denied".into()));
             if let Some(a) = &mut s.privacy.api {
                 a.on = true;
@@ -654,7 +759,6 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.ma.paired_with = vec!["Music Assistant (Home)".into()];
             s.ma.played = Some(Some(Date { day: 12, month: 10 }));
             s.about.updates.state = UpdateState::Failed { why: "no network".into() };
-            s.about.driver = Some(Driver::Running("1.1.2.215".into()));
             s.lab.carried_over = Some(CarriedOver { airplay_ms: Some(500), homepod_ms: Some(150), homepod_buffered: true, speakers: vec![] });
             s.playback.volume = Some(Err(Volume::Zero));
             s.playback.taking = Some(Err(Taking::NotAsking { two_ways: true }));
@@ -670,13 +774,6 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             tv.id = "guest".into();
             tv.cant_play = Some(CantPlay::AirPlayOff);
             s.speakers.speakers.push(tv);
-            for p in &mut s.pages {
-                p.comes_back = Some(ComesBack::WhenItAppears);
-                p.pairing = Some(Pairing::Paired { on: Some(Date { day: 3, month: 10 }) });
-                if let Some(d) = &mut p.delay {
-                    d.at_once = true;
-                }
-            }
         },
         |s| {
             s.speakers.networks.as_mut().unwrap().looking = Looking::Nowhere;
@@ -687,9 +784,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers".into() }));
             s.general.shortcuts.as_mut().unwrap().on = true;
             for p in &mut s.pages {
-                p.comes_back = Some(ComesBack::Never);
                 p.row.presence = Presence::Connecting;
-                p.group = Some(Group::AppleTv { members: vec!["A".into(), "B".into()] });
             }
         },
         |s| {
@@ -702,9 +797,6 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.about.updates.state = UpdateState::Checking;
             for p in &mut s.pages {
                 p.row.presence = Presence::Ready;
-                if let Some(d) = &mut p.delay {
-                    d.status.choice = Some(DelayChoice::Short);
-                }
             }
         },
         |s| {
@@ -728,7 +820,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.ma.paired_with = vec!["x".into()];
             s.ma.played = Some(None);
         },
-        |s| s.about.updates.state = UpdateState::NotSigned,
+        |s| { s.about.updates.state = UpdateState::NotSigned; s.general.shortcuts.as_mut().unwrap().on = false; },
         |s| s.about.updates.state = UpdateState::DevBuild,
         |s| {
             s.about.updates.state = UpdateState::UpToDate { at: Seen::On(Date { day: 3, month: 1 }) };
@@ -736,9 +828,6 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.ma.found_by = None;
             s.ma.paired_with.clear();
             s.lab.carried_over = Some(CarriedOver { airplay_ms: Some(500), homepod_ms: None, homepod_buffered: false, speakers: vec!["Office".into()] });
-            for p in &mut s.pages {
-                p.delay.iter_mut().for_each(|d| d.measured = Some((210, Date { day: 12, month: 10 })));
-            }
         },
         |s| {
             s.about.updates.state = UpdateState::Available { version: "0.2.1".into(), at: None };
@@ -756,19 +845,18 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.playback.apple_tv = true;
         },
     ];
-    let mut drawn: Vec<String> = Vec::new();
     for v in variants {
         let port = scripted(v);
         for (_, view) in every_view(port.clone()) {
-            let h = H::new(port.clone(), view, snap(Scenario::Playing));
+            let h = H::new(port.clone(), view, snap("kitchen-playing"));
             drawn.extend(h.texts.iter().map(|t| t.text.clone()));
         }
         // Speakers in the states their views have.
         for id in ["kitchen", "office", "garage", "desk", "bedroom", "den"] {
-            let h = H::new(port.clone(), Box::new(SpeakerOptions::new(port.clone(), id)), snap(Scenario::Playing));
+            let h = H::new(port.clone(), Box::new(SpeakerOptions::new(port.clone(), id)), snap("kitchen-playing"));
             drawn.extend(h.texts.iter().map(|t| t.text.clone()));
         }
-        let h = H::new(port.clone(), Box::new(SpeakerOptions::new(port.clone(), "den")), snap(Scenario::NeedsPairing));
+        let h = H::new(port.clone(), Box::new(SpeakerOptions::new(port.clone(), "den")), snap("pc-den-needs-code"));
         drawn.extend(h.texts.iter().map(|t| t.text.clone()));
     }
     // Speaker missing? with each result of an address.
@@ -786,7 +874,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
         },
     ] {
         let port = scripted(|_| ());
-        let mut h = H::new(port.clone(), Box::new(MissingView::new(port.clone()).with_address("x")), snap(Scenario::Playing));
+        let mut h = H::new(port.clone(), Box::new(MissingView::new(port.clone()).with_address("x")), snap("kitchen-playing"));
         h.click("Add");
         port.set(|s| s.probe = probe.clone());
         h.settle();
@@ -796,16 +884,13 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
     // password; the shortcut being recorded; Lab with its counters closed.
     let port = scripted(|_| ());
     let mut look = |h: &H| drawn.extend(h.texts.iter().map(|t| t.text.clone()));
-    look(&H::new(port.clone(), Box::new(SpeakerOptions::new(port.clone(), "gone")), snap(Scenario::Playing)));
+    look(&H::new(port.clone(), Box::new(SpeakerOptions::new(port.clone(), "gone")), snap("kitchen-playing")));
     let hidden = port.state().speakers.hidden[0].id.clone();
-    look(&H::new(port.clone(), Box::new(SpeakerOptions::new(port.clone(), &hidden)), snap(Scenario::Playing)));
-    let engine = ScriptedEngine::new(Scenario::Playing);
-    let mut f = engine.facts();
-    f.state = NowState::NeedsSecret { speaker: sid("office"), secret: Secret::Password };
-    engine.set_facts(f);
+    look(&H::new(port.clone(), Box::new(SpeakerOptions::new(port.clone(), &hidden)), snap("kitchen-playing")));
+    let engine = ScriptedEngine::new("pc-office-needs-password");
     look(&H::new(port.clone(), Box::new(SpeakerOptions::new(port.clone(), "office")), engine.snapshot()));
-    look(&H::new(port.clone(), Box::new(super::LabView::new(port.clone())), snap(Scenario::Playing)));
-    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port.clone())), snap(Scenario::Playing));
+    look(&H::new(port.clone(), Box::new(super::LabView::new(port.clone())), snap("kitchen-playing")));
+    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port.clone())), snap("kitchen-playing"));
     h.click("Change…");
     look(&h);
     for m in 1..=12 {
@@ -813,4 +898,85 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
     }
     let _ = crate::settings::words::seen(lang, Seen::Yesterday(crate::model::text::LocalTime::new(22, 10)));
     drawn
+}
+
+fn welcome_page(snap: Arc<Snapshot>) -> H {
+    H::new(scripted(|_| ()), Box::new(FirstRunPage::new(snap.scene.situation.first_run.clone().unwrap())), snap)
+}
+
+pub(crate) fn draw_welcome_words() {
+    for sample in ["pc-welcome-pick", "pc-welcome-busy", "pc-welcome-looking", "pc-welcome-none-found", "pc-welcome-chime", "kitchen-welcome-done"] {
+        welcome_page(snap(sample));
+    }
+    let snap = snap("pc-welcome-chime");
+    let port = scripted(|_| ());
+    let view = CantHearView::for_speaker(port.clone(), Some(sid("kitchen")));
+    H::new(port, Box::new(view), snap);
+}
+
+#[test]
+fn welcome_pages_and_their_controls() {
+    use crate::model::command::FirstRunAction as A;
+    let command = |a| Asked::Command(Command::FirstRunAction(a));
+    let page = |name| welcome_page(snap(name));
+    let ordered = |h: &H, words: &[&str]| {
+        let mut texts = h.texts.iter();
+        for word in words {
+            assert!(texts.any(|t| t.text == *word), "missing or out of order: {word} in {:?}", h.texts.iter().map(|t| &t.text).collect::<Vec<_>>());
+        }
+        assert_clean(&h.texts, h.width, words[0]);
+    };
+    let engine = ScriptedEngine::new("pc-welcome-pick");
+    let mut scene = engine.snapshot().scene.clone();
+    for speaker in &mut scene.speakers { speaker.used_here = false; }
+    engine.publish(scene);
+    assert!(engine.snapshot().panel.list.rows.is_empty());
+    let mut h = welcome_page(engine.snapshot());
+    ordered(&h, &["Where should this PC’s sound play?", "Click a speaker to hear a short chime on it.", "Bedroom", "Kitchen", "Office", "Looking for more speakers…", "Speaker missing?", "Settings"]);
+    assert!(!h.view.has_back() && !h.has("This PC") && !h.has("Can’t hear it?"));
+    assert_eq!(h.find("Kitchen").unwrap().left(), 46.0);
+    h.click("Kitchen");
+    assert_eq!(h.asks(), [command(A::Chime(sid("kitchen")))]);
+    h.click_at(egui::pos2(358.0, h.find("Kitchen").unwrap().center().y));
+    assert_eq!(h.asks(), [command(A::Chime(sid("kitchen")))], "the gear slot belongs to the row");
+    h.click("Settings");
+    assert_eq!(h.asks(), [Asked::Open(Open::Settings)]);
+    assert!(page("pc-welcome-looking").has("Looking for speakers…"));
+    let mut h = page("pc-welcome-none-found");
+    ordered(&h, &["No speakers found on the network.", "Why?", "Speaker missing?", "Settings"]);
+    h.click("Why?");
+    assert_eq!(h.asks(), [Asked::Open(Open::SpeakerMissing)]);
+    let mut h = page("pc-welcome-busy");
+    ordered(&h, &["Kitchen", "Kitchen is playing something else. A test chime stops it, and it may not start again by itself.", "Play a test chime", "Cancel", "Living Room + Dining Room"]);
+    for (label, yes) in [("Cancel", false), ("Play a test chime", true)] {
+        h.click(label);
+        assert_eq!(h.asks(), [Asked::Command(Command::Confirm { yes })]);
+    }
+
+    let mut h = page("pc-welcome-chime");
+    ordered(&h, &["Did you hear the chime on Kitchen?", "If you did, this PC’s sound will play on Kitchen.", "I heard it", "I didn’t hear it", "Volume on Kitchen", "25", "Play it again", "Use Kitchen without checking", "Choose another speaker"]);
+    assert!(h.view.has_back() && !h.has("Bedroom"));
+    h.click_at(egui::pos2(170.0, h.find("25").unwrap().center().y));
+    let levels = h.asks();
+    assert!(matches!(levels.last(), Some(Asked::Command(Command::FirstRunAction(A::ChimeVolume(v)))) if *v > 25));
+    for (a, b) in [("I heard it", "I didn’t hear it"), ("Play it again", "Use Kitchen without checking")] {
+        assert_eq!(h.find(a).unwrap().center().y, h.find(b).unwrap().center().y);
+    }
+    for (word, act) in [("Choose another speaker", A::ChooseAnother), ("I heard it", A::Heard), ("Play it again", A::ChimeAgain), ("Use Kitchen without checking", A::UseWithoutChecking)] {
+        h.click(word);
+        assert_eq!(h.asks(), [command(act)]);
+    }
+    h.click("I didn’t hear it");
+    let dest = Open::CantHear(Some(sid("kitchen")));
+    assert_eq!(h.asks(), [Asked::Open(dest.clone())]);
+    let views = SettingsViews::new(h.port.clone());
+    let help = H::new(h.port.clone(), views.view(&dest, &h.snap).unwrap(), h.snap.clone());
+    assert!(help.has("This PC sent the chime to Kitchen."));
+    let mut h = page("kitchen-welcome-done");
+    ordered(&h, &["Kitchen now plays this PC’s sound", "It stays on Kitchen until you switch it.", "The app’s icon is by the clock, or under the ^ arrow there. A click on it opens the same controls as this window.", "Start when I sign in to Windows", "Done"]);
+    assert!(!h.view.has_back());
+    h.flip("Start when I sign in to Windows");
+    assert_eq!(h.asks(), [command(A::StartAtSignIn(false))]);
+    h.click("Done");
+    assert_eq!(h.asks(), [command(A::Done)]);
 }
