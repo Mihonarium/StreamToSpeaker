@@ -692,10 +692,31 @@ function Test-TaskbarButtons($rec, [string]$when, [switch]$ExpectMain) {
     }
 }
 
-# Click the button that shows the hidden icons; where the app's icon is
-# among them: an element of the hidden icons' window named as the tray icon
-# is, and found there again by its place.
+# Where the app's icon is among the hidden icons while they are open: an
+# element of the hidden icons' window named as the tray icon is, and found
+# there again by its place. $null when they are closed or it isn't there.
+function Find-HiddenIcon {
+    foreach ($class in "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland") {
+        foreach ($hit in @(Find-UiaNamed (Get-UiaTopLevel $class) $TrayPattern)) {
+            $icon = Get-TrayIconAt $hit.X $hit.Y
+            if ($icon) {
+                return [pscustomobject]@{ Where = "hidden"; X = $icon.X; Y = $icon.Y; What = "the hidden icons' button $($icon.What) in $class" }
+            }
+        }
+    }
+    $null
+}
+
+# Open the hidden icons and return where the app's icon is among them. They
+# can still be open from the quit before the start; a click on their
+# button would close them then.
 function Open-HiddenIcons($rec) {
+    $open = Find-HiddenIcon
+    if ($open) {
+        $rec.Note("the hidden icons were open already")
+        Say "The hidden icons were open already"
+        return $open
+    }
     $bar = Get-UiaTopLevel "Shell_TrayWnd"
     $chevron = @(Find-UiaNamed $bar '(?i)chevron|hidden icons') | Select-Object -First 1
     if (-not $chevron) { throw "found no button for the hidden icons on the taskbar" }
@@ -705,14 +726,8 @@ function Open-HiddenIcons($rec) {
     $deadline = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 300
-        foreach ($class in "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland") {
-            foreach ($hit in @(Find-UiaNamed (Get-UiaTopLevel $class) $TrayPattern)) {
-                $icon = Get-TrayIconAt $hit.X $hit.Y
-                if ($icon) {
-                    return [pscustomobject]@{ Where = "hidden"; X = $icon.X; Y = $icon.Y; What = "the hidden icons' button $($icon.What) in $class" }
-                }
-            }
-        }
+        $icon = Find-HiddenIcon
+        if ($icon) { return $icon }
     }
     $rec.Shot("hidden-icons-without-the-app")
     throw "the hidden icons opened without the app's icon among them ('$TrayTip...')"
