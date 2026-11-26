@@ -196,10 +196,7 @@ impl ActiveSession {
     /// keeps its own volume per speaker.
     pub fn volume_control(&self) -> Option<VolumeControl> {
         match self {
-            ActiveSession::Upnp(s) => Some(match s.renderer.group_volume_control_url() {
-                Some(url) => VolumeControl::UpnpGroup(url.to_string()),
-                None => VolumeControl::Upnp(s.renderer.rendering_control_control_url.clone()),
-            }),
+            ActiveSession::Upnp(s) => Some(VolumeControl::upnp(&s.renderer)),
             ActiveSession::AirPlay(s) => Some(VolumeControl::AirPlay(s.volume_control())),
             ActiveSession::AirPlay2(s) => Some(VolumeControl::AirPlay2(s.volume_control())),
             ActiveSession::Sendspin(s) => Some(VolumeControl::Sendspin(s.volume_control())),
@@ -208,10 +205,9 @@ impl ActiveSession {
     }
 
     /// The speaker's level as its session starts, when known without
-    /// asking it: AirPlay sessions set it as they start, and a Sendspin
-    /// player counts only if it reported one as it connected (one that
-    /// takes the volume command but sends no level gives None). None for
-    /// UPnP, whose speaker has to be asked, and Music Assistant.
+    /// asking it. AirPlay starts at the level the app sets. Sendspin uses
+    /// the player's level when reported, or the app's level for a player
+    /// with fixed volume. A UPnP speaker has to be asked separately.
     pub fn level_on_connect(&self) -> Option<u32> {
         match self {
             ActiveSession::AirPlay(s) => Some(s.volume_pct()),
@@ -279,9 +275,9 @@ impl ActiveSession {
         }
     }
 
-    /// The fault that ended the session when a reconnect can't fix it
-    /// (e.g. the receiver rejected our authentication). Such a session is
-    /// ended without the engine's tries.
+    /// The final fault reported by AirPlay 2. If authentication failed,
+    /// the engine treats the receiver as asking for its code. For other
+    /// faults it retries while sound is playing.
     pub fn final_fault(&self) -> Option<crate::airplay::ap2_health::Ap2Fault> {
         match self {
             ActiveSession::AirPlay2(s) => s
@@ -337,6 +333,13 @@ pub enum VolumeControl {
 }
 
 impl VolumeControl {
+    fn upnp(r: &Renderer) -> Self {
+        match r.group_volume_control_url() {
+            Some(url) => Self::UpnpGroup(url.to_owned()),
+            None => Self::Upnp(r.rendering_control_control_url.clone()),
+        }
+    }
+
     pub fn set_volume_pct(&self, pct: u32) -> Result<()> {
         match self {
             VolumeControl::Upnp(url) => upnp::set_volume(url, pct),
@@ -500,7 +503,12 @@ fn run_speaker_control(
         let Some(control) = control else { continue };
         let result = match cmd {
             SpeakerCommand::Volume(level) => {
-                let result = control.set_volume_pct(level);
+                // AirPlay uses its volume for mute. Keep the level for the next unmute.
+                let result = match &control {
+                    VolumeControl::AirPlay(h) if vsync.is_muted() => Ok(h.remember_volume_pct(level)),
+                    VolumeControl::AirPlay2(h) if vsync.is_muted() => Ok(h.remember_volume_pct(level)),
+                    _ => control.set_volume_pct(level),
+                };
                 vsync.speaker_send_done();
                 settle_due = true;
                 result
@@ -698,6 +706,11 @@ pub struct PasswordDialog {
     pub one_session: bool,
 }
 
+enum TypedPassword {
+    Once(String),
+    Saved,
+}
+
 /// In-memory update-check state (the persistent part lives in `UserConfig`).
 #[derive(Clone, Debug, Default)]
 pub struct UpdateState {
@@ -714,11 +727,8 @@ pub struct App {
     // ---- Discovery + active session ----
     pub discovery: Option<Arc<DiscoveryState>>,
     pub airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
-    /// Passwords typed for an AirPlay receiver that announces another
-    /// speaker's identity (a newcomer, see `RaopDetails::newcomer`), by
-    /// its id (`airplay:<MAC>/<instance>`): used for the next connect to
-    /// it, never stored.
-    unsaved_airplay_passwords: Mutex<std::collections::HashMap<String, String>>,
+    /// What the password dialog supplied for the next connect to each receiver.
+    typed_airplay_passwords: Mutex<std::collections::HashMap<String, TypedPassword>>,
     /// AirPlay receivers (by id) that asked for a password in this run,
     /// whether or not they announce one: picking them opens the password
     /// dialog, as for one that does.
@@ -879,12 +889,12 @@ pub struct App {
     discovery_error: Mutex<Option<String>>,
     /// Where today's entry points (the window, the tray, the web API, the
     /// terminal prompt) send their commands once the engine runs.
-    command_sink: OnceLock<CommandSink>,
+    pub(crate) command_sink: OnceLock<CommandSink>,
     pub(crate) engine_port: OnceLock<std::sync::Weak<crate::model::PortCore>>,
     engine_connects: Mutex<EngineConnects>,
     engine_connect_ended: Condvar,
-    /// The test sound being played: the next frame of it.
-    test_sound: Mutex<Option<usize>>,
+    /// The session the chime plays on and its next frame.
+    test_sound: Mutex<Option<(u64, usize)>>,
     pub(crate) capture_tap: std::sync::OnceLock<crate::engine::place_driver::tap::Tap>,
     /// Devices refused the stream lately, newest first.
     refused: Mutex<Vec<RefusedDevice>>,
@@ -903,6 +913,7 @@ pub struct App {
     /// The speaker this PC played on last and when that ended: its
     /// announcement may still say it receives for a moment.
     last_ended: Mutex<Option<(String, Instant)>>,
+    device_uses: Arc<DeviceUses>,
 }
 
 /// Takes a command for the engine (see [`App::set_command_sink`]); the
@@ -999,6 +1010,17 @@ pub struct DiscoveryNetStatus {
     pub error: Option<String>,
 }
 
+/// Take a session under the session lock and remember which speaker the connect let go.
+fn take_for_connect(slot: &mut Option<ActiveSession>, number: u64, job: Option<&crate::engine::cancel::Binding>) -> Option<ActiveSession> {
+    let session = slot.take()?;
+    if let Some(job) = job {
+        let taken = (session.stable_id(), number);
+        let mut released = job.released.lock().unwrap();
+        if !released.contains(&taken) { released.push(taken); }
+    }
+    Some(session)
+}
+
 /// A PIN pairing ceremony in flight (see [`App::begin_pin_pairing`]).
 struct PinCeremonyState {
     /// Stable id of the receiver being paired.
@@ -1006,6 +1028,8 @@ struct PinCeremonyState {
     /// Friendly name, for the modal + toasts.
     name: String,
     stage: PinStage,
+    /// The person cancelled the dialog.
+    cancelled: Arc<AtomicBool>,
     /// What the last code, or the last ask for a new one, came to.
     code_try: Option<CodeTry>,
 }
@@ -1032,10 +1056,8 @@ enum PinAnswer {
 enum PinStage {
     /// Connecting + /pair-pin-start — the receiver isn't showing a PIN yet.
     Starting,
-    /// The receiver is displaying its PIN; the ceremony thread is parked
-    /// on the receiver end of this channel. The GUI modal is (or is about
-    /// to be) up; [`App::submit_pin`] sends the PIN (or `None` = cancel).
-    AwaitingPin(crossbeam_channel::Sender<PinAnswer>),
+    /// The ceremony waits here even if the code expired or the TV failed to show it.
+    AwaitingPin { answers: crossbeam_channel::Sender<PinAnswer>, expires: Instant },
     /// PIN received — pair-setup M1–M6 is running.
     Pairing,
 }
@@ -1177,16 +1199,82 @@ enum SelectFailure {
     Msg(String),
 }
 
-/// RAII cleanup for a PIN pairing ceremony: on any exit (success, error,
-/// cancel, timeout, panic, failed thread spawn) it clears the ceremony
-/// slot so the modal closes and the user can try again. Constructed right
-/// after the slot is reserved and moved into the ceremony thread, so the
-/// pre-spawn early-return paths clean up by simply dropping it.
-struct CeremonyGuard(Arc<App>);
+fn check_job() -> Result<(), String> {
+    if crate::engine::cancel::cancelled() { Err(SUPERSEDED.into()) } else { Ok(()) }
+}
+
+fn chime_airplay<T>(
+    in_window: bool,
+    mut connect: impl FnMut() -> Result<T, SelectFailure>,
+    pair: impl FnOnce(String, String) -> Result<(), String>,
+) -> Result<T, String> {
+    check_job()?;
+    let mut result = connect();
+    if in_window {
+        if let Err(SelectFailure::NeedsPin { id, name, .. }) = result {
+            check_job()?;
+            pair(id, name)?;
+            check_job()?;
+            result = connect();
+        }
+    }
+    result.map_err(|e| match e {
+        SelectFailure::Msg(m) => m,
+        SelectFailure::NeedsPin { name, .. } => format!("{name} needs its code"),
+    })
+}
+
+#[derive(Default)]
+struct DeviceUses {
+    devices: Mutex<Vec<Arc<SessionDevice>>>,
+    ended: Condvar,
+}
+
+impl DeviceUses {
+    fn register(self: &Arc<Self>, devices: &mut Vec<Arc<SessionDevice>>, device: SessionDevice) -> DeviceUse {
+        let device = Arc::new(device);
+        devices.push(device.clone());
+        DeviceUse { uses: self.clone(), device }
+    }
+}
+
+struct SessionDevice {
+    id: String,
+    speaker: Option<crate::model::SpeakerId>,
+    renderer: Option<Renderer>,
+}
+
+/// Held from before a connect starts playback until it binds or finishes stopping,
+/// and from taking a bound session until its teardown ends.
+struct DeviceUse {
+    uses: Arc<DeviceUses>,
+    device: Arc<SessionDevice>,
+}
+
+impl Drop for DeviceUse {
+    fn drop(&mut self) {
+        self.uses.devices.lock().unwrap().retain(|d| !Arc::ptr_eq(d, &self.device));
+        self.uses.ended.notify_all();
+    }
+}
+
+pub(crate) struct ReleasingSession {
+    session: ActiveSession,
+    device: DeviceUse,
+}
+
+impl ReleasingSession {
+    pub(crate) fn stop(self) {
+        self.session.stop();
+    }
+}
+
+/// Clears this ceremony's prompt when it ends, including when its thread fails to start.
+struct CeremonyGuard(Arc<App>, Arc<AtomicBool>);
 
 impl Drop for CeremonyGuard {
     fn drop(&mut self) {
-        *self.0.pin_ceremony.lock().unwrap() = None;
+        self.0.pin_ceremony.lock().unwrap().take_if(|s| Arc::ptr_eq(&s.cancelled, &self.1));
     }
 }
 
@@ -1275,7 +1363,7 @@ impl App {
             config,
             discovery,
             airplay_discovery,
-            unsaved_airplay_passwords: Mutex::new(std::collections::HashMap::new()),
+            typed_airplay_passwords: Mutex::new(std::collections::HashMap::new()),
             airplay_asked_password: Mutex::new(std::collections::HashSet::new()),
             session,
             last_speaker_id,
@@ -1342,6 +1430,7 @@ impl App {
             signals: Default::default(),
             sounding_apps: Mutex::default(),
             last_ended: Mutex::new(None),
+            device_uses: Arc::default(),
         });
         if web_initial {
             if let Err(e) = app.set_web_ui_enabled(true) {
@@ -1695,6 +1784,7 @@ impl App {
             self.keep_typed_password(id, pw);
             return;
         }
+        self.forget_typed_password(id);
         let mut uc = self.user_config.lock().unwrap();
         if pw.is_empty() {
             uc.remove_airplay_password(id);
@@ -1739,6 +1829,9 @@ impl App {
             self.keep_typed_password(&dialog.id, pw);
         } else {
             self.set_airplay_password(&dialog.id, pw);
+            if !pw.is_empty() {
+                self.typed_airplay_passwords.lock().unwrap().insert(dialog.id.clone(), TypedPassword::Saved);
+            }
         }
         Ok(())
     }
@@ -1754,34 +1847,34 @@ impl App {
     /// Keep `pw` for the next connect to `id` only (an empty one clears
     /// it); never stored.
     fn keep_typed_password(&self, id: &str, pw: &str) {
-        let mut typed = self.unsaved_airplay_passwords.lock().unwrap();
+        let mut typed = self.typed_airplay_passwords.lock().unwrap();
         if pw.is_empty() {
             typed.remove(id);
         } else {
-            typed.insert(id.to_string(), pw.to_string());
+            typed.insert(id.to_string(), TypedPassword::Once(pw.to_string()));
         }
     }
 
     /// A password typed for one connection lives until the connect it was
     /// typed for ends, used or not.
     fn forget_typed_password(&self, id: &str) {
-        self.unsaved_airplay_passwords.lock().unwrap().remove(id);
+        self.typed_airplay_passwords.lock().unwrap().remove(id);
     }
 
-    /// The password for a connect to `renderer`: one typed for it for one
-    /// connection (under its id, or its instance's id when the conflict it
-    /// was typed in has ended since), used once; else the stored one,
-    /// which a newcomer never gets.
-    fn airplay_password_for(&self, renderer: &AirPlayRenderer) -> Option<String> {
+    /// The password to send, and whether it came from the dialog for this connection.
+    /// A one-connection password follows its instance if an identity conflict ends.
+    fn airplay_password_for(&self, renderer: &AirPlayRenderer) -> (Option<String>, bool) {
         let stable_id = renderer.stable_id();
         let typed = {
-            let mut typed = self.unsaved_airplay_passwords.lock().unwrap();
-            typed.remove(&stable_id).or_else(|| renderer.instance_id().and_then(|k| typed.remove(&k)))
+            let mut typed = self.typed_airplay_passwords.lock().unwrap();
+            renderer.instance_id().and_then(|k| typed.remove(&k)).or_else(|| typed.remove(&stable_id))
         };
-        typed.or_else(|| {
-            let stored = !renderer.is_newcomer();
-            self.user_config.lock().unwrap().airplay_passwords.get(&stable_id).filter(|_| stored).cloned()
-        })
+        if let Some(TypedPassword::Once(pw)) = typed {
+            return (Some(pw), true);
+        }
+        let password = self.user_config.lock().unwrap().airplay_passwords.get(&stable_id).filter(|_| !renderer.is_newcomer()).cloned();
+        let entered = password.is_some() && matches!(typed, Some(TypedPassword::Saved));
+        (password, entered)
     }
 
     /// Does `id` name a discovered AirPlay receiver (or pair) that
@@ -1796,7 +1889,7 @@ impl App {
     /// Whether a discovered device is password-protected (needs a
     /// password entered before it can connect).
     pub fn is_password_protected(&self, id: &str) -> bool {
-        self.airplay_asked_password.lock().unwrap().contains(id)
+        self.asked_for_password(id)
             || self
                 .airplay_discovery
                 .as_ref()
@@ -1986,7 +2079,7 @@ impl App {
         let stopped = {
             let mut guard = self.session.lock().unwrap();
             if guard.as_ref().map_or(false, |s| s.stable_id() == id) {
-                guard.take()
+                guard.take().map(|s| self.releasing(s, None))
             } else {
                 None
             }
@@ -2059,7 +2152,7 @@ impl App {
             let stopped = {
                 let mut guard = app.session.lock().unwrap();
                 if guard.as_ref().is_some_and(|s| s.stable_id() == id) {
-                    guard.take()
+                    guard.take().map(|s| app.releasing(s, None))
                 } else {
                     None
                 }
@@ -2377,11 +2470,11 @@ impl App {
     }
 
     /// Record that the user picked a speaker (see `user_picks`).
-    pub(crate) fn note_user_pick(&self) {
-        self.user_picks.fetch_add(1, Ordering::SeqCst);
+    pub(crate) fn note_user_pick(&self) -> u64 {
+        self.user_picks.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
     }
 
-    /// How many speakers the user has picked so far (see `user_picks`).
+    /// How many times the person chose where the sound plays.
     pub(crate) fn user_pick_count(&self) -> u64 {
         self.user_picks.load(Ordering::SeqCst)
     }
@@ -2402,7 +2495,7 @@ impl App {
     /// under the same `connecting` lock every select claims, so an
     /// automatic connect can never replace a speaker the user picked.
     fn select_speaker_async_opts(self: &Arc<Self>, id: &str, interactive: bool, only_if_idle: bool) {
-        self.select_speaker_async_full(id, interactive, only_if_idle, None, None);
+        self.select_speaker_async_full(id, interactive, only_if_idle, None);
     }
 
     /// Automatic, non-interactive connect that gives way to the user:
@@ -2415,28 +2508,7 @@ impl App {
         if self.command_sink.get().is_some() {
             return;
         }
-        self.select_speaker_async_full(id, false, false, Some(picks_seen), None);
-    }
-
-    /// [`select_speaker_async_opts`] carrying a Sendspin pairing input
-    /// (token or code) for a speaker that needs pairing.
-    ///
-    /// [`select_speaker_async_opts`]: App::select_speaker_async_opts
-    pub(crate) fn select_speaker_async_with(
-        self: &Arc<Self>,
-        id: &str,
-        interactive: bool,
-        sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
-    ) {
-        if sendspin_pairing.is_none() && self.command_sink.get().is_some() {
-            // A pick in the window goes to the engine; an automatic one
-            // (the launch reconnect) is the engine's own decision.
-            if interactive {
-                self.send_command(crate::model::Surface::Panel, crate::model::Command::Switch { place: place_of(id), way: None });
-            }
-            return;
-        }
-        self.select_speaker_async_full(id, interactive, false, None, sendspin_pairing);
+        self.select_speaker_async_full(id, false, false, Some(picks_seen));
     }
 
     fn select_speaker_async_full(
@@ -2445,7 +2517,6 @@ impl App {
         interactive: bool,
         only_if_idle: bool,
         unless_picked_since: Option<u64>,
-        sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
     ) {
         {
             let mut guard = self.connecting.lock().unwrap();
@@ -2467,7 +2538,7 @@ impl App {
             }
             // Resolve a display name best-effort for the banner.
             let name = self.speaker_name(id).unwrap_or_else(|| id.to_string());
-            *guard = Some(if sendspin_pairing.is_some() { format!("{} (pairing)", name) } else { name });
+            *guard = Some(name);
         }
         let app = self.clone();
         let requested = id;
@@ -2478,7 +2549,7 @@ impl App {
                 // A click is the user's choice; other background connects
                 // (reconnects, auto-connect) only bind while streaming is
                 // still enabled.
-                let result = app.select_speaker_inner(&id, interactive, interactive, sendspin_pairing);
+                let result = app.select_speaker_opts(&id, interactive, interactive);
                 app.forget_typed_password(&id);
                 *app.connecting.lock().unwrap() = None;
                 app.clear_connecting_notice();
@@ -2623,7 +2694,7 @@ impl App {
         let Some(sink) = self.command_sink.get() else { return Err("Stream To Speaker isn't running.".into()) };
         let command = match picks_seen {
             Some(count) => crate::model::Command::PlayWhenListed { speaker: speaker.clone(), picks_seen: count },
-            None => crate::model::Command::Switch { place: crate::model::Place::of_speaker(&speaker), way: None },
+            None => crate::model::Command::Switch { place: place_of(id), way: None },
         };
         let outcome = sink(from, command).wait(Duration::from_secs(10));
         let Some(outcome) = outcome else {
@@ -2721,7 +2792,7 @@ impl App {
             }
             *guard = Some(self.speaker_name(id).unwrap_or_else(|| id.to_string()));
         }
-        let result = self.select_speaker_inner(id, false, false, None);
+        let result = self.select_speaker_opts(id, false, false);
         *self.connecting.lock().unwrap() = None;
         self.clear_connecting_notice();
         result.map_err(Some)
@@ -2736,16 +2807,6 @@ impl App {
         id: &str,
         interactive: bool,
         user_choice: bool,
-    ) -> Result<(), String> {
-        self.select_speaker_inner(id, interactive, user_choice, None)
-    }
-
-    fn select_speaker_inner(
-        self: &Arc<Self>,
-        id: &str,
-        interactive: bool,
-        user_choice: bool,
-        sendspin_pairing: Option<crate::sendspin::server::PairingInput>,
     ) -> Result<(), String> {
         // A receiver that announces another speaker's identity is played
         // only when a person picks it, one session at a time: no
@@ -2803,10 +2864,11 @@ impl App {
             if crate::engine::cancel::cancelled() {
                 return Err(SUPERSEDED.into());
             }
-            if guard.as_ref().is_some_and(|s| s.is_device(id, target.as_ref())) { guard.take() } else { None }
+            if guard.as_ref().is_some_and(|s| s.is_device(id, target.as_ref())) {
+                take_for_connect(&mut guard, self.session_number(), crate::engine::cancel::binding().as_deref()).map(|s| self.releasing(s, None))
+            } else { None }
         };
         if let Some(old) = replacing { old.stop(); }
-
         // The session's stable id can legitimately differ from the
         // requested one: selecting a Sonos that joined a group since the
         // last scan streams to its group coordinator instead (see
@@ -2814,10 +2876,12 @@ impl App {
         // active-row highlighting track reality.
         let manual = self.find_manual_speaker(id);
         let asking = crate::engine::cancel::asking_speaker();
-        let new_session = if id == crate::sendspin_app::MA_OUTPUT_ID {
-            self.start_ma_output()?
+        let started = if id == crate::sendspin_app::MA_OUTPUT_ID {
+            let device = self.wait_for_release(id, None)?;
+            (self.start_ma_output()?, device)
         } else if crate::sendspin_app::is_sendspin_id(id) {
-            self.start_sendspin_player(id, sendspin_pairing, interactive)?
+            let device = self.wait_for_release(id, None)?;
+            (self.start_sendspin_player(id, interactive)?, device)
         } else if let Some(m) = manual.as_ref().filter(|m| m.kind == ManualKind::Upnp) {
             self.start_upnp_manual(m)?
         } else if id.starts_with("airplay:") {
@@ -2841,20 +2905,8 @@ impl App {
                     // says where to do it instead.
                     if interactive {
                         if crate::engine::cancel::binding().is_some() && pid == id {
-                            // The engine job owns the reconnect. A closed sender means
-                            // the ceremony ended without a usable code.
-                            let (paired, result) = std::sync::mpsc::channel();
-                            self.begin_pin_pairing(pid, name.clone(), Some(paired));
-                            loop {
-                                if crate::engine::cancel::cancelled() {
-                                    return Err(SUPERSEDED.into());
-                                }
-                                match result.recv_timeout(Duration::from_millis(100)) {
-                                    Ok(()) => return self.select_speaker_inner(id, false, user_choice, None),
-                                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(CODE_WINDOW_CLOSED.into()),
-                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                                }
-                            }
+                            self.pair_for_job(pid, name)?;
+                            return self.select_speaker_opts(id, false, user_choice);
                         }
                         self.begin_pin_pairing(pid, name.clone(), None);
                     }
@@ -2865,6 +2917,10 @@ impl App {
             self.start_upnp(id)?
         };
         drop(asking);
+        self.bind_selected_session(started)
+    }
+
+    fn bind_selected_session(self: &Arc<Self>, (new_session, _device): (ActiveSession, DeviceUse)) -> Result<(), String> {
         let actual_id = new_session.stable_id();
         let is_newcomer = new_session.is_newcomer();
 
@@ -2879,9 +2935,16 @@ impl App {
                 self.prune_stream_clients();
                 return Err(SUPERSEDED.to_string());
             }
-            let Some(old) = guard.take() else { break };
+            let Some(old) = take_for_connect(&mut guard, self.session_number(), crate::engine::cancel::binding().as_deref()) else { break };
+            let old = self.releasing(old, None);
             drop(guard);
-            old.stop();
+            match (&old.session, &new_session) {
+                (ActiveSession::Upnp(before), ActiveSession::Upnp(after)) if before.renderer.same_device_as(&after.renderer) => {
+                    // The coordinator is already playing the new stream.
+                    unsubscribe_all(before);
+                }
+                _ => old.stop(),
+            }
             guard = self.session.lock().unwrap();
         }
         // Checked under the session lock: Disable flips the flag before it
@@ -2915,6 +2978,9 @@ impl App {
         // speaker is asked below).
         let new_level = new_session.level_on_connect();
         let new_airplay = matches!(&new_session, ActiveSession::AirPlay(_) | ActiveSession::AirPlay2(_));
+        if let ActiveSession::Sendspin(s) = &new_session {
+            s.inherit_local_mute(self.vsync.is_muted());
+        }
         let session_number = self.bind_session(&mut guard, new_session);
         // CRITICAL: drop the session-mutex guard before calling any
         // method that re-locks it. std::sync::Mutex is NOT re-entrant
@@ -3011,7 +3077,7 @@ impl App {
         number
     }
 
-    fn start_upnp(&self, id: &str) -> Result<ActiveSession, String> {
+    fn start_upnp(&self, id: &str) -> Result<(ActiveSession, DeviceUse), String> {
         let discovery = self
             .discovery
             .as_ref()
@@ -3041,15 +3107,16 @@ impl App {
             crate::sonos::resolve_group_coordinator(new_r, &move |cid| d.find_by_id(cid), Some(reach))
         };
         let settings_id = new_r.stable_id();
-        let session = self.start_upnp_session(new_r, &settings_id)?;
-        Ok(ActiveSession::Upnp(session))
+        let (session, device) = self.start_upnp_session(new_r, &settings_id)?;
+        Ok((ActiveSession::Upnp(session), device))
     }
 
     /// Hand `r` the stream and start it playing: offer the stream
     /// profiles chosen for it in turn (see [`Self::stream_offer`]),
     /// remember the one it took under `settings_id`, and watch for it
     /// fetching the stream.
-    fn start_upnp_session(&self, r: Renderer, settings_id: &str) -> Result<RendererSession, String> {
+    fn start_upnp_session(&self, r: Renderer, settings_id: &str) -> Result<(RendererSession, DeviceUse), String> {
+        let device = self.wait_for_release(settings_id, Some(&r))?;
         // Grant the speaker's addresses in the stream gate (what privacy
         // mode admits) BEFORE the SOAP handshake — it HEAD/GETs the
         // stream while SetAVTransportURI and Play are answered, while
@@ -3077,6 +3144,11 @@ impl App {
         }
         let _clear = ClearDetail(&self.connect_detail);
         let progress = |step: ConnectStep| *self.connect_detail.lock().unwrap() = step.text();
+        if let Some(level) = crate::engine::cancel::welcome_level() {
+            check_job()?;
+            let level = level.min(self.volume_limit(settings_id).unwrap_or(100));
+            VolumeControl::upnp(&r).set_volume_pct(level.into()).map_err(|e| format!("{e:#}"))?;
+        }
         let Started { session, remember } = start_session(r, &offer, &callback_url, Some(grant), &progress)
             .map_err(|e| self.upnp_failure_message(&name, ip, &e))?;
         let mut settings = self.speaker_settings(settings_id);
@@ -3085,7 +3157,7 @@ impl App {
             self.set_speaker_settings(settings_id, settings);
         }
         self.watch_first_fetch(name, peers, session.profile, session.stream_given_at, session.played_at);
-        Ok(session)
+        Ok((session, device))
     }
 
     /// What `r` is offered (see [`stream_profile::plan`]): a Sonos the
@@ -3147,7 +3219,7 @@ impl App {
     /// description is fetched now, as discovery would, except that its
     /// service URLs are used as given (the user chose this device), and
     /// the session keeps the manual id.
-    fn start_upnp_manual(&self, m: &ManualSpeaker) -> Result<ActiveSession, String> {
+    fn start_upnp_manual(&self, m: &ManualSpeaker) -> Result<(ActiveSession, DeviceUse), String> {
         let r = self.describe_manual(m)?;
         let own_udn = r.udn.clone();
         // A Sonos that's grouped streams via its coordinator, as for a
@@ -3160,11 +3232,11 @@ impl App {
         };
         let redirected = r.udn != own_udn;
         let settings_id = if redirected { r.stable_id() } else { m.id() };
-        let mut session = self.start_upnp_session(r, &settings_id)?;
+        let (mut session, device) = self.start_upnp_session(r, &settings_id)?;
         if !redirected {
             session.id_override = Some(m.id());
         }
-        Ok(ActiveSession::Upnp(session))
+        Ok((ActiveSession::Upnp(session), device))
     }
 
     /// What the person is told when starting the UPnP speaker `name` at
@@ -3198,7 +3270,7 @@ impl App {
         &self,
         id: &str,
         manual: Option<&ManualSpeaker>,
-    ) -> Result<ActiveSession, SelectFailure> {
+    ) -> Result<(ActiveSession, DeviceUse), SelectFailure> {
         self.start_airplay_from(id, manual, &self.hub)
     }
 
@@ -3208,7 +3280,7 @@ impl App {
         id: &str,
         manual: Option<&ManualSpeaker>,
         hub: &crate::http_server::StreamHub,
-    ) -> Result<ActiveSession, SelectFailure> {
+    ) -> Result<(ActiveSession, DeviceUse), SelectFailure> {
         let (renderer, discovery) = match manual {
             Some(m) => (self.resolve_manual_airplay(m).map_err(SelectFailure::Msg)?, None),
             None => {
@@ -3283,8 +3355,9 @@ impl App {
             info!("AirPlay: attempting {} to {}", label, r.friendly_name);
             let name = r.friendly_name.clone();
             let id = r.stable_id();
+            let device = self.wait_for_release(&id, None).map_err(SelectFailure::Msg)?;
             match self.start_airplay_one(transport, r, local_ip, hub) {
-                Ok(session) => return Ok(session),
+                Ok(session) => return Ok((session, device)),
                 Err(AttemptError::NeedsPin(reason)) => {
                     warn!("AirPlay {} to {} needs one-time PIN pairing ({:?})", label, name, reason);
                     pin_target = Some((id, name.clone(), reason));
@@ -3416,7 +3489,7 @@ impl App {
                 // Nothing stored for a speaker goes to a newcomer: only a
                 // password typed for it, once.
                 let stored = !renderer.is_newcomer();
-                let password = self.airplay_password_for(&renderer);
+                let (password, entered) = self.airplay_password_for(&renderer);
                 let latency_ms = self.delay_for_airplay(&renderer).latency_ms;
                 let (mfi_encryption, uncompressed_alac, opener_hint) = {
                     let uc = self.user_config.lock().unwrap();
@@ -3464,6 +3537,9 @@ impl App {
                 if let Some(s) = session.as_ref().err().and_then(|e| e.downcast_ref::<crate::airplay::session::SignInNeeded>()) {
                     if matches!(s.why, crate::airplay::rtsp::SignIn::PasswordNeeded | crate::airplay::rtsp::SignIn::PasswordRejected) {
                         self.airplay_asked_password.lock().unwrap().insert(stable_id.clone());
+                        if let Some(job) = crate::engine::cancel::binding() {
+                            let _ = job.password_rejected.set(entered);
+                        }
                     }
                 }
                 let session = session.map_err(|e| AttemptError::Other(format!("{:#}", e)))?;
@@ -3516,6 +3592,20 @@ impl App {
         }
     }
 
+    fn pair_for_job(self: &Arc<Self>, id: String, name: String) -> Result<(), String> {
+        check_job()?;
+        let (paired, result) = std::sync::mpsc::channel();
+        self.begin_pin_pairing(id, name, Some(paired));
+        loop {
+            check_job()?;
+            match result.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) => return check_job(),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(CODE_WINDOW_CLOSED.into()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
     /// Launch a one-time HomeKit PIN pairing ceremony for an AP2 receiver
     /// that refused transient pairing (Apple TV with access control).
     ///
@@ -3530,33 +3620,30 @@ impl App {
     /// been reaped by the receiver. On success the credentials are stored
     /// and we reconnect, which pair-verifies and streams.
     ///
-    /// Only ever called from an interactive select (GUI speaker click) —
-    /// automatic retries must not make a TV display a pairing PIN.
+    /// A switch or test chime from the window can ask the person for the PIN.
     ///
     /// [`submit_pin`]: App::submit_pin
     fn begin_pin_pairing(self: &Arc<Self>, id: String, name: String, paired: Option<std::sync::mpsc::Sender<()>>) {
+        let picks_seen = self.user_pick_count();
+        let cancelled = Arc::new(AtomicBool::new(false));
         // Reserve the single ceremony slot; holding it also blocks
         // re-selects of this device (see select_speaker_opts).
         {
             let mut slot = self.pin_ceremony.lock().unwrap();
+            if crate::engine::cancel::cancelled() { return; }
             if let Some(existing) = slot.as_ref() {
-                debug!(
-                    "PIN pairing already in progress for {}; ignoring request for {}",
-                    existing.name, name
-                );
-                return;
+                if existing.id == id { return; }
+                existing.cancelled.store(true, Ordering::Release);
             }
             *slot = Some(PinCeremonyState {
                 id: id.clone(),
                 name: name.clone(),
                 stage: PinStage::Starting,
+                cancelled: cancelled.clone(),
                 code_try: None,
             });
         }
-        // From here on the guard owns the slot: every exit — early return,
-        // ceremony-thread end, failed spawn (the unexecuted closure drops
-        // it), panic — clears it.
-        let guard = CeremonyGuard(self.clone());
+        let guard = CeremonyGuard(self.clone(), cancelled.clone());
 
         let Some(renderer) = self.find_airplay_renderer(&id) else {
             self.record_error(format!("Can't pair {} — it's no longer discovered.", name));
@@ -3583,67 +3670,55 @@ impl App {
                 // Connection 1: ask the receiver to display its PIN. A
                 // fresh connection each time: after a wrong code, and when
                 // the person asks for a new one, it is asked again.
+                let check_ceremony = || {
+                    if cancelled.load(Ordering::Acquire) { return Err(anyhow!(SUPERSEDED)); }
+                    check_job().map_err(anyhow::Error::msg)
+                };
                 let show_code = || -> Result<()> {
+                    check_ceremony()?;
                     let mut rtsp = Ap2Rtsp::connect(renderer.ip, port, local_ip, Duration::from_secs(5))?;
+                    check_ceremony()?;
                     if let Err(e) = rtsp.get_info() {
                         debug!("pairing GET /info failed (continuing): {:#}", e);
                     }
+                    check_ceremony()?;
                     rtsp.pin_start()
                 };
-                if let Err(e) = show_code() {
-                    app.record_error(format!(
-                        "Couldn't start pairing on {}: {:#}.{}",
-                        name,
-                        e,
-                        forget_pairing_hint(&name, app.has_airplay_pairing(&id))
-                    ));
-                    return;
-                }
-
+                let mut wrong_code = None;
                 loop {
-                    // Publish the awaiting-PIN stage (opens the code
-                    // window) and park until the person answers or the
-                    // window expires. 2 min matches the window Apple TVs
-                    // give for on-screen PIN entry.
-                    let (tx, rx) = crossbeam_channel::bounded::<PinAnswer>(1);
+                    if cancelled.load(Ordering::Acquire) || check_job().is_err() { return; }
+                    // The dialog says when the TV didn't show a code, and offers to ask again.
+                    let shown = show_code().map_err(|e| {
+                        info!("{} didn't show a code: {:#}.{}", name, e, forget_pairing_hint(&name, app.has_airplay_pairing(&id)));
+                    }).is_ok();
+                    let (answers, rx) = crossbeam_channel::bounded(1);
+                    let now = Instant::now();
                     {
                         let mut slot = app.pin_ceremony.lock().unwrap();
-                        match slot.as_mut() {
-                            Some(state) => state.stage = PinStage::AwaitingPin(tx),
-                            None => return, // shutdown raced us
-                        }
+                        let Some(state) = slot.as_mut().filter(|s| Arc::ptr_eq(&s.cancelled, &cancelled)) else { return };
+                        state.code_try = match wrong_code {
+                            Some(true) => Some(CodeTry::Wrong { shown }),
+                            None if shown => None,
+                            _ => Some(CodeTry::NewCode { shown }),
+                        };
+                        state.stage = PinStage::AwaitingPin { answers, expires: now + Duration::from_secs(120) };
                     }
-                    let end = Instant::now() + Duration::from_secs(120);
-                    let answer = loop {
-                        let remaining = end.saturating_duration_since(Instant::now());
-                        let wait = if let Some(job) = &job {
-                            if job.cancelled.load(Ordering::SeqCst) { return; }
-                            remaining.min(Duration::from_millis(100))
-                        } else { remaining };
-                        match rx.recv_timeout(wait) {
-                            Err(crossbeam_channel::RecvTimeoutError::Timeout) if Instant::now() < end => continue,
-                            answer => break answer,
-                        }
-                    };
-                    let pin = match answer {
-                        Ok(PinAnswer::Code(pin)) => pin,
-                        Ok(PinAnswer::NewCode) => {
-                            let shown = show_code().map_err(|e| info!("{} didn't show a new code: {:#}", name, e)).is_ok();
-                            app.note_code_try(CodeTry::NewCode { shown });
-                            continue;
-                        }
-                        Ok(PinAnswer::Cancel) => {
-                            info!("PIN pairing for {} cancelled by user", name);
+                    // The code on the TV expires before the person's request does.
+                    let idle_end = now + Duration::from_secs(600);
+                    let pin = loop {
+                        if cancelled.load(Ordering::Acquire) || check_job().is_err() || app.is_shutting_down() { return; }
+                        if job.is_none() && Instant::now() >= idle_end {
+                            app.record_error(format!("PIN entry for {} timed out — select it again to retry.", name));
                             return;
                         }
-                        Err(_) => {
-                            app.record_error(format!(
-                                "PIN entry for {} timed out — select it again to retry.",
-                                name
-                            ));
-                            return;
+                        match rx.recv_timeout(Duration::from_millis(100)) {
+                            Ok(PinAnswer::Code(pin)) => break Some(pin),
+                            Ok(PinAnswer::NewCode) => break None,
+                            Ok(PinAnswer::Cancel) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                         }
                     };
+                    let Some(pin) = pin else { wrong_code = Some(false); continue };
 
                     // Stage is Pairing now (submit_pin flipped it). Claim
                     // the "Connecting…" banner while pair-setup runs so
@@ -3666,18 +3741,24 @@ impl App {
                     // finite pairing slots per ceremony.
                     let (ctrl_id, ctrl_seed_hex) = app.airplay_controller_identity();
                     let setup = (|| -> Result<PairingCredentials> {
+                        check_ceremony()?;
                         let mut rtsp =
                             Ap2Rtsp::connect(renderer.ip, port, local_ip, Duration::from_secs(5))?;
+                        check_ceremony()?;
                         if let Err(e) = rtsp.get_info() {
                             debug!("pairing GET /info failed (continuing): {:#}", e);
                         }
+                        check_ceremony()?;
                         rtsp.pair_setup_pin(pin.trim(), &ctrl_id, &ctrl_seed_hex)
                     })();
                     if claimed_banner {
                         *app.connecting.lock().unwrap() = None;
                     }
 
+                    let ended = cancelled.load(Ordering::Acquire) || check_job().is_err();
                     match setup {
+                        // The code was typed: the pairing is kept even when
+                        // nobody waits for it any more.
                         Ok(creds) => {
                             if !app.store_airplay_pairing(&id, creds) {
                                 app.record_error(format!(
@@ -3685,36 +3766,30 @@ impl App {
                                      settings: the PIN will be asked for again after the app restarts."
                                 ));
                             }
-                            info!("AirPlay 2: paired {} — connecting", name);
+                            info!("AirPlay 2: paired {}", name);
                             // Release the ceremony slot BEFORE reconnecting —
                             // the select guard refuses selects for the
                             // pairing device while the slot is held.
                             drop(guard);
+                            if ended {
+                                return;
+                            }
                             if let Some(paired) = paired {
                                 let _ = paired.send(());
                                 return;
                             }
-                            // Wait out any in-flight connect so the
-                            // reconnect isn't swallowed by the connecting
-                            // guard.
-                            for _ in 0..300 {
-                                if app.is_shutting_down() {
-                                    return;
-                                }
-                                if app.connecting.lock().unwrap().is_none() {
-                                    break;
-                                }
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                            app.select_speaker_async_opts(&id, false, false);
+                            app.play_after_pairing(&id, picks_seen);
                             return;
                         }
+                        Err(_) if ended => return,
                         // A wrong code: the device is asked for a new one,
                         // and the window waits for it.
                         Err(e) if format!("{e:#}").contains("wrong PIN") => {
                             info!("the code for {} didn't work: {:#}; asking it for a new one", name, e);
-                            let shown = show_code().map_err(|e| info!("{} didn't show a new code: {:#}", name, e)).is_ok();
-                            app.note_code_try(CodeTry::Wrong { shown });
+                            wrong_code = Some(true);
+                            let mut slot = app.pin_ceremony.lock().unwrap();
+                            let Some(s) = slot.as_mut().filter(|s| Arc::ptr_eq(&s.cancelled, &cancelled)) else { return };
+                            s.stage = PinStage::Starting;
                         }
                         Err(e) => {
                             app.record_error(format!(
@@ -3731,11 +3806,22 @@ impl App {
             .ok();
     }
 
-    /// Note what the last code, or ask for a new one, came to.
-    fn note_code_try(&self, code_try: CodeTry) {
-        if let Some(state) = self.pin_ceremony.lock().unwrap().as_mut() {
-            state.code_try = Some(code_try);
+    pub(crate) fn play_after_pairing(self: &Arc<Self>, id: &str, picks_seen: u64) {
+        if let Some(sink) = self.command_sink.get() {
+            if self.user_pick_count() == picks_seen {
+                let _ = sink(crate::model::Surface::Panel, crate::model::Command::PlayAfterPairing {
+                    speaker: crate::model::SpeakerId::new(id), picks_seen,
+                });
+            }
+            return;
         }
+        // The original connect may still hold the connecting slot.
+        for _ in 0..300 {
+            if self.is_shutting_down() { return; }
+            if self.connecting.lock().unwrap().is_none() { break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        self.select_speaker_async_opts(id, false, false);
     }
 
     /// What the last code typed for the pairing in flight, or the last ask
@@ -3746,8 +3832,8 @@ impl App {
 
     /// Ask the device that is being paired to show a new code (*Show a new
     /// code on Den TV*). False when no pairing waits for a code.
-    pub fn ask_for_new_code(&self) -> bool {
-        self.answer_pin(PinAnswer::NewCode)
+    pub fn ask_for_new_code(&self, id: &str) -> bool {
+        self.answer_pin(id, PinAnswer::NewCode)
     }
 
     /// The persistent per-install HomeKit controller identity (pairing id
@@ -3861,11 +3947,34 @@ impl App {
     pub fn pending_pin_pairing(&self) -> Option<(String, String)> {
         let guard = self.pin_ceremony.lock().unwrap();
         match guard.as_ref() {
-            Some(s) if matches!(s.stage, PinStage::AwaitingPin(_)) => {
+            Some(s) if matches!(s.stage, PinStage::AwaitingPin { .. }) => {
                 Some((s.id.clone(), s.name.clone()))
             }
             _ => None,
         }
+    }
+
+    pub(crate) fn pairing_code_ask(&self) -> Option<crate::settings::port::CodeAsk> {
+        use crate::settings::port::{CodeAsk, CodeStage};
+        let slot = self.pin_ceremony.lock().unwrap();
+        let state = slot.as_ref()?;
+        if state.cancelled.load(Ordering::Acquire) { return None; }
+        let (stage, seconds_left) = match &state.stage {
+            PinStage::Starting => (CodeStage::Starting, None),
+            PinStage::Pairing => (CodeStage::Checking, None),
+            PinStage::AwaitingPin { expires, .. } => {
+                let left = expires.saturating_duration_since(Instant::now());
+                match state.code_try {
+                    Some(CodeTry::Wrong { shown: false } | CodeTry::NewCode { shown: false }) => (CodeStage::NoAnswer, None),
+                    _ if left.is_zero() => (CodeStage::TimedOut, None),
+                    last => {
+                        let stage = if matches!(last, Some(CodeTry::Wrong { .. })) { CodeStage::Wrong } else { CodeStage::Showing };
+                        (stage, Some(left.as_millis().div_ceil(1000) as u32))
+                    }
+                }
+            }
+        };
+        Some(CodeAsk { id: state.id.clone(), name: state.name.clone(), stage, seconds_left })
     }
 
     /// GUI: deliver the entered PIN (`Some`) or cancel the ceremony
@@ -3873,24 +3982,36 @@ impl App {
     /// ceremony was awaiting a PIN (it expired or was never started) —
     /// the caller should tell the user to re-select the speaker, since a
     /// PIN typed into a stale modal would otherwise vanish silently.
-    pub fn submit_pin(&self, pin: Option<String>) -> bool {
-        self.answer_pin(pin.map_or(PinAnswer::Cancel, PinAnswer::Code))
+    pub fn submit_pin(&self, id: &str, pin: Option<String>) -> bool {
+        self.answer_pin(id, pin.map_or(PinAnswer::Cancel, PinAnswer::Code))
     }
 
     /// Give the pairing waiting for its code `answer`.
-    fn answer_pin(&self, answer: PinAnswer) -> bool {
+    fn answer_pin(&self, id: &str, answer: PinAnswer) -> bool {
         let mut guard = self.pin_ceremony.lock().unwrap();
-        let Some(state) = guard.as_mut() else {
+        let Some(state) = guard.as_mut().filter(|s| s.id == id && !s.cancelled.load(Ordering::Acquire)) else {
             return false;
         };
-        if !matches!(state.stage, PinStage::AwaitingPin(_)) {
-            return false;
+        let next = match answer {
+            PinAnswer::Code(_) => Some(PinStage::Pairing),
+            PinAnswer::NewCode => Some(PinStage::Starting),
+            PinAnswer::Cancel => {
+                info!("PIN pairing for {} cancelled by user", state.name);
+                state.cancelled.store(true, Ordering::Release);
+                None
+            }
+        };
+        // The dialog offers no code to enter or renew while it asks the TV
+        // or checks a code. A code or renewal arriving then changes nothing.
+        let PinStage::AwaitingPin { answers, .. } = &state.stage else { return true };
+        // The ceremony checks for a cancel by itself too.
+        if answers.try_send(answer).is_err() {
+            return next.is_none();
         }
-        let PinStage::AwaitingPin(tx) = std::mem::replace(&mut state.stage, PinStage::Pairing)
-        else {
-            unreachable!("stage checked above");
-        };
-        tx.send(answer).is_ok()
+        if let Some(stage) = next {
+            state.stage = stage;
+        }
+        true
     }
 
     /// Current speaker-side volume (0-100) if known: None until a level
@@ -3903,13 +4024,17 @@ impl App {
     /// the Windows slider, and queues the level for the bound speaker's
     /// volume thread (see [`SpeakerControl`]), so the caller doesn't
     /// block. Moving the slider unmutes, as the Windows volume slider
-    /// does. No-op unless the bound speaker takes volume changes.
+    /// does. The bound session applies the level.
     pub fn set_speaker_volume(&self, level: u32) {
+        self.apply_speaker_level(level, true);
+    }
+
+    pub(crate) fn apply_speaker_level(&self, level: u32, unmute: bool) {
         if !self.speaker_volume_controllable() {
             return;
         }
         let level = (level.min(100) as u8).min(self.bound_limit().unwrap_or(100)) as u32;
-        let unmute = self.vsync.is_muted();
+        let unmute = unmute && self.vsync.is_muted();
         if unmute {
             self.vsync.note_muted(false);
         }
@@ -3919,7 +4044,7 @@ impl App {
         // and the next Windows key press would otherwise step from the old
         // Windows level.
         if self.vsync.window_changed(level) || unmute {
-            push_windows_level(&self.windows_volume, level, false);
+            push_windows_level(&self.windows_volume, level, self.vsync.is_muted());
         }
         // Level first: on AirPlay an unmute restores the session's level,
         // which is then already the new one.
@@ -3929,10 +4054,9 @@ impl App {
         }
     }
 
-    /// The bound speaker takes volume changes from us (every transport but
-    /// Music Assistant, which keeps its own volume per speaker).
+    /// The bound session can change the speaker’s level.
     pub fn speaker_volume_controllable(&self) -> bool {
-        self.session.lock().unwrap().as_ref().is_some_and(|s| s.has_volume_control())
+        self.session.lock().unwrap().as_ref().is_some_and(ActiveSession::has_volume_control)
     }
 
     /// The level an AirPlay session starts the speaker at: the current
@@ -3941,8 +4065,26 @@ impl App {
     /// The level an AirPlay speaker starts at: the one last used with it,
     /// 25 the first time. Never louder: its own level can't be read.
     fn airplay_start_volume(&self, id: &str) -> u32 {
+        if let Some(level) = crate::engine::cancel::welcome_level() {
+            return u32::from(level.min(self.volume_limit(id).unwrap_or(100)));
+        }
         let s = self.speaker_settings(id);
         start_level(s.level, s.level_at, unix_seconds(), self.volume_limit(id)) as u32
+    }
+
+    /// A fixed-volume player starts at full scale until the app has a level for it.
+    pub(crate) fn sendspin_start_level(&self, id: &str) -> u8 {
+        let cfg = self.user_config.lock().unwrap();
+        let saved = cfg.speaker_settings.get(id);
+        let limit = saved.and_then(|s| s.volume_limit);
+        let kept = cfg.sound_place.as_ref().and_then(|p| p.levels.get(&crate::model::SpeakerId::new(id)));
+        if let Some(kept) = kept {
+            start_level(Some(kept.level), Some(kept.at.0.max(0) as u64 / 1000), unix_seconds(), limit)
+        } else if let Some(s) = saved.filter(|s| s.level.is_some()) {
+            start_level(s.level, s.level_at, unix_seconds(), limit)
+        } else {
+            limit.unwrap_or(100).min(100)
+        }
     }
 
     /// The speaker bound as session `session_number` is at `level` as
@@ -3956,7 +4098,7 @@ impl App {
         }
         if let Some(limit) = self.bound_limit().filter(|l| level > *l as u32) {
             info!("the speaker started at {} above its maximum: {}", level, limit);
-            self.set_speaker_volume(limit as u32);
+            self.apply_speaker_level(limit as u32, false);
             return;
         }
         if let Some(level) = self.vsync.speaker_connected(level) {
@@ -3990,7 +4132,7 @@ impl App {
     /// Mute or unmute the bound speaker from the app, as
     /// [`Self::set_speaker_volume`] sets its level.
     pub fn set_speaker_muted(&self, muted: bool) {
-        if !self.speaker_volume_controllable() {
+        if !self.session.lock().unwrap().as_ref().is_some_and(ActiveSession::has_volume_control) {
             return;
         }
         self.vsync.note_muted(muted);
@@ -4262,13 +4404,13 @@ impl App {
         // out the dispatch, but don't hold the lock during the slow
         // network calls.
         enum Kind {
-            Upnp(Renderer),
+            Upnp(Renderer, DeviceUse),
             AirPlay(String),
         }
         let kind = {
             let guard = self.session.lock().unwrap();
             match guard.as_ref() {
-                Some(ActiveSession::Upnp(s)) => Kind::Upnp(s.renderer.clone()),
+                Some(session @ ActiveSession::Upnp(s)) => Kind::Upnp(s.renderer.clone(), self.stopping_device(session, None)),
                 Some(ActiveSession::AirPlay(s)) => {
                     Kind::AirPlay(s.renderer.stable_id())
                 }
@@ -4286,7 +4428,7 @@ impl App {
             }
         };
         match kind {
-            Kind::Upnp(r) => {
+            Kind::Upnp(r, _device) => {
                 info!("resync: UPnP Stop + Play on {}", r.friendly_name);
                 if let Err(e) = upnp::stop(&r.av_transport_control_url) {
                     debug!("resync stop ignored: {}", e);
@@ -4341,7 +4483,7 @@ impl App {
             return Ok(());
         }
         if !enabled {
-            let s = self.session.lock().unwrap().take();
+            let s = self.session.lock().unwrap().take().map(|s| self.releasing(s, None));
             if let Some(s) = s {
                 s.stop();
             }
@@ -4644,11 +4786,11 @@ impl App {
     }
 
     /// Plain-text diagnostics for the clipboard.
-    pub fn diagnostics_report(&self, speakers: bool) -> String {
+    pub fn diagnostics_report(&self, speakers: bool, versions: bool) -> String {
         let last_error = self.last_error.lock().unwrap().as_ref().map(|(m, _)| m.clone());
         crate::diagnostics::report(
             PRODUCT_NAME,
-            crate::display_version(),
+            versions.then(crate::display_version),
             &self.diagnostics_snapshot(),
             last_error.as_deref(),
             self.last_fault().as_ref(),
@@ -4773,9 +4915,9 @@ impl App {
 
     /// `--player`: connect to the speaker `query` names (see
     /// [`rank_player_match`]) once discovery has had its first look,
-    /// unless the user picks a speaker first. Each time it appears it is
+    /// unless the person chooses an output first. Each time it appears it is
     /// tried once, without a PIN prompt; the wait ends when a speaker plays
-    /// or the user picks one.
+    /// or the person chooses where the sound plays.
     pub fn connect_when_listed(self: &Arc<Self>, query: String) {
         self.connect_when_listed_every(query, Duration::from_secs(1));
     }
@@ -4796,7 +4938,7 @@ impl App {
                 let mut attempt: Option<(String, String, Option<Fault>)> = None;
                 loop {
                     if app.user_pick_count() != picks_seen {
-                        info!("--player {:?}: a speaker was picked; no longer waiting", query);
+                        info!("{}", player_wait_ended(&query));
                         break;
                     }
                     let busy = app.connecting_to().is_some();
@@ -4834,7 +4976,7 @@ impl App {
                                 }
                             } else {
                                 attempt = Some((m.id.clone(), name, app.last_fault()));
-                                app.select_speaker_async_full(&m.id, false, false, Some(picks_seen), None);
+                                app.select_speaker_async_full(&m.id, false, false, Some(picks_seen));
                             }
                         }
                         None if steps.tried.is_none() && attempt.is_none() => {
@@ -4925,7 +5067,7 @@ impl App {
         let app = self.clone();
         let spawned = std::thread::Builder::new().name("stream-to-speaker-quit".into()).spawn(move || {
             app.stop_sendspin();
-            let s = app.session.lock().unwrap().take();
+            let s = app.session.lock().unwrap().take().map(|s| app.releasing(s, None));
             if let Some(s) = s {
                 s.stop();
             }
@@ -4951,7 +5093,7 @@ impl App {
             }
             Err(_) => {
                 self.stop_sendspin();
-                let s = self.session.lock().unwrap().take();
+                let s = self.session.lock().unwrap().take().map(|s| self.releasing(s, None));
                 if let Some(s) = s {
                     s.stop();
                 }
@@ -5021,7 +5163,7 @@ impl App {
 
     /// Send `cmd` from `from` to the engine, if it runs. Returns whether
     /// it was sent.
-    fn send_command(&self, from: crate::model::Surface, cmd: crate::model::Command) -> bool {
+    pub(crate) fn send_command(&self, from: crate::model::Surface, cmd: crate::model::Command) -> bool {
         match self.command_sink.get() {
             Some(sink) => {
                 let _ = sink(from, cmd);
@@ -5035,7 +5177,7 @@ impl App {
     /// calling thread. A pick in the app's own window may ask for a secret.
     pub(crate) fn engine_connect(self: &Arc<Self>, id: &str, window: bool) -> Result<(), String> {
         *self.connecting.lock().unwrap() = Some(self.speaker_name(id).unwrap_or_else(|| id.to_string()));
-        let result = self.select_speaker_inner(id, window, window, None);
+        let result = self.select_speaker_opts(id, window, window);
         self.forget_typed_password(id);
         *self.connecting.lock().unwrap() = None;
         self.clear_connecting_notice();
@@ -5080,6 +5222,7 @@ impl App {
             let Ok(state) = upnp::get_transport_state(&r.av_transport_control_url) else {
                 return SpeakerSignal::NotResponding;
             };
+            if crate::engine::cancel::cancelled() { return SpeakerSignal::NotResponding; }
             let Ok((uri, title)) = upnp::get_media_info(&r.av_transport_control_url) else {
                 return SpeakerSignal::NotResponding;
             };
@@ -5126,18 +5269,19 @@ impl App {
     /// and let go (connected again when sound starts). Others keep their
     /// stream. What was done; None for nothing.
     pub(crate) fn take_stream_off_number(self: &Arc<Self>, number: Option<u64>) -> Option<TakenOff> {
-        let (avt, name) = {
+        let (avt, name, _device) = {
             let guard = self.session.lock().unwrap();
             if number.is_some_and(|n| n != self.session_number()) {
                 return None;
             }
-            match guard.as_ref()? {
-                ActiveSession::Upnp(r) => (r.renderer.av_transport_control_url.clone(), r.renderer.friendly_name.clone()),
+            let session = guard.as_ref()?;
+            match session {
+                ActiveSession::Upnp(r) => (r.renderer.av_transport_control_url.clone(), r.renderer.friendly_name.clone(), self.stopping_device(session, None)),
                 ActiveSession::AirPlay(_) | ActiveSession::AirPlay2(_) => {
                     let id = guard.as_ref()?.stable_id();
                     let number = self.session_number();
                     drop(guard);
-                    if let Some(h) = self.release_number_then(Some(number), true, Box::new(|| {})) {
+                    if let Some(h) = self.release_number_then(Some(number), true, Box::new(|| {}), None) {
                         let _ = h.join();
                     }
                     info!("took the stream off {} after a long quiet", id);
@@ -5193,34 +5337,85 @@ impl App {
         self.speaker_control.session_number()
     }
 
-    /// Release the session this job bound, if it still owns it. A zero
-    /// number means the job never bound a session.
-    pub(crate) fn release_job(self: &Arc<Self>, job: &crate::engine::cancel::Binding) -> Option<std::thread::JoinHandle<()>> {
-        let number = job.number.load(Ordering::Acquire);
-        if number == 0 {
-            return None;
+    /// Reserve the device before Play so another connect waits through a cancelled start's Stop.
+    fn wait_for_release(&self, id: &str, renderer: Option<&Renderer>) -> Result<DeviceUse, String> {
+        let speaker = crate::engine::cancel::binding().map(|j| j.speaker.clone());
+        let devices = self.device_uses.devices.lock().unwrap();
+        let (mut devices, timeout) = self.device_uses.ended.wait_timeout_while(devices, Duration::from_secs(8), |devices| {
+            devices.iter().any(|d| d.id == id
+                || speaker.is_some() && d.speaker == speaker
+                || d.renderer.as_ref().zip(renderer).is_some_and(|(a, b)| a.same_device_as(b)))
+        }).unwrap();
+        if timeout.timed_out() { return Err(format!("Timed out waiting for the previous session on {id} to stop.")); }
+        check_job()?;
+        Ok(self.device_uses.register(&mut devices, SessionDevice { id: id.to_string(), speaker, renderer: renderer.cloned() }))
+    }
+
+    fn stopping_device(&self, session: &ActiveSession, speaker: Option<crate::model::SpeakerId>) -> DeviceUse {
+        let renderer = match session { ActiveSession::Upnp(s) => Some(s.renderer.clone()), _ => None };
+        let device = SessionDevice { id: session.stable_id(), speaker, renderer };
+        self.device_uses.register(&mut self.device_uses.devices.lock().unwrap(), device)
+    }
+
+    /// Record the release while the session lock still identifies the binding.
+    pub(crate) fn releasing(&self, session: ActiveSession, speaker: Option<crate::model::SpeakerId>) -> ReleasingSession {
+        let device = self.stopping_device(&session, speaker);
+        ReleasingSession { session, device }
+    }
+
+    /// Cancel the connect under the same lock it uses to bind. Report whether it
+    /// owned the session we took, even if its stop has to run on this thread.
+    pub(crate) fn release_job(self: &Arc<Self>, job: &crate::engine::cancel::Binding) -> (bool, Option<std::thread::JoinHandle<()>>) {
+        let session = {
+            let mut guard = self.session.lock().unwrap();
+            job.cancelled.store(true, Ordering::SeqCst);
+            let number = job.number.load(Ordering::Acquire);
+            if number != 0 && number == self.session_number() { guard.take().map(|s| self.releasing(s, Some(job.speaker.clone()))) } else { None }
+        };
+        match session {
+            Some(session) => (true, self.release_taken(session, true, Box::new(|| {}))),
+            None => (false, None),
         }
-        self.release_number_then(Some(number), true, Box::new(|| {}))
     }
 
     /// A later session, even to the same speaker, belongs to another job.
     pub(crate) fn release_number_then(
+        self: &Arc<Self>, number: Option<u64>, tell_speaker: bool, then: Box<dyn FnOnce() + Send>, job: Option<&crate::engine::cancel::Binding>,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        self.release_speaker_number_then(number, tell_speaker, then, job, job.map(|j| j.speaker.clone()))
+    }
+
+    /// [`Self::release_number_then`] for the session of `speaker`: while the
+    /// release tells the speaker to stop (a UPnP Stop, an AirPlay TEARDOWN),
+    /// a connect to that speaker by its other way waits for it too.
+    pub(crate) fn release_speaker_number_then(
         self: &Arc<Self>, number: Option<u64>, tell_speaker: bool, then: Box<dyn FnOnce() + Send>,
+        job: Option<&crate::engine::cancel::Binding>, speaker: Option<crate::model::SpeakerId>,
     ) -> Option<std::thread::JoinHandle<()>> {
         let session = {
             let mut guard = self.session.lock().unwrap();
-            if number.is_none_or(|n| n == self.session_number()) { guard.take() } else { None }
+            if number.is_none_or(|n| n == self.session_number()) && !job.is_some_and(|j| j.cancelled.load(Ordering::SeqCst)) {
+                take_for_connect(&mut guard, self.session_number(), job).map(|s| {
+                    // A UPnP session let go without telling the speaker is only unsubscribed.
+                    let told = tell_speaker || !matches!(s, ActiveSession::Upnp(_));
+                    self.releasing(s, speaker.filter(|_| told))
+                })
+            } else { None }
         };
         let Some(session) = session else {
             then();
             return None;
         };
-        *self.last_ended.lock().unwrap() = Some((session.stable_id(), Instant::now()));
+        self.release_taken(session, tell_speaker, then)
+    }
+
+    fn release_taken(self: &Arc<Self>, session: ReleasingSession, tell_speaker: bool, then: Box<dyn FnOnce() + Send>) -> Option<std::thread::JoinHandle<()>> {
+        *self.last_ended.lock().unwrap() = Some((session.session.stable_id(), Instant::now()));
         self.prune_stream_clients();
         let cell = Arc::new(Mutex::new(Some((session, then))));
         let app = self.clone();
-        let stop = move |cell: &Mutex<Option<(ActiveSession, Box<dyn FnOnce() + Send>)>>| {
-            let Some((session, then)) = cell.lock().unwrap().take() else { return };
+        let stop = move |cell: &Mutex<Option<(ReleasingSession, Box<dyn FnOnce() + Send>)>>| {
+            let Some((ReleasingSession { session, device }, then)) = cell.lock().unwrap().take() else { return };
             match session {
                 ActiveSession::Upnp(s) if !tell_speaker => unsubscribe_all(&s),
                 other if tell_speaker => {
@@ -5234,6 +5429,7 @@ impl App {
                 }
                 other => other.stop(),
             }
+            drop(device);
             then();
         };
         let stop = Arc::new(stop);
@@ -5259,7 +5455,16 @@ impl App {
     /// Play the test sound on whatever plays now: two short notes mixed
     /// into the stream.
     pub fn play_test_sound(&self) {
-        *self.test_sound.lock().unwrap() = Some(0);
+        let number = self.session.lock().unwrap().as_ref().map(|_| self.session_number());
+        if let Some(number) = number { self.play_test_sound_on(number); }
+    }
+
+    pub(crate) fn play_test_sound_on(&self, number: u64) {
+        *self.test_sound.lock().unwrap() = Some((number, 0));
+    }
+
+    pub(crate) fn stop_test_sound_on(&self, number: u64) {
+        self.test_sound.lock().unwrap().take_if(|(session, _)| *session == number);
     }
 
     /// Whether the test sound is still playing.
@@ -5271,7 +5476,18 @@ impl App {
     /// frame), if one is playing.
     pub(crate) fn mix_test_sound(&self, samples: &mut [i16], channels: u16) {
         let mut guard = self.test_sound.lock().unwrap();
-        let Some(pos) = guard.as_mut() else { return };
+        let Some((number, pos)) = guard.as_mut() else { return };
+        // Keep the session while mixing. If it is changing, leave the chime
+        // at this frame for the next packet.
+        let session = match self.session.try_lock() {
+            Ok(session) => session,
+            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::Poisoned(_)) => { *guard = None; return; }
+        };
+        if session.is_none() || self.session_number() != *number {
+            *guard = None;
+            return;
+        }
         let ch = channels.max(1) as usize;
         for frame in samples.chunks_mut(ch) {
             if *pos >= CHIME_FRAMES {
@@ -5288,6 +5504,17 @@ impl App {
         }
     }
 
+    fn set_chime_level(&self, id: &str, asked: Option<u8>, control: &VolumeControl, current: impl FnOnce() -> Result<u32>) -> Result<(), String> {
+        let limit = self.volume_limit(id);
+        let level = match (asked, limit) {
+            (Some(level), _) => level.min(limit.unwrap_or(100)),
+            (None, Some(limit)) if current().map_err(|e| format!("{e:#}"))? > u32::from(limit) => limit,
+            _ => return Ok(()),
+        };
+        check_job()?;
+        control.set_volume_pct(u32::from(level)).map_err(|e| format!("{e:#}"))
+    }
+
     /// Play the test chime on speaker `id`, which isn't the place, while
     /// the place's sound goes on: a second, short session of its own,
     /// ended after the chime. A UPnP speaker is given the chime's file at
@@ -5296,28 +5523,31 @@ impl App {
     /// and then lets go. A speaker that plays something else is left
     /// alone (it gets the chime only once a person confirmed that it may
     /// stop what plays there). Runs on the caller's thread: network I/O.
-    pub(crate) fn chime_beside(self: &Arc<Self>, id: &str, confirmed: bool, level: Option<u8>) -> Result<(), String> {
+    pub(crate) fn chime_beside(self: &Arc<Self>, id: &str, confirmed: bool, level: Option<u8>, in_window: bool) -> Result<(), String> {
+        check_job()?;
         let _asking = crate::engine::cancel::asking_speaker();
         let name = self.speaker_name(id).unwrap_or_else(|| id.to_string());
         if !confirmed && matches!(self.look_at_speaker(id), crate::engine::signals::SpeakerSignal::PlayingElse { .. }) {
             return Err(format!("{name} is playing something else"));
         }
-        let upnp = self.discovery.as_ref().and_then(|d| d.find_by_id(id)).or_else(|| {
-            self.find_manual_speaker(id).filter(|m| m.kind == ManualKind::Upnp).and_then(|m| self.manual_renderer(&m))
+        check_job()?;
+        let upnp = self.discovery.as_ref().and_then(|d| d.find_by_id(id)).map(|r| (r.stable_id(), r)).or_else(|| {
+            self.find_manual_speaker(id).filter(|m| m.kind == ManualKind::Upnp)
+                .and_then(|m| self.manual_renderer(&m).map(|r| (m.id(), r)))
         });
-        if let Some(r) = upnp {
+        if let Some((speaker, r)) = upnp {
+            let _device = self.wait_for_release(&speaker, Some(&r))?;
             let local = self.local_ip_toward(r.ip)?;
             let uri = format!("http://{}{}", SocketAddr::new(local, self.config.bind.port()), CHIME_PATH);
             let didl = chime_didl(&uri);
             let avt = &r.av_transport_control_url;
-            if let Some(level) = level {
-                let volume = match r.group_volume_control_url() {
-                    Some(url) => VolumeControl::UpnpGroup(url.to_owned()),
-                    None => VolumeControl::Upnp(r.rendering_control_control_url.clone()),
-                };
-                volume.set_volume_pct(u32::from(level)).map_err(|e| format!("{e:#}"))?;
-            }
+            self.set_chime_level(&speaker, level, &VolumeControl::upnp(&r), || match r.group_volume_control_url() {
+                Some(url) => upnp::get_group_volume(url),
+                None => upnp::get_volume(&r.rendering_control_control_url),
+            })?;
+            check_job()?;
             upnp::set_av_transport_uri(avt, &uri, &didl, &upnp::TRANSPORT).map_err(|e| format!("{e:#}"))?;
+            check_job()?;
             upnp::play(avt).map_err(|e| format!("{e:#}"))?;
             info!("test chime on {name} beside the place");
             return Ok(());
@@ -5327,14 +5557,19 @@ impl App {
             return Err(format!("{name} can't play a test chime"));
         }
         let hub = crate::http_server::StreamHub::new();
-        let session = self.start_airplay_from(id, manual.as_ref(), &hub).map_err(|e| match e {
-            SelectFailure::Msg(m) => m,
-            SelectFailure::NeedsPin { name, .. } => format!("{name} needs its code"),
-        })?;
-        if let (Some(level), Some(control)) = (level, session.volume_control()) {
-            if let Err(e) = control.set_volume_pct(u32::from(level)) {
-                session.stop();
-                return Err(format!("{e:#}"));
+        let (session, _device) = chime_airplay(in_window, || self.start_airplay_from(id, manual.as_ref(), &hub),
+            |id, name| self.pair_for_job(id, name))?;
+        if let Err(e) = check_job() {
+            session.silence();
+            return Err(e);
+        }
+        if let Some(control) = session.volume_control() {
+            let result = self.set_chime_level(&session.stable_id(), level, &control, || {
+                session.level_on_connect().ok_or_else(|| anyhow!("the speaker didn't give its volume"))
+            });
+            if let Err(e) = result {
+                if crate::engine::cancel::cancelled() { session.silence(); } else { session.stop(); }
+                return Err(e);
             }
         }
         // The chime in the frames the audio loop sends, at their pace,
@@ -5349,11 +5584,20 @@ impl App {
         let tail = hold.as_millis() as usize / 10;
         let start = Instant::now();
         for (n, samples) in packets.chain(std::iter::repeat(silence.as_slice()).take(tail)).enumerate() {
+            if let Err(e) = check_job() {
+                session.silence();
+                return Err(e);
+            }
             hub.publish(crate::http_server::PcmFrame(Arc::new(crate::http_server::samples_to_wav_le_bytes(samples))));
             let due = start + Duration::from_millis(10 * (n as u64 + 1));
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
         }
+        if let Err(e) = check_job() {
+            session.silence();
+            return Err(e);
+        }
         session.stop();
+        check_job()?;
         info!("test chime on {name} beside the place");
         Ok(())
     }
@@ -5447,6 +5691,25 @@ impl App {
     /// A speaker's *Never louder than*, if set below 100.
     pub fn volume_limit(&self, id: &str) -> Option<u8> {
         self.speaker_settings(id).volume_limit.filter(|l| *l < 100)
+    }
+
+    /// Apply a newly saved maximum to the session that owns it.
+    pub(crate) fn apply_bound_volume_limit(&self, edited: &[String]) {
+        let bound = self.session.lock().unwrap();
+        let Some(session) = bound.as_ref() else { return };
+        let id = session.stable_id();
+        if !edited.contains(&id) { return; }
+        let Some(limit) = self.volume_limit(&id) else { return };
+        if matches!(session, ActiveSession::MusicAssistant(_)) {
+            if self.ma_level() > limit { self.set_ma_level(limit); }
+        } else if self.current_volume().is_some_and(|v| v > u32::from(limit)) {
+            let level = u32::from(limit);
+            self.speaker_control.send(SpeakerCommand::Volume(level));
+            if self.vsync.window_changed(level) {
+                drop(bound);
+                push_windows_level(&self.windows_volume, level, self.vsync.is_muted());
+            }
+        }
     }
 
     /// The bound speaker's limit.
@@ -5996,6 +6259,10 @@ pub(crate) fn rank_player_match(query: &str, rows: &[PlayerCandidate]) -> Option
     })
 }
 
+fn player_wait_ended(query: &str) -> String {
+    format!("--player {query:?}: where the sound plays changed meanwhile; no longer waiting")
+}
+
 /// How long `--player` waits for discovery's first look before taking a
 /// match from what is listed (as long as the start-up wait for the first
 /// UPnP sweep was).
@@ -6073,7 +6340,7 @@ impl PlayerWish {
 /// speaker wants PIN pairing, which a connect nobody clicked can't start
 /// (see [`pin_pairing_message`]); trying again would only fail again.
 pub(crate) fn needs_the_person(reason: &str) -> bool {
-    reason.contains("click it in the speaker list")
+    reason.contains("click it in the speaker list") || reason.ends_with(" — follow the prompt.")
 }
 
 /// How often the window tries a failed settings save again.
@@ -6177,6 +6444,197 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+
+    #[test]
+    fn finishing_pairing_without_a_waiting_request_respects_later_picks() {
+        use crate::model::{Command, SpeakerId, Surface};
+        let app = App::for_tests();
+        let (sent, commands) = crossbeam_channel::unbounded();
+        app.set_command_sink(Box::new(move |from, cmd| {
+            sent.send((from, cmd)).unwrap();
+            crate::model::command::ticket().1
+        }));
+        let picks_seen = app.user_pick_count();
+        app.play_after_pairing(KITCHEN, picks_seen);
+        assert_eq!(commands.try_recv().unwrap(), (Surface::Panel, Command::PlayAfterPairing {
+            speaker: SpeakerId::new(KITCHEN), picks_seen,
+        }));
+        app.note_user_pick();
+        app.play_after_pairing(KITCHEN, picks_seen);
+        assert!(commands.is_empty());
+        assert!(!app.is_speaker_bound());
+    }
+
+    #[test]
+    fn an_airplay_chime_retries_after_pairing_in_the_window() {
+        for (window, close) in [(false, false), (true, true), (true, false)] {
+            let mut attempts = 0;
+            let mut prompted = false;
+            let result = chime_airplay(window, || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(SelectFailure::NeedsPin { id: "ap".into(), name: "Office".into(), reason: PinReason::Required, details: String::new() })
+                } else { Ok(()) }
+            }, |id, name| {
+                assert_eq!((id.as_str(), name.as_str()), ("ap", "Office"));
+                prompted = true;
+                if close { Err(CODE_WINDOW_CLOSED.into()) } else { Ok(()) }
+            });
+            assert_eq!(prompted, window);
+            assert_eq!(attempts, if window && !close { 2 } else { 1 });
+            assert_eq!(result, if !window { Err("Office needs its code".into()) } else if close { Err(CODE_WINDOW_CLOSED.into()) } else { Ok(()) });
+        }
+    }
+
+    #[test]
+    fn asking_after_a_code_expires_shows_another_code_for_the_same_request() {
+        use crate::airplay::discovery::AIRPLAY_SERVICE;
+        use crate::airplay::fake_raop::{Answer, FakeRaop, Reply};
+        use crate::settings::{Act, SettingsPort, port::{CodeStage, Wanted}, real::AppSettings};
+        let failed_show = AtomicBool::new(true);
+        let receiver = FakeRaop::start(move |req| {
+            if req.uri == "/pair-pin-start" && failed_show.swap(false, Ordering::SeqCst) {
+                Answer::Reply(Reply::status(503, "Unavailable"))
+            } else { Answer::Reply(Reply::ok()) }
+        });
+        let lan = crate::discovery_net::LanTargets::from_networks([("192.168.1.10".parse().unwrap(), 24)]);
+        let (app, discovery) = airplay_test_app_with(Arc::new(AirPlayDiscoveryState::with_lan(lan.with_fakes_on_loopback())));
+        let txt = &[("deviceid", "B8:E9:37:35:AC:11"), ("features", "0x445F8A00,0x1C340")][..];
+        discovery.ingest_for_tests(AIRPLAY_SERVICE, &mdns_sd::ServiceInfo::new(
+            AIRPLAY_SERVICE, "Kitchen", "k.local.", "127.0.0.1", receiver.port(), txt).unwrap());
+        let port = AppSettings::new(app.clone());
+        let at = |stage| matches!(port.wanted_dialog(), Some(Wanted::PairingCode(a)) if a.stage == stage);
+        let (sent, commands) = crossbeam_channel::unbounded();
+        app.set_command_sink(Box::new(move |_, cmd| {
+            sent.send(cmd).unwrap();
+            crate::model::command::ticket().1
+        }));
+        let (paired, request) = std::sync::mpsc::channel();
+        let job = Arc::new(crate::engine::cancel::Binding::new(crate::model::SpeakerId::new(KITCHEN), Some(40), app.user_pick_count(), || {}));
+        let scope = job.enter();
+        app.begin_pin_pairing(KITCHEN.into(), "Kitchen".into(), Some(paired));
+        drop(scope);
+        assert!(eventually(|| at(CodeStage::NoAnswer)));
+        // A second click while the TV is asked again changes nothing.
+        port.act(Act::NewCode(KITCHEN.into()));
+        port.act(Act::NewCode(KITCHEN.into()));
+        assert_eq!(app.current_error(), None);
+        assert!(eventually(|| at(CodeStage::Showing)));
+        {
+            let mut slot = app.pin_ceremony.lock().unwrap();
+            let PinStage::AwaitingPin { expires, .. } = &mut slot.as_mut().unwrap().stage else { panic!("expected the code") };
+            *expires = Instant::now();
+        }
+        assert!(at(CodeStage::TimedOut));
+        port.act(Act::NewCode(KITCHEN.into()));
+        assert!(eventually(|| at(CodeStage::Showing)));
+        // A slow test machine can take the second click as a third ask.
+        assert!(receiver.requests().iter().filter(|r| r.uri == "/pair-pin-start").count() >= 3);
+        assert!(matches!(request.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        port.act(Act::CancelPairing(KITCHEN.into()));
+        assert!(eventually(|| app.pin_pairing_device().is_none()));
+        port.act(Act::NewCode(KITCHEN.into()));
+        assert_eq!(app.current_error().as_deref(), Some("That pairing had already ended. Pick the speaker again to pair it."));
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn picking_another_tv_ends_the_old_ceremony_and_shows_the_new_code() {
+        use crate::airplay::discovery::AIRPLAY_SERVICE;
+        use crate::airplay::fake_raop::{Answer, FakeRaop, Reply};
+        let (showing, asked) = crossbeam_channel::bounded(1);
+        let (finish, resume) = crossbeam_channel::bounded(1);
+        let kitchen = FakeRaop::start(move |req| {
+            if req.uri == "/pair-pin-start" {
+                showing.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            Answer::Reply(Reply::ok())
+        });
+        let den_tv = FakeRaop::start(|_| Answer::Reply(Reply::ok()));
+        let lan = crate::discovery_net::LanTargets::from_networks([("192.168.1.10".parse().unwrap(), 24)]);
+        let (app, discovery) = airplay_test_app_with(Arc::new(AirPlayDiscoveryState::with_lan(lan.with_fakes_on_loopback())));
+        for (name, device, tv) in [("Kitchen", "B8:E9:37:35:AC:11", &kitchen), ("Den", "B8:E9:37:35:AC:12", &den_tv)] {
+            let txt = &[("deviceid", device), ("features", "0x445F8A00,0x1C340")][..];
+            discovery.ingest_for_tests(AIRPLAY_SERVICE, &mdns_sd::ServiceInfo::new(
+                AIRPLAY_SERVICE, name, &format!("{name}.local."), "127.0.0.1", tv.port(), txt).unwrap());
+        }
+        let (paired, old_ended) = std::sync::mpsc::channel();
+        app.begin_pin_pairing(KITCHEN.into(), "Kitchen".into(), Some(paired));
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let old = app.pin_ceremony.lock().unwrap().as_ref().unwrap().cancelled.clone();
+        let den = "airplay:B8E93735AC12";
+        app.begin_pin_pairing(den.into(), "Den".into(), None);
+        assert!(old.load(Ordering::Acquire));
+        assert!(eventually(|| app.pending_pin_pairing().is_some_and(|(id, _)| id == den)));
+        finish.send(()).unwrap();
+        assert_eq!(old_ended.recv_timeout(Duration::from_secs(5)), Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
+        // The first TV finally answered. The second TV still owns the prompt and its answers.
+        assert!(app.ask_for_new_code(den));
+        assert!(eventually(|| den_tv.requests().iter().filter(|q| q.uri == "/pair-pin-start").count() == 2));
+        assert!(eventually(|| app.pending_pin_pairing().is_some_and(|(id, _)| id == den)));
+        app.submit_pin(den, None);
+        assert!(eventually(|| app.pin_pairing_device().is_none()));
+    }
+
+    #[test]
+    fn a_dialog_for_another_tv_cannot_answer_the_waiting_ceremony() {
+        use crate::settings::{Act, SettingsPort, real::AppSettings};
+        let app = test_app();
+        let (answers, rx) = crossbeam_channel::bounded(1);
+        *app.pin_ceremony.lock().unwrap() = Some(PinCeremonyState {
+            id: "kitchen".into(), name: "Kitchen".into(), code_try: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            stage: PinStage::AwaitingPin { answers, expires: Instant::now() + Duration::from_secs(90) },
+        });
+        let port = AppSettings::new(app.clone());
+        for act in [Act::NewCode("den".into()), Act::SubmitCode { id: "den".into(), code: "1234".into() }] {
+            port.act(act);
+            assert_eq!(app.current_error().as_deref(), Some("That pairing had already ended. Pick the speaker again to pair it."));
+            app.dismiss_error();
+        }
+        port.act(Act::CancelPairing("den".into()));
+        assert!(app.pairing_code_ask().is_some_and(|a| a.id == "kitchen"));
+        assert!(rx.try_recv().is_err());
+        port.act(Act::SubmitCode { id: "kitchen".into(), code: "5678".into() });
+        assert!(matches!(rx.try_recv(), Ok(PinAnswer::Code(code)) if code == "5678"));
+    }
+
+    #[test]
+    fn the_chime_keeps_its_position_while_the_session_lock_is_held() {
+        let app = test_app();
+        bind(&app, upnp_session(""));
+        app.play_test_sound();
+        let session = app.session.lock().unwrap();
+        let mut samples = [0; 128];
+        app.mix_test_sound(&mut samples, 2);
+        assert_eq!(samples, [0; 128]);
+        assert_eq!(*app.test_sound.lock().unwrap(), Some((app.session_number(), 0)));
+        drop(session);
+        app.mix_test_sound(&mut samples, 2);
+        assert!(samples.iter().any(|s| *s != 0));
+    }
+
+    #[test]
+    fn the_shared_chime_stops_when_its_session_is_replaced_or_released() {
+        for replace in [false, true] {
+            let app = test_app();
+            bind(&app, upnp_session(""));
+            app.play_test_sound();
+            let mut samples = [0; 128];
+            app.mix_test_sound(&mut samples, 2);
+            assert!(samples.iter().any(|s| *s != 0));
+            if replace {
+                bind(&app, upnp_session(""));
+            } else {
+                app.session.lock().unwrap().take();
+            }
+            samples.fill(10);
+            app.mix_test_sound(&mut samples, 2);
+            assert_eq!(samples, [10; 128]);
+            assert!(!app.test_sound_playing());
+        }
+    }
 
     #[test]
     fn local_urls_bracket_ipv6_hosts() {
@@ -6651,7 +7109,7 @@ mod tests {
         probed.lock().unwrap().offered.iter().map(|(uri, _, _)| url::Url::parse(uri).unwrap().path().to_string()).collect()
     }
 
-    fn end(session: ActiveSession) {
+    fn end((session, _device): (ActiveSession, DeviceUse)) {
         session.stop();
         crate::gena::registry().remove("uuid:strict");
     }
@@ -6679,7 +7137,7 @@ mod tests {
         // Its list was asked for only after the refusal.
         let actions: Vec<String> = fake.soap_actions();
         assert_eq!(actions, ["Stop", "SetAVTransportURI", "GetProtocolInfo", "Stop", "SetAVTransportURI", "Play"]);
-        let ActiveSession::Upnp(s) = &session else { unreachable!() };
+        let ActiveSession::Upnp(s) = &session.0 else { unreachable!() };
         assert_eq!(s.profile, StreamProfile::Wav);
         end(session);
         // Remembered: the next connect plays at the first offer, unasked.
@@ -6725,7 +7183,7 @@ mod tests {
         assert!(uri.ends_with("/stream.raw"), "{uri}");
         assert_eq!((didl_type.as_str(), head_type.as_str()), ("audio/wav", "audio/vnd.wave;codec=1"));
         drop(p);
-        let ActiveSession::Upnp(s) = &session else { unreachable!() };
+        let ActiveSession::Upnp(s) = &session.0 else { unreachable!() };
         assert_eq!(s.profile, StreamProfile::Legacy);
         end(session);
     }
@@ -6855,7 +7313,7 @@ mod tests {
             let m = manual_upnp(&fake);
             let session = app.start_upnp_manual(&m).expect("the second offer plays");
             assert_eq!(given_paths(&fake), ["/stream.raw", "/wav/stream.wav"]);
-            let ActiveSession::Upnp(s) = &session else { unreachable!() };
+            let ActiveSession::Upnp(s) = &session.0 else { unreachable!() };
             assert_eq!(s.profile, StreamProfile::Wav);
             assert_eq!(app.speaker_settings(&m.id()), SpeakerSettings::default(), "nothing saved");
             end(session);
@@ -7026,7 +7484,7 @@ mod tests {
         assert_eq!(pushed.lock().unwrap().len(), 1);
     }
 
-    /// The connect step of `select_speaker_inner` for `session`: bind it
+    /// The connect step of `select_speaker_opts` for `session`: bind it
     /// and show the level it reports as it starts, if any.
     fn connect_with_level(app: &App, session: ActiveSession) {
         let level = session.level_on_connect();
@@ -7217,7 +7675,7 @@ mod tests {
         assert!(err.contains("no socket"), "{}", err);
         assert_eq!(app.current_error(), Some(err.clone()));
         assert_eq!(app.discovery_net_status().error, Some(err.clone()));
-        match app.start_sendspin_player("sendspin:kitchen", None, false) {
+        match app.start_sendspin_player("sendspin:kitchen", false) {
             Err(e) => assert_eq!(e, "Sendspin discovery is not running"),
             Ok(_) => panic!("connected without discovery"),
         }
@@ -7233,7 +7691,7 @@ mod tests {
         assert_eq!(app.sendspin_discovery_error(), None);
         assert_eq!(app.discovery_net_status().error, None);
         assert!(app.sendspin.browse.lock().unwrap().as_ref().unwrap().is_running());
-        match app.start_sendspin_player("sendspin:kitchen", None, false) {
+        match app.start_sendspin_player("sendspin:kitchen", false) {
             Err(e) => assert!(e.starts_with("no Sendspin speaker with id"), "{}", e),
             Ok(_) => panic!("connected to a speaker that wasn't found"),
         }
@@ -7849,6 +8307,7 @@ mod tests {
         app.connect_when_listed_every("Den".into(), Duration::from_millis(5));
         app.note_user_pick();
         assert!(eventually(|| app.player_wish().is_none()), "still waiting after the user picked");
+        assert_eq!(player_wait_ended("Den"), "--player \"Den\": where the sound plays changed meanwhile; no longer waiting");
     }
 
     #[test]
@@ -8289,8 +8748,8 @@ mod tests {
             assert!(!serde_json::to_string(&*uc).unwrap().contains("typed-after-conflict"));
         }
         // The connect the dialog starts uses it, and only that one.
-        assert_eq!(app.airplay_password_for(&left).as_deref(), Some("typed-after-conflict"));
-        assert_ne!(app.airplay_password_for(&left).as_deref(), Some("typed-after-conflict"));
+        assert_eq!(app.airplay_password_for(&left), (Some("typed-after-conflict".into()), true));
+        assert_eq!(app.airplay_password_for(&left), (Some("hunter2".into()), false));
     }
 
     /// When the entry the dialog was opened for has gone by the time the
@@ -8319,7 +8778,7 @@ mod tests {
             );
         }
         assert!(app.connecting_to().is_none());
-        assert!(app.unsaved_airplay_passwords.lock().unwrap().is_empty());
+        assert!(app.typed_airplay_passwords.lock().unwrap().is_empty());
         let uc = app.user_config.lock().unwrap();
         assert!(uc.airplay_passwords.is_empty());
         assert!(!serde_json::to_string(&*uc).unwrap().contains("typed-for-a-gone-one"));
@@ -8340,7 +8799,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(app.connecting_to().is_none());
-        assert!(app.unsaved_airplay_passwords.lock().unwrap().is_empty());
+        assert!(app.typed_airplay_passwords.lock().unwrap().is_empty());
     }
 
     /// A password typed for a newcomer is used for its next connect and

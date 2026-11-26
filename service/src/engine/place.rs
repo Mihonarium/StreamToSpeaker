@@ -54,6 +54,8 @@ use sound::Detector;
 enum Stream {
     /// Not connected: it connects when sound starts.
     Off,
+    /// A switch let this speaker go. Restore it if the newer switch leaves it the place.
+    Released,
     /// Sound without a player began: if it ends within about 3 seconds it
     /// is played on the PC's own output and the speaker isn't connected.
     ShortWait { since_ms: u64 },
@@ -72,7 +74,7 @@ enum Stream {
     WaitNet { since_ms: u64, until_ms: u64 },
     /// The one try at a sound's start; `asked_ms` is when the speaker was
     /// asked.
-    Connecting { gen: u64, asked_ms: u64, until_ms: u64 },
+    Connecting { gen: u64, asked_ms: u64, until_ms: u64, restoring: bool },
     /// Connected and sending since `since_wall`.
     On { since_wall: WallTime },
     /// The tries during play.
@@ -96,6 +98,7 @@ struct Tries {
 #[derive(Clone, Debug, PartialEq)]
 struct Switching {
     gen: u64,
+    welcome_level: Option<u8>,
     speaker: SpeakerId,
     way: WayChoice,
     by: SwitchBy,
@@ -199,7 +202,7 @@ struct Listen {
 enum FirstRun {
     Off,
     One,
-    Two(SpeakerId, u8),
+    Two { speaker: SpeakerId, level: Option<u8> },
     Three(SpeakerId),
 }
 
@@ -230,6 +233,8 @@ pub struct Core {
     pick_failed: Option<(PickFailed, bool)>,
     /// Windows didn't take the app's device for a switch to this speaker.
     windows_refused: Option<SpeakerId>,
+    window_open: bool,
+    no_speaker_chosen: bool,
     /// The kept note: why the sound is on this PC, and the way back.
     note: Option<NoteRec>,
     /// A note the state implies that a person closed: it stays away while
@@ -293,7 +298,7 @@ pub struct Core {
     window_close_explained: bool,
     /// A chime on its way: its job, its speaker, and whether the app's own
     /// windows asked for it.
-    chime: Option<Job>,
+    chime: Option<(Job, SwitchBy, SwitchFrom)>,
     gen: u64,
     panel_open: bool,
     device_missing: bool,
@@ -332,6 +337,8 @@ impl Core {
             confirm: None,
             pick_failed: None,
             windows_refused: None,
+            window_open: false,
+            no_speaker_chosen: false,
             note,
             closed: kept.closed_note,
             passed_pause: Vec::new(),
@@ -429,6 +436,12 @@ impl Core {
         self.begin(w, w.panel_open, now, &mut out);
         match e {
             Event::Connected { gen, ended } => self.connected(gen, ended, w, now, &mut out),
+            Event::PlaceReleased(id) => {
+                if self.connected_speaker() == Some(&id) {
+                    self.stream_off(&mut out);
+                    self.stream = Stream::Released;
+                }
+            }
             Event::WayLost { speaker, ended } => self.way_lost(speaker, ended, w, now, &mut out),
             Event::Speaker { id, signal } => self.speaker_said(id, signal, w, now, &mut out),
             Event::Output(o) => self.output_event(o, w, now, &mut out),
@@ -498,7 +511,7 @@ impl Core {
                 let quiet_from = self.last_real_wall.map_or(*since_wall, |r| r.max(*since_wall));
                 due.push(self.mono_at(quiet_from.plus_ms(STREAM_REST_AFTER_WALL_MS)));
             }
-            Stream::Off | Stream::OnPc => {}
+            Stream::Off | Stream::OnPc | Stream::Released => {}
         }
         if self.place.is_some() && self.switch_back_on {
             let quiet_from = self.quiet_from();
@@ -604,6 +617,7 @@ impl Core {
             Command::FirstRunAction(_)
             | Command::RemoveSpeaker(_)
             | Command::ResetSpeaker(_)
+            | Command::WindowOpened
             | Command::WindowClosed
             | Command::PanelShown(_)
             | Command::PlayChime { .. }
@@ -617,6 +631,7 @@ impl Core {
     fn handle(&mut self, from: Surface, cmd: &Command, w: &World, now: Clock, out: &mut Vec<Do>) -> Result<Effect, Refusal> {
         let who = Asker::of(from);
         match cmd {
+            Command::PlayWhenListed { speaker, .. } => self.switch_request(speaker.clone(), None, SwitchBy::Switch, who, false, w, now, out),
             Command::Switch { place, way } => match place.speaker() {
                 Some(k) => self.switch_request(k, *way, SwitchBy::Switch, who, false, w, now, out),
                 None => {
@@ -642,6 +657,10 @@ impl Core {
                 Ok(Effect::Done)
             }
             Command::Confirm { yes } => self.answer(*yes, w, now, out),
+            Command::CloseNote if self.no_speaker_chosen => {
+                self.no_speaker_chosen = false;
+                Ok(Effect::Done)
+            }
             Command::CloseNote => {
                 match self.note_now(w, now) {
                     // No × there: the note goes by itself within seconds.
@@ -667,7 +686,14 @@ impl Core {
                 }
                 Ok(Effect::Done)
             }
+            Command::WindowOpened => {
+                self.window_open = true;
+                self.keep_no_speaker_popup();
+                Ok(Effect::Done)
+            }
             Command::WindowClosed => {
+                self.window_open = false;
+                self.no_speaker_chosen = false;
                 // Counted as told once it has shown: while another pop-up or
                 // a question shows, the next close tells it.
                 if !self.window_close_explained && self.popup.is_none() && self.confirm.is_none() {
@@ -781,6 +807,7 @@ impl Core {
                     self.stream = Stream::Off;
                 }
             }
+            Stream::Released if self.switch.is_none() => self.connect_place(w, now, out),
             Stream::OnPc if !self.sent_to_speaker(now) => self.stream = Stream::Off,
             Stream::WaitNet { until_ms, .. } if t >= until_ms => self.connect_place(w, now, out),
             Stream::Connecting { gen, until_ms, .. } if t >= until_ms => {
@@ -858,6 +885,16 @@ impl Core {
     /// The speaker whose stream the engine should follow at the session.
     pub(crate) fn connected_speaker(&self) -> Option<&SpeakerId> {
         self.place.as_ref().filter(|_| self.stream_connected())
+    }
+
+    pub(crate) fn place_speaker(&self) -> Option<&SpeakerId> {
+        self.place.as_ref()
+    }
+
+    /// A change of Windows' output waits to be told apart: a person's
+    /// choice, or Windows following an output that came or went.
+    pub(crate) fn deciding_output(&self) -> bool {
+        self.pending_default.is_some() || self.pending_headphones.is_some()
     }
 
     /// The place's speaker has a connection the app made (or is making).
@@ -970,6 +1007,7 @@ impl Core {
         self.note = None;
         self.closed = None;
         self.headphones = None;
+        self.no_speaker_chosen = false;
         self.pick_failed = None;
         self.windows_refused = None;
         self.popup = None;

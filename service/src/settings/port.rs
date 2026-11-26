@@ -506,7 +506,7 @@ pub enum CodeStage {
     Wrong,
     /// The time ran out.
     TimedOut,
-    /// The TV stopped responding, so pairing couldn't start.
+    /// The TV didn’t show a code.
     NoAnswer,
 }
 

@@ -1378,8 +1378,12 @@ pub struct VolumeHandle {
 }
 
 impl VolumeHandle {
-    pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
+    pub(crate) fn remember_volume_pct(&self, vol: u32) {
         self.volume_pct.store(vol.min(100), Ordering::Relaxed);
+    }
+
+    pub fn set_volume_pct(&self, vol: u32) -> Result<()> {
+        self.remember_volume_pct(vol);
         let db = volume_pct_to_raop_db(vol);
         self.rtsp.lock().unwrap().set_volume(db)
     }

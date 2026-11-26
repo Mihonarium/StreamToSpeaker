@@ -1,6 +1,6 @@
 //! Drives the rules for where this PC's sound plays.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -41,8 +41,13 @@ pub(crate) enum PlaceInput {
     /// The first reply to this job. Its speaker keeps the same id whichever way it was reached.
     Answered(u64),
     Event(place::Event),
-    /// The worker let the old session go to try another way to its speaker.
-    WayFinished { gen: u64, speaker: SpeakerId, ended: Ended },
+    WindowsNotTaken { decision: u64, at_ms: u64 },
+    /// A connect's work let this speaker's session go.
+    Released(SpeakerId),
+    /// How a connect ended and which sessions it let go.
+    Connected { gen: u64, ended: Ended, released: Vec<(String, u64)> },
+    /// A change of way or delay let its speaker's session go and then failed.
+    WayFinished { speaker: SpeakerId, ended: Ended },
     System(SystemEvent),
     Stop,
 }
@@ -50,6 +55,7 @@ pub(crate) enum PlaceInput {
 pub(crate) struct PlaceDriver {
     app: Arc<App>,
     platform: Platform,
+    windows_decision: Arc<Mutex<u64>>,
     core: Core,
     tx: Sender<PlaceInput>,
     events: Receiver<PlaceInput>,
@@ -64,6 +70,8 @@ pub(crate) struct PlaceDriver {
     bound_ids: Option<world::Ids>,
     /// A Sonos connect can bind the group's coordinator under another id.
     bound_as: Option<(u64, String, SpeakerId)>,
+    /// A release can arrive after another session has taken the coordinator's id.
+    recent_bindings: VecDeque<(u64, SpeakerId)>,
     seen: Option<world::Observation>,
     session: watch::SessionWatch,
     buttons: Option<watch::Buttons>,
@@ -76,6 +84,11 @@ pub(crate) struct PlaceDriver {
     level: Option<(SpeakerId, u8, u64)>,
     ma_before_mute: Option<u8>,
     pass: Option<pass::Worker>,
+    /// A `--player` request waits while a change of Windows' output is told
+    /// apart: a person who is choosing an output goes first.
+    held: VecDeque<(Surface, Command, Option<run::Answer>)>,
+    /// The answer to a held request, once it was carried out.
+    held_answers: Vec<(run::Answer, Result<Effect, Refusal>)>,
 }
 
 fn clock_since(started: Instant) -> Clock {
@@ -137,6 +150,7 @@ impl PlaceDriver {
         Self {
             app,
             platform,
+            windows_decision: Arc::default(),
             tx,
             events,
             opener,
@@ -149,6 +163,7 @@ impl PlaceDriver {
             ids: rows.into_iter().map(|(s, _)| s).collect(),
             bound_ids: None,
             bound_as: None,
+            recent_bindings: VecDeque::new(),
             seen: None,
             panel_open: false,
             session: Default::default(),
@@ -161,6 +176,8 @@ impl PlaceDriver {
             level: None,
             ma_before_mute: None,
             pass,
+            held: VecDeque::new(),
+            held_answers: Vec::new(),
             start_at_sign_in: crate::autostart::set_enabled,
         }
     }
@@ -196,8 +213,13 @@ impl PlaceDriver {
     }
 
     pub(crate) fn input(&mut self, input: PlaceInput) -> Option<(run::Answer, Result<Effect, Refusal>)> {
+        let mut lost_binding = None;
         let event = match input {
             PlaceInput::Command(from, cmd, reply) => {
+                if matches!(cmd, Command::PlayWhenListed { .. } | Command::PlayAfterPairing { .. }) && self.core.deciding_output() {
+                    self.held.push_back((from, cmd, reply));
+                    return None;
+                }
                 let result = self.command(from, &cmd);
                 return reply.map(|answer| (answer, result));
             }
@@ -205,13 +227,21 @@ impl PlaceDriver {
                 let job = self.jobs.get(&gen)?;
                 Event::Speaker { id: job.speaker.clone(), signal: SpeakerSignal::Responding }
             }
+            PlaceInput::WindowsNotTaken { decision, at_ms } => {
+                if decision != *self.windows_decision.lock().unwrap() { return None; }
+                Event::Output(OutputEvent::NotTaken { at_ms })
+            }
             PlaceInput::Event(e) => {
                 if let Event::Connected { gen, ended } = &e {
                     let job = self.jobs.remove(gen)?;
-                    if *ended == Ended::Ready {
-                        let number = job.binding.number.load(Ordering::Acquire);
+                    let number = job.binding.number.load(Ordering::Acquire);
+                    if *ended == Ended::Ready && number != 0 {
+                        self.recent_bindings.push_front((number, job.speaker.clone()));
+                        self.recent_bindings.truncate(32);
                         if let Some((id, n)) = self.bound().filter(|(_, n)| *n == number) {
                             self.bound_as = Some((n, id, job.speaker.clone()));
+                        } else {
+                            lost_binding = Some(job.speaker.clone());
                         }
                     }
                     if *ended == Ended::Ready && job.resumes {
@@ -221,13 +251,16 @@ impl PlaceDriver {
                 }
                 e
             }
-            PlaceInput::WayFinished { gen, speaker, ended } => {
-                // Finish a current switch before reconciling its binding. Even
-                // a superseded worker can have already released the old way.
-                self.input(PlaceInput::Event(Event::Connected { gen, ended: ended.clone() }));
-                if self.core.connected_speaker() != Some(&speaker) || self.session_of(&speaker).is_some() {
-                    return None;
-                }
+            PlaceInput::Released(id) => {
+                if self.session_of(&id).is_some() { return None; }
+                Event::PlaceReleased(id)
+            }
+            PlaceInput::Connected { gen, ended, released } => {
+                self.finished(gen, ended, released);
+                return None;
+            }
+            PlaceInput::WayFinished { speaker, ended } => {
+                if self.session_of(&speaker).is_some() { return None; }
                 Event::WayLost { speaker, ended }
             }
             PlaceInput::System(e) => {
@@ -239,7 +272,7 @@ impl PlaceDriver {
                     worker.stop();
                 }
                 for gen in self.jobs.keys().copied().collect::<Vec<_>>() {
-                    self.supersede(gen);
+                    self.cancel_job(gen);
                 }
                 return None;
             }
@@ -247,6 +280,9 @@ impl PlaceDriver {
         let now = self.clock();
         let obs = self.observe(now, false);
         self.event(event, &obs.world, now);
+        if let Some(speaker) = lost_binding {
+            let _ = self.tx.send(PlaceInput::Released(speaker));
+        }
         self.remember_playback(&obs.world, now);
         None
     }
@@ -254,9 +290,6 @@ impl PlaceDriver {
     fn event(&mut self, e: Event, world: &World, now: Clock) {
         let follows_output = matches!(e, Event::Started(_) | Event::Output(OutputEvent::DefaultChanged { .. }));
         let mut actions = self.core.event(e, world, now);
-        if actions.iter().any(Do::starts_pick) {
-            self.app.note_user_pick();
-        }
         // Windows can choose an output without changing the place (including at launch).
         if follows_output && !actions.contains(&Do::Save) {
             let kept = self.core.kept();
@@ -271,6 +304,14 @@ impl PlaceDriver {
 
     pub(crate) fn look(&mut self) {
         self.compare(None);
+        if !self.core.deciding_output() {
+            while let Some((from, cmd, reply)) = self.held.pop_front() {
+                let result = self.command(from, &cmd);
+                if let Some(answer) = reply {
+                    self.held_answers.push((answer, result));
+                }
+            }
+        }
     }
 }
 

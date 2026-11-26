@@ -24,9 +24,8 @@ impl Core {
                 // Windows may have switched to it just before saying it
                 // came.
                 if w.default_output == Some(OutputRef::Pc(id.clone())) {
-                    if let Some(p) = self.pending_default.take() {
-                        self.last_default = p.to.clone();
-                    }
+                    self.pending_default = None;
+                    self.last_default = w.default_output.clone();
                     self.pending_headphones = None;
                     self.headphones_connected(id, w, now, out);
                 }
@@ -97,6 +96,10 @@ impl Core {
         if self.moved_near(at_ms) {
             return self.windows_doing(to, w, now, out);
         }
+        // On this PC the new default is already where the sound plays.
+        if self.place.is_none() && prev != to && matches!(to, Some(OutputRef::Pc(_))) {
+            out.push(Do::PickedOutput);
+        }
         // An output may still come or go within the window: decide then.
         self.pending_default = Some(PendingDefault { to, prev, at_ms });
     }
@@ -139,6 +142,8 @@ impl Core {
                     // the sound stays on the speaker.
                     self.expect_default = None;
                     self.win(WinTarget::OurDevice, w, out);
+                } else if self.place.is_none() {
+                    out.push(Do::PickedOutput);
                 }
             }
             Some(OutputRef::Ours) => {
@@ -168,6 +173,7 @@ impl Core {
                 }
                 match self.named.clone() {
                     Some(k) => {
+                        out.push(Do::PickedOutput);
                         let _ = self.switch_request_from_list(
                             k,
                             None,
@@ -181,7 +187,11 @@ impl Core {
                         );
                     }
                     None => {
-                        self.raise_popup(Popup::NoSpeakerChosen, w, now);
+                        if self.panel_open || self.window_open {
+                            self.no_speaker_chosen = true;
+                        } else {
+                            self.raise_popup(Popup::NoSpeakerChosen, w, now);
+                        }
                         if let Some(p) = prev_pc {
                             self.expect_default = None;
                             self.win(WinTarget::Output(p), w, out);
@@ -194,6 +204,7 @@ impl Core {
                 self.cancel_switch(w, out);
                 self.confirm = None;
                 if let Some(k) = self.place.clone() {
+                    out.push(Do::PickedOutput);
                     if self.stream_connected() {
                         out.push(Do::Silence { speaker: k, then: None });
                     }
@@ -235,6 +246,7 @@ impl Core {
     /// row would make it. The app remembers the speaker that was the place,
     /// for the way back when they go.
     pub(super) fn headphones_connected(&mut self, o: PcOutputId, w: &World, now: Clock, out: &mut Vec<Do>) {
+        out.push(Do::PickedOutput);
         // Being connected cancels a switch connecting or waiting.
         self.cancel_switch(w, out);
         self.confirm = None;

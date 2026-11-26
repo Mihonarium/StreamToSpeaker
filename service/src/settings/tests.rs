@@ -175,6 +175,7 @@ fn asking_for_a_new_code_after_no_answer_requests_one() {
     let port = ScriptedSettings::new();
     port.set(|s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::NoAnswer, seconds_left: None })));
     let mut h = Harness::dialog(Dialog::Code(CodeDialog::new("den")), port);
+    assert!(h.has("Den TV didn’t show a code."));
     h.click("Ask for a new code");
     assert_eq!(h.acts(), vec![Act::NewCode("den".into())]);
 }
@@ -642,4 +643,16 @@ fn saving_a_report_reports_the_file_and_folder_results() {
         h.click("Save as a file");
         assert!(h.shows(words));
     }
+}
+
+#[test]
+fn diagnostics_follows_the_report_versions_checkbox() {
+    let (_, port, _) = real();
+    let report = |versions| port.report(ReportParts { versions, diagnostics: true, speakers: false, log: false });
+    let with = report(true);
+    assert!(with.contains(&format!("{} v{} diagnostics", crate::PRODUCT_NAME, crate::display_version())));
+    let without = report(false);
+    assert_eq!(without.lines().next().unwrap(), format!("{} diagnostics", crate::PRODUCT_NAME));
+    assert!(!without.contains(crate::display_version()));
+    assert!(without.contains("[now]"));
 }

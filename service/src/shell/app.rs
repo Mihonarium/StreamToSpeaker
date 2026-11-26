@@ -372,6 +372,7 @@ impl Shell {
     fn open_window(&mut self, ctx: &egui::Context, home: bool) {
         let already_open = self.windows.main.is_some();
         if !already_open {
+            self.port.send(Surface::Panel, Command::WindowOpened);
             crate::ui::look::set_focus_visible(ctx, false);
             self.monitors = self.desktop.monitors();
         }

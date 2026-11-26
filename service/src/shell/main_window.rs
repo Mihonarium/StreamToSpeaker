@@ -126,6 +126,7 @@ impl MainWindow {
         self.sync_first_run(snap.scene.situation.first_run.as_ref());
         if self.pages.is_empty() {
             if let Some((view, state)) = &mut self.welcome {
+                view.tray = tray;
                 state.cap = Some(height);
                 state.bottom_links = true;
                 let mut page = show_view(ui, view, snap, state, 0);

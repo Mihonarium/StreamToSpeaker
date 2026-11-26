@@ -30,6 +30,7 @@ pub fn way(choice: WayChoice, own_ms: u32) -> WaySeen {
 }
 pub fn seen(id: SpeakerId, name: &str) -> SpeakerSeen {
     SpeakerSeen {
+        airplay_id: None,
         id,
         name: name.into(),
         kind: SpeakerKind::Sonos,
@@ -66,6 +67,7 @@ pub fn scene() -> Scene {
             pick_failed: None,
             standing: vec![],
             speakers: vec![SpeakerNow {
+                can_chime: true,
                 id: kitchen(),
                 state: RowState::Plain,
                 way: WayChoice::Native,
@@ -171,6 +173,7 @@ fn home() -> Scene {
         .speakers
         .iter()
         .map(|sp| SpeakerNow {
+            can_chime: true,
             id: sp.id.clone(),
             is_place: sp.id == self::kitchen(),
             way: sp.way,
@@ -199,6 +202,7 @@ fn speaker_mut<'a>(s: &'a mut Scene, id: &SpeakerId) -> &'a mut SpeakerSeen {
 }
 fn add_speaker(s: &mut Scene, sp: SpeakerSeen) {
     s.situation.speakers.push(SpeakerNow {
+        can_chime: true,
         id: sp.id.clone(),
         state: RowState::Plain,
         way: sp.way,
@@ -234,7 +238,7 @@ pub fn named(name: &str) -> Scene {
             row_state(&mut s, &k, RowState::PlayingElse);
             s.situation.confirm_in_panel = Some(Confirm::ChimeBusy { speaker: k, who: None });
         }
-        "pc-welcome-chime" => s.situation.first_run = Some(FirstRunStep::Two { speaker: k, level: 25, limit: 100 }),
+        "pc-welcome-chime" => s.situation.first_run = Some(FirstRunStep::Two { speaker: k, level: Some(25), limit: 100 }),
         "kitchen-welcome-done" => s.situation.first_run = Some(FirstRunStep::Three { speaker: k }),
         "kitchen-playing" => {
             s.situation.popups.popup = Some(shown(Popup::PlayingOn { speaker: k }));

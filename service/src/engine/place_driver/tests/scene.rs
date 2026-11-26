@@ -174,6 +174,14 @@ fn enabled_music_assistant_has_its_own_row() {
     let mut r = Rig::on(App::for_tests());
     r.app.set_sendspin_source_enabled(true).unwrap();
     let scene = r.driver.scene();
+    assert_eq!(scene.search.phase, SearchPhase::Off);
+    let ma = SpeakerId::music_assistant();
+    assert!(!scene.situation.speaker(&ma).unwrap().can_chime);
+    r.send(Command::Switch { place: Place::MusicAssistant, way: None });
+    r.settle();
+    assert!(r.driver.scene().situation.speaker(&ma).unwrap().can_chime);
+    r.send(Command::StayOnThisPc);
+    r.settle();
     r.app.set_sendspin_source_enabled(false).unwrap();
     assert_eq!(scene.speakers.len(), 1);
     assert_eq!(scene.speakers[0].id, SpeakerId::music_assistant());
@@ -275,4 +283,12 @@ fn discovery_search_times_out_then_clears_on_a_find() {
     .unwrap()]);
     r.advance(1000);
     assert_eq!(r.driver.scene().search, Default::default());
+}
+
+#[test]
+fn first_run_without_speaker_search_starts_with_search_off() {
+    let mut r = Rig::on(App::for_tests());
+    let scene = r.driver.scene();
+    assert!(scene.speakers.is_empty() && scene.situation.first_run.is_some());
+    assert_eq!(scene.search.phase, SearchPhase::Off);
 }

@@ -75,6 +75,7 @@ impl ViewContent for SpeakerOptions {
         let row = self.row(snap);
         let missing = row.map_or(matches!(v.row.presence, Presence::NotFound { .. }), |r| r.state == RowState::NotFound);
         let here = snap.scene.situation.place_speaker() == Some(&id);
+        let can_chime = snap.scene.situation.speaker(&id).is_some_and(|s| s.can_chime);
         let chime = w!(lang, PlayTestChime);
         buttons(ui, |ui| {
             if missing {
@@ -88,12 +89,12 @@ impl ViewContent for SpeakerOptions {
                     let pair_width = ui.fonts(|fonts| [&label, &chime].into_iter().map(|s|
                         fonts.layout_no_wrap(s.clone(), font.clone(), egui::Color32::PLACEHOLDER).size().x
                     ).sum::<f32>()) + 4.0 * crate::ui::theme::space::M + 8.0;
-                    let label_fit = if pair_width <= ui.available_width() { &label } else { &short };
+                    let label_fit = if !can_chime || pair_width <= ui.available_width() { &label } else { &short };
                     if page_button(label_fit).accessible_name(&label).enabled(command.is_some()).show(ui).clicked() {
                         ask(Ask::Command(command.unwrap().clone()));
                     }
                 }
-                if page_button(&chime).show(ui).on_hover_text(w!(lang, SetChimeTip, speaker = name)).clicked() {
+                if can_chime && page_button(&chime).show(ui).on_hover_text(w!(lang, SetChimeTip, speaker = name)).clicked() {
                     ask(Ask::Command(Command::PlayChime { speaker: id.clone(), confirmed: false }));
                 }
             }

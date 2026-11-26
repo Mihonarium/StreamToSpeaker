@@ -594,18 +594,29 @@ fn list(scene: &Scene) -> ListPart {
 pub(crate) fn search_line(scene: &Scene) -> Option<SearchLine> {
     let lang = scene.lang;
     match scene.search.phase {
-        SearchPhase::Found => None,
-        SearchPhase::Looking => Some(SearchLine {
-            text: t!(lang, Searching),
-            spinner: true,
-            link: None,
-        }),
-        SearchPhase::NoneFound => Some(SearchLine {
-            text: t!(lang, NoSpeakersOnNetwork),
-            spinner: false,
-            link: Some(Act::open(t!(lang, Why), Open::SpeakerMissing)),
-        }),
+        SearchPhase::Found | SearchPhase::Off => None,
+        SearchPhase::Looking => Some(SearchLine { text: t!(lang, Searching), spinner: true, link: None }),
+        SearchPhase::NoneFound => Some(none_found(lang)),
     }
+}
+
+fn none_found(lang: Lang) -> SearchLine {
+    SearchLine {
+        text: t!(lang, NoSpeakersOnNetwork),
+        spinner: false,
+        link: Some(Act::open(t!(lang, Why), Open::SpeakerMissing)),
+    }
+}
+
+pub(crate) fn first_run_search(scene: &Scene) -> Option<SearchLine> {
+    if scene.search.phase == SearchPhase::Off {
+        return scene.speakers.is_empty().then(|| none_found(scene.lang));
+    }
+    search_line(scene).or_else(|| Some(SearchLine {
+        text: if scene.speakers.is_empty() { t!(scene.lang, Searching) } else { t!(scene.lang, LookingForMore) },
+        spinner: true,
+        link: None,
+    }))
 }
 
 fn about(scene: &Scene, list: &ListPart) -> About {
@@ -616,6 +627,9 @@ fn about(scene: &Scene, list: &ListPart) -> About {
     }
     if sit.standing.contains(&Standing::OutputMissing) || scene.repair == RepairNow::Worked {
         return About::Note(notes::repair(scene));
+    }
+    if sit.standing.contains(&Standing::NoSpeakerChosen) {
+        return About::Note(notes::no_speaker_chosen(scene));
     }
     if let Some(n) = &sit.note {
         if n.shows()

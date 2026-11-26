@@ -68,6 +68,17 @@ fn name_of(snap: &Snapshot, id: &SpeakerId) -> String {
     snap.scene.speaker_name(id)
 }
 
+fn password_id<'a>(snap: &'a Snapshot, id: &'a SpeakerId) -> &'a SpeakerId {
+    snap.scene.speaker(id).and_then(|s| s.airplay_id.as_ref()).unwrap_or(id)
+}
+
+fn password_to_connect(snap: &Snapshot, id: &SpeakerId) -> PasswordDialog {
+    let target = password_id(snap, id);
+    let mut dialog = PasswordDialog::to_connect(target.as_str(), &name_of(snap, id));
+    dialog.wrong = snap.scene.situation.secret_failure(id) == Some(crate::model::situation::PickWhy::WrongSecret(Secret::Password));
+    dialog
+}
+
 impl Contents for SettingsContents {
     fn open(&self, open: &Open, snap: &Snapshot, from_window: bool) -> Option<Box<dyn WindowContent>> {
         match open {
@@ -76,7 +87,9 @@ impl Contents for SettingsContents {
             // pairing with a code, from the window: it starts at once (its
             // dialog then opens by itself). From elsewhere the shell opens
             // the speaker's view instead (see [`pair_from_outside`]).
-            Open::Pair(id) if wants_password(snap, id) => self.dialog(Dialog::Password(PasswordDialog::to_connect(id.as_str(), &name_of(snap, id)))),
+            Open::Pair(id) if wants_password(snap, id) => {
+                self.dialog(Dialog::Password(password_to_connect(snap, id)))
+            }
             Open::Pair(id) if from_window => {
                 self.port.act(Act::PairAgain(id.as_str().to_string()));
                 None
@@ -102,10 +115,13 @@ impl Contents for SettingsContents {
     }
 
     fn before_play(&self, speaker: &SpeakerId, snap: &Snapshot) -> Option<Box<dyn WindowContent>> {
-        if !(self.needs_password)(speaker.as_str()) {
+        // A click plays by the row's way: its AirPlay identity only when that way is AirPlay.
+        let by_airplay = snap.scene.speaker(speaker).is_some_and(|s| s.way != crate::model::situation::WayChoice::Native);
+        let asked = if by_airplay { password_id(snap, speaker) } else { speaker };
+        if !(self.needs_password)(asked.as_str()) {
             return None;
         }
-        let dialog = Dialog::Password(PasswordDialog::to_connect(speaker.as_str(), &name_of(snap, speaker)));
+        let dialog = Dialog::Password(password_to_connect(snap, speaker));
         Some(Box::new(DialogWindow { dialog, port: self.port.clone() }))
     }
 
@@ -234,6 +250,34 @@ mod tests {
             assert!(c.open(&open, &playing, true).is_none(), "{open:?}: no window");
         }
         assert!(views.view(&Open::Donate, &playing).is_none());
+    }
+
+    #[test]
+    fn a_folded_sonos_row_opens_the_password_for_its_airplay_identity() {
+        let engine = ScriptedEngine::new("pc-office-needs-password");
+        let mut scene = engine.snapshot().scene.clone();
+        let id = SpeakerId::new("office");
+        let row = scene.speakers.iter_mut().find(|s| s.id == id).unwrap();
+        row.kind = crate::model::facts::SpeakerKind::Sonos;
+        row.airplay_id = Some(SpeakerId::new("airplay:office"));
+        // A click on the row plays by Sonos: no AirPlay password is asked first.
+        row.way = crate::model::situation::WayChoice::Native;
+        engine.publish(scene.clone());
+        let (mut c, _) = contents();
+        c.needs_password = Box::new(|id| id == "airplay:office");
+        assert!(c.before_play(&id, &engine.snapshot()).is_none());
+        // By AirPlay, the password of its AirPlay identity is asked first.
+        scene.speakers.iter_mut().find(|s| s.id == id).unwrap().way = crate::model::situation::WayChoice::AirPlaySteady;
+        engine.publish(scene);
+        let snap = engine.snapshot();
+        assert!(c.before_play(&id, &snap).is_some());
+        assert!(wants_password(&snap, &id));
+        assert_eq!(password_to_connect(&snap, &id).id, "airplay:office");
+        assert!(password_to_connect(&snap, &id).wrong);
+        let mut scene = snap.scene.clone();
+        scene.situation.pick_failed.as_mut().unwrap().why = crate::model::situation::PickWhy::NeedsSecret(Secret::Password);
+        engine.publish(scene);
+        assert!(!password_to_connect(&engine.snapshot(), &id).wrong);
     }
 
     #[test]

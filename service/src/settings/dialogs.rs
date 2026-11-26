@@ -194,7 +194,9 @@ impl CodeDialog {
                         ui.add_space(6.0);
                         tv_drawing(ui, ui.available_width().min(200.0));
                         ui.add_space(6.0);
-                        body(ui, &w!(lang, SetLookAtTv, speaker = &name));
+                        if matches!(ask.stage, CodeStage::Showing | CodeStage::Wrong) {
+                            body(ui, &w!(lang, SetLookAtTv, speaker = &name));
+                        }
                     });
                 }
                 {
@@ -332,6 +334,7 @@ fn digit_boxes(ui: &mut Ui, typed: &mut String, count: usize, focus: &mut bool, 
 #[derive(Debug, Default)]
 pub struct PasswordDialog {
     pub id: String,
+    pub(crate) wrong: bool,
     name: String,
     /// The speaker asked while connecting (rather than *Change* on its
     /// page).
@@ -362,7 +365,7 @@ impl PasswordDialog {
             _ if self.asked => return false,
             _ => None,
         };
-        let wrong = ask.as_ref().is_some_and(|a| a.wrong);
+        let wrong = ask.as_ref().map_or(self.wrong, |a| a.wrong);
         let once = ask.as_ref().is_some_and(|a| a.once);
         let name = ask.as_ref().map_or(self.name.clone(), |a| a.name.clone());
         let mut keep = true;

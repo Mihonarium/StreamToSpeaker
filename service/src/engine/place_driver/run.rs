@@ -24,9 +24,9 @@ impl PlaceDriver {
         loop {
             // Only callers own senders to rx. Windows and the driver's
             // workers can report events without keeping the loop alive.
-            let received = crossbeam_channel::select! {
-                recv(rx) -> msg => Some(msg.unwrap_or(PlaceInput::Stop)),
+            let received = crossbeam_channel::select_biased! {
                 recv(self.events) -> msg => Some(msg.unwrap_or(PlaceInput::Stop)),
+                recv(rx) -> msg => Some(msg.unwrap_or(PlaceInput::Stop)),
                 default(self.next_wake()) => None,
             };
             if matches!(received, Some(PlaceInput::Stop)) {
@@ -36,6 +36,9 @@ impl PlaceDriver {
             self.look();
             current = self.publish(&out, Some(current));
             if let Some((reply, result)) = answer {
+                reply(result, current.clone());
+            }
+            for (reply, result) in self.held_answers.drain(..) {
                 reply(result, current.clone());
             }
         }

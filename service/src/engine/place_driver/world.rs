@@ -69,6 +69,7 @@ pub(super) fn fold(list: &[SpeakerFacts], mut choice: impl FnMut(&str) -> Option
                 found: s.presence == Presence::Found || ap.is_some_and(|t| t.presence == Presence::Found),
                 ways,
                 shows_doing: upnp(s),
+                can_chime: (upnp(s) && s.presence == Presence::Found) || ap.is_some_and(|t| t.presence == Presence::Found),
                 level_unreadable: airplay(s),
                 ..SpeakerWorld::found(s.id.as_str())
             },
@@ -121,11 +122,14 @@ impl PlaceDriver {
             self.list = facts::speaker_list(app);
             self.list_at = Some(clock.mono_ms);
         }
-        let binding = self.bound();
-        if self.bound_as.as_ref().is_some_and(|(n, _, _)| binding.as_ref().is_none_or(|(_, current)| current != n)) {
+        let binding = app.session.lock().unwrap().as_ref().map(|session| {
+            (session.stable_id(), app.session_number(), matches!(session, crate::app::ActiveSession::Sendspin(s) if !s.accepts_volume()))
+        });
+        if self.bound_as.as_ref().is_some_and(|(n, _, _)| binding.as_ref().is_none_or(|(_, current, _)| current != n)) {
             self.bound_as = None;
         }
-        let bound = binding.map(|(id, _)| id);
+        let local_level = binding.as_ref().is_some_and(|(_, _, local)| *local);
+        let bound = binding.map(|(id, _, _)| id);
         let bound_place = self.bound_as.as_ref().map(|(_, _, speaker)| speaker);
         let connections: Vec<_> = self
             .platform
@@ -148,9 +152,10 @@ impl PlaceDriver {
         if app.is_sendspin_source_enabled() {
             rows.push((
                 Ids { id: SpeakerId::music_assistant(), native: Some(MA_OUTPUT_ID.into()), airplay: None },
-                SpeakerWorld { shows_doing: false, found: ma_found, ..SpeakerWorld::found(MA_OUTPUT_ID) },
+                SpeakerWorld { shows_doing: false, can_chime: false, found: ma_found, ..SpeakerWorld::found(MA_OUTPUT_ID) },
             ));
         }
+        let kept = self.core.kept();
         self.ids.clear();
         let mut speakers = Vec::new();
         for (ids, mut s) in rows {
@@ -158,6 +163,10 @@ impl PlaceDriver {
             let plays_here =
                 bound_place.map_or_else(|| bound.as_deref().is_some_and(|id| ids.has(id)), |k| *k == ids.id);
             if let Some(id) = bound.as_deref().filter(|_| plays_here) {
+                s.can_chime |= self.core.connected_speaker() == Some(&ids.id);
+                // A fixed player starts at full scale on its first session.
+                // Later sessions use the level kept for this speaker.
+                s.level_unreadable |= local_level && kept.levels.contains_key(&s.id);
                 self.bound_ids = Some(ids.clone());
                 s.level = if s.id.is_music_assistant() {
                     Some(app.ma_level())
@@ -175,6 +184,7 @@ impl PlaceDriver {
         if bound.is_none() {
             self.bound_ids = None;
         }
+        let bound_speaker = bound.as_deref().map(|id| self.speaker_of(id));
         let settings = {
             let mut cfg = app.user_config.lock().unwrap();
             let net = connections.iter().find(|c| c.kind != ConnKind::Other).map(|c| &c.net);
@@ -200,7 +210,6 @@ impl PlaceDriver {
             }
             // A speaker absent on this network still needs its last network
             // in the world for the core's minute after a change of network.
-            let kept = self.core.kept();
             let mut absent: Vec<_> = cfg.speaker_settings.iter().filter(|(_, s)| s.network.is_some())
                 .map(|(k, _)| k.as_str())
                 .chain(kept.place.iter().chain(kept.named.iter()).map(SpeakerId::as_str))
@@ -212,6 +221,8 @@ impl PlaceDriver {
                 let saved = cfg.speaker_settings.get(id);
                 speakers.push(SpeakerWorld {
                     found: false,
+                    can_chime: self.core.connected_speaker().is_some_and(|k| k.as_str() == id && bound_speaker.as_ref() == Some(k)),
+                    level_unreadable: local_level && bound_speaker.as_ref().is_some_and(|k| k.as_str() == id && kept.levels.contains_key(k)),
                     ways: Vec::new(),
                     network: saved.and_then(|s| s.network.clone()),
                     max_level: saved.and_then(|s| s.volume_limit),

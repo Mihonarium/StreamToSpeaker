@@ -15,6 +15,7 @@ use crate::ui::{button::Button, theme::size};
 
 pub(crate) struct FirstRunPage {
     pub step: FirstRunStep,
+    pub tray: bool,
     picker: ChimePicker,
 }
 
@@ -22,6 +23,7 @@ impl FirstRunPage {
     pub fn new(step: FirstRunStep) -> Self {
         Self {
             step,
+            tray: true,
             picker: ChimePicker::default(),
         }
     }
@@ -44,6 +46,13 @@ fn plain(ui: &mut Ui, words: &str) {
 }
 
 fn question(ui: &mut Ui, snap: &Snapshot, speaker: &SpeakerId, ask: &mut dyn FnMut(Ask)) {
+    if let Some(failure) = snap.scene.situation.pick_failed.as_ref().filter(|p|
+        &p.speaker == speaker && (p.by == crate::model::situation::SwitchBy::FirstRun
+            || matches!(snap.scene.situation.first_run, Some(FirstRunStep::Two { .. })))) {
+        let (title, _) = crate::model::notes::didnt_get_ready(&snap.scene, speaker, failure.why);
+        plain(ui, &title);
+        return;
+    }
     let Some(q) = snap
         .scene
         .situation
@@ -108,11 +117,16 @@ impl ViewContent for FirstRunPage {
     fn bar(&self, snap: &Snapshot) -> ViewBar {
         let title = match &self.step {
             FirstRunStep::One => t!(snap.lang, FirstPickTitle),
+            FirstRunStep::Two { speaker, level: None, .. } => t!(
+                snap.lang, FirstSwitchTitle, speaker = &snap.scene.speaker_name(speaker)
+            ),
             FirstRunStep::Two { speaker, .. } => t!(
                 snap.lang,
                 FirstHearTitle,
                 speaker = &snap.scene.speaker_name(speaker)
             ),
+            FirstRunStep::Three { speaker } if snap.scene.situation.place_speaker() != Some(speaker)
+                || matches!(snap.panel.about, About::Note(_)) => snap.panel.place.name.clone(),
             FirstRunStep::Three { speaker } => t!(
                 snap.lang,
                 FirstPlayingTitle,
@@ -130,7 +144,11 @@ impl ViewContent for FirstRunPage {
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
         match &self.step {
             FirstRunStep::One => {
-                plain(ui, &t!(lang, FirstPickChime));
+                let can_chime = snap.scene.speakers.iter().any(|s| snap.scene.situation.speaker(&s.id)
+                    .is_some_and(|r| r.can_chime && !r.state.grey()));
+                if !snap.scene.speakers.is_empty() {
+                    plain(ui, &if can_chime { t!(lang, FirstPickChime) } else { t!(lang, ClickSpeaker) });
+                }
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     let commands = self.picker.show(ui, snap, |ui, id| {
@@ -147,9 +165,19 @@ impl ViewContent for FirstRunPage {
                     }
                 });
             }
+            // Nothing to hear yet, so no volume to choose: the speaker
+            // starts at its own level.
+            FirstRunStep::Two { speaker, level: None, .. } => {
+                let name = snap.scene.speaker_name(speaker);
+                plain(ui, &t!(lang, FirstNoChime, speaker = &name));
+                if Button::primary(&t!(lang, SwitchToSpeaker, speaker = &name)).text_size(size::BODY).show(ui).clicked() {
+                    action(ask, FirstRunAction::UseWithoutChecking);
+                }
+                question(ui, snap, speaker, ask);
+            }
             FirstRunStep::Two {
                 speaker,
-                level,
+                level: Some(level),
                 limit,
             } => {
                 let name = snap.scene.speaker_name(speaker);
@@ -184,15 +212,22 @@ impl ViewContent for FirstRunPage {
                 });
             }
             FirstRunStep::Three { speaker } => {
-                plain(
-                    ui,
-                    &t!(
-                        lang,
-                        FirstStays,
-                        speaker = &snap.scene.speaker_name(speaker)
-                    ),
-                );
-                plain(ui, &t!(lang, FirstIcon));
+                if snap.scene.situation.place_speaker() == Some(speaker) {
+                    plain(ui, &t!(lang, FirstStays, speaker = &snap.scene.speaker_name(speaker)));
+                }
+                if let About::Note(note) = &snap.panel.about {
+                    plain(ui, &note.title);
+                    plain(ui, &note.sentence);
+                    if let Some(a) = &note.button {
+                        if page_button(&a.label).show(ui).clicked() {
+                            match &a.command {
+                                Command::Open(page) => ask(Ask::Open(page.clone())),
+                                cmd => ask(Ask::Command(cmd.clone())),
+                            }
+                        }
+                    }
+                }
+                if self.tray { plain(ui, &t!(lang, FirstIcon)); }
                 gap(ui);
                 if let Some(on) =
                     switch_line(ui, &t!(lang, SetStartAtSignIn), snap.scene.start_at_sign_in)
@@ -207,7 +242,7 @@ impl ViewContent for FirstRunPage {
                     {
                         action(ask, FirstRunAction::Done);
                     }
-                    if page_button(&t!(lang, SwitchToPc)).show(ui).clicked() {
+                    if snap.scene.situation.place_speaker().is_some() && page_button(&t!(lang, SwitchToPc)).show(ui).clicked() {
                         ask(Ask::Command(Command::Switch { place: crate::model::Place::ThisPc, way: None }));
                         action(ask, FirstRunAction::Done);
                     }

@@ -29,23 +29,27 @@ fn away_title(lang: Lang, name: &str, why: Away) -> String {
     }
 }
 
-pub(super) fn didnt_get_ready(
+pub(crate) fn didnt_get_ready(
     scene: &Scene,
     speaker: &SpeakerId,
     why: PickWhy,
 ) -> (String, String) {
-    let lang = scene.lang;
-    let name = scene.speaker_name(speaker);
-    let title = match why {
-        PickWhy::NotResponding => away_title(lang, &name, Away::NotResponding),
-        PickWhy::NotFound => away_title(lang, &name, Away::NotFound),
-        PickWhy::NoNetwork => away_title(lang, &name, Away::NoNetwork),
+    let title = failure_title(scene.lang, &scene.speaker_name(speaker), why);
+    (title, t!(scene.lang, SoundStillOn, place = &scene.place_name()))
+}
+
+fn failure_title(lang: Lang, name: &str, why: PickWhy) -> String {
+    match why {
+        PickWhy::NotResponding => away_title(lang, name, Away::NotResponding),
+        PickWhy::NotFound => away_title(lang, name, Away::NotFound),
+        PickWhy::NoNetwork => away_title(lang, name, Away::NoNetwork),
+        PickWhy::NeedsSecret(Secret::Code) => t!(lang, NeedsCode, speaker = name),
+        PickWhy::NeedsSecret(Secret::Password) => t!(lang, NeedsPassword, speaker = name),
         PickWhy::WrongSecret(Secret::Code) => t!(lang, CodeDidntWork),
         PickWhy::WrongSecret(Secret::Password) => t!(lang, PasswordDidntWork),
-        PickWhy::CouldntStart => t!(lang, CouldntStartPlaying, speaker = &name),
-        PickWhy::Refused => t!(lang, RefusedConnection, speaker = &name),
-    };
-    (title, t!(lang, SoundStillOn, place = &scene.place_name()))
+        PickWhy::CouldntStart => t!(lang, CouldntStartPlaying, speaker = name),
+        PickWhy::Refused => t!(lang, RefusedConnection, speaker = name),
+    }
 }
 
 fn lost_network(lang: Lang, kind: ConnKind) -> String {
@@ -159,6 +163,7 @@ fn words(scene: &Scene, n: &Note, name: &str) -> (String, String) {
             t!(lang, QuietForThirty),
             t!(lang, MovedFromSpeaker, speaker = name, when = &when),
         ),
+        Cause::WayFailed { why, .. } => (failure_title(lang, name, *why), moved()),
         Cause::DidntGetReady { speaker, why } => didnt_get_ready(scene, speaker, *why),
     }
 }
@@ -196,6 +201,16 @@ pub fn note(scene: &Scene, n: &Note) -> NoteView {
         close: n
             .can_close()
             .then(|| Act::new(t!(lang, Close), Command::CloseNote)),
+    }
+}
+
+pub(super) fn no_speaker_chosen(scene: &Scene) -> NoteView {
+    NoteView {
+        mark: Mark::Info,
+        title: t!(scene.lang, NoSpeakerChosen),
+        sentence: t!(scene.lang, ChooseInList, place = &scene.place_name()),
+        button: None,
+        close: Some(Act::new(t!(scene.lang, Close), Command::CloseNote)),
     }
 }
 

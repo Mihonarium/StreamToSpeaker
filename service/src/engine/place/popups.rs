@@ -25,7 +25,15 @@ impl Core {
         }
     }
 
+    pub(super) fn keep_no_speaker_popup(&mut self) {
+        if self.popup.as_ref().is_some_and(|(p, _)| p.what == Popup::NoSpeakerChosen) {
+            self.popup = None;
+            self.no_speaker_chosen = true;
+        }
+    }
+
     pub(super) fn panel_opened(&mut self) {
+        self.keep_no_speaker_popup();
         self.popup = None;
         if let Some(c) = &mut self.confirm {
             c.by_clock = false;
@@ -36,7 +44,8 @@ impl Core {
     }
 
     pub(super) fn panel_closed(&mut self) {
-        if self.pick_failed.as_ref().is_some_and(|(_, shown)| *shown) {
+        self.no_speaker_chosen = false;
+        if self.pick_failed.as_ref().is_some_and(|(p, shown)| *shown && !self.first_run_failure(p)) {
             self.pick_failed = None;
         }
         // A confirmation in the panel goes with it: nothing changed.

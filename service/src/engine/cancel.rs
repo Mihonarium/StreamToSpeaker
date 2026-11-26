@@ -7,7 +7,7 @@
 //! argument: it asks [`cancelled`].
 
 use std::cell::{Cell, RefCell};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 type Check = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -20,7 +20,16 @@ thread_local! {
 /// can carry the same job onto the thread that applies the change.
 pub(crate) struct Binding {
     pub cancelled: AtomicBool,
+    pub speaker: crate::model::SpeakerId,
+    pub picks_seen: u64,
+    welcome_level: Option<u8>,
+    /// When the receiver asks for a password, whether it refused one typed for this connect.
+    pub password_rejected: OnceLock<bool>,
+    /// The final error from this connect’s delay reconnect.
+    pub delay_failure: OnceLock<String>,
     pub number: AtomicU64,
+    /// The transport ids and numbers of the sessions this connect let go.
+    pub released: Mutex<Vec<(String, u64)>>,
     first_answer: Once,
     on_answer: Box<dyn Fn() + Send + Sync>,
 }
@@ -31,10 +40,16 @@ thread_local! {
 }
 
 impl Binding {
-    pub fn new(on_answer: impl Fn() + Send + Sync + 'static) -> Self {
+    pub fn new(speaker: crate::model::SpeakerId, welcome_level: Option<u8>, picks_seen: u64, on_answer: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
+            speaker,
+            picks_seen,
             cancelled: AtomicBool::new(false),
             number: AtomicU64::new(0),
+            released: Mutex::new(Vec::new()),
+            welcome_level,
+            password_rejected: OnceLock::new(),
+            delay_failure: OnceLock::new(),
             first_answer: Once::new(),
             on_answer: Box::new(on_answer),
         }
@@ -50,6 +65,11 @@ impl Binding {
 
 pub(crate) fn binding() -> Option<Arc<Binding>> {
     BINDING.with(|b| b.borrow().clone())
+}
+
+/// The volume chosen in first run, before the receiver starts playing.
+pub(crate) fn welcome_level() -> Option<u8> {
+    BINDING.with_borrow(|job| job.as_ref().and_then(|j| j.welcome_level))
 }
 
 /// While this scope lives, replies are from the speaker being asked.

@@ -18,12 +18,16 @@ impl PlaceDriver {
         }
         for action in actions {
             match action {
+                Do::PickedOutput => {
+                    *self.windows_decision.lock().unwrap() += 1;
+                    self.app.note_user_pick();
+                }
                 Do::Connect(job) => self.connect(job),
                 Do::Supersede(gen) => self.supersede(gen),
                 Do::Silence { speaker, then } => {
                     let move_windows = self.windows_later(then);
                     if let Some((_, number)) = self.session_of(&speaker) {
-                        self.threads.extend(self.app.release_number_then(Some(number), true, move_windows));
+                        self.threads.extend(self.app.release_speaker_number_then(Some(number), true, move_windows, None, Some(speaker.clone())));
                     } else {
                         move_windows();
                     }
@@ -46,7 +50,7 @@ impl PlaceDriver {
                             Err(e) => warn!("couldn't take the stream off: {e}"),
                         }
                     } else {
-                        self.threads.extend(self.app.release_number_then(Some(number), false, Box::new(|| {})));
+                        self.threads.extend(self.app.release_speaker_number_then(Some(number), false, Box::new(|| {}), None, Some(speaker.clone())));
                     }
                 }
                 Do::Windows(target) => self.windows_later(Some(target))(),
@@ -66,7 +70,16 @@ impl PlaceDriver {
                 }
                 Do::SetLevel { speaker, level } => {
                     if self.session_of(&speaker).is_some() {
-                        self.app.set_speaker_volume(level.into());
+                        if speaker.is_music_assistant() {
+                            if self.ma_before_mute.is_some() && self.app.ma_level() == 0 {
+                                self.ma_before_mute = Some(level);
+                            } else {
+                                self.ma_before_mute = None;
+                                self.app.set_ma_level(level);
+                            }
+                        } else {
+                            self.app.apply_speaker_level(level.into(), false);
+                        }
                     }
                 }
                 Do::StartAtSignIn(on) => {
@@ -117,16 +130,22 @@ impl PlaceDriver {
     }
 
     fn windows_later(&self, target: Option<WinTarget>) -> Box<dyn FnOnce() + Send> {
+        let Some(target) = target else { return Box::new(|| {}) };
+        let decisions = self.windows_decision.clone();
+        let decision = {
+            let mut current = decisions.lock().unwrap();
+            *current += 1;
+            *current
+        };
         let outputs = self.platform.outputs.clone();
         let tx = self.tx.clone();
         let now = self.clock().mono_ms;
         let at = Instant::now();
         Box::new(move || {
-            if let Some(target) = target {
-                if !switch_windows(&*outputs, target) {
-                    let at_ms = now + at.elapsed().as_millis() as u64;
-                    let _ = tx.send(PlaceInput::Event(Event::Output(OutputEvent::NotTaken { at_ms })));
-                }
+            let current = decisions.lock().unwrap();
+            if *current == decision && !switch_windows(&*outputs, target) {
+                let at_ms = now + at.elapsed().as_millis() as u64;
+                let _ = tx.send(PlaceInput::WindowsNotTaken { decision, at_ms });
             }
         })
     }

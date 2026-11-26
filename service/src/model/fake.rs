@@ -59,27 +59,29 @@ impl ScriptedEngine {
             }
             (Command::FirstRunAction(Act::Chime(id)), Some(Step::One)) => {
                 sit.confirm_in_panel = None;
-                match sit.speaker(id).map(|s| s.state) {
-                    Some(RowState::PlayingElse) => sit.confirm_in_panel = Some(Confirm::ChimeBusy { speaker: id.clone(), who: None }),
-                    Some(RowState::Plain | RowState::MayBeInUse) => sit.first_run = Some(Step::Two { speaker: id.clone(), level: 25, limit: 100 }),
-                    _ => {}
+                if let Some(row) = sit.speaker(id).filter(|r| !r.state.grey()) {
+                    if !row.can_chime || matches!(row.state, RowState::Plain | RowState::MayBeInUse) {
+                        sit.first_run = Some(Step::Two { speaker: id.clone(), level: row.can_chime.then_some(25), limit: 100 });
+                    } else if row.state == RowState::PlayingElse {
+                        sit.confirm_in_panel = Some(Confirm::ChimeBusy { speaker: id.clone(), who: None });
+                    }
                 }
             }
             (Command::Confirm { yes }, Some(Step::One)) => {
                 if let Some(Confirm::ChimeBusy { speaker, .. }) = sit.confirm_in_panel.take() {
                     if *yes {
                         if let Some(row) = sit.speakers.iter_mut().find(|s| s.id == speaker) { row.state = RowState::Plain; }
-                        sit.first_run = Some(Step::Two { speaker, level: 25, limit: 100 });
+                        sit.first_run = Some(Step::Two { speaker, level: Some(25), limit: 100 });
                     }
                 }
             }
-            (Command::FirstRunAction(Act::ChimeVolume(v)), Some(Step::Two { speaker, limit, .. })) => {
-                sit.first_run = Some(Step::Two { speaker, level: (*v).min(limit), limit });
+            (Command::FirstRunAction(Act::ChimeVolume(v)), Some(Step::Two { speaker, limit, level: Some(_) })) => {
+                sit.first_run = Some(Step::Two { speaker, level: Some((*v).min(limit)), limit });
             }
             (Command::FirstRunAction(Act::Heard | Act::UseWithoutChecking), Some(Step::Two { speaker, level, .. })) => {
                 for row in &mut sit.speakers { row.is_place = row.id == speaker; }
                 sit.spot = Spot::Speaker(speaker.clone());
-                scene.volume.place = Some(super::facts::Level::at(level));
+                scene.volume.place = level.map(super::facts::Level::at);
                 sit.first_run = Some(Step::Three { speaker });
             }
             (Command::FirstRunAction(Act::ChooseAnother), Some(Step::Two { .. })) => sit.first_run = Some(Step::One),

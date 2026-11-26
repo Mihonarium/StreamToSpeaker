@@ -38,6 +38,62 @@ fn starting() -> Rig {
 }
 
 #[test]
+fn switching_way_supersedes_the_places_connect_or_retry_and_restores_it_on_failure() {
+    for retry in [false, true] {
+        let mut r = if retry { dropped() } else { starting() };
+        if retry { r.wait(numbers::TRIES_AT_MS[0]); }
+        let old = r.job(if retry { Purpose::Retry } else { Purpose::SoundStarted });
+        r.w.speakers[0].ways.push(WayChoice::AirPlaySteady);
+        r.take();
+        r.cmd(Command::ChooseWay { speaker: id(K), way: WayChoice::AirPlaySteady }).unwrap();
+        let actions = r.take();
+        let stop = actions.iter().position(|a| a == &Do::Supersede(old.gen)).unwrap();
+        let start = actions.iter().position(|a| matches!(a, Do::Connect(j) if j.purpose == Purpose::Way)).unwrap();
+        assert!(stop < start);
+        r.event(Event::Connected { gen: old.gen, ended: Ended::Ready });
+        assert_eq!(r.jobs.len(), 1);
+        r.end(Purpose::Way, Ended::Refused);
+        r.tick();
+        assert_eq!(r.job(Purpose::SoundStarted).way, WayChoice::Native);
+        assert_eq!(r.sit().place_speaker(), Some(&id(K)));
+    }
+}
+
+#[test]
+fn try_again_replaces_the_places_own_connect_or_retry() {
+    for retry in [false, true] {
+        let mut r = if retry { dropped() } else { starting() };
+        if retry { r.wait(numbers::TRIES_AT_MS[0]); }
+        let old = r.job(if retry { Purpose::Retry } else { Purpose::SoundStarted });
+        r.take();
+        r.cmd(Command::TryAgain(id(K))).unwrap();
+        let actions = r.take();
+        let stop = actions.iter().position(|a| a == &Do::Supersede(old.gen)).unwrap();
+        let new = r.job(Purpose::TryAgain);
+        assert_eq!((&new.speaker, new.way), (&old.speaker, old.way));
+        assert!(actions[stop + 1..].contains(&Do::Connect(new)));
+        r.event(Event::Connected { gen: old.gen, ended: Ended::Ready });
+        assert_eq!(r.sit().picking.unwrap().by, SwitchBy::TryAgain);
+        r.end(Purpose::TryAgain, Ended::Ready);
+        assert_eq!(r.core.connected_speaker(), Some(&id(K)));
+    }
+}
+
+#[test]
+fn the_note_after_losing_a_way_uses_the_receivers_answer() {
+    for (ended, why) in [(Ended::Refused, Some(PickWhy::Refused)), (Ended::CouldntStart, Some(PickWhy::CouldntStart)),
+        (Ended::NotResponding, None)] {
+        let mut r = Rig::playing_on_kitchen();
+        r.event(Event::WayLost { speaker: id(K), ended });
+        assert_eq!(r.sit().spot, this_pc());
+        assert_eq!(cause(&r), Some(match why {
+            Some(why) => Cause::WayFailed { speaker: id(K), why },
+            None => Cause::StoppedResponding { speaker: id(K), vpn: None },
+        }));
+    }
+}
+
+#[test]
 fn the_note_says_why_the_sound_moved() {
     run(&[
         Row {

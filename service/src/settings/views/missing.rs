@@ -344,9 +344,13 @@ impl ViewContent for CheckView {
         ViewBar { title: w!(self.port.lang(), SetCheckStepByStep), ..Default::default() }
     }
 
-    fn show(&mut self, ui: &mut Ui, _snap: &Snapshot, _ask: &mut dyn FnMut(Ask)) {
+    fn show(&mut self, ui: &mut Ui, snap: &Snapshot, _ask: &mut dyn FnMut(Ask)) {
         let lang = self.port.lang();
         ui.spacing_mut().item_spacing.y = 8.0;
+        if snap.scene.search.phase == crate::model::facts::SearchPhase::Off {
+            check_line(ui, Mark2::Info, &w!(lang, SetFindSearchOff), None, |_| ());
+            return;
+        }
         let c = self.port.discovery_check();
         let place = |p: &NetworkPlace| match &p.network {
             Some(net) => w!(lang, SetNetworkNamed, adapter = &p.adapter, network = net, address = &p.address),

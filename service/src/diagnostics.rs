@@ -161,14 +161,17 @@ impl Snapshot {
 /// with its before-snapshot.
 pub fn report(
     product: &str,
-    version: &str,
+    version: Option<&str>,
     now: &Snapshot,
     last_error: Option<&str>,
     fault: Option<&Fault>,
     speakers: bool,
 ) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "{} v{} diagnostics", product, version);
+    match version {
+        Some(v) => writeln!(s, "{product} v{v} diagnostics"),
+        None => writeln!(s, "{product} diagnostics"),
+    }.expect("writing to a string");
     let _ = writeln!(s, "Taken at unix {}", now.taken_unix);
     let _ = writeln!(s);
     let _ = writeln!(s, "[now]");
@@ -240,7 +243,7 @@ mod tests {
         };
         let before = Snapshot { packets_published: 777, ..now.clone() };
         let fault = Fault { when_unix: 990, what: "Lost connection to Kitchen".into(), before };
-        let text = report("App", "1.2.3", &now, Some("oops"), Some(&fault), true);
+        let text = report("App", Some("1.2.3"), &now, Some("oops"), Some(&fault), true);
         assert!(text.starts_with("App v1.2.3 diagnostics"));
         assert!(text.contains("Speaker: Kitchen"));
         assert!(text.contains("AirPlay resend requests / packets: 3 / 40"));
@@ -252,7 +255,7 @@ mod tests {
 
     #[test]
     fn report_without_fault() {
-        let text = report("App", "1", &Snapshot::default(), None, None, true);
+        let text = report("App", Some("1"), &Snapshot::default(), None, None, true);
         assert!(text.contains("[last fault] none this run"));
         assert!(text.contains("Speaker: —"));
     }

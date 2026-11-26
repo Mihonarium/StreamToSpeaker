@@ -48,6 +48,7 @@ pub struct PairPromptView {
 
 pub(crate) struct PairPrompt {
     view: PairPromptView,
+    picks_seen: u64,
     /// Live-code attempts: the connect thread waits on the other end.
     tx: Option<Sender<Option<String>>>,
 }
@@ -425,7 +426,7 @@ impl App {
             let session = {
                 let mut g = self.session.lock().unwrap();
                 if g.as_ref().is_some_and(|s| is_sendspin_id(&s.stable_id())) {
-                    g.take()
+                    g.take().map(|s| self.releasing(s, None))
                 } else {
                     None
                 }
@@ -596,7 +597,7 @@ impl App {
         let s = {
             let mut g = self.session.lock().unwrap();
             if g.as_ref().is_some_and(|s| s.stable_id() == MA_OUTPUT_ID) {
-                g.take()
+                g.take().map(|s| self.releasing(s, None))
             } else {
                 None
             }
@@ -617,6 +618,9 @@ impl App {
         }
         // Counted, so an overlapping select that drops an older session
         // cannot unselect the newer one.
+        if let Some(level) = crate::engine::cancel::welcome_level() {
+            self.set_ma_level(level);
+        }
         self.sendspin.ma_output.fetch_add(1, Ordering::SeqCst);
         Ok(ActiveSession::MusicAssistant(MaOutputSession {
             name: "Music Assistant".into(),
@@ -723,7 +727,7 @@ impl App {
             }
             Some(SendspinLaunch::MaOutput) => {
                 info!("auto-reconnect: Music Assistant output");
-                self.select_speaker_async_with(MA_OUTPUT_ID, false, None);
+                self.connect_in_background(MA_OUTPUT_ID);
                 return;
             }
             Some(SendspinLaunch::Speaker(id)) => id,
@@ -791,13 +795,7 @@ impl App {
         self.sendspin_discovery()?.find_by_id(id).map(|r| r.friendly_name)
     }
 
-    /// Bring up a session to a Sendspin speaker.
-    pub(crate) fn start_sendspin_player(
-        self: &Arc<Self>,
-        id: &str,
-        pairing: Option<PairingInput>,
-        interactive: bool,
-    ) -> Result<ActiveSession, String> {
+    fn sendspin_renderer(&self, id: &str) -> Result<server::SendspinRenderer, String> {
         if !self.is_sendspin_available() {
             return Err("Sendspin is disabled for this run".into());
         }
@@ -808,9 +806,19 @@ impl App {
             .sendspin_discovery()
             .filter(|_| self.sendspin_discovery_error().is_none())
             .ok_or_else(|| "Sendspin discovery is not running".to_string())?;
-        let renderer = disc
+        disc
             .find_by_id(id)
-            .ok_or_else(|| format!("no Sendspin speaker with id {:?}", id))?;
+            .ok_or_else(|| format!("no Sendspin speaker with id {:?}", id))
+    }
+
+    /// Bring up a session to a Sendspin speaker.
+    pub(crate) fn start_sendspin_player(
+        self: &Arc<Self>,
+        id: &str,
+        interactive: bool,
+    ) -> Result<ActiveSession, String> {
+        let picks_seen = crate::engine::cancel::binding().map_or_else(|| self.user_pick_count(), |b| b.picks_seen);
+        let renderer = self.sendspin_renderer(id)?;
         let name = renderer.friendly_name.clone();
         // What was added to this speaker's delay (nothing can be removed).
         let extra = self.delay_for_sendspin(id);
@@ -830,11 +838,12 @@ impl App {
             store: self.sendspin_store(),
             samples_rx: self.hub.subscribe(),
             extra_latency_ms: extra,
-            pairing,
+            pairing: None,
             now_playing: Some(now_playing),
             connect_timeout: Duration::from_secs(5),
         };
-        match PlayerSession::start(cfg) {
+        let level = self.sendspin_start_level(id);
+        match PlayerSession::start_with_local_level(cfg, level, self.vsync.is_muted()) {
             Ok(s) => {
                 // Sendspin may have been turned off while we connected.
                 if !self.is_sendspin_enabled() {
@@ -848,13 +857,14 @@ impl App {
                 lost_credential,
                 identity_changed,
             }) => {
+                if crate::engine::cancel::cancelled() { return Err(crate::app::SUPERSEDED.into()); }
                 let what = if identity_changed {
                     format!("{}'s identity changed since it was paired, so it must be paired again", name)
                 } else {
                     format!("{} needs to be paired once", name)
                 };
                 if interactive {
-                    self.begin_sendspin_pairing(id, &name, &methods, lost_credential, identity_changed);
+                    self.begin_sendspin_pairing(id, &name, &methods, lost_credential, identity_changed, picks_seen);
                     Err(format!("{} — follow the prompt.", what))
                 } else {
                     Err(format!(
@@ -867,7 +877,8 @@ impl App {
         }
     }
 
-    fn begin_sendspin_pairing(self: &Arc<Self>, id: &str, name: &str, methods: &[PairMethod], lost: bool, identity_changed: bool) {
+    fn begin_sendspin_pairing(self: &Arc<Self>, id: &str, name: &str, methods: &[PairMethod], lost: bool, identity_changed: bool, picks_seen: u64) {
+        if crate::engine::cancel::cancelled() { return; }
         let kind = if methods.contains(&PairMethod::DynamicCode) {
             PairPromptKind::LiveCode
         } else if methods.contains(&PairMethod::StaticCode) {
@@ -886,16 +897,16 @@ impl App {
             // Connect again in pairing mode: the speaker derives a code
             // for *this* connection and shows/speaks it; the prompt opens
             // when it does.
-            let input = self.live_code_input(view);
-            self.spawn_select_with_pairing(id.to_string(), input);
+            let input = self.live_code_input(view, picks_seen);
+            self.spawn_select_with_pairing(id.to_string(), input, picks_seen);
         } else {
-            *self.sendspin.prompt.lock().unwrap() = Some(PairPrompt { view, tx: None });
+            *self.sendspin.prompt.lock().unwrap() = Some(PairPrompt { view, tx: None, picks_seen });
         }
     }
 
     /// A `PairingInput::Code` whose `ask` publishes the prompt and waits
     /// for the user (3 minutes, the server-side attempt bound).
-    fn live_code_input(self: &Arc<Self>, view: PairPromptView) -> PairingInput {
+    fn live_code_input(self: &Arc<Self>, view: PairPromptView, picks_seen: u64) -> PairingInput {
         let weak = Arc::downgrade(self);
         PairingInput::Code {
             dynamic: true,
@@ -904,6 +915,7 @@ impl App {
                 let (tx, rx) = bounded::<Option<String>>(1);
                 *app.sendspin.prompt.lock().unwrap() = Some(PairPrompt {
                     view: view.clone(),
+                    picks_seen,
                     tx: Some(tx),
                 });
                 let answer = rx.recv_timeout(Duration::from_secs(175)).ok().flatten();
@@ -916,8 +928,7 @@ impl App {
         }
     }
 
-    fn spawn_select_with_pairing(self: &Arc<Self>, id: String, input: PairingInput) {
-        self.note_user_pick();
+    fn spawn_select_with_pairing(self: &Arc<Self>, id: String, input: PairingInput, picks_seen: u64) {
         let app = self.clone();
         std::thread::Builder::new()
             .name("stream-to-speaker-sendspin-pair".into())
@@ -929,7 +940,20 @@ impl App {
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                app.select_speaker_async_with(&id, true, Some(input));
+                let paired = app.sendspin_renderer(&id).and_then(|renderer| {
+                    let name = format!("{} on {}", PRODUCT_NAME, machine_name());
+                    server::pair_player(&renderer, &name, &app.sendspin_store(), input, Duration::from_secs(5))
+                        .map_err(|e| e.to_string())
+                });
+                match paired {
+                    Ok(()) if app.command_sink.get().is_some() => app.play_after_pairing(&id, picks_seen),
+                    Ok(()) => app.connect_unless_user_picked(&id, picks_seen),
+                    Err(e) => {
+                        let msg = format!("Couldn't connect to speaker: {e}");
+                        app.record_fault(&msg);
+                        app.record_error(msg);
+                    }
+                }
             })
             .ok();
     }
@@ -941,8 +965,8 @@ impl App {
 
     /// GUI: answer the pairing prompt (`None` = cancel). Accepts a code
     /// (digits; spaces and dashes ignored) or a pairing token (`SP:…`).
-    pub fn submit_sendspin_pairing(self: &Arc<Self>, input: Option<String>) {
-        let Some(prompt) = self.sendspin.prompt.lock().unwrap().take() else {
+    pub fn submit_sendspin_pairing(self: &Arc<Self>, id: &str, input: Option<String>) {
+        let Some(prompt) = self.sendspin.prompt.lock().unwrap().take_if(|p| p.view.id == id) else {
             return;
         };
         let id = prompt.view.id.clone();
@@ -956,12 +980,12 @@ impl App {
                 // A token while a live-code attempt waits: end that
                 // attempt, then pair with the token.
                 let _ = tx.send(None);
-                self.spawn_select_with_pairing(id, PairingInput::Token(t));
+                self.spawn_select_with_pairing(id, PairingInput::Token(t), prompt.picks_seen);
             }
             (Some(tx), None) => {
                 let _ = tx.send(None);
             }
-            (None, Some(t)) if is_token => self.spawn_select_with_pairing(id, PairingInput::Token(t)),
+            (None, Some(t)) if is_token => self.spawn_select_with_pairing(id, PairingInput::Token(t), prompt.picks_seen),
             (None, Some(t)) => {
                 let code = t.clone();
                 self.spawn_select_with_pairing(
@@ -970,6 +994,7 @@ impl App {
                         dynamic: false,
                         ask: Box::new(move || Some(code.clone())),
                     },
+                    prompt.picks_seen,
                 );
             }
             (None, None) => {}
@@ -980,6 +1005,99 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typing_the_players_code_pairs_without_sound_and_requests_one_current_switch() {
+        use crate::model::{Command, SpeakerId, Surface};
+        use crate::sendspin::{channel, handshake, keys::b64url, noise, pairing, proto, pump, ws};
+        use serde_json::json;
+        let wait = Duration::from_secs(10);
+        for picked in [false, true] {
+            let app = App::for_tests();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let renderer = server::SendspinRenderer {
+                instance: "Den".into(), friendly_name: "Den".into(), ip: addr.ip(), port: addr.port(), path: "/sendspin".into(),
+            };
+            let id = renderer.stable_id();
+            let discovery = SendspinDiscoveryState::new();
+            discovery.insert(renderer);
+            *app.sendspin.discovery.lock().unwrap() = Some(discovery);
+            app.user_config.lock().unwrap().sendspin.enabled = true;
+            let (show, code) = bounded(1);
+            let peer = std::thread::spawn(move || {
+                let key = noise::generate_private_key();
+                // First it asks to pair. On the second connection it shows the code.
+                for attempt in 0..2 {
+                    let (stream, _) = listener.accept().unwrap();
+                    let ws::Accepted::WebSocket(r, w) = ws::accept(stream, "/sendspin", wait).unwrap() else { panic!() };
+                    let hs = handshake::client_handshake(r, w, &key, noise::Suite::ChaChaPoly, &|_, _| None, wait).unwrap();
+                    let events = pump::spawn_pump(hs.reader, "den", Box::new(|_, _| None));
+                    assert!(matches!(events.recv_timeout(wait).unwrap(), pump::Event::Json { value, .. } if channel::msg_type(&value) == "server/hello"));
+                    hs.writer.send_json(&channel::envelope("client/hello", json!({
+                        "name": "Den", "supported_roles": ["player@v1"], "supported_pair_methods": {"dynamic_pairing_code": {}}
+                    }))).unwrap();
+                    if attempt == 0 {
+                        assert!(matches!(events.recv_timeout(wait).unwrap(), pump::Event::Closed(_)));
+                        continue;
+                    }
+                    let pump::Event::Json { value, .. } = events.recv_timeout(wait).unwrap() else { panic!() };
+                    let activation = proto::parse_activation(channel::payload(&value));
+                    assert!(activation.pairing && !activation.playback);
+                    let ctx = pairing::PairingCtx { writer: &hs.writer, events: &events, dialect: proto::Dialect::Spec,
+                        handshake_hash: hs.handshake_hash, suite: hs.suite, pairing_index: 1 };
+                    let result = pairing::client_dynamic_code(&ctx, 6, &|digits| {
+                        if let Some(digits) = digits { show.send(digits).unwrap(); }
+                    }).unwrap();
+                    let pairing::PairOutcome::Finalized { long_term_psk } = result else { panic!("{result:?}") };
+                    // The next frame must close the connection. Playback and audio never started.
+                    assert!(matches!(events.recv_timeout(wait).unwrap(), pump::Event::Closed(_)));
+                    return (b64url(&noise::x25519_public(&key)), b64url(&long_term_psk));
+                }
+                unreachable!()
+            });
+            let (sent, commands) = crossbeam_channel::unbounded();
+            app.set_command_sink(Box::new(move |surface, command| {
+                sent.send((surface, command)).unwrap();
+                crate::model::command::ticket().1
+            }));
+            let picks_seen = app.user_pick_count();
+            let binding = Arc::new(crate::engine::cancel::Binding::new(SpeakerId::new(&id), None, picks_seen, || {}));
+            let checking = binding.enter();
+            // The driver records the next choice before it cancels this connect.
+            if picked { app.note_user_pick(); }
+            assert!(app.start_sendspin_player(&id, true).is_err());
+            if picked { app.release_job(&binding); }
+            drop(checking);
+            let digits = code.recv_timeout(wait).unwrap();
+            assert!(server::test_player::eventually(|| app.pending_sendspin_pairing().is_some_and(|p| p.id == id)));
+            let port = crate::settings::real::AppSettings::new(app.clone());
+            use crate::settings::{Act, SettingsPort};
+            port.act(Act::SubmitSendspin { id: "elsewhere".into(), code: digits.clone() });
+            port.act(Act::CancelSendspin("elsewhere".into()));
+            assert_eq!(app.pending_sendspin_pairing().unwrap().id, id);
+            port.act(Act::SubmitSendspin { id: id.clone(), code: digits });
+            drop(port);
+            let (client, psk) = peer.join().unwrap();
+            assert_eq!(app.sendspin_store().snapshot().player_pairings[&client].psk, psk);
+            assert!(!app.is_speaker_bound());
+            drop(app);
+            if !picked {
+                assert_eq!(commands.recv_timeout(wait).unwrap(), (Surface::Panel, Command::PlayAfterPairing {
+                    speaker: SpeakerId::new(&id), picks_seen,
+                }));
+            }
+            assert_eq!(commands.recv_timeout(wait), Err(crossbeam_channel::RecvTimeoutError::Disconnected));
+        }
+    }
+
+    #[test]
+    fn a_cancelled_sendspin_connect_opens_no_pairing_prompt() {
+        let app = App::for_tests();
+        let _scope = crate::engine::cancel::enter(Arc::new(|| true));
+        app.begin_sendspin_pairing("sendspin:den", "Den", &[PairMethod::StaticCode], false, false, app.user_pick_count());
+        assert!(app.pending_sendspin_pairing().is_none());
+    }
 
     #[test]
     fn ids() {

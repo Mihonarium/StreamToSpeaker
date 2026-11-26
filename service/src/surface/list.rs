@@ -571,18 +571,27 @@ impl ChimePicker {
         snap: &crate::model::Snapshot,
         mut question: impl FnMut(&mut Ui, &crate::model::SpeakerId),
     ) -> Vec<Command> {
-        use crate::model::{command::FirstRunAction, panel::{speaker_row, SearchLine}, text::t};
+        use crate::model::{command::FirstRunAction, panel::speaker_row, text::t};
         let scene = &snap.scene;
         let theme = Theme::of(ui.ctx());
         let rows: Vec<_> = scene.speakers.iter().map(|s| {
             let mut row = speaker_row(scene, s);
-            row.spoken = t!(snap.lang, ChimeOnSpeaker, speaker = &row.name);
+            // A click on a speaker without a chime asks whether to switch.
+            row.spoken = if scene.situation.speaker(&s.id).is_some_and(|r| r.can_chime) {
+                t!(snap.lang, ChimeOnSpeaker, speaker = &row.name)
+            } else {
+                row.name.clone()
+            };
             row.tooltip = Some(row.spoken.clone());
             row.marked = false;
             row.command = (!row.grey).then(|| Command::FirstRunAction(FirstRunAction::Chime(s.id.clone())));
             row
         }).collect();
         let entries: Vec<_> = rows.iter().map(Entry::Speaker).collect();
+        if let Some(failure) = scene.situation.pick_failed.as_ref().filter(|p|
+            p.by == crate::model::situation::SwitchBy::FirstRun && scene.speaker(&p.speaker).is_none()) {
+            question(ui, &failure.speaker);
+        }
         let tab = (!rows.is_empty()).then(|| self.keyboard.tab_row(ui, &entries));
         let mut out = Drawn { commands: Vec::new(), controls: Vec::new(), parts: [Rect::NOTHING; 4], natural_height: 0.0 };
         for ((row, entry), speaker) in rows.iter().zip(entries).zip(&scene.speakers) {
@@ -591,16 +600,15 @@ impl ChimePicker {
             let mut place = PlaceRow::from(row);
             place.action = None;
             place.draw(ui, r.min - vec2(LEFT, 0.0), RowFocus { id, tab: Some(id) == tab }, &theme, &mut out);
-            if matches!(&scene.situation.confirm_in_panel, Some(crate::model::situation::Confirm::ChimeBusy { speaker: target, .. }) if target == &speaker.id) {
+            if matches!(&scene.situation.confirm_in_panel, Some(crate::model::situation::Confirm::ChimeBusy { speaker: target, .. }) if target == &speaker.id)
+                || scene.situation.pick_failed.as_ref().is_some_and(|p| p.by == crate::model::situation::SwitchBy::FirstRun && p.speaker == speaker.id) {
                 question(ui, &speaker.id);
             }
         }
-        let search = crate::model::panel::search_line(scene).unwrap_or_else(|| SearchLine {
-            text: if rows.is_empty() { t!(snap.lang, Searching) } else { t!(snap.lang, LookingForMore) },
-            spinner: true, link: None,
-        });
-        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), SHORT_ROW), Sense::hover());
-        search_line(ui, r.min - vec2(LEFT, 0.0), &search, &theme, &mut out);
+        if let Some(search) = crate::model::panel::first_run_search(scene) {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), SHORT_ROW), Sense::hover());
+            search_line(ui, r.min - vec2(LEFT, 0.0), &search, &theme, &mut out);
+        }
         out.commands
     }
 }

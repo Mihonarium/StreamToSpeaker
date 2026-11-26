@@ -53,6 +53,7 @@ impl Core {
             .speakers
             .iter()
             .map(|s| SpeakerNow {
+                can_chime: s.can_chime,
                 id: s.id.clone(),
                 state: self.row_state(s, now),
                 way: self.way_for(&s.id, None, w),
@@ -75,9 +76,9 @@ impl Core {
         let first_run = match &self.first_run {
             FirstRun::Off => None,
             FirstRun::One => Some(FirstRunStep::One),
-            FirstRun::Two(k, level) => {
+            FirstRun::Two { speaker: k, level } => {
                 let limit = self.speaker_world(k, w).and_then(|s| s.max_level).unwrap_or(100);
-                Some(FirstRunStep::Two { speaker: k.clone(), level: (*level).min(limit), limit })
+                Some(FirstRunStep::Two { speaker: k.clone(), level: level.map(|v| v.min(limit)), limit })
             }
             FirstRun::Three(k) => Some(FirstRunStep::Three { speaker: k.clone() }),
         };
@@ -175,6 +176,7 @@ impl Core {
 
     fn standing(&self, w: &World, now: Clock) -> Vec<Standing> {
         let mut standing = Vec::new();
+        if self.no_speaker_chosen { standing.push(Standing::NoSpeakerChosen); }
         if self.device_missing {
             standing.push(Standing::OutputMissing);
         }
@@ -216,7 +218,7 @@ impl Core {
         let is_place = self.place.as_ref() == Some(id);
         let connecting = self.switch.as_ref().is_some_and(|x| &x.speaker == id)
             || (is_place && matches!(self.stream, Stream::Connecting { .. } | Stream::WaitNet { .. }));
-        if self.chime.as_ref().is_some_and(|job| job.chime_level.is_some() && &job.speaker == id) {
+        if self.chime.as_ref().is_some_and(|(job, by, _)| *by == SwitchBy::FirstRun && &job.speaker == id) {
             return RowState::Connecting;
         }
         if connecting {

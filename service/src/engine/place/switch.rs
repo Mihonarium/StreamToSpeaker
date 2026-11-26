@@ -48,18 +48,31 @@ impl Core {
             return Ok(Effect::Done);
         }
         let way = self.way_for(&k, way, w);
-        // The row of the place does nothing; a switch on its way to another
-        // place is cancelled, since the newest choice is where the sound is.
-        if self.place.as_ref() == Some(&k) && way == self.place_way(w) {
-            self.cancel_switch(w, out);
-            self.confirm = None;
-            return Ok(Effect::Done);
+        if by != SwitchBy::TryAgain && self.place.as_ref() == Some(&k) && way == self.place_way(w) {
+            let welcome = matches!(&self.first_run, FirstRun::Two { speaker, .. } if speaker == &k)
+                && matches!(self.stream, Stream::On { .. });
+            if welcome || by != SwitchBy::FirstRun {
+                self.cancel_switch(w, out);
+                self.confirm = None;
+                if welcome {
+                    self.leave_first_run_step(out);
+                    if let Some(level) = self.welcome_level(&k, w) {
+                        self.set_welcome_level(&k, level, w, now, out);
+                    }
+                    self.first_run = FirstRun::Three(k);
+                    self.first_run_done = true;
+                    out.push(Do::Save);
+                }
+                return Ok(Effect::Done);
+            }
         }
         if self.speaker_world(&k, w).is_some_and(|s| s.only_from_window) && !who.in_window {
             return Err(Refusal::OnlyFromWindow { speaker: k });
         }
-        if self.switch.as_ref().is_some_and(|s| s.speaker == k && s.way == way) {
-            // Already on its way.
+        let welcome_level = self.welcome_switch_level(&k, w);
+        if let Some(s) = self.switch.as_mut().filter(|s| s.speaker == k && s.way == way) {
+            // Already on its way. The person can accept the chime level now.
+            if by == SwitchBy::FirstRun && welcome_level.is_some() { s.welcome_level = welcome_level; }
             return Ok(Effect::Done);
         }
         let confirm = if take_over { None } else { self.needs_confirm(&k, way, w) };
@@ -70,6 +83,7 @@ impl Core {
         self.cancel_switch(w, out);
         self.confirm = None;
         self.pick_failed = None;
+        self.no_speaker_chosen = false;
         if let Some(what) = confirm {
             self.ask(what, by, who, windows_prev.clone(), w, now, out);
             return Ok(Effect::Done);
@@ -77,8 +91,7 @@ impl Core {
         // Where the app doesn't ask before it takes a busy speaker, it
         // doesn't look first either: the switch stops what plays there.
         let take_over = take_over || !self.ask_before_taking;
-        self.start_switch(k, way, by, who, windows_prev, take_over, now, out);
-        let _ = w;
+        self.start_switch(k, way, by, who, windows_prev, take_over, w, out);
         Ok(Effect::Done)
     }
 
@@ -135,27 +148,33 @@ impl Core {
         who: Asker,
         windows_prev: Option<PcOutputId>,
         take_over: bool,
-        now: Clock,
+        w: &World,
         out: &mut Vec<Do>,
     ) {
-        let _ = now;
+        if matches!(self.stream, Stream::Connecting { restoring: true, .. })
+            || (self.place.as_ref() == Some(&k) && matches!(self.stream, Stream::Connecting { .. } | Stream::Trying(_)))
+        {
+            self.stream_off(out);
+            self.stream = Stream::Released;
+        }
         let gen = self.next_gen();
         let purpose = match by {
             SwitchBy::Switch | SwitchBy::FirstRun => Purpose::Switch,
             SwitchBy::TryAgain => Purpose::TryAgain,
             SwitchBy::Way => Purpose::Way,
         };
+        let welcome_level = self.welcome_switch_level(&k, w);
         self.rec(&k).last_try = None;
         out.push(Do::Connect(Job {
             gen,
             speaker: k.clone(),
             way,
             purpose,
-            chime_level: None,
+            welcome_level,
             look_first: !take_over,
             in_window: who.in_window,
         }));
-        self.switch = Some(Switching { gen, speaker: k, way, by, who, windows_prev });
+        self.switch = Some(Switching { gen, welcome_level, speaker: k, way, by, who, windows_prev });
     }
 
     /// A person's switch to This PC (on `output`, or on This PC's output).
@@ -213,7 +232,7 @@ impl Core {
         }
         match c.what {
             Confirm::ChimeBusy { speaker, .. } => {
-                self.start_chime(speaker, true, c.by, c.who.in_window, w, out);
+                self.start_chime(speaker, true, c.by, c.who, w, out);
             }
             Confirm::Busy { speaker, way, .. } | Confirm::MayBeInUse { speaker, way } => {
                 if let Some(next) = self.screen_reader_confirm(&speaker, way, w) {
@@ -221,14 +240,14 @@ impl Core {
                     self.confirm = Some(Confirming { what: next, seq, since_ms: now.mono_ms, ..c });
                     return Ok(Effect::Done);
                 }
-                self.start_switch(speaker, way, c.by, c.who, c.windows_prev, true, now, out);
+                self.start_switch(speaker, way, c.by, c.who, c.windows_prev, true, w, out);
             }
             Confirm::ScreenReader { speaker, way } => {
                 self.screen_reader_answered.insert(speaker.clone());
                 out.push(Do::Save);
                 let take_over = !self.ask_before_taking
                     || self.recs.get(&speaker).is_some_and(|r| r.busy.is_some() || r.may_be_in_use.is_some());
-                self.start_switch(speaker, way, c.by, c.who, c.windows_prev, take_over, now, out);
+                self.start_switch(speaker, way, c.by, c.who, c.windows_prev, take_over, w, out);
             }
         }
         Ok(Effect::Done)
@@ -265,37 +284,65 @@ impl Core {
                 return Ok(Effect::Done);
             }
         }
-        self.start_chime(k, confirmed, by, asker.in_window, w, out);
+        self.start_chime(k, confirmed, by, asker, w, out);
         Ok(Effect::Done)
     }
 
     fn cancel_chime(&mut self, out: &mut Vec<Do>) {
-        if let Some(job) = self.chime.take() {
+        if let Some((job, _, _)) = self.chime.take() {
             out.push(Do::Supersede(job.gen));
         }
     }
 
-    fn start_chime(&mut self, k: SpeakerId, take_over: bool, by: SwitchBy, in_window: bool, w: &World, out: &mut Vec<Do>) {
+    fn start_chime(&mut self, k: SpeakerId, take_over: bool, by: SwitchBy, who: Asker, w: &World, out: &mut Vec<Do>) {
         self.cancel_chime(out);
-        let chime_level = (by == SwitchBy::FirstRun).then(|| {
-            let speaker = self.speaker_world(&k, w);
-            let level = match &self.first_run {
-                FirstRun::Two(id, level) if *id == k => *level,
-                _ => speaker.and_then(|s| s.level).unwrap_or_else(|| {
-                    levels::start_level(true, None, self.levels.get(&k).copied(), None, self.now.wall)
-                        .expect("an unreadable speaker has a starting level")
-                }),
-            };
-            level.min(speaker.and_then(|s| s.max_level).unwrap_or(100))
-        });
+        let welcome_level = if by == SwitchBy::FirstRun { self.welcome_level(&k, w) } else { None };
         let way = self.way_for(&k, None, w);
-        let job = Job { gen: self.next_gen(), speaker: k, way, purpose: Purpose::Chime, chime_level, look_first: !take_over, in_window };
+        let job = Job { gen: self.next_gen(), speaker: k, way, purpose: Purpose::Chime, welcome_level, look_first: !take_over, in_window: who.in_window };
         out.push(Do::Connect(job.clone()));
-        self.chime = Some(job);
+        self.chime = Some((job, by, who.from));
+    }
+
+    /// The level a switch to `k` starts at after first run's chime on it:
+    /// the level chosen on the slider.
+    fn welcome_switch_level(&self, k: &SpeakerId, w: &World) -> Option<u8> {
+        matches!(&self.first_run, FirstRun::Two { speaker, level: Some(_), .. } if speaker == k)
+            .then(|| self.welcome_level(k, w))
+            .flatten()
+    }
+
+    pub(super) fn welcome_level(&self, k: &SpeakerId, w: &World) -> Option<u8> {
+        let speaker = self.speaker_world(k, w)?;
+        let level = match &self.first_run {
+            FirstRun::Two { speaker, level, .. } if speaker == k => (*level)?,
+            _ => speaker.level.unwrap_or_else(|| {
+                levels::start_level(true, None, self.levels.get(k).copied(), None, self.now.wall)
+                    .expect("an unreadable speaker has a starting level")
+            }),
+        };
+        Some(level.min(speaker.max_level.unwrap_or(100)))
+    }
+
+    fn set_welcome_level(&mut self, k: &SpeakerId, level: u8, w: &World, now: Clock, out: &mut Vec<Do>) {
+        let Some(speaker) = self.speaker_world(k, w) else { return };
+        let level = level.min(speaker.max_level.unwrap_or(100));
+        self.levels.insert(k.clone(), KeptLevel { level, at: now.wall });
+        out.push(Do::SetLevel { speaker: k.clone(), level });
+    }
+
+    pub(super) fn first_run_failure(&self, p: &PickFailed) -> bool {
+        match &self.first_run {
+            FirstRun::One => p.by == SwitchBy::FirstRun,
+            FirstRun::Two { speaker, .. } => speaker == &p.speaker,
+            _ => false,
+        }
     }
 
     fn leave_first_run_step(&mut self, out: &mut Vec<Do>) {
-        if self.chime.as_ref().is_some_and(|job| job.chime_level.is_some()) {
+        if self.pick_failed.as_ref().is_some_and(|(p, _)| self.first_run_failure(p)) {
+            self.pick_failed = None;
+        }
+        if matches!(self.chime, Some((_, SwitchBy::FirstRun, _))) {
             self.cancel_chime(out);
         }
         if self.confirm.as_ref().is_some_and(|c| c.by == SwitchBy::FirstRun) {
@@ -316,39 +363,37 @@ impl Core {
             FirstRunAction::Chime(k) => {
                 if self.first_run == FirstRun::One {
                     self.pick_failed = None;
+                    if self.speaker_world(&k, w).is_some_and(|s| !s.can_chime) {
+                        self.leave_first_run_step(out);
+                        self.first_run = FirstRun::Two { level: None, speaker: k };
+                        return Ok(Effect::Done);
+                    }
                     return self.chime_request(k, false, SwitchBy::FirstRun, who, w, now, out);
                 }
             }
             FirstRunAction::ChimeAgain => {
-                if let FirstRun::Two(k, _) = self.first_run.clone() {
+                if let FirstRun::Two { speaker: k, level: Some(_) } = self.first_run.clone() {
                     return self.chime_request(k, false, SwitchBy::FirstRun, who, w, now, out);
                 }
             }
             FirstRunAction::ChimeVolume(value) => {
-                if let FirstRun::Two(k, _) = self.first_run.clone() {
+                if let FirstRun::Two { speaker: k, level: Some(_) } = self.first_run.clone() {
                     let limit = self.speaker_world(&k, w).and_then(|s| s.max_level).unwrap_or(100);
-                    self.first_run = FirstRun::Two(k, value.min(limit));
+                    self.first_run = FirstRun::Two { speaker: k, level: Some(value.min(limit)) };
                 }
             }
             FirstRunAction::Heard | FirstRunAction::UseWithoutChecking => {
-                if let FirstRun::Two(k, level) = self.first_run.clone() {
+                if let FirstRun::Two { speaker: k, .. } = self.first_run.clone() {
                     // *Volume on Kitchen* set the chime's level: the sound
-                    // starts on Kitchen at it.
-                    self.levels.insert(k.clone(), KeptLevel { level, at: now.wall });
+                    // starts on Kitchen at it. Without a chime there is no
+                    // slider, and the speaker keeps its own level.
                     self.leave_first_run_step(out);
-                    if self.place.as_ref() == Some(&k) && !self.device_missing {
-                        self.cancel_switch(w, out);
-                        self.first_run = FirstRun::Three(k);
-                        self.first_run_done = true;
-                        out.push(Do::Save);
-                    } else {
-                        return self.switch_request(k, None, SwitchBy::FirstRun, who, false, w, now, out);
-                    }
+                    return self.switch_request(k, None, SwitchBy::FirstRun, who, false, w, now, out);
                 }
             }
             FirstRunAction::DidntHear => {}
             FirstRunAction::ChooseAnother => {
-                if matches!(self.first_run, FirstRun::Two(..)) {
+                if matches!(self.first_run, FirstRun::Two { .. }) {
                     self.leave_first_run_step(out);
                     self.cancel_switch(w, out);
                     self.first_run = FirstRun::One;
@@ -380,9 +425,9 @@ impl Core {
             self.place_connect_ended(ended, w, now, out);
         } else if matches!(&self.stream, Stream::Trying(t) if t.job == Some(gen)) {
             self.try_ended(ended, w, now, out);
-        } else if self.chime.as_ref().is_some_and(|job| job.gen == gen) {
-            let job = self.chime.take().expect("checked");
-            self.chime_ended(job, ended, w, now, out);
+        } else if self.chime.as_ref().is_some_and(|(job, _, _)| job.gen == gen) {
+            let chime = self.chime.take().expect("checked");
+            self.chime_ended(chime, ended, w, now, out);
         }
     }
 
@@ -406,7 +451,8 @@ impl Core {
             Ended::NotResponding => PickWhy::NotResponding,
             Ended::NotFound => PickWhy::NotFound,
             Ended::NoNetwork => PickWhy::NoNetwork,
-            Ended::NeedsSecret(secret) | Ended::WrongSecret(secret) => PickWhy::WrongSecret(secret),
+            Ended::NeedsSecret(secret) => PickWhy::NeedsSecret(secret),
+            Ended::WrongSecret(secret) => PickWhy::WrongSecret(secret),
             Ended::CouldntStart => PickWhy::CouldntStart,
             Ended::Refused => PickWhy::Refused,
         };
@@ -458,33 +504,37 @@ impl Core {
         }
         self.listening.remove(&k);
         self.place_changed(now);
-        self.start_level(&k, w, now, out);
-        if s.by == SwitchBy::FirstRun && matches!(&self.first_run, FirstRun::Two(id, _) if *id == k) {
+        if let Some(level) = s.welcome_level {
+            self.set_welcome_level(&k, level, w, now, out);
+        } else {
+            self.start_level(&k, w, now, out);
+        }
+        if matches!(&self.first_run, FirstRun::Two { speaker, .. } if *speaker == k) {
+            self.leave_first_run_step(out);
             self.first_run = FirstRun::Three(k);
             self.first_run_done = true;
         }
         out.push(Do::Save);
     }
 
-    fn chime_ended(&mut self, job: Job, ended: Ended, w: &World, now: Clock, out: &mut Vec<Do>) {
+    fn chime_ended(&mut self, (job, by, from): (Job, SwitchBy, SwitchFrom), ended: Ended, w: &World, now: Clock, out: &mut Vec<Do>) {
         let k = job.speaker;
         let in_window = job.in_window;
-        let by = if job.chime_level.is_some() { SwitchBy::FirstRun } else { SwitchBy::Switch };
         let why = match ended {
             Ended::Ready => {
                 self.rec(&k).last_try = None;
                 self.rec(&k).busy = None;
-                if let (FirstRun::One, Some(level)) = (&self.first_run, job.chime_level) {
-                    self.first_run = FirstRun::Two(k, level);
+                if self.first_run == FirstRun::One && by == SwitchBy::FirstRun {
+                    self.first_run = FirstRun::Two { speaker: k, level: job.welcome_level };
                 }
                 return;
             }
             Ended::Busy { who } => {
                 self.rec(&k).busy = Some(who.clone());
-                if by == SwitchBy::FirstRun && matches!(&self.first_run, FirstRun::Two(id, _) if *id == k) {
+                if by == SwitchBy::FirstRun && matches!(&self.first_run, FirstRun::Two { speaker, .. } if *speaker == k) {
                     self.first_run = FirstRun::One;
                 }
-                let asker = Asker { from: if in_window { SwitchFrom::Window } else { SwitchFrom::Remote }, in_window };
+                let asker = Asker { from, in_window };
                 if asker.from != SwitchFrom::Remote {
                     self.ask(Confirm::ChimeBusy { speaker: k, who }, by, asker, None, w, now, out);
                 }
@@ -493,19 +543,17 @@ impl Core {
             Ended::NotResponding => PickWhy::NotResponding,
             Ended::NotFound => PickWhy::NotFound,
             Ended::NoNetwork => PickWhy::NoNetwork,
-            Ended::NeedsSecret(secret) | Ended::WrongSecret(secret) => PickWhy::WrongSecret(secret),
+            Ended::NeedsSecret(secret) => PickWhy::NeedsSecret(secret),
+            Ended::WrongSecret(secret) => PickWhy::WrongSecret(secret),
             Ended::CouldntStart => PickWhy::CouldntStart,
             Ended::Refused => PickWhy::Refused,
         };
-        self.rec(&k).last_try = Some(match (by, why) {
-            (SwitchBy::FirstRun, PickWhy::Refused | PickWhy::CouldntStart | PickWhy::NoNetwork) => PickWhy::NotResponding,
-            _ => why,
-        });
-        if by == SwitchBy::FirstRun && matches!(&self.first_run, FirstRun::Two(id, _) if *id == k) {
+        self.rec(&k).last_try = Some(why);
+        if by == SwitchBy::FirstRun && matches!(&self.first_run, FirstRun::Two { speaker, .. } if *speaker == k) {
             self.first_run = FirstRun::One;
         }
         self.pick_failed = Some((
-            PickFailed { speaker: k, why, by: SwitchBy::FirstRun, from: SwitchFrom::Window },
+            PickFailed { speaker: k, why, by, from },
             self.panel_open,
         ));
     }

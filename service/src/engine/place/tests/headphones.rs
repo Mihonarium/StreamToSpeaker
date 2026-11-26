@@ -407,3 +407,24 @@ fn a_switch_in_windows_list_plays_meanwhile_on_the_old_output() {
         },
     ]);
 }
+
+#[test]
+fn no_speaker_chosen_stays_in_the_open_panel_or_window() {
+    for window in [false, true] {
+        for dismiss in 0..3 {
+            let mut r = Rig::new();
+            if window { r.cmd(Command::WindowOpened).unwrap(); } else { r.open_panel(); }
+            r.choose_in_windows(OutputRef::Ours);
+            assert_eq!(popup(&r), None);
+            r.open_panel();
+            r.wait(15_000);
+            assert!(r.sit().standing.contains(&Standing::NoSpeakerChosen));
+            match dismiss {
+                0 => { r.cmd(Command::CloseNote).unwrap(); }
+                1 => r.close_panel(),
+                _ => r.switch_to(K),
+            }
+            assert!(!r.sit().standing.contains(&Standing::NoSpeakerChosen));
+        }
+    }
+}

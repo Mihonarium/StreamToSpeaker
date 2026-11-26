@@ -77,9 +77,9 @@ impl PlaceDriver {
             })
             .unwrap_or(Progress::Settled);
         let mut search = SearchFacts::default();
-        if !w.speakers.iter().any(|s| s.found)
-            && (situation.first_run.is_some() || self.app.discovery.is_some() || self.app.airplay_discovery.is_some())
-        {
+        if self.app.discovery.is_none() && self.app.airplay_discovery.is_none() {
+            search.phase = SearchPhase::Off;
+        } else if !w.speakers.iter().any(|s| s.found) {
             search.phase = if now.mono_ms < CANT_FIND_AFTER_MS {
                 SearchPhase::Looking
             } else {
@@ -197,6 +197,7 @@ impl PlaceDriver {
             DelayChoice::Steady => WayChoice::AirPlaySteady,
         });
         Some(SpeakerSeen {
+            airplay_id: ids.and_then(|s| s.airplay.as_deref()).map(SpeakerId::new),
             id: id.clone(),
             way: state.way,
             ways,

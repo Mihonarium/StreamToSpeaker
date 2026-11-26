@@ -43,7 +43,7 @@ impl ViewContent for CantHearView {
     fn show(&mut self, ui: &mut Ui, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) {
         let lang = self.port.lang();
         ui.spacing_mut().item_spacing.y = 8.0;
-        if let Some(crate::model::situation::FirstRunStep::Two { speaker, level, limit }) = &snap.scene.situation.first_run {
+        if let Some(crate::model::situation::FirstRunStep::Two { speaker, level: Some(level), limit }) = &snap.scene.situation.first_run {
             if self.target.as_ref() == Some(speaker) {
                 // The test session reached this speaker. The live playback chain
                 // belongs to the current place and cannot diagnose this chime.

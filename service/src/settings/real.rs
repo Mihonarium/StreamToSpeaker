@@ -253,16 +253,17 @@ impl AppSettings {
     }
 
     /// Keep edits to both ways together with other fields the engine may have saved.
-    fn change_speaker(&self, id: &str, edit: impl Fn(&mut crate::user_config::SpeakerSettings)) {
+    fn change_speaker(&self, id: &str, edit: impl Fn(&mut crate::user_config::SpeakerSettings)) -> Vec<String> {
         let ids = self.transport_ids(id);
         let mut cfg = self.app.user_config.lock().unwrap();
-        for id in ids {
-            if crate::airplay::discovery::is_instance_id(&id) { continue; }
+        for id in &ids {
+            if crate::airplay::discovery::is_instance_id(id) { continue; }
             let entry = cfg.speaker_settings.entry(id.clone()).or_default();
             edit(entry);
-            if entry.is_default() { cfg.speaker_settings.remove(&id); }
+            if entry.is_default() { cfg.speaker_settings.remove(id); }
         }
         cfg.save();
+        ids
     }
 
     fn playing_id(&self) -> Option<String> {
@@ -703,8 +704,9 @@ impl SettingsPort for AppSettings {
 
     fn wanted_dialog(&self) -> Option<Wanted> {
         let app = &self.app;
-        if let Some((id, name)) = app.pending_pin_pairing() {
-            return Some(Wanted::PairingCode(CodeAsk { id, name: clean_name(&name).0, stage: CodeStage::Showing, seconds_left: None }));
+        if let Some(mut ask) = app.pairing_code_ask() {
+            ask.name = clean_name(&ask.name).0;
+            return Some(Wanted::PairingCode(ask));
         }
         if let Some(p) = app.pending_sendspin_pairing() {
             return Some(Wanted::SendspinCode(SendspinAsk {
@@ -746,7 +748,7 @@ impl SettingsPort for AppSettings {
             out.push(w!(lang, SetReportVersionLine, version = crate::display_version(), os = std::env::consts::OS));
         }
         if parts.diagnostics {
-            out.push(self.app.diagnostics_report(parts.speakers));
+            out.push(self.app.diagnostics_report(parts.speakers, parts.versions));
         }
         if parts.speakers {
             for s in self.app.speaker_view_opts(true).speakers {
@@ -835,7 +837,8 @@ impl SettingsPort for AppSettings {
                 app.tone_follows_speaker();
             }
             Act::VolumeLimit(id, limit) => {
-                self.change_speaker(&id, |s| s.volume_limit = (limit < 100).then_some(limit));
+                let ids = self.change_speaker(&id, |s| s.volume_limit = (limit < 100).then_some(limit));
+                app.apply_bound_volume_limit(&ids);
             }
             Act::ShowAs(id, name) => {
                 let name = name.trim();
@@ -941,17 +944,18 @@ impl SettingsPort for AppSettings {
             Act::Donate => self.desktop.open_url(DONATE),
             Act::LicenceAndSource => self.desktop.open_url(REPOSITORY),
             Act::Lab(l) => self.lab_act(l),
-            Act::SubmitCode { code, .. } => {
-                if !app.submit_pin(Some(code)) {
+            Act::SubmitCode { id, code } => {
+                if !app.submit_pin(&id, Some(code)) {
                     app.record_error(w!(self.lang(), SetPairingEnded));
                 }
             }
             Act::NewCode(id) => {
-                let _ = app.submit_pin(None);
-                app.select_speaker_async(&id);
+                if !app.ask_for_new_code(&id) {
+                    app.record_error(w!(self.lang(), SetPairingEnded));
+                }
             }
-            Act::CancelPairing(_) => {
-                let _ = app.submit_pin(None);
+            Act::CancelPairing(id) => {
+                let _ = app.submit_pin(&id, None);
             }
             Act::SubmitPassword { id, password, connect } => {
                 let name = self.rows().into_iter().find(|(r, _)| r.id == id).map(|(r, _)| r.name).unwrap_or_else(|| id.clone());
@@ -961,8 +965,8 @@ impl SettingsPort for AppSettings {
                     app.record_error(e);
                 }
             }
-            Act::SubmitSendspin { code, .. } => app.submit_sendspin_pairing(Some(code)),
-            Act::CancelSendspin(_) => app.submit_sendspin_pairing(None),
+            Act::SubmitSendspin { id, code } => app.submit_sendspin_pairing(&id, Some(code)),
+            Act::CancelSendspin(id) => app.submit_sendspin_pairing(&id, None),
             Act::Find { address, name } => self.find(address, name),
             Act::AddFound { way, name } => {
                 let address = match self.probe() {

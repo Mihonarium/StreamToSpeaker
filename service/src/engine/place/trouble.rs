@@ -150,10 +150,14 @@ impl Core {
     /// can't play ends the try at once.
     pub(super) fn connect_place(&mut self, w: &World, now: Clock, out: &mut Vec<Do>) {
         let Some(k) = self.place.clone() else { return };
+        if self.switch.as_ref().is_some_and(|s| s.speaker == k) {
+            self.stream = Stream::Released;
+            return;
+        }
         let gen = self.next_gen();
         let way = self.place_way(w);
-        out.push(Do::Connect(Job { gen, speaker: k, way, chime_level: None, purpose: Purpose::SoundStarted, look_first: true, in_window: false }));
-        self.stream = Stream::Connecting { gen, asked_ms: now.mono_ms, until_ms: now.mono_ms + START_TRY_MS };
+        out.push(Do::Connect(Job { gen, speaker: k, way, welcome_level: None, purpose: Purpose::SoundStarted, look_first: true, in_window: false }));
+        self.stream = Stream::Connecting { gen, asked_ms: now.mono_ms, until_ms: now.mono_ms + START_TRY_MS, restoring: self.stream == Stream::Released };
     }
 
     pub(super) fn place_connect_ended(&mut self, ended: Ended, w: &World, now: Clock, out: &mut Vec<Do>) {
@@ -242,6 +246,10 @@ impl Core {
     /// The place's speaker stopped responding while it played: the tries.
     /// Nothing is paused; what plays meanwhile isn't heard.
     fn start_tries(&mut self, k: SpeakerId, w: &World, now: Clock) {
+        if self.switch.as_ref().is_some_and(|s| s.speaker == k) {
+            self.stream = Stream::Released;
+            return;
+        }
         let cause = self.cause_for_drop(&k, w, now);
         self.stream = Stream::Trying(Tries { since_ms: now.mono_ms, started: 0, job: None, cause, at: now.local });
     }
@@ -276,7 +284,7 @@ impl Core {
             }
             let gen = self.next_gen();
             let way = self.place_way(w);
-            out.push(Do::Connect(Job { gen, speaker: k, way, chime_level: None, purpose: Purpose::Retry, look_first: false, in_window: false }));
+            out.push(Do::Connect(Job { gen, speaker: k, way, welcome_level: None, purpose: Purpose::Retry, look_first: false, in_window: false }));
             t.started += 1;
             t.job = Some(gen);
             self.stream = Stream::Trying(t);
@@ -334,7 +342,11 @@ impl Core {
         let cause = match ended {
             Ended::NeedsSecret(secret) | Ended::WrongSecret(secret) => Cause::NeedsSecret { speaker: speaker.clone(), secret },
             Ended::Busy { who } => Cause::PlayingElse { speaker: speaker.clone(), who },
-            _ => self.cause_for_drop(&speaker, w, now),
+            Ended::Refused => Cause::WayFailed { speaker: speaker.clone(), why: PickWhy::Refused },
+            Ended::CouldntStart => Cause::WayFailed { speaker: speaker.clone(), why: PickWhy::CouldntStart },
+            Ended::NotFound => Cause::WayFailed { speaker: speaker.clone(), why: PickWhy::NotFound },
+            Ended::NotResponding | Ended::NoNetwork => self.cause_for_drop(&speaker, w, now),
+            Ended::Ready => return,
         };
         self.cant_play(speaker, cause, w, now, out);
     }

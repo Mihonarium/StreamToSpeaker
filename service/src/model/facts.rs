@@ -99,6 +99,8 @@ pub struct SearchFacts {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SearchPhase {
+    /// All speaker searches are off for this run.
+    Off,
     /// Speakers were found (or the search isn't news).
     #[default]
     Found,

@@ -96,7 +96,7 @@ impl Rig {
         let PlaceInput::Answered(gen) = self.rx.recv_timeout(WAIT).unwrap() else { panic!("expected the first answer") };
         self.driver.input(PlaceInput::Answered(gen));
         let end = self.rx.recv_timeout(WAIT).unwrap();
-        assert!(matches!(end, PlaceInput::Event(Event::Connected { gen: n, .. }) if n == gen));
+        assert!(matches!(end, PlaceInput::Connected { gen: n, .. } if n == gen));
         end
     }
 
@@ -564,6 +564,26 @@ fn sound_start_leaves_a_busy_speaker_alone() {
 }
 
 #[test]
+fn a_late_windows_failure_leaves_the_new_speaker_playing() {
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.windows.refuse_switches(true);
+    r.driver.execute(vec![Do::Windows(WinTarget::OurDevice)]);
+    let failure = r.rx.try_recv().unwrap();
+    r.windows.refuse_switches(false);
+    r.pick();
+    let ready = r.answered_connect();
+    r.driver.input(ready);
+    r.driver.input(failure);
+    r.settle();
+    let s = r.driver.situation();
+    assert_eq!(s.spot, Spot::Speaker(id()));
+    assert!(!s.standing.contains(&Standing::WindowsDidntSwitch { speaker: id() }));
+    assert_eq!(r.driver.bound().unwrap().0, DEN);
+    assert_eq!(r.default(), output(OURS));
+}
+
+#[test]
 fn a_refused_windows_switch_restores_the_old_place() {
     let fake = FakeRenderer::start(answer);
     let mut r = Rig::new(&fake, UserConfig::in_memory());
@@ -687,6 +707,7 @@ fn a_sonos_and_its_twin_share_a_row_and_airplay_follows_the_delay_choice() {
         row("sonos", SpeakerKind::Sonos, Some("ap")),
         row("alone", SpeakerKind::AirPlay, None),
         row("pair", SpeakerKind::HomePodPair, None),
+        row("player", SpeakerKind::Sendspin, None),
     ];
     let result = world::fold(&list, |id| match id {
         "ap" => Some(crate::delay::DelayChoice::Short),
@@ -694,7 +715,9 @@ fn a_sonos_and_its_twin_share_a_row_and_airplay_follows_the_delay_choice() {
         _ => None,
     });
     use WayChoice::*;
-    assert_eq!(result.len(), 3);
+    assert_eq!(result.len(), 4);
+    assert!(result[..3].iter().all(|(_, s)| s.can_chime));
+    assert!(!result[3].1.can_chime);
     assert_eq!(result[0].1.ways, [Native, AirPlayShort, AirPlaySteady]);
     assert!(result[0].0.has("ap") && result[0].0.has("sonos"));
     assert_eq!(result[0].1.id.as_str(), "sonos");

@@ -79,8 +79,9 @@ pub struct SpeakerWorld {
     /// speakers, Music Assistant's players and a Sonos on its TV input
     /// don't.
     pub shows_doing: bool,
-    /// Its level can't be read (AirPlay): it starts at the level the app
-    /// sets.
+    /// A chime can play on this speaker now.
+    pub can_chime: bool,
+    /// The app sets its starting level, as on AirPlay and fixed-volume Sendspin players.
     pub level_unreadable: bool,
     /// Its level now, where it can be read.
     pub level: Option<u8>,
@@ -101,6 +102,7 @@ impl SpeakerWorld {
             found: true,
             ways: vec![WayChoice::Native],
             shows_doing: true,
+            can_chime: true,
             level_unreadable: false,
             level: None,
             max_level: None,
@@ -173,6 +175,8 @@ impl Default for SettingsWorld {
 pub enum Event {
     /// A connection the core asked for ended.
     Connected { gen: u64, ended: Ended },
+    /// A switch released this place's session before another choice took effect.
+    PlaceReleased(SpeakerId),
     /// A change of way ended with neither session bound.
     WayLost { speaker: SpeakerId, ended: Ended },
     /// A speaker said something, or a request to it told something.
@@ -261,6 +265,8 @@ pub enum StartKind {
 /// What the engine does, in the order given.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Do {
+    /// A person or Windows chose an output.
+    PickedOutput,
     /// Connect a speaker (on a thread of its own); the end comes back as
     /// [`Event::Connected`] with the job's `gen`.
     Connect(Job),
@@ -303,8 +309,8 @@ pub struct Job {
     pub speaker: SpeakerId,
     pub way: WayChoice,
     pub purpose: Purpose,
-    /// First-run chimes carry their own playback level.
-    pub chime_level: Option<u8>,
+    /// First run sets the level for both the chime and the switch.
+    pub welcome_level: Option<u8>,
     /// Look first whether it is playing something else (it ends
     /// [`Ended::Busy`] then, without sending anything).
     pub look_first: bool,

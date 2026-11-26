@@ -502,6 +502,16 @@ fn speaker_missing_adds_by_address_in_place() {
 }
 
 #[test]
+fn the_discovery_check_explains_why_search_is_off() {
+    let port = scripted(|_| ());
+    let mut scene = snap("kitchen-playing").scene.clone();
+    scene.search.phase = crate::model::facts::SearchPhase::Off;
+    let h = H::new(port.clone(), Box::new(CheckView::new(port)), Arc::new(crate::model::view::view(scene, None, false, 1)));
+    assert!(h.has("Not looking for speakers: speaker search was turned off when the app was started."));
+    assert!(!h.shows("Looking on") && !h.shows("network") && !h.shows("found") && !h.has("Search again"));
+}
+
+#[test]
 fn speaker_missing_searches_shows_hidden_speakers_and_opens_the_check() {
     let port = scripted(|s| {
         let mut tv = s.speakers.hidden[0].clone();
@@ -730,6 +740,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
     let lang = crate::model::text::Lang::English;
     reset_and_remove_only_act_after_confirmation();
     a_busy_chime_asks_in_the_page_before_playing();
+    the_discovery_check_explains_why_search_is_off();
     tone_name_and_speaker_commands();
     the_page_uses_the_panel_delay_commands_and_the_selected_ways_limits();
     // Draw the exact-delay row with a saved change so the reset link is covered too.
@@ -905,6 +916,7 @@ fn welcome_page(snap: Arc<Snapshot>) -> H {
 }
 
 pub(crate) fn draw_welcome_words() {
+    welcome_without_chime();
     for sample in ["pc-welcome-pick", "pc-welcome-busy", "pc-welcome-looking", "pc-welcome-none-found", "pc-welcome-chime", "kitchen-welcome-done"] {
         welcome_page(snap(sample));
     }
@@ -943,6 +955,7 @@ fn welcome_pages_and_their_controls() {
     assert_eq!(h.asks(), [Asked::Open(Open::Settings)]);
     assert!(page("pc-welcome-looking").has("Looking for speakers…"));
     let mut h = page("pc-welcome-none-found");
+    assert!(!h.has("Click a speaker to hear a short chime on it.") && !h.has("Click a speaker to play this PC’s sound on it."));
     ordered(&h, &["No speakers found on the network.", "Why?", "Speaker missing?", "Settings"]);
     h.click("Why?");
     assert_eq!(h.asks(), [Asked::Open(Open::SpeakerMissing)]);
@@ -979,4 +992,155 @@ fn welcome_pages_and_their_controls() {
     assert_eq!(h.asks(), [command(A::StartAtSignIn(false))]);
     h.click("Done");
     assert_eq!(h.asks(), [command(A::Done)]);
+}
+
+fn welcome_without_chime() -> H {
+    let mut scene = snap("pc-welcome-chime").scene.clone();
+    if let Some(crate::model::situation::FirstRunStep::Two { level, .. }) = &mut scene.situation.first_run {
+        *level = None;
+    }
+    welcome_page(Arc::new(crate::model::view::view(scene, None, false, 1)))
+}
+
+#[test]
+fn a_speaker_without_a_chime_offers_the_switch_without_a_volume() {
+    let mut page = speaker_in("office", "pc-welcome-pick", |_| ());
+    let mut scene = page.snap.scene.clone();
+    scene.situation.speakers.iter_mut().find(|s| s.id == sid("office")).unwrap().can_chime = false;
+    page.snap = Arc::new(crate::model::view::view(scene, None, false, 2));
+    page.settle();
+    assert!(!page.has("Play a test chime"));
+    assert!(page.has("Switch to Office"));
+    let mut h = welcome_without_chime();
+    for text in ["Play this PC’s sound on Kitchen?", "Kitchen can’t play a test chime first. Switch to it, then play something on this PC to check.",
+        "Switch to Kitchen", "Choose another speaker"] {
+        assert!(h.has(text), "{text}");
+    }
+    for text in ["I heard it", "I didn’t hear it", "Play it again", "Use Kitchen without checking", "Volume on Kitchen"] { assert!(!h.has(text), "{text}"); }
+    h.click("Switch to Kitchen");
+    assert_eq!(h.asks(), [Asked::Command(Command::FirstRunAction(crate::model::command::FirstRunAction::UseWithoutChecking))]);
+}
+
+#[test]
+fn a_first_run_failure_outlives_its_row_and_shows_once_above_the_list() {
+    use crate::model::situation::{PickFailed, PickWhy, SwitchBy, SwitchFrom};
+    let mut scene = snap("pc-welcome-pick").scene.clone();
+    let speaker = sid("kitchen");
+    scene.situation.pick_failed = Some(PickFailed { speaker: speaker.clone(), why: PickWhy::NotResponding, by: SwitchBy::FirstRun, from: SwitchFrom::Window });
+    scene.speakers.retain(|s| s.id != speaker);
+    let (title, sentence) = crate::model::notes::didnt_get_ready(&scene, &speaker, PickWhy::NotResponding);
+    let mut h = welcome_page(Arc::new(crate::model::view::view(scene.clone(), None, false, 1)));
+    assert_eq!(h.texts.iter().filter(|t| t.text == title).count(), 1);
+    assert!(h.find(&title).unwrap().bottom() <= h.find("Bedroom").unwrap().top());
+    assert!(!h.has(&sentence));
+    scene.situation.pick_failed = None;
+    h.snap = Arc::new(crate::model::view::view(scene, None, false, 2));
+    h.settle();
+    assert!(!h.has(&title));
+}
+
+#[test]
+fn first_run_shows_only_the_failure_title_under_its_speaker() {
+    use crate::model::situation::{PickFailed, PickWhy, SwitchBy, SwitchFrom};
+    let mut scene = snap("pc-welcome-pick").scene.clone();
+    for why in [PickWhy::Refused, PickWhy::CouldntStart, PickWhy::NoNetwork, PickWhy::NotResponding,
+        PickWhy::NotFound, PickWhy::WrongSecret(crate::model::state::Secret::Code), PickWhy::NeedsSecret(crate::model::state::Secret::Code),
+        PickWhy::WrongSecret(crate::model::state::Secret::Password), PickWhy::NeedsSecret(crate::model::state::Secret::Password)] {
+        scene.situation.pick_failed = Some(PickFailed { speaker: sid("kitchen"), why, by: SwitchBy::FirstRun, from: SwitchFrom::Window });
+        let (title, sentence) = crate::model::notes::didnt_get_ready(&scene, &sid("kitchen"), why);
+        let h = welcome_page(Arc::new(crate::model::view::view(scene.clone(), None, false, 1)));
+        let line = h.find(&title).unwrap();
+        assert!(h.find("Kitchen").unwrap().bottom() <= line.top() && line.bottom() <= h.find("Office").unwrap().top());
+        assert!(!h.has(&sentence));
+    }
+}
+
+#[test]
+fn welcome_done_follows_the_place_and_its_note() {
+    use crate::model::situation::{FirstRunStep, Standing};
+    for sample in ["pc-plain", "pc-kitchen-stopped-responding", "pc-headphones-connected"] {
+        let mut scene = snap(sample).scene.clone();
+        scene.situation.first_run = Some(FirstRunStep::Three { speaker: sid("kitchen") });
+        if sample == "pc-plain" { scene.situation.standing.push(Standing::WindowsDidntSwitch { speaker: sid("kitchen") }); }
+        let snap = Arc::new(crate::model::view::view(scene, None, false, 1));
+        let crate::model::panel::About::Note(note) = &snap.panel.about else { panic!("{sample}") };
+        let mut h = welcome_page(snap.clone());
+        assert!(h.has(&snap.panel.place.name) && h.has(&note.title) && h.has(&note.sentence));
+        assert!(!h.shows("now plays") && !h.shows("until you switch it.") && !h.has("Switch to this PC"));
+        if let Some(button) = &note.button {
+            h.click(&button.label);
+            let expected = match &button.command { Command::Open(o) => Asked::Open(o.clone()), c => Asked::Command(c.clone()) };
+            assert_eq!(h.asks(), [expected]);
+        }
+    }
+}
+
+#[test]
+fn welcome_done_without_tray_omits_the_icon_sentence() {
+    let snap = snap("kitchen-welcome-done");
+    let mut page = FirstRunPage::new(snap.scene.situation.first_run.clone().unwrap());
+    page.tray = false;
+    let h = H::new(scripted(|_| ()), Box::new(page), snap);
+    assert!(h.has("Kitchen now plays this PC’s sound") && h.has("Switch to this PC"));
+    assert!(!h.shows("by the clock"));
+}
+
+#[test]
+fn welcome_with_search_off_never_shows_a_search_in_progress() {
+    use crate::model::facts::SearchPhase;
+    for empty in [false, true] {
+        let mut scene = snap("pc-welcome-pick").scene.clone();
+        if empty { scene.speakers.clear(); }
+        scene.search.phase = SearchPhase::Off;
+        let search = crate::model::panel::first_run_search(&scene);
+        assert_eq!(search.as_ref().map(|s| s.spinner), empty.then_some(false));
+        let h = welcome_page(Arc::new(crate::model::view::view(scene, None, false, 1)));
+        assert_eq!(h.has("No speakers found on the network."), empty);
+        assert!(!h.shows("Looking for") && !h.shows("Searching"));
+    }
+}
+
+#[test]
+fn step_two_shows_only_its_speakers_failure_title() {
+    use crate::model::situation::{FirstRunStep, PickFailed, PickWhy, SwitchBy, SwitchFrom};
+    let mut scene = snap("pc-welcome-chime").scene.clone();
+    for chimed in [false, true] {
+        if let Some(FirstRunStep::Two { level, .. }) = &mut scene.situation.first_run { *level = chimed.then_some(25); }
+        for speaker in [sid("kitchen"), sid("office")] {
+            let why = PickWhy::Refused;
+            scene.situation.pick_failed = Some(PickFailed { speaker: speaker.clone(), why, by: SwitchBy::Switch, from: SwitchFrom::Tray });
+            let (title, sentence) = crate::model::notes::didnt_get_ready(&scene, &speaker, why);
+            let h = welcome_page(Arc::new(crate::model::view::view(scene.clone(), None, false, 1)));
+            assert_eq!(h.has(&title), speaker == sid("kitchen"));
+            assert!(!h.has(&sentence));
+        }
+    }
+}
+
+#[test]
+fn step_one_offers_a_chime_only_if_a_listed_speaker_can_play_one() {
+    let mut scene = snap("pc-welcome-pick").scene.clone();
+    scene.speakers.retain(|s| s.id == sid("kitchen"));
+    for available in [false, true] {
+        scene.situation.speakers.iter_mut().find(|s| s.id == sid("kitchen")).unwrap().can_chime = available;
+        let h = welcome_page(Arc::new(crate::model::view::view(scene.clone(), None, false, 1)));
+        assert_eq!(h.has("Click a speaker to hear a short chime on it."), available);
+        assert_eq!(h.has("Click a speaker to play this PC’s sound on it."), !available);
+    }
+}
+
+#[test]
+fn step_three_shows_how_to_start_the_music_assistant_input() {
+    use crate::model::situation::{FirstRunStep, Standing};
+    let mut scene = snap("music-assistant-playing").scene.clone();
+    scene.situation.first_run = Some(FirstRunStep::Three { speaker: SpeakerId::music_assistant() });
+    scene.situation.standing.push(Standing::MusicAssistantNotStarted);
+    let mut h = welcome_page(Arc::new(crate::model::view::view(scene, None, false, 1)));
+    let stays = h.find("It stays on Music Assistant until you switch it.").unwrap();
+    assert!(h.has("Music Assistant") && !h.shows("now plays"));
+    let title = h.find("Music Assistant hasn’t started playing").unwrap();
+    assert!(stays.bottom() <= title.top());
+    assert!(h.has("Start this PC’s sound in Music Assistant, or set Music Assistant to start it by itself."));
+    h.click("How to start it");
+    assert_eq!(h.asks(), [Asked::Open(Open::MusicAssistantHowTo)]);
 }

@@ -19,14 +19,41 @@ impl PlaceDriver {
         // Older entry points can name the AirPlay ID of a speaker with two ways.
         let wish;
         let waiting = matches!(cmd, Command::PlayWhenListed { .. });
-        let cmd = if let Command::PlayWhenListed { speaker, picks_seen } = cmd {
-            if app.user_pick_count() != *picks_seen { return Ok(Effect::Done); }
-            wish = Command::Switch { place: crate::model::Place::of_speaker(speaker), way: None };
-            &wish
-        } else { cmd };
+        let cmd = match cmd {
+            Command::PlayWhenListed { picks_seen, .. } | Command::PlayAfterPairing { picks_seen, .. }
+                if app.user_pick_count() != *picks_seen => return Ok(Effect::Done),
+            Command::PlayWhenListed { speaker, picks_seen } => {
+                wish = Command::PlayWhenListed { speaker: self.speaker_of(speaker.as_str()), picks_seen: *picks_seen };
+                &wish
+            }
+            Command::PlayAfterPairing { speaker, .. } => {
+                wish = Command::Switch { place: crate::model::Place::of_speaker(speaker), way: None };
+                &wish
+            }
+            _ => cmd,
+        };
         let canonical;
         let cmd = if let Command::Switch { place: crate::model::Place::Speaker(id), way } = cmd {
-            canonical = Command::Switch { place: crate::model::Place::of_speaker(&self.speaker_of(id.as_str())), way: *way };
+            let speaker = self.speaker_of(id.as_str());
+            let way = way.or_else(|| {
+                let status = obs.airplay.get(id.as_str()).filter(|_| speaker != *id)?;
+                self.core.kept().ways.get(&speaker).copied().filter(|w| *w != WayChoice::Native)
+                    .or(Some(match status.choice {
+                        Some(crate::delay::DelayChoice::Short) => WayChoice::AirPlayShort,
+                        _ => WayChoice::AirPlaySteady,
+                    }))
+            });
+            canonical = Command::Switch { place: crate::model::Place::of_speaker(&speaker), way };
+            &canonical
+        } else if let Command::UseDelayChoice { speaker, choice } = cmd {
+            let (choice, way) = match choice {
+                crate::model::facts::DelayChoice::Short => (crate::delay::DelayChoice::Short, WayChoice::AirPlayShort),
+                crate::model::facts::DelayChoice::Steady => (crate::delay::DelayChoice::Steady, WayChoice::AirPlaySteady),
+            };
+            if self.core.place_speaker() != Some(speaker) {
+                app.store_delay_choice(&self.app_id(speaker, way), choice, false).map_err(|why| refusal(why, speaker))?;
+            }
+            canonical = Command::ChooseWay { speaker: speaker.clone(), way };
             &canonical
         } else { cmd };
         match cmd {
@@ -60,15 +87,6 @@ impl PlaceDriver {
                     })),
                     Err(why) => Err(refusal(why, speaker)),
                 }
-            }
-            Command::UseDelayChoice { speaker, choice } => {
-                let choice = match choice {
-                    crate::model::facts::DelayChoice::Short => crate::delay::DelayChoice::Short,
-                    crate::model::facts::DelayChoice::Steady => crate::delay::DelayChoice::Steady,
-                };
-                app.set_delay_choice(&self.app_id(speaker, WayChoice::AirPlayShort), choice)
-                    .map(|_| Effect::Done)
-                    .map_err(|why| refusal(why, speaker))
             }
             Command::Reconnect(id) => {
                 if self.core.connected_speaker() == Some(id) && self.session_of(id).is_some() {

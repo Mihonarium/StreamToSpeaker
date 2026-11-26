@@ -183,6 +183,8 @@ pub enum Cause {
     /// The Settings option switched to this PC after 30 minutes without
     /// sound.
     SwitchedAfterQuiet { from: SpeakerId },
+    /// Changing the way the speaker plays failed after its previous session ended.
+    WayFailed { speaker: SpeakerId, why: PickWhy },
     /// A person's switch to `speaker` didn't get ready: nothing changed,
     /// and the sound is still in line 1's place.
     DidntGetReady { speaker: SpeakerId, why: PickWhy },
@@ -203,6 +205,7 @@ impl Cause {
             | OtherNetwork { speaker }
             | Removed { speaker }
             | PlayingAtStart { speaker }
+            | WayFailed { speaker, .. }
             | DidntGetReady { speaker, .. } => speaker,
             HeadphonesGone { before, .. } | HeadphonesConnected { before, .. } => before,
             SwitchedAfterQuiet { from } => from,
@@ -286,10 +289,10 @@ impl Note {
         let speaker = self.cause.speaker().clone();
         match &self.cause {
             Cause::Removed { .. } => None,
-            Cause::NeedsSecret { secret, .. } | Cause::DidntGetReady { why: PickWhy::WrongSecret(secret), .. } => {
+            Cause::NeedsSecret { secret, .. } | Cause::DidntGetReady { why: PickWhy::WrongSecret(secret) | PickWhy::NeedsSecret(secret), .. } => {
                 Some(NoteButton::EnterSecret(speaker, *secret))
             }
-            Cause::DidntGetReady { .. } => Some(NoteButton::TryAgain(speaker)),
+            Cause::WayFailed { .. } | Cause::DidntGetReady { .. } => Some(NoteButton::TryAgain(speaker)),
             Cause::GroupedInto { .. } if !self.available_again => None,
             cause if cause.was_unreachable() && !self.available_again => Some(NoteButton::TryAgain(speaker)),
             _ => Some(NoteButton::SwitchTo(speaker)),
@@ -309,6 +312,7 @@ impl Note {
                     | Cause::PlayingElse { .. }
                     | Cause::Disconnected { .. }
                     | Cause::GroupedInto { .. }
+                    | Cause::WayFailed { .. }
                     | Cause::DidntGetReady { .. }
             )
     }
@@ -379,7 +383,10 @@ pub enum PickWhy {
     NotFound,
     /// This PC has no network connection.
     NoNetwork,
-    /// The code or password was refused, or the dialog was closed.
+    /// The speaker asks for its code or password and none was given (its
+    /// dialog was closed, or nobody was there to answer).
+    NeedsSecret(Secret),
+    /// The code or password was refused.
     WrongSecret(Secret),
     /// The app couldn't start the attempt (this PC is short of resources).
     CouldntStart,
@@ -404,6 +411,9 @@ pub struct PickFailed {
 /// state (or in its place).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Standing {
+    /// The app's sound output was chosen in Windows while no speaker was
+    /// chosen: the sound stays on this PC.
+    NoSpeakerChosen,
     /// An app plays on another output of this PC while a speaker is the
     /// place.
     AppElsewhere { app: String, output: PcOutputId },
@@ -452,6 +462,7 @@ pub enum RowState {
 /// A speaker as the list shows it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SpeakerNow {
+    pub can_chime: bool,
     pub id: SpeakerId,
     pub state: RowState,
     /// The way a click on its row uses (its tooltip names it).
@@ -557,8 +568,8 @@ pub struct Popups {
 pub enum FirstRunStep {
     /// Click a speaker to hear a chime on it.
     One,
-    /// Did you hear the chime on `speaker`?
-    Two { speaker: SpeakerId, level: u8, limit: u8 },
+    /// The chime played at `level`. Without a chime the page offers a switch.
+    Two { speaker: SpeakerId, level: Option<u8>, limit: u8 },
     /// `speaker` now plays this PC's sound.
     Three { speaker: SpeakerId },
 }
@@ -601,15 +612,22 @@ pub struct Situation {
 }
 
 impl Situation {
-    /// The speaker of line 1's place, if it is one.
-    /// Which credential this speaker is waiting for after a pick or a move to this PC.
-    pub fn secret_for(&self, id: &SpeakerId) -> Option<Secret> {
-        if let Some(PickFailed { speaker, why: PickWhy::WrongSecret(secret), .. }) = &self.pick_failed {
-            if speaker == id { return Some(*secret); }
+    /// The password or code the speaker asked for after a pick or a move to this PC.
+    pub(crate) fn secret_failure(&self, id: &SpeakerId) -> Option<PickWhy> {
+        if let Some(PickFailed { speaker, why: why @ (PickWhy::WrongSecret(_) | PickWhy::NeedsSecret(_)), .. }) = &self.pick_failed {
+            if speaker == id { return Some(*why); }
         }
         match &self.note.as_ref()?.cause {
-            Cause::NeedsSecret { speaker, secret } | Cause::DidntGetReady { speaker, why: PickWhy::WrongSecret(secret) }
-                if speaker == id => Some(*secret),
+            Cause::NeedsSecret { speaker, secret } if speaker == id => Some(PickWhy::NeedsSecret(*secret)),
+            Cause::DidntGetReady { speaker, why: why @ (PickWhy::WrongSecret(_) | PickWhy::NeedsSecret(_)) }
+                if speaker == id => Some(*why),
+            _ => None,
+        }
+    }
+
+    pub fn secret_for(&self, id: &SpeakerId) -> Option<Secret> {
+        match self.secret_failure(id)? {
+            PickWhy::WrongSecret(secret) | PickWhy::NeedsSecret(secret) => Some(secret),
             _ => None,
         }
     }

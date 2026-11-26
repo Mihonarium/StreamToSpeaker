@@ -592,6 +592,8 @@ fn every_cause_and_form_has_the_rules_button_mark_and_close() {
         PickWhy::NotResponding,
         PickWhy::NotFound,
         PickWhy::NoNetwork,
+        PickWhy::NeedsSecret(Secret::Code),
+        PickWhy::NeedsSecret(Secret::Password),
         PickWhy::WrongSecret(Secret::Code),
         PickWhy::WrongSecret(Secret::Password),
         PickWhy::CouldntStart,
@@ -1339,6 +1341,19 @@ fn outputs_and_volume_belong_to_the_place() {
 }
 
 #[test]
+fn no_speaker_chosen_names_the_list_in_the_panel_and_the_icon_in_the_popup() {
+    let mut scene = named("pc-plain");
+    scene.situation.popups.popup = Some(shown(Popup::NoSpeakerChosen));
+    let popup = by_clock::popup(&scene).unwrap().what;
+    scene.situation.standing.push(Standing::NoSpeakerChosen);
+    let About::Note(note) = view(&scene).about else { panic!("expected the panel note") };
+    assert_eq!(note.title, popup.title);
+    assert_eq!(note.sentence, "The sound is still on this PC. Choose a speaker in the list.");
+    assert_eq!(popup.sentence.as_deref(), Some("The sound is still on this PC. Click the app’s icon by the clock to choose a speaker."));
+    assert_eq!(note.close.unwrap().command, Command::CloseNote);
+}
+
+#[test]
 fn popup_words_and_actions() {
     let mut s = scene();
     assert!(by_clock::popup(&s).is_none());
@@ -1393,6 +1408,7 @@ fn tray_and_window_words() {
             _ => RowState::Plain,
         };
         s.situation.speakers.push(SpeakerNow {
+            can_chime: true,
             id: sp.id.clone(),
             is_place: false,
             way: sp.way,
@@ -1479,6 +1495,7 @@ pub(super) fn check_all_scenes() {
     rows_show_the_state_and_its_actions();
     names_folds_and_search();
     outputs_and_volume_belong_to_the_place();
+    no_speaker_chosen_names_the_list_in_the_panel_and_the_icon_in_the_popup();
     popup_words_and_actions();
     confirmations_share_words_and_answers();
     tray_and_window_words();
@@ -1496,6 +1513,7 @@ fn a_move_names_its_time_only_when_the_core_supplies_one() {
     };
     for (cause, title, body) in [
         (stopped(), "Kitchen stopped responding", "The app moved the sound to this PC at 08:02."),
+        (Cause::WayFailed { speaker: kitchen(), why: PickWhy::Refused }, "Kitchen refused the connection", "The app moved the sound to this PC at 08:02."),
         (vpn(Some("Corp VPN".into())), "Kitchen stopped responding", "The app moved the sound to this PC at 08:02, just after this PC connected to “Corp VPN”."),
         (vpn(None), "Kitchen stopped responding", "The app moved the sound to this PC at 08:02, just after this PC made a new network connection."),
         (Cause::GroupedInto { speaker: kitchen(), with: "Living Room".into() }, "Kitchen was grouped with Living Room", "The app moved the sound to this PC at 08:02. Kitchen can play it again once it leaves that group."),

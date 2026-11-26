@@ -402,6 +402,10 @@ impl App {
     /// single HomePod). Each keeps its own change. A speaker that plays
     /// reconnects to apply it. Returns at once.
     pub fn set_delay_choice(self: &Arc<Self>, id: &str, choice: DelayChoice) -> Result<DelayStatus, Unchangeable> {
+        self.store_delay_choice(id, choice, true)
+    }
+
+    pub(crate) fn store_delay_choice(self: &Arc<Self>, id: &str, choice: DelayChoice, reconnect: bool) -> Result<DelayStatus, Unchangeable> {
         let before = self.delay_status_of(id);
         if before.choice.is_none() {
             return Err(before.applies.err().unwrap_or(Unchangeable::NoSpeaker));
@@ -421,7 +425,7 @@ impl App {
             (super::stored_change(entry, Some(choice)), super::stored_change(entry, Some(other)))
         };
         let bound = self.session.lock().unwrap().as_ref()
-            .filter(|s| s.stable_id() == id)
+            .filter(|s| reconnect && s.stable_id() == id)
             .map(|_| self.session_number());
         let choice_job = bound.and_then(|number| {
             crate::engine::cancel::binding().map(|job| (id.to_string(), number, job))
@@ -742,7 +746,7 @@ fn run_worker(app: Weak<App>, shared: Arc<Shared>, connector: &dyn Connector) {
                 reconnect_for_delay(&app, &shared, connector, &id);
             }
             if crate::engine::cancel::cancelled() {
-                if let Some(t) = app.release_job(job) {
+                if let Some(t) = app.release_job(job).1 {
                     let _ = t.join();
                 }
             }
@@ -830,12 +834,15 @@ fn reconnect_for_delay(app: &Arc<App>, shared: &Shared, connector: &dyn Connecto
     }
     shared.state.lock().unwrap().schedule.began_again(Instant::now());
     let again = connector.connect_again(app, id);
-    shared.state.lock().unwrap().reconnecting = None;
     if let Err(Some(why)) = again {
         let msg = format!("Couldn't connect to {}: {}", bound.name, why);
+        if let Some(job) = crate::engine::cancel::binding() {
+            let _ = job.delay_failure.set(why);
+        }
         app.record_fault(&msg);
         app.record_error(msg);
     }
+    shared.state.lock().unwrap().reconnecting = None;
 }
 
 #[cfg(test)]

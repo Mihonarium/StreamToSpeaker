@@ -58,6 +58,8 @@ pub enum Command {
     PanelShown(bool),
     /// The ordinary window was closed and the app continues in the tray.
     WindowClosed,
+    /// The ordinary window opened.
+    WindowOpened,
     /// Give Windows' output back to this PC and let the speaker go, as
     /// Setup does before it updates the app.
     Release { for_update: bool },
@@ -71,6 +73,8 @@ pub enum Command {
     Switch { place: Place, way: Option<WayChoice> },
     /// The speaker named by `--player` appeared. Give way to any newer pick.
     PlayWhenListed { speaker: SpeakerId, picks_seen: u64 },
+    /// The person finished pairing a speaker whose connection request already ended.
+    PlayAfterPairing { speaker: SpeakerId, picks_seen: u64 },
     /// A switch to This PC on one of its outputs (one of This PC's outputs
     /// under its row).
     SwitchOutput(PcOutputId),

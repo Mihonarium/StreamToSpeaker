@@ -45,6 +45,8 @@ pub struct SpeakerSeen {
     pub way: WayChoice,
     /// Last AirPlay choice when the speaker offers both.
     pub airplay: Option<WayChoice>,
+    /// The identity the speaker uses for its AirPlay password.
+    pub airplay_id: Option<SpeakerId>,
     pub used_here: bool,
     pub last_used: Option<u64>,
     /// Shown only to distinguish two rows with the same name.
@@ -105,7 +107,7 @@ impl SpeakerSeen {
 }
 
 impl RowState {
-    pub(super) fn grey(self) -> bool {
+    pub(crate) fn grey(self) -> bool {
         matches!(self, Self::NotFound | Self::RepairFirst)
     }
 }

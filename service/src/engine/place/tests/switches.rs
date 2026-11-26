@@ -637,7 +637,7 @@ fn first_run_rows_only_play_a_chime() {
             },
             when: |r| r.close_panel(),
             then: |r, _| {
-                assert_eq!(r.sit().first_run, Some(FirstRunStep::Two { speaker: id(K), level: 25, limit: 100 }));
+                assert_eq!(r.sit().first_run, Some(FirstRunStep::Two { speaker: id(K), level: Some(25), limit: 100 }));
                 assert!(!r.core.kept().first_run_done);
             },
         },
@@ -698,12 +698,12 @@ fn welcome_checks_only_the_chime_then_switches_or_closes() {
         chime(&mut r);
         r.cmd(Command::FirstRunAction(A::ChimeVolume(41))).unwrap();
         r.cmd(Command::FirstRunAction(A::ChimeAgain)).unwrap();
-        assert_eq!(r.job(Purpose::Chime).chime_level, Some(41));
+        assert_eq!(r.job(Purpose::Chime).welcome_level, Some(41));
         r.end(Purpose::Chime, Ended::Ready);
         r.cmd(Command::FirstRunAction(A::DidntHear)).unwrap();
         r.open_panel();
         r.close_panel();
-        assert_eq!(r.sit().first_run, Some(FirstRunStep::Two { speaker: id(K), level: 41, limit: 100 }));
+        assert_eq!(r.sit().first_run, Some(FirstRunStep::Two { speaker: id(K), level: Some(41), limit: 100 }));
         assert!(r.sit().place_speaker().is_none());
         assert_eq!(r.restart(world(), StartKind::Normal).sit().first_run, Some(FirstRunStep::One));
         r.cmd(Command::FirstRunAction(A::ChooseAnother)).unwrap();
@@ -712,8 +712,9 @@ fn welcome_checks_only_the_chime_then_switches_or_closes() {
         r.cmd(Command::FirstRunAction(A::ChimeVolume(37))).unwrap();
         r.cmd(Command::FirstRunAction(finish)).unwrap();
         // The level set for the chime is Kitchen's level from this PC.
-        assert_eq!(r.core.kept().levels.get(&id(K)).map(|l| l.level), Some(37));
+        assert_eq!(r.job(Purpose::Switch).welcome_level, Some(37));
         r.end(Purpose::Switch, Ended::Ready);
+        assert_eq!(r.core.kept().levels.get(&id(K)).map(|l| l.level), Some(37));
         assert_eq!(r.sit().place_speaker(), Some(&id(K)));
         assert_eq!(r.sit().first_run, Some(FirstRunStep::Three { speaker: id(K) }));
         assert_eq!(r.restart(world(), StartKind::Normal).sit().first_run, None);
@@ -747,5 +748,158 @@ fn welcome_chime_errors_and_busy_answers_belong_to_the_row() {
         assert_eq!(row(&r, K), state);
         assert_eq!(r.sit().first_run, Some(FirstRunStep::One));
         assert!(r.sit().place_speaker().is_none());
+    }
+}
+
+#[test]
+fn the_welcome_switch_sets_the_slider_level_even_on_the_current_speaker() {
+    use FirstRunAction as A;
+    for current in [false, true] {
+        for finish in [Command::FirstRunAction(A::Heard), Command::FirstRunAction(A::UseWithoutChecking),
+            Command::Switch { place: Place::Speaker(id(K)), way: None }] {
+            let mut r = Rig::with(Kept::default(), world());
+            if current { r.switch_to(K); }
+            r.w.speakers[0].level = Some(64);
+            r.cmd(Command::FirstRunAction(A::Chime(id(K)))).unwrap();
+            r.end(Purpose::Chime, Ended::Ready);
+            r.cmd(Command::FirstRunAction(A::ChimeVolume(42))).unwrap();
+            r.w.speakers[0].max_level = Some(39);
+            r.take();
+            r.cmd(finish).unwrap();
+            if !current { r.end(Purpose::Switch, Ended::Ready); }
+            assert_eq!(r.sit().first_run, Some(FirstRunStep::Three { speaker: id(K) }));
+            assert_eq!(r.core.kept().levels[&id(K)].level, 39);
+            assert!(r.take().contains(&Do::SetLevel { speaker: id(K), level: 39 }));
+        }
+    }
+}
+
+#[test]
+fn a_speaker_without_a_chime_can_be_chosen_in_first_run() {
+    use FirstRunAction as A;
+    let mut r = Rig::with(Kept::default(), world());
+    r.w.speakers[0].can_chime = false;
+    r.cmd(Command::FirstRunAction(A::Chime(id(B)))).unwrap();
+    let old = r.job(Purpose::Chime);
+    r.cmd(Command::FirstRunAction(A::Chime(id(K)))).unwrap();
+    r.event(Event::Connected { gen: old.gen, ended: Ended::Ready });
+    assert_eq!(r.sit().first_run, Some(FirstRunStep::Two { speaker: id(K), level: None, limit: 100 }));
+    r.cmd(Command::FirstRunAction(A::ChimeAgain)).unwrap();
+    assert!(!r.has_job(Purpose::Chime));
+    r.cmd(Command::FirstRunAction(A::ChooseAnother)).unwrap();
+    assert_eq!(r.sit().first_run, Some(FirstRunStep::One));
+    r.cmd(Command::FirstRunAction(A::Chime(id(K)))).unwrap();
+    // The page has no slider without a chime: a level sent anyway isn't used.
+    r.cmd(Command::FirstRunAction(A::ChimeVolume(31))).unwrap();
+    r.cmd(Command::FirstRunAction(A::UseWithoutChecking)).unwrap();
+    assert_eq!(r.job(Purpose::Switch).welcome_level, None);
+    r.end(Purpose::Switch, Ended::Ready);
+    assert!(!r.take().contains(&Do::SetLevel { speaker: id(K), level: 31 }));
+    assert_eq!(r.sit().first_run, Some(FirstRunStep::Three { speaker: id(K) }));
+}
+
+#[test]
+fn an_ordinary_chime_failure_belongs_to_its_surface() {
+    let mut r = Rig::with(Kept::default(), world());
+    r.cmd_from(Surface::Settings, Command::PlayTestSound(id(K))).unwrap();
+    r.end(Purpose::Chime, Ended::Refused);
+    let failure = r.sit().pick_failed.unwrap();
+    assert_eq!((failure.by, failure.from), (SwitchBy::Switch, SwitchFrom::Window));
+    assert!(!r.core.first_run_failure(&failure));
+}
+
+#[test]
+fn first_run_keeps_the_chime_failure_until_another_choice_or_close() {
+    use FirstRunAction as A;
+    for (end, why) in [
+        (Ended::NoNetwork, PickWhy::NoNetwork), (Ended::Refused, PickWhy::Refused),
+        (Ended::CouldntStart, PickWhy::CouldntStart), (Ended::WrongSecret(Secret::Code), PickWhy::WrongSecret(Secret::Code)),
+        (Ended::NeedsSecret(Secret::Code), PickWhy::NeedsSecret(Secret::Code)),
+    ] {
+        let mut r = Rig::with(Kept::default(), world());
+        r.cmd(Command::FirstRunAction(A::Chime(id(K)))).unwrap();
+        r.end(Purpose::Chime, end.clone());
+        assert_eq!(r.sit().first_run, Some(FirstRunStep::One));
+        assert_eq!(r.sit().pick_failed.map(|p| (p.speaker, p.why)), Some((id(K), why)));
+        assert_eq!(r.core.recs[&id(K)].last_try, Some(why));
+        r.cmd(Command::FirstRunAction(A::Chime(id(B)))).unwrap();
+        assert!(r.sit().pick_failed.is_none());
+        r.end(Purpose::Chime, end);
+        r.cmd(Command::FirstRunAction(A::Close)).unwrap();
+        r.cmd(Command::FirstRunAction(A::ShowAgain)).unwrap();
+        assert!(r.sit().pick_failed.is_none());
+    }
+}
+
+#[test]
+fn the_welcome_switch_takes_the_level_when_confirmation_is_answered() {
+    use FirstRunAction as A;
+    let mut r = Rig::with(Kept::default(), world());
+    r.w.screen_reader = true;
+    r.cmd(Command::FirstRunAction(A::Chime(id(K)))).unwrap();
+    r.end(Purpose::Chime, Ended::Ready);
+    r.cmd(Command::FirstRunAction(A::ChimeVolume(40))).unwrap();
+    r.cmd(Command::FirstRunAction(A::Heard)).unwrap();
+    assert!(matches!(r.sit().confirm_in_panel, Some(Confirm::ScreenReader { .. })));
+    r.cmd(Command::FirstRunAction(A::ChimeVolume(10))).unwrap();
+    r.cmd(Command::Confirm { yes: true }).unwrap();
+    assert_eq!(r.job(Purpose::Switch).welcome_level, Some(10));
+    assert!(!r.core.kept().levels.contains_key(&id(K)));
+    r.cmd(Command::FirstRunAction(A::ChimeVolume(30))).unwrap();
+    r.end(Purpose::Switch, Ended::Ready);
+    assert_eq!(r.core.kept().levels[&id(K)].level, 10);
+    assert!(r.take().contains(&Do::SetLevel { speaker: id(K), level: 10 }));
+}
+
+#[test]
+fn another_switch_to_the_welcome_speaker_finishes_step_two() {
+    use FirstRunAction as A;
+    let mut r = Rig::with(Kept::default(), world());
+    r.w.speakers[0].can_chime = false;
+    r.cmd(Command::FirstRunAction(A::Chime(id(K)))).unwrap();
+    r.cmd(Command::FirstRunAction(A::UseWithoutChecking)).unwrap();
+    r.end(Purpose::Switch, Ended::NeedsSecret(Secret::Code));
+    r.open_panel();
+    r.close_panel();
+    assert_eq!(r.sit().pick_failed.unwrap().why, PickWhy::NeedsSecret(Secret::Code));
+    r.cmd_from(Surface::Tray, Command::Switch { place: Place::Speaker(id(K)), way: None }).unwrap();
+    r.end(Purpose::Switch, Ended::Refused);
+    r.open_panel();
+    r.close_panel();
+    assert_eq!(r.sit().pick_failed.unwrap().why, PickWhy::Refused);
+    r.switch_to(B);
+    assert!(matches!(r.sit().first_run, Some(FirstRunStep::Two { .. })));
+    r.switch_to(K);
+    assert_eq!(r.sit().first_run, Some(FirstRunStep::Three { speaker: id(K) }));
+    assert!(r.core.kept().first_run_done);
+
+    r.cmd(Command::FirstRunAction(A::ShowAgain)).unwrap();
+    r.cmd(Command::FirstRunAction(A::Chime(id(K)))).unwrap();
+    r.take();
+    r.cmd(Command::Switch { place: Place::Speaker(id(K)), way: None }).unwrap();
+    assert_eq!(r.sit().first_run, Some(FirstRunStep::Three { speaker: id(K) }));
+    assert!(!r.take().iter().any(|action| matches!(action, Do::SetLevel { .. } | Do::Connect(_))));
+}
+
+#[test]
+fn the_tray_switch_carries_the_welcome_level_and_heard_can_update_it() {
+    use FirstRunAction as A;
+    for heard in [false, true] {
+        let mut r = Rig::with(Kept::default(), world());
+        r.cmd(Command::FirstRunAction(A::Chime(id(K)))).unwrap();
+        r.end(Purpose::Chime, Ended::Ready);
+        r.cmd(Command::FirstRunAction(A::ChimeVolume(10))).unwrap();
+        r.cmd_from(Surface::Tray, Command::Switch { place: Place::Speaker(id(K)), way: None }).unwrap();
+        let job = r.job(Purpose::Switch);
+        assert_eq!(job.welcome_level, Some(10));
+        let expected = if heard {
+            r.cmd(Command::FirstRunAction(A::ChimeVolume(14))).unwrap();
+            r.cmd(Command::FirstRunAction(A::Heard)).unwrap();
+            assert_eq!(r.job(Purpose::Switch).gen, job.gen);
+            14
+        } else { 10 };
+        r.event(Event::Connected { gen: job.gen, ended: Ended::Ready });
+        assert!(r.take().contains(&Do::SetLevel { speaker: id(K), level: expected }));
+        assert_eq!(r.sit().first_run, Some(FirstRunStep::Three { speaker: id(K) }));
     }
 }
