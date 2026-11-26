@@ -837,6 +837,8 @@ fn cancelling_the_second_way_after_it_binds_restores_the_place() {
     r.send(Command::CancelSwitch);
     r.driver.input(steady);
     r.settle();
+    // The music still plays: a fresh look sees it, however long the reconnect took.
+    r.driver.look();
     let s = r.driver.situation();
     assert_eq!((s.spot, s.doing, s.note), (Spot::Speaker(id()), Doing::Playing, None));
     assert_eq!(r.driver.bound().unwrap().0, DEN);
