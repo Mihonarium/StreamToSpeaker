@@ -56,6 +56,7 @@ struct Harness {
     scale: f32,
     pass: usize,
     texts: Vec<Text>,
+    clipboard: String,
 }
 
 impl Harness {
@@ -65,7 +66,7 @@ impl Harness {
     }
 
     fn with(dialog: Dialog, port: ScriptedSettings, size: Vec2, scale: f32) -> Self {
-        let mut h = Harness { ctx: preview::context(fonts(), Mode::Light), port: Arc::new(port), dialog: Some(dialog), size, scale, pass: 0, texts: Vec::new() };
+        let mut h = Harness { ctx: preview::context(fonts(), Mode::Light), port: Arc::new(port), dialog: Some(dialog), size, scale, pass: 0, texts: Vec::new(), clipboard: String::new() };
         h.settle();
         h
     }
@@ -87,6 +88,9 @@ impl Harness {
             });
         });
         self.texts.clear();
+        if !out.platform_output.copied_text.is_empty() {
+            self.clipboard = out.platform_output.copied_text;
+        }
         for cs in &out.shapes {
             collect(&cs.shape, cs.clip_rect, &mut self.texts);
         }
@@ -231,12 +235,17 @@ fn a_sendspin_code_or_its_token() {
 #[test]
 fn the_report_previews_exactly_what_is_copied() {
     let mut h = Harness::dialog(Dialog::Report(ReportDialog::default()), ScriptedSettings::new());
-    let preview = |h: &Harness| h.texts.iter().any(|t| t.text.contains("Last message: Kitchen"));
-    assert!(preview(&h));
+    let preview = |h: &Harness| h.texts.iter().find(|t| t.text.contains("Speakers: Kitchen")).unwrap().text.clone();
+    let with_diagnostics = preview(&h);
+    assert!(with_diagnostics.contains("Last message: Kitchen"));
+    h.click("Copy report");
+    assert_eq!(h.clipboard, with_diagnostics);
     h.click("Playback diagnostics");
-    assert!(!preview(&h), "unticked, it leaves the preview");
+    let without_diagnostics = preview(&h);
+    assert!(!without_diagnostics.contains("Last message: Kitchen"));
     h.click("Open a GitHub issue");
-    assert!(matches!(h.acts().as_slice(), [Act::OpenIssue(t)] if !t.contains("Last message: Kitchen")));
+    assert_eq!(h.clipboard, without_diagnostics);
+    assert_eq!(h.acts(), vec![Act::OpenIssue(without_diagnostics)]);
 }
 
 // -------------------------------------------------------------------------

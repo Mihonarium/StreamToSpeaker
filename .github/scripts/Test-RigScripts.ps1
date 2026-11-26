@@ -10,9 +10,10 @@
     workflow runs (Test-PanelClick.ps1 and this one) and the inline script of
     every step of panel-click.yml that runs in PowerShell (pwsh or
     powershell). Errors give the file, line, column and parser message and go to
-    the step summary. For inline scripts the step is named, and the position
-    comes from the trimmed script with folded lines joined, offset to its
-    start in the workflow. It can differ from the position in the YAML.
+    the step summary. For inline scripts the error also gives the line where
+    the step starts. The error position comes from the trimmed script with
+    folded lines joined, offset to its start in the workflow. It can differ
+    from the position in the YAML.
 
     With -CompileRig (on Windows), PanelRig.cs is compiled the way
     Test-PanelClick.ps1 compiles it, with Add-Type in Windows PowerShell,

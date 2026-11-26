@@ -626,7 +626,9 @@ function Invoke-WithTray($app, $rec) {
     Say "The icon is $(if ($place.Where -eq 'taskbar') { 'on the taskbar' } else { 'among the hidden icons' }) (wanted: $Icon)"
     if ($Icon -eq "hidden" -and $place.Where -eq "taskbar") {
         $rec.Problem("The icon was on the taskbar. This case requires a click among the hidden icons.")
-    } elseif ($place.Where -ne $Icon) { Warn "the icon is $(if ($place.Where -eq 'taskbar') { 'on the taskbar' } else { 'among the hidden icons' }), not where this case wanted it; clicked where it is" }
+    } elseif ($Icon -eq "taskbar" -and $place.Where -eq "hidden") {
+        $rec.Problem("The icon was among the hidden icons. This case requires a click on the taskbar.")
+    }
     $rec.Shot("before-the-click")
 
     # The click.
@@ -730,7 +732,7 @@ function Open-HiddenIcons($rec) {
         if ($icon) { return $icon }
     }
     $rec.Shot("hidden-icons-without-the-app")
-    throw "the hidden icons opened without the app's icon among them ('$TrayTip...')"
+    throw "clicked the hidden icons button and did not find the app's icon ('$TrayTip...') among the hidden icons within 5 seconds"
 }
 
 # ---------------------------------------------------------------------------

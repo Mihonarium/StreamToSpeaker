@@ -273,7 +273,7 @@ fn levels_set_outside_the_panel_settle_and_song_titles_follow_other_sound() {
 }
 
 #[test]
-fn window_commands_open_the_requested_page() {
+fn window_commands_send_the_requested_page_to_the_opener() {
     let mut r = Rig::on(App::for_tests());
     let (opened, pages) = unbounded();
     *r.driver.opener.lock().unwrap() = Some(Box::new(move |_, page| opened.send(page).unwrap()));

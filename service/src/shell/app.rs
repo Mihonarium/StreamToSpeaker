@@ -15,6 +15,7 @@ use windows_sys::Win32::Foundation::HWND;
 use super::content::WantedGate;
 use super::panel_window::{FrameOutput, PanelWindow, Step, Toggle, TrayClick};
 use super::passes::{dialog_pass, Passes};
+use super::scroll::ScrollState;
 use super::popup::{popup_builder, popup_pass, popup_rect, PopupKind, Slots};
 use super::main_window::{MainWindow, Windows, OpenView};
 use super::views::ViewMemory;
@@ -190,6 +191,9 @@ pub fn run(opts: ShellOptions, wiring: Wiring) -> anyhow::Result<()> {
                 looked_at: f64::NEG_INFINITY,
                 monitors: Vec::new(),
                 windows: Windows::default(),
+                panel_scroll: ScrollState::default(),
+                window_scroll: ScrollState::default(),
+                dialog_scroll: ScrollState::default(),
                 panel_reported: false,
                 window_height,
                 save_height,
@@ -239,6 +243,9 @@ struct Shell {
     looked_at: f64,
     monitors: Vec<super::placement::Monitor>,
     windows: Windows,
+    panel_scroll: ScrollState,
+    window_scroll: ScrollState,
+    dialog_scroll: ScrollState,
     panel_reported: bool,
     window_height: Option<f32>,
     save_height: Box<dyn Fn(f32)>,
@@ -363,6 +370,7 @@ impl Shell {
                     None => log::info!("panel: opening ({why}; no tray icon)"),
                 }
                 self.windows.flyout = Some(PanelWindow::open(icon));
+                self.panel_scroll = ScrollState::default();
                 // Opened with the mouse: the focus ring waits for a key.
                 crate::ui::look::set_focus_visible(ctx, false);
             }
@@ -372,6 +380,7 @@ impl Shell {
     fn open_window(&mut self, ctx: &egui::Context, home: bool) {
         let already_open = self.windows.main.is_some();
         if !already_open {
+            self.window_scroll = ScrollState::default();
             self.port.send(Surface::Panel, Command::WindowOpened);
             crate::ui::look::set_focus_visible(ctx, false);
             self.monitors = self.desktop.monitors();
@@ -521,6 +530,7 @@ impl Shell {
         let builder = panel.builder(mode);
         let mut frame = FrameOutput::default();
         ctx.show_viewport_immediate(panel_id(), builder, |ctx, _class| {
+            self.panel_scroll.apply(ctx);
             let t = theme::Theme::of(ctx);
             panel.pass(ctx, &mut frame, mode, desktop, |ctx, panel| {
                 egui::CentralPanel::default().frame(Frame::none().fill(t.c.surface).stroke(t.card_stroke()))
@@ -564,6 +574,7 @@ impl Shell {
             }
         }
         ctx.show_viewport_immediate(main_id(), window.geometry.builder(), |ctx, _| {
+            self.window_scroll.apply(ctx);
             passes.notice_close(ctx);
             let t = theme::Theme::of(ctx);
             let (inner, outer, minimized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().outer_rect, i.viewport().minimized));
@@ -643,7 +654,10 @@ impl Shell {
         let Some(mut content) = self.dialog.take() else { return Vec::new() };
         let builder = self.dialog_builder(content.as_ref(), snap);
         let mut passes = Passes::default();
-        ctx.show_viewport_immediate(dialog_id(), builder, |ctx, _class| dialog_pass(ctx, &mut passes, content.as_mut(), snap));
+        ctx.show_viewport_immediate(dialog_id(), builder, |ctx, _class| {
+            self.dialog_scroll.apply(ctx);
+            dialog_pass(ctx, &mut passes, content.as_mut(), snap);
+        });
         if passes.asked_to_close {
             // Its ×: undo what the dialog started.
             content.closed();
@@ -653,6 +667,7 @@ impl Shell {
         } else {
             let still = self.contents.wanted().map(|(k, _)| k);
             self.wanted.closed(still.as_deref());
+            self.dialog_scroll = ScrollState::default();
             self.dialog = self.waiting.pop_front();
         }
         passes.asks

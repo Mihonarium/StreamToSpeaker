@@ -21,6 +21,8 @@ pub mod passes;
 pub mod placement;
 pub mod popup;
 pub mod scenes;
+#[cfg(any(windows, test))]
+mod scroll;
 pub mod views;
 #[cfg(windows)]
 mod app;
