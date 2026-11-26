@@ -47,17 +47,20 @@ if (-not $devices.Count) { Write-Step 'There is none.' }
 $removedNow = 0
 $staying = 0
 foreach ($d in $devices) {
-    $code = if ([IO.File]::Exists($StsDevcon)) {
+    $withDevcon = [IO.File]::Exists($StsDevcon)
+    $code = if ($withDevcon) {
         Remove-Device $d.InstanceId
     } else {
         # devcon ships with the app; without it, pnputil can remove devices
         # on Windows 10 version 2004 and later.
         Invoke-Tool -FilePath $StsPnputil -Arguments @('/remove-device', $d.InstanceId)
     }
-    # 0: the device is removed. 1 (devcon) and 3010 (pnputil): Windows
-    # removes it when it restarts. Anything else: it could not be removed.
+    # 0: the device is removed. Windows removes it when it restarts: 1 from
+    # devcon, 3010 from pnputil. Anything else: it could not be removed.
+    $atRestartCode = if ($withDevcon) { 1 } else { 3010 }
     if ($code -eq 0) { $removedNow++ } else { $staying++ }
-    if ($code -ne 0 -and $code -ne 1 -and $code -ne 3010) { $problems += "the device $($d.InstanceId) is still there" }
+    $why = if ($withDevcon -or [IO.File]::Exists($StsPnputil)) { "exit code $code" } else { 'pnputil.exe is missing' }
+    if ($code -ne 0 -and $code -ne $atRestartCode) { $problems += "the device $($d.InstanceId) could not be removed ($why)" }
 }
 
 Write-Host '2/3  Deleting the driver from the driver store...' -ForegroundColor Cyan
@@ -65,7 +68,8 @@ $packages = @(Get-OurDriverPackageNames)
 if (-not $packages.Count) { Write-Step 'There is none.' }
 foreach ($p in $packages) {
     $code = Invoke-Tool -FilePath $StsPnputil -Arguments @('/delete-driver', $p, '/uninstall', '/force')
-    if ($code -ne 0 -and $code -ne 3010) { $problems += "the driver package $p is still there" }
+    $why = if ([IO.File]::Exists($StsPnputil)) { "exit code $code" } else { 'pnputil.exe is missing' }
+    if ($code -ne 0 -and $code -ne 3010) { $problems += "the driver package $p could not be deleted ($why)" }
 }
 
 Write-Host "3/3  Clearing Windows' cached entries for the sound output..." -ForegroundColor Cyan

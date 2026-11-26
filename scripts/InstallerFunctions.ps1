@@ -1607,18 +1607,23 @@ function Invoke-DriverRemoval([hashtable]$Tools = (New-DriverTools)) {
     # The output of a device that just went can take a moment to show as
     # gone: a run that removed every device it found waits for that. While a
     # device stays (until the restart, or because it could not be removed),
-    # so does its output, and there is nothing to wait for.
+    # the wait is skipped, since an output still listed then may be that
+    # device's and not go. The output of a device that went in the same run
+    # may then still be listed; its entry is left for a later run, which
+    # tries to delete it once Windows shows that output as not present.
     $entries = @(& $Tools.GetEndpoints)
     for ($i = 0; $i -lt 5 -and $removedNow -and -not $atRestart.Count -and -not $stillThere.Count -and @(Select-PresentEndpoints $entries).Count; $i++) {
         $null = & $Tools.Pause
         $entries = @(& $Tools.GetEndpoints)
     }
     $present = @(Select-PresentEndpoints $entries).Count
-    # An output that is listed although this run left no device behind
-    # belongs to a device an earlier run handed to the restart (the
-    # uninstaller runs the removal twice).
+    # An output can still be listed when Windows lists no device of the app:
+    # an earlier run handed its device to the restart (the uninstaller runs
+    # the removal twice, and the second run no longer finds that device), or
+    # its device went, in this run or an earlier one, and Windows hasn't
+    # caught up yet. The log says what was seen.
     if ($present -and -not $atRestart.Count -and -not $stillThere.Count) {
-        Write-Step "Windows still lists the app's sound output. It goes when Windows restarts."
+        Write-Step "Windows still lists a sound output matching $StsProductName, but the scan found no $StsProductName device."
     }
     $gone = @(Select-OrphanedEndpoints $entries)
     if ($gone.Count) { $null = & $Tools.RemoveEndpoints $gone }

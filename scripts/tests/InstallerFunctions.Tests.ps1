@@ -601,24 +601,48 @@ Test 'a run that removed a device waits for its output to go, and a run that rem
     Assert-Equal '' (@(Invoke-DriverRemoval -Tools $settling) -join ',') 'nothing left'
     Assert-Equal 1 (Called 'Pause') 'one wait'
     Assert-Equal 1 (Called 'RemoveEndpoints:1') 'the entry is deleted once its output is gone'
-    # A second run finds no device: waiting would change nothing.
+    # A second run finds no device, and doesn't wait.
     New-World -Endpoints @(Fake-Endpoint)
     Assert-Equal '' (@(Invoke-DriverRemoval -Tools $settling) -join ',') 'nothing to say'
     Assert-Equal 0 (Called 'Pause') 'no wait'
     Assert-Equal 0 (Called 'RemoveEndpoints') 'the entry of an output that is still there is left alone'
 }
 
-Test 'a device that could not be removed is named, and its output is not waited for' {
+Test 'an output still listed after its device went is logged with what is known' {
     New-World -Devices @(Fake-Device) -Packages @('oem5.inf') -Endpoints @(Fake-Endpoint)
-    $failing = $FakeTools.Clone()
-    # As DevCon answers when it could not remove the device: exit code 2,
-    # and Windows still lists it.
-    $failing.RemoveDevice = { param($Id) Note "RemoveDevice:$Id"; 2 }
-    $failing.Pause = { Note 'Pause' }
-    $lines = @(Invoke-DriverRemoval -Tools $failing)
-    Assert-Equal 'left: the Stream To Speaker device ROOT\MEDIA\0000' $lines 'lines'
+    $slow = $FakeTools.Clone()
+    # The device goes at once; Windows still lists its output after the wait.
+    $slow.Pause = { Note 'Pause' }
+    $steps = New-Object System.Collections.ArrayList
+    function Write-Step([string]$Message) { [void]$steps.Add($Message) }
+    Assert-Equal '' (@(Invoke-DriverRemoval -Tools $slow) -join ',') 'nothing left'
+    Assert-Equal 5 (Called 'Pause') 'five waits'
+    $said = 'Windows still lists a sound output matching Stream To Speaker, but the scan found no Stream To Speaker device.'
+    Assert-Equal 1 (@($steps | Where-Object { $_ -ceq $said }).Count) 'what was seen, said once'
+    Assert-Equal 0 (Called 'RemoveEndpoints') 'the entry of a listed output is left alone'
+}
+
+Test 'a device that could not be removed is named; beside it nothing waits or speaks of the restart' {
+    $second = '{22222222-2222-2222-2222-222222222222}'
+    New-World -Devices @((Fake-Device), (Fake-Device -Id 'ROOT\MEDIA\0001')) -Packages @('oem5.inf') `
+        -Endpoints @((Fake-Endpoint), (Fake-Endpoint -Guid $second -Device 'ROOT\MEDIA\0001'))
+    $mixed = $FakeTools.Clone()
+    # The first device goes. DevCon can't remove the second (exit code 2),
+    # and Windows still lists it. Both outputs stay listed.
+    $mixed.RemoveDevice = { param($Id) Note "RemoveDevice:$Id"
+        if ($Id -ne 'ROOT\MEDIA\0000') { return 2 }
+        $script:W.Devices = @($script:W.Devices | Where-Object { $_.InstanceId -ne $Id })
+        0 }
+    $mixed.Pause = { Note 'Pause' }
+    # What the removal logs.
+    $steps = New-Object System.Collections.ArrayList
+    function Write-Step([string]$Message) { [void]$steps.Add($Message) }
+    $lines = @(Invoke-DriverRemoval -Tools $mixed)
+    Assert-Equal 'left: the Stream To Speaker device ROOT\MEDIA\0001' $lines 'lines'
     Assert-Equal 0 (Called 'Pause') 'no wait'
-    Assert-Equal 0 (Called 'RemoveEndpoints') 'the entry of its output is left alone'
+    Assert-Equal 0 (@($steps | Where-Object { $_ -like '*restart*' }).Count) 'nothing said about a restart'
+    Assert-Equal 1 (@($steps | Where-Object { $_ -like 'Removing the device ROOT\MEDIA\0001*' }).Count) 'the log is the removal''s own'
+    Assert-Equal 0 (Called 'RemoveEndpoints') 'the entries of listed outputs are left alone'
 }
 
 Test 'the log names the app''s outputs, and no name a person chose' {
