@@ -655,10 +655,14 @@ function Invoke-WithTray($app, $rec) {
 }
 
 # Compare window-button names even when the ordinary window is also on
-# the taskbar. Explorer may append a running-window count to the name.
+# the taskbar. Explorer may append a running-window count to the name, and
+# it can name the button of a program started from a shortcut after the
+# shortcut.
 function Test-TaskbarButtons($rec, [string]$when, [switch]$ExpectMain) {
     $bar = Get-UiaTopLevel "Shell_TrayWnd"
-    $prefix = '^' + [regex]::Escape($MainTitle)
+    $names = @($MainTitle)
+    if ($Start -eq "menu") { $names += $ShortcutName }
+    $prefix = '^(' + ((@($names | ForEach-Object { [regex]::Escape($_) })) -join '|') + ')'
     $mainButton = $null
     $allowed = $rec.TaskbarWindowShown()
     $forbidden = @([PanelRig.Recorder]::RootTitle, [PanelRig.Recorder]::NotificationTitle, [PanelRig.Recorder]::ConfirmationTitle)
@@ -677,9 +681,13 @@ function Test-TaskbarButtons($rec, [string]$when, [switch]$ExpectMain) {
         }
     }
     if ($ExpectMain) {
-        $met = $mainButton -and ($rec.ShownHandle([PanelRig.Role]::Main) -ne [IntPtr]::Zero)
+        $shown = $rec.ShownHandle([PanelRig.Role]::Main) -ne [IntPtr]::Zero
+        $met = $mainButton -and $shown
+        $buttons = @(Find-UiaNamed $bar '.' | Where-Object {
+                $_.Type -in @("ControlType.Button", "ControlType.ListItem") -and $_.Name -notmatch $TrayPattern
+            } | ForEach-Object { "'$($_.Name)'" }) -join ', '
         $rec.Expect([PanelRig.Judge]::Fact("The ordinary window has its own taskbar button $when", $met,
-            "the rig did not find both the framed ordinary window and its taskbar button"))
+            "the ordinary window is $(if ($shown) { 'shown' } else { 'not shown' }); the taskbar's buttons: $buttons"))
         if ($mainButton) { Say "Ordinary window's taskbar button: $($mainButton.What)" }
     }
 }
