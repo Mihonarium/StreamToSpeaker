@@ -9,7 +9,7 @@ use crate::model::facts::{
 pub(super) const CANT_FIND_AFTER_MS: u64 = 10_000;
 use crate::model::scene::{RepairNow, Scene, SpeakerSeen, WaySeen};
 use crate::model::situation::{ConnKind, SpeakerNow};
-use crate::model::text::{t, Lang};
+use crate::model::text::t;
 use world::{Ids, Observation};
 
 impl PlaceDriver {
@@ -93,7 +93,7 @@ impl PlaceDriver {
             .filter(|k| *k != ConnKind::Other);
         let network = kinds.next().filter(|_| kinds.next().is_none());
         let scene = Scene {
-            lang: Lang::English,
+            lang: self.lang,
             start_at_sign_in: matches!(situation.first_run, Some(crate::model::situation::FirstRunStep::Three { .. })) && crate::autostart::is_enabled(),
             situation,
             speakers,
@@ -121,7 +121,7 @@ impl PlaceDriver {
         obs: &Observation,
     ) -> Option<SpeakerSeen> {
         let id = &row.id;
-        let lang = Lang::English;
+        let lang = self.lang;
         let (name, kind, used_here, last_used, address) =
             if let Some(s) = self.list.iter().find(|s| s.id == *id) {
                 if s.hidden && !keep {

@@ -145,6 +145,12 @@ macro_rules! looks {
 /// One picture per sample and per forced control look.
 pub fn scenes() -> Vec<Scene> {
     let mut all = samples::with_sample_names!(pictures);
+    macro_rules! apps {
+        ($($name:literal),*) => { [$(Scene {
+            name: $name, size: SIZE, draw: |ui, stage| draw(ui, stage, $name, None),
+        }),*] };
+    }
+    all.extend(samples::with_sample_names!(apps_panel, apps));
     all.extend(looks! {
         "row-pointed"=>(Office,Hover),
         "row-pressed"=>(Office,Press),

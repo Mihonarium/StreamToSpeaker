@@ -116,7 +116,11 @@ impl ViewContent for FirstRunPage {
 
     fn bar(&self, snap: &Snapshot) -> ViewBar {
         let title = match &self.step {
+            FirstRunStep::One if snap.scene.situation.only_some_apps => t!(snap.lang, FirstPickAppsTitle),
             FirstRunStep::One => t!(snap.lang, FirstPickTitle),
+            FirstRunStep::Two { speaker, level: None, .. } if snap.scene.situation.only_some_apps => t!(
+                snap.lang, FirstSwitchAppsTitle, speaker = &snap.scene.speaker_name(speaker)
+            ),
             FirstRunStep::Two { speaker, level: None, .. } => t!(
                 snap.lang, FirstSwitchTitle, speaker = &snap.scene.speaker_name(speaker)
             ),
@@ -127,6 +131,9 @@ impl ViewContent for FirstRunPage {
             ),
             FirstRunStep::Three { speaker } if snap.scene.situation.place_speaker() != Some(speaker)
                 || matches!(snap.panel.about, About::Note(_)) => snap.panel.place.name.clone(),
+            FirstRunStep::Three { speaker } if snap.scene.situation.only_some_apps => t!(
+                snap.lang, FirstAppsTitle, speaker = &snap.scene.speaker_name(speaker)
+            ),
             FirstRunStep::Three { speaker } => t!(
                 snap.lang,
                 FirstPlayingTitle,
@@ -147,7 +154,7 @@ impl ViewContent for FirstRunPage {
                 let can_chime = snap.scene.speakers.iter().any(|s| snap.scene.situation.speaker(&s.id)
                     .is_some_and(|r| r.can_chime && !r.state.grey()));
                 if !snap.scene.speakers.is_empty() {
-                    plain(ui, &if can_chime { t!(lang, FirstPickChime) } else { t!(lang, ClickSpeaker) });
+                    plain(ui, &if can_chime { t!(lang, FirstPickChime) } else if snap.scene.situation.only_some_apps { t!(lang, ClickSpeakerApps) } else { t!(lang, ClickSpeaker) });
                 }
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
@@ -169,7 +176,8 @@ impl ViewContent for FirstRunPage {
             // starts at its own level.
             FirstRunStep::Two { speaker, level: None, .. } => {
                 let name = snap.scene.speaker_name(speaker);
-                plain(ui, &t!(lang, FirstNoChime, speaker = &name));
+                plain(ui, &if snap.scene.situation.only_some_apps { t!(lang, FirstNoChimeApps, speaker = &name) }
+                    else { t!(lang, FirstNoChime, speaker = &name) });
                 if Button::primary(&t!(lang, SwitchToSpeaker, speaker = &name)).text_size(size::BODY).show(ui).clicked() {
                     action(ask, FirstRunAction::UseWithoutChecking);
                 }
@@ -181,7 +189,8 @@ impl ViewContent for FirstRunPage {
                 limit,
             } => {
                 let name = snap.scene.speaker_name(speaker);
-                plain(ui, &t!(lang, FirstHearLine, speaker = &name));
+                plain(ui, &if snap.scene.situation.only_some_apps { t!(lang, FirstHearApps, speaker = &name) }
+                    else { t!(lang, FirstHearLine, speaker = &name) });
                 ui.horizontal(|ui| {
                     if Button::primary(&t!(lang, HeardIt))
                         .text_size(size::BODY)
@@ -213,7 +222,12 @@ impl ViewContent for FirstRunPage {
             }
             FirstRunStep::Three { speaker } => {
                 if snap.scene.situation.place_speaker() == Some(speaker) {
-                    plain(ui, &t!(lang, FirstStays, speaker = &snap.scene.speaker_name(speaker)));
+                    if snap.scene.situation.only_some_apps {
+                        plain(ui, &t!(lang, SetSomeAppsHelp));
+                        if page_link(&t!(lang, ChooseApps)).show(ui).clicked() { ask(Ask::Open(Open::VolumeMixer)); }
+                    } else {
+                        plain(ui, &t!(lang, FirstStays, speaker = &snap.scene.speaker_name(speaker)));
+                    }
                 }
                 if let About::Note(note) = &snap.panel.about {
                     plain(ui, &note.title);

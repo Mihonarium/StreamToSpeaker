@@ -755,7 +755,7 @@ fn status_lines_follow_precedence_and_link_to_the_right_page() {
             None,
             Sign::Still,
             "Only chosen apps play here",
-            Some(("Choose apps…", Open::SoundSettings)),
+            Some(("Choose apps…", Open::VolumeMixer)),
         ),
         (
             Doing::Playing,
@@ -1390,6 +1390,14 @@ fn confirmations_share_words_and_answers() {
         let clock = by_clock::confirmation(&s).unwrap(); assert_eq!((clock.seq, clock.since_ms), (7,2000));
         assert_eq!(clock.what, QuestionView { sentence: if chime { body.into() } else { format!("{body} Until you switch, the sound stays on this PC.") }, ..q });
     }
+    s.situation.confirm_in_panel = Some(Confirm::ScreenReader { speaker: k, way });
+    s.situation.popups.confirmation = None;
+    for (routing, yes) in [(RoutingQuestion::StartSwitch, "Switch to Kitchen"), (RoutingQuestion::TakePlayback, "Play this PC’s sound on Kitchen")] {
+        s.situation.confirm_under_routing = Some(routing);
+        let About::Question(q) = view(&s).about else { panic!() };
+        assert_button(Some(&q.yes), Some((yes, Command::Confirm { yes: true })));
+        assert_button(Some(&q.no), Some(("Cancel", Command::Confirm { yes: false })));
+    }
 }
 
 #[test]
@@ -1477,7 +1485,32 @@ fn tray_and_window_words() {
 }
 
 /// Exercise the same scenes on the thread recording the sentence keys.
+#[test]
+fn notes_follow_the_apps_sent_to_the_speaker() {
+    let mut s = pc();
+    s.situation.only_some_apps = true;
+    let mut connecting = named("pc-connecting-to-kitchen");
+    connecting.situation.only_some_apps = true;
+    assert!(matches!(panel(&connecting).about, About::Line { text, .. } if text == "Connecting to Kitchen…"));
+    let mut n = note(stopped());
+    for (ahead, words) in [
+        (Some(Ahead::InAFewSeconds), "The sound from your chosen apps moves to this PC in a few seconds."),
+        (Some(Ahead::WhenSoundStarts), "Your chosen apps will play on this PC when they make sound."),
+        (None, "The sound from your chosen apps moved to this PC at 21:14."),
+    ] {
+        n.ahead = ahead;
+        assert_eq!(super::notes::note(&s, &n).sentence, words);
+    }
+    s.situation.popups.popup = Some(shown(Popup::Note(n.clone())));
+    assert_eq!(by_clock::popup(&s).unwrap().what.sentence.as_deref(), Some("Your chosen apps now play on this PC."));
+    s.situation.popups.popup = Some(shown(Popup::DidntGetReady { speaker: kitchen(), why: PickWhy::Refused }));
+    assert_eq!(by_clock::popup(&s).unwrap().what.sentence.as_deref(), Some("The apps you choose play on this PC."));
+    n.available_again = true;
+    assert_eq!(super::notes::note(&s, &n).sentence, "The apps you choose play on this PC.");
+}
+
 pub(super) fn check_all_scenes() {
+    notes_follow_the_apps_sent_to_the_speaker();
     sound_plays_on_kitchen();
     nothing_plays_on_kitchen();
     sound_starts_and_connects();

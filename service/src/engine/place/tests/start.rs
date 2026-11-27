@@ -58,7 +58,7 @@ fn at_a_start_the_app_looks_at_what_plays_on_this_pc() {
 fn after_a_crash_or_update_the_app_goes_on_at_the_speaker_after_a_look() {
     fn after(kind: StartKind) -> Rig {
         let mut w = world();
-        w.default_output = Some(OutputRef::Ours);
+        w.set_playback(OutputRef::Ours);
         let mut r = Rig::starting(kept_on_kitchen(), w, kind, false);
         r.w.players.push(PlayerWorld {
             id: PlayerId::new(SPOTIFY),
@@ -100,7 +100,7 @@ fn after_a_crash_or_update_the_app_goes_on_at_the_speaker_after_a_look() {
             name: "the watcher gave up: the start begins on this PC",
             given: || {
                 let mut w = world();
-                w.default_output = Some(OutputRef::Pc(out("speakers")));
+                w.set_playback(OutputRef::Pc(out("speakers")));
                 Rig::starting(kept_on_kitchen(), w, StartKind::AfterGivingUp, true)
             },
             when: |_| {},

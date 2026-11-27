@@ -706,7 +706,7 @@ fn run(cli: Cli) -> Result<()> {
 
     // Build the audio source up front so we fail fast if the driver is
     // missing under --source driver.
-    let Source { audio: source, reopen: reopen_source, driver: uses_driver } = build_source(&cli)?;
+    let Source { audio: source, reopen: reopen_source } = build_source(&cli)?;
     info!("audio source: {}", source.name());
 
     let app = setup_app(&cli)?;
@@ -755,9 +755,6 @@ fn run(cli: Cli) -> Result<()> {
     // current track to the speaker when enabled).
     app.spawn_now_playing_forwarder();
 
-    // Ctrl-C handler — set the shutdown flag.
-    install_signal_handler(app.clone());
-
     // Apply initial values from CLI to the runtime atomics.
     app.set_silence_pace_ms(cli.silence_pace_ms);
     app.set_rate_fudge_ppm(cli.rate_fudge_ppm);
@@ -770,7 +767,8 @@ fn run(cli: Cli) -> Result<()> {
     let _audio_thread = thread::Builder::new()
         .name("stream-to-speaker-audio".to_string())
         .spawn(move || {
-            if let Err(e) = audio_loop::run(audio_app.clone(), source, reopen_source) {
+            let result = audio_loop::run(audio_app.clone(), source, reopen_source);
+            if let Err(e) = result {
                 error!("audio loop couldn't start: {:#}", e);
                 audio_app.record_error(format!(
                     "Couldn't start reading this PC's sound ({:#}). Quit {} and start it again.",
@@ -804,6 +802,13 @@ fn run(cli: Cli) -> Result<()> {
         app.clone(),
         stream_to_speaker::platform::Platform::this_pc(),
     )?;
+    let quitting = engine.clone();
+    let headless = cli.headless;
+    app.on_quit_from(move |from| {
+        if !headless { stream_to_speaker::single_instance::announce_closing(); }
+        quitting.quit_from(from);
+    });
+    install_signal_handler(app.clone());
     if let LaunchChoice::Wish(query) = &choice {
         // In the background: the speaker may not be on the network yet.
         app.connect_when_listed(query.clone());
@@ -820,26 +825,13 @@ fn run(cli: Cli) -> Result<()> {
         warn!("no speaker selected; pick one with the GUI / web UI / POST /api/select");
     }
 
-    let ran = if cli.headless {
-        let quitting = engine.clone();
-        app.on_quit_from(move |from| quitting.quit_from(from));
+    if cli.headless {
         run_headless(app)
     } else {
         // Keep an existing sign-in entry pointing at this exe.
         stream_to_speaker::autostart::reapply();
-        // From the moment Quit is chosen, a new launch waits for this copy
-        // to end instead of handing over to it: it is about to have no
-        // window to show.
-        let quitting = engine.clone();
-        app.on_quit_from(move |from| {
-            stream_to_speaker::single_instance::announce_closing();
-            quitting.quit_from(from);
-        });
         run_gui_mode(app, engine, &cli)
-    };
-    // The platform names the app's device (and "not running" at quit).
-    let _ = uses_driver;
-    ran
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -848,9 +840,7 @@ fn run(cli: Cli) -> Result<()> {
 // -----------------------------------------------------------------------------
 
 fn run_headless(app: Arc<App>) -> Result<()> {
-    while !app.is_shutting_down() {
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    app.wait_for_headless_shutdown(Duration::from_secs(4));
     app.shut_down();
     Ok(())
 }
@@ -1115,13 +1105,11 @@ struct Source {
     /// How to open the same kind again if it fails while the app runs (the
     /// audio loop does that).
     reopen: audio_loop::Reopen,
-    /// It is the Stream To Speaker driver.
-    driver: bool,
 }
 
 impl Source {
-    fn new(audio: Box<dyn AudioSource>, reopen: audio_loop::Reopen, driver: bool) -> Self {
-        Self { audio, reopen, driver }
+    fn new(audio: Box<dyn AudioSource>, reopen: audio_loop::Reopen) -> Self {
+        Self { audio, reopen }
     }
 }
 
@@ -1130,11 +1118,11 @@ impl Source {
 /// waited for, not swapped for WASAPI.
 fn build_source(cli: &Cli) -> Result<Source> {
     match cli.source {
-        SourceKind::Sine => Ok(Source::new(open_sine()?, Box::new(open_sine), false)),
+        SourceKind::Sine => Ok(Source::new(open_sine()?, Box::new(open_sine))),
         SourceKind::WasapiLoopback => {
             #[cfg(windows)]
             {
-                Ok(Source::new(open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone()), false))
+                Ok(Source::new(open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone())))
             }
             #[cfg(not(windows))]
             {
@@ -1146,7 +1134,7 @@ fn build_source(cli: &Cli) -> Result<Source> {
             {
                 let src = open_driver()
                     .context("opening Stream-To-Speaker kernel driver (--source driver was specified)")?;
-                Ok(Source::new(src, Box::new(open_driver), true))
+                Ok(Source::new(src, Box::new(open_driver)))
             }
             #[cfg(not(windows))]
             {
@@ -1157,17 +1145,17 @@ fn build_source(cli: &Cli) -> Result<Source> {
             #[cfg(windows)]
             {
                 match open_driver() {
-                    Ok(s) => Ok(Source::new(s, Box::new(open_driver), true)),
+                    Ok(s) => Ok(Source::new(s, Box::new(open_driver))),
                     Err(e) => {
                         info!("driver not present, falling back to WASAPI loopback: {}", e);
-                        Ok(Source::new(open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone()), false))
+                        Ok(Source::new(open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone())))
                     }
                 }
             }
             #[cfg(not(windows))]
             {
                 warn!("non-Windows host; using sine source for --source auto");
-                Ok(Source::new(open_sine()?, Box::new(open_sine), false))
+                Ok(Source::new(open_sine()?, Box::new(open_sine)))
             }
         }
     }
@@ -1427,6 +1415,13 @@ mod tests {
 
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("stream-to-speaker").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn an_explicit_sine_source_opens_and_reopens_the_generator() {
+        let mut source = build_source(&cli(&["--source", "sine"])).unwrap();
+        assert_eq!(source.audio.name(), "sine-440");
+        assert_eq!((source.reopen)().unwrap().name(), "sine-440");
     }
 
     #[test]

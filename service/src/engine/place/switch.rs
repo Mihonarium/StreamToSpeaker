@@ -95,6 +95,34 @@ impl Core {
         Ok(Effect::Done)
     }
 
+    /// The switch started while chosen apps could play without moving the screen reader.
+    pub(super) fn ask_for_connecting_switch(&mut self, w: &World, out: &mut Vec<Do>) -> bool {
+        let Some(s) = &self.switch else { return false };
+        let Some(question) = self.screen_reader_confirm(&s.speaker, s.way, w) else { return false };
+        let by = s.by;
+        self.cancel_switch(w, out);
+        self.ask(question, by, Asker::of(Surface::Settings), None, w, self.now, out).routing = Some(RoutingQuestion::StartSwitch);
+        true
+    }
+
+    /// Whole-PC playback resumes on the speaker already chosen for individual apps.
+    pub(super) fn take_playback_for_place(&mut self, speaker: SpeakerId, w: &World, out: &mut Vec<Do>) {
+        self.cancel_switch(w, out);
+        self.confirm = None;
+        if w.default_output.is_none() || w.playback_on(&OutputRef::Ours) { return; }
+        let way = self.place_way(w);
+        if let Some(question) = self.screen_reader_confirm(&speaker, way, w) {
+            self.ask(question, SwitchBy::Switch, Asker::of(Surface::Settings), None, w, self.now, out).routing = Some(RoutingQuestion::TakePlayback);
+        } else {
+            self.take_playback(None, w, out);
+        }
+    }
+
+    fn take_playback(&mut self, before: Option<SpeakerId>, w: &World, out: &mut Vec<Do>) {
+        self.revert = Some(before);
+        self.win(WinTarget::OurDevice, w, out);
+    }
+
     /// The confirmation a switch to `k` needs first: where the app asks
     /// before it takes a busy speaker, that question comes first.
     fn needs_confirm(&self, k: &SpeakerId, way: WayChoice, w: &World) -> Option<Confirm> {
@@ -128,7 +156,7 @@ impl Core {
         w: &World,
         now: Clock,
         out: &mut Vec<Do>,
-    ) {
+    ) -> &mut Confirming {
         if who.from == SwitchFrom::WindowsList {
             if let Some(prev) = windows_prev.clone().or_else(|| self.pc_target(w)) {
                 self.win(WinTarget::Output(prev), w, out);
@@ -136,7 +164,7 @@ impl Core {
         }
         let by_clock = matches!(who.from, SwitchFrom::Tray | SwitchFrom::WindowsList) && !self.panel_open;
         let seq = self.next_seq();
-        self.confirm = Some(Confirming { what, by, who, windows_prev, by_clock, seq, since_ms: now.mono_ms });
+        self.confirm.insert(Confirming { what, by, who, windows_prev, by_clock, seq, since_ms: now.mono_ms, routing: None })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -228,6 +256,9 @@ impl Core {
     pub(super) fn answer(&mut self, yes: bool, w: &World, now: Clock, out: &mut Vec<Do>) -> Result<Effect, Refusal> {
         let Some(c) = self.confirm.take() else { return Ok(Effect::Done) };
         if !yes {
+            if c.routing == Some(RoutingQuestion::TakePlayback) {
+                out.push(Do::RestoreOnlySomeApps);
+            }
             return Ok(Effect::Done);
         }
         match c.what {
@@ -245,6 +276,12 @@ impl Core {
             Confirm::ScreenReader { speaker, way } => {
                 self.screen_reader_answered.insert(speaker.clone());
                 out.push(Do::Save);
+                if c.routing == Some(RoutingQuestion::TakePlayback) {
+                    if self.place.as_ref() == Some(&speaker) && !self.device_missing {
+                        self.take_playback(None, w, out);
+                    }
+                    return Ok(Effect::Done);
+                }
                 let take_over = !self.ask_before_taking
                     || self.recs.get(&speaker).is_some_and(|r| r.busy.is_some() || r.may_be_in_use.is_some());
                 self.start_switch(speaker, way, c.by, c.who, c.windows_prev, take_over, w, out);
@@ -485,9 +522,8 @@ impl Core {
         if before.as_ref() != Some(&k) || s.by == SwitchBy::Way {
             self.stream_off(out);
         }
-        if !was_here || w.default_output.as_ref() != Some(&OutputRef::Ours) {
-            self.revert = Some(if was_here { before.clone() } else { None });
-            self.win(WinTarget::OurDevice, w, out);
+        if !w.settings.only_some_apps && (!was_here || !w.playback_on(&OutputRef::Ours)) {
+            self.take_playback(if was_here { before } else { None }, w, out);
         }
         self.place = Some(k.clone());
         self.ways.insert(k.clone(), s.way);

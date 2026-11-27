@@ -160,7 +160,7 @@ fn at_the_edges() {
             given: || {
                 let mut r = Rig::on_kitchen();
                 r.w.our_device = false;
-                r.w.default_output = Some(OutputRef::Pc(out("speakers")));
+                r.w.set_playback(OutputRef::Pc(out("speakers")));
                 r.tick();
                 r
             },
@@ -265,7 +265,7 @@ fn the_option_counts_quiet_across_a_restart() {
     r.wait_long(20 * 60_000);
     let mut w = world();
     w.settings.switch_back_after_quiet = true;
-    w.default_output = Some(OutputRef::Ours);
+    w.set_playback(OutputRef::Ours);
     let mut again = r.restart(w, StartKind::AfterUpdate);
     again.wait_long(9 * 60_000);
     assert_eq!(again.sit().spot, Spot::Speaker(id(K)));
@@ -292,4 +292,190 @@ fn a_level_set_from_this_pc_is_saved_once_it_stands() {
     assert_eq!(r.core.kept().levels.get(&id(OFFICE)).map(|l| l.level), Some(55));
     r.wait(5_000);
     assert!(!r.take().contains(&Do::Save), "it is saved once");
+}
+
+#[test]
+fn changing_the_pc_default_keeps_the_chosen_apps_on_their_speaker() {
+    let mut r = Rig::on_kitchen();
+    r.w.settings.only_some_apps = true;
+    r.tick();
+    assert_eq!(r.w.default_output, Some(OutputRef::Pc(out("speakers"))));
+    r.take();
+    r.sound("Local game");
+    r.plug_headphones(true);
+    r.wait(4_000);
+    assert_eq!(r.sit().spot, Spot::Speaker(id(K)));
+    assert_eq!(r.sit().doing, Doing::NothingPlaying);
+    assert!(note(&r).is_none());
+    r.sources.push(Source { app: AppKey::new("Chosen game"), player: None, output: Some(OutputRef::Ours) });
+    r.wait(4_000);
+    r.unplug_headphones();
+    r.wait(4_000);
+    let s = r.sit();
+    assert_eq!(s.doing, Doing::Playing);
+    assert!(s.standing.contains(&Standing::OnlySomeApps { none_playing: false }));
+    assert!(note(&r).is_none());
+    assert!(r.take().iter().all(|action| !matches!(action, Do::Windows(_) | Do::Silence { then: Some(_), .. })));
+    r.w.settings.only_some_apps = false;
+    r.tick();
+    assert_eq!(r.w.default_output, Some(OutputRef::Ours));
+    assert!(r.take().iter().all(|a| !matches!(a, Do::Connect(_) | Do::StopSending { .. } | Do::Silence { .. })));
+}
+
+#[test]
+fn chosen_apps_return_a_refused_default_without_changing_place() {
+    let mut r = Rig::playing_on_kitchen();
+    r.obliging = false;
+    r.w.settings.only_some_apps = true;
+    r.tick();
+    assert!(to_speakers(&r.take()));
+    r.event(Event::Output(OutputEvent::NotTaken { at_ms: r.now.mono_ms }));
+    assert_eq!(r.sit().doing, Doing::Playing);
+    assert!(!r.sit().standing.iter().any(|s| matches!(s, Standing::OnlySomeApps { .. })));
+    r.obliging = true;
+    r.wait(2_000);
+    assert_eq!(r.w.default_output, Some(OutputRef::Pc(out("speakers"))));
+    assert_eq!(r.sit().spot, Spot::Speaker(id(K)));
+}
+
+#[test]
+fn chosen_apps_return_the_default_at_start() {
+    let mut w = world();
+    w.settings.only_some_apps = true;
+    w.set_playback(OutputRef::Ours);
+    let r = Rig::with(Kept { place: Some(id(K)), ..Default::default() }, w);
+    assert_eq!(r.w.default_output, Some(OutputRef::Pc(out("speakers"))));
+    assert_eq!(r.sit().spot, Spot::Speaker(id(K)));
+}
+
+#[test]
+fn chosen_apps_return_the_default_after_headphones_go() {
+    let mut w = world();
+    w.settings.only_some_apps = true;
+    let mut r = Rig::with(Kept { place: Some(id(K)), ..Default::default() }, w);
+    r.plug_headphones(true);
+    r.w.outputs.retain(|o| o.id != out("headphones"));
+    r.choose_in_windows(OutputRef::Ours);
+    assert_eq!(r.w.default_output, Some(OutputRef::Pc(out("speakers"))));
+    r.w.outputs.clear();
+    r.choose_in_windows(OutputRef::Ours);
+    r.plug_headphones(false);
+    r.wait(12_000);
+    assert_eq!(r.w.default_output, Some(OutputRef::Ours));
+    assert_eq!(r.sit().spot, Spot::Speaker(id(K)));
+}
+
+#[test]
+fn sending_everything_again_asks_the_screen_reader_and_explains_a_refusal() {
+    let mut r = Rig::on_kitchen();
+    r.w.settings.only_some_apps = true;
+    r.tick();
+    r.sources.push(Source { app: AppKey::new(GAME), player: None, output: Some(OutputRef::Ours) });
+    r.wait(4_000);
+    r.take();
+    r.w.screen_reader = true;
+    r.w.settings.only_some_apps = false;
+    r.tick();
+    assert_eq!(r.sit().confirm_under_routing, Some(crate::model::situation::RoutingQuestion::TakePlayback));
+    assert!(matches!(r.core.confirm.as_ref().map(|c| &c.what), Some(Confirm::ScreenReader { .. })));
+    assert_eq!(r.w.default_output, Some(OutputRef::Pc(out("speakers"))));
+    assert_eq!(r.core.connected_speaker(), Some(&id(K)));
+    assert_eq!(r.sit().doing, Doing::Playing);
+    assert!(r.take().iter().all(|a| !matches!(a, Do::Connect(_) | Do::StopSending { .. } | Do::Silence { .. })));
+    r.obliging = false;
+    r.cmd(Command::Confirm { yes: true }).unwrap();
+    let actions = r.take();
+    assert!(to_ours(&actions));
+    assert!(actions.iter().all(|a| !matches!(a, Do::Connect(_) | Do::StopSending { .. } | Do::Silence { .. })));
+    r.event(Event::Output(OutputEvent::NotTaken { at_ms: r.now.mono_ms }));
+    assert_eq!(r.sit().spot, Spot::ThisPc(Some(out("speakers"))));
+    assert!(r.sit().standing.contains(&Standing::WindowsDidntSwitch { speaker: id(K) }));
+}
+
+#[test]
+fn sending_everything_again_on_this_pc_uses_the_chosen_output() {
+    let mut r = Rig::new();
+    r.w.settings.only_some_apps = true;
+    r.plug_headphones(false);
+    r.cmd(Command::SwitchOutput(out("headphones"))).unwrap();
+    assert_eq!(r.w.default_output, Some(OutputRef::Pc(out("speakers"))));
+    r.w.settings.only_some_apps = false;
+    r.tick();
+    assert_eq!(r.w.default_output, Some(OutputRef::Pc(out("headphones"))));
+}
+
+#[test]
+fn chosen_apps_leave_a_persons_playback_choice_in_windows() {
+    let mut r = Rig::playing_on_kitchen();
+    r.w.settings.only_some_apps = true;
+    r.tick();
+    assert_eq!(r.w.default_output, Some(OutputRef::Pc(out("speakers"))));
+    r.take();
+    r.choose_in_windows(OutputRef::Ours);
+    r.wait(12_000);
+    assert_eq!(r.w.default_output, Some(OutputRef::Ours));
+    assert!(!to_speakers(&r.take()));
+    assert_eq!(r.sit().doing, Doing::Playing);
+    assert!(!r.sit().standing.iter().any(|s| matches!(s, Standing::OnlySomeApps { .. })));
+}
+
+#[test]
+fn chosen_apps_stop_retrying_a_refused_playback_move_after_ten_seconds() {
+    let mut r = Rig::on_kitchen();
+    r.obliging = false;
+    r.w.settings.only_some_apps = true;
+    r.tick();
+    for delay in [2_000, 3_000, 5_000] {
+        assert!(to_speakers(&r.take()));
+        r.event(Event::Output(OutputEvent::NotTaken { at_ms: r.now.mono_ms }));
+        r.wait(delay - 1);
+        assert!(!to_speakers(&r.take()));
+        r.wait(1);
+    }
+    assert!(to_speakers(&r.take()));
+    r.event(Event::Output(OutputEvent::NotTaken { at_ms: r.now.mono_ms }));
+    r.wait(60_000);
+    assert!(!to_speakers(&r.take()));
+}
+
+#[test]
+fn chosen_apps_notice_when_the_previous_default_disappears_after_the_switch() {
+    for delay in [500, WINDOWS_DOING_MS + 1] {
+        let mut w = world();
+        w.settings.only_some_apps = true;
+        let mut r = Rig::with(Kept { place: Some(id(K)), ..Default::default() }, w);
+        r.plug_headphones(true);
+        r.w.set_playback(OutputRef::Ours);
+        r.event(Event::Output(OutputEvent::DefaultChanged { at_ms: r.now.mono_ms }));
+        r.wait(delay);
+        assert_eq!(r.w.default_output, Some(OutputRef::Ours));
+        r.unplug_headphones();
+        let expected = if delay <= WINDOWS_DOING_MS { OutputRef::Pc(out("speakers")) } else { OutputRef::Ours };
+        assert_eq!(r.w.default_output, Some(expected));
+        assert_eq!(r.sit().spot, Spot::Speaker(id(K)));
+    }
+}
+
+#[test]
+fn turning_off_chosen_apps_during_a_switch_asks_before_taking_playback() {
+    for yes in [false, true] {
+        let mut r = Rig::new();
+        r.w.screen_reader = true;
+        r.w.settings.only_some_apps = true;
+        r.tick();
+        r.cmd(Command::Switch { place: crate::model::Place::Speaker(id(K)), way: None }).unwrap();
+        let gen = r.core.switch.as_ref().unwrap().gen;
+        r.w.settings.only_some_apps = false;
+        r.event(Event::Connected { gen, ended: Ended::Ready });
+        assert_eq!(r.w.default_output, Some(OutputRef::Pc(out("speakers"))));
+        assert_eq!(r.sit().confirm_under_routing, Some(crate::model::situation::RoutingQuestion::StartSwitch));
+        assert!(matches!(r.core.confirm.as_ref().map(|c| &c.what), Some(Confirm::ScreenReader { speaker, .. }) if *speaker == id(K)));
+        r.cmd_from(Surface::Settings, Command::Confirm { yes }).unwrap();
+        if yes {
+            r.end(Purpose::Switch, Ended::Ready);
+            assert_eq!(r.w.default_output, Some(OutputRef::Ours));
+        } else {
+            assert_eq!(r.sit().spot, Spot::ThisPc(Some(out("speakers"))));
+        }
+    }
 }

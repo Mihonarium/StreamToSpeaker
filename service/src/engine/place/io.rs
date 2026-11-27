@@ -52,6 +52,8 @@ pub struct World {
     /// Windows' default output now; `None` where the platform can't tell
     /// (then the app never changes it).
     pub default_output: Option<OutputRef>,
+    /// The default for apps that follow Windows’ Multimedia role.
+    pub multimedia_output: Option<OutputRef>,
     /// The app’s device is in Windows’ list of sound outputs.
     pub our_device: bool,
     pub players: Vec<PlayerWorld>,
@@ -64,6 +66,20 @@ pub struct World {
     pub panel_open: bool,
     /// Music Assistant plays this PC's sound (while it is the place).
     pub music_assistant_playing: bool,
+}
+
+impl World {
+    pub(super) fn playback_on(&self, target: &OutputRef) -> bool {
+        self.default_output.as_ref() == Some(target) && self.multimedia_output.as_ref() == Some(target)
+    }
+
+    pub(super) fn uses_app_output(&self) -> bool {
+        self.default_output == Some(OutputRef::Ours) || self.multimedia_output == Some(OutputRef::Ours)
+    }
+
+    pub(super) fn playback_on_pc(&self) -> bool {
+        matches!(self.default_output, Some(OutputRef::Pc(_))) && matches!(self.multimedia_output, Some(OutputRef::Pc(_)))
+    }
 }
 
 /// A speaker as the engine knows it now.
@@ -298,6 +314,8 @@ pub enum Do {
     Look(SpeakerId),
     /// The switch *Start when I sign in to Windows*.
     StartAtSignIn(bool),
+    /// Turn Only send some apps back on.
+    RestoreOnlySomeApps,
     /// What is kept changed ([`super::Core::kept`]).
     Save,
 }

@@ -48,6 +48,21 @@ impl PlaceDriver {
         }
     }
 
+    pub(super) fn prepare_handback(&mut self, pc: Option<PcOutputId>, ours: Option<PcOutputId>, lang: crate::model::text::Lang) {
+        let saved = self.app.user_config.lock().unwrap().calls_back.clone();
+        let calls = saved.filter(|id| self.platform.outputs.list().iter().any(|o| o.id == *id));
+        let plan = crate::platform::HandbackPlan {
+            our_output: ours,
+            calls: calls.or_else(|| pc.clone()),
+            playback: pc,
+            name: device_name_not_running(lang),
+        };
+        if self.handback.as_ref() != Some(&plan) {
+            self.platform.handback.prepare(&plan);
+            self.handback = Some(plan);
+        }
+    }
+
     fn publish(&mut self, out: &Outlet, previous: Option<Arc<View>>) -> Arc<View> {
         let (scene, ours) = self.scene_and_output();
         let sit = &scene.situation;
@@ -62,6 +77,7 @@ impl PlaceDriver {
             .map_or(0.0, |id| self.platform.sessions.peak(id).clamp(0.05, 1.0));
         let version = previous.as_ref().map_or(0, |v| v.version);
         let mut next = view(scene, self.core.named(), ours.is_none(), version);
+        self.prepare_handback(next.scene.situation.pc_output.clone(), ours, next.lang);
         let current = match previous {
             Some(old) if *old == next => old,
             old => {
@@ -71,13 +87,6 @@ impl PlaceDriver {
                             debug!("couldn't name the app's output: {e}");
                         }
                     }
-                }
-                let pc = &next.scene.situation.pc_output;
-                let name = device_name_not_running(next.lang);
-                if old.as_ref().is_none_or(|v| {
-                    &v.scene.situation.pc_output != pc || device_name_not_running(v.lang) != name
-                }) {
-                    self.platform.handback.prepare(pc.as_ref(), &name);
                 }
                 next.version += 1;
                 (out.publish)(next)

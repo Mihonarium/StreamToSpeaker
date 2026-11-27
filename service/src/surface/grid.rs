@@ -149,6 +149,10 @@ pub(crate) fn page_paragraph(ui: &mut Ui, words: &str, font: FontId, color: Colo
     let galley = wrapped(ui, job(words, font, color), ui.available_width(), height, false);
     ui.label(galley);
 }
+
+pub(crate) fn box_title(ui: &Ui, title: &str, width: f32, t: &crate::ui::theme::Theme) -> Arc<Galley> {
+    wrapped(ui, job(title, t.strong(BODY), t.c.text), width, BODY_LINE, true)
+}
 pub(super) fn figured(
     f: &crate::model::panel::Figured,
     regular: FontId,

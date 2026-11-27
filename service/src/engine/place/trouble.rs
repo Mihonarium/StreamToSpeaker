@@ -69,7 +69,9 @@ impl Core {
         if status != Some(PlayerStatus::Paused) && (status.is_some() || trials::T2_ANY_UNASKED_CHANGE_IS_A_TOUCH) {
             self.passed_pause.retain(|p| *p != id);
         }
-        if status != Some(PlayerStatus::Playing) {
+        // In per-app mode a player may have started on a PC output. Sound
+        // arriving at our device starts the connection.
+        if w.settings.only_some_apps || status != Some(PlayerStatus::Playing) {
             return;
         }
         if self.place.is_none() || self.device_missing || self.start_look.is_some() {
@@ -453,13 +455,16 @@ impl Core {
         let playing_here = is_place && matches!(self.stream, Stream::On { .. } | Stream::Trying(_));
         let grace = self.in_grace(now);
         match signal {
-            SpeakerSignal::Responding => {
+            SpeakerSignal::Responding | SpeakerSignal::PlayingOurStream => {
                 let rec = self.rec(&id);
                 rec.away = None;
                 rec.last_try = None;
                 rec.answered_ms = Some(now.mono_ms);
                 if is_place {
                     self.listening.remove(&id);
+                    if signal == SpeakerSignal::PlayingOurStream && (self.paused_at_speaker || !self.passed_pause.is_empty()) {
+                        self.play_from_speaker(w, out);
+                    }
                 }
             }
             SpeakerSignal::Announced => {
@@ -614,10 +619,12 @@ impl Core {
         if !real {
             self.after_break = false;
             self.joined = None;
+        }
+        let on_speaker = !self.device_missing && matches!(self.stream, Stream::On { .. });
+        if !on_speaker || (self.was_real && !real) {
             self.paused_at_speaker = false;
         }
         self.was_real = real;
-        let on_speaker = !self.device_missing && matches!(self.stream, Stream::On { .. });
         if self.after_break && on_speaker {
             self.after_break = false;
             if let Some(k) = self.place.clone() {

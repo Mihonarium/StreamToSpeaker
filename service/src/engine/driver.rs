@@ -18,6 +18,7 @@ use crate::platform::Platform;
 /// the driver's push. `false` is the fallback if Windows' slider doesn't
 /// follow it.
 pub const LEVEL_THROUGH_WINDOWS: bool = true;
+pub(super) const QUIT_MOVE_WAIT: Duration = Duration::from_secs(2);
 /// A UPnP speaker that stopped fetching the stream for this long has
 /// dropped out (its own reconnects take far less).
 pub(super) const UPNP_GONE_AFTER: Duration = Duration::from_secs(4);
@@ -97,9 +98,9 @@ impl Engine {
         *self.opener.lock().unwrap() = Some(opener);
     }
 
-    /// Quitting: give Windows' output back and let the speaker go, then
-    /// name the app's output for when it isn't running. Waits at most a
-    /// second for the engine.
+    /// Wait up to two seconds for the engine to stop the speaker and give
+    /// Windows its outputs back. If the engine hasn't answered, return the
+    /// outputs here, then give the app's output its name for when it is closed.
     pub fn quit(&self) {
         self.quit_from(Surface::Panel);
     }
@@ -107,7 +108,9 @@ impl Engine {
     /// Send the single quit command with the origin of the shutdown request.
     pub fn quit_from(&self, from: Surface) {
         let ticket = self.send(from, Command::Quit);
-        let _ = ticket.wait(Duration::from_secs(1));
+        if ticket.wait(QUIT_MOVE_WAIT).is_none() {
+            self.platform.handback.hand_back_now();
+        }
         let lang = self.port.snapshot().lang;
         let _ = self.platform.device.rename(&crate::model::view::device_name_not_running(lang));
         self.platform.device.settle(Duration::from_secs(1));
@@ -262,6 +265,25 @@ pub(crate) fn local_time() -> LocalTime {
 mod tests {
     use super::*;
     use crate::{platform::fake::FakePlatform, user_config::UserConfig};
+
+    #[test]
+    fn quit_returns_the_roles_when_the_driver_never_reads_the_ticket() {
+        use crate::model::{samples, view::view};
+        use crate::platform::{fake::{OURS, SPEAKERS}, Handback, HandbackPlan, Outputs, PcOutputId};
+        let windows = FakePlatform::new();
+        windows.choose_in_windows(OURS);
+        let pc = Some(PcOutputId::new(SPEAKERS));
+        windows.prepare(&HandbackPlan { our_output: Some(PcOutputId::new(OURS)), playback: pc.clone(),
+            calls: pc.clone(), name: "Stream To Speaker (not running)".into() });
+        let (tx, unread) = crossbeam_channel::unbounded();
+        let engine = Engine { tx, platform: windows.platform(), opener: Default::default(),
+            port: Arc::new(PortCore::new(view(samples::scene(), None, false, 1))) };
+        engine.quit_from(Surface::Settings);
+        assert!(matches!(unread.try_recv(), Ok(PlaceInput::Command(Surface::Settings, Command::Quit, Some(_)))));
+        assert_eq!(windows.handbacks(), 1);
+        assert_eq!(windows.default_output(), pc);
+        assert_eq!(windows.calls_output(), pc);
+    }
 
     #[test]
     fn the_port_answers_with_the_published_view() {

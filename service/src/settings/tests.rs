@@ -491,7 +491,19 @@ fn the_real_app_keeps_general_privacy_about_and_lab() {
     port.act(Act::SwitchBackAfterQuiet(true));
     port.act(Act::NotesByClock(false));
     let g = port.general();
-    assert!(g.shortcuts.is_none() && g.play_calls.is_none() && g.what_plays.is_none() && g.language.is_none());
+    assert!(g.shortcuts.unwrap().on && g.language.is_none());
+    assert_eq!(g.play_calls, Some(false));
+    assert_eq!(g.what_plays, Some(WhatPlays::Everything));
+    port.act(Act::WhatPlays(WhatPlays::OnlySentApps));
+    port.act(Act::PlayCalls(true));
+    port.act(Act::Shortcuts(false));
+    port.act(Act::ShortcutKeys(crate::platform::DelayKeys(["F8", "F9"].map(|k| vec!["Alt".into(), k.into()]))));
+    let g = port.general();
+    assert_eq!(g.what_plays, Some(WhatPlays::OnlySentApps));
+    assert_eq!(g.play_calls, Some(true));
+    let keys = g.shortcuts.unwrap();
+    assert!(!keys.on);
+    assert_eq!(keys.add, ["Alt", "F9"]);
     port.act(Act::ShowLab(true));
     assert!(port.general().switch_back_after_quiet && !port.general().notes_by_clock && port.about().show_lab);
     {

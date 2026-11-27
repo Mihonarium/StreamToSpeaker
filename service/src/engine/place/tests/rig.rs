@@ -48,6 +48,7 @@ pub fn world() -> World {
         ],
         outputs: vec![OutputWorld { id: out("speakers"), kind: OutputKind::Speakers, name: "Speakers".into() }],
         default_output: Some(OutputRef::Pc(out("speakers"))),
+        multimedia_output: Some(OutputRef::Pc(out("speakers"))),
         our_device: true,
         players: Vec::new(),
         connections: vec![Connection { net: home(), name: Some("HomeNet".into()), kind: ConnKind::WiFi }],
@@ -55,6 +56,13 @@ pub fn world() -> World {
         screen_reader: false,
         panel_open: false,
         music_assistant_playing: false,
+    }
+}
+
+impl World {
+    pub fn set_playback(&mut self, to: OutputRef) {
+        self.multimedia_output = Some(to.clone());
+        self.default_output = Some(to);
     }
 }
 
@@ -142,8 +150,8 @@ impl Rig {
                 Do::Supersede(gen) => self.jobs.retain(|j| j.gen != *gen),
                 Do::Windows(t) | Do::Silence { then: Some(t), .. } if self.obliging => {
                     let to = switch::win_ref(t);
-                    if self.w.default_output.as_ref() != Some(&to) {
-                        self.w.default_output = Some(to);
+                    if !self.w.playback_on(&to) {
+                        self.w.set_playback(to);
                         follow.push(Event::Output(OutputEvent::DefaultChanged { at_ms: self.now.mono_ms }));
                     }
                 }
@@ -331,7 +339,7 @@ impl Rig {
         }));
         if windows_switches {
             self.now = self.now.later(50);
-            self.w.default_output = Some(OutputRef::Pc(out("headphones")));
+            self.w.set_playback(OutputRef::Pc(out("headphones")));
             self.event(Event::Output(OutputEvent::DefaultChanged { at_ms: self.now.mono_ms }));
         }
     }
@@ -341,7 +349,7 @@ impl Rig {
     pub fn unplug_headphones(&mut self) {
         self.w.outputs.retain(|o| o.id != out("headphones"));
         if self.w.default_output == Some(OutputRef::Pc(out("headphones"))) {
-            self.w.default_output = Some(OutputRef::Pc(out("speakers")));
+            self.w.set_playback(OutputRef::Pc(out("speakers")));
             self.event(Event::Output(OutputEvent::DefaultChanged { at_ms: self.now.mono_ms }));
         }
         self.now = self.now.later(30);
@@ -350,7 +358,7 @@ impl Rig {
 
     /// Windows' default changed by a person in Windows' list.
     pub fn choose_in_windows(&mut self, to: OutputRef) {
-        self.w.default_output = Some(to);
+        self.w.set_playback(to);
         self.event(Event::Output(OutputEvent::DefaultChanged { at_ms: self.now.mono_ms }));
         self.wait(2_500);
     }

@@ -22,6 +22,8 @@ mod carry;
 mod commands;
 mod connect;
 mod pass;
+mod shortcuts;
+pub(crate) use shortcuts::DelayShortcuts;
 pub(crate) mod run;
 mod scene;
 pub(crate) mod tap;
@@ -49,6 +51,7 @@ pub(crate) enum PlaceInput {
     /// A change of way or delay let its speaker's session go and then failed.
     WayFinished { speaker: SpeakerId, ended: Ended },
     System(SystemEvent),
+    Shortcut { generation: u64, press: crate::platform::DelayPress },
     Stop,
 }
 
@@ -56,6 +59,13 @@ pub(crate) struct PlaceDriver {
     app: Arc<App>,
     platform: Platform,
     windows_decision: Arc<Mutex<u64>>,
+    lang: crate::model::text::Lang,
+    playback_was_ours: bool,
+    calls_to_speaker: Option<bool>,
+    calls_retry: Option<carry::CallRetry>,
+    releases: Vec<Receiver<()>>,
+    quitting: bool,
+    handback: Option<crate::platform::HandbackPlan>,
     core: Core,
     tx: Sender<PlaceInput>,
     events: Receiver<PlaceInput>,
@@ -75,6 +85,7 @@ pub(crate) struct PlaceDriver {
     seen: Option<world::Observation>,
     session: watch::SessionWatch,
     buttons: Option<watch::Buttons>,
+    shortcuts: Arc<Mutex<DelayShortcuts>>,
     jobs: HashMap<u64, Arc<connect::Attempt>>,
     parked: Option<Arc<carry::Parked>>,
     threads: Vec<JoinHandle<()>>,
@@ -147,10 +158,19 @@ impl PlaceDriver {
         let tap = app.capture_tap.get_or_init(tap::Tap::new);
         let pass = pass::Worker::start(tap.clone(), platform.pass.clone());
         let (tx, events) = crossbeam_channel::unbounded();
+        let shortcuts = Arc::new(Mutex::new(DelayShortcuts::new(platform.hotkeys.clone(), tx.clone())));
+        *app.delay_shortcuts.lock().unwrap() = Arc::downgrade(&shortcuts);
         Self {
             app,
             platform,
             windows_decision: Arc::default(),
+            lang: crate::model::text::Lang::English,
+            playback_was_ours: false,
+            calls_to_speaker: None,
+            calls_retry: None,
+            releases: Vec::new(),
+            quitting: false,
+            handback: None,
             tx,
             events,
             opener,
@@ -168,6 +188,7 @@ impl PlaceDriver {
             panel_open: false,
             session: Default::default(),
             buttons: None,
+            shortcuts,
             jobs: HashMap::new(),
             threads: Vec::new(),
             parked: None,
@@ -199,8 +220,10 @@ impl PlaceDriver {
     }
 
     pub(crate) fn start(&mut self, kind: StartKind) {
+        self.sync_shortcuts();
         let now = self.clock();
         let obs = self.observe(now, true);
+        self.playback_was_ours = obs.world.default_output == Some(OutputRef::Ours);
         self.event(Event::Started(kind), &obs.world, now);
         self.seen = Some(obs);
     }
@@ -233,7 +256,7 @@ impl PlaceDriver {
             }
             PlaceInput::Event(e) => {
                 if let Event::Connected { gen, ended } = &e {
-                    let job = self.jobs.remove(gen)?;
+                    let job = self.jobs.get(gen)?;
                     let number = job.binding.number.load(Ordering::Acquire);
                     if *ended == Ended::Ready && number != 0 {
                         self.recent_bindings.push_front((number, job.speaker.clone()));
@@ -263,11 +286,16 @@ impl PlaceDriver {
                 if self.session_of(&speaker).is_some() { return None; }
                 Event::WayLost { speaker, ended }
             }
+            PlaceInput::Shortcut { generation, press } => {
+                self.press_shortcut(generation, press);
+                return None;
+            }
             PlaceInput::System(e) => {
                 self.compare(Some(e));
                 return None;
             }
             PlaceInput::Stop => {
+                self.stop_shortcuts();
                 if let Some(worker) = self.pass.take() {
                     worker.stop();
                 }
@@ -279,7 +307,9 @@ impl PlaceDriver {
         };
         let now = self.clock();
         let obs = self.observe(now, false);
+        let finished = if let Event::Connected { gen, .. } = &event { Some(*gen) } else { None };
         self.event(event, &obs.world, now);
+        if let Some(gen) = finished { self.jobs.remove(&gen); }
         if let Some(speaker) = lost_binding {
             let _ = self.tx.send(PlaceInput::Released(speaker));
         }
@@ -300,9 +330,11 @@ impl PlaceDriver {
             }
         }
         self.execute(actions);
+        self.follow_calls(world);
     }
 
     pub(crate) fn look(&mut self) {
+        self.sync_shortcuts();
         self.compare(None);
         if !self.core.deciding_output() {
             while let Some((from, cmd, reply)) = self.held.pop_front() {

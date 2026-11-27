@@ -45,6 +45,8 @@ pub fn popup(scene: &Scene) -> Option<Shown<PopupView>> {
                 v.title,
                 Some(if own_sentence {
                     v.sentence
+                } else if scene.situation.only_some_apps {
+                    t!(lang, ChosenAppsNowOn, place = &scene.place_name())
                 } else {
                     t!(lang, SoundIsOnPc)
                 }),
@@ -96,7 +98,7 @@ pub fn popup(scene: &Scene) -> Option<Shown<PopupView>> {
 pub fn confirmation(scene: &Scene) -> Option<Shown<QuestionView>> {
     let shown = scene.situation.popups.confirmation.as_ref()?;
     let mut question = notes::question(scene, &shown.what);
-    if !matches!(shown.what, Confirm::ChimeBusy { .. }) {
+    if !scene.situation.only_some_apps && !matches!(shown.what, Confirm::ChimeBusy { .. }) {
         question.sentence = t!(
             scene.lang,
             UntilYouSwitch,
@@ -176,7 +178,7 @@ pub fn tray(scene: &Scene) -> Tray {
         Some(Command::Open(Open::Settings)),
     ));
     menu.push(MenuEntry::new(
-        if accent {
+        if accent && !scene.situation.only_some_apps {
             t!(lang, QuitAndPlayOnPc)
         } else {
             t!(lang, Quit)
@@ -201,7 +203,7 @@ pub struct WindowWords {
 
 pub fn window_words(scene: &Scene) -> WindowWords {
     let lang = scene.lang;
-    let quit = if scene.situation.place_speaker().is_some() {
+    let quit = if scene.situation.place_speaker().is_some() && !scene.situation.only_some_apps {
         t!(lang, QuitAndPlayOnPc)
     } else {
         t!(lang, QuitTheApp)

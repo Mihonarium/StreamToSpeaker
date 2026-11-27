@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::app::App;
-use crate::audio_source::{AudioPacket, AudioSource, PACKET_FLAG_HINT_SILENT, PACKET_FLAG_STREAM_RESTART};
+use crate::audio_source::{AudioPacket, AudioSource, LocalPlayback, PACKET_FLAG_HINT_SILENT, PACKET_FLAG_STREAM_RESTART};
 use crate::equalizer::Equalizer;
 use crate::http_server::{samples_to_wav_le_bytes, PcmFrame};
 use crate::silence::SilenceDetector;
@@ -103,9 +103,14 @@ impl Drop for ProAudio {
 /// 10 ms of silence per packet, the length the driver's stop marker has.
 const SILENCE_FRAMES: usize = WIRE_SAMPLE_RATE as usize / 100;
 
+enum PacketOrigin {
+    Source(LocalPlayback),
+    Idle,
+}
+
 /// What the reader hands the loop.
 enum FromReader {
-    Packet(AudioPacket),
+    Packet(AudioPacket, LocalPlayback),
     /// The source failed (why); the reader is opening it again.
     Lost(String),
     /// A reopened source is being read.
@@ -141,7 +146,7 @@ fn run_with(app: Arc<App>, source: Box<dyn AudioSource>, reopen: Reopen, timing:
         };
         let got = rx.recv_deadline(wake);
         match got {
-            Ok(FromReader::Packet(mut pkt)) => {
+            Ok(FromReader::Packet(mut pkt, playback)) => {
                 if is_stream_stop(&pkt) {
                     // The driver completes the read it holds with nothing
                     // when Windows stops the stream.
@@ -150,14 +155,14 @@ fn run_with(app: Arc<App>, source: Box<dyn AudioSource>, reopen: Reopen, timing:
                 } else {
                     let handover = feed.source_packet(Instant::now(), pkt.frame_count(), pace);
                     if handover.fill > 0 {
-                        out.publish(&app, AudioPacket::silence(handover.fill), false);
+                        out.publish(&app, AudioPacket::silence(handover.fill), PacketOrigin::Idle);
                     }
                     if handover.trim > 0 {
                         let cut = (handover.trim * pkt.channels as usize).min(pkt.samples.len());
                         pkt.samples.drain(..cut);
                     }
                     if !pkt.samples.is_empty() {
-                        out.publish(&app, pkt, true);
+                        out.publish(&app, pkt, PacketOrigin::Source(playback));
                     }
                     back.sound();
                 }
@@ -169,7 +174,7 @@ fn run_with(app: Arc<App>, source: Box<dyn AudioSource>, reopen: Reopen, timing:
             Ok(FromReader::Reopened) => back.reopened(Instant::now()),
             Err(RecvTimeoutError::Timeout) => {
                 if feed.silence_due(Instant::now(), pace) {
-                    out.publish(&app, AudioPacket::silence(SILENCE_FRAMES), false);
+                    out.publish(&app, AudioPacket::silence(SILENCE_FRAMES), PacketOrigin::Idle);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -212,26 +217,37 @@ fn read_source(
 ) {
     let mut attempts = 0;
     loop {
+        let playback = source.local_playback();
         let failure = loop {
+            if source.needs_reopen() { break None; }
             match source.recv_packet() {
+                Ok(_) if source.needs_reopen() => break None,
                 Ok(pkt) => {
                     attempts = 0;
-                    if tx.send(FromReader::Packet(pkt)).is_err() {
+                    if tx.send(FromReader::Packet(pkt, playback.clone())).is_err() {
                         return;
                     }
                 }
-                Err(e) => break e,
+                Err(e) => break Some(e),
             }
         };
         if app.is_shutting_down() {
             return;
         }
-        if tx.send(FromReader::Lost(format!("{:#}", failure))).is_err() {
+        drop(source);
+        let failure = match failure {
+            Some(e) => e,
+            None => match reopen() {
+                Ok(new_source) => {
+                    source = new_source;
+                    continue;
+                }
+                Err(e) => e,
+            },
+        };
+        if tx.send(FromReader::Lost(format!("{failure:#}"))).is_err() {
             return;
         }
-        // Closed before the next one opens: the driver gives each block of
-        // audio to one reader only.
-        drop(source);
         source = match open_again_after(app, delays, &mut attempts, "the audio source", &mut reopen) {
             Some(s) => s,
             None => return,
@@ -307,9 +323,8 @@ impl Output {
         }
     }
 
-    /// Process `pkt` and publish it. `from_source`: it came from Windows
-    /// rather than standing in for it.
-    fn publish(&mut self, app: &App, mut pkt: AudioPacket, from_source: bool) {
+    /// Process the packet and publish it to the stream.
+    fn publish(&mut self, app: &App, mut pkt: AudioPacket, origin: PacketOrigin) {
         if pkt.flags & PACKET_FLAG_STREAM_RESTART != 0 {
             info!("stream restart from source (new session)");
         }
@@ -321,12 +336,11 @@ impl Output {
             );
             return;
         }
-        if from_source {
-            if let Some(tap) = app.capture_tap.get() {
-                tap.block(&pkt.samples);
+        match &origin {
+            PacketOrigin::Source(playback) => {
+                if let Some(tap) = app.capture_tap.get() { tap.block_from(&pkt.samples, playback); }
             }
-        } else {
-            app.idle_silence_packets.fetch_add(1, Ordering::Relaxed);
+            PacketOrigin::Idle => { app.idle_silence_packets.fetch_add(1, Ordering::Relaxed); }
         }
 
         // EQ before the silence detector, so the keep-alive noise floor
@@ -334,10 +348,14 @@ impl Output {
         if let Some(design) = app.eq.take_ready() {
             self.eq.set_design(design);
         }
-        self.eq.process(&mut pkt.samples);
+        if matches!(origin, PacketOrigin::Source(LocalPlayback::WindowsDefault)) && app.user_config.lock().unwrap().only_some_apps {
+            pkt.samples.fill(0);
+        } else {
+            self.eq.process(&mut pkt.samples);
+        }
 
         self.silence.process(&mut pkt);
-        if from_source {
+        if matches!(origin, PacketOrigin::Source(_)) {
             app.note_source_packet(self.silence.heard_sound());
         }
 
@@ -933,6 +951,143 @@ mod tests {
     }
 
     #[test]
+    fn the_selected_sine_source_reaches_the_stream_in_both_modes() {
+        for some in [false, true] {
+            let app = App::for_tests();
+            app.user_config.lock().unwrap().only_some_apps = some;
+            let hub = app.hub.subscribe();
+            let audio = app.clone();
+            let open = || -> Result<Box<dyn AudioSource>> { Ok(Box::new(crate::sine_source::SineSource::new())) };
+            let worker = std::thread::spawn(move || run(audio, open().unwrap(), Box::new(open)).unwrap());
+            let until = Instant::now() + PATIENCE;
+            let mut heard = false;
+            while let Ok(frame) = hub.recv_deadline(until) {
+                let left: Vec<_> = frame.0.chunks_exact(4).map(|lr| i16::from_le_bytes([lr[0], lr[1]])).collect();
+                let rising = left.windows(2).filter(|s| s[0] <= 0 && s[1] > 0).count();
+                if left.len() == 441 && (4..=5).contains(&rising) && left.iter().any(|s| *s > 8_000) {
+                    heard = true;
+                    break;
+                }
+            }
+            app.request_shutdown();
+            worker.join().unwrap();
+            assert!(heard, "expected the 440 Hz source, chosen apps: {some}");
+        }
+    }
+
+    struct Following(Box<dyn AudioSource>, crate::audio_source::LoopbackEndpoint);
+
+    impl AudioSource for Following {
+        fn recv_packet(&mut self) -> Result<AudioPacket> { self.0.recv_packet() }
+        fn needs_reopen(&self) -> bool { self.1.changed() }
+        fn local_playback(&self) -> LocalPlayback { self.1.local_playback() }
+    }
+
+    #[test]
+    fn only_chosen_apps_silence_default_loopback_but_keep_named_capture() {
+        use crate::audio_source::LoopbackEndpoint;
+        use crate::platform::fake::FakePlatform;
+        let windows = FakePlatform::new();
+        let ours = LoopbackEndpoint::new(windows.clone()).local_playback();
+        windows.set_our_output_present(false);
+        let default = LoopbackEndpoint::new(windows.clone()).local_playback();
+        let named = LocalPlayback::for_named_output(&*windows, "Speakers (Realtek Audio)");
+        let unlisted = LocalPlayback::for_named_output(&*windows, "Another endpoint");
+        let app = App::for_tests();
+        let hub = app.hub.subscribe();
+        let mut out = Output::new(&app);
+        for some in [false, true, false] {
+            app.user_config.lock().unwrap().only_some_apps = some;
+            for (source, muted) in [(&default, some), (&ours, false), (&named, false), (&unlisted, false)] {
+                out.publish(&app, sound(), PacketOrigin::Source(source.clone()));
+                let frame = next_frame(&hub, "captured packet");
+                assert_eq!(frame.0.len(), 441 * 4);
+                for sample in frame.0.chunks_exact(2) {
+                    let value = i16::from_le_bytes([sample[0], sample[1]]);
+                    if muted { assert!(value.abs() <= 4, "default loopback published {value}"); }
+                    else { assert_eq!(value, 1000); }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_packets_cannot_play_back_on_the_captured_speakers() {
+        use crate::platform::fake::{FakePlatform, Passed};
+        use crate::platform::Outputs;
+        // The pass-through is still open when the reader falls back to the PC.
+        let windows = FakePlatform::new();
+        let capture = FakePlatform::new();
+        let app = App::for_tests();
+        let _engine = crate::engine::Engine::start(app.clone(), windows.platform()).unwrap();
+        let hub = app.hub.subscribe();
+        wait_until("pass-through open", || windows.passing_to().is_some());
+        let (opened, next) = unbounded::<Box<dyn AudioSource>>();
+        let make_source = || {
+            let (input, source) = fed();
+            let endpoint = crate::audio_source::LoopbackEndpoint::new(capture.clone());
+            (input, Box::new(Following(source, endpoint)) as Box<dyn AudioSource>)
+        };
+        let (mut input, source) = make_source();
+        let done = start(&app, source, Box::new(move || Ok(next.recv()?)));
+        for some in [false, true] {
+            app.user_config.lock().unwrap().only_some_apps = some;
+            for ours in [true, false] {
+                if capture.our_output().is_some() != ours {
+                    capture.set_our_output_present(ours);
+                    let (new_input, source) = make_source();
+                    opened.send(source).unwrap();
+                    input.items.send(Ok(sound())).unwrap();
+                    input = new_input;
+                }
+                input.reads.recv_timeout(PATIENCE).unwrap();
+                let writes = || windows.passed().iter().filter(|p| matches!(p, Passed::Wrote { .. })).count();
+                let before = writes();
+                input.items.send(Ok(sound())).unwrap();
+                if some && !ours {
+                    let frame = next_frame(&hub, "silence from default loopback");
+                    assert!(frame.0.chunks_exact(2).all(|s| i16::from_le_bytes([s[0], s[1]]).abs() <= 4));
+                } else {
+                    wait_for_sound(&hub);
+                }
+                assert_eq!(writes() - before, usize::from(ours), "some apps: {some}, app output: {ours}");
+                input.reads.recv_timeout(PATIENCE).unwrap();
+            }
+        }
+        app.request_shutdown();
+        drop(input);
+        done.recv_timeout(PATIENCE).unwrap();
+    }
+
+    #[test]
+    fn capture_follows_a_new_default_even_while_the_old_device_keeps_delivering() {
+        use crate::platform::fake::{FakePlatform, HEADPHONES, SPEAKERS};
+        let windows = FakePlatform::new();
+        windows.set_our_output_present(false);
+        windows.choose_in_windows(HEADPHONES);
+        let (old, source) = fed();
+        let (new, next) = fed();
+        let source = Box::new(Following(source, crate::audio_source::LoopbackEndpoint::new(windows.clone())));
+        let mut next = Some(next);
+        let app = App::for_tests();
+        let reader_app = app.clone();
+        let (tx, rx) = bounded(READER_QUEUE);
+        let reader = std::thread::spawn(move || {
+            read_source(&reader_app, source, Box::new(move || Ok(next.take().unwrap())), A_MILLISECOND_APART, &tx)
+        });
+        old.reads.recv_timeout(PATIENCE).unwrap();
+        windows.choose_in_windows(SPEAKERS);
+        old.items.send(Ok(sound())).unwrap();
+        new.reads.recv_timeout(PATIENCE).unwrap();
+        assert!(rx.is_empty());
+        new.items.send(Ok(sound())).unwrap();
+        assert!(matches!(rx.recv_timeout(PATIENCE), Ok(FromReader::Packet(_, _))));
+        app.request_shutdown();
+        drop(new);
+        reader.join().unwrap();
+    }
+
+    #[test]
     fn a_source_that_fails_as_soon_as_it_opens_waits_longer_each_time() {
         let app = App::for_tests();
         let (first, source) = fed();
@@ -985,7 +1140,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(feeder.reads.try_recv().is_err(), "read ahead of a loop that took nothing");
         // Taking one lets exactly one more read happen.
-        assert!(matches!(rx.recv_timeout(PATIENCE), Ok(FromReader::Packet(_))));
+        assert!(matches!(rx.recv_timeout(PATIENCE), Ok(FromReader::Packet(_, _))));
         feeder.reads.recv_timeout(PATIENCE).expect("no read after the hand-over");
         app.request_shutdown();
         drop(rx);

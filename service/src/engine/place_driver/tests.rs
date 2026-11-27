@@ -300,6 +300,22 @@ fn pass_through_writes_only_while_open() {
     );
 }
 
+#[test]
+fn named_loopback_can_only_pass_or_replay_to_another_output() {
+    use crate::audio_source::LocalPlayback;
+    let mut r = Rig::on(App::for_tests());
+    r.settle();
+    let speakers = output(SPEAKERS);
+    let tap = r.app.capture_tap.get().unwrap();
+    let before = r.windows.passed();
+    tap.block_from(&[1, 2], &LocalPlayback::Except(speakers.clone()));
+    assert_eq!(r.windows.passed(), before);
+    assert!(tap.take(100, &speakers).is_empty());
+    tap.block_from(&[3, 4], &LocalPlayback::Except(output(HEADPHONES)));
+    assert!(matches!(r.windows.passed().last(), Some(Passed::Wrote { frames: 1, .. })));
+    assert_eq!(tap.take(100, &speakers), [3, 4]);
+}
+
 struct ObservedPass {
     windows: Arc<FakePlatform>,
     delay: Duration,
@@ -584,6 +600,44 @@ fn a_late_windows_failure_leaves_the_new_speaker_playing() {
 }
 
 #[test]
+fn chosen_apps_wait_for_both_playback_roles_to_return() {
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.playing();
+    r.windows.refuse_role(Some(Role::Multimedia));
+    r.app.user_config.lock().unwrap().only_some_apps = true;
+    r.driver.look();
+    r.settle();
+    assert_eq!(r.default(), output(SPEAKERS));
+    assert_eq!(r.windows.default_for(Role::Multimedia), Some(output(OURS)));
+    let only_chosen = |r: &mut Rig| r.driver.situation().standing.iter().any(|s| matches!(s, Standing::OnlySomeApps { .. }));
+    assert!(!only_chosen(&mut r));
+    r.windows.refuse_role(None);
+    r.advance(2_100);
+    r.settle();
+    assert_eq!(r.windows.default_for(Role::Multimedia), Some(output(SPEAKERS)));
+    assert!(only_chosen(&mut r));
+    assert_eq!(r.windows.switches().last().unwrap().1, [Role::Multimedia]);
+}
+
+#[test]
+fn taking_playback_needs_both_roles_even_after_the_console_change_arrives() {
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.windows.refuse_role(Some(Role::Multimedia));
+    r.pick();
+    let ready = r.answered_connect();
+    r.driver.input(ready);
+    r.driver.input(PlaceInput::System(SystemEvent::DefaultOutputChanged));
+    r.settle();
+    let s = r.driver.situation();
+    assert_eq!(r.default(), output(SPEAKERS));
+    assert_eq!(r.windows.default_for(Role::Multimedia), Some(output(SPEAKERS)));
+    assert!(s.standing.contains(&Standing::WindowsDidntSwitch { speaker: id() }));
+    assert!(r.driver.bound().is_none());
+}
+
+#[test]
 fn a_refused_windows_switch_restores_the_old_place() {
     let fake = FakeRenderer::start(answer);
     let mut r = Rig::new(&fake, UserConfig::in_memory());
@@ -728,3 +782,508 @@ fn a_sonos_and_its_twin_share_a_row_and_airplay_follows_the_delay_choice() {
 mod connections;
 mod scene;
 mod run;
+
+#[test]
+fn cancelling_the_routing_question_restores_chosen_apps_only_for_the_playing_speaker() {
+    use crate::settings::{real::AppSettings, port::{Act, SettingsPort, WhatPlays}};
+    let fake = FakeRenderer::start(answer);
+    for playing in [false, true] {
+        for surface in [Surface::Panel, Surface::Settings] {
+            let mut cfg = UserConfig::in_memory();
+            cfg.only_some_apps = true;
+            let mut r = Rig::new(&fake, cfg);
+            r.windows.set_screen_reader(true);
+            if playing { r.playing(); } else { r.pick(); }
+            let settings = AppSettings::new(r.app.clone());
+            settings.act(Act::WhatPlays(WhatPlays::Everything));
+            r.driver.look();
+            assert!(r.driver.situation().confirm_in_panel.is_some());
+            r.driver.command(surface, &Command::Confirm { yes: false }).unwrap();
+            r.driver.look();
+            r.settle();
+            assert_eq!(settings.general().what_plays, Some(if playing { WhatPlays::OnlySentApps } else { WhatPlays::Everything }));
+            assert_eq!(r.default(), output(SPEAKERS));
+            assert_eq!(r.driver.bound().is_some(), playing);
+            assert!(r.driver.situation().confirm_in_panel.is_none());
+        }
+    }
+}
+
+#[test]
+fn chosen_apps_reach_the_bound_speaker_without_moving_either_default() {
+    let fake = FakeRenderer::start(answer);
+    let mut cfg = remembered();
+    cfg.only_some_apps = true;
+    cfg.play_calls = true;
+    let mut r = Rig::new(&fake, cfg);
+    r.windows.player("Local", Some(Status::Playing));
+    r.windows.app_plays("Local", SPEAKERS, Some(0.6));
+    r.advance(3_500);
+    assert!(r.driver.bound().is_none());
+    assert!(r.driver.situation().standing.contains(&Standing::OnlySomeApps { none_playing: true }));
+    r.windows.app_plays("Music", OURS, Some(0.6));
+    r.driver.look();
+    r.advance(3_250);
+    r.settle();
+    assert_eq!(r.driver.bound().unwrap().0, DEN);
+    assert_eq!(r.driver.situation().doing, Doing::Playing);
+    assert!(r.driver.situation().standing.contains(&Standing::OnlySomeApps { none_playing: false }));
+    r.send(Command::StayOnThisPc);
+    r.settle();
+    assert!(r.windows.switches().is_empty());
+}
+
+#[test]
+fn quitting_returns_calls_the_person_put_on_the_app_output() {
+    use crate::platform::Outputs;
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.windows.set_default(&output(OURS), &[Role::Communications]).unwrap();
+    r.playing();
+    assert_eq!(r.windows.calls_output(), Some(output(OURS)));
+    r.send(Command::Quit);
+    assert_eq!(r.windows.calls_output(), Some(output(SPEAKERS)));
+}
+
+#[test]
+fn calls_follow_playback_off_the_app_output_in_whole_pc_mode() {
+    use crate::platform::fake::MONITOR;
+    use crate::platform::{Outputs, PLAYBACK_ROLES};
+    let fake = FakeRenderer::start(answer);
+    for person in [true, false] {
+        let mut r = Rig::new(&fake, UserConfig::in_memory());
+        r.windows.set_output_on(MONITOR, true);
+        r.driver.look();
+        r.advance(3_000);
+        r.windows.set_default(&output(OURS), &[Role::Communications]).unwrap();
+        r.playing();
+        let pc = output(if person { MONITOR } else { SPEAKERS });
+        if person {
+            r.windows.set_default(&pc, PLAYBACK_ROLES).unwrap();
+        } else {
+            r.send(Command::StayOnThisPc);
+            r.settle();
+        }
+        r.driver.look();
+        r.advance(2_500);
+        assert_eq!(r.driver.situation().spot, Spot::ThisPc(Some(pc.clone())));
+        assert_eq!(r.windows.calls_output(), Some(pc), "person chose playback: {person}");
+    }
+}
+
+#[test]
+fn chosen_apps_keep_the_call_output_the_person_picked() {
+    use crate::platform::{Outputs, PLAYBACK_ROLES};
+    let fake = FakeRenderer::start(answer);
+    let mut cfg = UserConfig::in_memory();
+    cfg.only_some_apps = true;
+    let mut r = Rig::new(&fake, cfg);
+    r.playing();
+    r.windows.set_default(&output(OURS), &[Role::Communications]).unwrap();
+    r.windows.set_default(&output(OURS), PLAYBACK_ROLES).unwrap();
+    r.driver.look();
+    r.windows.set_default(&output(SPEAKERS), PLAYBACK_ROLES).unwrap();
+    r.driver.look();
+    r.advance(2_500);
+    assert_eq!(r.driver.situation().spot, Spot::Speaker(id()));
+    assert_eq!(r.windows.calls_output(), Some(output(OURS)));
+}
+
+#[test]
+fn quitting_uses_the_view_language_for_the_device_name() {
+    use crate::model::{text::Lang, view::device_name_not_running};
+    let mut r = Rig::on(App::for_tests());
+    r.driver.lang = Lang::Test;
+    let lang = r.driver.scene().lang;
+    r.send(Command::Quit);
+    assert_eq!(r.windows.handback().unwrap().name, device_name_not_running(lang));
+}
+
+#[test]
+fn calls_follow_the_setting_and_return_to_their_own_device() {
+    use crate::platform::Outputs;
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.windows.set_output_on(HEADPHONES, true);
+    r.windows.set_default(&output(HEADPHONES), &[Role::Communications]).unwrap();
+    r.playing();
+    let calls = Some(output(HEADPHONES));
+    assert_eq!(r.windows.default_for(Role::Communications), calls);
+    r.app.user_config.lock().unwrap().play_calls = true;
+    r.driver.look();
+    assert_eq!(r.windows.default_for(Role::Communications), Some(output(OURS)));
+    r.app.user_config.lock().unwrap().play_calls = false;
+    r.driver.look();
+    assert_eq!(r.windows.default_for(Role::Communications), calls);
+    assert_eq!(r.default(), output(OURS));
+    r.send(Command::StayOnThisPc);
+    r.settle();
+    assert_eq!(r.windows.default_for(Role::Communications), calls);
+    r.app.user_config.lock().unwrap().play_calls = true;
+    r.pick();
+    r.settle();
+    let monitor = output(crate::platform::fake::MONITOR);
+    r.windows.set_output_on(monitor.as_str(), true);
+    r.windows.set_default(&monitor, &[Role::Communications]).unwrap();
+    r.send(Command::StayOnThisPc);
+    r.settle();
+    assert_eq!(r.windows.default_for(Role::Communications), Some(monitor.clone()));
+    r.pick();
+    r.settle();
+    assert_eq!(r.windows.default_for(Role::Communications), Some(output(OURS)));
+    r.send(Command::Quit);
+    r.settle();
+    assert_eq!(r.windows.default_for(Role::Communications), Some(monitor));
+    assert_eq!(r.default(), output(SPEAKERS));
+}
+
+#[test]
+fn recording_releases_delay_keys_until_cancelled_or_saved() {
+    use crate::platform::{DelayKeys, DelayPress};
+    use crate::settings::{real::AppSettings, port::{Act, SettingsPort}};
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.playing();
+    let settings = AppSettings::new(r.app.clone());
+    let old = DelayKeys::default();
+    let [remove, add] = old.0.clone();
+    assert!(r.windows.press_keys(&add));
+    settings.act(Act::RecordShortcuts(true));
+    r.driver.look();
+    for press in DelayPress::ALL {
+        assert!(!r.windows.press_keys(&press.keys(&old)));
+    }
+    let busy = vec!["Alt".into(), "F10".into()];
+    r.windows.occupy_keys(busy.clone());
+    assert!(!settings.accepts_shortcuts(&DelayKeys([busy, Vec::new()])));
+    assert!(!settings.accepts_shortcuts(&DelayKeys([remove.clone(), remove.clone()])));
+    assert!(settings.accepts_shortcuts(&old));
+    settings.act(Act::RecordShortcuts(false));
+    r.driver.input(r.rx.recv_timeout(WAIT).unwrap());
+    assert_eq!(r.app.delay_status_of(DEN).change_ms, 0, "press queued before recording");
+    assert!(r.windows.press_keys(&add));
+    r.driver.input(r.rx.recv_timeout(WAIT).unwrap());
+    assert_eq!(r.app.delay_status_of(DEN).change_ms, 25);
+
+    settings.act(Act::RecordShortcuts(true));
+    let new_add = vec!["Alt".into(), "F9".into()];
+    settings.act(Act::ShortcutKeys(DelayKeys([add.clone(), new_add.clone()])));
+    assert!(!r.windows.press_keys(&add));
+    settings.act(Act::RecordShortcuts(false));
+    assert!(!r.windows.press_keys(&remove));
+    for (keys, after) in [(&add, 0), (&new_add, 25)] {
+        assert!(r.windows.press_keys(keys));
+        r.driver.input(r.rx.recv_timeout(WAIT).unwrap());
+        assert_eq!(r.app.delay_status_of(DEN).change_ms, after);
+    }
+}
+
+fn keys_after_hiding_settings(close: bool) {
+    use crate::settings::{real::AppSettings, views::{AboutView, SettingsView}};
+    use crate::shell::{main_window::{MainWindow, Windows, WIDTH}, views::ViewMemory};
+    use crate::ui::{preview, theme::Mode};
+
+    let fake = FakeRenderer::start(answer);
+    let mut cfg = UserConfig::in_memory();
+    cfg.onboarding_dismissed = true;
+    let mut r = Rig::new(&fake, cfg);
+    r.playing();
+    let settings = Arc::new(AppSettings::new(r.app.clone()));
+    let mut windows = Windows::default();
+    let window = windows.open(|| MainWindow::new(None, None));
+    window.page(Box::new(SettingsView::new(settings.clone())), false);
+    let snap = crate::model::view::view(r.driver.scene(), Some(&id()), false, 1);
+    let ctx = preview::context(crate::fonts::definitions(&[], &mut |_| None).0, Mode::Light);
+    let mut frame = 0;
+    let mut draw = |events| {
+        frame += 1;
+        let mut input = preview::input(egui::vec2(WIDTH, 900.0), 1.0, frame as f64 * 0.05);
+        input.events = events;
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { window.draw(ui, &snap, true, 900.0); });
+        })
+    };
+    draw(vec![]);
+    let pos = draw(vec![]).shapes.iter().find_map(|s| match &s.shape {
+        egui::Shape::Text(t) if t.galley.text() == "Change…" => Some(t.pos + t.galley.size() / 2.0),
+        _ => None,
+    }).unwrap();
+    draw(vec![egui::Event::PointerMoved(pos)]);
+    for pressed in [true, false] {
+        draw(vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }]);
+    }
+    let add = &crate::platform::DelayKeys::default().0[1];
+    assert!(!r.windows.press_keys(add));
+    let mut memory = ViewMemory::default();
+    if close {
+        assert!(windows.close(&mut memory, 1.0, false));
+    } else {
+        window.page(Box::new(AboutView::new(settings)), true);
+    }
+    assert!(r.windows.press_keys(add));
+    r.driver.input(r.rx.recv_timeout(WAIT).unwrap());
+    assert_eq!(r.app.delay_status_of(DEN).change_ms, 25);
+    if close { assert_eq!(memory.reopen(2.0, |_| false).len(), 1); }
+}
+
+#[test]
+fn covering_settings_restores_the_delay_keys() {
+    keys_after_hiding_settings(false);
+}
+
+#[test]
+fn closing_the_window_restores_the_delay_keys() {
+    keys_after_hiding_settings(true);
+}
+
+#[test]
+fn delay_keys_do_nothing_while_the_speaker_is_paused() {
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.pick();
+    r.settle();
+    r.windows.app_plays("Game", OURS, Some(0.5));
+    r.driver.look();
+    for _ in 0..4 { r.advance(250); }
+    let add = crate::platform::DelayKeys::default().0[1].clone();
+    let transport = |state: &str| crate::gena::TransportChange { state: Some(state.into()), uri: None, title: None };
+    r.app.note_transport(transport("PAUSED_PLAYBACK"));
+    r.driver.look();
+    let sit = r.driver.situation();
+    assert_eq!(sit.doing, Doing::Playing);
+    assert!(sit.standing.contains(&Standing::PausedAtSpeaker { speaker: id() }));
+    assert_eq!(crate::model::panel::panel(&r.driver.scene()).place.state.text, "Paused on the speaker");
+    assert!(r.windows.press_keys(&add));
+    r.driver.input(r.rx.recv_timeout(WAIT).unwrap());
+    assert_eq!(r.app.delay_status_of(DEN).change_ms, 0);
+    r.app.note_transport(transport("PLAYING"));
+    r.driver.look();
+    assert!(!r.driver.situation().standing.contains(&Standing::PausedAtSpeaker { speaker: id() }));
+    assert!(r.windows.press_keys(&add));
+    r.driver.input(r.rx.recv_timeout(WAIT).unwrap());
+    assert_eq!(r.app.delay_status_of(DEN).change_ms, 25);
+}
+
+#[test]
+fn delay_keys_act_on_the_playing_speaker_and_release_their_registrations() {
+    use crate::platform::{DelayKeys, DelayPress};
+    use crate::settings::{real::AppSettings, port::{Act, SettingsPort}};
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    let settings = AppSettings::new(r.app.clone());
+    let keys = DelayKeys::default();
+    let [remove, add, large_remove, large_add] = DelayPress::ALL.map(|p| p.keys(&keys));
+    let press = |r: &mut Rig, chord: &[String]| {
+        assert!(r.windows.press_keys(chord));
+        r.driver.input(r.rx.recv_timeout(WAIT).unwrap());
+    };
+    press(&mut r, &add);
+    assert_eq!(r.app.delay_status_of(DEN).change_ms, 0);
+    r.pick();
+    r.settle();
+    press(&mut r, &add);
+    assert_eq!(r.app.delay_status_of(DEN).change_ms, 0, "connected and quiet");
+    r.windows.app_plays("Music", OURS, Some(0.5));
+    r.driver.look();
+    for (key, after) in [(&add, 25), (&large_remove, -75), (&remove, -100), (&large_add, 0)] {
+        press(&mut r, key);
+        assert_eq!(r.app.delay_status_of(DEN).change_ms, after);
+    }
+    assert!(r.windows.press_keys(&add));
+    settings.act(Act::Shortcuts(false));
+    r.driver.input(r.rx.recv_timeout(WAIT).unwrap());
+    assert_eq!(r.app.delay_status_of(DEN).change_ms, 0, "queued press after switching off");
+    assert!(!r.windows.press_keys(&add));
+    r.windows.occupy_keys(add.clone());
+    r.windows.occupy_keys(large_remove.clone());
+    settings.act(Act::Shortcuts(true));
+    r.driver.look();
+    assert_eq!(settings.general().shortcuts.unwrap().status, [crate::platform::KeyStatus::Registered, crate::platform::KeyStatus::Taken, crate::platform::KeyStatus::Taken]);
+    assert!(!r.windows.press_keys(&add) && !r.windows.press_keys(&large_remove));
+    press(&mut r, &large_add);
+    let custom = vec!["Alt".into(), "F9".into()];
+    settings.act(Act::ShortcutKeys(DelayKeys([remove.clone(), custom.clone()])));
+    r.driver.look();
+    assert_eq!(settings.general().shortcuts.unwrap().status, [crate::platform::KeyStatus::Registered, crate::platform::KeyStatus::Registered, crate::platform::KeyStatus::Taken]);
+    assert!(!r.windows.press_keys(&large_add));
+    press(&mut r, &custom);
+    assert_eq!(r.app.delay_status_of(DEN).change_ms, 125);
+    r.windows.app_plays("Music", OURS, None);
+    press(&mut r, &custom);
+    assert_eq!(r.app.delay_status_of(DEN).change_ms, 125);
+    r.send(Command::Quit);
+    r.driver.look();
+    assert!(!r.windows.press_keys(&custom));
+    r.settle();
+}
+
+#[test]
+fn choosing_our_playback_in_windows_routes_calls_when_the_speaker_becomes_the_place() {
+    use crate::platform::{Outputs, PLAYBACK_ROLES};
+    let fake = FakeRenderer::start(answer);
+    let mut cfg = remembered();
+    cfg.sound_place.as_mut().unwrap().place = None;
+    cfg.play_calls = true;
+    let mut r = Rig::new(&fake, cfg);
+    r.windows.set_output_on(HEADPHONES, true);
+    r.windows.choose_in_windows(HEADPHONES);
+    r.driver.look();
+    r.advance(4_000);
+    assert_eq!(r.windows.calls_output(), Some(output(HEADPHONES)));
+    r.windows.set_default(&output(OURS), PLAYBACK_ROLES).unwrap();
+    r.driver.look();
+    assert_eq!(r.windows.calls_output(), Some(output(HEADPHONES)));
+    r.advance(3_000);
+    r.settle();
+    assert_eq!(r.driver.situation().place_speaker(), Some(&id()));
+    assert_eq!(r.windows.calls_output(), Some(output(OURS)));
+    r.windows.set_default(&output(HEADPHONES), &[Role::Communications]).unwrap();
+    r.advance(30_000);
+    assert_eq!(r.windows.calls_output(), Some(output(HEADPHONES)));
+}
+
+#[test]
+fn refused_call_moves_retry_at_two_five_and_ten_seconds() {
+    use crate::platform::{Outputs, PLAYBACK_ROLES};
+    let windows = FakePlatform::new();
+    windows.set_default(&output(OURS), PLAYBACK_ROLES).unwrap();
+    let app = App::with_settings(App::test_config(), remembered(), None, None);
+    let mut r = Rig::with_platform(app, windows.clone(), windows.platform());
+    r.windows.refuse_switches(true);
+    r.app.user_config.lock().unwrap().play_calls = true;
+    r.driver.look();
+    let count = || windows.switches().iter().filter(|(_, roles)| roles == &[Role::Communications]).count();
+    assert_eq!(count(), 1);
+    for (advance, n) in [(1_500, 1), (500, 2), (2_500, 2), (500, 3), (4_500, 3), (500, 4), (60_000, 4)] {
+        r.advance(advance);
+        assert_eq!(count(), n);
+    }
+    r.app.user_config.lock().unwrap().play_calls = false;
+    r.driver.look();
+    r.windows.refuse_switches(false);
+    r.app.user_config.lock().unwrap().play_calls = true;
+    r.driver.look();
+    assert_eq!(windows.calls_output(), Some(output(OURS)));
+    windows.refuse_switches(true);
+    r.app.user_config.lock().unwrap().play_calls = false;
+    r.driver.look();
+    assert_eq!(windows.calls_output(), Some(output(OURS)));
+    windows.refuse_switches(false);
+    r.advance(2_000);
+    assert_eq!(windows.calls_output(), Some(output(SPEAKERS)));
+    assert!(r.app.user_config.lock().unwrap().calls_back.is_none());
+}
+
+#[test]
+fn an_update_remembers_the_separate_call_headset() {
+    use crate::platform::Outputs;
+    let fake = FakeRenderer::start(answer);
+    let dir = std::env::temp_dir().join(format!("sts-call-headset-{}", std::process::id()));
+    let path = dir.join("config.json");
+    let mut r = Rig::new(&fake, UserConfig::at_path(path.clone()));
+    let headset = output(HEADPHONES);
+    r.windows.set_output_on(HEADPHONES, true);
+    r.windows.set_default(&headset, &[Role::Communications]).unwrap();
+    r.app.user_config.lock().unwrap().play_calls = true;
+    r.playing();
+    r.send(Command::Release { for_update: true });
+    assert_eq!(r.default(), output(OURS));
+    assert_eq!(r.windows.calls_output(), Some(output(OURS)));
+    assert_eq!(r.windows.handbacks(), 0);
+    let mut cfg = UserConfig::load_at_path(path.clone());
+    assert_eq!(cfg.calls_back, Some(headset.clone()));
+    cfg.play_calls = false;
+    let app = App::with_settings(App::test_config(), cfg, None, None);
+    let mut driver = PlaceDriver::new(app.clone(), r.windows.platform(), Arc::default(), Instant::now());
+    driver.start(StartKind::AfterUpdate);
+    assert_eq!(r.windows.calls_output(), Some(headset));
+    assert!(UserConfig::load_at_path(path).calls_back.is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn quit_waits_for_stop_then_returns_the_roles_still_on_the_app() {
+    use crate::engine::driver::Engine;
+    use crate::model::port::Port;
+    use crate::platform::Outputs;
+    for (some, timeout, command_only) in [(false, false, false), (true, false, true), (false, true, false), (false, true, true)] {
+        let (stopping, stopped) = bounded(1);
+        let (resume, go) = bounded(1);
+        let stops = AtomicU64::new(0);
+        let fake = FakeRenderer::start(move |req| {
+            if req.soap_action() == Some("Stop") && stops.fetch_add(1, Ordering::Relaxed) == 1 {
+                stopping.send(()).unwrap();
+                let _ = go.recv_timeout(WAIT);
+            }
+            answer(req)
+        });
+        let mut cfg = UserConfig::in_memory();
+        cfg.play_calls = true;
+        cfg.only_some_apps = some;
+        let host = TestApp::with_speaker(&fake, cfg);
+        let windows = FakePlatform::new();
+        windows.set_default(&output(HEADPHONES), &[Role::Communications]).unwrap();
+        let engine = Engine::start(host.app.clone(), windows.platform()).unwrap();
+        engine.send(Surface::Panel, Command::Switch { place: Place::Speaker(id()), way: None });
+        let end = Instant::now() + WAIT;
+        while engine.snapshot().scene.situation.place_speaker() != Some(&id()) {
+            assert!(Instant::now() < end);
+            std::thread::yield_now();
+        }
+        if some {
+            windows.set_default(&output(OURS), &[Role::Communications]).unwrap();
+        }
+        let (done, finished) = bounded(1);
+        let quit = std::thread::spawn(move || {
+            if command_only {
+                let outcome = engine.send(Surface::Panel, Command::Quit).wait(WAIT).unwrap();
+                assert_eq!(outcome.result, Ok(Effect::Done));
+            } else {
+                engine.quit();
+            }
+            done.send(()).unwrap();
+        });
+        stopped.recv_timeout(WAIT).unwrap();
+        assert!(finished.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(windows.default_output(), Some(output(if some { SPEAKERS } else { OURS })));
+        assert_eq!(windows.calls_output(), Some(output(OURS)));
+        windows.set_default(&output(HEADPHONES), &[Role::Multimedia]).unwrap();
+        if timeout {
+            finished.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(windows.default_for(Role::Multimedia), Some(output(HEADPHONES)));
+        }
+        let _ = resume.send(());
+        quit.join().unwrap();
+        assert!(windows.handbacks() >= 1);
+        assert_eq!(windows.default_for(Role::Multimedia), Some(output(HEADPHONES)));
+        assert_eq!(windows.default_output(), Some(output(SPEAKERS)));
+        assert_eq!(windows.calls_output(), Some(output(if some { SPEAKERS } else { HEADPHONES })));
+    }
+}
+
+#[test]
+fn a_late_call_move_keeps_the_headset_until_calls_return() {
+    use crate::platform::{Outputs, PLAYBACK_ROLES};
+    let windows = FakePlatform::new();
+    windows.set_default(&output(OURS), PLAYBACK_ROLES).unwrap();
+    windows.set_default(&output(HEADPHONES), &[Role::Communications]).unwrap();
+    let app = App::with_settings(App::test_config(), remembered(), None, None);
+    let mut driver = PlaceDriver::new(app.clone(), windows.platform(), Arc::default(), Instant::now());
+    driver.start(StartKind::Normal);
+    windows.refuse_switches(true);
+    app.user_config.lock().unwrap().play_calls = true;
+    for advance in [0, 2_000, 3_000, 5_000, 1_000] {
+        driver.skip(advance);
+        driver.look();
+        assert_eq!(app.user_config.lock().unwrap().calls_back, Some(output(HEADPHONES)));
+        assert_eq!(windows.handback().unwrap().calls, Some(output(HEADPHONES)));
+    }
+    windows.refuse_switches(false);
+    windows.set_default(&output(OURS), &[Role::Communications]).unwrap();
+    driver.look();
+    app.user_config.lock().unwrap().play_calls = false;
+    driver.look();
+    assert_eq!(windows.calls_output(), Some(output(HEADPHONES)));
+    assert!(app.user_config.lock().unwrap().calls_back.is_none());
+    driver.input(PlaceInput::Stop);
+}

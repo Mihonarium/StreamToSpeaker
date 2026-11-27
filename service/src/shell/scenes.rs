@@ -34,7 +34,16 @@ pub fn scenes() -> Vec<Scene> {
     }
     windows!("kitchen-playing", "pc-plain", "pc-kitchen-didnt-respond", "many-speakers", "long-names",
         "pc-welcome-pick", "pc-welcome-looking", "pc-welcome-none-found", "pc-welcome-busy", "pc-welcome-chime", "kitchen-welcome-done");
+    macro_rules! first_run {
+        ($($name:literal),*) => { [$(Scene {
+            name: $name, size: [super::main_window::WIDTH + 42.0, 0.0],
+            draw: |ui, _| ordinary(ui, $name, None),
+        }),*] };
+    }
+    scenes.extend(samples::with_sample_names!(apps_first_run, first_run));
     scenes.extend([
+        Scene { name: "apps-window-playing", size: [super::main_window::WIDTH + 42.0, 0.0], draw: |ui, _| ordinary(ui, "apps-panel-playing", None) },
+        Scene { name: "apps-popup-moved", size: [368.0, 0.0], draw: |ui, _| popup(ui, "apps-moved") },
         Scene { name: "window-speaker", size: [424.0, 0.0], draw: |ui, _| ordinary(ui, "kitchen-playing",
             Some(crate::model::Open::SpeakerSettings(crate::model::SpeakerId::new("kitchen")))) },
         Scene { name: "window-settings", size: [424.0, 0.0], draw: |ui, _| ordinary(ui, "kitchen-playing", Some(crate::model::Open::Settings)) },

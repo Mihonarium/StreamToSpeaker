@@ -125,16 +125,15 @@ impl<'a> Layout<'a> {
         close: Option<&'a Act>,
         t: &Theme,
     ) -> Self {
-        let title = wrapped(
+        let title = box_title(
             ui,
-            job(title, t.strong(BODY), t.c.text),
+            title,
             if close.is_some() {
                 END - TEXT - GAP
             } else {
                 NOTE_END - TEXT
             },
-            BODY_LINE,
-            true,
+            t,
         );
         let sentence = wrapped(
             ui,

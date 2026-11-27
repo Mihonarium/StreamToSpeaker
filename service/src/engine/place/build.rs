@@ -83,6 +83,7 @@ impl Core {
             FirstRun::Three(k) => Some(FirstRunStep::Three { speaker: k.clone() }),
         };
         Situation {
+            only_some_apps: w.settings.only_some_apps,
             spot,
             pc_output,
             away,
@@ -94,6 +95,7 @@ impl Core {
             standing: self.standing(w, now),
             speakers,
             confirm_in_panel,
+            confirm_under_routing: self.confirm.as_ref().and_then(|c| c.routing),
             popups,
             first_run,
         }
@@ -185,7 +187,9 @@ impl Core {
         }
         if let (Some(k), false) = (&self.place, self.device_missing) {
             if w.settings.only_some_apps {
-                standing.push(Standing::OnlySomeApps { none_playing: !self.detector.audible_on(&OutputRef::Ours) });
+                if w.playback_on_pc() {
+                    standing.push(Standing::OnlySomeApps { none_playing: !self.detector.audible_on(&OutputRef::Ours) });
+                }
             } else if let Some((app, output)) = w.outputs.iter().find_map(|o| {
                 let at = OutputRef::Pc(o.id.clone());
                 if self.detector.real_on(&at, now.mono_ms) {

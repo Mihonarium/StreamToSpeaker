@@ -385,6 +385,15 @@ impl App {
 }
 
 impl SettingsPort for AppSettings {
+    fn accepts_shortcuts(&self, keys: &crate::platform::DelayKeys) -> bool {
+        self.app.delay_shortcuts.lock().unwrap().upgrade().is_some_and(|s| s.lock().unwrap().accepts(keys))
+    }
+
+    #[cfg(windows)]
+    fn windows_key_down(&self) -> bool {
+        crate::platform::win::windows_key_down()
+    }
+
     fn speakers(&self) -> SpeakersView {
         let app = &self.app;
         let (hidden, shown): (Vec<_>, Vec<_>) = self.rows().into_iter().partition(|(_, h)| *h);
@@ -476,12 +485,19 @@ impl SettingsPort for AppSettings {
         };
         let cfg = app.user_config.lock().unwrap();
         GeneralView {
-            what_plays: None,
-            play_calls: None,
+            what_plays: Some(if cfg.only_some_apps { WhatPlays::OnlySentApps } else { WhatPlays::Everything }),
+            play_calls: Some(cfg.play_calls),
             switch_back_after_quiet: cfg.switch_back_after_quiet,
             notes_by_clock: cfg.notes_by_clock,
             start_at_sign_in: Some(start),
-            shortcuts: None,
+            shortcuts: Some(Shortcuts {
+                on: cfg.delay_shortcuts,
+                remove: cfg.delay_keys.0[0].clone(),
+                add: cfg.delay_keys.0[1].clone(),
+                larger: "Shift".into(),
+                status: app.delay_shortcuts.lock().unwrap().upgrade()
+                    .map_or([crate::platform::KeyStatus::Rejected; 3], |keys| keys.lock().unwrap().status()),
+            }),
             language: None,
         }
     }
@@ -844,11 +860,30 @@ impl SettingsPort for AppSettings {
                 let name = name.trim();
                 self.change_speaker(&id, |s| s.show_as = (!name.is_empty()).then(|| name.to_owned()));
             }
-            Act::SwitchBackAfterQuiet(on) | Act::NotesByClock(on) | Act::ShowLab(on) => {
+            Act::WhatPlays(mode) => {
+                let mut cfg = app.user_config.lock().unwrap();
+                cfg.only_some_apps = mode == WhatPlays::OnlySentApps;
+                cfg.save();
+            }
+            Act::RecordShortcuts(recording) => {
+                let cfg = app.user_config.lock().unwrap();
+                if let Some(keys) = app.delay_shortcuts.lock().unwrap().upgrade() {
+                    keys.lock().unwrap().record(recording, &cfg);
+                }
+            }
+            Act::ShortcutKeys(keys) => {
+                let mut cfg = app.user_config.lock().unwrap();
+                cfg.delay_keys = keys;
+                cfg.save();
+            }
+            Act::SwitchBackAfterQuiet(on) | Act::NotesByClock(on) | Act::ShowLab(on)
+            | Act::PlayCalls(on) | Act::Shortcuts(on) => {
                 let mut cfg = app.user_config.lock().unwrap();
                 match act {
                     Act::SwitchBackAfterQuiet(_) => cfg.switch_back_after_quiet = on,
                     Act::NotesByClock(_) => cfg.notes_by_clock = on,
+                    Act::PlayCalls(_) => cfg.play_calls = on,
+                    Act::Shortcuts(_) => cfg.delay_shortcuts = on,
                     _ => cfg.show_lab = on,
                 }
                 cfg.save();
@@ -999,9 +1034,7 @@ impl SettingsPort for AppSettings {
             }
             Act::OpenIssue(_) => self.desktop.open_url(&format!("{REPOSITORY}/issues/new")),
             // Controls the real app's views leave out.
-            Act::WhatPlays(_) | Act::PlayCalls(_) | Act::Shortcuts(_)
-            | Act::ShortcutKeys(..)
-            | Act::Language(_)
+            Act::Language(_)
             | Act::OpenMusicAssistant
             | Act::Unmute
             | Act::SendToUs

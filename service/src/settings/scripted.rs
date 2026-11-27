@@ -29,6 +29,7 @@ pub struct State {
     pub speakers: SpeakersView,
     pub pages: Vec<SpeakerView>,
     pub general: GeneralView,
+    pub rejected_shortcut: Option<Vec<String>>,
     pub ma: MaView,
     pub privacy: PrivacyView,
     pub about: AboutView,
@@ -113,6 +114,11 @@ fn rename(s: &mut State, id: &str, name: &str) {
 }
 
 impl SettingsPort for ScriptedSettings {
+    fn accepts_shortcuts(&self, keys: &crate::platform::DelayKeys) -> bool {
+        let s = self.state.lock().unwrap();
+        keys.0[0] != keys.0[1] && s.rejected_shortcut.as_ref().is_none_or(|rejected| !keys.0.contains(rejected))
+    }
+
     fn speakers(&self) -> SpeakersView {
         self.state.lock().unwrap().speakers.clone()
     }
@@ -267,13 +273,9 @@ fn apply(s: &mut State, act: &Act) {
                 k.on = *on;
             }
         }
-        Act::ShortcutKeys(i, keys) => {
+        Act::ShortcutKeys(keys) => {
             if let Some(k) = &mut s.general.shortcuts {
-                match i {
-                    0 => k.remove = keys.clone(),
-                    1 => k.add = keys.clone(),
-                    _ => k.larger = keys.last().cloned().unwrap_or_default(),
-                }
+                [k.remove, k.add] = keys.0.clone();
             }
         }
         Act::Language(l) => s.general.language = Some(l.clone()),
@@ -408,6 +410,7 @@ pub fn example() -> State {
             sendspin: Some(false),
         },
         pages: vec![kitchen, living_p, bedroom_p, office_p, garage_p, den_p, desk_p, neighbour_p],
+        rejected_shortcut: None,
         general: GeneralView {
             what_plays: Some(WhatPlays::Everything),
             play_calls: Some(false),
@@ -419,7 +422,7 @@ pub fn example() -> State {
                 remove: vec!["Ctrl".into(), "Win".into(), ",".into()],
                 add: vec!["Ctrl".into(), "Win".into(), ".".into()],
                 larger: "Shift".into(),
-                taken: [false, false, false],
+                status: [crate::platform::KeyStatus::Registered; 3],
             }),
             language: Some(None),
         },

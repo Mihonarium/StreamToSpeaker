@@ -33,7 +33,7 @@ fn world_with_headphones(default: bool) -> World {
     let mut w = world();
     w.outputs.push(OutputWorld { id: out("headphones"), kind: OutputKind::Headphones, name: "Headphones".into() });
     if default {
-        w.default_output = Some(OutputRef::Pc(out("headphones")));
+        w.set_playback(OutputRef::Pc(out("headphones")));
     }
     w
 }
@@ -303,7 +303,7 @@ fn a_windows_change_within_two_seconds_is_windows_doing() {
                 let at = r.now.mono_ms;
                 r.event(Event::Output(OutputEvent::Removed { id: out("usb"), at_ms: at }));
                 r.now = r.now.later(300);
-                r.w.default_output = Some(OutputRef::Ours);
+                r.w.set_playback(OutputRef::Ours);
                 let at = r.now.mono_ms;
                 r.event(Event::Output(OutputEvent::DefaultChanged { at_ms: at }));
                 r.wait(2_500);

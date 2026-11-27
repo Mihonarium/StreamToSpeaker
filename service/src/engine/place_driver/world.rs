@@ -235,7 +235,7 @@ impl PlaceDriver {
             SettingsWorld {
                 switch_back_after_quiet: cfg.switch_back_after_quiet,
                 notes: cfg.notes_by_clock,
-                only_some_apps: false,
+                only_some_apps: cfg.only_some_apps,
             }
         };
         let outputs = &self.platform.outputs;
@@ -248,6 +248,7 @@ impl PlaceDriver {
                 .map(|o| OutputWorld { id: o.id.clone(), name: o.name.clone(), kind: o.kind })
                 .collect(),
             default_output: outputs.default_output().map(|o| output_ref(o, &ours)),
+            multimedia_output: outputs.default_for(crate::platform::Role::Multimedia).map(|o| output_ref(o, &ours)),
             our_device: ours.is_some(),
             players: players
                 .iter()

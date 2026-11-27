@@ -428,9 +428,8 @@ impl Shell {
     }
 
     fn close_window(&mut self) {
-        if let Some(w) = self.windows.main.take() {
-            let first_run = self.port.snapshot().scene.situation.first_run.is_some();
-            if first_run { self.memory.forget(); } else { self.memory.closed(w.pages, self.now); }
+        let first_run = self.port.snapshot().scene.situation.first_run.is_some();
+        if self.windows.close(&mut self.memory, self.now, first_run) {
             self.report_panel();
             self.save_window_height(true);
             for command in super::main_window::close_commands(self.opts.tray, first_run) {

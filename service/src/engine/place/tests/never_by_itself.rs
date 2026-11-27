@@ -104,6 +104,7 @@ fn events(r: &Rig) -> Vec<(String, Event)> {
     for s in [K, B, OFFICE] {
         for signal in [
             SpeakerSignal::Responding,
+            SpeakerSignal::PlayingOurStream,
             SpeakerSignal::NotResponding,
             SpeakerSignal::Silenced,
             SpeakerSignal::AsksSecret(Secret::Code),
@@ -172,7 +173,7 @@ fn speakers_own_pause(e: &Event) -> bool {
 }
 
 fn speakers_own_play(e: &Event) -> bool {
-    matches!(e, Event::Speaker { signal: SpeakerSignal::PlayPressed, .. })
+    matches!(e, Event::Speaker { signal: SpeakerSignal::PlayPressed | SpeakerSignal::PlayingOurStream, .. })
 }
 
 #[test]

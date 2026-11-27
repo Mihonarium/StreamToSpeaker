@@ -16,6 +16,8 @@ pub use crate::model::facts::OutputKind;
 pub use crate::model::PcOutputId;
 
 pub mod fake;
+mod hotkeys;
+pub use hotkeys::{DelayKeys, DelayPress, Hotkeys, KeyRegistration, KeySink, KeyStatus};
 #[cfg(windows)]
 pub(crate) mod win;
 
@@ -72,13 +74,21 @@ pub const ALL_ROLES: &[Role] = &[Role::Console, Role::Multimedia, Role::Communic
 
 /// Windows' outputs: which one plays, switching it, names and levels.
 pub trait Outputs: Send + Sync {
+    /// The default Windows reports for one role.
+    fn default_for(&self, role: Role) -> Option<PcOutputId>;
     /// Windows' default output (the console role), or `None` when this
     /// platform can't tell.
-    fn default_output(&self) -> Option<PcOutputId>;
+    fn default_output(&self) -> Option<PcOutputId> { self.default_for(Role::Console) }
+    /// The output used by apps that follow Windows' default for calls.
+    fn calls_output(&self) -> Option<PcOutputId> { self.default_for(Role::Communications) }
     /// This app's own output (its driver's endpoint), while Windows has it.
     fn our_output(&self) -> Option<PcOutputId>;
     /// Windows' names for an output; `None` once it is gone.
     fn describe(&self, id: &PcOutputId) -> Option<OutputInfo>;
+    /// Read the endpoint's friendly name when opening it for capture.
+    fn current_friendly(&self, id: &PcOutputId) -> Option<String> {
+        self.describe(id).map(|o| o.friendly)
+    }
     /// Every output that is switched on, this app's own among them.
     fn list(&self) -> Vec<OutputInfo>;
     /// Make `id` Windows' default output for `roles`. The caller reads the
@@ -209,12 +219,51 @@ pub trait OurDevice: Send + Sync {
     fn settle(&self, _max: std::time::Duration) {}
 }
 
+/// The defaults the app can return and the name to leave on its device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandbackPlan {
+    pub our_output: Option<PcOutputId>,
+    pub playback: Option<PcOutputId>,
+    pub calls: Option<PcOutputId>,
+    pub name: String,
+}
+
+impl HandbackPlan {
+    /// A crash can happen before the driver has read the person's saved place.
+    #[cfg(any(windows, test))]
+    fn before_driver(outputs: &dyn Outputs) -> Self {
+        let ours = outputs.our_output();
+        let active: Vec<_> = outputs.list().into_iter().filter(|o| Some(&o.id) != ours.as_ref())
+            .map(|o| crate::engine::place::OutputWorld { id: o.id, kind: o.kind, name: o.name }).collect();
+        let default: Vec<_> = outputs.default_output().into_iter().collect();
+        let pc = crate::engine::place::outputs::pc_own_output(&default, &active);
+        let calls = outputs.calls_output().filter(|id| active.iter().any(|o| o.id == *id)).or_else(|| pc.clone());
+        Self { our_output: ours, calls, playback: pc, name: crate::model::view::device_name_not_running(crate::model::text::Lang::English) }
+    }
+
+    fn return_roles(&self, lookup: impl FnOnce() -> Option<PcOutputId>,
+        mut current: impl FnMut(Role) -> Option<PcOutputId>, mut set: impl FnMut(&PcOutputId, Role) -> Result<(), String>) {
+        let Some(ours) = self.our_output.clone().or_else(lookup) else { return };
+        for &role in ALL_ROLES {
+            let target = if role == Role::Communications { &self.calls } else { &self.playback };
+            let Some(target) = target else { continue };
+            if current(role).as_ref() != Some(&ours) { continue; }
+            let _ = set(target, role);
+            if current(role).as_ref() == Some(&ours) {
+                if let Some(pc) = &self.playback { let _ = set(pc, role); }
+            }
+        }
+    }
+}
+
 /// What happens to the sound if the app ends without quitting.
 pub trait Handback: Send + Sync {
     /// If the app dies, give Windows' output back to `output` (when this
     /// app's output is the default) and name this app's output `name`.
     /// Called again whenever either changes.
-    fn prepare(&self, output: Option<&PcOutputId>, name: &str);
+    fn prepare(&self, plan: &HandbackPlan);
+    /// Return each role that still belongs to the app to its prepared output.
+    fn hand_back_now(&self);
 }
 
 /// Something Windows tells the app.
@@ -250,6 +299,7 @@ pub trait SystemEvents: Send + Sync {
 #[derive(Clone)]
 pub struct Platform {
     pub outputs: Arc<dyn Outputs>,
+    pub hotkeys: Arc<dyn Hotkeys>,
     pub sessions: Arc<dyn AudioSessions>,
     pub device: Arc<dyn OurDevice>,
     pub handback: Arc<dyn Handback>,
@@ -287,6 +337,7 @@ impl Platform {
         let p = Arc::new(Passive);
         Platform {
             outputs: p.clone(),
+            hotkeys: p.clone(),
             sessions: p.clone(),
             device: p.clone(),
             handback: p.clone(),
@@ -315,9 +366,7 @@ impl Platform {
 struct NoSwitch(Arc<dyn Outputs>);
 
 impl Outputs for NoSwitch {
-    fn default_output(&self) -> Option<PcOutputId> {
-        self.0.default_output()
-    }
+    fn default_for(&self, role: Role) -> Option<PcOutputId> { self.0.default_for(role) }
     fn our_output(&self) -> Option<PcOutputId> {
         self.0.our_output()
     }
@@ -341,9 +390,7 @@ impl Outputs for NoSwitch {
 struct Passive;
 
 impl Outputs for Passive {
-    fn default_output(&self) -> Option<PcOutputId> {
-        None
-    }
+    fn default_for(&self, _: Role) -> Option<PcOutputId> { None }
     fn our_output(&self) -> Option<PcOutputId> {
         None
     }
@@ -380,7 +427,8 @@ impl OurDevice for Passive {
 }
 
 impl Handback for Passive {
-    fn prepare(&self, _: Option<&PcOutputId>, _: &str) {}
+    fn prepare(&self, _: &HandbackPlan) {}
+    fn hand_back_now(&self) {}
 }
 
 impl SystemEvents for Passive {

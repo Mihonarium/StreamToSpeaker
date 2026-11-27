@@ -4,6 +4,7 @@ use std::sync::Arc;
 use egui::Ui;
 
 use crate::model::command::Open;
+use crate::model::situation::RoutingQuestion;
 use crate::model::Snapshot;
 use crate::shell::{Ask, ViewBar, ViewContent};
 use crate::ui::icon::Icon;
@@ -19,11 +20,37 @@ use crate::settings::{PageState, SettingsPort};
 pub struct SettingsView {
     port: Arc<dyn SettingsPort>,
     st: PageState,
+    recording: Option<Recording>,
+    rejected_keys: Option<RejectedKeys>,
+}
+
+enum RejectedKeys {
+    Shift,
+    Windows(String),
+    OtherShortcut(String),
+}
+
+enum Recording {
+    Remove,
+    Add { remove: Vec<String> },
 }
 
 impl SettingsView {
     pub fn new(port: Arc<dyn SettingsPort>) -> Self {
-        SettingsView { port, st: PageState::default() }
+        SettingsView { port, st: PageState::default(), recording: None, rejected_keys: None }
+    }
+
+    fn end_recording(&mut self) {
+        self.rejected_keys = None;
+        if self.recording.take().is_some() {
+            self.port.act(Act::RecordShortcuts(false));
+        }
+    }
+}
+
+impl Drop for SettingsView {
+    fn drop(&mut self) {
+        self.end_recording();
     }
 }
 
@@ -34,6 +61,10 @@ fn setting(ui: &mut Ui, label: &str, help: Option<String>, value: bool) -> Optio
 }
 
 impl ViewContent for SettingsView {
+    fn hidden(&mut self) {
+        self.end_recording();
+    }
+
     fn bar(&self, _snap: &Snapshot) -> ViewBar {
         ViewBar { title: w!(self.port.lang(), Settings), ..Default::default() }
     }
@@ -51,9 +82,15 @@ impl ViewContent for SettingsView {
             }
             gap(ui);
         }
+        if !g.shortcuts.as_ref().is_some_and(|k| k.on) || !ui.input(|i| i.focused) {
+            self.end_recording();
+        }
         if let Some(k) = &g.shortcuts {
-            if let Some(on) = setting(ui, &w!(lang, SetShortcutsSwitch), Some(w!(lang, SetKeysHelp)), k.on) { self.port.act(Act::Shortcuts(on)); }
-            if k.on { shortcuts(ui, lang, k, &mut self.st, self.port.as_ref()); }
+            if let Some(on) = setting(ui, &w!(lang, SetShortcutsSwitch), Some(w!(lang, SetKeysHelp)), k.on) {
+                self.port.act(Act::Shortcuts(on));
+                if !on { self.end_recording(); }
+            }
+            if k.on { self.shortcuts(ui, lang, k); }
             gap(ui);
         }
         if let Some(phone) = &p.phone {
@@ -70,7 +107,7 @@ impl ViewContent for SettingsView {
             }
             gap(ui);
         }
-        if let Some(on) = g.play_calls {
+        if let Some(on) = g.play_calls.filter(|_| g.what_plays != Some(WhatPlays::OnlySentApps)) {
             if let Some(on) = setting(ui, &w!(lang, SetPlayCalls), Some(w!(lang, SetCallsHelp)), on) { self.port.act(Act::PlayCalls(on)); }
             gap(ui);
         }
@@ -79,7 +116,25 @@ impl ViewContent for SettingsView {
             if let Some(on) = setting(ui, &w!(lang, SetOnlySomeApps), Some(w!(lang, SetSomeAppsHelp)), some) {
                 self.port.act(Act::WhatPlays(if on { WhatPlays::OnlySentApps } else { WhatPlays::Everything }));
             }
-            if some && page_button(&w!(lang, SetOpenSoundSettings)).show(ui).clicked() { ask(Ask::Open(Open::VolumeMixer)); }
+            if let Some(routing) = snap.scene.situation.confirm_under_routing.filter(|_| !some) {
+                if let crate::model::panel::About::Question(q) = &snap.panel.about {
+                    if routing == RoutingQuestion::TakePlayback {
+                        let theme = crate::ui::theme::Theme::of(ui.ctx());
+                        ui.label(crate::surface::grid::box_title(ui, &q.title, ui.available_width(), &theme));
+                    } else {
+                        sentence(ui, &q.title);
+                    }
+                    sentence(ui, &q.sentence);
+                    super::parts::buttons(ui, |ui| {
+                        for answer in [&q.yes, &q.no] {
+                            if page_button(&answer.label).show(ui).clicked() {
+                                ask(Ask::Command(answer.command.clone()));
+                            }
+                        }
+                    });
+                }
+            }
+            if some && page_button(&w!(lang, ChooseApps)).show(ui).clicked() { ask(Ask::Open(Open::VolumeMixer)); }
             gap(ui);
         }
         if let Some(start) = &g.start_at_sign_in {
@@ -124,8 +179,10 @@ impl ViewContent for SettingsView {
             if page_link(&w!(lang, SetReportProblem)).show(ui).clicked() { super::open_dialog(&self.port, Dialog::Report(ReportDialog::default()), ask); }
             if page_link(&w!(lang, SetNavAbout)).show(ui).clicked() { ask(Ask::View(Box::new(AboutView::new(self.port.clone())))); }
         });
-        let label = if snap.scene.situation.place_speaker().is_some() { w!(lang, QuitAndPlayOnPc) } else { w!(lang, Quit) };
+        let some = g.what_plays.map_or(snap.scene.situation.only_some_apps, |mode| mode == WhatPlays::OnlySentApps);
+        let label = if snap.scene.situation.place_speaker().is_some() && !some { w!(lang, QuitAndPlayOnPc) } else { w!(lang, Quit) };
         if page_button(&label).show(ui).clicked() { ask(Ask::Command(crate::model::Command::Quit)); }
+        if some { crate::settings::widgets::note(ui, &w!(lang, SetQuitChosenApps)); }
     }
 }
 
@@ -145,56 +202,129 @@ pub(super) fn refused(ui: &mut Ui, port: &dyn SettingsPort, r: &Refused) {
     }
 }
 
-/// The delay shortcuts while they are on: each combination and whether
-/// it is free, and *Change…*.
-fn shortcuts(ui: &mut Ui, lang: crate::model::text::Lang, k: &Shortcuts, st: &mut PageState, port: &dyn SettingsPort) {
-    let lines =
-        [(w!(lang, SetShortcutRemove, ms = 25u32), k.remove.join("+"), k.taken[0]), (w!(lang, SetShortcutAdd, ms = 25u32), k.add.join("+"), k.taken[1])];
-    for (i, (what, keys, taken)) in lines.iter().enumerate() {
-        if st.recording == Some(i) {
-            sentence(ui, &w!(lang, SetPressKeysFor, what = what));
-            record(ui, st, port, i);
-            continue;
+impl SettingsView {
+    fn shortcuts(&mut self, ui: &mut Ui, lang: crate::model::text::Lang, k: &Shortcuts) {
+        if self.recording.is_some() { self.record(ui); }
+        let remove = match &self.recording {
+            Some(Recording::Add { remove }) => remove,
+            _ => &k.remove,
+        };
+        let lines =
+            [(w!(lang, SetShortcutRemove, ms = 25u32), words::shortcut_name(remove), k.status[0]), (w!(lang, SetShortcutAdd, ms = 25u32), words::shortcut_name(&k.add), k.status[1])];
+        let failure = |status| match status {
+            crate::platform::KeyStatus::Registered => None,
+            crate::platform::KeyStatus::Taken => Some(w!(lang, SetShortcutTaken)),
+            crate::platform::KeyStatus::Rejected => Some(w!(lang, SetShortcutRejected)),
+        };
+        let recording = self.recording.as_ref().map(|r| usize::from(matches!(r, Recording::Add { .. })));
+        for (i, (what, keys, status)) in lines.iter().enumerate() {
+            if recording == Some(i) {
+                let prompt = match &self.rejected_keys {
+                    Some(RejectedKeys::Shift) => w!(lang, SetShiftKeptForLargeStep, what = what),
+                    Some(RejectedKeys::Windows(keys)) => w!(lang, SetPressOtherKeysFor, keys = keys, what = what),
+                    Some(RejectedKeys::OtherShortcut(keys)) => w!(lang, SetKeysAlreadyFor, keys = keys, other = &lines[1 - i].0, what = what),
+                    None => w!(lang, SetPressKeysFor, what = what),
+                };
+                sentence(ui, &prompt);
+                continue;
+            }
+            let line = w!(lang, SetShortcutLine, what = what, keys = keys);
+            if i == 0 && recording == Some(1) {
+                sentence(ui, &line);
+            } else if let Some(message) = failure(*status) {
+                marked(ui, Mark::Warning, Tone::Amber, &format!("{line}. {message}"), &[]);
+            } else {
+                marked(ui, Mark::Done, Tone::Secondary, &line, &[]);
+            }
         }
-        let line = w!(lang, SetShortcutLine, what = what, keys = keys);
-        if *taken {
-            marked(ui, Mark::Warning, Tone::Amber, &format!("{line} {}", w!(lang, SetShortcutTaken)), &[]);
+        let large = w!(lang, SetHoldForLarge, key = &k.larger, ms = 100u32);
+        if let Some(message) = failure(k.status[2]) {
+            marked(ui, Mark::Warning, Tone::Amber, &format!("{large} {message}"), &[]);
         } else {
-            marked(ui, Mark::Done, Tone::Secondary, &line, &[]);
+            sentence(ui, &large);
+        }
+        if page_button(&w!(lang, SetChangeKeys)).show(ui).clicked() {
+            self.start_recording();
         }
     }
-    sentence(ui, &w!(lang, SetHoldForLarge, key = &k.larger, ms = 100u32));
-    if page_button(&w!(lang, SetChangeKeys)).show(ui).clicked() {
-        st.recording = Some(0);
-    }
-}
 
-/// While recording: the next key pressed with Ctrl or Alt is the new
-/// combination; Esc stops recording.
-fn record(ui: &mut Ui, st: &mut PageState, port: &dyn SettingsPort, i: usize) {
-    let pressed = ui.input(|inp| {
-        inp.events.iter().find_map(|e| match e {
-            egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
-            _ => None,
-        })
-    });
-    if let Some((key, m)) = pressed {
+    fn record(&mut self, ui: &mut Ui) {
+        let mut presses = Vec::new();
+        ui.input_mut(|input| input.events.retain(|event| {
+            if let egui::Event::Key { key, pressed: true, repeat, modifiers, .. } = event {
+                if *key == egui::Key::Escape || modifiers.ctrl || modifiers.alt || modifiers.shift {
+                    if !repeat { presses.push((*key, *modifiers)); }
+                    return false;
+                }
+            }
+            true
+        }));
+        for (key, modifiers) in presses {
+            if self.recording.is_none() { break; }
+            self.record_press(key, modifiers);
+        }
+    }
+
+    pub(super) fn start_recording(&mut self) {
+        self.port.act(Act::RecordShortcuts(true));
+        self.rejected_keys = None;
+        self.recording = Some(Recording::Remove);
+    }
+
+    pub(super) fn record_press(&mut self, key: egui::Key, m: egui::Modifiers) {
         if key == egui::Key::Escape {
-            st.recording = None;
-        } else if m.ctrl || m.alt {
-            let mut keys = Vec::new();
-            if m.ctrl {
-                keys.push("Ctrl".to_string());
+            self.end_recording();
+            return;
+        }
+        if m.shift {
+            self.rejected_keys = Some(RejectedKeys::Shift);
+            return;
+        }
+        let mut keys = Vec::new();
+        if m.ctrl {
+            keys.push("Ctrl".to_string());
+        }
+        if m.alt {
+            keys.push("Alt".to_string());
+        }
+        if self.port.windows_key_down() {
+            keys.push("Win".to_string());
+        }
+        let name = match key {
+            egui::Key::ArrowLeft => "Left",
+            egui::Key::ArrowRight => "Right",
+            egui::Key::ArrowDown => "Down",
+            egui::Key::ArrowUp => "Up",
+            egui::Key::PageDown => "Page Down",
+            egui::Key::PageUp => "Page Up",
+            egui::Key::Backtick => "`",
+            egui::Key::Minus => "-",
+            egui::Key::Quote => "'",
+            egui::Key::Copy | egui::Key::Cut | egui::Key::Paste => return,
+            _ => key.symbol_or_name(),
+        };
+        keys.push(name.to_string());
+        let candidate = match &self.recording {
+            Some(Recording::Remove) => [keys.clone(), Vec::new()],
+            Some(Recording::Add { remove }) => [remove.clone(), keys.clone()],
+            None => return,
+        };
+        if candidate[0] == candidate[1] {
+            self.rejected_keys = Some(RejectedKeys::OtherShortcut(words::shortcut_name(&keys)));
+            return;
+        }
+        if !self.port.accepts_shortcuts(&crate::platform::DelayKeys(candidate)) {
+            self.rejected_keys = Some(RejectedKeys::Windows(words::shortcut_name(&keys)));
+            return;
+        }
+        self.rejected_keys = None;
+        match &mut self.recording {
+            Some(Recording::Remove) => self.recording = Some(Recording::Add { remove: keys }),
+            Some(Recording::Add { remove }) => {
+                self.port.act(Act::ShortcutKeys(crate::platform::DelayKeys([std::mem::take(remove), keys])));
+                self.end_recording();
             }
-            if m.alt {
-                keys.push("Alt".to_string());
-            }
-            if m.shift {
-                keys.push("Shift".to_string());
-            }
-            keys.push(key.symbol_or_name().to_string());
-            port.act(Act::ShortcutKeys(i, keys));
-            st.recording = if i == 0 { Some(1) } else { None };
+            None => {}
         }
     }
 }

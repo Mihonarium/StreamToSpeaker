@@ -70,13 +70,81 @@ impl AudioPacket {
     }
 }
 
+/// Which PC outputs can play captured samples without feeding them back into capture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalPlayback {
+    Any,
+    Except(crate::model::PcOutputId),
+    /// Capture follows Windows’ default because the app’s output is absent.
+    WindowsDefault,
+    /// The output opened by name could not be identified for local playback.
+    None,
+}
+
+impl LocalPlayback {
+    pub(crate) fn allows(&self, output: &crate::model::PcOutputId) -> bool {
+        match self { Self::Any => true, Self::Except(id) => id != output, Self::WindowsDefault | Self::None => false }
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn for_named_output(outputs: &dyn crate::platform::Outputs, name: &str) -> Self {
+        let ours = outputs.our_output();
+        let listed = outputs.list();
+        let mut matches = listed.iter().filter(|o| {
+            if Some(&o.id) == ours.as_ref() {
+                outputs.current_friendly(&o.id).as_deref() == Some(name)
+            } else { o.friendly == name }
+        });
+        match (matches.next(), matches.next()) {
+            (Some(o), None) => Self::Except(o.id.clone()),
+            _ => Self::None,
+        }
+    }
+}
+
 /// Source of PCM packets. `recv_packet` blocks until a packet is available
 /// or returns an error (e.g. driver handle closed, shutdown requested).
 pub trait AudioSource: Send {
     fn recv_packet(&mut self) -> Result<AudioPacket>;
 
+    /// The endpoint this source follows changed while it was open.
+    fn needs_reopen(&self) -> bool { false }
+
+    fn local_playback(&self) -> LocalPlayback { LocalPlayback::Any }
+
     /// Optional human-readable name for logs.
     fn name(&self) -> &str {
         "audio-source"
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(crate) struct LoopbackEndpoint {
+    outputs: std::sync::Arc<dyn crate::platform::Outputs>,
+    ours: Option<crate::model::state::PcOutputId>,
+    default: Option<crate::model::state::PcOutputId>,
+}
+
+#[cfg(any(windows, test))]
+impl LoopbackEndpoint {
+    pub(crate) fn new(outputs: std::sync::Arc<dyn crate::platform::Outputs>) -> Self {
+        let ours = outputs.our_output();
+        let default = if ours.is_none() { outputs.default_output() } else { None };
+        Self { outputs, ours, default }
+    }
+
+    /// The exact name to open. With no app output, open Windows' default.
+    pub(crate) fn name(&self) -> Result<Option<String>> {
+        self.ours.as_ref().map(|id| self.outputs.current_friendly(id)
+            .ok_or_else(|| anyhow::anyhow!("Stream To Speaker’s sound output is unavailable"))).transpose()
+    }
+
+    pub(crate) fn local_playback(&self) -> LocalPlayback {
+        if self.ours.is_some() { LocalPlayback::Any } else { LocalPlayback::WindowsDefault }
+    }
+
+    pub(crate) fn changed(&self) -> bool {
+        self.outputs.our_output() != self.ours
+            || (self.ours.is_none() && self.outputs.default_output() != self.default)
     }
 }

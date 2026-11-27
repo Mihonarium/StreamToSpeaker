@@ -237,6 +237,8 @@ pub trait ViewContent {
     /// The bar's words.
     fn bar(&self, snap: &Snapshot) -> ViewBar;
     fn has_back(&self) -> bool { true }
+    /// The page is covered by another page or its window is closed.
+    fn hidden(&mut self) {}
 
     /// The bar's button was pressed.
     fn bar_button(&mut self, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) {

@@ -664,6 +664,22 @@ fn the_app_asks_a_speaker_that_couldnt_play_for_thirty_minutes() {
 fn a_short_sound_is_played_on_this_pc() {
     run(&[
         Row {
+            name: "a short sound from a chosen app replays on the PC",
+            given: rested,
+            when: |r| {
+                r.w.settings.only_some_apps = true;
+                r.sources.push(Source { app: AppKey::new("Mail"), player: None, output: Some(OutputRef::Ours) });
+                r.wait(1_000);
+                r.silence("Mail");
+                r.wait(2_000);
+            },
+            then: |r, dos| {
+                assert!(!connects(dos, Purpose::SoundStarted));
+                assert!(dos.contains(&Do::ReplayShort { on: out("speakers"), ms: 2_500 }));
+                assert_eq!(r.sit().spot, Spot::Speaker(id(K)));
+            },
+        },
+        Row {
             name: "a sound that ends within 3 seconds doesn't connect the resting speaker",
             given: rested,
             when: |r| {
@@ -805,4 +821,22 @@ fn the_option_switches_back_after_thirty_minutes() {
             },
         },
     ]);
+}
+
+#[test]
+fn upnp_playing_ends_the_pause_reported_by_the_speaker() {
+    let mut r = Rig::playing_on_kitchen();
+    r.sound(GAME);
+    r.wait(4_000);
+    let transport = |state: &str| crate::engine::signals::upnp_transport(
+        &crate::gena::TransportChange { state: Some(state.into()), uri: None, title: None }, "http://pc/"
+    ).unwrap();
+    r.speaker(K, transport("PAUSED_PLAYBACK"));
+    r.speaker(K, SpeakerSignal::Responding);
+    r.speaker(OFFICE, transport("PLAYING"));
+    let paused = Standing::PausedAtSpeaker { speaker: id(K) };
+    assert!(r.sit().standing.contains(&paused));
+    r.speaker(K, transport("PLAYING"));
+    assert!(!r.sit().standing.contains(&paused));
+    assert_eq!(r.sit().doing, Doing::Playing);
 }

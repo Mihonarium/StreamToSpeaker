@@ -5,7 +5,7 @@ use super::facts::OutputKind;
 use super::panel::{switch, Act, Mark, NoteView, QuestionView};
 use super::scene::{RepairNow, Scene};
 use super::situation::{
-    Ahead, Away, Cause, Confirm, ConnKind, Note, NoteButton, PickWhy, Standing,
+    Ahead, Away, Cause, Confirm, ConnKind, Note, NoteButton, PickWhy, RoutingQuestion, Standing,
 };
 use super::state::{Place, Secret, SpeakerId};
 use super::text::{t, Lang};
@@ -35,7 +35,9 @@ pub(crate) fn didnt_get_ready(
     why: PickWhy,
 ) -> (String, String) {
     let title = failure_title(scene.lang, &scene.speaker_name(speaker), why);
-    (title, t!(scene.lang, SoundStillOn, place = &scene.place_name()))
+    let sentence = if scene.situation.only_some_apps { t!(scene.lang, ChosenAppsOn, place = &scene.place_name()) }
+        else { t!(scene.lang, SoundStillOn, place = &scene.place_name()) };
+    (title, sentence)
 }
 
 fn failure_title(lang: Lang, name: &str, why: PickWhy) -> String {
@@ -80,6 +82,8 @@ fn words(scene: &Scene, n: &Note, name: &str) -> (String, String) {
         return (
             ahead_title(lang, name, &n.cause),
             match ahead {
+                Ahead::InAFewSeconds if scene.situation.only_some_apps => t!(lang, ChosenAppsMoveSoon),
+                Ahead::WhenSoundStarts if scene.situation.only_some_apps => t!(lang, ChosenAppsWhenStarting),
                 Ahead::InAFewSeconds => t!(lang, MoveInSeconds),
                 Ahead::WhenSoundStarts => t!(lang, MoveWhenSoundStarts),
             },
@@ -88,7 +92,8 @@ fn words(scene: &Scene, n: &Note, name: &str) -> (String, String) {
     let available = || {
         (
             t!(lang, AvailableAgain, speaker = name),
-            t!(lang, StaysUntilSwitch),
+            if scene.situation.only_some_apps { t!(lang, ChosenAppsOn, place = &scene.place_name()) }
+            else { t!(lang, StaysUntilSwitch) },
         )
     };
     if n.available_again {
@@ -97,7 +102,8 @@ fn words(scene: &Scene, n: &Note, name: &str) -> (String, String) {
     let when =
         n.at.map(|time| t!(lang, AtTime, time = &lang.time(time)))
             .unwrap_or_default();
-    let moved = || t!(lang, MovedToPc, when = &when);
+    let moved = || if scene.situation.only_some_apps { t!(lang, ChosenAppsMoved, when = &when) }
+        else { t!(lang, MovedToPc, when = &when) };
     match &n.cause {
         Cause::StoppedResponding { vpn, .. } => {
             let sentence = match vpn {
@@ -133,7 +139,7 @@ fn words(scene: &Scene, n: &Note, name: &str) -> (String, String) {
         Cause::OtherNetwork { .. } => available(),
         Cause::Removed { .. } => (
             t!(lang, YouRemoved, speaker = name),
-            t!(lang, MovedToPc, when = ""),
+            if scene.situation.only_some_apps { t!(lang, ChosenAppsMoved, when = "") } else { t!(lang, MovedToPc, when = "") },
         ),
         Cause::PlayingAtStart { .. } => (t!(lang, SoundStayedHere), t!(lang, PlayingAtStartup)),
         Cause::HeadphonesGone { name, .. } => (
@@ -349,7 +355,11 @@ pub fn question(scene: &Scene, confirm: &Confirm) -> QuestionView {
         Confirm::ScreenReader { .. } => (
             t!(lang, ReaderWouldPlay, speaker = &name),
             t!(lang, ReaderWouldPlayLine),
-            switch(),
+            if scene.situation.confirm_under_routing == Some(RoutingQuestion::TakePlayback) {
+                t!(lang, PlayPcSoundOnSpeaker, speaker = &name)
+            } else {
+                switch()
+            },
         ),
     };
     QuestionView {

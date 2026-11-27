@@ -356,7 +356,7 @@ fn state_line(scene: &Scene) -> StateLine {
             return StateLine {
                 sign: Sign::Still,
                 text: t!(lang, OnlyChosenApps),
-                link: Some(Act::open(t!(lang, ChooseApps), Open::SoundSettings)),
+                link: Some(Act::open(t!(lang, ChooseApps), Open::VolumeMixer)),
             };
         }
     }
@@ -647,12 +647,12 @@ fn about(scene: &Scene, list: &ListPart) -> About {
         }
         let speaker = scene.speaker_name(&p.speaker);
         return About::Line {
-            text: t!(
+            text: if sit.only_some_apps { t!(lang, ConnectingToSpeaker, speaker = &speaker) } else { t!(
                 lang,
                 ConnectingFromPlace,
                 speaker = &speaker,
                 place = &scene.place_name()
-            ),
+            ) },
             link: p.can_cancel.then(|| cancel_connecting(lang, &speaker)),
         };
     }
@@ -669,7 +669,7 @@ fn about(scene: &Scene, list: &ListPart) -> About {
         .any(|row| row.command.is_some())
     {
         About::Line {
-            text: t!(lang, ClickSpeaker),
+            text: if sit.only_some_apps { t!(lang, ClickSpeakerApps) } else { t!(lang, ClickSpeaker) },
             link: None,
         }
     } else {

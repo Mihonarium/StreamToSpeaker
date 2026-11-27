@@ -35,6 +35,14 @@ impl Windows {
         self.flyout = None;
         self.main.get_or_insert_with(create)
     }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn close(&mut self, memory: &mut super::views::ViewMemory<OpenView>, now: f64, first_run: bool) -> bool {
+        let Some(mut window) = self.main.take() else { return false };
+        if let Some((page, _)) = window.pages.last_mut() { page.hidden(); }
+        if first_run { memory.forget(); } else { memory.closed(window.pages, now); }
+        true
+    }
 }
 
 pub fn tray_opens_window(tray: bool, first_run: Option<&FirstRunStep>) -> bool {
@@ -99,6 +107,7 @@ impl MainWindow {
     }
 
     pub fn page(&mut self, view: Box<dyn ViewContent>, push: bool) {
+        if let Some((current, _)) = self.pages.last_mut() { current.hidden(); }
         if !push {
             self.pages.clear();
         }

@@ -57,6 +57,7 @@ pub fn scene() -> Scene {
         lang: Lang::English,
         start_at_sign_in: true,
         situation: Situation {
+            only_some_apps: false,
             spot: Spot::Speaker(kitchen()),
             pc_output: Some(output.id.clone()),
             away: None,
@@ -74,6 +75,7 @@ pub fn scene() -> Scene {
                 is_place: true,
             }],
             confirm_in_panel: None,
+            confirm_under_routing: None,
             popups: Popups::default(),
             first_run: None,
         },
@@ -219,6 +221,9 @@ fn on_speaker(s: &mut Scene, id: SpeakerId) {
 
 /// Build one example. An unknown name is a programming error.
 pub fn named(name: &str) -> Scene {
+    if name.starts_with("apps-") {
+        return apps(name);
+    }
     let mut s = home();
     let k = kitchen();
     if name.starts_with("pc-") {
@@ -371,6 +376,7 @@ pub fn named(name: &str) -> Scene {
             output: s.outputs[0].id.clone(),
         }),
         "kitchen-only-chosen-apps" => {
+            s.situation.only_some_apps = true;
             s.situation.doing = Doing::NothingPlaying;
             s.situation
                 .standing
@@ -484,8 +490,53 @@ pub fn named(name: &str) -> Scene {
     s
 }
 
+fn apps(name: &str) -> Scene {
+    let mut s = match name {
+        "apps-first-pick" => named("pc-welcome-pick"),
+        "apps-first-hear" => named("pc-welcome-chime"),
+        "apps-first-done" => named("kitchen-welcome-done"),
+        "apps-first-pick-no-chime" | "apps-first-switch-no-chime" | "apps-first-done-no-chime" => {
+            let mut s = pc();
+            let desk = id("desk");
+            s.speakers[0] = seen(desk.clone(), "Desk");
+            s.speakers[0].kind = SpeakerKind::Sendspin;
+            s.situation.speakers[0].id = desk.clone();
+            s.situation.speakers[0].can_chime = false;
+            s.situation.first_run = Some(match name {
+                "apps-first-pick-no-chime" => FirstRunStep::One,
+                "apps-first-switch-no-chime" => FirstRunStep::Two { speaker: desk, level: None, limit: 100 },
+                _ => {
+                    on_speaker(&mut s, desk.clone());
+                    FirstRunStep::Three { speaker: desk }
+                }
+            });
+            s
+        }
+        "apps-panel-playing" => home(),
+        "apps-move-soon" => named("kitchen-not-responding-trying"),
+        "apps-when-starting" => named("kitchen-away"),
+        "apps-moved" => named("pc-kitchen-stopped-responding"),
+        "apps-connecting" => named("pc-connecting-to-kitchen"),
+        _ => panic!("unknown apps sample {name}"),
+    };
+    s.situation.only_some_apps = true;
+    if s.situation.place_speaker().is_some() {
+        s.situation.standing.push(Standing::OnlySomeApps {
+            none_playing: s.situation.doing == Doing::NothingPlaying,
+        });
+    }
+    s
+}
+
 // Preview scenes need literal names and non-capturing draw functions.
 macro_rules! with_sample_names {
+    (apps_first_run, $f:ident) => {
+        $f!("apps-first-pick", "apps-first-hear", "apps-first-done",
+            "apps-first-pick-no-chime", "apps-first-switch-no-chime", "apps-first-done-no-chime")
+    };
+    (apps_panel, $f:ident) => {
+        $f!("apps-panel-playing", "apps-move-soon", "apps-when-starting", "apps-moved", "apps-connecting")
+    };
     ($f:ident) => {
         $f!(
             "kitchen-playing",
@@ -547,5 +598,8 @@ pub fn all() -> Vec<Sample> {
     macro_rules! collect {
         ($($name:literal),* $(,)?) => { vec![$( Sample { name: $name, scene: named($name) } ),*] }
     }
-    with_sample_names!(collect)
+    let mut samples = with_sample_names!(collect);
+    samples.extend(with_sample_names!(apps_first_run, collect));
+    samples.extend(with_sample_names!(apps_panel, collect));
+    samples
 }

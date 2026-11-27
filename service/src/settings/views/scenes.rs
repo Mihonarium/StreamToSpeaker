@@ -45,6 +45,11 @@ pub fn scenes() -> Vec<Scene> {
         s("view-speaker-refused", 1380.0, speaker_kitchen),
         s("view-settings-update-ready", 1080.0, settings_update),
         s("view-settings-shortcut-taken", 1080.0, settings_taken),
+        s("apps-settings", 0.0, apps_settings),
+        s("apps-settings-rejected-keys", 0.0, apps_rejected_keys),
+        s("apps-settings-shift", 0.0, apps_shift),
+        s("apps-speaker-delay-key", 0.0, apps_speaker_delay_key),
+        s("apps-settings-screen-reader", 0.0, apps_screen_reader),
         s("view-missing", 860.0, missing_start),
         s("view-missing-searching", 760.0, missing_searching),
         s("view-missing-found", 800.0, missing_found),
@@ -266,10 +271,62 @@ fn settings_taken(ui: &mut Ui, _: &mut Stage) {
         starting(s);
         if let Some(k) = &mut s.general.shortcuts {
             k.on = true;
-            k.taken = [false, true, false];
+            k.status = [crate::platform::KeyStatus::Registered, crate::platform::KeyStatus::Taken, crate::platform::KeyStatus::Registered];
         }
         s.about.updates.state = UpdateState::UpToDate { at: Seen::Today(LocalTime::new(9, 12)) };
     });
+}
+
+fn apps_settings(ui: &mut Ui, _: &mut Stage) {
+    let mut view = SettingsView::new(port(Names::Usual, |s| {
+        starting(s);
+        s.general.what_plays = Some(WhatPlays::OnlySentApps);
+        s.general.play_calls = Some(true);
+        let keys = s.general.shortcuts.as_mut().unwrap();
+        keys.on = true;
+        keys.status = [crate::platform::KeyStatus::Registered, crate::platform::KeyStatus::Taken, crate::platform::KeyStatus::Registered];
+        s.about.updates.state = UpdateState::UpToDate { at: Seen::Today(LocalTime::new(9, 12)) };
+    }));
+    frame(ui, "apps-settings", &mut view, &snap("apps-panel-playing"));
+}
+
+fn apps_rejected_keys(ui: &mut Ui, _: &mut Stage) {
+    let mut view = SettingsView::new(port(Names::Usual, |s| {
+        starting(s);
+        s.general.what_plays = Some(WhatPlays::OnlySentApps);
+        s.general.shortcuts.as_mut().unwrap().on = true;
+    }));
+    view.start_recording();
+    for _ in 0..2 { view.record_press(egui::Key::Minus, egui::Modifiers::CTRL); }
+    frame(ui, "apps-settings-rejected-keys", &mut view, &snap("apps-panel-playing"));
+}
+
+fn apps_shift(ui: &mut Ui, _: &mut Stage) {
+    let mut view = SettingsView::new(port(Names::Usual, |s| {
+        starting(s);
+        s.general.what_plays = Some(WhatPlays::OnlySentApps);
+        s.general.shortcuts.as_mut().unwrap().on = true;
+    }));
+    view.start_recording();
+    view.record_press(egui::Key::F9, egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
+    frame(ui, "apps-settings-shift", &mut view, &snap("apps-panel-playing"));
+}
+
+fn apps_speaker_delay_key(ui: &mut Ui, _: &mut Stage) {
+    speaker_view(ui, "apps-speaker-delay-key", "apps-panel-playing", Names::Usual, "kitchen", |s| {
+        s.general.shortcuts.as_mut().unwrap().status[1] = crate::platform::KeyStatus::Taken;
+    }, |v| v);
+}
+
+fn apps_screen_reader(ui: &mut Ui, _: &mut Stage) {
+    use crate::model::situation::{Confirm, WayChoice};
+    let mut view = SettingsView::new(port(Names::Usual, starting));
+    let mut scene = snap("kitchen-playing").scene.clone();
+    scene.situation.confirm_in_panel = Some(Confirm::ScreenReader {
+        speaker: crate::model::SpeakerId::new("kitchen"), way: WayChoice::Native,
+    });
+    scene.situation.confirm_under_routing = Some(crate::model::situation::RoutingQuestion::TakePlayback);
+    frame(ui, "apps-settings-screen-reader", &mut view, &crate::model::view::view(scene, None, false, 1));
 }
 
 fn missing_view(ui: &mut Ui, key: &str, f: impl FnOnce(&mut State), tune: impl FnOnce(MissingView) -> MissingView) {

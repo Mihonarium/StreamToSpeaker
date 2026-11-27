@@ -796,6 +796,7 @@ pub struct App {
     pub shutdown: Arc<AtomicBool>,
     /// Quit without waiting for the speaker (a second Ctrl+C).
     quit_now: AtomicBool,
+    quit_hook_finished: AtomicBool,
     /// Run once when quitting begins (see [`App::on_quit`]).
     on_quit: OnceLock<Box<dyn Fn(crate::model::Surface) + Send + Sync>>,
     /// Update-check state; see `update_check` and [`App::spawn_update_checker`].
@@ -819,6 +820,7 @@ pub struct App {
     /// because saves happen lazily from any thread (GUI click,
     /// auto-reconnect bg thread, ...).
     pub user_config: crate::user_config::SettingsCell,
+    pub(crate) delay_shortcuts: Mutex<std::sync::Weak<Mutex<crate::engine::place_driver::DelayShortcuts>>>,
     /// Whether settings saves reach `config.json` (shared with the settings).
     settings_health: crate::user_config::SaveHealth,
     /// What loading the settings found that the window says once, until
@@ -1390,6 +1392,7 @@ impl App {
             last_fault: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             quit_now: AtomicBool::new(false),
+            quit_hook_finished: AtomicBool::new(false),
             on_quit: OnceLock::new(),
             update: Mutex::new(UpdateState::default()),
             rescan_in_flight: Arc::new(AtomicBool::new(false)),
@@ -1401,6 +1404,7 @@ impl App {
             settings_retry_at: Mutex::new(None),
             settings_retrying: Arc::new(AtomicBool::new(false)),
             user_config: crate::user_config::SettingsCell::new(user_config),
+            delay_shortcuts: Mutex::default(),
             last_error: Mutex::new(None),
             connecting: Mutex::new(None),
             connect_detail: Mutex::new(None),
@@ -5140,6 +5144,20 @@ impl App {
             if let Some(hook) = self.on_quit.get() {
                 hook(from);
             }
+            self.quit_hook_finished.store(true, Ordering::Release);
+        }
+    }
+
+    /// Wait for shutdown, then give the quit hook time to return Windows’ outputs.
+    pub fn wait_for_headless_shutdown(&self, hook_timeout: Duration) {
+        while !self.is_shutting_down() {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let deadline = Instant::now() + hook_timeout;
+        while !self.quit_hook_finished.load(Ordering::Acquire) && !self.quitting_now() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() { break; }
+            std::thread::sleep(left.min(Duration::from_millis(20)));
         }
     }
 
@@ -7863,6 +7881,35 @@ mod tests {
         assert!(refused.contains("quitting"), "{refused}");
         // And it didn't turn streaming back on for a session to bind.
         assert!(!app.is_streaming_enabled());
+    }
+
+    #[test]
+    fn headless_shutdown_waits_for_the_hook_and_has_a_deadline() {
+        let app = test_app();
+        let (started, entered) = crossbeam_channel::bounded(1);
+        let (release, proceed) = crossbeam_channel::bounded(1);
+        app.on_quit(move || {
+            started.send(()).unwrap();
+            let _ = proceed.recv();
+        });
+        let quitting = app.clone();
+        let quit = std::thread::spawn(move || quitting.request_shutdown());
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = Instant::now();
+        let bound = Duration::from_millis(40);
+        app.wait_for_headless_shutdown(bound);
+        assert!(before.elapsed() >= bound);
+        let (done, finished) = crossbeam_channel::bounded(1);
+        let waiting = app.clone();
+        let headless = std::thread::spawn(move || {
+            waiting.wait_for_headless_shutdown(Duration::from_secs(4));
+            done.send(()).unwrap();
+        });
+        assert!(finished.recv_timeout(bound).is_err());
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        headless.join().unwrap();
+        quit.join().unwrap();
     }
 
     #[test]

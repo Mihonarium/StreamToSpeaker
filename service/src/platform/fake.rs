@@ -51,12 +51,17 @@ struct State {
     default: HashMap<Role, PcOutputId>,
     ours_present: bool,
     refuse_switch: bool,
+    refuse_role: Option<Role>,
+    occupied_keys: Vec<Vec<String>>,
+    registered_keys: Vec<(Vec<String>, super::DelayPress)>,
+    key_sink: Option<std::sync::Weak<dyn Fn(super::DelayPress) + Send + Sync>>,
     sessions: Vec<AppAudio>,
     switches: Vec<(PcOutputId, Vec<Role>)>,
     names: Vec<String>,
-    handback: Option<(Option<PcOutputId>, String)>,
+    handback: Option<super::HandbackPlan>,
     #[cfg(test)]
     preparations: usize,
+    handbacks: usize,
     players: Vec<Player>,
     /// Players that take a pause or a play without doing it.
     deaf: Vec<String>,
@@ -115,6 +120,7 @@ impl FakePlatform {
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             outputs: self.clone(),
+            hotkeys: self.clone(),
             sessions: self.clone(),
             device: self.clone(),
             handback: self.clone(),
@@ -144,9 +150,29 @@ impl FakePlatform {
         self.fire(SystemEvent::DefaultOutputChanged);
     }
 
+    /// Keys already registered by another program.
+    pub fn occupy_keys(&self, keys: Vec<String>) {
+        self.state.lock().unwrap().occupied_keys.push(keys);
+    }
+
+    /// Press a key combination in the foreground app.
+    pub fn press_keys(&self, keys: &[String]) -> bool {
+        let st = self.state.lock().unwrap();
+        let Some(sink) = st.key_sink.as_ref().and_then(|s| s.upgrade()) else { return false };
+        let Some(press) = st.registered_keys.iter().find(|(chord, _)| chord == keys).map(|(_, p)| *p) else { return false };
+        drop(st);
+        sink(press);
+        true
+    }
+
     /// Windows refuses switches from now on (or takes them again).
     pub fn refuse_switches(&self, refuse: bool) {
         self.state.lock().unwrap().refuse_switch = refuse;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refuse_role(&self, role: Option<Role>) {
+        self.state.lock().unwrap().refuse_role = role;
     }
 
     /// This app's output disappears from Windows, or comes back.
@@ -272,7 +298,7 @@ impl FakePlatform {
     }
 
     /// What the app said to do if it dies.
-    pub fn handback(&self) -> Option<(Option<PcOutputId>, String)> {
+    pub fn handback(&self) -> Option<super::HandbackPlan> {
         self.state.lock().unwrap().handback.clone()
     }
 
@@ -282,16 +308,34 @@ impl FakePlatform {
         self.state.lock().unwrap().preparations
     }
 
+    pub fn handbacks(&self) -> usize { self.state.lock().unwrap().handbacks }
+
     /// An output's level.
     pub fn level_of(&self, output: &str) -> Option<(u8, bool)> {
         self.state.lock().unwrap().levels.get(&id(output)).copied()
     }
 }
 
-impl Outputs for FakePlatform {
-    fn default_output(&self) -> Option<PcOutputId> {
-        self.state.lock().unwrap().default.get(&Role::Console).cloned()
+impl super::Hotkeys for FakePlatform {
+    fn register(&self, keys: &super::DelayKeys, sink: super::KeySink) -> super::KeyRegistration {
+        let mut st = self.state.lock().unwrap();
+        st.registered_keys.clear();
+        st.key_sink = Some(Arc::downgrade(&sink));
+        let registered = super::DelayPress::ALL.map(|press| {
+            let chord = press.keys(keys);
+            if st.occupied_keys.contains(&chord) { return super::KeyStatus::Taken; }
+            if chord.is_empty() || st.registered_keys.iter().any(|(k, _)| *k == chord) {
+                return super::KeyStatus::Rejected;
+            }
+            st.registered_keys.push((chord, press));
+            super::KeyStatus::Registered
+        });
+        super::KeyRegistration::new(registered, sink)
     }
+}
+
+impl Outputs for FakePlatform {
+    fn default_for(&self, role: Role) -> Option<PcOutputId> { FakePlatform::default_for(self, role) }
 
     fn our_output(&self) -> Option<PcOutputId> {
         self.state.lock().unwrap().ours_present.then(|| id(OURS))
@@ -303,6 +347,14 @@ impl Outputs for FakePlatform {
             return None;
         }
         st.outputs.iter().find(|o| &o.id == output).cloned()
+    }
+
+    fn current_friendly(&self, id: &PcOutputId) -> Option<String> {
+        let info = self.describe(id)?;
+        if self.our_output().as_ref() == Some(id) {
+            if let Some(name) = self.state.lock().unwrap().names.last() { return Some(name.clone()); }
+        }
+        Some(info.friendly)
     }
 
     fn list(&self) -> Vec<OutputInfo> {
@@ -321,11 +373,12 @@ impl Outputs for FakePlatform {
             if st.refuse_switch {
                 return Ok(());
             }
-            if !st.outputs.iter().any(|o| &o.id == output) || (*output == id(OURS) && !st.ours_present) {
+            if st.off.contains(output) || !st.outputs.iter().any(|o| &o.id == output) || (*output == id(OURS) && !st.ours_present) {
                 return Err("no such output".into());
             }
             let mut changed = false;
             for r in roles {
+                if st.refuse_role == Some(*r) { continue; }
                 changed |= st.default.insert(*r, output.clone()).as_ref() != Some(output);
             }
             changed
@@ -365,12 +418,23 @@ impl OurDevice for FakePlatform {
 }
 
 impl Handback for FakePlatform {
-    fn prepare(&self, output: Option<&PcOutputId>, name: &str) {
+    fn hand_back_now(&self) {
+        let plan = {
+            let mut state = self.state.lock().unwrap();
+            state.handbacks += 1;
+            state.handback.clone()
+        };
+        if let Some(plan) = plan {
+            plan.return_roles(|| Some(id(OURS)), |role| self.default_for(role), |target, role| self.set_default(target, &[role]));
+        }
+    }
+
+    fn prepare(&self, plan: &super::HandbackPlan) {
         #[cfg(test)]
         {
             self.state.lock().unwrap().preparations += 1;
         }
-        self.state.lock().unwrap().handback = Some((output.cloned(), name.to_string()));
+        self.state.lock().unwrap().handback = Some(plan.clone());
     }
 }
 
@@ -462,6 +526,71 @@ impl Desk for FakePlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_opens_the_current_app_name_or_follows_the_default_without_passing_it_back() {
+        use crate::audio_source::{LocalPlayback, LoopbackEndpoint};
+        let fake = FakePlatform::new();
+        for name in ["Stream To Speaker", "Kitchen (Stream To Speaker)"] {
+            fake.rename(name).unwrap();
+            let opened = LoopbackEndpoint::new(fake.clone());
+            assert_eq!(opened.name().unwrap().as_deref(), Some(name));
+            assert_eq!(opened.local_playback(), LocalPlayback::Any);
+            assert_eq!(LocalPlayback::for_named_output(&*fake, name), LocalPlayback::Except(id(OURS)));
+            fake.choose_in_windows(HEADPHONES);
+            assert!(!opened.changed());
+        }
+        let app = LoopbackEndpoint::new(fake.clone());
+        fake.set_our_output_present(false);
+        assert!(app.changed());
+        let fallback = LoopbackEndpoint::new(fake.clone());
+        assert_eq!(fallback.name().unwrap(), None);
+        assert_eq!(fallback.local_playback(), LocalPlayback::WindowsDefault);
+        fake.choose_in_windows(SPEAKERS);
+        assert!(fallback.changed());
+        let fallback = LoopbackEndpoint::new(fake.clone());
+        fake.set_our_output_present(true);
+        assert!(fallback.changed());
+    }
+
+    #[test]
+    fn before_the_first_driver_plan_calls_can_return_to_an_active_pc_output() {
+        let windows = FakePlatform::new();
+        windows.choose_in_windows(OURS);
+        windows.set_default(&id(HEADPHONES), &[Role::Communications]).unwrap();
+        let plan = super::super::HandbackPlan::before_driver(&*windows);
+        assert_eq!(plan.our_output, Some(id(OURS)));
+        assert_eq!(plan.playback, Some(id(SPEAKERS)));
+        assert_eq!(plan.calls, Some(id(HEADPHONES)));
+    }
+
+    #[test]
+    fn handback_compares_each_role_with_the_live_id_before_using_the_lookup() {
+        let windows = FakePlatform::new();
+        let mut plan = super::super::HandbackPlan { our_output: Some(id(HEADPHONES)), playback: Some(id(SPEAKERS)),
+            calls: Some(id(SPEAKERS)), name: String::new() };
+        windows.choose_in_windows(OURS);
+        windows.set_default(&id(HEADPHONES), &[Role::Communications]).unwrap();
+        windows.prepare(&plan);
+        windows.hand_back_now();
+        assert_eq!(windows.calls_output(), Some(id(SPEAKERS)));
+        assert_eq!(windows.default_output(), Some(id(OURS)));
+        plan.our_output = None;
+        windows.prepare(&plan);
+        windows.hand_back_now();
+        assert_eq!(windows.default_output(), Some(id(SPEAKERS)));
+    }
+
+    #[test]
+    fn handback_retries_the_playback_target_after_a_silent_refusal() {
+        let windows = FakePlatform::new();
+        windows.set_default(&id(OURS), &[Role::Communications]).unwrap();
+        windows.prepare(&super::super::HandbackPlan { our_output: Some(id(OURS)), playback: Some(id(SPEAKERS)),
+            calls: Some(id(HEADPHONES)), name: String::new() });
+        windows.refuse_switches(true);
+        windows.hand_back_now();
+        assert_eq!(windows.switches(), [OURS, HEADPHONES, SPEAKERS].map(|o| (id(o), vec![Role::Communications])));
+    }
 
     #[test]
     fn the_fake_switches_reads_back_and_refuses_when_told() {

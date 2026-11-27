@@ -43,8 +43,6 @@ pub(crate) struct PageState {
     pub open: HashSet<String>,
     /// Text being typed, by field, until it is kept.
     pub typing: HashMap<String, String>,
-    /// A shortcut whose keys are being recorded.
-    pub recording: Option<usize>,
     /// What was just copied, and when (the button says *Copied*).
     pub copied: Option<(String, f64)>,
     /// The pairing token is shown in clear.

@@ -19,6 +19,8 @@ pub enum SpeakerSignal {
     /// core asked for, while that connection is still getting ready: that
     /// is what tells a speaker that takes its time from one that is silent.
     Responding,
+    /// The speaker reports that it is playing this PC’s stream.
+    PlayingOurStream,
     /// A request to it failed, or the stream to it broke.
     NotResponding,
     /// It confirmed it stopped playing this PC's sound (or the request to
@@ -107,7 +109,7 @@ pub fn upnp_transport(change: &TransportChange, ours: &str) -> Option<SpeakerSig
         "PAUSED_PLAYBACK" if !someone_else => Some(SpeakerSignal::PausedAtSpeaker),
         "STOPPED" | "NO_MEDIA_PRESENT" if !someone_else => Some(SpeakerSignal::StoppedAtSpeaker),
         "PLAYING" | "TRANSITIONING" if someone_else => Some(SpeakerSignal::PlayingElse { who: who() }),
-        "PLAYING" => Some(SpeakerSignal::Responding),
+        "PLAYING" => Some(SpeakerSignal::PlayingOurStream),
         // Paused or stopped on another source: someone else's, not
         // playing; nothing to say about this PC's stream.
         "PAUSED_PLAYBACK" | "STOPPED" | "NO_MEDIA_PRESENT" => Some(SpeakerSignal::Free),
@@ -190,8 +192,8 @@ mod tests {
         assert_eq!(read(Some("PAUSED_PLAYBACK"), None, None), Some(SpeakerSignal::PausedAtSpeaker));
         assert_eq!(read(Some("STOPPED"), ours, None), Some(SpeakerSignal::StoppedAtSpeaker));
         assert_eq!(read(Some("NO_MEDIA_PRESENT"), None, None), Some(SpeakerSignal::StoppedAtSpeaker));
-        assert_eq!(read(Some("PLAYING"), ours, None), Some(SpeakerSignal::Responding));
-        assert_eq!(read(Some("playing"), None, None), Some(SpeakerSignal::Responding));
+        assert_eq!(read(Some("PLAYING"), ours, None), Some(SpeakerSignal::PlayingOurStream));
+        assert_eq!(read(Some("playing"), None, None), Some(SpeakerSignal::PlayingOurStream));
         let spotify = Some("x-sonos-spotify:spotify%3atrack%3a1");
         assert_eq!(read(Some("PLAYING"), spotify, None), Some(SpeakerSignal::PlayingElse { who: None }));
         assert_eq!(read(Some("TRANSITIONING"), spotify, None), Some(SpeakerSignal::PlayingElse { who: None }));

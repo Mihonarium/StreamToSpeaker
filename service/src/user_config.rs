@@ -42,6 +42,17 @@ pub struct UserConfig {
     pub switch_back_after_quiet: bool,
     #[serde(default = "default_true")]
     pub notes_by_clock: bool,
+    #[serde(default)]
+    pub only_some_apps: bool,
+    #[serde(default)]
+    pub play_calls: bool,
+    /// The endpoint to give calls back to after routing them to a speaker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls_back: Option<crate::model::state::PcOutputId>,
+    #[serde(default = "default_true")]
+    pub delay_shortcuts: bool,
+    #[serde(default)]
+    pub delay_keys: crate::platform::DelayKeys,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub show_lab: bool,
     /// The person chose This PC last: at the next start nothing goes back
@@ -1031,8 +1042,13 @@ const SETTING_LABELS: &[(&str, &str, bool)] = &[
     ("closed_for_update", "The speaker used last", false),
     ("sound_place", "Where this PC's sound plays", false),
     ("switch_back_after_quiet", "Switch back to this PC after 30 minutes with nothing playing", true),
+    ("only_some_apps", "Only send some apps to the speaker", true),
+    ("play_calls", "Play calls on the speaker too", true),
+    ("delay_shortcuts", "Keyboard shortcuts for the delay", true),
+    ("delay_keys", "Keyboard shortcuts for the delay", true),
     ("show_lab", "Show Lab", true),
     ("notes_by_clock", "Show notes by the clock about where the sound is playing", true),
+    ("calls_back", "The output calls return to", false),
     ("pc_output", "The output This PC plays on", false),
     ("window_height", "Window height", false),
     ("pc_outputs_open", "This PC's outputs shown in the panel", false),
@@ -2186,6 +2202,11 @@ mod tests {
         c.scripts_key = Some("112233445566778899aabbccddeeff00".into());
         c.switch_back_after_quiet = true;
         c.notes_by_clock = false;
+        c.only_some_apps = true;
+        c.play_calls = true;
+        c.calls_back = Some(crate::model::state::PcOutputId::new("call-headset"));
+        c.delay_shortcuts = false;
+        c.delay_keys.0 = ["F8", "F9"].map(|key| vec!["Alt".into(), "Ctrl".into(), key.into()]);
         c.pc_outputs_open = true;
         c.window_height = Some(512.0);
         c.ma_level = Some(60);

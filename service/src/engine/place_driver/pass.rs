@@ -139,7 +139,7 @@ fn pass_to(tap: &Tap, pass: &Arc<dyn PassThrough>, output: Option<&PcOutputId>) 
     tap.pass(None);
     if let Some(id) = output {
         match pass.open(id) {
-            Ok(()) => tap.pass(Some(pass.clone())),
+            Ok(()) => tap.pass(Some((id.clone(), pass.clone()))),
             Err(e) => {
                 pass.close();
                 debug!("couldn't play through this PC: {e}");

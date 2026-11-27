@@ -180,6 +180,13 @@ fn enabled_music_assistant_has_its_own_row() {
     r.send(Command::Switch { place: Place::MusicAssistant, way: None });
     r.settle();
     assert!(r.driver.scene().situation.speaker(&ma).unwrap().can_chime);
+    r.windows.app_plays("Music", OURS, Some(0.5));
+    r.driver.look();
+    assert_eq!(r.driver.situation().doing, Doing::Playing);
+    let keys = crate::platform::DelayKeys::default();
+    assert!(r.windows.press_keys(&keys.0[1]));
+    r.driver.input(r.rx.recv_timeout(WAIT).unwrap());
+    assert_eq!(r.app.delay_status_of(crate::sendspin_app::MA_OUTPUT_ID).change_ms, 0);
     r.send(Command::StayOnThisPc);
     r.settle();
     r.app.set_sendspin_source_enabled(false).unwrap();

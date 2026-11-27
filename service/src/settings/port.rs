@@ -23,6 +23,10 @@ pub trait SettingsPort: Send + Sync {
     /// One speaker's page; `None` once it is gone (forgotten or removed).
     fn speaker(&self, id: &str) -> Option<SpeakerView>;
     fn general(&self) -> GeneralView;
+    /// Try the recorded keys while the normal shortcuts are released.
+    fn accepts_shortcuts(&self, keys: &crate::platform::DelayKeys) -> bool;
+    /// The Windows key held while recording a shortcut.
+    fn windows_key_down(&self) -> bool { false }
     fn music_assistant(&self) -> MaView;
     fn privacy(&self) -> PrivacyView;
     fn about(&self) -> AboutView;
@@ -208,8 +212,8 @@ pub struct Shortcuts {
     pub add: Vec<String>,
     /// The modifier for 100 ms: `Shift`.
     pub larger: String,
-    /// Whether each registered: remove, add, larger.
-    pub taken: [bool; 3],
+    /// Registration results for remove, add and the larger steps.
+    pub status: [crate::platform::KeyStatus; 3],
 }
 
 // -------------------------------------------------------------------------
@@ -636,9 +640,8 @@ pub enum Act {
     NotesByClock(bool),
     ShowLab(bool),
     Shortcuts(bool),
-    /// Record a new combination for one shortcut (0 remove, 1 add, 2 the
-    /// larger step's key).
-    ShortcutKeys(usize, Vec<String>),
+    RecordShortcuts(bool),
+    ShortcutKeys(crate::platform::DelayKeys),
     Language(Option<String>),
     // Music Assistant
     OfferToMa(bool),

@@ -148,10 +148,9 @@ impl ViewContent for SpeakerOptions {
         } else {
             self.exact_delay = None;
         }
-        if let Some(k) = self.port.general().shortcuts {
-            let label = if k.on { w!(lang, SetDelayKeysOn, remove = &k.remove.join("+"), add = &k.add.join("+")) }
-                else { w!(lang, SetDelayKeysLink) };
-            if super::parts::wrapped_link(ui, &label).clicked() { ask(Ask::Open(Open::Settings)); }
+        let can_change_delay = matches!(&about, About::Delay(d) if d.rows.iter().any(|row| row.enabled));
+        if can_change_delay && self.port.general().shortcuts.is_some() {
+            if super::parts::wrapped_link(ui, &w!(lang, SetDelayKeysLink)).clicked() { ask(Ask::Open(Open::Settings)); }
         }
         if !self.playing(snap) { widgets::note(ui, &w!(lang, SetInactiveDelay, speaker = name)); }
         if let Some((bass, treble)) = v.tone {

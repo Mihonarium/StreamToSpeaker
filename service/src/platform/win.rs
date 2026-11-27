@@ -14,6 +14,8 @@
 #![cfg(windows)]
 
 mod desk;
+mod hotkeys;
+pub(crate) use hotkeys::windows_key_down;
 mod network;
 mod pass;
 mod players;
@@ -30,7 +32,7 @@ use windows::Win32::Devices::FunctionDiscovery::{
 };
 use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioMeterInformation};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
+    eCommunications, eConsole, eMultimedia, eRender, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
     IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE, PKEY_AudioEndpoint_FormFactor,
 };
 use windows::Win32::System::Com::{
@@ -58,9 +60,9 @@ pub(crate) fn platform() -> Platform {
             let mut p = Platform::passive();
             if let Some(shared) = Shared::start() {
                 crate::endpoint_name::platform_names_the_device();
-                install_crash_handback();
-                start_session_window();
                 let w = Arc::new(Windows(shared));
+                install_crash_handback(&*w);
+                start_session_window();
                 p.outputs = w.clone();
                 p.sessions = w.clone();
                 p.device = w.clone();
@@ -69,6 +71,7 @@ pub(crate) fn platform() -> Platform {
                 warn!("Windows' sound outputs can't be read here; the person chooses the output in Windows");
             }
             p.events = notices().clone();
+            p.hotkeys = Arc::new(hotkeys::WindowsKeys);
             p.players = players::players().clone();
             p.network = network::start();
             p.pass = Arc::new(pass::WindowsPass::new(p.outputs.clone()));
@@ -151,6 +154,8 @@ fn find_process(mut visit: impl FnMut(u32, &str) -> bool) -> bool {
 #[derive(Clone, Default)]
 struct Seen {
     default: Option<PcOutputId>,
+    multimedia: Option<PcOutputId>,
+    calls: Option<PcOutputId>,
     ours: Option<PcOutputId>,
     outputs: Vec<OutputInfo>,
     levels: HashMap<PcOutputId, (u8, bool)>,
@@ -159,6 +164,7 @@ struct Seen {
 }
 
 enum Job {
+    CaptureName(PcOutputId, Sender<Option<String>>),
     SetDefault(PcOutputId, Vec<Role>, Sender<Result<(), String>>),
     SetVolume(PcOutputId, u8, bool, Sender<Result<(), String>>),
 }
@@ -233,6 +239,15 @@ impl Worker {
                     self.look(shared);
                     let _ = reply.send(r);
                 }
+                Ok(Job::CaptureName(id, reply)) => {
+                    // SAFETY: this worker owns the enumerator and reads the live endpoint's property store.
+                    let name = unsafe {
+                        self.enumerator.GetDevice(&windows::core::HSTRING::from(id.as_str())).ok()
+                            .and_then(|device| device.OpenPropertyStore(STGM_READ).ok())
+                            .and_then(|store| text_of(&store, &PKEY_Device_FriendlyName))
+                    };
+                    let _ = reply.send(name);
+                }
                 Ok(Job::SetVolume(id, level, muted, reply)) => {
                     let r = self.set_volume(&id, level, muted);
                     self.look(shared);
@@ -254,6 +269,8 @@ impl Worker {
                 .GetDefaultAudioEndpoint(eRender, eConsole)
                 .ok()
                 .and_then(|d| device_id(&d));
+            seen.multimedia = self.enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia).ok().and_then(|d| device_id(&d));
+            seen.calls = self.enumerator.GetDefaultAudioEndpoint(eRender, eCommunications).ok().and_then(|d| device_id(&d));
             let active = self.active_ids();
             self.endpoints.retain(|id, _| active.iter().any(|(a, _)| a == id));
             for (id, device) in active {
@@ -297,7 +314,7 @@ impl Worker {
         let (default_changed, outputs_changed) = {
             let mut was = shared.seen.lock().unwrap();
             let ids = |s: &Seen| s.outputs.iter().map(|o| o.id.clone()).collect::<Vec<_>>();
-            let changes = (was.default != seen.default, ids(&was) != ids(&seen));
+            let changes = (was.default != seen.default || was.multimedia != seen.multimedia, ids(&was) != ids(&seen));
             let first = was.outputs.is_empty() && was.default.is_none();
             *was = seen;
             if first {
@@ -529,11 +546,21 @@ fn file_description(path: &str) -> Option<String> {
 struct Windows(Arc<Shared>);
 
 impl Outputs for Windows {
-    fn default_output(&self) -> Option<PcOutputId> {
-        self.0.seen.lock().unwrap().default.clone()
+    fn default_for(&self, role: Role) -> Option<PcOutputId> {
+        let seen = self.0.seen.lock().unwrap();
+        match role {
+            Role::Console => seen.default.clone(),
+            Role::Multimedia => seen.multimedia.clone(),
+            Role::Communications => seen.calls.clone(),
+        }
     }
     fn our_output(&self) -> Option<PcOutputId> {
         self.0.seen.lock().unwrap().ours.clone()
+    }
+    fn current_friendly(&self, id: &PcOutputId) -> Option<String> {
+        let (tx, rx) = bounded(1);
+        self.0.jobs.send(Job::CaptureName(id.clone(), tx)).ok()?;
+        rx.recv_timeout(WAIT_FOR_WORKER).ok().flatten()
     }
     fn describe(&self, id: &PcOutputId) -> Option<OutputInfo> {
         self.0.seen.lock().unwrap().outputs.iter().find(|o| &o.id == id).cloned()
@@ -578,48 +605,49 @@ static LAST_RENAME: Mutex<u64> = Mutex::new(0);
 
 /// Where the sound goes back to, and the device's name, if the app ends
 /// without quitting.
-static HANDBACK: Mutex<Option<(Option<String>, String)>> = Mutex::new(None);
+static HANDBACK: Mutex<Option<super::HandbackPlan>> = Mutex::new(None);
 
 impl Handback for Windows {
-    fn prepare(&self, output: Option<&PcOutputId>, name: &str) {
-        *HANDBACK.lock().unwrap() = Some((output.map(|o| o.0.to_string()), name.to_string()));
+    fn hand_back_now(&self) {
+        let plan = HANDBACK.lock().unwrap().clone();
+        if let Some(plan) = plan { return_roles(&plan); }
+    }
+    fn prepare(&self, plan: &super::HandbackPlan) {
+        *HANDBACK.lock().unwrap() = Some(plan.clone());
     }
 }
 
-/// Give Windows' output back and name the device, now, on this thread:
-/// when the app crashes and when Windows ends the session. Waits for no
-/// lock another thread may hold.
+/// Give each role back only if it still belongs to this app.
 fn hand_back_now() {
     let Ok(guard) = HANDBACK.try_lock() else { return };
-    let Some((output, name)) = guard.clone() else { return };
+    let Some(plan) = guard.clone() else { return };
     drop(guard);
-    if let Some(output) = output {
-        let ours = crate::endpoint_name::find_our_endpoint_id().ok().flatten();
-        // SAFETY: COM for this thread, balanced when it was this call that
-        // set it up; the enumerator and device are released on return.
-        let default = unsafe {
-            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-            let d = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .ok()
-                .and_then(|e| e.GetDefaultAudioEndpoint(eRender, eConsole).ok())
-                .and_then(|d| device_id(&d));
-            if hr.is_ok() {
-                windows::Win32::System::Com::CoUninitialize();
-            }
-            d
-        };
-        if ours.is_some() && default.as_ref().map(|d| d.0.to_string()) == ours {
-            let _ = set_default(&PcOutputId::new(&output), super::ALL_ROLES);
+    return_roles(&plan);
+    let _ = crate::endpoint_name::rename_endpoint_now(&plan.name);
+}
+
+fn return_roles(plan: &super::HandbackPlan) {
+    let lookup = || crate::endpoint_name::find_our_endpoint_id().ok().flatten().map(|id| PcOutputId::new(&id));
+    // SAFETY: the enumerator and devices stay on this thread and are dropped
+    // before a successful COM initialization is balanced.
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if let Ok(e) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+            plan.return_roles(lookup, |role| {
+                let role_id = windows::Win32::Media::Audio::ERole(role_number(role));
+                e.GetDefaultAudioEndpoint(eRender, role_id).ok().and_then(|d| device_id(&d))
+            }, |target, role| set_default(target, &[role]));
         }
+        if hr.is_ok() { windows::Win32::System::Com::CoUninitialize(); }
     }
-    let _ = crate::endpoint_name::rename_endpoint_now(&name);
 }
 
 /// Hand the sound back before the app's own panic hook runs (which logs
 /// and may show a dialog).
-fn install_crash_handback() {
+fn install_crash_handback(windows: &Windows) {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
+        windows.prepare(&super::HandbackPlan::before_driver(windows));
         let earlier = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             hand_back_now();

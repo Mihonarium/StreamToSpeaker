@@ -409,6 +409,107 @@ fn tone_name_and_speaker_commands() {
 }
 
 #[test]
+fn recording_the_delay_keys_uses_two_separate_presses() {
+    use crate::platform::DelayKeys;
+    let port = scripted(|_| ());
+    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Hold Shift with a shortcut to change the delay by 100 ms."));
+    h.click("Change…");
+    assert_eq!(h.acts(), [Act::RecordShortcuts(true)]);
+    let key = |key, repeat| Event::Key {
+        key, physical_key: None, pressed: true, repeat, modifiers: egui::Modifiers::CTRL,
+    };
+    h.run(vec![key(egui::Key::F9, false)]);
+    assert!(h.acts().is_empty());
+    h.key(egui::Key::Escape);
+    assert_eq!(h.acts(), [Act::RecordShortcuts(false)]);
+    assert!(h.asks().is_empty());
+    assert_eq!(h.port.general().shortcuts.unwrap().remove, DelayKeys::default().0[0]);
+    h.click("Change…");
+    assert_eq!(h.acts(), [Act::RecordShortcuts(true)]);
+    h.run(vec![key(egui::Key::ArrowDown, false)]);
+    h.run(vec![key(egui::Key::ArrowDown, true)]);
+    assert!(h.acts().is_empty());
+    h.run(vec![Event::Key { key: egui::Key::ArrowDown, physical_key: None, pressed: false,
+        repeat: false, modifiers: egui::Modifiers::CTRL }]);
+    h.run(vec![key(egui::Key::ArrowDown, false)]);
+    h.settle();
+    assert!(h.has("Ctrl+Down is already the shortcut for Remove 25 ms. Press other keys for Add 25 ms… (Esc stops)"));
+    assert!(h.acts().is_empty());
+    h.run(vec![key(egui::Key::ArrowUp, false)]);
+    assert_eq!(h.acts(), [
+        Act::ShortcutKeys(DelayKeys(["Down", "Up"].map(|k| vec!["Ctrl".into(), k.into()]))),
+        Act::RecordShortcuts(false),
+    ]);
+}
+
+#[test]
+fn the_remove_shortcut_has_no_mark_until_the_pair_is_saved() {
+    let port = scripted(|_| ());
+    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
+    h.click("Change…");
+    let press = |key| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL };
+    h.run(vec![press(egui::Key::ArrowDown)]);
+    let line = "Remove 25 ms: Ctrl+Down";
+    let plain_left = h.find("Press the new keys for Add 25 ms… (Esc stops)").unwrap().left();
+    assert_eq!(h.find(line).unwrap().left(), plain_left, "the pending keys have no leading mark");
+    h.run(vec![press(egui::Key::ArrowUp)]);
+    h.settle();
+    assert!(h.find(line).unwrap().left() > plain_left, "the saved keys have a leading mark");
+}
+
+#[test]
+fn a_held_alt_left_stays_in_the_shortcut_recorder() {
+    let port = scripted(|_| ());
+    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
+    h.click("Change…");
+    let key = |key, repeat| Event::Key {
+        key, physical_key: None, pressed: true, repeat, modifiers: egui::Modifiers::ALT,
+    };
+    h.run(vec![key(egui::Key::ArrowLeft, false), key(egui::Key::ArrowLeft, true)]);
+    h.run(vec![key(egui::Key::ArrowLeft, true)]);
+    assert!(h.asks().is_empty());
+    assert_eq!(h.acts(), [Act::RecordShortcuts(true)]);
+    h.run(vec![key(egui::Key::ArrowRight, false)]);
+    assert_eq!(h.acts(), [
+        Act::ShortcutKeys(crate::platform::DelayKeys(["Left", "Right"].map(|k| vec!["Alt".into(), k.into()]))),
+        Act::RecordShortcuts(false),
+    ]);
+}
+
+#[test]
+fn choosing_apps_hides_the_call_switch_and_keeps_its_value() {
+    let port = scripted(|s| s.general.play_calls = Some(true));
+    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
+    let calls = "Play calls on the speaker too";
+    let apps = "Only send some apps to the speaker";
+    assert!(h.has(calls));
+    h.flip(apps);
+    assert!(!h.has(calls));
+    assert!(h.has("In Windows, set the output of each app you choose to the one with “Stream To Speaker” in its name."));
+    h.click("Choose apps…");
+    assert_eq!(h.asks(), [Asked::Open(Open::VolumeMixer)]);
+    h.flip(apps);
+    assert!(h.has(calls));
+    assert_eq!(h.port.general().play_calls, Some(true));
+    assert!(!h.has("Choose apps…"));
+}
+
+#[test]
+fn quitting_explains_the_silence_only_for_chosen_apps() {
+    let port = scripted(|_| ());
+    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
+    let note = "Your chosen apps are silent while Stream To Speaker isn’t running.";
+    assert!(!h.has(note));
+    h.flip("Only send some apps to the speaker");
+    assert!(h.find(note).unwrap().top() >= h.find("Quit").unwrap().bottom());
+    h.click("Quit");
+    assert_eq!(h.asks(), [Asked::Command(Command::Quit)]);
+    h.flip("Only send some apps to the speaker");
+    assert!(!h.has(note));
+}
+
+#[test]
 fn each_settings_switch_changes_its_own_field() {
     let port = scripted(|s| { s.general.shortcuts.as_mut().unwrap().on = false; s.ma.offer = Some(false); });
     let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
@@ -448,7 +549,7 @@ fn each_settings_switch_changes_its_own_field() {
     h.click("Update now"); assert_eq!(h.acts(), vec![Act::UpdateNow]);
     h.click("Report a problem"); assert_eq!(h.asks(), vec![Asked::Dialog]);
     h.click("About"); assert_eq!(h.asks(), vec![Asked::View("About".into())]);
-    h.click("Quit, and play the sound on this PC"); assert_eq!(h.asks(), vec![Asked::Command(Command::Quit)]);
+    h.click("Quit"); assert_eq!(h.asks(), vec![Asked::Command(Command::Quit)]);
 }
 
 #[test]
@@ -533,6 +634,18 @@ fn speaker_missing_searches_shows_hidden_speakers_and_opens_the_check() {
     assert_eq!(h.acts(), vec![Act::LookOn(Some("eth2".into()))]);
     h.click("Check step by step");
     assert_eq!(h.asks(), vec![Asked::View("Check step by step".into())]);
+}
+
+#[test]
+fn the_playback_check_shows_only_chosen_apps_after_the_roles_return() {
+    let port = scripted(|s| s.playback.playing = Some(Err(None)));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("apps-panel-playing"));
+    assert!(h.has("Only chosen apps play here"));
+    let mut scene = h.snap.scene.clone();
+    scene.situation.standing.retain(|s| !matches!(s, crate::model::situation::Standing::OnlySomeApps { .. }));
+    h.snap = Arc::new(crate::model::view::view(scene, None, false, 2));
+    h.settle();
+    assert!(!h.has("Only chosen apps play here"));
 }
 
 #[test]
@@ -695,7 +808,7 @@ fn every_view_holds_at_the_panels_width_at_200_percent_with_longer_words_and_lon
                     a.on = true;
                 }
                 if let Some(k) = &mut s.general.shortcuts {
-                    k.taken = [true, true, false];
+                    k.status = [crate::platform::KeyStatus::Taken, crate::platform::KeyStatus::Rejected, crate::platform::KeyStatus::Registered];
                 }
                 s.ma.paused = true;
             });
@@ -738,6 +851,7 @@ fn tab_goes_through_a_speakers_view_in_reading_order() {
 /// the table's Settings block is said: what they drew.
 pub(in crate::settings) fn say_everything() -> Vec<String> {
     let lang = crate::model::text::Lang::English;
+    recording_keeps_shift_for_the_large_step();
     reset_and_remove_only_act_after_confirmation();
     a_busy_chime_asks_in_the_page_before_playing();
     the_discovery_check_explains_why_search_is_off();
@@ -758,7 +872,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
                 a.on = true;
             }
             if let Some(k) = &mut s.general.shortcuts {
-                k.taken = [true, false, false];
+                k.status = [crate::platform::KeyStatus::Taken, crate::platform::KeyStatus::Rejected, crate::platform::KeyStatus::Registered];
             }
             if let Some(p) = &mut s.privacy.phone {
                 p.problem = Some("port in use".into());
@@ -904,6 +1018,17 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
     let mut h = H::new(port.clone(), Box::new(SettingsView::new(port.clone())), snap("kitchen-playing"));
     h.click("Change…");
     look(&h);
+    for _ in 0..2 {
+        h.run(vec![Event::Key { key: egui::Key::Minus, physical_key: None, pressed: true,
+            repeat: false, modifiers: egui::Modifiers::CTRL }]);
+        h.run(vec![Event::Key { key: egui::Key::Minus, physical_key: None, pressed: false,
+            repeat: false, modifiers: egui::Modifiers::CTRL }]);
+    }
+    look(&h);
+    port.set(|s| s.rejected_shortcut = Some(vec!["Ctrl".into(), "F9".into()]));
+    h.run(vec![Event::Key { key: egui::Key::F9, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL }]);
+    assert!(h.has("Windows didn’t accept Ctrl+F9. Press other keys for Add 25 ms… (Esc stops)"));
+    look(&h);
     for m in 1..=12 {
         let _ = crate::settings::words::date(lang, Date { day: 1, month: m });
     }
@@ -915,7 +1040,40 @@ fn welcome_page(snap: Arc<Snapshot>) -> H {
     H::new(scripted(|_| ()), Box::new(FirstRunPage::new(snap.scene.situation.first_run.clone().unwrap())), snap)
 }
 
+#[test]
+fn first_run_explains_routing_for_chosen_apps() {
+    for (sample, chimed, title) in [
+        ("pc-welcome-pick", true, "Where should the apps you choose play?"),
+        ("pc-welcome-chime", false, "Play the apps you choose on Kitchen?"),
+        ("pc-welcome-chime", true, "Did you hear the chime on Kitchen?"),
+        ("kitchen-welcome-done", true, "Kitchen is ready for the apps you choose"),
+    ] {
+        let mut scene = snap(sample).scene.clone();
+        scene.situation.only_some_apps = true;
+        if !chimed {
+            if let Some(crate::model::situation::FirstRunStep::Two { level, .. }) = &mut scene.situation.first_run {
+                *level = None;
+            }
+        }
+        let mut page = welcome_page(Arc::new(crate::model::view::view(scene, None, false, 1)));
+        assert!(page.has(title), "{title}");
+        assert!(!page.shows("this PC’s sound"));
+        if sample == "kitchen-welcome-done" {
+            assert!(page.has("In Windows, set the output of each app you choose to the one with “Stream To Speaker” in its name."));
+            page.click("Choose apps…");
+            assert_eq!(page.asks(), [Asked::Open(Open::VolumeMixer)]);
+        } else if sample == "pc-welcome-chime" {
+            assert!(page.has(if chimed {
+                "If you did, the apps you send to Stream To Speaker will play on Kitchen."
+            } else {
+                "Kitchen can’t play a test chime first. Switch to it, then play something in an app you send to Stream To Speaker."
+            }));
+        }
+    }
+}
+
 pub(crate) fn draw_welcome_words() {
+    first_run_explains_routing_for_chosen_apps();
     welcome_without_chime();
     for sample in ["pc-welcome-pick", "pc-welcome-busy", "pc-welcome-looking", "pc-welcome-none-found", "pc-welcome-chime", "kitchen-welcome-done"] {
         welcome_page(snap(sample));
@@ -1143,4 +1301,100 @@ fn step_three_shows_how_to_start_the_music_assistant_input() {
     assert!(h.has("Start this PC’s sound in Music Assistant, or set Music Assistant to start it by itself."));
     h.click("How to start it");
     assert_eq!(h.asks(), [Asked::Open(Open::MusicAssistantHowTo)]);
+}
+
+#[test]
+fn the_speaker_page_links_to_delay_shortcuts_in_settings() {
+    let label = "Keyboard shortcuts for the delay…";
+    for (scenario, visible) in [
+        ("office-playing", true),
+        ("kitchen-least-delay", true),
+        ("kitchen-playing", true),
+        ("kitchen-fixed-way", false),
+        ("kitchen-changing-way", false),
+    ] {
+        for on in [false, true] {
+            let mut h = speaker_in("kitchen", scenario, |s| s.general.shortcuts.as_mut().unwrap().on = on);
+            assert_eq!(h.has(label), visible, "{scenario}, shortcuts on = {on}");
+            assert!(!h.shows("From the keyboard"), "{scenario}");
+            for key in ["Ctrl+Win+Comma", "Ctrl+Win+Period"] {
+                assert!(!h.shows(key), "{scenario} shows {key}");
+            }
+            if visible {
+                h.click(label);
+                assert_eq!(h.asks(), [Asked::Open(Open::Settings)]);
+            }
+        }
+    }
+}
+
+#[test]
+fn recording_keeps_shift_for_the_large_step() {
+    let port = scripted(|_| ());
+    let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
+    h.click("Change…");
+    h.acts();
+    let press = |key, modifiers| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+    for (what, key) in [("Remove", egui::Key::ArrowDown), ("Add", egui::Key::ArrowUp)] {
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        h.run(vec![press(egui::Key::F9, modifiers)]);
+        h.run(vec![Event::Key { key: egui::Key::F9, physical_key: None, pressed: false, repeat: false, modifiers }]);
+        assert!(h.has(&format!("Shift is kept for the 100 ms step. Press other keys for {what} 25 ms… (Esc stops)")), "{what}");
+        assert!(h.acts().is_empty());
+        h.run(vec![press(key, egui::Modifiers::CTRL)]);
+    }
+    assert_eq!(h.acts(), [
+        Act::ShortcutKeys(crate::platform::DelayKeys(["Down", "Up"].map(|key| vec!["Ctrl".into(), key.into()]))),
+        Act::RecordShortcuts(false),
+    ]);
+}
+
+#[test]
+fn shortcut_lines_distinguish_windows_errors() {
+    use crate::platform::KeyStatus::*;
+    let port = scripted(|s| {
+        let keys = s.general.shortcuts.as_mut().unwrap();
+        keys.status = [Rejected, Taken, Rejected];
+        keys.remove = vec!["Ctrl".into(), "Win".into(), ",".into()];
+        keys.add = vec!["Ctrl".into(), "Win".into(), ".".into()];
+    });
+    let h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
+    assert!(h.shows("Ctrl+Win+Comma. Windows didn’t accept this shortcut."));
+    assert!(h.shows("Ctrl+Win+Period. This shortcut is already in use. Choose another."));
+}
+
+#[test]
+fn shortcut_names_spell_out_punctuation() {
+    let punctuation = [",", ".", ";", "/", "\\", "-", "=", "'", "`", "[", "]", "+"].map(String::from);
+    assert_eq!(crate::settings::words::shortcut_name(&punctuation),
+        "Comma+Period+Semicolon+Slash+Backslash+Minus+Equals+Quote+Backtick+Left Bracket+Right Bracket+Plus");
+}
+
+#[test]
+fn the_routing_question_can_be_answered_under_the_setting() {
+    for yes in [false, true] {
+        let port = scripted(|s| s.general.what_plays = Some(WhatPlays::OnlySentApps));
+        let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
+        let apps = "Only send some apps to the speaker";
+        h.flip(apps);
+        let mut scene = h.snap.scene.clone();
+        let question = crate::model::situation::Confirm::ScreenReader {
+            speaker: sid("kitchen"), way: crate::model::situation::WayChoice::Native,
+        };
+        let words = crate::model::notes::question(&scene, &question);
+        scene.situation.confirm_in_panel = Some(question);
+        scene.situation.confirm_under_routing = Some(crate::model::situation::RoutingQuestion::TakePlayback);
+        h.snap = Arc::new(crate::model::view::view(scene, None, false, 2));
+        h.settle();
+        let title = h.texts.iter().find(|t| t.text == words.title).unwrap();
+        assert!(title.rect.top() >= h.find(apps).unwrap().bottom());
+        let format = &title.galley.job.sections[0].format;
+        let theme = crate::ui::theme::Theme::of(&h.ctx);
+        assert_eq!(format.font_id, theme.strong(crate::ui::theme::size::BODY));
+        assert_eq!(format.color, theme.c.text);
+        assert!(h.has(&words.sentence));
+        assert!(h.has("Play this PC’s sound on Kitchen"));
+        h.click(if yes { "Play this PC’s sound on Kitchen" } else { "Cancel" });
+        assert_eq!(h.asks(), [Asked::Command(Command::Confirm { yes })]);
+    }
 }

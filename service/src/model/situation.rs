@@ -517,6 +517,13 @@ impl Popup {
     }
 }
 
+/// What turning off Only send some apps would do once the person agrees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingQuestion {
+    TakePlayback,
+    StartSwitch,
+}
+
 /// A confirmation: nothing changes until it is answered.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Confirm {
@@ -578,6 +585,7 @@ pub enum FirstRunStep {
 /// at one moment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Situation {
+    pub only_some_apps: bool,
     /// Line 1.
     pub spot: Spot,
     /// This PC's output now: the one a switch to This PC plays on (This
@@ -607,6 +615,8 @@ pub struct Situation {
     /// A confirmation in the panel, under its speaker's row (or under the
     /// bar of that speaker's view).
     pub confirm_in_panel: Option<Confirm>,
+    /// The routing setting also shows this question.
+    pub confirm_under_routing: Option<RoutingQuestion>,
     pub popups: Popups,
     pub first_run: Option<FirstRunStep>,
 }

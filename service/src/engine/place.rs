@@ -40,7 +40,7 @@ pub use kept::{Kept, KeptHeadphones, KeptLevel, KeptNote};
 
 use crate::model::command::{Command, Effect, Refusal, Surface};
 use crate::model::situation::{
-    Ahead, Away, Cause, Clock, Confirm, NetJoined, Note, PickFailed, Popup, Shown, SwitchBy, SwitchFrom, WallTime,
+    Ahead, Away, Cause, Clock, Confirm, NetJoined, Note, PickFailed, Popup, RoutingQuestion, Shown, SwitchBy, SwitchFrom, WallTime,
     WayChoice,
 };
 use crate::model::state::{PcOutputId, SpeakerId};
@@ -112,6 +112,7 @@ struct Switching {
 #[derive(Clone, Debug, PartialEq)]
 struct Confirming {
     what: Confirm,
+    routing: Option<RoutingQuestion>,
     by: SwitchBy,
     who: Asker,
     windows_prev: Option<PcOutputId>,
@@ -271,6 +272,7 @@ pub struct Core {
     expect_default: Option<OutputRef>,
     /// Windows' default as last seen.
     last_default: Option<OutputRef>,
+    pc_before_ours: Option<(PcOutputId, u64)>,
     pass: Option<PcOutputId>,
     /// Windows' names of the outputs seen, for an output that has gone.
     names: BTreeMap<PcOutputId, String>,
@@ -306,6 +308,8 @@ pub struct Core {
     started_wall: WallTime,
     /// The Settings option, as last seen.
     switch_back_on: bool,
+    only_some_apps: Option<bool>,
+    pc_return: Option<windows::PcReturn>,
     /// The fixed choices, from [`numbers`].
     after_headphones: AfterHeadphones,
     after_failed_start: AfterFailedStart,
@@ -359,6 +363,7 @@ impl Core {
             pending_headphones: None,
             expect_default: None,
             last_default: None,
+            pc_before_ours: None,
             pass: None,
             names: BTreeMap::new(),
             revert: None,
@@ -382,6 +387,8 @@ impl Core {
             device_missing: false,
             started_wall: now.wall,
             switch_back_on: false,
+            only_some_apps: None,
+            pc_return: None,
             after_headphones: AFTER_HEADPHONES,
             after_failed_start: PLACE_AFTER_FAILED_START,
             ask_before_taking: ASK_BEFORE_TAKING_A_BUSY_SPEAKER,
@@ -528,6 +535,7 @@ impl Core {
         due.extend(self.listening.values().map(|l| l.next_ms));
         due.extend(self.pending_default.as_ref().map(|p| p.at_ms + WINDOWS_DOING_MS));
         due.extend(self.pending_headphones.as_ref().map(|(_, at)| at + WINDOWS_DOING_MS));
+        due.extend(self.pc_return.as_ref().map(windows::PcReturn::due));
         due.extend(self.other_net.as_ref().map(|(_, until)| *until));
         due.extend(self.start_look.map(|t| t + START_LOOK_MS));
         due.extend(self.level_set_ms.map(|t| t + LEVEL_SAVED_AFTER_MS));
@@ -545,6 +553,7 @@ impl Core {
     fn begin(&mut self, w: &World, panel_open: bool, now: Clock, out: &mut Vec<Do>) {
         self.now = now;
         self.switch_back_on = w.settings.switch_back_after_quiet;
+        self.follow_routing_mode(w, out);
         if panel_open != self.panel_open {
             self.panel_open = panel_open;
             if panel_open {
@@ -976,8 +985,7 @@ impl Core {
         }
     }
 
-    /// Windows' default output to `target`, unless the app never changes it
-    /// (*Only send some apps*, or a platform that can't tell).
+    /// Move Windows' default for a place switch in whole-PC mode.
     fn win(&mut self, target: WinTarget, w: &World, out: &mut Vec<Do>) {
         if w.settings.only_some_apps || w.default_output.is_none() {
             return;
@@ -986,7 +994,7 @@ impl Core {
             WinTarget::OurDevice => OutputRef::Ours,
             WinTarget::Output(o) => OutputRef::Pc(o.clone()),
         };
-        if w.default_output.as_ref() == Some(&want) && self.expect_default.is_none() {
+        if w.playback_on(&want) && self.expect_default.is_none() {
             return;
         }
         self.expect_default = Some(want);

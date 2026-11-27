@@ -30,7 +30,7 @@ fn changes(old: &Observation, obs: &Observation, at_ms: u64) -> Vec<Event> {
     if before.our_device != now.our_device {
         events.push(Event::Output(OutputEvent::DeviceChanged { present: now.our_device, at_ms }));
     }
-    if before.default_output != now.default_output {
+    if before.default_output != now.default_output || before.multimedia_output != now.multimedia_output {
         events.push(Event::Output(OutputEvent::DefaultChanged { at_ms }));
     }
     for (p, raw) in now.players.iter().zip(&obs.players) {
@@ -129,6 +129,7 @@ impl PlaceDriver {
         }
         Buttons::follow(&self.app, &mut self.buttons);
         self.remember_playback(w, now);
+        self.follow_calls(w);
         self.seen = Some(obs);
     }
 

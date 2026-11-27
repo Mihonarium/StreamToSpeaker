@@ -126,19 +126,21 @@ fn only_changed_views_publish_and_commands_answer_with_the_current_arc() {
 
 #[test]
 fn names_and_handback_follow_only_changes_of_their_inputs() {
-    let r = Running::on(App::for_tests());
+    let app = App::for_tests();
+    let r = Running::on(app.clone());
     r.wait_view(|_| true);
     assert_eq!(r.windows.names(), ["Stream To Speaker"]);
     assert_eq!(
         r.windows.handback(),
-        Some((
-            Some(output(SPEAKERS)),
-            "Stream To Speaker (not running)".into()
-        ))
+        Some(crate::platform::HandbackPlan {
+            our_output: Some(output(OURS)),
+            playback: Some(output(SPEAKERS)), calls: Some(output(SPEAKERS)), name: "Stream To Speaker (not running)".into()
+        })
     );
     assert_eq!(r.windows.preparations(), 1);
     r.windows.set_our_output_present(false);
     r.wait_view(|v| v.device_name.is_none());
+    assert_eq!(r.windows.handback().unwrap().our_output, None);
     assert_eq!(r.windows.names(), ["Stream To Speaker"]);
     r.windows.set_our_output_present(true);
     r.wait_view(|v| v.device_name.is_some());
@@ -146,19 +148,28 @@ fn names_and_handback_follow_only_changes_of_their_inputs() {
         r.windows.names(),
         ["Stream To Speaker", "Stream To Speaker"]
     );
-    assert_eq!(r.windows.preparations(), 1);
+    assert_eq!(r.windows.preparations(), 3);
     r.command(Command::SwitchOutput(output(HEADPHONES)))
         .0
         .unwrap();
     assert_eq!(
         r.windows.handback(),
-        Some((
-            Some(output(HEADPHONES)),
-            "Stream To Speaker (not running)".into()
-        ))
+        Some(crate::platform::HandbackPlan {
+            our_output: Some(output(OURS)),
+            playback: Some(output(HEADPHONES)), calls: Some(output(HEADPHONES)), name: "Stream To Speaker (not running)".into()
+        })
     );
     r.command(Command::ShowPcOutputs(true)).0.unwrap();
-    assert_eq!(r.windows.preparations(), 2);
+    assert_eq!(r.windows.preparations(), 4);
+    app.user_config.lock().unwrap().only_some_apps = true;
+    r.wait_view(|v| v.scene.situation.only_some_apps);
+    let plan = r.windows.handback().unwrap();
+    assert_eq!(plan.playback, Some(output(HEADPHONES)));
+    assert_eq!(plan.calls, Some(output(HEADPHONES)));
+    use crate::platform::{Handback, Outputs};
+    r.windows.set_default(&output(OURS), &[Role::Communications]).unwrap();
+    r.windows.hand_back_now();
+    assert_eq!(r.windows.calls_output(), Some(output(HEADPHONES)));
     r.finish(true);
 }
 
@@ -289,4 +300,32 @@ fn window_commands_send_the_requested_page_to_the_opener() {
         assert_eq!(pages.recv_timeout(WAIT).unwrap(), page);
     }
     assert!(pages.is_empty());
+}
+
+#[test]
+fn handback_uses_playback_when_the_call_device_leaves() {
+    use crate::platform::{Handback, Outputs};
+    let app = App::for_tests();
+    let r = Running::on(app.clone());
+    r.wait_view(|_| true);
+    r.windows.set_default(&output(OURS), &[Role::Communications]).unwrap();
+    app.user_config.lock().unwrap().calls_back = Some(output(HEADPHONES));
+    r.command(Command::ShowPcOutputs(true)).0.unwrap();
+    let prepared = r.windows.handback().unwrap();
+    assert_eq!(prepared.calls, Some(output(HEADPHONES)));
+    r.windows.set_output_on(HEADPHONES, false);
+    r.command(Command::ShowPcOutputs(false)).0.unwrap();
+    assert_eq!(r.windows.handback().unwrap().calls, Some(output(SPEAKERS)));
+    r.finish(true);
+    // Unplugging after preparation leaves the old headset in the plan.
+    let windows = FakePlatform::new();
+    windows.set_output_on(HEADPHONES, false);
+    windows.set_default(&output(OURS), &[Role::Communications]).unwrap();
+    windows.prepare(&prepared);
+    windows.refuse_switches(true);
+    windows.hand_back_now();
+    assert_eq!(windows.calls_output(), Some(output(OURS)));
+    windows.refuse_switches(false);
+    windows.hand_back_now();
+    assert_eq!(windows.calls_output(), Some(output(SPEAKERS)));
 }

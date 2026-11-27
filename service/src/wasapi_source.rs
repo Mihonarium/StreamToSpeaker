@@ -3,9 +3,8 @@
 
 //! WASAPI-loopback fallback source, using `cpal`.
 //!
-//! When the kernel driver isn't installed we capture the system mix from
-//! the default render endpoint and stream that to Sonos. This mirrors what
-//! swyh-rs does and is good enough for casual use.
+//! When the driver's capture interface is unavailable, we capture the app's
+//! render endpoint if present. Otherwise we follow Windows' default output.
 //!
 //! cpal 0.15+ on Windows treats the default *output* device as openable for
 //! input via WASAPI loopback. We pull samples (which may be f32 / i16 /
@@ -18,7 +17,7 @@ use cpal::{Sample, SampleFormat, StreamConfig};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{debug, info, warn};
 
-use crate::audio_source::{AudioPacket, AudioSource};
+use crate::audio_source::{AudioPacket, AudioSource, LocalPlayback};
 use crate::{WIRE_CHANNELS, WIRE_SAMPLE_RATE};
 
 /// Frames per emitted packet downstream (10 ms @ 44.1 kHz).
@@ -36,6 +35,8 @@ pub struct WasapiLoopbackSource {
     // The cpal::Stream is !Send, so we keep it on a dedicated thread; this
     // handle lets us tell that thread to drop the stream and exit.
     _worker: WorkerJoin,
+    endpoint: Option<crate::audio_source::LoopbackEndpoint>,
+    local_playback: LocalPlayback,
     rx: Receiver<CapturedChunk>,
 
     // Resampler state (linear interpolation in time domain).
@@ -59,12 +60,27 @@ pub struct WasapiLoopbackSource {
 }
 
 impl WasapiLoopbackSource {
-    /// Build a loopback source.  `device_name` matches a substring against
-    /// the device's reported name; pass `None` for the default output
-    /// device.
+    /// A name selects a device by substring. With no name, prefer the app's
+    /// output and follow Windows' default while the app's output is absent.
     pub fn new(device_name: Option<&str>) -> Result<Self> {
+        match device_name {
+            Some(name) => Self::open(Some(name), None),
+            None => Self::for_app_output(),
+        }
+    }
+
+    /// Capture the app's output while it exists, otherwise follow Windows' default.
+    pub fn for_app_output() -> Result<Self> {
+        let outputs = crate::platform::Platform::this_pc().outputs;
+        let endpoint = crate::audio_source::LoopbackEndpoint::new(outputs);
+        let name = endpoint.name()?;
+        Self::open(name.as_deref(), Some(endpoint))
+    }
+
+    fn open(device_name: Option<&str>, endpoint: Option<crate::audio_source::LoopbackEndpoint>) -> Result<Self> {
+        let exact = endpoint.is_some();
         let (tx_chunk, rx_chunk) = bounded::<CapturedChunk>(64);
-        let (tx_ready, rx_ready) = bounded::<Result<(u32, u16)>>(1);
+        let (tx_ready, rx_ready) = bounded(1);
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let device_name_owned = device_name.map(|s| s.to_string());
         let shutdown_for_thread = shutdown.clone();
@@ -77,10 +93,10 @@ impl WasapiLoopbackSource {
         let join = std::thread::Builder::new()
             .name("stream-to-speaker-wasapi-loopback".to_string())
             .spawn(move || {
-                let res = build_loopback_stream(device_name_owned.as_deref(), tx_chunk);
+                let res = build_loopback_stream(device_name_owned.as_deref(), exact, tx_chunk);
                 match res {
-                    Ok((stream, src_rate, src_channels)) => {
-                        if tx_ready.send(Ok((src_rate, src_channels))).is_err() {
+                    Ok((stream, src_rate, src_channels, name)) => {
+                        if tx_ready.send(Ok((src_rate, src_channels, name))).is_err() {
                             return;
                         }
                         // Hold the stream alive until shutdown.
@@ -96,11 +112,20 @@ impl WasapiLoopbackSource {
             })
             .context("spawning wasapi loopback worker")?;
 
-        let (src_rate, src_channels) = rx_ready
+        let (src_rate, src_channels, opened_name) = rx_ready
             .recv()
             .map_err(|_| anyhow!("wasapi worker died before ready"))??;
 
+        let local_playback = match &endpoint {
+            Some(endpoint) => endpoint.local_playback(),
+            None => {
+                let outputs = crate::platform::Platform::this_pc().outputs;
+                LocalPlayback::for_named_output(&*outputs, &opened_name)
+            }
+        };
         Ok(Self {
+            endpoint,
+            local_playback,
             _worker: WorkerJoin {
                 shutdown,
                 handle: Some(join),
@@ -119,19 +144,20 @@ impl WasapiLoopbackSource {
 
     /// Pull at least one chunk from cpal, convert to 44.1 kHz stereo i16,
     /// and push the result into `self.pending`.
-    fn refill(&mut self) -> Result<()> {
-        // Block on at least one chunk.
-        let chunk = self
-            .rx
-            .recv()
-            .map_err(|_| anyhow!("wasapi capture stream closed"))?;
+    fn refill(&mut self) -> Result<bool> {
+        // While this endpoint is quiet the reader still needs to follow a change of source.
+        let chunk = match self.rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(chunk) => chunk,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => return Ok(false),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Err(anyhow!("wasapi capture stream closed")),
+        };
         self.absorb_chunk(chunk);
 
         // Drain anything else that's already queued, opportunistically.
         while let Ok(chunk) = self.rx.try_recv() {
             self.absorb_chunk(chunk);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn absorb_chunk(&mut self, chunk: CapturedChunk) {
@@ -265,6 +291,14 @@ fn f32_to_i16(v: f32) -> i16 {
 }
 
 impl AudioSource for WasapiLoopbackSource {
+    fn needs_reopen(&self) -> bool {
+        self.endpoint.as_ref().is_some_and(|d| d.changed())
+    }
+
+    fn local_playback(&self) -> LocalPlayback {
+        self.local_playback.clone()
+    }
+
     fn name(&self) -> &str {
         "wasapi-loopback"
     }
@@ -272,7 +306,7 @@ impl AudioSource for WasapiLoopbackSource {
     fn recv_packet(&mut self) -> Result<AudioPacket> {
         let target = FRAMES_PER_PACKET * WIRE_CHANNELS as usize;
         while self.pending.len() < target {
-            self.refill()?;
+            if !self.refill()? { return Ok(AudioPacket::silence(FRAMES_PER_PACKET)); }
         }
 
         // Drain `target` samples into scratch.
@@ -317,20 +351,21 @@ impl Drop for WorkerJoin {
 /// stream's source sample rate / channels.
 fn build_loopback_stream(
     device_name: Option<&str>,
+    exact: bool,
     tx: Sender<CapturedChunk>,
-) -> Result<(cpal::Stream, u32, u16)> {
+) -> Result<(cpal::Stream, u32, u16, String)> {
     let host = cpal::default_host();
 
     let device = if let Some(name) = device_name {
         let lower = name.to_ascii_lowercase();
-        host.output_devices()
-            .context("enumerating output devices")?
-            .find(|d| {
-                d.name()
-                    .map(|n| n.to_ascii_lowercase().contains(&lower))
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| anyhow!("no output device matches {:?}", name))?
+        let mut matches = host.output_devices().context("enumerating output devices")?.filter(|d| {
+            d.name().is_ok_and(|n| if exact { n == name } else { n.to_ascii_lowercase().contains(&lower) })
+        });
+        let device = matches.next().ok_or_else(|| anyhow!("no output device matches {:?}", name))?;
+        if exact && matches.next().is_some() {
+            anyhow::bail!("more than one output has the name {:?}", name);
+        }
+        device
     } else {
         host.default_output_device()
             .ok_or_else(|| anyhow!("no default output device"))?
@@ -405,5 +440,5 @@ fn build_loopback_stream(
     .with_context(|| format!("building loopback stream on {}", dev_name))?;
 
     stream.play().context("starting wasapi loopback stream")?;
-    Ok((stream, src_rate, src_channels))
+    Ok((stream, src_rate, src_channels, dev_name))
 }

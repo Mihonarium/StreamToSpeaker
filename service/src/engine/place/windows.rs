@@ -9,10 +9,100 @@ use crate::model::situation::ConnKind;
 /// which a change of Windows' default is Windows' own doing.
 const MOVES_KEPT_MS: u64 = 10_000;
 
+/// Attempts to give the PC its default back, measured from the first request.
+const PC_RETURN_AT_MS: [u64; 4] = [0, 2_000, 5_000, 10_000];
+
+pub(super) struct PcReturn {
+    started: u64,
+    attempt: usize,
+}
+
+impl PcReturn {
+    fn new(now: Clock) -> Self { Self { started: now.mono_ms, attempt: 0 } }
+
+    pub(super) fn due(&self) -> u64 { self.started + PC_RETURN_AT_MS[self.attempt] }
+}
+
 impl Core {
+    pub(super) fn follow_routing_mode(&mut self, w: &World, out: &mut Vec<Do>) {
+        let some = w.settings.only_some_apps;
+        match self.only_some_apps.replace(some) {
+            Some(before) if before == some => return,
+            None if !some => return,
+            _ if some => {
+                self.pc_return = w.uses_app_output().then(|| PcReturn::new(self.now));
+                self.pending_headphones = None;
+                self.pending_default = None;
+                self.moves.clear();
+                self.start_look = None;
+                self.windows_refused = None;
+                self.expect_default = None;
+                self.revert = None;
+                self.no_speaker_chosen = false;
+                if self.confirm.as_ref().is_some_and(|c| matches!(c.what, Confirm::ScreenReader { .. })) {
+                    self.confirm = None;
+                }
+                let old_note = self.note.as_ref().is_some_and(|n| matches!(n.note.cause,
+                    Cause::PlayingAtStart { .. } | Cause::HeadphonesGone { .. } | Cause::HeadphonesConnected { .. }));
+                if self.headphones.take().is_some() || old_note {
+                    self.clear_note();
+                    out.push(Do::Save);
+                }
+            }
+            _ => {
+                self.pc_before_ours = None;
+                self.pc_return = None;
+                self.expect_default = None;
+                if self.ask_for_connecting_switch(w, out) { return; }
+                if let Some(speaker) = self.place.clone().filter(|_| w.our_device) {
+                    self.take_playback_for_place(speaker, w, out);
+                } else if let Some(target) = self.win_pc(w) {
+                    self.win(target, w, out);
+                }
+            }
+        }
+    }
+
     pub(super) fn output_event(&mut self, e: OutputEvent, w: &World, now: Clock, out: &mut Vec<Do>) {
         for o in &w.outputs {
             self.names.insert(o.id.clone(), o.name.clone());
+        }
+        if w.settings.only_some_apps {
+            // A change of PC output affects the local apps and the pass-through.
+            // The apps sent to our device keep their speaker.
+            if let Some(OutputRef::Pc(id)) = &w.default_output {
+                outputs::used(&mut self.last_outputs, id, OUTPUTS_REMEMBERED);
+            }
+            if let OutputEvent::NotTaken { .. } = e {
+                self.windows_not_taken(w, now, out);
+                if let Some(retry) = &mut self.pc_return {
+                    retry.attempt += 1;
+                    if retry.attempt == PC_RETURN_AT_MS.len() { self.pc_return = None; }
+                }
+            }
+            if w.default_output == Some(OutputRef::Ours) {
+                if let Some(OutputRef::Pc(id)) = &self.last_default {
+                    self.pc_before_ours = Some((id.clone(), now.mono_ms));
+                }
+                if let Some((id, at)) = &self.pc_before_ours {
+                    if now.mono_ms.saturating_sub(*at) > WINDOWS_DOING_MS {
+                        self.pc_before_ours = None;
+                    } else if !w.outputs.iter().any(|o| o.id == *id) {
+                        self.pc_return = Some(PcReturn::new(now));
+                        self.pc_before_ours = None;
+                    }
+                }
+            } else if w.playback_on_pc() {
+                self.pc_before_ours = None;
+                self.expect_default = None;
+                self.pc_return = None;
+            }
+            if w.default_output.is_some() { self.last_default = w.default_output.clone(); }
+            if let OutputEvent::Removed { id, .. } = e {
+                if self.pc_choice.as_ref() == Some(&id) { self.pc_choice = None; }
+                self.detector.forget_output(&OutputRef::Pc(id));
+            }
+            return;
         }
         match e {
             OutputEvent::Added { id, kind, name, at_ms } => {
@@ -85,6 +175,7 @@ impl Core {
             outputs::used(&mut self.last_outputs, o, OUTPUTS_REMEMBERED);
         }
         if self.expect_default.is_some() && self.expect_default == to {
+            if !to.as_ref().is_some_and(|target| w.playback_on(target)) { return; }
             // The change the app asked for.
             self.expect_default = None;
             if to == Some(OutputRef::Ours) {
@@ -106,6 +197,15 @@ impl Core {
 
     /// The timers of Windows' changes.
     pub(super) fn windows_timers(&mut self, w: &World, now: Clock, out: &mut Vec<Do>) {
+        if w.uses_app_output() && self.expect_default.is_none()
+            && self.pc_return.as_ref().is_some_and(|retry| now.mono_ms >= retry.due()) {
+            if let Some(pc) = self.pc_target(w) {
+                self.expect_default = Some(OutputRef::Pc(pc.clone()));
+                out.push(Do::Windows(WinTarget::Output(pc)));
+            } else {
+                self.pc_return = None;
+            }
+        }
         if self.pending_default.as_ref().is_some_and(|p| now.mono_ms >= p.at_ms + WINDOWS_DOING_MS) {
             let p = self.pending_default.take().expect("checked");
             if self.moved_near(p.at_ms) {
@@ -283,7 +383,7 @@ impl Core {
             AfterHeadphones::StayOnThisPc => {
                 // The sound stays on this PC, on its other output; the
                 // note offers the way back.
-                if w.default_output == Some(OutputRef::Ours) && self.expect_default.is_none() {
+                if w.uses_app_output() && self.expect_default.is_none() {
                     if let Some(t) = self.pc_target(w) {
                         self.win(WinTarget::Output(t), w, out);
                     }
@@ -324,7 +424,7 @@ impl Core {
         if let Some(OutputRef::Pc(o)) = &w.default_output {
             outputs::used(&mut self.last_outputs, o, OUTPUTS_REMEMBERED);
         }
-        if kind == StartKind::AfterGivingUp && self.place.is_some() {
+        if kind == StartKind::AfterGivingUp && !w.settings.only_some_apps && self.place.is_some() {
             // The watcher gave Windows the PC's own output: the start
             // begins on this PC.
             self.place = None;
@@ -353,14 +453,14 @@ impl Core {
         }
         match &self.place {
             None => {
-                if w.default_output == Some(OutputRef::Ours) {
+                if w.uses_app_output() {
                     if let Some(t) = self.pc_target(w) {
                         self.win(WinTarget::Output(t), w, out);
                     }
                 }
             }
             Some(_) => {
-                if w.default_output.is_some() && w.default_output != Some(OutputRef::Ours) && !w.settings.only_some_apps {
+                if w.default_output.is_some() && !w.playback_on(&OutputRef::Ours) && !w.settings.only_some_apps {
                     // Look first at what plays on this PC.
                     self.start_look = Some(now.mono_ms);
                 }

@@ -172,6 +172,13 @@ impl PlaceDriver {
                     }
                     match cmd {
                         Command::PanelShown(open) => self.panel_open = *open,
+                        Command::Quit => {
+                            self.stop_shortcuts();
+                            self.quitting = true;
+                            let pc = self.core.situation(&obs.world, now).pc_output;
+                            *self.windows_decision.lock().unwrap() += 1;
+                            self.prepare_handback(pc, obs.ours.clone(), self.lang);
+                        }
                         Command::Release { for_update: true } | Command::ReleaseWindows { for_update: true, .. } => {
                             let mut cfg = app.user_config.lock().unwrap();
                             cfg.closed_for_update = true;
@@ -181,6 +188,14 @@ impl PlaceDriver {
                     }
                 }
                 self.execute(actions);
+                if matches!(cmd, Command::Quit) {
+                    let deadline = Instant::now() + crate::engine::driver::QUIT_MOVE_WAIT;
+                    for done in self.releases.drain(..) {
+                        let _ = done.recv_deadline(deadline);
+                    }
+                    self.platform.handback.hand_back_now();
+                }
+                self.follow_calls(&obs.world);
                 if result.is_ok() {
                     if let Command::RemoveSpeaker(k) | Command::ResetSpeaker(k) = cmd {
                         let mut ids = vec![self.app_id(k, WayChoice::Native)];

@@ -110,3 +110,11 @@ pub fn left(lang: Lang, seconds: u32) -> String {
 pub fn about(lang: Lang, ms: u32) -> String {
     crate::model::panel::delay_figure(lang, crate::model::facts::SpeakerDelay { own_ms: ms, measured: false, change_ms: 0 })
 }
+
+pub(super) fn shortcut_name(keys: &[String]) -> String {
+    keys.iter().map(|k| match k.as_str() {
+        "," => "Comma", "." => "Period", ";" => "Semicolon", "/" => "Slash", "\\" => "Backslash",
+        "-" => "Minus", "=" => "Equals", "'" => "Quote", "`" => "Backtick", "[" => "Left Bracket",
+        "]" => "Right Bracket", "+" => "Plus", other => other,
+    }).collect::<Vec<_>>().join("+")
+}

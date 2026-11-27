@@ -8,6 +8,7 @@ use egui::Ui;
 use crate::model::command::{Command, VolumeOwner};
 use crate::model::Snapshot;
 use crate::model::state::SpeakerId;
+use crate::model::situation::Standing;
 use crate::shell::{Ask, ViewBar, ViewContent};
 use crate::ui::button::Button;
 use crate::ui::text::{Para, Tone};
@@ -76,7 +77,10 @@ impl ViewContent for CantHearView {
                 }
                 Err(_) => {
                     all_good = false;
-                    check_line(ui, Found::Bad, &w!(lang, ReadyLine), None, |ui| {
+                    let quiet = if snap.scene.situation.only_some_apps { w!(lang, NothingPlaying) } else { w!(lang, ReadyLine) };
+                    let detail = snap.scene.situation.standing.iter().any(|s| matches!(s, Standing::OnlySomeApps { .. }))
+                        .then(|| w!(lang, OnlyChosenApps));
+                    check_line(ui, Found::Bad, &quiet, detail.as_deref(), |ui| {
                         if let Some(id) = &id {
                             if Button::standard(&w!(lang, PlayTestChime)).show(ui).clicked() {
                                 send(ask, Command::PlayTestSound(id.clone()));
