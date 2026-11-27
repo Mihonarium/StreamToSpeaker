@@ -4,8 +4,8 @@ use egui::Ui;
 use super::parts::{gap, page_button, page_link, slider_line, switch_line};
 use crate::model::{
     command::FirstRunAction,
-    panel::About,
-    situation::{Confirm, FirstRunStep},
+    panel::{About, NoteView},
+    situation::{Confirm, FirstRunStep, Standing},
     text::t,
     Command, Open, Snapshot, SpeakerId,
 };
@@ -43,6 +43,20 @@ fn action(ask: &mut dyn FnMut(Ask), act: FirstRunAction) {
 fn plain(ui: &mut Ui, words: &str) {
     let t = crate::ui::theme::Theme::of(ui.ctx());
     crate::surface::grid::page_paragraph(ui, words, t.font(size::BODY), t.c.text);
+}
+
+fn show_note(ui: &mut Ui, note: &NoteView, ask: &mut dyn FnMut(Ask)) {
+    let theme = crate::ui::theme::Theme::of(ui.ctx());
+    ui.label(crate::surface::grid::box_title(ui, &note.title, ui.available_width(), &theme));
+    plain(ui, &note.sentence);
+    if let Some(a) = &note.button {
+        if page_button(&a.label).show(ui).clicked() {
+            match &a.command {
+                Command::Open(page) => ask(Ask::Open(page.clone())),
+                cmd => ask(Ask::Command(cmd.clone())),
+            }
+        }
+    }
 }
 
 fn question(ui: &mut Ui, snap: &Snapshot, speaker: &SpeakerId, ask: &mut dyn FnMut(Ask)) {
@@ -153,7 +167,10 @@ impl ViewContent for FirstRunPage {
             FirstRunStep::One => {
                 let can_chime = snap.scene.speakers.iter().any(|s| snap.scene.situation.speaker(&s.id)
                     .is_some_and(|r| r.can_chime && !r.state.grey()));
-                if !snap.scene.speakers.is_empty() {
+                if snap.scene.situation.standing.contains(&Standing::OutputMissing)
+                    || snap.scene.repair == crate::model::scene::RepairNow::Running {
+                    show_note(ui, &crate::model::notes::repair(&snap.scene), ask);
+                } else if !snap.scene.speakers.is_empty() {
                     plain(ui, &if can_chime { t!(lang, FirstPickChime) } else if snap.scene.situation.only_some_apps { t!(lang, ClickSpeakerApps) } else { t!(lang, ClickSpeaker) });
                 }
                 ui.scope(|ui| {
@@ -230,16 +247,7 @@ impl ViewContent for FirstRunPage {
                     }
                 }
                 if let About::Note(note) = &snap.panel.about {
-                    plain(ui, &note.title);
-                    plain(ui, &note.sentence);
-                    if let Some(a) = &note.button {
-                        if page_button(&a.label).show(ui).clicked() {
-                            match &a.command {
-                                Command::Open(page) => ask(Ask::Open(page.clone())),
-                                cmd => ask(Ask::Command(cmd.clone())),
-                            }
-                        }
-                    }
+                    show_note(ui, note, ask);
                 }
                 if self.tray { plain(ui, &t!(lang, FirstIcon)); }
                 gap(ui);

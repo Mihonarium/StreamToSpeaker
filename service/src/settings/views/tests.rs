@@ -1041,6 +1041,23 @@ fn welcome_page(snap: Arc<Snapshot>) -> H {
 }
 
 #[test]
+fn first_run_shows_the_output_note_and_its_action_above_the_speakers() {
+    for (sample, title, command) in [
+        ("pc-welcome-repair", "The app’s sound output is missing", Command::RepairOutput),
+        ("pc-welcome-output-turned-off", "Stream To Speaker is turned off in Windows", Command::TurnOnOutput),
+    ] {
+        let mut page = welcome_page(snap(sample));
+        let heading = page.texts.iter().find(|text| text.text == title).unwrap();
+        let theme = crate::ui::theme::Theme::of(&page.ctx);
+        assert_eq!(heading.galley.job.sections[0].format.font_id, theme.strong(crate::surface::grid::BODY));
+        assert!(page.has("Repair first"));
+        assert!(page.find("Repair").unwrap().bottom() <= page.find("Kitchen").unwrap().top());
+        page.click("Repair");
+        assert_eq!(page.asks(), [Asked::Command(command)]);
+    }
+}
+
+#[test]
 fn first_run_explains_routing_for_chosen_apps() {
     for (sample, chimed, title) in [
         ("pc-welcome-pick", true, "Where should the apps you choose play?"),

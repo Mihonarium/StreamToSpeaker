@@ -479,3 +479,263 @@ fn turning_off_chosen_apps_during_a_switch_asks_before_taking_playback() {
         }
     }
 }
+
+#[test]
+fn repair_preserves_windows_outputs_and_reports_the_observed_endpoint() {
+    use crate::model::scene::RepairNow;
+    use crate::platform::RepairExit;
+    for exit in [RepairExit::Success, RepairExit::Failed] {
+        for (active, off, note) in [(true, false, RepairNow::Worked), (false, true, RepairNow::TurnedOff), (false, false, RepairNow::DidntWork)] {
+            let mut r = Rig::on_kitchen();
+            r.w.our_device = false;
+            r.w.outputs.push(OutputWorld { id: out("headphones"), kind: OutputKind::Headphones, name: "Headphones".into() });
+            r.w.set_playback(OutputRef::Pc(out("headphones")));
+            r.tick();
+            r.take();
+            r.cmd(Command::RepairOutput).unwrap();
+            let actions = r.take();
+            let [Do::RepairOutput(run)] = actions.as_slice() else { panic!("{actions:?}") };
+            r.event(Event::RepairApproved(*run));
+            r.w.our_device = active;
+            r.w.output_turned_off = off;
+            r.wait(20_000);
+            assert_eq!(r.core.repair_note(&r.w), RepairNow::Running);
+            assert_eq!(row(&r, K), RowState::RepairFirst);
+            r.event(Event::RepairExited(*run, exit));
+            if exit == RepairExit::Success && !active {
+                r.wait(4_999);
+                assert_eq!(r.core.repair_note(&r.w), RepairNow::Running);
+                r.wait(1);
+            }
+            assert_eq!(r.core.repair_note(&r.w), note);
+            assert_eq!(row(&r, K) == RowState::RepairFirst, !active);
+            assert!(r.w.playback_on(&OutputRef::Pc(out("headphones"))));
+            assert!(!r.take().iter().any(|d| matches!(d, Do::Windows(_) | Do::Silence { then: Some(_), .. })));
+        }
+    }
+}
+
+#[test]
+fn turning_on_a_saved_speakers_output_leaves_it_available_for_the_next_switch() {
+    use crate::model::scene::RepairNow;
+    let mut r = Rig::on_kitchen();
+    r.w.our_device = false;
+    r.w.output_turned_off = true;
+    r.w.set_playback(OutputRef::Pc(out("speakers")));
+    r.tick();
+    r.cmd(Command::TurnOnOutput).unwrap();
+    assert!(r.take().contains(&Do::TurnOnOutput));
+    r.w.our_device = true;
+    r.w.output_turned_off = false;
+    r.wait(60_000);
+    assert_eq!(r.core.repair_note(&r.w), RepairNow::Worked);
+    assert!(r.w.playback_on(&OutputRef::Pc(out("speakers"))));
+    r.switch_to(K);
+    assert_eq!(r.core.repair_note(&r.w), RepairNow::NotAsked);
+    assert_eq!(r.sit().spot, Spot::Speaker(id(K)));
+}
+
+#[test]
+fn observing_the_output_after_the_helper_exits_completes_repair() {
+    use crate::model::scene::RepairNow;
+    let mut r = Rig::new();
+    r.w.our_device = false;
+    r.cmd(Command::RepairOutput).unwrap();
+    let run = r.take().into_iter().find_map(|d| match d { Do::RepairOutput(id) => Some(id), _ => None }).unwrap();
+    r.event(Event::RepairApproved(run));
+    r.event(Event::RepairExited(run, crate::platform::RepairExit::Success));
+    r.wait(4_999);
+    assert_eq!(r.core.repair_note(&r.w), RepairNow::Running);
+    r.w.our_device = true;
+    r.tick();
+    assert_eq!(r.core.repair_note(&r.w), RepairNow::Worked);
+}
+
+#[test]
+fn restoring_the_windows_default_after_repair_does_not_reconnect_kitchen() {
+    for delay in [0, WINDOWS_DOING_MS] {
+        let mut r = Rig::on_kitchen();
+        r.w.our_device = false;
+        r.w.output_turned_off = true;
+        r.w.set_playback(OutputRef::Pc(out("speakers")));
+        r.event(Event::Output(OutputEvent::DefaultChanged { at_ms: r.now.mono_ms }));
+        r.cmd(Command::TurnOnOutput).unwrap();
+        assert!(r.take().contains(&Do::Save));
+        assert!(r.core.kept().named.is_none() && r.core.kept().place.is_none());
+        r.w.output_turned_off = false;
+        r.w.our_device = true;
+        if delay > 0 {
+            r.tick();
+            r.wait(delay);
+        }
+        r.w.set_playback(OutputRef::Ours);
+        r.event(Event::Output(OutputEvent::DefaultChanged { at_ms: r.now.mono_ms }));
+        r.wait(WINDOWS_DOING_MS + 1);
+        assert!(r.jobs.is_empty());
+        assert!(r.core.kept().place.is_none());
+        assert!(!r.core.no_speaker_chosen && r.core.popup.is_none());
+        assert!(r.w.playback_on(&OutputRef::Pc(out("speakers"))));
+    }
+}
+
+fn request_repair(r: &mut Rig) -> u64 {
+    r.cmd(Command::RepairOutput).unwrap();
+    r.take().into_iter().find_map(|action| match action {
+        Do::RepairOutput(run) => Some(run),
+        _ => None,
+    }).expect("Repair should launch")
+}
+
+fn per_app_repair() -> (Rig, u64) {
+    let mut r = Rig::new();
+    r.w.settings.only_some_apps = true;
+    r.plug_headphones(true);
+    r.w.our_device = false;
+    let run = request_repair(&mut r);
+    (r, run)
+}
+
+#[test]
+fn per_app_turn_on_checks_playback_when_the_output_returns_and_two_seconds_later() {
+    let mut r = Rig::new();
+    r.w.settings.only_some_apps = true;
+    r.plug_headphones(true);
+    r.w.our_device = false;
+    r.w.output_turned_off = true;
+    r.cmd(Command::TurnOnOutput).unwrap();
+    r.wait(3_000);
+
+    let headphones = OutputRef::Pc(out("headphones"));
+    r.w.output_turned_off = false;
+    r.w.our_device = true;
+    r.w.default_output = Some(OutputRef::Ours);
+    r.tick();
+    assert_eq!(r.w.default_output, Some(headphones.clone()));
+    assert_eq!(r.core.next_due(), Some(r.now.mono_ms + 2_000));
+
+    r.w.multimedia_output = Some(OutputRef::Ours);
+    r.wait(1_999);
+    assert_eq!(r.w.multimedia_output, Some(OutputRef::Ours));
+    r.wait(1);
+    assert!(r.w.playback_on(&headphones));
+}
+
+#[test]
+fn per_app_repair_checks_each_role_at_the_end_and_two_seconds_later() {
+    use crate::platform::RepairExit;
+    enum Approval { BeforeOutput, BeforeExit, AfterExit }
+    for exit in [RepairExit::Success, RepairExit::Cancelled, RepairExit::Failed] {
+        for approval in [Approval::BeforeOutput, Approval::BeforeExit, Approval::AfterExit] {
+            for console_first in [true, false] {
+                let (mut r, run) = per_app_repair();
+                if matches!(approval, Approval::BeforeOutput) { r.event(Event::RepairApproved(run)); }
+                r.w.our_device = true;
+                if console_first { r.w.default_output = Some(OutputRef::Ours); }
+                else { r.w.multimedia_output = Some(OutputRef::Ours); }
+                r.event(Event::Output(OutputEvent::DefaultChanged { at_ms: r.now.mono_ms }));
+                if matches!(approval, Approval::BeforeExit) { r.event(Event::RepairApproved(run)); }
+                r.wait(12_000);
+                assert!(r.w.uses_app_output());
+                let headphones = WinTarget::Output(out("headphones"));
+                assert!(!windows_to(&r.take(), &headphones));
+
+                r.event(Event::RepairExited(run, exit));
+                let pc = OutputRef::Pc(out("headphones"));
+                assert!(r.w.playback_on(&pc));
+                assert_eq!(r.core.next_due(), Some(r.now.mono_ms + 2_000));
+                if matches!(approval, Approval::AfterExit) { r.event(Event::RepairApproved(run)); }
+
+                if console_first { r.w.multimedia_output = Some(OutputRef::Ours); }
+                else { r.w.default_output = Some(OutputRef::Ours); }
+                r.wait(1_999);
+                assert!(r.w.uses_app_output());
+                r.wait(1);
+                assert!(r.w.playback_on(&pc));
+
+                r.choose_in_windows(OutputRef::Ours);
+                r.wait(12_000);
+                assert!(r.w.playback_on(&OutputRef::Ours));
+            }
+        }
+    }
+}
+
+#[test]
+fn per_app_repair_checks_when_the_output_appears_after_a_successful_exit() {
+    use crate::platform::RepairExit;
+    enum Approval { BeforeExit, BeforeOutput, AfterOutput }
+    for approval in [Approval::BeforeExit, Approval::BeforeOutput, Approval::AfterOutput] {
+        let (mut r, run) = per_app_repair();
+        if matches!(approval, Approval::BeforeExit) { r.event(Event::RepairApproved(run)); }
+        r.event(Event::RepairExited(run, RepairExit::Success));
+        if matches!(approval, Approval::BeforeOutput) { r.event(Event::RepairApproved(run)); }
+        r.wait(4_000);
+        r.w.our_device = true;
+        r.w.multimedia_output = Some(OutputRef::Ours);
+        r.tick();
+        assert!(r.w.playback_on(&OutputRef::Pc(out("headphones"))));
+        if matches!(approval, Approval::AfterOutput) { r.event(Event::RepairApproved(run)); }
+        r.w.default_output = Some(OutputRef::Ours);
+        r.wait(1_999);
+        assert_eq!(r.w.default_output, Some(OutputRef::Ours));
+        r.wait(1);
+        assert!(r.w.playback_on(&OutputRef::Pc(out("headphones"))));
+        r.choose_in_windows(OutputRef::Ours);
+        r.wait(12_000);
+        assert!(r.w.playback_on(&OutputRef::Ours));
+    }
+}
+
+#[test]
+fn per_app_repair_checks_after_a_timeout_even_if_both_roles_were_on_the_pc() {
+    for approved in [true, false] {
+        let (mut r, run) = per_app_repair();
+        if approved { r.event(Event::RepairApproved(run)); }
+        let until = r.core.recovery.due().unwrap();
+        r.now = r.now.later(until - r.now.mono_ms);
+        r.tick();
+        r.w.our_device = true;
+        r.w.multimedia_output = Some(OutputRef::Ours);
+        r.wait(1_999);
+        assert_eq!(r.w.multimedia_output, Some(OutputRef::Ours));
+        r.wait(1);
+        assert!(r.w.playback_on(&OutputRef::Pc(out("headphones"))));
+    }
+}
+
+#[test]
+fn an_active_output_ends_an_unanswered_approval_and_unlocks_the_rows() {
+    use crate::model::scene::RepairNow;
+    let mut r = Rig::new();
+    r.w.our_device = false;
+    let run = request_repair(&mut r);
+    assert_eq!(row(&r, K), RowState::RepairFirst);
+    r.w.our_device = true;
+    r.tick();
+    assert_eq!(r.core.repair_note(&r.w), RepairNow::Worked);
+    assert_ne!(row(&r, K), RowState::RepairFirst);
+    r.event(Event::RepairApproved(run));
+    r.event(Event::RepairExited(run, crate::platform::RepairExit::Cancelled));
+    assert_eq!(r.core.repair_note(&r.w), RepairNow::Worked);
+}
+
+#[test]
+fn repair_can_launch_again_at_five_minutes_and_ignores_the_old_prompt() {
+    use crate::model::scene::RepairNow;
+    let mut r = Rig::new();
+    r.w.our_device = false;
+    let first = request_repair(&mut r);
+    let deadline = r.now.mono_ms + 300_000;
+    assert_eq!(r.core.recovery.due(), Some(deadline));
+    r.now = r.now.later(299_999);
+    r.cmd(Command::RepairOutput).unwrap();
+    assert!(!r.take().iter().any(|a| matches!(a, Do::RepairOutput(_))));
+    r.now = r.now.later(1);
+    let second = request_repair(&mut r);
+    assert_ne!(first, second);
+    r.event(Event::RepairApproved(first));
+    r.event(Event::RepairExited(first, crate::platform::RepairExit::Cancelled));
+    assert_eq!(r.core.repair_note(&r.w), RepairNow::NotAsked);
+    r.event(Event::RepairApproved(second));
+    assert_eq!(r.core.repair_note(&r.w), RepairNow::Running);
+}

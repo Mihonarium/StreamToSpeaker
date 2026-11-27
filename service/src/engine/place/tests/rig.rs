@@ -50,6 +50,8 @@ pub fn world() -> World {
         default_output: Some(OutputRef::Pc(out("speakers"))),
         multimedia_output: Some(OutputRef::Pc(out("speakers"))),
         our_device: true,
+        output_turned_off: false,
+        can_repair: true,
         players: Vec::new(),
         connections: vec![Connection { net: home(), name: Some("HomeNet".into()), kind: ConnKind::WiFi }],
         settings: SettingsWorld::default(),

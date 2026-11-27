@@ -4,7 +4,7 @@ name: Installer lifecycle
 # runner and checks what each step leaves behind (logic and checks in
 # .github/scripts/Test-InstallerLifecycle.ps1):
 #
-#   fresh install → repair → uninstall
+#   fresh install → repair output → repair install → uninstall
 #   → previous public release → upgrade to this build → uninstall
 #   (→ also over the Microsoft-signed-driver variant, when built)
 #
@@ -13,12 +13,12 @@ name: Installer lifecycle
 # Pre-Install.ps1 and Rename-Endpoint.ps1 must log into the install
 # directory, never into the user's profile.
 #
-# Hosted runners run Windows Server without test-signing, so the driver is
-# never expected to load here: the checks cover what the installer itself
-# does (files, Apps & Features entry, shortcuts, certificate trust, driver
-# store, device node) and only report the device's status.
+# After removal and again after disabling, repair-output checks that the
+# device is enabled with its installed problem code. The disabled instance
+# must keep its ID and the render endpoint must match the fresh install.
+# A restored device whose driver cannot load has its own exit code and log ending.
 #
-# Called by build.yml on pull requests that touch the installer (same run,
+# Called by build.yml on pull requests that touch the installer or Repair (same run,
 # so it tests exactly the installer that run built), or dispatched by hand
 # against an earlier Build installer run's artifacts.
 
@@ -219,6 +219,13 @@ jobs:
           -Installer $env:STS_DEV_EXE -DriverRecord $env:STS_DEV_RECORD
           -ExpectVersion $env:STS_VERSION -ExpectExe $env:STS_SERVICE_EXE
 
+      - name: Repair the removed and disabled sound output
+        id: repair_output
+        # Finish the other installer phases before reporting a repair failure.
+        continue-on-error: true
+        shell: pwsh
+        run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase repair-output
+
       - name: Repair (reinstall over itself)
         shell: pwsh
         run: >
@@ -259,6 +266,11 @@ jobs:
         if: steps.prev.outputs.found == 'true'
         shell: pwsh
         run: .github/scripts/Test-InstallerLifecycle.ps1 -Phase uninstall
+
+      - name: Check the sound output repair result
+        if: always() && steps.repair_output.outcome == 'failure'
+        shell: pwsh
+        run: throw "The repair-output phase failed. See its device and endpoint checks."
 
       - name: Collect logs
         if: always()

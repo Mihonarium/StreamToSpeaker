@@ -98,6 +98,7 @@ impl Contents for SettingsContents {
                 self.port.act(Act::Donate);
                 None
             }
+            Open::ReportProblem => self.dialog(Dialog::Report(Default::default())),
             Open::SoundSettings => {
                 (self.open_windows_page)(WindowsPage::Sound);
                 None
@@ -305,6 +306,7 @@ mod tests {
         assert!(s.take_acts().is_empty());
         assert!(c.open(&Open::Donate, &snap("kitchen-playing"), true).is_none());
         assert_eq!(s.take_acts(), vec![Act::Donate]);
+        assert!(c.open(&Open::ReportProblem, &snap("restart-needed"), true).is_some());
         OPENED.lock().unwrap().clear();
         for open in [Open::SoundSettings, Open::VolumeMixer, Open::NetworkSettings] {
             assert!(c.open(&open, &snap("kitchen-playing"), true).is_none());

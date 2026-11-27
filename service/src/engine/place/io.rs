@@ -56,6 +56,9 @@ pub struct World {
     pub multimedia_output: Option<OutputRef>,
     /// The app’s device is in Windows’ list of sound outputs.
     pub our_device: bool,
+    /// Windows lists the app’s render endpoint as disabled.
+    pub output_turned_off: bool,
+    pub can_repair: bool,
     pub players: Vec<PlayerWorld>,
     /// This PC's network connections now.
     pub connections: Vec<Connection>,
@@ -189,6 +192,9 @@ impl Default for SettingsWorld {
 /// Something that happened.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    RepairApproved(u64),
+    RepairExited(u64, crate::platform::RepairExit),
+    TurnOnFailed,
     /// A connection the core asked for ended.
     Connected { gen: u64, ended: Ended },
     /// A switch released this place's session before another choice took effect.
@@ -281,6 +287,8 @@ pub enum StartKind {
 /// What the engine does, in the order given.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Do {
+    TurnOnOutput,
+    RepairOutput(u64),
     /// A person or Windows chose an output.
     PickedOutput,
     /// Connect a speaker (on a thread of its own); the end comes back as

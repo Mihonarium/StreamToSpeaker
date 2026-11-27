@@ -240,6 +240,7 @@ impl PlaceDriver {
         };
         let outputs = &self.platform.outputs;
         let ours = outputs.our_output();
+        let output_turned_off = ours.is_none() && self.platform.device.turned_off();
         let players = self.platform.players.list();
         let enabled: Vec<_> = outputs.list().iter().filter(|o| Some(&o.id) != ours.as_ref()).map(|o| o.to_model()).collect();
         let world = World {
@@ -250,6 +251,8 @@ impl PlaceDriver {
             default_output: outputs.default_output().map(|o| output_ref(o, &ours)),
             multimedia_output: outputs.default_for(crate::platform::Role::Multimedia).map(|o| output_ref(o, &ours)),
             our_device: ours.is_some(),
+            can_repair: ours.is_none() && !output_turned_off && self.platform.device.can_repair(),
+            output_turned_off,
             players: players
                 .iter()
                 .map(|p| PlayerWorld {

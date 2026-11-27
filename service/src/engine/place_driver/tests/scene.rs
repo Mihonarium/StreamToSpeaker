@@ -299,3 +299,130 @@ fn first_run_without_speaker_search_starts_with_search_off() {
     assert!(scene.speakers.is_empty() && scene.situation.first_run.is_some());
     assert_eq!(scene.search.phase, SearchPhase::Off);
 }
+
+#[test]
+fn disabled_output_uses_visibility_and_recovers_without_repair() {
+    use crate::model::scene::RepairNow;
+    let mut r = Rig::on(App::for_tests());
+    r.windows.set_output_on(OURS, false);
+    r.driver.look();
+    assert_eq!(r.driver.scene().repair, RepairNow::TurnedOff);
+    r.send(Command::RepairOutput);
+    r.windows.set_protected_install(false);
+    assert_eq!(r.driver.scene().repair, RepairNow::TurnedOff);
+    r.windows.refuse_turn_on(true);
+    r.send(Command::TurnOnOutput);
+    r.settle();
+    assert_eq!(r.driver.scene().repair, RepairNow::TurnOnFailed);
+    assert_eq!(r.windows.recovery_calls(), (1, 0));
+
+    r.windows.set_our_output_present(false);
+    r.driver.look();
+    assert_eq!(r.driver.scene().repair, RepairNow::Unavailable);
+    r.windows.set_our_output_present(true);
+    r.windows.refuse_turn_on(false);
+    r.driver.look();
+    r.send(Command::TurnOnOutput);
+    r.driver.look();
+    let scene = r.driver.scene();
+    assert!(!scene.situation.standing.contains(&Standing::OutputMissing));
+    assert_eq!(scene.repair, RepairNow::Worked);
+    assert_eq!(r.windows.recovery_calls(), (2, 0));
+}
+
+#[test]
+fn per_app_repair_returns_multimedia_when_windows_refuses_console() {
+    use crate::platform::{Outputs, RepairExit, PLAYBACK_ROLES};
+    let mut r = Rig::on(App::for_tests());
+    r.app.user_config.lock().unwrap().only_some_apps = true;
+    r.windows.set_our_output_present(false);
+    r.windows.set_repair_exit(RepairExit::Success);
+    r.send(Command::RepairOutput);
+    r.settle();
+
+    r.windows.set_our_output_present(true);
+    r.windows.set_default(&output(OURS), PLAYBACK_ROLES).unwrap();
+    r.windows.refuse_role(Some(Role::Console));
+    let before = r.windows.switches().len();
+    r.driver.look();
+    assert_eq!(r.default(), output(OURS));
+    assert_eq!(r.windows.default_for(Role::Multimedia), Some(output(SPEAKERS)));
+    assert_eq!(r.windows.switches()[before..], [
+        (output(SPEAKERS), vec![Role::Console]),
+        (output(SPEAKERS), vec![Role::Multimedia]),
+    ]);
+}
+
+#[test]
+fn repair_needs_a_protected_install_and_a_window_and_follows_the_output() {
+    use crate::model::scene::RepairNow;
+    use crate::platform::RepairExit;
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.windows.set_our_output_present(false);
+    r.driver.look();
+    assert_eq!(r.driver.situation().speaker(&id()).unwrap().state, RowState::RepairFirst);
+    for from in [Surface::Phone, Surface::Api, Surface::CommandLine] {
+        assert_eq!(r.driver.command(from, &Command::RepairOutput), Err(Refusal::WindowOnly));
+    }
+    r.send(Command::TurnOnOutput);
+    assert_eq!(r.windows.recovery_calls(), (0, 0));
+
+    r.windows.set_protected_install(false);
+    assert_eq!(r.driver.scene().repair, RepairNow::Unavailable);
+    r.send(Command::RepairOutput);
+    r.settle();
+    assert_eq!(r.windows.recovery_calls(), (0, 0));
+    r.windows.set_protected_install(true);
+    r.windows.set_output_on(HEADPHONES, true);
+    r.windows.choose_in_windows(HEADPHONES);
+    r.driver.look();
+    r.advance(2_000);
+    let switches = r.windows.switches();
+
+    r.windows.set_repair_exit(RepairExit::Cancelled);
+    r.send(Command::RepairOutput);
+    r.send(Command::RepairOutput);
+    r.settle();
+    assert_eq!(r.driver.scene().repair, RepairNow::NotApproved);
+    assert_eq!(r.windows.recovery_calls(), (0, 1));
+
+    r.windows.set_repair_exit(RepairExit::Failed);
+    r.send(Command::RepairOutput);
+    r.settle();
+    assert_eq!(r.driver.scene().repair, RepairNow::DidntWork);
+
+    r.windows.set_repair_exit(RepairExit::Success);
+    r.send(Command::RepairOutput);
+    assert_eq!(r.driver.scene().repair, RepairNow::NotAsked);
+    let approved = r.rx.recv_timeout(WAIT).unwrap();
+    assert!(matches!(approved, PlaceInput::Event(Event::RepairApproved(_))));
+    r.driver.input(approved);
+    assert_eq!(r.driver.scene().repair, RepairNow::Running);
+    r.send(Command::RepairOutput);
+    r.advance(119_000);
+    assert_eq!(r.driver.scene().repair, RepairNow::Running);
+    r.advance(1_001);
+    assert_eq!(r.driver.scene().repair, RepairNow::DidntWork);
+    assert_eq!(r.windows.switches(), switches);
+    assert_eq!(r.windows.recovery_calls(), (0, 3));
+    let late_exit = r.rx.recv_timeout(WAIT).unwrap();
+
+    r.windows.set_repair_exit(RepairExit::Failed);
+    r.send(Command::RepairOutput);
+    r.driver.input(late_exit);
+    r.windows.set_output_on(OURS, false);
+    r.windows.set_our_output_present(true);
+    r.settle();
+    assert_eq!(r.driver.scene().repair, RepairNow::TurnedOff);
+    r.send(Command::TurnOnOutput);
+    r.driver.look();
+    assert_eq!(r.driver.scene().repair, RepairNow::Worked);
+    assert_ne!(r.driver.situation().speaker(&id()).unwrap().state, RowState::RepairFirst);
+    r.advance(60_000);
+    assert_eq!(r.driver.scene().repair, RepairNow::Worked);
+    r.pick();
+    assert_eq!(r.driver.scene().repair, RepairNow::NotAsked);
+    r.settle();
+    assert_eq!(r.windows.recovery_calls(), (1, 4));
+}

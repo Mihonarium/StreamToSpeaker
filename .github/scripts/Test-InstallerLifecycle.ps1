@@ -21,9 +21,10 @@
     Each setup run's copy of the log goes with the uploaded logs, since
     uninstall deletes it.
 
-    Hosted runners have no test-signing and run Windows Server, so the
-    driver is not expected to *load*: the device's status is reported, not
-    required. What is required is everything the installer itself controls.
+    The repair-output phase compares each repair with the fresh install.
+    Even when the runner cannot load the driver, repair must restore the
+    device and its original problem code. The render endpoint must return to
+    its measured state. Enabling a device must preserve its instance ID.
 
     State shared between phases (sentinel hash, certificate thumbprint)
     lives in a JSON file under -WorkDir.
@@ -31,6 +32,7 @@
 .PARAMETER Phase
     env       report test-signing / Secure Boot / OS; create the sentinel
     install   run -Installer on a clean machine
+    repair-output restore the removed device, then restore it after disabling it
     repair    delete two installed files, re-run -Installer, expect them back
     uninstall run the registered uninstaller
     previous  run -Installer (an older release) with lighter file checks
@@ -39,7 +41,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("env", "install", "repair", "uninstall", "previous", "upgrade")]
+    [ValidateSet("env", "install", "repair-output", "repair", "uninstall", "previous", "upgrade")]
     [string]$Phase,
     # Installer to run (install / repair / previous / upgrade).
     [string]$Installer = "",
@@ -103,8 +105,8 @@ function Get-DriverPackages {
         Where-Object { Select-String -Path $_.FullName -Pattern $HardwareId -SimpleMatch -Quiet -ErrorAction SilentlyContinue })
 }
 
-function Get-OurDevices {
-    @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+function Get-OurDevices([System.Management.Automation.ActionPreference]$onError = "SilentlyContinue") {
+    @(Get-CimInstance Win32_PnPEntity -ErrorAction $onError |
         Where-Object { $_.HardwareID -and ($_.HardwareID -contains $HardwareId) })
 }
 
@@ -437,6 +439,88 @@ function Assert-Installed([switch]$Full) {
     Write-State $s
 }
 
+function Test-ActiveRenderEndpoint([string]$instance) {
+    $render = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
+    try {
+        foreach ($endpoint in (Get-ChildItem -LiteralPath $render -ErrorAction Stop)) {
+            $state = $endpoint.GetValue("DeviceState")
+            if ($null -eq $state) { throw "Missing DeviceState on $($endpoint.Name)" }
+            if ($state -ne 1) { continue }
+            $id = "SWD\MMDEVAPI\{0.0.0.00000000}.$($endpoint.PSChildName)"
+            $parent = Get-PnpDeviceProperty -InstanceId $id -KeyName DEVPKEY_Device_Parent -ErrorAction Stop
+            if ([string]::IsNullOrWhiteSpace($parent.Data)) { throw "Missing parent on $id" }
+            if ($parent.Data -eq $instance) { return "Active" }
+        }
+        return "Inactive"
+    } catch {
+        Write-Host "Could not read the render endpoint for ${instance}: $_"
+        return "Unreadable"
+    }
+}
+
+# PnP and WMI update asynchronously. Wait for two consecutive matching snapshots.
+function Wait-OutputDevices([int]$count, [int]$problem = -1, [string]$expectedEndpoint, [int]$timeoutSeconds = 20) {
+    $until = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
+    $previous = $null
+    do {
+        $devices = @(Get-OurDevices -onError Stop | Where-Object Present)
+        if ($devices.Count -eq $count -and
+            ($count -eq 0 -or $problem -eq -1 -or $devices[0].ConfigManagerErrorCode -eq $problem)) {
+            $readings = @(foreach ($device in $devices) {
+                $endpoint = Test-ActiveRenderEndpoint $device.PNPDeviceID
+                [pscustomobject]@{
+                    PNPDeviceID = $device.PNPDeviceID
+                    ConfigManagerErrorCode = $device.ConfigManagerErrorCode
+                    Endpoint = $endpoint
+                }
+            })
+            $snapshot = ($readings | ForEach-Object { "$($_.PNPDeviceID) $($_.ConfigManagerErrorCode) $($_.Endpoint)" }) -join ','
+            if ($readings.Endpoint -contains "Unreadable") {
+                $previous = $null
+            } elseif ($null -ne $previous -and $snapshot -eq $previous -and
+                (!$expectedEndpoint -or $readings[0].Endpoint -eq $expectedEndpoint)) {
+                return $readings
+            } else {
+                $previous = $snapshot
+            }
+        } else {
+            $previous = $null
+            $snapshot = "Observed $($devices.Count) present device(s), problem code(s) $($devices.ConfigManagerErrorCode)"
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $until)
+    throw "PnP did not settle at $count present $HardwareId device(s) with expected problem code $problem and endpoint '$expectedEndpoint'. Last reading: $snapshot"
+}
+
+function Assert-OutputRepair([string]$from, [uint32]$installedProblem, [string]$installedEndpoint,
+                             [bool]$installedWorking, [string]$sameInstance) {
+    $app = Get-AppDir
+    $runId = [guid]::NewGuid().ToString("N")
+    $repair = Start-Process (Join-Path $app $ExeName) -ArgumentList "--repair-output $runId" -PassThru
+    if (-not $repair.WaitForExit(120000)) { throw "Repair from $from exceeded two minutes" }
+    if (-not $installedWorking) {
+        $expectedExit = 2
+        $ending = "Repair ended with the device present but not working"
+    } elseif ($installedEndpoint -eq "Active") {
+        $expectedExit = 0
+        $ending = "Repair finished with a working device and active render endpoint"
+    } else {
+        $expectedExit = 1
+        $ending = "Repair failed: No active render endpoint on a working $HardwareId device"
+    }
+    Check ($repair.ExitCode -eq $expectedExit) "repair from $from exited with $($repair.ExitCode) (expected $expectedExit)"
+    $log = Get-Item (Join-Path $app "logs\repair-output-$runId.log")
+    Copy-Item $log.FullName $LogDir
+    $last = Get-Content -LiteralPath $log.FullName -Tail 1
+    Check ($last -ceq $ending) "repair from $from ended its log with '$last' (expected '$ending')"
+
+    $devices = @(Wait-OutputDevices 1 $installedProblem $installedEndpoint)
+    $instance = $devices[0].PNPDeviceID
+    Check ($devices[0].ConfigManagerErrorCode -ne 22) "device $instance enabled after repair from $from"
+    if ($sameInstance) { Check ($instance -eq $sameInstance) "repair enabled the same instance $sameInstance" }
+    Check ($devices[0].Endpoint -eq $installedEndpoint) "render endpoint on $instance returned to its installed state ($installedEndpoint)"
+}
+
 function Assert-Removed {
     Check (-not (Test-Path $UninstallKey)) "Apps & Features entry removed"
     Check (-not (Test-Path $DefaultAppDir)) "install directory removed"
@@ -489,6 +573,33 @@ switch ($Phase) {
         Invoke-CurrentSetup "install"
         Assert-Installed -Full
         Assert-DiagnoseFindsInstallLog "install"
+        Assert-Sentinel
+    }
+    "repair-output" {
+        $devcon = Join-Path (Get-AppDir) "driver\devcon.exe"
+        $installed = @(Wait-OutputDevices 1)
+        $installedProblem = $installed[0].ConfigManagerErrorCode
+        if ($null -eq $installedProblem -or $installedProblem -eq 22) {
+            throw "Expected an enabled device after install, found problem code '$installedProblem'"
+        }
+        $status = (Get-PnpDeviceProperty -InstanceId $installed[0].PNPDeviceID -KeyName DEVPKEY_Device_DevNodeStatus -ErrorAction Stop).Data
+        if ($null -eq $status) { throw "Could not read the installed device's status flags" }
+        # DN_STARTED (0x8) set and DN_HAS_PROBLEM (0x400) clear.
+        $working = $installedProblem -eq 0 -and ($status -band 0x408) -eq 8
+        $endpoint = $installed[0].Endpoint
+        Write-Host "Installed $($installed[0].PNPDeviceID) has problem code $installedProblem. Render endpoint: $endpoint"
+        & $devcon remove $HardwareId
+        Check ($LASTEXITCODE -eq 0) "devcon removed $HardwareId"
+        $null = Wait-OutputDevices 0
+        Assert-OutputRepair "removed" $installedProblem $endpoint $working
+
+        $devices = @(Wait-OutputDevices 1 $installedProblem)
+        $instance = $devices[0].PNPDeviceID
+        & pnputil.exe /disable-device $instance
+        Check ($LASTEXITCODE -eq 0) "pnputil disabled $instance"
+        $disabled = @(Wait-OutputDevices 1 22)
+        Check ($disabled[0].PNPDeviceID -eq $instance) "the intended instance is disabled"
+        Assert-OutputRepair "disabled" $installedProblem $endpoint $working $instance
         Assert-Sentinel
     }
     "repair" {

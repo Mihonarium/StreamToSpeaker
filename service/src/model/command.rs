@@ -27,6 +27,8 @@ pub enum Surface {
 /// One request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    TurnOnOutput,
+    RepairOutput,
     /// Play on a speaker that is playing something else, taking it over:
     /// the answer to the row's question, or *Play on Kitchen again* after
     /// a takeover.
@@ -199,6 +201,7 @@ pub enum Open {
     Donate,
     /// Windows: Sound settings.
     SoundSettings,
+    ReportProblem,
     /// Windows: the Volume mixer.
     VolumeMixer,
     /// Windows: the network's settings (to make it private).

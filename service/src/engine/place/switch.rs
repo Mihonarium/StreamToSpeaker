@@ -44,7 +44,7 @@ impl Core {
         now: Clock,
         out: &mut Vec<Do>,
     ) -> Result<Effect, Refusal> {
-        if self.device_missing {
+        if self.device_missing || self.recovery.repairing() {
             return Ok(Effect::Done);
         }
         let way = self.way_for(&k, way, w);
@@ -83,6 +83,7 @@ impl Core {
         self.cancel_switch(w, out);
         self.confirm = None;
         self.pick_failed = None;
+        self.recovery.switched();
         self.no_speaker_chosen = false;
         if let Some(what) = confirm {
             self.ask(what, by, who, windows_prev.clone(), w, now, out);

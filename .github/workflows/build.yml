@@ -1344,7 +1344,7 @@ jobs:
         run: |
           files=$(git diff --name-only HEAD^1 HEAD)
           printf '%s\n' "$files"
-          if printf '%s\n' "$files" | grep -qE '^(installer/|scripts/(Pre-Install|Rename-Endpoint|Reset-Install|Diagnose)\.ps1$|\.github/workflows/(build|installer-lifecycle)\.yml$|\.github/scripts/(Test-InstallerLifecycle|Write-DriverRecord)\.ps1$)'; then
+          if printf '%s\n' "$files" | grep -qE '^(installer/|service/src/(main|endpoint_name|platform/win|platform/win/(repair|repair_policy|install|pnp))\.rs$|scripts/(Pre-Install|Rename-Endpoint|Reset-Install|Diagnose)\.ps1$|\.github/workflows/(build|installer-lifecycle)\.yml$|\.github/scripts/(Test-InstallerLifecycle|Write-DriverRecord)\.ps1$)'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -1381,6 +1381,10 @@ jobs:
       - name: Workflow checks (test_workflows.py)
         working-directory: .github/scripts
         run: python3 -m unittest -v test_workflows
+
+      - name: Test installer endpoint readings
+        shell: pwsh
+        run: .github/scripts/test_installer_endpoint.ps1
 
       - name: Read rust-version from Cargo.toml
         id: msrv

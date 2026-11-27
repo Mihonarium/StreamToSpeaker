@@ -837,15 +837,18 @@ fn status_lines_follow_precedence_and_link_to_the_right_page() {
 #[test]
 fn lasting_notes_and_repairs() {
     for (state, mark, title, body, button) in [
-        (RepairNow::NotAsked, Mark::Warn, "The app’s sound output is missing", "Turn Stream To Speaker back on in Windows’ sound settings, or install the app again.", Some(("Open Windows’ sound settings", Open::SoundSettings))),
+        (RepairNow::Unavailable, Mark::Warn, "The app’s sound output is missing", "Turn Stream To Speaker back on in Windows’ sound settings, or install the app again.", Some(("Open Windows’ sound settings", Command::Open(Open::SoundSettings)))),
+        (RepairNow::NotAsked, Mark::Warn, "The app’s sound output is missing", "The sound stays on this PC. Repair puts it back; it needs administrator approval.", Some(("Repair", Command::RepairOutput))),
+        (RepairNow::TurnedOff, Mark::Warn, "Stream To Speaker is turned off in Windows", "Repair turns it back on.", Some(("Repair", Command::TurnOnOutput))),
+        (RepairNow::TurnOnFailed, Mark::Warn, "Stream To Speaker is turned off in Windows", "Windows didn’t turn it back on. Turn it on in Windows’ sound settings.", Some(("Open Windows’ sound settings", Command::Open(Open::SoundSettings)))),
         (RepairNow::Running, Mark::Busy, "Repairing the app’s sound output…", "The sound stays on this PC meanwhile.", None),
-        (RepairNow::DidntWork, Mark::Warn, "Repair didn’t work", "Restart Windows to try to bring the app’s sound output back.", None),
-        (RepairNow::NotApproved, Mark::Warn, "Repair needs administrator approval", "It wasn’t given, so the sound stays on this PC.", Some(("Open Windows’ sound settings", Open::SoundSettings))),
+        (RepairNow::DidntWork, Mark::Warn, "Repair didn’t work: the app’s sound output is still missing", "Restarting Windows may help; if not, report the problem.", Some(("Report a problem", Command::Open(Open::ReportProblem)))),
+        (RepairNow::NotApproved, Mark::Warn, "Repair needs administrator approval, and it wasn’t given", "The sound stays on this PC.", Some(("Repair", Command::RepairOutput))),
         (RepairNow::Worked, Mark::Info, "The app’s sound output is back", "You can switch to a speaker again.", None),
     ] {
         let mut s = pc(); s.repair = state;
         if state != RepairNow::Worked { s.situation.standing.push(Standing::OutputMissing); }
-        assert_note(view(&s).about, mark, title, body, button.map(|(label, page)| (label, Command::Open(page))), false);
+        assert_note(view(&s).about, mark, title, body, button, false);
     }
     for (condition, mark, title, body, button) in [
         (Standing::WindowsDidntSwitch { speaker: kitchen() }, Mark::Warn, "Windows didn’t switch to Kitchen", "Try again, or choose this app’s output in Windows’ sound settings.", ("Open Windows’ sound settings", Command::Open(Open::SoundSettings))),
@@ -1581,8 +1584,8 @@ fn a_stale_repair_result_and_a_missing_name() {
         view(&s).about,
         Mark::Warn,
         "The app’s sound output is missing",
-        "Turn Stream To Speaker back on in Windows’ sound settings, or install the app again.",
-        Some(("Open Windows’ sound settings", Command::Open(Open::SoundSettings))),
+        "The sound stays on this PC. Repair puts it back; it needs administrator approval.",
+        Some(("Repair", Command::RepairOutput)),
         false,
     );
     s.repair = RepairNow::NotAsked;

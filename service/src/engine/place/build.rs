@@ -215,7 +215,7 @@ impl Core {
 
     /// The one state name a speaker's row shows.
     fn row_state(&self, s: &SpeakerWorld, now: Clock) -> RowState {
-        if self.device_missing {
+        if self.device_missing || self.recovery.repairing() {
             return RowState::RepairFirst;
         }
         let id = &s.id;

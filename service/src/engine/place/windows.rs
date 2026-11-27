@@ -52,6 +52,9 @@ impl Core {
             _ => {
                 self.pc_before_ours = None;
                 self.pc_return = None;
+                if matches!(self.repair_playback, RepairPlayback::AgainAt(_)) {
+                    self.repair_playback = RepairPlayback::Idle;
+                }
                 self.expect_default = None;
                 if self.ask_for_connecting_switch(w, out) { return; }
                 if let Some(speaker) = self.place.clone().filter(|_| w.our_device) {
@@ -165,6 +168,10 @@ impl Core {
         })
     }
 
+    fn in_repair_window(&self, at_ms: u64) -> bool {
+        self.repair_defaults.as_ref().is_some_and(|window| window.contains(&at_ms))
+    }
+
     fn default_changed(&mut self, to: Option<OutputRef>, at_ms: u64, w: &World, now: Clock, out: &mut Vec<Do>) {
         let prev = std::mem::replace(&mut self.last_default, to.clone());
         if prev == to && self.expect_default.is_none() {
@@ -184,6 +191,10 @@ impl Core {
             }
             return;
         }
+        if to == Some(OutputRef::Ours) && self.in_repair_window(at_ms) {
+            self.pending_default = None;
+            return self.windows_doing(to, w, now, out);
+        }
         if self.moved_near(at_ms) {
             return self.windows_doing(to, w, now, out);
         }
@@ -195,10 +206,29 @@ impl Core {
         self.pending_default = Some(PendingDefault { to, prev, at_ms });
     }
 
+    fn check_playback_after_repair(&mut self, w: &World, now: Clock) {
+        match self.repair_playback {
+            RepairPlayback::WhenFinished if self.recovery.due().is_none() => {
+                self.repair_playback = if w.settings.only_some_apps {
+                    RepairPlayback::AgainAt(now.mono_ms + WINDOWS_DOING_MS)
+                } else {
+                    RepairPlayback::Idle
+                };
+            }
+            RepairPlayback::AgainAt(at) if now.mono_ms >= at => self.repair_playback = RepairPlayback::Idle,
+            _ => return,
+        }
+        if w.settings.only_some_apps {
+            self.pc_return = w.uses_app_output().then(|| PcReturn::new(now));
+            self.expect_default = None;
+        }
+    }
+
     /// The timers of Windows' changes.
     pub(super) fn windows_timers(&mut self, w: &World, now: Clock, out: &mut Vec<Do>) {
-        if w.uses_app_output() && self.expect_default.is_none()
-            && self.pc_return.as_ref().is_some_and(|retry| now.mono_ms >= retry.due()) {
+        self.check_playback_after_repair(w, now);
+        if self.pc_return.as_ref().is_some_and(|retry| now.mono_ms >= retry.due())
+            && self.expect_default.is_none() && w.uses_app_output() {
             if let Some(pc) = self.pc_target(w) {
                 self.expect_default = Some(OutputRef::Pc(pc.clone()));
                 out.push(Do::Windows(WinTarget::Output(pc)));

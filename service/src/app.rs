@@ -315,7 +315,7 @@ pub type WindowsVolumePush = Box<dyn Fn(i32, bool) -> Result<()> + Send + Sync>;
 #[derive(Default)]
 pub struct WindowsSlider {
     driver: OnceLock<WindowsVolumePush>,
-    endpoint: OnceLock<Box<dyn Fn(u32, bool) + Send + Sync>>,
+    endpoint: OnceLock<Box<dyn Fn(u32, bool) -> bool + Send + Sync>>,
 }
 
 /// What a volume or mute change needs to reach the bound speaker, cloned
@@ -438,8 +438,7 @@ impl Drop for SpeakerControl {
 /// Set the Windows slider to `level`: through Windows' endpoint volume when
 /// the engine set that up, else through the driver if it is there.
 fn push_windows_level(windows: &WindowsSlider, level: u32, muted: bool) {
-    if let Some(set) = windows.endpoint.get() {
-        set(level.min(100), muted);
+    if windows.endpoint.get().is_some_and(|set| set(level.min(100), muted)) {
         return;
     }
     if let Some(push) = windows.driver.get() {
@@ -4130,6 +4129,11 @@ impl App {
     /// 0–100, muted) from now on, instead of the driver's push. The first
     /// registration wins.
     pub fn set_windows_level_through(&self, set: impl Fn(u32, bool) + Send + Sync + 'static) {
+        self.try_windows_level_through(move |level, muted| { set(level, muted); true });
+    }
+
+    /// Fall back to the driver when Windows has no active endpoint for this change.
+    pub(crate) fn try_windows_level_through(&self, set: impl Fn(u32, bool) -> bool + Send + Sync + 'static) {
         let _ = self.windows_volume.endpoint.set(Box::new(set));
     }
 

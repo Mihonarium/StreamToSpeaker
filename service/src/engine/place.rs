@@ -22,6 +22,8 @@ pub mod trials;
 
 mod build;
 mod popups;
+mod repair;
+use repair::{Recovery, RepairPlayback};
 mod switch;
 mod trouble;
 mod windows;
@@ -304,6 +306,10 @@ pub struct Core {
     gen: u64,
     panel_open: bool,
     device_missing: bool,
+    recovery: Recovery,
+    repair_playback: RepairPlayback,
+    /// Windows can restore its default during Repair and just after it ends.
+    repair_defaults: Option<std::ops::RangeInclusive<u64>>,
     /// When the core was made.
     started_wall: WallTime,
     /// The Settings option, as last seen.
@@ -385,6 +391,9 @@ impl Core {
             gen: 0,
             panel_open: false,
             device_missing: false,
+            recovery: Recovery::Idle,
+            repair_playback: RepairPlayback::Idle,
+            repair_defaults: None,
             started_wall: now.wall,
             switch_back_on: false,
             only_some_apps: None,
@@ -443,6 +452,23 @@ impl Core {
         self.begin(w, w.panel_open, now, &mut out);
         match e {
             Event::Connected { gen, ended } => self.connected(gen, ended, w, now, &mut out),
+            Event::RepairApproved(run) => {
+                let until = now.mono_ms + u64::from(crate::platform::REPAIR_TIMEOUT_MS);
+                if let RepairPlayback::Helper { run: id, until: deadline } = &mut self.repair_playback {
+                    if *id == run { *deadline = until; }
+                }
+                if matches!(self.recovery, Recovery::Asking { run: id, .. } if id == run) {
+                    self.stay_on_pc_for_repair(now, &mut out);
+                    self.recovery = Recovery::Running { run, until };
+                }
+            }
+            Event::RepairExited(run, exit) => {
+                if matches!(self.repair_playback, RepairPlayback::Helper { run: id, .. } if id == run) {
+                    self.repair_playback = RepairPlayback::WhenFinished;
+                }
+                self.recovery.exited(run, exit, now.mono_ms);
+            }
+            Event::TurnOnFailed => self.recovery = Recovery::TurnOnFailed,
             Event::PlaceReleased(id) => {
                 if self.connected_speaker() == Some(&id) {
                     self.stream_off(&mut out);
@@ -468,6 +494,27 @@ impl Core {
         self.begin(w, w.panel_open, now, &mut out);
         self.finish(w, now, &mut out);
         out
+    }
+
+    // Drop the old speaker choice without asking Windows to change any role.
+    fn stay_on_pc_for_repair(&mut self, now: Clock, out: &mut Vec<Do>) {
+        self.repair_defaults = Some(now.mono_ms..=now.mono_ms + WINDOWS_DOING_MS);
+        self.start_look = None;
+        self.confirm = None;
+        if let Some(s) = self.switch.take() { out.push(Do::Supersede(s.gen)); }
+        if self.pending_default.as_ref().is_some_and(|p| p.to == Some(OutputRef::Ours)) {
+            self.pending_default = None;
+        }
+        if self.expect_default == Some(OutputRef::Ours) { self.expect_default = None; }
+        let named = self.named.take();
+        if self.place.take().is_some() || named.is_some() {
+            self.place_changed(now);
+            out.push(Do::Save);
+        }
+    }
+
+    pub(super) fn repair_note(&self, w: &World) -> crate::model::scene::RepairNow {
+        self.recovery.note(w)
     }
 
     /// What is kept across a restart.
@@ -532,6 +579,8 @@ impl Core {
                 due.push(c.since_ms + CONFIRMATION_POPUP_MS);
             }
         }
+        due.extend(self.recovery.due());
+        due.extend(self.repair_playback.due());
         due.extend(self.listening.values().map(|l| l.next_ms));
         due.extend(self.pending_default.as_ref().map(|p| p.at_ms + WINDOWS_DOING_MS));
         due.extend(self.pending_headphones.as_ref().map(|(_, at)| at + WINDOWS_DOING_MS));
@@ -552,6 +601,15 @@ impl Core {
     /// Before handling a call: the time, the panel, the app's device.
     fn begin(&mut self, w: &World, panel_open: bool, now: Clock, out: &mut Vec<Do>) {
         self.now = now;
+        if matches!(self.repair_playback, RepairPlayback::Helper { until, .. } if now.mono_ms >= until) {
+            self.repair_playback = RepairPlayback::WhenFinished;
+        }
+        self.recovery.observe_approval(w, now.mono_ms);
+        if self.recovery.changing_output() {
+            if let Some(window) = &mut self.repair_defaults {
+                *window = *window.start()..=now.mono_ms + WINDOWS_DOING_MS;
+            }
+        }
         self.switch_back_on = w.settings.switch_back_after_quiet;
         self.follow_routing_mode(w, out);
         if panel_open != self.panel_open {
@@ -566,8 +624,9 @@ impl Core {
         if missing != self.device_missing {
             self.device_missing = missing;
             if !missing {
-                // The device is back: go on at the speaker as at a start.
-                self.start_place(w, now, out);
+                if self.recovery == Recovery::Idle || self.recovery == Recovery::NotApproved {
+                    self.start_place(w, now, out);
+                }
             } else if let Some(k) = self.place.clone() {
                 if self.stream_connected() {
                     out.push(Do::StopSending { speaker: k, take_off: false });
@@ -580,6 +639,7 @@ impl Core {
     /// After handling a call: what time decides, then what follows from
     /// the state.
     fn finish(&mut self, w: &World, now: Clock, out: &mut Vec<Do>) {
+        self.recovery.observe(w, now.mono_ms);
         let changes = self.detector.advance(now.mono_ms);
         self.sound_changes(changes, w, now, out);
         self.timers(w, now, out);
@@ -624,6 +684,8 @@ impl Core {
             },
             Command::CloseNote | Command::ClosePopup => app_window || from == Surface::Notification,
             Command::FirstRunAction(_)
+            | Command::RepairOutput
+            | Command::TurnOnOutput
             | Command::RemoveSpeaker(_)
             | Command::ResetSpeaker(_)
             | Command::WindowOpened
@@ -648,6 +710,26 @@ impl Core {
                     Ok(Effect::Done)
                 }
             },
+            Command::RepairOutput => {
+                if w.can_repair && !w.our_device && !w.output_turned_off && !self.recovery.repairing() {
+                    let run = self.next_seq();
+                    let until = now.mono_ms + 5 * 60_000;
+                    self.recovery = Recovery::Asking { run, until };
+                    self.repair_playback = RepairPlayback::Helper { run, until };
+                    out.push(Do::RepairOutput(run));
+                }
+                Ok(Effect::Done)
+            }
+            Command::TurnOnOutput => {
+                if !w.our_device && w.output_turned_off && !self.recovery.repairing()
+                    && !matches!(self.recovery, Recovery::TurningOn { .. }) {
+                    self.stay_on_pc_for_repair(now, out);
+                    self.recovery = Recovery::turn_on(now.mono_ms);
+                    self.repair_playback = RepairPlayback::WhenFinished;
+                    out.push(Do::TurnOnOutput);
+                }
+                Ok(Effect::Done)
+            }
             Command::StayOnThisPc => {
                 self.switch_to_pc(None, w, now, out);
                 Ok(Effect::Done)
@@ -1012,6 +1094,7 @@ impl Core {
     /// A switch took effect, or the place changed: what was about the old
     /// place goes, the note and the way back after headphones with it.
     fn place_changed(&mut self, now: Clock) {
+        self.recovery.switched();
         self.note = None;
         self.closed = None;
         self.headphones = None;

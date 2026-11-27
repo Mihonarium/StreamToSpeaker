@@ -50,6 +50,11 @@ struct State {
     /// Per role.
     default: HashMap<Role, PcOutputId>,
     ours_present: bool,
+    protected_install: bool,
+    refuse_turn_on: bool,
+    turn_on_calls: usize,
+    repair_exit: super::RepairExit,
+    repair_calls: usize,
     refuse_switch: bool,
     refuse_role: Option<Role>,
     occupied_keys: Vec<Vec<String>>,
@@ -104,7 +109,7 @@ impl FakePlatform {
                 kind: OutputKind::Other,
             },
         ];
-        let mut state = State { outputs, off: vec![id(MONITOR)], ours_present: true, ..Default::default() };
+        let mut state = State { outputs, off: vec![id(MONITOR)], ours_present: true, protected_install: true, ..Default::default() };
         for r in super::ALL_ROLES {
             state.default.insert(*r, id(SPEAKERS));
         }
@@ -297,6 +302,14 @@ impl FakePlatform {
         self.state.lock().unwrap().names.clone()
     }
 
+    pub fn set_protected_install(&self, protected: bool) { self.state.lock().unwrap().protected_install = protected; }
+    pub fn refuse_turn_on(&self, refuse: bool) { self.state.lock().unwrap().refuse_turn_on = refuse; }
+    pub fn set_repair_exit(&self, exit: super::RepairExit) { self.state.lock().unwrap().repair_exit = exit; }
+    pub fn recovery_calls(&self) -> (usize, usize) {
+        let st = self.state.lock().unwrap();
+        (st.turn_on_calls, st.repair_calls)
+    }
+
     /// What the app said to do if it dies.
     pub fn handback(&self) -> Option<super::HandbackPlan> {
         self.state.lock().unwrap().handback.clone()
@@ -338,7 +351,8 @@ impl Outputs for FakePlatform {
     fn default_for(&self, role: Role) -> Option<PcOutputId> { FakePlatform::default_for(self, role) }
 
     fn our_output(&self) -> Option<PcOutputId> {
-        self.state.lock().unwrap().ours_present.then(|| id(OURS))
+        let st = self.state.lock().unwrap();
+        (st.ours_present && !st.off.contains(&id(OURS))).then(|| id(OURS))
     }
 
     fn describe(&self, output: &PcOutputId) -> Option<OutputInfo> {
@@ -367,7 +381,7 @@ impl Outputs for FakePlatform {
     }
 
     fn set_default(&self, output: &PcOutputId, roles: &[Role]) -> Result<(), String> {
-        let changed = {
+        let (changed, result) = {
             let mut st = self.state.lock().unwrap();
             st.switches.push((output.clone(), roles.to_vec()));
             if st.refuse_switch {
@@ -377,16 +391,20 @@ impl Outputs for FakePlatform {
                 return Err("no such output".into());
             }
             let mut changed = false;
+            let mut result = Ok(());
             for r in roles {
-                if st.refuse_role == Some(*r) { continue; }
+                if st.refuse_role == Some(*r) {
+                    result = Err("Windows refused".into());
+                    break;
+                }
                 changed |= st.default.insert(*r, output.clone()).as_ref() != Some(output);
             }
-            changed
+            (changed, result)
         };
         if changed {
             self.fire(SystemEvent::DefaultOutputChanged);
         }
-        Ok(())
+        result
     }
 
     fn volume(&self, output: &PcOutputId) -> Option<(u8, bool)> {
@@ -411,6 +429,33 @@ impl AudioSessions for FakePlatform {
 }
 
 impl OurDevice for FakePlatform {
+    fn can_repair(&self) -> bool { self.state.lock().unwrap().protected_install }
+    fn turned_off(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.ours_present && st.off.contains(&id(OURS))
+    }
+
+    fn turn_on(&self) -> Result<(), String> {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.turn_on_calls += 1;
+            if st.refuse_turn_on || !st.ours_present { return Err("Windows refused".into()); }
+        }
+        self.set_output_on(OURS, true);
+        Ok(())
+    }
+
+    fn repair(&self, approved: &mut dyn FnMut()) -> super::RepairExit {
+        let exit = {
+            let mut st = self.state.lock().unwrap();
+            if !st.protected_install { return super::RepairExit::Failed; }
+            st.repair_calls += 1;
+            st.repair_exit
+        };
+        if exit != super::RepairExit::Cancelled { approved(); }
+        exit
+    }
+
     fn rename(&self, name: &str) -> Result<(), String> {
         self.state.lock().unwrap().names.push(name.to_string());
         Ok(())
@@ -526,6 +571,23 @@ impl Desk for FakePlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_calls_require_an_installed_copy_and_report_approval_separately() {
+        use crate::platform::RepairExit;
+        let fake = FakePlatform::new();
+        let mut approvals = 0;
+        fake.set_protected_install(false);
+        assert_eq!(fake.repair(&mut || approvals += 1), RepairExit::Failed);
+        fake.set_protected_install(true);
+        fake.set_repair_exit(RepairExit::Cancelled);
+        assert_eq!(fake.repair(&mut || approvals += 1), RepairExit::Cancelled);
+        fake.set_repair_exit(RepairExit::Failed);
+        assert_eq!(fake.repair(&mut || approvals += 1), RepairExit::Failed);
+        assert_eq!(approvals, 1);
+        assert_eq!(fake.recovery_calls(), (0, 2));
+        assert!(fake.switches().is_empty());
+    }
 
     #[test]
     fn loopback_opens_the_current_app_name_or_follows_the_default_without_passing_it_back() {

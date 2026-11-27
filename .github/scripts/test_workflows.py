@@ -10,6 +10,7 @@ SHA cannot. Local actions (./...) run from this repository's own commit.
 import os
 import re
 import unittest
+from unittest.mock import mock_open, patch
 
 GITHUB_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
 WORKFLOWS_DIR = os.path.join(GITHUB_DIR, "workflows")
@@ -106,9 +107,9 @@ def job_fields(name):
             jobs[job] = {}
         elif job is not None:
             key_depth = _depth(line) if key_depth is None else key_depth
-            m = re.match(r"^\s*([A-Za-z0-9_-]+):\s*(.*?)\s*$", line)
+            m = re.match(r"""^\s*(?P<quote>['"]?)(?P<key>[A-Za-z0-9_-]+)(?P=quote)\s*:\s*(?P<value>.*?)\s*$""", line)
             if _depth(line) == key_depth and m:
-                jobs[job][m.group(1)] = re.sub(r"\s+#.*$", "", m.group(2))
+                jobs[job][m["key"]] = re.sub(r"\s+#.*$", "", m["value"])
     return jobs
 
 
@@ -141,9 +142,10 @@ def step_field(step, key):
     for k, line in enumerate(step):
         text = line.lstrip()[2:] if k == 0 else line
         if (k == 0 or _depth(line) == base) and _content(line):
-            m = re.match(rf"^\s*{re.escape(key)}:\s*(.*?)\s*$", text)
+            # A key may be written plain, 'single-' or "double-quoted".
+            m = re.match(rf"""^\s*(?P<quote>['"]?){re.escape(key)}(?P=quote)\s*:\s*(?P<value>.*?)\s*$""", text)
             if m:
-                return m.group(1)
+                return m["value"]
     return None
 
 
@@ -288,6 +290,60 @@ class WhereTheseChecksRun(unittest.TestCase):
         self.assertEqual(step_field(steps[0], "uses").split("@")[0], "actions/checkout")
         self.assertEqual((step_field(steps[1], "working-directory"), step_field(steps[1], "run")),
                          (".github/scripts", "python3 -m unittest -v test_workflows"))
+        endpoint = [step for step in steps if step_script(step) == [".github/scripts/test_installer_endpoint.ps1"]]
+        self.assertEqual(len(endpoint), 1)
+        self.assertEqual(step_field(endpoint[0], "shell"), "pwsh")
+        self.assertIsNone(step_field(endpoint[0], "if"))
+        self.assertIn(step_field(endpoint[0], "continue-on-error"), (None, "false"))
+
+
+@unittest.skipUnless(HAVE_WORKFLOWS, "workflows not checked out")
+class InstallerLifecycle(unittest.TestCase):
+    def test_job_fields_read_plain_and_quoted_keys(self):
+        for quote in ("", "'", '"'):
+            workflow = (f"jobs:\n  lifecycle:\n    {quote}if{quote}: false\n"
+                        f"    {quote}continue-on-error{quote}: true\n")
+            with self.subTest(quote=quote), patch("builtins.open", mock_open(read_data=workflow)):
+                self.assertEqual(job_fields("installer-lifecycle.yml")["lifecycle"],
+                                 {"if": "false", "continue-on-error": "true"})
+
+    def test_step_fields_read_plain_and_quoted_keys(self):
+        for quote in ("", "'", '"'):
+            step = ["      - name: Repair",
+                    f"        {quote}if{quote}: ${{{{ false }}}}",
+                    f"        {quote}continue-on-error{quote}: true"]
+            with self.subTest(quote=quote):
+                self.assertEqual(step_field(step, "if"), "${{ false }}")
+                self.assertEqual(step_field(step, "continue-on-error"), "true")
+
+    def test_repair_files_trigger_the_installer_phase(self):
+        steps = jobs_steps("build.yml")["installer-changes"]
+        script = "\n".join(line for step in steps for line in step_script(step))
+        pattern = re.search(r"grep -qE '([^']+)'", script).group(1)
+        for name in ("main", "endpoint_name", "platform/win", "platform/win/repair",
+                     "platform/win/repair_policy", "platform/win/install", "platform/win/pnp"):
+            path = f"service/src/{name}.rs"
+            with self.subTest(path=path):
+                self.assertRegex(path, pattern)
+
+    def test_lifecycle_runs_output_repair(self):
+        job = job_fields("installer-lifecycle.yml")["lifecycle"]
+        if "if" in job:
+            self.assertIn(expression(job["if"]), ("always()", "success()", "true"))
+        self.assertNotIn("continue-on-error", job)
+        steps = jobs_steps("installer-lifecycle.yml")["lifecycle"]
+        repair = [step for step in steps if step_field(step, "id") == "repair_output"]
+        self.assertEqual(len(repair), 1)
+        condition = step_field(repair[0], "if")
+        if condition is not None:
+            self.assertIn(expression(condition), ("always()", "true"))
+        self.assertEqual(step_script(repair[0]), [".github/scripts/Test-InstallerLifecycle.ps1 -Phase repair-output"])
+        check = [step for step in steps[steps.index(repair[0]) + 1:]
+                 if expression(step_field(step, "if")) == "always()&&steps.repair_output.outcome=='failure'"]
+        self.assertEqual(len(check), 1)
+        self.assertEqual(step_field(check[0], "shell"), "pwsh")
+        self.assertIn(step_field(check[0], "continue-on-error"), (None, "false"))
+        self.assertRegex("\n".join(step_script(check[0])), r"^throw\s+[^\n]+$")
 
 
 @unittest.skipUnless(HAVE_WORKFLOWS, "the workflow files are not checked out next to this script")

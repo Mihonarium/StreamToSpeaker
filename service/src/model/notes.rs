@@ -220,9 +220,9 @@ pub(super) fn no_speaker_chosen(scene: &Scene) -> NoteView {
     }
 }
 
-pub(super) fn repair(scene: &Scene) -> NoteView {
+pub(crate) fn repair(scene: &Scene) -> NoteView {
     let lang = scene.lang;
-    let sound_settings = || Some(Act::open(t!(lang, OpenWindowsSound), Open::SoundSettings));
+    let repair = || Some(Act::new(t!(lang, RepairOutput), Command::RepairOutput));
     // An output that went missing again needs a new repair.
     let state = if scene.repair == RepairNow::Worked
         && scene.situation.standing.contains(&Standing::OutputMissing)
@@ -232,11 +232,29 @@ pub(super) fn repair(scene: &Scene) -> NoteView {
         scene.repair
     };
     let (mark, title, sentence, button) = match state {
+        RepairNow::Unavailable => (
+            Mark::Warn,
+            t!(lang, AppOutputMissing),
+            t!(lang, RestoreInSettings),
+            Some(Act::open(t!(lang, OpenWindowsSound), Open::SoundSettings)),
+        ),
         RepairNow::NotAsked => (
             Mark::Warn,
             t!(lang, AppOutputMissing),
             t!(lang, RestoreOutputLine),
-            sound_settings(),
+            repair(),
+        ),
+        RepairNow::TurnedOff => (
+            Mark::Warn,
+            t!(lang, OutputTurnedOff),
+            t!(lang, TurnOnOutputLine),
+            Some(Act::new(t!(lang, RepairOutput), Command::TurnOnOutput)),
+        ),
+        RepairNow::TurnOnFailed => (
+            Mark::Warn,
+            t!(lang, OutputTurnedOff),
+            t!(lang, TurnOnFailedLine),
+            Some(Act::open(t!(lang, OpenWindowsSound), Open::SoundSettings)),
         ),
         RepairNow::Running => (
             Mark::Busy,
@@ -248,13 +266,13 @@ pub(super) fn repair(scene: &Scene) -> NoteView {
             Mark::Warn,
             t!(lang, RepairDidntWork),
             t!(lang, RestartForOutput),
-            None,
+            Some(Act::open(t!(lang, SetReportProblem), Open::ReportProblem)),
         ),
         RepairNow::NotApproved => (
             Mark::Warn,
             t!(lang, RepairNeedsApproval),
             t!(lang, ApprovalNotGiven),
-            sound_settings(),
+            repair(),
         ),
         RepairNow::Worked => (
             Mark::Info,

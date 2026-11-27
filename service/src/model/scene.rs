@@ -63,7 +63,10 @@ pub struct WaySeen {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairNow {
+    Unavailable,
     NotAsked,
+    TurnedOff,
+    TurnOnFailed,
     Running,
     Worked,
     DidntWork,

@@ -7,7 +7,7 @@ use crate::model::facts::{
     DelaySteps, Level, Progress, SearchFacts, SearchPhase, SpeakerDelay, SpeakerKind, VolumeFacts,
 };
 pub(super) const CANT_FIND_AFTER_MS: u64 = 10_000;
-use crate::model::scene::{RepairNow, Scene, SpeakerSeen, WaySeen};
+use crate::model::scene::{Scene, SpeakerSeen, WaySeen};
 use crate::model::situation::{ConnKind, SpeakerNow};
 use crate::model::text::t;
 use world::{Ids, Observation};
@@ -107,7 +107,7 @@ impl PlaceDriver {
             steps: DelaySteps::default(),
             search,
             network,
-            repair: RepairNow::NotAsked,
+            repair: self.core.repair_note(w),
         };
         (scene, obs.ours)
     }

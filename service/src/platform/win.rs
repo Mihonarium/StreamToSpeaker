@@ -16,14 +16,19 @@
 mod desk;
 mod hotkeys;
 pub(crate) use hotkeys::windows_key_down;
+mod install;
 mod network;
+mod pnp;
 mod pass;
 mod players;
+mod repair;
+pub use repair::repair_output;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use anyhow::Context;
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use log::{debug, info, warn};
 use windows::core::{Interface, PWSTR};
@@ -33,7 +38,7 @@ use windows::Win32::Devices::FunctionDiscovery::{
 use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioMeterInformation};
 use windows::Win32::Media::Audio::{
     eCommunications, eConsole, eMultimedia, eRender, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
-    IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE, PKEY_AudioEndpoint_FormFactor,
+    IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED, PKEY_AudioEndpoint_FormFactor,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
@@ -49,8 +54,6 @@ use super::{
 const LOOK_EVERY: Duration = Duration::from_millis(250);
 /// The longest a switch or a level change waits for the worker.
 const WAIT_FOR_WORKER: Duration = Duration::from_secs(2);
-/// The words every name of the app's own output carries.
-const OUR_NAME: &str = "Stream To Speaker";
 
 /// The workers and subscriptions belong to this Windows process.
 pub(crate) fn platform() -> Platform {
@@ -58,14 +61,15 @@ pub(crate) fn platform() -> Platform {
     PLATFORM
         .get_or_init(|| {
             let mut p = Platform::passive();
-            if let Some(shared) = Shared::start() {
+            let audio = Shared::start();
+            p.device = Arc::new(WindowsDevice(audio.clone()));
+            if let Some(shared) = audio {
                 crate::endpoint_name::platform_names_the_device();
                 let w = Arc::new(Windows(shared));
                 install_crash_handback(&*w);
                 start_session_window();
                 p.outputs = w.clone();
                 p.sessions = w.clone();
-                p.device = w.clone();
                 p.handback = w;
             } else {
                 warn!("Windows' sound outputs can't be read here; the person chooses the output in Windows");
@@ -157,6 +161,7 @@ struct Seen {
     multimedia: Option<PcOutputId>,
     calls: Option<PcOutputId>,
     ours: Option<PcOutputId>,
+    disabled_ours: Option<PcOutputId>,
     outputs: Vec<OutputInfo>,
     levels: HashMap<PcOutputId, (u8, bool)>,
     peaks: HashMap<PcOutputId, f32>,
@@ -164,6 +169,7 @@ struct Seen {
 }
 
 enum Job {
+    TurnOn(Sender<Result<(), String>>),
     CaptureName(PcOutputId, Sender<Option<String>>),
     SetDefault(PcOutputId, Vec<Role>, Sender<Result<(), String>>),
     SetVolume(PcOutputId, u8, bool, Sender<Result<(), String>>),
@@ -171,51 +177,56 @@ enum Job {
 
 struct Shared {
     seen: Mutex<Seen>,
-    jobs: Sender<Job>,
+    jobs: OnceLock<Sender<Job>>,
 }
 
 impl Shared {
-    /// Start the worker; `None` when Core Audio can't be reached.
+    /// Keep looking for Core Audio if it was unavailable at startup.
     fn start() -> Option<Arc<Shared>> {
-        let (jobs, rx) = unbounded();
-        let shared = Arc::new(Shared { seen: Mutex::new(Seen::default()), jobs });
+        let shared = Arc::new(Shared { seen: Mutex::new(Seen::default()), jobs: OnceLock::new() });
         let (ready_tx, ready) = bounded(1);
         let for_worker = shared.clone();
-        let spawned = std::thread::Builder::new().name("stream-to-speaker-windows-audio".into()).spawn(move || {
-            let Ok(_apartment) = Apartment::enter() else {
-                let _ = ready_tx.send(false);
-                return;
+        std::thread::Builder::new().name("stream-to-speaker-windows-audio".into()).spawn(move || {
+            let open = || -> windows::core::Result<_> {
+                let apartment = Apartment::enter()?;
+                // SAFETY: the worker owns the apartment and will drop its enumerator before leaving it.
+                let enumerator: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+                Ok((apartment, enumerator))
             };
-            // SAFETY: plain object creation on a COM thread.
-            let enumerator: IMMDeviceEnumerator = match unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) } {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!("no audio device enumerator: {e}");
-                    let _ = ready_tx.send(false);
-                    return;
+            let mut first = Some(ready_tx);
+            let (_apartment, enumerator) = loop {
+                match open() {
+                    Ok(audio) => break audio,
+                    Err(e) => {
+                        if let Some(first) = first.take() {
+                            warn!("Core Audio is unavailable, retrying: {e}");
+                            let _ = first.send(());
+                        }
+                        std::thread::sleep(WAIT_FOR_WORKER);
+                    }
                 }
             };
             let mut worker = Worker { enumerator, endpoints: HashMap::new(), apps: HashMap::new() };
             worker.look(&for_worker);
-            if ready_tx.send(true).is_ok() {
-                worker.run(&rx, &for_worker);
-            }
-        });
-        if spawned.is_err() {
-            return None;
-        }
-        ready.recv_timeout(WAIT_FOR_WORKER).ok().filter(|ok| *ok).map(|_| shared)
+            let (jobs, rx) = unbounded();
+            let _ = for_worker.jobs.set(jobs);
+            if let Some(first) = first { let _ = first.send(()); }
+            worker.run(&rx, &for_worker);
+        }).ok()?;
+        let _ = ready.recv_timeout(WAIT_FOR_WORKER);
+        Some(shared)
     }
 
     fn ask(&self, job: impl FnOnce(Sender<Result<(), String>>) -> Job) -> Result<(), String> {
         let (tx, rx) = bounded(1);
-        self.jobs.send(job(tx)).map_err(|_| "the Windows audio worker has stopped".to_string())?;
+        self.jobs.get().ok_or("Windows audio is still starting")?.send(job(tx)).map_err(|_| "the Windows audio worker has stopped".to_string())?;
         rx.recv_timeout(WAIT_FOR_WORKER).unwrap_or_else(|_| Err("Windows didn't answer in time".into()))
     }
 }
 
 /// The Core Audio objects of one active output, kept while it stays.
 struct Endpoint {
+    ours: bool,
     info: OutputInfo,
     volume: Option<IAudioEndpointVolume>,
     meter: Option<IAudioMeterInformation>,
@@ -238,6 +249,13 @@ impl Worker {
                     let r = set_default(&id, &roles);
                     self.look(shared);
                     let _ = reply.send(r);
+                }
+                Ok(Job::TurnOn(reply)) => {
+                    let disabled = self.disabled_output();
+                    let result = disabled.ok_or_else(|| "No disabled Stream To Speaker endpoint".to_string())
+                        .and_then(|id| crate::endpoint_name::turn_on_endpoint(id.as_str()).map_err(|e| e.to_string()));
+                    self.look(shared);
+                    let _ = reply.send(result);
                 }
                 Ok(Job::CaptureName(id, reply)) => {
                     // SAFETY: this worker owns the enumerator and reads the live endpoint's property store.
@@ -271,23 +289,31 @@ impl Worker {
                 .and_then(|d| device_id(&d));
             seen.multimedia = self.enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia).ok().and_then(|d| device_id(&d));
             seen.calls = self.enumerator.GetDefaultAudioEndpoint(eRender, eCommunications).ok().and_then(|d| device_id(&d));
-            let active = self.active_ids();
+            let active = self.render_ids(DEVICE_STATE_ACTIVE);
             self.endpoints.retain(|id, _| active.iter().any(|(a, _)| a == id));
+            let looking_for_ours = !self.endpoints.values().any(|e| e.ours);
             for (id, device) in active {
-                if !self.endpoints.contains_key(&id) {
-                    if let Some(e) = open_endpoint(&id, &device) {
-                        self.endpoints.insert(id.clone(), e);
+                if let Some(endpoint) = self.endpoints.get_mut(&id) {
+                    // The PnP parent can appear after Core Audio first lists the endpoint.
+                    if looking_for_ours {
+                        if let Some(info) = endpoint_info(&id, &device) { endpoint.info = info; }
+                        endpoint.ours = is_ours(&endpoint.info);
                     }
+                    if endpoint.ours && endpoint.volume.is_none() {
+                        endpoint.volume = device.Activate(CLSCTX_ALL, None).ok();
+                    }
+                } else if let Some(endpoint) = open_endpoint(&id, &device) {
+                    self.endpoints.insert(id, endpoint);
                 }
             }
             for (id, e) in &self.endpoints {
                 seen.outputs.push(e.info.clone());
-                if is_ours(&e.info) {
+                if e.ours {
                     seen.ours = Some(id.clone());
                 }
                 if let Some(v) = &e.volume {
                     let muted = v.GetMute().map(|b| b.as_bool()).unwrap_or(false);
-                    let level = if is_ours(&e.info) {
+                    let level = if e.ours {
                         v.GetMasterVolumeLevel()
                             .ok()
                             .map(|db| crate::volume_sync::millibels_to_sonos((db * 100.0).round() as i32) as u8)
@@ -302,6 +328,9 @@ impl Worker {
                     seen.peaks.insert(id.clone(), m.GetPeakValue().unwrap_or(0.0));
                 }
             }
+            if seen.ours.is_none() {
+                seen.disabled_ours = self.disabled_output();
+            }
             let managers: Vec<(PcOutputId, IAudioSessionManager2)> =
                 self.endpoints.iter().filter_map(|(id, e)| e.sessions.clone().map(|m| (id.clone(), m))).collect();
             let mut sessions = Vec::new();
@@ -314,7 +343,7 @@ impl Worker {
         let (default_changed, outputs_changed) = {
             let mut was = shared.seen.lock().unwrap();
             let ids = |s: &Seen| s.outputs.iter().map(|o| o.id.clone()).collect::<Vec<_>>();
-            let changes = (was.default != seen.default || was.multimedia != seen.multimedia, ids(&was) != ids(&seen));
+            let changes = (was.default != seen.default || was.multimedia != seen.multimedia, was.ours != seen.ours || was.disabled_ours != seen.disabled_ours || ids(&was) != ids(&seen));
             let first = was.outputs.is_empty() && was.default.is_none();
             *was = seen;
             if first {
@@ -331,12 +360,18 @@ impl Worker {
         }
     }
 
-    /// Every active render endpoint, by id.
+    fn disabled_output(&self) -> Option<PcOutputId> {
+        // SAFETY: only the audio worker uses its enumerator.
+        unsafe { self.render_ids(DEVICE_STATE_DISABLED) }.into_iter()
+            .map(|(id, _)| id).find(|id| pnp::endpoint_parent(id.as_str()).is_ok_and(|p| p.is_some()))
+    }
+
+    /// Render endpoints in the requested Windows device state.
     ///
     /// # Safety
     /// On this worker's thread only.
-    unsafe fn active_ids(&self) -> Vec<(PcOutputId, IMMDevice)> {
-        let Ok(all) = self.enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else { return Vec::new() };
+    unsafe fn render_ids(&self, state: DEVICE_STATE) -> Vec<(PcOutputId, IMMDevice)> {
+        let Ok(all) = self.enumerator.EnumAudioEndpoints(eRender, state) else { return Vec::new() };
         let count = all.GetCount().unwrap_or(0);
         (0..count)
             .filter_map(|i| all.Item(i).ok())
@@ -374,7 +409,7 @@ impl Worker {
         let level = level.min(100);
         // SAFETY: calls on an endpoint volume this thread activated.
         unsafe {
-            if is_ours(&e.info) {
+            if e.ours {
                 // The app's own output: in dB, on the linear mapping its
                 // level node uses (Windows draws that node's slider
                 // linearly, so the scalar call's taper would misplace it).
@@ -389,15 +424,19 @@ impl Worker {
     }
 }
 
-/// An output's id, as Windows gives it.
-///
-/// # Safety
-/// `device` must be a live IMMDevice.
-unsafe fn device_id(device: &IMMDevice) -> Option<PcOutputId> {
-    let id: PWSTR = device.GetId().ok()?;
-    let text = id.to_string().ok();
-    CoTaskMemFree(Some(id.0 as *const _));
-    text.map(|t| PcOutputId::new(&t))
+fn read_device_id(device: &IMMDevice) -> anyhow::Result<String> {
+    // SAFETY: GetId returns a terminated string allocated by COM. Copy it before freeing it.
+    unsafe {
+        let id: PWSTR = device.GetId().context("Read render endpoint ID")?;
+        anyhow::ensure!(!id.is_null(), "Windows returned a null render endpoint ID");
+        let text = id.to_string();
+        CoTaskMemFree(Some(id.0 as *const _));
+        text.context("Decode render endpoint ID")
+    }
+}
+
+fn device_id(device: &IMMDevice) -> Option<PcOutputId> {
+    read_device_id(device).ok().map(|id| PcOutputId::new(&id))
 }
 
 /// A string property, if set.
@@ -439,6 +478,7 @@ unsafe fn endpoint_info(id: &PcOutputId, device: &IMMDevice) -> Option<OutputInf
 unsafe fn open_endpoint(id: &PcOutputId, device: &IMMDevice) -> Option<Endpoint> {
     let info = endpoint_info(id, device)?;
     Some(Endpoint {
+        ours: is_ours(&info),
         volume: device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok(),
         meter: device.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None).ok(),
         sessions: device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None).ok(),
@@ -446,10 +486,25 @@ unsafe fn open_endpoint(id: &PcOutputId, device: &IMMDevice) -> Option<Endpoint>
     })
 }
 
-/// The app's own output: its device is "Stream To Speaker", whatever the
-/// output itself is called now.
 fn is_ours(info: &OutputInfo) -> bool {
-    info.device.contains(OUR_NAME) || info.friendly.contains(OUR_NAME)
+    pnp::endpoint_parent(info.id.as_str()).is_ok_and(|p| p.is_some())
+}
+
+pub(crate) fn active_endpoint(accept: impl Fn(u32) -> bool) -> anyhow::Result<Option<String>> {
+    // SAFETY: all interfaces stay on this thread and drop before COM is uninitialized.
+    // A caller already in an STA can use its existing apartment.
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if hr != windows::Win32::Foundation::RPC_E_CHANGED_MODE { hr.ok()?; }
+        let result = (|| {
+            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let all = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+            let ids = (0..all.GetCount()?).map(|i| read_device_id(&all.Item(i)?));
+            super::repair_policy::find_active_endpoint(ids, pnp::endpoint_parent, accept)
+        })();
+        if hr.is_ok() { windows::Win32::System::Com::CoUninitialize(); }
+        result
+    }
 }
 
 fn role_number(role: Role) -> i32 {
@@ -559,7 +614,7 @@ impl Outputs for Windows {
     }
     fn current_friendly(&self, id: &PcOutputId) -> Option<String> {
         let (tx, rx) = bounded(1);
-        self.0.jobs.send(Job::CaptureName(id.clone(), tx)).ok()?;
+        self.0.jobs.get()?.send(Job::CaptureName(id.clone(), tx)).ok()?;
         rx.recv_timeout(WAIT_FOR_WORKER).ok().flatten()
     }
     fn describe(&self, id: &PcOutputId) -> Option<OutputInfo> {
@@ -589,8 +644,23 @@ impl AudioSessions for Windows {
     }
 }
 
-impl OurDevice for Windows {
+/// Windows can launch a repair even when its audio worker could not start.
+struct WindowsDevice(Option<Arc<Shared>>);
+
+impl OurDevice for WindowsDevice {
+    fn can_repair(&self) -> bool { install::protected_app().is_ok() }
+    fn turned_off(&self) -> bool {
+        self.0.as_ref().is_some_and(|audio| audio.seen.lock().unwrap().disabled_ours.is_some())
+    }
+    fn turn_on(&self) -> Result<(), String> {
+        self.0.as_ref().ok_or("No Windows audio worker")?.ask(Job::TurnOn)
+    }
+    fn repair(&self, approved: &mut dyn FnMut()) -> super::RepairExit {
+        repair::run(approved)
+    }
+
     fn rename(&self, name: &str) -> Result<(), String> {
+        if self.0.is_none() { return Ok(()); }
         let ticket = crate::endpoint_name::rename_endpoint(name);
         *LAST_RENAME.lock().unwrap() = ticket;
         Ok(())

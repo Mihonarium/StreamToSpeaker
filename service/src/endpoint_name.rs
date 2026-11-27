@@ -31,7 +31,7 @@ use windows_sys::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
     RegQueryValueExW, REG_SZ,
 };
 
@@ -41,7 +41,7 @@ const RPC_E_CHANGED_MODE: HRESULT = -2147417850; // 0x80010106
 
 // IPolicyConfig — undocumented but stable Vista+. Documented usage
 // in github.com/frgnca/AudioDeviceCmdlets and others. We need
-// SetPropertyValue (vtable slot 12) and SetDefaultEndpoint (slot 13).
+// SetPropertyValue (slot 12), SetDefaultEndpoint (13) and SetEndpointVisibility (14).
 const CLSID_POLICY_CONFIG_CLIENT: GUID = GUID {
     data1: 0x870af99c,
     data2: 0x171d,
@@ -83,7 +83,7 @@ struct PropVariant {
 }
 
 // Vtable — only the slots called are typed. Padding fills the others;
-// SetPropertyValue is at index 12, SetDefaultEndpoint at 13.
+// the final three entries set the name, default output and visibility.
 #[repr(C)]
 struct IPolicyConfigVtbl {
     query_interface: unsafe extern "system" fn(
@@ -110,7 +110,7 @@ struct IPolicyConfigVtbl {
         *const PropVariant,
     ) -> HRESULT,
     set_default_endpoint: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> HRESULT,
-    _slot14: *const c_void,
+    set_endpoint_visibility: unsafe extern "system" fn(*mut c_void, *const u16, BOOL) -> HRESULT,
 }
 
 #[repr(C)]
@@ -217,10 +217,7 @@ fn do_update(new_name: &str) -> Result<()> {
     // category afterwards. Without this check a silent recompose looks
     // exactly like success, which is how the original bug hid for so
     // long — the failing step reported nothing at all.
-    let Some((_, guid)) = endpoint_id.rsplit_once('.') else {
-        return Ok(());
-    };
-    match read_friendly_name(guid) {
+    match endpoint_friendly_name(&endpoint_id) {
         Some(actual) if actual == new_name => {
             log::info!("Windows endpoint renamed to {:?}", actual);
         }
@@ -236,15 +233,16 @@ fn do_update(new_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Current `PKEY_Device_FriendlyName` of the endpoint whose MMDevices key
-/// is `guid`, straight from the registry — used to confirm a rename landed.
-fn read_friendly_name(guid: &str) -> Option<String> {
+/// Read the render endpoint's friendly name back after naming it.
+pub(crate) fn endpoint_friendly_name(endpoint_id: &str) -> Option<String> {
+    let (_, guid) = endpoint_id.rsplit_once('.')?;
     let path = format!(
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\{}\Properties",
         guid
     );
     let path_w = to_wide_null(&path);
     let mut key: HKEY = ptr::null_mut();
+    // SAFETY: the terminated path stays live and key receives the opened handle.
     if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path_w.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
         return None;
     }
@@ -256,129 +254,36 @@ fn read_friendly_name(guid: &str) -> Option<String> {
 fn read_string_value(key: HKEY, pkey: &str) -> Option<String> {
     let name = to_wide_null(pkey);
     let mut data_type: u32 = 0;
-    let mut buf = [0u8; 1024];
-    let mut len = buf.len() as u32;
+    let mut buf = [0u16; 512];
+    let mut len = size_of_val(&buf) as u32;
+    // SAFETY: key stays open and len is the byte capacity of the aligned buffer.
     let r = unsafe {
         RegQueryValueExW(
             key,
             name.as_ptr(),
             ptr::null_mut(),
             &mut data_type,
-            buf.as_mut_ptr(),
+            buf.as_mut_ptr().cast(),
             &mut len,
         )
     };
     if r != 0 || data_type != REG_SZ {
         return None;
     }
-    let u16_slice =
-        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u16, (len / 2) as usize) };
+    let u16_slice = &buf[..len as usize / 2];
     let stop = u16_slice.iter().position(|&c| c == 0).unwrap_or(u16_slice.len());
     Some(String::from_utf16_lossy(&u16_slice[..stop]))
 }
 
-/// Scan `HKLM\...\MMDevices\Audio\Render\*` and return the device id
-/// (`{0.0.0.00000000}.{<guid>}`) of the first endpoint whose
-/// DeviceDesc contains "Stream To Speaker". Returns None if no such
-/// endpoint exists.
+/// Find the active render endpoint whose parent carries the driver's hardware ID.
 pub(crate) fn find_our_endpoint_id() -> Result<Option<String>> {
-    let base = to_wide_null(r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render");
-    let mut render_key: HKEY = ptr::null_mut();
-    let r = unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            base.as_ptr(),
-            0,
-            KEY_READ,
-            &mut render_key,
-        )
-    };
-    if r != 0 {
-        bail!("RegOpenKeyExW(MMDevices\\Render): {}", r);
-    }
-    let _guard = CloseKeyOnDrop(render_key);
-
-    let mut idx = 0u32;
-    loop {
-        let mut name_buf = [0u16; 128];
-        let mut name_len = name_buf.len() as u32;
-        let r = unsafe {
-            RegEnumKeyExW(
-                render_key,
-                idx,
-                name_buf.as_mut_ptr(),
-                &mut name_len,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        // ERROR_NO_MORE_ITEMS = 259
-        if r == 259 {
-            return Ok(None);
-        }
-        if r != 0 {
-            bail!("RegEnumKeyExW: {}", r);
-        }
-        idx += 1;
-        let guid_str = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-
-        let props_path = to_wide_null(&format!(r"{}\Properties", &guid_str));
-        let mut props_key: HKEY = ptr::null_mut();
-        let r = unsafe {
-            RegOpenKeyExW(
-                render_key,
-                props_path.as_ptr(),
-                0,
-                KEY_READ,
-                &mut props_key,
-            )
-        };
-        if r != 0 {
-            continue;
-        }
-        let _guard2 = CloseKeyOnDrop(props_key);
-
-        // Match on any of the three names Windows keeps for an endpoint,
-        // because the one that carries our string is not the obvious one.
-        //
-        //   ,2  DeviceDesc              "Speakers"
-        //   ,14 FriendlyName            "Speakers (Stream To Speaker)"
-        //   ,6  interface friendly name "Stream To Speaker"
-        //
-        // DeviceDesc is generated from the endpoint's form factor, so on our
-        // device it reads "Speakers" and contains nothing identifying at
-        // all. Matching only on it — as this did — meant the scan never
-        // found the endpoint and every rename silently bailed.
-        //
-        // ,14 keeps matching after we have renamed, since the name we write
-        // still begins "Stream To Speaker".
-        const NAME_KEYS: [&str; 3] = [
-            "{a45c254e-df1c-4efd-8020-67d146a850e0},14",
-            "{b3f8fa53-0004-438e-9003-51a46e139bfc},6",
-            "{a45c254e-df1c-4efd-8020-67d146a850e0},2",
-        ];
-        let matched = NAME_KEYS.iter().any(|pkey| {
-            read_string_value(props_key, pkey)
-                .is_some_and(|v| v.contains("Stream To Speaker"))
-        });
-
-        if matched {
-            log::debug!(
-                "matched endpoint {} (desc={:?}, friendly={:?})",
-                guid_str,
-                read_string_value(props_key, NAME_KEYS[2]),
-                read_string_value(props_key, NAME_KEYS[0]),
-            );
-            return Ok(Some(format!(r"{{0.0.0.00000000}}.{}", &guid_str)));
-        }
-    }
+    crate::platform::win::active_endpoint(|_| true)
 }
 
 struct CloseKeyOnDrop(HKEY);
 impl Drop for CloseKeyOnDrop {
     fn drop(&mut self) {
+        // SAFETY: this guard owns the open registry key.
         unsafe { RegCloseKey(self.0) };
     }
 }
@@ -396,6 +301,17 @@ pub(crate) fn set_default_endpoint(endpoint_id: &str, role: i32) -> Result<()> {
         if hr < 0 {
             bail!("IPolicyConfig::SetDefaultEndpoint: 0x{:08x}", hr);
         }
+        Ok(())
+    })
+}
+
+/// Turn on the render endpoint the audio worker found in Windows' disabled list.
+pub(crate) fn turn_on_endpoint(endpoint_id: &str) -> Result<()> {
+    with_policy_config(|pc| {
+        let id = to_wide_null(endpoint_id);
+        // SAFETY: the closure holds a live policy client and id is NUL-terminated for the call.
+        let hr = unsafe { ((*(*pc).vtbl).set_endpoint_visibility)(pc.cast(), id.as_ptr(), 1) };
+        if hr < 0 { bail!("IPolicyConfig::SetEndpointVisibility: 0x{:08x}", hr); }
         Ok(())
     })
 }
@@ -429,56 +345,15 @@ fn with_policy_config(f: impl FnOnce(*mut IPolicyConfig) -> Result<()>) -> Resul
     }
 }
 
-fn set_endpoint_friendly_name(endpoint_id: &str, new_name: &str) -> Result<()> {
-    unsafe {
-        let hr = CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32);
-        let initialized_here = hr == S_OK;
-        if hr != S_OK && hr != S_FALSE && hr != RPC_E_CHANGED_MODE {
-            bail!("CoInitializeEx: 0x{:08x}", hr);
-        }
-        let result: Result<()> = (|| {
-            let mut client: *mut c_void = ptr::null_mut();
-            let hr = CoCreateInstance(
-                &CLSID_POLICY_CONFIG_CLIENT,
-                ptr::null_mut(),
-                CLSCTX_ALL,
-                &IID_I_POLICY_CONFIG,
-                &mut client,
-            );
-            if hr < 0 {
-                bail!("CoCreateInstance(PolicyConfig): 0x{:08x}", hr);
-            }
-            let pc = client as *mut IPolicyConfig;
-            let key = PropertyKey {
-                fmtid: PKEY_DEVICE_FMTID,
-                pid: PKEY_DEVICE_FRIENDLY_NAME_PID,
-            };
-            let name_wide = to_wide_null(new_name);
-            let pv = PropVariant {
-                vt: VT_LPWSTR,
-                _r1: 0,
-                _r2: 0,
-                _r3: 0,
-                data: name_wide.as_ptr() as *mut u16,
-                _data2: 0,
-            };
-            let endpoint_id_wide = to_wide_null(endpoint_id);
-            let hr = ((*(*pc).vtbl).set_property_value)(
-                pc as *mut c_void,
-                endpoint_id_wide.as_ptr(),
-                0, // bFxStore = FALSE → endpoint store, not FX store
-                &key,
-                &pv,
-            );
-            ((*(*pc).vtbl).release)(pc as *mut c_void);
-            if hr < 0 {
-                bail!("IPolicyConfig::SetPropertyValue: 0x{:08x}", hr);
-            }
-            Ok(())
-        })();
-        if initialized_here {
-            CoUninitialize();
-        }
-        result
-    }
+pub(crate) fn set_endpoint_friendly_name(endpoint_id: &str, new_name: &str) -> Result<()> {
+    with_policy_config(|pc| {
+        let key = PropertyKey { fmtid: PKEY_DEVICE_FMTID, pid: PKEY_DEVICE_FRIENDLY_NAME_PID };
+        let name = to_wide_null(new_name);
+        let pv = PropVariant { vt: VT_LPWSTR, _r1: 0, _r2: 0, _r3: 0, data: name.as_ptr() as *mut u16, _data2: 0 };
+        let id = to_wide_null(endpoint_id);
+        // SAFETY: pc is live and the endpoint id, property key and string value outlive the call.
+        let hr = unsafe { ((*(*pc).vtbl).set_property_value)(pc.cast(), id.as_ptr(), 0, &key, &pv) };
+        if hr < 0 { bail!("IPolicyConfig::SetPropertyValue: 0x{:08x}", hr); }
+        Ok(())
+    })
 }

@@ -19,6 +19,26 @@ impl PlaceDriver {
         self.releases.retain(|r| r.try_recv() == Err(crossbeam_channel::TryRecvError::Empty));
         for action in actions {
             match action {
+                Do::TurnOnOutput => {
+                    if let Err(e) = self.platform.device.turn_on() {
+                        warn!("Windows couldn't turn the app's output on: {e}");
+                        let _ = self.tx.send(PlaceInput::Event(Event::TurnOnFailed));
+                    }
+                }
+                Do::RepairOutput(run) => {
+                    let tx = self.tx.clone();
+                    let device = self.platform.device.clone();
+                    match std::thread::Builder::new().name("stream-to-speaker-repair".into()).spawn(move || {
+                        let exit = device.repair(&mut || { let _ = tx.send(PlaceInput::Event(Event::RepairApproved(run))); });
+                        let _ = tx.send(PlaceInput::Event(Event::RepairExited(run, exit)));
+                    }) {
+                        Ok(t) => self.threads.push(t),
+                        Err(e) => {
+                            warn!("Couldn't start output repair: {e}");
+                            let _ = self.tx.send(PlaceInput::Event(Event::RepairExited(run, crate::platform::RepairExit::Failed)));
+                        }
+                    }
+                }
                 Do::PickedOutput => {
                     *self.windows_decision.lock().unwrap() += 1;
                     self.app.note_user_pick();
@@ -156,16 +176,21 @@ impl PlaceDriver {
         Box::new(move || {
             let current = decisions.lock().unwrap();
             if *current != decision { return; }
-            let cfg = app.user_config.lock().unwrap();
-            let mut roles = PLAYBACK_ROLES.to_vec();
-            if cfg.only_some_apps {
+            let only_some_apps = app.user_config.lock().unwrap().only_some_apps;
+            let switched = if only_some_apps {
                 if !returning_default || target == WinTarget::OurDevice { return; }
                 let Some(ours) = outputs.our_output() else { return };
-                roles.retain(|role| outputs.default_for(*role).as_ref() == Some(&ours));
-                if roles.is_empty() { return; }
-            }
-            drop(cfg);
-            if !switch_windows(&*outputs, target, &roles) {
+                let mut switched = true;
+                for &role in PLAYBACK_ROLES {
+                    if outputs.default_for(role).as_ref() == Some(&ours) {
+                        switched &= switch_windows(&*outputs, target.clone(), &[role]);
+                    }
+                }
+                switched
+            } else {
+                switch_windows(&*outputs, target, PLAYBACK_ROLES)
+            };
+            if !switched {
                 let at_ms = now + at.elapsed().as_millis() as u64;
                 let _ = tx.send(PlaceInput::WindowsNotTaken { decision, at_ms });
             }

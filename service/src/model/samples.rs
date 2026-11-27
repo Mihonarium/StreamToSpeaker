@@ -399,9 +399,19 @@ pub fn named(name: &str) -> Scene {
                 who: None,
             });
         }
-        "repair-needed" | "restart-needed" => {
-            if name == "restart-needed" { s.repair = RepairNow::DidntWork; }
+        "repair-needed" | "repair-unavailable" | "restart-needed" | "repair-running" | "repair-not-approved"
+        | "output-turned-off" | "output-turned-off-refused" | "pc-welcome-repair" | "pc-welcome-output-turned-off" => {
+            s.repair = match name {
+                "repair-unavailable" => RepairNow::Unavailable,
+                "restart-needed" => RepairNow::DidntWork,
+                "repair-running" => RepairNow::Running,
+                "repair-not-approved" => RepairNow::NotApproved,
+                "output-turned-off" | "pc-welcome-output-turned-off" => RepairNow::TurnedOff,
+                "output-turned-off-refused" => RepairNow::TurnOnFailed,
+                _ => RepairNow::NotAsked,
+            };
             on_pc(&mut s);
+            if name.starts_with("pc-welcome-") { s.situation.first_run = Some(FirstRunStep::One); }
             s.situation.standing.push(Standing::OutputMissing);
             for r in &mut s.situation.speakers {
                 r.state = RowState::RepairFirst;
@@ -575,6 +585,11 @@ macro_rules! with_sample_names {
             "kitchen-volume-limit",
             "question",
             "repair-needed",
+            "repair-unavailable",
+            "repair-running",
+            "repair-not-approved",
+            "output-turned-off",
+            "output-turned-off-refused",
             "restart-needed",
             "repair-worked",
             "pc-outputs-open",

@@ -32,7 +32,7 @@ pub fn scenes() -> Vec<Scene> {
         ($($sample:literal),*) => { $(scenes.push(Scene { name: concat!("window-", $sample),
             size: [super::main_window::WIDTH + 42.0, 0.0], draw: |ui, _| ordinary(ui, $sample, None) });)* };
     }
-    windows!("kitchen-playing", "pc-plain", "pc-kitchen-didnt-respond", "many-speakers", "long-names",
+    windows!("pc-welcome-repair", "pc-welcome-output-turned-off", "kitchen-playing", "pc-plain", "pc-kitchen-didnt-respond", "many-speakers", "long-names",
         "pc-welcome-pick", "pc-welcome-looking", "pc-welcome-none-found", "pc-welcome-busy", "pc-welcome-chime", "kitchen-welcome-done");
     macro_rules! first_run {
         ($($name:literal),*) => { [$(Scene {

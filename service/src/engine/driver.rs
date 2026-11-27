@@ -50,15 +50,16 @@ impl Engine {
             if updated { StartKind::AfterUpdate } else { StartKind::Normal }
         };
         if LEVEL_THROUGH_WINDOWS {
-            if let Some(ours) = platform.outputs.our_output() {
-                let outputs = platform.outputs.clone();
-                let levels = crate::latest::Latest::new("stream-to-speaker-windows-level", move |(level, muted): &(u32, bool)| {
-                    outputs.set_volume(&ours, *level as u8, *muted).is_ok()
-                });
-                app.set_windows_level_through(move |level, muted| {
-                    levels.want((level, muted));
-                });
-            }
+            let outputs = platform.outputs.clone();
+            let levels = crate::latest::Latest::new("stream-to-speaker-windows-level", move |(id, level, muted): &(crate::model::PcOutputId, u32, bool)| {
+                outputs.set_volume(id, *level as u8, *muted).is_ok()
+            });
+            let outputs = platform.outputs.clone();
+            app.try_windows_level_through(move |level, muted| {
+                let Some(id) = outputs.our_output() else { return false };
+                levels.want((id, level, muted));
+                true
+            });
         }
 
         let opener = Arc::new(Mutex::new(None));
@@ -283,6 +284,23 @@ mod tests {
         assert_eq!(windows.handbacks(), 1);
         assert_eq!(windows.default_output(), pc);
         assert_eq!(windows.calls_output(), pc);
+    }
+
+    #[test]
+    fn speaker_volume_reaches_an_output_that_was_missing_at_start() {
+        use crate::platform::fake::OURS;
+        let windows = FakePlatform::new();
+        windows.set_our_output_present(false);
+        let app = App::for_tests();
+        let engine = Engine::start(app.clone(), windows.platform()).unwrap();
+        windows.set_our_output_present(true);
+        app.speaker_reported_level(Some(43), Some(true));
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while windows.level_of(OURS) != Some((43, true)) {
+            assert!(std::time::Instant::now() < until, "the restored endpoint did not receive the volume and mute");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        engine.quit();
     }
 
     #[test]

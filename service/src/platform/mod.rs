@@ -16,10 +16,15 @@ pub use crate::model::facts::OutputKind;
 pub use crate::model::PcOutputId;
 
 pub mod fake;
+#[cfg(any(windows, test))]
+#[path = "win/repair_policy.rs"]
+mod repair_policy;
 mod hotkeys;
 pub use hotkeys::{DelayKeys, DelayPress, Hotkeys, KeyRegistration, KeySink, KeyStatus};
 #[cfg(windows)]
 pub(crate) mod win;
+#[cfg(windows)]
+pub use win::repair_output;
 
 // Compile the same process matching, adapter classification and PCM code on test hosts.
 #[cfg(all(test, not(windows)))]
@@ -211,8 +216,24 @@ pub trait Desk: Send + Sync {
     fn screen_reader(&self) -> bool;
 }
 
+pub(crate) const REPAIR_TIMEOUT_MS: u32 = 120_000;
+
+/// The elevated process has exited or Windows declined to start it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RepairExit {
+    Success,
+    Cancelled,
+    #[default]
+    Failed,
+}
+
 /// This app's own output in Windows.
 pub trait OurDevice: Send + Sync {
+    fn can_repair(&self) -> bool { false }
+    fn turned_off(&self) -> bool;
+    fn turn_on(&self) -> Result<(), String>;
+    /// Call approved once Windows starts the elevated process, then wait for its exit.
+    fn repair(&self, approved: &mut dyn FnMut()) -> RepairExit;
     /// Name it, e.g. "Kitchen (Stream To Speaker)". Returns at once.
     fn rename(&self, name: &str) -> Result<(), String>;
     /// Wait up to `max` for the last rename to be done (at quit).
@@ -421,6 +442,9 @@ impl AudioSessions for Passive {
 }
 
 impl OurDevice for Passive {
+    fn turned_off(&self) -> bool { false }
+    fn turn_on(&self) -> Result<(), String> { Err("No Windows audio worker".into()) }
+    fn repair(&self, _: &mut dyn FnMut()) -> RepairExit { RepairExit::Failed }
     fn rename(&self, _: &str) -> Result<(), String> {
         Ok(())
     }

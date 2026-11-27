@@ -296,14 +296,20 @@ fn report_arguments(e: &clap::Error) -> i32 {
 }
 
 fn main() {
-    // Startup tombstone. Written as the FIRST thing in main, before
-    // any state initialization, CLI parsing, panic-hook install, or
-    // singleton check could turn around and exit silently. If this
-    // file exists but no log line follows it, we know the process
-    // got at least this far and then died between the tombstone and
-    // env_logger.init(). If the file DOESN'T exist after a launch
-    // attempt, the binary isn't starting at all (SmartScreen,
-    // antivirus quarantine, missing dependency DLL, broken install).
+    #[cfg(windows)]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() == Some(std::ffi::OsStr::new("--repair-output")) {
+            let id = args.next();
+            if args.next().is_none() {
+                if let Some(id) = id.as_deref().and_then(|s| s.to_str()) {
+                    stream_to_speaker::platform::repair_output(id);
+                }
+            }
+            std::process::exit(1);
+        }
+    }
+    // Ordinary startup leaves a trace before CLI parsing, logging or the singleton check.
     write_startup_tombstone();
 
     // Help, the version and mistakes in the arguments are printed where
@@ -942,12 +948,20 @@ fn setup_app(cli: &Cli) -> Result<Arc<App>> {
 fn start_http(app: &Arc<App>) -> Result<u16> {
     let gena_callback = {
         let transport = app.clone();
-        let pusher = build_driver_volume_pusher();
-        let pusher = pusher.map(Arc::new);
-        // The window's volume slider moves the Windows slider through the
-        // same push.
-        if let Some(p) = pusher.clone() {
-            app.set_windows_volume_push(move |mb, muted| p.push(mb, muted));
+        #[cfg(windows)]
+        {
+            use stream_to_speaker::ioctl_source::IoctlAudioSource;
+            let source = std::sync::Mutex::new(None::<IoctlAudioSource>);
+            app.set_windows_volume_push(move |mb, muted| {
+                let mut source = source.lock().unwrap();
+                if let Some(s) = source.as_ref() {
+                    if s.push_volume(mb, muted).is_ok() { return Ok(()); }
+                }
+                let fresh = IoctlAudioSource::open_audio_only()?;
+                fresh.push_volume(mb, muted)?;
+                *source = Some(fresh);
+                Ok(())
+            });
         }
         Arc::new(move |path: &str, body: &str| {
             debug!("GENA NOTIFY on {}: {} bytes", path, body.len());
@@ -1144,13 +1158,7 @@ fn build_source(cli: &Cli) -> Result<Source> {
         SourceKind::Auto => {
             #[cfg(windows)]
             {
-                match open_driver() {
-                    Ok(s) => Ok(Source::new(s, Box::new(open_driver))),
-                    Err(e) => {
-                        info!("driver not present, falling back to WASAPI loopback: {}", e);
-                        Ok(Source::new(open_wasapi(cli.device.as_deref())?, reopen_wasapi(cli.device.clone())))
-                    }
-                }
+                auto_source(Box::new(open_driver), reopen_wasapi(cli.device.clone()), cli.device.is_none())
             }
             #[cfg(not(windows))]
             {
@@ -1159,6 +1167,41 @@ fn build_source(cli: &Cli) -> Result<Source> {
             }
         }
     }
+}
+
+/// Try both capture paths until one opens. Subsequent reads stay with that kind.
+#[cfg(any(windows, test))]
+fn auto_source(mut driver: audio_loop::Reopen, mut loopback: audio_loop::Reopen, retry_missing: bool) -> Result<Source> {
+    struct Unopened(String);
+    impl AudioSource for Unopened {
+        fn name(&self) -> &str { "waiting for a Windows sound output" }
+        fn recv_packet(&mut self) -> Result<stream_to_speaker::audio_source::AudioPacket> {
+            anyhow::bail!("{}", self.0)
+        }
+    }
+
+    let mut chosen = None;
+    let mut reopen: audio_loop::Reopen = Box::new(move || {
+        match chosen {
+            Some(SourceKind::Driver) => return driver(),
+            Some(SourceKind::WasapiLoopback) => return loopback(),
+            _ => {}
+        }
+        match driver() {
+            Ok(source) => { chosen = Some(SourceKind::Driver); Ok(source) }
+            Err(driver_error) => {
+                let source = loopback().with_context(|| format!("Driver unavailable ({driver_error:#}) and WASAPI loopback failed"))?;
+                chosen = Some(SourceKind::WasapiLoopback);
+                Ok(source)
+            }
+        }
+    });
+    let source = match reopen() {
+        Ok(source) => source,
+        Err(e) if retry_missing => Box::new(Unopened(format!("{e:#}"))),
+        Err(e) => return Err(e),
+    };
+    Ok(Source::new(source, reopen))
 }
 
 fn open_sine() -> Result<Box<dyn AudioSource>> {
@@ -1193,19 +1236,17 @@ fn spawn_driver_event_consumer(app: Arc<App>, cli: &Cli) {
     thread::Builder::new()
         .name("stream-to-speaker-driver-events".to_string())
         .spawn(move || {
-            // The first open says whether there is a driver at all (`auto`
-            // runs on WASAPI without one). Once open, a consumer that ends
-            // (the device was disabled, removed or updated) is opened
-            // again, as the audio source is. One consumer at a time: two
-            // would split the driver's single event stream between them.
+            // A single consumer follows the driver whenever it becomes available.
+            let mut attempts = 0;
             let mut src = match IoctlAudioSource::open() {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!("driver-event consumer: open failed: {}", e);
-                    return;
+                    debug!("Waiting for the driver event stream: {e}");
+                    let Some(s) = audio_loop::open_again(&app, &mut attempts, "the driver's events", IoctlAudioSource::open) else { return };
+                    app.note_driver_events_back();
+                    s
                 }
             };
-            let mut attempts = 0;
             loop {
                 if consume_driver_events(&app, &src) > 0 {
                     attempts = 0;
@@ -1286,54 +1327,6 @@ fn consume_driver_events(app: &Arc<App>, src: &stream_to_speaker::ioctl_source::
 #[cfg(not(windows))]
 #[allow(dead_code)]
 fn spawn_driver_event_consumer(_app: Arc<App>, _cli: &Cli) {}
-
-trait DriverVolumePush: Send + Sync {
-    fn push(&self, mb: i32, muted: bool) -> Result<()>;
-}
-
-#[cfg(windows)]
-struct IoctlPusher {
-    src: std::sync::Mutex<stream_to_speaker::ioctl_source::IoctlAudioSource>,
-}
-
-#[cfg(windows)]
-impl DriverVolumePush for IoctlPusher {
-    fn push(&self, mb: i32, muted: bool) -> Result<()> {
-        use stream_to_speaker::ioctl_source::IoctlAudioSource;
-        let mut s = self.src.lock().unwrap();
-        match s.push_volume(mb, muted) {
-            Ok(()) => Ok(()),
-            // After the device was restarted under the app (Device Manager,
-            // a driver update) the old handle is dead and a new one works.
-            Err(e) => match IoctlAudioSource::open_audio_only() {
-                Ok(fresh) => {
-                    *s = fresh;
-                    s.push_volume(mb, muted)
-                }
-                Err(_) => Err(e),
-            },
-        }
-    }
-}
-
-#[cfg(windows)]
-fn build_driver_volume_pusher() -> Option<Box<dyn DriverVolumePush>> {
-    use stream_to_speaker::ioctl_source::IoctlAudioSource;
-    match IoctlAudioSource::open_audio_only() {
-        Ok(s) => Some(Box::new(IoctlPusher {
-            src: std::sync::Mutex::new(s),
-        })),
-        Err(e) => {
-            debug!("no driver for volume pusher: {}", e);
-            None
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn build_driver_volume_pusher() -> Option<Box<dyn DriverVolumePush>> {
-    None
-}
 
 // -----------------------------------------------------------------------------
 // Signal handler
@@ -1422,6 +1415,23 @@ mod tests {
         let mut source = build_source(&cli(&["--source", "sine"])).unwrap();
         assert_eq!(source.audio.name(), "sine-440");
         assert_eq!((source.reopen)().unwrap().name(), "sine-440");
+    }
+
+    #[test]
+    fn auto_capture_starts_without_an_output_and_reopens_when_windows_recovers() {
+        for driver_returns in [true, false] {
+            let opener = |works: bool| -> audio_loop::Reopen {
+                let mut attempts = 0;
+                Box::new(move || {
+                    attempts += 1;
+                    if works && attempts >= 3 { open_sine() } else { anyhow::bail!("unavailable") }
+                })
+            };
+            let mut source = auto_source(opener(driver_returns), opener(!driver_returns), true).unwrap();
+            assert!(source.audio.recv_packet().is_err());
+            assert!((source.reopen)().is_err());
+            assert_eq!((source.reopen)().unwrap().name(), "sine-440");
+        }
     }
 
     #[test]

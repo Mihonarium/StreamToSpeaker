@@ -625,7 +625,7 @@ fn about(scene: &Scene, list: &ListPart) -> About {
     if let Some(q) = &sit.confirm_in_panel {
         return About::Question(notes::question(scene, q));
     }
-    if sit.standing.contains(&Standing::OutputMissing) || scene.repair == RepairNow::Worked {
+    if sit.standing.contains(&Standing::OutputMissing) || matches!(scene.repair, RepairNow::Running | RepairNow::Worked | RepairNow::DidntWork) {
         return About::Note(notes::repair(scene));
     }
     if sit.standing.contains(&Standing::NoSpeakerChosen) {
