@@ -793,8 +793,11 @@ impl SettingsPort for AppSettings {
         let st = app.discovery_net_status();
         let found = app.speaker_view().speakers.iter().filter(|s| s.id != MA_OUTPUT_ID).count();
         let mut lines = find_lines(&st.scope, &app.network_adapters(), &self.networks(), found);
-        if st.error.is_some() {
+        if app.airplay_discovery_error().is_some() {
             lines.push(FindLine::AirPlaySearchFailed);
+        }
+        if app.sendspin_discovery_error().is_some() {
+            lines.push(FindLine::SendspinSearchFailed);
         }
         DiscoveryCheck { lines }
     }

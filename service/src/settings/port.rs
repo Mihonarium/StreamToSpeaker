@@ -480,8 +480,10 @@ pub enum FindLine {
     /// Windows treats the network as private (fine) or public, where its
     /// firewall may keep speakers from reaching this PC.
     Profile { network: String, private: bool },
-    /// AirPlay discovery couldn't start.
+    /// AirPlay discovery couldn't start; the app keeps trying.
     AirPlaySearchFailed,
+    /// Sendspin discovery couldn't start; the app keeps trying.
+    SendspinSearchFailed,
     /// The chosen adapter is off.
     AdapterOff { adapter: String },
     /// Searching failed on a network, with the plain cause.

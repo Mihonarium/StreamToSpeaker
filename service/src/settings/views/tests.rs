@@ -1163,6 +1163,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.discovery.lines = vec![
                 FindLine::Profile { network: "HomeNet".into(), private: false },
                 FindLine::AirPlaySearchFailed,
+                FindLine::SendspinSearchFailed,
                 FindLine::AdapterOff { adapter: "Wi-Fi".into() },
                 FindLine::Failed { adapter: "Wi-Fi".into(), why: "no answer".into() },
             ];

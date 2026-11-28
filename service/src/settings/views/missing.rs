@@ -377,7 +377,12 @@ impl ViewContent for CheckView {
                         }
                     })
                 }
-                FindLine::AirPlaySearchFailed => check_line(ui, Mark2::Warning, &w!(lang, SetFindAirPlayFailed), None, |_| ()),
+                FindLine::AirPlaySearchFailed => {
+                    check_line(ui, Mark2::Warning, &w!(lang, SetFindAirPlayFailed), Some(&w!(lang, SetFindAirPlayFailedLine)), |_| ())
+                }
+                FindLine::SendspinSearchFailed => {
+                    check_line(ui, Mark2::Warning, &w!(lang, SetFindSendspinFailed), Some(&w!(lang, SetFindKeepsTrying)), |_| ())
+                }
                 FindLine::AdapterOff { adapter } => check_line(ui, Mark2::Bad, &w!(lang, SetNotLookingOff, adapter = adapter), None, |ui| {
                     if Button::standard(&w!(lang, SetLookEverywhere)).show(ui).clicked() {
                         self.port.act(Act::LookOn(None));
