@@ -834,25 +834,39 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
 }
 
 #[test]
-fn cant_hear_names_a_device_that_was_refused_the_sound() {
-    let refused = |device: Option<&str>| {
+fn cant_hear_says_which_device_privacy_turned_away_and_allows_nothing() {
+    let away = |device: Option<&str>| {
         let device = device.map(String::from);
         scripted(move |s| {
-            s.playback.taking = Some(Err(Taking::Refused { device, address: "192.168.1.51".into() }));
+            s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
+            s.playback.turned_away = Some(TurnedAway { device, address: "192.168.1.51".into() });
             s.playback.volume = None;
         })
     };
-    let port = refused(Some("Kitchen Sub"));
+    let port = away(Some("Kitchen Sub"));
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
-    assert!(h.has("Kitchen Sub asked for the sound and was refused."));
-    assert!(h.shows("Only Kitchen is allowed to listen. If that device plays together with Kitchen, allow it."));
+    // The broken step stays the speaker's, with its ways out.
+    assert!(h.has("Kitchen accepted the connection but isn’t asking for the sound.") && h.has("Try Kitchen again"));
     assert!(h.shows("It stops at the first broken step.") && !h.shows("is taking the sound") && !h.shows("volume"));
-    h.click("Allow it");
-    assert_eq!(h.acts(), vec![Act::Allow { address: "192.168.1.51".into(), speaker: "kitchen".into() }]);
+    // The device is named with its address, and the page allows nothing:
+    // its button opens the speaker's page, which lists the refused ones.
+    assert!(h.has("Kitchen Sub (192.168.1.51) asked for the sound and was refused."));
+    assert!(h.shows("Only Kitchen is allowed to listen. If that device is yours and plays together with Kitchen, you can allow it in Kitchen’s settings."));
+    assert!(!h.has("Allow") && !h.has("Allow it"));
+    h.click("Open Kitchen’s settings");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::SpeakerSettings(sid("kitchen")))]);
+    assert_eq!(h.acts(), vec![]);
     // A device the search doesn't know goes by its address.
-    let port = refused(None);
+    let port = away(None);
     let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
-    assert!(h.has("A device at 192.168.1.51 asked for the sound and was refused.") && h.has("Allow it"));
+    assert!(h.has("A device at 192.168.1.51 asked for the sound and was refused."));
+    // Without one, the step has nothing to say about privacy.
+    let port = scripted(|s| {
+        s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
+        s.playback.volume = None;
+    });
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(!h.shows("was refused") && !h.shows("allowed to listen"));
 }
 
 #[test]
@@ -1081,7 +1095,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
     reset_and_remove_only_act_after_confirmation();
     a_busy_chime_asks_in_the_page_before_playing();
     the_discovery_check_explains_why_search_is_off();
-    cant_hear_names_a_device_that_was_refused_the_sound();
+    cant_hear_says_which_device_privacy_turned_away_and_allows_nothing();
     cant_hear_says_why_the_sound_stayed_on_this_pc();
     tone_name_and_speaker_commands();
     the_page_uses_the_panel_delay_commands_and_the_selected_ways_limits();
@@ -1131,7 +1145,8 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.speakers.networks.as_mut().unwrap().looking = Looking::Nowhere;
             s.ma.offer = None;
             s.about.updates.state = UpdateState::NeverChecked;
-            s.playback.taking = Some(Err(Taking::Refused { device: Some("Kitchen Sub".into()), address: "192.168.1.51".into() }));
+            s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
+            s.playback.turned_away = Some(TurnedAway { device: Some("Kitchen Sub".into()), address: "192.168.1.51".into() });
             s.playback.playing = Some(Ok(Some("Chrome".into())));
             s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers".into() }));
             s.general.shortcuts.as_mut().unwrap().on = true;

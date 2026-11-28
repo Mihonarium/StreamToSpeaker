@@ -628,6 +628,13 @@ fn the_real_app_lists_refused_devices_and_allows_one() {
     assert_eq!(refused.len(), 1);
     assert_eq!(refused[0].address, "192.0.2.77");
     assert_eq!(refused[0].name, None, "a device discovery doesn't know has no name");
+    // Only a device that asked and was refused can be allowed, from the
+    // page that lists it.
+    port.act(Act::Allow { address: "192.0.2.99".into(), speaker: String::new() });
+    assert!(!app.is_speaker_peer("192.0.2.99".parse().unwrap()), "a device that never asked");
+    port.act(Act::Allow { address: "192.0.2.77".into(), speaker: "kitchen".into() });
+    assert!(!app.is_speaker_peer(peer), "it asked beside no speaker");
+    assert_eq!(port.privacy().refused.unwrap().len(), 1);
     port.act(Act::Allow { address: "192.0.2.77".into(), speaker: String::new() });
     assert!(port.privacy().refused.unwrap().is_empty());
     assert!(app.check_stream_client(peer).is_ok(), "allowed for this run");

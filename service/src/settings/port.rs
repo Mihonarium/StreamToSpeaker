@@ -399,6 +399,11 @@ pub struct PlaybackCheck {
     pub windows: Link<WindowsSends>,
     pub connected: Link<()>,
     pub taking: Link<Taking>,
+    /// While the speaker isn't asking for the sound: a device that asked
+    /// for it during this connection and that privacy turned away. The app
+    /// can't tell whether it plays the speaker's sound, so the check only
+    /// says what happened; a device is allowed on the speaker's page.
+    pub turned_away: Option<TurnedAway>,
     pub volume: Link<Volume>,
     /// Routes nobody has tried on real hardware.
     pub untested: bool,
@@ -435,17 +440,18 @@ pub enum Taking {
     NotAsking {
         two_ways: bool,
     },
-    /// Another device asked for the sound during this connection and
-    /// privacy refused it: it may be the one that plays the speaker's
-    /// sound. `device` is its name, where the search knows it.
-    Refused {
-        device: Option<String>,
-        address: String,
-    },
     /// AirPlay speakers and HomePods don't report it.
     CantTell,
     /// Paused with the speaker's own buttons or app while sound is sent.
     Paused,
+}
+
+/// A device that asked for the sound and that privacy turned away.
+/// `device` is the name the search has for it, where it has one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TurnedAway {
+    pub device: Option<String>,
+    pub address: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

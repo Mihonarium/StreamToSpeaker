@@ -486,6 +486,7 @@ pub fn example() -> State {
             windows: Some(Ok(WindowsSends::ToUs)),
             connected: Some(Ok(())),
             taking: Some(Ok(Taking::Yes)),
+            turned_away: None,
             volume: Some(Ok(Volume::Level(32))),
             untested: false,
             apple_tv: false,

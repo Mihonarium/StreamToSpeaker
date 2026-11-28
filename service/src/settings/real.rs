@@ -192,6 +192,17 @@ impl AppSettings {
         })
     }
 
+    /// Whether `address` asked for the sound and was refused while the app
+    /// was connected to `speaker` (to no speaker, for an empty one).
+    fn was_refused(&self, address: IpAddr, speaker: &str) -> bool {
+        let app = &self.app;
+        let address = crate::stream_gate::canonical_ip(address);
+        app.recently_refused().iter().any(|r| {
+            let beside = r.speaker.as_deref().map(|id| crate::engine::place_driver::speaker_for_pick(app, id));
+            r.address == address && beside.as_ref().map_or("", |id| id.as_str()) == speaker
+        })
+    }
+
     /// Every speaker the app lists, hidden ones included, as rows.
     fn rows(&self) -> Vec<(SpeakerRow, bool)> {
         let app = &self.app;
@@ -661,6 +672,7 @@ impl SettingsPort for AppSettings {
             windows: None,
             connected: None,
             taking: None,
+            turned_away: None,
             volume: None,
             untested: false,
             apple_tv: false,
@@ -729,12 +741,14 @@ impl SettingsPort for AppSettings {
             Some(Kind::Upnp) => {
                 if app.subscriber_count() > 0 {
                     Ok(Taking::Yes)
-                } else if let Some(refused) = self.refused_now(id) {
-                    // Nothing fetches the sound, and privacy turned a
-                    // device away: it may be the one that plays it.
-                    let address = refused.address.to_string();
-                    Err(Taking::Refused { device: (refused.name != address).then_some(refused.name), address })
                 } else {
+                    // Nothing fetches the sound. A device privacy turned
+                    // away is said beside that; whether it plays the
+                    // speaker's sound, the app can't tell.
+                    c.turned_away = self.refused_now(id).map(|refused| {
+                        let address = refused.address.to_string();
+                        TurnedAway { device: (refused.name != address).then_some(refused.name), address }
+                    });
                     // The speaker can be reached by AirPlay as well.
                     Err(Taking::NotAsking { two_ways: scene.speaker(id).is_some_and(|row| row.airplay_way().is_some()) })
                 }
@@ -935,8 +949,12 @@ impl SettingsPort for AppSettings {
                 }
                 cfg.save();
             }
-            Act::Allow { address, .. } => match address.parse::<IpAddr>() {
-                Ok(ip) => app.allow_device(ip),
+            Act::Allow { address, speaker } => match address.parse::<IpAddr>() {
+                // Only a device that asked for the sound and was refused
+                // is allowed, from the page that lists it: its speaker's,
+                // or Privacy for one that asked beside no speaker.
+                Ok(ip) if self.was_refused(ip, &speaker) => app.allow_device(ip),
+                Ok(_) => log::warn!("settings: {address} wasn't refused beside {speaker:?}: not allowed"),
                 Err(_) => log::warn!("settings: can't allow {address}: not an address"),
             },
             Act::StartAtSignIn(on) => {

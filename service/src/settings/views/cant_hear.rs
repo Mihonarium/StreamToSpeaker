@@ -244,22 +244,25 @@ impl ViewContent for CantHearView {
                             }
                         });
                     });
-                }
-                Err(Taking::Refused { device, address }) => {
-                    all_good = false;
-                    // Nothing fetches the sound, and another device that
-                    // asked was turned away: it may be the one that plays
-                    // the speaker's sound.
-                    let title = match device {
-                        Some(device) => w!(lang, SetCheckRefused, device = device),
-                        None => w!(lang, SetCheckRefusedUnnamed, address = address),
-                    };
-                    check_line(ui, Found::Bad, &title, Some(&w!(lang, SetCheckRefusedLine, speaker = &speaker)), |ui| {
-                        if Button::standard(&w!(lang, SetAllowIt)).show(ui).clicked() {
-                            let speaker = id.as_ref().map(|id| id.as_str().to_owned()).unwrap_or_default();
-                            self.port.act(Act::Allow { address: address.clone(), speaker });
-                        }
-                    });
+                    if let Some(away) = &c.turned_away {
+                        // A device privacy turned away while nothing
+                        // fetches the sound. Whether it plays the
+                        // speaker's sound, the app can't tell: the page
+                        // says what happened and allows nothing itself.
+                        // The speaker's page lists the refused devices.
+                        let title = match &away.device {
+                            Some(device) => w!(lang, SetCheckRefused, device = device, address = &away.address),
+                            None => w!(lang, SetCheckRefusedUnnamed, address = &away.address),
+                        };
+                        check_line(ui, Found::Info, &title, Some(&w!(lang, SetCheckRefusedLine, speaker = &speaker)), |ui| {
+                            if let Some(id) = &id {
+                                if Button::standard(&w!(lang, SetOpenSpeakerSettings, speaker = &speaker))
+                                    .max_width(ui.max_rect().width()).show(ui).clicked() {
+                                    ask(Ask::Open(crate::model::command::Open::SpeakerSettings(id.clone())));
+                                }
+                            }
+                        });
+                    }
                 }
                 Err(Taking::Paused) => {
                     // The panel's note, and its way out.
@@ -332,7 +335,7 @@ impl ViewContent for CantHearView {
         let broken = matches!(c.playing, Some(Err(_)))
             || matches!(c.windows, Some(Err(WindowsSends::AppElsewhere { .. } | WindowsSends::InputLost)))
             || (matches!(c.connected, Some(Err(()))) && !connecting)
-            || matches!(c.taking, Some(Err(Taking::NotAsking { .. } | Taking::Refused { .. } | Taking::Paused)))
+            || matches!(c.taking, Some(Err(Taking::NotAsking { .. } | Taking::Paused)))
             || matches!(c.volume, Some(Err(_)));
         let live = w!(lang, SetCheckLive);
         sentence(ui, &if broken { format!("{live} {}", w!(lang, SetCheckStops)) } else { live });

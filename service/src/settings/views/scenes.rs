@@ -539,7 +539,8 @@ fn cant_hear_music_assistant(ui: &mut Ui, _: &mut Stage) {
 
 fn cant_hear_refused(ui: &mut Ui, _: &mut Stage) {
     cant_hear(ui, "cant-hear-refused", "kitchen-playing", |s| {
-        s.playback.taking = Some(Err(Taking::Refused { device: Some("Kitchen Sub".into()), address: "192.168.1.51".into() }));
+        s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
+        s.playback.turned_away = Some(TurnedAway { device: Some("Kitchen Sub".into()), address: "192.168.1.51".into() });
         s.playback.volume = None;
     });
 }

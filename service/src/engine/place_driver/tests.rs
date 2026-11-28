@@ -946,9 +946,9 @@ fn calls_follow_the_setting_and_return_to_their_own_device() {
 }
 
 #[test]
-fn the_playback_check_names_a_device_privacy_refused_while_nobody_fetches_the_sound() {
+fn the_playback_check_says_which_device_privacy_turned_away_while_nobody_fetches_the_sound() {
     use crate::model::{view::view, PortCore};
-    use crate::settings::{real::AppSettings, port::{Act, SettingsPort, Taking}};
+    use crate::settings::{real::AppSettings, port::{Act, SettingsPort, Taking, TurnedAway}};
     let fake = FakeRenderer::start(answer);
     let mut r = Rig::new(&fake, UserConfig::in_memory());
     r.playing();
@@ -956,35 +956,51 @@ fn the_playback_check_names_a_device_privacy_refused_while_nobody_fetches_the_so
     let settings = AppSettings::new(r.app.clone());
     let port = Arc::new(PortCore::new(view(r.driver.scene(), None, false, 1)));
     r.app.engine_port.set(Arc::downgrade(&port)).unwrap();
-    let not_asking = Some(Err(Taking::NotAsking { two_ways: false }));
+    // What the step finds, and the device it says was turned away.
+    let found = || {
+        let c = settings.playback_check();
+        assert_eq!(c.taking, Some(Err(Taking::NotAsking { two_ways: false })));
+        c.turned_away.map(|away| {
+            assert_eq!(away.device, None, "the search doesn't know these devices");
+            away.address
+        })
+    };
     // The speaker accepted the connection and nothing fetches the sound.
-    assert_eq!(settings.playback_check().taking, not_asking);
-    // Another device asks and privacy turns it away: it may be the one
-    // that plays the speaker's sound, so the step names it.
+    assert_eq!(found(), None);
+    // Another device asks and privacy turns it away: the step says so.
     let other: std::net::IpAddr = "192.0.2.77".parse().unwrap();
     assert!(r.app.check_stream_client(other).is_err());
-    assert_eq!(settings.playback_check().taking, Some(Err(Taking::Refused { device: None, address: "192.0.2.77".into() })));
-    // Allowed, it is no finding any more.
+    assert_eq!(found().as_deref(), Some("192.0.2.77"));
+    // Only a device that was refused can be allowed, and from the page
+    // of the speaker it asked beside.
+    settings.act(Act::Allow { address: "192.0.2.99".into(), speaker: DEN.into() });
+    assert!(!r.app.is_speaker_peer("192.0.2.99".parse().unwrap()));
+    settings.act(Act::Allow { address: "192.0.2.77".into(), speaker: "uuid:another".into() });
+    assert!(!r.app.is_speaker_peer(other));
+    assert_eq!(found().as_deref(), Some("192.0.2.77"));
+    // Allowed there, it may fetch the sound and is said no more.
     settings.act(Act::Allow { address: "192.0.2.77".into(), speaker: DEN.into() });
-    assert_eq!(settings.playback_check().taking, not_asking);
+    assert!(r.app.is_speaker_peer(other));
+    assert_eq!(found(), None);
     // With any device let to listen, an earlier refusal explains nothing.
     let another: std::net::IpAddr = "192.0.2.78".parse().unwrap();
     assert!(r.app.check_stream_client(another).is_err());
-    assert!(matches!(settings.playback_check().taking, Some(Err(Taking::Refused { .. }))));
+    assert_eq!(found().as_deref(), Some("192.0.2.78"));
     r.app.set_privacy_mode(false);
-    assert_eq!(settings.playback_check().taking, not_asking);
+    assert_eq!(found(), None);
     r.app.set_privacy_mode(true);
-    assert!(matches!(settings.playback_check().taking, Some(Err(Taking::Refused { .. }))));
+    assert_eq!(found().as_deref(), Some("192.0.2.78"));
+    assert_eq!(settings.playback_check().turned_away, Some(TurnedAway { device: None, address: "192.0.2.78".into() }));
     // A refusal belongs to the connection it happened in: once the
-    // speaker is picked anew, it isn't given as the reason for the new
-    // connection's silence.
+    // speaker is picked anew, it isn't said beside the new connection's
+    // silence.
     r.send(Command::StayOnThisPc);
     r.settle();
     r.pick();
     r.settle();
     r.driver.look();
     port.publish(view(r.driver.scene(), None, false, 2));
-    assert_eq!(settings.playback_check().taking, not_asking);
+    assert_eq!(found(), None);
 }
 
 #[test]
