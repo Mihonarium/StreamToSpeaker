@@ -740,8 +740,12 @@ pub struct App {
     // ---- Discovery + active session ----
     pub discovery: Option<Arc<DiscoveryState>>,
     pub airplay_discovery: Option<Arc<AirPlayDiscoveryState>>,
-    /// What the password dialog supplied for the next connect to each receiver.
-    typed_airplay_passwords: Mutex<std::collections::HashMap<String, TypedPassword>>,
+    /// What the password dialog supplied for the next connect to each
+    /// receiver, with its number among the passwords typed in this run.
+    typed_airplay_passwords: Mutex<std::collections::HashMap<String, (u64, TypedPassword)>>,
+    /// How many passwords were typed in this run: the end of a connect
+    /// forgets only what was typed before it began.
+    typed_passwords: std::sync::atomic::AtomicU64,
     /// AirPlay receivers (by id) that asked for a password in this run,
     /// whether or not they announce one: picking them opens the password
     /// dialog, as for one that does.
@@ -1382,6 +1386,7 @@ impl App {
             discovery,
             airplay_discovery,
             typed_airplay_passwords: Mutex::new(std::collections::HashMap::new()),
+            typed_passwords: std::sync::atomic::AtomicU64::new(0),
             airplay_asked_password: Mutex::new(std::collections::HashSet::new()),
             session,
             last_speaker_id,
@@ -1850,7 +1855,8 @@ impl App {
         } else {
             self.set_airplay_password(&dialog.id, pw);
             if !pw.is_empty() {
-                self.typed_airplay_passwords.lock().unwrap().insert(dialog.id.clone(), TypedPassword::Saved);
+                let typed = (self.next_typed_password(), TypedPassword::Saved);
+                self.typed_airplay_passwords.lock().unwrap().insert(dialog.id.clone(), typed);
             }
         }
         Ok(())
@@ -1867,12 +1873,17 @@ impl App {
     /// Keep `pw` for the next connect to `id` only (an empty one clears
     /// it); never stored.
     fn keep_typed_password(&self, id: &str, pw: &str) {
+        let number = self.next_typed_password();
         let mut typed = self.typed_airplay_passwords.lock().unwrap();
         if pw.is_empty() {
             typed.remove(id);
         } else {
-            typed.insert(id.to_string(), TypedPassword::Once(pw.to_string()));
+            typed.insert(id.to_string(), (number, TypedPassword::Once(pw.to_string())));
         }
+    }
+
+    fn next_typed_password(&self) -> u64 {
+        self.typed_passwords.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// A password typed for one connection lives until the connect it was
@@ -1881,13 +1892,23 @@ impl App {
         self.typed_airplay_passwords.lock().unwrap().remove(id);
     }
 
+    /// The end of a connect that began when `typed` passwords had been
+    /// typed in this run: one typed since then is for the next connect to
+    /// `id`, and stays.
+    fn forget_typed_password_before(&self, id: &str, typed: u64) {
+        let mut all = self.typed_airplay_passwords.lock().unwrap();
+        if all.get(id).is_some_and(|(number, _)| *number <= typed) {
+            all.remove(id);
+        }
+    }
+
     /// The password to send, and whether it came from the dialog for this connection.
     /// A one-connection password follows its instance if an identity conflict ends.
     fn airplay_password_for(&self, renderer: &AirPlayRenderer) -> (Option<String>, bool) {
         let stable_id = renderer.stable_id();
         let typed = {
             let mut typed = self.typed_airplay_passwords.lock().unwrap();
-            renderer.instance_id().and_then(|k| typed.remove(&k)).or_else(|| typed.remove(&stable_id))
+            renderer.instance_id().and_then(|k| typed.remove(&k)).or_else(|| typed.remove(&stable_id)).map(|(_, typed)| typed)
         };
         if let Some(TypedPassword::Once(pw)) = typed {
             return (Some(pw), true);
@@ -2217,6 +2238,12 @@ impl App {
         if let Some(name) = self.speaker_settings(id).show_as.filter(|n| !n.trim().is_empty()) {
             return Some(name);
         }
+        self.speaker_own_name(id)
+    }
+
+    /// The name a speaker goes by where the person gave it no *Show as*
+    /// name: its own, or its manual entry's.
+    pub(crate) fn speaker_own_name(&self, id: &str) -> Option<String> {
         if let Some(m) = self.find_manual_speaker(id) {
             return Some(m.display_name());
         }
@@ -5282,8 +5309,11 @@ impl App {
     /// calling thread. A pick in the app's own window may ask for a secret.
     pub(crate) fn engine_connect(self: &Arc<Self>, id: &str, window: bool) -> Result<(), String> {
         *self.connecting.lock().unwrap() = Some(self.speaker_name(id).unwrap_or_else(|| id.to_string()));
+        // A connect that was left behind can end after the next one's
+        // password was typed: that one is not this connect's to forget.
+        let typed = self.typed_passwords.load(Ordering::Acquire);
         let result = self.select_speaker_opts(id, window, window);
-        self.forget_typed_password(id);
+        self.forget_typed_password_before(id, typed);
         *self.connecting.lock().unwrap() = None;
         self.clear_connecting_notice();
         result
@@ -9112,6 +9142,22 @@ mod tests {
         let uc = app.user_config.lock().unwrap();
         assert!(uc.airplay_passwords.is_empty());
         assert!(!serde_json::to_string(&*uc).unwrap().contains("typed-for-a-gone-one"));
+    }
+
+    /// A connect that ends late leaves a password typed after it began to
+    /// the connect it was typed for.
+    #[test]
+    fn the_end_of_a_connect_leaves_a_password_typed_since_it_began() {
+        let app = test_app();
+        let typed = |app: &App| app.typed_airplay_passwords.lock().unwrap().len();
+        app.keep_typed_password("airplay:AA", "for the first connect");
+        let first_began = app.typed_passwords.load(Ordering::Acquire);
+        app.keep_typed_password("airplay:AA", "for the second connect");
+        let second_began = app.typed_passwords.load(Ordering::Acquire);
+        app.forget_typed_password_before("airplay:AA", first_began);
+        assert_eq!(typed(&app), 1);
+        app.forget_typed_password_before("airplay:AA", second_began);
+        assert_eq!(typed(&app), 0);
     }
 
     /// A password typed for one connection doesn't outlive the connect it

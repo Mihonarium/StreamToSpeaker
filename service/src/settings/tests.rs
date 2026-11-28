@@ -175,11 +175,34 @@ fn the_code_goes_in_by_itself_after_the_fourth_digit() {
 }
 
 #[test]
+fn the_password_window_says_whether_the_password_is_saved() {
+    let saved = "Saved on this PC for next time.";
+    let once = "Used for this connection only: another speaker answers with the same identity, so it isn’t saved.";
+    // Opened by the person, from the speaker's page or its row.
+    let h = Harness::dialog(Dialog::Password(PasswordDialog::to_connect("office", "Office")), ScriptedSettings::new());
+    assert!(h.has(saved) && !h.has(once));
+    let port = ScriptedSettings::new();
+    port.set(|s| s.password_once = true);
+    let h = Harness::dialog(Dialog::Password(PasswordDialog::to_connect("office", "Office")), port);
+    assert!(h.has(once) && !h.has(saved));
+}
+
+#[test]
+fn the_real_app_says_when_a_typed_password_is_used_once() {
+    let (app, port, _) = real();
+    let id = with_speaker(&app);
+    assert!(!port.password_once(&id));
+    // An id that names one announcement of two with the same identity:
+    // nothing is saved under it.
+    assert!(port.password_once("airplay:B8E93735AC11/Kitchen 2"));
+}
+
+#[test]
 fn asking_for_a_new_code_after_no_answer_requests_one() {
     let port = ScriptedSettings::new();
     port.set(|s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::NoAnswer, seconds_left: None })));
     let mut h = Harness::dialog(Dialog::Code(CodeDialog::new("den")), port);
-    assert!(h.has("Den TV didn’t show a code."));
+    assert!(h.has("Asking Den TV to show a code didn’t work."));
     h.click("Ask for a new code");
     assert_eq!(h.acts(), vec![Act::NewCode("den".into())]);
 }

@@ -6,7 +6,7 @@
 use crossbeam_channel::{bounded, Sender};
 use log::{debug, info};
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,8 @@ pub struct PairPromptView {
 pub(crate) struct PairPrompt {
     view: PairPromptView,
     picks_seen: u64,
+    /// Which attempt put it up: an attempt takes down only its own.
+    attempt: u64,
     /// Live-code attempts: the connect thread waits on the other end.
     tx: Option<Sender<Option<String>>>,
 }
@@ -920,8 +922,23 @@ impl App {
             let input = self.live_code_input(view, picks_seen);
             self.spawn_select_with_pairing(id.to_string(), input, picks_seen);
         } else {
-            *self.sendspin.prompt.lock().unwrap() = Some(PairPrompt { view, tx: None, picks_seen });
+            self.put_up_pair_prompt(view, picks_seen, None);
         }
+    }
+
+    /// Puts up a pairing prompt and returns its attempt's number, by which
+    /// the attempt takes it down again. Where the prompt of a later choice
+    /// is up, nothing changes and `None` comes back: an attempt that this
+    /// choice left behind must not take its place.
+    fn put_up_pair_prompt(&self, view: PairPromptView, picks_seen: u64, tx: Option<Sender<Option<String>>>) -> Option<u64> {
+        static ATTEMPTS: AtomicU64 = AtomicU64::new(1);
+        let mut slot = self.sendspin.prompt.lock().unwrap();
+        if slot.as_ref().is_some_and(|p| p.picks_seen > picks_seen) {
+            return None;
+        }
+        let attempt = ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        *slot = Some(PairPrompt { view, picks_seen, attempt, tx });
+        Some(attempt)
     }
 
     /// A `PairingInput::Code` whose `ask` publishes the prompt and waits
@@ -936,14 +953,13 @@ impl App {
                 let app = weak.upgrade()?;
                 let until = ends.checked_sub(Duration::from_secs(5)).unwrap_or(ends);
                 let (tx, rx) = bounded::<Option<String>>(1);
-                *app.sendspin.prompt.lock().unwrap() = Some(PairPrompt {
-                    view: PairPromptView { until: Some(until), ..view.clone() },
-                    picks_seen,
-                    tx: Some(tx),
-                });
+                let shown = PairPromptView { until: Some(until), ..view.clone() };
+                let attempt = app.put_up_pair_prompt(shown, picks_seen, Some(tx))?;
+                // A later attempt's prompt in its place ends this wait
+                // unanswered, and stays up.
                 let answer = rx.recv_deadline(until).ok().flatten();
                 let mut slot = app.sendspin.prompt.lock().unwrap();
-                if slot.as_ref().map(|p| p.view.id == view.id && p.tx.is_some()).unwrap_or(false) {
+                if slot.as_ref().is_some_and(|p| p.attempt == attempt) {
                     *slot = None;
                 }
                 answer
@@ -1028,6 +1044,42 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prompt_view(id: &str, kind: PairPromptKind) -> PairPromptView {
+        PairPromptView { id: id.into(), name: id.into(), kind, lost_credential: false, identity_changed: false, until: None }
+    }
+
+    #[test]
+    fn an_attempt_of_an_earlier_choice_leaves_a_later_ones_prompt_up() {
+        let app = App::for_tests();
+        assert!(app.put_up_pair_prompt(prompt_view("sendspin:den", PairPromptKind::TokenOnly), 2, None).is_some());
+        assert_eq!(app.put_up_pair_prompt(prompt_view("sendspin:hall", PairPromptKind::TokenOnly), 1, None), None);
+        assert_eq!(app.pending_sendspin_pairing().unwrap().id, "sendspin:den");
+        // The next choice's prompt takes its place.
+        assert!(app.put_up_pair_prompt(prompt_view("sendspin:hall", PairPromptKind::TokenOnly), 3, None).is_some());
+        assert_eq!(app.pending_sendspin_pairing().unwrap().id, "sendspin:hall");
+    }
+
+    #[test]
+    fn a_replaced_live_code_attempt_leaves_the_newer_prompt_up() {
+        let app = App::for_tests();
+        let ask = |picks_seen| match app.live_code_input(prompt_view("sendspin:den", PairPromptKind::LiveCode), picks_seen) {
+            PairingInput::Code { ask, .. } => ask,
+            _ => unreachable!(),
+        };
+        let (first, second) = (ask(1), ask(2));
+        let ends = Instant::now() + Duration::from_secs(60);
+        let old = std::thread::spawn(move || first(ends));
+        assert!(server::test_player::eventually(|| app.pending_sendspin_pairing().is_some()));
+        let new = std::thread::spawn(move || second(ends));
+        // The second attempt's prompt replaces the first one's, whose wait
+        // ends unanswered and takes nothing down.
+        assert_eq!(old.join().unwrap(), None);
+        assert_eq!(app.pending_sendspin_pairing().map(|p| p.id), Some("sendspin:den".to_string()));
+        app.submit_sendspin_pairing("sendspin:den", Some("123456".into()));
+        assert_eq!(new.join().unwrap(), Some("123456".to_string()));
+        assert!(app.pending_sendspin_pairing().is_none());
+    }
 
     #[test]
     fn typing_the_players_code_pairs_without_sound_and_requests_one_current_switch() {

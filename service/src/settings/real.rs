@@ -849,6 +849,10 @@ impl SettingsPort for AppSettings {
         DiscoveryCheck { lines }
     }
 
+    fn password_once(&self, id: &str) -> bool {
+        self.app.password_dialog(id, "").one_session
+    }
+
     fn wanted_dialog(&self) -> Option<Wanted> {
         let app = &self.app;
         if let Some(mut ask) = app.pairing_code_ask() {

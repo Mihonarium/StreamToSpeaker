@@ -38,6 +38,8 @@ pub struct State {
     pub report_save: ReportSave,
     pub discovery: DiscoveryCheck,
     pub wanted: Option<Wanted>,
+    /// A password typed now is used for one connection and not saved.
+    pub password_once: bool,
     pub probe: Probe,
     pub tones: Vec<(String, ToneView)>,
 }
@@ -148,6 +150,9 @@ impl SettingsPort for ScriptedSettings {
     }
     fn wanted_dialog(&self) -> Option<Wanted> {
         self.state.lock().unwrap().wanted.clone()
+    }
+    fn password_once(&self, _id: &str) -> bool {
+        self.state.lock().unwrap().password_once
     }
     fn probe(&self) -> Probe {
         self.state.lock().unwrap().probe.clone()
@@ -510,6 +515,7 @@ pub fn example() -> State {
             ],
         },
         wanted: None,
+        password_once: false,
         probe: Probe::Idle,
         tones: vec![(
             "kitchen".into(),

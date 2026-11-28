@@ -250,7 +250,9 @@ fn ended_by(app: &App, platform: &Platform, id: &str, password_rejected: Option<
     if crate::app::needs_the_person(msg) {
         return Ended::NeedsSecret(Secret::Code);
     }
-    let lower = msg.to_lowercase();
+    // The message names the speaker, and a word of its name isn't what
+    // went wrong: "Busy Room was too slow to answer" is no busy speaker.
+    let lower = without_names(msg, &[app.speaker_name(id), app.speaker_own_name(id)]);
     if lower.contains("busy") || lower.contains("is playing something else") {
         return Ended::Busy { who: None };
     }
@@ -274,9 +276,54 @@ fn ended_by(app: &App, platform: &Platform, id: &str, password_rejected: Option<
     Ended::Refused
 }
 
+/// `msg` in lower case without the speaker's names: each is cut out where
+/// it stands by itself, and left where it is part of a longer word.
+fn without_names(msg: &str, names: &[Option<String>]) -> String {
+    let mut text = msg.to_lowercase();
+    for name in names.iter().flatten() {
+        let name = name.trim().to_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        let mut cut = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(&name) {
+            let end = at + name.len();
+            let in_a_word = rest[..at].chars().next_back().is_some_and(char::is_alphanumeric)
+                || rest[end..].chars().next().is_some_and(char::is_alphanumeric);
+            cut.push_str(&rest[..at]);
+            if in_a_word {
+                cut.push_str(&name);
+            }
+            rest = &rest[end..];
+        }
+        cut.push_str(rest);
+        text = cut;
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_word_in_the_speakers_name_isnt_read_as_what_went_wrong() {
+        let app = App::for_tests();
+        let windows = crate::platform::fake::FakePlatform::new();
+        let id = app.add_manual_speaker(crate::manual_speakers::ManualKind::AirPlay, "Busy Room", "192.0.2.40", "7000").unwrap();
+        let slow = "Busy Room was too slow to answer, so Stream To Speaker stopped trying after 12 seconds.";
+        assert!(!matches!(ended_by(&app, &windows.platform(), &id, None, slow), Ended::Busy { .. }));
+        // What the speaker is doing still counts.
+        let plays = ended_by(&app, &windows.platform(), &id, None, "Busy Room is playing something else");
+        assert_eq!(plays, Ended::Busy { who: None });
+        let busy = ended_by(&app, &windows.platform(), &id, None, "Busy Room is busy with another source right now");
+        assert_eq!(busy, Ended::Busy { who: None });
+        // A name is cut out where it stands by itself, whatever its case.
+        let names = [Some("Busy Room".to_string()), None, Some("TV".to_string())];
+        assert_eq!(without_names("BUSY ROOM was too slow; restart Busy Room. TV, hdtv", &names), " was too slow; restart . , hdtv");
+        assert_eq!(without_names("Den is busy", &[Some(" ".to_string())]), "den is busy");
+    }
 
     #[test]
     fn a_sendspin_pairing_prompt_from_the_window_means_the_speaker_needs_its_code() {

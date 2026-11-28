@@ -366,7 +366,7 @@ impl PasswordDialog {
             _ => None,
         };
         let wrong = ask.as_ref().map_or(self.wrong, |a| a.wrong);
-        let once = ask.as_ref().is_some_and(|a| a.once);
+        let once = ask.as_ref().map_or_else(|| port.password_once(&self.id), |a| a.once);
         let name = ask.as_ref().map_or(self.name.clone(), |a| a.name.clone());
         let mut keep = true;
         let mut submit = false;
