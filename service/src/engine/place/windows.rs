@@ -290,6 +290,22 @@ impl Core {
         }
     }
 
+    /// A switch got ready while a change of Windows' output to one of this
+    /// PC's own waits to be told from Windows' own changes, and no output
+    /// came or went so far: the change is the person's newer choice, and
+    /// This PC is the place. Returns whether it was so.
+    pub(super) fn this_pc_picked_meanwhile(&mut self, w: &World, now: Clock, out: &mut Vec<Do>) -> bool {
+        let picked = self
+            .pending_default
+            .as_ref()
+            .is_some_and(|p| matches!(p.to, Some(OutputRef::Pc(_))) && !self.moved_near(p.at_ms));
+        if picked {
+            let p = self.pending_default.take().expect("checked");
+            self.person_chose(p.to, p.prev, w, now, out);
+        }
+        picked
+    }
+
     /// A person chose an output in Windows' list.
     fn person_chose(&mut self, to: Option<OutputRef>, prev: Option<OutputRef>, w: &World, now: Clock, out: &mut Vec<Do>) {
         let prev_pc = match &prev {

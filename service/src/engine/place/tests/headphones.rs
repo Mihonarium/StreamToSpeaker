@@ -317,6 +317,30 @@ fn a_windows_change_within_two_seconds_is_windows_doing() {
     ]);
 }
 
+/// A person picks one of this PC's outputs in Windows' list while a switch
+/// to a speaker connects, and the speaker gets ready before the two
+/// seconds are over in which the app can't tell whose change that was.
+#[test]
+fn an_output_picked_in_windows_while_a_switch_connects_is_where_the_sound_stays() {
+    let mut r = Rig::new();
+    r.w.outputs.push(OutputWorld { id: out("usb"), kind: OutputKind::Other, name: "USB Audio".into() });
+    r.cmd(Command::Switch { place: Place::Speaker(id(K)), way: None }).unwrap();
+    r.w.set_playback(OutputRef::Pc(out("usb")));
+    let at = r.now.mono_ms;
+    r.event(Event::Output(OutputEvent::DefaultChanged { at_ms: at }));
+    r.wait(500);
+    r.take();
+    r.end(Purpose::Switch, Ended::Ready);
+    let dos = r.take();
+    assert!(silenced(&dos, K), "the connection that got ready is let go");
+    assert!(!dos.iter().any(|d| matches!(d, Do::Windows(_))), "Windows stays on the output the person picked");
+    assert_eq!(r.sit().spot, Spot::ThisPc(Some(out("usb"))));
+    r.wait(2_500);
+    assert_eq!(r.sit().spot, Spot::ThisPc(Some(out("usb"))));
+    assert!(r.w.playback_on(&OutputRef::Pc(out("usb"))));
+    assert!(!r.has_job(Purpose::Switch));
+}
+
 #[test]
 fn a_switch_in_windows_list_plays_meanwhile_on_the_old_output() {
     run(&[

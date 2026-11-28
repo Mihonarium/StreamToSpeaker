@@ -470,6 +470,12 @@ impl Core {
     }
 
     fn switch_ended(&mut self, s: Switching, ended: Ended, w: &World, now: Clock, out: &mut Vec<Do>) {
+        if ended == Ended::Ready && self.this_pc_picked_meanwhile(w, now, out) {
+            // Taking effect would move Windows off the output the person
+            // picked while this connected: the connection is let go.
+            out.push(Do::Silence { speaker: s.speaker, then: None });
+            return;
+        }
         let why = match ended {
             Ended::Ready => return self.take_effect(s, w, now, out),
             Ended::Busy { who } if self.ask_before_taking => {
