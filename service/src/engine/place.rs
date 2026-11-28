@@ -808,6 +808,11 @@ impl Core {
                 }
                 self.ways.insert(speaker.clone(), *way);
                 out.push(Do::Save);
+                // A switch on its way to that speaker goes on by the new
+                // way: getting ready by the old one would keep the old one.
+                if let Some(s) = self.switch.clone().filter(|s| &s.speaker == speaker && s.way != *way) {
+                    return self.switch_request_from_list(s.speaker, Some(*way), s.by, who, false, s.windows_prev, w, now, out);
+                }
                 Ok(Effect::Done)
             }
             Command::PlayChime { speaker, confirmed } => self.chime_request(speaker.clone(), *confirmed, SwitchBy::Switch, who, w, now, out),

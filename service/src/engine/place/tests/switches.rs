@@ -441,6 +441,26 @@ fn ways_are_chosen_per_speaker_and_switching_way_is_a_switch() {
             },
         },
         Row {
+            name: "a way chosen for the speaker a switch is on its way to: the switch goes on by that way, which is kept",
+            given: || {
+                let mut r = Rig::new();
+                r.cmd(Command::Switch { place: Place::Speaker(id(OFFICE)), way: None }).unwrap();
+                assert_eq!(r.job(Purpose::Switch).way, WayChoice::AirPlaySteady);
+                r
+            },
+            when: |r| {
+                r.cmd(Command::ChooseWay { speaker: id(OFFICE), way: WayChoice::AirPlayShort }).unwrap();
+            },
+            then: |r, dos| {
+                assert!(connects(dos, Purpose::Switch), "the switch starts again by the new way");
+                assert_eq!(r.job(Purpose::Switch).way, WayChoice::AirPlayShort);
+                r.end(Purpose::Switch, Ended::Ready);
+                let s = r.sit();
+                assert_eq!(s.spot, Spot::Speaker(id(OFFICE)));
+                assert_eq!(s.speaker(&id(OFFICE)).unwrap().way, WayChoice::AirPlayShort);
+            },
+        },
+        Row {
             name: "another way of the place is a switch: the sound stays on the old way until ready",
             given: || {
                 let mut r = Rig::new();
