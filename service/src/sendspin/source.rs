@@ -130,8 +130,9 @@ struct Shared {
     /// Open connections on the listener.
     slots: Arc<ConnectionSlots>,
     state: Mutex<SourceState>,
-    /// Code on display for an in-progress dynamic pairing: (code, server).
-    code: Mutex<Option<(u64, String, String)>>,
+    /// Code on display for an in-progress dynamic pairing: its connection,
+    /// the code, the server, and when the attempt ends at the latest.
+    code: Mutex<Option<(u64, String, String, Instant)>>,
     admitted: Mutex<Option<Admitted>>,
     last_event: Mutex<Option<(String, Instant)>>,
 }
@@ -319,9 +320,16 @@ impl SourceService {
         *self.shared.state.lock().unwrap() = state;
     }
 
-    /// The 6-digit code to show while a server is pairing with us.
-    pub fn pairing_code(&self) -> Option<(String, String)> {
-        self.shared.code.lock().unwrap().as_ref().map(|(_, c, s)| (c.clone(), s.clone()))
+    /// The 6-digit code to show while a server is pairing with us: the
+    /// code, the server, and when the attempt ends at the latest.
+    pub fn pairing_code(&self) -> Option<(String, String, Instant)> {
+        self.shared.code.lock().unwrap().as_ref().map(|(_, c, s, until)| (c.clone(), s.clone(), *until))
+    }
+
+    /// Puts a code on display as a pairing attempt does.
+    #[cfg(test)]
+    pub(crate) fn set_pairing_code(&self, code: Option<(String, String, Instant)>) {
+        *self.shared.code.lock().unwrap() = code.map(|(c, s, until)| (0, c, s, until));
     }
 
     /// A short status note (pairing results etc.), with its time.
@@ -571,7 +579,7 @@ fn handle_socket(sh: &Arc<Shared>, conn_id: u64, stream: TcpStream, peer: Socket
     }
     {
         let mut code = sh.code.lock().unwrap();
-        if code.as_ref().map(|(id, _, _)| *id) == Some(conn_id) {
+        if code.as_ref().map(|(id, ..)| *id) == Some(conn_id) {
             *code = None;
         }
     }
@@ -1214,13 +1222,13 @@ fn run_pairing(
         Some(PairMethod::PairingPsk) => pairing::client_pairing_psk(&ctx),
         _ => {
             let digits = act.pin_length.unwrap_or(MIN_CODE_DIGITS).max(MIN_CODE_DIGITS);
-            let show = |code: Option<String>| {
-                if let Some(c) = &code {
+            let show = |code: Option<(String, Instant)>| {
+                if let Some((c, _)) = &code {
                     // Single-use and only valid for this attempt; logged so
                     // a headless install can still be paired.
                     info!("Sendspin source: pairing code for {} is {}", server_name, c);
                 }
-                *sh.code.lock().unwrap() = code.map(|c| (conn_id, c, server_name.to_string()));
+                *sh.code.lock().unwrap() = code.map(|(c, until)| (conn_id, c, server_name.to_string(), until));
             };
             pairing::client_dynamic_code(&ctx, digits, &show)
         }

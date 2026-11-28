@@ -106,7 +106,7 @@ fn main() {
             loop {
                 let code = svc.pairing_code();
                 if code != last_code {
-                    if let Some((c, server)) = &code {
+                    if let Some((c, server, _)) = &code {
                         println!("CODE {} {}", c, server);
                     }
                     last_code = code;
@@ -136,11 +136,11 @@ fn main() {
             let pairing = if let Some(t) = arg(&args, "--token") {
                 Some(PairingInput::Token(t))
             } else if let Some(code) = arg(&args, "--static-code") {
-                Some(PairingInput::Code { dynamic: false, ask: Box::new(move || Some(code.clone())) })
+                Some(PairingInput::Code { dynamic: false, ask: Box::new(move |_| Some(code.clone())) })
             } else if args.iter().any(|a| a == "--dynamic-code") {
                 Some(PairingInput::Code {
                     dynamic: true,
-                    ask: Box::new(|| {
+                    ask: Box::new(|_| {
                         println!("ENTER-CODE");
                         let mut line = String::new();
                         std::io::stdin().read_line(&mut line).ok()?;

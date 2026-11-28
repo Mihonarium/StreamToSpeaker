@@ -66,7 +66,7 @@ fn sendspin_ask(identity_changed: bool) -> impl FnOnce(&mut State) {
             id: "desk".into(),
             name: "Desk Speaker".into(),
             live_code: true,
-            seconds_left: None,
+            seconds_left: Some(160),
             identity_changed,
             lost: false,
             wrong: false,
@@ -84,7 +84,7 @@ fn sendspin_identity(ui: &mut Ui, _: &mut Stage) {
 
 fn ma_code(ui: &mut Ui, _: &mut Stage) {
     dialog(ui, Dialog::MaCode(MaCodeDialog::default()), |s| {
-        s.wanted = Some(Wanted::MaCode(MaCodeShow { code: "482917".into(), this_pc: "DESKTOP-7Q".into(), seconds_left: None }));
+        s.wanted = Some(Wanted::MaCode(MaCodeShow { code: "482917".into(), this_pc: "DESKTOP-7Q".into(), seconds_left: Some(102) }));
     });
 }
 

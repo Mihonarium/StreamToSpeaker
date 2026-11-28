@@ -584,6 +584,30 @@ fn values_from_an_earlier_version_are_carried_over_not_lab_settings() {
 }
 
 #[test]
+fn music_assistants_code_says_how_long_it_stays() {
+    use std::time::{Duration, Instant};
+    let (app, port, _desk) = real();
+    app.set_sendspin_source_enabled(true).unwrap();
+    assert_eq!(port.music_assistant().code, None);
+    let code = |ends: Instant| Some(("482917".to_string(), "Music Assistant".to_string(), ends));
+    app.set_sendspin_source_code(code(Instant::now() + Duration::from_secs(90)));
+    // The page and the window count the same seconds down.
+    let (shown, left) = port.music_assistant().code.expect("a code is on display");
+    assert_eq!(shown, "482917");
+    assert!(matches!(left, Some(88..=90)), "{left:?}");
+    match port.wanted_dialog() {
+        Some(Wanted::MaCode(show)) => assert!(show.code == "482917" && matches!(show.seconds_left, Some(88..=90)), "{show:?}"),
+        other => panic!("{other:?}"),
+    }
+    // An attempt that is over has nothing left.
+    app.set_sendspin_source_code(code(Instant::now()));
+    assert_eq!(port.music_assistant().code, Some(("482917".to_string(), Some(0))));
+    app.set_sendspin_source_code(None);
+    assert_eq!(port.music_assistant().code, None);
+    app.set_sendspin_source_enabled(false).unwrap();
+}
+
+#[test]
 fn music_assistant_having_played_is_remembered_across_starts() {
     use super::real::earlier_day;
     let (app, port, _desk) = real();

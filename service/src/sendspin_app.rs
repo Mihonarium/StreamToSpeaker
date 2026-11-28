@@ -8,7 +8,7 @@ use log::{debug, info};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::app::{ActiveSession, App};
 use crate::discovery_net::MdnsController;
@@ -44,6 +44,8 @@ pub struct PairPromptView {
     pub lost_credential: bool,
     /// A different identity answered at the name we paired with.
     pub identity_changed: bool,
+    /// For a code the speaker shows now: until when it can be typed.
+    pub until: Option<Instant>,
 }
 
 pub(crate) struct PairPrompt {
@@ -545,9 +547,15 @@ impl App {
         addresses_for_music_assistant(self.this_pc_address(), &crate::ssdp::local_ipv4_interfaces())
     }
 
-    /// The code to show while Music Assistant pairs with us: (code, server).
-    pub fn sendspin_source_code(&self) -> Option<(String, String)> {
+    /// The code to show while Music Assistant pairs with us: the code,
+    /// the server, and when the attempt ends at the latest.
+    pub fn sendspin_source_code(&self) -> Option<(String, String, Instant)> {
         self.sendspin.source.lock().unwrap().as_ref().and_then(|s| s.pairing_code())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sendspin_source_code(&self, code: Option<(String, String, Instant)>) {
+        self.sendspin.source.lock().unwrap().as_ref().expect("the input is on").set_pairing_code(code);
     }
 
     /// Recent pairing outcome text for the card, if any (last 15 s).
@@ -903,6 +911,7 @@ impl App {
             kind,
             lost_credential: lost,
             identity_changed,
+            until: None,
         };
         if kind == PairPromptKind::LiveCode {
             // Connect again in pairing mode: the speaker derives a code
@@ -916,20 +925,23 @@ impl App {
     }
 
     /// A `PairingInput::Code` whose `ask` publishes the prompt and waits
-    /// for the user (3 minutes, the server-side attempt bound).
+    /// for the user until shortly before the attempt ends (3 minutes after
+    /// it began, the server-side bound), so that a code typed at the last
+    /// moment can still be checked.
     fn live_code_input(self: &Arc<Self>, view: PairPromptView, picks_seen: u64) -> PairingInput {
         let weak = Arc::downgrade(self);
         PairingInput::Code {
             dynamic: true,
-            ask: Box::new(move || {
+            ask: Box::new(move |ends: Instant| {
                 let app = weak.upgrade()?;
+                let until = ends.checked_sub(Duration::from_secs(5)).unwrap_or(ends);
                 let (tx, rx) = bounded::<Option<String>>(1);
                 *app.sendspin.prompt.lock().unwrap() = Some(PairPrompt {
-                    view: view.clone(),
+                    view: PairPromptView { until: Some(until), ..view.clone() },
                     picks_seen,
                     tx: Some(tx),
                 });
-                let answer = rx.recv_timeout(Duration::from_secs(175)).ok().flatten();
+                let answer = rx.recv_deadline(until).ok().flatten();
                 let mut slot = app.sendspin.prompt.lock().unwrap();
                 if slot.as_ref().map(|p| p.view.id == view.id && p.tx.is_some()).unwrap_or(false) {
                     *slot = None;
@@ -1003,7 +1015,7 @@ impl App {
                     id,
                     PairingInput::Code {
                         dynamic: false,
-                        ask: Box::new(move || Some(code.clone())),
+                        ask: Box::new(move |_| Some(code.clone())),
                     },
                     prompt.picks_seen,
                 );
@@ -1057,8 +1069,13 @@ mod tests {
                     assert!(activation.pairing && !activation.playback);
                     let ctx = pairing::PairingCtx { writer: &hs.writer, events: &events, dialect: proto::Dialect::Spec,
                         handshake_hash: hs.handshake_hash, suite: hs.suite, pairing_index: 1 };
-                    let result = pairing::client_dynamic_code(&ctx, 6, &|digits| {
-                        if let Some(digits) = digits { show.send(digits).unwrap(); }
+                    let began = std::time::Instant::now();
+                    let result = pairing::client_dynamic_code(&ctx, 6, &|shown| {
+                        if let Some((digits, ends)) = shown {
+                            // The code comes with the end of its attempt.
+                            assert!(ends > began && ends <= std::time::Instant::now() + pairing::CLIENT_ATTEMPT_TIMEOUT);
+                            show.send(digits).unwrap();
+                        }
                     }).unwrap();
                     let pairing::PairOutcome::Finalized { long_term_psk } = result else { panic!("{result:?}") };
                     // The next frame must close the connection. Playback and audio never started.
@@ -1082,6 +1099,11 @@ mod tests {
             drop(checking);
             let digits = code.recv_timeout(wait).unwrap();
             assert!(server::test_player::eventually(|| app.pending_sendspin_pairing().is_some_and(|p| p.id == id)));
+            // The prompt says until when the code can be typed: shortly
+            // before the attempt's three minutes are over.
+            let until = app.pending_sendspin_pairing().unwrap().until.expect("a live code's prompt has an end");
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            assert!(left > Duration::from_secs(120) && left <= Duration::from_secs(175), "{left:?}");
             let port = crate::settings::real::AppSettings::new(app.clone());
             use crate::settings::{Act, SettingsPort};
             port.act(Act::SubmitSendspin { id: "elsewhere".into(), code: digits.clone() });

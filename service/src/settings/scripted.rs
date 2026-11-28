@@ -431,9 +431,9 @@ pub fn example() -> State {
             failed: None,
             appears_as: "DESKTOP-7Q".into(),
             // As the app is told: Music Assistant's name, without its
-            // address or how long its code stays.
+            // address.
             found_by: Some(("Music Assistant (Home)".into(), None)),
-            code: Some(("482917".into(), None)),
+            code: Some(("482917".into(), Some(102))),
             paired_with: vec![],
             played: None,
             paused: false,
