@@ -753,8 +753,8 @@ fn run(cli: Cli) -> Result<()> {
     #[cfg(windows)]
     spawn_driver_event_consumer(app.clone(), &cli);
 
-    // Once-a-day "newer release on GitHub?" check (Advanced toggle; a
-    // dev build without a baked release tag never checks).
+    // Once-a-day "newer release on GitHub?" check (the About page's
+    // switch; a dev build without a baked release tag never checks).
     app.spawn_update_checker();
 
     // Now-playing metadata forwarder (off by default; pushes the OS's

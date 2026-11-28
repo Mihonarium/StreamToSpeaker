@@ -23,8 +23,8 @@
 //!   unauthenticated request a day is nothing against GitHub's 60/h
 //!   per-IP limit, so there is no ETag / conditional-request machinery.
 //! - **Privacy:** a plain GET carrying only a `User-Agent` with the app
-//!   version; GitHub sees the IP address as for any web request. Off
-//!   switch in Advanced (`check_for_updates`).
+//!   version; GitHub sees the IP address as for any web request. The
+//!   About page's switch turns the check off (`check_for_updates`).
 //! - **No auto-download, no auto-install.** The app only *tells* the user
 //!   and links to the release page; the installer (which also installs a
 //!   driver) is run by the user. Executing something we fetched ourselves

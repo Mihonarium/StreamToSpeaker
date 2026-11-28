@@ -247,7 +247,8 @@ pub struct UserConfig {
     /// own.
     #[serde(default = "default_homepod_latency_ms")]
     pub airplay_homepod_latency_ms: u32,
-    /// Once-a-day check for a newer release on GitHub (Advanced toggle).
+    /// Once-a-day check for a newer release on GitHub (the About page's
+    /// switch).
     /// One unauthenticated GET of the releases API; nothing is downloaded
     /// or installed. On by default. See `update_check`.
     #[serde(default = "default_true")]
