@@ -1,4 +1,4 @@
-//! Embeds the application icon into the executable on Windows.
+//! Embeds the application's icon and name into the executable on Windows.
 //!
 //! Without this the exe carries no icon resource, so Explorer, the Start
 //! Menu and any shortcut fall back to the generic default. The window and
@@ -26,6 +26,11 @@ fn main() {
         // with no icon.
         let mut res = winresource::WindowsResource::new();
         res.set_icon(ICON);
+        // The name Windows shows wherever it names the program itself:
+        // Task Manager, the firewall's question and its list of allowed
+        // apps. Left alone, both are the package's name.
+        res.set("FileDescription", "Stream To Speaker");
+        res.set("ProductName", "Stream To Speaker");
         res.compile().unwrap_or_else(|e| {
             panic!(
                 "failed to embed {ICON} into the executable: {e}\n\
