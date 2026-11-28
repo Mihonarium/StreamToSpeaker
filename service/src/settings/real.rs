@@ -655,7 +655,7 @@ impl SettingsPort for AppSettings {
         // stayed on another output of this PC, which is then named.
         let elsewhere = scene.situation.standing.iter().find_map(|s| match s {
             Standing::AppElsewhere { app, output } => {
-                let output = scene.outputs.iter().find(|o| o.id == *output).map_or_else(|| output.as_str().to_string(), |o| o.friendly.clone());
+                let output = scene.outputs.iter().find(|o| o.id == *output).map_or_else(|| output.as_str().to_string(), |o| scene.output_label(o));
                 Some(WindowsSends::AppElsewhere { app: app.clone(), output })
             }
             _ => None,

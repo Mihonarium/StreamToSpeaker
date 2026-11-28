@@ -663,19 +663,13 @@ fn the_playback_check_reads_its_first_steps_from_what_the_panel_shows() {
     // An app stayed on another output while the rest goes to the place:
     // it is named, and the links after it are still looked at, since the
     // speaker may be silent for a reason of its own.
-    // The output has Windows' full name for it, as on the panel's rows.
-    let except = || {
-        let mut scene = samples::named("kitchen-except-an-app");
-        for o in &mut scene.outputs {
-            o.friendly = "Speakers (Realtek Audio)".into();
-            o.name = "Speakers".into();
-        }
-        scene
-    };
+    // The output goes by the name the panel's rows give it: its own.
+    let except = || samples::named("kitchen-except-an-app");
+    assert!(except().outputs.iter().any(|o| o.name == "Speakers" && o.friendly == "Speakers (Realtek Audio)"));
     port.publish(view(except(), None, false, 3));
     let c = settings.playback_check();
     assert_eq!(c.playing, Some(Ok(None)));
-    assert!(matches!(&c.windows, Some(Ok(WindowsSends::AppElsewhere { app, output })) if app == "Chrome" && output == "Speakers (Realtek Audio)"), "{:?}", c.windows);
+    assert!(matches!(&c.windows, Some(Ok(WindowsSends::AppElsewhere { app, output })) if app == "Chrome" && output == "Speakers"), "{:?}", c.windows);
     assert_eq!(c.connected, Some(Err(())));
     // Nothing else plays: the app is what plays, and the check ends there.
     let mut scene = except();
@@ -683,7 +677,7 @@ fn the_playback_check_reads_its_first_steps_from_what_the_panel_shows() {
     port.publish(view(scene, None, false, 4));
     let c = settings.playback_check();
     assert_eq!(c.playing, Some(Ok(Some("Chrome".into()))));
-    assert!(matches!(&c.windows, Some(Err(WindowsSends::AppElsewhere { app, output })) if app == "Chrome" && output == "Speakers (Realtek Audio)"), "{:?}", c.windows);
+    assert!(matches!(&c.windows, Some(Err(WindowsSends::AppElsewhere { app, output })) if app == "Chrome" && output == "Speakers"), "{:?}", c.windows);
     assert_eq!((c.connected, c.taking, c.volume), (None, None, None));
     // The app can't read the sound Windows sends it: the check ends there
     // whatever plays, and goes on once the sound is read again.

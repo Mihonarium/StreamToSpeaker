@@ -147,7 +147,7 @@ fn words(scene: &Scene, n: &Note, name: &str) -> (String, String) {
             match scene.output(scene.situation.pc_output.as_ref()) {
                 Some(o) if o.kind == OutputKind::Speakers => t!(lang, MovedToPcSpeakers, when = &when),
                 output => {
-                    let name = output.map(|o| o.friendly.clone()).unwrap_or_else(|| t!(lang, ThisPcInSentence));
+                    let name = output.map(|o| scene.output_label(o)).unwrap_or_else(|| t!(lang, ThisPcInSentence));
                     t!(lang, MovedToOutput, output = &name, when = &when)
                 }
             },

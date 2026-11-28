@@ -169,9 +169,9 @@ fn moment(s: &Scene, name: &str, state: &str, sign: Sign) -> About {
     let p = view(s);
     assert_eq!(p.place.name, name);
     assert_eq!(
-        p.place.output.as_deref(),
+        p.place.output,
         if name == "This PC" {
-            s.outputs.first().map(|o| o.friendly.as_str())
+            s.outputs.first().map(|o| s.output_label(o))
         } else {
             None
         }
@@ -1308,6 +1308,32 @@ fn names_folds_and_search() {
 }
 
 #[test]
+fn an_output_goes_by_its_own_name_until_another_output_shares_it() {
+    let mut s = scene();
+    s.outputs.push(output("Headphones", OutputKind::Headphones));
+    on_pc(&mut s);
+    s.outputs_open = true;
+    let names = |s: &Scene| view(s).list.this_pc.outputs.iter().map(|o| o.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&s), ["Speakers", "Headphones"]);
+    assert_eq!(view(&s).place.output.as_deref(), Some("Speakers"));
+    assert_eq!(view(&s).list.this_pc.output, "Speakers");
+    // A second "Speakers": Windows' full names tell the two apart, and
+    // the other output keeps its own.
+    let mut usb = output("USB", OutputKind::Speakers);
+    usb.name = "Speakers".into();
+    usb.friendly = "Speakers (USB Audio)".into();
+    s.outputs.push(usb);
+    assert_eq!(names(&s), ["Speakers (Realtek Audio)", "Headphones", "Speakers (USB Audio)"]);
+    assert_eq!(view(&s).place.output.as_deref(), Some("Speakers (Realtek Audio)"));
+    assert_eq!(view(&s).list.this_pc.output, "Speakers (Realtek Audio)");
+    // The full name is what hovering shows.
+    assert_eq!(view(&s).list.this_pc.outputs[1].tooltip, "Headphones (Realtek Audio)");
+    // An output Windows gives no name of its own goes by the full one.
+    s.outputs[1].name.clear();
+    assert_eq!(names(&s)[1], "Headphones (Realtek Audio)");
+}
+
+#[test]
 fn outputs_and_volume_belong_to_the_place() {
     let mut s = scene();
     let p = view(&s);
@@ -1348,8 +1374,8 @@ fn outputs_and_volume_belong_to_the_place() {
     assert_eq!(row.outputs.len(), 2);
     assert!(row.outputs[0].marked && !row.outputs[1].marked);
     for (row, output) in row.outputs.iter().zip(&s.outputs) {
-        assert_eq!(row.name, output.friendly);
-        assert_eq!(row.tooltip, output.name);
+        assert_eq!(row.name, output.name);
+        assert_eq!(row.tooltip, output.friendly);
         assert_eq!(row.command, Command::SwitchOutput(output.id.clone()));
     }
     let v = p.place.volume.unwrap();

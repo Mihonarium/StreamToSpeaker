@@ -153,4 +153,16 @@ impl Scene {
     pub(super) fn output(&self, id: Option<&PcOutputId>) -> Option<&PcOutput> {
         id.and_then(|id| self.outputs.iter().find(|output| &output.id == id))
     }
+
+    /// The name an output is shown by: its own name ("Speakers"), or
+    /// Windows' full name, which adds the device, while another output
+    /// has the same name.
+    pub(crate) fn output_label(&self, output: &PcOutput) -> String {
+        let shared = self.outputs.iter().filter(|o| o.name == output.name).count() > 1;
+        if output.name.is_empty() || (shared && !output.friendly.is_empty()) {
+            output.friendly.clone()
+        } else {
+            output.name.clone()
+        }
+    }
 }

@@ -232,7 +232,7 @@ pub(super) fn place_part(scene: &Scene) -> PlacePart {
     let (name, output, owner, level) = match &scene.situation.spot {
         Spot::ThisPc(id) => (
             t!(lang, ThisPc),
-            scene.output(id.as_ref()).map(|o| o.friendly.clone()),
+            scene.output(id.as_ref()).map(|o| scene.output_label(o)),
             id.clone().map(VolumeOwner::PcOutput),
             scene.volume.pc,
         ),
@@ -402,8 +402,8 @@ fn pc_row(scene: &Scene) -> PcRow {
             .outputs
             .iter()
             .map(|o| OutputRow {
-                name: o.friendly.clone(),
-                tooltip: o.name.clone(),
+                name: scene.output_label(o),
+                tooltip: o.friendly.clone(),
                 marked: Some(&o.id) == output_id,
                 command: Command::SwitchOutput(o.id.clone()),
             })
@@ -415,7 +415,7 @@ fn pc_row(scene: &Scene) -> PcRow {
         name: t!(lang, ThisPc),
         output: scene
             .output(output_id)
-            .map(|o| o.friendly.clone())
+            .map(|o| scene.output_label(o))
             .unwrap_or_else(|| t!(lang, NoOutputConnected)),
         marked,
         command: if marked {

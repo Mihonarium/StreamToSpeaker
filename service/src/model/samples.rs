@@ -45,8 +45,8 @@ pub fn seen(id: SpeakerId, name: &str) -> SpeakerSeen {
 pub fn output(name: &str, kind: OutputKind) -> PcOutput {
     PcOutput {
         id: PcOutputId::new(name),
-        friendly: name.into(),
-        name: format!("{name} (Realtek Audio)"),
+        friendly: format!("{name} (Realtek Audio)"),
+        name: name.into(),
         device: "Realtek Audio".into(),
         kind,
     }
@@ -494,8 +494,11 @@ pub fn named(name: &str) -> Scene {
         }
         "long-names" => {
             on_pc(&mut s);
+            // Two outputs with one name go by Windows' full names.
             s.outputs[0].friendly = "Speakers (Realtek High Definition Audio)".into();
-            s.outputs[1].friendly = "Headphones (USB High Definition Audio Device)".into();
+            s.outputs[1].friendly = "Speakers (USB High Definition Audio Device)".into();
+            s.outputs[1].name = "Speakers".into();
+            s.outputs[1].kind = OutputKind::Speakers;
             for (sp, name) in s.speakers.iter_mut().zip([
                 "Bedroom HomePod Stereo Pair by the Window",
                 "Living Room + Dining Room + Kitchen",
