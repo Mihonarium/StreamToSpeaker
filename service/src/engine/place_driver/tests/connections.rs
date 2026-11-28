@@ -543,6 +543,9 @@ fn cancelling_after_the_place_was_released_restores_it_unless_a_new_switch_wins(
         };
         go.send(()).unwrap();
         r.settle();
+        // The app samples the sound all the while; here the last sample
+        // was taken before the waits above, so one is taken now.
+        r.driver.look();
         let s = r.driver.situation();
         assert_eq!(s.place_speaker(), Some(&expected));
         assert_eq!(s.doing, Doing::Playing);
@@ -724,6 +727,9 @@ fn cancelling_a_switch_restores_the_place_that_bound_after_it_started() {
     r.send(Command::CancelSwitch);
     r.driver.input(ready);
     r.settle();
+    // The app samples the sound all the while; here the last sample
+    // was taken before the waits above, so one is taken now.
+    r.driver.look();
     assert_eq!(r.driver.bound().unwrap().0, DEN);
     assert_ne!(r.driver.bound().unwrap().1, first.1);
     let s = r.driver.situation();
@@ -761,6 +767,9 @@ fn a_cancelled_delay_change_leaves_recovery_to_the_switch_that_took_the_session(
     r.app.set_sendspin_source_enabled(false).unwrap();
     go.send(()).unwrap();
     r.settle();
+    // The app samples the sound all the while; here the last sample
+    // was taken before the waits above, so one is taken now.
+    r.driver.look();
     assert_eq!(r.driver.bound().unwrap().0, speaker.as_str());
     let s = r.driver.situation();
     assert_eq!((s.spot, s.doing), (Spot::Speaker(speaker), Doing::Playing));
@@ -871,6 +880,9 @@ fn a_switch_whose_ready_arrives_after_its_session_was_taken_plays() {
     assert_eq!(r.driver.bound().unwrap().0, DEN);
     r.driver.input(office_ready);
     r.settle();
+    // The app samples the sound all the while; here the last sample
+    // was taken before the waits above, so one is taken now.
+    r.driver.look();
     let s = r.driver.situation();
     assert_eq!((s.spot, s.doing, s.note), (Spot::Speaker(target.clone()), Doing::Playing, None));
     assert_eq!(r.driver.bound().unwrap().0, target.as_str());
