@@ -429,6 +429,9 @@ pub enum Standing {
     /// Music Assistant is the place and hasn't started playing this PC's
     /// sound.
     MusicAssistantNotStarted,
+    /// Music Assistant is the place and its server isn't connected: this
+    /// PC's sound isn't heard until it connects.
+    MusicAssistantNotConnected,
     /// A room joined the group that is playing; said while that sound
     /// lasts.
     RoomJoined { room: String },
@@ -505,7 +508,7 @@ impl Popup {
         }
     }
 
-    /// Whether the Settings switch *Show notes by the clock about where the
+    /// Whether the Settings switch *Show pop-ups by the clock about where the
     /// sound is playing* turns this pop-up off. A failure that moved the
     /// sound, and an answer to something the person just did, always show.
     pub fn governed_by_switch(&self) -> bool {

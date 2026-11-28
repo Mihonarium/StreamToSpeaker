@@ -486,7 +486,7 @@ fn choosing_apps_hides_the_call_switch_and_keeps_its_value() {
     assert!(h.has(calls));
     h.flip(apps);
     assert!(!h.has(calls));
-    assert!(h.has("In Windows, set the output of each app you choose to the one with “Stream To Speaker” in its name."));
+    assert!(h.has("The rest keep playing on this PC. In Windows, set the output of each app you choose to the one with “Stream To Speaker” in its name."));
     h.click("Choose apps…");
     assert_eq!(h.asks(), [Asked::Open(Open::VolumeMixer)]);
     h.flip(apps);
@@ -524,7 +524,7 @@ fn each_settings_switch_changes_its_own_field() {
         ("Only send some apps to the speaker", Act::WhatPlays(WhatPlays::OnlySentApps)),
         ("Start when I sign in to Windows", Act::StartAtSignIn(false)),
         ("Switch back to this PC after 30 minutes with nothing playing", Act::SwitchBackAfterQuiet(true)),
-        ("Show notes by the clock about where the sound is playing", Act::NotesByClock(false)),
+        ("Show pop-ups by the clock about where the sound is playing", Act::NotesByClock(false)),
         ("Let Music Assistant play this PC’s sound", Act::OfferToMa(true)),
         ("Let scripts and home automation control this app", Act::Api(true)),
     ] {
@@ -546,7 +546,10 @@ fn each_settings_switch_changes_its_own_field() {
         assert_eq!((actual.general, actual.privacy, actual.ma), (expected.general, expected.privacy, expected.ma));
     }
     assert_eq!(h.asks(), vec![Asked::Open(Open::MusicAssistantSettings)]);
-    h.click("Update now"); assert_eq!(h.acts(), vec![Act::UpdateNow]);
+    // This app opens the page that has the update: the line doesn't call
+    // it ready to install, and the button says where it leads.
+    assert!(h.has("Version 0.2.1 is available.") && !h.shows("ready to install"));
+    h.click("Open the download page"); assert_eq!(h.acts(), vec![Act::WhatsNew]);
     h.click("Report a problem"); assert_eq!(h.asks(), vec![Asked::Dialog]);
     h.click("About"); assert_eq!(h.asks(), vec![Asked::View("About".into())]);
     h.click("Quit"); assert_eq!(h.asks(), vec![Asked::Command(Command::Quit)]);
@@ -649,6 +652,35 @@ fn the_playback_check_shows_only_chosen_apps_after_the_roles_return() {
 }
 
 #[test]
+fn cant_hear_says_what_the_panel_says_while_the_app_connects_by_itself() {
+    let not_connected = || {
+        scripted(|s| {
+            s.playback.connected = Some(Err(()));
+            s.playback.taking = None;
+            s.playback.volume = None;
+        })
+    };
+    // Connecting because sound started: no fault, and nothing to press.
+    let port = not_connected();
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-connecting"));
+    assert!(h.has("Connecting to Kitchen…") && !h.has("Not connected.") && !h.has("Connect"));
+    // A step the app is still working on isn't a broken one.
+    assert!(h.shows("This check updates by itself as things change.") && !h.shows("first broken step"));
+    // Trying again after the speaker stopped responding: the panel's line
+    // under it.
+    let port = not_connected();
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-not-responding-trying"));
+    assert!(h.has("Connecting to Kitchen…") && h.shows("Not responding. Trying again…"));
+    assert!(!h.has("Not connected.") && !h.has("Connect"));
+    // Nothing under way: the step is broken, and Connect is its fix.
+    let port = not_connected();
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port.clone())), snap("kitchen-playing"));
+    assert!(h.has("Not connected."));
+    h.click("Connect");
+    assert_eq!(port.acts(), vec![Act::Reconnect]);
+}
+
+#[test]
 fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     let port = scripted(|s| s.playback.volume = Some(Err(Volume::Muted)));
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
@@ -659,6 +691,85 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("music-assistant-playing"));
     h.click("Set to 20");
     assert_eq!(h.asks(), vec![Asked::Command(Command::SetVolume { owner: VolumeOwner::MusicAssistant, level: 20 })]);
+    let port = scripted(|s| s.playback.volume = Some(Err(Volume::Muted)));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("music-assistant-playing"));
+    h.click("Unmute");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::SetMuted { owner: VolumeOwner::MusicAssistant, muted: false })]);
+    // With every step good, a test chime is offered where the place can
+    // play one: Music Assistant can while it plays this PC's sound.
+    let port = scripted(|_| ());
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("music-assistant-playing"));
+    assert!(h.shows("Everything this PC can check looks right.") && h.has("Write a report"));
+    h.click("Play a test chime");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::PlayTestSound(SpeakerId::music_assistant()))]);
+    // Nothing plays: a chime is the way to make a sound, where the place
+    // can play one. Music Assistant with no server connected can't.
+    let nothing = |s: &mut State| {
+        s.playback.playing = Some(Err(None));
+        s.playback.windows = None;
+        s.playback.connected = None;
+        s.playback.taking = None;
+        s.playback.volume = None;
+    };
+    let port = scripted(nothing);
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Nothing on this PC is playing right now.") && h.has("Play a test chime"));
+    let port = scripted(nothing);
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("music-assistant-not-connected"));
+    assert!(h.has("Nothing on this PC is playing right now.") && !h.has("Play a test chime"));
+    // Music Assistant with no server connected, while sound is sent: said
+    // in the panel's words, with its page in place of a Connect button.
+    let port = scripted(|s| {
+        s.playback.speaker = Some("Music Assistant".into());
+        s.playback.connected = Some(Err(()));
+        s.playback.server_away = true;
+        s.playback.taking = None;
+        s.playback.volume = None;
+    });
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("music-assistant-not-connected"));
+    assert!(h.has("Music Assistant isn’t connected.") && h.has("This PC’s sound isn’t heard until it connects."));
+    assert!(!h.has("Connect") && !h.shows("Connected to") && !h.has("Not connected."));
+    assert!(h.shows("It stops at the first broken step."));
+    h.click("How to connect it");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::MusicAssistantSettings)]);
+    // The app can't read the sound Windows sends it: said, with the way
+    // to hear the sound meanwhile, and the check ends there.
+    let port = scripted(|s| {
+        s.playback.windows = Some(Err(WindowsSends::InputLost));
+        s.playback.connected = None;
+        s.playback.taking = None;
+        s.playback.volume = None;
+    });
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Stream To Speaker can’t read this PC’s sound.") && h.has("It keeps trying. Kitchen is silent meanwhile."));
+    assert!(!h.shows("Connected to") && !h.shows("Everything this PC can check looks right."));
+    h.click("Switch to this PC");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::Switch { place: crate::model::state::Place::ThisPc, way: None })]);
+    // An app that stayed on another output while the rest plays on the
+    // speaker: a remark with the same ways out, and the check goes on.
+    let port = scripted(|s| {
+        s.playback.windows = Some(Ok(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers (Realtek Audio)".into() }));
+    });
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-except-an-app"));
+    assert!(h.has("Chrome is still playing on this PC’s Speakers (Realtek Audio). The rest goes to Kitchen."));
+    assert!(h.has("Connected to Kitchen.") && h.has("Kitchen is taking the sound.") && h.shows("32, not muted"));
+    assert!(h.shows("This check updates by itself as things change.") && !h.shows("first broken step"), "a remark isn't a broken step");
+    assert!(!h.shows("Everything this PC can check looks right."), "something was found");
+    h.click("Set Chrome’s output in Windows…");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::VolumeMixer)]);
+    // An app that stayed on one of this PC's own outputs: the line says
+    // which one, and that it isn't the speaker.
+    let port = scripted(|s| {
+        s.playback.playing = Some(Ok(Some("Chrome".into())));
+        s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers (Realtek Audio)".into() }));
+    });
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Chrome is still playing on this PC’s Speakers (Realtek Audio), not on Kitchen."));
+    // The two ways out: a restart, named for the app, and Windows' page
+    // of apps and their outputs.
+    assert!(h.shows("Restart Chrome: some apps move to a new output only after a restart."));
+    h.click("Set Chrome’s output in Windows…");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::VolumeMixer)]);
     let port = scripted(|s| {
         s.playback.taking = Some(Err(Taking::NotAsking { two_ways: true }));
         s.playback.volume = None;
@@ -667,8 +778,18 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     h.click("Try Kitchen again");
     assert_eq!(h.asks(), vec![Asked::Command(Command::Reconnect(crate::model::samples::kitchen()))]);
     h.click("Switch to Kitchen by AirPlay");
-    assert_eq!(h.acts(), vec![Act::TryAirPlay]);
+    assert_eq!(h.asks(), vec![Asked::Command(Command::ChooseWay { speaker: crate::model::samples::kitchen(), way: crate::model::situation::WayChoice::AirPlaySteady })]);
     assert!(!h.shows("volume"), "the check stops at the first broken step");
+    // Music Assistant that hasn't started this PC's sound: the panel's
+    // note and its way out, in place of trying a speaker again.
+    let port = scripted(|s| {
+        s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
+        s.playback.volume = None;
+    });
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("music-assistant-playing"));
+    assert!(h.has("Music Assistant hasn’t started playing.") && !h.has("Try Music Assistant again"));
+    h.click("How to start it");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::MusicAssistantHowTo)]);
     let port = scripted(|s| {
         s.playback.taking = Some(Ok(Taking::CantTell));
         s.playback.on_short = true;
@@ -706,6 +827,16 @@ fn music_assistant_about_and_lab_act_at_once() {
     h.click("Show the welcome again");
     assert_eq!(h.acts(), vec![Act::CheckNow, Act::ShowLab(true), Act::LicenceAndSource]);
     assert_eq!(h.asks(), vec![Asked::Command(Command::FirstRunAction(crate::model::command::FirstRunAction::ShowAgain))]);
+
+    // About says the same about an update as Settings does: the app opens
+    // the page that has it. The line under the daily check says what the
+    // check sends and that it installs nothing.
+    let port = scripted(|_| ());
+    let mut h = H::new(port.clone(), Box::new(super::AboutView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Version 0.2.1 is available.") && !h.shows("ready to install") && !h.has("Update now"));
+    assert!(h.shows("Sends only the app’s version to GitHub. Nothing is downloaded or installed by itself."));
+    h.click("Open the download page");
+    assert_eq!(h.acts(), vec![Act::WhatsNew]);
 
     let port = scripted(|s| s.lab.mfi = Some(true));
     let mut h = H::new(port.clone(), Box::new(super::LabView::new(port)), snap("kitchen-playing"));
@@ -757,6 +888,24 @@ fn assert_clean(texts: &[Text], right: f32, what: &str) {
             a.text
         );
     }
+}
+
+#[test]
+fn a_speaker_with_no_known_way_of_playing_has_no_delay_part() {
+    // Nothing is known of how it plays, so there is nothing to set, and
+    // no sentence about hearing a change.
+    let mut scene = snap("kitchen-playing").scene.clone();
+    scene.speakers.iter_mut().find(|s| s.id == sid("garage")).unwrap().ways.clear();
+    let port = scripted(|_| ());
+    let mut h = H::new(port.clone(), Box::new(SpeakerOptions::new(port, "garage")), Arc::new(crate::model::view::view(scene, None, false, 1)));
+    assert!(h.has("Tone") && h.has("Volume limit"));
+    assert!(!h.has("Delay") && !h.shows("isn’t playing now"));
+    // Why it isn't found is one click away, as on its row in the panel.
+    h.click("Why?");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::SpeakerMissing)]);
+    // A found speaker that isn't playing has both.
+    let h = speaker("office");
+    assert!(h.has("Delay") && h.shows("Office isn’t playing now"));
 }
 
 #[test]
@@ -909,8 +1058,8 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.speakers.networks.as_mut().unwrap().looking = Looking::Nowhere;
             s.ma.offer = None;
             s.about.updates.state = UpdateState::NeverChecked;
-            s.about.updates.installs_here = false;
             s.playback.taking = Some(Err(Taking::Refused { device: "Kitchen Sub".into(), address: "192.168.1.51".into() }));
+            s.playback.playing = Some(Ok(Some("Chrome".into())));
             s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers".into() }));
             s.general.shortcuts.as_mut().unwrap().on = true;
             for p in &mut s.pages {
@@ -918,6 +1067,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             }
         },
         |s| {
+            s.playback.windows = Some(Ok(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers".into() }));
             s.speakers.networks.as_mut().unwrap().pinned = Some("192.168.1.23".into());
             s.playback.playing = Some(Err(None));
             s.playback.untested = true;
@@ -967,7 +1117,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
         },
         |s| {
             s.about.updates.state = UpdateState::Available { version: "0.2.1".into(), at: None };
-            s.about.updates.installs_here = false;
+            s.about.updates.installs_here = true;
             s.playback.connected = Some(Err(()));
             s.ma.found_by = Some(("Music Assistant (Home)".into(), Some("192.168.1.10".into())));
             s.ma.code = Some(("482917".into(), Some(171)));
@@ -1030,6 +1180,30 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
     let engine = ScriptedEngine::new("pc-office-needs-password");
     look(&H::new(port.clone(), Box::new(SpeakerOptions::new(port.clone(), "office")), engine.snapshot()));
     look(&H::new(port.clone(), Box::new(super::LabView::new(port.clone())), snap("kitchen-playing")));
+    // Can't hear it? while the app connects to the speaker.
+    let connecting = scripted(|s| {
+        s.playback.connected = Some(Err(()));
+        s.playback.taking = None;
+        s.playback.volume = None;
+    });
+    look(&H::new(connecting.clone(), Box::new(CantHearView::new(connecting)), snap("kitchen-connecting")));
+    // Can't hear it? while Music Assistant hasn't started this PC's sound.
+    let waiting = scripted(|s| {
+        s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
+        s.playback.volume = None;
+    });
+    look(&H::new(waiting.clone(), Box::new(CantHearView::new(waiting)), snap("music-assistant-playing")));
+    // Can't hear it? while Music Assistant's server isn't connected, and
+    // while the app can't read this PC's sound.
+    let away = scripted(|s| {
+        s.playback.connected = Some(Err(()));
+        s.playback.server_away = true;
+        s.playback.taking = None;
+        s.playback.volume = None;
+    });
+    look(&H::new(away.clone(), Box::new(CantHearView::new(away)), snap("music-assistant-not-connected")));
+    let lost = scripted(|s| s.playback.windows = Some(Err(WindowsSends::InputLost)));
+    look(&H::new(lost.clone(), Box::new(CantHearView::new(lost)), snap("kitchen-playing")));
     let mut h = H::new(port.clone(), Box::new(SettingsView::new(port.clone())), snap("kitchen-playing"));
     h.click("Change…");
     look(&h);

@@ -185,8 +185,20 @@ pub fn tray(scene: &Scene) -> Tray {
         },
         Some(Command::Quit),
     ));
+    // An amber icon over "This PC" doesn't say what happened: the title
+    // of the note about a failure does. It is the note the panel shows
+    // unless a question, a repair or a switch stands in its place. With a
+    // speaker as the place, its state says it already.
+    let why = scene
+        .situation
+        .note
+        .as_ref()
+        .filter(|n| scene.situation.amber && !accent && n.failure())
+        .map(|n| notes::note(scene, n).title);
+    let mut parts = vec![place.name, place.state.text];
+    parts.extend(why);
     Tray {
-        tooltip: format!("{} – {}", t!(lang, AppName), lang.join_parts(&[place.name, place.state.text])),
+        tooltip: format!("{} – {}", t!(lang, AppName), lang.join_parts(&parts)),
         amber: scene.situation.amber,
         accent,
         menu,

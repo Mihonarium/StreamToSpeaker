@@ -6,6 +6,7 @@ use std::sync::Arc;
 use egui::Ui;
 
 use crate::model::command::{Command, VolumeOwner};
+use crate::model::panel::Sign;
 use crate::model::Snapshot;
 use crate::model::state::SpeakerId;
 use crate::model::situation::Standing;
@@ -71,6 +72,8 @@ impl ViewContent for CantHearView {
         let c = self.port.playback_check();
         // The speaker the sound is on, for the actions that go to it.
         let id: Option<SpeakerId> = snap.scene.situation.place_speaker().cloned();
+        // A test chime is offered where the place can play one.
+        let chimes = id.as_ref().filter(|id| snap.scene.situation.speaker(id).is_some_and(|s| s.can_chime));
         let Some(speaker) = c.speaker.clone() else {
             check_line(ui, Found::Info, &w!(lang, SetCheckOnPc), Some(&w!(lang, SetCheckOnPcLineView)), |_| ());
             return;
@@ -91,7 +94,7 @@ impl ViewContent for CantHearView {
                     let detail = snap.scene.situation.standing.iter().any(|s| matches!(s, Standing::OnlySomeApps { .. }))
                         .then(|| w!(lang, OnlyChosenApps));
                     check_line(ui, Found::Bad, &quiet, detail.as_deref(), |ui| {
-                        if let Some(id) = &id {
+                        if let Some(id) = chimes {
                             if Button::standard(&w!(lang, PlayTestChime)).show(ui).clicked() {
                                 send(ask, Command::PlayTestSound(id.clone()));
                             }
@@ -103,7 +106,37 @@ impl ViewContent for CantHearView {
         // 2. Windows sends it here.
         if let Some(r) = &c.windows {
             match r {
+                // An app on another output. While the rest goes to the
+                // speaker it is a remark, and the check goes on.
+                Ok(WindowsSends::AppElsewhere { app, output }) | Err(WindowsSends::AppElsewhere { app, output }) => {
+                    all_good = false;
+                    // The remark says where the rest goes, so the speaker
+                    // isn't taken for silent.
+                    let (found, title) = if r.is_ok() {
+                        (Found::Warning, w!(lang, SetCheckAppElsewhereRest, app = app, output = output, speaker = &speaker))
+                    } else {
+                        (Found::Bad, w!(lang, SetCheckAppElsewhere, app = app, output = output, speaker = &speaker))
+                    };
+                    check_line(ui, found, &title, Some(&w!(lang, SetCheckRestartApp, app = app)), |ui| {
+                        // Windows' page of apps and their outputs: an app
+                        // that was given an output of its own is set back
+                        // there.
+                        if Button::standard(&w!(lang, SetCheckSetOutput, app = app)).max_width(ui.max_rect().width()).show(ui).clicked() {
+                            ask(Ask::Open(crate::model::command::Open::VolumeMixer));
+                        }
+                    });
+                }
                 Ok(_) => check_line(ui, Found::Good, &w!(lang, SetCheckWindows), None, |_| ()),
+                Err(WindowsSends::InputLost) => {
+                    all_good = false;
+                    // The way to hear the sound meanwhile: what plays on
+                    // this PC's own output doesn't pass through the app.
+                    check_line(ui, Found::Bad, &w!(lang, SetCheckInputLost), Some(&w!(lang, SetCheckInputLostLine, speaker = &speaker)), |ui| {
+                        if Button::standard(&w!(lang, SwitchToPc)).show(ui).clicked() {
+                            send(ask, Command::Switch { place: crate::model::state::Place::ThisPc, way: None });
+                        }
+                    });
+                }
                 Err(WindowsSends::Elsewhere { output }) => {
                     all_good = false;
                     check_line(ui, Found::Bad, &w!(lang, SetCheckWindowsElsewhere, output = output), None, |ui| {
@@ -114,10 +147,6 @@ impl ViewContent for CantHearView {
                         }
                     });
                 }
-                Err(WindowsSends::AppElsewhere { app, output }) => {
-                    all_good = false;
-                    check_line(ui, Found::Bad, &w!(lang, SetCheckAppElsewhere, app = app, output = output), Some(&w!(lang, SetCheckRestartApp)), |_| ());
-                }
                 Err(WindowsSends::ToUs) => {}
             }
         }
@@ -127,11 +156,28 @@ impl ViewContent for CantHearView {
                 Ok(()) => check_line(ui, Found::Good, &w!(lang, SetCheckConnected, speaker = &speaker), None, |_| ()),
                 Err(()) => {
                     all_good = false;
-                    check_line(ui, Found::Bad, &w!(lang, SetCheckNotConnected), None, |ui| {
-                        if Button::standard(&w!(lang, SetConnect)).show(ui).clicked() {
-                            self.port.act(Act::Reconnect);
-                        }
-                    });
+                    // While the app connects or tries again by itself, the
+                    // step says so, with the panel's line about a try that
+                    // follows trouble, and offers nothing: the app is at it
+                    // already.
+                    let state = &snap.panel.place.state;
+                    match state.sign {
+                        Sign::Spinner => check_line(ui, Found::Info, &w!(lang, SetCheckConnecting, speaker = &speaker), None, |_| ()),
+                        Sign::SpinnerWarn => check_line(ui, Found::Warning, &w!(lang, SetCheckConnecting, speaker = &speaker), Some(&state.text), |_| ()),
+                        // Music Assistant's server connects to the app:
+                        // a Connect button would do nothing, and its page
+                        // says how it connects.
+                        _ if c.server_away => check_line(ui, Found::Bad, &w!(lang, SetCheckMaNotConnected), Some(&w!(lang, MaNotConnectedLine)), |ui| {
+                            if Button::standard(&w!(lang, HowToConnect)).show(ui).clicked() {
+                                ask(Ask::Open(crate::model::command::Open::MusicAssistantSettings));
+                            }
+                        }),
+                        _ => check_line(ui, Found::Bad, &w!(lang, SetCheckNotConnected), None, |ui| {
+                            if Button::standard(&w!(lang, SetConnect)).show(ui).clicked() {
+                                self.port.act(Act::Reconnect);
+                            }
+                        }),
+                    }
                 }
             }
         }
@@ -159,14 +205,31 @@ impl ViewContent for CantHearView {
                     });
                 }
                 Ok(_) => check_line(ui, Found::Good, &w!(lang, SetCheckTaking, speaker = &speaker), None, |_| ()),
+                Err(Taking::NotAsking { .. }) if id.as_ref().is_some_and(SpeakerId::is_music_assistant) => {
+                    // Music Assistant's server is connected and hasn't
+                    // started this PC's sound: the panel's note, and its
+                    // way out.
+                    all_good = false;
+                    check_line(ui, Found::Bad, &w!(lang, SetCheckMaNotStarted), Some(&w!(lang, MaStartPcSound)), |ui| {
+                        if Button::standard(&w!(lang, HowToStart)).show(ui).clicked() {
+                            ask(Ask::Open(crate::model::command::Open::MusicAssistantHowTo));
+                        }
+                    });
+                }
                 Err(Taking::NotAsking { two_ways }) => {
                     all_good = false;
+                    // The same speaker by AirPlay: the choice the panel's
+                    // own ways make.
+                    let airplay = id.as_ref().and_then(|id| Some((id, snap.scene.speaker(id)?.airplay_way()?)));
                     check_line(ui, Found::Bad, &w!(lang, SetCheckNotAsking, speaker = &speaker), None, |ui| {
                         buttons(ui, |ui| {
                             reconnect(ui, ask);
                             if *two_ways && Button::standard(&w!(lang, SwitchByWay, speaker = &speaker, way = &w!(lang, KindAirPlay)))
                                 .max_width(ui.max_rect().width()).show(ui).clicked() {
-                                self.port.act(Act::TryAirPlay);
+                                match airplay {
+                                    Some((id, way)) => send(ask, Command::ChooseWay { speaker: id.clone(), way }),
+                                    None => self.port.act(Act::TryAirPlay),
+                                }
                             }
                         });
                     });
@@ -224,7 +287,7 @@ impl ViewContent for CantHearView {
             }
             let _ = Para::new(&text).lead(&w!(lang, SetCheckAllGood)).size(size::SECONDARY).tone(Tone::Primary).show(ui);
             buttons(ui, |ui| {
-                if let Some(id) = &id {
+                if let Some(id) = chimes {
                     if Button::standard(&w!(lang, PlayTestChime)).show(ui).clicked() {
                         send(ask, Command::PlayTestSound(id.clone()));
                     }
@@ -235,6 +298,15 @@ impl ViewContent for CantHearView {
             });
         }
         gap(ui);
-        sentence(ui, &w!(lang, SetCheckLive));
+        // That the list stops at a broken step is said only when it did:
+        // not at a step the app is still working on, nor after a remark.
+        let connecting = matches!(snap.panel.place.state.sign, Sign::Spinner | Sign::SpinnerWarn);
+        let broken = matches!(c.playing, Some(Err(_)))
+            || matches!(c.windows, Some(Err(WindowsSends::AppElsewhere { .. } | WindowsSends::InputLost | WindowsSends::Elsewhere { .. })))
+            || (matches!(c.connected, Some(Err(()))) && !connecting)
+            || matches!(c.taking, Some(Err(Taking::NotAsking { .. } | Taking::Refused { .. })))
+            || matches!(c.volume, Some(Err(_)));
+        let live = w!(lang, SetCheckLive);
+        sentence(ui, &if broken { format!("{live} {}", w!(lang, SetCheckStops)) } else { live });
     }
 }

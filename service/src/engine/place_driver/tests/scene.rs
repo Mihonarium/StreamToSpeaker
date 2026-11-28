@@ -179,6 +179,13 @@ fn enabled_music_assistant_has_its_own_row() {
     assert!(!scene.situation.speaker(&ma).unwrap().can_chime);
     r.send(Command::Switch { place: Place::MusicAssistant, way: None });
     r.settle();
+    // A chime is mixed into what the app sends: Music Assistant can play
+    // one only while it plays this PC's sound.
+    use crate::sendspin::source::SourceState;
+    assert!(!r.driver.scene().situation.speaker(&ma).unwrap().can_chime);
+    r.app.set_sendspin_source_state(SourceState::Connected { server: "Server".into(), streaming: false });
+    assert!(!r.driver.scene().situation.speaker(&ma).unwrap().can_chime);
+    r.app.set_sendspin_source_state(SourceState::Connected { server: "Server".into(), streaming: true });
     assert!(r.driver.scene().situation.speaker(&ma).unwrap().can_chime);
     r.windows.app_plays("Music", OURS, Some(0.5));
     r.app.user_config.lock().unwrap().delay_shortcuts = true;
@@ -275,6 +282,36 @@ fn music_assistant_follows_the_network_it_connected_on() {
     assert_eq!(network(&r), Some(NetId(HOME_NET.into())));
     connected(&mut r, false);
     assert!(listed(&mut r));
+    r.app.set_sendspin_source_enabled(false).unwrap();
+}
+
+#[test]
+fn music_assistant_chosen_with_no_server_connected_says_so() {
+    use crate::model::situation::Standing;
+    use crate::sendspin::source::SourceState;
+    let mut r = Rig::on(App::for_tests());
+    r.app.set_sendspin_source_enabled(true).unwrap();
+    r.send(Command::Switch { place: Place::MusicAssistant, way: None });
+    r.settle();
+    r.windows.app_plays("Music", OURS, Some(0.5));
+    for _ in 0..62 {
+        r.advance(1_000);
+    }
+    let about = |r: &mut Rig| {
+        let s = r.driver.scene().situation;
+        (s.standing.contains(&Standing::MusicAssistantNotConnected), s.standing.contains(&Standing::MusicAssistantNotStarted))
+    };
+    assert_eq!(about(&mut r), (true, false));
+    assert_eq!(r.driver.scene().situation.speaker(&SpeakerId::music_assistant()).unwrap().state, RowState::NotFound);
+    // Its server connects and hasn't started this PC's sound yet.
+    r.app.set_sendspin_source_state(SourceState::Connected { server: "Server".into(), streaming: false });
+    r.driver.look();
+    assert_eq!(about(&mut r), (false, true));
+    r.app.set_sendspin_source_state(SourceState::Connected { server: "Server".into(), streaming: true });
+    r.driver.look();
+    assert_eq!(about(&mut r), (false, false));
+    r.send(Command::StayOnThisPc);
+    r.settle();
     r.app.set_sendspin_source_enabled(false).unwrap();
 }
 

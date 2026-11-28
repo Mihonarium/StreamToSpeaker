@@ -407,6 +407,8 @@ pub struct PlaybackCheck {
     /// Single HomePod or AirPlay speaker on Short delay: *Try Steady
     /// instead* helps.
     pub on_short: bool,
+    /// Music Assistant is the speaker and its server isn't connected.
+    pub server_away: bool,
 }
 
 /// One link of the playback check: `None` while not known (an earlier
@@ -420,11 +422,14 @@ pub enum WindowsSends {
     Elsewhere {
         output: String,
     },
-    /// An app still plays on another output.
+    /// An app still plays on another output. Found while the rest goes to
+    /// the speaker, it doesn't end the check.
     AppElsewhere {
         app: String,
         output: String,
     },
+    /// The app can't read the sound Windows sends it and is trying again.
+    InputLost,
 }
 
 #[derive(Clone, Debug, PartialEq)]

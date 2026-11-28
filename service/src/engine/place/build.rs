@@ -200,8 +200,15 @@ impl Core {
             }) {
                 standing.push(Standing::AppElsewhere { app: app.as_str().to_string(), output });
             }
-            if k.is_music_assistant() && matches!(self.stream, Stream::On { .. }) && !w.music_assistant_playing {
-                standing.push(Standing::MusicAssistantNotStarted);
+            if k.is_music_assistant() && matches!(self.stream, Stream::On { .. }) {
+                // Its server connects to the app, so the app can be sending
+                // with no server there. Outside the minute after a wake or
+                // a start that is said, as on its row.
+                if !self.in_grace(now) && !self.speaker_world(k, w).is_some_and(|s| s.found) {
+                    standing.push(Standing::MusicAssistantNotConnected);
+                } else if !w.music_assistant_playing {
+                    standing.push(Standing::MusicAssistantNotStarted);
+                }
             }
             if self.paused_at_speaker && matches!(self.stream, Stream::On { .. }) {
                 standing.push(Standing::PausedAtSpeaker { speaker: k.clone() });

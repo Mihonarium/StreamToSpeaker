@@ -105,6 +105,11 @@ impl PlaceDriver {
                     && s.peak > place::numbers::LEVEL_THRESHOLD)
                 .map(|s| s.app.clone())
                 .collect();
+            for s in sessions.iter().filter(|s| !s.system_sounds) {
+                if self.app_names.get(&s.key) != Some(&s.app) {
+                    self.app_names.insert(s.key.clone(), s.app.clone());
+                }
+            }
             let levels = sessions
                 .into_iter()
                 .map(|s| Level {

@@ -314,6 +314,12 @@ pub(super) fn standing(scene: &Scene) -> Option<NoteView> {
             t!(lang, WindowsDidntSwitchLine),
             Act::open(t!(lang, OpenWindowsSound), Open::SoundSettings),
         )
+    } else if conditions.contains(&Standing::MusicAssistantNotConnected) {
+        (
+            t!(lang, MaNotConnected),
+            t!(lang, MaNotConnectedLine),
+            Act::open(t!(lang, HowToConnect), Open::MusicAssistantSettings),
+        )
     } else if conditions.contains(&Standing::MusicAssistantNotStarted) {
         (
             t!(lang, MaNotStarted),

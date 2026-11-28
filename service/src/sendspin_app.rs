@@ -640,21 +640,21 @@ impl App {
         }))
     }
 
-    /// The "Music Assistant" speaker-list entry: shown while the input is
-    /// on and paired with a server (or while it is the output).
+    /// The "Music Assistant" speaker-list entry: listed while a paired
+    /// server is connected (or while it is the output). A server that is
+    /// away can't play what is sent to it, so it isn't offered then.
     fn ma_output_entry(&self, active_id: Option<&str>) -> Option<SpeakerInfo> {
         let active = active_id == Some(MA_OUTPUT_ID);
-        let ip = self.sendspin.source.lock().unwrap().as_ref().map(|s| s.paired_server_ip());
-        let paired = !self.user_config.lock().unwrap().sendspin.server_pairings.is_empty();
-        let shown = active || (ip.is_some() && paired && self.is_sendspin_available());
-        if !shown {
+        let connected = matches!(self.sendspin_source_state(), Some(SourceState::Connected { .. }));
+        if !active && !(connected && self.is_sendspin_available()) {
             return None;
         }
+        let ip = self.sendspin.source.lock().unwrap().as_ref().and_then(|s| s.paired_server_ip());
         Some(SpeakerInfo {
             active,
             id: MA_OUTPUT_ID.to_string(),
             friendly_name: "Music Assistant".to_string(),
-            ip: ip.flatten().map(|a| a.to_string()).unwrap_or_default(),
+            ip: ip.map(|a| a.to_string()).unwrap_or_default(),
             note: Some(
                 "Sends this computer's audio to Music Assistant's Sendspin input, only while this \
                  is selected. Music Assistant plays it on the speaker set in this computer's \

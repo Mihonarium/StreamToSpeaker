@@ -646,6 +646,134 @@ fn the_playback_check_names_the_place_before_its_session_starts() {
 }
 
 #[test]
+fn the_playback_check_reads_its_first_steps_from_what_the_panel_shows() {
+    use crate::model::{samples, view::view, PortCore};
+    let (app, settings, _) = real();
+    let port = Arc::new(PortCore::new(view(samples::named("kitchen-nothing-playing"), None, false, 1)));
+    app.engine_port.set(Arc::downgrade(&port)).unwrap();
+    // Nothing plays: the check stops at its first step, as the panel says.
+    let c = settings.playback_check();
+    assert_eq!((c.playing, c.windows, c.connected), (Some(Err(None)), None, None));
+    // Sound goes to the place: Windows sends it here, and the connection
+    // is looked at next.
+    port.publish(view(samples::named("kitchen-playing"), None, false, 2));
+    assert!(!app.is_speaker_bound());
+    let c = settings.playback_check();
+    assert_eq!((c.playing, c.windows, c.connected), (Some(Ok(None)), Some(Ok(WindowsSends::ToUs)), Some(Err(()))));
+    // An app stayed on another output while the rest goes to the place:
+    // it is named, and the links after it are still looked at, since the
+    // speaker may be silent for a reason of its own.
+    // The output has Windows' full name for it, as on the panel's rows.
+    let except = || {
+        let mut scene = samples::named("kitchen-except-an-app");
+        for o in &mut scene.outputs {
+            o.friendly = "Speakers (Realtek Audio)".into();
+            o.name = "Speakers".into();
+        }
+        scene
+    };
+    port.publish(view(except(), None, false, 3));
+    let c = settings.playback_check();
+    assert_eq!(c.playing, Some(Ok(None)));
+    assert!(matches!(&c.windows, Some(Ok(WindowsSends::AppElsewhere { app, output })) if app == "Chrome" && output == "Speakers (Realtek Audio)"), "{:?}", c.windows);
+    assert_eq!(c.connected, Some(Err(())));
+    // Nothing else plays: the app is what plays, and the check ends there.
+    let mut scene = except();
+    scene.situation.doing = crate::model::situation::Doing::NothingPlaying;
+    port.publish(view(scene, None, false, 4));
+    let c = settings.playback_check();
+    assert_eq!(c.playing, Some(Ok(Some("Chrome".into()))));
+    assert!(matches!(&c.windows, Some(Err(WindowsSends::AppElsewhere { app, output })) if app == "Chrome" && output == "Speakers (Realtek Audio)"), "{:?}", c.windows);
+    assert_eq!((c.connected, c.taking, c.volume), (None, None, None));
+    // The app can't read the sound Windows sends it: the check ends there
+    // whatever plays, and goes on once the sound is read again.
+    port.publish(view(samples::named("kitchen-playing"), None, false, 5));
+    app.note_sound_input_lost("the device went away");
+    let c = settings.playback_check();
+    assert_eq!((c.playing, c.windows, c.connected), (Some(Ok(None)), Some(Err(WindowsSends::InputLost)), None));
+    app.note_sound_input_back();
+    let c = settings.playback_check();
+    assert_eq!((c.windows, c.connected), (Some(Ok(WindowsSends::ToUs)), Some(Err(()))));
+}
+
+#[test]
+fn the_playback_check_says_what_the_speaker_page_knows_about_the_place() {
+    use crate::model::{samples, view::view, PortCore};
+    let (app, settings, _) = real();
+    let port = Arc::new(PortCore::new(view(samples::named("kitchen-playing"), None, false, 1)));
+    app.engine_port.set(Arc::downgrade(&port)).unwrap();
+    assert!(!settings.playback_check().apple_tv);
+    // An Apple TV may not pass the sound on to its HomePods: the check's
+    // last lines say so.
+    let mut scene = samples::named("kitchen-playing");
+    scene.speakers.iter_mut().find(|s| s.id == samples::kitchen()).unwrap().kind = SpeakerKind::AppleTv;
+    port.publish(view(scene, None, false, 2));
+    assert!(settings.playback_check().apple_tv);
+}
+
+#[test]
+fn the_playback_check_follows_music_assistants_server() {
+    use crate::model::{samples, situation::Standing, view::view, PortCore};
+    use crate::sendspin::source::SourceState;
+    let (app, settings, _) = real();
+    app.set_sendspin_source_enabled(true).unwrap();
+    app.streaming_enabled.store(true, std::sync::atomic::Ordering::Release);
+    app.connect_again(crate::sendspin_app::MA_OUTPUT_ID).unwrap();
+    assert!(app.is_speaker_bound(), "choosing Music Assistant binds a session with no server there");
+    let port = Arc::new(PortCore::new(view(samples::named("music-assistant-playing"), None, false, 1)));
+    app.engine_port.set(Arc::downgrade(&port)).unwrap();
+    // No server is connected: the check says so and ends there.
+    let c = settings.playback_check();
+    assert!(c.server_away);
+    assert_eq!((c.connected, c.taking, c.volume), (Some(Err(())), None, None));
+    // A server that only asks to pair isn't one that plays.
+    app.set_sendspin_source_state(SourceState::NeedsPairing { server: "Server".into() });
+    let c = settings.playback_check();
+    assert!(c.server_away && c.connected == Some(Err(())));
+    // Connected, and it hasn't started this PC's sound: the panel's note.
+    app.set_sendspin_source_state(SourceState::Connected { server: "Server".into(), streaming: false });
+    let mut scene = samples::named("music-assistant-playing");
+    scene.situation.standing.push(Standing::MusicAssistantNotStarted);
+    port.publish(view(scene, None, false, 2));
+    let c = settings.playback_check();
+    assert!(!c.server_away);
+    assert_eq!((c.connected, c.taking, c.volume), (Some(Ok(())), Some(Err(Taking::NotAsking { two_ways: false })), None));
+    // It plays this PC's sound.
+    app.set_sendspin_source_state(SourceState::Connected { server: "Server".into(), streaming: true });
+    port.publish(view(samples::named("music-assistant-playing"), None, false, 3));
+    let c = settings.playback_check();
+    assert_eq!((c.connected, c.taking), (Some(Ok(())), Some(Ok(Taking::Yes))));
+    assert!(matches!(c.volume, Some(Ok(_))), "{:?}", c.volume);
+    app.set_sendspin_source_enabled(false).unwrap();
+}
+
+#[test]
+fn the_playback_check_reads_the_level_and_mute_the_panel_shows() {
+    use crate::model::{facts::Level, samples, view::view, PortCore};
+    let (app, settings, _) = real();
+    // Music Assistant as the output, playing this PC's sound: it is bound
+    // with no speaker to reach.
+    app.set_sendspin_source_enabled(true).unwrap();
+    app.set_sendspin_source_state(crate::sendspin::source::SourceState::Connected { server: "Server".into(), streaming: true });
+    app.streaming_enabled.store(true, std::sync::atomic::Ordering::Release);
+    app.connect_again(crate::sendspin_app::MA_OUTPUT_ID).unwrap();
+    assert!(app.is_speaker_bound());
+    let mut scene = samples::named("music-assistant-playing");
+    scene.volume.place = Some(Level::at(32));
+    let port = Arc::new(PortCore::new(view(scene.clone(), None, false, 1)));
+    app.engine_port.set(Arc::downgrade(&port)).unwrap();
+    assert_eq!(settings.playback_check().volume, Some(Ok(Volume::Level(32))));
+    // A muted place is silent at any level.
+    scene.volume.place.as_mut().unwrap().muted = true;
+    port.publish(view(scene.clone(), None, false, 2));
+    assert_eq!(settings.playback_check().volume, Some(Err(Volume::Muted)));
+    scene.volume.place = Some(Level::at(0));
+    port.publish(view(scene, None, false, 3));
+    assert_eq!(settings.playback_check().volume, Some(Err(Volume::Zero)));
+    app.set_sendspin_source_enabled(false).unwrap();
+}
+
+#[test]
 fn a_report_without_speaker_details_omits_identifying_text_from_every_part() {
     let (app, port, _) = real();
     let id = with_speaker(&app);

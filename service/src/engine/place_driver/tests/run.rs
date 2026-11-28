@@ -284,6 +284,33 @@ fn levels_set_outside_the_panel_settle_and_song_titles_follow_other_sound() {
 }
 
 #[test]
+fn an_app_on_another_output_is_named_as_windows_names_it() {
+    use crate::model::situation::{Situation, Standing};
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.playing();
+    r.windows.app_plays(r"C:\Apps\Browser.exe", SPEAKERS, Some(0.6));
+    for _ in 0..20 {
+        r.advance(250);
+    }
+    let named = |s: &Situation| {
+        s.standing.iter().find_map(|s| match s {
+            Standing::AppElsewhere { app, .. } => Some(app.clone()),
+            _ => None,
+        })
+    };
+    // The rules know the app by the name of its program's file; what
+    // people read is the name Windows shows for it.
+    let key = named(&r.driver.situation()).expect("the rules see the app on the other output");
+    let shown = named(&r.driver.scene().situation).expect("the scene names it");
+    assert_eq!(key, crate::platform::app_key(r"C:\Apps\Browser.exe"));
+    assert_eq!(shown, r.windows.platform().sessions.sessions().iter().find(|s| s.key == key).unwrap().app);
+    assert_ne!(shown, key);
+    r.send(Command::StayOnThisPc);
+    r.settle();
+}
+
+#[test]
 fn window_commands_send_the_requested_page_to_the_opener() {
     let mut r = Rig::on(App::for_tests());
     let (opened, pages) = unbounded();

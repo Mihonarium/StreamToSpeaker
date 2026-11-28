@@ -97,6 +97,9 @@ pub(crate) struct PlaceDriver {
     /// Which arrival of Music Assistant's server was connected when its
     /// network was last looked at; `None` while none was.
     ma_connected: Option<u64>,
+    /// The name Windows shows for each app heard so far, by the name of
+    /// its program's file, which is what the rules know it by.
+    app_names: HashMap<String, String>,
     pass: Option<pass::Worker>,
     /// A `--player` request waits while a change of Windows' output is told
     /// apart: a person who is choosing an output goes first.
@@ -200,6 +203,7 @@ impl PlaceDriver {
             level: None,
             ma_before_mute: None,
             ma_connected: None,
+            app_names: HashMap::new(),
             pass,
             held: VecDeque::new(),
             held_answers: Vec::new(),

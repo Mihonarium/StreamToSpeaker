@@ -7653,6 +7653,32 @@ mod tests {
     }
 
     #[test]
+    fn music_assistant_is_listed_while_a_server_is_connected_or_it_is_the_output() {
+        use crate::sendspin::source::SourceState;
+        use crate::sendspin_app::MA_OUTPUT_ID;
+        let app = test_app();
+        // A server was paired before: that alone doesn't list it.
+        app.user_config.lock().unwrap().sendspin.server_pairings.push(crate::sendspin::store::ServerPairing {
+            server_id: "server".into(),
+            psk: "00".into(),
+            server_name: Some("Server".into()),
+            last_used_unix: 0,
+        });
+        app.set_sendspin_source_enabled(true).unwrap();
+        let listed = || app.speaker_view().speakers.iter().any(|s| s.id == MA_OUTPUT_ID);
+        assert!(!listed(), "listed before a server connected");
+        app.set_sendspin_source_state(SourceState::Connected { server: "Server".into(), streaming: false });
+        assert!(listed());
+        // A server that only asks to pair isn't one that can play.
+        app.set_sendspin_source_state(SourceState::NeedsPairing { server: "Server".into() });
+        assert!(!listed());
+        app.set_sendspin_source_state(SourceState::Waiting);
+        assert!(!listed(), "listed after the server went away");
+        // As the output in use it stays listed without a server.
+        assert!(app.sendspin_speakers(Some(MA_OUTPUT_ID)).iter().any(|s| s.id == MA_OUTPUT_ID));
+    }
+
+    #[test]
     fn sendspin_speakers_are_listed_while_enabled() {
         use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
         let app = test_app();

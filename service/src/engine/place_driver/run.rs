@@ -70,7 +70,10 @@ impl PlaceDriver {
             && sit
                 .place_speaker()
                 .is_some_and(|id| self.core.connected_speaker() == Some(id))
-            && !sit.standing.contains(&Standing::MusicAssistantNotStarted);
+            && !sit
+                .standing
+                .iter()
+                .any(|s| matches!(s, Standing::MusicAssistantNotStarted | Standing::MusicAssistantNotConnected));
         let level = ours
             .as_ref()
             .filter(|_| sending)

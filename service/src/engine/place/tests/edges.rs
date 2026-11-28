@@ -232,6 +232,29 @@ fn at_the_edges() {
             },
         },
         Row {
+            name: "Music Assistant is the place and its server isn't connected",
+            given: || {
+                let mut w = world();
+                w.speakers.push(SpeakerWorld::found(crate::model::state::MUSIC_ASSISTANT_ID));
+                let mut r = Rig::with(Kept { first_run_done: true, ..Kept::default() }, w);
+                r.cmd(Command::Switch { place: Place::MusicAssistant, way: None }).unwrap();
+                r.end(Purpose::Switch, Ended::Ready);
+                r
+            },
+            when: |r| {
+                // The world shows no server any more while the app is
+                // sending: the place stays, and the standing says so.
+                r.w.speakers.last_mut().unwrap().found = false;
+                r.tick();
+            },
+            then: |r, _| {
+                let s = r.sit();
+                assert_eq!(s.spot, Spot::Speaker(SpeakerId::music_assistant()));
+                assert!(s.standing.contains(&Standing::MusicAssistantNotConnected));
+                assert!(!s.standing.contains(&Standing::MusicAssistantNotStarted));
+            },
+        },
+        Row {
             name: "while this PC is the place, what still arrives at the app's device plays on its output",
             given: Rig::on_kitchen,
             when: |r| {

@@ -163,7 +163,9 @@ impl PlaceDriver {
             let plays_here =
                 bound_place.map_or_else(|| bound.as_deref().is_some_and(|id| ids.has(id)), |k| *k == ids.id);
             if let Some(id) = bound.as_deref().filter(|_| plays_here) {
-                s.can_chime |= self.core.connected_speaker() == Some(&ids.id);
+                // Music Assistant can play a chime only while it plays
+                // this PC's sound.
+                s.can_chime |= self.core.connected_speaker() == Some(&ids.id) && (!s.id.is_music_assistant() || ma_playing);
                 // A fixed player starts at full scale on its first session.
                 // Later sessions use the level kept for this speaker.
                 s.level_unreadable |= local_level && kept.levels.contains_key(&s.id);

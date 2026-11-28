@@ -80,6 +80,11 @@ impl ViewContent for SpeakerOptions {
         buttons(ui, |ui| {
             if missing {
                 if page_button(&w!(lang, SetSearchAgain)).show(ui).clicked() { self.port.act(Act::SearchAgain); }
+                // What keeps a speaker from being found: the link its row
+                // has in the panel.
+                if page_link(&w!(lang, Why)).accessible_name(w!(lang, MissingWhySpoken, speaker = name)).show(ui).clicked() {
+                    ask(Ask::Open(Open::SpeakerMissing));
+                }
             } else {
                 if !here {
                     let command = row.and_then(|r| r.command.as_ref());
@@ -119,10 +124,12 @@ impl ViewContent for SpeakerOptions {
             let label = match secret { Secret::Code => w!(lang, SetEnterCode), Secret::Password => w!(lang, SetEnterPassword) };
             if page_button(&label).show(ui).clicked() { ask(Ask::Open(Open::Pair(id.clone()))); }
         }
+        // The Delay part is there while the speaker's delay can be seen or
+        // set: a speaker with no known way of playing has none to show.
         let about = panel::delay_about(&snap.scene, &id);
-        thin(ui);
-        widgets::strong(ui, &w!(lang, DelayLabel), size::BODY);
         if let About::Delay(d) = &about {
+            thin(ui);
+            widgets::strong(ui, &w!(lang, DelayLabel), size::BODY);
             for c in crate::surface::panel::page_delay(ui, &about) { ask(Ask::Command(c)); }
             let way = snap.scene.speaker(&id).and_then(|s| s.ways.iter().find(|w| w.way == s.way && w.applies != Applies::Fixed));
             if let Some(way) = way {
@@ -145,14 +152,13 @@ impl ViewContent for SpeakerOptions {
             } else {
                 self.exact_delay = None;
             }
+            if d.rows.iter().any(|row| row.enabled) && self.port.general().shortcuts.is_some() {
+                if super::parts::wrapped_link(ui, &w!(lang, SetDelayKeysLink)).clicked() { ask(Ask::Open(Open::Settings)); }
+            }
+            if !self.playing(snap) { widgets::note(ui, &w!(lang, SetInactiveDelay, speaker = name)); }
         } else {
             self.exact_delay = None;
         }
-        let can_change_delay = matches!(&about, About::Delay(d) if d.rows.iter().any(|row| row.enabled));
-        if can_change_delay && self.port.general().shortcuts.is_some() {
-            if super::parts::wrapped_link(ui, &w!(lang, SetDelayKeysLink)).clicked() { ask(Ask::Open(Open::Settings)); }
-        }
-        if !self.playing(snap) { widgets::note(ui, &w!(lang, SetInactiveDelay, speaker = name)); }
         if let Some((bass, treble)) = v.tone {
             thin(ui);
             widgets::strong(ui, &w!(lang, SetTone), size::BODY);

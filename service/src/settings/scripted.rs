@@ -459,7 +459,7 @@ pub fn example() -> State {
             updates: Updates {
                 daily: Some(true),
                 state: UpdateState::Available { version: "0.2.1".into(), at: Some(Seen::Today(LocalTime::new(9, 12))) },
-                installs_here: true,
+                installs_here: false,
             },
         },
         lab: LabView {
@@ -482,7 +482,7 @@ pub fn example() -> State {
         report_save: ReportSave::Opened,
         playback: PlaybackCheck {
             speaker: Some("Kitchen".into()),
-            playing: Some(Ok(Some("Edge".into()))),
+            playing: Some(Ok(None)),
             windows: Some(Ok(WindowsSends::ToUs)),
             connected: Some(Ok(())),
             taking: Some(Ok(Taking::Yes)),
@@ -490,6 +490,7 @@ pub fn example() -> State {
             untested: false,
             apple_tv: false,
             on_short: false,
+            server_away: false,
         },
         discovery: DiscoveryCheck {
             lines: vec![

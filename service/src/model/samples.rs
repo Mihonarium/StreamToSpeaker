@@ -471,6 +471,21 @@ pub fn named(name: &str) -> Scene {
             add_speaker(&mut s, row);
             on_speaker(&mut s, ma);
         }
+        "pc-music-assistant-not-connected" | "music-assistant-not-connected" => {
+            let ma = SpeakerId::music_assistant();
+            let row = SpeakerSeen { kind: SpeakerKind::Sendspin, ways: Vec::new(), ..seen(ma.clone(), "Music Assistant") };
+            add_speaker(&mut s, row);
+            // No server is connected: no chime can play there.
+            let now = s.situation.speakers.last_mut().unwrap();
+            now.can_chime = false;
+            now.state = RowState::NotFound;
+            if name == "music-assistant-not-connected" {
+                // It is the place all the same: sound that plays isn't
+                // heard until its server connects.
+                on_speaker(&mut s, ma);
+                s.situation.standing.push(Standing::MusicAssistantNotConnected);
+            }
+        }
         "twins" => {
             speaker_mut(&mut s, &k).address = Some("192.168.1.7".into());
             let mut twin = seen(id("second"), "Kitchen");
@@ -607,6 +622,8 @@ macro_rules! with_sample_names {
             "looking",
             "none-found",
             "music-assistant-playing",
+            "music-assistant-not-connected",
+            "pc-music-assistant-not-connected",
             "twins",
             "long-names"
         )

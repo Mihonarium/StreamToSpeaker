@@ -176,7 +176,7 @@ pub struct Connection {
 pub struct SettingsWorld {
     /// *Switch back to this PC after 30 minutes without sound* (off).
     pub switch_back_after_quiet: bool,
-    /// *Show notes by the clock about where the sound is playing* (on).
+    /// *Show pop-ups by the clock about where the sound is playing* (on).
     pub notes: bool,
     /// *Only send some apps to the speaker* (off): Windows' output is never
     /// changed.

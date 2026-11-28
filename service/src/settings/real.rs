@@ -626,16 +626,12 @@ impl SettingsPort for AppSettings {
     }
 
     fn playback_check(&self) -> PlaybackCheck {
+        use crate::model::situation::{Doing, Standing};
         let app = &self.app;
         let view = app.engine_view();
-        let speaker = view.as_ref().and_then(|view| {
-            view.scene.situation.place_speaker().map(|id| view.scene.speaker_name(id))
-        });
-        // The level and mute the panel shows for the place, so that the
-        // check and the panel can't disagree.
-        let level = view.as_ref().and_then(|view| view.scene.volume.place.as_ref().map(|l| (l.value, l.muted)));
+        let place = view.as_ref().and_then(|view| view.scene.situation.place_speaker().map(|id| (&view.scene, id)));
         let mut c = PlaybackCheck {
-            speaker: speaker.clone(),
+            speaker: place.map(|(scene, id)| scene.speaker_name(id)),
             playing: None,
             windows: None,
             connected: None,
@@ -644,17 +640,53 @@ impl SettingsPort for AppSettings {
             untested: false,
             apple_tv: false,
             on_short: false,
+            server_away: false,
         };
-        if speaker.is_none() {
+        let Some((scene, id)) = place else {
+            return c;
+        };
+        c.apple_tv = scene.speaker(id).is_some_and(|row| row.kind == SpeakerKind::AppleTv);
+        // Each link is checked only while the ones before it hold. Whether
+        // something plays, an app on another output and the volume come
+        // from the state the panel shows; that the app can't read the
+        // sound, and the links about the connection, come from the app.
+        //
+        // 1. Something plays: sound that goes to the place, or an app that
+        // stayed on another output of this PC, which is then named.
+        let elsewhere = scene.situation.standing.iter().find_map(|s| match s {
+            Standing::AppElsewhere { app, output } => {
+                let output = scene.outputs.iter().find(|o| o.id == *output).map_or_else(|| output.as_str().to_string(), |o| o.friendly.clone());
+                Some(WindowsSends::AppElsewhere { app: app.clone(), output })
+            }
+            _ => None,
+        });
+        let sent = matches!(scene.situation.doing, Doing::Playing | Doing::Connecting | Doing::Trying);
+        c.playing = Some(match &elsewhere {
+            _ if sent => Ok(None),
+            Some(WindowsSends::AppElsewhere { app, .. }) => Ok(Some(app.clone())),
+            _ => Err(None),
+        });
+        // 2. Windows sends it to the app's output, and the app reads it
+        // there. An app that stayed on another output ends the check only
+        // while nothing goes to the place: the speaker may be playing the
+        // rest, and the links after this one say whether it does.
+        let lost = sent && app.sound_input_lost();
+        c.windows = Some(match elsewhere {
+            _ if lost => Err(WindowsSends::InputLost),
+            Some(found) if sent => Ok(found),
+            Some(found) => Err(found),
+            None if sent => Ok(WindowsSends::ToUs),
+            None => return c,
+        });
+        if matches!(c.windows, Some(Err(_))) {
             return c;
         }
-        // Each link is checked only while the ones before it hold.
-        let playing = app.receiving_windows_audio();
-        c.playing = Some(if playing { Ok(None) } else { Err(None) });
-        if !playing {
-            return c;
-        }
-        let bound = app.is_speaker_bound() && !app.selected_session_dead();
+        let level = scene.volume.place.as_ref().map(|l| (l.value, l.muted));
+        // 3. Connected. Music Assistant's server connects to the app:
+        // choosing Music Assistant binds a session with or without it.
+        c.server_away = id.is_music_assistant()
+            && !matches!(app.sendspin_source_state(), Some(crate::sendspin::source::SourceState::Connected { .. }));
+        let bound = app.is_speaker_bound() && !app.selected_session_dead() && !c.server_away;
         c.connected = Some(if bound { Ok(()) } else { Err(()) });
         if !bound {
             return c;
@@ -669,10 +701,14 @@ impl SettingsPort for AppSettings {
                 if app.subscriber_count() > 0 {
                     Ok(Taking::Yes)
                 } else {
-                    Err(Taking::NotAsking { two_ways: false })
+                    // The speaker can be reached by AirPlay as well.
+                    Err(Taking::NotAsking { two_ways: scene.speaker(id).is_some_and(|row| row.airplay_way().is_some()) })
                 }
             }
             Some(Kind::AirPlay { .. } | Kind::HomePod { .. } | Kind::HomePodPair) => Ok(Taking::CantTell),
+            // Music Assistant's server is connected and hasn't started this
+            // PC's sound: the panel's note says the same.
+            _ if scene.situation.standing.contains(&Standing::MusicAssistantNotStarted) => Err(Taking::NotAsking { two_ways: false }),
             _ => Ok(Taking::Yes),
         };
         let broken = taking.is_err();

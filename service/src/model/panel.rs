@@ -302,6 +302,9 @@ fn state_line(scene: &Scene) -> StateLine {
         {
             return line(Sign::Still, t!(lang, PausedOnSpeaker));
         }
+        if sit.standing.contains(&Standing::MusicAssistantNotConnected) {
+            return line(Sign::Warn, t!(lang, RowNotConnected));
+        }
         if sit.standing.contains(&Standing::MusicAssistantNotStarted) {
             return line(Sign::Still, t!(lang, NotPlayingYet));
         }
@@ -310,6 +313,8 @@ fn state_line(scene: &Scene) -> StateLine {
                 Sign::Warn,
                 match away {
                     Away::NotResponding => t!(lang, NotResponding),
+                    // The app doesn't look for Music Assistant: it connects to the app.
+                    Away::NotFound if sit.place_speaker().is_some_and(|id| id.is_music_assistant()) => t!(lang, RowNotConnected),
                     Away::NotFound => t!(lang, RowNotFoundShort),
                     Away::NoNetwork => t!(lang, NoNetworkConnection),
                 },
@@ -475,6 +480,11 @@ pub(crate) fn speaker_row(scene: &Scene, speaker: &SpeakerSeen) -> Row {
             Some(t!(lang, NotResponding)),
             t!(lang, SpokenNotResponding, name = &name),
         ),
+        // The app doesn't look for Music Assistant: it connects to the app.
+        RowState::NotFound if id.is_music_assistant() => (
+            Some(t!(lang, RowNotConnected)),
+            t!(lang, SpokenNotConnected, name = &name),
+        ),
         RowState::NotFound => (
             Some(t!(lang, RowNotFoundShort)),
             t!(lang, SpokenNotFound, name = &name),
@@ -498,11 +508,16 @@ pub(crate) fn speaker_row(scene: &Scene, speaker: &SpeakerSeen) -> Row {
         _ => None,
     };
     let link = matches!(state, RowState::NotResponding | RowState::NotFound).then(|| {
-        Act::open(t!(lang, Why), Open::SpeakerMissing).spoken(t!(
-            lang,
-            MissingWhySpoken,
-            speaker = &name
-        ))
+        if id.is_music_assistant() {
+            // Its own page says whether it is connected and what that takes.
+            Act::open(t!(lang, Why), Open::MusicAssistantSettings).spoken(t!(lang, MaWhySpoken))
+        } else {
+            Act::open(t!(lang, Why), Open::SpeakerMissing).spoken(t!(
+                lang,
+                MissingWhySpoken,
+                speaker = &name
+            ))
+        }
     });
     let grey = state.grey();
     let marked = scene.situation.place_speaker() == Some(id);
@@ -521,15 +536,15 @@ pub(crate) fn speaker_row(scene: &Scene, speaker: &SpeakerSeen) -> Row {
             t!(lang, SwitchToSpeaker, speaker = bare.as_ref())
         }
     });
-    let settings = if id.is_music_assistant() {
-        Open::MusicAssistantSettings
+    let gear = if id.is_music_assistant() {
+        Act::open(t!(lang, MaGear), Open::MusicAssistantSettings)
     } else {
-        Open::SpeakerSettings(id.clone())
+        Act::open(t!(lang, SpeakerGear, speaker = bare.as_ref()), Open::SpeakerSettings(id.clone()))
     };
     Row {
         place,
         icon: speaker.icon(),
-        gear: Act::open(t!(lang, SpeakerGear, speaker = bare.as_ref()), settings),
+        gear,
         name,
         state,
         text,

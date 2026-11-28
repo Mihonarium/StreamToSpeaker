@@ -1812,12 +1812,13 @@ const LINK_NEEDED_HTML: &str = r#"<!doctype html>
 <style>body { font-family: -apple-system, system-ui, Segoe UI, sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }</style>
 </head><body>
 <h1>Stream To Speaker</h1>
-<p>The web UI opens only from its link, which holds a secret key. On the PC,
-open Settings and use <b>Copy link</b> under <b>Control from your phone</b>. If it runs
-without a window (<code>--headless</code>, or as a service), run
-<code>stream-to-speaker.exe --web-link</code> as the Windows account it runs
-under: that prints the link.</p>
-<p>A link stops working when <b>Make a new link</b> is used.</p>
+<p>This address doesn't hold the app's current key: part of the link is
+missing, or <b>Make a new link</b> has replaced it. On the PC, open Settings:
+under <b>Control from your phone</b>, scan the code with your phone, or use
+<b>Copy link</b> and send the link to the phone.</p>
+<p>If the app runs without a window (<code>--headless</code>, or as a
+service), run <code>stream-to-speaker.exe --web-link</code> as the Windows
+account it runs under: that prints the link.</p>
 </body></html>"#;
 
 const WEB_UI_OFF_HTML: &str = r#"<!doctype html>
@@ -1827,8 +1828,8 @@ const WEB_UI_OFF_HTML: &str = r#"<!doctype html>
 <style>body { font-family: -apple-system, system-ui, Segoe UI, sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }</style>
 </head><body>
 <h1>Stream To Speaker</h1>
-<p>The web UI is off. Turn on <b>Control from your phone</b> in Settings,
-or start the app with <code>--web</code>, then open its link: the window shows
+<p><b>Control from your phone</b> is off. Turn it on in Settings on the PC,
+or start the app with <code>--web</code>, then open its link: Settings shows
 it, and <code>stream-to-speaker.exe --web-link</code> prints it.</p>
 </body></html>"#;
 
@@ -3141,7 +3142,7 @@ mod tests {
             assert!(r.starts_with("HTTP/1.1 401"), "{path}: {r}");
             assert!(header(&r, "WWW-Authenticate").is_some(), "{r}");
             // Where the link is: the window, or --web-link without one.
-            assert!(r.contains("Copy link") && r.contains("--web-link"), "{r}");
+            assert!(r.contains("doesn't hold the app's current key") && r.contains("Copy link") && r.contains("--web-link"), "{r}");
             assert!(!r.contains("data-select") && !r.contains("192.168.1.50"), "{path}: {r}");
             assert_eq!(header(&r, "Referrer-Policy"), Some("no-referrer"), "{r}");
         }
@@ -3298,7 +3299,7 @@ mod tests {
         let srv = api_server();
         srv.access.set_enabled(false);
         let page = get(srv.port, &format!("/r/{KEY}/"), "");
-        assert!(page.starts_with("HTTP/1.1 404") && page.contains("The web UI is off"), "{page}");
+        assert!(page.starts_with("HTTP/1.1 404") && page.contains("<b>Control from your phone</b> is off"), "{page}");
         assert!(page.contains("--web-link"), "{page}");
         assert!(!page.contains("data-select"));
         let api = get(srv.port, "/api/speakers", &auth());

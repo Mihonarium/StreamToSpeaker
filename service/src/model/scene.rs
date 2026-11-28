@@ -101,6 +101,18 @@ impl SpeakerSeen {
         name.into_owned()
     }
 
+    /// The AirPlay way a speaker that is on its own way can be switched to:
+    /// the one it last used by AirPlay, else the steadier one it offers.
+    pub fn airplay_way(&self) -> Option<WayChoice> {
+        if self.way != WayChoice::Native {
+            return None;
+        }
+        let offers = |way: WayChoice| self.ways.iter().any(|w| w.way == way);
+        self.airplay
+            .filter(|way| offers(*way))
+            .or_else(|| [WayChoice::AirPlaySteady, WayChoice::AirPlayShort].into_iter().find(|way| offers(*way)))
+    }
+
     pub(super) fn row_state(&self, scene: &Scene) -> RowState {
         scene
             .situation

@@ -256,6 +256,23 @@ fn first_delay(doing: Doing, state: &str, sign: Sign, dimmed: bool) {
         }
     }
 }
+
+#[test]
+fn the_tray_tooltip_says_why_the_icon_is_amber_over_this_pc() {
+    let s = named("pc-kitchen-stopped-responding");
+    let tray = by_clock::tray(&s);
+    assert!(tray.amber && !tray.accent);
+    assert_eq!(tray.tooltip, "Stream To Speaker – This PC · Playing · Kitchen stopped responding");
+    // No failure stands: the place and what it does, nothing more.
+    let s = named("pc-kitchen-available-again");
+    let tray = by_clock::tray(&s);
+    assert!(!tray.amber);
+    assert_eq!(tray.tooltip, "Stream To Speaker – This PC · Playing");
+    // A speaker as the place says its trouble in its own state.
+    let s = named("kitchen-not-responding-trying");
+    assert_eq!(by_clock::tray(&s).tooltip, "Stream To Speaker – Kitchen · Not responding. Trying again…");
+}
+
 #[test]
 fn sound_plays_on_kitchen() {
     first_delay(Doing::Playing, "Playing", Sign::Bars, false);
@@ -777,6 +794,14 @@ fn status_lines_follow_precedence_and_link_to_the_right_page() {
             None,
         ),
         (
+            Doing::Playing,
+            vec![Standing::MusicAssistantNotConnected],
+            None,
+            Sign::Warn,
+            "Not connected",
+            None,
+        ),
+        (
             Doing::NothingPlaying,
             vec![],
             Some(Away::NotResponding),
@@ -853,6 +878,7 @@ fn lasting_notes_and_repairs() {
     for (condition, mark, title, body, button) in [
         (Standing::WindowsDidntSwitch { speaker: kitchen() }, Mark::Warn, "Windows didn’t switch to Kitchen", "Try again, or choose this app’s output in Windows’ sound settings.", ("Open Windows’ sound settings", Command::Open(Open::SoundSettings))),
         (Standing::MusicAssistantNotStarted, Mark::Warn, "Music Assistant hasn’t started playing", "Start this PC’s sound in Music Assistant, or set Music Assistant to start it by itself.", ("How to start it", Command::Open(Open::MusicAssistantHowTo))),
+        (Standing::MusicAssistantNotConnected, Mark::Warn, "Music Assistant isn’t connected", "This PC’s sound isn’t heard until it connects.", ("How to connect it", Command::Open(Open::MusicAssistantSettings))),
         (Standing::PausedAtSpeaker { speaker: kitchen() }, Mark::Warn, "Kitchen was paused", "It was paused with its own buttons or app, so this PC’s sound isn’t heard.", ("Switch to this PC", to_pc())),
         (Standing::CallOn { speaker: kitchen() }, Mark::Info, "A microphone is in use", "If this is a call, you will hear the other person late on Kitchen.", ("Switch to this PC", to_pc())),
     ] {
@@ -1079,6 +1105,40 @@ fn delay_limits_fixed_progress_and_dimmed_states() {
         let d = delay(view(&s).about);
         assert!(d.dimmed && d.rows.iter().all(|r| !r.enabled));
         assert!(way_lines(&s).iter().all(|l| l.command.is_none()));
+    }
+}
+
+#[test]
+fn music_assistant_that_is_not_connected_says_so_and_opens_its_own_page() {
+    let p = view(&named("pc-music-assistant-not-connected"));
+    let r = p.list.rows.iter().find(|r| r.place == Place::MusicAssistant).unwrap();
+    assert_eq!(
+        (r.text.as_deref(), r.spoken.as_str(), r.grey, &r.command),
+        (Some("Not connected"), "Music Assistant, not connected", true, &None)
+    );
+    assert_button(r.link.as_ref(), Some(("Why?", Command::Open(Open::MusicAssistantSettings))));
+    assert_eq!(r.link.as_ref().unwrap().spoken.as_deref(), Some("Why? Opens Music Assistant’s settings"));
+    assert_button(Some(&r.gear), Some(("Music Assistant’s settings", Command::Open(Open::MusicAssistantSettings))));
+    // While it is the place and can't play, the line under its name says
+    // the same.
+    let mut s = named("music-assistant-playing");
+    s.situation.doing = Doing::NothingPlaying;
+    s.situation.away = Some(Away::NotFound);
+    assert_eq!(view(&s).place.state.text, "Not connected");
+    // A speaker keeps its own words.
+    let mut s = named("kitchen-nothing-playing");
+    s.situation.away = Some(Away::NotFound);
+    assert_eq!(view(&s).place.state.text, "Not found");
+    // Chosen with no server connected, the app is sending all the same:
+    // the line, the row and the note say why nothing is heard.
+    let p = view(&named("music-assistant-not-connected"));
+    assert_eq!((p.place.state.sign, p.place.state.text.as_str()), (Sign::Warn, "Not connected"));
+    let r = p.list.rows.iter().find(|r| r.place == Place::MusicAssistant).unwrap();
+    assert_eq!(r.text.as_deref(), Some("Not connected"));
+    assert_button(r.link.as_ref(), Some(("Why?", Command::Open(Open::MusicAssistantSettings))));
+    match p.about {
+        About::Note(n) => assert_eq!((n.title.as_str(), n.sentence.as_str()), ("Music Assistant isn’t connected", "This PC’s sound isn’t heard until it connects.")),
+        v => panic!("{v:?}"),
     }
 }
 
@@ -1573,6 +1633,25 @@ fn a_move_names_its_time_only_when_the_core_supplies_one() {
         panic!()
     };
     assert_eq!(v.sentence, "The app moved the sound to this PC at 8.02.");
+}
+
+#[test]
+fn a_speaker_on_its_own_way_can_be_switched_to_the_airplay_way_it_offers() {
+    let mut s = seen(kitchen(), "Kitchen");
+    assert_eq!(s.airplay_way(), None, "it offers no AirPlay way");
+    s.ways.push(way(WayChoice::AirPlayShort, 300));
+    assert_eq!(s.airplay_way(), Some(WayChoice::AirPlayShort));
+    // The steadier one of the two.
+    s.ways.push(way(WayChoice::AirPlaySteady, 2_000));
+    assert_eq!(s.airplay_way(), Some(WayChoice::AirPlaySteady));
+    // The one it last used by AirPlay, while it is offered.
+    s.airplay = Some(WayChoice::AirPlayShort);
+    assert_eq!(s.airplay_way(), Some(WayChoice::AirPlayShort));
+    s.ways.retain(|w| w.way != WayChoice::AirPlayShort);
+    assert_eq!(s.airplay_way(), Some(WayChoice::AirPlaySteady));
+    // On AirPlay already: there is nothing to switch to.
+    s.way = WayChoice::AirPlaySteady;
+    assert_eq!(s.airplay_way(), None);
 }
 
 #[test]

@@ -1050,7 +1050,7 @@ const SETTING_LABELS: &[(&str, &str, bool)] = &[
     ("delay_shortcuts", "Keyboard shortcuts for the delay", true),
     ("delay_keys", "Keyboard shortcuts for the delay", true),
     ("show_lab", "Show Lab", true),
-    ("notes_by_clock", "Show notes by the clock about where the sound is playing", true),
+    ("notes_by_clock", "Show pop-ups by the clock about where the sound is playing", true),
     ("calls_back", "The output calls return to", false),
     ("pc_output", "The output This PC plays on", false),
     ("window_height", "Window height", false),

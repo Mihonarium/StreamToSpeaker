@@ -63,9 +63,15 @@ pub fn scenes() -> Vec<Scene> {
         s("view-cant-hear-muted", 760.0, cant_hear_muted),
         s("view-cant-hear-nothing-playing", 520.0, cant_hear_nothing),
         s("view-cant-hear-not-connected", 640.0, cant_hear_not_connected),
+        s("view-cant-hear-connecting", 640.0, cant_hear_connecting),
+        s("view-cant-hear-trying", 640.0, cant_hear_trying),
         s("view-cant-hear-not-asking", 760.0, cant_hear_not_asking),
         s("view-cant-hear-windows-elsewhere", 640.0, cant_hear_windows),
         s("view-cant-hear-app-elsewhere", 640.0, cant_hear_app),
+        s("view-cant-hear-app-elsewhere-playing", 900.0, cant_hear_app_while_playing),
+        s("view-cant-hear-input-lost", 560.0, cant_hear_input_lost),
+        s("view-cant-hear-music-assistant", 700.0, cant_hear_music_assistant),
+        s("view-cant-hear-music-assistant-not-connected", 640.0, cant_hear_music_assistant_away),
         s("view-cant-hear-refused", 760.0, cant_hear_refused),
         s("view-cant-hear-volume-zero", 760.0, cant_hear_zero),
         s("view-cant-hear-on-this-pc", 360.0, cant_hear_pc),
@@ -464,11 +470,22 @@ fn cant_hear_nothing(ui: &mut Ui, _: &mut Stage) {
 }
 
 fn cant_hear_not_connected(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-not-connected", "kitchen-playing", |s| {
-        s.playback.connected = Some(Err(()));
-        s.playback.taking = None;
-        s.playback.volume = None;
-    });
+    cant_hear(ui, "cant-hear-not-connected", "kitchen-playing", not_connected);
+}
+
+fn cant_hear_connecting(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-connecting", "kitchen-connecting", not_connected);
+}
+
+fn cant_hear_trying(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-trying", "kitchen-not-responding-trying", not_connected);
+}
+
+/// The check as the app reports it while no speaker is connected.
+fn not_connected(s: &mut State) {
+    s.playback.connected = Some(Err(()));
+    s.playback.taking = None;
+    s.playback.volume = None;
 }
 
 fn cant_hear_not_asking(ui: &mut Ui, _: &mut Stage) {
@@ -480,9 +497,41 @@ fn cant_hear_not_asking(ui: &mut Ui, _: &mut Stage) {
 
 fn cant_hear_app(ui: &mut Ui, _: &mut Stage) {
     cant_hear(ui, "cant-hear-app", "kitchen-playing", |s| {
+        s.playback.playing = Some(Ok(Some("Chrome".into())));
         s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers (Realtek Audio)".into() }));
         s.playback.connected = None;
         s.playback.taking = None;
+        s.playback.volume = None;
+    });
+}
+
+fn cant_hear_app_while_playing(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-app-playing", "kitchen-except-an-app", |s| {
+        s.playback.windows = Some(Ok(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers (Realtek Audio)".into() }));
+    });
+}
+
+fn cant_hear_input_lost(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-input-lost", "kitchen-playing", |s| {
+        s.playback.windows = Some(Err(WindowsSends::InputLost));
+        s.playback.connected = None;
+        s.playback.taking = None;
+        s.playback.volume = None;
+    });
+}
+
+fn cant_hear_music_assistant_away(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-music-assistant-away", "music-assistant-not-connected", |s| {
+        s.playback.speaker = Some("Music Assistant".into());
+        s.playback.server_away = true;
+        not_connected(s);
+    });
+}
+
+fn cant_hear_music_assistant(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-music-assistant", "music-assistant-playing", |s| {
+        s.playback.speaker = Some("Music Assistant".into());
+        s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
         s.playback.volume = None;
     });
 }

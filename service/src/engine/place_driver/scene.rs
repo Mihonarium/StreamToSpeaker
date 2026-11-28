@@ -22,7 +22,16 @@ impl PlaceDriver {
         let now = self.clock();
         let obs = self.observe(now, false);
         let w = &obs.world;
-        let situation = self.core.situation(w, now);
+        let mut situation = self.core.situation(w, now);
+        // The rules know an app by the name of its program's file; people
+        // read the name Windows shows for it.
+        for s in &mut situation.standing {
+            if let crate::model::situation::Standing::AppElsewhere { app, .. } = s {
+                if let Some(name) = self.app_names.get(app.as_str()) {
+                    *app = name.clone();
+                }
+            }
+        }
         let place = situation.place_speaker();
         let speakers = w
             .speakers

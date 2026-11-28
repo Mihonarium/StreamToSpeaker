@@ -10,7 +10,7 @@ use crate::ui::button::Button;
 use crate::ui::text::{Mark, Tone};
 use crate::ui::theme::size;
 
-use super::parts::{page_button, page_link, control_line, gap, marked, plain, sentence, thin};
+use super::parts::{page_button, page_link, gap, marked, plain, sentence, switch_line, thin};
 use crate::settings::port::*;
 use crate::settings::words::{self, w};
 use crate::settings::{PageState, SettingsPort};
@@ -37,11 +37,11 @@ impl ViewContent for AboutView {
         crate::settings::widgets::strong(ui, &w!(lang, SetAppVersion, version = &v.version), size::TITLE);
         updates(ui, lang, &v.updates, self.port.as_ref());
         if let Some(daily) = v.updates.daily {
-            if let Some(on) = control_line(ui, &w!(lang, SetDailyCheck), Some(&w!(lang, SetDailyCheckLine)), |ui| {
-                crate::ui::inputs::Switch::new(daily, &w!(lang, SetDailyCheck)).without_words().show(ui)
-            }) {
+            // The switch sits level with its words, as on the Settings page.
+            if let Some(on) = switch_line(ui, &w!(lang, SetDailyCheck), daily) {
                 self.port.act(Act::DailyUpdateCheck(on));
             }
+            crate::settings::widgets::note(ui, &w!(lang, SetDailyCheckLine));
         }
         gap(ui);
         if page_link(&w!(lang, SetLicences)).show(ui).clicked() { self.port.act(Act::LicenceAndSource); }
@@ -61,10 +61,12 @@ fn updates(ui: &mut Ui, lang: crate::model::text::Lang, u: &Updates, port: &dyn 
         UpdateState::NeverChecked => (w!(lang, SetNotChecked), None),
         UpdateState::Checking => (w!(lang, SetChecking), None),
         UpdateState::UpToDate { at } => (w!(lang, SetUpToDate), checked(&Some(*at))),
-        UpdateState::Available { version, at } => {
-            let how = if u.installs_here { w!(lang, SetUpdateHow) } else { w!(lang, SetUpdateHowPage) };
+        UpdateState::Available { version, at } if u.installs_here => {
+            let how = w!(lang, SetUpdateHow);
             (w!(lang, NoticeUpdate, version = version), Some(checked(at).map_or(how.clone(), |c| format!("{c} {how}"))))
         }
+        // The app opens the page that has the installer: its button says so.
+        UpdateState::Available { version, at } => (w!(lang, SetUpdateAvailable, version = version), checked(at)),
         UpdateState::Failed { why } => (w!(lang, SetUpdateFailed), Some(why.clone())),
         UpdateState::Downloading => (w!(lang, SetDownloading), None),
         UpdateState::ReadyToInstall { version, speaker } => (
@@ -89,7 +91,7 @@ fn updates(ui: &mut Ui, lang: crate::model::text::Lang, u: &Updates, port: &dyn 
                 if page_button(&w!(lang, SetWhatsNew)).show(ui).clicked() {
                     port.act(Act::WhatsNew);
                 }
-            } else if page_button(&w!(lang, SetGetUpdate)).show(ui).clicked() {
+            } else if page_button(&w!(lang, SetOpenDownloadPage)).show(ui).clicked() {
                 port.act(Act::WhatsNew);
             }
             if page_button(&w!(lang, SetSkipVersion)).show(ui).clicked() {
@@ -206,18 +208,16 @@ impl ViewContent for LabView {
             }
         }
         if let Some(on) = v.mfi {
-            if let Some(on) = control_line(ui, &w!(lang, SetLabMfi), Some(&w!(lang, SetLabMfiLine)), |ui| {
-                crate::ui::inputs::Switch::new(on, &w!(lang, SetLabMfi)).without_words().show(ui)
-            }) {
+            if let Some(on) = switch_line(ui, &w!(lang, SetLabMfi), on) {
                 self.port.act(Act::Lab(LabAct::Mfi(on)));
             }
+            crate::settings::widgets::note(ui, &w!(lang, SetLabMfiLine));
         }
         if let Some(on) = v.uncompressed_alac {
-            if let Some(on) = control_line(ui, &w!(lang, SetLabAlac), Some(&w!(lang, SetLabAlacLine)), |ui| {
-                crate::ui::inputs::Switch::new(on, &w!(lang, SetLabAlac)).without_words().show(ui)
-            }) {
+            if let Some(on) = switch_line(ui, &w!(lang, SetLabAlac), on) {
                 self.port.act(Act::Lab(LabAct::UncompressedAlac(on)));
             }
+            crate::settings::widgets::note(ui, &w!(lang, SetLabAlacLine));
         }
         let p = self.port.privacy();
         if let Some(on) = super::parts::switch_line(ui, &w!(lang, SetAnyoneListens), !p.only_playing) { self.port.act(Act::OnlyPlaying(!on)); }

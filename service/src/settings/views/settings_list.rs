@@ -77,8 +77,15 @@ impl ViewContent for SettingsView {
         let ma = self.port.music_assistant();
         let about = self.port.about();
         if let UpdateState::Available { version, .. } = &about.updates.state {
-            if control_line(ui, &w!(lang, NoticeUpdate, version = version), None, |ui| page_button(&w!(lang, SetUpdateNow)).show(ui).clicked()) {
-                self.port.act(if about.updates.installs_here { Act::UpdateNow } else { Act::WhatsNew });
+            // The line and its button say what happens: the app installs
+            // the update, or opens the page that has it.
+            let (line, label, act) = if about.updates.installs_here {
+                (w!(lang, NoticeUpdate, version = version), w!(lang, SetUpdateNow), Act::UpdateNow)
+            } else {
+                (w!(lang, SetUpdateAvailable, version = version), w!(lang, SetOpenDownloadPage), Act::WhatsNew)
+            };
+            if control_line(ui, &line, None, |ui| page_button(&label).show(ui).clicked()) {
+                self.port.act(act);
             }
             gap(ui);
         }
@@ -113,7 +120,9 @@ impl ViewContent for SettingsView {
         }
         if let Some(mode) = g.what_plays {
             let some = mode == WhatPlays::OnlySentApps;
-            if let Some(on) = setting(ui, &w!(lang, SetOnlySomeApps), Some(w!(lang, SetSomeAppsHelp)), some) {
+            // What the switch does by itself, then what the person does in Windows.
+            let help = format!("{} {}", w!(lang, SetSomeAppsRest), w!(lang, SetSomeAppsHelp));
+            if let Some(on) = setting(ui, &w!(lang, SetOnlySomeApps), Some(help), some) {
                 self.port.act(Act::WhatPlays(if on { WhatPlays::OnlySentApps } else { WhatPlays::Everything }));
             }
             if let Some(routing) = snap.scene.situation.confirm_under_routing.filter(|_| !some) {
@@ -177,6 +186,8 @@ impl ViewContent for SettingsView {
         thin(ui);
         super::parts::buttons(ui, |ui| {
             if page_link(&w!(lang, SetReportProblem)).show(ui).clicked() { super::open_dialog(&self.port, Dialog::Report(ReportDialog::default()), ask); }
+            // Room between two links, which otherwise read as one phrase.
+            ui.add_space(12.0);
             if page_link(&w!(lang, SetNavAbout)).show(ui).clicked() { ask(Ask::View(Box::new(AboutView::new(self.port.clone())))); }
         });
         let some = g.what_plays.map_or(snap.scene.situation.only_some_apps, |mode| mode == WhatPlays::OnlySentApps);
