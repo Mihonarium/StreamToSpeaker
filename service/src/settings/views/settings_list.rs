@@ -199,7 +199,11 @@ impl ViewContent for SettingsView {
 
 pub(super) fn refused(ui: &mut Ui, port: &dyn SettingsPort, r: &Refused) {
     let lang = port.lang();
-    let at = words::time(lang, r.at);
+    // Today's by its time alone; an earlier one says which day.
+    let at = match r.at {
+        Seen::Today(t) => words::time(lang, t),
+        earlier => words::seen(lang, earlier),
+    };
     let who = match &r.name {
         Some(n) => w!(lang, SetRefusedNamed, name = n, address = &r.address, time = &at),
         None => w!(lang, SetRefusedUnknown, address = &r.address, time = &at),

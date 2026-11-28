@@ -589,10 +589,7 @@ impl SettingsPort for AppSettings {
                     .into_iter()
                     .map(|r| {
                         let unix = r.at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                        let at = match self.seen(unix) {
-                            Seen::Today(t) | Seen::Yesterday(t) => t,
-                            Seen::On(_) => LocalTime::new(0, 0),
-                        };
+                        let at = self.seen(unix);
                         let address = r.address.to_string();
                         let group_of = r.speaker.map(|id| {
                             let id = crate::engine::place_driver::speaker_for_pick(app, &id).as_str().to_owned();

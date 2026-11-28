@@ -510,6 +510,20 @@ fn quitting_explains_the_silence_only_for_chosen_apps() {
 }
 
 #[test]
+fn a_refused_device_of_an_earlier_day_says_which_day() {
+    use crate::model::text::LocalTime;
+    let row = |at: Seen| {
+        let port = scripted(move |s| s.privacy.refused.as_mut().unwrap()[1].at = at);
+        H::new(port.clone(), Box::new(super::LabView::new(port)), snap("kitchen-playing"))
+    };
+    // Today's goes by its time alone.
+    let today = row(Seen::Today(LocalTime::new(21, 12)));
+    assert!(today.shows("192.168.1.77 (unknown device) · 21:12") && !today.shows("today"));
+    assert!(row(Seen::Yesterday(LocalTime::new(22, 10))).shows("192.168.1.77 (unknown device) · yesterday 22:10"));
+    assert!(row(Seen::On(Date { day: 3, month: 10 })).shows("192.168.1.77 (unknown device) · 3 October"));
+}
+
+#[test]
 fn each_settings_switch_changes_its_own_field() {
     let port = scripted(|s| { s.general.shortcuts.as_mut().unwrap().on = false; s.ma.offer = Some(false); });
     let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));

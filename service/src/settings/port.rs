@@ -262,7 +262,8 @@ pub struct Refused {
     /// The device's name, when it said one.
     pub name: Option<String>,
     pub address: String,
-    pub at: LocalTime,
+    /// When it asked.
+    pub at: Seen,
     /// The speaker whose group it belongs to: it can be allowed for it.
     pub group_of: Option<(String, String)>,
 }
