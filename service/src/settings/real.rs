@@ -696,7 +696,11 @@ impl SettingsPort for AppSettings {
         c.untested = kind == Some(Kind::HomePodPair);
         c.on_short = matches!(kind, Some(Kind::AirPlay { .. } | Kind::HomePod { .. }))
             && status.as_ref().and_then(|s| s.choice) == Some(crate::delay::DelayChoice::Short);
+        // A pause pressed on the speaker that left sound going, sent and
+        // not heard: the panel's note says the same.
+        let paused = scene.situation.standing.iter().any(|s| matches!(s, Standing::PausedAtSpeaker { .. }));
         let taking = match kind {
+            _ if paused => Err(Taking::Paused),
             Some(Kind::Upnp) => {
                 if app.subscriber_count() > 0 {
                     Ok(Taking::Yes)

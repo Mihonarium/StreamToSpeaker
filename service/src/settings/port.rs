@@ -446,6 +446,8 @@ pub enum Taking {
     },
     /// AirPlay speakers and HomePods don't report it.
     CantTell,
+    /// Paused with the speaker's own buttons or app while sound is sent.
+    Paused,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -242,6 +242,15 @@ impl ViewContent for CantHearView {
                         }
                     });
                 }
+                Err(Taking::Paused) => {
+                    // The panel's note, and its way out.
+                    all_good = false;
+                    check_line(ui, Found::Bad, &w!(lang, SetCheckPaused, speaker = &speaker), Some(&w!(lang, PausedBySpeaker)), |ui| {
+                        if Button::standard(&w!(lang, SwitchToPc)).show(ui).clicked() {
+                            send(ask, Command::Switch { place: crate::model::state::Place::ThisPc, way: None });
+                        }
+                    });
+                }
                 Err(Taking::Yes) => {}
             }
         }
@@ -304,7 +313,7 @@ impl ViewContent for CantHearView {
         let broken = matches!(c.playing, Some(Err(_)))
             || matches!(c.windows, Some(Err(WindowsSends::AppElsewhere { .. } | WindowsSends::InputLost | WindowsSends::Elsewhere { .. })))
             || (matches!(c.connected, Some(Err(()))) && !connecting)
-            || matches!(c.taking, Some(Err(Taking::NotAsking { .. } | Taking::Refused { .. })))
+            || matches!(c.taking, Some(Err(Taking::NotAsking { .. } | Taking::Refused { .. } | Taking::Paused)))
             || matches!(c.volume, Some(Err(_)));
         let live = w!(lang, SetCheckLive);
         sentence(ui, &if broken { format!("{live} {}", w!(lang, SetCheckStops)) } else { live });

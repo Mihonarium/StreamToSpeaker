@@ -73,6 +73,7 @@ pub fn scenes() -> Vec<Scene> {
         s("view-cant-hear-music-assistant", 700.0, cant_hear_music_assistant),
         s("view-cant-hear-music-assistant-not-connected", 640.0, cant_hear_music_assistant_away),
         s("view-cant-hear-refused", 760.0, cant_hear_refused),
+        s("view-cant-hear-paused", 760.0, cant_hear_paused),
         s("view-cant-hear-volume-zero", 760.0, cant_hear_zero),
         s("view-cant-hear-on-this-pc", 360.0, cant_hear_pc),
         s("view-music-assistant-off", 520.0, ma_off),
@@ -539,6 +540,13 @@ fn cant_hear_music_assistant(ui: &mut Ui, _: &mut Stage) {
 fn cant_hear_refused(ui: &mut Ui, _: &mut Stage) {
     cant_hear(ui, "cant-hear-refused", "kitchen-playing", |s| {
         s.playback.taking = Some(Err(Taking::Refused { device: "Kitchen Sub".into(), address: "192.168.1.51".into() }));
+        s.playback.volume = None;
+    });
+}
+
+fn cant_hear_paused(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-paused", "kitchen-playing", |s| {
+        s.playback.taking = Some(Err(Taking::Paused));
         s.playback.volume = None;
     });
 }

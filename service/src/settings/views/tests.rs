@@ -790,6 +790,18 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     assert!(h.has("Music Assistant hasn’t started playing.") && !h.has("Try Music Assistant again"));
     h.click("How to start it");
     assert_eq!(h.asks(), vec![Asked::Open(Open::MusicAssistantHowTo)]);
+    // A speaker paused with its own buttons while sound is sent: the
+    // panel's note and its way out.
+    let port = scripted(|s| {
+        s.playback.taking = Some(Err(Taking::Paused));
+        s.playback.volume = None;
+    });
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Kitchen was paused.") && h.shows("It was paused with its own buttons or app, so this PC’s sound isn’t heard."));
+    assert!(!h.shows("is taking the sound") && !h.shows("Everything this PC can check looks right."));
+    assert!(h.shows("It stops at the first broken step.") && !h.shows("volume"));
+    h.click("Switch to this PC");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::Switch { place: crate::model::state::Place::ThisPc, way: None })]);
     let port = scripted(|s| {
         s.playback.taking = Some(Ok(Taking::CantTell));
         s.playback.on_short = true;
@@ -1193,6 +1205,12 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
         s.playback.volume = None;
     });
     look(&H::new(waiting.clone(), Box::new(CantHearView::new(waiting)), snap("music-assistant-playing")));
+    // Can't hear it? for a speaker paused with its own buttons.
+    let paused = scripted(|s| {
+        s.playback.taking = Some(Err(Taking::Paused));
+        s.playback.volume = None;
+    });
+    look(&H::new(paused.clone(), Box::new(CantHearView::new(paused)), snap("kitchen-playing")));
     // Can't hear it? while Music Assistant's server isn't connected, and
     // while the app can't read this PC's sound.
     let away = scripted(|s| {

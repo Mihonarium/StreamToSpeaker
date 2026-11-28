@@ -744,6 +744,15 @@ fn the_playback_check_follows_music_assistants_server() {
     let c = settings.playback_check();
     assert_eq!((c.connected, c.taking), (Some(Ok(())), Some(Ok(Taking::Yes))));
     assert!(matches!(c.volume, Some(Ok(_))), "{:?}", c.volume);
+    // A pause pressed on the speaker that left sound going: the check
+    // reads it from the panel's state, whatever the speaker is, and ends
+    // there.
+    let mut scene = samples::named("music-assistant-playing");
+    let speaker = scene.situation.place_speaker().cloned().unwrap();
+    scene.situation.standing.push(Standing::PausedAtSpeaker { speaker });
+    port.publish(view(scene, None, false, 4));
+    let c = settings.playback_check();
+    assert_eq!((c.connected, c.taking, c.volume), (Some(Ok(())), Some(Err(Taking::Paused)), None));
     app.set_sendspin_source_enabled(false).unwrap();
 }
 
